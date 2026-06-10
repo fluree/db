@@ -1899,6 +1899,7 @@ impl Operator for BinaryScanOperator {
             || range_min_okey.is_some()
             || range_max_okey.is_some();
 
+        let mut range_keys: Option<(RunRecordV2, RunRecordV2)> = None;
         let mut cursor = if use_range {
             let min_key = RunRecordV2 {
                 s_id: SubjectId(filter.s_id.unwrap_or(0)),
@@ -1918,7 +1919,7 @@ impl Operator for BinaryScanOperator {
                 o_type: filter.o_type.or(range_o_type).unwrap_or(u16::MAX),
                 g_id: self.g_id,
             };
-            BinaryCursor::new(
+            let cursor = BinaryCursor::new(
                 Arc::clone(&store_arc),
                 order,
                 branch,
@@ -1927,7 +1928,9 @@ impl Operator for BinaryScanOperator {
                 filter,
                 projection,
             )
-            .with_tracker(ctx.tracker.clone())
+            .with_tracker(ctx.tracker.clone());
+            range_keys = Some((min_key, max_key));
+            cursor
         } else {
             BinaryCursor::scan_all(Arc::clone(&store_arc), order, branch, filter, projection)
                 .with_tracker(ctx.tracker.clone())
@@ -1986,8 +1989,24 @@ impl Operator for BinaryScanOperator {
             }
 
             if !translated.ops.is_empty() {
-                cursor.set_overlay_ops_shared(Arc::clone(&translated.ops));
-                cursor.set_epoch(epoch);
+                // Range-bounded cursors get only the ops window intersecting
+                // [min_key, max_key]: out-of-range ops can never match the
+                // filter, and carrying them costs an O(overlay) merge walk per
+                // cursor (per probe row in nested-loop joins) while defeating
+                // leaflet pre-skips.
+                let (start, end) = match &range_keys {
+                    Some((min_key, max_key)) => fluree_db_binary_index::overlay_window_for_range(
+                        &translated.ops,
+                        min_key,
+                        max_key,
+                        order,
+                    ),
+                    None => (0, translated.ops.len()),
+                };
+                if start < end {
+                    cursor.set_overlay_ops_window(Arc::clone(&translated.ops), start, end);
+                    cursor.set_epoch(epoch);
+                }
             }
 
             // Some overlay flakes cannot be represented in V3 overlay ops (e.g., @vector).

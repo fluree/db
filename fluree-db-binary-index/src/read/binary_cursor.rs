@@ -47,10 +47,14 @@ pub struct BinaryCursor {
     /// Index of the next leaflet within the current leaf.
     current_leaflet_idx: usize,
     exhausted: bool,
-    /// Overlay ops sorted by this cursor's sort order.
+    /// Overlay ops sorted by this cursor's sort order. May be shared across
+    /// cursors; this cursor consumes only `[overlay_pos, overlay_end)`.
     overlay_ops: Arc<[OverlayOp]>,
     /// Start position in overlay_ops for the current leaf (set per-leaf via slicing).
     overlay_pos: usize,
+    /// Exclusive end of this cursor's overlay window. Ops at or beyond this
+    /// are outside the cursor's key range and never consumed.
+    overlay_end: usize,
     /// Exclusive end position in overlay_ops for the current leaf.
     /// Ops beyond this belong to a later leaf and must not be consumed.
     leaf_overlay_end: usize,
@@ -60,6 +64,11 @@ pub struct BinaryCursor {
     to_t: i64,
     /// Optional fuel tracker. When set, charges one index touch per leaflet returned.
     tracker: Option<Tracker>,
+    /// Key-range bounds for range cursors (`None` for full scans). Used to
+    /// seek to the first in-range leaflet of each leaf and to early-break
+    /// once past the range, instead of walking every directory entry.
+    range_min: Option<RunRecordV2>,
+    range_max: Option<RunRecordV2>,
 }
 
 /// State for a leaf that's been opened via `LeafHandle`.
@@ -95,10 +104,13 @@ impl BinaryCursor {
             exhausted: false,
             overlay_ops: Arc::from([]),
             overlay_pos: 0,
+            overlay_end: 0,
             leaf_overlay_end: 0,
             epoch: 0,
             to_t: i64::MAX,
             tracker: None,
+            range_min: Some(*min_key),
+            range_max: Some(*max_key),
         }
     }
 
@@ -124,10 +136,13 @@ impl BinaryCursor {
             exhausted: false,
             overlay_ops: Arc::from([]),
             overlay_pos: 0,
+            overlay_end: 0,
             leaf_overlay_end: 0,
             epoch: 0,
             to_t: i64::MAX,
             tracker: None,
+            range_min: None,
+            range_max: None,
         }
     }
 
@@ -156,6 +171,18 @@ impl BinaryCursor {
     /// translated overlay is attached to many cursors (e.g. per-row join
     /// probes) to avoid cloning the ops per cursor.
     pub fn set_overlay_ops_shared(&mut self, ops: Arc<[OverlayOp]>) {
+        let len = ops.len();
+        self.set_overlay_ops_window(ops, 0, len);
+    }
+
+    /// Set overlay ops from a shared slice, consuming only `[start, end)`.
+    ///
+    /// Same contract as [`Self::set_overlay_ops`]. Use with
+    /// [`overlay_window_for_range`](crate::read::types::overlay_window_for_range)
+    /// so a range-bounded cursor carries only the ops that can intersect its
+    /// key range: ops outside the window cost an O(overlay) merge walk per
+    /// cursor and defeat leaflet pre-skips.
+    pub fn set_overlay_ops_window(&mut self, ops: Arc<[OverlayOp]>, start: usize, end: usize) {
         debug_assert!(
             ops.windows(2).all(|w| w[0].fact_key() != w[1].fact_key()),
             "overlay ops contain duplicate fact keys — caller must resolve \
@@ -181,10 +208,11 @@ impl BinaryCursor {
              in the cursor projection; got {:?}",
             self.projection
         );
-        let len = ops.len();
+        debug_assert!(start <= end && end <= ops.len());
         self.overlay_ops = ops;
-        self.overlay_pos = 0;
-        self.leaf_overlay_end = len; // default: all ops visible (refined per-leaf)
+        self.overlay_pos = start;
+        self.overlay_end = end;
+        self.leaf_overlay_end = end; // default: all window ops visible (refined per-leaf)
     }
 
     /// Set the overlay epoch for cache key differentiation.
@@ -241,13 +269,13 @@ impl BinaryCursor {
 
     /// Whether any overlay ops remain globally (for overlay-only path).
     fn has_any_overlay(&self) -> bool {
-        self.overlay_pos < self.overlay_ops.len()
+        self.overlay_pos < self.overlay_end
     }
 
     /// Slice overlay ops for the leaf at `leaf_idx` using branch manifest keys.
     /// Sets `overlay_pos` and `leaf_overlay_end` for this leaf.
     fn slice_overlay_for_leaf(&mut self, leaf_idx: usize) {
-        let ops = &self.overlay_ops[self.overlay_pos..];
+        let ops = &self.overlay_ops[self.overlay_pos..self.overlay_end];
         if ops.is_empty() {
             self.leaf_overlay_end = self.overlay_pos;
             return;
@@ -287,7 +315,35 @@ impl BinaryCursor {
 
                     // Pre-skip by directory metadata (only when no overlay —
                     // overlay merge may add rows to otherwise-skippable leaflets).
-                    let has_ov = self.has_overlay();
+                    // Overlay rules apply to this leaflet only when the next
+                    // unconsumed op sorts at or before its last key; later ops
+                    // are handled by later leaflets (or the overlay-only tail),
+                    // so the pure-base pre-skips below remain valid here.
+                    let has_ov = self.has_overlay() && {
+                        let leaflet_last_key: RunRecordV2 =
+                            read_ordered_key_v2(self.order, &entry.last_key);
+                        cmp_overlay_vs_record(
+                            &self.overlay_ops[self.overlay_pos],
+                            &leaflet_last_key,
+                            self.order,
+                        ) != std::cmp::Ordering::Greater
+                    };
+                    // Range early-break: leaflets are key-ordered, so once a
+                    // leaflet starts past `range_max` no later leaflet in this
+                    // leaf can match. Only valid when no overlay op is pending
+                    // for this leaflet (those must drain through the merge or
+                    // the overlay-only tail) and no time-travel replay could
+                    // resurrect rows outside the current key bounds.
+                    if !has_ov && !self.need_replay() {
+                        if let Some(max_key) = &self.range_max {
+                            let first = read_ordered_key_v2(self.order, &entry.first_key);
+                            if cmp_v2_for_order(self.order)(&first, max_key)
+                                == std::cmp::Ordering::Greater
+                            {
+                                break;
+                            }
+                        }
+                    }
                     if !has_ov && self.filter.skip_leaflet(entry.p_const, entry.o_type_const) {
                         continue;
                     }
@@ -423,8 +479,8 @@ impl BinaryCursor {
             // Open the next leaf.
             if self.current_leaf_idx >= self.leaf_range.end {
                 // All indexed leaves exhausted. Try overlay-only path.
-                // Reset leaf_overlay_end to cover all remaining ops.
-                self.leaf_overlay_end = self.overlay_ops.len();
+                // Reset leaf_overlay_end to cover all remaining window ops.
+                self.leaf_overlay_end = self.overlay_end;
                 if self.has_any_overlay() {
                     let batch = self.emit_overlay_only();
                     self.exhausted = true;
@@ -442,7 +498,7 @@ impl BinaryCursor {
             self.current_leaf_idx += 1;
 
             // Slice overlay ops for this leaf (binary search on branch keys).
-            if !self.overlay_ops.is_empty() {
+            if self.has_any_overlay() {
                 self.slice_overlay_for_leaf(leaf_idx);
             }
 
@@ -450,8 +506,25 @@ impl BinaryCursor {
             let handle =
                 self.store
                     .open_leaf_handle(&leaf_cid, sidecar_cid.as_ref(), self.need_replay())?;
+
+            // Range seek: skip directory entries wholly before `range_min`
+            // instead of walking them one by one. Safe only when no replay
+            // could resurrect rows outside current key bounds and no pending
+            // overlay op sorts into the skipped span (window ops are >=
+            // range_min, and skipped leaflets end below it).
+            let mut start_leaflet = 0;
+            if !self.need_replay() {
+                if let Some(min_key) = &self.range_min {
+                    let cmp = cmp_v2_for_order(self.order);
+                    start_leaflet = handle.dir().entries.partition_point(|e| {
+                        cmp(&read_ordered_key_v2(self.order, &e.last_key), min_key)
+                            == std::cmp::Ordering::Less
+                    });
+                }
+            }
+
             self.current_leaf = Some(OpenLeaf { handle });
-            self.current_leaflet_idx = 0;
+            self.current_leaflet_idx = start_leaflet;
         }
     }
 
