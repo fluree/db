@@ -289,8 +289,10 @@ impl<'a, 'g> GraphQueryBuilder<'a, 'g> {
                         input,
                         format_config,
                         tracking,
-                        provider.as_ref(),
-                        table_provider.as_ref(),
+                        crate::R2rmlProviders {
+                            provider: provider.as_ref(),
+                            table_provider: table_provider.as_ref(),
+                        },
                         execution,
                     )
                     .await
@@ -504,8 +506,10 @@ impl<'a: 'v, 'v> GraphSnapshotQueryBuilder<'a, 'v> {
                         input,
                         format_config,
                         tracking,
-                        provider.as_ref(),
-                        table_provider.as_ref(),
+                        crate::R2rmlProviders {
+                            provider: provider.as_ref(),
+                            table_provider: table_provider.as_ref(),
+                        },
                         execution,
                     )
                     .await

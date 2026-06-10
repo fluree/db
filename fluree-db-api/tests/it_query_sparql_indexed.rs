@@ -8239,7 +8239,7 @@ async fn indexed_overlay_count_no_cache_projection_invariant() {
 /// read base leaflets directly and previously skipped overlay flakes,
 /// silently undercounting aggregates (SUM 60 instead of 67).
 #[tokio::test]
-async fn indexed_inline_type_star_aggregate_with_overlay_multivalue_and_facet() {
+async fn indexed_inline_type_star_aggregate_overlay_undercount_regression() {
     assert_index_defaults();
     let fluree = FlureeBuilder::memory()
         .with_ledger_cache_config(LedgerManagerConfig::default())

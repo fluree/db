@@ -1085,8 +1085,9 @@ fn build_sequential_join_block(
 
     // Base required vars from the post-WHERE pipeline (SELECT, ORDER BY, etc.).
     // Computed once; filter/bind vars are added per-step using only remaining items.
-    let base_vars: Option<HashSet<VarId>> =
-        ctx.required_where_vars.map(|rwv| rwv.iter().copied().collect());
+    let base_vars: Option<HashSet<VarId>> = ctx
+        .required_where_vars
+        .map(|rwv| rwv.iter().copied().collect());
 
     // Tracks the running driving-chain cardinality across steps for the hash-join
     // cost model; `before_step` snapshots it against the live `bound` set per pattern.
@@ -1168,7 +1169,8 @@ fn build_sequential_join_block(
             );
             pending_binds = new_binds;
             pending_filters = new_filters;
-            operator = if ctx.distinct_query && pruned_vars.as_ref().is_some_and(|s| !s.is_empty()) {
+            operator = if ctx.distinct_query && pruned_vars.as_ref().is_some_and(|s| !s.is_empty())
+            {
                 Some(Box::new(DistinctOperator::new(child)))
             } else {
                 Some(child)
@@ -2242,7 +2244,8 @@ pub fn build_triple_operators(
 
     if existing.is_none() && object_bounds.is_empty() {
         if let Some(cyclic_plan) = analyze_cyclic_bgp(&triples_for_exec, ctx.stats) {
-            let fallback = build_sequential_triple_chain(None, &triples_for_exec, object_bounds, ctx)?;
+            let fallback =
+                build_sequential_triple_chain(None, &triples_for_exec, object_bounds, ctx)?;
             return Ok(Box::new(CyclicBgpOperator::new(
                 cyclic_plan,
                 ctx.required_where_vars,

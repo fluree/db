@@ -235,8 +235,10 @@ impl Fluree {
                 &vars,
                 &executable,
                 &tracker,
-                r2rml_provider,
-                r2rml_table_provider,
+                crate::R2rmlProviders {
+                    provider: r2rml_provider,
+                    table_provider: r2rml_table_provider,
+                },
                 &options,
             )
             .await?;
@@ -376,8 +378,7 @@ impl Fluree {
         q: impl Into<QueryInput<'_>>,
         format_config: Option<crate::format::FormatterConfig>,
         tracking_override: Option<TrackingOptions>,
-        r2rml_provider: &dyn R2rmlProvider,
-        r2rml_table_provider: &dyn R2rmlTableProvider,
+        r2rml: crate::R2rmlProviders<'_>,
         options: QueryExecutionOptions,
     ) -> std::result::Result<crate::query::TrackedQueryResponse, crate::query::TrackedErrorResponse>
     {
@@ -435,8 +436,7 @@ impl Fluree {
                 &vars,
                 &executable,
                 &tracker,
-                r2rml_provider,
-                r2rml_table_provider,
+                r2rml,
                 &options,
             )
             .await
@@ -577,7 +577,15 @@ impl Fluree {
     ) -> Result<Vec<crate::Batch>> {
         let noop = crate::NoOpR2rmlProvider::new();
         self.execute_dataset_internal_with_r2rml(
-            dataset, vars, executable, tracker, &noop, &noop, options,
+            dataset,
+            vars,
+            executable,
+            tracker,
+            crate::R2rmlProviders {
+                provider: &noop,
+                table_provider: &noop,
+            },
+            options,
         )
         .await
     }
@@ -586,14 +594,13 @@ impl Fluree {
     ///
     /// Used by callers that need R2RML/Iceberg graph source support
     /// (e.g., server query handlers with iceberg support).
-    pub(crate) async fn execute_dataset_internal_with_r2rml<'b>(
+    pub(crate) async fn execute_dataset_internal_with_r2rml(
         &self,
         dataset: &DataSetDb,
         vars: &crate::VarRegistry,
         executable: &ExecutableQuery,
         tracker: &Tracker,
-        r2rml_provider: &'b dyn fluree_db_query::r2rml::R2rmlProvider,
-        r2rml_table_provider: &'b dyn fluree_db_query::r2rml::R2rmlTableProvider,
+        r2rml: crate::R2rmlProviders<'_>,
         options: &QueryExecutionOptions,
     ) -> Result<Vec<crate::Batch>> {
         let primary = dataset
@@ -681,7 +688,7 @@ impl Fluree {
             cancellation: options.cancellation.clone(),
             dataset: Some(&runtime_dataset),
             policy_enforcer: primary.policy_enforcer().cloned(),
-            r2rml: Some((r2rml_provider, r2rml_table_provider)),
+            r2rml: Some((r2rml.provider, r2rml.table_provider)),
             binary_g_id: primary.graph_id,
             binary_store,
             dict_novelty,
@@ -713,7 +720,15 @@ impl Fluree {
     ) -> std::result::Result<Vec<crate::Batch>, fluree_db_query::QueryError> {
         let noop = crate::NoOpR2rmlProvider::new();
         self.execute_dataset_tracked_with_r2rml(
-            dataset, vars, executable, tracker, &noop, &noop, options,
+            dataset,
+            vars,
+            executable,
+            tracker,
+            crate::R2rmlProviders {
+                provider: &noop,
+                table_provider: &noop,
+            },
+            options,
         )
         .await
     }
@@ -724,8 +739,7 @@ impl Fluree {
         vars: &crate::VarRegistry,
         executable: &ExecutableQuery,
         tracker: &Tracker,
-        r2rml_provider: &dyn R2rmlProvider,
-        r2rml_table_provider: &dyn R2rmlTableProvider,
+        r2rml: crate::R2rmlProviders<'_>,
         options: &QueryExecutionOptions,
     ) -> std::result::Result<Vec<crate::Batch>, fluree_db_query::QueryError> {
         let primary = dataset.primary().ok_or_else(|| {
@@ -802,7 +816,7 @@ impl Fluree {
             cancellation: options.cancellation.clone(),
             dataset: Some(&runtime_dataset),
             policy_enforcer: primary.policy_enforcer().cloned(),
-            r2rml: Some((r2rml_provider, r2rml_table_provider)),
+            r2rml: Some((r2rml.provider, r2rml.table_provider)),
             binary_g_id: primary.graph_id,
             binary_store,
             dict_novelty,

@@ -257,6 +257,15 @@ pub use fluree_db_policy::{
 // Re-export tracking types for query/transaction metrics
 pub use fluree_db_core::{FuelExceededError, PolicyStats, Tracker, TrackingOptions, TrackingTally};
 
+/// Bundles the two R2RML provider references that always travel together.
+///
+/// Reduces function-arity on the eight `*_with_r2rml*` helpers that would
+/// otherwise exceed the clippy `too_many_arguments` threshold.
+pub(crate) struct R2rmlProviders<'a> {
+    pub(crate) provider: &'a dyn fluree_db_query::r2rml::R2rmlProvider,
+    pub(crate) table_provider: &'a dyn fluree_db_query::r2rml::R2rmlTableProvider,
+}
+
 use async_trait::async_trait;
 use fluree_db_core::{ContentStore, StorageBackend};
 #[cfg(feature = "native")]

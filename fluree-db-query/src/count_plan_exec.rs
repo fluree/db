@@ -1606,6 +1606,7 @@ fn sum_optional_join_overlay_parallel(
 /// decompression of the outer *and* every inner predicate across partitions (the
 /// inner keyset build is the dominant cost for a multi-predicate inner). BASE index
 /// only (no overlay), no exclude/include (the caller gates that).
+#[allow(clippy::too_many_arguments)]
 fn merge_modifier_intersect_range(
     store: &BinaryIndexStore,
     g_id: fluree_db_core::GraphId,

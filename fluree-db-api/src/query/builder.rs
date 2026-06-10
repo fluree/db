@@ -435,8 +435,10 @@ impl<'a> ViewQueryBuilder<'a> {
                         input,
                         format_config,
                         tracking,
-                        provider.as_ref(),
-                        table_provider.as_ref(),
+                        crate::R2rmlProviders {
+                            provider: provider.as_ref(),
+                            table_provider: table_provider.as_ref(),
+                        },
                         execution,
                     )
                     .await
@@ -726,8 +728,10 @@ impl<'a> DatasetQueryBuilder<'a> {
                         input,
                         format_config,
                         tracking,
-                        provider.as_ref(),
-                        table_provider.as_ref(),
+                        crate::R2rmlProviders {
+                            provider: provider.as_ref(),
+                            table_provider: table_provider.as_ref(),
+                        },
                         execution,
                     )
                     .await
@@ -1331,8 +1335,10 @@ impl<'a> FromQueryBuilder<'a> {
                                 policy,
                                 format_config,
                                 tracking,
-                                provider.as_ref(),
-                                table_provider.as_ref(),
+                                crate::R2rmlProviders {
+                                    provider: provider.as_ref(),
+                                    table_provider: table_provider.as_ref(),
+                                },
                                 execution,
                             )
                             .await
@@ -1383,8 +1389,10 @@ impl<'a> FromQueryBuilder<'a> {
                                 policy,
                                 format_config,
                                 tracking,
-                                provider.as_ref(),
-                                table_provider.as_ref(),
+                                crate::R2rmlProviders {
+                                    provider: provider.as_ref(),
+                                    table_provider: table_provider.as_ref(),
+                                },
                                 execution,
                             )
                             .await

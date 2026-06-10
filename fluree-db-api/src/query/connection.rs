@@ -463,8 +463,10 @@ impl Fluree {
                     query_json,
                     format_config,
                     tracking_override,
-                    r2rml_provider,
-                    r2rml_table_provider,
+                    crate::R2rmlProviders {
+                        provider: r2rml_provider,
+                        table_provider: r2rml_table_provider,
+                    },
                     options,
                 )
                 .await;
@@ -479,8 +481,10 @@ impl Fluree {
             query_json,
             format_config,
             tracking_override,
-            r2rml_provider,
-            r2rml_table_provider,
+            crate::R2rmlProviders {
+                provider: r2rml_provider,
+                table_provider: r2rml_table_provider,
+            },
             options,
         )
         .await
@@ -492,8 +496,7 @@ impl Fluree {
         policy: &PolicyContext,
         format_config: Option<FormatterConfig>,
         tracking_override: Option<TrackingOptions>,
-        r2rml_provider: &dyn R2rmlProvider,
-        r2rml_table_provider: &dyn R2rmlTableProvider,
+        r2rml: crate::R2rmlProviders<'_>,
         options: QueryExecutionOptions,
     ) -> std::result::Result<crate::query::TrackedQueryResponse, crate::query::TrackedErrorResponse>
     {
@@ -528,8 +531,7 @@ impl Fluree {
                     query_json,
                     format_config,
                     tracking_override,
-                    r2rml_provider,
-                    r2rml_table_provider,
+                    r2rml,
                     options,
                 )
                 .await;
@@ -545,8 +547,7 @@ impl Fluree {
             query_json,
             format_config,
             tracking_override,
-            r2rml_provider,
-            r2rml_table_provider,
+            r2rml,
             options,
         )
         .await
@@ -906,8 +907,10 @@ impl Fluree {
             sparql,
             format_config,
             tracking_override,
-            r2rml_provider,
-            r2rml_table_provider,
+            crate::R2rmlProviders {
+                provider: r2rml_provider,
+                table_provider: r2rml_table_provider,
+            },
             options,
         )
         .await
@@ -1011,8 +1014,7 @@ impl Fluree {
         policy: &PolicyContext,
         format_config: Option<FormatterConfig>,
         tracking_override: Option<TrackingOptions>,
-        r2rml_provider: &dyn R2rmlProvider,
-        r2rml_table_provider: &dyn R2rmlTableProvider,
+        r2rml: crate::R2rmlProviders<'_>,
         options: QueryExecutionOptions,
     ) -> std::result::Result<crate::query::TrackedQueryResponse, crate::query::TrackedErrorResponse>
     {
@@ -1047,8 +1049,7 @@ impl Fluree {
             sparql,
             format_config,
             tracking_override,
-            r2rml_provider,
-            r2rml_table_provider,
+            r2rml,
             options,
         )
         .await
