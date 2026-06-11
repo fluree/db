@@ -56,6 +56,9 @@ impl<'a> CancelTicker<'a> {
 
     #[inline]
     pub(crate) fn check(&mut self) -> Result<()> {
+        if cfg!(feature = "cancel-checks-off") {
+            return Ok(());
+        }
         self.tick = self.tick.wrapping_add(1);
         if self.tick & Self::STRIDE_MASK != 0 {
             return Ok(());
