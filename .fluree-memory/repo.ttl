@@ -1108,6 +1108,24 @@ mem:fact-01kp4g1wa8yyty4sd2p03k6bg9 a mem:Fact ;
     mem:artifactRef "fluree-graph-json-ld/src/expand.rs" ;
     mem:createdAt "2026-04-13T22:40:33.608461+00:00"^^xsd:dateTime .
 
+mem:fact-01ktwg9z9hkvq603ape6c4wbah a mem:Fact ;
+    mem:content "Perf guardrails (audit Phase 0.0) implemented on branch bench/phase0-baseline-guardrails: bench-baseline bin (capture/compare against regression-budget.json, exit 1 on breach, --only for PR-scoped subsets), fluree-bench-alloc tracking allocator (separate crate so bench-support keeps forbid(unsafe_code)), mem sidecars merged into baselines, and query_overlay_matrix bench (count/star/groupby × base/overlay/novelty conditions). First overlay-lane measurements (tiny, 100 products, quick profile): base→overlay penalties are count 31µs→273µs (~9×), star 63µs→911µs (~14×), groupby 154µs→19.8ms (~128×) — large improvement headroom for the Phase 1 overlay-merge refactor. Novelty condition skipped at large scale by design." ;
+    mem:tag "audit" ;
+    mem:tag "baseline" ;
+    mem:tag "benchmarking" ;
+    mem:tag "guardrails" ;
+    mem:tag "overlay" ;
+    mem:tag "query-perf" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "BENCHMARKING.md" ;
+    mem:artifactRef "fluree-bench-alloc/src/lib.rs" ;
+    mem:artifactRef "fluree-bench-support/src/baseline.rs" ;
+    mem:artifactRef "fluree-bench-support/src/bin/bench_baseline.rs" ;
+    mem:artifactRef "fluree-db-api/benches/query_overlay_matrix.rs" ;
+    mem:branch "bench/phase0-baseline-guardrails" ;
+    mem:createdAt "2026-06-11T23:29:32.465491+00:00"^^xsd:dateTime ;
+    mem:rationale "Phase gates for all audit roadmap phases run through this tooling; the overlay-penalty numbers are the pre-refactor reference for judging Phase 1 outcomes." .
+
 mem:decision-01kkymgaynzn5mrgy21pw22tf6 a mem:Decision ;
     mem:content "CLI write command naming: \"transact\" is the umbrella (API builder, HTTP endpoint), while specific operations are \"insert\", \"upsert\", and \"update\". The CLI command is `fluree update` (not `transact`) matching the API's `.transact().update()` pattern. Code: Commands::Update, commands::update::run(), UpdateFormat enum. Remote: update_jsonld()/update_sparql() both route to HTTP /transact. Internal types use \"transact\" for the generic write concept (TransactCore, GraphTransactBuilder, fluree-db-transact crate)." ;
     mem:tag "api-alignment" ;
