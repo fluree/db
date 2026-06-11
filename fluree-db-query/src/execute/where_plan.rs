@@ -26,7 +26,7 @@ use crate::minus::MinusOperator;
 use crate::operator::inline::InlineOperator;
 use crate::operator::BoxedOperator;
 use crate::optional::{GroupedPatternOptionalBuilder, OptionalOperator, PlanTreeOptionalBuilder};
-use crate::planner::{analyze_property_join, reorder_patterns};
+use crate::planner::{analyze_property_join, is_property_join, reorder_patterns};
 use crate::property_join::PropertyJoinOperator;
 use crate::property_path::{PropertyPathOperator, DEFAULT_MAX_VISITED};
 use crate::seed::EmptyOperator;
@@ -1043,12 +1043,27 @@ fn inline_chain(
     (remaining_binds, remaining_filters)
 }
 
+/// Query-level planning metadata shared across triple-building functions.
+///
+/// Groups the parameters derived from the outer WHERE-planning pass that remain
+/// constant across all triple blocks and inner calls. Constructing this once at
+/// each logical call site and borrowing it is cheaper than threading seven
+/// individual references through every helper.
+pub(crate) struct TriplePlanContext<'a> {
+    required_where_vars: Option<&'a [VarId]>,
+    var_counts: &'a HashMap<VarId, usize>,
+    protected_vars: &'a HashSet<VarId>,
+    group_by: &'a [VarId],
+    distinct_query: bool,
+    planning: &'a PlanningContext,
+    stats: Option<&'a StatsView>,
+}
+
 /// Build an operator tree for a sequential scan/join block of triples.
 ///
 /// Applies VALUES first (if any), then iterates triples building scan/join
 /// operators, inlining eligible filters and binds into each step and applying
 /// deferred BINDs/FILTERs as their dependencies become bound.
-#[allow(clippy::too_many_arguments)]
 fn build_sequential_join_block(
     operator: Option<BoxedOperator>,
     triples: &[TriplePattern],
@@ -1056,13 +1071,7 @@ fn build_sequential_join_block(
     pending_binds: Vec<BindPattern>,
     pending_filters: Vec<FilterPattern>,
     pushdown: &FilterPushdown,
-    required_where_vars: Option<&[VarId]>,
-    var_counts: &HashMap<VarId, usize>,
-    protected_vars: &HashSet<VarId>,
-    group_by: &[VarId],
-    distinct_query: bool,
-    planning: &PlanningContext,
-    stats: Option<&StatsView>,
+    ctx: &TriplePlanContext<'_>,
 ) -> Result<Option<BoxedOperator>> {
     let mut operator = operator;
 
@@ -1076,12 +1085,13 @@ fn build_sequential_join_block(
 
     // Base required vars from the post-WHERE pipeline (SELECT, ORDER BY, etc.).
     // Computed once; filter/bind vars are added per-step using only remaining items.
-    let base_vars: Option<HashSet<VarId>> =
-        required_where_vars.map(|rwv| rwv.iter().copied().collect());
+    let base_vars: Option<HashSet<VarId>> = ctx
+        .required_where_vars
+        .map(|rwv| rwv.iter().copied().collect());
 
     // Tracks the running driving-chain cardinality across steps for the hash-join
     // cost model; `before_step` snapshots it against the live `bound` set per pattern.
-    let mut hash_planner = HashJoinPlanner::new(stats);
+    let mut hash_planner = HashJoinPlanner::new(ctx.stats);
     for (k, tp) in triples.iter().enumerate() {
         hash_planner.before_step(tp, &bound);
         let mut vars_after: HashSet<VarId> = bound.clone();
@@ -1120,7 +1130,7 @@ fn build_sequential_join_block(
             live.into_iter().collect::<Vec<VarId>>()
         });
 
-        let pruned_vars: Option<HashSet<VarId>> = if distinct_query {
+        let pruned_vars: Option<HashSet<VarId>> = if ctx.distinct_query {
             live_vars.as_ref().map(|live| {
                 let live_set: HashSet<VarId> = live.iter().copied().collect();
                 vars_after
@@ -1133,7 +1143,7 @@ fn build_sequential_join_block(
             None
         };
 
-        let emit = emit_mask_for_triple(tp, var_counts, protected_vars);
+        let emit = emit_mask_for_triple(tp, ctx.var_counts, ctx.protected_vars);
         let op = build_scan_or_join(
             operator,
             tp,
@@ -1141,8 +1151,8 @@ fn build_sequential_join_block(
             inline_ops,
             live_vars.as_deref(),
             emit,
-            group_by,
-            planning,
+            ctx.group_by,
+            ctx.planning,
             &hash_planner,
         );
         bound.extend(op.schema().iter().copied());
@@ -1155,11 +1165,12 @@ fn build_sequential_join_block(
                 pending_binds,
                 pending_filters,
                 &pushdown.consumed_indices,
-                planning,
+                ctx.planning,
             );
             pending_binds = new_binds;
             pending_filters = new_filters;
-            operator = if distinct_query && pruned_vars.as_ref().is_some_and(|s| !s.is_empty()) {
+            operator = if ctx.distinct_query && pruned_vars.as_ref().is_some_and(|s| !s.is_empty())
+            {
                 Some(Box::new(DistinctOperator::new(child)))
             } else {
                 Some(child)
@@ -1174,7 +1185,7 @@ fn build_sequential_join_block(
             pending_binds,
             pending_filters,
             &pushdown.consumed_indices,
-            planning,
+            ctx.planning,
         ));
     }
 
@@ -1444,47 +1455,26 @@ pub fn build_where_operators_seeded_with_needed(
                 // Hot path: triples only (no BIND/FILTER).
                 // Skip dependency bookkeeping entirely.
                 if block.binds.is_empty() && block.filters.is_empty() {
-                    let mut augmented_rwv = augmented_at(end);
+                    let augmented_rwv = augmented_at(end);
+                    let augmented_ref = augmented_rwv.as_deref();
 
-                    // A VALUES that shares no vars with the block is a parameter
-                    // injection: defer it above the block (a pure cross product
-                    // either way, and seeding would re-open the scans per VALUES
-                    // row). A VALUES that overlaps the block constrains it — seed
-                    // it under the chain so its bindings drive the scans, except
-                    // when the block will take the anchored property-join path
-                    // (same gate as `build_triple_operators`), which keeps
-                    // overlap vars alive itself and prefers VALUES layered above.
-                    let star_analysis = analyze_property_join(&block.triples);
-                    let block_vars: HashSet<VarId> = block
-                        .triples
-                        .iter()
-                        .flat_map(crate::ir::triple::TriplePattern::referenced_vars)
-                        .collect();
-                    let values_overlap_block = block
-                        .values
-                        .iter()
-                        .any(|vp| vp.vars.iter().any(|v| block_vars.contains(v)));
+                    // Preserve property-join eligibility when a top-level VALUES precedes
+                    // a pure star block. Wrapping VALUES first seeds the schema/operator and
+                    // prevents `build_triple_operators()` from taking the property-join path.
                     let values_after_triples = operator.is_none()
                         && !block.values.is_empty()
                         && block.triples.len() >= 2
-                        && (!values_overlap_block
-                            || (star_analysis.eligible() && star_analysis.has_bound_objects));
+                        && is_property_join(&block.triples);
 
-                    // A deferred VALUES joins against the block's output above it, so
-                    // its vars must survive the block's liveness trimming.
-                    if values_after_triples {
-                        if let Some(rwv) = augmented_rwv.as_mut() {
-                            for vp in &block.values {
-                                for v in &vp.vars {
-                                    if !rwv.contains(v) {
-                                        rwv.push(*v);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    let augmented_ref = augmented_rwv.as_deref();
-
+                    let ctx = TriplePlanContext {
+                        required_where_vars: augmented_ref,
+                        var_counts: &var_counts,
+                        protected_vars: &protected_vars,
+                        group_by,
+                        distinct_query,
+                        planning,
+                        stats: stats.as_deref(),
+                    };
                     let mut built = build_triple_operators(
                         if values_after_triples {
                             operator.take()
@@ -1493,13 +1483,7 @@ pub fn build_where_operators_seeded_with_needed(
                         },
                         &block.triples,
                         &HashMap::new(),
-                        augmented_ref,
-                        &var_counts,
-                        &protected_vars,
-                        group_by,
-                        distinct_query,
-                        planning,
-                        stats.as_deref(),
+                        &ctx,
                     )?;
                     if values_after_triples {
                         built = apply_values(Some(built), block.values)
@@ -1662,6 +1646,15 @@ pub fn build_where_operators_seeded_with_needed(
                         planning,
                     )?;
                 } else {
+                    let ctx = TriplePlanContext {
+                        required_where_vars: augmented_ref,
+                        var_counts: &var_counts,
+                        protected_vars: &protected_vars,
+                        group_by,
+                        distinct_query,
+                        planning,
+                        stats: stats.as_deref(),
+                    };
                     operator = build_sequential_join_block(
                         operator,
                         &triples_for_exec,
@@ -1669,13 +1662,7 @@ pub fn build_where_operators_seeded_with_needed(
                         pending_binds,
                         pending_filters,
                         &pushdown,
-                        augmented_ref,
-                        &var_counts,
-                        &protected_vars,
-                        group_by,
-                        distinct_query,
-                        planning,
-                        stats.as_deref(),
+                        &ctx,
                     )?;
                 }
             }
@@ -2137,26 +2124,20 @@ fn scan_index_hint_for_triple(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn build_sequential_triple_chain(
     existing: Option<BoxedOperator>,
     triples: &[TriplePattern],
     object_bounds: &HashMap<VarId, ObjectBounds>,
-    required_where_vars: Option<&[VarId]>,
-    var_counts: &HashMap<VarId, usize>,
-    protected_vars: &HashSet<VarId>,
-    group_by: &[VarId],
-    distinct_query: bool,
-    planning: &PlanningContext,
-    stats: Option<&StatsView>,
+    ctx: &TriplePlanContext<'_>,
 ) -> Result<BoxedOperator> {
     let mut operator = existing;
-    let rwv_set: Option<HashSet<VarId>> = required_where_vars.map(|v| v.iter().copied().collect());
+    let rwv_set: Option<HashSet<VarId>> =
+        ctx.required_where_vars.map(|v| v.iter().copied().collect());
 
     // Drives the hash-join cost model; snapshots cardinality against `seen_vars`
     // (the chain bound so far) before each pattern — see build_sequential_join_block.
     let mut seen_vars: HashSet<VarId> = HashSet::new();
-    let mut hash_planner = HashJoinPlanner::new(stats);
+    let mut hash_planner = HashJoinPlanner::new(ctx.stats);
     for (k, pattern) in triples.iter().enumerate() {
         hash_planner.before_step(pattern, &seen_vars);
         seen_vars.extend(pattern.produced_vars());
@@ -2169,7 +2150,7 @@ fn build_sequential_triple_chain(
             base.union(&suffix_vars).copied().collect::<Vec<VarId>>()
         });
 
-        let emit = emit_mask_for_triple(pattern, var_counts, protected_vars);
+        let emit = emit_mask_for_triple(pattern, ctx.var_counts, ctx.protected_vars);
         operator = Some(build_scan_or_join(
             operator,
             pattern,
@@ -2177,14 +2158,14 @@ fn build_sequential_triple_chain(
             Vec::new(),
             live_vars.as_deref(),
             emit,
-            group_by,
-            planning,
+            ctx.group_by,
+            ctx.planning,
             &hash_planner,
         ));
 
         // DISTINCT query optimization: if any variables seen so far are no longer live,
         // collapse duplicates early to avoid downstream join blowups.
-        if distinct_query {
+        if ctx.distinct_query {
             if let Some(live) = live_vars.as_ref() {
                 let live_set: HashSet<VarId> = live.iter().copied().collect();
                 let dead = seen_vars
@@ -2209,18 +2190,11 @@ fn build_sequential_triple_chain(
 /// Uses property join optimization when applicable.
 /// When `object_bounds` is provided, range constraints are pushed down to the scan operator
 /// for the first pattern, enabling index-level filtering.
-#[allow(clippy::too_many_arguments)]
 pub fn build_triple_operators(
     existing: Option<BoxedOperator>,
     triples: &[TriplePattern],
     object_bounds: &HashMap<VarId, ObjectBounds>,
-    required_where_vars: Option<&[VarId]>,
-    var_counts: &HashMap<VarId, usize>,
-    protected_vars: &HashSet<VarId>,
-    group_by: &[VarId],
-    distinct_query: bool,
-    planning: &PlanningContext,
-    stats: Option<&StatsView>,
+    ctx: &TriplePlanContext<'_>,
 ) -> Result<BoxedOperator> {
     if triples.is_empty() {
         return existing
@@ -2250,11 +2224,11 @@ pub fn build_triple_operators(
         // otherwise protected), treat that predicate as existence-only (semijoin) to avoid
         // cartesian-product blowups.
         let mut needed: HashSet<VarId> = HashSet::new();
-        if let Some(rwv) = required_where_vars {
+        if let Some(rwv) = ctx.required_where_vars {
             needed.extend(rwv.iter().copied());
         }
-        for (v, c) in var_counts {
-            if *c > 1 || protected_vars.contains(v) {
+        for (v, c) in ctx.var_counts {
+            if *c > 1 || ctx.protected_vars.contains(v) {
                 needed.insert(*v);
             }
         }
@@ -2263,46 +2237,25 @@ pub fn build_triple_operators(
             &triples_for_exec,
             object_bounds.clone(),
             Some(&needed),
-            planning.mode(),
+            ctx.planning.mode(),
         )?;
         return Ok(Box::new(pj));
     }
 
     if existing.is_none() && object_bounds.is_empty() {
-        if let Some(cyclic_plan) = analyze_cyclic_bgp(&triples_for_exec, stats) {
-            let fallback = build_sequential_triple_chain(
-                None,
-                &triples_for_exec,
-                object_bounds,
-                required_where_vars,
-                var_counts,
-                protected_vars,
-                group_by,
-                distinct_query,
-                planning,
-                stats,
-            )?;
+        if let Some(cyclic_plan) = analyze_cyclic_bgp(&triples_for_exec, ctx.stats) {
+            let fallback =
+                build_sequential_triple_chain(None, &triples_for_exec, object_bounds, ctx)?;
             return Ok(Box::new(CyclicBgpOperator::new(
                 cyclic_plan,
-                required_where_vars,
-                planning.mode(),
+                ctx.required_where_vars,
+                ctx.planning.mode(),
                 fallback,
             )));
         }
     }
 
-    build_sequential_triple_chain(
-        existing,
-        &triples_for_exec,
-        object_bounds,
-        required_where_vars,
-        var_counts,
-        protected_vars,
-        group_by,
-        distinct_query,
-        planning,
-        stats,
-    )
+    build_sequential_triple_chain(existing, &triples_for_exec, object_bounds, ctx)
 }
 
 #[cfg(test)]
@@ -2355,18 +2308,16 @@ mod tests {
                 .collect::<Vec<_>>(),
             &needed,
         );
-        super::build_triple_operators(
-            existing,
-            triples,
-            object_bounds,
-            None,
-            &counts,
-            &protected,
-            &[],
-            false,
-            &crate::temporal_mode::PlanningContext::current(),
-            None,
-        )
+        let ctx = super::TriplePlanContext {
+            required_where_vars: None,
+            var_counts: &counts,
+            protected_vars: &protected,
+            group_by: &[],
+            distinct_query: false,
+            planning: &crate::temporal_mode::PlanningContext::current(),
+            stats: None,
+        };
+        super::build_triple_operators(existing, triples, object_bounds, &ctx)
     }
 
     fn make_pattern(s_var: VarId, p_name: &str, o_var: VarId) -> TriplePattern {

@@ -33,6 +33,7 @@ pub mod extract;
 pub mod jwks;
 pub mod mcp;
 pub mod peer;
+pub(crate) mod query_control;
 pub mod registry;
 pub mod routes;
 pub mod serde;

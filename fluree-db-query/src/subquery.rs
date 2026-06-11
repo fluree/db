@@ -566,6 +566,7 @@ impl SubqueryOperator {
         let mut results = Vec::new();
 
         while let Some(batch) = operator.next_batch(ctx).await? {
+            ctx.check_cancelled()?;
             for sub_row_idx in 0..batch.len() {
                 // Extract bindings for subquery SELECT variables (in order)
                 let row: Vec<Binding> = self
@@ -581,6 +582,7 @@ impl SubqueryOperator {
                     .collect();
                 results.push(row);
             }
+            ctx.check_cancelled()?;
         }
 
         operator.close();

@@ -8,7 +8,7 @@ use crate::query::helpers::{
 use crate::view::{DataSetDb, GraphDb, QueryInput};
 use crate::{
     ApiError, DatasetSpec, Fluree, FormatterConfig, PolicyContext, QueryConnectionOptions,
-    QueryResult, Result,
+    QueryExecutionOptions, QueryResult, Result,
 };
 use fluree_db_core::TrackingOptions;
 use fluree_db_query::r2rml::{R2rmlProvider, R2rmlTableProvider};
@@ -102,6 +102,15 @@ impl Fluree {
     /// 3. For multi-ledger: builds a `DataSetDb` for proper merge
     /// 4. Applies policy wrappers if policy options are present
     pub async fn query_connection(&self, query_json: &JsonValue) -> Result<QueryResult> {
+        self.query_connection_with_options(query_json, QueryExecutionOptions::default())
+            .await
+    }
+
+    pub async fn query_connection_with_options(
+        &self,
+        query_json: &JsonValue,
+        options: QueryExecutionOptions,
+    ) -> Result<QueryResult> {
         let (spec, qc_opts) = parse_dataset_spec(query_json)?;
 
         if spec.is_empty() {
@@ -114,13 +123,14 @@ impl Fluree {
             .prepare_single_view_for_connection(&spec, &qc_opts)
             .await?
         {
-            return self.query(&view, query_json).await;
+            return self.query_with_options(&view, query_json, options).await;
         }
 
         // Multi-ledger: use DataSetDb
         let dataset = self.build_dataset_for_connection(&spec, &qc_opts).await?;
 
-        self.query_dataset(&dataset, query_json).await
+        self.query_dataset_with_options(&dataset, query_json, options)
+            .await
     }
 
     /// Execute a JSON-LD connection query and, for the multi-ledger case,
@@ -133,11 +143,12 @@ impl Fluree {
     /// [`Self::query_connection_with_policy_and_r2rml`] in one place. Returns
     /// `None` for the single-ledger fast path (formatting is correct against
     /// the sole view) and `Some(dataset)` for genuine multi-ledger queries.
-    pub(crate) async fn query_connection_jsonld_returning_dataset(
+    pub(crate) async fn query_connection_jsonld_returning_dataset_with_options(
         &self,
         query_json: &JsonValue,
         policy: Option<&PolicyContext>,
         r2rml: Option<(&dyn R2rmlProvider, &dyn R2rmlTableProvider)>,
+        options: QueryExecutionOptions,
     ) -> Result<(QueryResult, Option<DataSetDb>)> {
         let (spec, qc_opts) = parse_dataset_spec(query_json)?;
 
@@ -161,10 +172,10 @@ impl Fluree {
         if let Some(view) = single {
             let result = match r2rml {
                 Some((rp, rtp)) => {
-                    self.query_view_with_r2rml(&view, query_json, rp, rtp)
+                    self.query_view_with_r2rml_options(&view, query_json, rp, rtp, options)
                         .await?
                 }
-                None => self.query(&view, query_json).await?,
+                None => self.query_with_options(&view, query_json, options).await?,
             };
             return Ok((result, None));
         }
@@ -177,10 +188,13 @@ impl Fluree {
         };
         let result = match r2rml {
             Some((rp, rtp)) => {
-                self.query_dataset_with_r2rml(&dataset, query_json, rp, rtp)
+                self.query_dataset_with_r2rml_options(&dataset, query_json, rp, rtp, options)
                     .await?
             }
-            None => self.query_dataset(&dataset, query_json).await?,
+            None => {
+                self.query_dataset_with_options(&dataset, query_json, options)
+                    .await?
+            }
         };
         Ok((result, Some(dataset)))
     }
@@ -190,11 +204,12 @@ impl Fluree {
     /// Uses graph source fallback for alias resolution: if a source in the
     /// dataset spec is not found as a ledger, it checks graph sources and
     /// creates a minimal genesis context tagged with the graph source ID.
-    pub(crate) async fn query_connection_jsonld_with_r2rml(
+    pub(crate) async fn query_connection_jsonld_with_r2rml_options(
         &self,
         query_json: &JsonValue,
         r2rml_provider: &dyn R2rmlProvider,
         r2rml_table_provider: &dyn R2rmlTableProvider,
+        options: QueryExecutionOptions,
     ) -> Result<QueryResult> {
         let (spec, qc_opts) = parse_dataset_spec(query_json)?;
 
@@ -209,7 +224,13 @@ impl Fluree {
             .await?
         {
             return self
-                .query_view_with_r2rml(&view, query_json, r2rml_provider, r2rml_table_provider)
+                .query_view_with_r2rml_options(
+                    &view,
+                    query_json,
+                    r2rml_provider,
+                    r2rml_table_provider,
+                    options,
+                )
                 .await;
         }
 
@@ -217,16 +238,22 @@ impl Fluree {
         // in dataset is deferred to the scan backend level)
         let dataset = self.build_dataset_for_connection(&spec, &qc_opts).await?;
 
-        self.query_dataset_with_r2rml(&dataset, query_json, r2rml_provider, r2rml_table_provider)
-            .await
+        self.query_dataset_with_r2rml_options(
+            &dataset,
+            query_json,
+            r2rml_provider,
+            r2rml_table_provider,
+            options,
+        )
+        .await
     }
 
-    /// Execute a SPARQL connection query with explicit R2RML providers.
-    pub(crate) async fn query_connection_sparql_with_r2rml(
+    pub(crate) async fn query_connection_sparql_with_r2rml_options(
         &self,
         sparql: &str,
         r2rml_provider: &dyn R2rmlProvider,
         r2rml_table_provider: &dyn R2rmlTableProvider,
+        options: QueryExecutionOptions,
     ) -> Result<QueryResult> {
         let ast = parse_and_validate_sparql(sparql)?;
         let spec = extract_sparql_dataset_spec(&ast)?;
@@ -238,18 +265,25 @@ impl Fluree {
         }
 
         let dataset = self.build_dataset_view(&spec).await?;
-        self.query_dataset_with_r2rml(&dataset, sparql, r2rml_provider, r2rml_table_provider)
-            .await
+        self.query_dataset_with_r2rml_options(
+            &dataset,
+            sparql,
+            r2rml_provider,
+            r2rml_table_provider,
+            options,
+        )
+        .await
     }
 
     /// Execute a connection query and return a tracked JSON-LD response.
     ///
     /// Uses GraphDb API for single-ledger, DataSetDb for multi-ledger.
-    pub(crate) async fn query_connection_jsonld_tracked(
+    pub(crate) async fn query_connection_jsonld_tracked_with_options(
         &self,
         query_json: &JsonValue,
         format_config: Option<FormatterConfig>,
         tracking_override: Option<TrackingOptions>,
+        options: QueryExecutionOptions,
     ) -> std::result::Result<crate::query::TrackedQueryResponse, crate::query::TrackedErrorResponse>
     {
         // Enforce the query floor up front: a sub-floor `max-fuel` fails here
@@ -278,7 +312,13 @@ impl Fluree {
             .await?
         {
             return self
-                .query_tracked(&view, query_json, format_config, tracking_override)
+                .query_tracked_with_options(
+                    &view,
+                    query_json,
+                    format_config,
+                    tracking_override,
+                    options,
+                )
                 .await;
         }
 
@@ -287,8 +327,14 @@ impl Fluree {
             .build_dataset_for_connection_tracked(&spec, &qc_opts)
             .await?;
 
-        self.query_dataset_tracked(&dataset, query_json, format_config, tracking_override)
-            .await
+        self.query_dataset_tracked_with_options(
+            &dataset,
+            query_json,
+            format_config,
+            tracking_override,
+            options,
+        )
+        .await
     }
 
     /// Compatibility alias: tracked connection query entrypoint.
@@ -297,17 +343,23 @@ impl Fluree {
         query_json: &JsonValue,
     ) -> std::result::Result<crate::query::TrackedQueryResponse, crate::query::TrackedErrorResponse>
     {
-        self.query_connection_jsonld_tracked(query_json, None, None)
-            .await
+        self.query_connection_jsonld_tracked_with_options(
+            query_json,
+            None,
+            None,
+            QueryExecutionOptions::default(),
+        )
+        .await
     }
 
     /// Execute a JSON-LD query via connection with explicit policy context.
     ///
     /// Uses GraphDb API for single-ledger, DataSetDb for multi-ledger.
-    pub(crate) async fn query_connection_with_policy(
+    pub(crate) async fn query_connection_with_policy_options(
         &self,
         query_json: &JsonValue,
         policy: &PolicyContext,
+        options: QueryExecutionOptions,
     ) -> Result<QueryResult> {
         let (spec, _qc_opts) = parse_dataset_spec(query_json)?;
 
@@ -321,21 +373,23 @@ impl Fluree {
             .prepare_single_view_for_connection_with_policy(&spec, policy)
             .await?
         {
-            return self.query(&view, query_json).await;
+            return self.query_with_options(&view, query_json, options).await;
         }
 
         // Multi-ledger: use DataSetDb and apply explicit policy to each view
         let dataset = self.build_dataset_view(&spec).await?;
         let dataset = apply_policy_to_dataset(dataset, policy);
-        self.query_dataset(&dataset, query_json).await
+        self.query_dataset_with_options(&dataset, query_json, options)
+            .await
     }
 
-    pub(crate) async fn query_connection_with_policy_and_r2rml(
+    pub(crate) async fn query_connection_with_policy_and_r2rml_options(
         &self,
         query_json: &JsonValue,
         policy: &PolicyContext,
         r2rml_provider: &dyn R2rmlProvider,
         r2rml_table_provider: &dyn R2rmlTableProvider,
+        options: QueryExecutionOptions,
     ) -> Result<QueryResult> {
         let (spec, _qc_opts) = parse_dataset_spec(query_json)?;
 
@@ -350,23 +404,36 @@ impl Fluree {
             .await?
         {
             return self
-                .query_view_with_r2rml(&view, query_json, r2rml_provider, r2rml_table_provider)
+                .query_view_with_r2rml_options(
+                    &view,
+                    query_json,
+                    r2rml_provider,
+                    r2rml_table_provider,
+                    options,
+                )
                 .await;
         }
 
         let dataset = self.build_dataset_view(&spec).await?;
         let dataset = apply_policy_to_dataset(dataset, policy);
-        self.query_dataset_with_r2rml(&dataset, query_json, r2rml_provider, r2rml_table_provider)
-            .await
+        self.query_dataset_with_r2rml_options(
+            &dataset,
+            query_json,
+            r2rml_provider,
+            r2rml_table_provider,
+            options,
+        )
+        .await
     }
 
-    pub(crate) async fn query_connection_jsonld_tracked_with_r2rml(
+    pub(crate) async fn query_connection_jsonld_tracked_with_r2rml_options(
         &self,
         query_json: &JsonValue,
         format_config: Option<FormatterConfig>,
         tracking_override: Option<TrackingOptions>,
         r2rml_provider: &dyn R2rmlProvider,
         r2rml_table_provider: &dyn R2rmlTableProvider,
+        options: QueryExecutionOptions,
     ) -> std::result::Result<crate::query::TrackedQueryResponse, crate::query::TrackedErrorResponse>
     {
         // See `query_connection_jsonld_tracked` for the up-front floor enforcement.
@@ -391,13 +458,16 @@ impl Fluree {
             .await?
         {
             return self
-                .query_tracked_with_r2rml(
+                .query_tracked_with_r2rml_options(
                     &view,
                     query_json,
                     format_config,
                     tracking_override,
-                    r2rml_provider,
-                    r2rml_table_provider,
+                    crate::R2rmlProviders {
+                        provider: r2rml_provider,
+                        table_provider: r2rml_table_provider,
+                    },
+                    options,
                 )
                 .await;
         }
@@ -406,25 +476,28 @@ impl Fluree {
             .build_dataset_for_connection_tracked(&spec, &qc_opts)
             .await?;
 
-        self.query_dataset_tracked_with_r2rml(
+        self.query_dataset_tracked_with_r2rml_options(
             &dataset,
             query_json,
             format_config,
             tracking_override,
-            r2rml_provider,
-            r2rml_table_provider,
+            crate::R2rmlProviders {
+                provider: r2rml_provider,
+                table_provider: r2rml_table_provider,
+            },
+            options,
         )
         .await
     }
 
-    pub(crate) async fn query_connection_jsonld_tracked_with_policy_and_r2rml(
+    pub(crate) async fn query_connection_jsonld_tracked_with_policy_and_r2rml_options(
         &self,
         query_json: &JsonValue,
         policy: &PolicyContext,
         format_config: Option<FormatterConfig>,
         tracking_override: Option<TrackingOptions>,
-        r2rml_provider: &dyn R2rmlProvider,
-        r2rml_table_provider: &dyn R2rmlTableProvider,
+        r2rml: crate::R2rmlProviders<'_>,
+        options: QueryExecutionOptions,
     ) -> std::result::Result<crate::query::TrackedQueryResponse, crate::query::TrackedErrorResponse>
     {
         // See `query_connection_jsonld_tracked` for the up-front floor enforcement.
@@ -453,13 +526,13 @@ impl Fluree {
             let view = view.with_policy(Arc::new(policy.clone()));
             let view = self.apply_config_defaults(view, None);
             return self
-                .query_tracked_with_r2rml(
+                .query_tracked_with_r2rml_options(
                     &view,
                     query_json,
                     format_config,
                     tracking_override,
-                    r2rml_provider,
-                    r2rml_table_provider,
+                    r2rml,
+                    options,
                 )
                 .await;
         }
@@ -469,13 +542,13 @@ impl Fluree {
             .await
             .map_err(|e| crate::query::TrackedErrorResponse::new(500, e.to_string(), None))?;
         let dataset = apply_policy_to_dataset(dataset, policy);
-        self.query_dataset_tracked_with_r2rml(
+        self.query_dataset_tracked_with_r2rml_options(
             &dataset,
             query_json,
             format_config,
             tracking_override,
-            r2rml_provider,
-            r2rml_table_provider,
+            r2rml,
+            options,
         )
         .await
     }
@@ -483,12 +556,13 @@ impl Fluree {
     /// Execute a connection query with explicit policy context and return a tracked JSON-LD response.
     ///
     /// Uses GraphDb API for single-ledger, DataSetDb for multi-ledger.
-    pub(crate) async fn query_connection_jsonld_tracked_with_policy(
+    pub(crate) async fn query_connection_jsonld_tracked_with_policy_options(
         &self,
         query_json: &JsonValue,
         policy: &PolicyContext,
         format_config: Option<FormatterConfig>,
         tracking_override: Option<TrackingOptions>,
+        options: QueryExecutionOptions,
     ) -> std::result::Result<crate::query::TrackedQueryResponse, crate::query::TrackedErrorResponse>
     {
         // See `query_connection_jsonld_tracked` for the up-front floor enforcement.
@@ -518,7 +592,13 @@ impl Fluree {
             let view = view.with_policy(Arc::new(policy.clone()));
             let view = self.apply_config_defaults(view, None);
             return self
-                .query_tracked(&view, query_json, format_config, tracking_override)
+                .query_tracked_with_options(
+                    &view,
+                    query_json,
+                    format_config,
+                    tracking_override,
+                    options,
+                )
                 .await;
         }
 
@@ -528,8 +608,14 @@ impl Fluree {
             .await
             .map_err(|e| crate::query::TrackedErrorResponse::new(500, e.to_string(), None))?;
         let dataset = apply_policy_to_dataset(dataset, policy);
-        self.query_dataset_tracked(&dataset, query_json, format_config, tracking_override)
-            .await
+        self.query_dataset_tracked_with_options(
+            &dataset,
+            query_json,
+            format_config,
+            tracking_override,
+            options,
+        )
+        .await
     }
 
     /// Explain a JSON-LD query via connection.
@@ -596,6 +682,15 @@ impl Fluree {
     /// Note: SPARQL connection queries allow dataset clauses because the dataset
     /// is being specified at the connection level.
     pub async fn query_connection_sparql(&self, sparql: &str) -> Result<QueryResult> {
+        self.query_connection_sparql_with_options(sparql, QueryExecutionOptions::default())
+            .await
+    }
+
+    pub async fn query_connection_sparql_with_options(
+        &self,
+        sparql: &str,
+        options: QueryExecutionOptions,
+    ) -> Result<QueryResult> {
         let ast = parse_and_validate_sparql(sparql)?;
         let spec = extract_sparql_dataset_spec(&ast)?;
 
@@ -606,14 +701,15 @@ impl Fluree {
         }
 
         let dataset = self.build_dataset_view(&spec).await?;
-        self.query_dataset(&dataset, sparql).await
+        self.query_dataset_with_options(&dataset, sparql, options)
+            .await
     }
 
-    /// Execute a SPARQL query via connection with explicit policy context.
-    pub(crate) async fn query_connection_sparql_with_policy(
+    pub(crate) async fn query_connection_sparql_with_policy_options(
         &self,
         sparql: &str,
         policy: &PolicyContext,
+        options: QueryExecutionOptions,
     ) -> Result<QueryResult> {
         let ast = parse_and_validate_sparql(sparql)?;
         let spec = extract_sparql_dataset_spec(&ast)?;
@@ -626,7 +722,8 @@ impl Fluree {
 
         let dataset = self.build_dataset_view(&spec).await?;
         let dataset = apply_policy_to_dataset(dataset, policy);
-        self.query_dataset(&dataset, sparql).await
+        self.query_dataset_with_options(&dataset, sparql, options)
+            .await
     }
 
     /// Execute a SPARQL connection query applying policy derived from
@@ -637,10 +734,11 @@ impl Fluree {
     /// `query_connection`'s opts→policy behaviour for JSON-LD: when the opts
     /// carry any policy input the dataset is built with policy
     /// (`build_dataset_view_with_policy`), otherwise it is the plain view.
-    pub(crate) async fn query_connection_sparql_with_opts(
+    pub(crate) async fn query_connection_sparql_with_opts_options(
         &self,
         sparql: &str,
         qc_opts: &QueryConnectionOptions,
+        options: QueryExecutionOptions,
     ) -> Result<QueryResult> {
         let ast = parse_and_validate_sparql(sparql)?;
         let spec = extract_sparql_dataset_spec(&ast)?;
@@ -652,15 +750,17 @@ impl Fluree {
         }
 
         let dataset = self.build_dataset_for_connection(&spec, qc_opts).await?;
-        self.query_dataset(&dataset, sparql).await
+        self.query_dataset_with_options(&dataset, sparql, options)
+            .await
     }
 
-    pub(crate) async fn query_connection_sparql_with_policy_and_r2rml(
+    pub(crate) async fn query_connection_sparql_with_policy_and_r2rml_options(
         &self,
         sparql: &str,
         policy: &PolicyContext,
         r2rml_provider: &dyn R2rmlProvider,
         r2rml_table_provider: &dyn R2rmlTableProvider,
+        options: QueryExecutionOptions,
     ) -> Result<QueryResult> {
         let ast = parse_and_validate_sparql(sparql)?;
         let spec = extract_sparql_dataset_spec(&ast)?;
@@ -673,8 +773,14 @@ impl Fluree {
 
         let dataset = self.build_dataset_view(&spec).await?;
         let dataset = apply_policy_to_dataset(dataset, policy);
-        self.query_dataset_with_r2rml(&dataset, sparql, r2rml_provider, r2rml_table_provider)
-            .await
+        self.query_dataset_with_r2rml_options(
+            &dataset,
+            sparql,
+            r2rml_provider,
+            r2rml_table_provider,
+            options,
+        )
+        .await
     }
 
     /// Execute a SPARQL query via connection with tracking (dataset specified via SPARQL `FROM` / `FROM NAMED`).
@@ -689,42 +795,21 @@ impl Fluree {
         tracking_override: Option<TrackingOptions>,
     ) -> std::result::Result<crate::query::TrackedQueryResponse, crate::query::TrackedErrorResponse>
     {
-        // See `query_connection_jsonld_tracked` for the up-front floor enforcement.
-        let input = QueryInput::Sparql(sparql);
-        let floor = tracked_query_tracker(&input, &tracking_override);
-        charge_query_floor(&floor)
-            .map_err(|e| crate::query::TrackedErrorResponse::fuel_exceeded(&e, floor.tally()))?;
-        let ast = parse_and_validate_sparql(sparql).map_err(|e| {
-            crate::query::TrackedErrorResponse::new(400, e.to_string(), floor.tally())
-        })?;
-        let spec = extract_sparql_dataset_spec(&ast).map_err(|e| {
-            crate::query::TrackedErrorResponse::new(400, e.to_string(), floor.tally())
-        })?;
-
-        if spec.is_empty() {
-            return Err(crate::query::TrackedErrorResponse::new(
-                400,
-                "Missing dataset specification in SPARQL connection query (no FROM / FROM NAMED)",
-                floor.tally(),
-            ));
-        }
-
-        let dataset = self
-            .build_dataset_view(&spec)
-            .await
-            .map_err(|e| crate::query::TrackedErrorResponse::new(500, e.to_string(), None))?;
-
-        self.query_dataset_tracked(&dataset, sparql, format_config, tracking_override)
-            .await
+        self.query_connection_sparql_tracked_with_options(
+            sparql,
+            format_config,
+            tracking_override,
+            QueryExecutionOptions::default(),
+        )
+        .await
     }
 
-    pub async fn query_connection_sparql_tracked_with_r2rml(
+    pub async fn query_connection_sparql_tracked_with_options(
         &self,
         sparql: &str,
         format_config: Option<FormatterConfig>,
         tracking_override: Option<TrackingOptions>,
-        r2rml_provider: &dyn R2rmlProvider,
-        r2rml_table_provider: &dyn R2rmlTableProvider,
+        options: QueryExecutionOptions,
     ) -> std::result::Result<crate::query::TrackedQueryResponse, crate::query::TrackedErrorResponse>
     {
         // See `query_connection_jsonld_tracked` for the up-front floor enforcement.
@@ -752,28 +837,92 @@ impl Fluree {
             .await
             .map_err(|e| crate::query::TrackedErrorResponse::new(500, e.to_string(), None))?;
 
-        self.query_dataset_tracked_with_r2rml(
+        self.query_dataset_tracked_with_options(
             &dataset,
+            sparql,
+            format_config,
+            tracking_override,
+            options,
+        )
+        .await
+    }
+
+    pub async fn query_connection_sparql_tracked_with_r2rml(
+        &self,
+        sparql: &str,
+        format_config: Option<FormatterConfig>,
+        tracking_override: Option<TrackingOptions>,
+        r2rml_provider: &dyn R2rmlProvider,
+        r2rml_table_provider: &dyn R2rmlTableProvider,
+    ) -> std::result::Result<crate::query::TrackedQueryResponse, crate::query::TrackedErrorResponse>
+    {
+        self.query_connection_sparql_tracked_with_r2rml_options(
             sparql,
             format_config,
             tracking_override,
             r2rml_provider,
             r2rml_table_provider,
+            QueryExecutionOptions::default(),
         )
         .await
     }
 
-    /// Execute a SPARQL query via connection with explicit policy context and tracking.
-    ///
-    /// Note: Unlike JSON-LD connection queries, SPARQL always uses the dataset path because
-    /// SPARQL FROM clauses specify the dataset and are incompatible with the single-view path
-    /// (which validates against FROM clauses).
-    pub(crate) async fn query_connection_sparql_tracked_with_policy(
+    pub async fn query_connection_sparql_tracked_with_r2rml_options(
+        &self,
+        sparql: &str,
+        format_config: Option<FormatterConfig>,
+        tracking_override: Option<TrackingOptions>,
+        r2rml_provider: &dyn R2rmlProvider,
+        r2rml_table_provider: &dyn R2rmlTableProvider,
+        options: QueryExecutionOptions,
+    ) -> std::result::Result<crate::query::TrackedQueryResponse, crate::query::TrackedErrorResponse>
+    {
+        // See `query_connection_jsonld_tracked` for the up-front floor enforcement.
+        let input = QueryInput::Sparql(sparql);
+        let floor = tracked_query_tracker(&input, &tracking_override);
+        charge_query_floor(&floor)
+            .map_err(|e| crate::query::TrackedErrorResponse::fuel_exceeded(&e, floor.tally()))?;
+        let ast = parse_and_validate_sparql(sparql).map_err(|e| {
+            crate::query::TrackedErrorResponse::new(400, e.to_string(), floor.tally())
+        })?;
+        let spec = extract_sparql_dataset_spec(&ast).map_err(|e| {
+            crate::query::TrackedErrorResponse::new(400, e.to_string(), floor.tally())
+        })?;
+
+        if spec.is_empty() {
+            return Err(crate::query::TrackedErrorResponse::new(
+                400,
+                "Missing dataset specification in SPARQL connection query (no FROM / FROM NAMED)",
+                floor.tally(),
+            ));
+        }
+
+        let dataset = self
+            .build_dataset_view(&spec)
+            .await
+            .map_err(|e| crate::query::TrackedErrorResponse::new(500, e.to_string(), None))?;
+
+        self.query_dataset_tracked_with_r2rml_options(
+            &dataset,
+            sparql,
+            format_config,
+            tracking_override,
+            crate::R2rmlProviders {
+                provider: r2rml_provider,
+                table_provider: r2rml_table_provider,
+            },
+            options,
+        )
+        .await
+    }
+
+    pub(crate) async fn query_connection_sparql_tracked_with_policy_options(
         &self,
         sparql: &str,
         policy: &PolicyContext,
         format_config: Option<FormatterConfig>,
         tracking_override: Option<TrackingOptions>,
+        options: QueryExecutionOptions,
     ) -> std::result::Result<crate::query::TrackedQueryResponse, crate::query::TrackedErrorResponse>
     {
         // See `query_connection_jsonld_tracked` for the up-front floor enforcement.
@@ -802,20 +951,27 @@ impl Fluree {
             .map_err(|e| crate::query::TrackedErrorResponse::new(500, e.to_string(), None))?;
         let dataset = apply_policy_to_dataset(dataset, policy);
 
-        self.query_dataset_tracked(&dataset, sparql, format_config, tracking_override)
-            .await
+        self.query_dataset_tracked_with_options(
+            &dataset,
+            sparql,
+            format_config,
+            tracking_override,
+            options,
+        )
+        .await
     }
 
     /// Tracked SPARQL connection query applying policy derived from
     /// [`QueryConnectionOptions`]. Opts→policy twin of
     /// [`Self::query_connection_sparql_tracked`], used by the multi-query
     /// dispatcher for policy-enforced SPARQL aliases under tracking.
-    pub(crate) async fn query_connection_sparql_tracked_with_opts(
+    pub(crate) async fn query_connection_sparql_tracked_with_opts_options(
         &self,
         sparql: &str,
         qc_opts: &QueryConnectionOptions,
         format_config: Option<FormatterConfig>,
         tracking_override: Option<TrackingOptions>,
+        options: QueryExecutionOptions,
     ) -> std::result::Result<crate::query::TrackedQueryResponse, crate::query::TrackedErrorResponse>
     {
         // See `query_connection_jsonld_tracked` for the up-front floor enforcement.
@@ -842,18 +998,24 @@ impl Fluree {
             .build_dataset_for_connection_tracked(&spec, qc_opts)
             .await?;
 
-        self.query_dataset_tracked(&dataset, sparql, format_config, tracking_override)
-            .await
+        self.query_dataset_tracked_with_options(
+            &dataset,
+            sparql,
+            format_config,
+            tracking_override,
+            options,
+        )
+        .await
     }
 
-    pub(crate) async fn query_connection_sparql_tracked_with_policy_and_r2rml(
+    pub(crate) async fn query_connection_sparql_tracked_with_policy_and_r2rml_options(
         &self,
         sparql: &str,
         policy: &PolicyContext,
         format_config: Option<FormatterConfig>,
         tracking_override: Option<TrackingOptions>,
-        r2rml_provider: &dyn R2rmlProvider,
-        r2rml_table_provider: &dyn R2rmlTableProvider,
+        r2rml: crate::R2rmlProviders<'_>,
+        options: QueryExecutionOptions,
     ) -> std::result::Result<crate::query::TrackedQueryResponse, crate::query::TrackedErrorResponse>
     {
         // See `query_connection_jsonld_tracked` for the up-front floor enforcement.
@@ -882,13 +1044,13 @@ impl Fluree {
             .map_err(|e| crate::query::TrackedErrorResponse::new(500, e.to_string(), None))?;
         let dataset = apply_policy_to_dataset(dataset, policy);
 
-        self.query_dataset_tracked_with_r2rml(
+        self.query_dataset_tracked_with_r2rml_options(
             &dataset,
             sparql,
             format_config,
             tracking_override,
-            r2rml_provider,
-            r2rml_table_provider,
+            r2rml,
+            options,
         )
         .await
     }

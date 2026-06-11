@@ -30,10 +30,10 @@ use crate::context::ExecutionContext;
 use crate::error::{QueryError, Result};
 use crate::fast_path_common::{
     build_count_batch, build_overlay_cursor_for_subject_range, build_psot_cursor_for_predicate,
-    collect_resolved_overlay_ops, count_predicate_overlay_delta, count_rows_for_predicate_psot,
-    count_to_i64, cursor_projection_sid_only, cursor_projection_sid_otype_okey,
-    leaf_entries_for_predicate, normalize_pred_sid, slice_overlay_ops_by_subject,
-    CursorSubjectCountStream, PsotSubjectCountIter,
+    cached_overlay_ops, count_predicate_overlay_delta, count_rows_for_predicate_psot, count_to_i64,
+    cursor_projection_sid_only, cursor_projection_sid_otype_okey, leaf_entries_for_predicate,
+    normalize_pred_sid, slice_overlay_ops_by_subject, CursorSubjectCountStream,
+    PsotSubjectCountIter, SharedOverlayOps,
 };
 use crate::ir::triple::Ref;
 use crate::operator::{BoxedOperator, Operator, OperatorState};
@@ -41,6 +41,7 @@ use crate::var_registry::VarId;
 use async_trait::async_trait;
 use fluree_db_binary_index::{BinaryCursor, RunSortOrder};
 use fluree_db_core::o_type::OType;
+use fluree_db_core::QueryCancellation;
 use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -111,6 +112,7 @@ impl Operator for UnionStarCountAllOperator {
             && ctx.policy_enforcer.as_ref().is_none_or(|p| p.is_root());
         if allow_fast {
             if let Some(store) = ctx.binary_store.as_ref() {
+                let started = std::time::Instant::now();
                 let Some(n) = count_union_star(
                     store,
                     ctx,
@@ -132,6 +134,12 @@ impl Operator for UnionStarCountAllOperator {
                     self.state = OperatorState::Open;
                     return Ok(());
                 };
+                tracing::debug!(
+                    count = n,
+                    mode = ?self.mode,
+                    elapsed_us = started.elapsed().as_micros() as u64,
+                    "union-star count fast path executed"
+                );
                 self.result = Some(count_to_i64(n, "COUNT(*) UNION-star")?);
                 self.emitted = false;
                 self.state = OperatorState::Open;
@@ -342,12 +350,16 @@ fn merge_union_constraint_count_range(
     g_id: fluree_db_core::GraphId,
     union_pids: &[u32],
     extra_pids: &[u32],
+    cancellation: &QueryCancellation,
     lo: u64,
     hi: u64,
 ) -> Result<u128> {
     let mut u_iters: Vec<PsotSubjectCountIter<'_>> = Vec::with_capacity(union_pids.len());
     for &p in union_pids {
-        u_iters.push(PsotSubjectCountIter::new_bounded(store, g_id, p, lo, hi)?);
+        u_iters.push(
+            PsotSubjectCountIter::new_bounded(store, g_id, p, lo, hi)?
+                .with_cancellation(cancellation),
+        );
     }
     let mut u_cur: Vec<Option<(u64, u64)>> = Vec::with_capacity(u_iters.len());
     for it in &mut u_iters {
@@ -355,7 +367,10 @@ fn merge_union_constraint_count_range(
     }
     let mut e_iters: Vec<PsotSubjectCountIter<'_>> = Vec::with_capacity(extra_pids.len());
     for &p in extra_pids {
-        e_iters.push(PsotSubjectCountIter::new_bounded(store, g_id, p, lo, hi)?);
+        e_iters.push(
+            PsotSubjectCountIter::new_bounded(store, g_id, p, lo, hi)?
+                .with_cancellation(cancellation),
+        );
     }
     let mut e_cur: Vec<Option<(u64, u64)>> = Vec::with_capacity(e_iters.len());
     for it in &mut e_iters {
@@ -390,6 +405,7 @@ fn try_union_constraint_parallel(
     g_id: fluree_db_core::GraphId,
     union_preds: &[Ref],
     extra_preds: &[Ref],
+    cancellation: &QueryCancellation,
 ) -> Result<Option<u64>> {
     let mut union_pids: Vec<u32> = Vec::with_capacity(union_preds.len());
     let mut extra_pids: Vec<u32> = Vec::with_capacity(extra_preds.len());
@@ -423,9 +439,24 @@ fn try_union_constraint_parallel(
         .max_by_key(|&p| leaf_entries_for_predicate(store, g_id, RunSortOrder::Psot, p).len())
         .unwrap();
 
-    crate::count_plan_exec::parallel_partition_count(store, g_id, driver_p, total_rows, |lo, hi| {
-        merge_union_constraint_count_range(store, g_id, &union_pids, &extra_pids, lo, hi)
-    })
+    crate::count_plan_exec::parallel_partition_count(
+        store,
+        g_id,
+        driver_p,
+        total_rows,
+        cancellation,
+        |lo, hi| {
+            merge_union_constraint_count_range(
+                store,
+                g_id,
+                &union_pids,
+                &extra_pids,
+                cancellation,
+                lo,
+                hi,
+            )
+        },
+    )
 }
 
 /// Overlay/time-travel variant of `merge_union_constraint_count_range` for one
@@ -438,11 +469,12 @@ fn merge_union_constraint_count_range_overlay(
     store: &Arc<fluree_db_binary_index::BinaryIndexStore>,
     g_id: fluree_db_core::GraphId,
     union_pids: &[u32],
-    union_ops: &[Vec<fluree_db_binary_index::read::types::OverlayOp>],
+    union_ops: &[SharedOverlayOps],
     extra_pids: &[u32],
-    extra_ops: &[Vec<fluree_db_binary_index::read::types::OverlayOp>],
+    extra_ops: &[SharedOverlayOps],
     to_t: i64,
     epoch: u64,
+    cancellation: &QueryCancellation,
     lo: u64,
     hi: u64,
 ) -> Result<u128> {
@@ -459,7 +491,7 @@ fn merge_union_constraint_count_range_overlay(
             to_t,
             epoch,
         )
-        .map(CursorSubjectCountStream::new)
+        .map(|c| CursorSubjectCountStream::new(c).with_cancellation(cancellation))
     };
 
     let mut u_streams: Vec<CursorSubjectCountStream> = Vec::with_capacity(union_pids.len());
@@ -551,11 +583,10 @@ fn try_union_constraint_overlay_parallel(
         return Ok(None);
     }
 
-    let collect = |sids: &[fluree_db_core::Sid]| -> Result<Option<Vec<Vec<fluree_db_binary_index::read::types::OverlayOp>>>> {
+    let collect = |sids: &[fluree_db_core::Sid]| -> Result<Option<Vec<SharedOverlayOps>>> {
         let mut out = Vec::with_capacity(sids.len());
         for sid in sids {
-            let Some(ops) = collect_resolved_overlay_ops(ctx, store, g_id, RunSortOrder::Psot, sid)?
-            else {
+            let Some(ops) = cached_overlay_ops(ctx, store, g_id, RunSortOrder::Psot, sid)? else {
                 return Ok(None);
             };
             out.push(ops);
@@ -585,9 +616,20 @@ fn try_union_constraint_overlay_parallel(
         g_id,
         driver_p,
         total_rows,
+        &ctx.cancellation,
         move |lo, hi| {
             merge_union_constraint_count_range_overlay(
-                store, g_id, union_pids, union_ops, extra_pids, extra_ops, to_t, epoch, lo, hi,
+                store,
+                g_id,
+                union_pids,
+                union_ops,
+                extra_pids,
+                extra_ops,
+                to_t,
+                epoch,
+                &ctx.cancellation,
+                lo,
+                hi,
             )
         },
     )
@@ -679,7 +721,9 @@ fn count_union_star(
         && !overlay_has_rows
         && !time_travel
     {
-        if let Some(total) = try_union_constraint_parallel(store, g_id, union_preds, extra_preds)? {
+        if let Some(total) =
+            try_union_constraint_parallel(store, g_id, union_preds, extra_preds, &ctx.cancellation)?
+        {
             return Ok(Some(total));
         }
     }
@@ -723,7 +767,9 @@ fn count_union_star(
         };
         match mode {
             UnionCountMode::AllRows => {
-                union_streams_all.push(CursorSubjectCountStream::new(cursor));
+                union_streams_all.push(
+                    CursorSubjectCountStream::new(cursor).with_cancellation(&ctx.cancellation),
+                );
             }
             UnionCountMode::SubjectEqObject => {
                 union_streams_eq.push(SubjectSelfLoopCountStreamV6::new(cursor));
@@ -832,7 +878,8 @@ fn count_union_star(
         else {
             return Ok(None);
         };
-        extra_streams.push(CursorSubjectCountStream::new(cursor));
+        extra_streams
+            .push(CursorSubjectCountStream::new(cursor).with_cancellation(&ctx.cancellation));
     }
     let mut extra_curr: Vec<Option<(u64, u64)>> = Vec::with_capacity(extra_streams.len());
     for s in &mut extra_streams {

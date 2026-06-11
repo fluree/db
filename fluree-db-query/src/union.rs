@@ -309,6 +309,7 @@ impl Operator for UnionOperator {
 
                 branch_op.open(ctx).await?;
                 while let Some(batch) = branch_op.next_batch(ctx).await? {
+                    ctx.check_cancelled()?;
                     if batch.is_empty() {
                         continue;
                     }
@@ -318,6 +319,7 @@ impl Operator for UnionOperator {
                     self.max_output_batch_len = self.max_output_batch_len.max(normalized.len());
                     self.pending_output_rows += normalized.len();
                     self.output_buffer.push_back(normalized);
+                    ctx.check_cancelled()?;
                 }
                 branch_op.close();
             }

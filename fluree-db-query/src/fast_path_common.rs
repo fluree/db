@@ -27,6 +27,29 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
+// 0a. Cold-path cancellation checkpoint
+// ---------------------------------------------------------------------------
+
+/// Bail with `QueryError::Cancelled` if cancellation was signalled.
+///
+/// Call ONLY from cold paths — leaflet refill, leaf open, partition start.
+/// Never call from per-group/per-row merge loops: any added instruction
+/// stream there (even a strided counter+branch) measurably perturbs codegen
+/// of the fused-COUNT loops (+5-15% end-to-end, wikidata-scale benchmarks).
+/// Leaflet granularity is thousands of rows, so cancellation still lands
+/// within ~1ms of work.
+#[inline]
+pub(crate) fn bail_if_cancelled(cancellation: &fluree_db_core::QueryCancellation) -> Result<()> {
+    if cfg!(feature = "cancel-checks-off") {
+        return Ok(());
+    }
+    match cancellation.reason() {
+        Some(reason) => Err(QueryError::Cancelled { reason }),
+        None => Ok(()),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // 0. Shared string-ID range helpers
 // ---------------------------------------------------------------------------
 
@@ -151,6 +174,22 @@ pub fn projection_sid_otype_okey() -> ColumnProjection {
             s.insert(ColumnId::SId);
             s.insert(ColumnId::OType);
             s.insert(ColumnId::OKey);
+            s
+        },
+    }
+}
+
+/// [`projection_sid_otype_okey`] plus `OI` — the full per-subject fact
+/// identity an overlay-merging probe needs to reconcile retracts.
+pub fn projection_sid_otype_okey_oi() -> ColumnProjection {
+    ColumnProjection {
+        output: ColumnSet::EMPTY,
+        internal: {
+            let mut s = ColumnSet::EMPTY;
+            s.insert(ColumnId::SId);
+            s.insert(ColumnId::OType);
+            s.insert(ColumnId::OKey);
+            s.insert(ColumnId::OI);
             s
         },
     }
@@ -595,6 +634,8 @@ pub struct PsotSubjectCountIter<'a> {
     /// partition one predicate's subjects across parallel workers.
     lo: u64,
     hi: u64,
+    /// Checked once per leaflet refill (cold path), never per group.
+    cancellation: fluree_db_core::QueryCancellation,
 }
 
 impl<'a> PsotSubjectCountIter<'a> {
@@ -631,10 +672,18 @@ impl<'a> PsotSubjectCountIter<'a> {
             cur_count: 0,
             lo,
             hi,
+            cancellation: fluree_db_core::QueryCancellation::disabled(),
         })
     }
 
+    /// Attach a cancellation handle, checked once per leaflet refill.
+    pub fn with_cancellation(mut self, cancellation: &fluree_db_core::QueryCancellation) -> Self {
+        self.cancellation = cancellation.clone();
+        self
+    }
+
     fn load_next_batch(&mut self) -> Result<Option<()>> {
+        bail_if_cancelled(&self.cancellation)?;
         let projection = projection_sid_only();
         loop {
             if self.handle.is_none() {
@@ -791,6 +840,8 @@ pub struct PsotSubjectSeek<'a> {
     handle: Option<Box<dyn fluree_db_binary_index::read::leaf_access::LeafHandle>>,
     batch: Option<ColumnBatch>,
     projection: ColumnProjection,
+    /// Checked once per leaflet refill (cold path), never per probe.
+    cancellation: fluree_db_core::QueryCancellation,
 }
 
 impl<'a> PsotSubjectSeek<'a> {
@@ -798,17 +849,21 @@ impl<'a> PsotSubjectSeek<'a> {
         Self::with_projection(store, g_id, p_id, projection_sid_only())
     }
 
-    /// Row-yielding variant for [`Self::rows_for_subject`]: decodes OType +
-    /// OKey alongside SId. Returns `None` when the PSOT branch is absent —
-    /// that means "branch unavailable", never "predicate has no rows" —
-    /// so callers can decline their fast path instead of dropping rows.
-    pub fn new_with_objects(store: &'a BinaryIndexStore, g_id: GraphId, p_id: u32) -> Option<Self> {
+    /// Identity-yielding variant for [`Self::rows_for_subject_identity`]:
+    /// decodes `OI` alongside SId/OType/OKey so overlay-merging callers can
+    /// reconcile retracts on the full fact identity. Same `None` semantics as
+    /// [`Self::new_with_objects`].
+    pub fn new_with_identity(
+        store: &'a BinaryIndexStore,
+        g_id: GraphId,
+        p_id: u32,
+    ) -> Option<Self> {
         store.branch_for_order(g_id, RunSortOrder::Psot)?;
         Some(Self::with_projection(
             store,
             g_id,
             p_id,
-            projection_sid_otype_okey(),
+            projection_sid_otype_okey_oi(),
         ))
     }
 
@@ -829,11 +884,19 @@ impl<'a> PsotSubjectSeek<'a> {
             handle: None,
             batch: None,
             projection,
+            cancellation: fluree_db_core::QueryCancellation::disabled(),
         }
+    }
+
+    /// Attach a cancellation handle, checked once per leaflet refill.
+    pub fn with_cancellation(mut self, cancellation: &fluree_db_core::QueryCancellation) -> Self {
+        self.cancellation = cancellation.clone();
+        self
     }
 
     fn load_next_batch(&mut self, target_s: u64) -> Result<Option<()>> {
         use fluree_db_binary_index::format::run_record_v2::read_ordered_key_v2;
+        bail_if_cancelled(&self.cancellation)?;
         loop {
             if self.handle.is_none() {
                 // Leaf leapfrog: skip leaves that provably cannot contain target_s.
@@ -916,17 +979,21 @@ impl<'a> PsotSubjectSeek<'a> {
         self.visit_subject(target_s, |_, _| {})
     }
 
-    /// Visit each of `target_s`'s rows as `(o_type, o_key)`, returning the row
-    /// count, or `None` if the subject is absent. Requires construction via
-    /// [`Self::new_with_objects`] so the object columns are decoded. Targets
-    /// MUST be non-decreasing across calls.
-    pub fn rows_for_subject(
+    /// Visit each of `target_s`'s rows as `(o_type, o_key, o_i)`, returning
+    /// the row count, or `None` if the subject is absent. Requires
+    /// construction via [`Self::new_with_identity`]. Targets MUST be
+    /// non-decreasing across calls.
+    pub fn rows_for_subject_identity(
         &mut self,
         target_s: u64,
-        mut on_row: impl FnMut(u16, u64),
+        mut on_row: impl FnMut(u16, u64, u32),
     ) -> Result<Option<u64>> {
         self.visit_subject(target_s, |batch, row| {
-            on_row(batch.o_type.get(row), batch.o_key.get(row));
+            on_row(
+                batch.o_type.get(row),
+                batch.o_key.get(row),
+                batch.o_i.get_or(row, u32::MAX),
+            );
         })
     }
 
@@ -1191,6 +1258,8 @@ pub struct PsotSubjectWeightedSumIter<'a> {
     /// True when the current batch is a pure non-IRI_REF leaflet —
     /// every row gets `default_weight` without looking up `o_key` in `weights`.
     all_default: bool,
+    /// Checked once per leaflet refill (cold path), never per group.
+    cancellation: fluree_db_core::QueryCancellation,
 }
 
 impl<'a> PsotSubjectWeightedSumIter<'a> {
@@ -1219,7 +1288,14 @@ impl<'a> PsotSubjectWeightedSumIter<'a> {
             cur_sum: 0,
             mixed: false,
             all_default: false,
+            cancellation: fluree_db_core::QueryCancellation::disabled(),
         }))
+    }
+
+    /// Attach a cancellation handle, checked once per leaflet refill.
+    pub fn with_cancellation(mut self, cancellation: &fluree_db_core::QueryCancellation) -> Self {
+        self.cancellation = cancellation.clone();
+        self
     }
 
     /// Create a new iterator that only emits groups for subjects in `allowed_subjects`.
@@ -1253,10 +1329,12 @@ impl<'a> PsotSubjectWeightedSumIter<'a> {
             cur_sum: 0,
             mixed: false,
             all_default: false,
+            cancellation: fluree_db_core::QueryCancellation::disabled(),
         }))
     }
 
     fn load_next_batch(&mut self) -> Result<Option<()>> {
+        bail_if_cancelled(&self.cancellation)?;
         let proj_sid_okey = projection_sid_okey();
         let proj_sid_otype_okey = projection_sid_otype_okey();
         loop {
@@ -1822,6 +1900,39 @@ pub fn build_range_cursor(
     ))
 }
 
+/// Boundary flakes bracketing every flake with predicate `pred` in a
+/// predicate-leading index order (Psot/Post both compare `p` first).
+///
+/// `first` (exclusive) sorts strictly before any real flake with `p == pred`
+/// (all non-predicate fields at their minimum; no real flake has
+/// `t == i64::MIN`). `rhs` (inclusive) sorts at-or-after any such flake and
+/// before any flake of a higher predicate. The bounds are a superset
+/// optimization for `for_each_overlay_flake` — callers must still filter the
+/// callback by predicate.
+fn predicate_walk_bounds(pred: &Sid) -> (fluree_db_core::Flake, fluree_db_core::Flake) {
+    use fluree_db_core::flake::FlakeMeta;
+    use fluree_db_core::Flake;
+    let first = Flake::new(
+        Sid::min(),
+        pred.clone(),
+        FlakeValue::min(),
+        Sid::min(),
+        i64::MIN,
+        false,
+        None,
+    );
+    let rhs = Flake::new(
+        Sid::max(),
+        pred.clone(),
+        FlakeValue::max(),
+        Sid::max(),
+        i64::MAX,
+        true,
+        Some(FlakeMeta::max()),
+    );
+    (first, rhs)
+}
+
 /// Collect the novelty-overlay ops for a single predicate, translated into the
 /// binary-index `OverlayOp` representation and sorted/resolved for `order`.
 ///
@@ -1829,6 +1940,12 @@ pub fn build_range_cursor(
 /// any flake fails to translate — in which case the caller must disable the
 /// fast path for correctness. Only meaningful when an overlay carrying novelty
 /// is present (`epoch != 0`).
+///
+/// For predicate-leading orders (Psot/Post) the overlay walk is range-bounded
+/// to the predicate via [`predicate_walk_bounds`], so its cost is
+/// O(log novelty + matching flakes) instead of a full-novelty walk. Other
+/// orders keep the full walk; the callback-side predicate filter is the
+/// correctness backstop in all cases.
 pub fn collect_resolved_overlay_ops(
     ctx: &ExecutionContext<'_>,
     store: &Arc<BinaryIndexStore>,
@@ -1846,12 +1963,19 @@ pub fn collect_resolved_overlay_ops(
     let mut translate_failed = false;
     let mut translate_fail_count: u32 = 0;
 
+    let pred_bounds = matches!(order, RunSortOrder::Psot | RunSortOrder::Post)
+        .then(|| predicate_walk_bounds(pred_sid));
+    let (first, rhs, leftmost) = match &pred_bounds {
+        Some((first, rhs)) => (Some(first), Some(rhs), false),
+        None => (None, None, true),
+    };
+
     ctx.overlay().for_each_overlay_flake(
         g_id,
         crate::binary_scan::sort_order_to_index_type(order),
-        None,
-        None,
-        true,
+        first,
+        rhs,
+        leftmost,
         ctx.to_t,
         &mut |flake| {
             if flake.p != *pred_sid {
@@ -1898,6 +2022,552 @@ pub fn collect_resolved_overlay_ops(
         fluree_db_binary_index::read::types::resolve_overlay_ops(&mut ops);
     }
     Ok(Some(ops))
+}
+
+/// Shared, immutable translated overlay ops for one `(graph, order, predicate)`.
+pub type SharedOverlayOps = Arc<[fluree_db_binary_index::read::types::OverlayOp]>;
+
+/// Identity of every input that determines a translated overlay-ops vector.
+///
+/// Address fields are stable for the lifetime of the borrows/Arcs the
+/// `ExecutionContext` holds, which covers the whole execution. `epoch` is
+/// included so a (hypothetical) in-place overlay mutation mid-query also
+/// invalidates rather than serving stale ops.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct OverlayOpsBinding {
+    overlay_addr: usize,
+    overlay_epoch: u64,
+    to_t: i64,
+    dict_novelty_addr: usize,
+    small_dicts_addr: usize,
+    store_addr: usize,
+}
+
+impl OverlayOpsBinding {
+    fn of(ctx: &ExecutionContext<'_>, store: &Arc<BinaryIndexStore>) -> Self {
+        Self {
+            overlay_addr: ctx.overlay.map_or(0, |o| {
+                o as *const dyn fluree_db_core::OverlayProvider as *const () as usize
+            }),
+            overlay_epoch: ctx.overlay().epoch(),
+            to_t: ctx.to_t,
+            dict_novelty_addr: ctx
+                .dict_novelty
+                .as_ref()
+                .map_or(0, |d| Arc::as_ptr(d) as usize),
+            small_dicts_addr: ctx
+                .runtime_small_dicts
+                .map_or(0, |d| d as *const _ as usize),
+            store_addr: Arc::as_ptr(store) as usize,
+        }
+    }
+}
+
+struct BoundOpsMap {
+    binding: OverlayOpsBinding,
+    /// `None` value = translation failed for that predicate (memoized so a
+    /// declined fast path doesn't re-walk the overlay on every retry).
+    map: std::sync::Mutex<FxHashMap<(GraphId, RunSortOrder, Sid), Option<SharedOverlayOps>>>,
+}
+
+/// Per-execution memo of translated + resolved overlay ops, keyed by
+/// `(graph, order, predicate)`.
+///
+/// Lazily binds on first access to the fingerprint of the inputs that
+/// determine the result ([`OverlayOpsBinding`]); every access re-validates, so
+/// an `ExecutionContext` derivation that shares the cache while changing
+/// `overlay`/`to_t`/dictionaries can never read stale ops — it merely computes
+/// uncached (and trips a `debug_assert` so the lifecycle bug is caught in CI).
+/// Derivations that change none of the bound inputs (e.g. graph switches —
+/// `GraphId` is in the key) share safely.
+///
+/// Note: translated ops may carry *ephemeral* `p_id`s (predicates absent from
+/// the base index get ids allocated from `store.predicate_count()` per
+/// collect). Cached vecs from different predicates can therefore carry
+/// colliding ephemeral ids — safe because consumers only compare identity
+/// within a single predicate's vec.
+#[derive(Default)]
+pub struct OverlayOpsCache {
+    inner: std::sync::OnceLock<BoundOpsMap>,
+}
+
+impl OverlayOpsCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+/// Cached front-end to [`collect_resolved_overlay_ops`].
+///
+/// Same contract (`Ok(None)` = translation failed → caller must decline the
+/// fast path), but the walk + translation + sort runs at most once per
+/// `(graph, order, predicate)` per execution; repeat lookups are an `Arc`
+/// clone. Misses compute *outside* the map lock so concurrent workers on
+/// different predicates never serialize behind one another's overlay walk.
+pub fn cached_overlay_ops(
+    ctx: &ExecutionContext<'_>,
+    store: &Arc<BinaryIndexStore>,
+    g_id: GraphId,
+    order: RunSortOrder,
+    pred_sid: &Sid,
+) -> Result<Option<SharedOverlayOps>> {
+    let binding = OverlayOpsBinding::of(ctx, store);
+    let bound = ctx.overlay_ops_cache.inner.get_or_init(|| BoundOpsMap {
+        binding,
+        map: std::sync::Mutex::new(FxHashMap::default()),
+    });
+    if bound.binding != binding {
+        debug_assert!(
+            false,
+            "overlay-ops cache shared across an ExecutionContext derivation that \
+             changed its binding (overlay/to_t/dict_novelty/runtime_small_dicts/store); \
+             the deriving constructor must start a fresh cache"
+        );
+        tracing::debug!("overlay-ops cache binding mismatch; computing uncached");
+        return Ok(
+            collect_resolved_overlay_ops(ctx, store, g_id, order, pred_sid)?
+                .map(SharedOverlayOps::from),
+        );
+    }
+    let key = (g_id, order, pred_sid.clone());
+    if let Some(entry) = bound
+        .map
+        .lock()
+        .expect("overlay ops cache poisoned")
+        .get(&key)
+    {
+        return Ok(entry.clone());
+    }
+    // A concurrent miss on the same key duplicates the walk (acceptable —
+    // last write wins with an identical value) but never holds the lock
+    // across the walk.
+    let computed = collect_resolved_overlay_ops(ctx, store, g_id, order, pred_sid)?
+        .map(SharedOverlayOps::from);
+    bound
+        .map
+        .lock()
+        .expect("overlay ops cache poisoned")
+        .insert(key, computed.clone());
+    Ok(computed)
+}
+
+/// Fate of a base row checked against a predicate's overlay ops.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RowFate {
+    /// Emit the base row (no op for it, or a re-assert of the same fact).
+    Keep,
+    /// A novelty retract matched the row's identity — suppress it.
+    Drop,
+}
+
+/// Per-flush reconciler merging resolved overlay ops into a batched
+/// leaflet-probe scan (the "strategy (b)" merge for probe lanes that
+/// read base leaflets directly instead of going through `BinaryCursor`).
+///
+/// Mirrors `merge_overlay_into_batch`'s case analysis for set-of-matches
+/// consumers: base row with no identity-matching op → emit; identity-matching
+/// retract → suppress; identity-matching assert (re-asserted fact) → emit the
+/// base row once; unconsumed asserts are injected per probed subject after the
+/// base scan ([`Self::drain_asserts_for_subject`]); unconsumed retracts are
+/// no-ops (their base row is absent). Equivalence with the cursor merge holds
+/// because `resolve_overlay_ops` guarantees at most one op per fact key and
+/// probe consumers are emission-order-insensitive.
+///
+/// Identity is the full `(p_id, o_type, o_key, o_i)` within a subject, so one
+/// reconciler serves both the single-predicate PSOT probes (p constant) and
+/// the multi-predicate SPOT star probes (ops merged across the star's
+/// predicates): both sort by `(s_id, p_id, o_type, o_key, o_i)`.
+///
+/// **Scope: one instance per flush** (one probe call, or one predicate's
+/// chunk sequence over disjoint probed subjects). Probed keys legitimately recur across
+/// flushes (each flush carries different left rows), so consumed-state must
+/// not outlive a flush — a longer-lived instance would silently drop injected
+/// asserts from every flush after the first.
+pub struct ProbeOps {
+    ops: SharedOverlayOps,
+    consumed: Vec<bool>,
+    /// Base rows suppressed by novelty retracts (diagnostics).
+    pub dropped_rows: u64,
+    /// Novelty asserts injected as new matches (diagnostics).
+    pub injected_rows: u64,
+}
+
+impl ProbeOps {
+    /// `ops` must be resolved and sorted by `(s_id, p_id, o_type, o_key,
+    /// o_i)`: a single predicate's [`cached_overlay_ops`] for
+    /// `RunSortOrder::Psot`, or a multi-predicate merge re-sorted for
+    /// `RunSortOrder::Spot`. Returns `None` when empty — callers then run
+    /// their unmodified scan.
+    pub fn new(ops: SharedOverlayOps) -> Option<Self> {
+        if ops.is_empty() {
+            return None;
+        }
+        debug_assert!(
+            ops.windows(2).all(|w| {
+                (w[0].s_id, w[0].p_id, w[0].o_type, w[0].o_key, w[0].o_i)
+                    < (w[1].s_id, w[1].p_id, w[1].o_type, w[1].o_key, w[1].o_i)
+            }),
+            "ProbeOps requires subject-major sorted, resolved ops"
+        );
+        let consumed = vec![false; ops.len()];
+        Some(Self {
+            ops,
+            consumed,
+            dropped_rows: 0,
+            injected_rows: 0,
+        })
+    }
+
+    /// Index range of ops for `s_id` (ops are subject-sorted within the
+    /// predicate). Empty for subjects with no novelty — the common case, which
+    /// makes the per-row fate check free for them.
+    pub fn subject_window(&self, s_id: u64) -> std::ops::Range<usize> {
+        let start = self.ops.partition_point(|o| o.s_id < s_id);
+        let end = start + self.ops[start..].partition_point(|o| o.s_id == s_id);
+        start..end
+    }
+
+    /// Reconcile one base row of `window`'s subject against the ops, marking a
+    /// matching op consumed. `window` must come from
+    /// [`Self::subject_window`] for the row's subject.
+    pub fn base_row_fate(
+        &mut self,
+        window: &std::ops::Range<usize>,
+        p_id: u32,
+        o_type: u16,
+        o_key: u64,
+        o_i: u32,
+    ) -> RowFate {
+        if window.is_empty() {
+            return RowFate::Keep;
+        }
+        let win = &self.ops[window.clone()];
+        let probe = (p_id, o_type, o_key, o_i);
+        let pos = win.partition_point(|o| (o.p_id, o.o_type, o.o_key, o.o_i) < probe);
+        if pos < win.len() {
+            let op = &win[pos];
+            if (op.p_id, op.o_type, op.o_key, op.o_i) == probe {
+                self.consumed[window.start + pos] = true;
+                if op.op {
+                    // Re-asserted fact: the base row stands in for it.
+                    return RowFate::Keep;
+                }
+                self.dropped_rows += 1;
+                return RowFate::Drop;
+            }
+        }
+        RowFate::Keep
+    }
+
+    /// Hand every not-yet-consumed assert for `s_id` to `f` — the
+    /// `emit_overlay_only` analogue: novelty-only facts of probed subjects
+    /// become new matches. Call once per probed subject after the base scan;
+    /// retracts without a base row are dropped silently, matching the cursor.
+    pub fn drain_asserts_for_subject(
+        &mut self,
+        s_id: u64,
+        mut f: impl FnMut(&fluree_db_binary_index::read::types::OverlayOp) -> Result<()>,
+    ) -> Result<()> {
+        let window = self.subject_window(s_id);
+        for i in window {
+            if !self.consumed[i] && self.ops[i].op {
+                self.consumed[i] = true;
+                self.injected_rows += 1;
+                f(&self.ops[i])?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// One overlay op of the object-probe subset: an `IRI_REF`-valued fact of
+/// the probed predicate, keyed for object-major reconciliation.
+#[derive(Clone, Copy)]
+struct ObjectProbeOp {
+    o_key: u64,
+    s_id: u64,
+    o_i: u32,
+    /// true = assert, false = retract.
+    op: bool,
+}
+
+/// Per-flush reconciler for the OPST bound-object probe lane.
+///
+/// The lane scans only `IRI_REF` rows of one predicate, keyed by object id,
+/// so this owns the matching subset of the predicate's resolved ops re-sorted
+/// by `(o_key, s_id, o_i)` — object-major windows with a well-defined
+/// binary-search order regardless of the source vec's sort order (the cached
+/// PSOT ops serve directly; no second overlay walk in OPST order). Same case
+/// analysis and per-flush scope as [`ProbeOps`].
+pub struct ObjectProbeOps {
+    ops: Vec<ObjectProbeOp>,
+    consumed: Vec<bool>,
+    /// Base rows suppressed by novelty retracts (diagnostics).
+    pub dropped_rows: u64,
+    /// Novelty asserts injected as new matches (diagnostics).
+    pub injected_rows: u64,
+}
+
+impl ObjectProbeOps {
+    /// Filter `ops` (one predicate's resolved ops, any sort order) to the
+    /// `IRI_REF` subset and index it object-major. Returns `None` when no op
+    /// can affect the lane — callers then run their unmodified scan.
+    pub fn new(ops: &[fluree_db_binary_index::read::types::OverlayOp]) -> Option<Self> {
+        let iri_ref = OType::IRI_REF.as_u16();
+        let mut subset: Vec<ObjectProbeOp> = ops
+            .iter()
+            .filter(|o| o.o_type == iri_ref)
+            .map(|o| ObjectProbeOp {
+                o_key: o.o_key,
+                s_id: o.s_id,
+                o_i: o.o_i,
+                op: o.op,
+            })
+            .collect();
+        if subset.is_empty() {
+            return None;
+        }
+        subset.sort_unstable_by_key(|o| (o.o_key, o.s_id, o.o_i));
+        let consumed = vec![false; subset.len()];
+        Some(Self {
+            ops: subset,
+            consumed,
+            dropped_rows: 0,
+            injected_rows: 0,
+        })
+    }
+
+    /// Index range of ops for `o_key`. Empty for objects with no novelty —
+    /// the common case, which keeps the per-row fate check free for them.
+    pub fn object_window(&self, o_key: u64) -> std::ops::Range<usize> {
+        let start = self.ops.partition_point(|o| o.o_key < o_key);
+        let end = start + self.ops[start..].partition_point(|o| o.o_key == o_key);
+        start..end
+    }
+
+    /// Reconcile one base row of `window`'s object against the ops, marking a
+    /// matching op consumed. `window` must come from
+    /// [`Self::object_window`] for the row's object key.
+    pub fn base_row_fate(
+        &mut self,
+        window: &std::ops::Range<usize>,
+        s_id: u64,
+        o_i: u32,
+    ) -> RowFate {
+        if window.is_empty() {
+            return RowFate::Keep;
+        }
+        let win = &self.ops[window.clone()];
+        let probe = (s_id, o_i);
+        let pos = win.partition_point(|o| (o.s_id, o.o_i) < probe);
+        if pos < win.len() {
+            let op = &win[pos];
+            if (op.s_id, op.o_i) == probe {
+                self.consumed[window.start + pos] = true;
+                if op.op {
+                    return RowFate::Keep;
+                }
+                self.dropped_rows += 1;
+                return RowFate::Drop;
+            }
+        }
+        RowFate::Keep
+    }
+
+    /// Hand every not-yet-consumed assert for `o_key` to `f` (as the
+    /// asserting subject id) — novelty-only facts of probed objects become
+    /// new matches. Call once per probed object after the base scan.
+    pub fn drain_asserts_for_object(
+        &mut self,
+        o_key: u64,
+        mut f: impl FnMut(u64) -> Result<()>,
+    ) -> Result<()> {
+        let window = self.object_window(o_key);
+        for i in window {
+            if !self.consumed[i] && self.ops[i].op {
+                self.consumed[i] = true;
+                self.injected_rows += 1;
+                f(self.ops[i].s_id)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// How a batched leaflet-probe lane should handle the active overlay.
+///
+/// Centralizes the decline analysis every probe lane needs (the bug class
+/// the old `overlay_free_single_graph()` bails guarded against): translation
+/// failure, a predicate that exists only in novelty (no base `p_id` to scan),
+/// and a graph whose branch is absent while novelty exists would all silently
+/// drop or duplicate rows if the probe ran against base leaflets.
+pub enum ProbeLanePlan {
+    /// No novelty on the active graph (or none survives `to_t`) — run the
+    /// unmodified probe.
+    Clean,
+    /// Merge these non-empty resolved ops during the probe (construct one
+    /// [`ProbeOps`] per flush from them).
+    Merge(SharedOverlayOps),
+    /// Unmergeable — the caller must take its overlay-correct fallback.
+    Decline,
+}
+
+/// True when no policy enforcer is active (or it is root). The batched
+/// leaflet probes read base leaflets directly and never run the per-leaf
+/// `filter_flakes` policy filtering that scan operators apply — engaging
+/// them under a restrictive policy would leak rows the policy hides.
+pub(crate) fn root_or_no_policy(ctx: &ExecutionContext<'_>) -> bool {
+    ctx.policy_enforcer.as_ref().is_none_or(|p| p.is_root())
+}
+
+/// Plan a single-predicate PSOT subject probe under the active overlay.
+pub fn subject_probe_lane_plan(
+    ctx: &ExecutionContext<'_>,
+    store: &Arc<BinaryIndexStore>,
+    pred_sid: &Sid,
+) -> Result<ProbeLanePlan> {
+    // BEFORE the overlay-free return: the probe lanes read raw leaflets in
+    // `Clean` mode too, so a restrictive policy must decline regardless of
+    // novelty state.
+    if !root_or_no_policy(ctx) {
+        return Ok(ProbeLanePlan::Decline);
+    }
+    if ctx.overlay_free_single_graph() {
+        return Ok(ProbeLanePlan::Clean);
+    }
+    // Eager-materialization callers (reasoning queries with Sid-space derived
+    // overlays, federated queries) need the per-row path: probes emit
+    // encoded bindings and merge only V3-translated novelty.
+    if ctx.eager_materialization {
+        return Ok(ProbeLanePlan::Decline);
+    }
+    if !matches!(ctx.active_graphs(), crate::dataset::ActiveGraphs::Single) {
+        return Ok(ProbeLanePlan::Decline);
+    }
+    let Some(ops) = cached_overlay_ops(ctx, store, ctx.binary_g_id, RunSortOrder::Psot, pred_sid)?
+    else {
+        tracing::debug!("subject probe: overlay flake translation failed; declining");
+        return Ok(ProbeLanePlan::Decline);
+    };
+    if ops.is_empty() {
+        return Ok(ProbeLanePlan::Clean);
+    }
+    if store.sid_to_p_id(pred_sid).is_none() {
+        tracing::debug!("subject probe: predicate exists only in novelty; declining");
+        return Ok(ProbeLanePlan::Decline);
+    }
+    if store
+        .branch_for_order(ctx.binary_g_id, RunSortOrder::Psot)
+        .is_none()
+    {
+        tracing::debug!("subject probe: PSOT branch absent with novelty present; declining");
+        return Ok(ProbeLanePlan::Decline);
+    }
+    Ok(ProbeLanePlan::Merge(ops))
+}
+
+/// Plan an OPST bound-object probe under the active overlay.
+///
+/// Reuses the predicate's cached PSOT ops (the object lane filters and
+/// re-sorts its `IRI_REF` subset itself), but gates on the OPST branch the
+/// scan actually reads.
+pub fn object_probe_lane_plan(
+    ctx: &ExecutionContext<'_>,
+    store: &Arc<BinaryIndexStore>,
+    pred_sid: &Sid,
+) -> Result<ProbeLanePlan> {
+    // See subject_probe_lane_plan: policy declines before the overlay-free
+    // return (raw leaflet reads bypass per-leaf policy filtering in `Clean`
+    // mode too); eager callers keep the per-row path under an overlay.
+    if !root_or_no_policy(ctx) {
+        return Ok(ProbeLanePlan::Decline);
+    }
+    if ctx.overlay_free_single_graph() {
+        return Ok(ProbeLanePlan::Clean);
+    }
+    if ctx.eager_materialization {
+        return Ok(ProbeLanePlan::Decline);
+    }
+    if !matches!(ctx.active_graphs(), crate::dataset::ActiveGraphs::Single) {
+        return Ok(ProbeLanePlan::Decline);
+    }
+    let Some(ops) = cached_overlay_ops(ctx, store, ctx.binary_g_id, RunSortOrder::Psot, pred_sid)?
+    else {
+        tracing::debug!("object probe: overlay flake translation failed; declining");
+        return Ok(ProbeLanePlan::Decline);
+    };
+    if ops.is_empty() {
+        return Ok(ProbeLanePlan::Clean);
+    }
+    if store.sid_to_p_id(pred_sid).is_none() {
+        tracing::debug!("object probe: predicate exists only in novelty; declining");
+        return Ok(ProbeLanePlan::Decline);
+    }
+    if store
+        .branch_for_order(ctx.binary_g_id, RunSortOrder::Opst)
+        .is_none()
+    {
+        tracing::debug!("object probe: OPST branch absent with novelty present; declining");
+        return Ok(ProbeLanePlan::Decline);
+    }
+    Ok(ProbeLanePlan::Merge(ops))
+}
+
+/// Plan a multi-predicate SPOT star probe under the active overlay.
+///
+/// Fetches each predicate's resolved ops, declines if any predicate is
+/// unmergeable, and merges the non-empty vecs into one SPOT-sorted vec
+/// (identities stay unique across predicates because `p_id` is part of the
+/// fact key, so the merge stays resolved).
+pub fn star_probe_lane_plan(
+    ctx: &ExecutionContext<'_>,
+    store: &Arc<BinaryIndexStore>,
+    pred_sids: &[&Sid],
+) -> Result<ProbeLanePlan> {
+    // See subject_probe_lane_plan: policy declines before the overlay-free
+    // return (raw leaflet reads bypass per-leaf policy filtering in `Clean`
+    // mode too); eager callers keep the per-row path under an overlay.
+    if !root_or_no_policy(ctx) {
+        return Ok(ProbeLanePlan::Decline);
+    }
+    if ctx.overlay_free_single_graph() {
+        return Ok(ProbeLanePlan::Clean);
+    }
+    if ctx.eager_materialization {
+        return Ok(ProbeLanePlan::Decline);
+    }
+    if !matches!(ctx.active_graphs(), crate::dataset::ActiveGraphs::Single) {
+        return Ok(ProbeLanePlan::Decline);
+    }
+    let mut merged: Vec<fluree_db_binary_index::read::types::OverlayOp> = Vec::new();
+    for pred_sid in pred_sids {
+        let Some(ops) =
+            cached_overlay_ops(ctx, store, ctx.binary_g_id, RunSortOrder::Psot, pred_sid)?
+        else {
+            tracing::debug!("star probe: overlay flake translation failed; declining");
+            return Ok(ProbeLanePlan::Decline);
+        };
+        if ops.is_empty() {
+            continue;
+        }
+        if store.sid_to_p_id(pred_sid).is_none() {
+            tracing::debug!("star probe: predicate exists only in novelty; declining");
+            return Ok(ProbeLanePlan::Decline);
+        }
+        merged.extend_from_slice(&ops);
+    }
+    if merged.is_empty() {
+        return Ok(ProbeLanePlan::Clean);
+    }
+    if store
+        .branch_for_order(ctx.binary_g_id, RunSortOrder::Spot)
+        .is_none()
+    {
+        tracing::debug!("star probe: SPOT branch absent with novelty present; declining");
+        return Ok(ProbeLanePlan::Decline);
+    }
+    fluree_db_binary_index::read::types::sort_overlay_ops(&mut merged, RunSortOrder::Spot);
+    Ok(ProbeLanePlan::Merge(merged.into()))
 }
 
 /// Build a per-predicate `BinaryCursor` in `order`, folding in the novelty
@@ -1964,11 +2634,13 @@ pub fn build_overlay_cursor_for_predicate(
     cursor.set_to_t(ctx.to_t);
 
     // Fold the novelty overlay in. Skip the walk entirely when there is no
-    // novelty (epoch 0): the persisted index alone is then exact.
+    // novelty (epoch 0): the persisted index alone is then exact. Ops come
+    // from the per-execution cache, so N cursors over the same predicate
+    // (flushes, partitions, cyclic edges) share one walk + translation.
     if ctx.overlay.is_some() {
         let epoch = ctx.overlay().epoch();
         if epoch != 0 {
-            match collect_resolved_overlay_ops(ctx, store, g_id, order, &pred_sid)? {
+            match cached_overlay_ops(ctx, store, g_id, order, &pred_sid)? {
                 Some(ops) => {
                     if !ops.is_empty() {
                         cursor.set_overlay_ops(ops);
@@ -2094,7 +2766,7 @@ pub fn build_overlay_cursor_for_subject_range(
     cursor.set_to_t(to_t);
     if overlay_active {
         if !sliced_ops.is_empty() {
-            cursor.set_overlay_ops(sliced_ops);
+            cursor.set_overlay_ops(sliced_ops.into());
         }
         cursor.set_epoch(epoch);
     }
@@ -2130,6 +2802,8 @@ pub struct CursorSubjectCountStream {
     row: usize,
     cur_s: Option<u64>,
     cur_count: u64,
+    /// Checked once per cursor-batch refill (cold path), never per group.
+    cancellation: fluree_db_core::QueryCancellation,
 }
 
 impl CursorSubjectCountStream {
@@ -2140,13 +2814,21 @@ impl CursorSubjectCountStream {
             row: 0,
             cur_s: None,
             cur_count: 0,
+            cancellation: fluree_db_core::QueryCancellation::disabled(),
         }
+    }
+
+    /// Attach a cancellation handle, checked once per cursor-batch refill.
+    pub fn with_cancellation(mut self, cancellation: &fluree_db_core::QueryCancellation) -> Self {
+        self.cancellation = cancellation.clone();
+        self
     }
 
     /// Next `(subject_id, row_count)` group, or `None` when exhausted.
     pub fn next_group(&mut self) -> Result<Option<(u64, u64)>> {
         loop {
             if self.current.is_none() {
+                bail_if_cancelled(&self.cancellation)?;
                 self.current = self
                     .cursor
                     .next_batch()
@@ -2257,8 +2939,8 @@ pub fn parallel_overlay_psot_filter_count<P>(
 where
     P: Fn(u64, u16, u64) -> bool + Sync + Send,
 {
-    // Collect + resolve the predicate's overlay ops once (serial; novelty is small).
-    let ops = match collect_resolved_overlay_ops(ctx, store, g_id, RunSortOrder::Psot, &pred_sid)? {
+    // Per-execution cached collect + resolve; sliced per partition below.
+    let ops = match cached_overlay_ops(ctx, store, g_id, RunSortOrder::Psot, &pred_sid)? {
         Some(o) => o,
         None => return Ok(None),
     };
@@ -2273,6 +2955,7 @@ where
         g_id,
         p_id,
         total_rows,
+        &ctx.cancellation,
         move |lo, hi| {
             let sliced = slice_overlay_ops_by_subject(ops_ref, lo, hi);
             let Some(mut cursor) = build_overlay_cursor_for_subject_range(
@@ -2344,7 +3027,7 @@ pub fn count_predicate_overlay_delta(
     pred_sid: Sid,
     p_id: u32,
 ) -> Result<Option<u64>> {
-    let ops = match collect_resolved_overlay_ops(ctx, store, g_id, RunSortOrder::Psot, &pred_sid)? {
+    let ops = match cached_overlay_ops(ctx, store, g_id, RunSortOrder::Psot, &pred_sid)? {
         Some(o) => o,
         None => return Ok(None),
     };
@@ -2889,5 +3572,76 @@ impl Operator for FastPathOperator {
             fb.close();
         }
         self.state = OperatorState::Closed;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fluree_db_core::comparator::IndexType;
+    use fluree_db_core::Flake;
+
+    /// `predicate_walk_bounds` must bracket every possible flake of the
+    /// predicate in both predicate-leading orders: `first` strictly below all
+    /// of them (it is an exclusive bound), `rhs` at-or-above all of them
+    /// (inclusive), and both bounds strictly inside the neighboring
+    /// predicates' ranges so no foreign flake is required — only allowed — by
+    /// the range. Callback-side predicate filtering removes any extras.
+    #[test]
+    fn predicate_walk_bounds_bracket_predicate() {
+        let pred = Sid::new(5, "knows");
+        let (first, rhs) = predicate_walk_bounds(&pred);
+
+        let flake = |p: &Sid, s: u16, v: i64, t: i64| {
+            Flake::new(
+                Sid::new(s, format!("s{s}")),
+                p.clone(),
+                FlakeValue::Long(v),
+                Sid::new(2, "long"),
+                t,
+                true,
+                None,
+            )
+        };
+        // Extremes a real flake of `pred` can plausibly take (plus a
+        // ref-valued minimum-class object).
+        let lowest = Flake::new(
+            Sid::new(0, "a"),
+            pred.clone(),
+            FlakeValue::Ref(Sid::new(0, "a")),
+            Sid::new(0, ""),
+            1,
+            false,
+            None,
+        );
+        let highest = flake(&pred, u16::MAX - 1, i64::MAX, i64::MAX);
+        let pred_below = flake(&Sid::new(5, "kno"), 9, 9, 9);
+        let pred_above = flake(&Sid::new(5, "knowsX"), 0, 0, 1);
+
+        for index in [IndexType::Psot, IndexType::Post] {
+            let cmp = index.comparator();
+            for real in [&lowest, &highest] {
+                assert_eq!(
+                    cmp(&first, real),
+                    std::cmp::Ordering::Less,
+                    "{index:?}: first must sort strictly below every {pred:?} flake"
+                );
+                assert_ne!(
+                    cmp(real, &rhs),
+                    std::cmp::Ordering::Greater,
+                    "{index:?}: rhs must sort at-or-above every {pred:?} flake"
+                );
+            }
+            assert_eq!(
+                cmp(&pred_below, &first),
+                std::cmp::Ordering::Less,
+                "{index:?}: lower predicates stay below first"
+            );
+            assert_eq!(
+                cmp(&rhs, &pred_above),
+                std::cmp::Ordering::Less,
+                "{index:?}: rhs stays below higher predicates"
+            );
+        }
     }
 }

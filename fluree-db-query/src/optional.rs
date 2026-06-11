@@ -27,6 +27,7 @@ use crate::binding::{Batch, Binding};
 use crate::context::ExecutionContext;
 use crate::error::{QueryError, Result};
 use crate::fast_path_common::try_normalize_pred_sid;
+use crate::fast_path_common::{subject_probe_lane_plan, ProbeLanePlan, ProbeOps};
 use crate::ir::triple::{Ref, Term, TriplePattern};
 use crate::ir::Pattern;
 use crate::join::{
@@ -284,9 +285,20 @@ impl PatternOptionalBuilder {
         };
         match binding {
             Binding::EncodedSid { s_id, .. } => Ok(Some(*s_id)),
-            Binding::Sid { sid, .. } => store
-                .find_subject_id_by_parts(sid.namespace_code, &sid.name)
-                .map_err(|e| QueryError::execution(format!("find_subject_id_by_parts: {e}"))),
+            Binding::Sid { sid, .. } => {
+                // Persisted reverse dict first, then DictNovelty — subjects
+                // minted after the last index resolve to novelty s_ids, the
+                // same id space the overlay ops are translated into.
+                let persisted = store
+                    .find_subject_id_by_parts(sid.namespace_code, &sid.name)
+                    .map_err(|e| QueryError::execution(format!("find_subject_id_by_parts: {e}")))?;
+                Ok(persisted.or_else(|| {
+                    ctx.dict_novelty
+                        .as_ref()
+                        .filter(|dn| dn.is_initialized())
+                        .and_then(|dn| dn.subjects.find_subject(sid.namespace_code, &sid.name))
+                }))
+            }
             _ => Ok(None),
         }
     }
@@ -424,11 +436,6 @@ impl OptionalBuilder for PatternOptionalBuilder {
         if start_row >= required_batch.len() || ctx.is_multi_ledger() {
             return Ok(None);
         }
-        // Batched probe reads base leaflets without overlay merging — bail to
-        // the per-row scan when novelty is present.
-        if !ctx.overlay_free_single_graph() {
-            return Ok(None);
-        }
         let Some(store) = ctx.binary_store.as_ref() else {
             return Ok(None);
         };
@@ -439,6 +446,12 @@ impl OptionalBuilder for PatternOptionalBuilder {
             return Ok(None);
         };
         if self.pattern.dtc.is_some() {
+            return Ok(None);
+        }
+        // Novelty merges per probed subject; unmergeable overlays fall back
+        // to the per-row scan (whose cursor merges the overlay).
+        let lane_plan = subject_probe_lane_plan(ctx, store, &pred_sid)?;
+        if matches!(lane_plan, ProbeLanePlan::Decline) {
             return Ok(None);
         }
 
@@ -468,6 +481,13 @@ impl OptionalBuilder for PatternOptionalBuilder {
                 .push(slot);
         }
 
+        // One reconciler per probe call; the dict overlay decodes
+        // novelty-minted object values on injected asserts.
+        let mut probe_ops = match &lane_plan {
+            ProbeLanePlan::Merge(ops) => ProbeOps::new(ops.clone()),
+            _ => None,
+        };
+        let dict_overlay = crate::join::make_dict_overlay(ctx, store);
         let probe_matches = batched_subject_probe_binary(
             ctx,
             store,
@@ -477,8 +497,9 @@ impl OptionalBuilder for PatternOptionalBuilder {
                 object_bounds: None,
                 bound_object: (!matches!(&self.pattern.o, Term::Var(_))).then_some(&self.pattern.o),
                 emit_object: emit_object_var.is_some(),
-                dict_overlay: None,
+                dict_overlay: dict_overlay.as_ref(),
             },
+            probe_ops.as_mut(),
         )?;
 
         for probe_match in probe_matches {
@@ -513,6 +534,7 @@ impl OptionalBuilder for PatternOptionalBuilder {
             pending.push((start_row + slot, optional_batches));
         }
 
+        tracing::debug!(rows = pending.len(), "optional batched probe complete");
         Ok(Some(pending))
     }
 
@@ -658,9 +680,20 @@ impl GroupedPatternOptionalBuilder {
         };
         match binding {
             Binding::EncodedSid { s_id, .. } => Ok(Some(*s_id)),
-            Binding::Sid { sid, .. } => store
-                .find_subject_id_by_parts(sid.namespace_code, &sid.name)
-                .map_err(|e| QueryError::execution(format!("find_subject_id_by_parts: {e}"))),
+            Binding::Sid { sid, .. } => {
+                // Persisted reverse dict first, then DictNovelty — subjects
+                // minted after the last index resolve to novelty s_ids, the
+                // same id space the overlay ops are translated into.
+                let persisted = store
+                    .find_subject_id_by_parts(sid.namespace_code, &sid.name)
+                    .map_err(|e| QueryError::execution(format!("find_subject_id_by_parts: {e}")))?;
+                Ok(persisted.or_else(|| {
+                    ctx.dict_novelty
+                        .as_ref()
+                        .filter(|dn| dn.is_initialized())
+                        .and_then(|dn| dn.subjects.find_subject(sid.namespace_code, &sid.name))
+                }))
+            }
             _ => Ok(None),
         }
     }
@@ -777,17 +810,6 @@ impl OptionalBuilder for GroupedPatternOptionalBuilder {
             );
             return Ok(None);
         };
-        // Batched probe reads base leaflets without overlay merging — bail to
-        // the per-row scan when novelty is present.
-        if !ctx.overlay_free_single_graph() {
-            tracing::debug!(
-                predicate_count = self.triples.len(),
-                start_row,
-                reason = "overlay-present",
-                "grouped optional builder fallback"
-            );
-            return Ok(None);
-        }
         if self.triples.iter().any(|tp| tp.dtc.is_some()) {
             tracing::debug!(
                 predicate_count = self.triples.len(),
@@ -844,6 +866,21 @@ impl OptionalBuilder for GroupedPatternOptionalBuilder {
                 );
                 return Ok(None);
             };
+            let lane_plan = subject_probe_lane_plan(ctx, store, &pred_sid)?;
+            if matches!(lane_plan, ProbeLanePlan::Decline) {
+                tracing::debug!(
+                    predicate_count = self.triples.len(),
+                    start_row,
+                    pred_idx,
+                    reason = "overlay-unmergeable",
+                    "grouped optional builder fallback"
+                );
+                return Ok(None);
+            }
+            let mut probe_ops = match &lane_plan {
+                ProbeLanePlan::Merge(ops) => ProbeOps::new(ops.clone()),
+                _ => None,
+            };
             let probe_matches = batched_subject_probe_binary(
                 ctx,
                 store,
@@ -855,6 +892,7 @@ impl OptionalBuilder for GroupedPatternOptionalBuilder {
                     emit_object: true,
                     dict_overlay: dict_overlay.as_ref(),
                 },
+                probe_ops.as_mut(),
             )?;
             for probe_match in probe_matches {
                 let Some(slots) = subject_rows.get(&probe_match.subject_id) else {
@@ -888,6 +926,11 @@ impl OptionalBuilder for GroupedPatternOptionalBuilder {
             pending.push((start_row + slot, optional_batches));
         }
 
+        tracing::debug!(
+            rows = pending.len(),
+            predicate_count = self.triples.len(),
+            "grouped optional batched probe complete"
+        );
         Ok(Some(pending))
     }
 
@@ -1578,9 +1621,11 @@ impl Operator for OptionalOperator {
                         // Collect all optional results
                         let mut optional_batches = Vec::new();
                         while let Some(opt_batch) = optional_op.next_batch(ctx).await? {
+                            ctx.check_cancelled()?;
                             if !opt_batch.is_empty() {
                                 optional_batches.push(opt_batch);
                             }
+                            ctx.check_cancelled()?;
                         }
                         optional_result_batches += optional_batches.len();
 

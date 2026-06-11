@@ -61,6 +61,7 @@ pub struct ServerFileConfig {
     pub log_level: Option<String>,
     pub cors_enabled: Option<bool>,
     pub body_limit: Option<usize>,
+    pub query_timeout_ms: Option<u64>,
     pub cache_max_mb: Option<usize>,
 
     /// `[server.indexing]`
@@ -158,6 +159,8 @@ pub struct McpFileConfig {
     pub auth_trusted_issuers: Option<Vec<String>>,
     /// Byte budget for the MCP `sparql_query` Agent JSON envelope.
     pub agent_json_max_bytes: Option<usize>,
+    /// Query timeout for MCP `sparql_query`, in milliseconds.
+    pub query_timeout_ms: Option<u64>,
 }
 
 #[derive(Debug, Default, Clone, Deserialize, Serialize)]
@@ -373,6 +376,7 @@ pub const CONFIG_FILE_ARG_IDS: &[&str] = &[
     "log_level",
     "cors_enabled",
     "body_limit",
+    "query_timeout_ms",
     "cache_max_mb",
     "indexing_enabled",
     "reindex_min_bytes",
@@ -402,6 +406,7 @@ pub const CONFIG_FILE_ARG_IDS: &[&str] = &[
     "mcp_enabled",
     "mcp_auth_trusted_issuers",
     "mcp_agent_json_max_bytes",
+    "mcp_query_timeout_ms",
     "storage_proxy_enabled",
     "storage_proxy_trusted_issuers",
     "storage_proxy_default_identity",
@@ -474,6 +479,11 @@ pub fn apply_to_server_config(
     if is_default("body_limit") {
         if let Some(v) = file.body_limit {
             config.body_limit = v;
+        }
+    }
+    if is_default("query_timeout_ms") {
+        if let Some(v) = file.query_timeout_ms {
+            config.query_timeout_ms = v;
         }
     }
     if is_default("cache_max_mb") {
@@ -709,6 +719,11 @@ pub fn apply_to_server_config(
         if is_default("mcp_agent_json_max_bytes") {
             if let Some(v) = mcp.agent_json_max_bytes {
                 config.mcp_agent_json_max_bytes = v;
+            }
+        }
+        if is_default("mcp_query_timeout_ms") {
+            if let Some(v) = mcp.query_timeout_ms {
+                config.mcp_query_timeout_ms = v;
             }
         }
     }

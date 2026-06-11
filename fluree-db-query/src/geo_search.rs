@@ -55,7 +55,7 @@ pub struct GeoSearchOperator {
     /// by `DictOverlay`.
     p_id: Option<u32>,
     /// Pre-translated novelty overlay operations, sorted by POST order.
-    overlay_ops: Vec<OverlayOp>,
+    overlay_ops: std::sync::Arc<[OverlayOp]>,
     /// Overlay epoch for cursor cache keying.
     overlay_epoch: u64,
     /// Dict overlay for ephemeral ID translation and forward resolution.
@@ -96,7 +96,7 @@ impl GeoSearchOperator {
             out_pos,
             datatypes: WellKnownDatatypes::new(),
             p_id: None,
-            overlay_ops: Vec::new(),
+            overlay_ops: Vec::new().into(),
             overlay_epoch: 0,
             dict_overlay: None,
             state: OperatorState::Created,
@@ -405,7 +405,7 @@ impl Operator for GeoSearchOperator {
             if !ops.is_empty() {
                 sort_overlay_ops(&mut ops, RunSortOrder::Post);
                 resolve_overlay_ops(&mut ops);
-                self.overlay_ops = ops;
+                self.overlay_ops = ops.into();
                 self.overlay_epoch = epoch;
             }
             // Build DictOverlay for ephemeral ID translation.

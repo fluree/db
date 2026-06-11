@@ -14,8 +14,8 @@ use crate::vector::VectorIndexProvider;
 use fluree_db_binary_index::{BinaryGraphView, BinaryIndexStore, FulltextArena};
 use fluree_db_core::dict_novelty::DictNovelty;
 use fluree_db_core::{
-    GraphDbRef, GraphId, LedgerSnapshot, NoOverlay, OverlayProvider, RuntimeSmallDicts, Sid,
-    Tracker, FIRST_USER_GRAPH_ID,
+    GraphDbRef, GraphId, LedgerSnapshot, NoOverlay, OverlayProvider, QueryCancellation,
+    RuntimeSmallDicts, Sid, Tracker, FIRST_USER_GRAPH_ID,
 };
 
 use crate::binary_range::BinaryRangeProvider;
@@ -54,6 +54,10 @@ pub enum ConstSidKey {
 /// the memo is correctly scoped — no cross-ledger aliasing. `Arc<Mutex<…>>` so
 /// derived per-graph contexts can share it and the context stays `Send + Sync`.
 pub type ConstSidCache = Arc<Mutex<FxHashMap<ConstSidKey, Option<u64>>>>;
+
+/// Shared handle to the per-query overlay-ops memo
+/// ([`OverlayOpsCache`](crate::fast_path_common::OverlayOpsCache)).
+pub type SharedOverlayOpsCache = Arc<crate::fast_path_common::OverlayOpsCache>;
 
 /// Map from `(graph_id, predicate_id, lang_id)` to fulltext BoW arenas used
 /// by `fulltext()` BM25 scoring.
@@ -113,6 +117,8 @@ pub struct ExecutionContext<'a> {
     pub active_graph: ActiveGraph,
     /// Optional execution tracker (time/fuel/policy)
     pub tracker: Tracker,
+    /// Optional cooperative cancellation handle.
+    pub cancellation: QueryCancellation,
     /// When true, bind evaluation errors are treated as query errors.
     pub strict_bind_errors: bool,
     /// Optional binary columnar index store for fast local-file scans.
@@ -195,6 +201,16 @@ pub struct ExecutionContext<'a> {
     /// Per-query memo: constant filter operands → internal subject id, so a
     /// `<const> != ?var` FILTER resolves the constant once, not per row.
     pub const_sid_cache: ConstSidCache,
+    /// Per-query memo: translated + resolved overlay ops per
+    /// `(graph, order, predicate)` — see
+    /// [`OverlayOpsCache`](crate::fast_path_common::OverlayOpsCache).
+    ///
+    /// Derivations that change `overlay`, `to_t`, dictionaries, or the binary
+    /// store must start a fresh cache; graph switches may share it (the graph
+    /// id is part of the cache key). The cache self-validates its binding at
+    /// access time, so a wrongly-shared cache degrades to uncached compute
+    /// rather than serving stale ops.
+    pub overlay_ops_cache: SharedOverlayOpsCache,
 }
 
 impl<'a> ExecutionContext<'a> {
@@ -216,6 +232,7 @@ impl<'a> ExecutionContext<'a> {
             dataset: None,
             active_graph: ActiveGraph::Default,
             tracker: Tracker::disabled(),
+            cancellation: QueryCancellation::disabled(),
             strict_bind_errors: false,
             binary_store: None,
             binary_g_id: 0,
@@ -231,6 +248,7 @@ impl<'a> ExecutionContext<'a> {
             eager_materialization: false,
             original_snapshot: snapshot,
             const_sid_cache: ConstSidCache::default(),
+            overlay_ops_cache: SharedOverlayOpsCache::default(),
         }
     }
 
@@ -264,6 +282,7 @@ impl<'a> ExecutionContext<'a> {
             dataset: None,
             active_graph: ActiveGraph::Default,
             tracker: Tracker::disabled(),
+            cancellation: QueryCancellation::disabled(),
             strict_bind_errors: false,
             binary_store,
             binary_g_id: db.g_id,
@@ -279,6 +298,7 @@ impl<'a> ExecutionContext<'a> {
             eager_materialization: db.eager,
             original_snapshot: db.snapshot,
             const_sid_cache: ConstSidCache::default(),
+            overlay_ops_cache: SharedOverlayOpsCache::default(),
         }
     }
 
@@ -316,6 +336,7 @@ impl<'a> ExecutionContext<'a> {
             dataset: None,
             active_graph: ActiveGraph::Default,
             tracker: Tracker::disabled(),
+            cancellation: QueryCancellation::disabled(),
             strict_bind_errors: false,
             binary_store,
             binary_g_id: db.g_id,
@@ -331,6 +352,7 @@ impl<'a> ExecutionContext<'a> {
             eager_materialization: db.eager,
             original_snapshot: db.snapshot,
             const_sid_cache: ConstSidCache::default(),
+            overlay_ops_cache: SharedOverlayOpsCache::default(),
         }
     }
 
@@ -357,6 +379,7 @@ impl<'a> ExecutionContext<'a> {
             dataset: None,
             active_graph: ActiveGraph::Default,
             tracker: Tracker::disabled(),
+            cancellation: QueryCancellation::disabled(),
             strict_bind_errors: false,
             binary_store: None,
             binary_g_id: 0,
@@ -372,6 +395,7 @@ impl<'a> ExecutionContext<'a> {
             eager_materialization: false,
             original_snapshot: snapshot,
             const_sid_cache: ConstSidCache::default(),
+            overlay_ops_cache: SharedOverlayOpsCache::default(),
         }
     }
 
@@ -397,6 +421,7 @@ impl<'a> ExecutionContext<'a> {
             dataset: None,
             active_graph: ActiveGraph::Default,
             tracker: Tracker::disabled(),
+            cancellation: QueryCancellation::disabled(),
             strict_bind_errors: false,
             binary_store: None,
             binary_g_id: 0,
@@ -412,6 +437,7 @@ impl<'a> ExecutionContext<'a> {
             eager_materialization: false,
             original_snapshot: snapshot,
             const_sid_cache: ConstSidCache::default(),
+            overlay_ops_cache: SharedOverlayOpsCache::default(),
         }
     }
 
@@ -439,6 +465,7 @@ impl<'a> ExecutionContext<'a> {
             dataset: None,
             active_graph: ActiveGraph::Default,
             tracker: Tracker::disabled(),
+            cancellation: QueryCancellation::disabled(),
             strict_bind_errors: false,
             binary_store: None,
             binary_g_id: 0,
@@ -454,6 +481,7 @@ impl<'a> ExecutionContext<'a> {
             eager_materialization: false,
             original_snapshot: snapshot,
             const_sid_cache: ConstSidCache::default(),
+            overlay_ops_cache: SharedOverlayOpsCache::default(),
         }
     }
 
@@ -531,6 +559,21 @@ impl<'a> ExecutionContext<'a> {
     pub fn with_tracker(mut self, tracker: Tracker) -> Self {
         self.tracker = tracker;
         self
+    }
+
+    /// Attach a cooperative cancellation handle to this context.
+    pub fn with_cancellation(mut self, cancellation: QueryCancellation) -> Self {
+        self.cancellation = cancellation;
+        self
+    }
+
+    /// Return an error if query execution has been cancelled or timed out.
+    #[inline]
+    pub fn check_cancelled(&self) -> Result<(), QueryError> {
+        match self.cancellation.reason() {
+            Some(reason) => Err(QueryError::Cancelled { reason }),
+            None => Ok(()),
+        }
     }
 
     /// Enable strict bind error handling.
@@ -882,6 +925,7 @@ impl<'a> ExecutionContext<'a> {
             dataset: self.dataset,
             active_graph,
             tracker: self.tracker.clone(),
+            cancellation: self.cancellation.clone(),
             strict_bind_errors: self.strict_bind_errors,
             binary_store: self.binary_store.clone(),
             binary_g_id,
@@ -897,6 +941,7 @@ impl<'a> ExecutionContext<'a> {
             eager_materialization: self.eager_materialization,
             original_snapshot: self.original_snapshot,
             const_sid_cache: self.const_sid_cache.clone(),
+            overlay_ops_cache: self.overlay_ops_cache.clone(),
         }
     }
 
@@ -933,6 +978,7 @@ impl<'a> ExecutionContext<'a> {
             dataset: self.dataset,
             active_graph: ActiveGraph::Default,
             tracker: self.tracker.clone(),
+            cancellation: self.cancellation.clone(),
             strict_bind_errors: self.strict_bind_errors,
             binary_store: self.binary_store.clone(),
             binary_g_id,
@@ -948,6 +994,7 @@ impl<'a> ExecutionContext<'a> {
             eager_materialization: self.eager_materialization,
             original_snapshot: self.original_snapshot,
             const_sid_cache: self.const_sid_cache.clone(),
+            overlay_ops_cache: self.overlay_ops_cache.clone(),
         }
     }
 
@@ -980,6 +1027,7 @@ impl<'a> ExecutionContext<'a> {
             dataset: None,
             active_graph: ActiveGraph::Default,
             tracker: self.tracker.clone(),
+            cancellation: self.cancellation.clone(),
             strict_bind_errors: self.strict_bind_errors,
             binary_store: Self::extract_binary_store(graph.snapshot),
             binary_g_id: graph.g_id,
@@ -1002,6 +1050,7 @@ impl<'a> ExecutionContext<'a> {
             // graph/store into another. (`with_active_graph`/`with_default_graph`
             // keep the same store, so they correctly share the parent's memo.)
             const_sid_cache: ConstSidCache::default(),
+            overlay_ops_cache: SharedOverlayOpsCache::default(),
         }
     }
 
@@ -1048,18 +1097,24 @@ impl<'a> ExecutionContext<'a> {
     pub fn with_binary_store(mut self, store: Arc<BinaryIndexStore>, g_id: GraphId) -> Self {
         self.binary_store = Some(store);
         self.binary_g_id = g_id;
+        // Store identity is part of the overlay-ops cache binding.
+        self.overlay_ops_cache = SharedOverlayOpsCache::default();
         self
     }
 
     /// Attach a dictionary novelty layer for binary scan subject/string lookups.
     pub fn with_dict_novelty(mut self, dict_novelty: Arc<DictNovelty>) -> Self {
         self.dict_novelty = Some(dict_novelty);
+        // Dict-novelty identity is part of the overlay-ops cache binding.
+        self.overlay_ops_cache = SharedOverlayOpsCache::default();
         self
     }
 
     /// Attach runtime predicate/datatype IDs carried by the db value.
     pub fn with_runtime_small_dicts(mut self, runtime_small_dicts: &'a RuntimeSmallDicts) -> Self {
         self.runtime_small_dicts = Some(runtime_small_dicts);
+        // Small-dict identity is part of the overlay-ops cache binding.
+        self.overlay_ops_cache = SharedOverlayOpsCache::default();
         self
     }
 

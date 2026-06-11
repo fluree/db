@@ -18,7 +18,7 @@ use crate::stats_cache::cached_stats_view_for_db;
 use crate::var_registry::VarRegistry;
 use fluree_db_binary_index::BinaryIndexStore;
 use fluree_db_core::dict_novelty::DictNovelty;
-use fluree_db_core::{GraphDbRef, GraphId, LedgerSnapshot, Tracker};
+use fluree_db_core::{GraphDbRef, GraphId, LedgerSnapshot, QueryCancellation, Tracker};
 use fluree_db_reasoner::DerivedFactsOverlay;
 use fluree_db_spatial::SpatialIndexProvider;
 use std::collections::HashMap;
@@ -461,11 +461,13 @@ pub async fn run_operator(
 
         span.record("from_t", ctx.from_t);
 
+        ctx.check_cancelled()?;
         let open_start = Instant::now();
         operator
             .open(ctx)
             .instrument(tracing::debug_span!("operator_open"))
             .await?;
+        ctx.check_cancelled()?;
         span.record(
             "open_ms",
             (open_start.elapsed().as_secs_f64() * 1000.0) as u64,
@@ -477,8 +479,10 @@ pub async fn run_operator(
         let mut max_batch_ms: u64 = 0;
         let run_start = Instant::now();
         while {
+            ctx.check_cancelled()?;
             let batch_start = Instant::now();
             let next = operator.next_batch(ctx).await?;
+            ctx.check_cancelled()?;
             let batch_ms = (batch_start.elapsed().as_secs_f64() * 1000.0) as u64;
             if batch_ms > max_batch_ms {
                 max_batch_ms = batch_ms;
@@ -526,6 +530,8 @@ pub async fn run_operator(
 /// This is the unified knob for all query execution paths.
 pub struct ContextConfig<'a, 'b> {
     pub tracker: Option<&'a Tracker>,
+    /// Cooperative cancellation handle for execution.
+    pub cancellation: Option<QueryCancellation>,
     /// Policy enforcer for async policy evaluation with full f:query support.
     ///
     /// When set, scan operators will use per-leaf batch filtering via `filter_flakes`.
@@ -577,6 +583,7 @@ impl Default for ContextConfig<'_, '_> {
     fn default() -> Self {
         Self {
             tracker: None,
+            cancellation: None,
             policy_enforcer: None,
             dataset: None,
             r2rml: None,
@@ -650,6 +657,9 @@ pub async fn execute_prepared<'a, 'b>(
 
     if let Some(tracker) = config.tracker {
         ctx = ctx.with_tracker(tracker.clone());
+    }
+    if let Some(cancellation) = config.cancellation {
+        ctx = ctx.with_cancellation(cancellation);
     }
     if let Some(enforcer) = config.policy_enforcer {
         ctx = ctx.with_policy_enforcer(enforcer);

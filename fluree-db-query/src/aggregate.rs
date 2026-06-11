@@ -189,9 +189,11 @@ impl Operator for AggregateOperator {
 
             let num_cols = self.in_schema.len();
             let mut output_columns: Vec<Vec<Binding>> = Vec::with_capacity(num_cols);
+            ctx.check_cancelled()?;
 
             // Process child columns (regular aggregates and pass-through)
             for col_idx in 0..self.child_col_count {
+                ctx.check_cancelled()?;
                 let mut col_output = Vec::with_capacity(batch.len());
 
                 for row_idx in 0..batch.len() {
@@ -214,11 +216,13 @@ impl Operator for AggregateOperator {
 
                 output_columns.push(col_output);
             }
+            ctx.check_cancelled()?;
 
             if !self.extra_specs.is_empty() {
                 let mut group_sizes: Option<Vec<i64>> = None;
 
                 for (agg_idx, input_col, _output_col_idx) in &self.extra_specs {
+                    ctx.check_cancelled()?;
                     let spec = &self.aggregates[*agg_idx];
                     let col_output: Vec<Binding> = match input_col {
                         Some(col_idx) => (0..batch.len())
@@ -258,6 +262,7 @@ impl Operator for AggregateOperator {
                     output_columns.push(col_output);
                 }
             }
+            ctx.check_cancelled()?;
 
             let out = Batch::new(self.in_schema.clone(), output_columns)?;
             span.record("ms", (start.elapsed().as_secs_f64() * 1000.0) as u64);

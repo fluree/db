@@ -328,9 +328,11 @@ impl Operator for MinusOperator {
 
             let mut batches = Vec::new();
             while let Some(batch) = minus_op.next_batch(ctx).await? {
+                ctx.check_cancelled()?;
                 if !batch.is_empty() {
                     batches.push(batch);
                 }
+                ctx.check_cancelled()?;
             }
 
             minus_op.close();

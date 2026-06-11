@@ -200,6 +200,7 @@ impl Operator for GroupByOperator {
 
                 // Drain all input from child
                 loop {
+                    ctx.check_cancelled()?;
                     let next_start = Instant::now();
                     let next = self
                         .child
@@ -211,6 +212,7 @@ impl Operator for GroupByOperator {
                     let Some(batch) = next else {
                         break;
                     };
+                    ctx.check_cancelled()?;
                     input_batches += 1;
                     if batch.is_empty() {
                         continue;
@@ -234,6 +236,7 @@ impl Operator for GroupByOperator {
                         self.groups.entry(group_key).or_default().push(row);
                     }
                     process_rows_ms += (proc_start.elapsed().as_secs_f64() * 1000.0) as u64;
+                    ctx.check_cancelled()?;
                 }
 
                 span.record("input_batches", input_batches);

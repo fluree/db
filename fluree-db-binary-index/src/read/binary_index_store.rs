@@ -1446,6 +1446,26 @@ impl BinaryIndexStore {
     }
 
     /// Reverse subject lookup by namespace parts (avoids IRI construction).
+    /// Find the NumBig arena handle for an already-indexed big numeric value
+    /// (overflow `xsd:integer` / typed `xsd:decimal`) under `(g_id, p_id)`.
+    ///
+    /// Read-only: returns `None` when the value was never indexed for this
+    /// predicate — overlay translation treats that as untranslatable (raw
+    /// flake / fast-path decline) rather than minting a handle.
+    pub fn find_numbig_handle(
+        &self,
+        g_id: GraphId,
+        p_id: u32,
+        val: &fluree_db_core::value::FlakeValue,
+    ) -> Option<u32> {
+        let arena = self.graph_indexes.get(&g_id)?.numbig.get(&p_id)?;
+        match val {
+            fluree_db_core::value::FlakeValue::BigInt(bi) => arena.find_bigint(bi),
+            fluree_db_core::value::FlakeValue::Decimal(bd) => arena.find_bigdec(bd),
+            _ => None,
+        }
+    }
+
     pub fn find_subject_id_by_parts(&self, ns_code: u16, suffix: &str) -> io::Result<Option<u64>> {
         match &self.dicts.subject_reverse_tree {
             Some(tree) => {

@@ -186,44 +186,57 @@ impl FlureeToolService {
         // — which target the connection-scoped path and don't round-trip through this
         // ledger-scoped tool — never apply. Pagination guidance is added by `annotate_pagination`.
         let config = fluree_db_api::FormatterConfig::agent_json().with_max_bytes(max_bytes);
+        let state = self.state.clone();
+        let ledger = ledger.to_string();
+        let query = query.to_string();
+        let identity = identity.map(str::to_string);
+        let timeout_ms = state.config.mcp_query_timeout_ms;
 
-        let mut envelope = match identity {
-            Some(id) => {
-                let opts = fluree_db_api::QueryConnectionOptions {
-                    identity: Some(id.to_string()),
-                    ..Default::default()
-                };
-                let view = match t {
-                    Some(t) => {
-                        self.state
+        let mut envelope = crate::query_control::run_query_task(timeout_ms, move || async move {
+            let envelope = match identity.as_deref() {
+                Some(id) => {
+                    let opts = fluree_db_api::QueryConnectionOptions {
+                        identity: Some(id.to_string()),
+                        ..Default::default()
+                    };
+                    let view = match t {
+                        Some(t) => state.fluree.db_at_t_with_policy(&ledger, t, &opts).await?,
+                        None => state.fluree.db_with_policy(&ledger, &opts).await?,
+                    };
+                    view.query(state.fluree.as_ref())
+                        .sparql(&query)
+                        .format(config)
+                        .execution_options(crate::query_control::current_query_execution_options(
+                            timeout_ms,
+                        ))
+                        .execute_formatted()
+                        .await?
+                }
+                None => {
+                    let graph = match t {
+                        Some(t) => state
                             .fluree
-                            .db_at_t_with_policy(ledger, t, &opts)
-                            .await?
-                    }
-                    None => self.state.fluree.db_with_policy(ledger, &opts).await?,
-                };
-                view.query(self.state.fluree.as_ref())
-                    .sparql(query)
-                    .format(config)
-                    .execute_formatted()
-                    .await?
-            }
-            None => {
-                let graph = match t {
-                    Some(t) => self
-                        .state
-                        .fluree
-                        .graph_at(ledger, fluree_db_api::TimeSpec::AtT(t)),
-                    None => self.state.fluree.graph(ledger),
-                };
-                graph
-                    .query()
-                    .sparql(query)
-                    .format(config)
-                    .execute_formatted()
-                    .await?
-            }
-        };
+                            .graph_at(&ledger, fluree_db_api::TimeSpec::AtT(t)),
+                        None => state.fluree.graph(&ledger),
+                    };
+                    graph
+                        .query()
+                        .sparql(&query)
+                        .format(config)
+                        .execution_options(crate::query_control::current_query_execution_options(
+                            timeout_ms,
+                        ))
+                        .execute_formatted()
+                        .await?
+                }
+            };
+            Ok(envelope)
+        })
+        .await
+        .map_err(|e| match e {
+            crate::error::ServerError::Api(api) => api,
+            other => fluree_db_api::ApiError::Internal(other.to_string()),
+        })?;
 
         Self::annotate_pagination(&mut envelope);
         Ok(envelope)
