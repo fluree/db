@@ -50,13 +50,51 @@ pub struct CapturedSpan {
 /// Index into the SpanStore vec, stored in span extensions for `on_record` and `on_close` updates.
 struct SpanIndex(usize);
 
-/// Thread-safe store of captured spans with query methods.
+/// A captured event (e.g. `tracing::debug!(...)`) with its fields.
+/// The event's message lives under the `"message"` field key.
+#[derive(Debug, Clone)]
+pub struct CapturedEvent {
+    pub level: tracing::Level,
+    pub fields: HashMap<String, String>,
+}
+
+impl CapturedEvent {
+    pub fn message(&self) -> &str {
+        self.fields.get("message").map(String::as_str).unwrap_or("")
+    }
+}
+
+/// Thread-safe store of captured spans and events with query methods.
 #[derive(Debug, Clone, Default)]
-pub struct SpanStore(Arc<Mutex<Vec<CapturedSpan>>>);
+pub struct SpanStore(
+    Arc<Mutex<Vec<CapturedSpan>>>,
+    Arc<Mutex<Vec<CapturedEvent>>>,
+);
 
 impl SpanStore {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// All captured events.
+    pub fn all_events(&self) -> Vec<CapturedEvent> {
+        self.1.lock().unwrap().clone()
+    }
+
+    /// All captured events whose message equals `message`.
+    pub fn find_events(&self, message: &str) -> Vec<CapturedEvent> {
+        self.1
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| e.message() == message)
+            .cloned()
+            .collect()
+    }
+
+    /// Check if any event with the given message was captured.
+    pub fn has_event(&self, message: &str) -> bool {
+        !self.find_events(message).is_empty()
     }
 
     /// Check if any span with the given name was captured.
@@ -223,6 +261,15 @@ where
                 }
             }
         }
+    }
+
+    fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
+        let mut fields = FieldVisitor(HashMap::new());
+        event.record(&mut fields);
+        self.store.1.lock().unwrap().push(CapturedEvent {
+            level: *event.metadata().level(),
+            fields: fields.0,
+        });
     }
 
     fn on_close(&self, id: tracing::span::Id, ctx: Context<'_, S>) {

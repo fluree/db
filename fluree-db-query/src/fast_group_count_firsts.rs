@@ -1391,6 +1391,7 @@ fn compute_group_by_object_star_topk(
          -> Result<Option<u64>> {
             loop {
                 if f_batch.is_none() || *f_i >= f_batch.as_ref().unwrap().row_count {
+                    ctx.check_cancelled()?;
                     *f_batch = fcur
                         .next_batch()
                         .map_err(|e| QueryError::Internal(format!("cursor batch: {e}")))?;
@@ -1415,6 +1416,7 @@ fn compute_group_by_object_star_topk(
                                   g_i: &mut usize|
          -> Result<Option<u64>> {
             if g_batch.is_none() || *g_i >= g_batch.as_ref().unwrap().row_count {
+                ctx.check_cancelled()?;
                 *g_batch = cursor
                     .next_batch()
                     .map_err(|e| QueryError::Internal(format!("cursor batch: {e}")))?;
@@ -1431,7 +1433,6 @@ fn compute_group_by_object_star_topk(
         while let (Some(gs), Some(cur_fs)) =
             (peek_group_subject(&mut cursor, &mut g_batch, &mut g_i)?, fs)
         {
-            ctx.check_cancelled()?;
             match gs.cmp(&cur_fs) {
                 Ordering::Less => {
                     // Skip all group rows for this subject.
@@ -1439,7 +1440,6 @@ fn compute_group_by_object_star_topk(
                     while let Some(cur_gs) =
                         peek_group_subject(&mut cursor, &mut g_batch, &mut g_i)?
                     {
-                        ctx.check_cancelled()?;
                         if cur_gs != skip_s {
                             break;
                         }
@@ -1454,7 +1454,6 @@ fn compute_group_by_object_star_topk(
                     while let Some(cur_gs) =
                         peek_group_subject(&mut cursor, &mut g_batch, &mut g_i)?
                     {
-                        ctx.check_cancelled()?;
                         if cur_gs != s {
                             break;
                         }

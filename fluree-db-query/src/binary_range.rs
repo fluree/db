@@ -57,6 +57,9 @@ fn translate_overlay_ops_v3_with_raw(
     let mut ops: Vec<fluree_db_binary_index::OverlayOp> = Vec::new();
     let mut raw: Vec<Flake> = Vec::new();
     let mut failed = false;
+    let mut unsupported_count: u64 = 0;
+    let mut error_count: u64 = 0;
+    let mut first_error: Option<String> = None;
 
     overlay.for_each_overlay_flake(g_id, index, None, None, true, to_t, &mut |flake| {
         if !include(flake) {
@@ -75,7 +78,15 @@ fn translate_overlay_ops_v3_with_raw(
             Err(e) => {
                 failed = true;
                 raw.push(flake.clone());
-                tracing::warn!(
+                if e.kind() == std::io::ErrorKind::Unsupported {
+                    unsupported_count += 1;
+                } else {
+                    error_count += 1;
+                }
+                if first_error.is_none() {
+                    first_error = Some(e.to_string());
+                }
+                tracing::debug!(
                     ctx = warn_ctx,
                     error = %e,
                     s = %flake.s,
@@ -87,6 +98,30 @@ fn translate_overlay_ops_v3_with_raw(
             }
         }
     });
+
+    // One summary per translation call, not one line per flake: a novelty
+    // tail full of untranslatable values (e.g. arena-new decimals) used to
+    // emit a WARN per flake per query — a log storm at INFO. `Unsupported`
+    // is a handled condition (the raw-flake merge is correct), so it stays
+    // at debug; unexpected errors keep a warn.
+    if failed {
+        if error_count > 0 {
+            tracing::warn!(
+                ctx = warn_ctx,
+                unsupported = unsupported_count,
+                errors = error_count,
+                first_error = first_error.as_deref().unwrap_or(""),
+                "some overlay flakes failed V3 translation; merging as raw flakes"
+            );
+        } else {
+            tracing::debug!(
+                ctx = warn_ctx,
+                unsupported = unsupported_count,
+                first_error = first_error.as_deref().unwrap_or(""),
+                "some overlay flakes are not V3-translatable; merging as raw flakes"
+            );
+        }
+    }
 
     let ephemeral_p_id_to_sid: HashMap<u32, Sid> = ephemeral_preds
         .into_iter()
@@ -457,7 +492,7 @@ fn binary_range_eq_v3(
         fluree_db_binary_index::read::types::sort_overlay_ops(&mut ops, order);
         fluree_db_binary_index::read::types::resolve_overlay_ops(&mut ops);
         let epoch = overlay.epoch();
-        cursor.set_overlay_ops(ops);
+        cursor.set_overlay_ops(ops.into());
         cursor.set_epoch(epoch);
     }
 
@@ -800,7 +835,7 @@ fn binary_lookup_subject_predicate_refs_batched_v3(
     if !ops.is_empty() {
         fluree_db_binary_index::read::types::sort_overlay_ops(&mut ops, RunSortOrder::Psot);
         fluree_db_binary_index::read::types::resolve_overlay_ops(&mut ops);
-        cursor.set_overlay_ops(ops);
+        cursor.set_overlay_ops(ops.into());
         cursor.set_epoch(overlay.epoch());
     }
 
@@ -1122,7 +1157,7 @@ fn binary_range_bounded_v3(
     if !overlay_ops.is_empty() {
         fluree_db_binary_index::read::types::sort_overlay_ops(&mut overlay_ops, order);
         fluree_db_binary_index::read::types::resolve_overlay_ops(&mut overlay_ops);
-        cursor.set_overlay_ops(overlay_ops);
+        cursor.set_overlay_ops(overlay_ops.into());
         cursor.set_epoch(overlay.epoch());
     }
 

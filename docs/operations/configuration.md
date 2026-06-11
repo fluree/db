@@ -300,7 +300,10 @@ Maximum request body size in bytes:
 
 Maximum query execution time in milliseconds. The server starts a timeout task
 that signals query cancellation when the limit elapses; query execution observes
-that signal at batch/leaf boundaries. Set to `0` to disable the server-side
+that signal at I/O boundaries — operator batch handoffs, leaflet refills in the
+fused COUNT fast paths, and parallel-partition starts — never inside per-row
+loops (in-loop checks measurably perturb hot-loop codegen). Cancellation
+latency is bounded by one leaflet/batch of work, typically well under 10ms. Set to `0` to disable the server-side
 timeout. If an HTTP client disconnects while a query is still running, the
 server signals cancellation through the same cooperative handle so long-running
 operators can stop at the next checkpoint.
