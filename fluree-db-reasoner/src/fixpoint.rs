@@ -150,22 +150,12 @@ pub async fn run_fixpoint(
     while !delta.is_empty() || same_as_changed_carry {
         // Check budget
         if start.elapsed() > budget.max_duration {
-            diagnostics = ReasoningDiagnostics::capped(
-                "time",
-                iterations,
-                derived.derived_len(),
-                start.elapsed(),
-            );
+            diagnostics.mark_capped("time", iterations, derived.derived_len(), start.elapsed());
             break;
         }
 
         if derived.derived_len() > budget.max_facts {
-            diagnostics = ReasoningDiagnostics::capped(
-                "facts",
-                iterations,
-                derived.derived_len(),
-                start.elapsed(),
-            );
+            diagnostics.mark_capped("facts", iterations, derived.derived_len(), start.elapsed());
             break;
         }
 
@@ -332,9 +322,7 @@ pub async fn run_fixpoint(
 
     // Update diagnostics if not already capped
     if !diagnostics.capped {
-        diagnostics =
-            ReasoningDiagnostics::completed(iterations, derived.derived_len(), start.elapsed());
-        diagnostics.rules_fired = std::mem::take(&mut diagnostics.rules_fired);
+        diagnostics.mark_completed(iterations, derived.derived_len(), start.elapsed());
     }
 
     Ok((derived.into_derived_flakes(), frozen_same_as, diagnostics))

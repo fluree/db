@@ -17,7 +17,7 @@ use fluree_db_core::comparator::IndexType;
 use fluree_db_core::flake::Flake;
 use fluree_db_core::value::FlakeValue;
 use fluree_db_core::{GraphDbRef, LedgerSnapshot, OverlayProvider, Sid};
-use fluree_db_reasoner::{reason_owl2rl, ReasoningCache, ReasoningOptions};
+use fluree_db_reasoner::{reason_owl2rl, ReasoningBudget, ReasoningCache, ReasoningOptions};
 
 struct SortedOverlay {
     epoch: u64,
@@ -145,6 +145,15 @@ async fn assert_fp_conflict_after_merge(fp_subject: &str, spo_subject: &str) {
 
     eprintln!("rules_fired: {:?}", res.diagnostics.rules_fired);
 
+    // Diagnostics must report the rules that fired, not an empty map.
+    for rule in ["prp-ifp", "prp-fp", "prp-spo1"] {
+        assert!(
+            res.diagnostics.rules_fired.contains_key(rule),
+            "rules_fired should record {rule}: {:?}",
+            res.diagnostics.rules_fired
+        );
+    }
+
     // Sanity: prp-ifp must have merged A and B.
     assert_eq!(
         same_as.canonical(ex("A")),
@@ -158,6 +167,46 @@ async fn assert_fp_conflict_after_merge(fp_subject: &str, spo_subject: &str) {
         same_as.canonical(ex("y2")),
         "prp-fp must derive sameAs(y1, y2) after the A≡B merge \
          ({fp_subject} p y1 ; {spo_subject} r y2 ; r ⊑ p)"
+    );
+}
+
+/// A capped run must still report the rules that fired before the cap hit.
+#[tokio::test]
+async fn capped_run_preserves_rules_fired() {
+    let ty = rdf("type");
+
+    let mut f = vec![
+        tf(ex("p"), ty.clone(), owl("TransitiveProperty")),
+        tf(ex("a"), ex("p"), ex("b")),
+        tf(ex("b"), ex("p"), ex("c")),
+        tf(ex("c"), ex("p"), ex("d")),
+        tf(ex("d"), ex("p"), ex("e")),
+    ];
+    f.sort_by(|a, b| IndexType::Spot.compare(a, b));
+
+    let mut snapshot = LedgerSnapshot::genesis("test/main");
+    for (code, iri) in [
+        (3, "http://www.w3.org/1999/02/22-rdf-syntax-ns#"),
+        (4, "http://www.w3.org/2000/01/rdf-schema#"),
+        (6, "http://www.w3.org/2002/07/owl#"),
+        (100, "http://example.org/"),
+    ] {
+        let _ = snapshot.insert_namespace_code(code, iri.to_string());
+    }
+    let overlay = SortedOverlay::new(1234, f);
+    let cache = ReasoningCache::with_default_capacity();
+    let db = GraphDbRef::new(&snapshot, 0, &overlay, 10);
+    let opts = ReasoningOptions::with_budget(ReasoningBudget {
+        max_facts: 1,
+        ..ReasoningBudget::default()
+    });
+    let res = reason_owl2rl(db, &opts, &cache).await.unwrap();
+
+    assert!(res.diagnostics.capped, "max_facts=1 must cap the closure");
+    assert!(
+        res.diagnostics.rules_fired.contains_key("prp-trp"),
+        "capped diagnostics should keep rule-fire counts: {:?}",
+        res.diagnostics.rules_fired
     );
 }
 
