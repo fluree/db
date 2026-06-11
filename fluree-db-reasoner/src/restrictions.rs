@@ -219,6 +219,11 @@ impl RestrictionIndex {
         self.by_id.get(id)
     }
 
+    /// Iterate over all parsed restrictions (used by rule compilation).
+    pub fn iter(&self) -> impl Iterator<Item = &ParsedRestriction> {
+        self.by_id.values()
+    }
+
     /// Get all HasValue restriction IDs for a property
     pub fn has_value_restrictions_for(&self, property: &Sid) -> &[Sid] {
         static EMPTY: &[Sid] = &[];

@@ -36,6 +36,7 @@
 //! ```
 
 pub mod cache;
+pub mod compile;
 pub mod datalog;
 pub mod error;
 pub mod execute;
@@ -52,6 +53,7 @@ pub mod types;
 pub use cache::{
     ReasoningBudget, ReasoningCache, ReasoningCacheKey, ReasoningDiagnostics, ReasoningResult,
 };
+pub use compile::{compile, ClassRuleKind, CompiledRules, PropertyRuleKind};
 pub use datalog::{
     execute_rule_with_bindings, instantiate_pattern, BindingValue, Bindings, CompareOp,
     DatalogRule, DatalogRuleSet, RuleFilter, RuleTerm, RuleTriplePattern, RuleValue,
