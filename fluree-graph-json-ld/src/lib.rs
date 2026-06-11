@@ -44,10 +44,14 @@ pub mod adapter;
 // JSON-LD file splitter for bulk import
 pub mod splitter;
 
+// Newline-delimited JSON-LD (ndjson / jsonl) splitter for bulk import
+pub mod ndjson_splitter;
+
 pub use compact::ContextCompactor;
 pub use context::{Container, ContextEntry, ParsedContext, TypeValue};
 pub use error::{JsonLdError, Result};
 pub use iri::UnresolvedIriDisposition;
+pub use ndjson_splitter::{FirstLineContextPolicy, NdjsonReader};
 pub use normalize::{Algorithm, Format, NormalizeOptions};
 
 use serde_json::Value as JsonValue;

@@ -136,8 +136,9 @@ pub use graph_source::{
 };
 pub use graph_transact_builder::{GraphTransactBuilder, StagedGraph};
 pub use import::{
-    scan_directory_format, CreateBuilder, DirectoryFormat, EffectiveImportSettings, ImportBuilder,
-    ImportConfig, ImportError, ImportPhase, ImportResult, ImportSummary, RemoteSource,
+    is_bulk_import_file, scan_directory_format, CreateBuilder, DirectoryFormat,
+    EffectiveImportSettings, ImportBuilder, ImportConfig, ImportError, ImportPhase, ImportResult,
+    ImportSummary, RemoteSource,
 };
 pub use ledger_info::LedgerInfoBuilder;
 pub use ledger_manager::{
@@ -278,6 +279,10 @@ use std::sync::Arc;
 // Re-export encryption types for convenient access
 pub use fluree_db_crypto::{EncryptedStorage, EncryptionKey, StaticKeyProvider};
 pub use fluree_graph_json_ld::ParsedContext;
+// Appears in `ImportConfig` / `ImportBuilder::ndjson_first_line_context`, so
+// API consumers must be able to name it without a direct dependency on the
+// internal fluree-graph-json-ld crate.
+pub use fluree_graph_json_ld::FirstLineContextPolicy;
 
 // ============================================================================
 // Dynamic runtime wrappers (single JSON-LD "source of truth")
@@ -767,6 +772,11 @@ where
         }
     }
 
+    fn supports_ranged_reads(&self) -> bool {
+        // No address to route on — claim support only if both tiers have it.
+        self.commit.supports_ranged_reads() && self.index.supports_ranged_reads()
+    }
+
     async fn exists(&self, address: &str) -> std::result::Result<bool, fluree_db_core::Error> {
         if Self::route_to_commit(address) {
             self.commit.exists(address).await
@@ -950,6 +960,16 @@ impl StorageRead for AddressIdentifierResolverStorage {
         range: std::ops::Range<u64>,
     ) -> std::result::Result<Vec<u8>, fluree_db_core::Error> {
         self.route(address).read_byte_range(address, range).await
+    }
+
+    fn supports_ranged_reads(&self) -> bool {
+        // No address to route on — claim support only if every routable
+        // storage has it.
+        self.default.supports_ranged_reads()
+            && self
+                .identifier_map
+                .values()
+                .all(fluree_db_core::StorageRead::supports_ranged_reads)
     }
 
     async fn exists(&self, address: &str) -> std::result::Result<bool, fluree_db_core::Error> {

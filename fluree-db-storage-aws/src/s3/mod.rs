@@ -363,6 +363,10 @@ impl StorageRead for S3Storage {
         Ok(bytes)
     }
 
+    fn supports_ranged_reads(&self) -> bool {
+        true
+    }
+
     async fn read_byte_range(
         &self,
         address: &str,
