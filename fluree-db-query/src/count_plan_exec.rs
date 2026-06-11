@@ -19,7 +19,7 @@ use crate::count_plan::{
 use crate::error::{QueryError, Result};
 use crate::fast_path_common::{
     allow_cursor_fast_path, build_count_batch, build_overlay_cursor_for_subject_range,
-    build_post_cursor_for_predicate, build_psot_cursor_for_predicate, collect_resolved_overlay_ops,
+    build_post_cursor_for_predicate, build_psot_cursor_for_predicate, cached_overlay_ops,
     collect_subjects_for_predicate_set, collect_subjects_for_predicate_sorted,
     collect_subjects_with_object_in_set, count_rows_for_predicate_psot,
     cursor_projection_otype_okey, cursor_projection_sid_only, cursor_projection_sid_otype_okey,
@@ -27,7 +27,7 @@ use crate::fast_path_common::{
     projection_sid_otype_okey, slice_overlay_ops_by_subject, sum_post_object_counts_filtered,
     CancelTicker, CursorSubjectCountStream, FastPathOperator, ObjectFilterMode,
     PostObjectGroupCountIter, PsotObjectFilterCountIter, PsotSubjectCountIter, PsotSubjectSeek,
-    PsotSubjectWeightedSumIter,
+    PsotSubjectWeightedSumIter, SharedOverlayOps,
 };
 use crate::ir::triple::Ref;
 use crate::operator::BoxedOperator;
@@ -1159,7 +1159,7 @@ fn merge_count_range_overlay(
     store: &Arc<BinaryIndexStore>,
     g_id: fluree_db_core::GraphId,
     p_ids: &[u32],
-    ops_per_pred: &[Vec<fluree_db_binary_index::read::types::OverlayOp>],
+    ops_per_pred: &[SharedOverlayOps],
     to_t: i64,
     epoch: u64,
     cancellation: &QueryCancellation,
@@ -1256,10 +1256,9 @@ fn sum_star_join_overlay_parallel(
     }
 
     // Collect + resolve each predicate's overlay ops once (serial; novelty is small).
-    let mut ops_per_pred: Vec<Vec<fluree_db_binary_index::read::types::OverlayOp>> =
-        Vec::with_capacity(sids.len());
+    let mut ops_per_pred: Vec<SharedOverlayOps> = Vec::with_capacity(sids.len());
     for sid in &sids {
-        match collect_resolved_overlay_ops(ec.ctx, ec.store, ec.g_id, RunSortOrder::Psot, sid)? {
+        match cached_overlay_ops(ec.ctx, ec.store, ec.g_id, RunSortOrder::Psot, sid)? {
             Some(ops) => ops_per_pred.push(ops),
             None => return Ok(None),
         }
@@ -1385,9 +1384,9 @@ fn merge_optional_count_range_overlay(
     store: &Arc<BinaryIndexStore>,
     g_id: fluree_db_core::GraphId,
     req_pids: &[u32],
-    req_ops: &[Vec<fluree_db_binary_index::read::types::OverlayOp>],
+    req_ops: &[SharedOverlayOps],
     opt_groups: &[Vec<u32>],
-    opt_ops: &[Vec<Vec<fluree_db_binary_index::read::types::OverlayOp>>],
+    opt_ops: &[Vec<SharedOverlayOps>],
     to_t: i64,
     epoch: u64,
     cancellation: &QueryCancellation,
@@ -1561,10 +1560,9 @@ fn sum_optional_join_overlay_parallel(
         return Ok(None);
     }
 
-    let collect =
-        |sid: &Sid| -> Result<Option<Vec<fluree_db_binary_index::read::types::OverlayOp>>> {
-            collect_resolved_overlay_ops(ec.ctx, ec.store, ec.g_id, RunSortOrder::Psot, sid)
-        };
+    let collect = |sid: &Sid| -> Result<Option<SharedOverlayOps>> {
+        cached_overlay_ops(ec.ctx, ec.store, ec.g_id, RunSortOrder::Psot, sid)
+    };
     let mut req_ops = Vec::with_capacity(req_sids.len());
     for sid in &req_sids {
         let Some(ops) = collect(sid)? else {
@@ -1572,8 +1570,7 @@ fn sum_optional_join_overlay_parallel(
         };
         req_ops.push(ops);
     }
-    let mut opt_ops: Vec<Vec<Vec<fluree_db_binary_index::read::types::OverlayOp>>> =
-        Vec::with_capacity(opt_sids.len());
+    let mut opt_ops: Vec<Vec<SharedOverlayOps>> = Vec::with_capacity(opt_sids.len());
     for grp in &opt_sids {
         let mut group_ops = Vec::with_capacity(grp.len());
         for sid in grp {
@@ -1815,7 +1812,7 @@ fn merge_modifier_intersect_range_overlay(
     outer_pid: u32,
     outer_ops: &[fluree_db_binary_index::read::types::OverlayOp],
     inner_pids: &[u32],
-    inner_ops: &[Vec<fluree_db_binary_index::read::types::OverlayOp>],
+    inner_ops: &[SharedOverlayOps],
     is_anti: bool,
     to_t: i64,
     epoch: u64,
@@ -1922,15 +1919,13 @@ fn try_modifier_intersect_overlay_parallel(
     }
 
     let Some(outer_ops) =
-        collect_resolved_overlay_ops(ec.ctx, ec.store, ec.g_id, RunSortOrder::Psot, &outer_sid)?
+        cached_overlay_ops(ec.ctx, ec.store, ec.g_id, RunSortOrder::Psot, &outer_sid)?
     else {
         return Ok(None);
     };
-    let mut inner_ops: Vec<Vec<fluree_db_binary_index::read::types::OverlayOp>> =
-        Vec::with_capacity(inner.len());
+    let mut inner_ops: Vec<SharedOverlayOps> = Vec::with_capacity(inner.len());
     for (_, sid) in &inner {
-        let Some(ops) =
-            collect_resolved_overlay_ops(ec.ctx, ec.store, ec.g_id, RunSortOrder::Psot, sid)?
+        let Some(ops) = cached_overlay_ops(ec.ctx, ec.store, ec.g_id, RunSortOrder::Psot, sid)?
         else {
             return Ok(None);
         };

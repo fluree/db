@@ -30,6 +30,14 @@ use crate::format::column_block::ColumnId;
 // BinaryCursor
 // ============================================================================
 
+/// Shared empty overlay-ops slice: cursors are built far more often than they
+/// carry overlay ops, so the no-overlay default is a refcount bump, not an
+/// allocation.
+fn empty_overlay_ops() -> Arc<[OverlayOp]> {
+    static EMPTY: std::sync::OnceLock<Arc<[OverlayOp]>> = std::sync::OnceLock::new();
+    Arc::clone(EMPTY.get_or_init(|| Arc::from(Vec::new())))
+}
+
 /// V3 columnar cursor: iterates leaflets across leaves in a branch manifest.
 ///
 /// Yields one `ColumnBatch` per leaflet per `next_batch()` call.
@@ -47,8 +55,10 @@ pub struct BinaryCursor {
     /// Index of the next leaflet within the current leaf.
     current_leaflet_idx: usize,
     exhausted: bool,
-    /// Overlay ops sorted by this cursor's sort order.
-    overlay_ops: Vec<OverlayOp>,
+    /// Overlay ops sorted by this cursor's sort order. Shared (`Arc`) so
+    /// per-query caches can hand the same translated ops to many cursors
+    /// without copying.
+    overlay_ops: Arc<[OverlayOp]>,
     /// Start position in overlay_ops for the current leaf (set per-leaf via slicing).
     overlay_pos: usize,
     /// Exclusive end position in overlay_ops for the current leaf.
@@ -93,7 +103,7 @@ impl BinaryCursor {
             // Don't mark exhausted when leaf_range is empty — overlay-only path
             // may still have ops to emit.
             exhausted: false,
-            overlay_ops: Vec::new(),
+            overlay_ops: empty_overlay_ops(),
             overlay_pos: 0,
             leaf_overlay_end: 0,
             epoch: 0,
@@ -122,7 +132,7 @@ impl BinaryCursor {
             current_leaf: None,
             current_leaflet_idx: 0,
             exhausted: false,
-            overlay_ops: Vec::new(),
+            overlay_ops: empty_overlay_ops(),
             overlay_pos: 0,
             leaf_overlay_end: 0,
             epoch: 0,
@@ -146,7 +156,11 @@ impl BinaryCursor {
     /// **Contract:** ops must be pre-sorted by this cursor's sort order AND
     /// assert/retract lifecycles must be resolved (at most one op per fact key).
     /// Use [`sort_overlay_ops`] then [`resolve_overlay_ops`] before calling.
-    pub fn set_overlay_ops(&mut self, ops: Vec<OverlayOp>) {
+    ///
+    /// Takes `Arc<[OverlayOp]>` so callers holding cached translated ops share
+    /// them across cursors without copying; `Vec<OverlayOp>` converts via
+    /// `.into()`.
+    pub fn set_overlay_ops(&mut self, ops: Arc<[OverlayOp]>) {
         debug_assert!(
             ops.windows(2).all(|w| w[0].fact_key() != w[1].fact_key()),
             "overlay ops contain duplicate fact keys — caller must resolve \

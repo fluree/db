@@ -1959,7 +1959,7 @@ impl Operator for BinaryScanOperator {
                 sort_overlay_ops(&mut ops, order);
                 resolve_overlay_ops(&mut ops);
                 let epoch = ctx.overlay().epoch();
-                cursor.set_overlay_ops(ops);
+                cursor.set_overlay_ops(ops.into());
                 cursor.set_epoch(epoch);
             }
 

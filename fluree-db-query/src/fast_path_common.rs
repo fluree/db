@@ -1866,6 +1866,39 @@ pub fn build_range_cursor(
     ))
 }
 
+/// Boundary flakes bracketing every flake with predicate `pred` in a
+/// predicate-leading index order (Psot/Post both compare `p` first).
+///
+/// `first` (exclusive) sorts strictly before any real flake with `p == pred`
+/// (all non-predicate fields at their minimum; no real flake has
+/// `t == i64::MIN`). `rhs` (inclusive) sorts at-or-after any such flake and
+/// before any flake of a higher predicate. The bounds are a superset
+/// optimization for `for_each_overlay_flake` — callers must still filter the
+/// callback by predicate.
+fn predicate_walk_bounds(pred: &Sid) -> (fluree_db_core::Flake, fluree_db_core::Flake) {
+    use fluree_db_core::flake::FlakeMeta;
+    use fluree_db_core::Flake;
+    let first = Flake::new(
+        Sid::min(),
+        pred.clone(),
+        FlakeValue::min(),
+        Sid::min(),
+        i64::MIN,
+        false,
+        None,
+    );
+    let rhs = Flake::new(
+        Sid::max(),
+        pred.clone(),
+        FlakeValue::max(),
+        Sid::max(),
+        i64::MAX,
+        true,
+        Some(FlakeMeta::max()),
+    );
+    (first, rhs)
+}
+
 /// Collect the novelty-overlay ops for a single predicate, translated into the
 /// binary-index `OverlayOp` representation and sorted/resolved for `order`.
 ///
@@ -1873,6 +1906,12 @@ pub fn build_range_cursor(
 /// any flake fails to translate — in which case the caller must disable the
 /// fast path for correctness. Only meaningful when an overlay carrying novelty
 /// is present (`epoch != 0`).
+///
+/// For predicate-leading orders (Psot/Post) the overlay walk is range-bounded
+/// to the predicate via [`predicate_walk_bounds`], so its cost is
+/// O(log novelty + matching flakes) instead of a full-novelty walk. Other
+/// orders keep the full walk; the callback-side predicate filter is the
+/// correctness backstop in all cases.
 pub fn collect_resolved_overlay_ops(
     ctx: &ExecutionContext<'_>,
     store: &Arc<BinaryIndexStore>,
@@ -1890,12 +1929,19 @@ pub fn collect_resolved_overlay_ops(
     let mut translate_failed = false;
     let mut translate_fail_count: u32 = 0;
 
+    let pred_bounds = matches!(order, RunSortOrder::Psot | RunSortOrder::Post)
+        .then(|| predicate_walk_bounds(pred_sid));
+    let (first, rhs, leftmost) = match &pred_bounds {
+        Some((first, rhs)) => (Some(first), Some(rhs), false),
+        None => (None, None, true),
+    };
+
     ctx.overlay().for_each_overlay_flake(
         g_id,
         crate::binary_scan::sort_order_to_index_type(order),
-        None,
-        None,
-        true,
+        first,
+        rhs,
+        leftmost,
         ctx.to_t,
         &mut |flake| {
             if flake.p != *pred_sid {
@@ -1942,6 +1988,133 @@ pub fn collect_resolved_overlay_ops(
         fluree_db_binary_index::read::types::resolve_overlay_ops(&mut ops);
     }
     Ok(Some(ops))
+}
+
+/// Shared, immutable translated overlay ops for one `(graph, order, predicate)`.
+pub type SharedOverlayOps = Arc<[fluree_db_binary_index::read::types::OverlayOp]>;
+
+/// Identity of every input that determines a translated overlay-ops vector.
+///
+/// Address fields are stable for the lifetime of the borrows/Arcs the
+/// `ExecutionContext` holds, which covers the whole execution. `epoch` is
+/// included so a (hypothetical) in-place overlay mutation mid-query also
+/// invalidates rather than serving stale ops.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct OverlayOpsBinding {
+    overlay_addr: usize,
+    overlay_epoch: u64,
+    to_t: i64,
+    dict_novelty_addr: usize,
+    small_dicts_addr: usize,
+    store_addr: usize,
+}
+
+impl OverlayOpsBinding {
+    fn of(ctx: &ExecutionContext<'_>, store: &Arc<BinaryIndexStore>) -> Self {
+        Self {
+            overlay_addr: ctx.overlay.map_or(0, |o| {
+                o as *const dyn fluree_db_core::OverlayProvider as *const () as usize
+            }),
+            overlay_epoch: ctx.overlay().epoch(),
+            to_t: ctx.to_t,
+            dict_novelty_addr: ctx
+                .dict_novelty
+                .as_ref()
+                .map_or(0, |d| Arc::as_ptr(d) as usize),
+            small_dicts_addr: ctx
+                .runtime_small_dicts
+                .map_or(0, |d| d as *const _ as usize),
+            store_addr: Arc::as_ptr(store) as usize,
+        }
+    }
+}
+
+struct BoundOpsMap {
+    binding: OverlayOpsBinding,
+    /// `None` value = translation failed for that predicate (memoized so a
+    /// declined fast path doesn't re-walk the overlay on every retry).
+    map: std::sync::Mutex<FxHashMap<(GraphId, RunSortOrder, Sid), Option<SharedOverlayOps>>>,
+}
+
+/// Per-execution memo of translated + resolved overlay ops, keyed by
+/// `(graph, order, predicate)`.
+///
+/// Lazily binds on first access to the fingerprint of the inputs that
+/// determine the result ([`OverlayOpsBinding`]); every access re-validates, so
+/// an `ExecutionContext` derivation that shares the cache while changing
+/// `overlay`/`to_t`/dictionaries can never read stale ops — it merely computes
+/// uncached (and trips a `debug_assert` so the lifecycle bug is caught in CI).
+/// Derivations that change none of the bound inputs (e.g. graph switches —
+/// `GraphId` is in the key) share safely.
+///
+/// Note: translated ops may carry *ephemeral* `p_id`s (predicates absent from
+/// the base index get ids allocated from `store.predicate_count()` per
+/// collect). Cached vecs from different predicates can therefore carry
+/// colliding ephemeral ids — safe because consumers only compare identity
+/// within a single predicate's vec.
+#[derive(Default)]
+pub struct OverlayOpsCache {
+    inner: std::sync::OnceLock<BoundOpsMap>,
+}
+
+impl OverlayOpsCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+/// Cached front-end to [`collect_resolved_overlay_ops`].
+///
+/// Same contract (`Ok(None)` = translation failed → caller must decline the
+/// fast path), but the walk + translation + sort runs at most once per
+/// `(graph, order, predicate)` per execution; repeat lookups are an `Arc`
+/// clone. Misses compute *outside* the map lock so concurrent workers on
+/// different predicates never serialize behind one another's overlay walk.
+pub fn cached_overlay_ops(
+    ctx: &ExecutionContext<'_>,
+    store: &Arc<BinaryIndexStore>,
+    g_id: GraphId,
+    order: RunSortOrder,
+    pred_sid: &Sid,
+) -> Result<Option<SharedOverlayOps>> {
+    let binding = OverlayOpsBinding::of(ctx, store);
+    let bound = ctx.overlay_ops_cache.inner.get_or_init(|| BoundOpsMap {
+        binding,
+        map: std::sync::Mutex::new(FxHashMap::default()),
+    });
+    if bound.binding != binding {
+        debug_assert!(
+            false,
+            "overlay-ops cache shared across an ExecutionContext derivation that \
+             changed its binding (overlay/to_t/dict_novelty/runtime_small_dicts/store); \
+             the deriving constructor must start a fresh cache"
+        );
+        tracing::debug!("overlay-ops cache binding mismatch; computing uncached");
+        return Ok(
+            collect_resolved_overlay_ops(ctx, store, g_id, order, pred_sid)?
+                .map(SharedOverlayOps::from),
+        );
+    }
+    let key = (g_id, order, pred_sid.clone());
+    if let Some(entry) = bound
+        .map
+        .lock()
+        .expect("overlay ops cache poisoned")
+        .get(&key)
+    {
+        return Ok(entry.clone());
+    }
+    // A concurrent miss on the same key duplicates the walk (acceptable —
+    // last write wins with an identical value) but never holds the lock
+    // across the walk.
+    let computed = collect_resolved_overlay_ops(ctx, store, g_id, order, pred_sid)?
+        .map(SharedOverlayOps::from);
+    bound
+        .map
+        .lock()
+        .expect("overlay ops cache poisoned")
+        .insert(key, computed.clone());
+    Ok(computed)
 }
 
 /// Build a per-predicate `BinaryCursor` in `order`, folding in the novelty
@@ -2008,11 +2181,13 @@ pub fn build_overlay_cursor_for_predicate(
     cursor.set_to_t(ctx.to_t);
 
     // Fold the novelty overlay in. Skip the walk entirely when there is no
-    // novelty (epoch 0): the persisted index alone is then exact.
+    // novelty (epoch 0): the persisted index alone is then exact. Ops come
+    // from the per-execution cache, so N cursors over the same predicate
+    // (flushes, partitions, cyclic edges) share one walk + translation.
     if ctx.overlay.is_some() {
         let epoch = ctx.overlay().epoch();
         if epoch != 0 {
-            match collect_resolved_overlay_ops(ctx, store, g_id, order, &pred_sid)? {
+            match cached_overlay_ops(ctx, store, g_id, order, &pred_sid)? {
                 Some(ops) => {
                     if !ops.is_empty() {
                         cursor.set_overlay_ops(ops);
@@ -2138,7 +2313,7 @@ pub fn build_overlay_cursor_for_subject_range(
     cursor.set_to_t(to_t);
     if overlay_active {
         if !sliced_ops.is_empty() {
-            cursor.set_overlay_ops(sliced_ops);
+            cursor.set_overlay_ops(sliced_ops.into());
         }
         cursor.set_epoch(epoch);
     }
@@ -2933,5 +3108,76 @@ impl Operator for FastPathOperator {
             fb.close();
         }
         self.state = OperatorState::Closed;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fluree_db_core::comparator::IndexType;
+    use fluree_db_core::Flake;
+
+    /// `predicate_walk_bounds` must bracket every possible flake of the
+    /// predicate in both predicate-leading orders: `first` strictly below all
+    /// of them (it is an exclusive bound), `rhs` at-or-above all of them
+    /// (inclusive), and both bounds strictly inside the neighboring
+    /// predicates' ranges so no foreign flake is required — only allowed — by
+    /// the range. Callback-side predicate filtering removes any extras.
+    #[test]
+    fn predicate_walk_bounds_bracket_predicate() {
+        let pred = Sid::new(5, "knows");
+        let (first, rhs) = predicate_walk_bounds(&pred);
+
+        let flake = |p: &Sid, s: u16, v: i64, t: i64| {
+            Flake::new(
+                Sid::new(s, format!("s{s}")),
+                p.clone(),
+                FlakeValue::Long(v),
+                Sid::new(2, "long"),
+                t,
+                true,
+                None,
+            )
+        };
+        // Extremes a real flake of `pred` can plausibly take (plus a
+        // ref-valued minimum-class object).
+        let lowest = Flake::new(
+            Sid::new(0, "a"),
+            pred.clone(),
+            FlakeValue::Ref(Sid::new(0, "a")),
+            Sid::new(0, ""),
+            1,
+            false,
+            None,
+        );
+        let highest = flake(&pred, u16::MAX - 1, i64::MAX, i64::MAX);
+        let pred_below = flake(&Sid::new(5, "kno"), 9, 9, 9);
+        let pred_above = flake(&Sid::new(5, "knowsX"), 0, 0, 1);
+
+        for index in [IndexType::Psot, IndexType::Post] {
+            let cmp = index.comparator();
+            for real in [&lowest, &highest] {
+                assert_eq!(
+                    cmp(&first, real),
+                    std::cmp::Ordering::Less,
+                    "{index:?}: first must sort strictly below every {pred:?} flake"
+                );
+                assert_ne!(
+                    cmp(real, &rhs),
+                    std::cmp::Ordering::Greater,
+                    "{index:?}: rhs must sort at-or-above every {pred:?} flake"
+                );
+            }
+            assert_eq!(
+                cmp(&pred_below, &first),
+                std::cmp::Ordering::Less,
+                "{index:?}: lower predicates stay below first"
+            );
+            assert_eq!(
+                cmp(&rhs, &pred_above),
+                std::cmp::Ordering::Less,
+                "{index:?}: rhs stays below higher predicates"
+            );
+        }
     }
 }

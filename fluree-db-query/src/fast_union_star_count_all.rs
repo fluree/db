@@ -30,10 +30,10 @@ use crate::context::ExecutionContext;
 use crate::error::{QueryError, Result};
 use crate::fast_path_common::{
     build_count_batch, build_overlay_cursor_for_subject_range, build_psot_cursor_for_predicate,
-    collect_resolved_overlay_ops, count_predicate_overlay_delta, count_rows_for_predicate_psot,
-    count_to_i64, cursor_projection_sid_only, cursor_projection_sid_otype_okey,
-    leaf_entries_for_predicate, normalize_pred_sid, slice_overlay_ops_by_subject, CancelTicker,
-    CursorSubjectCountStream, PsotSubjectCountIter,
+    cached_overlay_ops, count_predicate_overlay_delta, count_rows_for_predicate_psot, count_to_i64,
+    cursor_projection_sid_only, cursor_projection_sid_otype_okey, leaf_entries_for_predicate,
+    normalize_pred_sid, slice_overlay_ops_by_subject, CancelTicker, CursorSubjectCountStream,
+    PsotSubjectCountIter, SharedOverlayOps,
 };
 use crate::ir::triple::Ref;
 use crate::operator::{BoxedOperator, Operator, OperatorState};
@@ -458,9 +458,9 @@ fn merge_union_constraint_count_range_overlay(
     store: &Arc<fluree_db_binary_index::BinaryIndexStore>,
     g_id: fluree_db_core::GraphId,
     union_pids: &[u32],
-    union_ops: &[Vec<fluree_db_binary_index::read::types::OverlayOp>],
+    union_ops: &[SharedOverlayOps],
     extra_pids: &[u32],
-    extra_ops: &[Vec<fluree_db_binary_index::read::types::OverlayOp>],
+    extra_ops: &[SharedOverlayOps],
     to_t: i64,
     epoch: u64,
     cancellation: &QueryCancellation,
@@ -574,11 +574,10 @@ fn try_union_constraint_overlay_parallel(
         return Ok(None);
     }
 
-    let collect = |sids: &[fluree_db_core::Sid]| -> Result<Option<Vec<Vec<fluree_db_binary_index::read::types::OverlayOp>>>> {
+    let collect = |sids: &[fluree_db_core::Sid]| -> Result<Option<Vec<SharedOverlayOps>>> {
         let mut out = Vec::with_capacity(sids.len());
         for sid in sids {
-            let Some(ops) = collect_resolved_overlay_ops(ctx, store, g_id, RunSortOrder::Psot, sid)?
-            else {
+            let Some(ops) = cached_overlay_ops(ctx, store, g_id, RunSortOrder::Psot, sid)? else {
                 return Ok(None);
             };
             out.push(ops);

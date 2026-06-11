@@ -55,6 +55,10 @@ pub enum ConstSidKey {
 /// derived per-graph contexts can share it and the context stays `Send + Sync`.
 pub type ConstSidCache = Arc<Mutex<FxHashMap<ConstSidKey, Option<u64>>>>;
 
+/// Shared handle to the per-query overlay-ops memo
+/// ([`OverlayOpsCache`](crate::fast_path_common::OverlayOpsCache)).
+pub type SharedOverlayOpsCache = Arc<crate::fast_path_common::OverlayOpsCache>;
+
 /// Map from `(graph_id, predicate_id, lang_id)` to fulltext BoW arenas used
 /// by `fulltext()` BM25 scoring.
 pub type FulltextProviders = HashMap<(GraphId, u32, u16), Arc<FulltextArena>>;
@@ -197,6 +201,16 @@ pub struct ExecutionContext<'a> {
     /// Per-query memo: constant filter operands → internal subject id, so a
     /// `<const> != ?var` FILTER resolves the constant once, not per row.
     pub const_sid_cache: ConstSidCache,
+    /// Per-query memo: translated + resolved overlay ops per
+    /// `(graph, order, predicate)` — see
+    /// [`OverlayOpsCache`](crate::fast_path_common::OverlayOpsCache).
+    ///
+    /// Derivations that change `overlay`, `to_t`, dictionaries, or the binary
+    /// store must start a fresh cache; graph switches may share it (the graph
+    /// id is part of the cache key). The cache self-validates its binding at
+    /// access time, so a wrongly-shared cache degrades to uncached compute
+    /// rather than serving stale ops.
+    pub overlay_ops_cache: SharedOverlayOpsCache,
 }
 
 impl<'a> ExecutionContext<'a> {
@@ -234,6 +248,7 @@ impl<'a> ExecutionContext<'a> {
             eager_materialization: false,
             original_snapshot: snapshot,
             const_sid_cache: ConstSidCache::default(),
+            overlay_ops_cache: SharedOverlayOpsCache::default(),
         }
     }
 
@@ -283,6 +298,7 @@ impl<'a> ExecutionContext<'a> {
             eager_materialization: db.eager,
             original_snapshot: db.snapshot,
             const_sid_cache: ConstSidCache::default(),
+            overlay_ops_cache: SharedOverlayOpsCache::default(),
         }
     }
 
@@ -336,6 +352,7 @@ impl<'a> ExecutionContext<'a> {
             eager_materialization: db.eager,
             original_snapshot: db.snapshot,
             const_sid_cache: ConstSidCache::default(),
+            overlay_ops_cache: SharedOverlayOpsCache::default(),
         }
     }
 
@@ -378,6 +395,7 @@ impl<'a> ExecutionContext<'a> {
             eager_materialization: false,
             original_snapshot: snapshot,
             const_sid_cache: ConstSidCache::default(),
+            overlay_ops_cache: SharedOverlayOpsCache::default(),
         }
     }
 
@@ -419,6 +437,7 @@ impl<'a> ExecutionContext<'a> {
             eager_materialization: false,
             original_snapshot: snapshot,
             const_sid_cache: ConstSidCache::default(),
+            overlay_ops_cache: SharedOverlayOpsCache::default(),
         }
     }
 
@@ -462,6 +481,7 @@ impl<'a> ExecutionContext<'a> {
             eager_materialization: false,
             original_snapshot: snapshot,
             const_sid_cache: ConstSidCache::default(),
+            overlay_ops_cache: SharedOverlayOpsCache::default(),
         }
     }
 
@@ -921,6 +941,7 @@ impl<'a> ExecutionContext<'a> {
             eager_materialization: self.eager_materialization,
             original_snapshot: self.original_snapshot,
             const_sid_cache: self.const_sid_cache.clone(),
+            overlay_ops_cache: self.overlay_ops_cache.clone(),
         }
     }
 
@@ -973,6 +994,7 @@ impl<'a> ExecutionContext<'a> {
             eager_materialization: self.eager_materialization,
             original_snapshot: self.original_snapshot,
             const_sid_cache: self.const_sid_cache.clone(),
+            overlay_ops_cache: self.overlay_ops_cache.clone(),
         }
     }
 
@@ -1028,6 +1050,7 @@ impl<'a> ExecutionContext<'a> {
             // graph/store into another. (`with_active_graph`/`with_default_graph`
             // keep the same store, so they correctly share the parent's memo.)
             const_sid_cache: ConstSidCache::default(),
+            overlay_ops_cache: SharedOverlayOpsCache::default(),
         }
     }
 
@@ -1074,18 +1097,24 @@ impl<'a> ExecutionContext<'a> {
     pub fn with_binary_store(mut self, store: Arc<BinaryIndexStore>, g_id: GraphId) -> Self {
         self.binary_store = Some(store);
         self.binary_g_id = g_id;
+        // Store identity is part of the overlay-ops cache binding.
+        self.overlay_ops_cache = SharedOverlayOpsCache::default();
         self
     }
 
     /// Attach a dictionary novelty layer for binary scan subject/string lookups.
     pub fn with_dict_novelty(mut self, dict_novelty: Arc<DictNovelty>) -> Self {
         self.dict_novelty = Some(dict_novelty);
+        // Dict-novelty identity is part of the overlay-ops cache binding.
+        self.overlay_ops_cache = SharedOverlayOpsCache::default();
         self
     }
 
     /// Attach runtime predicate/datatype IDs carried by the db value.
     pub fn with_runtime_small_dicts(mut self, runtime_small_dicts: &'a RuntimeSmallDicts) -> Self {
         self.runtime_small_dicts = Some(runtime_small_dicts);
+        // Small-dict identity is part of the overlay-ops cache binding.
+        self.overlay_ops_cache = SharedOverlayOpsCache::default();
         self
     }
 
