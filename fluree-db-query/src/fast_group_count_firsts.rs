@@ -3,7 +3,7 @@ use crate::context::{ExecutionContext, WellKnownDatatypes};
 use crate::error::{QueryError, Result};
 use crate::fast_path_common::{
     allow_cursor_fast_path, build_psot_cursor_for_predicate, fast_path_store, normalize_pred_sid,
-    subject_ref_to_s_id,
+    subject_ref_to_s_id, CancelTicker,
 };
 use crate::ir::triple::{Ref, Term};
 use crate::operator::BoxedOperator;
@@ -1428,10 +1428,11 @@ fn compute_group_by_object_star_topk(
         };
 
         let mut fs = next_filter_subject(&mut fcur, &mut f_batch, &mut f_i, &mut f_last)?;
+        let mut cancel = CancelTicker::new(&ctx.cancellation);
         while let (Some(gs), Some(cur_fs)) =
             (peek_group_subject(&mut cursor, &mut g_batch, &mut g_i)?, fs)
         {
-            ctx.check_cancelled()?;
+            cancel.check()?;
             match gs.cmp(&cur_fs) {
                 Ordering::Less => {
                     // Skip all group rows for this subject.
@@ -1439,7 +1440,7 @@ fn compute_group_by_object_star_topk(
                     while let Some(cur_gs) =
                         peek_group_subject(&mut cursor, &mut g_batch, &mut g_i)?
                     {
-                        ctx.check_cancelled()?;
+                        cancel.check()?;
                         if cur_gs != skip_s {
                             break;
                         }
@@ -1454,7 +1455,7 @@ fn compute_group_by_object_star_topk(
                     while let Some(cur_gs) =
                         peek_group_subject(&mut cursor, &mut g_batch, &mut g_i)?
                     {
-                        ctx.check_cancelled()?;
+                        cancel.check()?;
                         if cur_gs != s {
                             break;
                         }

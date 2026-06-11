@@ -27,6 +27,47 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
+// 0a. Strided cancellation checkpoint
+// ---------------------------------------------------------------------------
+
+/// Strided cancellation checkpoint for tight per-group merge loops.
+///
+/// Fused COUNT loops iterate per distinct subject (10⁷–10⁸ iterations at
+/// wikidata scale) with only tens of ns of work per iteration; consulting the
+/// shared atomic every iteration measured as a 5-15% regression. `check()`
+/// only touches the atomic once every `STRIDE` calls, so the hot path is a
+/// register increment plus a predicted branch.
+pub(crate) struct CancelTicker<'a> {
+    cancellation: &'a fluree_db_core::QueryCancellation,
+    tick: u32,
+}
+
+impl<'a> CancelTicker<'a> {
+    /// At typical merge-loop rates (~15-40ns/group) this checks every ~1-3ms,
+    /// far finer than timeout/disconnect granularity needs.
+    const STRIDE_MASK: u32 = 0xFFFF;
+
+    pub(crate) fn new(cancellation: &'a fluree_db_core::QueryCancellation) -> Self {
+        Self {
+            cancellation,
+            tick: 0,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn check(&mut self) -> Result<()> {
+        self.tick = self.tick.wrapping_add(1);
+        if self.tick & Self::STRIDE_MASK != 0 {
+            return Ok(());
+        }
+        match self.cancellation.reason() {
+            Some(reason) => Err(QueryError::Cancelled { reason }),
+            None => Ok(()),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // 0. Shared string-ID range helpers
 // ---------------------------------------------------------------------------
 

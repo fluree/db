@@ -32,7 +32,7 @@ use crate::fast_path_common::{
     build_count_batch, build_overlay_cursor_for_subject_range, build_psot_cursor_for_predicate,
     collect_resolved_overlay_ops, count_predicate_overlay_delta, count_rows_for_predicate_psot,
     count_to_i64, cursor_projection_sid_only, cursor_projection_sid_otype_okey,
-    leaf_entries_for_predicate, normalize_pred_sid, slice_overlay_ops_by_subject,
+    leaf_entries_for_predicate, normalize_pred_sid, slice_overlay_ops_by_subject, CancelTicker,
     CursorSubjectCountStream, PsotSubjectCountIter,
 };
 use crate::ir::triple::Ref;
@@ -43,14 +43,6 @@ use fluree_db_binary_index::{BinaryCursor, RunSortOrder};
 use fluree_db_core::o_type::OType;
 use fluree_db_core::QueryCancellation;
 use std::sync::Arc;
-
-#[inline]
-fn check_cancelled(cancellation: &QueryCancellation) -> Result<()> {
-    match cancellation.reason() {
-        Some(reason) => Err(QueryError::Cancelled { reason }),
-        None => Ok(()),
-    }
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UnionCountMode {
@@ -120,6 +112,7 @@ impl Operator for UnionStarCountAllOperator {
             && ctx.policy_enforcer.as_ref().is_none_or(|p| p.is_root());
         if allow_fast {
             if let Some(store) = ctx.binary_store.as_ref() {
+                let started = std::time::Instant::now();
                 let Some(n) = count_union_star(
                     store,
                     ctx,
@@ -141,6 +134,12 @@ impl Operator for UnionStarCountAllOperator {
                     self.state = OperatorState::Open;
                     return Ok(());
                 };
+                tracing::debug!(
+                    count = n,
+                    mode = ?self.mode,
+                    elapsed_us = started.elapsed().as_micros() as u64,
+                    "union-star count fast path executed"
+                );
                 self.result = Some(count_to_i64(n, "COUNT(*) UNION-star")?);
                 self.emitted = false;
                 self.state = OperatorState::Open;
@@ -375,8 +374,9 @@ fn merge_union_constraint_count_range(
     let mut u = next_union_group(&mut u_iters, &mut u_cur)?;
     let mut e = next_extra_product_group(&mut e_iters, &mut e_cur)?;
     let mut total: u128 = 0;
+    let mut cancel = CancelTicker::new(cancellation);
     while let (Some((us, usum)), Some((es, eprod))) = (u, e) {
-        check_cancelled(cancellation)?;
+        cancel.check()?;
         if us < es {
             u = next_union_group(&mut u_iters, &mut u_cur)?;
             continue;
@@ -509,8 +509,9 @@ fn merge_union_constraint_count_range_overlay(
     let mut u = next_union_group(&mut u_streams, &mut u_cur)?;
     let mut e = next_extra_product_group(&mut e_streams, &mut e_cur)?;
     let mut total: u128 = 0;
+    let mut cancel = CancelTicker::new(cancellation);
     while let (Some((us, usum)), Some((es, eprod))) = (u, e) {
-        check_cancelled(cancellation)?;
+        cancel.check()?;
         if us < es {
             u = next_union_group(&mut u_streams, &mut u_cur)?;
             continue;
@@ -837,8 +838,9 @@ fn count_union_star(
     // If no extra predicates, total is just Σ_s union_sum(s).
     if extra_preds.is_empty() {
         let mut total: u64 = 0;
+        let mut cancel = CancelTicker::new(&ctx.cancellation);
         while let Some((_s, u)) = next_union()? {
-            ctx.check_cancelled()?;
+            cancel.check()?;
             total = total.saturating_add(u);
         }
         return Ok(Some(total));
@@ -914,8 +916,9 @@ fn count_union_star(
     let mut u_cur = next_union()?;
     let mut e_cur = next_extra_product()?;
     let mut total: u128 = 0;
+    let mut cancel = CancelTicker::new(&ctx.cancellation);
     while let (Some((us, u)), Some((es, eprod))) = (u_cur, e_cur) {
-        ctx.check_cancelled()?;
+        cancel.check()?;
         if us < es {
             u_cur = next_union()?;
             continue;

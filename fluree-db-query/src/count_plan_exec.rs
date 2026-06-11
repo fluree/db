@@ -25,8 +25,9 @@ use crate::fast_path_common::{
     cursor_projection_otype_okey, cursor_projection_sid_only, cursor_projection_sid_otype_okey,
     intersect_many_sorted, leaf_entries_for_predicate, normalize_pred_sid,
     projection_sid_otype_okey, slice_overlay_ops_by_subject, sum_post_object_counts_filtered,
-    CursorSubjectCountStream, FastPathOperator, ObjectFilterMode, PostObjectGroupCountIter,
-    PsotObjectFilterCountIter, PsotSubjectCountIter, PsotSubjectSeek, PsotSubjectWeightedSumIter,
+    CancelTicker, CursorSubjectCountStream, FastPathOperator, ObjectFilterMode,
+    PostObjectGroupCountIter, PsotObjectFilterCountIter, PsotSubjectCountIter, PsotSubjectSeek,
+    PsotSubjectWeightedSumIter,
 };
 use crate::ir::triple::Ref;
 use crate::operator::BoxedOperator;
@@ -36,14 +37,6 @@ use fluree_db_core::{GraphId, QueryCancellation, Sid};
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::cmp::Ordering;
 use std::sync::Arc;
-
-#[inline]
-fn check_cancelled(cancellation: &QueryCancellation) -> Result<()> {
-    match cancellation.reason() {
-        Some(reason) => Err(QueryError::Cancelled { reason }),
-        None => Ok(()),
-    }
-}
 
 /// Per-execution bundle threaded through the plan evaluator.
 ///
@@ -113,8 +106,16 @@ pub(crate) fn count_plan_operator(
                 overlay,
             };
 
+            let started = std::time::Instant::now();
             match execute_plan(&plan.root, &ec)? {
                 Some(count) => {
+                    tracing::debug!(
+                        overlay,
+                        count,
+                        elapsed_us = started.elapsed().as_micros() as u64,
+                        plan_root = ?plan.root,
+                        "count plan executed"
+                    );
                     let count_i64 = i64::try_from(count)
                         .map_err(|_| QueryError::execution("COUNT(*) exceeds i64 in count plan"))?;
                     Ok(Some(build_count_batch(out_var, count_i64)?))
@@ -294,8 +295,9 @@ fn subject_keys_sorted(ec: &ExecCtx<'_, '_>, pred: &Ref) -> Result<Option<Vec<u6
             return Ok(None);
         };
         let mut out: Vec<u64> = Vec::new();
+        let mut cancel = CancelTicker::new(&ec.ctx.cancellation);
         while let Some((s, _)) = groups.next_group()? {
-            ec.ctx.check_cancelled()?;
+            cancel.check()?;
             // One group per distinct subject, emitted in ascending order.
             out.push(s);
         }
@@ -542,8 +544,9 @@ fn sum_stream(
             let mut excl_idx: usize = 0;
             let mut incl_idx: usize = 0;
             let mut total: u128 = 0;
+            let mut cancel = CancelTicker::new(&ec.ctx.cancellation);
             while let Some((s, count)) = groups.next_group()? {
-                ec.ctx.check_cancelled()?;
+                cancel.check()?;
                 if is_excluded(s, exclude_sorted, &mut excl_idx) {
                     continue;
                 }
@@ -693,8 +696,9 @@ fn try_modifier_seek(
         };
         let mut b_seek = PsotSubjectSeek::new(ec.store, ec.g_id, p_b);
         let mut acc: u128 = 0;
+        let mut cancel = CancelTicker::new(&ec.ctx.cancellation);
         while let Some((s, count_a)) = a_groups.next_group()? {
-            ec.ctx.check_cancelled()?;
+            cancel.check()?;
             let present = b_seek.subject_present(s)?;
             // EXISTS keeps present subjects; MINUS keeps absent ones.
             if present != is_anti {
@@ -710,8 +714,9 @@ fn try_modifier_seek(
         };
         let mut a_seek = PsotSubjectSeek::new(ec.store, ec.g_id, p_a);
         let mut matched: u128 = 0;
+        let mut cancel = CancelTicker::new(&ec.ctx.cancellation);
         while let Some((s, _)) = b_groups.next_group()? {
-            ec.ctx.check_cancelled()?;
+            cancel.check()?;
             if let Some(count_a) = a_seek.count_for_subject(s)? {
                 matched = matched.saturating_add(count_a as u128);
             }
@@ -852,8 +857,9 @@ fn merge_count_range(
         curr.push(it.next_group()?);
     }
     let mut total: u128 = 0;
+    let mut cancel = CancelTicker::new(cancellation);
     loop {
-        check_cancelled(cancellation)?;
+        cancel.check()?;
         if curr.iter().any(std::option::Option::is_none) {
             break;
         }
@@ -932,8 +938,9 @@ fn merge_optional_count_range(
         req_cur.push(it.next_group()?);
     }
     let mut total: u128 = 0;
+    let mut cancel = CancelTicker::new(cancellation);
     loop {
-        check_cancelled(cancellation)?;
+        cancel.check()?;
         if req_cur.iter().any(std::option::Option::is_none) {
             break;
         }
@@ -1183,8 +1190,9 @@ fn merge_count_range_overlay(
         curr.push(s.next_group()?);
     }
     let mut total: u128 = 0;
+    let mut cancel = CancelTicker::new(cancellation);
     loop {
-        check_cancelled(cancellation)?;
+        cancel.check()?;
         if curr.iter().any(std::option::Option::is_none) {
             break;
         }
@@ -1435,8 +1443,9 @@ fn merge_optional_count_range_overlay(
         req_cur.push(s.next_group()?);
     }
     let mut total: u128 = 0;
+    let mut cancel = CancelTicker::new(cancellation);
     loop {
-        check_cancelled(cancellation)?;
+        cancel.check()?;
         if req_cur.iter().any(std::option::Option::is_none) {
             break;
         }
@@ -1643,8 +1652,9 @@ fn merge_modifier_intersect_range(
     }
 
     let mut total: u128 = 0;
+    let mut cancel = CancelTicker::new(cancellation);
     while let Some((os, ocount)) = outer.next_group()? {
-        check_cancelled(cancellation)?;
+        cancel.check()?;
         // In the inner intersection iff present in every inner predicate. Each
         // inner cursor advances monotonically to the first subject >= os; since os
         // is non-decreasing, cursors skipped by an early break catch up lazily.
@@ -1845,8 +1855,9 @@ fn merge_modifier_intersect_range_overlay(
     }
 
     let mut total: u128 = 0;
+    let mut cancel = CancelTicker::new(cancellation);
     while let Some((os, ocount)) = outer.next_group()? {
-        check_cancelled(cancellation)?;
+        cancel.check()?;
         if os < lo {
             continue; // boundary subject below the partition; owned by a lower one
         }
@@ -2091,9 +2102,10 @@ fn sum_star_join(
     let mut excl_idx: usize = 0;
     let mut incl_idx: usize = 0;
     let mut total: u128 = 0;
+    let mut cancel = CancelTicker::new(&ec.ctx.cancellation);
 
     loop {
-        ec.ctx.check_cancelled()?;
+        cancel.check()?;
         if curr.iter().any(std::option::Option::is_none) {
             break;
         }
@@ -2281,8 +2293,9 @@ fn try_optional_seek(
         };
         let mut b_seek = PsotSubjectSeek::new(ec.store, ec.g_id, p_b);
         let mut acc: u128 = 0;
+        let mut cancel = CancelTicker::new(&ec.ctx.cancellation);
         while let Some((s, count_a)) = a_groups.next_group()? {
-            ec.ctx.check_cancelled()?;
+            cancel.check()?;
             let mult = b_seek.count_for_subject(s)?.unwrap_or(0).max(1);
             acc = acc.saturating_add((count_a as u128).saturating_mul(mult as u128));
         }
@@ -2294,8 +2307,9 @@ fn try_optional_seek(
         };
         let mut a_seek = PsotSubjectSeek::new(ec.store, ec.g_id, p_a);
         let mut bonus: u128 = 0;
+        let mut cancel = CancelTicker::new(&ec.ctx.cancellation);
         while let Some((s, count_b)) = b_groups.next_group()? {
-            ec.ctx.check_cancelled()?;
+            cancel.check()?;
             // count_B == 1 yields no bonus; skip the seek (targets stay ascending).
             if count_b <= 1 {
                 continue;
@@ -2422,9 +2436,10 @@ fn sum_optional_join(
     let mut excl_idx: usize = 0;
     let mut incl_idx: usize = 0;
     let mut total: u128 = 0;
+    let mut cancel = CancelTicker::new(&ec.ctx.cancellation);
 
     loop {
-        ec.ctx.check_cancelled()?;
+        cancel.check()?;
         if req_cur.iter().any(std::option::Option::is_none) {
             break;
         }
@@ -3307,8 +3322,9 @@ fn build_chain_rightmost_overlay(
                 return Ok(None);
             };
             let mut mult: FxHashMap<u64, u64> = FxHashMap::default();
+            let mut cancel = CancelTicker::new(&ec.ctx.cancellation);
             while let Some((c, count)) = groups.next_group()? {
-                ec.ctx.check_cancelled()?;
+                cancel.check()?;
                 mult.insert(c, count.max(1));
             }
             psot_weighted_subject_sums(
