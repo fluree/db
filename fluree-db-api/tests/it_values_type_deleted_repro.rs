@@ -196,6 +196,71 @@ async fn values_bound_type_after_delete_indexed_before_delete() {
     assert_shapes_agree(&fluree, &receipt2.ledger, 5, "post-reinsert").await;
 }
 
+/// Production-like timeline: incremental index builds interleaved with the
+/// delete and re-insert (the server's background indexer path), plus an RDFS
+/// schema transacted after the re-insert as in the original report.
+#[tokio::test]
+async fn values_bound_type_after_delete_incremental_index_timeline() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let fluree = FlureeBuilder::file(tmp.path().to_str().unwrap())
+        .build()
+        .expect("build");
+    let alias = "values-deleted/incremental:main";
+    let ledger0 = fluree.create_ledger(alias).await.expect("create");
+
+    // Populate across two commits, then index.
+    let r1 = fluree
+        .insert(ledger0, &parts_graph("olda", 20))
+        .await
+        .expect("insert 1");
+    let r2 = fluree
+        .insert(r1.ledger, &parts_graph("oldb", 20))
+        .await
+        .expect("insert 2");
+    support::build_and_publish_index(&fluree, alias).await;
+    let ledger = fluree.ledger(alias).await.expect("reload");
+    assert_shapes_agree(&fluree, &ledger, 40, "pre-delete indexed").await;
+    let _ = r2;
+
+    // Wipe, then fold the retractions into the index incrementally.
+    let wiped = wipe_ledger(&fluree, ledger).await;
+    support::build_and_publish_index(&fluree, alias).await;
+    let ledger = fluree.ledger(alias).await.expect("reload post-delete");
+    assert_shapes_agree(&fluree, &ledger, 0, "post-delete indexed").await;
+    let _ = wiped;
+
+    // Re-insert a smaller set, then transact an RDFS schema (the affected
+    // production ledger carried rdfs:domain/range/Class declarations).
+    let r3 = fluree
+        .insert(ledger, &parts_graph("new", 5))
+        .await
+        .expect("re-insert");
+    let schema = json!({
+        "@context": {
+            "ex": "http://example.org/",
+            "rdfs": "http://www.w3.org/2000/01/rdf-schema#"
+        },
+        "@graph": [
+            { "@id": "ex:Part", "@type": "rdfs:Class", "rdfs:label": "Part" },
+            {
+                "@id": "ex:name",
+                "rdfs:domain": { "@id": "ex:Part" },
+                "rdfs:range": { "@id": "rdfs:Literal" }
+            }
+        ]
+    });
+    let r4 = fluree
+        .insert(r3.ledger, &schema)
+        .await
+        .expect("schema insert");
+    assert_shapes_agree(&fluree, &r4.ledger, 5, "post-reinsert novelty").await;
+
+    // Fold the re-insert into the index and check the steady state.
+    support::build_and_publish_index(&fluree, alias).await;
+    let ledger = fluree.ledger(alias).await.expect("reload post-reinsert");
+    assert_shapes_agree(&fluree, &ledger, 5, "post-reinsert indexed").await;
+}
+
 /// Binary index rebuilt after the delete + re-insert (fully indexed state).
 #[tokio::test]
 async fn values_bound_type_after_delete_indexed_after_reinsert() {
