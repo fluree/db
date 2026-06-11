@@ -142,28 +142,51 @@ async fn batched_subject_join_merges_novelty() {
               ORDER BY ?b ?v",
             1, // bounds applied to injected asserts too: only grace 35
         ),
+        (
+            "values-novelty-key",
+            r"PREFIX ex: <http://example.org/ns/>
+              SELECT ?b ?v WHERE { VALUES ?b { ex:grace ex:bob } ?b ex:age ?v }
+              ORDER BY ?b ?v",
+            3, // bob 25 + 26, grace 35 — grace's key resolves via DictNovelty
+        ),
     ];
 
-    // Phase 1: base index + novelty tail, with span capture for engagement.
+    // Phase 1: base index + novelty tail. Each query gets its own span
+    // capture so engagement is proven per query: under an active overlay the
+    // flush span only exists in merge mode (the bail routes to per-row scans,
+    // which never enter the flush).
     let view = fluree.db(ledger_id).await.expect("novelty view");
     let mut novelty_results = Vec::new();
-    {
-        let (spans, _guard) = span_capture::init_test_tracing();
-        for (name, query, expected_len) in queries {
-            let rows = run_query(&fluree, &view, query).await;
-            assert_eq!(
-                rows.len(),
-                *expected_len,
-                "{name}: row count under novelty; got {rows:?}"
-            );
-            novelty_results.push(rows);
-        }
+    for (name, query, expected_len) in queries {
+        let (spans, guard) = span_capture::init_test_tracing();
+        let rows = run_query(&fluree, &view, query).await;
+        drop(guard);
+        assert_eq!(
+            rows.len(),
+            *expected_len,
+            "{name}: row count under novelty; got {rows:?}"
+        );
+        let flushes = spans.find_spans("join_flush_batched_binary");
         assert!(
-            spans.has_span("join_flush_batched_binary"),
-            "batched subject lane should engage under novelty (merge mode); \
-             captured spans: {:?}",
+            !flushes.is_empty(),
+            "{name}: batched subject lane should engage under novelty (merge \
+             mode); captured spans: {:?}",
             spans.span_names()
         );
+        if *name == "values-novelty-key" {
+            // The novelty-only subject (ex:grace, Sid-form from VALUES) must
+            // resolve through DictNovelty and accumulate alongside ex:bob —
+            // accum_len 2 proves neither key fell back to a per-row scan.
+            assert!(
+                flushes
+                    .iter()
+                    .any(|s| s.fields.get("accum_len").map(String::as_str) == Some("2")),
+                "{name}: both VALUES keys (incl. the novelty-only subject) \
+                 should enter the batched accumulator; flush fields: {:?}",
+                flushes.iter().map(|s| &s.fields).collect::<Vec<_>>()
+            );
+        }
+        novelty_results.push(rows);
     }
 
     // Phase 2: ground truth — fully reindexed, same queries, identical rows.
