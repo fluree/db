@@ -161,6 +161,30 @@ pub async fn schema_hierarchy_with_overlay(
     }
 }
 
+/// Build the OWL2-RL materialization budget, honoring environment overrides.
+///
+/// `FLUREE_REASONING_MAX_FACTS` and `FLUREE_REASONING_MAX_SECONDS` raise (or
+/// lower) the default 1M-fact / 30s budget. Datasets whose closure exceeds
+/// the budget get a CAPPED (incomplete) materialization — see the warning in
+/// [`compute_derived_facts`] — so operators need an escape hatch until the
+/// budget is wired into ledger/query configuration.
+fn reasoning_budget_from_env() -> fluree_db_reasoner::ReasoningBudget {
+    let mut budget = fluree_db_reasoner::ReasoningBudget::default();
+    if let Some(max_facts) = std::env::var("FLUREE_REASONING_MAX_FACTS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+    {
+        budget.max_facts = max_facts;
+    }
+    if let Some(max_secs) = std::env::var("FLUREE_REASONING_MAX_SECONDS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        budget.max_duration = std::time::Duration::from_secs(max_secs);
+    }
+    budget
+}
+
 /// Compute derived facts from OWL2-RL reasoning and/or user-defined datalog rules
 ///
 /// This function handles both reasoning modes:
@@ -184,15 +208,35 @@ pub async fn compute_derived_facts(
     // OWL2-RL materialization
     if reasoning.owl2rl {
         tracing::debug!("computing OWL2-RL derived facts");
-        let reasoning_opts = ReasoningOptions::default();
+        let reasoning_opts = ReasoningOptions {
+            budget: reasoning_budget_from_env(),
+            ..Default::default()
+        };
         let cache = global_reasoning_cache();
         let db = GraphDbRef::new(snapshot, g_id, overlay, to_t);
         match reason_owl2rl(db, &reasoning_opts, cache).await {
             Ok(result) => {
-                tracing::debug!(
-                    derived_facts = result.diagnostics.facts_derived,
-                    "OWL2-RL reasoning completed"
-                );
+                if result.diagnostics.capped {
+                    // A capped materialization is an INCOMPLETE closure:
+                    // reasoning queries will silently miss entailments. Make
+                    // this loud — it is a correctness event, not a perf detail.
+                    tracing::warn!(
+                        derived_facts = result.diagnostics.facts_derived,
+                        capped_reason = result.diagnostics.capped_reason.as_deref(),
+                        iterations = result.diagnostics.iterations,
+                        duration_ms = result.diagnostics.duration.as_millis() as u64,
+                        "OWL2-RL materialization hit its budget before reaching \
+                         fixpoint; query results may be missing entailments. \
+                         Raise FLUREE_REASONING_MAX_FACTS / FLUREE_REASONING_MAX_SECONDS."
+                    );
+                } else {
+                    tracing::debug!(
+                        derived_facts = result.diagnostics.facts_derived,
+                        iterations = result.diagnostics.iterations,
+                        duration_ms = result.diagnostics.duration.as_millis() as u64,
+                        "OWL2-RL reasoning completed"
+                    );
+                }
 
                 // Without datalog there is nothing to combine: hand the
                 // prebuilt (cached, pre-sorted) overlay straight to
