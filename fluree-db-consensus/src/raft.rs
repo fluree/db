@@ -57,7 +57,8 @@ use crate::{
 };
 use async_trait::async_trait;
 use fluree_db_api::{
-    ConflictStrategy, Fluree, GuardedStagedCommit, StagedMerge, StagedRebase, StagedRevert,
+    ConflictStrategy, Fluree, GuardedStagedCommit, PushCommitsRequest, StagedMerge, StagedPush,
+    StagedRebase, StagedRevert,
 };
 use fluree_db_core::{CommitId, ContentId, ContentStore};
 use fluree_db_ledger::IndexConfig;
@@ -821,9 +822,158 @@ impl Committer for RaftCommitter {
         }
     }
 
-    async fn push(&self, _request: PushRequest) -> Result<PushReceipt, SubmissionError> {
-        todo!("RaftCommitter::push — pending push dry-run terminal")
+    async fn push(&self, request: PushRequest) -> Result<PushReceipt, SubmissionError> {
+        let PushRequest {
+            idempotency_key,
+            ledger_id,
+            commits,
+            blobs,
+            governance,
+        } = request;
+
+        // 1. Build the staged push. Decode + validate the commit
+        //    chain, evolve novelty + apply policy/SHACL per commit,
+        //    write all blobs to the shared content store (the
+        //    push's content-addressed writes are already idempotent),
+        //    and derive `final_state` + `indexing_status`. The build
+        //    phase performs no ref advance.
+        let payload = PushCommitsRequest {
+            commits: commits.into_iter().map(fluree_db_api::Base64Bytes).collect(),
+            blobs: blobs
+                .into_iter()
+                .map(|(k, v)| (k, fluree_db_api::Base64Bytes(v)))
+                .collect(),
+        };
+        let StagedPush {
+            ledger,
+            accepted,
+            rollback_snapshot: _,
+            pre_push_head,
+            new_head_id,
+            new_head_t,
+            write_guard,
+            final_state,
+            indexing_status,
+        } = self
+            .fluree
+            .prepare_push(&ledger_id, payload, &governance, &self.index_config)
+            .await
+            .map_err(execution_failure)?;
+
+        // 2. Materialize idempotency context. Push doesn't have a
+        //    request body the way transact does, but the resulting
+        //    new head is content-derived from the inputs, so it
+        //    serves as a deterministic body marker on retries.
+        let idempotency_ctx = idempotency_key.as_ref().map(|key| SmIdempotencyContext {
+            key: IdempotencyCacheKey::new(ledger.clone(), key.clone()),
+            body_hash: push_body_hash(&ledger, &new_head_id, accepted, new_head_t),
+        });
+
+        // 3. Split `ledger` into `(ledger_name, branch)` for the
+        //    state-machine command. Push targets a single branch
+        //    (the ledger_id is already `"<name>:<branch>"`).
+        let (ledger_name, branch) = split_ledger_id(&ledger)?;
+
+        // 4. Construct the AdvanceRef proposal. expected_prev is the
+        //    branch's pre-push head (`None` only on genesis push,
+        //    which is rare — push usually appends to an existing
+        //    chain).
+        let applied_at_millis = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let cmd = SmCommand::AdvanceRef(AdvanceRefArgs {
+            ledger_id: ledger_name,
+            branch,
+            expected_prev: pre_push_head.id.clone(),
+            new_head: new_head_id.clone(),
+            t: new_head_t,
+            applied_at_millis,
+            idempotency: idempotency_ctx,
+            release: Vec::<ExecutionRecordRef>::new(),
+            tally: None,
+        });
+
+        let resp =
+            self.raft
+                .client_write(cmd)
+                .await
+                .map_err(|e| SubmissionError::Execution {
+                    status: 500,
+                    message: format!("raft client_write failed: {e}"),
+                })?;
+
+        // 5. Translate Response → PushReceipt; on Applied, install
+        //    the cumulative `final_state` through the held write
+        //    guard so the leader's cache catches up with consensus.
+        match resp.data {
+            SmResponse::Applied {
+                head_t,
+                head_id,
+                accepted: _,
+                release: _,
+                tally: _,
+            } => {
+                let needs_reindex = final_state.should_reindex(&self.index_config);
+                self.fluree
+                    .finalize_commit(write_guard, final_state, head_t, needs_reindex)
+                    .await
+                    .map_err(execution_failure)?;
+                Ok(PushReceipt {
+                    idempotency_key,
+                    ledger,
+                    accepted,
+                    head_t,
+                    head_id,
+                    indexing: indexing_status,
+                })
+            }
+            SmResponse::Conflict {
+                current_head: _,
+                current_t: _,
+            } => Err(SubmissionError::Execution {
+                status: 409,
+                message: "raft CAS conflict on AdvanceRef for push".into(),
+            }),
+            SmResponse::BodyHashMismatch => Err(SubmissionError::KeyCollision),
+            SmResponse::LedgerNotFound { ledger_id } => Err(SubmissionError::Execution {
+                status: 404,
+                message: format!("ledger not found: {ledger_id}"),
+            }),
+            SmResponse::Created { .. }
+            | SmResponse::Deleted { .. }
+            | SmResponse::AlreadyExists { .. }
+            | SmResponse::NoOp => Err(SubmissionError::Execution {
+                status: 500,
+                message: "unexpected Response variant for AdvanceRef".into(),
+            }),
+        }
     }
+}
+
+/// Body hash for push idempotency. Domain-tagged so a key reused
+/// across operation kinds is a collision rather than a cross-shape
+/// dedup. Push's request body is large (N commit blobs); we hash
+/// the validated outputs the state machine can re-derive on retry:
+/// target ledger id, the new head id + t, and the accepted count.
+/// All four are content-derived from the inputs, so a retry of the
+/// same payload produces the same hash.
+fn push_body_hash(
+    ledger: &str,
+    new_head: &ContentId,
+    accepted: usize,
+    new_head_t: i64,
+) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(b"push");
+    hasher.update(ledger.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(new_head.to_string().as_bytes());
+    hasher.update(b"\0");
+    hasher.update(accepted.to_le_bytes());
+    hasher.update(new_head_t.to_le_bytes());
+    hasher.finalize().into()
 }
 
 /// Body hash for rebase idempotency. Domain-tagged so a key reused

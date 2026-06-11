@@ -33,7 +33,8 @@ use fluree_db_core::{
 use fluree_db_core::{RangeMatch, RangeOptions, RangeTest, Storage};
 use fluree_db_core::{CODEC_FLUREE_COMMIT, CODEC_FLUREE_TXN};
 use fluree_db_ledger::LedgerState;
-use fluree_db_nameservice::{CasResult, RefKind, RefValue};
+use crate::ledger_manager::LedgerWriteGuard;
+use fluree_db_nameservice::{CasResult, NsRecordSnapshot, RefKind, RefValue};
 use fluree_db_novelty::{generate_commit_flakes, stamp_graph_on_commit_flakes, Novelty};
 use fluree_db_policy::PolicyContext;
 use serde::{Deserialize, Serialize};
@@ -105,6 +106,51 @@ pub struct PushedHead {
     pub commit_id: ContentId,
 }
 
+/// Output of [`Fluree::prepare_push`].
+///
+/// Bundles everything the apply phase needs: receipt metadata
+/// (`ledger`, `accepted`, `indexing_status`), the rollback snapshot
+/// for local-mode bookkeeping, the ref endpoints the apply will
+/// advance between (CAS `expected_prev` = `pre_push_head`; new head
+/// = `new_head_*`), the post-push `final_state` to install through
+/// the held write guard, and the write guard itself held across the
+/// build → apply window.
+///
+/// `pending_blobs` is intentionally absent — push writes blobs
+/// inline during the build phase (they're content-addressed by hash
+/// and idempotent), so by the time `apply_push` runs the only thing
+/// left is the single ref advance.
+pub struct StagedPush {
+    /// Target ledger id (`"<name>:<branch>"`).
+    pub ledger: String,
+    /// Number of commits accepted in this push.
+    pub accepted: usize,
+    /// Branch's pre-push head snapshot. The local apply path passes
+    /// this to `RefPublisher::reset_head` to roll back a partial
+    /// publish on apply failure. The Raft apply path ignores it
+    /// (the `AdvanceRef` proposal either applies or doesn't).
+    pub rollback_snapshot: NsRecordSnapshot,
+    /// Branch's pre-push commit head. `expected_prev` for the CAS
+    /// or `AdvanceRef` proposal.
+    pub pre_push_head: RefValue,
+    /// Head ref the apply step advances the branch to (the last
+    /// commit in the push batch).
+    pub new_head_id: ContentId,
+    /// Companion to [`Self::new_head_id`].
+    pub new_head_t: i64,
+    /// Ledger write guard held across build → apply so concurrent
+    /// transactions stay serialized through the apply step. Always
+    /// present (push requires a managed ledger manager).
+    pub write_guard: LedgerWriteGuard,
+    /// Cumulative post-push state. The apply step installs this
+    /// through `write_guard` after the ref advance, so the cache
+    /// catches up with the new head atomically.
+    pub final_state: LedgerState,
+    /// Indexing-needed hint carried through to the receipt and the
+    /// background indexer trigger.
+    pub indexing_status: IndexingStatus,
+}
+
 /// Push precomputed commits to a ledger (transaction server mode).
 ///
 /// This acquires the ledger write mutex for the duration of validation + publish,
@@ -117,28 +163,70 @@ impl Fluree {
         opts: &GovernanceOptions,
         index_config: &IndexConfig,
     ) -> Result<PushCommitsResponse> {
+        let staged = self
+            .prepare_push(ledger_id, request, opts, index_config)
+            .await?;
+        self.apply_push(staged).await
+    }
+
+    /// Validate and write the push payload up to (but not including)
+    /// the CAS / ref-advance step. Returns a [`StagedPush`] the
+    /// caller can then apply via [`Self::apply_push`] (local
+    /// single-step apply: CAS + cache install) or by proposing a
+    /// single `AdvanceRef` through consensus (Raft path).
+    ///
+    /// The build phase:
+    /// - Acquires the ledger write guard (push requires a managed
+    ///   ledger manager).
+    /// - Decodes + validates the commit chain (strict sequencing,
+    ///   per-commit policy / SHACL / namespace / retraction checks
+    ///   against an evolving novelty overlay).
+    /// - Writes all referenced blobs and commit bytes to the
+    ///   content store. Content-addressed, so writes are idempotent
+    ///   and orphan blobs on failure are GC fodder.
+    /// - Derives the post-push `final_state` and the indexing
+    ///   status hint.
+    ///
+    /// Returns the `StagedPush` with the head endpoints (`pre_push_head`
+    /// as `expected_prev`, `new_head_*` as the target) and the held
+    /// write guard. The apply step performs only the single ref
+    /// advance + cache install.
+    pub async fn prepare_push(
+        &self,
+        ledger_id: &str,
+        request: PushCommitsRequest,
+        opts: &GovernanceOptions,
+        index_config: &IndexConfig,
+    ) -> Result<StagedPush> {
         if request.commits.is_empty() {
             return Err(ApiError::http(400, "missing required field 'commits'"));
         }
 
         // 0) Lock ledger state for write (serialize with transactions).
-        let mut guard = self
+        let guard = self
             .lock_ledger(ledger_id)
             .await?
             .ok_or_else(|| ApiError::internal("push requires a ledger manager"))?;
         let mut base_state = guard.clone_state();
 
-        // 1) Read current head ref (CAS expected).
-        let current_ref = self
-            .publisher()?
-            .get_ref(base_state.ledger_id(), RefKind::CommitHead)
-            .await?;
-        let Some(current_ref) = current_ref else {
-            return Err(ApiError::NotFound(format!(
-                "Ledger not found: {}",
-                base_state.ledger_id()
-            )));
+        // 1) Read current head ref (CAS expected). Use the lookup
+        //    surface rather than the publisher's `get_ref` so this
+        //    works in modes where the publisher trait isn't directly
+        //    available (e.g., a Raft state-machine projection where
+        //    writes flow through consensus proposals rather than the
+        //    `RefPublisher` surface).
+        let current_record = self
+            .nameservice()
+            .lookup(base_state.ledger_id())
+            .await?
+            .ok_or_else(|| {
+                ApiError::NotFound(format!("Ledger not found: {}", base_state.ledger_id()))
+            })?;
+        let current_ref = RefValue {
+            id: current_record.commit_head_id.clone(),
+            t: current_record.commit_t,
         };
+        let rollback_snapshot = NsRecordSnapshot::from_record(&current_record);
 
         // 2) Decode commits and preflight strict sequencing.
         let decoded = decode_and_validate_commit_chain(base_state.ledger_id(), &request)
@@ -296,7 +384,9 @@ impl Fluree {
             accepted_all_flakes.push((c.commit.t, all_flakes));
         }
 
-        // 5) Write required blobs and commit bytes to storage (safe before CAS).
+        // 5) Write required blobs and commit bytes to storage. Content
+        //    addressing makes these writes idempotent; orphan blobs on
+        //    a later apply failure are GC fodder.
         let storage = self
             .backend()
             .admin_storage_cloned()
@@ -310,20 +400,74 @@ impl Fluree {
             .map_err(PushError::into_api_error)?;
 
         let final_head = stored_commits.last().expect("non-empty stored_commits");
-        let new_ref = RefValue {
-            id: Some(final_head.commit_id.clone()),
-            t: final_head.t,
+        let new_head_id = final_head.commit_id.clone();
+        let new_head_t = final_head.t;
+        let accepted = decoded.len();
+
+        // 6) Derive the post-push LedgerState. The apply step
+        //    installs it through the held write guard.
+        let mut new_state = apply_pushed_commits_to_state(
+            base_state,
+            &accepted_all_flakes,
+            &decoded,
+            &stored_commits,
+        )
+        .map_err(PushError::into_api_error)?;
+        self.refresh_index(&mut new_state).await?;
+
+        // 7) Compute indexing status from the updated state.
+        let indexing_enabled = self.indexing_mode.is_enabled() && self.defaults_indexing_enabled();
+        let indexing_needed = new_state.should_reindex(index_config);
+        let indexing_status = IndexingStatus {
+            enabled: indexing_enabled,
+            needed: indexing_needed,
+            novelty_size: new_state.novelty_size(),
+            index_t: new_state.index_t(),
+            commit_t: new_head_t,
         };
 
-        // 6) CAS update CommitHead (single CAS, strict).
+        Ok(StagedPush {
+            ledger: ledger_id.to_string(),
+            accepted,
+            rollback_snapshot,
+            pre_push_head: current_ref,
+            new_head_id,
+            new_head_t,
+            write_guard: guard,
+            final_state: new_state,
+            indexing_status,
+        })
+    }
+
+    /// Apply a [`StagedPush`] through the local commit pipeline:
+    /// single CAS to advance the branch HEAD, then install the
+    /// cumulative state through the held write guard and trigger
+    /// background indexing if needed.
+    ///
+    /// Atomic with the build phase: blobs are already content-
+    /// addressed in storage; if the CAS fails, the orphan blobs are
+    /// GC fodder and the ref stays at `pre_push_head`.
+    async fn apply_push(&self, staged: StagedPush) -> Result<PushCommitsResponse> {
+        let StagedPush {
+            ledger,
+            accepted,
+            rollback_snapshot: _,
+            pre_push_head,
+            new_head_id,
+            new_head_t,
+            mut write_guard,
+            final_state,
+            indexing_status,
+        } = staged;
+
+        let new_ref = RefValue {
+            id: Some(new_head_id.clone()),
+            t: new_head_t,
+        };
+
         match self
             .publisher()?
-            .compare_and_set_ref(
-                base_state.ledger_id(),
-                RefKind::CommitHead,
-                Some(&current_ref),
-                &new_ref,
-            )
+            .compare_and_set_ref(&ledger, RefKind::CommitHead, Some(&pre_push_head), &new_ref)
             .await?
         {
             CasResult::Updated => {}
@@ -332,57 +476,32 @@ impl Fluree {
                     409,
                     format!(
                         "commit head changed during push (expected t={}, actual={:?})",
-                        current_ref.t, actual
+                        pre_push_head.t, actual
                     ),
                 ));
             }
         }
 
-        // 7) Update in-memory ledger state (now committed).
-        let new_state = apply_pushed_commits_to_state(
-            base_state,
-            &accepted_all_flakes,
-            &decoded,
-            &stored_commits,
-        )
-        .map_err(PushError::into_api_error)?;
-
-        let mut new_state = new_state;
-        self.refresh_index(&mut new_state).await?;
-
-        // 8) Compute indexing status from the updated state.
-        let indexing_enabled = self.indexing_mode.is_enabled() && self.defaults_indexing_enabled();
-        let indexing_needed = new_state.should_reindex(index_config);
-
-        let indexing_status = IndexingStatus {
-            enabled: indexing_enabled,
-            needed: indexing_needed,
-            novelty_size: new_state.novelty_size(),
-            index_t: new_state.index_t(),
-            commit_t: final_head.t,
-        };
-
         // Sync binary_store BEFORE replacing state so that concurrent readers
         // (via snapshot()) never see the new state with a stale binary_store.
-        guard
+        write_guard
             .ledger()
-            .sync_binary_store_from_state(&new_state)
+            .sync_binary_store_from_state(&final_state)
             .await;
-        guard.replace(new_state);
+        write_guard.replace(final_state);
 
-        // 9) Trigger background indexing if enabled and needed.
-        if let IndexingMode::Background(idx_handle) = &self.indexing_mode {
-            if indexing_enabled && indexing_needed {
-                idx_handle.trigger(ledger_id, final_head.t).await;
+        if indexing_status.enabled && indexing_status.needed {
+            if let IndexingMode::Background(idx_handle) = &self.indexing_mode {
+                idx_handle.trigger(&ledger, new_head_t).await;
             }
         }
 
         Ok(PushCommitsResponse {
-            ledger: ledger_id.to_string(),
-            accepted: decoded.len(),
+            ledger,
+            accepted,
             head: PushedHead {
-                t: final_head.t,
-                commit_id: final_head.commit_id.clone(),
+                t: new_head_t,
+                commit_id: new_head_id,
             },
             indexing: indexing_status,
         })

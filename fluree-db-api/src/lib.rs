@@ -112,7 +112,7 @@ pub use block_fetch::{
 };
 pub use commit_transfer::{
     Base64Bytes, BulkImportResult, CommitImportResult, ExportCommitsRequest, ExportCommitsResponse,
-    PushCommitsRequest, PushCommitsResponse, PushedHead,
+    PushCommitsRequest, PushCommitsResponse, PushedHead, StagedPush,
 };
 pub use dataset::{
     sparql_dataset_ledger_ids, DatasetParseError, DatasetSpec, GovernanceOptions, GraphSource,
