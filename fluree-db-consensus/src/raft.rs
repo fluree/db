@@ -56,8 +56,8 @@ use crate::{
     TransactionReceipt, TransactionRequest,
 };
 use async_trait::async_trait;
-use fluree_db_api::Fluree;
-use fluree_db_core::ContentStore;
+use fluree_db_api::{ConflictStrategy, Fluree, StagedRevert, GuardedStagedCommit};
+use fluree_db_core::{CommitId, ContentStore};
 use fluree_db_ledger::IndexConfig;
 use openraft::{BasicNode, Raft};
 use std::sync::Arc;
@@ -313,8 +313,174 @@ impl Committer for RaftCommitter {
         // pre-build snapshot (correct: nothing advanced).
     }
 
-    async fn revert(&self, _request: RevertRequest) -> Result<RevertReceipt, SubmissionError> {
-        todo!("RaftCommitter::revert — pending merge/rebase/revert dry-run terminals")
+    async fn revert(&self, request: RevertRequest) -> Result<RevertReceipt, SubmissionError> {
+        let RevertRequest {
+            idempotency_key,
+            ledger_name,
+            branch,
+            selection,
+            strategy,
+        } = request;
+
+        // 1. Build the staged revert. Strategy validation, conflict-key
+        //    computation, and the StagedCommit construction all live
+        //    inside `prepare_revert`.
+        let StagedRevert {
+            branch_id,
+            branch: branch_name,
+            reverted_commits,
+            conflict_count,
+            strategy,
+            rollback_snapshot: _,
+            current_head_t,
+            current_head_id,
+            commit,
+        } = self
+            .fluree
+            .prepare_revert(&ledger_name, &branch, selection, strategy)
+            .await
+            .map_err(execution_failure)?;
+
+        // 2. NoOp short-circuit: the conflict strategy dropped every
+        //    reverted flake. Nothing to propose — return the head ref
+        //    the build phase observed.
+        let GuardedStagedCommit {
+            write_guard,
+            staged: staged_commit,
+        } = match commit {
+            Some(c) => c,
+            None => {
+                return Ok(RevertReceipt {
+                    idempotency_key,
+                    branch: branch_name,
+                    reverted_commits,
+                    conflict_count,
+                    strategy,
+                    new_head_t: current_head_t,
+                    new_head_id: current_head_id,
+                });
+            }
+        };
+
+        // 3. Materialize idempotency context (consensus-side only).
+        let idempotency_ctx = idempotency_key.as_ref().map(|key| SmIdempotencyContext {
+            key: IdempotencyCacheKey::new(branch_id.clone(), key.clone()),
+            body_hash: revert_body_hash(&reverted_commits, &strategy),
+        });
+
+        let commit_cid = staged_commit
+            .commit
+            .id
+            .clone()
+            .expect("build_revert_commit guarantees commit.id is set");
+        let new_t = staged_commit.commit.t;
+        let expected_prev = staged_commit
+            .expected_head_ref
+            .as_ref()
+            .and_then(|r| r.id.clone());
+
+        // 4. Write the commit blob to the shared content store.
+        self.content_store
+            .put_with_id(&commit_cid, &staged_commit.commit_bytes)
+            .await
+            .map_err(|e| SubmissionError::Execution {
+                status: 500,
+                message: format!("revert commit blob write failed: {e}"),
+            })?;
+
+        // 5. Write any referenced blobs (v1: empty).
+        for (cid, bytes) in &staged_commit.referenced_bytes {
+            self.content_store
+                .put_with_id(cid, bytes)
+                .await
+                .map_err(|e| SubmissionError::Execution {
+                    status: 500,
+                    message: format!("revert referenced blob write failed: {e}"),
+                })?;
+        }
+
+        // 6. Construct the AdvanceRef proposal.
+        let applied_at_millis = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let cmd = SmCommand::AdvanceRef(AdvanceRefArgs {
+            ledger_id: ledger_name,
+            branch: branch_name.clone(),
+            expected_prev,
+            new_head: commit_cid.clone(),
+            t: new_t,
+            applied_at_millis,
+            idempotency: idempotency_ctx,
+            release: Vec::<ExecutionRecordRef>::new(),
+            tally: None,
+        });
+
+        // 7. Propose through Raft, await quorum.
+        let resp =
+            self.raft
+                .client_write(cmd)
+                .await
+                .map_err(|e| SubmissionError::Execution {
+                    status: 500,
+                    message: format!("raft client_write failed: {e}"),
+                })?;
+
+        // 8. Translate Response into RevertReceipt; on Applied, derive
+        //    the post-commit LedgerState and install it through the
+        //    held write guard before dropping.
+        match resp.data {
+            SmResponse::Applied {
+                head_t,
+                head_id,
+                accepted: _,
+                release: _,
+                tally: _,
+            } => {
+                let (_receipt, new_state) =
+                    staged_commit
+                        .finalize_state()
+                        .map_err(|e| SubmissionError::Execution {
+                            status: 500,
+                            message: format!("revert finalize_state failed: {e}"),
+                        })?;
+                if let Some(guard) = write_guard {
+                    let needs_reindex = new_state.should_reindex(&self.index_config);
+                    self.fluree
+                        .finalize_commit(guard, new_state, head_t, needs_reindex)
+                        .await
+                        .map_err(execution_failure)?;
+                }
+                Ok(RevertReceipt {
+                    idempotency_key,
+                    branch: branch_name,
+                    reverted_commits,
+                    conflict_count,
+                    strategy,
+                    new_head_t: head_t,
+                    new_head_id: head_id,
+                })
+            }
+            SmResponse::Conflict {
+                current_head: _,
+                current_t: _,
+            } => Err(SubmissionError::Execution {
+                status: 409,
+                message: "raft CAS conflict on AdvanceRef for revert".into(),
+            }),
+            SmResponse::BodyHashMismatch => Err(SubmissionError::KeyCollision),
+            SmResponse::LedgerNotFound { ledger_id } => Err(SubmissionError::Execution {
+                status: 404,
+                message: format!("ledger not found: {ledger_id}"),
+            }),
+            SmResponse::Created { .. }
+            | SmResponse::Deleted { .. }
+            | SmResponse::AlreadyExists { .. }
+            | SmResponse::NoOp => Err(SubmissionError::Execution {
+                status: 500,
+                message: "unexpected Response variant for AdvanceRef".into(),
+            }),
+        }
     }
 
     async fn merge(&self, _request: MergeRequest) -> Result<MergeReceipt, SubmissionError> {
@@ -328,6 +494,24 @@ impl Committer for RaftCommitter {
     async fn push(&self, _request: PushRequest) -> Result<PushReceipt, SubmissionError> {
         todo!("RaftCommitter::push — pending push dry-run terminal")
     }
+}
+
+/// Body hash for revert idempotency: domain-tagged so an
+/// idempotency key reused across operation kinds (transact / revert /
+/// merge / rebase) flags as a collision rather than dedup-ing across
+/// shapes. Hash inputs are the validated request fields the state
+/// machine can verify on retry: the ordered list of reverted commits
+/// and the conflict strategy.
+fn revert_body_hash(reverted: &[CommitId], strategy: &ConflictStrategy) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(b"revert");
+    for cid in reverted {
+        hasher.update(cid.to_string().as_bytes());
+        hasher.update(b"\0");
+    }
+    hasher.update(strategy.as_str().as_bytes());
+    hasher.finalize().into()
 }
 
 /// Split a fully-qualified ledger id (`"name:branch"`) into its

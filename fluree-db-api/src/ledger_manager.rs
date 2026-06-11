@@ -98,6 +98,30 @@ impl LedgerWriteGuard {
 }
 
 // ============================================================================
+// GuardedStagedCommit - StagedCommit + held ledger write guard
+// ============================================================================
+
+/// A [`StagedCommit`] paired with the [`LedgerWriteGuard`] that
+/// serialized its construction. The guard stays held across the
+/// caller's apply step so concurrent transactions don't slip a write
+/// in between staging and apply.
+///
+/// `write_guard` is `Option` because some build paths run without a
+/// [`LedgerManager`] (embedded use with no shared cache); in those
+/// cases there's nothing to serialize against and `None` is correct.
+///
+/// Used as the `Option<GuardedStagedCommit>` apply payload on
+/// [`StagedRevert`](crate::StagedRevert), and (when wired up) the
+/// merge / rebase / push staged shapes.
+///
+/// [`StagedCommit`]: fluree_db_transact::StagedCommit
+/// [`LedgerManager`]: crate::LedgerManager
+pub struct GuardedStagedCommit {
+    pub write_guard: Option<LedgerWriteGuard>,
+    pub staged: fluree_db_transact::StagedCommit,
+}
+
+// ============================================================================
 // LedgerHandle - Cheap cloneable reference to cached state
 // ============================================================================
 

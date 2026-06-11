@@ -168,7 +168,8 @@ pub use query::builder::{
 pub use query::nameservice_builder::NameserviceQueryBuilder;
 pub use query::{QueryResult, TrackedErrorResponse, TrackedQueryResponse};
 pub use rebase::{ConflictStrategy, RebaseConflict, RebaseFailure, RebaseReport};
-pub use revert::{RevertReport, RevertSelection};
+pub use ledger_manager::GuardedStagedCommit;
+pub use revert::{RevertReport, RevertSelection, StagedRevert};
 pub use revert_preview::{RevertConflictSummary, RevertPreview, RevertPreviewOpts};
 pub use tx::{
     IndexingMode, IndexingStatus, StageResult, TrackedTransactionInput, TransactResult,

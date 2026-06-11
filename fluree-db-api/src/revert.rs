@@ -30,7 +30,8 @@ use fluree_db_core::{
 };
 use fluree_db_ledger::{LedgerState, StagedLedger};
 use fluree_db_nameservice::NsRecordSnapshot;
-use fluree_db_transact::{CommitOpts, NamespaceRegistry, StagedCommit};
+use crate::ledger_manager::GuardedStagedCommit;
+use fluree_db_transact::{CommitOpts, NamespaceRegistry};
 use fluree_vocab::namespaces::FLUREE_DB;
 use futures::TryStreamExt;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -171,13 +172,27 @@ impl crate::Fluree {
         .await
     }
 
-    async fn revert_inner(
+    /// Validate and build the revert up to (but not including) the
+    /// commit-blob write + ref advance. Returns a [`StagedRevert`]
+    /// the caller can then apply via [`StagedCommit::apply`] (local
+    /// path) or by writing the blob + proposing `AdvanceRef` through
+    /// consensus (Raft path).
+    ///
+    /// When the resulting [`StagedRevert::commit`] is `Some`, the
+    /// embedded [`GuardedStagedCommit`] carries the [`LedgerWriteGuard`]
+    /// held during the build so concurrent transactions stay
+    /// serialized through the caller's apply step.
+    ///
+    /// Errors with [`ApiError::InvalidBranch`] for unsupported
+    /// strategies and [`ApiError::BranchConflict`] when the
+    /// [`ConflictStrategy::Abort`] strategy meets actual conflicts.
+    pub async fn prepare_revert(
         &self,
         ledger_name: &str,
         branch: &str,
         selection: RevertSelection,
         strategy: ConflictStrategy,
-    ) -> Result<RevertReport> {
+    ) -> Result<StagedRevert> {
         match strategy {
             ConflictStrategy::TakeBoth => {
                 return Err(ApiError::InvalidBranch(
@@ -204,7 +219,6 @@ impl crate::Fluree {
             )));
         }
 
-        let snapshot = NsRecordSnapshot::from_record(&ctx.branch_record);
         if let Some(ref lm) = self.ledger_manager {
             lm.disconnect(&ctx.branch_id).await;
         }
@@ -217,22 +231,48 @@ impl crate::Fluree {
             conflict_keys,
         } = ctx;
 
+        self.build_revert_commit(
+            &branch_id,
+            branch,
+            branch_record,
+            &branch_store,
+            &plan,
+            &conflict_keys,
+            strategy,
+        )
+        .await
+    }
+
+    async fn revert_inner(
+        &self,
+        ledger_name: &str,
+        branch: &str,
+        selection: RevertSelection,
+        strategy: ConflictStrategy,
+    ) -> Result<RevertReport> {
+        let StagedRevert {
+            branch_id,
+            branch: branch_string,
+            reverted_commits,
+            conflict_count,
+            strategy,
+            rollback_snapshot: snapshot,
+            current_head_t,
+            current_head_id,
+            commit,
+        } = self
+            .prepare_revert(ledger_name, branch, selection, strategy)
+            .await?;
+
         let result = self
-            .write_revert_commit(
-                &branch_id,
-                branch_record.clone(),
-                &branch_store,
-                &plan,
-                &conflict_keys,
-                &strategy,
-            )
+            .apply_staged_revert_commit(&branch_id, current_head_t, current_head_id, commit)
             .await;
 
         match result {
             Ok((new_head_t, new_head_id)) => Ok(RevertReport {
-                branch: branch.to_string(),
-                reverted_commits: plan.ordered_commits.into_vec(),
-                conflict_count: conflict_keys.len(),
+                branch: branch_string,
+                reverted_commits,
+                conflict_count,
                 strategy: strategy.as_str().to_string(),
                 new_head_t,
                 new_head_id,
@@ -254,6 +294,40 @@ impl crate::Fluree {
                 Err(e)
             }
         }
+    }
+
+    /// Apply the [`GuardedStagedCommit`] (if present) through the local
+    /// commit pipeline (write blob + publish via nameservice + cache
+    /// refresh). When `commit` is `None`, the conflict strategy
+    /// dropped every reverted flake — return `current_head_*` as the
+    /// no-op result. Returns the resulting head's `(t, commit_id)`
+    /// either way.
+    async fn apply_staged_revert_commit(
+        &self,
+        branch_id: &str,
+        current_head_t: i64,
+        current_head_id: CommitId,
+        commit: Option<GuardedStagedCommit>,
+    ) -> Result<(i64, CommitId)> {
+        let GuardedStagedCommit {
+            write_guard,
+            staged,
+        } = match commit {
+            Some(c) => c,
+            None => return Ok((current_head_t, current_head_id)),
+        };
+
+        let content_store = self.content_store(branch_id);
+        let publisher = self.publisher()?;
+        let (receipt, new_state) = staged.apply(&content_store, publisher, false).await?;
+
+        if let Some(guard) = write_guard {
+            let needs_reindex = new_state.should_reindex(&self.index_config);
+            self.finalize_commit(guard, new_state, receipt.t, needs_reindex)
+                .await?;
+        }
+
+        Ok((receipt.t, receipt.commit_id))
     }
 
     /// Resolve `selection` against `branch`'s current state, walk the DAG,
@@ -332,10 +406,10 @@ impl crate::Fluree {
     /// the conflict strategy, stage them on top of the branch head, and
     /// run [`fluree_db_transact::build_commit`] to produce a
     /// [`StagedCommit`] — but do not write the commit blob and do not
-    /// publish the new head ref. Returns the staged commit (plus the
-    /// optional write guard the caller must keep alive until apply
-    /// completes), or a no-op outcome when the conflict strategy drops
-    /// every reverted flake.
+    /// publish the new head ref. Populates a [`StagedRevert`] carrying
+    /// the receipt metadata, the rollback snapshot, the observed head
+    /// ref, and (when the conflict strategy left something to apply)
+    /// the staged commit + held write guard.
     ///
     /// Used by the local revert pipeline (which immediately calls
     /// [`StagedCommit::apply`]) and by the Raft revert path (which
@@ -344,12 +418,16 @@ impl crate::Fluree {
     pub(crate) async fn build_revert_commit<C: ContentStore + Clone + 'static>(
         &self,
         branch_id: &str,
+        branch: &str,
         branch_record: fluree_db_nameservice::NsRecord,
         branch_store: &C,
         plan: &RevertPlan,
         conflict_keys: &[ConflictKey],
-        strategy: &ConflictStrategy,
+        strategy: ConflictStrategy,
     ) -> Result<StagedRevert> {
+        let reverted_commits = plan.ordered_commits.clone().into_vec();
+        let conflict_count = conflict_keys.len();
+        let rollback_snapshot = NsRecordSnapshot::from_record(&branch_record);
         // Load reverted commits oldest-first then fold via the shared
         // accumulator: invert each flake's `op` (assertion ⇄ retraction) and
         // accumulate `namespace_delta`/`graph_delta` with earlier-wins
@@ -373,20 +451,30 @@ impl crate::Fluree {
             .await?;
 
         let staged = self
-            .apply_two_way_strategy(inverted, conflict_keys, strategy, &target_state)
+            .apply_two_way_strategy(inverted, conflict_keys, &strategy, &target_state)
             .await?;
+
+        let current_head_t = target_state.t();
+        let current_head_id = target_state
+            .head_commit_id
+            .clone()
+            .ok_or_else(|| ApiError::internal("branch has no head commit id"))?;
 
         // If every reverted flake was a conflict and the strategy dropped
         // them all (e.g. TakeBranch with full overlap), there is nothing to
         // commit. Return a no-op outcome rather than letting build_commit
         // reject the empty transaction.
         if staged.is_empty() {
-            return Ok(StagedRevert::NoOp {
-                head_t: target_state.t(),
-                head_id: target_state
-                    .head_commit_id
-                    .clone()
-                    .ok_or_else(|| ApiError::internal("branch has no head commit id"))?,
+            return Ok(StagedRevert {
+                branch_id: branch_id.to_string(),
+                branch: branch.to_string(),
+                reverted_commits,
+                conflict_count,
+                strategy,
+                rollback_snapshot,
+                current_head_t,
+                current_head_id,
+                commit: None,
             });
         }
 
@@ -438,52 +526,20 @@ impl crate::Fluree {
         )
         .await?;
 
-        Ok(StagedRevert::Commit {
-            write_guard,
-            staged: staged_commit,
+        Ok(StagedRevert {
+            branch_id: branch_id.to_string(),
+            branch: branch.to_string(),
+            reverted_commits,
+            conflict_count,
+            strategy,
+            rollback_snapshot,
+            current_head_t,
+            current_head_id,
+            commit: Some(GuardedStagedCommit {
+                write_guard,
+                staged: staged_commit,
+            }),
         })
-    }
-
-    /// Run [`Self::build_revert_commit`] and either apply the staged
-    /// commit (writing the blob + publishing the new head + refreshing
-    /// the cache) or surface the strategy-induced no-op head ref.
-    /// Returns the new head's `(t, commit_id)` either way.
-    async fn write_revert_commit<C: ContentStore + Clone + 'static>(
-        &self,
-        branch_id: &str,
-        branch_record: fluree_db_nameservice::NsRecord,
-        branch_store: &C,
-        plan: &RevertPlan,
-        conflict_keys: &[ConflictKey],
-        strategy: &ConflictStrategy,
-    ) -> Result<(i64, CommitId)> {
-        let built = self
-            .build_revert_commit(
-                branch_id,
-                branch_record,
-                branch_store,
-                plan,
-                conflict_keys,
-                strategy,
-            )
-            .await?;
-
-        let (write_guard, staged) = match built {
-            StagedRevert::NoOp { head_t, head_id } => return Ok((head_t, head_id)),
-            StagedRevert::Commit { write_guard, staged } => (write_guard, staged),
-        };
-
-        let content_store = self.content_store(branch_id);
-        let publisher = self.publisher()?;
-        let (receipt, new_state) = staged.apply(&content_store, publisher, false).await?;
-
-        if let Some(guard) = write_guard {
-            let needs_reindex = new_state.should_reindex(&self.index_config);
-            self.finalize_commit(guard, new_state, receipt.t, needs_reindex)
-                .await?;
-        }
-
-        Ok((receipt.t, receipt.commit_id))
     }
 }
 
@@ -544,26 +600,52 @@ pub(crate) struct RevertPlan {
     pub(crate) oldest_t: i64,
 }
 
-/// Output of [`Fluree::build_revert_commit`].
+/// Output of [`Fluree::prepare_revert`] / [`Fluree::build_revert_commit`].
 ///
-/// Carries either a [`StagedCommit`] ready for [`StagedCommit::apply`]
-/// (or a custom apply path like the Raft committer), or a no-op shape
-/// when the conflict strategy dropped every reverted flake.
+/// Bundles everything either apply path needs: receipt metadata
+/// (`branch`, `reverted_commits`, `conflict_count`, `strategy`), the
+/// `rollback_snapshot` the local path uses to undo a partial
+/// nameservice publish on apply failure, the head ref observed under
+/// the lock (which doubles as the result when the conflict strategy
+/// drops everything), and — when there's something to actually
+/// commit — the [`GuardedStagedCommit`] carrying the staged commit
+/// plus the held write guard.
 ///
-/// The `Commit` variant also carries the [`LedgerWriteGuard`] held
-/// during the build so the caller can serialize the subsequent
-/// content-store write + ref-advance step against concurrent
-/// transactions.
-pub(crate) enum StagedRevert {
-    Commit {
-        write_guard: Option<crate::LedgerWriteGuard>,
-        staged: StagedCommit,
-    },
-    NoOp {
-        head_t: i64,
-        head_id: CommitId,
-    },
+/// Callers route on `commit`:
+/// - `Some(_)` → apply (locally via [`StagedCommit::apply`], or in
+///   Raft mode by writing the commit blob + proposing `AdvanceRef`).
+/// - `None` → no-op outcome; use `current_head_t` / `current_head_id`
+///   directly as the result.
+pub struct StagedRevert {
+    /// Fully-qualified branch id (`"<ledger>:<branch>"`) used by the
+    /// apply path for content-store + publisher addressing.
+    pub branch_id: String,
+    /// Branch name (without ledger prefix) — echoed onto the
+    /// resulting receipt.
+    pub branch: String,
+    /// Commits whose effects this revert undoes, in application order
+    /// (newest-first).
+    pub reverted_commits: Vec<CommitId>,
+    /// Number of `(s, p, g)` conflicts the strategy resolved.
+    pub conflict_count: usize,
+    /// Validated conflict strategy carried through to the receipt.
+    pub strategy: ConflictStrategy,
+    /// Pre-revert head snapshot. The local path passes this to
+    /// `RefPublisher::reset_head` to undo a partial publish if apply
+    /// fails. The Raft path ignores it (no publish happens until
+    /// `AdvanceRef` applies through consensus).
+    pub rollback_snapshot: NsRecordSnapshot,
+    /// Branch head observed under the lock during build. Also the
+    /// result when `commit` is `None`.
+    pub current_head_t: i64,
+    /// Companion to [`Self::current_head_t`].
+    pub current_head_id: CommitId,
+    /// `Some` when the conflict strategy left a non-empty staged
+    /// commit; `None` when it dropped everything (use
+    /// `current_head_t` / `current_head_id` as the no-op result).
+    pub commit: Option<GuardedStagedCommit>,
 }
+
 
 // ---------------------------------------------------------------------------
 // Helpers
