@@ -2476,8 +2476,8 @@ pub fn parallel_overlay_psot_filter_count<P>(
 where
     P: Fn(u64, u16, u64) -> bool + Sync + Send,
 {
-    // Collect + resolve the predicate's overlay ops once (serial; novelty is small).
-    let ops = match collect_resolved_overlay_ops(ctx, store, g_id, RunSortOrder::Psot, &pred_sid)? {
+    // Per-execution cached collect + resolve; sliced per partition below.
+    let ops = match cached_overlay_ops(ctx, store, g_id, RunSortOrder::Psot, &pred_sid)? {
         Some(o) => o,
         None => return Ok(None),
     };
@@ -2563,7 +2563,7 @@ pub fn count_predicate_overlay_delta(
     pred_sid: Sid,
     p_id: u32,
 ) -> Result<Option<u64>> {
-    let ops = match collect_resolved_overlay_ops(ctx, store, g_id, RunSortOrder::Psot, &pred_sid)? {
+    let ops = match cached_overlay_ops(ctx, store, g_id, RunSortOrder::Psot, &pred_sid)? {
         Some(o) => o,
         None => return Ok(None),
     };
