@@ -1953,26 +1953,47 @@ impl Operator for BinaryScanOperator {
                 if let Some(hit) = cache.get(&cache_key) {
                     Arc::clone(hit)
                 } else {
-                    let (mut ops, mut untranslated, ephemeral_preds) =
-                        translate_overlay_flakes_with_untranslated(
-                            ctx.overlay(),
-                            &store_arc,
-                            ctx.dict_novelty.as_ref(),
-                            ctx.runtime_small_dicts,
-                            ctx.to_t,
-                            self.g_id,
-                        );
-                    sort_overlay_ops(&mut ops, order);
-                    resolve_overlay_ops(&mut ops);
-                    if !untranslated.is_empty() {
-                        untranslated.sort_by(self.index.comparator());
-                        untranslated = resolve_overlay_retractions(untranslated);
-                    }
-                    let entry = Arc::new(TranslatedOverlayOps {
-                        ops: ops.into(),
-                        untranslated,
-                        ephemeral_preds,
-                    });
+                    // Cross-query layer: the translation is also stable across
+                    // executions for the same (ledger, snapshot, overlay epoch,
+                    // store, to_t) state — large overlays (reasoning
+                    // materializations) cost O(overlay × dict lookups) to
+                    // translate, which would otherwise put a flat multi-second
+                    // floor under every query at scale.
+                    let global_key = GlobalTranslationKey {
+                        ledger_id: ctx.active_snapshot.ledger_id.as_str().into(),
+                        snapshot_t: ctx.active_snapshot.t,
+                        overlay_epoch: epoch,
+                        store_max_t: store_arc.max_t(),
+                        to_t: ctx.to_t,
+                        g_id: self.g_id,
+                        index: self.index,
+                    };
+                    let entry = if let Some(hit) = global_translation_cache().get(&global_key) {
+                        hit
+                    } else {
+                        let (mut ops, mut untranslated, ephemeral_preds) =
+                            translate_overlay_flakes_with_untranslated(
+                                ctx.overlay(),
+                                &store_arc,
+                                ctx.dict_novelty.as_ref(),
+                                ctx.runtime_small_dicts,
+                                ctx.to_t,
+                                self.g_id,
+                            );
+                        sort_overlay_ops(&mut ops, order);
+                        resolve_overlay_ops(&mut ops);
+                        if !untranslated.is_empty() {
+                            untranslated.sort_by(self.index.comparator());
+                            untranslated = resolve_overlay_retractions(untranslated);
+                        }
+                        let entry = Arc::new(TranslatedOverlayOps {
+                            ops: ops.into(),
+                            untranslated,
+                            ephemeral_preds,
+                        });
+                        global_translation_cache().insert(global_key, Arc::clone(&entry));
+                        entry
+                    };
                     cache.insert(cache_key, Arc::clone(&entry));
                     entry
                 }
@@ -2241,6 +2262,67 @@ pub fn translate_overlay_flakes(
     );
 
     (ops, ephemeral_preds)
+}
+
+/// Identity of an overlay translation across query executions.
+///
+/// Every component that can change the translated product is included:
+/// commits bump the overlay epoch (covering novelty contents, dict novelty,
+/// and runtime small dicts), snapshot/store swaps change `snapshot_t` /
+/// `store_max_t`, and `to_t` bounds which overlay flakes are visible.
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub struct GlobalTranslationKey {
+    pub ledger_id: Arc<str>,
+    pub snapshot_t: i64,
+    pub overlay_epoch: u64,
+    pub store_max_t: i64,
+    pub to_t: i64,
+    pub g_id: GraphId,
+    pub index: IndexType,
+}
+
+/// Cross-query LRU of translated overlay ops.
+///
+/// Reasoning materializations are cached across queries (see
+/// `global_reasoning_cache`), but their translation to V3 ops was rebuilt per
+/// execution — O(overlay × dict lookups), a flat multi-second floor per query
+/// once the overlay holds millions of derived facts. Entries are large
+/// (~50 B/op), so the capacity is deliberately small: one or two database
+/// states are typically hot.
+pub fn global_translation_cache() -> &'static TranslationCache {
+    use once_cell::sync::Lazy;
+    static CACHE: Lazy<TranslationCache> = Lazy::new(|| TranslationCache::new(4));
+    &CACHE
+}
+
+/// Thread-safe LRU for [`GlobalTranslationKey`] → [`TranslatedOverlayOps`].
+pub struct TranslationCache {
+    inner: std::sync::Mutex<lru::LruCache<GlobalTranslationKey, Arc<TranslatedOverlayOps>>>,
+}
+
+impl TranslationCache {
+    fn new(capacity: usize) -> Self {
+        Self {
+            inner: std::sync::Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(capacity).expect("capacity must be > 0"),
+            )),
+        }
+    }
+
+    fn get(&self, key: &GlobalTranslationKey) -> Option<Arc<TranslatedOverlayOps>> {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(key)
+            .cloned()
+    }
+
+    fn insert(&self, key: GlobalTranslationKey, value: Arc<TranslatedOverlayOps>) {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .put(key, value);
+    }
 }
 
 /// Overlay translation product memoized per query execution (see
