@@ -14,7 +14,7 @@ use fluree_db_core::{trace_commits_by_id, Commit};
 use fluree_db_ledger::{LedgerState, StagedLedger};
 use fluree_db_nameservice::NsRecordSnapshot;
 use fluree_db_novelty::compute_delta_keys;
-use fluree_db_transact::{CommitOpts, NamespaceRegistry};
+use fluree_db_transact::{CommitOpts, NamespaceRegistry, StagedCommit};
 use futures::TryStreamExt;
 use rustc_hash::FxHashSet;
 use serde::Serialize;
@@ -418,13 +418,24 @@ impl crate::Fluree {
         })
     }
 
-    /// Stage flakes and commit as a replay of the original commit.
-    async fn replay_commit(
+    /// Dry-run terminal for rebase: stage `flakes` on top of `state`
+    /// and produce a [`StagedCommit`] representing the replay of
+    /// `original_commit`, without writing the commit blob or
+    /// publishing the ref. The caller composes this with either
+    /// [`StagedCommit::apply`] (local single-step apply) or the
+    /// blob-write + `AdvanceRef` consensus apply path.
+    ///
+    /// Uses `skip_sequencing=true` (no `expected_head_ref` baked in)
+    /// and `skip_backpressure=true` (a single rebase can accumulate
+    /// novelty well past the per-commit gate). Atomic rebase is
+    /// instead bounded by a cumulative novelty check the caller
+    /// applies after `staged.finalize_state()` of each step.
+    pub(crate) async fn build_replay_commit(
         &self,
         state: LedgerState,
         flakes: Vec<Flake>,
         original_commit: &Commit,
-    ) -> Result<LedgerState> {
+    ) -> Result<StagedCommit> {
         let reverse_graph = state.snapshot.build_reverse_graph().map_err(|e| {
             ApiError::internal(format!("Failed to build reverse graph during rebase: {e}"))
         })?;
@@ -440,17 +451,40 @@ impl crate::Fluree {
             .with_namespace_delta(original_commit.namespace_delta.clone())
             .with_graph_delta(original_commit.graph_delta.clone());
 
-        let content_store = self.content_store(view.db().ledger_id.as_str());
-        let publisher = self.publisher()?;
-        let (_receipt, new_state) = fluree_db_transact::commit(
+        // With skip_sequencing=true the apply path uses
+        // `fast_forward_commit` (no CAS), so `expected_head_ref` is
+        // intentionally `None` here. raw_txn has no place in a replay
+        // commit, so `txn_id` is `None` as well.
+        let staged = fluree_db_transact::build_commit(
             view,
             ns_registry,
-            &content_store,
-            publisher,
+            None,
+            None,
             &self.index_config,
             commit_opts,
         )
         .await?;
+
+        Ok(staged)
+    }
+
+    /// Stage flakes and commit as a replay of the original commit.
+    /// Thin composer: builds the staged replay then drives the local
+    /// apply (write blob + fast-forward-publish via the nameservice).
+    async fn replay_commit(
+        &self,
+        state: LedgerState,
+        flakes: Vec<Flake>,
+        original_commit: &Commit,
+    ) -> Result<LedgerState> {
+        let ledger_id = state.ledger_id().to_string();
+        let staged = self
+            .build_replay_commit(state, flakes, original_commit)
+            .await?;
+
+        let content_store = self.content_store(&ledger_id);
+        let publisher = self.publisher()?;
+        let (_receipt, new_state) = staged.apply(&content_store, publisher, true).await?;
 
         Ok(new_state)
     }
