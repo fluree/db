@@ -17,13 +17,21 @@
 //! document — the exact shape [`crate::splitter`] emits, so downstream chunk
 //! parsing is identical (the chunks reuse [`crate::splitter::ChunkPayload`]).
 //!
-//! # First line
+//! # Context lines
 //!
 //! The first non-blank line MAY be a lone `{"@context": …}` map shared by all
 //! following nodes, or it may already be the first node.
 //! [`FirstLineContextPolicy`] controls the interpretation; the default
 //! ([`FirstLineContextPolicy::Auto`]) treats line 1 as a context only when it
 //! is an object whose single key is `@context`.
+//!
+//! A lone context on a LATER line **replaces** the shared context for the
+//! lines that follow (logged at `warn`), so concatenated ndjson files
+//! (`cat a.jsonl b.jsonl`) compose naturally — each segment's records resolve
+//! against its own context, exactly as if the files were imported separately.
+//! Under [`FirstLineContextPolicy::Entity`] lone context lines are data nodes
+//! everywhere, never switches. Nodes carrying an inline `@context` alongside
+//! other keys remain ordinary nodes anywhere.
 //!
 //! # Streaming
 //!
@@ -64,7 +72,9 @@ pub enum FirstLineContextPolicy {
     /// its `@context` value is used; otherwise the whole object is used as the
     /// context map. Errors if line 1 is not a JSON object.
     Context,
-    /// Line 1 is the first node; never a context.
+    /// Lone `{"@context": …}` lines are always data nodes — line 1 is the
+    /// first node, and mid-stream lone contexts do NOT replace the shared
+    /// context. The escape hatch for data whose nodes can look like contexts.
     Entity,
 }
 
@@ -104,6 +114,7 @@ impl NdjsonReader {
                 first_node,
                 lines_consumed,
                 chunk_size_bytes,
+                policy,
                 tx,
             )
         });
@@ -246,6 +257,22 @@ fn lone_context(value: &JsonValue) -> Option<JsonValue> {
     }
 }
 
+/// If `line` (already validated as one JSON object) is a lone
+/// `{"@context":…}` object, return its context value. The byte pre-filter
+/// keeps the cost near zero for ordinary node lines: a lone-context object
+/// necessarily opens with the `"@context"` key, so only lines that do are
+/// fully parsed (and a node that merely *starts* with an inline `@context`
+/// is rejected by the single-key check).
+fn lone_context_line(line: &[u8]) -> Option<JsonValue> {
+    let inner = line[1..].trim_ascii_start();
+    if !inner.starts_with(b"\"@context\"") {
+        return None;
+    }
+    serde_json::from_slice::<JsonValue>(line)
+        .ok()
+        .and_then(|v| lone_context(&v))
+}
+
 /// Context to use for a forced (policy=Context) first line: the `@context`
 /// value if present, otherwise the whole object treated as the context map.
 fn context_from_value(value: &JsonValue) -> Option<JsonValue> {
@@ -267,9 +294,10 @@ fn reader_thread(
     first_node: Option<Vec<u8>>,
     lines_consumed: usize,
     chunk_size: u64,
+    policy: FirstLineContextPolicy,
     tx: mpsc::SyncSender<ChunkPayload>,
 ) -> Result<usize, SplitError> {
-    let prefix = build_prefix(&context)?;
+    let mut prefix = build_prefix(&context)?;
     let suffix: &[u8] = b"]}";
 
     // The buffer always starts with the prefix; `emit` seals it with the
@@ -296,6 +324,29 @@ fn reader_thread(
             continue;
         }
         validate_json_line(trimmed, line_no)?;
+        // A lone `{"@context":…}` line mid-stream REPLACES the shared context
+        // for the lines that follow, so concatenated ndjson files
+        // (`cat a.jsonl b.jsonl`) compose naturally — each segment keeps its
+        // own context, mirroring the per-file behavior of directory imports.
+        // The current chunk is sealed under the outgoing context first.
+        // Under `Entity` policy (the "my lines are never contexts" escape
+        // hatch) lone contexts remain data nodes, as on line 1.
+        if policy != FirstLineContextPolicy::Entity {
+            if let Some(new_ctx) = lone_context_line(trimmed) {
+                if element_count > 0 {
+                    emit(&tx, &mut chunk_idx, &mut chunk_buf, suffix)?;
+                }
+                tracing::warn!(
+                    line = line_no,
+                    "ndjson: lone {{\"@context\":…}} line replaces the shared \
+                     context for subsequent lines (concatenated sources?)"
+                );
+                prefix = build_prefix(&Some(new_ctx))?;
+                chunk_buf = seeded_buf(&prefix, chunk_size);
+                element_count = 0;
+                continue;
+            }
+        }
         push_node(&mut chunk_buf, &mut element_count, trimmed);
 
         if chunk_buf.len() as u64 >= chunk_size {
@@ -596,6 +647,71 @@ mod tests {
             msg.contains("line 2") && msg.contains("JSON object per line"),
             "unexpected error: {msg}"
         );
+    }
+
+    #[test]
+    fn mid_stream_lone_context_replaces_shared_context() {
+        // Concatenated-files shape: b.jsonl's context lands mid-stream and
+        // replaces a.jsonl's for the lines that follow. The chunk in flight
+        // is sealed under the outgoing context.
+        let input = "{\"@context\":{\"a\":\"http://a.example/\"}}\n\
+                     {\"@id\":\"a:1\"}\n\
+                     {\"@context\":{\"b\":\"http://b.example/\"}}\n\
+                     {\"@id\":\"b:1\"}\n";
+        let (ctx, chunks) = read_all(input, 1_000_000, FirstLineContextPolicy::Auto).unwrap();
+        // Prelude still reports the FIRST context.
+        assert_eq!(ctx.unwrap()["a"], "http://a.example/");
+        assert_eq!(chunks.len(), 2, "switch must seal the in-flight chunk");
+        assert_eq!(chunks[0]["@context"]["a"], "http://a.example/");
+        assert_eq!(chunks[0]["@graph"][0]["@id"], "a:1");
+        assert_eq!(chunks[1]["@context"]["b"], "http://b.example/");
+        assert_eq!(chunks[1]["@graph"][0]["@id"], "b:1");
+        assert_eq!(total_nodes(&chunks), 2);
+    }
+
+    #[test]
+    fn consecutive_context_lines_last_one_wins() {
+        // Two switches with no nodes between them: no empty chunk is emitted
+        // and the following nodes resolve against the last context.
+        let input = "{\"@context\":{\"a\":\"http://a.example/\"}}\n\
+                     {\"@context\":{\"b\":\"http://b.example/\"}}\n\
+                     {\"@id\":\"b:1\"}\n";
+        let (_ctx, chunks) = read_all(input, 1_000_000, FirstLineContextPolicy::Auto).unwrap();
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0]["@context"]["b"], "http://b.example/");
+        assert_eq!(total_nodes(&chunks), 1);
+    }
+
+    #[test]
+    fn trailing_context_line_emits_no_empty_chunk() {
+        let input = "{\"@id\":\"http://example.org/1\"}\n\
+                     {\"@context\":{\"x\":\"http://x.example/\"}}\n";
+        let (_ctx, chunks) = read_all(input, 1_000_000, FirstLineContextPolicy::Auto).unwrap();
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(total_nodes(&chunks), 1);
+    }
+
+    #[test]
+    fn entity_policy_keeps_mid_stream_lone_context_as_node() {
+        let input = "{\"@id\":\"http://example.org/1\"}\n\
+                     {\"@context\":{\"x\":\"http://x.example/\"}}\n\
+                     {\"@id\":\"http://example.org/2\"}\n";
+        let (ctx, chunks) = read_all(input, 1_000_000, FirstLineContextPolicy::Entity).unwrap();
+        assert!(ctx.is_none());
+        // No switch: all three lines are nodes in one no-context chunk.
+        assert_eq!(chunks.len(), 1);
+        assert!(chunks[0].get("@context").is_none());
+        assert_eq!(total_nodes(&chunks), 3);
+    }
+
+    #[test]
+    fn inline_context_on_node_lines_is_still_valid() {
+        // A node carrying @context alongside other keys is legal JSON-LD and
+        // must not trip the lone-context rejection.
+        let input = "{\"@id\":\"http://example.org/1\",\"http://schema.org/name\":\"One\"}\n\
+                     {\"@context\":{\"s\":\"http://schema.org/\"},\"@id\":\"http://example.org/2\",\"s:name\":\"Two\"}\n";
+        let (_ctx, chunks) = read_all(input, 1_000_000, FirstLineContextPolicy::Auto).unwrap();
+        assert_eq!(total_nodes(&chunks), 2);
     }
 
     #[test]

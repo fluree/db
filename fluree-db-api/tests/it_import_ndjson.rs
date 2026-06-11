@@ -265,6 +265,54 @@ async fn import_local_dir_of_ndjson_then_query() {
     assert_eq!(extract_sorted_strings(&json), vec!["Alice", "Bob"]);
 }
 
+/// One file that is the concatenation of two ndjson files (`cat a.jsonl
+/// b.jsonl`), each segment with its own leading `@context` using a different
+/// prefix for schema.org. The mid-stream lone context must REPLACE the shared
+/// context, so each segment's records resolve against their own context —
+/// identical results to importing the two files separately.
+#[tokio::test]
+async fn import_concatenated_ndjson_segments_then_query() {
+    let db_dir = tempfile::tempdir().expect("db tmpdir");
+    let data_dir = tempfile::tempdir().expect("data tmpdir");
+
+    let ndjson = concat!(
+        "{\"@context\":{\"schema\":\"http://schema.org/\"}}\n",
+        "{\"@id\":\"http://example.org/ns/ann\",\"schema:name\":\"Ann\"}\n",
+        "{\"@context\":{\"s\":\"http://schema.org/\"}}\n",
+        "{\"@id\":\"http://example.org/ns/ben\",\"s:name\":\"Ben\"}\n",
+    );
+    let path = write_file(data_dir.path(), "concat.jsonl", ndjson);
+
+    let fluree = FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build file-backed Fluree");
+    let result = fluree
+        .create("test/import-ndjson-concat:main")
+        .import(&path)
+        .threads(2)
+        .memory_budget_mb(256)
+        .cleanup(false)
+        .execute()
+        .await
+        .expect("concatenated ndjson import should succeed");
+    assert!(result.flake_count > 0);
+
+    let ledger = fluree
+        .ledger("test/import-ndjson-concat:main")
+        .await
+        .expect("load ledger after import");
+    let query = json!({
+        "@context": { "schema": "http://schema.org/" },
+        "select": ["?name"],
+        "where": { "schema:name": "?name" }
+    });
+    let qr = support::query_jsonld(&fluree, &ledger, &query)
+        .await
+        .expect("query after import");
+    let json = qr.to_jsonld(&ledger.snapshot).expect("format jsonld");
+    assert_eq!(extract_sorted_strings(&json), vec!["Ann", "Ben"]);
+}
+
 /// A `.jsonl` source with no data lines (context-only) fails with a clear
 /// up-front error — not an opaque "no commit head" storage error at the end
 /// of the pipeline.

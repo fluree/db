@@ -504,6 +504,10 @@ pub enum ImportError {
     Io(std::io::Error),
     /// Chunk discovery error.
     NoChunks(String),
+    /// Reading or validating an import source failed: unreadable, malformed,
+    /// or truncated input (e.g. a bad ndjson line). The message names the
+    /// source and, where known, the offending line.
+    Source(String),
     /// Directory contains both Turtle and JSON-LD files.
     MixedFormats(String),
     /// Tracker max-fuel limit exceeded mid-import.
@@ -521,6 +525,7 @@ impl std::fmt::Display for ImportError {
             Self::Upload(msg) => write!(f, "upload: {msg}"),
             Self::Io(e) => write!(f, "I/O: {e}"),
             Self::NoChunks(msg) => write!(f, "no chunks: {msg}"),
+            Self::Source(msg) => write!(f, "import source: {msg}"),
             Self::MixedFormats(msg) => write!(f, "mixed formats: {msg}"),
             Self::FuelExceeded(e) => write!(
                 f,
@@ -1245,7 +1250,7 @@ async fn resolve_remote_objects(
 
     if accepted.is_empty() {
         return Err(ImportError::NoChunks(
-            "remote source contains no .ttl/.nt/.nq/.trig/.jsonld/.jsonl objects".into(),
+            "remote source contains no .ttl/.nt/.nq/.trig/.jsonld/.jsonl/.ndjson objects".into(),
         ));
     }
 
@@ -1472,7 +1477,7 @@ fn spawn_chained_ndjson_producer(
                 let byte_source = match factory() {
                     Ok(r) => r,
                     Err(e) => {
-                        let _ = error_tx.send(Some(ImportError::Storage(format!(
+                        let _ = error_tx.send(Some(ImportError::Source(format!(
                             "open ndjson source {label}: {e}"
                         ))));
                         return;
@@ -1486,7 +1491,7 @@ fn spawn_chained_ndjson_producer(
                     match NdjsonReader::new_from_reader(byte_source, chunk_size_bytes, 1, policy) {
                         Ok(r) => r,
                         Err(e) => {
-                            let _ = error_tx.send(Some(ImportError::NoChunks(format!(
+                            let _ = error_tx.send(Some(ImportError::Source(format!(
                                 "ndjson reader init for {label}: {e}"
                             ))));
                             return;
@@ -1504,7 +1509,7 @@ fn spawn_chained_ndjson_producer(
                         }
                         Ok(None) => break,
                         Err(e) => {
-                            let _ = error_tx.send(Some(ImportError::Transact(format!(
+                            let _ = error_tx.send(Some(ImportError::Source(format!(
                                 "ndjson read of {label}: {e}"
                             ))));
                             return;
@@ -1514,7 +1519,7 @@ fn spawn_chained_ndjson_producer(
                 // Malformed-line errors surface here (channel close alone is
                 // not sufficient).
                 if let Err(e) = reader.join() {
-                    let _ = error_tx.send(Some(ImportError::Transact(format!(
+                    let _ = error_tx.send(Some(ImportError::Source(format!(
                         "ndjson read of {label}: {e}"
                     ))));
                     return;
@@ -2198,8 +2203,9 @@ fn validate_format_families(
 ) -> std::result::Result<(), ImportError> {
     if has_turtle && (has_jsonld || has_ndjson) {
         return Err(ImportError::MixedFormats(format!(
-            "{source_desc} contains both Turtle (.ttl/.trig) and JSON-LD \
-             (.jsonld/.jsonl) files; use a single format family per import"
+            "{source_desc} contains both Turtle-family (.ttl/.nt/.nq/.trig) and \
+             JSON-LD-family (.jsonld/.jsonl/.ndjson) files; use a single format \
+             family per import"
         )));
     }
     if has_jsonld && has_ndjson {
@@ -2258,7 +2264,7 @@ pub fn scan_directory_format(dir: &Path) -> std::result::Result<DirectoryFormat,
         (true, _) => Ok(DirectoryFormat::Turtle),
         (false, true) => Ok(DirectoryFormat::JsonLd),
         (false, false) => Err(ImportError::NoChunks(format!(
-            "no supported data files (.ttl, .nt, .nq, .trig, .jsonld, .jsonl) found in {}",
+            "no supported data files (.ttl, .nt, .nq, .trig, .jsonld, .jsonl, .ndjson) found in {}",
             dir.display()
         ))),
     }
