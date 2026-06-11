@@ -83,7 +83,7 @@ impl crate::Fluree {
             strategy = strategy.as_str()
         );
         async move {
-            self.revert_inner(
+            self.revert_selection(
                 ledger_name,
                 branch,
                 RevertSelection::single(commit),
@@ -130,7 +130,7 @@ impl crate::Fluree {
             let selection = RevertSelection::try_set(commits).ok_or_else(|| {
                 ApiError::InvalidBranch("Revert requires at least one commit".to_string())
             })?;
-            self.revert_inner(ledger_name, branch, selection, strategy)
+            self.revert_selection(ledger_name, branch, selection, strategy)
                 .await
         }
         .instrument(span)
@@ -160,7 +160,7 @@ impl crate::Fluree {
             strategy = strategy.as_str()
         );
         async move {
-            self.revert_inner(
+            self.revert_selection(
                 ledger_name,
                 branch,
                 RevertSelection::range(from, to),
@@ -243,7 +243,7 @@ impl crate::Fluree {
         .await
     }
 
-    async fn revert_inner(
+    async fn revert_selection(
         &self,
         ledger_name: &str,
         branch: &str,
@@ -265,7 +265,7 @@ impl crate::Fluree {
             .await?;
 
         let result = self
-            .apply_staged_revert_commit(&branch_id, current_head_t, current_head_id, commit)
+            .apply_revert(&branch_id, current_head_t, current_head_id, commit)
             .await;
 
         match result {
@@ -302,7 +302,7 @@ impl crate::Fluree {
     /// dropped every reverted flake — return `current_head_*` as the
     /// no-op result. Returns the resulting head's `(t, commit_id)`
     /// either way.
-    async fn apply_staged_revert_commit(
+    async fn apply_revert(
         &self,
         branch_id: &str,
         current_head_t: i64,
@@ -332,7 +332,7 @@ impl crate::Fluree {
 
     /// Resolve `selection` against `branch`'s current state, walk the DAG,
     /// build the revert plan, and compute conflict keys — every step that
-    /// [`Self::revert_inner`] performs *before* mutating state. Shared with the
+    /// [`Self::revert_selection`] performs *before* mutating state. Shared with the
     /// preview path.
     pub(crate) async fn build_revert_context(
         &self,
@@ -573,7 +573,7 @@ impl RevertSelection {
     }
 }
 
-/// Everything [`Fluree::revert_inner`] needs after resolution and validation
+/// Everything [`Fluree::revert_selection`] needs after resolution and validation
 /// but before mutating state. Shared with the preview path.
 pub(crate) struct RevertContext {
     pub(crate) branch_id: String,

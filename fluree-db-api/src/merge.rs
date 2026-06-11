@@ -129,55 +129,44 @@ impl crate::Fluree {
     ) -> Result<MergeReport> {
         let span = tracing::debug_span!("merge_branch", ledger_name, source_branch, ?target_branch);
         async move {
-            self.merge_branch_inner(ledger_name, source_branch, target_branch, strategy)
-                .await
+            let staged = self
+                .prepare_merge(ledger_name, source_branch, target_branch, strategy)
+                .await?;
+            let source_id = staged.source_id.clone();
+            let target_id = staged.target_id.clone();
+            let target_snapshot = staged.rollback_snapshot.clone();
+
+            match self.apply_merge(staged).await {
+                Ok(report) => Ok(report),
+                Err(e) => {
+                    tracing::warn!(
+                        source = %source_id,
+                        target = %target_id,
+                        error = %e,
+                        "merge failed, rolling back nameservice state"
+                    );
+                    if let Err(rollback_err) = self
+                        .publisher()?
+                        .reset_head(&target_id, target_snapshot)
+                        .await
+                    {
+                        tracing::error!(
+                            target = %target_id,
+                            error = %rollback_err,
+                            "failed to roll back target nameservice state after merge failure"
+                        );
+                    }
+                    Err(e)
+                }
+            }
         }
         .instrument(span)
         .await
     }
 
-    async fn merge_branch_inner(
-        &self,
-        ledger_name: &str,
-        source_branch: &str,
-        target_branch: Option<&str>,
-        strategy: ConflictStrategy,
-    ) -> Result<MergeReport> {
-        let staged = self
-            .prepare_merge(ledger_name, source_branch, target_branch, strategy)
-            .await?;
-        let source_id = staged.source_id.clone();
-        let target_id = staged.target_id.clone();
-        let target_snapshot = staged.rollback_snapshot.clone();
-
-        match self.apply_staged_merge(staged).await {
-            Ok(report) => Ok(report),
-            Err(e) => {
-                tracing::warn!(
-                    source = %source_id,
-                    target = %target_id,
-                    error = %e,
-                    "merge failed, rolling back nameservice state"
-                );
-                if let Err(rollback_err) = self
-                    .publisher()?
-                    .reset_head(&target_id, target_snapshot)
-                    .await
-                {
-                    tracing::error!(
-                        target = %target_id,
-                        error = %rollback_err,
-                        "failed to roll back target nameservice state after merge failure"
-                    );
-                }
-                Err(e)
-            }
-        }
-    }
-
     /// Validate and build the merge up to (but not including) the
     /// commit-blob write + ref advance. Returns a [`StagedMerge`] the
-    /// caller can then apply via [`Self::apply_staged_merge`] (local
+    /// caller can then apply via [`Self::apply_merge`] (local
     /// path) or by writing the merge commit blob + proposing
     /// `AdvanceRef` through consensus (Raft path).
     ///
@@ -319,7 +308,7 @@ impl crate::Fluree {
     /// Apply a [`StagedMerge`] through the local commit pipeline.
     /// Returns the [`MergeReport`] regardless of whether the apply
     /// was a fast-forward or a general merge.
-    async fn apply_staged_merge(&self, staged: StagedMerge) -> Result<MergeReport> {
+    async fn apply_merge(&self, staged: StagedMerge) -> Result<MergeReport> {
         let StagedMerge {
             target,
             source,
