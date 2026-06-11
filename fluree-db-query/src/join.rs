@@ -9,6 +9,7 @@ use crate::binding::{Batch, Binding, RowAccess};
 use crate::context::ExecutionContext;
 use crate::dataset::ActiveGraphs;
 use crate::error::{QueryError, Result};
+use crate::fast_path_common::{ProbeOps, RowFate, SharedOverlayOps};
 use crate::ir::triple::{Ref, Term, TriplePattern};
 use crate::object_binding::{late_materialized_object_binding, materialized_object_binding};
 use crate::operator::inline::{apply_inline, extend_schema, InlineOperator};
@@ -386,6 +387,24 @@ fn is_batched_subject_exists_eligible(
 /// When a shared variable is `Unbound` on the left (e.g., from VALUES with UNDEF),
 /// `combine_rows` falls back to the right-side value so the concrete binding
 /// propagates through the join.
+/// How the batched lanes handle the active overlay. Recomputed at the top of
+/// every `next_batch` call (cheap: the ops fetch hits the per-execution
+/// cache after the first call).
+#[derive(Clone, Default)]
+enum BatchedOverlayMode {
+    /// No novelty on the active graph — batched lanes read base leaflets as-is.
+    #[default]
+    Free,
+    /// Single-graph novelty, subject-probe lane only: merge these resolved
+    /// PSOT ops per probed subject during each flush. May be empty (novelty
+    /// exists but none of it touches the batched predicate).
+    Merge(SharedOverlayOps),
+    /// Overlay present but unmergeable (multi-graph, object/exists lanes,
+    /// translation failure, novelty-only predicate, missing PSOT branch) —
+    /// fall back to per-row scans, whose cursor merges the overlay.
+    PerRow,
+}
+
 pub struct NestedLoopJoinOperator {
     /// Left (driving) operator
     left: Box<dyn Operator>,
@@ -440,6 +459,8 @@ pub struct NestedLoopJoinOperator {
     object_left_col: Option<usize>,
     /// The fixed predicate SID (batched mode)
     batched_predicate: Option<Sid>,
+    /// Overlay handling decision for the batched lanes (see [`BatchedOverlayMode`]).
+    batched_overlay_mode: BatchedOverlayMode,
     /// Accumulated entries for batched processing: (stored_batch_idx, row_idx, subject_s_id)
     /// Stores the raw s_id directly to avoid dictionary round-trips with EncodedSid.
     batched_accumulator: Vec<(usize, usize, u64)>,
@@ -723,6 +744,7 @@ impl NestedLoopJoinOperator {
             subject_left_col,
             object_left_col,
             batched_predicate,
+            batched_overlay_mode: BatchedOverlayMode::default(),
             batched_accumulator: Vec::new(),
             stored_left_batches: Vec::new(),
             batched_output: VecDeque::new(),
@@ -1142,12 +1164,15 @@ impl Operator for NestedLoopJoinOperator {
         // batched flush helper via `replay_leaflet_at_t`, which reconstructs
         // leaflet state at `to_t` from the history sidecar.
         //
-        // Novelty overlay is NOT handled: the flush helpers walk base leaflets
-        // directly, so an active overlay must force the per-row scan path
-        // (whose binary cursor merges overlay ops).
+        // Novelty overlay: the subject-probe lane merges the predicate's
+        // resolved overlay ops per probed key (`BatchedOverlayMode::Merge`);
+        // the object/exists lanes still require an overlay-free graph and
+        // otherwise force the per-row scan path (whose binary cursor merges
+        // overlay ops).
+        self.batched_overlay_mode = self.compute_batched_overlay_mode(ctx)?;
         let use_batched = (self.batched_eligible || self.batched_object_eligible || self.batched_exists_eligible)
                 && ctx.binary_store.is_some()
-                && ctx.overlay_free_single_graph()
+                && !matches!(self.batched_overlay_mode, BatchedOverlayMode::PerRow)
                 // The batched path reads binary leaves directly and works in
                 // `EncodedSid` space (it even emits `EncodedSid` for newly-bound
                 // subject vars). Whenever eager materialization is required —
@@ -1551,6 +1576,63 @@ impl NestedLoopJoinOperator {
         self.current_left_batch_stored_idx = None;
     }
 
+    /// Decide how the batched lanes handle the active overlay this call.
+    ///
+    /// Decline cases route to the overlay-correct per-row fallback BEFORE any
+    /// accumulation, so a flush never has to reroute mid-stream: translation
+    /// failure, a predicate that exists only in novelty (no base `p_id` to
+    /// scan), and a graph whose PSOT branch is absent while novelty exists
+    /// (novelty-only graph) would all silently drop or duplicate rows if the
+    /// batched scan ran.
+    fn compute_batched_overlay_mode(
+        &self,
+        ctx: &ExecutionContext<'_>,
+    ) -> Result<BatchedOverlayMode> {
+        use crate::fast_path_common::cached_overlay_ops;
+        use fluree_db_binary_index::RunSortOrder;
+        if ctx.overlay_free_single_graph() {
+            return Ok(BatchedOverlayMode::Free);
+        }
+        // Only the subject-probe lane merges overlay ops (v1).
+        if !self.batched_eligible || self.batched_object_eligible || self.batched_exists_eligible {
+            return Ok(BatchedOverlayMode::PerRow);
+        }
+        if !matches!(ctx.active_graphs(), ActiveGraphs::Single) {
+            return Ok(BatchedOverlayMode::PerRow);
+        }
+        let (Some(store), Some(pred)) =
+            (ctx.binary_store.as_ref(), self.batched_predicate.as_ref())
+        else {
+            return Ok(BatchedOverlayMode::PerRow);
+        };
+        let Some(ops) =
+            cached_overlay_ops(ctx, store, ctx.binary_g_id, RunSortOrder::Psot, pred)?
+        else {
+            tracing::debug!(
+                "batched join: overlay flake translation failed; using per-row scans"
+            );
+            return Ok(BatchedOverlayMode::PerRow);
+        };
+        if !ops.is_empty() {
+            if store.sid_to_p_id(pred).is_none() {
+                tracing::debug!(
+                    "batched join: predicate exists only in novelty; using per-row scans"
+                );
+                return Ok(BatchedOverlayMode::PerRow);
+            }
+            if store
+                .branch_for_order(ctx.binary_g_id, RunSortOrder::Psot)
+                .is_none()
+            {
+                tracing::debug!(
+                    "batched join: PSOT branch absent with novelty present; using per-row scans"
+                );
+                return Ok(BatchedOverlayMode::PerRow);
+            }
+        }
+        Ok(BatchedOverlayMode::Merge(ops))
+    }
+
     /// Phase 1: Resolve the batched predicate SID to a binary-index p_id.
     ///
     /// Returns `None` if the predicate is not in the binary index (no results possible).
@@ -1656,6 +1738,7 @@ impl NestedLoopJoinOperator {
         unique_s_ids: &[u64],
         s_id_to_accum: &FxHashMap<u64, Vec<usize>>,
         dict_overlay: &Option<crate::dict_overlay::DictOverlay>,
+        mut probe_ops: Option<&mut ProbeOps>,
         on_match: &mut dyn FnMut(&[usize], &Binding) -> Result<()>,
     ) -> Result<()> {
         use fluree_db_binary_index::read::column_loader::load_leaflet_columns_cached;
@@ -1787,12 +1870,27 @@ impl NestedLoopJoinOperator {
                     if row_start == row_end {
                         continue;
                     }
+                    // One window of this subject's novelty ops per (leaflet,
+                    // subject); empty (the common case) keeps the row loop free
+                    // of per-row overlay work.
+                    let probe_window = probe_ops
+                        .as_ref()
+                        .map(|p| p.subject_window(s_id))
+                        .filter(|w| !w.is_empty());
                     for row in row_start..row_end {
                         matched_rows += 1;
                         let o_type_val = entry
                             .o_type_const
                             .unwrap_or_else(|| batch.o_type.get_or(row, 0));
                         let o_key_val = batch.o_key.get(row);
+                        if let (Some(probe), Some(win)) = (probe_ops.as_mut(), &probe_window) {
+                            let o_i_val = batch.o_i.get_or(row, u32::MAX);
+                            if probe.base_row_fate(win, o_type_val, o_key_val, o_i_val)
+                                == RowFate::Drop
+                            {
+                                continue;
+                            }
+                        }
                         if !self.batched_row_matches_object_bounds(
                             store,
                             ctx.binary_g_id,
@@ -1808,10 +1906,156 @@ impl NestedLoopJoinOperator {
                         {
                             Binding::encoded_sid(o_key_val)
                         } else {
-                            let p_id = entry.p_const.unwrap_or_else(|| batch.p_id.get_or(row, 0));
                             let o_i = batch.o_i.get_or(row, u32::MAX);
                             let t = batch.t.get_or(row, 0) as i64;
-                            let ot = OType::from_u16(o_type_val);
+                            self.build_batched_object_binding(
+                                ctx,
+                                store,
+                                dict_overlay,
+                                p_id,
+                                o_type_val,
+                                o_key_val,
+                                o_i,
+                                t,
+                            )?
+                        };
+
+                        on_match(accum_indices, &obj_binding)?;
+                    }
+                }
+            }
+        }
+
+        // Inject novelty-only matches: unconsumed asserts for probed subjects
+        // (facts with no identical base row — including subjects absent from
+        // the base index entirely). The `emit_overlay_only` analogue; runs
+        // through the same bounds check and `on_match` path as base rows.
+        if let Some(probe) = probe_ops {
+            for &s_id in unique_s_ids {
+                let Some(accum_indices) = s_id_to_accum.get(&s_id) else {
+                    continue;
+                };
+                probe.drain_asserts_for_subject(s_id, |op| {
+                    if !self.injected_op_matches_object_bounds(
+                        store,
+                        ctx,
+                        dict_overlay,
+                        p_id,
+                        op.o_type,
+                        op.o_key,
+                    )? {
+                        return Ok(());
+                    }
+                    let obj_binding = if op.o_type == OType::IRI_REF.as_u16()
+                        || op.o_type == OType::BLANK_NODE.as_u16()
+                    {
+                        Binding::encoded_sid(op.o_key)
+                    } else {
+                        self.build_batched_object_binding(
+                            ctx, store, dict_overlay, p_id, op.o_type, op.o_key, op.o_i,
+                            op.t,
+                        )?
+                    };
+                    matched_rows += 1;
+                    on_match(accum_indices, &obj_binding)
+                })?;
+            }
+        }
+
+        tracing::debug!(
+            scan_ms = (scan_start.elapsed().as_secs_f64() * 1000.0) as u64,
+            leaflets_scanned,
+            matched_rows,
+            "join batched binary scan complete"
+        );
+
+        Ok(())
+    }
+
+    fn batched_row_matches_object_bounds(
+        &self,
+        store: &BinaryIndexStore,
+        g_id: GraphId,
+        p_id: u32,
+        o_type: u16,
+        o_key: u64,
+    ) -> Result<bool> {
+        let Some(bounds) = &self.object_bounds else {
+            return Ok(true);
+        };
+        let val = store
+            .decode_value_v3(o_type, o_key, p_id, g_id)
+            .map_err(|e| QueryError::Internal(format!("decode_value_v3 (batched bounds): {e}")))?;
+        Ok(bounds.matches(&val))
+    }
+
+    /// Object-bounds check for an injected novelty assert. Ids minted in dict
+    /// novelty resolve through `dict_overlay` (which falls back to the base
+    /// dictionaries for indexed ids), mirroring the binding decode path.
+    fn injected_op_matches_object_bounds(
+        &self,
+        store: &BinaryIndexStore,
+        ctx: &ExecutionContext<'_>,
+        dict_overlay: &Option<crate::dict_overlay::DictOverlay>,
+        p_id: u32,
+        o_type: u16,
+        o_key: u64,
+    ) -> Result<bool> {
+        let Some(bounds) = &self.object_bounds else {
+            return Ok(true);
+        };
+        use fluree_db_core::o_type::{DecodeKind, OType};
+        let val = match (OType::from_u16(o_type).decode_kind(), dict_overlay.as_ref()) {
+            (DecodeKind::IriRef, Some(ov)) => {
+                let iri = ov.resolve_subject_iri(o_key).map_err(|e| {
+                    QueryError::Internal(format!("resolve_subject_iri (injected bounds): {e}"))
+                })?;
+                fluree_db_core::FlakeValue::Ref(store.encode_iri(&iri))
+            }
+            (DecodeKind::StringDict, Some(ov)) => {
+                let s = ov.resolve_string_value(o_key as u32).map_err(|e| {
+                    QueryError::Internal(format!("resolve_string_value (injected bounds): {e}"))
+                })?;
+                fluree_db_core::FlakeValue::String(s)
+            }
+            (DecodeKind::JsonArena, Some(ov)) => {
+                let s = ov.resolve_string_value(o_key as u32).map_err(|e| {
+                    QueryError::Internal(format!(
+                        "resolve_string_value (injected bounds json): {e}"
+                    ))
+                })?;
+                fluree_db_core::FlakeValue::Json(s)
+            }
+            _ => store
+                .decode_value_v3(o_type, o_key, p_id, ctx.binary_g_id)
+                .map_err(|e| {
+                    QueryError::Internal(format!("decode_value_v3 (injected bounds): {e}"))
+                })?,
+        };
+        Ok(bounds.matches(&val))
+    }
+
+    /// Build the late-materialized object binding for one non-ref matched row.
+    ///
+    /// Shared by base leaflet rows in `scan_matches` and by injected novelty
+    /// asserts (whose `o_type`/`o_key`/`o_i`/`t` come from the overlay op), so
+    /// both produce identical binding representations. Novelty-minted
+    /// string/subject ids resolve through `dict_overlay`.
+    #[allow(clippy::too_many_arguments)]
+    fn build_batched_object_binding(
+        &self,
+        ctx: &ExecutionContext<'_>,
+        store: &BinaryIndexStore,
+        dict_overlay: &Option<crate::dict_overlay::DictOverlay>,
+        p_id: u32,
+        o_type_val: u16,
+        o_key_val: u64,
+        o_i: u32,
+        t: i64,
+    ) -> Result<Binding> {
+        use fluree_db_core::o_type::OType;
+        let ot = OType::from_u16(o_type_val);
+        Ok(
 
                             // Prefer a stable EncodedLit representation when possible so that
                             // formatters can materialize using the root's canonical datatype table.
@@ -1971,40 +2215,8 @@ impl NestedLoopJoinOperator {
                                         )
                                     }
                                 }
-                            }
-                        };
-
-                        on_match(accum_indices, &obj_binding)?;
-                    }
-                }
-            }
-        }
-
-        tracing::debug!(
-            scan_ms = (scan_start.elapsed().as_secs_f64() * 1000.0) as u64,
-            leaflets_scanned,
-            matched_rows,
-            "join batched binary scan complete"
-        );
-
-        Ok(())
-    }
-
-    fn batched_row_matches_object_bounds(
-        &self,
-        store: &BinaryIndexStore,
-        g_id: GraphId,
-        p_id: u32,
-        o_type: u16,
-        o_key: u64,
-    ) -> Result<bool> {
-        let Some(bounds) = &self.object_bounds else {
-            return Ok(true);
-        };
-        let val = store
-            .decode_value_v3(o_type, o_key, p_id, g_id)
-            .map_err(|e| QueryError::Internal(format!("decode_value_v3 (batched bounds): {e}")))?;
-        Ok(bounds.matches(&val))
+                            },
+        )
     }
 
     /// Phase 5: Assemble scattered results into output batches in left-row order.
@@ -2181,6 +2393,13 @@ impl NestedLoopJoinOperator {
             *unique_s_ids.last().unwrap(),
         );
 
+        // One reconciler per flush: probed keys recur across flushes with new
+        // left rows, so consumed-state must not outlive this flush.
+        let mut probe_ops = match &self.batched_overlay_mode {
+            BatchedOverlayMode::Merge(ops) => ProbeOps::new(ops.clone(), p_id),
+            _ => None,
+        };
+
         // Phase 4+5: Scan leaves, scatter matches by accumulator position, emit
         // output batches in left-row order. Two scatter representations:
         //
@@ -2236,6 +2455,7 @@ impl NestedLoopJoinOperator {
                     &unique_s_ids,
                     &s_id_to_accum,
                     &dict_overlay,
+                    probe_ops.as_mut(),
                     &mut on_match,
                 )?;
             }
@@ -2284,10 +2504,19 @@ impl NestedLoopJoinOperator {
                     &unique_s_ids,
                     &s_id_to_accum,
                     &dict_overlay,
+                    probe_ops.as_mut(),
                     &mut on_match,
                 )?;
             }
             self.emit_scatter_to_output(scatter, ctx.batch_size)?;
+        }
+
+        if let Some(probe) = &probe_ops {
+            tracing::debug!(
+                dropped_rows = probe.dropped_rows,
+                injected_rows = probe.injected_rows,
+                "join batched flush merged novelty overlay"
+            );
         }
 
         tracing::debug!(

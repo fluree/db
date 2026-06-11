@@ -2117,6 +2117,130 @@ pub fn cached_overlay_ops(
     Ok(computed)
 }
 
+/// Fate of a base row checked against a predicate's overlay ops.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RowFate {
+    /// Emit the base row (no op for it, or a re-assert of the same fact).
+    Keep,
+    /// A novelty retract matched the row's identity — suppress it.
+    Drop,
+}
+
+/// Per-flush reconciler merging a single predicate's resolved overlay ops into
+/// a batched leaflet-probe scan (the "strategy (b)" merge for probe lanes that
+/// read base leaflets directly instead of going through `BinaryCursor`).
+///
+/// Mirrors `merge_overlay_into_batch`'s case analysis for set-of-matches
+/// consumers: base row with no identity-matching op → emit; identity-matching
+/// retract → suppress; identity-matching assert (re-asserted fact) → emit the
+/// base row once; unconsumed asserts are injected per probed subject after the
+/// base scan ([`Self::drain_asserts_for_subject`]); unconsumed retracts are
+/// no-ops (their base row is absent). Equivalence with the cursor merge holds
+/// because `resolve_overlay_ops` guarantees at most one op per fact key and
+/// probe consumers are emission-order-insensitive.
+///
+/// **Scope: one instance per flush.** Probed keys legitimately recur across
+/// flushes (each flush carries different left rows), so consumed-state must
+/// not outlive a flush — a longer-lived instance would silently drop injected
+/// asserts from every flush after the first.
+pub struct ProbeOps {
+    ops: SharedOverlayOps,
+    consumed: Vec<bool>,
+    /// Base rows suppressed by novelty retracts (diagnostics).
+    pub dropped_rows: u64,
+    /// Novelty asserts injected as new matches (diagnostics).
+    pub injected_rows: u64,
+}
+
+impl ProbeOps {
+    /// `ops` must be the single predicate `p_id`'s resolved ops in PSOT order
+    /// (the [`cached_overlay_ops`] output for `RunSortOrder::Psot`). Returns
+    /// `None` when empty — callers then run their unmodified scan.
+    pub fn new(ops: SharedOverlayOps, p_id: u32) -> Option<Self> {
+        if ops.is_empty() {
+            return None;
+        }
+        debug_assert!(
+            ops.iter().all(|o| o.p_id == p_id),
+            "ProbeOps requires single-predicate ops (p_id {p_id})"
+        );
+        debug_assert!(
+            ops.windows(2).all(|w| {
+                (w[0].s_id, w[0].o_type, w[0].o_key, w[0].o_i)
+                    < (w[1].s_id, w[1].o_type, w[1].o_key, w[1].o_i)
+            }),
+            "ProbeOps requires PSOT-sorted, resolved ops"
+        );
+        let consumed = vec![false; ops.len()];
+        Some(Self {
+            ops,
+            consumed,
+            dropped_rows: 0,
+            injected_rows: 0,
+        })
+    }
+
+    /// Index range of ops for `s_id` (ops are subject-sorted within the
+    /// predicate). Empty for subjects with no novelty — the common case, which
+    /// makes the per-row fate check free for them.
+    pub fn subject_window(&self, s_id: u64) -> std::ops::Range<usize> {
+        let start = self.ops.partition_point(|o| o.s_id < s_id);
+        let end = start + self.ops[start..].partition_point(|o| o.s_id == s_id);
+        start..end
+    }
+
+    /// Reconcile one base row of `window`'s subject against the ops, marking a
+    /// matching op consumed. `window` must come from
+    /// [`Self::subject_window`] for the row's subject.
+    pub fn base_row_fate(
+        &mut self,
+        window: &std::ops::Range<usize>,
+        o_type: u16,
+        o_key: u64,
+        o_i: u32,
+    ) -> RowFate {
+        if window.is_empty() {
+            return RowFate::Keep;
+        }
+        let win = &self.ops[window.clone()];
+        let probe = (o_type, o_key, o_i);
+        let pos = win.partition_point(|o| (o.o_type, o.o_key, o.o_i) < probe);
+        if pos < win.len() {
+            let op = &win[pos];
+            if (op.o_type, op.o_key, op.o_i) == probe {
+                self.consumed[window.start + pos] = true;
+                if op.op {
+                    // Re-asserted fact: the base row stands in for it.
+                    return RowFate::Keep;
+                }
+                self.dropped_rows += 1;
+                return RowFate::Drop;
+            }
+        }
+        RowFate::Keep
+    }
+
+    /// Hand every not-yet-consumed assert for `s_id` to `f` — the
+    /// `emit_overlay_only` analogue: novelty-only facts of probed subjects
+    /// become new matches. Call once per probed subject after the base scan;
+    /// retracts without a base row are dropped silently, matching the cursor.
+    pub fn drain_asserts_for_subject(
+        &mut self,
+        s_id: u64,
+        mut f: impl FnMut(&fluree_db_binary_index::read::types::OverlayOp) -> Result<()>,
+    ) -> Result<()> {
+        let window = self.subject_window(s_id);
+        for i in window {
+            if !self.consumed[i] && self.ops[i].op {
+                self.consumed[i] = true;
+                self.injected_rows += 1;
+                f(&self.ops[i])?;
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Build a per-predicate `BinaryCursor` in `order`, folding in the novelty
 /// overlay and honoring `to_t`.
 ///
