@@ -38,6 +38,7 @@
 pub mod execution_record;
 pub mod log_adapter;
 pub mod nameservice;
+pub mod network;
 pub mod state_machine;
 pub mod state_machine_adapter;
 pub mod storage;

@@ -11,7 +11,7 @@ default = []
 # Enables the Raft-replicated `Committer` implementation. Off by default
 # so that monolithic users don't compile (or link) openraft and its
 # transitive dependencies.
-raft = ["dep:openraft", "dep:postcard"]
+raft = ["dep:openraft", "dep:postcard", "dep:reqwest", "dep:axum"]
 
 [dependencies]
 fluree-db-api = { path = "../fluree-db-api" }
@@ -42,6 +42,15 @@ openraft = { version = "0.9", optional = true, features = [
 # entries, vote, and snapshot metadata. Gated behind `raft` because
 # only the storage impls reach for it.
 postcard = { workspace = true, optional = true }
+
+# HTTP client for the inter-node Raft RPC layer. Gated behind `raft`
+# because only the network impl reaches for it.
+reqwest = { workspace = true, optional = true }
+
+# HTTP server for the inter-node Raft RPC layer; consumers nest the
+# returned `axum::Router` under whatever path they want. Gated behind
+# `raft` because only the network impl reaches for it.
+axum = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt", "test-util"] }

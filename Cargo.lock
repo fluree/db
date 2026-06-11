@@ -2637,6 +2637,7 @@ name = "fluree-db-consensus"
 version = "4.0.4"
 dependencies = [
  "async-trait",
+ "axum",
  "fluree-db-api",
  "fluree-db-core",
  "fluree-db-ledger",
@@ -2646,6 +2647,7 @@ dependencies = [
  "moka",
  "openraft",
  "postcard",
+ "reqwest",
  "serde",
  "serde_json",
  "sha2",
