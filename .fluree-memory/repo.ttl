@@ -1464,6 +1464,37 @@ mem:fact-01ks1m2nn2exrjt7tjkmzgqtg2 a mem:Fact ;
     mem:createdAt "2026-05-20T02:40:16.034976+00:00"^^xsd:dateTime ;
     mem:rationale "Pre-fix the extractors only handled Long/Double/Boolean and silently dropped FlakeValue::Decimal, causing SUM(decimal)=0 and AVG(decimal)=Unbound. The shared NumericAcc keeps the streaming and non-streaming paths in sync and prevents future drift between them." .
 
+mem:fact-01ktwep3pg2dxz9r44083zdrxy a mem:Fact ;
+    mem:content "Comprehensive architecture audit (2026-06-11) written to docs/audit/2026-06-architecture-audit.md. Thesis: the three chronic-bug contracts are convention-enforced, not type-enforced: (1) overlay→binary translation/merge has 5 merge impls + per-callsite failure policies; (2) LedgerState coherence spans 4 pub Arc fields with Arc-IDENTITY dependency (BinaryRangeProvider must share state.dict_novelty Arc); (3) fast-path gates (fast_path_store vs allow_cursor_fast_path) chosen per-operator — all 12 currently correct but unguarded. Roadmap phases: 0 newtypes+differential tests, 1 overlay chokepoint, 2 CoherentLedgerState/ArcSwap, 3 PlanCapabilities registry, 4 crate carve-outs." ;
+    mem:tag "architecture" ;
+    mem:tag "audit" ;
+    mem:tag "fast-path" ;
+    mem:tag "lifecycle" ;
+    mem:tag "overlay" ;
+    mem:tag "refactor-plan" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "docs/audit/2026-06-architecture-audit.md" ;
+    mem:branch "main" ;
+    mem:createdAt "2026-06-11T23:01:13.040806+00:00"^^xsd:dateTime ;
+    mem:rationale "Anchor document for any future refactor work; recall before structural changes to query/ledger/binary-index." .
+
+mem:fact-01ktwepk8ernqdycdrns8e8kyq a mem:Fact ;
+    mem:content "Audit flagged unconfirmed lifecycle/correctness candidates — verify before fixing: (1) apply_loaded_db (~ledger lib.rs:606-622) merges old namespace codes but may not replay graph_registry deltas from remaining novelty; (2) apply_index_v2 (~ledger_manager.rs:351) doesn't call sync_binary_store_from_state before releasing state lock (snapshot/store TOCTOU); (3) reload swap condition new_state.t() >= current.t() (~ledger_manager.rs:1157) races concurrent commits; (4) export translate path WARN-drops non-Unsupported translation errors (binary_scan.rs:2238-2242) — same silent-drop class fixed earlier in graph crawl. Also: DecodedRow.dt u32 vs OverlayOp/RunRecord.dt u16; GraphId is bare u16 alias." ;
+    mem:tag "audit" ;
+    mem:tag "bug-candidates" ;
+    mem:tag "id-space" ;
+    mem:tag "lifecycle" ;
+    mem:tag "overlay" ;
+    mem:tag "verification-needed" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/src/ledger_manager.rs" ;
+    mem:artifactRef "fluree-db-binary-index/src/types.rs" ;
+    mem:artifactRef "fluree-db-ledger/src/lib.rs" ;
+    mem:artifactRef "fluree-db-query/src/binary_scan.rs" ;
+    mem:branch "main" ;
+    mem:createdAt "2026-06-11T23:01:28.974709+00:00"^^xsd:dateTime ;
+    mem:rationale "Read-level findings from exploration agents, not reproduced bugs; each needs confirmation (test or trace) before being treated as fact." .
+
 mem:constraint-01kp8yczz09ndt54ztchbheeyb a mem:Constraint ;
     mem:content "JSON-LD transaction parsing does NOT auto-promote bare string values to IRI references. User data becomes an IRI only when wrapped in `{\"@id\": \"...\"}` or when the property has `@type: \"@id\"` in `@context`. The former `looks_like_iri` heuristic (three sites in parse/jsonld.rs) was removed — it silently promoted strings starting with `http://`/`https://`/`did:`/`fluree:`/`urn:` to IRIs, which violated the JSON-LD spec (especially for `{\"@value\": \"...\"}`, explicitly a literal)." ;
     mem:tag "iri" ;
