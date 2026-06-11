@@ -2426,6 +2426,12 @@ pub fn subject_probe_lane_plan(
     store: &Arc<BinaryIndexStore>,
     pred_sid: &Sid,
 ) -> Result<ProbeLanePlan> {
+    // BEFORE the overlay-free return: the probe lanes read raw leaflets in
+    // `Clean` mode too, so a restrictive policy must decline regardless of
+    // novelty state.
+    if !root_or_no_policy(ctx) {
+        return Ok(ProbeLanePlan::Decline);
+    }
     if ctx.overlay_free_single_graph() {
         return Ok(ProbeLanePlan::Clean);
     }
@@ -2433,9 +2439,6 @@ pub fn subject_probe_lane_plan(
     // overlays, federated queries) need the per-row path: probes emit
     // encoded bindings and merge only V3-translated novelty.
     if ctx.eager_materialization {
-        return Ok(ProbeLanePlan::Decline);
-    }
-    if !root_or_no_policy(ctx) {
         return Ok(ProbeLanePlan::Decline);
     }
     if !matches!(ctx.active_graphs(), crate::dataset::ActiveGraphs::Single) {
@@ -2473,12 +2476,16 @@ pub fn object_probe_lane_plan(
     store: &Arc<BinaryIndexStore>,
     pred_sid: &Sid,
 ) -> Result<ProbeLanePlan> {
+    // See subject_probe_lane_plan: policy declines before the overlay-free
+    // return (raw leaflet reads bypass per-leaf policy filtering in `Clean`
+    // mode too); eager callers keep the per-row path under an overlay.
+    if !root_or_no_policy(ctx) {
+        return Ok(ProbeLanePlan::Decline);
+    }
     if ctx.overlay_free_single_graph() {
         return Ok(ProbeLanePlan::Clean);
     }
-    // See subject_probe_lane_plan: eager and policy-enforced callers keep
-    // the per-row path.
-    if ctx.eager_materialization || !root_or_no_policy(ctx) {
+    if ctx.eager_materialization {
         return Ok(ProbeLanePlan::Decline);
     }
     if !matches!(ctx.active_graphs(), crate::dataset::ActiveGraphs::Single) {
@@ -2517,12 +2524,16 @@ pub fn star_probe_lane_plan(
     store: &Arc<BinaryIndexStore>,
     pred_sids: &[&Sid],
 ) -> Result<ProbeLanePlan> {
+    // See subject_probe_lane_plan: policy declines before the overlay-free
+    // return (raw leaflet reads bypass per-leaf policy filtering in `Clean`
+    // mode too); eager callers keep the per-row path under an overlay.
+    if !root_or_no_policy(ctx) {
+        return Ok(ProbeLanePlan::Decline);
+    }
     if ctx.overlay_free_single_graph() {
         return Ok(ProbeLanePlan::Clean);
     }
-    // See subject_probe_lane_plan: eager and policy-enforced callers keep
-    // the per-row path.
-    if ctx.eager_materialization || !root_or_no_policy(ctx) {
+    if ctx.eager_materialization {
         return Ok(ProbeLanePlan::Decline);
     }
     if !matches!(ctx.active_graphs(), crate::dataset::ActiveGraphs::Single) {
