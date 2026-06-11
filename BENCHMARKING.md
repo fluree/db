@@ -60,6 +60,7 @@ Hand-maintained; add new entries when introducing a bench file.
 | `fluree-db-api` | `reindex_incremental.rs` | Orchestrator's incremental path via `Fluree::trigger_index(...)` over delta novelty |
 | `fluree-db-api` | `novelty_replay.rs` | Cold reload with `without_indexing()` so populate stays in novelty; scaled by commit count |
 | `fluree-db-api` | `query_hot_bsbm.rs` | Warm-cache SPARQL: BSBM-shape Q3/Q5/Q9 against a reindexed ledger |
+| `fluree-db-api` | `query_overlay_matrix.rs` | Same query shapes at three ledger conditions — `base` (indexed, epoch 0), `overlay` (indexed + trailing novelty), `novelty` (no index) — with per-scenario memory metrics. The overlay-merge regression gate. |
 | `fluree-db-query` | `vector_math.rs` | SIMD vs scalar dot/L2/cosine micro-bench |
 | `fluree-db-spatial` | `spatial_bench.rs` | S2 covering build + within/intersects/radius latency |
 
@@ -116,6 +117,86 @@ The gate runs in two phases, defined separately in CI:
 
 To intentionally accept a regression (or tighten a budget), edit
 `regression-budget.json` in the same PR and explain in the PR body.
+
+## Baselines: capture & compare
+
+`bench-baseline` (a bin in `fluree-bench-support`) turns "benchmark before
+and after a change" into a mechanical workflow. It backs the per-phase
+performance gate defined in
+[`docs/audit/2026-06-architecture-audit.md`](docs/audit/2026-06-architecture-audit.md)
+(Phase 0.0): capture a labeled baseline **before** starting a refactor
+phase, compare against it on every PR in the phase, and validate at phase
+close.
+
+```bash
+# 1. Run the benches you care about (criterion writes target/criterion/):
+FLUREE_BENCH_SCALE=small cargo bench -p fluree-db-api --bench query_overlay_matrix
+
+# 2. Capture a labeled, git-stamped baseline:
+cargo run -p fluree-bench-support --bin bench-baseline -- \
+    capture --label phase-1-pre --out bench-baselines/phase-1-pre.json
+
+# 3. ...make changes, rerun the same benches under the same env knobs...
+
+# 4. Compare. Prints regressions AND improvements; exits 1 on any breach:
+cargo run -p fluree-bench-support --bin bench-baseline -- \
+    compare --baseline bench-baselines/phase-1-pre.json
+
+# PR-scoped subset (only scenario IDs containing the filter):
+cargo run -p fluree-bench-support --bin bench-baseline -- \
+    compare --baseline bench-baselines/phase-1-pre.json --only query_overlay_matrix
+```
+
+Details:
+
+- Scenario IDs are criterion's layout joined with `/` —
+  `<group>/<function>/<scale>` — and the scale segment maps comparisons
+  onto `regression-budget.json` budgets via the same machinery as
+  `budget::check()`.
+- Baselines record provenance (label, short git sha, timestamp, profile
+  and scale env at capture time). Compare like against like: same
+  profile, same scale, same machine class. `quick` profile for direction,
+  `full` for decisions.
+- Scenarios in the baseline but not rerun are reported as "not rerun" and
+  do **not** fail the gate — subset runs are expected on PRs. Breaches
+  fail with exit 1.
+- Phase reference baselines live in `bench-baselines/` and are committed
+  with the first PR of a phase so reviewers and CI share the reference.
+  Improvements found at phase close get banked by tightening the budget
+  in `regression-budget.json` in the closing PR.
+
+## Memory metrics
+
+Criterion measures wall-clock only. Benches that also want allocation
+metrics install the tracking allocator from `fluree-bench-alloc` (a
+dedicated crate so `fluree-bench-support` keeps `#![forbid(unsafe_code)]`)
+and record per-scenario peak / total allocation:
+
+```rust
+use fluree_bench_alloc::TrackingAllocator;
+
+#[global_allocator]
+static ALLOC: TrackingAllocator = TrackingAllocator::new();
+
+// around a scenario:
+fluree_bench_alloc::reset_peak();
+group.bench_with_input(/* ... */);
+let m = fluree_bench_alloc::snapshot();
+fluree_bench_support::mem::record_scenario("my_bench", "my_bench/q1/small",
+    MemMetrics { peak_bytes: m.peak_bytes as u64,
+                 total_allocated_bytes: m.total_allocated_bytes as u64 });
+```
+
+Metrics land in `target/fluree-bench-mem/<bench>.json` sidecars;
+`bench-baseline capture` merges them into the baseline and `compare`
+gates `peak_mem` with the same per-bench budgets as time.
+`total_allocated_bytes` (churn) is recorded for analysis but not gated —
+it scales with criterion's adaptive iteration counts. The tracker costs
+two relaxed atomics per alloc; that overhead is identical between a
+baseline and a comparison run of the same bench, so deltas stay valid —
+but don't compare a tracking bench's absolute times against a
+non-tracking bench. `query_overlay_matrix` is the first memory-aware
+bench; opt others in as needed.
 
 ### Why two phases
 
