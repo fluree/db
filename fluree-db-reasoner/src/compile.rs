@@ -332,8 +332,8 @@ pub fn compile(
                     compiled.one_of_active = true;
                 }
             }
-            // Identity-producing restrictions run in phase B, not through
-            // the per-fact index.
+            // Identity-producing restrictions run with the other identity
+            // rules in the fixpoint loop, not through the per-fact index.
             RestrictionType::MaxCardinality1 { .. }
             | RestrictionType::MaxQualifiedCardinality1 { .. } => {}
         }

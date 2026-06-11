@@ -899,7 +899,8 @@ pub(crate) fn fire_all_values_from_prop_inverse(
 /// If x is of type C (where C restricts property P to have at most one value),
 /// and x has P with values y1 and y2, then y1 and y2 must be owl:sameAs.
 ///
-/// This is an identity-producing rule and should be applied in Phase B.
+/// This is an identity-producing rule and should be applied before the
+/// non-identity rules in the fixpoint loop.
 pub fn apply_max_cardinality_rule(
     restrictions: &RestrictionIndex,
     ctx: &mut IdentityRuleContext<'_>,
@@ -1007,7 +1008,8 @@ pub fn apply_max_cardinality_rule(
 ///
 /// Similar to maxCardinality, but only applies when the values are of the qualifying class D.
 ///
-/// This is an identity-producing rule and should be applied in Phase B.
+/// This is an identity-producing rule and should be applied before the
+/// non-identity rules in the fixpoint loop.
 pub fn apply_max_qualified_cardinality_rule(
     restrictions: &RestrictionIndex,
     ctx: &mut IdentityRuleContext<'_>,
