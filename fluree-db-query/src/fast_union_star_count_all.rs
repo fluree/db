@@ -32,7 +32,7 @@ use crate::fast_path_common::{
     build_count_batch, build_overlay_cursor_for_subject_range, build_psot_cursor_for_predicate,
     cached_overlay_ops, count_predicate_overlay_delta, count_rows_for_predicate_psot, count_to_i64,
     cursor_projection_sid_only, cursor_projection_sid_otype_okey, leaf_entries_for_predicate,
-    normalize_pred_sid, slice_overlay_ops_by_subject, CancelTicker, CursorSubjectCountStream,
+    normalize_pred_sid, slice_overlay_ops_by_subject, CursorSubjectCountStream,
     PsotSubjectCountIter, SharedOverlayOps,
 };
 use crate::ir::triple::Ref;
@@ -356,7 +356,10 @@ fn merge_union_constraint_count_range(
 ) -> Result<u128> {
     let mut u_iters: Vec<PsotSubjectCountIter<'_>> = Vec::with_capacity(union_pids.len());
     for &p in union_pids {
-        u_iters.push(PsotSubjectCountIter::new_bounded(store, g_id, p, lo, hi)?);
+        u_iters.push(
+            PsotSubjectCountIter::new_bounded(store, g_id, p, lo, hi)?
+                .with_cancellation(cancellation),
+        );
     }
     let mut u_cur: Vec<Option<(u64, u64)>> = Vec::with_capacity(u_iters.len());
     for it in &mut u_iters {
@@ -364,7 +367,10 @@ fn merge_union_constraint_count_range(
     }
     let mut e_iters: Vec<PsotSubjectCountIter<'_>> = Vec::with_capacity(extra_pids.len());
     for &p in extra_pids {
-        e_iters.push(PsotSubjectCountIter::new_bounded(store, g_id, p, lo, hi)?);
+        e_iters.push(
+            PsotSubjectCountIter::new_bounded(store, g_id, p, lo, hi)?
+                .with_cancellation(cancellation),
+        );
     }
     let mut e_cur: Vec<Option<(u64, u64)>> = Vec::with_capacity(e_iters.len());
     for it in &mut e_iters {
@@ -374,9 +380,7 @@ fn merge_union_constraint_count_range(
     let mut u = next_union_group(&mut u_iters, &mut u_cur)?;
     let mut e = next_extra_product_group(&mut e_iters, &mut e_cur)?;
     let mut total: u128 = 0;
-    let mut cancel = CancelTicker::new(cancellation);
     while let (Some((us, usum)), Some((es, eprod))) = (u, e) {
-        cancel.check()?;
         if us < es {
             u = next_union_group(&mut u_iters, &mut u_cur)?;
             continue;
@@ -435,17 +439,24 @@ fn try_union_constraint_parallel(
         .max_by_key(|&p| leaf_entries_for_predicate(store, g_id, RunSortOrder::Psot, p).len())
         .unwrap();
 
-    crate::count_plan_exec::parallel_partition_count(store, g_id, driver_p, total_rows, |lo, hi| {
-        merge_union_constraint_count_range(
-            store,
-            g_id,
-            &union_pids,
-            &extra_pids,
-            cancellation,
-            lo,
-            hi,
-        )
-    })
+    crate::count_plan_exec::parallel_partition_count(
+        store,
+        g_id,
+        driver_p,
+        total_rows,
+        cancellation,
+        |lo, hi| {
+            merge_union_constraint_count_range(
+                store,
+                g_id,
+                &union_pids,
+                &extra_pids,
+                cancellation,
+                lo,
+                hi,
+            )
+        },
+    )
 }
 
 /// Overlay/time-travel variant of `merge_union_constraint_count_range` for one
@@ -480,7 +491,7 @@ fn merge_union_constraint_count_range_overlay(
             to_t,
             epoch,
         )
-        .map(CursorSubjectCountStream::new)
+        .map(|c| CursorSubjectCountStream::new(c).with_cancellation(cancellation))
     };
 
     let mut u_streams: Vec<CursorSubjectCountStream> = Vec::with_capacity(union_pids.len());
@@ -509,9 +520,7 @@ fn merge_union_constraint_count_range_overlay(
     let mut u = next_union_group(&mut u_streams, &mut u_cur)?;
     let mut e = next_extra_product_group(&mut e_streams, &mut e_cur)?;
     let mut total: u128 = 0;
-    let mut cancel = CancelTicker::new(cancellation);
     while let (Some((us, usum)), Some((es, eprod))) = (u, e) {
-        cancel.check()?;
         if us < es {
             u = next_union_group(&mut u_streams, &mut u_cur)?;
             continue;
@@ -607,6 +616,7 @@ fn try_union_constraint_overlay_parallel(
         g_id,
         driver_p,
         total_rows,
+        &ctx.cancellation,
         move |lo, hi| {
             merge_union_constraint_count_range_overlay(
                 store,
@@ -757,7 +767,9 @@ fn count_union_star(
         };
         match mode {
             UnionCountMode::AllRows => {
-                union_streams_all.push(CursorSubjectCountStream::new(cursor));
+                union_streams_all.push(
+                    CursorSubjectCountStream::new(cursor).with_cancellation(&ctx.cancellation),
+                );
             }
             UnionCountMode::SubjectEqObject => {
                 union_streams_eq.push(SubjectSelfLoopCountStreamV6::new(cursor));
@@ -837,9 +849,7 @@ fn count_union_star(
     // If no extra predicates, total is just Σ_s union_sum(s).
     if extra_preds.is_empty() {
         let mut total: u64 = 0;
-        let mut cancel = CancelTicker::new(&ctx.cancellation);
         while let Some((_s, u)) = next_union()? {
-            cancel.check()?;
             total = total.saturating_add(u);
         }
         return Ok(Some(total));
@@ -868,7 +878,8 @@ fn count_union_star(
         else {
             return Ok(None);
         };
-        extra_streams.push(CursorSubjectCountStream::new(cursor));
+        extra_streams
+            .push(CursorSubjectCountStream::new(cursor).with_cancellation(&ctx.cancellation));
     }
     let mut extra_curr: Vec<Option<(u64, u64)>> = Vec::with_capacity(extra_streams.len());
     for s in &mut extra_streams {
@@ -915,9 +926,7 @@ fn count_union_star(
     let mut u_cur = next_union()?;
     let mut e_cur = next_extra_product()?;
     let mut total: u128 = 0;
-    let mut cancel = CancelTicker::new(&ctx.cancellation);
     while let (Some((us, u)), Some((es, eprod))) = (u_cur, e_cur) {
-        cancel.check()?;
         if us < es {
             u_cur = next_union()?;
             continue;

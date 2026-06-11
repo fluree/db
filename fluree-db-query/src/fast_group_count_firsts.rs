@@ -3,7 +3,7 @@ use crate::context::{ExecutionContext, WellKnownDatatypes};
 use crate::error::{QueryError, Result};
 use crate::fast_path_common::{
     allow_cursor_fast_path, build_psot_cursor_for_predicate, fast_path_store, normalize_pred_sid,
-    subject_ref_to_s_id, CancelTicker,
+    subject_ref_to_s_id,
 };
 use crate::ir::triple::{Ref, Term};
 use crate::operator::BoxedOperator;
@@ -1391,6 +1391,7 @@ fn compute_group_by_object_star_topk(
          -> Result<Option<u64>> {
             loop {
                 if f_batch.is_none() || *f_i >= f_batch.as_ref().unwrap().row_count {
+                    ctx.check_cancelled()?;
                     *f_batch = fcur
                         .next_batch()
                         .map_err(|e| QueryError::Internal(format!("cursor batch: {e}")))?;
@@ -1415,6 +1416,7 @@ fn compute_group_by_object_star_topk(
                                   g_i: &mut usize|
          -> Result<Option<u64>> {
             if g_batch.is_none() || *g_i >= g_batch.as_ref().unwrap().row_count {
+                ctx.check_cancelled()?;
                 *g_batch = cursor
                     .next_batch()
                     .map_err(|e| QueryError::Internal(format!("cursor batch: {e}")))?;
@@ -1428,11 +1430,9 @@ fn compute_group_by_object_star_topk(
         };
 
         let mut fs = next_filter_subject(&mut fcur, &mut f_batch, &mut f_i, &mut f_last)?;
-        let mut cancel = CancelTicker::new(&ctx.cancellation);
         while let (Some(gs), Some(cur_fs)) =
             (peek_group_subject(&mut cursor, &mut g_batch, &mut g_i)?, fs)
         {
-            cancel.check()?;
             match gs.cmp(&cur_fs) {
                 Ordering::Less => {
                     // Skip all group rows for this subject.
@@ -1440,7 +1440,6 @@ fn compute_group_by_object_star_topk(
                     while let Some(cur_gs) =
                         peek_group_subject(&mut cursor, &mut g_batch, &mut g_i)?
                     {
-                        cancel.check()?;
                         if cur_gs != skip_s {
                             break;
                         }
@@ -1455,7 +1454,6 @@ fn compute_group_by_object_star_topk(
                     while let Some(cur_gs) =
                         peek_group_subject(&mut cursor, &mut g_batch, &mut g_i)?
                     {
-                        cancel.check()?;
                         if cur_gs != s {
                             break;
                         }

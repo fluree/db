@@ -27,46 +27,25 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
-// 0a. Strided cancellation checkpoint
+// 0a. Cold-path cancellation checkpoint
 // ---------------------------------------------------------------------------
 
-/// Strided cancellation checkpoint for tight per-group merge loops.
+/// Bail with `QueryError::Cancelled` if cancellation was signalled.
 ///
-/// Fused COUNT loops iterate per distinct subject (10⁷–10⁸ iterations at
-/// wikidata scale) with only tens of ns of work per iteration; consulting the
-/// shared atomic every iteration measured as a 5-15% regression. `check()`
-/// only touches the atomic once every `STRIDE` calls, so the hot path is a
-/// register increment plus a predicted branch.
-pub(crate) struct CancelTicker<'a> {
-    cancellation: &'a fluree_db_core::QueryCancellation,
-    tick: u32,
-}
-
-impl<'a> CancelTicker<'a> {
-    /// At typical merge-loop rates (~15-40ns/group) this checks every ~1-3ms,
-    /// far finer than timeout/disconnect granularity needs.
-    const STRIDE_MASK: u32 = 0xFFFF;
-
-    pub(crate) fn new(cancellation: &'a fluree_db_core::QueryCancellation) -> Self {
-        Self {
-            cancellation,
-            tick: 0,
-        }
+/// Call ONLY from cold paths — leaflet refill, leaf open, partition start.
+/// Never call from per-group/per-row merge loops: any added instruction
+/// stream there (even a strided counter+branch) measurably perturbs codegen
+/// of the fused-COUNT loops (+5-15% end-to-end, wikidata-scale benchmarks).
+/// Leaflet granularity is thousands of rows, so cancellation still lands
+/// within ~1ms of work.
+#[inline]
+pub(crate) fn bail_if_cancelled(cancellation: &fluree_db_core::QueryCancellation) -> Result<()> {
+    if cfg!(feature = "cancel-checks-off") {
+        return Ok(());
     }
-
-    #[inline]
-    pub(crate) fn check(&mut self) -> Result<()> {
-        if cfg!(feature = "cancel-checks-off") {
-            return Ok(());
-        }
-        self.tick = self.tick.wrapping_add(1);
-        if self.tick & Self::STRIDE_MASK != 0 {
-            return Ok(());
-        }
-        match self.cancellation.reason() {
-            Some(reason) => Err(QueryError::Cancelled { reason }),
-            None => Ok(()),
-        }
+    match cancellation.reason() {
+        Some(reason) => Err(QueryError::Cancelled { reason }),
+        None => Ok(()),
     }
 }
 
@@ -639,6 +618,8 @@ pub struct PsotSubjectCountIter<'a> {
     /// partition one predicate's subjects across parallel workers.
     lo: u64,
     hi: u64,
+    /// Checked once per leaflet refill (cold path), never per group.
+    cancellation: fluree_db_core::QueryCancellation,
 }
 
 impl<'a> PsotSubjectCountIter<'a> {
@@ -675,10 +656,18 @@ impl<'a> PsotSubjectCountIter<'a> {
             cur_count: 0,
             lo,
             hi,
+            cancellation: fluree_db_core::QueryCancellation::disabled(),
         })
     }
 
+    /// Attach a cancellation handle, checked once per leaflet refill.
+    pub fn with_cancellation(mut self, cancellation: &fluree_db_core::QueryCancellation) -> Self {
+        self.cancellation = cancellation.clone();
+        self
+    }
+
     fn load_next_batch(&mut self) -> Result<Option<()>> {
+        bail_if_cancelled(&self.cancellation)?;
         let projection = projection_sid_only();
         loop {
             if self.handle.is_none() {
@@ -835,6 +824,8 @@ pub struct PsotSubjectSeek<'a> {
     handle: Option<Box<dyn fluree_db_binary_index::read::leaf_access::LeafHandle>>,
     batch: Option<ColumnBatch>,
     projection: ColumnProjection,
+    /// Checked once per leaflet refill (cold path), never per probe.
+    cancellation: fluree_db_core::QueryCancellation,
 }
 
 impl<'a> PsotSubjectSeek<'a> {
@@ -873,11 +864,19 @@ impl<'a> PsotSubjectSeek<'a> {
             handle: None,
             batch: None,
             projection,
+            cancellation: fluree_db_core::QueryCancellation::disabled(),
         }
+    }
+
+    /// Attach a cancellation handle, checked once per leaflet refill.
+    pub fn with_cancellation(mut self, cancellation: &fluree_db_core::QueryCancellation) -> Self {
+        self.cancellation = cancellation.clone();
+        self
     }
 
     fn load_next_batch(&mut self, target_s: u64) -> Result<Option<()>> {
         use fluree_db_binary_index::format::run_record_v2::read_ordered_key_v2;
+        bail_if_cancelled(&self.cancellation)?;
         loop {
             if self.handle.is_none() {
                 // Leaf leapfrog: skip leaves that provably cannot contain target_s.
@@ -1235,6 +1234,8 @@ pub struct PsotSubjectWeightedSumIter<'a> {
     /// True when the current batch is a pure non-IRI_REF leaflet —
     /// every row gets `default_weight` without looking up `o_key` in `weights`.
     all_default: bool,
+    /// Checked once per leaflet refill (cold path), never per group.
+    cancellation: fluree_db_core::QueryCancellation,
 }
 
 impl<'a> PsotSubjectWeightedSumIter<'a> {
@@ -1263,7 +1264,14 @@ impl<'a> PsotSubjectWeightedSumIter<'a> {
             cur_sum: 0,
             mixed: false,
             all_default: false,
+            cancellation: fluree_db_core::QueryCancellation::disabled(),
         }))
+    }
+
+    /// Attach a cancellation handle, checked once per leaflet refill.
+    pub fn with_cancellation(mut self, cancellation: &fluree_db_core::QueryCancellation) -> Self {
+        self.cancellation = cancellation.clone();
+        self
     }
 
     /// Create a new iterator that only emits groups for subjects in `allowed_subjects`.
@@ -1297,10 +1305,12 @@ impl<'a> PsotSubjectWeightedSumIter<'a> {
             cur_sum: 0,
             mixed: false,
             all_default: false,
+            cancellation: fluree_db_core::QueryCancellation::disabled(),
         }))
     }
 
     fn load_next_batch(&mut self) -> Result<Option<()>> {
+        bail_if_cancelled(&self.cancellation)?;
         let proj_sid_okey = projection_sid_okey();
         let proj_sid_otype_okey = projection_sid_otype_okey();
         loop {
@@ -2473,6 +2483,8 @@ pub struct CursorSubjectCountStream {
     row: usize,
     cur_s: Option<u64>,
     cur_count: u64,
+    /// Checked once per cursor-batch refill (cold path), never per group.
+    cancellation: fluree_db_core::QueryCancellation,
 }
 
 impl CursorSubjectCountStream {
@@ -2483,13 +2495,21 @@ impl CursorSubjectCountStream {
             row: 0,
             cur_s: None,
             cur_count: 0,
+            cancellation: fluree_db_core::QueryCancellation::disabled(),
         }
+    }
+
+    /// Attach a cancellation handle, checked once per cursor-batch refill.
+    pub fn with_cancellation(mut self, cancellation: &fluree_db_core::QueryCancellation) -> Self {
+        self.cancellation = cancellation.clone();
+        self
     }
 
     /// Next `(subject_id, row_count)` group, or `None` when exhausted.
     pub fn next_group(&mut self) -> Result<Option<(u64, u64)>> {
         loop {
             if self.current.is_none() {
+                bail_if_cancelled(&self.cancellation)?;
                 self.current = self
                     .cursor
                     .next_batch()
@@ -2616,6 +2636,7 @@ where
         g_id,
         p_id,
         total_rows,
+        &ctx.cancellation,
         move |lo, hi| {
             let sliced = slice_overlay_ops_by_subject(ops_ref, lo, hi);
             let Some(mut cursor) = build_overlay_cursor_for_subject_range(
