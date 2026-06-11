@@ -1014,11 +1014,17 @@ impl Operator for PropertyJoinOperator {
 
                 scan.close();
 
-                // After the first scan, capture subject IDs for batched probing when the
-                // subject keys stayed as encoded IDs. This lets a selective exact scan like
-                // `?s rdf:type :Deal` drive later subject-bound probes.
-                driver_subject_ids =
-                    self.capture_driver_subject_ids(ctx, order_pos, &all_subject_values);
+                // After the driver scan, capture subject IDs for batched probing
+                // when the subject keys stayed as encoded IDs. This lets a
+                // selective exact scan like `?s rdf:type :Deal` drive later
+                // subject-bound probes. Only the driver position captures —
+                // re-capturing on later iterations would erase the ids (the
+                // helper returns None off the driver), cutting every
+                // predicate after the first remaining one off from probing.
+                if order_pos == 0 {
+                    driver_subject_ids =
+                        self.capture_driver_subject_ids(ctx, order_pos, &all_subject_values);
+                }
 
                 if order_pos == 0 {
                     let remaining_predicates = &scan_order[1..];

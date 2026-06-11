@@ -284,7 +284,8 @@ async fn probe_helpers_merge_novelty() {
                 "@graph": [
                     {"@id": "ex:bob", "ex:age": 26},
                     {"@id": "ex:alice", "ex:knows": {"@id": "ex:grace"}},
-                    {"@id": "ex:grace", "ex:age": 35, "ex:name": "Grace", "ex:city": "Quito"}
+                    {"@id": "ex:grace", "ex:age": 35, "ex:name": "Grace", "ex:city": "Quito",
+                     "ex:nick": "G"}
                 ]
             }),
         )
@@ -294,9 +295,10 @@ async fn probe_helpers_merge_novelty() {
     // (name, query, expected row count, engagement)
     enum Engage {
         ExistsFlush,
-        NoGroupedFallback,
-        PropertyJoinFast,
-        DifferentialOnly,
+        OptionalBatched,
+        GroupedOptionalBatched,
+        SpotStarWalk,
+        BatchedProbe,
     }
     let queries: &[(&str, &str, usize, Engage)] = &[
         (
@@ -319,7 +321,7 @@ async fn probe_helpers_merge_novelty() {
               SELECT ?b ?v WHERE { ex:carol ex:knows ?b . OPTIONAL { ?b ex:age ?v } }
               ORDER BY ?b ?v",
             1, // dave row stays with ?v unbound — never dropped
-            Engage::DifferentialOnly,
+            Engage::OptionalBatched,
         ),
         (
             "optional-injected",
@@ -327,27 +329,46 @@ async fn probe_helpers_merge_novelty() {
               SELECT ?b ?v WHERE { ex:alice ex:knows ?b . OPTIONAL { ?b ex:age ?v } }
               ORDER BY ?b ?v",
             3, // bob 25 + 26 (injected), grace 35 (novelty-only subject)
-            Engage::DifferentialOnly,
+            Engage::OptionalBatched,
         ),
         (
+            // Two consecutive single-triple OPTIONALs take the grouped
+            // builder (a multi-triple OPTIONAL block goes through the
+            // correlated per-row chain, whose inner joins merge via the
+            // batched subject lane instead).
             "grouped-optional",
             r"PREFIX ex: <http://example.org/ns/>
               SELECT ?b ?v ?n
-              WHERE { ex:alice ex:knows ?b . OPTIONAL { ?b ex:age ?v . ?b ex:name ?n } }
+              WHERE { ex:alice ex:knows ?b .
+                      OPTIONAL { ?b ex:age ?v } OPTIONAL { ?b ex:name ?n } }
               ORDER BY ?b ?v ?n",
             3, // bob (25,Bob) + (26,Bob), grace (35,Grace)
-            Engage::NoGroupedFallback,
+            Engage::GroupedOptionalBatched,
         ),
         (
             // The bound object anchors the star on PropertyJoinOperator
             // (pure variable-object stars stay on the sequential join chain).
-            "property-join-star",
+            "property-join-spot-walk",
             r#"PREFIX ex: <http://example.org/ns/>
               SELECT ?s ?v ?n
               WHERE { ?s ex:city "Quito" . ?s ex:age ?v . ?s ex:name ?n }
               ORDER BY ?s ?v ?n"#,
             1, // grace — city/age/name are all novelty-only
-            Engage::PropertyJoinFast,
+            Engage::SpotStarWalk,
+        ),
+        (
+            // ex:nick exists only in novelty, so the whole-star SPOT plan
+            // declines and the remaining base predicates take the chunked
+            // batched probes instead (the novelty-only predicate full-scans).
+            "property-join-chunked-probe",
+            r#"PREFIX ex: <http://example.org/ns/>
+              SELECT ?s ?k
+              WHERE { ?s ex:city "Quito" . ?s ex:age 35 . ?s ex:nick ?k }
+              ORDER BY ?s ?k"#,
+            1, // grace ("G"); both base predicates are bound-object so one of
+            // them probes right after the driver (the novelty-only ex:nick
+            // declines the SPOT walk and full-scans)
+            Engage::BatchedProbe,
         ),
     ];
 
@@ -370,25 +391,40 @@ async fn probe_helpers_merge_novelty() {
                     spans.span_names()
                 );
             }
-            Engage::NoGroupedFallback => {
+            Engage::OptionalBatched => {
                 assert!(
-                    !spans.has_event("grouped optional builder fallback"),
-                    "{name}: grouped optional should stay batched under novelty"
+                    spans.has_event("optional batched probe complete"),
+                    "{name}: single OPTIONAL should stay batched under novelty"
                 );
             }
-            Engage::PropertyJoinFast => {
+            Engage::GroupedOptionalBatched => {
+                assert!(
+                    spans.has_event("grouped optional batched probe complete"),
+                    "{name}: grouped OPTIONAL should stay batched under novelty"
+                );
+            }
+            Engage::SpotStarWalk => {
                 let opens = spans.find_events("property_join: open complete");
                 assert!(
-                    opens.iter().any(|e| {
-                        e.fields.get("used_spot_star_walk").map(String::as_str) == Some("true")
-                            || e.fields.get("used_batched_probe").map(String::as_str)
-                                == Some("true")
-                    }),
-                    "{name}: property join should use a batched walk/probe under \
+                    opens
+                        .iter()
+                        .any(|e| e.fields.get("used_spot_star_walk").map(String::as_str)
+                            == Some("true")),
+                    "{name}: property join should use the SPOT star walk under \
                      novelty; events: {opens:?}"
                 );
             }
-            Engage::DifferentialOnly => {}
+            Engage::BatchedProbe => {
+                let opens = spans.find_events("property_join: open complete");
+                assert!(
+                    opens
+                        .iter()
+                        .any(|e| e.fields.get("used_batched_probe").map(String::as_str)
+                            == Some("true")),
+                    "{name}: property join should use the chunked batched probes \
+                     under novelty; events: {opens:?}"
+                );
+            }
         }
         novelty_results.push(rows);
     }

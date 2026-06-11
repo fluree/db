@@ -534,6 +534,7 @@ impl OptionalBuilder for PatternOptionalBuilder {
             pending.push((start_row + slot, optional_batches));
         }
 
+        tracing::debug!(rows = pending.len(), "optional batched probe complete");
         Ok(Some(pending))
     }
 
@@ -925,6 +926,11 @@ impl OptionalBuilder for GroupedPatternOptionalBuilder {
             pending.push((start_row + slot, optional_batches));
         }
 
+        tracing::debug!(
+            rows = pending.len(),
+            predicate_count = self.triples.len(),
+            "grouped optional batched probe complete"
+        );
         Ok(Some(pending))
     }
 
