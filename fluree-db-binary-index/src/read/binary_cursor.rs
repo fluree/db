@@ -67,8 +67,6 @@ pub struct BinaryCursor {
     /// Exclusive end position in overlay_ops for the current leaf.
     /// Ops beyond this belong to a later leaf and must not be consumed.
     leaf_overlay_end: usize,
-    /// Overlay epoch for cache key differentiation.
-    epoch: u64,
     /// Time bound for overlay ops (only emit ops with t <= to_t).
     to_t: i64,
     /// Optional fuel tracker. When set, charges one index touch per leaflet returned.
@@ -115,7 +113,6 @@ impl BinaryCursor {
             overlay_pos: 0,
             overlay_end: 0,
             leaf_overlay_end: 0,
-            epoch: 0,
             to_t: i64::MAX,
             tracker: None,
             range_min: Some(*min_key),
@@ -147,7 +144,6 @@ impl BinaryCursor {
             overlay_pos: 0,
             overlay_end: 0,
             leaf_overlay_end: 0,
-            epoch: 0,
             to_t: i64::MAX,
             tracker: None,
             range_min: None,
@@ -225,11 +221,6 @@ impl BinaryCursor {
         self.overlay_pos = start;
         self.overlay_end = end;
         self.leaf_overlay_end = end; // default: all window ops visible (refined per-leaf)
-    }
-
-    /// Set the overlay epoch for cache key differentiation.
-    pub fn set_epoch(&mut self, epoch: u64) {
-        self.epoch = epoch;
     }
 
     /// Set the time bound for overlay ops.

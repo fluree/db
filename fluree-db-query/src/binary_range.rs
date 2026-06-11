@@ -491,9 +491,7 @@ fn binary_range_eq_v3(
     if !ops.is_empty() {
         fluree_db_binary_index::read::types::sort_overlay_ops(&mut ops, order);
         fluree_db_binary_index::read::types::resolve_overlay_ops(&mut ops);
-        let epoch = overlay.epoch();
         cursor.set_overlay_ops(ops.into());
-        cursor.set_epoch(epoch);
     }
 
     // Extend the row-loop allow-set with ephemeral p_ids whose mapped Sid is
@@ -836,7 +834,6 @@ fn binary_lookup_subject_predicate_refs_batched_v3(
         fluree_db_binary_index::read::types::sort_overlay_ops(&mut ops, RunSortOrder::Psot);
         fluree_db_binary_index::read::types::resolve_overlay_ops(&mut ops);
         cursor.set_overlay_ops(ops.into());
-        cursor.set_epoch(overlay.epoch());
     }
 
     // Membership filter for s_id (fast O(1)).
@@ -1158,7 +1155,6 @@ fn binary_range_bounded_v3(
         fluree_db_binary_index::read::types::sort_overlay_ops(&mut overlay_ops, order);
         fluree_db_binary_index::read::types::resolve_overlay_ops(&mut overlay_ops);
         cursor.set_overlay_ops(overlay_ops.into());
-        cursor.set_epoch(overlay.epoch());
     }
 
     let view =

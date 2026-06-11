@@ -2637,19 +2637,15 @@ pub fn build_overlay_cursor_for_predicate(
     // novelty (epoch 0): the persisted index alone is then exact. Ops come
     // from the per-execution cache, so N cursors over the same predicate
     // (flushes, partitions, cyclic edges) share one walk + translation.
-    if ctx.overlay.is_some() {
-        let epoch = ctx.overlay().epoch();
-        if epoch != 0 {
-            match cached_overlay_ops(ctx, store, g_id, order, &pred_sid)? {
-                Some(ops) => {
-                    if !ops.is_empty() {
-                        cursor.set_overlay_ops(ops);
-                    }
+    if ctx.overlay.is_some() && ctx.overlay().epoch() != 0 {
+        match cached_overlay_ops(ctx, store, g_id, order, &pred_sid)? {
+            Some(ops) => {
+                if !ops.is_empty() {
+                    cursor.set_overlay_ops(ops);
                 }
-                None => return Ok(None),
             }
+            None => return Ok(None),
         }
-        cursor.set_epoch(epoch);
     }
 
     Ok(Some(cursor))
@@ -2764,11 +2760,8 @@ pub fn build_overlay_cursor_for_subject_range(
         projection,
     )?;
     cursor.set_to_t(to_t);
-    if overlay_active {
-        if !sliced_ops.is_empty() {
-            cursor.set_overlay_ops(sliced_ops.into());
-        }
-        cursor.set_epoch(epoch);
+    if overlay_active && !sliced_ops.is_empty() {
+        cursor.set_overlay_ops(sliced_ops.into());
     }
     Some(cursor)
 }

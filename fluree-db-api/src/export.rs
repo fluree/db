@@ -94,7 +94,6 @@ fn apply_time_travel(
         if !ops.is_empty() {
             sort_overlay_ops(&mut ops, RunSortOrder::Spot);
             cursor.set_overlay_ops(ops.into());
-            cursor.set_epoch(overlay.epoch());
         }
         (ephemeral_preds, surviving_untranslated(untranslated))
     } else {

@@ -2024,7 +2024,6 @@ impl Operator for BinaryScanOperator {
                 };
                 if start < end {
                     cursor.set_overlay_ops_window(Arc::clone(&translated.ops), start, end);
-                    cursor.set_epoch(epoch);
                 }
             }
 
