@@ -2032,8 +2032,6 @@ impl Operator for BinaryScanOperator {
             // Keep them as materialized flakes and stream them after the cursor completes.
             // (Already sorted + retraction-resolved in the cached entry.)
             if !translated.untranslated.is_empty() {
-                let mut untranslated = translated.untranslated.clone();
-
                 // Apply equality match (subject/predicate/object) against pattern constants.
                 let s_sid = match &self.pattern.s {
                     Ref::Sid(s) => Some(s.clone()),
@@ -2044,30 +2042,17 @@ impl Operator for BinaryScanOperator {
                     _ => None,
                 };
 
-                if s_sid.is_some() || p_sid.is_some() || self.bound_o.is_some() {
-                    untranslated.retain(|f| {
-                        if let Some(s) = s_sid.as_ref() {
-                            if &f.s != s {
-                                return false;
-                            }
-                        }
-                        if let Some(p) = p_sid.as_ref() {
-                            if &f.p != p {
-                                return false;
-                            }
-                        }
-                        if let Some(o) = self.bound_o.as_ref() {
-                            if &f.o != o {
-                                return false;
-                            }
-                        }
-                        true
-                    });
-                }
-
-                if let Some(bounds) = self.object_bounds.as_ref() {
-                    untranslated.retain(|f| bounds.matches(&f.o));
-                }
+                let untranslated: Vec<_> = translated
+                    .untranslated
+                    .iter()
+                    .filter(|f| {
+                        s_sid.as_ref().is_none_or(|s| &f.s == s)
+                            && p_sid.as_ref().is_none_or(|p| &f.p == p)
+                            && self.bound_o.as_ref().is_none_or(|o| &f.o == o)
+                            && self.object_bounds.as_ref().is_none_or(|b| b.matches(&f.o))
+                    })
+                    .cloned()
+                    .collect();
 
                 if !untranslated.is_empty() {
                     self.range_iter = Some(untranslated.into_iter());

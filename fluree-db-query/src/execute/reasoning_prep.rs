@@ -175,16 +175,13 @@ pub async fn schema_hierarchy_with_overlay(
 /// materialization — see the warning in [`compute_derived_facts`].
 fn reasoning_budget(modes: &ReasoningModes) -> fluree_db_reasoner::ReasoningBudget {
     let mut budget = fluree_db_reasoner::ReasoningBudget::default();
-    if let Some(max_facts) = std::env::var("FLUREE_REASONING_MAX_FACTS")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-    {
+    // The env vars are re-read on every call deliberately: they are a live
+    // operator tuning knob (no restart needed), and two getenv calls per
+    // reasoning query are negligible next to materialization itself.
+    if let Some(max_facts) = budget_env_var::<usize>("FLUREE_REASONING_MAX_FACTS") {
         budget.max_facts = max_facts;
     }
-    if let Some(max_secs) = std::env::var("FLUREE_REASONING_MAX_SECONDS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-    {
+    if let Some(max_secs) = budget_env_var::<u64>("FLUREE_REASONING_MAX_SECONDS") {
         budget.max_duration = std::time::Duration::from_secs(max_secs);
     }
     if let Some(max_facts) = modes.max_facts {
@@ -194,6 +191,23 @@ fn reasoning_budget(modes: &ReasoningModes) -> fluree_db_reasoner::ReasoningBudg
         budget.max_duration = std::time::Duration::from_secs(max_secs);
     }
     budget
+}
+
+/// Read and parse a reasoning-budget env var, warning (instead of silently
+/// ignoring) when a set value doesn't parse.
+fn budget_env_var<T: std::str::FromStr>(name: &str) -> Option<T> {
+    let raw = std::env::var(name).ok()?;
+    match raw.parse::<T>() {
+        Ok(v) => Some(v),
+        Err(_) => {
+            tracing::warn!(
+                name,
+                value = %raw,
+                "ignoring unparseable reasoning budget env var"
+            );
+            None
+        }
+    }
 }
 
 /// Result of [`compute_derived_facts`]: the overlay plus the OWL2-RL
