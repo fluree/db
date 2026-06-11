@@ -442,3 +442,128 @@ async fn probe_helpers_merge_novelty() {
         );
     }
 }
+
+/// Differential test for the bound-object (OPST) lane under novelty: retracts
+/// suppress matched base rows (including multi-entry `@list` refs, whose
+/// retract identity lives in `o_i` — the column the lane's narrow projection
+/// previously never decoded), asserts inject new matches, and novelty-only
+/// subjects emit as encoded ids.
+#[tokio::test]
+async fn batched_object_join_merges_novelty() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/join-batched-object-overlay:main";
+    let ledger = genesis_ledger_for_fluree(&fluree, ledger_id);
+
+    let base = json!({
+        "@context": ctx(),
+        "@graph": [
+            {"@id": "ex:alice", "ex:knows": {"@id": "ex:bob"}},
+            {"@id": "ex:b1", "ex:author": {"@id": "ex:alice"}},
+            {"@id": "ex:b2", "ex:author": {"@id": "ex:bob"}},
+            {"@id": "ex:b5", "ex:authors": {"@list": [{"@id": "ex:bob"}, {"@id": "ex:bob"}]}},
+            {"@id": "ex:d1", "ex:author": {"@id": "ex:dave"}}
+        ]
+    });
+    let receipt = fluree.insert(ledger, &base).await.expect("base insert");
+    fluree
+        .reindex(ledger_id, ReindexOptions::default())
+        .await
+        .expect("reindex base");
+
+    // Novelty tail: b2's author retracted, b3 asserted, grace + b4 exist only
+    // in novelty, and b5's two-entry author @list is fully retracted (both
+    // flakes share (s, p, o) and differ only in o_i).
+    let receipt = fluree
+        .update(
+            receipt.ledger,
+            &json!({
+                "@context": ctx(),
+                "where":  {"@id": "ex:b2", "ex:author": "?a"},
+                "delete": {"@id": "ex:b2", "ex:author": "?a"}
+            }),
+        )
+        .await
+        .expect("retract b2 author");
+    let receipt = fluree
+        .update(
+            receipt.ledger,
+            &json!({
+                "@context": ctx(),
+                "where":  {"@id": "ex:b5", "ex:authors": "?a"},
+                "delete": {"@id": "ex:b5", "ex:authors": "?a"}
+            }),
+        )
+        .await
+        .expect("retract b5 author list");
+    let _receipt = fluree
+        .insert(
+            receipt.ledger,
+            &json!({
+                "@context": ctx(),
+                "@graph": [
+                    {"@id": "ex:b3", "ex:author": {"@id": "ex:bob"}},
+                    {"@id": "ex:alice", "ex:knows": {"@id": "ex:grace"}},
+                    {"@id": "ex:b4", "ex:author": {"@id": "ex:grace"}}
+                ]
+            }),
+        )
+        .await
+        .expect("novelty asserts");
+
+    let queries: &[(&str, &str, usize)] = &[
+        (
+            "object-probe-mixed",
+            r"PREFIX ex: <http://example.org/ns/>
+              SELECT ?b ?x WHERE { ex:alice ex:knows ?b . ?x ex:author ?b }
+              ORDER BY ?b ?x",
+            2, // (bob, b3 injected) + (grace novelty-only, b4 injected);
+               // b2 retracted, b1/d1 authors not known by alice
+        ),
+        (
+            "object-probe-list-retract",
+            r"PREFIX ex: <http://example.org/ns/>
+              SELECT ?x WHERE { VALUES ?b { ex:bob } ?x ex:authors ?b }
+              ORDER BY ?x",
+            1, // the delete's WHERE dedupes the repeated @list value to one
+               // binding, so exactly ONE of the two o_i entries is retracted:
+               // the fate check must discriminate the entries by o_i (a
+               // default-read o_i would either resurrect both or drop both)
+        ),
+    ];
+
+    let view = fluree.db(ledger_id).await.expect("novelty view");
+    let mut novelty_results = Vec::new();
+    for (name, query, expected_len) in queries {
+        let (spans, guard) = span_capture::init_test_tracing();
+        let rows = run_query(&fluree, &view, query).await;
+        drop(guard);
+        assert_eq!(
+            rows.len(),
+            *expected_len,
+            "{name}: row count under novelty; got {rows:?}"
+        );
+        assert!(
+            spans.has_span("join_flush_batched_object_binary"),
+            "{name}: bound-object lane should engage under novelty; spans: {:?}",
+            spans.span_names()
+        );
+        assert!(
+            spans.has_event("join batched object flush merged novelty overlay"),
+            "{name}: object flush should merge the overlay"
+        );
+        novelty_results.push(rows);
+    }
+
+    fluree
+        .reindex(ledger_id, ReindexOptions::default())
+        .await
+        .expect("reindex ground truth");
+    let view = fluree.db(ledger_id).await.expect("indexed view");
+    for ((name, query, _), novelty_rows) in queries.iter().zip(&novelty_results) {
+        let indexed_rows = run_query(&fluree, &view, query).await;
+        assert_eq!(
+            &indexed_rows, novelty_rows,
+            "{name}: novelty-merged object join != reindexed ground truth"
+        );
+    }
+}

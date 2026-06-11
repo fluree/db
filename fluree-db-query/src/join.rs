@@ -9,7 +9,10 @@ use crate::binding::{Batch, Binding, RowAccess};
 use crate::context::ExecutionContext;
 use crate::dataset::ActiveGraphs;
 use crate::error::{QueryError, Result};
-use crate::fast_path_common::{subject_probe_lane_plan, ProbeLanePlan, ProbeOps, RowFate};
+use crate::fast_path_common::{
+    object_probe_lane_plan, subject_probe_lane_plan, ObjectProbeOps, ProbeLanePlan, ProbeOps,
+    RowFate,
+};
 use crate::ir::triple::{Ref, Term, TriplePattern};
 use crate::object_binding::{late_materialized_object_binding, materialized_object_binding};
 use crate::operator::inline::{apply_inline, extend_schema, InlineOperator};
@@ -443,9 +446,7 @@ pub struct NestedLoopJoinOperator {
     batched_predicate: Option<Sid>,
     /// Overlay handling decision for the batched lanes, recomputed at the
     /// top of every `next_batch` call (cheap: the ops fetch hits the
-    /// per-execution cache after the first call). The subject-probe and
-    /// exists lanes merge under `Merge`; the object (OPST) lane requires
-    /// `Clean`.
+    /// per-execution cache after the first call).
     batched_overlay_mode: ProbeLanePlan,
     /// Accumulated entries for batched processing: (stored_batch_idx, row_idx, subject_s_id)
     /// Stores the raw s_id directly to avoid dictionary round-trips with EncodedSid.
@@ -1576,14 +1577,14 @@ impl NestedLoopJoinOperator {
     /// Decide how the batched lanes handle the active overlay this call.
     ///
     /// The subject-probe and exists lanes merge overlay ops per probed
-    /// subject; the object (OPST) lane still requires an overlay-free graph
-    /// (v1). Decline cases route to the overlay-correct per-row fallback
+    /// subject; the object (OPST) lane merges its `IRI_REF` subset per probed
+    /// object. Decline cases route to the overlay-correct per-row fallback
     /// BEFORE any accumulation, so a flush never reroutes mid-stream.
     fn compute_batched_overlay_mode(&self, ctx: &ExecutionContext<'_>) -> Result<ProbeLanePlan> {
         if ctx.overlay_free_single_graph() {
             return Ok(ProbeLanePlan::Clean);
         }
-        if self.batched_object_eligible || !(self.batched_eligible || self.batched_exists_eligible)
+        if !(self.batched_eligible || self.batched_object_eligible || self.batched_exists_eligible)
         {
             return Ok(ProbeLanePlan::Decline);
         }
@@ -1592,7 +1593,11 @@ impl NestedLoopJoinOperator {
         else {
             return Ok(ProbeLanePlan::Decline);
         };
-        subject_probe_lane_plan(ctx, store, pred)
+        if self.batched_object_eligible {
+            object_probe_lane_plan(ctx, store, pred)
+        } else {
+            subject_probe_lane_plan(ctx, store, pred)
+        }
     }
 
     /// Phase 1: Resolve the batched predicate SID to a binary-index p_id.
@@ -2512,10 +2517,20 @@ impl NestedLoopJoinOperator {
         }
 
         let Some(branch) = store.branch_for_order(ctx.binary_g_id, RunSortOrder::Opst) else {
+            debug_assert!(
+                !matches!(self.batched_overlay_mode, ProbeLanePlan::Merge(_)),
+                "lane plan must decline branchless graphs"
+            );
             self.clear_batched_state();
             return Ok(());
         };
         let branch = Arc::clone(branch);
+
+        // One reconciler per flush (see `flush_batched_accumulator_binary`).
+        let mut probe_ops = match &self.batched_overlay_mode {
+            ProbeLanePlan::Merge(ops) => ObjectProbeOps::new(ops),
+            _ => None,
+        };
 
         let mut scatter: Vec<Vec<Vec<Binding>>> = vec![Vec::new(); self.batched_accumulator.len()];
         let mut matched_rows: u64 = 0;
@@ -2608,13 +2623,24 @@ impl NestedLoopJoinOperator {
 
                 // We only need core identity columns for this join, but for
                 // historical snapshots we also need `T` so `replay_leaflet_at_t`
-                // can detect base rows that postdate `to_t`.
+                // can detect base rows that postdate `to_t`. The overlay merge
+                // additionally needs `OI`: CORE lacks it, and a fate check
+                // reading `o_i` as a default would mis-reconcile retracts on
+                // multi-entry (`@list`) refs in BOTH cache configurations.
+                use fluree_db_binary_index::read::column_types::{ColumnProjection, ColumnSet};
                 let proj = if need_replay {
-                    fluree_db_binary_index::read::column_types::ColumnProjection::all()
+                    ColumnProjection::all()
+                } else if probe_ops.is_some() {
+                    ColumnProjection {
+                        output: ColumnSet::CORE.union(ColumnSet::single(
+                            fluree_db_binary_index::format::column_block::ColumnId::OI,
+                        )),
+                        internal: ColumnSet::EMPTY,
+                    }
                 } else {
-                    fluree_db_binary_index::read::column_types::ColumnProjection {
-                        output: fluree_db_binary_index::read::column_types::ColumnSet::CORE,
-                        internal: fluree_db_binary_index::read::column_types::ColumnSet::EMPTY,
+                    ColumnProjection {
+                        output: ColumnSet::CORE,
+                        internal: ColumnSet::EMPTY,
                     }
                 };
                 let batch = if entry.row_count == 0 {
@@ -2688,41 +2714,20 @@ impl NestedLoopJoinOperator {
                             continue;
                         };
                         let s_id = batch.s_id.get_or(row, 0);
-                        for &accum_idx in accum_idxs {
-                            let (batch_idx, row_idx, _) = self.batched_accumulator[accum_idx];
-                            let left_batch =
-                                self.stored_left_batches.get(batch_idx).ok_or_else(|| {
-                                    QueryError::Internal(
-                                        "batched object join: left batch missing".into(),
-                                    )
-                                })?;
-                            let mut right_bindings = Vec::with_capacity(self.right_new_vars.len());
-                            for _ in &self.right_new_vars {
-                                right_bindings.push(Binding::encoded_sid(s_id));
-                            }
-                            if !self.apply_right_scan_inline_ops(ctx, &mut right_bindings)? {
+                        if let Some(probe) = probe_ops.as_mut() {
+                            let win = probe.object_window(o_key);
+                            let o_i_val = batch.o_i.get_or(row, u32::MAX);
+                            if probe.base_row_fate(&win, s_id, o_i_val) == RowFate::Drop {
                                 continue;
                             }
-
-                            let mut combined: Vec<Binding> =
-                                Vec::with_capacity(self.combined_schema.len());
-                            for col in 0..self.left_schema.len() {
-                                combined.push(left_batch.get_by_col(row_idx, col).clone());
-                            }
-                            combined.extend(right_bindings);
-
-                            if !apply_inline(
-                                &self.inline_ops,
-                                &self.combined_schema,
-                                &mut combined,
-                                Some(ctx),
-                            )? {
-                                continue;
-                            }
-
-                            scatter[accum_idx].push(combined);
-                            matched_rows += 1;
                         }
+                        self.emit_object_probe_match(
+                            ctx,
+                            s_id,
+                            accum_idxs,
+                            &mut scatter,
+                            &mut matched_rows,
+                        )?;
                     }
                     continue;
                 };
@@ -2765,6 +2770,10 @@ impl NestedLoopJoinOperator {
                         obj_idx += 1;
                         continue;
                     };
+                    let probe_window = probe_ops
+                        .as_ref()
+                        .map(|p| p.object_window(target))
+                        .filter(|w| !w.is_empty());
 
                     for r in row..run_end {
                         if !ot_const_ok {
@@ -2781,41 +2790,19 @@ impl NestedLoopJoinOperator {
                         }
 
                         let s_id = batch.s_id.get_or(r, 0);
-                        for &accum_idx in accum_idxs {
-                            let (batch_idx, row_idx, _) = self.batched_accumulator[accum_idx];
-                            let left_batch =
-                                self.stored_left_batches.get(batch_idx).ok_or_else(|| {
-                                    QueryError::Internal(
-                                        "batched object join: left batch missing".into(),
-                                    )
-                                })?;
-                            let mut right_bindings = Vec::with_capacity(self.right_new_vars.len());
-                            for _ in &self.right_new_vars {
-                                right_bindings.push(Binding::encoded_sid(s_id));
-                            }
-                            if !self.apply_right_scan_inline_ops(ctx, &mut right_bindings)? {
+                        if let (Some(probe), Some(win)) = (probe_ops.as_mut(), &probe_window) {
+                            let o_i_val = batch.o_i.get_or(r, u32::MAX);
+                            if probe.base_row_fate(win, s_id, o_i_val) == RowFate::Drop {
                                 continue;
                             }
-
-                            let mut combined: Vec<Binding> =
-                                Vec::with_capacity(self.combined_schema.len());
-                            for col in 0..self.left_schema.len() {
-                                combined.push(left_batch.get_by_col(row_idx, col).clone());
-                            }
-                            combined.extend(right_bindings);
-
-                            if !apply_inline(
-                                &self.inline_ops,
-                                &self.combined_schema,
-                                &mut combined,
-                                Some(ctx),
-                            )? {
-                                continue;
-                            }
-
-                            scatter[accum_idx].push(combined);
-                            matched_rows += 1;
                         }
+                        self.emit_object_probe_match(
+                            ctx,
+                            s_id,
+                            accum_idxs,
+                            &mut scatter,
+                            &mut matched_rows,
+                        )?;
                     }
 
                     row = run_end;
@@ -2824,12 +2811,90 @@ impl NestedLoopJoinOperator {
             }
         }
 
+        // Inject novelty-only matches: unconsumed asserts per probed object,
+        // through the same emit path (and so the same inline filters) as base
+        // rows. Novelty-asserting subjects emit as EncodedSid, the same
+        // representation overlay-merged cursor rows use.
+        if let Some(probe) = probe_ops.as_mut() {
+            for &o_key in &objs {
+                let Some(accum_idxs) = o_to_accum.get(&o_key) else {
+                    continue;
+                };
+                let mut injected: Vec<u64> = Vec::new();
+                probe.drain_asserts_for_object(o_key, |s_id| {
+                    injected.push(s_id);
+                    Ok(())
+                })?;
+                for s_id in injected {
+                    self.emit_object_probe_match(
+                        ctx,
+                        s_id,
+                        accum_idxs,
+                        &mut scatter,
+                        &mut matched_rows,
+                    )?;
+                }
+            }
+        }
+        if let Some(probe) = &probe_ops {
+            tracing::debug!(
+                dropped_rows = probe.dropped_rows,
+                injected_rows = probe.injected_rows,
+                "join batched object flush merged novelty overlay"
+            );
+        }
+
         self.emit_scatter_to_output(scatter, ctx.batch_size)?;
         tracing::debug!(
             total_ms = (overall_start.elapsed().as_secs_f64() * 1000.0) as u64,
             matched_rows,
             "join batched object flush complete"
         );
+        Ok(())
+    }
+
+    /// Emit one matched (subject, left-row group) of the bound-object lane:
+    /// build the combined row per accumulator slot through the same inline-op
+    /// stages for base and injected matches.
+    fn emit_object_probe_match(
+        &self,
+        ctx: &ExecutionContext<'_>,
+        s_id: u64,
+        accum_idxs: &[usize],
+        scatter: &mut [Vec<Vec<Binding>>],
+        matched_rows: &mut u64,
+    ) -> Result<()> {
+        for &accum_idx in accum_idxs {
+            let (batch_idx, row_idx, _) = self.batched_accumulator[accum_idx];
+            let left_batch = self.stored_left_batches.get(batch_idx).ok_or_else(|| {
+                QueryError::Internal("batched object join: left batch missing".into())
+            })?;
+            let mut right_bindings = Vec::with_capacity(self.right_new_vars.len());
+            for _ in &self.right_new_vars {
+                right_bindings.push(Binding::encoded_sid(s_id));
+            }
+            if !self.apply_right_scan_inline_ops(ctx, &mut right_bindings)? {
+                continue;
+            }
+
+            let mut combined: Vec<Binding> = Vec::with_capacity(self.combined_schema.len());
+            for col in 0..self.left_schema.len() {
+                combined.push(left_batch.get_by_col(row_idx, col).clone());
+            }
+            combined.extend(right_bindings);
+
+            if !apply_inline(
+                &self.inline_ops,
+                &self.combined_schema,
+                &mut combined,
+                Some(ctx),
+            )? {
+                continue;
+            }
+
+            scatter[accum_idx].push(combined);
+            *matched_rows += 1;
+        }
         Ok(())
     }
 

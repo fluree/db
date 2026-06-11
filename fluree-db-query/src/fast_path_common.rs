@@ -179,6 +179,22 @@ pub fn projection_sid_otype_okey() -> ColumnProjection {
     }
 }
 
+/// [`projection_sid_otype_okey`] plus `OI` — the full per-subject fact
+/// identity an overlay-merging probe needs to reconcile retracts.
+pub fn projection_sid_otype_okey_oi() -> ColumnProjection {
+    ColumnProjection {
+        output: ColumnSet::EMPTY,
+        internal: {
+            let mut s = ColumnSet::EMPTY;
+            s.insert(ColumnId::SId);
+            s.insert(ColumnId::OType);
+            s.insert(ColumnId::OKey);
+            s.insert(ColumnId::OI);
+            s
+        },
+    }
+}
+
 /// Projection that loads OType + OKey columns (internal, not output).
 #[inline]
 pub fn projection_otype_okey() -> ColumnProjection {
@@ -833,17 +849,21 @@ impl<'a> PsotSubjectSeek<'a> {
         Self::with_projection(store, g_id, p_id, projection_sid_only())
     }
 
-    /// Row-yielding variant for [`Self::rows_for_subject`]: decodes OType +
-    /// OKey alongside SId. Returns `None` when the PSOT branch is absent —
-    /// that means "branch unavailable", never "predicate has no rows" —
-    /// so callers can decline their fast path instead of dropping rows.
-    pub fn new_with_objects(store: &'a BinaryIndexStore, g_id: GraphId, p_id: u32) -> Option<Self> {
+    /// Identity-yielding variant for [`Self::rows_for_subject_identity`]:
+    /// decodes `OI` alongside SId/OType/OKey so overlay-merging callers can
+    /// reconcile retracts on the full fact identity. Same `None` semantics as
+    /// [`Self::new_with_objects`].
+    pub fn new_with_identity(
+        store: &'a BinaryIndexStore,
+        g_id: GraphId,
+        p_id: u32,
+    ) -> Option<Self> {
         store.branch_for_order(g_id, RunSortOrder::Psot)?;
         Some(Self::with_projection(
             store,
             g_id,
             p_id,
-            projection_sid_otype_okey(),
+            projection_sid_otype_okey_oi(),
         ))
     }
 
@@ -959,17 +979,21 @@ impl<'a> PsotSubjectSeek<'a> {
         self.visit_subject(target_s, |_, _| {})
     }
 
-    /// Visit each of `target_s`'s rows as `(o_type, o_key)`, returning the row
-    /// count, or `None` if the subject is absent. Requires construction via
-    /// [`Self::new_with_objects`] so the object columns are decoded. Targets
-    /// MUST be non-decreasing across calls.
-    pub fn rows_for_subject(
+    /// Visit each of `target_s`'s rows as `(o_type, o_key, o_i)`, returning
+    /// the row count, or `None` if the subject is absent. Requires
+    /// construction via [`Self::new_with_identity`]. Targets MUST be
+    /// non-decreasing across calls.
+    pub fn rows_for_subject_identity(
         &mut self,
         target_s: u64,
-        mut on_row: impl FnMut(u16, u64),
+        mut on_row: impl FnMut(u16, u64, u32),
     ) -> Result<Option<u64>> {
         self.visit_subject(target_s, |batch, row| {
-            on_row(batch.o_type.get(row), batch.o_key.get(row));
+            on_row(
+                batch.o_type.get(row),
+                batch.o_key.get(row),
+                batch.o_i.get_or(row, u32::MAX),
+            );
         })
     }
 
@@ -2256,6 +2280,120 @@ impl ProbeOps {
     }
 }
 
+/// One overlay op of the object-probe subset: an `IRI_REF`-valued fact of
+/// the probed predicate, keyed for object-major reconciliation.
+#[derive(Clone, Copy)]
+struct ObjectProbeOp {
+    o_key: u64,
+    s_id: u64,
+    o_i: u32,
+    /// true = assert, false = retract.
+    op: bool,
+}
+
+/// Per-flush reconciler for the OPST bound-object probe lane.
+///
+/// The lane scans only `IRI_REF` rows of one predicate, keyed by object id,
+/// so this owns the matching subset of the predicate's resolved ops re-sorted
+/// by `(o_key, s_id, o_i)` — object-major windows with a well-defined
+/// binary-search order regardless of the source vec's sort order (the cached
+/// PSOT ops serve directly; no second overlay walk in OPST order). Same case
+/// analysis and per-flush scope as [`ProbeOps`].
+pub struct ObjectProbeOps {
+    ops: Vec<ObjectProbeOp>,
+    consumed: Vec<bool>,
+    /// Base rows suppressed by novelty retracts (diagnostics).
+    pub dropped_rows: u64,
+    /// Novelty asserts injected as new matches (diagnostics).
+    pub injected_rows: u64,
+}
+
+impl ObjectProbeOps {
+    /// Filter `ops` (one predicate's resolved ops, any sort order) to the
+    /// `IRI_REF` subset and index it object-major. Returns `None` when no op
+    /// can affect the lane — callers then run their unmodified scan.
+    pub fn new(ops: &[fluree_db_binary_index::read::types::OverlayOp]) -> Option<Self> {
+        let iri_ref = OType::IRI_REF.as_u16();
+        let mut subset: Vec<ObjectProbeOp> = ops
+            .iter()
+            .filter(|o| o.o_type == iri_ref)
+            .map(|o| ObjectProbeOp {
+                o_key: o.o_key,
+                s_id: o.s_id,
+                o_i: o.o_i,
+                op: o.op,
+            })
+            .collect();
+        if subset.is_empty() {
+            return None;
+        }
+        subset.sort_unstable_by_key(|o| (o.o_key, o.s_id, o.o_i));
+        let consumed = vec![false; subset.len()];
+        Some(Self {
+            ops: subset,
+            consumed,
+            dropped_rows: 0,
+            injected_rows: 0,
+        })
+    }
+
+    /// Index range of ops for `o_key`. Empty for objects with no novelty —
+    /// the common case, which keeps the per-row fate check free for them.
+    pub fn object_window(&self, o_key: u64) -> std::ops::Range<usize> {
+        let start = self.ops.partition_point(|o| o.o_key < o_key);
+        let end = start + self.ops[start..].partition_point(|o| o.o_key == o_key);
+        start..end
+    }
+
+    /// Reconcile one base row of `window`'s object against the ops, marking a
+    /// matching op consumed. `window` must come from
+    /// [`Self::object_window`] for the row's object key.
+    pub fn base_row_fate(
+        &mut self,
+        window: &std::ops::Range<usize>,
+        s_id: u64,
+        o_i: u32,
+    ) -> RowFate {
+        if window.is_empty() {
+            return RowFate::Keep;
+        }
+        let win = &self.ops[window.clone()];
+        let probe = (s_id, o_i);
+        let pos = win.partition_point(|o| (o.s_id, o.o_i) < probe);
+        if pos < win.len() {
+            let op = &win[pos];
+            if (op.s_id, op.o_i) == probe {
+                self.consumed[window.start + pos] = true;
+                if op.op {
+                    return RowFate::Keep;
+                }
+                self.dropped_rows += 1;
+                return RowFate::Drop;
+            }
+        }
+        RowFate::Keep
+    }
+
+    /// Hand every not-yet-consumed assert for `o_key` to `f` (as the
+    /// asserting subject id) — novelty-only facts of probed objects become
+    /// new matches. Call once per probed object after the base scan.
+    pub fn drain_asserts_for_object(
+        &mut self,
+        o_key: u64,
+        mut f: impl FnMut(u64) -> Result<()>,
+    ) -> Result<()> {
+        let window = self.object_window(o_key);
+        for i in window {
+            if !self.consumed[i] && self.ops[i].op {
+                self.consumed[i] = true;
+                self.injected_rows += 1;
+                f(self.ops[i].s_id)?;
+            }
+        }
+        Ok(())
+    }
+}
+
 /// How a batched leaflet-probe lane should handle the active overlay.
 ///
 /// Centralizes the decline analysis every probe lane needs (the bug class
@@ -2274,6 +2412,14 @@ pub enum ProbeLanePlan {
     Decline,
 }
 
+/// True when no policy enforcer is active (or it is root). The batched
+/// leaflet probes read base leaflets directly and never run the per-leaf
+/// `filter_flakes` policy filtering that scan operators apply — engaging
+/// them under a restrictive policy would leak rows the policy hides.
+pub(crate) fn root_or_no_policy(ctx: &ExecutionContext<'_>) -> bool {
+    ctx.policy_enforcer.as_ref().is_none_or(|p| p.is_root())
+}
+
 /// Plan a single-predicate PSOT subject probe under the active overlay.
 pub fn subject_probe_lane_plan(
     ctx: &ExecutionContext<'_>,
@@ -2287,6 +2433,9 @@ pub fn subject_probe_lane_plan(
     // overlays, federated queries) need the per-row path: probes emit
     // encoded bindings and merge only V3-translated novelty.
     if ctx.eager_materialization {
+        return Ok(ProbeLanePlan::Decline);
+    }
+    if !root_or_no_policy(ctx) {
         return Ok(ProbeLanePlan::Decline);
     }
     if !matches!(ctx.active_graphs(), crate::dataset::ActiveGraphs::Single) {
@@ -2314,6 +2463,49 @@ pub fn subject_probe_lane_plan(
     Ok(ProbeLanePlan::Merge(ops))
 }
 
+/// Plan an OPST bound-object probe under the active overlay.
+///
+/// Reuses the predicate's cached PSOT ops (the object lane filters and
+/// re-sorts its `IRI_REF` subset itself), but gates on the OPST branch the
+/// scan actually reads.
+pub fn object_probe_lane_plan(
+    ctx: &ExecutionContext<'_>,
+    store: &Arc<BinaryIndexStore>,
+    pred_sid: &Sid,
+) -> Result<ProbeLanePlan> {
+    if ctx.overlay_free_single_graph() {
+        return Ok(ProbeLanePlan::Clean);
+    }
+    // See subject_probe_lane_plan: eager and policy-enforced callers keep
+    // the per-row path.
+    if ctx.eager_materialization || !root_or_no_policy(ctx) {
+        return Ok(ProbeLanePlan::Decline);
+    }
+    if !matches!(ctx.active_graphs(), crate::dataset::ActiveGraphs::Single) {
+        return Ok(ProbeLanePlan::Decline);
+    }
+    let Some(ops) = cached_overlay_ops(ctx, store, ctx.binary_g_id, RunSortOrder::Psot, pred_sid)?
+    else {
+        tracing::debug!("object probe: overlay flake translation failed; declining");
+        return Ok(ProbeLanePlan::Decline);
+    };
+    if ops.is_empty() {
+        return Ok(ProbeLanePlan::Clean);
+    }
+    if store.sid_to_p_id(pred_sid).is_none() {
+        tracing::debug!("object probe: predicate exists only in novelty; declining");
+        return Ok(ProbeLanePlan::Decline);
+    }
+    if store
+        .branch_for_order(ctx.binary_g_id, RunSortOrder::Opst)
+        .is_none()
+    {
+        tracing::debug!("object probe: OPST branch absent with novelty present; declining");
+        return Ok(ProbeLanePlan::Decline);
+    }
+    Ok(ProbeLanePlan::Merge(ops))
+}
+
 /// Plan a multi-predicate SPOT star probe under the active overlay.
 ///
 /// Fetches each predicate's resolved ops, declines if any predicate is
@@ -2328,8 +2520,9 @@ pub fn star_probe_lane_plan(
     if ctx.overlay_free_single_graph() {
         return Ok(ProbeLanePlan::Clean);
     }
-    // See subject_probe_lane_plan: eager callers keep the per-row path.
-    if ctx.eager_materialization {
+    // See subject_probe_lane_plan: eager and policy-enforced callers keep
+    // the per-row path.
+    if ctx.eager_materialization || !root_or_no_policy(ctx) {
         return Ok(ProbeLanePlan::Decline);
     }
     if !matches!(ctx.active_graphs(), crate::dataset::ActiveGraphs::Single) {

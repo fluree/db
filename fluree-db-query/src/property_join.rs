@@ -540,9 +540,14 @@ impl PropertyJoinOperator {
         // NOT under eager materialization: eager `Sid` bindings (reasoning
         // views with derived-fact overlays, federation) can carry namespace
         // codes from a different snapshot space, so resolving them against
-        // this store's dictionary would key the wrong subject.
+        // this store's dictionary would key the wrong subject. NOT under a
+        // restrictive policy either: an all-`Id` key set enables the batched
+        // walks, which read raw leaflets and would bypass the per-leaf policy
+        // filtering the scans applied to produce these rows.
+        let normalizable =
+            !ctx.eager_materialization && crate::fast_path_common::root_or_no_policy(ctx);
         Ok(Self::subject_key_single(subject).map(|key| match key {
-            SubjectKey::Sid(sid) if !ctx.eager_materialization => {
+            SubjectKey::Sid(sid) if normalizable => {
                 let resolved = ctx.binary_store.as_deref().and_then(|store| {
                     store
                         .find_subject_id_by_parts(sid.namespace_code, &sid.name)
