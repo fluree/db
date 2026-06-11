@@ -161,21 +161,6 @@ pub async fn schema_hierarchy_with_overlay(
     }
 }
 
-/// Compute effective reasoning modes given query options and available hierarchy
-///
-/// Applies auto-RDFS when:
-/// - No explicit reasoning modes are set in query
-/// - Reasoning is not explicitly disabled ("reasoning": "none")
-/// - A schema hierarchy is available
-pub fn effective_reasoning_modes(
-    configured: &ReasoningModes,
-    hierarchy_available: bool,
-) -> ReasoningModes {
-    configured
-        .clone()
-        .effective_with_hierarchy(hierarchy_available)
-}
-
 /// Compute derived facts from OWL2-RL reasoning and/or user-defined datalog rules
 ///
 /// This function handles both reasoning modes:
@@ -306,25 +291,4 @@ pub async fn compute_derived_facts(
 
     let derived_overlay = builder.build(same_as, overlay.epoch());
     Some(Arc::new(derived_overlay))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_effective_reasoning_modes_with_hierarchy() {
-        let modes = ReasoningModes::default();
-        let effective = effective_reasoning_modes(&modes, true);
-        // With hierarchy available and no explicit modes, should enable RDFS
-        assert!(effective.rdfs);
-    }
-
-    #[test]
-    fn test_effective_reasoning_modes_without_hierarchy() {
-        let modes = ReasoningModes::default();
-        let effective = effective_reasoning_modes(&modes, false);
-        // Without hierarchy, should not enable auto-RDFS
-        assert!(!effective.rdfs);
-    }
 }

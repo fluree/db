@@ -27,9 +27,7 @@ use std::time::Instant;
 use tracing::Instrument;
 
 use super::operator_tree::build_operator_tree;
-use super::reasoning_prep::{
-    compute_derived_facts, effective_reasoning_modes, schema_hierarchy_with_overlay,
-};
+use super::reasoning_prep::{compute_derived_facts, schema_hierarchy_with_overlay};
 use super::rewrite_glue::rewrite_query_patterns;
 
 /// Remove exact duplicate triple patterns inside conjunctive blocks.
@@ -233,22 +231,27 @@ pub async fn prepare_execution_with_config(
             .map(|o| o as &dyn fluree_db_core::OverlayProvider)
             .unwrap_or(db.overlay);
         let (hierarchy, reasoning, derived_overlay, ontology) = async {
+            // Reasoning is opt-in: a query (or view/ledger-config default) must
+            // explicitly request a mode. Without one, skip reasoning prep
+            // entirely — including the schema-hierarchy range scans, which are
+            // pure overhead for plain-semantics queries.
+            let reasoning = query.reasoning.modes.clone();
+            if !reasoning.has_any_enabled() {
+                return Ok::<_, crate::error::QueryError>((None, reasoning, None, None));
+            }
+
             // Step 1: Compute schema hierarchy from overlay
             let hierarchy =
                 schema_hierarchy_with_overlay(db.snapshot, effective_overlay, db.t).await?;
 
-            // Step 2: Determine effective reasoning modes
-            let reasoning = effective_reasoning_modes(&query.reasoning.modes, hierarchy.is_some());
-
-            if reasoning.rdfs || reasoning.owl2ql || reasoning.owl2rl || reasoning.datalog {
-                tracing::debug!(
-                    rdfs = reasoning.rdfs,
-                    owl2ql = reasoning.owl2ql,
-                    owl2rl = reasoning.owl2rl,
-                    datalog = reasoning.datalog,
-                    "reasoning enabled"
-                );
-            }
+            tracing::debug!(
+                rdfs = reasoning.rdfs,
+                owl2ql = reasoning.owl2ql,
+                owl2rl = reasoning.owl2rl,
+                datalog = reasoning.datalog,
+                hierarchy_available = hierarchy.is_some(),
+                "reasoning enabled"
+            );
 
             // Step 3: Compute derived facts from OWL2-RL and/or datalog rules
             //

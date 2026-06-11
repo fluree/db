@@ -41,7 +41,8 @@ are active:
 }
 ```
 
-Use `"none"` to suppress auto-enabled RDFS and any ledger-wide defaults.
+Use `"none"` to override any view- or ledger-wide reasoning defaults for
+this query (with no defaults configured, it is a no-op affirmation).
 
 ### Valid mode strings
 
@@ -55,15 +56,22 @@ Use `"none"` to suppress auto-enabled RDFS and any ledger-wide defaults.
 
 ## Default behavior
 
-When the `reasoning` key is **absent** from a query:
+Reasoning is **opt-in**. When the `reasoning` key is absent from a query, no
+reasoning runs — even if the data contains `rdfs:subClassOf` /
+`rdfs:subPropertyOf` hierarchies. Plain queries match asserted triples only,
+pay no reasoning-prep cost, and behave like other SPARQL engines under simple
+entailment.
 
-- **RDFS auto-enables** if your data contains `rdfs:subClassOf` or
-  `rdfs:subPropertyOf` hierarchies. This is lightweight (query rewriting only)
-  and usually desirable.
-- **OWL 2 QL, OWL 2 RL, and Datalog remain disabled** unless enabled via
-  ledger-wide configuration.
+To enable reasoning without setting it per query, configure a default at the
+view level (`GraphDb::with_reasoning(...)` in the Rust API) or in the ledger
+configuration graph (`reasoningModes`). To override such a default for a
+single query, use `"reasoning": "none"`.
 
-To override ledger defaults for a single query, use `"reasoning": "none"`.
+> **Behavior change**: versions prior to this release auto-enabled RDFS when a
+> schema hierarchy existed in the data (though for imported ledgers the
+> auto-detection often silently failed). If you relied on automatic subclass /
+> subproperty expansion, add `"reasoning": "rdfs"` to your queries or set a
+> ledger default.
 
 ## Examples
 
@@ -242,8 +250,8 @@ Semantics:
 - **Transient.** Axioms never persist. The next query without
   `ontology` runs against only the configured bundle.
 - **Reasoning mode still required.** Inline axioms don't enable
-  reasoning on their own — set `reasoning` (or rely on auto-RDFS
-  when a hierarchy exists) so the engine actually uses them.
+  reasoning on their own — set `reasoning` so the engine actually
+  uses them.
 - **Namespace-scoped.** IRIs the snapshot already knows reuse
   their codes; previously-unseen IRIs allocate request-scoped
   codes that are discarded with the response — the on-disk
