@@ -262,7 +262,6 @@ impl crate::Fluree {
         // Run replay and finalization; roll back on any error.
         let ctx = ReplayContext {
             branch_id: &branch_id,
-            branch_record: &branch_record,
             source_id: &source_id,
             source_head_id: &source_head_id,
             source_head_t,
@@ -302,6 +301,28 @@ impl crate::Fluree {
 
     /// The actual replay loop + finalization, extracted so the caller can
     /// wrap it in a snapshot/rollback guard.
+    ///
+    /// Atomic: the build phase chains N [`StagedCommit`]s in memory
+    /// (each step's input is the previous step's post-commit state),
+    /// the apply phase writes all blobs and then does a *single*
+    /// fast-forward publish to advance the branch HEAD from
+    /// `pre_rebase` directly to the last replay's commit id.
+    /// Intermediate commits exist in the content store but aren't on
+    /// the active head chain until that single advance commits.
+    ///
+    /// Failure modes (all leave the branch ref untouched):
+    /// - any build step errors → no blobs written, no advance;
+    /// - cumulative novelty exceeds `reindex_max_bytes` → 422 with
+    ///   actionable remediation (reindex source then retry, or
+    ///   rebase a smaller range);
+    /// - blob write fails → orphan blobs in the content store but no
+    ///   ref advance;
+    /// - the final fast-forward publish fails → ditto.
+    ///
+    /// Mid-rebase reindex is intentionally not performed here:
+    /// publishing a new index head mid-flight would break atomicity.
+    /// Post-rebase, `finalize_commit` reports `needs_reindex` and the
+    /// background indexer rebuilds.
     async fn run_replay(&self, ctx: &ReplayContext<'_>) -> Result<RebaseReport> {
         // Acquire the target branch's write lock when a manager is
         // available, serializing the entire replay against regular
@@ -327,6 +348,12 @@ impl crate::Fluree {
             total_commits: ctx.total_commits,
             skipped: 0,
         };
+
+        // Build phase: chain N replay commits in memory. Each
+        // iteration consumes its `StagedCommit` via `finalize_state`
+        // to derive the next iteration's base state, keeping only
+        // the bytes + id needed by the apply phase.
+        let mut pending_blobs: Vec<PendingReplayBlob> = Vec::new();
 
         for summary in ctx.summaries {
             let has_conflicts = !summary.conflict_keys.is_empty();
@@ -367,14 +394,57 @@ impl crate::Fluree {
                 continue;
             }
 
-            current_state = self.replay_commit(current_state, flakes, &commit).await?;
-            report.replayed += 1;
+            let staged = self
+                .build_replay_commit(current_state, flakes, &commit)
+                .await?;
+            let commit_id = staged
+                .commit
+                .id
+                .clone()
+                .expect("build_replay_commit guarantees commit.id is set");
+            let commit_bytes = staged.commit_bytes.clone();
 
-            if current_state.should_reindex(&self.index_config) {
-                current_state = self
-                    .flush_rebase_novelty(ctx.branch_id, ctx.branch_record)
-                    .await?;
+            let (_receipt, next_state) = staged
+                .finalize_state()
+                .map_err(|e| ApiError::internal(format!("rebase finalize_state failed: {e}")))?;
+
+            if next_state.at_max_novelty(&self.index_config) {
+                let cumulative = next_state.novelty_size();
+                let max = self.index_config.reindex_max_bytes;
+                return Err(ApiError::http(
+                    422,
+                    format!(
+                        "Rebase would accumulate {cumulative} bytes of novelty (max {max}); \
+                         reindex the source branch then retry, or rebase a smaller commit range."
+                    ),
+                ));
             }
+
+            pending_blobs.push(PendingReplayBlob {
+                commit_id,
+                commit_bytes,
+            });
+            current_state = next_state;
+            report.replayed += 1;
+        }
+
+        // Apply phase: atomic. Write all blobs, then a single
+        // fast-forward publish jumps the branch HEAD past the
+        // intermediate replays to the last one's id.
+        if let Some(last) = pending_blobs.last() {
+            let content_store = self.content_store(ctx.branch_id);
+            for blob in &pending_blobs {
+                content_store
+                    .put_with_id(&blob.commit_id, &blob.commit_bytes)
+                    .await
+                    .map_err(|e| {
+                        ApiError::internal(format!("rebase commit blob write failed: {e}"))
+                    })?;
+            }
+            let final_t = current_state.t();
+            self.publisher()?
+                .publish_commit(ctx.branch_id, final_t, &last.commit_id)
+                .await?;
         }
 
         if let Some(guard) = write_guard {
@@ -466,27 +536,6 @@ impl crate::Fluree {
         .await?;
 
         Ok(staged)
-    }
-
-    /// Stage flakes and commit as a replay of the original commit.
-    /// Thin composer: builds the staged replay then drives the local
-    /// apply (write blob + fast-forward-publish via the nameservice).
-    async fn replay_commit(
-        &self,
-        state: LedgerState,
-        flakes: Vec<Flake>,
-        original_commit: &Commit,
-    ) -> Result<LedgerState> {
-        let ledger_id = state.ledger_id().to_string();
-        let staged = self
-            .build_replay_commit(state, flakes, original_commit)
-            .await?;
-
-        let content_store = self.content_store(&ledger_id);
-        let publisher = self.publisher()?;
-        let (_receipt, new_state) = staged.apply(&content_store, publisher, true).await?;
-
-        Ok(new_state)
     }
 
     /// Filter flakes based on the conflict strategy, generating retractions
@@ -613,70 +662,6 @@ impl crate::Fluree {
         Ok(retractions)
     }
 
-    /// Build an inline index for the branch mid-rebase to flush novelty.
-    ///
-    /// Uses `rebuild_index_from_commits_with_store` with a `BranchedContentStore`
-    /// so the indexer can follow the branch's commit chain through parent
-    /// namespaces. Publishes the result to the nameservice, then reloads the
-    /// `LedgerState` so novelty only contains commits since the new index.
-    async fn flush_rebase_novelty(
-        &self,
-        branch_id: &str,
-        branch_record: &fluree_db_nameservice::NsRecord,
-    ) -> Result<LedgerState> {
-        tracing::debug!(
-            branch_id,
-            "building inline index mid-rebase to flush novelty"
-        );
-
-        let branch_store = LedgerState::build_branched_store(
-            &self.nameservice_mode,
-            branch_record,
-            self.backend(),
-        )
-        .await?;
-
-        let record = self
-            .nameservice()
-            .lookup(branch_id)
-            .await?
-            .ok_or_else(|| ApiError::NotFound(branch_id.to_string()))?;
-
-        let mut indexer_config = crate::build_indexer_config(self.config());
-
-        // Seed configured full-text properties from the branch's current
-        // `f:fullTextDefaults`. Best-effort: failures leave the set empty and
-        // fall back to the `@fulltext`-datatype-only path for this rebuild.
-        if let Ok(state) = self.ledger(branch_id).await {
-            // `state.t()` covers the novelty-only case (no prior index) where
-            // `snapshot.t == 0` would drop all novelty flakes from the query.
-            let to_t = state.t();
-            let snapshot = &state.snapshot;
-            let overlay: &dyn fluree_db_core::OverlayProvider = &*state.novelty;
-            if let Ok(Some(cfg)) =
-                crate::config_resolver::resolve_ledger_config(snapshot, overlay, to_t).await
-            {
-                indexer_config.fulltext_configured_properties =
-                    crate::config_resolver::configured_fulltext_properties_for_indexer(&cfg);
-            }
-        }
-
-        let index_result = fluree_db_indexer::rebuild_index_from_commits_with_store(
-            branch_store,
-            branch_id,
-            &record,
-            indexer_config,
-        )
-        .await
-        .map_err(|e| ApiError::internal(format!("Mid-rebase index build failed: {e}")))?;
-
-        self.publisher()?
-            .publish_index(branch_id, index_result.index_t, &index_result.root_id)
-            .await?;
-
-        self.ledger(branch_id).await
-    }
-
     /// Copy index artifacts from source to branch (best-effort).
     async fn copy_source_index(
         &self,
@@ -709,11 +694,18 @@ impl crate::Fluree {
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// Built-but-unwritten replay commit. The build phase accumulates
+/// these; the apply phase writes them to the content store in order
+/// and then advances the branch HEAD to the last one's id.
+struct PendingReplayBlob {
+    commit_id: ContentId,
+    commit_bytes: Vec<u8>,
+}
+
 /// Context for the replay loop, bundling references that would otherwise
 /// require 10+ parameters.
 struct ReplayContext<'a> {
     branch_id: &'a str,
-    branch_record: &'a fluree_db_nameservice::NsRecord,
     source_id: &'a str,
     source_head_id: &'a ContentId,
     source_head_t: i64,
