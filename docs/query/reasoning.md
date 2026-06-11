@@ -278,6 +278,45 @@ The `f:overrideControl` setting on the ledger config determines whether
 query-time overrides are allowed. See
 [Override control](../ledger-config/override-control.md) for details.
 
+## Materialization budget
+
+OWL 2 RL materialization runs under a budget (default: 1,000,000 derived
+facts / 30 seconds). When the closure exceeds the budget it is **capped**:
+the query still answers, but over an incomplete closure — results may be
+missing entailments. A capped run is therefore surfaced, not just logged:
+
+- Tracked responses (`"opts": {"meta": true}` or the `fluree-track-*`
+  headers) carry a top-level `reasoning` block:
+
+  ```json
+  {
+    "status": 200,
+    "result": [...],
+    "reasoning": {
+      "capped": true,
+      "capped_reason": "facts",
+      "derived_facts": 1000000,
+      "iterations": 3,
+      "duration_ms": 12450
+    }
+  }
+  ```
+
+- The same JSON rides the `x-fdb-reasoning` response header.
+- The server logs a WARN per capped materialization.
+
+The budget is configurable at three levels (highest precedence first):
+
+1. **Per query** — JSON-LD `"reasoningBudget": {"maxFacts": 20000000,
+   "maxSeconds": 300}`, or SPARQL `# PRAGMA reasoning-max-facts: 20000000` /
+   `# PRAGMA reasoning-max-seconds: 300`. Subject to the ledger's
+   `f:overrideControl` on `f:reasoningDefaults`.
+2. **Per ledger** — `f:reasoningMaxFacts` / `f:reasoningMaxSeconds` in
+   `f:reasoningDefaults` (see
+   [Setting groups](../ledger-config/setting-groups.md)).
+3. **Server-wide** — `FLUREE_REASONING_MAX_FACTS` /
+   `FLUREE_REASONING_MAX_SECONDS` environment variables.
+
 ## Performance considerations
 
 | Mode | Overhead | Caching |

@@ -109,16 +109,7 @@ mod tests {
     #[test]
     fn test_no_rewriting_when_disabled() {
         let patterns = vec![];
-        let modes = ReasoningModes {
-            rdfs: false,
-            owl2ql: false,
-            owl2rl: false,
-            datalog: false,
-            owl_datalog: false,
-            explicit_none: false,
-            rules: vec![],
-            ontology: None,
-        };
+        let modes = ReasoningModes::default();
 
         let (rewritten, diag) = rewrite_query_patterns(&patterns, None, &modes, None);
         assert_eq!(rewritten.len(), 0);

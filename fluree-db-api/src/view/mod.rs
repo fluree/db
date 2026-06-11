@@ -68,4 +68,4 @@ mod types;
 
 pub use dataset::DataSetDb;
 pub use query_input::QueryInput;
-pub use types::{DerivedFactsHandle, GraphDb, ReasoningModePrecedence};
+pub use types::{ConfigReasoningBudget, DerivedFactsHandle, GraphDb, ReasoningModePrecedence};

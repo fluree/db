@@ -198,39 +198,64 @@ impl<'a, E: IriEncoder> LoweringContext<'a, E> {
     fn reasoning_config(&self) -> Result<ReasoningConfig> {
         use fluree_db_query::ir::ReasoningModes;
 
-        let Some(mode_strs) = &self.ast.pragmas.reasoning else {
+        let mut modes = match &self.ast.pragmas.reasoning {
+            None => ReasoningModes::default(),
+            Some(mode_strs) => {
+                if mode_strs.is_empty() {
+                    return Err(LowerError::invalid_pragma(
+                        "reasoning",
+                        "expected at least one mode: none, rdfs, owl2ql, owl2rl, datalog, owl-datalog",
+                        self.ast.span,
+                    ));
+                }
+                if mode_strs.len() > 1 && mode_strs.iter().any(|m| m.eq_ignore_ascii_case("none")) {
+                    return Err(LowerError::invalid_pragma(
+                        "reasoning",
+                        "'none' cannot be combined with other modes",
+                        self.ast.span,
+                    ));
+                }
+
+                let value = if mode_strs.len() == 1 {
+                    serde_json::Value::String(mode_strs[0].clone())
+                } else {
+                    serde_json::Value::Array(
+                        mode_strs
+                            .iter()
+                            .map(|m| serde_json::Value::String(m.clone()))
+                            .collect(),
+                    )
+                };
+                ReasoningModes::from_json(&value)
+                    .map_err(|e| LowerError::invalid_pragma("reasoning", e, self.ast.span))?
+            }
+        };
+
+        // Budget pragmas don't flip any mode flag — they only take effect
+        // when a reasoning mode runs (from this query or a ledger default).
+        modes.max_facts = self.budget_pragma_value(
+            "reasoning-max-facts",
+            self.ast.pragmas.reasoning_max_facts.as_deref(),
+        )?;
+        modes.max_seconds = self.budget_pragma_value(
+            "reasoning-max-seconds",
+            self.ast.pragmas.reasoning_max_seconds.as_deref(),
+        )?;
+
+        if modes == ReasoningModes::default() {
             return Ok(ReasoningConfig::default());
-        };
-
-        if mode_strs.is_empty() {
-            return Err(LowerError::invalid_pragma(
-                "reasoning",
-                "expected at least one mode: none, rdfs, owl2ql, owl2rl, datalog, owl-datalog",
-                self.ast.span,
-            ));
         }
-        if mode_strs.len() > 1 && mode_strs.iter().any(|m| m.eq_ignore_ascii_case("none")) {
-            return Err(LowerError::invalid_pragma(
-                "reasoning",
-                "'none' cannot be combined with other modes",
-                self.ast.span,
-            ));
-        }
-
-        let value = if mode_strs.len() == 1 {
-            serde_json::Value::String(mode_strs[0].clone())
-        } else {
-            serde_json::Value::Array(
-                mode_strs
-                    .iter()
-                    .map(|m| serde_json::Value::String(m.clone()))
-                    .collect(),
-            )
-        };
-        let modes = ReasoningModes::from_json(&value)
-            .map_err(|e| LowerError::invalid_pragma("reasoning", e, self.ast.span))?;
-
         Ok(ReasoningConfig::new().with_modes(modes))
+    }
+
+    /// Validate a `# PRAGMA reasoning-max-*: <n>` value as a non-negative integer.
+    fn budget_pragma_value(&self, name: &'static str, raw: Option<&str>) -> Result<Option<u64>> {
+        let Some(raw) = raw else {
+            return Ok(None);
+        };
+        raw.parse::<u64>().map(Some).map_err(|_| {
+            LowerError::invalid_pragma(name, "expected a non-negative integer", self.ast.span)
+        })
     }
 
     /// Main entry point for lowering.
@@ -3414,6 +3439,50 @@ mod pragma_tests {
     fn pragma_reasoning_none_combined_errors() {
         let err = lower_query(
             "# PRAGMA reasoning: none, rdfs
+             SELECT * WHERE { ?s ?p ?o }",
+        )
+        .unwrap_err();
+        assert!(matches!(err, LowerError::InvalidPragma { .. }), "{err}");
+    }
+
+    #[test]
+    fn pragma_reasoning_budget_sets_modes() {
+        let query = lower_query(
+            "# PRAGMA reasoning: owl2rl
+             # PRAGMA reasoning-max-facts: 20000000
+             # PRAGMA reasoning-max-seconds: 300
+             SELECT * WHERE { ?s ?p ?o }",
+        )
+        .unwrap();
+        assert!(query.reasoning.modes.owl2rl);
+        assert_eq!(query.reasoning.modes.max_facts, Some(20_000_000));
+        assert_eq!(query.reasoning.modes.max_seconds, Some(300));
+    }
+
+    #[test]
+    fn pragma_reasoning_budget_without_mode_is_carried() {
+        // A budget pragma alone doesn't enable reasoning, but it must survive
+        // lowering so a ledger-config default mode runs under it.
+        let query = lower_query(
+            "# PRAGMA reasoning-max-facts: 5
+             SELECT * WHERE { ?s ?p ?o }",
+        )
+        .unwrap();
+        assert!(!query.reasoning.modes.has_any_enabled());
+        assert_eq!(query.reasoning.modes.max_facts, Some(5));
+    }
+
+    #[test]
+    fn pragma_reasoning_budget_invalid_number_errors() {
+        let err = lower_query(
+            "# PRAGMA reasoning-max-facts: lots
+             SELECT * WHERE { ?s ?p ?o }",
+        )
+        .unwrap_err();
+        assert!(matches!(err, LowerError::InvalidPragma { .. }), "{err}");
+
+        let err = lower_query(
+            "# PRAGMA reasoning-max-seconds:
              SELECT * WHERE { ?s ?p ?o }",
         )
         .unwrap_err();

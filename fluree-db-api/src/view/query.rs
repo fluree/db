@@ -502,10 +502,28 @@ impl Fluree {
             let query_has_reasoning = executable.reasoning.modes.has_any_enabled();
             let query_disabled = executable.reasoning.modes.is_disabled();
 
-            // Apply precedence rules
+            // Apply precedence rules. Mode replacement keeps the query's
+            // budget: wrapper modes come from config mode strings and never
+            // carry one, and whether the query budget survives is decided
+            // below by `ConfigReasoningBudget::apply` (override control),
+            // not by mode precedence.
             if let Some(effective) = db.effective_reasoning(query_has_reasoning, query_disabled) {
+                let (max_facts, max_seconds) = (
+                    executable.reasoning.modes.max_facts,
+                    executable.reasoning.modes.max_seconds,
+                );
                 executable.reasoning.modes = effective.clone();
+                executable.reasoning.modes.max_facts = max_facts;
+                executable.reasoning.modes.max_seconds = max_seconds;
             }
+        }
+
+        // Apply the ledger-config materialization budget. Runs after mode
+        // precedence on purpose: the budget governs whichever modes won
+        // (config defaults or a query override), and override control decides
+        // whether a query-supplied budget survives.
+        if let Some(budget) = db.config_reasoning_budget() {
+            budget.apply(&mut executable.reasoning.modes);
         }
 
         // Enforce config-graph datalog restrictions

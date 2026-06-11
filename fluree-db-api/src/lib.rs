@@ -173,7 +173,7 @@ pub use tx::{
     TransactResultRef,
 };
 pub use tx_builder::{OwnedTransactBuilder, RefTransactBuilder, Staged};
-pub use view::{DataSetDb, GraphDb, QueryInput, ReasoningModePrecedence};
+pub use view::{ConfigReasoningBudget, DataSetDb, GraphDb, QueryInput, ReasoningModePrecedence};
 
 #[cfg(feature = "iceberg")]
 pub use graph_source::{

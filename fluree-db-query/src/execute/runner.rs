@@ -118,6 +118,10 @@ pub struct PreparedExecution {
     pub operator: BoxedOperator,
     /// Derived facts overlay (kept alive during execution)
     pub derived_overlay: Option<Arc<DerivedFactsOverlay>>,
+    /// OWL2-RL materialization diagnostics (when OWL2-RL ran). Recorded into
+    /// the request tracker by [`execute_prepared`] so a capped (incomplete)
+    /// closure surfaces in response metadata.
+    pub reasoning_diagnostics: Option<fluree_db_reasoner::ReasoningDiagnostics>,
 }
 
 /// Inputs that the preparation phase needs to know up front.
@@ -230,14 +234,19 @@ pub async fn prepare_execution_with_config(
             .as_ref()
             .map(|o| o as &dyn fluree_db_core::OverlayProvider)
             .unwrap_or(db.overlay);
-        let (hierarchy, reasoning, derived_overlay, ontology) = async {
+        let (hierarchy, reasoning, derived_outcome, ontology) = async {
             // Reasoning is opt-in: a query (or view/ledger-config default) must
             // explicitly request a mode. Without one, skip reasoning prep
             // entirely — including the schema-hierarchy range scans, which are
             // pure overhead for plain-semantics queries.
             let reasoning = query.reasoning.modes.clone();
             if !reasoning.has_any_enabled() {
-                return Ok::<_, crate::error::QueryError>((None, reasoning, None, None));
+                return Ok::<_, crate::error::QueryError>((
+                    None,
+                    reasoning,
+                    super::reasoning_prep::DerivedFactsOutcome::default(),
+                    None,
+                ));
             }
 
             // Step 1: Compute schema hierarchy from overlay
@@ -260,7 +269,7 @@ pub async fn prepare_execution_with_config(
             // axioms (e.g. `?p a owl:TransitiveProperty`) from the import
             // closure are visible when scanning g_id=0, and base-overlay
             // novelty remains visible for other graphs.
-            let derived_overlay = compute_derived_facts(
+            let derived_outcome = compute_derived_facts(
                 db.snapshot,
                 db.g_id,
                 effective_overlay,
@@ -271,7 +280,8 @@ pub async fn prepare_execution_with_config(
             .await;
 
             // Step 4: Build ontology for OWL2-QL mode (if enabled)
-            let reasoning_overlay_for_ontology: Option<ReasoningOverlay<'_>> = derived_overlay
+            let reasoning_overlay_for_ontology: Option<ReasoningOverlay<'_>> = derived_outcome
+                .overlay
                 .as_ref()
                 .map(|derived| ReasoningOverlay::new(effective_overlay, derived.clone()));
 
@@ -294,7 +304,7 @@ pub async fn prepare_execution_with_config(
                 None
             };
 
-            Ok::<_, crate::error::QueryError>((hierarchy, reasoning, derived_overlay, ontology))
+            Ok::<_, crate::error::QueryError>((hierarchy, reasoning, derived_outcome, ontology))
         }
         .instrument(reasoning_span)
         .await?;
@@ -420,7 +430,8 @@ pub async fn prepare_execution_with_config(
 
         Ok(PreparedExecution {
             operator,
-            derived_overlay,
+            derived_overlay: derived_outcome.overlay,
+            reasoning_diagnostics: derived_outcome.diagnostics,
         })
     }
     .instrument(span)
@@ -612,6 +623,18 @@ pub async fn execute_prepared<'a, 'b>(
     prepared: PreparedExecution,
     config: ContextConfig<'a, 'b>,
 ) -> Result<Vec<Batch>> {
+    // Surface the OWL2-RL materialization outcome in request tracking so a
+    // capped (incomplete) closure is visible to clients, not just in logs.
+    if let (Some(diag), Some(tracker)) = (&prepared.reasoning_diagnostics, config.tracker) {
+        tracker.record_reasoning(fluree_db_core::ReasoningTally {
+            capped: diag.capped,
+            capped_reason: diag.capped_reason.clone(),
+            derived_facts: diag.facts_derived as u64,
+            iterations: diag.iterations as u64,
+            duration_ms: diag.duration.as_millis() as u64,
+        });
+    }
+
     let reasoning_overlay: Option<ReasoningOverlay<'a>> = prepared
         .derived_overlay
         .as_ref()
