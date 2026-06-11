@@ -56,7 +56,7 @@ use crate::{
     TransactionReceipt, TransactionRequest,
 };
 use async_trait::async_trait;
-use fluree_db_api::{ConflictStrategy, Fluree, StagedRevert, GuardedStagedCommit};
+use fluree_db_api::{ConflictStrategy, Fluree, GuardedStagedCommit, StagedMerge, StagedRevert};
 use fluree_db_core::{CommitId, ContentStore};
 use fluree_db_ledger::IndexConfig;
 use openraft::{BasicNode, Raft};
@@ -483,8 +483,175 @@ impl Committer for RaftCommitter {
         }
     }
 
-    async fn merge(&self, _request: MergeRequest) -> Result<MergeReceipt, SubmissionError> {
-        todo!("RaftCommitter::merge — pending merge/rebase/revert dry-run terminals")
+    async fn merge(&self, request: MergeRequest) -> Result<MergeReceipt, SubmissionError> {
+        let MergeRequest {
+            idempotency_key,
+            ledger_name,
+            source_branch,
+            target_branch,
+            strategy,
+        } = request;
+
+        // 1. Build the staged merge. Source/target resolution,
+        //    common-ancestor calculation, fast-forward dispatch, and
+        //    (for general merges) the merge-commit construction all
+        //    live inside `prepare_merge`. The build phase already
+        //    copied source commits into the target namespace.
+        let StagedMerge {
+            target,
+            source,
+            target_id,
+            source_id: _,
+            source_ledger_id: _,
+            fast_forward,
+            conflict_count,
+            strategy: staged_strategy,
+            commits_copied,
+            rollback_snapshot: _,
+            current_head_t: _,
+            current_head_id,
+            new_head_t,
+            new_head_id,
+            commit,
+            source_index_for_publish: _,
+        } = self
+            .fluree
+            .prepare_merge(
+                &ledger_name,
+                &source_branch,
+                target_branch.as_deref(),
+                strategy,
+            )
+            .await
+            .map_err(execution_failure)?;
+
+        // 2. Write any new commit blob (general merge) to the shared
+        //    content store. Fast-forward has no new commit body — the
+        //    source's commits are already in the target namespace
+        //    from the build phase.
+        let (write_guard, staged_for_finalize) = match commit {
+            Some(GuardedStagedCommit {
+                write_guard,
+                staged,
+            }) => {
+                let commit_cid = staged
+                    .commit
+                    .id
+                    .clone()
+                    .expect("build_merge_general guarantees commit.id is set");
+                self.content_store
+                    .put_with_id(&commit_cid, &staged.commit_bytes)
+                    .await
+                    .map_err(|e| SubmissionError::Execution {
+                        status: 500,
+                        message: format!("merge commit blob write failed: {e}"),
+                    })?;
+                for (cid, bytes) in &staged.referenced_bytes {
+                    self.content_store
+                        .put_with_id(cid, bytes)
+                        .await
+                        .map_err(|e| SubmissionError::Execution {
+                            status: 500,
+                            message: format!("merge referenced blob write failed: {e}"),
+                        })?;
+                }
+                (write_guard, Some(staged))
+            }
+            None => (None, None),
+        };
+
+        // 3. Materialize idempotency context (consensus-side only).
+        let idempotency_ctx = idempotency_key.as_ref().map(|key| SmIdempotencyContext {
+            key: IdempotencyCacheKey::new(target_id.clone(), key.clone()),
+            body_hash: merge_body_hash(&source, &target, fast_forward, staged_strategy.as_ref()),
+        });
+
+        // 4. Construct the AdvanceRef proposal. expected_prev is the
+        //    target's pre-merge head (None if the target was empty).
+        let applied_at_millis = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let cmd = SmCommand::AdvanceRef(AdvanceRefArgs {
+            ledger_id: ledger_name,
+            branch: target.clone(),
+            expected_prev: current_head_id,
+            new_head: new_head_id.clone(),
+            t: new_head_t,
+            applied_at_millis,
+            idempotency: idempotency_ctx,
+            release: Vec::<ExecutionRecordRef>::new(),
+            tally: None,
+        });
+
+        // 5. Propose through Raft, await quorum.
+        let resp =
+            self.raft
+                .client_write(cmd)
+                .await
+                .map_err(|e| SubmissionError::Execution {
+                    status: 500,
+                    message: format!("raft client_write failed: {e}"),
+                })?;
+
+        // 6. Translate Response → MergeReceipt; on Applied, derive
+        //    the post-commit LedgerState (general merge only) and
+        //    install it through the held write guard before drop.
+        let request_strategy = strategy;
+        match resp.data {
+            SmResponse::Applied {
+                head_t,
+                head_id,
+                accepted: _,
+                release: _,
+                tally: _,
+            } => {
+                if let Some(staged) = staged_for_finalize {
+                    let (_receipt, new_state) =
+                        staged.finalize_state().map_err(|e| SubmissionError::Execution {
+                            status: 500,
+                            message: format!("merge finalize_state failed: {e}"),
+                        })?;
+                    if let Some(guard) = write_guard {
+                        let needs_reindex = new_state.should_reindex(&self.index_config);
+                        self.fluree
+                            .finalize_commit(guard, new_state, head_t, needs_reindex)
+                            .await
+                            .map_err(execution_failure)?;
+                    }
+                }
+                Ok(MergeReceipt {
+                    idempotency_key,
+                    source,
+                    target,
+                    fast_forward,
+                    new_head_t: head_t,
+                    new_head_id: head_id,
+                    commits_copied,
+                    conflict_count,
+                    strategy: request_strategy,
+                })
+            }
+            SmResponse::Conflict {
+                current_head: _,
+                current_t: _,
+            } => Err(SubmissionError::Execution {
+                status: 409,
+                message: "raft CAS conflict on AdvanceRef for merge".into(),
+            }),
+            SmResponse::BodyHashMismatch => Err(SubmissionError::KeyCollision),
+            SmResponse::LedgerNotFound { ledger_id } => Err(SubmissionError::Execution {
+                status: 404,
+                message: format!("ledger not found: {ledger_id}"),
+            }),
+            SmResponse::Created { .. }
+            | SmResponse::Deleted { .. }
+            | SmResponse::AlreadyExists { .. }
+            | SmResponse::NoOp => Err(SubmissionError::Execution {
+                status: 500,
+                message: "unexpected Response variant for AdvanceRef".into(),
+            }),
+        }
     }
 
     async fn rebase(&self, _request: RebaseRequest) -> Result<RebaseReceipt, SubmissionError> {
@@ -494,6 +661,37 @@ impl Committer for RaftCommitter {
     async fn push(&self, _request: PushRequest) -> Result<PushReceipt, SubmissionError> {
         todo!("RaftCommitter::push — pending push dry-run terminal")
     }
+}
+
+/// Body hash for merge idempotency. Domain-tagged so a key reused
+/// across operation kinds is a collision rather than a cross-shape
+/// dedup. Inputs are the validated request fields the state machine
+/// can verify on retry: source + resolved-target branch names, the
+/// fast-forward bit, and the conflict strategy (`None` on
+/// fast-forward).
+fn merge_body_hash(
+    source: &str,
+    target: &str,
+    fast_forward: bool,
+    strategy: Option<&ConflictStrategy>,
+) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(b"merge");
+    hasher.update(source.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(target.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(if fast_forward {
+        b"ff".as_slice()
+    } else {
+        b"general".as_slice()
+    });
+    hasher.update(b"\0");
+    if let Some(s) = strategy {
+        hasher.update(s.as_str().as_bytes());
+    }
+    hasher.finalize().into()
 }
 
 /// Body hash for revert idempotency: domain-tagged so an

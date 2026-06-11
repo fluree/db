@@ -148,7 +148,7 @@ pub use ledger_manager::{
     UpdatePlan,
 };
 pub use ledger_view::{CommitRef, LedgerView};
-pub use merge::MergeReport;
+pub use merge::{MergeReport, StagedMerge};
 pub use merge_preview::{
     AncestorRef, BranchDelta, ConflictDetail, ConflictResolutionPreview, ConflictSummary,
     MergePreview, MergePreviewOpts,
