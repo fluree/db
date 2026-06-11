@@ -216,3 +216,193 @@ async fn run_query(
     let jsonld = result.to_jsonld(&view.snapshot).expect("to_jsonld");
     normalize_rows(&jsonld)
 }
+
+/// Differential test for the shared probe helpers under novelty: the EXISTS
+/// lane, single and grouped OPTIONAL, and the property-join SPOT star walk —
+/// all converted from the overlay-free bail to the per-subject ops merge.
+#[tokio::test]
+async fn probe_helpers_merge_novelty() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/probe-helpers-overlay:main";
+    let ledger = genesis_ledger_for_fluree(&fluree, ledger_id);
+
+    let base = json!({
+        "@context": ctx(),
+        "@graph": [
+            {"@id": "ex:alice", "ex:knows": {"@id": "ex:bob"}},
+            {"@id": "ex:carol", "ex:knows": {"@id": "ex:dave"}},
+            {"@id": "ex:eve",   "ex:knows": {"@id": "ex:frank"}},
+            {"@id": "ex:bob",   "ex:age": 25, "ex:name": "Bob", "ex:city": "Berlin"},
+            {"@id": "ex:dave",  "ex:age": 30, "ex:name": "Dave", "ex:city": "Lyon"},
+            {"@id": "ex:frank", "ex:age": 40, "ex:name": "Frank", "ex:city": "Oslo"},
+            {"@id": "ex:lonely", "ex:age": 99}
+        ]
+    });
+    let receipt = fluree.insert(ledger, &base).await.expect("base insert");
+    fluree
+        .reindex(ledger_id, ReindexOptions::default())
+        .await
+        .expect("reindex base");
+
+    // Novelty tail: dave loses his age (name survives), frank's age is
+    // retracted + re-asserted, bob gains a second age, grace exists only in
+    // novelty (knows edge + age + name).
+    let receipt = fluree
+        .update(
+            receipt.ledger,
+            &json!({
+                "@context": ctx(),
+                "where":  {"@id": "ex:dave", "ex:age": "?a"},
+                "delete": {"@id": "ex:dave", "ex:age": "?a"}
+            }),
+        )
+        .await
+        .expect("retract dave age");
+    let receipt = fluree
+        .update(
+            receipt.ledger,
+            &json!({
+                "@context": ctx(),
+                "where":  {"@id": "ex:frank", "ex:age": "?a"},
+                "delete": {"@id": "ex:frank", "ex:age": "?a"}
+            }),
+        )
+        .await
+        .expect("retract frank age");
+    let receipt = fluree
+        .insert(
+            receipt.ledger,
+            &json!({"@context": ctx(), "@id": "ex:frank", "ex:age": 40}),
+        )
+        .await
+        .expect("re-assert frank age");
+    let _receipt = fluree
+        .insert(
+            receipt.ledger,
+            &json!({
+                "@context": ctx(),
+                "@graph": [
+                    {"@id": "ex:bob", "ex:age": 26},
+                    {"@id": "ex:alice", "ex:knows": {"@id": "ex:grace"}},
+                    {"@id": "ex:grace", "ex:age": 35, "ex:name": "Grace", "ex:city": "Quito"}
+                ]
+            }),
+        )
+        .await
+        .expect("novelty asserts");
+
+    // (name, query, expected row count, engagement)
+    enum Engage {
+        ExistsFlush,
+        NoGroupedFallback,
+        PropertyJoinFast,
+        DifferentialOnly,
+    }
+    let queries: &[(&str, &str, usize, Engage)] = &[
+        (
+            "exists-injected-age",
+            r"PREFIX ex: <http://example.org/ns/>
+              SELECT ?b WHERE { ex:alice ex:knows ?b . ?b ex:age 26 } ORDER BY ?b",
+            1, // bob: his 26 exists only in novelty
+            Engage::ExistsFlush,
+        ),
+        (
+            "exists-retracted-age",
+            r"PREFIX ex: <http://example.org/ns/>
+              SELECT ?b WHERE { ex:carol ex:knows ?b . ?b ex:age 30 } ORDER BY ?b",
+            0, // dave's 30 was novelty-retracted
+            Engage::ExistsFlush,
+        ),
+        (
+            "optional-retracted-row-survives",
+            r"PREFIX ex: <http://example.org/ns/>
+              SELECT ?b ?v WHERE { ex:carol ex:knows ?b . OPTIONAL { ?b ex:age ?v } }
+              ORDER BY ?b ?v",
+            1, // dave row stays with ?v unbound — never dropped
+            Engage::DifferentialOnly,
+        ),
+        (
+            "optional-injected",
+            r"PREFIX ex: <http://example.org/ns/>
+              SELECT ?b ?v WHERE { ex:alice ex:knows ?b . OPTIONAL { ?b ex:age ?v } }
+              ORDER BY ?b ?v",
+            3, // bob 25 + 26 (injected), grace 35 (novelty-only subject)
+            Engage::DifferentialOnly,
+        ),
+        (
+            "grouped-optional",
+            r"PREFIX ex: <http://example.org/ns/>
+              SELECT ?b ?v ?n
+              WHERE { ex:alice ex:knows ?b . OPTIONAL { ?b ex:age ?v . ?b ex:name ?n } }
+              ORDER BY ?b ?v ?n",
+            3, // bob (25,Bob) + (26,Bob), grace (35,Grace)
+            Engage::NoGroupedFallback,
+        ),
+        (
+            // The bound object anchors the star on PropertyJoinOperator
+            // (pure variable-object stars stay on the sequential join chain).
+            "property-join-star",
+            r#"PREFIX ex: <http://example.org/ns/>
+              SELECT ?s ?v ?n
+              WHERE { ?s ex:city "Quito" . ?s ex:age ?v . ?s ex:name ?n }
+              ORDER BY ?s ?v ?n"#,
+            1, // grace — city/age/name are all novelty-only
+            Engage::PropertyJoinFast,
+        ),
+    ];
+
+    let view = fluree.db(ledger_id).await.expect("novelty view");
+    let mut novelty_results = Vec::new();
+    for (name, query, expected_len, engage) in queries {
+        let (spans, guard) = span_capture::init_test_tracing();
+        let rows = run_query(&fluree, &view, query).await;
+        drop(guard);
+        assert_eq!(
+            rows.len(),
+            *expected_len,
+            "{name}: row count under novelty; got {rows:?}"
+        );
+        match engage {
+            Engage::ExistsFlush => {
+                assert!(
+                    spans.has_span("join_flush_batched_exists_binary"),
+                    "{name}: exists lane should engage under novelty; spans: {:?}",
+                    spans.span_names()
+                );
+            }
+            Engage::NoGroupedFallback => {
+                assert!(
+                    !spans.has_event("grouped optional builder fallback"),
+                    "{name}: grouped optional should stay batched under novelty"
+                );
+            }
+            Engage::PropertyJoinFast => {
+                let opens = spans.find_events("property_join: open complete");
+                assert!(
+                    opens.iter().any(|e| {
+                        e.fields.get("used_spot_star_walk").map(String::as_str) == Some("true")
+                            || e.fields.get("used_batched_probe").map(String::as_str)
+                                == Some("true")
+                    }),
+                    "{name}: property join should use a batched walk/probe under \
+                     novelty; events: {opens:?}"
+                );
+            }
+            Engage::DifferentialOnly => {}
+        }
+        novelty_results.push(rows);
+    }
+
+    fluree
+        .reindex(ledger_id, ReindexOptions::default())
+        .await
+        .expect("reindex ground truth");
+    let view = fluree.db(ledger_id).await.expect("indexed view");
+    for ((name, query, _, _), novelty_rows) in queries.iter().zip(&novelty_results) {
+        let indexed_rows = run_query(&fluree, &view, query).await;
+        assert_eq!(
+            &indexed_rows, novelty_rows,
+            "{name}: novelty-merged probe helpers != reindexed ground truth"
+        );
+    }
+}

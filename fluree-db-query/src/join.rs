@@ -9,7 +9,7 @@ use crate::binding::{Batch, Binding, RowAccess};
 use crate::context::ExecutionContext;
 use crate::dataset::ActiveGraphs;
 use crate::error::{QueryError, Result};
-use crate::fast_path_common::{ProbeOps, RowFate, SharedOverlayOps};
+use crate::fast_path_common::{subject_probe_lane_plan, ProbeLanePlan, ProbeOps, RowFate};
 use crate::ir::triple::{Ref, Term, TriplePattern};
 use crate::object_binding::{late_materialized_object_binding, materialized_object_binding};
 use crate::operator::inline::{apply_inline, extend_schema, InlineOperator};
@@ -387,24 +387,6 @@ fn is_batched_subject_exists_eligible(
 /// When a shared variable is `Unbound` on the left (e.g., from VALUES with UNDEF),
 /// `combine_rows` falls back to the right-side value so the concrete binding
 /// propagates through the join.
-/// How the batched lanes handle the active overlay. Recomputed at the top of
-/// every `next_batch` call (cheap: the ops fetch hits the per-execution
-/// cache after the first call).
-#[derive(Clone, Default)]
-enum BatchedOverlayMode {
-    /// No novelty on the active graph — batched lanes read base leaflets as-is.
-    #[default]
-    Free,
-    /// Single-graph novelty, subject-probe lane only: merge these resolved
-    /// PSOT ops per probed subject during each flush. May be empty (novelty
-    /// exists but none of it touches the batched predicate).
-    Merge(SharedOverlayOps),
-    /// Overlay present but unmergeable (multi-graph, object/exists lanes,
-    /// translation failure, novelty-only predicate, missing PSOT branch) —
-    /// fall back to per-row scans, whose cursor merges the overlay.
-    PerRow,
-}
-
 pub struct NestedLoopJoinOperator {
     /// Left (driving) operator
     left: Box<dyn Operator>,
@@ -459,8 +441,12 @@ pub struct NestedLoopJoinOperator {
     object_left_col: Option<usize>,
     /// The fixed predicate SID (batched mode)
     batched_predicate: Option<Sid>,
-    /// Overlay handling decision for the batched lanes (see [`BatchedOverlayMode`]).
-    batched_overlay_mode: BatchedOverlayMode,
+    /// Overlay handling decision for the batched lanes, recomputed at the
+    /// top of every `next_batch` call (cheap: the ops fetch hits the
+    /// per-execution cache after the first call). The subject-probe and
+    /// exists lanes merge under `Merge`; the object (OPST) lane requires
+    /// `Clean`.
+    batched_overlay_mode: ProbeLanePlan,
     /// Accumulated entries for batched processing: (stored_batch_idx, row_idx, subject_s_id)
     /// Stores the raw s_id directly to avoid dictionary round-trips with EncodedSid.
     batched_accumulator: Vec<(usize, usize, u64)>,
@@ -744,7 +730,7 @@ impl NestedLoopJoinOperator {
             subject_left_col,
             object_left_col,
             batched_predicate,
-            batched_overlay_mode: BatchedOverlayMode::default(),
+            batched_overlay_mode: ProbeLanePlan::Clean,
             batched_accumulator: Vec::new(),
             stored_left_batches: Vec::new(),
             batched_output: VecDeque::new(),
@@ -1172,7 +1158,7 @@ impl Operator for NestedLoopJoinOperator {
         self.batched_overlay_mode = self.compute_batched_overlay_mode(ctx)?;
         let use_batched = (self.batched_eligible || self.batched_object_eligible || self.batched_exists_eligible)
                 && ctx.binary_store.is_some()
-                && !matches!(self.batched_overlay_mode, BatchedOverlayMode::PerRow)
+                && !matches!(self.batched_overlay_mode, ProbeLanePlan::Decline)
                 // The batched path reads binary leaves directly and works in
                 // `EncodedSid` space (it even emits `EncodedSid` for newly-bound
                 // subject vars). Whenever eager materialization is required —
@@ -1589,56 +1575,24 @@ impl NestedLoopJoinOperator {
 
     /// Decide how the batched lanes handle the active overlay this call.
     ///
-    /// Decline cases route to the overlay-correct per-row fallback BEFORE any
-    /// accumulation, so a flush never has to reroute mid-stream: translation
-    /// failure, a predicate that exists only in novelty (no base `p_id` to
-    /// scan), and a graph whose PSOT branch is absent while novelty exists
-    /// (novelty-only graph) would all silently drop or duplicate rows if the
-    /// batched scan ran.
-    fn compute_batched_overlay_mode(
-        &self,
-        ctx: &ExecutionContext<'_>,
-    ) -> Result<BatchedOverlayMode> {
-        use crate::fast_path_common::cached_overlay_ops;
-        use fluree_db_binary_index::RunSortOrder;
+    /// The subject-probe and exists lanes merge overlay ops per probed
+    /// subject; the object (OPST) lane still requires an overlay-free graph
+    /// (v1). Decline cases route to the overlay-correct per-row fallback
+    /// BEFORE any accumulation, so a flush never reroutes mid-stream.
+    fn compute_batched_overlay_mode(&self, ctx: &ExecutionContext<'_>) -> Result<ProbeLanePlan> {
         if ctx.overlay_free_single_graph() {
-            return Ok(BatchedOverlayMode::Free);
+            return Ok(ProbeLanePlan::Clean);
         }
-        // Only the subject-probe lane merges overlay ops (v1).
-        if !self.batched_eligible || self.batched_object_eligible || self.batched_exists_eligible {
-            return Ok(BatchedOverlayMode::PerRow);
-        }
-        if !matches!(ctx.active_graphs(), ActiveGraphs::Single) {
-            return Ok(BatchedOverlayMode::PerRow);
+        if self.batched_object_eligible || !(self.batched_eligible || self.batched_exists_eligible)
+        {
+            return Ok(ProbeLanePlan::Decline);
         }
         let (Some(store), Some(pred)) =
             (ctx.binary_store.as_ref(), self.batched_predicate.as_ref())
         else {
-            return Ok(BatchedOverlayMode::PerRow);
+            return Ok(ProbeLanePlan::Decline);
         };
-        let Some(ops) = cached_overlay_ops(ctx, store, ctx.binary_g_id, RunSortOrder::Psot, pred)?
-        else {
-            tracing::debug!("batched join: overlay flake translation failed; using per-row scans");
-            return Ok(BatchedOverlayMode::PerRow);
-        };
-        if !ops.is_empty() {
-            if store.sid_to_p_id(pred).is_none() {
-                tracing::debug!(
-                    "batched join: predicate exists only in novelty; using per-row scans"
-                );
-                return Ok(BatchedOverlayMode::PerRow);
-            }
-            if store
-                .branch_for_order(ctx.binary_g_id, RunSortOrder::Psot)
-                .is_none()
-            {
-                tracing::debug!(
-                    "batched join: PSOT branch absent with novelty present; using per-row scans"
-                );
-                return Ok(BatchedOverlayMode::PerRow);
-            }
-        }
-        Ok(BatchedOverlayMode::Merge(ops))
+        subject_probe_lane_plan(ctx, store, pred)
     }
 
     /// Phase 1: Resolve the batched predicate SID to a binary-index p_id.
@@ -1893,7 +1847,7 @@ impl NestedLoopJoinOperator {
                         let o_key_val = batch.o_key.get(row);
                         if let (Some(probe), Some(win)) = (probe_ops.as_mut(), &probe_window) {
                             let o_i_val = batch.o_i.get_or(row, u32::MAX);
-                            if probe.base_row_fate(win, o_type_val, o_key_val, o_i_val)
+                            if probe.base_row_fate(win, p_id, o_type_val, o_key_val, o_i_val)
                                 == RowFate::Drop
                             {
                                 continue;
@@ -2383,7 +2337,7 @@ impl NestedLoopJoinOperator {
         // One reconciler per flush: probed keys recur across flushes with new
         // left rows, so consumed-state must not outlive this flush.
         let mut probe_ops = match &self.batched_overlay_mode {
-            BatchedOverlayMode::Merge(ops) => ProbeOps::new(ops.clone(), p_id),
+            ProbeLanePlan::Merge(ops) => ProbeOps::new(ops.clone()),
             _ => None,
         };
 
@@ -2899,6 +2853,14 @@ impl NestedLoopJoinOperator {
             return Ok(());
         }
 
+        // One reconciler per flush (see `flush_batched_accumulator_binary`).
+        let mut probe_ops = match &self.batched_overlay_mode {
+            ProbeLanePlan::Merge(ops) => ProbeOps::new(ops.clone()),
+            _ => None,
+        };
+        // Needed to decode novelty-minted object values for the bound-object
+        // filter on injected asserts.
+        let dict_overlay = make_dict_overlay(ctx, &store);
         let probe_matches = batched_subject_probe_binary(
             ctx,
             &store,
@@ -2911,9 +2873,17 @@ impl NestedLoopJoinOperator {
                 object_bounds: None,
                 bound_object: Some(&self.right_pattern.o),
                 emit_object: false,
-                dict_overlay: None,
+                dict_overlay: dict_overlay.as_ref(),
             },
+            probe_ops.as_mut(),
         )?;
+        if let Some(probe) = &probe_ops {
+            tracing::debug!(
+                dropped_rows = probe.dropped_rows,
+                injected_rows = probe.injected_rows,
+                "join batched existence flush merged novelty overlay"
+            );
+        }
 
         let accum_len = self.batched_accumulator.len();
         let mut scatter: Vec<Vec<Vec<Binding>>> = vec![Vec::new(); accum_len];
@@ -3034,6 +3004,49 @@ fn build_probe_object_binding(
     ))
 }
 
+/// Decode an object value for filter evaluation (bounds / bound-object) on
+/// an injected novelty assert. Novelty-minted subject and string ids resolve
+/// through `dict_overlay` (which falls back to the base dictionaries for
+/// indexed ids); everything else decodes from the store, mirroring
+/// `build_probe_object_binding`.
+fn decode_probe_filter_value(
+    ctx: &ExecutionContext<'_>,
+    store: &BinaryIndexStore,
+    dict_overlay: Option<&crate::dict_overlay::DictOverlay>,
+    p_id: u32,
+    o_type: u16,
+    o_key: u64,
+) -> Result<fluree_db_core::FlakeValue> {
+    use fluree_db_core::o_type::{DecodeKind, OType};
+    Ok(
+        match (OType::from_u16(o_type).decode_kind(), dict_overlay) {
+            (DecodeKind::IriRef, Some(ov)) => {
+                let iri = ov.resolve_subject_iri(o_key).map_err(|e| {
+                    QueryError::Internal(format!("resolve_subject_iri (probe filter): {e}"))
+                })?;
+                fluree_db_core::FlakeValue::Ref(store.encode_iri(&iri))
+            }
+            (DecodeKind::StringDict, Some(ov)) => {
+                let s = ov.resolve_string_value(o_key as u32).map_err(|e| {
+                    QueryError::Internal(format!("resolve_string_value (probe filter): {e}"))
+                })?;
+                fluree_db_core::FlakeValue::String(s)
+            }
+            (DecodeKind::JsonArena, Some(ov)) => {
+                let s = ov.resolve_string_value(o_key as u32).map_err(|e| {
+                    QueryError::Internal(format!("resolve_string_value (probe filter json): {e}"))
+                })?;
+                fluree_db_core::FlakeValue::Json(s)
+            }
+            _ => store
+                .decode_value_v3(o_type, o_key, p_id, ctx.binary_g_id)
+                .map_err(|e| {
+                    QueryError::Internal(format!("decode_value_v3 (probe filter): {e}"))
+                })?,
+        },
+    )
+}
+
 /// Bundled parameters for [`batched_subject_probe_binary`].
 pub(crate) struct SubjectProbeParams<'a> {
     pub pred_sid: &'a Sid,
@@ -3048,6 +3061,7 @@ pub(crate) fn batched_subject_probe_binary(
     ctx: &ExecutionContext<'_>,
     store: &Arc<BinaryIndexStore>,
     params: &SubjectProbeParams<'_>,
+    mut probe_ops: Option<&mut ProbeOps>,
 ) -> Result<Vec<BatchedSubjectProbeMatch>> {
     use fluree_db_binary_index::format::run_record_v2::{cmp_v2_for_order, RunRecordV2};
     use fluree_db_binary_index::read::column_loader::load_leaflet_columns_cached;
@@ -3058,9 +3072,19 @@ pub(crate) fn batched_subject_probe_binary(
     }
 
     let Some(p_id) = store.sid_to_p_id(params.pred_sid) else {
+        // Empty only when no overlay merge is in play — the lane plan
+        // declines novelty-only predicates before reaching here.
+        debug_assert!(
+            probe_ops.is_none(),
+            "lane plan must decline novelty-only predicates"
+        );
         return Ok(Vec::new());
     };
     let Some(branch) = store.branch_for_order(ctx.binary_g_id, RunSortOrder::Psot) else {
+        debug_assert!(
+            probe_ops.is_none(),
+            "lane plan must decline branchless graphs"
+        );
         return Ok(Vec::new());
     };
 
@@ -3194,12 +3218,24 @@ pub(crate) fn batched_subject_probe_binary(
                 if row_start == row_end {
                     continue;
                 }
+                let probe_window = probe_ops
+                    .as_ref()
+                    .map(|p| p.subject_window(s_id))
+                    .filter(|w| !w.is_empty());
 
                 for row in row_start..row_end {
                     let o_type_val = entry
                         .o_type_const
                         .unwrap_or_else(|| batch.o_type.get_or(row, 0));
                     let o_key_val = batch.o_key.get(row);
+                    if let (Some(probe), Some(win)) = (probe_ops.as_mut(), &probe_window) {
+                        let o_i_val = batch.o_i.get_or(row, u32::MAX);
+                        if probe.base_row_fate(win, p_id, o_type_val, o_key_val, o_i_val)
+                            == RowFate::Drop
+                        {
+                            continue;
+                        }
+                    }
 
                     if params.object_bounds.is_some() || params.bound_object.is_some() {
                         let decoded = store
@@ -3245,6 +3281,54 @@ pub(crate) fn batched_subject_probe_binary(
         }
     }
 
+    // Inject novelty-only matches: unconsumed asserts for probed subjects,
+    // through the same filters as base rows.
+    if let Some(probe) = probe_ops {
+        for &s_id in &unique_s_ids {
+            probe.drain_asserts_for_subject(s_id, |op| {
+                if params.object_bounds.is_some() || params.bound_object.is_some() {
+                    let decoded = decode_probe_filter_value(
+                        ctx,
+                        store,
+                        params.dict_overlay,
+                        p_id,
+                        op.o_type,
+                        op.o_key,
+                    )?;
+                    if let Some(bounds) = params.object_bounds {
+                        if !bounds.matches(&decoded) {
+                            return Ok(());
+                        }
+                    }
+                    if let Some(term) = params.bound_object {
+                        if !term_matches_probe_value(store, term, &decoded) {
+                            return Ok(());
+                        }
+                    }
+                }
+                let object = if params.emit_object {
+                    Some(build_probe_object_binding(
+                        ctx,
+                        store,
+                        params.dict_overlay,
+                        p_id,
+                        op.o_type,
+                        op.o_key,
+                        op.o_i,
+                        op.t,
+                    )?)
+                } else {
+                    None
+                };
+                out.push(BatchedSubjectProbeMatch {
+                    subject_id: s_id,
+                    object,
+                });
+                Ok(())
+            })?;
+        }
+    }
+
     Ok(out)
 }
 
@@ -3254,6 +3338,7 @@ pub(crate) fn batched_subject_star_spot(
     subject_ids: &[u64],
     predicates: &[SpotStarPredicateParams<'_>],
     dict_overlay: Option<&crate::dict_overlay::DictOverlay>,
+    mut probe_ops: Option<&mut ProbeOps>,
 ) -> Result<Vec<BatchedSpotStarMatch>> {
     use fluree_db_binary_index::format::run_record_v2::{cmp_v2_for_order, RunRecordV2};
     use fluree_db_binary_index::read::column_loader::load_leaflet_columns_cached;
@@ -3272,10 +3357,18 @@ pub(crate) fn batched_subject_star_spot(
         predicates_by_id.insert(p_id, predicate);
     }
     if predicates_by_id.is_empty() {
+        debug_assert!(
+            probe_ops.is_none(),
+            "lane plan must decline novelty-only predicates"
+        );
         return Ok(Vec::new());
     }
 
     let Some(branch) = store.branch_for_order(ctx.binary_g_id, RunSortOrder::Spot) else {
+        debug_assert!(
+            probe_ops.is_none(),
+            "lane plan must decline branchless graphs"
+        );
         return Ok(Vec::new());
     };
 
@@ -3312,6 +3405,7 @@ pub(crate) fn batched_subject_star_spot(
     let mut out = Vec::new();
 
     for leaf_idx in leaf_range {
+        ctx.check_cancelled()?;
         let leaf_entry = &branch.leaves[leaf_idx];
         let LeafScan {
             leaf_bytes,
@@ -3395,6 +3489,10 @@ pub(crate) fn batched_subject_star_spot(
                 if row_start == row_end {
                     continue;
                 }
+                let probe_window = probe_ops
+                    .as_ref()
+                    .map(|p| p.subject_window(s_id))
+                    .filter(|w| !w.is_empty());
 
                 for row in row_start..row_end {
                     let p_id = entry.p_const.unwrap_or_else(|| batch.p_id.get_or(row, 0));
@@ -3406,6 +3504,14 @@ pub(crate) fn batched_subject_star_spot(
                         .o_type_const
                         .unwrap_or_else(|| batch.o_type.get_or(row, 0));
                     let o_key_val = batch.o_key.get(row);
+                    if let (Some(probe), Some(win)) = (probe_ops.as_mut(), &probe_window) {
+                        let o_i_val = batch.o_i.get_or(row, u32::MAX);
+                        if probe.base_row_fate(win, p_id, o_type_val, o_key_val, o_i_val)
+                            == RowFate::Drop
+                        {
+                            continue;
+                        }
+                    }
 
                     if predicate.object_bounds.is_some() || predicate.bound_object.is_some() {
                         let decoded = store
@@ -3449,6 +3555,58 @@ pub(crate) fn batched_subject_star_spot(
                     });
                 }
             }
+        }
+    }
+
+    // Inject novelty-only matches per probed subject, dispatching each assert
+    // to its predicate's filters and emit shape.
+    if let Some(probe) = probe_ops {
+        for &s_id in &unique_s_ids {
+            probe.drain_asserts_for_subject(s_id, |op| {
+                let Some(predicate) = predicates_by_id.get(&op.p_id).copied() else {
+                    return Ok(());
+                };
+                if predicate.object_bounds.is_some() || predicate.bound_object.is_some() {
+                    let decoded = decode_probe_filter_value(
+                        ctx,
+                        store,
+                        dict_overlay,
+                        op.p_id,
+                        op.o_type,
+                        op.o_key,
+                    )?;
+                    if let Some(bounds) = predicate.object_bounds {
+                        if !bounds.matches(&decoded) {
+                            return Ok(());
+                        }
+                    }
+                    if let Some(term) = predicate.bound_object {
+                        if !term_matches_probe_value(store, term, &decoded) {
+                            return Ok(());
+                        }
+                    }
+                }
+                let object = if predicate.emit_object {
+                    Some(build_probe_object_binding(
+                        ctx,
+                        store,
+                        dict_overlay,
+                        op.p_id,
+                        op.o_type,
+                        op.o_key,
+                        op.o_i,
+                        op.t,
+                    )?)
+                } else {
+                    None
+                };
+                out.push(BatchedSpotStarMatch {
+                    subject_id: s_id,
+                    predicate_idx: predicate.predicate_idx,
+                    object,
+                });
+                Ok(())
+            })?;
         }
     }
 

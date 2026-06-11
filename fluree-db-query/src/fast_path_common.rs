@@ -2136,8 +2136,8 @@ pub enum RowFate {
     Drop,
 }
 
-/// Per-flush reconciler merging a single predicate's resolved overlay ops into
-/// a batched leaflet-probe scan (the "strategy (b)" merge for probe lanes that
+/// Per-flush reconciler merging resolved overlay ops into a batched
+/// leaflet-probe scan (the "strategy (b)" merge for probe lanes that
 /// read base leaflets directly instead of going through `BinaryCursor`).
 ///
 /// Mirrors `merge_overlay_into_batch`'s case analysis for set-of-matches
@@ -2149,7 +2149,13 @@ pub enum RowFate {
 /// because `resolve_overlay_ops` guarantees at most one op per fact key and
 /// probe consumers are emission-order-insensitive.
 ///
-/// **Scope: one instance per flush.** Probed keys legitimately recur across
+/// Identity is the full `(p_id, o_type, o_key, o_i)` within a subject, so one
+/// reconciler serves both the single-predicate PSOT probes (p constant) and
+/// the multi-predicate SPOT star probes (ops merged across the star's
+/// predicates): both sort by `(s_id, p_id, o_type, o_key, o_i)`.
+///
+/// **Scope: one instance per flush** (one probe call, or one predicate's
+/// chunk sequence over disjoint probed subjects). Probed keys legitimately recur across
 /// flushes (each flush carries different left rows), so consumed-state must
 /// not outlive a flush — a longer-lived instance would silently drop injected
 /// asserts from every flush after the first.
@@ -2163,23 +2169,21 @@ pub struct ProbeOps {
 }
 
 impl ProbeOps {
-    /// `ops` must be the single predicate `p_id`'s resolved ops in PSOT order
-    /// (the [`cached_overlay_ops`] output for `RunSortOrder::Psot`). Returns
-    /// `None` when empty — callers then run their unmodified scan.
-    pub fn new(ops: SharedOverlayOps, p_id: u32) -> Option<Self> {
+    /// `ops` must be resolved and sorted by `(s_id, p_id, o_type, o_key,
+    /// o_i)`: a single predicate's [`cached_overlay_ops`] for
+    /// `RunSortOrder::Psot`, or a multi-predicate merge re-sorted for
+    /// `RunSortOrder::Spot`. Returns `None` when empty — callers then run
+    /// their unmodified scan.
+    pub fn new(ops: SharedOverlayOps) -> Option<Self> {
         if ops.is_empty() {
             return None;
         }
         debug_assert!(
-            ops.iter().all(|o| o.p_id == p_id),
-            "ProbeOps requires single-predicate ops (p_id {p_id})"
-        );
-        debug_assert!(
             ops.windows(2).all(|w| {
-                (w[0].s_id, w[0].o_type, w[0].o_key, w[0].o_i)
-                    < (w[1].s_id, w[1].o_type, w[1].o_key, w[1].o_i)
+                (w[0].s_id, w[0].p_id, w[0].o_type, w[0].o_key, w[0].o_i)
+                    < (w[1].s_id, w[1].p_id, w[1].o_type, w[1].o_key, w[1].o_i)
             }),
-            "ProbeOps requires PSOT-sorted, resolved ops"
+            "ProbeOps requires subject-major sorted, resolved ops"
         );
         let consumed = vec![false; ops.len()];
         Some(Self {
@@ -2205,6 +2209,7 @@ impl ProbeOps {
     pub fn base_row_fate(
         &mut self,
         window: &std::ops::Range<usize>,
+        p_id: u32,
         o_type: u16,
         o_key: u64,
         o_i: u32,
@@ -2213,11 +2218,11 @@ impl ProbeOps {
             return RowFate::Keep;
         }
         let win = &self.ops[window.clone()];
-        let probe = (o_type, o_key, o_i);
-        let pos = win.partition_point(|o| (o.o_type, o.o_key, o.o_i) < probe);
+        let probe = (p_id, o_type, o_key, o_i);
+        let pos = win.partition_point(|o| (o.p_id, o.o_type, o.o_key, o.o_i) < probe);
         if pos < win.len() {
             let op = &win[pos];
-            if (op.o_type, op.o_key, op.o_i) == probe {
+            if (op.p_id, op.o_type, op.o_key, op.o_i) == probe {
                 self.consumed[window.start + pos] = true;
                 if op.op {
                     // Re-asserted fact: the base row stands in for it.
@@ -2249,6 +2254,116 @@ impl ProbeOps {
         }
         Ok(())
     }
+}
+
+/// How a batched leaflet-probe lane should handle the active overlay.
+///
+/// Centralizes the decline analysis every probe lane needs (the bug class
+/// the old `overlay_free_single_graph()` bails guarded against): translation
+/// failure, a predicate that exists only in novelty (no base `p_id` to scan),
+/// and a graph whose branch is absent while novelty exists would all silently
+/// drop or duplicate rows if the probe ran against base leaflets.
+pub enum ProbeLanePlan {
+    /// No novelty on the active graph (or none survives `to_t`) — run the
+    /// unmodified probe.
+    Clean,
+    /// Merge these non-empty resolved ops during the probe (construct one
+    /// [`ProbeOps`] per flush from them).
+    Merge(SharedOverlayOps),
+    /// Unmergeable — the caller must take its overlay-correct fallback.
+    Decline,
+}
+
+/// Plan a single-predicate PSOT subject probe under the active overlay.
+pub fn subject_probe_lane_plan(
+    ctx: &ExecutionContext<'_>,
+    store: &Arc<BinaryIndexStore>,
+    pred_sid: &Sid,
+) -> Result<ProbeLanePlan> {
+    if ctx.overlay_free_single_graph() {
+        return Ok(ProbeLanePlan::Clean);
+    }
+    // Eager-materialization callers (reasoning queries with Sid-space derived
+    // overlays, federated queries) need the per-row path: probes emit
+    // encoded bindings and merge only V3-translated novelty.
+    if ctx.eager_materialization {
+        return Ok(ProbeLanePlan::Decline);
+    }
+    if !matches!(ctx.active_graphs(), crate::dataset::ActiveGraphs::Single) {
+        return Ok(ProbeLanePlan::Decline);
+    }
+    let Some(ops) = cached_overlay_ops(ctx, store, ctx.binary_g_id, RunSortOrder::Psot, pred_sid)?
+    else {
+        tracing::debug!("subject probe: overlay flake translation failed; declining");
+        return Ok(ProbeLanePlan::Decline);
+    };
+    if ops.is_empty() {
+        return Ok(ProbeLanePlan::Clean);
+    }
+    if store.sid_to_p_id(pred_sid).is_none() {
+        tracing::debug!("subject probe: predicate exists only in novelty; declining");
+        return Ok(ProbeLanePlan::Decline);
+    }
+    if store
+        .branch_for_order(ctx.binary_g_id, RunSortOrder::Psot)
+        .is_none()
+    {
+        tracing::debug!("subject probe: PSOT branch absent with novelty present; declining");
+        return Ok(ProbeLanePlan::Decline);
+    }
+    Ok(ProbeLanePlan::Merge(ops))
+}
+
+/// Plan a multi-predicate SPOT star probe under the active overlay.
+///
+/// Fetches each predicate's resolved ops, declines if any predicate is
+/// unmergeable, and merges the non-empty vecs into one SPOT-sorted vec
+/// (identities stay unique across predicates because `p_id` is part of the
+/// fact key, so the merge stays resolved).
+pub fn star_probe_lane_plan(
+    ctx: &ExecutionContext<'_>,
+    store: &Arc<BinaryIndexStore>,
+    pred_sids: &[&Sid],
+) -> Result<ProbeLanePlan> {
+    if ctx.overlay_free_single_graph() {
+        return Ok(ProbeLanePlan::Clean);
+    }
+    // See subject_probe_lane_plan: eager callers keep the per-row path.
+    if ctx.eager_materialization {
+        return Ok(ProbeLanePlan::Decline);
+    }
+    if !matches!(ctx.active_graphs(), crate::dataset::ActiveGraphs::Single) {
+        return Ok(ProbeLanePlan::Decline);
+    }
+    let mut merged: Vec<fluree_db_binary_index::read::types::OverlayOp> = Vec::new();
+    for pred_sid in pred_sids {
+        let Some(ops) =
+            cached_overlay_ops(ctx, store, ctx.binary_g_id, RunSortOrder::Psot, pred_sid)?
+        else {
+            tracing::debug!("star probe: overlay flake translation failed; declining");
+            return Ok(ProbeLanePlan::Decline);
+        };
+        if ops.is_empty() {
+            continue;
+        }
+        if store.sid_to_p_id(pred_sid).is_none() {
+            tracing::debug!("star probe: predicate exists only in novelty; declining");
+            return Ok(ProbeLanePlan::Decline);
+        }
+        merged.extend_from_slice(&ops);
+    }
+    if merged.is_empty() {
+        return Ok(ProbeLanePlan::Clean);
+    }
+    if store
+        .branch_for_order(ctx.binary_g_id, RunSortOrder::Spot)
+        .is_none()
+    {
+        tracing::debug!("star probe: SPOT branch absent with novelty present; declining");
+        return Ok(ProbeLanePlan::Decline);
+    }
+    fluree_db_binary_index::read::types::sort_overlay_ops(&mut merged, RunSortOrder::Spot);
+    Ok(ProbeLanePlan::Merge(merged.into()))
 }
 
 /// Build a per-predicate `BinaryCursor` in `order`, folding in the novelty
