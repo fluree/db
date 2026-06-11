@@ -632,6 +632,10 @@ impl CyclicBgpOperator {
         };
         let pred_sid = normalize_pred_sid(store, &edge.predicate)?;
         let Some(p_id) = store.sid_to_p_id(&pred_sid) else {
+            if overlay_may_have_facts(ctx) {
+                self.log_fast_path_bail("novelty-only-predicate", Some(edge));
+                return Ok(None);
+            }
             return Ok(Some(Vec::new()));
         };
         let mut cursor = match build_psot_cursor_for_predicate(
@@ -689,6 +693,10 @@ impl CyclicBgpOperator {
         };
         let pred_sid = normalize_pred_sid(store, &edge.predicate)?;
         let Some(p_id) = store.sid_to_p_id(&pred_sid) else {
+            if overlay_may_have_facts(ctx) {
+                self.log_fast_path_bail("novelty-only-predicate", Some(edge));
+                return Ok(None);
+            }
             return Ok(Some(Vec::new()));
         };
         let mut cursor = match build_psot_cursor_for_predicate(
@@ -759,6 +767,10 @@ impl CyclicBgpOperator {
         };
         let pred_sid = normalize_pred_sid(store, &edge.predicate)?;
         let Some(p_id) = store.sid_to_p_id(&pred_sid) else {
+            if overlay_may_have_facts(ctx) {
+                self.log_fast_path_bail("novelty-only-predicate", Some(edge));
+                return Ok(None);
+            }
             return Ok(Some(Vec::new()));
         };
 
@@ -941,6 +953,10 @@ impl CyclicBgpOperator {
         };
         let pred_sid = normalize_pred_sid(store, &edge.predicate)?;
         let Some(p_id) = store.sid_to_p_id(&pred_sid) else {
+            if overlay_may_have_facts(ctx) {
+                self.log_fast_path_bail("novelty-only-predicate", Some(edge));
+                return Ok(None);
+            }
             return Ok(Some(Vec::new()));
         };
 
@@ -2257,6 +2273,17 @@ fn advance_probe_cursor(cursor: &mut EncodedProbeWedgeCursor) {
         cursor.a_pos += 1;
         cursor.b_pos = 0;
     }
+}
+
+/// True when the active overlay may hold facts the base index lacks.
+///
+/// A predicate absent from the base dictionary can still have rows in
+/// novelty; treating it as an empty relation would zero the whole BGP, so
+/// the relation loaders must decline to the overlay-merging fallback
+/// instead. Checks the same provider the fast path's cursors merge.
+fn overlay_may_have_facts(ctx: &ExecutionContext<'_>) -> bool {
+    let overlay = ctx.overlay();
+    overlay.epoch() != 0 && !overlay.is_effectively_empty()
 }
 
 fn predicate_display(predicate: &Ref) -> String {
