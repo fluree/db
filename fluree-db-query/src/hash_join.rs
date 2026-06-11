@@ -101,8 +101,32 @@ fn hash_join_force() -> HashJoinForce {
 }
 
 /// Probe-predicate floor: below this, scattered OPST object seeks stay cheap and the
-/// hash join is a wash (the BSBM crossover is between 55.7k @1M and 560k @10M).
-const HASH_JOIN_PROBE_MIN: u64 = 250_000;
+/// hash join is often a wash.
+///
+/// The original 250k floor was tuned on smaller indexes and rejected mid-size
+/// object stars where a ~70k-row driving set caused tens of thousands of
+/// scattered OPST seeks into a ~136k-row probe predicate. On very large
+/// indexes, scanning such a predicate once is decisively cheaper, so keep the
+/// floor near the observed lower crossover while relying on the scan-ratio cap
+/// below to reject small-driving-set pathologies.
+const HASH_JOIN_PROBE_MIN: u64 = 50_000;
+/// For small driving sets, even a below-floor probe predicate is worth scanning
+/// once. Deep object-star chains commonly start from a 1k-5k-row anchor and then
+/// suffer thousands of scattered OPST seeks into 3k-35k-row predicates; a compact
+/// hash build is cheaper and remains memory-bounded.
+const HASH_JOIN_SMALL_BUILD_MAX: f64 = 20_000.0;
+const HASH_JOIN_SMALL_BUILD_PROBE_MIN: u64 = 1_000;
+/// A wider intermediate is still safe to hash-build when it is in the low
+/// hundreds of thousands and the alternative is that many scattered OPST seeks
+/// into a smaller predicate. This catches long path-join tails without
+/// admitting million-row cyclic intermediates.
+const HASH_JOIN_MEDIUM_BUILD_MAX: f64 = 250_000.0;
+/// Auto hash-join freely when the build side still looks like a base scan or
+/// narrow two-column stream. Wider intermediates are allowed only while their
+/// estimated row count stays under the medium-build cap; the operator drains the
+/// build side in `open()`, so a wide, high-row intermediate can defeat outer
+/// LIMIT.
+const HASH_JOIN_AUTO_NARROW_BUILD_SCHEMA: usize = 2;
 /// Don't scan a probe predicate more than this many times the driving-set size —
 /// a guard against the pathological "scan a huge predicate for a handful of driving
 /// rows" case. It is deliberately loose: the alternative we replace is the scattered
@@ -122,7 +146,13 @@ const HASH_JOIN_MAX_SCAN_RATIO: f64 = 1024.0;
 fn hash_join_cost_wins(probe_count: Option<u64>, driving_est: Option<f64>) -> bool {
     let Some(pc) = probe_count else { return false };
     let drive = driving_est.unwrap_or(0.0).max(1.0);
-    pc >= HASH_JOIN_PROBE_MIN && (pc as f64) <= drive * HASH_JOIN_MAX_SCAN_RATIO
+    let within_scan_budget = (pc as f64) <= drive * HASH_JOIN_MAX_SCAN_RATIO;
+    within_scan_budget
+        && (pc >= HASH_JOIN_PROBE_MIN
+            || (drive <= HASH_JOIN_SMALL_BUILD_MAX && pc >= HASH_JOIN_SMALL_BUILD_PROBE_MIN)
+            || (drive <= HASH_JOIN_MEDIUM_BUILD_MAX
+                && pc >= HASH_JOIN_SMALL_BUILD_PROBE_MIN
+                && (pc as f64) <= drive))
 }
 
 /// Why the object→subject hash join was (or was not) chosen. Mirrors the
@@ -142,6 +172,9 @@ pub(crate) enum HashJoinReason {
     ScanRatioTooHigh,
     /// No probe-predicate stats, so the cost model can't justify the hash join.
     NoProbeStats,
+    /// The object-join shape matched, but the build side is already a wider
+    /// intermediate. Auto hash join would drain it in open() and can defeat LIMIT.
+    BuildSideTooWide,
     /// The subject (not the object) is bound from the left, so this is a forward
     /// join the object→subject hash can't replace. Reordering to drive the other
     /// end is what helps (the BSBM-BI bowtie case).
@@ -157,6 +190,7 @@ impl HashJoinReason {
             HashJoinReason::ProbeTooSmall => "probe-too-small",
             HashJoinReason::ScanRatioTooHigh => "scan-ratio-too-high",
             HashJoinReason::NoProbeStats => "no-probe-stats",
+            HashJoinReason::BuildSideTooWide => "build-side-too-wide",
             HashJoinReason::SubjectDriven => "subject-driven-forward-join",
         }
     }
@@ -200,10 +234,16 @@ impl HashJoinDecision {
 /// `property_stats` fallback so the cost model sees the same numbers reorder did.
 fn predicate_count(stats: &StatsView, pred: &crate::ir::triple::Ref) -> Option<u64> {
     if let Some(sid) = pred.as_sid() {
-        return stats.get_property(sid).map(|p| p.count);
+        return stats
+            .get_property(sid)
+            .map(|p| p.count)
+            .or_else(|| stats.has_property_stats().then_some(0));
     }
     if let Some(iri) = pred.as_iri() {
-        return stats.get_property_by_iri(iri).map(|p| p.count);
+        return stats
+            .get_property_by_iri(iri)
+            .map(|p| p.count)
+            .or_else(|| stats.has_property_stats().then_some(0));
     }
     None
 }
@@ -353,6 +393,25 @@ impl<'a> HashJoinPlanner<'a> {
             });
         }
 
+        if self.force == HashJoinForce::Auto
+            && left_schema.len() > HASH_JOIN_AUTO_NARROW_BUILD_SCHEMA
+            && driving_est.unwrap_or(f64::INFINITY) > HASH_JOIN_MEDIUM_BUILD_MAX
+        {
+            let probe_count = self.stats.and_then(|s| predicate_count(s, &tp.p));
+            let scan_ratio = match (probe_count, driving_est) {
+                (Some(pc), Some(d)) => Some(pc as f64 / d.max(1.0)),
+                _ => None,
+            };
+            return Some(HashJoinDecision {
+                join_var: Some(join_var),
+                probe_count,
+                driving_est,
+                scan_ratio,
+                chosen: false,
+                reason: HashJoinReason::BuildSideTooWide,
+            });
+        }
+
         let probe_count = self.stats.and_then(|s| predicate_count(s, &tp.p));
         let scan_ratio = match (probe_count, driving_est) {
             (Some(pc), Some(d)) => Some(pc as f64 / d.max(1.0)),
@@ -364,13 +423,21 @@ impl<'a> HashJoinPlanner<'a> {
             HashJoinForce::Off => unreachable!("handled above"),
             HashJoinForce::Auto => match probe_count {
                 None => (false, HashJoinReason::NoProbeStats),
-                Some(pc) if pc < HASH_JOIN_PROBE_MIN => (false, HashJoinReason::ProbeTooSmall),
+                Some(pc) if pc < HASH_JOIN_SMALL_BUILD_PROBE_MIN => {
+                    (false, HashJoinReason::ProbeTooSmall)
+                }
                 Some(pc) => {
                     let drive = driving_est.unwrap_or(0.0).max(1.0);
-                    if (pc as f64) <= drive * HASH_JOIN_MAX_SCAN_RATIO {
+                    let within_scan_budget = (pc as f64) <= drive * HASH_JOIN_MAX_SCAN_RATIO;
+                    let probe_large_enough = pc >= HASH_JOIN_PROBE_MIN
+                        || drive <= HASH_JOIN_SMALL_BUILD_MAX
+                        || (drive <= HASH_JOIN_MEDIUM_BUILD_MAX && (pc as f64) <= drive);
+                    if within_scan_budget && probe_large_enough {
                         (true, HashJoinReason::CostWins)
-                    } else {
+                    } else if !within_scan_budget {
                         (false, HashJoinReason::ScanRatioTooHigh)
+                    } else {
+                        (false, HashJoinReason::ProbeTooSmall)
                     }
                 }
             },
@@ -1006,11 +1073,216 @@ mod tests {
     }
 
     #[test]
+    fn cost_gate_fires_for_midsize_object_star() {
+        // A mid-size object star after reordering:
+        //   build ~69,885 rows, probe ~136,131 rows, joined on object ?x.
+        // The old 250k probe floor rejected this as "probe-too-small", forcing ~70k
+        // scattered OPST object seeks. A single predicate scan is cheaper and allows
+        // the outer LIMIT to stop after the first output batch.
+        assert!(hash_join_cost_wins(Some(136_131), Some(69_885.0)));
+    }
+
+    #[test]
+    fn cost_gate_fires_for_small_build_star_anchors() {
+        // First object-star joins from slow deep-star plans (build -> probe rows):
+        // 5,092 -> 7,100; 2,196 -> 35,246; 1,068 -> 7,684.
+        //
+        // The probe predicates are below the generic floor, but the build sides are
+        // tiny enough that a hash table is cheap and avoids thousands of OPST seeks.
+        assert!(hash_join_cost_wins(Some(7_100), Some(5_092.0)));
+        assert!(hash_join_cost_wins(Some(35_246), Some(2_196.0)));
+        assert!(hash_join_cost_wins(Some(7_684), Some(1_068.0)));
+    }
+
+    #[test]
+    fn planner_chooses_hash_join_for_midsize_object_star() {
+        let x = VarId(0);
+        let y = VarId(1);
+        let z = VarId(2);
+        let build = TriplePattern::new(
+            Ref::Var(z),
+            Ref::Sid(Sid::new(100, "buildPred")),
+            Term::Var(x),
+        );
+        let probe = TriplePattern::new(
+            Ref::Var(y),
+            Ref::Sid(Sid::new(100, "probePred")),
+            Term::Var(x),
+        );
+
+        let mut stats = StatsView::default();
+        stats.properties.insert(
+            Sid::new(100, "buildPred"),
+            PropertyStatData {
+                count: 69_885,
+                ndv_values: 74_401,
+                ndv_subjects: 65_138,
+            },
+        );
+        stats.properties.insert(
+            Sid::new(100, "probePred"),
+            PropertyStatData {
+                count: 136_131,
+                ndv_values: 135_901,
+                ndv_subjects: 150_921,
+            },
+        );
+
+        let mut planner = HashJoinPlanner::new(Some(&stats));
+        let mut bound = HashSet::new();
+        planner.before_step(&build, &bound);
+        bound.extend(build.produced_vars());
+        planner.before_step(&probe, &bound);
+
+        let d = planner
+            .explain_object_hash_join(&[z, x], &probe, false, true)
+            .expect("mid-size probe should produce a hash-join decision");
+        assert!(d.chosen);
+        assert_eq!(d.reason, HashJoinReason::CostWins);
+        assert_eq!(d.probe_count, Some(136_131));
+        assert_eq!(d.driving_est.map(|v| v.round() as u64), Some(69_885));
+    }
+
+    #[test]
+    fn planner_rejects_auto_hash_join_for_wide_intermediate() {
+        let x = VarId(0);
+        let w = VarId(3);
+        let probe = TriplePattern::new(
+            Ref::Var(w),
+            Ref::Sid(Sid::new(100, "probePred")),
+            Term::Var(x),
+        );
+
+        let mut stats = StatsView::default();
+        stats.properties.insert(
+            Sid::new(100, "probePred"),
+            PropertyStatData {
+                count: 100_000,
+                ndv_values: 80_000,
+                ndv_subjects: 90_000,
+            },
+        );
+
+        let d = HashJoinPlanner::new(Some(&stats))
+            .explain_object_hash_join(&[VarId(2), x, VarId(1)], &probe, false, true)
+            .expect("wide continuation should still produce a decision");
+        assert!(!d.chosen);
+        assert_eq!(d.reason, HashJoinReason::BuildSideTooWide);
+    }
+
+    #[test]
+    fn planner_allows_hash_join_for_small_wide_intermediate() {
+        // After the first hash join in a deep star chain: the build-side schema
+        // is already wide (?z, ?x, ?y), but the estimated intermediate is only
+        // ~10,980 rows and the next predicate has 3,140 rows. Hashing the
+        // intermediate avoids thousands of scattered OPST seeks.
+        let x = VarId(0);
+        let u = VarId(3);
+        let probe = TriplePattern::new(
+            Ref::Var(u),
+            Ref::Sid(Sid::new(100, "probePred")),
+            Term::Var(x),
+        );
+
+        let mut stats = StatsView::default();
+        stats.properties.insert(
+            Sid::new(100, "probePred"),
+            PropertyStatData {
+                count: 3_140,
+                ndv_values: 166,
+                ndv_subjects: 3_179,
+            },
+        );
+
+        let planner = HashJoinPlanner {
+            stats: Some(&stats),
+            force: HashJoinForce::Auto,
+            driving_est: 10_980.0,
+            step_est: Some(10_980.0),
+        };
+        let d = planner
+            .explain_object_hash_join(&[VarId(2), x, VarId(1)], &probe, false, true)
+            .expect("final probe should produce a hash-join decision");
+        assert!(d.chosen);
+        assert_eq!(d.reason, HashJoinReason::CostWins);
+        assert_eq!(d.probe_count, Some(3_140));
+        assert_eq!(d.driving_est.map(|v| v.round() as u64), Some(10_980));
+    }
+
+    #[test]
+    fn planner_allows_hash_join_for_medium_wide_path_tail() {
+        // Long path-join tail: the left intermediate is wide, but still only
+        // ~237k rows. Scanning the 24,874-row probe predicate once is cheaper
+        // than hundreds of thousands of scattered object seeks.
+        let x2 = VarId(1);
+        let x1 = VarId(0);
+        let probe = TriplePattern::new(
+            Ref::Var(x1),
+            Ref::Sid(Sid::new(100, "probePred")),
+            Term::Var(x2),
+        );
+
+        let mut stats = StatsView::default();
+        stats.properties.insert(
+            Sid::new(100, "probePred"),
+            PropertyStatData {
+                count: 24_874,
+                ndv_values: 408,
+                ndv_subjects: 15_508,
+            },
+        );
+
+        let planner = HashJoinPlanner {
+            stats: Some(&stats),
+            force: HashJoinForce::Auto,
+            driving_est: 237_440.0,
+            step_est: Some(237_440.0),
+        };
+        let d = planner
+            .explain_object_hash_join(&[VarId(2), VarId(3), x2, VarId(4)], &probe, false, true)
+            .expect("path tail should produce a hash-join decision");
+        assert!(d.chosen);
+        assert_eq!(d.reason, HashJoinReason::CostWins);
+        assert_eq!(d.probe_count, Some(24_874));
+    }
+
+    #[test]
+    fn planner_rejects_hash_join_for_million_row_wide_cycle_tail() {
+        let x2 = VarId(1);
+        let x1 = VarId(0);
+        let probe = TriplePattern::new(Ref::Var(x1), Ref::Sid(Sid::new(658, "P40")), Term::Var(x2));
+
+        let mut stats = StatsView::default();
+        stats.properties.insert(
+            Sid::new(658, "P40"),
+            PropertyStatData {
+                count: 1_966_039,
+                ndv_values: 1_161_505,
+                ndv_subjects: 1_205_280,
+            },
+        );
+
+        let planner = HashJoinPlanner {
+            stats: Some(&stats),
+            force: HashJoinForce::Auto,
+            driving_est: 1_085_090.0,
+            step_est: Some(1_085_090.0),
+        };
+        let d = planner
+            .explain_object_hash_join(&[VarId(2), VarId(3), x2, VarId(4)], &probe, false, true)
+            .expect("S3 tail should produce a hash-join decision");
+        assert!(!d.chosen);
+        assert_eq!(d.reason, HashJoinReason::BuildSideTooWide);
+    }
+
+    #[test]
     fn cost_gate_still_guards_pathological_and_small_probes() {
         // Huge probe for a handful of driving rows is still rejected (ratio ≫ 1024×).
         assert!(!hash_join_cost_wins(Some(2_848_260), Some(100.0)));
-        // Probe below the floor never qualifies, regardless of ratio.
-        assert!(!hash_join_cost_wins(Some(100_000), Some(10.0)));
+        // Very small probe stays below the small-build exception.
+        assert!(!hash_join_cost_wins(Some(500), Some(100.0)));
+        // Below-floor probe with a non-small build still falls back to nested loop.
+        assert!(!hash_join_cost_wins(Some(40_000), Some(25_000.0)));
         // No probe stats => fall back to the safe nested-loop default.
         assert!(!hash_join_cost_wins(None, Some(1_000_000.0)));
     }

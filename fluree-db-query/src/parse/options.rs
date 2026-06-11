@@ -461,7 +461,7 @@ fn rewrite_having_aggregates(
 /// - `"reasoning": "owl2ql"` - OWL2-QL (implies RDFS)
 /// - `"reasoning": ["rdfs", "owl2ql"]` - multiple modes
 /// - `"rules": [...]` - query-time datalog rules (enables datalog automatically)
-/// - No key present - use defaults (auto-RDFS when hierarchy exists)
+/// - No key present - no reasoning (reasoning is opt-in)
 ///
 /// # Example
 ///

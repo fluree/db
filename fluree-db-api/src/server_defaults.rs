@@ -354,7 +354,7 @@ pub fn generate_config_template(storage_path_override: Option<&str>) -> String {
 # log_level = "{log_level}"                 # trace, debug, info, warn, error
 # cors_enabled = {cors_enabled}
 # body_limit = {body_limit}              # 50 MB
-# cache_max_mb = 4096                    # global cache budget (MB); default: tiered fraction of RAM (30% <4GB, 40% 4-8GB, 50% ≥8GB)
+# cache_max_mb = 4096                    # global cache budget (MB); default: tiered by RAM (<4GB: 30%, 4-8GB: 40%, >=8GB: 35%)
 
 # [server.indexing]
 # enabled = {indexing_enabled}                    # disable only when a separate peer/indexer owns indexing for this storage

@@ -9,7 +9,9 @@ use crate::ir::triple::{Ref, Term, TriplePattern};
 use crate::planner::{classify_pattern, estimate_triple_row_count, PatternType};
 use crate::var_registry::VarId;
 use crate::{
-    execute::{analyze_property_join_plan, collect_inner_join_block},
+    execute::{
+        analyze_property_join_plan, collect_inner_join_block, pushdown::extract_bounds_from_filters,
+    },
     ir::Pattern,
 };
 use fluree_db_core::StatsView;
@@ -175,8 +177,17 @@ pub fn explain_execution_hints(
                     continue;
                 }
                 let has_upstream_seed = block_start > 0;
-                let (decision, _) =
-                    analyze_property_join_plan(&reordered, end, &block.triples, has_upstream_seed);
+                let filters_for_pushdown: Vec<_> =
+                    block.filters.iter().map(|f| f.expr.clone()).collect();
+                let (object_bounds, _) =
+                    extract_bounds_from_filters(&block.triples, &filters_for_pushdown);
+                let (decision, _) = analyze_property_join_plan(
+                    &reordered,
+                    end,
+                    &block.triples,
+                    &object_bounds,
+                    has_upstream_seed,
+                );
                 i = end;
                 if !decision.can_property_join {
                     continue;

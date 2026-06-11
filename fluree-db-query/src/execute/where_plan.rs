@@ -12,6 +12,7 @@
 use crate::binary_scan::EmitMask;
 use crate::bind::BindOperator;
 use crate::bm25::Bm25SearchOperator;
+use crate::cyclic_bgp::{analyze_cyclic_bgp, CyclicBgpOperator};
 use crate::distinct::DistinctOperator;
 use crate::error::{QueryError, Result};
 use crate::eval::PreparedBoolExpression;
@@ -25,7 +26,7 @@ use crate::minus::MinusOperator;
 use crate::operator::inline::InlineOperator;
 use crate::operator::BoxedOperator;
 use crate::optional::{GroupedPatternOptionalBuilder, OptionalOperator, PlanTreeOptionalBuilder};
-use crate::planner::{analyze_property_join, is_property_join, reorder_patterns};
+use crate::planner::{analyze_property_join, reorder_patterns};
 use crate::property_join::PropertyJoinOperator;
 use crate::property_path::{PropertyPathOperator, DEFAULT_MAX_VISITED};
 use crate::seed::EmptyOperator;
@@ -493,6 +494,7 @@ pub(crate) struct PropertyJoinPlanDecision {
     pub optional_bonus: f32,
     pub meets_width_threshold: bool,
     pub has_upstream_seed: bool,
+    pub has_selective_anchor: bool,
     pub can_property_join: bool,
     pub tail_optional_triples: usize,
     pub tail_filters: usize,
@@ -620,13 +622,20 @@ pub(crate) fn analyze_property_join_plan(
     patterns: &[Pattern],
     block_end_index: usize,
     triples_for_exec: &[TriplePattern],
+    object_bounds: &HashMap<VarId, ObjectBounds>,
     has_upstream_seed: bool,
 ) -> (PropertyJoinPlanDecision, PropertyJoinTail) {
     let analysis = analyze_property_join(triples_for_exec);
     let (width_score, optional_bonus) =
         property_join_width_score(triples_for_exec, &patterns[block_end_index..]);
     let meets_width_threshold = width_score >= PROPERTY_JOIN_MIN_WIDTH_SCORE;
-    let can_property_join = !has_upstream_seed && analysis.eligible() && meets_width_threshold;
+    // PropertyJoinOperator eagerly builds per-subject value vectors in open().
+    // Keep it for anchored stars, where the first scan can shrink the subject set;
+    // route pure high-cardinality variable stars through the sequential chain so
+    // subject-bound probes and outer LIMIT can stream results.
+    let has_selective_anchor = analysis.has_bound_objects || !object_bounds.is_empty();
+    let can_property_join =
+        !has_upstream_seed && analysis.eligible() && meets_width_threshold && has_selective_anchor;
     let tail = if can_property_join {
         collect_property_join_tail(patterns, block_end_index, triples_for_exec)
     } else {
@@ -641,6 +650,7 @@ pub(crate) fn analyze_property_join_plan(
         optional_bonus,
         meets_width_threshold,
         has_upstream_seed,
+        has_selective_anchor,
         can_property_join,
         tail_optional_triples: tail.optional_triples.len(),
         tail_filters: tail.filters.len(),
@@ -1434,16 +1444,46 @@ pub fn build_where_operators_seeded_with_needed(
                 // Hot path: triples only (no BIND/FILTER).
                 // Skip dependency bookkeeping entirely.
                 if block.binds.is_empty() && block.filters.is_empty() {
-                    let augmented_rwv = augmented_at(end);
-                    let augmented_ref = augmented_rwv.as_deref();
+                    let mut augmented_rwv = augmented_at(end);
 
-                    // Preserve property-join eligibility when a top-level VALUES precedes
-                    // a pure star block. Wrapping VALUES first seeds the schema/operator and
-                    // prevents `build_triple_operators()` from taking the property-join path.
+                    // A VALUES that shares no vars with the block is a parameter
+                    // injection: defer it above the block (a pure cross product
+                    // either way, and seeding would re-open the scans per VALUES
+                    // row). A VALUES that overlaps the block constrains it — seed
+                    // it under the chain so its bindings drive the scans, except
+                    // when the block will take the anchored property-join path
+                    // (same gate as `build_triple_operators`), which keeps
+                    // overlap vars alive itself and prefers VALUES layered above.
+                    let star_analysis = analyze_property_join(&block.triples);
+                    let block_vars: HashSet<VarId> = block
+                        .triples
+                        .iter()
+                        .flat_map(crate::ir::triple::TriplePattern::referenced_vars)
+                        .collect();
+                    let values_overlap_block = block
+                        .values
+                        .iter()
+                        .any(|vp| vp.vars.iter().any(|v| block_vars.contains(v)));
                     let values_after_triples = operator.is_none()
                         && !block.values.is_empty()
                         && block.triples.len() >= 2
-                        && is_property_join(&block.triples);
+                        && (!values_overlap_block
+                            || (star_analysis.eligible() && star_analysis.has_bound_objects));
+
+                    // A deferred VALUES joins against the block's output above it, so
+                    // its vars must survive the block's liveness trimming.
+                    if values_after_triples {
+                        if let Some(rwv) = augmented_rwv.as_mut() {
+                            for vp in &block.values {
+                                for v in &vp.vars {
+                                    if !rwv.contains(v) {
+                                        rwv.push(*v);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    let augmented_ref = augmented_rwv.as_deref();
 
                     let mut built = build_triple_operators(
                         if values_after_triples {
@@ -1551,8 +1591,13 @@ pub fn build_where_operators_seeded_with_needed(
                 }
 
                 let has_upstream_seed = operator.is_some();
-                let (property_join_plan, property_join_tail) =
-                    analyze_property_join_plan(patterns, end, &triples_for_exec, has_upstream_seed);
+                let (property_join_plan, property_join_tail) = analyze_property_join_plan(
+                    patterns,
+                    end,
+                    &triples_for_exec,
+                    &pushdown.object_bounds,
+                    has_upstream_seed,
+                );
                 let property_join_end = property_join_tail.end_index;
                 let augmented_rwv = augmented_at(property_join_end);
                 let augmented_ref = augmented_rwv.as_deref();
@@ -1584,6 +1629,8 @@ pub fn build_where_operators_seeded_with_needed(
                         property_join_optional_bonus = property_join_plan.optional_bonus,
                         property_join_meets_width_threshold =
                             property_join_plan.meets_width_threshold,
+                        property_join_has_selective_anchor =
+                            property_join_plan.has_selective_anchor,
                         property_join_optional_triples = property_join_plan.tail_optional_triples,
                         property_join_tail_filters = property_join_plan.tail_filters,
                         property_join_tail_binds = property_join_plan.tail_binds,
@@ -2090,13 +2137,8 @@ fn scan_index_hint_for_triple(
     }
 }
 
-/// Build operators for a sequence of triple patterns
-///
-/// Uses property join optimization when applicable.
-/// When `object_bounds` is provided, range constraints are pushed down to the scan operator
-/// for the first pattern, enabling index-level filtering.
 #[allow(clippy::too_many_arguments)]
-pub fn build_triple_operators(
+fn build_sequential_triple_chain(
     existing: Option<BoxedOperator>,
     triples: &[TriplePattern],
     object_bounds: &HashMap<VarId, ObjectBounds>,
@@ -2108,57 +2150,19 @@ pub fn build_triple_operators(
     planning: &PlanningContext,
     stats: Option<&StatsView>,
 ) -> Result<BoxedOperator> {
-    if triples.is_empty() {
-        return existing
-            .ok_or_else(|| QueryError::InvalidQuery("No triple patterns to process".to_string()));
-    }
-
     let mut operator = existing;
-    let triples_for_exec: Vec<TriplePattern> = triples.to_vec();
-
-    // Check for property join optimization
-    //
-    // PropertyJoinOperator scans each predicate independently and applies per-predicate
-    // object bounds during its scan phase, then intersects subjects. This is far cheaper
-    // than falling back to NestedLoopJoin which does correlated novelty traversals.
-    if operator.is_none() && triples_for_exec.len() >= 2 && is_property_join(&triples_for_exec) {
-        // Use PropertyJoinOperator for multi-property patterns.
-        //
-        // If an object var is not needed downstream (not in required_where_vars and not
-        // otherwise protected), treat that predicate as existence-only (semijoin) to avoid
-        // cartesian-product blowups.
-        let mut needed: HashSet<VarId> = HashSet::new();
-        if let Some(rwv) = required_where_vars {
-            needed.extend(rwv.iter().copied());
-        }
-        for (v, c) in var_counts {
-            if *c > 1 || protected_vars.contains(v) {
-                needed.insert(*v);
-            }
-        }
-
-        let pj = PropertyJoinOperator::new_with_needed_vars(
-            &triples_for_exec,
-            object_bounds.clone(),
-            Some(&needed),
-            planning.mode(),
-        )?;
-        return Ok(Box::new(pj));
-    }
-
-    // Build chain of scan/join operators using the shared helper
     let rwv_set: Option<HashSet<VarId>> = required_where_vars.map(|v| v.iter().copied().collect());
 
     // Drives the hash-join cost model; snapshots cardinality against `seen_vars`
     // (the chain bound so far) before each pattern — see build_sequential_join_block.
     let mut seen_vars: HashSet<VarId> = HashSet::new();
     let mut hash_planner = HashJoinPlanner::new(stats);
-    for (k, pattern) in triples_for_exec.iter().enumerate() {
+    for (k, pattern) in triples.iter().enumerate() {
         hash_planner.before_step(pattern, &seen_vars);
         seen_vars.extend(pattern.produced_vars());
         // Compute live vars: required_where_vars ∪ vars from subsequent triples
         let live_vars = rwv_set.as_ref().map(|base| {
-            let suffix_vars: HashSet<VarId> = triples_for_exec[k + 1..]
+            let suffix_vars: HashSet<VarId> = triples[k + 1..]
                 .iter()
                 .flat_map(crate::ir::triple::TriplePattern::referenced_vars)
                 .collect();
@@ -2198,6 +2202,107 @@ pub fn build_triple_operators(
     }
 
     Ok(operator.unwrap())
+}
+
+/// Build operators for a sequence of triple patterns
+///
+/// Uses property join optimization when applicable.
+/// When `object_bounds` is provided, range constraints are pushed down to the scan operator
+/// for the first pattern, enabling index-level filtering.
+#[allow(clippy::too_many_arguments)]
+pub fn build_triple_operators(
+    existing: Option<BoxedOperator>,
+    triples: &[TriplePattern],
+    object_bounds: &HashMap<VarId, ObjectBounds>,
+    required_where_vars: Option<&[VarId]>,
+    var_counts: &HashMap<VarId, usize>,
+    protected_vars: &HashSet<VarId>,
+    group_by: &[VarId],
+    distinct_query: bool,
+    planning: &PlanningContext,
+    stats: Option<&StatsView>,
+) -> Result<BoxedOperator> {
+    if triples.is_empty() {
+        return existing
+            .ok_or_else(|| QueryError::InvalidQuery("No triple patterns to process".to_string()));
+    }
+
+    let triples_for_exec: Vec<TriplePattern> = triples.to_vec();
+
+    // Check for anchored property join optimization
+    //
+    // PropertyJoinOperator scans each predicate independently and applies per-predicate
+    // object bounds during its scan phase, then intersects subjects. This is far cheaper
+    // than falling back to NestedLoopJoin when a bound object or object bounds shrink
+    // the subject domain. Pure variable-object stars stay on the sequential chain so
+    // LIMIT can stop before every predicate has been fully drained.
+    let property_join_analysis = analyze_property_join(&triples_for_exec);
+    let has_property_join_anchor =
+        property_join_analysis.has_bound_objects || !object_bounds.is_empty();
+    if existing.is_none()
+        && triples_for_exec.len() >= 2
+        && property_join_analysis.eligible()
+        && has_property_join_anchor
+    {
+        // Use PropertyJoinOperator for multi-property patterns.
+        //
+        // If an object var is not needed downstream (not in required_where_vars and not
+        // otherwise protected), treat that predicate as existence-only (semijoin) to avoid
+        // cartesian-product blowups.
+        let mut needed: HashSet<VarId> = HashSet::new();
+        if let Some(rwv) = required_where_vars {
+            needed.extend(rwv.iter().copied());
+        }
+        for (v, c) in var_counts {
+            if *c > 1 || protected_vars.contains(v) {
+                needed.insert(*v);
+            }
+        }
+
+        let pj = PropertyJoinOperator::new_with_needed_vars(
+            &triples_for_exec,
+            object_bounds.clone(),
+            Some(&needed),
+            planning.mode(),
+        )?;
+        return Ok(Box::new(pj));
+    }
+
+    if existing.is_none() && object_bounds.is_empty() {
+        if let Some(cyclic_plan) = analyze_cyclic_bgp(&triples_for_exec, stats) {
+            let fallback = build_sequential_triple_chain(
+                None,
+                &triples_for_exec,
+                object_bounds,
+                required_where_vars,
+                var_counts,
+                protected_vars,
+                group_by,
+                distinct_query,
+                planning,
+                stats,
+            )?;
+            return Ok(Box::new(CyclicBgpOperator::new(
+                cyclic_plan,
+                required_where_vars,
+                planning.mode(),
+                fallback,
+            )));
+        }
+    }
+
+    build_sequential_triple_chain(
+        existing,
+        &triples_for_exec,
+        object_bounds,
+        required_where_vars,
+        var_counts,
+        protected_vars,
+        group_by,
+        distinct_query,
+        planning,
+        stats,
+    )
 }
 
 #[cfg(test)]
@@ -2273,6 +2378,48 @@ mod tests {
     }
 
     #[test]
+    fn cyclic_square_uses_cyclic_bgp_operator() {
+        // 4-cycle square:
+        // ?x1 p1 ?x2 . ?x1 p2 ?x3 . ?x4 p3 ?x2 . ?x4 p4 ?x3
+        let triples = vec![
+            make_pattern(VarId(0), "p1", VarId(1)),
+            make_pattern(VarId(0), "p2", VarId(2)),
+            make_pattern(VarId(3), "p3", VarId(1)),
+            make_pattern(VarId(3), "p4", VarId(2)),
+        ];
+
+        let op = build_triple_operators(None, &triples, &HashMap::new()).unwrap();
+        let plan = op.describe();
+        assert_eq!(plan.op, "CyclicBgpOperator");
+        assert_eq!(
+            plan.details.get("strategy").and_then(|v| v.as_str()),
+            Some("cyclic_bgp_join")
+        );
+        assert_eq!(
+            plan.details.get("shape").and_then(|v| v.as_str()),
+            Some("square")
+        );
+        assert!(
+            plan.children
+                .iter()
+                .any(|child| child.rel == crate::plan_node::PlanEdgeRel::Fallback),
+            "cyclic operator should expose the sequential fallback in EXPLAIN"
+        );
+    }
+
+    #[test]
+    fn acyclic_chain_stays_on_sequential_join() {
+        let triples = vec![
+            make_pattern(VarId(0), "p1", VarId(1)),
+            make_pattern(VarId(1), "p2", VarId(2)),
+            make_pattern(VarId(2), "p3", VarId(3)),
+        ];
+
+        let op = build_triple_operators(None, &triples, &HashMap::new()).unwrap();
+        assert_ne!(op.describe().op, "CyclicBgpOperator");
+    }
+
+    #[test]
     fn test_build_where_operators_single_triple() {
         let patterns = vec![Pattern::Triple(make_pattern(VarId(0), "name", VarId(1)))];
 
@@ -2297,12 +2444,11 @@ mod tests {
         assert!(result.is_ok());
     }
 
-    /// Regression: top-level VALUES must not block PropertyJoinOperator selection.
+    /// Regression: top-level VALUES must not force VALUES to become the first plan node.
     ///
     /// Previously, we eagerly inserted an EmptyOperator seed whenever the first pattern
     /// was non-triple. With VALUES at position 0, that made `operator.is_none()` false
-    /// and disabled PropertyJoinOperator, causing a catastrophic fallback to nested-loop
-    /// joins on multi-property patterns (e.g. vector score + date filter).
+    /// and prevented the triple block from choosing its best plan shape.
     #[test]
     fn test_values_does_not_block_property_join_schema_order() {
         use crate::binding::Binding;
@@ -2315,7 +2461,7 @@ mod tests {
         //
         // We assert schema order to distinguish the plan shape:
         // - Bad (VALUES first): schema starts with ?queryVec
-        // - Good (PropertyJoin first, then VALUES wrap): schema starts with ?article
+        // - Good (triple block first, then VALUES wrap): schema starts with ?article
         let patterns = vec![
             Pattern::Values {
                 vars: vec![VarId(9)],
@@ -2911,7 +3057,7 @@ mod tests {
     }
 
     #[test]
-    fn test_property_join_plan_accepts_exact_width_threshold() {
+    fn test_property_join_plan_rejects_unanchored_exact_width_threshold() {
         let s = VarId(0);
         let triples = vec![
             make_pattern(s, "type", VarId(1)),
@@ -2921,10 +3067,34 @@ mod tests {
         let patterns: Vec<Pattern> = triples.iter().cloned().map(Pattern::Triple).collect();
 
         let (decision, _tail) =
-            analyze_property_join_plan(&patterns, patterns.len(), &triples, false);
+            analyze_property_join_plan(&patterns, patterns.len(), &triples, &HashMap::new(), false);
 
         assert_eq!(decision.width_score, PROPERTY_JOIN_MIN_WIDTH_SCORE);
         assert!(decision.meets_width_threshold);
+        assert!(!decision.has_selective_anchor);
+        assert!(!decision.can_property_join);
+    }
+
+    #[test]
+    fn test_property_join_plan_accepts_anchored_exact_width_threshold() {
+        let s = VarId(0);
+        let triples = vec![
+            TriplePattern::new(
+                Ref::Var(s),
+                Ref::Sid(Sid::new(100, "type")),
+                Term::Sid(Sid::new(100, "Product")),
+            ),
+            make_pattern(s, "text", VarId(2)),
+            make_pattern(s, "vector", VarId(3)),
+        ];
+        let patterns: Vec<Pattern> = triples.iter().cloned().map(Pattern::Triple).collect();
+
+        let (decision, _tail) =
+            analyze_property_join_plan(&patterns, patterns.len(), &triples, &HashMap::new(), false);
+
+        assert_eq!(decision.width_score, PROPERTY_JOIN_MIN_WIDTH_SCORE);
+        assert!(decision.meets_width_threshold);
+        assert!(decision.has_selective_anchor);
         assert!(decision.can_property_join);
     }
 
