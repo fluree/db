@@ -47,9 +47,11 @@ pub struct ReasoningModes {
     ///
     /// Opt-in mode, not enabled by default.
     pub owl_datalog: bool,
-    /// Explicitly disable all reasoning (overrides auto-RDFS)
+    /// Explicitly disable all reasoning.
     ///
-    /// When true, no reasoning is applied even if hierarchy exists.
+    /// Reasoning is opt-in (no mode runs unless requested), so this flag is
+    /// mostly an affirmation — but it also overrides any view- or
+    /// ledger-config-level reasoning default for this query.
     /// This is set by `"reasoning": "none"` in JSON.
     pub explicit_none: bool,
     /// Query-time datalog rules (JSON-LD format)
@@ -245,8 +247,8 @@ impl ReasoningModes {
         // Parse query-time ontology (RDFS / OWL axioms supplied
         // inline). Layered on top of f:schemaSource at reasoning
         // prep; doesn't itself flip any mode flag — reasoning is
-        // a separate decision (auto-RDFS still applies if a
-        // schema hierarchy exists).
+        // a separate, explicit decision (the axioms only take
+        // effect when a reasoning mode is requested).
         if let Some(ontology) = query.get("ontology") {
             if !ontology.is_null() {
                 modes.ontology = Some(ontology.clone());
@@ -341,28 +343,6 @@ impl ReasoningModes {
     pub fn has_rules(&self) -> bool {
         !self.rules.is_empty()
     }
-
-    /// Compute effective reasoning given available hierarchy
-    ///
-    /// Auto-enables RDFS if:
-    /// - RDFS is not already enabled
-    /// - User didn't explicitly disable reasoning with "none"
-    /// - A schema hierarchy is available
-    ///
-    /// This means other modes (datalog, owl2rl) can be enabled independently
-    /// and RDFS will still be auto-enabled unless explicitly disabled.
-    pub fn effective_with_hierarchy(self, hierarchy_available: bool) -> Self {
-        if self.explicit_none {
-            // User explicitly disabled - no auto-enable
-            return self;
-        }
-        // Auto-enable RDFS if not already enabled and hierarchy exists
-        if !self.rdfs && hierarchy_available {
-            Self { rdfs: true, ..self }
-        } else {
-            self
-        }
-    }
 }
 
 /// Reasoning configuration consumed by the rewriter. Solution modifiers
@@ -373,10 +353,9 @@ pub struct ReasoningConfig {
     /// Reasoning modes for RDFS/OWL reasoning
     ///
     /// Controls pattern expansion based on class/property hierarchies.
-    /// Default is to auto-enable RDFS when hierarchy exists.
-    ///
-    /// Use `modes.effective_with_hierarchy(has_hierarchy)` at execution
-    /// time to compute the actual modes to apply.
+    /// Reasoning is opt-in: no mode runs unless explicitly requested by the
+    /// query (`"reasoning"` key / SPARQL pragma), the view builder, or a
+    /// ledger-config reasoning default.
     pub modes: ReasoningModes,
     /// Pre-resolved schema bundle flakes projected to `g_id=0`.
     ///
@@ -637,43 +616,11 @@ mod tests {
     }
 
     #[test]
-    fn test_reasoning_modes_effective_with_hierarchy_auto_rdfs() {
-        // Default modes (no explicit setting) + hierarchy available = RDFS enabled
+    fn test_reasoning_is_opt_in_by_default() {
+        // Default modes request nothing — reasoning must be explicitly enabled
+        // (no auto-RDFS, regardless of whether a schema hierarchy exists).
         let modes = ReasoningModes::default();
-        let effective = modes.effective_with_hierarchy(true);
-        assert!(effective.rdfs);
-    }
-
-    #[test]
-    fn test_reasoning_modes_effective_with_hierarchy_no_auto_without_hierarchy() {
-        // Default modes + no hierarchy = RDFS not enabled
-        let modes = ReasoningModes::default();
-        let effective = modes.effective_with_hierarchy(false);
-        assert!(!effective.rdfs);
-    }
-
-    #[test]
-    fn test_reasoning_modes_effective_explicit_none_overrides_auto() {
-        // Explicit "none" + hierarchy available = RDFS NOT enabled
-        let modes = ReasoningModes::none();
-        let effective = modes.effective_with_hierarchy(true);
-        assert!(!effective.rdfs);
-    }
-
-    #[test]
-    fn test_reasoning_modes_effective_explicit_rdfs_without_hierarchy() {
-        // Explicit RDFS + no hierarchy = RDFS still requested (may warn at runtime)
-        let modes = ReasoningModes::rdfs();
-        let effective = modes.effective_with_hierarchy(false);
-        assert!(effective.rdfs);
-    }
-
-    #[test]
-    fn test_reasoning_modes_effective_preserves_other_modes() {
-        // Auto-RDFS shouldn't affect other modes
-        let modes = ReasoningModes::default().with_datalog();
-        let effective = modes.effective_with_hierarchy(true);
-        assert!(effective.rdfs);
-        assert!(effective.datalog);
+        assert!(!modes.has_any_enabled());
+        assert!(!modes.is_disabled());
     }
 }

@@ -75,9 +75,15 @@ pub(crate) fn count_plan_operator(
             // here (unlike `fast_path_store`). Multi-ledger / `from_t` / non-root
             // policy still bail.
             if !allow_cursor_fast_path(ctx) {
+                tracing::debug!(
+                    multi_ledger = ctx.is_multi_ledger(),
+                    has_from_t = ctx.from_t.is_some(),
+                    "count plan declined: cursor fast path gate"
+                );
                 return Ok(None);
             }
             let Some(store) = ctx.binary_store.as_ref() else {
+                tracing::debug!("count plan declined: no binary store");
                 return Ok(None);
             };
             let g_id = ctx.binary_g_id;
@@ -96,6 +102,7 @@ pub(crate) fn count_plan_operator(
             // under overlay must bail to the (correct, slower) generic fallback
             // rather than read stale base-only counts.
             if overlay && !plan_overlay_supported(&plan.root) {
+                tracing::debug!("count plan declined: overlay lane unsupported for plan shape");
                 return Ok(None);
             }
 
@@ -112,7 +119,15 @@ pub(crate) fn count_plan_operator(
                         .map_err(|_| QueryError::execution("COUNT(*) exceeds i64 in count plan"))?;
                     Ok(Some(build_count_batch(out_var, count_i64)?))
                 }
-                None => Ok(None), // Fall through to general pipeline.
+                None => {
+                    // Fall through to general pipeline.
+                    tracing::debug!(
+                        overlay,
+                        plan_root = ?plan.root,
+                        "count plan declined: executor returned no result"
+                    );
+                    Ok(None)
+                }
             }
         },
         fallback,
