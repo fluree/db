@@ -72,9 +72,12 @@ usearch = { version = "2.16", optional = true }
 native = ["fluree-db-core/native"]
 # Enable embedded vector search (HNSW-based approximate nearest neighbor)
 vector = ["dep:usearch"]
-# EXPERIMENT(debug/cancellation-timings): compile cooperative-cancellation
-# checks out of the fused-COUNT hot loops, making their bodies bit-identical
-# to pre-cancellation builds. For regression bisection only — do not ship.
+# Diagnostic control: compile out all cooperative-cancellation checkpoints
+# routed through `fast_path_common::bail_if_cancelled` (leaflet-refill,
+# partition-start, and property-path traversal checks). Build with this
+# feature to A/B whether cancellation checks contribute to a perf regression;
+# queries remain cancellable only at generic per-batch operator boundaries.
+# Never enable in production builds.
 cancel-checks-off = []
 
 [dev-dependencies]
