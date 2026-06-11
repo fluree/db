@@ -567,3 +567,191 @@ async fn batched_object_join_merges_novelty() {
         );
     }
 }
+
+/// Decimal (NumBig arena) overlay translation: retracts and re-asserts of
+/// already-indexed `xsd:decimal` values resolve to their arena handles, so
+/// the batched lane stays live (previously ANY decimal in novelty declined
+/// the whole predicate lane and, on the range path, warned per flake). A
+/// value the index has never seen has no handle — the lane declines to the
+/// overlay-correct fallback.
+#[tokio::test]
+async fn batched_join_decimal_novelty() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/join-batched-decimal:main";
+    let ledger = genesis_ledger_for_fluree(&fluree, ledger_id);
+
+    fn dec(v: &str) -> serde_json::Value {
+        json!({"@value": v, "@type": "http://www.w3.org/2001/XMLSchema#decimal"})
+    }
+
+    let base = json!({
+        "@context": ctx(),
+        "@graph": [
+            {"@id": "ex:alice", "ex:knows": {"@id": "ex:bob"}},
+            {"@id": "ex:carol", "ex:knows": {"@id": "ex:dave"}},
+            {"@id": "ex:eve",   "ex:knows": {"@id": "ex:frank"}},
+            {"@id": "ex:bob",   "ex:budget": dec("19.99")},
+            {"@id": "ex:dave",  "ex:budget": dec("30.50")},
+            {"@id": "ex:frank", "ex:budget": dec("40.25")}
+        ]
+    });
+    let receipt = fluree.insert(ledger, &base).await.expect("base insert");
+    fluree
+        .reindex(ledger_id, ReindexOptions::default())
+        .await
+        .expect("reindex base");
+
+    // Novelty phase A: only arena-resolvable decimal ops — dave's budget
+    // retracted, frank's retracted and re-asserted with the same value.
+    let receipt = fluree
+        .update(
+            receipt.ledger,
+            &json!({
+                "@context": ctx(),
+                "where":  {"@id": "ex:dave", "ex:budget": "?v"},
+                "delete": {"@id": "ex:dave", "ex:budget": "?v"}
+            }),
+        )
+        .await
+        .expect("retract dave budget");
+    let receipt = fluree
+        .update(
+            receipt.ledger,
+            &json!({
+                "@context": ctx(),
+                "where":  {"@id": "ex:frank", "ex:budget": "?v"},
+                "delete": {"@id": "ex:frank", "ex:budget": "?v"}
+            }),
+        )
+        .await
+        .expect("retract frank budget");
+    let receipt = fluree
+        .insert(
+            receipt.ledger,
+            &json!({"@context": ctx(), "@id": "ex:frank", "ex:budget": dec("40.25")}),
+        )
+        .await
+        .expect("re-assert frank budget");
+
+    let phase_a: &[(&str, &str, usize)] = &[
+        (
+            "carol-budget-retracted",
+            r"PREFIX ex: <http://example.org/ns/>
+              SELECT ?v WHERE { ex:carol ex:knows ?b . ?b ex:budget ?v } ORDER BY ?v",
+            0,
+        ),
+        (
+            "eve-budget-reasserted",
+            r"PREFIX ex: <http://example.org/ns/>
+              SELECT ?v WHERE { ex:eve ex:knows ?b . ?b ex:budget ?v } ORDER BY ?v",
+            1,
+        ),
+        (
+            "alice-budget-base",
+            r"PREFIX ex: <http://example.org/ns/>
+              SELECT ?v WHERE { ex:alice ex:knows ?b . ?b ex:budget ?v } ORDER BY ?v",
+            1,
+        ),
+    ];
+
+    let view = fluree
+        .db_at_t(ledger_id, receipt.ledger.t())
+        .await
+        .expect("phase A view");
+    let mut results_a = Vec::new();
+    for (name, query, expected_len) in phase_a {
+        let (spans, guard) = span_capture::init_test_tracing();
+        let rows = run_query(&fluree, &view, query).await;
+        drop(guard);
+        assert_eq!(rows.len(), *expected_len, "{name}: rows; got {rows:?}");
+        // Arena-resolved decimal ops keep the lane live — engagement proves
+        // translation succeeded (a single untranslatable op would decline
+        // the predicate's lane entirely).
+        assert!(
+            spans.has_span("join_flush_batched_binary"),
+            "{name}: decimal ops should translate and keep the batched lane \
+             live; spans: {:?}",
+            spans.span_names()
+        );
+        results_a.push(rows);
+    }
+
+    // Novelty phase B: a decimal the index has never seen — no arena handle,
+    // so the budget lane declines and the fallback serves (still correct).
+    let _receipt = fluree
+        .insert(
+            receipt.ledger,
+            &json!({
+                "@context": ctx(),
+                "@graph": [
+                    {"@id": "ex:alice", "ex:knows": {"@id": "ex:grace"}},
+                    {"@id": "ex:grace", "ex:budget": dec("55.55")}
+                ]
+            }),
+        )
+        .await
+        .expect("novelty-new decimal");
+
+    // Second view fetch after more commits: pin the post-commit t (a cached
+    // pre-commit view can otherwise serve).
+    let view = fluree
+        .db_at_t(ledger_id, _receipt.ledger.t())
+        .await
+        .expect("phase B view");
+    let alice_q = r"PREFIX ex: <http://example.org/ns/>
+        SELECT ?v WHERE { ex:alice ex:knows ?b . ?b ex:budget ?v } ORDER BY ?v";
+    let rows_b = run_query(&fluree, &view, alice_q).await;
+    assert_eq!(rows_b.len(), 2, "phase B: bob + grace; got {rows_b:?}");
+
+    // Ground truth for both phases' final state.
+    fluree
+        .reindex(ledger_id, ReindexOptions::default())
+        .await
+        .expect("reindex ground truth");
+    let view = fluree
+        .db_at_t(ledger_id, _receipt.ledger.t())
+        .await
+        .expect("indexed view");
+    // Decimal rendering differs between raw-flake-served values (plain
+    // string) and arena-decoded ones (`{"@value": …}`) — a pre-existing
+    // formatter discrepancy — so compare extracted decimal values rather
+    // than exact JSON shapes.
+    let indexed_b = run_query(&fluree, &view, alice_q).await;
+    assert_eq!(
+        decimal_values(&indexed_b),
+        decimal_values(&rows_b),
+        "phase B != reindexed ground truth"
+    );
+    for ((name, query, _), novelty_rows) in phase_a.iter().zip(&results_a) {
+        // dave/frank state is unchanged by phase B; their queries must match.
+        if *name == "alice-budget-base" {
+            continue;
+        }
+        let indexed_rows = run_query(&fluree, &view, query).await;
+        assert_eq!(
+            decimal_values(&indexed_rows),
+            decimal_values(novelty_rows),
+            "{name} != reindexed ground truth"
+        );
+    }
+}
+
+/// Extract decimal lexical values from result rows regardless of whether the
+/// formatter rendered them as plain strings or `{"@value": …}` objects.
+fn decimal_values(rows: &[serde_json::Value]) -> Vec<String> {
+    let mut out: Vec<String> = rows
+        .iter()
+        .flat_map(|row| row.as_array().into_iter().flatten())
+        .map(|cell| match cell {
+            serde_json::Value::String(s) => s.clone(),
+            serde_json::Value::Object(o) => o
+                .get("@value")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            other => other.to_string(),
+        })
+        .collect();
+    out.sort();
+    out
+}

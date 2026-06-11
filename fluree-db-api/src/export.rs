@@ -131,7 +131,7 @@ fn surviving_untranslated(flakes: Vec<Flake>) -> Vec<Flake> {
 struct ExportResolver<'a> {
     store: &'a Arc<BinaryIndexStore>,
     dict_novelty: Option<&'a Arc<DictNovelty>>,
-    /// Reverse map: ephemeral p_id → Sid (inverted from translate_overlay_flakes).
+    /// Reverse map: ephemeral p_id → Sid (inverted from translate_overlay_flakes_with_untranslated).
     ephemeral_preds_reverse: HashMap<u32, Sid>,
 }
 

@@ -150,8 +150,6 @@ fn inline_ops_need_t(ops: &[InlineOperator]) -> bool {
     })
 }
 
-// `translate_overlay_flakes` lives below, after BinaryScanOperator.
-
 // ============================================================================
 // BinaryScanOperator
 // ============================================================================
@@ -1757,7 +1755,7 @@ impl Operator for BinaryScanOperator {
             } else {
                 let encoded = match (dt_sid.or(inferred_dt_sid.as_ref()), lang) {
                     (Some(dt_sid), lang) => {
-                        value_to_otype_okey(bound_o, dt_sid, lang, store_ref, dict_novelty)
+                        value_to_otype_okey(bound_o, dt_sid, lang, store_ref, dict_novelty, None)
                     }
                     // Refs and untyped strings are handled above; this is reached
                     // for untyped non-string values (numeric/bool/date/…).
@@ -2154,49 +2152,8 @@ impl Operator for BinaryScanOperator {
 /// Uses the V6 store for persisted dictionary lookups and DictNovelty for
 /// ephemeral IDs from uncommitted transactions.
 /// Ephemeral predicate mapping: IRI → ephemeral p_id for predicates that only
-/// exist in novelty. Callers must use this to extend p_id resolution so that
-/// novelty-only predicates can be resolved back to IRIs during decode.
+/// Map of novelty-only predicate Sid → ephemeral p_id assigned during overlay translation.
 pub type EphemeralPredicateMap = HashMap<Sid, u32>;
-
-pub fn translate_overlay_flakes(
-    overlay: &dyn OverlayProvider,
-    store: &Arc<BinaryIndexStore>,
-    dict_novelty: Option<&Arc<fluree_db_core::dict_novelty::DictNovelty>>,
-    runtime_small_dicts: Option<&RuntimeSmallDicts>,
-    to_t: i64,
-    g_id: GraphId,
-) -> (Vec<OverlayOp>, EphemeralPredicateMap) {
-    let mut ops = Vec::new();
-    let mut ephemeral_preds: EphemeralPredicateMap = HashMap::new();
-    let mut next_ephemeral_p_id = runtime_small_dicts
-        .map(|dicts| dicts.predicate_count().max(store.predicate_count()))
-        .unwrap_or_else(|| store.predicate_count());
-
-    overlay.for_each_overlay_flake(
-        g_id,
-        fluree_db_core::IndexType::Spot,
-        None,
-        None,
-        true,
-        to_t,
-        &mut |flake| match translate_one_flake_v3_pub(
-            flake,
-            store,
-            dict_novelty,
-            runtime_small_dicts,
-            &mut ephemeral_preds,
-            &mut next_ephemeral_p_id,
-            g_id,
-        ) {
-            Ok(op) => ops.push(op),
-            Err(e) => {
-                tracing::warn!(error = %e, "failed to translate overlay flake to V3");
-            }
-        },
-    );
-
-    (ops, ephemeral_preds)
-}
 
 /// Translate overlay flakes to V3 overlay ops, also returning flakes that cannot be translated
 /// and the mapping of novelty-only predicate IRIs to ephemeral p_ids.
@@ -2343,7 +2300,14 @@ pub(crate) fn translate_one_flake_v3_pub(
     }
 
     // Object value → (o_type, o_key), using flake.dt + lang for proper OType.
-    let (o_type, o_key) = value_to_otype_okey(&flake.o, &flake.dt, lang, store, dict_novelty)?;
+    let (o_type, o_key) = value_to_otype_okey(
+        &flake.o,
+        &flake.dt,
+        lang,
+        store,
+        dict_novelty,
+        Some((g_id, p_id)),
+    )?;
 
     // List index
     let o_i = flake
@@ -2432,6 +2396,11 @@ fn value_to_otype_okey(
     lang: Option<&str>,
     store: &BinaryIndexStore,
     dict_novelty: Option<&Arc<fluree_db_core::dict_novelty::DictNovelty>>,
+    // `(g_id, p_id)` for NumBig arena lookups: big numerics (overflow
+    // integers, typed decimals) are arena-handle-keyed per (graph,
+    // predicate). `None` (bound-object prefilter callers) keeps them
+    // Unsupported as before.
+    numbig_ctx: Option<(GraphId, u32)>,
 ) -> std::io::Result<(OType, u64)> {
     // If the value has a language tag, it's rdf:langString — encode lang_id into OType.
     if let Some(lang_tag) = lang {
@@ -2566,12 +2535,51 @@ fn value_to_otype_okey(
             ObjKey::encode_day_time_dur(d.micros()).as_u64(),
         )),
         FlakeValue::GeoPoint(bits) => Ok((OType::GEO_POINT, bits.0)),
-        // Types not yet handled: BigInt, Decimal, Vector, Duration
+        // Big numerics mirror the resolver: i64-fitting integers are inline;
+        // everything else is keyed by a per-(graph, predicate) NumBig arena
+        // handle, resolvable read-only for values the index has seen. A value
+        // absent from the arena (asserted only in novelty) has no handle —
+        // Unsupported, so callers take the raw-flake / decline path.
+        FlakeValue::BigInt(bi) => {
+            if let Some(v) = num_traits::ToPrimitive::to_i64(bi.as_ref()) {
+                let ot = dt_otype.ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::Unsupported,
+                        "datatype not resolvable to OType for BigInt value",
+                    )
+                })?;
+                return Ok((ot, ObjKey::encode_i64(v).as_u64()));
+            }
+            find_numbig_okey(val, store, numbig_ctx)
+        }
+        FlakeValue::Decimal(_) => find_numbig_okey(val, store, numbig_ctx),
+        // Not handled: Vector (arena + HNSW identity; raw-merge is the
+        // intended lane) and generic Duration (its V3 decode is a stub —
+        // the raw flake preserves the value, the binary row would not).
         _ => Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
             format!("unsupported FlakeValue variant for V3 overlay: {val:?}"),
         )),
     }
+}
+
+/// Resolve a big numeric value to its `(NUM_BIG_OVERFLOW, arena handle)`
+/// encoding, or `Unsupported` when the value is not in the arena / no
+/// `(g_id, p_id)` context is available.
+fn find_numbig_okey(
+    val: &FlakeValue,
+    store: &BinaryIndexStore,
+    numbig_ctx: Option<(GraphId, u32)>,
+) -> std::io::Result<(OType, u64)> {
+    numbig_ctx
+        .and_then(|(g_id, p_id)| store.find_numbig_handle(g_id, p_id, val))
+        .map(|handle| (OType::NUM_BIG_OVERFLOW, handle as u64))
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "big numeric value not in NumBig arena (novelty-new); use raw flake path",
+            )
+        })
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2597,7 +2605,7 @@ pub(crate) fn encode_bound_object_prefilter(
 
     match (dt_sid, lang) {
         (Some(dt_sid), lang) => {
-            let (ot, key) = value_to_otype_okey(val, dt_sid, lang, store, dict_novelty)?;
+            let (ot, key) = value_to_otype_okey(val, dt_sid, lang, store, dict_novelty, None)?;
             Ok(EncodedObjectPrefilter {
                 o_type: Some(ot),
                 o_key: key,
