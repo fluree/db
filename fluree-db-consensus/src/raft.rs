@@ -56,8 +56,10 @@ use crate::{
     TransactionReceipt, TransactionRequest,
 };
 use async_trait::async_trait;
-use fluree_db_api::{ConflictStrategy, Fluree, GuardedStagedCommit, StagedMerge, StagedRevert};
-use fluree_db_core::{CommitId, ContentStore};
+use fluree_db_api::{
+    ConflictStrategy, Fluree, GuardedStagedCommit, StagedMerge, StagedRebase, StagedRevert,
+};
+use fluree_db_core::{CommitId, ContentId, ContentStore};
 use fluree_db_ledger::IndexConfig;
 use openraft::{BasicNode, Raft};
 use std::sync::Arc;
@@ -654,13 +656,204 @@ impl Committer for RaftCommitter {
         }
     }
 
-    async fn rebase(&self, _request: RebaseRequest) -> Result<RebaseReceipt, SubmissionError> {
-        todo!("RaftCommitter::rebase — pending merge/rebase/revert dry-run terminals")
+    async fn rebase(&self, request: RebaseRequest) -> Result<RebaseReceipt, SubmissionError> {
+        let RebaseRequest {
+            idempotency_key,
+            ledger_name,
+            branch,
+            strategy,
+        } = request;
+
+        // 1. Build the staged rebase. Validation, FF detection,
+        //    summary scan, abort check, source-index copy, write
+        //    guard acquisition, and the chained build of N replay
+        //    commits all live inside `prepare_rebase`. On success
+        //    the build phase has done no durable writes — blobs and
+        //    ref advance happen in (4-5) below.
+        let StagedRebase {
+            branch: branch_name,
+            branch_id,
+            source: _,
+            source_id: _,
+            source_head_id,
+            source_head_t,
+            fast_forward,
+            total_commits,
+            replayed,
+            skipped,
+            conflicts,
+            rollback_snapshot: _,
+            pre_rebase_head_id,
+            pre_rebase_head_t: _,
+            new_head_id,
+            new_head_t,
+            write_guard,
+            final_state,
+            pending_replays,
+        } = self
+            .fluree
+            .prepare_rebase(&ledger_name, &branch, strategy)
+            .await
+            .map_err(execution_failure)?;
+
+        // 2. All-skipped no-op: every conflicting commit was dropped
+        //    by `Skip` (or every replay had empty flakes after
+        //    resolution). Nothing to propose; return the receipt
+        //    with `replayed: 0`.
+        let Some(advance_to) = new_head_id else {
+            return Ok(RebaseReceipt {
+                idempotency_key,
+                branch: branch_name,
+                fast_forward,
+                replayed,
+                skipped,
+                conflicts: conflicts.len(),
+                failures: 0,
+                total_commits,
+                source_head_t,
+                source_head_id,
+                strategy,
+            });
+        };
+
+        // 3. Write all built replay blobs to the shared content
+        //    store. Fast-forward has no `pending_replays` (source's
+        //    commits are already in their namespace and addressable
+        //    through the branched store fallback); only general
+        //    rebase writes blobs here.
+        for replay in &pending_replays {
+            self.content_store
+                .put_with_id(&replay.commit_id, &replay.commit_bytes)
+                .await
+                .map_err(|e| SubmissionError::Execution {
+                    status: 500,
+                    message: format!("rebase commit blob write failed: {e}"),
+                })?;
+        }
+
+        // 4. Materialize idempotency context.
+        let idempotency_ctx = idempotency_key.as_ref().map(|key| SmIdempotencyContext {
+            key: IdempotencyCacheKey::new(branch_id.clone(), key.clone()),
+            body_hash: rebase_body_hash(&branch_id, fast_forward, &strategy, &advance_to),
+        });
+
+        // 5. Single atomic AdvanceRef proposal: jumps branch HEAD
+        //    from its pre-rebase position past all intermediate
+        //    replays to `advance_to`. Intermediate replays are
+        //    addressable in the content store but aren't on the
+        //    active head chain until this advance commits.
+        let applied_at_millis = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let cmd = SmCommand::AdvanceRef(AdvanceRefArgs {
+            ledger_id: ledger_name,
+            branch: branch_name.clone(),
+            expected_prev: pre_rebase_head_id,
+            new_head: advance_to.clone(),
+            t: new_head_t,
+            applied_at_millis,
+            idempotency: idempotency_ctx,
+            release: Vec::<ExecutionRecordRef>::new(),
+            tally: None,
+        });
+
+        let resp =
+            self.raft
+                .client_write(cmd)
+                .await
+                .map_err(|e| SubmissionError::Execution {
+                    status: 500,
+                    message: format!("raft client_write failed: {e}"),
+                })?;
+
+        // 6. Translate Response → RebaseReceipt; on Applied, install
+        //    the cumulative `final_state` through the held write
+        //    guard so the leader's cache catches up with consensus.
+        match resp.data {
+            SmResponse::Applied {
+                head_t,
+                head_id,
+                accepted: _,
+                release: _,
+                tally: _,
+            } => {
+                if let Some(guard) = write_guard {
+                    let needs_reindex = final_state.should_reindex(&self.index_config);
+                    self.fluree
+                        .finalize_commit(guard, final_state, head_t, needs_reindex)
+                        .await
+                        .map_err(execution_failure)?;
+                }
+                Ok(RebaseReceipt {
+                    idempotency_key,
+                    branch: branch_name,
+                    fast_forward,
+                    replayed,
+                    skipped,
+                    conflicts: conflicts.len(),
+                    failures: 0,
+                    total_commits,
+                    source_head_t: head_t,
+                    source_head_id: head_id,
+                    strategy,
+                })
+            }
+            SmResponse::Conflict {
+                current_head: _,
+                current_t: _,
+            } => Err(SubmissionError::Execution {
+                status: 409,
+                message: "raft CAS conflict on AdvanceRef for rebase".into(),
+            }),
+            SmResponse::BodyHashMismatch => Err(SubmissionError::KeyCollision),
+            SmResponse::LedgerNotFound { ledger_id } => Err(SubmissionError::Execution {
+                status: 404,
+                message: format!("ledger not found: {ledger_id}"),
+            }),
+            SmResponse::Created { .. }
+            | SmResponse::Deleted { .. }
+            | SmResponse::AlreadyExists { .. }
+            | SmResponse::NoOp => Err(SubmissionError::Execution {
+                status: 500,
+                message: "unexpected Response variant for AdvanceRef".into(),
+            }),
+        }
     }
 
     async fn push(&self, _request: PushRequest) -> Result<PushReceipt, SubmissionError> {
         todo!("RaftCommitter::push — pending push dry-run terminal")
     }
+}
+
+/// Body hash for rebase idempotency. Domain-tagged so a key reused
+/// across operation kinds is a collision rather than a cross-shape
+/// dedup. Inputs are the validated request fields the state machine
+/// can verify on retry: the resolved branch id, the fast-forward
+/// bit, the conflict strategy, and the new head the proposal would
+/// advance the ref to (which is content-derived from the rebase
+/// inputs, so a retry of the same request produces the same value).
+fn rebase_body_hash(
+    branch_id: &str,
+    fast_forward: bool,
+    strategy: &ConflictStrategy,
+    new_head: &ContentId,
+) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(b"rebase");
+    hasher.update(branch_id.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(if fast_forward {
+        b"ff".as_slice()
+    } else {
+        b"general".as_slice()
+    });
+    hasher.update(b"\0");
+    hasher.update(strategy.as_str().as_bytes());
+    hasher.update(b"\0");
+    hasher.update(new_head.to_string().as_bytes());
+    hasher.finalize().into()
 }
 
 /// Body hash for merge idempotency. Domain-tagged so a key reused
