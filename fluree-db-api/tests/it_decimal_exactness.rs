@@ -169,6 +169,65 @@ async fn sparql_decimal_constant_matches_stored_decimal() {
 }
 
 #[tokio::test]
+async fn jsonld_number_decimal_matches_sparql_constant_across_paths() {
+    // The same decimal written as a JSON number via JSON-LD and referenced
+    // as a SPARQL constant must be ONE value — not two encodings.
+    let fluree = memory_fluree();
+    let ledger = genesis_ledger(&fluree, "decimal/crosspath:main");
+
+    let insert = serde_json::json!({
+        "@context": {
+            "ex": "http://example.org/",
+            "xsd": "http://www.w3.org/2001/XMLSchema#"
+        },
+        "@id": "ex:item",
+        "ex:price": {"@value": 19.99, "@type": "xsd:decimal"}
+    });
+    let ledger = fluree.insert(ledger, &insert).await.expect("insert").ledger;
+
+    // SPARQL constant matches the JSON-LD-ingested value.
+    let query = r#"
+        PREFIX ex: <http://example.org/>
+        SELECT ?s WHERE { ?s ex:price 19.99 . }
+    "#;
+    let result = support::query_sparql(&fluree, &ledger, query)
+        .await
+        .expect("query");
+    let sparql_json = result
+        .to_sparql_json(&ledger.snapshot)
+        .expect("to_sparql_json");
+    assert_eq!(binding_values(&sparql_json, "s"), vec!["ex:item"]);
+
+    // SPARQL DELETE DATA retracts the JSON-LD-ingested fact.
+    let result = run_sparql_update(
+        &fluree,
+        ledger,
+        r#"
+        PREFIX ex: <http://example.org/>
+        DELETE DATA { ex:item ex:price 19.99 . }
+        "#,
+    )
+    .await;
+    let ledger = result.ledger;
+
+    let query = r#"
+        PREFIX ex: <http://example.org/>
+        SELECT ?price WHERE { ex:item ex:price ?price . }
+    "#;
+    let result = support::query_sparql(&fluree, &ledger, query)
+        .await
+        .expect("query");
+    let sparql_json = result
+        .to_sparql_json(&ledger.snapshot)
+        .expect("to_sparql_json");
+    assert_eq!(
+        binding_values(&sparql_json, "price"),
+        Vec::<String>::new(),
+        "SPARQL DELETE DATA must retract the JSON-LD-ingested decimal"
+    );
+}
+
+#[tokio::test]
 async fn sparql_delete_data_decimal_retracts_exactly() {
     let fluree = memory_fluree();
     let ledger = genesis_ledger(&fluree, "decimal/delete:main");

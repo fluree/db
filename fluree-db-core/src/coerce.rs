@@ -253,8 +253,36 @@ pub fn coerce_value(value: FlakeValue, datatype_iri: &str) -> CoercionResult<Fla
             Ok(FlakeValue::BigInt(n.clone()))
         }
 
-        // Long → xsd:decimal: convert to Double (policy: JSON numbers are lossy)
-        (FlakeValue::Long(n), dt) if dt == xsd::DECIMAL => Ok(FlakeValue::Double(*n as f64)),
+        // Long → xsd:decimal: exact conversion (i64 is always representable)
+        (FlakeValue::Long(n), dt) if dt == xsd::DECIMAL => {
+            Ok(FlakeValue::Decimal(Box::new(BigDecimal::from(*n))))
+        }
+
+        // Double → xsd:decimal: recover the written lexical via the shortest
+        // round-trip representation. A JSON number like 19.99 parses to the
+        // nearest f64, whose shortest representation is the original "19.99";
+        // digits beyond f64 precision (~17 significant) were already lost at
+        // JSON parse time and cannot be recovered here.
+        (FlakeValue::Double(d), dt) if dt == xsd::DECIMAL => {
+            if !d.is_finite() {
+                return Err(CoercionError::incompatible(
+                    &format!("number {d}"),
+                    "xsd:decimal",
+                    None,
+                ));
+            }
+            BigDecimal::from_str(&d.to_string())
+                .map(|bd| FlakeValue::Decimal(Box::new(bd)))
+                .map_err(|_| CoercionError::parse_failed(&d.to_string(), "xsd:decimal", None))
+        }
+
+        // BigInt → xsd:decimal: exact conversion
+        (FlakeValue::BigInt(n), dt) if dt == xsd::DECIMAL => Ok(FlakeValue::Decimal(Box::new(
+            BigDecimal::from((*n.clone(), 0)),
+        ))),
+
+        // Decimal → xsd:decimal: already exact
+        (FlakeValue::Decimal(d), dt) if dt == xsd::DECIMAL => Ok(FlakeValue::Decimal(d.clone())),
 
         // Long → xsd:double/xsd:float: widen to Double
         (FlakeValue::Long(n), dt) if dt == xsd::DOUBLE || dt == xsd::FLOAT => {
@@ -578,12 +606,14 @@ fn coerce_number_value(n: &serde_json::Number, datatype_iri: &str) -> CoercionRe
         ));
     }
 
-    // Number → Decimal
+    // Number → Decimal: parse the JSON number's lexical form exactly. For
+    // integers this is always exact; for fractional numbers serde_json has
+    // already gone through f64, and the shortest round-trip representation
+    // recovers the written lexical up to ~17 significant digits.
     if datatype_iri == xsd::DECIMAL {
-        let f = n
-            .as_f64()
-            .ok_or_else(|| CoercionError::new(format!("Cannot convert number {n} to f64")))?;
-        return Ok(FlakeValue::Double(f));
+        return BigDecimal::from_str(&n.to_string())
+            .map(|bd| FlakeValue::Decimal(Box::new(bd)))
+            .map_err(|_| CoercionError::parse_failed(&n.to_string(), "xsd:decimal", None));
     }
 
     // Number → Integer family
