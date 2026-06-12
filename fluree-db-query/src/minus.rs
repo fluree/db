@@ -15,7 +15,7 @@ use crate::context::ExecutionContext;
 use crate::error::{QueryError, Result};
 use crate::execute::build_where_operators_seeded;
 use crate::ir::Pattern;
-use crate::object_binding::{equality_norm_store, normalize_for_key};
+use crate::object_binding::{equality_norm, normalize_for_key, EqualityNorm};
 use crate::operator::{BoxedOperator, Operator, OperatorState};
 use crate::seed::EmptyOperator;
 use crate::temporal_mode::PlanningContext;
@@ -86,7 +86,7 @@ pub struct MinusOperator {
     /// Store for normalizing decoded bindings to encoded form on both sides
     /// of the anti-join, so mixed-representation rows match. `None` outside
     /// single-ledger binary execution.
-    norm_store: Option<Arc<fluree_db_binary_index::BinaryIndexStore>>,
+    norm: Option<EqualityNorm>,
 }
 
 impl MinusOperator {
@@ -123,7 +123,7 @@ impl MinusOperator {
             planning,
             minus_hash: HashSet::new(),
             minus_wildcards: Vec::new(),
-            norm_store: None,
+            norm: None,
         }
     }
 
@@ -138,8 +138,10 @@ impl MinusOperator {
                     let binding = batch.column(var).map(|col| &col[row_idx]);
                     match binding {
                         Some(b) if b.is_matchable() => {
-                            key_bindings
-                                .push(Some(normalize_for_key(b, self.norm_store.as_deref())));
+                            key_bindings.push(Some({
+                                let (store, gv) = EqualityNorm::parts(&self.norm);
+                                normalize_for_key(b, store, gv)
+                            }));
                         }
                         _ => {
                             key_bindings.push(None);
@@ -183,7 +185,10 @@ impl MinusOperator {
             let binding = input_batch.column(var).map(|col| &col[row_idx]);
             match binding {
                 Some(b) if b.is_matchable() => {
-                    input_bindings.push(Some(normalize_for_key(b, self.norm_store.as_deref())));
+                    input_bindings.push(Some({
+                        let (store, gv) = EqualityNorm::parts(&self.norm);
+                        normalize_for_key(b, store, gv)
+                    }));
                 }
                 _ => {
                     input_bindings.push(None);
@@ -318,8 +323,8 @@ impl Operator for MinusOperator {
     }
 
     async fn open(&mut self, ctx: &ExecutionContext<'_>) -> Result<()> {
-        if self.norm_store.is_none() {
-            self.norm_store = equality_norm_store(ctx);
+        if self.norm.is_none() {
+            self.norm = equality_norm(ctx);
         }
         // Materialize the MINUS subtree once with an empty seed (fresh scope).
         // MINUS is always uncorrelated — the subtree doesn't see outer variables.
@@ -564,7 +569,7 @@ mod tests {
             planning: crate::temporal_mode::PlanningContext::current(),
             minus_hash: HashSet::new(),
             minus_wildcards: Vec::new(),
-            norm_store: None,
+            norm: None,
         }
     }
 

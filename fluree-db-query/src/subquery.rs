@@ -26,7 +26,7 @@ use crate::error::{QueryError, Result};
 use crate::execute::build_where_operators_seeded;
 use crate::group_aggregate::{binding_to_group_key_normalized, GroupKeyOwned};
 use crate::ir::{Pattern, SubqueryPattern};
-use crate::object_binding::equality_norm_store;
+use crate::object_binding::{equality_norm, EqualityNorm};
 use crate::operator::{
     compute_trimmed_vars, effective_schema, trim_batch, BoxedOperator, Operator, OperatorState,
 };
@@ -89,7 +89,7 @@ pub struct SubqueryOperator {
     /// Store for normalizing decoded bindings to encoded form on both join
     /// sides, so mixed-representation rows key identically. `None` outside
     /// single-ledger binary execution.
-    norm_store: Option<Arc<fluree_db_binary_index::BinaryIndexStore>>,
+    norm: Option<EqualityNorm>,
 }
 
 /// A once-evaluated subquery result, indexed for hash-join probing.
@@ -193,7 +193,7 @@ impl SubqueryOperator {
             join_keys,
             join_mode,
             materialized: None,
-            norm_store: None,
+            norm: None,
         }
     }
 
@@ -277,8 +277,8 @@ impl Operator for SubqueryOperator {
         self.child.open(ctx).await?;
         self.state = OperatorState::Open;
         self.materialized = None;
-        if self.norm_store.is_none() {
-            self.norm_store = equality_norm_store(ctx);
+        if self.norm.is_none() {
+            self.norm = equality_norm(ctx);
         }
         Ok(())
     }
@@ -330,7 +330,10 @@ impl Operator for SubqueryOperator {
                     .map(|v| {
                         parent_batch
                             .get(row_idx, *v)
-                            .map(|b| binding_to_group_key_normalized(b, self.norm_store.as_deref()))
+                            .map(|b| {
+                                let (store, gv) = EqualityNorm::parts(&self.norm);
+                                binding_to_group_key_normalized(b, store, gv)
+                            })
                             .unwrap_or(GroupKeyOwned::Absent)
                     })
                     .collect();
@@ -476,7 +479,10 @@ impl SubqueryOperator {
                     self.select_index
                         .get(v)
                         .and_then(|&si| row.get(si))
-                        .map(|b| binding_to_group_key_normalized(b, self.norm_store.as_deref()))
+                        .map(|b| {
+                            let (store, gv) = EqualityNorm::parts(&self.norm);
+                            binding_to_group_key_normalized(b, store, gv)
+                        })
                         .unwrap_or(GroupKeyOwned::Absent)
                 })
                 .collect();

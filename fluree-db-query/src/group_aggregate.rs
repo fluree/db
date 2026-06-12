@@ -255,8 +255,11 @@ impl AggState {
                     // Convert binding to owned group key for HashSet,
                     // normalizing decoded bindings so mixed-representation
                     // streams count as one value.
-                    let key =
-                        binding_to_group_key_normalized(binding, gv.map(BinaryGraphView::store));
+                    let key = binding_to_group_key_normalized(
+                        binding,
+                        gv.map(BinaryGraphView::store),
+                        gv,
+                    );
                     seen.insert(key);
                 }
             }
@@ -409,14 +412,26 @@ impl Hash for MaterializedLitKey {
     }
 }
 
-/// [`binding_to_group_key_owned`] with decoded→encoded normalization, so
+/// [`binding_to_group_key_owned`] with representation normalization, so
 /// mixed-representation streams (encoded scan output meeting decoded
 /// VALUES/UNION/BIND bindings) key identically. Pass the store whenever the
-/// stream may contain late-materialized bindings.
+/// stream may contain late-materialized bindings; pass the graph view so
+/// arena-backed NUM_BIG values key by decoded numeric value (handles are
+/// per-(graph, predicate) and not canonical across representations).
 pub(crate) fn binding_to_group_key_normalized(
     binding: &Binding,
     store: Option<&fluree_db_binary_index::BinaryIndexStore>,
+    gv: Option<&BinaryGraphView>,
 ) -> GroupKeyOwned {
+    if crate::object_binding::is_numbig_encoded(binding) {
+        if let Some(gv) = gv {
+            let materialized = materialize_encoded(binding, Some(gv));
+            if !matches!(materialized, Binding::EncodedLit { .. }) {
+                return binding_to_group_key_owned(&materialized);
+            }
+        }
+        return binding_to_group_key_owned(binding);
+    }
     if let Some(store) = store {
         if let Some(normalized) = crate::object_binding::encoded_equivalent(binding, store) {
             return binding_to_group_key_owned(&normalized);
@@ -496,6 +511,23 @@ fn flake_value_to_key(val: &FlakeValue, dtc: &DatatypeConstraint) -> Materialize
             string_val: None,
             number_bits: None,
             bool_val: Some(*b),
+            dtc: dtc.clone(),
+        },
+        // Decimals key on the normalized lexical: 1.5 and 1.50 are one
+        // xsd:decimal value and must land in one group. (The Debug catch-all
+        // below is scale-sensitive and structurally fragile.)
+        FlakeValue::Decimal(d) => MaterializedLitKey {
+            discriminant: 5,
+            string_val: Some(Arc::from(d.normalized().to_string())),
+            number_bits: None,
+            bool_val: None,
+            dtc: dtc.clone(),
+        },
+        FlakeValue::BigInt(n) => MaterializedLitKey {
+            discriminant: 6,
+            string_val: Some(Arc::from(n.to_string())),
+            number_bits: None,
+            bool_val: None,
             dtc: dtc.clone(),
         },
         _ => MaterializedLitKey {
@@ -649,7 +681,7 @@ impl GroupAggregateOperator {
             .iter()
             .map(|&col_idx| {
                 let binding = batch.get_by_col(row_idx, col_idx);
-                binding_to_group_key_normalized(binding, store)
+                binding_to_group_key_normalized(binding, store, self.graph_view.as_ref())
             })
             .collect();
         CompositeGroupKey(keys)

@@ -578,6 +578,100 @@ async fn scale_variant_decimal_retracts_indexed_fact() {
 }
 
 #[tokio::test]
+async fn group_by_and_distinct_unify_decimals_across_index_and_novelty() {
+    // The same decimal value served encoded from the index (arena handle)
+    // and decoded from novelty (raw flake) must land in ONE group and ONE
+    // distinct row.
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(fluree_db_api::LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "decimal/groupkey:main";
+
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        Arc::new(fluree.nameservice_mode().clone()),
+        fluree_db_indexer::IndexerConfig::small(),
+    );
+
+    local
+        .run_until(async move {
+            let ledger = genesis_ledger(&fluree, ledger_id);
+
+            let result = run_sparql_update(
+                &fluree,
+                ledger,
+                r"
+                PREFIX ex: <http://example.org/>
+                INSERT DATA {
+                    ex:a ex:price 19.99 .
+                    ex:b ex:price 5.25 .
+                }
+                ",
+            )
+            .await;
+            trigger_index_and_wait(&handle, ledger_id, result.receipt.t).await;
+            let ledger = fluree.ledger(ledger_id).await.expect("load ledger");
+
+            // Same value again via novelty (decoded lane) plus a scale variant.
+            let result = run_sparql_update(
+                &fluree,
+                ledger,
+                r#"
+                PREFIX ex: <http://example.org/>
+                PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+                INSERT DATA {
+                    ex:c ex:price 19.99 .
+                    ex:d ex:price "5.250"^^xsd:decimal .
+                }
+                "#,
+            )
+            .await;
+            let ledger = result.ledger;
+
+            // DISTINCT: two values total (19.99, 5.25), each in two
+            // representations.
+            let query = r"
+                PREFIX ex: <http://example.org/>
+                SELECT DISTINCT ?price WHERE { ?s ex:price ?price . }
+            ";
+            let result = support::query_sparql(&fluree, &ledger, query)
+                .await
+                .expect("distinct query");
+            let sparql_json = result
+                .to_sparql_json(&ledger.snapshot)
+                .expect("to_sparql_json");
+            let mut prices = binding_values(&sparql_json, "price");
+            prices.sort();
+            assert_eq!(
+                prices.len(),
+                2,
+                "index- and novelty-served copies of one value must dedup: {prices:?}"
+            );
+
+            // GROUP BY: each value groups its two subjects together.
+            let query = r"
+                PREFIX ex: <http://example.org/>
+                SELECT ?price (COUNT(?s) AS ?n)
+                WHERE { ?s ex:price ?price . }
+                GROUP BY ?price
+            ";
+            let result = support::query_sparql(&fluree, &ledger, query)
+                .await
+                .expect("group query");
+            let sparql_json = result
+                .to_sparql_json(&ledger.snapshot)
+                .expect("to_sparql_json");
+            let counts = binding_values(&sparql_json, "n");
+            assert_eq!(
+                counts,
+                vec!["2", "2"],
+                "each decimal value must form one group of two subjects"
+            );
+        })
+        .await;
+}
+
+#[tokio::test]
 async fn sparql_delete_data_decimal_retracts_exactly() {
     let fluree = memory_fluree();
     let ledger = genesis_ledger(&fluree, "decimal/delete:main");
