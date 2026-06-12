@@ -151,12 +151,12 @@ fn compare_for_minmax(
 
     // General path: materialize then use SPARQL ordering comparator.
     // BinaryGraphView handles novelty watermark routing internally.
-    let am = materialize_for_minmax(a, Some(gv));
-    let bm = materialize_for_minmax(b, Some(gv));
+    let am = materialize_encoded(a, Some(gv));
+    let bm = materialize_encoded(b, Some(gv));
     crate::sort::compare_bindings(&am, &bm)
 }
 
-fn materialize_for_minmax(binding: &Binding, gv: Option<&BinaryGraphView>) -> Binding {
+pub(crate) fn materialize_encoded(binding: &Binding, gv: Option<&BinaryGraphView>) -> Binding {
     let Some(gv) = gv else {
         return binding.clone();
     };
@@ -311,7 +311,11 @@ impl AggState {
                 }
             }
             AggState::Collect { values } => {
-                values.push(binding.clone());
+                // Median/Variance/Stddev/GroupConcat fold over decoded values;
+                // encoded bindings would be silently dropped by the value
+                // matchers in `aggregate.rs` (e.g. GROUP_CONCAT returned
+                // Unbound for every indexed-ledger string).
+                values.push(materialize_encoded(binding, gv));
             }
         }
     }
