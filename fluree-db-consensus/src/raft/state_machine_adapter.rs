@@ -15,11 +15,11 @@ use crate::raft::state_machine::{self, NameServiceState, Response};
 use crate::raft::storage::{
     RaftSnapshotStore, RaftStorage, SnapshotId as OurSnapshotId, SnapshotMeta as OurSnapshotMeta,
 };
-use crate::raft::{NodeId, TypeConfig};
+use crate::raft::{ClusterNode, NodeId, TypeConfig};
 use openraft::storage::{RaftSnapshotBuilder, RaftStateMachine};
 use openraft::{
-    AnyError, BasicNode, Entry, EntryPayload, ErrorSubject, ErrorVerb, LogId, Snapshot,
-    SnapshotMeta, StorageError, StorageIOError, StoredMembership,
+    AnyError, Entry, EntryPayload, ErrorSubject, ErrorVerb, LogId, Snapshot, SnapshotMeta,
+    StorageError, StorageIOError, StoredMembership,
 };
 use std::io::Cursor;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -74,7 +74,7 @@ where
 {
     state: SharedState,
     last_applied: Option<LogId<NodeId>>,
-    last_membership: StoredMembership<NodeId, BasicNode>,
+    last_membership: StoredMembership<NodeId, ClusterNode>,
     storage: Arc<S>,
     /// Monotonic counter for snapshot ids — combined with the
     /// last-applied index for uniqueness across rebuilds.
@@ -117,7 +117,7 @@ where
 
     async fn applied_state(
         &mut self,
-    ) -> Result<(Option<LogId<NodeId>>, StoredMembership<NodeId, BasicNode>), StorageError<NodeId>>
+    ) -> Result<(Option<LogId<NodeId>>, StoredMembership<NodeId, ClusterNode>), StorageError<NodeId>>
     {
         Ok((self.last_applied, self.last_membership.clone()))
     }
@@ -166,7 +166,7 @@ where
 
     async fn install_snapshot(
         &mut self,
-        meta: &SnapshotMeta<NodeId, BasicNode>,
+        meta: &SnapshotMeta<NodeId, ClusterNode>,
         snapshot: Box<Cursor<Vec<u8>>>,
     ) -> Result<(), StorageError<NodeId>> {
         let bytes = snapshot.into_inner();
@@ -205,7 +205,7 @@ where
         let Some((our_meta, data)) = current else {
             return Ok(None);
         };
-        let last_membership: StoredMembership<NodeId, BasicNode> =
+        let last_membership: StoredMembership<NodeId, ClusterNode> =
             postcard::from_bytes(&our_meta.membership).map_err(read_state_err)?;
         let meta = SnapshotMeta {
             last_log_id: our_meta.last_applied.map(to_openraft_log_id),
@@ -229,7 +229,7 @@ where
 {
     state: NameServiceState,
     last_applied: Option<LogId<NodeId>>,
-    last_membership: StoredMembership<NodeId, BasicNode>,
+    last_membership: StoredMembership<NodeId, ClusterNode>,
     storage: Arc<S>,
     counter: u64,
 }

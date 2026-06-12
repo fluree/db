@@ -20,13 +20,13 @@ use openraft::raft::{
     AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
     VoteRequest, VoteResponse,
 };
-use openraft::{BasicNode, Config, Raft, ServerState};
+use openraft::{Config, Raft, ServerState};
 
 use fluree_db_consensus::raft::log_adapter::LogAdapter;
 use fluree_db_consensus::raft::state_machine::{Command as SmCommand, CreateLedgerArgs, Response};
 use fluree_db_consensus::raft::state_machine_adapter::StateMachineAdapter;
 use fluree_db_consensus::raft::storage::memory::MemoryRaftStorage;
-use fluree_db_consensus::raft::{NodeId, TypeConfig};
+use fluree_db_consensus::raft::{ClusterNode, NodeId, TypeConfig};
 
 struct StubFactory;
 struct StubNetwork;
@@ -34,7 +34,7 @@ struct StubNetwork;
 impl RaftNetworkFactory<TypeConfig> for StubFactory {
     type Network = StubNetwork;
 
-    async fn new_client(&mut self, _target: NodeId, _node: &BasicNode) -> Self::Network {
+    async fn new_client(&mut self, _target: NodeId, _node: &ClusterNode) -> Self::Network {
         StubNetwork
     }
 }
@@ -44,7 +44,7 @@ impl RaftNetwork<TypeConfig> for StubNetwork {
         &mut self,
         _rpc: AppendEntriesRequest<TypeConfig>,
         _option: RPCOption,
-    ) -> Result<AppendEntriesResponse<NodeId>, RPCError<NodeId, BasicNode, RaftError<NodeId>>> {
+    ) -> Result<AppendEntriesResponse<NodeId>, RPCError<NodeId, ClusterNode, RaftError<NodeId>>> {
         panic!("single-node Raft should never invoke append_entries");
     }
 
@@ -54,7 +54,7 @@ impl RaftNetwork<TypeConfig> for StubNetwork {
         _option: RPCOption,
     ) -> Result<
         InstallSnapshotResponse<NodeId>,
-        RPCError<NodeId, BasicNode, RaftError<NodeId, InstallSnapshotError>>,
+        RPCError<NodeId, ClusterNode, RaftError<NodeId, InstallSnapshotError>>,
     > {
         panic!("single-node Raft should never invoke install_snapshot");
     }
@@ -63,7 +63,7 @@ impl RaftNetwork<TypeConfig> for StubNetwork {
         &mut self,
         _rpc: VoteRequest<NodeId>,
         _option: RPCOption,
-    ) -> Result<VoteResponse<NodeId>, RPCError<NodeId, BasicNode, RaftError<NodeId>>> {
+    ) -> Result<VoteResponse<NodeId>, RPCError<NodeId, ClusterNode, RaftError<NodeId>>> {
         panic!("single-node Raft should never invoke vote");
     }
 }
@@ -92,7 +92,7 @@ async fn single_node_create_ledger_round_trip() {
 
     // Bootstrap as a single-member cluster.
     let mut members = BTreeMap::new();
-    members.insert(1u64, BasicNode::default());
+    members.insert(1u64, ClusterNode::default());
     raft.initialize(members).await.unwrap();
 
     // Wait for self-election. With one node and a configured timeout,

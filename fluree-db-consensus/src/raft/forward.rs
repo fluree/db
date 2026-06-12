@@ -12,38 +12,23 @@
 //! This module gives you the primitives:
 //!
 //! - [`LeaderForwarder`]: per-node state — the Raft handle, this
-//!   node's id, the static [`NodeId`] → client-URL map, and a
-//!   pooled `reqwest::Client`.
+//!   node's id, and a pooled `reqwest::Client`.
 //! - [`forward_to_leader`]: an axum middleware that intercepts a
 //!   request, checks leadership, and either calls `next.run(...)`
 //!   (this node *is* the leader) or rebuilds the request as an
 //!   outbound HTTP call to the leader's client port and returns the
 //!   leader's response verbatim.
 //!
-//! # Configuring the map
+//! # Resolving the leader's client URL
 //!
-//! The forwarder needs the leader's **client-facing** URL, not the
-//! raft URL. Operators wire both at deploy time — each node's
-//! config carries the cluster topology:
-//!
-//! ```toml
-//! [cluster]
-//! node_id = 1
-//!
-//! [cluster.peers.1]
-//! raft_url = "http://node-1:9090/raft"
-//! client_url = "http://node-1:8080"
-//!
-//! [cluster.peers.2]
-//! raft_url = "http://node-2:9090/raft"
-//! client_url = "http://node-2:8080"
-//! ```
-//!
-//! `BasicNode.addr` (what openraft propagates through membership
-//! changes) carries the raft URL only; the client URLs live in this
-//! static map. v1 trade-off: the map is fixed at startup. Hot
-//! membership changes require restarting peers so they pick up the
-//! new node's client URL.
+//! [`ClusterNode`](crate::raft::ClusterNode) — the type config's
+//! `Node` — carries both `raft_addr` (the inter-node RPC URL) and
+//! `client_addr` (the client-facing URL). The membership openraft
+//! replicates therefore already contains every voter's and
+//! learner's client URL; the forwarder reads it from the current
+//! membership snapshot on each request, so a peer added at runtime
+//! via [`super::admin::RaftAdmin::add_learner`] is immediately
+//! reachable for forwarding on every other node — no restart.
 
 use crate::raft::{NodeId, TypeConfig};
 use axum::body::Body;
@@ -52,7 +37,6 @@ use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use openraft::Raft;
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
 /// Hop-by-hop headers from RFC 7230 §6.1 plus a couple of modern
@@ -79,40 +63,39 @@ const HOP_BY_HOP_HEADERS: &[&str] = &[
 pub struct LeaderForwarder {
     raft: Arc<Raft<TypeConfig>>,
     self_id: NodeId,
-    peer_client_urls: Arc<BTreeMap<NodeId, String>>,
     client: reqwest::Client,
 }
 
 impl LeaderForwarder {
-    /// Construct with the cluster topology already resolved into a
-    /// `NodeId` → client-URL map. The `self_id` entry can be
-    /// omitted (we never forward to ourselves), but including it is
-    /// harmless.
-    pub fn new(
-        raft: Arc<Raft<TypeConfig>>,
-        self_id: NodeId,
-        peer_client_urls: BTreeMap<NodeId, String>,
-        client: reqwest::Client,
-    ) -> Self {
+    pub fn new(raft: Arc<Raft<TypeConfig>>, self_id: NodeId, client: reqwest::Client) -> Self {
         Self {
             raft,
             self_id,
-            peer_client_urls: Arc::new(peer_client_urls),
             client,
         }
     }
 
     /// Decide whether this node should serve the request locally or
-    /// forward it. Returned [`ForwardDecision::Forward`] carries the
-    /// leader's client URL.
+    /// forward it, resolving the leader's client URL from the
+    /// current membership snapshot.
     async fn decide(&self) -> ForwardDecision {
-        match self.raft.current_leader().await {
-            Some(id) if id == self.self_id => ForwardDecision::Local,
-            Some(id) => match self.peer_client_urls.get(&id) {
-                Some(url) => ForwardDecision::Forward(url.clone()),
-                None => ForwardDecision::UnknownLeader(id),
-            },
-            None => ForwardDecision::NoLeader,
+        let Some(leader_id) = self.raft.current_leader().await else {
+            return ForwardDecision::NoLeader;
+        };
+        if leader_id == self.self_id {
+            return ForwardDecision::Local;
+        }
+        let metrics = self.raft.metrics().borrow().clone();
+        let leader_node = metrics
+            .membership_config
+            .nodes()
+            .find(|(id, _)| **id == leader_id)
+            .map(|(_, node)| node.clone());
+        match leader_node {
+            Some(node) if !node.client_addr.is_empty() => {
+                ForwardDecision::Forward(node.client_addr)
+            }
+            _ => ForwardDecision::UnknownLeader(leader_id),
         }
     }
 }
@@ -122,8 +105,10 @@ enum ForwardDecision {
     Local,
     /// Forward to the leader at this base client URL.
     Forward(String),
-    /// We know the leader's id but have no client URL for it (map
-    /// missing the entry). Usually a deployment-config bug.
+    /// We know the leader's id but the membership entry has no
+    /// `client_addr` (or no entry for this id at all). Indicates a
+    /// stale membership snapshot or a misconfigured `add_learner`
+    /// call.
     UnknownLeader(NodeId),
     /// No leader is currently elected (election in progress).
     NoLeader,
@@ -143,7 +128,7 @@ enum ForwardDecision {
 /// use axum::{middleware, Router};
 /// use std::sync::Arc;
 ///
-/// let forwarder = Arc::new(LeaderForwarder::new(raft, self_id, peers, client));
+/// let forwarder = Arc::new(LeaderForwarder::new(raft, self_id, client));
 /// let app = Router::new()
 ///     .route("/api/transact", axum::routing::post(transact_handler))
 ///     .layer(middleware::from_fn_with_state(forwarder, forward_to_leader));
@@ -163,8 +148,8 @@ pub async fn forward_to_leader(
         ForwardDecision::UnknownLeader(id) => (
             StatusCode::SERVICE_UNAVAILABLE,
             format!(
-                "no client URL configured for leader node {id}; \
-                 check the cluster peer map"
+                "leader node {id} has no client address in the current \
+                 membership; cluster may be reconfiguring"
             ),
         )
             .into_response(),
@@ -255,7 +240,6 @@ async fn response_from_upstream(upstream: reqwest::Response) -> Result<Response,
         if is_hop_by_hop(name.as_str()) {
             continue;
         }
-        // axum / http types are the same; copy across.
         if let (Ok(n), Ok(v)) = (
             HeaderName::from_bytes(name.as_str().as_bytes()),
             HeaderValue::from_bytes(value.as_bytes()),
@@ -290,9 +274,9 @@ fn status_from_reqwest(s: reqwest::StatusCode) -> StatusCode {
 #[cfg(test)]
 mod tests {
     //! Unit tests cover the header-scrubbing + status-mapping
-    //! helpers. The end-to-end leader-forward flow needs a live
-    //! Raft cluster; that's exercised in the multi-node integration
-    //! test.
+    //! helpers. The end-to-end leader-forward flow (membership
+    //! lookup → outbound HTTP → response relay) needs a live Raft
+    //! cluster; that's exercised in the multi-node integration test.
 
     use super::*;
 

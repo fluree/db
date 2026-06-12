@@ -29,13 +29,11 @@
 //!
 //! # Routing
 //!
-//! [`BasicNode::addr`] carries the peer's base URL — for example
-//! `http://node-2:9090/raft`. The factory derives endpoint URLs by
-//! appending `/append-entries`, `/vote`, `/install-snapshot`.
-//!
-//! [`BasicNode`]: openraft::BasicNode
+//! [`ClusterNode::raft_addr`] carries the peer's base URL — for
+//! example `http://node-2:9090/raft`. The factory derives endpoint
+//! URLs by appending `/append-entries`, `/vote`, `/install-snapshot`.
 
-use crate::raft::{NodeId, TypeConfig};
+use crate::raft::{ClusterNode, NodeId, TypeConfig};
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -47,7 +45,7 @@ use openraft::raft::{
     AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
     VoteRequest, VoteResponse,
 };
-use openraft::{AnyError, BasicNode, Raft};
+use openraft::{AnyError, Raft};
 use serde::{de::DeserializeOwned, Serialize};
 use std::sync::Arc;
 use std::time::Duration;
@@ -123,12 +121,12 @@ impl HttpRaftNetworkFactory {
 impl RaftNetworkFactory<TypeConfig> for HttpRaftNetworkFactory {
     type Network = HttpRaftNetwork;
 
-    async fn new_client(&mut self, target: NodeId, node: &BasicNode) -> Self::Network {
+    async fn new_client(&mut self, target: NodeId, node: &ClusterNode) -> Self::Network {
         HttpRaftNetwork {
             client: self.client.clone(),
             config: self.config.clone(),
             target,
-            base_url: node.addr.trim_end_matches('/').to_string(),
+            base_url: node.raft_addr.trim_end_matches('/').to_string(),
         }
     }
 }
@@ -155,7 +153,7 @@ impl HttpRaftNetwork {
         path: &str,
         req: &Req,
         timeout: Duration,
-    ) -> Result<Resp, RPCError<NodeId, BasicNode, RaftError<NodeId, E>>>
+    ) -> Result<Resp, RPCError<NodeId, ClusterNode, RaftError<NodeId, E>>>
     where
         Req: Serialize,
         Resp: DeserializeOwned,
@@ -209,7 +207,7 @@ impl RaftNetwork<TypeConfig> for HttpRaftNetwork {
         _option: RPCOption,
     ) -> Result<
         AppendEntriesResponse<NodeId>,
-        RPCError<NodeId, BasicNode, RaftError<NodeId>>,
+        RPCError<NodeId, ClusterNode, RaftError<NodeId>>,
     > {
         self.post(PATH_APPEND_ENTRIES, &rpc, self.config.rpc_timeout)
             .await
@@ -219,7 +217,7 @@ impl RaftNetwork<TypeConfig> for HttpRaftNetwork {
         &mut self,
         rpc: VoteRequest<NodeId>,
         _option: RPCOption,
-    ) -> Result<VoteResponse<NodeId>, RPCError<NodeId, BasicNode, RaftError<NodeId>>> {
+    ) -> Result<VoteResponse<NodeId>, RPCError<NodeId, ClusterNode, RaftError<NodeId>>> {
         self.post(PATH_VOTE, &rpc, self.config.rpc_timeout).await
     }
 
@@ -229,7 +227,7 @@ impl RaftNetwork<TypeConfig> for HttpRaftNetwork {
         _option: RPCOption,
     ) -> Result<
         InstallSnapshotResponse<NodeId>,
-        RPCError<NodeId, BasicNode, RaftError<NodeId, InstallSnapshotError>>,
+        RPCError<NodeId, ClusterNode, RaftError<NodeId, InstallSnapshotError>>,
     > {
         self.post(PATH_INSTALL_SNAPSHOT, &rpc, self.config.snapshot_timeout)
             .await
@@ -278,7 +276,7 @@ impl std::error::Error for HttpStatusError {}
 fn classify_reqwest_error<E>(
     _target: &NodeId,
     err: reqwest::Error,
-) -> RPCError<NodeId, BasicNode, RaftError<NodeId, E>>
+) -> RPCError<NodeId, ClusterNode, RaftError<NodeId, E>>
 where
     E: std::error::Error + Send + Sync + 'static,
 {

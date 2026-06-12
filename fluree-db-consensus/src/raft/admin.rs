@@ -29,13 +29,13 @@
 //! ACL); embedders can layer their own auth on top of the returned
 //! [`axum::Router`].
 
-use crate::raft::{NodeId, TypeConfig};
+use crate::raft::{ClusterNode, NodeId, TypeConfig};
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use openraft::{BasicNode, Raft, RaftMetrics};
+use openraft::{Raft, RaftMetrics};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -50,25 +50,34 @@ use thiserror::Error;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct InitializeRequest {
     /// Initial cluster members. Typically a single-node bootstrap
-    /// (`{self_id: self_addr}`) followed by `add_learner` calls;
+    /// (`{self_id: self_addrs}`) followed by `add_learner` calls;
     /// a multi-node initialize is supported but less common.
-    pub members: BTreeMap<NodeId, NodeAddr>,
+    pub members: BTreeMap<NodeId, NodeAddrs>,
 }
 
-/// Network address of a peer node, carried on
-/// [`openraft::BasicNode`] for the routing layer to derive RPC URLs
-/// from.
+/// Address pair for a peer node — both the inter-node Raft RPC URL
+/// and the client-facing URL. Stored on the [`ClusterNode`] entries
+/// the Raft state machine replicates, so adding a peer at runtime
+/// makes both URLs immediately resolvable on every other node.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct NodeAddr {
+pub struct NodeAddrs {
     /// Base URL of the peer's Raft RPC endpoint
     /// (e.g. `"http://node-2:9090/raft"`). See the network module
     /// for the exact path layout.
-    pub addr: String,
+    pub raft_addr: String,
+    /// Base URL of the peer's client-facing endpoint
+    /// (e.g. `"http://node-2:8080"`). The follower-forward
+    /// middleware uses this to redirect leader-only client requests
+    /// to the leader.
+    pub client_addr: String,
 }
 
-impl From<NodeAddr> for BasicNode {
-    fn from(n: NodeAddr) -> Self {
-        BasicNode { addr: n.addr }
+impl From<NodeAddrs> for ClusterNode {
+    fn from(n: NodeAddrs) -> Self {
+        ClusterNode {
+            raft_addr: n.raft_addr,
+            client_addr: n.client_addr,
+        }
     }
 }
 
@@ -78,7 +87,8 @@ impl From<NodeAddr> for BasicNode {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AddLearnerRequest {
     pub node_id: NodeId,
-    pub addr: String,
+    #[serde(flatten)]
+    pub addrs: NodeAddrs,
     /// Block until the learner catches up to the leader's log before
     /// returning. `true` is the safe default for orchestration
     /// scripts that immediately follow up with `change_membership`.
@@ -166,11 +176,16 @@ impl RaftAdmin {
     /// forming a new cluster; that node becomes the initial leader.
     pub async fn initialize(
         &self,
-        members: BTreeMap<NodeId, NodeAddr>,
+        members: BTreeMap<NodeId, NodeAddrs>,
     ) -> Result<(), AdminError> {
-        let members: BTreeMap<NodeId, BasicNode> =
-            members.into_iter().map(|(id, addr)| (id, addr.into())).collect();
-        self.raft.initialize(members).await.map_err(map_initialize_err)
+        let members: BTreeMap<NodeId, ClusterNode> = members
+            .into_iter()
+            .map(|(id, addrs)| (id, addrs.into()))
+            .collect();
+        self.raft
+            .initialize(members)
+            .await
+            .map_err(map_initialize_err)
     }
 
     /// Add a non-voting peer. Block until the learner has caught up
@@ -180,11 +195,11 @@ impl RaftAdmin {
     pub async fn add_learner(
         &self,
         node_id: NodeId,
-        addr: String,
+        addrs: NodeAddrs,
         blocking: bool,
     ) -> Result<(), AdminError> {
         self.raft
-            .add_learner(node_id, BasicNode { addr }, blocking)
+            .add_learner(node_id, addrs.into(), blocking)
             .await
             .map(|_| ())
             .map_err(map_client_write_err)
@@ -211,7 +226,7 @@ impl RaftAdmin {
 
     /// Snapshot of cluster state for status / health endpoints.
     pub fn status(&self) -> ClusterStatus {
-        let metrics: RaftMetrics<NodeId, BasicNode> = self.raft.metrics().borrow().clone();
+        let metrics: RaftMetrics<NodeId, ClusterNode> = self.raft.metrics().borrow().clone();
         let voters: BTreeSet<NodeId> = metrics
             .membership_config
             .membership()
@@ -237,7 +252,7 @@ impl RaftAdmin {
 // ============================================================================
 
 fn map_initialize_err(
-    err: openraft::error::RaftError<NodeId, openraft::error::InitializeError<NodeId, BasicNode>>,
+    err: openraft::error::RaftError<NodeId, openraft::error::InitializeError<NodeId, ClusterNode>>,
 ) -> AdminError {
     use openraft::error::InitializeError;
     use openraft::error::RaftError;
@@ -251,7 +266,7 @@ fn map_initialize_err(
 fn map_client_write_err(
     err: openraft::error::RaftError<
         NodeId,
-        openraft::error::ClientWriteError<NodeId, BasicNode>,
+        openraft::error::ClientWriteError<NodeId, ClusterNode>,
     >,
 ) -> AdminError {
     use openraft::error::ClientWriteError;
@@ -314,10 +329,7 @@ async fn handle_add_learner(
     State(admin): State<RaftAdmin>,
     Json(req): Json<AddLearnerRequest>,
 ) -> Response {
-    match admin
-        .add_learner(req.node_id, req.addr, req.blocking)
-        .await
-    {
+    match admin.add_learner(req.node_id, req.addrs, req.blocking).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => admin_error_response(e),
     }
@@ -356,22 +368,27 @@ mod tests {
         let req = InitializeRequest {
             members: BTreeMap::from([(
                 1,
-                NodeAddr {
-                    addr: "http://node-1:9090/raft".into(),
+                NodeAddrs {
+                    raft_addr: "http://node-1:9090/raft".into(),
+                    client_addr: "http://node-1:8080".into(),
                 },
             )]),
         };
         let json = serde_json::to_string(&req).unwrap();
         let parsed: InitializeRequest = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.members.len(), 1);
-        assert_eq!(parsed.members[&1].addr, "http://node-1:9090/raft");
+        assert_eq!(parsed.members[&1].raft_addr, "http://node-1:9090/raft");
+        assert_eq!(parsed.members[&1].client_addr, "http://node-1:8080");
     }
 
     #[test]
     fn add_learner_request_round_trips() {
         let req = AddLearnerRequest {
             node_id: 2,
-            addr: "http://node-2:9090/raft".into(),
+            addrs: NodeAddrs {
+                raft_addr: "http://node-2:9090/raft".into(),
+                client_addr: "http://node-2:8080".into(),
+            },
             blocking: true,
         };
         let v = serde_json::to_value(&req).unwrap();
@@ -379,12 +396,14 @@ mod tests {
             v,
             json!({
                 "node_id": 2,
-                "addr": "http://node-2:9090/raft",
+                "raft_addr": "http://node-2:9090/raft",
+                "client_addr": "http://node-2:8080",
                 "blocking": true,
             })
         );
         let parsed: AddLearnerRequest = serde_json::from_value(v).unwrap();
         assert_eq!(parsed.node_id, 2);
+        assert_eq!(parsed.addrs.client_addr, "http://node-2:8080");
         assert!(parsed.blocking);
     }
 

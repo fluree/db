@@ -65,16 +65,57 @@ use fluree_db_api::{
 };
 use fluree_db_core::{CommitId, ContentId, ContentStore};
 use fluree_db_ledger::IndexConfig;
-use openraft::{BasicNode, Raft};
+use openraft::Raft;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::SystemTime;
 
 /// Identifier for a node in the Raft cluster.
 ///
-/// Plain `u64` for now; concrete node addressing (URL, gRPC endpoint,
-/// etc.) is carried separately on [`BasicNode`] entries supplied at
-/// cluster-membership time.
+/// Plain `u64`; the address pair (raft RPC URL + client-facing URL) is
+/// carried on the [`ClusterNode`] entries supplied at cluster-membership
+/// time.
 pub type NodeId = u64;
+
+/// Address pair for a Raft cluster member.
+///
+/// Replaces openraft's [`BasicNode`](openraft::BasicNode) so both
+/// endpoints — the inter-node Raft RPC URL **and** the client-facing
+/// URL the follower-forward middleware needs — travel together through
+/// membership changes. Storing both inside the Raft state machine means
+/// adding a peer at runtime (via [`admin::RaftAdmin::add_learner`])
+/// makes its client URL immediately resolvable on every other node, no
+/// restart required.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClusterNode {
+    /// Base URL of the peer's inter-node Raft RPC endpoint, e.g.
+    /// `"http://node-2:9090/raft"`. See [`network`] for how this is
+    /// consumed.
+    pub raft_addr: String,
+    /// Base URL of the peer's client-facing endpoint, e.g.
+    /// `"http://node-2:8080"`. See [`forward`] for how this is
+    /// consumed by the follower-forward middleware.
+    pub client_addr: String,
+}
+
+impl ClusterNode {
+    pub fn new(raft_addr: impl Into<String>, client_addr: impl Into<String>) -> Self {
+        Self {
+            raft_addr: raft_addr.into(),
+            client_addr: client_addr.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for ClusterNode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "ClusterNode {{ raft: {}, client: {} }}",
+            self.raft_addr, self.client_addr
+        )
+    }
+}
 
 openraft::declare_raft_types!(
     /// Type config wiring [`Command`] / [`Response`] into openraft.
@@ -82,7 +123,7 @@ openraft::declare_raft_types!(
         D = Command,
         R = Response,
         NodeId = NodeId,
-        Node = BasicNode,
+        Node = ClusterNode,
         Entry = openraft::Entry<TypeConfig>,
         SnapshotData = std::io::Cursor<Vec<u8>>,
         AsyncRuntime = openraft::TokioRuntime,
