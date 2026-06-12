@@ -25,7 +25,14 @@ use serde::{Deserialize, Serialize};
 /// (churn). Both come from `fluree_bench_alloc::snapshot()` semantics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemMetrics {
+    /// Absolute live-bytes high-water across the scenario (includes the
+    /// ambient process baseline; can shift uniformly between binaries).
     pub peak_bytes: u64,
+    /// Scenario-attributable high-water (peak minus live bytes at reset).
+    /// Preferred for regression gating; 0 in sidecars written before this
+    /// field existed.
+    #[serde(default)]
+    pub scenario_peak_bytes: u64,
     pub total_allocated_bytes: u64,
 }
 
@@ -126,6 +133,7 @@ mod tests {
             "some_bench/q1/small".into(),
             MemMetrics {
                 peak_bytes: 1024,
+                scenario_peak_bytes: 512,
                 total_allocated_bytes: 4096,
             },
         );

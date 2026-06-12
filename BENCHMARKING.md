@@ -189,7 +189,12 @@ fluree_bench_support::mem::record_scenario("my_bench", "my_bench/q1/small",
 
 Metrics land in `target/fluree-bench-mem/<bench>.json` sidecars;
 `bench-baseline capture` merges them into the baseline and `compare`
-gates `peak_mem` with the same per-bench budgets as time.
+gates memory with the same per-bench budgets as time. The gated metric
+is `scenario_mem` (`scenario_peak_bytes`: the high-water mark *minus*
+live bytes at scenario start) — absolute peak includes the ambient
+process baseline, which a recompile can shift by megabytes uniformly
+across every scenario, so it is recorded but only used as a fallback
+when comparing against baselines captured before the field existed.
 `total_allocated_bytes` (churn) is recorded for analysis but not gated —
 it scales with criterion's adaptive iteration counts. The tracker costs
 two relaxed atomics per alloc; that overhead is identical between a

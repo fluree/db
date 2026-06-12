@@ -181,7 +181,8 @@ pub enum CompareStatus {
 #[derive(Debug, Clone)]
 pub struct Comparison {
     pub id: String,
-    /// `"time"` or `"peak_mem"`.
+    /// `"time"`, `"scenario_mem"` (preferred), or `"peak_mem"` (legacy
+    /// absolute fallback).
     pub metric: &'static str,
     pub baseline: f64,
     pub observed: f64,
@@ -295,13 +296,26 @@ pub fn compare(
             });
         }
         if let (Some(bm), Some(cm)) = (base.mem, cur.mem) {
-            let (change_pct, status) =
-                classify(bm.peak_bytes as f64, cm.peak_bytes as f64, budget_pct);
+            // Prefer the scenario-attributable peak (robust against ambient
+            // process-heap shifts between binaries); absolute peak is the
+            // legacy fallback for baselines captured before the field
+            // existed (serde default 0).
+            let (metric, b_val, c_val) = if bm.scenario_peak_bytes > 0 && cm.scenario_peak_bytes > 0
+            {
+                (
+                    "scenario_mem",
+                    bm.scenario_peak_bytes as f64,
+                    cm.scenario_peak_bytes as f64,
+                )
+            } else {
+                ("peak_mem", bm.peak_bytes as f64, cm.peak_bytes as f64)
+            };
+            let (change_pct, status) = classify(b_val, c_val, budget_pct);
             report.comparisons.push(Comparison {
                 id: id.clone(),
-                metric: "peak_mem",
-                baseline: bm.peak_bytes as f64,
-                observed: cm.peak_bytes as f64,
+                metric,
+                baseline: b_val,
+                observed: c_val,
                 change_pct,
                 budget_pct,
                 status,
@@ -430,6 +444,7 @@ mod tests {
     fn compare_includes_memory_metric() {
         let mem = |peak: u64| MemMetrics {
             peak_bytes: peak,
+            scenario_peak_bytes: peak / 2,
             total_allocated_bytes: peak * 2,
         };
         let mut base_entry = entry(1000.0);
@@ -445,7 +460,7 @@ mod tests {
         let report = compare(&base, &current, &budget, None);
         assert!(!report.passed());
         let breach = report.breaches().next().unwrap();
-        assert_eq!(breach.metric, "peak_mem");
+        assert_eq!(breach.metric, "scenario_mem");
     }
 
     #[test]
