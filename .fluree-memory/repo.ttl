@@ -1905,6 +1905,23 @@ mem:fact-01ktcfdrpyfq8btp10mf75cmp5 a mem:Fact ;
     mem:createdAt "2026-06-05T18:06:17.310296+00:00"^^xsd:dateTime ;
     mem:rationale "Candidate 3 lever is scatter/sort assembly, not join grouping or DISTINCT which are already optimized." .
 
+mem:fact-01ktxag4v0tctpgwfww6dgbp2c a mem:Fact ;
+    mem:content "GraphId is now a #[repr(transparent)] newtype (was bare u16 alias) — PR #1316, audit Phase 0.1/0.2. Wire formats unchanged (#[serde(transparent)]; manual codecs use as_u16/from_u16). The migration surfaced two id-space seams the alias hid: (1) txn.graph_delta keys are TRANSACTION-LOCAL graph ids — kept raw u16 in transact; staging adopts txn-local numbering as ledger numbering at one commented GraphId() wrap in build_reverse_graph_lookup; (2) commit_transfer replay resolves ledger GraphIds but feeds envelope-keyed u16 staging APIs — now an explicit conversion. Also deleted dead pre-V3 types in binary-index src/types.rs, resolving the audit's dt-width mismatch by deletion. Bench gate: 0 breaches, scenario_mem ±0.06%." ;
+    mem:tag "audit" ;
+    mem:tag "graphid" ;
+    mem:tag "id-space" ;
+    mem:tag "newtype" ;
+    mem:tag "refactor" ;
+    mem:tag "txn-local" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/src/commit_transfer.rs" ;
+    mem:artifactRef "fluree-db-binary-index/src/types.rs" ;
+    mem:artifactRef "fluree-db-core/src/ids.rs" ;
+    mem:artifactRef "fluree-db-transact/src/stage.rs" ;
+    mem:branch "refactor/phase0-newtypes" ;
+    mem:createdAt "2026-06-12T07:07:17.728499+00:00"^^xsd:dateTime ;
+    mem:rationale "NsCode newtype (with snapshot/store space tagging) and TxnGraphId remain open Phase 0 items; the adoption seams documented here are where they'd land." .
+
 mem:fact-01ktwjrjrvj60k0v0q7gstwknz a mem:Fact ;
     mem:content "Differential fast-path harness (Phase 0.7) found 3 fast≠generic divergences on first run (2026-06-11); ALL THREE FIXED same-day in PR #1314 and now hard-enforced by the harness: FD-1 AVG fast path now mirrors generic finalize_avg per number kind (exact i64+BigDecimal for integers → xsd:decimal, plain non-Kahan f64 for doubles); FD-2 MIN/MAX-string gated on lex_sorted_string_ids (was returning insertion-order extremes on reindex-built ledgers); FD-3 per-predicate counts rewritten to exact POST leaf-directory row_count sums at epoch-0 (StatsView numbers are estimates — never use as query answers). Cross-condition axis (generic: base≡overlay≡novelty) passed throughout. Kill switch: set_fast_paths_disabled / FLUREE_DISABLE_QUERY_FAST_PATHS." ;
     mem:tag "audit" ;
