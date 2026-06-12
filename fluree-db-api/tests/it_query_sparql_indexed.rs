@@ -1674,6 +1674,133 @@ async fn indexed_number_of_predicates_from_stats_matches_general() {
         .await;
 }
 
+/// `number-of-subjects` / `number-of-objects` (`COUNT(DISTINCT ?s|?o)` over
+/// `?s ?p ?o`) answered metadata-only from leaflet `lead_group_count` with
+/// lead-prefix boundary dedup, read via directory-only leaf opens. Tiny leaves
+/// force many leaf/leaflet boundaries with multi-valued subjects and shared
+/// objects, so the count is sensitive to any seam-dedup or dir-read bug.
+/// Asserts the indexed result equals the memory (general-pipeline) result.
+#[tokio::test]
+async fn indexed_number_of_subjects_and_objects_matches_general() {
+    assert_index_defaults();
+
+    let seed = || {
+        let mut nodes: Vec<serde_json::Value> = Vec::with_capacity(1500);
+        for i in 0..1500i64 {
+            // 2-4 rows per subject; objects mix shared IRI refs (mod 97) and
+            // literals (mod 311 / mod 13) so distinct-object groups span
+            // leaflet boundaries in OPST order.
+            let mut node = json!({
+                "@id": format!("ex:s{i}"),
+                "ex:ref": {"@id": format!("ex:t{}", i % 97)},
+                "ex:val": i % 311
+            });
+            if i % 2 == 0 {
+                node["ex:extra"] = json!(format!("lit{}", i % 13));
+            }
+            if i % 3 == 0 {
+                node["ex:ref2"] = json!({"@id": format!("ex:t{}", (i + 7) % 97)});
+            }
+            nodes.push(node);
+        }
+        json!({ "@context": { "ex": "http://example.org/ns/" }, "@graph": nodes })
+    };
+    let queries = [
+        (
+            "number-of-subjects",
+            "SELECT (COUNT(DISTINCT ?s) AS ?count) WHERE { ?s ?p ?o }",
+        ),
+        (
+            "number-of-objects",
+            "SELECT (COUNT(DISTINCT ?o) AS ?count) WHERE { ?s ?p ?o }",
+        ),
+    ];
+
+    // Memory reference (general pipeline).
+    let mem = FlureeBuilder::memory().build_memory();
+    let mem_ledger = mem
+        .insert_with_opts(
+            genesis_ledger_for_fluree(&mem, "it/nos-mem:main"),
+            &seed(),
+            TxnOpts::default(),
+            CommitOpts::default(),
+            &IndexConfig {
+                reindex_min_bytes: 0,
+                reindex_max_bytes: 80_000_000,
+            },
+        )
+        .await
+        .expect("mem seed")
+        .ledger;
+    let mem_view = mem
+        .db_at_t("it/nos-mem:main", mem_ledger.t())
+        .await
+        .expect("mem view");
+    let mut mem_rows = Vec::new();
+    for (_, q) in &queries {
+        mem_rows.push(normalize_rows(
+            &mem.query(&mem_view, QueryInput::Sparql(q))
+                .await
+                .expect("mem query")
+                .to_jsonld(&mem_view.snapshot)
+                .expect("to_jsonld"),
+        ));
+    }
+
+    // Indexed path: tiny leaves/leaflets so the data spans many boundaries.
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "it/nos-indexed:main";
+    let mut idx_config = fluree_db_indexer::IndexerConfig::small();
+    idx_config.leaflet_rows = 100;
+    idx_config.leaf_target_bytes = 8_000;
+    idx_config.leaf_max_bytes = 16_000;
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        Arc::new(fluree.nameservice_mode().clone()),
+        idx_config,
+    );
+    local
+        .run_until(async move {
+            let index_cfg = IndexConfig {
+                reindex_min_bytes: 0,
+                reindex_max_bytes: 80_000_000,
+            };
+            let ledger1 = fluree
+                .insert_with_opts(
+                    genesis_ledger_for_fluree(&fluree, ledger_id),
+                    &seed(),
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg,
+                )
+                .await
+                .expect("indexed seed")
+                .ledger;
+            let _ = trigger_index_and_wait_outcome(&handle, ledger_id, ledger1.t()).await;
+            let view = fluree
+                .db_at_t(ledger_id, ledger1.t())
+                .await
+                .expect("indexed view");
+            for ((label, q), mem) in queries.iter().zip(&mem_rows) {
+                let idx_rows = normalize_rows(
+                    &fluree
+                        .query(&view, QueryInput::Sparql(q))
+                        .await
+                        .expect("indexed query")
+                        .to_jsonld(&view.snapshot)
+                        .expect("to_jsonld"),
+                );
+                assert_eq!(
+                    &idx_rows, mem,
+                    "{label} from lead-group metadata must equal the general-pipeline count"
+                );
+            }
+        })
+        .await;
+}
+
 /// Parallel partitioned inner-star COUNT(*): seed enough rows (>50k, the parallel
 /// threshold) with VARYING per-subject multiplicity so the count is sensitive to
 /// any partition-boundary bug (a misattributed subject changes the product sum).

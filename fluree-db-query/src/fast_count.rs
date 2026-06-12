@@ -1023,10 +1023,9 @@ fn count_distinct_lead_groups(
     let mut total: u64 = 0;
 
     for leaf_entry in &branch.leaves {
-        let handle = store
-            .open_leaf_handle(&leaf_entry.leaf_cid, leaf_entry.sidecar_cid.as_ref(), false)
-            .map_err(|e| QueryError::Internal(format!("leaf open: {e}")))?;
-        let dir = handle.dir();
+        let dir = store
+            .open_leaf_dir(&leaf_entry.leaf_cid)
+            .map_err(|e| QueryError::Internal(format!("leaf dir open: {e}")))?;
 
         for entry in &dir.entries {
             if entry.row_count == 0 || entry.lead_group_count == 0 {
@@ -1063,10 +1062,9 @@ fn count_distinct_predicates_psot(store: &BinaryIndexStore, g_id: GraphId) -> Re
     let mut total: u64 = 0;
 
     for leaf_entry in &branch.leaves {
-        let handle = store
-            .open_leaf_handle(&leaf_entry.leaf_cid, leaf_entry.sidecar_cid.as_ref(), false)
-            .map_err(|e| QueryError::Internal(format!("leaf open: {e}")))?;
-        let dir = handle.dir();
+        let dir = store
+            .open_leaf_dir(&leaf_entry.leaf_cid)
+            .map_err(|e| QueryError::Internal(format!("leaf dir open: {e}")))?;
 
         for entry in &dir.entries {
             if entry.row_count == 0 {

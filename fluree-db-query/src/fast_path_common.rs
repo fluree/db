@@ -592,11 +592,11 @@ pub fn count_rows_for_predicate_psot(
             total += leaf_entry.row_count;
             continue;
         }
-        // Boundary leaf: may mix predicates → open and sum the matching leaflets.
-        let handle = store
-            .open_leaf_handle(&leaf_entry.leaf_cid, leaf_entry.sidecar_cid.as_ref(), false)
-            .map_err(|e| QueryError::Internal(format!("leaf open: {e}")))?;
-        let dir = handle.dir();
+        // Boundary leaf: may mix predicates → read its directory (no payload)
+        // and sum the matching leaflets.
+        let dir = store
+            .open_leaf_dir(&leaf_entry.leaf_cid)
+            .map_err(|e| QueryError::Internal(format!("leaf dir open: {e}")))?;
         for entry in &dir.entries {
             if entry.row_count == 0 {
                 continue;

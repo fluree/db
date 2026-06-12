@@ -713,6 +713,40 @@ impl BinaryIndexStore {
         )))
     }
 
+    /// Open just a leaf's decoded directory — no column payload access.
+    ///
+    /// For directory-only walks (metadata counts, leaflet skips) this reads
+    /// only the header+directory prefix (a few KB) instead of the full leaf
+    /// blob, regardless of whether the leaf is local, disk-cached, or remote
+    /// (`ContentStoreRangeFetcher` resolves locality with positional reads).
+    /// Decoded directories are cached in the shared [`LeafletCache`] keyed by
+    /// leaf CID — content-addressed, so entries never go stale.
+    ///
+    /// Callers that may need `load_columns` must use [`Self::open_leaf_handle`].
+    pub fn open_leaf_dir(&self, leaf_cid: &ContentId) -> io::Result<Arc<DecodedLeafDirV3>> {
+        let key = xxhash_rust::xxh3::xxh3_128(leaf_cid.to_bytes().as_ref());
+        if let Some(cache) = &self.leaflet_cache {
+            return cache.try_get_or_load_leaf_dir(key, || self.load_leaf_dir_uncached(leaf_cid));
+        }
+        self.load_leaf_dir_uncached(leaf_cid)
+    }
+
+    fn load_leaf_dir_uncached(&self, leaf_cid: &ContentId) -> io::Result<Arc<DecodedLeafDirV3>> {
+        // A prior full open may already have memoized this remote leaf's
+        // directory — reuse it rather than re-fetching.
+        if let Some(dir) = self.remote_leaf_metadata.read().get(leaf_cid) {
+            return Ok(Arc::new(dir.clone()));
+        }
+        let cs = self
+            .cas
+            .as_ref()
+            .ok_or_else(|| io::Error::other("no content store"))?;
+        let fetcher = ContentStoreRangeFetcher::new(Arc::clone(cs), self.cache_dir.clone());
+        let (dir, _payload_base) =
+            super::leaf_access::fetch_header_and_directory(&fetcher, leaf_cid)?;
+        Ok(Arc::new(dir))
+    }
+
     /// Fetch sidecar bytes by CID (full object, sync).
     ///
     /// Used by both the cursor (`open_leaf_handle`) and external callers
@@ -2868,6 +2902,175 @@ mod tests {
             "once promoted, repeated opens should not refetch the full blob"
         );
 
+        let _ = std::fs::remove_dir_all(cache_dir);
+    }
+
+    #[test]
+    fn open_leaf_dir_reads_prefix_only_and_caches() {
+        let store = CountingContentStore::new();
+        let leaf_bytes = build_test_leaf_bytes();
+        let leaf_cid = run_sync_on_runtime({
+            let store = store.clone();
+            async move {
+                store
+                    .put(ContentKind::IndexLeaf, &leaf_bytes)
+                    .await
+                    .map_err(|e| io::Error::other(e.to_string()))
+            }
+        })
+        .expect("store leaf bytes");
+        let cache_dir = temp_cache_dir();
+        let mut binary_store = empty_store(Arc::new(store.clone()), cache_dir.clone());
+        binary_store.leaflet_cache = Some(Arc::new(LeafletCache::with_max_mb(4)));
+
+        let dir = binary_store
+            .open_leaf_dir(&leaf_cid)
+            .expect("first dir open");
+        assert_eq!(dir.entries.len(), 1);
+        assert_eq!(dir.entries[0].row_count, 5);
+        assert_eq!(
+            store.get_calls(),
+            0,
+            "dir-only open must never fetch the full blob"
+        );
+        let first_range_calls = store.range_calls();
+        assert!(
+            first_range_calls >= 2,
+            "expected header + directory range reads"
+        );
+
+        let dir2 = binary_store
+            .open_leaf_dir(&leaf_cid)
+            .expect("second dir open");
+        assert_eq!(dir2.entries.len(), 1);
+        assert_eq!(
+            store.range_calls(),
+            first_range_calls,
+            "cached dir should avoid any further reads"
+        );
+        assert_eq!(store.get_calls(), 0);
+
+        // Same directory as a full-blob open would produce.
+        let handle = binary_store
+            .open_leaf_handle(&leaf_cid, None, false)
+            .expect("full open");
+        assert_eq!(handle.dir().entries.len(), dir.entries.len());
+        assert_eq!(handle.dir().entries[0].row_count, dir.entries[0].row_count);
+        assert_eq!(handle.dir().payload_base, dir.payload_base);
+
+        let _ = std::fs::remove_dir_all(cache_dir);
+    }
+
+    /// Content store whose blobs resolve to local files. `get`/`get_range`
+    /// count as CAS access — a dir-only open of a locally resolvable leaf
+    /// must be served entirely by positional reads on the local file.
+    #[derive(Debug, Clone)]
+    struct LocalFileContentStore {
+        inner: MemoryContentStore,
+        local: Arc<RwLock<HashMap<ContentId, PathBuf>>>,
+        cas_calls: Arc<AtomicUsize>,
+    }
+
+    impl LocalFileContentStore {
+        fn new() -> Self {
+            Self {
+                inner: MemoryContentStore::new(),
+                local: Arc::new(RwLock::new(HashMap::new())),
+                cas_calls: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ContentStore for LocalFileContentStore {
+        async fn has(&self, id: &ContentId) -> fluree_db_core::Result<bool> {
+            self.inner.has(id).await
+        }
+
+        async fn get(&self, id: &ContentId) -> fluree_db_core::Result<Vec<u8>> {
+            self.cas_calls.fetch_add(1, AtomicOrdering::Relaxed);
+            self.inner.get(id).await
+        }
+
+        async fn put(&self, kind: ContentKind, bytes: &[u8]) -> fluree_db_core::Result<ContentId> {
+            self.inner.put(kind, bytes).await
+        }
+
+        async fn put_with_id(&self, id: &ContentId, bytes: &[u8]) -> fluree_db_core::Result<()> {
+            self.inner.put_with_id(id, bytes).await
+        }
+
+        async fn release(&self, id: &ContentId) -> fluree_db_core::Result<()> {
+            self.inner.release(id).await
+        }
+
+        async fn get_range(
+            &self,
+            id: &ContentId,
+            range: std::ops::Range<u64>,
+        ) -> fluree_db_core::Result<Vec<u8>> {
+            self.cas_calls.fetch_add(1, AtomicOrdering::Relaxed);
+            self.inner.get_range(id, range).await
+        }
+
+        fn resolve_local_path(&self, id: &ContentId) -> Option<PathBuf> {
+            self.local.read().get(id).cloned()
+        }
+    }
+
+    #[test]
+    fn open_leaf_dir_serves_local_files_without_cas_access() {
+        let store = LocalFileContentStore::new();
+        let leaf_bytes = build_test_leaf_bytes();
+        let leaf_cid = run_sync_on_runtime({
+            let store = store.clone();
+            let leaf_bytes = leaf_bytes.clone();
+            async move {
+                store
+                    .put(ContentKind::IndexLeaf, &leaf_bytes)
+                    .await
+                    .map_err(|e| io::Error::other(e.to_string()))
+            }
+        })
+        .expect("store leaf bytes");
+
+        // Materialize the blob as a local file the store resolves to.
+        let local_dir = temp_cache_dir();
+        let leaf_path = local_dir.join(format!("{leaf_cid}.fli"));
+        std::fs::write(&leaf_path, &leaf_bytes).expect("write local leaf file");
+        store.local.write().insert(leaf_cid.clone(), leaf_path);
+
+        let cache_dir = temp_cache_dir();
+        let mut binary_store = empty_store(Arc::new(store.clone()), cache_dir.clone());
+
+        // No leaflet cache: every open must still resolve via the local file.
+        let dir = binary_store
+            .open_leaf_dir(&leaf_cid)
+            .expect("uncached local dir open");
+        assert_eq!(dir.entries.len(), 1);
+        assert_eq!(dir.entries[0].row_count, 5);
+        assert_eq!(
+            store.cas_calls.load(AtomicOrdering::Relaxed),
+            0,
+            "local leaf dir must be read from the file, not CAS"
+        );
+
+        // With the cache attached: same result, still no CAS access.
+        binary_store.leaflet_cache = Some(Arc::new(LeafletCache::with_max_mb(4)));
+        for _ in 0..2 {
+            let dir2 = binary_store
+                .open_leaf_dir(&leaf_cid)
+                .expect("cached local dir open");
+            assert_eq!(dir2.entries.len(), 1);
+            assert_eq!(dir2.entries[0].row_count, 5);
+        }
+        assert_eq!(
+            store.cas_calls.load(AtomicOrdering::Relaxed),
+            0,
+            "cached local dir opens must not touch CAS either"
+        );
+
+        let _ = std::fs::remove_dir_all(local_dir);
         let _ = std::fs::remove_dir_all(cache_dir);
     }
 
