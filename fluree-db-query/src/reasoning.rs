@@ -23,11 +23,19 @@ pub struct ReasoningOverlay<'a> {
 impl<'a> ReasoningOverlay<'a> {
     /// Create a new reasoning overlay combining base and derived facts.
     pub fn new(base: &'a dyn OverlayProvider, derived: Arc<DerivedFactsOverlay>) -> Self {
-        // Combine epochs deterministically
-        let epoch = base
-            .epoch()
-            .wrapping_mul(1_000_003)
-            .wrapping_add(derived.epoch());
+        // Combine the base epoch with the materialization's process-unique
+        // instance id, and tag the high bit so the combined value can never
+        // collide with a plain novelty epoch (a small counter). The derived
+        // EPOCH alone is insufficient: it equals the base epoch at
+        // materialization time (0 ↔ 0 on a freshly indexed ledger), and two
+        // materializations under different rule configs share it — epoch-keyed
+        // caches (overlay translation, cursor batches) would alias them.
+        let epoch = 0x8000_0000_0000_0000u64
+            | (base
+                .epoch()
+                .wrapping_mul(1_000_003)
+                .wrapping_add(derived.instance_id())
+                & 0x7FFF_FFFF_FFFF_FFFF);
         Self {
             base,
             derived,

@@ -573,6 +573,19 @@ pub struct DecodedLeafDirV3 {
     pub payload_base: usize,
 }
 
+impl DecodedLeafDirV3 {
+    /// Approximate in-memory byte size (for cache weighing).
+    pub fn byte_size(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + self.entries.capacity() * std::mem::size_of::<LeafletDirEntryV3>()
+            + self
+                .entries
+                .iter()
+                .map(|e| e.column_refs.capacity() * std::mem::size_of::<ColumnBlockRef>())
+                .sum::<usize>()
+    }
+}
+
 /// Decode the leaflet directory from a V3 leaf blob, returning the directory
 /// entries and the authoritative payload base offset.
 ///

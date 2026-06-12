@@ -33,5 +33,5 @@ mod chars;
 mod lexer;
 mod token;
 
-pub use lexer::{tokenize, Lexer};
+pub use lexer::{tokenize, tokenize_with_comments, Lexer};
 pub use token::{keyword_from_str, Token, TokenKind};

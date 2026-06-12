@@ -3779,8 +3779,9 @@ impl CursorSoIter {
 enum SoRows<'a> {
     /// Genuinely empty (predicate absent from the base index, no overlay).
     Empty,
-    Meta(PsotSoIter<'a>),
-    Cursor(CursorSoIter),
+    Meta(Box<PsotSoIter<'a>>),
+    /// Boxed: embeds a `BinaryCursor`, much larger than the other variants.
+    Cursor(Box<CursorSoIter>),
 }
 
 impl SoRows<'_> {
@@ -3817,9 +3818,11 @@ fn so_rows<'a>(ec: &ExecCtx<'a, '_>, pred: &Ref) -> Result<Option<SoRows<'a>>> {
         else {
             return Ok(None);
         };
-        Ok(Some(SoRows::Cursor(CursorSoIter::new(cursor))))
+        Ok(Some(SoRows::Cursor(Box::new(CursorSoIter::new(cursor)))))
     } else {
-        Ok(Some(SoRows::Meta(PsotSoIter::new(store, ec.g_id, p_id))))
+        Ok(Some(SoRows::Meta(Box::new(PsotSoIter::new(
+            store, ec.g_id, p_id,
+        )))))
     }
 }
 

@@ -6,6 +6,8 @@
 //! - `x-fdb-time`: Execution time (e.g., "12.34ms")
 //! - `x-fdb-fuel`: Fuel consumed (as string, e.g., "42")
 //! - `x-fdb-policy`: Policy stats as base64-encoded JSON
+//! - `x-fdb-reasoning`: OWL2-RL materialization outcome as JSON (only when a
+//!   reasoning mode ran); `"capped": true` means results may be incomplete
 
 use axum::http::{HeaderMap, HeaderName, HeaderValue};
 use base64::{engine::general_purpose::STANDARD, Engine};
@@ -17,6 +19,8 @@ pub const X_FDB_TIME: &str = "x-fdb-time";
 pub const X_FDB_FUEL: &str = "x-fdb-fuel";
 /// Header name for policy stats (base64-encoded JSON)
 pub const X_FDB_POLICY: &str = "x-fdb-policy";
+/// Header name for the reasoning materialization outcome (JSON)
+pub const X_FDB_REASONING: &str = "x-fdb-reasoning";
 
 /// Build tracking headers from a TrackingTally
 ///
@@ -47,6 +51,17 @@ pub fn tracking_headers(tally: &TrackingTally) -> HeaderMap {
             let encoded = STANDARD.encode(json.as_bytes());
             if let Ok(value) = HeaderValue::from_str(&encoded) {
                 headers.insert(HeaderName::from_static(X_FDB_POLICY), value);
+            }
+        }
+    }
+
+    // Add reasoning header if a materialization ran. Plain JSON (not base64):
+    // the payload is short, has no user data, and `capped` should be greppable
+    // straight off the wire.
+    if let Some(ref reasoning) = tally.reasoning {
+        if let Ok(json) = serde_json::to_string(reasoning) {
+            if let Ok(value) = HeaderValue::from_str(&json) {
+                headers.insert(HeaderName::from_static(X_FDB_REASONING), value);
             }
         }
     }

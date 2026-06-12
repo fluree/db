@@ -38,7 +38,9 @@ pub use format::wire_helpers::{
 pub use arena::fulltext::FulltextArena;
 
 // ── Types ───────────────────────────────────────────────────────────────────
-pub use read::types::{resolve_overlay_ops, sort_overlay_ops, DecodedRowV3, OverlayOp};
+pub use read::types::{
+    overlay_window_for_range, resolve_overlay_ops, sort_overlay_ops, DecodedRowV3, OverlayOp,
+};
 pub use types::NumericShape;
 
 // ── Dict ────────────────────────────────────────────────────────────────────

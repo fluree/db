@@ -62,7 +62,9 @@ use crate::binding::{Batch, Binding};
 use crate::context::ExecutionContext;
 use crate::dataset::ActiveGraphs;
 use crate::error::{QueryError, Result};
-use crate::group_aggregate::{binding_to_group_key_owned, GroupKeyOwned};
+use crate::group_aggregate::{
+    binding_to_group_key_normalized, binding_to_group_key_owned, GroupKeyOwned,
+};
 use crate::ir::triple::TriplePattern;
 use crate::join::NestedLoopJoinOperator;
 use crate::operator::{
@@ -510,7 +512,11 @@ fn join_key(binding: &Binding, store: Option<&BinaryIndexStore>) -> JoinKeyClass
         }
         Binding::Unbound => JoinKeyClass::Wildcard,
         Binding::Poisoned => JoinKeyClass::Dead,
-        other => JoinKeyClass::Keyed(JoinKey::Other(binding_to_group_key_owned(other))),
+        // Normalize decoded literals to their encoded form so they key
+        // identically to late-materialized scan output.
+        other => JoinKeyClass::Keyed(JoinKey::Other(binding_to_group_key_normalized(
+            other, store,
+        ))),
     }
 }
 

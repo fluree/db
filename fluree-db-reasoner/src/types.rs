@@ -4,36 +4,6 @@
 
 use fluree_db_core::Sid;
 
-/// Reasoning modes that may affect derived-facts materialization and caching.
-///
-/// This mirrors `fluree-db-query::ir::ReasoningModes` structurally, but is defined
-/// locally to keep `fluree-db-reasoner` dependency-free of the query crate.
-///
-/// # Reasoning Methods
-///
-/// - `rdfs` - RDFS entailment (subClassOf, subPropertyOf hierarchies)
-/// - `owl2ql` - OWL 2 QL profile (query rewriting for simple ontologies)
-/// - `owl2rl` - OWL 2 RL profile (forward-chaining materialization)
-/// - `owl_datalog` - Extended OWL with Datalog-expressible constructs:
-///   - Complex class expressions (intersectionOf, unionOf with restrictions)
-///   - Property chains with inverse elements and arbitrary length
-///   - Enhanced someValuesFrom/allValuesFrom reasoning
-///   - This is a SUPERSET of owl2rl, enabling additional constructs
-/// - `datalog` - Custom user-defined datalog rules
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct ReasoningModes {
-    pub rdfs: bool,
-    pub owl2ql: bool,
-    pub datalog: bool,
-    pub owl2rl: bool,
-    /// OWL-Datalog: Extended OWL reasoning with complex class expressions.
-    /// This is a superset of owl2rl that supports additional constructs
-    /// expressible in Datalog: complex intersections, property chains with
-    /// inverses, nested restrictions, etc.
-    pub owl_datalog: bool,
-    pub explicit_none: bool,
-}
-
 /// An element in a property chain (owl:propertyChainAxiom).
 ///
 /// Property chains express derived properties as compositions of other properties:

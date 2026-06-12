@@ -72,6 +72,7 @@ pub async fn run_jsonld_subquery(
             time: response.time.clone(),
             fuel: response.fuel,
             policy: response.policy.clone(),
+            reasoning: response.reasoning.clone(),
         };
         Ok(SubqueryOutput {
             data: response.result,
@@ -138,6 +139,7 @@ pub async fn run_sparql_subquery(
             time: response.time.clone(),
             fuel: response.fuel,
             policy: response.policy.clone(),
+            reasoning: response.reasoning.clone(),
         };
         Ok(SubqueryOutput {
             data: response.result,

@@ -5,7 +5,6 @@
 
 use crate::ast::query::AskQuery;
 
-use fluree_db_query::ir::ReasoningConfig;
 use fluree_db_query::ir::{Query, QueryOutput};
 use fluree_db_query::parse::encode::IriEncoder;
 
@@ -29,7 +28,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
             orig_context: None,
             output: QueryOutput::Ask,
             patterns,
-            reasoning: ReasoningConfig::default(),
+            reasoning: self.reasoning_config()?,
             grouping: None,
             ordering: Vec::new(),
             order_binds: Vec::new(),

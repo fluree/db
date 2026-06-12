@@ -25,6 +25,7 @@
 use crate::binding::{Batch, Binding};
 use crate::context::ExecutionContext;
 use crate::error::Result;
+use crate::object_binding::{equality_norm_store, normalize_for_key};
 use crate::operator::{
     compute_trimmed_vars, effective_schema, trim_batch, BoxedOperator, Operator, OperatorState,
 };
@@ -59,6 +60,10 @@ pub struct GroupByOperator {
     group_key_indices: Vec<usize>,
     /// Variables required by downstream operators; if set, output is trimmed.
     out_schema: Option<Arc<[VarId]>>,
+    /// Store for normalizing decoded group-key bindings to encoded form so
+    /// mixed-representation streams land in one group. `None` outside
+    /// single-ledger binary execution.
+    norm_store: Option<Arc<fluree_db_binary_index::BinaryIndexStore>>,
 }
 
 impl GroupByOperator {
@@ -94,6 +99,7 @@ impl GroupByOperator {
             emit_iter: None,
             group_key_indices,
             out_schema: None,
+            norm_store: None,
         }
     }
 
@@ -107,7 +113,7 @@ impl GroupByOperator {
     fn extract_group_key(&self, row: &[Binding]) -> Vec<Binding> {
         self.group_key_indices
             .iter()
-            .map(|&idx| row[idx].clone())
+            .map(|&idx| normalize_for_key(&row[idx], self.norm_store.as_deref()))
             .collect()
     }
 
@@ -166,6 +172,9 @@ impl Operator for GroupByOperator {
         self.state = OperatorState::Open;
         self.groups.clear();
         self.emit_iter = None;
+        if self.norm_store.is_none() {
+            self.norm_store = equality_norm_store(ctx);
+        }
         Ok(())
     }
 

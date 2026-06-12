@@ -248,6 +248,16 @@ fn bindings_compatible_for_values(ctx: &ExecutionContext<'_>, a: &Binding, b: &B
         return true;
     }
 
+    // Encoded scan output vs decoded VALUES constants: normalize the decoded
+    // side to its encoded form and retry the structural comparison.
+    if let Some(store) = crate::object_binding::equality_norm_store(ctx) {
+        let an = crate::object_binding::encoded_equivalent(a, &store);
+        let bn = crate::object_binding::encoded_equivalent(b, &store);
+        if (an.is_some() || bn.is_some()) && an.as_ref().unwrap_or(a) == bn.as_ref().unwrap_or(b) {
+            return true;
+        }
+    }
+
     match (a, b) {
         // Compare SID to IRI-bearing bindings by decoding SID via primary db.
         (Binding::Sid { sid, .. }, Binding::Iri(iri) | Binding::IriMatch { iri, .. })

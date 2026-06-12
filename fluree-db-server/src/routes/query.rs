@@ -530,6 +530,7 @@ pub async fn query(
                             time: r.time.clone(),
                             fuel: r.fuel,
                             policy: r.policy.clone(),
+                            reasoning: r.reasoning.clone(),
                         };
                         let mut resp_headers = tracking_headers(&tally);
                         resp_headers.insert(
@@ -605,6 +606,7 @@ pub async fn query(
                 time: response.time.clone(),
                 fuel: response.fuel,
                 policy: response.policy.clone(),
+                reasoning: response.reasoning.clone(),
             };
             let resp_headers = tracking_headers(&tally);
             tracing::info!(
@@ -1514,6 +1516,7 @@ async fn execute_query(
             time: response.time.clone(),
             fuel: response.fuel,
             policy: response.policy.clone(),
+            reasoning: response.reasoning.clone(),
         };
         let headers = tracking_headers(&tally);
 
@@ -1624,6 +1627,7 @@ async fn execute_query_proxy(
             time: response.time.clone(),
             fuel: response.fuel,
             policy: response.policy.clone(),
+            reasoning: response.reasoning.clone(),
         };
         let headers = tracking_headers(&tally);
 
@@ -2004,6 +2008,7 @@ async fn execute_sparql_ledger(
                     time: response.time.clone(),
                     fuel: response.fuel,
                     policy: response.policy.clone(),
+                    reasoning: response.reasoning.clone(),
                 };
                 let headers = tracking_headers(&tally);
 
@@ -2207,6 +2212,7 @@ async fn execute_sparql_ledger(
                 time: response.time.clone(),
                 fuel: response.fuel,
                 policy: response.policy.clone(),
+                reasoning: response.reasoning.clone(),
             };
             let resp_headers = tracking_headers(&tally);
 
@@ -2748,6 +2754,7 @@ async fn execute_history_query(
             time: response.time.clone(),
             fuel: response.fuel,
             policy: response.policy.clone(),
+            reasoning: response.reasoning.clone(),
         };
         let headers = tracking_headers(&tally);
 

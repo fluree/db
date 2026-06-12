@@ -1455,8 +1455,7 @@ pub fn build_where_operators_seeded_with_needed(
                 // Hot path: triples only (no BIND/FILTER).
                 // Skip dependency bookkeeping entirely.
                 if block.binds.is_empty() && block.filters.is_empty() {
-                    let augmented_rwv = augmented_at(end);
-                    let augmented_ref = augmented_rwv.as_deref();
+                    let mut augmented_rwv = augmented_at(end);
 
                     // Preserve property-join eligibility when a top-level VALUES precedes
                     // a pure star block. Wrapping VALUES first seeds the schema/operator and
@@ -1465,6 +1464,22 @@ pub fn build_where_operators_seeded_with_needed(
                         && !block.values.is_empty()
                         && block.triples.len() >= 2
                         && is_property_join(&block.triples);
+
+                    // The deferred VALUES wrapper joins on its vars AFTER the triple
+                    // operators run, so those vars must survive schema pruning even
+                    // when the SELECT list doesn't mention them.
+                    if values_after_triples {
+                        if let Some(rwv) = augmented_rwv.as_mut() {
+                            for vp in &block.values {
+                                for v in &vp.vars {
+                                    if !rwv.contains(v) {
+                                        rwv.push(*v);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    let augmented_ref = augmented_rwv.as_deref();
 
                     let ctx = TriplePlanContext {
                         required_where_vars: augmented_ref,

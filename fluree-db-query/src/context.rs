@@ -12,6 +12,7 @@ use crate::remote_service::RemoteServiceExecutor;
 use crate::var_registry::VarRegistry;
 use crate::vector::VectorIndexProvider;
 use fluree_db_binary_index::{BinaryGraphView, BinaryIndexStore, FulltextArena};
+use fluree_db_core::comparator::IndexType;
 use fluree_db_core::dict_novelty::DictNovelty;
 use fluree_db_core::{
     GraphDbRef, GraphId, LedgerSnapshot, NoOverlay, OverlayProvider, QueryCancellation,
@@ -62,6 +63,21 @@ pub type SharedOverlayOpsCache = Arc<crate::fast_path_common::OverlayOpsCache>;
 /// Map from `(graph_id, predicate_id, lang_id)` to fulltext BoW arenas used
 /// by `fulltext()` BM25 scoring.
 pub type FulltextProviders = HashMap<(GraphId, u32, u16), Arc<FulltextArena>>;
+
+/// Per-query memo for overlay flake → V3 `OverlayOp` translation, keyed by
+/// `(overlay epoch, graph id, index)`.
+///
+/// Translating the overlay walks every overlay flake and resolves each
+/// subject/predicate/object through the dictionaries, then sorts the result —
+/// O(overlay size × dict lookups). Per-row join probes open a fresh scan per
+/// left row; without this memo each probe re-translates the entire overlay
+/// (quadratic on reasoning queries, where the derived-facts overlay holds the
+/// whole materialization).
+///
+/// Scoping: contexts that swap the overlay (`with_graph_ref`) start a fresh
+/// memo, mirroring `const_sid_cache`; same-overlay derivations share it.
+pub type TranslatedOverlayCache =
+    Arc<Mutex<FxHashMap<(u64, GraphId, IndexType), Arc<crate::binary_scan::TranslatedOverlayOps>>>>;
 
 /// Execution context providing access to database and query state.
 ///
@@ -211,6 +227,11 @@ pub struct ExecutionContext<'a> {
     /// access time, so a wrongly-shared cache degrades to uncached compute
     /// rather than serving stale ops.
     pub overlay_ops_cache: SharedOverlayOpsCache,
+    /// Per-query memo: WHOLE-overlay translation per `(epoch, graph, index)`,
+    /// so per-row scan opens reuse one overlay translation (see
+    /// [`TranslatedOverlayCache`]). Complements `overlay_ops_cache`, which
+    /// memoizes per-predicate subsets for the fast-path/probe lanes.
+    pub translated_overlay_cache: TranslatedOverlayCache,
 }
 
 impl<'a> ExecutionContext<'a> {
@@ -249,6 +270,7 @@ impl<'a> ExecutionContext<'a> {
             original_snapshot: snapshot,
             const_sid_cache: ConstSidCache::default(),
             overlay_ops_cache: SharedOverlayOpsCache::default(),
+            translated_overlay_cache: TranslatedOverlayCache::default(),
         }
     }
 
@@ -299,6 +321,7 @@ impl<'a> ExecutionContext<'a> {
             original_snapshot: db.snapshot,
             const_sid_cache: ConstSidCache::default(),
             overlay_ops_cache: SharedOverlayOpsCache::default(),
+            translated_overlay_cache: TranslatedOverlayCache::default(),
         }
     }
 
@@ -353,6 +376,7 @@ impl<'a> ExecutionContext<'a> {
             original_snapshot: db.snapshot,
             const_sid_cache: ConstSidCache::default(),
             overlay_ops_cache: SharedOverlayOpsCache::default(),
+            translated_overlay_cache: TranslatedOverlayCache::default(),
         }
     }
 
@@ -396,6 +420,7 @@ impl<'a> ExecutionContext<'a> {
             original_snapshot: snapshot,
             const_sid_cache: ConstSidCache::default(),
             overlay_ops_cache: SharedOverlayOpsCache::default(),
+            translated_overlay_cache: TranslatedOverlayCache::default(),
         }
     }
 
@@ -438,6 +463,7 @@ impl<'a> ExecutionContext<'a> {
             original_snapshot: snapshot,
             const_sid_cache: ConstSidCache::default(),
             overlay_ops_cache: SharedOverlayOpsCache::default(),
+            translated_overlay_cache: TranslatedOverlayCache::default(),
         }
     }
 
@@ -482,6 +508,7 @@ impl<'a> ExecutionContext<'a> {
             original_snapshot: snapshot,
             const_sid_cache: ConstSidCache::default(),
             overlay_ops_cache: SharedOverlayOpsCache::default(),
+            translated_overlay_cache: TranslatedOverlayCache::default(),
         }
     }
 
@@ -942,6 +969,7 @@ impl<'a> ExecutionContext<'a> {
             original_snapshot: self.original_snapshot,
             const_sid_cache: self.const_sid_cache.clone(),
             overlay_ops_cache: self.overlay_ops_cache.clone(),
+            translated_overlay_cache: self.translated_overlay_cache.clone(),
         }
     }
 
@@ -995,6 +1023,7 @@ impl<'a> ExecutionContext<'a> {
             original_snapshot: self.original_snapshot,
             const_sid_cache: self.const_sid_cache.clone(),
             overlay_ops_cache: self.overlay_ops_cache.clone(),
+            translated_overlay_cache: self.translated_overlay_cache.clone(),
         }
     }
 
@@ -1051,6 +1080,7 @@ impl<'a> ExecutionContext<'a> {
             // keep the same store, so they correctly share the parent's memo.)
             const_sid_cache: ConstSidCache::default(),
             overlay_ops_cache: SharedOverlayOpsCache::default(),
+            translated_overlay_cache: TranslatedOverlayCache::default(),
         }
     }
 
@@ -1099,6 +1129,7 @@ impl<'a> ExecutionContext<'a> {
         self.binary_g_id = g_id;
         // Store identity is part of the overlay-ops cache binding.
         self.overlay_ops_cache = SharedOverlayOpsCache::default();
+        self.translated_overlay_cache = TranslatedOverlayCache::default();
         self
     }
 
@@ -1107,6 +1138,7 @@ impl<'a> ExecutionContext<'a> {
         self.dict_novelty = Some(dict_novelty);
         // Dict-novelty identity is part of the overlay-ops cache binding.
         self.overlay_ops_cache = SharedOverlayOpsCache::default();
+        self.translated_overlay_cache = TranslatedOverlayCache::default();
         self
     }
 
@@ -1115,6 +1147,7 @@ impl<'a> ExecutionContext<'a> {
         self.runtime_small_dicts = Some(runtime_small_dicts);
         // Small-dict identity is part of the overlay-ops cache binding.
         self.overlay_ops_cache = SharedOverlayOpsCache::default();
+        self.translated_overlay_cache = TranslatedOverlayCache::default();
         self
     }
 

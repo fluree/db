@@ -12,7 +12,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::overlay::DerivedFactsOverlay;
-use crate::types::ReasoningModes;
 
 /// Cache key for derived facts
 ///
@@ -30,8 +29,6 @@ pub struct ReasoningCacheKey {
     pub overlay_epoch: u64,
     /// Schema version that affects rules
     pub ontology_epoch: u64,
-    /// Which reasoning modes are enabled (rdfs, owl2ql, owl2rl, etc.)
-    pub reasoning_modes: ReasoningModes,
     /// Hash of rule-specific options
     ///
     /// INCLUDE: enabled RL rule subset, budgets (max_duration, max_facts, max_memory),
@@ -47,12 +44,6 @@ impl Hash for ReasoningCacheKey {
         self.to_t.hash(state);
         self.overlay_epoch.hash(state);
         self.ontology_epoch.hash(state);
-        // ReasoningModes fields
-        self.reasoning_modes.rdfs.hash(state);
-        self.reasoning_modes.owl2ql.hash(state);
-        self.reasoning_modes.datalog.hash(state);
-        self.reasoning_modes.owl2rl.hash(state);
-        self.reasoning_modes.explicit_none.hash(state);
         self.rule_config_hash.hash(state);
     }
 }
@@ -64,11 +55,6 @@ impl PartialEq for ReasoningCacheKey {
             && self.to_t == other.to_t
             && self.overlay_epoch == other.overlay_epoch
             && self.ontology_epoch == other.ontology_epoch
-            && self.reasoning_modes.rdfs == other.reasoning_modes.rdfs
-            && self.reasoning_modes.owl2ql == other.reasoning_modes.owl2ql
-            && self.reasoning_modes.datalog == other.reasoning_modes.datalog
-            && self.reasoning_modes.owl2rl == other.reasoning_modes.owl2rl
-            && self.reasoning_modes.explicit_none == other.reasoning_modes.explicit_none
             && self.rule_config_hash == other.rule_config_hash
     }
 }
@@ -150,23 +136,6 @@ pub struct ReasoningDiagnostics {
 }
 
 impl ReasoningDiagnostics {
-    /// Create diagnostics for a capped result
-    pub fn capped(
-        reason: impl Into<String>,
-        iterations: usize,
-        facts: usize,
-        duration: Duration,
-    ) -> Self {
-        Self {
-            iterations,
-            facts_derived: facts,
-            capped: true,
-            capped_reason: Some(reason.into()),
-            duration,
-            rules_fired: hashbrown::HashMap::new(),
-        }
-    }
-
     /// Create diagnostics for a completed (uncapped) result
     pub fn completed(iterations: usize, facts: usize, duration: Duration) -> Self {
         Self {
@@ -177,6 +146,30 @@ impl ReasoningDiagnostics {
             duration,
             rules_fired: hashbrown::HashMap::new(),
         }
+    }
+
+    /// Finalize as capped, preserving accumulated rule-fire counts.
+    pub fn mark_capped(
+        &mut self,
+        reason: impl Into<String>,
+        iterations: usize,
+        facts: usize,
+        duration: Duration,
+    ) {
+        self.iterations = iterations;
+        self.facts_derived = facts;
+        self.capped = true;
+        self.capped_reason = Some(reason.into());
+        self.duration = duration;
+    }
+
+    /// Finalize as completed, preserving accumulated rule-fire counts.
+    pub fn mark_completed(&mut self, iterations: usize, facts: usize, duration: Duration) {
+        self.iterations = iterations;
+        self.facts_derived = facts;
+        self.capped = false;
+        self.capped_reason = None;
+        self.duration = duration;
     }
 
     /// Record that a rule fired
@@ -190,8 +183,11 @@ impl ReasoningDiagnostics {
 /// Always returned together so callers have full visibility into what happened.
 #[derive(Debug)]
 pub struct ReasoningResult {
-    /// The derived facts overlay
-    pub overlay: DerivedFactsOverlay,
+    /// The derived facts overlay.
+    ///
+    /// `Arc` so cache hits can hand the prebuilt (pre-sorted) overlay
+    /// directly to query execution instead of rebuilding it per query.
+    pub overlay: Arc<DerivedFactsOverlay>,
     /// Diagnostics about the reasoning process
     pub diagnostics: ReasoningDiagnostics,
 }
@@ -200,7 +196,7 @@ impl ReasoningResult {
     /// Create a new result
     pub fn new(overlay: DerivedFactsOverlay, diagnostics: ReasoningDiagnostics) -> Self {
         Self {
-            overlay,
+            overlay: Arc::new(overlay),
             diagnostics,
         }
     }
@@ -286,14 +282,13 @@ mod tests {
             to_t: 0,
             overlay_epoch: 0,
             ontology_epoch: 0,
-            reasoning_modes: ReasoningModes::default(),
             rule_config_hash: 0,
         }
     }
 
     fn make_result() -> Arc<ReasoningResult> {
         Arc::new(ReasoningResult {
-            overlay: DerivedFactsOverlay::empty(),
+            overlay: Arc::new(DerivedFactsOverlay::empty()),
             diagnostics: ReasoningDiagnostics::default(),
         })
     }

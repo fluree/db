@@ -477,12 +477,15 @@ fn rewrite_having_aggregates(
 pub fn parse_reasoning(
     obj: &serde_json::Map<String, JsonValue>,
 ) -> Result<Option<crate::ir::ReasoningModes>> {
-    // Check if reasoning, rules, or ontology is present.
+    // Check if reasoning, rules, ontology, or a budget is present. A budget
+    // alone enables no mode, but it must be carried so a ledger-config
+    // default mode runs under it.
     let has_reasoning = obj.contains_key("reasoning");
     let has_rules = obj.contains_key("rules");
     let has_ontology = obj.contains_key("ontology");
+    let has_budget = obj.contains_key("reasoningBudget");
 
-    if !has_reasoning && !has_rules && !has_ontology {
+    if !has_reasoning && !has_rules && !has_ontology && !has_budget {
         return Ok(None);
     }
 
