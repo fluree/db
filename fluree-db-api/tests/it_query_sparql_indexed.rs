@@ -7176,10 +7176,15 @@ async fn indexed_numeric_avg_min_max_fast_paths_work() {
                 .await
                 .expect("indexed AVG(?o) query");
             let avg_json = avg_result.to_jsonld(&view.snapshot).expect("to_jsonld");
+            // AVG over xsd:integer inputs is xsd:decimal (SPARQL 1.1), which
+            // formats as a string — same output as the generic pipeline. The
+            // fast path previously emitted a float (xsd:double) here; the
+            // differential harness flagged that divergence (FD-1) and the
+            // fast path now matches the generic accumulator.
             assert_eq!(
                 normalize_rows(&avg_json),
-                normalize_rows(&json!([[2.5]])),
-                "indexed AVG(?o) should average numeric values directly"
+                normalize_rows(&json!([["2.5"]])),
+                "indexed AVG(?o) should average numeric values directly (as xsd:decimal)"
             );
 
             let min_query = r"
@@ -7618,7 +7623,9 @@ async fn indexed_overlay_scalar_agg_reflects_assert_and_retract() {
                 .expect("view t=1");
             for (q, expected) in [
                 (sum_q, json!([[60]])),
-                (avg_q, json!([[20.0]])),
+                // AVG over integers is xsd:decimal (string-formatted) — see FD-1
+                // in the differential harness; fast and generic paths now agree.
+                (avg_q, json!([["20"]])),
                 (cd_q, json!([[2]])),
             ] {
                 let result = fluree
@@ -7650,7 +7657,7 @@ async fn indexed_overlay_scalar_agg_reflects_assert_and_retract() {
                 .expect("view t=2");
             for (q, expected) in [
                 (sum_q, json!([[100]])),
-                (avg_q, json!([[25.0]])),
+                (avg_q, json!([["25"]])),
                 (cd_q, json!([[3]])),
             ] {
                 let result = fluree
@@ -7685,7 +7692,7 @@ async fn indexed_overlay_scalar_agg_reflects_assert_and_retract() {
                 .expect("view t=3");
             for (q, expected) in [
                 (sum_q, json!([[90]])),
-                (avg_q, json!([[30.0]])),
+                (avg_q, json!([["30"]])),
                 (cd_q, json!([[2]])),
             ] {
                 let result = fluree
