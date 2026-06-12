@@ -82,6 +82,23 @@ pub struct ServerFileConfig {
     /// `[server.storage_proxy]`
     #[serde(default)]
     pub storage_proxy: Option<StorageProxyFileConfig>,
+
+    /// `[server.raft]` — Raft cluster mode (replicated writes).
+    /// Only consumed when the `raft` feature is built; deserializes
+    /// silently when the feature is off so configs are portable.
+    #[serde(default)]
+    pub raft: Option<RaftFileConfig>,
+}
+
+/// Raft cluster mode settings. Mirrors the
+/// `--raft-*` CLI flags. All fields are optional in the file; the
+/// CLI overlay decides which are required at validation time.
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
+pub struct RaftFileConfig {
+    pub enabled: Option<bool>,
+    pub node_id: Option<u64>,
+    pub storage_path: Option<String>,
+    pub listen_addr: Option<String>,
 }
 
 #[derive(Debug, Default, Clone, Deserialize, Serialize)]
@@ -732,6 +749,41 @@ pub fn apply_to_server_config(
                 config.storage_proxy_debug_headers = v;
             }
         }
+    }
+
+    // --- Raft ---
+    #[cfg(feature = "raft")]
+    if let Some(ref raft) = file.raft {
+        if is_default("raft_enabled") {
+            if let Some(v) = raft.enabled {
+                config.raft_enabled = v;
+            }
+        }
+        if is_default("raft_node_id") {
+            if let Some(v) = raft.node_id {
+                config.raft_node_id = Some(v);
+            }
+        }
+        if is_default("raft_storage_path") {
+            if let Some(ref v) = raft.storage_path {
+                config.raft_storage_path = Some(PathBuf::from(v));
+            }
+        }
+        if is_default("raft_listen_addr") {
+            if let Some(ref addr_str) = raft.listen_addr {
+                match addr_str.parse::<SocketAddr>() {
+                    Ok(addr) => config.raft_listen_addr = Some(addr),
+                    Err(_) => warn!(
+                        value = addr_str,
+                        "Invalid raft.listen_addr in config file, ignoring"
+                    ),
+                }
+            }
+        }
+    }
+    #[cfg(not(feature = "raft"))]
+    {
+        let _ = &file.raft;
     }
 }
 

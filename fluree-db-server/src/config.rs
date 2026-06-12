@@ -638,6 +638,40 @@ pub struct ServerConfig {
     /// DANGEROUS: Accept any valid admin signature regardless of issuer (dev only)
     #[arg(long, env = "FLUREE_ADMIN_AUTH_INSECURE", hide = true)]
     pub admin_auth_insecure_accept_any_issuer: bool,
+
+    // === Raft cluster options (replicated writes) ===
+    //
+    // When `raft_enabled` is `true`, the server bootstraps an
+    // openraft node, mounts the follower-forward middleware over
+    // leader-only routes, and exposes the inter-node RPC + cluster
+    // admin routers on `raft_listen_addr` (a separate private
+    // listener). All four fields below are required when raft is
+    // on; validation rejects partial configs.
+    /// Replicate writes through a Raft cluster.
+    #[cfg(feature = "raft")]
+    #[arg(long, env = "FLUREE_RAFT_ENABLED")]
+    pub raft_enabled: bool,
+
+    /// This node's id in the Raft cluster. Must be unique and
+    /// stable across restarts — the openraft log + snapshots are
+    /// keyed by it.
+    #[cfg(feature = "raft")]
+    #[arg(long, env = "FLUREE_RAFT_NODE_ID")]
+    pub raft_node_id: Option<u64>,
+
+    /// Root directory for the Raft log and snapshots. Distinct
+    /// from `--storage-path` — losing this directory loses commits.
+    #[cfg(feature = "raft")]
+    #[arg(long, env = "FLUREE_RAFT_STORAGE_PATH")]
+    pub raft_storage_path: Option<PathBuf>,
+
+    /// VPC-internal address for the inter-node Raft RPC + cluster
+    /// admin listener. Distinct from `--listen-addr` (the
+    /// client-facing port). No auth — operators enforce trust at
+    /// the network layer.
+    #[cfg(feature = "raft")]
+    #[arg(long, env = "FLUREE_RAFT_LISTEN_ADDR")]
+    pub raft_listen_addr: Option<SocketAddr>,
 }
 
 impl Default for ServerConfig {
@@ -700,6 +734,15 @@ impl Default for ServerConfig {
             admin_auth_mode: AdminAuthMode::None,
             admin_auth_trusted_issuers: Vec::new(),
             admin_auth_insecure_accept_any_issuer: false,
+            // Raft defaults
+            #[cfg(feature = "raft")]
+            raft_enabled: false,
+            #[cfg(feature = "raft")]
+            raft_node_id: None,
+            #[cfg(feature = "raft")]
+            raft_storage_path: None,
+            #[cfg(feature = "raft")]
+            raft_listen_addr: None,
         }
     }
 }
@@ -870,6 +913,29 @@ impl ServerConfig {
                 "storage_proxy.enabled is only valid for server_role=transaction (not peer)"
                     .to_string(),
             );
+        }
+
+        // Raft validation: when enabled, node_id + storage_path +
+        // listen_addr must all be set, and proxy storage is
+        // incompatible with raft (raft replicates writes via the
+        // log; proxy mode forwards to a remote tx server).
+        #[cfg(feature = "raft")]
+        if self.raft_enabled {
+            if self.raft_node_id.is_none() {
+                return Err("raft.enabled=true requires --raft-node-id".to_string());
+            }
+            if self.raft_storage_path.is_none() {
+                return Err("raft.enabled=true requires --raft-storage-path".to_string());
+            }
+            if self.raft_listen_addr.is_none() {
+                return Err("raft.enabled=true requires --raft-listen-addr".to_string());
+            }
+            if self.is_proxy_storage_mode() {
+                return Err(
+                    "raft.enabled=true is incompatible with storage-access-mode=proxy"
+                        .to_string(),
+                );
+            }
         }
 
         // Peer mode validation

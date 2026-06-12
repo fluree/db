@@ -13,7 +13,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use fluree_db_server::raft::{RaftBootstrapConfig, RaftIntegration};
-use fluree_db_server::FlureeServerBuilder;
+use fluree_db_server::{FlureeServerBuilder, ServerConfig};
 use tempfile::TempDir;
 
 #[tokio::test]
@@ -49,4 +49,63 @@ async fn builder_with_raft_attaches_integration_to_app_state() {
     // Router builds without panicking; concrete route behavior is
     // covered by the public-side integration tests.
     let _ = server.router();
+}
+
+#[test]
+fn raft_enabled_requires_node_id() {
+    let config = ServerConfig {
+        raft_enabled: true,
+        raft_node_id: None,
+        raft_storage_path: Some(std::path::PathBuf::from("/tmp/raft")),
+        raft_listen_addr: Some("127.0.0.1:9090".parse().unwrap()),
+        ..Default::default()
+    };
+    let err = config.validate().expect_err("missing node_id should error");
+    assert!(err.contains("raft-node-id"), "got: {err}");
+}
+
+#[test]
+fn raft_enabled_requires_storage_path() {
+    let config = ServerConfig {
+        raft_enabled: true,
+        raft_node_id: Some(1),
+        raft_storage_path: None,
+        raft_listen_addr: Some("127.0.0.1:9090".parse().unwrap()),
+        ..Default::default()
+    };
+    let err = config.validate().expect_err("missing storage_path should error");
+    assert!(err.contains("raft-storage-path"), "got: {err}");
+}
+
+#[test]
+fn raft_enabled_requires_listen_addr() {
+    let config = ServerConfig {
+        raft_enabled: true,
+        raft_node_id: Some(1),
+        raft_storage_path: Some(std::path::PathBuf::from("/tmp/raft")),
+        raft_listen_addr: None,
+        ..Default::default()
+    };
+    let err = config.validate().expect_err("missing listen_addr should error");
+    assert!(err.contains("raft-listen-addr"), "got: {err}");
+}
+
+#[test]
+fn raft_enabled_rejects_proxy_storage() {
+    use fluree_db_server::config::{ServerRole, StorageAccessMode};
+    let config = ServerConfig {
+        raft_enabled: true,
+        raft_node_id: Some(1),
+        raft_storage_path: Some(std::path::PathBuf::from("/tmp/raft")),
+        raft_listen_addr: Some("127.0.0.1:9090".parse().unwrap()),
+        server_role: ServerRole::Peer,
+        storage_access_mode: StorageAccessMode::Proxy,
+        tx_server_url: Some("http://tx.example".into()),
+        storage_proxy_token: Some("dummy".into()),
+        ..Default::default()
+    };
+    let err = config
+        .validate()
+        .expect_err("raft + proxy storage should error");
+    assert!(err.contains("proxy"), "got: {err}");
 }
