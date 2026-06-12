@@ -64,20 +64,38 @@ pub fn write_stored_hash(memory_dir: &Path, hash: &str) -> Result<()> {
 // Sync check
 // ---------------------------------------------------------------------------
 
-/// Recompute and write the build hash.
+/// Recompute and write the build hash, returning it.
 ///
-/// Called after any mutation to `.ttl` files (add, update, forget).
-pub fn update_hash(memory_dir: &Path) -> Result<()> {
+/// Called after any mutation to `.ttl` files (add, update, forget). The
+/// returned hash lets the caller advance its per-process sync watermark to
+/// match the file it just wrote, without re-hashing.
+pub fn update_hash(memory_dir: &Path) -> Result<String> {
     let hash = compute_build_hash(memory_dir)?;
-    write_stored_hash(memory_dir, &hash)
+    write_stored_hash(memory_dir, &hash)?;
+    Ok(hash)
 }
 
-/// Check if the ledger needs rebuilding from files.
+/// Check if **this process's** ledger needs rebuilding from files.
 ///
 /// Returns true if:
-/// - Stored hash is missing (fresh clone or first init)
-/// - Hash mismatch (files changed externally — e.g., `git pull`)
-/// - Ledger doesn't exist (deleted or corrupted)
+/// - Ledger doesn't exist (deleted, corrupted, or fresh init)
+/// - This process has not yet synced (no watermark — e.g. a fresh in-memory
+///   ledger that has not ingested the files)
+/// - The live file hash differs from the hash our ledger last ingested
+///   (another process wrote the files, or `git pull` changed them)
+///
+/// The decision is made against the store's **per-process** watermark, not the
+/// shared on-disk `build-hash`: that on-disk hash records whoever wrote the
+/// files last, so a long-lived process whose own ledger never ingested those
+/// writes would otherwise be fooled into thinking it is in sync. The watermark
+/// is advanced only by our own rebuilds and mutations, so once set it rebuilds
+/// whenever the files diverge from what our ledger holds.
+///
+/// On the first check the watermark is unset. For a persistent (file-backed)
+/// ledger it is seeded from the on-disk hash — the just-loaded ledger is
+/// consistent with it, avoiding a needless rebuild — but for an ephemeral
+/// (in-memory) ledger seeding is unsafe (the fresh ledger is empty), so a
+/// rebuild is forced. See [`MemoryStore::seed_watermark_from_disk`].
 pub async fn needs_rebuild(store: &MemoryStore, memory_dir: &Path) -> Result<bool> {
     // Check if ledger exists
     if !store.is_initialized().await? {
@@ -85,23 +103,34 @@ pub async fn needs_rebuild(store: &MemoryStore, memory_dir: &Path) -> Result<boo
         return Ok(true);
     }
 
-    let current_hash = compute_build_hash(memory_dir)?;
-    let stored_hash = read_stored_hash(memory_dir);
+    let synced = match store.synced_hash() {
+        Some(h) => Some(h),
+        None if store.seed_watermark_from_disk() => {
+            let seed = read_stored_hash(memory_dir);
+            store.set_synced_hash(seed.clone());
+            seed
+        }
+        None => None,
+    };
 
-    match stored_hash {
+    match synced {
         None => {
-            debug!("No stored build hash — rebuild needed");
+            debug!("No watermark for this process — rebuild needed");
             Ok(true)
         }
-        Some(stored) if stored != current_hash => {
-            debug!(
-                stored = %stored,
-                current = %current_hash,
-                "Build hash mismatch — rebuild needed"
-            );
-            Ok(true)
+        Some(synced) => {
+            let current_hash = compute_build_hash(memory_dir)?;
+            if synced != current_hash {
+                debug!(
+                    synced = %synced,
+                    current = %current_hash,
+                    "Files diverged from this process's ledger — rebuild needed"
+                );
+                Ok(true)
+            } else {
+                Ok(false)
+            }
         }
-        _ => Ok(false),
     }
 }
 
@@ -182,6 +211,28 @@ async fn acquire_lock_file(lock_path: PathBuf) -> Result<fs::File> {
     .map_err(|e| MemoryError::FileSync(format!("failed to join rebuild lock task: {e}")))?
 }
 
+/// Rebuild the ledger from files if this process's ledger is stale, assuming
+/// the caller **already holds** the cross-process file lock (and the store
+/// mutation lock).
+///
+/// Unlike [`ensure_synced`], this acquires neither lock itself, so it is safe
+/// to call from inside a mutation's locked critical section. `needs_rebuild`
+/// and `rebuild_from_files` (via `drop_and_reinit_unlocked`) take no locks of
+/// their own.
+pub(crate) async fn rebuild_if_stale_unlocked(
+    store: &MemoryStore,
+    memory_dir: &Path,
+) -> Result<()> {
+    if !memory_dir.exists() {
+        return Ok(());
+    }
+    if needs_rebuild(store, memory_dir).await? {
+        debug!("In-lock rebuild: files diverged from this process's ledger");
+        rebuild_from_files(store, memory_dir).await?;
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Atomic rebuild
 // ---------------------------------------------------------------------------
@@ -235,9 +286,11 @@ async fn rebuild_from_files(store: &MemoryStore, memory_dir: &Path) -> Result<()
         transact_batch(store, user_data).await?;
     }
 
-    // Phase 4: Write hash
+    // Phase 4: Write hash and record it as this process's sync watermark —
+    // our ledger now reflects exactly this file content.
     let hash = compute_build_hash(memory_dir)?;
     write_stored_hash(memory_dir, &hash)?;
+    store.set_synced_hash(Some(hash.clone()));
 
     debug!(hash = %hash, "Memory ledger rebuilt from files");
     Ok(())
