@@ -1532,7 +1532,7 @@ async fn validate_class_constraint(
 /// below leans on `GraphDbRef: Copy` to carry every field through unchanged.
 fn rescope_to_schema_graph(db: GraphDbRef<'_>) -> GraphDbRef<'_> {
     let mut schema_db = db;
-    schema_db.g_id = 0;
+    schema_db.g_id = GraphId(0);
     schema_db
 }
 
@@ -1675,10 +1675,14 @@ mod tests {
         });
         assert!(tracker.is_enabled(), "tracker must be enabled for the test");
 
-        let db = GraphDbRef::new(&snapshot, 7, &NoOverlay, snapshot.t)
+        let db = GraphDbRef::new(&snapshot, GraphId(7), &NoOverlay, snapshot.t)
             .with_tracker(&tracker)
             .eager();
-        assert_eq!(db.g_id, 7, "precondition: caller is in a non-default graph");
+        assert_eq!(
+            db.g_id,
+            GraphId(7),
+            "precondition: caller is in a non-default graph"
+        );
         assert!(
             db.tracker.is_some(),
             "precondition: caller's db has tracker attached"
@@ -1687,7 +1691,11 @@ mod tests {
 
         let schema_db = super::rescope_to_schema_graph(db);
 
-        assert_eq!(schema_db.g_id, 0, "schema walk must run in default graph");
+        assert_eq!(
+            schema_db.g_id,
+            GraphId(0),
+            "schema walk must run in default graph"
+        );
         assert!(
             schema_db.tracker.is_some(),
             "tracker must survive rescope — otherwise fuel accounting is lost on \
@@ -1762,7 +1770,7 @@ mod tests {
         modified_subjects.insert(Sid::new(100, "ex:alice"));
         modified_subjects.insert(Sid::new(100, "ex:bob"));
 
-        let db = GraphDbRef::new(&snapshot, 0, &NoOverlay, snapshot.t);
+        let db = GraphDbRef::new(&snapshot, GraphId(0), &NoOverlay, snapshot.t);
         let report = engine
             .validate_staged(db, &modified_subjects)
             .await
@@ -1801,7 +1809,7 @@ mod tests {
         // Empty subject set
         let modified_subjects = HashSet::new();
 
-        let db = GraphDbRef::new(&snapshot, 0, &NoOverlay, snapshot.t);
+        let db = GraphDbRef::new(&snapshot, GraphId(0), &NoOverlay, snapshot.t);
         let report = engine
             .validate_staged(db, &modified_subjects)
             .await

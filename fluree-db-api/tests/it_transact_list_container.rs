@@ -5,6 +5,7 @@
 mod support;
 
 use fluree_db_api::FlureeBuilder;
+use fluree_db_core::GraphId;
 use serde_json::json;
 use tempfile::TempDir;
 
@@ -56,7 +57,7 @@ async fn list_container_serialization_test() {
         .await
         .unwrap();
     let jsonld = result
-        .to_jsonld_async(loaded_ledger.as_graph_db_ref(0))
+        .to_jsonld_async(loaded_ledger.as_graph_db_ref(GraphId(0)))
         .await
         .unwrap();
 
@@ -128,7 +129,7 @@ async fn list_container_multiple_values_test() {
         .await
         .unwrap();
     let jsonld = result
-        .to_jsonld_async(loaded_ledger.as_graph_db_ref(0))
+        .to_jsonld_async(loaded_ledger.as_graph_db_ref(GraphId(0)))
         .await
         .unwrap();
 
@@ -178,7 +179,7 @@ async fn list_container_duplicate_values_at_distinct_positions_preserved() {
     let jsonld = support::query_jsonld(&fluree, &ledger, &query)
         .await
         .unwrap()
-        .to_jsonld_async(ledger.as_graph_db_ref(0))
+        .to_jsonld_async(ledger.as_graph_db_ref(GraphId(0)))
         .await
         .unwrap();
     let thing = &jsonld.as_array().unwrap()[0];
@@ -217,7 +218,7 @@ async fn set_container_duplicate_scalar_values_collapse() {
     let jsonld = support::query_jsonld(&fluree, &ledger, &query)
         .await
         .unwrap()
-        .to_jsonld_async(ledger.as_graph_db_ref(0))
+        .to_jsonld_async(ledger.as_graph_db_ref(GraphId(0)))
         .await
         .unwrap();
     let thing = &jsonld.as_array().unwrap()[0];
@@ -287,7 +288,7 @@ async fn list_container_with_objects_test() {
         .await
         .unwrap();
     let jsonld = result
-        .to_jsonld_async(loaded_ledger.as_graph_db_ref(0))
+        .to_jsonld_async(loaded_ledger.as_graph_db_ref(GraphId(0)))
         .await
         .unwrap();
 
@@ -351,7 +352,7 @@ async fn list_container_with_blank_node_objects_test() {
         .await
         .unwrap();
     let jsonld = result
-        .to_jsonld_async(ledger.as_graph_db_ref(0))
+        .to_jsonld_async(ledger.as_graph_db_ref(GraphId(0)))
         .await
         .unwrap();
 

@@ -4,6 +4,7 @@
 mod support;
 
 use fluree_db_api::FlureeBuilder;
+use fluree_db_core::GraphId;
 use serde_json::json;
 use support::{normalize_rows, seed_people_compound_dataset};
 
@@ -28,7 +29,7 @@ async fn compound_two_tuple_select_with_crawl_and_values() {
     let rows = support::query_jsonld(&fluree, &ledger, &q)
         .await
         .unwrap()
-        .to_jsonld_async(ledger.as_graph_db_ref(0))
+        .to_jsonld_async(ledger.as_graph_db_ref(GraphId(0)))
         .await
         .unwrap();
     assert_eq!(
@@ -51,7 +52,7 @@ async fn compound_two_tuple_select_with_crawl_and_values() {
     let rows2 = support::query_jsonld(&fluree, &ledger, &q2)
         .await
         .unwrap()
-        .to_jsonld_async(ledger.as_graph_db_ref(0))
+        .to_jsonld_async(ledger.as_graph_db_ref(GraphId(0)))
         .await
         .unwrap();
     assert_eq!(normalize_rows(&rows2), normalize_rows(&rows));
@@ -75,7 +76,7 @@ async fn compound_two_tuple_select_with_crawl_scalar_plus_object() {
     let rows = support::query_jsonld(&fluree, &ledger, &q)
         .await
         .unwrap()
-        .to_jsonld_async(ledger.as_graph_db_ref(0))
+        .to_jsonld_async(ledger.as_graph_db_ref(GraphId(0)))
         .await
         .unwrap();
 
@@ -97,7 +98,7 @@ async fn compound_two_tuple_select_with_crawl_scalar_plus_object() {
     let rows2 = support::query_jsonld(&fluree, &ledger, &q2)
         .await
         .unwrap()
-        .to_jsonld_async(ledger.as_graph_db_ref(0))
+        .to_jsonld_async(ledger.as_graph_db_ref(GraphId(0)))
         .await
         .unwrap();
     assert_eq!(normalize_rows(&rows2), normalize_rows(&expected));
@@ -316,7 +317,7 @@ async fn compound_s_p_o_and_object_subject_joins_with_expansion() {
     let joined = support::query_jsonld(&fluree, &ledger, &q_join)
         .await
         .unwrap()
-        .to_jsonld_async(ledger.as_graph_db_ref(0))
+        .to_jsonld_async(ledger.as_graph_db_ref(GraphId(0)))
         .await
         .unwrap();
 

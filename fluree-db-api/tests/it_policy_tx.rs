@@ -14,6 +14,7 @@ use fluree_db_api::{
     CommitOpts, FlureeBuilder, IndexConfig, QueryConnectionOptions, TrackedTransactionInput,
     TxnOpts, TxnType,
 };
+use fluree_db_core::GraphId;
 use serde_json::json;
 use std::collections::HashMap;
 use support::{assert_index_defaults, genesis_ledger};
@@ -105,7 +106,7 @@ async fn modify_policy_allows_own_property() {
         Some(ledger.novelty.as_ref()),
         ledger.t(),
         &qc_opts,
-        &[0],
+        &[GraphId(0)],
     )
     .await
     .expect("build policy context");
@@ -226,7 +227,7 @@ async fn modify_policy_denies_other_property() {
         Some(ledger.novelty.as_ref()),
         ledger.t(),
         &qc_opts,
-        &[0],
+        &[GraphId(0)],
     )
     .await
     .expect("build policy context");
@@ -324,7 +325,7 @@ async fn view_only_policy_blocks_modify() {
         Some(ledger.novelty.as_ref()),
         ledger.t(),
         &qc_opts,
-        &[0],
+        &[GraphId(0)],
     )
     .await
     .expect("build policy context");
@@ -424,7 +425,7 @@ async fn modify_query_always_false_denies() {
         Some(ledger.novelty.as_ref()),
         ledger.t(),
         &qc_opts,
-        &[0],
+        &[GraphId(0)],
     )
     .await
     .expect("build policy context");

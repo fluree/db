@@ -7,6 +7,7 @@ mod support;
 
 use fluree_db_api::FlureeBuilder;
 use fluree_db_core::prelude::*; // For storage traits
+use fluree_db_core::GraphId;
 use serde_json::json;
 
 /// Test that we can create an encrypted memory instance and perform basic operations
@@ -54,7 +55,7 @@ async fn test_encrypted_memory_create_and_query() {
 
     // Convert to JSON-LD for easy inspection
     let jsonld = result
-        .to_jsonld_async(ledger.as_graph_db_ref(0))
+        .to_jsonld_async(ledger.as_graph_db_ref(GraphId(0)))
         .await
         .unwrap();
 

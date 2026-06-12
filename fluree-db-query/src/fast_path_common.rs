@@ -272,7 +272,7 @@ fn predicate_range_keys(p_id: u32, g_id: GraphId) -> (RunRecordV2, RunRecordV2) 
         t: 0,
         o_i: 0,
         o_type: 0,
-        g_id,
+        g_id: g_id.as_u16(),
     };
     let max_key = RunRecordV2 {
         s_id: SubjectId(u64::MAX),
@@ -281,7 +281,7 @@ fn predicate_range_keys(p_id: u32, g_id: GraphId) -> (RunRecordV2, RunRecordV2) 
         t: u32::MAX,
         o_i: u32::MAX,
         o_type: u16::MAX,
-        g_id,
+        g_id: g_id.as_u16(),
     };
     (min_key, max_key)
 }

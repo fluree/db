@@ -1615,7 +1615,7 @@ impl NestedLoopJoinOperator {
             t: 0,
             o_i: 0,
             o_type: 0,
-            g_id: _g_id,
+            g_id: _g_id.as_u16(),
         };
         let max_key = RunRecordV2 {
             s_id: SubjectId::from_u64(max_s_id),
@@ -1624,7 +1624,7 @@ impl NestedLoopJoinOperator {
             t: u32::MAX,
             o_i: u32::MAX,
             o_type: u16::MAX,
-            g_id: _g_id,
+            g_id: _g_id.as_u16(),
         };
         branch.find_leaves_in_range(&min_key, &max_key, cmp)
     }
@@ -2365,7 +2365,7 @@ impl NestedLoopJoinOperator {
                 t: 0,
                 o_i: 0,
                 o_type: iri_ref,
-                g_id: ctx.binary_g_id,
+                g_id: ctx.binary_g_id.as_u16(),
             };
             let max_key = RunRecordV2 {
                 s_id: SubjectId(u64::MAX),
@@ -2374,7 +2374,7 @@ impl NestedLoopJoinOperator {
                 t: u32::MAX,
                 o_i: u32::MAX,
                 o_type: iri_ref,
-                g_id: ctx.binary_g_id,
+                g_id: ctx.binary_g_id.as_u16(),
             };
             let r = branch.find_leaves_in_range(&min_key, &max_key, cmp);
             leaf_indices.extend(r);
@@ -2848,7 +2848,7 @@ pub(crate) fn batched_subject_probe_binary(
         t: 0,
         o_i: 0,
         o_type: 0,
-        g_id: ctx.binary_g_id,
+        g_id: ctx.binary_g_id.as_u16(),
     };
     let max_key = RunRecordV2 {
         s_id: SubjectId::from_u64(*unique_s_ids.last().unwrap()),
@@ -2857,7 +2857,7 @@ pub(crate) fn batched_subject_probe_binary(
         t: u32::MAX,
         o_i: u32::MAX,
         o_type: u16::MAX,
-        g_id: ctx.binary_g_id,
+        g_id: ctx.binary_g_id.as_u16(),
     };
     let leaf_range = branch.find_leaves_in_range(&min_key, &max_key, cmp);
     let cache = store.leaflet_cache();
@@ -3059,7 +3059,7 @@ pub(crate) fn batched_subject_star_spot(
         t: 0,
         o_i: 0,
         o_type: 0,
-        g_id: ctx.binary_g_id,
+        g_id: ctx.binary_g_id.as_u16(),
     };
     let max_key = RunRecordV2 {
         s_id: SubjectId::from_u64(*unique_s_ids.last().unwrap()),
@@ -3068,7 +3068,7 @@ pub(crate) fn batched_subject_star_spot(
         t: u32::MAX,
         o_i: u32::MAX,
         o_type: u16::MAX,
-        g_id: ctx.binary_g_id,
+        g_id: ctx.binary_g_id.as_u16(),
     };
     let leaf_range = branch.find_leaves_in_range(&min_key, &max_key, cmp);
     let cache = store.leaflet_cache();

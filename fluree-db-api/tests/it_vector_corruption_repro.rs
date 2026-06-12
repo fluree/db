@@ -34,6 +34,7 @@
 mod support;
 
 use fluree_db_api::{FlureeBuilder, LedgerState};
+use fluree_db_core::GraphId;
 use fluree_db_transact::{NamespaceRegistry, Txn, TxnOpts};
 use serde_json::json;
 
@@ -83,7 +84,7 @@ async fn jsonld_context_vector_bare_array_round_trips_after_indexing() {
     let rows = support::query_sparql(&fluree, &loaded, select)
         .await
         .expect("query indexed vector")
-        .to_jsonld_async(loaded.as_graph_db_ref(0))
+        .to_jsonld_async(loaded.as_graph_db_ref(GraphId(0)))
         .await
         .expect("format vector result");
     // Pre-fix this query failed with "vector handle out of arena" because the
@@ -196,7 +197,7 @@ async fn jsonld_context_vector_bare_array_retracts_after_indexing() {
     let count_rows = support::query_sparql(&fluree, &reloaded, count)
         .await
         .expect("count")
-        .to_jsonld_async(reloaded.as_graph_db_ref(0))
+        .to_jsonld_async(reloaded.as_graph_db_ref(GraphId(0)))
         .await
         .expect("format");
     assert_eq!(count_rows, json!([[0]]));
@@ -254,7 +255,7 @@ async fn jsonld_context_vector_bare_array_retracts_via_novelty_overlay() {
     let count_rows = support::query_sparql(&fluree, &deleted.ledger, count)
         .await
         .expect("count after delete (novelty-overlay path)")
-        .to_jsonld_async(deleted.ledger.as_graph_db_ref(0))
+        .to_jsonld_async(deleted.ledger.as_graph_db_ref(GraphId(0)))
         .await
         .expect("format");
     assert_eq!(
@@ -315,7 +316,7 @@ async fn jsonld_context_vector_duplicate_values_retract_one_keeps_other() {
     let rows = support::query_sparql(&fluree, &reloaded, select_doc1)
         .await
         .expect("query doc1")
-        .to_jsonld_async(reloaded.as_graph_db_ref(0))
+        .to_jsonld_async(reloaded.as_graph_db_ref(GraphId(0)))
         .await
         .expect("format");
     assert_ne!(
@@ -332,7 +333,7 @@ async fn jsonld_context_vector_duplicate_values_retract_one_keeps_other() {
     let rows = support::query_sparql(&fluree, &reloaded, select_doc2)
         .await
         .expect("query doc2")
-        .to_jsonld_async(reloaded.as_graph_db_ref(0))
+        .to_jsonld_async(reloaded.as_graph_db_ref(GraphId(0)))
         .await
         .expect("format");
     assert_eq!(rows, json!([]), "doc2's vector must be retracted");
@@ -388,7 +389,7 @@ async fn jsonld_multi_valued_vectors_retract_one_keeps_other() {
     let count_rows = support::query_sparql(&fluree, &reloaded, count)
         .await
         .expect("count")
-        .to_jsonld_async(reloaded.as_graph_db_ref(0))
+        .to_jsonld_async(reloaded.as_graph_db_ref(GraphId(0)))
         .await
         .expect("format");
     assert_eq!(
@@ -405,7 +406,7 @@ async fn jsonld_multi_valued_vectors_retract_one_keeps_other() {
     let rows = support::query_sparql(&fluree, &reloaded, select)
         .await
         .expect("select")
-        .to_jsonld_async(reloaded.as_graph_db_ref(0))
+        .to_jsonld_async(reloaded.as_graph_db_ref(GraphId(0)))
         .await
         .expect("format");
     let surviving = rows
@@ -471,7 +472,7 @@ async fn jsonld_re_asserting_same_vector_dedups() {
     let count_rows = support::query_sparql(&fluree, &reloaded, count_q)
         .await
         .expect("count after re-assert")
-        .to_jsonld_async(reloaded.as_graph_db_ref(0))
+        .to_jsonld_async(reloaded.as_graph_db_ref(GraphId(0)))
         .await
         .expect("format");
     assert_eq!(
@@ -497,7 +498,7 @@ async fn jsonld_re_asserting_same_vector_dedups() {
     let count_rows = support::query_sparql(&fluree, &final_ledger, count_q)
         .await
         .expect("count after delete")
-        .to_jsonld_async(final_ledger.as_graph_db_ref(0))
+        .to_jsonld_async(final_ledger.as_graph_db_ref(GraphId(0)))
         .await
         .expect("format");
     assert_eq!(
@@ -554,7 +555,7 @@ async fn jsonld_multi_valued_vectors_overlay_retract_one_keeps_other() {
     let count_rows = support::query_sparql(&fluree, &deleted.ledger, count)
         .await
         .expect("count")
-        .to_jsonld_async(deleted.ledger.as_graph_db_ref(0))
+        .to_jsonld_async(deleted.ledger.as_graph_db_ref(GraphId(0)))
         .await
         .expect("format");
     assert_eq!(
@@ -570,7 +571,7 @@ async fn jsonld_multi_valued_vectors_overlay_retract_one_keeps_other() {
     let rows = support::query_sparql(&fluree, &deleted.ledger, select)
         .await
         .expect("select")
-        .to_jsonld_async(deleted.ledger.as_graph_db_ref(0))
+        .to_jsonld_async(deleted.ledger.as_graph_db_ref(GraphId(0)))
         .await
         .expect("format");
     let surviving = rows
@@ -632,7 +633,7 @@ async fn jsonld_context_vector_duplicate_values_overlay_retract_one_keeps_other(
     let rows = support::query_sparql(&fluree, &deleted.ledger, select_doc1)
         .await
         .expect("query doc1 via overlay")
-        .to_jsonld_async(deleted.ledger.as_graph_db_ref(0))
+        .to_jsonld_async(deleted.ledger.as_graph_db_ref(GraphId(0)))
         .await
         .expect("format");
     assert_ne!(
@@ -648,7 +649,7 @@ async fn jsonld_context_vector_duplicate_values_overlay_retract_one_keeps_other(
     let rows = support::query_sparql(&fluree, &deleted.ledger, select_doc2)
         .await
         .expect("query doc2 via overlay")
-        .to_jsonld_async(deleted.ledger.as_graph_db_ref(0))
+        .to_jsonld_async(deleted.ledger.as_graph_db_ref(GraphId(0)))
         .await
         .expect("format");
     assert_eq!(rows, json!([]), "overlay must retract doc2");
@@ -712,7 +713,7 @@ async fn jsonld_vector_retracts_via_incremental_publish() {
     let count_rows = support::query_sparql(&fluree, &final_ledger, count)
         .await
         .expect("count after incremental")
-        .to_jsonld_async(final_ledger.as_graph_db_ref(0))
+        .to_jsonld_async(final_ledger.as_graph_db_ref(GraphId(0)))
         .await
         .expect("format");
     assert_eq!(
@@ -796,7 +797,7 @@ async fn sparql_insert_data_embedding_vector_literal_round_trips_after_indexing(
     let rows = support::query_sparql(&fluree, &loaded, select)
         .await
         .expect("query should produce results")
-        .to_jsonld_async(loaded.as_graph_db_ref(0))
+        .to_jsonld_async(loaded.as_graph_db_ref(GraphId(0)))
         .await
         .expect("format result");
     let vector = rows
@@ -888,7 +889,7 @@ async fn jsonld_vector_round_trips_through_incremental_publish() {
     let rows1 = support::query_sparql(&fluree, &after_publish_2, select_doc1)
         .await
         .expect("query S1")
-        .to_jsonld_async(after_publish_2.as_graph_db_ref(0))
+        .to_jsonld_async(after_publish_2.as_graph_db_ref(GraphId(0)))
         .await
         .expect("format S1 result");
     let s1_vec = rows1
@@ -909,7 +910,7 @@ async fn jsonld_vector_round_trips_through_incremental_publish() {
     let rows2 = support::query_sparql(&fluree, &after_publish_2, select_doc2)
         .await
         .expect("query S2")
-        .to_jsonld_async(after_publish_2.as_graph_db_ref(0))
+        .to_jsonld_async(after_publish_2.as_graph_db_ref(GraphId(0)))
         .await
         .expect("format S2 result");
     let s2_vec = rows2

@@ -35,6 +35,7 @@ use fluree_db_binary_index::{BinaryGraphView, BinaryIndexStore};
 use fluree_db_core::content_kind::ContentKind;
 use fluree_db_core::flake::Flake;
 use fluree_db_core::storage::content_address;
+use fluree_db_core::GraphId;
 use fluree_db_core::{
     ContentId, LedgerSnapshot, NoOverlay, OType, OverlayProvider, Storage, Tracker,
 };
@@ -381,10 +382,16 @@ pub async fn apply_policy_filter(
 
     let overlay: &dyn OverlayProvider = &NoOverlay;
 
-    let policy_ctx =
-        policy_builder::build_policy_context_from_opts(snapshot, overlay, None, to_t, &opts, &[0])
-            .await
-            .map_err(|e| BlockFetchError::PolicyBuild(e.to_string()))?;
+    let policy_ctx = policy_builder::build_policy_context_from_opts(
+        snapshot,
+        overlay,
+        None,
+        to_t,
+        &opts,
+        &[GraphId(0)],
+    )
+    .await
+    .map_err(|e| BlockFetchError::PolicyBuild(e.to_string()))?;
 
     if policy_ctx.wrapper().is_root() {
         return Ok((flakes, false));
@@ -483,7 +490,7 @@ pub async fn fetch_and_decode_block<S: Storage + Clone + 'static>(
             // Construct a BinaryGraphView with g_id=0 (default graph) for leaf decoding.
             // Block fetch decodes leaves for replication / policy filtering;
             // specialty kinds (BigInt, Vector) route through per-graph arenas.
-            let gv = BinaryGraphView::new(Arc::clone(store), 0);
+            let gv = BinaryGraphView::new(Arc::clone(store), GraphId(0));
             let flakes = decode_leaf_block(&bytes, &gv, lctx.snapshot)?;
 
             let (filtered, policy_applied) = apply_policy_filter(

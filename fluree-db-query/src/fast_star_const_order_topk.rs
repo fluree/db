@@ -162,7 +162,7 @@ fn collect_subjects_for_predicate_object_ref_opst(
         t: 0,
         o_i: 0,
         o_type: OType::IRI_REF.as_u16(),
-        g_id,
+        g_id: g_id.as_u16(),
     };
     let max_key = RunRecordV2 {
         s_id: SubjectId(u64::MAX),
@@ -171,7 +171,7 @@ fn collect_subjects_for_predicate_object_ref_opst(
         t: u32::MAX,
         o_i: u32::MAX,
         o_type: OType::IRI_REF.as_u16(),
-        g_id,
+        g_id: g_id.as_u16(),
     };
 
     // We want SId output, but we must also load filter columns for row-level filtering.
@@ -285,7 +285,7 @@ where
             t: 0,
             o_i: 0,
             o_type: 0,
-            g_id,
+            g_id: g_id.as_u16(),
         };
         let max_key = RunRecordV2 {
             s_id: SubjectId::from_u64(max_s),
@@ -294,7 +294,7 @@ where
             t: 0,
             o_i: u32::MAX,
             o_type: u16::MAX,
-            g_id,
+            g_id: g_id.as_u16(),
         };
         let filter = BinaryFilter {
             p_id: Some(p_id),

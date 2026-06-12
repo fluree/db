@@ -394,7 +394,7 @@ mod tests {
         let vars = VarRegistry::new();
         let snapshot = LedgerSnapshot::genesis("test:main");
         let overlay = NoOverlay;
-        let db = GraphDbRef::new(&snapshot, 0, &overlay, 0);
+        let db = GraphDbRef::new(&snapshot, fluree_db_core::GraphId(0), &overlay, 0);
 
         let mut cursor = execute_where_streaming(db, &vars, &[], None)
             .await
@@ -421,7 +421,7 @@ mod tests {
         let vars = VarRegistry::new();
         let snapshot = LedgerSnapshot::genesis("test:main");
         let overlay = NoOverlay;
-        let db = GraphDbRef::new(&snapshot, 0, &overlay, 0);
+        let db = GraphDbRef::new(&snapshot, fluree_db_core::GraphId(0), &overlay, 0);
 
         let mut cursor = execute_where_streaming(db, &vars, &[], None)
             .await
@@ -445,7 +445,7 @@ mod tests {
         let vars = VarRegistry::new();
         let snapshot = LedgerSnapshot::genesis("test:main");
         let overlay = NoOverlay;
-        let db = GraphDbRef::new(&snapshot, 0, &overlay, 0);
+        let db = GraphDbRef::new(&snapshot, fluree_db_core::GraphId(0), &overlay, 0);
 
         let mut cursor = execute_where_streaming(db, &vars, &[], None)
             .await

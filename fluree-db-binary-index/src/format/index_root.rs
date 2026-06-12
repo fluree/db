@@ -566,7 +566,7 @@ impl IndexRoot {
         sorted_arenas.sort_by_key(|ga| ga.g_id);
         buf.extend_from_slice(&(sorted_arenas.len() as u16).to_le_bytes());
         for ga in &sorted_arenas {
-            buf.extend_from_slice(&ga.g_id.to_le_bytes());
+            buf.extend_from_slice(&ga.g_id.as_u16().to_le_bytes());
             write_graph_arenas_v5(&mut buf, ga);
         }
 
@@ -628,7 +628,7 @@ impl IndexRoot {
         sorted_named.sort_by_key(|ng| ng.g_id);
         buf.extend_from_slice(&(sorted_named.len() as u16).to_le_bytes());
         for ng in &sorted_named {
-            buf.extend_from_slice(&ng.g_id.to_le_bytes());
+            buf.extend_from_slice(&ng.g_id.as_u16().to_le_bytes());
             let mut sorted_orders = ng.orders.clone();
             sorted_orders.sort_by_key(|(order, _)| order.to_wire_id());
             buf.push(sorted_orders.len() as u8);
@@ -838,7 +838,10 @@ impl IndexRoot {
                 let branch_cid = read_cid(data, &mut pos)?;
                 orders.push((order, branch_cid));
             }
-            named_graphs.push(NamedGraphRouting { g_id, orders });
+            named_graphs.push(NamedGraphRouting {
+                g_id: GraphId(g_id),
+                orders,
+            });
         }
 
         // Optional sections
@@ -1099,7 +1102,7 @@ fn read_graph_arenas_v5(data: &[u8], pos: &mut usize) -> io::Result<GraphArenaRe
         });
     }
     Ok(GraphArenaRefs {
-        g_id,
+        g_id: GraphId(g_id),
         numbig,
         vectors,
         spatial,
@@ -1291,7 +1294,7 @@ mod tests {
         .unwrap();
 
         root.named_graphs = vec![NamedGraphRouting {
-            g_id: 1,
+            g_id: GraphId(1),
             orders: vec![
                 (RunSortOrder::Spot, branch_cid.clone()),
                 (RunSortOrder::Post, branch_cid.clone()),
@@ -1302,7 +1305,7 @@ mod tests {
         let decoded = IndexRoot::decode(&bytes).unwrap();
 
         assert_eq!(decoded.named_graphs.len(), 1);
-        assert_eq!(decoded.named_graphs[0].g_id, 1);
+        assert_eq!(decoded.named_graphs[0].g_id, GraphId(1));
         assert_eq!(decoded.named_graphs[0].orders.len(), 2);
     }
 
@@ -1431,7 +1434,7 @@ mod tests {
             ],
         }];
         root.named_graphs = vec![NamedGraphRouting {
-            g_id: 1,
+            g_id: GraphId(1),
             orders: vec![(RunSortOrder::Spot, branch_cid.clone())],
         }];
         root.sketch_ref = Some(sketch_cid.clone());

@@ -21,6 +21,7 @@ use fluree_db_core::index_stats::{
     IndexStats, PropertyStatEntry,
 };
 use fluree_db_core::sid::Sid;
+use fluree_db_core::GraphId;
 use std::io;
 
 // ============================================================================
@@ -164,7 +165,7 @@ pub fn encode_stats(stats: &IndexStats) -> Vec<u8> {
 
     buf.extend_from_slice(&(sorted_graphs.len() as u16).to_le_bytes());
     for g in &sorted_graphs {
-        buf.extend_from_slice(&g.g_id.to_le_bytes());
+        buf.extend_from_slice(&g.g_id.as_u16().to_le_bytes());
         buf.extend_from_slice(&g.flakes.to_le_bytes());
         buf.extend_from_slice(&g.size.to_le_bytes());
 
@@ -435,7 +436,7 @@ pub fn decode_stats(data: &[u8]) -> io::Result<IndexStats> {
         let graph_classes = decode_optional_classes(data, &mut pos)?;
 
         graphs.push(GraphStatsEntry {
-            g_id,
+            g_id: GraphId(g_id),
             flakes: g_flakes,
             size: g_size,
             properties,
@@ -681,7 +682,7 @@ pub fn decode_stats_with_len(data: &[u8]) -> io::Result<(IndexStats, usize)> {
         let graph_classes = decode_optional_classes(data, &mut pos)?;
 
         graphs.push(GraphStatsEntry {
-            g_id,
+            g_id: GraphId(g_id),
             flakes: g_flakes,
             size: g_size,
             properties,
@@ -855,7 +856,7 @@ mod tests {
             classes: None,
             graphs: Some(vec![
                 GraphStatsEntry {
-                    g_id: 0,
+                    g_id: GraphId(0),
                     flakes: 40_000,
                     size: 800_000,
                     properties: vec![
@@ -879,7 +880,7 @@ mod tests {
                     classes: None,
                 },
                 GraphStatsEntry {
-                    g_id: 1,
+                    g_id: GraphId(1),
                     flakes: 10_000,
                     size: 200_000,
                     properties: vec![],
@@ -895,12 +896,12 @@ mod tests {
         assert_eq!(decoded.size, 1_000_000);
         let graphs = decoded.graphs.unwrap();
         assert_eq!(graphs.len(), 2);
-        assert_eq!(graphs[0].g_id, 0);
+        assert_eq!(graphs[0].g_id, GraphId(0));
         assert_eq!(graphs[0].properties.len(), 2);
         assert_eq!(graphs[0].properties[0].p_id, 1);
         assert_eq!(graphs[0].properties[0].datatypes.len(), 2);
         assert_eq!(graphs[0].properties[1].p_id, 5);
-        assert_eq!(graphs[1].g_id, 1);
+        assert_eq!(graphs[1].g_id, GraphId(1));
         assert_eq!(graphs[1].properties.len(), 0);
     }
 
@@ -1045,7 +1046,7 @@ mod tests {
             properties: None,
             classes: None,
             graphs: Some(vec![GraphStatsEntry {
-                g_id: 0,
+                g_id: GraphId(0),
                 flakes: 42,
                 size: 100,
                 properties: vec![],

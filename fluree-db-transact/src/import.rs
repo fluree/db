@@ -56,7 +56,7 @@ mod inner {
         pub import_time: String,
         /// Named graph IRI → g_id mapping (stable across chunks).
         /// g_id 0 = default graph, 1 = txn-meta, 2 = config, 3+ = user-defined.
-        pub graph_ids: HashMap<String, u16>,
+        pub graph_ids: HashMap<String, fluree_db_core::GraphId>,
         /// Next available g_id for user-defined named graphs. Only used by the
         /// non-spooling fallback; the spooling path allocates from the shared
         /// graph allocator instead (see `import_trig_commit`).
@@ -82,7 +82,7 @@ mod inner {
                 // 0=default, 1=txn-meta, 2=config (reserved); user graphs start
                 // at FIRST_USER_GRAPH_ID. Matches the shared graph allocator's
                 // dict_id+1 convention so spooled and fallback g_ids agree.
-                next_gid: fluree_db_core::graph_registry::FIRST_USER_GRAPH_ID,
+                next_gid: fluree_db_core::graph_registry::FIRST_USER_GRAPH_ID.as_u16(),
                 prefix_map: HashMap::new(),
             }
         }
@@ -156,8 +156,13 @@ mod inner {
 
         if let Some((dir, config)) = spool_dir.zip(spool_config) {
             let spool_path = dir.join(format!("chunk_{chunk_idx}.spool"));
-            let spool_ctx = crate::import_sink::SpoolContext::new(spool_path, chunk_idx, 0, config)
-                .map_err(|e| TransactError::Parse(format!("spool create: {e}")))?;
+            let spool_ctx = crate::import_sink::SpoolContext::new(
+                spool_path,
+                chunk_idx,
+                fluree_db_core::GraphId(0),
+                config,
+            )
+            .map_err(|e| TransactError::Parse(format!("spool create: {e}")))?;
             sink.set_spool_context(spool_ctx);
         }
 
@@ -290,8 +295,13 @@ mod inner {
 
         if let Some((dir, config)) = spool_dir.zip(spool_config) {
             let spool_path = dir.join(format!("chunk_{chunk_idx}.spool"));
-            let spool_ctx = crate::import_sink::SpoolContext::new(spool_path, chunk_idx, 0, config)
-                .map_err(|e| TransactError::Parse(format!("spool create: {e}")))?;
+            let spool_ctx = crate::import_sink::SpoolContext::new(
+                spool_path,
+                chunk_idx,
+                fluree_db_core::GraphId(0),
+                config,
+            )
+            .map_err(|e| TransactError::Parse(format!("spool create: {e}")))?;
             sink.set_spool_context(spool_ctx);
         }
 
@@ -445,8 +455,13 @@ mod inner {
 
         if let Some((dir, config)) = spool_dir.zip(spool_config) {
             let spool_path = dir.join(format!("chunk_{chunk_idx}.spool"));
-            let spool_ctx = crate::import_sink::SpoolContext::new(spool_path, chunk_idx, 0, config)
-                .map_err(|e| TransactError::Parse(format!("spool create: {e}")))?;
+            let spool_ctx = crate::import_sink::SpoolContext::new(
+                spool_path,
+                chunk_idx,
+                fluree_db_core::GraphId(0),
+                config,
+            )
+            .map_err(|e| TransactError::Parse(format!("spool create: {e}")))?;
             sink.set_spool_context(spool_ctx);
         }
 
@@ -488,11 +503,11 @@ mod inner {
                     None => {
                         let id = state.next_gid;
                         state.next_gid += 1;
-                        id
+                        fluree_db_core::GraphId(id)
                     }
                 };
                 state.graph_ids.insert(block.iri.clone(), id);
-                graph_delta.insert(id, block.iri.clone());
+                graph_delta.insert(id.as_u16(), block.iri.clone());
                 id
             };
 
@@ -773,8 +788,13 @@ mod inner {
 
         if let Some((dir, config)) = spool_dir.zip(spool_config) {
             let spool_path = dir.join(format!("chunk_{chunk_idx}.spool"));
-            let spool_ctx = crate::import_sink::SpoolContext::new(spool_path, chunk_idx, 0, config)
-                .map_err(|e| TransactError::Parse(format!("spool create: {e}")))?;
+            let spool_ctx = crate::import_sink::SpoolContext::new(
+                spool_path,
+                chunk_idx,
+                fluree_db_core::GraphId(0),
+                config,
+            )
+            .map_err(|e| TransactError::Parse(format!("spool create: {e}")))?;
             sink.set_spool_context(spool_ctx);
         }
 
@@ -833,8 +853,13 @@ mod inner {
 
         if let Some((dir, config)) = spool_dir.zip(spool_config) {
             let spool_path = dir.join(format!("chunk_{chunk_idx}.spool"));
-            let spool_ctx = crate::import_sink::SpoolContext::new(spool_path, chunk_idx, 0, config)
-                .map_err(|e| TransactError::Parse(format!("spool create: {e}")))?;
+            let spool_ctx = crate::import_sink::SpoolContext::new(
+                spool_path,
+                chunk_idx,
+                fluree_db_core::GraphId(0),
+                config,
+            )
+            .map_err(|e| TransactError::Parse(format!("spool create: {e}")))?;
             sink.set_spool_context(spool_ctx);
         }
 
@@ -944,8 +969,13 @@ mod inner {
 
         if let Some((dir, config)) = spool_dir.zip(spool_config) {
             let spool_path = dir.join(format!("chunk_{chunk_idx}.spool"));
-            let spool_ctx = crate::import_sink::SpoolContext::new(spool_path, chunk_idx, 0, config)
-                .map_err(|e| TransactError::Parse(format!("spool create: {e}")))?;
+            let spool_ctx = crate::import_sink::SpoolContext::new(
+                spool_path,
+                chunk_idx,
+                fluree_db_core::GraphId(0),
+                config,
+            )
+            .map_err(|e| TransactError::Parse(format!("spool create: {e}")))?;
             sink.set_spool_context(spool_ctx);
         }
 

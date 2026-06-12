@@ -10,6 +10,7 @@
 mod support;
 
 use fluree_db_api::{FlureeBuilder, ReindexOptions};
+use fluree_db_core::GraphId;
 use fluree_db_transact::{CommitOpts, TxnOpts};
 use serde_json::json;
 use support::genesis_ledger_for_fluree;
@@ -143,7 +144,7 @@ async fn reindex_produces_correct_class_counts_and_property_usage() {
         "expected at least one graph stats entry"
     );
     // Default graph (g_id=0) should have property entries.
-    let g0 = graphs.iter().find(|g| g.g_id == 0);
+    let g0 = graphs.iter().find(|g| g.g_id == GraphId(0));
     assert!(g0.is_some(), "default graph (g_id=0) stats should exist");
     let g0 = g0.unwrap();
     assert!(

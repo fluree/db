@@ -622,7 +622,7 @@ fn count_bound_object_v6(
         t: 0,
         o_i: 0,
         o_type: target_o_type,
-        g_id,
+        g_id: g_id.as_u16(),
     };
     let max_key = RunRecordV2 {
         s_id: SubjectId(u64::MAX),
@@ -631,7 +631,7 @@ fn count_bound_object_v6(
         t: 0,
         o_i: u32::MAX,
         o_type: target_o_type,
-        g_id,
+        g_id: g_id.as_u16(),
     };
     let leaf_range = branch.find_leaves_in_range(&min_key, &max_key, cmp);
 
@@ -831,7 +831,7 @@ fn group_count_v6(
         t: 0,
         o_i: 0,
         o_type: 0,
-        g_id,
+        g_id: g_id.as_u16(),
     };
     let max_key = RunRecordV2 {
         s_id: SubjectId(u64::MAX),
@@ -840,7 +840,7 @@ fn group_count_v6(
         t: 0,
         o_i: u32::MAX,
         o_type: u16::MAX,
-        g_id,
+        g_id: g_id.as_u16(),
     };
     let leaf_range = branch.find_leaves_in_range(&min_key, &max_key, cmp);
 

@@ -2,6 +2,7 @@
 //!
 //! We prioritize query semantics; some scenarios are intentionally out of scope here.
 
+use fluree_db_core::GraphId;
 use std::sync::Arc;
 mod support;
 
@@ -168,7 +169,7 @@ async fn result_formatting_expansion_variants() {
     let r1 = support::query_jsonld(&fluree, &ledger, &q1)
         .await
         .unwrap()
-        .to_jsonld_async(ledger.as_graph_db_ref(0))
+        .to_jsonld_async(ledger.as_graph_db_ref(GraphId(0)))
         .await
         .unwrap();
 
@@ -183,7 +184,7 @@ async fn result_formatting_expansion_variants() {
     let r2 = support::query_jsonld(&fluree, &ledger, &q2)
         .await
         .unwrap()
-        .to_jsonld_async(ledger.as_graph_db_ref(0))
+        .to_jsonld_async(ledger.as_graph_db_ref(GraphId(0)))
         .await
         .unwrap();
 
@@ -198,7 +199,7 @@ async fn result_formatting_expansion_variants() {
     let r3 = support::query_jsonld(&fluree, &ledger, &q3)
         .await
         .unwrap()
-        .to_jsonld_async(ledger.as_graph_db_ref(0))
+        .to_jsonld_async(ledger.as_graph_db_ref(GraphId(0)))
         .await
         .unwrap();
 
@@ -213,7 +214,7 @@ async fn result_formatting_expansion_variants() {
     let r4 = support::query_jsonld(&fluree, &ledger, &q4)
         .await
         .unwrap()
-        .to_jsonld_async(ledger.as_graph_db_ref(0))
+        .to_jsonld_async(ledger.as_graph_db_ref(GraphId(0)))
         .await
         .unwrap();
 
@@ -224,7 +225,7 @@ async fn result_formatting_expansion_variants() {
     let r5 = support::query_jsonld(&fluree, &ledger, &q5)
         .await
         .unwrap()
-        .to_jsonld_async(ledger.as_graph_db_ref(0))
+        .to_jsonld_async(ledger.as_graph_db_ref(GraphId(0)))
         .await
         .unwrap();
 
@@ -236,7 +237,7 @@ async fn result_formatting_expansion_variants() {
     let r6 = support::query_jsonld(&fluree, &ledger, &q6)
         .await
         .unwrap()
-        .to_jsonld_async(ledger.as_graph_db_ref(0))
+        .to_jsonld_async(ledger.as_graph_db_ref(GraphId(0)))
         .await
         .unwrap();
 
@@ -248,7 +249,7 @@ async fn result_formatting_expansion_variants() {
     let r7 = support::query_jsonld(&fluree, &ledger, &q7)
         .await
         .unwrap()
-        .to_jsonld_async(ledger.as_graph_db_ref(0))
+        .to_jsonld_async(ledger.as_graph_db_ref(GraphId(0)))
         .await
         .unwrap();
 
@@ -352,7 +353,7 @@ async fn s_p_o_full_db_queries_parity() {
     let r_graph = support::query_jsonld(&fluree, &ledger, &q_graph)
         .await
         .unwrap()
-        .to_jsonld_async(ledger.as_graph_db_ref(0))
+        .to_jsonld_async(ledger.as_graph_db_ref(GraphId(0)))
         .await
         .unwrap();
 
@@ -577,7 +578,7 @@ async fn type_handling_parity() {
     let r_type = support::query_jsonld(&fluree, &db1, &q_type)
         .await
         .unwrap()
-        .to_jsonld_async(db1.as_graph_db_ref(0))
+        .to_jsonld_async(db1.as_graph_db_ref(GraphId(0)))
         .await
         .unwrap();
     let canon_rows = |rows: &serde_json::Value| -> Vec<serde_json::Value> {
@@ -619,7 +620,7 @@ async fn type_handling_parity() {
     let r_rdf = support::query_jsonld(&fluree, &db1, &q_rdf_type)
         .await
         .unwrap()
-        .to_jsonld_async(db1.as_graph_db_ref(0))
+        .to_jsonld_async(db1.as_graph_db_ref(GraphId(0)))
         .await
         .unwrap();
     let set_rdf = canon_rows(&r_rdf);
@@ -696,7 +697,7 @@ async fn type_handling_parity() {
     let r_alias = support::query_jsonld(&fluree, &db2, &q_alias)
         .await
         .unwrap()
-        .to_jsonld_async(db2.as_graph_db_ref(0))
+        .to_jsonld_async(db2.as_graph_db_ref(GraphId(0)))
         .await
         .unwrap();
     assert_eq!(
@@ -737,7 +738,7 @@ async fn load_with_new_connection_placeholder() {
     let result = fluree2.query_connection(&query).await.unwrap();
     let ledger = fluree2.ledger(ledger_id).await.unwrap();
     let jsonld = result
-        .to_jsonld_async(ledger.as_graph_db_ref(0))
+        .to_jsonld_async(ledger.as_graph_db_ref(GraphId(0)))
         .await
         .unwrap();
 
@@ -768,7 +769,7 @@ async fn repeated_transaction_results_parity() {
     let result = support::query_jsonld(&fluree, &ledger2, &q)
         .await
         .unwrap()
-        .to_jsonld_async(ledger2.as_graph_db_ref(0))
+        .to_jsonld_async(ledger2.as_graph_db_ref(GraphId(0)))
         .await
         .unwrap();
 
@@ -801,7 +802,7 @@ async fn base_context_parity() {
     let r1 = support::query_jsonld(&fluree, &ledger, &q1)
         .await
         .unwrap()
-        .to_jsonld_async(ledger.as_graph_db_ref(0))
+        .to_jsonld_async(ledger.as_graph_db_ref(GraphId(0)))
         .await
         .unwrap();
     let normalize_type_pred = |rows: &serde_json::Value| -> serde_json::Value {
@@ -832,7 +833,7 @@ async fn base_context_parity() {
     let r2 = support::query_jsonld(&fluree, &ledger, &q2)
         .await
         .unwrap()
-        .to_jsonld_async(ledger.as_graph_db_ref(0))
+        .to_jsonld_async(ledger.as_graph_db_ref(GraphId(0)))
         .await
         .unwrap();
     assert_eq!(
@@ -1039,7 +1040,7 @@ async fn index_range_scans() {
     // Slice for subject id only
     let alice_flakes = range_with_overlay(
         &ledger.snapshot,
-        0,
+        GraphId(0),
         ledger.novelty.as_ref(),
         IndexType::Spot,
         RangeTest::Eq,
@@ -1069,7 +1070,7 @@ async fn index_range_scans() {
 
     let alice_favnums_flakes = range_with_overlay(
         &ledger.snapshot,
-        0,
+        GraphId(0),
         ledger.novelty.as_ref(),
         IndexType::Spot,
         RangeTest::Eq,
@@ -1101,7 +1102,7 @@ async fn index_range_scans() {
     // Slice for subject + predicate + value
     let alice_favnum_42_flakes = range_with_overlay(
         &ledger.snapshot,
-        0,
+        GraphId(0),
         ledger.novelty.as_ref(),
         IndexType::Spot,
         RangeTest::Eq,
@@ -1131,7 +1132,7 @@ async fn index_range_scans() {
 
     let alice_favnum_42_typed_flakes = range_with_overlay(
         &ledger.snapshot,
-        0,
+        GraphId(0),
         ledger.novelty.as_ref(),
         IndexType::Spot,
         RangeTest::Eq,
@@ -1157,7 +1158,7 @@ async fn index_range_scans() {
 
     let alice_favnum_42_wrong_type_flakes = range_with_overlay(
         &ledger.snapshot,
-        0,
+        GraphId(0),
         ledger.novelty.as_ref(),
         IndexType::Spot,
         RangeTest::Eq,

@@ -5,6 +5,7 @@
 mod support;
 
 use fluree_db_api::FlureeBuilder;
+use fluree_db_core::GraphId;
 use serde_json::json;
 use support::normalize_rows;
 
@@ -112,7 +113,7 @@ async fn staging_data_mixed_data_types() {
         .await
         .unwrap();
     let jsonld = result
-        .to_jsonld_async(ledger2.as_graph_db_ref(0))
+        .to_jsonld_async(ledger2.as_graph_db_ref(GraphId(0)))
         .await
         .unwrap();
 
@@ -151,7 +152,7 @@ async fn staging_data_mixed_data_types_numeric() {
         .await
         .unwrap();
     let jsonld = result
-        .to_jsonld_async(ledger2.as_graph_db_ref(0))
+        .to_jsonld_async(ledger2.as_graph_db_ref(GraphId(0)))
         .await
         .unwrap();
 
@@ -186,7 +187,7 @@ async fn iri_value_maps() {
         .await
         .unwrap();
     let jsonld = result
-        .to_jsonld_async(ledger1.as_graph_db_ref(0))
+        .to_jsonld_async(ledger1.as_graph_db_ref(GraphId(0)))
         .await
         .unwrap();
 
@@ -235,7 +236,7 @@ async fn object_var_test() {
         .await
         .unwrap();
     let jsonld = result
-        .to_jsonld_async(ledger2.as_graph_db_ref(0))
+        .to_jsonld_async(ledger2.as_graph_db_ref(GraphId(0)))
         .await
         .unwrap();
 
@@ -292,7 +293,7 @@ async fn transact_api_test() {
     )
     .await
     .unwrap()
-        .to_jsonld_async(ledger2.as_graph_db_ref(0))
+        .to_jsonld_async(ledger2.as_graph_db_ref(GraphId(0)))
         .await
         .unwrap();
     assert_eq!(
@@ -325,7 +326,7 @@ async fn transact_api_test() {
     )
     .await
     .unwrap()
-    .to_jsonld_async(ledger3.as_graph_db_ref(0))
+    .to_jsonld_async(ledger3.as_graph_db_ref(GraphId(0)))
     .await
     .unwrap();
     assert_eq!(
@@ -362,7 +363,7 @@ async fn transact_api_test() {
     )
     .await
     .unwrap()
-    .to_jsonld_async(ledger4.as_graph_db_ref(0))
+    .to_jsonld_async(ledger4.as_graph_db_ref(GraphId(0)))
     .await
     .unwrap();
     assert_eq!(
@@ -437,7 +438,7 @@ async fn base_and_vocab_test() {
     let r_full = support::query_jsonld(&fluree, &ledger1, &q_full)
         .await
         .unwrap()
-        .to_jsonld_async(ledger1.as_graph_db_ref(0))
+        .to_jsonld_async(ledger1.as_graph_db_ref(GraphId(0)))
         .await
         .unwrap();
     assert_eq!(
@@ -459,7 +460,7 @@ async fn base_and_vocab_test() {
     let r_vocab = support::query_jsonld(&fluree, &ledger1, &q_vocab)
         .await
         .unwrap()
-        .to_jsonld_async(ledger1.as_graph_db_ref(0))
+        .to_jsonld_async(ledger1.as_graph_db_ref(GraphId(0)))
         .await
         .unwrap();
     assert_eq!(
@@ -484,7 +485,7 @@ async fn base_and_vocab_test() {
     let r2 = support::query_jsonld(&fluree, &ledger3, &q_vocab)
         .await
         .unwrap()
-        .to_jsonld_async(ledger3.as_graph_db_ref(0))
+        .to_jsonld_async(ledger3.as_graph_db_ref(GraphId(0)))
         .await
         .unwrap();
     assert_eq!(
@@ -528,7 +529,7 @@ async fn json_objects() {
     let r_graph = support::query_jsonld(&fluree, &ledger1, &q_graph)
         .await
         .unwrap()
-        .to_jsonld_async(ledger1.as_graph_db_ref(0))
+        .to_jsonld_async(ledger1.as_graph_db_ref(GraphId(0)))
         .await
         .unwrap();
     assert_eq!(
@@ -591,7 +592,7 @@ async fn no_where_solutions() {
         .await
         .unwrap();
     let jsonld = result
-        .to_jsonld_async(ledger2.as_graph_db_ref(0))
+        .to_jsonld_async(ledger2.as_graph_db_ref(GraphId(0)))
         .await
         .unwrap();
 
@@ -637,7 +638,7 @@ async fn transaction_iri_special_char() {
     let r1 = support::query_jsonld(&fluree, &ledger2, &q1)
         .await
         .unwrap()
-        .to_jsonld_async(ledger2.as_graph_db_ref(0))
+        .to_jsonld_async(ledger2.as_graph_db_ref(GraphId(0)))
         .await
         .unwrap();
     assert_eq!(
@@ -656,7 +657,7 @@ async fn transaction_iri_special_char() {
     let r2 = support::query_jsonld(&fluree, &ledger2, &q2)
         .await
         .unwrap()
-        .to_jsonld_async(ledger2.as_graph_db_ref(0))
+        .to_jsonld_async(ledger2.as_graph_db_ref(GraphId(0)))
         .await
         .unwrap();
     assert_eq!(
@@ -716,7 +717,7 @@ async fn transact_with_explicit_commit() {
     let rows = support::query_jsonld(&fluree, &ledger1, &query)
         .await
         .unwrap()
-        .to_jsonld_async(ledger1.as_graph_db_ref(0))
+        .to_jsonld_async(ledger1.as_graph_db_ref(GraphId(0)))
         .await
         .unwrap();
     assert_eq!(
@@ -870,7 +871,7 @@ async fn retract_property_removes_only_that_property() {
         .await
         .expect("query");
     let jsonld = result
-        .to_jsonld_async(updated.ledger.as_graph_db_ref(0))
+        .to_jsonld_async(updated.ledger.as_graph_db_ref(GraphId(0)))
         .await
         .expect("to_jsonld_async");
 
@@ -927,7 +928,7 @@ async fn retracting_ordered_lists_removes_list_values() {
         .await
         .expect("query before");
     let before_json = before
-        .to_jsonld_async(seeded.ledger.as_graph_db_ref(0))
+        .to_jsonld_async(seeded.ledger.as_graph_db_ref(GraphId(0)))
         .await
         .expect("to_jsonld_async before");
 
@@ -956,7 +957,7 @@ async fn retracting_ordered_lists_removes_list_values() {
         .await
         .expect("query after");
     let after_json = after
-        .to_jsonld_async(updated.ledger.as_graph_db_ref(0))
+        .to_jsonld_async(updated.ledger.as_graph_db_ref(GraphId(0)))
         .await
         .expect("to_jsonld_async after");
 
@@ -1011,7 +1012,7 @@ async fn turtle_insert() {
     let rows = support::query_jsonld(&fluree, &ledger1, &query)
         .await
         .unwrap()
-        .to_jsonld_async(ledger1.as_graph_db_ref(0))
+        .to_jsonld_async(ledger1.as_graph_db_ref(GraphId(0)))
         .await
         .unwrap();
     assert_eq!(
@@ -1030,7 +1031,7 @@ async fn turtle_insert() {
     let rows2 = support::query_jsonld(&fluree, &ledger1, &query2)
         .await
         .unwrap()
-        .to_jsonld_async(ledger1.as_graph_db_ref(0))
+        .to_jsonld_async(ledger1.as_graph_db_ref(GraphId(0)))
         .await
         .unwrap();
     let row2 = rows2.as_array().unwrap()[0].as_object().unwrap();
@@ -1050,7 +1051,7 @@ async fn turtle_insert() {
     let rows3 = support::query_jsonld(&fluree, &ledger1, &query3)
         .await
         .unwrap()
-        .to_jsonld_async(ledger1.as_graph_db_ref(0))
+        .to_jsonld_async(ledger1.as_graph_db_ref(GraphId(0)))
         .await
         .unwrap();
     let row3 = rows3.as_array().unwrap()[0].as_object().unwrap();
@@ -1095,7 +1096,7 @@ async fn turtle_insert_and_commit() {
     let rows = support::query_jsonld(&fluree, &ledger2, &query)
         .await
         .unwrap()
-        .to_jsonld_async(ledger2.as_graph_db_ref(0))
+        .to_jsonld_async(ledger2.as_graph_db_ref(GraphId(0)))
         .await
         .unwrap();
     assert_eq!(
@@ -1136,7 +1137,7 @@ ex:foo ex:name "UPDATED Name" ;
     )
     .await
     .unwrap()
-    .to_jsonld_async(ledger2.as_graph_db_ref(0))
+    .to_jsonld_async(ledger2.as_graph_db_ref(GraphId(0)))
     .await
     .unwrap();
     assert_eq!(
@@ -1180,7 +1181,7 @@ ex:foo ex:name "UPDATED Name" ;
     )
     .await
     .unwrap()
-    .to_jsonld_async(ledger2.as_graph_db_ref(0))
+    .to_jsonld_async(ledger2.as_graph_db_ref(GraphId(0)))
     .await
     .unwrap();
     assert_eq!(

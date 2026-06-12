@@ -72,7 +72,7 @@ pub(crate) async fn upload_indexes_to_cas(
     for (order, order_result) in &build_result.order_results {
         for graph in &order_result.graphs {
             let g_id = graph.g_id;
-            let is_default_graph = g_id == 0;
+            let is_default_graph = g_id == GraphId(0);
 
             // Upload leaf blobs + sidecar blobs.
             for leaf_info in &graph.leaf_infos {

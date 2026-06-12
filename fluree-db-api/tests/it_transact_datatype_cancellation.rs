@@ -40,6 +40,7 @@
 mod support;
 
 use fluree_db_api::FlureeBuilder;
+use fluree_db_core::GraphId;
 use fluree_db_core::{load_commit_by_id, FlakeValue};
 use serde_json::json;
 
@@ -126,7 +127,7 @@ async fn json_same_value_update_with_mixed_curie_and_full_iri_forms_is_noop() {
     )
     .await
     .expect("post-update query")
-    .to_jsonld_async(out.ledger.as_graph_db_ref(0))
+    .to_jsonld_async(out.ledger.as_graph_db_ref(GraphId(0)))
     .await
     .expect("to_jsonld_async");
 
@@ -212,7 +213,7 @@ async fn xsd_string_same_value_update_with_mixed_curie_and_full_iri_forms_is_noo
     )
     .await
     .expect("post-update query")
-    .to_jsonld_async(out.ledger.as_graph_db_ref(0))
+    .to_jsonld_async(out.ledger.as_graph_db_ref(GraphId(0)))
     .await
     .expect("to_jsonld_async");
 
@@ -622,7 +623,7 @@ async fn json_update_with_different_values_still_produces_commit() {
     )
     .await
     .expect("query post-update")
-    .to_jsonld_async(out.ledger.as_graph_db_ref(0))
+    .to_jsonld_async(out.ledger.as_graph_db_ref(GraphId(0)))
     .await
     .expect("to_jsonld_async");
 

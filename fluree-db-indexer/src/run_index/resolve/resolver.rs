@@ -175,7 +175,7 @@ impl CommitResolver {
                     raw_op.dt_name,
                 );
                 hook.on_record(&crate::stats::StatsRecord {
-                    g_id: record.g_id,
+                    g_id: GraphId(record.g_id),
                     p_id: record.p_id,
                     s_id: record.s_id.as_u64(),
                     dt,
@@ -192,7 +192,7 @@ impl CommitResolver {
             if let Some(ref mut spatial) = self.spatial_hook {
                 spatial.on_op(
                     &raw_op,
-                    record.g_id,
+                    GraphId(record.g_id),
                     record.s_id.as_u64(),
                     record.p_id,
                     t as i64,
@@ -204,7 +204,7 @@ impl CommitResolver {
             // from lang_id / default_language) into BM25 arena building.
             if let Some(ref mut ft) = self.fulltext_hook {
                 ft.on_op(crate::fulltext_hook::FulltextOpInput {
-                    g_id: record.g_id,
+                    g_id: GraphId(record.g_id),
                     p_id: record.p_id,
                     dt_id: record.dt,
                     o_kind: record.o_kind,
@@ -680,7 +680,7 @@ impl CommitResolver {
         let (o_kind, o_key) = match self
             .resolve_object(
                 &op.o,
-                g_id,
+                GraphId(g_id),
                 op.s_ns_code,
                 op.s_name,
                 p_id,
@@ -850,7 +850,7 @@ impl CommitResolver {
                 Some(handle) => Ok(Some((ObjKind::VECTOR_ID, ObjKey::encode_u32_id(handle)))),
                 None => {
                     tracing::debug!(
-                        g_id,
+                        g_id = g_id.as_u16(),
                         s_ns_code,
                         s_name,
                         p_id,
@@ -1351,7 +1351,7 @@ impl SharedResolverState {
                 }
                 ConfiguredFulltextScope::DefaultGraph => {
                     // Default graph is always `g_id = 0` — not in the graph dict.
-                    config.add_per_graph(0, p_id);
+                    config.add_per_graph(GraphId(0), p_id);
                 }
                 ConfiguredFulltextScope::TxnMetaGraph => {
                     // `new_for_ledger` pre-reserves txn-meta at graph-dict slot 0
@@ -1359,7 +1359,7 @@ impl SharedResolverState {
                     // structurally fixed, and `get_or_insert(sentinel_iri)`
                     // would allocate an unrelated entry for the literal
                     // sentinel string, which is the bug we're avoiding.
-                    config.add_per_graph(1, p_id);
+                    config.add_per_graph(GraphId(1), p_id);
                 }
                 ConfiguredFulltextScope::NamedGraph(iri) => {
                     let raw = self.graphs.get_or_insert(iri) + 1;
@@ -1371,7 +1371,7 @@ impl SharedResolverState {
                         );
                         continue;
                     }
-                    config.add_per_graph(raw as u16, p_id);
+                    config.add_per_graph(GraphId(raw as u16), p_id);
                 }
             }
         }
@@ -1438,7 +1438,7 @@ impl SharedResolverState {
             if let Some(ref mut spatial) = self.spatial_hook {
                 spatial.on_op(
                     &raw_op,
-                    record.g_id,
+                    GraphId(record.g_id),
                     record.s_id.as_u64(),
                     record.p_id,
                     t as i64,
@@ -1452,7 +1452,7 @@ impl SharedResolverState {
             // to global IDs after dict reconciliation (see incremental_resolve.rs step 7).
             if let Some(ref mut ft) = self.fulltext_hook {
                 ft.on_op(crate::fulltext_hook::FulltextOpInput {
-                    g_id: record.g_id,
+                    g_id: GraphId(record.g_id),
                     p_id: record.p_id,
                     dt_id: record.dt,
                     o_kind: record.o_kind,
@@ -1536,7 +1536,7 @@ impl SharedResolverState {
         let (o_kind, o_key) = match self
             .resolve_object_chunk(
                 &op.o,
-                g_id,
+                GraphId(g_id),
                 op.s_ns_code,
                 op.s_name,
                 p_id,
@@ -1662,7 +1662,7 @@ impl SharedResolverState {
                 Some(handle) => Ok(Some((ObjKind::VECTOR_ID, ObjKey::encode_u32_id(handle)))),
                 None => {
                     tracing::debug!(
-                        g_id,
+                        g_id = g_id.as_u16(),
                         s_ns_code,
                         s_name,
                         p_id,

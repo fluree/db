@@ -16,6 +16,7 @@
 //! 4. **Dict updates**: Update reverse trees + forward packs for new subjects/strings
 //! 5. **Root assembly**: `IncrementalRootBuilder` → encode → CAS write → publish
 
+use fluree_db_core::GraphId;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -719,7 +720,7 @@ pub async fn incremental_index(
                 match base_root
                     .named_graphs
                     .iter()
-                    .find(|ng| ng.g_id == g_id)
+                    .find(|ng| ng.g_id == GraphId(g_id))
                     .and_then(|ng| ng.orders.iter().find(|(o, _)| *o == order))
                     .map(|(_, cid)| cid.clone())
                 {
@@ -1061,7 +1062,7 @@ pub async fn incremental_index(
 
         let mut arenas_by_gid: BTreeMap<u16, GraphArenaRefs> = BTreeMap::new();
         for ga in &base_root.graph_arenas {
-            arenas_by_gid.insert(ga.g_id, ga.clone());
+            arenas_by_gid.insert(ga.g_id.as_u16(), ga.clone());
         }
 
         let has_new_numbigs = !novelty.shared.numbigs.is_empty();
@@ -1080,13 +1081,15 @@ pub async fn incremental_index(
         if has_new_numbigs || has_new_vectors || has_new_spatial || has_new_fulltext {
             // ---- NumBig arena upload ----
             for (&g_id, per_pred) in &novelty.shared.numbigs {
-                let ga = arenas_by_gid.entry(g_id).or_insert_with(|| GraphArenaRefs {
-                    g_id,
-                    numbig: Vec::new(),
-                    vectors: Vec::new(),
-                    spatial: Vec::new(),
-                    fulltext: vec![],
-                });
+                let ga = arenas_by_gid
+                    .entry(g_id.as_u16())
+                    .or_insert_with(|| GraphArenaRefs {
+                        g_id,
+                        numbig: Vec::new(),
+                        vectors: Vec::new(),
+                        spatial: Vec::new(),
+                        fulltext: vec![],
+                    });
 
                 for (&p_id, arena) in per_pred {
                     if arena.is_empty() {
@@ -1094,7 +1097,7 @@ pub async fn incremental_index(
                     }
                     let base_nb_count = novelty
                         .base_numbig_counts
-                        .get(&(g_id, p_id))
+                        .get(&(GraphId(g_id.as_u16()), p_id))
                         .copied()
                         .unwrap_or(0);
                     if arena.len() == base_nb_count {
@@ -1129,13 +1132,15 @@ pub async fn incremental_index(
 
             // ---- Vector arena upload ----
             for (&g_id, per_pred) in &novelty.shared.vectors {
-                let ga = arenas_by_gid.entry(g_id).or_insert_with(|| GraphArenaRefs {
-                    g_id,
-                    numbig: Vec::new(),
-                    vectors: Vec::new(),
-                    spatial: Vec::new(),
-                    fulltext: vec![],
-                });
+                let ga = arenas_by_gid
+                    .entry(g_id.as_u16())
+                    .or_insert_with(|| GraphArenaRefs {
+                        g_id,
+                        numbig: Vec::new(),
+                        vectors: Vec::new(),
+                        spatial: Vec::new(),
+                        fulltext: vec![],
+                    });
 
                 for (&p_id, arena) in per_pred {
                     if arena.is_empty() {
@@ -1144,7 +1149,7 @@ pub async fn incremental_index(
 
                     let base_count = novelty
                         .base_vector_counts
-                        .get(&(g_id, p_id))
+                        .get(&(GraphId(g_id.as_u16()), p_id))
                         .copied()
                         .unwrap_or(0);
                     // `arena` here is the unified base+chunk arena (see
@@ -1455,7 +1460,7 @@ pub async fn incremental_index(
                         }
                     };
                     ft_grouped
-                        .entry((entry.g_id, entry.p_id, bucket_lang_id))
+                        .entry((entry.g_id.as_u16(), entry.p_id, bucket_lang_id))
                         .or_default()
                         .push(entry);
                 }
@@ -1547,7 +1552,7 @@ pub async fn incremental_index(
                     };
 
                     let ga = arenas_by_gid.entry(g_id).or_insert_with(|| GraphArenaRefs {
-                        g_id,
+                        g_id: GraphId(g_id),
                         numbig: Vec::new(),
                         vectors: Vec::new(),
                         spatial: Vec::new(),
@@ -1598,7 +1603,7 @@ pub async fn incremental_index(
                     BTreeMap::new();
                 for entry in spatial_entries {
                     grouped
-                        .entry((entry.g_id, entry.p_id))
+                        .entry((entry.g_id.as_u16(), entry.p_id))
                         .or_default()
                         .push(entry);
                 }
@@ -1789,7 +1794,7 @@ pub async fn incremental_index(
 
                     // Replace or insert in graph arenas.
                     let ga = arenas_by_gid.entry(g_id).or_insert_with(|| GraphArenaRefs {
-                        g_id,
+                        g_id: GraphId(g_id),
                         numbig: Vec::new(),
                         vectors: Vec::new(),
                         spatial: Vec::new(),
@@ -1995,7 +2000,7 @@ pub async fn incremental_index(
                 );
                 // subject_classes: (g_id, s_id) → HashSet<class_sid64>
                 let mut subject_classes: std::collections::HashMap<
-                    (u16, u64),
+                    (GraphId, u64),
                     std::collections::HashSet<u64>,
                 > = std::collections::HashMap::new();
 
@@ -2078,13 +2083,16 @@ pub async fn incremental_index(
                 // Also include ref-object s_ids so we can resolve ref-class edges.
                 if let Some(ref store) = store_opt {
                     let iri_ref_otype = fluree_db_core::o_type::OType::IRI_REF.as_u16();
-                    let mut subjects_by_graph: std::collections::HashMap<u16, Vec<u64>> =
+                    let mut subjects_by_graph: std::collections::HashMap<GraphId, Vec<u64>> =
                         std::collections::HashMap::new();
                     for &(g_id, s_id) in novelty_subject_class_deltas
                         .keys()
                         .chain(novelty_subject_props.keys())
                     {
-                        subjects_by_graph.entry(g_id).or_default().push(s_id);
+                        subjects_by_graph
+                            .entry(GraphId(g_id.as_u16()))
+                            .or_default()
+                            .push(s_id);
                     }
                     // Add ref-object targets so we can look up their class memberships.
                     for (i, rec) in novelty.records.iter().enumerate() {
@@ -2093,7 +2101,7 @@ pub async fn incremental_index(
                             && novelty.ops[i] != 0
                         {
                             subjects_by_graph
-                                .entry(rec.g_id)
+                                .entry(GraphId(rec.g_id))
                                 .or_default()
                                 .push(rec.o_key);
                         }
@@ -2119,7 +2127,7 @@ pub async fn incremental_index(
                         let min_s = sids[0];
                         let max_s = *sids.last().unwrap_or(&min_s);
                         tracing::debug!(
-                            g_id = g,
+                            g_id = g.as_u16(),
                             subjects = sids.len(),
                             min_s_id = min_s,
                             max_s_id = max_s,
@@ -2146,7 +2154,7 @@ pub async fn incremental_index(
                             t: 0,
                             o_i: 0,
                             o_type: 0,
-                            g_id: scan_g_id,
+                            g_id: scan_g_id.as_u16(),
                         };
                         let max_key = fluree_db_binary_index::format::run_record_v2::RunRecordV2 {
                             s_id: fluree_db_core::subject_id::SubjectId::from_u64(max_s),
@@ -2155,11 +2163,11 @@ pub async fn incremental_index(
                             t: 0,
                             o_i: u32::MAX,
                             o_type: u16::MAX,
-                            g_id: scan_g_id,
+                            g_id: scan_g_id.as_u16(),
                         };
                         store
                             .prefetch_leaves_for_range(
-                                scan_g_id,
+                                GraphId(scan_g_id.as_u16()),
                                 fluree_db_binary_index::format::run_record::RunSortOrder::Psot,
                                 &min_key,
                                 &max_key,
@@ -2176,7 +2184,7 @@ pub async fn incremental_index(
                         let min_s = scan_sids[0];
                         let max_s = *scan_sids.last().unwrap_or(&min_s);
                         tracing::debug!(
-                            g_id = scan_g_id,
+                            g_id = scan_g_id.as_u16(),
                             subjects = scan_sids.len(),
                             min_s_id = min_s,
                             max_s_id = max_s,
@@ -2186,14 +2194,14 @@ pub async fn incremental_index(
                         let started = Instant::now();
                         match fluree_db_binary_index::batched_lookup_predicate_refs(
                             store,
-                            scan_g_id,
+                            GraphId(scan_g_id.as_u16()),
                             rdf_type_p_id,
                             scan_sids,
                             base_root.index_t,
                         ) {
                             Ok(base_map) => {
                                 tracing::debug!(
-                                    g_id = scan_g_id,
+                                    g_id = scan_g_id.as_u16(),
                                     subjects_with_hits = base_map.len(),
                                     elapsed_ms = started.elapsed().as_millis() as u64,
                                     "Phase 3b: completed batched PSOT rdf:type lookup"
@@ -2231,7 +2239,9 @@ pub async fn incremental_index(
                 // Apply novelty rdf:type deltas on top of base memberships.
                 let subject_classes_started = Instant::now();
                 for (&(g_id, s_id), class_map) in &novelty_subject_class_deltas {
-                    let set = subject_classes.entry((g_id, s_id)).or_default();
+                    let set = subject_classes
+                        .entry((GraphId(g_id.as_u16()), s_id))
+                        .or_default();
                     for (&class_sid64, &delta) in class_map {
                         if delta > 0 {
                             set.insert(class_sid64);
@@ -2258,7 +2268,7 @@ pub async fn incremental_index(
                 // below skips them and the base-index re-scan (Stage 2) handles them.
                 // A no-op rdf:type assertion (same type) leaves base == net and is not
                 // considered changed. See issue #1266.
-                let changed_membership: std::collections::HashSet<(u16, u64)> =
+                let changed_membership: std::collections::HashSet<(GraphId, u64)> =
                     novelty_subject_class_deltas
                         .keys()
                         .filter(|key| base_subject_classes.get(*key) != subject_classes.get(*key))
@@ -2294,19 +2304,19 @@ pub async fn incremental_index(
                 // Build class→properties, class→prop→dts, class→prop→langs, ref_edges.
                 let attribution_maps_started = Instant::now();
                 let mut class_properties: std::collections::HashMap<
-                    (u16, u64),
+                    (GraphId, u64),
                     std::collections::HashSet<u32>,
                 > = std::collections::HashMap::new();
                 let mut class_prop_dts: std::collections::HashMap<
-                    (u16, u64),
+                    (GraphId, u64),
                     std::collections::HashMap<u32, std::collections::HashMap<u8, i64>>,
                 > = std::collections::HashMap::new();
                 let mut class_prop_lang_deltas: std::collections::HashMap<
-                    (u16, u64),
+                    (GraphId, u64),
                     std::collections::HashMap<u32, std::collections::HashMap<u16, i64>>,
                 > = std::collections::HashMap::new();
                 let mut ref_edges: std::collections::HashMap<
-                    (u16, u64),
+                    (GraphId, u64),
                     std::collections::HashMap<u32, std::collections::HashMap<u64, i64>>,
                 > = std::collections::HashMap::new();
 
@@ -2327,8 +2337,8 @@ pub async fn incremental_index(
                         // here avoids double-counting its in-batch deltas.
                         continue;
                     }
-                    let net_cls = subject_classes.get(&(g_id, s_id));
-                    let base_cls = base_subject_classes.get(&(g_id, s_id));
+                    let net_cls = subject_classes.get(&(GraphId(g_id.as_u16()), s_id));
+                    let base_cls = base_subject_classes.get(&(GraphId(g_id.as_u16()), s_id));
                     let mut classes_touched: std::collections::HashSet<u64> =
                         std::collections::HashSet::new();
                     if let Some(c) = net_cls {
@@ -2347,14 +2357,14 @@ pub async fn incremental_index(
                                 for (&dt, &cnt) in dt_map {
                                     if (cnt > 0 && in_net) || (cnt < 0 && in_base) {
                                         *class_prop_dts
-                                            .entry((g_id, class_sid64))
+                                            .entry((GraphId(g_id.as_u16()), class_sid64))
                                             .or_default()
                                             .entry(pid)
                                             .or_default()
                                             .entry(dt)
                                             .or_insert(0) += cnt;
                                         class_properties
-                                            .entry((g_id, class_sid64))
+                                            .entry((GraphId(g_id.as_u16()), class_sid64))
                                             .or_default()
                                             .insert(pid);
                                     }
@@ -2366,14 +2376,14 @@ pub async fn incremental_index(
                                 for (&lid, &cnt) in lang_map {
                                     if (cnt > 0 && in_net) || (cnt < 0 && in_base) {
                                         *class_prop_lang_deltas
-                                            .entry((g_id, class_sid64))
+                                            .entry((GraphId(g_id.as_u16()), class_sid64))
                                             .or_default()
                                             .entry(pid)
                                             .or_default()
                                             .entry(lid)
                                             .or_insert(0) += cnt;
                                         class_properties
-                                            .entry((g_id, class_sid64))
+                                            .entry((GraphId(g_id.as_u16()), class_sid64))
                                             .or_default()
                                             .insert(pid);
                                     }
@@ -2383,8 +2393,8 @@ pub async fn incremental_index(
                     }
                 }
                 for (&(g_id, subj), per_prop) in &subject_ref_history {
-                    let net_subj = subject_classes.get(&(g_id, subj));
-                    let base_subj = base_subject_classes.get(&(g_id, subj));
+                    let net_subj = subject_classes.get(&(GraphId(g_id.as_u16()), subj));
+                    let base_subj = base_subject_classes.get(&(GraphId(g_id.as_u16()), subj));
                     let mut subj_classes_touched: std::collections::HashSet<u64> =
                         std::collections::HashSet::new();
                     if let Some(c) = net_subj {
@@ -2398,7 +2408,9 @@ pub async fn incremental_index(
                             if delta == 0 {
                                 continue;
                             }
-                            let Some(obj_classes) = subject_classes.get(&(g_id, obj)) else {
+                            let Some(obj_classes) =
+                                subject_classes.get(&(GraphId(g_id.as_u16()), obj))
+                            else {
                                 continue;
                             };
                             // Route the edge by sign on the subject side (issue #1266):
@@ -2412,7 +2424,7 @@ pub async fn incremental_index(
                                 }
                                 for &oc in obj_classes {
                                     *ref_edges
-                                        .entry((g_id, sc))
+                                        .entry((GraphId(g_id.as_u16()), sc))
                                         .or_default()
                                         .entry(pid)
                                         .or_default()
@@ -2453,13 +2465,16 @@ pub async fn incremental_index(
                         let mut changed_by_graph: std::collections::HashMap<u16, Vec<u64>> =
                             std::collections::HashMap::new();
                         for &(g_id, s_id) in &changed_membership {
-                            changed_by_graph.entry(g_id).or_default().push(s_id);
+                            changed_by_graph
+                                .entry(g_id.as_u16())
+                                .or_default()
+                                .push(s_id);
                         }
                         for (&g_id, sids) in &changed_by_graph {
                             let base_props =
                                 match fluree_db_binary_index::batched_lookup_subject_properties(
                                     store,
-                                    g_id,
+                                    GraphId(g_id),
                                     sids,
                                     base_root.index_t,
                                 ) {
@@ -2482,11 +2497,11 @@ pub async fn incremental_index(
                                 };
                             for &s_id in sids {
                                 let base_cls = base_subject_classes
-                                    .get(&(g_id, s_id))
+                                    .get(&(GraphId(g_id), s_id))
                                     .cloned()
                                     .unwrap_or_default();
                                 let net_cls = subject_classes
-                                    .get(&(g_id, s_id))
+                                    .get(&(GraphId(g_id), s_id))
                                     .cloned()
                                     .unwrap_or_default();
 
@@ -2542,7 +2557,9 @@ pub async fn incremental_index(
                                         }
                                     }
                                 }
-                                if let Some(s_dts) = novelty_subject_prop_dts.get(&(g_id, s_id)) {
+                                if let Some(s_dts) =
+                                    novelty_subject_prop_dts.get(&(GraphId(g_id), s_id))
+                                {
                                     for (&pid, dt_map) in s_dts {
                                         for (&dt, &cnt) in dt_map {
                                             combined_dts
@@ -2554,7 +2571,8 @@ pub async fn incremental_index(
                                         }
                                     }
                                 }
-                                if let Some(s_langs) = novelty_subject_prop_langs.get(&(g_id, s_id))
+                                if let Some(s_langs) =
+                                    novelty_subject_prop_langs.get(&(GraphId(g_id), s_id))
                                 {
                                     for (&pid, lang_map) in s_langs {
                                         for (&lid, &cnt) in lang_map {
@@ -2586,14 +2604,14 @@ pub async fn incremental_index(
                                             };
                                             if amt != 0 {
                                                 *class_prop_dts
-                                                    .entry((g_id, c))
+                                                    .entry((GraphId(g_id), c))
                                                     .or_default()
                                                     .entry(pid)
                                                     .or_default()
                                                     .entry(dt)
                                                     .or_insert(0) += amt;
                                                 class_properties
-                                                    .entry((g_id, c))
+                                                    .entry((GraphId(g_id), c))
                                                     .or_default()
                                                     .insert(pid);
                                             }
@@ -2610,14 +2628,14 @@ pub async fn incremental_index(
                                             };
                                             if amt != 0 {
                                                 *class_prop_lang_deltas
-                                                    .entry((g_id, c))
+                                                    .entry((GraphId(g_id), c))
                                                     .or_default()
                                                     .entry(pid)
                                                     .or_default()
                                                     .entry(lid)
                                                     .or_insert(0) += amt;
                                                 class_properties
-                                                    .entry((g_id, c))
+                                                    .entry((GraphId(g_id), c))
                                                     .or_default()
                                                     .insert(pid);
                                             }
@@ -2646,14 +2664,14 @@ pub async fn incremental_index(
                             // edges whose subject also changed — Case A already owns those.
                             match fluree_db_binary_index::batched_lookup_inbound_refs(
                                 store,
-                                g_id,
+                                GraphId(g_id),
                                 sids,
                                 base_root.index_t,
                             ) {
                                 Ok(inbound) => {
                                     for (&obj, ins) in &inbound {
                                         for &(p, subj) in ins {
-                                            if changed_membership.contains(&(g_id, subj)) {
+                                            if changed_membership.contains(&(GraphId(g_id), subj)) {
                                                 continue;
                                             }
                                             edges.insert((subj, p, obj));
@@ -2675,7 +2693,7 @@ pub async fn incremental_index(
                             // Drop edges touched this batch — the forward pass owns them.
                             edges.retain(|&(s, p, o)| {
                                 !subject_ref_history
-                                    .get(&(g_id, s))
+                                    .get(&(GraphId(g_id), s))
                                     .and_then(|per_prop| per_prop.get(&p))
                                     .map(|objs| objs.contains_key(&o))
                                     .unwrap_or(false)
@@ -2688,10 +2706,10 @@ pub async fn incremental_index(
                             // in base_subject_classes (re-typed / novelty) use those maps.
                             let mut external_sids: Vec<u64> = Vec::new();
                             for &(s, _p, o) in &edges {
-                                if !base_subject_classes.contains_key(&(g_id, s)) {
+                                if !base_subject_classes.contains_key(&(GraphId(g_id), s)) {
                                     external_sids.push(s);
                                 }
-                                if !base_subject_classes.contains_key(&(g_id, o)) {
+                                if !base_subject_classes.contains_key(&(GraphId(g_id), o)) {
                                     external_sids.push(o);
                                 }
                             }
@@ -2706,7 +2724,7 @@ pub async fn incremental_index(
                                 // silently treat every endpoint as class-less).
                                 match fluree_db_binary_index::batched_lookup_predicate_refs(
                                     store,
-                                    g_id,
+                                    GraphId(g_id),
                                     rdf_type_p_id,
                                     &external_sids,
                                     base_root.index_t,
@@ -2724,10 +2742,10 @@ pub async fn incremental_index(
                             // (base_classes, net_classes) for an endpoint. A stable base
                             // entity has base == net (its type did not change this batch).
                             let resolve = |sid: u64| -> (Vec<u64>, Vec<u64>) {
-                                if let Some(b) = base_subject_classes.get(&(g_id, sid)) {
+                                if let Some(b) = base_subject_classes.get(&(GraphId(g_id), sid)) {
                                     let base: Vec<u64> = b.iter().copied().collect();
                                     let net: Vec<u64> = subject_classes
-                                        .get(&(g_id, sid))
+                                        .get(&(GraphId(g_id), sid))
                                         .map(|s| s.iter().copied().collect())
                                         .unwrap_or_default();
                                     (base, net)
@@ -2744,7 +2762,7 @@ pub async fn incremental_index(
                                 for &sc in &bs {
                                     for &oc in &bo {
                                         *ref_edges
-                                            .entry((g_id, sc))
+                                            .entry((GraphId(g_id), sc))
                                             .or_default()
                                             .entry(p)
                                             .or_default()
@@ -2755,7 +2773,7 @@ pub async fn incremental_index(
                                 for &sc in &ns {
                                     for &oc in &no {
                                         *ref_edges
-                                            .entry((g_id, sc))
+                                            .entry((GraphId(g_id), sc))
                                             .or_default()
                                             .entry(p)
                                             .or_default()
@@ -2856,7 +2874,8 @@ pub async fn incremental_index(
                                         .unwrap_or(0);
                                     if sid64 != 0 {
                                         base_class_sid_hits.fetch_add(1, Ordering::Relaxed);
-                                        entries_by_key.insert((g.g_id, sid64), entry.clone());
+                                        entries_by_key
+                                            .insert((g.g_id.as_u16(), sid64), entry.clone());
                                     }
                                 }
                             }
@@ -2876,7 +2895,7 @@ pub async fn incremental_index(
                 let class_count_delta_started = Instant::now();
                 for (&(g_id, class_sid64), &delta) in &class_count_deltas {
                     let entry = entries_by_key
-                        .entry((g_id, class_sid64))
+                        .entry((g_id.as_u16(), class_sid64))
                         .or_insert_with(|| {
                             let class_sid = resolve_class_sid(
                                 class_sid64,
@@ -2922,7 +2941,7 @@ pub async fn incremental_index(
                 // from the base stats (issue #1266: a class that only lost a property
                 // via retraction, or gained one via re-typing, must be revisited so its
                 // decrement/move is applied rather than dropped).
-                let mut delta_class_keys: std::collections::HashSet<(u16, u64)> =
+                let mut delta_class_keys: std::collections::HashSet<(GraphId, u64)> =
                     std::collections::HashSet::new();
                 delta_class_keys.extend(class_properties.keys().copied());
                 delta_class_keys.extend(class_prop_dts.keys().copied());
@@ -2930,7 +2949,7 @@ pub async fn incremental_index(
                 delta_class_keys.extend(ref_edges.keys().copied());
                 for (g_id, class_sid64) in delta_class_keys {
                     entries_by_key
-                        .entry((g_id, class_sid64))
+                        .entry((g_id.as_u16(), class_sid64))
                         .or_insert_with(|| {
                             let class_sid = resolve_class_sid(
                                 class_sid64,
@@ -2964,10 +2983,10 @@ pub async fn incremental_index(
                 let mut next_merged_class_progress = 500usize;
                 for (&(g_id, class_sid64), entry) in &mut entries_by_key {
                     visited_class_entries += 1;
-                    let class_dts = class_prop_dts.get(&(g_id, class_sid64));
-                    let class_refs = ref_edges.get(&(g_id, class_sid64));
-                    let class_langs = class_prop_lang_deltas.get(&(g_id, class_sid64));
-                    let class_props_present = class_properties.get(&(g_id, class_sid64));
+                    let class_dts = class_prop_dts.get(&(GraphId(g_id), class_sid64));
+                    let class_refs = ref_edges.get(&(GraphId(g_id), class_sid64));
+                    let class_langs = class_prop_lang_deltas.get(&(GraphId(g_id), class_sid64));
+                    let class_props_present = class_properties.get(&(GraphId(g_id), class_sid64));
                     // Revisit a class if it was touched by ANY delta this batch. The
                     // prior gate used only the assert-only presence set, so a class
                     // whose sole change was a retraction (or a re-type moving a
@@ -3265,10 +3284,10 @@ pub async fn incremental_index(
                 entries_by_key.retain(|_, e| e.count > 0);
 
                 // Group into per-graph class lists.
-                let mut by_graph: std::collections::HashMap<u16, Vec<is::ClassStatEntry>> =
+                let mut by_graph: std::collections::HashMap<GraphId, Vec<is::ClassStatEntry>> =
                     std::collections::HashMap::new();
                 for ((g_id, _), entry) in entries_by_key {
-                    by_graph.entry(g_id).or_default().push(entry);
+                    by_graph.entry(GraphId(g_id)).or_default().push(entry);
                 }
 
                 for g in &mut final_graphs {

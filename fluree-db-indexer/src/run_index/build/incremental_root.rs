@@ -10,6 +10,7 @@ use fluree_db_binary_index::format::run_record::RunSortOrder;
 use fluree_db_binary_index::{BinaryGarbageRef, BinaryPrevIndexRef};
 use fluree_db_binary_index::{DictRefs, GraphArenaRefs};
 use fluree_db_core::ContentId;
+use fluree_db_core::GraphId;
 use fluree_db_core::{IndexSchema, IndexStats};
 use std::collections::BTreeMap;
 use std::collections::HashSet;
@@ -74,7 +75,12 @@ impl IncrementalRootBuilder {
         order: RunSortOrder,
         branch_cid: ContentId,
     ) {
-        if let Some(ng) = self.root.named_graphs.iter_mut().find(|ng| ng.g_id == g_id) {
+        if let Some(ng) = self
+            .root
+            .named_graphs
+            .iter_mut()
+            .find(|ng| ng.g_id == GraphId(g_id))
+        {
             if let Some(entry) = ng.orders.iter_mut().find(|(o, _)| *o == order) {
                 self.replaced_cids.push(entry.1.clone());
                 entry.1 = branch_cid;
@@ -83,7 +89,7 @@ impl IncrementalRootBuilder {
             }
         } else {
             self.root.named_graphs.push(NamedGraphRouting {
-                g_id,
+                g_id: GraphId(g_id),
                 orders: vec![(order, branch_cid)],
             });
         }

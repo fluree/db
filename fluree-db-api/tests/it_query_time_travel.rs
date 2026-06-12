@@ -9,6 +9,7 @@ mod support;
 
 use chrono::{DateTime, Duration, FixedOffset, SecondsFormat, TimeZone, Utc};
 use fluree_db_api::FlureeBuilder;
+use fluree_db_core::GraphId;
 use serde_json::{json, Value as JsonValue};
 use support::{assert_index_defaults, genesis_ledger, normalize_rows, MemoryFluree, MemoryLedger};
 use tokio::time::sleep;
@@ -117,7 +118,7 @@ async fn time_travel_query_connection_at_t_iso_and_sha() {
     assert_eq!(
         query_names_at(
             &fluree,
-            ledger3.as_graph_db_ref(0),
+            ledger3.as_graph_db_ref(GraphId(0)),
             &format!("{ledger_id}@t:1")
         )
         .await,
@@ -126,7 +127,7 @@ async fn time_travel_query_connection_at_t_iso_and_sha() {
     assert_eq!(
         query_names_at(
             &fluree,
-            ledger3.as_graph_db_ref(0),
+            ledger3.as_graph_db_ref(GraphId(0)),
             &format!("{ledger_id}@t:2")
         )
         .await,
@@ -135,7 +136,7 @@ async fn time_travel_query_connection_at_t_iso_and_sha() {
     assert_eq!(
         query_names_at(
             &fluree,
-            ledger3.as_graph_db_ref(0),
+            ledger3.as_graph_db_ref(GraphId(0)),
             &format!("{ledger_id}@t:3")
         )
         .await,
@@ -146,7 +147,7 @@ async fn time_travel_query_connection_at_t_iso_and_sha() {
     assert_eq!(
         query_names_at(
             &fluree,
-            ledger3.as_graph_db_ref(0),
+            ledger3.as_graph_db_ref(GraphId(0)),
             &format!("{ledger_id}@iso:{iso_t1}")
         )
         .await,
@@ -158,7 +159,7 @@ async fn time_travel_query_connection_at_t_iso_and_sha() {
     assert_eq!(
         query_names_at(
             &fluree,
-            ledger3.as_graph_db_ref(0),
+            ledger3.as_graph_db_ref(GraphId(0)),
             &format!("{ledger_id}@iso:{iso_now}")
         )
         .await,
@@ -173,7 +174,7 @@ async fn time_travel_query_connection_at_t_iso_and_sha() {
     assert_eq!(
         query_names_at(
             &fluree,
-            ledger3.as_graph_db_ref(0),
+            ledger3.as_graph_db_ref(GraphId(0)),
             &format!("{ledger_id}@commit:{sha_7}")
         )
         .await,
@@ -182,7 +183,7 @@ async fn time_travel_query_connection_at_t_iso_and_sha() {
     assert_eq!(
         query_names_at(
             &fluree,
-            ledger3.as_graph_db_ref(0),
+            ledger3.as_graph_db_ref(GraphId(0)),
             &format!("{ledger_id}@commit:{sha_52}")
         )
         .await,
@@ -191,7 +192,7 @@ async fn time_travel_query_connection_at_t_iso_and_sha() {
     assert_eq!(
         query_names_at(
             &fluree,
-            ledger3.as_graph_db_ref(0),
+            ledger3.as_graph_db_ref(GraphId(0)),
             &format!("{ledger_id}@commit:{sha_6}")
         )
         .await,
@@ -223,7 +224,7 @@ async fn time_travel_invalid_format_errors() {
     assert_eq!(
         query_names_at(
             &fluree,
-            ledger3.as_graph_db_ref(0),
+            ledger3.as_graph_db_ref(GraphId(0)),
             &format!("{ledger_id}@t:1")
         )
         .await,
@@ -306,7 +307,7 @@ async fn time_travel_iso_too_early_errors() {
     assert_eq!(
         query_names_at(
             &fluree,
-            ledger3.as_graph_db_ref(0),
+            ledger3.as_graph_db_ref(GraphId(0)),
             &format!("{ledger_id}@t:1")
         )
         .await,
@@ -357,7 +358,7 @@ async fn time_travel_iso_between_commits_resolves_to_previous_commit() {
     assert_eq!(
         query_names_at(
             &fluree,
-            ledger3.as_graph_db_ref(0),
+            ledger3.as_graph_db_ref(GraphId(0)),
             &format!("{ledger_id}@iso:{mid_12}")
         )
         .await,
@@ -367,7 +368,7 @@ async fn time_travel_iso_between_commits_resolves_to_previous_commit() {
     assert_eq!(
         query_names_at(
             &fluree,
-            ledger3.as_graph_db_ref(0),
+            ledger3.as_graph_db_ref(GraphId(0)),
             &format!("{ledger_id}@iso:{mid_23}")
         )
         .await,
@@ -426,7 +427,7 @@ async fn time_travel_branch_interaction_main_at_t() {
 
     let result = fluree.query_connection(&q).await.expect("query_connection");
     let jsonld = result
-        .to_jsonld_async(ledger1.as_graph_db_ref(0))
+        .to_jsonld_async(ledger1.as_graph_db_ref(GraphId(0)))
         .await
         .expect("to_jsonld_async");
 

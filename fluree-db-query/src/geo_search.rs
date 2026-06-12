@@ -182,7 +182,7 @@ impl GeoSearchOperator {
                 o_key: min_o_key,
                 o_i: 0,
                 t: 0,
-                g_id,
+                g_id: g_id.as_u16(),
             };
 
             let max_key = RunRecordV2 {
@@ -192,7 +192,7 @@ impl GeoSearchOperator {
                 o_key: max_o_key,
                 o_i: u32::MAX,
                 t: u32::MAX,
-                g_id,
+                g_id: g_id.as_u16(),
             };
 
             // Create filter for p_id and GEO_POINT

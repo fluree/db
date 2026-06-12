@@ -31,6 +31,7 @@
 //! even though chunk parsing is parallel.
 
 use crate::error::ApiError;
+use fluree_db_core::GraphId;
 use fluree_db_core::{
     ContentId, ContentKind, ContentStore, FuelExceededError, RemoteObject, Storage, StorageRead,
     Tracker, TrackingTally,
@@ -4407,7 +4408,7 @@ where
     // RDF import.
     let v3_named_g_ids: Vec<u16> = {
         let graph_count = spool_config.graph_alloc.len();
-        (u32::from(fluree_db_core::graph_registry::FIRST_USER_GRAPH_ID)..=graph_count)
+        (u32::from(fluree_db_core::graph_registry::FIRST_USER_GRAPH_ID.as_u16())..=graph_count)
             .map(|g| g as u16)
             .collect()
     };
@@ -5060,7 +5061,7 @@ where
                     })
                     .unwrap_or_default();
                 GraphArenaRefs {
-                    g_id,
+                    g_id: GraphId(g_id),
                     numbig,
                     vectors,
                     spatial: Vec::new(),

@@ -34,7 +34,7 @@ impl<'a> QueryPolicyExecutor<'a> {
             snapshot,
             overlay: None,
             to_t: snapshot.t,
-            g_id: 0,
+            g_id: GraphId(0),
         }
     }
 
@@ -48,7 +48,7 @@ impl<'a> QueryPolicyExecutor<'a> {
             snapshot,
             overlay: Some(overlay),
             to_t,
-            g_id: 0,
+            g_id: GraphId(0),
         }
     }
 

@@ -48,6 +48,25 @@ impl DictId for u16 {
     }
 }
 
+impl DictId for crate::ids::GraphId {
+    #[inline]
+    fn from_usize(v: usize) -> Self {
+        crate::ids::GraphId(v as u16)
+    }
+    #[inline]
+    fn to_usize(self) -> usize {
+        self.0 as usize
+    }
+    #[inline]
+    fn checked_add(self, rhs: Self) -> Option<Self> {
+        self.0.checked_add(rhs.0).map(crate::ids::GraphId)
+    }
+    #[inline]
+    fn one() -> Self {
+        crate::ids::GraphId(1)
+    }
+}
+
 impl DictId for u32 {
     #[inline]
     fn from_usize(v: usize) -> Self {

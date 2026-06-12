@@ -11,6 +11,7 @@
 mod support;
 
 use async_trait::async_trait;
+use fluree_db_core::GraphId;
 use fluree_db_iceberg::io::batch::{BatchSchema, Column, ColumnBatch, FieldInfo, FieldType};
 use fluree_db_query::error::{QueryError, Result as QueryResult};
 use fluree_db_query::r2rml::{R2rmlProvider, R2rmlTableProvider};
@@ -452,7 +453,7 @@ async fn e2e_r2rml_query_iceberg_table() {
 
     // Execute query
     let result = execute(
-        GraphDbRef::new(&ledger.snapshot, 0, &NoOverlay, ledger.t()),
+        GraphDbRef::new(&ledger.snapshot, GraphId(0), &NoOverlay, ledger.t()),
         &vars,
         &executable,
         r2rml_test_config(&tracker, &provider),
@@ -1096,7 +1097,7 @@ async fn engine_e2e_graph_pattern_r2rml_scan() {
 
     // Execute with our mock R2RML provider
     let batches = execute(
-        GraphDbRef::new(&ledger.snapshot, 0, &NoOverlay, ledger.t()),
+        GraphDbRef::new(&ledger.snapshot, GraphId(0), &NoOverlay, ledger.t()),
         &vars,
         &executable,
         r2rml_test_config(&tracker, &provider),
@@ -1212,7 +1213,7 @@ async fn engine_e2e_provider_method_calls() {
 
     // Execute query - should succeed
     let result = execute(
-        GraphDbRef::new(&ledger.snapshot, 0, &NoOverlay, ledger.t()),
+        GraphDbRef::new(&ledger.snapshot, GraphId(0), &NoOverlay, ledger.t()),
         &vars,
         &executable,
         r2rml_test_config(&tracker, &provider),
@@ -1844,7 +1845,7 @@ async fn engine_e2e_ref_object_map_join_execution() {
 
     // Execute query
     let batches = execute(
-        GraphDbRef::new(&ledger.snapshot, 0, &NoOverlay, ledger.t()),
+        GraphDbRef::new(&ledger.snapshot, GraphId(0), &NoOverlay, ledger.t()),
         &vars,
         &executable,
         r2rml_test_config(&tracker, &provider),

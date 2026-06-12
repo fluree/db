@@ -582,7 +582,7 @@ impl Default for ContextConfig<'_, '_> {
             from_t: None,
             strict_bind_errors: true,
             binary_store: None,
-            binary_g_id: 0,
+            binary_g_id: GraphId(0),
             dict_novelty: None,
             spatial_providers: None,
             fulltext_providers: None,

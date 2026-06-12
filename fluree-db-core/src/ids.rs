@@ -69,8 +69,56 @@ impl fmt::Display for RuntimePredicateId {
 /// Graph dictionary ID (u16).
 ///
 /// 0 = default graph, 1 = txn-meta. Named-graph dict indices start at 2.
-/// Using a type alias keeps a single definition for easy future changes.
-pub type GraphId = u16;
+///
+/// A newtype (not an alias) so graph ids cannot be cross-assigned with the
+/// system's other pervasive `u16` spaces — namespace codes above all; the
+/// 2026-06 audit flagged that confusion class as compile-time preventable.
+/// `#[repr(transparent)]` + `Copy`: zero runtime cost. Wire formats that
+/// serialize a graph id store the raw `u16` via `as_u16`/`from_u16` at the
+/// codec boundary; in-memory structs carry `GraphId`.
+#[derive(
+    Copy,
+    Clone,
+    Eq,
+    PartialEq,
+    Ord,
+    PartialOrd,
+    Hash,
+    Debug,
+    Default,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+#[repr(transparent)]
+#[serde(transparent)]
+pub struct GraphId(pub u16);
+
+impl GraphId {
+    /// The default graph (id 0).
+    pub const DEFAULT: GraphId = GraphId(0);
+    /// The transaction-metadata graph (id 1).
+    pub const TXN_META: GraphId = GraphId(1);
+
+    #[inline]
+    pub fn as_u16(self) -> u16 {
+        self.0
+    }
+    #[inline]
+    pub fn from_u16(v: u16) -> Self {
+        Self(v)
+    }
+    /// For indexing per-graph tables.
+    #[inline]
+    pub fn as_usize(self) -> usize {
+        self.0 as usize
+    }
+}
+
+impl fmt::Display for GraphId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "GraphId({})", self.0)
+    }
+}
 
 // ---------------------------------------------------------------------------
 // TxnT

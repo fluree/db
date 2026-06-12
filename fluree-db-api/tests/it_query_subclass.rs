@@ -6,6 +6,7 @@
 mod support;
 
 use fluree_db_api::FlureeBuilder;
+use fluree_db_core::GraphId;
 use serde_json::json;
 use support::{genesis_ledger, normalize_rows, MemoryFluree, MemoryLedger};
 use tempfile::TempDir;
@@ -134,7 +135,7 @@ async fn subclass_creative_work_returns_book_and_movie_instances() {
     let rows = support::query_jsonld(&fluree, &ledger, &q)
         .await
         .unwrap()
-        .to_jsonld_async(ledger.as_graph_db_ref(0))
+        .to_jsonld_async(ledger.as_graph_db_ref(GraphId(0)))
         .await
         .unwrap();
     assert_eq!(
@@ -214,7 +215,7 @@ async fn subclass_inferencing_issue_core_48() {
     let rows = support::query_jsonld(&fluree, &ledger, &q)
         .await
         .unwrap()
-        .to_jsonld_async(ledger.as_graph_db_ref(0))
+        .to_jsonld_async(ledger.as_graph_db_ref(GraphId(0)))
         .await
         .unwrap();
     assert_eq!(
@@ -282,7 +283,7 @@ async fn subclass_inferencing_after_load_issue_core_48() {
     let rows = support::query_jsonld(&fluree2, &loaded, &q)
         .await
         .unwrap()
-        .to_jsonld_async(loaded.as_graph_db_ref(0))
+        .to_jsonld_async(loaded.as_graph_db_ref(GraphId(0)))
         .await
         .unwrap();
     assert_eq!(

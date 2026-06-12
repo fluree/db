@@ -23,6 +23,7 @@ use fluree_db_binary_index::format::run_record::RunSortOrder;
 use fluree_db_binary_index::format::run_record_v2::cmp_v2_spot;
 use fluree_db_core::o_type::OType;
 use fluree_db_core::o_type_registry::OTypeRegistry;
+use fluree_db_core::GraphId;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -759,7 +760,7 @@ const MAX_CLASS_REF_LEAF_ENTRIES: usize = 64_000_000;
 pub struct SpotClassStatsCollector {
     rdf_type_p_id: u32,
     current_s_id: Option<u64>,
-    current_g_id: u16,
+    current_g_id: GraphId,
     classes: Vec<u64>,
     prop_dts: FxHashMap<(u32, u16), u64>,
     prop_langs: FxHashMap<(u32, u16), u64>,
@@ -780,7 +781,7 @@ impl SpotClassStatsCollector {
         Self {
             rdf_type_p_id,
             current_s_id: None,
-            current_g_id: 0,
+            current_g_id: GraphId(0),
             classes: Vec::new(),
             prop_dts: FxHashMap::default(),
             prop_langs: FxHashMap::default(),
@@ -837,12 +838,12 @@ impl SpotClassStatsCollector {
             *self
                 .result
                 .class_counts
-                .entry((g_id, class_sid))
+                .entry((GraphId(g_id.as_u16()), class_sid))
                 .or_insert(0) += 1;
             let class_entry = self
                 .result
                 .class_prop_dts
-                .entry((g_id, class_sid))
+                .entry((GraphId(g_id.as_u16()), class_sid))
                 .or_default();
             for (&(p_id, dt), &count) in &self.prop_dts {
                 *class_entry.entry(p_id).or_default().entry(dt).or_insert(0) += count;
@@ -851,7 +852,7 @@ impl SpotClassStatsCollector {
                 let lang_entry = self
                     .result
                     .class_prop_langs
-                    .entry((g_id, class_sid))
+                    .entry((GraphId(g_id.as_u16()), class_sid))
                     .or_default();
                 for (&(p_id, lang_id), &count) in &self.prop_langs {
                     *lang_entry
@@ -868,7 +869,7 @@ impl SpotClassStatsCollector {
             // membership (also a field of `self`) is borrowed immutably below.
             let mut tbuf = std::mem::take(&mut self.target_class_buf);
             for &(p_id, target_sid) in &self.ref_targets {
-                membership.collect_classes(g_id, target_sid, &mut tbuf);
+                membership.collect_classes(g_id.as_u16(), target_sid, &mut tbuf);
                 if tbuf.is_empty() {
                     continue;
                 }
@@ -876,7 +877,7 @@ impl SpotClassStatsCollector {
                     let ref_entry = self
                         .result
                         .class_prop_refs
-                        .entry((g_id, src_class))
+                        .entry((GraphId(g_id.as_u16()), src_class))
                         .or_default()
                         .entry(p_id)
                         .or_default();
@@ -1235,7 +1236,7 @@ fn build_spot_index_from_commits(
     // so the SPOT build — which overlaps the parallel secondary-order builds —
     // does not retain its whole compressed leaf set in RAM.
     let mut writer = PersistingLeafWriter::new(
-        g_id,
+        GraphId(g_id),
         order,
         index_dir,
         leaflet_target_rows,
@@ -1522,7 +1523,7 @@ mod tests {
             .unwrap();
         let post_graphs = &post_result.1.graphs;
         assert_eq!(post_graphs.len(), 1);
-        assert_eq!(post_graphs[0].g_id, 0);
+        assert_eq!(post_graphs[0].g_id, GraphId(0));
 
         // Check the POST leaf has 2 leaflets (p_id=1 and p_id=2).
         let post_leaf = &post_graphs[0].leaf_infos[0];

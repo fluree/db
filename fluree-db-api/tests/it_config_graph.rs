@@ -43,7 +43,11 @@ async fn config_graph_reserved_at_gid2() {
     // Config graph IRI should resolve to g_id=2
     let config_iri = config_graph_iri(ledger_id);
     let g_id = view.snapshot.graph_registry.graph_id_for_iri(&config_iri);
-    assert_eq!(g_id, Some(2), "config graph should be reserved at g_id=2");
+    assert_eq!(
+        g_id,
+        Some(fluree_db_core::GraphId(2)),
+        "config graph should be reserved at g_id=2"
+    );
 }
 
 // =============================================================================

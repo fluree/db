@@ -8,6 +8,7 @@
 mod support;
 
 use fluree_db_api::FlureeBuilder;
+use fluree_db_core::GraphId;
 use fluree_db_core::{LedgerSnapshot, Sid};
 use serde_json::json;
 use std::io::Write;
@@ -315,7 +316,7 @@ ex:bob a ex:User ;
     let graphs = stats.graphs.as_ref().expect("graphs should be present");
     let default_graph_size = graphs
         .iter()
-        .find(|g| g.g_id == 0)
+        .find(|g| g.g_id == GraphId(0))
         .map(|g| g.size)
         .unwrap_or(0);
     assert!(
@@ -532,7 +533,7 @@ ex:bob a ex:User ;
         .await
         .expect("load txn-meta view");
 
-    assert_eq!(view.graph_id, 1, "txn-meta should use g_id=1");
+    assert_eq!(view.graph_id, GraphId(1), "txn-meta should use g_id=1");
     assert!(
         view.binary_store().is_some(),
         "binary store should be loaded"

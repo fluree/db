@@ -730,7 +730,7 @@ impl Fluree {
                     view.novelty_for_stats(),
                     view.t,
                     &effective_opts,
-                    &[0], // identity-mode uses [0]; unused under cross-ledger
+                    &[GraphId(0)], // identity-mode uses [0]; unused under cross-ledger
                     restrictions,
                 )
                 .await?;
@@ -750,7 +750,7 @@ impl Fluree {
                 .and_then(|p| p.policy_source.as_ref());
             crate::policy_builder::resolve_policy_source_g_ids(source, &view.snapshot)?
         } else {
-            vec![0]
+            vec![GraphId(0)]
         };
 
         let policy_ctx = crate::policy_builder::build_policy_context_from_opts(
@@ -925,9 +925,9 @@ fn resolve_local_rules_source_g_id(
         ));
     }
     let g_id = match src.graph_selector.as_deref() {
-        Some(iri) if iri == fluree_vocab::config_iris::DEFAULT_GRAPH => Some(0u16),
+        Some(iri) if iri == fluree_vocab::config_iris::DEFAULT_GRAPH => Some(GraphId(0)),
         Some(iri) => snapshot.graph_registry.graph_id_for_iri(iri),
-        None => Some(0u16),
+        None => Some(GraphId(0)),
     };
     match g_id {
         Some(id) => Ok(Some(id)),

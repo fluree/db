@@ -5,6 +5,7 @@
 mod support;
 
 use fluree_db_api::FlureeBuilder;
+use fluree_db_core::GraphId;
 use serde_json::{json, Value as JsonValue};
 use std::sync::Arc;
 use support::{
@@ -3104,7 +3105,7 @@ async fn jsonld_exact_repro_expansion_custom_type() {
         .await
         .expect("expansion should not error");
     let jsonld = result
-        .to_jsonld_async(ledger.as_graph_db_ref(0))
+        .to_jsonld_async(ledger.as_graph_db_ref(GraphId(0)))
         .await
         .expect("to_jsonld_async");
     let rows = jsonld.as_array().expect("array");

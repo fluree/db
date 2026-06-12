@@ -23,6 +23,7 @@
 mod support;
 
 use fluree_db_api::{FlureeBuilder, ReindexOptions};
+use fluree_db_core::GraphId;
 use serde_json::{json, Value as JsonValue};
 
 fn ctx() -> JsonValue {
@@ -48,7 +49,7 @@ async fn count_subjects_with_predicate(
         .await
         .expect("query");
     result
-        .to_jsonld_async(ledger.as_graph_db_ref(0))
+        .to_jsonld_async(ledger.as_graph_db_ref(GraphId(0)))
         .await
         .expect("to_jsonld_async")
         .as_array()

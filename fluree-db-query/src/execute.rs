@@ -96,7 +96,12 @@ mod tests {
     async fn test_empty_patterns_returns_one_row() {
         let snapshot = make_test_snapshot();
         let vars = VarRegistry::new();
-        let db = GraphDbRef::new(&snapshot, 0, &NoOverlay, snapshot.t);
+        let db = GraphDbRef::new(
+            &snapshot,
+            fluree_db_core::GraphId(0),
+            &NoOverlay,
+            snapshot.t,
+        );
 
         let query = Query {
             context: ParsedContext::default(),

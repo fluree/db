@@ -29,16 +29,16 @@ use std::sync::Arc;
 use crate::error::{Error, Result};
 
 /// Well-known GraphId for the default (implicit) graph.
-pub const DEFAULT_GRAPH_ID: GraphId = 0;
+pub const DEFAULT_GRAPH_ID: GraphId = GraphId(0);
 
 /// Well-known GraphId for the txn-meta graph.
-pub const TXN_META_GRAPH_ID: GraphId = 1;
+pub const TXN_META_GRAPH_ID: GraphId = GraphId(1);
 
 /// Well-known GraphId for the ledger config graph.
-pub const CONFIG_GRAPH_ID: GraphId = 2;
+pub const CONFIG_GRAPH_ID: GraphId = GraphId(2);
 
 /// First GraphId available for user-defined named graphs.
-pub const FIRST_USER_GRAPH_ID: GraphId = 3;
+pub const FIRST_USER_GRAPH_ID: GraphId = GraphId(3);
 
 /// Construct the ledger-scoped txn-meta graph IRI from a ledger ID.
 ///
@@ -158,7 +158,7 @@ impl GraphRegistry {
         id_to_iri.push(None); // slot 0 = default graph
 
         for (root_idx, iri_str) in iris.iter().enumerate() {
-            let g_id = (root_idx as GraphId) + 1; // root index 0 → g_id 1
+            let g_id = GraphId(root_idx as u16 + 1); // root index 0 → g_id 1
             if iri_str.is_empty() {
                 return Err(Error::invalid_index(format!(
                     "GraphRegistry: empty IRI at root index {root_idx} (g_id={g_id})"
@@ -175,7 +175,7 @@ impl GraphRegistry {
         }
 
         // next_id = number of slots used, but always >= FIRST_USER_GRAPH_ID
-        let next_id = (id_to_iri.len() as GraphId).max(FIRST_USER_GRAPH_ID);
+        let next_id = GraphId(id_to_iri.len() as u16).max(FIRST_USER_GRAPH_ID);
 
         Ok(Self {
             iri_to_id,
@@ -196,12 +196,12 @@ impl GraphRegistry {
         }
 
         let max_id = entries.iter().map(|(g_id, _)| *g_id).max().unwrap();
-        let capacity = (max_id as usize) + 1;
+        let capacity = max_id.as_usize() + 1;
         let mut id_to_iri: Vec<Option<Arc<str>>> = vec![None; capacity];
         let mut iri_to_id: HashMap<Arc<str>, GraphId> = HashMap::with_capacity(entries.len());
 
         for &(g_id, iri) in entries {
-            if g_id == 0 {
+            if g_id == GraphId(0) {
                 return Err(Error::invalid_index(
                     "GraphRegistry: g_id=0 (default graph) must not be stored",
                 ));
@@ -212,17 +212,17 @@ impl GraphRegistry {
                     "GraphRegistry: duplicate IRI '{iri}' at g_id={g_id} (already at g_id={existing_id})"
                 )));
             }
-            if id_to_iri[g_id as usize].is_some() {
+            if id_to_iri[g_id.as_usize()].is_some() {
                 return Err(Error::invalid_index(format!(
                     "GraphRegistry: duplicate g_id={g_id} with different IRIs"
                 )));
             }
             iri_to_id.insert(arc.clone(), g_id);
-            id_to_iri[g_id as usize] = Some(arc);
+            id_to_iri[g_id.as_usize()] = Some(arc);
         }
 
         // Always >= FIRST_USER_GRAPH_ID even if entries only contain g_id=1
-        let next_id = (max_id + 1).max(FIRST_USER_GRAPH_ID);
+        let next_id = GraphId(max_id.0 + 1).max(FIRST_USER_GRAPH_ID);
 
         Ok(Self {
             iri_to_id,
@@ -270,13 +270,13 @@ impl GraphRegistry {
                 g_id >= FIRST_USER_GRAPH_ID,
                 "apply_delta must never assign system graph IDs (0, 1, or 2)"
             );
-            self.next_id += 1;
+            self.next_id = GraphId(self.next_id.0 + 1);
 
             // Extend id_to_iri to accommodate the new g_id
-            while self.id_to_iri.len() <= g_id as usize {
+            while self.id_to_iri.len() <= g_id.as_usize() {
                 self.id_to_iri.push(None);
             }
-            self.id_to_iri[g_id as usize] = Some(arc.clone());
+            self.id_to_iri[g_id.as_usize()] = Some(arc.clone());
             self.iri_to_id.insert(arc.clone(), g_id);
             assigned.push((g_id, arc));
         }
@@ -304,8 +304,8 @@ impl GraphRegistry {
         // Same deterministic sort as apply_delta
         truly_new.sort();
 
-        for (next, arc) in (self.next_id..).zip(truly_new) {
-            result.insert(arc, next);
+        for (offset, arc) in truly_new.into_iter().enumerate() {
+            result.insert(arc, GraphId(self.next_id.0 + offset as u16));
         }
 
         result
@@ -319,7 +319,7 @@ impl GraphRegistry {
     /// Reverse lookup: GraphId → IRI.
     pub fn iri_for_graph_id(&self, g_id: GraphId) -> Option<&str> {
         self.id_to_iri
-            .get(g_id as usize)
+            .get(g_id.as_usize())
             .and_then(|opt| opt.as_deref())
     }
 
@@ -328,7 +328,7 @@ impl GraphRegistry {
         self.id_to_iri
             .iter()
             .enumerate()
-            .filter_map(|(idx, opt)| opt.as_deref().map(|iri| (idx as GraphId, iri)))
+            .filter_map(|(idx, opt)| opt.as_deref().map(|iri| (GraphId(idx as u16), iri)))
     }
 
     /// Number of registered graphs (excluding default graph).
@@ -377,9 +377,9 @@ mod tests {
         let reg = GraphRegistry::default();
         assert_eq!(reg.next_id(), FIRST_USER_GRAPH_ID);
         // Default has no system graphs seeded
-        assert_eq!(reg.iri_for_graph_id(0), None); // default graph
-        assert_eq!(reg.iri_for_graph_id(1), None); // txn-meta not seeded
-        assert_eq!(reg.iri_for_graph_id(2), None); // config not seeded
+        assert_eq!(reg.iri_for_graph_id(GraphId(0)), None); // default graph
+        assert_eq!(reg.iri_for_graph_id(GraphId(1)), None); // txn-meta not seeded
+        assert_eq!(reg.iri_for_graph_id(GraphId(2)), None); // config not seeded
         assert_eq!(reg.len(), 0);
         assert!(reg.is_empty());
     }
@@ -397,7 +397,7 @@ mod tests {
         assert_eq!(reg.graph_id_for_iri(config_iri), Some(CONFIG_GRAPH_ID));
         assert_eq!(reg.iri_for_graph_id(CONFIG_GRAPH_ID), Some(config_iri));
         // default graph still None
-        assert_eq!(reg.iri_for_graph_id(0), None);
+        assert_eq!(reg.iri_for_graph_id(GraphId(0)), None);
         // 2 system graphs registered
         assert_eq!(reg.len(), 2);
         assert!(!reg.is_empty());
@@ -413,8 +413,8 @@ mod tests {
 
         assert_eq!(assigned1, assigned2);
         // User graphs start at g_id=3
-        assert_eq!(reg1.graph_id_for_iri("http://a.org/g"), Some(3));
-        assert_eq!(reg1.graph_id_for_iri("http://b.org/g"), Some(4));
+        assert_eq!(reg1.graph_id_for_iri("http://a.org/g"), Some(GraphId(3)));
+        assert_eq!(reg1.graph_id_for_iri("http://b.org/g"), Some(GraphId(4)));
     }
 
     #[test]
@@ -438,7 +438,7 @@ mod tests {
         reg.apply_delta(["http://example.org/g1"]);
         let assigned = reg.apply_delta(["http://example.org/g1"]);
         assert!(assigned.is_empty());
-        assert_eq!(reg.next_id(), FIRST_USER_GRAPH_ID + 1); // 4
+        assert_eq!(reg.next_id(), GraphId(FIRST_USER_GRAPH_ID.0 + 1)); // 4
     }
 
     #[test]
@@ -460,12 +460,24 @@ mod tests {
 
         let txn_meta = txn_meta_graph_iri("test:a");
         let config = config_graph_iri("test:a");
-        assert_eq!(reg.graph_id_for_iri("http://example.org/g1"), Some(3));
-        assert_eq!(reg.graph_id_for_iri("http://example.org/g2"), Some(4));
-        assert_eq!(reg.iri_for_graph_id(1), Some(txn_meta.as_str()));
-        assert_eq!(reg.iri_for_graph_id(2), Some(config.as_str()));
-        assert_eq!(reg.iri_for_graph_id(3), Some("http://example.org/g1"));
-        assert_eq!(reg.iri_for_graph_id(4), Some("http://example.org/g2"));
+        assert_eq!(
+            reg.graph_id_for_iri("http://example.org/g1"),
+            Some(GraphId(3))
+        );
+        assert_eq!(
+            reg.graph_id_for_iri("http://example.org/g2"),
+            Some(GraphId(4))
+        );
+        assert_eq!(reg.iri_for_graph_id(GraphId(1)), Some(txn_meta.as_str()));
+        assert_eq!(reg.iri_for_graph_id(GraphId(2)), Some(config.as_str()));
+        assert_eq!(
+            reg.iri_for_graph_id(GraphId(3)),
+            Some("http://example.org/g1")
+        );
+        assert_eq!(
+            reg.iri_for_graph_id(GraphId(4)),
+            Some("http://example.org/g2")
+        );
     }
 
     #[test]
@@ -479,10 +491,13 @@ mod tests {
         ];
         let reg = GraphRegistry::seed_from_root_iris(&iris).unwrap();
 
-        assert_eq!(reg.graph_id_for_iri(&txn_meta), Some(1));
-        assert_eq!(reg.graph_id_for_iri(&config), Some(2));
-        assert_eq!(reg.graph_id_for_iri("http://example.org/g1"), Some(3));
-        assert_eq!(reg.next_id(), 4);
+        assert_eq!(reg.graph_id_for_iri(&txn_meta), Some(GraphId(1)));
+        assert_eq!(reg.graph_id_for_iri(&config), Some(GraphId(2)));
+        assert_eq!(
+            reg.graph_id_for_iri("http://example.org/g1"),
+            Some(GraphId(3))
+        );
+        assert_eq!(reg.next_id(), GraphId(4));
     }
 
     #[test]
@@ -496,7 +511,10 @@ mod tests {
         // seed_from_root_iris trusts whatever IRI is at iris[0]
         let iris = vec!["http://custom.org/txn-meta".to_string()];
         let reg = GraphRegistry::seed_from_root_iris(&iris).unwrap();
-        assert_eq!(reg.graph_id_for_iri("http://custom.org/txn-meta"), Some(1));
+        assert_eq!(
+            reg.graph_id_for_iri("http://custom.org/txn-meta"),
+            Some(GraphId(1))
+        );
     }
 
     #[test]
@@ -533,37 +551,40 @@ mod tests {
         let txn_meta = txn_meta_graph_iri("test:a");
         let config = config_graph_iri("test:a");
         let entries = vec![
-            (1u16, txn_meta.as_str()),
-            (2u16, config.as_str()),
-            (3u16, "http://example.org/g1"),
+            (GraphId(1), txn_meta.as_str()),
+            (GraphId(2), config.as_str()),
+            (GraphId(3), "http://example.org/g1"),
         ];
         let reg = GraphRegistry::seed_from_entries(&entries).unwrap();
 
-        assert_eq!(reg.graph_id_for_iri(&txn_meta), Some(1));
-        assert_eq!(reg.graph_id_for_iri(&config), Some(2));
-        assert_eq!(reg.graph_id_for_iri("http://example.org/g1"), Some(3));
-        assert_eq!(reg.next_id(), 4);
+        assert_eq!(reg.graph_id_for_iri(&txn_meta), Some(GraphId(1)));
+        assert_eq!(reg.graph_id_for_iri(&config), Some(GraphId(2)));
+        assert_eq!(
+            reg.graph_id_for_iri("http://example.org/g1"),
+            Some(GraphId(3))
+        );
+        assert_eq!(reg.next_id(), GraphId(4));
     }
 
     #[test]
     fn test_seed_from_entries_empty_returns_default() {
         let reg = GraphRegistry::seed_from_entries(&[]).unwrap();
         // Empty entries → default (no system graphs seeded)
-        assert_eq!(reg.iri_for_graph_id(1), None);
+        assert_eq!(reg.iri_for_graph_id(GraphId(1)), None);
         assert_eq!(reg.next_id(), FIRST_USER_GRAPH_ID);
     }
 
     #[test]
     fn test_seed_from_entries_single_gid1() {
         let txn_meta = txn_meta_graph_iri("test:a");
-        let entries = vec![(1u16, txn_meta.as_str())];
+        let entries = vec![(GraphId(1), txn_meta.as_str())];
         let reg = GraphRegistry::seed_from_entries(&entries).unwrap();
         assert_eq!(reg.next_id(), FIRST_USER_GRAPH_ID);
     }
 
     #[test]
     fn test_seed_from_entries_rejects_gid0() {
-        let entries = vec![(0u16, "bad")];
+        let entries = vec![(GraphId(0), "bad")];
         let err = GraphRegistry::seed_from_entries(&entries).unwrap_err();
         assert!(err.to_string().contains("g_id=0"));
     }
@@ -580,17 +601,26 @@ mod tests {
         ]);
 
         // User graphs start at g_id=3 (existing got 3, new ones get 4 and 5)
-        assert_eq!(prov.get("http://example.org/existing").copied(), Some(3));
-        assert_eq!(prov.get("http://example.org/new_a").copied(), Some(4));
-        assert_eq!(prov.get("http://example.org/new_b").copied(), Some(5));
+        assert_eq!(
+            prov.get("http://example.org/existing").copied(),
+            Some(GraphId(3))
+        );
+        assert_eq!(
+            prov.get("http://example.org/new_a").copied(),
+            Some(GraphId(4))
+        );
+        assert_eq!(
+            prov.get("http://example.org/new_b").copied(),
+            Some(GraphId(5))
+        );
         // System graphs always present
         let txn_meta = txn_meta_graph_iri("test:a");
         let config = config_graph_iri("test:a");
-        assert_eq!(prov.get(txn_meta.as_str()).copied(), Some(1));
-        assert_eq!(prov.get(config.as_str()).copied(), Some(2));
+        assert_eq!(prov.get(txn_meta.as_str()).copied(), Some(GraphId(1)));
+        assert_eq!(prov.get(config.as_str()).copied(), Some(GraphId(2)));
 
         // Registry unchanged
-        assert_eq!(reg.next_id(), 4);
+        assert_eq!(reg.next_id(), GraphId(4));
         assert_eq!(reg.graph_id_for_iri("http://example.org/new_a"), None);
     }
 
@@ -604,10 +634,10 @@ mod tests {
         let config = config_graph_iri("test:a");
         // 4 entries: txn-meta at 1, config at 2, user graphs at 3 and 4
         assert_eq!(entries.len(), 4);
-        assert_eq!(entries[0], (1, txn_meta.as_str()));
-        assert_eq!(entries[1], (2, config.as_str()));
-        assert_eq!(entries[2], (3, "http://a.org/g"));
-        assert_eq!(entries[3], (4, "http://b.org/g"));
+        assert_eq!(entries[0], (GraphId(1), txn_meta.as_str()));
+        assert_eq!(entries[1], (GraphId(2), config.as_str()));
+        assert_eq!(entries[2], (GraphId(3), "http://a.org/g"));
+        assert_eq!(entries[3], (GraphId(4), "http://b.org/g"));
     }
 
     #[test]
@@ -623,17 +653,23 @@ mod tests {
 
         let assigned = reg.apply_delta(["http://example.org/g2"]);
         assert_eq!(assigned.len(), 1);
-        assert_eq!(assigned[0].0, 4);
-        assert_eq!(reg.graph_id_for_iri("http://example.org/g2"), Some(4));
-        assert_eq!(reg.graph_id_for_iri("http://example.org/g1"), Some(3));
-        assert_eq!(reg.graph_id_for_iri(&config), Some(2));
-        assert_eq!(reg.graph_id_for_iri(&txn_meta), Some(1));
+        assert_eq!(assigned[0].0, GraphId(4));
+        assert_eq!(
+            reg.graph_id_for_iri("http://example.org/g2"),
+            Some(GraphId(4))
+        );
+        assert_eq!(
+            reg.graph_id_for_iri("http://example.org/g1"),
+            Some(GraphId(3))
+        );
+        assert_eq!(reg.graph_id_for_iri(&config), Some(GraphId(2)));
+        assert_eq!(reg.graph_id_for_iri(&txn_meta), Some(GraphId(1)));
     }
 
     #[test]
     fn test_system_graph_id_constants() {
-        assert_eq!(TXN_META_GRAPH_ID, 1);
-        assert_eq!(CONFIG_GRAPH_ID, 2);
-        assert_eq!(FIRST_USER_GRAPH_ID, 3);
+        assert_eq!(TXN_META_GRAPH_ID, GraphId(1));
+        assert_eq!(CONFIG_GRAPH_ID, GraphId(2));
+        assert_eq!(FIRST_USER_GRAPH_ID, GraphId(3));
     }
 }

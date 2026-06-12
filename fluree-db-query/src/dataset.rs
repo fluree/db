@@ -130,7 +130,7 @@ impl<'a> GraphRef<'a> {
     ) -> Self {
         Self {
             snapshot,
-            g_id: 0,
+            g_id: GraphId(0),
             overlay,
             to_t,
             ledger_id: Arc::from(snapshot.ledger_id.as_str()),

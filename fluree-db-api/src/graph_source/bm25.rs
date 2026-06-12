@@ -9,6 +9,7 @@ use crate::graph_source::result::{
     Bm25CreateResult, Bm25DropResult, Bm25StalenessCheck, Bm25SyncResult, SnapshotSelection,
 };
 use crate::Result;
+use fluree_db_core::GraphId;
 use fluree_db_core::{
     ledger_id::split_ledger_id, ContentId, ContentStore, OverlayProvider, Storage,
 };
@@ -224,7 +225,7 @@ impl crate::Fluree {
 
         let executable = ExecutableQuery::simple(parsed_for_exec);
 
-        let db = ledger.as_graph_db_ref(0);
+        let db = ledger.as_graph_db_ref(GraphId(0));
         let batches = execute(db, &vars, &executable, ContextConfig::default()).await?;
 
         // Format using the standard JSON-LD formatter
@@ -237,7 +238,9 @@ impl crate::Fluree {
             None,
         );
 
-        let json = result.to_jsonld_async(ledger.as_graph_db_ref(0)).await?;
+        let json = result
+            .to_jsonld_async(ledger.as_graph_db_ref(GraphId(0)))
+            .await?;
         match json {
             JsonValue::Array(arr) => Ok(arr),
             JsonValue::Object(_) => Ok(vec![json]),

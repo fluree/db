@@ -1,3 +1,4 @@
+use fluree_db_core::GraphId;
 use fluree_db_query::{execute, ContextConfig};
 use serde_json::Value as JsonValue;
 
@@ -76,7 +77,7 @@ impl Fluree {
 
         let r2rml_provider = crate::r2rml_provider!(self);
         let tracker = crate::Tracker::disabled();
-        let db = ledger.as_graph_db_ref(0);
+        let db = ledger.as_graph_db_ref(GraphId(0));
         let batches = execute(
             db,
             &vars,
@@ -111,7 +112,7 @@ impl Fluree {
 
         let r2rml_provider = crate::r2rml_provider!(self);
         let tracker = crate::Tracker::disabled();
-        let db = ledger.as_graph_db_ref(0);
+        let db = ledger.as_graph_db_ref(GraphId(0));
         let batches = execute(
             db,
             &vars,

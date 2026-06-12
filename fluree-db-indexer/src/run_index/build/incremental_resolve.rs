@@ -11,6 +11,7 @@
 //! 2. Output records: `Vec<RunRecordV2>` + `Vec<u8>` (parallel ops)
 //! 3. `OTypeRegistry` built from root's `datatype_iris` + `language_tags`
 
+use fluree_db_core::GraphId;
 use std::collections::HashMap;
 use std::io;
 use std::path::Path;
@@ -168,9 +169,9 @@ pub struct IncrementalNovelty {
     /// Total retractions.
     pub delta_retracts: u64,
     /// Base vector arena counts per (g_id, p_id) for handle offsetting.
-    pub base_vector_counts: HashMap<(u16, u32), u32>,
+    pub base_vector_counts: HashMap<(GraphId, u32), u32>,
     /// Base numbig arena counts per (g_id, p_id).
-    pub base_numbig_counts: HashMap<(u16, u32), usize>,
+    pub base_numbig_counts: HashMap<(GraphId, u32), usize>,
     /// String text bytes for fulltext assertion entries.
     pub fulltext_string_bytes: HashMap<u32, Vec<u8>>,
 }
@@ -285,7 +286,7 @@ pub async fn resolve_incremental_commits_v6(
     let (base_numbig_counts, base_vector_counts, vector_manifests, t_seed_arenas_ms) = {
         let t0 = Instant::now();
 
-        let mut base_numbig_counts: HashMap<(u16, u32), usize> = HashMap::new();
+        let mut base_numbig_counts: HashMap<(GraphId, u32), usize> = HashMap::new();
         for ga in &root.graph_arenas {
             if ga.numbig.is_empty() {
                 continue;
@@ -309,9 +310,9 @@ pub async fn resolve_incremental_commits_v6(
             }
         }
 
-        let mut base_vector_counts: HashMap<(u16, u32), u32> = HashMap::new();
+        let mut base_vector_counts: HashMap<(GraphId, u32), u32> = HashMap::new();
         let mut vector_manifests: Vec<(
-            u16,
+            GraphId,
             u32,
             fluree_db_binary_index::arena::vector::VectorManifest,
         )> = Vec::new();
@@ -642,12 +643,12 @@ pub async fn resolve_incremental_commits_v6(
                 return true;
             }
             let base_count = base_vector_counts
-                .get(&(record.g_id, record.p_id))
+                .get(&(GraphId(record.g_id), record.p_id))
                 .copied()
                 .unwrap_or(0) as u64;
             let chunk_count = shared
                 .vectors
-                .get(&record.g_id)
+                .get(&GraphId(record.g_id))
                 .and_then(|m| m.get(&record.p_id))
                 .map(|a| a.len() as u64)
                 .unwrap_or(0);
@@ -804,7 +805,7 @@ async fn seed_vector_fact_handles(
     // Walk every graph that has vector arenas; for each, scan SPOT for
     // VECTOR_ID rows and decode (s_ns_code, s_name, p_id, o_i, value) →
     // handle into the shared fact map.
-    let graphs_with_vectors: Vec<u16> = shared.vectors.keys().copied().collect();
+    let graphs_with_vectors: Vec<GraphId> = shared.vectors.keys().copied().collect();
     for g_id in graphs_with_vectors {
         let branch = match store.branch_for_order(g_id, RunSortOrder::Spot) {
             Some(b) => Arc::clone(b),
@@ -826,7 +827,10 @@ async fn seed_vector_fact_handles(
             filter,
             projection,
         );
-        let fact_map = shared.vector_fact_handles.entry(g_id).or_default();
+        let fact_map = shared
+            .vector_fact_handles
+            .entry(GraphId(g_id.as_u16()))
+            .or_default();
         while let Some(batch) = cursor.next_batch()? {
             for i in 0..batch.row_count {
                 if batch.o_type.get_or(i, 0) != OType::VECTOR.as_u16() {
@@ -840,7 +844,7 @@ async fn seed_vector_fact_handles(
                     Ok(parts) => parts,
                     Err(e) => {
                         tracing::warn!(
-                            g_id,
+                            g_id = g_id.as_u16(),
                             s_id,
                             error = %e,
                             "vector fact-handle seed: subject decode failed; skipping row"
@@ -856,7 +860,7 @@ async fn seed_vector_fact_handles(
                     Some(slice) => slice.iter().map(|&x| x.to_bits()).collect(),
                     None => {
                         tracing::warn!(
-                            g_id,
+                            g_id = g_id.as_u16(),
                             p_id,
                             handle,
                             "vector fact-handle seed: arena handle out of range; skipping"

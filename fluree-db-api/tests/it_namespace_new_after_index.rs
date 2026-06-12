@@ -16,6 +16,7 @@
 mod support;
 
 use fluree_db_api::{FlureeBuilder, ReindexOptions};
+use fluree_db_core::GraphId;
 use fluree_db_ledger::TypeErasedStore;
 use serde_json::json;
 
@@ -93,7 +94,7 @@ async fn query_bound_iri_in_new_namespace_after_index_returns_row() {
     let rows = support::query_sparql(&fluree, &ledger2, sparql)
         .await
         .unwrap()
-        .to_jsonld_async(ledger2.as_graph_db_ref(0))
+        .to_jsonld_async(ledger2.as_graph_db_ref(GraphId(0)))
         .await
         .unwrap();
 
@@ -258,7 +259,7 @@ async fn reload_after_new_namespace_commit_resolves_correctly() {
     let result = support::query_jsonld(&fluree, &reloaded, &query)
         .await
         .unwrap()
-        .to_jsonld_async(reloaded.as_graph_db_ref(0))
+        .to_jsonld_async(reloaded.as_graph_db_ref(GraphId(0)))
         .await
         .unwrap();
 
@@ -326,7 +327,7 @@ async fn reload_file_storage_after_new_namespace_commit_resolves_correctly() {
     let result = support::query_jsonld(&fluree2, &reloaded, &query)
         .await
         .unwrap()
-        .to_jsonld_async(reloaded.as_graph_db_ref(0))
+        .to_jsonld_async(reloaded.as_graph_db_ref(GraphId(0)))
         .await
         .unwrap();
 

@@ -46,7 +46,7 @@ pub(crate) fn resolve_selector_g_id(
     graph_iri: &str,
 ) -> Result<Option<fluree_db_core::GraphId>, CrossLedgerError> {
     if graph_iri == fluree_vocab::config_iris::DEFAULT_GRAPH {
-        return Ok(Some(0u16));
+        return Ok(Some(fluree_db_core::GraphId(0)));
     }
     if graph_iri == fluree_vocab::config_iris::TXN_META_GRAPH {
         return Err(CrossLedgerError::ReservedGraphSelected {

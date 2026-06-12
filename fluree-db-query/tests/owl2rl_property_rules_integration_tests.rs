@@ -12,7 +12,7 @@ use fluree_db_core::flake::Flake;
 use fluree_db_core::overlay::OverlayProvider;
 use fluree_db_core::range::{range_with_overlay, RangeMatch, RangeOptions, RangeTest};
 use fluree_db_core::value::FlakeValue;
-use fluree_db_core::{GraphDbRef, LedgerSnapshot, Sid};
+use fluree_db_core::{GraphDbRef, GraphId, LedgerSnapshot, Sid};
 use fluree_db_query::binding::{Binding, RowAccess};
 use fluree_db_query::execute::{execute, ContextConfig, ExecutableQuery};
 use fluree_db_query::ir::ReasoningConfig;
@@ -258,7 +258,7 @@ async fn owl2rl_domain_range_and_chain_visible_via_execute_with_overlay() {
     // Sanity check: core range_with_overlay can see the schema axioms in overlay.
     let domain_flakes = range_with_overlay(
         &snapshot,
-        0,
+        GraphId(0),
         &overlay,
         IndexType::Psot,
         RangeTest::Eq,
@@ -304,7 +304,7 @@ async fn owl2rl_domain_range_and_chain_visible_via_execute_with_overlay() {
         parsed_a.clone(),
         ReasoningConfig::new().with_modes(ReasoningModes::default()),
     );
-    let source = GraphDbRef::new(&snapshot, 0, &overlay, 10);
+    let source = GraphDbRef::new(&snapshot, GraphId(0), &overlay, 10);
     let res_no = execute(source, &vars_a, &exec_no, ContextConfig::default())
         .await
         .unwrap();
@@ -319,14 +319,14 @@ async fn owl2rl_domain_range_and_chain_visible_via_execute_with_overlay() {
         parsed_a,
         ReasoningConfig::new().with_modes(ReasoningModes::default().with_owl2rl()),
     );
-    let source = GraphDbRef::new(&snapshot, 0, &overlay, 10);
+    let source = GraphDbRef::new(&snapshot, GraphId(0), &overlay, 10);
     let res_yes = execute(source, &vars_a, &exec_yes, ContextConfig::default())
         .await
         .unwrap();
 
     // Sanity check: reasoner itself produces derived facts from this overlay.
     let cache = ReasoningCache::with_default_capacity();
-    let db = GraphDbRef::new(&snapshot, 0, &overlay, 10);
+    let db = GraphDbRef::new(&snapshot, GraphId(0), &overlay, 10);
     let reasoner_res = reason_owl2rl(db, &ReasoningOptions::default(), &cache)
         .await
         .unwrap();
@@ -368,7 +368,7 @@ async fn owl2rl_domain_range_and_chain_visible_via_execute_with_overlay() {
         parsed_b,
         ReasoningConfig::new().with_modes(ReasoningModes::default().with_owl2rl()),
     );
-    let source = GraphDbRef::new(&snapshot, 0, &overlay, 10);
+    let source = GraphDbRef::new(&snapshot, GraphId(0), &overlay, 10);
     let res_chain = execute(source, &vars_b, &exec_chain, ContextConfig::default())
         .await
         .unwrap();

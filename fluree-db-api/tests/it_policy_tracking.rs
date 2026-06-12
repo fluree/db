@@ -9,6 +9,7 @@ use fluree_db_api::{
     CommitOpts, FlureeBuilder, IndexConfig, QueryConnectionOptions, TrackedTransactionInput,
     TxnOpts, TxnType,
 };
+use fluree_db_core::GraphId;
 use serde_json::json;
 use std::collections::HashMap;
 use support::{assert_index_defaults, genesis_ledger};
@@ -60,7 +61,7 @@ async fn transact_policy_denied_includes_policy_and_fuel_tracking() {
         Some(ledger.novelty.as_ref()),
         ledger.t(),
         &qc_opts,
-        &[0],
+        &[GraphId(0)],
     )
     .await
     .expect("build policy context");

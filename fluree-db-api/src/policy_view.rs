@@ -28,6 +28,7 @@
 use crate::dataset::QueryConnectionOptions;
 use crate::error::Result;
 use crate::policy_builder;
+use fluree_db_core::GraphId;
 use fluree_db_core::{LedgerSnapshot, OverlayProvider};
 use fluree_db_ledger::{HistoricalLedgerView, LedgerState};
 use fluree_db_novelty::Novelty;
@@ -279,7 +280,7 @@ async fn resolve_policy_graphs_from_config(
     let config = match crate::config_resolver::resolve_ledger_config(snapshot, overlay, to_t).await
     {
         Ok(Some(c)) => c,
-        Ok(None) => return Ok(vec![0]),
+        Ok(None) => return Ok(vec![GraphId(0)]),
         Err(e) => {
             return Err(crate::error::ApiError::config(format!(
                 "Failed to load ledger config while resolving f:policySource: {e}"

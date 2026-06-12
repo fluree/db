@@ -4,7 +4,7 @@
 //! `cargo test -p fluree-db-connection --test it_fixture_database_load -- --ignored --nocapture`
 
 use fluree_db_connection::{connect, ConnectionHandle, StorageType};
-use fluree_db_core::{ContentId, ContentKind, GraphDbRef, NoOverlay};
+use fluree_db_core::{ContentId, ContentKind, GraphDbRef, GraphId, NoOverlay};
 use fluree_db_query::{execute_pattern, Ref, RowAccess, Term, TriplePattern, VarRegistry};
 use serde_json::json;
 use std::path::{Path, PathBuf};
@@ -118,7 +118,7 @@ async fn loads_fixture_database_and_scans_triples() {
 
     let pattern = TriplePattern::new(Ref::Var(s), Ref::Var(p), Term::Var(o));
     let no_overlay = NoOverlay;
-    let db_ref = GraphDbRef::new(&db, 0, &no_overlay, db.t);
+    let db_ref = GraphDbRef::new(&db, GraphId(0), &no_overlay, db.t);
     let batches = execute_pattern(db_ref, &vars, pattern).await.unwrap();
 
     assert!(!batches.is_empty(), "Should have at least one batch");

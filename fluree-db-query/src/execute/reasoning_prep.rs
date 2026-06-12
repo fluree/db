@@ -47,7 +47,7 @@ pub async fn schema_hierarchy_with_overlay(
     let mut subproperty_of: HashMap<fluree_db_core::Sid, Vec<fluree_db_core::Sid>> = HashMap::new();
 
     // Scan the full default-graph state (indexed + unindexed commits + overlay).
-    let db = GraphDbRef::new(snapshot, 0, overlay, to_t);
+    let db = GraphDbRef::new(snapshot, GraphId(0), overlay, to_t);
 
     for flake in db
         .range(
@@ -210,7 +210,7 @@ pub async fn compute_derived_facts(
                 );
                 // Collect flakes from the OWL2-RL overlay
                 result.overlay.for_each_overlay_flake(
-                    0, // derived facts are default-graph only
+                    GraphId(0), // derived facts are default-graph only
                     fluree_db_core::IndexType::Spot,
                     None,
                     None,
