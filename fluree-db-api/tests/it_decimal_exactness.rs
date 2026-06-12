@@ -228,6 +228,58 @@ async fn jsonld_number_decimal_matches_sparql_constant_across_paths() {
 }
 
 #[tokio::test]
+async fn trig_graph_block_decimal_matches_default_graph_decimal() {
+    // A bare decimal literal inside a GRAPH block must parse exactly as
+    // xsd:decimal — the same as in the default graph — not via f64 as
+    // xsd:double.
+    let fluree = memory_fluree();
+    let ledger = genesis_ledger(&fluree, "decimal/trig:main");
+
+    let trig = r#"
+        @prefix ex: <http://example.org/> .
+
+        ex:default ex:price 19.99 .
+
+        GRAPH <http://example.org/g> {
+            ex:named ex:price 19.99 .
+        }
+    "#;
+    let result = fluree
+        .stage_owned(ledger)
+        .upsert_turtle(trig)
+        .execute()
+        .await
+        .expect("upsert trig");
+    let ledger = result.ledger;
+
+    // Default graph value is exact.
+    let query = r#"
+        PREFIX ex: <http://example.org/>
+        SELECT ?price WHERE { ex:default ex:price ?price . }
+    "#;
+    let result = support::query_sparql(&fluree, &ledger, query)
+        .await
+        .expect("query default");
+    let sparql_json = result
+        .to_sparql_json(&ledger.snapshot)
+        .expect("to_sparql_json");
+    assert_eq!(binding_values(&sparql_json, "price"), vec!["19.99"]);
+
+    // Named-graph value is exact and the same value.
+    let query = r#"
+        PREFIX ex: <http://example.org/>
+        SELECT ?price WHERE { GRAPH <http://example.org/g> { ex:named ex:price ?price . } }
+    "#;
+    let result = support::query_sparql(&fluree, &ledger, query)
+        .await
+        .expect("query named graph");
+    let sparql_json = result
+        .to_sparql_json(&ledger.snapshot)
+        .expect("to_sparql_json");
+    assert_eq!(binding_values(&sparql_json, "price"), vec!["19.99"]);
+}
+
+#[tokio::test]
 async fn sparql_delete_data_decimal_retracts_exactly() {
     let fluree = memory_fluree();
     let ledger = genesis_ledger(&fluree, "decimal/delete:main");
