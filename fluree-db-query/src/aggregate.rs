@@ -316,6 +316,9 @@ fn apply_aggregate(
             | AggregateFn::Stddev { .. }
             | AggregateFn::Min(_)
             | AggregateFn::Max(_)
+            // COUNT(DISTINCT) dedups structurally; mixed-representation
+            // Grouped values (scan ∪ VALUES/BIND) would overcount.
+            | AggregateFn::CountDistinct(_)
     );
     if needs_decoded_values && gv.is_some() {
         if let Binding::Grouped(values) = binding {
