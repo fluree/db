@@ -32,11 +32,13 @@ pub use local::LocalCommitter;
 #[cfg(feature = "raft")]
 pub use raft::{ClusterNode, Command, NodeId, RaftCommitter, Response, TypeConfig};
 
-/// Re-export of `openraft::Raft` so consumers of `fluree-db-server`
-/// (and similar embedders) can construct the integration without a
-/// direct openraft dependency.
+/// Re-exports from openraft so embedders can construct a
+/// [`Raft<TypeConfig>`] handle without taking a direct openraft
+/// dependency.
 #[cfg(feature = "raft")]
-pub use openraft::Raft;
+pub use openraft::error::Fatal as RaftFatal;
+#[cfg(feature = "raft")]
+pub use openraft::{Config as RaftConfig, ConfigError as RaftConfigError, Raft};
 
 use async_trait::async_trait;
 use fluree_db_api::{
