@@ -672,6 +672,65 @@ async fn group_by_and_distinct_unify_decimals_across_index_and_novelty() {
 }
 
 #[tokio::test]
+async fn named_graph_decimal_decodes_against_its_own_arena() {
+    // NumBig arenas are per (graph, predicate): the default graph's 19.99
+    // and the named graph's 42.42 both occupy handle 0 of their own arena.
+    // A value projected out of a GRAPH scope must decode against ITS graph's
+    // arena — decoding against the outer graph would return 19.99 for the
+    // named-graph row.
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(fluree_db_api::LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "decimal/graph-arena:main";
+
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        Arc::new(fluree.nameservice_mode().clone()),
+        fluree_db_indexer::IndexerConfig::small(),
+    );
+
+    local
+        .run_until(async move {
+            let ledger = genesis_ledger(&fluree, ledger_id);
+
+            let trig = r"
+                @prefix ex: <http://example.org/> .
+
+                ex:default ex:price 19.99 .
+
+                GRAPH <http://example.org/g> {
+                    ex:named ex:price 42.42 .
+                }
+            ";
+            let result = fluree
+                .stage_owned(ledger)
+                .upsert_turtle(trig)
+                .execute()
+                .await
+                .expect("upsert trig");
+            trigger_index_and_wait(&handle, ledger_id, result.receipt.t).await;
+            let ledger = fluree.ledger(ledger_id).await.expect("load ledger");
+
+            let query = r"
+                PREFIX ex: <http://example.org/>
+                SELECT ?price WHERE { GRAPH <http://example.org/g> { ex:named ex:price ?price } }
+            ";
+            let result = support::query_sparql(&fluree, &ledger, query)
+                .await
+                .expect("graph query");
+            let sparql_json = result
+                .to_sparql_json(&ledger.snapshot)
+                .expect("to_sparql_json");
+            assert_eq!(
+                binding_values(&sparql_json, "price"),
+                vec!["42.42"],
+                "named-graph decimal must decode against its own arena, not the default graph's"
+            );
+        })
+        .await;
+}
+
+#[tokio::test]
 async fn sparql_delete_data_decimal_retracts_exactly() {
     let fluree = memory_fluree();
     let ledger = genesis_ledger(&fluree, "decimal/delete:main");
