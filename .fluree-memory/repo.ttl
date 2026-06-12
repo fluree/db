@@ -1888,3 +1888,20 @@ mem:fact-01ktcfdrpyfq8btp10mf75cmp5 a mem:Fact ;
     mem:branch "refactor/column-caching" ;
     mem:createdAt "2026-06-05T18:06:17.310296+00:00"^^xsd:dateTime ;
     mem:rationale "Candidate 3 lever is scatter/sort assembly, not join grouping or DISTINCT which are already optimized." .
+
+mem:fact-01ktwjrjrvj60k0v0q7gstwknz a mem:Fact ;
+    mem:content "Differential fast-path harness (Phase 0.7) found 3 reproducible fast≠generic divergences on first run (2026-06-11), pinned as known_divergence markers: FD-1 AVG fast path emits f64 JSON number vs generic's xsd:decimal string; FD-2 MIN/MAX-string fast path returns WRONG answers on reindex-built ledgers (treats string-ID order as lexicographic; lex_sorted_string_ids only holds after bulk import — suspect missing gate in fast_min_max_string); FD-3 StatsCountByPredicateOperator counts duplicate re-asserts, applies novelty deltas inconsistently per predicate, and drops rdf:type in pure novelty. Cross-condition axis (generic: base≡overlay≡novelty) passed all 16 cases. Kill switch: set_fast_paths_disabled / FLUREE_DISABLE_QUERY_FAST_PATHS." ;
+    mem:tag "audit" ;
+    mem:tag "bug" ;
+    mem:tag "correctness" ;
+    mem:tag "differential-harness" ;
+    mem:tag "fast-path" ;
+    mem:tag "min-max" ;
+    mem:tag "stats" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/tests/it_differential_fastpath.rs" ;
+    mem:artifactRef "fluree-db-query/src/fast_min_max_string.rs" ;
+    mem:artifactRef "fluree-db-query/src/fast_predicate_scalar_agg.rs" ;
+    mem:branch "test/phase0-differential-harness" ;
+    mem:createdAt "2026-06-12T00:12:28.315996+00:00"^^xsd:dateTime ;
+    mem:rationale "FD-2 and FD-3 are user-visible wrong answers — high-priority fixes. Remove a case's known_divergence marker when its fix lands so the harness enforces it." .
