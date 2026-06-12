@@ -2,10 +2,16 @@
 //!
 //! These aggregates can be answered by exploiting permutation order and metadata
 //! to avoid scanning all rows. For Fluree's V3 index, we do this as follows:
-//! - for homogeneous numeric predicates, use each POST leaflet's first/last key as the
-//!   MIN/MAX candidate
-//! - for homogeneous string-dict predicates, use each leaflet's first/last key as the
-//!   MIN/MAX candidate and compare string dictionary values lexicographically
+//! - for numeric predicates, use each POST leaflet's first/last key as the
+//!   MIN/MAX candidate (numeric `o_key` encodings are order-preserving)
+//! - for string-dict predicates on lex-sorted indexes (`lex_sorted_string_ids`,
+//!   i.e. bulk imports), reduce leaflet boundary keys across all datatype/language
+//!   groups by raw `(str_id, dt_id, lang_id)` — the same order the fallback
+//!   aggregate applies to `EncodedLit` bindings
+//!
+//! Boundary keys are only a leaflet's extreme within its own `o_type` when the
+//! leaflet is `o_type`-homogeneous; the few leaflets containing an `o_type`
+//! region edge are column-scanned so an extreme hidden mid-leaflet is not missed.
 //!
 //! This reduces work from O(rows) decode/materialization to O(leaflets) — only leaflet
 //! directory keys are read. The row-scanning aggregates (`SUM`/`AVG`/`COUNT(DISTINCT)`)
@@ -20,9 +26,10 @@ use crate::fast_path_common::{
 use crate::ir::triple::Ref;
 use crate::operator::BoxedOperator;
 use crate::var_registry::VarId;
+use fluree_db_binary_index::format::column_block::ColumnId;
 use fluree_db_binary_index::format::run_record::RunSortOrder;
 use fluree_db_binary_index::format::run_record_v2::read_ordered_key_v2;
-use fluree_db_binary_index::BinaryIndexStore;
+use fluree_db_binary_index::{BinaryIndexStore, ColumnProjection, ColumnSet};
 use fluree_db_core::ids::DatatypeDictId;
 use fluree_db_core::o_type::{DecodeKind, OType};
 use fluree_db_core::value_id::{ObjKey, ObjKind};
@@ -78,9 +85,12 @@ pub fn predicate_min_max_string_operator(
     )
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Candidate identity, ordered to match the fallback aggregate's `EncodedLit`
+/// comparison: `(o_key, dt_id, lang_id)`. On lex-sorted indexes (the only place
+/// the string path runs) `str_id` order equals UTF-8 byte order of the values.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 struct EncodedStringIdentity {
-    /// String dictionary ID (NOT lexicographically ordered).
+    /// String dictionary ID.
     str_id: u32,
     /// Datatype identity for ordering/equality (xsd:string vs rdf:langString vs fulltext).
     dt_id: u16,
@@ -125,16 +135,29 @@ fn encoded_lit_from_otype(
     Some((ident, b))
 }
 
-/// Compute MIN/MAX candidate for a predicate by scanning POST leaflets and considering
-/// only directory keys (first/last key per leaflet).
+/// Compute MIN/MAX candidate for a string-dict predicate from POST leaflet metadata.
 ///
-/// Returns `None` when leaflets contain non-string objects (to avoid semantic surprises).
+/// Sound only when string dictionary IDs are lexicographically assigned
+/// (`lex_sorted_string_ids`): a homogeneous leaflet's boundary key is then its
+/// lexicographic extreme, and raw [`EncodedStringIdentity`] comparison across
+/// datatype/language groups matches the fallback aggregate's ordering. Without
+/// that property the true extreme can sit mid-leaflet where directory keys never
+/// surface it, so we decline.
+///
+/// `o_type`-heterogeneous leaflets (a datatype/language region edge falls inside —
+/// at most one leaflet per region) are column-scanned; every row is a valid
+/// candidate, so no per-region bookkeeping is needed.
+///
+/// Returns `None` when any object is not string-dict-backed.
 fn minmax_string_dict_post(
     store: &BinaryIndexStore,
     g_id: GraphId,
     p_id: u32,
     mode: MinMaxMode,
 ) -> Result<Option<Binding>> {
+    if !store.lex_sorted_string_ids() {
+        return Ok(None);
+    }
     let leaves = leaf_entries_for_predicate(store, g_id, RunSortOrder::Post, p_id);
 
     let mut best: Option<(EncodedStringIdentity, Binding)> = None;
@@ -145,36 +168,27 @@ fn minmax_string_dict_post(
             .map_err(|e| QueryError::Internal(format!("leaf open: {e}")))?;
         let dir = handle.dir();
 
-        for entry in &dir.entries {
+        for (leaflet_idx, entry) in dir.entries.iter().enumerate() {
             if entry.row_count == 0 || entry.p_const != Some(p_id) {
                 continue;
             }
-            let rr = match mode {
-                MinMaxMode::Min => read_ordered_key_v2(RunSortOrder::Post, &entry.first_key),
-                MinMaxMode::Max => read_ordered_key_v2(RunSortOrder::Post, &entry.last_key),
-            };
-            let Some(candidate) = encoded_lit_from_otype(rr.o_type, rr.o_key, p_id) else {
-                return Ok(None);
-            };
-
-            match &best {
-                None => best = Some(candidate),
-                Some((best_id, _)) => {
-                    // We can compare lexicographically without materialization *only*
-                    // when both candidates share the same datatype+lang identity.
-                    if candidate.0.dt_id != best_id.dt_id || candidate.0.lang_id != best_id.lang_id
-                    {
+            if entry.o_type_const.is_some() {
+                let rr = match mode {
+                    MinMaxMode::Min => read_ordered_key_v2(RunSortOrder::Post, &entry.first_key),
+                    MinMaxMode::Max => read_ordered_key_v2(RunSortOrder::Post, &entry.last_key),
+                };
+                if !consider_string_candidate(&mut best, rr.o_type, rr.o_key, p_id, mode) {
+                    return Ok(None);
+                }
+            } else {
+                let batch = handle
+                    .load_columns(leaflet_idx, &projection_otype_okey(), RunSortOrder::Post)
+                    .map_err(|e| QueryError::Internal(format!("load columns: {e}")))?;
+                for row in 0..batch.row_count {
+                    let o_type = batch.o_type.get_or(row, 0);
+                    let o_key = batch.o_key.get(row);
+                    if !consider_string_candidate(&mut best, o_type, o_key, p_id, mode) {
                         return Ok(None);
-                    }
-                    let ord = store
-                        .compare_string_lex(candidate.0.str_id, best_id.str_id)
-                        .map_err(|e| QueryError::Internal(format!("compare string lex: {e}")))?;
-                    let better = match mode {
-                        MinMaxMode::Min => ord.is_lt(),
-                        MinMaxMode::Max => ord.is_gt(),
-                    };
-                    if better {
-                        best = Some(candidate);
                     }
                 }
             }
@@ -182,6 +196,45 @@ fn minmax_string_dict_post(
     }
 
     Ok(best.map(|(_, b)| b))
+}
+
+/// Fold one `(o_type, o_key)` candidate into `best`.
+///
+/// Returns `false` for non-string-dict objects: the caller must decline the
+/// fast path and defer to the planned pipeline.
+fn consider_string_candidate(
+    best: &mut Option<(EncodedStringIdentity, Binding)>,
+    o_type: u16,
+    o_key: u64,
+    p_id: u32,
+    mode: MinMaxMode,
+) -> bool {
+    let Some(candidate) = encoded_lit_from_otype(o_type, o_key, p_id) else {
+        return false;
+    };
+    match best {
+        None => *best = Some(candidate),
+        Some((best_id, _)) => {
+            let better = match mode {
+                MinMaxMode::Min => candidate.0 < *best_id,
+                MinMaxMode::Max => candidate.0 > *best_id,
+            };
+            if better {
+                *best = Some(candidate);
+            }
+        }
+    }
+    true
+}
+
+fn projection_otype_okey() -> ColumnProjection {
+    let mut internal = ColumnSet::EMPTY;
+    internal.insert(ColumnId::OType);
+    internal.insert(ColumnId::OKey);
+    ColumnProjection {
+        output: ColumnSet::EMPTY,
+        internal,
+    }
 }
 
 fn minmax_numeric_post(
@@ -202,6 +255,12 @@ fn minmax_numeric_post(
         for entry in &dir.entries {
             if entry.row_count == 0 || entry.p_const != Some(p_id) {
                 continue;
+            }
+            // A heterogeneous leaflet can hide another o_type's extreme
+            // mid-leaflet where boundary keys never surface it; the numeric
+            // path only supports a single o_type anyway, so decline.
+            if entry.o_type_const.is_none() {
+                return Ok(None);
             }
             let rr = match mode {
                 MinMaxMode::Min => read_ordered_key_v2(RunSortOrder::Post, &entry.first_key),

@@ -1195,9 +1195,10 @@ impl BinaryIndexStore {
         ))
     }
 
-    /// Compare two string dictionary IDs by lexicographic string value without allocating.
+    /// Compare two string dictionary IDs by lexicographic string value.
     ///
-    /// Useful for MIN/MAX over `Binding::EncodedLit` values of string-like kinds.
+    /// Use when value order is needed but raw ID order can't stand in for it —
+    /// i.e. on indexes without `lex_sorted_string_ids`.
     pub fn compare_string_lex(&self, a: u32, b: u32) -> io::Result<Ordering> {
         if a == b {
             return Ok(Ordering::Equal);
