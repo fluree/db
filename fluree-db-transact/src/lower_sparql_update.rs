@@ -750,9 +750,9 @@ fn literal_to_unresolved(
             ))),
         }),
         SparqlLiteralValue::Decimal(s) => {
-            // Try to parse as f64; on failure, keep as string with datatype
-            let term = match s.parse::<f64>() {
-                Ok(d) => UnresolvedTerm::Literal(LiteralValue::Double(d)),
+            // Parse exactly; on failure, keep as string with datatype
+            let term = match s.parse::<bigdecimal::BigDecimal>() {
+                Ok(d) => UnresolvedTerm::Literal(LiteralValue::Decimal(Box::new(d))),
                 Err(_) => UnresolvedTerm::Literal(LiteralValue::String(Arc::from(s.as_ref()))),
             };
             Ok(UnresolvedTermWithMeta {
@@ -890,9 +890,9 @@ fn literal_to_template(
             dtc: Some(DatatypeConstraint::Explicit(ns.sid_for_iri(xsd::DOUBLE))),
         }),
         SparqlLiteralValue::Decimal(s) => {
-            // Try to parse as f64; on failure, keep as string with datatype
-            let term = match s.parse::<f64>() {
-                Ok(d) => TemplateTerm::Value(FlakeValue::Double(d)),
+            // Parse exactly; on failure, keep as string with datatype
+            let term = match s.parse::<bigdecimal::BigDecimal>() {
+                Ok(d) => TemplateTerm::Value(FlakeValue::Decimal(Box::new(d))),
                 Err(_) => TemplateTerm::Value(FlakeValue::String(s.to_string())),
             };
             Ok(LiteralResult {
@@ -944,9 +944,14 @@ fn coerce_typed_value(lexical: &str, datatype_iri: &str) -> UnresolvedTerm {
                 return UnresolvedTerm::Literal(LiteralValue::Long(i));
             }
         }
-        xsd::DOUBLE | xsd::DECIMAL => {
+        xsd::DOUBLE => {
             if let Ok(d) = lexical.parse::<f64>() {
                 return UnresolvedTerm::Literal(LiteralValue::Double(d));
+            }
+        }
+        xsd::DECIMAL => {
+            if let Ok(d) = lexical.parse::<bigdecimal::BigDecimal>() {
+                return UnresolvedTerm::Literal(LiteralValue::Decimal(Box::new(d)));
             }
         }
         xsd::BOOLEAN => {
@@ -982,9 +987,14 @@ fn coerce_typed_flake_value(lexical: &str, datatype_iri: &str) -> FlakeValue {
                 return FlakeValue::Long(i);
             }
         }
-        xsd::DOUBLE | xsd::DECIMAL => {
+        xsd::DOUBLE => {
             if let Ok(d) = lexical.parse::<f64>() {
                 return FlakeValue::Double(d);
+            }
+        }
+        xsd::DECIMAL => {
+            if let Ok(d) = lexical.parse::<bigdecimal::BigDecimal>() {
+                return FlakeValue::Decimal(Box::new(d));
             }
         }
         xsd::BOOLEAN => {
