@@ -11,9 +11,9 @@ use crate::error::{QueryError, Result};
 use crate::fast_path_common::{
     allow_cursor_fast_path, build_count_batch, count_predicate_overlay_delta,
     count_rows_for_predicate_psot, count_to_i64, fast_path_store, leaf_entries_for_predicate,
-    normalize_pred_sid, parallel_leaf_chunk_count, parallel_overlay_psot_filter_count,
-    projection_okey_only, projection_otype_only, projection_sid_only, projection_sid_otype_okey,
-    FastPathOperator,
+    normalize_pred_sid, parallel_leaf_chunk_count, parallel_leaf_chunk_reduce,
+    parallel_overlay_psot_filter_count, projection_okey_only, projection_otype_only,
+    projection_sid_only, projection_sid_otype_okey, FastPathOperator,
 };
 use crate::ir::triple::{Ref, TriplePattern};
 use crate::operator::inline::InlineOperator;
@@ -1001,10 +1001,24 @@ fn distinct_predicates_from_graph_stats(ctx: &ExecutionContext<'_>) -> Option<u6
     Some(g.properties.iter().filter(|p| p.count > 0).count() as u64)
 }
 
+/// Per-chunk partial for the distinct-lead count: groups counted within the
+/// chunk (internal leaflet seams already deduplicated) plus the lead key
+/// prefixes of the chunk's first and last non-empty leaflets, so adjacent
+/// chunks can dedup a lead group spanning their seam. Empty leads ⇔ the chunk
+/// had no non-empty leaflets (identity for the combine).
+struct LeadGroupPartial {
+    count: u64,
+    first_lead: Vec<u8>,
+    last_lead: Vec<u8>,
+}
+
 /// Count distinct lead groups across all leaflets in a given sort order.
 ///
 /// Uses `lead_group_count` from leaflet directory entries, deduplicating groups
-/// that span leaflet boundaries by comparing lead key prefixes.
+/// that span leaflet boundaries by comparing lead key prefixes. Reads only leaf
+/// directories (no column payload) and parallelizes over contiguous leaf chunks
+/// via [`parallel_leaf_chunk_reduce`], stitching chunk seams exactly like the
+/// internal leaflet seams.
 ///
 /// `lead_len` is the number of leading key bytes that define the grouping:
 /// - SPOT distinct subjects: 8 bytes (s_id)
@@ -1019,36 +1033,64 @@ fn count_distinct_lead_groups(
         return Ok(0);
     };
 
-    let mut prev_lead_last: Vec<u8> = Vec::new();
-    let mut total: u64 = 0;
+    let map = |chunk: &[LeafEntry]| -> Result<Option<LeadGroupPartial>> {
+        let mut partial = LeadGroupPartial {
+            count: 0,
+            first_lead: Vec::new(),
+            last_lead: Vec::new(),
+        };
+        for leaf_entry in chunk {
+            let dir = store
+                .open_leaf_dir(&leaf_entry.leaf_cid)
+                .map_err(|e| QueryError::Internal(format!("leaf dir open: {e}")))?;
 
-    for leaf_entry in &branch.leaves {
-        let dir = store
-            .open_leaf_dir(&leaf_entry.leaf_cid)
-            .map_err(|e| QueryError::Internal(format!("leaf dir open: {e}")))?;
+            for entry in &dir.entries {
+                if entry.row_count == 0 || entry.lead_group_count == 0 {
+                    continue;
+                }
 
-        for entry in &dir.entries {
-            if entry.row_count == 0 || entry.lead_group_count == 0 {
-                continue;
+                let lead_first = entry.first_key.get(..lead_len).ok_or_else(|| {
+                    QueryError::execution("leaflet key shorter than expected lead_len")
+                })?;
+                let lead_last = entry.last_key.get(..lead_len).ok_or_else(|| {
+                    QueryError::execution("leaflet key shorter than expected lead_len")
+                })?;
+
+                partial.count += u64::from(entry.lead_group_count);
+                if !partial.last_lead.is_empty() && partial.last_lead == lead_first {
+                    partial.count = partial.count.saturating_sub(1);
+                }
+                if partial.first_lead.is_empty() {
+                    partial.first_lead.extend_from_slice(lead_first);
+                }
+                partial.last_lead.clear();
+                partial.last_lead.extend_from_slice(lead_last);
             }
-
-            let lead_first = entry.first_key.get(..lead_len).ok_or_else(|| {
-                QueryError::execution("leaflet key shorter than expected lead_len")
-            })?;
-            let lead_last = entry.last_key.get(..lead_len).ok_or_else(|| {
-                QueryError::execution("leaflet key shorter than expected lead_len")
-            })?;
-
-            total += u64::from(entry.lead_group_count);
-            if !prev_lead_last.is_empty() && prev_lead_last == lead_first {
-                total = total.saturating_sub(1);
-            }
-            prev_lead_last.clear();
-            prev_lead_last.extend_from_slice(lead_last);
         }
-    }
+        Ok(Some(partial))
+    };
 
-    Ok(total)
+    let combine = |left: LeadGroupPartial, right: LeadGroupPartial| -> LeadGroupPartial {
+        if right.first_lead.is_empty() {
+            return left;
+        }
+        if left.first_lead.is_empty() {
+            return right;
+        }
+        let seam_dedup = u64::from(left.last_lead == right.first_lead);
+        LeadGroupPartial {
+            count: left
+                .count
+                .saturating_add(right.count)
+                .saturating_sub(seam_dedup),
+            first_lead: left.first_lead,
+            last_lead: right.last_lead,
+        }
+    };
+
+    let parallel = branch.leaves.len() >= crate::fast_path_common::parallel_dir_walk_min_leaves();
+    let result = parallel_leaf_chunk_reduce(&branch.leaves, parallel, map, combine)?;
+    Ok(result.map_or(0, |p| p.count))
 }
 
 /// Distinct predicates uses p_const metadata rather than lead_group_count,
