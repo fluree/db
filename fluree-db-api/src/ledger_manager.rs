@@ -20,7 +20,7 @@
 //! - Manager lock is released during I/O (no blocking other ledgers)
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -131,6 +131,15 @@ struct LedgerHandleInner {
     /// Always coherent with `state.snapshot.range_provider` — writers hold
     /// the `state` lock while updating this.
     binary_store: RwLock<Option<Arc<BinaryIndexStore>>>,
+    /// Read-side tiered-compaction trigger (tier width). When a query snapshot is
+    /// taken, if any graph has a full size class (>= this many same-class
+    /// segments) novelty is tier-compacted first — bounded incremental merges
+    /// that cap read fan-out without a full rewrite. `0`/`1` disables. Policy:
+    /// query nodes and long-lived servers keep the default; an insert-only
+    /// transactor (which never takes a query snapshot) is unaffected; a
+    /// latency-sensitive transactor can disable it. Never fires on the commit
+    /// path (commits use `LedgerWriteGuard`, not `snapshot`).
+    tier_width: AtomicUsize,
 }
 
 impl LedgerHandle {
@@ -146,7 +155,56 @@ impl LedgerHandle {
                 ledger_id,
                 last_access: AtomicU64::new(monotonic_secs()),
                 binary_store: RwLock::new(binary_store),
+                tier_width: AtomicUsize::new(fluree_db_novelty::DEFAULT_TIER_WIDTH),
             }),
+        }
+    }
+
+    /// Set the read-side tier width (`0`/`1` disables read-triggered compaction).
+    /// Policy hook: long-lived servers / query nodes keep the default; an
+    /// insert-only or latency-sensitive transactor can disable it.
+    pub fn set_tier_width(&self, tier_width: usize) {
+        self.inner.tier_width.store(tier_width, Ordering::Relaxed);
+    }
+
+    /// Read-side tiered-compaction trigger. If any graph has a full size class,
+    /// run bounded incremental merges (under the write lock) before serving so
+    /// this and subsequent reads avoid segment fan-out — no full rewrite, no
+    /// growing cliff. Idempotent and amortized over the request. Common case (no
+    /// full class) only pays a brief shared read-lock check. Never invoked on the
+    /// insert-only write path.
+    async fn compact_if_needed(&self) {
+        let tier_width = self.inner.tier_width.load(Ordering::Relaxed);
+        if tier_width < 2 {
+            return;
+        }
+        // Cheap shared-lock check first; escalate to the write lock only when
+        // there is real work, so the steady state never serializes queries.
+        let needs = {
+            self.inner
+                .state
+                .read()
+                .await
+                .novelty
+                .needs_tier_compaction(tier_width)
+        };
+        if !needs {
+            return;
+        }
+        let mut state = self.inner.state.write().await;
+        // Re-check: another query may have compacted between the locks.
+        if state.novelty.needs_tier_compaction(tier_width) {
+            let pre = state.novelty.max_segment_count();
+            let started = Instant::now();
+            let merges = Arc::make_mut(&mut state.novelty).tier_compact(tier_width);
+            tracing::debug!(
+                merges,
+                pre_max_segments = pre,
+                post_max_segments = state.novelty.max_segment_count(),
+                tier_width,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "novelty read-triggered tier compaction"
+            );
         }
     }
 
@@ -164,6 +222,8 @@ impl LedgerHandle {
     /// The snapshot is a cheap clone; the lock is released immediately after.
     pub async fn snapshot(&self) -> LedgerView {
         self.touch();
+        // Read-side compaction trigger (policy: query/maintenance path only).
+        self.compact_if_needed().await;
         let state = self.inner.state.read().await;
         let binary_store = self.inner.binary_store.read().await.clone();
         let mut snap = LedgerView::from_state(&state);
@@ -675,9 +735,7 @@ pub(crate) async fn load_and_attach_binary_store(
         fluree_db_binary_index::dict_novelty_safe::populate_dict_novelty_safe(
             dn,
             Some(&store),
-            novelty
-                .iter_index(fluree_db_core::IndexType::Post)
-                .map(|id| novelty.get_flake(id)),
+            novelty.iter_flakes(fluree_db_core::IndexType::Post),
         )
         .map_err(|e| ApiError::internal(format!("populate_dict_novelty_safe: {e}")))?;
     }
@@ -1654,6 +1712,25 @@ impl LedgerManager {
                         self.reload(&input.ledger_id).await?;
                         return Ok(NotifyResult::Reloaded);
                     }
+                    // Detach the range provider before the commit loop. A
+                    // BinaryRangeProvider owns Arc clones of dict_novelty /
+                    // runtime_small_dicts; while attached, each `apply_single_commit`'s
+                    // `Arc::make_mut` on those dicts sees strong_count >= 2 and
+                    // deep-clones the (growing) dictionaries every commit — the
+                    // O(accumulated-novelty) cost that returns right after the first
+                    // reindex. Capture its store first so we can rebuild the provider
+                    // with the updated dicts afterward.
+                    let provider_store = write_guard
+                        .state()
+                        .snapshot
+                        .range_provider
+                        .as_ref()
+                        .and_then(|rp| rp.as_any().downcast_ref::<BinaryRangeProvider>())
+                        .map(|brp| Arc::clone(brp.store()));
+                    if provider_store.is_some() {
+                        Arc::make_mut(&mut write_guard.state_mut().snapshot).range_provider = None;
+                    }
+
                     for commit in commits {
                         write_guard
                             .state_mut()
@@ -1661,26 +1738,23 @@ impl LedgerManager {
                             .map_err(|e| ApiError::internal(format!("apply commit: {e}")))?;
                     }
 
-                    // If a binary range provider is attached, refresh it to point at the
-                    // updated DictNovelty. `apply_single_commit` replaces `state.dict_novelty`
-                    // with a new Arc; without re-attaching here, the provider holds a stale
-                    // Arc and overlay translation will fail for novelty-only strings/subjects.
-                    if let Some(rp) = write_guard.state().snapshot.range_provider.as_ref() {
-                        if let Some(brp) = rp.as_any().downcast_ref::<BinaryRangeProvider>() {
-                            let store = Arc::clone(brp.store());
-                            let dn = Arc::clone(&write_guard.state().dict_novelty);
-                            let runtime_small_dicts =
-                                Arc::clone(&write_guard.state().runtime_small_dicts);
-                            let ns_fallback =
-                                Some(write_guard.state().snapshot.shared_namespaces());
-                            Arc::make_mut(&mut write_guard.state_mut().snapshot).range_provider =
-                                Some(Arc::new(BinaryRangeProvider::new(
-                                    store,
-                                    dn,
-                                    runtime_small_dicts,
-                                    ns_fallback,
-                                )));
-                        }
+                    // Rebuild + reattach the provider pointing at the updated
+                    // DictNovelty / runtime dicts so overlay translation resolves
+                    // novelty-only strings/subjects introduced by these commits.
+                    // (`apply_single_commit` mutates the dicts in place now that the
+                    // provider no longer pins them.)
+                    if let Some(store) = provider_store {
+                        let dn = Arc::clone(&write_guard.state().dict_novelty);
+                        let runtime_small_dicts =
+                            Arc::clone(&write_guard.state().runtime_small_dicts);
+                        let ns_fallback = Some(write_guard.state().snapshot.shared_namespaces());
+                        Arc::make_mut(&mut write_guard.state_mut().snapshot).range_provider =
+                            Some(Arc::new(BinaryRangeProvider::new(
+                                store,
+                                dn,
+                                runtime_small_dicts,
+                                ns_fallback,
+                            )));
                     }
                 }
 
@@ -1780,6 +1854,118 @@ mod tests {
         assert_eq!(NotifyResult::NotLoaded, NotifyResult::NotLoaded);
         assert_eq!(NotifyResult::Current, NotifyResult::Current);
         assert_eq!(NotifyResult::Reloaded, NotifyResult::Reloaded);
+    }
+
+    /// The read-side tiered-compaction trigger: a long-lived handle accumulates
+    /// one segment per incremental commit; taking a query `snapshot()` runs
+    /// tiered compaction, keeping segment count ~logarithmic (not linear in
+    /// commits) without losing any flake. Commit-only activity (no snapshot)
+    /// would let it grow unbounded; the trigger lives only on the snapshot path.
+    #[tokio::test]
+    async fn snapshot_triggers_tier_compaction() {
+        use fluree_db_core::{Flake, FlakeValue, LedgerSnapshot, Sid};
+        use fluree_db_ledger::LedgerState;
+        use fluree_db_novelty::Novelty;
+
+        fn mk(s: u16, t: i64) -> Flake {
+            Flake::new(
+                Sid::new(s, format!("s{s}")),
+                Sid::new(1, "p"),
+                FlakeValue::Long(i64::from(s)),
+                Sid::new(2, "long"),
+                t,
+                true,
+                None,
+            )
+        }
+
+        let state = LedgerState::new(
+            LedgerSnapshot::genesis("test/compact:main"),
+            Novelty::new(0),
+        );
+        let handle = LedgerHandle::new("test/compact:main".to_string(), state, None);
+        let tier_width = 4;
+        handle.set_tier_width(tier_width);
+        let rg = std::collections::HashMap::new();
+
+        let commits = 50u16;
+        for i in 0..commits {
+            {
+                let mut g = handle.lock_for_write().await;
+                Arc::make_mut(&mut g.state_mut().novelty)
+                    .apply_commit(vec![mk(i + 1, i64::from(i) + 1)], i64::from(i) + 1, &rg)
+                    .expect("apply_commit");
+            }
+            // Query path: snapshot() runs compact_if_needed (tiered) before serving.
+            let _view = handle.snapshot().await;
+            let k = handle
+                .lock_for_write()
+                .await
+                .state()
+                .novelty
+                .max_segment_count();
+            assert!(
+                k <= tier_width * 4,
+                "tiered snapshot must keep K ~logarithmic; got {k} after commit {i}"
+            );
+        }
+
+        let g = handle.lock_for_write().await;
+        assert_eq!(
+            g.state().novelty.len(),
+            commits as usize,
+            "tiered compaction must not lose flakes"
+        );
+        assert!(
+            g.state().novelty.max_segment_count() < commits as usize,
+            "tiering must keep K below commit count"
+        );
+    }
+
+    /// Tier width 0 disables the read-side trigger (e.g. a latency-sensitive
+    /// transactor opting out): segments accumulate unbounded across snapshots.
+    #[tokio::test]
+    async fn snapshot_tier_compaction_disabled_when_width_zero() {
+        use fluree_db_core::{Flake, FlakeValue, LedgerSnapshot, Sid};
+        use fluree_db_ledger::LedgerState;
+        use fluree_db_novelty::Novelty;
+
+        let state = LedgerState::new(
+            LedgerSnapshot::genesis("test/nocompact:main"),
+            Novelty::new(0),
+        );
+        let handle = LedgerHandle::new("test/nocompact:main".to_string(), state, None);
+        handle.set_tier_width(0);
+        let rg = std::collections::HashMap::new();
+
+        for i in 0..12u16 {
+            {
+                let mut g = handle.lock_for_write().await;
+                Arc::make_mut(&mut g.state_mut().novelty)
+                    .apply_commit(
+                        vec![Flake::new(
+                            Sid::new(i + 1, format!("s{i}")),
+                            Sid::new(1, "p"),
+                            FlakeValue::Long(i64::from(i)),
+                            Sid::new(2, "long"),
+                            i64::from(i) + 1,
+                            true,
+                            None,
+                        )],
+                        i64::from(i) + 1,
+                        &rg,
+                    )
+                    .expect("apply_commit");
+            }
+            let _ = handle.snapshot().await;
+        }
+        let k = handle
+            .lock_for_write()
+            .await
+            .state()
+            .novelty
+            .max_segment_count();
+        assert_eq!(k, 12, "tier width 0 must disable read-triggered compaction");
     }
 
     // ========================================================================

@@ -10,9 +10,17 @@
 use crate::error::LedgerError;
 use crate::LedgerState;
 use fluree_db_core::{Flake, GraphDbRef, GraphId, IndexType, OverlayProvider, Sid};
-use fluree_db_novelty::FlakeId;
 use std::cmp::Ordering;
 use std::collections::HashMap;
+
+/// Index into [`StagedStore`]'s own contiguous arena.
+///
+/// Independent of `fluree_db_novelty::FlakeId`: `StagedOverlay` is a single-shot,
+/// non-segmented store built once from the staged flakes, so its ids are plain
+/// dense `u32`s over `0..len`. Base-novelty ids (which are now segment-packed and
+/// opaque) flow through `base.novelty.get_flake` separately and never mix with
+/// these.
+type FlakeId = u32;
 
 /// Arena-style storage for staged flakes
 struct StagedStore {
