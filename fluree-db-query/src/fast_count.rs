@@ -27,7 +27,7 @@ use fluree_db_binary_index::format::run_record_v2::{
 use fluree_db_binary_index::BinaryIndexStore;
 use fluree_db_core::o_type::OType;
 use fluree_db_core::subject_id::SubjectId;
-use fluree_db_core::value_id::ObjKey;
+use fluree_db_core::value_id::{ObjKey, ValueTypeTag};
 use fluree_db_core::{FlakeValue, GraphId};
 use fluree_vocab::namespaces;
 use std::sync::Arc;
@@ -1102,6 +1102,10 @@ fn count_distinct_predicates_psot(store: &BinaryIndexStore, g_id: GraphId) -> Re
 // ---------------------------------------------------------------------------
 
 /// Fast-path: count triples with literal objects.
+///
+/// First tries a metadata-only fold over the per-graph property datatype stats
+/// (zero leaf I/O); when the stats can't attribute every row exactly it falls
+/// back to the PSOT leaflet walk.
 pub fn count_literal_objects_operator(
     out_var: VarId,
     fallback: Option<BoxedOperator>,
@@ -1112,13 +1116,66 @@ pub fn count_literal_objects_operator(
             let Some(store) = fast_path_store(ctx) else {
                 return Ok(None);
             };
-            let count = count_literal_rows_psot(store, ctx.binary_g_id)?;
+            let stats_fold = ctx
+                .active_snapshot
+                .stats
+                .as_ref()
+                .and_then(|stats| count_literal_rows_from_stats(stats, ctx.binary_g_id));
+            let count = match stats_fold {
+                Some(count) => {
+                    tracing::debug!(count, "literal COUNT answered from datatype stats");
+                    count
+                }
+                None => count_literal_rows_psot(store, ctx.binary_g_id)?,
+            };
             let count_i64 = count_to_i64(count, "COUNT literals")?;
             Ok(Some(build_count_batch(out_var, count_i64)?))
         },
         fallback,
         "literal COUNT",
     )
+}
+
+/// Metadata-only literal-row count from per-graph property datatype stats:
+/// literal rows = Σ over properties of every non-`JSON_LD_ID` datatype count
+/// (IRI and blank-node refs both carry `JSON_LD_ID`; every other tag is a
+/// literal).
+///
+/// Returns `None` (caller falls back to the leaflet walk) unless the stats
+/// provably attribute every row in the graph:
+/// - an `UNKNOWN` bucket means unattributable rows — the index-build mapping
+///   sends both blank-node objects (not literals) and NumBig overflow values
+///   (literals) to `UNKNOWN`;
+/// - each property's datatype counts must sum to its row count, and property
+///   counts must sum to the graph's flake total (guards stale/partial stats);
+/// - a zero result defers so the leaflet walk (cheap when empty) confirms it.
+fn count_literal_rows_from_stats(stats: &fluree_db_core::IndexStats, g_id: GraphId) -> Option<u64> {
+    let graph = stats.graphs.as_ref()?.iter().find(|g| g.g_id == g_id)?;
+
+    let ref_tag = ValueTypeTag::JSON_LD_ID.as_u8();
+    let unknown_tag = ValueTypeTag::UNKNOWN.as_u8();
+    let mut literals: u64 = 0;
+    let mut attributed: u64 = 0;
+    for prop in &graph.properties {
+        let mut prop_total: u64 = 0;
+        for &(tag, count) in &prop.datatypes {
+            if tag == unknown_tag && count > 0 {
+                return None;
+            }
+            prop_total = prop_total.checked_add(count)?;
+            if tag != ref_tag {
+                literals = literals.checked_add(count)?;
+            }
+        }
+        if prop_total != prop.count {
+            return None;
+        }
+        attributed = attributed.checked_add(prop_total)?;
+    }
+    if attributed != graph.flakes {
+        return None;
+    }
+    (literals > 0).then_some(literals)
 }
 
 fn is_literal_otype(ot_u16: u16) -> bool {
@@ -1266,3 +1323,97 @@ fn count_blank_subject_rows_spot(store: &BinaryIndexStore, g_id: GraphId) -> Res
 // `#[expect(dead_code)]` and not wired. If we revisit this, we should implement
 // a correctness-first detector + a plan that doesn't require enumerating large
 // string-id sets for common prefixes.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fluree_db_core::index_stats::{GraphPropertyStatEntry, GraphStatsEntry};
+    use fluree_db_core::IndexStats;
+
+    fn prop(p_id: u32, datatypes: Vec<(u8, u64)>) -> GraphPropertyStatEntry {
+        let count = datatypes.iter().map(|&(_, c)| c).sum();
+        GraphPropertyStatEntry {
+            p_id,
+            count,
+            ndv_values: 0,
+            ndv_subjects: 0,
+            last_modified_t: 1,
+            datatypes,
+        }
+    }
+
+    fn stats_with_graph(g_id: GraphId, properties: Vec<GraphPropertyStatEntry>) -> IndexStats {
+        let flakes = properties.iter().map(|p| p.count).sum();
+        IndexStats {
+            flakes,
+            size: 0,
+            properties: None,
+            classes: None,
+            graphs: Some(vec![GraphStatsEntry {
+                g_id,
+                flakes,
+                size: 0,
+                properties,
+                classes: None,
+            }]),
+        }
+    }
+
+    const REF: u8 = 16; // ValueTypeTag::JSON_LD_ID
+    const STRING: u8 = 1;
+    const INTEGER: u8 = 2;
+    const UNKNOWN: u8 = 255;
+
+    #[test]
+    fn literal_fold_sums_non_ref_tags() {
+        let stats = stats_with_graph(
+            0,
+            vec![
+                prop(1, vec![(STRING, 100), (REF, 40)]),
+                prop(2, vec![(INTEGER, 7)]),
+                prop(3, vec![(REF, 9)]),
+            ],
+        );
+        assert_eq!(count_literal_rows_from_stats(&stats, 0), Some(107));
+    }
+
+    #[test]
+    fn literal_fold_declines_on_unknown_bucket() {
+        // UNKNOWN holds both blank-node refs and NumBig literals — unattributable.
+        let stats = stats_with_graph(0, vec![prop(1, vec![(STRING, 5), (UNKNOWN, 1)])]);
+        assert_eq!(count_literal_rows_from_stats(&stats, 0), None);
+    }
+
+    #[test]
+    fn literal_fold_declines_on_datatype_count_mismatch() {
+        let mut stats = stats_with_graph(0, vec![prop(1, vec![(STRING, 5)])]);
+        stats.graphs.as_mut().unwrap()[0].properties[0].count = 6;
+        stats.graphs.as_mut().unwrap()[0].flakes = 6;
+        assert_eq!(count_literal_rows_from_stats(&stats, 0), None);
+    }
+
+    #[test]
+    fn literal_fold_declines_on_graph_total_mismatch() {
+        let mut stats = stats_with_graph(0, vec![prop(1, vec![(STRING, 5)])]);
+        stats.graphs.as_mut().unwrap()[0].flakes = 7;
+        assert_eq!(count_literal_rows_from_stats(&stats, 0), None);
+    }
+
+    #[test]
+    fn literal_fold_defers_on_zero_and_missing() {
+        let all_refs = stats_with_graph(0, vec![prop(1, vec![(REF, 9)])]);
+        assert_eq!(count_literal_rows_from_stats(&all_refs, 0), None);
+
+        let stats = stats_with_graph(0, vec![prop(1, vec![(STRING, 5)])]);
+        assert_eq!(count_literal_rows_from_stats(&stats, 2), None);
+
+        let no_graphs = IndexStats {
+            flakes: 5,
+            size: 0,
+            properties: None,
+            classes: None,
+            graphs: None,
+        };
+        assert_eq!(count_literal_rows_from_stats(&no_graphs, 0), None);
+    }
+}

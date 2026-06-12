@@ -7970,6 +7970,154 @@ async fn indexed_iri_ref_and_blank_node_resolve_correctly() {
         .await;
 }
 
+/// `COUNT(?o)` + `FILTER(isLiteral(?o))` over an all-variable triple on an
+/// indexed ledger. With no blank-node objects the literal-COUNT fast path
+/// answers from the per-graph property datatype stats (no leaf I/O); the
+/// result must equal the actual literal row count (names + ages are literals,
+/// `ex:knows` targets are refs).
+#[tokio::test]
+async fn indexed_count_literal_objects_from_stats() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "it/indexed-count-literals-stats:main";
+
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        Arc::new(fluree.nameservice_mode().clone()),
+        fluree_db_indexer::IndexerConfig::small(),
+    );
+
+    local
+        .run_until(async move {
+            let index_cfg = IndexConfig {
+                reindex_min_bytes: 0,
+                reindex_max_bytes: 10_000_000,
+            };
+
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let insert = json!({
+                "@context": { "ex": "http://example.org/ns/" },
+                "@graph": [
+                    {"@id": "ex:alice", "ex:name": "Alice", "ex:age": 30, "ex:knows": {"@id": "ex:bob"}},
+                    {"@id": "ex:bob", "ex:name": "Bob", "ex:age": 25}
+                ]
+            });
+            let ledger1 = fluree
+                .insert_with_opts(
+                    ledger0,
+                    &insert,
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg,
+                )
+                .await
+                .expect("seed insert")
+                .ledger;
+
+            let outcome = trigger_index_and_wait_outcome(&handle, ledger_id, ledger1.t()).await;
+            if let fluree_db_api::IndexOutcome::Completed { index_t, .. } = outcome {
+                assert_eq!(index_t, 1, "should index to t=1");
+            }
+
+            let view = fluree
+                .db_at_t(ledger_id, ledger1.t())
+                .await
+                .expect("load indexed view");
+
+            let q = r"
+                SELECT (COUNT(?o) AS ?count)
+                WHERE { ?s ?p ?o FILTER(isLiteral(?o)) }
+            ";
+            let r = fluree
+                .query(&view, QueryInput::Sparql(q))
+                .await
+                .expect("literal COUNT query should succeed");
+            let jsonld = r.to_jsonld(&view.snapshot).expect("to_jsonld");
+            assert_eq!(
+                normalize_rows(&jsonld),
+                normalize_rows(&json!([[4]])),
+                "2 names + 2 ages are literals; the ex:knows ref is not"
+            );
+        })
+        .await;
+}
+
+/// Same query with a blank-node OBJECT in the data: a bnode ref is not a
+/// literal, so the count must be 3, not 4. Depending on which path produced
+/// the stats, the bnode is tagged `JSON_LD_ID` (commit/runtime path — fold
+/// fires and excludes it) or `UNKNOWN` (bulk-import path — fold declines to
+/// the leaflet walk); both must agree on 3.
+#[tokio::test]
+async fn indexed_count_literal_objects_with_blank_node_object() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "it/indexed-count-literals-bnode:main";
+
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        Arc::new(fluree.nameservice_mode().clone()),
+        fluree_db_indexer::IndexerConfig::small(),
+    );
+
+    local
+        .run_until(async move {
+            let index_cfg = IndexConfig {
+                reindex_min_bytes: 0,
+                reindex_max_bytes: 10_000_000,
+            };
+
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let insert = json!({
+                "@context": { "ex": "http://example.org/ns/" },
+                "@graph": [
+                    {"@id": "ex:alice", "ex:name": "Alice", "ex:knows": {"@id": "ex:bob"}},
+                    {"@id": "ex:bob", "ex:name": "Bob", "ex:knows": {"ex:name": "Anonymous"}}
+                ]
+            });
+            let ledger1 = fluree
+                .insert_with_opts(
+                    ledger0,
+                    &insert,
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg,
+                )
+                .await
+                .expect("seed insert")
+                .ledger;
+
+            let outcome = trigger_index_and_wait_outcome(&handle, ledger_id, ledger1.t()).await;
+            if let fluree_db_api::IndexOutcome::Completed { index_t, .. } = outcome {
+                assert_eq!(index_t, 1, "should index to t=1");
+            }
+
+            let view = fluree
+                .db_at_t(ledger_id, ledger1.t())
+                .await
+                .expect("load indexed view");
+
+            let q = r"
+                SELECT (COUNT(?o) AS ?count)
+                WHERE { ?s ?p ?o FILTER(isLiteral(?o)) }
+            ";
+            let r = fluree
+                .query(&view, QueryInput::Sparql(q))
+                .await
+                .expect("literal COUNT query should succeed");
+            let jsonld = r.to_jsonld(&view.snapshot).expect("to_jsonld");
+            assert_eq!(
+                normalize_rows(&jsonld),
+                normalize_rows(&json!([[3]])),
+                "3 names are literals; the IRI ref and blank-node ref are not"
+            );
+        })
+        .await;
+}
+
 /// POST overlay cursor coverage: `SUM(?o)`, `AVG(?o)`, and `COUNT(DISTINCT ?o)`
 /// over a single predicate must reflect uncommitted novelty (overlay) — both
 /// asserts and retracts — not only the persisted index.
