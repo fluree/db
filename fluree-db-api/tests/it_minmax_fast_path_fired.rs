@@ -1,5 +1,6 @@
-//! Verifies the MIN/MAX string fast path actually serves (not just agrees with)
-//! a multi-language aggregate on a bulk-imported (lex-sorted) index.
+//! Verifies the MIN/MAX string and COUNT(DISTINCT) fast paths actually serve
+//! (not just agree with) aggregates over a multi-language predicate on a
+//! bulk-imported (lex-sorted) index.
 //!
 //! Kept as the only test in this binary: the assertion relies on a thread-local
 //! tracing subscriber (`set_default`), and concurrent tests in the same process
@@ -60,17 +61,33 @@ ex:s6 ex:desc "tomate"@fr .
     .expect("to_sparql_json");
     assert_eq!(result["results"]["bindings"][0]["min"]["value"], "abricot");
 
+    let distinct = support::query_sparql(
+        &fluree,
+        &ledger,
+        r"PREFIX ex: <http://example.org/ns/>
+          SELECT (COUNT(DISTINCT ?o) AS ?count) WHERE { ?s ex:desc ?o }",
+    )
+    .await
+    .expect("distinct query")
+    .to_sparql_json(&ledger.snapshot)
+    .expect("to_sparql_json");
+    assert_eq!(distinct["results"]["bindings"][0]["count"]["value"], "6");
+
+    let served: Vec<String> = store
+        .find_events("fast path produced result")
+        .iter()
+        .filter_map(|e| e.fields.get("label").cloned())
+        .collect();
     assert!(
-        store.has_event("fast path produced result"),
-        "expected the MIN/MAX string fast path to serve this query; events: {:?}",
-        store
-            .all_events()
-            .iter()
-            .map(|e| e.message().to_string())
-            .collect::<Vec<_>>()
+        served.iter().any(|l| l.contains("MIN/MAX")),
+        "expected the MIN/MAX string fast path to serve; served: {served:?}"
+    );
+    assert!(
+        served.iter().any(|l| l.contains("COUNT(DISTINCT)")),
+        "expected the COUNT(DISTINCT) lead-group walk to serve; served: {served:?}"
     );
     assert!(
         !store.has_event("fast path declined; running fallback"),
-        "fast path must not decline on a lex-sorted multi-language predicate"
+        "no fast path should decline on a lex-sorted multi-language predicate"
     );
 }

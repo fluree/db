@@ -1093,6 +1093,117 @@ fn count_distinct_lead_groups(
     Ok(result.map_or(0, |p| p.count))
 }
 
+/// Per-chunk partial for the per-predicate distinct-object count: the same
+/// seam stitching as [`LeadGroupPartial`], plus an `unsupported` flag for
+/// non-empty leaflets that predate `lead_group_count`.
+struct PredicateLeadPartial {
+    count: u64,
+    first_lead: Vec<u8>,
+    last_lead: Vec<u8>,
+    unsupported: bool,
+}
+
+/// Count distinct objects `(o_type, o_key)` for one predicate from POST
+/// leaflet directories only (cached header+directory prefix reads — no
+/// payload, columns, or dictionary access).
+///
+/// POST keys are `p_id(4) + o_type(2) + o_key(8) + o_i(4) + s_id(8)` and
+/// `lead_group_count` counts distinct `(o_type, o_key)` per leaflet (`o_i`
+/// excluded), so summing the predicate's leaflets and deduplicating groups
+/// that span leaflet/chunk seams by the 14-byte `p+o` prefix is exact.
+/// Distinctness is order-independent, so no `lex_sorted_string_ids` gate is
+/// needed and every object type is supported.
+///
+/// Returns `Ok(None)` when a non-empty leaflet has no `lead_group_count`
+/// (pre-§3.2 leaves) — the caller must fall back to a row scan.
+pub(crate) fn count_distinct_objects_for_predicate(
+    store: &BinaryIndexStore,
+    g_id: GraphId,
+    p_id: u32,
+) -> Result<Option<u64>> {
+    /// `p_id(4) + o_type(2) + o_key(8)` POST key prefix.
+    const POST_PO_LEAD_LEN: usize = 14;
+
+    let leaves = leaf_entries_for_predicate(store, g_id, RunSortOrder::Post, p_id);
+    if leaves.is_empty() {
+        return Ok(Some(0));
+    }
+
+    let map = |chunk: &[LeafEntry]| -> Result<Option<PredicateLeadPartial>> {
+        let mut partial = PredicateLeadPartial {
+            count: 0,
+            first_lead: Vec::new(),
+            last_lead: Vec::new(),
+            unsupported: false,
+        };
+        for leaf_entry in chunk {
+            let dir = store
+                .open_leaf_dir(&leaf_entry.leaf_cid)
+                .map_err(|e| QueryError::Internal(format!("leaf dir open: {e}")))?;
+
+            for entry in &dir.entries {
+                if entry.row_count == 0 || entry.p_const != Some(p_id) {
+                    continue;
+                }
+                if entry.lead_group_count == 0 {
+                    partial.unsupported = true;
+                    return Ok(Some(partial));
+                }
+
+                let lead_first = &entry.first_key[..POST_PO_LEAD_LEN];
+                let lead_last = &entry.last_key[..POST_PO_LEAD_LEN];
+
+                partial.count += u64::from(entry.lead_group_count);
+                if !partial.last_lead.is_empty() && partial.last_lead == lead_first {
+                    partial.count = partial.count.saturating_sub(1);
+                }
+                if partial.first_lead.is_empty() {
+                    partial.first_lead.extend_from_slice(lead_first);
+                }
+                partial.last_lead.clear();
+                partial.last_lead.extend_from_slice(lead_last);
+            }
+        }
+        Ok(Some(partial))
+    };
+
+    let combine =
+        |left: PredicateLeadPartial, right: PredicateLeadPartial| -> PredicateLeadPartial {
+            if left.unsupported || right.unsupported {
+                return PredicateLeadPartial {
+                    count: 0,
+                    first_lead: Vec::new(),
+                    last_lead: Vec::new(),
+                    unsupported: true,
+                };
+            }
+            if right.first_lead.is_empty() {
+                return left;
+            }
+            if left.first_lead.is_empty() {
+                return right;
+            }
+            let seam_dedup = u64::from(left.last_lead == right.first_lead);
+            PredicateLeadPartial {
+                count: left
+                    .count
+                    .saturating_add(right.count)
+                    .saturating_sub(seam_dedup),
+                first_lead: left.first_lead,
+                last_lead: right.last_lead,
+                unsupported: false,
+            }
+        };
+
+    let parallel = leaves.len() >= crate::fast_path_common::parallel_dir_walk_min_leaves();
+    let result = parallel_leaf_chunk_reduce(leaves, parallel, map, combine)?;
+    Ok(match result {
+        Some(p) if p.unsupported => None,
+        Some(p) => Some(p.count),
+        None => Some(0),
+    })
+}
+
 /// Distinct predicates uses p_const metadata rather than lead_group_count,
 /// since PSOT leaflets are predicate-homogeneous.
 fn count_distinct_predicates_psot(store: &BinaryIndexStore, g_id: GraphId) -> Result<u64> {
