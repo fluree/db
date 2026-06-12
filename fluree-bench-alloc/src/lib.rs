@@ -43,6 +43,12 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 static CURRENT: AtomicUsize = AtomicUsize::new(0);
 static PEAK: AtomicUsize = AtomicUsize::new(0);
 static TOTAL: AtomicUsize = AtomicUsize::new(0);
+/// Live bytes at the last [`reset_peak`] — the ambient baseline a scenario
+/// starts from. `scenario_peak_bytes = peak - this` isolates the memory a
+/// scenario itself is responsible for, making the gated metric robust
+/// against ambient process-heap shifts between binaries (a recompile can
+/// move absolute peak by megabytes uniformly across every scenario).
+static CURRENT_AT_RESET: AtomicUsize = AtomicUsize::new(0);
 
 /// A `GlobalAlloc` wrapper around [`System`] that maintains the module's
 /// current / peak / total counters.
@@ -122,7 +128,12 @@ pub struct AllocSnapshot {
     /// Live bytes at the time of the snapshot.
     pub current_bytes: usize,
     /// High-water mark of live bytes since the last [`reset_peak`].
+    /// Includes the ambient baseline live at reset time.
     pub peak_bytes: usize,
+    /// `peak_bytes` minus live bytes at the last [`reset_peak`] — the
+    /// scenario-attributable high-water mark. Comparable across binaries;
+    /// prefer this for regression gating.
+    pub scenario_peak_bytes: usize,
     /// Cumulative bytes allocated since the last [`reset_peak`] (churn).
     pub total_allocated_bytes: usize,
 }
@@ -132,15 +143,19 @@ pub struct AllocSnapshot {
 pub fn reset_peak() {
     let cur = CURRENT.load(Ordering::Relaxed);
     PEAK.store(cur, Ordering::Relaxed);
+    CURRENT_AT_RESET.store(cur, Ordering::Relaxed);
     TOTAL.store(0, Ordering::Relaxed);
 }
 
 /// Read the counters. Call after the measured region of a scenario.
 #[must_use]
 pub fn snapshot() -> AllocSnapshot {
+    let peak = PEAK.load(Ordering::Relaxed);
+    let at_reset = CURRENT_AT_RESET.load(Ordering::Relaxed);
     AllocSnapshot {
         current_bytes: CURRENT.load(Ordering::Relaxed),
-        peak_bytes: PEAK.load(Ordering::Relaxed),
+        peak_bytes: peak,
+        scenario_peak_bytes: peak.saturating_sub(at_reset),
         total_allocated_bytes: TOTAL.load(Ordering::Relaxed),
     }
 }

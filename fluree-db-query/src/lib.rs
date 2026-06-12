@@ -150,7 +150,7 @@ pub use rewrite::{rewrite_patterns, Diagnostics as RewriteDiagnostics, PlanConte
 pub use rewrite_owl_ql::{rewrite_owl_ql_patterns, Ontology, OwlQlContext};
 pub use seed::{EmptyOperator, SeedOperator};
 pub use sort::{compare_bindings, compare_flake_values, SortDirection, SortOperator, SortSpec};
-pub use stats_query::StatsCountByPredicateOperator;
+pub use stats_query::stats_count_by_predicate_operator;
 pub use subquery::SubqueryOperator;
 pub use temporal_mode::{PlanningContext, TemporalMode};
 

@@ -51,7 +51,7 @@ use crate::project::ProjectOperator;
 use crate::sort::SortDirection;
 use crate::sort::SortOperator;
 use crate::sort::SortSpec;
-use crate::stats_query::StatsCountByPredicateOperator;
+use crate::stats_query::stats_count_by_predicate_operator;
 use crate::temporal_mode::PlanningContext;
 use crate::var_registry::VarId;
 use fluree_db_core::StatsView;
@@ -1547,6 +1547,14 @@ fn detect_stats_count_by_predicate(query: &Query) -> Option<(VarId, VarId)> {
     if !query.order_binds.is_empty() {
         return None;
     }
+    // OFFSET would be applied twice when the operator defers to its planned
+    // fallback at open() time (the fallback tree already applies the full
+    // modifier stack; the dispatch wraps modifiers around this operator
+    // again, and OFFSET — unlike sort/project/distinct/limit — is not
+    // idempotent). Decline and let the generic pipeline handle it.
+    if query.offset.is_some() {
+        return None;
+    }
     // Must have stats available (checked by caller)
     // Must have exactly one triple pattern with all variables
     if query.patterns.len() != 1 {
@@ -2639,17 +2647,22 @@ fn build_operator_tree_inner(
         }
     }
 
-    // Fast-path: stats-based count-by-predicate query
-    // This avoids scanning all triples when we can answer directly from IndexStats.
-    // Skipped in `History` mode — IndexStats reflects current-state cardinality,
-    // not the asserts + retracts a history-range query needs.
-    if !planning.is_history() && !fast_paths_globally_disabled {
-        if let Some(ref stats_view) = stats {
+    // Fast-path: per-predicate count answered from POST leaf-directory
+    // metadata (exact; see stats_query.rs for why IndexStats numbers are
+    // NOT used as answers). Part of the fused chain: gating on
+    // `enable_fused_fast_paths` (a) skips it in History mode — directory
+    // rows are current-state only — and (b) keeps the fallback recursion
+    // below (which passes `false`) from re-entering this block. The
+    // operator's open()-time gate (`fast_path_store`) defers to the
+    // planned fallback under overlay/time-travel/policy/multi-ledger.
+    if enable_fused_fast_paths {
+        {
             if let Some((pred_var, count_var)) = detect_stats_count_by_predicate(query) {
-                let mut operator: BoxedOperator = Box::new(StatsCountByPredicateOperator::new(
-                    Arc::clone(stats_view),
+                let fallback = build_operator_tree_inner(query, stats.clone(), false, planning)?;
+                let mut operator: BoxedOperator = Box::new(stats_count_by_predicate_operator(
                     pred_var,
                     count_var,
+                    Some(fallback),
                 ));
 
                 // ORDER BY (on predicate or count)

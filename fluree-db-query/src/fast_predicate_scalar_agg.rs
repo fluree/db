@@ -213,9 +213,16 @@ enum AggState {
     },
     Avg {
         required_otype: Option<u16>,
-        // Kahan compensated summation state.
-        sum: f64,
-        compensation: f64,
+        // Exactly one of these accumulates, selected by required_otype's
+        // decode kind. The integer lane sums exactly in i64 (checked; falls
+        // back on overflow) and finalizes via BigDecimal division so the
+        // output is byte-identical to the generic pipeline's finalize_avg
+        // (SPARQL: AVG over integers is xsd:decimal). The double lane uses
+        // plain summation — NOT Kahan — to bit-match the generic
+        // accumulator; cross-path indistinguishability outranks the extra
+        // float accuracy (differential harness FD-1).
+        int_sum: i64,
+        dbl_sum: f64,
         count: u64,
     },
     CountDistinct {
@@ -230,8 +237,8 @@ impl AggState {
             ScalarAggKind::Sum(scalar) => AggState::Sum { scalar, sum: 0 },
             ScalarAggKind::AvgNumeric => AggState::Avg {
                 required_otype: None,
-                sum: 0.0,
-                compensation: 0.0,
+                int_sum: 0,
+                dbl_sum: 0.0,
                 count: 0,
             },
             ScalarAggKind::CountDistinctObject => AggState::CountDistinct {
@@ -244,14 +251,44 @@ impl AggState {
     fn finalize(self) -> Result<AggOutput> {
         Ok(match self {
             AggState::Sum { sum, .. } => AggOutput::Integer(sum),
-            AggState::Avg { sum, count, .. } => {
+            AggState::Avg {
+                required_otype,
+                int_sum,
+                dbl_sum,
+                count,
+            } => {
                 if count == 0 {
                     AggOutput::Binding(Binding::Unbound)
                 } else {
-                    AggOutput::Binding(Binding::lit(
-                        FlakeValue::Double(sum / count as f64),
-                        Sid::xsd_double(),
-                    ))
+                    let kind = required_otype
+                        .map(|ot| OType::from_u16(ot).decode_kind())
+                        .ok_or_else(|| {
+                            QueryError::execution("AVG fast-path: count > 0 without o_type")
+                        })?;
+                    match kind {
+                        DecodeKind::I64 => {
+                            // Mirror aggregate.rs finalize_avg (NumKind::Integer):
+                            // exact decimal division at the same precision.
+                            let avg = (bigdecimal::BigDecimal::from(int_sum)
+                                / bigdecimal::BigDecimal::from(count as i64))
+                            .with_prec(crate::aggregate::AVG_DECIMAL_PRECISION)
+                            .normalized();
+                            AggOutput::Binding(Binding::lit(
+                                FlakeValue::Decimal(Box::new(avg)),
+                                Sid::xsd_decimal(),
+                            ))
+                        }
+                        DecodeKind::F64 => AggOutput::Binding(Binding::lit(
+                            FlakeValue::Double(dbl_sum / count as f64),
+                            Sid::xsd_double(),
+                        )),
+                        // fold_row only admits I64/F64 kinds.
+                        other => {
+                            return Err(QueryError::execution(format!(
+                                "AVG fast-path: unexpected decode kind {other:?}"
+                            )))
+                        }
+                    }
                 }
             }
             AggState::CountDistinct { distinct, .. } => {
@@ -288,8 +325,8 @@ impl AggState {
             }
             AggState::Avg {
                 required_otype,
-                sum,
-                compensation,
+                int_sum,
+                dbl_sum,
                 count,
             } => {
                 if !OType::from_u16(o_type).is_numeric() {
@@ -300,12 +337,25 @@ impl AggState {
                     Some(existing) if existing != o_type => return Ok(false),
                     Some(_) => {}
                 }
-                let val = decode_numeric_as_f64(o_type, o_key)?;
-                // Kahan summation: compensate for lost low-order bits.
-                let y = val - *compensation;
-                let t = *sum + y;
-                *compensation = (t - *sum) - y;
-                *sum = t;
+                let key = ObjKey::from_u64(o_key);
+                match OType::from_u16(o_type).decode_kind() {
+                    DecodeKind::I64 => {
+                        // Exact integer accumulation; overflow → generic
+                        // pipeline (which sums in BigDecimal).
+                        let Some(next) = int_sum.checked_add(key.decode_i64()) else {
+                            return Ok(false);
+                        };
+                        *int_sum = next;
+                    }
+                    DecodeKind::F64 => {
+                        // Plain summation to match the generic accumulator
+                        // bit-for-bit (see AggState::Avg field docs).
+                        *dbl_sum += key.decode_f64();
+                    }
+                    // Other numeric encodings (e.g. dict-backed decimals)
+                    // need exact decimal arithmetic — generic pipeline.
+                    _ => return Ok(false),
+                }
                 *count = count.saturating_add(1);
             }
             AggState::CountDistinct {
@@ -502,18 +552,6 @@ fn scan_predicate_scalar_agg_overlay(
 // ---------------------------------------------------------------------------
 // Decode helpers
 // ---------------------------------------------------------------------------
-
-fn decode_numeric_as_f64(o_type: u16, o_key: u64) -> Result<f64> {
-    let ot = OType::from_u16(o_type);
-    let key = ObjKey::from_u64(o_key);
-    match ot.decode_kind() {
-        DecodeKind::I64 => Ok(key.decode_i64() as f64),
-        DecodeKind::F64 => Ok(key.decode_f64()),
-        _ => Err(QueryError::execution(format!(
-            "unsupported numeric decode kind for AVG fast-path: {ot:?}"
-        ))),
-    }
-}
 
 fn constant_component_for_otype(o_type: u16, component: DateComponentFn) -> Option<i64> {
     let ot = OType::from_u16(o_type);

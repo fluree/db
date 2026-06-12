@@ -135,6 +135,19 @@ fn minmax_string_dict_post(
     p_id: u32,
     mode: MinMaxMode,
 ) -> Result<Option<Binding>> {
+    // POST orders string objects by StringId, so a leaflet's first/last
+    // directory key is the min/max *by ID*, not by lexicographic value —
+    // the true lex extreme can sit anywhere inside the leaflet. The
+    // candidate set below is therefore only sound when string IDs are
+    // lex-order-preserving (bulk-import invariant, cleared by incremental
+    // dict appends). Without it, bail to the generic pipeline. Same gate
+    // as fast_string_prefix_count_all. (The `compare_string_lex` calls
+    // below order the *candidates* correctly either way; the gate is about
+    // candidate completeness, not candidate comparison.)
+    if !store.lex_sorted_string_ids() {
+        return Ok(None);
+    }
+
     let leaves = leaf_entries_for_predicate(store, g_id, RunSortOrder::Post, p_id);
 
     let mut best: Option<(EncodedStringIdentity, Binding)> = None;

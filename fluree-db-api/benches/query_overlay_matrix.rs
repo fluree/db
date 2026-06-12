@@ -254,6 +254,7 @@ fn bench_query_overlay_matrix(c: &mut Criterion) {
                 &format!("{GROUP}/{}/{}", $fn_id, scale.as_str()),
                 MemMetrics {
                     peak_bytes: m.peak_bytes as u64,
+                    scenario_peak_bytes: m.scenario_peak_bytes as u64,
                     total_allocated_bytes: m.total_allocated_bytes as u64,
                 },
             );

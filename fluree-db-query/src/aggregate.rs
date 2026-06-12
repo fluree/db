@@ -468,7 +468,9 @@ impl NumericAcc {
 /// inputs. Matches IEEE-754 decimal128 precision (34 digits) — well past
 /// xsd:double's ~17 digits of precision but small enough to keep output
 /// compact for typical financial / scientific aggregates.
-const AVG_DECIMAL_PRECISION: u64 = 34;
+// Shared with the AVG fast path (fast_predicate_scalar_agg), whose integer
+// lane must produce byte-identical decimal output to finalize_avg.
+pub(crate) const AVG_DECIMAL_PRECISION: u64 = 34;
 
 /// Best-effort `BigInt → f64`. Saturates at infinity for out-of-range values.
 fn bigint_to_f64(b: &BigInt) -> f64 {
