@@ -1513,13 +1513,13 @@ mem:fact-01ktwep3pg2dxz9r44083zdrxy a mem:Fact ;
     mem:rationale "Anchor document for any future refactor work; recall before structural changes to query/ledger/binary-index." .
 
 mem:fact-01ktwepk8ernqdycdrns8e8kyq a mem:Fact ;
-    mem:content "Audit flagged unconfirmed lifecycle/correctness candidates — verify before fixing: (1) apply_loaded_db (~ledger lib.rs:606-622) merges old namespace codes but may not replay graph_registry deltas from remaining novelty; (2) apply_index_v2 (~ledger_manager.rs:351) doesn't call sync_binary_store_from_state before releasing state lock (snapshot/store TOCTOU); (3) reload swap condition new_state.t() >= current.t() (~ledger_manager.rs:1157) races concurrent commits; (4) export translate path WARN-drops non-Unsupported translation errors (binary_scan.rs:2238-2242) — same silent-drop class fixed earlier in graph crawl. Also: DecodedRow.dt u32 vs OverlayOp/RunRecord.dt u16; GraphId is bare u16 alias." ;
+    mem:content "Audit lifecycle bug candidates — TRIAGED 2026-06-12 (PR #1315): (1) apply_loaded_db graph-registry replay: already implemented (old graph IRIs merged via apply_delta alongside ns codes); pinned by it_graph_registry_apply_loaded_db.rs incl. same-g_id property. (2) apply_index_v2 store TOCTOU: FALSE POSITIVE — out-of-band binary_store write is inside the state write-lock scope. (3) reload t() swap race: FALSE POSITIVE — comparison runs after lock_for_write(); skip-swap is novelty-protective by design. (4) export translation WARN-drop: REAL, FIXED — all failed translations now keep raw flakes for the untranslated post-pass. Also: dt-width mismatch (DecodedRow u32 vs OverlayOp/RunRecord u16) and bare GraphId alias remain open Phase 0 newtype items." ;
     mem:tag "audit" ;
     mem:tag "bug-candidates" ;
-    mem:tag "id-space" ;
     mem:tag "lifecycle" ;
     mem:tag "overlay" ;
-    mem:tag "verification-needed" ;
+    mem:tag "resolved" ;
+    mem:tag "triage" ;
     mem:scope mem:repo ;
     mem:artifactRef "fluree-db-api/src/ledger_manager.rs" ;
     mem:artifactRef "fluree-db-binary-index/src/types.rs" ;

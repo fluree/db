@@ -2236,11 +2236,26 @@ pub fn translate_overlay_flakes_with_untranslated(
         ) {
             Ok(op) => ops.push(op),
             Err(e) => {
-                if e.kind() == std::io::ErrorKind::Unsupported {
-                    untranslated.push(flake.clone());
-                } else {
-                    tracing::warn!(error = %e, "failed to translate overlay flake to V3");
+                // EVERY failed translation keeps the raw flake: the callers'
+                // untranslated post-pass (lifecycle-resolve, filter, stream
+                // after the cursor) makes it visible to results. `Unsupported`
+                // is the expected lane (e.g. @vector values); anything else —
+                // NotFound from a stale/detached DictNovelty, InvalidData —
+                // indicates degraded state and is warned, but the fact must
+                // not silently vanish. Dropping here previously caused
+                // disappearing properties in export under exactly the state
+                // the warning describes (same bug class fixed earlier in
+                // graph crawl). Failures only occur for identities the
+                // persisted dicts can't resolve, so the matching base rows —
+                // which always translate — are unaffected, and assert/retract
+                // pairs fail together and resolve within the raw set.
+                if e.kind() != std::io::ErrorKind::Unsupported {
+                    tracing::warn!(
+                        error = %e,
+                        "overlay flake failed V3 translation; keeping raw flake"
+                    );
                 }
+                untranslated.push(flake.clone());
             }
         },
     );
