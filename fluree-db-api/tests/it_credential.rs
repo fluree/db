@@ -10,6 +10,7 @@ mod support;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use ed25519_dalek::{Signer, SigningKey};
 use fluree_db_api::{credential, FlureeBuilder};
+use fluree_db_core::GraphId;
 use serde_json::{json, Value as JsonValue};
 use support::{assert_index_defaults, genesis_ledger, normalize_rows, MemoryFluree, MemoryLedger};
 
@@ -153,7 +154,7 @@ async fn credential_transact_then_credential_query_enforces_policy() {
     let open = support::query_jsonld(&fluree, &ledger1, &open_q)
         .await
         .expect("query open")
-        .to_jsonld_async(ledger1.as_graph_db_ref(0))
+        .to_jsonld_async(ledger1.as_graph_db_ref(GraphId(0)))
         .await
         .expect("to_jsonld_async");
     assert_eq!(open, json!([{"@id":"ct:open","ct:foo":"bar"}]));
@@ -211,7 +212,7 @@ async fn credential_transact_then_credential_query_enforces_policy() {
         .await
         .expect("credential_query_connection root");
     let root_json = root_res
-        .to_jsonld_async(ledger2.as_graph_db_ref(0))
+        .to_jsonld_async(ledger2.as_graph_db_ref(GraphId(0)))
         .await
         .expect("to_jsonld_async");
     assert_eq!(
@@ -234,7 +235,7 @@ async fn credential_transact_then_credential_query_enforces_policy() {
         .await
         .expect("credential_query_connection pleb");
     let pleb_json = pleb_res
-        .to_jsonld_async(ledger2.as_graph_db_ref(0))
+        .to_jsonld_async(ledger2.as_graph_db_ref(GraphId(0)))
         .await
         .expect("to_jsonld_async");
     assert_eq!(pleb_json, json!([]));

@@ -137,7 +137,7 @@ pub fn stats_record_from_v2(
     };
 
     StatsRecord {
-        g_id: rec.g_id,
+        g_id: GraphId(rec.g_id),
         p_id: rec.p_id,
         s_id: rec.s_id.as_u64(),
         dt,
@@ -849,13 +849,22 @@ mod tests {
         hll.subjects_hll.insert_hash(1000);
         hll.count = 5;
         hll.last_modified_t = 3;
-        prior.insert(GraphPropertyKey { g_id: 0, p_id: 1 }, hll);
+        prior.insert(
+            GraphPropertyKey {
+                g_id: GraphId(0),
+                p_id: 1,
+            },
+            hll,
+        );
 
         let hook = IdStatsHook::with_prior_properties(prior);
         let props = hook.properties();
         assert_eq!(props.len(), 1);
 
-        let key = GraphPropertyKey { g_id: 0, p_id: 1 };
+        let key = GraphPropertyKey {
+            g_id: GraphId(0),
+            p_id: 1,
+        };
         assert_eq!(props[&key].count, 5);
         assert_eq!(props[&key].last_modified_t, 3);
     }

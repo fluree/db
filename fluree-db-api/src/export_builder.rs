@@ -15,6 +15,7 @@
 use crate::export::{self, ExportConfig, ExportFormat, ExportStats, PrefixMap};
 use crate::{time_resolve, ApiError, Fluree, Result, TimeSpec};
 use fluree_db_binary_index::BinaryIndexStore;
+use fluree_db_core::GraphId;
 use fluree_db_core::GraphRegistry;
 use std::io::{self, BufWriter, Write};
 use std::sync::Arc;
@@ -131,7 +132,7 @@ impl<'a> ExportBuilder<'a> {
     fn resolve_graph_iri(&self, registry: &GraphRegistry) -> Result<(u16, String)> {
         let iri = self.graph_iri.as_deref().unwrap();
         match registry.graph_id_for_iri(iri) {
-            Some(g_id) => Ok((g_id, iri.to_string())),
+            Some(g_id) => Ok((g_id.as_u16(), iri.to_string())),
             None => Err(ApiError::Config(format!(
                 "graph '{iri}' not found in ledger graph registry"
             ))),
@@ -182,7 +183,9 @@ impl<'a> ExportBuilder<'a> {
                 export::write_prefix_declarations(&prefixes, writer).map_err(io_err)?;
 
                 let config = ExportConfig {
-                    g_id: target_graph.as_ref().map_or(0, |(g_id, _)| *g_id),
+                    g_id: target_graph
+                        .as_ref()
+                        .map_or(GraphId(0), |(g_id, _)| GraphId(*g_id)),
                     graph_iri: None,
                     to_t,
                     overlay: Some(overlay),
@@ -196,7 +199,9 @@ impl<'a> ExportBuilder<'a> {
 
             ExportFormat::NTriples => {
                 let config = ExportConfig {
-                    g_id: target_graph.as_ref().map_or(0, |(g_id, _)| *g_id),
+                    g_id: target_graph
+                        .as_ref()
+                        .map_or(GraphId(0), |(g_id, _)| GraphId(*g_id)),
                     graph_iri: None,
                     to_t,
                     overlay: Some(overlay),
@@ -212,7 +217,7 @@ impl<'a> ExportBuilder<'a> {
                 if let Some((g_id, iri)) = &target_graph {
                     // Single named graph
                     let config = ExportConfig {
-                        g_id: *g_id,
+                        g_id: GraphId(*g_id),
                         graph_iri: Some(iri.clone()),
                         to_t,
                         overlay: Some(overlay),
@@ -225,7 +230,7 @@ impl<'a> ExportBuilder<'a> {
                 } else {
                     // Default graph (no graph term)
                     let config = ExportConfig {
-                        g_id: 0,
+                        g_id: GraphId(0),
                         graph_iri: None,
                         to_t,
                         overlay: Some(overlay),
@@ -266,7 +271,7 @@ impl<'a> ExportBuilder<'a> {
                     writeln!(writer, " {{").map_err(io_err)?;
 
                     let config = ExportConfig {
-                        g_id: *g_id,
+                        g_id: GraphId(*g_id),
                         graph_iri: None,
                         to_t,
                         overlay: Some(overlay),
@@ -282,7 +287,7 @@ impl<'a> ExportBuilder<'a> {
                 } else {
                     // Default graph as top-level triples
                     let config = ExportConfig {
-                        g_id: 0,
+                        g_id: GraphId(0),
                         graph_iri: None,
                         to_t,
                         overlay: Some(overlay),
@@ -329,7 +334,9 @@ impl<'a> ExportBuilder<'a> {
                 export::write_jsonld_header(&prefixes, writer).map_err(io_err)?;
 
                 let config = ExportConfig {
-                    g_id: target_graph.as_ref().map_or(0, |(g_id, _)| *g_id),
+                    g_id: target_graph
+                        .as_ref()
+                        .map_or(GraphId(0), |(g_id, _)| GraphId(*g_id)),
                     graph_iri: None,
                     to_t,
                     overlay: Some(overlay),

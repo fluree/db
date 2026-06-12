@@ -13,7 +13,7 @@ use std::cmp::Ordering;
 use fluree_db_core::comparator::IndexType;
 use fluree_db_core::flake::Flake;
 use fluree_db_core::value::FlakeValue;
-use fluree_db_core::{GraphDbRef, LedgerSnapshot, OverlayProvider, Sid};
+use fluree_db_core::{GraphDbRef, GraphId, LedgerSnapshot, OverlayProvider, Sid};
 use fluree_db_reasoner::{reason_owl2rl, ReasoningCache, ReasoningOptions};
 
 struct SortedOverlay {
@@ -160,21 +160,28 @@ async fn lubm_grad_student_and_chair_defined_classes() {
     }
     let overlay = SortedOverlay::new(1234, f);
     let cache = ReasoningCache::with_default_capacity();
-    let db = GraphDbRef::new(&snapshot, 0, &overlay, 10);
+    let db = GraphDbRef::new(&snapshot, GraphId(0), &overlay, 10);
     let res = reason_owl2rl(db, &ReasoningOptions::default(), &cache)
         .await
         .unwrap();
 
     // Collect derived rdf:type facts.
     let mut derived: Vec<(Sid, Sid)> = Vec::new(); // (subject, class)
-    res.overlay
-        .for_each_overlay_flake(0, IndexType::Spot, None, None, true, i64::MAX, &mut |fl| {
+    res.overlay.for_each_overlay_flake(
+        GraphId(0),
+        IndexType::Spot,
+        None,
+        None,
+        true,
+        i64::MAX,
+        &mut |fl| {
             if fl.p == rdf("type") {
                 if let FlakeValue::Ref(c) = &fl.o {
                     derived.push((fl.s.clone(), c.clone()));
                 }
             }
-        });
+        },
+    );
     let has = |s: &str, c: &str| derived.iter().any(|(x, k)| *x == ex(s) && *k == ex(c));
 
     eprintln!("rules_fired: {:?}", res.diagnostics.rules_fired);

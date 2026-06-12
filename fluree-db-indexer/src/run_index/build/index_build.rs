@@ -182,7 +182,7 @@ pub fn build_index(config: &IndexBuildConfig) -> Result<IndexBuildResult, IndexB
     // only the active leaf's working set plus O(#leaves) branch metadata in RAM
     // — never the whole order's compressed FLI3/FHS1 blobs.
     let mut writer = PersistingLeafWriter::new(
-        g_id,
+        GraphId(g_id),
         order,
         &config.index_dir,
         config.leaflet_target_rows,
@@ -366,7 +366,7 @@ fn build_graph_index_result(
         .collect();
 
     // Write branch manifest (FBR3).
-    let branch_bytes = build_branch_bytes(order, g_id, &leaf_entries);
+    let branch_bytes = build_branch_bytes(order, g_id.as_u16(), &leaf_entries);
     let branch_hex = fluree_db_core::sha256_hex(&branch_bytes);
     let branch_cid = ContentId::from_hex_digest(
         fluree_db_core::content_kind::CODEC_FLUREE_INDEX_BRANCH,
@@ -419,7 +419,7 @@ impl PersistingLeafWriter {
         leaf_target_rows: usize,
         zstd_level: i32,
     ) -> io::Result<Self> {
-        let graph_dir = create_graph_dir(index_dir, g_id, order.dir_name())?;
+        let graph_dir = create_graph_dir(index_dir, g_id.as_u16(), order.dir_name())?;
         let inner = LeafWriter::new(order, leaflet_target_rows, leaf_target_rows, zstd_level);
         Ok(Self {
             inner,
@@ -765,7 +765,7 @@ mod tests {
         assert_eq!(result.graphs.len(), 1);
 
         let graph = &result.graphs[0];
-        assert_eq!(graph.g_id, 0);
+        assert_eq!(graph.g_id, GraphId(0));
         assert_eq!(graph.total_rows, 5);
         assert!(!graph.leaf_infos.is_empty());
 

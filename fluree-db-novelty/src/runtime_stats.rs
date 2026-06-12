@@ -367,12 +367,12 @@ fn include_in_runtime_stats(flake: &Flake, to_t: i64) -> bool {
 
 fn graph_id_for_flake(snapshot: &LedgerSnapshot, flake: &Flake) -> GraphId {
     let Some(g_sid) = &flake.g else {
-        return 0;
+        return GraphId(0);
     };
     snapshot
         .decode_sid(g_sid)
         .and_then(|iri| snapshot.graph_registry.graph_id_for_iri(&iri))
-        .unwrap_or(0)
+        .unwrap_or(GraphId(0))
 }
 
 fn indexed_t(indexed: &IndexStats, snapshot: &LedgerSnapshot) -> i64 {
@@ -800,7 +800,7 @@ mod tests {
             }]),
             classes: None,
             graphs: Some(vec![GraphStatsEntry {
-                g_id: 0,
+                g_id: GraphId(0),
                 flakes: 1,
                 size: 10,
                 properties: vec![],
@@ -854,7 +854,7 @@ mod tests {
                 properties: Vec::new(),
             }]),
             graphs: Some(vec![GraphStatsEntry {
-                g_id: 0,
+                g_id: GraphId(0),
                 flakes: 0,
                 size: 0,
                 properties: vec![],

@@ -33,6 +33,7 @@
 use fluree_db_binary_index::format::run_record::{RunRecord, SPOOL_RECORD_WIRE_SIZE};
 use fluree_db_binary_index::format::run_record_v2::RunRecordV2;
 use fluree_db_core::o_type_registry::OTypeRegistry;
+use fluree_db_core::GraphId;
 use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
@@ -1284,7 +1285,7 @@ pub(crate) fn stats_record_for_remapped_run_record(
         .unwrap_or(ValueTypeTag::UNKNOWN);
 
     crate::stats::StatsRecord {
-        g_id: record.g_id,
+        g_id: GraphId(record.g_id),
         p_id: record.p_id,
         s_id: record.s_id.as_u64(),
         dt,
@@ -2265,7 +2266,7 @@ mod tests {
 
         // All records are in graph 0, so we should have exactly 1 graph entry
         assert_eq!(result.graphs.len(), 1);
-        assert_eq!(result.graphs[0].g_id, 0);
+        assert_eq!(result.graphs[0].g_id, GraphId(0));
 
         // The graph entry should contain 3 properties (p_id 10, 20, 30)
         assert_eq!(result.graphs[0].properties.len(), 3);

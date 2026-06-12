@@ -395,7 +395,7 @@ fn binary_range_eq_v3(
             t: 0,
             o_i: 0,
             o_type: filter.o_type.unwrap_or(0),
-            g_id,
+            g_id: g_id.as_u16(),
         };
         let max_key = RunRecordV2 {
             s_id: SubjectId(filter.s_id.unwrap_or(u64::MAX)),
@@ -404,7 +404,7 @@ fn binary_range_eq_v3(
             t: u32::MAX,
             o_i: u32::MAX,
             o_type: filter.o_type.unwrap_or(u16::MAX),
-            g_id,
+            g_id: g_id.as_u16(),
         };
         BinaryCursor::new(
             Arc::clone(store),
@@ -730,7 +730,7 @@ fn binary_lookup_subject_predicate_refs_batched_v3(
         t: 0,
         o_i: 0,
         o_type: 0,
-        g_id,
+        g_id: g_id.as_u16(),
     };
     let max_key = RunRecordV2 {
         s_id: SubjectId::from_u64(max_s_id),
@@ -739,7 +739,7 @@ fn binary_lookup_subject_predicate_refs_batched_v3(
         t: 0,
         o_i: u32::MAX,
         o_type: u16::MAX,
-        g_id,
+        g_id: g_id.as_u16(),
     };
 
     // Get branch manifest.
@@ -1092,7 +1092,7 @@ fn binary_range_bounded_v3(
         t: 0,
         o_i: 0,
         o_type: 0,
-        g_id,
+        g_id: g_id.as_u16(),
     };
     let max_key = RunRecordV2 {
         s_id: SubjectId::from_u64(max_s_id),
@@ -1101,7 +1101,7 @@ fn binary_range_bounded_v3(
         t: 0,
         o_i: u32::MAX,
         o_type: u16::MAX,
-        g_id,
+        g_id: g_id.as_u16(),
     };
 
     let filter = BinaryFilter::default();

@@ -152,7 +152,7 @@ impl OverlayProvider for DerivedFactsOverlay {
         callback: &mut dyn FnMut(&Flake),
     ) {
         // Derived facts from reasoning are default-graph only
-        if g_id != 0 {
+        if g_id != GraphId(0) {
             return;
         }
 
@@ -306,16 +306,32 @@ mod tests {
 
         // Collect all flakes with to_t = 3 (g_id=0 for default graph)
         let mut collected = Vec::new();
-        overlay.for_each_overlay_flake(0, IndexType::Spot, None, None, true, 3, &mut |f| {
-            collected.push(f.clone());
-        });
+        overlay.for_each_overlay_flake(
+            GraphId(0),
+            IndexType::Spot,
+            None,
+            None,
+            true,
+            3,
+            &mut |f| {
+                collected.push(f.clone());
+            },
+        );
         assert_eq!(collected.len(), 3);
 
         // Collect with to_t = 2 (should exclude t=3 flake)
         collected.clear();
-        overlay.for_each_overlay_flake(0, IndexType::Spot, None, None, true, 2, &mut |f| {
-            collected.push(f.clone());
-        });
+        overlay.for_each_overlay_flake(
+            GraphId(0),
+            IndexType::Spot,
+            None,
+            None,
+            true,
+            2,
+            &mut |f| {
+                collected.push(f.clone());
+            },
+        );
         assert_eq!(collected.len(), 2);
     }
 }

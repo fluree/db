@@ -6,6 +6,7 @@
 
 #![cfg(feature = "native")]
 
+use fluree_db_core::GraphId;
 use std::sync::Arc;
 mod support;
 
@@ -134,7 +135,7 @@ SELECT ?o WHERE { ex:s ex:label ?o }
             // ExecutionContext must extract DictNovelty from the snapshot's BinaryRangeProvider.
             // Without that, overlay translation for novelty-only string IDs can fail, leading to
             // missing rows or "string id not found in forward packs" during decode.
-            let db_ref = after.as_graph_db_ref(0);
+            let db_ref = after.as_graph_db_ref(GraphId(0));
             assert!(
                 db_ref.snapshot.range_provider.is_some(),
                 "expected snapshot.range_provider to be set"
@@ -153,7 +154,7 @@ SELECT ?o WHERE { ex:s ex:label ?o }
                 Ref::Sid(fluree_db_core::Sid::new(0, "http://example.org/label")),
                 Term::Var(o_var),
             ))];
-            let batches = execute_where(after.as_graph_db_ref(0), &vars, &patterns, None)
+            let batches = execute_where(after.as_graph_db_ref(GraphId(0)), &vars, &patterns, None)
                 .await
                 .expect("execute_where");
             assert!(!batches.is_empty(), "expected at least one batch");

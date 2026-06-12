@@ -11,6 +11,7 @@
 mod support;
 
 use fluree_db_api::{FlureeBuilder, QueryInput};
+use fluree_db_core::GraphId;
 use serde_json::{json, Value as JsonValue};
 use support::{genesis_ledger, normalize_rows, MemoryFluree, MemoryLedger};
 
@@ -199,7 +200,7 @@ async fn custom_datatype_equality_matches_indexed_and_novelty_rows_after_reindex
     let rows = support::query_jsonld(&fluree, &ledger2, &q)
         .await
         .expect("query custom datatype equality")
-        .to_jsonld_async(ledger2.as_graph_db_ref(0))
+        .to_jsonld_async(ledger2.as_graph_db_ref(GraphId(0)))
         .await
         .expect("format custom datatype equality");
 
@@ -536,7 +537,7 @@ async fn langstring_same_value_different_tags_indexed_overlay() {
     let rows = support::query_jsonld(&fluree, &ledger2, &q)
         .await
         .unwrap()
-        .to_jsonld_async(ledger2.as_graph_db_ref(0))
+        .to_jsonld_async(ledger2.as_graph_db_ref(GraphId(0)))
         .await
         .unwrap();
     let langs: std::collections::BTreeSet<String> = rows

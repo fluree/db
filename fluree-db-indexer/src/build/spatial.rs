@@ -159,7 +159,7 @@ pub(crate) async fn build_and_upload_spatial_indexes<S: Storage>(
         });
 
         tracing::info!(
-            g_id,
+            g_id = g_id.as_u16(),
             p_id,
             predicate = %pred_iri,
             geometries = write_result.root.geometry_count,

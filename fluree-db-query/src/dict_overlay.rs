@@ -104,7 +104,7 @@ impl DictOverlay {
     pub fn new(graph_view: BinaryGraphView, dict_novelty: Arc<DictNovelty>) -> Self {
         let store = graph_view.store();
         let base_p_count = store.predicate_count();
-        let base_g_count = store.graph_ids().len() as GraphId;
+        let base_g_count = GraphId(store.graph_ids().len() as u16);
         let base_lang_count = store.language_tag_count();
         let base_str_count = store.string_count();
 

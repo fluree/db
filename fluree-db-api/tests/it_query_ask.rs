@@ -7,6 +7,7 @@
 mod support;
 
 use fluree_db_api::FlureeBuilder;
+use fluree_db_core::GraphId;
 use serde_json::{json, Value as JsonValue};
 use support::{genesis_ledger, MemoryFluree, MemoryLedger};
 
@@ -48,7 +49,7 @@ async fn ask_true_when_match_exists() {
         .await
         .expect("query");
     let json = result
-        .to_jsonld_async(ledger.as_graph_db_ref(0))
+        .to_jsonld_async(ledger.as_graph_db_ref(GraphId(0)))
         .await
         .expect("to_jsonld_async");
 
@@ -70,7 +71,7 @@ async fn ask_false_when_no_match() {
         .await
         .expect("query");
     let json = result
-        .to_jsonld_async(ledger.as_graph_db_ref(0))
+        .to_jsonld_async(ledger.as_graph_db_ref(GraphId(0)))
         .await
         .expect("to_jsonld_async");
 
@@ -94,7 +95,7 @@ async fn ask_with_filter() {
         .await
         .expect("query");
     let json = result
-        .to_jsonld_async(ledger.as_graph_db_ref(0))
+        .to_jsonld_async(ledger.as_graph_db_ref(GraphId(0)))
         .await
         .expect("to_jsonld_async");
 
@@ -113,7 +114,7 @@ async fn ask_with_filter() {
         .await
         .expect("query");
     let json = result
-        .to_jsonld_async(ledger.as_graph_db_ref(0))
+        .to_jsonld_async(ledger.as_graph_db_ref(GraphId(0)))
         .await
         .expect("to_jsonld_async");
 
@@ -135,7 +136,7 @@ async fn ask_with_type_pattern() {
         .await
         .expect("query");
     let json = result
-        .to_jsonld_async(ledger.as_graph_db_ref(0))
+        .to_jsonld_async(ledger.as_graph_db_ref(GraphId(0)))
         .await
         .expect("to_jsonld_async");
 
@@ -153,7 +154,7 @@ async fn ask_with_type_pattern() {
         .await
         .expect("query");
     let json = result
-        .to_jsonld_async(ledger.as_graph_db_ref(0))
+        .to_jsonld_async(ledger.as_graph_db_ref(GraphId(0)))
         .await
         .expect("to_jsonld_async");
 
@@ -177,7 +178,7 @@ async fn ask_with_optional() {
         .await
         .expect("query");
     let json = result
-        .to_jsonld_async(ledger.as_graph_db_ref(0))
+        .to_jsonld_async(ledger.as_graph_db_ref(GraphId(0)))
         .await
         .expect("to_jsonld_async");
 
@@ -198,7 +199,7 @@ async fn ask_object_shorthand() {
         .await
         .expect("query");
     let json = result
-        .to_jsonld_async(ledger.as_graph_db_ref(0))
+        .to_jsonld_async(ledger.as_graph_db_ref(GraphId(0)))
         .await
         .expect("to_jsonld_async");
 
@@ -247,7 +248,7 @@ async fn ask_sparql_parity() {
         .await
         .expect("json-ld query");
     let jsonld_json = jsonld_result
-        .to_jsonld_async(ledger.as_graph_db_ref(0))
+        .to_jsonld_async(ledger.as_graph_db_ref(GraphId(0)))
         .await
         .expect("json-ld format");
 

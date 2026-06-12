@@ -9,6 +9,7 @@
 
 #![cfg(feature = "native")]
 
+use fluree_db_core::GraphId;
 use std::sync::Arc;
 mod support;
 
@@ -124,7 +125,7 @@ async fn policy_class_survives_indexing() {
                     None,
                     r1.ledger.t(),
                     &alice_opts,
-                    &[0],
+                    &[GraphId(0)],
                 )
                 .await
                 .expect("build policy pre-index");
@@ -182,7 +183,7 @@ async fn policy_class_survives_indexing() {
                     None,
                     ledger_indexed.t(),
                     &alice_opts,
-                    &[0],
+                    &[GraphId(0)],
                 )
                 .await
                 .expect("build policy post-index");

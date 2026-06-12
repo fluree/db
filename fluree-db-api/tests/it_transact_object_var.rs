@@ -8,6 +8,7 @@
 mod support;
 
 use fluree_db_api::{FlureeBuilder, TxnOpts};
+use fluree_db_core::GraphId;
 use serde_json::json;
 
 // Helper function to create a standard context
@@ -251,7 +252,7 @@ async fn update_id_var_still_parses_when_flag_false() {
     let jsonld = support::query_jsonld(&fluree, &ledger2, &query)
         .await
         .unwrap()
-        .to_jsonld_async(ledger2.as_graph_db_ref(0))
+        .to_jsonld_async(ledger2.as_graph_db_ref(GraphId(0)))
         .await
         .unwrap();
     assert_eq!(
@@ -389,7 +390,7 @@ async fn upsert_literal_qmark_string_has_xsd_string_type() {
         .await
         .unwrap();
     let jsonld = result
-        .to_jsonld_async(ledger2.as_graph_db_ref(0))
+        .to_jsonld_async(ledger2.as_graph_db_ref(GraphId(0)))
         .await
         .unwrap();
 
@@ -500,7 +501,7 @@ async fn update_literal_qmark_string_where_binds_and_updates() {
         .await
         .unwrap();
     let jsonld = result
-        .to_jsonld_async(ledger2.as_graph_db_ref(0))
+        .to_jsonld_async(ledger2.as_graph_db_ref(GraphId(0)))
         .await
         .unwrap();
     assert_eq!(

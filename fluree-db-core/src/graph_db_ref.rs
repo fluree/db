@@ -230,7 +230,7 @@ mod tests {
     fn test_graph_db_ref_is_copy() {
         let snapshot = LedgerSnapshot::genesis("test:main");
         let overlay = NoOverlay;
-        let db = GraphDbRef::new(&snapshot, 0, &overlay, 1);
+        let db = GraphDbRef::new(&snapshot, GraphId(0), &overlay, 1);
         // Copy semantics — both bindings valid after copy
         let db2 = db;
         assert_eq!(db.t, db2.t);
@@ -241,7 +241,7 @@ mod tests {
     fn test_eager_flag() {
         let snapshot = LedgerSnapshot::genesis("test:eager");
         let overlay = NoOverlay;
-        let db = GraphDbRef::new(&snapshot, 0, &overlay, 1);
+        let db = GraphDbRef::new(&snapshot, GraphId(0), &overlay, 1);
         assert!(!db.eager);
 
         let eager_db = db.eager();
@@ -255,7 +255,7 @@ mod tests {
         let snapshot = LedgerSnapshot::genesis("test:with-t");
         let overlay = NoOverlay;
         let dicts = RuntimeSmallDicts::default();
-        let db = GraphDbRef::new(&snapshot, 0, &overlay, 1)
+        let db = GraphDbRef::new(&snapshot, GraphId(0), &overlay, 1)
             .with_runtime_small_dicts(&dicts)
             .eager();
 
@@ -269,7 +269,7 @@ mod tests {
     async fn test_range_auto_fills_to_t() {
         let snapshot = LedgerSnapshot::genesis("test:main");
         let overlay = NoOverlay;
-        let db = GraphDbRef::new(&snapshot, 0, &overlay, 0);
+        let db = GraphDbRef::new(&snapshot, GraphId(0), &overlay, 0);
         // Genesis + NoOverlay → empty result, but should not error
         let result = db
             .range(IndexType::Spot, RangeTest::Eq, RangeMatch::new())

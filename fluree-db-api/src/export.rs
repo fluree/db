@@ -59,8 +59,8 @@ pub enum ExportFormat {
 }
 
 /// System graph IDs excluded from dataset exports.
-pub const SYSTEM_GRAPH_TXN_META: GraphId = 1;
-pub const SYSTEM_GRAPH_CONFIG: GraphId = 2;
+pub const SYSTEM_GRAPH_TXN_META: GraphId = GraphId(1);
+pub const SYSTEM_GRAPH_CONFIG: GraphId = GraphId(2);
 
 /// Returns `true` if `g_id` is a system-internal graph.
 pub fn is_system_graph(g_id: GraphId) -> bool {

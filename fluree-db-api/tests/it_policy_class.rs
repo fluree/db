@@ -9,6 +9,7 @@ mod support;
 
 use fluree_db_api::policy_builder;
 use fluree_db_api::{FlureeBuilder, QueryConnectionOptions};
+use fluree_db_core::GraphId;
 use serde_json::json;
 use std::collections::HashMap;
 use support::{assert_index_defaults, genesis_ledger};
@@ -102,7 +103,7 @@ async fn policy_class_restricts_ssn_to_own_user() {
         Some(ledger.novelty.as_ref()),
         ledger.t(),
         &qc_opts,
-        &[0],
+        &[GraphId(0)],
     )
     .await
     .expect("build policy context");
@@ -209,7 +210,7 @@ async fn policy_class_allows_non_restricted_properties() {
         Some(ledger.novelty.as_ref()),
         ledger.t(),
         &qc_opts,
-        &[0],
+        &[GraphId(0)],
     )
     .await
     .expect("build policy context");
@@ -308,7 +309,7 @@ async fn policy_class_blocks_other_user_ssn_in_where() {
         Some(ledger.novelty.as_ref()),
         ledger.t(),
         &qc_opts,
-        &[0],
+        &[GraphId(0)],
     )
     .await
     .expect("build policy context");

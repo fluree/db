@@ -58,7 +58,7 @@ impl NoveltyFactState {
     /// Absent identity → `false`.
     pub(crate) fn is_asserted(&self, g: GraphId, flake: &Flake) -> bool {
         self.graphs
-            .get(g as usize)
+            .get(g.as_usize())
             .and_then(Option::as_ref)
             .and_then(|m| m.get(&key_of(flake)).copied())
             .unwrap_or(false)
@@ -68,7 +68,7 @@ impl NoveltyFactState {
     /// per *kept* flake (assert or retract), in commit/batch (ascending-`t`)
     /// order so the last write per identity wins.
     pub(crate) fn record(&mut self, g: GraphId, flake: &Flake) {
-        let idx = g as usize;
+        let idx = g.as_usize();
         if idx >= self.graphs.len() {
             self.graphs.resize_with(idx + 1, || None);
         }
@@ -97,36 +97,36 @@ mod tests {
     fn assert_then_retract_then_reassert() {
         let mut fs = NoveltyFactState::new();
         let f = mk(1, true, None);
-        assert!(!fs.is_asserted(0, &f), "absent => not asserted");
-        fs.record(0, &mk(1, true, None));
-        assert!(fs.is_asserted(0, &f));
-        fs.record(0, &mk(1, false, None)); // retract
-        assert!(!fs.is_asserted(0, &f), "retract tombstones");
-        fs.record(0, &mk(1, true, None)); // reassert
-        assert!(fs.is_asserted(0, &f), "reassert wins");
+        assert!(!fs.is_asserted(GraphId(0), &f), "absent => not asserted");
+        fs.record(GraphId(0), &mk(1, true, None));
+        assert!(fs.is_asserted(GraphId(0), &f));
+        fs.record(GraphId(0), &mk(1, false, None)); // retract
+        assert!(!fs.is_asserted(GraphId(0), &f), "retract tombstones");
+        fs.record(GraphId(0), &mk(1, true, None)); // reassert
+        assert!(fs.is_asserted(GraphId(0), &f), "reassert wins");
     }
 
     #[test]
     fn graphs_are_independent() {
         let mut fs = NoveltyFactState::new();
         let f = mk(1, true, None);
-        fs.record(1, &f);
-        assert!(fs.is_asserted(1, &f));
-        assert!(!fs.is_asserted(0, &f), "default graph unaffected");
-        assert!(!fs.is_asserted(2, &f), "other graph unaffected");
+        fs.record(GraphId(1), &f);
+        assert!(fs.is_asserted(GraphId(1), &f));
+        assert!(!fs.is_asserted(GraphId(0), &f), "default graph unaffected");
+        assert!(!fs.is_asserted(GraphId(2), &f), "other graph unaffected");
     }
 
     #[test]
     fn meta_is_part_of_identity() {
         let mut fs = NoveltyFactState::new();
-        fs.record(0, &mk(1, true, Some("en")));
-        assert!(fs.is_asserted(0, &mk(1, true, Some("en"))));
+        fs.record(GraphId(0), &mk(1, true, Some("en")));
+        assert!(fs.is_asserted(GraphId(0), &mk(1, true, Some("en"))));
         assert!(
-            !fs.is_asserted(0, &mk(1, true, Some("fr"))),
+            !fs.is_asserted(GraphId(0), &mk(1, true, Some("fr"))),
             "different lang = different identity"
         );
         assert!(
-            !fs.is_asserted(0, &mk(1, true, None)),
+            !fs.is_asserted(GraphId(0), &mk(1, true, None)),
             "no-meta = different identity"
         );
     }

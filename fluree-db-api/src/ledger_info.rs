@@ -343,12 +343,12 @@ fn resolve_graph_selector(
     store: Option<&BinaryIndexStore>,
 ) -> Result<GraphId> {
     match selector {
-        GraphSelector::Default => Ok(0),
+        GraphSelector::Default => Ok(GraphId(0)),
         GraphSelector::ById(g_id) => Ok(*g_id),
         GraphSelector::ByName(name) => match name.as_str() {
-            "default" | "urn:default" => Ok(0),
-            "txn-meta" => Ok(1),
-            "config" => Ok(2),
+            "default" | "urn:default" => Ok(GraphId(0)),
+            "txn-meta" => Ok(GraphId(1)),
+            "config" => Ok(GraphId(2)),
             other => {
                 // Try as IRI
                 if let Some(store) = store {
@@ -364,15 +364,15 @@ fn resolve_graph_selector(
         },
         GraphSelector::ByIri(iri) => {
             if iri == "urn:default" {
-                return Ok(0);
+                return Ok(GraphId(0));
             }
             // Recognize well-known system graph IRIs so resolution works even
             // without a binary store (e.g. pre-index).
             if iri.ends_with("#txn-meta") {
-                return Ok(1);
+                return Ok(GraphId(1));
             }
             if iri.ends_with("#config") {
-                return Ok(2);
+                return Ok(GraphId(2));
             }
             if let Some(store) = store {
                 store
@@ -389,7 +389,7 @@ fn resolve_graph_selector(
 
 /// Determine the display name for a graph ID.
 fn graph_display_name(g_id: GraphId, store: Option<&BinaryIndexStore>) -> String {
-    if g_id == 0 {
+    if g_id == GraphId(0) {
         return "urn:default".to_string();
     }
     if let Some(store) = store {
@@ -439,7 +439,7 @@ fn build_ledger_block(ledger: &LedgerState, stats: &IndexStats) -> JsonValue {
     let mut named_graphs = Vec::new();
     // Always include the default graph (g_id=0). The registry does not
     // store an IRI for it, so we synthesize `urn:default` here.
-    let (default_flakes, default_size) = graph_totals(0);
+    let (default_flakes, default_size) = graph_totals(GraphId(0));
     named_graphs.push(json!({
         "iri": "urn:default",
         "g-id": 0,
@@ -897,10 +897,11 @@ pub fn parse_pre_index_manifest(bytes: &[u8]) -> std::result::Result<Vec<GraphSt
 
     let mut entries = Vec::with_capacity(graphs_arr.len());
     for g in graphs_arr {
-        let g_id = g
-            .get("g_id")
-            .and_then(serde_json::Value::as_u64)
-            .ok_or_else(|| "missing g_id".to_string())? as GraphId;
+        let g_id = GraphId(
+            g.get("g_id")
+                .and_then(serde_json::Value::as_u64)
+                .ok_or_else(|| "missing g_id".to_string())? as u16,
+        );
         let flakes = g
             .get("flakes")
             .and_then(serde_json::Value::as_u64)
@@ -1286,33 +1287,33 @@ mod tests {
     fn test_graph_selector_default() {
         assert_eq!(
             resolve_graph_selector(&GraphSelector::Default, None).unwrap(),
-            0
+            GraphId(0)
         );
     }
 
     #[test]
     fn test_graph_selector_by_id() {
         assert_eq!(
-            resolve_graph_selector(&GraphSelector::ById(3), None).unwrap(),
-            3
+            resolve_graph_selector(&GraphSelector::ById(GraphId(3)), None).unwrap(),
+            GraphId(3)
         );
     }
 
     #[test]
     fn test_graph_selector_by_name_default() {
         let sel = GraphSelector::ByName("default".to_string());
-        assert_eq!(resolve_graph_selector(&sel, None).unwrap(), 0);
+        assert_eq!(resolve_graph_selector(&sel, None).unwrap(), GraphId(0));
     }
 
     #[test]
     fn test_graph_selector_by_name_txn_meta() {
         let sel = GraphSelector::ByName("txn-meta".to_string());
-        assert_eq!(resolve_graph_selector(&sel, None).unwrap(), 1);
+        assert_eq!(resolve_graph_selector(&sel, None).unwrap(), GraphId(1));
     }
 
     #[test]
     fn test_graph_selector_by_name_config() {
         let sel = GraphSelector::ByName("config".to_string());
-        assert_eq!(resolve_graph_selector(&sel, None).unwrap(), 2);
+        assert_eq!(resolve_graph_selector(&sel, None).unwrap(), GraphId(2));
     }
 }

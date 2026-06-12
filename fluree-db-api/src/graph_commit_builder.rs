@@ -25,6 +25,7 @@ use crate::graph::Graph;
 use crate::ledger_view::CommitRef;
 use crate::{policy_builder, ApiError, Result};
 use fluree_db_core::commit::codec::read_commit;
+use fluree_db_core::GraphId;
 use fluree_db_core::{ContentId, ContentStore, FlakeValue, OverlayProvider, Tracker};
 use fluree_db_novelty::Commit;
 use fluree_db_query::QueryPolicyEnforcer;
@@ -290,7 +291,7 @@ impl<'a, 'g> CommitBuilder<'a, 'g> {
                 Some(snapshot.novelty.as_ref()),
                 commit.t,
                 &opts,
-                &[0],
+                &[GraphId(0)],
             )
             .await?;
 

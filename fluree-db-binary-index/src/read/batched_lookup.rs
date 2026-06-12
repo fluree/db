@@ -69,7 +69,7 @@ pub fn batched_lookup_predicate_refs(
     let min_s = *sorted_subjects.first().unwrap_or(&0);
     let max_s = *sorted_subjects.last().unwrap_or(&min_s);
     tracing::debug!(
-        g_id,
+        g_id = g_id.as_u16(),
         p_id,
         subjects = sorted_subjects.len(),
         chunks = chunks.len(),
@@ -112,7 +112,7 @@ pub fn batched_lookup_predicate_refs(
                 let c = hb_chunk_idx.load(std::sync::atomic::Ordering::Relaxed);
                 let h = hb_hits.load(std::sync::atomic::Ordering::Relaxed);
                 tracing::debug!(
-                    g_id,
+                    g_id = g_id.as_u16(),
                     p_id,
                     chunk_idx = c,
                     scanned_batches = b,
@@ -132,7 +132,7 @@ pub fn batched_lookup_predicate_refs(
         let max_s = *chunk.last().unwrap();
 
         tracing::debug!(
-            g_id,
+            g_id = g_id.as_u16(),
             p_id,
             chunk_idx,
             chunk_subjects = chunk.len(),
@@ -149,7 +149,7 @@ pub fn batched_lookup_predicate_refs(
             t: 0,
             o_i: 0,
             o_type: 0,
-            g_id,
+            g_id: g_id.as_u16(),
         };
         let max_key = RunRecordV2 {
             s_id: SubjectId::from_u64(max_s),
@@ -158,7 +158,7 @@ pub fn batched_lookup_predicate_refs(
             t: 0,
             o_i: u32::MAX,
             o_type: u16::MAX,
-            g_id,
+            g_id: g_id.as_u16(),
         };
 
         let filter = BinaryFilter {
@@ -205,7 +205,7 @@ pub fn batched_lookup_predicate_refs(
     let _ = hb.join();
 
     tracing::debug!(
-        g_id,
+        g_id = g_id.as_u16(),
         p_id,
         subjects_with_hits = out.len(),
         scanned_batches = scanned_batches.load(std::sync::atomic::Ordering::Relaxed),
@@ -280,7 +280,7 @@ pub fn batched_lookup_subject_properties(
             t: 0,
             o_i: 0,
             o_type: 0,
-            g_id,
+            g_id: g_id.as_u16(),
         };
         let max_key = RunRecordV2 {
             s_id: SubjectId::from_u64(max_s),
@@ -289,7 +289,7 @@ pub fn batched_lookup_subject_properties(
             t: 0,
             o_i: u32::MAX,
             o_type: u16::MAX,
-            g_id,
+            g_id: g_id.as_u16(),
         };
 
         let mut cursor = BinaryCursor::new(
@@ -382,7 +382,7 @@ pub fn batched_lookup_inbound_refs(
             t: 0,
             o_i: 0,
             o_type: iri_ref,
-            g_id,
+            g_id: g_id.as_u16(),
         };
         let max_key = RunRecordV2 {
             s_id: SubjectId::from_u64(u64::MAX),
@@ -391,7 +391,7 @@ pub fn batched_lookup_inbound_refs(
             t: 0,
             o_i: u32::MAX,
             o_type: iri_ref,
-            g_id,
+            g_id: g_id.as_u16(),
         };
 
         let mut cursor = BinaryCursor::new(

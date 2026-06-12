@@ -233,7 +233,7 @@ impl Novelty {
 
     /// Ensure the graphs vec has a slot for `g_id`, growing if needed.
     fn ensure_graph(&mut self, g_id: GraphId) -> &mut GraphIndexVectors {
-        let idx = g_id as usize;
+        let idx = g_id.as_usize();
         if idx >= self.graphs.len() {
             self.graphs.resize_with(idx + 1, || None);
         }
@@ -246,7 +246,7 @@ impl Novelty {
     /// - `Some(sid)` → looked up in `reverse_graph`; returns error if unknown
     fn resolve_flake_g_id(flake: &Flake, reverse_graph: &HashMap<Sid, GraphId>) -> Result<GraphId> {
         match &flake.g {
-            None => Ok(0),
+            None => Ok(GraphId(0)),
             Some(g_sid) => reverse_graph.get(g_sid).copied().ok_or_else(|| {
                 NoveltyError::InvalidGraph(format!("flake references unknown graph Sid: {g_sid}"))
             }),
@@ -377,7 +377,7 @@ impl Novelty {
         let parent = tracing::Span::current();
 
         for (g_id, batch_ids) in &per_graph {
-            let graph_vecs = self.graphs[*g_id as usize]
+            let graph_vecs = self.graphs[g_id.as_usize()]
                 .as_mut()
                 .expect("graph slot ensured above");
             let (spot, psot, post, opst) = (
@@ -536,7 +536,7 @@ impl Novelty {
             // SPOT/PSOT/POST/OPST have identical alive sets (apply_commit
             // pushes the same batch_ids to all four), so taking SPOT is
             // the canonical choice.
-            let graph_vecs = self.graphs[g_id as usize]
+            let graph_vecs = self.graphs[g_id.as_usize()]
                 .as_mut()
                 .expect("ensure_graph above");
             let existing_spot = std::mem::take(&mut graph_vecs.spot);
@@ -613,7 +613,7 @@ impl Novelty {
             let mut opst = kept;
             opst.par_sort_unstable_by(|&a, &b| IndexType::Opst.compare(store.get(a), store.get(b)));
 
-            let graph_vecs = self.graphs[g_id as usize]
+            let graph_vecs = self.graphs[g_id.as_usize()]
                 .as_mut()
                 .expect("ensure_graph above");
             graph_vecs.spot = spot;
@@ -680,7 +680,8 @@ impl Novelty {
         for (g, slot) in self.graphs.iter().enumerate() {
             if let Some(gv) = slot {
                 for &id in &gv.spot {
-                    self.fact_state.record(g as GraphId, self.store.get(id));
+                    self.fact_state
+                        .record(GraphId(g as u16), self.store.get(id));
                 }
             }
         }
@@ -706,7 +707,7 @@ impl Novelty {
         rhs: Option<&Flake>,
         leftmost: bool,
     ) -> &[FlakeId] {
-        match self.graphs.get(g_id as usize).and_then(Option::as_ref) {
+        match self.graphs.get(g_id.as_usize()).and_then(Option::as_ref) {
             Some(graph_vecs) => {
                 graph_vecs.slice_for_range(&self.store, index, first, rhs, leftmost)
             }
@@ -1204,17 +1205,17 @@ mod tests {
         novelty.apply_commit(flakes, 1, &no_graphs()).unwrap();
 
         // Full range (leftmost, no rhs) — default graph
-        let slice = novelty.slice_for_range(0, IndexType::Spot, None, None, true);
+        let slice = novelty.slice_for_range(GraphId(0), IndexType::Spot, None, None, true);
         assert_eq!(slice.len(), 5);
 
         // From subject 2 (exclusive) to end
         let first = make_flake(2, 1, 100, 1, true);
-        let slice = novelty.slice_for_range(0, IndexType::Spot, Some(&first), None, false);
+        let slice = novelty.slice_for_range(GraphId(0), IndexType::Spot, Some(&first), None, false);
         // Should get subjects 3, 4, 5 (> 2)
         assert_eq!(slice.len(), 3);
 
         // Absent graph returns empty slice
-        let slice = novelty.slice_for_range(99, IndexType::Spot, None, None, true);
+        let slice = novelty.slice_for_range(GraphId(99), IndexType::Spot, None, None, true);
         assert!(slice.is_empty());
     }
 
@@ -1234,7 +1235,7 @@ mod tests {
 
         // From leftmost to subject 3 (inclusive) — default graph
         let rhs = make_flake(3, 1, 100, 1, true);
-        let slice = novelty.slice_for_range(0, IndexType::Spot, None, Some(&rhs), true);
+        let slice = novelty.slice_for_range(GraphId(0), IndexType::Spot, None, Some(&rhs), true);
         // Should get subjects 1, 2, 3 (<= 3)
         assert_eq!(slice.len(), 3);
     }
@@ -1349,7 +1350,7 @@ mod tests {
         // Set up: graph 2 mapped to Sid("g", "graph2")
         let g2_sid = Sid::new(100, "graph2");
         let mut rg = HashMap::new();
-        rg.insert(g2_sid.clone(), 2u16);
+        rg.insert(g2_sid.clone(), GraphId(2));
 
         // Default graph flakes (flake.g = None)
         let default_flakes = vec![
@@ -1369,15 +1370,15 @@ mod tests {
         novelty.apply_commit(all, 1, &rg).unwrap();
 
         // Default graph (g_id=0) should have 2 flakes
-        let g0_slice = novelty.slice_for_range(0, IndexType::Spot, None, None, true);
+        let g0_slice = novelty.slice_for_range(GraphId(0), IndexType::Spot, None, None, true);
         assert_eq!(g0_slice.len(), 2);
 
         // Named graph (g_id=2) should have 3 flakes
-        let g2_slice = novelty.slice_for_range(2, IndexType::Spot, None, None, true);
+        let g2_slice = novelty.slice_for_range(GraphId(2), IndexType::Spot, None, None, true);
         assert_eq!(g2_slice.len(), 3);
 
         // Non-existent graph returns empty
-        let g99_slice = novelty.slice_for_range(99, IndexType::Spot, None, None, true);
+        let g99_slice = novelty.slice_for_range(GraphId(99), IndexType::Spot, None, None, true);
         assert!(g99_slice.is_empty());
 
         // iter_index returns ALL flakes across graphs
@@ -1550,8 +1551,8 @@ mod tests {
 
     fn eq_reverse_graph() -> HashMap<Sid, GraphId> {
         let mut m = HashMap::new();
-        m.insert(Sid::new(8, "g1"), 1u16);
-        m.insert(Sid::new(8, "g2"), 2u16);
+        m.insert(Sid::new(8, "g1"), GraphId(1));
+        m.insert(Sid::new(8, "g2"), GraphId(2));
         m
     }
 
@@ -1615,7 +1616,7 @@ mod tests {
             for g in 0u16..=2 {
                 // Each order is sorted by its comparator.
                 for idx in ORDERS {
-                    let ids = eq_full(&n, g, idx);
+                    let ids = eq_full(&n, GraphId(g), idx);
                     for w in ids.windows(2) {
                         assert!(
                             idx.compare(n.get_flake(w[0]), n.get_flake(w[1])) != Ordering::Greater,
@@ -1625,7 +1626,7 @@ mod tests {
                 }
                 // All four orders hold the same multiset of flakes.
                 let canon = |idx: IndexType| -> Vec<String> {
-                    let mut v: Vec<String> = eq_full(&n, g, idx)
+                    let mut v: Vec<String> = eq_full(&n, GraphId(g), idx)
                         .iter()
                         .map(|&id| format!("{:?}", n.get_flake(id)))
                         .collect();
@@ -1644,10 +1645,11 @@ mod tests {
                 // bounded / first-only / open / empty cases. Exercises every
                 // comparator path the future k-way merge must implement.
                 for idx in ORDERS {
-                    let full = eq_full(&n, g, idx);
+                    let full = eq_full(&n, GraphId(g), idx);
                     // open-ended (leftmost, no rhs) == the full ordered scan
                     assert_eq!(
-                        n.slice_for_range(g, idx, None, None, true).to_vec(),
+                        n.slice_for_range(GraphId(g), idx, None, None, true)
+                            .to_vec(),
                         full,
                         "open range != full {idx:?} g{g} (seed {seed})"
                     );
@@ -1667,7 +1669,7 @@ mod tests {
                     };
                     // bounded (first, rhs]
                     assert_eq!(
-                        n.slice_for_range(g, idx, Some(&first), Some(&rhs), false)
+                        n.slice_for_range(GraphId(g), idx, Some(&first), Some(&rhs), false)
                             .to_vec(),
                         scan(&|f| {
                             idx.compare(f, &first) == Ordering::Greater
@@ -1677,7 +1679,7 @@ mod tests {
                     );
                     // first-only (first, end]
                     assert_eq!(
-                        n.slice_for_range(g, idx, Some(&first), None, false)
+                        n.slice_for_range(GraphId(g), idx, Some(&first), None, false)
                             .to_vec(),
                         scan(&|f| idx.compare(f, &first) == Ordering::Greater),
                         "first-only range {idx:?} g{g} (seed {seed})"
@@ -1686,7 +1688,7 @@ mod tests {
                     let maxf = n.get_flake(*full.last().unwrap()).clone();
                     let minf = n.get_flake(full[0]).clone();
                     assert_eq!(
-                        n.slice_for_range(g, idx, Some(&maxf), Some(&minf), false)
+                        n.slice_for_range(GraphId(g), idx, Some(&maxf), Some(&minf), false)
                             .to_vec(),
                         scan(&|f| {
                             idx.compare(f, &maxf) == Ordering::Greater
@@ -1698,7 +1700,7 @@ mod tests {
 
                 // Fold the full ordered snapshot into the contract digest.
                 for idx in ORDERS {
-                    let ids = eq_full(&n, g, idx);
+                    let ids = eq_full(&n, GraphId(g), idx);
                     ids.len().hash(&mut digest);
                     for id in ids {
                         format!("{:?}", n.get_flake(id)).hash(&mut digest);

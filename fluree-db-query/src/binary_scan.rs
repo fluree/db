@@ -641,7 +641,7 @@ impl BinaryScanOperator {
             o_var_pos,
             state: OperatorState::Created,
             store: None,
-            g_id: 0,
+            g_id: GraphId(0),
             cursor: None,
             p_sids: Vec::new(),
             sid_cache: HashMap::new(),
@@ -1039,7 +1039,7 @@ impl BinaryScanOperator {
     /// Filter: skip internal db: predicates when predicate is a variable.
     #[inline]
     fn is_internal_predicate(&self, p_id: u32) -> bool {
-        if !self.p_is_var || self.g_id != 0 {
+        if !self.p_is_var || self.g_id != GraphId(0) {
             return false;
         }
         self.p_sids
@@ -1907,7 +1907,7 @@ impl Operator for BinaryScanOperator {
                 t: 0,
                 o_i: 0,
                 o_type: filter.o_type.or(range_o_type).unwrap_or(0),
-                g_id: self.g_id,
+                g_id: self.g_id.as_u16(),
             };
             let max_key = RunRecordV2 {
                 s_id: SubjectId(filter.s_id.unwrap_or(u64::MAX)),
@@ -1916,7 +1916,7 @@ impl Operator for BinaryScanOperator {
                 t: u32::MAX,
                 o_i: u32::MAX,
                 o_type: filter.o_type.or(range_o_type).unwrap_or(u16::MAX),
-                g_id: self.g_id,
+                g_id: self.g_id.as_u16(),
             };
             BinaryCursor::new(
                 Arc::clone(&store_arc),
@@ -2031,7 +2031,7 @@ impl Operator for BinaryScanOperator {
         tracing::debug!(
             index = ?self.index,
             order = ?order,
-            g_id = self.g_id,
+            g_id = self.g_id.as_u16(),
             pattern = ?self.pattern,
             "BinaryScanOperator::open"
         );
@@ -2924,7 +2924,7 @@ mod tests {
     fn infer_exact_datatype_for_integer_family() {
         let mut stats = StatsView::default();
         stats.graph_properties.insert(
-            0,
+            GraphId(0),
             HashMap::from([(
                 RuntimePredicateId::from_u32(7),
                 GraphPropertyStatData {
@@ -2938,7 +2938,7 @@ mod tests {
 
         let inferred = infer_exact_datatype_sid_from_stats(
             Some(&stats),
-            0,
+            GraphId(0),
             RuntimePredicateId::from_u32(7),
             &FlakeValue::Long(42),
         )
@@ -2951,7 +2951,7 @@ mod tests {
     fn does_not_infer_when_multiple_datatypes_present() {
         let mut stats = StatsView::default();
         stats.graph_properties.insert(
-            0,
+            GraphId(0),
             HashMap::from([(
                 RuntimePredicateId::from_u32(7),
                 GraphPropertyStatData {
@@ -2965,7 +2965,7 @@ mod tests {
 
         assert!(infer_exact_datatype_sid_from_stats(
             Some(&stats),
-            0,
+            GraphId(0),
             RuntimePredicateId::from_u32(7),
             &FlakeValue::Long(42),
         )

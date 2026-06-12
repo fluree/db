@@ -269,7 +269,7 @@ mod tests {
         let mut hook = FulltextHook::new();
         let config = empty_config();
         hook.on_op(make_input(
-            0,
+            GraphId(0),
             5,
             DatatypeDictId::FULL_TEXT.as_u16(),
             LEX,
@@ -292,10 +292,10 @@ mod tests {
     fn test_hook_datatype_overrides_configured_set() {
         // A property that is ALSO in the configured set, but the value's
         // datatype is @fulltext — datatype wins, always English.
-        let config = FulltextHookConfig::new(std::iter::empty::<u32>(), [(0u16, 5u32)]);
+        let config = FulltextHookConfig::new(std::iter::empty::<u32>(), [(GraphId(0), 5u32)]);
         let mut hook = FulltextHook::new();
         hook.on_op(make_input(
-            0,
+            GraphId(0),
             5,
             DatatypeDictId::FULL_TEXT.as_u16(),
             LEX,
@@ -314,10 +314,10 @@ mod tests {
 
     #[test]
     fn test_hook_collects_configured_property_with_lang_id() {
-        let config = FulltextHookConfig::new(std::iter::empty::<u32>(), [(0u16, 5u32)]);
+        let config = FulltextHookConfig::new(std::iter::empty::<u32>(), [(GraphId(0), 5u32)]);
         let mut hook = FulltextHook::new();
         hook.on_op(make_input(
-            0,
+            GraphId(0),
             5,
             DatatypeDictId::STRING.as_u16(),
             LEX,
@@ -339,7 +339,7 @@ mod tests {
         let mut hook = FulltextHook::new();
         // Plain string, property not in config → should NOT be collected.
         hook.on_op(make_input(
-            0,
+            GraphId(0),
             5,
             DatatypeDictId::STRING.as_u16(),
             LEX,
@@ -359,7 +359,7 @@ mod tests {
 
         // Vector dt_id, not fulltext, not configured
         hook.on_op(make_input(
-            0,
+            GraphId(0),
             5,
             DatatypeDictId::VECTOR.as_u16(),
             LEX,
@@ -375,11 +375,11 @@ mod tests {
     #[test]
     fn test_hook_skips_non_lex_kind() {
         let mut hook = FulltextHook::new();
-        let config = FulltextHookConfig::new(std::iter::empty::<u32>(), [(0u16, 5u32)]);
+        let config = FulltextHookConfig::new(std::iter::empty::<u32>(), [(GraphId(0), 5u32)]);
 
         // @fulltext dt but wrong o_kind (REF_ID)
         hook.on_op(make_input(
-            0,
+            GraphId(0),
             5,
             DatatypeDictId::FULL_TEXT.as_u16(),
             ObjKind::REF_ID.as_u8(),
@@ -393,7 +393,7 @@ mod tests {
 
         // configured property but NUM_INT o_kind
         hook.on_op(make_input(
-            0,
+            GraphId(0),
             5,
             DatatypeDictId::STRING.as_u16(),
             ObjKind::NUM_INT.as_u8(),
@@ -411,7 +411,7 @@ mod tests {
         let mut hook = FulltextHook::new();
         let config = empty_config();
         hook.on_op(make_input(
-            0,
+            GraphId(0),
             5,
             DatatypeDictId::FULL_TEXT.as_u16(),
             LEX,
@@ -422,7 +422,7 @@ mod tests {
             &config,
         ));
         hook.on_op(make_input(
-            0,
+            GraphId(0),
             5,
             DatatypeDictId::FULL_TEXT.as_u16(),
             LEX,
@@ -442,7 +442,7 @@ mod tests {
         let mut hook = FulltextHook::new();
         let config = empty_config();
         hook.on_op(make_input(
-            0,
+            GraphId(0),
             5,
             DatatypeDictId::FULL_TEXT.as_u16(),
             LEX,
@@ -453,7 +453,7 @@ mod tests {
             &config,
         ));
         hook.on_op(make_input(
-            1,
+            GraphId(1),
             7,
             DatatypeDictId::FULL_TEXT.as_u16(),
             LEX,
@@ -465,7 +465,7 @@ mod tests {
         ));
         let entries = hook.into_entries();
         assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0].g_id, 0);
-        assert_eq!(entries[1].g_id, 1);
+        assert_eq!(entries[0].g_id, GraphId(0));
+        assert_eq!(entries[1].g_id, GraphId(1));
     }
 }

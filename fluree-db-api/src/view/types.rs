@@ -243,7 +243,7 @@ impl GraphDb {
             novelty,
             t,
             ledger_id: ledger_id.into(),
-            graph_id: 0,
+            graph_id: GraphId(0),
             policy: None,
             policy_enforcer: None,
             reasoning: None,

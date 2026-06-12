@@ -195,7 +195,7 @@ fn build_per_graph_shacl_policy(
     if let Some(cfg) = &ledger_wide {
         if cfg.enabled {
             map.insert(
-                0,
+                GraphId(0),
                 fluree_db_transact::ShaclGraphPolicy {
                     mode: cfg.validation_mode,
                 },
@@ -215,7 +215,7 @@ fn build_per_graph_shacl_policy(
         if let Some(per_graph) = config_resolver::merge_shacl_opts(&resolved, None) {
             if per_graph.enabled {
                 map.insert(
-                    *g_id,
+                    GraphId(*g_id),
                     fluree_db_transact::ShaclGraphPolicy {
                         mode: per_graph.validation_mode,
                     },
@@ -248,7 +248,7 @@ pub(crate) struct StagedShaclContext<'a> {
     /// `GraphId → Sid` mapping used by [`validate_view_with_shacl`] to route
     /// each staged flake to the correct per-graph validator. Pass `None` to
     /// fall back to default-graph validation (see `validate_staged_nodes`).
-    pub graph_sids: Option<&'a HashMap<GraphId, Sid>>,
+    pub graph_sids: Option<&'a HashMap<u16, Sid>>,
 
     /// Optional tracker for SHACL fuel accounting during validation.
     pub tracker: Option<&'a fluree_db_core::Tracker>,
@@ -367,7 +367,7 @@ fn resolve_shapes_source_g_ids(
         .and_then(|s| s.shapes_source.as_ref());
 
     let Some(source) = source else {
-        return Ok(vec![0]);
+        return Ok(vec![GraphId(0)]);
     };
 
     // Temporal / trust / rollback / cross-ledger dimensions of GraphSourceRef
@@ -395,9 +395,9 @@ fn resolve_shapes_source_g_ids(
     }
 
     let g_id = match source.graph_selector.as_deref() {
-        Some(iri) if iri == config_iris::DEFAULT_GRAPH => Some(0u16),
+        Some(iri) if iri == config_iris::DEFAULT_GRAPH => Some(GraphId(0)),
         Some(iri) => snapshot.graph_registry.graph_id_for_iri(iri),
-        None => Some(0u16),
+        None => Some(GraphId(0)),
     };
 
     match g_id {
@@ -452,7 +452,7 @@ pub(crate) async fn apply_shacl_policy_to_staged_view(
                 Some(cfg) if cfg.enabled => {
                     let mut m = HashMap::new();
                     m.insert(
-                        0u16,
+                        GraphId(0),
                         fluree_db_transact::ShaclGraphPolicy {
                             mode: cfg.validation_mode,
                         },
@@ -524,7 +524,7 @@ pub(crate) async fn apply_shacl_policy_to_staged_view(
             ));
             vec![fluree_db_core::GraphDbRef::new(
                 &base.snapshot,
-                0u16,
+                GraphId(0u16),
                 cl_overlay_holder.as_ref().expect("just set above"),
                 base.t(),
             )]
@@ -552,7 +552,7 @@ pub(crate) async fn apply_shacl_policy_to_staged_view(
         ));
         shape_dbs.push(fluree_db_core::GraphDbRef::new(
             &base.snapshot,
-            0u16,
+            GraphId(0u16),
             inline_overlay_holder.as_ref().expect("just set above"),
             base.t(),
         ));
@@ -687,7 +687,7 @@ async fn stage_with_config_shacl(
         None
     };
 
-    let graph_sids: HashMap<GraphId, Sid> = graph_delta
+    let graph_sids: HashMap<u16, Sid> = graph_delta
         .iter()
         .map(|(&g_id, iri)| (g_id, ns_registry.sid_for_iri(iri)))
         .collect();
@@ -808,7 +808,7 @@ fn affected_graph_ids(
     let mut sid_to_gid: HashMap<Sid, GraphId> = HashMap::new();
     for (&g_id, iri) in graph_delta {
         if let Some(sid) = snapshot.encode_iri(iri) {
-            sid_to_gid.insert(sid, g_id);
+            sid_to_gid.insert(sid, GraphId(g_id));
         }
     }
     for (g_id, iri) in snapshot.graph_registry.iter_entries() {
@@ -824,9 +824,13 @@ fn affected_graph_ids(
         }
         let g_id = match &flake.g {
             None => 0u16,
-            Some(g_sid) => sid_to_gid.get(g_sid).copied().unwrap_or(0),
+            Some(g_sid) => sid_to_gid
+                .get(g_sid)
+                .copied()
+                .unwrap_or(GraphId(0))
+                .as_u16(),
         };
-        out.insert(g_id);
+        out.insert(GraphId(g_id));
     }
     out
 }
@@ -850,11 +854,11 @@ async fn resolve_per_graph_unique_sids(
 
     for &g_id in &affected_g_ids {
         // Resolve graph IRI for per-graph config lookup
-        let graph_iri = if g_id == 0 {
+        let graph_iri = if g_id == GraphId(0) {
             None
         } else {
             graph_delta
-                .get(&g_id)
+                .get(&g_id.as_u16())
                 .map(std::string::String::as_str)
                 .or_else(|| snapshot.graph_registry.iri_for_graph_id(g_id))
         };
@@ -873,7 +877,7 @@ async fn resolve_per_graph_unique_sids(
 
         if transact_config.constraints_sources.is_empty() {
             // Default: annotations in the default graph (g_id=0)
-            let annotations = read_enforce_unique_from_graph(view, 0u16).await?;
+            let annotations = read_enforce_unique_from_graph(view, GraphId(0u16)).await?;
             unique_sids.extend(annotations);
         } else {
             let mut local_sources: Vec<&fluree_db_core::ledger_config::GraphSourceRef> = Vec::new();
@@ -986,9 +990,9 @@ fn resolve_constraint_source_g_ids_for(
         }
 
         let g_id = match source.graph_selector.as_deref() {
-            Some(iri) if iri == config_iris::DEFAULT_GRAPH => Some(0u16),
+            Some(iri) if iri == config_iris::DEFAULT_GRAPH => Some(GraphId(0)),
             Some(iri) => snapshot.graph_registry.graph_id_for_iri(iri),
-            None => Some(0u16), // no selector → default graph
+            None => Some(GraphId(0)), // no selector → default graph
         };
         match g_id {
             Some(id) => g_ids.push(id),
@@ -1069,7 +1073,7 @@ async fn enforce_unique_constraints(
     let mut sid_to_gid: HashMap<Sid, GraphId> = HashMap::new();
     for (&g_id, iri) in graph_delta {
         if let Some(sid) = snapshot.encode_iri(iri) {
-            sid_to_gid.insert(sid, g_id);
+            sid_to_gid.insert(sid, GraphId(g_id));
         }
     }
     for (g_id, iri) in snapshot.graph_registry.iter_entries() {
@@ -1087,8 +1091,8 @@ async fn enforce_unique_constraints(
             continue;
         }
         let g_id = match &flake.g {
-            None => 0u16,
-            Some(g_sid) => sid_to_gid.get(g_sid).copied().unwrap_or(0),
+            None => GraphId(0),
+            Some(g_sid) => sid_to_gid.get(g_sid).copied().unwrap_or(GraphId(0)),
         };
         if let Some(unique_set) = per_graph_unique.get(&g_id) {
             if unique_set.contains(&flake.p) {
@@ -1125,11 +1129,11 @@ async fn enforce_unique_constraints(
         if seen_subjects.len() > 1 {
             // Build a descriptive error with decoded IRIs
             let property_iri = snapshot.decode_sid(p).unwrap_or_else(|| format!("{p:?}"));
-            let graph_label = if *g_id == 0 {
+            let graph_label = if *g_id == GraphId(0) {
                 "default".to_string()
             } else {
                 graph_delta
-                    .get(g_id)
+                    .get(&g_id.as_u16())
                     .cloned()
                     .or_else(|| {
                         snapshot
@@ -2580,7 +2584,7 @@ impl crate::Fluree {
             Some(ledger.novelty.as_ref()),
             ledger.t(),
             &opts,
-            &[0],
+            &[GraphId(0)],
         )
         .await?;
 

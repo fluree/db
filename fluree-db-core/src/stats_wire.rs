@@ -3,6 +3,7 @@
 //! These decode the binary stats/schema sections embedded in `IndexRoot`
 //! (FIR6). The encode functions live in `fluree-db-indexer`.
 
+use crate::ids::GraphId;
 use crate::index_schema::{IndexSchema, SchemaPredicateInfo, SchemaPredicates};
 use crate::index_stats::{
     ClassPropertyUsage, ClassRefCount, ClassStatEntry, GraphPropertyStatEntry, GraphStatsEntry,
@@ -200,7 +201,7 @@ pub fn decode_stats(data: &[u8]) -> io::Result<(IndexStats, usize)> {
     let graph_count = read_u16(data, &mut pos)? as usize;
     let mut graphs = Vec::with_capacity(graph_count);
     for _ in 0..graph_count {
-        let g_id = read_u16(data, &mut pos)?;
+        let g_id = GraphId(read_u16(data, &mut pos)?);
         let g_flakes = read_u64(data, &mut pos)?;
         let g_size = read_u64(data, &mut pos)?;
         let prop_count = read_u32(data, &mut pos)? as usize;

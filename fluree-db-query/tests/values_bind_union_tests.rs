@@ -5,7 +5,7 @@
 //! - BIND expression evaluation
 //! - UNION branch execution
 
-use fluree_db_core::{FlakeValue, GraphDbRef, LedgerSnapshot, NoOverlay, Sid};
+use fluree_db_core::{FlakeValue, GraphDbRef, GraphId, LedgerSnapshot, NoOverlay, Sid};
 use fluree_db_query::binding::Binding;
 use fluree_db_query::context::ExecutionContext;
 use fluree_db_query::execute::{execute, ContextConfig, ExecutableQuery};
@@ -84,7 +84,7 @@ async fn test_values_first_then_join() {
     );
 
     // This should succeed even though VALUES is at position 0
-    let db = GraphDbRef::new(&snapshot, 0, &NoOverlay, snapshot.t);
+    let db = GraphDbRef::new(&snapshot, GraphId(0), &NoOverlay, snapshot.t);
     let executable = ExecutableQuery::simple(query);
     let results = execute(db, &vars, &executable, ContextConfig::default())
         .await
@@ -119,7 +119,7 @@ async fn test_bind_first() {
     );
 
     // Should succeed even though BIND is at position 0
-    let db = GraphDbRef::new(&snapshot, 0, &NoOverlay, snapshot.t);
+    let db = GraphDbRef::new(&snapshot, GraphId(0), &NoOverlay, snapshot.t);
     let executable = ExecutableQuery::simple(query);
     let results = execute(db, &vars, &executable, ContextConfig::default())
         .await
@@ -159,7 +159,7 @@ async fn test_union_first() {
     );
 
     // Should succeed even though UNION is at position 0
-    let db = GraphDbRef::new(&snapshot, 0, &NoOverlay, snapshot.t);
+    let db = GraphDbRef::new(&snapshot, GraphId(0), &NoOverlay, snapshot.t);
     let executable = ExecutableQuery::simple(query);
     let results = execute(db, &vars, &executable, ContextConfig::default())
         .await
@@ -191,7 +191,7 @@ async fn test_filter_first_true() {
     );
 
     // Should succeed - FILTER is on constants, passes for the empty seed row
-    let db = GraphDbRef::new(&snapshot, 0, &NoOverlay, snapshot.t);
+    let db = GraphDbRef::new(&snapshot, GraphId(0), &NoOverlay, snapshot.t);
     let executable = ExecutableQuery::simple(query);
     let results = execute(db, &vars, &executable, ContextConfig::default())
         .await
@@ -220,7 +220,7 @@ async fn test_filter_first_false() {
     );
 
     // The false filter should eliminate all rows
-    let db = GraphDbRef::new(&snapshot, 0, &NoOverlay, snapshot.t);
+    let db = GraphDbRef::new(&snapshot, GraphId(0), &NoOverlay, snapshot.t);
     let executable = ExecutableQuery::simple(query);
     let results = execute(db, &vars, &executable, ContextConfig::default())
         .await
@@ -376,7 +376,7 @@ async fn test_union_is_correlated_via_values_overlap() {
         ],
     );
 
-    let db = GraphDbRef::new(&snapshot, 0, &NoOverlay, snapshot.t);
+    let db = GraphDbRef::new(&snapshot, GraphId(0), &NoOverlay, snapshot.t);
     let executable = ExecutableQuery::simple(query);
     let results = execute(db, &vars, &executable, ContextConfig::default())
         .await

@@ -6,6 +6,7 @@ use async_trait::async_trait;
 use fluree_db_api::tx::IndexingMode;
 use fluree_db_api::{Fluree, IndexerConfig, NameServiceMode, TriggerIndexOptions};
 use fluree_db_connection::config::ConnectionConfig;
+use fluree_db_core::GraphId;
 use fluree_db_core::{ContentKind, ContentStore, MemoryStorage, StorageMethod};
 use fluree_db_nameservice::memory::MemoryNameService;
 use serde_json::json;
@@ -262,7 +263,7 @@ async fn trigger_index_second_run_uses_incremental_not_full_rebuild() {
                 let ga = root
                     .graph_arenas
                     .iter()
-                    .find(|ga| ga.g_id == g_id)
+                    .find(|ga| ga.g_id == GraphId(g_id))
                     .unwrap_or_else(|| panic!("missing graph_arenas entry for g_id={g_id}"));
                 ga.numbig
                     .iter()

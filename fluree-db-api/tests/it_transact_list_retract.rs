@@ -41,6 +41,7 @@
 mod support;
 
 use fluree_db_api::FlureeBuilder;
+use fluree_db_core::GraphId;
 use serde_json::{json, Value as JsonValue};
 
 fn ctx() -> JsonValue {
@@ -61,7 +62,7 @@ async fn count_items(fluree: &fluree_db_api::Fluree, ledger: &fluree_db_api::Led
         .await
         .expect("sparql count");
     let jsonld = result
-        .to_jsonld_async(ledger.as_graph_db_ref(0))
+        .to_jsonld_async(ledger.as_graph_db_ref(GraphId(0)))
         .await
         .expect("to_jsonld_async");
     let arr = jsonld.as_array().expect("array result");

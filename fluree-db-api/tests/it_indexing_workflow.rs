@@ -3,6 +3,7 @@
 
 #![cfg(feature = "native")]
 
+use fluree_db_core::GraphId;
 use std::sync::Arc;
 mod support;
 
@@ -1112,7 +1113,7 @@ async fn expansion_select_works_after_indexing() {
                 .await
                 .expect("query");
             let json_rows = result
-                .to_jsonld_async(loaded.as_graph_db_ref(0))
+                .to_jsonld_async(loaded.as_graph_db_ref(GraphId(0)))
                 .await
                 .expect("jsonld");
             let rows = json_rows.as_array().expect("should be array");
@@ -1139,7 +1140,7 @@ async fn expansion_select_works_after_indexing() {
                 .await
                 .expect("query2");
             let json_rows2 = result2
-                .to_jsonld_async(loaded.as_graph_db_ref(0))
+                .to_jsonld_async(loaded.as_graph_db_ref(GraphId(0)))
                 .await
                 .expect("jsonld2");
             let rows2 = json_rows2.as_array().expect("should be array");

@@ -147,7 +147,7 @@ mod tests {
             )
             .unwrap();
 
-        let db = GraphDbRef::new(&snapshot, 0, &novelty, 2);
+        let db = GraphDbRef::new(&snapshot, GraphId(0), &novelty, 2);
         let first = cached_stats_view_for_db(db, None).expect("first stats view");
         assert_eq!(
             first

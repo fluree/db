@@ -18,6 +18,7 @@
 mod support;
 
 use fluree_db_api::FlureeBuilder;
+use fluree_db_core::GraphId;
 use fluree_db_core::{
     range_with_overlay, FlakeValue, IndexType, RangeMatch, RangeOptions, RangeTest, Sid,
     TXN_META_GRAPH_ID,
@@ -96,7 +97,7 @@ async fn bulk_import_ref_classes_covers_more_than_64_classes() {
     let graphs = stats.graphs.as_ref().expect("graphs should be present");
     let default_graph = graphs
         .iter()
-        .find(|g| g.g_id == 0)
+        .find(|g| g.g_id == GraphId(0))
         .expect("default graph should be present");
     let classes = default_graph
         .classes
@@ -297,7 +298,10 @@ GRAPH <http://example.org/g/hr> {
     let graphs = stats.graphs.as_ref().expect("graphs present");
 
     // Default graph keeps exactly its own class (Person), unaffected.
-    let g0 = graphs.iter().find(|g| g.g_id == 0).expect("default graph");
+    let g0 = graphs
+        .iter()
+        .find(|g| g.g_id == GraphId(0))
+        .expect("default graph");
     let g0_classes = g0.classes.as_ref().expect("default graph has classes");
     assert_eq!(
         g0_classes.len(),

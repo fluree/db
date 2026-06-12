@@ -8,6 +8,7 @@ use crate::context::WellKnownDatatypes;
 use crate::error::{QueryError, Result};
 use crate::ir::{Expression, Function};
 use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime, TimeZone};
+use fluree_db_core::GraphId;
 use fluree_db_core::{FlakeValue, ObjKind};
 use once_cell::sync::Lazy;
 use regex::{Regex, RegexBuilder};
@@ -52,7 +53,7 @@ enum EncodedBindingCacheKey {
     },
 }
 
-type EncodedBoolPredicateKey = (usize, u16, u64, EncodedBindingCacheKey);
+type EncodedBoolPredicateKey = (usize, GraphId, u64, EncodedBindingCacheKey);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct CacheableBoolPredicate {

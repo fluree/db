@@ -233,7 +233,7 @@ where
     let mut collected: Vec<Flake> = Vec::new();
 
     for &g_id in sources {
-        if g_id == 0 {
+        if g_id == GraphId(0) {
             // The query already sees g_id=0 via its own overlay; skip.
             continue;
         }
@@ -325,7 +325,7 @@ where
     // materially differs.
     let mut epoch: u64 = spot.len() as u64;
     for &g in sources {
-        epoch = epoch.wrapping_mul(31).wrapping_add(u64::from(g));
+        epoch = epoch.wrapping_mul(31).wrapping_add(u64::from(g.as_u16()));
     }
 
     Ok(SchemaBundleFlakes {
@@ -381,7 +381,7 @@ impl OverlayProvider for SchemaBundleOverlay<'_> {
         to_t: i64,
         callback: &mut dyn FnMut(&Flake),
     ) {
-        if g_id != 0 || self.bundle.is_empty() {
+        if g_id != GraphId(0) || self.bundle.is_empty() {
             self.base
                 .for_each_overlay_flake(g_id, index, first, rhs, leftmost, to_t, callback);
             return;
@@ -449,9 +449,17 @@ mod tests {
         let overlay = SchemaBundleOverlay::new(&base, bundle);
 
         let mut count = 0;
-        overlay.for_each_overlay_flake(0, IndexType::Psot, None, None, true, i64::MAX, &mut |_| {
-            count += 1;
-        });
+        overlay.for_each_overlay_flake(
+            GraphId(0),
+            IndexType::Psot,
+            None,
+            None,
+            true,
+            i64::MAX,
+            &mut |_| {
+                count += 1;
+            },
+        );
         assert_eq!(count, 0);
     }
 
@@ -464,9 +472,17 @@ mod tests {
         let overlay = SchemaBundleOverlay::new(&base, bundle);
 
         let mut count = 0;
-        overlay.for_each_overlay_flake(5, IndexType::Psot, None, None, true, i64::MAX, &mut |_| {
-            count += 1;
-        });
+        overlay.for_each_overlay_flake(
+            GraphId(5),
+            IndexType::Psot,
+            None,
+            None,
+            true,
+            i64::MAX,
+            &mut |_| {
+                count += 1;
+            },
+        );
         assert_eq!(count, 0);
     }
 }

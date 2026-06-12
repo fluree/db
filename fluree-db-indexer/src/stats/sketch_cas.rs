@@ -214,14 +214,26 @@ mod tests {
         hll1.last_modified_t = 10;
         *hll1.datatypes.entry(3).or_insert(0) += 3; // 3 string values
         *hll1.datatypes.entry(5).or_insert(0) += 2; // 2 ref values
-        map.insert(GraphPropertyKey { g_id: 0, p_id: 1 }, hll1);
+        map.insert(
+            GraphPropertyKey {
+                g_id: GraphId(0),
+                p_id: 1,
+            },
+            hll1,
+        );
 
         let mut hll2 = IdPropertyHll::new();
         hll2.values_hll.insert_hash(300);
         hll2.subjects_hll.insert_hash(2000);
         hll2.count = 3;
         hll2.last_modified_t = 8;
-        map.insert(GraphPropertyKey { g_id: 0, p_id: 2 }, hll2);
+        map.insert(
+            GraphPropertyKey {
+                g_id: GraphId(0),
+                p_id: 2,
+            },
+            hll2,
+        );
 
         map
     }
@@ -242,8 +254,14 @@ mod tests {
         let restored = parsed.into_properties().unwrap();
         assert_eq!(restored.len(), 2);
 
-        let key1 = GraphPropertyKey { g_id: 0, p_id: 1 };
-        let key2 = GraphPropertyKey { g_id: 0, p_id: 2 };
+        let key1 = GraphPropertyKey {
+            g_id: GraphId(0),
+            p_id: 1,
+        };
+        let key2 = GraphPropertyKey {
+            g_id: GraphId(0),
+            p_id: 2,
+        };
         assert!(restored.contains_key(&key1));
         assert!(restored.contains_key(&key2));
         assert_eq!(restored[&key1].count, 5);
@@ -288,7 +306,10 @@ mod tests {
             .into_properties()
             .unwrap();
 
-        let key = GraphPropertyKey { g_id: 0, p_id: 1 };
+        let key = GraphPropertyKey {
+            g_id: GraphId(0),
+            p_id: 1,
+        };
         let original = &props[&key];
         let round_tripped = &restored[&key];
 
@@ -312,7 +333,13 @@ mod tests {
         hll.count = -3; // negative from retractions
         *hll.datatypes.entry(3).or_insert(0) = -2; // negative dt
         hll.last_modified_t = 5;
-        map.insert(GraphPropertyKey { g_id: 0, p_id: 1 }, hll);
+        map.insert(
+            GraphPropertyKey {
+                g_id: GraphId(0),
+                p_id: 1,
+            },
+            hll,
+        );
 
         let blob = HllSketchBlob::from_properties(5, &map);
         assert_eq!(blob.entries[0].count, 0, "negative count clamped to 0");
@@ -331,14 +358,26 @@ mod tests {
             let mut hll = IdPropertyHll::new();
             hll.count = 1;
             hll.last_modified_t = 1;
-            map.insert(GraphPropertyKey { g_id: g, p_id: p }, hll);
+            map.insert(
+                GraphPropertyKey {
+                    g_id: GraphId(g),
+                    p_id: p,
+                },
+                hll,
+            );
         }
 
         let blob = HllSketchBlob::from_properties(1, &map);
         let keys: Vec<(GraphId, u32)> = blob.entries.iter().map(|e| (e.g_id, e.p_id)).collect();
         assert_eq!(
             keys,
-            vec![(0, 1), (0, 5), (0, 10), (1, 2), (1, 10)],
+            vec![
+                (GraphId(0), 1),
+                (GraphId(0), 5),
+                (GraphId(0), 10),
+                (GraphId(1), 2),
+                (GraphId(1), 10)
+            ],
             "entries must be sorted by (g_id, p_id)"
         );
     }

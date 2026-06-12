@@ -5,6 +5,7 @@
 mod support;
 
 use fluree_db_api::FlureeBuilder;
+use fluree_db_core::GraphId;
 use serde_json::json;
 use support::{genesis_ledger, normalize_rows, MemoryFluree, MemoryLedger};
 
@@ -106,7 +107,7 @@ async fn subjects_as_predicates_reverse_crawl_without_star() {
     let rows = support::query_jsonld(&fluree, &ledger, &q)
         .await
         .unwrap()
-        .to_jsonld_async(ledger.as_graph_db_ref(0))
+        .to_jsonld_async(ledger.as_graph_db_ref(GraphId(0)))
         .await
         .unwrap();
     let arr = rows.as_array().expect("rows array");
@@ -222,7 +223,7 @@ async fn equivalent_properties_equivalent_symmetric_transitive_and_expansion() {
     let rows4 = support::query_jsonld(&fluree, &ledger, &q4)
         .await
         .unwrap()
-        .to_jsonld_async(ledger.as_graph_db_ref(0))
+        .to_jsonld_async(ledger.as_graph_db_ref(GraphId(0)))
         .await
         .unwrap();
     assert_eq!(

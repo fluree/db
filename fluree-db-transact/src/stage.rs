@@ -40,13 +40,19 @@ use fluree_db_shacl::{ShaclCache, ShaclEngine, ValidationReport};
 
 /// Build a reverse lookup from graph Sid → GraphId.
 ///
-/// Given `graph_sids` (GraphId → Sid from `txn.graph_delta`), returns the
-/// inverse mapping. Used by SHACL/policy to determine which graph a flake
-/// belongs to based on its `Flake.g` field.
-fn build_reverse_graph_lookup(graph_sids: &HashMap<GraphId, Sid>) -> HashMap<Sid, GraphId> {
+/// Given `graph_sids` (transaction-local graph id → Sid, from
+/// `txn.graph_delta`), returns the inverse mapping. Used by SHACL/policy to
+/// determine which graph a flake belongs to based on its `Flake.g` field.
+///
+/// The `GraphId(g_id)` wrap below is staging ADOPTING the transaction-local
+/// numbering as ledger numbering for novelty routing — longstanding behavior
+/// that the `GraphId` newtype now makes visible instead of implicit. The
+/// upsert path translates txn-local → ledger ids explicitly where the two
+/// can differ (see `generate_upsert_deletions`).
+fn build_reverse_graph_lookup(graph_sids: &HashMap<u16, Sid>) -> HashMap<Sid, GraphId> {
     graph_sids
         .iter()
-        .map(|(&g_id, sid)| (sid.clone(), g_id))
+        .map(|(&g_id, sid)| (sid.clone(), GraphId(g_id)))
         .collect()
 }
 
@@ -56,7 +62,7 @@ fn build_reverse_graph_lookup(graph_sids: &HashMap<GraphId, Sid>) -> HashMap<Sid
 /// - `Some(sid)` → looked up in `reverse_graph`; returns error if unknown
 fn resolve_flake_graph_id(flake: &Flake, reverse_graph: &HashMap<Sid, GraphId>) -> Result<GraphId> {
     match &flake.g {
-        None => Ok(0),
+        None => Ok(GraphId(0)),
         Some(g_sid) => reverse_graph.get(g_sid).copied().ok_or_else(|| {
             TransactError::FlakeGeneration(format!(
                 "staged flake references unknown graph Sid: {g_sid}"
@@ -92,7 +98,7 @@ pub struct StageOptions<'a> {
     /// named-graph flakes are present, `stage_flakes` will return an error.
     ///
     /// The normal `stage()` path builds this internally from `txn.graph_delta`.
-    pub graph_sids: Option<&'a HashMap<GraphId, Sid>>,
+    pub graph_sids: Option<&'a HashMap<u16, Sid>>,
 }
 
 impl<'a> StageOptions<'a> {
@@ -120,7 +126,7 @@ impl<'a> StageOptions<'a> {
     }
 
     /// Set the graph routing map for named-graph flakes
-    pub fn with_graph_sids(mut self, graph_sids: &'a HashMap<GraphId, Sid>) -> Self {
+    pub fn with_graph_sids(mut self, graph_sids: &'a HashMap<u16, Sid>) -> Self {
         self.graph_sids = Some(graph_sids);
         self
     }
@@ -232,7 +238,7 @@ pub async fn stage(
         let txn_id = generate_txn_id();
 
         // Convert graph_delta (g_id -> IRI) to graph_sids (g_id -> Sid) for named graph support
-        let graph_sids: HashMap<GraphId, Sid> = txn
+        let graph_sids: HashMap<u16, Sid> = txn
             .graph_delta
             .iter()
             .map(|(&g_id, iri)| (g_id, ns_registry.sid_for_iri(iri)))
@@ -787,10 +793,10 @@ async fn stream_where_into_accumulator(
         let base_g_id: GraphId = desired_where_default_graph_iris
             .first()
             .and_then(|iri| resolve_graph_id(iri))
-            .unwrap_or(0);
+            .unwrap_or(GraphId(0));
         ledger.as_graph_db_ref(base_g_id)
     } else {
-        ledger.as_graph_db_ref(0)
+        ledger.as_graph_db_ref(GraphId(0))
     };
 
     let make_graph_ref = |g_id: GraphId| -> fluree_db_query::GraphRef {
@@ -1042,7 +1048,7 @@ fn materialize_encoded_bindings_for_txn(ledger: &LedgerState, batch: Batch) -> R
         return Ok(batch);
     };
 
-    let gv = fluree_db_binary_index::BinaryGraphView::new(Arc::clone(&store), 0);
+    let gv = fluree_db_binary_index::BinaryGraphView::new(Arc::clone(&store), GraphId(0));
 
     let (schema, mut columns, len) = batch.into_parts();
 
@@ -1329,7 +1335,7 @@ async fn generate_upsert_deletions(
         // the correct per-graph index partition.
         //
         // txn_local_g_id -> graph IRI (txn.graph_delta) -> ledger g_id (GraphRegistry)
-        let ledger_g_id: Option<u16> = graph_id.and_then(|txn_g_id| {
+        let ledger_g_id: Option<GraphId> = graph_id.and_then(|txn_g_id| {
             txn.graph_delta
                 .get(&txn_g_id)
                 .and_then(|iri| ledger.snapshot.graph_registry.graph_id_for_iri(iri))
@@ -1366,8 +1372,12 @@ async fn generate_upsert_deletions(
             }
         } else {
             // Default graph: use standard query path through range_provider
-            fluree_db_query::execute_pattern(ledger.as_graph_db_ref(0), &query_vars, pattern)
-                .await?
+            fluree_db_query::execute_pattern(
+                ledger.as_graph_db_ref(GraphId(0)),
+                &query_vars,
+                pattern,
+            )
+            .await?
         };
 
         // Convert each result to a retraction flake in the appropriate graph.
@@ -1387,7 +1397,7 @@ async fn generate_upsert_deletions(
         // Create a materializer for this graph context if a binary store exists.
         // BinaryGraphView::with_novelty handles watermark routing internally,
         // so novelty-only string/subject IDs resolve correctly.
-        let effective_g_id = ledger_g_id.unwrap_or(0);
+        let effective_g_id = ledger_g_id.unwrap_or(GraphId(0));
         let mut materializer = binary_store.as_ref().map(|store| {
             let view = BinaryGraphView::with_novelty(
                 Arc::clone(store),
@@ -1442,7 +1452,7 @@ fn query_novelty_for_graph(
     ledger: &LedgerState,
     subject: &Sid,
     predicate: &Sid,
-    target_g_id: u16,
+    target_g_id: GraphId,
     o_var: VarId,
 ) -> Vec<Batch> {
     use fluree_db_core::IndexType;
@@ -1523,7 +1533,7 @@ pub async fn stage_with_shacl(
     // Rebuild graph_sids from the cloned graph_delta + returned ns_registry.
     // These IRIs were already resolved during stage(), so sid_for_iri will find
     // the prefix already registered — no new allocations.
-    let graph_sids: HashMap<GraphId, Sid> = graph_delta
+    let graph_sids: HashMap<u16, Sid> = graph_delta
         .iter()
         .map(|(&g_id, iri)| (g_id, ns_registry.sid_for_iri(iri)))
         .collect();
@@ -1594,7 +1604,7 @@ impl ShaclValidationOutcome {
 pub async fn validate_view_with_shacl(
     view: &StagedLedger,
     shacl_cache: &ShaclCache,
-    graph_sids: Option<&HashMap<GraphId, Sid>>,
+    graph_sids: Option<&HashMap<u16, Sid>>,
     tracker: Option<&fluree_db_core::Tracker>,
     per_graph_policy: Option<&HashMap<GraphId, ShaclGraphPolicy>>,
 ) -> Result<ShaclValidationOutcome> {
@@ -1649,7 +1659,7 @@ pub async fn validate_view_with_shacl(
 async fn validate_staged_nodes(
     view: &StagedLedger,
     engine: &ShaclEngine,
-    graph_sids: Option<&HashMap<GraphId, Sid>>,
+    graph_sids: Option<&HashMap<u16, Sid>>,
     tracker: Option<&fluree_db_core::Tracker>,
     enabled_graphs: Option<&HashSet<GraphId>>,
 ) -> Result<ValidationReport> {
@@ -1686,7 +1696,7 @@ async fn validate_staged_nodes(
         let g_id = match &reverse_graph {
             Some(rev) => resolve_flake_graph_id(flake, rev)?,
             // No reverse map (commit-transfer path): fall back to default graph
-            None => 0,
+            None => GraphId(0),
         };
         // Subject is always a focus (including for retractions — validators
         // must still see retracted-on subjects so class/node-targeted shapes

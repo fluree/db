@@ -164,6 +164,19 @@ impl Fluree {
         // when processing separate commits independently (each starts max_g_id=1).
         let all_push_flakes: Vec<&Flake> = decoded.iter().flat_map(|c| &c.commit.flakes).collect();
         let routing = derive_graph_routing(&base_state, &all_push_flakes);
+        // transact's staging APIs key graph maps by raw (envelope-local) u16
+        // ids; replay routing carries ledger `GraphId`s with the same
+        // numbering. The conversion below makes that adoption explicit.
+        let routing_sids_raw: HashMap<u16, Sid> = routing
+            .graph_sids
+            .iter()
+            .map(|(g, s)| (g.as_u16(), s.clone()))
+            .collect();
+        let routing_iris_raw: rustc_hash::FxHashMap<u16, String> = routing
+            .graph_iris
+            .iter()
+            .map(|(g, iri)| (g.as_u16(), iri.clone()))
+            .collect();
         let mut reverse_graph = reverse_graph_lookup(&routing.graph_sids);
         // Ensure txn-meta graph is always routable — commit metadata flakes
         // are stamped with this graph SID after routing is derived.
@@ -227,7 +240,7 @@ impl Fluree {
                 &c.commit.flakes,
                 index_config,
                 &policy_ctx,
-                &routing.graph_sids,
+                &routing_sids_raw,
             )
             .await
             .map_err(PushError::into_api_error)?;
@@ -250,8 +263,8 @@ impl Fluree {
                 crate::tx::apply_shacl_policy_to_staged_view(
                     &staged_view,
                     crate::tx::StagedShaclContext {
-                        graph_delta: Some(&routing.graph_iris),
-                        graph_sids: Some(&routing.graph_sids),
+                        graph_delta: Some(&routing_iris_raw),
+                        graph_sids: Some(&routing_sids_raw),
                         tracker: None,
                         // Commit replay doesn't engage the
                         // cross-ledger dispatch (the leader
@@ -478,7 +491,7 @@ fn derive_graph_routing(state: &LedgerState, flakes: &[&Flake]) -> GraphRoutingR
 
     let mut result: HashMap<GraphId, Sid> = HashMap::new();
     let mut graph_iris: rustc_hash::FxHashMap<GraphId, String> = rustc_hash::FxHashMap::default();
-    let mut max_g_id: GraphId = 1; // 0=default, 1=txn-meta
+    let mut max_g_id: GraphId = GraphId(1); // 0=default, 1=txn-meta
     let mut unresolved: Vec<Sid> = Vec::new();
 
     for g_sid in &graph_sids_set {
@@ -511,8 +524,8 @@ fn derive_graph_routing(state: &LedgerState, flakes: &[&Flake]) -> GraphRoutingR
     // Assign fabricated sequential GraphIds for unresolved graphs.
     // Sort to ensure deterministic assignment across calls.
     unresolved.sort();
-    for (next_id, g_sid) in (max_g_id + 1..).zip(unresolved) {
-        result.insert(next_id, g_sid);
+    for (offset, g_sid) in unresolved.into_iter().enumerate() {
+        result.insert(GraphId(max_g_id.as_u16() + 1 + offset as u16), g_sid);
     }
 
     GraphRoutingResult {
@@ -663,7 +676,7 @@ async fn build_policy_ctx_for_push(
         Some(evolving),
         current_t,
         opts,
-        &[0],
+        &[GraphId(0)],
     )
     .await
 }
@@ -673,7 +686,7 @@ async fn stage_commit_flakes(
     flakes: &[Flake],
     index_config: &IndexConfig,
     policy_ctx: &PolicyContext,
-    graph_sids: &HashMap<GraphId, Sid>,
+    graph_sids: &HashMap<u16, Sid>,
 ) -> std::result::Result<fluree_db_ledger::StagedLedger, PushError> {
     let mut options = fluree_db_transact::StageOptions::new()
         .with_index_config(index_config)
@@ -725,7 +738,7 @@ async fn is_currently_asserted(
     // GraphIds assigned by the cumulative routing. The overlay returns only that
     // graph's flakes, so no post-filtering by flake.g is needed for graph isolation.
     let g_id = match &target.g {
-        None => 0,
+        None => GraphId(0),
         Some(g_sid) => *reverse_graph.get(g_sid).ok_or_else(|| {
             PushError::Internal(format!(
                 "is_currently_asserted: graph Sid {g_sid:?} not found in reverse_graph map \

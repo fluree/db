@@ -136,7 +136,7 @@ fn count_prefix_rows_opst(
                 t: 0,
                 o_i: 0,
                 o_type,
-                g_id,
+                g_id: g_id.as_u16(),
             };
             let max_key = RunRecordV2 {
                 s_id: SubjectId(u64::MAX),
@@ -145,7 +145,7 @@ fn count_prefix_rows_opst(
                 t: u32::MAX,
                 o_i: u32::MAX,
                 o_type,
-                g_id,
+                g_id: g_id.as_u16(),
             };
             let filter = BinaryFilter {
                 p_id: Some(p_id),

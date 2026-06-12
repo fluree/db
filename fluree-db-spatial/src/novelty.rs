@@ -152,7 +152,7 @@ pub fn derive_from_wkt_values(
     index_points: bool,
 ) -> Result<DerivedNovelty> {
     let ops = values.map(|(s_id, wkt, t, op)| SpatialNoveltyOp {
-        g_id: 0,
+        g_id: GraphId(0),
         p_id: 0,
         s_id,
         wkt,
@@ -160,7 +160,7 @@ pub fn derive_from_wkt_values(
         op,
     });
 
-    derive_spatial_novelty(ops, 0, 0, s2_config, index_points)
+    derive_spatial_novelty(ops, 0, GraphId(0), s2_config, index_points)
 }
 
 #[cfg(test)]
@@ -170,7 +170,7 @@ mod tests {
     #[test]
     fn test_derive_polygon_novelty() {
         let ops = vec![SpatialNoveltyOp {
-            g_id: 0,
+            g_id: GraphId(0),
             p_id: 1,
             s_id: 100,
             wkt: "POLYGON((0 0, 10 0, 10 10, 0 10, 0 0))".to_string(),
@@ -180,8 +180,8 @@ mod tests {
 
         let result = derive_spatial_novelty(
             ops.into_iter(),
-            1, // target_p_id
-            0, // target_g_id
+            1,          // target_p_id
+            GraphId(0), // target_g_id
             &S2CoveringConfig::default(),
             false, // don't index points
         )
@@ -204,7 +204,7 @@ mod tests {
     #[test]
     fn test_skip_points_by_default() {
         let ops = vec![SpatialNoveltyOp {
-            g_id: 0,
+            g_id: GraphId(0),
             p_id: 1,
             s_id: 100,
             wkt: "POINT(5 5)".to_string(),
@@ -215,7 +215,7 @@ mod tests {
         let result = derive_spatial_novelty(
             ops.into_iter(),
             1,
-            0,
+            GraphId(0),
             &S2CoveringConfig::default(),
             false, // don't index points
         )
@@ -229,7 +229,7 @@ mod tests {
     fn test_filter_by_predicate() {
         let ops = vec![
             SpatialNoveltyOp {
-                g_id: 0,
+                g_id: GraphId(0),
                 p_id: 1, // matches
                 s_id: 100,
                 wkt: "POLYGON((0 0, 10 0, 10 10, 0 10, 0 0))".to_string(),
@@ -237,7 +237,7 @@ mod tests {
                 op: 1,
             },
             SpatialNoveltyOp {
-                g_id: 0,
+                g_id: GraphId(0),
                 p_id: 2, // doesn't match
                 s_id: 200,
                 wkt: "POLYGON((20 20, 30 20, 30 30, 20 30, 20 20))".to_string(),
@@ -249,7 +249,7 @@ mod tests {
         let result = derive_spatial_novelty(
             ops.into_iter(),
             1, // target_p_id = 1
-            0,
+            GraphId(0),
             &S2CoveringConfig::default(),
             false,
         )
@@ -264,7 +264,7 @@ mod tests {
     #[test]
     fn test_retraction_handling() {
         let ops = vec![SpatialNoveltyOp {
-            g_id: 0,
+            g_id: GraphId(0),
             p_id: 1,
             s_id: 100,
             wkt: "POLYGON((0 0, 10 0, 10 10, 0 10, 0 0))".to_string(),
@@ -272,9 +272,14 @@ mod tests {
             op: 0, // retract
         }];
 
-        let result =
-            derive_spatial_novelty(ops.into_iter(), 1, 0, &S2CoveringConfig::default(), false)
-                .unwrap();
+        let result = derive_spatial_novelty(
+            ops.into_iter(),
+            1,
+            GraphId(0),
+            &S2CoveringConfig::default(),
+            false,
+        )
+        .unwrap();
 
         // Should have entries with op=0 for retraction
         assert!(!result.is_empty());

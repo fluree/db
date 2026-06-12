@@ -318,7 +318,7 @@ impl LedgerSnapshot {
     pub fn build_reverse_graph(&self) -> Result<HashMap<Sid, GraphId>> {
         let mut map = HashMap::new();
         for (g_id, iri) in self.graph_registry.iter_entries() {
-            if g_id == 0 {
+            if g_id == GraphId(0) {
                 continue;
             } // default graph has no Sid
             let sid = self.encode_iri(iri).ok_or_else(|| {

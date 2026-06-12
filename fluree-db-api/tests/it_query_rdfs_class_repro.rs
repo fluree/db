@@ -14,6 +14,7 @@
 mod support;
 
 use fluree_db_api::FlureeBuilder;
+use fluree_db_core::GraphId;
 use serde_json::json;
 use std::io::Write;
 use tempfile::TempDir;
@@ -210,7 +211,7 @@ async fn jsonld_select_star_class() {
     let rows = support::query_jsonld(&fluree, &ledger, &q)
         .await
         .unwrap()
-        .to_jsonld_async(ledger.as_graph_db_ref(0))
+        .to_jsonld_async(ledger.as_graph_db_ref(GraphId(0)))
         .await
         .unwrap();
     assert_eq!(

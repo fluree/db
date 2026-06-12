@@ -158,7 +158,7 @@ async fn run_list(
         let g_id_label = g_id
             .map(|v| v.to_string())
             .unwrap_or_else(|| "-".to_string());
-        let kind = match g_id {
+        let kind = match g_id.map(fluree_db_core::GraphId) {
             Some(DEFAULT_GRAPH_ID) => "default",
             Some(TXN_META_GRAPH_ID) => "system:txn-meta",
             Some(CONFIG_GRAPH_ID) => "system:config",
@@ -200,7 +200,10 @@ fn extract_named_graphs(payload: &serde_json::Value) -> Option<&Vec<serde_json::
 }
 
 fn is_system_graph(g_id: u16, iri: &str, txn_meta: &str, config: &str) -> bool {
-    if matches!(g_id, DEFAULT_GRAPH_ID | TXN_META_GRAPH_ID | CONFIG_GRAPH_ID) {
+    if matches!(
+        fluree_db_core::GraphId(g_id),
+        DEFAULT_GRAPH_ID | TXN_META_GRAPH_ID | CONFIG_GRAPH_ID
+    ) {
         return true;
     }
     if !txn_meta.is_empty() && iri == txn_meta {

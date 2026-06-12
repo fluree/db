@@ -39,6 +39,7 @@ use crate::ir::triple::{Ref, Term, TriplePattern};
 use crate::ir::Pattern;
 use crate::rewrite::{rewrite_subpatterns, Diagnostics, PlanContext, RewriteResult};
 use crate::var_registry::VarId;
+use fluree_db_core::GraphId;
 use fluree_db_core::{
     is_owl_equivalent_property, is_rdf_type, FlakeValue, GraphDbRef, IndexType, RangeMatch,
     RangeTest, SchemaHierarchy, Sid,
@@ -345,7 +346,7 @@ impl Ontology {
         let range = base.inner.range.clone();
 
         db.overlay.for_each_overlay_flake(
-            0,
+            GraphId(0),
             IndexType::Psot,
             None,
             None,

@@ -1204,7 +1204,7 @@ fn count_blank_subject_rows_spot(store: &BinaryIndexStore, g_id: GraphId) -> Res
         t: 0,
         o_i: 0,
         o_type: 0,
-        g_id,
+        g_id: g_id.as_u16(),
     };
     let max_key = RunRecordV2 {
         s_id: SubjectId(s_max),
@@ -1213,7 +1213,7 @@ fn count_blank_subject_rows_spot(store: &BinaryIndexStore, g_id: GraphId) -> Res
         t: u32::MAX,
         o_i: u32::MAX,
         o_type: u16::MAX,
-        g_id,
+        g_id: g_id.as_u16(),
     };
 
     let cmp = cmp_v2_for_order(RunSortOrder::Spot);

@@ -15,6 +15,7 @@
 use crate::dataset::QueryConnectionOptions;
 use crate::error::{ApiError, Result};
 use async_trait::async_trait;
+use fluree_db_core::GraphId;
 use fluree_db_core::IndexStats;
 use fluree_db_core::{FlakeValue, GraphDbRef, IndexType, LedgerSnapshot, Sid};
 use fluree_db_core::{RangeMatch, RangeOptions, RangeTest};
@@ -30,7 +31,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 /// Default policy graph set: only the default graph (g_id = 0).
-const DEFAULT_POLICY_GRAPHS: [fluree_db_core::GraphId; 1] = [0];
+const DEFAULT_POLICY_GRAPHS: [fluree_db_core::GraphId; 1] = [GraphId(0)];
 
 // ============================================================================
 // Constants - Fluree policy vocabulary IRIs (from fluree-vocab)
@@ -78,9 +79,9 @@ pub fn resolve_policy_source_g_ids(
     }
 
     let g_id = match source.graph_selector.as_deref() {
-        Some(iri) if iri == config_iris::DEFAULT_GRAPH => Some(0u16),
+        Some(iri) if iri == config_iris::DEFAULT_GRAPH => Some(GraphId(0)),
         Some(iri) => snapshot.graph_registry.graph_id_for_iri(iri),
-        None => Some(0u16),
+        None => Some(GraphId(0)),
     };
 
     match g_id {

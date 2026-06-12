@@ -6,6 +6,7 @@ mod support;
 
 use fluree_db_api::FlureeBuilder;
 use fluree_db_core::comparator::IndexType;
+use fluree_db_core::GraphId;
 use fluree_db_core::{load_commit_by_id, FlakeValue};
 use serde_json::json;
 use support::normalize_rows;
@@ -81,7 +82,7 @@ async fn upsert_parsing() {
         .await
         .unwrap();
     let jsonld = result
-        .to_jsonld_async(ledger2.as_graph_db_ref(0))
+        .to_jsonld_async(ledger2.as_graph_db_ref(GraphId(0)))
         .await
         .unwrap();
 
@@ -135,7 +136,7 @@ async fn upsert_data() {
         .await
         .unwrap();
     let jsonld = result
-        .to_jsonld_async(ledger2.as_graph_db_ref(0))
+        .to_jsonld_async(ledger2.as_graph_db_ref(GraphId(0)))
         .await
         .unwrap();
 
@@ -200,7 +201,7 @@ async fn upsert_no_changes() {
         .await
         .unwrap();
     let jsonld1 = result1
-        .to_jsonld_async(ledger1.as_graph_db_ref(0))
+        .to_jsonld_async(ledger1.as_graph_db_ref(GraphId(0)))
         .await
         .unwrap();
 
@@ -213,7 +214,7 @@ async fn upsert_no_changes() {
         .await
         .unwrap();
     let jsonld2 = result2
-        .to_jsonld_async(ledger2.as_graph_db_ref(0))
+        .to_jsonld_async(ledger2.as_graph_db_ref(GraphId(0)))
         .await
         .unwrap();
 
@@ -226,7 +227,7 @@ async fn upsert_no_changes() {
         .await
         .unwrap();
     let jsonld3 = result3
-        .to_jsonld_async(ledger3.as_graph_db_ref(0))
+        .to_jsonld_async(ledger3.as_graph_db_ref(GraphId(0)))
         .await
         .unwrap();
 
@@ -340,7 +341,7 @@ async fn upsert_multicardinal_data() {
         .await
         .unwrap();
     let jsonld = result
-        .to_jsonld_async(ledger2.as_graph_db_ref(0))
+        .to_jsonld_async(ledger2.as_graph_db_ref(GraphId(0)))
         .await
         .unwrap();
 
@@ -466,7 +467,7 @@ async fn upsert_and_commit() {
         .await
         .unwrap();
     let jsonld = result
-        .to_jsonld_async(ledger2.as_graph_db_ref(0))
+        .to_jsonld_async(ledger2.as_graph_db_ref(GraphId(0)))
         .await
         .unwrap();
 
@@ -518,7 +519,7 @@ async fn upsert_json_type_replaces_not_appends() {
     let result = support::query_jsonld(&fluree, &ledger2, &query)
         .await
         .unwrap()
-        .to_jsonld_async(ledger2.as_graph_db_ref(0))
+        .to_jsonld_async(ledger2.as_graph_db_ref(GraphId(0)))
         .await
         .unwrap();
 
@@ -577,7 +578,7 @@ async fn update_json_type_replaces_via_where_delete_insert() {
     let result = support::query_jsonld(&fluree, &ledger2, &query)
         .await
         .unwrap()
-        .to_jsonld_async(ledger2.as_graph_db_ref(0))
+        .to_jsonld_async(ledger2.as_graph_db_ref(GraphId(0)))
         .await
         .unwrap();
 
@@ -627,13 +628,13 @@ async fn upsert_json_type_idempotent() {
     let result1 = support::query_jsonld(&fluree, &ledger1, &query)
         .await
         .unwrap()
-        .to_jsonld_async(ledger1.as_graph_db_ref(0))
+        .to_jsonld_async(ledger1.as_graph_db_ref(GraphId(0)))
         .await
         .unwrap();
     let result2 = support::query_jsonld(&fluree, &ledger2, &query)
         .await
         .unwrap()
-        .to_jsonld_async(ledger2.as_graph_db_ref(0))
+        .to_jsonld_async(ledger2.as_graph_db_ref(GraphId(0)))
         .await
         .unwrap();
 
@@ -705,7 +706,7 @@ async fn novelty_dedup_prevents_duplicate_assertions() {
     let result = support::query_jsonld(&fluree, &ledger, &query)
         .await
         .unwrap()
-        .to_jsonld_async(ledger.as_graph_db_ref(0))
+        .to_jsonld_async(ledger.as_graph_db_ref(GraphId(0)))
         .await
         .unwrap();
     let mut statuses: Vec<String> = result
@@ -731,7 +732,7 @@ async fn novelty_dedup_prevents_duplicate_assertions() {
     let post = support::query_jsonld(&fluree, &ledger_after, &query)
         .await
         .unwrap()
-        .to_jsonld_async(ledger_after.as_graph_db_ref(0))
+        .to_jsonld_async(ledger_after.as_graph_db_ref(GraphId(0)))
         .await
         .unwrap();
     assert_eq!(
@@ -781,7 +782,7 @@ async fn upsert_retracts_all_novelty_only_multicardinal_values() {
     let pre = support::query_jsonld(&fluree, &ledger2, &query)
         .await
         .unwrap()
-        .to_jsonld_async(ledger2.as_graph_db_ref(0))
+        .to_jsonld_async(ledger2.as_graph_db_ref(GraphId(0)))
         .await
         .unwrap();
     let pre_tags = &pre[0]["ex:tag"];
@@ -802,7 +803,7 @@ async fn upsert_retracts_all_novelty_only_multicardinal_values() {
     let post = support::query_jsonld(&fluree, &ledger3, &query)
         .await
         .unwrap()
-        .to_jsonld_async(ledger3.as_graph_db_ref(0))
+        .to_jsonld_async(ledger3.as_graph_db_ref(GraphId(0)))
         .await
         .unwrap();
     let post_tags = &post[0]["ex:tag"];
@@ -847,7 +848,7 @@ async fn upsert_single_value_replaces_array_in_novelty() {
     let result = support::query_jsonld(&fluree, &ledger2, &query)
         .await
         .unwrap()
-        .to_jsonld_async(ledger2.as_graph_db_ref(0))
+        .to_jsonld_async(ledger2.as_graph_db_ref(GraphId(0)))
         .await
         .unwrap();
 
@@ -921,7 +922,7 @@ async fn upsert_json_type_replaces_after_reindex() {
     let result = support::query_jsonld(&fluree, &ledger2, &query)
         .await
         .unwrap()
-        .to_jsonld_async(ledger2.as_graph_db_ref(0))
+        .to_jsonld_async(ledger2.as_graph_db_ref(GraphId(0)))
         .await
         .unwrap();
 

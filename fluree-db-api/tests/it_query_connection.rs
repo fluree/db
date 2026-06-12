@@ -7,6 +7,7 @@
 mod support;
 
 use fluree_db_api::FlureeBuilder;
+use fluree_db_core::GraphId;
 use serde_json::json;
 use support::{
     assert_index_defaults, context_ex_schema, genesis_ledger, normalize_rows, MemoryFluree,
@@ -143,7 +144,7 @@ async fn query_connection_from_combined_datasets_selecting_subgraphs_depth_3() {
     let result = fluree.query_connection(&q).await.expect("query_connection");
     let ledger = fluree.ledger("test/movies:main").await.expect("ledger");
     let jsonld = result
-        .to_jsonld_async(ledger.as_graph_db_ref(0))
+        .to_jsonld_async(ledger.as_graph_db_ref(GraphId(0)))
         .await
         .expect("to_jsonld_async");
 
@@ -189,7 +190,7 @@ async fn query_connection_from_named_selecting_subgraphs_depth_3() {
     let result = fluree.query_connection(&q).await.expect("query_connection");
     let ledger = fluree.ledger("test/movies:main").await.expect("ledger");
     let jsonld = result
-        .to_jsonld_async(ledger.as_graph_db_ref(0))
+        .to_jsonld_async(ledger.as_graph_db_ref(GraphId(0)))
         .await
         .expect("to_jsonld_async");
 

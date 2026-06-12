@@ -208,9 +208,9 @@ mod tests {
         let pool = SharedVectorArenaPool::new();
 
         // Insert vectors for two different predicates in the same graph
-        let h0 = pool.insert_f32(0, 1, &[1.0, 2.0, 3.0]).unwrap();
-        let h1 = pool.insert_f32(0, 1, &[4.0, 5.0, 6.0]).unwrap();
-        let h2 = pool.insert_f32(0, 2, &[7.0, 8.0, 9.0]).unwrap();
+        let h0 = pool.insert_f32(GraphId(0), 1, &[1.0, 2.0, 3.0]).unwrap();
+        let h1 = pool.insert_f32(GraphId(0), 1, &[4.0, 5.0, 6.0]).unwrap();
+        let h2 = pool.insert_f32(GraphId(0), 2, &[7.0, 8.0, 9.0]).unwrap();
 
         assert_eq!(h0, 0); // first handle for (g=0, p=1)
         assert_eq!(h1, 1); // second handle for (g=0, p=1)
@@ -223,8 +223,8 @@ mod tests {
         let pool = SharedVectorArenaPool::new();
 
         // Same predicate in different graphs -> separate arenas
-        let h0 = pool.insert_f32(0, 1, &[1.0, 2.0, 3.0]).unwrap();
-        let h1 = pool.insert_f32(2, 1, &[4.0, 5.0, 6.0]).unwrap();
+        let h0 = pool.insert_f32(GraphId(0), 1, &[1.0, 2.0, 3.0]).unwrap();
+        let h1 = pool.insert_f32(GraphId(2), 1, &[4.0, 5.0, 6.0]).unwrap();
 
         assert_eq!(h0, 0); // first handle for (g=0, p=1)
         assert_eq!(h1, 0); // first handle for (g=2, p=1) — independent arena
@@ -243,7 +243,7 @@ mod tests {
                     // Each thread inserts into the same (graph, predicate)
                     for i in 0..10 {
                         let vec = vec![thread_id as f32 * 100.0 + i as f32; 3];
-                        results.push(pool.insert_f32(0, 42, &vec).unwrap());
+                        results.push(pool.insert_f32(GraphId(0), 42, &vec).unwrap());
                     }
                     results
                 })
@@ -264,27 +264,27 @@ mod tests {
     #[test]
     fn test_vector_pool_into_arenas() {
         let pool = SharedVectorArenaPool::new();
-        pool.insert_f32(0, 1, &[1.0, 2.0]).unwrap();
-        pool.insert_f32(0, 2, &[3.0, 4.0]).unwrap();
-        pool.insert_f32(3, 1, &[5.0, 6.0]).unwrap();
+        pool.insert_f32(GraphId(0), 1, &[1.0, 2.0]).unwrap();
+        pool.insert_f32(GraphId(0), 2, &[3.0, 4.0]).unwrap();
+        pool.insert_f32(GraphId(3), 1, &[5.0, 6.0]).unwrap();
 
         let arenas = pool.into_arenas();
         assert_eq!(arenas.len(), 2); // 2 graphs
-        assert_eq!(arenas[&0].len(), 2); // 2 predicates in graph 0
-        assert_eq!(arenas[&3].len(), 1); // 1 predicate in graph 3
-        assert_eq!(arenas[&0][&1].len(), 1);
-        assert_eq!(arenas[&0][&2].len(), 1);
-        assert_eq!(arenas[&3][&1].len(), 1);
+        assert_eq!(arenas[&GraphId(0)].len(), 2); // 2 predicates in graph 0
+        assert_eq!(arenas[&GraphId(3)].len(), 1); // 1 predicate in graph 3
+        assert_eq!(arenas[&GraphId(0)][&1].len(), 1);
+        assert_eq!(arenas[&GraphId(0)][&2].len(), 1);
+        assert_eq!(arenas[&GraphId(3)][&1].len(), 1);
     }
 
     #[test]
     fn test_numbig_pool_basic() {
         let pool = SharedNumBigPool::new();
 
-        let h0 = pool.get_or_insert_bigint(0, 1, &BigInt::from(42));
-        let h1 = pool.get_or_insert_bigint(0, 1, &BigInt::from(99));
+        let h0 = pool.get_or_insert_bigint(GraphId(0), 1, &BigInt::from(42));
+        let h1 = pool.get_or_insert_bigint(GraphId(0), 1, &BigInt::from(99));
         // Dedup: same value returns same handle
-        let h0_again = pool.get_or_insert_bigint(0, 1, &BigInt::from(42));
+        let h0_again = pool.get_or_insert_bigint(GraphId(0), 1, &BigInt::from(42));
 
         assert_eq!(h0, 0);
         assert_eq!(h1, 1);
@@ -297,8 +297,8 @@ mod tests {
         let pool = SharedNumBigPool::new();
 
         let bd: BigDecimal = std::str::FromStr::from_str("3.14159").unwrap();
-        let h0 = pool.get_or_insert_bigdec(0, 5, &bd);
-        let h0_again = pool.get_or_insert_bigdec(0, 5, &bd);
+        let h0 = pool.get_or_insert_bigdec(GraphId(0), 5, &bd);
+        let h0_again = pool.get_or_insert_bigdec(GraphId(0), 5, &bd);
 
         assert_eq!(h0, 0);
         assert_eq!(h0, h0_again);
@@ -316,7 +316,7 @@ mod tests {
                     // Each thread inserts unique values
                     for i in 0..10 {
                         let val = BigInt::from(thread_id * 1000 + i);
-                        results.push(pool.get_or_insert_bigint(0, 42, &val));
+                        results.push(pool.get_or_insert_bigint(GraphId(0), 42, &val));
                     }
                     results
                 })
@@ -336,16 +336,16 @@ mod tests {
     #[test]
     fn test_numbig_pool_into_arenas() {
         let pool = SharedNumBigPool::new();
-        pool.get_or_insert_bigint(0, 1, &BigInt::from(42));
-        pool.get_or_insert_bigint(0, 2, &BigInt::from(99));
-        pool.get_or_insert_bigint(5, 1, &BigInt::from(7));
+        pool.get_or_insert_bigint(GraphId(0), 1, &BigInt::from(42));
+        pool.get_or_insert_bigint(GraphId(0), 2, &BigInt::from(99));
+        pool.get_or_insert_bigint(GraphId(5), 1, &BigInt::from(7));
 
         let arenas = pool.into_arenas();
         assert_eq!(arenas.len(), 2); // 2 graphs
-        assert_eq!(arenas[&0].len(), 2); // 2 predicates in graph 0
-        assert_eq!(arenas[&5].len(), 1); // 1 predicate in graph 5
-        assert_eq!(arenas[&0][&1].len(), 1);
-        assert_eq!(arenas[&0][&2].len(), 1);
-        assert_eq!(arenas[&5][&1].len(), 1);
+        assert_eq!(arenas[&GraphId(0)].len(), 2); // 2 predicates in graph 0
+        assert_eq!(arenas[&GraphId(5)].len(), 1); // 1 predicate in graph 5
+        assert_eq!(arenas[&GraphId(0)][&1].len(), 1);
+        assert_eq!(arenas[&GraphId(0)][&2].len(), 1);
+        assert_eq!(arenas[&GraphId(5)][&1].len(), 1);
     }
 }

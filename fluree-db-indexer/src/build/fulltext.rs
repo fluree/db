@@ -170,7 +170,7 @@ pub(crate) async fn build_and_upload_fulltext_arenas<C: ContentStore + ?Sized>(
         });
 
         tracing::info!(
-            g_id,
+            g_id = g_id.as_u16(),
             p_id,
             lang_id,
             docs = arena.doc_count(),
@@ -365,7 +365,7 @@ mod tests {
 
     fn make_entry(g_id: u16, p_id: u32, string_id: u32, t: i64, is_assert: bool) -> FulltextEntry {
         FulltextEntry {
-            g_id,
+            g_id: GraphId(g_id),
             p_id,
             string_id,
             lang_id: 0,

@@ -2,6 +2,7 @@
 //!
 //! Note: The `transaction-functions` section (hash/datetime) is covered with bind support.
 
+use fluree_db_core::GraphId;
 use std::sync::Arc;
 mod support;
 
@@ -112,7 +113,7 @@ async fn update_delete_bob_age_only() {
     let bob = support::query_jsonld(&fluree, &out.ledger, &q_bob)
         .await
         .expect("query bob")
-        .to_jsonld_async(out.ledger.as_graph_db_ref(0))
+        .to_jsonld_async(out.ledger.as_graph_db_ref(GraphId(0)))
         .await
         .expect("to_jsonld_async");
     assert_eq!(
@@ -186,7 +187,7 @@ async fn update_bob_age_when_match() {
     )
     .await
     .expect("query bob")
-    .to_jsonld_async(out.ledger.as_graph_db_ref(0))
+    .to_jsonld_async(out.ledger.as_graph_db_ref(GraphId(0)))
     .await
     .expect("to_jsonld_async");
     assert_eq!(
@@ -310,7 +311,7 @@ async fn update_no_match_is_noop_success_and_does_not_bump_t() {
     )
     .await
     .expect("query bob")
-    .to_jsonld_async(out.ledger.as_graph_db_ref(0))
+    .to_jsonld_async(out.ledger.as_graph_db_ref(GraphId(0)))
     .await
     .expect("to_jsonld_async");
     assert_eq!(
@@ -343,7 +344,7 @@ async fn update_replace_jane_age() {
     )
     .await
     .expect("query jane")
-    .to_jsonld_async(out.ledger.as_graph_db_ref(0))
+    .to_jsonld_async(out.ledger.as_graph_db_ref(GraphId(0)))
     .await
     .expect("to_jsonld_async");
     assert_eq!(
@@ -400,7 +401,7 @@ async fn update_where_bind_hash_functions() {
     )
     .await
     .expect("query hash fns")
-    .to_jsonld_async(updated.ledger.as_graph_db_ref(0))
+    .to_jsonld_async(updated.ledger.as_graph_db_ref(GraphId(0)))
     .await
     .expect("to_jsonld_async");
 
@@ -491,7 +492,7 @@ async fn update_where_bind_datetime_functions() {
     )
     .await
     .expect("query datetime fns")
-        .to_jsonld_async(updated.ledger.as_graph_db_ref(0))
+        .to_jsonld_async(updated.ledger.as_graph_db_ref(GraphId(0)))
         .await
         .expect("to_jsonld_async");
 
@@ -633,7 +634,7 @@ async fn update_where_bind_numeric_and_math_functions() {
     )
     .await
     .expect("query numeric fns")
-    .to_jsonld_async(updated.ledger.as_graph_db_ref(0))
+    .to_jsonld_async(updated.ledger.as_graph_db_ref(GraphId(0)))
     .await
     .expect("to_jsonld_async");
 
@@ -661,7 +662,7 @@ async fn update_where_bind_numeric_and_math_functions() {
     )
     .await
     .expect("query math fns")
-    .to_jsonld_async(updated.ledger.as_graph_db_ref(0))
+    .to_jsonld_async(updated.ledger.as_graph_db_ref(GraphId(0)))
     .await
     .expect("to_jsonld_async");
 
@@ -739,7 +740,7 @@ async fn update_where_bind_string_functions() {
     )
     .await
     .expect("query string fns")
-        .to_jsonld_async(updated.ledger.as_graph_db_ref(0))
+        .to_jsonld_async(updated.ledger.as_graph_db_ref(GraphId(0)))
         .await
         .expect("to_jsonld_async");
 
@@ -826,7 +827,7 @@ async fn update_where_bind_functional_forms() {
     )
     .await
     .expect("query functional fns")
-        .to_jsonld_async(updated.ledger.as_graph_db_ref(0))
+        .to_jsonld_async(updated.ledger.as_graph_db_ref(GraphId(0)))
         .await
         .expect("to_jsonld_async");
 
@@ -915,7 +916,7 @@ async fn update_where_bind_rdf_term_functions() {
     )
     .await
     .expect("query rdf term fns")
-        .to_jsonld_async(updated.ledger.as_graph_db_ref(0))
+        .to_jsonld_async(updated.ledger.as_graph_db_ref(GraphId(0)))
         .await
         .expect("to_jsonld_async");
 

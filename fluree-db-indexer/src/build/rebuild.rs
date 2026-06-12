@@ -5,6 +5,7 @@
 //! orders, and writes an `IndexRoot` (FIR6) descriptor to storage.
 
 use fluree_db_binary_index::{GraphArenaRefs, RunRecord, VectorDictRef};
+use fluree_db_core::GraphId;
 use fluree_db_core::{ContentId, ContentKind, ContentStore};
 
 use crate::error::{IndexerError, Result};
@@ -1052,7 +1053,7 @@ where
                     }
                 }
                 for g_id in fulltext_by_graph.keys() {
-                    graph_ids.insert(*g_id);
+                    graph_ids.insert(g_id.as_u16());
                 }
                 graph_ids
                     .into_iter()
@@ -1072,9 +1073,12 @@ where
                             .get(&g_id_str)
                             .map(|m| m.values().cloned().collect())
                             .unwrap_or_default();
-                        let fulltext = fulltext_by_graph.get(&g_id).cloned().unwrap_or_default();
+                        let fulltext = fulltext_by_graph
+                            .get(&GraphId(g_id))
+                            .cloned()
+                            .unwrap_or_default();
                         GraphArenaRefs {
-                            g_id,
+                            g_id: GraphId(g_id),
                             numbig,
                             vectors,
                             spatial: Vec::new(),

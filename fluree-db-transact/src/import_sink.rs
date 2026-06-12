@@ -435,7 +435,7 @@ mod inner {
                 .unwrap_or(LIST_INDEX_NONE);
 
             let record = RunRecord {
-                g_id: self.g_id,
+                g_id: self.g_id.as_u16(),
                 s_id: SubjectId::from_u64(s_id),
                 p_id,
                 dt: dt_id,
@@ -460,7 +460,7 @@ mod inner {
         /// envelope's `graph_delta` and the index agree on the same g_id.
         pub fn graph_g_id_for_iri(&mut self, iri: &str) -> GraphId {
             let dict_id = self.graphs.get_or_insert(iri);
-            (dict_id + 1) as GraphId
+            GraphId((dict_id + 1) as u16)
         }
 
         /// Spool one flake belonging to an explicit named graph (`g_id`).
@@ -965,7 +965,7 @@ mod inner {
 
             // Attach spool context
             let spool_path = dir.join("chunk_0.spool");
-            let spool_ctx = SpoolContext::new(&spool_path, 0, 0, &config).unwrap();
+            let spool_ctx = SpoolContext::new(&spool_path, 0, GraphId(0), &config).unwrap();
             sink.set_spool_context(spool_ctx);
 
             // Emit triples — both commit and spool should get records
@@ -1032,7 +1032,7 @@ mod inner {
             let mut sink = ImportSink::new(&mut ns, 1, "test-txn".to_string(), true).unwrap();
 
             let spool_path = dir.join("chunk_0.spool");
-            let spool_ctx = SpoolContext::new(&spool_path, 0, 0, &config).unwrap();
+            let spool_ctx = SpoolContext::new(&spool_path, 0, GraphId(0), &config).unwrap();
             sink.set_spool_context(spool_ctx);
 
             let s = sink.term_iri("http://example.org/alice");
@@ -1080,7 +1080,7 @@ mod inner {
             let mut sink = ImportSink::new(&mut ns, 1, "test-txn".to_string(), true).unwrap();
 
             let spool_path = dir.join("chunk_0.spool");
-            let spool_ctx = SpoolContext::new(&spool_path, 0, 0, &config).unwrap();
+            let spool_ctx = SpoolContext::new(&spool_path, 0, GraphId(0), &config).unwrap();
             sink.set_spool_context(spool_ctx);
 
             // Same subject used twice, same object ref used twice

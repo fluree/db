@@ -568,9 +568,17 @@ mod tests {
         let view = HistoricalLedgerView::new(snapshot, Some(Arc::new(novelty)), 5);
 
         let mut collected = Vec::new();
-        view.for_each_overlay_flake(0, IndexType::Spot, None, None, true, 100, &mut |f| {
-            collected.push(f.s.namespace_code);
-        });
+        view.for_each_overlay_flake(
+            GraphId(0),
+            IndexType::Spot,
+            None,
+            None,
+            true,
+            100,
+            &mut |f| {
+                collected.push(f.s.namespace_code);
+            },
+        );
 
         // Should only see flakes at t=1 and t=5, not t=10
         assert_eq!(collected, vec![1, 2]);

@@ -24,6 +24,7 @@ use crate::operator::{
 };
 use crate::var_registry::VarId;
 use async_trait::async_trait;
+use fluree_db_core::GraphId;
 use fluree_db_spatial::SpatialIndexProvider;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -278,7 +279,7 @@ impl Operator for S2SearchOperator {
                 let key = format!("g{g_id}:{pred_iri}");
                 if let Some(p) = providers.get(&key) {
                     p.as_ref()
-                } else if g_id != 0 {
+                } else if g_id != GraphId(0) {
                     // Fallback: try default graph (g_id=0) for backwards compat
                     let fallback_key = format!("g0:{pred_iri}");
                     if let Some(p) = providers.get(&fallback_key) {
@@ -316,7 +317,7 @@ impl Operator for S2SearchOperator {
                     providers.get(graph_keys[0]).unwrap().as_ref()
                 } else if graph_keys.is_empty() {
                     // No providers for this graph - try fallback to default graph (g_id=0)
-                    if g_id != 0 {
+                    if g_id != GraphId(0) {
                         let default_prefix = "g0:";
                         let default_keys: Vec<_> = providers
                             .keys()
@@ -324,7 +325,7 @@ impl Operator for S2SearchOperator {
                             .collect();
                         if default_keys.len() == 1 {
                             tracing::debug!(
-                                g_id = g_id,
+                                g_id = g_id.as_u16(),
                                 fallback = default_keys[0],
                                 "S2Search: no providers for graph, using default graph"
                             );

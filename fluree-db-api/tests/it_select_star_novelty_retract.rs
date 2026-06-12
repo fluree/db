@@ -14,6 +14,7 @@
 mod support;
 
 use fluree_db_api::{FlureeBuilder, FormatterConfig, ReindexOptions};
+use fluree_db_core::GraphId;
 use serde_json::{json, Value};
 
 /// Minimal schema to populate the index before the test entity is introduced.
@@ -133,7 +134,7 @@ async fn expansion_applies_novelty_retractions() {
         .await
         .expect("sparql query");
     let sparql_json = sparql_result
-        .to_jsonld_async(receipt.ledger.as_graph_db_ref(0))
+        .to_jsonld_async(receipt.ledger.as_graph_db_ref(GraphId(0)))
         .await
         .expect("format sparql");
 
@@ -236,7 +237,7 @@ async fn expansion_applies_novelty_retractions_for_indexed_base_rows() {
         .await
         .expect("sparql query");
     let sparql_json = sparql_result
-        .to_jsonld_async(receipt.ledger.as_graph_db_ref(0))
+        .to_jsonld_async(receipt.ledger.as_graph_db_ref(GraphId(0)))
         .await
         .expect("format sparql");
     let rows = sparql_json.as_array().expect("sparql rows");
@@ -334,7 +335,7 @@ async fn expansion_applies_novelty_retractions_for_list_indexed_values() {
         .await
         .expect("sparql query");
     let sparql_json = sparql_result
-        .to_jsonld_async(receipt.ledger.as_graph_db_ref(0))
+        .to_jsonld_async(receipt.ledger.as_graph_db_ref(GraphId(0)))
         .await
         .expect("format sparql");
     let rows = sparql_json.as_array().expect("sparql rows");
@@ -570,7 +571,7 @@ async fn memory_expansion_novelty_retractions() {
         .await
         .expect("query");
     let jsonld = result
-        .to_jsonld_async(receipt.ledger.as_graph_db_ref(0))
+        .to_jsonld_async(receipt.ledger.as_graph_db_ref(GraphId(0)))
         .await
         .expect("format");
 

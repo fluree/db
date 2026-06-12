@@ -257,13 +257,15 @@ impl BinaryIndexStore {
             let branch = BranchManifest {
                 leaves: dgo.leaves.clone(),
             };
-            let gi = graph_indexes.entry(0).or_insert_with(|| GraphIndex {
-                orders: HashMap::new(),
-                numbig: HashMap::new(),
-                vectors: HashMap::new(),
-                spatial: HashMap::new(),
-                fulltext: HashMap::new(),
-            });
+            let gi = graph_indexes
+                .entry(GraphId(0))
+                .or_insert_with(|| GraphIndex {
+                    orders: HashMap::new(),
+                    numbig: HashMap::new(),
+                    vectors: HashMap::new(),
+                    spatial: HashMap::new(),
+                    fulltext: HashMap::new(),
+                });
             gi.orders.insert(dgo.order, Arc::new(branch));
         }
 
@@ -443,7 +445,7 @@ impl BinaryIndexStore {
             .await;
 
         tracing::debug!(
-            g_id,
+            g_id = g_id.as_u16(),
             ?order,
             leaves = target_count,
             width,
@@ -833,7 +835,7 @@ impl BinaryIndexStore {
             DecodeKind::IriRef => {
                 let iri = self.resolve_subject_iri(o_key).map_err(|e| {
                     tracing::debug!(
-                        g_id,
+                        g_id = g_id.as_u16(),
                         o_key,
                         error = %e,
                         "binary index failed to resolve IRI ref subject"
@@ -845,7 +847,7 @@ impl BinaryIndexStore {
             DecodeKind::StringDict => {
                 let s = self.resolve_string_value(o_key as u32).map_err(|e| {
                     tracing::debug!(
-                        g_id,
+                        g_id = g_id.as_u16(),
                         str_id = o_key as u32,
                         error = %e,
                         "binary index failed to resolve string dictionary value"
@@ -860,7 +862,7 @@ impl BinaryIndexStore {
                 // A dedicated JSON arena may be introduced later.
                 let json_str = self.resolve_string_value(o_key as u32).map_err(|e| {
                     tracing::debug!(
-                        g_id,
+                        g_id = g_id.as_u16(),
                         str_id = o_key as u32,
                         error = %e,
                         "binary index failed to resolve JSON dictionary value"
@@ -1810,7 +1812,7 @@ impl BinaryIndexStore {
     /// (NumBig, Vector) will fail if they require per-graph/per-predicate arenas,
     /// but dict-backed types (String, IRI, numeric, temporal, etc.) work correctly.
     pub fn decode_value_no_graph(&self, o_type: u16, o_key: u64) -> io::Result<FlakeValue> {
-        self.decode_value_v3(o_type, o_key, 0, 0)
+        self.decode_value_v3(o_type, o_key, 0, GraphId(0))
     }
 
     /// Decode a value from `(o_kind, dt_id, lang_id)` fields.
@@ -2063,7 +2065,7 @@ impl BinaryGraphView {
             .decode_value_from_kind(o_kind, o_key, p_id, dt_id, lang_id, self.g_id);
         if let Err(err) = &result {
             tracing::debug!(
-                g_id = self.g_id,
+                g_id = self.g_id.as_u16(),
                 o_kind,
                 o_key,
                 p_id,
@@ -2085,7 +2087,7 @@ impl BinaryGraphView {
                 if let Some(result) = self.resolve_novel_subject_iri(dn, s_id) {
                     if let Err(err) = &result {
                         tracing::debug!(
-                            g_id = self.g_id,
+                            g_id = self.g_id.as_u16(),
                             s_id,
                             error = %err,
                             "BinaryGraphView novelty subject lookup failed"
@@ -2110,7 +2112,7 @@ impl BinaryGraphView {
         });
         if let Err(err) = &result {
             tracing::debug!(
-                g_id = self.g_id,
+                g_id = self.g_id.as_u16(),
                 s_id,
                 has_dict_novelty = self.dict_novelty.is_some(),
                 error = %err,
@@ -2368,7 +2370,7 @@ async fn build_dictionary_set(
         .graph_iris
         .iter()
         .enumerate()
-        .map(|(idx, iri)| (iri.to_string(), (idx as GraphId) + 1))
+        .map(|(idx, iri)| (iri.to_string(), GraphId(idx as u16 + 1)))
         .collect();
 
     // Subject count from watermarks.
@@ -2902,8 +2904,8 @@ mod tests {
                 int_key,
                 0, // p_id
                 DatatypeDictId::DOUBLE.as_u16(),
-                0, // lang_id
-                0, // g_id
+                0,          // lang_id
+                GraphId(0), // g_id
             )
             .unwrap();
         assert_eq!(val, FlakeValue::Double(1_350_000.0));
@@ -2916,7 +2918,7 @@ mod tests {
                 0,
                 DatatypeDictId::FLOAT.as_u16(),
                 0,
-                0,
+                GraphId(0),
             )
             .unwrap();
         assert_eq!(val, FlakeValue::Double(1_350_000.0));
@@ -2929,7 +2931,7 @@ mod tests {
                 0,
                 DatatypeDictId::INTEGER.as_u16(),
                 0,
-                0,
+                GraphId(0),
             )
             .unwrap();
         assert_eq!(val, FlakeValue::Long(1_350_000));
