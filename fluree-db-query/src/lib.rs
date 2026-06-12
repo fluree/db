@@ -120,8 +120,8 @@ pub use dataset_operator::{DatasetBuilder, DatasetOperator, ScanDatasetBuilder};
 pub use distinct::DistinctOperator;
 pub use error::{QueryError, Result};
 pub use execute::{
-    build_operator_tree, execute, expand_edge_annotation_patterns, run_operator, ContextConfig,
-    ExecutableQuery,
+    build_operator_tree, execute, expand_edge_annotation_patterns, fast_paths_disabled,
+    run_operator, set_fast_paths_disabled, ContextConfig, ExecutableQuery,
 };
 pub use exists::ExistsOperator;
 pub use explain::{
