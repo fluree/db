@@ -262,6 +262,115 @@ async fn incremental_index_min_max_is_value_ordered() {
         .await;
 }
 
+/// Commits above the index head (novelty) must be reflected: `to_t > max_t`
+/// fails the fast-path gates, so MIN/MAX, COUNT(DISTINCT), and the string
+/// folds all fall back to the overlay-aware pipeline.
+#[tokio::test]
+async fn novelty_above_index_head_is_visible() {
+    use fluree_db_api::{IndexConfig, LedgerManagerConfig};
+    use fluree_db_transact::{CommitOpts, TxnOpts};
+    use serde_json::json;
+    use std::sync::Arc;
+
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "it/minmax-novelty:main";
+
+    let (local, handle) = support::start_background_indexer_local(
+        fluree.backend().clone(),
+        Arc::new(fluree.nameservice_mode().clone()),
+        fluree_db_indexer::IndexerConfig::small(),
+    );
+
+    local
+        .run_until(async move {
+            let index_cfg = IndexConfig {
+                reindex_min_bytes: 0,
+                reindex_max_bytes: 10_000_000,
+            };
+            let ledger = support::genesis_ledger_for_fluree(&fluree, ledger_id);
+            let indexed = json!({
+                "@context": { "ex": "http://example.org/ns/" },
+                "@graph": [
+                    {"@id": "ex:a", "ex:word": "zebra"},
+                    {"@id": "ex:b", "ex:word": "mango"}
+                ]
+            });
+            let result = fluree
+                .insert_with_opts(
+                    ledger,
+                    &indexed,
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg,
+                )
+                .await
+                .expect("indexed insert");
+            support::trigger_index_and_wait_outcome(&handle, ledger_id, result.ledger.t()).await;
+
+            // This commit stays ABOVE the index head — no reindex wait.
+            let novelty = json!({
+                "@context": { "ex": "http://example.org/ns/" },
+                "@graph": [
+                    {"@id": "ex:c", "ex:word": "apple"}
+                ]
+            });
+            fluree
+                .insert_with_opts(
+                    result.ledger,
+                    &novelty,
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg,
+                )
+                .await
+                .expect("novelty insert");
+            let ledger_state = fluree.ledger(ledger_id).await.expect("ledger state");
+
+            let row = run_scalar(
+                &fluree,
+                &ledger_state,
+                r"PREFIX ex: <http://example.org/ns/>
+                  SELECT (MIN(?o) AS ?min) WHERE { ?s ex:word ?o }",
+            )
+            .await;
+            assert_eq!(row["min"]["value"], "apple", "MIN must see novelty");
+
+            let row = run_scalar(
+                &fluree,
+                &ledger_state,
+                r"PREFIX ex: <http://example.org/ns/>
+                  SELECT (COUNT(DISTINCT ?o) AS ?count) WHERE { ?s ex:word ?o }",
+            )
+            .await;
+            assert_eq!(
+                row["count"]["value"], "3",
+                "COUNT(DISTINCT) must see novelty"
+            );
+
+            // zebra(5) + mango(5) + apple(5)
+            let row = run_scalar(
+                &fluree,
+                &ledger_state,
+                r"PREFIX ex: <http://example.org/ns/>
+                  SELECT (SUM(STRLEN(?o)) AS ?sum) WHERE { ?s ex:word ?o }",
+            )
+            .await;
+            assert_eq!(row["sum"]["value"], "15", "SUM(STRLEN) must see novelty");
+
+            let row = run_scalar(
+                &fluree,
+                &ledger_state,
+                r#"PREFIX ex: <http://example.org/ns/>
+                  SELECT (COUNT(*) AS ?c) WHERE { ?s ex:word ?o FILTER CONTAINS(?o, "a") }"#,
+            )
+            .await;
+            assert_eq!(row["c"]["value"], "3", "COUNT(CONTAINS) must see novelty");
+        })
+        .await;
+}
+
 /// Mixed string/numeric objects: the string path declines (non-string-dict
 /// candidate) and the numeric path declines (non-numeric leaflet), so the
 /// planned pipeline answers. Just assert it returns a single bound row.
