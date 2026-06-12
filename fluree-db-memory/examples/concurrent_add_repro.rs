@@ -46,8 +46,22 @@ fn mk(kind: MemoryKind, content: &str, tags: &[&str]) -> MemoryInput {
     }
 }
 
-#[tokio::main(flavor = "multi_thread", worker_threads = 4)]
-async fn main() {
+fn main() {
+    // Default matches the CLI runtime's worker stack (main::WORKER_STACK_SIZE).
+    let stack_mb: usize = std::env::var("REPRO_STACK_MB")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8);
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .thread_stack_size(stack_mb * 1024 * 1024)
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async_main());
+}
+
+async fn async_main() {
     let mut args = std::env::args().skip(1);
     let concurrency: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(4);
     let seed: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(30);
@@ -104,11 +118,57 @@ async fn main() {
     if mode == "recall" {
         run_recall_stress(stores[0].clone(), concurrency).await;
     } else {
-        run_add_stress(stores, concurrency, rounds).await;
+        run_add_stress(stores.clone(), concurrency, rounds).await;
+        verify_no_lost_updates(&stores, seed, concurrency, rounds).await;
     }
 }
 
+/// After the add storm, every seeded and concurrently-added memory must be
+/// present in the authoritative `.ttl` file. With multiple stores sharing one
+/// directory (the cross-process model), a stale-ledger rewrite would silently
+/// drop another store's writes — this catches exactly that.
+async fn verify_no_lost_updates(
+    stores: &[Arc<MemoryStore>],
+    seed: usize,
+    concurrency: usize,
+    rounds: usize,
+) {
+    let expected = seed + concurrency * rounds;
+
+    // Force a fresh rebuild from the file so we count what is actually
+    // persisted (file is truth), not any one store's in-memory ledger.
+    let store = &stores[0];
+    store.ensure_synced().await.expect("final ensure_synced");
+    let all = store
+        .current_memories(&MemoryFilter::default())
+        .await
+        .expect("final current_memories");
+
+    eprintln!(
+        "VERIFY: expected={expected} persisted={} (seed={seed} + adds={})",
+        all.len(),
+        concurrency * rounds
+    );
+    assert_eq!(
+        all.len(),
+        expected,
+        "lost updates: {} memories persisted, expected {expected}",
+        all.len()
+    );
+    eprintln!("VERIFY OK: no lost updates");
+}
+
 fn build_store(storage: &Path, mem_dir: &Path, index: bool) -> MemoryStore {
+    // Production model (context::build_memory_fluree): a process-private,
+    // in-memory ledger over shared `.fluree-memory` files. Multiple stores
+    // sharing one `mem_dir` simulate multiple processes (Cursor + Claude Code,
+    // or several Claude sessions) in the same project.
+    if std::env::var("REPRO_FILE_LEDGER").as_deref() != Ok("1") {
+        let fluree = FlureeBuilder::memory().build_memory();
+        return MemoryStore::new_ephemeral_ledger(fluree, Some(mem_dir.to_path_buf()));
+    }
+    // REPRO_FILE_LEDGER=1 reproduces the old shared-on-disk ledger for
+    // comparison (exhibits cross-process commit "Not found" corruption).
     let mut b = FlureeBuilder::file(storage.to_string_lossy().to_string()).without_ledger_caching();
     b = if index {
         b.with_indexing_thresholds(8 * 1024, 256 * 1024)
