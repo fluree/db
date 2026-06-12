@@ -54,50 +54,36 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 use tracing::info;
 
+/// Private listener config for the Raft inter-node RPC + admin
+/// routers. Only populated when the server is constructed with a
+/// Raft handle via [`FlureeServer::new_with_raft`].
+#[cfg(feature = "raft")]
+struct RaftListener {
+    /// Routed under `/raft` (inter-node RPC) and `/cluster` (admin).
+    private_router: Router,
+    /// Address for the VPC-internal listener. Distinct from the
+    /// public client-facing listener at `config.listen_addr`.
+    listen_addr: std::net::SocketAddr,
+}
+
 /// Fluree HTTP Server
 pub struct FlureeServer {
     /// Application state
     state: Arc<AppState>,
     /// Configured router
     router: Router,
+    /// Optional private Raft listener (consensus + admin).
+    #[cfg(feature = "raft")]
+    raft_listener: Option<RaftListener>,
 }
 
 impl FlureeServer {
-    /// Create a new server with the given configuration
+    /// Create a new server with the given configuration.
+    ///
+    /// Sugar for `FlureeServerBuilder` with no extras. For Raft
+    /// mode, use [`FlureeServerBuilder::with_raft`].
     pub async fn new(config: ServerConfig) -> std::result::Result<Self, fluree_db_api::ApiError> {
-        let telemetry_config = TelemetryConfig::with_server_config(&config);
-        let state = Arc::new(AppState::new(config, telemetry_config).await?);
-
-        // Warm JWKS cache (async — fetch keys from configured endpoints)
-        #[cfg(feature = "oidc")]
-        if let Some(jwks_cache) = &state.jwks_cache {
-            let warmed = jwks_cache.warm().await;
-            let total = jwks_cache.configured_issuer_count();
-            if warmed == 0 && total > 0 {
-                if state.config.data_auth_mode == crate::config::DataAuthMode::Required {
-                    tracing::error!(
-                        total_issuers = total,
-                        "No JWKS endpoints reachable at startup — \
-                         OIDC token verification will FAIL until endpoints become available"
-                    );
-                } else {
-                    tracing::warn!(
-                        total_issuers = total,
-                        "No JWKS endpoints reachable at startup — \
-                         OIDC tokens will be rejected until endpoints become available"
-                    );
-                }
-            }
-        }
-
-        // Pre-load all ledgers into the LRU cache so the first query
-        // against each ledger doesn't pay the cold-start penalty (loading
-        // the binary index root from CAS, deserializing dicts, etc.).
-        Self::preload_all_ledgers(&state).await;
-
-        let router = routes::build_router(state.clone());
-
-        Ok(Self { state, router })
+        FlureeServerBuilder::for_config(config).build().await
     }
 
     /// Pre-load all non-retracted ledgers into the LRU cache.
@@ -189,6 +175,17 @@ impl FlureeServer {
         let addr = self.state.config.listen_addr;
         let listener = TcpListener::bind(addr).await?;
 
+        // Bind the private Raft listener up front so a port-in-use
+        // failure surfaces before we've spawned any background tasks.
+        #[cfg(feature = "raft")]
+        let raft_listener_bound = match self.raft_listener {
+            Some(rl) => {
+                let l = TcpListener::bind(rl.listen_addr).await?;
+                Some((l, rl.private_router, rl.listen_addr))
+            }
+            None => None,
+        };
+
         // Start peer subscription/sync task if in peer mode
         let subscription_task = if self.state.config.is_peer_mode() {
             let peer_state = self
@@ -225,6 +222,19 @@ impl FlureeServer {
         // Start ledger manager maintenance task for idle eviction
         let ledger_maintenance_task = self.state.fluree.spawn_maintenance();
 
+        // Spawn the private Raft listener. Carries the inter-node
+        // RPC + cluster admin routers — mount on a VPC-internal
+        // interface (no auth on these endpoints by design).
+        #[cfg(feature = "raft")]
+        let raft_listener_task = raft_listener_bound.map(|(private_listener, router, addr)| {
+            info!(addr = %addr, "Raft private listener starting");
+            tokio::spawn(async move {
+                if let Err(e) = axum::serve(private_listener, router).await {
+                    tracing::error!(error = %e, "Raft private listener exited");
+                }
+            })
+        });
+
         info!(
             addr = %addr,
             storage = %self.state.config.storage_type_str(),
@@ -242,6 +252,10 @@ impl FlureeServer {
             task.abort();
         }
         if let Some(task) = ledger_maintenance_task {
+            task.abort();
+        }
+        #[cfg(feature = "raft")]
+        if let Some(task) = raft_listener_task {
             task.abort();
         }
 
@@ -282,13 +296,26 @@ impl FlureeServer {
 /// Builder for FlureeServer with fluent API
 pub struct FlureeServerBuilder {
     config: ServerConfig,
+    /// Optional Raft integration and the private listener address
+    /// for inter-node RPC + cluster admin. Set via
+    /// [`Self::with_raft`].
+    #[cfg(feature = "raft")]
+    raft: Option<(Arc<crate::raft::RaftIntegration>, std::net::SocketAddr)>,
 }
 
 impl FlureeServerBuilder {
     /// Create a new builder with default config (memory storage)
     pub fn new() -> Self {
+        Self::for_config(ServerConfig::default())
+    }
+
+    /// Create a builder wrapping an already-built [`ServerConfig`].
+    /// Used by [`FlureeServer::new`] as the no-extras shortcut path.
+    pub fn for_config(config: ServerConfig) -> Self {
         Self {
-            config: ServerConfig::default(),
+            config,
+            #[cfg(feature = "raft")]
+            raft: None,
         }
     }
 
@@ -329,9 +356,79 @@ impl FlureeServerBuilder {
         self
     }
 
-    /// Build the server
+    /// Attach a [`RaftIntegration`](crate::raft::RaftIntegration) and
+    /// the private listener address. The resulting server mounts the
+    /// leader-forward middleware over write routes and serves the
+    /// inter-node RPC + cluster admin routers on `listen_addr`.
+    /// `listen_addr` should be a VPC-internal interface — those
+    /// routers carry no auth of their own.
+    #[cfg(feature = "raft")]
+    pub fn with_raft(
+        mut self,
+        integration: Arc<crate::raft::RaftIntegration>,
+        listen_addr: std::net::SocketAddr,
+    ) -> Self {
+        self.raft = Some((integration, listen_addr));
+        self
+    }
+
+    /// Build the server.
+    ///
+    /// Single construction path — attaches optional Raft state to
+    /// the unwrapped [`AppState`] before the `Arc` wrap, then warms
+    /// JWKS, preloads ledgers, and builds the router.
     pub async fn build(self) -> std::result::Result<FlureeServer, fluree_db_api::ApiError> {
-        FlureeServer::new(self.config).await
+        let telemetry_config = TelemetryConfig::with_server_config(&self.config);
+        #[allow(unused_mut)]
+        let mut state_inner = AppState::new(self.config, telemetry_config).await?;
+
+        #[cfg(feature = "raft")]
+        let raft_listener = self.raft.map(|(integration, listen_addr)| {
+            state_inner.raft = Some(Arc::clone(&integration));
+            RaftListener {
+                private_router: integration.private_router(),
+                listen_addr,
+            }
+        });
+
+        let state = Arc::new(state_inner);
+
+        // Warm JWKS cache (async — fetch keys from configured endpoints).
+        #[cfg(feature = "oidc")]
+        if let Some(jwks_cache) = &state.jwks_cache {
+            let warmed = jwks_cache.warm().await;
+            let total = jwks_cache.configured_issuer_count();
+            if warmed == 0 && total > 0 {
+                if state.config.data_auth_mode == crate::config::DataAuthMode::Required {
+                    tracing::error!(
+                        total_issuers = total,
+                        "No JWKS endpoints reachable at startup — \
+                         OIDC token verification will FAIL until endpoints become available"
+                    );
+                } else {
+                    tracing::warn!(
+                        total_issuers = total,
+                        "No JWKS endpoints reachable at startup — \
+                         OIDC tokens will be rejected until endpoints become available"
+                    );
+                }
+            }
+        }
+
+        // Pre-load all ledgers into the LRU cache so the first query
+        // against each ledger doesn't pay the cold-start penalty
+        // (loading the binary index root from CAS, deserializing
+        // dicts, etc.).
+        FlureeServer::preload_all_ledgers(&state).await;
+
+        let router = routes::build_router(state.clone());
+
+        Ok(FlureeServer {
+            state,
+            router,
+            #[cfg(feature = "raft")]
+            raft_listener,
+        })
     }
 }
 
