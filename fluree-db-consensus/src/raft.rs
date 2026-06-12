@@ -35,6 +35,7 @@
 //!
 //! [`LocalCommitter`]: crate::LocalCommitter
 
+pub mod admin;
 pub mod execution_record;
 pub mod log_adapter;
 pub mod nameservice;
