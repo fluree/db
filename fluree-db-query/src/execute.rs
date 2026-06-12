@@ -49,7 +49,7 @@ pub use where_plan::build_where_operators_seeded;
 pub(crate) use where_plan::{analyze_property_join_plan, collect_inner_join_block};
 
 // Re-export operator tree builder and runner for custom execution pipelines
-pub use operator_tree::build_operator_tree;
+pub use operator_tree::{build_operator_tree, fast_paths_disabled, set_fast_paths_disabled};
 pub use runner::run_operator;
 
 // Re-export pushdown utilities for tests

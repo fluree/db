@@ -2041,6 +2041,35 @@ fn detect_union_star_count_all(
     Some((union_preds, extra_preds, mode, out_var))
 }
 
+/// Global fast-path kill switch.
+///
+/// When set (programmatically via [`set_fast_paths_disabled`] or via the
+/// `FLUREE_DISABLE_QUERY_FAST_PATHS` env var), the planner skips every
+/// `detect_*` shape recognizer — the fused chain *and* the history-gated
+/// non-fused paths — and always builds the generic operator pipeline.
+///
+/// This exists for the differential correctness harness
+/// (`fluree-db-api/tests/it_differential_fastpath.rs`), which runs the same
+/// query with fast paths on and off and asserts identical results, and as
+/// an operational escape hatch when triaging a suspected fast-path bug.
+/// It is NOT a tuning knob: runtime operator-internal optimizations
+/// (cursor selection, batched joins) are unaffected.
+static FAST_PATHS_DISABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Disable (or re-enable) planner fast paths process-wide. Test/triage use.
+pub fn set_fast_paths_disabled(disabled: bool) {
+    FAST_PATHS_DISABLED.store(disabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// True when planner fast paths are disabled, either programmatically or
+/// via `FLUREE_DISABLE_QUERY_FAST_PATHS` (read once per process).
+pub fn fast_paths_disabled() -> bool {
+    static ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    FAST_PATHS_DISABLED.load(std::sync::atomic::Ordering::Relaxed)
+        || *ENV.get_or_init(|| std::env::var_os("FLUREE_DISABLE_QUERY_FAST_PATHS").is_some())
+}
+
 /// Build the complete operator tree for a query
 ///
 /// Constructs operators in the order:
@@ -2076,6 +2105,12 @@ fn build_operator_tree_inner(
     enable_fused_fast_paths: bool,
     planning: &PlanningContext,
 ) -> Result<BoxedOperator> {
+    // Global kill switch (differential harness / triage): force the generic
+    // pipeline for the fused chain and the non-fused history-gated paths
+    // below alike.
+    let fast_paths_globally_disabled = fast_paths_disabled();
+    let enable_fused_fast_paths = enable_fused_fast_paths && !fast_paths_globally_disabled;
+
     // Phase 5 of the planner-mode refactor: fast paths emit current-state
     // bindings (no `op` channel, no retract events) and don't consult the
     // history sidecar. In `History` mode they're semantically wrong, so the
@@ -2531,7 +2566,7 @@ fn build_operator_tree_inner(
     // This avoids decoding leaflets for long (p,o) runs that span leaflet boundaries.
     // Skipped in `History` mode for the same reason as the fused fast paths above:
     // the path emits current-state counts and ignores retracts.
-    if !planning.is_history() {
+    if !planning.is_history() && !fast_paths_globally_disabled {
         if let Some((pred, s_var, o_var, count_var, limit)) =
             detect_predicate_group_by_object_count_topk(query)
         {
@@ -2561,7 +2596,7 @@ fn build_operator_tree_inner(
 
     // Fast-path: `SELECT (COUNT(?s) AS ?c) WHERE { ?s <p> <o> }` using leaflet FIRST headers.
     // Skipped in `History` mode (current-state count semantics).
-    if !planning.is_history() {
+    if !planning.is_history() && !fast_paths_globally_disabled {
         if let Some((pred, s_var, obj, count_var)) = detect_predicate_object_count(query) {
             let mut operator: BoxedOperator = Box::new(PredicateObjectCountFirstsOperator::new(
                 pred,
@@ -2608,7 +2643,7 @@ fn build_operator_tree_inner(
     // This avoids scanning all triples when we can answer directly from IndexStats.
     // Skipped in `History` mode — IndexStats reflects current-state cardinality,
     // not the asserts + retracts a history-range query needs.
-    if !planning.is_history() {
+    if !planning.is_history() && !fast_paths_globally_disabled {
         if let Some(ref stats_view) = stats {
             if let Some((pred_var, count_var)) = detect_stats_count_by_predicate(query) {
                 let mut operator: BoxedOperator = Box::new(StatsCountByPredicateOperator::new(

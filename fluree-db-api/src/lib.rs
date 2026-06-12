@@ -228,6 +228,9 @@ pub use fluree_db_query::{
     execute, execute_pattern, Batch, ContextConfig, ExecutableQuery, NoOpR2rmlProvider, Pattern,
     ReasoningConfig, VarRegistry,
 };
+// Planner fast-path kill switch — differential correctness harness
+// (tests/it_differential_fastpath.rs) and operational triage.
+pub use fluree_db_query::{fast_paths_disabled, set_fast_paths_disabled};
 // Re-export for lower-level pattern-based queries (internal/advanced use)
 pub use fluree_db_query::{Term, TriplePattern};
 // Re-export parse types for query results
