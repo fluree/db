@@ -2918,6 +2918,7 @@ dependencies = [
 name = "fluree-db-sparql"
 version = "4.0.6"
 dependencies = [
+ "bigdecimal 0.4.10",
  "fluree-db-core",
  "fluree-db-query",
  "fluree-graph-json-ld",

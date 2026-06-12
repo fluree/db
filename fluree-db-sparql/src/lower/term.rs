@@ -24,6 +24,21 @@ use std::sync::Arc;
 
 use super::{LowerError, LoweringContext, Result};
 
+/// Parse an `xsd:decimal` lexical form into an exact `FlakeValue::Decimal`.
+///
+/// Decimals must never round-trip through `f64`: values like `19.99` have no
+/// exact binary representation, and the storage layer keys decimals on the
+/// exact `BigDecimal` value.
+pub(super) fn parse_decimal_value(
+    value: &str,
+    span: crate::span::SourceSpan,
+) -> Result<FlakeValue> {
+    value
+        .parse::<bigdecimal::BigDecimal>()
+        .map(|d| FlakeValue::Decimal(Box::new(d)))
+        .map_err(|_| LowerError::invalid_decimal(value, span))
+}
+
 impl<E: IriEncoder> LoweringContext<'_, E> {
     /// Register a SPARQL variable with the variable registry.
     pub(super) fn register_var(&mut self, v: &Var) -> VarId {
@@ -135,12 +150,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
             }
             LiteralValue::Typed { value, datatype } => self.lower_typed_literal(value, datatype)?,
             LiteralValue::Integer(i) => FlakeValue::Long(*i),
-            LiteralValue::Decimal(d) => {
-                let val: f64 = d
-                    .parse()
-                    .map_err(|_| LowerError::invalid_decimal(d.as_ref(), lit.span))?;
-                FlakeValue::Double(val)
-            }
+            LiteralValue::Decimal(d) => parse_decimal_value(d, lit.span)?,
             LiteralValue::Double(d) => FlakeValue::Double(*d),
             LiteralValue::Boolean(b) => FlakeValue::Boolean(*b),
         };
@@ -158,7 +168,8 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                     .map_err(|_| LowerError::invalid_integer(value, datatype.span))?;
                 Ok(FlakeValue::Long(i))
             }
-            xsd::DECIMAL | xsd::DOUBLE | xsd::FLOAT => {
+            xsd::DECIMAL => parse_decimal_value(value, datatype.span),
+            xsd::DOUBLE | xsd::FLOAT => {
                 let d: f64 = value
                     .parse()
                     .map_err(|_| LowerError::invalid_decimal(value, datatype.span))?;
@@ -328,15 +339,10 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                     FlakeValue::Boolean(*b),
                     Sid::new(XSD, xsd_names::BOOLEAN),
                 )),
-                LiteralValue::Decimal(d) => {
-                    let val: f64 = d
-                        .parse()
-                        .map_err(|_| LowerError::invalid_decimal(d.as_ref(), lit.span))?;
-                    Ok(Binding::lit(
-                        FlakeValue::Double(val),
-                        Sid::new(XSD, xsd_names::DECIMAL),
-                    ))
-                }
+                LiteralValue::Decimal(d) => Ok(Binding::lit(
+                    parse_decimal_value(d, lit.span)?,
+                    Sid::new(XSD, xsd_names::DECIMAL),
+                )),
                 LiteralValue::Typed { value, datatype } => {
                     let fv = self.lower_typed_literal(value, datatype)?;
                     let dt_iri = self.expand_iri(datatype)?;
