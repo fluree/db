@@ -21,15 +21,15 @@
 use crate::binding::{Batch, Binding};
 use crate::error::{QueryError, Result};
 use crate::fast_path_common::{
-    fast_path_store, leaf_entries_for_predicate, normalize_pred_sid, FastPathOperator,
+    fast_path_store, leaf_entries_for_predicate, normalize_pred_sid, projection_otype_okey,
+    FastPathOperator,
 };
 use crate::ir::triple::Ref;
 use crate::operator::BoxedOperator;
 use crate::var_registry::VarId;
-use fluree_db_binary_index::format::column_block::ColumnId;
 use fluree_db_binary_index::format::run_record::RunSortOrder;
 use fluree_db_binary_index::format::run_record_v2::read_ordered_key_v2;
-use fluree_db_binary_index::{BinaryIndexStore, ColumnProjection, ColumnSet};
+use fluree_db_binary_index::BinaryIndexStore;
 use fluree_db_core::ids::DatatypeDictId;
 use fluree_db_core::o_type::{DecodeKind, OType};
 use fluree_db_core::value_id::{ObjKey, ObjKind};
@@ -240,16 +240,6 @@ fn consider_string_candidate(
         }
     }
     true
-}
-
-fn projection_otype_okey() -> ColumnProjection {
-    let mut internal = ColumnSet::EMPTY;
-    internal.insert(ColumnId::OType);
-    internal.insert(ColumnId::OKey);
-    ColumnProjection {
-        output: ColumnSet::EMPTY,
-        internal,
-    }
 }
 
 fn minmax_numeric_post(

@@ -73,19 +73,43 @@ ex:s6 ex:desc "tomate"@fr .
     .expect("to_sparql_json");
     assert_eq!(distinct["results"]["bindings"][0]["count"]["value"], "6");
 
+    // banana cherry apfel zwiebel abricot tomate = 6+6+5+7+7+6 codepoints
+    let strlen_sum = support::query_sparql(
+        &fluree,
+        &ledger,
+        r"PREFIX ex: <http://example.org/ns/>
+          SELECT (SUM(STRLEN(?o)) AS ?n) WHERE { ?s ex:desc ?o }",
+    )
+    .await
+    .expect("strlen query")
+    .to_sparql_json(&ledger.snapshot)
+    .expect("to_sparql_json");
+    assert_eq!(strlen_sum["results"]["bindings"][0]["n"]["value"], "37");
+
+    // "a.f" matches only "apfel"
+    let regex_count = support::query_sparql(
+        &fluree,
+        &ledger,
+        r#"PREFIX ex: <http://example.org/ns/>
+          SELECT (COUNT(*) AS ?c) WHERE { ?s ex:desc ?o FILTER REGEX(?o, "a.f") }"#,
+    )
+    .await
+    .expect("regex query")
+    .to_sparql_json(&ledger.snapshot)
+    .expect("to_sparql_json");
+    assert_eq!(regex_count["results"]["bindings"][0]["c"]["value"], "1");
+
     let served: Vec<String> = store
         .find_events("fast path produced result")
         .iter()
         .filter_map(|e| e.fields.get("label").cloned())
         .collect();
-    assert!(
-        served.iter().any(|l| l.contains("MIN/MAX")),
-        "expected the MIN/MAX string fast path to serve; served: {served:?}"
-    );
-    assert!(
-        served.iter().any(|l| l.contains("COUNT(DISTINCT)")),
-        "expected the COUNT(DISTINCT) lead-group walk to serve; served: {served:?}"
-    );
+    for expected in ["MIN/MAX", "COUNT(DISTINCT)", "SUM(STRLEN)", "COUNT(REGEX)"] {
+        assert!(
+            served.iter().any(|l| l.contains(expected)),
+            "expected a fast path labeled {expected} to serve; served: {served:?}"
+        );
+    }
     assert!(
         !store.has_event("fast path declined; running fallback"),
         "no fast path should decline on a lex-sorted multi-language predicate"
