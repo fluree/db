@@ -1104,27 +1104,50 @@ struct PredicateLeadPartial {
 }
 
 /// Count distinct objects `(o_type, o_key)` for one predicate from POST
-/// leaflet directories only (cached header+directory prefix reads — no
-/// payload, columns, or dictionary access).
+/// leaflet directories only.
 ///
-/// POST keys are `p_id(4) + o_type(2) + o_key(8) + o_i(4) + s_id(8)` and
+/// POST keys are `p_id(4) + o_type(2) + o_key(8) + o_i(4) + s_id(8)` and POST
 /// `lead_group_count` counts distinct `(o_type, o_key)` per leaflet (`o_i`
-/// excluded), so summing the predicate's leaflets and deduplicating groups
-/// that span leaflet/chunk seams by the 14-byte `p+o` prefix is exact.
-/// Distinctness is order-independent, so no `lex_sorted_string_ids` gate is
-/// needed and every object type is supported.
-///
-/// Returns `Ok(None)` when a non-empty leaflet has no `lead_group_count`
-/// (pre-§3.2 leaves) — the caller must fall back to a row scan.
+/// excluded), so the 14-byte `p+o` prefix defines a group.
 pub(crate) fn count_distinct_objects_for_predicate(
     store: &BinaryIndexStore,
     g_id: GraphId,
     p_id: u32,
 ) -> Result<Option<u64>> {
-    /// `p_id(4) + o_type(2) + o_key(8)` POST key prefix.
-    const POST_PO_LEAD_LEN: usize = 14;
+    count_lead_groups_for_predicate(store, g_id, p_id, RunSortOrder::Post, 14)
+}
 
-    let leaves = leaf_entries_for_predicate(store, g_id, RunSortOrder::Post, p_id);
+/// Count distinct subjects for one predicate from PSOT leaflet directories
+/// only.
+///
+/// PSOT keys are `p_id(4) + s_id(8) + …` and PSOT `lead_group_count` counts
+/// distinct `s_id` per leaflet, so the 12-byte `p+s` prefix defines a group.
+pub(crate) fn count_distinct_subjects_for_predicate(
+    store: &BinaryIndexStore,
+    g_id: GraphId,
+    p_id: u32,
+) -> Result<Option<u64>> {
+    count_lead_groups_for_predicate(store, g_id, p_id, RunSortOrder::Psot, 12)
+}
+
+/// Count distinct lead groups for one predicate's leaf range (cached
+/// header+directory prefix reads — no payload, columns, or dictionary access).
+///
+/// Sums `lead_group_count` over the predicate's leaflets and deduplicates
+/// groups that span leaflet/chunk seams by the `lead_len`-byte key prefix.
+/// Distinctness is order-independent, so no `lex_sorted_string_ids` gate is
+/// needed and every object type is supported.
+///
+/// Returns `Ok(None)` when a non-empty leaflet has no `lead_group_count`
+/// (pre-§3.2 leaves) — the caller must fall back to a row scan.
+fn count_lead_groups_for_predicate(
+    store: &BinaryIndexStore,
+    g_id: GraphId,
+    p_id: u32,
+    order: RunSortOrder,
+    lead_len: usize,
+) -> Result<Option<u64>> {
+    let leaves = leaf_entries_for_predicate(store, g_id, order, p_id);
     if leaves.is_empty() {
         return Ok(Some(0));
     }
@@ -1150,8 +1173,8 @@ pub(crate) fn count_distinct_objects_for_predicate(
                     return Ok(Some(partial));
                 }
 
-                let lead_first = &entry.first_key[..POST_PO_LEAD_LEN];
-                let lead_last = &entry.last_key[..POST_PO_LEAD_LEN];
+                let lead_first = &entry.first_key[..lead_len];
+                let lead_last = &entry.last_key[..lead_len];
 
                 partial.count += u64::from(entry.lead_group_count);
                 if !partial.last_lead.is_empty() && partial.last_lead == lead_first {

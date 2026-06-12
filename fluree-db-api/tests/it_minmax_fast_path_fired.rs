@@ -99,12 +99,34 @@ ex:s6 ex:desc "tomate"@fr .
     .expect("to_sparql_json");
     assert_eq!(regex_count["results"]["bindings"][0]["c"]["value"], "1");
 
+    // Each description is its own group: Σ strlen + 0 separators = 37.
+    let group_concat = support::query_sparql(
+        &fluree,
+        &ledger,
+        r#"PREFIX ex: <http://example.org/ns/>
+          SELECT (SUM(STRLEN(?cat)) AS ?n) {
+            { SELECT (GROUP_CONCAT(?o; SEPARATOR=" ") AS ?cat)
+              WHERE { ?s ex:desc ?o } GROUP BY ?s }
+          }"#,
+    )
+    .await
+    .expect("group_concat query")
+    .to_sparql_json(&ledger.snapshot)
+    .expect("to_sparql_json");
+    assert_eq!(group_concat["results"]["bindings"][0]["n"]["value"], "37");
+
     let served: Vec<String> = store
         .find_events("fast path produced result")
         .iter()
         .filter_map(|e| e.fields.get("label").cloned())
         .collect();
-    for expected in ["MIN/MAX", "COUNT(DISTINCT)", "SUM(STRLEN)", "COUNT(REGEX)"] {
+    for expected in [
+        "MIN/MAX",
+        "COUNT(DISTINCT)",
+        "SUM(STRLEN)",
+        "COUNT(REGEX)",
+        "SUM(STRLEN(GROUP_CONCAT))",
+    ] {
         assert!(
             served.iter().any(|l| l.contains(expected)),
             "expected a fast path labeled {expected} to serve; served: {served:?}"

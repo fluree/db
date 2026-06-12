@@ -36,6 +36,8 @@ ex:s6 ex:label "zebra" .
 ex:s7 ex:label "äcom" .
 ex:m1 ex:mixed "com" .
 ex:m2 ex:mixed 5 .
+ex:t1 ex:tags "red", "blue" .
+ex:t2 ex:tags "green" .
 "#
 }
 
@@ -174,6 +176,110 @@ async fn mixed_type_rows_contribute_zero() {
     )
     .await;
     assert_eq!(total, "3", "STRLEN sums only the string row");
+}
+
+/// `SUM(STRLEN(GROUP_CONCAT(?o; sep)))` grouped by subject, computed via
+/// `Σ strlen + (rows − subjects)·strlen(sep)`.
+/// ex:tags: red(3)+blue(4)+green(5)=12 values, 3 rows over 2 subjects → one
+/// separator. Direct check: "red blue"(8) + "green"(5) = 13 with sep " ";
+/// 12 + 1·2 = 14 with sep "--". ex:label is single-valued per subject, so the
+/// separator term is 0 and the multi-language sum is just Σ strlen = 37.
+#[tokio::test]
+async fn group_concat_strlen_sum() {
+    let (_db_dir, _data_dir, fluree, ledger_id) = bulk_import_fold().await;
+    let ledger = fluree.ledger(&ledger_id).await.expect("load");
+
+    for (sep, expected) in [(" ", "13"), ("--", "14")] {
+        let got = scalar(
+            &fluree,
+            &ledger,
+            &format!(
+                r#"{PREFIXES}SELECT (SUM(STRLEN(?cat)) AS ?v) {{
+                    {{ SELECT (GROUP_CONCAT(?o; SEPARATOR="{sep}") AS ?cat)
+                       {{ ?s ex:tags ?o . }} GROUP BY ?s }}
+                }}"#
+            ),
+        )
+        .await;
+        assert_eq!(got, expected, "separator {sep:?}");
+    }
+
+    let labels = scalar(
+        &fluree,
+        &ledger,
+        &format!(
+            r#"{PREFIXES}SELECT (SUM(STRLEN(?cat)) AS ?v) {{
+                {{ SELECT (GROUP_CONCAT(?o; SEPARATOR=" ") AS ?cat)
+                   {{ ?s ex:label ?o . }} GROUP BY ?s }}
+            }}"#
+        ),
+    )
+    .await;
+    assert_eq!(labels, "37", "single-valued multi-lang groups");
+
+    // Mixed string/numeric objects decline the fold (GROUP_CONCAT stringifies
+    // numbers, which the dict-only sum cannot see) — pipeline must agree with
+    // a detection-disqualified variant of the same query.
+    let fast = scalar(
+        &fluree,
+        &ledger,
+        &format!(
+            r#"{PREFIXES}SELECT (SUM(STRLEN(?cat)) AS ?v) {{
+                {{ SELECT (GROUP_CONCAT(?o; SEPARATOR=" ") AS ?cat)
+                   {{ ?s ex:mixed ?o . }} GROUP BY ?s }}
+            }}"#
+        ),
+    )
+    .await;
+    let slow = scalar(
+        &fluree,
+        &ledger,
+        &format!(
+            r#"{PREFIXES}SELECT (SUM(STRLEN(?cat)) AS ?v) {{
+                {{ SELECT (GROUP_CONCAT(?o; SEPARATOR=" ") AS ?cat)
+                   {{ ?s ex:mixed ?o . FILTER(BOUND(?o)) }} GROUP BY ?s }}
+            }}"#
+        ),
+    )
+    .await;
+    assert_eq!(fast, slow, "mixed-type groupconcat agrees with pipeline");
+    // GROUP_CONCAT stringifies the number: "com"(3) + "5"(1).
+    assert_eq!(fast, "4");
+}
+
+/// Fast path and pipeline agree on the multi-valued predicate.
+#[tokio::test]
+async fn group_concat_strlen_sum_agrees_with_fallback() {
+    let (_db_dir, _data_dir, fluree, ledger_id) = bulk_import_fold().await;
+    let ledger = fluree.ledger(&ledger_id).await.expect("load");
+
+    let fast = scalar(
+        &fluree,
+        &ledger,
+        &format!(
+            r#"{PREFIXES}SELECT (SUM(STRLEN(?cat)) AS ?v) {{
+                {{ SELECT (GROUP_CONCAT(?o; SEPARATOR=", ") AS ?cat)
+                   {{ ?s ex:tags ?o . }} GROUP BY ?s }}
+            }}"#
+        ),
+    )
+    .await;
+    // An inner ORDER BY disqualifies detection without changing the sum, so
+    // this runs the identical aggregate through the planned pipeline (which
+    // exercises the GROUP_CONCAT encoded-binding materialization fix).
+    let pipeline = scalar(
+        &fluree,
+        &ledger,
+        &format!(
+            r#"{PREFIXES}SELECT (SUM(STRLEN(?cat)) AS ?v) {{
+                {{ SELECT (GROUP_CONCAT(?o; SEPARATOR=", ") AS ?cat)
+                   {{ ?s ex:tags ?o . }} GROUP BY ?s ORDER BY ?s }}
+            }}"#
+        ),
+    )
+    .await;
+    assert_eq!(fast, pipeline);
+    assert_eq!(fast, "14");
 }
 
 /// The fold needs only value equality/adjacency (POST groups equal o_keys),

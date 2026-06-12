@@ -127,27 +127,74 @@ fn strlen_codepoints(s: &str) -> u64 {
     }
 }
 
+/// Which object kinds the fold evaluates — set by the query shape's
+/// fallback semantics.
+#[derive(Clone, Copy, Debug)]
+enum StringKindPolicy {
+    /// Expression shapes (FILTER/SUM of a string function): only xsd:string
+    /// and rdf:langString evaluate; other non-string kinds error in the
+    /// fallback (FILTER excludes the row, SUM skips it) so they contribute 0;
+    /// string-dict kinds the evaluator may treat differently (fulltext,
+    /// custom datatypes, anyURI family, rdf:JSON) decline.
+    PlainOnly,
+    /// GROUP_CONCAT stringification: every string-dict-backed kind evaluates
+    /// on its dictionary value; anything else (inline numerics, refs, …)
+    /// declines.
+    AnyStringDict,
+}
+
 /// How a leaflet/row object participates in the fold.
 enum ObjClass {
-    /// xsd:string or rdf:langString — evaluate the function on the value.
-    PlainString,
-    /// The expression errors on this type in the fallback (FILTER excludes
-    /// the row, SUM skips it) — contributes 0.
+    /// Evaluate the function on the dictionary value.
+    Evaluate,
+    /// Contributes 0 (fallback expression-error semantics).
     Skip,
-    /// A string-dict kind the evaluator may treat differently (fulltext,
-    /// custom datatype, anyURI family, rdf:JSON) — decline the fast path.
+    /// Decline the fast path.
     Unsupported,
 }
 
-fn classify_otype(o_type: u16) -> ObjClass {
+fn classify_otype(o_type: u16, policy: StringKindPolicy) -> ObjClass {
     let ot = OType::from_u16(o_type);
-    if o_type == OType::XSD_STRING.as_u16() || ot.is_lang_string() {
-        ObjClass::PlainString
-    } else if ot.decode_kind() == DecodeKind::StringDict || o_type == OType::RDF_JSON.as_u16() {
-        ObjClass::Unsupported
-    } else {
-        ObjClass::Skip
+    let is_string_dict = ot.decode_kind() == DecodeKind::StringDict;
+    match policy {
+        StringKindPolicy::PlainOnly => {
+            if o_type == OType::XSD_STRING.as_u16() || ot.is_lang_string() {
+                ObjClass::Evaluate
+            } else if is_string_dict || o_type == OType::RDF_JSON.as_u16() {
+                ObjClass::Unsupported
+            } else {
+                ObjClass::Skip
+            }
+        }
+        StringKindPolicy::AnyStringDict => {
+            if is_string_dict {
+                ObjClass::Evaluate
+            } else {
+                ObjClass::Unsupported
+            }
+        }
     }
+}
+
+/// `Σ STRLEN(?o)` over every row of one predicate, evaluating any
+/// string-dict-backed kind (GROUP_CONCAT stringification semantics).
+///
+/// Returns `Ok(None)` when an object is not string-dict-backed — the caller
+/// must fall back.
+pub(crate) fn sum_strlen_any_string_dict(
+    store: &Arc<BinaryIndexStore>,
+    g_id: GraphId,
+    p_id: u32,
+    cancellation: &fluree_db_core::QueryCancellation,
+) -> Result<Option<u64>> {
+    scan_string_fold(
+        store,
+        g_id,
+        p_id,
+        &CompiledFold::Strlen,
+        StringKindPolicy::AnyStringDict,
+        cancellation,
+    )
 }
 
 /// Create a fused operator that outputs the folded aggregate as one row.
@@ -181,8 +228,14 @@ pub fn predicate_string_fold_operator(
             let Some(compiled) = agg.compile() else {
                 return Ok(None);
             };
-            let Some(total) =
-                scan_string_fold(store, ctx.binary_g_id, p_id, &compiled, &ctx.cancellation)?
+            let Some(total) = scan_string_fold(
+                store,
+                ctx.binary_g_id,
+                p_id,
+                &compiled,
+                StringKindPolicy::PlainOnly,
+                &ctx.cancellation,
+            )?
             else {
                 return Ok(None);
             };
@@ -213,6 +266,7 @@ fn scan_string_fold(
     g_id: GraphId,
     p_id: u32,
     fold: &CompiledFold,
+    policy: StringKindPolicy,
     cancellation: &fluree_db_core::QueryCancellation,
 ) -> Result<Option<u64>> {
     let leaves = leaf_entries_for_predicate(store, g_id, RunSortOrder::Post, p_id);
@@ -238,11 +292,11 @@ fn scan_string_fold(
                 if entry.row_count == 0 || entry.p_const != Some(p_id) {
                     continue;
                 }
-                let const_class = entry.o_type_const.map(classify_otype);
+                let const_class = entry.o_type_const.map(|ot| classify_otype(ot, policy));
                 match const_class {
                     Some(ObjClass::Skip) => continue, // contributes 0, no IO
                     Some(ObjClass::Unsupported) => return Ok(None),
-                    Some(ObjClass::PlainString) | None => {}
+                    Some(ObjClass::Evaluate) | None => {}
                 }
 
                 if handle.is_none() {
@@ -279,10 +333,10 @@ fn scan_string_fold(
                             continue;
                         }
                     }
-                    let contribution = match classify_otype(o_type) {
+                    let contribution = match classify_otype(o_type, policy) {
                         ObjClass::Skip => 0,
                         ObjClass::Unsupported => return Ok(None),
-                        ObjClass::PlainString => {
+                        ObjClass::Evaluate => {
                             let Ok(str_id) = u32::try_from(o_key) else {
                                 return Ok(None);
                             };
