@@ -290,6 +290,13 @@ pub enum Commands {
         action: BranchAction,
     },
 
+    /// Bootstrap and manage a Raft cluster (replicated transaction servers)
+    #[cfg(feature = "server")]
+    Cluster {
+        #[command(subcommand)]
+        action: ClusterAction,
+    },
+
     /// Drop (delete) a ledger or graph source
     Drop {
         /// Ledger or graph source name to drop. The server resolves as a ledger
@@ -1068,6 +1075,89 @@ pub enum BranchAction {
         /// Execute against a remote server (by remote name, e.g., "origin")
         #[arg(long)]
         remote: Option<String>,
+    },
+}
+
+/// `cluster` subcommands.
+///
+/// Wraps the Fluree server's private `/cluster/*` admin endpoints
+/// for bootstrapping and managing a Raft cluster. All commands take
+/// an admin URL pointing at the VPC-internal listener (`--addr` for
+/// the target node, `--leader` for ops that must run on the
+/// leader). The endpoints carry no auth — the CLI assumes the
+/// operator is reaching them over a private network or SSH tunnel.
+#[cfg(feature = "server")]
+#[derive(Subcommand)]
+pub enum ClusterAction {
+    /// Bootstrap a fresh single-node cluster on this node. Run once
+    /// on the seed node — it auto-elects itself leader. Subsequent
+    /// peers are added with `add` followed by `promote`.
+    Init {
+        /// Admin URL of the seed node (e.g., http://node-1:9090).
+        #[arg(long)]
+        addr: String,
+        /// This node's id. Must be unique in the cluster and stable
+        /// across restarts.
+        #[arg(long)]
+        node_id: u64,
+        /// This node's inter-node Raft RPC URL
+        /// (e.g. http://node-1:9090/raft).
+        #[arg(long)]
+        raft_url: String,
+        /// This node's client-facing URL — used by other nodes
+        /// when forwarding client requests to this leader
+        /// (e.g. http://node-1:8080).
+        #[arg(long)]
+        client_url: String,
+    },
+
+    /// Add a non-voting peer (learner) to the cluster. Issue
+    /// against the leader. The new node replicates the log until
+    /// caught up, then can be promoted to a voter with
+    /// `cluster promote`.
+    Add {
+        /// Admin URL of the cluster leader.
+        #[arg(long)]
+        leader: String,
+        /// Id for the new peer.
+        #[arg(long)]
+        node_id: u64,
+        /// New peer's inter-node Raft RPC URL.
+        #[arg(long)]
+        raft_url: String,
+        /// New peer's client-facing URL.
+        #[arg(long)]
+        client_url: String,
+        /// Wait for the learner to catch up to the leader's log
+        /// before returning. Default: true (the safe choice for
+        /// orchestration scripts that immediately follow up with
+        /// `promote`).
+        #[arg(long, default_value_t = true)]
+        blocking: bool,
+    },
+
+    /// Change the cluster's voting membership — promotes learners
+    /// to voters or demotes / removes existing voters. Issue
+    /// against the leader.
+    Promote {
+        /// Admin URL of the cluster leader.
+        #[arg(long)]
+        leader: String,
+        /// New voter set, comma-separated (e.g., `1,2,3`).
+        #[arg(long, value_delimiter = ',')]
+        members: Vec<u64>,
+        /// Keep voters dropped from `--members` as learners.
+        /// Default: removed entirely.
+        #[arg(long)]
+        retain: bool,
+    },
+
+    /// Snapshot cluster state (current leader, term, voters,
+    /// learners, last applied index). Any node's admin URL works.
+    Status {
+        /// Admin URL of the node to query.
+        #[arg(long)]
+        addr: String,
     },
 }
 

@@ -147,6 +147,9 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
             commands::branch::run(action, &fluree_dir, direct).await
         }
 
+        #[cfg(feature = "server")]
+        Commands::Cluster { action } => commands::cluster::run(action).await,
+
         Commands::Drop {
             name,
             force,
