@@ -29,38 +29,34 @@
 //! the audit's bug-class history says the fast/overlay side is usually the
 //! suspect, but the generic path is not presumed correct either.
 //!
-//! ## Known divergences (found by this harness's first run, 2026-06-11)
+//! ## Finding history
 //!
 //! Cases marked `known_divergence` REPORT their mismatch to stderr instead
 //! of failing, so the harness stays green while pinning the contract for
-//! everything else. Each entry is a real, reproducible fast-vs-generic
-//! divergence awaiting a fix; when the fix lands, remove the marker so the
-//! harness starts enforcing the case. The cross-condition axis is enforced
-//! for ALL cases — generic results agreed across base/overlay/novelty on
-//! every case at harness introduction.
+//! everything else; when a fix lands, the marker is removed and the case
+//! becomes enforced. The harness's first run (2026-06-11) found three
+//! divergence classes, all since fixed and now enforced:
 //!
-//! - **FD-1 `avg_numeric`** (base, overlay): values agree to f64
-//!   precision, but the AVG fast path emits an `xsd:double`-style JSON
-//!   number (`7072.886363636364`) while the generic pipeline emits an
-//!   arbitrary-precision `xsd:decimal` string. Observable datatype
-//!   contract difference. Suspect: `fast_predicate_scalar_agg`.
-//! - **FD-2 `max_label` / `min_label`** (base): wrong answers. With
-//!   `bsbm:label` on vendors and products, generic MAX is
-//!   `"Vendor 000003"` (lexicographic), fast returns `"Product 000219"`
-//!   — the last-inserted label, consistent with assuming string-ID order
-//!   is lexicographic order. That invariant (`lex_sorted_string_ids`)
-//!   only holds after bulk import and is cleared by incremental writes;
-//!   this ledger was reindex-built. Suspect: `fast_min_max_string`
-//!   missing the lex-order gate.
-//! - **FD-3 `group_by_predicate_count`** (all three conditions,
-//!   differently): the stats-answered path
-//!   (`StatsCountByPredicateOperator`) (a) counts duplicate re-asserts
-//!   that set-semantics novelty apply dedups (base: `bsbm:name` 42 vs
-//!   22), (b) applies novelty deltas inconsistently per predicate
-//!   (overlay: `rdf:type` stale at the index-time 824 while other
-//!   predicates include novelty), and (c) omits the `rdf:type` row
-//!   entirely in pure novelty. Suspect: IndexStats accounting +
-//!   `detect_stats_count_by_predicate` novelty handling.
+//! - **FD-1 `avg_numeric`** — FIXED. The AVG fast path accumulated
+//!   Kahan-f64 and emitted xsd:double; the generic pipeline emits exact
+//!   xsd:decimal for integer inputs (SPARQL semantics). Fix: the fast
+//!   path mirrors the generic accumulator per number kind — exact i64 +
+//!   BigDecimal division at the shared AVG_DECIMAL_PRECISION for
+//!   integers, plain (non-Kahan, bit-matching) f64 for doubles, fallback
+//!   for other numeric encodings (`fast_predicate_scalar_agg.rs`).
+//! - **FD-2 `max_label` / `min_label`** — FIXED. The MIN/MAX-string fast
+//!   path took per-leaflet first/last directory keys as candidates,
+//!   which are extremes by StringId, not by lexicographic value; sound
+//!   only under the bulk-import `lex_sorted_string_ids` invariant. Fix:
+//!   the same lex-order gate `fast_string_prefix_count_all` already used
+//!   (`fast_min_max_string.rs`, `minmax_string_dict_post`).
+//! - **FD-3 `group_by_predicate_count`** — FIXED. The path answered from
+//!   `StatsView` planner estimates, which count duplicate re-asserts,
+//!   track `rdf:type` asymmetrically between indexer-built and
+//!   novelty-accumulated stats, and apply novelty deltas inconsistently.
+//!   Fix: rewritten to count exactly from POST leaf-directory metadata
+//!   at epoch 0 (`stats_query.rs`), falling back to the generic pipeline
+//!   under overlay/time-travel/policy/multi-ledger.
 
 #![cfg(feature = "native")]
 
@@ -318,7 +314,7 @@ fn catalog() -> Vec<Case> {
         Case {
             name: "avg_numeric",
             ordered: false,
-            known_divergence: Some("FD-1"),
+            known_divergence: None,
             sparql: "SELECT (AVG(?o) AS ?avg) WHERE { ?s bsbm:price ?o }",
         },
         // detect_predicate_minmax_string — churned labels sort after
@@ -327,13 +323,13 @@ fn catalog() -> Vec<Case> {
         Case {
             name: "max_label",
             ordered: false,
-            known_divergence: Some("FD-2"),
+            known_divergence: None,
             sparql: "SELECT (MAX(?o) AS ?m) WHERE { ?s bsbm:label ?o }",
         },
         Case {
             name: "min_label",
             ordered: false,
-            known_divergence: Some("FD-2"),
+            known_divergence: None,
             sparql: "SELECT (MIN(?o) AS ?m) WHERE { ?s bsbm:label ?o }",
         },
         // detect_post_order_desc_limit — reverse-POST tail walk. The seven
@@ -359,7 +355,7 @@ fn catalog() -> Vec<Case> {
         Case {
             name: "group_by_predicate_count",
             ordered: false,
-            known_divergence: Some("FD-3"),
+            known_divergence: None,
             sparql: "SELECT ?p (COUNT(?s) AS ?c) WHERE { ?s ?p ?o } GROUP BY ?p",
         },
         // Property-join star fusion + ORDER BY (generic-path internal fast
