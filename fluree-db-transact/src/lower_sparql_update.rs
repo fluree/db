@@ -743,6 +743,18 @@ fn literal_to_unresolved(
                 xsd::INTEGER,
             ))),
         }),
+        SparqlLiteralValue::BigInteger(s) => {
+            let term = match s.parse::<num_bigint::BigInt>() {
+                Ok(n) => UnresolvedTerm::Literal(LiteralValue::BigInt(Box::new(n))),
+                Err(_) => UnresolvedTerm::Literal(LiteralValue::String(Arc::from(s.as_ref()))),
+            };
+            Ok(UnresolvedTermWithMeta {
+                term,
+                dtc: Some(UnresolvedDatatypeConstraint::Explicit(Arc::from(
+                    xsd::INTEGER,
+                ))),
+            })
+        }
         SparqlLiteralValue::Double(d) => Ok(UnresolvedTermWithMeta {
             term: UnresolvedTerm::Literal(LiteralValue::Double(*d)),
             dtc: Some(UnresolvedDatatypeConstraint::Explicit(Arc::from(
@@ -885,6 +897,16 @@ fn literal_to_template(
             term: TemplateTerm::Value(FlakeValue::Long(*i)),
             dtc: Some(DatatypeConstraint::Explicit(ns.sid_for_iri(xsd::INTEGER))),
         }),
+        SparqlLiteralValue::BigInteger(s) => {
+            let term = match s.parse::<num_bigint::BigInt>() {
+                Ok(n) => TemplateTerm::Value(FlakeValue::BigInt(Box::new(n))),
+                Err(_) => TemplateTerm::Value(FlakeValue::String(s.to_string())),
+            };
+            Ok(LiteralResult {
+                term,
+                dtc: Some(DatatypeConstraint::Explicit(ns.sid_for_iri(xsd::INTEGER))),
+            })
+        }
         SparqlLiteralValue::Double(d) => Ok(LiteralResult {
             term: TemplateTerm::Value(FlakeValue::Double(*d)),
             dtc: Some(DatatypeConstraint::Explicit(ns.sid_for_iri(xsd::DOUBLE))),

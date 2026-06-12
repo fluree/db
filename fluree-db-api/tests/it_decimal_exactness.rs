@@ -280,6 +280,56 @@ async fn trig_graph_block_decimal_matches_default_graph_decimal() {
 }
 
 #[tokio::test]
+async fn integer_beyond_i64_round_trips_exactly() {
+    // xsd:integer is unbounded: a literal past i64 must promote to BigInt
+    // end to end (it previously lexed to 0).
+    let fluree = memory_fluree();
+    let ledger = genesis_ledger(&fluree, "decimal/bigint:main");
+
+    let big = "123456789012345678901234567890";
+    let turtle = format!(
+        r"
+        @prefix ex: <http://example.org/> .
+        ex:item ex:serial {big} .
+        "
+    );
+    let result = fluree
+        .stage_owned(ledger)
+        .upsert_turtle(&turtle)
+        .execute()
+        .await
+        .expect("upsert turtle");
+    let ledger = result.ledger;
+
+    let query = r#"
+        PREFIX ex: <http://example.org/>
+        SELECT ?serial WHERE { ex:item ex:serial ?serial . }
+    "#;
+    let result = support::query_sparql(&fluree, &ledger, query)
+        .await
+        .expect("query");
+    let sparql_json = result
+        .to_sparql_json(&ledger.snapshot)
+        .expect("to_sparql_json");
+    assert_eq!(binding_values(&sparql_json, "serial"), vec![big]);
+
+    // The same literal as a SPARQL constant matches the stored value.
+    let query = format!(
+        r"
+        PREFIX ex: <http://example.org/>
+        SELECT ?s WHERE {{ ?s ex:serial {big} . }}
+        "
+    );
+    let result = support::query_sparql(&fluree, &ledger, &query)
+        .await
+        .expect("query constant");
+    let sparql_json = result
+        .to_sparql_json(&ledger.snapshot)
+        .expect("to_sparql_json");
+    assert_eq!(binding_values(&sparql_json, "s"), vec!["ex:item"]);
+}
+
+#[tokio::test]
 async fn sparql_delete_data_decimal_retracts_exactly() {
     let fluree = memory_fluree();
     let ledger = genesis_ledger(&fluree, "decimal/delete:main");

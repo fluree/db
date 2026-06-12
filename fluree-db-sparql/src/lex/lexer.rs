@@ -746,8 +746,12 @@ fn parse_integer(input: &mut Input<'_>) -> ModalResult<TokenKind> {
         // Followed by . but not a digit - that's fine, 1. becomes Integer(1) + Dot
     }
 
-    let value = digits.parse::<i64>().unwrap_or(0);
-    Ok(TokenKind::Integer(value))
+    // xsd:integer is unbounded: values past i64 carry their lexical and
+    // promote to BigInt downstream instead of silently corrupting.
+    match digits.parse::<i64>() {
+        Ok(value) => Ok(TokenKind::Integer(value)),
+        Err(_) => Ok(TokenKind::BigInteger(Arc::from(digits))),
+    }
 }
 
 /// Parse a decimal literal (unsigned only).

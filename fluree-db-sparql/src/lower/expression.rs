@@ -178,6 +178,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
             LiteralValue::Simple(s) => Ok(FlakeValue::String(s.to_string())),
             LiteralValue::LangTagged { value, .. } => Ok(FlakeValue::String(value.to_string())),
             LiteralValue::Integer(i) => Ok(FlakeValue::Long(*i)),
+            LiteralValue::BigInteger(s) => super::term::parse_big_integer_value(s, lit.span),
             LiteralValue::Double(d) => Ok(FlakeValue::Double(*d)),
             LiteralValue::Decimal(d) => super::term::parse_decimal_value(d, lit.span),
             LiteralValue::Boolean(b) => Ok(FlakeValue::Boolean(*b)),

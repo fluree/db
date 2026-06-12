@@ -10,7 +10,7 @@ repository.workspace = true
 default = ["lowering"]
 # Enable lowering to fluree-db-query algebra (requires fluree-db-query/fluree-db-core)
 # Disable for smaller Lambda/WASM builds when only parse/validate is needed
-lowering = ["dep:fluree-db-query", "dep:fluree-db-core", "dep:fluree-vocab", "dep:fluree-graph-json-ld", "dep:bigdecimal"]
+lowering = ["dep:fluree-db-query", "dep:fluree-db-core", "dep:fluree-vocab", "dep:fluree-graph-json-ld", "dep:bigdecimal", "dep:num-bigint"]
 
 [dependencies]
 # Internal crates (for lowering - feature-gated)
@@ -19,6 +19,7 @@ fluree-db-core = { path = "../fluree-db-core", optional = true }
 fluree-vocab = { path = "../fluree-vocab", optional = true }
 fluree-graph-json-ld = { path = "../fluree-graph-json-ld", optional = true }
 bigdecimal = { version = "0.4", optional = true }
+num-bigint = { version = "0.4", optional = true }
 
 # Parser
 winnow = { workspace = true }

@@ -2924,6 +2924,7 @@ dependencies = [
  "fluree-graph-json-ld",
  "fluree-vocab",
  "insta",
+ "num-bigint",
  "serde",
  "serde_json",
  "thiserror 1.0.69",

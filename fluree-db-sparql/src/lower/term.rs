@@ -39,6 +39,18 @@ pub(super) fn parse_decimal_value(
         .map_err(|_| LowerError::invalid_decimal(value, span))
 }
 
+/// Parse an integer lexical beyond i64 into an exact `FlakeValue::BigInt`
+/// (xsd:integer is unbounded).
+pub(super) fn parse_big_integer_value(
+    value: &str,
+    span: crate::span::SourceSpan,
+) -> Result<FlakeValue> {
+    value
+        .parse::<num_bigint::BigInt>()
+        .map(|n| FlakeValue::BigInt(Box::new(n)))
+        .map_err(|_| LowerError::invalid_integer(value, span))
+}
+
 impl<E: IriEncoder> LoweringContext<'_, E> {
     /// Register a SPARQL variable with the variable registry.
     pub(super) fn register_var(&mut self, v: &Var) -> VarId {
@@ -150,6 +162,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
             }
             LiteralValue::Typed { value, datatype } => self.lower_typed_literal(value, datatype)?,
             LiteralValue::Integer(i) => FlakeValue::Long(*i),
+            LiteralValue::BigInteger(s) => parse_big_integer_value(s, lit.span)?,
             LiteralValue::Decimal(d) => parse_decimal_value(d, lit.span)?,
             LiteralValue::Double(d) => FlakeValue::Double(*d),
             LiteralValue::Boolean(b) => FlakeValue::Boolean(*b),
@@ -338,6 +351,10 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                 LiteralValue::Boolean(b) => Ok(Binding::lit(
                     FlakeValue::Boolean(*b),
                     Sid::new(XSD, xsd_names::BOOLEAN),
+                )),
+                LiteralValue::BigInteger(s) => Ok(Binding::lit(
+                    parse_big_integer_value(s, lit.span)?,
+                    Sid::new(XSD, xsd_names::INTEGER),
                 )),
                 LiteralValue::Decimal(d) => Ok(Binding::lit(
                     parse_decimal_value(d, lit.span)?,

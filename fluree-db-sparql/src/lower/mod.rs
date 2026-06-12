@@ -479,6 +479,41 @@ mod tests {
     }
 
     #[test]
+    fn test_overflowing_integer_literal_promotes_to_bigint() {
+        // xsd:integer is unbounded; beyond i64 must promote, not corrupt.
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?s WHERE { ?s ex:serial 123456789012345678901234567890 }",
+        )
+        .unwrap();
+
+        let Term::Value(fluree_db_core::FlakeValue::BigInt(n)) = object_of(&query, 0) else {
+            panic!(
+                "expected BigInt object for overflowing integer, got {:?}",
+                object_of(&query, 0)
+            );
+        };
+        assert_eq!(n.to_string(), "123456789012345678901234567890");
+    }
+
+    #[test]
+    fn test_negative_overflowing_integer_literal_promotes_to_bigint() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?s WHERE { ?s ex:serial -123456789012345678901234567890 }",
+        )
+        .unwrap();
+
+        let Term::Value(fluree_db_core::FlakeValue::BigInt(n)) = object_of(&query, 0) else {
+            panic!(
+                "expected BigInt object for overflowing integer, got {:?}",
+                object_of(&query, 0)
+            );
+        };
+        assert_eq!(n.to_string(), "-123456789012345678901234567890");
+    }
+
+    #[test]
     fn test_bare_decimal_literal_is_exact() {
         let query = lower_query(
             "PREFIX ex: <http://example.org/>
