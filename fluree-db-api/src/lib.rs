@@ -2309,16 +2309,44 @@ impl FlureeBuilder {
     /// JSON-LD config). For compile-time-known backends, prefer the typed build
     /// methods for better type safety.
     pub async fn build_client(self) -> Result<FlureeClient> {
+        self.dispatch_build_client(None).await
+    }
+
+    /// Build a type-erased `FlureeClient` whose nameservice is the
+    /// supplied `nameservice` rather than the backend-implied default.
+    ///
+    /// Intended for replicated read-paths — most notably the Raft
+    /// state machine, where every node must serve reads against
+    /// committed log state rather than its local backend.
+    ///
+    /// The supplied nameservice fully replaces the per-backend
+    /// nameservice the default `build_client` path would build:
+    /// `NotifyingNameService` wrapping and the background indexer
+    /// are both skipped, because both presume a backend-owned
+    /// `ReadWrite` nameservice that the embedder controls.
+    pub async fn build_client_with_nameservice(
+        self,
+        nameservice: NameServiceMode,
+    ) -> Result<FlureeClient> {
+        self.dispatch_build_client(Some(nameservice)).await
+    }
+
+    /// Internal dispatcher that backs both [`build_client`](Self::build_client)
+    /// and [`build_client_with_nameservice`](Self::build_client_with_nameservice).
+    async fn dispatch_build_client(
+        self,
+        nameservice: Option<NameServiceMode>,
+    ) -> Result<FlureeClient> {
         // --- S3 / AWS path (async-only) ---
         #[cfg(feature = "aws")]
         if matches!(self.config.index_storage.storage_type, StorageType::S3(_)) {
-            return self.build_client_s3().await;
+            return self.build_client_s3(nameservice).await;
         }
 
         // --- Local (memory/filesystem) ---
         match &self.config.index_storage.storage_type {
-            StorageType::Memory => self.build_client_memory(),
-            StorageType::File => self.build_client_file(),
+            StorageType::Memory => self.build_client_memory(nameservice),
+            StorageType::File => self.build_client_file(nameservice),
             StorageType::S3(_) => Err(ApiError::config(
                 "S3 storage requires the 'aws' feature on fluree-db-api",
             )),
@@ -2328,22 +2356,32 @@ impl FlureeBuilder {
         }
     }
 
-    /// Build a type-erased memory-backed client.
-    fn build_client_memory(self) -> Result<FlureeClient> {
+    /// Build a type-erased memory-backed client. When `nameservice`
+    /// is `Some`, it replaces the default `MemoryNameService` (and
+    /// the notifying wrapper + background indexer that ride along
+    /// with it).
+    fn build_client_memory(self, nameservice: Option<NameServiceMode>) -> Result<FlureeClient> {
         let base_storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
 
         // Wrap with address identifier routing if configured
         let storage = self.wrap_address_identifiers(base_storage)?;
-
-        let nameservice = MemoryNameService::new();
-        let event_bus = Arc::new(fluree_db_nameservice::LedgerEventBus::new(1024));
-        let notifying =
-            fluree_db_nameservice::NotifyingNameService::new(nameservice, event_bus.clone());
-        let ns_mode = NameServiceMode::ReadWrite(Arc::new(notifying.clone()));
-
-        let index_config = self.derive_indexing();
         let backend = StorageBackend::Managed(storage);
-        let indexing_mode = self.start_background_indexing(&backend, &notifying);
+        let event_bus = Arc::new(fluree_db_nameservice::LedgerEventBus::new(1024));
+        let index_config = self.derive_indexing();
+
+        let (ns_mode, indexing_mode) = match nameservice {
+            Some(ns) => (ns, tx::IndexingMode::Disabled),
+            None => {
+                let ns = MemoryNameService::new();
+                let notifying =
+                    fluree_db_nameservice::NotifyingNameService::new(ns, event_bus.clone());
+                let indexing_mode = self.start_background_indexing(&backend, &notifying);
+                (
+                    NameServiceMode::ReadWrite(Arc::new(notifying)),
+                    indexing_mode,
+                )
+            }
+        };
         Ok(Self::finalize_with_backend(
             self.ledger_cache_config,
             self.config,
@@ -2358,10 +2396,14 @@ impl FlureeBuilder {
         ))
     }
 
-    /// Build a type-erased file-backed client.
-    fn build_client_file(self) -> Result<FlureeClient> {
+    /// Build a type-erased file-backed client. When `nameservice`
+    /// is `Some`, it replaces the default `FileNameService` (and
+    /// the notifying wrapper + background indexer that ride along
+    /// with it).
+    fn build_client_file(self, nameservice: Option<NameServiceMode>) -> Result<FlureeClient> {
         #[cfg(not(feature = "native"))]
         {
+            let _ = nameservice;
             Err(ApiError::config(
                 "Filesystem storage requires the 'native' feature",
             ))
@@ -2387,16 +2429,23 @@ impl FlureeBuilder {
 
             // Wrap with address identifier routing if configured
             let storage = self.wrap_address_identifiers(base_storage)?;
-
-            let nameservice = FileNameService::new(path.as_ref());
-            let event_bus = Arc::new(fluree_db_nameservice::LedgerEventBus::new(1024));
-            let notifying =
-                fluree_db_nameservice::NotifyingNameService::new(nameservice, event_bus.clone());
-            let ns_mode = NameServiceMode::ReadWrite(Arc::new(notifying.clone()));
-
-            let index_config = self.derive_indexing();
             let backend = StorageBackend::Managed(storage);
-            let indexing_mode = self.start_background_indexing(&backend, &notifying);
+            let event_bus = Arc::new(fluree_db_nameservice::LedgerEventBus::new(1024));
+            let index_config = self.derive_indexing();
+
+            let (ns_mode, indexing_mode) = match nameservice {
+                Some(ns) => (ns, tx::IndexingMode::Disabled),
+                None => {
+                    let ns = FileNameService::new(path.as_ref());
+                    let notifying =
+                        fluree_db_nameservice::NotifyingNameService::new(ns, event_bus.clone());
+                    let indexing_mode = self.start_background_indexing(&backend, &notifying);
+                    (
+                        NameServiceMode::ReadWrite(Arc::new(notifying)),
+                        indexing_mode,
+                    )
+                }
+            };
             Ok(Self::finalize_with_backend(
                 self.ledger_cache_config,
                 self.config,
@@ -2412,9 +2461,14 @@ impl FlureeBuilder {
         }
     }
 
-    /// Build a type-erased S3-backed client.
+    /// Build a type-erased S3-backed client. When `nameservice` is
+    /// `Some`, it replaces the AWS-managed nameservice (and the
+    /// background indexer that rides along with it).
     #[cfg(feature = "aws")]
-    async fn build_client_s3(self) -> Result<FlureeClient> {
+    async fn build_client_s3(
+        self,
+        nameservice: Option<NameServiceMode>,
+    ) -> Result<FlureeClient> {
         // Delegate to fluree_db_connection for AWS SDK init,
         // storage registry sharing, and nameservice creation.
         let handle = fluree_db_connection::connect_from_config(self.config.clone()).await?;
@@ -2438,16 +2492,20 @@ impl FlureeBuilder {
         let storage = self
             .wrap_address_identifiers_aws(base_storage, aws_handle.config())
             .await?;
-
-        let ns_arc: Arc<dyn NameServicePublisher> = aws_handle.nameservice_arc().clone();
-        let event_bus = Arc::new(fluree_db_nameservice::LedgerEventBus::new(1024));
-        let ns_mode = NameServiceMode::ReadWrite(ns_arc.clone());
-
-        let index_config = self.derive_indexing();
         let backend = StorageBackend::Managed(storage);
-        let ns_rw: Arc<dyn fluree_db_nameservice::ReadWriteNameService> =
-            aws_handle.nameservice_arc().clone();
-        let indexing_mode = self.start_background_indexing_dyn(&backend, ns_rw);
+        let event_bus = Arc::new(fluree_db_nameservice::LedgerEventBus::new(1024));
+        let index_config = self.derive_indexing();
+
+        let (ns_mode, indexing_mode) = match nameservice {
+            Some(ns) => (ns, tx::IndexingMode::Disabled),
+            None => {
+                let ns_arc: Arc<dyn NameServicePublisher> = aws_handle.nameservice_arc().clone();
+                let ns_rw: Arc<dyn fluree_db_nameservice::ReadWriteNameService> =
+                    aws_handle.nameservice_arc().clone();
+                let indexing_mode = self.start_background_indexing_dyn(&backend, ns_rw);
+                (NameServiceMode::ReadWrite(ns_arc), indexing_mode)
+            }
+        };
         Ok(Self::finalize_with_backend(
             self.ledger_cache_config,
             aws_handle.config().clone(),

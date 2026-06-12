@@ -374,13 +374,36 @@ impl FlureeServerBuilder {
 
     /// Build the server.
     ///
-    /// Single construction path — attaches optional Raft state to
-    /// the unwrapped [`AppState`] before the `Arc` wrap, then warms
-    /// JWKS, preloads ledgers, and builds the router.
+    /// Single construction path: pick the `Fluree` constructor
+    /// (default vs raft-replicated nameservice) based on whether
+    /// raft is attached, then build `AppState` around it, then warm
+    /// JWKS, preload ledgers, and build the router.
     pub async fn build(self) -> std::result::Result<FlureeServer, fluree_db_api::ApiError> {
         let telemetry_config = TelemetryConfig::with_server_config(&self.config);
+
+        // Build `Fluree` with the right nameservice for the
+        // deployment mode. Raft mode wires `RaftNameService` so
+        // every node's reads observe replicated state; default mode
+        // uses whatever the storage backend implies.
+        #[cfg(feature = "raft")]
+        let (fluree, cache_stats_handle) =
+            if let Some((integration, _)) = self.raft.as_ref() {
+                let raft_ns = fluree_db_consensus::raft::nameservice::RaftNameService::new(
+                    integration.shared_state.clone(),
+                );
+                let ns_mode =
+                    fluree_db_api::NameServiceMode::ReadOnly(std::sync::Arc::new(raft_ns));
+                state::build_fluree_with_nameservice(&self.config, ns_mode).await?
+            } else {
+                state::build_default_fluree(&self.config).await?
+            };
+        #[cfg(not(feature = "raft"))]
+        let (fluree, cache_stats_handle) = state::build_default_fluree(&self.config).await?;
+
         #[allow(unused_mut)]
-        let mut state_inner = AppState::new(self.config, telemetry_config).await?;
+        let mut state_inner =
+            AppState::with_fluree(self.config, telemetry_config, fluree, cache_stats_handle)
+                .await?;
 
         #[cfg(feature = "raft")]
         let raft_listener = self.raft.map(|(integration, listen_addr)| {
