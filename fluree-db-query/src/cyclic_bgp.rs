@@ -10,7 +10,8 @@ use crate::context::ExecutionContext;
 use crate::error::{QueryError, Result};
 use crate::fast_path_common::{
     allow_cursor_fast_path, build_psot_cursor_for_predicate, cursor_projection_sid_otype_okey,
-    fast_path_store, normalize_pred_sid, parallel_map_pooled, PsotSubjectSeek,
+    fast_path_store, normalize_pred_sid, parallel_map_pooled, subject_probe_lane_plan,
+    ProbeLanePlan, ProbeOps, PsotSubjectSeek, RowFate, SharedOverlayOps,
 };
 use crate::ir::triple::{Ref, TriplePattern};
 use crate::object_binding::late_materialized_object_binding;
@@ -632,6 +633,10 @@ impl CyclicBgpOperator {
         };
         let pred_sid = normalize_pred_sid(store, &edge.predicate)?;
         let Some(p_id) = store.sid_to_p_id(&pred_sid) else {
+            if overlay_may_have_facts(ctx) {
+                self.log_fast_path_bail("novelty-only-predicate", Some(edge));
+                return Ok(None);
+            }
             return Ok(Some(Vec::new()));
         };
         let mut cursor = match build_psot_cursor_for_predicate(
@@ -689,6 +694,10 @@ impl CyclicBgpOperator {
         };
         let pred_sid = normalize_pred_sid(store, &edge.predicate)?;
         let Some(p_id) = store.sid_to_p_id(&pred_sid) else {
+            if overlay_may_have_facts(ctx) {
+                self.log_fast_path_bail("novelty-only-predicate", Some(edge));
+                return Ok(None);
+            }
             return Ok(Some(Vec::new()));
         };
         let mut cursor = match build_psot_cursor_for_predicate(
@@ -737,13 +746,16 @@ impl CyclicBgpOperator {
         Ok(Some(rows))
     }
 
-    /// HEAD-only (callers gate on [`fast_path_store`]): the seek reads the
-    /// BASE PSOT index without overlay merge or `to_t` filtering.
+    /// The seek reads the BASE PSOT index at its latest state; callers gate
+    /// via `compute_probe_overlay_state` (overlay-free HEAD, or `to_t >=
+    /// max_t` with the edge's resolved ops in `overlay_ops`, merged here per
+    /// probed subject).
     fn scan_relation_for_subjects(
         &self,
         ctx: &ExecutionContext<'_>,
         edge: &CyclicEdge,
         subjects: &FxHashSet<u64>,
+        overlay_ops: Option<&SharedOverlayOps>,
     ) -> Result<Option<Vec<(u64, EncObj)>>> {
         let span = tracing::debug_span!(
             "cyclic_scan_relation",
@@ -759,6 +771,10 @@ impl CyclicBgpOperator {
         };
         let pred_sid = normalize_pred_sid(store, &edge.predicate)?;
         let Some(p_id) = store.sid_to_p_id(&pred_sid) else {
+            if overlay_may_have_facts(ctx) {
+                self.log_fast_path_bail("novelty-only-predicate", Some(edge));
+                return Ok(None);
+            }
             return Ok(Some(Vec::new()));
         };
 
@@ -768,14 +784,25 @@ impl CyclicBgpOperator {
         // One amortized monotonic pass over the predicate's PSOT leaves instead
         // of a fresh cursor per subject. None means the PSOT branch is
         // unavailable, never "no rows" — decline rather than dropping rows.
-        let Some(mut seek) = PsotSubjectSeek::new_with_objects(store, ctx.binary_g_id, p_id) else {
+        let Some(mut seek) = PsotSubjectSeek::new_with_identity(store, ctx.binary_g_id, p_id)
+        else {
             self.log_fast_path_bail("cursor-unavailable", Some(edge));
             return Ok(None);
         };
+        let mut probe = overlay_ops.and_then(|ops| ProbeOps::new(ops.clone()));
         let row_cap = max_predicate_rows();
         let mut raw_rows: Vec<RawEdgeRow> = Vec::new();
         for subject in ordered_subjects {
-            seek.rows_for_subject(subject, |o_type, o_key| {
+            let probe_window = probe
+                .as_ref()
+                .map(|p| p.subject_window(subject))
+                .filter(|w| !w.is_empty());
+            seek.rows_for_subject_identity(subject, |o_type, o_key, o_i| {
+                if let (Some(p), Some(win)) = (probe.as_mut(), &probe_window) {
+                    if p.base_row_fate(win, p_id, o_type, o_key, o_i) == RowFate::Drop {
+                        return;
+                    }
+                }
                 raw_rows.push(RawEdgeRow {
                     subject,
                     o_type,
@@ -783,6 +810,17 @@ impl CyclicBgpOperator {
                     p_id,
                 });
             })?;
+            if let Some(p) = probe.as_mut() {
+                p.drain_asserts_for_subject(subject, |op| {
+                    raw_rows.push(RawEdgeRow {
+                        subject,
+                        o_type: op.o_type,
+                        object: op.o_key,
+                        p_id,
+                    });
+                    Ok(())
+                })?;
+            }
             if raw_rows.len() as u64 > row_cap {
                 self.log_fast_path_bail("predicate-row-cap-exceeded", Some(edge));
                 return Ok(None);
@@ -919,13 +957,16 @@ impl CyclicBgpOperator {
         Some(frontier)
     }
 
-    /// HEAD-only (callers gate on [`fast_path_store`]): the seek reads the
-    /// BASE PSOT index without overlay merge or `to_t` filtering.
+    /// The seek reads the BASE PSOT index at its latest state; callers gate
+    /// via `compute_probe_overlay_state` (overlay-free HEAD, or `to_t >=
+    /// max_t` with the edge's resolved ops in `overlay_ops`, merged here per
+    /// probed subject).
     fn scan_ref_relation_for_subjects(
         &self,
         ctx: &ExecutionContext<'_>,
         edge: &CyclicEdge,
         subjects: &FxHashSet<u64>,
+        overlay_ops: Option<&SharedOverlayOps>,
     ) -> Result<Option<Vec<(u64, u64)>>> {
         let span = tracing::debug_span!(
             "cyclic_scan_relation",
@@ -941,6 +982,10 @@ impl CyclicBgpOperator {
         };
         let pred_sid = normalize_pred_sid(store, &edge.predicate)?;
         let Some(p_id) = store.sid_to_p_id(&pred_sid) else {
+            if overlay_may_have_facts(ctx) {
+                self.log_fast_path_bail("novelty-only-predicate", Some(edge));
+                return Ok(None);
+            }
             return Ok(Some(Vec::new()));
         };
 
@@ -950,21 +995,44 @@ impl CyclicBgpOperator {
         // One amortized monotonic pass over the predicate's PSOT leaves instead
         // of a fresh cursor per subject. None means the PSOT branch is
         // unavailable, never "no rows" — decline rather than dropping rows.
-        let Some(mut seek) = PsotSubjectSeek::new_with_objects(store, ctx.binary_g_id, p_id) else {
+        let Some(mut seek) = PsotSubjectSeek::new_with_identity(store, ctx.binary_g_id, p_id)
+        else {
             self.log_fast_path_bail("cursor-unavailable", Some(edge));
             return Ok(None);
         };
+        let mut probe = overlay_ops.and_then(|ops| ProbeOps::new(ops.clone()));
         let row_cap = max_predicate_rows();
         let mut rows: Vec<(u64, u64)> = Vec::new();
         let mut non_ref_object = false;
         for subject in ordered_subjects {
-            seek.rows_for_subject(subject, |o_type, o_key| {
+            let probe_window = probe
+                .as_ref()
+                .map(|p| p.subject_window(subject))
+                .filter(|w| !w.is_empty());
+            seek.rows_for_subject_identity(subject, |o_type, o_key, o_i| {
+                if let (Some(p), Some(win)) = (probe.as_mut(), &probe_window) {
+                    if p.base_row_fate(win, p_id, o_type, o_key, o_i) == RowFate::Drop {
+                        return;
+                    }
+                }
                 if o_type != OType::IRI_REF.as_u16() {
                     non_ref_object = true;
                 } else {
                     rows.push((subject, o_key));
                 }
             })?;
+            if let Some(p) = probe.as_mut() {
+                // Injected asserts respect the mode split exactly like base
+                // rows: a non-ref novelty object disqualifies ref mode.
+                p.drain_asserts_for_subject(subject, |op| {
+                    if op.o_type != OType::IRI_REF.as_u16() {
+                        non_ref_object = true;
+                    } else {
+                        rows.push((subject, op.o_key));
+                    }
+                    Ok(())
+                })?;
+            }
             if non_ref_object {
                 self.log_fast_path_bail("non-ref-object-in-ref-mode", Some(edge));
                 return Ok(None);
@@ -990,6 +1058,48 @@ impl CyclicBgpOperator {
         }
     }
 
+    /// Per-edge probe eligibility under the active overlay.
+    ///
+    /// Overlay-free HEAD keeps plain probes everywhere (`ops = None` for
+    /// every edge). With novelty present, probing stays allowed when every
+    /// edge's resolved ops are mergeable (empty → `None`, non-empty →
+    /// `Some(ops)` merged per probed subject); any unmergeable edge
+    /// (translation failure, novelty-only predicate, eager materialization)
+    /// disables probes for the cascade — full scans, which merge through the
+    /// overlay cursor, are unaffected. Historical snapshots keep probes off:
+    /// the seek reads latest base state with no replay.
+    fn compute_probe_overlay_state(
+        &self,
+        ctx: &ExecutionContext<'_>,
+    ) -> Result<(bool, Vec<Option<SharedOverlayOps>>)> {
+        let n = self.plan.edges.len();
+        if fast_path_store(ctx).is_some() {
+            return Ok((true, vec![None; n]));
+        }
+        let Some(store) = ctx.binary_store.as_ref() else {
+            return Ok((false, vec![None; n]));
+        };
+        if ctx.to_t < store.max_t() {
+            return Ok((false, vec![None; n]));
+        }
+        let mut ops_per_edge = Vec::with_capacity(n);
+        for edge in self.plan.edges.iter() {
+            let pred_sid = normalize_pred_sid(store, &edge.predicate)?;
+            match subject_probe_lane_plan(ctx, store, &pred_sid)? {
+                ProbeLanePlan::Clean => ops_per_edge.push(None),
+                ProbeLanePlan::Merge(ops) => ops_per_edge.push(Some(ops)),
+                ProbeLanePlan::Decline => {
+                    tracing::debug!(
+                        predicate = ?edge.predicate,
+                        "cyclic cascade: bounded probes disabled (overlay unmergeable)"
+                    );
+                    return Ok((false, vec![None; n]));
+                }
+            }
+        }
+        Ok((true, ops_per_edge))
+    }
+
     /// Pick the bounded-probe candidate with the smallest frontier among the
     /// remaining edges, logging every gate decision at debug level.
     /// `size_bound` / `materialize_frontier` abstract over the ref / encoded
@@ -997,6 +1107,7 @@ impl CyclicBgpOperator {
     fn select_bounded_probe(
         &self,
         remaining: &[usize],
+        edge_probe_ops: &[Option<SharedOverlayOps>],
         size_bound: impl Fn(VarId) -> Option<usize>,
         materialize_frontier: impl Fn(VarId) -> Option<FxHashSet<u64>>,
     ) -> Option<(usize, FxHashSet<u64>)> {
@@ -1032,6 +1143,13 @@ impl CyclicBgpOperator {
             let Some(frontier) = materialize_frontier(edge.subject) else {
                 continue;
             };
+            // Stats exclude novelty; count the edge's overlay ops into the
+            // scan-cost side so novelty-heavy edges don't look cheaper to
+            // scan than they are.
+            let estimate = estimate
+                + edge_probe_ops[edge_idx]
+                    .as_ref()
+                    .map_or(0, |ops| ops.len() as u64);
             if !should_probe_edge(frontier.len(), Some(estimate)) {
                 tracing::debug!(
                     predicate = ?edge.predicate,
@@ -1186,10 +1304,11 @@ impl CyclicBgpOperator {
     /// of the cheapest remaining edge. Probed relations are subject-restricted
     /// semi-joins; `prune_relations` re-establishes global consistency after.
     fn open_ref_fast_path(&mut self, ctx: &ExecutionContext<'_>) -> Result<bool> {
-        // Per-subject probes bypass the overlay, so they're only sound at HEAD.
-        let probing_allowed = fast_path_store(ctx).is_some();
+        let (probing_allowed, edge_probe_ops) = self.compute_probe_overlay_state(ctx)?;
         if !probing_allowed {
-            tracing::debug!("cyclic cascade: bounded probes disabled (off-HEAD or overlay active)");
+            tracing::debug!(
+                "cyclic cascade: bounded probes disabled (off-HEAD or overlay unmergeable)"
+            );
         }
         if self.parallel_scan_eligible(probing_allowed) {
             return self.open_ref_fast_path_parallel(ctx);
@@ -1204,6 +1323,7 @@ impl CyclicBgpOperator {
             let probe = if probing_allowed && !relations.is_empty() {
                 self.select_bounded_probe(
                     &remaining,
+                    &edge_probe_ops,
                     |var| Self::ref_frontier_size_bound(&relations, var),
                     |var| Self::ref_frontier_for_var(&relations, var),
                 )
@@ -1222,7 +1342,12 @@ impl CyclicBgpOperator {
                     let rows = if frontier.is_empty() {
                         Vec::new()
                     } else {
-                        match self.scan_ref_relation_for_subjects(ctx, edge, &frontier)? {
+                        match self.scan_ref_relation_for_subjects(
+                            ctx,
+                            edge,
+                            &frontier,
+                            edge_probe_ops[remaining[pos]].as_ref(),
+                        )? {
                             Some(rows) => rows,
                             None => return Ok(false),
                         }
@@ -1281,9 +1406,11 @@ impl CyclicBgpOperator {
     }
 
     fn open_encoded_fast_path(&mut self, ctx: &ExecutionContext<'_>) -> Result<bool> {
-        let probing_allowed = fast_path_store(ctx).is_some();
+        let (probing_allowed, edge_probe_ops) = self.compute_probe_overlay_state(ctx)?;
         if !probing_allowed {
-            tracing::debug!("cyclic cascade: bounded probes disabled (off-HEAD or overlay active)");
+            tracing::debug!(
+                "cyclic cascade: bounded probes disabled (off-HEAD or overlay unmergeable)"
+            );
         }
         if self.parallel_scan_eligible(probing_allowed) {
             return self.open_encoded_fast_path_parallel(ctx);
@@ -1298,6 +1425,7 @@ impl CyclicBgpOperator {
             let probe = if probing_allowed && !relations.is_empty() {
                 self.select_bounded_probe(
                     &remaining,
+                    &edge_probe_ops,
                     |var| Self::frontier_size_bound(&relations, var),
                     |var| self.frontier_for_var(&relations, var),
                 )
@@ -1316,7 +1444,12 @@ impl CyclicBgpOperator {
                     let rows = if frontier.is_empty() {
                         Vec::new()
                     } else {
-                        match self.scan_relation_for_subjects(ctx, edge, &frontier)? {
+                        match self.scan_relation_for_subjects(
+                            ctx,
+                            edge,
+                            &frontier,
+                            edge_probe_ops[remaining[pos]].as_ref(),
+                        )? {
                             Some(rows) => rows,
                             None => return Ok(false),
                         }
@@ -2257,6 +2390,17 @@ fn advance_probe_cursor(cursor: &mut EncodedProbeWedgeCursor) {
         cursor.a_pos += 1;
         cursor.b_pos = 0;
     }
+}
+
+/// True when the active overlay may hold facts the base index lacks.
+///
+/// A predicate absent from the base dictionary can still have rows in
+/// novelty; treating it as an empty relation would zero the whole BGP, so
+/// the relation loaders must decline to the overlay-merging fallback
+/// instead. Checks the same provider the fast path's cursors merge.
+fn overlay_may_have_facts(ctx: &ExecutionContext<'_>) -> bool {
+    let overlay = ctx.overlay();
+    overlay.epoch() != 0 && !overlay.is_effectively_empty()
 }
 
 fn predicate_display(predicate: &Ref) -> String {

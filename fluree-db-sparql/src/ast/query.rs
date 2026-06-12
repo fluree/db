@@ -55,6 +55,12 @@ pub struct Pragmas {
     /// (`none`, `rdfs`, `owl2ql`, `owl2rl`, `datalog`, `owl-datalog`).
     /// Values are collected verbatim; mode names validate during lowering.
     pub reasoning: Option<Vec<String>>,
+    /// `# PRAGMA reasoning-max-facts: <n>` — OWL2-RL materialization budget
+    /// (max derived facts). Collected verbatim; validates during lowering.
+    pub reasoning_max_facts: Option<String>,
+    /// `# PRAGMA reasoning-max-seconds: <n>` — OWL2-RL materialization budget
+    /// (max wall-clock seconds). Collected verbatim; validates during lowering.
+    pub reasoning_max_seconds: Option<String>,
 }
 
 /// The body of a SPARQL query (SELECT, CONSTRUCT, ASK, DESCRIBE, or UPDATE).

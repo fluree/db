@@ -124,18 +124,28 @@ pub struct TrackedQueryResponse {
     pub fuel: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub policy: Option<std::collections::HashMap<String, PolicyStats>>,
+    /// OWL2-RL materialization outcome (present when a reasoning mode ran).
+    /// `reasoning.capped == true` means the result set may be incomplete.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<fluree_db_core::ReasoningTally>,
 }
 
 impl TrackedQueryResponse {
     /// Create a successful response with optional tracking tally
     pub fn success(result: JsonValue, tally: Option<TrackingTally>) -> Self {
         match tally {
-            Some(TrackingTally { time, fuel, policy }) => Self {
+            Some(TrackingTally {
+                time,
+                fuel,
+                policy,
+                reasoning,
+            }) => Self {
                 status: 200,
                 result,
                 time,
                 fuel,
                 policy,
+                reasoning,
             },
             None => Self {
                 status: 200,
@@ -143,6 +153,7 @@ impl TrackedQueryResponse {
                 time: None,
                 fuel: None,
                 policy: None,
+                reasoning: None,
             },
         }
     }
@@ -166,7 +177,9 @@ impl TrackedErrorResponse {
     /// Create an error response with optional tracking tally
     pub fn new(status: u16, error: impl Into<String>, tally: Option<TrackingTally>) -> Self {
         match tally {
-            Some(TrackingTally { time, fuel, policy }) => Self {
+            Some(TrackingTally {
+                time, fuel, policy, ..
+            }) => Self {
                 status,
                 error: error.into(),
                 time,

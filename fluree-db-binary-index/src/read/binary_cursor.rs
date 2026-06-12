@@ -30,6 +30,14 @@ use crate::format::column_block::ColumnId;
 // BinaryCursor
 // ============================================================================
 
+/// Shared empty overlay-ops slice: cursors are built far more often than they
+/// carry overlay ops, so the no-overlay default is a refcount bump, not an
+/// allocation.
+fn empty_overlay_ops() -> Arc<[OverlayOp]> {
+    static EMPTY: std::sync::OnceLock<Arc<[OverlayOp]>> = std::sync::OnceLock::new();
+    Arc::clone(EMPTY.get_or_init(|| Arc::from(Vec::new())))
+}
+
 /// V3 columnar cursor: iterates leaflets across leaves in a branch manifest.
 ///
 /// Yields one `ColumnBatch` per leaflet per `next_batch()` call.
@@ -47,8 +55,9 @@ pub struct BinaryCursor {
     /// Index of the next leaflet within the current leaf.
     current_leaflet_idx: usize,
     exhausted: bool,
-    /// Overlay ops sorted by this cursor's sort order. May be shared across
-    /// cursors; this cursor consumes only `[overlay_pos, overlay_end)`.
+    /// Overlay ops sorted by this cursor's sort order. Shared (`Arc`) so
+    /// per-query caches can hand the same translated ops to many cursors
+    /// without copying; this cursor consumes only `[overlay_pos, overlay_end)`.
     overlay_ops: Arc<[OverlayOp]>,
     /// Start position in overlay_ops for the current leaf (set per-leaf via slicing).
     overlay_pos: usize,
@@ -58,8 +67,6 @@ pub struct BinaryCursor {
     /// Exclusive end position in overlay_ops for the current leaf.
     /// Ops beyond this belong to a later leaf and must not be consumed.
     leaf_overlay_end: usize,
-    /// Overlay epoch for cache key differentiation.
-    epoch: u64,
     /// Time bound for overlay ops (only emit ops with t <= to_t).
     to_t: i64,
     /// Optional fuel tracker. When set, charges one index touch per leaflet returned.
@@ -102,11 +109,10 @@ impl BinaryCursor {
             // Don't mark exhausted when leaf_range is empty — overlay-only path
             // may still have ops to emit.
             exhausted: false,
-            overlay_ops: Arc::from([]),
+            overlay_ops: empty_overlay_ops(),
             overlay_pos: 0,
             overlay_end: 0,
             leaf_overlay_end: 0,
-            epoch: 0,
             to_t: i64::MAX,
             tracker: None,
             range_min: Some(*min_key),
@@ -134,11 +140,10 @@ impl BinaryCursor {
             current_leaf: None,
             current_leaflet_idx: 0,
             exhausted: false,
-            overlay_ops: Arc::from([]),
+            overlay_ops: empty_overlay_ops(),
             overlay_pos: 0,
             overlay_end: 0,
             leaf_overlay_end: 0,
-            epoch: 0,
             to_t: i64::MAX,
             tracker: None,
             range_min: None,
@@ -161,18 +166,21 @@ impl BinaryCursor {
     /// **Contract:** ops must be pre-sorted by this cursor's sort order AND
     /// assert/retract lifecycles must be resolved (at most one op per fact key).
     /// Use [`sort_overlay_ops`] then [`resolve_overlay_ops`] before calling.
-    pub fn set_overlay_ops(&mut self, ops: Vec<OverlayOp>) {
-        self.set_overlay_ops_shared(ops.into());
+    ///
+    /// Takes `Arc<[OverlayOp]>` so callers holding cached translated ops share
+    /// them across cursors without copying; `Vec<OverlayOp>` converts via
+    /// `.into()`.
+    pub fn set_overlay_ops(&mut self, ops: Arc<[OverlayOp]>) {
+        let len = ops.len();
+        self.set_overlay_ops_window(ops, 0, len);
     }
 
     /// Set overlay ops from a shared, pre-translated slice.
     ///
-    /// Same contract as [`Self::set_overlay_ops`]. Use this when the same
-    /// translated overlay is attached to many cursors (e.g. per-row join
-    /// probes) to avoid cloning the ops per cursor.
+    /// Alias of [`Self::set_overlay_ops`], kept for callers predating the
+    /// signature unification.
     pub fn set_overlay_ops_shared(&mut self, ops: Arc<[OverlayOp]>) {
-        let len = ops.len();
-        self.set_overlay_ops_window(ops, 0, len);
+        self.set_overlay_ops(ops);
     }
 
     /// Set overlay ops from a shared slice, consuming only `[start, end)`.
@@ -213,11 +221,6 @@ impl BinaryCursor {
         self.overlay_pos = start;
         self.overlay_end = end;
         self.leaf_overlay_end = end; // default: all window ops visible (refined per-leaf)
-    }
-
-    /// Set the overlay epoch for cache key differentiation.
-    pub fn set_epoch(&mut self, epoch: u64) {
-        self.epoch = epoch;
     }
 
     /// Set the time bound for overlay ops.

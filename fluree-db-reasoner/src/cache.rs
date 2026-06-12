@@ -136,23 +136,6 @@ pub struct ReasoningDiagnostics {
 }
 
 impl ReasoningDiagnostics {
-    /// Create diagnostics for a capped result
-    pub fn capped(
-        reason: impl Into<String>,
-        iterations: usize,
-        facts: usize,
-        duration: Duration,
-    ) -> Self {
-        Self {
-            iterations,
-            facts_derived: facts,
-            capped: true,
-            capped_reason: Some(reason.into()),
-            duration,
-            rules_fired: hashbrown::HashMap::new(),
-        }
-    }
-
     /// Create diagnostics for a completed (uncapped) result
     pub fn completed(iterations: usize, facts: usize, duration: Duration) -> Self {
         Self {
@@ -163,6 +146,30 @@ impl ReasoningDiagnostics {
             duration,
             rules_fired: hashbrown::HashMap::new(),
         }
+    }
+
+    /// Finalize as capped, preserving accumulated rule-fire counts.
+    pub fn mark_capped(
+        &mut self,
+        reason: impl Into<String>,
+        iterations: usize,
+        facts: usize,
+        duration: Duration,
+    ) {
+        self.iterations = iterations;
+        self.facts_derived = facts;
+        self.capped = true;
+        self.capped_reason = Some(reason.into());
+        self.duration = duration;
+    }
+
+    /// Finalize as completed, preserving accumulated rule-fire counts.
+    pub fn mark_completed(&mut self, iterations: usize, facts: usize, duration: Duration) {
+        self.iterations = iterations;
+        self.facts_derived = facts;
+        self.capped = false;
+        self.capped_reason = None;
+        self.duration = duration;
     }
 
     /// Record that a rule fired

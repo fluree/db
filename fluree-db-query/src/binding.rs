@@ -463,7 +463,13 @@ impl Binding {
     pub fn is_matchable(&self) -> bool {
         matches!(
             self,
-            Binding::Sid { .. } | Binding::IriMatch { .. } | Binding::Iri(_) | Binding::Lit { .. }
+            Binding::Sid { .. }
+                | Binding::IriMatch { .. }
+                | Binding::Iri(_)
+                | Binding::Lit { .. }
+                | Binding::EncodedSid { .. }
+                | Binding::EncodedPid { .. }
+                | Binding::EncodedLit { .. }
         )
     }
 

@@ -28,6 +28,9 @@ use crate::binding::{Batch, Binding};
 use crate::context::ExecutionContext;
 use crate::error::{QueryError, Result};
 use crate::fast_path_common::try_normalize_pred_sid;
+use crate::fast_path_common::{
+    star_probe_lane_plan, subject_probe_lane_plan, ProbeLanePlan, ProbeOps,
+};
 use crate::ir::triple::{Ref, Term, TriplePattern};
 use crate::join::{
     batched_subject_probe_binary, batched_subject_star_spot, make_dict_overlay,
@@ -313,7 +316,6 @@ impl PropertyJoinOperator {
         driver_subject_ids.is_some()
             && !ctx.is_multi_ledger()
             && ctx.binary_store.is_some()
-            && ctx.overlay_free_single_graph()
             && !remaining_predicates.is_empty()
             && remaining_predicates
                 .iter()
@@ -525,10 +527,45 @@ impl PropertyJoinOperator {
 
     fn subject_key(ctx: &ExecutionContext<'_>, subject: &Binding) -> Result<Option<SubjectKey>> {
         if ctx.is_multi_ledger() {
-            Self::subject_key_multi(ctx, subject)
-        } else {
-            Ok(Self::subject_key_single(subject))
+            return Self::subject_key_multi(ctx, subject);
         }
+        // Normalize `Sid` keys to `SubjectKey::Id` whenever the subject
+        // resolves (persisted reverse dict first, then DictNovelty). Scan
+        // fallbacks emit `Binding::Sid` rows while the batched probes ingest
+        // by encoded id — without normalization the same subject would occupy
+        // two map entries, and the driver-id capture (which requires an
+        // all-`Id` key set) could never engage the batched walks under an
+        // overlay.
+        //
+        // NOT under eager materialization: eager `Sid` bindings (reasoning
+        // views with derived-fact overlays, federation) can carry namespace
+        // codes from a different snapshot space, so resolving them against
+        // this store's dictionary would key the wrong subject. NOT under a
+        // restrictive policy either: an all-`Id` key set enables the batched
+        // walks, which read raw leaflets and would bypass the per-leaf policy
+        // filtering the scans applied to produce these rows.
+        let normalizable =
+            !ctx.eager_materialization && crate::fast_path_common::root_or_no_policy(ctx);
+        Ok(Self::subject_key_single(subject).map(|key| match key {
+            SubjectKey::Sid(sid) if normalizable => {
+                let resolved = ctx.binary_store.as_deref().and_then(|store| {
+                    store
+                        .find_subject_id_by_parts(sid.namespace_code, &sid.name)
+                        .ok()
+                        .flatten()
+                        .or_else(|| {
+                            ctx.dict_novelty
+                                .as_ref()
+                                .filter(|dn| dn.is_initialized())
+                                .and_then(|dn| {
+                                    dn.subjects.find_subject(sid.namespace_code, &sid.name)
+                                })
+                        })
+                });
+                resolved.map_or(SubjectKey::Sid(sid), SubjectKey::Id)
+            }
+            other => other,
+        }))
     }
 
     /// Generate cartesian product rows for a given subject
@@ -790,7 +827,6 @@ impl Operator for PropertyJoinOperator {
                     && driver_subject_ids.is_some()
                     && !ctx.is_multi_ledger()
                     && ctx.binary_store.is_some()
-                    && ctx.overlay_free_single_graph()
                     && predicate.dtc.is_none();
 
                 if can_batched_probe {
@@ -799,7 +835,17 @@ impl Operator for PropertyJoinOperator {
 
                     if let Some(pred_sid) = pred_sid {
                         let subject_ids = driver_subject_ids.as_ref().unwrap();
-                        if !subject_ids.is_empty() {
+                        // Unmergeable overlays fall through to the
+                        // per-predicate scan below (overlay-correct cursor).
+                        let lane_plan = subject_probe_lane_plan(ctx, store, &pred_sid)?;
+                        if !subject_ids.is_empty() && !matches!(lane_plan, ProbeLanePlan::Decline) {
+                            // One reconciler per predicate, shared across its
+                            // chunks: chunked subject sets are disjoint, so
+                            // consumed-state never collides.
+                            let mut probe_ops = match &lane_plan {
+                                ProbeLanePlan::Merge(ops) => ProbeOps::new(ops.clone()),
+                                _ => None,
+                            };
                             let dict_overlay = make_dict_overlay(ctx, store);
                             // IMPORTANT: Batched join uses the min/max s_id range of the left batch
                             // to decide which leaf files/leaflets to scan. If the subject IDs are
@@ -849,6 +895,7 @@ impl Operator for PropertyJoinOperator {
                                         emit_object: emit_obj,
                                         dict_overlay: dict_overlay.as_ref(),
                                     },
+                                    probe_ops.as_mut(),
                                 )?;
                                 scan_rows_total += probe_matches.len() as u64;
                                 for probe_match in probe_matches {
@@ -972,11 +1019,17 @@ impl Operator for PropertyJoinOperator {
 
                 scan.close();
 
-                // After the first scan, capture subject IDs for batched probing when the
-                // subject keys stayed as encoded IDs. This lets a selective exact scan like
-                // `?s rdf:type :Deal` drive later subject-bound probes.
-                driver_subject_ids =
-                    self.capture_driver_subject_ids(ctx, order_pos, &all_subject_values);
+                // After the driver scan, capture subject IDs for batched probing
+                // when the subject keys stayed as encoded IDs. This lets a
+                // selective exact scan like `?s rdf:type :Deal` drive later
+                // subject-bound probes. Only the driver position captures —
+                // re-capturing on later iterations would erase the ids (the
+                // helper returns None off the driver), cutting every
+                // predicate after the first remaining one off from probing.
+                if order_pos == 0 {
+                    driver_subject_ids =
+                        self.capture_driver_subject_ids(ctx, order_pos, &all_subject_values);
+                }
 
                 if order_pos == 0 {
                     let remaining_predicates = &scan_order[1..];
@@ -999,9 +1052,20 @@ impl Operator for PropertyJoinOperator {
                             })
                             .collect();
 
-                        if spot_predicates.len() == remaining_predicates.len()
+                        let star_plan = if spot_predicates.len() == remaining_predicates.len()
                             && !spot_predicates.is_empty()
                         {
+                            let pred_refs: Vec<&fluree_db_core::Sid> =
+                                spot_predicates.iter().map(|p| &p.pred_sid).collect();
+                            star_probe_lane_plan(ctx, store, &pred_refs)?
+                        } else {
+                            ProbeLanePlan::Decline
+                        };
+                        if !matches!(star_plan, ProbeLanePlan::Decline) {
+                            let mut probe_ops = match &star_plan {
+                                ProbeLanePlan::Merge(ops) => ProbeOps::new(ops.clone()),
+                                _ => None,
+                            };
                             used_spot_star_walk = true;
                             let spot_matches = batched_subject_star_spot(
                                 ctx,
@@ -1009,6 +1073,7 @@ impl Operator for PropertyJoinOperator {
                                 driver_subject_ids.as_ref().unwrap(),
                                 &spot_predicates,
                                 dict_overlay.as_ref(),
+                                probe_ops.as_mut(),
                             )?;
                             scan_rows_total += spot_matches.len() as u64;
                             for spot_match in spot_matches {

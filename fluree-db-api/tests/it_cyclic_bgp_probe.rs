@@ -19,7 +19,7 @@ use fluree_db_api::{FlureeBuilder, IndexConfig, LedgerManagerConfig, QueryInput}
 use fluree_db_transact::{CommitOpts, TxnOpts};
 use serde_json::json;
 use support::{
-    genesis_ledger_for_fluree, normalize_rows, start_background_indexer_local,
+    genesis_ledger_for_fluree, normalize_rows, span_capture, start_background_indexer_local,
     trigger_index_and_wait_outcome,
 };
 
@@ -147,6 +147,85 @@ async fn cyclic_bgp_bounded_probe_matches_fallback() {
                 std::env::set_var("FLUREE_CYCLIC_BGP_MAX_BOUNDED_SUBJECTS", "0");
                 let scanned = run_query(&fluree, &view, query).await;
                 assert_eq!(scanned, expected, "{name}: full-scan cascade != fallback");
+            }
+
+            // Phase 2: novelty tail — retract triangle 2's closing edge and
+            // assert a triangle that exists only in novelty. Probes must merge
+            // the per-edge ops (suppressing the retracted closure, injecting
+            // the novelty-only edges) and still match the fallback.
+            let receipt = fluree
+                .update(
+                    ledger,
+                    &json!({
+                        "@context": {"ex": "http://example.org/ns/"},
+                        "where":  {"@id": "ex:n6", "ex:p3": "?o"},
+                        "delete": {"@id": "ex:n6", "ex:p3": "?o"}
+                    }),
+                )
+                .await
+                .expect("retract n6 closing edge");
+            let _receipt = fluree
+                .insert(
+                    receipt.ledger,
+                    &json!({
+                        "@context": {"ex": "http://example.org/ns/"},
+                        "@graph": [
+                            {"@id": "ex:n7", "ex:p1": {"@id": "ex:n8"}},
+                            {"@id": "ex:n8", "ex:p2": {"@id": "ex:n9"}},
+                            {"@id": "ex:n9", "ex:p3": {"@id": "ex:n7"}}
+                        ]
+                    }),
+                )
+                .await
+                .expect("novelty triangle");
+            let novelty_t = _receipt.ledger.t();
+            // `db()` can serve a cached pre-commit view in this manager
+            // configuration; pin the post-novelty `t` explicitly.
+            let view = fluree
+                .db_at_t(ledger_id, novelty_t)
+                .await
+                .expect("novelty view");
+
+            for (name, query) in queries {
+                clear_cyclic_env();
+                std::env::set_var("FLUREE_CYCLIC_BGP", "0");
+                let expected = run_query(&fluree, &view, query).await;
+
+                clear_cyclic_env();
+                std::env::set_var("FLUREE_CYCLIC_BGP_PROBE_SCAN_RATIO", "1");
+                let (spans, guard) = span_capture::init_test_tracing();
+                let probed = run_query(&fluree, &view, query).await;
+                drop(guard);
+                assert_eq!(
+                    probed, expected,
+                    "{name}: probed cascade under novelty != fallback"
+                );
+                if name == "directed-triangle" {
+                    assert!(
+                        spans.has_event("cyclic cascade: probing edge per-subject"),
+                        "{name}: bounded probes should engage under novelty"
+                    );
+                    assert!(
+                        expected
+                            .iter()
+                            .any(|row| format!("{row:?}").contains("ex:n7")),
+                        "{name}: novelty-only triangle should appear; rows: {expected:?}"
+                    );
+                    assert!(
+                        !expected
+                            .iter()
+                            .any(|row| format!("{row:?}").contains("ex:n4")),
+                        "{name}: retracted closure should disappear; rows: {expected:?}"
+                    );
+                }
+
+                clear_cyclic_env();
+                std::env::set_var("FLUREE_CYCLIC_BGP_MAX_BOUNDED_SUBJECTS", "0");
+                let scanned = run_query(&fluree, &view, query).await;
+                assert_eq!(
+                    scanned, expected,
+                    "{name}: full-scan cascade under novelty != fallback"
+                );
             }
             clear_cyclic_env();
         })

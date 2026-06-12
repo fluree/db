@@ -195,6 +195,11 @@ struct TrackerInner {
     // Policy tracking
     policy_stats: RwLock<HashMap<String, PolicyStats>>,
 
+    // Reasoning materialization outcome (recorded by query prepare when a
+    // reasoning mode ran). Not gated by an option: a capped materialization
+    // is a correctness signal, so any enabled tracker reports it.
+    reasoning: RwLock<Option<ReasoningTally>>,
+
     options: TrackingOptions,
 }
 
@@ -216,6 +221,7 @@ impl Tracker {
             fuel_total: AtomicU64::new(0),
             fuel_limit: options.max_fuel.unwrap_or(0),
             policy_stats: RwLock::new(HashMap::new()),
+            reasoning: RwLock::new(None),
             options,
         })))
     }
@@ -300,6 +306,19 @@ impl Tracker {
         }
     }
 
+    /// Record the outcome of an OWL2-RL materialization for this request.
+    ///
+    /// Last write wins (a request runs at most one materialization per
+    /// prepared query; dataset queries record the primary graph's run).
+    pub fn record_reasoning(&self, tally: ReasoningTally) {
+        let Some(inner) = &self.0 else {
+            return;
+        };
+        if let Ok(mut slot) = inner.reasoning.write() {
+            *slot = Some(tally);
+        }
+    }
+
     /// Finalize tracking into a serializable tally.
     pub fn tally(&self) -> Option<TrackingTally> {
         let inner = self.0.as_ref()?;
@@ -315,6 +334,7 @@ impl Tracker {
             } else {
                 None
             },
+            reasoning: inner.reasoning.read().ok().and_then(|r| r.clone()),
         })
     }
 }
@@ -331,6 +351,31 @@ pub struct TrackingTally {
     /// Policy stats: `{policy-id -> {executed, allowed}}`
     #[serde(skip_serializing_if = "Option::is_none")]
     pub policy: Option<HashMap<String, PolicyStats>>,
+    /// Reasoning materialization outcome, when a reasoning mode ran.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<ReasoningTally>,
+}
+
+/// Outcome of an OWL2-RL materialization, reported per request.
+///
+/// `capped: true` means the closure hit its budget before reaching fixpoint —
+/// query results may be missing entailments. Clients should treat capped
+/// results as incomplete, not merely slow.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReasoningTally {
+    /// Whether materialization was capped before reaching fixpoint.
+    pub capped: bool,
+    /// Why materialization was capped (e.g. budget kind), if it was.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capped_reason: Option<String>,
+    /// Number of facts derived.
+    pub derived_facts: u64,
+    /// Fixpoint iterations performed.
+    pub iterations: u64,
+    /// Wall-clock materialization time in milliseconds. For a cached
+    /// materialization this reports the original computation, not this
+    /// request's (near-zero) cache hit.
+    pub duration_ms: u64,
 }
 
 fn format_time_ms(duration: Duration) -> String {

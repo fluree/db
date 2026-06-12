@@ -508,11 +508,25 @@ impl Fluree {
                 let query_has_reasoning = executable.reasoning.modes.has_any_enabled();
                 let query_disabled = executable.reasoning.modes.is_disabled();
 
+                // Mode replacement keeps the query's budget — see
+                // `build_executable_for_view` for the rationale.
                 if let Some(effective) =
                     primary.effective_reasoning(query_has_reasoning, query_disabled)
                 {
+                    let (max_facts, max_seconds) = (
+                        executable.reasoning.modes.max_facts,
+                        executable.reasoning.modes.max_seconds,
+                    );
                     executable.reasoning.modes = effective.clone();
+                    executable.reasoning.modes.max_facts = max_facts;
+                    executable.reasoning.modes.max_seconds = max_seconds;
                 }
+            }
+
+            // Ledger-config materialization budget — after mode precedence,
+            // same rationale as `build_executable_for_view`.
+            if let Some(budget) = primary.config_reasoning_budget() {
+                budget.apply(&mut executable.reasoning.modes);
             }
 
             // Resolve schema bundle against the primary view's ledger

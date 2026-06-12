@@ -853,7 +853,13 @@ impl Fluree {
             None => return view,
         };
 
-        match config_resolver::merge_reasoning(resolved, server_identity) {
+        // The materialization budget applies independently of mode defaults:
+        // a ledger can cap (or extend) the OWL2-RL budget without forcing
+        // reasoning on, and the cap must hold even when the query brings its
+        // own modes.
+        let budget = config_resolver::config_reasoning_budget(resolved, server_identity);
+
+        let view = match config_resolver::merge_reasoning(resolved, server_identity) {
             Some((mode_strings, precedence)) => {
                 let modes = ReasoningModes::from_mode_strings(&mode_strings);
                 // Always wrap if modes has enabled flags or explicit_none=true
@@ -865,6 +871,11 @@ impl Fluree {
                     view
                 }
             }
+            None => view,
+        };
+
+        match budget {
+            Some(budget) => view.with_config_reasoning_budget(budget),
             None => view,
         }
     }

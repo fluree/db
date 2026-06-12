@@ -30,6 +30,7 @@ use crate::fast_predicate_scalar_agg::{
     predicate_scalar_agg_operator, DateComponentFn, NumericUnaryFn, ScalarAggKind, SumExprI64,
 };
 use crate::fast_star_const_order_topk::star_const_ordered_limit_operator;
+use crate::fast_string_fold::{predicate_string_fold_operator, StringFoldAgg};
 use crate::fast_string_prefix_count_all::{
     string_prefix_count_all_operator, string_prefix_sum_strstarts_operator,
 };
@@ -1464,6 +1465,136 @@ fn detect_string_prefix_sum_strstarts(query: &Query) -> Option<(Ref, Arc<str>, V
     Some((pred, Arc::from(prefix.as_str()), agg.output_var))
 }
 
+/// `COUNT(*)` / `COUNT(?s)` over one triple with a `REGEX(?o, const[, const])`
+/// or `CONTAINS(?o, const)` filter — the per-distinct-string fold shapes.
+fn detect_predicate_count_string_match(query: &Query) -> Option<(Ref, StringFoldAgg, VarId)> {
+    use crate::ir::{Expression, FlakeValue, Function};
+
+    let agg = implicit_single_aggregate(query)?;
+    if query.patterns.len() != 2 {
+        return None;
+    }
+    if !matches!(agg.function, AggregateFn::Count(_) | AggregateFn::CountAll) {
+        return None;
+    }
+
+    let (tp, filter) = match (&query.patterns[0], &query.patterns[1]) {
+        (Pattern::Triple(tp), Pattern::Filter(expr)) => (tp, expr),
+        (Pattern::Filter(expr), Pattern::Triple(tp)) => (tp, expr),
+        _ => return None,
+    };
+    let (s_var, pred, o_var) = validate_simple_triple(tp)?;
+    if matches!(agg.function, AggregateFn::Count(v) if v != s_var) {
+        return None;
+    }
+    let select_vars = query.output.projected_vars()?;
+    if select_vars.len() != 1 || select_vars[0] != agg.output_var {
+        return None;
+    }
+
+    let Expression::Call { func, args } = filter else {
+        return None;
+    };
+    if !matches!(&args[0], Expression::Var(v) if *v == o_var) {
+        return None;
+    }
+    let Some(Expression::Const(FlakeValue::String(needle))) = args.get(1) else {
+        return None;
+    };
+    let fold = match func {
+        Function::Regex => {
+            let flags: Arc<str> = match args.get(2) {
+                None => Arc::from(""),
+                Some(Expression::Const(FlakeValue::String(f))) => Arc::from(f.as_str()),
+                Some(_) => return None,
+            };
+            if args.len() > 3 {
+                return None;
+            }
+            StringFoldAgg::CountRegex {
+                pattern: Arc::from(needle.as_str()),
+                flags,
+            }
+        }
+        Function::Contains if args.len() == 2 => StringFoldAgg::CountContains {
+            needle: Arc::from(needle.as_str()),
+        },
+        _ => return None,
+    };
+    Some((pred, fold, agg.output_var))
+}
+
+/// `SUM(f(?o))` over one triple for the string functions the fold supports —
+/// lowered to a pre-aggregation BIND of the expression plus `SUM(?synthetic)`:
+/// `STRLEN(?o)`, `STRLEN(STRBEFORE/STRAFTER(?o, const))`, and
+/// `xsd:integer(STRENDS(?o, const))`.
+fn detect_predicate_sum_string_fn(query: &Query) -> Option<(Ref, StringFoldAgg, VarId)> {
+    use crate::ir::{Expression, FlakeValue, Function};
+
+    let agg = implicit_single_aggregate(query)?;
+    let AggregateFn::Sum(sum_input, InputSemantics::List) = agg.function else {
+        return None;
+    };
+    let select_vars = query.output.projected_vars()?;
+    if select_vars.len() != 1 || select_vars[0] != agg.output_var {
+        return None;
+    }
+
+    if query.patterns.len() != 2 {
+        return None;
+    }
+    let (tp, bind_var, bind_expr) = match (&query.patterns[0], &query.patterns[1]) {
+        (Pattern::Triple(tp), Pattern::Bind { var, expr }) => (tp, *var, expr),
+        _ => return None,
+    };
+    let (_s_var, pred, o_var) = validate_simple_triple(tp)?;
+    if sum_input != bind_var {
+        return None;
+    }
+
+    // Matches `f(Var(o), Const(needle))` for a given function.
+    let var_const_args = |func: Function, args: &[Expression]| -> Option<Arc<str>> {
+        let Expression::Call { func: f, args } = &args[0] else {
+            return None;
+        };
+        if *f != func || args.len() != 2 {
+            return None;
+        }
+        if !matches!(&args[0], Expression::Var(v) if *v == o_var) {
+            return None;
+        }
+        let Expression::Const(FlakeValue::String(needle)) = &args[1] else {
+            return None;
+        };
+        Some(Arc::from(needle.as_str()))
+    };
+
+    let Expression::Call { func, args } = bind_expr else {
+        return None;
+    };
+    let fold = match func {
+        Function::Strlen if args.len() == 1 => match &args[0] {
+            Expression::Var(v) if *v == o_var => StringFoldAgg::SumStrlen,
+            Expression::Call { .. } => {
+                if let Some(needle) = var_const_args(Function::StrBefore, args) {
+                    StringFoldAgg::SumStrlenBefore { needle }
+                } else if let Some(needle) = var_const_args(Function::StrAfter, args) {
+                    StringFoldAgg::SumStrlenAfter { needle }
+                } else {
+                    return None;
+                }
+            }
+            _ => return None,
+        },
+        Function::XsdInteger if args.len() == 1 => {
+            let needle = var_const_args(Function::StrEnds, args)?;
+            StringFoldAgg::SumStrEnds { needle }
+        }
+        _ => return None,
+    };
+    Some((pred, fold, agg.output_var))
+}
+
 fn extract_string_prefix_filter(
     expr: &crate::ir::Expression,
     object_var: VarId,
@@ -2202,6 +2333,24 @@ fn build_operator_tree_inner(
             return Ok(Box::new(string_prefix_sum_strstarts_operator(
                 pred,
                 prefix,
+                out_var,
+                Some(fallback),
+            )));
+        }
+    }
+
+    // Fast-path: per-distinct-string folds over one triple — COUNT(*) with a
+    // REGEX/CONTAINS filter on ?o, and SUM of STRLEN / STRLEN∘STRBEFORE /
+    // STRLEN∘STRAFTER / xsd:integer∘STRENDS of ?o. Placed after the
+    // string-prefix paths so anchored-prefix patterns keep the range shortcut.
+    if enable_fused_fast_paths {
+        if let Some((pred, agg, out_var)) = detect_predicate_count_string_match(query)
+            .or_else(|| detect_predicate_sum_string_fn(query))
+        {
+            let fallback = build_operator_tree_inner(query, stats.clone(), false, planning)?;
+            return Ok(Box::new(predicate_string_fold_operator(
+                pred,
+                agg,
                 out_var,
                 Some(fallback),
             )));

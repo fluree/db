@@ -161,28 +161,65 @@ pub async fn schema_hierarchy_with_overlay(
     }
 }
 
-/// Build the OWL2-RL materialization budget, honoring environment overrides.
+/// Build the OWL2-RL materialization budget for this query.
 ///
-/// `FLUREE_REASONING_MAX_FACTS` and `FLUREE_REASONING_MAX_SECONDS` raise (or
-/// lower) the default 1M-fact / 30s budget. Datasets whose closure exceeds
-/// the budget get a CAPPED (incomplete) materialization — see the warning in
-/// [`compute_derived_facts`] — so operators need an escape hatch until the
-/// budget is wired into ledger/query configuration.
-fn reasoning_budget_from_env() -> fluree_db_reasoner::ReasoningBudget {
+/// Layered, lowest to highest precedence:
+/// 1. built-in default (1M facts / 30s),
+/// 2. server env (`FLUREE_REASONING_MAX_FACTS` / `FLUREE_REASONING_MAX_SECONDS`)
+///    — operator-wide override,
+/// 3. `modes.max_facts` / `modes.max_seconds` — the merged ledger-config /
+///    per-query budget (override control is enforced upstream at the view
+///    layer, so by the time it reaches here the value is authoritative).
+///
+/// Datasets whose closure exceeds the budget get a CAPPED (incomplete)
+/// materialization — see the warning in [`compute_derived_facts`].
+fn reasoning_budget(modes: &ReasoningModes) -> fluree_db_reasoner::ReasoningBudget {
     let mut budget = fluree_db_reasoner::ReasoningBudget::default();
-    if let Some(max_facts) = std::env::var("FLUREE_REASONING_MAX_FACTS")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-    {
+    // The env vars are re-read on every call deliberately: they are a live
+    // operator tuning knob (no restart needed), and two getenv calls per
+    // reasoning query are negligible next to materialization itself.
+    if let Some(max_facts) = budget_env_var::<usize>("FLUREE_REASONING_MAX_FACTS") {
         budget.max_facts = max_facts;
     }
-    if let Some(max_secs) = std::env::var("FLUREE_REASONING_MAX_SECONDS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-    {
+    if let Some(max_secs) = budget_env_var::<u64>("FLUREE_REASONING_MAX_SECONDS") {
+        budget.max_duration = std::time::Duration::from_secs(max_secs);
+    }
+    if let Some(max_facts) = modes.max_facts {
+        budget.max_facts = max_facts as usize;
+    }
+    if let Some(max_secs) = modes.max_seconds {
         budget.max_duration = std::time::Duration::from_secs(max_secs);
     }
     budget
+}
+
+/// Read and parse a reasoning-budget env var, warning (instead of silently
+/// ignoring) when a set value doesn't parse.
+fn budget_env_var<T: std::str::FromStr>(name: &str) -> Option<T> {
+    let raw = std::env::var(name).ok()?;
+    match raw.parse::<T>() {
+        Ok(v) => Some(v),
+        Err(_) => {
+            tracing::warn!(
+                name,
+                value = %raw,
+                "ignoring unparseable reasoning budget env var"
+            );
+            None
+        }
+    }
+}
+
+/// Result of [`compute_derived_facts`]: the overlay plus the OWL2-RL
+/// materialization diagnostics (when OWL2-RL ran), so callers can surface a
+/// capped (incomplete) closure in response metadata instead of only logging.
+#[derive(Default)]
+pub struct DerivedFactsOutcome {
+    /// Combined derived-facts overlay (OWL2-RL and/or datalog), if any.
+    pub overlay: Option<Arc<DerivedFactsOverlay>>,
+    /// OWL2-RL materialization diagnostics; `None` when OWL2-RL didn't run
+    /// (datalog-only reasoning) or failed.
+    pub diagnostics: Option<fluree_db_reasoner::ReasoningDiagnostics>,
 }
 
 /// Compute derived facts from OWL2-RL reasoning and/or user-defined datalog rules
@@ -199,17 +236,18 @@ pub async fn compute_derived_facts(
     to_t: i64,
     reasoning: &ReasoningModes,
     rules_source_g_id: Option<GraphId>,
-) -> Option<Arc<DerivedFactsOverlay>> {
+) -> DerivedFactsOutcome {
     use crate::datalog_rules::execute_datalog_rules_with_query_rules;
 
     let mut all_flakes: Vec<fluree_db_core::Flake> = Vec::new();
     let mut same_as = FrozenSameAs::empty();
+    let mut diagnostics = None;
 
     // OWL2-RL materialization
     if reasoning.owl2rl {
         tracing::debug!("computing OWL2-RL derived facts");
         let reasoning_opts = ReasoningOptions {
-            budget: reasoning_budget_from_env(),
+            budget: reasoning_budget(reasoning),
             ..Default::default()
         };
         let cache = global_reasoning_cache();
@@ -227,7 +265,9 @@ pub async fn compute_derived_facts(
                         duration_ms = result.diagnostics.duration.as_millis() as u64,
                         "OWL2-RL materialization hit its budget before reaching \
                          fixpoint; query results may be missing entailments. \
-                         Raise FLUREE_REASONING_MAX_FACTS / FLUREE_REASONING_MAX_SECONDS."
+                         Raise the budget via f:reasoningMaxFacts/f:reasoningMaxSeconds \
+                         (ledger config), \"reasoningBudget\" (query), or \
+                         FLUREE_REASONING_MAX_FACTS/FLUREE_REASONING_MAX_SECONDS (server)."
                     );
                 } else {
                     tracing::debug!(
@@ -237,16 +277,17 @@ pub async fn compute_derived_facts(
                         "OWL2-RL reasoning completed"
                     );
                 }
+                diagnostics = Some(result.diagnostics.clone());
 
                 // Without datalog there is nothing to combine: hand the
                 // prebuilt (cached, pre-sorted) overlay straight to
                 // execution instead of re-collecting and re-sorting its
                 // flakes on every query.
                 if !reasoning.datalog {
-                    if result.overlay.is_empty() {
-                        return None;
-                    }
-                    return Some(result.overlay.clone());
+                    return DerivedFactsOutcome {
+                        overlay: (!result.overlay.is_empty()).then(|| result.overlay.clone()),
+                        diagnostics,
+                    };
                 }
 
                 // Datalog chains off OWL entailments — collect flakes so
@@ -325,7 +366,10 @@ pub async fn compute_derived_facts(
 
     // If we computed any derived facts, wrap them in a DerivedFactsOverlay
     if all_flakes.is_empty() {
-        return None;
+        return DerivedFactsOutcome {
+            overlay: None,
+            diagnostics,
+        };
     }
 
     let mut builder = DerivedFactsBuilder::new();
@@ -334,5 +378,8 @@ pub async fn compute_derived_facts(
     }
 
     let derived_overlay = builder.build(same_as, overlay.epoch());
-    Some(Arc::new(derived_overlay))
+    DerivedFactsOutcome {
+        overlay: Some(Arc::new(derived_overlay)),
+        diagnostics,
+    }
 }

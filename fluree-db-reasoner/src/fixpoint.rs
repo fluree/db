@@ -13,15 +13,18 @@ use fluree_vocab::jsonld_names::ID as JSONLD_ID;
 use fluree_vocab::namespaces::{JSON_LD, RDF};
 use fluree_vocab::predicates::RDF_TYPE;
 
+use crate::compile::{compile, ClassRuleKind, PropertyRuleKind};
 use crate::execute::{
-    apply_all_values_from_rule, apply_domain_rule, apply_equivalent_class_rule,
-    apply_functional_property_rule, apply_has_key_rule, apply_has_value_backward_rule,
-    apply_has_value_forward_rule, apply_intersection_backward_rule,
-    apply_intersection_forward_rule, apply_inverse_functional_property_rule, apply_inverse_rule,
+    apply_functional_property_rule, apply_has_key_rule, apply_inverse_functional_property_rule,
     apply_max_cardinality_rule, apply_max_qualified_cardinality_rule, apply_one_of_rule,
-    apply_property_chain_rule, apply_range_rule, apply_same_as_rule, apply_some_values_from_rule,
-    apply_sub_property_rule, apply_subclass_rule, apply_symmetric_rule, apply_transitive_rule,
-    apply_union_rule, DeltaSet, DerivedSet, IdentityRuleContext, IdentityRuleState, RuleContext,
+    apply_same_as_rule, apply_single_property_chain, fire_all_values_from_prop,
+    fire_all_values_from_prop_inverse, fire_all_values_from_type, fire_domain,
+    fire_equivalent_class, fire_has_value_backward, fire_has_value_forward,
+    fire_has_value_forward_inverse, fire_intersection_backward, fire_intersection_member,
+    fire_inverse, fire_range, fire_some_values_from, fire_some_values_from_filler,
+    fire_some_values_from_inverse, fire_sub_property, fire_subclass, fire_symmetric,
+    fire_transitive, fire_union_member, DeltaSet, DerivedSet, IdentityRuleContext,
+    IdentityRuleState, RuleContext,
 };
 use crate::ontology_rl::{load_same_as_assertions, OntologyRL};
 use crate::owl;
@@ -93,6 +96,11 @@ pub async fn run_fixpoint(
         ));
     }
 
+    // Compile the active ontology into trigger-indexed ground rules (A1.2).
+    // `enabled_rules` filtering happens here; the per-iteration loop below
+    // dispatches each delta fact straight to the rules it can fire.
+    let compiled = compile(&ontology, &restrictions, opts);
+
     // Seed initial delta with all base facts for relevant predicates
     let mut delta = seed_initial_delta(db, &ontology, &restrictions).await?;
 
@@ -130,47 +138,41 @@ pub async fn run_fixpoint(
     // iteration folds only its delta in; rebuilt when sameAs changes).
     let mut identity_state = IdentityRuleState::default();
 
+    // sameAs facts derived by the identity rules are unioned *after* those
+    // rules already folded this iteration's delta into `identity_state`, so
+    // the grouping keys may be stale. Carrying the union outcome into the
+    // next iteration's `same_as_changed` forces the rebuild branch there; it
+    // also keeps the loop alive when the merge lands on what would otherwise
+    // be the final iteration.
+    let mut same_as_changed_carry = false;
+
     // Semi-naive fixpoint loop
-    while !delta.is_empty() {
+    while !delta.is_empty() || same_as_changed_carry {
         // Check budget
         if start.elapsed() > budget.max_duration {
-            diagnostics = ReasoningDiagnostics::capped(
-                "time",
-                iterations,
-                derived.derived_len(),
-                start.elapsed(),
-            );
+            diagnostics.mark_capped("time", iterations, derived.derived_len(), start.elapsed());
             break;
         }
 
         if derived.derived_len() > budget.max_facts {
-            diagnostics = ReasoningDiagnostics::capped(
-                "facts",
-                iterations,
-                derived.derived_len(),
-                start.elapsed(),
-            );
+            diagnostics.mark_capped("facts", iterations, derived.derived_len(), start.elapsed());
             break;
         }
 
         iterations += 1;
         let mut new_delta = DeltaSet::new();
 
-        // Apply rules in order:
-        // PHASE A: Process existing sameAs in delta
-        // This updates the union-find for any owl:sameAs facts in the current delta
-        let mut same_as_changed = apply_same_as_rule(
-            &delta,
-            &mut same_as_tracker,
-            &owl_same_as_sid,
-            &mut diagnostics,
-        );
+        // Union any owl:sameAs facts in the current delta into the union-find.
+        let mut same_as_changed = std::mem::take(&mut same_as_changed_carry)
+            | apply_same_as_rule(
+                &delta,
+                &mut same_as_tracker,
+                &owl_same_as_sid,
+                &mut diagnostics,
+            );
 
-        // PHASE B: Apply identity-producing rules (produce owl:sameAs)
-        // These rules can derive new sameAs facts: prp-fp, prp-ifp
-        // They must run BEFORE non-identity rules to ensure proper canonicalization
-
-        // Create IdentityRuleContext for identity-producing rules
+        // Identity-producing rules (derive new owl:sameAs facts). They must
+        // run BEFORE non-identity rules to ensure proper canonicalization.
         {
             let mut identity_ctx = IdentityRuleContext {
                 delta: &delta,
@@ -185,39 +187,39 @@ pub async fn run_fixpoint(
                 state: &mut identity_state,
             };
 
-            // B.1. Functional property rule (prp-fp):
+            // Functional property rule (prp-fp):
             // FunctionalProperty(P), P(x, y1), P(x, y2) → sameAs(y1, y2)
             if opts.rule_enabled("prp-fp") {
                 apply_functional_property_rule(&ontology, &mut identity_ctx);
             }
 
-            // B.2. Inverse functional property rule (prp-ifp):
+            // Inverse functional property rule (prp-ifp):
             // InverseFunctionalProperty(P), P(x1, y), P(x2, y) → sameAs(x1, x2)
             if opts.rule_enabled("prp-ifp") {
                 apply_inverse_functional_property_rule(&ontology, &mut identity_ctx);
             }
 
-            // B.3. hasKey rule (prp-key):
+            // hasKey rule (prp-key):
             // hasKey(C, [P1..Pn]), type(x,C), P1(x,z1).., type(y,C), P1(y,z1).. → sameAs(x,y)
             if opts.rule_enabled("prp-key") {
                 apply_has_key_rule(&ontology, &mut identity_ctx);
             }
 
-            // B.4. MaxCardinality=1 rule (cls-maxc2):
+            // MaxCardinality=1 rule (cls-maxc2):
             // P(x, y1), P(x, y2), type(x, C) → sameAs(y1, y2) where C is maxCardinality=1 restriction
             if opts.rule_enabled("cls-maxc2") {
                 apply_max_cardinality_rule(&restrictions, &mut identity_ctx);
             }
 
-            // B.5. MaxQualifiedCardinality=1 rule (cls-maxqc3/4):
+            // MaxQualifiedCardinality=1 rule (cls-maxqc3/4):
             // P(x, y1), P(x, y2), type(x, C), type(y1, D), type(y2, D) → sameAs(y1, y2)
             if opts.rule_enabled_any(&["cls-maxqc", "cls-maxqc3", "cls-maxqc4"]) {
                 apply_max_qualified_cardinality_rule(&restrictions, &mut identity_ctx);
             }
         }
 
-        // B.6. Process any new sameAs facts generated by fp/ifp/hasKey/cardinality rules
-        // This ensures the union-find is updated before non-identity rules run
+        // Union the sameAs facts the identity rules just derived, so the
+        // union-find is current before non-identity rules run.
         let identity_same_as_changed = apply_same_as_rule(
             &new_delta,
             &mut same_as_tracker,
@@ -225,18 +227,16 @@ pub async fn run_fixpoint(
             &mut diagnostics,
         );
         same_as_changed = same_as_changed || identity_same_as_changed;
+        same_as_changed_carry = identity_same_as_changed;
 
-        // Phase C rules canonicalize every fact through a shared reference
-        // (read-only walks, no compression). Compress once here so those
-        // lookups are single-hop for the rest of the iteration.
+        // Non-identity rules canonicalize every fact through a shared
+        // reference (read-only walks, no compression). Compress once here so
+        // those lookups are single-hop for the rest of the iteration.
         if same_as_changed {
             same_as_tracker.compress_all();
         }
 
-        // PHASE C: Apply non-identity rules
-        // These rules produce property/type facts (not sameAs)
-
-        // Create RuleContext for standard rules
+        // Non-identity rules: produce property/type facts (not sameAs).
         let mut ctx = RuleContext {
             delta: &delta,
             derived: &derived,
@@ -247,93 +247,38 @@ pub async fn run_fixpoint(
             diagnostics: &mut diagnostics,
         };
 
-        // C.1. Symmetric property rule (prp-symp)
-        if opts.rule_enabled("prp-symp") {
-            apply_symmetric_rule(&ontology, &mut ctx);
+        // Single pass over the delta: dispatch each fact to exactly the
+        // compiled rules its predicate/class can fire (rulesFor index).
+        for flake in delta.iter() {
+            for rule in compiled.property_rules_for(&flake.p) {
+                fire_property_rule(rule, &ontology, &restrictions, flake, &mut ctx);
+            }
+            if flake.p == rdf_type_sid {
+                if let fluree_db_core::value::FlakeValue::Ref(class) = &flake.o {
+                    for rule in compiled.class_rules_for(class) {
+                        fire_class_rule(rule, &ontology, &restrictions, flake, class, &mut ctx);
+                    }
+                }
+            }
         }
 
-        // C.2. Transitive property rule (prp-trp)
-        if opts.rule_enabled("prp-trp") {
-            apply_transitive_rule(&ontology, &mut ctx);
+        // Property chains (prp-spo2) are n-way joins seeded from every chain
+        // position; they run whole, gated on any component predicate being
+        // present in the delta.
+        let chains = ontology.property_chains();
+        for chain_idx in compiled.triggered_chains(delta.predicates()) {
+            apply_single_property_chain(&chains[chain_idx], &mut ctx);
         }
 
-        // C.3. Inverse property rule (prp-inv)
-        if opts.rule_enabled("prp-inv") {
-            apply_inverse_rule(&ontology, &mut ctx);
-        }
-
-        // C.4. Domain rule (prp-dom): P(x,y), domain(P,C) → type(x,C)
-        if opts.rule_enabled("prp-dom") {
-            apply_domain_rule(&ontology, &mut ctx);
-        }
-
-        // C.5. Range rule (prp-rng): P(x,y), range(P,C) → type(y,C)
-        if opts.rule_enabled("prp-rng") {
-            apply_range_rule(&ontology, &mut ctx);
-        }
-
-        // C.6. SubPropertyOf rule (prp-spo1): P1(x,y), subPropertyOf(P1,P2) → P2(x,y)
-        if opts.rule_enabled("prp-spo1") {
-            apply_sub_property_rule(&ontology, &mut ctx);
-        }
-
-        // C.7. PropertyChain rule (prp-spo2): P1(u0,u1), P2(u1,u2) → P(u0,u2)
-        if opts.rule_enabled("prp-spo2") {
-            apply_property_chain_rule(&ontology, &mut ctx);
-        }
-
-        // C.8. SubClassOf rule (cax-sco): type(x, C1), subClassOf(C1, C2) → type(x, C2)
-        if opts.rule_enabled("cax-sco") {
-            apply_subclass_rule(&ontology, &mut ctx);
-        }
-
-        // C.9. EquivalentClass rule (cax-eqc): type(x, C1), equivalentClass(C1, C2) → type(x, C2)
-        if opts.rule_enabled_any(&["cax-eqc", "cax-eqc1", "cax-eqc2"]) {
-            apply_equivalent_class_rule(&ontology, &mut ctx);
-        }
-
-        // C.10. HasValue backward rule (cls-hv1): type(x, C) where C is hasValue restriction → P(x, v)
-        if opts.rule_enabled("cls-hv1") {
-            apply_has_value_backward_rule(&restrictions, &mut ctx);
-        }
-
-        // C.11. HasValue forward rule (cls-hv2): P(x, v) where C is hasValue restriction → type(x, C)
-        if opts.rule_enabled("cls-hv2") {
-            apply_has_value_forward_rule(&restrictions, &mut ctx);
-        }
-
-        // C.12. SomeValuesFrom rule (cls-svf1): P(x, y), type(y, D) → type(x, C)
-        if opts.rule_enabled("cls-svf1") {
-            apply_some_values_from_rule(&restrictions, &mut ctx);
-        }
-
-        // C.13. AllValuesFrom rule (cls-avf): type(x, C), P(x, y) → type(y, D)
-        if opts.rule_enabled("cls-avf") {
-            apply_all_values_from_rule(&restrictions, &mut ctx);
-        }
-
-        // C.14. IntersectionOf backward rule (cls-int2): type(x, I) → type(x, Ci)
-        if opts.rule_enabled("cls-int2") {
-            apply_intersection_backward_rule(&restrictions, &mut ctx);
-        }
-
-        // C.15. IntersectionOf forward rule (cls-int1): type(x, C1) ∧ ... → type(x, I)
-        if opts.rule_enabled("cls-int1") {
-            apply_intersection_forward_rule(&restrictions, &mut ctx);
-        }
-
-        // C.16. UnionOf rule (cls-uni): type(x, Ci) → type(x, U)
-        if opts.rule_enabled("cls-uni") {
-            apply_union_rule(&restrictions, &mut ctx);
-        }
-
-        // C.17. OneOf rule (cls-oo): i ∈ oneOf list → type(i, C)
-        if opts.rule_enabled("cls-oo") {
+        // cls-oo: enumerated individuals are typed unconditionally (no delta
+        // trigger); the derived-set check keeps it idempotent per iteration.
+        if compiled.one_of_active() {
             apply_one_of_rule(&restrictions, &mut ctx);
         }
 
-        // PHASE D: If sameAs changed this iteration, canonicalize both delta and new_delta (eq-rep-s/o)
-        // This ensures DerivedSet stays consistently canonical for proper deduplication
+        // If sameAs changed this iteration, canonicalize both delta and
+        // new_delta (eq-rep-s/o) so DerivedSet stays consistently canonical
+        // for proper deduplication.
         let (delta_to_merge, new_delta) = if same_as_changed {
             // Canonicalize delta before merging into derived
             let canonical_delta = delta.recanonicalize(&same_as_tracker);
@@ -377,12 +322,82 @@ pub async fn run_fixpoint(
 
     // Update diagnostics if not already capped
     if !diagnostics.capped {
-        diagnostics =
-            ReasoningDiagnostics::completed(iterations, derived.derived_len(), start.elapsed());
-        diagnostics.rules_fired = std::mem::take(&mut diagnostics.rules_fired);
+        diagnostics.mark_completed(iterations, derived.derived_len(), start.elapsed());
     }
 
     Ok((derived.into_derived_flakes(), frozen_same_as, diagnostics))
+}
+
+/// Dispatch one delta fact to a compiled property-triggered rule.
+fn fire_property_rule(
+    rule: &PropertyRuleKind,
+    ontology: &OntologyRL,
+    restrictions: &RestrictionIndex,
+    flake: &Flake,
+    ctx: &mut RuleContext<'_>,
+) {
+    match rule {
+        PropertyRuleKind::Symmetric => fire_symmetric(flake, ctx),
+        PropertyRuleKind::Transitive => fire_transitive(flake, ctx),
+        PropertyRuleKind::Inverse => fire_inverse(ontology, flake, ctx),
+        PropertyRuleKind::Domain => fire_domain(ontology, flake, ctx),
+        PropertyRuleKind::Range => fire_range(ontology, flake, ctx),
+        PropertyRuleKind::SubProperty => fire_sub_property(ontology, flake, ctx),
+        PropertyRuleKind::HasValueForward { restriction } => {
+            fire_has_value_forward(restrictions, restriction, flake, ctx);
+        }
+        PropertyRuleKind::HasValueForwardInverse { restriction } => {
+            fire_has_value_forward_inverse(restrictions, restriction, flake, ctx);
+        }
+        PropertyRuleKind::SomeValuesFrom { restriction } => {
+            fire_some_values_from(restrictions, restriction, flake, ctx);
+        }
+        PropertyRuleKind::SomeValuesFromInverse { restriction } => {
+            fire_some_values_from_inverse(restrictions, restriction, flake, ctx);
+        }
+        PropertyRuleKind::AllValuesFromProp { restriction } => {
+            fire_all_values_from_prop(restrictions, restriction, flake, ctx);
+        }
+        PropertyRuleKind::AllValuesFromPropInverse { restriction } => {
+            fire_all_values_from_prop_inverse(restrictions, restriction, flake, ctx);
+        }
+    }
+}
+
+/// Dispatch one delta `rdf:type` fact to a compiled class-triggered rule.
+fn fire_class_rule(
+    rule: &ClassRuleKind,
+    ontology: &OntologyRL,
+    restrictions: &RestrictionIndex,
+    flake: &Flake,
+    class: &Sid,
+    ctx: &mut RuleContext<'_>,
+) {
+    match rule {
+        ClassRuleKind::SubClass => fire_subclass(ontology, flake, class, ctx),
+        ClassRuleKind::EquivalentClass => fire_equivalent_class(ontology, flake, class, ctx),
+        ClassRuleKind::HasValueBackward => {
+            fire_has_value_backward(restrictions, flake, class, ctx);
+        }
+        ClassRuleKind::AllValuesFromType => {
+            fire_all_values_from_type(restrictions, flake, class, ctx);
+        }
+        ClassRuleKind::SomeValuesFromFiller {
+            restriction,
+            inverse,
+        } => {
+            fire_some_values_from_filler(restrictions, restriction, *inverse, flake, ctx);
+        }
+        ClassRuleKind::IntersectionMember { intersection } => {
+            fire_intersection_member(restrictions, intersection, flake, ctx);
+        }
+        ClassRuleKind::IntersectionBackward => {
+            fire_intersection_backward(restrictions, flake, class, ctx);
+        }
+        ClassRuleKind::UnionMember { union } => {
+            fire_union_member(restrictions, union, flake, ctx);
+        }
+    }
 }
 
 /// Seed the initial delta with base facts for relevant predicates

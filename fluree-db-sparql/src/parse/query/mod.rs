@@ -85,6 +85,8 @@ pub fn parse_sparql(input: &str) -> ParseOutput<SparqlAst> {
 /// Supported:
 /// - `# PRAGMA reasoning: owl2rl` (also `rdfs`, `owl2ql`, `datalog`,
 ///   `owl-datalog`, `none`, or a comma-separated combination)
+/// - `# PRAGMA reasoning-max-facts: 20000000` — OWL2-RL materialization budget
+/// - `# PRAGMA reasoning-max-seconds: 300` — OWL2-RL materialization budget
 fn extract_pragmas(comments: &[String]) -> Pragmas {
     let mut pragmas = Pragmas::default();
 
@@ -93,7 +95,15 @@ fn extract_pragmas(comments: &[String]) -> Pragmas {
             continue;
         };
 
-        if let Some(value) = strip_keyword_ci(rest, "reasoning") {
+        // `strip_keyword_ci` requires a word boundary, so plain `reasoning`
+        // never matches the `reasoning-max-*` directives.
+        if let Some(value) = strip_keyword_ci(rest, "reasoning-max-facts") {
+            // Last pragma wins; the raw value is preserved (even if empty) so
+            // lowering can reject an invalid number with a proper error.
+            pragmas.reasoning_max_facts = Some(pragma_scalar_value(value));
+        } else if let Some(value) = strip_keyword_ci(rest, "reasoning-max-seconds") {
+            pragmas.reasoning_max_seconds = Some(pragma_scalar_value(value));
+        } else if let Some(value) = strip_keyword_ci(rest, "reasoning") {
             let value = value.trim_start().strip_prefix(':').unwrap_or(value);
             let modes: Vec<String> = value
                 .split([',', ' ', '\t'])
@@ -108,6 +118,13 @@ fn extract_pragmas(comments: &[String]) -> Pragmas {
     }
 
     pragmas
+}
+
+/// Extract a single trimmed scalar value after an optional `:`.
+fn pragma_scalar_value(value: &str) -> String {
+    let value = value.trim_start();
+    let value = value.strip_prefix(':').unwrap_or(value);
+    value.trim().to_string()
 }
 
 /// Strip a case-insensitive keyword prefix followed by a word boundary

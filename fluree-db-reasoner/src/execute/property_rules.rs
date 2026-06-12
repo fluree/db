@@ -26,29 +26,35 @@ use super::util::{ref_dt, IdentityRuleContext, RuleContext};
 ///
 /// For each new fact δP(x,y) where P is symmetric, derive P(y,x).
 pub fn apply_symmetric_rule(ontology: &OntologyRL, ctx: &mut RuleContext<'_>) {
+    let delta = ctx.delta;
     for p in ontology.symmetric_properties() {
-        for flake in ctx.delta.get_by_p(p) {
-            // P(x, y) → P(y, x)
-            if let FlakeValue::Ref(y) = &flake.o {
-                let x = &flake.s;
+        for flake in delta.get_by_p(p) {
+            fire_symmetric(flake, ctx);
+        }
+    }
+}
 
-                // Create inverse flake P(y, x)
-                let inverse = Flake::new(
-                    y.clone(),
-                    p.clone(),
-                    FlakeValue::Ref(x.clone()),
-                    flake.dt.clone(),
-                    ctx.t,
-                    true,
-                    None,
-                );
+/// Per-fact body of `prp-symp`: the fact's predicate is symmetric.
+pub(crate) fn fire_symmetric(flake: &Flake, ctx: &mut RuleContext<'_>) {
+    // P(x, y) → P(y, x)
+    if let FlakeValue::Ref(y) = &flake.o {
+        let x = &flake.s;
 
-                // Only add if not already derived
-                if !ctx.derived.contains(&inverse.s, &inverse.p, &inverse.o) {
-                    ctx.new_delta.push(inverse);
-                    ctx.diagnostics.record_rule_fired("prp-symp");
-                }
-            }
+        // Create inverse flake P(y, x)
+        let inverse = Flake::new(
+            y.clone(),
+            flake.p.clone(),
+            FlakeValue::Ref(x.clone()),
+            flake.dt.clone(),
+            ctx.t,
+            true,
+            None,
+        );
+
+        // Only add if not already derived
+        if !ctx.derived.contains(&inverse.s, &inverse.p, &inverse.o) {
+            ctx.new_delta.push(inverse);
+            ctx.diagnostics.record_rule_fired("prp-symp");
         }
     }
 }
@@ -59,88 +65,82 @@ pub fn apply_symmetric_rule(ontology: &OntologyRL, ctx: &mut RuleContext<'_>) {
 /// - Join with existing P(y,z) to derive P(x,z)
 /// - Join with existing P(w,x) to derive P(w,y)
 pub fn apply_transitive_rule(ontology: &OntologyRL, ctx: &mut RuleContext<'_>) {
+    let delta = ctx.delta;
     for p in ontology.transitive_properties() {
-        for flake in ctx.delta.get_by_p(p) {
-            if let FlakeValue::Ref(y) = &flake.o {
-                let x = &flake.s;
+        for flake in delta.get_by_p(p) {
+            fire_transitive(flake, ctx);
+        }
+    }
+}
 
-                // Forward: δP(x,y) ⋈ P(y,z) → P(x,z)
-                // Look up all P(y, ?) in derived
-                for existing in ctx.derived.get_by_ps(p, y) {
-                    if let FlakeValue::Ref(z) = &existing.o {
-                        // Don't create self-loops (x = z)
-                        if x != z {
-                            let new_flake = Flake::new(
-                                x.clone(),
-                                p.clone(),
-                                FlakeValue::Ref(z.clone()),
-                                flake.dt.clone(),
-                                ctx.t,
-                                true,
-                                None,
-                            );
+/// Per-fact body of `prp-trp`: the fact's predicate is transitive.
+pub(crate) fn fire_transitive(flake: &Flake, ctx: &mut RuleContext<'_>) {
+    let p = &flake.p;
+    if let FlakeValue::Ref(y) = &flake.o {
+        let x = &flake.s;
 
-                            if !ctx
-                                .derived
-                                .contains(&new_flake.s, &new_flake.p, &new_flake.o)
-                            {
-                                ctx.new_delta.push(new_flake);
-                                ctx.diagnostics.record_rule_fired("prp-trp");
-                            }
-                        }
-                    }
+        // Forward: δP(x,y) ⋈ P(y,z) → P(x,z)
+        // Look up all P(y, ?) in derived
+        let mut pending: Vec<Flake> = Vec::new();
+        for existing in ctx.derived.get_by_ps(p, y) {
+            if let FlakeValue::Ref(z) = &existing.o {
+                // Don't create self-loops (x = z)
+                if x != z {
+                    pending.push(Flake::new(
+                        x.clone(),
+                        p.clone(),
+                        FlakeValue::Ref(z.clone()),
+                        flake.dt.clone(),
+                        ctx.t,
+                        true,
+                        None,
+                    ));
                 }
+            }
+        }
 
-                // Also check delta for P(y, ?) (new facts joining with new facts)
-                for delta_flake in ctx.delta.get_by_ps(p, y) {
-                    if let FlakeValue::Ref(z) = &delta_flake.o {
-                        if x != z {
-                            let new_flake = Flake::new(
-                                x.clone(),
-                                p.clone(),
-                                FlakeValue::Ref(z.clone()),
-                                flake.dt.clone(),
-                                ctx.t,
-                                true,
-                                None,
-                            );
-
-                            if !ctx
-                                .derived
-                                .contains(&new_flake.s, &new_flake.p, &new_flake.o)
-                            {
-                                ctx.new_delta.push(new_flake);
-                                ctx.diagnostics.record_rule_fired("prp-trp");
-                            }
-                        }
-                    }
+        // Also check delta for P(y, ?) (new facts joining with new facts)
+        for delta_flake in ctx.delta.get_by_ps(p, y) {
+            if let FlakeValue::Ref(z) = &delta_flake.o {
+                if x != z {
+                    pending.push(Flake::new(
+                        x.clone(),
+                        p.clone(),
+                        FlakeValue::Ref(z.clone()),
+                        flake.dt.clone(),
+                        ctx.t,
+                        true,
+                        None,
+                    ));
                 }
+            }
+        }
 
-                // Backward: P(w,x) ⋈ δP(x,y) → P(w,y)
-                // Look up all P(?, x) in derived (use by_po index)
-                for existing in ctx.derived.get_by_po(p, x) {
-                    let w = &existing.s;
-                    // Don't create self-loops (w = y)
-                    if w != y {
-                        let new_flake = Flake::new(
-                            w.clone(),
-                            p.clone(),
-                            FlakeValue::Ref(y.clone()),
-                            flake.dt.clone(),
-                            ctx.t,
-                            true,
-                            None,
-                        );
+        // Backward: P(w,x) ⋈ δP(x,y) → P(w,y)
+        // Look up all P(?, x) in derived (use by_po index)
+        for existing in ctx.derived.get_by_po(p, x) {
+            let w = &existing.s;
+            // Don't create self-loops (w = y)
+            if w != y {
+                pending.push(Flake::new(
+                    w.clone(),
+                    p.clone(),
+                    FlakeValue::Ref(y.clone()),
+                    flake.dt.clone(),
+                    ctx.t,
+                    true,
+                    None,
+                ));
+            }
+        }
 
-                        if !ctx
-                            .derived
-                            .contains(&new_flake.s, &new_flake.p, &new_flake.o)
-                        {
-                            ctx.new_delta.push(new_flake);
-                            ctx.diagnostics.record_rule_fired("prp-trp");
-                        }
-                    }
-                }
+        for new_flake in pending {
+            if !ctx
+                .derived
+                .contains(&new_flake.s, &new_flake.p, &new_flake.o)
+            {
+                ctx.new_delta.push(new_flake);
+                ctx.diagnostics.record_rule_fired("prp-trp");
             }
         }
     }
@@ -150,31 +150,37 @@ pub fn apply_transitive_rule(ontology: &OntologyRL, ctx: &mut RuleContext<'_>) {
 ///
 /// For each new fact δP(x,y) where P has inverses, derive P_inv(y,x).
 pub fn apply_inverse_rule(ontology: &OntologyRL, ctx: &mut RuleContext<'_>) {
-    for flake in ctx.delta.iter() {
-        let inverses = ontology.inverses_of(&flake.p);
-        if inverses.is_empty() {
-            continue;
-        }
+    let delta = ctx.delta;
+    for flake in delta.iter() {
+        fire_inverse(ontology, flake, ctx);
+    }
+}
 
-        if let FlakeValue::Ref(y) = &flake.o {
-            let x = &flake.s;
+/// Per-fact body of `prp-inv`: derive the inverse fact for each declared inverse.
+pub(crate) fn fire_inverse(ontology: &OntologyRL, flake: &Flake, ctx: &mut RuleContext<'_>) {
+    let inverses = ontology.inverses_of(&flake.p);
+    if inverses.is_empty() {
+        return;
+    }
 
-            for p_inv in inverses {
-                // P(x, y) → P_inv(y, x)
-                let inverse = Flake::new(
-                    y.clone(),
-                    p_inv.clone(),
-                    FlakeValue::Ref(x.clone()),
-                    flake.dt.clone(),
-                    ctx.t,
-                    true,
-                    None,
-                );
+    if let FlakeValue::Ref(y) = &flake.o {
+        let x = &flake.s;
 
-                if !ctx.derived.contains(&inverse.s, &inverse.p, &inverse.o) {
-                    ctx.new_delta.push(inverse);
-                    ctx.diagnostics.record_rule_fired("prp-inv");
-                }
+        for p_inv in inverses {
+            // P(x, y) → P_inv(y, x)
+            let inverse = Flake::new(
+                y.clone(),
+                p_inv.clone(),
+                FlakeValue::Ref(x.clone()),
+                flake.dt.clone(),
+                ctx.t,
+                true,
+                None,
+            );
+
+            if !ctx.derived.contains(&inverse.s, &inverse.p, &inverse.o) {
+                ctx.new_delta.push(inverse);
+                ctx.diagnostics.record_rule_fired("prp-inv");
             }
         }
     }
@@ -189,21 +195,27 @@ pub fn apply_inverse_rule(ontology: &OntologyRL, ctx: &mut RuleContext<'_>) {
 /// Note: sameAs canonicalization should be applied before calling this
 /// to ensure x is the canonical representative.
 pub fn apply_domain_rule(ontology: &OntologyRL, ctx: &mut RuleContext<'_>) {
+    let delta = ctx.delta;
     for p in ontology.properties_with_domain() {
-        let domain_classes = ontology.domain_of(p);
-        if domain_classes.is_empty() {
-            continue;
+        for flake in delta.get_by_p(p) {
+            fire_domain(ontology, flake, ctx);
         }
+    }
+}
 
-        for flake in ctx.delta.get_by_p(p) {
-            // Canonicalize subject before deriving type
-            let canonical_s = ctx.same_as.canonical(&flake.s);
+/// Per-fact body of `prp-dom`: the fact's predicate has domain declarations.
+pub(crate) fn fire_domain(ontology: &OntologyRL, flake: &Flake, ctx: &mut RuleContext<'_>) {
+    let domain_classes = ontology.domain_of(&flake.p);
+    if domain_classes.is_empty() {
+        return;
+    }
 
-            for c in domain_classes {
-                // Derive rdf:type(x, C)
-                super::util::try_derive_type(ctx, &canonical_s, c, "prp-dom");
-            }
-        }
+    // Canonicalize subject before deriving type
+    let canonical_s = ctx.same_as.canonical(&flake.s);
+
+    for c in domain_classes {
+        // Derive rdf:type(x, C)
+        super::util::try_derive_type(ctx, &canonical_s, c, "prp-dom");
     }
 }
 
@@ -218,22 +230,28 @@ pub fn apply_domain_rule(ontology: &OntologyRL, ctx: &mut RuleContext<'_>) {
 /// to ensure y is the canonical representative.
 /// Only Ref objects are typed (literals don't get rdf:type assertions).
 pub fn apply_range_rule(ontology: &OntologyRL, ctx: &mut RuleContext<'_>) {
+    let delta = ctx.delta;
     for p in ontology.properties_with_range() {
-        let range_classes = ontology.range_of(p);
-        if range_classes.is_empty() {
-            continue;
+        for flake in delta.get_by_p(p) {
+            fire_range(ontology, flake, ctx);
         }
+    }
+}
 
-        for flake in ctx.delta.get_by_p(p) {
-            // Only derive type for Ref objects (not literals)
-            if let FlakeValue::Ref(y) = &flake.o {
-                // Canonicalize object before deriving type
-                let canonical_y = ctx.same_as.canonical(y);
+/// Per-fact body of `prp-rng`: the fact's predicate has range declarations.
+pub(crate) fn fire_range(ontology: &OntologyRL, flake: &Flake, ctx: &mut RuleContext<'_>) {
+    let range_classes = ontology.range_of(&flake.p);
+    if range_classes.is_empty() {
+        return;
+    }
 
-                for c in range_classes {
-                    super::util::try_derive_type(ctx, &canonical_y, c, "prp-rng");
-                }
-            }
+    // Only derive type for Ref objects (not literals)
+    if let FlakeValue::Ref(y) = &flake.o {
+        // Canonicalize object before deriving type
+        let canonical_y = ctx.same_as.canonical(y);
+
+        for c in range_classes {
+            super::util::try_derive_type(ctx, &canonical_y, c, "prp-rng");
         }
     }
 }
@@ -246,42 +264,48 @@ pub fn apply_range_rule(ontology: &OntologyRL, ctx: &mut RuleContext<'_>) {
 /// Note: sameAs canonicalization should be applied before calling this
 /// to ensure consistent subject/object values.
 pub fn apply_sub_property_rule(ontology: &OntologyRL, ctx: &mut RuleContext<'_>) {
+    let delta = ctx.delta;
     for p1 in ontology.properties_with_super_properties() {
-        let super_props = ontology.super_properties_of(p1);
-        if super_props.is_empty() {
-            continue;
+        for flake in delta.get_by_p(p1) {
+            fire_sub_property(ontology, flake, ctx);
         }
+    }
+}
 
-        for flake in ctx.delta.get_by_p(p1) {
-            // Canonicalize subject
-            let canonical_s = ctx.same_as.canonical(&flake.s);
+/// Per-fact body of `prp-spo1`: the fact's predicate has superproperties.
+pub(crate) fn fire_sub_property(ontology: &OntologyRL, flake: &Flake, ctx: &mut RuleContext<'_>) {
+    let super_props = ontology.super_properties_of(&flake.p);
+    if super_props.is_empty() {
+        return;
+    }
 
-            // Canonicalize object if it's a Ref
-            let canonical_o = match &flake.o {
-                FlakeValue::Ref(o) => FlakeValue::Ref(ctx.same_as.canonical(o)),
-                other => other.clone(),
-            };
+    // Canonicalize subject
+    let canonical_s = ctx.same_as.canonical(&flake.s);
 
-            for p2 in super_props {
-                // Derive P2(x, y)
-                let derived_flake = Flake::new(
-                    canonical_s.clone(),
-                    p2.clone(),
-                    canonical_o.clone(),
-                    flake.dt.clone(),
-                    ctx.t,
-                    true,
-                    None,
-                );
+    // Canonicalize object if it's a Ref
+    let canonical_o = match &flake.o {
+        FlakeValue::Ref(o) => FlakeValue::Ref(ctx.same_as.canonical(o)),
+        other => other.clone(),
+    };
 
-                if !ctx
-                    .derived
-                    .contains(&derived_flake.s, &derived_flake.p, &derived_flake.o)
-                {
-                    ctx.new_delta.push(derived_flake);
-                    ctx.diagnostics.record_rule_fired("prp-spo1");
-                }
-            }
+    for p2 in super_props {
+        // Derive P2(x, y)
+        let derived_flake = Flake::new(
+            canonical_s.clone(),
+            p2.clone(),
+            canonical_o.clone(),
+            flake.dt.clone(),
+            ctx.t,
+            true,
+            None,
+        );
+
+        if !ctx
+            .derived
+            .contains(&derived_flake.s, &derived_flake.p, &derived_flake.o)
+        {
+            ctx.new_delta.push(derived_flake);
+            ctx.diagnostics.record_rule_fired("prp-spo1");
         }
     }
 }
@@ -310,7 +334,7 @@ pub fn apply_property_chain_rule(ontology: &OntologyRL, ctx: &mut RuleContext<'_
 }
 
 /// Apply a single property chain rule.
-fn apply_single_property_chain(chain: &PropertyChain, ctx: &mut RuleContext<'_>) {
+pub(crate) fn apply_single_property_chain(chain: &PropertyChain, ctx: &mut RuleContext<'_>) {
     let chain_len = chain.len();
     if chain_len < 2 {
         return;

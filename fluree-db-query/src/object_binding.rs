@@ -173,6 +173,148 @@ pub(crate) fn late_materialized_object_binding(
     }
 }
 
+/// Convert a decoded binding to the encoded form the late-materialized scan
+/// path emits for the same value (the inverse of
+/// [`late_materialized_object_binding`]).
+///
+/// Equality/hash surfaces (DISTINCT, GROUP BY keys, MINUS, COUNT(DISTINCT))
+/// compare `Binding`s structurally, and `Sid`/`Lit` never equal
+/// `EncodedSid`/`EncodedLit` — so a stream mixing scan output with decoded
+/// producers (VALUES, UNION branches, BIND) silently overcounts or fails to
+/// match. Normalizing the decoded minority to encoded form keeps those
+/// surfaces hashing cheap raw IDs.
+///
+/// Returns `None` when the binding is already encoded or has no encoded
+/// equivalent (value absent from the dictionaries, datatypes the scan keeps
+/// materialized). That is sound: late materialization runs only with an empty
+/// overlay, so a value outside the persisted dictionaries cannot equal any
+/// encoded binding.
+///
+/// The encoded identity fields are `(o_kind, o_key, dt_id, lang_id)` —
+/// `i_val`/`t`/`op` are metadata excluded from `PartialEq`/`Hash`, and `p_id`
+/// only participates for NUM_BIG (which this never produces).
+pub(crate) fn encoded_equivalent(binding: &Binding, store: &BinaryIndexStore) -> Option<Binding> {
+    match binding {
+        Binding::Sid { sid, t, op } => {
+            // Blank nodes stay decoded on the scan path too.
+            if sid.namespace_code == fluree_vocab::namespaces::BLANK_NODE {
+                return None;
+            }
+            let s_id = store
+                .find_subject_id_by_parts(sid.namespace_code, &sid.name)
+                .ok()??;
+            Some(Binding::EncodedSid {
+                s_id,
+                t: *t,
+                op: *op,
+            })
+        }
+        Binding::Iri(iri) | Binding::IriMatch { iri, .. } => {
+            let sid = store.encode_iri(iri.as_ref());
+            let s_id = store
+                .find_subject_id_by_parts(sid.namespace_code, &sid.name)
+                .ok()??;
+            Some(Binding::EncodedSid {
+                s_id,
+                t: None,
+                op: None,
+            })
+        }
+        Binding::Lit {
+            val,
+            dtc,
+            t,
+            op: _,
+            p_id,
+        } => {
+            let (o_kind, o_key, dt_id, lang_id) = match (val, dtc) {
+                (FlakeValue::String(s), DatatypeConstraint::LangTag(tag)) => {
+                    let str_id = store.find_string_id(s).ok()??;
+                    let lang_id = store.find_lang_id(tag)?;
+                    (
+                        ObjKind::LEX_ID.as_u8(),
+                        u64::from(str_id),
+                        DatatypeDictId::LANG_STRING.as_u16(),
+                        lang_id,
+                    )
+                }
+                (FlakeValue::String(s), DatatypeConstraint::Explicit(dt))
+                    if *dt == Sid::xsd_string() =>
+                {
+                    let str_id = store.find_string_id(s).ok()??;
+                    (
+                        ObjKind::LEX_ID.as_u8(),
+                        u64::from(str_id),
+                        DatatypeDictId::STRING.as_u16(),
+                        0,
+                    )
+                }
+                (FlakeValue::Long(v), DatatypeConstraint::Explicit(dt)) => {
+                    let dt_id = if *dt == Sid::xsd_integer() {
+                        DatatypeDictId::INTEGER.as_u16()
+                    } else if dt.namespace_code == fluree_vocab::namespaces::XSD
+                        && dt.name.as_ref() == "long"
+                    {
+                        DatatypeDictId::LONG.as_u16()
+                    } else {
+                        return None;
+                    };
+                    (
+                        ObjKind::NUM_INT.as_u8(),
+                        fluree_db_core::value_id::ObjKey::encode_i64(*v).as_u64(),
+                        dt_id,
+                        0,
+                    )
+                }
+                (FlakeValue::Double(v), DatatypeConstraint::Explicit(dt))
+                    if *dt == Sid::xsd_double() =>
+                {
+                    let key = fluree_db_core::value_id::ObjKey::encode_f64(*v).ok()?;
+                    (
+                        ObjKind::NUM_F64.as_u8(),
+                        key.as_u64(),
+                        DatatypeDictId::DOUBLE.as_u16(),
+                        0,
+                    )
+                }
+                _ => return None,
+            };
+            Some(Binding::EncodedLit {
+                o_kind,
+                o_key,
+                p_id: p_id.unwrap_or(0),
+                dt_id,
+                lang_id,
+                i_val: i32::MIN,
+                t: t.unwrap_or(0),
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Store handle for representation normalization at equality surfaces.
+///
+/// Present only for single-ledger binary execution — the only mode that
+/// emits encoded bindings, and the only mode where one store's dictionaries
+/// are authoritative for every row.
+pub(crate) fn equality_norm_store(
+    ctx: &crate::context::ExecutionContext<'_>,
+) -> Option<Arc<BinaryIndexStore>> {
+    if ctx.is_multi_ledger() {
+        return None;
+    }
+    ctx.binary_store.clone()
+}
+
+/// Normalize one binding for use in an equality/hash key (no-op clone-free
+/// path for already-encoded bindings).
+pub(crate) fn normalize_for_key(binding: &Binding, store: Option<&BinaryIndexStore>) -> Binding {
+    store
+        .and_then(|s| encoded_equivalent(binding, s))
+        .unwrap_or_else(|| binding.clone())
+}
+
 /// Build a materialized object binding for the binary scan path.
 ///
 /// `op` mirrors the meaning in `late_materialized_object_binding`: it is
