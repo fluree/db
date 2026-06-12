@@ -8,7 +8,11 @@ mod support;
 
 use fluree_db_api::FlureeBuilder;
 use serde_json::Value as JsonValue;
-use support::{assert_index_defaults, genesis_ledger, MemoryFluree};
+use std::sync::Arc;
+use support::{
+    assert_index_defaults, genesis_ledger, start_background_indexer_local, trigger_index_and_wait,
+    MemoryFluree,
+};
 
 async fn run_sparql_update(
     fluree: &fluree_db_api::Fluree,
@@ -327,6 +331,78 @@ async fn integer_beyond_i64_round_trips_exactly() {
         .to_sparql_json(&ledger.snapshot)
         .expect("to_sparql_json");
     assert_eq!(binding_values(&sparql_json, "s"), vec!["ex:item"]);
+}
+
+#[tokio::test]
+async fn sum_avg_over_indexed_decimals_is_exact() {
+    // Indexed decimals are arena-backed (NUM_BIG encoded). SUM/AVG must
+    // decode and accumulate them exactly — they previously contributed
+    // nothing to non-streaming aggregates.
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(fluree_db_api::LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "decimal/agg-indexed:main";
+
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        Arc::new(fluree.nameservice_mode().clone()),
+        fluree_db_indexer::IndexerConfig::small(),
+    );
+
+    local
+        .run_until(async move {
+            let ledger = genesis_ledger(&fluree, ledger_id);
+
+            let result = run_sparql_update(
+                &fluree,
+                ledger,
+                r#"
+                PREFIX ex: <http://example.org/>
+                INSERT DATA {
+                    ex:a ex:amount 19.99 .
+                    ex:b ex:amount 0.01 .
+                    ex:c ex:amount 10.00 .
+                }
+                "#,
+            )
+            .await;
+
+            trigger_index_and_wait(&handle, ledger_id, result.receipt.t).await;
+            let ledger = fluree.ledger(ledger_id).await.expect("load ledger");
+
+            let query = r#"
+                PREFIX ex: <http://example.org/>
+                SELECT (SUM(?amount) AS ?total) (AVG(?amount) AS ?mean)
+                WHERE { ?s ex:amount ?amount . }
+            "#;
+            let result = support::query_sparql(&fluree, &ledger, query)
+                .await
+                .expect("aggregate query");
+            let sparql_json = result
+                .to_sparql_json(&ledger.snapshot)
+                .expect("to_sparql_json");
+
+            // BigDecimal addition preserves the max input scale ("30.00").
+            // Compare numerically: any f64 contamination or dropped rows
+            // would surface as a different value entirely (e.g. "0" when
+            // arena-backed rows are skipped).
+            fn as_decimal(s: &str) -> num_bigdecimal::BigDecimal {
+                s.parse().expect("decimal result")
+            }
+            let totals = binding_values(&sparql_json, "total");
+            assert_eq!(
+                as_decimal(&totals[0]),
+                as_decimal("30"),
+                "SUM over indexed decimals must be exact (19.99 + 0.01 + 10.00), got {totals:?}"
+            );
+            let means = binding_values(&sparql_json, "mean");
+            assert_eq!(
+                as_decimal(&means[0]),
+                as_decimal("10"),
+                "AVG over indexed decimals must be exact, got {means:?}"
+            );
+        })
+        .await;
 }
 
 #[tokio::test]

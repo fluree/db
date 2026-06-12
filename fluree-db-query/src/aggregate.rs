@@ -329,6 +329,33 @@ fn apply_aggregate(
             return func.apply(&Binding::Grouped(decoded));
         }
     }
+    // SUM/AVG accumulate inline NUM_INT/NUM_F64 encodings natively, but
+    // arena-backed NUM_BIG (BigInt/BigDecimal) needs the graph view to
+    // decode — without this those rows silently drop from the aggregate.
+    if matches!(func, AggregateFn::Sum(..) | AggregateFn::Avg(..)) && gv.is_some() {
+        if let Binding::Grouped(values) = binding {
+            let is_numbig = |b: &Binding| {
+                matches!(
+                    b,
+                    Binding::EncodedLit { o_kind, .. }
+                        if *o_kind == fluree_db_core::ObjKind::NUM_BIG.as_u8()
+                )
+            };
+            if values.iter().any(is_numbig) {
+                let decoded: Vec<Binding> = values
+                    .iter()
+                    .map(|b| {
+                        if is_numbig(b) {
+                            crate::group_aggregate::materialize_encoded(b, gv)
+                        } else {
+                            b.clone()
+                        }
+                    })
+                    .collect();
+                return func.apply(&Binding::Grouped(decoded));
+            }
+        }
+    }
     func.apply(binding)
 }
 
@@ -782,6 +809,8 @@ fn agg_group_concat(values: &[Binding], separator: &str) -> Binding {
                 FlakeValue::Json(s) => Some(s.clone()), // JSON as string
                 FlakeValue::Long(n) => Some(n.to_string()),
                 FlakeValue::Double(n) => Some(n.to_string()),
+                FlakeValue::Decimal(d) => Some(d.to_string()),
+                FlakeValue::BigInt(n) => Some(n.to_string()),
                 FlakeValue::Boolean(b) => Some(b.to_string()),
                 _ => None,
             },
