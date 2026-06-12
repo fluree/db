@@ -71,18 +71,18 @@ async fn sparql_insert_data_decimal_roundtrip_is_exact() {
     let result = run_sparql_update(
         &fluree,
         ledger,
-        r#"
+        r"
         PREFIX ex: <http://example.org/>
         INSERT DATA { ex:item ex:price 19.99 . }
-        "#,
+        ",
     )
     .await;
     let ledger = result.ledger;
 
-    let query = r#"
+    let query = r"
         PREFIX ex: <http://example.org/>
         SELECT ?price WHERE { ex:item ex:price ?price . }
-    "#;
+    ";
     let result = support::query_sparql(&fluree, &ledger, query)
         .await
         .expect("query");
@@ -113,10 +113,10 @@ async fn sparql_insert_data_high_precision_decimal_survives() {
     .await;
     let ledger = result.ledger;
 
-    let query = r#"
+    let query = r"
         PREFIX ex: <http://example.org/>
         SELECT ?amount WHERE { ex:big ex:amount ?amount . }
-    "#;
+    ";
     let result = support::query_sparql(&fluree, &ledger, query)
         .await
         .expect("query");
@@ -134,22 +134,22 @@ async fn sparql_decimal_constant_matches_stored_decimal() {
     let result = run_sparql_update(
         &fluree,
         ledger,
-        r#"
+        r"
         PREFIX ex: <http://example.org/>
         INSERT DATA {
             ex:a ex:price 19.99 .
             ex:b ex:price 20.00 .
         }
-        "#,
+        ",
     )
     .await;
     let ledger = result.ledger;
 
     // Constant in object position must exactly match the stored decimal.
-    let query = r#"
+    let query = r"
         PREFIX ex: <http://example.org/>
         SELECT ?s WHERE { ?s ex:price 19.99 . }
-    "#;
+    ";
     let result = support::query_sparql(&fluree, &ledger, query)
         .await
         .expect("query");
@@ -159,10 +159,10 @@ async fn sparql_decimal_constant_matches_stored_decimal() {
     assert_eq!(binding_values(&sparql_json, "s"), vec!["ex:a"]);
 
     // FILTER equality with a decimal constant.
-    let query = r#"
+    let query = r"
         PREFIX ex: <http://example.org/>
         SELECT ?s WHERE { ?s ex:price ?p . FILTER(?p = 20.00) }
-    "#;
+    ";
     let result = support::query_sparql(&fluree, &ledger, query)
         .await
         .expect("query");
@@ -190,10 +190,10 @@ async fn jsonld_number_decimal_matches_sparql_constant_across_paths() {
     let ledger = fluree.insert(ledger, &insert).await.expect("insert").ledger;
 
     // SPARQL constant matches the JSON-LD-ingested value.
-    let query = r#"
+    let query = r"
         PREFIX ex: <http://example.org/>
         SELECT ?s WHERE { ?s ex:price 19.99 . }
-    "#;
+    ";
     let result = support::query_sparql(&fluree, &ledger, query)
         .await
         .expect("query");
@@ -206,18 +206,18 @@ async fn jsonld_number_decimal_matches_sparql_constant_across_paths() {
     let result = run_sparql_update(
         &fluree,
         ledger,
-        r#"
+        r"
         PREFIX ex: <http://example.org/>
         DELETE DATA { ex:item ex:price 19.99 . }
-        "#,
+        ",
     )
     .await;
     let ledger = result.ledger;
 
-    let query = r#"
+    let query = r"
         PREFIX ex: <http://example.org/>
         SELECT ?price WHERE { ex:item ex:price ?price . }
-    "#;
+    ";
     let result = support::query_sparql(&fluree, &ledger, query)
         .await
         .expect("query");
@@ -239,7 +239,7 @@ async fn trig_graph_block_decimal_matches_default_graph_decimal() {
     let fluree = memory_fluree();
     let ledger = genesis_ledger(&fluree, "decimal/trig:main");
 
-    let trig = r#"
+    let trig = r"
         @prefix ex: <http://example.org/> .
 
         ex:default ex:price 19.99 .
@@ -247,7 +247,7 @@ async fn trig_graph_block_decimal_matches_default_graph_decimal() {
         GRAPH <http://example.org/g> {
             ex:named ex:price 19.99 .
         }
-    "#;
+    ";
     let result = fluree
         .stage_owned(ledger)
         .upsert_turtle(trig)
@@ -257,10 +257,10 @@ async fn trig_graph_block_decimal_matches_default_graph_decimal() {
     let ledger = result.ledger;
 
     // Default graph value is exact.
-    let query = r#"
+    let query = r"
         PREFIX ex: <http://example.org/>
         SELECT ?price WHERE { ex:default ex:price ?price . }
-    "#;
+    ";
     let result = support::query_sparql(&fluree, &ledger, query)
         .await
         .expect("query default");
@@ -270,10 +270,10 @@ async fn trig_graph_block_decimal_matches_default_graph_decimal() {
     assert_eq!(binding_values(&sparql_json, "price"), vec!["19.99"]);
 
     // Named-graph value is exact and the same value.
-    let query = r#"
+    let query = r"
         PREFIX ex: <http://example.org/>
         SELECT ?price WHERE { GRAPH <http://example.org/g> { ex:named ex:price ?price . } }
-    "#;
+    ";
     let result = support::query_sparql(&fluree, &ledger, query)
         .await
         .expect("query named graph");
@@ -305,10 +305,10 @@ async fn integer_beyond_i64_round_trips_exactly() {
         .expect("upsert turtle");
     let ledger = result.ledger;
 
-    let query = r#"
+    let query = r"
         PREFIX ex: <http://example.org/>
         SELECT ?serial WHERE { ex:item ex:serial ?serial . }
-    "#;
+    ";
     let result = support::query_sparql(&fluree, &ledger, query)
         .await
         .expect("query");
@@ -356,25 +356,25 @@ async fn sum_avg_over_indexed_decimals_is_exact() {
             let result = run_sparql_update(
                 &fluree,
                 ledger,
-                r#"
+                r"
                 PREFIX ex: <http://example.org/>
                 INSERT DATA {
                     ex:a ex:amount 19.99 .
                     ex:b ex:amount 0.01 .
                     ex:c ex:amount 10.00 .
                 }
-                "#,
+                ",
             )
             .await;
 
             trigger_index_and_wait(&handle, ledger_id, result.receipt.t).await;
             let ledger = fluree.ledger(ledger_id).await.expect("load ledger");
 
-            let query = r#"
+            let query = r"
                 PREFIX ex: <http://example.org/>
                 SELECT (SUM(?amount) AS ?total) (AVG(?amount) AS ?mean)
                 WHERE { ?s ex:amount ?amount . }
-            "#;
+            ";
             let result = support::query_sparql(&fluree, &ledger, query)
                 .await
                 .expect("aggregate query");
@@ -429,7 +429,7 @@ async fn count_with_numeric_filter_over_decimal_rows_is_correct() {
             let result = run_sparql_update(
                 &fluree,
                 ledger,
-                r#"
+                r"
                 PREFIX ex: <http://example.org/>
                 INSERT DATA {
                     ex:a ex:amount 5 .
@@ -437,7 +437,7 @@ async fn count_with_numeric_filter_over_decimal_rows_is_correct() {
                     ex:c ex:amount 10.50 .
                     ex:d ex:amount 20.25 .
                 }
-                "#,
+                ",
             )
             .await;
             trigger_index_and_wait(&handle, ledger_id, result.receipt.t).await;
@@ -447,21 +447,21 @@ async fn count_with_numeric_filter_over_decimal_rows_is_correct() {
             let result = run_sparql_update(
                 &fluree,
                 ledger,
-                r#"
+                r"
                 PREFIX ex: <http://example.org/>
                 INSERT DATA { ex:e ex:amount 30.75 . }
-                "#,
+                ",
             )
             .await;
             let ledger = result.ledger;
 
             // Matches: 15, 10.50, 20.25, 30.75 (> 10) — integers and decimals,
             // base and novelty.
-            let query = r#"
+            let query = r"
                 PREFIX ex: <http://example.org/>
                 SELECT (COUNT(?s) AS ?n)
                 WHERE { ?s ex:amount ?o . FILTER(?o > 10) }
-            "#;
+            ";
             let result = support::query_sparql(&fluree, &ledger, query)
                 .await
                 .expect("count query");
@@ -476,11 +476,11 @@ async fn count_with_numeric_filter_over_decimal_rows_is_correct() {
 
             // Decimal threshold over mixed rows: 15, 10.50 excluded? (> 10.6):
             // matches 15, 20.25, 30.75.
-            let query = r#"
+            let query = r"
                 PREFIX ex: <http://example.org/>
                 SELECT (COUNT(?s) AS ?n)
                 WHERE { ?s ex:amount ?o . FILTER(?o > 10.6) }
-            "#;
+            ";
             let result = support::query_sparql(&fluree, &ledger, query)
                 .await
                 .expect("count query decimal threshold");
@@ -504,10 +504,10 @@ async fn sparql_delete_data_decimal_retracts_exactly() {
     let result = run_sparql_update(
         &fluree,
         ledger,
-        r#"
+        r"
         PREFIX ex: <http://example.org/>
         INSERT DATA { ex:item ex:price 19.99 . }
-        "#,
+        ",
     )
     .await;
 
@@ -516,18 +516,18 @@ async fn sparql_delete_data_decimal_retracts_exactly() {
     let result = run_sparql_update(
         &fluree,
         result.ledger,
-        r#"
+        r"
         PREFIX ex: <http://example.org/>
         DELETE DATA { ex:item ex:price 19.99 . }
-        "#,
+        ",
     )
     .await;
     let ledger = result.ledger;
 
-    let query = r#"
+    let query = r"
         PREFIX ex: <http://example.org/>
         SELECT ?price WHERE { ex:item ex:price ?price . }
-    "#;
+    ";
     let result = support::query_sparql(&fluree, &ledger, query)
         .await
         .expect("query");
