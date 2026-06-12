@@ -315,6 +315,10 @@ pub enum BindingValue {
     Long(i64),
     /// Literal floating point
     Double(f64),
+    /// Exact decimal (xsd:decimal — must not round-trip through f64)
+    Decimal(Box<bigdecimal::BigDecimal>),
+    /// Integer beyond i64 (xsd:integer is unbounded)
+    BigInt(Box<num_bigint::BigInt>),
     /// Literal boolean
     Boolean(bool),
 }
@@ -328,6 +332,8 @@ impl BindingValue {
             BindingValue::String(s) => FlakeValue::String(s.clone()),
             BindingValue::Long(n) => FlakeValue::Long(*n),
             BindingValue::Double(d) => FlakeValue::Double(*d),
+            BindingValue::Decimal(d) => FlakeValue::Decimal(d.clone()),
+            BindingValue::BigInt(n) => FlakeValue::BigInt(n.clone()),
             BindingValue::Boolean(b) => FlakeValue::Boolean(*b),
         }
     }
