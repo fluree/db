@@ -284,10 +284,9 @@ fn write_iri_ref(out: &mut String, iri: &str) {
 
 /// Resolve an `EncodedSid`/`EncodedPid` to its full IRI and write it.
 fn write_encoded_ref(out: &mut String, binding: &Binding, gv: &BinaryGraphView) -> Result<()> {
-    let store = gv.store();
     match binding {
         Binding::EncodedSid { s_id, .. } => {
-            let iri = store.resolve_subject_iri(*s_id).map_err(|e| {
+            let iri = gv.resolve_subject_iri(*s_id).map_err(|e| {
                 FormatError::InvalidBinding(format!(
                     "Failed to resolve subject IRI for s_id {s_id}: {e}"
                 ))
@@ -295,7 +294,7 @@ fn write_encoded_ref(out: &mut String, binding: &Binding, gv: &BinaryGraphView) 
             write_iri_ref(out, &iri);
         }
         Binding::EncodedPid { p_id } => {
-            let iri = store.resolve_predicate_iri(*p_id).ok_or_else(|| {
+            let iri = gv.store().resolve_predicate_iri(*p_id).ok_or_else(|| {
                 FormatError::InvalidBinding(format!(
                     "Failed to resolve predicate IRI for p_id {p_id}"
                 ))
