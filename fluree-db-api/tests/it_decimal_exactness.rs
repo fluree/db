@@ -497,6 +497,87 @@ async fn count_with_numeric_filter_over_decimal_rows_is_correct() {
 }
 
 #[tokio::test]
+async fn scale_variant_decimal_retracts_indexed_fact() {
+    // 1.50 and 1.5 are one xsd:decimal value. A retract written with a
+    // different scale than the indexed assert must still hit the same fact
+    // (arena keys normalize, so there is exactly one persisted encoding).
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(fluree_db_api::LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "decimal/scale-retract:main";
+
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        Arc::new(fluree.nameservice_mode().clone()),
+        fluree_db_indexer::IndexerConfig::small(),
+    );
+
+    local
+        .run_until(async move {
+            let ledger = genesis_ledger(&fluree, ledger_id);
+
+            let result = run_sparql_update(
+                &fluree,
+                ledger,
+                r#"
+                PREFIX ex: <http://example.org/>
+                PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+                INSERT DATA { ex:item ex:price "1.50"^^xsd:decimal . }
+                "#,
+            )
+            .await;
+            trigger_index_and_wait(&handle, ledger_id, result.receipt.t).await;
+            let ledger = fluree.ledger(ledger_id).await.expect("load ledger");
+
+            // Constant with a different scale matches the indexed fact.
+            let query = r"
+                PREFIX ex: <http://example.org/>
+                SELECT ?s WHERE { ?s ex:price 1.5 . }
+            ";
+            let result = support::query_sparql(&fluree, &ledger, query)
+                .await
+                .expect("query");
+            let sparql_json = result
+                .to_sparql_json(&ledger.snapshot)
+                .expect("to_sparql_json");
+            assert_eq!(
+                binding_values(&sparql_json, "s"),
+                vec!["ex:item"],
+                "1.5 constant must match indexed 1.50"
+            );
+
+            // Retract with the other scale form removes the fact.
+            let result = run_sparql_update(
+                &fluree,
+                ledger,
+                r"
+                PREFIX ex: <http://example.org/>
+                DELETE DATA { ex:item ex:price 1.5 . }
+                ",
+            )
+            .await;
+            let ledger = result.ledger;
+
+            let query = r"
+                PREFIX ex: <http://example.org/>
+                SELECT ?price WHERE { ex:item ex:price ?price . }
+            ";
+            let result = support::query_sparql(&fluree, &ledger, query)
+                .await
+                .expect("query");
+            let sparql_json = result
+                .to_sparql_json(&ledger.snapshot)
+                .expect("to_sparql_json");
+            assert_eq!(
+                binding_values(&sparql_json, "price"),
+                Vec::<String>::new(),
+                "retract written as 1.5 must remove the fact indexed as 1.50"
+            );
+        })
+        .await;
+}
+
+#[tokio::test]
 async fn sparql_delete_data_decimal_retracts_exactly() {
     let fluree = memory_fluree();
     let ledger = genesis_ledger(&fluree, "decimal/delete:main");
