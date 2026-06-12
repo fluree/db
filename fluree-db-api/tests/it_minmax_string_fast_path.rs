@@ -262,6 +262,95 @@ async fn incremental_index_min_max_is_value_ordered() {
         .await;
 }
 
+/// MIN/MAX grouped alongside a non-streamable aggregate (GROUP_CONCAT) route
+/// to the traditional GroupBy+Aggregate path, whose comparator ordered encoded
+/// bindings by raw dictionary ID — insertion order, not value order. With
+/// values inserted in reverse lex order this returned min="zebra"/max="apple"
+/// for strings and min=ex:zzz/max=ex:aaa for IRIs.
+#[tokio::test]
+async fn min_max_value_ordered_alongside_group_concat() {
+    use fluree_db_api::{IndexConfig, LedgerManagerConfig};
+    use fluree_db_transact::{CommitOpts, TxnOpts};
+    use serde_json::json;
+    use std::sync::Arc;
+
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "it/minmax-traditional-groupby:main";
+
+    let (local, handle) = support::start_background_indexer_local(
+        fluree.backend().clone(),
+        Arc::new(fluree.nameservice_mode().clone()),
+        fluree_db_indexer::IndexerConfig::small(),
+    );
+
+    local
+        .run_until(async move {
+            let index_cfg = IndexConfig {
+                reindex_min_bytes: 0,
+                reindex_max_bytes: 10_000_000,
+            };
+            let ledger = support::genesis_ledger_for_fluree(&fluree, ledger_id);
+            // Reverse lex order: zebra/zzz get LOWER dictionary ids.
+            let first = json!({
+                "@context": { "ex": "http://example.org/ns/" },
+                "@graph": [
+                    {"@id": "ex:s", "ex:word": "zebra", "ex:link": {"@id": "ex:zzz"}}
+                ]
+            });
+            let result = fluree
+                .insert_with_opts(
+                    ledger,
+                    &first,
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg,
+                )
+                .await
+                .expect("first insert");
+            let second = json!({
+                "@context": { "ex": "http://example.org/ns/" },
+                "@graph": [
+                    {"@id": "ex:s", "ex:word": "apple", "ex:link": {"@id": "ex:aaa"}}
+                ]
+            });
+            let result = fluree
+                .insert_with_opts(
+                    result.ledger,
+                    &second,
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg,
+                )
+                .await
+                .expect("second insert");
+            support::trigger_index_and_wait_outcome(&handle, ledger_id, result.ledger.t()).await;
+            let ledger = fluree.ledger(ledger_id).await.expect("ledger state");
+
+            for (pred, expect_min, expect_max) in [
+                ("ex:word", json!("apple"), json!("zebra")),
+                ("ex:link", json!("ex:aaa"), json!("ex:zzz")),
+            ] {
+                let q = format!(
+                    r#"PREFIX ex: <http://example.org/ns/>
+                       SELECT ?s (MIN(?o) AS ?min) (MAX(?o) AS ?max)
+                              (GROUP_CONCAT(?o; SEPARATOR=",") AS ?cat)
+                       WHERE {{ ?s {pred} ?o }} GROUP BY ?s"#
+                );
+                let r = support::query_sparql(&fluree, &ledger, &q)
+                    .await
+                    .expect("query")
+                    .to_sparql_json(&ledger.snapshot)
+                    .expect("json");
+                let b = &r["results"]["bindings"][0];
+                assert_eq!(b["min"]["value"], expect_min, "{pred} MIN");
+                assert_eq!(b["max"]["value"], expect_max, "{pred} MAX");
+            }
+        })
+        .await;
+}
+
 /// Commits above the index head (novelty) must be reflected: `to_t > max_t`
 /// fails the fast-path gates, so MIN/MAX, COUNT(DISTINCT), and the string
 /// folds all fall back to the overlay-aware pipeline.

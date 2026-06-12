@@ -294,11 +294,15 @@ impl Operator for AggregateOperator {
     }
 }
 
-/// Apply an aggregate, first materializing encoded bindings for the
-/// value-folding variants whose matchers in this module silently drop them
-/// (GROUP_CONCAT returned Unbound for every indexed-ledger string).
-/// Comparison/count variants and the numeric accumulator handle encoded
-/// bindings natively, so they skip the decode.
+/// Apply an aggregate, first materializing encoded bindings for the variants
+/// that need decoded values:
+/// - GROUP_CONCAT/MEDIAN/VARIANCE/STDDEV matchers silently drop encoded
+///   bindings (GROUP_CONCAT returned Unbound for every indexed-ledger string)
+/// - MIN/MAX compare via `compare_bindings`, which orders encoded bindings by
+///   raw dictionary ID — not value order (`min="zebra"`, `max="apple"`)
+///
+/// Count variants and the numeric accumulator handle encoded bindings
+/// natively, so they skip the decode.
 fn apply_aggregate(
     func: &AggregateFn,
     binding: &Binding,
@@ -310,6 +314,8 @@ fn apply_aggregate(
             | AggregateFn::Median { .. }
             | AggregateFn::Variance { .. }
             | AggregateFn::Stddev { .. }
+            | AggregateFn::Min(_)
+            | AggregateFn::Max(_)
     );
     if needs_decoded_values && gv.is_some() {
         if let Binding::Grouped(values) = binding {
