@@ -30,6 +30,35 @@ use axum::{
 use std::sync::Arc;
 use tower_http::cors::{Any, CorsLayer};
 
+/// Apply the Raft follower-forward middleware to a leader-only
+/// subrouter when the server was constructed with a Raft handle.
+/// Single-node and peer-mode deployments pass through unchanged.
+///
+/// Generic over the router's state type so it composes both before
+/// and after a downstream `.with_state(...)` call.
+#[cfg(feature = "raft")]
+fn apply_leader_forward<S>(router: Router<S>, state: &Arc<AppState>) -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    if let Some(integration) = &state.raft {
+        router.layer(middleware::from_fn_with_state(
+            Arc::clone(&integration.forwarder),
+            fluree_db_consensus::raft::forward::forward_to_leader,
+        ))
+    } else {
+        router
+    }
+}
+
+#[cfg(not(feature = "raft"))]
+fn apply_leader_forward<S>(router: Router<S>, _state: &Arc<AppState>) -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    router
+}
+
 /// Build the main application router
 pub fn build_router(state: Arc<AppState>) -> Router {
     // v1 API (versioned base path).
@@ -56,12 +85,47 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     let v1_admin_protected_routes =
         v1_admin_protected_routes.route("/iceberg/map", post(iceberg::iceberg_map));
 
+    // Forward to the Raft leader (when running in Raft mode) before
+    // admin-token auth: an out-of-date follower with stale credentials
+    // shouldn't reject a request the leader would accept.
+    let v1_admin_protected_routes = apply_leader_forward(v1_admin_protected_routes, &state);
+
     let v1_admin_protected_routes = v1_admin_protected_routes
         .layer(middleware::from_fn_with_state(
             state.clone(),
             admin_auth::require_admin_token,
         ))
         .with_state(state.clone());
+
+    // Leader-only writes outside the admin-token bracket: transactions,
+    // precomputed-commit push, and nameservice ref advances. Under
+    // Raft these all propose state-machine commands and must run on
+    // the current leader; followers transparently HTTP-forward via
+    // the layer below.
+    let v1_leader_only_routes = Router::new()
+        // Transaction endpoints
+        .route("/update", post(transact::update))
+        .route("/update/*ledger", post(transact::update_ledger_tail))
+        .route("/insert", post(transact::insert))
+        .route("/insert/*ledger", post(transact::insert_ledger_tail))
+        .route("/upsert", post(transact::upsert))
+        .route("/upsert/*ledger", post(transact::upsert_ledger_tail))
+        // Commit-push endpoint (precomputed commits)
+        .route("/push/*ledger", post(push::push_ledger_tail))
+        // Nameservice ref endpoints (for remote sync)
+        .route(
+            "/nameservice/refs/:alias/commit",
+            post(nameservice_refs::push_commit_head),
+        )
+        .route(
+            "/nameservice/refs/:alias/index",
+            post(nameservice_refs::push_index_head),
+        )
+        .route(
+            "/nameservice/refs/:alias/init",
+            post(nameservice_refs::init_ledger),
+        );
+    let v1_leader_only_routes = apply_leader_forward(v1_leader_only_routes, &state);
 
     let v1 = Router::new()
         // Admin endpoints (stats and whoami are read-only, no auth required)
@@ -76,6 +140,8 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/revert-preview/*ledger", get(ledger::revert_preview))
         // Merge admin-protected routes
         .merge(v1_admin_protected_routes)
+        // Merge leader-only routes (Raft-forwarded when applicable)
+        .merge(v1_leader_only_routes)
         // Query endpoints
         .route("/query", get(query::query).post(query::query))
         .route(
@@ -87,13 +153,6 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/explain/*ledger",
             get(query::explain_ledger_tail).post(query::explain_ledger_tail),
         )
-        // Transaction endpoints
-        .route("/update", post(transact::update))
-        .route("/update/*ledger", post(transact::update_ledger_tail))
-        .route("/insert", post(transact::insert))
-        .route("/insert/*ledger", post(transact::insert_ledger_tail))
-        .route("/upsert", post(transact::upsert))
-        .route("/upsert/*ledger", post(transact::upsert_ledger_tail))
         // Submission status lookup (by idempotency key)
         .route(
             "/submissions/:key/*ledger",
@@ -104,8 +163,6 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/context/*ledger",
             get(context::get_context).put(context::set_context),
         )
-        // Commit-push endpoint (precomputed commits)
-        .route("/push/*ledger", post(push::push_ledger_tail))
         // Commit show endpoint (decoded commit with resolved IRIs)
         .route("/show/*ledger", get(show::show_ledger_tail))
         // Commit log endpoint (lightweight per-commit summaries)
@@ -122,19 +179,6 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route(
             "/storage/objects/:cid",
             get(storage_proxy::get_object_by_cid),
-        )
-        // Nameservice ref endpoints (for remote sync)
-        .route(
-            "/nameservice/refs/:alias/commit",
-            post(nameservice_refs::push_commit_head),
-        )
-        .route(
-            "/nameservice/refs/:alias/index",
-            post(nameservice_refs::push_index_head),
-        )
-        .route(
-            "/nameservice/refs/:alias/init",
-            post(nameservice_refs::init_ledger),
         )
         .route("/nameservice/snapshot", get(nameservice_refs::snapshot))
         // Stub endpoints (not yet implemented)

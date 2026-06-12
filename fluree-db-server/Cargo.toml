@@ -44,6 +44,10 @@ otel = [
     "dep:opentelemetry-otlp",
     "dep:opentelemetry_sdk",
 ]
+# Replicate writes through a Raft cluster. Mounts the follower-forward
+# middleware on leader-only routes and exposes the inter-node RPC +
+# cluster-admin routers on a separate private listener.
+raft = ["fluree-db-consensus/raft"]
 
 [dependencies]
 # Fluree DB crates

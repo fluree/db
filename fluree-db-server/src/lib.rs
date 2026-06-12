@@ -33,6 +33,8 @@ pub mod extract;
 pub mod jwks;
 pub mod mcp;
 pub mod peer;
+#[cfg(feature = "raft")]
+pub mod raft;
 pub mod registry;
 pub mod routes;
 pub mod serde;

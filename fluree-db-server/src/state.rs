@@ -65,6 +65,14 @@ pub struct AppState {
     /// HTTP client for transaction forwarding (peer mode only)
     pub forwarding_client: Option<Arc<ForwardingClient>>,
 
+    // === Raft mode state ===
+    /// Raft consensus integration. `Some` when the server was
+    /// constructed with a Raft handle; routes that accept writes get
+    /// the follower-forward middleware. `None` for single-node and
+    /// peer-mode deployments.
+    #[cfg(feature = "raft")]
+    pub raft: Option<Arc<crate::raft::RaftIntegration>>,
+
     /// Counter for ledger refreshes (for testing/metrics)
     /// Incremented when a ledger is actually reloaded (not for coalesced requests)
     pub refresh_counter: AtomicU64,
@@ -193,6 +201,8 @@ impl AppState {
             jwks_cache,
             peer_state,
             forwarding_client,
+            #[cfg(feature = "raft")]
+            raft: None,
             refresh_counter: AtomicU64::new(0),
             cache_stats_handle: Some(cache_stats_handle),
         })

@@ -30,7 +30,13 @@ pub mod raft;
 pub use caching::{CachingCommitter, DEFAULT_IDEMPOTENCY_TTL};
 pub use local::LocalCommitter;
 #[cfg(feature = "raft")]
-pub use raft::{Command, NodeId, RaftCommitter, Response, TypeConfig};
+pub use raft::{ClusterNode, Command, NodeId, RaftCommitter, Response, TypeConfig};
+
+/// Re-export of `openraft::Raft` so consumers of `fluree-db-server`
+/// (and similar embedders) can construct the integration without a
+/// direct openraft dependency.
+#[cfg(feature = "raft")]
+pub use openraft::Raft;
 
 use async_trait::async_trait;
 use fluree_db_api::{
