@@ -20,7 +20,7 @@ use crate::peer::{ForwardingClient, PeerState, ProxyNameService, ProxyStorage};
 use crate::registry::LedgerRegistry;
 use crate::telemetry::TelemetryConfig;
 use fluree_db_api::{Fluree, FlureeBuilder, IndexConfig, NameServiceMode};
-use fluree_db_consensus::CachingCommitter;
+use fluree_db_consensus::{CachingCommitter, SubmittingCommitter};
 use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
@@ -45,10 +45,13 @@ pub struct AppState {
     /// Optional index configuration
     pub index_config: Option<IndexConfig>,
 
-    /// Transaction submission interface. Always present; only meaningful
-    /// when this node accepts writes (peer-mode nodes forward writes
-    /// elsewhere).
-    pub committer: Arc<CachingCommitter>,
+    /// Transaction submission interface. Always present; only
+    /// meaningful when this node accepts writes (peer-mode nodes
+    /// forward writes elsewhere). The concrete committer behind the
+    /// trait object is selected at server construction time —
+    /// `CachingCommitter` over `LocalCommitter` for single-node /
+    /// peer mode, or over `RaftCommitter` for Raft mode.
+    pub committer: Arc<dyn SubmittingCommitter>,
 
     /// Ledger registry for tracking loaded ledgers and their watermarks
     pub registry: Arc<LedgerRegistry>,
@@ -184,7 +187,7 @@ impl AppState {
                 .unwrap_or_else(fluree_db_api::server_defaults::default_reindex_max_bytes),
         };
 
-        let committer = Arc::new(CachingCommitter::new(
+        let committer: Arc<dyn SubmittingCommitter> = Arc::new(CachingCommitter::new(
             Arc::clone(&fluree),
             index_config.clone(),
         ));

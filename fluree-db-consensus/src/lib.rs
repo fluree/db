@@ -29,6 +29,10 @@ pub mod raft;
 
 pub use caching::{CachingCommitter, DEFAULT_IDEMPOTENCY_TTL};
 pub use local::LocalCommitter;
+
+// Trait re-exports for embedders that hold a type-erased committer.
+// `SubmittingCommitter` is the combined surface AppState typically
+// holds; `Committer` and `SubmissionLookup` are the constituents.
 #[cfg(feature = "raft")]
 pub use raft::{ClusterNode, Command, NodeId, RaftCommitter, Response, TypeConfig};
 
@@ -462,3 +466,15 @@ pub trait Committer: Send + Sync {
 pub trait SubmissionLookup: Send + Sync {
     async fn status(&self, ledger_id: &str, key: &IdempotencyKey) -> SubmissionState;
 }
+
+/// Combined committer + lookup trait. Lets callers (notably
+/// `fluree-db-server::AppState`) hold a single
+/// `Arc<dyn SubmittingCommitter>` whose concrete type can swap
+/// between [`LocalCommitter`]-backed and [`RaftCommitter`]-backed
+/// flavours at server-construction time.
+///
+/// Blanket-implemented for every type that already implements both
+/// parent traits, so no manual impl is needed on
+/// [`CachingCommitter`] / [`LocalCommitter`] / [`RaftCommitter`].
+pub trait SubmittingCommitter: Committer + SubmissionLookup {}
+impl<T> SubmittingCommitter for T where T: Committer + SubmissionLookup + ?Sized {}

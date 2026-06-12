@@ -38,8 +38,7 @@ use fluree_db_api::{
     TxnType,
 };
 use fluree_db_consensus::{
-    Committer, IdempotencyKey, SubmissionError, TransactionBody, TransactionReceipt,
-    TransactionRequest,
+    IdempotencyKey, SubmissionError, TransactionBody, TransactionReceipt, TransactionRequest,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;

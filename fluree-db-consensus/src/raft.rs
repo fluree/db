@@ -63,7 +63,7 @@ use fluree_db_api::{
     ConflictStrategy, Fluree, GuardedStagedCommit, PushCommitsRequest, StagedMerge, StagedPush,
     StagedRebase, StagedRevert,
 };
-use fluree_db_core::{CommitId, ContentId, ContentStore};
+use fluree_db_core::{CommitId, ContentId};
 use fluree_db_ledger::IndexConfig;
 use openraft::Raft;
 use serde::{Deserialize, Serialize};
@@ -140,24 +140,23 @@ openraft::declare_raft_types!(
 pub struct RaftCommitter {
     raft: Arc<Raft<TypeConfig>>,
     fluree: Arc<Fluree>,
-    content_store: Arc<dyn ContentStore>,
     index_config: IndexConfig,
 }
 
 impl RaftCommitter {
     /// Construct from the openraft handle, the Fluree instance whose
-    /// state we drive, the shared content store all replicas read
-    /// from, and the index-thresholds config used during staging.
+    /// state we drive, and the index-thresholds config used during
+    /// staging. The content store for each commit-blob write is
+    /// resolved per-request via [`Fluree::content_store`] so writes
+    /// land in the right per-ledger namespace.
     pub fn new(
         raft: Arc<Raft<TypeConfig>>,
         fluree: Arc<Fluree>,
-        content_store: Arc<dyn ContentStore>,
         index_config: IndexConfig,
     ) -> Self {
         Self {
             raft,
             fluree,
-            content_store,
             index_config,
         }
     }
@@ -252,8 +251,9 @@ impl Committer for RaftCommitter {
             .as_ref()
             .and_then(|r| r.id.clone());
 
-        // 6. Write the commit blob to the shared content store.
-        self.content_store
+        // 6. Write the commit blob to the per-ledger content store.
+        let content_store = self.fluree.content_store(&ledger_id);
+        content_store
             .put_with_id(&commit_cid, &staged_commit.commit_bytes)
             .await
             .map_err(|e| SubmissionError::Execution {
@@ -263,7 +263,7 @@ impl Committer for RaftCommitter {
 
         // 7. Write referenced blobs (v1: empty).
         for (cid, bytes) in &staged_commit.referenced_bytes {
-            self.content_store
+            content_store
                 .put_with_id(cid, bytes)
                 .await
                 .map_err(|e| SubmissionError::Execution {
@@ -426,8 +426,9 @@ impl Committer for RaftCommitter {
             .as_ref()
             .and_then(|r| r.id.clone());
 
-        // 4. Write the commit blob to the shared content store.
-        self.content_store
+        // 4. Write the commit blob to the per-ledger content store.
+        let content_store = self.fluree.content_store(&branch_id);
+        content_store
             .put_with_id(&commit_cid, &staged_commit.commit_bytes)
             .await
             .map_err(|e| SubmissionError::Execution {
@@ -437,7 +438,7 @@ impl Committer for RaftCommitter {
 
         // 5. Write any referenced blobs (v1: empty).
         for (cid, bytes) in &staged_commit.referenced_bytes {
-            self.content_store
+            content_store
                 .put_with_id(cid, bytes)
                 .await
                 .map_err(|e| SubmissionError::Execution {
@@ -586,7 +587,8 @@ impl Committer for RaftCommitter {
                     .id
                     .clone()
                     .expect("build_merge_general guarantees commit.id is set");
-                self.content_store
+                let content_store = self.fluree.content_store(&target_id);
+                content_store
                     .put_with_id(&commit_cid, &staged.commit_bytes)
                     .await
                     .map_err(|e| SubmissionError::Execution {
@@ -594,7 +596,7 @@ impl Committer for RaftCommitter {
                         message: format!("merge commit blob write failed: {e}"),
                     })?;
                 for (cid, bytes) in &staged.referenced_bytes {
-                    self.content_store
+                    content_store
                         .put_with_id(cid, bytes)
                         .await
                         .map_err(|e| SubmissionError::Execution {
@@ -761,13 +763,14 @@ impl Committer for RaftCommitter {
             });
         };
 
-        // 3. Write all built replay blobs to the shared content
+        // 3. Write all built replay blobs to the per-ledger content
         //    store. Fast-forward has no `pending_replays` (source's
         //    commits are already in their namespace and addressable
         //    through the branched store fallback); only general
         //    rebase writes blobs here.
+        let content_store = self.fluree.content_store(&branch_id);
         for replay in &pending_replays {
-            self.content_store
+            content_store
                 .put_with_id(&replay.commit_id, &replay.commit_bytes)
                 .await
                 .map_err(|e| SubmissionError::Execution {

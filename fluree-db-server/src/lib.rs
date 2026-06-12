@@ -384,6 +384,24 @@ impl FlureeServerBuilder {
 
         #[cfg(feature = "raft")]
         let raft_listener = self.raft.map(|(integration, listen_addr)| {
+            // Swap the local-only committer for one that proposes
+            // through Raft. Leader-side `transact` / `revert` /
+            // `merge` / `rebase` / `push` now stage locally, write
+            // commit blobs to the content store, then propose
+            // `AdvanceRef` through the log. The `CachingCommitter`
+            // wrap stays on top so keyed retries dedupe before the
+            // Raft pipeline.
+            let raft_committer = fluree_db_consensus::RaftCommitter::new(
+                Arc::clone(&integration.raft),
+                Arc::clone(&state_inner.fluree),
+                state_inner
+                    .index_config
+                    .clone()
+                    .expect("index_config set by AppState::new"),
+            );
+            state_inner.committer = Arc::new(
+                fluree_db_consensus::CachingCommitter::wrapping(raft_committer),
+            );
             state_inner.raft = Some(Arc::clone(&integration));
             RaftListener {
                 private_router: integration.private_router(),

@@ -12,7 +12,7 @@ use axum::{
 };
 use fluree_db_consensus::{
     IdempotencyKey, MergeReceipt, OperationReceipt, PushReceipt, RebaseReceipt, RevertReceipt,
-    SubmissionLookup, SubmissionState, TransactionReceipt,
+    SubmissionState, TransactionReceipt,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
