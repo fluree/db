@@ -26,13 +26,19 @@
 //! - [`fixtures`] — vendored / fetched fixture loaders.
 //! - [`budget`] — regression-budget loader and validator.
 //! - [`report`] — opt-in human-readable end-of-run summary tables.
+//! - [`baseline`] — labeled baseline capture/compare (backs the
+//!   `bench-baseline` bin; see BENCHMARKING.md "Baselines").
+//! - [`mem`] — per-scenario memory-metric sidecars (pairs with the
+//!   `fluree-bench-alloc` tracking allocator).
 
 #![forbid(unsafe_code)]
 
+pub mod baseline;
 pub mod budget;
 pub mod fixtures;
 pub mod gen;
 pub mod ledger;
+pub mod mem;
 pub mod report;
 pub mod runtime;
 pub mod tracing;

@@ -1,0 +1,19 @@
+[package]
+name = "fluree-bench-alloc"
+description = "Tracking global allocator for Fluree DB benchmarks: per-scenario peak / net allocation metrics with two relaxed atomics of overhead per alloc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# This crate exists separately from fluree-bench-support so that crate can
+# keep `#![forbid(unsafe_code)]`: implementing `GlobalAlloc` requires one
+# well-understood `unsafe impl`, which is quarantined here. Benches that
+# want memory metrics depend on this crate directly and install the
+# allocator in their own binary; nothing in the production dependency
+# graph references it.
+
+[dependencies]
+
+[lints]
+workspace = true
