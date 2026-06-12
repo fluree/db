@@ -163,10 +163,12 @@ fn minmax_string_dict_post(
     let mut best: Option<(EncodedStringIdentity, Binding)> = None;
 
     for leaf_entry in leaves {
-        let handle = store
-            .open_leaf_handle(&leaf_entry.leaf_cid, leaf_entry.sidecar_cid.as_ref(), false)
-            .map_err(|e| QueryError::Internal(format!("leaf open: {e}")))?;
-        let dir = handle.dir();
+        // Directory-only prefix read (cached); the full leaf blob is opened
+        // lazily and only for o_type-heterogeneous leaflets.
+        let dir = store
+            .open_leaf_dir(&leaf_entry.leaf_cid)
+            .map_err(|e| QueryError::Internal(format!("leaf dir open: {e}")))?;
+        let mut handle = None;
 
         for (leaflet_idx, entry) in dir.entries.iter().enumerate() {
             if entry.row_count == 0 || entry.p_const != Some(p_id) {
@@ -181,7 +183,20 @@ fn minmax_string_dict_post(
                     return Ok(None);
                 }
             } else {
+                if handle.is_none() {
+                    handle = Some(
+                        store
+                            .open_leaf_handle(
+                                &leaf_entry.leaf_cid,
+                                leaf_entry.sidecar_cid.as_ref(),
+                                false,
+                            )
+                            .map_err(|e| QueryError::Internal(format!("leaf open: {e}")))?,
+                    );
+                }
                 let batch = handle
+                    .as_ref()
+                    .expect("handle opened above")
                     .load_columns(leaflet_idx, &projection_otype_okey(), RunSortOrder::Post)
                     .map_err(|e| QueryError::Internal(format!("load columns: {e}")))?;
                 for row in 0..batch.row_count {
@@ -247,10 +262,10 @@ fn minmax_numeric_post(
     let mut best: Option<(u16, u64)> = None;
 
     for leaf_entry in leaves {
-        let handle = store
-            .open_leaf_handle(&leaf_entry.leaf_cid, leaf_entry.sidecar_cid.as_ref(), false)
-            .map_err(|e| QueryError::Internal(format!("leaf open: {e}")))?;
-        let dir = handle.dir();
+        // Directory-only prefix read (cached); this path never loads columns.
+        let dir = store
+            .open_leaf_dir(&leaf_entry.leaf_cid)
+            .map_err(|e| QueryError::Internal(format!("leaf dir open: {e}")))?;
 
         for entry in &dir.entries {
             if entry.row_count == 0 || entry.p_const != Some(p_id) {
