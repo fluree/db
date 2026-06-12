@@ -8,8 +8,8 @@
 /// Current resident set size of this process in bytes, best-effort.
 ///
 /// Linux reads `/proc/self/statm` (resident pages × page size) for the *live*
-/// RSS. On other platforms it falls back to `getrusage` peak RSS (a high-water
-/// mark, not the current value). Returns 0 if it cannot be determined.
+/// RSS. Other unix platforms fall back to `getrusage` peak RSS (a high-water
+/// mark, not the current value). Non-unix (Windows) and any failure return 0.
 pub fn current_rss_bytes() -> u64 {
     #[cfg(target_os = "linux")]
     {
@@ -26,7 +26,7 @@ pub fn current_rss_bytes() -> u64 {
         }
         0
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(all(unix, not(target_os = "linux")))]
     {
         let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
         if unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) } == 0 {
@@ -38,6 +38,10 @@ pub fn current_rss_bytes() -> u64 {
                 maxrss.saturating_mul(1024)
             };
         }
+        0
+    }
+    #[cfg(not(unix))]
+    {
         0
     }
 }
