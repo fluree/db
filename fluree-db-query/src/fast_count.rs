@@ -622,24 +622,46 @@ fn count_numeric_compare_overlay_parallel(
 ) -> Result<Option<u64>> {
     let tk_int = encode_numeric_threshold_for_otype(OType::XSD_INTEGER, threshold)?;
     let tk_dbl = encode_numeric_threshold_for_otype(OType::XSD_DOUBLE, threshold)?;
-    parallel_overlay_psot_filter_count(
+    // Numeric o_types this lane can't compare by o_key (other integer-family
+    // widths, floats, decimals — arena-keyed NUM_BIG has no value order at
+    // all) must defer the whole count: treating them as non-matches would
+    // silently undercount. Mirrors the base lane's per-leaflet Ok(None) bail.
+    let saw_unsupported_numeric = std::sync::atomic::AtomicBool::new(false);
+    let count = parallel_overlay_psot_filter_count(
         ctx,
         store,
         g_id,
         pred_sid,
         p_id,
-        move |_s, o_type, o_key| {
-            let tk = match OType::from_u16(o_type) {
+        |_s, o_type, o_key| {
+            let ot = OType::from_u16(o_type);
+            let tk = match ot {
                 OType::XSD_INTEGER => tk_int,
                 OType::XSD_DOUBLE => tk_dbl,
-                _ => return false, // non-numeric object: comparison errors => not a match
+                _ if ot.is_numeric() || ot == OType::NUM_BIG_OVERFLOW => {
+                    saw_unsupported_numeric.store(true, std::sync::atomic::Ordering::Relaxed);
+                    return false;
+                }
+                // Genuinely non-numeric object: comparison errors => not a match
+                _ => return false,
             };
             match tk {
                 Some(tk) => okey_matches(compare, o_key, tk),
-                None => false,
+                None => {
+                    // Threshold not encodable for this row's o_type (e.g. a
+                    // decimal threshold against integer rows): the comparison
+                    // is still numerically valid, so defer rather than
+                    // undercount — mirrors the base lane.
+                    saw_unsupported_numeric.store(true, std::sync::atomic::Ordering::Relaxed);
+                    false
+                }
             }
         },
-    )
+    )?;
+    if saw_unsupported_numeric.load(std::sync::atomic::Ordering::Relaxed) {
+        return Ok(None);
+    }
+    Ok(count)
 }
 
 /// Fast-path: parallel `COUNT(?s)` / `COUNT(*)` for a single predicate `?s <p> ?o`

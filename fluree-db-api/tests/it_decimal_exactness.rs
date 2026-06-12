@@ -406,6 +406,97 @@ async fn sum_avg_over_indexed_decimals_is_exact() {
 }
 
 #[tokio::test]
+async fn count_with_numeric_filter_over_decimal_rows_is_correct() {
+    // The numeric-compare COUNT fast path can't compare arena-keyed decimals
+    // by encoded key; it must defer to the general pipeline rather than
+    // count decimal rows as non-matches.
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(fluree_db_api::LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "decimal/count-filter:main";
+
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        Arc::new(fluree.nameservice_mode().clone()),
+        fluree_db_indexer::IndexerConfig::small(),
+    );
+
+    local
+        .run_until(async move {
+            let ledger = genesis_ledger(&fluree, ledger_id);
+
+            // Index a mix of integer and decimal rows.
+            let result = run_sparql_update(
+                &fluree,
+                ledger,
+                r#"
+                PREFIX ex: <http://example.org/>
+                INSERT DATA {
+                    ex:a ex:amount 5 .
+                    ex:b ex:amount 15 .
+                    ex:c ex:amount 10.50 .
+                    ex:d ex:amount 20.25 .
+                }
+                "#,
+            )
+            .await;
+            trigger_index_and_wait(&handle, ledger_id, result.receipt.t).await;
+            let ledger = fluree.ledger(ledger_id).await.expect("load ledger");
+
+            // Add decimal novelty on top of the indexed base (overlay lane).
+            let result = run_sparql_update(
+                &fluree,
+                ledger,
+                r#"
+                PREFIX ex: <http://example.org/>
+                INSERT DATA { ex:e ex:amount 30.75 . }
+                "#,
+            )
+            .await;
+            let ledger = result.ledger;
+
+            // Matches: 15, 10.50, 20.25, 30.75 (> 10) — integers and decimals,
+            // base and novelty.
+            let query = r#"
+                PREFIX ex: <http://example.org/>
+                SELECT (COUNT(?s) AS ?n)
+                WHERE { ?s ex:amount ?o . FILTER(?o > 10) }
+            "#;
+            let result = support::query_sparql(&fluree, &ledger, query)
+                .await
+                .expect("count query");
+            let sparql_json = result
+                .to_sparql_json(&ledger.snapshot)
+                .expect("to_sparql_json");
+            assert_eq!(
+                binding_values(&sparql_json, "n"),
+                vec!["4"],
+                "COUNT must include decimal rows matching the numeric filter"
+            );
+
+            // Decimal threshold over mixed rows: 15, 10.50 excluded? (> 10.6):
+            // matches 15, 20.25, 30.75.
+            let query = r#"
+                PREFIX ex: <http://example.org/>
+                SELECT (COUNT(?s) AS ?n)
+                WHERE { ?s ex:amount ?o . FILTER(?o > 10.6) }
+            "#;
+            let result = support::query_sparql(&fluree, &ledger, query)
+                .await
+                .expect("count query decimal threshold");
+            let sparql_json = result
+                .to_sparql_json(&ledger.snapshot)
+                .expect("to_sparql_json");
+            assert_eq!(
+                binding_values(&sparql_json, "n"),
+                vec!["3"],
+                "decimal threshold must compare numerically against all rows"
+            );
+        })
+        .await;
+}
+
+#[tokio::test]
 async fn sparql_delete_data_decimal_retracts_exactly() {
     let fluree = memory_fluree();
     let ledger = genesis_ledger(&fluree, "decimal/delete:main");
