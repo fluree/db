@@ -1307,6 +1307,22 @@ mem:fact-01kj8k5nzpe59p5vp7zrehbrr9 a mem:Fact ;
     mem:branch "feature/memory" ;
     mem:createdAt "2026-02-24T19:49:14.358637+00:00"^^xsd:dateTime .
 
+mem:constraint-01ktwn58n7jgsxdax2rsxv7rg2 a mem:Constraint ;
+    mem:content "Bench memory gating must use scenario_peak_bytes (peak minus live-bytes-at-reset), not absolute peak_bytes: absolute peak measures from process zero and inherits ambient heap shifts that a recompile moves uniformly (~+1.6MiB observed across ALL scenarios including untouched code paths), while same-binary variance is ±0.04%. bench-baseline compare prefers scenario_mem when both sides carry it. Also: StatsView/IndexStats property counts are planner estimates (count dup re-asserts, rdf:type tracked asymmetrically between indexer and novelty accumulation) — never answer user queries from them." ;
+    mem:tag "benchmarking" ;
+    mem:tag "gotcha" ;
+    mem:tag "guardrails" ;
+    mem:tag "memory-metrics" ;
+    mem:tag "stats" ;
+    mem:scope mem:repo ;
+    mem:severity "must" ;
+    mem:artifactRef "fluree-bench-alloc/src/lib.rs" ;
+    mem:artifactRef "fluree-bench-support/src/baseline.rs" ;
+    mem:artifactRef "fluree-db-query/src/stats_query.rs" ;
+    mem:branch "fix/fastpath-divergences" ;
+    mem:createdAt "2026-06-12T00:54:21.095112+00:00"^^xsd:dateTime ;
+    mem:rationale "Both learned by dogfooding the Phase 0.0 gate on PR #1314: the gate fired 9 false-positive peak_mem breaches that classification traced to ambient heap shift; the stats finding is why FD-3 was rewritten to directory counts." .
+
 mem:fact-01kta2t986nsjneban0hgbwzq7 a mem:Fact ;
     mem:content "RDF term/fact identity in Fluree is (s, p, o, dt, m) where m=FlakeMeta{lang, i} — matching Flake::eq/hash. Any dedup/stale-removal key that omits m collapses distinct facts: langString variants sharing a value (\"animal\"@en vs @fr), and @list members repeating a value at different indices. Issue #1273 was range::remove_stale_flakes (overlay-only/genesis read path) keying on (s,p,o,dt) only; the binary-scan stale-removal (binary_scan.rs FactKeyRef) already included m. Including m also correctly scopes retraction cancellation per variant." ;
     mem:tag "dedup" ;
@@ -1890,7 +1906,7 @@ mem:fact-01ktcfdrpyfq8btp10mf75cmp5 a mem:Fact ;
     mem:rationale "Candidate 3 lever is scatter/sort assembly, not join grouping or DISTINCT which are already optimized." .
 
 mem:fact-01ktwjrjrvj60k0v0q7gstwknz a mem:Fact ;
-    mem:content "Differential fast-path harness (Phase 0.7) found 3 reproducible fast≠generic divergences on first run (2026-06-11), pinned as known_divergence markers: FD-1 AVG fast path emits f64 JSON number vs generic's xsd:decimal string; FD-2 MIN/MAX-string fast path returns WRONG answers on reindex-built ledgers (treats string-ID order as lexicographic; lex_sorted_string_ids only holds after bulk import — suspect missing gate in fast_min_max_string); FD-3 StatsCountByPredicateOperator counts duplicate re-asserts, applies novelty deltas inconsistently per predicate, and drops rdf:type in pure novelty. Cross-condition axis (generic: base≡overlay≡novelty) passed all 16 cases. Kill switch: set_fast_paths_disabled / FLUREE_DISABLE_QUERY_FAST_PATHS." ;
+    mem:content "Differential fast-path harness (Phase 0.7) found 3 fast≠generic divergences on first run (2026-06-11); ALL THREE FIXED same-day in PR #1314 and now hard-enforced by the harness: FD-1 AVG fast path now mirrors generic finalize_avg per number kind (exact i64+BigDecimal for integers → xsd:decimal, plain non-Kahan f64 for doubles); FD-2 MIN/MAX-string gated on lex_sorted_string_ids (was returning insertion-order extremes on reindex-built ledgers); FD-3 per-predicate counts rewritten to exact POST leaf-directory row_count sums at epoch-0 (StatsView numbers are estimates — never use as query answers). Cross-condition axis (generic: base≡overlay≡novelty) passed throughout. Kill switch: set_fast_paths_disabled / FLUREE_DISABLE_QUERY_FAST_PATHS." ;
     mem:tag "audit" ;
     mem:tag "bug" ;
     mem:tag "correctness" ;
@@ -1902,6 +1918,7 @@ mem:fact-01ktwjrjrvj60k0v0q7gstwknz a mem:Fact ;
     mem:artifactRef "fluree-db-api/tests/it_differential_fastpath.rs" ;
     mem:artifactRef "fluree-db-query/src/fast_min_max_string.rs" ;
     mem:artifactRef "fluree-db-query/src/fast_predicate_scalar_agg.rs" ;
+    mem:artifactRef "fluree-db-query/src/stats_query.rs" ;
     mem:branch "test/phase0-differential-harness" ;
     mem:createdAt "2026-06-12T00:12:28.315996+00:00"^^xsd:dateTime ;
     mem:rationale "FD-2 and FD-3 are user-visible wrong answers — high-priority fixes. Remove a case's known_divergence marker when its fix lands so the harness enforces it." .
