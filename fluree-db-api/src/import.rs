@@ -3587,6 +3587,7 @@ where
         numbig_pool: Arc::new(SharedNumBigPool::new()),
         vector_pool: Arc::new(SharedVectorArenaPool::new()),
         ns_alloc: Arc::clone(&shared_alloc),
+        decimal_encoding: IMPORT_DECIMAL_ENCODING,
     });
 
     // Pre-insert rdf:type so we know the predicate ID before Phase A begins.
@@ -5064,6 +5065,13 @@ struct IndexUploadResult {
     summary: Option<ImportSummary>,
 }
 
+/// Decimal-encoding policy for a fresh bulk import. Like a full reindex, a new
+/// import adopts the inline-decimal (v3) format. This is the single source for
+/// BOTH the spool object resolution ([`SpoolConfig::decimal_encoding`]) and the
+/// written root version — they must agree or decimal identity would split.
+const IMPORT_DECIMAL_ENCODING: fluree_db_core::DecimalEncoding =
+    fluree_db_core::DecimalEncoding::InlineWhenFits;
+
 #[allow(clippy::too_many_arguments)]
 async fn build_and_upload<S>(
     storage: &S,
@@ -5820,11 +5828,9 @@ where
             garbage: None,
             sketch_ref: None,
             ns_split_mode: input.ns_split_mode,
-            // Bulk import writes arena-only roots for now; inline-decimal encoding
-            // is adopted on the ledger's first full reindex. (The import build
-            // path resolves objects independently of the rebuild resolver, so
-            // enabling inline here is a separate, follow-up wiring.)
-            decimal_encoding: fluree_db_core::DecimalEncoding::ArenaOnly,
+            // Same source as the spool object resolution (SpoolConfig): the root
+            // version must match how the import encoded decimals.
+            decimal_encoding: IMPORT_DECIMAL_ENCODING,
         };
 
         // Encode and upload FIR6 root.

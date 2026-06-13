@@ -1321,3 +1321,89 @@ ex:remove a ex:User ;
         "rebuilt V3 index should only contain 'Keep' — 'Remove' should be filtered as retract-winner"
     );
 }
+
+// ── Bulk import writes inline decimals (v3 root) and round-trips exactly ──
+#[tokio::test]
+async fn import_v3_inline_decimals_roundtrip() {
+    let db_dir = tempfile::tempdir().expect("db tmpdir");
+    let data_dir = tempfile::tempdir().expect("data tmpdir");
+
+    // Two inline-eligible decimals + one too large to fit inline (mantissa
+    // exceeds 2^57, so it falls back to the NumBig arena).
+    let ttl = r#"
+@prefix ex: <http://example.org/ns/> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+
+ex:a ex:amount 19.99 .
+ex:b ex:amount 0.0000001 .
+ex:c ex:amount "1234567890123456789.5"^^xsd:decimal .
+"#;
+    let ttl_path = write_ttl(data_dir.path(), "decimals.ttl", ttl);
+
+    let fluree = FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build file-backed Fluree");
+
+    let result = fluree
+        .create("test/v3-decimals:main")
+        .import(&ttl_path)
+        .threads(1)
+        .memory_budget_mb(128)
+        .cleanup(false)
+        .execute()
+        .await
+        .expect("decimal import should succeed");
+    assert!(result.root_id.is_some(), "index should have been built");
+
+    // The import must write a v3 (inline-decimal) root: byte 4 of the FIR6
+    // header is the version, and ROOT_V6_VERSION_INLINE_DECIMAL == 3.
+    let fir6_files = find_files_with_magic(db_dir.path(), b"FIR6");
+    assert!(!fir6_files.is_empty(), "expected a FIR6 root file");
+    let root_bytes = std::fs::read(&fir6_files[0]).expect("read FIR6 root");
+    assert_eq!(
+        root_bytes[4], 3,
+        "bulk import must write a v3 inline-decimal root"
+    );
+
+    let ledger = fluree
+        .ledger("test/v3-decimals:main")
+        .await
+        .expect("load decimal ledger");
+
+    let result = support::query_sparql(
+        &fluree,
+        &ledger,
+        r"
+        PREFIX ex: <http://example.org/ns/>
+        SELECT ?amount WHERE { ?s ex:amount ?amount } ORDER BY ?amount
+        ",
+    )
+    .await
+    .expect("decimal query");
+    let json = result
+        .to_sparql_json(&ledger.snapshot)
+        .expect("format sparql json");
+    let bindings = json["results"]["bindings"].as_array().expect("bindings");
+    let mut amounts: Vec<&str> = bindings
+        .iter()
+        .map(|b| b["amount"]["value"].as_str().unwrap())
+        .collect();
+    amounts.sort();
+
+    // All three decimals — two inline, one arena — round-trip exactly in plain
+    // (non-exponent) form.
+    assert_eq!(
+        amounts,
+        vec!["0.0000001", "1234567890123456789.5", "19.99"],
+        "inline + arena decimals must round-trip exactly through bulk import"
+    );
+
+    // Datatype is xsd:decimal for all (inline lane resolves the datatype).
+    for b in bindings {
+        assert_eq!(
+            b["amount"]["datatype"].as_str().unwrap(),
+            "http://www.w3.org/2001/XMLSchema#decimal",
+            "imported decimals must carry xsd:decimal datatype"
+        );
+    }
+}
