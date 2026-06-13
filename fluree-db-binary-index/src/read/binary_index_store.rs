@@ -1358,6 +1358,7 @@ impl BinaryIndexStore {
             OType::XSD_DOUBLE => Some(Sid::new(namespaces::XSD, xsd_names::DOUBLE)),
             OType::XSD_FLOAT => Some(Sid::new(namespaces::XSD, xsd_names::FLOAT)),
             OType::XSD_DECIMAL => Some(Sid::new(namespaces::XSD, xsd_names::DECIMAL)),
+            OType::XSD_DECIMAL_INLINE => Some(Sid::new(namespaces::XSD, xsd_names::DECIMAL)),
             OType::XSD_DATE => Some(Sid::new(namespaces::XSD, xsd_names::DATE)),
             OType::XSD_TIME => Some(Sid::new(namespaces::XSD, xsd_names::TIME)),
             OType::XSD_DATE_TIME => Some(Sid::new(namespaces::XSD, xsd_names::DATE_TIME)),

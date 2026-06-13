@@ -217,6 +217,10 @@ where
             _span_b.record("fetch_concurrency", fetch_concurrency);
 
             let mut shared = SharedResolverState::new_for_ledger(&ledger_id);
+            // A full rebuild writes a fresh root, so it adopts the inline-decimal
+            // format: small exact decimals encode inline, the rest fall back to
+            // the arena. Existing ledgers keep their format until reindexed.
+            shared.decimal_encoding = fluree_db_core::DecimalEncoding::InlineWhenFits;
 
             // Pre-insert rdf:type into predicate dictionary so class tracking
             // works from the very first commit.
@@ -1110,6 +1114,9 @@ where
                 db_stats: Some(db_stats),
                 db_schema,
                 sketch_ref,
+                // Same source as the resolver above: the root version must match
+                // how decimals were just encoded.
+                decimal_encoding: shared.decimal_encoding,
             };
 
             let result = super::root_assembly::encode_and_write_root_v6(

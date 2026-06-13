@@ -219,6 +219,11 @@ pub(crate) struct Fir6Inputs {
     pub db_schema: Option<fluree_db_core::IndexSchema>,
     /// CAS reference for the serialized HLL sketch blob.
     pub sketch_ref: Option<ContentId>,
+    /// Decimal-encoding policy for this build. Must equal the resolver's policy
+    /// for this run (same source) so the written root version matches how the
+    /// resolver encoded decimals — a mismatch would split decimal identity
+    /// across the inline/arena boundary.
+    pub decimal_encoding: fluree_db_core::DecimalEncoding,
 }
 
 /// Encode an `IndexRoot` (FIR6), write to CAS, and return an `IndexResult`.
@@ -291,10 +296,8 @@ pub(crate) async fn encode_and_write_root_v6(
         prev_index: None,
         garbage: None,
         sketch_ref: inputs.sketch_ref,
-        // Sticky per root: extending an inline-decimal root keeps inlining, an
-        // arena-only root keeps the arena. Until the write path emits inline
-        // decimals, every root is arena-only.
-        decimal_encoding: fluree_db_core::DecimalEncoding::ArenaOnly,
+        // Same source as the resolver's policy for this run (see Fir6Inputs).
+        decimal_encoding: inputs.decimal_encoding,
     };
 
     // `IndexStats.size` is defined as total commit data size (bytes) for the ledger.

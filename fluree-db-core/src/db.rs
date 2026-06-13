@@ -519,13 +519,13 @@ fn decode_fir6_metadata(bytes: &[u8]) -> std::io::Result<LedgerSnapshotMetadata>
         ));
     }
     let version = bytes[4];
-    // FIR6 version 2 adds `lang_id` to each `FulltextArenaRef` so fulltext
-    // arenas can be keyed by `(g_id, p_id, lang_id)`. This helper doesn't
-    // parse arena refs — it only consumes the header bits it needs — so
-    // both versions are accepted here. The authoritative parser
-    // (`IndexRoot::decode` in `fluree-db-binary-index`) enforces version
-    // matching for the full-root deserialization path.
-    if version != 1 && version != 2 {
+    // FIR6 version 2 adds `lang_id` to each `FulltextArenaRef`; version 3 enables
+    // inline xsd:decimal encoding. Neither changes the header layout this helper
+    // reads — it only consumes the fixed header + optional-section bits, not arena
+    // refs or leaf data — so all three versions are accepted here. The
+    // authoritative parser (`IndexRoot::decode` in `fluree-db-binary-index`)
+    // enforces version matching for the full-root deserialization path.
+    if version != 1 && version != 2 && version != 3 {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!("FIR6: unsupported version {version}"),

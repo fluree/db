@@ -889,3 +889,246 @@ async fn sparql_delete_data_decimal_retracts_exactly() {
         "deleted decimal fact must not survive"
     );
 }
+
+// =============================================================================
+// Inline xsd:decimal encoding (v3 root format)
+// =============================================================================
+
+/// Run a full rebuild, publish the new index, and return the decoded index root
+/// so tests can assert the on-disk decimal-encoding format.
+async fn full_rebuild_publish_decode_root(
+    fluree: &fluree_db_api::Fluree,
+    ledger_id: &str,
+) -> fluree_db_binary_index::format::index_root::IndexRoot {
+    use fluree_db_core::storage::ContentStore;
+    let record = fluree
+        .nameservice()
+        .lookup(ledger_id)
+        .await
+        .expect("nameservice lookup")
+        .expect("ledger record");
+    let result = fluree_db_indexer::rebuild_index_from_commits(
+        fluree.content_store(ledger_id),
+        ledger_id,
+        &record,
+        fluree_db_indexer::IndexerConfig::default(),
+    )
+    .await
+    .expect("full rebuild");
+    let root_bytes = fluree
+        .content_store(ledger_id)
+        .get(&result.root_id)
+        .await
+        .expect("fetch root bytes");
+    fluree
+        .publisher()
+        .expect("read-write nameservice")
+        .publish_index(ledger_id, result.index_t, &result.root_id)
+        .await
+        .expect("publish index");
+    fluree_db_binary_index::format::index_root::IndexRoot::decode(&root_bytes).expect("decode root")
+}
+
+#[tokio::test]
+async fn full_reindex_writes_inline_decimal_v3_format_and_roundtrips() {
+    // A full rebuild adopts the inline-decimal format: the root is v3
+    // (InlineWhenFits), small exact decimals encode inline, and a value too
+    // large to fit inline falls back to the arena — all round-trip exactly.
+    let fluree = memory_fluree();
+    let ledger_id = "decimal/inline-format:main";
+    let ledger = genesis_ledger(&fluree, ledger_id);
+
+    let result = run_sparql_update(
+        &fluree,
+        ledger,
+        r#"
+        PREFIX ex: <http://example.org/>
+        INSERT DATA {
+            ex:a ex:amount 19.99 .
+            ex:b ex:amount 0.0000001 .
+            ex:c ex:amount "1234567890123456789.5"^^<http://www.w3.org/2001/XMLSchema#decimal> .
+        }
+        "#,
+    )
+    .await;
+    let _ = result;
+
+    let root = full_rebuild_publish_decode_root(&fluree, ledger_id).await;
+    assert_eq!(
+        root.decimal_encoding(),
+        fluree_db_core::DecimalEncoding::InlineWhenFits,
+        "a full rebuild must write the inline-decimal (v3) format"
+    );
+
+    let ledger = fluree.ledger(ledger_id).await.expect("load reindexed ledger");
+    let query = r"
+        PREFIX ex: <http://example.org/>
+        SELECT ?s ?amount WHERE { ?s ex:amount ?amount . }
+    ";
+    let result = support::query_sparql(&fluree, &ledger, query)
+        .await
+        .expect("query");
+    let sparql_json = result
+        .to_sparql_json(&ledger.snapshot)
+        .expect("to_sparql_json");
+
+    let mut amounts = binding_values(&sparql_json, "amount");
+    amounts.sort();
+    // Two inline-eligible decimals + one arena-overflow decimal, all exact and
+    // in plain (non-exponent) form.
+    assert_eq!(
+        amounts,
+        vec![
+            "0.0000001".to_string(),
+            "1234567890123456789.5".to_string(),
+            "19.99".to_string(),
+        ],
+        "inline + arena decimals must round-trip exactly after reindex"
+    );
+}
+
+#[tokio::test]
+async fn inline_decimal_equality_constant_matches_after_reindex() {
+    // A decimal equality constant must encode the same way as the stored inline
+    // row so the bound-object lookup hits it (issue #1328 narrowing).
+    let fluree = memory_fluree();
+    let ledger_id = "decimal/inline-eq:main";
+    let ledger = genesis_ledger(&fluree, ledger_id);
+
+    run_sparql_update(
+        &fluree,
+        ledger,
+        r"
+        PREFIX ex: <http://example.org/>
+        INSERT DATA {
+            ex:a ex:price 19.99 .
+            ex:b ex:price 20.00 .
+        }
+        ",
+    )
+    .await;
+
+    let root = full_rebuild_publish_decode_root(&fluree, ledger_id).await;
+    assert_eq!(
+        root.decimal_encoding(),
+        fluree_db_core::DecimalEncoding::InlineWhenFits
+    );
+
+    let ledger = fluree.ledger(ledger_id).await.expect("load reindexed ledger");
+    let query = r"
+        PREFIX ex: <http://example.org/>
+        SELECT ?s WHERE { ?s ex:price 19.99 . }
+    ";
+    let result = support::query_sparql(&fluree, &ledger, query)
+        .await
+        .expect("query");
+    let sparql_json = result
+        .to_sparql_json(&ledger.snapshot)
+        .expect("to_sparql_json");
+    assert_eq!(
+        binding_values(&sparql_json, "s"),
+        vec!["ex:a".to_string()],
+        "decimal equality constant must match the stored inline decimal"
+    );
+}
+
+/// Canonicalize a SPARQL bindings array for differential comparison: any literal
+/// whose value parses as a `BigDecimal` is rewritten to its normalized form.
+/// Indexing canonicalizes decimal scale (`10.50` -> `10.5`) for both the arena
+/// and inline encodings, so a novelty-vs-indexed comparison must compare by
+/// numeric value, not lexical form. Datatype and structure are preserved and
+/// still compared exactly.
+fn canon_decimal_bindings(bindings: &JsonValue) -> JsonValue {
+    let mut bindings = bindings.clone();
+    if let Some(rows) = bindings.as_array_mut() {
+        for row in rows {
+            if let Some(obj) = row.as_object_mut() {
+                for (_var, cell) in obj.iter_mut() {
+                    if let Some(v) = cell.get("value").and_then(|v| v.as_str()) {
+                        if let Ok(bd) = v.parse::<num_bigdecimal::BigDecimal>() {
+                            cell["value"] =
+                                JsonValue::String(bd.normalized().to_plain_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    bindings
+}
+
+#[tokio::test]
+async fn inline_decimal_results_match_novelty_differential() {
+    // Differential: the same query must return identical results whether the
+    // decimals are unindexed (novelty, canonical FlakeValue::Decimal) or indexed
+    // under the inline (v3) format. Proves inline encoding is observably
+    // identical to the canonical representation across SELECT / ORDER BY / FILTER
+    // / aggregation.
+    let fluree = memory_fluree();
+    let ledger_id = "decimal/inline-differential:main";
+    let ledger = genesis_ledger(&fluree, ledger_id);
+
+    let result = run_sparql_update(
+        &fluree,
+        ledger,
+        r"
+        PREFIX ex: <http://example.org/>
+        INSERT DATA {
+            ex:a ex:amount 19.99 .
+            ex:b ex:amount 0.01 .
+            ex:c ex:amount 10.50 .
+            ex:d ex:amount 100.00 .
+        }
+        ",
+    )
+    .await;
+    let novelty_ledger = result.ledger;
+
+    let queries = [
+        // Plain projection + ORDER BY on the decimal value.
+        r"PREFIX ex: <http://example.org/>
+          SELECT ?amount WHERE { ?s ex:amount ?amount . } ORDER BY ?amount",
+        // FILTER comparison against a decimal threshold.
+        r"PREFIX ex: <http://example.org/>
+          SELECT ?amount WHERE { ?s ex:amount ?amount . FILTER(?amount > 10.0) } ORDER BY ?amount",
+        // Aggregation (SUM/AVG) + COUNT.
+        r"PREFIX ex: <http://example.org/>
+          SELECT (SUM(?amount) AS ?total) (COUNT(?amount) AS ?n) WHERE { ?s ex:amount ?amount . }",
+    ];
+
+    // Results from the unindexed (novelty) state.
+    let mut novelty_results = Vec::new();
+    for q in &queries {
+        let r = support::query_sparql(&fluree, &novelty_ledger, q)
+            .await
+            .expect("novelty query");
+        novelty_results.push(
+            r.to_sparql_json(&novelty_ledger.snapshot)
+                .expect("to_sparql_json")["results"]["bindings"]
+                .clone(),
+        );
+    }
+
+    // Reindex into the inline (v3) format.
+    let root = full_rebuild_publish_decode_root(&fluree, ledger_id).await;
+    assert_eq!(
+        root.decimal_encoding(),
+        fluree_db_core::DecimalEncoding::InlineWhenFits
+    );
+    let indexed_ledger = fluree.ledger(ledger_id).await.expect("load reindexed ledger");
+
+    for (q, novelty_bindings) in queries.iter().zip(novelty_results) {
+        let r = support::query_sparql(&fluree, &indexed_ledger, q)
+            .await
+            .expect("indexed query");
+        let indexed_bindings = r
+            .to_sparql_json(&indexed_ledger.snapshot)
+            .expect("to_sparql_json")["results"]["bindings"]
+            .clone();
+        assert_eq!(
+            canon_decimal_bindings(&indexed_bindings),
+            canon_decimal_bindings(&novelty_bindings),
+            "inline-indexed results must match novelty results (by value + datatype) for query:\n{q}"
+        );
+    }
+}
