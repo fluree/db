@@ -369,8 +369,14 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                 LiteralValue::Typed { value, datatype } => {
                     let fv = self.lower_typed_literal(value, datatype)?;
                     let dt_iri = self.expand_iri(datatype)?;
+                    // Bind the DECLARED datatype: Binding::Lit equality
+                    // includes the datatype, so labeling every typed literal
+                    // xsd:string made VALUES constants like
+                    // "…"^^xsd:integer unable to match stored values.
                     let dt_sid = if dt_iri == fluree::EMBEDDING_VECTOR {
                         Sid::new(FLUREE_DB, "vector")
+                    } else if let Some(sid) = self.encoder.encode_iri_strict(&dt_iri) {
+                        sid
                     } else {
                         Sid::new(XSD, xsd_names::STRING)
                     };

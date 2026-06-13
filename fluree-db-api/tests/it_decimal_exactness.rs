@@ -368,6 +368,32 @@ async fn integer_beyond_i64_round_trips_exactly() {
         vec!["ex:item", "ex:typed"],
         "typed xsd:integer constant must match both bare- and typed-ingested values"
     );
+
+    // VALUES with a typed constant: the binding must carry the declared
+    // datatype (it was labeled xsd:string, which made the join always fail).
+    let query = format!(
+        r#"
+        PREFIX ex: <http://example.org/>
+        PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+        SELECT ?s WHERE {{
+            VALUES ?serial {{ "{big}"^^xsd:integer }}
+            ?s ex:serial ?serial .
+        }}
+        "#
+    );
+    let result = support::query_sparql(&fluree, &ledger, &query)
+        .await
+        .expect("typed VALUES query");
+    let sparql_json = result
+        .to_sparql_json(&ledger.snapshot)
+        .expect("to_sparql_json");
+    let mut subjects = binding_values(&sparql_json, "s");
+    subjects.sort();
+    assert_eq!(
+        subjects,
+        vec!["ex:item", "ex:typed"],
+        "typed VALUES constant must join against stored values"
+    );
 }
 
 #[tokio::test]
