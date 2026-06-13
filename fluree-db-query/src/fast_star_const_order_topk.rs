@@ -75,14 +75,20 @@ pub fn star_const_ordered_limit_operator(
             }
 
             // Apply numeric existence filter: keep subjects with any numeric value satisfying the threshold.
-            let filtered_subjects = filter_subjects_by_numeric_gt(
+            // `None` ⇒ a row carried a numeric o_type we can't compare by o_key
+            // (inline decimal / arena big numeric); decline so the fallback path
+            // evaluates the filter correctly.
+            let Some(filtered_subjects) = filter_subjects_by_numeric_gt(
                 store,
                 g_id,
                 numeric_p_id,
                 &candidates,
                 ctx.to_t,
                 &numeric_threshold,
-            )?;
+            )?
+            else {
+                return Ok(None);
+            };
             if filtered_subjects.is_empty() {
                 return Ok(Some(empty_batch(schema.clone())?));
             }
@@ -329,6 +335,13 @@ where
     Ok(())
 }
 
+/// Returns `Some(subjects)` whose value satisfies `> threshold`, or `None` to
+/// decline the fast path (the caller falls back) when a row carries a numeric
+/// o_type this lane can't compare by `o_key` — only `XSD_INTEGER`/`XSD_DOUBLE`
+/// are o_key-order-comparable. Equality-keyed inline decimals
+/// (`XSD_DECIMAL_INLINE`) and arena `NUM_BIG_OVERFLOW` would be silently
+/// dropped by a naive `_ => false`, undercounting the filter; declining keeps
+/// the result correct via the general path.
 fn filter_subjects_by_numeric_gt(
     store: &Arc<fluree_db_binary_index::BinaryIndexStore>,
     g_id: GraphId,
@@ -336,12 +349,12 @@ fn filter_subjects_by_numeric_gt(
     subjects_sorted: &[u64],
     to_t: i64,
     threshold: &FlakeValue,
-) -> Result<Vec<u64>> {
+) -> Result<Option<Vec<u64>>> {
     // Only support numeric thresholds used in benchmark filters.
     let (thr_i, thr_d) = match threshold {
         FlakeValue::Long(n) => (*n, *n as f64),
         FlakeValue::Double(d) => (*d as i64, *d),
-        _ => return Ok(Vec::new()),
+        _ => return Ok(Some(Vec::new())),
     };
     let thr_i_key = fluree_db_core::value_id::ObjKey::encode_i64(thr_i).as_u64();
     let thr_d_key = fluree_db_core::value_id::ObjKey::encode_f64(thr_d)
@@ -349,6 +362,7 @@ fn filter_subjects_by_numeric_gt(
         .as_u64();
 
     let mut keep: FxHashSet<u64> = FxHashSet::default();
+    let mut saw_uncomparable_numeric = false;
     for_each_subject_row_psot(
         store,
         g_id,
@@ -360,6 +374,17 @@ fn filter_subjects_by_numeric_gt(
             let over_threshold = match ot {
                 OType::XSD_INTEGER => batch.o_key.get(i) > thr_i_key,
                 OType::XSD_DOUBLE => batch.o_key.get(i) > thr_d_key,
+                // Numeric but not o_key-comparable (inline decimals, arena big
+                // numerics, other integer widths/floats): can't decide here.
+                _ if ot.is_numeric()
+                    || ot == OType::NUM_BIG_OVERFLOW
+                    || ot == OType::XSD_DECIMAL_INLINE =>
+                {
+                    saw_uncomparable_numeric = true;
+                    false
+                }
+                // Genuinely non-numeric object: `?o > number` is a type
+                // mismatch, so it is correctly a non-match.
                 _ => false,
             };
             if over_threshold {
@@ -369,9 +394,13 @@ fn filter_subjects_by_numeric_gt(
         },
     )?;
 
+    if saw_uncomparable_numeric {
+        return Ok(None);
+    }
+
     let mut out: Vec<u64> = keep.into_iter().collect();
     out.sort_unstable();
-    Ok(out)
+    Ok(Some(out))
 }
 
 fn collect_label_pairs(

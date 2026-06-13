@@ -390,7 +390,10 @@ fn count_rows_for_predicate_numeric_compare_post(
 /// arena-keyed NUM_BIG): rows of these kinds force the count to defer.
 fn otype_unsupported_numeric(raw: u16) -> bool {
     let ot = OType::from_u16(raw);
-    (ot.is_numeric() || ot == OType::NUM_BIG_OVERFLOW)
+    // XSD_DECIMAL_INLINE is numeric but equality-keyed (o_key is not value
+    // ordered), so it can't be compared by o_key here — treat it as unsupported
+    // (defer), exactly like arena NUM_BIG and the non-canonical integer widths.
+    (ot.is_numeric() || ot == OType::NUM_BIG_OVERFLOW || ot == OType::XSD_DECIMAL_INLINE)
         && !matches!(ot, OType::XSD_INTEGER | OType::XSD_DOUBLE)
 }
 
@@ -660,7 +663,12 @@ fn count_numeric_compare_overlay_parallel(
                 OType::XSD_INTEGER if tk_int.is_none() => return Ok(None),
                 OType::XSD_DOUBLE if tk_dbl.is_none() => return Ok(None),
                 OType::XSD_INTEGER | OType::XSD_DOUBLE => {}
-                ot if ot.is_numeric() || ot == OType::NUM_BIG_OVERFLOW => return Ok(None),
+                ot if ot.is_numeric()
+                    || ot == OType::NUM_BIG_OVERFLOW
+                    || ot == OType::XSD_DECIMAL_INLINE =>
+                {
+                    return Ok(None)
+                }
                 _ => {}
             }
         } else if otype_unsupported_numeric(min_ot) || otype_unsupported_numeric(max_ot) {
@@ -687,7 +695,10 @@ fn count_numeric_compare_overlay_parallel(
             let tk = match ot {
                 OType::XSD_INTEGER => tk_int,
                 OType::XSD_DOUBLE => tk_dbl,
-                _ if ot.is_numeric() || ot == OType::NUM_BIG_OVERFLOW => {
+                _ if ot.is_numeric()
+                    || ot == OType::NUM_BIG_OVERFLOW
+                    || ot == OType::XSD_DECIMAL_INLINE =>
+                {
                     saw_unsupported_numeric.store(true, std::sync::atomic::Ordering::Relaxed);
                     return false;
                 }

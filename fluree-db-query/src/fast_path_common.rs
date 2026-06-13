@@ -283,7 +283,10 @@ pub fn cursor_projection_otype_okey() -> ColumnProjection {
 ///   by insertion order, not lexicographic value order;
 /// - lang strings (tag `11`);
 /// - `GEO_POINT` (packed lat/long — not a linear value order) and `BLANK_NODE`;
-/// - overflow big numerics / JSON / vector arena handles (equality-only).
+/// - overflow big numerics / JSON / vector arena handles (equality-only);
+/// - inline decimals (`XSD_DECIMAL_INLINE`, 0x0020): the packed
+///   `(sign, scale, mantissa)` is equality-keyed, NOT value-ordered, so it is
+///   outside the `is_numeric` range above and must never be admitted here.
 ///
 /// Within one `o_type`, this equals the SPARQL `ORDER BY` order; mixing
 /// `o_type`s under one predicate is rejected by the operator at runtime.
