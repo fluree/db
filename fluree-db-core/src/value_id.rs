@@ -15,6 +15,13 @@
 //! `NumInt(3)` vs `NumF64(3.0)`) is a query-layer concern resolved via
 //! multi-scan merge, not an index property.
 //!
+//! **Exception — [`ObjKind::NUM_DEC`]:** inline `xsd:decimal` keys are
+//! *equality-keyed*, not value-ordered. Equal values encode to identical bits
+//! (so equality, dedup, and joins are correct), but raw `u64` ordering of the
+//! packed `(sign, scale, mantissa)` is NOT numeric ordering. Range/`FILTER`
+//! pushdown that relies on `o_key` order must therefore exclude this kind. See
+//! [`ObjKey::encode_decimal`].
+//!
 //! [`ValueTypeTag`] is a compact `u8` identifier for XSD/RDF datatypes, used as
 //! a tie-breaker in index sort keys so that values with the same `(ObjKind,
 //! ObjKey)` but different types (e.g., `xsd:integer 3` vs `xsd:long 3`)

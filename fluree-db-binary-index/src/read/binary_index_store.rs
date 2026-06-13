@@ -789,6 +789,7 @@ impl BinaryIndexStore {
             DecodeKind::Bool => Ok(FlakeValue::Boolean(o_key != 0)),
             DecodeKind::I64 => Ok(FlakeValue::Long(key.decode_i64())),
             DecodeKind::F64 => Ok(FlakeValue::Double(key.decode_f64())),
+            DecodeKind::Decimal => Ok(FlakeValue::Decimal(Box::new(key.decode_decimal()))),
             DecodeKind::Date => {
                 let days = key.decode_date();
                 let date = chrono::NaiveDate::from_num_days_from_ce_opt(days + 719_163).unwrap_or(
