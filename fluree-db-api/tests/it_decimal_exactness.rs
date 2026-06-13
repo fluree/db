@@ -1280,3 +1280,72 @@ async fn inline_decimal_order_by_and_range_are_numeric_after_reindex() {
         "MAX over decimals must be the largest value"
     );
 }
+
+#[tokio::test]
+async fn mixed_int_decimal_predicate_range_filter_is_correct() {
+    // Correctness guard for decimal range-scan narrowing: a predicate with BOTH
+    // integer and inline-decimal values spans two o_types, so the uniform-extent
+    // precondition fails and the scan must NOT narrow to the decimal key range —
+    // doing so would drop the integer rows. The general post-filter must return
+    // every numerically-matching value regardless of type.
+    let fluree = memory_fluree();
+    let ledger_id = "decimal/mixed-range:main";
+    let ledger = genesis_ledger(&fluree, ledger_id);
+
+    run_sparql_update(
+        &fluree,
+        ledger,
+        r"
+        PREFIX ex: <http://example.org/>
+        INSERT DATA {
+            ex:a ex:v 5 .
+            ex:b ex:v 10.5 .
+            ex:c ex:v 2 .
+            ex:d ex:v 7.5 .
+            ex:e ex:v 3 .
+        }
+        ",
+    )
+    .await;
+
+    full_rebuild_publish_decode_root(&fluree, ledger_id).await;
+    let ledger = fluree
+        .ledger(ledger_id)
+        .await
+        .expect("load reindexed ledger");
+
+    // FILTER(?v > 4): must match the integer 5 AND the decimals 7.5, 10.5 —
+    // three values across two o_types. A decimal-only narrowed scan would miss 5.
+    let filtered = support::query_sparql(
+        &fluree,
+        &ledger,
+        r"PREFIX ex: <http://example.org/>
+          SELECT ?v WHERE { ?s ex:v ?v FILTER(?v > 4) } ORDER BY ?v",
+    )
+    .await
+    .expect("mixed range filter");
+    let json = filtered.to_sparql_json(&ledger.snapshot).expect("json");
+    let mut got = binding_values(&json, "v");
+    got.sort();
+    assert_eq!(
+        got,
+        vec!["10.5", "5", "7.5"],
+        "range filter over a mixed int+decimal predicate must keep matches of both types"
+    );
+
+    // Full ORDER BY must still interleave both types numerically.
+    let ordered = support::query_sparql(
+        &fluree,
+        &ledger,
+        r"PREFIX ex: <http://example.org/>
+          SELECT ?v WHERE { ?s ex:v ?v } ORDER BY ?v",
+    )
+    .await
+    .expect("mixed order by");
+    let oj = ordered.to_sparql_json(&ledger.snapshot).expect("json");
+    assert_eq!(
+        binding_values(&oj, "v"),
+        vec!["2", "3", "5", "7.5", "10.5"],
+        "ORDER BY over mixed int+decimal must be numerically interleaved"
+    );
+}

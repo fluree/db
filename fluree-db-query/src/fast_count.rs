@@ -405,6 +405,24 @@ fn otype_unsupported_numeric(raw: u16) -> bool {
         && !otype_okey_order_comparable(ot)
 }
 
+/// The single `o_type` shared by every row of `p_id` in POST order, or `None`
+/// if the predicate is empty or has mixed o_types. Read from the leaf manifest
+/// (plus ≤2 boundary leaves) — cheap, no full scan. A uniform
+/// `XSD_DECIMAL_INLINE` result means every value under the predicate is an
+/// inline decimal with no arena spill and no other types, which is the
+/// precondition for safely narrowing a numeric range scan by `o_key`.
+pub(crate) fn predicate_uniform_o_type(
+    store: &BinaryIndexStore,
+    g_id: GraphId,
+    p_id: u32,
+) -> Option<u16> {
+    let leaves = leaf_entries_for_predicate(store, g_id, RunSortOrder::Post, p_id);
+    match predicate_post_global_extent(store, p_id, leaves).ok()? {
+        Some((min_ot, _, max_ot, _)) if min_ot == max_ot => Some(min_ot),
+        _ => None,
+    }
+}
+
 fn predicate_post_global_extent(
     store: &BinaryIndexStore,
     p_id: u32,
@@ -543,7 +561,10 @@ fn count_numeric_compare_in_leaf_slice(
     Ok(Some(total))
 }
 
-fn encode_numeric_threshold_for_otype(otype: OType, threshold: &FlakeValue) -> Result<Option<u64>> {
+pub(crate) fn encode_numeric_threshold_for_otype(
+    otype: OType,
+    threshold: &FlakeValue,
+) -> Result<Option<u64>> {
     use bigdecimal::BigDecimal;
     // Encode the threshold into the row o_type's key space. Inline decimals use
     // the order-preserving decimal codec, so a `>`/`<` comparison of `o_key`s is
