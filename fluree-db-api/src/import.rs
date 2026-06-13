@@ -5,7 +5,7 @@
 //!
 //! ## Pipeline overview (Tier 2: parallel local IDs + remap)
 //!
-//! 1. **Create ledger** — `nameservice.publish_ledger_init(ledger_id)`
+//! 1. **Create ledger** — `nameservice.init(ledger_id)`
 //! 2. **Parse + commit** — parallel chunk parsing with chunk-local IDs written
 //!    to spool files, serial commit finalization
 //! 3. **Dict merge** — merge chunk-local subject/string dicts into global dicts,
@@ -1379,7 +1379,7 @@ where
 
         if needs_init {
             nameservice
-                .publish_ledger_init(&normalized_alias)
+                .init(&normalized_alias)
                 .await
                 .map_err(|e| ImportError::Storage(e.to_string()))?;
             tracing::info!(alias = %normalized_alias, "initialized new ledger in nameservice");

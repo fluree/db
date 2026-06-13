@@ -1787,11 +1787,11 @@ mod tests {
     async fn cached_handle_is_stale_respects_config_flag_and_ns_head() {
         use fluree_db_core::{ContentId, ContentKind, LedgerSnapshot, MemoryStorage};
         use fluree_db_ledger::LedgerState;
-        use fluree_db_nameservice::{memory::MemoryNameService, Publisher};
+        use fluree_db_nameservice::{memory::MemoryNameService, CommitPublisher, LedgerLifecycle};
         use fluree_db_novelty::Novelty;
 
         let ns = MemoryNameService::new();
-        ns.publish_ledger_init("test:main").await.unwrap();
+        ns.init("test:main").await.unwrap();
         ns.publish_commit("test:main", 5, &ContentId::new(ContentKind::Commit, b"c5"))
             .await
             .unwrap();

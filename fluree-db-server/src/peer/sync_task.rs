@@ -139,7 +139,7 @@ impl PeerSyncTask {
         };
 
         // 1. Ensure ledger exists locally (idempotent)
-        match ns.publish_ledger_init(&record.ledger_id).await {
+        match ns.init(&record.ledger_id).await {
             Ok(()) => {}
             Err(NameServiceError::LedgerAlreadyExists(_)) => {}
             Err(e) => {

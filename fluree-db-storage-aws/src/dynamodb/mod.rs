@@ -22,11 +22,11 @@ use fluree_db_core::ledger_id::{
 };
 use fluree_db_core::ContentId;
 use fluree_db_nameservice::{
-    AdminPublisher, CasResult, ConfigCasResult, ConfigLookup, ConfigPayload, ConfigPublisher,
-    ConfigValue, GraphSourceLookup, GraphSourcePublisher, GraphSourceRecord, GraphSourceType,
-    BranchLifecycle, NameServiceError, NameServiceLookup, NsLookupResult, NsRecord, Publisher,
-    RefKind, RefLookup, RefPublisher, RefValue, StatusCasResult, StatusLookup, StatusPayload,
-    StatusPublisher, StatusValue,
+    AdminPublisher, BranchLifecycle, CasResult, CommitPublisher, ConfigCasResult, ConfigLookup,
+    ConfigPayload, ConfigPublisher, ConfigValue, GraphSourceLookup, GraphSourcePublisher,
+    GraphSourceRecord, GraphSourceType, IndexPublisher, LedgerLifecycle, NameServiceError,
+    NameServiceLookup, NsLookupResult, NsRecord, RefKind, RefLookup, RefPublisher, RefValue,
+    StatusCasResult, StatusLookup, StatusPayload, StatusPublisher, StatusValue,
 };
 use schema::*;
 use std::collections::HashMap;
@@ -821,8 +821,8 @@ impl BranchLifecycle for DynamoDbNameService {
 // ─── Publisher ──────────────────────────────────────────────────────────────
 
 #[async_trait]
-impl Publisher for DynamoDbNameService {
-    async fn publish_ledger_init(
+impl LedgerLifecycle for DynamoDbNameService {
+    async fn init(
         &self,
         ledger_id: &str,
     ) -> std::result::Result<(), NameServiceError> {
@@ -922,6 +922,40 @@ impl Publisher for DynamoDbNameService {
         }
     }
 
+    async fn retract(&self, ledger_id: &str) -> std::result::Result<(), NameServiceError> {
+        let pk = Self::normalize(ledger_id);
+        let now = Self::now_epoch_ms().to_string();
+
+        self.client
+            .update_item()
+            .table_name(&self.table_name)
+            .key(ATTR_PK, AttributeValue::S(pk))
+            .key(ATTR_SK, AttributeValue::S(SK_META.to_string()))
+            .update_expression("SET #ret = :true_val, #ua = :now")
+            .expression_attribute_names("#ret", ATTR_RETRACTED)
+            .expression_attribute_names("#ua", ATTR_UPDATED_AT_MS)
+            .expression_attribute_values(":true_val", AttributeValue::Bool(true))
+            .expression_attribute_values(":now", AttributeValue::N(now))
+            .send()
+            .await
+            .map_err(|e| NameServiceError::storage(format!("DynamoDB UpdateItem failed: {e}")))?;
+
+        Ok(())
+    }
+
+    async fn purge(&self, ledger_id: &str) -> std::result::Result<(), NameServiceError> {
+        // Hard drop: delete every row under this pk (meta/head/index/status/
+        // config, plus any other ledger-level rows). Idempotent — if the
+        // record is already gone we return Ok so repeated drops are safe.
+        let pk = Self::normalize(ledger_id);
+        let items = self.query_all_items(&pk).await?;
+        let _ = self.delete_all_rows_for_pk(&pk, &items).await?;
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl CommitPublisher for DynamoDbNameService {
     async fn publish_commit(
         &self,
         ledger_id: &str,
@@ -966,6 +1000,13 @@ impl Publisher for DynamoDbNameService {
         }
     }
 
+    fn publishing_ledger_id(&self, ledger_id: &str) -> Option<String> {
+        Some(Self::normalize(ledger_id))
+    }
+}
+
+#[async_trait]
+impl IndexPublisher for DynamoDbNameService {
     async fn publish_index(
         &self,
         ledger_id: &str,
@@ -974,41 +1015,6 @@ impl Publisher for DynamoDbNameService {
     ) -> std::result::Result<(), NameServiceError> {
         self.update_index_item(ledger_id, index_t, index_id, "#it < :t")
             .await
-    }
-
-    async fn retract(&self, ledger_id: &str) -> std::result::Result<(), NameServiceError> {
-        let pk = Self::normalize(ledger_id);
-        let now = Self::now_epoch_ms().to_string();
-
-        self.client
-            .update_item()
-            .table_name(&self.table_name)
-            .key(ATTR_PK, AttributeValue::S(pk))
-            .key(ATTR_SK, AttributeValue::S(SK_META.to_string()))
-            .update_expression("SET #ret = :true_val, #ua = :now")
-            .expression_attribute_names("#ret", ATTR_RETRACTED)
-            .expression_attribute_names("#ua", ATTR_UPDATED_AT_MS)
-            .expression_attribute_values(":true_val", AttributeValue::Bool(true))
-            .expression_attribute_values(":now", AttributeValue::N(now))
-            .send()
-            .await
-            .map_err(|e| NameServiceError::storage(format!("DynamoDB UpdateItem failed: {e}")))?;
-
-        Ok(())
-    }
-
-    async fn purge(&self, ledger_id: &str) -> std::result::Result<(), NameServiceError> {
-        // Hard drop: delete every row under this pk (meta/head/index/status/
-        // config, plus any other ledger-level rows). Idempotent — if the
-        // record is already gone we return Ok so repeated drops are safe.
-        let pk = Self::normalize(ledger_id);
-        let items = self.query_all_items(&pk).await?;
-        let _ = self.delete_all_rows_for_pk(&pk, &items).await?;
-        Ok(())
-    }
-
-    fn publishing_ledger_id(&self, ledger_id: &str) -> Option<String> {
-        Some(Self::normalize(ledger_id))
     }
 }
 

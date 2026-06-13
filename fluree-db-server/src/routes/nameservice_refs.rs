@@ -183,7 +183,7 @@ pub async fn init_ledger(
         ServerError::internal("Write operations require a read-write nameservice")
     })?;
 
-    match ns.publish_ledger_init(&alias).await {
+    match ns.init(&alias).await {
         Ok(()) => Ok(Json(InitResponse { created: true })),
         Err(NameServiceError::LedgerAlreadyExists(_)) => Ok(Json(InitResponse { created: false })),
         Err(e) => Err(ServerError::internal(format!("Init failed: {e}"))),

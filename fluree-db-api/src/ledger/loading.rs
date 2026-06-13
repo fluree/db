@@ -122,7 +122,7 @@ impl Fluree {
         info!(ledger_id = %ledger_id, "Creating ledger");
 
         // 2. Register in nameservice via Publisher (fails if already exists)
-        match self.publisher()?.publish_ledger_init(&ledger_id).await {
+        match self.publisher()?.init(&ledger_id).await {
             Ok(()) => {}
             Err(NameServiceError::LedgerAlreadyExists(a)) => {
                 return Err(ApiError::ledger_exists(a));

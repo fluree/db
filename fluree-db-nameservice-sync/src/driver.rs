@@ -447,7 +447,7 @@ mod tests {
     use crate::config::{MemorySyncConfigStore, UpstreamConfig};
     use fluree_db_core::{ContentId, ContentKind};
     use fluree_db_nameservice::memory::MemoryNameService;
-    use fluree_db_nameservice::{MemoryTrackingStore, NsRecord, Publisher, RefLookup};
+    use fluree_db_nameservice::{CommitPublisher, MemoryTrackingStore, NsRecord, RefLookup};
 
     fn origin() -> RemoteName {
         RemoteName::new("origin")

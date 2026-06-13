@@ -532,12 +532,14 @@ impl NsRecordSnapshot {
     }
 }
 
-/// Publisher trait for writing nameservice records
+/// Ledger lifecycle writes — create, retract, purge.
 ///
-/// Implementations handle publishing commit and index updates with
-/// monotonic guarantees.
+/// Mirrors [`BranchLifecycle`] for ledger-level operations. The
+/// methods all mutate the nameservice record's existence (create
+/// it / mark it retracted / remove it), as opposed to advancing
+/// pointers on an existing record.
 #[async_trait]
-pub trait Publisher: Debug + Send + Sync {
+pub trait LedgerLifecycle: Debug + Send + Sync {
     /// Initialize a new ledger in the nameservice
     ///
     /// Creates a minimal NsRecord for a new ledger with no commits yet.
@@ -548,35 +550,7 @@ pub trait Publisher: Debug + Send + Sync {
     ///
     /// # Errors
     /// Returns an error if a record already exists (including retracted records).
-    async fn publish_ledger_init(&self, ledger_id: &str) -> Result<()>;
-
-    /// Publish a new commit
-    ///
-    /// Only updates if: `(not exists) OR (new_t > existing_t)`
-    ///
-    /// This is called by the transactor after each successful commit.
-    async fn publish_commit(
-        &self,
-        ledger_id: &str,
-        commit_t: i64,
-        commit_id: &ContentId,
-    ) -> Result<()>;
-
-    /// Publish a new index
-    ///
-    /// Only updates if: `(not exists) OR (new_t > existing_t)` - STRICTLY monotonic.
-    ///
-    /// This is called by the indexer after successfully writing new index roots.
-    /// The index is published to a separate file/attribute to avoid contention
-    /// with commit publishing.
-    ///
-    /// Note: "equal t prefers index file" is a READ-TIME merge rule, not a write rule.
-    async fn publish_index(
-        &self,
-        ledger_id: &str,
-        index_t: i64,
-        index_id: &ContentId,
-    ) -> Result<()>;
+    async fn init(&self, ledger_id: &str) -> Result<()>;
 
     /// Retract a ledger (soft drop)
     ///
@@ -593,6 +567,23 @@ pub trait Publisher: Debug + Send + Sync {
     async fn purge(&self, ledger_id: &str) -> Result<()> {
         self.retract(ledger_id).await
     }
+}
+
+/// Commit-head publishing — what the transactor calls after each
+/// successful commit.
+#[async_trait]
+pub trait CommitPublisher: Debug + Send + Sync {
+    /// Publish a new commit
+    ///
+    /// Only updates if: `(not exists) OR (new_t > existing_t)`
+    ///
+    /// This is called by the transactor after each successful commit.
+    async fn publish_commit(
+        &self,
+        ledger_id: &str,
+        commit_t: i64,
+        commit_id: &ContentId,
+    ) -> Result<()>;
 
     /// Get the publishing ledger ID for a ledger.
     ///
@@ -600,6 +591,42 @@ pub trait Publisher: Debug + Send + Sync {
     /// Returns `Some(ledger_id)` for the value to write into commit's ns field.
     fn publishing_ledger_id(&self, ledger_id: &str) -> Option<String>;
 }
+
+/// Index-head publishing — what the indexer calls when a new
+/// index root has been written to the content store.
+///
+/// Carved off [`Publisher`] so embedders (notably the Raft index
+/// publisher) can satisfy just this surface without faking the
+/// commit / lifecycle writes they don't drive.
+#[async_trait]
+pub trait IndexPublisher: Debug + Send + Sync {
+    /// Publish a new index
+    ///
+    /// Only updates if: `(not exists) OR (new_t > existing_t)` - STRICTLY monotonic.
+    ///
+    /// This is called by the indexer after successfully writing new index roots.
+    /// The index is published to a separate file/attribute to avoid contention
+    /// with commit publishing.
+    ///
+    /// Note: "equal t prefers index file" is a READ-TIME merge rule, not a write rule.
+    async fn publish_index(
+        &self,
+        ledger_id: &str,
+        index_t: i64,
+        index_id: &ContentId,
+    ) -> Result<()>;
+}
+
+/// Combined write trait for nameservice records. A supertrait
+/// composition of the three responsibility-aligned write traits —
+/// types that implement all three get `Publisher` automatically.
+///
+/// Used as a `dyn` bound where callers genuinely need the full
+/// write surface; the carved-off traits ([`IndexPublisher`],
+/// [`CommitPublisher`], [`LedgerLifecycle`]) are what to reach for
+/// when only one slice is needed.
+pub trait Publisher: IndexPublisher + CommitPublisher + LedgerLifecycle {}
+impl<T> Publisher for T where T: IndexPublisher + CommitPublisher + LedgerLifecycle + ?Sized {}
 
 /// Combined read-write nameservice trait.
 ///

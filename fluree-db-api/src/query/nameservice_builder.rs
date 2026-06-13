@@ -323,34 +323,31 @@ mod tests {
     use super::*;
     use crate::FlureeBuilder;
     use fluree_db_core::{ContentId, ContentKind};
-    use fluree_db_nameservice::{GraphSourcePublisher, GraphSourceType, Publisher};
+    use fluree_db_nameservice::GraphSourceType;
 
     async fn setup_ns_with_records() -> Fluree {
         let fluree = FlureeBuilder::memory().build_memory();
+        let publisher = fluree.publisher().expect("memory ns is read-write");
 
         // Create some ledger records
         let cid1 = ContentId::new(ContentKind::Commit, b"commit-1");
         let cid2 = ContentId::new(ContentKind::Commit, b"commit-2");
         let cid3 = ContentId::new(ContentKind::Commit, b"commit-3");
-        fluree
-            .nameservice_mode
+        publisher
             .publish_commit("db1:main", 10, &cid1)
             .await
             .unwrap();
-        fluree
-            .nameservice_mode
+        publisher
             .publish_commit("db1:dev", 5, &cid2)
             .await
             .unwrap();
-        fluree
-            .nameservice_mode
+        publisher
             .publish_commit("db2:main", 20, &cid3)
             .await
             .unwrap();
 
         // Create a graph source record
-        fluree
-            .nameservice_mode
+        publisher
             .publish_graph_source(
                 "my-search",
                 "main",

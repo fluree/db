@@ -11,8 +11,8 @@ use fluree_db_core::storage::ContentAddressedWrite;
 use fluree_db_core::ContentKind;
 use fluree_db_core::ContentStore;
 use fluree_db_nameservice::{
-    ConfigLookup, ConfigPayload, ConfigPublisher, ConfigValue, FileTrackingStore, LedgerConfig,
-    RefKind, RefLookup, RefPublisher, RemoteName, RemoteTrackingStore,
+    ConfigLookup, ConfigPayload, ConfigValue, FileTrackingStore, LedgerConfig, RefKind, RefLookup,
+    RefPublisher, RemoteName, RemoteTrackingStore,
 };
 use fluree_db_nameservice_sync::{
     ingest_pack_stream, ingest_pack_stream_with_header, peek_pack_header, FetchResult,
@@ -1626,7 +1626,8 @@ pub async fn run_clone_origin(
             }),
         );
         match fluree
-            .nameservice_mode()
+            .publisher()
+            .map_err(|e| CliError::Config(e.to_string()))?
             .push_config(&local_id, current.as_ref(), &new_config)
             .await
             .map_err(|e| CliError::Config(format!("clone failed (push config): {e}")))?

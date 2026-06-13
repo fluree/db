@@ -1382,7 +1382,7 @@ mod tests {
         ContentAddressedWrite, ContentId, ContentKind, Flake, FlakeValue, MemoryStorage, Sid,
     };
     use fluree_db_nameservice::memory::MemoryNameService;
-    use fluree_db_nameservice::{NameServiceLookup, Publisher};
+    use fluree_db_nameservice::{CommitPublisher, NameServiceLookup};
     use fluree_db_novelty::Commit;
     use std::collections::HashMap;
 
@@ -2053,7 +2053,7 @@ mod embedded_tests {
     };
     use fluree_db_ledger::LedgerState;
     use fluree_db_nameservice::memory::MemoryNameService;
-    use fluree_db_nameservice::Publisher;
+    use fluree_db_nameservice::CommitPublisher;
     use fluree_db_novelty::{Commit, Novelty};
     use std::collections::HashMap;
 

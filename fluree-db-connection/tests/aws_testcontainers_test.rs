@@ -9,9 +9,9 @@ use fluree_db_connection::{connect_async, ConnectionHandle};
 use fluree_db_core::{ContentId, ContentKind, StorageRead, StorageWrite};
 use fluree_db_nameservice::{
     AdminPublisher, CasResult, ConfigCasResult, ConfigLookup, ConfigPayload, ConfigPublisher,
-    ConfigValue, GraphSourceLookup, GraphSourcePublisher, GraphSourceType, NameServiceLookup,
-    NsLookupResult, Publisher, RefKind, RefLookup, RefPublisher, RefValue, StatusCasResult,
-    StatusLookup, StatusPayload, StatusPublisher, StatusValue,
+    ConfigValue, GraphSourceLookup, GraphSourcePublisher, GraphSourceType, IndexPublisher,
+    LedgerLifecycle, NameServiceLookup, NsLookupResult, RefKind, RefLookup, RefPublisher,
+    RefValue, StatusCasResult, StatusLookup, StatusPayload, StatusPublisher, StatusValue,
 };
 use fluree_db_storage_aws::DynamoDbNameService;
 use fs2::FileExt;
@@ -227,9 +227,9 @@ async fn localstack_s3_and_dynamodb_smoke() {
 
     // Init materializes all concern items (meta, head, index, status, config)
     aws.nameservice_arc()
-        .publish_ledger_init(alias)
+        .init(alias)
         .await
-        .expect("publish_ledger_init should succeed");
+        .expect("init should succeed");
 
     // Publish commit head
     let commit_id = test_commit_id("commit:1");
@@ -362,8 +362,8 @@ async fn nameservice_ledger_lifecycle() {
         "publish_index on uninitialized alias should fail"
     );
 
-    // ── publish_ledger_init ────────────────────────────────────────────────
-    ns.publish_ledger_init(alias).await.unwrap();
+    // ── init ────────────────────────────────────────────────
+    ns.init(alias).await.unwrap();
 
     // Lookup returns record with unborn head/index
     let rec = ns.lookup(alias).await.unwrap().expect("exists after init");
@@ -380,7 +380,7 @@ async fn nameservice_ledger_lifecycle() {
     // Double init → should succeed (idempotent or conflict suppressed)
     // The implementation uses conditional PutItems that will fail if items exist,
     // but the error should be suppressed as "already exists".
-    let init2 = ns.publish_ledger_init(alias).await;
+    let init2 = ns.init(alias).await;
     assert!(
         init2.is_ok() || init2.is_err(),
         "double init should not panic"
@@ -436,7 +436,7 @@ async fn nameservice_admin_publisher() {
     let (_lock, _container, ns) = setup_localstack_ns().await;
 
     let alias = "admin-test:main";
-    ns.publish_ledger_init(alias).await.unwrap();
+    ns.init(alias).await.unwrap();
     let index_id_5 = test_index_id("index:5");
     ns.publish_index(alias, 5, &index_id_5).await.unwrap();
 
@@ -480,7 +480,7 @@ async fn publish_index_without_preexisting_index_item() {
     let alias = "missing-index-item:main";
 
     // 1. Initialize ledger — creates meta, head, index, status, config items
-    ns.publish_ledger_init(alias).await.unwrap();
+    ns.init(alias).await.unwrap();
 
     // Sanity: publish_index works on a fully initialized ledger
     let index_id_1 = test_index_id("index:1");
@@ -555,7 +555,7 @@ async fn nameservice_ref_publisher() {
         .unwrap()
         .is_none());
 
-    ns.publish_ledger_init(alias).await.unwrap();
+    ns.init(alias).await.unwrap();
 
     // get_ref after init → unborn (id=None, t=0)
     let ref_val = ns
@@ -694,7 +694,7 @@ async fn nameservice_status_publisher() {
     // get_status before init → None
     assert!(ns.get_status(alias).await.unwrap().is_none());
 
-    ns.publish_ledger_init(alias).await.unwrap();
+    ns.init(alias).await.unwrap();
 
     // get_status after init → initial (v=1, state="ready")
     let status = ns.get_status(alias).await.unwrap().expect("exists");
@@ -733,7 +733,7 @@ async fn nameservice_config_publisher() {
     // get_config before init → None
     assert!(ns.get_config(alias).await.unwrap().is_none());
 
-    ns.publish_ledger_init(alias).await.unwrap();
+    ns.init(alias).await.unwrap();
 
     // get_config after init → unborn (v=0, payload=None)
     let config = ns.get_config(alias).await.unwrap().expect("exists");
@@ -855,7 +855,7 @@ async fn nameservice_graph_source_publisher() {
     }
 
     // Also test lookup_any for a ledger
-    ns.publish_ledger_init("ledger-test:main").await.unwrap();
+    ns.init("ledger-test:main").await.unwrap();
     let any = ns.lookup_any("ledger-test:main").await.unwrap();
     match any {
         NsLookupResult::Ledger(ref r) => assert_eq!(r.ledger_id, "ledger-test:main"),

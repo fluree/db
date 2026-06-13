@@ -21,12 +21,12 @@ use crate::ns_format::{
     ns_context, BranchPointRef, IndexRef, LedgerRef, NsFileV2, NsIndexFileV2, NS_VERSION,
 };
 use crate::{
-    deserialize_json, parse_default_context_value, serialize_json, AdminPublisher, CasResult,
-    ConfigCasResult, ConfigLookup, ConfigPublisher, ConfigValue, GraphSourceLookup,
-    BranchLifecycle, GraphSourcePublisher, GraphSourceRecord, GraphSourceType,
-    NameServiceError, NameServiceLookup, NsLookupResult, NsRecord, Publisher, RefKind, RefLookup,
-    RefPublisher,
-    RefValue, Result, StatusCasResult, StatusLookup, StatusPublisher, StatusValue,
+    deserialize_json, parse_default_context_value, serialize_json, AdminPublisher, BranchLifecycle,
+    CasResult, CommitPublisher, ConfigCasResult, ConfigLookup, ConfigPublisher, ConfigValue,
+    GraphSourceLookup, GraphSourcePublisher, GraphSourceRecord, GraphSourceType, IndexPublisher,
+    LedgerLifecycle, NameServiceError, NameServiceLookup, NsLookupResult, NsRecord, RefKind,
+    RefLookup, RefPublisher, RefValue, Result, StatusCasResult, StatusLookup, StatusPublisher,
+    StatusValue,
 };
 use async_trait::async_trait;
 use fluree_db_core::ledger_id::{format_ledger_id, normalize_ledger_id, split_ledger_id};
@@ -700,11 +700,11 @@ where
 }
 
 #[async_trait]
-impl<S> Publisher for StorageNameService<S>
+impl<S> LedgerLifecycle for StorageNameService<S>
 where
     S: StorageRead + StorageWrite + StorageList + StorageCas + Debug + Send + Sync,
 {
-    async fn publish_ledger_init(&self, ledger_id: &str) -> Result<()> {
+    async fn init(&self, ledger_id: &str) -> Result<()> {
         let (ledger_name, branch) = split_ledger_id(ledger_id)?;
         let key = self.ns_key(&ledger_name, &branch);
         let normalized_address = format_ledger_id(&ledger_name, &branch);
@@ -767,6 +767,30 @@ where
         }
     }
 
+    async fn retract(&self, ledger_id: &str) -> Result<()> {
+        let (ledger_name, branch) = split_ledger_id(ledger_id)?;
+        let key = self.ns_key(&ledger_name, &branch);
+
+        self.cas_update::<NsFileV2, _>(&key, |existing| {
+            let mut file = existing?;
+            if file.status == "retracted" {
+                return None; // Already retracted
+            }
+            file.status = "retracted".to_string();
+            // Advance status_v when retracting
+            let current_v = file.status_v.unwrap_or(1);
+            file.status_v = Some(current_v + 1);
+            Some(file)
+        })
+        .await
+    }
+}
+
+#[async_trait]
+impl<S> CommitPublisher for StorageNameService<S>
+where
+    S: StorageRead + StorageWrite + StorageList + StorageCas + Debug + Send + Sync,
+{
     async fn publish_commit(
         &self,
         ledger_id: &str,
@@ -806,6 +830,17 @@ where
         .await
     }
 
+    fn publishing_ledger_id(&self, ledger_id: &str) -> Option<String> {
+        // Return normalized ledger ID for publishing
+        Some(normalize_ledger_id(ledger_id).unwrap_or_else(|_| ledger_id.to_string()))
+    }
+}
+
+#[async_trait]
+impl<S> IndexPublisher for StorageNameService<S>
+where
+    S: StorageRead + StorageWrite + StorageList + StorageCas + Debug + Send + Sync,
+{
     async fn publish_index(
         &self,
         ledger_id: &str,
@@ -834,29 +869,6 @@ where
             })
         })
         .await
-    }
-
-    async fn retract(&self, ledger_id: &str) -> Result<()> {
-        let (ledger_name, branch) = split_ledger_id(ledger_id)?;
-        let key = self.ns_key(&ledger_name, &branch);
-
-        self.cas_update::<NsFileV2, _>(&key, |existing| {
-            let mut file = existing?;
-            if file.status == "retracted" {
-                return None; // Already retracted
-            }
-            file.status = "retracted".to_string();
-            // Advance status_v when retracting
-            let current_v = file.status_v.unwrap_or(1);
-            file.status_v = Some(current_v + 1);
-            Some(file)
-        })
-        .await
-    }
-
-    fn publishing_ledger_id(&self, ledger_id: &str) -> Option<String> {
-        // Return normalized ledger ID for publishing
-        Some(normalize_ledger_id(ledger_id).unwrap_or_else(|_| ledger_id.to_string()))
     }
 }
 
@@ -2284,7 +2296,7 @@ mod tests {
         use crate::StatusLookup;
 
         let ns = make_storage_ns();
-        ns.publish_ledger_init("mydb:main").await.unwrap();
+        ns.init("mydb:main").await.unwrap();
 
         // Get initial status (v=1, state="ready")
         let initial = ns.get_status("mydb:main").await.unwrap().unwrap();

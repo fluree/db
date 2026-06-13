@@ -1092,11 +1092,18 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl fluree_db_nameservice::Publisher for LosePublishRaceNameService {
-        async fn publish_ledger_init(&self, ledger_id: &str) -> fluree_db_nameservice::Result<()> {
-            self.inner.publish_ledger_init(ledger_id).await
+    impl fluree_db_nameservice::LedgerLifecycle for LosePublishRaceNameService {
+        async fn init(&self, ledger_id: &str) -> fluree_db_nameservice::Result<()> {
+            self.inner.init(ledger_id).await
         }
 
+        async fn retract(&self, ledger_id: &str) -> fluree_db_nameservice::Result<()> {
+            self.inner.retract(ledger_id).await
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl fluree_db_nameservice::CommitPublisher for LosePublishRaceNameService {
         async fn publish_commit(
             &self,
             ledger_id: &str,
@@ -1108,6 +1115,13 @@ mod tests {
                 .await
         }
 
+        fn publishing_ledger_id(&self, ledger_id: &str) -> Option<String> {
+            self.inner.publishing_ledger_id(ledger_id)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl fluree_db_nameservice::IndexPublisher for LosePublishRaceNameService {
         async fn publish_index(
             &self,
             ledger_id: &str,
@@ -1115,14 +1129,6 @@ mod tests {
             index_id: &ContentId,
         ) -> fluree_db_nameservice::Result<()> {
             self.inner.publish_index(ledger_id, index_t, index_id).await
-        }
-
-        async fn retract(&self, ledger_id: &str) -> fluree_db_nameservice::Result<()> {
-            self.inner.retract(ledger_id).await
-        }
-
-        fn publishing_ledger_id(&self, ledger_id: &str) -> Option<String> {
-            self.inner.publishing_ledger_id(ledger_id)
         }
     }
 

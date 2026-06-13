@@ -71,7 +71,7 @@ pub use run_index::build::build_from_commits::{
 };
 
 use fluree_db_core::ContentStore;
-use fluree_db_nameservice::{NameServiceLookup, Publisher};
+use fluree_db_nameservice::{IndexPublisher, NameServiceLookup};
 use tracing::Instrument;
 
 /// Result of building an index
@@ -310,8 +310,16 @@ pub async fn upload_dicts_from_disk(
     .await
 }
 
-/// Publish index result to nameservice
-pub async fn publish_index_result(publisher: &dyn Publisher, result: &IndexResult) -> Result<()> {
+/// Publish index result to nameservice. Takes the narrower
+/// [`IndexPublisher`] surface because the index head is the only
+/// nameservice write the indexer ever makes — that way embedders
+/// (notably the Raft cluster's `RaftIndexPublisher`) can implement
+/// just this trait without faking commit / lifecycle writes they
+/// don't drive.
+pub async fn publish_index_result(
+    publisher: &dyn IndexPublisher,
+    result: &IndexResult,
+) -> Result<()> {
     publisher
         .publish_index(&result.ledger_id, result.index_t, &result.root_id)
         .await

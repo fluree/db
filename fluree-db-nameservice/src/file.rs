@@ -28,10 +28,10 @@ use crate::ns_format::{
 };
 use crate::{
     check_cas_expectation, deserialize_json, parse_default_context_value, ref_values_match,
-    serialize_json, AdminPublisher, CasResult, ConfigCasResult, ConfigLookup, ConfigPublisher,
-    ConfigValue, GraphSourceLookup, GraphSourcePublisher, GraphSourceRecord, GraphSourceType,
-    NameServiceError, NsLookupResult, NsRecord, Publisher,
-    RefKind, RefLookup, RefPublisher, RefValue, Result, StatusCasResult, StatusLookup,
+    serialize_json, AdminPublisher, CasResult, CommitPublisher, ConfigCasResult, ConfigLookup,
+    ConfigPublisher, ConfigValue, GraphSourceLookup, GraphSourcePublisher, GraphSourceRecord,
+    GraphSourceType, IndexPublisher, LedgerLifecycle, NameServiceError, NsLookupResult,
+    NsRecord, RefKind, RefLookup, RefPublisher, RefValue, Result, StatusCasResult, StatusLookup,
     StatusPublisher, StatusValue,
 };
 use async_trait::async_trait;
@@ -616,8 +616,8 @@ impl crate::BranchLifecycle for FileNameService {
 }
 
 #[async_trait]
-impl Publisher for FileNameService {
-    async fn publish_ledger_init(&self, ledger_id: &str) -> Result<()> {
+impl LedgerLifecycle for FileNameService {
+    async fn init(&self, ledger_id: &str) -> Result<()> {
         let (ledger_name, branch) = split_ledger_id(ledger_id)?;
         let address = Self::ns_address(&ledger_name, &branch);
         let normalized_address = format_ledger_id(&ledger_name, &branch);
@@ -657,6 +657,47 @@ impl Publisher for FileNameService {
         Ok(())
     }
 
+    async fn retract(&self, ledger_id: &str) -> Result<()> {
+        let (ledger_name, branch) = split_ledger_id(ledger_id)?;
+        let address = Self::ns_address(&ledger_name, &branch);
+
+        self.storage
+            .compare_and_swap(&address, |bytes| {
+                let Some(data) = bytes else {
+                    return Ok(CasAction::Abort(()));
+                };
+                let mut file: NsFileV2 = deserialize_json(data)?;
+                if file.status == "retracted" {
+                    return Ok(CasAction::Abort(()));
+                }
+                file.status = "retracted".to_string();
+                // Advance status_v when retracting
+                let current_v = file.status_v.unwrap_or(1);
+                file.status_v = Some(current_v + 1);
+                let new_bytes = serialize_json(&file)?;
+                Ok(CasAction::Write(new_bytes))
+            })
+            .await?;
+
+        Ok(())
+    }
+
+    async fn purge(&self, ledger_id: &str) -> Result<()> {
+        // First retract (updates status, fires event)
+        self.retract(ledger_id).await?;
+        // Then remove the NS file so the alias can be reused
+        let (ledger_name, branch) = split_ledger_id(ledger_id)?;
+        let main_path = self.ns_path(&ledger_name, &branch);
+        let _ = tokio::fs::remove_file(&main_path).await;
+        // Also remove the index sidecar if present
+        let idx_path = self.index_path(&ledger_name, &branch);
+        let _ = tokio::fs::remove_file(&idx_path).await;
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl CommitPublisher for FileNameService {
     async fn publish_commit(
         &self,
         ledger_id: &str,
@@ -721,6 +762,14 @@ impl Publisher for FileNameService {
         Ok(())
     }
 
+    fn publishing_ledger_id(&self, ledger_id: &str) -> Option<String> {
+        // File nameservice returns the normalized ledger ID for publishing
+        Some(normalize_ledger_id(ledger_id).unwrap_or_else(|_| ledger_id.to_string()))
+    }
+}
+
+#[async_trait]
+impl IndexPublisher for FileNameService {
     async fn publish_index(
         &self,
         ledger_id: &str,
@@ -753,49 +802,6 @@ impl Publisher for FileNameService {
             .await?;
 
         Ok(())
-    }
-
-    async fn retract(&self, ledger_id: &str) -> Result<()> {
-        let (ledger_name, branch) = split_ledger_id(ledger_id)?;
-        let address = Self::ns_address(&ledger_name, &branch);
-
-        self.storage
-            .compare_and_swap(&address, |bytes| {
-                let Some(data) = bytes else {
-                    return Ok(CasAction::Abort(()));
-                };
-                let mut file: NsFileV2 = deserialize_json(data)?;
-                if file.status == "retracted" {
-                    return Ok(CasAction::Abort(()));
-                }
-                file.status = "retracted".to_string();
-                // Advance status_v when retracting
-                let current_v = file.status_v.unwrap_or(1);
-                file.status_v = Some(current_v + 1);
-                let new_bytes = serialize_json(&file)?;
-                Ok(CasAction::Write(new_bytes))
-            })
-            .await?;
-
-        Ok(())
-    }
-
-    async fn purge(&self, ledger_id: &str) -> Result<()> {
-        // First retract (updates status, fires event)
-        self.retract(ledger_id).await?;
-        // Then remove the NS file so the alias can be reused
-        let (ledger_name, branch) = split_ledger_id(ledger_id)?;
-        let main_path = self.ns_path(&ledger_name, &branch);
-        let _ = tokio::fs::remove_file(&main_path).await;
-        // Also remove the index sidecar if present
-        let idx_path = self.index_path(&ledger_name, &branch);
-        let _ = tokio::fs::remove_file(&idx_path).await;
-        Ok(())
-    }
-
-    fn publishing_ledger_id(&self, ledger_id: &str) -> Option<String> {
-        // File nameservice returns the normalized ledger ID for publishing
-        Some(normalize_ledger_id(ledger_id).unwrap_or_else(|_| ledger_id.to_string()))
     }
 }
 
@@ -2125,7 +2131,7 @@ mod tests {
     #[tokio::test]
     async fn test_file_status_get_initial() {
         let (_dir, ns) = setup().await;
-        ns.publish_ledger_init("mydb:main").await.unwrap();
+        ns.init("mydb:main").await.unwrap();
 
         let status = ns.get_status("mydb:main").await.unwrap().unwrap();
         assert_eq!(status.v, 1);
@@ -2135,7 +2141,7 @@ mod tests {
     #[tokio::test]
     async fn test_file_status_push_update() {
         let (_dir, ns) = setup().await;
-        ns.publish_ledger_init("mydb:main").await.unwrap();
+        ns.init("mydb:main").await.unwrap();
 
         let initial = ns.get_status("mydb:main").await.unwrap().unwrap();
 
@@ -2156,7 +2162,7 @@ mod tests {
     #[tokio::test]
     async fn test_file_status_push_conflict() {
         let (_dir, ns) = setup().await;
-        ns.publish_ledger_init("mydb:main").await.unwrap();
+        ns.init("mydb:main").await.unwrap();
 
         // Try to push with wrong expected value
         let wrong_expected = crate::StatusValue::new(5, crate::StatusPayload::new("wrong"));
@@ -2179,7 +2185,7 @@ mod tests {
     #[tokio::test]
     async fn test_file_retract_bumps_status_v() {
         let (_dir, ns) = setup().await;
-        ns.publish_ledger_init("mydb:main").await.unwrap();
+        ns.init("mydb:main").await.unwrap();
 
         // Get initial status (v=1, state="ready")
         let initial = ns.get_status("mydb:main").await.unwrap().unwrap();
@@ -2212,7 +2218,7 @@ mod tests {
     #[tokio::test]
     async fn test_file_config_get_unborn() {
         let (_dir, ns) = setup().await;
-        ns.publish_ledger_init("mydb:main").await.unwrap();
+        ns.init("mydb:main").await.unwrap();
 
         let config = ns.get_config("mydb:main").await.unwrap().unwrap();
         assert!(config.is_unborn());
@@ -2222,7 +2228,7 @@ mod tests {
     #[tokio::test]
     async fn test_file_config_push_from_unborn() {
         let (_dir, ns) = setup().await;
-        ns.publish_ledger_init("mydb:main").await.unwrap();
+        ns.init("mydb:main").await.unwrap();
 
         let unborn = ns.get_config("mydb:main").await.unwrap().unwrap();
         assert!(unborn.is_unborn());
@@ -2252,7 +2258,7 @@ mod tests {
     #[tokio::test]
     async fn test_file_config_push_conflict() {
         let (_dir, ns) = setup().await;
-        ns.publish_ledger_init("mydb:main").await.unwrap();
+        ns.init("mydb:main").await.unwrap();
 
         // Try to push with wrong expected value
         let wrong_expected = crate::ConfigValue::new(5, Some(crate::ConfigPayload::new()));
@@ -2278,7 +2284,7 @@ mod tests {
     #[tokio::test]
     async fn test_file_create_branch_from_main() {
         let (_temp, ns) = setup().await;
-        ns.publish_ledger_init("mydb:main").await.unwrap();
+        ns.init("mydb:main").await.unwrap();
         let cid = test_cid("commit-5");
         ns.publish_commit("mydb:main", 5, &cid).await.unwrap();
 
@@ -2297,7 +2303,7 @@ mod tests {
     #[tokio::test]
     async fn test_file_create_branch_duplicate_fails() {
         let (_temp, ns) = setup().await;
-        ns.publish_ledger_init("mydb:main").await.unwrap();
+        ns.init("mydb:main").await.unwrap();
         let cid = test_cid("commit-1");
         ns.publish_commit("mydb:main", 1, &cid).await.unwrap();
 
@@ -2310,7 +2316,7 @@ mod tests {
     #[tokio::test]
     async fn test_file_list_branches() {
         let (_temp, ns) = setup().await;
-        ns.publish_ledger_init("mydb:main").await.unwrap();
+        ns.init("mydb:main").await.unwrap();
         let cid = test_cid("commit-3");
         ns.publish_commit("mydb:main", 3, &cid).await.unwrap();
 
@@ -2320,7 +2326,7 @@ mod tests {
             .unwrap();
 
         // Also create a different ledger to ensure filtering works
-        ns.publish_ledger_init("other:main").await.unwrap();
+        ns.init("other:main").await.unwrap();
 
         let branches = ns.list_branches("mydb").await.unwrap();
         assert_eq!(branches.len(), 3);
@@ -2332,7 +2338,7 @@ mod tests {
     #[tokio::test]
     async fn test_file_list_branches_with_slashes() {
         let (_temp, ns) = setup().await;
-        ns.publish_ledger_init("mydb:main").await.unwrap();
+        ns.init("mydb:main").await.unwrap();
         let cid = test_cid("commit-1");
         ns.publish_commit("mydb:main", 1, &cid).await.unwrap();
 
@@ -2360,7 +2366,7 @@ mod tests {
     #[tokio::test]
     async fn test_file_list_branches_excludes_retracted() {
         let (_temp, ns) = setup().await;
-        ns.publish_ledger_init("mydb:main").await.unwrap();
+        ns.init("mydb:main").await.unwrap();
         let cid = test_cid("commit-1");
         ns.publish_commit("mydb:main", 1, &cid).await.unwrap();
 
@@ -2377,7 +2383,7 @@ mod tests {
     #[tokio::test]
     async fn test_file_branch_point_persists_across_reload() {
         let (temp, ns) = setup().await;
-        ns.publish_ledger_init("mydb:main").await.unwrap();
+        ns.init("mydb:main").await.unwrap();
         let cid = test_cid("commit-2");
         ns.publish_commit("mydb:main", 2, &cid).await.unwrap();
 

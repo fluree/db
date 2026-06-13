@@ -122,7 +122,7 @@ mod tests {
     use super::*;
     use fluree_db_core::{ContentId, ContentKind};
     use fluree_db_nameservice::{
-        memory::MemoryNameService, GraphSourcePublisher, GraphSourceType, Publisher,
+        memory::MemoryNameService, CommitPublisher, GraphSourcePublisher, GraphSourceType,
     };
 
     async fn setup_ns_with_records() -> MemoryNameService {

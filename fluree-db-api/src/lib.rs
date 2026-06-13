@@ -413,77 +413,21 @@ impl fluree_db_nameservice::GraphSourceLookup for NameServiceMode {
 }
 
 #[async_trait]
-impl fluree_db_nameservice::GraphSourcePublisher for NameServiceMode {
-    async fn publish_graph_source(
-        &self,
-        name: &str,
-        branch: &str,
-        source_type: fluree_db_nameservice::GraphSourceType,
-        config: &str,
-        dependencies: &[String],
-    ) -> std::result::Result<(), fluree_db_nameservice::NameServiceError> {
-        match self {
-            Self::ReadWrite(ns) => {
-                ns.publish_graph_source(name, branch, source_type, config, dependencies)
-                    .await
-            }
-            Self::ReadOnly(_) => Err(fluree_db_nameservice::NameServiceError::Storage(
-                "publish_graph_source not available on read-only nameservice".into(),
-            )),
-        }
-    }
-
-    async fn publish_graph_source_index(
-        &self,
-        name: &str,
-        branch: &str,
-        index_id: &fluree_db_core::ContentId,
-        index_t: i64,
-    ) -> std::result::Result<(), fluree_db_nameservice::NameServiceError> {
-        match self {
-            Self::ReadWrite(ns) => {
-                ns.publish_graph_source_index(name, branch, index_id, index_t)
-                    .await
-            }
-            Self::ReadOnly(_) => Err(fluree_db_nameservice::NameServiceError::Storage(
-                "publish_graph_source_index not available on read-only nameservice".into(),
-            )),
-        }
-    }
-
-    async fn retract_graph_source(
-        &self,
-        name: &str,
-        branch: &str,
-    ) -> std::result::Result<(), fluree_db_nameservice::NameServiceError> {
-        match self {
-            Self::ReadWrite(ns) => ns.retract_graph_source(name, branch).await,
-            Self::ReadOnly(_) => Err(fluree_db_nameservice::NameServiceError::Storage(
-                "retract_graph_source not available on read-only nameservice".into(),
-            )),
-        }
-    }
-}
-
-#[async_trait]
-impl fluree_db_nameservice::AdminPublisher for NameServiceMode {
-    async fn publish_index_allow_equal(
-        &self,
-        ledger_id: &str,
-        index_t: i64,
-        index_id: &fluree_db_core::ContentId,
-    ) -> std::result::Result<(), fluree_db_nameservice::NameServiceError> {
-        match self {
-            Self::ReadWrite(ns) => {
-                ns.publish_index_allow_equal(ledger_id, index_t, index_id)
-                    .await
-            }
-            Self::ReadOnly(_) => Err(fluree_db_nameservice::NameServiceError::Storage(
-                "publish_index_allow_equal not available on read-only nameservice".into(),
-            )),
-        }
-    }
-}
+// NOTE: `NameServiceMode` deliberately does NOT implement any of the
+// write traits (`GraphSourcePublisher`, `AdminPublisher`,
+// `ConfigPublisher`, `StatusPublisher`, `RefPublisher`,
+// `LedgerLifecycle`, `CommitPublisher`, `IndexPublisher`). The
+// `ReadOnly` variant has no writer to call, so any such impl would
+// have to fake the contract by returning an error on every call —
+// a runtime check for what is a compile-time guarantee, and a
+// violation of the "no trait-method stubs returning errors" rule.
+//
+// Callers that need write access go through `Self::publisher()` or
+// `Self::publisher_arc()` (or `Fluree::publisher()` for an
+// error-coordinated `Result`). Those return the inner
+// `Arc<dyn NameServicePublisher>` from `ReadWrite` and `None` /
+// `Err(...)` from `ReadOnly` — the variant check happens once at
+// the boundary, and from there the caller has an honest writer.
 
 #[async_trait]
 impl fluree_db_nameservice::ConfigLookup for NameServiceMode {
@@ -495,26 +439,6 @@ impl fluree_db_nameservice::ConfigLookup for NameServiceMode {
         fluree_db_nameservice::NameServiceError,
     > {
         self.reader().get_config(ledger_id).await
-    }
-}
-
-#[async_trait]
-impl fluree_db_nameservice::ConfigPublisher for NameServiceMode {
-    async fn push_config(
-        &self,
-        ledger_id: &str,
-        expected: Option<&fluree_db_nameservice::ConfigValue>,
-        new: &fluree_db_nameservice::ConfigValue,
-    ) -> std::result::Result<
-        fluree_db_nameservice::ConfigCasResult,
-        fluree_db_nameservice::NameServiceError,
-    > {
-        match self {
-            Self::ReadWrite(ns) => ns.push_config(ledger_id, expected, new).await,
-            Self::ReadOnly(_) => Err(fluree_db_nameservice::NameServiceError::Storage(
-                "push_config not available on read-only nameservice".into(),
-            )),
-        }
     }
 }
 
@@ -587,43 +511,15 @@ impl fluree_db_nameservice::RefPublisher for NameServiceMode {
 }
 
 #[async_trait]
-impl fluree_db_nameservice::Publisher for NameServiceMode {
-    async fn publish_ledger_init(
+impl fluree_db_nameservice::LedgerLifecycle for NameServiceMode {
+    async fn init(
         &self,
         ledger_id: &str,
     ) -> std::result::Result<(), fluree_db_nameservice::NameServiceError> {
         match self {
-            Self::ReadWrite(ns) => ns.publish_ledger_init(ledger_id).await,
+            Self::ReadWrite(ns) => ns.init(ledger_id).await,
             Self::ReadOnly(_) => Err(fluree_db_nameservice::NameServiceError::Storage(
-                "publish_ledger_init not available on read-only nameservice".into(),
-            )),
-        }
-    }
-
-    async fn publish_commit(
-        &self,
-        ledger_id: &str,
-        commit_t: i64,
-        commit_id: &fluree_db_core::ContentId,
-    ) -> std::result::Result<(), fluree_db_nameservice::NameServiceError> {
-        match self {
-            Self::ReadWrite(ns) => ns.publish_commit(ledger_id, commit_t, commit_id).await,
-            Self::ReadOnly(_) => Err(fluree_db_nameservice::NameServiceError::Storage(
-                "publish_commit not available on read-only nameservice".into(),
-            )),
-        }
-    }
-
-    async fn publish_index(
-        &self,
-        ledger_id: &str,
-        index_t: i64,
-        index_id: &fluree_db_core::ContentId,
-    ) -> std::result::Result<(), fluree_db_nameservice::NameServiceError> {
-        match self {
-            Self::ReadWrite(ns) => ns.publish_index(ledger_id, index_t, index_id).await,
-            Self::ReadOnly(_) => Err(fluree_db_nameservice::NameServiceError::Storage(
-                "publish_index not available on read-only nameservice".into(),
+                "init not available on read-only nameservice".into(),
             )),
         }
     }
@@ -651,11 +547,45 @@ impl fluree_db_nameservice::Publisher for NameServiceMode {
             )),
         }
     }
+}
+
+#[async_trait]
+impl fluree_db_nameservice::CommitPublisher for NameServiceMode {
+    async fn publish_commit(
+        &self,
+        ledger_id: &str,
+        commit_t: i64,
+        commit_id: &fluree_db_core::ContentId,
+    ) -> std::result::Result<(), fluree_db_nameservice::NameServiceError> {
+        match self {
+            Self::ReadWrite(ns) => ns.publish_commit(ledger_id, commit_t, commit_id).await,
+            Self::ReadOnly(_) => Err(fluree_db_nameservice::NameServiceError::Storage(
+                "publish_commit not available on read-only nameservice".into(),
+            )),
+        }
+    }
 
     fn publishing_ledger_id(&self, ledger_id: &str) -> Option<String> {
         match self {
             Self::ReadWrite(ns) => ns.publishing_ledger_id(ledger_id),
             Self::ReadOnly(_) => None,
+        }
+    }
+}
+
+#[async_trait]
+impl fluree_db_nameservice::IndexPublisher for NameServiceMode {
+    async fn publish_index(
+        &self,
+        ledger_id: &str,
+        index_t: i64,
+        index_id: &fluree_db_core::ContentId,
+    ) -> std::result::Result<(), fluree_db_nameservice::NameServiceError> {
+        match self {
+            Self::ReadWrite(ns) => ns.publish_index(ledger_id, index_t, index_id).await,
+            Self::ReadOnly(_) => Err(fluree_db_nameservice::NameServiceError::Storage(
+                "publish_index not available on read-only nameservice".into(),
+            )),
         }
     }
 }
@@ -3573,7 +3503,7 @@ impl Fluree {
             let new_config = ConfigValue::new(new_v, Some(new_payload));
 
             match self
-                .nameservice_mode
+                .publisher()?
                 .push_config(canonical_id, current_config.as_ref(), &new_config)
                 .await?
             {
