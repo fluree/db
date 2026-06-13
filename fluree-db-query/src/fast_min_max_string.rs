@@ -272,7 +272,10 @@ fn minmax_numeric_post(
                 MinMaxMode::Max => read_ordered_key_v2(RunSortOrder::Post, &entry.last_key),
             };
             let ot = OType::from_u16(rr.o_type);
-            if !ot.is_numeric() {
+            // Numeric kinds plus order-preserving inline decimals: their boundary
+            // o_key is the min/max value. (The single-o_type checks below ensure a
+            // predicate mixing inline and arena decimals declines.)
+            if !ot.is_numeric() && ot != OType::XSD_DECIMAL_INLINE {
                 return Ok(None);
             }
 
@@ -307,6 +310,10 @@ fn numeric_binding_from_otype_okey(store: &BinaryIndexStore, o_type: u16, o_key:
         DecodeKind::F64 => {
             Binding::lit(FlakeValue::Double(ObjKey::from_u64(o_key).decode_f64()), dt)
         }
+        DecodeKind::Decimal => Binding::lit(
+            FlakeValue::Decimal(Box::new(ObjKey::from_u64(o_key).decode_decimal())),
+            dt,
+        ),
         _ => Binding::Unbound,
     }
 }

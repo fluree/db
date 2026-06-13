@@ -1258,4 +1258,25 @@ async fn inline_decimal_order_by_and_range_are_numeric_after_reindex() {
         vec!["3"],
         "FILTER(?v >= 2) over decimals must count 2, 19.99, 1000.5"
     );
+
+    // 6. MIN / MAX — exercises the boundary-key numeric MIN/MAX fast path.
+    let minmax = support::query_sparql(
+        &fluree,
+        &ledger,
+        r"PREFIX ex: <http://example.org/>
+          SELECT (MIN(?v) AS ?lo) (MAX(?v) AS ?hi) WHERE { ?s ex:v ?v }",
+    )
+    .await
+    .expect("min/max");
+    let minmax_json = minmax.to_sparql_json(&ledger.snapshot).expect("json");
+    assert_eq!(
+        binding_values(&minmax_json, "lo"),
+        vec!["-1"],
+        "MIN over decimals must be the most negative value"
+    );
+    assert_eq!(
+        binding_values(&minmax_json, "hi"),
+        vec!["1000.5"],
+        "MAX over decimals must be the largest value"
+    );
 }
