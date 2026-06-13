@@ -1958,7 +1958,7 @@ mod tests {
     fn property_test_decimals() -> Vec<bigdecimal::BigDecimal> {
         use bigdecimal::BigDecimal;
         use num_bigint::BigInt;
-        let coeffs: [i64; 9] = [1, 2, 7, 9, 15, 100, 999, 12345, 9999999999999999];
+        let coeffs: [i64; 9] = [1, 2, 7, 9, 15, 100, 999, 12345, 9_999_999_999_999_999];
         let scales: [i64; 13] = [-15, -8, -3, -1, 0, 1, 2, 3, 5, 8, 12, 20, 28];
         let mut out = vec![BigDecimal::from(0)];
         for &c in &coeffs {
