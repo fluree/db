@@ -21,8 +21,8 @@
 //!
 //! # What's NOT tracked here
 //!
-//! The state machine only carries ledger lifecycle and branch heads —
-//! it does not replicate index roots, default contexts, ledger
+//! The state machine carries ledger lifecycle, branch commit heads,
+//! and published index heads — but not default contexts, ledger
 //! configuration, or graph-source records. The lookup methods report
 //! those as absent (None / 0 / empty), which is what
 //! [`LedgerState::load`] needs for a follower reload: it falls back
@@ -67,9 +67,9 @@ impl fmt::Debug for RaftNameService {
 /// [`LedgerRecord`](crate::raft::state_machine::LedgerRecord).
 ///
 /// Fields the state machine doesn't track
-/// (`index_head_id`/`index_t`/`default_context`/`config_id`/`source_branch`/`branches`)
-/// fall back to their `NsRecord::new` defaults — see the module docs
-/// for why that's enough for follower reload.
+/// (`default_context`/`config_id`/`source_branch`/`branches`) fall
+/// back to their `NsRecord::new` defaults — see the module docs for
+/// why that's enough for follower reload.
 fn record_from_state(state: &NameServiceState, ledger_name: &str, branch: &str) -> Option<NsRecord> {
     if !state.ledgers.contains_key(ledger_name) {
         return None;
@@ -79,6 +79,10 @@ fn record_from_state(state: &NameServiceState, ledger_name: &str, branch: &str) 
     if let Some(entry) = state.refs.get(&ref_key) {
         record.commit_head_id = Some(entry.head.clone());
         record.commit_t = entry.t;
+        if let Some(index) = &entry.index {
+            record.index_head_id = Some(index.head.clone());
+            record.index_t = index.t;
+        }
     }
     Some(record)
 }
@@ -121,7 +125,16 @@ impl RefLookup for RaftNameService {
                     t: entry.map(|e| e.t).unwrap_or(0),
                 }))
             }
-            RefKind::IndexHead => Ok(Some(RefValue { id: None, t: 0 })),
+            RefKind::IndexHead => {
+                let index = state
+                    .refs
+                    .get(&RefKey::new(&name, &branch))
+                    .and_then(|e| e.index.as_ref());
+                Ok(Some(RefValue {
+                    id: index.map(|i| i.head.clone()),
+                    t: index.map(|i| i.t).unwrap_or(0),
+                }))
+            }
         }
     }
 }
@@ -171,7 +184,7 @@ impl ConfigLookup for RaftNameService {
 mod tests {
     use super::*;
     use crate::raft::state_machine::{
-        AdvanceRefArgs, Command, CreateLedgerArgs, NameServiceState, Response,
+        AdvanceIndexHeadArgs, AdvanceRefArgs, Command, CreateLedgerArgs, NameServiceState, Response,
     };
     use fluree_db_api::{ContentId, ContentKind};
     use std::sync::Arc;
@@ -286,6 +299,138 @@ mod tests {
             .expect("index ref");
         assert!(index_ref.id.is_none());
         assert_eq!(index_ref.t, 0);
+    }
+
+    /// Convenience for the index-head tests: create a ledger at
+    /// `initial_head = cid(0)`, advance commit to `new_head = cid(c)` at
+    /// the supplied `commit_t`. Returns the shared state.
+    async fn ledger_at_commit(commit_head: u8, commit_t: i64) -> SharedState {
+        let state = fresh_state();
+        let _ = apply_cmd(
+            &state,
+            Command::CreateLedger(CreateLedgerArgs {
+                ledger_id: "test/db".into(),
+                initial_branch: "main".into(),
+                initial_head: cid(0),
+                initial_t: 0,
+                governance: cid(0xAA),
+                created_at_millis: 1_000,
+            }),
+            1,
+        )
+        .await;
+        let _ = apply_cmd(
+            &state,
+            Command::AdvanceRef(AdvanceRefArgs {
+                ledger_id: "test/db".into(),
+                branch: "main".into(),
+                expected_prev: Some(cid(0)),
+                new_head: cid(commit_head),
+                t: commit_t,
+                applied_at_millis: 2_000,
+                idempotency: None,
+                release: Vec::new(),
+                tally: None,
+            }),
+            2,
+        )
+        .await;
+        state
+    }
+
+    #[tokio::test]
+    async fn lookup_returns_index_after_advance_index_head() {
+        let state = ledger_at_commit(7, 10).await;
+        let _ = apply_cmd(
+            &state,
+            Command::AdvanceIndexHead(AdvanceIndexHeadArgs {
+                ledger_id: "test/db".into(),
+                branch: "main".into(),
+                new_index_head: cid(42),
+                t: 10,
+                applied_at_millis: 3_000,
+            }),
+            3,
+        )
+        .await;
+
+        let ns = RaftNameService::new(state);
+        let record = ns.lookup("test/db:main").await.unwrap().expect("record");
+        assert_eq!(record.commit_head_id, Some(cid(7)));
+        assert_eq!(record.commit_t, 10);
+        assert_eq!(record.index_head_id, Some(cid(42)));
+        assert_eq!(record.index_t, 10);
+    }
+
+    #[tokio::test]
+    async fn get_ref_returns_index_head_after_advance() {
+        let state = ledger_at_commit(7, 10).await;
+        let _ = apply_cmd(
+            &state,
+            Command::AdvanceIndexHead(AdvanceIndexHeadArgs {
+                ledger_id: "test/db".into(),
+                branch: "main".into(),
+                new_index_head: cid(42),
+                t: 10,
+                applied_at_millis: 3_000,
+            }),
+            3,
+        )
+        .await;
+
+        let ns = RaftNameService::new(state);
+        let ref_value = ns
+            .get_ref("test/db:main", RefKind::IndexHead)
+            .await
+            .unwrap()
+            .expect("ref value");
+        assert_eq!(ref_value.id, Some(cid(42)));
+        assert_eq!(ref_value.t, 10);
+    }
+
+    #[tokio::test]
+    async fn lookup_carries_index_forward_when_commit_advances_again() {
+        // Index at t=10, then advance the commit to t=20. The lookup
+        // should still report the t=10 index head — the next commit
+        // didn't re-index itself, but it also shouldn't drop the
+        // pointer to the latest available index.
+        let state = ledger_at_commit(7, 10).await;
+        let _ = apply_cmd(
+            &state,
+            Command::AdvanceIndexHead(AdvanceIndexHeadArgs {
+                ledger_id: "test/db".into(),
+                branch: "main".into(),
+                new_index_head: cid(42),
+                t: 10,
+                applied_at_millis: 3_000,
+            }),
+            3,
+        )
+        .await;
+        let _ = apply_cmd(
+            &state,
+            Command::AdvanceRef(AdvanceRefArgs {
+                ledger_id: "test/db".into(),
+                branch: "main".into(),
+                expected_prev: Some(cid(7)),
+                new_head: cid(8),
+                t: 20,
+                applied_at_millis: 4_000,
+                idempotency: None,
+                release: Vec::new(),
+                tally: None,
+            }),
+            4,
+        )
+        .await;
+
+        let ns = RaftNameService::new(state);
+        let record = ns.lookup("test/db:main").await.unwrap().expect("record");
+        assert_eq!(record.commit_head_id, Some(cid(8)));
+        assert_eq!(record.commit_t, 20);
+        // Index pointer unchanged.
+        assert_eq!(record.index_head_id, Some(cid(42)));
+        assert_eq!(record.index_t, 10);
     }
 
     #[tokio::test]
