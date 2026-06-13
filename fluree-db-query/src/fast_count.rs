@@ -340,8 +340,8 @@ fn count_rows_for_predicate_numeric_compare_post(
         // Same o_type at both ends ⇒ uniform o_type (POST sorts o_type before o_key).
         if min_ot == max_ot {
             let otype = OType::from_u16(min_ot);
-            if !matches!(otype, OType::XSD_INTEGER | OType::XSD_DOUBLE) {
-                // Uniformly unsupported (e.g. all-decimal predicate): the leaf
+            if !otype_okey_order_comparable(otype) {
+                // Uniformly not o_key-comparable (e.g. arena NUM_BIG): the leaf
                 // scan below would bail on its first leaflet anyway — defer
                 // now without opening any leaves.
                 return Ok(None);
@@ -385,16 +385,24 @@ fn count_rows_for_predicate_numeric_compare_post(
 /// per-leaflet directory must be consulted for this predicate's first/last key).
 /// Returns `None` if there are no leaves (an empty predicate — the caller's total is
 /// 0) or, defensively, if a boundary leaf yields no matching leaflet.
+/// o_types whose `o_key` order equals numeric order, so a `?o <cmp> K` count can
+/// compare encoded keys directly: canonical-width integers, doubles, and the
+/// order-preserving inline decimals. (Other integer widths and arena NUM_BIG are
+/// numeric but not o_key-comparable.)
+fn otype_okey_order_comparable(ot: OType) -> bool {
+    matches!(
+        ot,
+        OType::XSD_INTEGER | OType::XSD_DOUBLE | OType::XSD_DECIMAL_INLINE
+    )
+}
+
 /// True if this o_type is numeric but cannot be compared by encoded o_key in
-/// the numeric-COUNT lanes (non-canonical integer widths, floats, decimals,
-/// arena-keyed NUM_BIG): rows of these kinds force the count to defer.
+/// the numeric-COUNT lanes (non-canonical integer widths, floats, arena-keyed
+/// NUM_BIG): rows of these kinds force the count to defer.
 fn otype_unsupported_numeric(raw: u16) -> bool {
     let ot = OType::from_u16(raw);
-    // XSD_DECIMAL_INLINE is numeric but equality-keyed (o_key is not value
-    // ordered), so it can't be compared by o_key here — treat it as unsupported
-    // (defer), exactly like arena NUM_BIG and the non-canonical integer widths.
     (ot.is_numeric() || ot == OType::NUM_BIG_OVERFLOW || ot == OType::XSD_DECIMAL_INLINE)
-        && !matches!(ot, OType::XSD_INTEGER | OType::XSD_DOUBLE)
+        && !otype_okey_order_comparable(ot)
 }
 
 fn predicate_post_global_extent(
@@ -498,7 +506,7 @@ fn count_numeric_compare_in_leaf_slice(
                 return Ok(None);
             };
             let otype = OType::from_u16(raw_otype);
-            if !matches!(otype, OType::XSD_INTEGER | OType::XSD_DOUBLE) {
+            if !otype_okey_order_comparable(otype) {
                 return Ok(None);
             }
             let threshold_key = match encode_numeric_threshold_for_otype(otype, threshold)? {
@@ -536,6 +544,13 @@ fn count_numeric_compare_in_leaf_slice(
 }
 
 fn encode_numeric_threshold_for_otype(otype: OType, threshold: &FlakeValue) -> Result<Option<u64>> {
+    use bigdecimal::BigDecimal;
+    // Encode the threshold into the row o_type's key space. Inline decimals use
+    // the order-preserving decimal codec, so a `>`/`<` comparison of `o_key`s is
+    // exact: an integer/decimal threshold and a numerically-equal stored decimal
+    // encode identically, so cross-form (`?price > 10` over decimal rows) is
+    // correct. A threshold that doesn't fit inline (or a double threshold against
+    // decimal rows) yields `None` → the caller declines the fast path.
     let key = match (otype, threshold) {
         (OType::XSD_INTEGER, FlakeValue::Long(n)) => ObjKey::encode_i64(*n).as_u64(),
         (OType::XSD_DOUBLE, FlakeValue::Long(n)) => ObjKey::encode_f64(*n as f64)
@@ -544,6 +559,22 @@ fn encode_numeric_threshold_for_otype(otype: OType, threshold: &FlakeValue) -> R
         (OType::XSD_DOUBLE, FlakeValue::Double(d)) => ObjKey::encode_f64(*d)
             .map_err(|_| QueryError::execution("cannot encode f64 threshold".to_string()))?
             .as_u64(),
+        (OType::XSD_DECIMAL_INLINE, FlakeValue::Decimal(d)) => match ObjKey::encode_decimal(d) {
+            Some(k) => k.as_u64(),
+            None => return Ok(None),
+        },
+        (OType::XSD_DECIMAL_INLINE, FlakeValue::Long(n)) => {
+            match ObjKey::encode_decimal(&BigDecimal::from(*n)) {
+                Some(k) => k.as_u64(),
+                None => return Ok(None),
+            }
+        }
+        (OType::XSD_DECIMAL_INLINE, FlakeValue::BigInt(b)) => {
+            match ObjKey::encode_decimal(&BigDecimal::from(b.as_ref().clone())) {
+                Some(k) => k.as_u64(),
+                None => return Ok(None),
+            }
+        }
         _ => return Ok(None),
     };
     Ok(Some(key))
@@ -649,9 +680,10 @@ fn count_numeric_compare_overlay_parallel(
 ) -> Result<Option<u64>> {
     let tk_int = encode_numeric_threshold_for_otype(OType::XSD_INTEGER, threshold)?;
     let tk_dbl = encode_numeric_threshold_for_otype(OType::XSD_DOUBLE, threshold)?;
+    let tk_dec = encode_numeric_threshold_for_otype(OType::XSD_DECIMAL_INLINE, threshold)?;
 
-    // Pre-check the base predicate's POST extent: if the base rows are
-    // uniformly an unsupported o_type (e.g. all-decimal), or the threshold
+    // Pre-check the base predicate's POST extent: if the base rows are uniformly
+    // an o_type we can't compare by o_key (e.g. arena NUM_BIG), or the threshold
     // can't encode for the uniform supported type, the full scan below is
     // doomed — defer immediately instead of scanning every partition first.
     // (Unsupported values arriving only via novelty are still caught by the
@@ -662,13 +694,9 @@ fn count_numeric_compare_overlay_parallel(
             match OType::from_u16(min_ot) {
                 OType::XSD_INTEGER if tk_int.is_none() => return Ok(None),
                 OType::XSD_DOUBLE if tk_dbl.is_none() => return Ok(None),
-                OType::XSD_INTEGER | OType::XSD_DOUBLE => {}
-                ot if ot.is_numeric()
-                    || ot == OType::NUM_BIG_OVERFLOW
-                    || ot == OType::XSD_DECIMAL_INLINE =>
-                {
-                    return Ok(None)
-                }
+                OType::XSD_DECIMAL_INLINE if tk_dec.is_none() => return Ok(None),
+                OType::XSD_INTEGER | OType::XSD_DOUBLE | OType::XSD_DECIMAL_INLINE => {}
+                ot if ot.is_numeric() || ot == OType::NUM_BIG_OVERFLOW => return Ok(None),
                 _ => {}
             }
         } else if otype_unsupported_numeric(min_ot) || otype_unsupported_numeric(max_ot) {
@@ -680,9 +708,10 @@ fn count_numeric_compare_overlay_parallel(
     }
 
     // Numeric o_types this lane can't compare by o_key (other integer-family
-    // widths, floats, decimals — arena-keyed NUM_BIG has no value order at
-    // all) must defer the whole count: treating them as non-matches would
-    // silently undercount. Mirrors the base lane's per-leaflet Ok(None) bail.
+    // widths, and arena-keyed NUM_BIG which has no value order at all) must defer
+    // the whole count: treating them as non-matches would silently undercount.
+    // Inline decimals ARE comparable (order-preserving key). Mirrors the base
+    // lane's per-leaflet Ok(None) bail.
     let saw_unsupported_numeric = std::sync::atomic::AtomicBool::new(false);
     let count = parallel_overlay_psot_filter_count(
         ctx,
@@ -695,10 +724,8 @@ fn count_numeric_compare_overlay_parallel(
             let tk = match ot {
                 OType::XSD_INTEGER => tk_int,
                 OType::XSD_DOUBLE => tk_dbl,
-                _ if ot.is_numeric()
-                    || ot == OType::NUM_BIG_OVERFLOW
-                    || ot == OType::XSD_DECIMAL_INLINE =>
-                {
+                OType::XSD_DECIMAL_INLINE => tk_dec,
+                _ if ot.is_numeric() || ot == OType::NUM_BIG_OVERFLOW => {
                     saw_unsupported_numeric.store(true, std::sync::atomic::Ordering::Relaxed);
                     return false;
                 }

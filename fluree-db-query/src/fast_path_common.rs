@@ -283,21 +283,28 @@ pub fn cursor_projection_otype_okey() -> ColumnProjection {
 ///   by insertion order, not lexicographic value order;
 /// - lang strings (tag `11`);
 /// - `GEO_POINT` (packed lat/long — not a linear value order) and `BLANK_NODE`;
-/// - overflow big numerics / JSON / vector arena handles (equality-only);
-/// - inline decimals (`XSD_DECIMAL_INLINE`, 0x0020): the packed
-///   `(sign, scale, mantissa)` is equality-keyed, NOT value-ordered, so it is
-///   outside the `is_numeric` range above and must never be admitted here.
+/// - overflow big numerics / JSON / vector arena handles (equality-only).
+///
+/// Inline decimals (`XSD_DECIMAL_INLINE`) ARE admitted: their key is an
+/// order-preserving base-10 float code (raw `u64` order == numeric order), so a
+/// single-`o_type` scan yields them in value order like the other numerics.
 ///
 /// Within one `o_type`, this equals the SPARQL `ORDER BY` order; mixing
-/// `o_type`s under one predicate is rejected by the operator at runtime.
+/// `o_type`s under one predicate is rejected by the operator at runtime — which
+/// also means a predicate with both inline and arena (NUM_BIG) decimals can't
+/// use this path, so the inline-only scan never silently drops arena rows.
 #[inline]
 pub const fn is_post_desc_orderable(o_type: u16) -> bool {
     let ot = OType::from_u16(o_type);
     // XSD_BOOLEAN (0x0002), the signed/unsigned/constrained integers and floats
-    // (is_numeric: 0x0003..=0x0012), and the temporal + duration range
-    // (is_temporal: XSD_DATE 0x0013..=XSD_DURATION 0x001D). Excludes GEO_POINT
-    // (0x001E), BLANK_NODE (0x001F), and every dict-backed/lang/arena type.
-    o_type == OType::XSD_BOOLEAN.as_u16() || ot.is_numeric() || ot.is_temporal()
+    // (is_numeric: 0x0003..=0x0012), the temporal + duration range (is_temporal:
+    // XSD_DATE 0x0013..=XSD_DURATION 0x001D), and inline decimals
+    // (XSD_DECIMAL_INLINE 0x0020, order-preserving). Excludes GEO_POINT (0x001E),
+    // BLANK_NODE (0x001F), and every dict-backed/lang/arena type.
+    o_type == OType::XSD_BOOLEAN.as_u16()
+        || ot.is_numeric()
+        || ot.is_temporal()
+        || o_type == OType::XSD_DECIMAL_INLINE.as_u16()
 }
 
 // ---------------------------------------------------------------------------

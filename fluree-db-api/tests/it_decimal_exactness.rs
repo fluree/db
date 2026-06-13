@@ -1140,3 +1140,122 @@ async fn inline_decimal_results_match_novelty_differential() {
         );
     }
 }
+
+#[tokio::test]
+async fn inline_decimal_order_by_and_range_are_numeric_after_reindex() {
+    // Order-preserving inline decimal keys: ORDER BY and range filters on a
+    // decimal predicate must use NUMERIC order, not scale-broken key order.
+    // 0.05 vs 0.5 (different scales) and negatives are the cases the old
+    // equality-keyed layout got wrong.
+    let fluree = memory_fluree();
+    let ledger_id = "decimal/inline-order:main";
+    let ledger = genesis_ledger(&fluree, ledger_id);
+
+    run_sparql_update(
+        &fluree,
+        ledger,
+        r"
+        PREFIX ex: <http://example.org/>
+        INSERT DATA {
+            ex:a ex:v 0.5 .
+            ex:b ex:v 0.05 .
+            ex:c ex:v -1 .
+            ex:d ex:v 2 .
+            ex:e ex:v 19.99 .
+            ex:f ex:v -0.01 .
+            ex:g ex:v 1000.5 .
+        }
+        ",
+    )
+    .await;
+
+    let root = full_rebuild_publish_decode_root(&fluree, ledger_id).await;
+    assert_eq!(
+        root.decimal_encoding(),
+        fluree_db_core::DecimalEncoding::InlineWhenFits
+    );
+    let ledger = fluree
+        .ledger(ledger_id)
+        .await
+        .expect("load reindexed ledger");
+
+    // 1. Plain ORDER BY ascending — full numeric order across signs and scales.
+    let asc = support::query_sparql(
+        &fluree,
+        &ledger,
+        r"PREFIX ex: <http://example.org/>
+          SELECT ?v WHERE { ?s ex:v ?v } ORDER BY ?v",
+    )
+    .await
+    .expect("order by asc");
+    let asc_json = asc.to_sparql_json(&ledger.snapshot).expect("json");
+    assert_eq!(
+        binding_values(&asc_json, "v"),
+        vec!["-1", "-0.01", "0.05", "0.5", "2", "19.99", "1000.5"],
+        "ORDER BY must be numeric (0.05 < 0.5, negatives first)"
+    );
+
+    // 2. ORDER BY DESC LIMIT — exercises the reverse-POST top-k fast path.
+    let desc = support::query_sparql(
+        &fluree,
+        &ledger,
+        r"PREFIX ex: <http://example.org/>
+          SELECT ?v WHERE { ?s ex:v ?v } ORDER BY DESC(?v) LIMIT 3",
+    )
+    .await
+    .expect("order by desc limit");
+    let desc_json = desc.to_sparql_json(&ledger.snapshot).expect("json");
+    assert_eq!(
+        binding_values(&desc_json, "v"),
+        vec!["1000.5", "19.99", "2"],
+        "ORDER BY DESC LIMIT must return the numerically largest values"
+    );
+
+    // 3. SELECT with a range FILTER — numeric subset.
+    let filtered = support::query_sparql(
+        &fluree,
+        &ledger,
+        r"PREFIX ex: <http://example.org/>
+          SELECT ?v WHERE { ?s ex:v ?v FILTER(?v > 0.1) } ORDER BY ?v",
+    )
+    .await
+    .expect("range filter");
+    let filtered_json = filtered.to_sparql_json(&ledger.snapshot).expect("json");
+    assert_eq!(
+        binding_values(&filtered_json, "v"),
+        vec!["0.5", "2", "19.99", "1000.5"],
+        "FILTER(?v > 0.1) must exclude 0.05 and the negatives"
+    );
+
+    // 4. COUNT with a range FILTER — exercises the numeric-compare COUNT fast path.
+    let counted = support::query_sparql(
+        &fluree,
+        &ledger,
+        r"PREFIX ex: <http://example.org/>
+          SELECT (COUNT(?s) AS ?n) WHERE { ?s ex:v ?v FILTER(?v > 0.1) }",
+    )
+    .await
+    .expect("count filter");
+    let counted_json = counted.to_sparql_json(&ledger.snapshot).expect("json");
+    assert_eq!(
+        binding_values(&counted_json, "n"),
+        vec!["4"],
+        "COUNT over a decimal range filter must match the four values > 0.1"
+    );
+
+    // 5. COUNT with an integer threshold against decimal rows (cross-form).
+    let counted_int = support::query_sparql(
+        &fluree,
+        &ledger,
+        r"PREFIX ex: <http://example.org/>
+          SELECT (COUNT(?s) AS ?n) WHERE { ?s ex:v ?v FILTER(?v >= 2) }",
+    )
+    .await
+    .expect("count int threshold");
+    let counted_int_json = counted_int.to_sparql_json(&ledger.snapshot).expect("json");
+    assert_eq!(
+        binding_values(&counted_int_json, "n"),
+        vec!["3"],
+        "FILTER(?v >= 2) over decimals must count 2, 19.99, 1000.5"
+    );
+}
