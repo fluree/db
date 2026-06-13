@@ -960,7 +960,10 @@ async fn full_reindex_writes_inline_decimal_v3_format_and_roundtrips() {
         "a full rebuild must write the inline-decimal (v3) format"
     );
 
-    let ledger = fluree.ledger(ledger_id).await.expect("load reindexed ledger");
+    let ledger = fluree
+        .ledger(ledger_id)
+        .await
+        .expect("load reindexed ledger");
     let query = r"
         PREFIX ex: <http://example.org/>
         SELECT ?s ?amount WHERE { ?s ex:amount ?amount . }
@@ -1014,7 +1017,10 @@ async fn inline_decimal_equality_constant_matches_after_reindex() {
         fluree_db_core::DecimalEncoding::InlineWhenFits
     );
 
-    let ledger = fluree.ledger(ledger_id).await.expect("load reindexed ledger");
+    let ledger = fluree
+        .ledger(ledger_id)
+        .await
+        .expect("load reindexed ledger");
     let query = r"
         PREFIX ex: <http://example.org/>
         SELECT ?s WHERE { ?s ex:price 19.99 . }
@@ -1046,8 +1052,7 @@ fn canon_decimal_bindings(bindings: &JsonValue) -> JsonValue {
                 for (_var, cell) in obj.iter_mut() {
                     if let Some(v) = cell.get("value").and_then(|v| v.as_str()) {
                         if let Ok(bd) = v.parse::<num_bigdecimal::BigDecimal>() {
-                            cell["value"] =
-                                JsonValue::String(bd.normalized().to_plain_string());
+                            cell["value"] = JsonValue::String(bd.normalized().to_plain_string());
                         }
                     }
                 }
@@ -1115,7 +1120,10 @@ async fn inline_decimal_results_match_novelty_differential() {
         root.decimal_encoding(),
         fluree_db_core::DecimalEncoding::InlineWhenFits
     );
-    let indexed_ledger = fluree.ledger(ledger_id).await.expect("load reindexed ledger");
+    let indexed_ledger = fluree
+        .ledger(ledger_id)
+        .await
+        .expect("load reindexed ledger");
 
     for (q, novelty_bindings) in queries.iter().zip(novelty_results) {
         let r = support::query_sparql(&fluree, &indexed_ledger, q)

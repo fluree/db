@@ -418,9 +418,7 @@ impl ObjKey {
         let magnitude = magnitude.to_u64()?; // always Some given the bit check above
 
         let sign_bit = u64::from(sign == Sign::Minus);
-        let key = (sign_bit << DEC_SIGN_SHIFT)
-            | ((scale as u64) << DEC_SCALE_SHIFT)
-            | magnitude;
+        let key = (sign_bit << DEC_SIGN_SHIFT) | ((scale as u64) << DEC_SCALE_SHIFT) | magnitude;
         Some(Self(key))
     }
 
@@ -1793,8 +1791,8 @@ mod tests {
     /// to the numerically-equal value.
     fn assert_decimal_roundtrip(s: &str) {
         let v = bd(s);
-        let key = ObjKey::encode_decimal(&v)
-            .unwrap_or_else(|| panic!("{s} should be inline-eligible"));
+        let key =
+            ObjKey::encode_decimal(&v).unwrap_or_else(|| panic!("{s} should be inline-eligible"));
         let back = key.decode_decimal();
         assert_eq!(back, v, "round-trip mismatch for {s}: got {back}");
     }
@@ -1802,8 +1800,19 @@ mod tests {
     #[test]
     fn decimal_roundtrip_common_values() {
         for s in [
-            "0", "1", "-1", "19.99", "-19.99", "0.01", "-0.01", "3.14159", "100",
-            "1000000.5", "-1000000.5", "0.0000001", "12345678901234.56",
+            "0",
+            "1",
+            "-1",
+            "19.99",
+            "-19.99",
+            "0.01",
+            "-0.01",
+            "3.14159",
+            "100",
+            "1000000.5",
+            "-1000000.5",
+            "0.0000001",
+            "12345678901234.56",
         ] {
             assert_decimal_roundtrip(s);
         }
