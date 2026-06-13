@@ -1886,6 +1886,28 @@ mod tests {
     }
 
     #[test]
+    fn decimal_fold_overflow_falls_back_to_arena() {
+        // Integer-valued decimals normalize to a negative exponent (1e18 ->
+        // mantissa 1, scale -18); encode folds them back to scale 0. The fold
+        // can push the mantissa over the 57-bit budget, which must fall back to
+        // the arena (None) — a path the scale-0 boundary cases don't exercise.
+
+        // 1e17 (< 2^57 ≈ 1.44e17) folds and still fits inline, round-tripping.
+        assert!(ObjKey::encode_decimal(&bd("100000000000000000")).is_some());
+        assert_decimal_roundtrip("100000000000000000");
+
+        // 1e18 / 1e19 fold (scale -18 / -19, within the fold limit) but the
+        // folded mantissa exceeds 57 bits → arena fallback.
+        assert!(ObjKey::encode_decimal(&bd("1000000000000000000")).is_none());
+        assert!(ObjKey::encode_decimal(&bd("10000000000000000000")).is_none());
+
+        // Past the fold-exponent limit (scale < -DEC_FOLD_EXP_LIMIT): early
+        // arena fallback, without attempting the 10^n multiply.
+        assert!(ObjKey::encode_decimal(&bd("100000000000000000000")).is_none()); // 1e20
+        assert!(ObjKey::encode_decimal(&bd("1e30")).is_none());
+    }
+
+    #[test]
     fn decimal_sign_distinguished() {
         let pos = ObjKey::encode_decimal(&bd("19.99")).unwrap();
         let neg = ObjKey::encode_decimal(&bd("-19.99")).unwrap();

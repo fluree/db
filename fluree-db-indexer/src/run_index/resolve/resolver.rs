@@ -55,6 +55,15 @@ pub struct ResolvedCommit {
 }
 
 /// Resolves commit-local ops into globally-addressed RunRecords.
+///
+/// **Not on any production indexing path.** Live indexing resolves through
+/// [`SharedResolverState`] (full rebuild + incremental) or `ImportSink` (bulk
+/// import); `CommitResolver` is currently constructed only in tests. If it is
+/// ever wired into a production path, the caller MUST call
+/// [`set_decimal_encoding`](Self::set_decimal_encoding) with the target root's
+/// policy — it defaults to `ArenaOnly`, so without that call it would write
+/// arena decimals into a root that may be inline-decimal (v3), splitting
+/// `(o_type, o_key)` identity.
 pub struct CommitResolver {
     /// namespace_code -> prefix IRI.
     /// Seeded from `default_namespace_codes()`, updated by commit namespace_deltas.
