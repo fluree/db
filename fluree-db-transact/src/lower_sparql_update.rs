@@ -962,8 +962,13 @@ fn coerce_typed_value(lexical: &str, datatype_iri: &str) -> UnresolvedTerm {
     // MVP: basic coercion for common types
     match datatype_iri {
         xsd::INTEGER => {
+            // xsd:integer is unbounded: promote past i64 instead of falling
+            // back to a string-valued literal.
             if let Ok(i) = lexical.parse::<i64>() {
                 return UnresolvedTerm::Literal(LiteralValue::Long(i));
+            }
+            if let Ok(n) = lexical.parse::<num_bigint::BigInt>() {
+                return UnresolvedTerm::Literal(LiteralValue::BigInt(Box::new(n)));
             }
         }
         xsd::DOUBLE => {
@@ -1005,8 +1010,13 @@ fn coerce_typed_flake_value(lexical: &str, datatype_iri: &str) -> FlakeValue {
     // MVP: basic coercion for common types
     match datatype_iri {
         xsd::INTEGER => {
+            // xsd:integer is unbounded: promote past i64 instead of falling
+            // back to a string-valued literal.
             if let Ok(i) = lexical.parse::<i64>() {
                 return FlakeValue::Long(i);
+            }
+            if let Ok(n) = lexical.parse::<num_bigint::BigInt>() {
+                return FlakeValue::BigInt(Box::new(n));
             }
         }
         xsd::DOUBLE => {

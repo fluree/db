@@ -514,6 +514,26 @@ mod tests {
     }
 
     #[test]
+    fn test_typed_overflowing_integer_literal_promotes_to_bigint() {
+        // Typed lexical form: xsd:integer is unbounded, so this must promote,
+        // not error.
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+             SELECT ?s WHERE { ?s ex:serial \"123456789012345678901234567890\"^^xsd:integer }",
+        )
+        .unwrap();
+
+        let Term::Value(fluree_db_core::FlakeValue::BigInt(n)) = object_of(&query, 0) else {
+            panic!(
+                "expected BigInt object for typed overflowing integer, got {:?}",
+                object_of(&query, 0)
+            );
+        };
+        assert_eq!(n.to_string(), "123456789012345678901234567890");
+    }
+
+    #[test]
     fn test_bare_decimal_literal_is_exact() {
         let query = lower_query(
             "PREFIX ex: <http://example.org/>

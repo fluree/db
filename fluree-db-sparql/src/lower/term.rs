@@ -175,7 +175,13 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
 
         match dt_iri.as_str() {
             xsd::STRING => Ok(FlakeValue::String(value.to_string())),
-            xsd::INTEGER | xsd::INT | xsd::LONG => {
+            // xsd:integer is unbounded: promote past i64 instead of erroring.
+            xsd::INTEGER => match value.parse::<i64>() {
+                Ok(i) => Ok(FlakeValue::Long(i)),
+                Err(_) => parse_big_integer_value(value, datatype.span),
+            },
+            // xsd:int / xsd:long are bounded; out-of-range is a lexical error.
+            xsd::INT | xsd::LONG => {
                 let i: i64 = value
                     .parse()
                     .map_err(|_| LowerError::invalid_integer(value, datatype.span))?;

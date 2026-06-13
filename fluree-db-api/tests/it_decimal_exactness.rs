@@ -331,6 +331,43 @@ async fn integer_beyond_i64_round_trips_exactly() {
         .to_sparql_json(&ledger.snapshot)
         .expect("to_sparql_json");
     assert_eq!(binding_values(&sparql_json, "s"), vec!["ex:item"]);
+
+    // Typed lexical form via SPARQL UPDATE round-trips and is queryable by
+    // the typed constant (both previously degraded through i64 paths).
+    let result = run_sparql_update(
+        &fluree,
+        ledger,
+        &format!(
+            r#"
+            PREFIX ex: <http://example.org/>
+            PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+            INSERT DATA {{ ex:typed ex:serial "{big}"^^xsd:integer . }}
+            "#
+        ),
+    )
+    .await;
+    let ledger = result.ledger;
+
+    let query = format!(
+        r#"
+        PREFIX ex: <http://example.org/>
+        PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+        SELECT ?s WHERE {{ ?s ex:serial "{big}"^^xsd:integer . }}
+        "#
+    );
+    let result = support::query_sparql(&fluree, &ledger, &query)
+        .await
+        .expect("typed constant query");
+    let sparql_json = result
+        .to_sparql_json(&ledger.snapshot)
+        .expect("to_sparql_json");
+    let mut subjects = binding_values(&sparql_json, "s");
+    subjects.sort();
+    assert_eq!(
+        subjects,
+        vec!["ex:item", "ex:typed"],
+        "typed xsd:integer constant must match both bare- and typed-ingested values"
+    );
 }
 
 #[tokio::test]
