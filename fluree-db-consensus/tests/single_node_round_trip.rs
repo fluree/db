@@ -22,11 +22,15 @@ use openraft::raft::{
 };
 use openraft::{Config, Raft, ServerState};
 
+use fluree_db_consensus::raft::index_publisher::RaftIndexPublisher;
 use fluree_db_consensus::raft::log_adapter::LogAdapter;
-use fluree_db_consensus::raft::state_machine::{Command as SmCommand, CreateLedgerArgs, Response};
+use fluree_db_consensus::raft::state_machine::{
+    AdvanceRefArgs, Command as SmCommand, CreateLedgerArgs, RefKey, Response,
+};
 use fluree_db_consensus::raft::state_machine_adapter::StateMachineAdapter;
 use fluree_db_consensus::raft::storage::memory::MemoryRaftStorage;
 use fluree_db_consensus::raft::{ClusterNode, NodeId, TypeConfig};
+use fluree_db_nameservice::IndexPublisher;
 
 struct StubFactory;
 struct StubNetwork;
@@ -117,4 +121,95 @@ async fn single_node_create_ledger_round_trip() {
     }
 
     raft.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn single_node_raft_index_publisher_round_trip() {
+    let storage = Arc::new(MemoryRaftStorage::new());
+    let log = LogAdapter::new(Arc::clone(&storage));
+    let sm = StateMachineAdapter::new(Arc::clone(&storage));
+    let shared_state = sm.shared_state();
+
+    let config = Config {
+        cluster_name: "single-node-index-publisher".into(),
+        election_timeout_min: 150,
+        election_timeout_max: 300,
+        heartbeat_interval: 50,
+        ..Config::default()
+    };
+    let config = Arc::new(config.validate().unwrap());
+
+    let raft = Raft::new(1, config, StubFactory, log, sm).await.unwrap();
+
+    let mut members = BTreeMap::new();
+    members.insert(1u64, ClusterNode::default());
+    raft.initialize(members).await.unwrap();
+
+    raft.wait(Some(Duration::from_secs(5)))
+        .state(ServerState::Leader, "leader after self-election")
+        .await
+        .unwrap();
+
+    // Bootstrap the ledger + a commit so the index publish has
+    // something to attach to.
+    raft.client_write(SmCommand::CreateLedger(CreateLedgerArgs {
+        ledger_id: "test/db".into(),
+        initial_branch: "main".into(),
+        initial_head: cid(0),
+        initial_t: 0,
+        governance: cid(0xAA),
+        created_at_millis: 1_000,
+    }))
+    .await
+    .unwrap();
+
+    raft.client_write(SmCommand::AdvanceRef(AdvanceRefArgs {
+        ledger_id: "test/db".into(),
+        branch: "main".into(),
+        expected_prev: Some(cid(0)),
+        new_head: cid(7),
+        t: 10,
+        applied_at_millis: 2_000,
+        idempotency: None,
+        release: Vec::new(),
+        tally: None,
+    }))
+    .await
+    .unwrap();
+
+    // Publish through the IndexPublisher trait, end-to-end.
+    let publisher = RaftIndexPublisher::new(Arc::new(raft));
+    publisher
+        .publish_index("test/db:main", 10, &cid(42))
+        .await
+        .expect("publish_index ok");
+
+    // The state machine's RefEntry should now carry the index.
+    {
+        let state = shared_state.read().await;
+        let entry = state
+            .refs
+            .get(&RefKey::new("test/db", "main"))
+            .expect("ref entry");
+        let index = entry.index.as_ref().expect("index populated");
+        assert_eq!(index.head, cid(42));
+        assert_eq!(index.t, 10);
+    }
+
+    // A second publish at the same t is treated as stale and
+    // surfaces as Ok — the cluster's view is unchanged.
+    publisher
+        .publish_index("test/db:main", 10, &cid(99))
+        .await
+        .expect("stale publish is ok");
+    {
+        let state = shared_state.read().await;
+        let entry = state.refs.get(&RefKey::new("test/db", "main")).unwrap();
+        let index = entry.index.as_ref().unwrap();
+        // Original head preserved — second publish was stale.
+        assert_eq!(index.head, cid(42));
+        assert_eq!(index.t, 10);
+    }
+
+    publisher.raft().shutdown().await.unwrap();
 }

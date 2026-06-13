@@ -38,6 +38,7 @@
 pub mod admin;
 pub mod execution_record;
 pub mod forward;
+pub mod index_publisher;
 pub mod log_adapter;
 pub mod nameservice;
 pub mod network;
