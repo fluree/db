@@ -357,6 +357,14 @@ fn count_rows_for_predicate_numeric_compare_post(
             if leaflet_fully_matches(compare, min_ok, max_ok, threshold_key) {
                 return Ok(Some(count_rows_for_predicate_psot(store, g_id, p_id)?));
             }
+        } else if otype_unsupported_numeric(min_ot) || otype_unsupported_numeric(max_ot) {
+            // Mixed-type predicate whose extent BOUNDARY is an unsupported
+            // numeric (e.g. integer rows + decimals: NUM_BIG sorts last among
+            // the numerics, so it lands on the max boundary): those rows are
+            // guaranteed present and the scan below is doomed — defer now.
+            // An unsupported numeric strictly interior to the extent still
+            // falls through and is caught by the per-leaflet bail.
+            return Ok(None);
         }
     }
 
@@ -377,6 +385,15 @@ fn count_rows_for_predicate_numeric_compare_post(
 /// per-leaflet directory must be consulted for this predicate's first/last key).
 /// Returns `None` if there are no leaves (an empty predicate — the caller's total is
 /// 0) or, defensively, if a boundary leaf yields no matching leaflet.
+/// True if this o_type is numeric but cannot be compared by encoded o_key in
+/// the numeric-COUNT lanes (non-canonical integer widths, floats, decimals,
+/// arena-keyed NUM_BIG): rows of these kinds force the count to defer.
+fn otype_unsupported_numeric(raw: u16) -> bool {
+    let ot = OType::from_u16(raw);
+    (ot.is_numeric() || ot == OType::NUM_BIG_OVERFLOW)
+        && !matches!(ot, OType::XSD_INTEGER | OType::XSD_DOUBLE)
+}
+
 fn predicate_post_global_extent(
     store: &BinaryIndexStore,
     p_id: u32,
@@ -646,6 +663,11 @@ fn count_numeric_compare_overlay_parallel(
                 ot if ot.is_numeric() || ot == OType::NUM_BIG_OVERFLOW => return Ok(None),
                 _ => {}
             }
+        } else if otype_unsupported_numeric(min_ot) || otype_unsupported_numeric(max_ot) {
+            // Mixed base with an unsupported-numeric boundary (e.g. integer
+            // rows + decimals): doomed regardless of novelty — defer before
+            // scanning any partition.
+            return Ok(None);
         }
     }
 
