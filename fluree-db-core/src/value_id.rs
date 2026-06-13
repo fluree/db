@@ -116,6 +116,13 @@ impl ObjKind {
     /// Precision: approximately 0.3mm at the equator.
     pub const GEO_POINT: Self = Self(0x14);
 
+    /// Exact inline `xsd:decimal` — `o_key` is a packed `(sign, scale, mantissa)`
+    /// (see [`ObjKey::encode_decimal`]). Equality-keyed: the payload is canonical
+    /// but is **not** value-ordered, so this kind must be excluded from any
+    /// `o_key`-order range pushdown. Distinct from [`NUM_BIG`](Self::NUM_BIG)
+    /// (arena handle) — inline decimals carry the exact value with no arena.
+    pub const NUM_DEC: Self = Self(0x15);
+
     /// Get the raw `u8` discriminant.
     #[inline]
     pub const fn as_u8(self) -> u8 {
@@ -159,6 +166,7 @@ impl fmt::Debug for ObjKind {
             0x12 => write!(f, "ObjKind::YearMonthDur"),
             0x13 => write!(f, "ObjKind::DayTimeDur"),
             0x14 => write!(f, "ObjKind::GeoPoint"),
+            0x15 => write!(f, "ObjKind::NumDec"),
             0xFF => write!(f, "ObjKind::Max"),
             n => write!(f, "ObjKind({n:#04x})"),
         }
@@ -188,6 +196,25 @@ const SIGN_FLIP: u64 = 1u64 << 63;
 
 /// Sign bit mask for f64 bits.
 const F64_SIGN_BIT: u64 = 1u64 << 63;
+
+// ---- Inline decimal (NumDec) packing layout: [sign:1 | scale:6 | mantissa:57] ----
+
+/// Number of bits the inline-decimal mantissa magnitude occupies (low bits).
+const DEC_MANTISSA_BITS: u64 = 57;
+/// Mask selecting the 57-bit mantissa magnitude.
+const DEC_MANTISSA_MASK: u64 = (1u64 << DEC_MANTISSA_BITS) - 1;
+/// Bit offset of the 6-bit scale field.
+const DEC_SCALE_SHIFT: u64 = DEC_MANTISSA_BITS;
+/// Mask (pre-shift) selecting the 6-bit scale field.
+const DEC_SCALE_MASK: u64 = (1u64 << 6) - 1;
+/// Maximum representable scale (number of fractional digits).
+const DEC_MAX_SCALE: u64 = DEC_SCALE_MASK; // 63
+/// Bit offset of the sign bit (high bit).
+const DEC_SIGN_SHIFT: u64 = 63;
+/// Largest `|negative scale|` we will fold back into the mantissa before giving
+/// up. 10^19 already exceeds the 57-bit mantissa budget, so anything beyond this
+/// cannot fit inline regardless.
+const DEC_FOLD_EXP_LIMIT: i64 = 19;
 
 /// Error returned when a value cannot be stored in the index.
 #[derive(Debug, Clone, PartialEq)]
@@ -285,6 +312,81 @@ impl ObjKey {
             !self.0 // was negative: undo full flip
         };
         f64::from_bits(bits)
+    }
+
+    // ---- Inline decimal encoding (NumDec) ----
+    //
+    // Exact packed `xsd:decimal`: a canonical `(sign, scale, mantissa)` laid out
+    // as `[ sign:1 | scale:6 | mantissa:57 ]` in the 64-bit key. The packing is
+    // *equality-keyed*, not order-preserving — equal values produce identical
+    // bits, but raw `u64` ordering is NOT numeric ordering, so this kind must be
+    // excluded from any `o_key`-order range pushdown.
+    //
+    // A value is inline-eligible iff, after canonicalization (trailing fractional
+    // zeros stripped, integer-valued decimals folded to scale 0, zero canonical),
+    // it has `0 <= scale <= 63` and `|mantissa| < 2^57`. Anything else returns
+    // `None` and falls back to the NumBig arena, exactly like overflow integers.
+
+    /// Encode a canonical `xsd:decimal` inline, or `None` if it does not fit.
+    ///
+    /// Canonicalization guarantees that two numerically-equal decimals (e.g.
+    /// `1.50` and `1.5`, or `1.00` and `1`) encode to identical bits, so the
+    /// packed key is a stable fact identity.
+    pub fn encode_decimal(value: &bigdecimal::BigDecimal) -> Option<Self> {
+        use num_bigint::Sign;
+        use num_traits::{ToPrimitive, Zero};
+
+        // Strip trailing fractional zeros; canonicalizes 1.50 -> 1.5, 1.00 -> 1E2 etc.
+        let normalized = value.normalized();
+        let (mut mantissa, mut scale) = normalized.as_bigint_and_exponent();
+
+        if mantissa.is_zero() {
+            // Canonical zero: sign 0, scale 0, mantissa 0 (so 0, 0.0, -0.00 all match).
+            return Some(Self(0));
+        }
+
+        // A negative scale means the normalized form pushed trailing zeros into the
+        // exponent (e.g. 100 -> mantissa 1, scale -2). Fold them back into the
+        // mantissa at scale 0. Bound the exponent first: 10^19 already exceeds the
+        // 57-bit mantissa budget, so anything past that can never fit inline.
+        if scale < 0 {
+            if scale < -DEC_FOLD_EXP_LIMIT {
+                return None;
+            }
+            mantissa *= num_bigint::BigInt::from(10).pow((-scale) as u32);
+            scale = 0;
+        }
+
+        if scale > DEC_MAX_SCALE as i64 {
+            return None;
+        }
+
+        let (sign, magnitude) = mantissa.into_parts();
+        // |mantissa| must fit in 57 bits.
+        if magnitude.bits() > DEC_MANTISSA_BITS {
+            return None;
+        }
+        let magnitude = magnitude.to_u64()?; // always Some given the bit check above
+
+        let sign_bit = u64::from(sign == Sign::Minus);
+        let key = (sign_bit << DEC_SIGN_SHIFT)
+            | ((scale as u64) << DEC_SCALE_SHIFT)
+            | magnitude;
+        Some(Self(key))
+    }
+
+    /// Decode an inline `xsd:decimal` previously produced by [`encode_decimal`].
+    ///
+    /// [`encode_decimal`]: Self::encode_decimal
+    pub fn decode_decimal(self) -> bigdecimal::BigDecimal {
+        let magnitude = self.0 & DEC_MANTISSA_MASK;
+        let scale = ((self.0 >> DEC_SCALE_SHIFT) & DEC_SCALE_MASK) as i64;
+        let negative = (self.0 >> DEC_SIGN_SHIFT) & 1 == 1;
+        let mut mantissa = num_bigint::BigInt::from(magnitude);
+        if negative {
+            mantissa = -mantissa;
+        }
+        bigdecimal::BigDecimal::from_bigint(mantissa, scale)
     }
 
     // ---- Boolean encoding ----
@@ -1630,5 +1732,107 @@ mod tests {
             assert!(!dt.is_integer_type(), "{dt} should not be integer type");
             assert!(!dt.is_float_type(), "{dt} should not be float type");
         }
+    }
+
+    // ---- Inline decimal (NumDec) encode/decode ----
+
+    fn bd(s: &str) -> bigdecimal::BigDecimal {
+        s.parse().unwrap()
+    }
+
+    /// Round-trip an inline-eligible decimal: encode must succeed and decode back
+    /// to the numerically-equal value.
+    fn assert_decimal_roundtrip(s: &str) {
+        let v = bd(s);
+        let key = ObjKey::encode_decimal(&v)
+            .unwrap_or_else(|| panic!("{s} should be inline-eligible"));
+        let back = key.decode_decimal();
+        assert_eq!(back, v, "round-trip mismatch for {s}: got {back}");
+    }
+
+    #[test]
+    fn decimal_roundtrip_common_values() {
+        for s in [
+            "0", "1", "-1", "19.99", "-19.99", "0.01", "-0.01", "3.14159", "100",
+            "1000000.5", "-1000000.5", "0.0000001", "12345678901234.56",
+        ] {
+            assert_decimal_roundtrip(s);
+        }
+    }
+
+    #[test]
+    fn decimal_zero_is_canonical() {
+        // All spellings of zero encode to the same key.
+        let keys: Vec<_> = ["0", "0.0", "-0", "-0.00", "0.000000"]
+            .iter()
+            .map(|s| ObjKey::encode_decimal(&bd(s)).unwrap())
+            .collect();
+        for k in &keys {
+            assert_eq!(*k, keys[0], "zero spellings must share one key");
+        }
+        assert_eq!(keys[0].decode_decimal(), bd("0"));
+    }
+
+    #[test]
+    fn decimal_scale_variants_share_key() {
+        // 1.50 and 1.5 are the same value -> identical key (equality identity).
+        assert_eq!(
+            ObjKey::encode_decimal(&bd("1.50")).unwrap(),
+            ObjKey::encode_decimal(&bd("1.5")).unwrap(),
+        );
+        // 1.00 and 1 fold to scale 0 -> identical key.
+        assert_eq!(
+            ObjKey::encode_decimal(&bd("1.00")).unwrap(),
+            ObjKey::encode_decimal(&bd("1")).unwrap(),
+        );
+    }
+
+    #[test]
+    fn decimal_integer_valued_folds_to_scale_zero() {
+        // Trailing-zero integers (normalized form has negative exponent) fold back.
+        for s in ["100", "1000", "100000000", "-100"] {
+            assert_decimal_roundtrip(s);
+        }
+    }
+
+    #[test]
+    fn decimal_max_scale_boundary() {
+        // 63 fractional digits is the max scale that fits.
+        let s = format!("0.{}1", "0".repeat(62)); // scale 63
+        let v = bd(&s);
+        let key = ObjKey::encode_decimal(&v).expect("scale 63 should fit");
+        assert_eq!(key.decode_decimal(), v);
+
+        // scale 64 does not fit.
+        let s_over = format!("0.{}1", "0".repeat(63)); // scale 64
+        assert!(ObjKey::encode_decimal(&bd(&s_over)).is_none());
+    }
+
+    #[test]
+    fn decimal_mantissa_boundary() {
+        // |mantissa| just below 2^57 fits; at/above 2^57 does not.
+        let max_mantissa = (1i128 << 57) - 1;
+        let fits = bd(&max_mantissa.to_string());
+        assert!(ObjKey::encode_decimal(&fits).is_some());
+        assert_eq!(
+            ObjKey::encode_decimal(&fits).unwrap().decode_decimal(),
+            fits
+        );
+
+        let over = bd(&(1i128 << 57).to_string());
+        assert!(ObjKey::encode_decimal(&over).is_none());
+
+        // A fractional value whose mantissa overflows also falls back.
+        let frac_over = bd("1444115188.07585588"); // mantissa 144411518807585588 > 2^57
+        assert!(ObjKey::encode_decimal(&frac_over).is_none());
+    }
+
+    #[test]
+    fn decimal_sign_distinguished() {
+        let pos = ObjKey::encode_decimal(&bd("19.99")).unwrap();
+        let neg = ObjKey::encode_decimal(&bd("-19.99")).unwrap();
+        assert_ne!(pos, neg);
+        assert_eq!(pos.decode_decimal(), bd("19.99"));
+        assert_eq!(neg.decode_decimal(), bd("-19.99"));
     }
 }

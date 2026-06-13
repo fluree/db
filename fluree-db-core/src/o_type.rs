@@ -125,7 +125,14 @@ impl OType {
     /// Blank node (`_:b{id}`) — `o_key` is the atomic bnode integer.
     pub const BLANK_NODE: Self = Self(0x001F);
 
-    // Tag `00` payload range 0x0020–0x3FFF reserved for future embedded types.
+    /// `xsd:decimal` stored **inline** as an exact packed `(mantissa, scale)`
+    /// (see [`ObjKey::encode_decimal`]). Distinct from the lossy f64
+    /// [`XSD_DECIMAL`](Self::XSD_DECIMAL) lane: this carries the exact value with
+    /// no arena handle. Only written by new-format index roots; large/high-precision
+    /// decimals still fall back to the NumBig arena ([`NUM_BIG_OVERFLOW`](Self::NUM_BIG_OVERFLOW)).
+    pub const XSD_DECIMAL_INLINE: Self = Self(0x0020);
+
+    // Tag `00` payload range 0x0021–0x3FFF reserved for future embedded types.
 
     // ── Tag `10` — Fluree-reserved dictionary/arena-backed ─────────────
 
@@ -341,6 +348,7 @@ impl OType {
             0x001D => DecodeKind::Duration,
             0x001E => DecodeKind::GeoPoint,
             0x001F => DecodeKind::BlankNode,
+            0x0020 => DecodeKind::Decimal,
             _ => DecodeKind::Sentinel, // future embedded types
         }
     }
@@ -414,6 +422,9 @@ pub enum DecodeKind {
     NumBigArena,
     /// Spatial arena handle (per-predicate).
     SpatialArena,
+    /// Exact inline `xsd:decimal` — o_key is a packed `(sign, scale, mantissa)`
+    /// (see [`super::value_id::ObjKey::decode_decimal`]). Not arena-backed.
+    Decimal,
 }
 
 impl DecodeKind {
@@ -444,6 +455,7 @@ impl DecodeKind {
             21 => Some(Self::VectorArena),
             22 => Some(Self::NumBigArena),
             23 => Some(Self::SpatialArena),
+            24 => Some(Self::Decimal),
             _ => None,
         }
     }
@@ -486,6 +498,7 @@ impl fmt::Debug for OType {
             0x001D => write!(f, "OType::XSD_DURATION"),
             0x001E => write!(f, "OType::GEO_POINT"),
             0x001F => write!(f, "OType::BLANK_NODE"),
+            0x0020 => write!(f, "OType::XSD_DECIMAL_INLINE"),
             0x8000 => write!(f, "OType::XSD_STRING"),
             0x8001 => write!(f, "OType::XSD_ANY_URI"),
             0x8002 => write!(f, "OType::XSD_NORMALIZED_STRING"),
