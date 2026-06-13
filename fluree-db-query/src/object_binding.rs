@@ -307,12 +307,71 @@ pub(crate) fn equality_norm_store(
     ctx.binary_store.clone()
 }
 
+/// Store + graph view for representation normalization at equality surfaces
+/// (DISTINCT, GROUP BY, MINUS, semijoin, subquery keys). The store encodes
+/// decoded bindings to their dictionary form; the graph view decodes
+/// arena-backed NUM_BIG values to their canonical numeric form.
+pub(crate) struct EqualityNorm {
+    store: Arc<BinaryIndexStore>,
+    gv: Option<fluree_db_binary_index::BinaryGraphView>,
+}
+
+impl EqualityNorm {
+    pub(crate) fn parts(
+        norm: &Option<Self>,
+    ) -> (
+        Option<&BinaryIndexStore>,
+        Option<&fluree_db_binary_index::BinaryGraphView>,
+    ) {
+        match norm {
+            Some(n) => (Some(&n.store), n.gv.as_ref()),
+            None => (None, None),
+        }
+    }
+}
+
+/// Build an [`EqualityNorm`] when single-ledger binary execution applies.
+pub(crate) fn equality_norm(ctx: &crate::context::ExecutionContext<'_>) -> Option<EqualityNorm> {
+    let store = equality_norm_store(ctx)?;
+    Some(EqualityNorm {
+        store,
+        gv: ctx.graph_view(),
+    })
+}
+
 /// Normalize one binding for use in an equality/hash key (no-op clone-free
 /// path for already-encoded bindings).
-pub(crate) fn normalize_for_key(binding: &Binding, store: Option<&BinaryIndexStore>) -> Binding {
+pub(crate) fn normalize_for_key(
+    binding: &Binding,
+    store: Option<&BinaryIndexStore>,
+    gv: Option<&fluree_db_binary_index::BinaryGraphView>,
+) -> Binding {
+    // Arena-keyed NUM_BIG values normalize by DECODING: handles are scoped
+    // per (graph, predicate), so the encoded form is not a canonical key for
+    // one value across predicates or against decoded rows (VALUES, BIND,
+    // novelty raw-merge). The decoded BigDecimal/BigInt compares and hashes
+    // by numeric value.
+    if is_numbig_encoded(binding) {
+        if let Some(gv) = gv {
+            let materialized = crate::group_aggregate::materialize_encoded(binding, Some(gv));
+            if !matches!(materialized, Binding::EncodedLit { .. }) {
+                return materialized;
+            }
+        }
+        return binding.clone();
+    }
     store
         .and_then(|s| encoded_equivalent(binding, s))
         .unwrap_or_else(|| binding.clone())
+}
+
+/// True if this is an arena-backed (NUM_BIG) encoded literal.
+pub(crate) fn is_numbig_encoded(binding: &Binding) -> bool {
+    matches!(
+        binding,
+        Binding::EncodedLit { o_kind, .. }
+            if *o_kind == fluree_db_core::ObjKind::NUM_BIG.as_u8()
+    )
 }
 
 /// Build a materialized object binding for the binary scan path.

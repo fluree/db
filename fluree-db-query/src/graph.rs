@@ -236,6 +236,19 @@ impl GraphOperator {
 
         inner.open(&graph_ctx).await?;
 
+        // NumBig arena handles are scoped per (graph, predicate). When this
+        // GRAPH scope runs against a different g_id than the surrounding
+        // query, encoded NUM_BIG bindings escaping the scope would later be
+        // decoded against the OUTER graph's arena — silently producing wrong
+        // values. Materialize them here, against this graph's view, before
+        // they leave the scope. (Subject/string/predicate dictionaries are
+        // store-global, so all other encoded kinds escape safely.)
+        let numbig_exit_gv = if graph_ctx.binary_g_id != ctx.binary_g_id {
+            graph_ctx.graph_view()
+        } else {
+            None
+        };
+
         while let Some(batch) = inner.next_batch(&graph_ctx).await? {
             graph_ctx.check_cancelled()?;
             // Stamp cross-ledger provenance before merging so the formatter
@@ -280,6 +293,16 @@ impl GraphOperator {
                             .get(inner_row_idx, *var)
                             .cloned()
                             .unwrap_or(Binding::Unbound);
+                        let binding = if numbig_exit_gv.is_some()
+                            && crate::object_binding::is_numbig_encoded(&binding)
+                        {
+                            crate::group_aggregate::materialize_encoded(
+                                &binding,
+                                numbig_exit_gv.as_ref(),
+                            )
+                        } else {
+                            binding
+                        };
                         merged_row.push(binding);
                     }
                 }

@@ -6,11 +6,10 @@
 use crate::binding::{Batch, Binding};
 use crate::context::ExecutionContext;
 use crate::error::Result;
-use crate::object_binding::{equality_norm_store, normalize_for_key};
+use crate::object_binding::{equality_norm, normalize_for_key, EqualityNorm};
 use crate::operator::{BoxedOperator, Operator, OperatorState};
 use crate::var_registry::VarId;
 use async_trait::async_trait;
-use fluree_db_binary_index::BinaryIndexStore;
 use hashbrown::HashMap;
 use rustc_hash::{FxBuildHasher, FxHasher};
 use std::hash::{Hash, Hasher};
@@ -39,7 +38,7 @@ pub struct DistinctOperator {
     /// Store for normalizing decoded bindings to their encoded form before
     /// hashing, so mixed-representation streams (scan ∪ VALUES/BIND) dedup
     /// correctly. `None` outside single-ledger binary execution.
-    norm_store: Option<Arc<BinaryIndexStore>>,
+    norm: Option<EqualityNorm>,
 }
 
 impl DistinctOperator {
@@ -55,7 +54,7 @@ impl DistinctOperator {
             seen: HashMap::with_hasher(FxBuildHasher),
             schema,
             state: OperatorState::Created,
-            norm_store: None,
+            norm: None,
         }
     }
 
@@ -105,8 +104,8 @@ impl Operator for DistinctOperator {
 
         self.child.open(ctx).await?;
         self.seen.clear();
-        if self.norm_store.is_none() {
-            self.norm_store = equality_norm_store(ctx);
+        if self.norm.is_none() {
+            self.norm = equality_norm(ctx);
         }
         self.state = OperatorState::Open;
         Ok(())
@@ -140,12 +139,13 @@ impl Operator for DistinctOperator {
             let mut columns: Vec<Vec<Binding>> = (0..num_cols).map(|_| Vec::new()).collect();
 
             for row_idx in 0..batch.len() {
-                if let Some(store) = self.norm_store.as_deref() {
+                if self.norm.is_some() {
+                    let (store, gv) = EqualityNorm::parts(&self.norm);
                     // Normalize decoded bindings to encoded form so mixed
                     // representations of the same value dedup (encoded
                     // bindings pass through untouched).
                     let signature: RowSignature = (0..num_cols)
-                        .map(|col| normalize_for_key(batch.get_by_col(row_idx, col), Some(store)))
+                        .map(|col| normalize_for_key(batch.get_by_col(row_idx, col), store, gv))
                         .collect();
                     let mut h = FxHasher::default();
                     signature.hash(&mut h);

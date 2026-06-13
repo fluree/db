@@ -92,11 +92,14 @@ pub fn validate_max_exclusive(value: &FlakeValue, max: &FlakeValue) -> Option<Co
 ///
 /// Returns None if values are not comparable (different types).
 fn compare_values(a: &FlakeValue, b: &FlakeValue) -> Option<std::cmp::Ordering> {
+    // Numeric pairs (Long/Double/BigInt/Decimal in any combination) compare
+    // via core's exact cross-type ordering — a per-variant match here
+    // previously rejected every Decimal/BigInt value as "not comparable",
+    // which the range facets count as an unconditional violation.
+    if a.is_numeric() && b.is_numeric() {
+        return a.numeric_cmp(b);
+    }
     match (a, b) {
-        (FlakeValue::Long(a), FlakeValue::Long(b)) => Some(a.cmp(b)),
-        (FlakeValue::Double(a), FlakeValue::Double(b)) => a.partial_cmp(b),
-        (FlakeValue::Long(a), FlakeValue::Double(b)) => (*a as f64).partial_cmp(b),
-        (FlakeValue::Double(a), FlakeValue::Long(b)) => a.partial_cmp(&(*b as f64)),
         (FlakeValue::String(a), FlakeValue::String(b)) => Some(a.cmp(b)),
         (FlakeValue::Boolean(a), FlakeValue::Boolean(b)) => Some(a.cmp(b)),
         _ => None,
@@ -106,6 +109,39 @@ fn compare_values(a: &FlakeValue, b: &FlakeValue) -> Option<std::cmp::Ordering> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn dec(s: &str) -> FlakeValue {
+        FlakeValue::Decimal(Box::new(s.parse().expect("decimal")))
+    }
+
+    #[test]
+    fn test_range_facets_compare_decimals() {
+        // Decimal values previously hit the "not comparable" catch-all,
+        // which every range facet counts as a violation.
+        assert!(validate_min_inclusive(&dec("10.5"), &dec("10.5")).is_none());
+        assert!(validate_min_inclusive(&dec("10.4"), &dec("10.5")).is_some());
+        assert!(validate_max_inclusive(&dec("10.5"), &dec("10.5")).is_none());
+        assert!(validate_max_exclusive(&dec("10.5"), &dec("10.5")).is_some());
+        assert!(validate_min_exclusive(&dec("10.6"), &dec("10.5")).is_none());
+    }
+
+    #[test]
+    fn test_range_facets_compare_decimal_against_integer_constraint() {
+        // sh:minInclusive 10 (xsd:integer) against an xsd:decimal value.
+        assert!(validate_min_inclusive(&dec("10.00"), &FlakeValue::Long(10)).is_none());
+        assert!(validate_min_inclusive(&dec("9.99"), &FlakeValue::Long(10)).is_some());
+        // And a Long value against a decimal constraint.
+        assert!(validate_max_inclusive(&FlakeValue::Long(10), &dec("10.5")).is_none());
+    }
+
+    #[test]
+    fn test_range_facets_compare_bigint() {
+        let big = FlakeValue::BigInt(Box::new(
+            "123456789012345678901234567890".parse().expect("bigint"),
+        ));
+        assert!(validate_min_inclusive(&big, &FlakeValue::Long(1)).is_none());
+        assert!(validate_max_inclusive(&big, &FlakeValue::Long(1)).is_some());
+    }
 
     #[test]
     fn test_has_value_found() {

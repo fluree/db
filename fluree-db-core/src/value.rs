@@ -826,6 +826,27 @@ impl PartialOrd for FlakeValue {
     }
 }
 
+/// Hash a decimal in canonical numeric form, consistent with cross-variant
+/// numeric Eq: integer-valued decimals hash like integers (tag 0 + BigInt
+/// bytes, matching the Long/BigInt arms), non-integer decimals hash their
+/// normalized (scale, digits). The Double arm routes through here too for
+/// finite non-i64 values, so Double(2.5) and Decimal(2.5) hash identically.
+fn hash_decimal_canonical<H: std::hash::Hasher>(v: &BigDecimal, state: &mut H) {
+    use std::hash::Hash;
+    let normalized = v.normalized();
+    if normalized.is_integer() {
+        0u8.hash(state); // integer tag
+        let int_part = normalized.with_scale(0);
+        let (digits, _scale) = int_part.as_bigint_and_exponent();
+        digits.to_signed_bytes_le().hash(state);
+    } else {
+        1u8.hash(state); // non-integer numeric tag
+        let (digits, scale) = normalized.as_bigint_and_exponent();
+        scale.hash(state);
+        digits.to_signed_bytes_le().hash(state);
+    }
+}
+
 impl std::hash::Hash for FlakeValue {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         // IMPORTANT: Hash must be consistent with PartialEq.
@@ -853,33 +874,27 @@ impl std::hash::Hash for FlakeValue {
                     0u8.hash(state); // integer tag
                     BigInt::from(*d as i64).to_signed_bytes_le().hash(state);
                 } else {
-                    // Non-integer double: hash bits (can't equal any integer)
-                    1u8.hash(state); // non-integer numeric tag
-                    d.to_bits().hash(state);
+                    // Every finite f64 is exactly a decimal, and Eq treats
+                    // Double(2.5) == Decimal(2.5) — so hash the exact decimal
+                    // form the same way the Decimal arm does. Hashing the f64
+                    // bits here would violate the Hash/Eq contract for
+                    // binary-fraction values.
+                    match BigDecimal::try_from(*d) {
+                        Ok(dec) => hash_decimal_canonical(&dec, state),
+                        Err(_) => {
+                            // Unreachable for finite doubles; keep a stable
+                            // fallback rather than panicking in a hasher.
+                            1u8.hash(state);
+                            d.to_bits().hash(state);
+                        }
+                    }
                 }
             }
             FlakeValue::BigInt(v) => {
                 0u8.hash(state); // integer tag
                 v.to_signed_bytes_le().hash(state);
             }
-            FlakeValue::Decimal(v) => {
-                let normalized = v.normalized();
-                if normalized.is_integer() {
-                    // Integer decimal: hash as BigInt
-                    0u8.hash(state); // integer tag
-                                     // Extract integer part via with_scale(0)
-                    let int_part = normalized.with_scale(0);
-                    // Get digits and sign
-                    let (digits, _scale) = int_part.as_bigint_and_exponent();
-                    digits.to_signed_bytes_le().hash(state);
-                } else {
-                    // Non-integer decimal: hash (sign, scale, digits)
-                    1u8.hash(state); // non-integer numeric tag
-                    let (digits, scale) = normalized.as_bigint_and_exponent();
-                    scale.hash(state);
-                    digits.to_signed_bytes_le().hash(state);
-                }
-            }
+            FlakeValue::Decimal(v) => hash_decimal_canonical(v, state),
             // Non-numeric types: hash with type discriminant
             FlakeValue::Null => {
                 self.type_discriminant().hash(state);
@@ -968,7 +983,10 @@ impl fmt::Display for FlakeValue {
             FlakeValue::Long(l) => write!(f, "{l}"),
             FlakeValue::Double(d) => write!(f, "{d}"),
             FlakeValue::BigInt(v) => write!(f, "{v}"),
-            FlakeValue::Decimal(v) => write!(f, "{v}"),
+            // Plain form, never E-notation: BigDecimal's Display switches to
+            // exponent notation past a magnitude threshold (e.g. 0.0000001 →
+            // "1E-7"), which is invalid xsd:decimal lexical form.
+            FlakeValue::Decimal(v) => write!(f, "{}", v.to_plain_string()),
             FlakeValue::DateTime(v) => write!(f, "{v}"),
             FlakeValue::Date(v) => write!(f, "{v}"),
             FlakeValue::Time(v) => write!(f, "{v}"),
@@ -1302,6 +1320,49 @@ mod tests {
             h_decimal, h_decimal_00,
             "Decimal(3) and Decimal(3.00) must hash equally"
         );
+    }
+
+    #[test]
+    fn test_non_integer_double_decimal_hash_consistency() {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        fn compute_hash<T: Hash>(t: &T) -> u64 {
+            let mut s = DefaultHasher::new();
+            t.hash(&mut s);
+            s.finish()
+        }
+
+        // Binary-fraction values exist exactly in both representations and
+        // compare equal — so they must hash equally.
+        for lexical in ["2.5", "0.25", "-10.125", "0.0009765625"] {
+            let dec = FlakeValue::Decimal(Box::new(lexical.parse::<BigDecimal>().unwrap()));
+            let dbl = FlakeValue::Double(lexical.parse::<f64>().unwrap());
+            assert_eq!(dec, dbl, "{lexical}: Decimal and Double must be equal");
+            assert_eq!(
+                compute_hash(&dec),
+                compute_hash(&dbl),
+                "{lexical}: equal Decimal/Double must hash equally"
+            );
+        }
+
+        // Integer-valued double beyond i64 range vs BigInt/Decimal.
+        let dbl = FlakeValue::Double(1e20);
+        let bigint = FlakeValue::BigInt(Box::new("100000000000000000000".parse().unwrap()));
+        let dec = FlakeValue::Decimal(Box::new("100000000000000000000".parse().unwrap()));
+        assert_eq!(dbl, bigint);
+        assert_eq!(compute_hash(&dbl), compute_hash(&bigint));
+        assert_eq!(compute_hash(&dbl), compute_hash(&dec));
+
+        // HashSet dedup must treat mixed representations as one value.
+        let mut set = std::collections::HashSet::new();
+        set.insert(FlakeValue::Decimal(Box::new("2.5".parse().unwrap())));
+        assert!(!set.insert(FlakeValue::Double(2.5)), "2.5 already present");
+
+        // Non-equal values still hash independently (19.99 has no f64 twin).
+        let dec = FlakeValue::Decimal(Box::new("19.99".parse::<BigDecimal>().unwrap()));
+        let dbl = FlakeValue::Double(19.99);
+        assert_ne!(dec, dbl, "19.99 decimal != nearest f64");
     }
 
     #[test]

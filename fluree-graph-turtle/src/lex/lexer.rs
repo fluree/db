@@ -759,8 +759,12 @@ fn parse_integer(input: &mut Input<'_>) -> ModalResult<TokenKind> {
     }
     num_str.push_str(digits);
 
-    let value = num_str.parse::<i64>().unwrap_or(0);
-    Ok(TokenKind::Integer(value))
+    // xsd:integer is unbounded: values past i64 promote to BigInt downstream
+    // (span-based token, like Decimal) instead of silently corrupting.
+    match num_str.parse::<i64>() {
+        Ok(value) => Ok(TokenKind::Integer(value)),
+        Err(_) => Ok(TokenKind::IntegerOverflow),
+    }
 }
 
 /// Parse a decimal literal.

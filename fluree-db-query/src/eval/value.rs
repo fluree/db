@@ -380,7 +380,9 @@ impl ComparableValue {
             ComparableValue::Double(d) => Some(ComparableValue::String(Arc::from(d.to_string()))),
             ComparableValue::Bool(b) => Some(ComparableValue::String(Arc::from(b.to_string()))),
             ComparableValue::BigInt(n) => Some(ComparableValue::String(Arc::from(n.to_string()))),
-            ComparableValue::Decimal(d) => Some(ComparableValue::String(Arc::from(d.to_string()))),
+            ComparableValue::Decimal(d) => {
+                Some(ComparableValue::String(Arc::from(d.to_plain_string())))
+            }
             ComparableValue::DateTime(dt) => {
                 Some(ComparableValue::String(Arc::from(dt.to_string())))
             }

@@ -860,6 +860,17 @@ impl<'a> TrigMetaParser<'a> {
                 self.advance();
                 Ok(ObjectValue::Integer(val))
             }
+            TokenKind::IntegerOverflow => {
+                // Beyond i64: keep the lexical so downstream promotes to BigInt.
+                let s = self.current().start;
+                let e = self.current().end;
+                let text = self.span_text(s, e).to_string();
+                self.advance();
+                Ok(ObjectValue::TypedLiteral {
+                    value: text,
+                    datatype: fluree_vocab::xsd::INTEGER.to_string(),
+                })
+            }
             TokenKind::Double(n) => {
                 let val = n;
                 self.advance();
@@ -871,15 +882,19 @@ impl<'a> TrigMetaParser<'a> {
                 Ok(ObjectValue::Double(val))
             }
             TokenKind::Decimal => {
-                // Treat decimal as double for simplicity
+                // Bare decimal literals are xsd:decimal per the Turtle grammar.
+                // Keep the exact lexical and route through the typed-literal
+                // lane (shared exact parser downstream) — going through f64
+                // here both corrupts the value and re-types it xsd:double,
+                // diverging from the default-graph Turtle path.
                 let s = self.current().start;
                 let e = self.current().end;
-                let text = self.span_text(s, e);
+                let text = self.span_text(s, e).to_string();
                 self.advance();
-                let n: f64 = text
-                    .parse()
-                    .map_err(|_| TransactError::Parse(format!("invalid decimal: {text}")))?;
-                Ok(ObjectValue::Double(n))
+                Ok(ObjectValue::TypedLiteral {
+                    value: text,
+                    datatype: fluree_vocab::xsd::DECIMAL.to_string(),
+                })
             }
             TokenKind::KwTrue => {
                 self.advance();

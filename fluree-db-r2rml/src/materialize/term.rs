@@ -491,14 +491,25 @@ fn format_decimal(unscaled: i128, scale: i8) -> String {
     if scale <= 0 {
         // No decimal point needed
         let multiplier = 10i128.pow((-scale) as u32);
-        (unscaled * multiplier).to_string()
+        match unscaled.checked_mul(multiplier) {
+            Some(v) => v.to_string(),
+            None => {
+                // Out of i128 range: append zeros to the digits instead.
+                format!("{}{}", unscaled, "0".repeat((-scale) as usize))
+            }
+        }
     } else {
-        // Insert decimal point
+        // Insert decimal point. Truncating division loses the sign when the
+        // integer part is zero (-5/10 == 0), so format from the absolute
+        // value and apply the sign explicitly: -0.5 must not become "0.5".
         let divisor = 10i128.pow(scale as u32);
-        let integer_part = unscaled / divisor;
-        let fractional_part = (unscaled % divisor).abs();
+        let sign = if unscaled < 0 { "-" } else { "" };
+        let abs = unscaled.unsigned_abs();
+        let integer_part = abs / divisor.unsigned_abs();
+        let fractional_part = abs % divisor.unsigned_abs();
         format!(
-            "{}.{:0>width$}",
+            "{}{}.{:0>width$}",
+            sign,
             integer_part,
             fractional_part,
             width = scale as usize
@@ -1016,5 +1027,20 @@ mod tests {
         assert_eq!(format_decimal(5, 3), "0.005");
         assert_eq!(format_decimal(1000, 0), "1000");
         assert_eq!(format_decimal(5, -2), "500"); // scale -2 = multiply by 100
+    }
+
+    #[test]
+    fn test_format_decimal_negative() {
+        // Sign must survive when the integer part is zero: truncating
+        // division (-5/10 == 0) previously dropped it.
+        assert_eq!(format_decimal(-5, 1), "-0.5");
+        assert_eq!(format_decimal(-5, 3), "-0.005");
+        assert_eq!(format_decimal(-12345, 2), "-123.45");
+        assert_eq!(format_decimal(-1000, 0), "-1000");
+        assert_eq!(format_decimal(-5, -2), "-500");
+        assert_eq!(format_decimal(i128::MIN, 2), {
+            let s = i128::MIN.to_string();
+            format!("{}.{}", &s[..s.len() - 2], &s[s.len() - 2..])
+        });
     }
 }
