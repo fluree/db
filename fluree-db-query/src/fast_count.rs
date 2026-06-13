@@ -340,15 +340,22 @@ fn count_rows_for_predicate_numeric_compare_post(
         // Same o_type at both ends ⇒ uniform o_type (POST sorts o_type before o_key).
         if min_ot == max_ot {
             let otype = OType::from_u16(min_ot);
-            if matches!(otype, OType::XSD_INTEGER | OType::XSD_DOUBLE) {
-                if let Some(threshold_key) = encode_numeric_threshold_for_otype(otype, threshold)? {
-                    if leaflet_fully_excluded(compare, min_ok, max_ok, threshold_key) {
-                        return Ok(Some(0));
-                    }
-                    if leaflet_fully_matches(compare, min_ok, max_ok, threshold_key) {
-                        return Ok(Some(count_rows_for_predicate_psot(store, g_id, p_id)?));
-                    }
-                }
+            if !matches!(otype, OType::XSD_INTEGER | OType::XSD_DOUBLE) {
+                // Uniformly unsupported (e.g. all-decimal predicate): the leaf
+                // scan below would bail on its first leaflet anyway — defer
+                // now without opening any leaves.
+                return Ok(None);
+            }
+            let Some(threshold_key) = encode_numeric_threshold_for_otype(otype, threshold)? else {
+                // Threshold not encodable for the uniform o_type (e.g. a
+                // decimal constant over integer rows): same doomed scan.
+                return Ok(None);
+            };
+            if leaflet_fully_excluded(compare, min_ok, max_ok, threshold_key) {
+                return Ok(Some(0));
+            }
+            if leaflet_fully_matches(compare, min_ok, max_ok, threshold_key) {
+                return Ok(Some(count_rows_for_predicate_psot(store, g_id, p_id)?));
             }
         }
     }
@@ -622,6 +629,26 @@ fn count_numeric_compare_overlay_parallel(
 ) -> Result<Option<u64>> {
     let tk_int = encode_numeric_threshold_for_otype(OType::XSD_INTEGER, threshold)?;
     let tk_dbl = encode_numeric_threshold_for_otype(OType::XSD_DOUBLE, threshold)?;
+
+    // Pre-check the base predicate's POST extent: if the base rows are
+    // uniformly an unsupported o_type (e.g. all-decimal), or the threshold
+    // can't encode for the uniform supported type, the full scan below is
+    // doomed — defer immediately instead of scanning every partition first.
+    // (Unsupported values arriving only via novelty are still caught by the
+    // per-row flag; novelty is small, so that residual pass is bounded.)
+    let post_leaves = leaf_entries_for_predicate(store, g_id, RunSortOrder::Post, p_id);
+    if let Some((min_ot, _, max_ot, _)) = predicate_post_global_extent(store, p_id, post_leaves)? {
+        if min_ot == max_ot {
+            match OType::from_u16(min_ot) {
+                OType::XSD_INTEGER if tk_int.is_none() => return Ok(None),
+                OType::XSD_DOUBLE if tk_dbl.is_none() => return Ok(None),
+                OType::XSD_INTEGER | OType::XSD_DOUBLE => {}
+                ot if ot.is_numeric() || ot == OType::NUM_BIG_OVERFLOW => return Ok(None),
+                _ => {}
+            }
+        }
+    }
+
     // Numeric o_types this lane can't compare by o_key (other integer-family
     // widths, floats, decimals — arena-keyed NUM_BIG has no value order at
     // all) must defer the whole count: treating them as non-matches would
