@@ -5820,6 +5820,10 @@ where
             garbage: None,
             sketch_ref: None,
             ns_split_mode: input.ns_split_mode,
+            // Bulk import writes arena-only roots for now; inline-decimal encoding
+            // is adopted on the ledger's first full reindex. (The import build
+            // path resolves objects independently of the rebuild resolver, so
+            // enabling inline here is a separate, follow-up wiring.)
             decimal_encoding: fluree_db_core::DecimalEncoding::ArenaOnly,
         };
 

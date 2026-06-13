@@ -1965,6 +1965,7 @@ impl Operator for BinaryScanOperator {
                         to_t: ctx.to_t,
                         g_id: self.g_id,
                         index: self.index,
+                        decimal_encoding: store_arc.decimal_encoding(),
                     };
                     let entry = if let Some(hit) = global_translation_cache().get(&global_key) {
                         hit
@@ -2215,6 +2216,14 @@ pub struct GlobalTranslationKey {
     pub to_t: i64,
     pub g_id: GraphId,
     pub index: IndexType,
+    /// The base store's decimal-encoding policy. A full reindex can replace an
+    /// arena-only (v2) root with an inline-decimal (v3) root at the *same*
+    /// `index_t` (a pure re-encode of the same committed data), so `store_max_t`
+    /// alone can't tell the two apart. The two roots translate the same novelty
+    /// decimal to different `(o_type, o_key)` (NUM_BIG_OVERFLOW handle vs inline
+    /// XSD_DECIMAL_INLINE); keying on the policy prevents serving a stale
+    /// arena-keyed translation against an inline root (or vice versa).
+    pub decimal_encoding: fluree_db_core::DecimalEncoding,
 }
 
 /// Cross-query LRU of translated overlay ops.

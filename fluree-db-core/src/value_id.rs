@@ -208,7 +208,7 @@ impl fmt::Display for ObjKind {
 /// identity, so a single root must use **one** decimal encoding for all
 /// inline-eligible values — never a mix — or a retract computed under one scheme
 /// would miss an assert stored under the other.
-#[derive(Copy, Clone, Eq, PartialEq, Debug, Default)]
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug, Default)]
 pub enum DecimalEncoding {
     /// All `xsd:decimal` values route to the per-`(graph, predicate)` NumBig
     /// arena. The behavior of every pre-inline index root, bit-for-bit unchanged.
