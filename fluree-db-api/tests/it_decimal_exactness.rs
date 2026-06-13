@@ -127,6 +127,58 @@ async fn sparql_insert_data_high_precision_decimal_survives() {
 }
 
 #[tokio::test]
+async fn small_decimal_renders_in_plain_form_not_exponent() {
+    // bigdecimal 0.4's Display switches to E-notation past a magnitude
+    // threshold (0.0000001 -> "1E-7"), which is invalid xsd:decimal lexical
+    // form. Output paths must emit the plain form. Exposed by exact storage:
+    // these values used to be f64 doubles, now they're exact decimals.
+    let fluree = memory_fluree();
+    let ledger = genesis_ledger(&fluree, "decimal/plain-form:main");
+
+    let lexical = "0.0000001";
+    let result = run_sparql_update(
+        &fluree,
+        ledger,
+        &format!(
+            r#"
+            PREFIX ex: <http://example.org/>
+            PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+            INSERT DATA {{ ex:tiny ex:amount "{lexical}"^^xsd:decimal . }}
+            "#
+        ),
+    )
+    .await;
+    let ledger = result.ledger;
+
+    let query = r"
+        PREFIX ex: <http://example.org/>
+        SELECT ?amount WHERE { ex:tiny ex:amount ?amount . }
+    ";
+    let result = support::query_sparql(&fluree, &ledger, query)
+        .await
+        .expect("query");
+
+    // SPARQL JSON output.
+    let sparql_json = result
+        .to_sparql_json(&ledger.snapshot)
+        .expect("to_sparql_json");
+    assert_eq!(binding_values(&sparql_json, "amount"), vec![lexical]);
+
+    // STR() must also yield the plain lexical, not E-notation.
+    let str_query = r"
+        PREFIX ex: <http://example.org/>
+        SELECT ?s WHERE { ex:tiny ex:amount ?a . BIND(STR(?a) AS ?s) }
+    ";
+    let result = support::query_sparql(&fluree, &ledger, str_query)
+        .await
+        .expect("str query");
+    let sparql_json = result
+        .to_sparql_json(&ledger.snapshot)
+        .expect("to_sparql_json");
+    assert_eq!(binding_values(&sparql_json, "s"), vec![lexical]);
+}
+
+#[tokio::test]
 async fn sparql_decimal_constant_matches_stored_decimal() {
     let fluree = memory_fluree();
     let ledger = genesis_ledger(&fluree, "decimal/constant:main");

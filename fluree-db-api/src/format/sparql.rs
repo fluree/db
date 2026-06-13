@@ -351,7 +351,7 @@ fn scalar_lexical(val: &FlakeValue) -> String {
         FlakeValue::Vector(v) => serde_json::to_string(v).unwrap_or_else(|_| "[]".to_string()),
         FlakeValue::Json(json_str) => json_str.clone(),
         FlakeValue::BigInt(n) => n.to_string(),
-        FlakeValue::Decimal(d) => d.to_string(),
+        FlakeValue::Decimal(d) => d.to_plain_string(),
         other => other.to_string(),
     }
 }
@@ -527,7 +527,7 @@ fn format_binding(
                 }))),
                 FlakeValue::Decimal(d) => Ok(Some(json!({
                     "type": "literal",
-                    "value": d.to_string(),
+                    "value": d.to_plain_string(),
                     "datatype": dt_iri
                 }))),
                 // Temporal types

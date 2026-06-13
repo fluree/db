@@ -983,7 +983,10 @@ impl fmt::Display for FlakeValue {
             FlakeValue::Long(l) => write!(f, "{l}"),
             FlakeValue::Double(d) => write!(f, "{d}"),
             FlakeValue::BigInt(v) => write!(f, "{v}"),
-            FlakeValue::Decimal(v) => write!(f, "{v}"),
+            // Plain form, never E-notation: BigDecimal's Display switches to
+            // exponent notation past a magnitude threshold (e.g. 0.0000001 →
+            // "1E-7"), which is invalid xsd:decimal lexical form.
+            FlakeValue::Decimal(v) => write!(f, "{}", v.to_plain_string()),
             FlakeValue::DateTime(v) => write!(f, "{v}"),
             FlakeValue::Date(v) => write!(f, "{v}"),
             FlakeValue::Time(v) => write!(f, "{v}"),

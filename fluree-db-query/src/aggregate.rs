@@ -809,7 +809,7 @@ fn agg_group_concat(values: &[Binding], separator: &str) -> Binding {
                 FlakeValue::Json(s) => Some(s.clone()), // JSON as string
                 FlakeValue::Long(n) => Some(n.to_string()),
                 FlakeValue::Double(n) => Some(n.to_string()),
-                FlakeValue::Decimal(d) => Some(d.to_string()),
+                FlakeValue::Decimal(d) => Some(d.to_plain_string()),
                 FlakeValue::BigInt(n) => Some(n.to_string()),
                 FlakeValue::Boolean(b) => Some(b.to_string()),
                 _ => None,
