@@ -80,6 +80,10 @@ pub struct CommitResolver {
     /// be collected. Empty by default so the `@fulltext`-datatype path keeps
     /// working without any config setup.
     fulltext_hook_config: crate::fulltext_hook::FulltextHookConfig,
+    /// Decimal-encoding policy for this run, derived from the root being
+    /// extended. `ArenaOnly` by default so behavior is unchanged until a caller
+    /// opts a run into inline decimals.
+    decimal_encoding: fluree_db_core::DecimalEncoding,
 }
 
 impl CommitResolver {
@@ -92,7 +96,13 @@ impl CommitResolver {
             spatial_hook: None,
             fulltext_hook: None,
             fulltext_hook_config: crate::fulltext_hook::FulltextHookConfig::default(),
+            decimal_encoding: fluree_db_core::DecimalEncoding::default(),
         }
+    }
+
+    /// Set the decimal-encoding policy for this run (sticky per root).
+    pub fn set_decimal_encoding(&mut self, enc: fluree_db_core::DecimalEncoding) {
+        self.decimal_encoding = enc;
     }
 
     /// Set the ID-based stats hook for per-op stats collection.
@@ -951,17 +961,29 @@ impl CommitResolver {
                 }
             }
             RawObject::DecimalStr(s) => {
-                // All typed xsd:decimal values route to NumBig by default
                 match s.parse::<BigDecimal>() {
                     Ok(bd) => {
-                        let handle = dicts
-                            .numbigs
-                            .entry(g_id)
-                            .or_default()
-                            .entry(p_id)
-                            .or_default()
-                            .get_or_insert_bigdec(&bd);
-                        Ok((ObjKind::NUM_BIG, ObjKey::encode_u32_id(handle)))
+                        // Under InlineWhenFits, small/exact decimals encode inline;
+                        // large/high-precision values fall back to the arena. Under
+                        // ArenaOnly every decimal routes to the arena.
+                        let inline = self
+                            .decimal_encoding
+                            .inlines()
+                            .then(|| ObjKey::encode_decimal(&bd))
+                            .flatten();
+                        match inline {
+                            Some(key) => Ok((ObjKind::NUM_DEC, key)),
+                            None => {
+                                let handle = dicts
+                                    .numbigs
+                                    .entry(g_id)
+                                    .or_default()
+                                    .entry(p_id)
+                                    .or_default()
+                                    .get_or_insert_bigdec(&bd);
+                                Ok((ObjKind::NUM_BIG, ObjKey::encode_u32_id(handle)))
+                            }
+                        }
                     }
                     Err(_) => {
                         // Cannot parse as BigDecimal -- store as string
@@ -1115,6 +1137,10 @@ pub struct SharedResolverState {
     /// for every `rdfs:subClassOf` / `rdfs:subPropertyOf` user-data op so rebuild
     /// can populate `IndexSchema` in the FIR6 root.
     pub schema_hook: Option<crate::stats::SchemaExtractor>,
+    /// Decimal-encoding policy for this rebuild, derived from the root being
+    /// extended. `ArenaOnly` by default so behavior is unchanged until a caller
+    /// opts the rebuild into inline decimals.
+    pub decimal_encoding: fluree_db_core::DecimalEncoding,
 }
 
 impl SharedResolverState {
@@ -1161,6 +1187,7 @@ impl SharedResolverState {
             fulltext_hook: None,
             fulltext_hook_config: crate::fulltext_hook::FulltextHookConfig::default(),
             schema_hook: None,
+            decimal_encoding: fluree_db_core::DecimalEncoding::default(),
         }
     }
 
@@ -1288,6 +1315,9 @@ impl SharedResolverState {
             fulltext_hook: None,
             fulltext_hook_config: crate::fulltext_hook::FulltextHookConfig::default(),
             schema_hook: None,
+            // Sticky: an incremental rebuild inherits the base root's policy so
+            // it never mixes inline and arena encodings under one identity.
+            decimal_encoding: root.decimal_encoding(),
         })
     }
 
@@ -1736,14 +1766,24 @@ impl SharedResolverState {
             }
             RawObject::DecimalStr(s) => match s.parse::<BigDecimal>() {
                 Ok(bd) => {
-                    let handle = self
-                        .numbigs
-                        .entry(g_id)
-                        .or_default()
-                        .entry(p_id)
-                        .or_default()
-                        .get_or_insert_bigdec(&bd);
-                    Ok((ObjKind::NUM_BIG, ObjKey::encode_u32_id(handle)))
+                    let inline = self
+                        .decimal_encoding
+                        .inlines()
+                        .then(|| ObjKey::encode_decimal(&bd))
+                        .flatten();
+                    match inline {
+                        Some(key) => Ok((ObjKind::NUM_DEC, key)),
+                        None => {
+                            let handle = self
+                                .numbigs
+                                .entry(g_id)
+                                .or_default()
+                                .entry(p_id)
+                                .or_default()
+                                .get_or_insert_bigdec(&bd);
+                            Ok((ObjKind::NUM_BIG, ObjKey::encode_u32_id(handle)))
+                        }
+                    }
                 }
                 Err(_) => {
                     let id = chunk.strings.get_or_insert(s.as_bytes());
@@ -2404,6 +2444,58 @@ mod tests {
 
         // Verify records collected
         assert_eq!(collector.records.len(), 3);
+    }
+
+    #[test]
+    fn resolve_decimal_inline_vs_arena() {
+        use fluree_db_core::value_id::{ObjKey, ObjKind};
+        use fluree_db_core::DecimalEncoding;
+
+        // Resolve a single decimal-valued flake under the given policy and return
+        // the emitted record's (o_kind, o_key).
+        let resolve = |dec: &str, enc: DecimalEncoding| -> (u8, u64) {
+            let flake = Flake::new(
+                Sid::new(101, "Item"),
+                Sid::new(101, "price"),
+                FlakeValue::Decimal(Box::new(dec.parse().unwrap())),
+                Sid::new(2, "decimal"),
+                1,
+                true,
+                None,
+            );
+            let blob = build_test_blob(&[flake], 1);
+            let commit_ops = load_commit_ops(&blob).unwrap();
+            let mut dicts = GlobalDicts::new_memory("test:main");
+            let mut resolver = CommitResolver::new();
+            resolver
+                .ns_prefixes
+                .insert(101, "http://example.org/".to_string());
+            resolver.set_decimal_encoding(enc);
+            let mut collector = RecordCollector::new();
+            resolver
+                .resolve_commit_ops(&commit_ops, &mut dicts, &mut collector)
+                .unwrap();
+            assert_eq!(collector.records.len(), 1);
+            let r = &collector.records[0];
+            (r.o_kind, r.o_key)
+        };
+
+        // ArenaOnly: every decimal routes to the NumBig arena (handle in o_key).
+        let (kind, _) = resolve("19.99", DecimalEncoding::ArenaOnly);
+        assert_eq!(kind, ObjKind::NUM_BIG.as_u8());
+
+        // InlineWhenFits: a small decimal encodes inline and decodes back exactly.
+        let (kind, key) = resolve("19.99", DecimalEncoding::InlineWhenFits);
+        assert_eq!(kind, ObjKind::NUM_DEC.as_u8());
+        assert_eq!(
+            ObjKey::from_u64(key).decode_decimal(),
+            "19.99".parse::<bigdecimal::BigDecimal>().unwrap()
+        );
+
+        // InlineWhenFits: a value too large to fit (mantissa >= 2^57) falls back
+        // to the arena, exactly like overflow integers.
+        let (kind, _) = resolve("144115188075855872", DecimalEncoding::InlineWhenFits);
+        assert_eq!(kind, ObjKind::NUM_BIG.as_u8());
     }
 
     #[test]
