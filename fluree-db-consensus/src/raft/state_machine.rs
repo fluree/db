@@ -76,6 +76,21 @@ impl RefKey {
     }
 }
 
+/// Latest published index for a branch: the content id of the
+/// index root plus the logical time it covers up through. Bundled
+/// so the "head present" and "t present" cases can't drift apart
+/// at the type level.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IndexState {
+    /// Content id of the index root blob.
+    pub head: ContentId,
+    /// Logical time the index covers up through. Always `<=` the
+    /// containing [`RefEntry::t`] (we never publish an index over
+    /// commits we haven't applied) and strictly monotonic across
+    /// [`Command::AdvanceIndexHead`] applies.
+    pub t: i64,
+}
+
 /// Authoritative head for one branch.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RefEntry {
@@ -91,6 +106,11 @@ pub struct RefEntry {
     /// Source of truth for time-of-event lookups and any index-based
     /// eviction policy.
     pub last_advanced_index: u64,
+    /// Latest published index head + t for this branch, or `None`
+    /// if no index has been built yet. Advanced by
+    /// [`Command::AdvanceIndexHead`] (typically driven by the
+    /// indexer running on the current leader).
+    pub index: Option<IndexState>,
 }
 
 /// Lifecycle record for one ledger.
@@ -159,6 +179,11 @@ pub enum Command {
     /// CAS-advance a branch head. Apply checks `expected_prev`
     /// against the current head before writing.
     AdvanceRef(AdvanceRefArgs),
+    /// Advance the published index head for a branch. Driven by the
+    /// indexer running on the current leader after it finishes a
+    /// build. Apply enforces strict monotonicity and rejects index
+    /// claims for commits the state machine hasn't applied yet.
+    AdvanceIndexHead(AdvanceIndexHeadArgs),
     /// Register a new ledger and set its initial branch head in one
     /// atomic step.
     CreateLedger(CreateLedgerArgs),
@@ -201,6 +226,24 @@ pub struct AdvanceRefArgs {
     pub tally: Option<RecordedTally>,
 }
 
+/// Payload for [`Command::AdvanceIndexHead`].
+///
+/// Strict monotonic update: the new `t` must be greater than the
+/// branch's current `index_t`, and must not exceed the branch's
+/// current commit `t` (we never publish an index that claims to
+/// cover commits the state machine hasn't applied).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdvanceIndexHeadArgs {
+    pub ledger_id: String,
+    pub branch: String,
+    /// Content id of the new index root blob.
+    pub new_index_head: ContentId,
+    /// Logical time the new index covers up through.
+    pub t: i64,
+    /// Leader's wall-clock at proposal, milliseconds since epoch.
+    pub applied_at_millis: u64,
+}
+
 /// Payload for [`Command::CreateLedger`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateLedgerArgs {
@@ -240,6 +283,35 @@ pub enum Response {
     Conflict {
         current_head: Option<ContentId>,
         current_t: Option<i64>,
+    },
+    /// [`Command::AdvanceIndexHead`] succeeded. Carries the new
+    /// index head + t so the proposing publisher can confirm what
+    /// was committed.
+    IndexAdvanced {
+        index_t: i64,
+        index_head: ContentId,
+    },
+    /// [`Command::AdvanceIndexHead`] was no-op'd because the
+    /// branch's published index already covers the proposed t (or
+    /// further). Not an error — usually means a concurrent indexer
+    /// got there first, or the proposer is retrying after partial
+    /// success.
+    IndexStale {
+        /// Current published index t for the branch — strictly
+        /// greater than or equal to the proposed t.
+        current_t: i64,
+    },
+    /// [`Command::AdvanceIndexHead`] proposed an `index_t` that
+    /// exceeds the branch's current `commit_t`. The proposer is
+    /// trying to publish an index over commits the state machine
+    /// hasn't applied — usually means the indexer raced ahead of
+    /// the leader's apply or applied state from an older snapshot.
+    /// The proposer should re-stage from the current commit head.
+    IndexAhead {
+        /// Branch's current commit t.
+        commit_t: i64,
+        /// The proposed (rejected) index t.
+        proposed_t: i64,
     },
     /// [`Command::CreateLedger`] succeeded.
     Created { ledger_id: String },
@@ -291,14 +363,15 @@ impl NameServiceState {
 /// time for any state-machine bookkeeping that needs it.
 pub fn apply(state: &mut NameServiceState, command: Command, log_index: u64) -> Response {
     match command {
-        Command::AdvanceRef(args) => apply_advance_ref(state, log_index, args),
-        Command::CreateLedger(args) => apply_create_ledger(state, log_index, args),
-        Command::DeleteLedger { ledger_id } => apply_delete_ledger(state, ledger_id),
+        Command::AdvanceRef(args) => advance_ref(state, log_index, args),
+        Command::AdvanceIndexHead(args) => advance_index_head(state, args),
+        Command::CreateLedger(args) => create_ledger(state, log_index, args),
+        Command::DeleteLedger { ledger_id } => delete_ledger(state, ledger_id),
         Command::ReleaseContent { id: _ } => Response::NoOp,
     }
 }
 
-fn apply_advance_ref(
+fn advance_ref(
     state: &mut NameServiceState,
     log_index: u64,
     args: AdvanceRefArgs,
@@ -355,6 +428,10 @@ fn apply_advance_ref(
         ledger.branches.push(branch.clone());
     }
 
+    // Carry the existing index forward across commit advances — the
+    // new commit doesn't index itself; that happens later via
+    // `AdvanceIndexHead`.
+    let prior_index = state.refs.get(&ref_key).and_then(|r| r.index.clone());
     state.refs.insert(
         ref_key,
         RefEntry {
@@ -362,6 +439,7 @@ fn apply_advance_ref(
             t,
             last_advanced_at_millis: applied_at_millis,
             last_advanced_index: log_index,
+            index: prior_index,
         },
     );
 
@@ -387,7 +465,7 @@ fn apply_advance_ref(
     }
 }
 
-fn apply_create_ledger(
+fn create_ledger(
     state: &mut NameServiceState,
     log_index: u64,
     args: CreateLedgerArgs,
@@ -422,18 +500,85 @@ fn apply_create_ledger(
             t: initial_t,
             last_advanced_at_millis: created_at_millis,
             last_advanced_index: log_index,
+            // No index built yet; the first `AdvanceIndexHead` for
+            // this branch will populate this.
+            index: None,
         },
     );
 
     Response::Created { ledger_id }
 }
 
-fn apply_delete_ledger(state: &mut NameServiceState, ledger_id: String) -> Response {
+fn delete_ledger(state: &mut NameServiceState, ledger_id: String) -> Response {
     if state.ledgers.remove(&ledger_id).is_none() {
         return Response::LedgerNotFound { ledger_id };
     }
     state.refs.retain(|key, _| key.ledger_id != ledger_id);
     Response::Deleted { ledger_id }
+}
+
+fn advance_index_head(
+    state: &mut NameServiceState,
+    args: AdvanceIndexHeadArgs,
+) -> Response {
+    let AdvanceIndexHeadArgs {
+        ledger_id,
+        branch,
+        new_index_head,
+        t,
+        applied_at_millis,
+    } = args;
+
+    if !state.ledgers.contains_key(&ledger_id) {
+        return Response::LedgerNotFound { ledger_id };
+    }
+
+    let ref_key = RefKey::new(&ledger_id, &branch);
+    let Some(entry) = state.refs.get_mut(&ref_key) else {
+        // No ref means no commits on this branch yet — nothing to
+        // index. Reuse `LedgerNotFound` since `advance_ref`
+        // does the same for the "no refs yet" case at the caller's
+        // boundary, keeping the response surface narrow.
+        return Response::LedgerNotFound { ledger_id };
+    };
+
+    // Strict monotonic — concurrent indexers racing to publish only
+    // the latest survive. Equal `t` is treated as stale on purpose:
+    // the existing entry already covers everything this proposal
+    // would, so re-writing risks rewriting a content-equivalent
+    // root with a different cid (e.g. different leaf ordering) for
+    // no benefit.
+    if let Some(existing) = &entry.index {
+        if t <= existing.t {
+            return Response::IndexStale {
+                current_t: existing.t,
+            };
+        }
+    }
+
+    // The index can't claim to cover commits the state machine
+    // hasn't applied. This shouldn't normally happen — the leader
+    // runs the indexer against its own applied state — but a
+    // leadership transition mid-build can race: a stepped-down
+    // leader finishes a build after the new leader has reset to an
+    // older state. Reject so the proposer re-stages.
+    if t > entry.t {
+        return Response::IndexAhead {
+            commit_t: entry.t,
+            proposed_t: t,
+        };
+    }
+
+    entry.index = Some(IndexState {
+        head: new_index_head.clone(),
+        t,
+    });
+    entry.last_advanced_at_millis = applied_at_millis;
+
+    Response::IndexAdvanced {
+        index_t: t,
+        index_head: new_index_head,
+    }
 }
 
 #[cfg(test)]
@@ -939,5 +1084,160 @@ mod tests {
         );
 
         assert!(matches!(resp, Response::Conflict { .. }));
+    }
+
+    // -------------------------------------------------------------
+    // AdvanceIndexHead — apply path
+    // -------------------------------------------------------------
+
+    fn advance_index(ledger_id: &str, branch: &str, head: ContentId, t: i64) -> Command {
+        Command::AdvanceIndexHead(AdvanceIndexHeadArgs {
+            ledger_id: ledger_id.into(),
+            branch: branch.into(),
+            new_index_head: head,
+            t,
+            applied_at_millis: 3_000,
+        })
+    }
+
+    /// Set up a ledger with `main` at commit_t=10 — the baseline for
+    /// the index tests below.
+    fn ledger_with_commit_at_t10() -> NameServiceState {
+        let mut state = NameServiceState::new();
+        apply(&mut state, create_ledger("test/db"), 1);
+        apply(
+            &mut state,
+            advance("test/db", "main", Some(cid(0)), cid(1), 10, None),
+            2,
+        );
+        state
+    }
+
+    fn ref_entry<'a>(state: &'a NameServiceState, ledger: &str, branch: &str) -> &'a RefEntry {
+        state
+            .refs
+            .get(&RefKey::new(ledger, branch))
+            .expect("ref present")
+    }
+
+    #[test]
+    fn advance_index_head_writes_into_existing_ref() {
+        let mut state = ledger_with_commit_at_t10();
+        let resp = apply(&mut state, advance_index("test/db", "main", cid(42), 10), 3);
+
+        assert_eq!(
+            resp,
+            Response::IndexAdvanced {
+                index_t: 10,
+                index_head: cid(42),
+            }
+        );
+        let entry = ref_entry(&state, "test/db", "main");
+        assert_eq!(
+            entry.index,
+            Some(IndexState {
+                head: cid(42),
+                t: 10
+            })
+        );
+        // Commit head untouched.
+        assert_eq!(entry.head, cid(1));
+        assert_eq!(entry.t, 10);
+    }
+
+    #[test]
+    fn advance_index_head_is_strictly_monotonic() {
+        let mut state = ledger_with_commit_at_t10();
+        apply(&mut state, advance_index("test/db", "main", cid(42), 10), 3);
+
+        // Re-proposing the same t is stale (not advanced again).
+        let resp = apply(&mut state, advance_index("test/db", "main", cid(43), 10), 4);
+        assert_eq!(resp, Response::IndexStale { current_t: 10 });
+
+        // Lower t is also stale.
+        let resp = apply(&mut state, advance_index("test/db", "main", cid(44), 5), 5);
+        assert_eq!(resp, Response::IndexStale { current_t: 10 });
+
+        // State unchanged after the failed advances.
+        let entry = ref_entry(&state, "test/db", "main");
+        assert_eq!(
+            entry.index,
+            Some(IndexState {
+                head: cid(42),
+                t: 10
+            })
+        );
+    }
+
+    #[test]
+    fn advance_index_head_rejects_index_t_beyond_commit_t() {
+        let mut state = ledger_with_commit_at_t10();
+        // Branch is at commit_t=10; proposing index over t=15 means
+        // the indexer's claim to have indexed commits 11..=15 has
+        // no commits to back it on this node's state.
+        let resp = apply(&mut state, advance_index("test/db", "main", cid(99), 15), 3);
+        assert_eq!(
+            resp,
+            Response::IndexAhead {
+                commit_t: 10,
+                proposed_t: 15,
+            }
+        );
+        // No write happened.
+        let entry = ref_entry(&state, "test/db", "main");
+        assert_eq!(entry.index, None);
+    }
+
+    #[test]
+    fn advance_index_head_rejects_when_ledger_missing() {
+        let mut state = NameServiceState::new();
+        let resp = apply(&mut state, advance_index("nope/db", "main", cid(7), 1), 1);
+        assert_eq!(
+            resp,
+            Response::LedgerNotFound {
+                ledger_id: "nope/db".into()
+            }
+        );
+    }
+
+    #[test]
+    fn advance_index_head_rejects_when_branch_has_no_ref() {
+        // Ledger exists (its `main` ref was created), but `dev` has
+        // never been touched — there's nothing to index there.
+        let mut state = ledger_with_commit_at_t10();
+        let resp = apply(&mut state, advance_index("test/db", "dev", cid(7), 1), 3);
+        assert_eq!(
+            resp,
+            Response::LedgerNotFound {
+                ledger_id: "test/db".into()
+            }
+        );
+    }
+
+    #[test]
+    fn advance_ref_carries_index_head_forward_across_commits() {
+        // Publish an index at t=10, then advance commit to t=20. The
+        // index head should travel with the ref entry: the next
+        // commit doesn't index itself, but it shouldn't lose the
+        // pointer to the latest index either.
+        let mut state = ledger_with_commit_at_t10();
+        apply(&mut state, advance_index("test/db", "main", cid(42), 10), 3);
+        apply(
+            &mut state,
+            advance("test/db", "main", Some(cid(1)), cid(2), 20, None),
+            4,
+        );
+
+        let entry = ref_entry(&state, "test/db", "main");
+        assert_eq!(entry.head, cid(2));
+        assert_eq!(entry.t, 20);
+        // Index still points at the t=10 root.
+        assert_eq!(
+            entry.index,
+            Some(IndexState {
+                head: cid(42),
+                t: 10
+            })
+        );
     }
 }

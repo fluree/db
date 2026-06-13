@@ -350,7 +350,10 @@ impl Committer for RaftCommitter {
             SmResponse::Created { .. }
             | SmResponse::Deleted { .. }
             | SmResponse::AlreadyExists { .. }
-            | SmResponse::NoOp => Err(SubmissionError::Execution {
+            | SmResponse::NoOp
+            | SmResponse::IndexAdvanced { .. }
+            | SmResponse::IndexStale { .. }
+            | SmResponse::IndexAhead { .. } => Err(SubmissionError::Execution {
                 status: 500,
                 message: "unexpected Response variant for AdvanceRef".into(),
             }),
@@ -524,7 +527,10 @@ impl Committer for RaftCommitter {
             SmResponse::Created { .. }
             | SmResponse::Deleted { .. }
             | SmResponse::AlreadyExists { .. }
-            | SmResponse::NoOp => Err(SubmissionError::Execution {
+            | SmResponse::NoOp
+            | SmResponse::IndexAdvanced { .. }
+            | SmResponse::IndexStale { .. }
+            | SmResponse::IndexAhead { .. } => Err(SubmissionError::Execution {
                 status: 500,
                 message: "unexpected Response variant for AdvanceRef".into(),
             }),
@@ -696,7 +702,10 @@ impl Committer for RaftCommitter {
             SmResponse::Created { .. }
             | SmResponse::Deleted { .. }
             | SmResponse::AlreadyExists { .. }
-            | SmResponse::NoOp => Err(SubmissionError::Execution {
+            | SmResponse::NoOp
+            | SmResponse::IndexAdvanced { .. }
+            | SmResponse::IndexStale { .. }
+            | SmResponse::IndexAhead { .. } => Err(SubmissionError::Execution {
                 status: 500,
                 message: "unexpected Response variant for AdvanceRef".into(),
             }),
@@ -862,7 +871,10 @@ impl Committer for RaftCommitter {
             SmResponse::Created { .. }
             | SmResponse::Deleted { .. }
             | SmResponse::AlreadyExists { .. }
-            | SmResponse::NoOp => Err(SubmissionError::Execution {
+            | SmResponse::NoOp
+            | SmResponse::IndexAdvanced { .. }
+            | SmResponse::IndexStale { .. }
+            | SmResponse::IndexAhead { .. } => Err(SubmissionError::Execution {
                 status: 500,
                 message: "unexpected Response variant for AdvanceRef".into(),
             }),
@@ -990,7 +1002,10 @@ impl Committer for RaftCommitter {
             SmResponse::Created { .. }
             | SmResponse::Deleted { .. }
             | SmResponse::AlreadyExists { .. }
-            | SmResponse::NoOp => Err(SubmissionError::Execution {
+            | SmResponse::NoOp
+            | SmResponse::IndexAdvanced { .. }
+            | SmResponse::IndexStale { .. }
+            | SmResponse::IndexAhead { .. } => Err(SubmissionError::Execution {
                 status: 500,
                 message: "unexpected Response variant for AdvanceRef".into(),
             }),
