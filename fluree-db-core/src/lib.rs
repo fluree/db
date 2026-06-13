@@ -194,7 +194,7 @@ pub use value::{
     parse_decimal, parse_decimal_string, parse_double, parse_integer, parse_integer_string,
     FlakeValue, GeoPointBits,
 };
-pub use value_id::{ObjKey, ObjKeyError, ObjKind, ObjPair, ValueTypeTag};
+pub use value_id::{DecimalEncoding, ObjKey, ObjKeyError, ObjKind, ObjPair, ValueTypeTag};
 
 /// Prelude module for convenient imports of storage traits and common types.
 ///

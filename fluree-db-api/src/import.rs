@@ -5820,6 +5820,7 @@ where
             garbage: None,
             sketch_ref: None,
             ns_split_mode: input.ns_split_mode,
+            decimal_encoding: fluree_db_core::DecimalEncoding::ArenaOnly,
         };
 
         // Encode and upload FIR6 root.

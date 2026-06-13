@@ -187,6 +187,48 @@ impl fmt::Display for ObjKind {
 }
 
 // ============================================================================
+// DecimalEncoding
+// ============================================================================
+
+/// How an index root encodes `xsd:decimal` object values.
+///
+/// This is an **encode-time** policy derived from the active index root's
+/// format version — it is never user-facing. Decode is always capable of both
+/// schemes regardless of this policy, so new code reading any root is fully
+/// backward-compatible.
+///
+/// The policy is **sticky per root and preserved across incremental writes**:
+/// extending an `ArenaOnly` root keeps writing decimals to the NumBig arena;
+/// extending an `InlineWhenFits` root keeps inlining. Only a full reindex
+/// changes the policy, because only a full reindex rewrites existing facts under
+/// a new `(o_type, o_key)` identity. (Contrast `lex_sorted_string_ids`, which is
+/// *cleared* on incremental writes; inline decimals are not broken by appends.)
+///
+/// The hard invariant this protects: `(o_type, o_key)` is persisted fact
+/// identity, so a single root must use **one** decimal encoding for all
+/// inline-eligible values — never a mix — or a retract computed under one scheme
+/// would miss an assert stored under the other.
+#[derive(Copy, Clone, Eq, PartialEq, Debug, Default)]
+pub enum DecimalEncoding {
+    /// All `xsd:decimal` values route to the per-`(graph, predicate)` NumBig
+    /// arena. The behavior of every pre-inline index root, bit-for-bit unchanged.
+    #[default]
+    ArenaOnly,
+    /// Inline-eligible decimals (see [`ObjKey::encode_decimal`]) encode inline
+    /// under [`ObjKind::NUM_DEC`]; values that do not fit fall back to the arena,
+    /// exactly like overflow integers.
+    InlineWhenFits,
+}
+
+impl DecimalEncoding {
+    /// True if this policy may emit inline decimal keys on write.
+    #[inline]
+    pub const fn inlines(self) -> bool {
+        matches!(self, Self::InlineWhenFits)
+    }
+}
+
+// ============================================================================
 // ObjKey
 // ============================================================================
 

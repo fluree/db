@@ -117,7 +117,39 @@ pub const ROOT_V6_MAGIC: &[u8; 4] = b"FIR6";
 /// be keyed by `(g_id, p_id, lang_id)` for multi-language full-text indexing.
 /// Pre-v2 roots are refused outright — operators upgrading must run a full
 /// reindex before queries resume.
+///
+/// Version 3 enables inline `xsd:decimal` encoding ([`DecimalEncoding`]): leaf
+/// data may carry [`OType::XSD_DECIMAL_INLINE`] rows. The root layout is
+/// byte-identical to v2; the version is the capability signal. Old binaries
+/// refuse a v3 root outright (the strict version check below) rather than
+/// misdecoding inline-decimal leaf rows, which is the required "upgrade code
+/// first" safety property.
 pub const ROOT_V6_VERSION: u8 = 2;
+
+/// Root format version that enables inline `xsd:decimal` encoding. Written only
+/// by a full reindex/import under [`DecimalEncoding::InlineWhenFits`]; see
+/// [`IndexRoot::decimal_encoding`].
+pub const ROOT_V6_VERSION_INLINE_DECIMAL: u8 = 3;
+
+/// Derive the decimal-encoding policy from a decoded root format version.
+#[inline]
+pub const fn decimal_encoding_for_version(version: u8) -> fluree_db_core::DecimalEncoding {
+    if version >= ROOT_V6_VERSION_INLINE_DECIMAL {
+        fluree_db_core::DecimalEncoding::InlineWhenFits
+    } else {
+        fluree_db_core::DecimalEncoding::ArenaOnly
+    }
+}
+
+/// The root format version that must be written for a given decimal-encoding
+/// policy. Inverse of [`decimal_encoding_for_version`].
+#[inline]
+pub const fn version_for_decimal_encoding(enc: fluree_db_core::DecimalEncoding) -> u8 {
+    match enc {
+        fluree_db_core::DecimalEncoding::InlineWhenFits => ROOT_V6_VERSION_INLINE_DECIMAL,
+        fluree_db_core::DecimalEncoding::ArenaOnly => ROOT_V6_VERSION,
+    }
+}
 
 /// Binary index root (`FIR6`).
 ///
@@ -163,6 +195,12 @@ pub struct IndexRoot {
     /// current watermark, which breaks this invariant. Indexing code must clear
     /// this flag on the first post-import write.
     pub lex_sorted_string_ids: bool,
+
+    /// How this root encodes `xsd:decimal` values. Derived from the format
+    /// version on decode ([`decimal_encoding_for_version`]) and mapped back to
+    /// the version on encode ([`version_for_decimal_encoding`]). Sticky:
+    /// incremental writes preserve it; only a full reindex changes it.
+    pub decimal_encoding: fluree_db_core::DecimalEncoding,
 
     // ── Cumulative commit stats ────────────────────────────────────
     pub total_commit_size: u64,
@@ -481,6 +519,14 @@ impl IndexRoot {
     const FLAG_HAS_SKETCH: u8 = 1 << 4;
     const FLAG_LEX_SORTED_STRING_IDS: u8 = 1 << 5;
 
+    /// The decimal-encoding policy this root writes under. Equivalent to reading
+    /// [`decimal_encoding`](Self::decimal_encoding) directly; provided as the
+    /// stable accessor for encode-path callers.
+    #[inline]
+    pub fn decimal_encoding(&self) -> fluree_db_core::DecimalEncoding {
+        self.decimal_encoding
+    }
+
     /// Encode to the binary FIR6 wire format.
     ///
     /// Determinism: namespaces sorted by ns_code, named graphs by g_id,
@@ -490,7 +536,9 @@ impl IndexRoot {
 
         // ---- Header (24 bytes) ----
         buf.extend_from_slice(ROOT_V6_MAGIC);
-        buf.push(ROOT_V6_VERSION);
+        // The version byte is the inline-decimal capability signal: a root that
+        // inlines decimals is written as v3 so old binaries refuse it.
+        buf.push(version_for_decimal_encoding(self.decimal_encoding));
         let flags = (if self.stats.is_some() {
             Self::FLAG_HAS_STATS
         } else {
@@ -683,9 +731,13 @@ impl IndexRoot {
             )));
         }
         let version = data[4];
-        if version != ROOT_V6_VERSION {
+        // Accept v2 (arena-only) and v3 (inline-decimal-capable); the layouts are
+        // byte-identical, the version only signals whether inline-decimal leaf
+        // rows may appear. Any other version is refused.
+        if version != ROOT_V6_VERSION && version != ROOT_V6_VERSION_INLINE_DECIMAL {
             return Err(io_err(&format!("root v6: unsupported version {version}")));
         }
+        let decimal_encoding = decimal_encoding_for_version(version);
 
         let flags = data[5];
         let mut pos = 8; // skip pad(2)
@@ -898,6 +950,7 @@ impl IndexRoot {
             subject_watermarks,
             string_watermark,
             lex_sorted_string_ids,
+            decimal_encoding,
             total_commit_size,
             total_asserts,
             total_retracts,
@@ -1186,6 +1239,7 @@ mod tests {
             garbage: None,
             sketch_ref: None,
             ns_split_mode: fluree_db_core::ns_encoding::NsSplitMode::default(),
+            decimal_encoding: fluree_db_core::DecimalEncoding::ArenaOnly,
         }
     }
 
@@ -1199,6 +1253,10 @@ mod tests {
         assert_eq!(bytes[5], 0); // no optional sections
 
         let decoded = IndexRoot::decode(&bytes).unwrap();
+        assert_eq!(
+            decoded.decimal_encoding(),
+            fluree_db_core::DecimalEncoding::ArenaOnly
+        );
         assert_eq!(decoded.ledger_id, "test:main");
         assert_eq!(decoded.index_t, 42);
         assert_eq!(decoded.base_t, 0);
@@ -1209,6 +1267,44 @@ mod tests {
         assert_eq!(decoded.default_graph_orders.len(), 0);
         assert_eq!(decoded.named_graphs.len(), 0);
         assert!(decoded.stats.is_none());
+    }
+
+    #[test]
+    fn fir6_decimal_encoding_version_round_trip() {
+        use fluree_db_core::DecimalEncoding;
+
+        // Arena-only root is written as v2 and decodes back to ArenaOnly.
+        let arena = minimal_root_v6();
+        let arena_bytes = arena.encode();
+        assert_eq!(arena_bytes[4], ROOT_V6_VERSION);
+        assert_eq!(
+            IndexRoot::decode(&arena_bytes).unwrap().decimal_encoding(),
+            DecimalEncoding::ArenaOnly
+        );
+
+        // Inline-decimal root is written as v3 (the capability signal) and
+        // decodes back to InlineWhenFits.
+        let mut inline = minimal_root_v6();
+        inline.decimal_encoding = DecimalEncoding::InlineWhenFits;
+        let inline_bytes = inline.encode();
+        assert_eq!(inline_bytes[4], ROOT_V6_VERSION_INLINE_DECIMAL);
+        assert_eq!(
+            IndexRoot::decode(&inline_bytes).unwrap().decimal_encoding(),
+            DecimalEncoding::InlineWhenFits
+        );
+
+        // The two roots are byte-identical except for the version byte: the v3
+        // capability is purely a header signal, not a layout change.
+        assert_eq!(arena_bytes[0..4], inline_bytes[0..4]); // magic
+        assert_eq!(arena_bytes[5..], inline_bytes[5..]); // everything after version
+    }
+
+    #[test]
+    fn fir6_unknown_version_refused() {
+        let mut bytes = minimal_root_v6().encode();
+        bytes[4] = 99; // neither v2 nor v3
+        let err = IndexRoot::decode(&bytes).unwrap_err();
+        assert!(err.to_string().contains("unsupported version"));
     }
 
     #[test]

@@ -291,6 +291,10 @@ pub(crate) async fn encode_and_write_root_v6(
         prev_index: None,
         garbage: None,
         sketch_ref: inputs.sketch_ref,
+        // Sticky per root: extending an inline-decimal root keeps inlining, an
+        // arena-only root keeps the arena. Until the write path emits inline
+        // decimals, every root is arena-only.
+        decimal_encoding: fluree_db_core::DecimalEncoding::ArenaOnly,
     };
 
     // `IndexStats.size` is defined as total commit data size (bytes) for the ledger.
