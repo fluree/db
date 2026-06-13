@@ -2674,7 +2674,18 @@ fn value_to_otype_okey(
             }
             find_numbig_okey(val, store, numbig_ctx)
         }
-        FlakeValue::Decimal(_) => find_numbig_okey(val, store, numbig_ctx),
+        FlakeValue::Decimal(bd) => {
+            // Mirror the resolver exactly: under InlineWhenFits a decimal that
+            // fits is stored inline (XSD_DECIMAL_INLINE), so the constant must
+            // encode the same way to match the stored row; values that don't fit
+            // (and every decimal under ArenaOnly) live in the NumBig arena.
+            if store.decimal_encoding().inlines() {
+                if let Some(key) = ObjKey::encode_decimal(bd) {
+                    return Ok((OType::XSD_DECIMAL_INLINE, key.as_u64()));
+                }
+            }
+            find_numbig_okey(val, store, numbig_ctx)
+        }
         // Not handled: Vector (arena + HNSW identity; raw-merge is the
         // intended lane) and generic Duration (its V3 decode is a stub —
         // the raw flake preserves the value, the binary row would not).
@@ -3028,6 +3039,23 @@ pub(crate) fn value_to_otype_okey_simple(
             OType::XSD_G_MONTH_DAY,
             ObjKey::encode_g_month_day(g.month(), g.day()).as_u64(),
         )),
+        FlakeValue::Decimal(bd) => {
+            // An inline-eligible decimal under InlineWhenFits has a
+            // self-describing key, so the prefilter narrows with no arena
+            // round-trip (issue #1328). Arena decimals (too large, or any
+            // decimal under ArenaOnly) need a per-(graph, predicate) handle this
+            // helper has no context for, so leave the scan un-narrowed
+            // (Unsupported) — never NotFound, since the value may still exist.
+            if store.decimal_encoding().inlines() {
+                if let Some(key) = ObjKey::encode_decimal(bd) {
+                    return Ok((OType::XSD_DECIMAL_INLINE, key.as_u64()));
+                }
+            }
+            Err(Error::new(
+                ErrorKind::Unsupported,
+                "arena decimal not encodable without (graph, predicate) context",
+            ))
+        }
         _ => Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
             format!("unsupported FlakeValue variant for V6 fast-path: {val:?}"),

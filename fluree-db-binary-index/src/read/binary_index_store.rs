@@ -207,6 +207,9 @@ pub struct BinaryIndexStore {
     base_t: i64,
     language_tags: Vec<String>,
     lex_sorted_string_ids: bool,
+    /// Decimal-encoding policy of the loaded root. Governs how query constants
+    /// encode so they match stored rows (inline vs NumBig arena).
+    decimal_encoding: fluree_db_core::DecimalEncoding,
     /// Ledger-fixed split mode for canonical IRI encoding.
     /// Set from the snapshot's `ns_split_mode` via `set_ns_split_mode()`.
     ns_split_mode: NsSplitMode,
@@ -333,6 +336,7 @@ impl BinaryIndexStore {
             base_t: root.base_t,
             language_tags: root.language_tags.clone(),
             lex_sorted_string_ids: root.lex_sorted_string_ids,
+            decimal_encoding: root.decimal_encoding(),
             ns_split_mode: root.ns_split_mode,
             ns_split_mode_set: true,
         })
@@ -360,6 +364,13 @@ impl BinaryIndexStore {
     #[inline]
     pub fn lex_sorted_string_ids(&self) -> bool {
         self.lex_sorted_string_ids
+    }
+
+    /// The loaded root's decimal-encoding policy. Query constants must encode
+    /// under this policy so they match stored `(o_type, o_key)` rows.
+    #[inline]
+    pub fn decimal_encoding(&self) -> fluree_db_core::DecimalEncoding {
+        self.decimal_encoding
     }
 
     /// Get the branch manifest for a graph + sort order.
@@ -2813,6 +2824,7 @@ mod tests {
             base_t: 0,
             language_tags: Vec::new(),
             lex_sorted_string_ids: false,
+            decimal_encoding: fluree_db_core::DecimalEncoding::ArenaOnly,
             ns_split_mode: NsSplitMode::default(),
             ns_split_mode_set: true,
         }
