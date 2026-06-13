@@ -105,6 +105,13 @@ pub struct NumBigArena {
     dedup: HashMap<NumBigRepr, u32>,
     /// Forward: handle -> stored value.
     values: Vec<StoredBigValue>,
+    /// Extra handles per repr beyond the first (legacy pre-normalization
+    /// arenas only: the same decimal value persisted under several scales,
+    /// each with its own positional handle). Empty for arenas written after
+    /// normalization landed. Equality consumers that key on a single handle
+    /// must consult [`Self::find_bigdec_handles`] to cover every encoding of
+    /// the value.
+    dup_handles: HashMap<NumBigRepr, Vec<u32>>,
 }
 
 impl NumBigArena {
@@ -112,6 +119,7 @@ impl NumBigArena {
         Self {
             dedup: HashMap::new(),
             values: Vec::new(),
+            dup_handles: HashMap::new(),
         }
     }
 
@@ -154,12 +162,25 @@ impl NumBigArena {
 
     /// Append a stored value preserving its position (load path: entry N must
     /// receive handle N even if it duplicates an earlier entry). Each repr is
-    /// registered first-wins so lookups resolve to the earliest handle.
+    /// registered first-wins; later handles for an already-known repr are
+    /// tracked as duplicates so value lookups can report every handle.
     fn push_stored(&mut self, value: StoredBigValue, reprs: impl IntoIterator<Item = NumBigRepr>) {
         let handle = self.values.len() as u32;
         self.values.push(value);
         for repr in reprs {
-            self.dedup.entry(repr).or_insert(handle);
+            match self.dedup.entry(repr) {
+                std::collections::hash_map::Entry::Vacant(v) => {
+                    v.insert(handle);
+                }
+                std::collections::hash_map::Entry::Occupied(o) => {
+                    if *o.get() != handle {
+                        let dups = self.dup_handles.entry(o.key().clone()).or_default();
+                        if !dups.contains(&handle) {
+                            dups.push(handle);
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -182,6 +203,35 @@ impl NumBigArena {
         let unscaled = unscaled_bi.to_signed_bytes_le();
         let repr = NumBigRepr::BigDecBytes { unscaled, scale };
         self.dedup.get(&repr).copied()
+    }
+
+    /// ALL handles for a BigDecimal value, including legacy scale-variant
+    /// duplicates from pre-normalization arenas.
+    ///
+    /// Equality-by-handle consumers (e.g. bound-object prefilters that
+    /// translate a constant to `(NUM_BIG, handle)` keys) must match against
+    /// every handle returned here — matching only [`Self::find_bigdec`]'s
+    /// primary handle would miss base rows encoded under a duplicate.
+    pub fn find_bigdec_handles(&self, bd: &BigDecimal) -> Vec<u32> {
+        let normalized = bd.normalized();
+        let (unscaled_bi, scale) = normalized.as_bigint_and_exponent();
+        let unscaled = unscaled_bi.to_signed_bytes_le();
+        let repr = NumBigRepr::BigDecBytes { unscaled, scale };
+        let mut handles = Vec::new();
+        if let Some(&h) = self.dedup.get(&repr) {
+            handles.push(h);
+        }
+        if let Some(dups) = self.dup_handles.get(&repr) {
+            handles.extend_from_slice(dups);
+        }
+        handles
+    }
+
+    /// True if any value in this arena has more than one handle (legacy
+    /// pre-normalization duplicates). When false, a single-handle lookup is
+    /// complete.
+    pub fn has_duplicate_handles(&self) -> bool {
+        !self.dup_handles.is_empty()
     }
 
     /// Number of entries.
@@ -486,6 +536,32 @@ mod tests {
         assert_eq!(
             arena.find_bigdec(&"1.50".parse::<BigDecimal>().unwrap()),
             Some(0)
+        );
+
+        // Multi-handle lookup reports EVERY handle for the duplicated value —
+        // base rows may be encoded under either, so single-handle identity
+        // (e.g. prefilter keys, translated retracts) is incomplete here.
+        assert!(arena.has_duplicate_handles());
+        let mut handles = arena.find_bigdec_handles(&"1.5".parse::<BigDecimal>().unwrap());
+        handles.sort_unstable();
+        assert_eq!(handles, vec![0, 1]);
+        // Non-duplicated value still resolves to its single handle.
+        assert_eq!(
+            arena.find_bigdec_handles(&"19.99".parse::<BigDecimal>().unwrap()),
+            vec![2]
+        );
+    }
+
+    #[test]
+    fn test_normalized_arena_has_no_duplicate_handles() {
+        let mut arena = NumBigArena::new();
+        arena.get_or_insert_bigdec(&"1.50".parse::<BigDecimal>().unwrap());
+        arena.get_or_insert_bigdec(&"1.5".parse::<BigDecimal>().unwrap());
+        arena.get_or_insert_bigdec(&"19.99".parse::<BigDecimal>().unwrap());
+        assert!(!arena.has_duplicate_handles());
+        assert_eq!(
+            arena.find_bigdec_handles(&"1.500".parse::<BigDecimal>().unwrap()),
+            vec![0]
         );
     }
 
