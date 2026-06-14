@@ -145,12 +145,11 @@ fn read_query_via_update_entry_is_rejected() {
 }
 
 #[test]
-fn merge_set_delete_remove_are_deferred() {
+fn merge_and_delete_are_deferred() {
     for src in [
         "MERGE (n:Person {name: \"A\"})",
-        "MATCH (n:Person) SET n.age = 42",
         "MATCH (n:Person) DELETE n",
-        "MATCH (n:Person) REMOVE n.age",
+        "MATCH (n:Person) DETACH DELETE n",
     ] {
         let out = parse_cypher(src);
         if out.has_errors() {
@@ -170,4 +169,98 @@ fn merge_set_delete_remove_are_deferred() {
             r.ok()
         );
     }
+}
+
+#[test]
+fn match_set_property_emits_update_with_optional_old_value() {
+    let txn = lower(r#"MATCH (n:Person {name: "Alice"}) SET n.age = 42"#);
+    assert_eq!(txn.txn_type, TxnType::Update);
+    // WHERE: label triple + inline-name triple + OPTIONAL old-age.
+    assert_eq!(
+        txn.where_patterns.len(),
+        3,
+        "where: {:?}",
+        txn.where_patterns
+    );
+    // Retract old age (var object), insert new age.
+    assert_eq!(txn.delete_templates.len(), 1);
+    assert_eq!(txn.insert_templates.len(), 1);
+    assert!(matches!(
+        txn.delete_templates[0].object,
+        TemplateTerm::Var(_)
+    ));
+    assert!(matches!(
+        txn.insert_templates[0].object,
+        TemplateTerm::Value(_)
+    ));
+}
+
+#[test]
+fn match_set_label_is_additive_insert_only() {
+    let txn = lower("MATCH (n:Person) SET n:Employee");
+    assert_eq!(txn.txn_type, TxnType::Update);
+    assert_eq!(txn.delete_templates.len(), 0);
+    assert_eq!(txn.insert_templates.len(), 1);
+}
+
+#[test]
+fn match_set_map_merge_emits_per_key_replace() {
+    let txn = lower(r#"MATCH (n:Person {name: "Alice"}) SET n += {age: 42, city: "NYC"}"#);
+    // Two keys → two OPTIONAL old-value retracts + two inserts.
+    assert_eq!(txn.delete_templates.len(), 2);
+    assert_eq!(txn.insert_templates.len(), 2);
+}
+
+#[test]
+fn match_remove_property_emits_delete_only() {
+    let txn = lower(r#"MATCH (n:Person {name: "Alice"}) REMOVE n.age"#);
+    assert_eq!(txn.txn_type, TxnType::Update);
+    assert_eq!(txn.delete_templates.len(), 1);
+    assert_eq!(txn.insert_templates.len(), 0);
+    assert!(matches!(
+        txn.delete_templates[0].object,
+        TemplateTerm::Var(_)
+    ));
+}
+
+#[test]
+fn match_remove_label_deletes_rdf_type_triple() {
+    let txn = lower("MATCH (n:Person) REMOVE n:Person");
+    assert_eq!(txn.delete_templates.len(), 1);
+    assert!(matches!(
+        txn.delete_templates[0].object,
+        TemplateTerm::Sid(_)
+    ));
+}
+
+#[test]
+fn set_map_replace_is_deferred() {
+    let out = parse_cypher(r#"MATCH (n:Person {name: "A"}) SET n = {age: 1}"#);
+    assert!(!out.has_errors());
+    let ast = out.ast.unwrap();
+    let mut ns = NamespaceRegistry::new();
+    let r = lower_cypher_update(&ast, &mut ns, TxnOpts::default(), CypherLowerOpts::default());
+    assert!(r.is_err(), "SET n = {{…}} should be deferred");
+}
+
+#[test]
+fn set_on_unbound_variable_is_rejected() {
+    let out = parse_cypher("MATCH (n:Person) SET m.age = 1");
+    assert!(!out.has_errors());
+    let ast = out.ast.unwrap();
+    let mut ns = NamespaceRegistry::new();
+    let r = lower_cypher_update(&ast, &mut ns, TxnOpts::default(), CypherLowerOpts::default());
+    assert!(r.is_err(), "SET on a variable not bound by MATCH should error");
+}
+
+#[test]
+fn standalone_set_without_match_is_rejected() {
+    let out = parse_cypher("SET n.age = 1");
+    if out.has_errors() {
+        return;
+    }
+    let ast = out.ast.unwrap();
+    let mut ns = NamespaceRegistry::new();
+    let r = lower_cypher_update(&ast, &mut ns, TxnOpts::default(), CypherLowerOpts::default());
+    assert!(r.is_err(), "SET without a preceding MATCH should error");
 }

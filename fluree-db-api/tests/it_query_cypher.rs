@@ -182,6 +182,95 @@ async fn transact_cypher_create_round_trips_to_jsonld_query() {
 }
 
 #[tokio::test]
+async fn transact_cypher_set_property_replaces_old_value() {
+    // End-to-end: seed via JSON-LD, MATCH … SET via Cypher, read back.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/cypher:set-prop");
+
+    let txn = json!({
+        "@context": ctx(),
+        "@id": "ex:alice", "@type": "ex:Person", "ex:name": "Alice", "ex:age": 25,
+    });
+    let committed = fluree.insert(ledger0, &txn).await.expect("seed");
+
+    let updated = fluree
+        .transact_cypher(
+            committed.ledger,
+            r#"MATCH (n:Person {name: "Alice"}) SET n.age = 42"#,
+        )
+        .await
+        .expect("cypher set");
+
+    let db = graphdb_from_ledger(&updated.ledger);
+    // New value present.
+    let hi = fluree
+        .query_cypher(&db, "MATCH (n:Person) WHERE n.age > 40 RETURN n")
+        .await
+        .expect("query new age");
+    assert_eq!(hi.row_count(), 1, "age should now be 42");
+    // Old value gone (single-valued, not accumulated).
+    let lo = fluree
+        .query_cypher(&db, "MATCH (n:Person) WHERE n.age < 30 RETURN n")
+        .await
+        .expect("query old age");
+    assert_eq!(lo.row_count(), 0, "old age 25 should have been retracted");
+}
+
+#[tokio::test]
+async fn transact_cypher_set_label_adds_type() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/cypher:set-label");
+
+    let txn = json!({
+        "@context": ctx(),
+        "@id": "ex:alice", "@type": "ex:Person", "ex:name": "Alice",
+    });
+    let committed = fluree.insert(ledger0, &txn).await.expect("seed");
+
+    let updated = fluree
+        .transact_cypher(
+            committed.ledger,
+            r#"MATCH (n:Person {name: "Alice"}) SET n:Employee"#,
+        )
+        .await
+        .expect("cypher set label");
+
+    let db = graphdb_from_ledger(&updated.ledger);
+    let rows = fluree
+        .query_cypher(&db, "MATCH (n:Employee) RETURN n")
+        .await
+        .expect("query new label");
+    assert_eq!(rows.row_count(), 1, "node should now carry the Employee label");
+}
+
+#[tokio::test]
+async fn transact_cypher_remove_property_retracts_value() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/cypher:remove-prop");
+
+    let txn = json!({
+        "@context": ctx(),
+        "@id": "ex:alice", "@type": "ex:Person", "ex:name": "Alice", "ex:age": 25,
+    });
+    let committed = fluree.insert(ledger0, &txn).await.expect("seed");
+
+    let updated = fluree
+        .transact_cypher(
+            committed.ledger,
+            r#"MATCH (n:Person {name: "Alice"}) REMOVE n.age"#,
+        )
+        .await
+        .expect("cypher remove");
+
+    let db = graphdb_from_ledger(&updated.ledger);
+    let nulls = fluree
+        .query_cypher(&db, "MATCH (n:Person) WHERE n.age IS NULL RETURN n")
+        .await
+        .expect("query removed prop");
+    assert_eq!(nulls.row_count(), 1, "age should have been removed");
+}
+
+#[tokio::test]
 async fn transact_cypher_merge_returns_specific_deferred_error() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger0 = genesis_ledger(&fluree, "it/cypher:merge-deferred");
