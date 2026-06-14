@@ -65,6 +65,35 @@ async fn query_entity(
         .expect("to_jsonld_async")
 }
 
+/// Helper: run a raw SPARQL UPDATE string through the parse → lower → stage
+/// pipeline (the same path the server's update endpoint uses).
+async fn run_sparql_update(
+    fluree: &fluree_db_api::Fluree,
+    ledger: LedgerState,
+    sparql: &str,
+) -> fluree_db_api::TransactResult {
+    let parsed = fluree_db_sparql::parse_sparql(sparql);
+    assert!(
+        !parsed.has_errors(),
+        "SPARQL parse errors: {:?}",
+        parsed.diagnostics
+    );
+    let ast = parsed.ast.expect("SPARQL AST");
+    let mut ns = fluree_db_transact::NamespaceRegistry::from_db(&ledger.snapshot);
+    let txn = fluree_db_transact::lower_sparql_update_ast(
+        &ast,
+        &mut ns,
+        fluree_db_transact::TxnOpts::default(),
+    )
+    .expect("lower SPARQL UPDATE to Txn IR");
+    fluree
+        .stage_owned(ledger)
+        .txn(txn)
+        .execute()
+        .await
+        .expect("stage SPARQL UPDATE")
+}
+
 // ============================================================================
 // 1. Atomic Increment / Decrement
 // ============================================================================
@@ -236,10 +265,10 @@ async fn compare_and_swap_stale_version_is_noop() {
 
     // Client has stale version=1, but current is 3. WHERE won't match → no-op.
     //
-    // Pattern: use a WHERE variable in the INSERT subject so that when WHERE
-    // returns 0 rows, the variable is unbound and the INSERT produces 0 flakes.
-    // All-literal INSERTs fire unconditionally (the "delete-if-exists, always
-    // insert" pattern), so CAS must use a variable to be conditional.
+    // INSERT templates fire once per WHERE solution; zero solutions = no-op
+    // (SPARQL 1.1 Update §3.1.3), so this is a no-op regardless of whether the
+    // INSERT uses variables. A WHERE variable in the subject is still good
+    // practice here so the asserted subject is the matched one.
     let result = fluree
         .update(
             ledger,
@@ -592,9 +621,9 @@ async fn insert_if_not_exists_noop_when_exists() {
     let t_before = ledger.t();
 
     // Try to insert ex:alice again — should be a no-op because she exists.
-    // Use BIND to create variables for the insert values so the INSERT is
-    // conditional on WHERE (FILTER) passing. All-literal INSERTs fire
-    // unconditionally, so conditional creates must use WHERE variables.
+    // OPTIONAL + FILTER yields one row when alice is absent (probe unbound) and
+    // zero rows when she exists; INSERT fires once per WHERE solution, so the
+    // existing-alice case produces zero solutions and inserts nothing.
     let result = fluree
         .update(
             ledger,
@@ -617,6 +646,136 @@ async fn insert_if_not_exists_noop_when_exists() {
         alice.get("schema:name"),
         Some(&json!("Alice")),
         "name unchanged"
+    );
+}
+
+/// Regression: an all-literal INSERT guarded by a *required* WHERE pattern that
+/// matches nothing must NOT fire. Per SPARQL 1.1 Update §3.1.3, zero WHERE
+/// solutions means zero template instantiations — there is no fallback that
+/// fires constant templates against a synthetic empty solution.
+#[tokio::test]
+async fn all_literal_insert_noop_when_required_where_matches_nothing() {
+    let (fluree, ledger) = seed(
+        "it/conditional:literal-required-where-empty",
+        json!([{ "id": "ex:alice", "schema:name": "Alice" }]),
+    )
+    .await;
+    let t_before = ledger.t();
+
+    // ex:alice has no schema:status, so the required pattern matches nothing.
+    // The INSERT is all-literal — it must still be skipped (zero solutions).
+    let result = fluree
+        .update(
+            ledger,
+            &json!({
+                "@context": ctx(),
+                "where": { "id": "ex:alice", "schema:status": "?status" },
+                "insert": { "id": "ex:config", "ex:lastChecked": "2026-06-14" }
+            }),
+        )
+        .await
+        .expect("update");
+
+    assert_eq!(result.ledger.t(), t_before, "t should not bump on no-op");
+    let config = query_entity(&fluree, &result.ledger, "ex:config").await;
+    assert!(
+        config.get("ex:lastChecked").is_none(),
+        "all-literal insert must not fire when the required WHERE matched nothing"
+    );
+}
+
+/// Regression: an all-literal INSERT guarded by a FILTER that eliminates every
+/// row must NOT fire — the FILTER collapses WHERE to zero solutions.
+#[tokio::test]
+async fn all_literal_insert_noop_when_filter_excludes_all() {
+    let (fluree, ledger) = seed(
+        "it/conditional:literal-filter-false",
+        json!([{ "id": "ex:alice", "schema:age": 30 }]),
+    )
+    .await;
+    let t_before = ledger.t();
+
+    let result = fluree
+        .update(
+            ledger,
+            &json!({
+                "@context": ctx(),
+                "where": [
+                    { "id": "ex:alice", "schema:age": "?age" },
+                    ["filter", "(> ?age 100)"]
+                ],
+                "insert": { "id": "ex:config", "ex:flag": true }
+            }),
+        )
+        .await
+        .expect("update");
+
+    assert_eq!(result.ledger.t(), t_before, "t should not bump on no-op");
+    let config = query_entity(&fluree, &result.ledger, "ex:config").await;
+    assert!(
+        config.get("ex:flag").is_none(),
+        "all-literal insert must not fire when FILTER eliminated every WHERE row"
+    );
+}
+
+/// Contrast: with NO WHERE clause at all, an all-literal INSERT still fires once
+/// (the plain insert path — the single implicit empty solution). This guards
+/// against over-broadening the §3.1.3 no-op into the no-WHERE case.
+#[tokio::test]
+async fn all_literal_insert_fires_when_no_where_clause() {
+    let (fluree, ledger) = seed(
+        "it/conditional:literal-no-where",
+        json!([{ "id": "ex:alice", "schema:name": "Alice" }]),
+    )
+    .await;
+
+    let result = fluree
+        .update(
+            ledger,
+            &json!({
+                "@context": ctx(),
+                "insert": { "id": "ex:config", "ex:flag": true }
+            }),
+        )
+        .await
+        .expect("update");
+
+    let config = query_entity(&fluree, &result.ledger, "ex:config").await;
+    assert_eq!(
+        config.get("ex:flag"),
+        Some(&json!(true)),
+        "all-literal insert with no WHERE must fire once"
+    );
+}
+
+/// Regression (SPARQL parity): `INSERT { <s> <p> <o> } WHERE { FILTER(false) }`
+/// must insert nothing. The fix lives in the shared staging layer, so SPARQL
+/// UPDATE and JSON-LD update behave identically (W3C SPARQL 1.1 Update §3.1.3).
+#[tokio::test]
+async fn sparql_all_literal_insert_noop_when_filter_false() {
+    let (fluree, ledger) = seed(
+        "it/conditional:sparql-filter-false",
+        json!([{ "id": "ex:alice", "schema:name": "Alice" }]),
+    )
+    .await;
+    let t_before = ledger.t();
+
+    let sparql = r#"
+        PREFIX ex: <http://example.org/ns/>
+        INSERT { ex:config ex:flag true }
+        WHERE { FILTER(false) }
+    "#;
+    let result = run_sparql_update(&fluree, ledger, sparql).await;
+
+    assert_eq!(
+        result.ledger.t(),
+        t_before,
+        "FILTER(false) yields zero solutions → no insert → t must not bump"
+    );
+    let config = query_entity(&fluree, &result.ledger, "ex:config").await;
+    assert!(
+        config.get("ex:flag").is_none(),
+        "SPARQL all-literal insert must not fire under FILTER(false)"
     );
 }
 
