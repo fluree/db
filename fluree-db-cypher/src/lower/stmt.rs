@@ -311,6 +311,7 @@ fn lower_return<E: IriEncoder>(
     let limit = const_usize(&r.limit)?;
     let offset = const_usize(&r.skip)?;
 
+    reject_order_by_on_list(ctx, &r.order_by, &projection.list_outputs)?;
     let ordering = lower_order_by(ctx, &r.order_by, patterns)?;
 
     // GROUP BY keys are only meaningful when aggregates exist; if not,
@@ -351,6 +352,11 @@ struct ProjectionState {
     aggregates: Vec<AggregateSpec>,
     saw_star: bool,
     alias_counter: u32,
+    /// Output vars bound to `collect()` — list-valued. The list carrier
+    /// (`Binding::Grouped`) is an internal value the sort/join/group key paths
+    /// don't handle, so these vars must not reach ORDER BY (or flow out of a
+    /// WITH into a downstream join/sort/group). Tracked here to reject those.
+    list_outputs: std::collections::HashSet<VarId>,
 }
 
 impl ProjectionState {
@@ -361,6 +367,7 @@ impl ProjectionState {
             aggregates: Vec::new(),
             saw_star: false,
             alias_counter: 0,
+            list_outputs: std::collections::HashSet::new(),
         }
     }
 
@@ -387,6 +394,9 @@ impl ProjectionState {
                 let output_var = aggregate_output_var(ctx, &item.alias, &mut self.alias_counter);
                 let input_var = aggregate_input_var(ctx, call, patterns)?;
                 let function = build_aggregate_fn(&call.name, call.distinct, input_var)?;
+                if call.name.eq_ignore_ascii_case("collect") {
+                    self.list_outputs.insert(output_var);
+                }
                 self.aggregates.push(AggregateSpec {
                     function,
                     output_var,
@@ -426,6 +436,56 @@ fn expression_references_any(
         Expression::Const(_) => false,
         Expression::Call { args, .. } => args.iter().any(|a| expression_references_any(a, vars)),
         Expression::Exists { .. } => false,
+    }
+}
+
+/// Reject ORDER BY keys that reference a `collect()` list. The list carrier
+/// (`Binding::Grouped`) is treated as an internal value by the sort comparator
+/// (and the join/group key paths), so ordering by it is unsound until real
+/// list semantics land. ORDER BY on *other* keys while a list is merely
+/// projected is fine — the sort never inspects the list column.
+fn reject_order_by_on_list<E: IriEncoder>(
+    ctx: &mut LoweringContext<'_, E>,
+    order_by: &[crate::ast::OrderItem],
+    list_outputs: &std::collections::HashSet<VarId>,
+) -> Result<()> {
+    for item in order_by {
+        if expr_touches_list(ctx, &item.expr, list_outputs) {
+            return Err(LowerError::unsupported(
+                "ORDER BY on a collect() list is not supported in v1 (list ordering is deferred)",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// True if `e` references a `collect()` list output (directly as a `collect()`
+/// call, or via a variable bound to one).
+fn expr_touches_list<E: IriEncoder>(
+    ctx: &mut LoweringContext<'_, E>,
+    e: &Expr,
+    list_outputs: &std::collections::HashSet<VarId>,
+) -> bool {
+    match e {
+        Expr::Var(v) => list_outputs.contains(&ctx.intern_var(&v.name)),
+        Expr::Call(c) => {
+            c.name.eq_ignore_ascii_case("collect")
+                || c.args
+                    .iter()
+                    .any(|a| expr_touches_list(ctx, a, list_outputs))
+        }
+        Expr::BinOp(_, a, b, _)
+        | Expr::In(a, b, _)
+        | Expr::StartsWith(a, b, _)
+        | Expr::EndsWith(a, b, _)
+        | Expr::Contains(a, b, _) => {
+            expr_touches_list(ctx, a, list_outputs) || expr_touches_list(ctx, b, list_outputs)
+        }
+        Expr::UnaryOp(_, a, _)
+        | Expr::IsNull(a, _)
+        | Expr::IsNotNull(a, _)
+        | Expr::Prop(a, _, _) => expr_touches_list(ctx, a, list_outputs),
+        _ => false,
     }
 }
 
@@ -584,6 +644,15 @@ fn lower_with<E: IriEncoder>(
     if projection.saw_star {
         return Err(LowerError::unsupported(
             "WITH * is deferred in v1 — list the variables explicitly",
+        ));
+    }
+    if !projection.list_outputs.is_empty() {
+        // A `collect()` result projected by WITH becomes a variable that flows
+        // out of this subquery into the outer query, where it may be joined,
+        // sorted, or grouped — none of which handle the list carrier. Allow
+        // collect() only in the final RETURN until list semantics land.
+        return Err(LowerError::unsupported(
+            "collect() in WITH is deferred in v1 — use it only in the final RETURN",
         ));
     }
 

@@ -1062,6 +1062,67 @@ async fn cypher_collect_gathers_values_into_list() {
 }
 
 #[tokio::test]
+async fn cypher_collect_empty_input_returns_empty_list() {
+    // Cypher: an implicit aggregation over zero matched rows still yields one
+    // row; collect() of nothing is the empty list `[]`.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = seed_knows_chain(&fluree, "it/cypher:collect-empty").await;
+    let db = graphdb_from_ledger(&l);
+
+    for q in [
+        r#"MATCH (n:Nonexistent) RETURN collect(n) AS xs"#,
+        r#"MATCH (n:Nonexistent) RETURN collect(DISTINCT n) AS xs"#,
+    ] {
+        let jsonld = fluree
+            .query_cypher(&db, q)
+            .await
+            .expect("collect empty")
+            .to_jsonld_async(db.as_graph_db_ref())
+            .await
+            .expect("jsonld");
+        assert_eq!(
+            jsonld[0][0].as_array().map(Vec::len),
+            Some(0),
+            "empty collect is one row with []: {jsonld} ({q})"
+        );
+    }
+}
+
+#[tokio::test]
+async fn cypher_order_by_collect_rejected() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = seed_knows_chain(&fluree, "it/cypher:order-collect").await;
+    let db = graphdb_from_ledger(&l);
+
+    for q in [
+        r#"MATCH (a:Person)-[:KNOWS]->(b) RETURN a, collect(b) AS bs ORDER BY bs"#,
+        r#"MATCH (a:Person)-[:KNOWS]->(b) RETURN a, collect(b) ORDER BY collect(b)"#,
+    ] {
+        let err = fluree
+            .query_cypher(&db, q)
+            .await
+            .expect_err("ORDER BY on a collect list must be rejected");
+        assert!(format!("{err}").contains("ORDER BY"), "{err}");
+    }
+}
+
+#[tokio::test]
+async fn cypher_with_collect_rejected() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = seed_knows_chain(&fluree, "it/cypher:with-collect").await;
+    let db = graphdb_from_ledger(&l);
+
+    let err = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (a:Person)-[:KNOWS]->(b) WITH a, collect(b) AS bs RETURN a, bs"#,
+        )
+        .await
+        .expect_err("collect() in WITH must be rejected");
+    assert!(format!("{err}").contains("collect() in WITH"), "{err}");
+}
+
+#[tokio::test]
 async fn cypher_collect_distinct_dedupes() {
     // Two friends share the name "Bob"; collect(DISTINCT) keeps one.
     let fluree = FlureeBuilder::memory().build_memory();
