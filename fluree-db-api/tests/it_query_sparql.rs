@@ -840,6 +840,41 @@ async fn sparql_subquery_expression_order_by_with_limit() {
     assert_eq!(normalize_rows(&jsonld), normalize_rows(&json!([[99]])));
 }
 
+/// Regression: a variable-free subquery (`{ SELECT * WHERE { <ground> } }`)
+/// produces an empty schema. When the ground pattern matches it is one
+/// empty-binding solution and must NOT collapse to zero rows — otherwise it
+/// would wrongly wipe out the joined outer pattern. Guards
+/// `SubqueryOperator::drain_buffer`'s empty-schema handling.
+#[tokio::test]
+async fn sparql_ground_subquery_does_not_wipe_outer_pattern() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_people(&fluree, "people:main").await;
+
+    // Outer pattern matches exactly one row (jdoe's full name). The inner
+    // subquery is fully ground (jdoe's handle is "jdoe"), projects no variables,
+    // and exists — so the join must preserve the single outer row.
+    let query = r#"
+        PREFIX ex: <http://example.org/ns/>
+        PREFIX person: <http://example.org/Person#>
+        SELECT ?fullName
+        WHERE {
+          ex:jdoe person:fullName ?fullName .
+          { SELECT * WHERE { ex:jdoe person:handle "jdoe" } }
+        }
+    "#;
+
+    let result = support::query_sparql(&fluree, &ledger, query)
+        .await
+        .unwrap();
+    let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    assert_eq!(
+        normalize_rows(&jsonld),
+        normalize_rows(&json!([["Jane Doe"]])),
+        "ground matching subquery must yield one empty solution, not zero"
+    );
+}
+
 #[tokio::test]
 async fn sparql_subquery_aggregate_order_by_with_limit() {
     // Pattern 2: aggregate ORDER BY `DESC(COUNT(?favNum))` inside a subquery.

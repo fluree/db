@@ -352,6 +352,10 @@ impl ServiceOperator {
             return Ok(None);
         }
 
+        // Number of rows about to be drained — needed to size an empty-schema
+        // batch, where there are no columns to infer the row count from.
+        let drained = self.result_buffer.len() - self.buffer_pos;
+
         let num_cols = self.schema.len();
         let mut columns: Vec<Vec<Binding>> = (0..num_cols).map(|_| Vec::new()).collect();
 
@@ -365,7 +369,14 @@ impl ServiceOperator {
 
         self.buffer_pos = self.result_buffer.len();
 
-        if columns.is_empty() || columns[0].is_empty() {
+        // A variable-free SERVICE body produces an empty schema; a match is
+        // still one empty-binding solution per row. Emit an empty-schema batch
+        // with the row count rather than collapsing to zero rows.
+        if num_cols == 0 {
+            return Ok(Some(Batch::empty_schema_with_len(drained)));
+        }
+
+        if columns[0].is_empty() {
             Ok(None)
         } else {
             Ok(Some(Batch::new(self.schema.clone(), columns)?))
