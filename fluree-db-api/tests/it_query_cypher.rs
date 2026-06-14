@@ -420,6 +420,138 @@ async fn transact_cypher_with_parameters_creates_node() {
 }
 
 #[tokio::test]
+async fn transact_cypher_detach_delete_removes_node_and_both_directions() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let mut l = genesis_ledger(&fluree, "it/cypher:detach-delete");
+
+    for stmt in [
+        r#"CREATE (a:Person {name: "Alice"})"#,
+        r#"CREATE (b:Person {name: "Bob"})"#,
+        r#"CREATE (c:Person {name: "Carol"})"#,
+        r#"MATCH (a:Person {name: "Alice"}), (b:Person {name: "Bob"}) CREATE (a)-[:KNOWS]->(b)"#,
+        r#"MATCH (c:Person {name: "Carol"}), (a:Person {name: "Alice"}) CREATE (c)-[:KNOWS]->(a)"#,
+    ] {
+        l = fluree.transact_cypher(l, stmt).await.expect(stmt).ledger;
+    }
+
+    // Sanity: two KNOWS edges (Alice→Bob outbound, Carol→Alice inbound).
+    let db = graphdb_from_ledger(&l);
+    let edges = fluree
+        .query_cypher(&db, "MATCH (a:Person)-[:KNOWS]->(b:Person) RETURN a, b")
+        .await
+        .expect("edges");
+    assert_eq!(edges.row_count(), 2, "two KNOWS edges before delete");
+
+    // DETACH DELETE Alice — removes her node plus both directions.
+    let l = fluree
+        .transact_cypher(l, r#"MATCH (n:Person {name: "Alice"}) DETACH DELETE n"#)
+        .await
+        .expect("detach delete")
+        .ledger;
+    let db = graphdb_from_ledger(&l);
+
+    assert_eq!(
+        fluree
+            .query_cypher(&db, r#"MATCH (n:Person {name: "Alice"}) RETURN n"#)
+            .await
+            .expect("alice gone")
+            .row_count(),
+        0,
+        "Alice's node should be gone"
+    );
+    assert_eq!(
+        fluree
+            .query_cypher(&db, "MATCH (a:Person)-[:KNOWS]->(b:Person) RETURN a, b")
+            .await
+            .expect("edges gone")
+            .row_count(),
+        0,
+        "both inbound and outbound KNOWS edges should be gone"
+    );
+    assert_eq!(
+        fluree
+            .query_cypher(&db, "MATCH (n:Person) RETURN n")
+            .await
+            .expect("survivors")
+            .row_count(),
+        2,
+        "Bob and Carol should remain"
+    );
+}
+
+#[tokio::test]
+async fn transact_cypher_detach_delete_works_on_indexed_data() {
+    // Same as above but the data is drained into the base index before the
+    // delete, so the var-predicate scans and the reifier cascade run against
+    // indexed flakes (not novelty/overlay).
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/cypher:detach-delete-indexed";
+    let (local, handle) = support::start_background_indexer_local(
+        fluree.backend().clone(),
+        std::sync::Arc::new(fluree.nameservice_mode().clone()),
+        fluree_db_indexer::IndexerConfig::small(),
+    );
+
+    local
+        .run_until(async move {
+            let mut l = genesis_ledger(&fluree, ledger_id);
+            let mut last_t = 0;
+            for stmt in [
+                r#"CREATE (a:Person {name: "Alice"})"#,
+                r#"CREATE (b:Person {name: "Bob"})"#,
+                r#"MATCH (a:Person {name: "Alice"}), (b:Person {name: "Bob"}) CREATE (a)-[:KNOWS]->(b)"#,
+            ] {
+                let r = fluree.transact_cypher(l, stmt).await.expect(stmt);
+                last_t = r.receipt.t;
+                l = r.ledger;
+            }
+
+            // Drain novelty into the base index, then reload the indexed head.
+            support::trigger_index_and_wait(&handle, ledger_id, last_t).await;
+            let reloaded = fluree.ledger(ledger_id).await.expect("reload indexed");
+
+            let after = fluree
+                .transact_cypher(
+                    reloaded,
+                    r#"MATCH (n:Person {name: "Alice"}) DETACH DELETE n"#,
+                )
+                .await
+                .expect("detach delete indexed")
+                .ledger;
+            let db = graphdb_from_ledger(&after);
+
+            assert_eq!(
+                fluree
+                    .query_cypher(&db, r#"MATCH (n:Person {name: "Alice"}) RETURN n"#)
+                    .await
+                    .unwrap()
+                    .row_count(),
+                0,
+                "Alice gone (indexed base)"
+            );
+            assert_eq!(
+                fluree
+                    .query_cypher(&db, "MATCH (a:Person)-[:KNOWS]->(b:Person) RETURN a, b")
+                    .await
+                    .unwrap()
+                    .row_count(),
+                0,
+                "KNOWS edge gone (indexed base)"
+            );
+            assert_eq!(
+                fluree
+                    .query_cypher(&db, "MATCH (n:Person) RETURN n")
+                    .await
+                    .unwrap()
+                    .row_count(),
+                1,
+                "Bob remains"
+            );
+        })
+        .await;
+}
+
+#[tokio::test]
 async fn transact_cypher_merge_returns_specific_deferred_error() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger0 = genesis_ledger(&fluree, "it/cypher:merge-deferred");

@@ -29,6 +29,7 @@ commit path as SPARQL UPDATE so the in-memory cache stays current.
 | Write — `MATCH … SET` | `SET n.prop = lit`, `SET n += {…}`, `SET n:Label` | `TxnType::Update`; property forms use an OPTIONAL old-value WHERE binding so the prior value is retracted and the new one asserted (single-valued replace; absent property skips the delete). Labels are additive. |
 | Write — `MATCH … REMOVE` | `REMOVE n.prop`, `REMOVE n:Label` | `TxnType::Update`. |
 | Write — `MATCH … CREATE` | Template-driven writes: CREATE nodes bound by MATCH reference the matched node; unbound vars mint new nodes per solution | `TxnType::Update`. |
+| Write — `DETACH DELETE n` | Retracts every triple touching `n` in both directions (outbound + inbound var-predicate OPTIONAL scans → delete templates); the `f:reifies*` cascade auto-removes reifier bundles | Pure lowering, no probe. Var-predicate scans run with `include_system_facts = false` (write-WHERE default) so the inbound scan never touches reserved predicates. Sets `lpg_edge_lifecycle = true` so relationship body metadata is cascaded too. Tested on memory/overlay **and** indexed paths. |
 | Parameters (`$param`) | Scalar and flat-list (`UNWIND $ids`) parameters, on read and write, across API / CLI / HTTP | AST pre-substitution (`fluree_db_cypher::substitute_params`) replaces `$name` with the supplied value before lowering. Supplied as a JSON map; over HTTP/CLI via the `{"cypher": "...", "params": {...}}` envelope (raw Cypher still works). Missing param → clear error. Map/object params and nested collections rejected. |
 
 The MATCH→WHERE foundation lowers leading `MATCH`/`OPTIONAL MATCH`
@@ -41,7 +42,8 @@ DELETE/INSERT templates sharing variable ids via the shared
 
 | Feature | Why deferred |
 |---|---|
-| `DELETE` / `DETACH DELETE` | Cascade needs snapshot **index probes at lowering time** (find a node's inbound + outbound ref-typed relationships and their reifier bundles) — the pure WHERE/template model can't express the inbound scan. Likely lands partly at the API layer. |
+| Bare `DELETE n` (non-detach) | Cypher requires it to **error** when `n` still has relationships, which needs a snapshot probe (no `Txn` can conditionally error). Deferred to an API-level guard slice. `DETACH DELETE n` is implemented (see Done). |
+| `DELETE r` (relationship variable) | Needs write-MATCH relationship-variable binding (`EdgeAnnotation` in the write WHERE), plus a parallel-edge guard — retracting `(s,p,o)` removes **all** occurrences, so it's only faithful when the matched edge has a single annotation SID. |
 | `MERGE` (single-node) | Find-or-create needs a search-first phase the `TxnType` variants don't model (Insert is unconditional; Upsert is delete-then-insert; Update skips unbound vars). Will be layered at the API level: snapshot-query the identifying pattern, then conditionally stage CREATE-shape flakes / `ON MATCH SET`. |
 | `SET n = {…}` (bounded replace) | Needs a predicate-**variable** scan with a literal-object + non-`rdf:type` + non-`f:*` filter to bound the retract scope safely. Deferred to land with the DELETE slice (same predicate-var machinery). `SET n += {…}` covers the common per-key case. |
 | `WHERE` filter expressions in a **write** MATCH | Requires lowering Cypher `Expr` → `UnresolvedExpression`. Inline property filters (`(n:Label {key: val})`) cover find-by-key today; explicit `WHERE n.x > 1 SET …` is the follow-up. |

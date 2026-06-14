@@ -39,9 +39,9 @@ use fluree_vocab::{rdf, reifies_iris};
 use thiserror::Error;
 
 use fluree_db_cypher::ast::{
-    CreateClause, CypherAst, Direction, Expr, Label, Literal, MapLit, MatchClause, NodePattern,
-    Pattern, PatternPart, ReadClause, RelPattern, RemoveClause, RemoveItem, SetClause, SetItem,
-    Statement, Update, Variable, WriteClause,
+    CreateClause, CypherAst, DeleteClause, Direction, Expr, Label, Literal, MapLit, MatchClause,
+    NodePattern, Pattern, PatternPart, ReadClause, RelPattern, RemoveClause, RemoveItem, SetClause,
+    SetItem, Statement, Update, Variable, WriteClause,
 };
 
 use crate::ir::{TemplateTerm, TripleTemplate, Txn, TxnOpts, TxnType};
@@ -209,10 +209,9 @@ impl<'a> CypherLowering<'a> {
                     self.require_match(has_match, "REMOVE")?;
                     self.lower_remove(r)?;
                 }
-                WriteClause::Delete(_) => {
-                    return Err(LowerCypherError::unsupported(
-                        "DELETE / DETACH DELETE is deferred — cascade lowering lands in the next write slice",
-                    ));
+                WriteClause::Delete(d) => {
+                    self.require_match(has_match, "DELETE")?;
+                    self.lower_delete(d)?;
                 }
                 WriteClause::Merge(_) => {
                     return Err(LowerCypherError::unsupported(
@@ -506,6 +505,90 @@ impl<'a> CypherLowering<'a> {
             }
         }
         Ok(())
+    }
+
+    // ---- DELETE / DETACH DELETE -----------------------------------------
+
+    fn lower_delete(&mut self, d: &DeleteClause) -> Result<(), LowerCypherError> {
+        // Cypher relationship deletes operate on annotation identity, which
+        // requires LPG-lifecycle cleanup so a base-edge retract also clears
+        // the annotation body metadata (not just the `f:reifies*` bundle).
+        self.opts.lpg_edge_lifecycle = Some(true);
+
+        for target in &d.targets {
+            self.require_bound(target)?;
+            if d.detach {
+                self.lower_detach_delete(&target.name);
+            } else {
+                // Cypher requires bare `DELETE n` to fail when `n` still has
+                // relationships. That guard needs a snapshot probe (no Txn can
+                // conditionally error), so it is deferred to an API-level slice.
+                return Err(LowerCypherError::unsupported(
+                    "bare DELETE n is deferred — it must error when the node still has \
+                     relationships, which needs a snapshot probe. Use DETACH DELETE n to \
+                     remove a node together with its relationships.",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// `DETACH DELETE n`: retract every triple touching `n` in both
+    /// directions. The reifier-bundle cascade fires automatically as the base
+    /// edges are retracted; the var-predicate scans exclude `f:reifies*`
+    /// (write-WHERE runs with `include_system_facts = false`), so the inbound
+    /// scan never tries to delete a reserved predicate directly.
+    fn lower_detach_delete(&mut self, target: &str) {
+        let n_unres = self.unresolved_named_var(target);
+        let n_term = self.var_term(target);
+
+        // Outbound: OPTIONAL { ?n ?p ?o } → delete (?n, ?p, ?o).
+        let (p_unres, p_term) = self.fresh_scan_var();
+        let (o_unres, o_term) = self.fresh_scan_var();
+        self.where_patterns
+            .push(UnresolvedPattern::Optional(vec![UnresolvedPattern::Triple(
+                UnresolvedTriplePattern {
+                    s: n_unres.clone(),
+                    p: p_unres,
+                    o: o_unres,
+                    dtc: None,
+                },
+            )]));
+        self.delete_templates
+            .push(TripleTemplate::new(n_term.clone(), p_term, o_term));
+
+        // Inbound: OPTIONAL { ?s ?p2 ?n } → delete (?s, ?p2, ?n).
+        let (s_unres, s_term) = self.fresh_scan_var();
+        let (p2_unres, p2_term) = self.fresh_scan_var();
+        self.where_patterns
+            .push(UnresolvedPattern::Optional(vec![UnresolvedPattern::Triple(
+                UnresolvedTriplePattern {
+                    s: s_unres,
+                    p: p2_unres,
+                    o: n_unres,
+                    dtc: None,
+                },
+            )]));
+        self.delete_templates
+            .push(TripleTemplate::new(s_term, p2_term, n_term));
+    }
+
+    /// A WHERE-side `UnresolvedTerm::Var` for a named Cypher variable, keyed
+    /// the same way the templates intern it.
+    fn unresolved_named_var(&self, name: &str) -> UnresolvedTerm {
+        UnresolvedTerm::Var(Arc::from(var_name(name).as_str()))
+    }
+
+    /// Mint a fresh synthetic scan variable, returning the matching WHERE-side
+    /// and template-side terms (same interned id).
+    fn fresh_scan_var(&mut self) -> (UnresolvedTerm, TemplateTerm) {
+        let name = format!("?#__cy_scan_{}", self.synth_counter);
+        self.synth_counter += 1;
+        let vid = self.vars.get_or_insert(&name);
+        (
+            UnresolvedTerm::Var(Arc::from(name.as_str())),
+            TemplateTerm::Var(vid),
+        )
     }
 
     /// Emit `OPTIONAL { ?target <pred> ?old }` plus a delete template for

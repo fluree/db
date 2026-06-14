@@ -145,11 +145,28 @@ fn read_query_via_update_entry_is_rejected() {
 }
 
 #[test]
-fn merge_and_delete_are_deferred() {
+fn detach_delete_emits_inbound_and_outbound_scans() {
+    let txn = lower("MATCH (n:Person {name: \"Alice\"}) DETACH DELETE n");
+    assert_eq!(txn.txn_type, TxnType::Update);
+    // WHERE: label + inline-name filter + OPTIONAL outbound + OPTIONAL inbound.
+    assert_eq!(
+        txn.where_patterns.len(),
+        4,
+        "where: {:?}",
+        txn.where_patterns
+    );
+    // Delete both directions: (n ?p ?o) and (?s ?p2 n).
+    assert_eq!(txn.delete_templates.len(), 2);
+    assert_eq!(txn.insert_templates.len(), 0);
+    // LPG lifecycle is enabled so relationship body metadata is cascaded.
+    assert_eq!(txn.opts.lpg_edge_lifecycle, Some(true));
+}
+
+#[test]
+fn merge_and_bare_delete_are_deferred() {
     for src in [
         "MERGE (n:Person {name: \"A\"})",
         "MATCH (n:Person) DELETE n",
-        "MATCH (n:Person) DETACH DELETE n",
     ] {
         let out = parse_cypher(src);
         if out.has_errors() {
