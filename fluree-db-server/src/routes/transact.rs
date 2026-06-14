@@ -1755,8 +1755,10 @@ async fn execute_cypher_transact(
     let cached_state = handle.snapshot().await;
 
     // Most writes lower to a single Txn; conditional writes (e.g. MERGE … ON
-    // MATCH SET) probe the cached writer view first, then resolve to a Txn.
-    // Either way the Txn commits through the same cached-handle path below.
+    // MATCH SET) carry a resolver that probes the writer state. The plan is
+    // staged through the cached-handle builder below, which resolves a
+    // conditional plan under the write lock so the branch-choosing probe and
+    // the staged branch are atomic.
     let plan = state
         .fluree
         .cypher_write_plan(&cypher, params.as_ref(), ledger_id, &cached_state.snapshot)
@@ -1765,20 +1767,6 @@ async fn execute_cypher_transact(
             set_span_error_code(span, "error:InvalidTransaction");
             ServerError::Api(e)
         })?;
-    let txn = match plan {
-        fluree_db_api::cypher_write::WritePlan::Single(txn) => *txn,
-        fluree_db_api::cypher_write::WritePlan::Conditional(cw) => {
-            let probe = fluree_db_api::GraphDb::from_ledger_view(&cached_state, ledger_id);
-            state
-                .fluree
-                .resolve_conditional_cypher(&cw, probe, ledger_id, &cached_state.snapshot)
-                .await
-                .map_err(|e| {
-                    set_span_error_code(span, "error:InvalidTransaction");
-                    ServerError::Api(e)
-                })?
-        }
-    };
 
     // Build a PolicyContext when any policy input is present, so writes are
     // filtered the same way SPARQL UPDATE / JSON-LD writes are.
@@ -1811,7 +1799,11 @@ async fn execute_cypher_transact(
         commit_opts = commit_opts.with_raw_txn_spawned(content_store, raw_txn);
     }
 
-    let mut builder = state.fluree.stage(&handle).txn(txn).commit_opts(commit_opts);
+    let mut builder = state
+        .fluree
+        .stage(&handle)
+        .cypher_write_plan(plan, ledger_id.to_string())
+        .commit_opts(commit_opts);
     if let Some(config) = &state.index_config {
         builder = builder.index_config(config.clone());
     }

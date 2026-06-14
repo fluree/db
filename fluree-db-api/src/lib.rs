@@ -3383,7 +3383,7 @@ impl Fluree {
             .map_err(|e| ApiError::cypher(e.to_string(), Vec::new()))?;
 
         if let Some(cw) = crate::cypher_write::detect_conditional(&ast) {
-            return Ok(crate::cypher_write::WritePlan::Conditional(cw));
+            return Ok(crate::cypher_write::WritePlan::Conditional(Box::new(cw)));
         }
         let txn = self.lower_cypher_ast_to_txn(&ast, ledger_id, snapshot).await?;
         Ok(crate::cypher_write::WritePlan::Single(Box::new(txn)))
@@ -3420,14 +3420,43 @@ impl Fluree {
                         Vec::new(),
                     ));
                 }
-                let probe = crate::cypher_write::merge_probe_cypher(node)
-                    .map_err(|e| ApiError::cypher(e, Vec::new()))?;
-                let exists = self.query_cypher(&probe_view, &probe).await?.row_count() > 0;
+                let probe = crate::cypher_write::build_merge_probe_ast(node);
+                let exists = self.query_cypher_ast(&probe_view, &probe).await?.row_count() > 0;
                 let ast = if exists {
                     crate::cypher_write::build_on_match_ast(merge)
                 } else {
                     crate::cypher_write::build_create_ast(merge)
                 };
+                self.lower_cypher_ast_to_txn(&ast, ledger_id, snapshot).await
+            }
+            ConditionalCypherWrite::DeleteNode(update) => {
+                let delete = crate::cypher_write::delete_clause(update).ok_or_else(|| {
+                    ApiError::cypher("DELETE plan has no DELETE clause".to_string(), Vec::new())
+                })?;
+                // Cypher requires bare DELETE to fail when a target still has
+                // relationships. Probe each target in both directions.
+                for target in &delete.targets {
+                    for inbound in [false, true] {
+                        let probe_ast = crate::cypher_write::build_relationship_probe_ast(
+                            &update.read_clauses,
+                            target,
+                            inbound,
+                        );
+                        if self.query_cypher_ast(&probe_view, &probe_ast).await?.row_count() > 0 {
+                            return Err(ApiError::cypher(
+                                format!(
+                                    "DELETE of `{}` failed: the node still has relationships; \
+                                     use DETACH DELETE to remove it together with its relationships",
+                                    target.name
+                                ),
+                                Vec::new(),
+                            ));
+                        }
+                    }
+                }
+                // No relationships → the node retraction is identical to
+                // DETACH DELETE.
+                let ast = crate::cypher_write::build_detach_delete_ast(update);
                 self.lower_cypher_ast_to_txn(&ast, ledger_id, snapshot).await
             }
         }

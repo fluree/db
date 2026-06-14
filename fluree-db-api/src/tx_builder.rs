@@ -126,11 +126,27 @@ impl TransactOperation<'_> {
 // TransactCore (shared, private)
 // ============================================================================
 
+/// A resolver that produces a `Txn` from the **locked** writer state. Used by
+/// conditional Cypher writes (e.g. `MERGE … ON MATCH SET`): `commit_with_handle`
+/// calls it after acquiring the write lock, so the probe that chooses the
+/// branch and the staged branch see the same writer state — making the
+/// probe + stage atomic.
+pub(crate) type LockedTxnResolver<'a> = Box<
+    dyn FnOnce(
+            &LedgerState,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<Txn>> + Send + 'a>,
+        > + Send
+        + 'a,
+>;
+
 /// Shared fields for both transaction builders.
 pub(crate) struct TransactCore<'a> {
     pub(crate) operation: Option<TransactOperation<'a>>,
     /// Pre-built transaction IR (bypasses parsing, used for SPARQL UPDATE)
     pub(crate) pre_built_txn: Option<Txn>,
+    /// Resolve the transaction under the write lock (conditional Cypher writes).
+    pub(crate) pre_built_txn_resolver: Option<LockedTxnResolver<'a>>,
     pub(crate) txn_opts: TxnOpts,
     pub(crate) commit_opts: CommitOpts,
     pub(crate) index_config: Option<IndexConfig>,
@@ -144,6 +160,7 @@ impl<'a> TransactCore<'a> {
         Self {
             operation: None,
             pre_built_txn: None,
+            pre_built_txn_resolver: None,
             txn_opts: TxnOpts::default(),
             commit_opts: CommitOpts::default(),
             index_config: None,
@@ -178,8 +195,11 @@ impl<'a> TransactCore<'a> {
 
     pub(crate) fn validate(&self) -> std::result::Result<(), BuilderErrors> {
         let mut errors = self.errors.clone();
-        // Either operation or pre_built_txn must be set
-        if self.operation.is_none() && self.pre_built_txn.is_none() {
+        // An operation, a pre-built txn, or a locked resolver must be set.
+        if self.operation.is_none()
+            && self.pre_built_txn.is_none()
+            && self.pre_built_txn_resolver.is_none()
+        {
             errors.push(BuilderError::Missing {
                 field: "operation",
                 hint: "Call .insert(), .upsert(), .update(), .insert_turtle(), .upsert_turtle(), or .txn()",
@@ -756,6 +776,39 @@ impl<'a> RefTransactBuilder<'a> {
         self.core.validate()
     }
 
+    /// Stage a Cypher [`WritePlan`](crate::cypher_write::WritePlan). A `Single`
+    /// plan is a pre-built `Txn`; a `Conditional` plan installs a resolver that
+    /// `commit_with_handle` runs **under the write lock**, so the
+    /// branch-choosing probe and the staged branch see the same writer state.
+    pub fn cypher_write_plan(
+        mut self,
+        plan: crate::cypher_write::WritePlan,
+        ledger_id: String,
+    ) -> Self {
+        match plan {
+            crate::cypher_write::WritePlan::Single(txn) => {
+                self.core.set_pre_built_txn(*txn);
+            }
+            crate::cypher_write::WritePlan::Conditional(cw) => {
+                let fluree = self.fluree;
+                self.core.pre_built_txn_resolver = Some(Box::new(move |state: &LedgerState| {
+                    // Build the (Arc-shared, owned) probe view and snapshot
+                    // synchronously so the returned future doesn't borrow the
+                    // locked state — only `fluree` (`'a`).
+                    let probe = crate::GraphDb::from_ledger_state(state);
+                    let snapshot = std::sync::Arc::clone(&state.snapshot);
+                    Box::pin(async move {
+                        fluree
+                            .resolve_conditional_cypher(&cw, probe, &ledger_id, snapshot.as_ref())
+                            .await
+                    })
+                    // `cw: Box<ConditionalCypherWrite>` derefs to the inner enum.
+                }));
+            }
+        }
+        self
+    }
+
     /// Stage + commit the transaction, updating the handle in-place.
     pub async fn execute(self) -> Result<TransactResultRef> {
         commit_with_handle(self.fluree, self.handle, self.core).await
@@ -792,13 +845,26 @@ pub(crate) async fn commit_with_handle(
 
     // Fast path retains legacy behavior for complex cases that cannot be retried
     // without cloning inputs (e.g., pre-built Txn IR), or when using tracked+policy staging.
-    if core.pre_built_txn.is_some() || core.policy.is_some() {
+    if core.pre_built_txn.is_some()
+        || core.pre_built_txn_resolver.is_some()
+        || core.policy.is_some()
+    {
         // Acquire write lock
         let mut write_guard = handle.lock_for_write().await;
         let ledger_state = write_guard.clone_state();
 
-        // Handle pre-built Txn (SPARQL UPDATE) vs operation-based transaction
-        let (stage_result, txn_type, commit_opts) = if let Some(txn) = core.pre_built_txn {
+        // A conditional write resolves its Txn here, under the write lock, so
+        // the branch-choosing probe sees the same writer state the Txn stages
+        // against (probe + stage are atomic).
+        let pre_built_txn = if let Some(resolver) = core.pre_built_txn_resolver {
+            Some(resolver(&ledger_state).await?)
+        } else {
+            core.pre_built_txn
+        };
+
+        // Handle pre-built Txn (SPARQL UPDATE / resolved conditional) vs
+        // operation-based transaction.
+        let (stage_result, txn_type, commit_opts) = if let Some(txn) = pre_built_txn {
             let txn_type = txn.txn_type;
             // For pre-built Txn, don't attach raw_txn (we don't have the original format)
             let stage_result = fluree

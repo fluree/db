@@ -472,6 +472,72 @@ async fn transact_cypher_set_relationship_property() {
 }
 
 #[tokio::test]
+async fn transact_cypher_bare_delete_removes_relationship_free_node() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/cypher:delete-clean");
+    let committed = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": ctx(),
+                "@graph": [
+                    {"@id": "ex:alice", "@type": "ex:Person", "ex:name": "Alice"},
+                    {"@id": "ex:bob",   "@type": "ex:Person", "ex:name": "Bob"},
+                ]
+            }),
+        )
+        .await
+        .expect("seed");
+
+    // Neither node has relationships → bare DELETE succeeds.
+    let l = fluree
+        .transact_cypher(
+            committed.ledger,
+            r#"MATCH (n:Person {name: "Alice"}) DELETE n"#,
+        )
+        .await
+        .expect("bare delete")
+        .ledger;
+    let db = graphdb_from_ledger(&l);
+    assert_eq!(
+        fluree
+            .query_cypher(&db, "MATCH (n:Person) RETURN n")
+            .await
+            .unwrap()
+            .row_count(),
+        1,
+        "Alice removed, Bob remains"
+    );
+}
+
+#[tokio::test]
+async fn transact_cypher_bare_delete_errors_when_node_has_relationships() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let mut l = genesis_ledger(&fluree, "it/cypher:delete-guarded");
+    for stmt in [
+        r#"CREATE (a:Person {name: "Alice"})"#,
+        r#"CREATE (b:Person {name: "Bob"})"#,
+        r#"MATCH (a:Person {name: "Alice"}), (b:Person {name: "Bob"}) CREATE (a)-[:KNOWS]->(b)"#,
+    ] {
+        l = fluree.transact_cypher(l, stmt).await.expect(stmt).ledger;
+    }
+
+    // Alice has an outbound relationship → bare DELETE must error.
+    let err = fluree
+        .transact_cypher(l.clone(), r#"MATCH (n:Person {name: "Alice"}) DELETE n"#)
+        .await
+        .expect_err("DELETE on a node with an outbound relationship should error");
+    assert!(format!("{err}").contains("relationship"), "{err}");
+
+    // Bob has an inbound relationship → bare DELETE must also error.
+    let err = fluree
+        .transact_cypher(l, r#"MATCH (n:Person {name: "Bob"}) DELETE n"#)
+        .await
+        .expect_err("DELETE on a node with an inbound relationship should error");
+    assert!(format!("{err}").contains("relationship"), "{err}");
+}
+
+#[tokio::test]
 async fn transact_cypher_detach_delete_removes_node_and_both_directions() {
     let fluree = FlureeBuilder::memory().build_memory();
     let mut l = genesis_ledger(&fluree, "it/cypher:detach-delete");

@@ -134,6 +134,17 @@ pub(crate) fn parse_cypher_to_ir(
     fluree_db_cypher::substitute_params(&mut ast, params.unwrap_or(&empty))
         .map_err(|e| ApiError::cypher(e.to_string(), Vec::new()))?;
 
+    lower_cypher_ast_to_ir(&ast, snapshot, default_context)
+}
+
+/// Lower an already-parsed, param-substituted Cypher read AST to the shared
+/// query IR. Used by `parse_cypher_to_ir` and by the conditional-write probes,
+/// which build read ASTs in code.
+pub(crate) fn lower_cypher_ast_to_ir(
+    ast: &fluree_db_cypher::CypherAst,
+    snapshot: &LedgerSnapshot,
+    default_context: Option<&JsonValue>,
+) -> Result<(VarRegistry, Query)> {
     // Pull `@vocab` and named-term overrides out of the default
     // context, then build a `LoweringContext` and pass it to the
     // context-aware lower entry so the ledger's IRI mappings actually
@@ -145,7 +156,7 @@ pub(crate) fn parse_cypher_to_ir(
     if !overrides.is_empty() {
         ctx = ctx.with_overrides(overrides);
     }
-    let parsed = fluree_db_cypher::lower_cypher_with_context(&ast, &mut ctx)?;
+    let parsed = fluree_db_cypher::lower_cypher_with_context(ast, &mut ctx)?;
     Ok((vars, parsed))
 }
 

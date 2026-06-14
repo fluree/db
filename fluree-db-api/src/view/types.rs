@@ -335,24 +335,6 @@ impl GraphDb {
         gdb
     }
 
-    /// Create a queryable view from a cached writer `LedgerView` (what
-    /// `LedgerHandle::snapshot()` returns). Used by the conditional-write path
-    /// to probe the exact pre-write state the commit will target, without
-    /// re-loading the ledger.
-    pub fn from_ledger_view(view: &crate::ledger_view::LedgerView, ledger_id: &str) -> Self {
-        let mut gdb = Self::new(
-            Arc::clone(&view.snapshot),
-            Arc::clone(&view.novelty) as Arc<dyn OverlayProvider>,
-            Some(Arc::clone(&view.novelty)),
-            view.t,
-            ledger_id,
-        );
-        gdb.dict_novelty = Some(view.dict_novelty.clone());
-        gdb.runtime_small_dicts = Some(view.runtime_small_dicts.clone());
-        gdb.binary_store = view.binary_store.clone();
-        gdb
-    }
-
     /// Create a view from a `HistoricalLedgerView` (time-travel snapshot).
     ///
     /// Use this for querying ledger state at a specific point in time.

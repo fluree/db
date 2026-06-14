@@ -19,18 +19,20 @@
 //! current state, derives the actual write, and commits it as one transaction.
 
 use fluree_db_cypher::ast::{
-    CypherAst, Expr, Label, Literal, MatchClause, MergeClause, NodePattern, ReadClause, SetClause,
-    Statement, Update, WriteClause,
+    CypherAst, DeleteClause, Direction, Expr, Literal, MatchClause, MergeClause, NodePattern,
+    Pattern, PatternPart, ProjectionItem, Query, ReadClause, RelPattern, ReturnClause, SetClause,
+    Statement, Update, Variable, WriteClause,
 };
 use fluree_db_transact::ir::Txn;
 
 /// A lowered Cypher write: either a ready-to-stage `Txn`, or a conditional
 /// write that must probe the writer snapshot before it can be resolved.
 pub enum WritePlan {
-    /// A ready-to-stage transaction. Boxed because `Txn` is large relative to
-    /// the conditional variant.
+    /// A ready-to-stage transaction.
     Single(Box<Txn>),
-    Conditional(ConditionalCypherWrite),
+    /// A write needing a pre-write probe. Boxed (both variants embed a large
+    /// AST clause).
+    Conditional(Box<ConditionalCypherWrite>),
 }
 
 /// A write that needs a pre-write probe to choose between branches.
@@ -39,6 +41,11 @@ pub enum ConditionalCypherWrite {
     /// then stage the create branch (when absent) or the `ON MATCH SET`
     /// (when present).
     MergeOnMatch(MergeClause),
+    /// Bare `MATCH … DELETE n` (non-`DETACH`): probe whether any matched node
+    /// still has a relationship, error if so, otherwise stage the node
+    /// retraction (via the `DETACH DELETE` lowering — equivalent when there
+    /// are no relationships).
+    DeleteNode(Update),
 }
 
 /// Detect a write shape that requires a pre-write probe. Returns `None` for
@@ -47,67 +54,94 @@ pub fn detect_conditional(ast: &CypherAst) -> Option<ConditionalCypherWrite> {
     let Statement::Update(u) = &ast.statement else {
         return None;
     };
-    // Conditional shapes are standalone single write clauses.
-    if !u.read_clauses.is_empty() || u.write_clauses.len() != 1 {
+    if u.write_clauses.len() != 1 {
         return None;
     }
-    if let WriteClause::Merge(m) = &u.write_clauses[0] {
-        let single_node = m.pattern.parts.len() == 1 && m.pattern.parts[0].tail.is_empty();
-        if !m.on_match.is_empty() && single_node {
-            return Some(ConditionalCypherWrite::MergeOnMatch(m.clone()));
-        }
-    }
-    None
-}
-
-/// Fixed probe variable — uncollidable with user identifiers (leading
-/// underscore is fine in Cypher, and this name is generated, not parsed from
-/// user input).
-const PROBE_VAR: &str = "__cyprobe";
-
-/// Serialize a MERGE node pattern into a probe query that returns at most one
-/// row when a matching node exists: `MATCH (<probe>:Labels {props}) RETURN
-/// <probe> LIMIT 1`.
-pub(crate) fn merge_probe_cypher(node: &NodePattern) -> Result<String, String> {
-    let mut s = String::from("MATCH (");
-    s.push_str(PROBE_VAR);
-    for Label { name, .. } in &node.labels {
-        s.push(':');
-        s.push_str(name);
-    }
-    if let Some(props) = &node.props {
-        s.push_str(" {");
-        for (i, (key, val)) in props.entries.iter().enumerate() {
-            if i > 0 {
-                s.push_str(", ");
+    match &u.write_clauses[0] {
+        // MERGE … ON MATCH SET: standalone single-node MERGE with on-match.
+        WriteClause::Merge(m) => {
+            let single_node = m.pattern.parts.len() == 1 && m.pattern.parts[0].tail.is_empty();
+            if u.read_clauses.is_empty() && !m.on_match.is_empty() && single_node {
+                Some(ConditionalCypherWrite::MergeOnMatch(m.clone()))
+            } else {
+                None
             }
-            s.push_str(key);
-            s.push_str(": ");
-            s.push_str(&serialize_literal(val)?);
         }
-        s.push('}');
-    }
-    s.push_str(") RETURN ");
-    s.push_str(PROBE_VAR);
-    s.push_str(" LIMIT 1");
-    Ok(s)
-}
-
-fn serialize_literal(e: &Expr) -> Result<String, String> {
-    match e {
-        Expr::Lit(Literal::String(v, _)) => Ok(format!("\"{}\"", escape_string(v))),
-        Expr::Lit(Literal::Integer(n, _)) => Ok(n.to_string()),
-        Expr::Lit(Literal::Float(f, _)) => Ok(format!("{f}")),
-        Expr::Lit(Literal::Bool(b, _)) => Ok(b.to_string()),
-        Expr::Lit(Literal::Null(_)) => {
-            Err("null in a MERGE identity map is not supported".to_string())
+        // Bare DELETE n (non-DETACH). DETACH DELETE lowers directly. DELETE on
+        // a relationship variable is a different operation (deferred), so only
+        // node-variable targets qualify here.
+        WriteClause::Delete(d) => {
+            if !d.detach && !u.read_clauses.is_empty() && !any_target_is_rel_var(u, d) {
+                Some(ConditionalCypherWrite::DeleteNode(u.clone()))
+            } else {
+                None
+            }
         }
-        _ => Err("MERGE identity properties must be literals".to_string()),
+        _ => None,
     }
 }
 
-fn escape_string(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('"', "\\\"")
+/// True if any DELETE target is bound as a *relationship* variable in the
+/// MATCH (i.e. it's a `DELETE r`, not a `DELETE n`).
+fn any_target_is_rel_var(u: &Update, d: &DeleteClause) -> bool {
+    let mut rel_vars = std::collections::HashSet::new();
+    for clause in &u.read_clauses {
+        if let ReadClause::Match(m) | ReadClause::OptionalMatch(m) = clause {
+            for part in &m.pattern.parts {
+                for (rel, _) in &part.tail {
+                    if let Some(v) = &rel.var {
+                        rel_vars.insert(v.name.as_str());
+                    }
+                }
+            }
+        }
+    }
+    d.targets.iter().any(|t| rel_vars.contains(t.name.as_str()))
+}
+
+/// Build a probe that returns at most one row when a node matching the MERGE
+/// identity pattern exists: `MATCH (<node>) RETURN <var> LIMIT 1`. Built from
+/// the AST (the node is cloned verbatim) so labels/properties — including
+/// backtick-quoted identifiers — round-trip exactly, with no text
+/// serialization. The node carries a variable (required for ON MATCH SET).
+pub(crate) fn build_merge_probe_ast(node: &NodePattern) -> CypherAst {
+    let span = node.span;
+    let var = node
+        .var
+        .clone()
+        .expect("MERGE node has a variable (checked before resolution)");
+    CypherAst {
+        statement: Statement::Query(Query {
+            clauses: vec![ReadClause::Match(MatchClause {
+                pattern: Pattern {
+                    parts: vec![PatternPart {
+                        path_var: None,
+                        head: node.clone(),
+                        tail: Vec::new(),
+                        span,
+                    }],
+                    span,
+                },
+                where_clause: None,
+                span,
+            })],
+            return_clause: ReturnClause {
+                items: vec![ProjectionItem {
+                    expr: Expr::Var(var),
+                    alias: None,
+                    span,
+                }],
+                distinct: false,
+                order_by: Vec::new(),
+                skip: None,
+                limit: Some(Expr::Lit(Literal::Integer(1, span))),
+                span,
+            },
+            union_tail: None,
+            span,
+        }),
+        span,
+    }
 }
 
 /// Build the on-match branch: `MATCH (pattern) SET <on_match>`. Reuses the
@@ -129,6 +163,102 @@ pub(crate) fn build_on_match_ast(merge: &MergeClause) -> CypherAst {
             span,
         }),
         span,
+    }
+}
+
+/// The DELETE clause inside a `DeleteNode` plan (its single write clause).
+pub(crate) fn delete_clause(update: &Update) -> Option<&DeleteClause> {
+    match update.write_clauses.first() {
+        Some(WriteClause::Delete(d)) => Some(d),
+        _ => None,
+    }
+}
+
+/// Build a probe that returns at most one row when a matched `target` node
+/// still participates in a (reified) relationship — `<original MATCH>` plus a
+/// `(target)-[__r]->(__o)` (outbound) or `(__s)-[__r]->(target)` (inbound)
+/// hop, returning `target LIMIT 1`. Named relationship ⇒ only reified edges
+/// match, which is exactly Cypher's notion of a relationship.
+pub(crate) fn build_relationship_probe_ast(
+    read_clauses: &[ReadClause],
+    target: &Variable,
+    inbound: bool,
+) -> CypherAst {
+    let span = target.span;
+    let mk_var = |name: &str| Variable {
+        name: name.to_string(),
+        span,
+    };
+    let anon = |var: Variable| NodePattern {
+        var: Some(var),
+        labels: Vec::new(),
+        props: None,
+        span,
+    };
+    let rel = RelPattern {
+        var: Some(mk_var("__cydel_r")),
+        direction: Direction::Outgoing,
+        types: Vec::new(),
+        length: None,
+        props: None,
+        span,
+    };
+    let (head, tail_node) = if inbound {
+        (anon(mk_var("__cydel_s")), anon(target.clone()))
+    } else {
+        (anon(target.clone()), anon(mk_var("__cydel_o")))
+    };
+    let rel_part = PatternPart {
+        path_var: None,
+        head,
+        tail: vec![(rel, tail_node)],
+        span,
+    };
+    let mut clauses: Vec<ReadClause> = read_clauses.to_vec();
+    clauses.push(ReadClause::Match(MatchClause {
+        pattern: Pattern {
+            parts: vec![rel_part],
+            span,
+        },
+        where_clause: None,
+        span,
+    }));
+
+    CypherAst {
+        statement: Statement::Query(Query {
+            clauses,
+            return_clause: ReturnClause {
+                items: vec![ProjectionItem {
+                    expr: Expr::Var(target.clone()),
+                    alias: None,
+                    span,
+                }],
+                distinct: false,
+                order_by: Vec::new(),
+                skip: None,
+                limit: Some(Expr::Lit(Literal::Integer(1, span))),
+                span,
+            },
+            union_tail: None,
+            span,
+        }),
+        span,
+    }
+}
+
+/// Build the deletion branch for a verified-relationship-free `DELETE n`: the
+/// same statement as `DETACH DELETE n` (equivalent when there are no
+/// relationships), which lowers to the in/out-bound retraction templates.
+pub(crate) fn build_detach_delete_ast(update: &Update) -> CypherAst {
+    let mut u = update.clone();
+    for w in &mut u.write_clauses {
+        if let WriteClause::Delete(d) = w {
+            d.detach = true;
+        }
+    }
+    CypherAst {
+        statement: Statement::Update(u),
+        span: update.span,
     }
 }
 

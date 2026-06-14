@@ -171,6 +171,34 @@ impl Fluree {
 
         maybe_wrap_for_graph_source(db, &mut parsed);
 
+        self.execute_cypher_ir(db, vars, parsed, parse_ms).await
+    }
+
+    /// Execute an already-constructed Cypher read AST. Used by the
+    /// conditional-write probes, which build read ASTs in code rather than
+    /// from text.
+    pub async fn query_cypher_ast(
+        &self,
+        db: &GraphDb,
+        ast: &fluree_db_cypher::CypherAst,
+    ) -> Result<QueryResult> {
+        let (vars, mut parsed) = crate::query::helpers::lower_cypher_ast_to_ir(
+            ast,
+            &db.snapshot,
+            db.default_context.as_ref(),
+        )?;
+        maybe_wrap_for_graph_source(db, &mut parsed);
+        self.execute_cypher_ir(db, vars, parsed, 0.0).await
+    }
+
+    async fn execute_cypher_ir(
+        &self,
+        db: &GraphDb,
+        vars: crate::VarRegistry,
+        parsed: fluree_db_query::ir::Query,
+        parse_ms: f64,
+    ) -> Result<QueryResult> {
+
         let plan_start = std::time::Instant::now();
         let executable = self.build_executable_for_view(db, &parsed).await?;
         let plan_ms = plan_start.elapsed().as_secs_f64() * 1000.0;
