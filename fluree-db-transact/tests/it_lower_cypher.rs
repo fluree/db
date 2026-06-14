@@ -224,6 +224,55 @@ fn match_remove_property_emits_delete_only() {
 }
 
 #[test]
+fn match_create_relationship_references_bound_nodes() {
+    let txn = lower(
+        r#"MATCH (a:Person {name: "Alice"}), (b:Person {name: "Bob"})
+           CREATE (a)-[:KNOWS]->(b)"#,
+    );
+    assert_eq!(txn.txn_type, TxnType::Update);
+    // WHERE: 2 labels + 2 inline-name filters.
+    assert_eq!(
+        txn.where_patterns.len(),
+        4,
+        "where: {:?}",
+        txn.where_patterns
+    );
+    // CREATE: base edge + 3 reifier bundle triples = 4 (no new labels).
+    assert_eq!(
+        txn.insert_templates.len(),
+        4,
+        "inserts: {:?}",
+        txn.insert_templates
+    );
+    // Base edge endpoints reference the MATCH-bound variables.
+    let base = &txn.insert_templates[0];
+    assert!(matches!(base.subject, TemplateTerm::Var(_)));
+    assert!(matches!(base.object, TemplateTerm::Var(_)));
+}
+
+#[test]
+fn match_create_new_node_uses_blank_node() {
+    let txn = lower(
+        r#"MATCH (a:Person {name: "Alice"})
+           CREATE (a)-[:HAS_PET]->(p:Pet {name: "Rex"})"#,
+    );
+    assert_eq!(txn.txn_type, TxnType::Update);
+    // The bound `a` appears as a Var subject (the base edge); the new
+    // Pet node `p` appears as a blank-node subject (its label/prop
+    // triples).
+    let has_var_subject = txn
+        .insert_templates
+        .iter()
+        .any(|t| matches!(t.subject, TemplateTerm::Var(_)));
+    let has_bnode_subject = txn
+        .insert_templates
+        .iter()
+        .any(|t| matches!(t.subject, TemplateTerm::BlankNode(_)));
+    assert!(has_var_subject, "bound `a` should drive a Var-subject edge");
+    assert!(has_bnode_subject, "new `p` should be a blank node");
+}
+
+#[test]
 fn match_remove_label_deletes_rdf_type_triple() {
     let txn = lower("MATCH (n:Person) REMOVE n:Person");
     assert_eq!(txn.delete_templates.len(), 1);

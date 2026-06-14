@@ -217,6 +217,66 @@ async fn transact_cypher_set_property_replaces_old_value() {
 }
 
 #[tokio::test]
+async fn transact_cypher_match_create_links_existing_nodes() {
+    // MATCH binds Alice and Bob; CREATE links them with a new edge.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/cypher:match-create");
+
+    let txn = json!({
+        "@context": ctx(),
+        "@graph": [
+            {"@id": "ex:alice", "@type": "ex:Person", "ex:name": "Alice"},
+            {"@id": "ex:bob",   "@type": "ex:Person", "ex:name": "Bob"},
+        ]
+    });
+    let committed = fluree.insert(ledger0, &txn).await.expect("seed");
+
+    let linked = fluree
+        .transact_cypher(
+            committed.ledger,
+            r#"MATCH (a:Person {name: "Alice"}), (b:Person {name: "Bob"})
+               CREATE (a)-[:KNOWS]->(b)"#,
+        )
+        .await
+        .expect("match-create");
+
+    let db = graphdb_from_ledger(&linked.ledger);
+    let rows = fluree
+        .query_cypher(&db, "MATCH (a:Person)-[:KNOWS]->(b:Person) RETURN a, b")
+        .await
+        .expect("query edge");
+    assert_eq!(rows.row_count(), 1, "Alice KNOWS Bob should exist");
+}
+
+#[tokio::test]
+async fn transact_cypher_match_create_mints_new_node_per_match() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/cypher:match-create-new");
+
+    let txn = json!({
+        "@context": ctx(),
+        "@id": "ex:alice", "@type": "ex:Person", "ex:name": "Alice",
+    });
+    let committed = fluree.insert(ledger0, &txn).await.expect("seed");
+
+    let updated = fluree
+        .transact_cypher(
+            committed.ledger,
+            r#"MATCH (a:Person {name: "Alice"})
+               CREATE (a)-[:HAS_PET]->(p:Pet {name: "Rex"})"#,
+        )
+        .await
+        .expect("match-create-new");
+
+    let db = graphdb_from_ledger(&updated.ledger);
+    let pets = fluree
+        .query_cypher(&db, "MATCH (p:Pet) RETURN p")
+        .await
+        .expect("query pet");
+    assert_eq!(pets.row_count(), 1, "a new Pet node should have been created");
+}
+
+#[tokio::test]
 async fn transact_cypher_set_label_adds_type() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger0 = genesis_ledger(&fluree, "it/cypher:set-label");

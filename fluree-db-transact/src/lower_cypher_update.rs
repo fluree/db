@@ -197,14 +197,7 @@ impl<'a> CypherLowering<'a> {
 
         for clause in &update.write_clauses {
             match clause {
-                WriteClause::Create(c) => {
-                    if has_match {
-                        return Err(LowerCypherError::unsupported(
-                            "MATCH … CREATE (template-driven writes) is deferred — submit a pure CREATE",
-                        ));
-                    }
-                    self.lower_create(c)?;
-                }
+                WriteClause::Create(c) => self.lower_create(c)?,
                 WriteClause::Set(s) => {
                     self.require_match(has_match, "SET")?;
                     self.lower_set(s)?;
@@ -712,7 +705,12 @@ impl<'a> CypherLowering<'a> {
 
     fn node_subject(&mut self, n: &NodePattern) -> TemplateTerm {
         if let Some(var) = &n.var {
-            // Reuse a stable bnode for the same Cypher variable.
+            // A var bound by a preceding MATCH references the existing
+            // node (per-solution SID); an unbound var is a new node and
+            // gets a stable per-variable blank node.
+            if self.bound_vars.contains(&var.name) {
+                return self.var_term(&var.name);
+            }
             return TemplateTerm::BlankNode(format!("_:cy_{}", var.name));
         }
         // Anonymous node — cache by span.
