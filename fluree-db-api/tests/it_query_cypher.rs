@@ -645,6 +645,62 @@ async fn transact_cypher_merge_creates_then_is_a_noop() {
 }
 
 #[tokio::test]
+async fn transact_cypher_merge_on_match_set_fires_only_on_match() {
+    // Conditional write: ON CREATE SET on first (absent) run, ON MATCH SET on
+    // the second (present) run.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = genesis_ledger(&fluree, "it/cypher:merge-on-match");
+
+    let stmt = r#"MERGE (n:Person {name: "Alice"})
+                  ON CREATE SET n.origin = "created"
+                  ON MATCH  SET n.origin = "matched""#;
+
+    // First run: node absent → create branch → origin = "created".
+    let l = fluree.transact_cypher(l, stmt).await.expect("merge create").ledger;
+    let db = graphdb_from_ledger(&l);
+    assert_eq!(
+        fluree
+            .query_cypher(&db, r#"MATCH (n:Person {origin: "created"}) RETURN n"#)
+            .await
+            .unwrap()
+            .row_count(),
+        1,
+        "ON CREATE SET applied on first run"
+    );
+
+    // Second run: node present → on-match branch → origin = "matched".
+    let l = fluree.transact_cypher(l, stmt).await.expect("merge match").ledger;
+    let db = graphdb_from_ledger(&l);
+    assert_eq!(
+        fluree
+            .query_cypher(&db, "MATCH (n:Person) RETURN n")
+            .await
+            .unwrap()
+            .row_count(),
+        1,
+        "still exactly one node (no duplicate)"
+    );
+    assert_eq!(
+        fluree
+            .query_cypher(&db, r#"MATCH (n:Person {origin: "matched"}) RETURN n"#)
+            .await
+            .unwrap()
+            .row_count(),
+        1,
+        "ON MATCH SET overwrote origin on the second run"
+    );
+    assert_eq!(
+        fluree
+            .query_cypher(&db, r#"MATCH (n:Person {origin: "created"}) RETURN n"#)
+            .await
+            .unwrap()
+            .row_count(),
+        0,
+        "old origin value was retracted"
+    );
+}
+
+#[tokio::test]
 async fn transact_cypher_merge_on_create_set_fires_only_on_create() {
     let fluree = FlureeBuilder::memory().build_memory();
     let l = genesis_ledger(&fluree, "it/cypher:merge-on-create");

@@ -1753,14 +1753,32 @@ async fn execute_cypher_transact(
         .await
         .map_err(ServerError::Api)?;
     let cached_state = handle.snapshot().await;
-    let txn = state
+
+    // Most writes lower to a single Txn; conditional writes (e.g. MERGE … ON
+    // MATCH SET) probe the cached writer view first, then resolve to a Txn.
+    // Either way the Txn commits through the same cached-handle path below.
+    let plan = state
         .fluree
-        .lower_cypher_to_txn(ledger_id, &cached_state.snapshot, &cypher, params.as_ref())
+        .cypher_write_plan(&cypher, params.as_ref(), ledger_id, &cached_state.snapshot)
         .await
         .map_err(|e| {
             set_span_error_code(span, "error:InvalidTransaction");
             ServerError::Api(e)
         })?;
+    let txn = match plan {
+        fluree_db_api::cypher_write::WritePlan::Single(txn) => *txn,
+        fluree_db_api::cypher_write::WritePlan::Conditional(cw) => {
+            let probe = fluree_db_api::GraphDb::from_ledger_view(&cached_state, ledger_id);
+            state
+                .fluree
+                .resolve_conditional_cypher(&cw, probe, ledger_id, &cached_state.snapshot)
+                .await
+                .map_err(|e| {
+                    set_span_error_code(span, "error:InvalidTransaction");
+                    ServerError::Api(e)
+                })?
+        }
+    };
 
     // Build a PolicyContext when any policy input is present, so writes are
     // filtered the same way SPARQL UPDATE / JSON-LD writes are.

@@ -217,6 +217,41 @@ async fn cypher_tx_id_reflects_parameters() {
 }
 
 #[tokio::test]
+async fn cypher_http_merge_on_match_set_conditional() {
+    // The conditional write (MERGE … ON MATCH SET) must resolve over the
+    // server's cached-handle path: ON CREATE on the first POST, ON MATCH on
+    // the second.
+    let (_tmp, state) = server_state().await;
+    create_ledger(&state, "cyphermerge").await;
+
+    let stmt = r#"MERGE (n:Person {name: "Alice"})
+                  ON CREATE SET n.origin = "created"
+                  ON MATCH  SET n.origin = "matched""#;
+
+    let (s1, b1) = post_cypher(&state, "/v1/fluree/update/cyphermerge", stmt).await;
+    assert!(s1.is_success(), "first merge: {s1} {b1}");
+    let (status, body) = post_cypher(
+        &state,
+        "/v1/fluree/query/cyphermerge",
+        r#"MATCH (n:Person {origin: "created"}) RETURN n.name"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("Alice"), "ON CREATE applied: {body}");
+
+    let (s2, b2) = post_cypher(&state, "/v1/fluree/update/cyphermerge", stmt).await;
+    assert!(s2.is_success(), "second merge: {s2} {b2}");
+    let (status, body) = post_cypher(
+        &state,
+        "/v1/fluree/query/cyphermerge",
+        r#"MATCH (n:Person {origin: "matched"}) RETURN n.name"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("Alice"), "ON MATCH applied on second run: {body}");
+}
+
+#[tokio::test]
 async fn cypher_parse_error_is_client_error() {
     let (_tmp, state) = server_state().await;
     create_ledger(&state, "cypherbad").await;
