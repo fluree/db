@@ -1,5 +1,50 @@
 # GQL / Cypher Support — Implementation Plan
 
+> **Implementation status — updated 2026-06-14.** The openCypher v1 work
+> (the `fluree-db-cypher` crate + write-path lowering + `fluree-db-api`
+> entrypoints) has been merged onto `feature/edge-annotations`. The
+> sections below are the original *plan* (the target surface); this
+> banner and the **Implementation status** section immediately following
+> record what is actually built versus deferred, and why. When the two
+> disagree, the status section wins.
+
+## Implementation status
+
+**Reachable today only through the Rust library API**
+(`Fluree::query_cypher`, `Fluree::transact_cypher`). HTTP routes and the
+CLI flag (M5.6) are **not yet wired** — see Deferred.
+
+### Done
+
+| Area | Shipped | Notes |
+|---|---|---|
+| Read path | `MATCH` (labels, multi-label, inline `{prop}`), directed/typed/untyped/alternation relationships, anonymous vs named (EdgeAnnotation), `OPTIONAL MATCH`, `WHERE` (comparisons, boolean, `STARTS/ENDS/CONTAINS`, `IN`, `IS NULL`, `CASE`, `coalesce/length/toString/toInteger/toFloat/abs`, `n.prop`), `WITH … WHERE/ORDER BY/SKIP/LIMIT`, `UNWIND [literal]`, `RETURN`/`DISTINCT`/`AS`, aggregates `count/sum/avg/min/max`, `ORDER BY/SKIP/LIMIT`, `UNION`/`UNION ALL`, `CALL { subquery }`, `EXISTS` | Lowers to the shared query IR. |
+| Write — `CREATE` | Pure pattern CREATE (nodes + directed typed relationships + reifier bundle under LPG default) | `TxnType::Insert`. |
+| Write — `MATCH … SET` | `SET n.prop = lit`, `SET n += {…}`, `SET n:Label` | `TxnType::Update`; property forms use an OPTIONAL old-value WHERE binding so the prior value is retracted and the new one asserted (single-valued replace; absent property skips the delete). Labels are additive. |
+| Write — `MATCH … REMOVE` | `REMOVE n.prop`, `REMOVE n:Label` | `TxnType::Update`. |
+| Write — `MATCH … CREATE` | Template-driven writes: CREATE nodes bound by MATCH reference the matched node; unbound vars mint new nodes per solution | `TxnType::Update`. |
+
+The MATCH→WHERE foundation lowers leading `MATCH`/`OPTIONAL MATCH`
+(node labels + inline property filters + directed single-typed
+relationships) into `Txn.where_patterns`, with the WHERE side and the
+DELETE/INSERT templates sharing variable ids via the shared
+`VarRegistry` (`?name` interning) — the same linkage SPARQL UPDATE uses.
+
+### Deferred (with reasons)
+
+| Feature | Why deferred |
+|---|---|
+| `DELETE` / `DETACH DELETE` | Cascade needs snapshot **index probes at lowering time** (find a node's inbound + outbound ref-typed relationships and their reifier bundles) — the pure WHERE/template model can't express the inbound scan. Likely lands partly at the API layer. |
+| `MERGE` (single-node) | Find-or-create needs a search-first phase the `TxnType` variants don't model (Insert is unconditional; Upsert is delete-then-insert; Update skips unbound vars). Will be layered at the API level: snapshot-query the identifying pattern, then conditionally stage CREATE-shape flakes / `ON MATCH SET`. |
+| `SET n = {…}` (bounded replace) | Needs a predicate-**variable** scan with a literal-object + non-`rdf:type` + non-`f:*` filter to bound the retract scope safely. Deferred to land with the DELETE slice (same predicate-var machinery). `SET n += {…}` covers the common per-key case. |
+| `WHERE` filter expressions in a **write** MATCH | Requires lowering Cypher `Expr` → `UnresolvedExpression`. Inline property filters (`(n:Label {key: val})`) cover find-by-key today; explicit `WHERE n.x > 1 SET …` is the follow-up. |
+| Named / untyped / alternation relationships in a **write** MATCH | Read path supports them; write MATCH currently requires a directed single-typed relationship. Named-rel binding (needed for `SET r.prop`) maps to `EdgeAnnotation` in WHERE — a thin follow-up. |
+| Parameters (`$param`) | Not threaded through `query_cypher`/`transact_cypher` or any lowering site. Blocks driver compatibility; tracked as its own P0. |
+| HTTP routes + CLI flag (M5.6) | Never wired — Cypher is library-only today. |
+| Variable-length paths, path values, `shortestPath`, `collect()`/list values, reflection (`labels/type/keys/properties/id`), undirected, bare `(n)`, `LOAD CSV`, `FOREACH`, `CALL proc`, schema DDL, multi-statement | Per the original plan's deferral list below (engine work or product decisions). |
+
+---
+
 Builds on the edge-annotations storage primitive documented at
 [`docs/concepts/edge-annotations.md`](docs/concepts/edge-annotations.md)
 (user-facing semantics) and
@@ -540,14 +585,14 @@ reviewable.
 
 | ID | Scope | Status |
 |----|-------|--------|
-| M5.0 | Crate scaffolding, workspace wiring, feature flags | Not started |
-| M5.1 | Lex (Cypher tokens) | Not started |
-| M5.2 | AST + parser (v1 read + write surface) | Not started |
-| M5.3 | Query-path lower → shared IR; first round-trip with JSON-LD | Not started |
-| M5.4 | Write surface — CREATE / SET / REMOVE / DELETE / DETACH DELETE → `Txn` | Not started |
-| M5.5 | Single-node MERGE + ON CREATE / ON MATCH | Not started |
-| M5.6 | HTTP + CLI wiring, content negotiation, parameter passing | Not started |
-| M5.7 | Tests, docs, openCypher TCK subset | Not started |
+| M5.0 | Crate scaffolding, workspace wiring, feature flags | ✅ Done |
+| M5.1 | Lex (Cypher tokens) | ✅ Done |
+| M5.2 | AST + parser (v1 read + write surface) | ✅ Done |
+| M5.3 | Query-path lower → shared IR; first round-trip with JSON-LD | ✅ Done |
+| M5.4 | Write surface — CREATE / SET / REMOVE / MATCH…CREATE → `Txn` | 🟡 Partial — CREATE, MATCH…SET, MATCH…REMOVE, MATCH…CREATE done; DELETE / DETACH DELETE and `SET n = {…}` deferred (see Implementation status) |
+| M5.5 | Single-node MERGE + ON CREATE / ON MATCH | ⬜ Deferred (API-level search-then-stage) |
+| M5.6 | HTTP + CLI wiring, content negotiation, parameter passing | ⬜ Not started — Cypher is library-only |
+| M5.7 | Tests, docs, openCypher TCK subset | 🟡 Partial — lowering + end-to-end round-trip tests for the shipped surface; TCK subset not yet |
 
 Variable-length paths (formerly M5.6) are removed from v1 — see
 "Variable-length paths — deferred" in the semantic model.
