@@ -263,7 +263,12 @@ fn merge_single_node_emits_not_exists_guard_and_create_inserts() {
     let txn = lower(r#"MERGE (n:Person {name: "Alice"})"#);
     assert_eq!(txn.txn_type, TxnType::Update);
     // One NOT EXISTS guard over the identifying pattern.
-    assert_eq!(txn.where_patterns.len(), 1, "where: {:?}", txn.where_patterns);
+    assert_eq!(
+        txn.where_patterns.len(),
+        1,
+        "where: {:?}",
+        txn.where_patterns
+    );
     assert!(matches!(
         txn.where_patterns[0],
         UnresolvedPattern::NotExists(_)
@@ -277,7 +282,12 @@ fn merge_single_node_emits_not_exists_guard_and_create_inserts() {
 fn merge_on_create_set_adds_inserts() {
     let txn = lower(r#"MERGE (n:Person {name: "Alice"}) ON CREATE SET n.created = "yes""#);
     // label + name + created = 3 inserts.
-    assert_eq!(txn.insert_templates.len(), 3, "inserts: {:?}", txn.insert_templates);
+    assert_eq!(
+        txn.insert_templates.len(),
+        3,
+        "inserts: {:?}",
+        txn.insert_templates
+    );
     assert_eq!(txn.delete_templates.len(), 0);
 }
 
@@ -295,7 +305,12 @@ fn merge_must_be_only_write_clause() {
         }
         let ast = out.ast.unwrap();
         let mut ns = NamespaceRegistry::new();
-        let r = lower_cypher_update(&ast, &mut ns, TxnOpts::default(), CypherLowerOpts::default());
+        let r = lower_cypher_update(
+            &ast,
+            &mut ns,
+            TxnOpts::default(),
+            CypherLowerOpts::default(),
+        );
         assert!(r.is_err(), "expected rejection for `{src}`");
     }
 }
@@ -306,8 +321,16 @@ fn merge_on_create_set_on_identity_key_is_rejected() {
     assert!(!out.has_errors());
     let ast = out.ast.unwrap();
     let mut ns = NamespaceRegistry::new();
-    let r = lower_cypher_update(&ast, &mut ns, TxnOpts::default(), CypherLowerOpts::default());
-    assert!(r.is_err(), "ON CREATE SET on an identity-map key should be rejected");
+    let r = lower_cypher_update(
+        &ast,
+        &mut ns,
+        TxnOpts::default(),
+        CypherLowerOpts::default(),
+    );
+    assert!(
+        r.is_err(),
+        "ON CREATE SET on an identity-map key should be rejected"
+    );
 }
 
 #[test]
@@ -315,7 +338,12 @@ fn merge_on_create_map_merge_skips_null_entries() {
     // Consistent with `n.x = null`: a null map entry asserts nothing.
     let txn = lower(r#"MERGE (n:Person {name: "Alice"}) ON CREATE SET n += {x: null, y: 1}"#);
     // label + name (identity) + y = 3 (x skipped).
-    assert_eq!(txn.insert_templates.len(), 3, "inserts: {:?}", txn.insert_templates);
+    assert_eq!(
+        txn.insert_templates.len(),
+        3,
+        "inserts: {:?}",
+        txn.insert_templates
+    );
 }
 
 #[test]
@@ -405,7 +433,12 @@ fn set_map_replace_is_deferred() {
     assert!(!out.has_errors());
     let ast = out.ast.unwrap();
     let mut ns = NamespaceRegistry::new();
-    let r = lower_cypher_update(&ast, &mut ns, TxnOpts::default(), CypherLowerOpts::default());
+    let r = lower_cypher_update(
+        &ast,
+        &mut ns,
+        TxnOpts::default(),
+        CypherLowerOpts::default(),
+    );
     assert!(r.is_err(), "SET n = {{…}} should be deferred");
 }
 
@@ -415,8 +448,16 @@ fn set_on_unbound_variable_is_rejected() {
     assert!(!out.has_errors());
     let ast = out.ast.unwrap();
     let mut ns = NamespaceRegistry::new();
-    let r = lower_cypher_update(&ast, &mut ns, TxnOpts::default(), CypherLowerOpts::default());
-    assert!(r.is_err(), "SET on a variable not bound by MATCH should error");
+    let r = lower_cypher_update(
+        &ast,
+        &mut ns,
+        TxnOpts::default(),
+        CypherLowerOpts::default(),
+    );
+    assert!(
+        r.is_err(),
+        "SET on a variable not bound by MATCH should error"
+    );
 }
 
 #[test]
@@ -427,6 +468,11 @@ fn standalone_set_without_match_is_rejected() {
     }
     let ast = out.ast.unwrap();
     let mut ns = NamespaceRegistry::new();
-    let r = lower_cypher_update(&ast, &mut ns, TxnOpts::default(), CypherLowerOpts::default());
+    let r = lower_cypher_update(
+        &ast,
+        &mut ns,
+        TxnOpts::default(),
+        CypherLowerOpts::default(),
+    );
     assert!(r.is_err(), "SET without a preceding MATCH should error");
 }

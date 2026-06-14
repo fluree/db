@@ -2204,7 +2204,10 @@ fn update_via_stdin() {
 fn cypher_query_and_write_round_trip() {
     let tmp = TempDir::new().unwrap();
     fluree_cmd(&tmp).arg("init").assert().success();
-    fluree_cmd(&tmp).args(["create", "cypherdb"]).assert().success();
+    fluree_cmd(&tmp)
+        .args(["create", "cypherdb"])
+        .assert()
+        .success();
 
     // Seed a Person via JSON-LD (ex: = http://example.org/, the Cypher
     // resolver's default @vocab — so `Person`/`name`/`age` line up).
@@ -2275,7 +2278,10 @@ fn cypher_query_and_write_round_trip() {
 fn cypher_parameters_via_json_envelope() {
     let tmp = TempDir::new().unwrap();
     fluree_cmd(&tmp).arg("init").assert().success();
-    fluree_cmd(&tmp).args(["create", "cypherparamdb"]).assert().success();
+    fluree_cmd(&tmp)
+        .args(["create", "cypherparamdb"])
+        .assert()
+        .success();
 
     fluree_cmd(&tmp)
         .args([

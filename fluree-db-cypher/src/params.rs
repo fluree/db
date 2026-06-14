@@ -278,9 +278,7 @@ fn json_to_expr(v: &JsonValue, name: &str, span: SourceSpan) -> Result<Expr, Par
             Expr::List(out, span)
         }
         JsonValue::Object(_) => {
-            return Err(unsupported(
-                "map/object parameters are not supported in v1",
-            ))
+            return Err(unsupported("map/object parameters are not supported in v1"))
         }
     })
 }

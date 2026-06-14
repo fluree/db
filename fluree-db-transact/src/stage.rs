@@ -878,8 +878,8 @@ pub async fn stage(
         {
             use fluree_db_core::comparator::IndexType;
             use fluree_db_core::edge::EdgeKey;
-            use fluree_db_core::range::{RangeMatch, RangeOptions, RangeTest};
             use fluree_db_core::is_reserved_reifies_predicate;
+            use fluree_db_core::range::{RangeMatch, RangeOptions, RangeTest};
 
             // Annotation SIDs this txn asserts a `f:reifies*` flake for.
             // Pure retracts only shrink a bundle, so they can't create a
@@ -918,9 +918,7 @@ pub async fn stage(
                     // in v1); take the g_id from this txn's asserts.
                     let g_id = flakes
                         .iter()
-                        .find(|f| {
-                            f.op && f.s == *ann_sid && is_reserved_reifies_predicate(&f.p)
-                        })
+                        .find(|f| f.op && f.s == *ann_sid && is_reserved_reifies_predicate(&f.p))
                         .map(|f| resolve_flake_graph_id(f, &reverse_graph))
                         .transpose()?
                         .unwrap_or(0);

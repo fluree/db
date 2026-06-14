@@ -198,7 +198,6 @@ impl Fluree {
         parsed: fluree_db_query::ir::Query,
         parse_ms: f64,
     ) -> Result<QueryResult> {
-
         let plan_start = std::time::Instant::now();
         let executable = self.build_executable_for_view(db, &parsed).await?;
         let plan_ms = plan_start.elapsed().as_secs_f64() * 1000.0;

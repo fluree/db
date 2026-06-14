@@ -167,7 +167,10 @@ async fn cypher_http_json_envelope_with_params() {
         .to_string(),
     )
     .await;
-    assert!(status.is_success(), "param write status={status}; body={body}");
+    assert!(
+        status.is_success(),
+        "param write status={status}; body={body}"
+    );
 
     // Parameterized read via the envelope.
     let (status, body) = post_cypher(
@@ -212,7 +215,10 @@ async fn cypher_tx_id_reflects_parameters() {
     .await;
     assert!(s1.is_success() && s2.is_success(), "{b1}\n{b2}");
     let (id1, id2) = (tx_id(&b1), tx_id(&b2));
-    assert!(!id1.is_empty() && !id2.is_empty(), "tx-id present: {b1}\n{b2}");
+    assert!(
+        !id1.is_empty() && !id2.is_empty(),
+        "tx-id present: {b1}\n{b2}"
+    );
     assert_ne!(id1, id2, "different params must yield different tx-ids");
 }
 
@@ -248,7 +254,10 @@ async fn cypher_http_merge_on_match_set_conditional() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert!(body.contains("Alice"), "ON MATCH applied on second run: {body}");
+    assert!(
+        body.contains("Alice"),
+        "ON MATCH applied on second run: {body}"
+    );
 }
 
 #[tokio::test]
@@ -264,8 +273,7 @@ async fn cypher_parse_error_is_client_error() {
 async fn connection_scoped_cypher_is_rejected() {
     let (_tmp, state) = server_state().await;
     // No ledger in the path → 400 with a pointer to the ledger-scoped route.
-    let (status, body) =
-        post_cypher(&state, "/v1/fluree/query", "MATCH (n:Person) RETURN n").await;
+    let (status, body) = post_cypher(&state, "/v1/fluree/query", "MATCH (n:Person) RETURN n").await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "body={body}");
     let (status, _body) = post_cypher(
         &state,

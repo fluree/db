@@ -134,9 +134,9 @@ impl TransactOperation<'_> {
 pub(crate) type LockedTxnResolver<'a> = Box<
     dyn FnOnce(
             &LedgerState,
-        ) -> std::pin::Pin<
-            Box<dyn std::future::Future<Output = Result<Txn>> + Send + 'a>,
-        > + Send
+        )
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Txn>> + Send + 'a>>
+        + Send
         + 'a,
 >;
 

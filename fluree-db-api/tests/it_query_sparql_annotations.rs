@@ -317,7 +317,9 @@ async fn sparql_reattaching_id_to_different_edge_across_txns_is_rejected() {
         .txn(t2)
         .execute()
         .await
-        .expect_err("re-pointing an annotation id to a different edge across txns must be rejected");
+        .expect_err(
+            "re-pointing an annotation id to a different edge across txns must be rejected",
+        );
     let msg = format!("{err:?} {err}");
     assert!(
         msg.contains("multi-target") || msg.contains("reify exactly one edge"),

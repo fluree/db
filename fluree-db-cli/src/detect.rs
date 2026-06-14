@@ -131,7 +131,14 @@ pub fn detect_is_cypher(path: Option<&Path>, content: &str, cypher_flag: bool) -
 
 fn sniff_is_cypher(content: &str) -> bool {
     let upper = content.trim_start().to_uppercase();
-    const CYPHER_LEAD: [&str; 6] = ["MATCH ", "MERGE ", "UNWIND ", "OPTIONAL ", "DETACH ", "CREATE "];
+    const CYPHER_LEAD: [&str; 6] = [
+        "MATCH ",
+        "MERGE ",
+        "UNWIND ",
+        "OPTIONAL ",
+        "DETACH ",
+        "CREATE ",
+    ];
     CYPHER_LEAD.iter().any(|kw| upper.starts_with(kw))
 }
 
@@ -170,8 +177,16 @@ mod tests {
 
     #[test]
     fn cypher_by_extension() {
-        assert!(detect_is_cypher(Some(Path::new("q.cypher")), "anything", false));
-        assert!(detect_is_cypher(Some(Path::new("q.cyp")), "anything", false));
+        assert!(detect_is_cypher(
+            Some(Path::new("q.cypher")),
+            "anything",
+            false
+        ));
+        assert!(detect_is_cypher(
+            Some(Path::new("q.cyp")),
+            "anything",
+            false
+        ));
     }
 
     #[test]
@@ -184,9 +199,21 @@ mod tests {
     #[test]
     fn non_cypher_not_misdetected() {
         // SPARQL and JSON-LD must never sniff as Cypher.
-        assert!(!detect_is_cypher(None, "SELECT * WHERE { ?s ?p ?o }", false));
+        assert!(!detect_is_cypher(
+            None,
+            "SELECT * WHERE { ?s ?p ?o }",
+            false
+        ));
         assert!(!detect_is_cypher(None, "ASK { ?s ?p ?o }", false));
-        assert!(!detect_is_cypher(None, "PREFIX ex: <http://e/>\nSELECT *", false));
-        assert!(!detect_is_cypher(None, r#"{"select":["?s"],"where":{}}"#, false));
+        assert!(!detect_is_cypher(
+            None,
+            "PREFIX ex: <http://e/>\nSELECT *",
+            false
+        ));
+        assert!(!detect_is_cypher(
+            None,
+            r#"{"select":["?s"],"where":{}}"#,
+            false
+        ));
     }
 }

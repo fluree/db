@@ -321,8 +321,17 @@ pub async fn run(
     };
 
     if is_cypher {
-        return run_cypher_query(mode, &content, output_format, explain, bench, &tracking, at, policy)
-            .await;
+        return run_cypher_query(
+            mode,
+            &content,
+            output_format,
+            explain,
+            bench,
+            &tracking,
+            at,
+            policy,
+        )
+        .await;
     }
 
     match mode {
@@ -1009,8 +1018,12 @@ async fn run_cypher_query(
         OutputFormatKind::TypedJson => OutputFormatKind::TypedJson,
         _ => OutputFormatKind::Json,
     };
-    let output =
-        output::format_result(&formatted_json, display_format, detect::QueryFormat::JsonLd, None)?;
+    let output = output::format_result(
+        &formatted_json,
+        display_format,
+        detect::QueryFormat::JsonLd,
+        None,
+    )?;
     println!("{}", output.text);
     print_footer(output.total_rows, None, elapsed);
     Ok(())

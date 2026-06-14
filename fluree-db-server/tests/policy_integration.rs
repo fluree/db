@@ -1646,8 +1646,7 @@ async fn cypher_read_enforces_policy() {
         "http://example.org/public-user",
         "cypherpol:main",
     );
-    let (status, body) =
-        cypher_classifications(app.clone(), "cypherpol:main", Some(&token)).await;
+    let (status, body) = cypher_classifications(app.clone(), "cypherpol:main", Some(&token)).await;
     assert_eq!(status, StatusCode::OK, "policy body={body}");
     assert!(body.contains("public"), "public user sees public: {body}");
     assert!(
