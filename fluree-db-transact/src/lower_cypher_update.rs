@@ -406,6 +406,16 @@ impl<'a> CypherLowering<'a> {
             // / `REMOVE r.prop` target the relationship's annotation metadata,
             // and `DELETE r` retract the base edge it reifies.
             Some(v) => {
+                // A relationship variable may bind only one edge in a MATCH;
+                // reusing it would make the probe (first occurrence) and the
+                // delete lowering (last occurrence) disagree.
+                if self.rel_var_edges.contains_key(&v.name) {
+                    return Err(LowerCypherError::rejected(format!(
+                        "relationship variable `{}` is bound more than once in a write MATCH; \
+                         use a distinct name for each relationship",
+                        v.name
+                    )));
+                }
                 self.bound_vars.insert(v.name.clone());
                 let p_sid = self.ns.sid_for_iri(&type_iri);
                 self.rel_var_edges

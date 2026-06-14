@@ -945,6 +945,30 @@ async fn transact_cypher_delete_relationship_requires_named_endpoints() {
 }
 
 #[tokio::test]
+async fn transact_cypher_write_rejects_duplicate_relationship_variable() {
+    // A relationship variable may bind only one edge per MATCH; reusing it
+    // would make the parallel-edge probe (first occurrence) and the delete
+    // lowering (last occurrence) disagree, so the write MATCH rejects it.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let mut l = genesis_ledger(&fluree, "it/cypher:dup-rel-var");
+    for stmt in [
+        r#"CREATE (a:Person {name: "Alice"})"#,
+        r#"CREATE (b:Person {name: "Bob"})"#,
+    ] {
+        l = fluree.transact_cypher(l, stmt).await.expect(stmt).ledger;
+    }
+
+    let err = fluree
+        .transact_cypher(
+            l,
+            "MATCH (a)-[r:KNOWS]->(b), (c)-[r:LIKES]->(d) SET r.since = 2020",
+        )
+        .await
+        .expect_err("reusing a relationship variable must be rejected");
+    assert!(format!("{err}").contains("more than once"), "{err}");
+}
+
+#[tokio::test]
 async fn transact_cypher_bare_delete_rejects_optional_only_target() {
     // A bare DELETE target bound only by OPTIONAL MATCH is rejected: the node
     // can be unbound on some rows, where the relationship probe would bind an

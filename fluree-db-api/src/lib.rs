@@ -3522,8 +3522,9 @@ impl Fluree {
                         return Err(ApiError::cypher(
                             format!(
                                 "DELETE of relationship `{}` failed: parallel relationships \
-                                 share its underlying edge; deleting it would affect the \
-                                 others. Distinguish them with a property and delete by that.",
+                                 share its underlying edge, so deleting one would affect the \
+                                 others. Per-occurrence DELETE of a parallel relationship is \
+                                 not yet supported.",
                                 target.name
                             ),
                             Vec::new(),

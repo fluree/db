@@ -319,13 +319,16 @@ pub(crate) fn build_parallel_probe_ast(
         span,
     };
     let count_item = ProjectionItem {
+        // DISTINCT: count relationship *identities*, not solution rows. Extra
+        // multiplicity in the original MATCH (another matched variable) can
+        // repeat one identity across rows, which would falsely trip the guard.
         expr: Expr::Call(FuncCall {
             name: "count".to_string(),
             args: vec![Expr::Var(Variable {
                 name: rel_var.to_string(),
                 span,
             })],
-            distinct: false,
+            distinct: true,
             span,
         }),
         alias: Some(count_alias.clone()),
