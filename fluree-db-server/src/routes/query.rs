@@ -8,30 +8,80 @@
 
 use crate::config::ServerRole;
 use crate::error::{Result, ServerError};
-use crate::extract::{tracking_headers, FlureeHeaders, MaybeCredential, MaybeDataBearer};
+use crate::extract::{FlureeHeaders, MaybeCredential, MaybeDataBearer, tracking_headers};
 // Note: NeedsRefresh is no longer used - replaced by FreshnessSource trait
 use crate::state::AppState;
 use crate::telemetry::{
     create_request_span, extract_request_id, extract_trace_id, log_query_text, set_span_error_code,
     should_log_query_text,
 };
+use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
-use axum::Json;
 use fluree_db_api::dataset::GraphSelector;
 use fluree_db_api::{
     DatasetSpec, FreshnessCheck, FreshnessSource, GraphDb, GraphSource, LedgerState,
-    QueryExecutionOptions, TimeSpec, TrackingTally,
+    QueryExecutionOptions, RefreshOpts, TimeSpec, TrackingTally,
 };
 use serde::Deserialize;
 use serde_json::Value as JsonValue;
-use std::sync::atomic::Ordering;
+use std::collections::BTreeSet;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use tracing::Instrument;
 
 fn query_execution_options(state: &AppState) -> QueryExecutionOptions {
     crate::query_control::current_query_execution_options(state.config.query_timeout_ms)
+}
+
+async fn maybe_refresh_ledger_for_query(state: &AppState, ledger_id: &str) {
+    let Some(refresh_ledger_id) = refreshable_ledger_id(ledger_id) else {
+        return;
+    };
+    if !state.mark_query_refresh_due(&refresh_ledger_id) {
+        return;
+    }
+
+    match state
+        .fluree
+        .refresh(&refresh_ledger_id, RefreshOpts::default())
+        .await
+    {
+        Ok(Some(result)) => {
+            tracing::debug!(
+                ledger_id = refresh_ledger_id,
+                t = result.t,
+                action = ?result.action,
+                "query-time ledger refresh completed"
+            );
+        }
+        Ok(None) => {
+            tracing::debug!(
+                ledger_id = refresh_ledger_id,
+                "query-time refresh found no nameservice record"
+            );
+        }
+        Err(error) => {
+            // Query-time refresh is a freshness hint. Preserve availability and
+            // let the normal query path surface any load/parse errors.
+            tracing::warn!(
+                ledger_id = refresh_ledger_id,
+                error = %error,
+                "query-time ledger refresh failed; continuing with cached state"
+            );
+        }
+    }
+}
+
+async fn maybe_refresh_query_ledgers<I>(state: &AppState, ledger_ids: I)
+where
+    I: IntoIterator<Item = String>,
+{
+    let ledgers: BTreeSet<String> = ledger_ids.into_iter().filter(|id| !id.is_empty()).collect();
+    for ledger_id in ledgers {
+        maybe_refresh_ledger_for_query(state, &ledger_id).await;
+    }
 }
 
 // ============================================================================
@@ -472,6 +522,10 @@ pub async fn query(
                     }
                 }
             }
+        }
+
+        if let Ok(ledger_ids) = fluree_db_api::sparql_dataset_ledger_ids(&sparql) {
+            maybe_refresh_query_ledgers(state.as_ref(), ledger_ids).await;
         }
 
         // AgentJson: connection-scoped SPARQL with agent-optimized envelope
@@ -1275,6 +1329,31 @@ fn base_ledger_id(s: &str) -> Result<String> {
     Ok(base)
 }
 
+fn refreshable_ledger_id(s: &str) -> Option<String> {
+    if matches!(s, "default" | "txn-meta") || s.contains("://") || s.starts_with("urn:") {
+        return None;
+    }
+    let (no_frag, _frag) = split_graph_fragment(s);
+    fluree_db_core::ledger_id::split_time_travel_suffix(no_frag)
+        .ok()
+        .map(|(base, _time)| base)
+        .filter(|base| !base.is_empty())
+}
+
+fn collect_refreshable_jsonld_ledgers(query: &JsonValue) -> Vec<String> {
+    let mut raw_ids = Vec::new();
+    if let Some(from) = query.get("from") {
+        collect_ledger_identifiers(from, &mut raw_ids);
+    }
+    if let Some(named) = query.get("fromNamed").or_else(|| query.get("from-named")) {
+        collect_ledger_identifiers(named, &mut raw_ids);
+    }
+    raw_ids
+        .into_iter()
+        .filter_map(|id| refreshable_ledger_id(&id))
+        .collect()
+}
+
 fn looks_like_graph_selector_only(s: &str) -> bool {
     // Ledger IDs typically look like `name:branch` and do NOT include `://`.
     // Graph IRIs commonly include `://` or `urn:` and should be treated as selectors.
@@ -1338,8 +1417,19 @@ fn normalize_ledger_scoped_from(ledger_id: &str, query: &mut JsonValue) -> Resul
 
 #[cfg(test)]
 mod ledger_scoped_from_tests {
-    use super::{normalize_ledger_scoped_from, requires_dataset_features};
+    use super::{normalize_ledger_scoped_from, refreshable_ledger_id, requires_dataset_features};
     use serde_json::json;
+
+    #[test]
+    fn refreshable_ledger_id_strips_time_and_graph_selectors() {
+        assert_eq!(
+            refreshable_ledger_id("books:main@t:42#txn-meta").as_deref(),
+            Some("books:main")
+        );
+        assert_eq!(refreshable_ledger_id("books").as_deref(), Some("books"));
+        assert!(refreshable_ledger_id("txn-meta").is_none());
+        assert!(refreshable_ledger_id("https://example.org/graph").is_none());
+    }
 
     #[test]
     fn normalize_from_txn_meta_string_rewrites_to_object() {
@@ -1821,6 +1911,7 @@ async fn execute_sparql_ledger(
                     fmt.name().to_uppercase()
                 )));
             }
+            maybe_refresh_ledger_for_query(state, ledger_id).await;
             let view = state.fluree.db_with_policy(ledger_id, &qc_opts).await
                 .inspect_err(|_| { set_span_error_code(&span, "error:QueryFailed"); })?;
             let view = attach_default_context_to_graph(state, ledger_id, view, use_default_context)
@@ -2639,6 +2730,8 @@ pub(crate) async fn load_ledger_for_query(
 ) -> Result<LedgerState> {
     let fluree = &state.fluree;
 
+    maybe_refresh_ledger_for_query(state, ledger_id).await;
+
     // Get cached handle (loads if not cached)
     let handle = fluree.ledger_cached(ledger_id).await.map_err(|e| {
         set_span_error_code(span, "error:NotFound");
@@ -2823,6 +2916,8 @@ async fn execute_dataset_query(
         }
     }
 
+    maybe_refresh_query_ledgers(state, collect_refreshable_jsonld_ledgers(&query)).await;
+
     // Delegate the actual execution to the connection-scoped sub-query helper —
     // the same path the multi-query dispatcher uses for each sub-query alias.
     let tracked = has_tracking_opts(&query);
@@ -3004,6 +3099,8 @@ pub async fn multi_query(
                     }
                 }
             }
+
+            maybe_refresh_query_ledgers(state.as_ref(), distinct_ledgers.iter().cloned()).await;
 
             // Per-sub-query identity / default-policy-class injection runs
             // here, not inside the api crate. apply_auth_identity_to_opts

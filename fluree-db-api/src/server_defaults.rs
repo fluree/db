@@ -15,6 +15,8 @@ pub const DEFAULT_LOG_LEVEL: &str = "info";
 pub const DEFAULT_CORS_ENABLED: bool = true;
 pub const DEFAULT_BODY_LIMIT: usize = 52_428_800; // 50 MB
 pub const DEFAULT_QUERY_TIMEOUT_MS: u64 = 15 * 60 * 1000; // 15 minutes
+pub const DEFAULT_QUERY_REFRESH_ENABLED: bool = false;
+pub const DEFAULT_QUERY_REFRESH_TTL_MS: u64 = 1000;
 
 // ── Indexing ────────────────────────────────────────────────────────
 
@@ -361,6 +363,10 @@ pub fn generate_config_template(storage_path_override: Option<&str>) -> String {
 # query_timeout_ms = {query_timeout_ms}  # 15 minutes; set 0 to disable
 # cache_max_mb = 4096                    # global cache budget (MB); default: tiered by RAM (<4GB: 30%, 4-8GB: 40%, >=8GB: 35%)
 
+# [server.query_refresh]
+# enabled = {query_refresh_enabled}            # opt-in nameservice refresh before current-head queries
+# ttl_ms = {query_refresh_ttl_ms}              # minimum interval between refresh checks per ledger per process
+
 # [server.indexing]
 # enabled = {indexing_enabled}                    # disable only when a separate peer/indexer owns indexing for this storage
 # reindex_min_bytes = {reindex_min_bytes}         # {reindex_min_kb} KB — triggers background reindexing
@@ -438,6 +444,8 @@ pub fn generate_config_template(storage_path_override: Option<&str>) -> String {
         cors_enabled = DEFAULT_CORS_ENABLED,
         body_limit = DEFAULT_BODY_LIMIT,
         query_timeout_ms = DEFAULT_QUERY_TIMEOUT_MS,
+        query_refresh_enabled = DEFAULT_QUERY_REFRESH_ENABLED,
+        query_refresh_ttl_ms = DEFAULT_QUERY_REFRESH_TTL_MS,
         indexing_enabled = DEFAULT_INDEXING_ENABLED,
         reindex_min_bytes = DEFAULT_REINDEX_MIN_BYTES,
         reindex_min_kb = DEFAULT_REINDEX_MIN_BYTES / 1000,
@@ -476,6 +484,10 @@ pub fn generate_jsonld_config_template(storage_path_override: Option<&str>) -> S
             "cors_enabled": DEFAULT_CORS_ENABLED,
             "body_limit": DEFAULT_BODY_LIMIT,
             "query_timeout_ms": DEFAULT_QUERY_TIMEOUT_MS,
+            "query_refresh": {
+                "enabled": DEFAULT_QUERY_REFRESH_ENABLED,
+                "ttl_ms": DEFAULT_QUERY_REFRESH_TTL_MS
+            },
             "indexing": {
                 "enabled": DEFAULT_INDEXING_ENABLED,
                 "reindex_min_bytes": DEFAULT_REINDEX_MIN_BYTES,

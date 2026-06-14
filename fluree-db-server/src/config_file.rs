@@ -64,6 +64,10 @@ pub struct ServerFileConfig {
     pub query_timeout_ms: Option<u64>,
     pub cache_max_mb: Option<usize>,
 
+    /// `[server.query_refresh]`
+    #[serde(default)]
+    pub query_refresh: Option<QueryRefreshFileConfig>,
+
     /// `[server.indexing]`
     #[serde(default)]
     pub indexing: Option<IndexingFileConfig>,
@@ -90,6 +94,12 @@ pub struct IndexingFileConfig {
     pub enabled: Option<bool>,
     pub reindex_min_bytes: Option<usize>,
     pub reindex_max_bytes: Option<usize>,
+}
+
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
+pub struct QueryRefreshFileConfig {
+    pub enabled: Option<bool>,
+    pub ttl_ms: Option<u64>,
 }
 
 #[derive(Debug, Default, Clone, Deserialize, Serialize)]
@@ -377,6 +387,8 @@ pub const CONFIG_FILE_ARG_IDS: &[&str] = &[
     "cors_enabled",
     "body_limit",
     "query_timeout_ms",
+    "query_refresh_enabled",
+    "query_refresh_ttl_ms",
     "cache_max_mb",
     "indexing_enabled",
     "reindex_min_bytes",
@@ -489,6 +501,20 @@ pub fn apply_to_server_config(
     if is_default("cache_max_mb") {
         if let Some(v) = file.cache_max_mb {
             config.cache_max_mb = Some(v);
+        }
+    }
+
+    // --- Query-time refresh ---
+    if let Some(ref refresh) = file.query_refresh {
+        if is_default("query_refresh_enabled") {
+            if let Some(v) = refresh.enabled {
+                config.query_refresh_enabled = v;
+            }
+        }
+        if is_default("query_refresh_ttl_ms") {
+            if let Some(v) = refresh.ttl_ms {
+                config.query_refresh_ttl_ms = v;
+            }
         }
     }
 
@@ -892,6 +918,10 @@ log_level = "debug"
 cors_enabled = false
 cache_max_mb = 5000
 
+[server.query_refresh]
+enabled = true
+ttl_ms = 200
+
 [server.indexing]
 enabled = true
 reindex_min_bytes = 200000
@@ -913,6 +943,10 @@ default_policy_class = "ex:DefaultPolicy"
         assert_eq!(server.log_level.as_deref(), Some("debug"));
         assert_eq!(server.cors_enabled, Some(false));
         assert_eq!(server.cache_max_mb, Some(5000));
+
+        let refresh = server.query_refresh.unwrap();
+        assert_eq!(refresh.enabled, Some(true));
+        assert_eq!(refresh.ttl_ms, Some(200));
 
         let idx = server.indexing.unwrap();
         assert_eq!(idx.enabled, Some(true));

@@ -220,7 +220,9 @@ Reader Lambda:
 
 **HTTP API:**
 
-The HTTP query endpoint does not yet expose `min_t` directly. For HTTP clients, use the SSE events endpoint (`GET /v1/fluree/events`) to receive real-time commit notifications, or poll the ledger info endpoint until the desired `t` is reached.
+The HTTP query endpoint does not yet expose `min_t` directly. For HTTP clients that need a hard read-after-write guarantee for a specific transaction, use the SSE events endpoint (`GET /v1/fluree/events`) to receive real-time commit notifications, or poll the ledger info endpoint until the desired `t` is reached.
+
+Long-running HTTP query servers can also enable TTL-gated query-time refresh with `--query-refresh-enabled` and `--query-refresh-ttl-ms`. This makes the server call `refresh()` on demand before current-head queries, after that ledger's TTL window expires, so warm caches observe nameservice advances without checking DynamoDB on every request. The first query in a new TTL window pays the nameservice round-trip; idle ledgers are not refreshed. The TTL bounds ordinary staleness, but it is not a substitute for `min_t` when a client must prove it has observed a specific transaction.
 
 ### Rust API
 

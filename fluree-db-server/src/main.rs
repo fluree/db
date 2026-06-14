@@ -4,9 +4,9 @@
 
 use clap::{CommandFactory, FromArgMatches};
 use fluree_db_server::{
-    config_file::{config_error_is_fatal, load_and_merge_config},
-    telemetry::{init_logging, shutdown_tracer, TelemetryConfig},
     FlureeServer, ServerConfig,
+    config_file::{config_error_is_fatal, load_and_merge_config},
+    telemetry::{TelemetryConfig, init_logging, shutdown_tracer},
 };
 
 #[tokio::main]
@@ -40,6 +40,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         log_level = %config.log_level,
         cors = config.cors_enabled,
         indexing = config.indexing_enabled,
+        query_refresh_enabled = config.query_refresh_enabled,
+        query_refresh_ttl_ms = config.query_refresh_ttl_ms,
         reindex_min_bytes = config.reindex_min_bytes,
         reindex_max_bytes = config.reindex_max_bytes,
         events_auth_mode = ?config.events_auth_mode,

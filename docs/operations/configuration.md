@@ -40,6 +40,10 @@ log_level = "info"
 query_timeout_ms = 900000  # 15 minutes; set to 0 to disable
 # cache_max_mb = 4096  # global cache budget (MB); default: tiered by RAM (<4GB: 30%, 4-8GB: 40%, >=8GB: 35%)
 
+[server.query_refresh]
+enabled = false
+ttl_ms = 1000
+
 [server.indexing]
 enabled = true
 reindex_min_bytes = 100000
@@ -311,6 +315,27 @@ operators can stop at the next checkpoint.
 | Flag                 | Env Var                    | Default                  |
 | -------------------- | -------------------------- | ------------------------ |
 | `--query-timeout-ms` | `FLUREE_QUERY_TIMEOUT_MS`  | `900000` (15 minutes)    |
+
+### Query-Time Refresh
+
+Long-running query servers can opt in to a bounded nameservice freshness check before current-head queries. When enabled, the server calls the same `Fluree::refresh()` API used by serverless query handlers, but gates the call by a per-process, per-ledger TTL so high-QPS traffic does not check DynamoDB on every request.
+
+This is demand-driven, not a background poller: the first current-head query for a ledger after its TTL window expires pays the nameservice round-trip, and idle ledgers are not refreshed.
+
+This is useful for split deployments where writers update a shared DynamoDB nameservice but query servers do not subscribe to a transaction server's SSE event stream.
+
+| Flag | Env Var | Default | Description |
+| ---- | ------- | ------- | ----------- |
+| `--query-refresh-enabled` | `FLUREE_QUERY_REFRESH_ENABLED` | `false` | Enable TTL-gated nameservice refresh before current-head query execution |
+| `--query-refresh-ttl-ms` | `FLUREE_QUERY_REFRESH_TTL_MS` | `1000` | Minimum interval between refresh checks for the same ledger in one server process; set `0` to check every request |
+
+Config file equivalent:
+
+```toml
+[server.query_refresh]
+enabled = true
+ttl_ms = 200
+```
 
 ### Log Level
 
@@ -790,6 +815,8 @@ fluree server run \
 | `FLUREE_CACHE_MAX_MB`                   | Global cache budget (MB)                        | Tiered by RAM: `<4GB: 30%, 4-8GB: 40%, >=8GB: 35%`                                                     |
 | `FLUREE_BODY_LIMIT`                     | Max request body bytes                          | `52428800`                                                              |
 | `FLUREE_QUERY_TIMEOUT_MS`               | Max query execution time in milliseconds (`0` disables) | `900000`                                                     |
+| `FLUREE_QUERY_REFRESH_ENABLED`          | Enable TTL-gated nameservice refresh before current-head queries | `false`                                                       |
+| `FLUREE_QUERY_REFRESH_TTL_MS`           | Query-time refresh interval per ledger per process (`0` checks every request) | `1000`                                           |
 | `FLUREE_LOG_LEVEL`                      | Log level                                       | `info`                                                                  |
 | `FLUREE_SERVER_ROLE`                    | Server role                                     | `transaction`                                                           |
 | `FLUREE_TX_SERVER_URL`                  | Transaction server URL                          | None                                                                    |
