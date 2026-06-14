@@ -1016,6 +1016,108 @@ async fn seed_knows_chain(
 }
 
 #[tokio::test]
+async fn cypher_collect_gathers_values_into_list() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/cypher:collect");
+    let l = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": ctx(),
+                "@graph": [
+                    {"@id": "ex:alice", "@type": "ex:Person", "ex:name": "Alice",
+                     "ex:KNOWS": [{"@id": "ex:bob"}, {"@id": "ex:carol"}, {"@id": "ex:dave"}]},
+                    {"@id": "ex:bob",   "@type": "ex:Person", "ex:name": "Bob"},
+                    {"@id": "ex:carol", "@type": "ex:Person", "ex:name": "Carol"},
+                    {"@id": "ex:dave",  "@type": "ex:Person", "ex:name": "Dave"},
+                ]
+            }),
+        )
+        .await
+        .expect("seed")
+        .ledger;
+    let db = graphdb_from_ledger(&l);
+
+    let result = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (a:Person {name: "Alice"})-[:KNOWS]->(f) RETURN collect(f.name) AS friends"#,
+        )
+        .await
+        .expect("collect");
+    // collect groups all of Alice's friends into a single row.
+    assert_eq!(result.row_count(), 1, "one grouped row");
+
+    let jsonld = result
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    // Shape: rows[0][col0] is the collected list.
+    let list = jsonld[0][0]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected a list column, got {jsonld}"));
+    let mut names: Vec<&str> = list.iter().filter_map(|v| v.as_str()).collect();
+    names.sort_unstable();
+    assert_eq!(names, ["Bob", "Carol", "Dave"], "collected friend names");
+}
+
+#[tokio::test]
+async fn cypher_collect_distinct_dedupes() {
+    // Two friends share the name "Bob"; collect(DISTINCT) keeps one.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/cypher:collect-distinct");
+    let l = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": ctx(),
+                "@graph": [
+                    {"@id": "ex:alice", "@type": "ex:Person", "ex:name": "Alice",
+                     "ex:KNOWS": [{"@id": "ex:bob"}, {"@id": "ex:bob2"}]},
+                    {"@id": "ex:bob",  "@type": "ex:Person", "ex:name": "Bob"},
+                    {"@id": "ex:bob2", "@type": "ex:Person", "ex:name": "Bob"},
+                ]
+            }),
+        )
+        .await
+        .expect("seed")
+        .ledger;
+    let db = graphdb_from_ledger(&l);
+
+    let plain = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (a:Person {name: "Alice"})-[:KNOWS]->(f) RETURN collect(f.name) AS names"#,
+        )
+        .await
+        .expect("collect")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    assert_eq!(
+        plain[0][0].as_array().map(Vec::len),
+        Some(2),
+        "plain keeps duplicates: {plain}"
+    );
+
+    let distinct = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (a:Person {name: "Alice"})-[:KNOWS]->(f) RETURN collect(DISTINCT f.name) AS names"#,
+        )
+        .await
+        .expect("collect distinct")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    assert_eq!(
+        distinct[0][0].as_array().map(Vec::len),
+        Some(1),
+        "DISTINCT dedupes: {distinct}"
+    );
+}
+
+#[tokio::test]
 async fn cypher_undirected_relationship_matches_both_orientations() {
     // `-[:KNOWS]-` from Bob finds Alice (reverse: Alice KNOWS Bob, via Opst)
     // and Carol (forward: Bob KNOWS Carol).

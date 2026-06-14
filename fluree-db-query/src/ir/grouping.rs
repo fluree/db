@@ -65,6 +65,11 @@ pub enum AggregateFn {
     },
     /// `SAMPLE(?x)` — an arbitrary value; DISTINCT is a no-op.
     Sample(VarId),
+    /// `collect(?x)` / `collect(DISTINCT ?x)` (Cypher) — gather every
+    /// non-Unbound value of a variable into a list. Produces a
+    /// `Binding::Grouped` (the list carrier the JSON-LD formatter already
+    /// renders as a JSON array). No SPARQL surface; lowered only from Cypher.
+    Collect(VarId, InputSemantics),
 }
 
 impl AggregateFn {
@@ -82,7 +87,8 @@ impl AggregateFn {
             | Self::Median(v, _)
             | Self::Variance(v, _)
             | Self::Stddev(v, _)
-            | Self::Sample(v) => Some(*v),
+            | Self::Sample(v)
+            | Self::Collect(v, _) => Some(*v),
             Self::GroupConcat { input, .. } => Some(*input),
         }
     }
@@ -105,6 +111,7 @@ impl AggregateFn {
                     semantics: InputSemantics::Set,
                     ..
                 }
+                | Self::Collect(_, InputSemantics::Set)
         )
     }
 }
@@ -128,7 +135,8 @@ impl AggregateFn {
             | Self::Median(v, _)
             | Self::Variance(v, _)
             | Self::Stddev(v, _)
-            | Self::Sample(v) => rename(v),
+            | Self::Sample(v)
+            | Self::Collect(v, _) => rename(v),
             Self::GroupConcat { input, .. } => rename(input),
         }
     }

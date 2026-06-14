@@ -53,7 +53,7 @@ DELETE/INSERT templates sharing variable ids via the shared
 | Untyped / alternation / property-filtered relationships in a **write** MATCH | Write MATCH supports directed single-typed relationships, anonymous or named (named binds `r` for `SET r.prop`). Untyped (`-[r]->`), alternation (`-[:A\|B]->`), and inline relationship property filters in a write MATCH are still deferred. |
 | Map/object `$param` values; nested collections; whole-map node params (`(n $props)`) | v1 supports scalar and flat-list params only; object params and array-of-maps are rejected with a clear error. Whole-map node-property params need a map-valued `Expr` the AST doesn't carry yet. |
 | HTTP tracking (reads) / delimited / agent-json for Cypher | The Cypher HTTP routes return JSON-LD only and don't negotiate delimited (TSV/CSV) or agent-json output, and read-side tracking isn't surfaced yet. **Policy/identity enforcement IS applied** (resolved identity + header policy fields → `wrap_policy` on reads, `PolicyContext` on writes), and write-side tracking headers are honored. Remaining gap is output-format negotiation + read tracking. |
-| Variable-length paths, path values, `shortestPath`, `collect()`/list values, reflection (`labels/type/keys/properties/id`), undirected, bare `(n)`, `LOAD CSV`, `FOREACH`, `CALL proc`, schema DDL, multi-statement | Per the original plan's deferral list below (engine work or product decisions). |
+| Path values, `shortestPath`, list-*consuming* functions (`head/tail/size`), reflection (`labels/type/keys/properties/id`), bare `(n)`, `LOAD CSV`, `FOREACH`, `CALL proc`, schema DDL, multi-statement | Per the original plan's deferral list below (engine work or product decisions). Undirected, variable-length paths, and `collect()` have since landed (see status table). |
 
 ---
 
@@ -489,7 +489,7 @@ standard solution modifiers and a conservative expression sublanguage.**
 | `RETURN DISTINCT` | ✅ | Set semantics. |
 | `RETURN ... AS alias` | ✅ | Existing projection alias support. |
 | `RETURN count(*) / count(x) / sum(x) / avg(x) / min(x) / max(x)` | ✅ | Existing aggregate operators. |
-| `RETURN collect(x)` | ❌ | Deferred — needs list-valued binding/result formatting, not just GROUP_CONCAT. |
+| `RETURN collect(x)` / `collect(DISTINCT x)` | ✅ | `AggregateFn::Collect` gathers non-null values into a list (Cypher semantics: nulls dropped, empty → `[]`). Carried as a `Binding::Grouped`, which the JSON-LD formatter renders as a JSON array (v1 Cypher output is JSON-LD). `head/tail/size/reverse` over the list still deferred. |
 | `ORDER BY / SKIP / LIMIT` | ✅ | Existing modifiers. |
 | `UNION` / `UNION ALL` | ✅ | Lowers to existing `Union` pattern. |
 | `CALL { subquery }` (read-only) | ✅ | Lowers to `Subquery`. |
@@ -556,9 +556,10 @@ labels/properties, predicate-name reverse lookup) is deferred.
 
 - `XOR` — no direct IR variant; users write `(a OR b) AND NOT (a AND b)`.
 - `%` modulus, `^` exponent — pending IR confirmation.
-- `collect(x)` — needs list-valued bindings and result formatting.
-- `head, tail, size, reverse, range` and other list functions — no
-  list-value type in the result row format yet.
+- `head, tail, size, reverse, range` and other list functions — these
+  consume a list value; `collect(x)` now produces one (carried as
+  `Binding::Grouped`), but list-*consuming* functions still need
+  expression-language support over the list carrier.
 - `labels(n)`, `keys(n)`, `properties(n)`, `type(r)` — dynamic
   reflection over a node/relationship's facts; needs snapshot-time
   lookup expressions.

@@ -435,7 +435,7 @@ fn expression_references_any(
 fn is_aggregate(name: &str) -> bool {
     matches!(
         name.to_ascii_lowercase().as_str(),
-        "count" | "sum" | "avg" | "min" | "max"
+        "count" | "sum" | "avg" | "min" | "max" | "collect"
     )
 }
 
@@ -458,6 +458,7 @@ fn build_aggregate_fn(name: &str, distinct: bool, input_var: Option<VarId>) -> R
         ("avg", Some(v)) => AggregateFn::Avg(v, semantics),
         ("min", Some(v)) => AggregateFn::Min(v),
         ("max", Some(v)) => AggregateFn::Max(v),
+        ("collect", Some(v)) => AggregateFn::Collect(v, semantics),
         // sum/avg/min/max without an argument is already rejected in
         // aggregate_input_var; this arm is unreachable in practice.
         (other, _) => {

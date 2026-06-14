@@ -229,7 +229,8 @@ impl AggState {
             AggregateFn::Median { .. }
             | AggregateFn::Variance { .. }
             | AggregateFn::Stddev { .. }
-            | AggregateFn::GroupConcat { .. } => AggState::Collect { values: Vec::new() },
+            | AggregateFn::GroupConcat { .. }
+            | AggregateFn::Collect(..) => AggState::Collect { values: Vec::new() },
             // SAMPLE is explicitly arbitrary in SPARQL; we pick the first observed value.
             AggregateFn::Sample(_) => AggState::Sample { sample: None },
         }
@@ -637,7 +638,8 @@ impl GroupAggregateOperator {
             AggregateFn::Median { .. }
             | AggregateFn::Variance { .. }
             | AggregateFn::Stddev { .. }
-            | AggregateFn::GroupConcat { .. } => false,
+            | AggregateFn::GroupConcat { .. }
+            | AggregateFn::Collect(..) => false,
         })
     }
 
