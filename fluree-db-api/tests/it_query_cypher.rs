@@ -598,6 +598,63 @@ async fn transact_cypher_unwind_map_param_batches_edge_inserts() {
 }
 
 #[tokio::test]
+async fn transact_cypher_unwind_edge_with_property_batches() {
+    // Edge batch carrying a per-row edge property: `p.d` is a VALUES-bound
+    // column used in the relationship property map. The edge reifies, and each
+    // row's reifier is a distinct (per-solution) blank node — so the two edges
+    // get distinct `since` values without colliding.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = seed_nodes_with_ids(&fluree, "it/cypher:unwind-edge-props").await;
+
+    let params = json!({
+        "pairs": [
+            {"from": 1, "to": 2, "d": 2020},
+            {"from": 2, "to": 3, "d": 2021},
+        ]
+    });
+    let result = fluree
+        .transact_cypher_with_params(
+            l,
+            "UNWIND $pairs AS p MATCH (a:Person {id: p.from}), (b:Person {id: p.to}) \
+             CREATE (a)-[:KNOWS {since: p.d}]->(b)",
+            params.as_object(),
+        )
+        .await
+        .expect("edge-with-property batch");
+
+    let db = graphdb_from_ledger(&result.ledger);
+    // Two reified edges (named read sees reified edges).
+    assert_eq!(
+        fluree
+            .query_cypher(&db, "MATCH (a)-[r:KNOWS]->(b) RETURN r")
+            .await
+            .expect("edges")
+            .row_count(),
+        2,
+        "two reified KNOWS edges"
+    );
+    // Each edge carries its own `since` — proving distinct per-row reifiers.
+    assert_eq!(
+        fluree
+            .query_cypher(&db, "MATCH (a)-[r:KNOWS {since: 2020}]->(b) RETURN r")
+            .await
+            .expect("2020")
+            .row_count(),
+        1,
+        "the 1->2 edge carries since=2020"
+    );
+    assert_eq!(
+        fluree
+            .query_cypher(&db, "MATCH (a)-[r:KNOWS {since: 2021}]->(b) RETURN r")
+            .await
+            .expect("2021")
+            .row_count(),
+        1,
+        "the 2->3 edge carries since=2021"
+    );
+}
+
+#[tokio::test]
 async fn transact_cypher_unwind_edge_missing_id_drops_only_that_row() {
     // A row whose endpoint id matches nothing drops only itself — the rest of
     // the batch still commits (the value of the VALUES-join model over a

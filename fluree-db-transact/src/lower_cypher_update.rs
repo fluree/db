@@ -1038,14 +1038,15 @@ impl<'a> CypherLowering<'a> {
         Ok(())
     }
 
-    fn expr_to_object(&self, e: &Expr) -> Result<TemplateTerm, LowerCypherError> {
+    fn expr_to_object(&mut self, e: &Expr) -> Result<TemplateTerm, LowerCypherError> {
         match e {
             Expr::Lit(lit) => Ok(TemplateTerm::Value(lower_literal_value(lit)?)),
-            Expr::Var(_) => Err(LowerCypherError::unsupported(
-                "variable references in CREATE property maps are deferred (requires WHERE-driven templates)",
-            )),
+            // A WHERE-bound variable (e.g. a desugared `row.field` VALUES
+            // column, or a MATCH-bound value) fires the property template per
+            // solution. Unbound on a given row → that flake is skipped.
+            Expr::Var(v) => Ok(self.var_term(&v.name)),
             _ => Err(LowerCypherError::unsupported(
-                "CREATE property values must be literals in v1",
+                "CREATE property values must be literals or bound variables in v1",
             )),
         }
     }

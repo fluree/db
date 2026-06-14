@@ -62,6 +62,16 @@ pub struct FlakeGenerator<'a> {
     /// graph Sid for `Flake::new_in_graph()`. Graph IDs 0 (default) and 1 (txn-meta)
     /// are reserved and should not appear in this map.
     graph_sids: HashMap<u16, Sid>,
+
+    /// Global index of the first WHERE solution in the current batch.
+    ///
+    /// Per SPARQL 1.1 Update §3.1.3, blank nodes in INSERT templates are
+    /// instantiated **fresh per solution**. Skolemization folds in
+    /// `solution_base + row` so each solution mints distinct blank nodes
+    /// (while the same label within one solution stays the same node). The
+    /// streaming driver sets this before generating each batch. Defaults to 0
+    /// (the no-WHERE single-solution case).
+    solution_base: u64,
 }
 
 impl<'a> FlakeGenerator<'a> {
@@ -77,7 +87,16 @@ impl<'a> FlakeGenerator<'a> {
             ns_registry,
             txn_id,
             graph_sids: HashMap::new(),
+            solution_base: 0,
         }
+    }
+
+    /// Set the global solution index of the next batch's first row, so blank
+    /// nodes skolemize fresh per WHERE solution (SPARQL 1.1 Update §3.1.3).
+    /// Call once per batch, before generating its retractions/assertions, with
+    /// the cumulative count of solution rows already processed.
+    pub fn set_solution_base(&mut self, base: u64) {
+        self.solution_base = base;
     }
 
     /// Set the graph Sid mapping for named graph support.
@@ -262,7 +281,8 @@ impl<'a> FlakeGenerator<'a> {
                 }
             }
             TemplateTerm::BlankNode(label) => {
-                let sid = self.skolemize_blank_node(label);
+                let solution = self.solution_base + row as u64;
+                let sid = self.skolemize_blank_node(label, solution);
                 Ok(Some(sid))
             }
             TemplateTerm::Value(_) => Err(TransactError::InvalidTerm(
@@ -375,21 +395,22 @@ impl<'a> FlakeGenerator<'a> {
                 }
             }
             TemplateTerm::BlankNode(label) => {
-                let sid = self.skolemize_blank_node(label);
+                let solution = self.solution_base + row as u64;
+                let sid = self.skolemize_blank_node(label, solution);
                 Ok((Some(FlakeValue::Ref(sid)), Some(DT_ID.clone())))
             }
         }
     }
 
-    /// Skolemize a blank node to a Sid
+    /// Skolemize a blank node to a Sid.
     ///
-    /// Creates a unique Sid for a blank node label within this transaction.
-    /// The format is: `_:fdb-{txn_id}-{label}` where label is the user's
-    /// blank node identifier stripped of the `_:` prefix.
-    fn skolemize_blank_node(&mut self, label: &str) -> Sid {
+    /// Creates a unique Sid for a blank node label within this transaction and
+    /// WHERE solution. The key is `{txn_id}-{solution}-{label}`: folding in the
+    /// solution index makes blank nodes fresh per solution (SPARQL 1.1 Update
+    /// §3.1.3), while the same label within one solution maps to one node.
+    fn skolemize_blank_node(&mut self, label: &str, solution: u64) -> Sid {
         let local = label.trim_start_matches("_:");
-        // Combine txn_id and local label to create a unique ID
-        let unique_id = format!("{}-{}", self.txn_id, local);
+        let unique_id = format!("{}-{solution}-{local}", self.txn_id);
         self.ns_registry.blank_node_sid(&unique_id)
     }
 }

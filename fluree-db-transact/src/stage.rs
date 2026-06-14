@@ -1522,6 +1522,10 @@ async fn stream_where_into_accumulator(
     let mut assertion_count: usize = 0;
 
     while let Some(batch) = cursor.next_batch().await.map_err(TransactError::Query)? {
+        // Blank nodes in INSERT templates are fresh per WHERE solution
+        // (SPARQL 1.1 Update §3.1.3); give this batch its global solution
+        // offset so retractions and assertions of the same row agree.
+        generator.set_solution_base(total_binding_rows);
         total_binding_rows += batch.len() as u64;
 
         // Per-batch shape: project → materialize in place → generate →
