@@ -447,6 +447,15 @@ async fn update_local(
             .await;
         }
 
+        // Cypher needs an explicit ledger; the connection-scoped endpoint
+        // can't resolve one — direct callers at the ledger-scoped route.
+        if headers.is_cypher_query() {
+            set_span_error_code(&span, "error:BadRequest");
+            return Err(ServerError::bad_request(
+                "Cypher writes must target a ledger; use the /v1/fluree/update/<ledger> endpoint.",
+            ));
+        }
+
         // Update does not accept Turtle/TriG. Use /insert or /upsert.
         if credential.is_turtle_or_trig() {
             set_span_error_code(&span, "error:BadRequest");
@@ -589,6 +598,21 @@ async fn update_ledger_local(
                 &credential,
                 &span,
                 bearer.as_ref(),
+            )
+            .await;
+        }
+
+        // Cypher write (Content-Type: application/cypher) — ledger from path.
+        if headers.is_cypher_query() {
+            tracing::info!(status = "start", format = "cypher", "Cypher write request received");
+            let cypher = credential.body_string()?;
+            return execute_cypher_transact(
+                &state,
+                &ledger,
+                &cypher,
+                bearer.as_ref(),
+                &credential,
+                &span,
             )
             .await;
         }
@@ -1668,7 +1692,77 @@ async fn execute_turtle_transaction(
     .await
 }
 
-// ===== SPARQL UPDATE execution =====
+// ===== Cypher / SPARQL UPDATE execution =====
+
+/// Execute a Cypher write statement (CREATE, SET, REMOVE) against a ledger.
+///
+/// Goes through the same cached-handle commit path as SPARQL UPDATE
+/// (`ledger_cached` plus `stage(&handle)`) so the in-memory ledger cache stays
+/// current, meaning a subsequent read in the same process sees the write. The
+/// Cypher AST is lowered to a `Txn` via the shared `lower_cypher_to_txn`, which
+/// threads the ledger's default context. v1 does a single attempt with no
+/// reconcile/retry loop, so a concurrent-writer conflict surfaces as an error.
+async fn execute_cypher_transact(
+    state: &AppState,
+    ledger_id: &str,
+    cypher: &str,
+    bearer: Option<&crate::extract::DataPrincipal>,
+    credential: &MaybeCredential,
+    span: &tracing::Span,
+) -> Result<Response> {
+    enforce_write_access(state, ledger_id, bearer, credential)?;
+
+    let tx_id = compute_tx_id_sparql(cypher);
+    let handle = state
+        .fluree
+        .ledger_cached(ledger_id)
+        .await
+        .map_err(ServerError::Api)?;
+    let cached_state = handle.snapshot().await;
+    let txn = state
+        .fluree
+        .lower_cypher_to_txn(ledger_id, &cached_state.snapshot, cypher)
+        .await
+        .map_err(|e| {
+            set_span_error_code(span, "error:InvalidTransaction");
+            ServerError::Api(e)
+        })?;
+
+    let mut builder = state.fluree.stage(&handle).txn(txn);
+    if let Some(config) = &state.index_config {
+        builder = builder.index_config(config.clone());
+    }
+    let result = builder.execute().await.map_err(|e| {
+        set_span_error_code(span, "error:InvalidTransaction");
+        ServerError::Api(e)
+    })?;
+
+    tracing::info!(
+        status = "success",
+        format = "cypher",
+        commit_t = result.receipt.t,
+        commit_id = %result.receipt.commit_id,
+        "Cypher write committed"
+    );
+
+    if let Some(tally) = &result.tally {
+        record_tracking_on_span(span, tally);
+    }
+    let response = transact_response(
+        ledger_id.to_string(),
+        result.receipt.t,
+        tx_id,
+        result.receipt.commit_id.to_string(),
+        result.tally.as_ref(),
+    );
+    match &result.tally {
+        Some(tally) => {
+            let hdrs = tracking_headers(tally);
+            Ok((hdrs, Json(response)).into_response())
+        }
+        None => Ok(Json(response).into_response()),
+    }
+}
 
 /// Execute a SPARQL UPDATE request
 ///

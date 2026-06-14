@@ -3308,6 +3308,24 @@ impl Fluree {
         ledger: LedgerState,
         cypher: &str,
     ) -> Result<TransactResult> {
+        let txn = self
+            .lower_cypher_to_txn(ledger.ledger_id(), &ledger.snapshot, cypher)
+            .await?;
+        self.stage_owned(ledger).txn(txn).execute().await
+    }
+
+    /// Parse and lower a Cypher write statement to a `Txn`, resolving bare
+    /// identifiers against the ledger's default context (so writes match the
+    /// read path's IRI mapping). The returned `Txn` carries its own
+    /// `namespace_delta`, so it can be staged against any builder
+    /// (`stage_owned` for the owned-ledger path, or `stage(&handle)` for the
+    /// server's cached-handle path, which keeps the in-memory cache current).
+    pub async fn lower_cypher_to_txn(
+        &self,
+        ledger_id: &str,
+        snapshot: &fluree_db_core::LedgerSnapshot,
+        cypher: &str,
+    ) -> Result<fluree_db_transact::ir::Txn> {
         let out = fluree_db_cypher::parse_cypher(cypher);
         if out.has_errors() {
             let msg = out
@@ -3322,22 +3340,13 @@ impl Fluree {
             .ast
             .ok_or_else(|| ApiError::cypher("Cypher parse returned no AST", Vec::new()))?;
 
-        // Mirror the read path: pull @vocab and term overrides out of
-        // the ledger's default context so write Cypher resolves bare
-        // identifiers the same way `query_cypher` does.
-        //
-        // Two cases legitimately produce no context:
-        //   - `Ok(None)`: the ledger record exists but has no
-        //     `default_context` CID configured.
-        //   - `Err(ApiError::NotFound)`: the ledger has no nameservice
-        //     record yet (genesis / pre-commit). There's nothing to
-        //     load by definition.
-        //
-        // Every other error — CAS read failure, parse error, etc. —
-        // propagates so writes never silently land under the
-        // built-in vocab when a custom context was configured but
-        // couldn't be loaded.
-        let default_context = match self.get_default_context(ledger.ledger_id()).await {
+        // Pull @vocab and term overrides out of the ledger's default context so
+        // write Cypher resolves bare identifiers the same way `query_cypher`
+        // does. `Ok(None)` (no default_context configured) and
+        // `Err(NotFound)` (genesis / no nameservice record yet) both mean "no
+        // context"; every other error propagates so writes never silently land
+        // under the built-in vocab when a custom context couldn't be loaded.
+        let default_context = match self.get_default_context(ledger_id).await {
             Ok(ctx) => ctx,
             Err(ApiError::NotFound(_)) => None,
             Err(e) => return Err(e),
@@ -3349,14 +3358,13 @@ impl Fluree {
             overrides,
         };
 
-        let mut ns = NamespaceRegistry::from_db(&ledger.snapshot);
-        let txn = fluree_db_transact::lower_cypher_update::lower_cypher_update(
+        let mut ns = NamespaceRegistry::from_db(snapshot);
+        Ok(fluree_db_transact::lower_cypher_update::lower_cypher_update(
             &ast,
             &mut ns,
             TxnOpts::default(),
             cypher_opts,
-        )?;
-        self.stage_owned(ledger).txn(txn).execute().await
+        )?)
     }
 
     /// Create a FROM-driven query builder.

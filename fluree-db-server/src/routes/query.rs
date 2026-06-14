@@ -419,6 +419,15 @@ pub async fn query(
         return Err(error);
     }
 
+    // Cypher has no FROM/dataset clause, so the connection-scoped route can't
+    // resolve a ledger — direct callers at the ledger-scoped endpoint.
+    if headers.is_cypher_query() {
+        set_span_error_code(&span, "error:BadRequest");
+        return Err(ServerError::bad_request(
+            "Cypher queries must target a ledger; use the /v1/fluree/query/<ledger> endpoint.",
+        ));
+    }
+
     let delimited = wants_delimited(&headers);
 
     // Handle SPARQL query
@@ -815,6 +824,21 @@ pub async fn query_ledger(
             params.default_context,
         )
             .await;
+    }
+
+    // Handle Cypher query (Content-Type: application/cypher) — ledger is
+    // known from the path. v1 is local-execution only: JSON-LD output, no
+    // delimited/agent-json/tracking negotiation.
+    if headers.is_cypher_query() {
+        if let Some(p) = bearer.0.as_ref() {
+            if !credential.is_signed() && !p.can_read(&ledger) {
+                set_span_error_code(&span, "error:Forbidden");
+                return Err(ServerError::not_found("Ledger not found"));
+            }
+        }
+        let cypher = credential.body_string()?;
+        log_query_text(&cypher, &state.telemetry_config, &span);
+        return execute_cypher_ledger(&state, &ledger, &cypher, &span).await;
     }
 
     // Handle JSON-LD query (JSON body)
@@ -1661,6 +1685,39 @@ async fn execute_query_proxy(
         }
     };
     Ok((HeaderMap::new(), Json(result)).into_response())
+}
+
+/// Execute a Cypher read query against a specific ledger.
+///
+/// v1 server execution mirrors the CLI local path: load the ledger view with
+/// its default context (so bare Cypher identifiers resolve like JSON-LD), run
+/// `query_cypher`, and return JSON-LD. Tracking, delimited output, agent-json,
+/// and identity-scoped policy are not negotiated on this path yet.
+async fn execute_cypher_ledger(
+    state: &AppState,
+    ledger_id: &str,
+    cypher: &str,
+    span: &tracing::Span,
+) -> Result<Response> {
+    let view = state
+        .fluree
+        .db_with_default_context(ledger_id)
+        .await
+        .map_err(ServerError::Api)?;
+    let result = state
+        .fluree
+        .query_cypher(&view, cypher)
+        .await
+        .map_err(|e| {
+            set_span_error_code(span, "error:InvalidQuery");
+            ServerError::Api(e)
+        })?;
+    let json = result
+        .to_jsonld_async(view.as_graph_db_ref())
+        .await
+        .map_err(|e| ServerError::Api(e.into()))?;
+    tracing::info!(status = "success", query_kind = "cypher");
+    Ok((HeaderMap::new(), Json(json)).into_response())
 }
 
 /// Execute a SPARQL query against a specific ledger and return result
