@@ -1,0 +1,1454 @@
+# GQL / Cypher Support — Implementation Plan
+
+Builds on the edge-annotations storage primitive documented at
+[`docs/concepts/edge-annotations.md`](docs/concepts/edge-annotations.md)
+(user-facing semantics) and
+[`docs/design/edge-annotations.md`](docs/design/edge-annotations.md)
+(durable `f:reifies*` encoding, arena, and indexer state machine). An
+LPG edge `(:Person)-[:WORKS_FOR {role:...}]->(:Org)` lowers to a base
+triple plus an `f:reifies*` reifier bundle, identical to what JSON-LD
+`@annotation` and SPARQL 1.2 `{| ... |}` produce.
+
+This plan adds a **property-graph query surface** — initially
+openCypher 9, with a forward path to ISO GQL — on top of the same
+shared IR (`fluree_db_query::ir::Query`) and the same transaction
+staging pipeline (`fluree_db_transact::Txn`) used by JSON-LD and SPARQL.
+
+**Storage is unchanged.** The IR/executor are mostly reused, with two
+narrow exceptions called out in the milestones below: (a) reusing the
+existing `include_system_facts = false` filter for Cypher untyped
+relationship matches, and (b) any new IR variants ride the existing
+operator infrastructure. Anything that would need a new executor
+operator (path enumeration, list-valued aggregates) is deferred.
+
+## Why now
+
+The edge-annotations primitive is the missing piece that makes Cypher
+expressible without forcing users to model relationship-with-properties
+by hand. With JSON-LD `@annotation` and SPARQL `{| ... |}` shipped on
+that primitive, Cypher is the next natural surface to expose — the
+language work is the only remaining track.
+
+## Dialect choice: openCypher 9 first, GQL later
+
+openCypher and ISO GQL are not the same language. They share most of
+their pattern syntax, but they differ on session model, return shape,
+schema DDL, and many surface details:
+
+| Aspect | openCypher 9 (Neo4j-lineage) | ISO GQL (ISO/IEC 39075:2024) |
+|---|---|---|
+| Maturity | 10+ years of ecosystem (drivers, training, examples). | Standard published 2024; ecosystem nascent. |
+| Read core | `MATCH ... WHERE ... RETURN`. | `MATCH ... FILTER ... RETURN` (similar shape). |
+| Write core | `CREATE / MERGE / SET / DELETE / REMOVE`. | `INSERT / UPDATE / DELETE` (different keywords, similar semantics). |
+| Path values | First-class. | First-class. |
+| Schema | Implicit. | Explicit graph types and node/edge types. |
+| Bag semantics | Default. | Default. |
+| Session graphs | Implicit current graph. | First-class session graph / home graph. |
+
+**Decision: v1 implements an openCypher 9 subset.** Rationale: the
+existing ecosystem (Neo4j drivers, awesome-cypher docs, BSBM-style
+benchmarks) and the existence of an openCypher reference grammar
+(`Cypher.g4`) make this the cheaper, more useful first deliverable.
+GQL alignment is a Phase 2 concern — the AST will be structured so that
+adding GQL keyword surfaces (`INSERT` alias for `CREATE`, `FILTER`
+alias for `WHERE`) is parser-only work.
+
+Throughout this plan, "Cypher" means "openCypher 9 subset". When GQL
+diverges materially the difference is called out.
+
+## Frozen contract
+
+The contract this plan implements is:
+
+1. **The edge-annotations user contract** at
+   `docs/concepts/edge-annotations.md` — mode defaults (RDF vs LPG),
+   cascade behavior, empty-annotation semantics, multiplicity rules,
+   parallel-edge requirements, and the deferred/out-of-scope list.
+2. **The durable encoding and arena contract** at
+   `docs/design/edge-annotations.md` — `f:reifies*` bundle shape,
+   reserved-predicate firewall, `EdgeKey` definition, and the
+   forward/reverse attachment indexes that back lookup.
+3. **The multiplicity contract**: a bare `Triple(?s, p, ?o)` returns
+   one row per distinct `(s, p, o)`; binding an annotation variable
+   (or matching a relationship-property body) is what introduces
+   per-occurrence cardinality. Cypher's bag semantics match this rule
+   with one extra lowering choice (below) for the
+   bind-relationship-implicitly case.
+
+Any divergence between Cypher behavior and these contracts is a bug in
+this plan.
+
+## Semantic model — Cypher → Fluree
+
+| Cypher concept | Fluree mapping |
+|---|---|
+| Node `(n:Label)` | Subject with `rdf:type <Label IRI>`. Multiple labels = multiple `rdf:type` triples. |
+| Node `(n {key: val})` | Ordinary triples about `n`. Properties are open-world; no schema check unless SHACL is wired. |
+| Bare `(n)` with no label/prop/relationship constraint | **Rejected in v1** — see "Node existence model" below. |
+| Relationship `-[r:TYPE]->` | Base triple `(start, <TYPE IRI>, end)`. Direction is captured by triple direction. |
+| Relationship properties `-[:T {p: v}]->` | Base triple **plus** an edge-annotation reifier bundle (`f:reifies*` system encoding, see `docs/design/edge-annotations.md`). One annotation SID per relationship occurrence. |
+| Relationship variable `-[r]->` binds | The annotation SID. Only matches relationships that have a reifier bundle — see "Relationship lowering rule" below. |
+| Parallel relationships | Two annotation SIDs attached to the same `(s, p, o)` edge key. Already supported (multimap forward attachment index). |
+| Undirected `-[r]-` | **Rejected in v1.** Users write `-[r]->` or `<-[r]-` explicitly. See Open Questions. |
+| Variable-length `-[r*1..5]->` | **Deferred** — see "Variable-length paths" below. |
+| Path value `p = (a)-[r]->(b)-[r2]->(c)` | First-class path object. **Deferred.** |
+| `RETURN n, r, m` | SELECT projection. Bag semantics by default (no DISTINCT). |
+| `RETURN DISTINCT` | Lower to existing DISTINCT modifier. |
+| `WHERE` predicate | Lower to existing `Filter` patterns. |
+| `WITH ... [WHERE]` | Lower to subquery boundary (correlated subquery in IR). |
+| `UNWIND $list AS x` | Lower to existing list-binding shape. v1 supports parameter-bound lists of scalars or shallow maps; expression-built lists deferred. |
+| `ORDER BY / SKIP / LIMIT` | Existing solution modifiers. |
+| `CREATE (a:Label {p:v})-[:T {q:w}]->(b)` | Insert pipeline: base triples + reifier bundle, identical to JSON-LD `@annotation` inserts. |
+| Bare `CREATE (n)` with no label/prop/relationship | **Rejected in v1** — see "Node existence model" below. |
+| `SET n.prop = expr` | DELETE+INSERT staging on `(n, prop, *)`. See "SET property/relationship boundary" for the precise rule. |
+| `SET n = {p:v}` / `SET n += {p:v}` | Bounded data-property replace/merge — see "SET property/relationship boundary". |
+| `REMOVE n:Label` / `REMOVE n.prop` | DELETE staging. |
+| `DELETE r` | Retract attachment row + cascade owned annotation facts. LPG mode (see `docs/concepts/edge-annotations.md`). |
+| `DELETE n` | See "DELETE / DETACH DELETE in RDF" below — refuses to retract if `n` has any remaining outbound or inbound ref-typed triples. |
+| `DETACH DELETE n` | Retract all ref-typed triples involving `n` (with reifier bundles) plus all triples about `n`. |
+| `MERGE (n:Label {p:v})` | v1 supports single-node-only MERGE; relationship-MERGE deferred — see M5.5. |
+
+### IRI mapping for Cypher identifiers
+
+Cypher labels, relationship types, and property keys are bare
+identifiers (e.g., `Person`, `WORKS_FOR`, `name`). Fluree needs IRIs.
+The mapping is:
+
+1. **Ledger default context wins.** The ledger's `f:context` config
+   (the same context that applies to JSON-LD queries against the
+   same ledger) supplies `@vocab` and named prefixes. A Cypher label
+   `Person` resolves the same way a JSON-LD compact IRI `Person`
+   would: try prefixes first, then `@vocab` fallback.
+2. **Request-envelope override.** When Cypher is sent via the JSON
+   envelope (`{"cypher": "...", "params": {...}, "context": {...}}`),
+   the request `context` field overrides the ledger default for that
+   request only. This mirrors `opts.@context` in JSON-LD transactions.
+3. **Plain-text bodies** (`Content-Type: application/cypher` with a
+   raw query) get the ledger default context. No way to override
+   per-request without the JSON envelope.
+4. **Snake_case to camelCase or kebab-case is not done.** `WORKS_FOR`
+   maps to the IRI `<vocab>WORKS_FOR`, not `<vocab>worksFor`. If the
+   user wants the JSON-LD-style camelCase name, they put that mapping
+   in the context.
+5. **`rdf:type` is the only reserved Cypher → IRI mapping.** Labels
+   become `rdf:type` objects regardless of context.
+6. **Property keys follow the same rules** but use the context's
+   property-position resolution. v1 accepts a single mapping per key;
+   per-position aliasing (term has a different meaning as predicate vs
+   subject) is not exposed through the Cypher surface.
+
+Rejection rules at parse/lower time:
+- Identifier that resolves to no IRI under any rule → clear error.
+- Identifier that resolves to a reserved system predicate (`f:reifies*`
+  family) at lowering time → reject with reserved-predicate firewall
+  message, matching the SPARQL/JSON-LD behavior.
+
+### Node existence model — bare `(n)` is rejected in v1
+
+In Fluree, a node with no labels and no data triples has no facts
+asserted about it. There is no implicit marker fact ("this SID exists
+as a node") today.
+
+Consequences for Cypher:
+- `MATCH (n) RETURN n` is asking for "every node in the graph". In
+  RDF terms, that's "every subject of any triple". v1 rejects this
+  pattern at lower time with a clear error pointing at `MATCH (n:Label)`
+  or `MATCH (n) WHERE ...` as the v1 alternative. Reason: a literal
+  whole-graph subject scan with no predicate constraint is rarely
+  what users want and is expensive enough to be a footgun.
+- `MATCH (n)-[]->()` is fine — the relationship constraint anchors
+  `n`'s lower bound (it must be a subject of some triple).
+- `CREATE (n)` with no labels and no properties is also rejected in
+  v1. It would mint a SID that no query can address, and there's no
+  way to round-trip the result back to the user. Users wanting a
+  bare anonymous node should provide at least one identifying fact
+  (a label or a property).
+- `MATCH (n {prop:val})` (no label, with property) is accepted; the
+  property triple constrains `n`.
+
+A future v1.1 may introduce an explicit node-marker predicate
+(`f:Node` or similar) to support `MATCH (n)` without a whole-graph
+scan, but that is its own design decision and not part of this plan.
+
+### Relationship lowering rule
+
+This is the rule that determines whether a Cypher relationship pattern
+sees plain RDF triples or only annotated ones. It governs the
+"impedance mismatch" between Cypher's LPG worldview and Fluree's
+RDF substrate.
+
+The three input shapes and their lowering targets:
+
+```text
+1. (a)-[:T]->(b)                    (anonymous, no property filter)
+   → Triple(?a, <T>, ?b)
+   Matches ALL base edges with predicate <T>, including those that
+   have no reifier bundle. Set semantics (one row per (s, p, o)) —
+   matches SPARQL's bare-triple pattern.
+
+2. (a)-[r:T]->(b)                   (named, no property filter)
+   → EdgeAnnotation { edge: Triple(?a, <T>, ?b), annotation: ?r,
+                      body: vec![] }
+   Matches ONLY edges that have at least one reifier bundle. ?r
+   binds to the annotation SID. Bag semantics (one row per occurrence,
+   including parallels).
+
+3. (a)-[:T {prop:val}]->(b)         (anonymous OR named, with filter)
+   → EdgeAnnotation { edge: Triple(?a, <T>, ?b),
+                      annotation: fresh non-distinguished Var,
+                      body: vec![Triple(?annotation, prop, val)] }
+   Matches reifier-bundled edges whose annotation body satisfies the
+   filter. Bag semantics.
+```
+
+Trade-off acknowledged: shapes 2 and 3 cannot see plain RDF triples
+without a reifier. A user who writes `MATCH (a)-[r:T]->(b)` against
+non-Cypher-written data will get zero rows even though base triples
+exist. The Cypher docs page will explain this rule explicitly:
+
+> "Binding a relationship variable, or matching on relationship
+> properties, requires the edge to have a reifier. Plain RDF triples
+> inserted via JSON-LD or SPARQL without `@annotation` / `{| |}` are
+> not visible to these patterns. Use the anonymous form
+> `(a)-[:T]->(b)` to match across both worlds at set cardinality."
+
+For LPG-native workflows where all writes come through Cypher (and
+therefore every relationship has a reifier under LPG-default mode),
+the rule is transparent: bag semantics work as Cypher users expect.
+
+### Cardinality summary
+
+| Pattern shape | Cardinality | Sees plain RDF? |
+|---|---|---|
+| `(a)-[:T]->(b)` | Set (one per `(s,p,o)`) | Yes |
+| `(a)-[r:T]->(b)` | Bag (per occurrence) | No |
+| `(a)-[:T {p:v}]->(b)` | Bag (per occurrence) | No |
+| `MATCH ... RETURN DISTINCT a, b` | Set | (irrelevant — DISTINCT) |
+
+### Variable-length paths — deferred
+
+`-[r*1..5]->` is **not in v1**. The existing `PropertyPathPattern`
+operator is reachability/closure-oriented: it answers "does a path
+exist from `a` to `b` via `T*`?" and returns the reachable endpoints.
+It does not enumerate distinct paths, does not produce one row per
+parallel edge along the way, and has no concept of binding a
+relationship-list variable.
+
+Cypher `MATCH (a)-[*1..5]->(b)` semantically requires a
+**path-enumerating operator**: one solution per distinct walk through
+the graph, with multiplicity respecting parallel edges. This is its
+own executor design and is out of scope here.
+
+v1 rejects `-[r*...]->` and `-[*N..M]->` at parse time with a clear
+error pointing users at chained explicit hops or to wait for the
+path-enumeration follow-up.
+
+### LPG mode is the default for Cypher writes
+
+Per `docs/concepts/edge-annotations.md`, `opts.lpgEdgeLifecycle: true`
+is opt-in for JSON-LD/SPARQL and default-on for Cypher imports. The
+Cypher lowering threads this through automatically:
+
+- CREATE without relationship properties still mints an annotation SID
+  (relationship has identity).
+- DELETE on a relationship cascades attachment + owned metadata in
+  LPG mode (matches `MATCH ()-[r]->() DELETE r` semantics).
+- Empty relationship property maps `{}` mint a fresh SID (matching the
+  empty-annotation rule in the concept doc).
+
+Users do not opt into LPG mode for Cypher writes; it is the contract.
+
+### SET property/relationship boundary
+
+Cypher distinguishes node *properties* from *labels* and
+*relationships*. Fluree stores everything as triples, so the lowering
+must decide which triples are in scope for each `SET` shape:
+
+| `SET` shape | Retract scope | Insert |
+|---|---|---|
+| `SET n.prop = expr` | All `(n, <prop>, *)` flakes. | `(n, <prop>, expr-value)`. |
+| `SET r.prop = expr` (r is a reifier SID) | All `(r, <prop>, *)` flakes. | `(r, <prop>, expr-value)`. |
+| `SET n += {p:v, q:w}` | For each key `k` in the map, all `(n, <k>, *)`. | One triple per key. |
+| `SET n = {p:v, q:w}` | **All `(n, ?p, ?o)` where `?o` is a literal AND `?p` is not `rdf:type` AND `?p` is not in the `f:*` reserved namespace.** Then the keys in the map. | One triple per key. |
+| `SET n:NewLabel` | (none — additive) | `(n, rdf:type, <NewLabel>)`. |
+
+The `SET n = {...}` "replace all properties" rule is the tricky one.
+The bounded retract scope ensures we don't:
+- Wipe labels (Cypher's `SET n = {}` keeps labels — match Neo4j).
+- Wipe outbound relationships (a ref-valued triple is a relationship,
+  not a property).
+- Wipe inbound relationships (those have `n` in the object position).
+- Wipe reifier bundles attached to relationships originating from `n`.
+- Wipe `f:*` system facts (config, policy).
+
+Users who want to clear relationships and properties together use
+`DETACH DELETE` then `CREATE`.
+
+### DELETE / DETACH DELETE in RDF
+
+Cypher requires `DELETE n` to fail when `n` has remaining
+relationships. In RDF terms, the staging-time check is:
+
+- A "relationship" is any triple `(n, p, o)` or `(s, p, n)` where the
+  object position is a **ref-typed value** (IRI or blank node, not
+  a literal), and `p` is not `rdf:type`, and `p` is not in the
+  `f:*` system namespace.
+
+If any such triple exists at staging time, `DELETE n` errors with a
+message listing the count of remaining relationships and pointing at
+`DETACH DELETE n`.
+
+`DETACH DELETE n` cascade:
+1. Find all outbound relationship triples for `n` (per above
+   definition). For each, find its reifier bundle (if any) and retract
+   the bundle.
+2. Find all inbound relationship triples for `n`. For each, find its
+   reifier bundle (if any) and retract the bundle.
+3. Retract all triples where `n` is subject or object (covers labels,
+   data properties, both directions of relationships).
+
+This is more work than Neo4j's `DETACH DELETE` (which only sees
+outbound + inbound from the node's adjacency list), but the RDF
+substrate has no adjacency list — we scan SPO and OSP. The cost
+follows the existing index lookup machinery.
+
+### LPG mode is the default for Cypher writes
+
+Per `docs/concepts/edge-annotations.md`, `opts.lpgEdgeLifecycle: true`
+is opt-in for JSON-LD/SPARQL and default-on for Cypher imports. The
+Cypher lowering threads this through automatically:
+
+- CREATE without relationship properties still mints an annotation SID
+  (relationship has identity).
+- DELETE on a relationship cascades attachment + owned metadata in
+  LPG mode (matches `MATCH ()-[r]->() DELETE r` semantics).
+- Empty relationship property maps `{}` mint a fresh SID (matching the
+  empty-annotation rule in the concept doc).
+
+Users do not opt into LPG mode for Cypher writes; it is the contract.
+
+## Architecture
+
+A new sibling crate, `fluree-db-cypher/`, mirroring `fluree-db-sparql`:
+
+```
+fluree-db-cypher/
+  Cargo.toml
+  src/
+    lib.rs           — public surface: parse_cypher, lower_cypher
+    lex/             — winnow lexer; hand-written, same style as SPARQL
+    ast/             — pure AST types; no DB access
+    parse/           — token → AST
+    lower/           — AST → fluree_db_query::ir::Query
+    validate/        — capability-driven rejection of unsupported shapes
+    span.rs          — source spans, identical layout to SPARQL crate
+```
+
+Feature flags identical in shape to `fluree-db-sparql`:
+
+```toml
+[features]
+default = ["lowering"]
+lowering = ["dep:fluree-db-query", "dep:fluree-db-core",
+            "dep:fluree-vocab", "dep:fluree-graph-json-ld"]
+```
+
+Reasons for a separate crate rather than module-inside-sparql:
+
+- **Independent grammar.** Cypher and SPARQL share zero token shapes;
+  one lexer doing both would be a maintenance hazard.
+- **Independent test surface.** Cypher test fixtures want to be next
+  to Cypher source, not pasted into the SPARQL crate.
+- **WASM/Lambda parity.** Same `lowering` feature flag lets future
+  edge deployments include or exclude Cypher independently.
+- **Shared lowering target.** Both crates lower into the same shared
+  IR. There is one execution engine; that doesn't change.
+
+### Where the writes go
+
+Cypher write statements (`CREATE / SET / MERGE / DELETE`) lower into
+`fluree_db_transact::Txn` via a new file:
+
+```
+fluree-db-transact/src/lower_cypher_update.rs
+```
+
+analogous to `lower_sparql_update.rs`. Output staging records (the
+`f:reifies*` bundle for relationships, ordinary triples for node
+properties) are bit-for-bit identical to what the JSON-LD and SPARQL
+paths produce. Cascade, policy, firewall, and reserved-predicate
+machinery from the edge-annotations storage layer cover Cypher writes
+for free.
+
+## Surface — what's in v1
+
+Scope is "useful Cypher subset that round-trips with JSON-LD and SPARQL
+on the edge-annotation primitive". The table below is the contract;
+anything not in this list is **rejected with a clear
+`UnsupportedFeature` error** that names the feature and points at this
+document.
+
+### v1 read surface
+
+The narrowed v1 read surface is: **labeled-or-constrained nodes plus
+directed, typed relationships (with optional property filters), under
+standard solution modifiers and a conservative expression sublanguage.**
+
+| Feature | v1? | Notes |
+|---|---|---|
+| `MATCH (n)` (bare node) | ❌ | Rejected — no node-existence model in v1. See "Node existence model". |
+| `MATCH (n:Label)` | ✅ | One label via `rdf:type`. |
+| `MATCH (n:L1:L2)` | ✅ | AND across labels (multiple `rdf:type` triples). |
+| `MATCH (n {p:v})` | ✅ | Inline property filters; `n` is anchored by the property triple. |
+| `MATCH (a)-[:T]->(b)` | ✅ | Anonymous typed relationship — lowers to plain `Triple`, set semantics, sees plain RDF. |
+| `MATCH (a)-[r:T]->(b)` | ✅ | Named typed relationship — lowers to `EdgeAnnotation`, bag semantics, sees only reified edges. |
+| `MATCH (a)-[r:T {p:v}]->(b)` | ✅ | Relationship property filter — same as above plus body. |
+| `MATCH (a)-[r]->(b)` (untyped) | ✅ | Predicate is a Var. Implicitly filtered to exclude `f:reifies*` and other system predicates (reuses existing `include_system_facts = false`). |
+| `MATCH (a)-[r:T1\|T2]->(b)` | ✅ | Type alternatives via `Union`. |
+| `MATCH (a)<-[r:T]-(b)` | ✅ | Inverse direction (swap subject/object). |
+| `MATCH (a)-[r]-(b)` (undirected) | ❌ | Rejected — users write explicit direction. See Open Q1. |
+| `MATCH (a)-[*...]->(b)` (variable-length) | ❌ | Deferred — needs path-enumerating operator, see "Variable-length paths". |
+| `MATCH p = ...` (path value) | ❌ | Deferred — needs path-value IR. |
+| `OPTIONAL MATCH` | ✅ | Lowers to `Optional`. |
+| `WHERE expr` | ✅ | Conservative expression sublanguage — see "Expressions in v1" below. |
+| `WITH ... AS ...` | ✅ | Lowers to subquery boundary. |
+| `WITH ... WHERE ...` | ✅ | Subquery + outer filter. |
+| `WITH ... ORDER BY / SKIP / LIMIT` | ✅ | Modifiers inside subquery. |
+| `UNWIND $list AS x` | ✅ | Parameter-bound lists of scalars or shallow maps. Expression-built lists deferred. |
+| `UNWIND [literal, ...] AS x` | ✅ | Inline literal list. |
+| `RETURN ...` | ✅ | Default bag semantics. |
+| `RETURN DISTINCT` | ✅ | Set semantics. |
+| `RETURN ... AS alias` | ✅ | Existing projection alias support. |
+| `RETURN count(*) / count(x) / sum(x) / avg(x) / min(x) / max(x)` | ✅ | Existing aggregate operators. |
+| `RETURN collect(x)` | ❌ | Deferred — needs list-valued binding/result formatting, not just GROUP_CONCAT. |
+| `ORDER BY / SKIP / LIMIT` | ✅ | Existing modifiers. |
+| `UNION` / `UNION ALL` | ✅ | Lowers to existing `Union` pattern. |
+| `CALL { subquery }` (read-only) | ✅ | Lowers to `Subquery`. |
+| `CALL procedureName(...)` | ❌ | No procedure namespace yet. Reject. |
+| `shortestPath / allShortestPaths` | ❌ | Deferred — needs path-aware planner extension. |
+| `EXISTS { ... }` | ✅ | Lowers to existing `Exists`. |
+| `CASE ... WHEN ... END` | ✅ | Standard expression. |
+
+### v1 write surface
+
+| Feature | v1? | Notes |
+|---|---|---|
+| `CREATE (n)` (bare, no labels/props) | ❌ | Rejected — see "Node existence model". |
+| `CREATE (n:Label {p:v})` | ✅ | Node creation; at least one label or property required. |
+| `CREATE (a)-[r:T {p:v}]->(b)` | ✅ | Directed typed relationship + annotation. LPG mode default. |
+| `CREATE` chains and patterns | ✅ | `CREATE (a)-[:T]->(b)-[:T2]->(c)`. |
+| `MATCH ... CREATE ...` | ✅ | WHERE-bound bindings drive template. |
+| `MATCH ... SET n.prop = expr` | ✅ | Single-property update (DELETE+INSERT). |
+| `MATCH ... SET r.prop = expr` | ✅ | Relationship-property update (operates on annotation SID). |
+| `MATCH ... SET n += {p:v}` | ✅ | Merge map keys into node — per-key DELETE+INSERT. |
+| `MATCH ... SET n = {p:v}` | ✅ | Bounded replace — see "SET property/relationship boundary". |
+| `MATCH ... SET n:NewLabel` | ✅ | Additive — INSERT `(n, rdf:type, NewLabel)`. |
+| `MATCH ... REMOVE n.prop` | ✅ | DELETE staging on `(n, prop, *)`. |
+| `MATCH ... REMOVE n:Label` | ✅ | DELETE `(n, rdf:type, Label)`. |
+| `MATCH ... DELETE r` | ✅ | Retract attachment + cascade owned annotation facts (LPG mode). |
+| `MATCH ... DELETE n` | ✅ | Reject if `n` has remaining relationships — see "DELETE / DETACH DELETE in RDF". |
+| `MATCH ... DETACH DELETE n` | ✅ | Cascade all relationships + node. |
+| `MERGE (n:Label {p:v})` | ✅ | Single-node MERGE only in v1; see M5.5. |
+| `MERGE` with `ON CREATE SET` / `ON MATCH SET` | ✅ | For the single-node form. |
+| `MERGE (a)-[:T]->(b)` (relationship MERGE) | ❌ | Deferred to v1.1 — see M5.5. |
+| `LOAD CSV` | ❌ | Out of scope; use the existing import pipeline. |
+| `FOREACH` | ❌ | Imperative; deferred. |
+| Multi-statement scripts (`;`-separated) | ❌ | v1 = one statement per request, matching existing transact endpoint contract. |
+| Schema DDL (`CREATE INDEX / CREATE CONSTRAINT`) | ❌ | Fluree's schema lives in SHACL config graph; mapping is its own decision. |
+
+### Cypher expressions in v1
+
+The expression sublanguage is intentionally conservative: only Cypher
+operators and functions that map cleanly to an existing
+`fluree_db_query::ir::Expression` variant are in v1. Anything that
+would need new IR (list-valued bindings, dynamic introspection of node
+labels/properties, predicate-name reverse lookup) is deferred.
+
+**Included** (each maps to an existing IR variant):
+
+- Comparison: `=, <>, <, <=, >, >=`
+- Boolean: `AND, OR, NOT`
+- Arithmetic: `+, -, *, /` (the operators the IR already exposes;
+  `%` modulus and `^` exponent are deferred pending IR/op support
+  confirmation)
+- String: `STARTS WITH, ENDS WITH, CONTAINS`, string `+` concat
+- Null tests: `IS NULL, IS NOT NULL`
+- List membership: `IN` over inline literal lists or
+  parameter-bound scalar lists
+- `coalesce(...)`, `length(string)`, `toString(...)`, `toInteger(...)`,
+  `toFloat(...)`, `abs(...)` — these map directly to existing
+  scalar expression variants
+- Aggregations that already exist: `count(*)`, `count(x)`, `sum(x)`,
+  `avg(x)`, `min(x)`, `max(x)`
+- `CASE ... WHEN ... THEN ... ELSE ... END`
+- Parameter references: `$name` (literal substitution at lower time)
+
+**Deferred** (each would need new IR or runtime work):
+
+- `XOR` — no direct IR variant; users write `(a OR b) AND NOT (a AND b)`.
+- `%` modulus, `^` exponent — pending IR confirmation.
+- `collect(x)` — needs list-valued bindings and result formatting.
+- `head, tail, size, reverse, range` and other list functions — no
+  list-value type in the result row format yet.
+- `labels(n)`, `keys(n)`, `properties(n)`, `type(r)` — dynamic
+  reflection over a node/relationship's facts; needs snapshot-time
+  lookup expressions.
+- `id(n)` / `id(r)` — exposing SIDs has cross-import stability and
+  policy implications that need a separate decision. Users wanting
+  stable identity should project the IRI directly.
+- Map literals beyond their use as inline property filters in
+  patterns (`{p:v, q:w}` is supported in `MATCH (n {p:v})` and
+  `SET n = {p:v}` but is not a first-class expression value).
+- Map projection (`n {.prop1, .prop2}`).
+- `point()`, `distance()`, geo/temporal beyond `xsd:date`/`xsd:dateTime`.
+
+Functions not in the included list raise a clear deferred-feature
+error at parse/lower time. Adding a function later that maps to an
+existing IR variant is small; adding one that needs new IR is a
+follow-up project.
+
+## Out of scope (deferred to v1.1+)
+
+These produce a clear `UnsupportedFeature` error in v1 with a message
+pointing at this document. Error message templates live next to the
+SPARQL/JSON-LD deferred error catalog so the user sees one vocabulary
+across all three surfaces.
+
+- Path values (`MATCH p = (a)-->(b)`) and path-typed RETURN.
+- `shortestPath` / `allShortestPaths`.
+- `LOAD CSV`, `FOREACH`, `CALL` with side effects.
+- Stored procedures (`CALL apoc.*` etc.).
+- Schema DDL (`CREATE INDEX`, `CREATE CONSTRAINT`).
+- Multi-statement scripts (`;`-separated).
+- Map projections beyond trivial property selection.
+- Implicit query parameters via session state (Bolt protocol). v1
+  accepts `$param` syntax in queries but expects parameter values in a
+  separate JSON body field, same as Neo4j HTTP API.
+- Geospatial / temporal types beyond `xsd:date / xsd:dateTime`.
+- Cypher's `point()`, `distance()`, etc.
+- Schema-aware MERGE (where uniqueness constraints choose which
+  property matches).
+- GQL session-graph semantics. The default graph is the ledger the
+  request targets; Cypher's `USE` is rejected.
+- GQL-only keywords (`INSERT` as alias for `CREATE`, etc.). Parser may
+  accept them as future-compat sugar in v1.1.
+
+## Milestone overview
+
+Each milestone is one PR. Lex and parse may combine if the diff stays
+reviewable.
+
+| ID | Scope | Status |
+|----|-------|--------|
+| M5.0 | Crate scaffolding, workspace wiring, feature flags | Not started |
+| M5.1 | Lex (Cypher tokens) | Not started |
+| M5.2 | AST + parser (v1 read + write surface) | Not started |
+| M5.3 | Query-path lower → shared IR; first round-trip with JSON-LD | Not started |
+| M5.4 | Write surface — CREATE / SET / REMOVE / DELETE / DETACH DELETE → `Txn` | Not started |
+| M5.5 | Single-node MERGE + ON CREATE / ON MATCH | Not started |
+| M5.6 | HTTP + CLI wiring, content negotiation, parameter passing | Not started |
+| M5.7 | Tests, docs, openCypher TCK subset | Not started |
+
+Variable-length paths (formerly M5.6) are removed from v1 — see
+"Variable-length paths — deferred" in the semantic model.
+
+---
+
+## M5.0 — Crate scaffolding
+
+**Goal:** new `fluree-db-cypher/` crate compiles in the workspace and
+re-exports a stub `parse_cypher(input: &str) -> ParseOutput` that
+returns "not implemented". Nothing surfaced to users yet.
+
+### Files
+
+- `Cargo.toml` (workspace) — add `fluree-db-cypher` to members.
+- `fluree-db-cypher/Cargo.toml` — mirror the SPARQL crate's shape;
+  `winnow`, `thiserror`, `tracing`, `serde`/`serde_json`, feature-gated
+  internal deps.
+- `fluree-db-cypher/src/lib.rs` — public surface stubs:
+  ```rust
+  pub fn parse_cypher(input: &str) -> ParseOutput { /* todo */ }
+  #[cfg(feature = "lowering")]
+  pub fn lower_cypher<E: IriEncoder>(
+      ast: &CypherAst, encoder: &E, vars: &mut VarRegistry,
+  ) -> Result<Query> { /* todo */ }
+  ```
+- `fluree-db-cypher/src/{lex,ast,parse,lower,validate,span.rs}` —
+  empty modules, doc-only.
+
+### Definition of done
+
+- `cargo check -p fluree-db-cypher` passes.
+- `cargo check --workspace --all-features --all-targets` passes.
+- Empty test file `fluree-db-cypher/tests/it_smoke.rs` runs.
+
+---
+
+## M5.1 — Lex
+
+**Goal:** lexer recognizes all Cypher v1 tokens with correct
+longest-match precedence. No parse or AST work yet.
+
+### Token shape
+
+Cypher tokens fall into these groups:
+
+- **Keywords (case-insensitive per Cypher convention)**: `MATCH`,
+  `OPTIONAL`, `WHERE`, `RETURN`, `DISTINCT`, `AS`, `AND`, `OR`, `XOR`,
+  `NOT`, `IN`, `IS`, `NULL`, `TRUE`, `FALSE`, `ORDER`, `BY`, `ASC`,
+  `DESC`, `SKIP`, `LIMIT`, `UNION`, `ALL`, `WITH`, `UNWIND`, `CREATE`,
+  `MERGE`, `ON`, `SET`, `REMOVE`, `DELETE`, `DETACH`, `CASE`, `WHEN`,
+  `THEN`, `ELSE`, `END`, `STARTS`, `ENDS`, `CONTAINS`, `CALL`, `YIELD`,
+  `EXISTS`, `COUNT`, `COLLECT`, `SUM`, `AVG`, `MIN`, `MAX`.
+- **Identifiers**: `[A-Za-z_][A-Za-z0-9_]*` and backtick-quoted
+  ``` `weird name` ```.
+- **Numbers**: integer, decimal, scientific, hex (`0x...`), octal
+  (`0o...`).
+- **Strings**: single- and double-quoted, with `\` escapes including
+  `\u{...}`.
+- **Parameters**: `$name` and `$0`, `$1`, etc.
+- **Punctuation**: `(`, `)`, `[`, `]`, `{`, `}`, `,`, `;`, `.`, `..`
+  (range), `:`, `::` (type cast — reject in v1), `=`, `<>`, `<`, `<=`,
+  `>`, `>=`, `+`, `-`, `*`, `/`, `%`, `^`, `+=`, `|`.
+- **Relationship arrows**: `->`, `<-`, `--`, `-`, with the bracketed
+  forms `-[`, `]->`, `]-`, `<-[`, `]-(` parsed as token pairs by the
+  parser (the lexer emits individual punctuation).
+- **Comments**: `//` line comments and `/* ... */` block comments.
+
+### Precedence rules
+
+Most are obvious; the non-obvious ones:
+
+- `<>` must be tried before `<` and `>`.
+- `<=`, `>=`, `+=` before single-char.
+- `..` (range) before `.`.
+- `::` (reject) before `:`.
+
+### Files
+
+- `fluree-db-cypher/src/lex/token.rs` — `TokenKind` enum + `Display`.
+- `fluree-db-cypher/src/lex/lexer.rs` — winnow parsers; same style as
+  `fluree-db-sparql/src/lex/lexer.rs`.
+- `fluree-db-cypher/src/lex/chars.rs` — identifier/digit character
+  predicates.
+
+### Tests
+
+- One unit test per token kind.
+- Negative tests for `::` cast, `<<`, `>>` (Cypher does not use them;
+  ensure they don't tokenize to anything special).
+- Comment-skipping test.
+- Keyword case-insensitivity test (`MATCH` vs `match` vs `Match`).
+
+### Definition of done
+
+- [ ] All tokens produced for the canonical examples in this doc.
+- [ ] No regression in SPARQL lexer tests (Cypher crate doesn't touch
+      SPARQL code).
+
+---
+
+## M5.2 — AST + parser
+
+**Goal:** parse the v1 read surface and the v1 write surface into a
+stable AST. Lowering is the next slice.
+
+### Parser strategy
+
+Pratt-style precedence-climbing for expressions, recursive descent for
+statements and patterns. Same approach as `fluree-db-sparql/src/parse/`.
+
+### AST sketch
+
+```rust
+// fluree-db-cypher/src/ast/mod.rs
+
+pub struct CypherAst {
+    pub statement: Statement,
+    pub span: SourceSpan,
+}
+
+pub enum Statement {
+    Query(QueryStmt),       // MATCH ... RETURN ...
+    Update(UpdateStmt),     // CREATE / SET / DELETE / MERGE
+}
+
+pub struct QueryStmt {
+    pub clauses: Vec<Clause>,  // Match, With, Unwind, Where, Return
+}
+
+pub enum Clause {
+    Match { optional: bool, pattern: Pattern, where_: Option<Expr> },
+    With  { items: Vec<ProjectionItem>, where_: Option<Expr>,
+            order_by: Vec<OrderItem>, skip: Option<Expr>,
+            limit: Option<Expr>, distinct: bool },
+    Unwind { expr: Expr, alias: Variable },
+    Return { items: Vec<ProjectionItem>, distinct: bool,
+             order_by: Vec<OrderItem>, skip: Option<Expr>,
+             limit: Option<Expr> },
+    Create  { pattern: Pattern },
+    Merge   { pattern: Pattern, on_create: Vec<SetItem>,
+              on_match: Vec<SetItem> },
+    Set     { items: Vec<SetItem> },
+    Remove  { items: Vec<RemoveItem> },
+    Delete  { detach: bool, exprs: Vec<Expr> },
+}
+
+pub struct Pattern { pub parts: Vec<PatternPart> }
+pub enum PatternPart { Node(NodePat), Rel(RelPat) }  // alternating
+
+pub struct NodePat {
+    pub var: Option<Variable>,
+    pub labels: Vec<Label>,
+    pub props: Option<MapLit>,   // {k: v, ...}
+}
+
+pub struct RelPat {
+    pub var: Option<Variable>,
+    pub direction: Direction,    // Out, In, Either
+    pub types: Vec<RelType>,     // multiple via |
+    pub length: Option<LengthRange>,  // *, *N, *N..M
+    pub props: Option<MapLit>,
+}
+
+pub enum Direction { Out, In, Either }
+
+pub struct LengthRange { pub min: Option<u32>, pub max: Option<u32> }
+
+pub enum Expr {
+    Var(Variable),
+    Lit(Literal),
+    Param(String),
+    Prop(Box<Expr>, String),       // x.prop
+    BinOp(BinOpKind, Box<Expr>, Box<Expr>),
+    UnaryOp(UnaryOpKind, Box<Expr>),
+    Func(String, Vec<Expr>),
+    Case(CaseExpr),
+    Exists(Box<Pattern>),
+    ListLit(Vec<Expr>),
+    MapLit(MapLit),
+    // ... etc.
+}
+```
+
+### Property-path interaction
+
+Cypher's variable-length `-[r*1..5]->` becomes a `RelPat` with
+`length: Some(LengthRange { min: Some(1), max: Some(5) })`. The
+parser does not flatten it into multiple `RelPat` instances; that's
+the lowering's job.
+
+### Failure modes the parser rejects
+
+- `MATCH (a)-[r]-(b)` with type list and relationship var when the
+  type alternatives include both inbound and outbound semantics (rare
+  edge case; emit a clear error).
+- Multiple statements separated by `;` — point at the multi-statement
+  deferred feature.
+- `CALL` with anything other than a parenthesized subquery —
+  procedure invocation is rejected.
+- `::` cast operator — point at "type system not surfaced in v1".
+
+### Tests
+
+- Round-trip parse tests for every shape in the v1 surface tables.
+- Negative tests for each deferred shape; error message contains the
+  feature name.
+
+### Definition of done
+
+- [ ] All v1 read and write shapes parse without error.
+- [ ] All deferred shapes produce the documented error message and
+      span.
+- [ ] No SPARQL crate regressions.
+
+---
+
+## M5.3 — Lower (read path)
+
+**Goal:** Cypher `MATCH ... RETURN` queries execute against the shared
+IR. Once this slice lands, JSON-LD inserts of edge-annotation data
+round-trip cleanly with Cypher reads.
+
+### Files
+
+- `fluree-db-cypher/src/lower/mod.rs` — top-level dispatch
+  (`lower_cypher`).
+- `fluree-db-cypher/src/lower/pattern.rs` — Cypher pattern →
+  `Vec<Pattern>` for the WHERE clause.
+- `fluree-db-cypher/src/lower/expr.rs` — Cypher `Expr` → IR
+  `Expression`. Most operators map 1:1.
+- `fluree-db-cypher/src/lower/projection.rs` — RETURN items →
+  `QueryOutput::Select` projections.
+
+### Rule 1 — Node pattern lowering
+
+```text
+NodePat { var: Some(v), labels: [L1, L2], props: {k1:lit1} }
+
+  ===>
+
+Triple(?v, rdf:type, <L1 IRI>)
+Triple(?v, rdf:type, <L2 IRI>)
+Triple(?v, <k1 IRI>, lit1)
+```
+
+Anonymous node patterns (no `var`) get a fresh non-distinguished Var
+using the `?#__cy_<n>` convention — the `?#` prefix is uncollidable
+(`#` is comment-start in SPARQL var lex) and hidden from `RETURN *`.
+
+Bare `(n)` patterns are rejected at lower time, per "Node existence
+model". The pattern parser produces an AST; the lower step checks
+that the node carries at least one of: a label, a property filter, or
+a participating relationship in the same `MATCH` clause.
+
+### Rule 2 — Relationship pattern lowering (the core mapping)
+
+Three input shapes, three lowering targets, as per "Relationship
+lowering rule" in the semantic model.
+
+**Shape 1 — anonymous, no property filter:**
+
+```text
+NodePat(a) -- RelPat(var=None, type=T, dir=Out, props=None) --> NodePat(b)
+
+  ===>
+
+Triple(?a, <T IRI>, ?b)
+```
+
+Set semantics. Matches plain RDF triples.
+
+**Shape 2 — named relationship (`-[r:T]->`):**
+
+```text
+NodePat(a) -- RelPat(var=Some(r), type=T, dir=Out, props=None) --> NodePat(b)
+
+  ===>
+
+EdgeAnnotation {
+    edge: Triple(?a, <T IRI>, ?b),
+    annotation: ?r,
+    body: vec![],
+}
+```
+
+Bag semantics. Matches only edges that have a reifier bundle. `?r`
+binds to the annotation SID.
+
+**Shape 3 — relationship property filter (`-[:T {p:v}]->` or
+`-[r:T {p:v}]->`):**
+
+```text
+NodePat(a) -- RelPat(var=v?, type=T, dir=Out, props={p:lit}) --> NodePat(b)
+
+  ===>
+
+EdgeAnnotation {
+    edge: Triple(?a, <T IRI>, ?b),
+    annotation: ?r (if named) or fresh non-distinguished Var,
+    body: vec![Triple(?annotation, <p IRI>, lit)],
+}
+```
+
+Bag semantics. Matches only edges with a reifier bundle whose body
+satisfies the property filter.
+
+**Direction handling:**
+- `Out` (`-[]->`): subject = a, object = b as shown.
+- `In` (`<-[]-`): subject = b, object = a (swap).
+- `Either` (`-[]-`): **rejected at parse/lower time**. See Open Q1.
+
+**Multiple types `[:T1|T2]`** (for shapes 1 and 2):
+
+```text
+Shape 1, types=[T1, T2]:
+  Triple(?a, ?__pred, ?b)
+  Filter(?__pred IN [<T1 IRI>, <T2 IRI>])
+
+Shape 2 with name r:
+  EdgeAnnotation { edge: Triple(?a, ?__pred, ?b), annotation: ?r, body: [] }
+  Filter(?__pred IN [<T1 IRI>, <T2 IRI>])
+```
+
+The predicate-Var form is preferable to a `Union` of two
+`EdgeAnnotation` patterns because the executor's reverse-attachment
+lookup can fan out across an IN-list more cheaply than across separate
+branches.
+
+**Untyped relationship `-[r]->`** (no type given):
+
+```text
+Shape 1 untyped:
+  Triple(?a, ?__pred, ?b)
+  Filter (existing include_system_facts=false equivalent)
+
+Shape 2 untyped with name r:
+  EdgeAnnotation { edge: Triple(?a, ?__pred, ?b), annotation: ?r, body: [] }
+  Filter (system-predicate exclusion)
+```
+
+The system-predicate exclusion reuses the same machinery as
+`include_system_facts = false` in the existing query path. This
+prevents `?__pred` from binding to `f:reifiesSubject` etc. Open Q3
+discusses this.
+
+### Rule 3 — OPTIONAL MATCH
+
+```text
+OPTIONAL MATCH <patterns>
+
+  ===>
+
+Optional(<inner-lowered patterns>)
+```
+
+Maps 1:1 to existing `Pattern::Optional`.
+
+### Rule 4 — WITH ... WHERE ... RETURN ...
+
+`WITH` introduces a subquery boundary:
+
+```text
+MATCH X
+WITH a, count(*) AS c WHERE c > 5
+MATCH Y
+RETURN ...
+
+  ===>
+
+Subquery {
+    inner: Query {
+        patterns: [X],
+        output: Select(a, count(*)) bind c,
+        ... filter c > 5
+    },
+    binds: [a, c],
+}
++ patterns Y
++ projection
+```
+
+The existing `Pattern::Subquery` covers this; the lowering's job is
+chopping the clause list at `WITH` boundaries and emitting a
+correlated subquery.
+
+### Rule 5 — UNWIND
+
+`UNWIND $list AS x` and `UNWIND [lit1, lit2] AS x` lower to whatever
+list-binding pattern the IR already exposes (SPARQL `VALUES` is the
+closest shape — confirm during M5.3 whether `Pattern::Values` is
+directly usable, or whether a thin wrapper is needed). v1 list
+elements are scalars or shallow maps; arbitrary expression-built lists
+are deferred.
+
+### Cardinality contract enforced here
+
+The Cypher MATCH lowering selects the per-relationship IR variant
+that produces Cypher's expected cardinality:
+
+- Anonymous, no property filter → plain `Triple`, set semantics, sees
+  plain RDF. Same cardinality as SPARQL bare-triple.
+- Named or property-filtered → `EdgeAnnotation`, bag semantics
+  (per-occurrence), only sees reifier-bundled edges.
+- `RETURN DISTINCT` always falls back to set semantics regardless.
+
+This deliberately surfaces a Cypher-vs-RDF impedance to users at the
+syntax level: the `r` you wrote means "I want relationship identity",
+which only exists for reifier-bundled edges. The Cypher docs page
+makes this rule explicit.
+
+### Definition of done
+
+- [ ] All v1 read shapes execute against in-memory + indexed snapshots.
+- [ ] Bare `MATCH (n)` and bare `CREATE (n)` are rejected at lower
+      time with the documented error.
+- [ ] Shape-1 anonymous relationship reads plain RDF triples (proven
+      by inserting via JSON-LD without `@annotation`, then matching
+      via Cypher).
+- [ ] Shape-2 named relationship reads only reifier-bundled edges
+      (proven by inserting via JSON-LD `@annotation`, then matching
+      via Cypher with `r`).
+- [ ] Round-trip parity: Cypher write → JSON-LD read returns identical
+      bindings to JSON-LD write → JSON-LD read of the same logical
+      data.
+- [ ] Untyped `-[r]->` does not bind `?__pred` to `f:reifies*`.
+
+---
+
+## M5.4 — Lower (write path)
+
+**Goal:** Cypher writes route through the same staging pipeline as
+JSON-LD and SPARQL.
+
+### Files
+
+- `fluree-db-transact/src/lower_cypher_update.rs` (new) — analogous to
+  `lower_sparql_update.rs`. Consumes `CypherAst::Update(UpdateStmt)`,
+  produces `Txn`.
+- `fluree-db-transact/src/parse/edge_annotations.rs` — no changes;
+  Cypher writes funnel into the same `f:reifies*` emitter.
+
+### Per-clause rules
+
+#### CREATE
+
+```text
+CREATE (a:L {p:v})-[:T {q:w}]->(b:L2)
+```
+
+For each new node:
+- Mint a subject SID (unless `@id`-bound via parameter; v1 also
+  accepts `MERGE`-style identifying keys via M5.5).
+- Emit `(?a, rdf:type, L)`, `(?a, p, v)`.
+
+For each relationship:
+- Emit base triple `(?a, ex:T, ?b)`.
+- Emit the standard reifier bundle (`f:reifies*`) with a fresh
+  annotation SID — **always**, per LPG-mode default for Cypher.
+- Emit `(ann, q, w)` for relationship properties.
+
+If `MATCH ... CREATE ...`, bindings from WHERE drive the template per
+SPARQL Update §4.1.3 semantics (per-solution fresh blank nodes for
+unbound parts).
+
+#### SET — bounded scopes per the property/relationship boundary
+
+Per "SET property/relationship boundary" in the semantic model:
+
+```text
+SET n.prop = expr      → DELETE (n, <prop>, *), INSERT (n, <prop>, expr)
+SET n += {p:v, q:w}    → For each key k: DELETE (n, <k>, *), INSERT (n, <k>, val).
+SET n = {p:v, q:w}     → DELETE (n, ?p, ?o) where:
+                            ?o is a literal, AND
+                            ?p is not rdf:type, AND
+                            ?p is not in the f:* system namespace.
+                         Then INSERT one triple per key in the map.
+SET r.prop = expr      → SET on annotation SID r. Touches the
+                         annotation body, not the base edge or the
+                         reifier system predicates.
+SET n:Label            → INSERT (n, rdf:type, <Label>). Additive.
+```
+
+The bounded retract scope for `SET n = {...}` is the critical safety
+rule: it does not wipe labels, outbound or inbound relationships, or
+system facts.
+
+#### REMOVE
+
+```text
+REMOVE n.prop          → DELETE (n, <prop>, *)
+REMOVE n:Label         → DELETE (n, rdf:type, <Label>)
+```
+
+#### DELETE / DETACH DELETE
+
+Per "DELETE / DETACH DELETE in RDF" in the semantic model:
+
+```text
+DELETE r               → Retract attachment row for r + cascade
+                         owned annotation facts (LPG mode).
+
+DELETE n               → Staging-time check: count (n, p, o) and
+                         (s, p, n) where the non-n position is a ref
+                         (IRI/blank), p ∉ rdf:type, p ∉ f:* namespace.
+                         If count > 0: error pointing at DETACH DELETE.
+                         If count == 0: retract all triples about n.
+
+DETACH DELETE n        → For each outbound relationship (n, p, o):
+                            retract reifier bundle if present,
+                            retract base triple.
+                         For each inbound relationship (s, p, n):
+                            retract reifier bundle if present,
+                            retract base triple.
+                         Retract all remaining (n, p, o) and (s, p, n).
+```
+
+The relationship-detection check is two index probes (SPOT subject
+fan-out and OPST object fan-out) with the predicate filter applied
+on the fly.
+
+### Cascade and policy
+
+All inherited from the edge-annotations storage layer:
+- Plain-edge DELETE cascades the bundle. In LPG mode (Cypher default),
+  explicit-IRI annotation subjects also cascade.
+- Reserved-predicate firewall covers `f:reifies*` system predicates.
+- Policy + history work without change.
+
+### Parameter passing
+
+```text
+CREATE (n:Person {name: $name, age: $age})
+```
+
+Parameters arrive in the HTTP request body as a separate `params`
+object:
+
+```json
+{
+  "cypher": "CREATE (n:Person {name: $name})",
+  "params": {"name": "Alice"}
+}
+```
+
+Substitution happens at lowering time before staging. v1 supports
+literal substitution only; computed-parameter values (e.g.,
+`$people` as a list driving `UNWIND $people AS p CREATE (n:Person {name: p.name})`)
+are part of M5.4.
+
+### Definition of done
+
+- [ ] Insert via Cypher CREATE, query via JSON-LD: identical results.
+- [ ] Insert via Cypher CREATE, query via SPARQL: identical results.
+- [ ] DELETE r via Cypher triggers the same cascade as SPARQL UPDATE
+      DELETE of a reifier bundle.
+- [ ] DETACH DELETE n correctly retracts a node with N relationships.
+- [ ] `UNWIND $list AS x CREATE ...` round-trips for list-of-maps.
+
+---
+
+## M5.5 — MERGE
+
+**Goal:** Cypher's find-or-create semantics. The semantically loaded
+clause; deserves its own slice.
+
+### Surface
+
+```cypher
+MERGE (n:Person {name: "Alice"})
+ON CREATE SET n.created = timestamp()
+ON MATCH  SET n.lastSeen = timestamp()
+```
+
+```cypher
+MATCH (a:Person {name: "Alice"})
+MERGE (a)-[:KNOWS]->(b:Person {name: "Bob"})
+ON CREATE SET b.created = timestamp()
+```
+
+### Semantics
+
+`MERGE` is *find a pattern, otherwise create it*. The identifying
+property bag is the entire inline `{...}` map. Cypher considers
+**every property in the map** as identifying — there is no
+"identifying subset" without a uniqueness constraint.
+
+Lowering proceeds in three steps at staging time:
+
+1. **Search phase**: build a WHERE-equivalent pattern from the MERGE
+   shape. Run it against the snapshot.
+2. **Branch**:
+   - At least one binding: apply `ON MATCH` SET items to each binding.
+   - Zero bindings: apply CREATE template, then apply `ON CREATE` SET
+     items.
+
+The "every property is identifying" rule lets the search step reuse
+the same lowering as `MATCH` directly — `MERGE (n {p:v, q:w})` lowers
+to a search for nodes with both `(n, p, v)` and `(n, q, w)` asserted.
+
+### v1 supported shapes
+
+- Single-node MERGE only: `MERGE (n:Label {p:v})`.
+- ON CREATE / ON MATCH SET clauses (any combination, including none).
+
+### v1 deferred
+
+- **Single-edge MERGE** (`MERGE (a)-[:T]->(b)`) — pushed to v1.1.
+  Reason: the matching semantics interact with the relationship-
+  lowering rule (only sees reifier-bundled edges when the relationship
+  variable participates), and getting this right requires more design.
+- MERGE on patterns longer than one relationship.
+- MERGE with relationship properties as identifying keys.
+- Schema-aware MERGE (where a uniqueness constraint chooses which
+  property is identifying).
+
+### Atomicity
+
+MERGE must be atomic within the transaction. Search and create-or-set
+happen in the same `Txn`. The staging pipeline already runs `WHERE`
+against a frozen snapshot before applying any inserts, so the search
+phase sees a consistent view. No new atomicity machinery needed.
+
+### Race conditions
+
+Two concurrent MERGEs of the same identifying pattern can both
+observe "not present" and both create. Neo4j relies on uniqueness
+constraints to prevent this; without them, the same outcome can
+happen there. Fluree's SHACL `f:enforceUnique` is the natural
+parallel — when a SHACL constraint is in place, the optimistic
+concurrency check at commit time will reject the duplicate. Document
+this clearly.
+
+### Definition of done
+
+- [ ] `MERGE (n:Person {name: "Alice"})` creates exactly one node on
+      first run, finds it on second.
+- [ ] `ON CREATE SET` and `ON MATCH SET` fire on the correct branch.
+- [ ] Single-relationship MERGE with a previously-MATCHed left side
+      creates the edge + reifier exactly once.
+- [ ] Test against a SHACL `f:enforceUnique` constraint that the
+      duplicate-create race is caught by validation.
+
+---
+
+## M5.6 — HTTP + CLI wiring
+
+**Goal:** Cypher reaches users.
+
+### HTTP
+
+In `fluree-db-server/src/routes/query.rs`:
+
+- Accept `Content-Type: application/cypher` (de facto Neo4j MIME) and
+  `application/openCypher` for the read endpoint.
+- Accept the same for the write endpoint (`/transact`).
+- JSON body envelope accepted for both:
+  ```json
+  {
+    "cypher": "MATCH (n:Person) RETURN n",
+    "params": {"limit": 10}
+  }
+  ```
+- Plain-text body accepted for parameter-less queries (matches Neo4j
+  HTTP API convention).
+
+Reuse the SPARQL routes' content-negotiation pattern. Add:
+- `FlureeHeaders::wants_cypher()` predicate.
+- Format selection: Cypher queries return JSON-LD by default. SPARQL
+  Results JSON is also valid for SELECT-shape queries. Neo4j's
+  result-row format is rejected in v1 — document the deviation.
+
+### CLI
+
+In `fluree-db-cli/src/commands/query.rs` and `update.rs`:
+
+- New `--cypher` flag, mutually exclusive with `--sparql`.
+- Auto-detection via `detect_query_format()` — Cypher is detected by
+  presence of `MATCH`, `CREATE`, `MERGE` keywords near the top.
+  Fall through to JSON-LD if uncertain.
+- Remote client gains `query_cypher_accept_bytes()` and `update_cypher()`.
+- `--explain --cypher ...` prints the plan as JSON without executing.
+
+### Library
+
+In `fluree-db-api/src/lib.rs`:
+
+- Re-export `parse_cypher`, `lower_cypher` from `fluree-db-cypher`.
+- Re-export `lower_cypher_update` from `fluree-db-transact`.
+- Add `GraphQueryBuilder::cypher(&str)` method, parallel to existing
+  `.sparql(&str)`.
+- Add `GraphTransactBuilder::cypher(&str)` method.
+
+### Definition of done
+
+- [ ] `curl -H 'Content-Type: application/cypher' --data 'MATCH (n) RETURN n LIMIT 5' .../query` works.
+- [ ] `fluree query --cypher 'MATCH (n) RETURN n LIMIT 5'` works.
+- [ ] `fluree update --cypher 'CREATE (n:Person {name: "Alice"})'` works.
+- [ ] `fluree.graph("mydb").cypher("MATCH (n) RETURN n").await` works
+      from Rust.
+
+---
+
+## M5.7 — Tests, docs, TCK subset
+
+### Tests
+
+`fluree-db-api/tests/it_query_cypher.rs` — read-path tests:
+
+- Node patterns with labels and property filters.
+- Relationship patterns: anonymous, named, typed, untyped, alternative
+  types, both directions, undirected (if shipped).
+- Property filter on relationships via `EdgeAnnotation` body.
+- Variable-length paths: bounded, unbounded, reflexive.
+- OPTIONAL MATCH.
+- WHERE expressions (comparison, IS NULL, IN, list functions).
+- WITH ... WHERE ... boundary.
+- UNWIND of literal list and bound list.
+- Aggregations: count, sum, avg, collect.
+- ORDER BY, SKIP, LIMIT.
+- UNION / UNION ALL.
+- Parallel relationships return one row per occurrence.
+- Cross-surface parity: JSON-LD insert → Cypher read returns same
+  bindings as SPARQL read of same data.
+
+`fluree-db-api/tests/it_transact_cypher.rs` — write-path tests:
+
+- CREATE node, relationship, mixed patterns.
+- SET node prop, relationship prop, += map merge, = map replace.
+- REMOVE prop, REMOVE label.
+- DELETE r cascades reifier bundle.
+- DELETE n rejects when relationships remain.
+- DETACH DELETE n cascades.
+- MERGE node: create on first, match on second.
+- MERGE edge: create and match branches.
+- ON CREATE / ON MATCH SET branches.
+- Parameter substitution: literal, list of literals, list of maps.
+- LPG-mode cascade verified.
+- Reserved-predicate firewall: CREATE that mentions `f:reifiesSubject`
+  directly is rejected.
+
+`fluree-db-api/tests/it_query_cypher_indexed.rs`:
+- Reindex between insert and query; arena read path works through
+  Cypher surface.
+
+### openCypher TCK subset
+
+The openCypher project ships a Technology Compatibility Kit (TCK) as
+Cucumber feature files. v1 doesn't run the full TCK; instead, port
+the **Read1, Match1, Match2, Match3, Comparison1** TCK groups as
+manually-translated Rust integration tests. These exercise the read
+surface end-to-end against canonical Cypher semantics.
+
+Full TCK harness integration is a follow-up.
+
+### Docs
+
+- `docs/concepts/cypher.md` (new) — user-facing overview, mapping to
+  RDF/JSON-LD, what's supported, what's deferred. Cross-link from
+  `docs/concepts/edge-annotations.md` since Cypher relationship
+  properties surface the same primitive.
+- `docs/getting-started/cypher.md` (new) — quickstart with examples.
+- `docs/query/cypher.md` (new) — full v1 reference.
+- `docs/transactions/cypher.md` (new) — write surface.
+- `docs/SUMMARY.md` — link the four new pages.
+- `CLAUDE.md` — add Cypher to the "Patterns to Follow" or feature
+  table.
+
+### Definition of done
+
+- [ ] All tests pass on memory + file storage.
+- [ ] `cargo nextest run --workspace --all-features --no-fail-fast`
+      passes.
+- [ ] TCK subset tests pass.
+- [ ] Docs updated; SUMMARY.md links new pages.
+
+---
+
+## Open questions
+
+These need answers before or during M5.2, but don't block M5.0/M5.1.
+
+### Q1 — Undirected relationships `(a)-[r]-(b)`
+
+Cypher returns each match twice (once per direction) when the
+relationship is undirected. Two options:
+
+- **(a)** Lower to `Union` of both directions. Correct semantics; may
+  double-count for symmetric data.
+- **(b)** Reject `-[r]-` in v1 with a clear error message pointing
+  users at the explicit `<-[r]-` / `-[r]->` forms.
+
+Recommendation: **(b)** for v1. Most real Cypher queries are directed;
+the syntactic ambiguity is a footgun. Revisit when the user need
+becomes concrete.
+
+### Q2 — `id(n)` semantics
+
+Neo4j's `id(n)` returns an internal unstable integer. Fluree's SIDs
+are also internal unstable integers. Options:
+
+- **(a)** Return the SID directly. Faithful but exposes encoding.
+- **(b)** Return the IRI string. Stable but type-incompatible with
+  Neo4j queries that use `id(n)` numerically.
+
+Recommendation: **(a)** with the same caveat Neo4j docs carry ("don't
+rely on it across imports"). Add a separate `iri(n)` function for the
+stable-identity case.
+
+### Q3 — Cypher's untyped relationships and system predicates
+
+`MATCH (a)-[r]->(b)` (no type) lowers to a triple with a variable
+predicate. Without filtering, `?r` would bind to system predicates
+including `f:reifies*` and other `f:` namespace items — wrong from
+a user's standpoint.
+
+Recommendation: **reuse the existing `include_system_facts = false`
+filter** that the query path already exposes (used elsewhere for
+hiding system facts in default subject-expansion). The Cypher lower
+sets that flag (or the equivalent IR-level predicate exclusion) on
+any pattern where the predicate position is a Var. Adding Cypher-
+specific tests verifies the filter is hit. No new firewall machinery
+is invented.
+
+### Q4 — Multi-label MERGE
+
+`MERGE (n:L1:L2 {p:v})` — is the identifying key the property bag
+alone, or property bag + label set? Cypher spec says label is part of
+the pattern, so the search must find a node with both labels.
+Confirmation: yes, the search lowers to:
+
+```text
+Triple(?n, rdf:type, L1)
+Triple(?n, rdf:type, L2)
+Triple(?n, p, v)
+```
+
+If zero results, create with all three. Document.
+
+### Q5 — Should v1 ship GQL keyword aliases?
+
+`INSERT` for `CREATE`, `FILTER` for `WHERE`, etc. Cost is parser-only.
+
+Recommendation: **no** — adds surface area for v1 without buying any
+user-facing value (no GQL drivers in the wild yet). Add when there's
+a concrete GQL use case to validate against.
+
+---
+
+## Cross-cutting concerns
+
+- **Tracing.** No new spans; existing `parse / lower / execute` spans
+  cover the Cypher path the same way they cover SPARQL. If the lowering
+  becomes expensive enough to want a span, add `debug_span!("cypher.lower")`
+  scoped to the lowering call.
+- **Policy / history / cascade.** All inherited from the
+  edge-annotations storage layer. Cypher writes are indistinguishable
+  from SPARQL writes once they reach the staging pipeline.
+- **Reserved-predicate firewall.** Existing wiring covers Cypher writes
+  via the shared staging path. Query-side firewall extension (Q3) is
+  net new.
+- **W3C testsuite.** `cd testsuite-sparql/ && make count-eval` must
+  remain unchanged after each Cypher milestone. Cypher and SPARQL
+  share IR; if a Cypher slice ever changes the IR, SPARQL semantics
+  must be unaffected.
+- **Edge-annotation tests.** The annotation round-trip tests
+  (`it_query_sparql_annotations.rs`, `it_edge_annotations.rs`) must
+  keep passing after each Cypher slice. Cypher inserts that round-trip
+  to JSON-LD/SPARQL reads are the canonical cross-surface parity test.
+- **Lambda/WASM builds.** Cypher follows SPARQL's pattern: the
+  `lowering` feature is default-on for native builds and opt-out for
+  reduced-size deployments. Parser-only Cypher (no execution) is a
+  valid build target.
+
+## Success criteria
+
+- Ordinary RDF/JSON-LD queries are completely unaffected.
+- Ordinary SPARQL queries (including edge-annotation queries shipped
+  in M4) are completely unaffected.
+- Cypher round-trips data inserted via JSON-LD `@annotation` and
+  SPARQL `{| ... |}` to byte-identical results.
+- Cypher `CREATE (a)-[r:T {p:v}]->(b)` writes identical staging
+  records to the SPARQL `~ ?ann {| ... |}` form on the same input.
+- Parallel relationships, named relationships, and property-less
+  relationships preserve identity across all three surfaces.
+- A user can write Cypher in the CLI, HTTP, and Rust API.
+- `cd testsuite-sparql && make count-eval` shows no regression after
+  any Cypher milestone.
+
+## What I'd open as PR #1
+
+M5.0 (crate scaffolding) is the cleanest first PR. It's small, it
+proves workspace wiring, and it gives subsequent slices a place to
+live. Concretely:
+
+1. Add `fluree-db-cypher` to workspace `Cargo.toml`.
+2. Mirror `fluree-db-sparql/Cargo.toml` for the new crate's
+   manifest and feature shape.
+3. Skeleton `src/lib.rs` with `parse_cypher` stub returning
+   "not implemented".
+4. Empty `lex/`, `ast/`, `parse/`, `lower/`, `validate/` modules.
+5. `cargo check --workspace --all-features --all-targets` green.
+
+M5.1 (lex) follows directly.

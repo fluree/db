@@ -249,6 +249,16 @@ pub use fluree_db_sparql::{
     UpdateOperation as SparqlUpdateOperation,
 };
 
+// Re-export Cypher types (product feature; always enabled).
+pub use fluree_db_cypher::{
+    lower_cypher, parse_cypher, CypherAst, DiagCode as CypherDiagCode,
+    Diagnostic as CypherDiagnostic, LowerError as CypherLowerError,
+    ParseOutput as CypherParseOutput, Severity as CypherSeverity, SourceSpan as CypherSourceSpan,
+};
+pub use fluree_db_transact::lower_cypher_update::{
+    lower_cypher_update, CypherLowerOpts, LowerCypherError,
+};
+
 // Re-export policy types for access control
 pub use fluree_db_policy::{
     build_policy_set, build_policy_values_clause, filter_by_required, is_schema_flake,
@@ -3271,6 +3281,82 @@ impl Fluree {
     /// ```
     pub fn stage_owned(&self, ledger: LedgerState) -> OwnedTransactBuilder<'_> {
         OwnedTransactBuilder::new(self, ledger)
+    }
+
+    /// Stage a Cypher write statement.
+    ///
+    /// The Cypher parser produces a Txn that mirrors what the JSON-LD
+    /// `@annotation` lowering produces: base triples plus an
+    /// `f:reifies*` reifier bundle for every directed typed
+    /// relationship (LPG-mode default).
+    ///
+    /// v1 supports CREATE only. SET / REMOVE / DELETE / DETACH
+    /// DELETE / MERGE return clear deferred-feature errors. See
+    /// `docs/concepts/cypher.md` for the surface.
+    ///
+    /// Context resolution: the ledger's configured `default_context`
+    /// (if any) supplies `@vocab` and bare-identifier overrides.
+    /// A CAS read or parse failure on a configured context
+    /// propagates as an error — writes never silently fall back to
+    /// the built-in vocab when a custom context was specified.
+    /// The built-in fallback (`http://example.org/`) applies only
+    /// when (a) the ledger has no nameservice record yet
+    /// (genesis / pre-commit), or (b) the record exists but no
+    /// `default_context` CID is configured.
+    pub async fn transact_cypher(
+        &self,
+        ledger: LedgerState,
+        cypher: &str,
+    ) -> Result<TransactResult> {
+        let out = fluree_db_cypher::parse_cypher(cypher);
+        if out.has_errors() {
+            let msg = out
+                .diagnostics
+                .iter()
+                .map(|d| format!("{}: {}", d.code, d.message))
+                .collect::<Vec<_>>()
+                .join("; ");
+            return Err(ApiError::cypher(msg, out.diagnostics));
+        }
+        let ast = out
+            .ast
+            .ok_or_else(|| ApiError::cypher("Cypher parse returned no AST", Vec::new()))?;
+
+        // Mirror the read path: pull @vocab and term overrides out of
+        // the ledger's default context so write Cypher resolves bare
+        // identifiers the same way `query_cypher` does.
+        //
+        // Two cases legitimately produce no context:
+        //   - `Ok(None)`: the ledger record exists but has no
+        //     `default_context` CID configured.
+        //   - `Err(ApiError::NotFound)`: the ledger has no nameservice
+        //     record yet (genesis / pre-commit). There's nothing to
+        //     load by definition.
+        //
+        // Every other error — CAS read failure, parse error, etc. —
+        // propagates so writes never silently land under the
+        // built-in vocab when a custom context was configured but
+        // couldn't be loaded.
+        let default_context = match self.get_default_context(ledger.ledger_id()).await {
+            Ok(ctx) => ctx,
+            Err(ApiError::NotFound(_)) => None,
+            Err(e) => return Err(e),
+        };
+        let (vocab, overrides) =
+            crate::query::helpers::extract_cypher_iri_mapping(default_context.as_ref());
+        let cypher_opts = fluree_db_transact::lower_cypher_update::CypherLowerOpts {
+            vocab: Some(vocab),
+            overrides,
+        };
+
+        let mut ns = NamespaceRegistry::from_db(&ledger.snapshot);
+        let txn = fluree_db_transact::lower_cypher_update::lower_cypher_update(
+            &ast,
+            &mut ns,
+            TxnOpts::default(),
+            cypher_opts,
+        )?;
+        self.stage_owned(ledger).txn(txn).execute().await
     }
 
     /// Create a FROM-driven query builder.

@@ -98,6 +98,82 @@ pub(crate) fn parse_sparql_to_ir(
     Ok((vars, parsed))
 }
 
+/// Parse a Cypher (openCypher 9) query and prepare it for execution.
+///
+/// Cypher has no prologue/prefix syntax of its own. The ledger's
+/// default JSON-LD context supplies `@vocab` (used to resolve bare
+/// labels/types/property keys) and named term mappings (used as
+/// overrides). Without a default context, the lowering falls back to
+/// `http://example.org/` for the vocab — useful for tests, not for
+/// production data.
+pub(crate) fn parse_cypher_to_ir(
+    cypher: &str,
+    snapshot: &LedgerSnapshot,
+    default_context: Option<&JsonValue>,
+) -> Result<(VarRegistry, Query)> {
+    let out = fluree_db_cypher::parse_cypher(cypher);
+    if out.has_errors() {
+        let msg = out
+            .diagnostics
+            .iter()
+            .map(|d| format!("{}: {}", d.code, d.message))
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(ApiError::cypher(msg, out.diagnostics));
+    }
+    let ast = out
+        .ast
+        .ok_or_else(|| ApiError::cypher("Cypher parse returned no AST", Vec::new()))?;
+
+    // Pull `@vocab` and named-term overrides out of the default
+    // context, then build a `LoweringContext` and pass it to the
+    // context-aware lower entry so the ledger's IRI mappings actually
+    // apply to bare Cypher identifiers.
+    let (vocab, overrides) = extract_cypher_iri_mapping(default_context);
+
+    let mut vars = VarRegistry::new();
+    let mut ctx = fluree_db_cypher::LoweringContext::new(snapshot, &mut vars).with_vocab(vocab);
+    if !overrides.is_empty() {
+        ctx = ctx.with_overrides(overrides);
+    }
+    let parsed = fluree_db_cypher::lower_cypher_with_context(&ast, &mut ctx)?;
+    Ok((vars, parsed))
+}
+
+/// Extract `@vocab` and bare-identifier → IRI overrides from a
+/// JSON-LD `@context` object.
+///
+/// Shared by the read path (`parse_cypher_to_ir`) and the write path
+/// (`Fluree::transact_cypher`) so both surfaces honor the same
+/// ledger-context mappings.
+pub(crate) fn extract_cypher_iri_mapping(
+    default_context: Option<&JsonValue>,
+) -> (String, std::collections::HashMap<String, String>) {
+    let mut vocab = "http://example.org/".to_string();
+    let mut overrides = std::collections::HashMap::new();
+    if let Some(obj) = default_context.and_then(|v| v.as_object()) {
+        if let Some(v) = obj.get("@vocab").and_then(|v| v.as_str()) {
+            vocab = v.to_string();
+        }
+        for (k, v) in obj {
+            if k.starts_with('@') {
+                continue;
+            }
+            if let Some(s) = v.as_str() {
+                // Skip prefix-style entries (`"ex": "http://..."`); use
+                // only full-term mappings. Heuristic: a prefix entry
+                // ends in `#` or `/` and the key looks like a short
+                // prefix. We don't try to be exhaustive here.
+                if s.ends_with('#') || s.ends_with('/') {
+                    continue;
+                }
+                overrides.insert(k.clone(), s.to_string());
+            }
+        }
+    }
+    (vocab, overrides)
+}
+
 /// Prepare a parsed query for execution.
 pub(crate) fn prepare_for_execution(parsed: &Query) -> ExecutableQuery {
     ExecutableQuery::simple(parsed.clone())
