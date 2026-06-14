@@ -75,8 +75,10 @@ staging pipeline (`fluree_db_transact::Txn`) used by JSON-LD and SPARQL.
 narrow exceptions called out in the milestones below: (a) reusing the
 existing `include_system_facts = false` filter for Cypher untyped
 relationship matches, and (b) any new IR variants ride the existing
-operator infrastructure. Anything that would need a new executor
-operator (path enumeration, list-valued aggregates) is deferred.
+operator infrastructure. List-valued aggregation (`collect()`) landed
+by reusing the existing `Binding::Grouped` carrier — no new operator.
+Path *enumeration* (`shortestPath`, first-class path values) still needs
+a new executor operator and is deferred.
 
 ## Why now
 
@@ -147,7 +149,7 @@ this plan.
 | Relationship variable `-[r]->` binds | The annotation SID. Only matches relationships that have a reifier bundle — see "Relationship lowering rule" below. |
 | Parallel relationships | Two annotation SIDs attached to the same `(s, p, o)` edge key. Already supported (multimap forward attachment index). |
 | Undirected `-[r]-` | **Landed** — forward∪reverse `Union` (reverse via the `Opst` index). |
-| Variable-length `-[r*1..5]->` | **Landed** (anonymous, single-typed) — see "Variable-length paths" below; not relationship-uniqueness compliant on cyclic graphs. |
+| Variable-length `-[:T*1..5]->` | **Landed** (anonymous, single-typed) — see "Variable-length paths" below; not relationship-uniqueness compliant on cyclic graphs. Binding a variable to the path (`-[r:T*1..5]->`, a relationship *list*) is still deferred. |
 | Path value `p = (a)-[r]->(b)-[r2]->(c)` | First-class path object. **Deferred.** |
 | `RETURN n, r, m` | SELECT projection. Bag semantics by default (no DISTINCT). |
 | `RETURN DISTINCT` | Lower to existing DISTINCT modifier. |
@@ -624,8 +626,11 @@ reviewable.
 | M5.6 | HTTP + CLI wiring, content negotiation, parameter passing | 🟡 Partial — CLI (read + write, auto-detect), HTTP ledger-scoped routes (`application/cypher` on query/update), and parameter passing (scalar/list, `{cypher,params}` envelope) all wired; remaining: HTTP content-negotiation parity (tracking/delimited/agent-json/policy) |
 | M5.7 | Tests, docs, openCypher TCK subset | 🟡 Partial — lowering + end-to-end round-trip tests for the shipped surface; TCK subset not yet |
 
-Variable-length paths (formerly M5.6) are removed from v1 — see
-"Variable-length paths — deferred" in the semantic model.
+Variable-length paths have since **landed** (anonymous, single-typed
+`-[:T*m..n]->` / `-[:T*]->`; endpoint-reachability semantics, not
+relationship-uniqueness compliant) — see "Variable-length paths —
+landed" in the semantic model. Bound rel-var var-length and first-class
+path values remain deferred.
 
 ---
 
@@ -809,10 +814,12 @@ pub enum Expr {
 
 ### Property-path interaction
 
-Cypher's variable-length `-[r*1..5]->` becomes a `RelPat` with
+Cypher's variable-length `-[:T*1..5]->` becomes a `RelPat` with
 `length: Some(LengthRange { min: Some(1), max: Some(5) })`. The
 parser does not flatten it into multiple `RelPat` instances; that's
-the lowering's job.
+the lowering's job. The parser also accepts a bound rel-var form
+(`-[r:T*1..5]->`) syntactically, but lowering rejects it — binding a
+variable to a variable-length path needs list-valued bindings (deferred).
 
 ### Failure modes the parser rejects
 
