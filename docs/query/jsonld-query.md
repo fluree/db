@@ -812,7 +812,7 @@ Edge annotations attach metadata to a specific `(subject, predicate, object)` ed
 - **Inline form** with `@annotation` — match an edge and pull metadata about it.
 - **Annotation-rooted form** with `@reifies` — match metadata first, find the edges it reifies.
 
-`@edge` is a Cypher-oriented alias for `@annotation`; the two are interchangeable.
+`@edge` is a Cypher-oriented alias for `@annotation`; the two are interchangeable. For how to *write* annotations (`@annotation` on insert), the storage model, the cardinality contract, and worked output, see the [Edge annotations](../concepts/edge-annotations.md) concept doc. Note `@reifies` is a **query-side** construct only — user-authored `@reifies` on an insert/update is rejected; write with `@annotation` instead.
 
 **Inline form (`@annotation`):**
 

@@ -25,12 +25,12 @@ If a fact is naturally about a *node* (Alice's birthdate, Acme's industry), put 
 
 | Surface | How | Notes |
 |---|---|---|
-| **JSON-LD insert / upsert / update** | `@annotation` (or alias `@edge`) on a value object | Most ergonomic. Covers literal-valued edges (with explicit `@type` / `@language`), parallel annotations, named reifiers, and body cascades. Annotations land in the **default graph** — the `f:reifiesGraph` slot is a v1 deferral. `@reifies` is a query-side construct, **not** an insert form (user-authored `@reifies` on a write is rejected). |
-| **SPARQL 1.2 UPDATE** | `INSERT DATA { :s :p :o {\| ... \|} }`, `~ <reifier>`, optional `INSERT { } WHERE { }` templates | Use this when integrating with SPARQL pipelines or when porting from RDF 1.2 / SPARQL-star. See [SPARQL 1.2 surface](#sparql-12--rdf-12-surface) below for the per-operation rules. |
-| **Turtle / TriG / N-Quads file ingest** | Not natively (today) | The Turtle ingest path is RDF 1.1 + Fluree extensions; it does **not** parse RDF 1.2 annotation tails (`{\| ... \|}`) or the `~` reifier. Two routes work: (a) convert your `.ttl` to JSON-LD before ingesting, or (b) ingest the plain edges first and then add annotations with a follow-up SPARQL `INSERT DATA { :s :p :o {\| ... \|} }` transaction. Either route ends up with the same on-disk shape. |
+| **JSON-LD insert / upsert / update** | `@annotation` (or alias `@edge`) on a value object | Most ergonomic. Covers literal-valued edges (with explicit `@type` / `@language`), parallel annotations, named reifiers, body cascades, and **named-graph edges** (an annotation on an edge inside a named graph is written into that same graph, carrying `f:reifiesGraph`). `@reifies` is a query-side construct, **not** an insert form (user-authored `@reifies` on a write is rejected). |
+| **SPARQL 1.2 UPDATE** | `INSERT DATA { :s :p :o {\| ... \|} }`, `~ <reifier>`, optional `INSERT { } WHERE { }` templates | Use this when integrating with SPARQL pipelines or when porting from RDF 1.2 / SPARQL-star. **Default graph only:** an annotation tail inside an explicit `GRAPH { }` block, or under a `WITH <g>` template, is rejected — use the JSON-LD surface for named-graph edge annotations. See [SPARQL 1.2 surface](#sparql-12--rdf-12-surface) below for the per-operation rules. |
+| **Turtle / TriG / N-Triples / N-Quads file ingest** | Not natively (today) | These ingest paths are RDF 1.1 + Fluree extensions; they do **not** parse RDF 1.2 annotation tails (`{\| ... \|}`), the `~` reifier, or `<<( ... )>>` triple terms — a file containing them **fails to parse** with a lexer error (e.g. `unexpected character '~'`). Two routes work: (a) convert your file to JSON-LD before ingesting, or (b) ingest the plain edges first and then add annotations with a follow-up SPARQL `INSERT DATA { :s :p :o {\| ... \|} }` transaction. Either route ends up with the same on-disk shape. |
 | **Cypher / LPG import** | Relationship-property syntax (`-[:T {p:v}]->`) | The storage primitive is in place; the full Cypher front-end (paths, `MERGE`, pattern comprehensions) is a separate workstream. Relationship properties round-trip today through the JSON-LD surface that imports emit. |
 
-The reserved-predicate firewall rejects user-authored `f:reifies*` predicates on normal write surfaces (JSON-LD and SPARQL UPDATE). The way to mint annotations through application writes is `@annotation` / `@edge` (JSON-LD) or the RDF 1.2 annotation tail (`~`, `{| |}`) in SPARQL — not direct `f:reifiesSubject` triples. Bulk import is an administrative bootstrap path: it may ingest already-lowered `f:reifies*` bundles, marks the ledger as annotation-bearing, and lets the indexer seal the annotation arena from those durable facts.
+The reserved-predicate firewall rejects user-authored `f:reifies*` predicates on normal write surfaces (JSON-LD and SPARQL UPDATE). The way to mint annotations through application writes is `@annotation` / `@edge` (JSON-LD) or the RDF 1.2 annotation tail (`~`, `{| |}`) in SPARQL — not direct `f:reifiesSubject` triples. Bulk import is an administrative bootstrap path: it may ingest already-lowered `f:reifies*` bundles, marks the ledger as annotation-bearing, and lets the indexer seal the annotation arena from those durable facts. Import does **not** validate that input — bundle well-formedness and the single-target invariant (below) are checked at arena-build time and surfaced as a `tracing::warn!` plus a count (`multi_target_annotations`, `observed_malformed_bundle_count`), **not** rejected. Feeding malformed `f:reifies*` data therefore yields a data-quality signal rather than an error, and a malformed bundle can still match a query. Application writes (JSON-LD / SPARQL UPDATE) are validated up front and cannot produce these.
 
 ## The surface
 
@@ -341,7 +341,7 @@ In LPG mode, an empty block mints a fresh annotation subject — a property-less
 
 ## SPARQL 1.2 / RDF 1.2 surface
 
-`@annotation` lowers to the same on-disk model as the RDF 1.2 annotation tail. All four equivalent forms below produce identical storage; pick whichever is ergonomic for your input.
+`@annotation` lowers to the same on-disk model as the RDF 1.2 annotation tail. The equivalent **write** forms below produce identical storage; pick whichever is ergonomic for your input. (`@reifies` / `rdf:reifies` are **query-side** constructs — see [Querying annotation-rooted](#querying-annotation-rooted-metadata-first-edge-second) — and are rejected on the write side.)
 
 ### Equivalent forms
 
@@ -354,19 +354,6 @@ JSON-LD `@annotation`:
     "@id": "ex:acme",
     "@annotation": { "ex:role": "Engineer" }
   }
-}
-```
-
-JSON-LD `@reifies` (annotation-rooted form):
-
-```json
-{
-  "@id": "ex:ann1",
-  "@reifies": {
-    "@id": "ex:alice",
-    "ex:worksFor": { "@id": "ex:acme" }
-  },
-  "ex:role": "Engineer"
 }
 ```
 
@@ -461,6 +448,10 @@ Per SPARQL §4.1.4, a blank-node label in a `WHERE` clause is a **non-distinguis
 
 Anonymous annotation blocks (`{| |}` without `~`) lower to a fresh non-distinguished variable internally (the formatter hides it from `SELECT *` so query output stays clean).
 
+#### One annotation, one edge (single-target invariant)
+
+An annotation subject reifies **exactly one live edge**. A single edge can carry many parallel annotations, but a given annotation `@id` cannot point at two different edges at once. Asserting an attachment that would leave one annotation reifying two edges is rejected at stage time with an `InvariantViolation`. To move an explicit-IRI annotation from one edge to another, retract the old attachment and assert the new one in the same transaction — the retract + assert nets to a single live edge and is accepted. (This keeps the reverse lookup, retract cascade, and by-id cleanup unambiguous. Bulk import does not enforce this up front — see the import caveat above.)
+
 #### Lifecycle coupling
 
 Fluree's annotation is *lifecycle-coupled* to an asserted edge: the annotation describes a triple that's currently in the graph. RDF 1.2 also allows reifiers for unasserted propositions ("X claims Alice works for Acme without us asserting it"). That mode is **not supported in v1** — see *Current limits* below.
@@ -473,6 +464,8 @@ These produce a clear error with a span pointing at the offending construct:
 - **Nested triple terms.** `<<( :s :p <<( :a :b :c )>> )>>` is rejected.
 - **Multi-triple reifiers.** One reifier identifier reifying more than one triple term in the same scope is rejected. A reifier corresponds to one edge occurrence.
 - **Annotation on a property-path triple.** `?s ex:p1/ex:p2 ?o {| ... |}` is rejected — the grammar only attaches annotations to simple-predicate triples.
+- **Annotation tail inside an explicit `GRAPH { }` block.** `INSERT DATA { GRAPH <g> { :s :p :o {| ... |} } }` is rejected. SPARQL UPDATE annotations are **default-graph only** in v1 — the SPARQL lowering does not emit `f:reifiesGraph`. Use the JSON-LD `@annotation` surface to annotate an edge inside a named graph.
+- **Annotation tail under a `WITH <g>` template.** `WITH <g> INSERT { :s :p :o {| ... |} } WHERE { ... }` is rejected for the same reason: `WITH` would re-home the synthetic reification into `<g>` without a `f:reifiesGraph` slot, yielding a default-graph edge identity in a named graph. Again, use the JSON-LD surface for named-graph edge annotations.
 - **SPARQL `CONSTRUCT` template projecting annotation metadata.** Until the Turtle-star vs RDF 1.2 reifier output decision lands, a CONSTRUCT template containing an annotation tail or `rdf:reifies` returns `UnsupportedFeature`. CONSTRUCT *without* annotation in the template still works even when the WHERE pattern uses annotations to filter.
 
 Annotations on literal-valued objects (plain, typed, and language-tagged) are supported on **both** the JSON-LD and SPARQL UPDATE write surfaces — the SPARQL path emits `f:reifiesLang` for language-tagged objects so the stored reifier matches the base edge.
@@ -540,6 +533,6 @@ A full Cypher front-end is its own workstream — path values, `MERGE`, pattern 
 ## See also
 
 - [Edge annotations design](../design/edge-annotations.md) — storage internals (EdgeKey, sidecar arena, sticky-bit state machine, GC reachability).
-- [Datasets and named graphs](datasets-and-named-graphs.md) — annotations work in named graphs as well as the default graph.
+- [Datasets and named graphs](datasets-and-named-graphs.md) — annotations work in named graphs (via the JSON-LD `@annotation` surface) as well as the default graph; the SPARQL UPDATE surface is default-graph only.
 - [Time travel](time-travel.md) — annotation events live in history like every other fact.
 - [Policy enforcement](policy-enforcement.md) — annotation properties pass through normal policy checks.

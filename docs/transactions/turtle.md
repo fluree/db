@@ -441,7 +441,7 @@ ex:dataset-import-2024-01-22 a ex:DatasetImport ;
 
 ## Edge annotations (RDF 1.2 / Turtle-star)
 
-The Turtle ingest path is RDF 1.1 + Fluree extensions. It does **not** parse RDF 1.2 annotation tails (`{| ... |}`), the `~` reifier, or the parenthesized `<<( ... )>>` triple term. A `.ttl` file containing those productions will fail to parse.
+The Turtle ingest path — and the related N-Triples (`.nt`), TriG, and N-Quads paths, which share the same lexer — is RDF 1.1 + Fluree extensions. It does **not** parse RDF 1.2 annotation tails (`{| ... |}`), the `~` reifier, or the parenthesized `<<( ... )>>` triple term. A file containing those productions **fails to parse** with a lexer error (e.g. `unexpected character '~'`; a `<<` triple term errors as a malformed IRI) — the data is rejected, not silently ingested without the annotations.
 
 If you want to ingest edge annotations on data that lives in Turtle today, two paths work:
 

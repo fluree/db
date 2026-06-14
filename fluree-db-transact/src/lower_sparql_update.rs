@@ -516,8 +516,9 @@ fn reject_with_scoped_annotations(pattern: &QuadPattern) -> Result<(), LowerErro
             if tp.annotation.is_some() {
                 return Err(LowerError::UnsupportedFeature {
                     feature: "RDF 1.2 annotation tail (`{| ... |}`) on a WITH-scoped \
-                              SPARQL UPDATE template (named-graph edge annotations are \
-                              not yet supported — f:reifiesGraph is omitted in v1)",
+                              SPARQL UPDATE template (SPARQL UPDATE annotations are \
+                              default-graph only; use the JSON-LD @annotation surface to \
+                              annotate an edge in a named graph)",
                     span: tp.span,
                 });
             }
