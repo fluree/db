@@ -252,12 +252,34 @@ pub use fluree_db_sparql::{
 // Re-export Cypher types (product feature; always enabled).
 pub use fluree_db_cypher::{
     lower_cypher, parse_cypher, CypherAst, DiagCode as CypherDiagCode,
-    Diagnostic as CypherDiagnostic, LowerError as CypherLowerError,
+    Diagnostic as CypherDiagnostic, LowerError as CypherLowerError, ParamMap as CypherParamMap,
     ParseOutput as CypherParseOutput, Severity as CypherSeverity, SourceSpan as CypherSourceSpan,
 };
 pub use fluree_db_transact::lower_cypher_update::{
     lower_cypher_update, CypherLowerOpts, LowerCypherError,
 };
+
+/// Split a Cypher request body into its statement and optional parameters.
+///
+/// Accepts either a raw Cypher string, or a JSON envelope
+/// `{"cypher": "...", "params": {...}}` (the Neo4j-HTTP-style shape). A body
+/// that doesn't parse as a JSON object with a `cypher` key is returned
+/// verbatim as the statement with no params, so plain-text Cypher still works.
+/// Shared by the HTTP routes and the CLI so both accept the same two shapes.
+pub fn extract_cypher_envelope(body: &str) -> (String, Option<CypherParamMap>) {
+    let trimmed = body.trim_start();
+    if trimmed.starts_with('{') {
+        if let Ok(serde_json::Value::Object(obj)) =
+            serde_json::from_str::<serde_json::Value>(trimmed)
+        {
+            if let Some(cypher) = obj.get("cypher").and_then(|v| v.as_str()) {
+                let params = obj.get("params").and_then(|v| v.as_object()).cloned();
+                return (cypher.to_string(), params);
+            }
+        }
+    }
+    (body.to_string(), None)
+}
 
 // Re-export policy types for access control
 pub use fluree_db_policy::{
@@ -3308,8 +3330,19 @@ impl Fluree {
         ledger: LedgerState,
         cypher: &str,
     ) -> Result<TransactResult> {
+        self.transact_cypher_with_params(ledger, cypher, None).await
+    }
+
+    /// Like [`transact_cypher`](Self::transact_cypher) but substitutes
+    /// `$param` references from `params` before lowering.
+    pub async fn transact_cypher_with_params(
+        &self,
+        ledger: LedgerState,
+        cypher: &str,
+        params: Option<&fluree_db_cypher::ParamMap>,
+    ) -> Result<TransactResult> {
         let txn = self
-            .lower_cypher_to_txn(ledger.ledger_id(), &ledger.snapshot, cypher)
+            .lower_cypher_to_txn(ledger.ledger_id(), &ledger.snapshot, cypher, params)
             .await?;
         self.stage_owned(ledger).txn(txn).execute().await
     }
@@ -3325,6 +3358,7 @@ impl Fluree {
         ledger_id: &str,
         snapshot: &fluree_db_core::LedgerSnapshot,
         cypher: &str,
+        params: Option<&fluree_db_cypher::ParamMap>,
     ) -> Result<fluree_db_transact::ir::Txn> {
         let out = fluree_db_cypher::parse_cypher(cypher);
         if out.has_errors() {
@@ -3336,9 +3370,16 @@ impl Fluree {
                 .join("; ");
             return Err(ApiError::cypher(msg, out.diagnostics));
         }
-        let ast = out
+        let mut ast = out
             .ast
             .ok_or_else(|| ApiError::cypher("Cypher parse returned no AST", Vec::new()))?;
+
+        // Substitute `$param` references before lowering. Always run (empty
+        // map when no params were supplied) so an unfilled `$param` reports a
+        // clear missing-parameter error.
+        let empty = fluree_db_cypher::ParamMap::new();
+        fluree_db_cypher::substitute_params(&mut ast, params.unwrap_or(&empty))
+            .map_err(|e| ApiError::cypher(e.to_string(), Vec::new()))?;
 
         // Pull @vocab and term overrides out of the ledger's default context so
         // write Cypher resolves bare identifiers the same way `query_cypher`

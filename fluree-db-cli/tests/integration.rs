@@ -2270,3 +2270,51 @@ fn cypher_query_and_write_round_trip() {
         .success()
         .stdout(predicate::str::contains("Carol"));
 }
+
+#[test]
+fn cypher_parameters_via_json_envelope() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    fluree_cmd(&tmp).args(["create", "cypherparamdb"]).assert().success();
+
+    fluree_cmd(&tmp)
+        .args([
+            "insert",
+            "-e",
+            r#"{"@context": {"ex": "http://example.org/"}, "@graph": [{"@id": "ex:alice", "@type": "ex:Person", "ex:name": "Alice"}, {"@id": "ex:bob", "@type": "ex:Person", "ex:name": "Bob"}]}"#,
+        ])
+        .assert()
+        .success();
+
+    // Parameterized Cypher read via the {cypher, params} envelope (--cypher forces format).
+    fluree_cmd(&tmp)
+        .args([
+            "query",
+            "--cypher",
+            "-e",
+            r#"{"cypher": "MATCH (n:Person {name: $name}) RETURN n.name", "params": {"name": "Alice"}}"#,
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Alice"))
+        .stdout(predicate::str::contains("Bob").not());
+
+    // Parameterized Cypher write via envelope.
+    fluree_cmd(&tmp)
+        .args([
+            "update",
+            "--format",
+            "cypher",
+            "-e",
+            r#"{"cypher": "CREATE (n:Person {name: $name})", "params": {"name": "Carol"}}"#,
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Committed"));
+
+    fluree_cmd(&tmp)
+        .args(["query", "--cypher", "-e", "MATCH (n:Person) RETURN n.name"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Carol"));
+}

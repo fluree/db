@@ -29,6 +29,7 @@ commit path as SPARQL UPDATE so the in-memory cache stays current.
 | Write — `MATCH … SET` | `SET n.prop = lit`, `SET n += {…}`, `SET n:Label` | `TxnType::Update`; property forms use an OPTIONAL old-value WHERE binding so the prior value is retracted and the new one asserted (single-valued replace; absent property skips the delete). Labels are additive. |
 | Write — `MATCH … REMOVE` | `REMOVE n.prop`, `REMOVE n:Label` | `TxnType::Update`. |
 | Write — `MATCH … CREATE` | Template-driven writes: CREATE nodes bound by MATCH reference the matched node; unbound vars mint new nodes per solution | `TxnType::Update`. |
+| Parameters (`$param`) | Scalar and flat-list (`UNWIND $ids`) parameters, on read and write, across API / CLI / HTTP | AST pre-substitution (`fluree_db_cypher::substitute_params`) replaces `$name` with the supplied value before lowering. Supplied as a JSON map; over HTTP/CLI via the `{"cypher": "...", "params": {...}}` envelope (raw Cypher still works). Missing param → clear error. Map/object params and nested collections rejected. |
 
 The MATCH→WHERE foundation lowers leading `MATCH`/`OPTIONAL MATCH`
 (node labels + inline property filters + directed single-typed
@@ -45,7 +46,7 @@ DELETE/INSERT templates sharing variable ids via the shared
 | `SET n = {…}` (bounded replace) | Needs a predicate-**variable** scan with a literal-object + non-`rdf:type` + non-`f:*` filter to bound the retract scope safely. Deferred to land with the DELETE slice (same predicate-var machinery). `SET n += {…}` covers the common per-key case. |
 | `WHERE` filter expressions in a **write** MATCH | Requires lowering Cypher `Expr` → `UnresolvedExpression`. Inline property filters (`(n:Label {key: val})`) cover find-by-key today; explicit `WHERE n.x > 1 SET …` is the follow-up. |
 | Named / untyped / alternation relationships in a **write** MATCH | Read path supports them; write MATCH currently requires a directed single-typed relationship. Named-rel binding (needed for `SET r.prop`) maps to `EdgeAnnotation` in WHERE — a thin follow-up. |
-| Parameters (`$param`) | Not threaded through `query_cypher`/`transact_cypher` or any lowering site. Blocks driver compatibility; tracked as its own P0. |
+| Map/object `$param` values; nested collections; whole-map node params (`(n $props)`) | v1 supports scalar and flat-list params only; object params and array-of-maps are rejected with a clear error. Whole-map node-property params need a map-valued `Expr` the AST doesn't carry yet. |
 | HTTP tracking / delimited / agent-json / identity-scoped policy for Cypher | The Cypher HTTP routes return JSON-LD only and don't negotiate tracking, TSV/CSV, agent-json, or `opts.identity`/policy-class yet (the bearer read/write scope check IS enforced). Follow-up to reach SPARQL/JSON-LD parity. |
 | Variable-length paths, path values, `shortestPath`, `collect()`/list values, reflection (`labels/type/keys/properties/id`), undirected, bare `(n)`, `LOAD CSV`, `FOREACH`, `CALL proc`, schema DDL, multi-statement | Per the original plan's deferral list below (engine work or product decisions). |
 
@@ -597,7 +598,7 @@ reviewable.
 | M5.3 | Query-path lower → shared IR; first round-trip with JSON-LD | ✅ Done |
 | M5.4 | Write surface — CREATE / SET / REMOVE / MATCH…CREATE → `Txn` | 🟡 Partial — CREATE, MATCH…SET, MATCH…REMOVE, MATCH…CREATE done; DELETE / DETACH DELETE and `SET n = {…}` deferred (see Implementation status) |
 | M5.5 | Single-node MERGE + ON CREATE / ON MATCH | ⬜ Deferred (API-level search-then-stage) |
-| M5.6 | HTTP + CLI wiring, content negotiation, parameter passing | 🟡 Partial — CLI (read + write, auto-detect) and HTTP ledger-scoped routes (`application/cypher` on query/update) both wired; remaining: parameter passing and HTTP content-negotiation parity (tracking/delimited/agent-json/policy) |
+| M5.6 | HTTP + CLI wiring, content negotiation, parameter passing | 🟡 Partial — CLI (read + write, auto-detect), HTTP ledger-scoped routes (`application/cypher` on query/update), and parameter passing (scalar/list, `{cypher,params}` envelope) all wired; remaining: HTTP content-negotiation parity (tracking/delimited/agent-json/policy) |
 | M5.7 | Tests, docs, openCypher TCK subset | 🟡 Partial — lowering + end-to-end round-trip tests for the shipped surface; TCK subset not yet |
 
 Variable-length paths (formerly M5.6) are removed from v1 — see

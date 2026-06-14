@@ -971,8 +971,13 @@ async fn run_cypher_query(
         view
     };
 
+    // Accept either raw Cypher or a `{"cypher": "...", "params": {...}}`
+    // envelope (the latter carries parameters).
+    let (cypher, params) = fluree_db_api::extract_cypher_envelope(content);
     let timer = Instant::now();
-    let result = fluree.query_cypher(&view, content).await?;
+    let result = fluree
+        .query_cypher_with_params(&view, &cypher, params.as_ref())
+        .await?;
     let elapsed = timer.elapsed();
 
     // Delimited fast path mirrors the SPARQL/JSON-LD handler.

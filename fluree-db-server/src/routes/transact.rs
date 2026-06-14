@@ -1712,7 +1712,8 @@ async fn execute_cypher_transact(
 ) -> Result<Response> {
     enforce_write_access(state, ledger_id, bearer, credential)?;
 
-    let tx_id = compute_tx_id_sparql(cypher);
+    let (cypher, params) = fluree_db_api::extract_cypher_envelope(cypher);
+    let tx_id = compute_tx_id_sparql(&cypher);
     let handle = state
         .fluree
         .ledger_cached(ledger_id)
@@ -1721,7 +1722,7 @@ async fn execute_cypher_transact(
     let cached_state = handle.snapshot().await;
     let txn = state
         .fluree
-        .lower_cypher_to_txn(ledger_id, &cached_state.snapshot, cypher)
+        .lower_cypher_to_txn(ledger_id, &cached_state.snapshot, &cypher, params.as_ref())
         .await
         .map_err(|e| {
             set_span_error_code(span, "error:InvalidTransaction");

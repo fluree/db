@@ -110,6 +110,7 @@ pub(crate) fn parse_cypher_to_ir(
     cypher: &str,
     snapshot: &LedgerSnapshot,
     default_context: Option<&JsonValue>,
+    params: Option<&fluree_db_cypher::ParamMap>,
 ) -> Result<(VarRegistry, Query)> {
     let out = fluree_db_cypher::parse_cypher(cypher);
     if out.has_errors() {
@@ -121,9 +122,17 @@ pub(crate) fn parse_cypher_to_ir(
             .join("; ");
         return Err(ApiError::cypher(msg, out.diagnostics));
     }
-    let ast = out
+    let mut ast = out
         .ast
         .ok_or_else(|| ApiError::cypher("Cypher parse returned no AST", Vec::new()))?;
+
+    // Substitute `$param` references before lowering, so the lowering path
+    // only ever sees concrete literals. Always run (empty map when no params
+    // were supplied) so a `$param` with no value reports a clear missing-
+    // parameter error rather than reaching the lowering as an unsupported node.
+    let empty = fluree_db_cypher::ParamMap::new();
+    fluree_db_cypher::substitute_params(&mut ast, params.unwrap_or(&empty))
+        .map_err(|e| ApiError::cypher(e.to_string(), Vec::new()))?;
 
     // Pull `@vocab` and named-term overrides out of the default
     // context, then build a `LoweringContext` and pass it to the

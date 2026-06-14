@@ -140,6 +140,51 @@ async fn cypher_http_read_write_round_trip() {
 }
 
 #[tokio::test]
+async fn cypher_http_json_envelope_with_params() {
+    let (_tmp, state) = server_state().await;
+    create_ledger(&state, "cypherparams").await;
+    insert(
+        &state,
+        "cypherparams",
+        json!({
+            "@context": {"ex": "http://example.org/"},
+            "@graph": [
+                {"@id": "ex:alice", "@type": "ex:Person", "ex:name": "Alice"},
+                {"@id": "ex:bob",   "@type": "ex:Person", "ex:name": "Bob"},
+            ]
+        }),
+    )
+    .await;
+
+    // Parameterized write via the {cypher, params} envelope.
+    let (status, body) = post_cypher(
+        &state,
+        "/v1/fluree/update/cypherparams",
+        &json!({
+            "cypher": "CREATE (n:Person {name: $name})",
+            "params": {"name": "Carol"}
+        })
+        .to_string(),
+    )
+    .await;
+    assert!(status.is_success(), "param write status={status}; body={body}");
+
+    // Parameterized read via the envelope.
+    let (status, body) = post_cypher(
+        &state,
+        "/v1/fluree/query/cypherparams",
+        &json!({
+            "cypher": "MATCH (n:Person {name: $name}) RETURN n.name",
+            "params": {"name": "Carol"}
+        })
+        .to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "param read; body={body}");
+    assert!(body.contains("Carol"), "param read body: {body}");
+}
+
+#[tokio::test]
 async fn cypher_parse_error_is_client_error() {
     let (_tmp, state) = server_state().await;
     create_ledger(&state, "cypherbad").await;

@@ -1699,6 +1699,7 @@ async fn execute_cypher_ledger(
     cypher: &str,
     span: &tracing::Span,
 ) -> Result<Response> {
+    let (cypher, params) = fluree_db_api::extract_cypher_envelope(cypher);
     let view = state
         .fluree
         .db_with_default_context(ledger_id)
@@ -1706,7 +1707,7 @@ async fn execute_cypher_ledger(
         .map_err(ServerError::Api)?;
     let result = state
         .fluree
-        .query_cypher(&view, cypher)
+        .query_cypher_with_params(&view, &cypher, params.as_ref())
         .await
         .map_err(|e| {
             set_span_error_code(span, "error:InvalidQuery");

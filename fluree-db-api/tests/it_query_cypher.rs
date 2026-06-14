@@ -331,6 +331,69 @@ async fn transact_cypher_remove_property_retracts_value() {
 }
 
 #[tokio::test]
+async fn cypher_query_with_parameter_filters() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/cypher:param-read");
+    let txn = json!({
+        "@context": ctx(),
+        "@graph": [
+            {"@id": "ex:alice", "@type": "ex:Person", "ex:name": "Alice"},
+            {"@id": "ex:bob",   "@type": "ex:Person", "ex:name": "Bob"},
+        ]
+    });
+    let committed = fluree.insert(ledger0, &txn).await.expect("seed");
+    let db = graphdb_from_ledger(&committed.ledger);
+
+    let params = json!({ "name": "Alice" });
+    let result = fluree
+        .query_cypher_with_params(
+            &db,
+            "MATCH (n:Person {name: $name}) RETURN n",
+            params.as_object(),
+        )
+        .await
+        .expect("param query");
+    assert_eq!(result.row_count(), 1, "only the matching name binds");
+}
+
+#[tokio::test]
+async fn cypher_query_missing_parameter_errors() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/cypher:param-missing");
+    let db = graphdb_from_ledger(&ledger0);
+
+    // No params supplied for `$name`.
+    let r = fluree
+        .query_cypher_with_params(&db, "MATCH (n:Person {name: $name}) RETURN n", None)
+        .await;
+    let err = format!("{}", r.expect_err("should error on missing param"));
+    assert!(err.contains("name"), "error should name the param: {err}");
+}
+
+#[tokio::test]
+async fn transact_cypher_with_parameters_creates_node() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/cypher:param-write");
+
+    let params = json!({ "name": "Dana", "age": 27 });
+    let result = fluree
+        .transact_cypher_with_params(
+            ledger0,
+            "CREATE (n:Person {name: $name, age: $age})",
+            params.as_object(),
+        )
+        .await
+        .expect("param create");
+
+    let db = graphdb_from_ledger(&result.ledger);
+    let rows = fluree
+        .query_cypher(&db, r#"MATCH (n:Person {name: "Dana"}) RETURN n"#)
+        .await
+        .expect("verify");
+    assert_eq!(rows.row_count(), 1, "parameterized CREATE should persist");
+}
+
+#[tokio::test]
 async fn transact_cypher_merge_returns_specific_deferred_error() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger0 = genesis_ledger(&fluree, "it/cypher:merge-deferred");

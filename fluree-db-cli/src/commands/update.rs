@@ -197,7 +197,10 @@ pub async fn run(
                     ));
                 }
                 let ledger = fluree.ledger(&alias).await?;
-                let result = fluree.transact_cypher(ledger, &content).await?;
+                let (cypher, params) = fluree_db_api::extract_cypher_envelope(&content);
+                let result = fluree
+                    .transact_cypher_with_params(ledger, &cypher, params.as_ref())
+                    .await?;
                 println!(
                     "Committed t={}, {} flakes",
                     result.receipt.t, result.receipt.flake_count

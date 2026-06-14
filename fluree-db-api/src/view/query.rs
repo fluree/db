@@ -153,9 +153,20 @@ impl Fluree {
     /// identifier overrides; see `parse_cypher_to_ir` for the resolution
     /// rules.
     pub async fn query_cypher(&self, db: &GraphDb, cypher: &str) -> Result<QueryResult> {
+        self.query_cypher_with_params(db, cypher, None).await
+    }
+
+    /// Like [`query_cypher`](Self::query_cypher) but substitutes `$param`
+    /// references from `params` (a JSON map of name → value) before lowering.
+    pub async fn query_cypher_with_params(
+        &self,
+        db: &GraphDb,
+        cypher: &str,
+        params: Option<&fluree_db_cypher::ParamMap>,
+    ) -> Result<QueryResult> {
         let parse_start = std::time::Instant::now();
         let (vars, mut parsed) =
-            parse_cypher_to_ir(cypher, &db.snapshot, db.default_context.as_ref())?;
+            parse_cypher_to_ir(cypher, &db.snapshot, db.default_context.as_ref(), params)?;
         let parse_ms = parse_start.elapsed().as_secs_f64() * 1000.0;
 
         maybe_wrap_for_graph_source(db, &mut parsed);
