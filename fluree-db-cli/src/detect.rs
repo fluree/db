@@ -106,6 +106,35 @@ pub fn detect_query_format(
     sniff_query_format(content)
 }
 
+/// Whether a query should be treated as Cypher.
+///
+/// Cypher is dispatched out-of-band from the SPARQL/JSON-LD `QueryFormat`
+/// path because it uses a separate API method and result shape. Priority:
+/// explicit `--cypher` flag > `.cypher`/`.cyp`/`.cql` extension > content
+/// sniff. The sniffed lead keywords (`MATCH`/`MERGE`/`UNWIND`/`OPTIONAL`/
+/// `DETACH`/`CREATE`) do not collide with any valid SPARQL query (which
+/// leads with SELECT/ASK/CONSTRUCT/DESCRIBE/PREFIX/BASE) or JSON-LD (which
+/// is JSON), so auto-detection never reinterprets an existing query.
+pub fn detect_is_cypher(path: Option<&Path>, content: &str, cypher_flag: bool) -> bool {
+    if cypher_flag {
+        return true;
+    }
+    if let Some(p) = path {
+        if let Some(ext) = p.extension().and_then(|e| e.to_str()) {
+            if matches!(ext.to_lowercase().as_str(), "cypher" | "cyp" | "cql") {
+                return true;
+            }
+        }
+    }
+    sniff_is_cypher(content)
+}
+
+fn sniff_is_cypher(content: &str) -> bool {
+    let upper = content.trim_start().to_uppercase();
+    const CYPHER_LEAD: [&str; 6] = ["MATCH ", "MERGE ", "UNWIND ", "OPTIONAL ", "DETACH ", "CREATE "];
+    CYPHER_LEAD.iter().any(|kw| upper.starts_with(kw))
+}
+
 fn sniff_query_format(content: &str) -> CliResult<QueryFormat> {
     let trimmed = content.trim();
 
@@ -127,4 +156,37 @@ fn sniff_query_format(content: &str) -> CliResult<QueryFormat> {
         "could not detect query format\n  {} use --sparql or --jsonld to specify",
         colored::Colorize::bold(colored::Colorize::cyan("help:"))
     )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn cypher_flag_forces_cypher() {
+        assert!(detect_is_cypher(None, "SELECT * WHERE { ?s ?p ?o }", true));
+    }
+
+    #[test]
+    fn cypher_by_extension() {
+        assert!(detect_is_cypher(Some(Path::new("q.cypher")), "anything", false));
+        assert!(detect_is_cypher(Some(Path::new("q.cyp")), "anything", false));
+    }
+
+    #[test]
+    fn cypher_sniffed_by_lead_keyword() {
+        assert!(detect_is_cypher(None, "MATCH (n:Person) RETURN n", false));
+        assert!(detect_is_cypher(None, "  merge (n:Person {x:1})", false));
+        assert!(detect_is_cypher(None, "CREATE (n:Person)", false));
+    }
+
+    #[test]
+    fn non_cypher_not_misdetected() {
+        // SPARQL and JSON-LD must never sniff as Cypher.
+        assert!(!detect_is_cypher(None, "SELECT * WHERE { ?s ?p ?o }", false));
+        assert!(!detect_is_cypher(None, "ASK { ?s ?p ?o }", false));
+        assert!(!detect_is_cypher(None, "PREFIX ex: <http://e/>\nSELECT *", false));
+        assert!(!detect_is_cypher(None, r#"{"select":["?s"],"where":{}}"#, false));
+    }
 }

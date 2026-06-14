@@ -10,9 +10,12 @@
 
 ## Implementation status
 
-**Reachable today only through the Rust library API**
-(`Fluree::query_cypher`, `Fluree::transact_cypher`). HTTP routes and the
-CLI flag (M5.6) are **not yet wired** — see Deferred.
+**Reachable through the Rust library API** (`Fluree::query_cypher`,
+`Fluree::transact_cypher`) **and the CLI** (`fluree query --cypher …`,
+`fluree update --format cypher …`, plus auto-detection by lead keyword /
+`.cypher` extension). CLI Cypher is **local-only** — the HTTP route is
+still not wired, so a server-routed ledger errors with a `--direct`
+pointer. See Deferred.
 
 ### Done
 
@@ -40,7 +43,7 @@ DELETE/INSERT templates sharing variable ids via the shared
 | `WHERE` filter expressions in a **write** MATCH | Requires lowering Cypher `Expr` → `UnresolvedExpression`. Inline property filters (`(n:Label {key: val})`) cover find-by-key today; explicit `WHERE n.x > 1 SET …` is the follow-up. |
 | Named / untyped / alternation relationships in a **write** MATCH | Read path supports them; write MATCH currently requires a directed single-typed relationship. Named-rel binding (needed for `SET r.prop`) maps to `EdgeAnnotation` in WHERE — a thin follow-up. |
 | Parameters (`$param`) | Not threaded through `query_cypher`/`transact_cypher` or any lowering site. Blocks driver compatibility; tracked as its own P0. |
-| HTTP routes + CLI flag (M5.6) | Never wired — Cypher is library-only today. |
+| HTTP routes (M5.6) | Server content-negotiation/route not wired — Cypher has no remote endpoint. The CLI covers local use; remote needs the route. |
 | Variable-length paths, path values, `shortestPath`, `collect()`/list values, reflection (`labels/type/keys/properties/id`), undirected, bare `(n)`, `LOAD CSV`, `FOREACH`, `CALL proc`, schema DDL, multi-statement | Per the original plan's deferral list below (engine work or product decisions). |
 
 ---
@@ -591,7 +594,7 @@ reviewable.
 | M5.3 | Query-path lower → shared IR; first round-trip with JSON-LD | ✅ Done |
 | M5.4 | Write surface — CREATE / SET / REMOVE / MATCH…CREATE → `Txn` | 🟡 Partial — CREATE, MATCH…SET, MATCH…REMOVE, MATCH…CREATE done; DELETE / DETACH DELETE and `SET n = {…}` deferred (see Implementation status) |
 | M5.5 | Single-node MERGE + ON CREATE / ON MATCH | ⬜ Deferred (API-level search-then-stage) |
-| M5.6 | HTTP + CLI wiring, content negotiation, parameter passing | ⬜ Not started — Cypher is library-only |
+| M5.6 | HTTP + CLI wiring, content negotiation, parameter passing | 🟡 Partial — CLI read (`query --cypher`) + write (`update --format cypher`) wired with auto-detection (local-only); HTTP route and parameter passing still pending |
 | M5.7 | Tests, docs, openCypher TCK subset | 🟡 Partial — lowering + end-to-end round-trip tests for the shipped surface; TCK subset not yet |
 
 Variable-length paths (formerly M5.6) are removed from v1 — see

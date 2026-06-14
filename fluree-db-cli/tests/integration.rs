@@ -2199,3 +2199,74 @@ fn update_via_stdin() {
         .success()
         .stdout(predicate::str::contains("Committed t=1"));
 }
+
+#[test]
+fn cypher_query_and_write_round_trip() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    fluree_cmd(&tmp).args(["create", "cypherdb"]).assert().success();
+
+    // Seed a Person via JSON-LD (ex: = http://example.org/, the Cypher
+    // resolver's default @vocab — so `Person`/`name`/`age` line up).
+    fluree_cmd(&tmp)
+        .args([
+            "insert",
+            "-e",
+            r#"{"@context": {"ex": "http://example.org/"}, "@id": "ex:alice", "@type": "ex:Person", "ex:name": "Alice", "ex:age": 30}"#,
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Committed t=1"));
+
+    // Cypher read (explicit --cypher), default JSON output.
+    fluree_cmd(&tmp)
+        .args(["query", "--cypher", "-e", "MATCH (n:Person) RETURN n.name"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Alice"));
+
+    // Cypher read via auto-detection (no flag; leading MATCH).
+    fluree_cmd(&tmp)
+        .args(["query", "-e", "MATCH (n:Person) RETURN n.name"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Alice"));
+
+    // Cypher write: MATCH … SET (explicit --format cypher).
+    fluree_cmd(&tmp)
+        .args([
+            "update",
+            "--format",
+            "cypher",
+            "-e",
+            r#"MATCH (n:Person {name: "Alice"}) SET n.age = 42"#,
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Committed"));
+
+    // The new age is visible; the old one is gone.
+    fluree_cmd(&tmp)
+        .args([
+            "query",
+            "--cypher",
+            "-e",
+            "MATCH (n:Person) WHERE n.age > 40 RETURN n.name",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Alice"));
+
+    // Cypher write via auto-detection (leading `CREATE (`).
+    fluree_cmd(&tmp)
+        .args(["update", "-e", r#"CREATE (n:Person {name: "Carol"})"#])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Committed"));
+
+    fluree_cmd(&tmp)
+        .args(["query", "--cypher", "-e", "MATCH (n:Person) RETURN n.name"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Carol"));
+}

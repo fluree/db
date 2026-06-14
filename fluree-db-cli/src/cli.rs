@@ -481,6 +481,10 @@ pub enum Commands {
         #[arg(long, conflicts_with = "sparql")]
         jsonld: bool,
 
+        /// Force openCypher query format (local ledgers only)
+        #[arg(long, conflicts_with_all = ["sparql", "jsonld"])]
+        cypher: bool,
+
         /// Query at a specific point in time (transaction number, commit hash, or ISO-8601 timestamp)
         #[arg(long)]
         at: Option<String>,
