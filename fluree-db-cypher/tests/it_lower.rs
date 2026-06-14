@@ -115,27 +115,52 @@ fn bare_node_pattern_is_rejected() {
 }
 
 #[test]
-fn undirected_relationship_is_rejected() {
-    let out = parse_cypher("MATCH (a:Person)-[:KNOWS]-(b:Person) RETURN a, b");
-    assert!(!out.has_errors());
-    let ast = out.ast.unwrap();
-    let encoder = NoEncoder;
-    let mut vars = VarRegistry::new();
-    let r = lower_cypher(&ast, &encoder, &mut vars);
-    assert!(r.is_err(), "undirected should fail to lower");
+fn undirected_relationship_lowers_to_union() {
+    // `-[:KNOWS]-` matches either orientation → a `Union` of a forward and a
+    // reverse branch. Uses string-IRI predicates, so `NoEncoder` is fine.
+    let q = lower("MATCH (a:Person)-[:KNOWS]-(b:Person) RETURN a, b");
+    let has_union = q
+        .patterns
+        .iter()
+        .any(|p| matches!(p, Pattern::Union(branches) if branches.len() == 2));
+    assert!(has_union, "expected a 2-branch Union, got {:?}", q.patterns);
 }
 
 #[test]
-fn variable_length_path_is_rejected_at_lower() {
-    let out = parse_cypher("MATCH (a:Person)-[:KNOWS*1..3]->(b:Person) RETURN a, b");
-    // Parsing accepts it (AST captures the LengthRange); lowering
-    // rejects it.
-    assert!(!out.has_errors(), "parse should accept *1..3");
+fn bounded_variable_length_lowers_to_union_of_chains() {
+    // `*1..3` expands to a UNION of three fixed-length join chains (1, 2, 3
+    // hops). String-IRI predicates, so `NoEncoder` is fine.
+    let q = lower("MATCH (a:Person)-[:KNOWS*1..3]->(b:Person) RETURN a, b");
+    let union = q
+        .patterns
+        .iter()
+        .find_map(|p| match p {
+            Pattern::Union(branches) => Some(branches),
+            _ => None,
+        })
+        .expect("expected a Union of chains");
+    assert_eq!(union.len(), 3, "one chain per length 1..3");
+    // The k-hop chain has k triples (k-1 fresh intermediates).
+    let lens: Vec<usize> = union.iter().map(Vec::len).collect();
+    assert!(
+        lens.contains(&1) && lens.contains(&2) && lens.contains(&3),
+        "{lens:?}"
+    );
+}
+
+#[test]
+fn bound_variable_length_relationship_is_rejected() {
+    // Binding `r` to a variable-length relationship needs list values.
+    let out = parse_cypher("MATCH (a:Person)-[r:KNOWS*1..3]->(b) RETURN b");
+    assert!(!out.has_errors(), "parse should accept it");
     let ast = out.ast.unwrap();
     let encoder = NoEncoder;
     let mut vars = VarRegistry::new();
     let r = lower_cypher(&ast, &encoder, &mut vars);
-    assert!(r.is_err());
+    assert!(
+        r.is_err(),
+        "bound var-length relationship should be rejected"
+    );
 }
 
 #[test]

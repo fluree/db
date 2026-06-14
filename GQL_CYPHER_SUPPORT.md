@@ -282,19 +282,29 @@ the rule is transparent: bag semantics work as Cypher users expect.
 | `(a)-[:T {p:v}]->(b)` | Bag (per occurrence) | No |
 | `MATCH ... RETURN DISTINCT a, b` | Set | (irrelevant — DISTINCT) |
 
-### Variable-length paths — deferred
+### Variable-length paths — landed (endpoint-reachability semantics)
 
-`-[r*1..5]->` is **not in v1**. The existing `PropertyPathPattern`
-operator is reachability/closure-oriented: it answers "does a path
-exist from `a` to `b` via `T*`?" and returns the reachable endpoints.
-It does not enumerate distinct paths, does not produce one row per
-parallel edge along the way, and has no concept of binding a
-relationship-list variable.
+Anonymous variable-length relationships are now lowered (2026-06-14):
 
-Cypher `MATCH (a)-[*1..5]->(b)` semantically requires a
-**path-enumerating operator**: one solution per distinct walk through
-the graph, with multiplicity respecting parallel edges. This is its
-own executor design and is out of scope here.
+- **Bounded** `-[:T*m..n]->` expands to a `Union` of fixed-length join
+  chains (one chain per length, each with `k-1` fresh intermediate
+  nodes), honoring direction — undirected hops emit a forward∪reverse
+  `Union`. Capped at 16 hops.
+- **Unbounded** `-[:T*]->` / `-[:T*0..]->` reuses the existing transitive
+  `PropertyPathPattern` (`*`→`OneOrMore`, `*0..`→`ZeroOrMore`). Directed
+  only; unbounded-undirected and `*N..` (N>1) remain deferred.
+
+**Scope vs. full Cypher.** These produce **endpoint bindings**, not
+first-class path values, and the bounded chain expansion does **not**
+enforce Cypher's relationship-uniqueness rule (no repeated edge on a
+walk). For DAG/tree-shaped traversal (and the typical directed LDBC
+case) results match; on cyclic/undirected graphs a walk may revisit an
+edge and over-count. Binding a variable to the path (`-[r:T*]->`, a
+relationship *list*) and path values (`p = (...)`, `nodes()/relationships()
+/length(p)`) still need list/path-valued bindings — deferred. A true
+path-enumerating operator (one row per distinct walk, parallel-edge
+multiplicity) remains future work; the current lowering covers the
+reachability/bounded-neighborhood queries that dominate the benchmark.
 
 v1 rejects `-[r*...]->` and `-[*N..M]->` at parse time with a clear
 error pointing users at chained explicit hops or to wait for the
@@ -463,8 +473,10 @@ standard solution modifiers and a conservative expression sublanguage.**
 | `MATCH (a)-[r]->(b)` (untyped) | ✅ | Predicate is a Var. Implicitly filtered to exclude `f:reifies*` and other system predicates (reuses existing `include_system_facts = false`). |
 | `MATCH (a)-[r:T1\|T2]->(b)` | ✅ | Type alternatives via `Union`. |
 | `MATCH (a)<-[r:T]-(b)` | ✅ | Inverse direction (swap subject/object). |
-| `MATCH (a)-[r]-(b)` (undirected) | ❌ | Rejected — users write explicit direction. See Open Q1. |
-| `MATCH (a)-[*...]->(b)` (variable-length) | ❌ | Deferred — needs path-enumerating operator, see "Variable-length paths". |
+| `MATCH (a)-[:T]-(b)` (undirected) | ✅ | Forward∪reverse `Union` (reverse via the `Opst` object index). A bound rel var works for single-hop undirected. |
+| `MATCH (a)-[:T*m..n]->(b)` (bounded var-length) | ✅ | Expands to a `Union` of fixed-length join chains; honors direction incl. undirected hops. Anonymous rel only (a bound rel var binds a *list* — deferred). **Caveat:** does not enforce Cypher's relationship-uniqueness rule, so cyclic graphs can over-count; correct for DAG/tree traversal. |
+| `MATCH (a)-[:T*]->(b)` / `*0..` (unbounded var-length) | ✅ | Reuses the transitive `PropertyPathPattern` (`*`→OneOrMore, `*0..`→ZeroOrMore). Directed only; unbounded-undirected and `*N..` (N>1) deferred. |
+| `MATCH p = ...` (path value), `nodes()/relationships()/length(p)` | ❌ | Deferred — needs path-value IR + binding. |
 | `MATCH p = ...` (path value) | ❌ | Deferred — needs path-value IR. |
 | `OPTIONAL MATCH` | ✅ | Lowers to `Optional`. |
 | `WHERE expr` | ✅ | Conservative expression sublanguage — see "Expressions in v1" below. |
@@ -915,7 +927,7 @@ satisfies the property filter.
 **Direction handling:**
 - `Out` (`-[]->`): subject = a, object = b as shown.
 - `In` (`<-[]-`): subject = b, object = a (swap).
-- `Either` (`-[]-`): **rejected at parse/lower time**. See Open Q1.
+- `Either` (`-[]-`): **forward∪reverse `Union`** — the reverse branch finds the edge via the `Opst` object index (landed 2026-06-14).
 
 **Multiple types `[:T1|T2]`** (for shapes 1 and 2):
 

@@ -1,6 +1,6 @@
 //! Pattern lowering — Cypher MATCH patterns → fluree-db-query Pattern.
 
-use fluree_db_query::ir::{Pattern, Ref, Term, TriplePattern};
+use fluree_db_query::ir::{PathModifier, Pattern, PropertyPathPattern, Ref, Term, TriplePattern};
 use fluree_db_query::parse::encode::IriEncoder;
 
 use crate::ast::{
@@ -11,6 +11,11 @@ use crate::ast::{
 use super::context::LoweringContext;
 use super::expr::lower_literal;
 use super::{LowerError, Result};
+
+/// Upper bound on the fixed-length-chain expansion of a bounded variable-length
+/// path. LDBC and similar workloads use small bounds (`*1..3`); deeper bounded
+/// traversal should use an unbounded `*` instead of a huge UNION.
+const MAX_BOUNDED_HOPS: u32 = 16;
 
 /// Lower a Cypher pattern (used by MATCH / OPTIONAL MATCH / CREATE /
 /// MERGE) into a sequence of IR patterns. The returned vector is the
@@ -128,37 +133,51 @@ fn lower_rel<E: IriEncoder>(
     right: &NodePattern,
     out: &mut Vec<Pattern>,
 ) -> Result<()> {
-    // Reject deferred shapes early.
-    if matches!(rel.direction, Direction::Either) {
-        return Err(LowerError::unsupported(
-            "undirected relationship `-[r]-` is rejected in v1 — write `-[r]->` or `<-[r]-`",
-        ));
-    }
     if rel.length.is_some() {
-        return Err(LowerError::unsupported(
-            "variable-length paths (`-[*N..M]->`) are deferred — see GQL_CYPHER_SUPPORT.md",
-        ));
+        return lower_var_length_rel(ctx, left, rel, right, out);
     }
 
-    // Subject/object based on direction. Both nodes' refs were
-    // already minted in `lower_node`; re-resolve them by name (or
-    // re-mint anonymous via fresh_synth — but we want the same
-    // var, so re-look-up).
+    // Both nodes' refs were already minted in `lower_node`; re-resolve
+    // by name so the relationship triple shares their variable.
     let left_ref = lookup_node_ref(ctx, left);
     let right_ref = lookup_node_ref(ctx, right);
 
-    let (s, o) = match rel.direction {
-        Direction::Outgoing => (left_ref, right_ref),
-        Direction::Incoming => (right_ref, left_ref),
-        Direction::Either => unreachable!(),
-    };
+    match rel.direction {
+        Direction::Outgoing => {
+            let mut p = build_rel_hop(ctx, left_ref, right_ref, rel)?;
+            out.append(&mut p);
+        }
+        Direction::Incoming => {
+            let mut p = build_rel_hop(ctx, right_ref, left_ref, rel)?;
+            out.append(&mut p);
+        }
+        // Undirected `-[:T]-` — match the edge in either orientation. A
+        // KNOWS-style symmetric relationship is stored once as a directed
+        // triple; the reverse branch finds it via the object (`Opst`) index.
+        Direction::Either => {
+            let fwd = build_rel_hop(ctx, left_ref.clone(), right_ref.clone(), rel)?;
+            let rev = build_rel_hop(ctx, right_ref, left_ref, rel)?;
+            out.push(Pattern::Union(vec![fwd, rev]));
+        }
+    }
+    Ok(())
+}
 
-    // Predicate — typed, untyped, or alternation.
+/// Build the IR patterns for a single relationship hop in one fixed
+/// orientation (`s` → `o`). Handles untyped (var predicate), single-typed,
+/// and alternation (`-[:A|B]->`, a `Union` of per-type branches) relationships,
+/// plus the bound/anonymous + property-filter shapes.
+fn build_rel_hop<E: IriEncoder>(
+    ctx: &mut LoweringContext<'_, E>,
+    s: Ref,
+    o: Ref,
+    rel: &RelPattern,
+) -> Result<Vec<Pattern>> {
+    let mut out = Vec::new();
     let pred = match rel.types.len() {
         0 => {
-            // Untyped — use a var predicate, and the executor's
-            // existing system-fact filter (set via
-            // Query.include_system_facts = false) hides f:reifies*.
+            // Untyped — var predicate; the executor's system-fact filter
+            // (`Query.include_system_facts = false`) hides `f:reifies*`.
             Ref::Var(ctx.fresh_synth())
         }
         1 => {
@@ -166,11 +185,9 @@ fn lower_rel<E: IriEncoder>(
             Ref::Iri(iri.into())
         }
         _ => {
-            // Multiple types — emit a `Union` of one branch per type
-            // with a concrete predicate IRI. Using a var predicate +
-            // FILTER(IN ...) does not work: the predicate variable
-            // binds to an IRI/SID term but the IN comparison constants
-            // would be string literals, never matching.
+            // Alternation — a `Union` of one concrete-predicate branch per
+            // type. (A var predicate + `FILTER(IN ...)` can't work: the
+            // predicate binds an IRI/SID term, the IN constants are strings.)
             let mut branches: Vec<Vec<Pattern>> = Vec::with_capacity(rel.types.len());
             for t in &rel.types {
                 let iri = ctx.resolve_predicate(&t.name)?;
@@ -187,11 +204,179 @@ fn lower_rel<E: IriEncoder>(
                 branches.push(branch);
             }
             out.push(Pattern::Union(branches));
-            return Ok(());
+            return Ok(out);
         }
     };
 
-    push_rel_triple(ctx, &rel.var, &rel.props, pred, s, o, out)
+    push_rel_triple(ctx, &rel.var, &rel.props, pred, s, o, &mut out)?;
+    Ok(out)
+}
+
+/// Lower a variable-length relationship `-[:T*m..n]->`. Anonymous, single-typed
+/// relationships only — a bound relationship variable binds a *list* of
+/// relationships, which needs list-valued bindings (deferred). Unbounded ranges
+/// map to the existing transitive `PropertyPathPattern`; bounded ranges expand
+/// to a UNION of fixed-length join chains so they reuse the ordinary join
+/// machinery (and honor undirected hops as forward∪reverse).
+fn lower_var_length_rel<E: IriEncoder>(
+    ctx: &mut LoweringContext<'_, E>,
+    left: &NodePattern,
+    rel: &RelPattern,
+    right: &NodePattern,
+    out: &mut Vec<Pattern>,
+) -> Result<()> {
+    if rel.var.is_some() {
+        return Err(LowerError::unsupported(
+            "binding a variable to a variable-length relationship needs list-valued bindings \
+             (deferred); use an anonymous `-[:T*m..n]->`",
+        ));
+    }
+    if rel.props.is_some() {
+        return Err(LowerError::unsupported(
+            "property filters on a variable-length relationship are deferred",
+        ));
+    }
+    if rel.types.len() != 1 {
+        return Err(LowerError::unsupported(
+            "variable-length paths need exactly one relationship type (`-[:T*m..n]->`); untyped \
+             and alternation forms are deferred",
+        ));
+    }
+
+    let length = rel
+        .length
+        .as_ref()
+        .expect("caller checked length.is_some()");
+    let lo = length.min.unwrap_or(1);
+    let hi = length.max; // None = unbounded
+
+    let left_ref = lookup_node_ref(ctx, left);
+    let right_ref = lookup_node_ref(ctx, right);
+    let type_iri = ctx.resolve_predicate(&rel.types[0].name)?;
+
+    match hi {
+        // Unbounded — reuse the transitive PropertyPath operator. Cypher `*`
+        // means one-or-more (lower bound defaults to 1); `*0..` is zero-or-more.
+        None => {
+            let modifier = match lo {
+                0 => PathModifier::ZeroOrMore,
+                1 => PathModifier::OneOrMore,
+                _ => {
+                    return Err(LowerError::unsupported(
+                        "unbounded variable-length paths with a lower bound > 1 (`*N..`) are \
+                         deferred; use a bounded range like `*N..M`",
+                    ))
+                }
+            };
+            if matches!(rel.direction, Direction::Either) {
+                return Err(LowerError::unsupported(
+                    "unbounded undirected variable-length paths are deferred; use a bounded \
+                     range like `-[:T*1..3]-`",
+                ));
+            }
+            let predicate = ctx.encoder.encode_iri(&type_iri).ok_or_else(|| {
+                LowerError::unsupported(format!(
+                    "relationship type `{}` is not present in this ledger",
+                    rel.types[0].name
+                ))
+            })?;
+            let (s, o) = match rel.direction {
+                Direction::Outgoing => (left_ref, right_ref),
+                Direction::Incoming => (right_ref, left_ref),
+                Direction::Either => unreachable!(),
+            };
+            out.push(Pattern::PropertyPath(PropertyPathPattern::new(
+                s, predicate, modifier, o,
+            )));
+            Ok(())
+        }
+        // Bounded — expand to a UNION of fixed-length join chains.
+        Some(hi) => {
+            if lo == 0 {
+                return Err(LowerError::unsupported(
+                    "zero-length bounded paths (`*0..M`) are deferred; use `*1..M`",
+                ));
+            }
+            if hi < lo {
+                return Err(LowerError::unsupported(
+                    "variable-length path upper bound must be ≥ the lower bound",
+                ));
+            }
+            if hi > MAX_BOUNDED_HOPS {
+                return Err(LowerError::unsupported(
+                    "bounded variable-length paths above 16 hops are not supported; use an \
+                     unbounded `*` for deeper traversal",
+                ));
+            }
+            let mut chains: Vec<Vec<Pattern>> = Vec::with_capacity((hi - lo + 1) as usize);
+            for k in lo..=hi {
+                chains.push(build_fixed_chain(
+                    ctx,
+                    &left_ref,
+                    &right_ref,
+                    k,
+                    &type_iri,
+                    rel.direction,
+                )?);
+            }
+            if chains.len() == 1 {
+                out.append(&mut chains.pop().expect("non-empty range yields ≥ 1 chain"));
+            } else {
+                out.push(Pattern::Union(chains));
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Build a `k`-hop chain from `s` to `o` through `k - 1` fresh intermediate
+/// nodes, each hop honoring `direction`. Uses string-IRI predicate triples so
+/// an absent relationship type yields no rows rather than erroring.
+fn build_fixed_chain<E: IriEncoder>(
+    ctx: &mut LoweringContext<'_, E>,
+    s: &Ref,
+    o: &Ref,
+    k: u32,
+    type_iri: &str,
+    direction: Direction,
+) -> Result<Vec<Pattern>> {
+    let mut chain = Vec::new();
+    let mut prev = s.clone();
+    for hop in 0..k {
+        let next = if hop == k - 1 {
+            o.clone()
+        } else {
+            Ref::Var(ctx.fresh_synth())
+        };
+        push_hop(&prev, &next, type_iri, direction, &mut chain);
+        prev = next;
+    }
+    Ok(chain)
+}
+
+/// Push one hop between `a` and `b`. Directed hops emit a single triple;
+/// undirected hops emit a forward∪reverse `Union`.
+fn push_hop(a: &Ref, b: &Ref, type_iri: &str, direction: Direction, out: &mut Vec<Pattern>) {
+    let pred = Ref::Iri(type_iri.into());
+    let fwd = || {
+        Pattern::Triple(TriplePattern::new(
+            a.clone(),
+            pred.clone(),
+            b.clone().into(),
+        ))
+    };
+    let rev = || {
+        Pattern::Triple(TriplePattern::new(
+            b.clone(),
+            pred.clone(),
+            a.clone().into(),
+        ))
+    };
+    match direction {
+        Direction::Outgoing => out.push(fwd()),
+        Direction::Incoming => out.push(rev()),
+        Direction::Either => out.push(Pattern::Union(vec![vec![fwd()], vec![rev()]])),
+    }
 }
 
 /// Determine the IR ref for an already-lowered node. Re-uses the

@@ -147,18 +147,17 @@ async fn cypher_bare_node_pattern_rejected_at_lower() {
 }
 
 #[tokio::test]
-async fn cypher_variable_length_rejected_at_lower() {
+async fn cypher_var_length_bound_relationship_variable_rejected() {
+    // Binding a variable to a variable-length relationship yields a list of
+    // relationships, which needs list-valued bindings (deferred).
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "it/cypher:varlen");
+    let ledger0 = genesis_ledger(&fluree, "it/cypher:varlen-bound");
     let db = graphdb_from_ledger(&ledger0);
 
     let r = fluree
-        .query_cypher(
-            &db,
-            "MATCH (a:Person)-[:KNOWS*1..3]->(b:Person) RETURN a, b",
-        )
+        .query_cypher(&db, "MATCH (a:Person)-[r:KNOWS*1..3]->(b) RETURN b")
         .await;
-    assert!(r.is_err(), "variable-length paths must be rejected in v1");
+    assert!(r.is_err(), "bound var-length relationship must be rejected");
 }
 
 #[tokio::test]
@@ -992,14 +991,131 @@ async fn transact_cypher_bare_delete_rejects_optional_only_target() {
     assert!(format!("{err}").contains("mandatory"), "{err}");
 }
 
-#[tokio::test]
-async fn cypher_undirected_rejected_at_lower() {
-    let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "it/cypher:undirected");
-    let db = graphdb_from_ledger(&ledger0);
+/// Seed a directed KNOWS chain Alice→Bob→Carol→Dave (plain edges).
+async fn seed_knows_chain(
+    fluree: &fluree_db_api::Fluree,
+    ledger_id: &str,
+) -> fluree_db_api::LedgerState {
+    let ledger0 = genesis_ledger(fluree, ledger_id);
+    fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": ctx(),
+                "@graph": [
+                    {"@id": "ex:alice", "@type": "ex:Person", "ex:name": "Alice", "ex:KNOWS": {"@id": "ex:bob"}},
+                    {"@id": "ex:bob",   "@type": "ex:Person", "ex:name": "Bob",   "ex:KNOWS": {"@id": "ex:carol"}},
+                    {"@id": "ex:carol", "@type": "ex:Person", "ex:name": "Carol", "ex:KNOWS": {"@id": "ex:dave"}},
+                    {"@id": "ex:dave",  "@type": "ex:Person", "ex:name": "Dave"},
+                ]
+            }),
+        )
+        .await
+        .expect("seed chain")
+        .ledger
+}
 
-    let r = fluree
-        .query_cypher(&db, "MATCH (a:Person)-[:KNOWS]-(b:Person) RETURN a, b")
-        .await;
-    assert!(r.is_err());
+#[tokio::test]
+async fn cypher_undirected_relationship_matches_both_orientations() {
+    // `-[:KNOWS]-` from Bob finds Alice (reverse: Alice KNOWS Bob, via Opst)
+    // and Carol (forward: Bob KNOWS Carol).
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = seed_knows_chain(&fluree, "it/cypher:undirected").await;
+    let db = graphdb_from_ledger(&l);
+
+    let rows = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (a:Person {name: "Bob"})-[:KNOWS]-(x) RETURN x"#,
+        )
+        .await
+        .expect("undirected match");
+    assert_eq!(
+        rows.row_count(),
+        2,
+        "Bob's undirected neighbors: Alice, Carol"
+    );
+}
+
+#[tokio::test]
+async fn cypher_var_length_bounded_directed() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = seed_knows_chain(&fluree, "it/cypher:varlen-bounded").await;
+    let db = graphdb_from_ledger(&l);
+
+    // *1..2 from Alice → Bob (1 hop), Carol (2 hops).
+    let rows = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (a:Person {name: "Alice"})-[:KNOWS*1..2]->(x) RETURN x"#,
+        )
+        .await
+        .expect("*1..2");
+    assert_eq!(rows.row_count(), 2, "Alice within 1..2 hops: Bob, Carol");
+
+    // *1..3 from Alice → Bob, Carol, Dave.
+    let rows = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (a:Person {name: "Alice"})-[:KNOWS*1..3]->(x) RETURN x"#,
+        )
+        .await
+        .expect("*1..3");
+    assert_eq!(
+        rows.row_count(),
+        3,
+        "Alice within 1..3 hops: Bob, Carol, Dave"
+    );
+}
+
+#[tokio::test]
+async fn cypher_var_length_exact_hops() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = seed_knows_chain(&fluree, "it/cypher:varlen-exact").await;
+    let db = graphdb_from_ledger(&l);
+
+    // *2 from Alice → exactly Carol.
+    let rows = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (a:Person {name: "Alice"})-[:KNOWS*2]->(x) RETURN x"#,
+        )
+        .await
+        .expect("*2");
+    assert_eq!(rows.row_count(), 1, "Alice at exactly 2 hops: Carol");
+}
+
+#[tokio::test]
+async fn cypher_var_length_unbounded_transitive() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = seed_knows_chain(&fluree, "it/cypher:varlen-unbounded").await;
+    let db = graphdb_from_ledger(&l);
+
+    // `*` = one-or-more (PropertyPath OneOrMore) from Alice → Bob, Carol, Dave.
+    let rows = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (a:Person {name: "Alice"})-[:KNOWS*]->(x) RETURN x"#,
+        )
+        .await
+        .expect("*");
+    assert_eq!(
+        rows.row_count(),
+        3,
+        "Alice transitive reach: Bob, Carol, Dave"
+    );
+
+    // `*0..` = zero-or-more (includes Alice herself).
+    let rows = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (a:Person {name: "Alice"})-[:KNOWS*0..]->(x) RETURN x"#,
+        )
+        .await
+        .expect("*0..");
+    assert_eq!(
+        rows.row_count(),
+        4,
+        "zero-or-more includes Alice: +Bob, Carol, Dave"
+    );
 }
