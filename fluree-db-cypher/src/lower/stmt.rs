@@ -256,6 +256,9 @@ fn lower_single_branch<E: IriEncoder>(
             ReadClause::Unwind(u) => {
                 patterns.push(lower_unwind(ctx, u)?);
             }
+            ReadClause::InlineRows { vars, rows } => {
+                patterns.push(lower_inline_rows(ctx, vars, rows)?);
+            }
         }
     }
 
@@ -764,6 +767,33 @@ fn lower_unwind<E: IriEncoder>(
     Ok(Pattern::Values {
         vars: vec![alias],
         rows,
+    })
+}
+
+/// Lower a desugared `InlineRows` (constant multi-column row set, produced by
+/// the `UNWIND $listOfMaps` → VALUES rewrite) to a `Pattern::Values`.
+fn lower_inline_rows<E: IriEncoder>(
+    ctx: &mut LoweringContext<'_, E>,
+    vars: &[crate::ast::Variable],
+    rows: &[Vec<Expr>],
+) -> Result<Pattern> {
+    let col_vars: Vec<VarId> = vars.iter().map(|v| ctx.intern_var(&v.name)).collect();
+    let mut out_rows: Vec<Vec<Binding>> = Vec::with_capacity(rows.len());
+    for row in rows {
+        if row.len() != col_vars.len() {
+            return Err(LowerError::unsupported(
+                "internal: InlineRows row width does not match its column count",
+            ));
+        }
+        let mut cells = Vec::with_capacity(row.len());
+        for cell in row {
+            cells.push(literal_to_binding(cell)?);
+        }
+        out_rows.push(cells);
+    }
+    Ok(Pattern::Values {
+        vars: col_vars,
+        rows: out_rows,
     })
 }
 

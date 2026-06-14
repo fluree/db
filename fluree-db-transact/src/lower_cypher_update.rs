@@ -32,7 +32,7 @@ use std::sync::Arc;
 
 use fluree_db_core::{FlakeValue, Sid};
 use fluree_db_query::parse::{
-    LiteralValue, UnresolvedPattern, UnresolvedTerm, UnresolvedTriplePattern,
+    LiteralValue, UnresolvedPattern, UnresolvedTerm, UnresolvedTriplePattern, UnresolvedValue,
 };
 use fluree_db_query::VarRegistry;
 use fluree_vocab::{rdf, reifies_iris};
@@ -276,8 +276,30 @@ impl<'a> CypherLowering<'a> {
                 }
                 ReadClause::Unwind(_) => {
                     return Err(LowerCypherError::unsupported(
-                        "UNWIND before a write clause is deferred",
+                        "UNWIND before a write clause is deferred — supply the rows as a \
+                         `$param` list of maps so they desugar to a VALUES join",
                     ));
+                }
+                // Desugared constant rows (the `UNWIND $listOfMaps` → VALUES
+                // rewrite). Bind each column as a VALUES block; the MATCH and
+                // CREATE/SET templates then fire once per row.
+                ReadClause::InlineRows { vars, rows } => {
+                    let value_vars: Vec<Arc<str>> = vars
+                        .iter()
+                        .map(|v| Arc::from(var_name(&v.name).as_str()))
+                        .collect();
+                    let mut value_rows = Vec::with_capacity(rows.len());
+                    for row in rows {
+                        let mut cells = Vec::with_capacity(row.len());
+                        for cell in row {
+                            cells.push(inline_cell_to_value(cell)?);
+                        }
+                        value_rows.push(cells);
+                    }
+                    self.where_patterns.push(UnresolvedPattern::Values {
+                        vars: value_vars,
+                        rows: value_rows,
+                    });
                 }
             }
         }
@@ -951,15 +973,19 @@ impl<'a> CypherLowering<'a> {
             o.clone(),
         ));
 
-        // LPG mode: always mint a reifier bundle. The annotation
-        // subject is a fresh blank node. Cypher CREATE always carries
-        // relationship identity per the plan's LPG-default rule.
-        let ann = self.fresh_bnode();
-        self.emit_reifier_bundle(&ann, &s, &type_sid, &o)?;
-
-        // Relationship property body.
-        if let Some(props) = &rel.props {
-            self.emit_property_triples(&ann, props)?;
+        // Reify only when the relationship carries identity: a bound variable
+        // (so `r` can be matched/updated/deleted) or properties (which need a
+        // reifier to hang the body on). An anonymous, property-less edge is a
+        // plain RDF triple — matching the read-side contract (anonymous
+        // `-[:T]->` sees plain RDF) and, crucially, letting batched edge
+        // inserts (one row per VALUES solution) avoid colliding on a single
+        // template blank node (which isn't freshened per solution).
+        if rel.var.is_some() || rel.props.is_some() {
+            let ann = self.fresh_bnode();
+            self.emit_reifier_bundle(&ann, &s, &type_sid, &o)?;
+            if let Some(props) = &rel.props {
+                self.emit_property_triples(&ann, props)?;
+            }
         }
 
         Ok(())
@@ -1106,6 +1132,22 @@ fn merge_identity_override_err(key: &str) -> LowerCypherError {
          identity insert can't be retracted in the same create branch). Drop `{key}` from \
          the MERGE map or from ON CREATE SET."
     ))
+}
+
+/// Convert a desugared `InlineRows` cell (a literal expression) into a VALUES
+/// cell. `null` becomes `UNDEF` (unbound), so a row missing a field drops only
+/// that row's match rather than the whole batch.
+fn inline_cell_to_value(e: &Expr) -> Result<UnresolvedValue, LowerCypherError> {
+    match e {
+        Expr::Lit(Literal::Null(_)) => Ok(UnresolvedValue::Unbound),
+        Expr::Lit(lit) => Ok(UnresolvedValue::Literal {
+            value: lower_literal_unresolved(lit)?,
+            dtc: None,
+        }),
+        _ => Err(LowerCypherError::unsupported(
+            "internal: InlineRows cells must be literal values",
+        )),
+    }
 }
 
 fn lower_literal_unresolved(lit: &Literal) -> Result<LiteralValue, LowerCypherError> {

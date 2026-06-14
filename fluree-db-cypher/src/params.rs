@@ -50,10 +50,12 @@ impl std::error::Error for ParamError {}
 /// from `params`. No-op when `params` is empty (but still errors if the query
 /// references a `$param` that isn't supplied).
 pub fn substitute_params(ast: &mut CypherAst, params: &ParamMap) -> Result<(), ParamError> {
-    // Compile-time unroll of `UNWIND $list AS row CREATE (...)` (the idiomatic
-    // parameterized batched insert) runs first, so the generic substitution
-    // below never sees the list-of-maps parameter it would otherwise reject.
+    // Compile-time unroll of `UNWIND $list AS row CREATE (...)` (pure node
+    // batch) and the VALUES desugaring of `UNWIND $list AS row MATCH … CREATE`
+    // (batched edge insert) both run first, so the generic substitution below
+    // never sees the list-of-maps parameter it would otherwise reject.
     expand_unwind_create(ast, params)?;
+    expand_unwind_match(ast, params)?;
     subst_statement(&mut ast.statement, params)
 }
 
@@ -131,6 +133,381 @@ fn expand_unwind_create(ast: &mut CypherAst, params: &ParamMap) -> Result<(), Pa
     u.read_clauses.clear();
     u.write_clauses = new_writes;
     Ok(())
+}
+
+/// Desugar `UNWIND $list AS row <MATCH …> CREATE/SET …` (the batched **edge**
+/// insert) into a constant `InlineRows` (→ a `VALUES` join) plus `row.field`
+/// rewritten to per-column variables. Unlike the pure-CREATE node batch this
+/// can't unroll — each row's MATCH must stay independent, so a missing id drops
+/// only its own row. Reuses the existing VALUES + MATCH…CREATE machinery.
+///
+/// Fires only when an `UNWIND $param AS row` clause coexists with a MATCH; the
+/// pure-CREATE shape is handled by [`expand_unwind_create`] before this.
+fn expand_unwind_match(ast: &mut CypherAst, params: &ParamMap) -> Result<(), ParamError> {
+    let (unwind_idx, alias, pname, span) = {
+        let Statement::Update(u) = &ast.statement else {
+            return Ok(());
+        };
+        let mut found = None;
+        for (i, c) in u.read_clauses.iter().enumerate() {
+            if let ReadClause::Unwind(uw) = c {
+                if let Expr::Param(pref) = &uw.expr {
+                    found = Some((i, uw.alias.name.clone(), pref.name.clone(), uw.span));
+                    break;
+                }
+            }
+        }
+        let Some(found) = found else {
+            return Ok(());
+        };
+        let has_match = u
+            .read_clauses
+            .iter()
+            .any(|c| matches!(c, ReadClause::Match(_) | ReadClause::OptionalMatch(_)));
+        if !has_match {
+            return Ok(());
+        }
+        found
+    };
+
+    let val = params
+        .get(&pname)
+        .ok_or_else(|| ParamError::Missing(pname.clone()))?;
+    let JsonValue::Array(elems) = val else {
+        return Err(unsupported_param(&pname, "UNWIND parameter must be a list"));
+    };
+
+    // Which fields of `row` are referenced, and is the bare alias used?
+    let (fields, bare_used) = {
+        let Statement::Update(u) = &ast.statement else {
+            unreachable!("checked above");
+        };
+        let mut fields = Vec::new();
+        let mut bare = false;
+        collect_alias_in_update(u, &alias, unwind_idx, &mut fields, &mut bare);
+        (fields, bare)
+    };
+    if bare_used && !fields.is_empty() {
+        return Err(unsupported_param(
+            &pname,
+            "cannot use an UNWIND element both as a whole value (`row`) and by field (`row.x`)",
+        ));
+    }
+    if !bare_used && fields.is_empty() {
+        return Err(unsupported_param(
+            &pname,
+            "UNWIND element is never referenced — use `row.field` to bind values",
+        ));
+    }
+
+    let col_var = |field: &str| format!("__cyrow_{alias}_{field}");
+    let bare_var = format!("__cyrow_{alias}");
+
+    // One VALUES row per element, columns aligned to `fields` (or one bare cell).
+    let mut rows: Vec<Vec<Expr>> = Vec::with_capacity(elems.len());
+    for elem in elems {
+        let mut row = Vec::new();
+        if bare_used {
+            match elem {
+                JsonValue::Object(_) | JsonValue::Array(_) => {
+                    return Err(unsupported_param(
+                        &pname,
+                        "using the whole UNWIND element as a value is deferred — reference fields like `row.field`",
+                    ))
+                }
+                _ => row.push(json_scalar_to_expr(elem, &pname, span)?),
+            }
+        } else {
+            let JsonValue::Object(map) = elem else {
+                return Err(unsupported_param(
+                    &pname,
+                    "property access (`row.field`) requires the UNWIND list to contain maps",
+                ));
+            };
+            for f in &fields {
+                let fv = map.get(f).cloned().unwrap_or(JsonValue::Null);
+                row.push(json_scalar_to_expr(&fv, &pname, span)?);
+            }
+        }
+        rows.push(row);
+    }
+
+    let vars: Vec<Variable> = if bare_used {
+        vec![Variable {
+            name: bare_var.clone(),
+            span,
+        }]
+    } else {
+        fields
+            .iter()
+            .map(|f| Variable {
+                name: col_var(f),
+                span,
+            })
+            .collect()
+    };
+
+    let Statement::Update(u) = &mut ast.statement else {
+        unreachable!("checked above");
+    };
+    let bare_ref = if bare_used {
+        Some(bare_var.as_str())
+    } else {
+        None
+    };
+    rewrite_alias_in_update(u, &alias, unwind_idx, &col_var, bare_ref);
+    u.read_clauses[unwind_idx] = ReadClause::InlineRows { vars, rows };
+    Ok(())
+}
+
+// ---- alias collection (which `row.field`s are referenced) -------------------
+
+fn collect_alias_in_update(
+    u: &Update,
+    alias: &str,
+    skip_idx: usize,
+    fields: &mut Vec<String>,
+    bare: &mut bool,
+) {
+    for (i, c) in u.read_clauses.iter().enumerate() {
+        if i == skip_idx {
+            continue;
+        }
+        if let ReadClause::Match(m) | ReadClause::OptionalMatch(m) = c {
+            collect_alias_in_pattern(&m.pattern, alias, fields, bare);
+            if let Some(w) = &m.where_clause {
+                collect_alias_in_expr(w, alias, fields, bare);
+            }
+        }
+    }
+    for w in &u.write_clauses {
+        match w {
+            WriteClause::Create(c) => collect_alias_in_pattern(&c.pattern, alias, fields, bare),
+            WriteClause::Merge(m) => {
+                collect_alias_in_pattern(&m.pattern, alias, fields, bare);
+                for s in m.on_create.iter().chain(&m.on_match) {
+                    collect_alias_in_set_item(s, alias, fields, bare);
+                }
+            }
+            WriteClause::Set(s) => {
+                for it in &s.items {
+                    collect_alias_in_set_item(it, alias, fields, bare);
+                }
+            }
+            WriteClause::Remove(_) | WriteClause::Delete(_) => {}
+        }
+    }
+}
+
+fn collect_alias_in_pattern(pat: &Pattern, alias: &str, fields: &mut Vec<String>, bare: &mut bool) {
+    for part in &pat.parts {
+        collect_alias_in_props(&part.head.props, alias, fields, bare);
+        for (rel, node) in &part.tail {
+            collect_alias_in_props(&rel.props, alias, fields, bare);
+            collect_alias_in_props(&node.props, alias, fields, bare);
+        }
+    }
+}
+
+fn collect_alias_in_props(
+    props: &Option<MapLit>,
+    alias: &str,
+    fields: &mut Vec<String>,
+    bare: &mut bool,
+) {
+    if let Some(m) = props {
+        for (_, e) in &m.entries {
+            collect_alias_in_expr(e, alias, fields, bare);
+        }
+    }
+}
+
+fn collect_alias_in_set_item(s: &SetItem, alias: &str, fields: &mut Vec<String>, bare: &mut bool) {
+    match s {
+        SetItem::Property { value, .. } => collect_alias_in_expr(value, alias, fields, bare),
+        SetItem::MapMerge { map, .. } | SetItem::MapReplace { map, .. } => {
+            for (_, e) in &map.entries {
+                collect_alias_in_expr(e, alias, fields, bare);
+            }
+        }
+        SetItem::Labels { .. } => {}
+    }
+}
+
+fn collect_alias_in_expr(e: &Expr, alias: &str, fields: &mut Vec<String>, bare: &mut bool) {
+    match e {
+        Expr::Prop(inner, field, _) => {
+            if matches!(inner.as_ref(), Expr::Var(v) if v.name == alias) {
+                if !fields.iter().any(|x| x == field) {
+                    fields.push(field.clone());
+                }
+            } else {
+                collect_alias_in_expr(inner, alias, fields, bare);
+            }
+        }
+        Expr::Var(v) => {
+            if v.name == alias {
+                *bare = true;
+            }
+        }
+        Expr::BinOp(_, l, r, _)
+        | Expr::In(l, r, _)
+        | Expr::StartsWith(l, r, _)
+        | Expr::EndsWith(l, r, _)
+        | Expr::Contains(l, r, _) => {
+            collect_alias_in_expr(l, alias, fields, bare);
+            collect_alias_in_expr(r, alias, fields, bare);
+        }
+        Expr::UnaryOp(_, x, _) | Expr::IsNull(x, _) | Expr::IsNotNull(x, _) => {
+            collect_alias_in_expr(x, alias, fields, bare);
+        }
+        Expr::Call(c) => {
+            for a in &c.args {
+                collect_alias_in_expr(a, alias, fields, bare);
+            }
+        }
+        Expr::List(items, _) => {
+            for it in items {
+                collect_alias_in_expr(it, alias, fields, bare);
+            }
+        }
+        Expr::Lit(_) | Expr::Param(_) | Expr::Case(_) | Expr::Exists(_, _) => {}
+    }
+}
+
+// ---- alias rewrite (`row.field` → column var, bare `row` → bare var) --------
+
+fn rewrite_alias_in_update<F: Fn(&str) -> String>(
+    u: &mut Update,
+    alias: &str,
+    skip_idx: usize,
+    col_var: &F,
+    bare_var: Option<&str>,
+) {
+    for (i, c) in u.read_clauses.iter_mut().enumerate() {
+        if i == skip_idx {
+            continue;
+        }
+        if let ReadClause::Match(m) | ReadClause::OptionalMatch(m) = c {
+            rewrite_alias_in_pattern(&mut m.pattern, alias, col_var, bare_var);
+            if let Some(w) = &mut m.where_clause {
+                rewrite_alias_in_expr_to_var(w, alias, col_var, bare_var);
+            }
+        }
+    }
+    for w in &mut u.write_clauses {
+        match w {
+            WriteClause::Create(c) => {
+                rewrite_alias_in_pattern(&mut c.pattern, alias, col_var, bare_var);
+            }
+            WriteClause::Merge(m) => {
+                rewrite_alias_in_pattern(&mut m.pattern, alias, col_var, bare_var);
+                for s in m.on_create.iter_mut().chain(&mut m.on_match) {
+                    rewrite_alias_in_set_item(s, alias, col_var, bare_var);
+                }
+            }
+            WriteClause::Set(s) => {
+                for it in &mut s.items {
+                    rewrite_alias_in_set_item(it, alias, col_var, bare_var);
+                }
+            }
+            WriteClause::Remove(_) | WriteClause::Delete(_) => {}
+        }
+    }
+}
+
+fn rewrite_alias_in_pattern<F: Fn(&str) -> String>(
+    pat: &mut Pattern,
+    alias: &str,
+    col_var: &F,
+    bare_var: Option<&str>,
+) {
+    for part in &mut pat.parts {
+        rewrite_alias_in_props(&mut part.head.props, alias, col_var, bare_var);
+        for (rel, node) in &mut part.tail {
+            rewrite_alias_in_props(&mut rel.props, alias, col_var, bare_var);
+            rewrite_alias_in_props(&mut node.props, alias, col_var, bare_var);
+        }
+    }
+}
+
+fn rewrite_alias_in_props<F: Fn(&str) -> String>(
+    props: &mut Option<MapLit>,
+    alias: &str,
+    col_var: &F,
+    bare_var: Option<&str>,
+) {
+    if let Some(m) = props {
+        for (_, e) in &mut m.entries {
+            rewrite_alias_in_expr_to_var(e, alias, col_var, bare_var);
+        }
+    }
+}
+
+fn rewrite_alias_in_set_item<F: Fn(&str) -> String>(
+    s: &mut SetItem,
+    alias: &str,
+    col_var: &F,
+    bare_var: Option<&str>,
+) {
+    match s {
+        SetItem::Property { value, .. } => {
+            rewrite_alias_in_expr_to_var(value, alias, col_var, bare_var);
+        }
+        SetItem::MapMerge { map, .. } | SetItem::MapReplace { map, .. } => {
+            for (_, e) in &mut map.entries {
+                rewrite_alias_in_expr_to_var(e, alias, col_var, bare_var);
+            }
+        }
+        SetItem::Labels { .. } => {}
+    }
+}
+
+fn rewrite_alias_in_expr_to_var<F: Fn(&str) -> String>(
+    e: &mut Expr,
+    alias: &str,
+    col_var: &F,
+    bare_var: Option<&str>,
+) {
+    match e {
+        Expr::Prop(inner, field, span) => {
+            if matches!(inner.as_ref(), Expr::Var(v) if v.name == alias) {
+                *e = Expr::Var(Variable {
+                    name: col_var(field),
+                    span: *span,
+                });
+            } else {
+                rewrite_alias_in_expr_to_var(inner, alias, col_var, bare_var);
+            }
+        }
+        Expr::Var(v) if v.name == alias => {
+            if let Some(bv) = bare_var {
+                v.name = bv.to_string();
+            }
+        }
+        Expr::BinOp(_, l, r, _)
+        | Expr::In(l, r, _)
+        | Expr::StartsWith(l, r, _)
+        | Expr::EndsWith(l, r, _)
+        | Expr::Contains(l, r, _) => {
+            rewrite_alias_in_expr_to_var(l, alias, col_var, bare_var);
+            rewrite_alias_in_expr_to_var(r, alias, col_var, bare_var);
+        }
+        Expr::UnaryOp(_, x, _) | Expr::IsNull(x, _) | Expr::IsNotNull(x, _) => {
+            rewrite_alias_in_expr_to_var(x, alias, col_var, bare_var);
+        }
+        Expr::Call(c) => {
+            for a in &mut c.args {
+                rewrite_alias_in_expr_to_var(a, alias, col_var, bare_var);
+            }
+        }
+        Expr::List(items, _) => {
+            for it in items {
+                rewrite_alias_in_expr_to_var(it, alias, col_var, bare_var);
+            }
+        }
+        Expr::Var(_) | Expr::Lit(_) | Expr::Param(_) | Expr::Case(_) | Expr::Exists(_, _) => {}
+    }
 }
 
 fn replace_alias_in_pattern(
@@ -323,6 +700,16 @@ fn subst_read_clause(c: &mut ReadClause, p: &ParamMap) -> Result<(), ParamError>
             subst_opt(&mut w.limit, p)
         }
         ReadClause::Unwind(u) => subst_expr(&mut u.expr, p),
+        // Desugared constant rows: cells are already literals, but recurse for
+        // robustness (a future producer might leave a `$param` cell).
+        ReadClause::InlineRows { rows, .. } => {
+            for row in rows {
+                for cell in row {
+                    subst_expr(cell, p)?;
+                }
+            }
+            Ok(())
+        }
     }
 }
 

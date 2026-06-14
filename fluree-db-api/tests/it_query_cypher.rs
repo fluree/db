@@ -530,6 +530,104 @@ async fn transact_cypher_unwind_empty_batch_errors_empty_transaction() {
     assert!(format!("{err:?}").contains("EmptyTransaction"), "{err:?}");
 }
 
+/// Seed three Person nodes carrying `ex:id` 1/2/3 for edge-batch tests.
+async fn seed_nodes_with_ids(
+    fluree: &fluree_db_api::Fluree,
+    ledger_id: &str,
+) -> fluree_db_api::LedgerState {
+    let ledger0 = genesis_ledger(fluree, ledger_id);
+    fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": ctx(),
+                "@graph": [
+                    {"@id": "ex:n1", "@type": "ex:Person", "ex:id": 1, "ex:name": "Alice"},
+                    {"@id": "ex:n2", "@type": "ex:Person", "ex:id": 2, "ex:name": "Bob"},
+                    {"@id": "ex:n3", "@type": "ex:Person", "ex:id": 3, "ex:name": "Carol"},
+                ]
+            }),
+        )
+        .await
+        .expect("seed nodes")
+        .ledger
+}
+
+#[tokio::test]
+async fn transact_cypher_unwind_map_param_batches_edge_inserts() {
+    // The edge-loading idiom: one parameter of {from,to} maps, matched against
+    // existing nodes by id, one edge per row, committed once. Desugars to a
+    // VALUES join.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = seed_nodes_with_ids(&fluree, "it/cypher:unwind-edges").await;
+
+    let params = json!({ "pairs": [{"from": 1, "to": 2}, {"from": 2, "to": 3}] });
+    let result = fluree
+        .transact_cypher_with_params(
+            l,
+            "UNWIND $pairs AS p MATCH (a:Person {id: p.from}), (b:Person {id: p.to}) \
+             CREATE (a)-[:KNOWS]->(b)",
+            params.as_object(),
+        )
+        .await
+        .expect("edge batch insert");
+
+    let db = graphdb_from_ledger(&result.ledger);
+    assert_eq!(
+        fluree
+            .query_cypher(&db, "MATCH (a)-[:KNOWS]->(b) RETURN a, b")
+            .await
+            .expect("edges")
+            .row_count(),
+        2,
+        "two KNOWS edges created (1->2, 2->3)"
+    );
+    // The edges connect the right nodes.
+    assert_eq!(
+        fluree
+            .query_cypher(
+                &db,
+                r#"MATCH (a:Person {name: "Alice"})-[:KNOWS]->(b:Person {name: "Bob"}) RETURN a"#,
+            )
+            .await
+            .expect("alice->bob")
+            .row_count(),
+        1,
+        "Alice(id 1) -> Bob(id 2)"
+    );
+}
+
+#[tokio::test]
+async fn transact_cypher_unwind_edge_missing_id_drops_only_that_row() {
+    // A row whose endpoint id matches nothing drops only itself — the rest of
+    // the batch still commits (the value of the VALUES-join model over a
+    // cross-product unroll).
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = seed_nodes_with_ids(&fluree, "it/cypher:unwind-edges-missing").await;
+
+    let params = json!({ "pairs": [{"from": 1, "to": 2}, {"from": 1, "to": 99}] });
+    let result = fluree
+        .transact_cypher_with_params(
+            l,
+            "UNWIND $pairs AS p MATCH (a:Person {id: p.from}), (b:Person {id: p.to}) \
+             CREATE (a)-[:KNOWS]->(b)",
+            params.as_object(),
+        )
+        .await
+        .expect("partial edge batch");
+
+    let db = graphdb_from_ledger(&result.ledger);
+    assert_eq!(
+        fluree
+            .query_cypher(&db, "MATCH (a)-[:KNOWS]->(b) RETURN a, b")
+            .await
+            .expect("edges")
+            .row_count(),
+        1,
+        "only the 1->2 edge; the 1->99 row found no target and dropped"
+    );
+}
+
 #[tokio::test]
 async fn transact_cypher_unwind_whole_row_value_rejected() {
     // Using the whole map element as a value (not a field) is deferred.
@@ -646,7 +744,9 @@ async fn transact_cypher_bare_delete_errors_when_node_has_relationships() {
     for stmt in [
         r#"CREATE (a:Person {name: "Alice"})"#,
         r#"CREATE (b:Person {name: "Bob"})"#,
-        r#"MATCH (a:Person {name: "Alice"}), (b:Person {name: "Bob"}) CREATE (a)-[:KNOWS]->(b)"#,
+        // A property-bearing edge is reified (a Cypher relationship with
+        // identity); the bare-DELETE guard probes reified relationships.
+        r#"MATCH (a:Person {name: "Alice"}), (b:Person {name: "Bob"}) CREATE (a)-[:KNOWS {since: 2000}]->(b)"#,
     ] {
         l = fluree.transact_cypher(l, stmt).await.expect(stmt).ledger;
     }
@@ -1192,8 +1292,8 @@ async fn cypher_collect_empty_input_returns_empty_list() {
     let db = graphdb_from_ledger(&l);
 
     for q in [
-        r#"MATCH (n:Nonexistent) RETURN collect(n) AS xs"#,
-        r#"MATCH (n:Nonexistent) RETURN collect(DISTINCT n) AS xs"#,
+        r"MATCH (n:Nonexistent) RETURN collect(n) AS xs",
+        r"MATCH (n:Nonexistent) RETURN collect(DISTINCT n) AS xs",
     ] {
         let jsonld = fluree
             .query_cypher(&db, q)
@@ -1217,8 +1317,8 @@ async fn cypher_order_by_collect_rejected() {
     let db = graphdb_from_ledger(&l);
 
     for q in [
-        r#"MATCH (a:Person)-[:KNOWS]->(b) RETURN a, collect(b) AS bs ORDER BY bs"#,
-        r#"MATCH (a:Person)-[:KNOWS]->(b) RETURN a, collect(b) ORDER BY collect(b)"#,
+        r"MATCH (a:Person)-[:KNOWS]->(b) RETURN a, collect(b) AS bs ORDER BY bs",
+        r"MATCH (a:Person)-[:KNOWS]->(b) RETURN a, collect(b) ORDER BY collect(b)",
     ] {
         let err = fluree
             .query_cypher(&db, q)
@@ -1237,7 +1337,7 @@ async fn cypher_with_collect_rejected() {
     let err = fluree
         .query_cypher(
             &db,
-            r#"MATCH (a:Person)-[:KNOWS]->(b) WITH a, collect(b) AS bs RETURN a, bs"#,
+            r"MATCH (a:Person)-[:KNOWS]->(b) WITH a, collect(b) AS bs RETURN a, bs",
         )
         .await
         .expect_err("collect() in WITH must be rejected");
@@ -1367,7 +1467,7 @@ async fn cypher_var_length_unregistered_namespace_returns_no_rows() {
         let rows = fluree
             .query_cypher(
                 &db,
-                &format!(r#"MATCH (a:Person)-[:KNOWS{path}]->(x) RETURN x"#),
+                &format!(r"MATCH (a:Person)-[:KNOWS{path}]->(x) RETURN x"),
             )
             .await
             .unwrap_or_else(|e| panic!("unregistered type `{path}` should not error: {e}"));

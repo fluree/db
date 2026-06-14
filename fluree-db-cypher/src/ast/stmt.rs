@@ -59,6 +59,15 @@ pub enum ReadClause {
     OptionalMatch(MatchClause),
     With(WithClause),
     Unwind(UnwindClause),
+    /// Internal-only: a constant multi-column row set, never produced by the
+    /// parser. The parameter desugaring rewrites `UNWIND $listOfMaps AS row`
+    /// (when the body has a MATCH) into this — one column per `row.field`
+    /// accessed — so it lowers to a `VALUES` join (batched edge insert). Each
+    /// inner `Vec<Expr>` is one row of literals, aligned to `vars`.
+    InlineRows {
+        vars: Vec<Variable>,
+        rows: Vec<Vec<Expr>>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]
