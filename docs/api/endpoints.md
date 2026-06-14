@@ -901,13 +901,17 @@ The `GET` form is provided for W3C SPARQL Protocol compliance. It accepts SPARQL
 ```http
 Content-Type: application/json
 Accept: application/json
+Fluree-Min-T: 42  # optional read-after-write guarantee
 ```
 
 Or for SPARQL:
 ```http
 Content-Type: application/sparql-query
 Accept: application/sparql-results+json
+Fluree-Min-T: 42  # optional read-after-write guarantee
 ```
+
+`Fluree-Min-T` makes the server refresh the referenced ledger(s) until they have reached at least that transaction time before executing the query. JSON-LD bodies can also send `opts.min-t`, `opts.min_t`, or `opts.minT`; body opts take precedence over the header.
 
 **Request Body (JSON-LD Query):**
 

@@ -226,6 +226,17 @@ impl AppState {
         }
     }
 
+    /// Record that a query path has already performed a nameservice refresh.
+    pub fn mark_query_refresh_checked(&self, ledger_id: &str) {
+        if !self.config.query_refresh_enabled || self.config.is_proxy_storage_mode() {
+            return;
+        }
+
+        let canonical = normalize_ledger_id(ledger_id).unwrap_or_else(|_| ledger_id.to_string());
+        self.query_refresh_last_checked
+            .insert(canonical, Instant::now());
+    }
+
     /// Create a direct-storage Fluree instance (file, S3, DynamoDB, etc.)
     ///
     /// Uses `FlureeBuilder::build_client()` which returns a type-erased `FlureeClient`

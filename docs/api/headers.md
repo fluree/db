@@ -181,6 +181,18 @@ X-Request-ID: abc-123-def-456
 
 The server will include this in logs and response headers for correlation. When a request queues background indexing work, the copied `X-Request-ID` also appears on the background indexer worker logs so you can connect the foreground request and later indexing activity in plain log search.
 
+### Fluree-Min-T
+
+Request a hard read-after-write guarantee for query and explain endpoints:
+
+```http
+Fluree-Min-T: 42
+```
+
+Before executing the request, the server refreshes the referenced ledger(s) until each has reached at least the requested transaction time. If the target `t` is not visible before `query_min_t_timeout_ms`, the server returns a read-after-write timeout error. JSON-LD query bodies may also specify the same requirement as `opts.min-t`, `opts.min_t`, or `opts.minT`; body opts take precedence over the header for that query body.
+
+Numeric time-travel snapshots such as `from: "ledger:main@t:42"` also wait until that `t` is visible, then query that pinned snapshot. `Fluree-Min-T` is useful when the query itself reads current HEAD but must not run until a known transaction has arrived.
+
 ## Response Headers
 
 ### Content-Type

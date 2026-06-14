@@ -62,6 +62,7 @@ pub struct ServerFileConfig {
     pub cors_enabled: Option<bool>,
     pub body_limit: Option<usize>,
     pub query_timeout_ms: Option<u64>,
+    pub query_min_t_timeout_ms: Option<u64>,
     pub cache_max_mb: Option<usize>,
 
     /// `[server.query_refresh]`
@@ -387,6 +388,7 @@ pub const CONFIG_FILE_ARG_IDS: &[&str] = &[
     "cors_enabled",
     "body_limit",
     "query_timeout_ms",
+    "query_min_t_timeout_ms",
     "query_refresh_enabled",
     "query_refresh_ttl_ms",
     "cache_max_mb",
@@ -496,6 +498,11 @@ pub fn apply_to_server_config(
     if is_default("query_timeout_ms") {
         if let Some(v) = file.query_timeout_ms {
             config.query_timeout_ms = v;
+        }
+    }
+    if is_default("query_min_t_timeout_ms") {
+        if let Some(v) = file.query_min_t_timeout_ms {
+            config.query_min_t_timeout_ms = v;
         }
     }
     if is_default("cache_max_mb") {
@@ -916,6 +923,7 @@ listen_addr = "127.0.0.1:9090"
 storage_path = "/var/lib/fluree"
 log_level = "debug"
 cors_enabled = false
+query_min_t_timeout_ms = 5000
 cache_max_mb = 5000
 
 [server.query_refresh]
@@ -942,6 +950,7 @@ default_policy_class = "ex:DefaultPolicy"
         assert_eq!(server.storage_path.as_deref(), Some("/var/lib/fluree"));
         assert_eq!(server.log_level.as_deref(), Some("debug"));
         assert_eq!(server.cors_enabled, Some(false));
+        assert_eq!(server.query_min_t_timeout_ms, Some(5000));
         assert_eq!(server.cache_max_mb, Some(5000));
 
         let refresh = server.query_refresh.unwrap();
