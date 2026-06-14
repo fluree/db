@@ -1498,3 +1498,60 @@ async fn range_narrowing_keeps_cross_type_novelty() {
          uniform-decimal base predicate — narrowing must not drop it"
     );
 }
+
+#[tokio::test]
+async fn integer_range_narrowing_keeps_cross_type_novelty() {
+    // The overlay gate is type-agnostic: a uniform-INTEGER base predicate with a
+    // matching DECIMAL novelty value must not drop the decimal. (Mirror of
+    // range_narrowing_keeps_cross_type_novelty with the base/overlay types
+    // swapped, covering the generalized integer/double pushdown path.)
+    let fluree = memory_fluree();
+    let ledger_id = "decimal/int-xtype-novelty:main";
+    let ledger = genesis_ledger(&fluree, ledger_id);
+
+    run_sparql_update(
+        &fluree,
+        ledger,
+        r"
+        PREFIX ex: <http://example.org/>
+        INSERT DATA {
+            ex:a ex:v 5 .
+            ex:b ex:v 100 .
+            ex:c ex:v 50 .
+        }
+        ",
+    )
+    .await;
+
+    full_rebuild_publish_decode_root(&fluree, ledger_id).await;
+    let ledger = fluree
+        .ledger(ledger_id)
+        .await
+        .expect("load reindexed ledger");
+
+    // Novelty decimal (different o_type) that matches the filter.
+    let result = run_sparql_update(
+        &fluree,
+        ledger,
+        r"PREFIX ex: <http://example.org/> INSERT DATA { ex:d ex:v 75.5 . }",
+    )
+    .await;
+    let ledger = result.ledger;
+
+    let r = support::query_sparql(
+        &fluree,
+        &ledger,
+        r"PREFIX ex: <http://example.org/>
+          SELECT ?v WHERE { ?s ex:v ?v FILTER(?v > 60) } ORDER BY ?v",
+    )
+    .await
+    .expect("cross-type range filter");
+    let json = r.to_sparql_json(&ledger.snapshot).expect("json");
+    let mut got = binding_values(&json, "v");
+    got.sort();
+    assert_eq!(
+        got,
+        vec!["100", "75.5"],
+        "integer-base range filter must keep a cross-type novelty decimal (75.5)"
+    );
+}

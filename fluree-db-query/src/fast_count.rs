@@ -413,10 +413,12 @@ fn otype_unsupported_numeric(raw: u16) -> bool {
 
 /// The single `o_type` shared by every row of `p_id` in POST order, or `None`
 /// if the predicate is empty or has mixed o_types. Read from the leaf manifest
-/// (plus ≤2 boundary leaves) — cheap, no full scan. A uniform
-/// `XSD_DECIMAL_INLINE` result means every value under the predicate is an
-/// inline decimal with no arena spill and no other types, which is the
-/// precondition for safely narrowing a numeric range scan by `o_key`.
+/// (plus ≤2 boundary leaves) — cheap, no full scan. A uniform result in an
+/// order-preserving numeric type (any inline integer subtype, double/float, or
+/// inline decimal — see [`otype_okey_order_comparable`]) means every value
+/// shares that type with no arena spill and no other types, which is the base
+/// precondition for narrowing a numeric range scan by `o_key`. (The caller must
+/// additionally ensure no overlay, since novelty can add a cross-type value.)
 pub(crate) fn predicate_uniform_o_type(
     store: &BinaryIndexStore,
     g_id: GraphId,
