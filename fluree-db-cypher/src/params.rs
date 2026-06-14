@@ -14,8 +14,8 @@
 use serde_json::Value as JsonValue;
 
 use crate::ast::{
-    CaseExpr, CypherAst, Expr, Literal, MapLit, MatchClause, NodePattern, Pattern, Query,
-    ReadClause, RelPattern, ReturnClause, SetItem, Statement, Update, WriteClause,
+    CaseExpr, CreateClause, CypherAst, Expr, Literal, MapLit, MatchClause, NodePattern, Pattern,
+    Query, ReadClause, RelPattern, ReturnClause, SetItem, Statement, Update, Variable, WriteClause,
 };
 use crate::span::SourceSpan;
 
@@ -50,7 +50,229 @@ impl std::error::Error for ParamError {}
 /// from `params`. No-op when `params` is empty (but still errors if the query
 /// references a `$param` that isn't supplied).
 pub fn substitute_params(ast: &mut CypherAst, params: &ParamMap) -> Result<(), ParamError> {
+    // Compile-time unroll of `UNWIND $list AS row CREATE (...)` (the idiomatic
+    // parameterized batched insert) runs first, so the generic substitution
+    // below never sees the list-of-maps parameter it would otherwise reject.
+    expand_unwind_create(ast, params)?;
     subst_statement(&mut ast.statement, params)
+}
+
+fn unsupported_param(name: &str, reason: &str) -> ParamError {
+    ParamError::Unsupported {
+        name: name.to_string(),
+        reason: reason.to_string(),
+    }
+}
+
+/// Unroll `UNWIND $list AS row CREATE (...)` into a literal multi-pattern
+/// CREATE when `$list` is a constant array parameter (the standard driver
+/// batched-insert shape). Each element — a scalar or a flat map — becomes its
+/// own CREATE with the `row` alias resolved to literals (`row.field` → the
+/// map's value; a bare scalar `row` → the value). Node/relationship variables
+/// are suffixed per row so every element creates **distinct** nodes (otherwise
+/// the shared blank-node id would collapse them into one).
+///
+/// Only fires for the pure-`UNWIND` + CREATE-only shape. A leading MATCH
+/// (edge loading) or any non-CREATE write is left untouched for the generic
+/// path / VALUES desugaring.
+fn expand_unwind_create(ast: &mut CypherAst, params: &ParamMap) -> Result<(), ParamError> {
+    let (alias, pname) = {
+        let Statement::Update(u) = &ast.statement else {
+            return Ok(());
+        };
+        if u.read_clauses.len() != 1 {
+            return Ok(());
+        }
+        let ReadClause::Unwind(unwind) = &u.read_clauses[0] else {
+            return Ok(());
+        };
+        let Expr::Param(pref) = &unwind.expr else {
+            return Ok(());
+        };
+        if !u
+            .write_clauses
+            .iter()
+            .all(|w| matches!(w, WriteClause::Create(_)))
+        {
+            return Ok(());
+        }
+        (unwind.alias.name.clone(), pref.name.clone())
+    };
+
+    let val = params
+        .get(&pname)
+        .ok_or_else(|| ParamError::Missing(pname.clone()))?;
+    let JsonValue::Array(elems) = val else {
+        return Err(unsupported_param(&pname, "UNWIND parameter must be a list"));
+    };
+
+    let Statement::Update(u) = &mut ast.statement else {
+        unreachable!("checked above");
+    };
+    let creates: Vec<CreateClause> = u
+        .write_clauses
+        .iter()
+        .filter_map(|w| match w {
+            WriteClause::Create(c) => Some(c.clone()),
+            _ => None,
+        })
+        .collect();
+
+    let mut new_writes: Vec<WriteClause> = Vec::with_capacity(elems.len() * creates.len());
+    let mut anon = 0u32;
+    for (i, elem) in elems.iter().enumerate() {
+        for c in &creates {
+            let mut cloned = c.clone();
+            replace_alias_in_pattern(&mut cloned.pattern, &alias, elem, &pname)?;
+            rename_pattern_vars(&mut cloned.pattern, i, &mut anon);
+            new_writes.push(WriteClause::Create(cloned));
+        }
+    }
+    u.read_clauses.clear();
+    u.write_clauses = new_writes;
+    Ok(())
+}
+
+fn replace_alias_in_pattern(
+    pat: &mut Pattern,
+    alias: &str,
+    elem: &JsonValue,
+    pname: &str,
+) -> Result<(), ParamError> {
+    for part in &mut pat.parts {
+        replace_alias_in_node(&mut part.head, alias, elem, pname)?;
+        for (rel, node) in &mut part.tail {
+            if let Some(m) = &mut rel.props {
+                replace_alias_in_maplit(m, alias, elem, pname)?;
+            }
+            replace_alias_in_node(node, alias, elem, pname)?;
+        }
+    }
+    Ok(())
+}
+
+fn replace_alias_in_node(
+    n: &mut NodePattern,
+    alias: &str,
+    elem: &JsonValue,
+    pname: &str,
+) -> Result<(), ParamError> {
+    if let Some(m) = &mut n.props {
+        replace_alias_in_maplit(m, alias, elem, pname)?;
+    }
+    Ok(())
+}
+
+fn replace_alias_in_maplit(
+    m: &mut MapLit,
+    alias: &str,
+    elem: &JsonValue,
+    pname: &str,
+) -> Result<(), ParamError> {
+    for (_, e) in &mut m.entries {
+        replace_alias_in_expr(e, alias, elem, pname)?;
+    }
+    Ok(())
+}
+
+fn replace_alias_in_expr(
+    e: &mut Expr,
+    alias: &str,
+    elem: &JsonValue,
+    pname: &str,
+) -> Result<(), ParamError> {
+    match e {
+        // `row.field` → the element map's value for `field` (missing → null).
+        Expr::Prop(inner, field, span) => {
+            if matches!(inner.as_ref(), Expr::Var(v) if v.name == alias) {
+                let JsonValue::Object(map) = elem else {
+                    return Err(unsupported_param(
+                        pname,
+                        "property access (`row.field`) requires the UNWIND list to contain maps",
+                    ));
+                };
+                let fv = map.get(field).cloned().unwrap_or(JsonValue::Null);
+                *e = json_scalar_to_expr(&fv, pname, *span)?;
+                Ok(())
+            } else {
+                replace_alias_in_expr(inner, alias, elem, pname)
+            }
+        }
+        // Bare `row` as a value: a scalar element substitutes directly; a map
+        // element used whole is deferred (no map-valued property in v1).
+        Expr::Var(v) if v.name == alias => match elem {
+            JsonValue::Object(_) | JsonValue::Array(_) => Err(unsupported_param(
+                pname,
+                "using the whole UNWIND element as a value is deferred — reference fields like `row.field`",
+            )),
+            _ => {
+                *e = json_scalar_to_expr(elem, pname, v.span)?;
+                Ok(())
+            }
+        },
+        Expr::BinOp(_, l, r, _)
+        | Expr::In(l, r, _)
+        | Expr::StartsWith(l, r, _)
+        | Expr::EndsWith(l, r, _)
+        | Expr::Contains(l, r, _) => {
+            replace_alias_in_expr(l, alias, elem, pname)?;
+            replace_alias_in_expr(r, alias, elem, pname)
+        }
+        Expr::UnaryOp(_, x, _) | Expr::IsNull(x, _) | Expr::IsNotNull(x, _) => {
+            replace_alias_in_expr(x, alias, elem, pname)
+        }
+        Expr::Call(c) => {
+            for a in &mut c.args {
+                replace_alias_in_expr(a, alias, elem, pname)?;
+            }
+            Ok(())
+        }
+        Expr::List(items, _) => {
+            for it in items {
+                replace_alias_in_expr(it, alias, elem, pname)?;
+            }
+            Ok(())
+        }
+        Expr::Case(_) | Expr::Exists(_, _) | Expr::Var(_) | Expr::Lit(_) | Expr::Param(_) => Ok(()),
+    }
+}
+
+/// Convert a map field value to a literal expression. Scalars only — nested
+/// maps/lists as field values are deferred (no map-valued property in v1).
+fn json_scalar_to_expr(v: &JsonValue, name: &str, span: SourceSpan) -> Result<Expr, ParamError> {
+    match v {
+        JsonValue::Array(_) | JsonValue::Object(_) => Err(unsupported_param(
+            name,
+            "map/list field values inside an UNWIND element are not supported in v1",
+        )),
+        _ => json_to_expr(v, name, span),
+    }
+}
+
+/// Suffix every node/relationship variable with the row index (and name
+/// anonymous nodes), so each unrolled element creates distinct graph nodes
+/// rather than colliding on a shared blank-node id.
+fn rename_pattern_vars(pat: &mut Pattern, row: usize, anon: &mut u32) {
+    for part in &mut pat.parts {
+        rename_node_var(&mut part.head, row, anon);
+        for (rel, node) in &mut part.tail {
+            if let Some(v) = &mut rel.var {
+                v.name = format!("{}__cyrow{}", v.name, row);
+            }
+            rename_node_var(node, row, anon);
+        }
+    }
+}
+
+fn rename_node_var(n: &mut NodePattern, row: usize, anon: &mut u32) {
+    match &mut n.var {
+        Some(v) => v.name = format!("{}__cyrow{}", v.name, row),
+        None => {
+            let name = format!("__cyanon{anon}__cyrow{row}");
+            *anon += 1;
+            n.var = Some(Variable { name, span: n.span });
+        }
+    }
 }
 
 fn subst_statement(s: &mut Statement, p: &ParamMap) -> Result<(), ParamError> {

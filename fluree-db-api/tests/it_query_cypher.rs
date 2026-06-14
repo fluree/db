@@ -427,6 +427,128 @@ async fn transact_cypher_with_parameters_creates_node() {
 }
 
 #[tokio::test]
+async fn transact_cypher_unwind_map_param_batches_node_inserts() {
+    // The idiomatic driver batched insert: one parameter carrying N rows,
+    // UNWIND, CREATE one node per row, commit once.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/cypher:unwind-map");
+
+    let params = json!({
+        "batch": [
+            {"name": "Alice", "age": 30},
+            {"name": "Bob",   "age": 41},
+            {"name": "Carol", "age": 25},
+        ]
+    });
+    let result = fluree
+        .transact_cypher_with_params(
+            ledger0,
+            "UNWIND $batch AS row CREATE (n:Person {name: row.name, age: row.age})",
+            params.as_object(),
+        )
+        .await
+        .expect("unwind-map batched insert");
+
+    let db = graphdb_from_ledger(&result.ledger);
+    assert_eq!(
+        fluree
+            .query_cypher(&db, "MATCH (n:Person) RETURN n")
+            .await
+            .expect("count")
+            .row_count(),
+        3,
+        "three distinct nodes created"
+    );
+    // Each row's properties land on its own node.
+    assert_eq!(
+        fluree
+            .query_cypher(&db, "MATCH (n:Person) WHERE n.age > 28 RETURN n")
+            .await
+            .expect("filter")
+            .row_count(),
+        2,
+        "Alice(30) + Bob(41); Carol(25) excluded"
+    );
+    assert_eq!(
+        fluree
+            .query_cypher(
+                &db,
+                r#"MATCH (n:Person {name: "Bob"}) WHERE n.age = 41 RETURN n"#
+            )
+            .await
+            .expect("bob")
+            .row_count(),
+        1,
+        "Bob's name and age stayed on the same node"
+    );
+}
+
+#[tokio::test]
+async fn transact_cypher_unwind_scalar_list_param_batches_inserts() {
+    // Scalar-list UNWIND CREATE referencing the bare alias.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/cypher:unwind-scalar");
+
+    let params = json!({ "ids": [1, 2, 3, 4] });
+    let result = fluree
+        .transact_cypher_with_params(
+            ledger0,
+            "UNWIND $ids AS id CREATE (n:Thing {ref: id})",
+            params.as_object(),
+        )
+        .await
+        .expect("unwind-scalar batched insert");
+
+    let db = graphdb_from_ledger(&result.ledger);
+    assert_eq!(
+        fluree
+            .query_cypher(&db, "MATCH (n:Thing) RETURN n")
+            .await
+            .expect("count")
+            .row_count(),
+        4,
+        "four distinct nodes"
+    );
+}
+
+#[tokio::test]
+async fn transact_cypher_unwind_empty_batch_errors_empty_transaction() {
+    // An empty `$batch` unrolls to zero writes. Cypher would treat this as a
+    // no-op success; today it surfaces the engine's EmptyTransaction guard.
+    // Pinned here as a known limitation (graceful no-op is a follow-up).
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/cypher:unwind-empty");
+
+    let err = fluree
+        .transact_cypher_with_params(
+            ledger0,
+            "UNWIND $batch AS row CREATE (n:Person {name: row.name})",
+            json!({ "batch": [] }).as_object(),
+        )
+        .await
+        .expect_err("empty batch currently errors (EmptyTransaction)");
+    assert!(format!("{err:?}").contains("EmptyTransaction"), "{err:?}");
+}
+
+#[tokio::test]
+async fn transact_cypher_unwind_whole_row_value_rejected() {
+    // Using the whole map element as a value (not a field) is deferred.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/cypher:unwind-whole");
+
+    let params = json!({ "batch": [{"name": "Alice"}] });
+    let err = fluree
+        .transact_cypher_with_params(
+            ledger0,
+            "UNWIND $batch AS row CREATE (n:Person {data: row})",
+            params.as_object(),
+        )
+        .await
+        .expect_err("whole-map value must be rejected");
+    assert!(format!("{err}").contains("whole UNWIND element"), "{err}");
+}
+
+#[tokio::test]
 async fn transact_cypher_set_relationship_property() {
     // Bind a relationship variable in a write MATCH and update its metadata.
     let fluree = FlureeBuilder::memory().build_memory();
