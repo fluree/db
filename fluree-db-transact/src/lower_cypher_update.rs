@@ -189,6 +189,25 @@ impl<'a> CypherLowering<'a> {
             ));
         }
 
+        // MERGE must stand alone. Each MERGE appends a top-level NOT EXISTS
+        // guard evaluated against the pre-transaction snapshot, so combining
+        // MERGE with other writes (or another MERGE) would make the guards
+        // conjunctive and blind to earlier writes in the same statement —
+        // both unsound. Sequential MERGE needs multi-statement staging the
+        // single-Txn model can't provide.
+        let merge_count = update
+            .write_clauses
+            .iter()
+            .filter(|w| matches!(w, WriteClause::Merge(_)))
+            .count();
+        if merge_count > 0 && (update.write_clauses.len() > 1 || !update.read_clauses.is_empty()) {
+            return Err(LowerCypherError::unsupported(
+                "MERGE must be the only clause in v1 — combining MERGE with other writes, \
+                 a leading MATCH, or another MERGE needs sequential snapshot evaluation that \
+                 single-Txn staging can't provide",
+            ));
+        }
+
         // Lower any leading MATCH / OPTIONAL MATCH into where_patterns.
         // Their presence flips the transaction into Update mode (DELETE /
         // INSERT templates reference the bound variables).
@@ -213,14 +232,8 @@ impl<'a> CypherLowering<'a> {
                     self.require_match(has_match, "DELETE")?;
                     self.lower_delete(d)?;
                 }
-                WriteClause::Merge(m) => {
-                    if has_match {
-                        return Err(LowerCypherError::unsupported(
-                            "MATCH … MERGE is deferred — v1 supports standalone single-node MERGE",
-                        ));
-                    }
-                    self.lower_merge(m)?;
-                }
+                // MERGE-standalone is guaranteed by the merge-count guard above.
+                WriteClause::Merge(m) => self.lower_merge(m)?,
             }
         }
         Ok(())
@@ -648,8 +661,16 @@ impl<'a> CypherLowering<'a> {
         let new_subj = self.node_subject(node);
         self.lower_node_create(node, new_subj.clone())?;
         let merge_var = node.var.as_ref().map(|v| v.name.clone());
+        // Keys already asserted by the identity map — ON CREATE SET on one of
+        // these would double-assert (Cypher SET overwrites; our identity insert
+        // can't be retracted in the same create branch), so reject it.
+        let identity_keys: std::collections::HashSet<&str> = node
+            .props
+            .as_ref()
+            .map(|p| p.entries.iter().map(|(k, _)| k.as_str()).collect())
+            .unwrap_or_default();
         for item in &m.on_create {
-            self.emit_on_create_set(&new_subj, merge_var.as_deref(), item)?;
+            self.emit_on_create_set(&new_subj, merge_var.as_deref(), &identity_keys, item)?;
         }
         Ok(())
     }
@@ -691,6 +712,7 @@ impl<'a> CypherLowering<'a> {
         &mut self,
         subj: &TemplateTerm,
         merge_var: Option<&str>,
+        identity_keys: &std::collections::HashSet<&str>,
         item: &SetItem,
     ) -> Result<(), LowerCypherError> {
         let target_ok = |t: &Variable| matches!(merge_var, Some(v) if v == t.name);
@@ -702,6 +724,9 @@ impl<'a> CypherLowering<'a> {
             } => {
                 if !target_ok(target) {
                     return Err(merge_target_err());
+                }
+                if identity_keys.contains(property.as_str()) {
+                    return Err(merge_identity_override_err(property));
                 }
                 if matches!(value, Expr::Lit(Literal::Null(_))) {
                     return Ok(()); // null on a new node asserts nothing
@@ -720,6 +745,14 @@ impl<'a> CypherLowering<'a> {
                     return Err(merge_target_err());
                 }
                 for (key, val) in &map.entries {
+                    if identity_keys.contains(key.as_str()) {
+                        return Err(merge_identity_override_err(key));
+                    }
+                    // Consistent with `n.x = null`: a null map entry asserts
+                    // nothing on a new node.
+                    if matches!(val, Expr::Lit(Literal::Null(_))) {
+                        continue;
+                    }
                     let pred_iri = self.resolve_predicate(key)?;
                     let pred_sid = self.ns.sid_for_iri(&pred_iri);
                     let obj = self.expr_to_object(val)?;
@@ -1033,6 +1066,15 @@ fn var_name(name: &str) -> String {
 
 fn merge_target_err() -> LowerCypherError {
     LowerCypherError::rejected("ON CREATE SET target must be the MERGE node variable")
+}
+
+fn merge_identity_override_err(key: &str) -> LowerCypherError {
+    LowerCypherError::unsupported(format!(
+        "ON CREATE SET on `{key}`, which is already part of the MERGE identity map, is \
+         deferred — it would double-assert the property (Cypher SET overwrites, but the \
+         identity insert can't be retracted in the same create branch). Drop `{key}` from \
+         the MERGE map or from ON CREATE SET."
+    ))
 }
 
 fn lower_literal_unresolved(lit: &Literal) -> Result<LiteralValue, LowerCypherError> {

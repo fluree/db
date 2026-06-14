@@ -282,6 +282,43 @@ fn merge_on_create_set_adds_inserts() {
 }
 
 #[test]
+fn merge_must_be_only_write_clause() {
+    // Multiple MERGEs and CREATE … MERGE are rejected (guards would be
+    // conjunctive / blind to earlier writes).
+    for src in [
+        r#"MERGE (a:Person {name: "A"}) MERGE (b:Person {name: "B"})"#,
+        r#"CREATE (a:Person {name: "A"}) MERGE (b:Person {name: "B"})"#,
+    ] {
+        let out = parse_cypher(src);
+        if out.has_errors() {
+            continue;
+        }
+        let ast = out.ast.unwrap();
+        let mut ns = NamespaceRegistry::new();
+        let r = lower_cypher_update(&ast, &mut ns, TxnOpts::default(), CypherLowerOpts::default());
+        assert!(r.is_err(), "expected rejection for `{src}`");
+    }
+}
+
+#[test]
+fn merge_on_create_set_on_identity_key_is_rejected() {
+    let out = parse_cypher(r#"MERGE (n:Person {name: "Alice"}) ON CREATE SET n.name = "Alicia""#);
+    assert!(!out.has_errors());
+    let ast = out.ast.unwrap();
+    let mut ns = NamespaceRegistry::new();
+    let r = lower_cypher_update(&ast, &mut ns, TxnOpts::default(), CypherLowerOpts::default());
+    assert!(r.is_err(), "ON CREATE SET on an identity-map key should be rejected");
+}
+
+#[test]
+fn merge_on_create_map_merge_skips_null_entries() {
+    // Consistent with `n.x = null`: a null map entry asserts nothing.
+    let txn = lower(r#"MERGE (n:Person {name: "Alice"}) ON CREATE SET n += {x: null, y: 1}"#);
+    // label + name (identity) + y = 3 (x skipped).
+    assert_eq!(txn.insert_templates.len(), 3, "inserts: {:?}", txn.insert_templates);
+}
+
+#[test]
 fn match_create_relationship_references_bound_nodes() {
     let txn = lower(
         r#"MATCH (a:Person {name: "Alice"}), (b:Person {name: "Bob"})
