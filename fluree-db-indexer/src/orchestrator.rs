@@ -1229,6 +1229,20 @@ impl BackgroundIndexerWorker {
                 track_fuel: true,
                 ..Default::default()
             });
+        // Hand the commit-CID index (if any) to the incremental walk so it can
+        // skip the serial commit-DAG discovery. This is the background path
+        // that the no-NS `build_index_for_record_with_tracker` entry can't
+        // populate on its own; errors degrade to `None` (serial fallback).
+        // `force_serial_commit_walk` leaves it unset to A/B the serial baseline.
+        job_config.pending_commit_cids = if job_config.force_serial_commit_walk {
+            None
+        } else {
+            self.nameservice
+                .pending_commit_cids(ledger_id, record.index_t)
+                .await
+                .unwrap_or(None)
+        };
+
         let result = crate::build_index_for_record_with_tracker(
             content_store,
             build_tracker.clone(),
@@ -1277,6 +1291,9 @@ impl BackgroundIndexerWorker {
                     {
                         let gc_store = self.backend.content_store(&index_result.ledger_id);
                         let gc_root_id = index_result.root_id.clone();
+                        let gc_ns = Arc::clone(&self.nameservice);
+                        let gc_ledger_id = index_result.ledger_id.clone();
+                        let gc_index_t = index_result.index_t;
                         let gc_config = crate::gc::CleanGarbageConfig {
                             max_old_indexes: Some(self.config.gc_max_old_indexes),
                             min_time_garbage_mins: Some(self.config.gc_min_time_mins),
@@ -1305,6 +1322,20 @@ impl BackgroundIndexerWorker {
                                 );
                             } else {
                                 debug!(root_id = %gc_root_id, "Background GC completed");
+                                // Commits up to the published index_t are now
+                                // captured in the index root, so their entries
+                                // in the commit-CID index will never be needed
+                                // by an incremental walk again. Compact them.
+                                if let Err(e) =
+                                    gc_ns.prune_commit_index(&gc_ledger_id, gc_index_t).await
+                                {
+                                    debug!(
+                                        error = %e,
+                                        ledger_id = %gc_ledger_id,
+                                        up_to_t = gc_index_t,
+                                        "commit-index prune failed (non-fatal)"
+                                    );
+                                }
                             }
                         });
                     } else {

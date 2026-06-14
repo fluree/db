@@ -160,6 +160,7 @@ impl PropertyPathOperator {
         }
 
         while let Some(current) = queue.pop_front() {
+            crate::fast_path_common::bail_if_cancelled(&ctx.cancellation)?;
             // Safety bound check
             if visited.len() >= self.max_visited {
                 return Err(QueryError::ResourceLimit(format!(
@@ -240,6 +241,7 @@ impl PropertyPathOperator {
         }
 
         while let Some(current) = queue.pop_front() {
+            crate::fast_path_common::bail_if_cancelled(&ctx.cancellation)?;
             // Safety bound check
             if visited.len() >= self.max_visited {
                 return Err(QueryError::ResourceLimit(format!(
@@ -337,6 +339,7 @@ impl PropertyPathOperator {
 
             let mut added_self_via_cycle = false;
             while let Some(cur) = queue.pop_front() {
+                crate::fast_path_common::bail_if_cancelled(&ctx.cancellation)?;
                 if visited.len() >= self.max_visited {
                     return Err(QueryError::ResourceLimit(format!(
                         "Property path exceeded max visited nodes ({})",
@@ -386,6 +389,7 @@ impl PropertyPathOperator {
         visited.insert(start.clone());
 
         while let Some(current) = queue.pop_front() {
+            crate::fast_path_common::bail_if_cancelled(&ctx.cancellation)?;
             if visited.len() >= self.max_visited {
                 return Err(QueryError::ResourceLimit(format!(
                     "Property path exceeded max visited nodes ({})",

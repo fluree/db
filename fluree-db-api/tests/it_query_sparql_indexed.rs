@@ -1015,6 +1015,429 @@ async fn indexed_rdf_type_star_count_exact_after_incremental_retraction() {
         .await;
 }
 
+/// E2d differential repro: an aggregate over an inline typed star must see the
+/// same value multiset as the bare predicate scan when every value-bearing
+/// subject has the requested type, including values that live in novelty after
+/// the binary index was adopted.
+#[tokio::test]
+async fn indexed_inline_type_join_aggregate_includes_overlay_multivalue() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "it/indexed-e2d-inline-type-agg:main";
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        Arc::new(fluree.nameservice_mode().clone()),
+        fluree_db_indexer::IndexerConfig::small(),
+    );
+
+    local
+        .run_until(async move {
+            let index_cfg = IndexConfig {
+                reindex_min_bytes: 0,
+                reindex_max_bytes: 10_000_000,
+            };
+
+            let ledger1 = fluree
+                .insert_with_opts(
+                    genesis_ledger_for_fluree(&fluree, ledger_id),
+                    &json!({
+                        "@context": { "ex": "http://example.org/ns/" },
+                        "@graph": [
+                            {"@id": "ex:a", "@type": "ex:LineItem", "ex:price": [10, 20]},
+                            {"@id": "ex:b", "@type": "ex:LineItem", "ex:price": 30}
+                        ]
+                    }),
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg,
+                )
+                .await
+                .expect("seed insert")
+                .ledger;
+            let _ = trigger_index_and_wait_outcome(&handle, ledger_id, ledger1.t()).await;
+
+            // Leave this assertion in novelty (index_t remains at t=1). The bare
+            // predicate path must merge it with the index, and the inline typed
+            // star must preserve the same value multiset.
+            let ledger2 = fluree
+                .insert(
+                    ledger1,
+                    &json!({
+                        "@context": { "ex": "http://example.org/ns/" },
+                        "@graph": [{"@id": "ex:a", "ex:price": 7}]
+                    }),
+                )
+                .await
+                .expect("overlay insert")
+                .ledger;
+
+            let view = fluree
+                .db_at_t(ledger_id, ledger2.t())
+                .await
+                .expect("view at overlay head");
+            assert!(
+                view.snapshot.range_provider.is_some(),
+                "test requires the indexed query path"
+            );
+
+            let bare_rows = fluree
+                .query(
+                    &view,
+                    QueryInput::Sparql(
+                        r"
+                        PREFIX ex: <http://example.org/ns/>
+                        SELECT ?s ?v WHERE { ?s ex:price ?v }
+                        ",
+                    ),
+                )
+                .await
+                .expect("bare rows")
+                .to_jsonld(&view.snapshot)
+                .expect("bare rows jsonld");
+            assert_eq!(
+                normalize_rows(&bare_rows),
+                normalize_rows(&json!([
+                    ["ex:a", 7],
+                    ["ex:a", 10],
+                    ["ex:a", 20],
+                    ["ex:b", 30]
+                ])),
+                "bare predicate scan should include the overlay price"
+            );
+
+            let typed_rows = fluree
+                .query(
+                    &view,
+                    QueryInput::Sparql(
+                        r"
+                        PREFIX ex: <http://example.org/ns/>
+                        SELECT ?s ?v WHERE { ?s a ex:LineItem ; ex:price ?v }
+                        ",
+                    ),
+                )
+                .await
+                .expect("typed rows")
+                .to_jsonld(&view.snapshot)
+                .expect("typed rows jsonld");
+            assert_eq!(
+                normalize_rows(&typed_rows),
+                normalize_rows(&bare_rows),
+                "typed inline star must preserve the bare predicate value multiset"
+            );
+
+            let bare_sum = fluree
+                .query(
+                    &view,
+                    QueryInput::Sparql(
+                        r"
+                        PREFIX ex: <http://example.org/ns/>
+                        SELECT (SUM(?v) AS ?sum) WHERE { ?s ex:price ?v }
+                        ",
+                    ),
+                )
+                .await
+                .expect("bare sum")
+                .to_jsonld(&view.snapshot)
+                .expect("bare sum jsonld");
+            let typed_sum = fluree
+                .query(
+                    &view,
+                    QueryInput::Sparql(
+                        r"
+                        PREFIX ex: <http://example.org/ns/>
+                        SELECT (SUM(?v) AS ?sum) WHERE { ?s a ex:LineItem ; ex:price ?v }
+                        ",
+                    ),
+                )
+                .await
+                .expect("typed sum")
+                .to_jsonld(&view.snapshot)
+                .expect("typed sum jsonld");
+
+            assert_eq!(normalize_rows(&bare_sum), normalize_rows(&json!([[67]])));
+            assert_eq!(
+                normalize_rows(&typed_sum),
+                normalize_rows(&bare_sum),
+                "typed inline aggregate must match the bare aggregate when all subjects are typed"
+            );
+        })
+        .await;
+}
+
+/// E2d fully-indexed control: every subject with `ex:price` is also typed as
+/// `ex:LineItem`, so the bare predicate and inline typed star must expose the
+/// same binding multiset before aggregation.
+#[tokio::test]
+async fn indexed_inline_type_join_aggregate_matches_bare_multivalue() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "it/indexed-e2d-inline-type-agg-full:main";
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        Arc::new(fluree.nameservice_mode().clone()),
+        fluree_db_indexer::IndexerConfig::small(),
+    );
+
+    local
+        .run_until(async move {
+            let index_cfg = IndexConfig {
+                reindex_min_bytes: 0,
+                reindex_max_bytes: 10_000_000,
+            };
+
+            let mut graph = Vec::new();
+            let mut expected_count = 0i64;
+            let mut expected_sum = 0i64;
+            for i in 0..1_500 {
+                let mut prices = vec![(i % 100) as i64 + 1];
+                if i % 37 == 0 {
+                    prices.push(1_000 + i as i64);
+                }
+                expected_count += prices.len() as i64;
+                expected_sum += prices.iter().sum::<i64>();
+                graph.push(json!({
+                    "@id": format!("ex:item{i}"),
+                    "@type": "ex:LineItem",
+                    "ex:price": prices,
+                }));
+            }
+
+            let ledger1 = fluree
+                .insert_with_opts(
+                    genesis_ledger_for_fluree(&fluree, ledger_id),
+                    &json!({
+                        "@context": { "ex": "http://example.org/ns/" },
+                        "@graph": graph
+                    }),
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg,
+                )
+                .await
+                .expect("seed insert")
+                .ledger;
+            let _ = trigger_index_and_wait_outcome(&handle, ledger_id, ledger1.t()).await;
+
+            let view = fluree
+                .db_at_t(ledger_id, ledger1.t())
+                .await
+                .expect("indexed view");
+            assert!(
+                view.snapshot.range_provider.is_some(),
+                "test requires the indexed query path"
+            );
+
+            async fn query_rows(
+                fluree: &fluree_db_api::Fluree,
+                view: &fluree_db_api::GraphDb,
+                sparql: &'static str,
+            ) -> serde_json::Value {
+                fluree
+                    .query(view, QueryInput::Sparql(sparql))
+                    .await
+                    .expect("query")
+                    .to_jsonld(&view.snapshot)
+                    .expect("to_jsonld")
+            }
+
+            let bare_count = query_rows(
+                &fluree,
+                &view,
+                r"
+                PREFIX ex: <http://example.org/ns/>
+                SELECT (COUNT(?v) AS ?count) WHERE { ?s ex:price ?v }
+                ",
+            )
+            .await;
+            let typed_count = query_rows(
+                &fluree,
+                &view,
+                r"
+                PREFIX ex: <http://example.org/ns/>
+                SELECT (COUNT(?v) AS ?count) WHERE { ?s a ex:LineItem ; ex:price ?v }
+                ",
+            )
+            .await;
+            assert_eq!(
+                normalize_rows(&bare_count),
+                normalize_rows(&json!([[expected_count]]))
+            );
+            assert_eq!(
+                normalize_rows(&typed_count),
+                normalize_rows(&bare_count),
+                "typed inline COUNT must match bare COUNT when every priced subject is typed"
+            );
+
+            let bare_sum = query_rows(
+                &fluree,
+                &view,
+                r"
+                PREFIX ex: <http://example.org/ns/>
+                SELECT (SUM(?v) AS ?sum) WHERE { ?s ex:price ?v }
+                ",
+            )
+            .await;
+            let typed_sum = query_rows(
+                &fluree,
+                &view,
+                r"
+                PREFIX ex: <http://example.org/ns/>
+                SELECT (SUM(?v) AS ?sum) WHERE { ?s a ex:LineItem ; ex:price ?v }
+                ",
+            )
+            .await;
+            assert_eq!(
+                normalize_rows(&bare_sum),
+                normalize_rows(&json!([[expected_sum]]))
+            );
+            assert_eq!(
+                normalize_rows(&typed_sum),
+                normalize_rows(&bare_sum),
+                "typed inline SUM must match bare SUM when every priced subject is typed"
+            );
+        })
+        .await;
+}
+
+/// E2d overlay stressor for the wider same-subject star path. The additional
+/// `ex:currency` predicate makes this look like production "typed line-item
+/// fact + facet" queries while the extra price remains in novelty after the
+/// binary index was adopted.
+#[tokio::test]
+async fn indexed_inline_type_star_aggregate_with_overlay_multivalue_and_facet() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "it/indexed-e2d-inline-type-agg-facet:main";
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        Arc::new(fluree.nameservice_mode().clone()),
+        fluree_db_indexer::IndexerConfig::small(),
+    );
+
+    local
+        .run_until(async move {
+            let index_cfg = IndexConfig {
+                reindex_min_bytes: 0,
+                reindex_max_bytes: 10_000_000,
+            };
+
+            let ledger1 = fluree
+                .insert_with_opts(
+                    genesis_ledger_for_fluree(&fluree, ledger_id),
+                    &json!({
+                        "@context": { "ex": "http://example.org/ns/" },
+                        "@graph": [
+                            {
+                                "@id": "ex:a",
+                                "@type": "ex:LineItem",
+                                "ex:price": [10, 20],
+                                "ex:currency": "USD"
+                            },
+                            {
+                                "@id": "ex:b",
+                                "@type": "ex:LineItem",
+                                "ex:price": 30,
+                                "ex:currency": "USD"
+                            }
+                        ]
+                    }),
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg,
+                )
+                .await
+                .expect("seed insert")
+                .ledger;
+            let _ = trigger_index_and_wait_outcome(&handle, ledger_id, ledger1.t()).await;
+
+            let ledger2 = fluree
+                .insert(
+                    ledger1,
+                    &json!({
+                        "@context": { "ex": "http://example.org/ns/" },
+                        "@graph": [{"@id": "ex:a", "ex:price": 7}]
+                    }),
+                )
+                .await
+                .expect("overlay insert")
+                .ledger;
+
+            let view = fluree
+                .db_at_t(ledger_id, ledger2.t())
+                .await
+                .expect("view at overlay head");
+            assert!(
+                view.snapshot.range_provider.is_some(),
+                "test requires the indexed query path"
+            );
+
+            let q_price_only = r"
+                PREFIX ex: <http://example.org/ns/>
+                SELECT (SUM(?v) AS ?sum)
+                WHERE { ?s ex:price ?v . }
+            ";
+            let q_bare_star = r"
+                PREFIX ex: <http://example.org/ns/>
+                SELECT (SUM(?v) AS ?sum)
+                WHERE {
+                    ?s ex:price ?v .
+                    ?s ex:currency ?currency .
+                }
+            ";
+            let q_typed = r"
+                PREFIX ex: <http://example.org/ns/>
+                SELECT (SUM(?v) AS ?sum)
+                WHERE {
+                    ?s a ex:LineItem ;
+                       ex:price ?v ;
+                       ex:currency ?currency .
+                }
+            ";
+
+            let price_only_sum = fluree
+                .query(&view, QueryInput::Sparql(q_price_only))
+                .await
+                .expect("price-only sum")
+                .to_jsonld(&view.snapshot)
+                .expect("price-only sum jsonld");
+            let bare_star_sum = fluree
+                .query(&view, QueryInput::Sparql(q_bare_star))
+                .await
+                .expect("bare star sum")
+                .to_jsonld(&view.snapshot)
+                .expect("bare star sum jsonld");
+            let typed_sum = fluree
+                .query(&view, QueryInput::Sparql(q_typed))
+                .await
+                .expect("typed star sum")
+                .to_jsonld(&view.snapshot)
+                .expect("typed star sum jsonld");
+
+            assert_eq!(
+                normalize_rows(&price_only_sum),
+                normalize_rows(&json!([[67]])),
+                "single-predicate control must include the novelty price"
+            );
+            assert_eq!(
+                normalize_rows(&bare_star_sum),
+                normalize_rows(&price_only_sum),
+                "same-subject star join must preserve the single-predicate value multiset"
+            );
+            assert_eq!(
+                normalize_rows(&typed_sum),
+                normalize_rows(&price_only_sum),
+                "typed/faceted inline SUM must include novelty values just like the single-predicate control"
+            );
+        })
+        .await;
+}
+
 /// Cumulative-drift guard (#1266): the rdf:type-star fold must stay
 /// current-state-exact across SUCCESSIVE incremental builds, where each build
 /// seeds from the previous (possibly-drifted) root. Exercises all three
@@ -1247,6 +1670,264 @@ async fn indexed_number_of_predicates_from_stats_matches_general() {
                 idx_rows, mem_rows,
                 "number-of-predicates from stats must equal the general-pipeline count"
             );
+        })
+        .await;
+}
+
+/// `number-of-subjects` / `number-of-objects` (`COUNT(DISTINCT ?s|?o)` over
+/// `?s ?p ?o`) answered metadata-only from leaflet `lead_group_count` with
+/// lead-prefix boundary dedup, read via directory-only leaf opens. Tiny leaves
+/// force many leaf/leaflet boundaries with multi-valued subjects and shared
+/// objects, so the count is sensitive to any seam-dedup or dir-read bug.
+/// Asserts the indexed result equals the memory (general-pipeline) result.
+#[tokio::test]
+async fn indexed_number_of_subjects_and_objects_matches_general() {
+    assert_index_defaults();
+
+    let seed = || {
+        let mut nodes: Vec<serde_json::Value> = Vec::with_capacity(1500);
+        for i in 0..1500i64 {
+            // 2-4 rows per subject; objects mix shared IRI refs (mod 97) and
+            // literals (mod 311 / mod 13) so distinct-object groups span
+            // leaflet boundaries in OPST order.
+            let mut node = json!({
+                "@id": format!("ex:s{i}"),
+                "ex:ref": {"@id": format!("ex:t{}", i % 97)},
+                "ex:val": i % 311
+            });
+            if i % 2 == 0 {
+                node["ex:extra"] = json!(format!("lit{}", i % 13));
+            }
+            if i % 3 == 0 {
+                node["ex:ref2"] = json!({"@id": format!("ex:t{}", (i + 7) % 97)});
+            }
+            nodes.push(node);
+        }
+        json!({ "@context": { "ex": "http://example.org/ns/" }, "@graph": nodes })
+    };
+    let queries = [
+        (
+            "number-of-subjects",
+            "SELECT (COUNT(DISTINCT ?s) AS ?count) WHERE { ?s ?p ?o }",
+        ),
+        (
+            "number-of-objects",
+            "SELECT (COUNT(DISTINCT ?o) AS ?count) WHERE { ?s ?p ?o }",
+        ),
+    ];
+
+    // Memory reference (general pipeline).
+    let mem = FlureeBuilder::memory().build_memory();
+    let mem_ledger = mem
+        .insert_with_opts(
+            genesis_ledger_for_fluree(&mem, "it/nos-mem:main"),
+            &seed(),
+            TxnOpts::default(),
+            CommitOpts::default(),
+            &IndexConfig {
+                reindex_min_bytes: 0,
+                reindex_max_bytes: 80_000_000,
+            },
+        )
+        .await
+        .expect("mem seed")
+        .ledger;
+    let mem_view = mem
+        .db_at_t("it/nos-mem:main", mem_ledger.t())
+        .await
+        .expect("mem view");
+    let mut mem_rows = Vec::new();
+    for (_, q) in &queries {
+        mem_rows.push(normalize_rows(
+            &mem.query(&mem_view, QueryInput::Sparql(q))
+                .await
+                .expect("mem query")
+                .to_jsonld(&mem_view.snapshot)
+                .expect("to_jsonld"),
+        ));
+    }
+
+    // Indexed path: tiny leaves/leaflets so the data spans many boundaries.
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "it/nos-indexed:main";
+    let mut idx_config = fluree_db_indexer::IndexerConfig::small();
+    idx_config.leaflet_rows = 100;
+    idx_config.leaf_target_bytes = 8_000;
+    idx_config.leaf_max_bytes = 16_000;
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        Arc::new(fluree.nameservice_mode().clone()),
+        idx_config,
+    );
+    local
+        .run_until(async move {
+            let index_cfg = IndexConfig {
+                reindex_min_bytes: 0,
+                reindex_max_bytes: 80_000_000,
+            };
+            let ledger1 = fluree
+                .insert_with_opts(
+                    genesis_ledger_for_fluree(&fluree, ledger_id),
+                    &seed(),
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg,
+                )
+                .await
+                .expect("indexed seed")
+                .ledger;
+            let _ = trigger_index_and_wait_outcome(&handle, ledger_id, ledger1.t()).await;
+            let view = fluree
+                .db_at_t(ledger_id, ledger1.t())
+                .await
+                .expect("indexed view");
+            for ((label, q), mem) in queries.iter().zip(&mem_rows) {
+                let idx_rows = normalize_rows(
+                    &fluree
+                        .query(&view, QueryInput::Sparql(q))
+                        .await
+                        .expect("indexed query")
+                        .to_jsonld(&view.snapshot)
+                        .expect("to_jsonld"),
+                );
+                assert_eq!(
+                    &idx_rows, mem,
+                    "{label} from lead-group metadata must equal the general-pipeline count"
+                );
+            }
+        })
+        .await;
+}
+
+/// Parallel chunked `number-of-subjects` / `number-of-objects`: seed enough
+/// rows over tiny leaves that the SPOT/OPST branches exceed the 128-leaf
+/// parallel gate, so the distinct-lead count runs as a chunked reduce with
+/// seam stitching. Multi-valued subjects and heavily shared objects make lead
+/// groups straddle leaflet, leaf, AND chunk boundaries — any seam-dedup bug
+/// (double-counted or over-deduped group at a chunk seam) shifts the count.
+/// Asserts the indexed (parallel) result equals the memory (general-pipeline)
+/// result, which is computed without any chunking.
+#[tokio::test]
+async fn indexed_parallel_number_of_subjects_objects_matches_general() {
+    assert_index_defaults();
+    // Engage the parallel chunk reduce on this test-sized ledger (~42 leaves;
+    // the production default gate is 128). Safe under nextest (process-per-test).
+    std::env::set_var("FLUREE_PARALLEL_DIR_WALK_MIN_LEAVES", "8");
+
+    let seed = || {
+        let mut nodes: Vec<serde_json::Value> = Vec::with_capacity(12_000);
+        for i in 0..12_000i64 {
+            // ~4 rows per subject (≈48k rows). Objects shared mod 61 so each
+            // distinct object's group spans many leaflets in OPST order, and
+            // multi-valued subjects span leaflet seams in SPOT order.
+            let mut node = json!({
+                "@id": format!("ex:s{i}"),
+                "ex:ref": {"@id": format!("ex:t{}", i % 61)},
+                "ex:ref2": {"@id": format!("ex:t{}", (i + 13) % 61)},
+                "ex:val": i % 199
+            });
+            if i % 2 == 0 {
+                node["ex:extra"] = json!(format!("lit{}", i % 7));
+            }
+            nodes.push(node);
+        }
+        json!({ "@context": { "ex": "http://example.org/ns/" }, "@graph": nodes })
+    };
+    let queries = [
+        (
+            "number-of-subjects",
+            "SELECT (COUNT(DISTINCT ?s) AS ?count) WHERE { ?s ?p ?o }",
+        ),
+        (
+            "number-of-objects",
+            "SELECT (COUNT(DISTINCT ?o) AS ?count) WHERE { ?s ?p ?o }",
+        ),
+    ];
+
+    // Memory reference (general pipeline).
+    let mem = FlureeBuilder::memory().build_memory();
+    let mem_ledger = mem
+        .insert_with_opts(
+            genesis_ledger_for_fluree(&mem, "it/pnos-mem:main"),
+            &seed(),
+            TxnOpts::default(),
+            CommitOpts::default(),
+            &IndexConfig {
+                reindex_min_bytes: 0,
+                reindex_max_bytes: 80_000_000,
+            },
+        )
+        .await
+        .expect("mem seed")
+        .ledger;
+    let mem_view = mem
+        .db_at_t("it/pnos-mem:main", mem_ledger.t())
+        .await
+        .expect("mem view");
+    let mut mem_rows = Vec::new();
+    for (_, q) in &queries {
+        mem_rows.push(normalize_rows(
+            &mem.query(&mem_view, QueryInput::Sparql(q))
+                .await
+                .expect("mem query")
+                .to_jsonld(&mem_view.snapshot)
+                .expect("to_jsonld"),
+        ));
+    }
+
+    // Indexed path: tiny leaves so the branch spans hundreds of leaves and the
+    // parallel chunk reduce engages.
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "it/pnos-indexed:main";
+    let mut idx_config = fluree_db_indexer::IndexerConfig::small();
+    idx_config.leaflet_rows = 100;
+    idx_config.leaf_target_bytes = 4_000;
+    idx_config.leaf_max_bytes = 8_000;
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        Arc::new(fluree.nameservice_mode().clone()),
+        idx_config,
+    );
+    local
+        .run_until(async move {
+            let index_cfg = IndexConfig {
+                reindex_min_bytes: 0,
+                reindex_max_bytes: 80_000_000,
+            };
+            let ledger1 = fluree
+                .insert_with_opts(
+                    genesis_ledger_for_fluree(&fluree, ledger_id),
+                    &seed(),
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg,
+                )
+                .await
+                .expect("indexed seed")
+                .ledger;
+            let _ = trigger_index_and_wait_outcome(&handle, ledger_id, ledger1.t()).await;
+            let view = fluree
+                .db_at_t(ledger_id, ledger1.t())
+                .await
+                .expect("indexed view");
+            for ((label, q), mem) in queries.iter().zip(&mem_rows) {
+                let idx_rows = normalize_rows(
+                    &fluree
+                        .query(&view, QueryInput::Sparql(q))
+                        .await
+                        .expect("indexed query")
+                        .to_jsonld(&view.snapshot)
+                        .expect("to_jsonld"),
+                );
+                assert_eq!(
+                    &idx_rows, mem,
+                    "{label} from the parallel chunked reduce must equal the general-pipeline count"
+                );
+            }
         })
         .await;
 }
@@ -7547,6 +8228,154 @@ async fn indexed_iri_ref_and_blank_node_resolve_correctly() {
         .await;
 }
 
+/// `COUNT(?o)` + `FILTER(isLiteral(?o))` over an all-variable triple on an
+/// indexed ledger. With no blank-node objects the literal-COUNT fast path
+/// answers from the per-graph property datatype stats (no leaf I/O); the
+/// result must equal the actual literal row count (names + ages are literals,
+/// `ex:knows` targets are refs).
+#[tokio::test]
+async fn indexed_count_literal_objects_from_stats() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "it/indexed-count-literals-stats:main";
+
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        Arc::new(fluree.nameservice_mode().clone()),
+        fluree_db_indexer::IndexerConfig::small(),
+    );
+
+    local
+        .run_until(async move {
+            let index_cfg = IndexConfig {
+                reindex_min_bytes: 0,
+                reindex_max_bytes: 10_000_000,
+            };
+
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let insert = json!({
+                "@context": { "ex": "http://example.org/ns/" },
+                "@graph": [
+                    {"@id": "ex:alice", "ex:name": "Alice", "ex:age": 30, "ex:knows": {"@id": "ex:bob"}},
+                    {"@id": "ex:bob", "ex:name": "Bob", "ex:age": 25}
+                ]
+            });
+            let ledger1 = fluree
+                .insert_with_opts(
+                    ledger0,
+                    &insert,
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg,
+                )
+                .await
+                .expect("seed insert")
+                .ledger;
+
+            let outcome = trigger_index_and_wait_outcome(&handle, ledger_id, ledger1.t()).await;
+            if let fluree_db_api::IndexOutcome::Completed { index_t, .. } = outcome {
+                assert_eq!(index_t, 1, "should index to t=1");
+            }
+
+            let view = fluree
+                .db_at_t(ledger_id, ledger1.t())
+                .await
+                .expect("load indexed view");
+
+            let q = r"
+                SELECT (COUNT(?o) AS ?count)
+                WHERE { ?s ?p ?o FILTER(isLiteral(?o)) }
+            ";
+            let r = fluree
+                .query(&view, QueryInput::Sparql(q))
+                .await
+                .expect("literal COUNT query should succeed");
+            let jsonld = r.to_jsonld(&view.snapshot).expect("to_jsonld");
+            assert_eq!(
+                normalize_rows(&jsonld),
+                normalize_rows(&json!([[4]])),
+                "2 names + 2 ages are literals; the ex:knows ref is not"
+            );
+        })
+        .await;
+}
+
+/// Same query with a blank-node OBJECT in the data: a bnode ref is not a
+/// literal, so the count must be 3, not 4. Depending on which path produced
+/// the stats, the bnode is tagged `JSON_LD_ID` (commit/runtime path — fold
+/// fires and excludes it) or `UNKNOWN` (bulk-import path — fold declines to
+/// the leaflet walk); both must agree on 3.
+#[tokio::test]
+async fn indexed_count_literal_objects_with_blank_node_object() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "it/indexed-count-literals-bnode:main";
+
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        Arc::new(fluree.nameservice_mode().clone()),
+        fluree_db_indexer::IndexerConfig::small(),
+    );
+
+    local
+        .run_until(async move {
+            let index_cfg = IndexConfig {
+                reindex_min_bytes: 0,
+                reindex_max_bytes: 10_000_000,
+            };
+
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let insert = json!({
+                "@context": { "ex": "http://example.org/ns/" },
+                "@graph": [
+                    {"@id": "ex:alice", "ex:name": "Alice", "ex:knows": {"@id": "ex:bob"}},
+                    {"@id": "ex:bob", "ex:name": "Bob", "ex:knows": {"ex:name": "Anonymous"}}
+                ]
+            });
+            let ledger1 = fluree
+                .insert_with_opts(
+                    ledger0,
+                    &insert,
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg,
+                )
+                .await
+                .expect("seed insert")
+                .ledger;
+
+            let outcome = trigger_index_and_wait_outcome(&handle, ledger_id, ledger1.t()).await;
+            if let fluree_db_api::IndexOutcome::Completed { index_t, .. } = outcome {
+                assert_eq!(index_t, 1, "should index to t=1");
+            }
+
+            let view = fluree
+                .db_at_t(ledger_id, ledger1.t())
+                .await
+                .expect("load indexed view");
+
+            let q = r"
+                SELECT (COUNT(?o) AS ?count)
+                WHERE { ?s ?p ?o FILTER(isLiteral(?o)) }
+            ";
+            let r = fluree
+                .query(&view, QueryInput::Sparql(q))
+                .await
+                .expect("literal COUNT query should succeed");
+            let jsonld = r.to_jsonld(&view.snapshot).expect("to_jsonld");
+            assert_eq!(
+                normalize_rows(&jsonld),
+                normalize_rows(&json!([[3]])),
+                "3 names are literals; the IRI ref and blank-node ref are not"
+            );
+        })
+        .await;
+}
+
 /// POST overlay cursor coverage: `SUM(?o)`, `AVG(?o)`, and `COUNT(DISTINCT ?o)`
 /// over a single predicate must reflect uncommitted novelty (overlay) — both
 /// asserts and retracts — not only the persisted index.
@@ -7801,6 +8630,239 @@ async fn indexed_overlay_count_no_cache_projection_invariant() {
                 normalize_rows(&jsonld),
                 normalize_rows(&json!([[3]])),
                 "no-cache overlay EXISTS count must be 3 (a, b, c) with b asserted in novelty"
+            );
+        })
+        .await;
+}
+
+// =============================================================================
+// Bug repro: same-subject star join drops novelty bindings (indexed + overlay)
+// =============================================================================
+
+/// Indexed ledger + novelty-only assertion: a same-subject star join
+/// (`?s ex:price ?v . ?s ex:currency ?c`) must see the novelty price the
+/// single-predicate scan sees. The batched subject probe / SPOT star walk
+/// read base leaflets directly and previously skipped overlay flakes,
+/// silently undercounting aggregates (SUM 60 instead of 67).
+#[tokio::test]
+async fn indexed_inline_type_star_aggregate_overlay_undercount_regression() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "it/regress-star-overlay:main";
+
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        Arc::new(fluree.nameservice_mode().clone()),
+        fluree_db_indexer::IndexerConfig::small(),
+    );
+
+    local
+        .run_until(async move {
+            let index_cfg = IndexConfig {
+                reindex_min_bytes: 0,
+                reindex_max_bytes: 10_000_000,
+            };
+
+            // Phase 1: seed and index multivalue line items.
+            let ledger = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let baseline = json!({
+                "@context": { "ex": "http://example.org/ns/" },
+                "@graph": [
+                    {
+                        "@id": "ex:a",
+                        "@type": "ex:LineItem",
+                        "ex:price": [10, 20],
+                        "ex:currency": "USD"
+                    },
+                    {
+                        "@id": "ex:b",
+                        "@type": "ex:LineItem",
+                        "ex:price": 30,
+                        "ex:currency": "USD"
+                    },
+                    {
+                        "@id": "ex:order",
+                        "@type": "ex:Order",
+                        "ex:item": [{"@id": "ex:a"}, {"@id": "ex:b"}]
+                    }
+                ]
+            });
+            let ledger = fluree
+                .insert_with_opts(
+                    ledger,
+                    &baseline,
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg,
+                )
+                .await
+                .expect("baseline insert")
+                .ledger;
+            let outcome = trigger_index_and_wait_outcome(&handle, ledger_id, ledger.t()).await;
+            if let fluree_db_api::IndexOutcome::Completed { index_t, .. } = outcome {
+                assert_eq!(index_t, 1, "should index to t=1");
+            }
+
+            // Phase 2: novelty-only price for an already-indexed subject.
+            let _ledger = fluree
+                .insert(
+                    ledger,
+                    &json!({
+                        "@context": { "ex": "http://example.org/ns/" },
+                        "@graph": [ {"@id": "ex:a", "ex:price": 7} ]
+                    }),
+                )
+                .await
+                .expect("novelty insert")
+                .ledger;
+
+            // Phase 3: query at the new head without re-indexing.
+            let view = fluree.db(ledger_id).await.expect("load view");
+
+            // Control: single-predicate scan merges overlay correctly.
+            let control = r"
+                PREFIX ex: <http://example.org/ns/>
+                SELECT (SUM(?v) AS ?sum)
+                WHERE { ?s ex:price ?v . }
+            ";
+            let result = fluree
+                .query(&view, QueryInput::Sparql(control))
+                .await
+                .expect("control query");
+            let jsonld = result.to_jsonld(&view.snapshot).expect("to_jsonld");
+            assert_eq!(
+                normalize_rows(&jsonld),
+                normalize_rows(&json!([[67]])),
+                "control single-predicate SUM must include novelty price 7"
+            );
+
+            // Faceted same-subject star: previously dropped the novelty price.
+            let faceted = r"
+                PREFIX ex: <http://example.org/ns/>
+                SELECT (SUM(?v) AS ?sum)
+                WHERE {
+                  ?s ex:price ?v .
+                  ?s ex:currency ?currency .
+                }
+            ";
+            let result = fluree
+                .query(&view, QueryInput::Sparql(faceted))
+                .await
+                .expect("faceted star query");
+            let jsonld = result.to_jsonld(&view.snapshot).expect("to_jsonld");
+            assert_eq!(
+                normalize_rows(&jsonld),
+                normalize_rows(&json!([[67]])),
+                "faceted same-subject star SUM must include novelty price 7"
+            );
+
+            // Reversed pattern order: forces the other join driver choice.
+            let reversed = r"
+                PREFIX ex: <http://example.org/ns/>
+                SELECT (SUM(?v) AS ?sum)
+                WHERE {
+                  ?s ex:currency ?currency .
+                  ?s ex:price ?v .
+                }
+            ";
+            let result = fluree
+                .query(&view, QueryInput::Sparql(reversed))
+                .await
+                .expect("reversed faceted star query");
+            let jsonld = result.to_jsonld(&view.snapshot).expect("to_jsonld");
+            assert_eq!(
+                normalize_rows(&jsonld),
+                normalize_rows(&json!([[67]])),
+                "reversed faceted same-subject star SUM must include novelty price 7"
+            );
+
+            // Dataset mode (FROM clause): joins resolve IriMatch subjects to
+            // raw s_ids and use the batched leaflet probe.
+            let from_query = format!(
+                r"PREFIX ex: <http://example.org/ns/>
+                SELECT (SUM(?v) AS ?sum)
+                FROM <{ledger_id}>
+                WHERE {{
+                  ?s ex:price ?v .
+                  ?s ex:currency ?currency .
+                }}"
+            );
+            let jsonld = fluree
+                .query_from()
+                .sparql(&from_query)
+                .format(fluree_db_api::FormatterConfig::jsonld())
+                .execute_formatted()
+                .await
+                .expect("FROM faceted star query");
+            assert_eq!(
+                normalize_rows(&jsonld),
+                normalize_rows(&json!([[67]])),
+                "FROM-clause faceted star SUM must include novelty price 7"
+            );
+
+            // Ref-hop join: `?o ex:item ?s . ?s ex:price ?v` routes through
+            // the nested-loop join's batched subject probe.
+            let ref_hop = r"
+                PREFIX ex: <http://example.org/ns/>
+                SELECT (SUM(?v) AS ?sum)
+                WHERE {
+                  ?o ex:item ?s .
+                  ?s ex:price ?v .
+                }
+            ";
+            let result = fluree
+                .query(&view, QueryInput::Sparql(ref_hop))
+                .await
+                .expect("ref-hop join query");
+            let jsonld = result.to_jsonld(&view.snapshot).expect("to_jsonld");
+            assert_eq!(
+                normalize_rows(&jsonld),
+                normalize_rows(&json!([[67]])),
+                "ref-hop join SUM must include novelty price 7"
+            );
+
+            // OPTIONAL probe: the grouped/pattern optional batch builders use
+            // the same base-leaflet probe and previously dropped novelty too.
+            let optional_probe = r"
+                PREFIX ex: <http://example.org/ns/>
+                SELECT (SUM(?v) AS ?sum)
+                WHERE {
+                  ?o ex:item ?s .
+                  OPTIONAL { ?s ex:price ?v }
+                }
+            ";
+            let result = fluree
+                .query(&view, QueryInput::Sparql(optional_probe))
+                .await
+                .expect("optional probe query");
+            let jsonld = result.to_jsonld(&view.snapshot).expect("to_jsonld");
+            assert_eq!(
+                normalize_rows(&jsonld),
+                normalize_rows(&json!([[67]])),
+                "OPTIONAL probe SUM must include novelty price 7"
+            );
+
+            // Typed variant rides the same star/property-join family.
+            let typed = r"
+                PREFIX ex: <http://example.org/ns/>
+                SELECT (SUM(?v) AS ?sum)
+                WHERE {
+                  ?s a ex:LineItem ;
+                     ex:price ?v ;
+                     ex:currency ?currency .
+                }
+            ";
+            let result = fluree
+                .query(&view, QueryInput::Sparql(typed))
+                .await
+                .expect("typed star query");
+            let jsonld = result.to_jsonld(&view.snapshot).expect("to_jsonld");
+            assert_eq!(
+                normalize_rows(&jsonld),
+                normalize_rows(&json!([[67]])),
+                "typed same-subject star SUM must include novelty price 7"
             );
         })
         .await;

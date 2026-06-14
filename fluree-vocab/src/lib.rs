@@ -1932,6 +1932,14 @@ pub mod config_iris {
     /// `f:followOwlImports` — boolean, follow owl:imports closure from schemaSource
     pub const FOLLOW_OWL_IMPORTS: &str = "https://ns.flur.ee/db#followOwlImports";
 
+    /// `f:reasoningMaxFacts` — integer, max derived facts before OWL2-RL
+    /// materialization is capped (incomplete closure)
+    pub const REASONING_MAX_FACTS: &str = "https://ns.flur.ee/db#reasoningMaxFacts";
+
+    /// `f:reasoningMaxSeconds` — integer, max wall-clock seconds before OWL2-RL
+    /// materialization is capped (incomplete closure)
+    pub const REASONING_MAX_SECONDS: &str = "https://ns.flur.ee/db#reasoningMaxSeconds";
+
     /// `f:ontologyImportMap` — list of OntologyImportBinding
     pub const ONTOLOGY_IMPORT_MAP: &str = "https://ns.flur.ee/db#ontologyImportMap";
 

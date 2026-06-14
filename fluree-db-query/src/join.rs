@@ -9,6 +9,10 @@ use crate::binding::{Batch, Binding, RowAccess};
 use crate::context::ExecutionContext;
 use crate::dataset::ActiveGraphs;
 use crate::error::{QueryError, Result};
+use crate::fast_path_common::{
+    object_probe_lane_plan, subject_probe_lane_plan, ObjectProbeOps, ProbeLanePlan, ProbeOps,
+    RowFate,
+};
 use crate::ir::triple::{Ref, Term, TriplePattern};
 use crate::object_binding::{late_materialized_object_binding, materialized_object_binding};
 use crate::operator::inline::{apply_inline, extend_schema, InlineOperator};
@@ -440,6 +444,10 @@ pub struct NestedLoopJoinOperator {
     object_left_col: Option<usize>,
     /// The fixed predicate SID (batched mode)
     batched_predicate: Option<Sid>,
+    /// Overlay handling decision for the batched lanes, recomputed at the
+    /// top of every `next_batch` call (cheap: the ops fetch hits the
+    /// per-execution cache after the first call).
+    batched_overlay_mode: ProbeLanePlan,
     /// Accumulated entries for batched processing: (stored_batch_idx, row_idx, subject_s_id)
     /// Stores the raw s_id directly to avoid dictionary round-trips with EncodedSid.
     batched_accumulator: Vec<(usize, usize, u64)>,
@@ -723,6 +731,7 @@ impl NestedLoopJoinOperator {
             subject_left_col,
             object_left_col,
             batched_predicate,
+            batched_overlay_mode: ProbeLanePlan::Clean,
             batched_accumulator: Vec::new(),
             stored_left_batches: Vec::new(),
             batched_output: VecDeque::new(),
@@ -1141,9 +1150,24 @@ impl Operator for NestedLoopJoinOperator {
         // Historical snapshots (`to_t < store.max_t()`) are handled inside each
         // batched flush helper via `replay_leaflet_at_t`, which reconstructs
         // leaflet state at `to_t` from the history sidecar.
-        let use_batched =
-            (self.batched_eligible || self.batched_object_eligible || self.batched_exists_eligible)
+        //
+        // Novelty overlay: the subject-probe lane merges the predicate's
+        // resolved overlay ops per probed key (`BatchedOverlayMode::Merge`);
+        // the object/exists lanes still require an overlay-free graph and
+        // otherwise force the per-row scan path (whose binary cursor merges
+        // overlay ops).
+        self.batched_overlay_mode = self.compute_batched_overlay_mode(ctx)?;
+        let use_batched = (self.batched_eligible || self.batched_object_eligible || self.batched_exists_eligible)
                 && ctx.binary_store.is_some()
+                && !matches!(self.batched_overlay_mode, ProbeLanePlan::Decline)
+                // The batched path reads binary leaves directly and works in
+                // `EncodedSid` space (it even emits `EncodedSid` for newly-bound
+                // subject vars). Whenever eager materialization is required —
+                // reasoning queries (derived facts in the overlay are `Sid` and
+                // must join with base rows), federated queries, or any other
+                // caller that sets this flag — fall back to the per-row path,
+                // which merges the overlay and honours eager decoding.
+                && !ctx.eager_materialization
                 && match ctx.active_graphs() {
                     // Object-batched path currently emits `Binding::EncodedSid` for the new
                     // subject var. Keep it single-ledger only to avoid dataset-mode IriMatch
@@ -1178,6 +1202,7 @@ impl Operator for NestedLoopJoinOperator {
 
         // Process until we have output or exhaust input
         loop {
+            ctx.check_cancelled()?;
             // 1. Pre-built output from batched flush
             if let Some(batch) = self.batched_output.pop_front() {
                 return Ok(trim_batch(&self.out_schema, batch));
@@ -1194,7 +1219,9 @@ impl Operator for NestedLoopJoinOperator {
 
             // 3. Resume an in-flight right scan for the current left row.
             if let Some(scan) = &mut self.active_right_scan {
+                ctx.check_cancelled()?;
                 let next = scan.next_batch(ctx).await?;
+                ctx.check_cancelled()?;
 
                 match next {
                     Some(batch) if !batch.is_empty() => {
@@ -1223,6 +1250,7 @@ impl Operator for NestedLoopJoinOperator {
 
             // 4. Need to process more left rows
             if self.current_left_batch.is_none() {
+                ctx.check_cancelled()?;
                 match self.left.next_batch(ctx).await? {
                     Some(batch) => {
                         self.current_left_batch = Some(batch);
@@ -1233,7 +1261,9 @@ impl Operator for NestedLoopJoinOperator {
                     None => {
                         // Left exhausted — flush any remaining accumulator
                         if !self.batched_accumulator.is_empty() {
+                            ctx.check_cancelled()?;
                             self.flush_batched_accumulator_for_ctx(ctx).await?;
+                            ctx.check_cancelled()?;
                             continue;
                         }
                         self.state = OperatorState::Exhausted;
@@ -1277,21 +1307,32 @@ impl Operator for NestedLoopJoinOperator {
                 let resolved: Option<u64> = {
                     let left_batch = self.current_left_batch.as_ref().unwrap();
                     let store = ctx.binary_store.as_deref();
+                    // Persisted reverse dict first, then DictNovelty: a subject
+                    // minted after the last index resolves to a novelty s_id —
+                    // the same id space the overlay ops are translated into —
+                    // so novelty-only left subjects stay on the batched lane
+                    // (the merge injects their facts) instead of each paying a
+                    // per-row fallback scan.
+                    let resolve_subject = |sid: &Sid| -> Option<u64> {
+                        store
+                            .and_then(|s| {
+                                s.find_subject_id_by_parts(sid.namespace_code, &sid.name)
+                                    .ok()
+                                    .flatten()
+                            })
+                            .or_else(|| {
+                                ctx.dict_novelty
+                                    .as_ref()
+                                    .filter(|dn| dn.is_initialized())
+                                    .and_then(|dn| {
+                                        dn.subjects.find_subject(sid.namespace_code, &sid.name)
+                                    })
+                            })
+                    };
                     match left_batch.get_by_col(left_row, left_col) {
                         Binding::EncodedSid { s_id, .. } => Some(*s_id),
-                        Binding::Sid { sid, .. } => store.and_then(|s| {
-                            s.find_subject_id_by_parts(sid.namespace_code, &sid.name)
-                                .ok()
-                                .flatten()
-                        }),
-                        Binding::IriMatch { primary_sid, .. } => store.and_then(|s| {
-                            s.find_subject_id_by_parts(
-                                primary_sid.namespace_code,
-                                &primary_sid.name,
-                            )
-                            .ok()
-                            .flatten()
-                        }),
+                        Binding::Sid { sid, .. } => resolve_subject(sid),
+                        Binding::IriMatch { primary_sid, .. } => resolve_subject(primary_sid),
                         Binding::Unbound => None,
                         _ => {
                             // For subject/predicate bindings we already screened invalid types.
@@ -1305,7 +1346,9 @@ impl Operator for NestedLoopJoinOperator {
                     let batch_idx = self.ensure_current_batch_stored();
                     self.batched_accumulator.push((batch_idx, left_row, key));
                     if self.batched_accumulator.len() >= BATCHED_JOIN_SIZE {
+                        ctx.check_cancelled()?;
                         self.flush_batched_accumulator_for_ctx(ctx).await?;
+                        ctx.check_cancelled()?;
                     }
                 } else {
                     // Fall back to per-row scan for unsupported binding types.
@@ -1531,6 +1574,32 @@ impl NestedLoopJoinOperator {
         self.current_left_batch_stored_idx = None;
     }
 
+    /// Decide how the batched lanes handle the active overlay this call.
+    ///
+    /// The subject-probe and exists lanes merge overlay ops per probed
+    /// subject; the object (OPST) lane merges its `IRI_REF` subset per probed
+    /// object. Decline cases route to the overlay-correct per-row fallback
+    /// BEFORE any accumulation, so a flush never reroutes mid-stream.
+    fn compute_batched_overlay_mode(&self, ctx: &ExecutionContext<'_>) -> Result<ProbeLanePlan> {
+        if ctx.overlay_free_single_graph() {
+            return Ok(ProbeLanePlan::Clean);
+        }
+        if !(self.batched_eligible || self.batched_object_eligible || self.batched_exists_eligible)
+        {
+            return Ok(ProbeLanePlan::Decline);
+        }
+        let (Some(store), Some(pred)) =
+            (ctx.binary_store.as_ref(), self.batched_predicate.as_ref())
+        else {
+            return Ok(ProbeLanePlan::Decline);
+        };
+        if self.batched_object_eligible {
+            object_probe_lane_plan(ctx, store, pred)
+        } else {
+            subject_probe_lane_plan(ctx, store, pred)
+        }
+    }
+
     /// Phase 1: Resolve the batched predicate SID to a binary-index p_id.
     ///
     /// Returns `None` if the predicate is not in the binary index (no results possible).
@@ -1636,6 +1705,7 @@ impl NestedLoopJoinOperator {
         unique_s_ids: &[u64],
         s_id_to_accum: &FxHashMap<u64, Vec<usize>>,
         dict_overlay: &Option<crate::dict_overlay::DictOverlay>,
+        mut probe_ops: Option<&mut ProbeOps>,
         on_match: &mut dyn FnMut(&[usize], &Binding) -> Result<()>,
     ) -> Result<()> {
         use fluree_db_binary_index::read::column_loader::load_leaflet_columns_cached;
@@ -1650,6 +1720,7 @@ impl NestedLoopJoinOperator {
         let to_t_u32 = u32::try_from(ctx.to_t).unwrap_or(u32::MAX);
 
         for leaf_idx in leaf_range {
+            ctx.check_cancelled()?;
             let leaf_entry = &branch.leaves[leaf_idx];
             let LeafScan {
                 leaf_bytes,
@@ -1660,6 +1731,7 @@ impl NestedLoopJoinOperator {
             } = prepare_leaf_for_scan(store, leaf_entry, need_replay)?;
 
             for (leaflet_idx, entry) in dir.entries.iter().enumerate() {
+                ctx.check_cancelled()?;
                 leaflets_scanned += 1;
                 // An empty-after-retract leaflet (`row_count == 0`) is preserved
                 // by the indexer for time-travel replay. Skip only when there is
@@ -1708,6 +1780,7 @@ impl NestedLoopJoinOperator {
                     )
                     .map_err(|e| QueryError::Internal(format!("load columns: {e}")))?
                 };
+                ctx.check_cancelled()?;
 
                 // Apply time-travel replay when querying a historical snapshot.
                 // The cached `batch` reflects latest base state; `replay_leaflet_at_t`
@@ -1764,12 +1837,27 @@ impl NestedLoopJoinOperator {
                     if row_start == row_end {
                         continue;
                     }
+                    // One window of this subject's novelty ops per (leaflet,
+                    // subject); empty (the common case) keeps the row loop free
+                    // of per-row overlay work.
+                    let probe_window = probe_ops
+                        .as_ref()
+                        .map(|p| p.subject_window(s_id))
+                        .filter(|w| !w.is_empty());
                     for row in row_start..row_end {
                         matched_rows += 1;
                         let o_type_val = entry
                             .o_type_const
                             .unwrap_or_else(|| batch.o_type.get_or(row, 0));
                         let o_key_val = batch.o_key.get(row);
+                        if let (Some(probe), Some(win)) = (probe_ops.as_mut(), &probe_window) {
+                            let o_i_val = batch.o_i.get_or(row, u32::MAX);
+                            if probe.base_row_fate(win, p_id, o_type_val, o_key_val, o_i_val)
+                                == RowFate::Drop
+                            {
+                                continue;
+                            }
+                        }
                         if !self.batched_row_matches_object_bounds(
                             store,
                             ctx.binary_g_id,
@@ -1785,175 +1873,65 @@ impl NestedLoopJoinOperator {
                         {
                             Binding::encoded_sid(o_key_val)
                         } else {
-                            let p_id = entry.p_const.unwrap_or_else(|| batch.p_id.get_or(row, 0));
                             let o_i = batch.o_i.get_or(row, u32::MAX);
                             let t = batch.t.get_or(row, 0) as i64;
-                            let ot = OType::from_u16(o_type_val);
-
-                            // Prefer a stable EncodedLit representation when possible so that
-                            // formatters can materialize using the root's canonical datatype table.
-                            match ot.decode_kind() {
-                                fluree_db_core::o_type::DecodeKind::StringDict => {
-                                    use fluree_db_core::ids::DatatypeDictId;
-                                    use fluree_db_core::value_id::ObjKind;
-
-                                    let (dt_id, lang_id) = if ot.is_lang_string() {
-                                        (DatatypeDictId::LANG_STRING.as_u16(), ot.payload())
-                                    } else if o_type_val == OType::FULLTEXT.as_u16() {
-                                        (DatatypeDictId::FULL_TEXT.as_u16(), 0)
-                                    } else {
-                                        (DatatypeDictId::STRING.as_u16(), 0)
-                                    };
-
-                                    Binding::EncodedLit {
-                                        o_kind: ObjKind::LEX_ID.as_u8(),
-                                        o_key: o_key_val,
-                                        p_id,
-                                        dt_id,
-                                        lang_id,
-                                        i_val: if o_i == u32::MAX {
-                                            i32::MIN
-                                        } else {
-                                            o_i as i32
-                                        },
-                                        t,
-                                    }
-                                }
-                                fluree_db_core::o_type::DecodeKind::JsonArena => {
-                                    use fluree_db_core::ids::DatatypeDictId;
-                                    use fluree_db_core::value_id::ObjKind;
-                                    Binding::EncodedLit {
-                                        o_kind: ObjKind::JSON_ID.as_u8(),
-                                        o_key: o_key_val,
-                                        p_id,
-                                        dt_id: DatatypeDictId::JSON.as_u16(),
-                                        lang_id: 0,
-                                        i_val: if o_i == u32::MAX {
-                                            i32::MIN
-                                        } else {
-                                            o_i as i32
-                                        },
-                                        t,
-                                    }
-                                }
-                                fluree_db_core::o_type::DecodeKind::VectorArena => {
-                                    use fluree_db_core::ids::DatatypeDictId;
-                                    use fluree_db_core::value_id::ObjKind;
-                                    Binding::EncodedLit {
-                                        o_kind: ObjKind::VECTOR_ID.as_u8(),
-                                        o_key: o_key_val,
-                                        p_id,
-                                        dt_id: DatatypeDictId::VECTOR.as_u16(),
-                                        lang_id: 0,
-                                        i_val: if o_i == u32::MAX {
-                                            i32::MIN
-                                        } else {
-                                            o_i as i32
-                                        },
-                                        t,
-                                    }
-                                }
-                                fluree_db_core::o_type::DecodeKind::NumBigArena => {
-                                    use fluree_db_core::ids::DatatypeDictId;
-                                    use fluree_db_core::value_id::ObjKind;
-                                    Binding::EncodedLit {
-                                        o_kind: ObjKind::NUM_BIG.as_u8(),
-                                        o_key: o_key_val,
-                                        p_id,
-                                        dt_id: DatatypeDictId::DECIMAL.as_u16(),
-                                        lang_id: 0,
-                                        i_val: if o_i == u32::MAX {
-                                            i32::MIN
-                                        } else {
-                                            o_i as i32
-                                        },
-                                        t,
-                                    }
-                                }
-                                _ => {
-                                    // Inline numerics with a reserved dict id stay encoded
-                                    // (cheap through DISTINCT/joins, materialized at projection);
-                                    // everything else decodes eagerly via DictOverlay.
-                                    if let Some(encoded) =
-                                        crate::object_binding::inline_numeric_encoded_lit(
-                                            o_type_val, o_key_val, p_id, o_i, t,
-                                        )
-                                    {
-                                        encoded
-                                    } else {
-                                        // Fallback: decode eagerly, using DictOverlay for
-                                        // novelty-aware resolution of string/subject IDs.
-                                        use fluree_db_core::o_type::{DecodeKind, OType as OT};
-                                        let ot = OT::from_u16(o_type_val);
-                                        let val: fluree_db_core::FlakeValue =
-                                            match (ot.decode_kind(), dict_overlay.as_ref()) {
-                                                (DecodeKind::IriRef, Some(ov)) => {
-                                                    let iri = ov
-                                                        .resolve_subject_iri(o_key_val)
-                                                        .map_err(|e| {
-                                                            crate::error::QueryError::Internal(
-                                                                format!(
-                                                        "resolve_subject_iri (batched join): {e}"
-                                                    ),
-                                                            )
-                                                        })?;
-                                                    fluree_db_core::FlakeValue::Ref(
-                                                        store.encode_iri(&iri),
-                                                    )
-                                                }
-                                                (DecodeKind::StringDict, Some(ov)) => {
-                                                    let s = ov
-                                                        .resolve_string_value(o_key_val as u32)
-                                                        .map_err(|e| {
-                                                            crate::error::QueryError::Internal(
-                                                                format!(
-                                                        "resolve_string_value (batched join): {e}"
-                                                    ),
-                                                            )
-                                                        })?;
-                                                    fluree_db_core::FlakeValue::String(s)
-                                                }
-                                                (DecodeKind::JsonArena, Some(ov)) => {
-                                                    let s = ov
-                                                        .resolve_string_value(o_key_val as u32)
-                                                        .map_err(|e| {
-                                                            crate::error::QueryError::Internal(
-                                                                format!(
-                                                    "resolve_string_value (batched join json): {e}"
-                                                ),
-                                                            )
-                                                        })?;
-                                                    fluree_db_core::FlakeValue::Json(s)
-                                                }
-                                                _ => store
-                                                    .decode_value_v3(
-                                                        o_type_val,
-                                                        o_key_val,
-                                                        p_id,
-                                                        ctx.binary_g_id,
-                                                    )
-                                                    .map_err(|e| {
-                                                        crate::error::QueryError::Internal(format!(
-                                                            "decode_value_v3 (batched join): {e}"
-                                                        ))
-                                                    })?,
-                                            };
-                                        materialized_object_binding(
-                                            store,
-                                            o_type_val,
-                                            p_id,
-                                            val,
-                                            Some(t),
-                                            None,
-                                        )
-                                    }
-                                }
-                            }
+                            self.build_batched_object_binding(
+                                ctx,
+                                store,
+                                dict_overlay,
+                                p_id,
+                                o_type_val,
+                                o_key_val,
+                                o_i,
+                                t,
+                            )?
                         };
 
                         on_match(accum_indices, &obj_binding)?;
                     }
                 }
+            }
+        }
+
+        // Inject novelty-only matches: unconsumed asserts for probed subjects
+        // (facts with no identical base row — including subjects absent from
+        // the base index entirely). The `emit_overlay_only` analogue; runs
+        // through the same bounds check and `on_match` path as base rows.
+        if let Some(probe) = probe_ops {
+            for &s_id in unique_s_ids {
+                let Some(accum_indices) = s_id_to_accum.get(&s_id) else {
+                    continue;
+                };
+                probe.drain_asserts_for_subject(s_id, |op| {
+                    if !self.injected_op_matches_object_bounds(
+                        store,
+                        ctx,
+                        dict_overlay,
+                        p_id,
+                        op.o_type,
+                        op.o_key,
+                    )? {
+                        return Ok(());
+                    }
+                    let obj_binding = if op.o_type == OType::IRI_REF.as_u16()
+                        || op.o_type == OType::BLANK_NODE.as_u16()
+                    {
+                        Binding::encoded_sid(op.o_key)
+                    } else {
+                        self.build_batched_object_binding(
+                            ctx,
+                            store,
+                            dict_overlay,
+                            p_id,
+                            op.o_type,
+                            op.o_key,
+                            op.o_i,
+                            op.t,
+                        )?
+                    };
+                    matched_rows += 1;
+                    on_match(accum_indices, &obj_binding)
+                })?;
             }
         }
 
@@ -1982,6 +1960,209 @@ impl NestedLoopJoinOperator {
             .decode_value_v3(o_type, o_key, p_id, g_id)
             .map_err(|e| QueryError::Internal(format!("decode_value_v3 (batched bounds): {e}")))?;
         Ok(bounds.matches(&val))
+    }
+
+    /// Object-bounds check for an injected novelty assert. Ids minted in dict
+    /// novelty resolve through `dict_overlay` (which falls back to the base
+    /// dictionaries for indexed ids), mirroring the binding decode path.
+    fn injected_op_matches_object_bounds(
+        &self,
+        store: &BinaryIndexStore,
+        ctx: &ExecutionContext<'_>,
+        dict_overlay: &Option<crate::dict_overlay::DictOverlay>,
+        p_id: u32,
+        o_type: u16,
+        o_key: u64,
+    ) -> Result<bool> {
+        let Some(bounds) = &self.object_bounds else {
+            return Ok(true);
+        };
+        use fluree_db_core::o_type::{DecodeKind, OType};
+        let val = match (OType::from_u16(o_type).decode_kind(), dict_overlay.as_ref()) {
+            (DecodeKind::IriRef, Some(ov)) => {
+                let iri = ov.resolve_subject_iri(o_key).map_err(|e| {
+                    QueryError::Internal(format!("resolve_subject_iri (injected bounds): {e}"))
+                })?;
+                fluree_db_core::FlakeValue::Ref(store.encode_iri(&iri))
+            }
+            (DecodeKind::StringDict, Some(ov)) => {
+                let s = ov.resolve_string_value(o_key as u32).map_err(|e| {
+                    QueryError::Internal(format!("resolve_string_value (injected bounds): {e}"))
+                })?;
+                fluree_db_core::FlakeValue::String(s)
+            }
+            (DecodeKind::JsonArena, Some(ov)) => {
+                let s = ov.resolve_string_value(o_key as u32).map_err(|e| {
+                    QueryError::Internal(format!(
+                        "resolve_string_value (injected bounds json): {e}"
+                    ))
+                })?;
+                fluree_db_core::FlakeValue::Json(s)
+            }
+            _ => store
+                .decode_value_v3(o_type, o_key, p_id, ctx.binary_g_id)
+                .map_err(|e| {
+                    QueryError::Internal(format!("decode_value_v3 (injected bounds): {e}"))
+                })?,
+        };
+        Ok(bounds.matches(&val))
+    }
+
+    /// Build the late-materialized object binding for one non-ref matched row.
+    ///
+    /// Shared by base leaflet rows in `scan_matches` and by injected novelty
+    /// asserts (whose `o_type`/`o_key`/`o_i`/`t` come from the overlay op), so
+    /// both produce identical binding representations. Novelty-minted
+    /// string/subject ids resolve through `dict_overlay`.
+    #[allow(clippy::too_many_arguments)]
+    fn build_batched_object_binding(
+        &self,
+        ctx: &ExecutionContext<'_>,
+        store: &BinaryIndexStore,
+        dict_overlay: &Option<crate::dict_overlay::DictOverlay>,
+        p_id: u32,
+        o_type_val: u16,
+        o_key_val: u64,
+        o_i: u32,
+        t: i64,
+    ) -> Result<Binding> {
+        use fluree_db_core::o_type::OType;
+        let ot = OType::from_u16(o_type_val);
+        Ok(
+            // Prefer a stable EncodedLit representation when possible so that
+            // formatters can materialize using the root's canonical datatype table.
+            match ot.decode_kind() {
+                fluree_db_core::o_type::DecodeKind::StringDict => {
+                    use fluree_db_core::ids::DatatypeDictId;
+                    use fluree_db_core::value_id::ObjKind;
+
+                    let (dt_id, lang_id) = if ot.is_lang_string() {
+                        (DatatypeDictId::LANG_STRING.as_u16(), ot.payload())
+                    } else if o_type_val == OType::FULLTEXT.as_u16() {
+                        (DatatypeDictId::FULL_TEXT.as_u16(), 0)
+                    } else {
+                        (DatatypeDictId::STRING.as_u16(), 0)
+                    };
+
+                    Binding::EncodedLit {
+                        o_kind: ObjKind::LEX_ID.as_u8(),
+                        o_key: o_key_val,
+                        p_id,
+                        dt_id,
+                        lang_id,
+                        i_val: if o_i == u32::MAX {
+                            i32::MIN
+                        } else {
+                            o_i as i32
+                        },
+                        t,
+                    }
+                }
+                fluree_db_core::o_type::DecodeKind::JsonArena => {
+                    use fluree_db_core::ids::DatatypeDictId;
+                    use fluree_db_core::value_id::ObjKind;
+                    Binding::EncodedLit {
+                        o_kind: ObjKind::JSON_ID.as_u8(),
+                        o_key: o_key_val,
+                        p_id,
+                        dt_id: DatatypeDictId::JSON.as_u16(),
+                        lang_id: 0,
+                        i_val: if o_i == u32::MAX {
+                            i32::MIN
+                        } else {
+                            o_i as i32
+                        },
+                        t,
+                    }
+                }
+                fluree_db_core::o_type::DecodeKind::VectorArena => {
+                    use fluree_db_core::ids::DatatypeDictId;
+                    use fluree_db_core::value_id::ObjKind;
+                    Binding::EncodedLit {
+                        o_kind: ObjKind::VECTOR_ID.as_u8(),
+                        o_key: o_key_val,
+                        p_id,
+                        dt_id: DatatypeDictId::VECTOR.as_u16(),
+                        lang_id: 0,
+                        i_val: if o_i == u32::MAX {
+                            i32::MIN
+                        } else {
+                            o_i as i32
+                        },
+                        t,
+                    }
+                }
+                fluree_db_core::o_type::DecodeKind::NumBigArena => {
+                    use fluree_db_core::ids::DatatypeDictId;
+                    use fluree_db_core::value_id::ObjKind;
+                    Binding::EncodedLit {
+                        o_kind: ObjKind::NUM_BIG.as_u8(),
+                        o_key: o_key_val,
+                        p_id,
+                        dt_id: DatatypeDictId::DECIMAL.as_u16(),
+                        lang_id: 0,
+                        i_val: if o_i == u32::MAX {
+                            i32::MIN
+                        } else {
+                            o_i as i32
+                        },
+                        t,
+                    }
+                }
+                _ => {
+                    // Inline numerics with a reserved dict id stay encoded
+                    // (cheap through DISTINCT/joins, materialized at projection);
+                    // everything else decodes eagerly via DictOverlay.
+                    if let Some(encoded) = crate::object_binding::inline_numeric_encoded_lit(
+                        o_type_val, o_key_val, p_id, o_i, t,
+                    ) {
+                        encoded
+                    } else {
+                        // Fallback: decode eagerly, using DictOverlay for
+                        // novelty-aware resolution of string/subject IDs.
+                        use fluree_db_core::o_type::{DecodeKind, OType as OT};
+                        let ot = OT::from_u16(o_type_val);
+                        let val: fluree_db_core::FlakeValue =
+                            match (ot.decode_kind(), dict_overlay.as_ref()) {
+                                (DecodeKind::IriRef, Some(ov)) => {
+                                    let iri = ov.resolve_subject_iri(o_key_val).map_err(|e| {
+                                        crate::error::QueryError::Internal(format!(
+                                            "resolve_subject_iri (batched join): {e}"
+                                        ))
+                                    })?;
+                                    fluree_db_core::FlakeValue::Ref(store.encode_iri(&iri))
+                                }
+                                (DecodeKind::StringDict, Some(ov)) => {
+                                    let s =
+                                        ov.resolve_string_value(o_key_val as u32).map_err(|e| {
+                                            crate::error::QueryError::Internal(format!(
+                                                "resolve_string_value (batched join): {e}"
+                                            ))
+                                        })?;
+                                    fluree_db_core::FlakeValue::String(s)
+                                }
+                                (DecodeKind::JsonArena, Some(ov)) => {
+                                    let s =
+                                        ov.resolve_string_value(o_key_val as u32).map_err(|e| {
+                                            crate::error::QueryError::Internal(format!(
+                                                "resolve_string_value (batched join json): {e}"
+                                            ))
+                                        })?;
+                                    fluree_db_core::FlakeValue::Json(s)
+                                }
+                                _ => store
+                                    .decode_value_v3(o_type_val, o_key_val, p_id, ctx.binary_g_id)
+                                    .map_err(|e| {
+                                        crate::error::QueryError::Internal(format!(
+                                            "decode_value_v3 (batched join): {e}"
+                                        ))
+                                    })?,
+                            };
+                        materialized_object_binding(store, o_type_val, p_id, val, Some(t), None)
+                    }
+                }
+            },
+        )
     }
 
     /// Phase 5: Assemble scattered results into output batches in left-row order.
@@ -2158,6 +2339,13 @@ impl NestedLoopJoinOperator {
             *unique_s_ids.last().unwrap(),
         );
 
+        // One reconciler per flush: probed keys recur across flushes with new
+        // left rows, so consumed-state must not outlive this flush.
+        let mut probe_ops = match &self.batched_overlay_mode {
+            ProbeLanePlan::Merge(ops) => ProbeOps::new(ops.clone()),
+            _ => None,
+        };
+
         // Phase 4+5: Scan leaves, scatter matches by accumulator position, emit
         // output batches in left-row order. Two scatter representations:
         //
@@ -2213,6 +2401,7 @@ impl NestedLoopJoinOperator {
                     &unique_s_ids,
                     &s_id_to_accum,
                     &dict_overlay,
+                    probe_ops.as_mut(),
                     &mut on_match,
                 )?;
             }
@@ -2261,10 +2450,19 @@ impl NestedLoopJoinOperator {
                     &unique_s_ids,
                     &s_id_to_accum,
                     &dict_overlay,
+                    probe_ops.as_mut(),
                     &mut on_match,
                 )?;
             }
             self.emit_scatter_to_output(scatter, ctx.batch_size)?;
+        }
+
+        if let Some(probe) = &probe_ops {
+            tracing::debug!(
+                dropped_rows = probe.dropped_rows,
+                injected_rows = probe.injected_rows,
+                "join batched flush merged novelty overlay"
+            );
         }
 
         tracing::debug!(
@@ -2319,10 +2517,20 @@ impl NestedLoopJoinOperator {
         }
 
         let Some(branch) = store.branch_for_order(ctx.binary_g_id, RunSortOrder::Opst) else {
+            debug_assert!(
+                !matches!(self.batched_overlay_mode, ProbeLanePlan::Merge(_)),
+                "lane plan must decline branchless graphs"
+            );
             self.clear_batched_state();
             return Ok(());
         };
         let branch = Arc::clone(branch);
+
+        // One reconciler per flush (see `flush_batched_accumulator_binary`).
+        let mut probe_ops = match &self.batched_overlay_mode {
+            ProbeLanePlan::Merge(ops) => ObjectProbeOps::new(ops),
+            _ => None,
+        };
 
         let mut scatter: Vec<Vec<Vec<Binding>>> = vec![Vec::new(); self.batched_accumulator.len()];
         let mut matched_rows: u64 = 0;
@@ -2374,6 +2582,7 @@ impl NestedLoopJoinOperator {
         let need_replay = ctx.to_t < store.max_t();
         let to_t_u32 = u32::try_from(ctx.to_t).unwrap_or(u32::MAX);
         for leaf_idx in leaf_indices {
+            ctx.check_cancelled()?;
             let leaf_entry = &branch.leaves[leaf_idx];
             let LeafScan {
                 leaf_bytes,
@@ -2384,6 +2593,7 @@ impl NestedLoopJoinOperator {
             } = prepare_leaf_for_scan(&store, leaf_entry, need_replay)?;
 
             for (leaflet_idx, entry) in dir.entries.iter().enumerate() {
+                ctx.check_cancelled()?;
                 let needs_history_replay =
                     need_replay && entry.history_len > 0 && entry.history_max_t > to_t_u32;
                 if entry.row_count == 0 && !needs_history_replay {
@@ -2413,13 +2623,24 @@ impl NestedLoopJoinOperator {
 
                 // We only need core identity columns for this join, but for
                 // historical snapshots we also need `T` so `replay_leaflet_at_t`
-                // can detect base rows that postdate `to_t`.
+                // can detect base rows that postdate `to_t`. The overlay merge
+                // additionally needs `OI`: CORE lacks it, and a fate check
+                // reading `o_i` as a default would mis-reconcile retracts on
+                // multi-entry (`@list`) refs in BOTH cache configurations.
+                use fluree_db_binary_index::read::column_types::{ColumnProjection, ColumnSet};
                 let proj = if need_replay {
-                    fluree_db_binary_index::read::column_types::ColumnProjection::all()
+                    ColumnProjection::all()
+                } else if probe_ops.is_some() {
+                    ColumnProjection {
+                        output: ColumnSet::CORE.union(ColumnSet::single(
+                            fluree_db_binary_index::format::column_block::ColumnId::OI,
+                        )),
+                        internal: ColumnSet::EMPTY,
+                    }
                 } else {
-                    fluree_db_binary_index::read::column_types::ColumnProjection {
-                        output: fluree_db_binary_index::read::column_types::ColumnSet::CORE,
-                        internal: fluree_db_binary_index::read::column_types::ColumnSet::EMPTY,
+                    ColumnProjection {
+                        output: ColumnSet::CORE,
+                        internal: ColumnSet::EMPTY,
                     }
                 };
                 let batch = if entry.row_count == 0 {
@@ -2447,6 +2668,7 @@ impl NestedLoopJoinOperator {
                     load_leaflet_columns(&leaf_bytes, entry, dir.payload_base, &proj, header.order)
                         .map_err(|e| QueryError::Internal(format!("load columns: {e}")))?
                 };
+                ctx.check_cancelled()?;
 
                 // Apply time-travel replay when querying a historical snapshot.
                 let batch = if need_replay {
@@ -2465,6 +2687,7 @@ impl NestedLoopJoinOperator {
                 } else {
                     batch
                 };
+                ctx.check_cancelled()?;
 
                 // OPST leaflets are ordered by (o_type, o_key, p_id, s_id, t...).
                 // Instead of scanning every row in the leaflet, binary-search the
@@ -2491,41 +2714,20 @@ impl NestedLoopJoinOperator {
                             continue;
                         };
                         let s_id = batch.s_id.get_or(row, 0);
-                        for &accum_idx in accum_idxs {
-                            let (batch_idx, row_idx, _) = self.batched_accumulator[accum_idx];
-                            let left_batch =
-                                self.stored_left_batches.get(batch_idx).ok_or_else(|| {
-                                    QueryError::Internal(
-                                        "batched object join: left batch missing".into(),
-                                    )
-                                })?;
-                            let mut right_bindings = Vec::with_capacity(self.right_new_vars.len());
-                            for _ in &self.right_new_vars {
-                                right_bindings.push(Binding::encoded_sid(s_id));
-                            }
-                            if !self.apply_right_scan_inline_ops(ctx, &mut right_bindings)? {
+                        if let Some(probe) = probe_ops.as_mut() {
+                            let win = probe.object_window(o_key);
+                            let o_i_val = batch.o_i.get_or(row, u32::MAX);
+                            if probe.base_row_fate(&win, s_id, o_i_val) == RowFate::Drop {
                                 continue;
                             }
-
-                            let mut combined: Vec<Binding> =
-                                Vec::with_capacity(self.combined_schema.len());
-                            for col in 0..self.left_schema.len() {
-                                combined.push(left_batch.get_by_col(row_idx, col).clone());
-                            }
-                            combined.extend(right_bindings);
-
-                            if !apply_inline(
-                                &self.inline_ops,
-                                &self.combined_schema,
-                                &mut combined,
-                                Some(ctx),
-                            )? {
-                                continue;
-                            }
-
-                            scatter[accum_idx].push(combined);
-                            matched_rows += 1;
                         }
+                        self.emit_object_probe_match(
+                            ctx,
+                            s_id,
+                            accum_idxs,
+                            &mut scatter,
+                            &mut matched_rows,
+                        )?;
                     }
                     continue;
                 };
@@ -2568,6 +2770,10 @@ impl NestedLoopJoinOperator {
                         obj_idx += 1;
                         continue;
                     };
+                    let probe_window = probe_ops
+                        .as_ref()
+                        .map(|p| p.object_window(target))
+                        .filter(|w| !w.is_empty());
 
                     for r in row..run_end {
                         if !ot_const_ok {
@@ -2584,41 +2790,19 @@ impl NestedLoopJoinOperator {
                         }
 
                         let s_id = batch.s_id.get_or(r, 0);
-                        for &accum_idx in accum_idxs {
-                            let (batch_idx, row_idx, _) = self.batched_accumulator[accum_idx];
-                            let left_batch =
-                                self.stored_left_batches.get(batch_idx).ok_or_else(|| {
-                                    QueryError::Internal(
-                                        "batched object join: left batch missing".into(),
-                                    )
-                                })?;
-                            let mut right_bindings = Vec::with_capacity(self.right_new_vars.len());
-                            for _ in &self.right_new_vars {
-                                right_bindings.push(Binding::encoded_sid(s_id));
-                            }
-                            if !self.apply_right_scan_inline_ops(ctx, &mut right_bindings)? {
+                        if let (Some(probe), Some(win)) = (probe_ops.as_mut(), &probe_window) {
+                            let o_i_val = batch.o_i.get_or(r, u32::MAX);
+                            if probe.base_row_fate(win, s_id, o_i_val) == RowFate::Drop {
                                 continue;
                             }
-
-                            let mut combined: Vec<Binding> =
-                                Vec::with_capacity(self.combined_schema.len());
-                            for col in 0..self.left_schema.len() {
-                                combined.push(left_batch.get_by_col(row_idx, col).clone());
-                            }
-                            combined.extend(right_bindings);
-
-                            if !apply_inline(
-                                &self.inline_ops,
-                                &self.combined_schema,
-                                &mut combined,
-                                Some(ctx),
-                            )? {
-                                continue;
-                            }
-
-                            scatter[accum_idx].push(combined);
-                            matched_rows += 1;
                         }
+                        self.emit_object_probe_match(
+                            ctx,
+                            s_id,
+                            accum_idxs,
+                            &mut scatter,
+                            &mut matched_rows,
+                        )?;
                     }
 
                     row = run_end;
@@ -2627,12 +2811,90 @@ impl NestedLoopJoinOperator {
             }
         }
 
+        // Inject novelty-only matches: unconsumed asserts per probed object,
+        // through the same emit path (and so the same inline filters) as base
+        // rows. Novelty-asserting subjects emit as EncodedSid, the same
+        // representation overlay-merged cursor rows use.
+        if let Some(probe) = probe_ops.as_mut() {
+            for &o_key in &objs {
+                let Some(accum_idxs) = o_to_accum.get(&o_key) else {
+                    continue;
+                };
+                let mut injected: Vec<u64> = Vec::new();
+                probe.drain_asserts_for_object(o_key, |s_id| {
+                    injected.push(s_id);
+                    Ok(())
+                })?;
+                for s_id in injected {
+                    self.emit_object_probe_match(
+                        ctx,
+                        s_id,
+                        accum_idxs,
+                        &mut scatter,
+                        &mut matched_rows,
+                    )?;
+                }
+            }
+        }
+        if let Some(probe) = &probe_ops {
+            tracing::debug!(
+                dropped_rows = probe.dropped_rows,
+                injected_rows = probe.injected_rows,
+                "join batched object flush merged novelty overlay"
+            );
+        }
+
         self.emit_scatter_to_output(scatter, ctx.batch_size)?;
         tracing::debug!(
             total_ms = (overall_start.elapsed().as_secs_f64() * 1000.0) as u64,
             matched_rows,
             "join batched object flush complete"
         );
+        Ok(())
+    }
+
+    /// Emit one matched (subject, left-row group) of the bound-object lane:
+    /// build the combined row per accumulator slot through the same inline-op
+    /// stages for base and injected matches.
+    fn emit_object_probe_match(
+        &self,
+        ctx: &ExecutionContext<'_>,
+        s_id: u64,
+        accum_idxs: &[usize],
+        scatter: &mut [Vec<Vec<Binding>>],
+        matched_rows: &mut u64,
+    ) -> Result<()> {
+        for &accum_idx in accum_idxs {
+            let (batch_idx, row_idx, _) = self.batched_accumulator[accum_idx];
+            let left_batch = self.stored_left_batches.get(batch_idx).ok_or_else(|| {
+                QueryError::Internal("batched object join: left batch missing".into())
+            })?;
+            let mut right_bindings = Vec::with_capacity(self.right_new_vars.len());
+            for _ in &self.right_new_vars {
+                right_bindings.push(Binding::encoded_sid(s_id));
+            }
+            if !self.apply_right_scan_inline_ops(ctx, &mut right_bindings)? {
+                continue;
+            }
+
+            let mut combined: Vec<Binding> = Vec::with_capacity(self.combined_schema.len());
+            for col in 0..self.left_schema.len() {
+                combined.push(left_batch.get_by_col(row_idx, col).clone());
+            }
+            combined.extend(right_bindings);
+
+            if !apply_inline(
+                &self.inline_ops,
+                &self.combined_schema,
+                &mut combined,
+                Some(ctx),
+            )? {
+                continue;
+            }
+
+            scatter[accum_idx].push(combined);
+            *matched_rows += 1;
+        }
         Ok(())
     }
 
@@ -2656,6 +2918,14 @@ impl NestedLoopJoinOperator {
             return Ok(());
         }
 
+        // One reconciler per flush (see `flush_batched_accumulator_binary`).
+        let mut probe_ops = match &self.batched_overlay_mode {
+            ProbeLanePlan::Merge(ops) => ProbeOps::new(ops.clone()),
+            _ => None,
+        };
+        // Needed to decode novelty-minted object values for the bound-object
+        // filter on injected asserts.
+        let dict_overlay = make_dict_overlay(ctx, &store);
         let probe_matches = batched_subject_probe_binary(
             ctx,
             &store,
@@ -2668,9 +2938,17 @@ impl NestedLoopJoinOperator {
                 object_bounds: None,
                 bound_object: Some(&self.right_pattern.o),
                 emit_object: false,
-                dict_overlay: None,
+                dict_overlay: dict_overlay.as_ref(),
             },
+            probe_ops.as_mut(),
         )?;
+        if let Some(probe) = &probe_ops {
+            tracing::debug!(
+                dropped_rows = probe.dropped_rows,
+                injected_rows = probe.injected_rows,
+                "join batched existence flush merged novelty overlay"
+            );
+        }
 
         let accum_len = self.batched_accumulator.len();
         let mut scatter: Vec<Vec<Vec<Binding>>> = vec![Vec::new(); accum_len];
@@ -2791,6 +3069,49 @@ fn build_probe_object_binding(
     ))
 }
 
+/// Decode an object value for filter evaluation (bounds / bound-object) on
+/// an injected novelty assert. Novelty-minted subject and string ids resolve
+/// through `dict_overlay` (which falls back to the base dictionaries for
+/// indexed ids); everything else decodes from the store, mirroring
+/// `build_probe_object_binding`.
+fn decode_probe_filter_value(
+    ctx: &ExecutionContext<'_>,
+    store: &BinaryIndexStore,
+    dict_overlay: Option<&crate::dict_overlay::DictOverlay>,
+    p_id: u32,
+    o_type: u16,
+    o_key: u64,
+) -> Result<fluree_db_core::FlakeValue> {
+    use fluree_db_core::o_type::{DecodeKind, OType};
+    Ok(
+        match (OType::from_u16(o_type).decode_kind(), dict_overlay) {
+            (DecodeKind::IriRef, Some(ov)) => {
+                let iri = ov.resolve_subject_iri(o_key).map_err(|e| {
+                    QueryError::Internal(format!("resolve_subject_iri (probe filter): {e}"))
+                })?;
+                fluree_db_core::FlakeValue::Ref(store.encode_iri(&iri))
+            }
+            (DecodeKind::StringDict, Some(ov)) => {
+                let s = ov.resolve_string_value(o_key as u32).map_err(|e| {
+                    QueryError::Internal(format!("resolve_string_value (probe filter): {e}"))
+                })?;
+                fluree_db_core::FlakeValue::String(s)
+            }
+            (DecodeKind::JsonArena, Some(ov)) => {
+                let s = ov.resolve_string_value(o_key as u32).map_err(|e| {
+                    QueryError::Internal(format!("resolve_string_value (probe filter json): {e}"))
+                })?;
+                fluree_db_core::FlakeValue::Json(s)
+            }
+            _ => store
+                .decode_value_v3(o_type, o_key, p_id, ctx.binary_g_id)
+                .map_err(|e| {
+                    QueryError::Internal(format!("decode_value_v3 (probe filter): {e}"))
+                })?,
+        },
+    )
+}
+
 /// Bundled parameters for [`batched_subject_probe_binary`].
 pub(crate) struct SubjectProbeParams<'a> {
     pub pred_sid: &'a Sid,
@@ -2805,6 +3126,7 @@ pub(crate) fn batched_subject_probe_binary(
     ctx: &ExecutionContext<'_>,
     store: &Arc<BinaryIndexStore>,
     params: &SubjectProbeParams<'_>,
+    mut probe_ops: Option<&mut ProbeOps>,
 ) -> Result<Vec<BatchedSubjectProbeMatch>> {
     use fluree_db_binary_index::format::run_record_v2::{cmp_v2_for_order, RunRecordV2};
     use fluree_db_binary_index::read::column_loader::load_leaflet_columns_cached;
@@ -2815,9 +3137,19 @@ pub(crate) fn batched_subject_probe_binary(
     }
 
     let Some(p_id) = store.sid_to_p_id(params.pred_sid) else {
+        // Empty only when no overlay merge is in play — the lane plan
+        // declines novelty-only predicates before reaching here.
+        debug_assert!(
+            probe_ops.is_none(),
+            "lane plan must decline novelty-only predicates"
+        );
         return Ok(Vec::new());
     };
     let Some(branch) = store.branch_for_order(ctx.binary_g_id, RunSortOrder::Psot) else {
+        debug_assert!(
+            probe_ops.is_none(),
+            "lane plan must decline branchless graphs"
+        );
         return Ok(Vec::new());
     };
 
@@ -2854,6 +3186,7 @@ pub(crate) fn batched_subject_probe_binary(
     let mut out = Vec::new();
 
     for leaf_idx in leaf_range {
+        ctx.check_cancelled()?;
         let leaf_entry = &branch.leaves[leaf_idx];
         let LeafScan {
             leaf_bytes,
@@ -2864,6 +3197,7 @@ pub(crate) fn batched_subject_probe_binary(
         } = prepare_leaf_for_scan(store, leaf_entry, need_replay)?;
 
         for (leaflet_idx, entry) in dir.entries.iter().enumerate() {
+            ctx.check_cancelled()?;
             let needs_history_replay =
                 need_replay && entry.history_len > 0 && entry.history_max_t > to_t_u32;
             if entry.row_count == 0 && !needs_history_replay {
@@ -2902,6 +3236,7 @@ pub(crate) fn batched_subject_probe_binary(
                 )
                 .map_err(|e| QueryError::Internal(format!("load columns: {e}")))?
             };
+            ctx.check_cancelled()?;
 
             // Apply time-travel replay when querying a historical snapshot.
             let batch = if need_replay {
@@ -2920,6 +3255,7 @@ pub(crate) fn batched_subject_probe_binary(
             } else {
                 batch
             };
+            ctx.check_cancelled()?;
 
             let row_count = batch.row_count;
             let p_start = (0..row_count)
@@ -2947,12 +3283,24 @@ pub(crate) fn batched_subject_probe_binary(
                 if row_start == row_end {
                     continue;
                 }
+                let probe_window = probe_ops
+                    .as_ref()
+                    .map(|p| p.subject_window(s_id))
+                    .filter(|w| !w.is_empty());
 
                 for row in row_start..row_end {
                     let o_type_val = entry
                         .o_type_const
                         .unwrap_or_else(|| batch.o_type.get_or(row, 0));
                     let o_key_val = batch.o_key.get(row);
+                    if let (Some(probe), Some(win)) = (probe_ops.as_mut(), &probe_window) {
+                        let o_i_val = batch.o_i.get_or(row, u32::MAX);
+                        if probe.base_row_fate(win, p_id, o_type_val, o_key_val, o_i_val)
+                            == RowFate::Drop
+                        {
+                            continue;
+                        }
+                    }
 
                     if params.object_bounds.is_some() || params.bound_object.is_some() {
                         let decoded = store
@@ -2998,6 +3346,54 @@ pub(crate) fn batched_subject_probe_binary(
         }
     }
 
+    // Inject novelty-only matches: unconsumed asserts for probed subjects,
+    // through the same filters as base rows.
+    if let Some(probe) = probe_ops {
+        for &s_id in &unique_s_ids {
+            probe.drain_asserts_for_subject(s_id, |op| {
+                if params.object_bounds.is_some() || params.bound_object.is_some() {
+                    let decoded = decode_probe_filter_value(
+                        ctx,
+                        store,
+                        params.dict_overlay,
+                        p_id,
+                        op.o_type,
+                        op.o_key,
+                    )?;
+                    if let Some(bounds) = params.object_bounds {
+                        if !bounds.matches(&decoded) {
+                            return Ok(());
+                        }
+                    }
+                    if let Some(term) = params.bound_object {
+                        if !term_matches_probe_value(store, term, &decoded) {
+                            return Ok(());
+                        }
+                    }
+                }
+                let object = if params.emit_object {
+                    Some(build_probe_object_binding(
+                        ctx,
+                        store,
+                        params.dict_overlay,
+                        p_id,
+                        op.o_type,
+                        op.o_key,
+                        op.o_i,
+                        op.t,
+                    )?)
+                } else {
+                    None
+                };
+                out.push(BatchedSubjectProbeMatch {
+                    subject_id: s_id,
+                    object,
+                });
+                Ok(())
+            })?;
+        }
+    }
+
     Ok(out)
 }
 
@@ -3007,6 +3403,7 @@ pub(crate) fn batched_subject_star_spot(
     subject_ids: &[u64],
     predicates: &[SpotStarPredicateParams<'_>],
     dict_overlay: Option<&crate::dict_overlay::DictOverlay>,
+    mut probe_ops: Option<&mut ProbeOps>,
 ) -> Result<Vec<BatchedSpotStarMatch>> {
     use fluree_db_binary_index::format::run_record_v2::{cmp_v2_for_order, RunRecordV2};
     use fluree_db_binary_index::read::column_loader::load_leaflet_columns_cached;
@@ -3025,10 +3422,18 @@ pub(crate) fn batched_subject_star_spot(
         predicates_by_id.insert(p_id, predicate);
     }
     if predicates_by_id.is_empty() {
+        debug_assert!(
+            probe_ops.is_none(),
+            "lane plan must decline novelty-only predicates"
+        );
         return Ok(Vec::new());
     }
 
     let Some(branch) = store.branch_for_order(ctx.binary_g_id, RunSortOrder::Spot) else {
+        debug_assert!(
+            probe_ops.is_none(),
+            "lane plan must decline branchless graphs"
+        );
         return Ok(Vec::new());
     };
 
@@ -3065,6 +3470,7 @@ pub(crate) fn batched_subject_star_spot(
     let mut out = Vec::new();
 
     for leaf_idx in leaf_range {
+        ctx.check_cancelled()?;
         let leaf_entry = &branch.leaves[leaf_idx];
         let LeafScan {
             leaf_bytes,
@@ -3148,6 +3554,10 @@ pub(crate) fn batched_subject_star_spot(
                 if row_start == row_end {
                     continue;
                 }
+                let probe_window = probe_ops
+                    .as_ref()
+                    .map(|p| p.subject_window(s_id))
+                    .filter(|w| !w.is_empty());
 
                 for row in row_start..row_end {
                     let p_id = entry.p_const.unwrap_or_else(|| batch.p_id.get_or(row, 0));
@@ -3159,6 +3569,14 @@ pub(crate) fn batched_subject_star_spot(
                         .o_type_const
                         .unwrap_or_else(|| batch.o_type.get_or(row, 0));
                     let o_key_val = batch.o_key.get(row);
+                    if let (Some(probe), Some(win)) = (probe_ops.as_mut(), &probe_window) {
+                        let o_i_val = batch.o_i.get_or(row, u32::MAX);
+                        if probe.base_row_fate(win, p_id, o_type_val, o_key_val, o_i_val)
+                            == RowFate::Drop
+                        {
+                            continue;
+                        }
+                    }
 
                     if predicate.object_bounds.is_some() || predicate.bound_object.is_some() {
                         let decoded = store
@@ -3202,6 +3620,58 @@ pub(crate) fn batched_subject_star_spot(
                     });
                 }
             }
+        }
+    }
+
+    // Inject novelty-only matches per probed subject, dispatching each assert
+    // to its predicate's filters and emit shape.
+    if let Some(probe) = probe_ops {
+        for &s_id in &unique_s_ids {
+            probe.drain_asserts_for_subject(s_id, |op| {
+                let Some(predicate) = predicates_by_id.get(&op.p_id).copied() else {
+                    return Ok(());
+                };
+                if predicate.object_bounds.is_some() || predicate.bound_object.is_some() {
+                    let decoded = decode_probe_filter_value(
+                        ctx,
+                        store,
+                        dict_overlay,
+                        op.p_id,
+                        op.o_type,
+                        op.o_key,
+                    )?;
+                    if let Some(bounds) = predicate.object_bounds {
+                        if !bounds.matches(&decoded) {
+                            return Ok(());
+                        }
+                    }
+                    if let Some(term) = predicate.bound_object {
+                        if !term_matches_probe_value(store, term, &decoded) {
+                            return Ok(());
+                        }
+                    }
+                }
+                let object = if predicate.emit_object {
+                    Some(build_probe_object_binding(
+                        ctx,
+                        store,
+                        dict_overlay,
+                        op.p_id,
+                        op.o_type,
+                        op.o_key,
+                        op.o_i,
+                        op.t,
+                    )?)
+                } else {
+                    None
+                };
+                out.push(BatchedSpotStarMatch {
+                    subject_id: s_id,
+                    predicate_idx: predicate.predicate_idx,
+                    object,
+                });
+                Ok(())
+            })?;
         }
     }
 

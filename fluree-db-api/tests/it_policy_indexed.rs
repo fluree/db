@@ -226,3 +226,147 @@ async fn policy_class_survives_indexing() {
         })
         .await;
 }
+
+/// Tripwire: the batched join lanes read raw leaflets and never run the
+/// per-leaf `filter_flakes` policy filtering — the probe lane plans must
+/// decline under a restrictive policy even on a fully indexed, novelty-free
+/// ledger (they used to short-circuit to `Clean` on `overlay_free` before
+/// checking the policy). This harness's routing currently keeps policy
+/// queries off the batched lanes upstream, so the assertion guards against
+/// any future routing change exposing the raw path.
+#[tokio::test]
+async fn policy_batched_join_lane_declines_index_only() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let path = tmp.path().to_string_lossy().to_string();
+    let index_cfg = IndexConfig {
+        reindex_min_bytes: 0,
+        reindex_max_bytes: 1_000_000,
+    };
+
+    let mut fluree = FlureeBuilder::file(path).build().expect("build");
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        Arc::new(fluree.nameservice_mode().clone()),
+        fluree_db_indexer::IndexerConfig::small(),
+    );
+    fluree.set_indexing_mode(fluree_db_api::tx::IndexingMode::Background(handle.clone()));
+
+    local
+        .run_until(async move {
+            let ledger_id = "it/policy-batched-lane:main";
+            let ledger = fluree.create_ledger(ledger_id).await.unwrap();
+
+            let setup = json!({
+                "@context": {
+                    "ex": "http://example.org/ns/",
+                    "schema": "http://schema.org/",
+                    "f": "https://ns.flur.ee/db#"
+                },
+                "@graph": [
+                    {
+                        "@id": "ex:alice",
+                        "@type": "ex:User",
+                        "schema:name": "Alice",
+                        "schema:ssn": "111-11-1111"
+                    },
+                    {
+                        "@id": "ex:bob",
+                        "@type": "ex:User",
+                        "schema:name": "Bob",
+                        "schema:ssn": "222-22-2222"
+                    },
+                    {
+                        "@id": "ex:aliceIdentity",
+                        "f:policyClass": [{"@id": "ex:EmployeePolicy"}],
+                        "ex:user": {"@id": "ex:alice"}
+                    },
+                    {
+                        "@id": "ex:ssnRestriction",
+                        "@type": ["f:AccessPolicy", "ex:EmployeePolicy"],
+                        "f:required": true,
+                        "f:onProperty": [{"@id": "http://schema.org/ssn"}],
+                        "f:action": {"@id": "f:view"},
+                        "f:query": {
+                            "@value": "{\"@context\":{\"ex\":\"http://example.org/ns/\"},\"where\":{\"@id\":\"?$identity\",\"ex:user\":{\"@id\":\"?$this\"}}}",
+                            "@type": "http://www.w3.org/2001/XMLSchema#string"
+                        }
+                    },
+                    {
+                        "@id": "ex:defaultAllow",
+                        "@type": ["f:AccessPolicy", "ex:EmployeePolicy"],
+                        "f:action": {"@id": "f:view"},
+                        "f:query": {
+                            "@value": "{}",
+                            "@type": "http://www.w3.org/2001/XMLSchema#string"
+                        }
+                    }
+                ]
+            });
+            let r1 = fluree
+                .upsert_with_opts(
+                    ledger,
+                    &setup,
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg,
+                )
+                .await
+                .unwrap();
+
+            // Fully index — no novelty tail remains.
+            trigger_index_and_wait_outcome(&handle, ledger_id, r1.receipt.t).await;
+            let ledger_indexed = fluree.ledger(ledger_id).await.unwrap();
+            assert!(
+                ledger_indexed.snapshot.range_provider.is_some(),
+                "ledger should have binary index after indexing"
+            );
+
+            let alice_opts = QueryConnectionOptions {
+                identity: Some("http://example.org/ns/aliceIdentity".to_string()),
+                default_allow: false,
+                ..Default::default()
+            };
+            let policy_ctx = policy_builder::build_policy_context_from_opts(
+                &ledger_indexed.snapshot,
+                ledger_indexed.novelty.as_ref(),
+                None,
+                ledger_indexed.t(),
+                &alice_opts,
+                &[0],
+            )
+            .await
+            .expect("build policy");
+
+            // Two-pattern star: the planner gives this to the nested-loop
+            // join, whose batched subject lane reads raw leaflets when not
+            // declined — independent of the property-join driver capture the
+            // 3-pattern test exercises.
+            let query = json!({
+                "select": ["?name", "?ssn"],
+                "where": {
+                    "@id": "?u",
+                    "http://schema.org/name": "?name",
+                    "http://schema.org/ssn": "?ssn"
+                }
+            });
+            let result =
+                support::query_jsonld_with_policy(&fluree, &ledger_indexed, &query, &policy_ctx)
+                    .await
+                    .expect("query");
+            let jsonld = result
+                .to_jsonld(&ledger_indexed.snapshot)
+                .expect("to_jsonld");
+            let rows = jsonld.as_array().expect("array");
+            assert_eq!(
+                rows.len(),
+                1,
+                "index-only policy view: only Alice's SSN should be visible, got: {jsonld:#?}"
+            );
+            assert!(
+                rows[0].to_string().contains("111-11-1111")
+                    && !rows[0].to_string().contains("222-22-2222"),
+                "index-only policy view must hide Bob's SSN, got: {jsonld:#?}"
+            );
+        })
+        .await;
+}

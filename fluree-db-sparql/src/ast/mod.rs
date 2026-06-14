@@ -38,9 +38,9 @@ pub use pattern::{GraphName, GraphPattern, TriplePattern};
 pub use query::{
     AskQuery, BaseDecl, ConstructQuery, ConstructTemplate, DatasetClause, DescribeQuery,
     DescribeTarget, GroupByClause, GroupCondition, HavingClause, LimitClause, OffsetClause,
-    OrderByClause, OrderCondition, OrderDirection, OrderExpr, PrefixDecl, Prologue, QueryBody,
-    SelectClause, SelectModifier, SelectQuery, SelectVariable, SelectVariables, SolutionModifiers,
-    SparqlAst, VarOrIri, WhereClause,
+    OrderByClause, OrderCondition, OrderDirection, OrderExpr, Pragmas, PrefixDecl, Prologue,
+    QueryBody, SelectClause, SelectModifier, SelectQuery, SelectVariable, SelectVariables,
+    SolutionModifiers, SparqlAst, VarOrIri, WhereClause,
 };
 pub use term::{
     BlankNode, BlankNodeValue, Iri, IriValue, Literal, LiteralValue, ObjectTerm, PredicateTerm,

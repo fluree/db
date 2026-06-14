@@ -32,7 +32,7 @@
 
 mod dependency;
 pub(crate) mod operator_tree;
-mod pushdown;
+pub(crate) mod pushdown;
 mod reasoning_prep;
 mod rewrite_glue;
 mod runner;

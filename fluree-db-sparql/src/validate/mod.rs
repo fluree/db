@@ -208,10 +208,41 @@ impl<'a> Validator<'a> {
         }
     }
 
-    /// Validate that QuadData contains only ground triples (no variables).
+    /// Validate that QuadData contains only ground triples (no variables),
+    /// including inside `GRAPH <iri> { ... }` blocks. Variable graph names are
+    /// rejected: DATA must be ground.
     fn validate_ground_quad_data(&mut self, data: &QuadData, context: &str) {
-        for triple in &data.triples {
-            self.validate_ground_triple(triple, context);
+        for el in &data.quads {
+            match el {
+                QuadPatternElement::Triple(triple) => {
+                    self.validate_ground_triple(triple, context);
+                }
+                QuadPatternElement::Graph {
+                    name,
+                    triples,
+                    span,
+                } => {
+                    if let crate::ast::pattern::GraphName::Var(v) = name {
+                        self.diagnostics.push(
+                            Diagnostic::error(
+                                DiagCode::VariableInGroundData,
+                                format!("Variable graph name ?{} not allowed in {context}", v.name),
+                                *span,
+                            )
+                            .with_label(Label::new(v.span, "variable not allowed here"))
+                            .with_help(format!(
+                                "{context} requires a fixed graph IRI; use GRAPH <iri> {{ ... }}."
+                            ))
+                            .with_note(
+                                "Use INSERT/DELETE with a WHERE clause for variable graph targets.",
+                            ),
+                        );
+                    }
+                    for triple in triples {
+                        self.validate_ground_triple(triple, context);
+                    }
+                }
+            }
         }
     }
 
@@ -471,6 +502,39 @@ mod tests {
     #[test]
     fn test_delete_data_variable() {
         let diags = validate_query("DELETE DATA { ?s <http://example.org/p> \"value\" }");
+        assert!(diags
+            .iter()
+            .any(|d| d.code == DiagCode::VariableInGroundData));
+    }
+
+    #[test]
+    fn test_insert_data_graph_block_ground_valid() {
+        // Issue #1288: GRAPH <iri> { ground triples } is valid in INSERT DATA.
+        let diags = validate_query(
+            "INSERT DATA { GRAPH <urn:g> { <http://example.org/s> <http://example.org/p> \"v\" } }",
+        );
+        assert!(
+            diags.iter().all(|d| !d.is_error()),
+            "Expected no errors: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn test_insert_data_graph_block_variable_rejected() {
+        // A variable inside a GRAPH block in DATA is still non-ground.
+        let diags =
+            validate_query("INSERT DATA { GRAPH <urn:g> { ?s <http://example.org/p> \"v\" } }");
+        assert!(diags
+            .iter()
+            .any(|d| d.code == DiagCode::VariableInGroundData));
+    }
+
+    #[test]
+    fn test_insert_data_variable_graph_name_rejected() {
+        // A variable graph name is not ground and must be rejected.
+        let diags = validate_query(
+            "INSERT DATA { GRAPH ?g { <http://example.org/s> <http://example.org/p> \"v\" } }",
+        );
         assert!(diags
             .iter()
             .any(|d| d.code == DiagCode::VariableInGroundData));

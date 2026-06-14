@@ -170,8 +170,8 @@ pub enum RawObject {
 /// The raw metadata can be converted to `TxnMetaEntry` using `resolve_trig_meta()`
 /// once a `NamespaceRegistry` is available.
 pub fn parse_trig_phase1(input: &str) -> Result<TrigPhase1Result> {
-    // Check if input contains GRAPH keyword - if not, pass through as-is
-    if !contains_graph_keyword(input) {
+    // Check if input might contain a graph block - if not, pass through as-is
+    if !might_contain_graph_block(input) {
         return Ok(TrigPhase1Result {
             turtle: input.to_string(),
             raw_meta: None,
@@ -306,8 +306,8 @@ pub fn extract_trig_txn_meta(
     input: &str,
     ns_registry: &mut NamespaceRegistry,
 ) -> Result<TrigMetaResult> {
-    // Check if input contains GRAPH keyword - if not, pass through as-is
-    if !contains_graph_keyword(input) {
+    // Check if input might contain a graph block - if not, pass through as-is
+    if !might_contain_graph_block(input) {
         return Ok(TrigMetaResult {
             turtle: input.to_string(),
             txn_meta: Vec::new(),
@@ -334,11 +334,24 @@ pub fn extract_trig_txn_meta(
     })
 }
 
-/// Quick check if input might contain a GRAPH block.
-fn contains_graph_keyword(input: &str) -> bool {
-    // Case-insensitive check for GRAPH keyword
-    let upper = input.to_ascii_uppercase();
-    upper.contains("GRAPH")
+/// Quick check if input might contain a graph block — either the SPARQL-style
+/// `GRAPH <iri> { ... }` keyword form or the W3C-compliant compact `<iri> { ... }`
+/// form (the `GRAPH` keyword is optional per the TriG grammar).
+///
+/// A `{` triggers parsing because every graph block (both forms) contains one,
+/// while plain Turtle has no block syntax — the only way a `{` reaches here in
+/// non-TriG content is inside a string literal, and such inputs round-trip
+/// unchanged through the parser (the brace stays within a `String` token).
+/// The `GRAPH` keyword is still checked so a malformed `GRAPH <iri>` (missing
+/// braces) is routed to the parser for a proper error rather than passed
+/// through silently.
+fn might_contain_graph_block(input: &str) -> bool {
+    // Cheap, common-case-first: a brace is present in every graph block.
+    if input.contains('{') {
+        return true;
+    }
+    // Case-insensitive check for the GRAPH keyword.
+    input.to_ascii_uppercase().contains("GRAPH")
 }
 
 /// Parser state for TriG metadata extraction.
@@ -451,6 +464,13 @@ impl<'a> TrigMetaParser<'a> {
         std::mem::discriminant(&self.tokens[self.pos].kind) == std::mem::discriminant(kind)
     }
 
+    /// Kind of the token `offset` positions ahead of the cursor, if any.
+    /// The tokenizer emits no whitespace/comment tokens, so the immediate
+    /// successor is `offset == 1`.
+    fn peek_kind(&self, offset: usize) -> Option<&TokenKind> {
+        self.tokens.get(self.pos + offset).map(|t| &t.kind)
+    }
+
     fn span_text(&self, start: u32, end: u32) -> &'a str {
         &self.input[start as usize..end as usize]
     }
@@ -478,7 +498,44 @@ impl<'a> TrigMetaParser<'a> {
                 self.directives.push((start_pos, end_pos));
             }
             TokenKind::KwGraph => {
+                self.advance(); // consume the GRAPH keyword
                 self.parse_graph_block()?;
+            }
+            // W3C-compliant compact graph block: `<iri> { ... }` or
+            // `prefix:name { ... }` (the GRAPH keyword is optional per the TriG
+            // grammar). A bare IRI / prefixed name followed by `{` can only be a
+            // labeled graph block — in a default-graph triple the subject is
+            // always followed by a predicate, never a brace.
+            TokenKind::Iri
+            | TokenKind::IriEscaped(_)
+            | TokenKind::PrefixedName
+            | TokenKind::PrefixedNameNs
+                if matches!(self.peek_kind(1), Some(TokenKind::LBrace)) =>
+            {
+                self.parse_graph_block()?;
+            }
+            // Anonymous default-graph wrapped block `{ ... }`. Valid W3C TriG
+            // (it denotes the default graph), but unsupported here: this parser
+            // separates default-graph Turtle from labeled graph blocks. Reject
+            // cleanly rather than letting the brace leak into the reconstructed
+            // Turtle and surface as a misleading low-level parse error.
+            TokenKind::LBrace => {
+                return Err(TransactError::Parse(
+                    "anonymous default-graph block `{ ... }` is not supported; \
+                     write default-graph triples directly (outside any block), \
+                     or use a labeled graph block `<iri> { ... }`"
+                        .to_string(),
+                ));
+            }
+            // Blank-node graph label (`_:b { ... }`). Valid W3C TriG, but not
+            // supported here in either form (the keyword form rejects it too).
+            // Emit a clear error instead of a silent mis-parse.
+            TokenKind::BlankNodeLabel if matches!(self.peek_kind(1), Some(TokenKind::LBrace)) => {
+                return Err(TransactError::Parse(
+                    "blank-node graph labels are not supported; \
+                     use an IRI graph label, e.g. `<iri> { ... }`"
+                        .to_string(),
+                ));
             }
             TokenKind::Eof => {}
             _ => {
@@ -574,9 +631,10 @@ impl<'a> TrigMetaParser<'a> {
         }
     }
 
+    /// Parse a graph block starting at the graph label (the optional `GRAPH`
+    /// keyword, if present, must already be consumed by the caller). Handles
+    /// both `GRAPH <iri> { ... }` and the compact `<iri> { ... }` form.
     fn parse_graph_block(&mut self) -> Result<()> {
-        self.advance(); // consume GRAPH
-
         // Parse graph IRI
         let graph_iri = match self.current().kind.clone() {
             TokenKind::Iri => {
@@ -1662,5 +1720,198 @@ GRAPH <#txn-meta> {
         let result = extract_trig_txn_meta(input, &mut ns).unwrap();
         assert_eq!(result.txn_meta.len(), 3);
         assert!(result.txn_meta.iter().all(|e| e.predicate_name == "tags"));
+    }
+
+    // ---- W3C-compliant compact graph block form: `<iri> { ... }` (issue #1278) ----
+
+    #[test]
+    fn test_compact_named_graph() {
+        // The compact form omits the `GRAPH` keyword. The graph IRI here does
+        // NOT contain the substring "graph", so it also exercises the gate.
+        let mut ns = test_registry();
+        let input = r"
+@prefix ex: <http://example.org/> .
+
+<urn:g1> {
+    ex:alice ex:knows ex:bob .
+}
+";
+
+        let result = extract_trig_txn_meta(input, &mut ns).unwrap();
+        assert!(result.txn_meta.is_empty());
+        assert_eq!(result.named_graphs.len(), 1);
+        assert_eq!(result.named_graphs[0].iri, "urn:g1");
+        assert_eq!(result.named_graphs[0].triples.len(), 1);
+        // The graph block must NOT leak into the default-graph Turtle.
+        assert!(!result.turtle.contains('{'));
+        assert!(!result.turtle.contains("ex:alice"));
+    }
+
+    #[test]
+    fn test_compact_named_graph_prefixed() {
+        // Compact form with a prefixed-name graph label.
+        let mut ns = test_registry();
+        let input = r#"
+@prefix ex: <http://example.org/> .
+
+ex:g1 {
+    ex:alice ex:name "Alice" .
+}
+"#;
+
+        let result = extract_trig_txn_meta(input, &mut ns).unwrap();
+        assert!(result.txn_meta.is_empty());
+        assert_eq!(result.named_graphs.len(), 1);
+        assert_eq!(result.named_graphs[0].iri, "http://example.org/g1");
+        assert_eq!(result.named_graphs[0].triples.len(), 1);
+    }
+
+    #[test]
+    fn test_compact_and_keyword_forms_equivalent() {
+        // The compact form and the keyword form must produce identical results.
+        let compact = r#"
+@prefix ex: <http://example.org/> .
+<http://example.org/data> {
+    ex:alice ex:name "Alice" ;
+             ex:age 30 .
+}
+"#;
+        let keyword = r#"
+@prefix ex: <http://example.org/> .
+GRAPH <http://example.org/data> {
+    ex:alice ex:name "Alice" ;
+             ex:age 30 .
+}
+"#;
+
+        let mut ns_c = test_registry();
+        let mut ns_k = test_registry();
+        let rc = extract_trig_txn_meta(compact, &mut ns_c).unwrap();
+        let rk = extract_trig_txn_meta(keyword, &mut ns_k).unwrap();
+
+        assert_eq!(rc.named_graphs.len(), rk.named_graphs.len());
+        assert_eq!(rc.named_graphs.len(), 1);
+        assert_eq!(rc.named_graphs[0].iri, rk.named_graphs[0].iri);
+        assert_eq!(
+            rc.named_graphs[0].triples.len(),
+            rk.named_graphs[0].triples.len()
+        );
+        assert_eq!(rc.named_graphs[0].triples.len(), 2);
+    }
+
+    #[test]
+    fn test_compact_txn_meta() {
+        // The txn-meta graph in compact form must still be extracted.
+        let mut ns = test_registry();
+        let input = r#"
+@prefix ex: <http://example.org/> .
+@prefix fluree: <https://ns.flur.ee/db#> .
+
+ex:alice ex:name "Alice" .
+
+<#txn-meta> {
+    fluree:commit:this ex:machine "server-01" .
+}
+"#;
+
+        let result = extract_trig_txn_meta(input, &mut ns).unwrap();
+        assert_eq!(result.txn_meta.len(), 1);
+        assert_eq!(result.txn_meta[0].predicate_name, "machine");
+        assert!(result.turtle.contains("ex:alice ex:name"));
+        assert!(!result.turtle.contains('{'));
+    }
+
+    #[test]
+    fn test_compact_mixed_with_default_and_keyword() {
+        // Default triples, a keyword-form graph, and a compact-form graph mixed.
+        let mut ns = test_registry();
+        let input = r#"
+@prefix ex: <http://example.org/> .
+
+ex:bob ex:name "Bob" .
+
+GRAPH <http://example.org/products> {
+    ex:widget ex:price 19 .
+}
+
+<urn:orders> {
+    ex:order1 ex:qty 5 .
+}
+"#;
+
+        let result = extract_trig_txn_meta(input, &mut ns).unwrap();
+        assert!(result.txn_meta.is_empty());
+        assert_eq!(result.named_graphs.len(), 2);
+        assert!(result
+            .named_graphs
+            .iter()
+            .any(|g| g.iri == "http://example.org/products"));
+        assert!(result.named_graphs.iter().any(|g| g.iri == "urn:orders"));
+        assert!(result.turtle.contains("ex:bob ex:name"));
+        assert!(!result.turtle.contains('{'));
+    }
+
+    #[test]
+    fn test_compact_named_graph_comment_before_brace() {
+        // Whitespace and comments between the graph label and `{` must not
+        // defeat compact-form detection (the lexer skips both).
+        let mut ns = test_registry();
+        let input = "@prefix ex: <http://example.org/> .\n\
+                     <urn:g1>   # the audit graph\n\
+                     {\n    ex:a ex:b ex:c .\n}\n";
+
+        let result = extract_trig_txn_meta(input, &mut ns).unwrap();
+        assert_eq!(result.named_graphs.len(), 1);
+        assert_eq!(result.named_graphs[0].iri, "urn:g1");
+        assert_eq!(result.named_graphs[0].triples.len(), 1);
+    }
+
+    #[test]
+    fn test_anonymous_default_graph_block_clean_error() {
+        // Anonymous `{ ... }` is valid W3C TriG but unsupported here; it must
+        // produce a clear error, not a silent mis-parse / misleading downstream
+        // Turtle error.
+        let mut ns = test_registry();
+        let input = "@prefix ex: <http://example.org/> .\n{\n    ex:a ex:b ex:c .\n}\n";
+
+        let err = extract_trig_txn_meta(input, &mut ns)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("anonymous default-graph block"),
+            "expected a clear anonymous-block error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_blank_node_graph_label_clean_error() {
+        // Blank-node graph labels are unsupported; the compact form must report
+        // it clearly rather than silently mis-parsing.
+        let mut ns = test_registry();
+        let input = "@prefix ex: <http://example.org/> .\n_:b {\n    ex:a ex:b ex:c .\n}\n";
+
+        let err = extract_trig_txn_meta(input, &mut ns)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("blank-node graph labels are not supported"),
+            "expected a clear blank-node-label error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_brace_in_string_literal_roundtrips() {
+        // A `{` inside a string literal must not be mistaken for a graph block;
+        // the input round-trips unchanged through the TriG parser gate.
+        let mut ns = test_registry();
+        let input = r#"
+@prefix ex: <http://example.org/> .
+ex:alice ex:note "value with a { brace" .
+"#;
+
+        let result = extract_trig_txn_meta(input, &mut ns).unwrap();
+        assert!(result.txn_meta.is_empty());
+        assert!(result.named_graphs.is_empty());
+        assert!(result.turtle.contains("value with a { brace"));
     }
 }

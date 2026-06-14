@@ -377,7 +377,16 @@ async fn run_bulk_import(
                     sb.finish_and_clear();
                 }
                 let t0 = *commit_start.get_or_init(std::time::Instant::now);
-                cb.set_length(total as u64);
+                if total > 0 {
+                    // Estimated totals can undercount (e.g. compressed ndjson
+                    // sources) — never let the length fall below the position,
+                    // which would render the bar overfull.
+                    cb.set_length((total as u64).max(chunk as u64));
+                } else {
+                    // Unknown total: sentinel length so the bar never renders
+                    // as complete (mirrors the Scanning handler).
+                    cb.set_length(u64::MAX);
+                }
                 cb.set_position(chunk as u64);
                 let secs = t0.elapsed().as_secs_f64();
                 let rate = if secs > 0.0 {
@@ -782,9 +791,9 @@ fn is_import_path(path: &Path) -> CliResult<bool> {
     let name_lower = name.to_ascii_lowercase();
 
     // Bulk import handles every supported RDF format. Each may carry an outer
-    // `.gz` or `.zst` suffix — the bulk pipeline decompresses transparently
-    // (see `fluree-db-api::import::effective_extension`). `.bz2` is rejected
-    // explicitly because the import pipeline doesn't link a bzip2 decoder.
+    // `.gz` or `.zst` suffix — the bulk pipeline decompresses transparently.
+    // `.bz2` is rejected explicitly because the import pipeline doesn't link
+    // a bzip2 decoder.
     if name_lower.ends_with(".bz2") {
         return Err(CliError::Input(format!(
             "bzip2-compressed files are not supported; use .gz or .zst, or \
@@ -792,24 +801,9 @@ fn is_import_path(path: &Path) -> CliResult<bool> {
             path.display()
         )));
     }
-    const SUPPORTED: &[&str] = &[
-        ".ttl",
-        ".ttl.gz",
-        ".ttl.zst",
-        ".nt",
-        ".nt.gz",
-        ".nt.zst",
-        ".nq",
-        ".nq.gz",
-        ".nq.zst",
-        ".trig",
-        ".trig.gz",
-        ".trig.zst",
-        ".jsonld",
-        ".jsonld.gz",
-        ".jsonld.zst",
-    ];
-    Ok(SUPPORTED.iter().any(|suffix| name_lower.ends_with(suffix)))
+    // Single source of truth with the import pipeline's own discovery rules —
+    // a format accepted here is guaranteed to resolve there.
+    Ok(fluree_db_api::is_bulk_import_file(path))
 }
 
 /// Replace non-alphanumeric characters with underscores for safe filenames.
@@ -1133,4 +1127,39 @@ fn format_with_commas(n: u64) -> String {
         result.push(ch);
     }
     result
+}
+
+#[cfg(test)]
+mod is_import_path_tests {
+    use super::is_import_path;
+    use std::path::Path;
+
+    #[test]
+    fn ndjson_jsonl_are_import_paths() {
+        for name in [
+            "data.jsonl",
+            "data.ndjson",
+            "data.jsonl.gz",
+            "data.ndjson.zst",
+        ] {
+            assert!(
+                is_import_path(Path::new(name)).unwrap(),
+                "{name} should route to bulk import"
+            );
+        }
+    }
+
+    #[test]
+    fn rdf_formats_remain_import_paths() {
+        for name in ["x.ttl", "x.nt", "x.nq", "x.trig", "x.jsonld", "x.ttl.gz"] {
+            assert!(is_import_path(Path::new(name)).unwrap(), "{name}");
+        }
+    }
+
+    #[test]
+    fn non_bulk_inputs_are_not_import_paths() {
+        // `.json` deliberately routes to the detect/transact path, not import.
+        assert!(!is_import_path(Path::new("x.json")).unwrap());
+        assert!(!is_import_path(Path::new("x.csv")).unwrap());
+    }
 }

@@ -29,6 +29,7 @@ mod commit;
 mod commit_flakes;
 pub mod delta;
 mod error;
+mod fact_state;
 mod runtime_stats;
 mod stats;
 
@@ -52,6 +53,7 @@ pub use runtime_stats::{
 };
 pub use stats::current_stats;
 
+use fact_state::NoveltyFactState;
 use fluree_db_core::{Flake, GraphId, IndexType, Sid};
 use rayon::Scope;
 use std::cmp::Ordering;
@@ -217,6 +219,11 @@ pub struct Novelty {
     /// Updated automatically by [`Self::apply_commit`] /
     /// [`Self::bulk_apply_commits`] from the post-dedup flake set.
     pub attachments: AttachmentNovelty,
+
+    /// Current-state fact index for RDF set-semantics dedup (latest op per
+    /// identity, per graph, within this novelty window). Persistent map, so it
+    /// clones in O(1). The dedup oracle behind the seam; see [`fact_state`].
+    fact_state: NoveltyFactState,
 }
 
 impl Novelty {
@@ -229,6 +236,7 @@ impl Novelty {
             t,
             epoch: 0,
             attachments: AttachmentNovelty::new(),
+            fact_state: NoveltyFactState::new(),
         }
     }
 
@@ -254,11 +262,33 @@ impl Novelty {
         }
     }
 
+    /// Validate that a batch can be applied WITHOUT mutating any state.
+    ///
+    /// Checks the two conditions that make [`apply_commit`] fallible — FlakeId
+    /// capacity and graph routability. Callers that mutate a shared/live Novelty
+    /// in place (e.g. via `Arc::make_mut`) call this first to guarantee an
+    /// all-or-nothing apply: if it returns `Ok`, the subsequent `apply_commit`
+    /// cannot fail partway and leave the ledger inconsistent.
+    pub fn can_apply(&self, flakes: &[Flake], reverse_graph: &HashMap<Sid, GraphId>) -> Result<()> {
+        if self.store.len() + flakes.len() > MAX_FLAKE_ID as usize {
+            return Err(NoveltyError::overflow(
+                "FlakeId overflow: too many flakes in novelty, trigger reindex",
+            ));
+        }
+        for flake in flakes {
+            Self::resolve_flake_g_id(flake, reverse_graph)?;
+        }
+        Ok(())
+    }
+
     /// Apply a batch of flakes from a commit, routing each flake to its graph.
     ///
     /// Epoch bumps ONCE per call, not per flake.
     /// Each flake is routed to its graph via `reverse_graph`. Unknown graph Sids
     /// cause an error — no silent fallback to the default graph.
+    ///
+    /// Atomic: graph routing (the only fallible step) is resolved before any
+    /// mutation, so an error leaves novelty untouched.
     pub fn apply_commit(
         &mut self,
         flakes: Vec<Flake>,
@@ -277,7 +307,7 @@ impl Novelty {
         );
         let _guard = span.enter();
 
-        // Check FlakeId overflow
+        // Check FlakeId overflow (before any mutation)
         let new_count = self.store.len() + flakes.len();
         if new_count > MAX_FLAKE_ID as usize {
             return Err(NoveltyError::overflow(
@@ -285,11 +315,22 @@ impl Novelty {
             ));
         }
 
-        // Update metadata
+        // Resolve every flake's graph id FIRST. Graph routing is the only fallible
+        // step, so resolving it before any mutation makes apply_commit atomic: a
+        // routing error leaves novelty completely untouched. This matters because
+        // callers mutate a possibly cache-shared Novelty in place (Arc::make_mut),
+        // where a partial mutation would poison live state under the write lock.
+        let mut routed: Vec<(Flake, GraphId)> = Vec::with_capacity(flakes.len());
+        for flake in flakes {
+            let g_id = Self::resolve_flake_g_id(&flake, reverse_graph)?;
+            routed.push((flake, g_id));
+        }
+
+        // From here on every step is infallible.
         self.t = self.t.max(commit_t);
         self.epoch += 1; // Bump epoch once per commit
 
-        // Store flakes in arena, resolve graph IDs, and group by graph.
+        // Store flakes in arena and group by graph.
         //
         // RDF set semantics: skip assertion flakes whose fact (s, p, o, dt, m)
         // is already **currently asserted** in novelty. This prevents duplicate
@@ -309,11 +350,12 @@ impl Novelty {
         // ledgers that never use annotations.
         let mut accepted_reifies: Vec<Flake> = Vec::new();
 
-        for flake in flakes {
-            let g_id = Self::resolve_flake_g_id(&flake, reverse_graph)?;
-
-            // Set semantics: skip duplicate assertions
-            if flake.op && self.fact_currently_asserted_in_graph(g_id, &flake) {
+        for (flake, g_id) in routed {
+            // Set semantics: skip assertions already current in this graph's
+            // novelty window. `fact_state` reflects PRIOR-commit state here (it
+            // is updated only after this loop), matching the previous SPOT-vector
+            // dedup which likewise updated after the batch.
+            if flake.op && self.fact_state.is_asserted(g_id, &flake) {
                 deduped += 1;
                 continue;
             }
@@ -326,6 +368,15 @@ impl Novelty {
             self.size += size;
             let flake_id = self.store.push_with_size(flake, size);
             per_graph.entry(g_id).or_default().push(flake_id);
+        }
+
+        // Record every kept flake (assert + retract) into the current-state
+        // index, per graph in batch order so the latest op per identity wins.
+        // After the keep loop, so within-batch decisions saw only prior state.
+        for (&g_id, ids) in &per_graph {
+            for &id in ids {
+                self.fact_state.record(g_id, self.store.get(id));
+            }
         }
 
         if deduped > 0 {
@@ -570,15 +621,18 @@ impl Novelty {
             }
 
             // Capture `f:reifies*` flakes from the kept set for the
-            // attachment overlay observer. Cloning is cheap (rare
-            // relative to data flakes) and avoids holding a borrow
-            // across the parallel sort below.
+            // attachment overlay observer (cheap clone, rare relative to
+            // data flakes), and maintain the current-state fact index so
+            // later apply_commit calls dedup against bulk-loaded facts.
+            // `kept` is in (s,p,o,dt,m,t,op) order, so the last record per
+            // identity is its highest-t (latest) op.
             let mut accepted_reifies: Vec<Flake> = Vec::new();
             for &id in &kept {
                 let f = store.get(id);
                 if fluree_db_core::namespaces::is_reserved_reifies_predicate(&f.p) {
                     accepted_reifies.push(f.clone());
                 }
+                self.fact_state.record(g_id, f);
             }
 
             // Build the 4 sorted index vectors from the deduped set. Each
@@ -664,6 +718,17 @@ impl Novelty {
         // Update size
         self.size = new_size;
 
+        // Rebuild the current-state index from surviving flakes. SPOT order is
+        // ascending-t within an identity, so the last record per identity wins.
+        self.fact_state = NoveltyFactState::new();
+        for (g, slot) in self.graphs.iter().enumerate() {
+            if let Some(gv) = slot {
+                for &id in &gv.spot {
+                    self.fact_state.record(g as GraphId, self.store.get(id));
+                }
+            }
+        }
+
         self.epoch += 1;
     }
 
@@ -717,65 +782,6 @@ impl Novelty {
             .filter_map(Option::as_ref)
             .flat_map(move |graph_vecs| graph_vecs.get_index(index).iter().copied())
     }
-
-    /// Returns true if the fact `(s, p, o, dt, m)` is **currently asserted**
-    /// in the given graph's novelty.
-    ///
-    /// Uses binary search on the SPOT index (sorted by s, p, o, dt, t, op, m)
-    /// to find the region where `(s, p, o, dt)` lives, then walks backwards
-    /// to find the latest operation for the matching `(s, p, o, dt, m)`.
-    ///
-    /// Important: we must consider the **latest** op, not "any assertion exists",
-    /// otherwise a prior assertion followed by a retraction would incorrectly
-    /// cause a later re-assertion to be dropped.
-    fn fact_currently_asserted_in_graph(&self, g_id: GraphId, flake: &Flake) -> bool {
-        let spot = match self.graphs.get(g_id as usize).and_then(Option::as_ref) {
-            Some(graph_vecs) => &graph_vecs.spot,
-            None => return false,
-        };
-
-        if spot.is_empty() {
-            return false;
-        }
-
-        // Find the (s, p, o, dt) run.
-        let start = spot.partition_point(|&id| {
-            let existing = self.store.get(id);
-            let cmp = existing
-                .s
-                .cmp(&flake.s)
-                .then_with(|| existing.p.cmp(&flake.p))
-                .then_with(|| existing.o.cmp(&flake.o))
-                .then_with(|| existing.dt.cmp(&flake.dt));
-            cmp == Ordering::Less
-        });
-
-        let end = spot.partition_point(|&id| {
-            let existing = self.store.get(id);
-            let cmp = existing
-                .s
-                .cmp(&flake.s)
-                .then_with(|| existing.p.cmp(&flake.p))
-                .then_with(|| existing.o.cmp(&flake.o))
-                .then_with(|| existing.dt.cmp(&flake.dt));
-            cmp != Ordering::Greater
-        });
-
-        if start >= end {
-            return false;
-        }
-
-        // Walk backward (latest t/op first) and find the most recent op for the
-        // exact fact identity (including metadata).
-        for &id in spot[start..end].iter().rev() {
-            let existing = self.store.get(id);
-            if existing.m == flake.m {
-                return existing.op;
-            }
-        }
-
-        false // No matching (s, p, o, dt, m) in novelty
-    }
 }
 
 impl std::fmt::Debug for Novelty {
@@ -804,6 +810,12 @@ impl OverlayProvider for Novelty {
 
     fn epoch(&self) -> u64 {
         self.epoch
+    }
+
+    fn is_effectively_empty(&self) -> bool {
+        // Not `store.is_empty()`: after `clear_up_to` the arena retains dead
+        // flakes, while `size` tracks only alive bytes.
+        self.size == 0
     }
 
     fn for_each_overlay_flake(
@@ -972,6 +984,45 @@ mod tests {
         assert_eq!(novelty.epoch, 0);
         assert_eq!(novelty.size, 0);
         assert!(novelty.is_empty());
+    }
+
+    /// apply_commit must be atomic: a graph-routing error part-way through a
+    /// batch must leave novelty completely untouched (t / epoch / size / arena),
+    /// so callers that mutate a cache-shared Novelty in place via Arc::make_mut
+    /// can't poison live state. Regression guard for the clone-elimination work.
+    #[test]
+    fn apply_commit_atomic_on_routing_error() {
+        let mut novelty = Novelty::new(0);
+        novelty
+            .apply_commit(vec![make_flake(1, 1, 1, 1, true)], 1, &no_graphs())
+            .expect("first commit applies");
+        let (t, epoch, size, len) = (novelty.t, novelty.epoch, novelty.size, novelty.store.len());
+
+        // Batch with a good flake followed by one referencing an unknown named
+        // graph: the old in-place code would have bumped t/epoch and pushed the
+        // good flake before erroring on the second.
+        let good = make_flake(2, 2, 2, 2, true);
+        let bad = make_graph_flake(3, 3, 3, 2, Sid::new(9, "g-unknown"));
+        let err = novelty.apply_commit(vec![good, bad], 2, &no_graphs());
+
+        assert!(err.is_err(), "unknown graph Sid must error");
+        assert_eq!(novelty.t, t, "t unchanged after failed apply");
+        assert_eq!(novelty.epoch, epoch, "epoch unchanged after failed apply");
+        assert_eq!(novelty.size, size, "size unchanged after failed apply");
+        assert_eq!(
+            novelty.store.len(),
+            len,
+            "no flakes added after failed apply"
+        );
+
+        // can_apply reports the same routing failure without mutating.
+        assert!(novelty
+            .can_apply(
+                &[make_graph_flake(4, 4, 4, 3, Sid::new(9, "g-unknown"))],
+                &no_graphs()
+            )
+            .is_err());
+        assert_eq!(novelty.store.len(), len, "can_apply does not mutate");
     }
 
     #[test]
@@ -1266,6 +1317,28 @@ mod tests {
     }
 
     #[test]
+    fn test_is_effectively_empty_after_full_clear() {
+        let mut novelty = Novelty::new(0);
+        let rg = no_graphs();
+
+        assert!(novelty.is_effectively_empty());
+
+        novelty
+            .apply_commit(vec![make_flake(1, 1, 100, 1, true)], 1, &rg)
+            .unwrap();
+        assert!(!novelty.is_effectively_empty());
+
+        // Drain everything, as an index swap does (apply_index/apply_loaded_db)
+        novelty.clear_up_to(1);
+
+        // The arena retains dead flakes, so `is_empty()` stays false — pin that
+        // `is_effectively_empty()` sees through it via `size`.
+        assert!(!novelty.is_empty());
+        assert!(novelty.epoch > 0);
+        assert!(novelty.is_effectively_empty());
+    }
+
+    #[test]
     fn test_merge_preserves_order() {
         let mut novelty = Novelty::new(0);
         let rg = no_graphs();
@@ -1499,5 +1572,211 @@ mod tests {
             !same_identity(&with_long, &with_int),
             "datatype is part of identity — must split"
         );
+    }
+
+    // ===== Equivalence / contract harness for the segmented-novelty rewrite =====
+    // Applies random commit sequences (asserts/retracts/reasserts, same (s,p,o,dt)
+    // with different list-index meta, multiple named graphs, comparator ties) and,
+    // after every commit, checks impl-independent invariants (range reads ==
+    // filtered full scan; each order sorted; all four orders hold the same
+    // multiset) plus a golden digest of the full snapshot. The golden digests pin
+    // the exact observable contract so the segmented rewrite must reproduce it.
+    // Uses only the stable public surface (apply_commit / slice_for_range /
+    // get_flake), so it survives the internal rewrite unchanged.
+
+    fn sm64(state: &mut u64) -> u64 {
+        *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = *state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    fn eq_reverse_graph() -> HashMap<Sid, GraphId> {
+        let mut m = HashMap::new();
+        m.insert(Sid::new(8, "g1"), 1u16);
+        m.insert(Sid::new(8, "g2"), 2u16);
+        m
+    }
+
+    // Small value pools force collisions, reasserts, and comparator ties.
+    fn eq_make(rng: &mut u64, t: i64) -> Flake {
+        let s = sm64(rng) % 4;
+        let p = sm64(rng) % 3;
+        let o = (sm64(rng) % 4) as i64;
+        let op = !sm64(rng).is_multiple_of(3); // ~2/3 assert, 1/3 retract
+        let gsel = sm64(rng) % 3; // 0 default, 1 g1, 2 g2
+        let m = if sm64(rng).is_multiple_of(2) {
+            Some(FlakeMeta {
+                lang: None,
+                i: Some((sm64(rng) % 3) as i32),
+            })
+        } else {
+            None
+        };
+        let mut f = Flake::new(
+            Sid::new(1, format!("s{s}")),
+            Sid::new(1, format!("p{p}")),
+            FlakeValue::Long(o),
+            Sid::new(2, "long"),
+            t,
+            op,
+            m,
+        );
+        match gsel {
+            1 => f.g = Some(Sid::new(8, "g1")),
+            2 => f.g = Some(Sid::new(8, "g2")),
+            _ => {}
+        }
+        f
+    }
+
+    fn eq_full(n: &Novelty, g: GraphId, idx: IndexType) -> Vec<FlakeId> {
+        n.slice_for_range(g, idx, None, None, true).to_vec()
+    }
+
+    fn eq_run(seed: u64) -> u64 {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let rg = eq_reverse_graph();
+        let mut rng = seed;
+        let mut n = Novelty::new(0);
+        let mut digest = DefaultHasher::new();
+        const ORDERS: [IndexType; 4] = [
+            IndexType::Spot,
+            IndexType::Psot,
+            IndexType::Post,
+            IndexType::Opst,
+        ];
+
+        for c in 0..40 {
+            let t = c as i64 + 1;
+            let batch_n = 1 + (sm64(&mut rng) % 6) as usize;
+            let batch: Vec<Flake> = (0..batch_n).map(|_| eq_make(&mut rng, t)).collect();
+            // Only routable graphs are used, so apply_commit cannot error here.
+            n.apply_commit(batch, t, &rg).expect("apply_commit");
+
+            for g in 0u16..=2 {
+                // Each order is sorted by its comparator.
+                for idx in ORDERS {
+                    let ids = eq_full(&n, g, idx);
+                    for w in ids.windows(2) {
+                        assert!(
+                            idx.compare(n.get_flake(w[0]), n.get_flake(w[1])) != Ordering::Greater,
+                            "order {idx:?} g{g} not sorted (seed {seed})"
+                        );
+                    }
+                }
+                // All four orders hold the same multiset of flakes.
+                let canon = |idx: IndexType| -> Vec<String> {
+                    let mut v: Vec<String> = eq_full(&n, g, idx)
+                        .iter()
+                        .map(|&id| format!("{:?}", n.get_flake(id)))
+                        .collect();
+                    v.sort();
+                    v
+                };
+                let base = canon(IndexType::Spot);
+                for idx in [IndexType::Psot, IndexType::Post, IndexType::Opst] {
+                    assert_eq!(
+                        base,
+                        canon(idx),
+                        "multiset spot vs {idx:?} g{g} (seed {seed})"
+                    );
+                }
+                // Range reads == filtered full scan, across ALL four orders, with
+                // bounded / first-only / open / empty cases. Exercises every
+                // comparator path the future k-way merge must implement.
+                for idx in ORDERS {
+                    let full = eq_full(&n, g, idx);
+                    // open-ended (leftmost, no rhs) == the full ordered scan
+                    assert_eq!(
+                        n.slice_for_range(g, idx, None, None, true).to_vec(),
+                        full,
+                        "open range != full {idx:?} g{g} (seed {seed})"
+                    );
+                    if full.len() < 2 {
+                        continue;
+                    }
+                    let a = sm64(&mut rng) as usize % full.len();
+                    let b = sm64(&mut rng) as usize % full.len();
+                    let (lo, hi) = (a.min(b), a.max(b));
+                    let first = n.get_flake(full[lo]).clone();
+                    let rhs = n.get_flake(full[hi]).clone();
+                    let scan = |pred: &dyn Fn(&Flake) -> bool| -> Vec<FlakeId> {
+                        full.iter()
+                            .copied()
+                            .filter(|&id| pred(n.get_flake(id)))
+                            .collect()
+                    };
+                    // bounded (first, rhs]
+                    assert_eq!(
+                        n.slice_for_range(g, idx, Some(&first), Some(&rhs), false)
+                            .to_vec(),
+                        scan(&|f| {
+                            idx.compare(f, &first) == Ordering::Greater
+                                && idx.compare(f, &rhs) != Ordering::Greater
+                        }),
+                        "bounded range {idx:?} g{g} (seed {seed})"
+                    );
+                    // first-only (first, end]
+                    assert_eq!(
+                        n.slice_for_range(g, idx, Some(&first), None, false)
+                            .to_vec(),
+                        scan(&|f| idx.compare(f, &first) == Ordering::Greater),
+                        "first-only range {idx:?} g{g} (seed {seed})"
+                    );
+                    // empty/degenerate: first = max, rhs = min
+                    let maxf = n.get_flake(*full.last().unwrap()).clone();
+                    let minf = n.get_flake(full[0]).clone();
+                    assert_eq!(
+                        n.slice_for_range(g, idx, Some(&maxf), Some(&minf), false)
+                            .to_vec(),
+                        scan(&|f| {
+                            idx.compare(f, &maxf) == Ordering::Greater
+                                && idx.compare(f, &minf) != Ordering::Greater
+                        }),
+                        "empty range {idx:?} g{g} (seed {seed})"
+                    );
+                }
+
+                // Fold the full ordered snapshot into the contract digest.
+                for idx in ORDERS {
+                    let ids = eq_full(&n, g, idx);
+                    ids.len().hash(&mut digest);
+                    for id in ids {
+                        format!("{:?}", n.get_flake(id)).hash(&mut digest);
+                    }
+                }
+            }
+        }
+        digest.finish()
+    }
+
+    #[test]
+    fn novelty_equivalence_contract() {
+        const SEEDS: [u64; 6] = [1, 2, 3, 42, 1337, 0xDEAD_BEEF];
+        // Golden digests pin the observable contract; the segmented rewrite must
+        // reproduce these exactly. Regenerate intentionally only when novelty
+        // semantics change on purpose.
+        const EXPECTED: &[u64] = &[
+            17_085_636_203_747_601_083,
+            17_735_258_564_421_583_015,
+            10_042_115_320_558_787_806,
+            10_849_888_332_386_873_009,
+            17_714_828_874_643_605_845,
+            5_823_289_256_863_810_933,
+        ];
+        let mut got = Vec::new();
+        for &s in &SEEDS {
+            let d1 = eq_run(s);
+            let d2 = eq_run(s);
+            assert_eq!(d1, d2, "novelty non-deterministic for seed {s}");
+            got.push(d1);
+        }
+        eprintln!("NOVELTY_EQUIVALENCE_DIGESTS={got:?}");
+        if !EXPECTED.is_empty() {
+            assert_eq!(got.as_slice(), EXPECTED, "novelty contract digest changed");
+        }
     }
 }

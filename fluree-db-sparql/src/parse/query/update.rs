@@ -189,7 +189,13 @@ impl super::Parser<'_> {
         Some(UpdateOperation::Modify(Box::new(modify)))
     }
 
-    /// Parse quad data (ground triples for INSERT DATA / DELETE DATA).
+    /// Parse quad data (ground quads for INSERT DATA / DELETE DATA).
+    ///
+    /// Per SPARQL 1.1 Update §3.1.1, `QuadData` accepts both default-graph
+    /// triples and `GRAPH VarOrIri '{' TriplesTemplate? '}'` blocks
+    /// (`QuadsNotTriples`). Variables — including a variable graph name — are
+    /// syntactically permitted here but rejected by the validator, since DATA
+    /// must be ground.
     fn parse_quad_data(&mut self) -> Option<QuadData> {
         let start = self.stream.current_span();
 
@@ -199,10 +205,20 @@ impl super::Parser<'_> {
             return None;
         }
 
-        // Parse triple patterns (should be ground - no variables, but we validate later)
-        let mut triples = Vec::new();
+        // Parse quad data elements:
+        // - default-graph triples
+        // - GRAPH <iri>|?g { ... } blocks (QuadsNotTriples)
+        let mut quads: Vec<QuadPatternElement> = Vec::new();
         while !self.stream.check(&TokenKind::RBrace) && !self.stream.is_eof() {
-            // Parse subject
+            if self.stream.check_keyword(TokenKind::KwGraph) {
+                let graph = self.parse_quad_pattern_graph_block()?;
+                quads.push(graph);
+                // Optional dot after GRAPH block
+                self.stream.match_token(&TokenKind::Dot);
+                continue;
+            }
+
+            // Default-graph triples
             let subject = match self.parse_subject() {
                 Some(s) => s,
                 None => {
@@ -216,7 +232,11 @@ impl super::Parser<'_> {
             };
 
             // Parse predicate-object list (simple predicates only, no paths)
+            let mut triples: Vec<crate::ast::TriplePattern> = Vec::new();
             self.parse_construct_predicate_object_list(&subject, &mut triples)?;
+            for t in triples {
+                quads.push(QuadPatternElement::Triple(Box::new(t)));
+            }
 
             // Optional dot
             self.stream.match_token(&TokenKind::Dot);
@@ -229,7 +249,7 @@ impl super::Parser<'_> {
         }
 
         let span = start.union(self.stream.previous_span());
-        Some(QuadData::new(triples, span))
+        Some(QuadData::new(quads, span))
     }
 
     /// Parse quad pattern (for DELETE/INSERT templates).

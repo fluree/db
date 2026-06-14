@@ -303,8 +303,10 @@ fn expand_annotated_triples(
 
         // f:reifies* bundle: SUBJECT, PREDICATE, OBJECT, and (for a
         // language-tagged object) LANG. f:reifiesGraph is omitted
-        // (default graph only). f:reifiesDatatype rides on the
-        // f:reifiesObject flake's flake-level dt (the decoder derives
+        // (default graph only) — WITH-scoped templates are rejected
+        // upstream by `reject_with_scoped_annotations` so this default
+        // identity never gets graph-stamped. f:reifiesDatatype rides on
+        // the f:reifiesObject flake's flake-level dt (the decoder derives
         // it), and f:reifiesListIndex is deferred (v1).
         let pred_iri =
             |s: &'static str| -> PredicateTerm { PredicateTerm::Iri(Iri::full(s, span)) };
@@ -496,6 +498,34 @@ fn reject_user_authored_reifies_in_quad_pattern(
     Ok(())
 }
 
+/// Reject RDF 1.2 annotation tails on `WITH <g>`-scoped template triples.
+///
+/// `WITH <g>` re-homes default-position template triples into `<g>` *after*
+/// annotation expansion, but the v1 expansion omits `f:reifiesGraph` — the
+/// synthetic bundle encodes a default-graph edge identity. Stamping the WITH
+/// graph id over that bundle would mint graph-tagged reifications whose edge
+/// identity is still default-graph, so the forward-map lookup misses: the
+/// annotation never hydrates and never cascades on base-edge retract. Reject
+/// until graph-aware expansion (emitting `f:reifiesGraph`) lands. Annotation
+/// tails inside explicit `GRAPH { ... }` blocks are already rejected by
+/// [`expand_annotated_triples_in_quad_pattern`]; this covers the top-level
+/// (WITH-scoped) triples it would otherwise expand as default-graph.
+fn reject_with_scoped_annotations(pattern: &QuadPattern) -> Result<(), LowerError> {
+    for el in &pattern.patterns {
+        if let QuadPatternElement::Triple(tp) = el {
+            if tp.annotation.is_some() {
+                return Err(LowerError::UnsupportedFeature {
+                    feature: "RDF 1.2 annotation tail (`{| ... |}`) on a WITH-scoped \
+                              SPARQL UPDATE template (named-graph edge annotations are \
+                              not yet supported — f:reifiesGraph is omitted in v1)",
+                    span: tp.span,
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Assign stable variable names for SPARQL blank nodes when lowering
 /// triple-template forms like `DELETE WHERE { ... }`.
 ///
@@ -654,7 +684,9 @@ pub fn lower_sparql_update(
 
 /// Lower INSERT DATA operation.
 ///
-/// INSERT DATA contains ground triples (no variables) that are directly inserted.
+/// INSERT DATA contains ground quads (no variables) that are directly inserted.
+/// `GRAPH <iri> { ... }` blocks route their triples into the named graph,
+/// registering it via `graph_delta` (same machinery as DELETE/INSERT ... WHERE).
 fn lower_insert_data(
     data: &QuadData,
     prologue: &Prologue,
@@ -663,16 +695,27 @@ fn lower_insert_data(
     bnodes: &mut BlankNodeCounter,
     opts: TxnOpts,
 ) -> Result<Txn, LowerError> {
-    // M4.4: reject user-authored f:reifies* IRIs and expand any
-    // RDF 1.2 annotation tails into the f:reifies* bundle + body.
-    reject_user_authored_reifies(&data.triples, prologue)?;
-    let mut data_triples = data.triples.clone();
-    expand_annotated_triples(
-        &mut data_triples,
+    // M4.4: reject user-authored f:reifies* IRIs and expand any RDF 1.2
+    // annotation tails before lowering. Route through a QuadPattern so the
+    // same firewall + expansion used by INSERT ... WHERE applies, while
+    // GRAPH blocks still lower into their named graphs.
+    let mut pattern = QuadPattern::new(data.quads.clone(), data.span);
+    reject_user_authored_reifies_in_quad_pattern(&pattern, prologue)?;
+    expand_annotated_triples_in_quad_pattern(
+        &mut pattern,
         AnnotationExpansionMode::InsertData,
         bnodes,
     )?;
-    let insert_templates = lower_triples_to_templates(&data_triples, prologue, ns, vars, bnodes)?;
+    let mut graph_ids = TemplateGraphIds::new();
+    let insert_templates = lower_quad_pattern_to_templates(
+        &pattern.patterns,
+        prologue,
+        ns,
+        vars,
+        bnodes,
+        &mut graph_ids,
+        None,
+    )?;
 
     Ok(Txn {
         txn_type: TxnType::Insert,
@@ -686,14 +729,15 @@ fn lower_insert_data(
         opts,
         vars: mem::take(vars),
         txn_meta: Vec::new(),
-        graph_delta: FxHashMap::default(),
+        graph_delta: graph_ids.delta(),
         namespace_delta: std::collections::HashMap::new(),
     })
 }
 
 /// Lower DELETE DATA operation.
 ///
-/// DELETE DATA contains ground triples (no variables) that are retracted.
+/// DELETE DATA contains ground quads (no variables) that are retracted.
+/// `GRAPH <iri> { ... }` blocks scope the retraction to the named graph.
 /// Uses TxnType::Update because it's a retract-only transaction.
 fn lower_delete_data(
     data: &QuadData,
@@ -705,14 +749,23 @@ fn lower_delete_data(
 ) -> Result<Txn, LowerError> {
     // M4.4: same firewall + expansion as INSERT DATA, with the
     // DELETE DATA blank-node / variable rejections per SPARQL §3.1.3.
-    reject_user_authored_reifies(&data.triples, prologue)?;
-    let mut data_triples = data.triples.clone();
-    expand_annotated_triples(
-        &mut data_triples,
+    let mut pattern = QuadPattern::new(data.quads.clone(), data.span);
+    reject_user_authored_reifies_in_quad_pattern(&pattern, prologue)?;
+    expand_annotated_triples_in_quad_pattern(
+        &mut pattern,
         AnnotationExpansionMode::DeleteData,
         bnodes,
     )?;
-    let delete_templates = lower_triples_to_templates(&data_triples, prologue, ns, vars, bnodes)?;
+    let mut graph_ids = TemplateGraphIds::new();
+    let delete_templates = lower_quad_pattern_to_templates(
+        &pattern.patterns,
+        prologue,
+        ns,
+        vars,
+        bnodes,
+        &mut graph_ids,
+        None,
+    )?;
 
     Ok(Txn {
         txn_type: TxnType::Update,
@@ -726,7 +779,7 @@ fn lower_delete_data(
         opts,
         vars: mem::take(vars),
         txn_meta: Vec::new(),
-        graph_delta: FxHashMap::default(),
+        graph_delta: graph_ids.delta(),
         namespace_delta: std::collections::HashMap::new(),
     })
 }
@@ -881,6 +934,9 @@ fn lower_modify(
     // aren't mistaken for user input.
     let delete_templates = if let Some(delete_clause) = &modify.delete_clause {
         reject_user_authored_reifies_in_quad_pattern(delete_clause, prologue)?;
+        if default_template_graph_id.is_some() {
+            reject_with_scoped_annotations(delete_clause)?;
+        }
         let mut expanded = delete_clause.clone();
         expand_annotated_triples_in_quad_pattern(
             &mut expanded,
@@ -888,7 +944,7 @@ fn lower_modify(
             bnodes,
         )?;
         lower_quad_pattern_to_templates(
-            &expanded,
+            &expanded.patterns,
             prologue,
             ns,
             vars,
@@ -902,6 +958,9 @@ fn lower_modify(
 
     let insert_templates = if let Some(insert_clause) = &modify.insert_clause {
         reject_user_authored_reifies_in_quad_pattern(insert_clause, prologue)?;
+        if default_template_graph_id.is_some() {
+            reject_with_scoped_annotations(insert_clause)?;
+        }
         let mut expanded = insert_clause.clone();
         expand_annotated_triples_in_quad_pattern(
             &mut expanded,
@@ -909,7 +968,7 @@ fn lower_modify(
             bnodes,
         )?;
         lower_quad_pattern_to_templates(
-            &expanded,
+            &expanded.patterns,
             prologue,
             ns,
             vars,
@@ -939,7 +998,7 @@ fn lower_modify(
 }
 
 fn lower_quad_pattern_to_templates(
-    pattern: &QuadPattern,
+    elements: &[QuadPatternElement],
     prologue: &Prologue,
     ns: &mut NamespaceRegistry,
     vars: &mut VarRegistry,
@@ -948,7 +1007,7 @@ fn lower_quad_pattern_to_templates(
     default_graph_id: Option<u16>,
 ) -> Result<Vec<TripleTemplate>, LowerError> {
     let mut out: Vec<TripleTemplate> = Vec::new();
-    for el in &pattern.patterns {
+    for el in elements {
         match el {
             QuadPatternElement::Triple(tp) => {
                 let mut t = lower_triple_to_template(tp, prologue, ns, vars, bnodes)?;
@@ -980,20 +1039,6 @@ fn lower_quad_pattern_to_templates(
         }
     }
     Ok(out)
-}
-
-/// Lower triple patterns to TripleTemplate for DELETE/INSERT templates.
-fn lower_triples_to_templates(
-    triples: &[TriplePattern],
-    prologue: &Prologue,
-    ns: &mut NamespaceRegistry,
-    vars: &mut VarRegistry,
-    bnodes: &mut BlankNodeCounter,
-) -> Result<Vec<TripleTemplate>, LowerError> {
-    triples
-        .iter()
-        .map(|tp| lower_triple_to_template(tp, prologue, ns, vars, bnodes))
-        .collect()
 }
 
 /// Lower a single triple pattern to TripleTemplate.
@@ -1544,6 +1589,58 @@ mod tests {
         assert_eq!(counter.next(), "_:b0");
         assert_eq!(counter.next(), "_:b1");
         assert_eq!(counter.next(), "_:b2");
+    }
+
+    #[test]
+    fn test_lower_insert_data_graph_block_registers_named_graph() {
+        // Issue #1288: INSERT DATA { GRAPH <g> { ... } } must lower into
+        // graph-tagged templates plus a graph_delta registering the named graph.
+        let parsed = fluree_db_sparql::parse_sparql(
+            "INSERT DATA { GRAPH <urn:g1> { <http://example.org/s> <http://example.org/p> \"v\" } }",
+        );
+        assert!(
+            !parsed.has_errors(),
+            "parse errors: {:?}",
+            parsed.diagnostics
+        );
+        let ast = parsed.ast.expect("AST");
+
+        let mut ns = NamespaceRegistry::new();
+        let txn = lower_sparql_update_ast(&ast, &mut ns, TxnOpts::default()).expect("lower");
+
+        assert_eq!(txn.txn_type, TxnType::Insert);
+        assert_eq!(txn.insert_templates.len(), 1);
+        assert!(
+            txn.insert_templates[0].graph_id.is_some(),
+            "template should carry a txn-local graph id"
+        );
+        // The named graph IRI must be registered in graph_delta.
+        assert!(
+            txn.graph_delta.values().any(|iri| iri == "urn:g1"),
+            "graph_delta must register <urn:g1>, got {:?}",
+            txn.graph_delta
+        );
+    }
+
+    #[test]
+    fn test_lower_insert_data_default_graph_has_no_graph_delta() {
+        // A plain INSERT DATA (no GRAPH block) lowers with no named-graph delta.
+        let parsed = fluree_db_sparql::parse_sparql(
+            "INSERT DATA { <http://example.org/s> <http://example.org/p> \"v\" }",
+        );
+        assert!(
+            !parsed.has_errors(),
+            "parse errors: {:?}",
+            parsed.diagnostics
+        );
+        let ast = parsed.ast.expect("AST");
+
+        let mut ns = NamespaceRegistry::new();
+        let txn = lower_sparql_update_ast(&ast, &mut ns, TxnOpts::default()).expect("lower");
+
+        assert_eq!(txn.insert_templates.len(), 1);
+        assert!(txn.insert_templates[0].graph_id.is_none());
+        assert!(txn.graph_delta.is_empty());
     }
 
     #[test]

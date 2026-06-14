@@ -430,6 +430,10 @@ pub struct ServerConfig {
     #[arg(long, env = "FLUREE_BODY_LIMIT", default_value_t = server_defaults::DEFAULT_BODY_LIMIT)]
     pub body_limit: usize,
 
+    /// Query execution timeout in milliseconds (default 15 minutes, 0 disables)
+    #[arg(long, env = "FLUREE_QUERY_TIMEOUT_MS", default_value_t = server_defaults::DEFAULT_QUERY_TIMEOUT_MS)]
+    pub query_timeout_ms: u64,
+
     /// Log level (trace, debug, info, warn, error)
     #[arg(long, env = "FLUREE_LOG_LEVEL", default_value = server_defaults::DEFAULT_LOG_LEVEL)]
     pub log_level: String,
@@ -629,6 +633,14 @@ pub struct ServerConfig {
     )]
     pub mcp_agent_json_max_bytes: usize,
 
+    /// Query execution timeout for MCP `sparql_query` in milliseconds (default 5 minutes, 0 disables timeout).
+    #[arg(
+        long,
+        env = "FLUREE_MCP_QUERY_TIMEOUT_MS",
+        default_value_t = server_defaults::DEFAULT_MCP_QUERY_TIMEOUT_MS
+    )]
+    pub mcp_query_timeout_ms: u64,
+
     // === Admin endpoint authentication options ===
     /// Authentication mode for admin endpoints (/fluree/create, /fluree/drop)
     #[arg(
@@ -666,6 +678,7 @@ impl Default for ServerConfig {
             reindex_max_bytes: None,
             cache_max_mb: None,
             body_limit: server_defaults::DEFAULT_BODY_LIMIT,
+            query_timeout_ms: server_defaults::DEFAULT_QUERY_TIMEOUT_MS,
             log_level: server_defaults::DEFAULT_LOG_LEVEL.to_string(),
             events_auth_mode: EventsAuthMode::None,
             events_auth_audience: None,
@@ -709,6 +722,7 @@ impl Default for ServerConfig {
             mcp_auth_trusted_issuers: Vec::new(),
             mcp_auth_insecure_accept_any_issuer: false,
             mcp_agent_json_max_bytes: server_defaults::DEFAULT_MCP_AGENT_JSON_MAX_BYTES,
+            mcp_query_timeout_ms: server_defaults::DEFAULT_MCP_QUERY_TIMEOUT_MS,
             // Admin auth defaults
             admin_auth_mode: AdminAuthMode::None,
             admin_auth_trusted_issuers: Vec::new(),

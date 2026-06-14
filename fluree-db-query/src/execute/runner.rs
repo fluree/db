@@ -18,7 +18,7 @@ use crate::stats_cache::cached_stats_view_for_db;
 use crate::var_registry::VarRegistry;
 use fluree_db_binary_index::BinaryIndexStore;
 use fluree_db_core::dict_novelty::DictNovelty;
-use fluree_db_core::{GraphDbRef, GraphId, LedgerSnapshot, Tracker};
+use fluree_db_core::{GraphDbRef, GraphId, LedgerSnapshot, QueryCancellation, Tracker};
 use fluree_db_reasoner::DerivedFactsOverlay;
 use fluree_db_spatial::SpatialIndexProvider;
 use std::collections::HashMap;
@@ -27,9 +27,7 @@ use std::time::Instant;
 use tracing::Instrument;
 
 use super::operator_tree::build_operator_tree;
-use super::reasoning_prep::{
-    compute_derived_facts, effective_reasoning_modes, schema_hierarchy_with_overlay,
-};
+use super::reasoning_prep::{compute_derived_facts, schema_hierarchy_with_overlay};
 use super::rewrite_glue::rewrite_query_patterns;
 
 /// Remove exact duplicate triple patterns inside conjunctive blocks.
@@ -120,6 +118,10 @@ pub struct PreparedExecution {
     pub operator: BoxedOperator,
     /// Derived facts overlay (kept alive during execution)
     pub derived_overlay: Option<Arc<DerivedFactsOverlay>>,
+    /// OWL2-RL materialization diagnostics (when OWL2-RL ran). Recorded into
+    /// the request tracker by [`execute_prepared`] so a capped (incomplete)
+    /// closure surfaces in response metadata.
+    pub reasoning_diagnostics: Option<fluree_db_reasoner::ReasoningDiagnostics>,
 }
 
 /// Inputs that the preparation phase needs to know up front.
@@ -232,22 +234,33 @@ pub async fn prepare_execution_with_config(
             .as_ref()
             .map(|o| o as &dyn fluree_db_core::OverlayProvider)
             .unwrap_or(db.overlay);
-        let (hierarchy, reasoning, derived_overlay, ontology) = async {
-            // Step 1: Compute schema hierarchy from overlay
-            let hierarchy = schema_hierarchy_with_overlay(db.snapshot, effective_overlay, db.t);
-
-            // Step 2: Determine effective reasoning modes
-            let reasoning = effective_reasoning_modes(&query.reasoning.modes, hierarchy.is_some());
-
-            if reasoning.rdfs || reasoning.owl2ql || reasoning.owl2rl || reasoning.datalog {
-                tracing::debug!(
-                    rdfs = reasoning.rdfs,
-                    owl2ql = reasoning.owl2ql,
-                    owl2rl = reasoning.owl2rl,
-                    datalog = reasoning.datalog,
-                    "reasoning enabled"
-                );
+        let (hierarchy, reasoning, derived_outcome, ontology) = async {
+            // Reasoning is opt-in: a query (or view/ledger-config default) must
+            // explicitly request a mode. Without one, skip reasoning prep
+            // entirely — including the schema-hierarchy range scans, which are
+            // pure overhead for plain-semantics queries.
+            let reasoning = query.reasoning.modes.clone();
+            if !reasoning.has_any_enabled() {
+                return Ok::<_, crate::error::QueryError>((
+                    None,
+                    reasoning,
+                    super::reasoning_prep::DerivedFactsOutcome::default(),
+                    None,
+                ));
             }
+
+            // Step 1: Compute schema hierarchy from overlay
+            let hierarchy =
+                schema_hierarchy_with_overlay(db.snapshot, effective_overlay, db.t).await?;
+
+            tracing::debug!(
+                rdfs = reasoning.rdfs,
+                owl2ql = reasoning.owl2ql,
+                owl2rl = reasoning.owl2rl,
+                datalog = reasoning.datalog,
+                hierarchy_available = hierarchy.is_some(),
+                "reasoning enabled"
+            );
 
             // Step 3: Compute derived facts from OWL2-RL and/or datalog rules
             //
@@ -256,7 +269,7 @@ pub async fn prepare_execution_with_config(
             // axioms (e.g. `?p a owl:TransitiveProperty`) from the import
             // closure are visible when scanning g_id=0, and base-overlay
             // novelty remains visible for other graphs.
-            let derived_overlay = compute_derived_facts(
+            let derived_outcome = compute_derived_facts(
                 db.snapshot,
                 db.g_id,
                 effective_overlay,
@@ -267,7 +280,8 @@ pub async fn prepare_execution_with_config(
             .await;
 
             // Step 4: Build ontology for OWL2-QL mode (if enabled)
-            let reasoning_overlay_for_ontology: Option<ReasoningOverlay<'_>> = derived_overlay
+            let reasoning_overlay_for_ontology: Option<ReasoningOverlay<'_>> = derived_outcome
+                .overlay
                 .as_ref()
                 .map(|derived| ReasoningOverlay::new(effective_overlay, derived.clone()));
 
@@ -290,7 +304,7 @@ pub async fn prepare_execution_with_config(
                 None
             };
 
-            Ok::<_, crate::error::QueryError>((hierarchy, reasoning, derived_overlay, ontology))
+            Ok::<_, crate::error::QueryError>((hierarchy, reasoning, derived_outcome, ontology))
         }
         .instrument(reasoning_span)
         .await?;
@@ -416,7 +430,8 @@ pub async fn prepare_execution_with_config(
 
         Ok(PreparedExecution {
             operator,
-            derived_overlay,
+            derived_overlay: derived_outcome.overlay,
+            reasoning_diagnostics: derived_outcome.diagnostics,
         })
     }
     .instrument(span)
@@ -457,11 +472,13 @@ pub async fn run_operator(
 
         span.record("from_t", ctx.from_t);
 
+        ctx.check_cancelled()?;
         let open_start = Instant::now();
         operator
             .open(ctx)
             .instrument(tracing::debug_span!("operator_open"))
             .await?;
+        ctx.check_cancelled()?;
         span.record(
             "open_ms",
             (open_start.elapsed().as_secs_f64() * 1000.0) as u64,
@@ -473,8 +490,10 @@ pub async fn run_operator(
         let mut max_batch_ms: u64 = 0;
         let run_start = Instant::now();
         while {
+            ctx.check_cancelled()?;
             let batch_start = Instant::now();
             let next = operator.next_batch(ctx).await?;
+            ctx.check_cancelled()?;
             let batch_ms = (batch_start.elapsed().as_secs_f64() * 1000.0) as u64;
             if batch_ms > max_batch_ms {
                 max_batch_ms = batch_ms;
@@ -522,6 +541,8 @@ pub async fn run_operator(
 /// This is the unified knob for all query execution paths.
 pub struct ContextConfig<'a, 'b> {
     pub tracker: Option<&'a Tracker>,
+    /// Cooperative cancellation handle for execution.
+    pub cancellation: Option<QueryCancellation>,
     /// Policy enforcer for async policy evaluation with full f:query support.
     ///
     /// When set, scan operators will use per-leaf batch filtering via `filter_flakes`.
@@ -577,6 +598,7 @@ impl Default for ContextConfig<'_, '_> {
     fn default() -> Self {
         Self {
             tracker: None,
+            cancellation: None,
             policy_enforcer: None,
             dataset: None,
             r2rml: None,
@@ -606,6 +628,18 @@ pub async fn execute_prepared<'a, 'b>(
     prepared: PreparedExecution,
     config: ContextConfig<'a, 'b>,
 ) -> Result<Vec<Batch>> {
+    // Surface the OWL2-RL materialization outcome in request tracking so a
+    // capped (incomplete) closure is visible to clients, not just in logs.
+    if let (Some(diag), Some(tracker)) = (&prepared.reasoning_diagnostics, config.tracker) {
+        tracker.record_reasoning(fluree_db_core::ReasoningTally {
+            capped: diag.capped,
+            capped_reason: diag.capped_reason.clone(),
+            derived_facts: diag.facts_derived as u64,
+            iterations: diag.iterations as u64,
+            duration_ms: diag.duration.as_millis() as u64,
+        });
+    }
+
     let reasoning_overlay: Option<ReasoningOverlay<'a>> = prepared
         .derived_overlay
         .as_ref()
@@ -634,12 +668,26 @@ pub async fn execute_prepared<'a, 'b>(
     {
         ctx = ctx.with_runtime_small_dicts(runtime_small_dicts);
     }
-    if db.eager {
+    // Reasoning derived facts live in the overlay as decoded `Binding::Sid`
+    // (they have no binary-store `s_id`). A binary scan otherwise late-
+    // materializes base rows to `Binding::EncodedSid` whenever it believes the
+    // store is authoritative for decoding — which it does when the effective
+    // overlay reports epoch 0 (e.g. a fully-indexed ledger with no novelty, so
+    // the base overlay epoch is 0 and the combined reasoning epoch is too).
+    // `EncodedSid` and `Sid` are defined to never compare equal, so a join
+    // between a base row and a derived fact about the same entity silently
+    // yields nothing. Force eager materialization whenever reasoning produced
+    // derived facts so every scan emits decoded `Sid`, keeping base and derived
+    // bindings comparable on join keys.
+    if db.eager || prepared.derived_overlay.is_some() {
         ctx = ctx.with_eager_materialization();
     }
 
     if let Some(tracker) = config.tracker {
         ctx = ctx.with_tracker(tracker.clone());
+    }
+    if let Some(cancellation) = config.cancellation {
+        ctx = ctx.with_cancellation(cancellation);
     }
     if let Some(enforcer) = config.policy_enforcer {
         ctx = ctx.with_policy_enforcer(enforcer);

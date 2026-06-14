@@ -172,7 +172,7 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub config: Option<PathBuf>,
 
-    /// Memory budget in MB for bulk import (0 = auto: 60% of system RAM).
+    /// Memory budget in MB for bulk import (0 = auto: 80% of system RAM).
     /// Derives chunk size, concurrency limits, and run budget when not set explicitly.
     #[arg(long, global = true, default_value_t = 0)]
     pub memory_budget_mb: usize,
@@ -208,8 +208,9 @@ pub enum Commands {
         ledger: String,
 
         /// Import data from a file or directory.
-        /// Accepts a single .ttl, .nt, .nq, .json, or .jsonld file, or a directory
-        /// of .ttl/.nt/.nq/.trig or .jsonld files (bulk import, bypasses novelty).
+        /// Accepts a single .ttl, .nt, .nq, .json, .jsonld, or .jsonl/.ndjson
+        /// file, or a directory of .ttl/.nt/.nq/.trig, .jsonld, or
+        /// .jsonl/.ndjson files (bulk import, bypasses novelty).
         /// Any of these may carry a `.gz` or `.zst` suffix and is decoded
         /// transparently (e.g. `data.ttl.gz`, `dump.nq.zst`).
         /// Files in a directory are processed in lexicographic order.
@@ -232,7 +233,7 @@ pub enum Commands {
         #[arg(long, default_value_t = 0)]
         chunk_size_mb: usize,
 
-        /// Memory budget in MB for bulk import (0 = auto: 60% of system RAM).
+        /// Memory budget in MB for bulk import (0 = auto: 80% of system RAM).
         /// Derives chunk size, concurrency limits, and run budget when not set explicitly.
         #[arg(long, default_value_t = 0)]
         memory_budget_mb: usize,

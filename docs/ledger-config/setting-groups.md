@@ -127,9 +127,23 @@ Controls OWL/RDFS reasoning applied at query time.
 |-------|------|---------|-------------|
 | `f:reasoningModes` | IRI or list | (none) | Reasoning modes: `f:RDFS`, `f:OWL2QL`, `f:OWL2RL`, `f:Datalog` |
 | `f:schemaSource` | `f:GraphRef` | (none) | Graph containing schema triples (`rdfs:subClassOf`, etc.) |
+| `f:reasoningMaxFacts` | integer | 1,000,000 | OWL2-RL materialization budget: max derived facts before the closure is capped |
+| `f:reasoningMaxSeconds` | integer | 30 | OWL2-RL materialization budget: max wall-clock seconds before the closure is capped |
 | `f:overrideControl` | IRI or object | `f:OverrideAll` | Override gating |
 
-`f:schemaSource` is non-overridable. `f:reasoningModes` is overridable.
+`f:schemaSource` is non-overridable. `f:reasoningModes` and the budget fields
+are overridable.
+
+The budget fields are a **correctness control**: a capped materialization is
+an incomplete closure, so reasoning queries may silently miss entailments.
+A capped run surfaces in tracked query responses as a `reasoning` block with
+`"capped": true` (and in the `x-fdb-reasoning` response header). The budget
+can be configured without `f:reasoningModes` — it then governs queries that
+request reasoning themselves. Queries may supply their own budget via the
+`"reasoningBudget"` key (JSON-LD) or `# PRAGMA reasoning-max-facts:` /
+`# PRAGMA reasoning-max-seconds:` (SPARQL), subject to `f:overrideControl`.
+Server-wide defaults come from `FLUREE_REASONING_MAX_FACTS` /
+`FLUREE_REASONING_MAX_SECONDS` (lowest precedence above the built-ins).
 
 ### Example
 

@@ -36,6 +36,7 @@
 //! ```
 
 pub mod cache;
+pub mod compile;
 pub mod datalog;
 pub mod error;
 pub mod execute;
@@ -52,6 +53,7 @@ pub mod types;
 pub use cache::{
     ReasoningBudget, ReasoningCache, ReasoningCacheKey, ReasoningDiagnostics, ReasoningResult,
 };
+pub use compile::{compile, ClassRuleKind, CompiledRules, PropertyRuleKind};
 pub use datalog::{
     execute_rule_with_bindings, instantiate_pattern, BindingValue, Bindings, CompareOp,
     DatalogRule, DatalogRuleSet, RuleFilter, RuleTerm, RuleTriplePattern, RuleValue,
@@ -66,21 +68,81 @@ pub use same_as::{FrozenSameAs, SameAsTracker};
 
 use fluree_db_core::GraphDbRef;
 use std::sync::Arc;
-pub use types::{ChainElement, PropertyChain, PropertyExpression, ReasoningModes};
+pub use types::{ChainElement, PropertyChain, PropertyExpression};
 
 /// Options for OWL2-RL reasoning
 #[derive(Clone, Debug, Default)]
 pub struct ReasoningOptions {
     /// Budget constraints for materialization
     pub budget: ReasoningBudget,
-    /// Which RL rules to enable (empty = all)
+    /// Which RL rules to enable (empty = all).
+    ///
+    /// Names are the W3C OWL2-RL rule identifiers used in
+    /// [`ReasoningDiagnostics::rules_fired`]: `prp-symp`, `prp-trp`, `prp-inv`,
+    /// `prp-dom`, `prp-rng`, `prp-spo1`, `prp-spo2`, `prp-fp`, `prp-ifp`,
+    /// `prp-key`, `cax-sco`, `cax-eqc`, `cls-hv1`, `cls-hv2`, `cls-svf1`,
+    /// `cls-avf`, `cls-int1`, `cls-int2`, `cls-uni`, `cls-oo`, `cls-maxc2`,
+    /// `cls-maxqc`.
+    ///
+    /// Where one implementation covers several spec rules, the spec IDs are
+    /// accepted as aliases: `cax-eqc1`/`cax-eqc2` for `cax-eqc`, and
+    /// `cls-maxqc3`/`cls-maxqc4` for `cls-maxqc`.
+    ///
+    /// `owl:sameAs` equality processing (`eq-*`) is canonicalization
+    /// infrastructure and always runs.
     pub enabled_rules: Vec<String>,
 }
+
+/// All rule identifiers accepted in [`ReasoningOptions::enabled_rules`]: the
+/// implemented W3C OWL2-RL rule IDs plus the spec-ID aliases documented there.
+pub const KNOWN_RULE_NAMES: &[&str] = &[
+    "prp-symp",
+    "prp-trp",
+    "prp-inv",
+    "prp-dom",
+    "prp-rng",
+    "prp-spo1",
+    "prp-spo2",
+    "prp-fp",
+    "prp-ifp",
+    "prp-key",
+    "cax-sco",
+    "cax-eqc",
+    "cax-eqc1",
+    "cax-eqc2",
+    "cls-hv1",
+    "cls-hv2",
+    "cls-svf1",
+    "cls-avf",
+    "cls-int1",
+    "cls-int2",
+    "cls-uni",
+    "cls-oo",
+    "cls-maxc2",
+    "cls-maxqc",
+    "cls-maxqc3",
+    "cls-maxqc4",
+];
 
 impl ReasoningOptions {
     /// Create options with default budget and all rules enabled
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Reject unknown names in `enabled_rules`.
+    ///
+    /// The rule gates do plain string matching, so a misspelled name would
+    /// otherwise match nothing and silently disable the intended rule.
+    pub fn validate(&self) -> Result<()> {
+        if let Some(unknown) = self
+            .enabled_rules
+            .iter()
+            .find(|r| !KNOWN_RULE_NAMES.contains(&r.as_str()))
+        {
+            return Err(ReasonerError::UnknownRule(unknown.clone()));
+        }
+        Ok(())
     }
 
     /// Create options with custom budget
@@ -89,6 +151,25 @@ impl ReasoningOptions {
             budget,
             enabled_rules: Vec::new(),
         }
+    }
+
+    /// Whether a rule (by W3C OWL2-RL identifier) should run.
+    ///
+    /// An empty `enabled_rules` list enables every rule.
+    pub fn rule_enabled(&self, name: &str) -> bool {
+        self.rule_enabled_any(&[name])
+    }
+
+    /// Whether a rule known under any of the given identifiers should run.
+    ///
+    /// Used for gates whose single implementation covers several spec rules
+    /// (e.g. `cax-eqc` implements `cax-eqc1` and `cax-eqc2`).
+    pub fn rule_enabled_any(&self, names: &[&str]) -> bool {
+        self.enabled_rules.is_empty()
+            || self
+                .enabled_rules
+                .iter()
+                .any(|r| names.iter().any(|n| r == n))
     }
 
     /// Compute a hash for cache key purposes
@@ -128,6 +209,8 @@ pub async fn reason_owl2rl(
     opts: &ReasoningOptions,
     cache: &ReasoningCache,
 ) -> Result<Arc<ReasoningResult>> {
+    opts.validate()?;
+
     // Get ontology epoch from schema (or 0 if no schema)
     let ontology_epoch = db.snapshot.schema_epoch().unwrap_or(0);
 
@@ -138,7 +221,6 @@ pub async fn reason_owl2rl(
         to_t: db.t,
         overlay_epoch: db.overlay.epoch(),
         ontology_epoch,
-        reasoning_modes: ReasoningModes::default(),
         rule_config_hash: opts.config_hash(),
     };
 
@@ -148,7 +230,7 @@ pub async fn reason_owl2rl(
     }
 
     // Run fixpoint reasoning
-    let (derived_flakes, same_as, diagnostics) = fixpoint::run_fixpoint(db, &opts.budget).await?;
+    let (derived_flakes, same_as, diagnostics) = fixpoint::run_fixpoint(db, opts).await?;
 
     // Build the derived facts overlay
     let mut builder = DerivedFactsBuilder::with_capacity(derived_flakes.len());
@@ -173,6 +255,20 @@ mod tests {
     fn test_reasoning_options_default() {
         let opts = ReasoningOptions::default();
         assert!(opts.enabled_rules.is_empty());
+    }
+
+    #[test]
+    fn test_validate_rejects_unknown_rule_name() {
+        let mut opts = ReasoningOptions::default();
+        assert!(opts.validate().is_ok());
+
+        opts.enabled_rules = vec!["prp-spo1".to_string(), "cax-eqc2".to_string()];
+        assert!(opts.validate().is_ok());
+
+        opts.enabled_rules.push("prp-sop1".to_string()); // typo
+        let err = opts.validate().unwrap_err();
+        assert!(matches!(err, ReasonerError::UnknownRule(ref n) if n == "prp-sop1"));
+        assert!(err.to_string().contains("prp-spo1"));
     }
 
     #[test]

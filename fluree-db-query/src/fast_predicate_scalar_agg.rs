@@ -351,6 +351,20 @@ fn scan_predicate_scalar_agg(
         return Ok(Some(empty_result(kind)));
     };
 
+    // COUNT(DISTINCT ?o): metadata-only POST lead-group walk (directory
+    // reads, every object type). The per-row scan below remains the fallback
+    // for leaves that predate `lead_group_count` and handles IRI refs only.
+    if matches!(kind, ScalarAggKind::CountDistinctObject) {
+        if let Some(distinct) =
+            crate::fast_count::count_distinct_objects_for_predicate(store, g_id, p_id)?
+        {
+            return Ok(Some(AggOutput::Integer(count_to_i64(
+                distinct,
+                "COUNT(DISTINCT)",
+            )?)));
+        }
+    }
+
     let leaves = leaf_entries_for_predicate(store, g_id, RunSortOrder::Post, p_id);
     let mut state = AggState::new(kind);
 

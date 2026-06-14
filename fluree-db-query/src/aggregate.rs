@@ -57,6 +57,10 @@ pub struct AggregateOperator {
     child_col_count: usize,
     /// Variables required by downstream operators; if set, output is trimmed.
     out_schema: Option<Arc<[VarId]>>,
+    /// Graph view for materializing encoded bindings before value-folding
+    /// aggregates (GROUP_CONCAT/MEDIAN/VARIANCE/STDDEV) — their matchers
+    /// silently drop encoded values.
+    graph_view: Option<fluree_db_binary_index::BinaryGraphView>,
 }
 
 impl AggregateOperator {
@@ -133,6 +137,7 @@ impl AggregateOperator {
             group_size_col,
             child_col_count,
             out_schema: None,
+            graph_view: None,
         }
     }
 
@@ -155,6 +160,9 @@ impl Operator for AggregateOperator {
     async fn open(&mut self, ctx: &ExecutionContext<'_>) -> Result<()> {
         self.child.open(ctx).await?;
         self.state = OperatorState::Open;
+        if self.graph_view.is_none() {
+            self.graph_view = ctx.graph_view();
+        }
         Ok(())
     }
 
@@ -189,9 +197,11 @@ impl Operator for AggregateOperator {
 
             let num_cols = self.in_schema.len();
             let mut output_columns: Vec<Vec<Binding>> = Vec::with_capacity(num_cols);
+            ctx.check_cancelled()?;
 
             // Process child columns (regular aggregates and pass-through)
             for col_idx in 0..self.child_col_count {
+                ctx.check_cancelled()?;
                 let mut col_output = Vec::with_capacity(batch.len());
 
                 for row_idx in 0..batch.len() {
@@ -201,7 +211,7 @@ impl Operator for AggregateOperator {
                         Some(agg_idx) => {
                             // This column needs aggregation
                             let spec = &self.aggregates[agg_idx];
-                            spec.function.apply(input_binding)
+                            apply_aggregate(&spec.function, input_binding, self.graph_view.as_ref())
                         }
                         None => {
                             // Pass through unchanged
@@ -214,17 +224,23 @@ impl Operator for AggregateOperator {
 
                 output_columns.push(col_output);
             }
+            ctx.check_cancelled()?;
 
             if !self.extra_specs.is_empty() {
                 let mut group_sizes: Option<Vec<i64>> = None;
 
                 for (agg_idx, input_col, _output_col_idx) in &self.extra_specs {
+                    ctx.check_cancelled()?;
                     let spec = &self.aggregates[*agg_idx];
                     let col_output: Vec<Binding> = match input_col {
                         Some(col_idx) => (0..batch.len())
                             .map(|row_idx| {
                                 let input_binding = batch.get_by_col(row_idx, *col_idx);
-                                spec.function.apply(input_binding)
+                                apply_aggregate(
+                                    &spec.function,
+                                    input_binding,
+                                    self.graph_view.as_ref(),
+                                )
                             })
                             .collect(),
                         None => {
@@ -258,6 +274,7 @@ impl Operator for AggregateOperator {
                     output_columns.push(col_output);
                 }
             }
+            ctx.check_cancelled()?;
 
             let out = Batch::new(self.in_schema.clone(), output_columns)?;
             span.record("ms", (start.elapsed().as_secs_f64() * 1000.0) as u64);
@@ -275,6 +292,44 @@ impl Operator for AggregateOperator {
     fn estimated_rows(&self) -> Option<usize> {
         self.child.estimated_rows()
     }
+}
+
+/// Apply an aggregate, first materializing encoded bindings for the variants
+/// that need decoded values:
+/// - GROUP_CONCAT/MEDIAN/VARIANCE/STDDEV matchers silently drop encoded
+///   bindings (GROUP_CONCAT returned Unbound for every indexed-ledger string)
+/// - MIN/MAX compare via `compare_bindings`, which orders encoded bindings by
+///   raw dictionary ID — not value order (`min="zebra"`, `max="apple"`)
+///
+/// Count variants and the numeric accumulator handle encoded bindings
+/// natively, so they skip the decode.
+fn apply_aggregate(
+    func: &AggregateFn,
+    binding: &Binding,
+    gv: Option<&fluree_db_binary_index::BinaryGraphView>,
+) -> Binding {
+    let needs_decoded_values = matches!(
+        func,
+        AggregateFn::GroupConcat { .. }
+            | AggregateFn::Median { .. }
+            | AggregateFn::Variance { .. }
+            | AggregateFn::Stddev { .. }
+            | AggregateFn::Min(_)
+            | AggregateFn::Max(_)
+            // COUNT(DISTINCT) dedups structurally; mixed-representation
+            // Grouped values (scan ∪ VALUES/BIND) would overcount.
+            | AggregateFn::CountDistinct(_)
+    );
+    if needs_decoded_values && gv.is_some() {
+        if let Binding::Grouped(values) = binding {
+            let decoded: Vec<Binding> = values
+                .iter()
+                .map(|b| crate::group_aggregate::materialize_encoded(b, gv))
+                .collect();
+            return func.apply(&Binding::Grouped(decoded));
+        }
+    }
+    func.apply(binding)
 }
 
 impl AggregateFn {

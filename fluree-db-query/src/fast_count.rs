@@ -11,9 +11,9 @@ use crate::error::{QueryError, Result};
 use crate::fast_path_common::{
     allow_cursor_fast_path, build_count_batch, count_predicate_overlay_delta,
     count_rows_for_predicate_psot, count_to_i64, fast_path_store, leaf_entries_for_predicate,
-    normalize_pred_sid, parallel_leaf_chunk_count, parallel_overlay_psot_filter_count,
-    projection_okey_only, projection_otype_only, projection_sid_only, projection_sid_otype_okey,
-    FastPathOperator,
+    normalize_pred_sid, parallel_leaf_chunk_count, parallel_leaf_chunk_reduce,
+    parallel_overlay_psot_filter_count, projection_okey_only, projection_otype_only,
+    projection_sid_only, projection_sid_otype_okey, FastPathOperator,
 };
 use crate::ir::triple::{Ref, TriplePattern};
 use crate::operator::inline::InlineOperator;
@@ -27,7 +27,7 @@ use fluree_db_binary_index::format::run_record_v2::{
 use fluree_db_binary_index::BinaryIndexStore;
 use fluree_db_core::o_type::OType;
 use fluree_db_core::subject_id::SubjectId;
-use fluree_db_core::value_id::ObjKey;
+use fluree_db_core::value_id::{ObjKey, ValueTypeTag};
 use fluree_db_core::{FlakeValue, GraphId};
 use fluree_vocab::namespaces;
 use std::sync::Arc;
@@ -1001,10 +1001,24 @@ fn distinct_predicates_from_graph_stats(ctx: &ExecutionContext<'_>) -> Option<u6
     Some(g.properties.iter().filter(|p| p.count > 0).count() as u64)
 }
 
+/// Per-chunk partial for the distinct-lead count: groups counted within the
+/// chunk (internal leaflet seams already deduplicated) plus the lead key
+/// prefixes of the chunk's first and last non-empty leaflets, so adjacent
+/// chunks can dedup a lead group spanning their seam. Empty leads ⇔ the chunk
+/// had no non-empty leaflets (identity for the combine).
+struct LeadGroupPartial {
+    count: u64,
+    first_lead: Vec<u8>,
+    last_lead: Vec<u8>,
+}
+
 /// Count distinct lead groups across all leaflets in a given sort order.
 ///
 /// Uses `lead_group_count` from leaflet directory entries, deduplicating groups
-/// that span leaflet boundaries by comparing lead key prefixes.
+/// that span leaflet boundaries by comparing lead key prefixes. Reads only leaf
+/// directories (no column payload) and parallelizes over contiguous leaf chunks
+/// via [`parallel_leaf_chunk_reduce`], stitching chunk seams exactly like the
+/// internal leaflet seams.
 ///
 /// `lead_len` is the number of leading key bytes that define the grouping:
 /// - SPOT distinct subjects: 8 bytes (s_id)
@@ -1019,37 +1033,198 @@ fn count_distinct_lead_groups(
         return Ok(0);
     };
 
-    let mut prev_lead_last: Vec<u8> = Vec::new();
-    let mut total: u64 = 0;
+    let map = |chunk: &[LeafEntry]| -> Result<Option<LeadGroupPartial>> {
+        let mut partial = LeadGroupPartial {
+            count: 0,
+            first_lead: Vec::new(),
+            last_lead: Vec::new(),
+        };
+        for leaf_entry in chunk {
+            let dir = store
+                .open_leaf_dir(&leaf_entry.leaf_cid)
+                .map_err(|e| QueryError::Internal(format!("leaf dir open: {e}")))?;
 
-    for leaf_entry in &branch.leaves {
-        let handle = store
-            .open_leaf_handle(&leaf_entry.leaf_cid, leaf_entry.sidecar_cid.as_ref(), false)
-            .map_err(|e| QueryError::Internal(format!("leaf open: {e}")))?;
-        let dir = handle.dir();
+            for entry in &dir.entries {
+                if entry.row_count == 0 || entry.lead_group_count == 0 {
+                    continue;
+                }
 
-        for entry in &dir.entries {
-            if entry.row_count == 0 || entry.lead_group_count == 0 {
-                continue;
+                let lead_first = entry.first_key.get(..lead_len).ok_or_else(|| {
+                    QueryError::execution("leaflet key shorter than expected lead_len")
+                })?;
+                let lead_last = entry.last_key.get(..lead_len).ok_or_else(|| {
+                    QueryError::execution("leaflet key shorter than expected lead_len")
+                })?;
+
+                partial.count += u64::from(entry.lead_group_count);
+                if !partial.last_lead.is_empty() && partial.last_lead == lead_first {
+                    partial.count = partial.count.saturating_sub(1);
+                }
+                if partial.first_lead.is_empty() {
+                    partial.first_lead.extend_from_slice(lead_first);
+                }
+                partial.last_lead.clear();
+                partial.last_lead.extend_from_slice(lead_last);
             }
-
-            let lead_first = entry.first_key.get(..lead_len).ok_or_else(|| {
-                QueryError::execution("leaflet key shorter than expected lead_len")
-            })?;
-            let lead_last = entry.last_key.get(..lead_len).ok_or_else(|| {
-                QueryError::execution("leaflet key shorter than expected lead_len")
-            })?;
-
-            total += u64::from(entry.lead_group_count);
-            if !prev_lead_last.is_empty() && prev_lead_last == lead_first {
-                total = total.saturating_sub(1);
-            }
-            prev_lead_last.clear();
-            prev_lead_last.extend_from_slice(lead_last);
         }
+        Ok(Some(partial))
+    };
+
+    let combine = |left: LeadGroupPartial, right: LeadGroupPartial| -> LeadGroupPartial {
+        if right.first_lead.is_empty() {
+            return left;
+        }
+        if left.first_lead.is_empty() {
+            return right;
+        }
+        let seam_dedup = u64::from(left.last_lead == right.first_lead);
+        LeadGroupPartial {
+            count: left
+                .count
+                .saturating_add(right.count)
+                .saturating_sub(seam_dedup),
+            first_lead: left.first_lead,
+            last_lead: right.last_lead,
+        }
+    };
+
+    let parallel = branch.leaves.len() >= crate::fast_path_common::parallel_dir_walk_min_leaves();
+    let result = parallel_leaf_chunk_reduce(&branch.leaves, parallel, map, combine)?;
+    Ok(result.map_or(0, |p| p.count))
+}
+
+/// Per-chunk partial for the per-predicate distinct-object count: the same
+/// seam stitching as [`LeadGroupPartial`], plus an `unsupported` flag for
+/// non-empty leaflets that predate `lead_group_count`.
+struct PredicateLeadPartial {
+    count: u64,
+    first_lead: Vec<u8>,
+    last_lead: Vec<u8>,
+    unsupported: bool,
+}
+
+/// Count distinct objects `(o_type, o_key)` for one predicate from POST
+/// leaflet directories only.
+///
+/// POST keys are `p_id(4) + o_type(2) + o_key(8) + o_i(4) + s_id(8)` and POST
+/// `lead_group_count` counts distinct `(o_type, o_key)` per leaflet (`o_i`
+/// excluded), so the 14-byte `p+o` prefix defines a group.
+pub(crate) fn count_distinct_objects_for_predicate(
+    store: &BinaryIndexStore,
+    g_id: GraphId,
+    p_id: u32,
+) -> Result<Option<u64>> {
+    count_lead_groups_for_predicate(store, g_id, p_id, RunSortOrder::Post, 14)
+}
+
+/// Count distinct subjects for one predicate from PSOT leaflet directories
+/// only.
+///
+/// PSOT keys are `p_id(4) + s_id(8) + …` and PSOT `lead_group_count` counts
+/// distinct `s_id` per leaflet, so the 12-byte `p+s` prefix defines a group.
+pub(crate) fn count_distinct_subjects_for_predicate(
+    store: &BinaryIndexStore,
+    g_id: GraphId,
+    p_id: u32,
+) -> Result<Option<u64>> {
+    count_lead_groups_for_predicate(store, g_id, p_id, RunSortOrder::Psot, 12)
+}
+
+/// Count distinct lead groups for one predicate's leaf range (cached
+/// header+directory prefix reads — no payload, columns, or dictionary access).
+///
+/// Sums `lead_group_count` over the predicate's leaflets and deduplicates
+/// groups that span leaflet/chunk seams by the `lead_len`-byte key prefix.
+/// Distinctness is order-independent, so no `lex_sorted_string_ids` gate is
+/// needed and every object type is supported.
+///
+/// Returns `Ok(None)` when a non-empty leaflet has no `lead_group_count`
+/// (pre-§3.2 leaves) — the caller must fall back to a row scan.
+fn count_lead_groups_for_predicate(
+    store: &BinaryIndexStore,
+    g_id: GraphId,
+    p_id: u32,
+    order: RunSortOrder,
+    lead_len: usize,
+) -> Result<Option<u64>> {
+    let leaves = leaf_entries_for_predicate(store, g_id, order, p_id);
+    if leaves.is_empty() {
+        return Ok(Some(0));
     }
 
-    Ok(total)
+    let map = |chunk: &[LeafEntry]| -> Result<Option<PredicateLeadPartial>> {
+        let mut partial = PredicateLeadPartial {
+            count: 0,
+            first_lead: Vec::new(),
+            last_lead: Vec::new(),
+            unsupported: false,
+        };
+        for leaf_entry in chunk {
+            let dir = store
+                .open_leaf_dir(&leaf_entry.leaf_cid)
+                .map_err(|e| QueryError::Internal(format!("leaf dir open: {e}")))?;
+
+            for entry in &dir.entries {
+                if entry.row_count == 0 || entry.p_const != Some(p_id) {
+                    continue;
+                }
+                if entry.lead_group_count == 0 {
+                    partial.unsupported = true;
+                    return Ok(Some(partial));
+                }
+
+                let lead_first = &entry.first_key[..lead_len];
+                let lead_last = &entry.last_key[..lead_len];
+
+                partial.count += u64::from(entry.lead_group_count);
+                if !partial.last_lead.is_empty() && partial.last_lead == lead_first {
+                    partial.count = partial.count.saturating_sub(1);
+                }
+                if partial.first_lead.is_empty() {
+                    partial.first_lead.extend_from_slice(lead_first);
+                }
+                partial.last_lead.clear();
+                partial.last_lead.extend_from_slice(lead_last);
+            }
+        }
+        Ok(Some(partial))
+    };
+
+    let combine =
+        |left: PredicateLeadPartial, right: PredicateLeadPartial| -> PredicateLeadPartial {
+            if left.unsupported || right.unsupported {
+                return PredicateLeadPartial {
+                    count: 0,
+                    first_lead: Vec::new(),
+                    last_lead: Vec::new(),
+                    unsupported: true,
+                };
+            }
+            if right.first_lead.is_empty() {
+                return left;
+            }
+            if left.first_lead.is_empty() {
+                return right;
+            }
+            let seam_dedup = u64::from(left.last_lead == right.first_lead);
+            PredicateLeadPartial {
+                count: left
+                    .count
+                    .saturating_add(right.count)
+                    .saturating_sub(seam_dedup),
+                first_lead: left.first_lead,
+                last_lead: right.last_lead,
+                unsupported: false,
+            }
+        };
+
+    let parallel = leaves.len() >= crate::fast_path_common::parallel_dir_walk_min_leaves();
+    let result = parallel_leaf_chunk_reduce(leaves, parallel, map, combine)?;
+    Ok(match result {
+        Some(p) if p.unsupported => None,
+        Some(p) => Some(p.count),
+        None => Some(0),
+    })
 }
 
 /// Distinct predicates uses p_const metadata rather than lead_group_count,
@@ -1063,10 +1238,9 @@ fn count_distinct_predicates_psot(store: &BinaryIndexStore, g_id: GraphId) -> Re
     let mut total: u64 = 0;
 
     for leaf_entry in &branch.leaves {
-        let handle = store
-            .open_leaf_handle(&leaf_entry.leaf_cid, leaf_entry.sidecar_cid.as_ref(), false)
-            .map_err(|e| QueryError::Internal(format!("leaf open: {e}")))?;
-        let dir = handle.dir();
+        let dir = store
+            .open_leaf_dir(&leaf_entry.leaf_cid)
+            .map_err(|e| QueryError::Internal(format!("leaf dir open: {e}")))?;
 
         for entry in &dir.entries {
             if entry.row_count == 0 {
@@ -1102,6 +1276,10 @@ fn count_distinct_predicates_psot(store: &BinaryIndexStore, g_id: GraphId) -> Re
 // ---------------------------------------------------------------------------
 
 /// Fast-path: count triples with literal objects.
+///
+/// First tries a metadata-only fold over the per-graph property datatype stats
+/// (zero leaf I/O); when the stats can't attribute every row exactly it falls
+/// back to the PSOT leaflet walk.
 pub fn count_literal_objects_operator(
     out_var: VarId,
     fallback: Option<BoxedOperator>,
@@ -1112,13 +1290,66 @@ pub fn count_literal_objects_operator(
             let Some(store) = fast_path_store(ctx) else {
                 return Ok(None);
             };
-            let count = count_literal_rows_psot(store, ctx.binary_g_id)?;
+            let stats_fold = ctx
+                .active_snapshot
+                .stats
+                .as_ref()
+                .and_then(|stats| count_literal_rows_from_stats(stats, ctx.binary_g_id));
+            let count = match stats_fold {
+                Some(count) => {
+                    tracing::debug!(count, "literal COUNT answered from datatype stats");
+                    count
+                }
+                None => count_literal_rows_psot(store, ctx.binary_g_id)?,
+            };
             let count_i64 = count_to_i64(count, "COUNT literals")?;
             Ok(Some(build_count_batch(out_var, count_i64)?))
         },
         fallback,
         "literal COUNT",
     )
+}
+
+/// Metadata-only literal-row count from per-graph property datatype stats:
+/// literal rows = Σ over properties of every non-`JSON_LD_ID` datatype count
+/// (IRI and blank-node refs both carry `JSON_LD_ID`; every other tag is a
+/// literal).
+///
+/// Returns `None` (caller falls back to the leaflet walk) unless the stats
+/// provably attribute every row in the graph:
+/// - an `UNKNOWN` bucket means unattributable rows — the index-build mapping
+///   sends both blank-node objects (not literals) and NumBig overflow values
+///   (literals) to `UNKNOWN`;
+/// - each property's datatype counts must sum to its row count, and property
+///   counts must sum to the graph's flake total (guards stale/partial stats);
+/// - a zero result defers so the leaflet walk (cheap when empty) confirms it.
+fn count_literal_rows_from_stats(stats: &fluree_db_core::IndexStats, g_id: GraphId) -> Option<u64> {
+    let graph = stats.graphs.as_ref()?.iter().find(|g| g.g_id == g_id)?;
+
+    let ref_tag = ValueTypeTag::JSON_LD_ID.as_u8();
+    let unknown_tag = ValueTypeTag::UNKNOWN.as_u8();
+    let mut literals: u64 = 0;
+    let mut attributed: u64 = 0;
+    for prop in &graph.properties {
+        let mut prop_total: u64 = 0;
+        for &(tag, count) in &prop.datatypes {
+            if tag == unknown_tag && count > 0 {
+                return None;
+            }
+            prop_total = prop_total.checked_add(count)?;
+            if tag != ref_tag {
+                literals = literals.checked_add(count)?;
+            }
+        }
+        if prop_total != prop.count {
+            return None;
+        }
+        attributed = attributed.checked_add(prop_total)?;
+    }
+    if attributed != graph.flakes {
+        return None;
+    }
+    (literals > 0).then_some(literals)
 }
 
 fn is_literal_otype(ot_u16: u16) -> bool {
@@ -1266,3 +1497,97 @@ fn count_blank_subject_rows_spot(store: &BinaryIndexStore, g_id: GraphId) -> Res
 // `#[expect(dead_code)]` and not wired. If we revisit this, we should implement
 // a correctness-first detector + a plan that doesn't require enumerating large
 // string-id sets for common prefixes.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fluree_db_core::index_stats::{GraphPropertyStatEntry, GraphStatsEntry};
+    use fluree_db_core::IndexStats;
+
+    fn prop(p_id: u32, datatypes: Vec<(u8, u64)>) -> GraphPropertyStatEntry {
+        let count = datatypes.iter().map(|&(_, c)| c).sum();
+        GraphPropertyStatEntry {
+            p_id,
+            count,
+            ndv_values: 0,
+            ndv_subjects: 0,
+            last_modified_t: 1,
+            datatypes,
+        }
+    }
+
+    fn stats_with_graph(g_id: GraphId, properties: Vec<GraphPropertyStatEntry>) -> IndexStats {
+        let flakes = properties.iter().map(|p| p.count).sum();
+        IndexStats {
+            flakes,
+            size: 0,
+            properties: None,
+            classes: None,
+            graphs: Some(vec![GraphStatsEntry {
+                g_id,
+                flakes,
+                size: 0,
+                properties,
+                classes: None,
+            }]),
+        }
+    }
+
+    const REF: u8 = 16; // ValueTypeTag::JSON_LD_ID
+    const STRING: u8 = 1;
+    const INTEGER: u8 = 2;
+    const UNKNOWN: u8 = 255;
+
+    #[test]
+    fn literal_fold_sums_non_ref_tags() {
+        let stats = stats_with_graph(
+            0,
+            vec![
+                prop(1, vec![(STRING, 100), (REF, 40)]),
+                prop(2, vec![(INTEGER, 7)]),
+                prop(3, vec![(REF, 9)]),
+            ],
+        );
+        assert_eq!(count_literal_rows_from_stats(&stats, 0), Some(107));
+    }
+
+    #[test]
+    fn literal_fold_declines_on_unknown_bucket() {
+        // UNKNOWN holds both blank-node refs and NumBig literals — unattributable.
+        let stats = stats_with_graph(0, vec![prop(1, vec![(STRING, 5), (UNKNOWN, 1)])]);
+        assert_eq!(count_literal_rows_from_stats(&stats, 0), None);
+    }
+
+    #[test]
+    fn literal_fold_declines_on_datatype_count_mismatch() {
+        let mut stats = stats_with_graph(0, vec![prop(1, vec![(STRING, 5)])]);
+        stats.graphs.as_mut().unwrap()[0].properties[0].count = 6;
+        stats.graphs.as_mut().unwrap()[0].flakes = 6;
+        assert_eq!(count_literal_rows_from_stats(&stats, 0), None);
+    }
+
+    #[test]
+    fn literal_fold_declines_on_graph_total_mismatch() {
+        let mut stats = stats_with_graph(0, vec![prop(1, vec![(STRING, 5)])]);
+        stats.graphs.as_mut().unwrap()[0].flakes = 7;
+        assert_eq!(count_literal_rows_from_stats(&stats, 0), None);
+    }
+
+    #[test]
+    fn literal_fold_defers_on_zero_and_missing() {
+        let all_refs = stats_with_graph(0, vec![prop(1, vec![(REF, 9)])]);
+        assert_eq!(count_literal_rows_from_stats(&all_refs, 0), None);
+
+        let stats = stats_with_graph(0, vec![prop(1, vec![(STRING, 5)])]);
+        assert_eq!(count_literal_rows_from_stats(&stats, 2), None);
+
+        let no_graphs = IndexStats {
+            flakes: 5,
+            size: 0,
+            properties: None,
+            classes: None,
+            graphs: None,
+        };
+        assert_eq!(count_literal_rows_from_stats(&no_graphs, 0), None);
+    }
+}

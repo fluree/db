@@ -116,6 +116,15 @@ fn property_stats<'a>(stats: &'a StatsView, pred: &Ref) -> Option<&'a PropertySt
     None
 }
 
+fn property_known_absent(stats: &StatsView, pred: &Ref) -> bool {
+    stats.has_property_stats()
+        && match pred {
+            Ref::Sid(sid) => stats.get_property(sid).is_none(),
+            Ref::Iri(iri) => stats.get_property_by_iri(iri).is_none(),
+            Ref::Var(_) => false,
+        }
+}
+
 /// Look up class instance count by class term (SID or IRI).
 fn class_count(stats: &StatsView, class: &Term) -> Option<u64> {
     if let Some(sid) = class.as_sid() {
@@ -163,6 +172,9 @@ pub(crate) fn estimate_triple_row_count(
                         return est.ceil().max(HIGHLY_SELECTIVE);
                     }
                 }
+                if property_known_absent(s, &pattern.p) {
+                    return 0.0;
+                }
             }
             DEFAULT_BOUND_OBJECT_SELECTIVITY
         }
@@ -176,6 +188,9 @@ pub(crate) fn estimate_triple_row_count(
                             .max(HIGHLY_SELECTIVE);
                     }
                     return (prop.count as f64).min(BOUND_SUBJECT_FALLBACK_CAP);
+                }
+                if property_known_absent(s, &pattern.p) {
+                    return 0.0;
                 }
             }
             MODERATELY_SELECTIVE
@@ -191,6 +206,9 @@ pub(crate) fn estimate_triple_row_count(
                     }
                     return (prop.count as f64).min(BOUND_OBJECT_FALLBACK_CAP);
                 }
+                if property_known_absent(s, &pattern.p) {
+                    return 0.0;
+                }
             }
             DEFAULT_BOUND_OBJECT_SELECTIVITY
         }
@@ -199,6 +217,9 @@ pub(crate) fn estimate_triple_row_count(
             if let Some(s) = stats {
                 if let Some(prop) = property_stats(s, &pattern.p) {
                     return prop.count as f64;
+                }
+                if property_known_absent(s, &pattern.p) {
+                    return 0.0;
                 }
             }
             DEFAULT_PROPERTY_SCAN_SELECTIVITY
@@ -1514,6 +1535,84 @@ mod tests {
 
     fn make_pattern(s: VarId, p_name: &str, o: VarId) -> TriplePattern {
         TriplePattern::new(Ref::Var(s), Ref::Sid(Sid::new(100, p_name)), Term::Var(o))
+    }
+
+    #[test]
+    fn populated_stats_treat_missing_predicate_as_empty() {
+        let mut stats = StatsView::default();
+        stats.properties.insert(
+            Sid::new(100, "known"),
+            PropertyStatData {
+                count: 250_000,
+                ndv_values: 200_000,
+                ndv_subjects: 200_000,
+            },
+        );
+
+        let missing = make_pattern(VarId(0), "missing", VarId(1));
+        assert_eq!(
+            estimate_triple_row_count(&missing, &HashSet::new(), Some(&stats)),
+            0.0
+        );
+
+        let unknown_stats = StatsView::default();
+        assert_eq!(
+            estimate_triple_row_count(&missing, &HashSet::new(), Some(&unknown_stats)),
+            DEFAULT_PROPERTY_SCAN_SELECTIVITY
+        );
+    }
+
+    #[test]
+    fn absent_predicate_drives_before_large_known_scan() {
+        let mut stats = StatsView::default();
+        stats.properties.insert(
+            Sid::new(100, "large"),
+            PropertyStatData {
+                count: 250_000,
+                ndv_values: 200_000,
+                ndv_subjects: 200_000,
+            },
+        );
+
+        let large = Pattern::Triple(make_pattern(VarId(0), "large", VarId(1)));
+        let missing = Pattern::Triple(make_pattern(VarId(2), "missing", VarId(3)));
+        let ordered = reorder_patterns(&[large, missing], Some(&stats), &HashSet::new());
+        assert!(
+            matches!(
+                &ordered[0],
+                Pattern::Triple(tp)
+                    if matches!(&tp.p, Ref::Sid(sid) if sid.name.as_ref() == "missing")
+            ),
+            "missing predicate should drive first: {ordered:?}"
+        );
+    }
+
+    #[test]
+    fn class_stats_win_before_missing_rdf_type_property_zero() {
+        let class = Sid::new(100, "Class");
+        let mut stats = StatsView::default();
+        stats.properties.insert(
+            Sid::new(100, "known"),
+            PropertyStatData {
+                count: 250_000,
+                ndv_values: 200_000,
+                ndv_subjects: 200_000,
+            },
+        );
+        stats.classes.insert(class.clone(), 42);
+
+        let pattern = TriplePattern::new(
+            Ref::Var(VarId(0)),
+            Ref::Sid(Sid::new(
+                fluree_vocab::namespaces::RDF,
+                fluree_vocab::predicates::RDF_TYPE,
+            )),
+            Term::Sid(class),
+        );
+        assert_eq!(
+            estimate_triple_row_count(&pattern, &HashSet::new(), Some(&stats)),
+            42.0
+        );
     }
 
     #[test]

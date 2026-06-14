@@ -365,6 +365,7 @@ mod tests {
                     time: Some("3ms".into()),
                     fuel: Some(123.0),
                     policy: None,
+                    reasoning: None,
                 }),
             },
         }];
@@ -405,6 +406,7 @@ mod tests {
                     time: Some("5ms".into()),
                     fuel: Some(12.3),
                     policy: None,
+                    reasoning: None,
                 },
             ),
             success_with_tally(
@@ -414,6 +416,7 @@ mod tests {
                     time: Some("3ms".into()),
                     fuel: Some(8.1),
                     policy: None,
+                    reasoning: None,
                 },
             ),
         ];
@@ -446,6 +449,7 @@ mod tests {
                     time: Some("5ms".into()),
                     fuel: Some(10.0),
                     policy: None,
+                    reasoning: None,
                 },
             ),
             success("brian", serde_json::json!([])),
@@ -468,6 +472,7 @@ mod tests {
                     time: None,
                     fuel: Some(1.0),
                     policy: None,
+                    reasoning: None,
                 },
             ),
             success_with_tally(
@@ -477,6 +482,7 @@ mod tests {
                     time: None,
                     fuel: Some(2.0),
                     policy: None,
+                    reasoning: None,
                 },
             ),
         ];

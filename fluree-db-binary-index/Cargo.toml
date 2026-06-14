@@ -31,6 +31,7 @@ fs2 = "0.4"
 # Concurrency
 once_cell.workspace = true
 parking_lot = "0.12"
+futures.workspace = true
 
 # Numeric types (for NumBig arena)
 num-bigint = { version = "0.4", features = ["serde"] }

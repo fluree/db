@@ -96,6 +96,9 @@ impl ServerError {
             ServerError::Json(_) => errors::JSON_PARSE,
 
             // Query/Transaction errors
+            ServerError::Api(ApiError::Query(fluree_db_query::QueryError::Cancelled {
+                ..
+            })) => errors::QUERY_CANCELLED,
             ServerError::Api(ApiError::Query(_)) => errors::INVALID_QUERY,
             ServerError::Api(ApiError::Batch(_)) => errors::INVALID_QUERY,
             // Optimistic-concurrency conflicts: a distinct, retryable class so
@@ -172,6 +175,9 @@ impl ServerError {
 
             // 400 - Bad Request (client errors)
             ServerError::Api(ApiError::Parse(_)) => StatusCode::BAD_REQUEST,
+            ServerError::Api(ApiError::Query(fluree_db_query::QueryError::Cancelled {
+                ..
+            })) => StatusCode::REQUEST_TIMEOUT,
             ServerError::Api(ApiError::Query(_)) => StatusCode::BAD_REQUEST,
             ServerError::Api(ApiError::Batch(_)) => StatusCode::BAD_REQUEST,
             ServerError::Api(ApiError::Transact(_)) => StatusCode::BAD_REQUEST,

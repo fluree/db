@@ -1149,3 +1149,70 @@ async fn owl2rl_disabled_shows_no_derived_facts() {
     // Without reasoning, person-b does NOT live with person-a (symmetric inference not applied)
     assert_eq!(rows, json!([]), "no results without reasoning");
 }
+
+// =============================================================================
+// SPARQL per-query reasoning (`# PRAGMA reasoning: ...`)
+// =============================================================================
+
+#[tokio::test]
+async fn owl2rl_sparql_pragma_reasoning() {
+    // Same shape as owl2rl_symmetric_property, but driven through SPARQL with
+    // a `# PRAGMA reasoning: owl2rl` comment directive instead of the JSON-LD
+    // "reasoning" field. Symmetry is owl2rl-only (not covered by auto-RDFS),
+    // so the derived edge is only visible when the pragma takes effect.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "owl2rl/sparql-pragma");
+
+    let data = json!({
+        "@context": {
+            "ex": "http://example.org/",
+            "owl": "http://www.w3.org/2002/07/owl#"
+        },
+        "@graph": [
+            {"@id": "ex:livesWith", "@type": ["owl:ObjectProperty", "owl:SymmetricProperty"]},
+            {"@id": "ex:person-a", "ex:livesWith": {"@id": "ex:person-b"}}
+        ]
+    });
+    let ledger = fluree.insert(ledger0, &data).await.unwrap().ledger;
+
+    let with_pragma = "\
+# PRAGMA reasoning: owl2rl
+PREFIX ex: <http://example.org/>
+SELECT ?x WHERE { ex:person-b ex:livesWith ?x }";
+
+    let result = support::query_sparql(&fluree, &ledger, with_pragma)
+        .await
+        .unwrap()
+        .to_sparql_json(&ledger.snapshot)
+        .unwrap();
+    let bindings = support::normalize_sparql_bindings(&result);
+    assert_eq!(
+        bindings.len(),
+        1,
+        "pragma owl2rl: expected derived symmetric edge, got {bindings:?}"
+    );
+    assert_eq!(bindings[0]["x"]["value"], json!("ex:person-a"));
+
+    // Control: without the pragma only auto-RDFS applies — no symmetric edge.
+    let without_pragma = "\
+PREFIX ex: <http://example.org/>
+SELECT ?x WHERE { ex:person-b ex:livesWith ?x }";
+
+    let result = support::query_sparql(&fluree, &ledger, without_pragma)
+        .await
+        .unwrap()
+        .to_sparql_json(&ledger.snapshot)
+        .unwrap();
+    let bindings = support::normalize_sparql_bindings(&result);
+    assert!(
+        bindings.is_empty(),
+        "no pragma: expected no derived facts, got {bindings:?}"
+    );
+
+    // Invalid mode in the pragma errors rather than silently ignoring it.
+    let bad_pragma = "\
+# PRAGMA reasoning: owl3xl
+SELECT * WHERE { ?s ?p ?o }";
+    let err = support::query_sparql(&fluree, &ledger, bad_pragma).await;
+    assert!(err.is_err(), "unknown reasoning mode should error");
+}

@@ -74,7 +74,9 @@ use crate::query::multi::{
     MultiQueryRequest, MultiQueryResponse, MultiQuerySubquery, MultiQueryValidationError,
     SparqlContextDirectives, SubqueryLanguage,
 };
-use crate::{ApiError, Fluree, QueryConnectionOptions, TrackingOptions, TrackingTally};
+use crate::{
+    ApiError, Fluree, QueryConnectionOptions, QueryExecutionOptions, TrackingOptions, TrackingTally,
+};
 
 // =============================================================================
 // Public error type
@@ -244,6 +246,7 @@ pub struct MultiQueryBuilder {
     envelope: Option<MultiQueryRequest>,
     bounds: MultiQueryBounds,
     format: Option<FormatterConfig>,
+    execution: QueryExecutionOptions,
 }
 
 impl MultiQueryBuilder {
@@ -253,6 +256,7 @@ impl MultiQueryBuilder {
             envelope: None,
             bounds: MultiQueryBounds::DEFAULT,
             format: None,
+            execution: QueryExecutionOptions::default(),
         }
     }
 
@@ -302,6 +306,12 @@ impl MultiQueryBuilder {
         self
     }
 
+    /// Set execution controls applied to every sub-query in the envelope.
+    pub fn execution_options(mut self, options: QueryExecutionOptions) -> Self {
+        self.execution = options;
+        self
+    }
+
     /// Execute the envelope and return the assembled response.
     ///
     /// Validates → resolves the snapshot → dispatches sub-queries in
@@ -316,7 +326,14 @@ impl MultiQueryBuilder {
                 return Err(MultiQueryError::UnsupportedFormat { format: cfg.format });
             }
         }
-        run_envelope(self.fluree, envelope, &self.bounds, self.format).await
+        run_envelope(
+            self.fluree,
+            envelope,
+            &self.bounds,
+            self.format,
+            self.execution,
+        )
+        .await
     }
 }
 
@@ -365,6 +382,7 @@ pub(crate) async fn run_envelope(
     envelope: MultiQueryRequest,
     bounds: &MultiQueryBounds,
     default_format: Option<FormatterConfig>,
+    execution: QueryExecutionOptions,
 ) -> Result<MultiQueryResponse, MultiQueryError> {
     // Envelope wall-clock starts here so meta.elapsed_ms reflects the
     // full pipeline the client observes: validation, snapshot
@@ -411,6 +429,7 @@ pub(crate) async fn run_envelope(
         Arc::clone(&snapshot),
         config,
         default_format,
+        execution,
     )
     .await;
     tracing::debug!(
@@ -447,6 +466,7 @@ async fn dispatch_subqueries(
     snapshot: Arc<EnvelopeSnapshot>,
     config: DispatchConfig,
     default_format: Option<FormatterConfig>,
+    execution: QueryExecutionOptions,
 ) -> Vec<AliasOutcome> {
     let envelope_context = Arc::new(envelope.context.clone());
     let envelope_opts = Arc::new(envelope.opts.clone());
@@ -464,6 +484,7 @@ async fn dispatch_subqueries(
         let envelope_context = Arc::clone(&envelope_context);
         let envelope_opts = Arc::clone(&envelope_opts);
         let envelope_format = Arc::clone(&envelope_format);
+        let execution = execution.clone();
         let semaphore = Arc::clone(&semaphore);
 
         let span = tracing::debug_span!(
@@ -516,6 +537,7 @@ async fn dispatch_subqueries(
                     envelope_opts.as_ref().as_ref(),
                     envelope_format.as_ref().as_ref(),
                     snapshot.as_ref(),
+                    execution,
                 );
                 let kind = match tokio::time::timeout(effective, exec).await {
                     Ok(Ok(output)) => {
@@ -639,6 +661,7 @@ async fn execute_subquery(
     envelope_opts: Option<&JsonValue>,
     envelope_format: Option<&FormatterConfig>,
     snapshot: &EnvelopeSnapshot,
+    execution: QueryExecutionOptions,
 ) -> crate::Result<SubqueryOutput> {
     // Three-layer opts merge with body opts winning. The body layer is
     // pulled out **before** any merge so callers that pre-injected
@@ -687,7 +710,7 @@ async fn execute_subquery(
 
             apply_snapshot_to_jsonld(&mut query_body, snapshot);
 
-            run_jsonld_subquery(fluree, &query_body, envelope_format.cloned()).await
+            run_jsonld_subquery(fluree, &query_body, envelope_format.cloned(), execution).await
         }
         SubqueryLanguage::Sparql => {
             let sparql = sub.query.as_str().unwrap_or_default();
@@ -748,6 +771,7 @@ async fn execute_subquery(
                 Some(policy_opts),
                 tracking,
                 sparql_format,
+                execution,
             )
             .await
         }

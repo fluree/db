@@ -37,9 +37,14 @@ use fluree_db_core::{
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+
+use fluree_graph_json_ld::ndjson_splitter::{FirstLineContextPolicy, NdjsonReader};
 use std::sync::Arc;
 use std::time::Instant;
 use tracing::Instrument;
+
+const IMPORT_PIPELINE_WAIT_LOG_THRESHOLD_MS: u128 = 50;
+const LOCAL_RECHUNK_EVENT_CHANNEL_CAPACITY: usize = 2;
 
 // ============================================================================
 // Configuration
@@ -122,7 +127,7 @@ pub struct ImportConfig {
     /// Publish nameservice head every N chunks during import. Default: 50.
     /// 0 disables periodic checkpoints.
     pub publish_every: usize,
-    /// Overall memory budget in MB for the import pipeline. 0 = auto-detect (60% of RAM).
+    /// Overall memory budget in MB for the import pipeline. 0 = auto-detect (80% of RAM).
     ///
     /// Used to derive `chunk_size_mb` and `max_inflight_chunks` when those fields
     /// are left at 0.
@@ -170,6 +175,10 @@ pub struct ImportConfig {
     /// `max_fuel` limit, the import aborts with `ImportError::FuelExceeded`
     /// as soon as the limit is exceeded. Default: `Tracker::disabled()`.
     pub tracker: Tracker,
+    /// First-line interpretation for ndjson/jsonl imports: whether line 1 is a
+    /// shared `@context` map or already the first node. No effect on other
+    /// formats. Default: [`FirstLineContextPolicy::Auto`].
+    pub ndjson_first_line_context: FirstLineContextPolicy,
 }
 
 impl std::fmt::Debug for ImportConfig {
@@ -207,6 +216,7 @@ impl Default for ImportConfig {
             leaf_target_rows: 250_000,
             progress: None,
             tracker: Tracker::disabled(),
+            ndjson_first_line_context: FirstLineContextPolicy::Auto,
         }
     }
 }
@@ -215,14 +225,16 @@ impl Default for ImportConfig {
 // Memory budget derivation
 // ============================================================================
 
-/// Detect total system memory in MB. Falls back to 16 GB if detection fails.
+/// Detect the memory-budget basis in MB: host RAM clamped to the cgroup limit
+/// (so a container/cgroup-limited import sizes to its real limit, not host RAM).
+/// Falls back to 16 GB if detection fails.
 #[cfg(feature = "native")]
 pub fn detect_system_memory_mb() -> usize {
     use sysinfo::{MemoryRefreshKind, System};
 
     let mut sys = System::new();
     sys.refresh_memory_specifics(MemoryRefreshKind::everything());
-    let total_bytes = sys.total_memory();
+    let total_bytes = fluree_db_core::sysmem::effective_memory_limit_bytes(sys.total_memory());
 
     if total_bytes == 0 {
         tracing::warn!("could not detect system memory, falling back to 16 GB");
@@ -267,14 +279,23 @@ impl ImportConfig {
         if self.memory_budget_mb > 0 {
             self.memory_budget_mb
         } else {
+            // Default: assume the import owns the box and use most of it. `ram` is
+            // already cgroup-clamped (detect_system_memory_mb), so this respects
+            // a container limit automatically; pass --memory-budget-mb to curtail
+            // for shared environments. 80% leaves headroom for OS page cache +
+            // disk-spill writeback (the pipeline spills scratch to disk).
             let ram = detect_system_memory_mb();
-            // 60% of system RAM
-            (ram as f64 * 0.60) as usize
+            (ram as f64 * 0.80) as usize
         }
     }
 
     /// Effective max inflight chunks (derived from budget if 0).
     pub fn effective_max_inflight(&self) -> usize {
+        if let Ok(v) = std::env::var("FLUREE_IMPORT_MAX_INFLIGHT") {
+            if let Ok(n) = v.parse::<usize>() {
+                return n.max(1);
+            }
+        }
         if self.max_inflight_chunks > 0 {
             return self.max_inflight_chunks;
         }
@@ -296,6 +317,27 @@ impl ImportConfig {
             }
         }
         self.coalesce_small_files_threshold
+    }
+
+    /// Effective local-directory rechunk worker count.
+    ///
+    /// This is intentionally not a CLI knob. The local rechunk stage only exists
+    /// to feed parser workers, so auto-size it conservatively from parser
+    /// parallelism and the existing inflight memory budget. Operators can use
+    /// `FLUREE_IMPORT_RECHUNK_THREADS=<n>` while validating large imports.
+    pub fn effective_rechunk_threads(&self) -> usize {
+        if let Ok(v) = std::env::var("FLUREE_IMPORT_RECHUNK_THREADS") {
+            if let Ok(n) = v.parse::<usize>() {
+                return n.max(1);
+            }
+        }
+        let parser_threads = self.effective_parse_threads();
+        let inflight = self.effective_max_inflight();
+        parser_threads
+            .div_ceil(4)
+            .max(1)
+            .min(inflight.saturating_mul(2).max(1))
+            .min(8)
     }
 
     /// Effective chunk size in MB (derived from budget if 0).
@@ -393,13 +435,23 @@ impl ImportConfig {
         let max_inflight = self.effective_max_inflight();
         let run_budget = self.effective_run_budget_mb();
         let parallelism = self.effective_parse_threads();
+        let rechunk_threads = self.effective_rechunk_threads();
+        let max_inflight_source = if std::env::var("FLUREE_IMPORT_MAX_INFLIGHT").is_ok() {
+            "env"
+        } else if self.max_inflight_chunks > 0 {
+            "config"
+        } else {
+            "auto"
+        };
 
         tracing::info!(
             memory_budget_mb = budget,
             chunk_size_mb = chunk_size,
             max_inflight = max_inflight,
+            max_inflight_source,
             run_budget_mb = run_budget,
             parallelism = parallelism,
+            rechunk_threads = rechunk_threads,
             "import pipeline computed settings"
         );
     }
@@ -427,7 +479,7 @@ impl ImportConfig {
 /// Used to report to the user what the import pipeline will use when values are auto-detected.
 #[derive(Debug, Clone)]
 pub struct EffectiveImportSettings {
-    /// Memory budget in MB (60% of system RAM when not set).
+    /// Memory budget in MB (80% of system RAM when not set).
     pub memory_budget_mb: usize,
     /// Number of parallel parse threads (auto: logical cores, memory-capped, when not set).
     pub parallelism: usize,
@@ -508,6 +560,10 @@ pub enum ImportError {
     Io(std::io::Error),
     /// Chunk discovery error.
     NoChunks(String),
+    /// Reading or validating an import source failed: unreadable, malformed,
+    /// or truncated input (e.g. a bad ndjson line). The message names the
+    /// source and, where known, the offending line.
+    Source(String),
     /// Directory contains both Turtle and JSON-LD files.
     MixedFormats(String),
     /// Tracker max-fuel limit exceeded mid-import.
@@ -525,6 +581,7 @@ impl std::fmt::Display for ImportError {
             Self::Upload(msg) => write!(f, "upload: {msg}"),
             Self::Io(e) => write!(f, "I/O: {e}"),
             Self::NoChunks(msg) => write!(f, "no chunks: {msg}"),
+            Self::Source(msg) => write!(f, "import source: {msg}"),
             Self::MixedFormats(msg) => write!(f, "mixed formats: {msg}"),
             Self::FuelExceeded(e) => write!(
                 f,
@@ -595,6 +652,9 @@ pub(crate) enum RemoteFormat {
     Trig,
     Nquads,
     JsonLd,
+    /// Newline-delimited JSON-LD (`.jsonl`/`.ndjson`). Routed to the streaming
+    /// `JsonLdStream` source rather than the whole-object producer.
+    Ndjson,
 }
 
 /// `(chunk_index, raw_bytes)` payload sent from the remote producer to parser workers.
@@ -694,6 +754,13 @@ pub enum ChunkSource {
     /// self-contained payloads by a background producer thread (splits large
     /// files, coalesces small ones). Channel-fed, like `Remote`.
     LocalRechunk(LocalChunkProducer),
+    /// Newline-delimited JSON-LD (`.jsonl`/`.ndjson`) source — single local
+    /// file, local directory, or remote objects — streamed through chained
+    /// [`NdjsonReader`]s (one per file/object, so each source's own leading
+    /// `@context` is honored) by [`spawn_chained_ndjson_producer`]. Channel-fed
+    /// and parsed serially via `parse_jsonld_chunk` using the same channel +
+    /// `error_rx` completion protocol as `Remote`.
+    JsonLdStream(RemoteChunkProducer),
 }
 
 impl ChunkSource {
@@ -706,6 +773,9 @@ impl ChunkSource {
             Self::Streaming(reader) => reader.estimated_chunk_count(),
             Self::Remote(producer) => producer.estimated_count,
             Self::LocalRechunk(producer) => producer.estimated_count,
+            // Estimated from total source bytes / chunk_size (one source →
+            // many chunks, so the exact count is unknown upfront).
+            Self::JsonLdStream(producer) => producer.estimated_count,
         }
     }
 
@@ -724,6 +794,11 @@ impl ChunkSource {
         matches!(self, Self::LocalRechunk(_))
     }
 
+    /// Whether this is the channel-fed ndjson/jsonl streaming source.
+    pub fn is_jsonld_stream(&self) -> bool {
+        matches!(self, Self::JsonLdStream(_))
+    }
+
     /// Read chunk at `index` as a String (only for `Files` variant).
     ///
     /// Panics if called on `Streaming`/`Remote` — use `recv_next` instead.
@@ -732,7 +807,10 @@ impl ChunkSource {
             // Transparently decodes `.gz` / `.zst` wrappers; plain files use
             // the original `read_to_string` fast path inside `read_decoded_to_string`.
             Self::Files(files) => read_decoded_to_string(&files[index]),
-            Self::Streaming(_) | Self::Remote(_) | Self::LocalRechunk(_) => {
+            Self::Streaming(_)
+            | Self::Remote(_)
+            | Self::LocalRechunk(_)
+            | Self::JsonLdStream(_) => {
                 panic!("read_chunk not supported for channel-fed source; use recv_next")
             }
         }
@@ -763,7 +841,7 @@ impl ChunkSource {
                     None => Ok(None),
                 }
             }
-            Self::Files(_) | Self::Remote(_) | Self::LocalRechunk(_) => {
+            Self::Files(_) | Self::Remote(_) | Self::LocalRechunk(_) | Self::JsonLdStream(_) => {
                 panic!("recv_next not supported for this source variant")
             }
         }
@@ -779,6 +857,7 @@ impl ChunkSource {
             // Streaming and local rechunk are Turtle/N-Triples only.
             Self::Streaming(_) | Self::LocalRechunk(_) => false,
             Self::Remote(producer) => matches!(producer.format_at(index), Some(RemoteFormat::Trig)),
+            Self::JsonLdStream(_) => false,
         }
     }
 
@@ -796,6 +875,7 @@ impl ChunkSource {
             Self::Remote(producer) => {
                 matches!(producer.format_at(index), Some(RemoteFormat::Nquads))
             }
+            Self::JsonLdStream(_) => false,
         }
     }
 
@@ -811,6 +891,7 @@ impl ChunkSource {
                 .per_chunk_format
                 .iter()
                 .any(|f| matches!(f, RemoteFormat::Nquads)),
+            Self::JsonLdStream(_) => false,
         }
     }
 
@@ -824,6 +905,7 @@ impl ChunkSource {
             Self::Remote(producer) => {
                 matches!(producer.format_at(index), Some(RemoteFormat::JsonLd))
             }
+            Self::JsonLdStream(_) => true,
         }
     }
 
@@ -837,6 +919,7 @@ impl ChunkSource {
                 .any(|p| effective_extension(p).0.as_deref() == Some("jsonld")),
             Self::Streaming(_) | Self::LocalRechunk(_) => false,
             Self::Remote(producer) => producer.has_jsonld(),
+            Self::JsonLdStream(_) => true,
         }
     }
 }
@@ -883,27 +966,63 @@ pub(crate) fn effective_extension(path: &Path) -> (Option<String>, Compression) 
     (inner, comp)
 }
 
-/// Open `path` as a buffered byte stream, transparently decoding `.gz` / `.zst`.
+/// Whether an effective (inner) extension from [`effective_extension`] names
+/// the newline-delimited JSON-LD family. Single source of truth for
+/// `.jsonl`/`.ndjson` routing — keep classification sites on this predicate.
+pub(crate) fn is_ndjson_ext(ext: Option<&str>) -> bool {
+    matches!(ext, Some("jsonl" | "ndjson"))
+}
+
+/// Whether `path` names a file the bulk-import pipeline accepts: any supported
+/// RDF/JSON-LD extension (`.ttl`/`.nt`/`.nq`/`.trig`/`.jsonld`/`.jsonl`/
+/// `.ndjson`, case-insensitive), optionally compressed with `.gz`/`.zst`.
 ///
-/// Gzip uses `MultiGzDecoder` (handles concatenated streams from `pigz` /
-/// `bgzip`). The outer `BufReader` is sized to match the splitter's scan
+/// Single source of truth shared with the CLI's import-vs-transact routing —
+/// keep new formats here so callers cannot drift.
+pub fn is_bulk_import_file(path: &Path) -> bool {
+    let inner = effective_extension(path).0;
+    is_ndjson_ext(inner.as_deref())
+        || matches!(
+            inner.as_deref(),
+            Some("ttl" | "nt" | "trig" | "nq" | "jsonld")
+        )
+}
+
+/// Buffer size for decoded input streams, sized to match the splitter's scan
 /// buffer for cache-friendly chunked reads.
+const IO_BUF: usize = 256 * 1024;
+
+/// Wrap an already-buffered byte stream in the decoder named by `comp`.
+///
+/// `Compression::None` returns the stream unchanged (no extra buffer layer).
+/// Gzip uses `MultiGzDecoder` (handles concatenated streams from `pigz` /
+/// `bgzip`). Both decoders read compressed bytes strictly sequentially, so
+/// this composes with any streaming source (local file, remote byte ranges).
+fn decode_buffered(
+    comp: Compression,
+    inner: Box<dyn std::io::BufRead + Send>,
+) -> std::io::Result<Box<dyn std::io::BufRead + Send>> {
+    Ok(match comp {
+        Compression::None => inner,
+        Compression::Gzip => Box::new(std::io::BufReader::with_capacity(
+            IO_BUF,
+            flate2::bufread::MultiGzDecoder::new(inner),
+        )),
+        Compression::Zstd => Box::new(std::io::BufReader::with_capacity(
+            IO_BUF,
+            zstd::stream::read::Decoder::with_buffer(inner)?,
+        )),
+    })
+}
+
+/// Open `path` as a buffered byte stream, transparently decoding `.gz` / `.zst`.
 fn open_decoded(path: &Path) -> std::io::Result<Box<dyn std::io::BufRead + Send>> {
     let file = std::fs::File::open(path)?;
     let (_, comp) = effective_extension(path);
-    const BUF: usize = 256 * 1024;
-    let reader: Box<dyn std::io::BufRead + Send> = match comp {
-        Compression::None => Box::new(std::io::BufReader::with_capacity(BUF, file)),
-        Compression::Gzip => Box::new(std::io::BufReader::with_capacity(
-            BUF,
-            flate2::read::MultiGzDecoder::new(file),
-        )),
-        Compression::Zstd => Box::new(std::io::BufReader::with_capacity(
-            BUF,
-            zstd::stream::read::Decoder::new(file)?,
-        )),
-    };
-    Ok(reader)
+    decode_buffered(
+        comp,
+        Box::new(std::io::BufReader::with_capacity(IO_BUF, file)),
+    )
 }
 
 /// Read the entire (possibly-compressed) file into a `String`.
@@ -938,6 +1057,27 @@ fn resolve_chunk_source(
     if path.is_dir() {
         let files = discover_chunks(path)?;
 
+        // A directory of newline-delimited JSON-LD streams via chained
+        // NdjsonReaders (one file → many JSON-LD chunks). `.jsonl`/`.ndjson`
+        // cannot be parsed as whole documents, so they never take the `Files`
+        // path. `scan_directory_format` (run inside `discover_chunks`) has
+        // already rejected mixing them with other formats.
+        let all_ndjson = !files.is_empty()
+            && files
+                .iter()
+                .all(|p| is_ndjson_ext(effective_extension(p).0.as_deref()));
+        if all_ndjson {
+            let chunk_size_bytes = config.effective_chunk_size_mb() as u64 * 1024 * 1024;
+            let channel_capacity = config.effective_max_inflight();
+            let producer = spawn_local_ndjson_producer(
+                files,
+                config.ndjson_first_line_context,
+                chunk_size_bytes,
+                channel_capacity,
+            );
+            return Ok(ChunkSource::JsonLdStream(producer));
+        }
+
         // A directory of purely Turtle/N-Triples files can be rechunked through
         // the channel-fed producer (true N-wide parsing + bounded chunk count).
         // Any TriG/N-Quads/JSON-LD file forces the index-based `Files` path,
@@ -950,11 +1090,13 @@ fn resolve_chunk_source(
             let chunk_size_bytes = config.effective_chunk_size_mb() as u64 * 1024 * 1024;
             let channel_capacity = config.effective_max_inflight();
             let coalesce_threshold = config.effective_coalesce_threshold();
+            let rechunk_threads = config.effective_rechunk_threads();
             let producer = spawn_local_producer(
                 files,
                 chunk_size_bytes,
                 channel_capacity,
                 coalesce_threshold,
+                rechunk_threads,
             );
             return Ok(ChunkSource::LocalRechunk(producer));
         }
@@ -983,6 +1125,25 @@ fn resolve_chunk_source(
     // through the same triple-boundary reader as `.ttl`. `.ttl.gz` / `.nt.gz`
     // and the `.zst` variants stream too — via the new factory constructor.
     let (inner_ext, compression) = effective_extension(path);
+
+    // Newline-delimited JSON-LD (`.jsonl`/`.ndjson`) streams via NdjsonReader,
+    // which transforms each line group into a standalone JSON-LD document
+    // parsed on the serial json-ld path. A single file is just a one-element
+    // chained-producer source — same machinery (and completion protocol) as
+    // directories and remote objects. `open_decoded` transparently handles
+    // `.gz`/`.zst`.
+    if is_ndjson_ext(inner_ext.as_deref()) {
+        let chunk_size_bytes = config.effective_chunk_size_mb() as u64 * 1024 * 1024;
+        let channel_capacity = config.effective_max_inflight();
+        let producer = spawn_local_ndjson_producer(
+            vec![path.to_path_buf()],
+            config.ndjson_first_line_context,
+            chunk_size_bytes,
+            channel_capacity,
+        );
+        return Ok(ChunkSource::JsonLdStream(producer));
+    }
+
     let is_ttl = matches!(inner_ext.as_deref(), Some("ttl" | "nt"));
 
     if is_ttl && file_size > chunk_size_bytes {
@@ -1082,59 +1243,72 @@ async fn resolve_remote_objects(
         ));
     }
 
-    // Detect format by extension (mirrors local discover_chunks rules).
-    // Turtle-family (.ttl/.trig) and JSON-LD must not be mixed in a single import.
-    let mut has_ttl = false;
-    let mut has_trig = false;
+    // Detect format by *effective* extension (compression suffix stripped,
+    // mirroring local discover_chunks rules). Turtle-family (.ttl/.trig) and
+    // JSON-LD must not be mixed in a single import.
+    let mut has_turtle = false;
     let mut has_jsonld = false;
+    let mut has_ndjson = false;
     let mut accepted: Vec<RemoteObject> = Vec::with_capacity(all_objects.len());
     let mut extensions: Vec<RemoteFormat> = Vec::with_capacity(all_objects.len());
+    let mut skipped: Vec<String> = Vec::new();
     for obj in all_objects {
-        let ext = std::path::Path::new(&obj.address)
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(str::to_ascii_lowercase);
-        match ext.as_deref() {
-            // `.nt` (N-Triples) is a Turtle subset — parse it as Turtle.
-            Some("ttl" | "nt") => {
-                has_ttl = true;
-                accepted.push(obj);
-                extensions.push(RemoteFormat::Ttl);
-            }
-            Some("trig") => {
-                has_trig = true;
-                accepted.push(obj);
-                extensions.push(RemoteFormat::Trig);
-            }
-            // N-Quads → converted to TriG and dispatched via the serial path.
-            Some("nq") => {
-                has_trig = true;
-                accepted.push(obj);
-                extensions.push(RemoteFormat::Nquads);
-            }
-            Some("jsonld") => {
-                has_jsonld = true;
-                accepted.push(obj);
-                extensions.push(RemoteFormat::JsonLd);
-            }
-            _ => {
-                // Skip non-data files silently (mirrors local behavior).
+        let (ext, comp) = effective_extension(std::path::Path::new(&obj.address));
+        let compressed = !matches!(comp, Compression::None);
+        if is_ndjson_ext(ext.as_deref()) {
+            // ndjson decodes through a sequential decoder, so compressed
+            // remote objects are supported (mirrors the local path).
+            has_ndjson = true;
+            accepted.push(obj);
+            extensions.push(RemoteFormat::Ndjson);
+        } else if compressed {
+            // Whole-object remote fetches do not decode `.gz`/`.zst` yet.
+            skipped.push(obj.address);
+        } else {
+            match ext.as_deref() {
+                // `.nt` (N-Triples) is a Turtle subset — parse it as Turtle.
+                Some("ttl" | "nt") => {
+                    has_turtle = true;
+                    accepted.push(obj);
+                    extensions.push(RemoteFormat::Ttl);
+                }
+                Some("trig") => {
+                    has_turtle = true;
+                    accepted.push(obj);
+                    extensions.push(RemoteFormat::Trig);
+                }
+                // N-Quads → converted to TriG and dispatched via the serial path.
+                Some("nq") => {
+                    has_turtle = true;
+                    accepted.push(obj);
+                    extensions.push(RemoteFormat::Nquads);
+                }
+                Some("jsonld") => {
+                    has_jsonld = true;
+                    accepted.push(obj);
+                    extensions.push(RemoteFormat::JsonLd);
+                }
+                _ => skipped.push(obj.address),
             }
         }
     }
 
-    let has_turtle_family = has_ttl || has_trig;
-    if has_turtle_family && has_jsonld {
-        return Err(ImportError::MixedFormats(
-            "remote source contains both Turtle (.ttl/.trig) and JSON-LD (.jsonld) objects; \
-             use a single format family per import"
-                .into(),
-        ));
+    if !skipped.is_empty() {
+        // Loud, not silent: a prefix mixing recognized and unrecognized
+        // objects would otherwise "succeed" with part of the data missing.
+        tracing::warn!(
+            skipped = skipped.len(),
+            examples = ?skipped.iter().take(5).collect::<Vec<_>>(),
+            "remote source objects skipped (unsupported extension; compressed \
+             .gz/.zst is supported remotely only for .jsonl/.ndjson)"
+        );
     }
+
+    validate_format_families(has_turtle, has_jsonld, has_ndjson, "remote source")?;
 
     if accepted.is_empty() {
         return Err(ImportError::NoChunks(
-            "remote source contains no .ttl/.nt/.nq/.trig/.jsonld objects".into(),
+            "remote source contains no .ttl/.nt/.nq/.trig/.jsonld/.jsonl/.ndjson objects".into(),
         ));
     }
 
@@ -1225,6 +1399,298 @@ fn spawn_remote_producer(
         estimated_count,
         per_chunk_format,
     }
+}
+
+// ============================================================================
+// Remote ndjson streaming
+// ============================================================================
+
+/// Bytes fetched per `read_byte_range` request when streaming a remote ndjson
+/// object. This is the dominant request-count/latency knob for remote
+/// streaming: a 10 GB object issues `size / window` sequential range requests,
+/// each paying one round trip.
+const REMOTE_NDJSON_RANGE_WINDOW: usize = 8 * 1024 * 1024;
+
+/// A synchronous [`std::io::BufRead`] over a remote object's byte ranges,
+/// backed by an async [`StorageRead`]. Each refill pulls the next window via
+/// `read_byte_range`, `block_on`'d on the calling thread — which is the
+/// [`NdjsonReader`]'s own (non-runtime) reader thread, so blocking is safe.
+/// Reads are bounded by the object's known size, so it never depends on
+/// past-EOF range semantics.
+///
+/// Callers must check [`StorageRead::supports_ranged_reads`] first: on a
+/// backend with the default full-fetch `read_byte_range`, every window refill
+/// would re-download the entire object.
+struct StorageRangeReader {
+    storage: Arc<dyn StorageRead>,
+    address: String,
+    size: u64,
+    offset: u64,
+    handle: tokio::runtime::Handle,
+    buf: Vec<u8>,
+    buf_pos: usize,
+}
+
+impl StorageRangeReader {
+    fn new(
+        storage: Arc<dyn StorageRead>,
+        address: String,
+        size: u64,
+        handle: tokio::runtime::Handle,
+    ) -> Self {
+        Self {
+            storage,
+            address,
+            size,
+            offset: 0,
+            handle,
+            buf: Vec::new(),
+            buf_pos: 0,
+        }
+    }
+}
+
+impl std::io::BufRead for StorageRangeReader {
+    fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+        if self.buf_pos >= self.buf.len() {
+            if self.offset >= self.size {
+                return Ok(&[]); // EOF
+            }
+            let end = (self.offset + REMOTE_NDJSON_RANGE_WINDOW as u64).min(self.size);
+            let bytes = self
+                .handle
+                .block_on(
+                    self.storage
+                        .read_byte_range(&self.address, self.offset..end),
+                )
+                .map_err(|e| {
+                    std::io::Error::other(format!("read_byte_range({}) failed: {e}", self.address))
+                })?;
+            if bytes.is_empty() {
+                // Defensive: storage returned nothing though offset < size
+                // (object shorter than its listed size) — treat as EOF.
+                return Ok(&[]);
+            }
+            self.offset += bytes.len() as u64;
+            self.buf = bytes;
+            self.buf_pos = 0;
+        }
+        Ok(&self.buf[self.buf_pos..])
+    }
+
+    fn consume(&mut self, amt: usize) {
+        self.buf_pos = (self.buf_pos + amt).min(self.buf.len());
+    }
+}
+
+impl std::io::Read for StorageRangeReader {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        use std::io::BufRead;
+        let available = self.fill_buf()?;
+        let n = out.len().min(available.len());
+        out[..n].copy_from_slice(&available[..n]);
+        self.consume(n);
+        Ok(n)
+    }
+}
+
+/// A lazily-opened ndjson byte source: returns a fresh `BufRead` when called on
+/// the producer thread. Defers S3 range reads / file opens to that thread.
+type NdjsonSourceFactory =
+    Box<dyn FnOnce() -> std::io::Result<Box<dyn std::io::BufRead + Send>> + Send>;
+
+/// Estimated chunk count for an ndjson source: total source bytes divided by
+/// chunk size (floor 1). Compressed sources undercount — it is only a progress
+/// denominator.
+fn estimate_ndjson_chunks(total_bytes: u64, chunk_size_bytes: u64) -> usize {
+    total_bytes.div_ceil(chunk_size_bytes.max(1)).max(1) as usize
+}
+
+/// Spawn a producer that streams ndjson from a sequence of `(label, factory)`
+/// byte sources, chaining one [`NdjsonReader`] per source and forwarding their
+/// JSON-LD chunks into a shared channel with a global chunk index. The readers
+/// are independent, so each source's own leading `@context` is honored.
+/// Reuses [`RemoteChunkProducer`]'s channel + `error_rx` machinery;
+/// `per_chunk_format` is empty because the chunks ride the
+/// [`ChunkSource::JsonLdStream`] path, which always parses them as JSON-LD.
+fn spawn_chained_ndjson_producer(
+    sources: Vec<(String, NdjsonSourceFactory)>,
+    policy: FirstLineContextPolicy,
+    chunk_size_bytes: u64,
+    in_flight: usize,
+    estimated_count: usize,
+) -> RemoteChunkProducer {
+    let in_flight = in_flight.max(1);
+    let (std_tx, std_rx) = std::sync::mpsc::sync_channel::<(usize, Vec<u8>)>(in_flight);
+    let (error_tx, error_rx) = tokio::sync::oneshot::channel::<Option<ImportError>>();
+
+    // A dedicated std thread: each NdjsonReader spawns its own reader thread,
+    // and remote sources `block_on` byte-range reads, so this must NOT be a
+    // tokio worker.
+    let producer_handle = std::thread::Builder::new()
+        .name("ndjson-producer".into())
+        .spawn(move || {
+            let mut global_idx = 0usize;
+            for (label, factory) in sources {
+                let byte_source = match factory() {
+                    Ok(r) => r,
+                    Err(e) => {
+                        let _ = error_tx.send(Some(ImportError::Source(format!(
+                            "open ndjson source {label}: {e}"
+                        ))));
+                        return;
+                    }
+                };
+                // Inner channel capacity 1: the outer channel below already
+                // provides the `in_flight` pipelining bound. A larger inner
+                // capacity would buffer up to a second `in_flight × chunk_size`
+                // of chunk text beyond the documented max_inflight budget.
+                let mut reader =
+                    match NdjsonReader::new_from_reader(byte_source, chunk_size_bytes, 1, policy) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            let _ = error_tx.send(Some(ImportError::Source(format!(
+                                "ndjson reader init for {label}: {e}"
+                            ))));
+                            return;
+                        }
+                    };
+                loop {
+                    match reader.recv_chunk() {
+                        Ok(Some((_local_idx, bytes))) => {
+                            if std_tx.send((global_idx, bytes)).is_err() {
+                                // Consumer aborted upstream — exit cleanly.
+                                let _ = error_tx.send(None);
+                                return;
+                            }
+                            global_idx += 1;
+                        }
+                        Ok(None) => break,
+                        Err(e) => {
+                            let _ = error_tx.send(Some(ImportError::Source(format!(
+                                "ndjson read of {label}: {e}"
+                            ))));
+                            return;
+                        }
+                    }
+                }
+                // Malformed-line errors surface here (channel close alone is
+                // not sufficient).
+                if let Err(e) = reader.join() {
+                    let _ = error_tx.send(Some(ImportError::Source(format!(
+                        "ndjson read of {label}: {e}"
+                    ))));
+                    return;
+                }
+            }
+            let _ = error_tx.send(None); // success
+        })
+        .expect("spawn ndjson producer thread");
+
+    RemoteChunkProducer {
+        rx: Arc::new(std::sync::Mutex::new(std_rx)),
+        error_rx: std::sync::Mutex::new(Some(error_rx)),
+        bridge_handle: std::sync::Mutex::new(Some(producer_handle)),
+        estimated_count,
+        per_chunk_format: Vec::new(),
+    }
+}
+
+/// Stream remote ndjson objects (S3 byte-range) through the chained producer.
+///
+/// Objects are range-streamed in bounded memory when the backend supports
+/// native ranged reads and the object's size is known. Otherwise — a backend
+/// whose `read_byte_range` is the full-fetch default (proxy, encrypted), or a
+/// caller-supplied object list with `size_bytes` 0 = unknown (matching the
+/// whole-object path's interpretation) — the object is fetched whole exactly
+/// once instead of once per window.
+fn spawn_remote_ndjson_producer(
+    storage: Arc<dyn StorageRead>,
+    objects: Vec<RemoteObject>,
+    policy: FirstLineContextPolicy,
+    chunk_size_bytes: u64,
+    in_flight: usize,
+) -> RemoteChunkProducer {
+    let handle = tokio::runtime::Handle::current();
+    let ranged = storage.supports_ranged_reads();
+    let total_bytes: u64 = objects.iter().map(|o| o.size_bytes).sum();
+    let estimated_count = estimate_ndjson_chunks(total_bytes, chunk_size_bytes);
+    let sources: Vec<(String, NdjsonSourceFactory)> = objects
+        .into_iter()
+        .map(|obj| {
+            let storage = Arc::clone(&storage);
+            let handle = handle.clone();
+            let label = obj.address.clone();
+            // Compressed objects (`.jsonl.gz`/`.zst`) decode through the same
+            // sequential decoder as local files — byte-range streaming reads
+            // the compressed bytes strictly in order, so the two compose.
+            let comp = effective_extension(std::path::Path::new(&obj.address)).1;
+            let factory: NdjsonSourceFactory = if ranged && obj.size_bytes > 0 {
+                Box::new(move || {
+                    let raw = Box::new(StorageRangeReader::new(
+                        storage,
+                        obj.address,
+                        obj.size_bytes,
+                        handle,
+                    )) as Box<dyn std::io::BufRead + Send>;
+                    decode_buffered(comp, raw)
+                })
+            } else {
+                Box::new(move || {
+                    let bytes = handle
+                        .block_on(storage.read_bytes(&obj.address))
+                        .map_err(|e| {
+                            std::io::Error::other(format!(
+                                "read_bytes({}) failed: {e}",
+                                obj.address
+                            ))
+                        })?;
+                    decode_buffered(comp, Box::new(std::io::Cursor::new(bytes)))
+                })
+            };
+            (label, factory)
+        })
+        .collect();
+    spawn_chained_ndjson_producer(
+        sources,
+        policy,
+        chunk_size_bytes,
+        in_flight,
+        estimated_count,
+    )
+}
+
+/// Stream a local directory of ndjson files through the chained producer.
+/// `open_decoded` handles `.gz`/`.zst` transparently.
+fn spawn_local_ndjson_producer(
+    files: Vec<PathBuf>,
+    policy: FirstLineContextPolicy,
+    chunk_size_bytes: u64,
+    in_flight: usize,
+) -> RemoteChunkProducer {
+    // On-disk (compressed) size — an undercount for `.gz`/`.zst`, but this is
+    // only a progress denominator.
+    let total_bytes: u64 = files
+        .iter()
+        .filter_map(|f| std::fs::metadata(f).ok())
+        .map(|m| m.len())
+        .sum();
+    let estimated_count = estimate_ndjson_chunks(total_bytes, chunk_size_bytes);
+    let sources: Vec<(String, NdjsonSourceFactory)> = files
+        .into_iter()
+        .map(|f| {
+            let label = f.display().to_string();
+            let factory: NdjsonSourceFactory = Box::new(move || open_decoded(&f));
+            (label, factory)
+        })
+        .collect();
+    spawn_chained_ndjson_producer(
+        sources,
+        policy,
+        chunk_size_bytes,
+        in_flight,
+        estimated_count,
+    )
 }
 
 // ============================================================================
@@ -1337,10 +1803,28 @@ fn local_rechunk_loop(
 
     macro_rules! emit {
         ($payload:expr) => {{
-            if tx.send((next_idx, $payload)).is_err() {
+            let payload = $payload;
+            let payload_len = payload.len();
+            let send_start = Instant::now();
+            if tx.send((next_idx, payload)).is_err() {
                 // Consumer dropped the receiver — pipeline aborted upstream.
                 return Ok(());
             }
+            let send_wait_ms = send_start.elapsed().as_millis();
+            if send_wait_ms >= IMPORT_PIPELINE_WAIT_LOG_THRESHOLD_MS {
+                tracing::info!(
+                    chunk_idx = next_idx,
+                    payload_bytes = payload_len,
+                    send_wait_ms,
+                    "local rechunk producer waited to hand off chunk"
+                );
+            }
+            tracing::debug!(
+                chunk_idx = next_idx,
+                payload_bytes = payload_len,
+                send_wait_ms,
+                "local rechunk producer handed off chunk"
+            );
             next_idx += 1;
         }};
     }
@@ -1395,10 +1879,21 @@ fn local_rechunk_loop(
             loop {
                 match reader.recv_chunk() {
                     Ok(Some((_sub_idx, raw))) => {
+                        let payload_start = Instant::now();
                         let mut payload = Vec::with_capacity(prefix.len() + 1 + raw.len());
                         payload.extend_from_slice(&prefix);
                         payload.push(b'\n');
                         payload.extend_from_slice(&raw);
+                        let payload_build_ms = payload_start.elapsed().as_millis();
+                        if payload_build_ms >= IMPORT_PIPELINE_WAIT_LOG_THRESHOLD_MS {
+                            tracing::info!(
+                                file = %path.display(),
+                                raw_bytes = raw.len(),
+                                payload_bytes = payload.len(),
+                                payload_build_ms,
+                                "local rechunk built split-file payload"
+                            );
+                        }
                         emit!(payload);
                     }
                     Ok(None) => break,
@@ -1421,10 +1916,20 @@ fn local_rechunk_loop(
             })?;
         } else {
             // ---- Small file: read whole (decodes .gz/.zst). ----
+            let read_start = Instant::now();
             let text = read_decoded_to_string(path).map_err(|e| {
                 ImportError::NoChunks(format!("failed to read {}: {e}", path.display()))
             })?;
+            let read_ms = read_start.elapsed().as_millis();
             let bytes = text.into_bytes();
+            if read_ms >= IMPORT_PIPELINE_WAIT_LOG_THRESHOLD_MS {
+                tracing::info!(
+                    file = %path.display(),
+                    bytes = bytes.len(),
+                    read_ms,
+                    "local rechunk read/decompressed file"
+                );
+            }
 
             if !coalesce_enabled || coalesce_unsafe(&bytes) {
                 // Emit standalone (flush any pending buffer first).
@@ -1448,12 +1953,386 @@ fn local_rechunk_loop(
         }
     }
 
-    // Final flush — send directly (no index advance needed after the last chunk).
-    if !buf.is_empty() && tx.send((next_idx, buf)).is_err() {
-        // Consumer dropped the receiver — pipeline aborted upstream.
-        return Ok(());
+    // Final flush.
+    if !buf.is_empty() {
+        let payload = std::mem::take(&mut buf);
+        let payload_len = payload.len();
+        let send_start = Instant::now();
+        if tx.send((next_idx, payload)).is_err() {
+            // Consumer dropped the receiver — pipeline aborted upstream.
+            return Ok(());
+        }
+        let send_wait_ms = send_start.elapsed().as_millis();
+        if send_wait_ms >= IMPORT_PIPELINE_WAIT_LOG_THRESHOLD_MS {
+            tracing::info!(
+                chunk_idx = next_idx,
+                payload_bytes = payload_len,
+                send_wait_ms,
+                "local rechunk producer waited to hand off chunk"
+            );
+        }
+        tracing::debug!(
+            chunk_idx = next_idx,
+            payload_bytes = payload_len,
+            send_wait_ms,
+            "local rechunk producer handed off chunk"
+        );
     }
     Ok(())
+}
+
+struct LocalRechunkJob {
+    file_idx: usize,
+    path: PathBuf,
+    on_disk: u64,
+    event_tx: std::sync::mpsc::SyncSender<LocalRechunkEvent>,
+}
+
+enum LocalRechunkEvent {
+    SplitChunk(Vec<u8>),
+    SmallFile {
+        bytes: Vec<u8>,
+        unsafe_to_coalesce: bool,
+    },
+    Done,
+    Error(ImportError),
+}
+
+fn send_local_rechunk_event(
+    tx: &std::sync::mpsc::SyncSender<LocalRechunkEvent>,
+    event: LocalRechunkEvent,
+) -> bool {
+    tx.send(event).is_ok()
+}
+
+fn process_local_rechunk_job(
+    job: LocalRechunkJob,
+    chunk_size_bytes: u64,
+) -> std::result::Result<(), ImportError> {
+    let LocalRechunkJob {
+        file_idx,
+        path,
+        on_disk,
+        event_tx,
+    } = job;
+
+    let (_inner_ext, comp) = effective_extension(&path);
+    if should_stream_split(&path, on_disk, chunk_size_bytes) {
+        let mut reader = if matches!(comp, Compression::None) {
+            fluree_graph_turtle::splitter::StreamingTurtleReader::new(
+                &path,
+                chunk_size_bytes,
+                2,
+                None,
+            )
+            .map_err(|e| {
+                ImportError::NoChunks(format!("turtle split failed for {}: {e}", path.display()))
+            })?
+        } else {
+            let path_owned = path.to_path_buf();
+            let factory = move || open_decoded(&path_owned);
+            fluree_graph_turtle::splitter::StreamingTurtleReader::new_from_factory(
+                factory,
+                0,
+                chunk_size_bytes,
+                2,
+                None,
+            )
+            .map_err(|e| {
+                ImportError::NoChunks(format!(
+                    "compressed turtle split failed for {}: {e}",
+                    path.display()
+                ))
+            })?
+        };
+
+        let prefix = reader.prefix_block().as_bytes().to_vec();
+        loop {
+            match reader.recv_chunk() {
+                Ok(Some((_sub_idx, raw))) => {
+                    let payload_start = Instant::now();
+                    let mut payload = Vec::with_capacity(prefix.len() + 1 + raw.len());
+                    payload.extend_from_slice(&prefix);
+                    payload.push(b'\n');
+                    payload.extend_from_slice(&raw);
+                    let payload_build_ms = payload_start.elapsed().as_millis();
+                    if payload_build_ms >= IMPORT_PIPELINE_WAIT_LOG_THRESHOLD_MS {
+                        tracing::info!(
+                            file_idx,
+                            file = %path.display(),
+                            raw_bytes = raw.len(),
+                            payload_bytes = payload.len(),
+                            payload_build_ms,
+                            "local rechunk built split-file payload"
+                        );
+                    }
+                    if !send_local_rechunk_event(&event_tx, LocalRechunkEvent::SplitChunk(payload))
+                    {
+                        return Ok(());
+                    }
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    return Err(ImportError::NoChunks(format!(
+                        "streaming read failed for {}: {e}",
+                        path.display()
+                    )));
+                }
+            }
+        }
+        reader.join().map_err(|e| {
+            ImportError::NoChunks(format!(
+                "turtle reader thread failed for {}: {e}",
+                path.display()
+            ))
+        })?;
+    } else {
+        let read_start = Instant::now();
+        let text = read_decoded_to_string(&path).map_err(|e| {
+            ImportError::NoChunks(format!("failed to read {}: {e}", path.display()))
+        })?;
+        let read_ms = read_start.elapsed().as_millis();
+        let bytes = text.into_bytes();
+        if read_ms >= IMPORT_PIPELINE_WAIT_LOG_THRESHOLD_MS {
+            tracing::info!(
+                file_idx,
+                file = %path.display(),
+                bytes = bytes.len(),
+                read_ms,
+                "local rechunk read/decompressed file"
+            );
+        }
+        let unsafe_to_coalesce = coalesce_unsafe(&bytes);
+        if !send_local_rechunk_event(
+            &event_tx,
+            LocalRechunkEvent::SmallFile {
+                bytes,
+                unsafe_to_coalesce,
+            },
+        ) {
+            return Ok(());
+        }
+    }
+
+    let _ = send_local_rechunk_event(&event_tx, LocalRechunkEvent::Done);
+    Ok(())
+}
+
+fn emit_local_rechunk_payload(
+    tx: &std::sync::mpsc::SyncSender<(usize, Vec<u8>)>,
+    next_idx: &mut usize,
+    payload: Vec<u8>,
+) -> bool {
+    let payload_len = payload.len();
+    let chunk_idx = *next_idx;
+    let send_start = Instant::now();
+    if tx.send((chunk_idx, payload)).is_err() {
+        // Consumer dropped the receiver — pipeline aborted upstream.
+        return false;
+    }
+    let send_wait_ms = send_start.elapsed().as_millis();
+    if send_wait_ms >= IMPORT_PIPELINE_WAIT_LOG_THRESHOLD_MS {
+        tracing::info!(
+            chunk_idx,
+            payload_bytes = payload_len,
+            send_wait_ms,
+            "local rechunk producer waited to hand off chunk"
+        );
+    }
+    tracing::debug!(
+        chunk_idx,
+        payload_bytes = payload_len,
+        send_wait_ms,
+        "local rechunk producer handed off chunk"
+    );
+    *next_idx += 1;
+    true
+}
+
+fn local_rechunk_loop_parallel(
+    files: Vec<PathBuf>,
+    sizes: Vec<u64>,
+    chunk_size_bytes: u64,
+    coalesce_enabled: bool,
+    tx: &std::sync::mpsc::SyncSender<(usize, Vec<u8>)>,
+    rechunk_threads: usize,
+) -> std::result::Result<(), ImportError> {
+    let worker_count = rechunk_threads.min(files.len()).max(1);
+    if worker_count <= 1 {
+        return local_rechunk_loop(&files, &sizes, chunk_size_bytes, coalesce_enabled, tx);
+    }
+
+    let (job_tx, job_rx) = std::sync::mpsc::sync_channel::<LocalRechunkJob>(worker_count);
+    let job_rx = Arc::new(std::sync::Mutex::new(job_rx));
+    let mut worker_handles = Vec::with_capacity(worker_count);
+    for worker_idx in 0..worker_count {
+        let job_rx = Arc::clone(&job_rx);
+        let handle = std::thread::Builder::new()
+            .name(format!("ttl-local-rechunk-worker-{worker_idx}"))
+            .spawn(move || loop {
+                let job = match job_rx.lock().unwrap().recv() {
+                    Ok(job) => job,
+                    Err(_) => break,
+                };
+                let error_tx = job.event_tx.clone();
+                if let Err(err) = process_local_rechunk_job(job, chunk_size_bytes) {
+                    let _ = error_tx.send(LocalRechunkEvent::Error(err));
+                }
+            })
+            .map_err(|e| ImportError::Transact(format!("spawn local rechunk worker: {e}")))?;
+        worker_handles.push(handle);
+    }
+
+    let mut file_iter = files.into_iter().zip(sizes).enumerate();
+    let mut event_rxs: std::collections::VecDeque<(
+        usize,
+        std::sync::mpsc::Receiver<LocalRechunkEvent>,
+    )> = std::collections::VecDeque::with_capacity(worker_count);
+
+    let mut schedule_next = |event_rxs: &mut std::collections::VecDeque<(
+        usize,
+        std::sync::mpsc::Receiver<LocalRechunkEvent>,
+    )>|
+     -> bool {
+        let Some((file_idx, (path, on_disk))) = file_iter.next() else {
+            return false;
+        };
+        let (event_tx, event_rx) =
+            std::sync::mpsc::sync_channel(LOCAL_RECHUNK_EVENT_CHANNEL_CAPACITY);
+        let job = LocalRechunkJob {
+            file_idx,
+            path,
+            on_disk,
+            event_tx,
+        };
+        if job_tx.send(job).is_err() {
+            return false;
+        }
+        event_rxs.push_back((file_idx, event_rx));
+        true
+    };
+
+    for _ in 0..worker_count {
+        if !schedule_next(&mut event_rxs) {
+            break;
+        }
+    }
+
+    let mut result: std::result::Result<(), ImportError> = Ok(());
+    let mut output_open = true;
+    let mut next_idx = 0usize;
+    let mut buf: Vec<u8> = Vec::new();
+
+    while let Some((file_idx, event_rx)) = event_rxs.pop_front() {
+        loop {
+            let event = match event_rx.recv() {
+                Ok(event) => event,
+                Err(_) => {
+                    if result.is_ok() {
+                        result = Err(ImportError::NoChunks(format!(
+                            "local rechunk worker ended before completing file index {file_idx}"
+                        )));
+                    }
+                    output_open = false;
+                    break;
+                }
+            };
+
+            match event {
+                LocalRechunkEvent::SplitChunk(payload) => {
+                    if output_open && result.is_ok() {
+                        if !buf.is_empty() {
+                            let pending = std::mem::take(&mut buf);
+                            if !emit_local_rechunk_payload(tx, &mut next_idx, pending) {
+                                output_open = false;
+                                buf.clear();
+                            }
+                        }
+                        if output_open && !emit_local_rechunk_payload(tx, &mut next_idx, payload) {
+                            output_open = false;
+                            buf.clear();
+                        }
+                    }
+                }
+                LocalRechunkEvent::SmallFile {
+                    bytes,
+                    unsafe_to_coalesce,
+                } => {
+                    if output_open && result.is_ok() {
+                        if !coalesce_enabled || unsafe_to_coalesce {
+                            if !buf.is_empty() {
+                                let pending = std::mem::take(&mut buf);
+                                if !emit_local_rechunk_payload(tx, &mut next_idx, pending) {
+                                    output_open = false;
+                                    buf.clear();
+                                }
+                            }
+                            if output_open && !emit_local_rechunk_payload(tx, &mut next_idx, bytes)
+                            {
+                                output_open = false;
+                                buf.clear();
+                            }
+                        } else {
+                            if !buf.is_empty()
+                                && (buf.len() + 1 + bytes.len()) as u64 > chunk_size_bytes
+                            {
+                                let pending = std::mem::take(&mut buf);
+                                if !emit_local_rechunk_payload(tx, &mut next_idx, pending) {
+                                    output_open = false;
+                                    buf.clear();
+                                }
+                            }
+                            if output_open {
+                                if !buf.is_empty() {
+                                    buf.push(b'\n');
+                                }
+                                buf.extend_from_slice(&bytes);
+                                if buf.len() as u64 >= chunk_size_bytes {
+                                    let pending = std::mem::take(&mut buf);
+                                    if !emit_local_rechunk_payload(tx, &mut next_idx, pending) {
+                                        output_open = false;
+                                        buf.clear();
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                LocalRechunkEvent::Done => break,
+                LocalRechunkEvent::Error(err) => {
+                    if result.is_ok() {
+                        result = Err(err);
+                    }
+                    output_open = false;
+                    buf.clear();
+                    break;
+                }
+            }
+        }
+
+        // Sliding-window backpressure: only schedule the next file after the
+        // next ordered file has been fully drained. This bounds decoded
+        // read-ahead to `worker_count` files instead of the whole directory.
+        if output_open && result.is_ok() {
+            schedule_next(&mut event_rxs);
+        }
+    }
+
+    drop(job_tx);
+    for handle in worker_handles {
+        handle
+            .join()
+            .map_err(|_| ImportError::Transact("local rechunk worker panicked".into()))?;
+    }
+
+    if output_open && result.is_ok() && !buf.is_empty() {
+        let pending = std::mem::take(&mut buf);
+        if !emit_local_rechunk_payload(tx, &mut next_idx, pending) {
+            return Ok(());
+        }
+    }
+
+    result
 }
 
 /// Spawn the local-directory rechunk producer (see [`LocalChunkProducer`]).
@@ -1468,6 +2347,7 @@ fn spawn_local_producer(
     chunk_size_bytes: u64,
     channel_capacity: usize,
     coalesce_threshold: usize,
+    rechunk_threads: usize,
 ) -> LocalChunkProducer {
     let estimated_count = files.len();
     let channel_capacity = channel_capacity.max(1);
@@ -1494,6 +2374,9 @@ fn spawn_local_producer(
         coalesce_enabled,
         chunk_size_mb = chunk_size_bytes / (1024 * 1024),
         channel_capacity,
+        rechunk_threads = rechunk_threads.min(files.len()).max(1),
+        rechunk_file_window = rechunk_threads.min(files.len()).max(1),
+        per_file_event_capacity = LOCAL_RECHUNK_EVENT_CHANNEL_CAPACITY,
         "local directory rechunk producer"
     );
 
@@ -1503,8 +2386,14 @@ fn spawn_local_producer(
     let producer_handle = std::thread::Builder::new()
         .name("ttl-local-rechunk".into())
         .spawn(move || {
-            let result =
-                local_rechunk_loop(&files, &sizes, chunk_size_bytes, coalesce_enabled, &tx);
+            let result = local_rechunk_loop_parallel(
+                files,
+                sizes,
+                chunk_size_bytes,
+                coalesce_enabled,
+                &tx,
+                rechunk_threads,
+            );
             // Drop tx so workers see EOF, then signal success/failure.
             drop(tx);
             let _ = error_tx.send(result.err());
@@ -1575,7 +2464,7 @@ impl<'a> ImportBuilder<'a> {
         self
     }
 
-    /// Set the overall memory budget in MB. 0 = auto-detect (60% of RAM).
+    /// Set the overall memory budget in MB. 0 = auto-detect (80% of RAM).
     pub fn memory_budget_mb(mut self, mb: usize) -> Self {
         self.config.memory_budget_mb = mb;
         self
@@ -1635,6 +2524,14 @@ impl<'a> ImportBuilder<'a> {
     /// Whether to collect ID-based stats during commit resolution. Default: true.
     pub fn collect_id_stats(mut self, v: bool) -> Self {
         self.config.collect_id_stats = v;
+        self
+    }
+
+    /// First-line interpretation for ndjson/jsonl sources: whether line 1 is a
+    /// shared `@context` map or the first node. No effect on other formats.
+    /// Default: [`FirstLineContextPolicy::Auto`].
+    pub fn ndjson_first_line_context(mut self, policy: FirstLineContextPolicy) -> Self {
+        self.config.ndjson_first_line_context = policy;
         self
     }
 
@@ -1774,6 +2671,33 @@ pub enum DirectoryFormat {
     JsonLd,
 }
 
+/// Enforce the format-family mixing rules shared by local directories and
+/// remote sources: the Turtle family (`.ttl`/`.nt`/`.nq`/`.trig`) and the
+/// JSON-LD family (`.jsonld`/`.jsonl`/`.ndjson`) cannot be mixed, and
+/// whole-document `.jsonld` cannot be mixed with newline-delimited
+/// `.jsonl`/`.ndjson` (they take different parse paths).
+fn validate_format_families(
+    has_turtle: bool,
+    has_jsonld: bool,
+    has_ndjson: bool,
+    source_desc: &str,
+) -> std::result::Result<(), ImportError> {
+    if has_turtle && (has_jsonld || has_ndjson) {
+        return Err(ImportError::MixedFormats(format!(
+            "{source_desc} contains both Turtle-family (.ttl/.nt/.nq/.trig) and \
+             JSON-LD-family (.jsonld/.jsonl/.ndjson) files; use a single format \
+             family per import"
+        )));
+    }
+    if has_jsonld && has_ndjson {
+        return Err(ImportError::MixedFormats(format!(
+            "{source_desc} mixes whole-object .jsonld with newline-delimited \
+             .jsonl/.ndjson files; import them separately"
+        )));
+    }
+    Ok(())
+}
+
 /// Scan a directory and determine its data format.
 ///
 /// Returns [`DirectoryFormat::Turtle`] if all supported files are `.ttl`/`.nt`/`.nq`/`.trig`,
@@ -1783,6 +2707,7 @@ pub enum DirectoryFormat {
 pub fn scan_directory_format(dir: &Path) -> std::result::Result<DirectoryFormat, ImportError> {
     let mut has_turtle = false;
     let mut has_jsonld = false;
+    let mut has_ndjson = false;
 
     for entry in std::fs::read_dir(dir)? {
         let entry = match entry {
@@ -1795,23 +2720,32 @@ pub fn scan_directory_format(dir: &Path) -> std::result::Result<DirectoryFormat,
         // `effective_extension` strips an outer `.gz`/`.zst` so compressed
         // RDF files (`foo.ttl.gz`, `foo.nq.zst`, …) classify identically.
         let inner = effective_extension(&entry.path()).0;
-        match inner.as_deref() {
-            Some("ttl" | "trig" | "nt" | "nq") => has_turtle = true,
-            Some("jsonld") => has_jsonld = true,
-            _ => {}
+        if is_ndjson_ext(inner.as_deref()) {
+            has_ndjson = true;
+        } else {
+            match inner.as_deref() {
+                Some("ttl" | "trig" | "nt" | "nq") => has_turtle = true,
+                Some("jsonld") => has_jsonld = true,
+                _ => {}
+            }
         }
     }
 
-    match (has_turtle, has_jsonld) {
-        (true, true) => Err(ImportError::MixedFormats(format!(
-            "directory {} contains both Turtle (.ttl/.trig) and JSON-LD (.jsonld) files; \
-             use a single format per directory",
-            dir.display(),
-        ))),
-        (true, false) => Ok(DirectoryFormat::Turtle),
+    validate_format_families(
+        has_turtle,
+        has_jsonld,
+        has_ndjson,
+        &format!("directory {}", dir.display()),
+    )?;
+    let has_jsonld_family = has_jsonld || has_ndjson;
+
+    match (has_turtle, has_jsonld_family) {
+        // All-ndjson directories also report JsonLd here (ndjson is a JSON-LD
+        // family); the resolver distinguishes them by extension.
+        (true, _) => Ok(DirectoryFormat::Turtle),
         (false, true) => Ok(DirectoryFormat::JsonLd),
         (false, false) => Err(ImportError::NoChunks(format!(
-            "no supported data files (.ttl, .nt, .nq, .trig, .jsonld) found in {}",
+            "no supported data files (.ttl, .nt, .nq, .trig, .jsonld, .jsonl, .ndjson) found in {}",
             dir.display()
         ))),
     }
@@ -1846,12 +2780,7 @@ fn discover_chunks(dir: &Path) -> std::result::Result<Vec<PathBuf>, ImportError>
         .map(|e| e.path())
         // `effective_extension` strips compression suffixes, so `.ttl.gz`,
         // `.nq.zst`, etc. are accepted alongside their plain counterparts.
-        .filter(|p| {
-            matches!(
-                effective_extension(p).0.as_deref(),
-                Some("ttl" | "nt" | "trig" | "nq" | "jsonld")
-            )
-        })
+        .filter(|p| is_bulk_import_file(p))
         .collect();
 
     chunks.sort();
@@ -1895,41 +2824,64 @@ where
                 let count = objects.len();
                 let total_bytes: u64 = objects.iter().map(|o| o.size_bytes).sum();
                 let in_flight = config.effective_max_inflight();
-
-                // Each remote object is fetched whole into memory by the
-                // producer (MVP does not split single objects via byte-range).
-                // Warn if any object exceeds the configured chunk size — peak
-                // memory will be `largest_object × in_flight`.
                 let chunk_size_bytes = config.effective_chunk_size_mb() as u64 * 1024 * 1024;
-                if let Some(largest) = objects.iter().max_by_key(|o| o.size_bytes) {
-                    if largest.size_bytes > chunk_size_bytes {
-                        tracing::warn!(
-                            address = %largest.address,
-                            size_mb = largest.size_bytes / (1024 * 1024),
-                            chunk_size_mb = config.effective_chunk_size_mb(),
-                            in_flight,
-                            "remote object exceeds configured chunk size; \
-                             single-object byte-range splitting is not yet \
-                             supported — object will be materialized whole. \
-                             Pre-split large objects or raise chunk_size_mb \
-                             to silence this warning."
-                        );
-                    }
-                }
 
-                let producer = spawn_remote_producer(
-                    Arc::clone(storage),
-                    objects,
-                    per_chunk_format,
-                    in_flight,
-                );
-                tracing::info!(
-                    estimated_chunks = count,
-                    total_bytes,
-                    in_flight,
-                    "resolved remote import chunks"
-                );
-                ChunkSource::Remote(producer)
+                // ndjson objects are streamed per-object via byte ranges (one
+                // source → many JSON-LD chunks), in bounded memory; other
+                // formats are fetched whole.
+                let all_ndjson = !per_chunk_format.is_empty()
+                    && per_chunk_format
+                        .iter()
+                        .all(|f| matches!(f, RemoteFormat::Ndjson));
+
+                if all_ndjson {
+                    let producer = spawn_remote_ndjson_producer(
+                        Arc::clone(storage),
+                        objects,
+                        config.ndjson_first_line_context,
+                        chunk_size_bytes,
+                        in_flight,
+                    );
+                    tracing::info!(
+                        objects = count,
+                        total_bytes,
+                        in_flight,
+                        "resolved remote ndjson import (streamed)"
+                    );
+                    ChunkSource::JsonLdStream(producer)
+                } else {
+                    // Each remote object is fetched whole into memory by the
+                    // producer. Warn if any object exceeds the configured chunk
+                    // size — peak memory will be `largest_object × in_flight`.
+                    if let Some(largest) = objects.iter().max_by_key(|o| o.size_bytes) {
+                        if largest.size_bytes > chunk_size_bytes {
+                            tracing::warn!(
+                                address = %largest.address,
+                                size_mb = largest.size_bytes / (1024 * 1024),
+                                chunk_size_mb = config.effective_chunk_size_mb(),
+                                in_flight,
+                                "remote object exceeds configured chunk size; \
+                                 single-object byte-range splitting is not yet \
+                                 supported — object will be materialized whole. \
+                                 Pre-split large objects or raise chunk_size_mb \
+                                 to silence this warning."
+                            );
+                        }
+                    }
+                    let producer = spawn_remote_producer(
+                        Arc::clone(storage),
+                        objects,
+                        per_chunk_format,
+                        in_flight,
+                    );
+                    tracing::info!(
+                        estimated_chunks = count,
+                        total_bytes,
+                        in_flight,
+                        "resolved remote import chunks"
+                    );
+                    ChunkSource::Remote(producer)
+                }
             }
         };
 
@@ -2438,9 +3390,11 @@ where
                         .set_split_mode(env.shared_alloc.split_mode());
                 }
 
+                let finalize_start = Instant::now();
                 let result = finalize_parsed_chunk(state, parsed, ns_delta, env.storage, env.alias)
                     .await
                     .map_err(|e| ImportError::Transact(e.to_string()))?;
+                let finalize_ms = finalize_start.elapsed().as_millis();
 
                 // Fuel: 10 fuel baseline per commit + 1 micro-fuel per flake,
                 // matching the per-chunk-as-transaction model in `stage.rs`.
@@ -2456,6 +3410,8 @@ where
                     previous_commit_hex,
                 });
 
+                let sort_handoff_start = Instant::now();
+                let mut sort_handoff_ms = 0;
                 if let Some(sr) = result.spool_result {
                     spawn_sorted_commit_write(
                         sort_write_handles,
@@ -2467,6 +3423,7 @@ where
                         sr,
                     )
                     .await;
+                    sort_handoff_ms = sort_handoff_start.elapsed().as_millis();
                 }
 
                 *total_commit_size += result.blob_bytes as u64;
@@ -2477,6 +3434,9 @@ where
                     total = env.estimated_total,
                     t = result.t,
                     flakes = result.flake_count,
+                    finalize_ms,
+                    sort_handoff_ms,
+                    pending_chunks = pending.len(),
                     cumulative_flakes = state.cumulative_flakes,
                     flakes_per_sec = format!(
                         "{:.2}M",
@@ -2525,6 +3485,7 @@ where
     let is_remote_parallel = is_remote && remote_all_ttl;
     let is_remote_serial = is_remote && !remote_all_ttl;
     let is_local_rechunk = chunk_source.is_local_rechunk();
+    let is_jsonld_stream = chunk_source.is_jsonld_stream();
     let is_channel_fed = is_streaming || is_remote_parallel || is_local_rechunk;
     let estimated_total = chunk_source.estimated_len();
     let compress = config.compress_commits;
@@ -2989,10 +3950,21 @@ where
                         spool_config: &spool_config,
                     };
                     loop {
+                        let recv_start = Instant::now();
                         let (idx, raw_bytes) = match work_rx.lock().unwrap().recv() {
                             Ok(payload) => payload,
                             Err(_) => break, // Bridge dropped — channel closed.
                         };
+                        let recv_wait_ms = recv_start.elapsed().as_millis();
+                        if recv_wait_ms >= IMPORT_PIPELINE_WAIT_LOG_THRESHOLD_MS {
+                            tracing::info!(
+                                thread_idx,
+                                chunk_idx = idx,
+                                payload_bytes = raw_bytes.len(),
+                                recv_wait_ms,
+                                "parser waited for chunk input"
+                            );
+                        }
 
                         let ttl = match String::from_utf8(raw_bytes) {
                             Ok(s) => s,
@@ -3004,11 +3976,32 @@ where
                         };
 
                         let t = (idx + 1) as i64;
+                        let parse_start = Instant::now();
                         match parse_ttl_chunk(&ttl, &ctx, t, idx) {
                             Ok(parsed) => {
+                                let parse_ms = parse_start.elapsed().as_millis();
+                                let send_start = Instant::now();
                                 if result_tx.send(Ok((idx, parsed))).is_err() {
                                     break;
                                 }
+                                let result_send_wait_ms = send_start.elapsed().as_millis();
+                                if result_send_wait_ms >= IMPORT_PIPELINE_WAIT_LOG_THRESHOLD_MS {
+                                    tracing::info!(
+                                        thread_idx,
+                                        chunk_idx = idx,
+                                        parse_ms,
+                                        result_send_wait_ms,
+                                        "parser waited to hand off parsed chunk"
+                                    );
+                                }
+                                tracing::debug!(
+                                    thread_idx,
+                                    chunk_idx = idx,
+                                    parse_ms,
+                                    recv_wait_ms,
+                                    result_send_wait_ms,
+                                    "parser completed chunk"
+                                );
                             }
                             Err(e) => {
                                 let _ =
@@ -3069,34 +4062,49 @@ where
             },
             "channel-fed import phase complete"
         );
-    } else if is_remote_serial {
-        // Remote serial path: producer fetches each object whole; we drain
-        // the channel one chunk at a time and dispatch to the format-specific
-        // parser (`import_trig_commit` for `.trig`, `parse_jsonld_chunk` for
-        // `.jsonld`, `parse_chunk` otherwise). Mirrors the local serial
-        // fallback below — the only difference is `recv()` vs `read_chunk(i)`.
+    } else if is_remote_serial || is_jsonld_stream {
+        // Serial channel-fed path: chunks arrive one at a time on a shared
+        // channel and are dispatched to the format-specific parser
+        // (`import_trig_commit` for `.trig`, `parse_jsonld_chunk` for
+        // `.jsonld`/ndjson, `parse_chunk` otherwise). Used whenever the source
+        // contains any `.trig`/`.jsonld` objects, or is an ndjson/jsonl stream.
+        // Single-threaded by design (TriG/JSON-LD parsers do not parallelize
+        // across chunks today).
         //
-        // This path is used whenever the remote source contains any `.trig`
-        // or `.jsonld` objects. Performance is single-threaded by design
-        // (TriG/JSON-LD parsers do not parallelize across chunks today).
+        // The remote and ndjson producers expose the same
+        // `Arc<Mutex<Receiver<(usize, Vec<u8>)>>>` chunk channel and the same
+        // `error_rx` completion protocol.
         let (remote_rx, error_rx, bridge_handle) = match &**chunk_source {
-            ChunkSource::Remote(producer) => {
+            ChunkSource::Remote(producer) | ChunkSource::JsonLdStream(producer) => {
                 let error_rx = producer.error_rx.lock().unwrap().take().ok_or_else(|| {
                     ImportError::Transact(
-                        "remote producer error_rx already taken (import re-entered?)".into(),
+                        "producer error_rx already taken (import re-entered?)".into(),
                     )
                 })?;
-                let bridge = producer.bridge_handle.lock().unwrap().take();
-                (Arc::clone(&producer.rx), error_rx, bridge)
+                let bridge_handle = producer.bridge_handle.lock().unwrap().take();
+                (Arc::clone(&producer.rx), error_rx, bridge_handle)
             }
-            _ => unreachable!("is_remote_serial guard"),
+            _ => unreachable!("is_remote_serial || is_jsonld_stream guard"),
         };
 
         let mut next_expected: i64 = 0;
         loop {
-            let (idx, raw_bytes) = match remote_rx.lock().unwrap().recv() {
+            // The blocking recv must not park a runtime worker: the producer
+            // side `block_on`s storage reads from its own threads and relies
+            // on this runtime to drive the IO driver. On a current_thread (or
+            // single-worker) runtime, a sync recv here would deadlock the
+            // whole import — so receive on the blocking pool.
+            let payload = {
+                let rx = Arc::clone(&remote_rx);
+                tokio::task::spawn_blocking(move || rx.lock().unwrap().recv())
+                    .await
+                    .map_err(|e| {
+                        ImportError::Transact(format!("chunk receive task panicked: {e}"))
+                    })?
+            };
+            let (idx, raw_bytes) = match payload {
                 Ok(payload) => payload,
-                Err(_) => break, // Channel closed — bridge thread exited.
+                Err(_) => break, // Channel closed — producer thread exited.
             };
 
             let content = String::from_utf8(raw_bytes)
@@ -3207,24 +4215,34 @@ where
             }
         }
 
+        // Completion: the closed channel above is not sufficient to detect a
+        // producer error (e.g. a malformed ndjson line) — that signal arrives
+        // via `error_rx`.
         if let Some(bridge) = bridge_handle {
-            bridge.join().expect("remote bridge thread panicked");
+            bridge.join().expect("producer thread panicked");
         }
-
-        // Producer error vs clean EOF — same protocol as the parallel arm.
         match error_rx.await {
             Ok(None) => {}
             Ok(Some(err)) => return Err(err),
             Err(_) => {
                 return Err(ImportError::Storage(
-                    "remote producer task dropped without signaling completion".into(),
+                    "producer task dropped without signaling completion".into(),
                 ));
             }
         }
 
+        // The producer finished cleanly but emitted nothing (e.g. an empty or
+        // context-only .jsonl source). Fail here with a clear error — the
+        // alternative is an opaque "no commit head after import" much later.
+        if next_expected == 0 {
+            return Err(ImportError::NoChunks(
+                "source contained no data records (no chunks were produced)".into(),
+            ));
+        }
+
         tracing::info!(
             committed_chunks = next_expected,
-            "remote serial import phase complete"
+            "serial import phase complete"
         );
     } else {
         // File-based path: index-based access to chunk files.
@@ -5059,15 +6077,34 @@ fn build_import_summary(
 
 /// Generate a unique session identifier for directory naming.
 ///
-/// Uses nanosecond timestamp XOR'd for uniqueness. Not cryptographic,
-/// just unique enough for concurrent session directories.
+/// Builds a scratch-directory identifier that is unique across every concurrent
+/// import, even when several import the same ledger alias at the same instant.
+///
+/// The id combines three sources so no two live imports can collide:
+/// - a nanosecond timestamp (human-readable ordering),
+/// - the process id (distinguishes separate processes, e.g. nextest workers,
+///   whose clocks can report the same nanosecond),
+/// - a per-process atomic counter (distinguishes concurrent imports inside one
+///   process, where the clock can be coarser than nanosecond resolution).
+///
+/// This matters because [`derive_session_dir`] keys the import scratch space on
+/// `{alias, session_id}` only. A timestamp-only id let two same-alias imports
+/// land in the same `run_dir`/`remap_dir`, where their parallel vocab merges
+/// truncated each other's mmap'd remap files (`File::create` on a shared path)
+/// and panicked. Not cryptographic — just collision-free for live sessions.
 fn session_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::SystemTime;
-    let seed = SystemTime::now()
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    let nanos = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    format!("{:032x}", seed ^ (seed >> 64))
+    let pid = std::process::id();
+    let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{nanos:032x}-{pid:08x}-{seq:016x}")
 }
 
 /// Derive the session directory path.
@@ -5199,8 +6236,8 @@ mod resource_model_tests {
     /// Serializes env mutation across these tests (process-global env is shared
     /// by all test threads) and guarantees the import override vars are unset for
     /// the body — so a developer/CI environment that exports
-    /// `FLUREE_IMPORT_THREADS` / `FLUREE_IMPORT_HEAVY_WORKERS` cannot perturb the
-    /// resolution logic under test. Vars are restored on drop.
+    /// `FLUREE_IMPORT_THREADS` / related hidden import overrides cannot perturb
+    /// the resolution logic under test. Vars are restored on drop.
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     struct EnvGuard {
@@ -5213,7 +6250,13 @@ mod resource_model_tests {
             let lock = ENV_LOCK
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let vars = ["FLUREE_IMPORT_THREADS", "FLUREE_IMPORT_HEAVY_WORKERS"];
+            let vars = [
+                "FLUREE_IMPORT_THREADS",
+                "FLUREE_IMPORT_HEAVY_WORKERS",
+                "FLUREE_IMPORT_MAX_INFLIGHT",
+                "FLUREE_IMPORT_RECHUNK_THREADS",
+                "FLUREE_IMPORT_COALESCE_THRESHOLD",
+            ];
             let saved = vars
                 .iter()
                 .map(|&k| (k, std::env::var(k).ok()))
@@ -5312,5 +6355,83 @@ mod resource_model_tests {
         // Auto result is min(cores, cap); it must be >= 1 and <= cap.
         let t = c.effective_parse_threads();
         assert!((1..=cap).contains(&t));
+    }
+
+    #[test]
+    fn rechunk_threads_env_override_is_hidden_escape_hatch() {
+        let _env = EnvGuard::clear_overrides();
+        std::env::set_var("FLUREE_IMPORT_RECHUNK_THREADS", "12");
+        let c = cfg(256 * 1024, 128, 32);
+        assert_eq!(c.effective_rechunk_threads(), 12);
+
+        std::env::set_var("FLUREE_IMPORT_RECHUNK_THREADS", "0");
+        assert_eq!(c.effective_rechunk_threads(), 1);
+    }
+
+    #[test]
+    fn parallel_local_rechunk_matches_serial_order_and_coalescing() {
+        let _env = EnvGuard::clear_overrides();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let inputs = [
+            (
+                "000.nt",
+                "<http://example/s0> <http://example/p> <http://example/o> .\n",
+            ),
+            (
+                "001.nt",
+                "<http://example/s1> <http://example/p> <http://example/o> .\n",
+            ),
+            ("002.nt", "_:b0 <http://example/p> <http://example/o> .\n"),
+            (
+                "003.nt",
+                "<http://example/s3> <http://example/p> <http://example/o> .\n",
+            ),
+        ];
+
+        let files: Vec<PathBuf> = inputs
+            .iter()
+            .map(|(name, contents)| {
+                let path = dir.path().join(name);
+                std::fs::write(&path, contents).expect("write fixture");
+                path
+            })
+            .collect();
+        let sizes: Vec<u64> = files
+            .iter()
+            .map(|p| std::fs::metadata(p).expect("metadata").len())
+            .collect();
+        let chunk_size_bytes = 1024;
+        let coalesce_enabled = true;
+
+        let (serial_tx, serial_rx) = std::sync::mpsc::sync_channel(16);
+        local_rechunk_loop(
+            &files,
+            &sizes,
+            chunk_size_bytes,
+            coalesce_enabled,
+            &serial_tx,
+        )
+        .expect("serial rechunk");
+        drop(serial_tx);
+        let serial: Vec<_> = serial_rx.into_iter().collect();
+
+        let (parallel_tx, parallel_rx) = std::sync::mpsc::sync_channel(16);
+        local_rechunk_loop_parallel(
+            files,
+            sizes,
+            chunk_size_bytes,
+            coalesce_enabled,
+            &parallel_tx,
+            4,
+        )
+        .expect("parallel rechunk");
+        drop(parallel_tx);
+        let parallel: Vec<_> = parallel_rx.into_iter().collect();
+
+        assert_eq!(parallel, serial);
+        assert_eq!(parallel.len(), 3, "first two files should coalesce");
+        assert_eq!(parallel[0].0, 0);
+        assert_eq!(parallel[1].0, 1);
+        assert_eq!(parallel[2].0, 2);
     }
 }

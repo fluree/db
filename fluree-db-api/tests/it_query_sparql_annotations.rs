@@ -428,6 +428,42 @@ async fn sparql_reifies_hidden_in_annotation_block_body_is_rejected() {
 }
 
 #[tokio::test]
+async fn sparql_with_scoped_annotation_template_is_rejected() {
+    // `WITH <g>` re-homes default-position template triples into <g> after
+    // annotation expansion, but v1 expansion omits f:reifiesGraph (the edge
+    // identity is default-graph). Allowing it would mint graph-tagged
+    // reifications carrying a default-graph edge identity — a broken edge
+    // that never hydrates or cascades. Reject until graph-aware expansion
+    // lands. Annotation tails inside explicit GRAPH blocks are rejected
+    // separately by the quad-pattern expansion.
+    let ledger0 = {
+        let fluree = FlureeBuilder::memory().build_memory();
+        genesis_ledger(&fluree, "it/sparql-ann-update/with-scoped-rej")
+    };
+    let update = r#"
+        PREFIX ex: <http://example.org/>
+        WITH <http://example.org/g>
+        INSERT { ?person ex:worksFor ex:acme {| ex:role "Engineer" |} }
+        WHERE  { ?person a ex:Person }
+    "#;
+    let parsed = fluree_db_sparql::parse_sparql(update);
+    assert!(
+        !parsed.has_errors(),
+        "parse should succeed: {:?}",
+        parsed.diagnostics
+    );
+    let ast = parsed.ast.unwrap();
+    let mut ns = NamespaceRegistry::from_db(&ledger0.snapshot);
+    let err = fluree_db_transact::lower_sparql_update_ast(&ast, &mut ns, TxnOpts::default())
+        .expect_err("annotation tail on a WITH-scoped template must be rejected");
+    let msg = format!("{err:?} {err}");
+    assert!(
+        msg.contains("WITH-scoped"),
+        "expected WITH-scoped annotation rejection, got: {msg}"
+    );
+}
+
+#[tokio::test]
 async fn sparql_user_authored_reifies_in_insert_data_is_rejected() {
     let ledger0 = {
         let fluree = FlureeBuilder::memory().build_memory();

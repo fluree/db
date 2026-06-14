@@ -5,9 +5,10 @@
 
 use crate::ir::ReasoningModes;
 use crate::reasoning::{global_reasoning_cache, reason_owl2rl, ReasoningOverlay};
+use crate::Result;
 use fluree_db_core::{
-    is_rdfs_subclass_of, is_rdfs_subproperty_of, overlay::OverlayProvider, GraphDbRef, GraphId,
-    IndexSchema, LedgerSnapshot, SchemaHierarchy, SchemaPredicateInfo,
+    overlay::OverlayProvider, GraphDbRef, GraphId, IndexSchema, LedgerSnapshot, SchemaHierarchy,
+    SchemaPredicateInfo,
 };
 use fluree_db_reasoner::{
     DerivedFactsBuilder, DerivedFactsOverlay, FrozenSameAs, ReasoningOptions,
@@ -17,48 +18,66 @@ use std::sync::Arc;
 
 /// Build schema hierarchy from database and overlay
 ///
-/// Merges overlay rdfs:subClassOf and rdfs:subPropertyOf assertions
-/// with the existing database schema to create a unified hierarchy view.
-pub fn schema_hierarchy_with_overlay(
+/// Reads `rdfs:subClassOf` and `rdfs:subPropertyOf` assertions from the full
+/// snapshot (indexed root *and* committed-but-unindexed novelty) plus the
+/// overlay, and merges them with the existing database schema to create a
+/// unified hierarchy view.
+///
+/// Reading via the range provider (rather than only `overlay` flakes) is
+/// essential: right after `fluree create`/import, the ontology axioms live in
+/// committed-but-not-yet-background-indexed data. Those flakes are invisible to
+/// both an overlay scan and `snapshot.schema` (the last indexed root), so an
+/// overlay-only scan returned an empty hierarchy and silently disabled RDFS
+/// query rewriting until background indexing happened to run. OWL2-QL already
+/// read its axioms through the range provider (`Ontology::from_db`); this brings
+/// RDFS in line so subclass/subproperty expansion works on a freshly imported
+/// ledger.
+pub async fn schema_hierarchy_with_overlay(
     snapshot: &LedgerSnapshot,
     overlay: &dyn fluree_db_core::OverlayProvider,
     to_t: i64,
-) -> Option<SchemaHierarchy> {
+) -> Result<Option<SchemaHierarchy>> {
     use fluree_db_core::value::FlakeValue;
+    use fluree_db_core::{IndexType, RangeMatch, RangeTest, Sid};
+    use fluree_vocab::namespaces::RDFS;
 
-    // Build child -> parents from overlay rdfs:subClassOf assertions.
+    // Build child -> parents from rdfs:subClassOf assertions.
     let mut subclass_of: HashMap<fluree_db_core::Sid, Vec<fluree_db_core::Sid>> = HashMap::new();
-    // Build child -> parents from overlay rdfs:subPropertyOf assertions.
+    // Build child -> parents from rdfs:subPropertyOf assertions.
     let mut subproperty_of: HashMap<fluree_db_core::Sid, Vec<fluree_db_core::Sid>> = HashMap::new();
-    overlay.for_each_overlay_flake(
-        0, // default graph — schema hierarchy is default-graph only
-        fluree_db_core::IndexType::Psot,
-        None,
-        None,
-        true,
-        to_t,
-        &mut |flake| {
-            if !is_rdfs_subclass_of(&flake.p) {
-                // fall through for subPropertyOf
-            } else if let FlakeValue::Ref(parent) = &flake.o {
-                subclass_of
-                    .entry(flake.s.clone())
-                    .or_default()
-                    .push(parent.clone());
-                return;
-            }
 
-            if !is_rdfs_subproperty_of(&flake.p) {
-                return;
+    // Scan the full default-graph state (indexed + unindexed commits + overlay).
+    let db = GraphDbRef::new(snapshot, 0, overlay, to_t);
+
+    for flake in db
+        .range(
+            IndexType::Psot,
+            RangeTest::Eq,
+            RangeMatch::predicate(Sid::new(RDFS, "subClassOf")),
+        )
+        .await?
+    {
+        if flake.op {
+            if let FlakeValue::Ref(parent) = flake.o {
+                subclass_of.entry(flake.s).or_default().push(parent);
             }
-            if let FlakeValue::Ref(parent) = &flake.o {
-                subproperty_of
-                    .entry(flake.s.clone())
-                    .or_default()
-                    .push(parent.clone());
+        }
+    }
+
+    for flake in db
+        .range(
+            IndexType::Psot,
+            RangeTest::Eq,
+            RangeMatch::predicate(Sid::new(RDFS, "subPropertyOf")),
+        )
+        .await?
+    {
+        if flake.op {
+            if let FlakeValue::Ref(parent) = flake.o {
+                subproperty_of.entry(flake.s).or_default().push(parent);
             }
-        },
-    );
+        }
+    }
 
     // Merge overlay edges into the LedgerSnapshot's existing schema (if any).
     //
@@ -136,25 +155,71 @@ pub fn schema_hierarchy_with_overlay(
     schema.pred.vals = vals;
 
     if schema.pred.vals.is_empty() {
-        None
+        Ok(None)
     } else {
-        Some(SchemaHierarchy::from_db_root_schema(&schema))
+        Ok(Some(SchemaHierarchy::from_db_root_schema(&schema)))
     }
 }
 
-/// Compute effective reasoning modes given query options and available hierarchy
+/// Build the OWL2-RL materialization budget for this query.
 ///
-/// Applies auto-RDFS when:
-/// - No explicit reasoning modes are set in query
-/// - Reasoning is not explicitly disabled ("reasoning": "none")
-/// - A schema hierarchy is available
-pub fn effective_reasoning_modes(
-    configured: &ReasoningModes,
-    hierarchy_available: bool,
-) -> ReasoningModes {
-    configured
-        .clone()
-        .effective_with_hierarchy(hierarchy_available)
+/// Layered, lowest to highest precedence:
+/// 1. built-in default (1M facts / 30s),
+/// 2. server env (`FLUREE_REASONING_MAX_FACTS` / `FLUREE_REASONING_MAX_SECONDS`)
+///    — operator-wide override,
+/// 3. `modes.max_facts` / `modes.max_seconds` — the merged ledger-config /
+///    per-query budget (override control is enforced upstream at the view
+///    layer, so by the time it reaches here the value is authoritative).
+///
+/// Datasets whose closure exceeds the budget get a CAPPED (incomplete)
+/// materialization — see the warning in [`compute_derived_facts`].
+fn reasoning_budget(modes: &ReasoningModes) -> fluree_db_reasoner::ReasoningBudget {
+    let mut budget = fluree_db_reasoner::ReasoningBudget::default();
+    // The env vars are re-read on every call deliberately: they are a live
+    // operator tuning knob (no restart needed), and two getenv calls per
+    // reasoning query are negligible next to materialization itself.
+    if let Some(max_facts) = budget_env_var::<usize>("FLUREE_REASONING_MAX_FACTS") {
+        budget.max_facts = max_facts;
+    }
+    if let Some(max_secs) = budget_env_var::<u64>("FLUREE_REASONING_MAX_SECONDS") {
+        budget.max_duration = std::time::Duration::from_secs(max_secs);
+    }
+    if let Some(max_facts) = modes.max_facts {
+        budget.max_facts = max_facts as usize;
+    }
+    if let Some(max_secs) = modes.max_seconds {
+        budget.max_duration = std::time::Duration::from_secs(max_secs);
+    }
+    budget
+}
+
+/// Read and parse a reasoning-budget env var, warning (instead of silently
+/// ignoring) when a set value doesn't parse.
+fn budget_env_var<T: std::str::FromStr>(name: &str) -> Option<T> {
+    let raw = std::env::var(name).ok()?;
+    match raw.parse::<T>() {
+        Ok(v) => Some(v),
+        Err(_) => {
+            tracing::warn!(
+                name,
+                value = %raw,
+                "ignoring unparseable reasoning budget env var"
+            );
+            None
+        }
+    }
+}
+
+/// Result of [`compute_derived_facts`]: the overlay plus the OWL2-RL
+/// materialization diagnostics (when OWL2-RL ran), so callers can surface a
+/// capped (incomplete) closure in response metadata instead of only logging.
+#[derive(Default)]
+pub struct DerivedFactsOutcome {
+    /// Combined derived-facts overlay (OWL2-RL and/or datalog), if any.
+    pub overlay: Option<Arc<DerivedFactsOverlay>>,
+    /// OWL2-RL materialization diagnostics; `None` when OWL2-RL didn't run
+    /// (datalog-only reasoning) or failed.
+    pub diagnostics: Option<fluree_db_reasoner::ReasoningDiagnostics>,
 }
 
 /// Compute derived facts from OWL2-RL reasoning and/or user-defined datalog rules
@@ -171,25 +236,62 @@ pub async fn compute_derived_facts(
     to_t: i64,
     reasoning: &ReasoningModes,
     rules_source_g_id: Option<GraphId>,
-) -> Option<Arc<DerivedFactsOverlay>> {
+) -> DerivedFactsOutcome {
     use crate::datalog_rules::execute_datalog_rules_with_query_rules;
 
     let mut all_flakes: Vec<fluree_db_core::Flake> = Vec::new();
     let mut same_as = FrozenSameAs::empty();
+    let mut diagnostics = None;
 
     // OWL2-RL materialization
     if reasoning.owl2rl {
         tracing::debug!("computing OWL2-RL derived facts");
-        let reasoning_opts = ReasoningOptions::default();
+        let reasoning_opts = ReasoningOptions {
+            budget: reasoning_budget(reasoning),
+            ..Default::default()
+        };
         let cache = global_reasoning_cache();
         let db = GraphDbRef::new(snapshot, g_id, overlay, to_t);
         match reason_owl2rl(db, &reasoning_opts, cache).await {
             Ok(result) => {
-                tracing::debug!(
-                    derived_facts = result.diagnostics.facts_derived,
-                    "OWL2-RL reasoning completed"
-                );
-                // Collect flakes from the OWL2-RL overlay
+                if result.diagnostics.capped {
+                    // A capped materialization is an INCOMPLETE closure:
+                    // reasoning queries will silently miss entailments. Make
+                    // this loud — it is a correctness event, not a perf detail.
+                    tracing::warn!(
+                        derived_facts = result.diagnostics.facts_derived,
+                        capped_reason = result.diagnostics.capped_reason.as_deref(),
+                        iterations = result.diagnostics.iterations,
+                        duration_ms = result.diagnostics.duration.as_millis() as u64,
+                        "OWL2-RL materialization hit its budget before reaching \
+                         fixpoint; query results may be missing entailments. \
+                         Raise the budget via f:reasoningMaxFacts/f:reasoningMaxSeconds \
+                         (ledger config), \"reasoningBudget\" (query), or \
+                         FLUREE_REASONING_MAX_FACTS/FLUREE_REASONING_MAX_SECONDS (server)."
+                    );
+                } else {
+                    tracing::debug!(
+                        derived_facts = result.diagnostics.facts_derived,
+                        iterations = result.diagnostics.iterations,
+                        duration_ms = result.diagnostics.duration.as_millis() as u64,
+                        "OWL2-RL reasoning completed"
+                    );
+                }
+                diagnostics = Some(result.diagnostics.clone());
+
+                // Without datalog there is nothing to combine: hand the
+                // prebuilt (cached, pre-sorted) overlay straight to
+                // execution instead of re-collecting and re-sorting its
+                // flakes on every query.
+                if !reasoning.datalog {
+                    return DerivedFactsOutcome {
+                        overlay: (!result.overlay.is_empty()).then(|| result.overlay.clone()),
+                        diagnostics,
+                    };
+                }
+
+                // Datalog chains off OWL entailments — collect flakes so
+                // both rule sets land in one combined overlay below.
                 result.overlay.for_each_overlay_flake(
                     0, // derived facts are default-graph only
                     fluree_db_core::IndexType::Spot,
@@ -264,7 +366,10 @@ pub async fn compute_derived_facts(
 
     // If we computed any derived facts, wrap them in a DerivedFactsOverlay
     if all_flakes.is_empty() {
-        return None;
+        return DerivedFactsOutcome {
+            overlay: None,
+            diagnostics,
+        };
     }
 
     let mut builder = DerivedFactsBuilder::new();
@@ -273,26 +378,8 @@ pub async fn compute_derived_facts(
     }
 
     let derived_overlay = builder.build(same_as, overlay.epoch());
-    Some(Arc::new(derived_overlay))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_effective_reasoning_modes_with_hierarchy() {
-        let modes = ReasoningModes::default();
-        let effective = effective_reasoning_modes(&modes, true);
-        // With hierarchy available and no explicit modes, should enable RDFS
-        assert!(effective.rdfs);
-    }
-
-    #[test]
-    fn test_effective_reasoning_modes_without_hierarchy() {
-        let modes = ReasoningModes::default();
-        let effective = effective_reasoning_modes(&modes, false);
-        // Without hierarchy, should not enable auto-RDFS
-        assert!(!effective.rdfs);
+    DerivedFactsOutcome {
+        overlay: Some(Arc::new(derived_overlay)),
+        diagnostics,
     }
 }

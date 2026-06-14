@@ -25,6 +25,7 @@
 use crate::binding::{Batch, Binding};
 use crate::context::ExecutionContext;
 use crate::error::Result;
+use crate::object_binding::{equality_norm_store, normalize_for_key};
 use crate::operator::{
     compute_trimmed_vars, effective_schema, trim_batch, BoxedOperator, Operator, OperatorState,
 };
@@ -59,6 +60,10 @@ pub struct GroupByOperator {
     group_key_indices: Vec<usize>,
     /// Variables required by downstream operators; if set, output is trimmed.
     out_schema: Option<Arc<[VarId]>>,
+    /// Store for normalizing decoded group-key bindings to encoded form so
+    /// mixed-representation streams land in one group. `None` outside
+    /// single-ledger binary execution.
+    norm_store: Option<Arc<fluree_db_binary_index::BinaryIndexStore>>,
 }
 
 impl GroupByOperator {
@@ -94,6 +99,7 @@ impl GroupByOperator {
             emit_iter: None,
             group_key_indices,
             out_schema: None,
+            norm_store: None,
         }
     }
 
@@ -107,7 +113,7 @@ impl GroupByOperator {
     fn extract_group_key(&self, row: &[Binding]) -> Vec<Binding> {
         self.group_key_indices
             .iter()
-            .map(|&idx| row[idx].clone())
+            .map(|&idx| normalize_for_key(&row[idx], self.norm_store.as_deref()))
             .collect()
     }
 
@@ -166,6 +172,9 @@ impl Operator for GroupByOperator {
         self.state = OperatorState::Open;
         self.groups.clear();
         self.emit_iter = None;
+        if self.norm_store.is_none() {
+            self.norm_store = equality_norm_store(ctx);
+        }
         Ok(())
     }
 
@@ -200,6 +209,7 @@ impl Operator for GroupByOperator {
 
                 // Drain all input from child
                 loop {
+                    ctx.check_cancelled()?;
                     let next_start = Instant::now();
                     let next = self
                         .child
@@ -211,6 +221,7 @@ impl Operator for GroupByOperator {
                     let Some(batch) = next else {
                         break;
                     };
+                    ctx.check_cancelled()?;
                     input_batches += 1;
                     if batch.is_empty() {
                         continue;
@@ -234,6 +245,7 @@ impl Operator for GroupByOperator {
                         self.groups.entry(group_key).or_default().push(row);
                     }
                     process_rows_ms += (proc_start.elapsed().as_secs_f64() * 1000.0) as u64;
+                    ctx.check_cancelled()?;
                 }
 
                 span.record("input_batches", input_batches);

@@ -177,6 +177,11 @@ Build the server with the `otel` feature flag:
 cargo build -p fluree-db-server --features otel --release
 ```
 
+> **Building via the CLI crate?** Feature flags do not propagate across
+> binaries: `cargo build -p fluree-db-cli --features otel` enables OTEL only
+> for the CLI's import pipeline, not for the server the daemon launches. Use
+> `--features "otel,fluree-db-server/otel"` to enable both.
+
 Then set environment variables to configure the OTLP exporter:
 
 ```bash
@@ -274,6 +279,7 @@ Additional spans: `binary_cursor_next_leaf`, `property_join`, `group_by`, `aggre
 
 ```
 query_execute (debug)
+├── ledger_view_load (debug, ledger_id, cold_binary_store — view acquisition; the pre-prepare phase, multi-second on cold ledgers)
 ├── query_prepare (debug)
 │   ├── reasoning_prep (debug)
 │   ├── pattern_rewrite (debug, patterns_before, patterns_after)
@@ -282,6 +288,11 @@ query_execute (debug)
 │   ├── scan (debug)
 │   ├── join (debug)
 │   │   └── join_next_batch (debug, per iteration)
+│   ├── cyclic_scan_relation (debug, per cyclic edge: predicate, mode=full|probed, rows; cross-thread when scans parallelize)
+│   ├── cyclic_index_build (debug, per cyclic edge: predicate, rows; cross-thread when scans parallelize)
+│   ├── cyclic_prune (debug: rows_before, rows_after, passes)
+│   ├── cyclic_wedge_build (debug, squares only)
+│   ├── cyclic_enumerate (debug, per output batch: strategy, rows)
 │   ├── filter (debug)
 │   ├── project (debug)
 │   ├── sort (debug)
