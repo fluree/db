@@ -40,8 +40,8 @@ use thiserror::Error;
 
 use fluree_db_cypher::ast::{
     CreateClause, CypherAst, DeleteClause, Direction, Expr, Label, Literal, MapLit, MatchClause,
-    NodePattern, Pattern, PatternPart, ReadClause, RelPattern, RemoveClause, RemoveItem, SetClause,
-    SetItem, Statement, Update, Variable, WriteClause,
+    MergeClause, NodePattern, Pattern, PatternPart, ReadClause, RelPattern, RemoveClause,
+    RemoveItem, SetClause, SetItem, Statement, Update, Variable, WriteClause,
 };
 
 use crate::ir::{TemplateTerm, TripleTemplate, Txn, TxnOpts, TxnType};
@@ -213,17 +213,13 @@ impl<'a> CypherLowering<'a> {
                     self.require_match(has_match, "DELETE")?;
                     self.lower_delete(d)?;
                 }
-                WriteClause::Merge(_) => {
-                    return Err(LowerCypherError::unsupported(
-                        "MERGE is deferred. Cypher's find-or-create semantics need a \
-                         search-first phase that the existing TxnType variants don't \
-                         model (Insert is unconditional; Upsert is delete-then-insert; \
-                         Update silently skips unbound variables). A v1.1 implementation \
-                         can layer it at the API level: snapshot-query for the \
-                         identifying pattern, then conditionally stage CREATE-shape \
-                         flakes when no match is found, or apply ON MATCH SET when \
-                         matches exist.",
-                    ));
+                WriteClause::Merge(m) => {
+                    if has_match {
+                        return Err(LowerCypherError::unsupported(
+                            "MATCH … MERGE is deferred — v1 supports standalone single-node MERGE",
+                        ));
+                    }
+                    self.lower_merge(m)?;
                 }
             }
         }
@@ -608,6 +604,156 @@ impl<'a> CypherLowering<'a> {
         )
     }
 
+    // ---- MERGE ----------------------------------------------------------
+
+    /// Single-node MERGE (find-or-create). The identifying pattern (labels +
+    /// inline props) becomes a `NOT EXISTS` guard: when no match exists the
+    /// guard yields one empty solution and the create templates fire once
+    /// against a fresh node (folding in `ON CREATE SET`); when a match exists
+    /// the guard yields zero rows and nothing is inserted. The zero-row =
+    /// no-op behavior relies on the SPARQL-UPDATE staging fix (a present WHERE
+    /// matching nothing no longer fires all-literal inserts).
+    fn lower_merge(&mut self, m: &MergeClause) -> Result<(), LowerCypherError> {
+        if m.pattern.parts.len() != 1 || !m.pattern.parts[0].tail.is_empty() {
+            return Err(LowerCypherError::unsupported(
+                "relationship / multi-part MERGE is deferred — v1 supports single-node MERGE",
+            ));
+        }
+        if !m.on_match.is_empty() {
+            return Err(LowerCypherError::unsupported(
+                "MERGE … ON MATCH SET is deferred — it needs a complementary guarded \
+                 operation (create is the NOT EXISTS branch; ON MATCH SET is the EXISTS \
+                 branch). v1 supports MERGE [ON CREATE SET …].",
+            ));
+        }
+        let node = &m.pattern.parts[0].head;
+        if node.labels.is_empty() && node.props.is_none() {
+            return Err(LowerCypherError::rejected(
+                "bare MERGE `(n)` — a MERGE node needs a label or property to identify it",
+            ));
+        }
+
+        self.txn_type = TxnType::Update;
+
+        // NOT EXISTS guard over a fresh probe var: the full identifying pattern.
+        let probe_name = format!("?#__cy_merge_{}", self.synth_counter);
+        self.synth_counter += 1;
+        let probe = UnresolvedTerm::Var(Arc::from(probe_name.as_str()));
+        let guard = self.build_merge_guard(node, &probe)?;
+        self.where_patterns.push(UnresolvedPattern::NotExists(guard));
+
+        // Create branch: a fresh node (blank node, keyed on the MERGE var so
+        // ON CREATE SET shares the subject) carrying the identifying
+        // labels/props, plus ON CREATE SET inserts.
+        let new_subj = self.node_subject(node);
+        self.lower_node_create(node, new_subj.clone())?;
+        let merge_var = node.var.as_ref().map(|v| v.name.clone());
+        for item in &m.on_create {
+            self.emit_on_create_set(&new_subj, merge_var.as_deref(), item)?;
+        }
+        Ok(())
+    }
+
+    fn build_merge_guard(
+        &mut self,
+        node: &NodePattern,
+        probe: &UnresolvedTerm,
+    ) -> Result<Vec<UnresolvedPattern>, LowerCypherError> {
+        let mut guard = Vec::new();
+        for Label { name, .. } in &node.labels {
+            let label_iri = self.resolve_iri(name);
+            guard.push(UnresolvedPattern::Triple(UnresolvedTriplePattern {
+                s: probe.clone(),
+                p: UnresolvedTerm::Iri(Arc::from(rdf::TYPE)),
+                o: UnresolvedTerm::Iri(Arc::from(label_iri.as_str())),
+                dtc: None,
+            }));
+        }
+        if let Some(props) = &node.props {
+            for (key, val_expr) in &props.entries {
+                let pred_iri = self.resolve_predicate(key)?;
+                let obj = self.match_object_term(val_expr)?;
+                guard.push(UnresolvedPattern::Triple(UnresolvedTriplePattern {
+                    s: probe.clone(),
+                    p: UnresolvedTerm::Iri(Arc::from(pred_iri.as_str())),
+                    o: obj,
+                    dtc: None,
+                }));
+            }
+        }
+        Ok(guard)
+    }
+
+    /// Emit an `ON CREATE SET` item as a plain insert on the freshly created
+    /// node (no retract — the node is new). The target must be the MERGE
+    /// node's variable.
+    fn emit_on_create_set(
+        &mut self,
+        subj: &TemplateTerm,
+        merge_var: Option<&str>,
+        item: &SetItem,
+    ) -> Result<(), LowerCypherError> {
+        let target_ok = |t: &Variable| matches!(merge_var, Some(v) if v == t.name);
+        match item {
+            SetItem::Property {
+                target,
+                property,
+                value,
+            } => {
+                if !target_ok(target) {
+                    return Err(merge_target_err());
+                }
+                if matches!(value, Expr::Lit(Literal::Null(_))) {
+                    return Ok(()); // null on a new node asserts nothing
+                }
+                let pred_iri = self.resolve_predicate(property)?;
+                let pred_sid = self.ns.sid_for_iri(&pred_iri);
+                let obj = self.expr_to_object(value)?;
+                self.insert_templates.push(TripleTemplate::new(
+                    subj.clone(),
+                    TemplateTerm::Sid(pred_sid),
+                    obj,
+                ));
+            }
+            SetItem::MapMerge { target, map } => {
+                if !target_ok(target) {
+                    return Err(merge_target_err());
+                }
+                for (key, val) in &map.entries {
+                    let pred_iri = self.resolve_predicate(key)?;
+                    let pred_sid = self.ns.sid_for_iri(&pred_iri);
+                    let obj = self.expr_to_object(val)?;
+                    self.insert_templates.push(TripleTemplate::new(
+                        subj.clone(),
+                        TemplateTerm::Sid(pred_sid),
+                        obj,
+                    ));
+                }
+            }
+            SetItem::Labels { target, labels } => {
+                if !target_ok(target) {
+                    return Err(merge_target_err());
+                }
+                let rdf_type_sid = self.ns.sid_for_iri(rdf::TYPE);
+                for label in labels {
+                    let iri = self.resolve_iri(label);
+                    let sid = self.ns.sid_for_iri(&iri);
+                    self.insert_templates.push(TripleTemplate::new(
+                        subj.clone(),
+                        TemplateTerm::Sid(rdf_type_sid.clone()),
+                        TemplateTerm::Sid(sid),
+                    ));
+                }
+            }
+            SetItem::MapReplace { .. } => {
+                return Err(LowerCypherError::unsupported(
+                    "ON CREATE SET n = {…} (replace) is deferred",
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Emit `OPTIONAL { ?target <pred> ?old }` plus a delete template for
     /// `(?target, <pred>, ?old)`. Shared by SET (replace) and REMOVE.
     fn push_optional_old_value(&mut self, target: &str, pred_iri: &str, pred_sid: &Sid) {
@@ -883,6 +1029,10 @@ fn require_node_match_anchored(node: &NodePattern) -> Result<(), LowerCypherErro
 /// keeping the WHERE side and the DELETE/INSERT templates on the same id.
 fn var_name(name: &str) -> String {
     format!("?{name}")
+}
+
+fn merge_target_err() -> LowerCypherError {
+    LowerCypherError::rejected("ON CREATE SET target must be the MERGE node variable")
 }
 
 fn lower_literal_unresolved(lit: &Literal) -> Result<LiteralValue, LowerCypherError> {

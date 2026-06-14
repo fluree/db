@@ -604,18 +604,98 @@ async fn transact_cypher_detach_delete_works_on_indexed_data() {
 }
 
 #[tokio::test]
-async fn transact_cypher_merge_returns_specific_deferred_error() {
+async fn transact_cypher_merge_creates_then_is_a_noop() {
+    // MERGE = find-or-create: the first run creates the node, the second run
+    // finds the existing one and inserts nothing (single-Txn NOT EXISTS guard).
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "it/cypher:merge-deferred");
+    let l = genesis_ledger(&fluree, "it/cypher:merge");
 
-    let err = fluree
-        .transact_cypher(ledger0, "MERGE (n:Person {name: \"Alice\"})")
+    let l = fluree
+        .transact_cypher(l, r#"MERGE (n:Person {name: "Alice"})"#)
         .await
-        .expect_err("MERGE should be deferred");
-    let msg = format!("{err}");
-    assert!(
-        msg.contains("MERGE"),
-        "expected MERGE-specific deferral, got: {msg}"
+        .expect("merge create")
+        .ledger;
+    let db = graphdb_from_ledger(&l);
+    assert_eq!(
+        fluree
+            .query_cypher(&db, "MATCH (n:Person) RETURN n")
+            .await
+            .expect("after first merge")
+            .row_count(),
+        1,
+        "first MERGE creates the node"
+    );
+
+    // Second identical MERGE must not create a duplicate.
+    let l = fluree
+        .transact_cypher(l, r#"MERGE (n:Person {name: "Alice"})"#)
+        .await
+        .expect("merge match")
+        .ledger;
+    let db = graphdb_from_ledger(&l);
+    assert_eq!(
+        fluree
+            .query_cypher(&db, "MATCH (n:Person) RETURN n")
+            .await
+            .expect("after second merge")
+            .row_count(),
+        1,
+        "second MERGE finds the existing node — no duplicate"
+    );
+}
+
+#[tokio::test]
+async fn transact_cypher_merge_on_create_set_fires_only_on_create() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = genesis_ledger(&fluree, "it/cypher:merge-on-create");
+
+    // Create Bob with role=admin via ON CREATE SET.
+    let l = fluree
+        .transact_cypher(
+            l,
+            r#"MERGE (n:Person {name: "Bob"}) ON CREATE SET n.role = "admin""#,
+        )
+        .await
+        .expect("merge create")
+        .ledger;
+    let db = graphdb_from_ledger(&l);
+    assert_eq!(
+        fluree
+            .query_cypher(&db, r#"MATCH (n:Person {role: "admin"}) RETURN n"#)
+            .await
+            .expect("role admin")
+            .row_count(),
+        1,
+        "ON CREATE SET applied on first create"
+    );
+
+    // Second MERGE with a different ON CREATE SET must NOT fire (Bob exists).
+    let l = fluree
+        .transact_cypher(
+            l,
+            r#"MERGE (n:Person {name: "Bob"}) ON CREATE SET n.role = "guest""#,
+        )
+        .await
+        .expect("merge match")
+        .ledger;
+    let db = graphdb_from_ledger(&l);
+    assert_eq!(
+        fluree
+            .query_cypher(&db, r#"MATCH (n:Person {role: "guest"}) RETURN n"#)
+            .await
+            .expect("role guest")
+            .row_count(),
+        0,
+        "ON CREATE SET must not fire when the node already exists"
+    );
+    assert_eq!(
+        fluree
+            .query_cypher(&db, r#"MATCH (n:Person {role: "admin"}) RETURN n"#)
+            .await
+            .expect("role still admin")
+            .row_count(),
+        1,
+        "original role unchanged"
     );
 }
 

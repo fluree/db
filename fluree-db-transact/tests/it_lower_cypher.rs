@@ -163,10 +163,14 @@ fn detach_delete_emits_inbound_and_outbound_scans() {
 }
 
 #[test]
-fn merge_and_bare_delete_are_deferred() {
+fn deferred_write_shapes_are_rejected() {
     for src in [
-        "MERGE (n:Person {name: \"A\"})",
+        // Bare DELETE n needs a relationship-existence probe.
         "MATCH (n:Person) DELETE n",
+        // MERGE ON MATCH SET needs a complementary EXISTS branch.
+        "MERGE (n:Person {name: \"A\"}) ON MATCH SET n.x = 1",
+        // Relationship MERGE is deferred.
+        "MERGE (a:Person {name: \"A\"})-[:KNOWS]->(b:Person {name: \"B\"})",
     ] {
         let out = parse_cypher(src);
         if out.has_errors() {
@@ -251,6 +255,30 @@ fn match_remove_property_emits_delete_only() {
         txn.delete_templates[0].object,
         TemplateTerm::Var(_)
     ));
+}
+
+#[test]
+fn merge_single_node_emits_not_exists_guard_and_create_inserts() {
+    use fluree_db_query::parse::UnresolvedPattern;
+    let txn = lower(r#"MERGE (n:Person {name: "Alice"})"#);
+    assert_eq!(txn.txn_type, TxnType::Update);
+    // One NOT EXISTS guard over the identifying pattern.
+    assert_eq!(txn.where_patterns.len(), 1, "where: {:?}", txn.where_patterns);
+    assert!(matches!(
+        txn.where_patterns[0],
+        UnresolvedPattern::NotExists(_)
+    ));
+    // Create branch: label + name = 2 inserts, no deletes.
+    assert_eq!(txn.insert_templates.len(), 2);
+    assert_eq!(txn.delete_templates.len(), 0);
+}
+
+#[test]
+fn merge_on_create_set_adds_inserts() {
+    let txn = lower(r#"MERGE (n:Person {name: "Alice"}) ON CREATE SET n.created = "yes""#);
+    // label + name + created = 3 inserts.
+    assert_eq!(txn.insert_templates.len(), 3, "inserts: {:?}", txn.insert_templates);
+    assert_eq!(txn.delete_templates.len(), 0);
 }
 
 #[test]
