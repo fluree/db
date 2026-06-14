@@ -304,6 +304,32 @@ async fn transact_cypher_set_label_adds_type() {
 }
 
 #[tokio::test]
+async fn transact_cypher_set_null_removes_property() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/cypher:set-null");
+    let txn = json!({
+        "@context": ctx(),
+        "@id": "ex:alice", "@type": "ex:Person", "ex:name": "Alice", "ex:age": 25,
+    });
+    let committed = fluree.insert(ledger0, &txn).await.expect("seed");
+
+    let updated = fluree
+        .transact_cypher(
+            committed.ledger,
+            r#"MATCH (n:Person {name: "Alice"}) SET n.age = null"#,
+        )
+        .await
+        .expect("cypher set null");
+
+    let db = graphdb_from_ledger(&updated.ledger);
+    let nulls = fluree
+        .query_cypher(&db, "MATCH (n:Person) WHERE n.age IS NULL RETURN n")
+        .await
+        .expect("query");
+    assert_eq!(nulls.row_count(), 1, "SET age = null should remove it");
+}
+
+#[tokio::test]
 async fn transact_cypher_remove_property_retracts_value() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger0 = genesis_ledger(&fluree, "it/cypher:remove-prop");

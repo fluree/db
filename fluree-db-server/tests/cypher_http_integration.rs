@@ -185,6 +185,38 @@ async fn cypher_http_json_envelope_with_params() {
 }
 
 #[tokio::test]
+async fn cypher_tx_id_reflects_parameters() {
+    // Same statement, different params → distinct tx-ids (the tx-id hashes the
+    // full envelope, not just the statement text).
+    let (_tmp, state) = server_state().await;
+    create_ledger(&state, "cyphertxid").await;
+
+    let tx_id = |body: &str| -> String {
+        serde_json::from_str::<serde_json::Value>(body)
+            .ok()
+            .and_then(|v| v.get("tx-id").and_then(|t| t.as_str()).map(String::from))
+            .unwrap_or_default()
+    };
+
+    let (s1, b1) = post_cypher(
+        &state,
+        "/v1/fluree/update/cyphertxid",
+        &json!({"cypher": "CREATE (n:Person {name: $name})", "params": {"name": "A"}}).to_string(),
+    )
+    .await;
+    let (s2, b2) = post_cypher(
+        &state,
+        "/v1/fluree/update/cyphertxid",
+        &json!({"cypher": "CREATE (n:Person {name: $name})", "params": {"name": "B"}}).to_string(),
+    )
+    .await;
+    assert!(s1.is_success() && s2.is_success(), "{b1}\n{b2}");
+    let (id1, id2) = (tx_id(&b1), tx_id(&b2));
+    assert!(!id1.is_empty() && !id2.is_empty(), "tx-id present: {b1}\n{b2}");
+    assert_ne!(id1, id2, "different params must yield different tx-ids");
+}
+
+#[tokio::test]
 async fn cypher_parse_error_is_client_error() {
     let (_tmp, state) = server_state().await;
     create_ledger(&state, "cypherbad").await;

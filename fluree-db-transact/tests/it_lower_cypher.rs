@@ -196,6 +196,19 @@ fn match_set_property_emits_update_with_optional_old_value() {
 }
 
 #[test]
+fn match_set_property_to_null_removes_it() {
+    // `SET n.prop = null` is Cypher's property removal: retract, no insert.
+    let txn = lower(r#"MATCH (n:Person {name: "Alice"}) SET n.age = null"#);
+    assert_eq!(txn.txn_type, TxnType::Update);
+    assert_eq!(txn.delete_templates.len(), 1, "retract the old value");
+    assert_eq!(txn.insert_templates.len(), 0, "null asserts nothing");
+    assert!(matches!(
+        txn.delete_templates[0].object,
+        TemplateTerm::Var(_)
+    ));
+}
+
+#[test]
 fn match_set_label_is_additive_insert_only() {
     let txn = lower("MATCH (n:Person) SET n:Employee");
     assert_eq!(txn.txn_type, TxnType::Update);

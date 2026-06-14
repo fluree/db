@@ -610,6 +610,7 @@ async fn update_ledger_local(
                 &state,
                 &ledger,
                 &cypher,
+                &headers,
                 bearer.as_ref(),
                 &credential,
                 &span,
@@ -1702,18 +1703,50 @@ async fn execute_turtle_transaction(
 /// Cypher AST is lowered to a `Txn` via the shared `lower_cypher_to_txn`, which
 /// threads the ledger's default context. v1 does a single attempt with no
 /// reconcile/retry loop, so a concurrent-writer conflict surfaces as an error.
+#[allow(clippy::too_many_arguments)]
 async fn execute_cypher_transact(
     state: &AppState,
     ledger_id: &str,
-    cypher: &str,
+    body: &str,
+    headers: &FlureeHeaders,
     bearer: Option<&crate::extract::DataPrincipal>,
     credential: &MaybeCredential,
     span: &tracing::Span,
 ) -> Result<Response> {
     enforce_write_access(state, ledger_id, bearer, credential)?;
 
-    let (cypher, params) = fluree_db_api::extract_cypher_envelope(cypher);
-    let tx_id = compute_tx_id_sparql(&cypher);
+    // Hash the full request body (statement + any params envelope) so two
+    // requests with the same statement but different params get distinct
+    // tx-ids.
+    let tx_id = compute_tx_id_sparql(body);
+    let (cypher, params) = fluree_db_api::extract_cypher_envelope(body);
+
+    // Resolve the effective identity (impersonation-aware) and build policy
+    // options from headers, same as the SPARQL UPDATE path.
+    let bearer_identity = effective_author(credential, bearer);
+    let effective_identity = crate::routes::policy_auth::resolve_sparql_identity(
+        state,
+        ledger_id,
+        bearer_identity.as_deref(),
+        headers.identity.as_deref(),
+    )
+    .await;
+    let policy_values_map = headers.policy_values_map().inspect_err(|_| {
+        set_span_error_code(span, "error:BadRequest");
+    })?;
+    let qc_opts = fluree_db_api::QueryConnectionOptions {
+        identity: effective_identity.clone(),
+        policy_class: if headers.policy_class.is_empty() {
+            None
+        } else {
+            Some(headers.policy_class.clone())
+        },
+        policy: headers.policy.clone(),
+        policy_values: policy_values_map,
+        default_allow: headers.default_allow,
+        ..Default::default()
+    };
+
     let handle = state
         .fluree
         .ledger_cached(ledger_id)
@@ -1729,9 +1762,46 @@ async fn execute_cypher_transact(
             ServerError::Api(e)
         })?;
 
-    let mut builder = state.fluree.stage(&handle).txn(txn);
+    // Build a PolicyContext when any policy input is present, so writes are
+    // filtered the same way SPARQL UPDATE / JSON-LD writes are.
+    let policy_ctx = if qc_opts.has_any_policy_inputs() {
+        Some(
+            fluree_db_api::build_policy_context(
+                &cached_state.snapshot,
+                cached_state.novelty.as_ref(),
+                Some(cached_state.novelty.as_ref()),
+                cached_state.t,
+                &qc_opts,
+            )
+            .await
+            .map_err(|e| {
+                set_span_error_code(span, "error:PolicyBuildFailed");
+                ServerError::Api(e)
+            })?,
+        )
+    } else {
+        None
+    };
+
+    let mut commit_opts = CommitOpts::default();
+    if let Some(d) = &effective_identity {
+        commit_opts = commit_opts.identity(d.clone());
+    }
+    // Persist the original signed envelope for provenance when present.
+    if let Some(raw_txn) = raw_txn_from_credential(credential) {
+        let content_store = state.fluree.content_store(handle.ledger_id());
+        commit_opts = commit_opts.with_raw_txn_spawned(content_store, raw_txn);
+    }
+
+    let mut builder = state.fluree.stage(&handle).txn(txn).commit_opts(commit_opts);
     if let Some(config) = &state.index_config {
         builder = builder.index_config(config.clone());
+    }
+    if headers.has_tracking() {
+        builder = builder.tracking(headers.to_tracking_options());
+    }
+    if let Some(ctx) = policy_ctx {
+        builder = builder.policy(ctx);
     }
     let result = builder.execute().await.map_err(|e| {
         set_span_error_code(span, "error:InvalidTransaction");

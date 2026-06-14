@@ -827,8 +827,9 @@ pub async fn query_ledger(
     }
 
     // Handle Cypher query (Content-Type: application/cypher) — ledger is
-    // known from the path. v1 is local-execution only: JSON-LD output, no
-    // delimited/agent-json/tracking negotiation.
+    // known from the path. JSON-LD output; tracking/delimited/agent-json are
+    // not negotiated yet, but policy/identity are enforced for parity with
+    // the SPARQL/JSON-LD paths.
     if headers.is_cypher_query() {
         if let Some(p) = bearer.0.as_ref() {
             if !credential.is_signed() && !p.can_read(&ledger) {
@@ -838,7 +839,25 @@ pub async fn query_ledger(
         }
         let cypher = credential.body_string()?;
         log_query_text(&cypher, &state.telemetry_config, &span);
-        return execute_cypher_ledger(&state, &ledger, &cypher, &span).await;
+        // Resolve the effective identity (impersonation-aware), same as the
+        // SPARQL read path, so policy enforcement applies to Cypher too.
+        let bearer_identity = effective_identity(&credential, &bearer);
+        let identity = crate::routes::policy_auth::resolve_sparql_identity(
+            &state,
+            &ledger,
+            bearer_identity.as_deref(),
+            headers.identity.as_deref(),
+        )
+        .await;
+        return execute_cypher_ledger(
+            &state,
+            &ledger,
+            &cypher,
+            identity.as_deref(),
+            &headers,
+            &span,
+        )
+        .await;
     }
 
     // Handle JSON-LD query (JSON body)
@@ -1689,22 +1708,57 @@ async fn execute_query_proxy(
 
 /// Execute a Cypher read query against a specific ledger.
 ///
-/// v1 server execution mirrors the CLI local path: load the ledger view with
-/// its default context (so bare Cypher identifiers resolve like JSON-LD), run
-/// `query_cypher`, and return JSON-LD. Tracking, delimited output, agent-json,
-/// and identity-scoped policy are not negotiated on this path yet.
+/// Loads the ledger view with its default context (so bare Cypher identifiers
+/// resolve like JSON-LD), applies policy enforcement from the resolved
+/// identity plus header-supplied policy fields (parity with the SPARQL/JSON-LD
+/// paths), runs `query_cypher`, and returns JSON-LD. Tracking, delimited
+/// output, and agent-json are not negotiated on this path yet.
 async fn execute_cypher_ledger(
     state: &AppState,
     ledger_id: &str,
     cypher: &str,
+    identity: Option<&str>,
+    headers: &FlureeHeaders,
     span: &tracing::Span,
 ) -> Result<Response> {
     let (cypher, params) = fluree_db_api::extract_cypher_envelope(cypher);
+
+    // Build policy options from the resolved identity + headers. Cypher has no
+    // body `opts` block, so headers are the only transport for `policy-class`,
+    // `policy`, `policy-values`, and `default-allow` (same as SPARQL).
+    let policy_values_map = headers.policy_values_map().inspect_err(|_| {
+        set_span_error_code(span, "error:BadRequest");
+    })?;
+    let qc_opts = fluree_db_api::QueryConnectionOptions {
+        identity: identity.map(String::from),
+        policy_class: if headers.policy_class.is_empty() {
+            None
+        } else {
+            Some(headers.policy_class.clone())
+        },
+        policy: headers.policy.clone(),
+        policy_values: policy_values_map,
+        default_allow: headers.default_allow,
+        ..Default::default()
+    };
+
     let view = state
         .fluree
         .db_with_default_context(ledger_id)
         .await
         .map_err(ServerError::Api)?;
+    // Wrap the view with policy when any policy input is present (identity,
+    // policy-class, inline policy, etc.), so restricted data is filtered.
+    let view = if qc_opts.has_any_policy_inputs() {
+        state
+            .fluree
+            .wrap_policy(view, &qc_opts, None)
+            .await
+            .map_err(ServerError::Api)?
+    } else {
+        view
+    };
+
     let result = state
         .fluree
         .query_cypher_with_params(&view, &cypher, params.as_ref())

@@ -11,19 +11,22 @@
 //! ## v1 scope
 //!
 //! - **CREATE** (nodes + directed typed relationships, with optional
-//!   relationship properties producing an `f:reifies*` bundle). Pure
-//!   pattern CREATE (no leading MATCH) only.
-//! - **MATCH … SET / REMOVE** — node-anchored WHERE patterns (labels +
-//!   inline property filters + directed single-typed relationships)
-//!   lowered to `where_patterns`, with DELETE/INSERT templates that
-//!   reference the bound variables (`TxnType::Update`). Covers
-//!   `SET n.prop = lit`, `SET n += {…}`, `SET n:Label`,
-//!   `REMOVE n.prop`, `REMOVE n:Label`.
+//!   relationship properties producing an `f:reifies*` bundle).
+//! - **MATCH … CREATE / SET / REMOVE** — node-anchored WHERE patterns
+//!   (labels + inline property filters + directed single-typed
+//!   relationships) lowered to `where_patterns`, with DELETE/INSERT
+//!   templates that reference the bound variables (`TxnType::Update`).
+//!   Covers template-driven CREATE, `SET n.prop = lit`, `SET n.prop = null`
+//!   (removes the property), `SET n += {…}`, `SET n:Label`, `REMOVE n.prop`,
+//!   and `REMOVE n:Label`.
 //!
-//! Still deferred (clear errors): `MATCH … CREATE`, DELETE / DETACH
-//! DELETE, MERGE, `SET n = {…}` (bounded replace), WHERE-clause filter
-//! expressions, named/untyped/alternation relationships in a write
-//! MATCH, and parameter substitution.
+//! Parameter (`$param`) substitution happens upstream in
+//! `fluree_db_cypher::substitute_params` before this lowering runs, so the
+//! AST reaching here carries only concrete literals.
+//!
+//! Still deferred (clear errors): DELETE / DETACH DELETE, MERGE,
+//! `SET n = {…}` (bounded replace), WHERE-clause filter expressions, and
+//! named/untyped/alternation relationships in a write MATCH.
 
 use std::sync::Arc;
 
@@ -457,6 +460,14 @@ impl<'a> CypherLowering<'a> {
     ) -> Result<(), LowerCypherError> {
         let pred_iri = self.resolve_predicate(property)?;
         let pred_sid = self.ns.sid_for_iri(&pred_iri);
+
+        // `SET n.prop = null` removes the property (Cypher semantics) — same
+        // shape as `REMOVE n.prop`: retract any existing value, assert nothing.
+        if matches!(value, Expr::Lit(Literal::Null(_))) {
+            self.push_optional_old_value(target, &pred_iri, &pred_sid);
+            return Ok(());
+        }
+
         let obj = self.expr_to_object(value)?;
         let subj = self.var_term(target);
 
@@ -802,6 +813,3 @@ fn lower_literal_value(lit: &Literal) -> Result<FlakeValue, LowerCypherError> {
     })
 }
 
-// Silence unused-import warnings for symbols we'll wire later.
-#[allow(dead_code)]
-fn _retain_arc(_a: &Arc<str>) {}
