@@ -125,11 +125,12 @@ impl OType {
     /// Blank node (`_:b{id}`) — `o_key` is the atomic bnode integer.
     pub const BLANK_NODE: Self = Self(0x001F);
 
-    /// `xsd:decimal` stored **inline** as an exact packed `(mantissa, scale)`
-    /// (see [`ObjKey::encode_decimal`]). Distinct from the lossy f64
-    /// [`XSD_DECIMAL`](Self::XSD_DECIMAL) lane: this carries the exact value with
-    /// no arena handle. Only written by new-format index roots; large/high-precision
-    /// decimals still fall back to the NumBig arena ([`NUM_BIG_OVERFLOW`](Self::NUM_BIG_OVERFLOW)).
+    /// `xsd:decimal` stored **inline** as an exact, order-preserving base-10
+    /// float key (see [`ObjKey::encode_decimal`]) — canonical *and* value-ordered.
+    /// Distinct from the lossy f64 [`XSD_DECIMAL`](Self::XSD_DECIMAL) lane: this
+    /// carries the exact value with no arena handle. Only written by new-format
+    /// index roots; large/high-precision decimals still fall back to the NumBig
+    /// arena ([`NUM_BIG_OVERFLOW`](Self::NUM_BIG_OVERFLOW)).
     pub const XSD_DECIMAL_INLINE: Self = Self(0x0020);
 
     // Tag `00` payload range 0x0021–0x3FFF reserved for future embedded types.
@@ -422,8 +423,8 @@ pub enum DecodeKind {
     NumBigArena,
     /// Spatial arena handle (per-predicate).
     SpatialArena,
-    /// Exact inline `xsd:decimal` — o_key is a packed `(sign, scale, mantissa)`
-    /// (see [`super::value_id::ObjKey::decode_decimal`]). Not arena-backed.
+    /// Exact inline `xsd:decimal` — o_key is an order-preserving base-10 float
+    /// code (see [`super::value_id::ObjKey::decode_decimal`]). Not arena-backed.
     Decimal,
 }
 

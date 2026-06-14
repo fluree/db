@@ -352,11 +352,14 @@ fn filter_subjects_by_numeric_gt(
     threshold: &FlakeValue,
 ) -> Result<Option<Vec<u64>>> {
     use fluree_db_core::value_id::ObjKey;
-    // Only support numeric thresholds used in benchmark filters.
+    // This lane derives its row-comparison keys from a Long/Double threshold.
+    // Any other threshold type (e.g. an xsd:decimal constant, now that the
+    // detector can extract them) must DECLINE to the fallback — returning an
+    // empty set would silently undercount instead of evaluating the filter.
     let (thr_i, thr_d) = match threshold {
         FlakeValue::Long(n) => (*n, *n as f64),
         FlakeValue::Double(d) => (*d as i64, *d),
-        _ => return Ok(Some(Vec::new())),
+        _ => return Ok(None),
     };
     let thr_i_key = ObjKey::encode_i64(thr_i).as_u64();
     let thr_d_key = ObjKey::encode_f64(thr_d)

@@ -414,9 +414,15 @@ fn extract_simple_numeric_compare_threshold(
     if args.len() != 2 {
         return None;
     }
+    // Long/Double, plus exact integer (BigInt) and decimal constants — the
+    // numeric-compare fast paths now encode all of these into the matching
+    // order-preserving key space, so `FILTER(?v > 0.1)` and `FILTER(?n > big)`
+    // can take the pushdown rather than always deferring to the general scan.
     let const_to_flake = |c: &FlakeValue| match c {
         FlakeValue::Long(n) => Some(fluree_db_core::FlakeValue::Long(*n)),
         FlakeValue::Double(d) => Some(fluree_db_core::FlakeValue::Double(*d)),
+        FlakeValue::Decimal(d) => Some(fluree_db_core::FlakeValue::Decimal(d.clone())),
+        FlakeValue::BigInt(b) => Some(fluree_db_core::FlakeValue::BigInt(b.clone())),
         _ => None,
     };
     let direct_op = match *func {

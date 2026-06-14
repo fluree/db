@@ -1829,11 +1829,15 @@ impl Operator for BinaryScanOperator {
             Arc::clone(branch_ref);
 
         // If this scan has range bounds on the object variable and we're scanning in POST order,
-        // narrow the cursor's leaf range by object-key range.
-        //
-        // IMPORTANT: SPARQL numeric comparisons are cross-type (integer bounds match double
-        // values), and ObjKey encodings differ between types. For correctness, we only apply
-        // range narrowing for temporal types where cross-type comparison does not apply.
+        // narrow the cursor's leaf range by object-key range. Two cases are safe:
+        //   - **Temporal** types: comparison is within-type, so a cross-type value
+        //     can't satisfy the filter — dropping it via narrowing is harmless.
+        //   - **A uniform, order-preserving numeric predicate with no overlay**:
+        //     no other-typed base rows exist and no novelty can introduce a
+        //     cross-type match (see the numeric block below).
+        // SPARQL numeric comparison is otherwise cross-type (an integer bound
+        // matches double/decimal values under different o_types), so numeric
+        // narrowing is gated on those preconditions.
         let mut range_min_okey: Option<u64> = None;
         let mut range_max_okey: Option<u64> = None;
         let mut range_o_type: Option<u16> = None;
@@ -1856,15 +1860,26 @@ impl Operator for BinaryScanOperator {
                 };
                 // Numeric range narrowing is unsafe in general (cross-type:
                 // `?o > 10` matches integer 11 AND decimal 11.5, stored under
-                // different o_types). But when the predicate is *uniformly* one
-                // order-preserving numeric type — manifest extent
-                // min_o_type == max_o_type and that type is o_key-ordered
-                // (any inline integer subtype, double/float, or inline decimal) —
-                // there are no other-typed rows to miss, so we encode the bounds
-                // into that type's key space and seek the key range. The
-                // post-filter below stays as the correctness backstop.
-                let numeric_uniform_ot = if has_numeric_bound(&bounds.lower)
-                    || has_numeric_bound(&bounds.upper)
+                // different o_types). It's safe only when the predicate is
+                // *uniformly* one order-preserving numeric type AND there is no
+                // overlay:
+                //
+                // - **Uniform base** (manifest extent min_o_type == max_o_type,
+                //   o_key-ordered — any inline integer subtype, double/float, or
+                //   inline decimal) means no other-typed *base* rows to miss.
+                // - **Overlay-free** is required because novelty can add a
+                //   matching value of a *different* type (e.g. integer 100 to a
+                //   decimal predicate). Its translated overlay op sorts outside
+                //   the narrowed o_type/o_key window and would be dropped before
+                //   the post-filter could rescue it. (Temporal narrowing doesn't
+                //   need this: cross-type values can't satisfy a temporal filter,
+                //   so dropping them is harmless.) With overlay present we fall
+                //   back to the full base scan + overlay merge + post-filter.
+                //
+                // The post-filter below stays as the correctness backstop.
+                let numeric_uniform_ot = if (has_numeric_bound(&bounds.lower)
+                    || has_numeric_bound(&bounds.upper))
+                    && ctx.overlay_free_single_graph()
                 {
                     crate::fast_count::predicate_uniform_o_type(store_ref, self.g_id, p_id)
                         .map(OType::from_u16)

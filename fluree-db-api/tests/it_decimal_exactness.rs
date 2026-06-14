@@ -1429,3 +1429,72 @@ async fn inline_integer_range_pushdown_is_correct() {
         "COUNT(?n >= 0) over integers must be 4 (0, 5, 42, 100)"
     );
 }
+
+#[tokio::test]
+async fn range_narrowing_keeps_cross_type_novelty() {
+    // Regression guard for the overlay/novelty hazard in numeric range
+    // narrowing. The base predicate is uniformly inline-decimal (so narrowing
+    // WOULD fire on a clean index), but novelty then adds a matching value of a
+    // DIFFERENT type (an integer) for the same predicate. The integer's overlay
+    // op sorts outside the decimal o_type/o_key window, so narrowing must be
+    // disabled while overlay is present — otherwise the integer is dropped
+    // before the post-filter sees it. With the overlay gate, the full scan +
+    // merge + post-filter keeps it.
+    let fluree = memory_fluree();
+    let ledger_id = "decimal/xtype-novelty:main";
+    let ledger = genesis_ledger(&fluree, ledger_id);
+
+    run_sparql_update(
+        &fluree,
+        ledger,
+        r"
+        PREFIX ex: <http://example.org/>
+        INSERT DATA {
+            ex:a ex:v 0.5 .
+            ex:b ex:v 100.5 .
+            ex:c ex:v 10.5 .
+        }
+        ",
+    )
+    .await;
+
+    // Reindex: the base predicate is now uniformly inline-decimal (v3).
+    let root = full_rebuild_publish_decode_root(&fluree, ledger_id).await;
+    assert_eq!(
+        root.decimal_encoding(),
+        fluree_db_core::DecimalEncoding::InlineWhenFits
+    );
+    let ledger = fluree
+        .ledger(ledger_id)
+        .await
+        .expect("load reindexed ledger");
+
+    // Add a NOVELTY integer (different o_type) that matches the filter, without
+    // reindexing — it lives in the overlay as XSD_INTEGER.
+    let result = run_sparql_update(
+        &fluree,
+        ledger,
+        r"PREFIX ex: <http://example.org/> INSERT DATA { ex:d ex:v 100 . }",
+    )
+    .await;
+    let ledger = result.ledger;
+
+    // FILTER(?v > 50): the indexed decimal 100.5 AND the novelty integer 100.
+    let r = support::query_sparql(
+        &fluree,
+        &ledger,
+        r"PREFIX ex: <http://example.org/>
+          SELECT ?v WHERE { ?s ex:v ?v FILTER(?v > 50) } ORDER BY ?v",
+    )
+    .await
+    .expect("cross-type range filter");
+    let json = r.to_sparql_json(&ledger.snapshot).expect("json");
+    let mut got = binding_values(&json, "v");
+    got.sort();
+    assert_eq!(
+        got,
+        vec!["100", "100.5"],
+        "range filter must keep a cross-type novelty match (integer 100) on a \
+         uniform-decimal base predicate — narrowing must not drop it"
+    );
+}
