@@ -358,9 +358,9 @@ impl<'a> CypherLowering<'a> {
                 "variable-length paths in a write MATCH are not allowed",
             ));
         }
-        if rel.var.is_some() || rel.props.is_some() {
+        if rel.props.is_some() {
             return Err(LowerCypherError::unsupported(
-                "relationship-bound variables / property filters in a write MATCH are deferred — match the connecting nodes instead",
+                "relationship property filters in a write MATCH are deferred — match the connecting nodes instead",
             ));
         }
         if rel.types.len() != 1 {
@@ -376,12 +376,29 @@ impl<'a> CypherLowering<'a> {
             Direction::Incoming => (right_t, left_t),
             Direction::Either => unreachable!(),
         };
-        out.push(UnresolvedPattern::Triple(UnresolvedTriplePattern {
+        let edge = UnresolvedTriplePattern {
             s,
             p: UnresolvedTerm::Iri(Arc::from(type_iri.as_str())),
             o,
             dtc: None,
-        }));
+        };
+
+        match &rel.var {
+            // Anonymous relationship → plain base-edge triple (set semantics).
+            None => out.push(UnresolvedPattern::Triple(edge)),
+            // Named relationship → bind `r` to the annotation SID via an
+            // EdgeAnnotation pattern (only matches reifier-bundled edges, which
+            // is every LPG/Cypher-written relationship). This makes `SET r.prop`
+            // / `REMOVE r.prop` target the relationship's annotation metadata.
+            Some(v) => {
+                self.bound_vars.insert(v.name.clone());
+                out.push(UnresolvedPattern::EdgeAnnotation {
+                    edge,
+                    annotation: UnresolvedTerm::Var(Arc::from(var_name(&v.name).as_str())),
+                    body: Vec::new(),
+                });
+            }
+        }
         Ok(())
     }
 

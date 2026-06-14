@@ -303,6 +303,28 @@ fn match_create_new_node_uses_blank_node() {
 }
 
 #[test]
+fn match_set_relationship_property_binds_annotation_subject() {
+    use fluree_db_query::parse::UnresolvedPattern;
+    let txn = lower("MATCH (a:Person)-[r:KNOWS]->(b:Person) SET r.since = 2020");
+    assert_eq!(txn.txn_type, TxnType::Update);
+    // The named relationship lowers to an EdgeAnnotation that binds `r`.
+    assert!(
+        txn.where_patterns
+            .iter()
+            .any(|p| matches!(p, UnresolvedPattern::EdgeAnnotation { .. })),
+        "where: {:?}",
+        txn.where_patterns
+    );
+    // SET r.since: retract old, insert new — both keyed on the `r` var subject.
+    assert_eq!(txn.delete_templates.len(), 1);
+    assert_eq!(txn.insert_templates.len(), 1);
+    assert!(matches!(
+        txn.insert_templates[0].subject,
+        TemplateTerm::Var(_)
+    ));
+}
+
+#[test]
 fn match_remove_label_deletes_rdf_type_triple() {
     let txn = lower("MATCH (n:Person) REMOVE n:Person");
     assert_eq!(txn.delete_templates.len(), 1);

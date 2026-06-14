@@ -420,6 +420,58 @@ async fn transact_cypher_with_parameters_creates_node() {
 }
 
 #[tokio::test]
+async fn transact_cypher_set_relationship_property() {
+    // Bind a relationship variable in a write MATCH and update its metadata.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let mut l = genesis_ledger(&fluree, "it/cypher:set-rel-prop");
+    for stmt in [
+        r#"CREATE (a:Person {name: "Alice"})"#,
+        r#"CREATE (b:Person {name: "Bob"})"#,
+        r#"MATCH (a:Person {name: "Alice"}), (b:Person {name: "Bob"}) CREATE (a)-[:KNOWS {since: 2000}]->(b)"#,
+    ] {
+        l = fluree.transact_cypher(l, stmt).await.expect(stmt).ledger;
+    }
+
+    // Sanity: the edge has since=2000.
+    let db = graphdb_from_ledger(&l);
+    assert_eq!(
+        fluree
+            .query_cypher(&db, "MATCH (a)-[r:KNOWS {since: 2000}]->(b) RETURN r")
+            .await
+            .expect("pre")
+            .row_count(),
+        1
+    );
+
+    // Update the relationship property via a bound relationship variable.
+    let l = fluree
+        .transact_cypher(l, "MATCH (a)-[r:KNOWS]->(b) SET r.since = 2020")
+        .await
+        .expect("set rel prop")
+        .ledger;
+    let db = graphdb_from_ledger(&l);
+
+    assert_eq!(
+        fluree
+            .query_cypher(&db, "MATCH (a)-[r:KNOWS {since: 2020}]->(b) RETURN r")
+            .await
+            .expect("post-new")
+            .row_count(),
+        1,
+        "relationship now has since=2020"
+    );
+    assert_eq!(
+        fluree
+            .query_cypher(&db, "MATCH (a)-[r:KNOWS {since: 2000}]->(b) RETURN r")
+            .await
+            .expect("post-old")
+            .row_count(),
+        0,
+        "old since=2000 retracted"
+    );
+}
+
+#[tokio::test]
 async fn transact_cypher_detach_delete_removes_node_and_both_directions() {
     let fluree = FlureeBuilder::memory().build_memory();
     let mut l = genesis_ledger(&fluree, "it/cypher:detach-delete");
