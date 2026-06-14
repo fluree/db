@@ -402,9 +402,11 @@ pub(crate) fn otype_okey_order_comparable(ot: OType) -> bool {
         || ot == OType::XSD_DECIMAL_INLINE
 }
 
-/// True if this o_type is numeric but cannot be compared by encoded o_key in
-/// the numeric-COUNT lanes (non-canonical integer widths, floats, arena-keyed
-/// NUM_BIG): rows of these kinds force the count to defer.
+/// True if this o_type is numeric but NOT o_key-order-comparable, so rows of it
+/// force the numeric-COUNT lanes to defer. With all inline integer subtypes,
+/// `xsd:double`/`xsd:float`, and inline decimals now comparable
+/// ([`otype_okey_order_comparable`]), this is the arena `NUM_BIG_OVERFLOW` lane
+/// (equality-only) and the dormant lossy-f64 `XSD_DECIMAL` lane.
 fn otype_unsupported_numeric(raw: u16) -> bool {
     let ot = OType::from_u16(raw);
     (ot.is_numeric() || ot == OType::NUM_BIG_OVERFLOW || ot == OType::XSD_DECIMAL_INLINE)
