@@ -146,8 +146,8 @@ this plan.
 | Relationship properties `-[:T {p: v}]->` | Base triple **plus** an edge-annotation reifier bundle (`f:reifies*` system encoding, see `docs/design/edge-annotations.md`). One annotation SID per relationship occurrence. |
 | Relationship variable `-[r]->` binds | The annotation SID. Only matches relationships that have a reifier bundle — see "Relationship lowering rule" below. |
 | Parallel relationships | Two annotation SIDs attached to the same `(s, p, o)` edge key. Already supported (multimap forward attachment index). |
-| Undirected `-[r]-` | **Rejected in v1.** Users write `-[r]->` or `<-[r]-` explicitly. See Open Questions. |
-| Variable-length `-[r*1..5]->` | **Deferred** — see "Variable-length paths" below. |
+| Undirected `-[r]-` | **Landed** — forward∪reverse `Union` (reverse via the `Opst` index). |
+| Variable-length `-[r*1..5]->` | **Landed** (anonymous, single-typed) — see "Variable-length paths" below; not relationship-uniqueness compliant on cyclic graphs. |
 | Path value `p = (a)-[r]->(b)-[r2]->(c)` | First-class path object. **Deferred.** |
 | `RETURN n, r, m` | SELECT projection. Bag semantics by default (no DISTINCT). |
 | `RETURN DISTINCT` | Lower to existing DISTINCT modifier. |
@@ -297,18 +297,23 @@ Anonymous variable-length relationships are now lowered (2026-06-14):
 **Scope vs. full Cypher.** These produce **endpoint bindings**, not
 first-class path values, and the bounded chain expansion does **not**
 enforce Cypher's relationship-uniqueness rule (no repeated edge on a
-walk). For DAG/tree-shaped traversal (and the typical directed LDBC
-case) results match; on cyclic/undirected graphs a walk may revisit an
-edge and over-count. Binding a variable to the path (`-[r:T*]->`, a
-relationship *list*) and path values (`p = (...)`, `nodes()/relationships()
-/length(p)`) still need list/path-valued bindings — deferred. A true
-path-enumerating operator (one row per distinct walk, parallel-edge
-multiplicity) remains future work; the current lowering covers the
-reachability/bounded-neighborhood queries that dominate the benchmark.
+walk). It is therefore **openCypher-compliant only for acyclic /
+tree-shaped traversal**. On cyclic or undirected graphs a walk may
+revisit an edge, which not only over-counts but can surface endpoint
+rows that should not exist at all (e.g. an exact-length `*k` path that
+reuses one edge). Treat this as an endpoint-reachability / bounded-
+neighborhood feature, not a compliant path matcher. Binding a variable
+to the path (`-[r:T*]->`, a relationship *list*) and path values
+(`p = (...)`, `nodes()/relationships()/length(p)`) still need
+list/path-valued bindings — deferred. A true path-enumerating operator
+(one row per distinct walk, with relationship-uniqueness and
+parallel-edge multiplicity) remains future work.
 
-v1 rejects `-[r*...]->` and `-[*N..M]->` at parse time with a clear
-error pointing users at chained explicit hops or to wait for the
-path-enumeration follow-up.
+A relationship *type* whose namespace isn't registered in the ledger
+encodes to no predicate; such a path yields **zero rows**, not an error
+(the same as an absent label). Bound rel-var var-length, unbounded
+undirected, and unbounded `*N..` (N>1) are still rejected at lower time
+with a clear message.
 
 ### LPG mode is the default for Cypher writes
 
@@ -474,7 +479,7 @@ standard solution modifiers and a conservative expression sublanguage.**
 | `MATCH (a)-[r:T1\|T2]->(b)` | ✅ | Type alternatives via `Union`. |
 | `MATCH (a)<-[r:T]-(b)` | ✅ | Inverse direction (swap subject/object). |
 | `MATCH (a)-[:T]-(b)` (undirected) | ✅ | Forward∪reverse `Union` (reverse via the `Opst` object index). A bound rel var works for single-hop undirected. |
-| `MATCH (a)-[:T*m..n]->(b)` (bounded var-length) | ✅ | Expands to a `Union` of fixed-length join chains; honors direction incl. undirected hops. Anonymous rel only (a bound rel var binds a *list* — deferred). **Caveat:** does not enforce Cypher's relationship-uniqueness rule, so cyclic graphs can over-count; correct for DAG/tree traversal. |
+| `MATCH (a)-[:T*m..n]->(b)` (bounded var-length) | ✅ | Expands to a `Union` of fixed-length join chains; honors direction incl. undirected hops. Anonymous rel only (a bound rel var binds a *list* — deferred). **Caveat:** does not enforce relationship-uniqueness, so it is openCypher-compliant **only for acyclic/tree traversal**; on cyclic/undirected graphs it can both over-count and surface rows that shouldn't exist. Endpoint-reachability feature, not a compliant path matcher. |
 | `MATCH (a)-[:T*]->(b)` / `*0..` (unbounded var-length) | ✅ | Reuses the transitive `PropertyPathPattern` (`*`→OneOrMore, `*0..`→ZeroOrMore). Directed only; unbounded-undirected and `*N..` (N>1) deferred. |
 | `MATCH p = ...` (path value), `nodes()/relationships()/length(p)` | ❌ | Deferred — needs path-value IR + binding. |
 | `MATCH p = ...` (path value) | ❌ | Deferred — needs path-value IR. |

@@ -274,20 +274,20 @@ fn lower_var_length_rel<E: IriEncoder>(
                      range like `-[:T*1..3]-`",
                 ));
             }
-            let predicate = ctx.encoder.encode_iri(&type_iri).ok_or_else(|| {
-                LowerError::unsupported(format!(
-                    "relationship type `{}` is not present in this ledger",
-                    rel.types[0].name
-                ))
-            })?;
             let (s, o) = match rel.direction {
                 Direction::Outgoing => (left_ref, right_ref),
                 Direction::Incoming => (right_ref, left_ref),
                 Direction::Either => unreachable!(),
             };
-            out.push(Pattern::PropertyPath(PropertyPathPattern::new(
-                s, predicate, modifier, o,
-            )));
+            match ctx.encoder.encode_iri(&type_iri) {
+                Some(predicate) => out.push(Pattern::PropertyPath(PropertyPathPattern::new(
+                    s, predicate, modifier, o,
+                ))),
+                // Unknown relationship type ⇒ no such edges ⇒ no rows, matching
+                // how absent labels/types and the bounded (string-IRI) path
+                // behave — a missing predicate is empty, not a query error.
+                None => out.push(empty_path_result(&s, &o)),
+            }
             Ok(())
         }
         // Bounded — expand to a UNION of fixed-length join chains.
@@ -352,6 +352,25 @@ fn build_fixed_chain<E: IriEncoder>(
         prev = next;
     }
     Ok(chain)
+}
+
+/// An always-empty result over the path's endpoint variables — used when a
+/// variable-length path names a relationship type absent from the ledger. A
+/// `Values` with zero rows yields no solutions, so the conjunction is empty
+/// (the same outcome as the bounded string-IRI path probing a missing type).
+fn empty_path_result(s: &Ref, o: &Ref) -> Pattern {
+    let mut vars = Vec::new();
+    for r in [s, o] {
+        if let Ref::Var(v) = r {
+            if !vars.contains(v) {
+                vars.push(*v);
+            }
+        }
+    }
+    Pattern::Values {
+        vars,
+        rows: Vec::new(),
+    }
 }
 
 /// Push one hop between `a` and `b`. Directed hops emit a single triple;

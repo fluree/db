@@ -1171,6 +1171,28 @@ async fn cypher_var_length_bounded_directed() {
 }
 
 #[tokio::test]
+async fn cypher_var_length_unregistered_namespace_returns_no_rows() {
+    // When the relationship type's *namespace* isn't registered in the ledger
+    // (here: an empty genesis ledger), the predicate can't be encoded. An
+    // unbounded path must then yield zero rows, not a query error — matching
+    // how the bounded (string-IRI) path and absent labels behave.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = genesis_ledger(&fluree, "it/cypher:varlen-unregistered");
+    let db = graphdb_from_ledger(&ledger);
+
+    for path in ["*", "*0..", "*1..3", "*2"] {
+        let rows = fluree
+            .query_cypher(
+                &db,
+                &format!(r#"MATCH (a:Person)-[:KNOWS{path}]->(x) RETURN x"#),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("unregistered type `{path}` should not error: {e}"));
+        assert_eq!(rows.row_count(), 0, "unregistered type with `{path}`");
+    }
+}
+
+#[tokio::test]
 async fn cypher_var_length_exact_hops() {
     let fluree = FlureeBuilder::memory().build_memory();
     let l = seed_knows_chain(&fluree, "it/cypher:varlen-exact").await;
