@@ -760,11 +760,11 @@ async fn sparql_all_literal_insert_noop_when_filter_false() {
     .await;
     let t_before = ledger.t();
 
-    let sparql = r#"
+    let sparql = r"
         PREFIX ex: <http://example.org/ns/>
         INSERT { ex:config ex:flag true }
         WHERE { FILTER(false) }
-    "#;
+    ";
     let result = run_sparql_update(&fluree, ledger, sparql).await;
 
     assert_eq!(
