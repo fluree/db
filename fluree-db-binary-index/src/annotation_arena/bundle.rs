@@ -69,6 +69,13 @@ pub struct ArenaBuildOutput {
     /// emit a single rolled-up telemetry counter rather than one
     /// per-bundle.
     pub skipped_bundles: u64,
+    /// Number of annotation SIDs that reify more than one **live** edge
+    /// — a single-target-invariant violation. Zero for any data Fluree
+    /// itself wrote (the transaction path rejects it at stage time);
+    /// non-zero only for malformed `f:reifies*` data brought in by bulk
+    /// import (which intentionally does not validate input). Surfaced so
+    /// the import / reindex caller can warn without re-walking the arena.
+    pub multi_target_annotations: u64,
 }
 
 /// Reconstruct + sort + chunk forward / reverse arena rows from a slab
@@ -171,6 +178,7 @@ pub fn build_arenas_from_flakes(flakes: &[Flake], target_rows_per_leaf: usize) -
     });
 
     let stats = compute_stats(&forward_rows, &reverse_rows);
+    let multi_target_annotations = report_multi_target(&forward_rows);
 
     let forward_leaves = build_forward_leaves(&forward_rows, target_rows_per_leaf);
     let reverse_leaves = build_reverse_leaves(&reverse_rows, target_rows_per_leaf);
@@ -181,6 +189,7 @@ pub fn build_arenas_from_flakes(flakes: &[Flake], target_rows_per_leaf: usize) -
         max_t,
         stats,
         skipped_bundles: skipped,
+        multi_target_annotations,
     }
 }
 
@@ -241,6 +250,7 @@ pub fn build_arenas_from_event_pairs(
     });
 
     let stats = compute_stats(&forward_rows, &reverse_rows);
+    let multi_target_annotations = report_multi_target(&forward_rows);
     let forward_leaves = build_forward_leaves(&forward_rows, target_rows_per_leaf);
     let reverse_leaves = build_reverse_leaves(&reverse_rows, target_rows_per_leaf);
 
@@ -250,7 +260,57 @@ pub fn build_arenas_from_event_pairs(
         max_t,
         stats,
         skipped_bundles: 0,
+        multi_target_annotations,
     }
+}
+
+/// Count annotation SIDs that reify more than one **live** edge — the
+/// single-target invariant violation. "Live" means the latest event for
+/// an `(edge, ann)` pair is an assert (`op = true`); `forward` must be
+/// sorted by `(edge, ann, t, op)` as both builders leave it. Returns the
+/// number of offending annotations plus the smallest such SID for the
+/// diagnostic message. Retract-based re-points and idempotent
+/// re-asserts do not count (they net to one live edge). Cheap: one pass
+/// over the annotation-only forward rows.
+fn detect_multi_target_annotations(forward: &[AnnotationForwardRow]) -> (u64, Option<Sid>) {
+    use std::collections::HashMap;
+    let mut live_edges_per_ann: HashMap<&Sid, u32> = HashMap::new();
+    for i in 0..forward.len() {
+        let last_in_group = i + 1 == forward.len()
+            || forward[i].edge != forward[i + 1].edge
+            || forward[i].ann != forward[i + 1].ann;
+        if last_in_group && forward[i].op {
+            *live_edges_per_ann.entry(&forward[i].ann).or_insert(0) += 1;
+        }
+    }
+    let mut offenders: Vec<&Sid> = live_edges_per_ann
+        .iter()
+        .filter(|(_, &c)| c > 1)
+        .map(|(a, _)| *a)
+        .collect();
+    offenders.sort_unstable();
+    (
+        offenders.len() as u64,
+        offenders.first().map(|s| (*s).clone()),
+    )
+}
+
+/// Warn when the arena build observed any multi-target annotation, and
+/// return the count for the build output. Keeps the two builders'
+/// emission identical.
+fn report_multi_target(forward: &[AnnotationForwardRow]) -> u64 {
+    let (count, example) = detect_multi_target_annotations(forward);
+    if count > 0 {
+        tracing::warn!(
+            multi_target_annotations = count,
+            example = ?example,
+            "arena build: annotation @id(s) reify multiple live edges (single-target \
+             invariant violated). Fluree's transaction path rejects this at stage time, \
+             so it indicates malformed f:reifies* data introduced by bulk import; the \
+             reverse lookup will return multiple edges for these annotations"
+        );
+    }
+    count
 }
 
 fn compute_stats(
@@ -489,6 +549,86 @@ mod tests {
         assert_eq!(out.stats.forward_rows, 3, "all events kept for history");
         assert_eq!(out.stats.distinct_edges, 1, "edge with ann_b is live");
         assert_eq!(out.stats.distinct_annotations, 1, "only ann_b is live");
+    }
+
+    /// Same as [`make_bundle`] but the reified object is `obj`, so the
+    /// edge identity differs while the annotation SID can be reused.
+    fn make_bundle_obj(ann_name: &str, obj: &str, t: i64, op: bool) -> Vec<Flake> {
+        let ann = ann_sid(ann_name);
+        vec![
+            Flake::new(
+                ann.clone(),
+                p_reifies(db_predicates::REIFIES_SUBJECT),
+                FlakeValue::Ref(ref_sid("alice")),
+                id_dt(),
+                t,
+                op,
+                None,
+            ),
+            Flake::new(
+                ann.clone(),
+                p_reifies(db_predicates::REIFIES_PREDICATE),
+                FlakeValue::Ref(ref_sid("worksFor")),
+                id_dt(),
+                t,
+                op,
+                None,
+            ),
+            Flake::new(
+                ann,
+                p_reifies(db_predicates::REIFIES_OBJECT),
+                FlakeValue::Ref(ref_sid(obj)),
+                id_dt(),
+                t,
+                op,
+                None,
+            ),
+        ]
+    }
+
+    #[test]
+    fn single_target_data_reports_zero_multi_target() {
+        let flakes = make_bundle("ann_1", 5, true);
+        let out = build_arenas_from_flakes(&flakes, DEFAULT_TARGET_ROWS_PER_LEAF);
+        assert_eq!(out.multi_target_annotations, 0);
+    }
+
+    #[test]
+    fn same_ann_two_live_edges_across_t_is_flagged_multi_target() {
+        // ann_1 reifies (alice, worksFor, acme) at t=1 AND
+        // (alice, worksFor, bob) at t=2 — both asserted, neither
+        // retracted. Each is a distinct, individually-valid bundle
+        // (the per-(ann,t) decode can't see the conflict), so this is
+        // exactly the cross-commit multi-target a bulk import can
+        // introduce. The arena builder must flag it.
+        let mut flakes = make_bundle_obj("ann_1", "acme", 1, true);
+        flakes.extend(make_bundle_obj("ann_1", "bob", 2, true));
+        let out = build_arenas_from_flakes(&flakes, DEFAULT_TARGET_ROWS_PER_LEAF);
+        assert_eq!(
+            out.multi_target_annotations, 1,
+            "one annotation reifies two live edges"
+        );
+    }
+
+    #[test]
+    fn retract_then_repoint_is_not_flagged() {
+        // Legitimate re-point: attach to acme, retract it, attach to bob.
+        // Net live state is a single edge, so it must not be flagged.
+        let mut flakes = make_bundle_obj("ann_1", "acme", 1, true);
+        flakes.extend(make_bundle_obj("ann_1", "acme", 2, false));
+        flakes.extend(make_bundle_obj("ann_1", "bob", 3, true));
+        let out = build_arenas_from_flakes(&flakes, DEFAULT_TARGET_ROWS_PER_LEAF);
+        assert_eq!(out.multi_target_annotations, 0);
+    }
+
+    #[test]
+    fn idempotent_reassert_is_not_flagged() {
+        // Re-asserting the identical attachment at a later t nets to one
+        // live edge.
+        let mut flakes = make_bundle_obj("ann_1", "acme", 1, true);
+        flakes.extend(make_bundle_obj("ann_1", "acme", 2, true));
+        let out = build_arenas_from_flakes(&flakes, DEFAULT_TARGET_ROWS_PER_LEAF);
+        assert_eq!(out.multi_target_annotations, 0);
     }
 
     #[test]
