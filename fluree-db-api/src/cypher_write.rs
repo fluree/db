@@ -19,9 +19,9 @@
 //! current state, derives the actual write, and commits it as one transaction.
 
 use fluree_db_cypher::ast::{
-    CypherAst, DeleteClause, Direction, Expr, Literal, MatchClause, MergeClause, NodePattern,
-    Pattern, PatternPart, ProjectionItem, Query, ReadClause, RelPattern, ReturnClause, SetClause,
-    Statement, Update, Variable, WriteClause,
+    BinOp, CypherAst, DeleteClause, Direction, Expr, FuncCall, Literal, MatchClause, MergeClause,
+    NodePattern, Pattern, PatternPart, ProjectionItem, Query, ReadClause, RelPattern, ReturnClause,
+    SetClause, Statement, Update, Variable, WithClause, WriteClause,
 };
 use fluree_db_transact::ir::Txn;
 
@@ -46,6 +46,11 @@ pub enum ConditionalCypherWrite {
     /// retraction (via the `DETACH DELETE` lowering — equivalent when there
     /// are no relationships).
     DeleteNode(Update),
+    /// `MATCH (a)-[r:T]->(b) DELETE r`: probe whether the matched edge has
+    /// parallel siblings (a shared `(s,p,o)` carrying multiple annotation
+    /// SIDs), reject if so, otherwise stage the base-edge retraction (the
+    /// `f:reifies*` cascade removes the bundle).
+    DeleteRel(Update),
 }
 
 /// Detect a write shape that requires a pre-write probe. Returns `None` for
@@ -67,11 +72,18 @@ pub fn detect_conditional(ast: &CypherAst) -> Option<ConditionalCypherWrite> {
                 None
             }
         }
-        // Bare DELETE n (non-DETACH). DETACH DELETE lowers directly. DELETE on
-        // a relationship variable is a different operation (deferred), so only
-        // node-variable targets qualify here.
+        // DELETE needs a MATCH. All-relationship-variable targets → DeleteRel
+        // (parallel-edge probe). All-node-variable bare targets → DeleteNode
+        // (relationship-existence probe). DETACH DELETE (node) and mixed/other
+        // shapes lower directly (the lowering handles or rejects them).
         WriteClause::Delete(d) => {
-            if !d.detach && !u.read_clauses.is_empty() && !any_target_is_rel_var(u, d) {
+            if u.read_clauses.is_empty() {
+                return None;
+            }
+            let rel_targets = d.targets.iter().filter(|t| is_rel_var(u, &t.name)).count();
+            if rel_targets == d.targets.len() && rel_targets > 0 {
+                Some(ConditionalCypherWrite::DeleteRel(u.clone()))
+            } else if rel_targets == 0 && !d.detach {
                 Some(ConditionalCypherWrite::DeleteNode(u.clone()))
             } else {
                 None
@@ -81,22 +93,58 @@ pub fn detect_conditional(ast: &CypherAst) -> Option<ConditionalCypherWrite> {
     }
 }
 
-/// True if any DELETE target is bound as a *relationship* variable in the
-/// MATCH (i.e. it's a `DELETE r`, not a `DELETE n`).
-fn any_target_is_rel_var(u: &Update, d: &DeleteClause) -> bool {
-    let mut rel_vars = std::collections::HashSet::new();
+/// True if `name` is bound as a *relationship* variable in any MATCH.
+fn is_rel_var(u: &Update, name: &str) -> bool {
+    u.read_clauses.iter().any(|clause| {
+        let (ReadClause::Match(m) | ReadClause::OptionalMatch(m)) = clause else {
+            return false;
+        };
+        m.pattern
+            .parts
+            .iter()
+            .flat_map(|p| &p.tail)
+            .any(|(rel, _)| rel.var.as_ref().is_some_and(|v| v.name == name))
+    })
+}
+
+/// True if `name` is bound as a node variable by a **mandatory** (non-OPTIONAL)
+/// MATCH. Used to reject bare DELETE targets that are only optionally bound
+/// (the relationship probe could otherwise bind an unrelated relationship).
+pub(crate) fn bound_by_mandatory_match(u: &Update, name: &str) -> bool {
+    u.read_clauses.iter().any(|clause| {
+        let ReadClause::Match(m) = clause else {
+            return false;
+        };
+        m.pattern.parts.iter().any(|part| {
+            let mut nodes = std::iter::once(&part.head).chain(part.tail.iter().map(|(_, n)| n));
+            nodes.any(|n| n.var.as_ref().is_some_and(|v| v.name == name))
+        })
+    })
+}
+
+/// Find the (subject-side, object-side) endpoint variables of relationship
+/// variable `rel_var` in the MATCH, honoring direction. Returns `None` if the
+/// endpoints aren't both named.
+pub(crate) fn rel_endpoint_vars(u: &Update, rel_var: &str) -> Option<(Variable, Variable)> {
     for clause in &u.read_clauses {
-        if let ReadClause::Match(m) | ReadClause::OptionalMatch(m) = clause {
-            for part in &m.pattern.parts {
-                for (rel, _) in &part.tail {
-                    if let Some(v) = &rel.var {
-                        rel_vars.insert(v.name.as_str());
-                    }
+        let (ReadClause::Match(m) | ReadClause::OptionalMatch(m)) = clause else {
+            continue;
+        };
+        for part in &m.pattern.parts {
+            let mut prev = &part.head;
+            for (rel, next) in &part.tail {
+                if rel.var.as_ref().is_some_and(|v| v.name == rel_var) {
+                    let (s, o) = match rel.direction {
+                        Direction::Incoming => (next, prev),
+                        _ => (prev, next),
+                    };
+                    return Some((s.var.clone()?, o.var.clone()?));
                 }
+                prev = next;
             }
         }
     }
-    d.targets.iter().any(|t| rel_vars.contains(t.name.as_str()))
+    None
 }
 
 /// Build a probe that returns at most one row when a node matching the MERGE
@@ -233,6 +281,78 @@ pub(crate) fn build_relationship_probe_ast(
                     alias: None,
                     span,
                 }],
+                distinct: false,
+                order_by: Vec::new(),
+                skip: None,
+                limit: Some(Expr::Lit(Literal::Integer(1, span))),
+                span,
+            },
+            union_tail: None,
+            span,
+        }),
+        span,
+    }
+}
+
+/// Build a probe that returns at most one row when the matched relationship
+/// `rel_var` has a **parallel sibling** — another reified edge sharing the same
+/// `(a)-[:T]->(b)` base triple. Appends
+/// `WITH <a>, <b>, count(<rel_var>) AS __cyrel_c WHERE __cyrel_c > 1
+///  RETURN <a> LIMIT 1` to the original read clauses. Named relationships bind
+/// one row per annotation SID, so a `count > 1` per `(a, b)` group means the
+/// base edge backs multiple relationship identities — retracting it would
+/// disturb the siblings, so `DELETE r` must reject.
+pub(crate) fn build_parallel_probe_ast(
+    read_clauses: &[ReadClause],
+    a: &Variable,
+    b: &Variable,
+    rel_var: &str,
+) -> CypherAst {
+    let span = a.span;
+    let proj = |v: &Variable| ProjectionItem {
+        expr: Expr::Var(v.clone()),
+        alias: None,
+        span,
+    };
+    let count_alias = Variable {
+        name: "__cyrel_c".to_string(),
+        span,
+    };
+    let count_item = ProjectionItem {
+        expr: Expr::Call(FuncCall {
+            name: "count".to_string(),
+            args: vec![Expr::Var(Variable {
+                name: rel_var.to_string(),
+                span,
+            })],
+            distinct: false,
+            span,
+        }),
+        alias: Some(count_alias.clone()),
+        span,
+    };
+    let having = Expr::BinOp(
+        BinOp::Gt,
+        Box::new(Expr::Var(count_alias)),
+        Box::new(Expr::Lit(Literal::Integer(1, span))),
+        span,
+    );
+    let mut clauses: Vec<ReadClause> = read_clauses.to_vec();
+    clauses.push(ReadClause::With(WithClause {
+        items: vec![proj(a), proj(b), count_item],
+        distinct: false,
+        where_clause: Some(having),
+        order_by: Vec::new(),
+        skip: None,
+        limit: None,
+        span,
+    }));
+
+    CypherAst {
+        statement: Statement::Query(Query {
+            clauses,
+            return_clause: ReturnClause {
+                items: vec![proj(a)],
                 distinct: false,
                 order_by: Vec::new(),
                 skip: None,

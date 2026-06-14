@@ -1769,7 +1769,12 @@ async fn execute_cypher_transact(
         })?;
 
     // Build a PolicyContext when any policy input is present, so writes are
-    // filtered the same way SPARQL UPDATE / JSON-LD writes are.
+    // filtered the same way SPARQL UPDATE / JSON-LD writes are. Built from the
+    // pre-lock `cached_state` — identical to the SPARQL/JSON-LD path above —
+    // since policy rules change far more slowly than the write lock turns over
+    // and writes are serialized per ledger. (The branch-choosing probe of a
+    // conditional plan, which *is* order-sensitive, resolves under the lock via
+    // the staged `WritePlan` resolver.)
     let policy_ctx = if qc_opts.has_any_policy_inputs() {
         Some(
             fluree_db_api::build_policy_context(

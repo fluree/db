@@ -3385,7 +3385,9 @@ impl Fluree {
         if let Some(cw) = crate::cypher_write::detect_conditional(&ast) {
             return Ok(crate::cypher_write::WritePlan::Conditional(Box::new(cw)));
         }
-        let txn = self.lower_cypher_ast_to_txn(&ast, ledger_id, snapshot).await?;
+        let txn = self
+            .lower_cypher_ast_to_txn(&ast, ledger_id, snapshot)
+            .await?;
         Ok(crate::cypher_write::WritePlan::Single(Box::new(txn)))
     }
 
@@ -3421,13 +3423,18 @@ impl Fluree {
                     ));
                 }
                 let probe = crate::cypher_write::build_merge_probe_ast(node);
-                let exists = self.query_cypher_ast(&probe_view, &probe).await?.row_count() > 0;
+                let exists = self
+                    .query_cypher_ast(&probe_view, &probe)
+                    .await?
+                    .row_count()
+                    > 0;
                 let ast = if exists {
                     crate::cypher_write::build_on_match_ast(merge)
                 } else {
                     crate::cypher_write::build_create_ast(merge)
                 };
-                self.lower_cypher_ast_to_txn(&ast, ledger_id, snapshot).await
+                self.lower_cypher_ast_to_txn(&ast, ledger_id, snapshot)
+                    .await
             }
             ConditionalCypherWrite::DeleteNode(update) => {
                 let delete = crate::cypher_write::delete_clause(update).ok_or_else(|| {
@@ -3436,13 +3443,32 @@ impl Fluree {
                 // Cypher requires bare DELETE to fail when a target still has
                 // relationships. Probe each target in both directions.
                 for target in &delete.targets {
+                    // Only mandatorily-bound targets are well-defined here. An
+                    // OPTIONAL-only binding can leave `target` unbound on some
+                    // rows, where the appended relationship hop would bind an
+                    // unrelated node and false-trigger the guard.
+                    if !crate::cypher_write::bound_by_mandatory_match(update, &target.name) {
+                        return Err(ApiError::cypher(
+                            format!(
+                                "DELETE of `{}` requires the node to be bound by a \
+                                 mandatory MATCH (not only OPTIONAL MATCH)",
+                                target.name
+                            ),
+                            Vec::new(),
+                        ));
+                    }
                     for inbound in [false, true] {
                         let probe_ast = crate::cypher_write::build_relationship_probe_ast(
                             &update.read_clauses,
                             target,
                             inbound,
                         );
-                        if self.query_cypher_ast(&probe_view, &probe_ast).await?.row_count() > 0 {
+                        if self
+                            .query_cypher_ast(&probe_view, &probe_ast)
+                            .await?
+                            .row_count()
+                            > 0
+                        {
                             return Err(ApiError::cypher(
                                 format!(
                                     "DELETE of `{}` failed: the node still has relationships; \
@@ -3457,7 +3483,61 @@ impl Fluree {
                 // No relationships → the node retraction is identical to
                 // DETACH DELETE.
                 let ast = crate::cypher_write::build_detach_delete_ast(update);
-                self.lower_cypher_ast_to_txn(&ast, ledger_id, snapshot).await
+                self.lower_cypher_ast_to_txn(&ast, ledger_id, snapshot)
+                    .await
+            }
+            ConditionalCypherWrite::DeleteRel(update) => {
+                let delete = crate::cypher_write::delete_clause(update).ok_or_else(|| {
+                    ApiError::cypher("DELETE plan has no DELETE clause".to_string(), Vec::new())
+                })?;
+                // `DELETE r` retracts the relationship's base `(a)-[:T]->(b)`
+                // triple, whose `f:reifies*` cascade removes the bundle. If the
+                // base edge backs a parallel sibling, that retraction would
+                // disturb the sibling — reject. The endpoints must be named so
+                // the probe can group by them.
+                for target in &delete.targets {
+                    let (a, b) = crate::cypher_write::rel_endpoint_vars(update, &target.name)
+                        .ok_or_else(|| {
+                            ApiError::cypher(
+                                format!(
+                                    "DELETE of relationship `{}` requires both endpoint \
+                                     nodes to be named (e.g. `(a)-[{}]->(b)`)",
+                                    target.name, target.name
+                                ),
+                                Vec::new(),
+                            )
+                        })?;
+                    let probe_ast = crate::cypher_write::build_parallel_probe_ast(
+                        &update.read_clauses,
+                        &a,
+                        &b,
+                        &target.name,
+                    );
+                    if self
+                        .query_cypher_ast(&probe_view, &probe_ast)
+                        .await?
+                        .row_count()
+                        > 0
+                    {
+                        return Err(ApiError::cypher(
+                            format!(
+                                "DELETE of relationship `{}` failed: parallel relationships \
+                                 share its underlying edge; deleting it would affect the \
+                                 others. Distinguish them with a property and delete by that.",
+                                target.name
+                            ),
+                            Vec::new(),
+                        ));
+                    }
+                }
+                // No parallel siblings → retracting each base edge removes only
+                // its own reifier bundle. Lower the original DELETE directly.
+                let ast = fluree_db_cypher::CypherAst {
+                    statement: fluree_db_cypher::ast::Statement::Update(update.clone()),
+                    span: update.span,
+                };
+                self.lower_cypher_ast_to_txn(&ast, ledger_id, snapshot)
+                    .await
             }
         }
     }
@@ -3496,7 +3576,8 @@ impl Fluree {
         fluree_db_cypher::substitute_params(&mut ast, params.unwrap_or(&empty))
             .map_err(|e| ApiError::cypher(e.to_string(), Vec::new()))?;
 
-        self.lower_cypher_ast_to_txn(&ast, ledger_id, snapshot).await
+        self.lower_cypher_ast_to_txn(&ast, ledger_id, snapshot)
+            .await
     }
 
     /// Lower an already-parsed, param-substituted Cypher AST to a `Txn`,
@@ -3528,12 +3609,14 @@ impl Fluree {
         };
 
         let mut ns = NamespaceRegistry::from_db(snapshot);
-        Ok(fluree_db_transact::lower_cypher_update::lower_cypher_update(
-            ast,
-            &mut ns,
-            TxnOpts::default(),
-            cypher_opts,
-        )?)
+        Ok(
+            fluree_db_transact::lower_cypher_update::lower_cypher_update(
+                ast,
+                &mut ns,
+                TxnOpts::default(),
+                cypher_opts,
+            )?,
+        )
     }
 
     /// Create a FROM-driven query builder.

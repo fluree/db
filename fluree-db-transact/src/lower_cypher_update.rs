@@ -134,6 +134,11 @@ struct CypherLowering<'a> {
     /// Variable names bound by a preceding MATCH, used to reject SET /
     /// REMOVE on an unbound target.
     bound_vars: std::collections::HashSet<String>,
+    /// For each named relationship variable bound in the MATCH, the base edge
+    /// it reifies: `(subject var-name, predicate Sid, object var-name)`. Lets
+    /// `DELETE r` retract the base edge (the `f:reifies*` cascade then removes
+    /// the bundle).
+    rel_var_edges: std::collections::HashMap<String, (String, Sid, String)>,
     /// Stable per-pattern-occurrence node labels, keyed by node span.
     /// Used so two appearances of the same node pattern in `CREATE
     /// (a)-[]->(b), (a)-[]->(c)` resolve to the same SID at staging
@@ -160,6 +165,7 @@ impl<'a> CypherLowering<'a> {
             bnode_counter: 0,
             synth_counter: 0,
             bound_vars: std::collections::HashSet::new(),
+            rel_var_edges: std::collections::HashMap::new(),
             node_subject_cache: std::collections::HashMap::new(),
         }
     }
@@ -378,17 +384,16 @@ impl<'a> CypherLowering<'a> {
             ));
         }
         let type_iri = self.resolve_predicate(&rel.types[0].name)?;
-        let left_t = self.node_match_term(left);
-        let right_t = self.node_match_term(right);
-        let (s, o) = match rel.direction {
-            Direction::Outgoing => (left_t, right_t),
-            Direction::Incoming => (right_t, left_t),
+        let (left_name, right_name) = (self.node_var_name(left), self.node_var_name(right));
+        let (s_name, o_name) = match rel.direction {
+            Direction::Outgoing => (left_name, right_name),
+            Direction::Incoming => (right_name, left_name),
             Direction::Either => unreachable!(),
         };
         let edge = UnresolvedTriplePattern {
-            s,
+            s: UnresolvedTerm::Var(Arc::from(s_name.as_str())),
             p: UnresolvedTerm::Iri(Arc::from(type_iri.as_str())),
-            o,
+            o: UnresolvedTerm::Var(Arc::from(o_name.as_str())),
             dtc: None,
         };
 
@@ -398,9 +403,13 @@ impl<'a> CypherLowering<'a> {
             // Named relationship → bind `r` to the annotation SID via an
             // EdgeAnnotation pattern (only matches reifier-bundled edges, which
             // is every LPG/Cypher-written relationship). This makes `SET r.prop`
-            // / `REMOVE r.prop` target the relationship's annotation metadata.
+            // / `REMOVE r.prop` target the relationship's annotation metadata,
+            // and `DELETE r` retract the base edge it reifies.
             Some(v) => {
                 self.bound_vars.insert(v.name.clone());
+                let p_sid = self.ns.sid_for_iri(&type_iri);
+                self.rel_var_edges
+                    .insert(v.name.clone(), (s_name, p_sid, o_name));
                 out.push(UnresolvedPattern::EdgeAnnotation {
                     edge,
                     annotation: UnresolvedTerm::Var(Arc::from(var_name(&v.name).as_str())),
@@ -411,15 +420,18 @@ impl<'a> CypherLowering<'a> {
         Ok(())
     }
 
-    /// The WHERE-side term for a node: its named variable, or a stable
-    /// span-keyed synthetic for an anonymous node.
-    fn node_match_term(&self, n: &NodePattern) -> UnresolvedTerm {
+    /// The interned variable name for a node: its named variable (`?name`), or
+    /// a stable span-keyed synthetic for an anonymous node.
+    fn node_var_name(&self, n: &NodePattern) -> String {
         match &n.var {
-            Some(v) => UnresolvedTerm::Var(Arc::from(var_name(&v.name).as_str())),
-            None => UnresolvedTerm::Var(Arc::from(
-                format!("?#__cy_anon_{}_{}", n.span.start, n.span.end).as_str(),
-            )),
+            Some(v) => var_name(&v.name),
+            None => format!("?#__cy_anon_{}_{}", n.span.start, n.span.end),
         }
+    }
+
+    /// The WHERE-side term for a node.
+    fn node_match_term(&self, n: &NodePattern) -> UnresolvedTerm {
+        UnresolvedTerm::Var(Arc::from(self.node_var_name(n).as_str()))
     }
 
     fn match_object_term(&self, e: &Expr) -> Result<UnresolvedTerm, LowerCypherError> {
@@ -497,11 +509,8 @@ impl<'a> CypherLowering<'a> {
         let subj = self.var_term(target);
 
         self.push_optional_old_value(target, &pred_iri, &pred_sid);
-        self.insert_templates.push(TripleTemplate::new(
-            subj,
-            TemplateTerm::Sid(pred_sid),
-            obj,
-        ));
+        self.insert_templates
+            .push(TripleTemplate::new(subj, TemplateTerm::Sid(pred_sid), obj));
         Ok(())
     }
 
@@ -542,17 +551,31 @@ impl<'a> CypherLowering<'a> {
         self.opts.lpg_edge_lifecycle = Some(true);
 
         for target in &d.targets {
+            // `DELETE r` — retract the base edge the relationship reifies; the
+            // cascade then removes the `f:reifies*` bundle. Parallel-edge safety
+            // (a shared `(s,p,o)` carrying multiple annotation SIDs) is enforced
+            // by the API-level conditional probe before this lowering runs.
+            if let Some((s_name, p_sid, o_name)) = self.rel_var_edges.get(&target.name).cloned() {
+                let s = TemplateTerm::Var(self.vars.get_or_insert(&s_name));
+                let o = TemplateTerm::Var(self.vars.get_or_insert(&o_name));
+                self.delete_templates
+                    .push(TripleTemplate::new(s, TemplateTerm::Sid(p_sid), o));
+                continue;
+            }
+
             self.require_bound(target)?;
             if d.detach {
                 self.lower_detach_delete(&target.name);
             } else {
                 // Cypher requires bare `DELETE n` to fail when `n` still has
                 // relationships. That guard needs a snapshot probe (no Txn can
-                // conditionally error), so it is deferred to an API-level slice.
+                // conditionally error), so it is handled by the API-level
+                // conditional-write path before this lowering runs.
                 return Err(LowerCypherError::unsupported(
-                    "bare DELETE n is deferred — it must error when the node still has \
-                     relationships, which needs a snapshot probe. Use DETACH DELETE n to \
-                     remove a node together with its relationships.",
+                    "bare DELETE n is resolved by the API-level conditional-write path \
+                     (it must error when the node still has relationships, which needs a \
+                     snapshot probe). Use DETACH DELETE n to remove a node together with \
+                     its relationships.",
                 ));
             }
         }
@@ -571,30 +594,28 @@ impl<'a> CypherLowering<'a> {
         // Outbound: OPTIONAL { ?n ?p ?o } → delete (?n, ?p, ?o).
         let (p_unres, p_term) = self.fresh_scan_var();
         let (o_unres, o_term) = self.fresh_scan_var();
-        self.where_patterns
-            .push(UnresolvedPattern::Optional(vec![UnresolvedPattern::Triple(
-                UnresolvedTriplePattern {
-                    s: n_unres.clone(),
-                    p: p_unres,
-                    o: o_unres,
-                    dtc: None,
-                },
-            )]));
+        self.where_patterns.push(UnresolvedPattern::Optional(vec![
+            UnresolvedPattern::Triple(UnresolvedTriplePattern {
+                s: n_unres.clone(),
+                p: p_unres,
+                o: o_unres,
+                dtc: None,
+            }),
+        ]));
         self.delete_templates
             .push(TripleTemplate::new(n_term.clone(), p_term, o_term));
 
         // Inbound: OPTIONAL { ?s ?p2 ?n } → delete (?s, ?p2, ?n).
         let (s_unres, s_term) = self.fresh_scan_var();
         let (p2_unres, p2_term) = self.fresh_scan_var();
-        self.where_patterns
-            .push(UnresolvedPattern::Optional(vec![UnresolvedPattern::Triple(
-                UnresolvedTriplePattern {
-                    s: s_unres,
-                    p: p2_unres,
-                    o: n_unres,
-                    dtc: None,
-                },
-            )]));
+        self.where_patterns.push(UnresolvedPattern::Optional(vec![
+            UnresolvedPattern::Triple(UnresolvedTriplePattern {
+                s: s_unres,
+                p: p2_unres,
+                o: n_unres,
+                dtc: None,
+            }),
+        ]));
         self.delete_templates
             .push(TripleTemplate::new(s_term, p2_term, n_term));
     }
@@ -653,7 +674,8 @@ impl<'a> CypherLowering<'a> {
         self.synth_counter += 1;
         let probe = UnresolvedTerm::Var(Arc::from(probe_name.as_str()));
         let guard = self.build_merge_guard(node, &probe)?;
-        self.where_patterns.push(UnresolvedPattern::NotExists(guard));
+        self.where_patterns
+            .push(UnresolvedPattern::NotExists(guard));
 
         // Create branch: a fresh node (blank node, keyed on the MERGE var so
         // ON CREATE SET shares the subject) carrying the identifying
@@ -794,15 +816,14 @@ impl<'a> CypherLowering<'a> {
         self.synth_counter += 1;
         let old_vid = self.vars.get_or_insert(&old_name);
 
-        self.where_patterns
-            .push(UnresolvedPattern::Optional(vec![UnresolvedPattern::Triple(
-                UnresolvedTriplePattern {
-                    s: UnresolvedTerm::Var(Arc::from(var_name(target).as_str())),
-                    p: UnresolvedTerm::Iri(Arc::from(pred_iri)),
-                    o: UnresolvedTerm::Var(Arc::from(old_name.as_str())),
-                    dtc: None,
-                },
-            )]));
+        self.where_patterns.push(UnresolvedPattern::Optional(vec![
+            UnresolvedPattern::Triple(UnresolvedTriplePattern {
+                s: UnresolvedTerm::Var(Arc::from(var_name(target).as_str())),
+                p: UnresolvedTerm::Iri(Arc::from(pred_iri)),
+                o: UnresolvedTerm::Var(Arc::from(old_name.as_str())),
+                dtc: None,
+            }),
+        ]));
 
         let subj = self.var_term(target);
         self.delete_templates.push(TripleTemplate::new(
@@ -1104,4 +1125,3 @@ fn lower_literal_value(lit: &Literal) -> Result<FlakeValue, LowerCypherError> {
         }
     })
 }
-

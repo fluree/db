@@ -273,7 +273,11 @@ async fn transact_cypher_match_create_mints_new_node_per_match() {
         .query_cypher(&db, "MATCH (p:Pet) RETURN p")
         .await
         .expect("query pet");
-    assert_eq!(pets.row_count(), 1, "a new Pet node should have been created");
+    assert_eq!(
+        pets.row_count(),
+        1,
+        "a new Pet node should have been created"
+    );
 }
 
 #[tokio::test]
@@ -300,7 +304,11 @@ async fn transact_cypher_set_label_adds_type() {
         .query_cypher(&db, "MATCH (n:Employee) RETURN n")
         .await
         .expect("query new label");
-    assert_eq!(rows.row_count(), 1, "node should now carry the Employee label");
+    assert_eq!(
+        rows.row_count(),
+        1,
+        "node should now carry the Employee label"
+    );
 }
 
 #[tokio::test]
@@ -722,7 +730,11 @@ async fn transact_cypher_merge_on_match_set_fires_only_on_match() {
                   ON MATCH  SET n.origin = "matched""#;
 
     // First run: node absent → create branch → origin = "created".
-    let l = fluree.transact_cypher(l, stmt).await.expect("merge create").ledger;
+    let l = fluree
+        .transact_cypher(l, stmt)
+        .await
+        .expect("merge create")
+        .ledger;
     let db = graphdb_from_ledger(&l);
     assert_eq!(
         fluree
@@ -735,7 +747,11 @@ async fn transact_cypher_merge_on_match_set_fires_only_on_match() {
     );
 
     // Second run: node present → on-match branch → origin = "matched".
-    let l = fluree.transact_cypher(l, stmt).await.expect("merge match").ledger;
+    let l = fluree
+        .transact_cypher(l, stmt)
+        .await
+        .expect("merge match")
+        .ledger;
     let db = graphdb_from_ledger(&l);
     assert_eq!(
         fluree
@@ -819,6 +835,137 @@ async fn transact_cypher_merge_on_create_set_fires_only_on_create() {
         1,
         "original role unchanged"
     );
+}
+
+#[tokio::test]
+async fn transact_cypher_delete_relationship_removes_edge() {
+    // `DELETE r` retracts the relationship's base edge; the reifier cascade
+    // clears the bundle. The endpoint nodes survive.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let mut l = genesis_ledger(&fluree, "it/cypher:delete-rel");
+    for stmt in [
+        r#"CREATE (a:Person {name: "Alice"})"#,
+        r#"CREATE (b:Person {name: "Bob"})"#,
+        r#"MATCH (a:Person {name: "Alice"}), (b:Person {name: "Bob"}) CREATE (a)-[:KNOWS {since: 2000}]->(b)"#,
+    ] {
+        l = fluree.transact_cypher(l, stmt).await.expect(stmt).ledger;
+    }
+
+    let db = graphdb_from_ledger(&l);
+    assert_eq!(
+        fluree
+            .query_cypher(&db, "MATCH (a)-[r:KNOWS]->(b) RETURN r")
+            .await
+            .expect("pre")
+            .row_count(),
+        1,
+        "edge present before delete"
+    );
+
+    let l = fluree
+        .transact_cypher(l, "MATCH (a)-[r:KNOWS]->(b) DELETE r")
+        .await
+        .expect("delete rel")
+        .ledger;
+    let db = graphdb_from_ledger(&l);
+
+    assert_eq!(
+        fluree
+            .query_cypher(&db, "MATCH (a)-[r:KNOWS]->(b) RETURN r")
+            .await
+            .expect("post")
+            .row_count(),
+        0,
+        "relationship removed"
+    );
+    assert_eq!(
+        fluree
+            .query_cypher(&db, "MATCH (n:Person) RETURN n")
+            .await
+            .expect("nodes")
+            .row_count(),
+        2,
+        "both endpoint nodes survive"
+    );
+}
+
+#[tokio::test]
+async fn transact_cypher_delete_relationship_rejects_parallel_edges() {
+    // Two KNOWS edges between the same pair share one base `(a,KNOWS,b)`
+    // triple. Deleting one by retracting the base edge would disturb the
+    // other, so `DELETE r` must reject when parallel siblings exist.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let mut l = genesis_ledger(&fluree, "it/cypher:delete-rel-parallel");
+    for stmt in [
+        r#"CREATE (a:Person {name: "Alice"})"#,
+        r#"CREATE (b:Person {name: "Bob"})"#,
+        r#"MATCH (a:Person {name: "Alice"}), (b:Person {name: "Bob"}) CREATE (a)-[:KNOWS {since: 2000}]->(b)"#,
+        r#"MATCH (a:Person {name: "Alice"}), (b:Person {name: "Bob"}) CREATE (a)-[:KNOWS {since: 2010}]->(b)"#,
+    ] {
+        l = fluree.transact_cypher(l, stmt).await.expect(stmt).ledger;
+    }
+
+    let db = graphdb_from_ledger(&l);
+    assert_eq!(
+        fluree
+            .query_cypher(&db, "MATCH (a)-[r:KNOWS]->(b) RETURN r")
+            .await
+            .expect("pre")
+            .row_count(),
+        2,
+        "two parallel KNOWS edges"
+    );
+
+    let err = fluree
+        .transact_cypher(l, "MATCH (a)-[r:KNOWS]->(b) DELETE r")
+        .await
+        .expect_err("DELETE r on parallel relationships must error");
+    assert!(format!("{err}").contains("parallel"), "{err}");
+}
+
+#[tokio::test]
+async fn transact_cypher_delete_relationship_requires_named_endpoints() {
+    // `DELETE r` needs both endpoints named so the parallel-edge probe can
+    // group by them. An anonymous endpoint is rejected.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let mut l = genesis_ledger(&fluree, "it/cypher:delete-rel-anon");
+    for stmt in [
+        r#"CREATE (a:Person {name: "Alice"})"#,
+        r#"CREATE (b:Person {name: "Bob"})"#,
+        r#"MATCH (a:Person {name: "Alice"}), (b:Person {name: "Bob"}) CREATE (a)-[:KNOWS]->(b)"#,
+    ] {
+        l = fluree.transact_cypher(l, stmt).await.expect(stmt).ledger;
+    }
+
+    let err = fluree
+        .transact_cypher(l, "MATCH (a)-[r:KNOWS]->() DELETE r")
+        .await
+        .expect_err("DELETE r with an anonymous endpoint must error");
+    assert!(format!("{err}").contains("endpoint"), "{err}");
+}
+
+#[tokio::test]
+async fn transact_cypher_bare_delete_rejects_optional_only_target() {
+    // A bare DELETE target bound only by OPTIONAL MATCH is rejected: the node
+    // can be unbound on some rows, where the relationship probe would bind an
+    // unrelated node and false-trigger the guard.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let mut l = genesis_ledger(&fluree, "it/cypher:delete-optional");
+    for stmt in [
+        r#"CREATE (a:Person {name: "Alice"})"#,
+        r#"CREATE (b:Person {name: "Bob"})"#,
+    ] {
+        l = fluree.transact_cypher(l, stmt).await.expect(stmt).ledger;
+    }
+
+    let err = fluree
+        .transact_cypher(
+            l,
+            r#"MATCH (a:Person {name: "Alice"}) OPTIONAL MATCH (b:Person {name: "Bob"}) DELETE b"#,
+        )
+        .await
+        .expect_err("bare DELETE of an OPTIONAL-only target must error");
+    assert!(format!("{err}").contains("mandatory"), "{err}");
 }
 
 #[tokio::test]
