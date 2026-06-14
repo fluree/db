@@ -314,8 +314,9 @@ fn lower_return<E: IriEncoder>(
     let limit = const_usize(&r.limit)?;
     let offset = const_usize(&r.skip)?;
 
-    reject_order_by_on_list(ctx, &r.order_by, &projection.list_outputs)?;
-    let ordering = lower_order_by(ctx, &r.order_by, patterns)?;
+    let order_by = align_order_by_with_projection(&r.items, &r.order_by);
+    reject_order_by_on_list(ctx, &order_by, &projection.list_outputs)?;
+    let ordering = lower_order_by(ctx, &order_by, patterns)?;
 
     // GROUP BY keys are only meaningful when aggregates exist; if not,
     // pass an empty list so Grouping::assemble produces None.
@@ -439,6 +440,50 @@ fn expression_references_any(
         Expression::Const(_) => false,
         Expression::Call { args, .. } => args.iter().any(|a| expression_references_any(a, vars)),
         Expression::Exists { .. } => false,
+    }
+}
+
+/// Rewrite ORDER BY keys that are written as an expression already projected
+/// under an alias (e.g. `RETURN f.id AS friendId … ORDER BY f.id`) to reference
+/// that alias. Under aggregation the sort runs post-grouping, where only group
+/// keys and aggregate outputs survive; re-lowering the bare `f.id` would mint a
+/// fresh pre-grouping variable absent from the sorted stream ("Sort variable
+/// not found"). Aliasing makes `ORDER BY f.id` behave like `ORDER BY friendId`.
+fn align_order_by_with_projection(
+    items: &[ProjectionItem],
+    order_by: &[crate::ast::OrderItem],
+) -> Vec<crate::ast::OrderItem> {
+    order_by
+        .iter()
+        .map(|oi| match projection_alias_for(items, &oi.expr) {
+            Some(alias) => crate::ast::OrderItem {
+                expr: Expr::Var(alias),
+                direction: oi.direction,
+            },
+            None => oi.clone(),
+        })
+        .collect()
+}
+
+/// The alias a projection item gives to `e`, if any item projects exactly that
+/// expression under an alias (bare variable or property accessor only).
+fn projection_alias_for(items: &[ProjectionItem], e: &Expr) -> Option<crate::ast::Variable> {
+    items.iter().find_map(|it| {
+        let alias = it.alias.as_ref()?;
+        expr_matches_ignoring_span(&it.expr, e).then(|| alias.clone())
+    })
+}
+
+/// Structural equality for the projection-key shapes shared by a projection and
+/// an ORDER BY — bare variables and property accessors — ignoring source spans
+/// (the two occurrences are at different positions).
+fn expr_matches_ignoring_span(a: &Expr, b: &Expr) -> bool {
+    match (a, b) {
+        (Expr::Var(x), Expr::Var(y)) => x.name == y.name,
+        (Expr::Prop(xi, xf, _), Expr::Prop(yi, yf, _)) => {
+            xf == yf && expr_matches_ignoring_span(xi, yi)
+        }
+        _ => false,
     }
 }
 
@@ -708,8 +753,10 @@ fn lower_with<E: IriEncoder>(
 
     // ORDER BY may also reference property accessors; emit any
     // resulting auxiliary triples into the subquery body before we
-    // hand patterns to SubqueryPattern.
-    let ordering = lower_order_by(ctx, &w.order_by, &mut inner_patterns)?;
+    // hand patterns to SubqueryPattern. Align accessor/var keys that match an
+    // aliased projection item to that alias (so they survive grouping).
+    let order_by = align_order_by_with_projection(&w.items, &w.order_by);
+    let ordering = lower_order_by(ctx, &order_by, &mut inner_patterns)?;
 
     // SubqueryOperator runs Project BEFORE Sort. Sort keys not in
     // `select` are dropped before the sort can see them, silently

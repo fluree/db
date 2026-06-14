@@ -598,6 +598,37 @@ async fn transact_cypher_unwind_map_param_batches_edge_inserts() {
 }
 
 #[tokio::test]
+async fn cypher_order_by_property_accessor_grouping_key() {
+    // ORDER BY a grouping key written as a property accessor (`f.id`, not its
+    // alias) must work under aggregation — it should behave like ORDER BY the
+    // alias, not mint a fresh post-grouping sort var.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = seed_nodes_with_ids(&fluree, "it/cypher:order-prop-group").await;
+    let db = graphdb_from_ledger(&l);
+
+    let via_accessor = fluree
+        .query_cypher(
+            &db,
+            "MATCH (f:Person) RETURN f.id AS friendId, count(f) AS c ORDER BY f.id",
+        )
+        .await
+        .expect("ORDER BY property accessor under aggregation");
+    let via_alias = fluree
+        .query_cypher(
+            &db,
+            "MATCH (f:Person) RETURN f.id AS friendId, count(f) AS c ORDER BY friendId",
+        )
+        .await
+        .expect("ORDER BY alias");
+    assert_eq!(via_accessor.row_count(), 3, "one row per distinct id");
+    assert_eq!(
+        via_accessor.row_count(),
+        via_alias.row_count(),
+        "accessor and alias forms agree"
+    );
+}
+
+#[tokio::test]
 async fn transact_cypher_unwind_edge_with_property_batches() {
     // Edge batch carrying a per-row edge property: `p.d` is a VALUES-bound
     // column used in the relationship property map. The edge reifies, and each
