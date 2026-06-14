@@ -8,10 +8,8 @@
 //! the rest of the parsing pipeline (`expand_with_context_policy`,
 //! `parse_expanded_triples_with_ctx`) processes it unchanged.
 //!
-//! Two source shapes are accepted:
-//!
-//! 1. **Inline form** (`@annotation` / `@edge` on the *object* node of
-//!    a predicate):
+//! The accepted insert shape is the **inline form** (`@annotation` /
+//! `@edge` on the *object* node of a predicate):
 //!    ```json
 //!    { "@id": "ex:alice",
 //!      "ex:worksFor": {
@@ -20,28 +18,25 @@
 //!      }
 //!    }
 //!    ```
-//!    The annotation reifies the edge `(ex:alice, ex:worksFor, ex:acme)`.
-//!    The annotation subject is the `@id` inside the `@annotation` block,
-//!    or a freshly-minted blank node when absent.
+//! The annotation reifies the edge `(ex:alice, ex:worksFor, ex:acme)`.
+//! The annotation subject is the `@id` inside the `@annotation` block,
+//! or a freshly-minted blank node when absent. Annotated literal objects
+//! (plain, typed, and language-tagged) are supported, provided they
+//! carry an explicit `@type` / `@language` — `@context` coercion of an
+//! annotated literal is rejected (see
+//! [`reject_context_coercion_on_annotated_literal`]) so the reified
+//! `f:reifiesObject` bundle can't silently diverge from the base flake.
 //!
-//! 2. **Annotation-rooted form** (`@reifies` on an enclosing node):
-//!    ```json
-//!    { "@id": "ex:employment-1",
-//!      "ex:role": "Engineer",
-//!      "@reifies": {
-//!        "@id": "ex:alice",
-//!        "ex:worksFor": { "@id": "ex:acme" }
-//!      }
-//!    }
-//!    ```
-//!    The enclosing node IS the annotation; `@reifies` names the base
-//!    edge it reifies. We emit the base edge as a *sibling* top-level
-//!    node so the standard parser asserts it.
+//! The **annotation-rooted form** (`@reifies` on an enclosing node) is
+//! *not* an insert surface in v1: user-authored `@reifies` on a write is
+//! rejected as deferred by [`lower_reifies_block`]. `@reifies` is a
+//! query-side construct; the only writer that produces the
+//! `@reifies`-rooted shape is the internal delete-by-id rewrite.
 //!
 //! Strict deferred-shape rejection (per the contract in
 //! `docs/concepts/edge-annotations.md` "Current limits"):
 //!
-//! - Literal-valued annotations (`@value` + `@annotation`) → error.
+//! - User-authored `@reifies` on the insert side → error.
 //! - Multi-triple `@reifies` (more than one predicate-object pair) →
 //!   error.
 //! - Annotation-of-annotation (nested `@annotation` inside an

@@ -885,29 +885,113 @@ pub async fn stage(
             }
         }
 
-        // Stage-time single-target invariant: an annotation SID may be
-        // attached to at most one edge at a time. Re-pointing the same
-        // SID to a different edge in one transaction requires
-        // explicitly retracting the prior attachment in the same
-        // transaction (the retract + assert pair nets to one asserted
-        // `f:reifiesSubject` flake). We enforce this on the final
-        // flake set so the legitimate re-point shape passes (one
-        // retract for the old subject, one assert for the new),
-        // while two concurrent attaches against the same explicit-IRI
-        // `@id` fail loudly here rather than corrupting
-        // `EdgeKey::from_reifies_facts` downstream.
-        let mut asserted_subjects: HashMap<Sid, usize> = HashMap::new();
-        for f in &flakes {
-            if f.op && fluree_db_core::is_reifies_subject(&f.p) {
-                *asserted_subjects.entry(f.s.clone()).or_insert(0) += 1;
+        // Stage-time attachment-bundle invariant: an annotation SID may
+        // reify exactly one edge. Counting this txn's asserted
+        // `f:reifiesSubject` flakes is insufficient — it misses
+        // (a) re-pointing an `@id` already attached to a *different*
+        // edge in a prior transaction (no retract in this txn), and
+        // (b) same-subject / different-slot multiplicity within one txn
+        // (the subject slot dedupes while the predicate/object slots
+        // diverge). Validate the *net* asserted bundle per touched
+        // annotation SID — current snapshot/novelty state, minus this
+        // txn's retracts, plus its asserts — by decoding it the way the
+        // arena / hydration paths will. A malformed (multi-target) net
+        // bundle is rejected here rather than corrupting downstream
+        // `EdgeKey::from_reifies_facts`.
+        {
+            use fluree_db_core::comparator::IndexType;
+            use fluree_db_core::edge::EdgeKey;
+            use fluree_db_core::range::{RangeMatch, RangeOptions, RangeTest};
+            use fluree_db_core::is_reserved_reifies_predicate;
+
+            // Annotation SIDs this txn asserts a `f:reifies*` flake for.
+            // Pure retracts only shrink a bundle, so they can't create a
+            // multi-target; gating on asserts keeps non-annotation and
+            // retract-only transactions at zero scan cost.
+            let mut touched: Vec<Sid> = Vec::new();
+            let mut touched_seen: HashSet<Sid> = HashSet::new();
+            for f in &flakes {
+                if f.op && is_reserved_reifies_predicate(&f.p) && touched_seen.insert(f.s.clone()) {
+                    touched.push(f.s.clone());
+                }
             }
-        }
-        if let Some((ann_sid, count)) = asserted_subjects.iter().find(|(_, n)| **n > 1) {
-            return Err(TransactError::InvariantViolation(format!(
-                "annotation subject `{ann_sid}` would be attached to {count} different edges in one \
-                 transaction; an annotation may reify exactly one edge. Retract the prior \
-                 attachment in the same transaction if you intended to re-point it.",
-            )));
+
+            if !touched.is_empty() {
+                let to_t = ledger.t();
+                // Set key for a `f:reifies*` fact: graph + subject +
+                // predicate + object + datatype. Keying as a set gives
+                // RDF set-semantics, so an idempotent re-assert of an
+                // existing attachment collapses instead of looking like
+                // a duplicate slot, while genuinely divergent slots
+                // (two different edges) remain distinct and trip
+                // `EdgeKey::from_reifies_facts`'s `Duplicate` check.
+                type ReifiesKey = (Option<Sid>, Sid, Sid, FlakeValue, Sid);
+                let reifies_key = |f: &Flake| -> ReifiesKey {
+                    (
+                        f.g.clone(),
+                        f.s.clone(),
+                        f.p.clone(),
+                        f.o.clone(),
+                        f.dt.clone(),
+                    )
+                };
+
+                for ann_sid in &touched {
+                    // The bundle lives in a single graph (default graph
+                    // in v1); take the g_id from this txn's asserts.
+                    let g_id = flakes
+                        .iter()
+                        .find(|f| {
+                            f.op && f.s == *ann_sid && is_reserved_reifies_predicate(&f.p)
+                        })
+                        .map(|f| resolve_flake_graph_id(f, &reverse_graph))
+                        .transpose()?
+                        .unwrap_or(0);
+
+                    // Current asserted `f:reifies*` bundle for this SID
+                    // (pre-txn snapshot + novelty), as a deduped set.
+                    let current = fluree_db_core::range_with_overlay(
+                        &ledger.snapshot,
+                        g_id,
+                        ledger.novelty.as_ref(),
+                        IndexType::Spot,
+                        RangeTest::Eq,
+                        RangeMatch::new().with_subject(ann_sid.clone()),
+                        RangeOptions::new().with_to_t(to_t),
+                    )
+                    .await?;
+                    let mut net: HashMap<ReifiesKey, Flake> = HashMap::new();
+                    for f in current {
+                        if is_reserved_reifies_predicate(&f.p) {
+                            net.insert(reifies_key(&f), f);
+                        }
+                    }
+
+                    // Fold this txn's effects for the SID: retracts drop
+                    // the matching fact; asserts add it.
+                    for f in flakes
+                        .iter()
+                        .filter(|f| f.s == *ann_sid && is_reserved_reifies_predicate(&f.p))
+                    {
+                        let key = reifies_key(f);
+                        if f.op {
+                            net.insert(key, f.clone());
+                        } else {
+                            net.remove(&key);
+                        }
+                    }
+
+                    let net_bundle: Vec<Flake> = net.into_values().collect();
+                    if let Err(e) = EdgeKey::from_reifies_facts(&net_bundle) {
+                        return Err(TransactError::InvariantViolation(format!(
+                            "annotation subject `{ann_sid}` would reify a malformed or \
+                             multi-target edge after this transaction ({e:?}); an annotation \
+                             may reify exactly one edge. Retract the prior attachment in the \
+                             same transaction if you intended to re-point it.",
+                        )));
+                    }
+                }
+            }
         }
 
         // Charge 1 micro-fuel per staged flake. Matches query-side scan fuel,

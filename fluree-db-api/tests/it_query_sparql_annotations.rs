@@ -256,6 +256,104 @@ async fn sparql_insert_data_with_named_blank_reifier_round_trips() {
 }
 
 #[tokio::test]
+async fn sparql_same_id_reifying_two_edges_in_one_txn_is_rejected() {
+    // Single-txn multi-target: one explicit `@id` reifying two edges
+    // that share a subject. The `f:reifiesSubject` slot dedupes (same
+    // subject) so a subject-flake *count* sees one — but the predicate
+    // and object slots diverge, so the net bundle is multi-target. The
+    // net-bundle decode catches it; a plain count would not.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/sparql-ann-update/multi-target-one-txn");
+    let update = r#"
+        PREFIX ex: <http://example.org/>
+        INSERT DATA {
+          ex:alice ex:worksFor ex:acme ~ ex:ann1 {| ex:role "Engineer" |} .
+          ex:alice ex:knows    ex:bob  ~ ex:ann1 {| ex:role "Friend"   |} .
+        }
+    "#;
+    let txn = lower_update(&ledger0, update);
+    let err = fluree
+        .stage_owned(ledger0)
+        .txn(txn)
+        .execute()
+        .await
+        .expect_err("one annotation id reifying two edges in one txn must be rejected");
+    let msg = format!("{err:?} {err}");
+    assert!(
+        msg.contains("multi-target") || msg.contains("reify exactly one edge"),
+        "expected multi-target rejection, got: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn sparql_reattaching_id_to_different_edge_across_txns_is_rejected() {
+    // Cross-txn re-point with no retract: the prior attachment lives in
+    // snapshot/novelty, not in this txn's flake set, so a count over the
+    // current txn alone sees a single subject assert and passes. The
+    // net-bundle check folds the prior state in and rejects.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/sparql-ann-update/repoint-across-txn");
+
+    let attach = r#"
+        PREFIX ex: <http://example.org/>
+        INSERT DATA { ex:alice ex:worksFor ex:acme ~ ex:ann1 {| ex:role "Engineer" |} . }
+    "#;
+    let t1 = lower_update(&ledger0, attach);
+    let ledger1 = fluree
+        .stage_owned(ledger0)
+        .txn(t1)
+        .execute()
+        .await
+        .expect("first attach")
+        .ledger;
+
+    let repoint = r#"
+        PREFIX ex: <http://example.org/>
+        INSERT DATA { ex:carol ex:worksFor ex:dave ~ ex:ann1 {| ex:role "Manager" |} . }
+    "#;
+    let t2 = lower_update(&ledger1, repoint);
+    let err = fluree
+        .stage_owned(ledger1)
+        .txn(t2)
+        .execute()
+        .await
+        .expect_err("re-pointing an annotation id to a different edge across txns must be rejected");
+    let msg = format!("{err:?} {err}");
+    assert!(
+        msg.contains("multi-target") || msg.contains("reify exactly one edge"),
+        "expected multi-target rejection, got: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn sparql_reasserting_same_annotation_across_txns_is_idempotent() {
+    // Guard against a false positive in the net-bundle check: re-asserting
+    // the *identical* attachment must not look like a duplicate slot. RDF
+    // set-semantics means the net bundle is unchanged, so it must pass.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/sparql-ann-update/reassert-idempotent");
+    let update = r#"
+        PREFIX ex: <http://example.org/>
+        INSERT DATA { ex:alice ex:worksFor ex:acme ~ ex:ann1 {| ex:role "Engineer" |} . }
+    "#;
+    let t1 = lower_update(&ledger0, update);
+    let ledger1 = fluree
+        .stage_owned(ledger0)
+        .txn(t1)
+        .execute()
+        .await
+        .expect("first attach")
+        .ledger;
+    let t2 = lower_update(&ledger1, update);
+    let _ = fluree
+        .stage_owned(ledger1)
+        .txn(t2)
+        .execute()
+        .await
+        .expect("re-asserting the identical annotation must succeed");
+}
+
+#[tokio::test]
 async fn sparql_insert_data_with_named_iri_reifier_round_trips() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/sparql-ann-update/insert-named-iri";
