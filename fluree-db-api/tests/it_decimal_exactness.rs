@@ -1349,3 +1349,83 @@ async fn mixed_int_decimal_predicate_range_filter_is_correct() {
         "ORDER BY over mixed int+decimal must be numerically interleaved"
     );
 }
+
+#[tokio::test]
+async fn inline_integer_range_pushdown_is_correct() {
+    // Integer keys are order-preserving (encode_i64), so a uniform-integer
+    // predicate gets the same range/ORDER BY/COUNT pushdown as decimals — and it
+    // needs no format change (works on any index). This checks correctness of
+    // the generalized path on a uniform xsd:integer predicate.
+    let fluree = memory_fluree();
+    let ledger_id = "decimal/inline-int-range:main";
+    let ledger = genesis_ledger(&fluree, ledger_id);
+
+    run_sparql_update(
+        &fluree,
+        ledger,
+        r"
+        PREFIX ex: <http://example.org/>
+        INSERT DATA {
+            ex:a ex:n 5 .
+            ex:b ex:n 100 .
+            ex:c ex:n -3 .
+            ex:d ex:n 42 .
+            ex:e ex:n 0 .
+        }
+        ",
+    )
+    .await;
+
+    full_rebuild_publish_decode_root(&fluree, ledger_id).await;
+    let ledger = fluree
+        .ledger(ledger_id)
+        .await
+        .expect("load reindexed ledger");
+
+    // ORDER BY: numeric order across negatives.
+    let asc = support::query_sparql(
+        &fluree,
+        &ledger,
+        r"PREFIX ex: <http://example.org/>
+          SELECT ?n WHERE { ?s ex:n ?n } ORDER BY ?n",
+    )
+    .await
+    .expect("order by");
+    let asc_json = asc.to_sparql_json(&ledger.snapshot).expect("json");
+    assert_eq!(
+        binding_values(&asc_json, "n"),
+        vec!["-3", "0", "5", "42", "100"],
+        "integer ORDER BY must be numeric"
+    );
+
+    // Range FILTER (the new narrowing path) + COUNT.
+    let filtered = support::query_sparql(
+        &fluree,
+        &ledger,
+        r"PREFIX ex: <http://example.org/>
+          SELECT ?n WHERE { ?s ex:n ?n FILTER(?n > 4) } ORDER BY ?n",
+    )
+    .await
+    .expect("range filter");
+    let fj = filtered.to_sparql_json(&ledger.snapshot).expect("json");
+    assert_eq!(
+        binding_values(&fj, "n"),
+        vec!["5", "42", "100"],
+        "integer range filter must narrow to values > 4"
+    );
+
+    let counted = support::query_sparql(
+        &fluree,
+        &ledger,
+        r"PREFIX ex: <http://example.org/>
+          SELECT (COUNT(?s) AS ?c) WHERE { ?s ex:n ?n FILTER(?n >= 0) }",
+    )
+    .await
+    .expect("count");
+    let cj = counted.to_sparql_json(&ledger.snapshot).expect("json");
+    assert_eq!(
+        binding_values(&cj, "c"),
+        vec!["4"],
+        "COUNT(?n >= 0) over integers must be 4 (0, 5, 42, 100)"
+    );
+}

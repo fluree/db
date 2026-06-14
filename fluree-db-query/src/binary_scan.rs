@@ -1839,39 +1839,44 @@ impl Operator for BinaryScanOperator {
         let mut range_o_type: Option<u16> = None;
         if order == RunSortOrder::Post && self.bound_o.is_none() {
             if let (Some(bounds), Some(p_id)) = (self.object_bounds.as_ref(), filter.p_id) {
-                // Only numeric bounds can target a decimal predicate; gate the
+                // Only numeric bounds can target a numeric predicate; gate the
                 // manifest extent probe (which may open ≤2 boundary leaves) on
                 // that so temporal/string range scans don't pay for it.
                 let has_numeric_bound = |b: &Option<(FlakeValue, bool)>| {
                     matches!(
                         b,
                         Some((
-                            FlakeValue::Long(_) | FlakeValue::BigInt(_) | FlakeValue::Decimal(_),
+                            FlakeValue::Long(_)
+                                | FlakeValue::BigInt(_)
+                                | FlakeValue::Decimal(_)
+                                | FlakeValue::Double(_),
                             _
                         ))
                     )
                 };
                 // Numeric range narrowing is unsafe in general (cross-type:
                 // `?o > 10` matches integer 11 AND decimal 11.5, stored under
-                // different o_types). But when the predicate is *uniformly*
-                // inline decimal — manifest extent min_o_type == max_o_type ==
-                // XSD_DECIMAL_INLINE, i.e. every value is an inline decimal with
-                // no arena spill and no other types — there are no other-typed
-                // rows to miss, so we can encode the bounds into the
-                // order-preserving decimal key space and seek the key range.
-                // The post-filter below stays as the correctness backstop.
-                let uniform_dec = (has_numeric_bound(&bounds.lower)
-                    || has_numeric_bound(&bounds.upper))
-                    && crate::fast_count::predicate_uniform_o_type(store_ref, self.g_id, p_id)
-                        == Some(OType::XSD_DECIMAL_INLINE.as_u16());
-                if uniform_dec {
+                // different o_types). But when the predicate is *uniformly* one
+                // order-preserving numeric type — manifest extent
+                // min_o_type == max_o_type and that type is o_key-ordered
+                // (any inline integer subtype, double/float, or inline decimal) —
+                // there are no other-typed rows to miss, so we encode the bounds
+                // into that type's key space and seek the key range. The
+                // post-filter below stays as the correctness backstop.
+                let numeric_uniform_ot = if has_numeric_bound(&bounds.lower)
+                    || has_numeric_bound(&bounds.upper)
+                {
+                    crate::fast_count::predicate_uniform_o_type(store_ref, self.g_id, p_id)
+                        .map(OType::from_u16)
+                        .filter(|ot| crate::fast_count::otype_okey_order_comparable(*ot))
+                } else {
+                    None
+                };
+                if let Some(pred_ot) = numeric_uniform_ot {
                     let enc = |v: &FlakeValue| {
-                        crate::fast_count::encode_numeric_threshold_for_otype(
-                            OType::XSD_DECIMAL_INLINE,
-                            v,
-                        )
-                        .ok()
-                        .flatten()
+                        crate::fast_count::encode_numeric_threshold_for_otype(pred_ot, v)
+                            .ok()
+                            .flatten()
                     };
                     if let Some((v, _inclusive)) = bounds.lower.as_ref() {
                         range_min_okey = enc(v);
@@ -1880,14 +1885,14 @@ impl Operator for BinaryScanOperator {
                         range_max_okey = enc(v);
                     }
                     if range_min_okey.is_some() || range_max_okey.is_some() {
-                        range_o_type = Some(OType::XSD_DECIMAL_INLINE.as_u16());
-                        filter.o_type = Some(OType::XSD_DECIMAL_INLINE.as_u16());
+                        range_o_type = Some(pred_ot.as_u16());
+                        filter.o_type = Some(pred_ot.as_u16());
                     }
                 }
 
                 // Temporal range narrowing (within-type comparison, always safe).
-                // Skipped if the uniform-decimal branch above already narrowed.
-                if !uniform_dec {
+                // Skipped if the numeric-uniform branch above already narrowed.
+                if numeric_uniform_ot.is_none() {
                     let supports_range = |ot: OType| -> bool {
                         matches!(
                             ot,
