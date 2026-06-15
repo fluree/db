@@ -182,6 +182,7 @@ The server's `POST /import/<ledger>` endpoint is exactly this: it adapts the req
 - **Integrity**: Every data frame is verified (SHA-256) before writing, and the manifest's commit/index head CIDs are checked to be present in the archive before the heads are set — a corrupted, truncated, or mismatched archive is rejected rather than creating a dangling head.
 - **Atomic on failure**: Any mid-stream error rolls back the half-created ledger, so a failed restore never leaves a live, partially-ingested ledger behind.
 - **Indexes are optional**: Without indexes, the restored ledger is functional but replays from commits (or reindexes) before queries are efficient. With indexes, it's queryable immediately.
+- **Default context preserved**: If the source ledger has a stored default JSON-LD context, its blob travels in the archive and the restored ledger keeps it — so queries that omit an inline `@context` and rely on the ledger's prefixes keep working. (Currently the local `archive_ledger` path; the remote `export --remote --format ledger` path does not yet carry it.)
 - **Storage-agnostic destination**: The restored ledger can live on file storage, S3, or any backend that implements the `Storage` trait — independent of where the archive's bytes came from.
 
 ## Wire format reference

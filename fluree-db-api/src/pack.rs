@@ -373,6 +373,34 @@ pub async fn stream_archive(
 
     match result {
         Ok(stats) => {
+            // Ship the default-context blob (if the archive carries one) as a
+            // data frame before the nameservice manifest, so the importer can
+            // restore the ledger's stored default JSON-LD context. The blob is
+            // a `LedgerConfig` CAS object, not reachable via commits or the
+            // index root, so it must be sent explicitly.
+            if let Some(cid_str) = nameservice_manifest
+                .get("default_context_id")
+                .and_then(|v| v.as_str())
+            {
+                let cid: ContentId = cid_str
+                    .parse()
+                    .map_err(|e| format!("invalid default_context_id in manifest: {e}"))?;
+                let store = fluree
+                    .branched_content_store(handle.ledger_id())
+                    .await
+                    .map_err(|e| format!("failed to build store for default context: {e}"))?;
+                let bytes = store
+                    .get(&cid)
+                    .await
+                    .map_err(|e| format!("failed to read default context blob {cid}: {e}"))?;
+                let mut buf = Vec::with_capacity(bytes.len() + 64);
+                encode_data_frame(&cid, &bytes, &mut buf);
+                frame_tx
+                    .send(Ok(buf))
+                    .await
+                    .map_err(|_| "client disconnected before default context".to_string())?;
+            }
+
             let mut manifest_buf = Vec::with_capacity(512);
             encode_manifest_frame(&nameservice_manifest, &mut manifest_buf);
             frame_tx

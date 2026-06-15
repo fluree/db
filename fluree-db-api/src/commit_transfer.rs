@@ -1658,6 +1658,30 @@ impl Fluree {
             index_t_out = Some(index_t);
         }
 
+        // Restore the ledger's stored default JSON-LD context, if the archive
+        // carried one. The blob was ingested above; re-point the new ledger's
+        // config at it so queries that omit an inline @context keep working.
+        if let Some(ctx_cid_str) = manifest.get("default_context_id").and_then(|v| v.as_str()) {
+            let ctx_cid: ContentId = ctx_cid_str.parse().map_err(|e| {
+                ApiError::http(400, format!("invalid default_context CID in manifest: {e}"))
+            })?;
+            if !content.has(&ctx_cid).await.unwrap_or(false) {
+                return Err(ApiError::http(
+                    400,
+                    format!(".flpack manifest names default-context blob {ctx_cid} that the archive did not contain"),
+                ));
+            }
+            let bytes = content.get(&ctx_cid).await.map_err(|e| {
+                ApiError::internal(format!("failed to read default context blob {ctx_cid}: {e}"))
+            })?;
+            let ctx_json: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| {
+                ApiError::http(400, format!("default context blob is not valid JSON: {e}"))
+            })?;
+            // Re-points config + bumps configV via the standard CAS path; the
+            // re-put of the (content-addressed) blob is idempotent.
+            self.set_default_context(new_ledger_id, &ctx_json).await?;
+        }
+
         Ok(RestoreResult {
             ledger_id: new_ledger_id.to_string(),
             commits,

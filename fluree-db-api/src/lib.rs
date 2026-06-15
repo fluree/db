@@ -3565,6 +3565,13 @@ impl Fluree {
             manifest["index_head_id"] = serde_json::Value::String(cid.to_string());
             manifest["index_t"] = serde_json::Value::from(view.index_t());
         }
+        // Carry the ledger's stored default JSON-LD context so the restored
+        // ledger keeps it. `stream_archive` ships the referenced blob as a data
+        // frame; the importer re-points the new ledger's config at it. Only set
+        // when present — `stream_archive` keys blob inclusion off this field.
+        if let Some(ctx_cid) = record.default_context.as_ref() {
+            manifest["default_context_id"] = serde_json::Value::String(ctx_cid.to_string());
+        }
 
         let (tx, mut rx) = tokio::sync::mpsc::channel::<pack::PackChunk>(64);
 

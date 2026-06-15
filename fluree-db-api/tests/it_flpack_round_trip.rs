@@ -644,6 +644,73 @@ async fn flpack_restore_bare_name_normalizes_to_main() {
     assert_eq!(out.as_array().expect("array").len(), 1);
 }
 
+/// The ledger's stored default JSON-LD context must survive an
+/// `archive_ledger` → `restore_ledger` round-trip (regression: the config
+/// blob + nameservice pointer were dropped, breaking queries that omit an
+/// inline `@context`).
+#[tokio::test]
+async fn flpack_preserves_default_context() {
+    let src_dir = tempfile::TempDir::new().expect("src tempdir");
+    let dst_dir = tempfile::TempDir::new().expect("dst tempdir");
+    let src_ledger = "flpack-test/ctx-source:main";
+    let dst_ledger = "flpack-test/ctx-restored:main";
+
+    let src_fluree = FlureeBuilder::file(src_dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build source");
+
+    // Populate, then set a default context on the source.
+    let src_db = fluree_db_core::LedgerSnapshot::genesis(src_ledger);
+    let src_state = fluree_db_api::LedgerState::new(src_db, fluree_db_api::Novelty::new(0));
+    let insert = json!({
+        "@context": {"ex": "http://example.org/ns/"},
+        "@id": "ex:a", "ex:v": "1"
+    });
+    src_fluree.insert(src_state, &insert).await.expect("insert");
+
+    let ctx = json!({ "ex": "http://example.org/ns/", "schema": "http://schema.org/" });
+    src_fluree
+        .set_default_context(src_ledger, &ctx)
+        .await
+        .expect("set default context");
+    let src_ctx = src_fluree
+        .get_default_context(src_ledger)
+        .await
+        .expect("get src context");
+    assert!(src_ctx.is_some(), "source should have a default context");
+
+    // Archive via the real export path (Vec<u8> is an AsyncWrite sink).
+    let mut archive: Vec<u8> = Vec::new();
+    src_fluree
+        .archive_ledger(src_ledger, true, &mut archive)
+        .await
+        .expect("archive");
+
+    // Restore into a separate instance under a different name.
+    let dst_fluree = FlureeBuilder::file(dst_dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build destination");
+    let mut reader = std::io::Cursor::new(archive);
+    dst_fluree
+        .restore_ledger(dst_ledger, &mut reader)
+        .await
+        .expect("restore");
+
+    // The restored ledger must carry the same default context.
+    let dst_ctx = dst_fluree
+        .get_default_context(dst_ledger)
+        .await
+        .expect("get dst context");
+    assert!(
+        dst_ctx.is_some(),
+        "restored default context must not be null (regression)"
+    );
+    assert_eq!(
+        dst_ctx, src_ctx,
+        "default context should be byte-identical after the round-trip"
+    );
+}
+
 /// A truncated archive (missing the End frame) must fail and leave no ledger
 /// behind — the half-created ledger is rolled back.
 #[tokio::test]

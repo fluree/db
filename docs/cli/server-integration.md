@@ -1932,9 +1932,12 @@ The `.flpack` format is identical to the binary stream served by `POST /pack/{le
   "commit_head_id": "bafybeig...commitHead",
   "commit_t": 42,
   "index_head_id": "bafybeig...indexRoot",
-  "index_t": 40
+  "index_t": 40,
+  "default_context_id": "bafybeig...contextBlob"
 }
 ```
+
+`index_head_id` / `index_t` appear only when the archive carries index artifacts; `default_context_id` appears only when the ledger has a stored default JSON-LD context — its blob is shipped as a data frame and the importer re-points the restored ledger's config at it (so queries that omit an inline `@context` keep working).
 
 **Aliasing on import:** The ledger name provided to `fluree create` determines the local storage path. The data itself is content-addressed (CIDs), so a ledger can be imported under any name. The `ledger_id` inside the index root binary is informational and does not affect CAS resolution.
 
