@@ -33,6 +33,7 @@ pub mod budget;
 pub mod fixtures;
 pub mod gen;
 pub mod ledger;
+pub mod normalize;
 pub mod report;
 pub mod runtime;
 pub mod tracing;
