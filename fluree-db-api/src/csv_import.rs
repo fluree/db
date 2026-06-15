@@ -22,10 +22,14 @@
 //!
 //! A node row and a property-less edge row are always **plain RDF 1.1**. An edge
 //! row that carries property columns is the only place reification enters, and
-//! [`EdgePolicy`] picks the encoding:
-//! - [`EdgePolicy::Reify`] (default) — property-bearing edges become an
+//! [`EdgePolicy`] (the CLI's `--edge-properties annotated|nary|plain`) picks the
+//! encoding:
+//! - [`EdgePolicy::Annotated`] (default) — property-bearing edges become an
 //!   `@annotation` (RDF 1.2 / LPG): Cypher `(a)-[r:T]->(b)` + `r.prop` and
 //!   SPARQL `{| … |}` both read the property; property-less edges stay plain.
+//! - [`EdgePolicy::Nary`] — edge properties become an intermediate node (pure
+//!   RDF 1.1, no reification). *Deferred* — the n-ary predicate convention isn't
+//!   pinned yet, so this errors rather than guess.
 //! - [`EdgePolicy::Plain`] — edge properties are dropped; every edge is a plain
 //!   triple (pure RDF 1.1).
 
@@ -34,14 +38,18 @@ use serde_json::{Map, Value};
 /// XSD namespace for typed literals emitted as JSON-LD `@value`/`@type`.
 const XSD: &str = "http://www.w3.org/2001/XMLSchema#";
 
-/// How a relationship that carries property columns is encoded in RDF.
+/// How a relationship that carries property columns is encoded in RDF — the
+/// CLI's `--edge-properties` flag.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum EdgePolicy {
     /// Property-bearing edges → `@annotation` (RDF 1.2 / LPG); property-less
     /// edges → plain triple. Reads from both Cypher (`r.prop`) and SPARQL
     /// (`{| |}`).
     #[default]
-    Reify,
+    Annotated,
+    /// Edge properties → an intermediate "statement" node (pure RDF 1.1, no
+    /// reification). Deferred until the n-ary predicate convention is fixed.
+    Nary,
     /// Drop edge properties — every edge is a plain RDF 1.1 triple.
     Plain,
 }
@@ -96,6 +104,11 @@ pub enum CsvImportError {
         kind: &'static str,
         value: String,
     },
+    #[error(
+        "`--edge-properties nary` is not implemented yet (relationship `{rel_type}` carries \
+         properties); use `annotated` or `plain` for now"
+    )]
+    NaryDeferred { rel_type: String },
 }
 
 type Result<T> = std::result::Result<T, CsvImportError>;
@@ -436,11 +449,19 @@ fn rel_object(
     let s_iri = mint_iri(&opts.base_iri, s_space.as_deref(), &s_val);
     let o_iri = mint_iri(&opts.base_iri, e_space.as_deref(), &e_val);
 
+    // Nary encoding is deferred (its intermediate-node predicate convention is
+    // not fixed); error rather than silently mis-model property-bearing edges.
+    if !props.is_empty() && opts.edge_policy == EdgePolicy::Nary {
+        return Err(CsvImportError::NaryDeferred {
+            rel_type: rel_type.clone(),
+        });
+    }
+
     let mut object = Map::new();
     object.insert("@id".to_string(), Value::String(o_iri));
-    // Property-bearing edges reify under EdgePolicy::Reify; otherwise the
-    // properties are dropped and the edge is a plain triple.
-    if !props.is_empty() && opts.edge_policy == EdgePolicy::Reify {
+    // A property-bearing edge reifies under `Annotated`; under `Plain` the
+    // properties are dropped and the edge stays a plain triple.
+    if !props.is_empty() && opts.edge_policy == EdgePolicy::Annotated {
         object.insert("@annotation".to_string(), Value::Object(props));
     }
 
@@ -559,6 +580,34 @@ mod tests {
                 "@id": "http://ex/Person/10",
                 "http://ex/KNOWS": {"@id": "http://ex/Person/20"}
             })]
+        );
+    }
+
+    #[test]
+    fn property_edge_under_nary_policy_is_deferred() {
+        let csv =
+            ":START_ID(Person),:END_ID(Person),:TYPE,creationDate:long\n10,20,KNOWS,1577934245\n";
+        let err = csv_to_jsonld(
+            csv,
+            &CsvImportOptions {
+                edge_policy: EdgePolicy::Nary,
+                ..opts()
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, CsvImportError::NaryDeferred { .. }), "{err}");
+        // A property-LESS edge is a plain triple under any policy — no n-ary node.
+        let plainish = csv_to_jsonld(
+            ":START_ID(Person),:END_ID(Person),:TYPE\n10,20,KNOWS\n",
+            &CsvImportOptions {
+                edge_policy: EdgePolicy::Nary,
+                ..opts()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            plainish,
+            vec![json!({"@id": "http://ex/Person/10", "http://ex/KNOWS": {"@id": "http://ex/Person/20"}})]
         );
     }
 
