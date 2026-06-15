@@ -1654,7 +1654,58 @@ impl Fluree {
                 .get("index_t")
                 .and_then(serde_json::Value::as_i64)
                 .unwrap_or(0);
-            self.set_index_head(&handle, &index_cid, index_t).await?;
+
+            // The FIR6 index root embeds the *source* ledger_id as an inline
+            // identity field. Loading it under a new name trips
+            // `apply_loaded_db`'s identity check ("Index ledger_id '<src>' does
+            // not match expected '<dst>'"), which only the write path hits —
+            // leaving an otherwise-queryable restored ledger silently
+            // read-only. Re-stamp that one field and re-write the root under a
+            // fresh CID when the names differ. Every other artifact (branches,
+            // leaves, dicts) is name-independent and was ingested verbatim;
+            // the source ledger name is intentionally preserved in the
+            // historical txn-meta/config graph IRIs (those live in the
+            // content-addressed dict tree and match clone/pull semantics).
+            let head_index_cid = {
+                use fluree_db_binary_index::IndexRoot;
+                let root_bytes = content.get(&index_cid).await.map_err(|e| {
+                    ApiError::internal(format!(
+                        "failed to read restored index root {index_cid}: {e}"
+                    ))
+                })?;
+                let mut root = IndexRoot::decode(&root_bytes).map_err(|e| {
+                    ApiError::http(
+                        400,
+                        format!("restored index root {index_cid} is not a valid FIR6 root: {e}"),
+                    )
+                })?;
+                if root.ledger_id == new_ledger_id {
+                    index_cid
+                } else {
+                    root.ledger_id = new_ledger_id.to_string();
+                    let restamped = root.encode();
+                    let res = storage
+                        .content_write_bytes(ContentKind::IndexRoot, new_ledger_id, &restamped)
+                        .await
+                        .map_err(|e| {
+                            ApiError::internal(format!(
+                                "failed to write re-stamped index root: {e}"
+                            ))
+                        })?;
+                    ContentId::from_hex_digest(
+                        ContentKind::IndexRoot.to_codec(),
+                        &res.content_hash,
+                    )
+                    .ok_or_else(|| {
+                        ApiError::internal(format!(
+                            "re-stamped index root produced an invalid content hash '{}'",
+                            res.content_hash
+                        ))
+                    })?
+                }
+            };
+
+            self.set_index_head(&handle, &head_index_cid, index_t).await?;
             index_t_out = Some(index_t);
         }
 
