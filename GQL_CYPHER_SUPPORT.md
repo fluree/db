@@ -567,7 +567,7 @@ standard solution modifiers and a conservative expression sublanguage.**
 | `CALL { subquery }` (read-only) | ✅ | Lowers to `Subquery`. |
 | `CALL procedureName(...)` | ❌ | No procedure namespace yet. Reject. |
 | `shortestPath / allShortestPaths` | ❌ | Deferred — needs path-aware planner extension. |
-| `EXISTS { ... }` | ✅ | Lowers to existing `Exists`. |
+| `EXISTS { ... }` | ✅ | Bare pattern **and** the subquery form `EXISTS { MATCH … WHERE … }` (inner WHERE ANDed into the test; outer vars visible). Lowers to the shared `Exists`. |
 | `CASE ... WHEN ... END` | ✅ | Standard expression. |
 
 ### v1 write surface

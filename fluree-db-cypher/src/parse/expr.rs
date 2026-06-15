@@ -244,9 +244,18 @@ fn parse_primary(s: &mut TokenStream) -> Result<Expr, Diagnostic> {
         TokenKind::Exists => {
             s.advance();
             s.expect(&TokenKind::LBrace)?;
+            // Accept both the bare-pattern form `EXISTS { (a)-[:T]-(b) }` and the
+            // openCypher subquery form `EXISTS { MATCH (a)-[:T]-(b) WHERE … }`.
+            // The leading MATCH is optional; an inner WHERE filters the test.
+            s.eat(&TokenKind::Match);
             let pat = parse_pattern(s)?;
+            let inner_where = if s.eat(&TokenKind::Where).is_some() {
+                Some(Box::new(parse_expr(s)?))
+            } else {
+                None
+            };
             let end = s.expect(&TokenKind::RBrace)?;
-            Ok(Expr::Exists(Box::new(pat), start.union(end)))
+            Ok(Expr::Exists(Box::new(pat), inner_where, start.union(end)))
         }
         TokenKind::Count => {
             // count(*) | count(DISTINCT x) | count(x)

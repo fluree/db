@@ -2009,3 +2009,133 @@ async fn cypher_shortest_path_single_honors_lower_hop_bound() {
         .expect("jsonld");
     assert_eq!(out[0][0], json!(2), "shortest qualifying path is length 2: {out}");
 }
+
+/// Seed 4 persons with `ex:id` 1..4 where person 1 KNOWS persons 3 and 4.
+async fn seed_exists_graph(
+    fluree: &fluree_db_api::Fluree,
+    ledger_id: &str,
+) -> fluree_db_api::LedgerState {
+    let ledger0 = genesis_ledger(fluree, ledger_id);
+    fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": ctx(),
+                "@graph": [
+                    {"@id": "ex:n1", "@type": "ex:Person", "ex:id": 1, "ex:name": "Alice",
+                     "ex:KNOWS": [{"@id": "ex:n3"}, {"@id": "ex:n4"}]},
+                    {"@id": "ex:n2", "@type": "ex:Person", "ex:id": 2, "ex:name": "Bob"},
+                    {"@id": "ex:n3", "@type": "ex:Person", "ex:id": 3, "ex:name": "Carol"},
+                    {"@id": "ex:n4", "@type": "ex:Person", "ex:id": 4, "ex:name": "Dave"},
+                ]
+            }),
+        )
+        .await
+        .expect("seed exists graph")
+        .ledger
+}
+
+#[tokio::test]
+async fn cypher_exists_bare_pattern_form() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = seed_exists_graph(&fluree, "it/cypher:exists-bare").await;
+    let db = graphdb_from_ledger(&l);
+
+    let out = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (p:Person {id: 1}) WHERE EXISTS { (p)-[:KNOWS]-(x:Person) } RETURN p.id AS id"#,
+        )
+        .await
+        .expect("exists bare")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    assert_eq!(out[0][0], json!(1), "person 1 has a KNOWS edge: {out}");
+}
+
+#[tokio::test]
+async fn cypher_exists_subquery_match_form() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = seed_exists_graph(&fluree, "it/cypher:exists-match").await;
+    let db = graphdb_from_ledger(&l);
+
+    // Subquery form with an explicit MATCH but no inner WHERE.
+    let out = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (p:Person {id: 1}) WHERE EXISTS { MATCH (p)-[:KNOWS]-(x:Person) } RETURN p.id AS id"#,
+        )
+        .await
+        .expect("exists match-form")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    assert_eq!(out[0][0], json!(1), "MATCH-form existence holds: {out}");
+}
+
+#[tokio::test]
+async fn cypher_exists_subquery_inner_where() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = seed_exists_graph(&fluree, "it/cypher:exists-inner-where").await;
+    let db = graphdb_from_ledger(&l);
+
+    // The IC4 shape: subquery form with an inner WHERE. Person 1 KNOWS 3 and 4
+    // (both id > 2), so the filtered existence test holds.
+    let out = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (p:Person {id: 1})
+               WHERE EXISTS { MATCH (p)-[:KNOWS]-(x) WHERE x.id > 2 }
+               RETURN p.id AS id"#,
+        )
+        .await
+        .expect("exists inner-where")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    assert_eq!(out[0][0], json!(1), "person 1 has a friend with id > 2: {out}");
+}
+
+#[tokio::test]
+async fn cypher_exists_inner_where_excludes_when_unmet() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = seed_exists_graph(&fluree, "it/cypher:exists-inner-where-neg").await;
+    let db = graphdb_from_ledger(&l);
+
+    // No friend with id > 100, so the filtered existence test fails and the
+    // row is excluded.
+    let rows = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (p:Person {id: 1})
+               WHERE EXISTS { MATCH (p)-[:KNOWS]-(x) WHERE x.id > 100 }
+               RETURN p.id AS id"#,
+        )
+        .await
+        .expect("exists inner-where unmet");
+    assert_eq!(rows.row_count(), 0, "no friend with id > 100");
+}
+
+#[tokio::test]
+async fn cypher_not_exists_subquery_inner_where() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = seed_exists_graph(&fluree, "it/cypher:not-exists-inner-where").await;
+    let db = graphdb_from_ledger(&l);
+
+    // NOT EXISTS with an inner WHERE: person 1 has no friend with id > 100,
+    // so NOT EXISTS holds and the row is kept.
+    let out = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (p:Person {id: 1})
+               WHERE NOT EXISTS { MATCH (p)-[:KNOWS]-(x) WHERE x.id > 100 }
+               RETURN p.id AS id"#,
+        )
+        .await
+        .expect("not exists inner-where")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    assert_eq!(out[0][0], json!(1), "no friend with id > 100 → NOT EXISTS holds: {out}");
+}

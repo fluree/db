@@ -389,7 +389,7 @@ fn collect_alias_in_expr(e: &Expr, alias: &str, fields: &mut Vec<String>, bare: 
                 collect_alias_in_expr(it, alias, fields, bare);
             }
         }
-        Expr::Lit(_) | Expr::Param(_) | Expr::Case(_) | Expr::Exists(_, _) => {}
+        Expr::Lit(_) | Expr::Param(_) | Expr::Case(_) | Expr::Exists(_, _, _) => {}
     }
 }
 
@@ -524,7 +524,7 @@ fn rewrite_alias_in_expr_to_var<F: Fn(&str) -> String>(
                 rewrite_alias_in_expr_to_var(it, alias, col_var, bare_var);
             }
         }
-        Expr::Var(_) | Expr::Lit(_) | Expr::Param(_) | Expr::Case(_) | Expr::Exists(_, _) => {}
+        Expr::Var(_) | Expr::Lit(_) | Expr::Param(_) | Expr::Case(_) | Expr::Exists(_, _, _) => {}
     }
 }
 
@@ -628,7 +628,9 @@ fn replace_alias_in_expr(
             }
             Ok(())
         }
-        Expr::Case(_) | Expr::Exists(_, _) | Expr::Var(_) | Expr::Lit(_) | Expr::Param(_) => Ok(()),
+        Expr::Case(_) | Expr::Exists(_, _, _) | Expr::Var(_) | Expr::Lit(_) | Expr::Param(_) => {
+            Ok(())
+        }
     }
 }
 
@@ -846,7 +848,13 @@ fn subst_expr(e: &mut Expr, p: &ParamMap) -> Result<(), ParamError> {
             Ok(())
         }
         Expr::Case(c) => subst_case(c, p),
-        Expr::Exists(pat, _) => subst_pattern(pat, p),
+        Expr::Exists(pat, inner_where, _) => {
+            subst_pattern(pat, p)?;
+            if let Some(w) = inner_where {
+                subst_expr(w, p)?;
+            }
+            Ok(())
+        }
         Expr::List(items, _) => {
             for it in items {
                 subst_expr(it, p)?;

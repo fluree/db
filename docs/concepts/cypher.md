@@ -133,7 +133,9 @@ ORDER BY / SKIP / LIMIT
 - `WHERE` expressions: comparison, AND/OR/NOT, arithmetic +/-/*//,
   STARTS WITH / ENDS WITH / CONTAINS, IS NULL / IS NOT NULL,
   `expr IN [a, b, ...]`, `CASE WHEN ... THEN ... END` (simple and
-  subject forms), `EXISTS { pattern }`.
+  subject forms), `EXISTS { pattern }` and the subquery form
+  `EXISTS { MATCH pattern WHERE expr }` (the inner `WHERE` is ANDed into
+  the correlated existence test; outer-scope variables stay visible).
 - Property accessors `n.prop` in expression position. Lowered by
   emitting an auxiliary `Optional((n, <prop IRI>, ?#__prop_n_prop))`
   before the consuming Filter/Bind/aggregate. The Optional wrap

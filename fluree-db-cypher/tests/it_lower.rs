@@ -235,6 +235,28 @@ fn plain_path_value_is_still_rejected() {
 }
 
 #[test]
+fn exists_accepts_bare_match_and_subquery_forms() {
+    // All three openCypher EXISTS body forms must parse: bare pattern, an
+    // explicit MATCH, and the subquery form with an inner WHERE.
+    for src in [
+        "MATCH (p:Person) WHERE EXISTS { (p)-[:KNOWS]-(x:Person) } RETURN p",
+        "MATCH (p:Person) WHERE EXISTS { MATCH (p)-[:KNOWS]-(x:Person) } RETURN p",
+        "MATCH (p:Person) WHERE EXISTS { MATCH (p)-[:KNOWS]-(x) WHERE x.id > 2 } RETURN p",
+        "MATCH (p:Person) WHERE NOT EXISTS { MATCH (p)-[:KNOWS]-(x) WHERE x.id > 2 } RETURN p",
+    ] {
+        let out = parse_cypher(src);
+        assert!(!out.has_errors(), "should parse: {src}\n{:?}", out.diagnostics);
+        // The inner-WHERE form must lower (inner filter ANDed into the test).
+        let ast = out.ast.expect("ast");
+        let mut vars = VarRegistry::new();
+        assert!(
+            lower_cypher(&ast, &ConstEncoder, &mut vars).is_ok(),
+            "should lower: {src}"
+        );
+    }
+}
+
+#[test]
 fn inverse_direction() {
     let q = lower("MATCH (a:Person)<-[:KNOWS]-(b:Person) RETURN a, b");
     // 3 patterns; the rel triple should have b's var as subject.

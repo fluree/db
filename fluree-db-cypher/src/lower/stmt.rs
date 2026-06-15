@@ -457,7 +457,6 @@ impl ProjectionState {
             &mut rewritten,
             patterns,
             &mut self.aggregates,
-            &mut self.list_outputs,
             &mut self.agg_name_counter,
         )?;
         if composite_references_grouping_value(&rewritten) {
@@ -605,7 +604,9 @@ fn expr_has_aggregate(e: &Expr) -> bool {
         | Expr::IsNotNull(x, _)
         | Expr::Prop(x, _, _) => expr_has_aggregate(x),
         Expr::List(items, _) => items.iter().any(expr_has_aggregate),
-        Expr::Var(_) | Expr::Lit(_) | Expr::Param(_) | Expr::Case(_) | Expr::Exists(_, _) => false,
+        Expr::Var(_) | Expr::Lit(_) | Expr::Param(_) | Expr::Case(_) | Expr::Exists(_, _, _) => {
+            false
+        }
     }
 }
 
@@ -618,7 +619,6 @@ fn extract_aggregates<E: IriEncoder>(
     e: &mut Expr,
     patterns: &mut Vec<Pattern>,
     aggregates: &mut Vec<AggregateSpec>,
-    list_outputs: &mut std::collections::HashSet<VarId>,
     counter: &mut u32,
 ) -> Result<()> {
     match e {
@@ -650,7 +650,7 @@ fn extract_aggregates<E: IriEncoder>(
         }
         Expr::Call(call) => {
             for a in &mut call.args {
-                extract_aggregates(ctx, a, patterns, aggregates, list_outputs, counter)?;
+                extract_aggregates(ctx, a, patterns, aggregates, counter)?;
             }
             Ok(())
         }
@@ -659,22 +659,22 @@ fn extract_aggregates<E: IriEncoder>(
         | Expr::StartsWith(l, r, _)
         | Expr::EndsWith(l, r, _)
         | Expr::Contains(l, r, _) => {
-            extract_aggregates(ctx, l, patterns, aggregates, list_outputs, counter)?;
-            extract_aggregates(ctx, r, patterns, aggregates, list_outputs, counter)
+            extract_aggregates(ctx, l, patterns, aggregates, counter)?;
+            extract_aggregates(ctx, r, patterns, aggregates, counter)
         }
         Expr::UnaryOp(_, x, _)
         | Expr::IsNull(x, _)
         | Expr::IsNotNull(x, _)
         | Expr::Prop(x, _, _) => {
-            extract_aggregates(ctx, x, patterns, aggregates, list_outputs, counter)
+            extract_aggregates(ctx, x, patterns, aggregates, counter)
         }
         Expr::List(items, _) => {
             for it in items {
-                extract_aggregates(ctx, it, patterns, aggregates, list_outputs, counter)?;
+                extract_aggregates(ctx, it, patterns, aggregates, counter)?;
             }
             Ok(())
         }
-        Expr::Case(_) | Expr::Exists(_, _) => Err(LowerError::unsupported(
+        Expr::Case(_) | Expr::Exists(_, _, _) => Err(LowerError::unsupported(
             "aggregates inside CASE / EXISTS are not supported in v1",
         )),
         Expr::Var(_) | Expr::Lit(_) | Expr::Param(_) => Ok(()),
@@ -700,7 +700,7 @@ fn composite_references_grouping_value(e: &Expr) -> bool {
         }
         Expr::Call(c) => c.args.iter().any(composite_references_grouping_value),
         Expr::List(items, _) => items.iter().any(composite_references_grouping_value),
-        Expr::Lit(_) | Expr::Param(_) | Expr::Case(_) | Expr::Exists(_, _) => false,
+        Expr::Lit(_) | Expr::Param(_) | Expr::Case(_) | Expr::Exists(_, _, _) => false,
     }
 }
 

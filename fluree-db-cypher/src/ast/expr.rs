@@ -38,8 +38,10 @@ pub enum Expr {
     Contains(Box<Expr>, Box<Expr>, SourceSpan),
     /// `CASE ... WHEN ... THEN ... ELSE ... END`.
     Case(Box<CaseExpr>),
-    /// `EXISTS { pattern }`.
-    Exists(Box<Pattern>, SourceSpan),
+    /// `EXISTS { pattern }` or the subquery form
+    /// `EXISTS { MATCH pattern WHERE expr }`. The optional second element is
+    /// the inner `WHERE` condition, ANDed into the existence test.
+    Exists(Box<Pattern>, Option<Box<Expr>>, SourceSpan),
     /// Inline list literal `[expr, expr, ...]`.
     List(Vec<Expr>, SourceSpan),
 }
@@ -59,7 +61,7 @@ impl Expr {
             | Expr::StartsWith(_, _, s)
             | Expr::EndsWith(_, _, s)
             | Expr::Contains(_, _, s)
-            | Expr::Exists(_, s)
+            | Expr::Exists(_, _, s)
             | Expr::List(_, s) => *s,
             Expr::Call(c) => c.span,
             Expr::Case(c) => c.span,

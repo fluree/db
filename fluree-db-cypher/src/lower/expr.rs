@@ -105,8 +105,18 @@ pub fn lower_expr<E: IriEncoder>(
             Ok(Expression::binary(Function::Contains, l, r))
         }
         Expr::Case(case) => lower_case(ctx, case, aux),
-        Expr::Exists(pattern, _) => {
-            let patterns = lower_pattern(ctx, pattern)?;
+        Expr::Exists(pattern, inner_where, _) => {
+            let mut patterns = lower_pattern(ctx, pattern)?;
+            // An inner WHERE is ANDed into the existence test. Its own auxiliary
+            // patterns (e.g. property-accessor Optionals) must live INSIDE the
+            // subquery so `x.id` resolves within the existence scope, not the
+            // outer query — so lower it against a local aux, not the caller's.
+            if let Some(cond) = inner_where {
+                let mut inner_aux = Vec::new();
+                let filter = lower_expr(ctx, cond, &mut inner_aux)?;
+                patterns.extend(inner_aux);
+                patterns.push(Pattern::Filter(filter));
+            }
             Ok(Expression::Exists {
                 patterns,
                 negated: false,
