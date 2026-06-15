@@ -6,9 +6,9 @@ mod commits;
 mod context;
 mod events;
 mod export;
-mod import;
 #[cfg(feature = "iceberg")]
 mod iceberg;
+mod import;
 mod ledger;
 mod log;
 mod nameservice_refs;
@@ -126,6 +126,12 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route(
             "/import-upload/:import_id/blob",
             axum::routing::put(import::put_blob),
+        )
+        // Negotiated-upload multipart part sink (also token-authorized via the
+        // minted URL, so it sits outside the admin bracket).
+        .route(
+            "/import-upload/:import_id/part/:part_number",
+            axum::routing::put(import::put_part),
         )
         // SSE event streaming
         .route("/events", get(events::events))

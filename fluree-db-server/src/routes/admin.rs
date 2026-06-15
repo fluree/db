@@ -301,11 +301,18 @@ pub async fn discovery(State(state): State<Arc<AppState>>) -> Json<serde_json::V
     // choice when `presigned-put` is also offered.
     let mut import_modes = vec!["direct"];
     if config.import_presign_enabled {
+        // `presigned-put` (single PUT) and `multipart-put` (parts) are minted by
+        // the same `/import-upload` endpoint; the server picks per-archive by
+        // size at mint time. Advertising both lets the client know multipart is
+        // available for archives over the single-PUT 5 GiB ceiling.
         import_modes.push("presigned-put");
+        import_modes.push("multipart-put");
     }
     doc["import"] = serde_json::json!({
         "modes": import_modes,
         "direct_max_bytes": config.import_direct_max_bytes,
+        "multipart_threshold_bytes": config.import_multipart_threshold_bytes,
+        "multipart_part_size_bytes": config.import_multipart_part_size_bytes,
     });
 
     Json(doc)

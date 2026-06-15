@@ -17,17 +17,25 @@
 
 use crate::config::ServerRole;
 use crate::error::{Result, ServerError};
-use crate::import_jobs::{ImportJob, ImportStatus};
+use crate::import_jobs::{ImportJob, ImportStatus, MultipartPlan};
 use crate::state::AppState;
 use axum::extract::{Path, Query, Request, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json, Response};
 use futures::TryStreamExt;
 use serde::Deserialize;
+use std::path::{Path as FsPath, PathBuf};
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio_util::io::StreamReader;
 use tracing::debug;
+
+/// S3's hard ceiling on parts per multipart upload. The server raises the part
+/// size when an archive would otherwise need more parts than this. This is the
+/// real correctness constraint; the 5 MiB-per-part S3 minimum is left to the
+/// configured `import_multipart_part_size_bytes` (default 256 MiB), which sits
+/// comfortably above it.
+const MAX_MULTIPART_PARTS: u64 = 10_000;
 
 /// Import endpoint (ledger in path tail).
 ///
@@ -112,15 +120,60 @@ struct MintRequest {
     /// Target ledger name (path is fixed; the ledger rides in the body so it
     /// doesn't collide with the greedy `*ledger` tail on `POST /import`).
     ledger: String,
-    /// Optional archive size hint (bytes).
+    /// Archive size hint (bytes). Drives the single-PUT vs multipart choice:
+    /// an archive at or above the configured threshold is minted as multipart.
     #[serde(default)]
-    #[allow(dead_code)]
     size: Option<u64>,
 }
 
 #[derive(Deserialize)]
 pub(crate) struct BlobQuery {
     token: String,
+}
+
+/// One completed part reported by the client on `complete` (multipart).
+#[derive(Deserialize)]
+struct CompletedPart {
+    part_number: u32,
+    /// Object-store ETag for the part. The reference backend doesn't re-verify
+    /// it (restore re-hashes every frame anyway); a real backend passes it to
+    /// `CompleteMultipartUpload`.
+    #[serde(default)]
+    #[allow(dead_code)]
+    etag: Option<String>,
+}
+
+/// Optional body on `POST …/complete`. Empty for single-PUT uploads; carries
+/// the part list for multipart uploads.
+#[derive(Deserialize, Default)]
+struct CompleteRequest {
+    #[serde(default)]
+    parts: Vec<CompletedPart>,
+}
+
+/// Path a multipart part is staged at: a sibling of the assembled archive,
+/// e.g. `<staging>/imp_abc.flpack` → `<staging>/imp_abc.part.00001`.
+fn part_staging_path(staged_path: &FsPath, part_number: u32) -> PathBuf {
+    let stem = staged_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("import");
+    let parent = staged_path.parent().unwrap_or(FsPath::new("."));
+    parent.join(format!("{stem}.part.{part_number:05}"))
+}
+
+/// Choose a part size and count for an archive of `size` bytes, starting from
+/// the configured target and raising it so the count never exceeds S3's
+/// 10,000-part ceiling. Returns `(part_size, num_parts)`, both ≥ 1.
+fn plan_multipart(size: u64, configured_part_size: u64) -> (u64, u32) {
+    let mut part_size = configured_part_size.max(1);
+    if size.div_ceil(part_size) > MAX_MULTIPART_PARTS {
+        // Raise to the smallest MiB-aligned size that fits under the ceiling.
+        let needed = size.div_ceil(MAX_MULTIPART_PARTS);
+        part_size = needed.div_ceil(1024 * 1024) * 1024 * 1024;
+    }
+    let num_parts = size.div_ceil(part_size).max(1) as u32;
+    (part_size, num_parts)
 }
 
 /// Forward a request to the transactor. Callers check `server_role == Peer`
@@ -140,7 +193,9 @@ fn ensure_presign_enabled(state: &AppState) -> Result<()> {
     if state.config.import_presign_enabled {
         Ok(())
     } else {
-        Err(ServerError::not_found("Negotiated upload import is not enabled"))
+        Err(ServerError::not_found(
+            "Negotiated upload import is not enabled",
+        ))
     }
 }
 
@@ -181,38 +236,94 @@ async fn mint_upload_local(state: Arc<AppState>, request: Request) -> Result<Res
         .map_err(|e| ServerError::internal(format!("failed to create staging dir: {e}")))?;
     let staged_path = staging_dir.join(format!("{import_id}.flpack"));
 
-    state.import_jobs.insert(
-        import_id.clone(),
-        ImportJob {
-            ledger_id: req.ledger.clone(),
-            token: token.clone(),
-            staged_path,
-            status: ImportStatus::AwaitingUpload,
-            result: None,
-            error: None,
-            created_at: Instant::now(),
-        },
-    );
-
-    // Reference backend: the upload URL points back at this server's own blob
-    // endpoint (relative — the client resolves it against the origin it is
-    // already talking to). A production backend returns an absolute presigned
-    // object-store URL here instead.
     let expires_at_unix = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() + 3600)
         .unwrap_or(0);
 
-    let response = serde_json::json!({
-        "import_id": import_id,
-        "ledger": req.ledger,
-        "upload": {
-            "method": "PUT",
-            "url": format!("/v1/fluree/import-upload/{import_id}/blob?token={token}"),
-            "headers": { "Content-Type": "application/x-fluree-pack" },
-            "expires_at_unix": expires_at_unix,
-        },
-    });
+    // An archive at or above the multipart threshold is uploaded in parts: a
+    // single S3 PUT caps at 5 GiB, so anything larger MUST go multipart.
+    let multipart = req
+        .size
+        .filter(|&sz| sz >= state.config.import_multipart_threshold_bytes)
+        .map(|sz| plan_multipart(sz, state.config.import_multipart_part_size_bytes));
+
+    let response = if let Some((part_size, num_parts)) = multipart {
+        // Reference backend: one upload URL per part, each pointing back at this
+        // server's own part-sink endpoint. A production backend mints one
+        // presigned `UploadPart` URL per part against its object store instead.
+        let parts: Vec<serde_json::Value> = (1..=num_parts)
+            .map(|part_number| {
+                serde_json::json!({
+                    "part_number": part_number,
+                    "url": format!(
+                        "/v1/fluree/import-upload/{import_id}/part/{part_number}?token={token}"
+                    ),
+                    "headers": { "Content-Type": "application/x-fluree-pack" },
+                })
+            })
+            .collect();
+
+        // The reference `upload_id` is just the import_id; a real backend
+        // carries the object-store UploadId here.
+        state.import_jobs.insert(
+            import_id.clone(),
+            ImportJob {
+                ledger_id: req.ledger.clone(),
+                token: token.clone(),
+                staged_path,
+                multipart: Some(MultipartPlan {
+                    upload_id: import_id.clone(),
+                    part_size,
+                    num_parts,
+                }),
+                status: ImportStatus::AwaitingUpload,
+                result: None,
+                error: None,
+                created_at: Instant::now(),
+            },
+        );
+
+        serde_json::json!({
+            "import_id": import_id,
+            "ledger": req.ledger,
+            "multipart": {
+                "upload_id": import_id,
+                "part_size_bytes": part_size,
+                "parts": parts,
+                "expires_at_unix": expires_at_unix,
+            },
+        })
+    } else {
+        state.import_jobs.insert(
+            import_id.clone(),
+            ImportJob {
+                ledger_id: req.ledger.clone(),
+                token: token.clone(),
+                staged_path,
+                multipart: None,
+                status: ImportStatus::AwaitingUpload,
+                result: None,
+                error: None,
+                created_at: Instant::now(),
+            },
+        );
+
+        // Reference backend: the upload URL points back at this server's own
+        // blob endpoint (relative — the client resolves it against the origin
+        // it is already talking to). A production backend returns an absolute
+        // presigned object-store URL here instead.
+        serde_json::json!({
+            "import_id": import_id,
+            "ledger": req.ledger,
+            "upload": {
+                "method": "PUT",
+                "url": format!("/v1/fluree/import-upload/{import_id}/blob?token={token}"),
+                "headers": { "Content-Type": "application/x-fluree-pack" },
+                "expires_at_unix": expires_at_unix,
+            },
+        })
+    };
     Ok((StatusCode::OK, Json(response)).into_response())
 }
 
@@ -242,7 +353,7 @@ async fn put_blob_local(
 ) -> Result<Response> {
     ensure_presign_enabled(&state)?;
 
-    let (expected_token, staged_path, status) = state
+    let (expected_token, staged_path, status, multipart) = state
         .import_jobs
         .upload_target(&import_id)
         .ok_or_else(|| ServerError::not_found("unknown import_id"))?;
@@ -252,6 +363,11 @@ async fn put_blob_local(
     if token != expected_token {
         return Err(ServerError::not_found("unknown import_id"));
     }
+    if multipart.is_some() {
+        return Err(ServerError::bad_request(
+            "this import was minted for multipart upload; PUT parts to the part URLs instead",
+        ));
+    }
     if status != ImportStatus::AwaitingUpload {
         return Err(ServerError::bad_request(
             "upload slot is no longer awaiting an upload",
@@ -259,19 +375,110 @@ async fn put_blob_local(
     }
 
     // Stream the body straight to the staged file — never buffer the archive.
-    let mut file = tokio::fs::File::create(&staged_path)
+    stream_body_to_file(request, &staged_path)
         .await
-        .map_err(|e| ServerError::internal(format!("failed to open staging file: {e}")))?;
+        .map_err(|e| ServerError::bad_request(format!("failed to stage upload: {e}")))?;
+
+    Ok((
+        StatusCode::OK,
+        Json(serde_json::json!({ "status": "uploaded" })),
+    )
+        .into_response())
+}
+
+/// `PUT /v1/fluree/import-upload/:import_id/part/:part_number?token=…` — stage
+/// one multipart part. Token-authorized via the URL (not admin auth), mirroring
+/// a presigned `UploadPart`.
+pub async fn put_part(
+    State(state): State<Arc<AppState>>,
+    Path((import_id, part_number)): Path<(String, u32)>,
+    Query(q): Query<BlobQuery>,
+    request: Request,
+) -> Response {
+    if state.config.server_role == ServerRole::Peer {
+        return forward_to_transactor(&state, request).await;
+    }
+    put_part_local(state, import_id, part_number, q.token, request)
+        .await
+        .into_response()
+}
+
+async fn put_part_local(
+    state: Arc<AppState>,
+    import_id: String,
+    part_number: u32,
+    token: String,
+    request: Request,
+) -> Result<Response> {
+    ensure_presign_enabled(&state)?;
+
+    let (expected_token, staged_path, status, multipart) = state
+        .import_jobs
+        .upload_target(&import_id)
+        .ok_or_else(|| ServerError::not_found("unknown import_id"))?;
+
+    if token != expected_token {
+        return Err(ServerError::not_found("unknown import_id"));
+    }
+    let Some(plan) = multipart else {
+        return Err(ServerError::bad_request(
+            "this import was not minted for multipart upload",
+        ));
+    };
+    if part_number < 1 || part_number > plan.num_parts {
+        return Err(ServerError::bad_request(format!(
+            "part_number {part_number} out of range 1..={}",
+            plan.num_parts
+        )));
+    }
+    if status != ImportStatus::AwaitingUpload {
+        return Err(ServerError::bad_request(
+            "upload slot is no longer awaiting an upload",
+        ));
+    }
+
+    // Stream the part straight to its sibling file, hashing as we go so the
+    // response carries an ETag the client echoes back on `complete`.
+    let part_path = part_staging_path(&staged_path, part_number);
+    let etag = stream_body_to_file_hashed(request, &part_path)
+        .await
+        .map_err(|e| ServerError::bad_request(format!("failed to stage part: {e}")))?;
+
+    Ok((
+        StatusCode::OK,
+        [(axum::http::header::ETAG, format!("\"{etag}\""))],
+        Json(serde_json::json!({ "status": "uploaded", "part_number": part_number })),
+    )
+        .into_response())
+}
+
+/// Stream a request body to `path`, never buffering the whole body.
+async fn stream_body_to_file(request: Request, path: &FsPath) -> std::io::Result<()> {
+    let mut file = tokio::fs::File::create(path).await?;
     let body_stream = request
         .into_body()
         .into_data_stream()
         .map_err(std::io::Error::other);
     let mut reader = StreamReader::new(body_stream);
-    tokio::io::copy(&mut reader, &mut file)
-        .await
-        .map_err(|e| ServerError::bad_request(format!("failed to stage upload: {e}")))?;
+    tokio::io::copy(&mut reader, &mut file).await?;
+    Ok(())
+}
 
-    Ok((StatusCode::OK, Json(serde_json::json!({ "status": "uploaded" }))).into_response())
+/// Like [`stream_body_to_file`] but returns the SHA-256 hex of the bytes
+/// written — the reference backend's stand-in for an object-store part ETag.
+async fn stream_body_to_file_hashed(request: Request, path: &FsPath) -> std::io::Result<String> {
+    use sha2::{Digest, Sha256};
+    use tokio::io::AsyncWriteExt as _;
+
+    let mut file = tokio::fs::File::create(path).await?;
+    let mut hasher = Sha256::new();
+    let mut stream = request.into_body().into_data_stream();
+    while let Some(chunk) = stream.try_next().await.map_err(std::io::Error::other)? {
+        hasher.update(&chunk);
+        file.write_all(&chunk).await?;
+    }
+    file.flush().await?;
+    Ok(hex::encode(hasher.finalize()))
 }
 
 /// `POST /v1/fluree/import-upload/:import_id/complete` — begin the restore.
@@ -286,13 +493,19 @@ pub async fn complete_upload(
     if state.config.server_role == ServerRole::Peer {
         return forward_to_transactor(&state, request).await;
     }
-    complete_upload_local(state, import_id).await.into_response()
+    complete_upload_local(state, import_id, request)
+        .await
+        .into_response()
 }
 
-async fn complete_upload_local(state: Arc<AppState>, import_id: String) -> Result<Response> {
+async fn complete_upload_local(
+    state: Arc<AppState>,
+    import_id: String,
+    request: Request,
+) -> Result<Response> {
     ensure_presign_enabled(&state)?;
 
-    let (ledger_id, staged_path, status) = state
+    let (ledger_id, staged_path, status, multipart) = state
         .import_jobs
         .completion_target(&import_id)
         .ok_or_else(|| ServerError::not_found("unknown import_id"))?;
@@ -306,20 +519,64 @@ async fn complete_upload_local(state: Arc<AppState>, import_id: String) -> Resul
             return Err(ServerError::bad_request("import has already completed"));
         }
     }
-    if !tokio::fs::try_exists(&staged_path).await.unwrap_or(false) {
+
+    // Parse the (optional) part list. Empty body is fine for single-PUT.
+    let body = axum::body::to_bytes(request.into_body(), 4 * 1024 * 1024)
+        .await
+        .map_err(|e| ServerError::bad_request(format!("failed to read body: {e}")))?;
+    let complete_req: CompleteRequest = if body.is_empty() {
+        CompleteRequest::default()
+    } else {
+        serde_json::from_slice(&body)
+            .map_err(|e| ServerError::bad_request(format!("invalid complete request: {e}")))?
+    };
+
+    // For multipart, every part must be staged before we assemble. The blob
+    // (single-PUT) case just checks the staged archive exists.
+    if let Some(ref plan) = multipart {
+        let reported: std::collections::BTreeSet<u32> =
+            complete_req.parts.iter().map(|p| p.part_number).collect();
+        let expected: std::collections::BTreeSet<u32> = (1..=plan.num_parts).collect();
+        if reported != expected {
+            return Err(ServerError::bad_request(format!(
+                "complete must list exactly parts 1..={} (got {} distinct)",
+                plan.num_parts,
+                reported.len()
+            )));
+        }
+        for part_number in 1..=plan.num_parts {
+            let part_path = part_staging_path(&staged_path, part_number);
+            if !tokio::fs::try_exists(&part_path).await.unwrap_or(false) {
+                return Err(ServerError::bad_request(format!(
+                    "part {part_number} was never uploaded"
+                )));
+            }
+        }
+    } else if !tokio::fs::try_exists(&staged_path).await.unwrap_or(false) {
         return Err(ServerError::bad_request(
             "no archive was uploaded for this import_id",
         ));
     }
 
-    state.import_jobs.set_status(&import_id, ImportStatus::Running);
+    state
+        .import_jobs
+        .set_status(&import_id, ImportStatus::Running);
 
-    // Restore on a background task so a large restore is not bounded by the
-    // request lifetime; the client polls status to a terminal state.
+    // Assemble (multipart) + restore on a background task so a large restore is
+    // not bounded by the request lifetime; the client polls to a terminal state.
     let bg_state = Arc::clone(&state);
     let bg_import_id = import_id.clone();
+    let num_parts = multipart.as_ref().map(|p| p.num_parts);
     tokio::spawn(async move {
         let outcome = async {
+            // Concatenate parts in order into the assembled archive. A real
+            // object-store backend would instead call CompleteMultipartUpload
+            // with the reported ETags; here the parts are local files.
+            if let Some(num_parts) = num_parts {
+                assemble_parts(&staged_path, num_parts)
+                    .await
+                    .map_err(|e| format!("failed to assemble multipart upload: {e}"))?;
+            }
             let mut file = tokio::fs::File::open(&staged_path)
                 .await
                 .map_err(|e| format!("failed to open staged archive: {e}"))?;
@@ -340,12 +597,30 @@ async fn complete_upload_local(state: Arc<AppState>, import_id: String) -> Resul
                 bg_state.import_jobs.set_failed(&bg_import_id, msg);
             }
         }
-        // Best-effort cleanup of the staged archive.
+        // Best-effort cleanup of the staged archive (parts are removed by
+        // `assemble_parts` as they are consumed).
         let _ = tokio::fs::remove_file(&staged_path).await;
     });
 
     let response = serde_json::json!({ "import_id": import_id, "status": "running" });
     Ok((StatusCode::ACCEPTED, Json(response)).into_response())
+}
+
+/// Concatenate staged parts `1..=num_parts` into `staged_path` (in order), then
+/// remove each part file. Streams part-by-part — never holds a whole part, let
+/// alone the whole archive, in memory.
+async fn assemble_parts(staged_path: &FsPath, num_parts: u32) -> std::io::Result<()> {
+    let mut out = tokio::fs::File::create(staged_path).await?;
+    for part_number in 1..=num_parts {
+        let part_path = part_staging_path(staged_path, part_number);
+        let mut part = tokio::fs::File::open(&part_path).await?;
+        tokio::io::copy(&mut part, &mut out).await?;
+        drop(part);
+        let _ = tokio::fs::remove_file(&part_path).await;
+    }
+    use tokio::io::AsyncWriteExt as _;
+    out.flush().await?;
+    Ok(())
 }
 
 /// `GET /v1/fluree/import-upload/:import_id` — poll import status.

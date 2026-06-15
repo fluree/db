@@ -1341,49 +1341,103 @@ Advertise import capabilities in the discovery document (`GET /.well-known/flure
 
 ```jsonc
 "import": {
-  "modes": ["direct", "presigned-put"],
-  "direct_max_bytes": 6291456
+  "modes": ["direct", "presigned-put", "multipart-put"],
+  "direct_max_bytes": 6291456,
+  "multipart_threshold_bytes": 5368709120,
+  "multipart_part_size_bytes": 268435456
 }
 ```
 
-- `modes` — `"direct"` (streaming `POST /import`) and/or `"presigned-put"` (the flow below).
-- `direct_max_bytes` — the largest body you accept on `POST /import`. Only gates the choice when `presigned-put` is also offered.
+- `modes` — `"direct"` (streaming `POST /import`), `"presigned-put"` (single out-of-band PUT), and/or `"multipart-put"` (chunked out-of-band upload, below).
+- `direct_max_bytes` — the largest body you accept on `POST /import`. Only gates the direct-vs-negotiated choice.
+- `multipart_threshold_bytes` *(informational)* — the archive size at or above which **you** mint a multipart plan instead of a single PUT. A single S3 PUT caps at 5 GiB, so this should be ≤ 5 GiB.
+- `multipart_part_size_bytes` *(informational)* — the part size you intend to hand out. Must be ≥ 5 MiB for S3 (its minimum part size, except the last part).
 
-**CLI selection rule:** use the negotiated flow when `presigned-put` is offered **and** either `direct` is not offered or the archive size exceeds `direct_max_bytes`; otherwise stream directly. A server omitting the `import` block is treated as direct-only (back-compatible).
+**CLI selection rule:** use the negotiated flow when `presigned-put` **or** `multipart-put` is offered **and** either `direct` is not offered or the archive size exceeds `direct_max_bytes`; otherwise stream directly. A server omitting the `import` block is treated as direct-only (back-compatible).
+
+**Single-PUT vs multipart is the server's call, not the client's.** The CLI sends its archive `size` in the mint request and reacts to whichever shape you return (`upload` for single PUT, `multipart` for parts). The threshold/part-size hints exist only so operators can see what the server will do; the client does not pre-decide.
 
 ### The handshake
 
 | Step | Call | Server responsibility |
 |------|------|----------------------|
-| 1. Mint | `POST {api_base}/import-upload` `{ "ledger": "<name>", "size"?: <bytes> }` | Allocate an upload slot. Return `{ import_id, upload: { method:"PUT", url, headers, expires_at_unix } }` where `url` is a presigned object-store PUT (absolute) **or** a relative path the client resolves against the server origin. |
+| 1. Mint | `POST {api_base}/import-upload` `{ "ledger": "<name>", "size"?: <bytes> }` | Allocate an upload slot. Return `{ import_id, upload: { method:"PUT", url, headers, expires_at_unix } }` where `url` is a presigned object-store PUT (absolute) **or** a relative path the client resolves against the server origin. For `size` at or above your multipart threshold, return a `multipart` block instead — see [Multipart upload](#multipart-upload-archives-over-5-gb). |
 | 2. Upload | `PUT <upload.url>` (raw `.flpack`, streamed) | Receive the bytes into staging (object storage). The URL is the capability — **do not require the API bearer token** on this request; authorize via the presigned signature (or a token embedded in the URL). |
 | 3. Complete | `POST {api_base}/import-upload/{import_id}/complete` | Verify the upload exists, begin `restore_ledger` from it **asynchronously**, return `{ import_id, status:"running" }` (`202`). |
 | 4. Poll | `GET {api_base}/import-upload/{import_id}` | Return `{ status, result?, error? }`, `status ∈ {awaiting-upload, running, succeeded, failed}`. On `succeeded`, `result` is the same summary as the direct import endpoint. |
 
 The CLI carries the bearer token on steps 1, 3, 4 (mint/complete/status are admin-grade) but **not** step 2.
 
+### Multipart upload (archives over 5 GB)
+
+A single S3 PUT rejects bodies over 5 GiB (`EntityTooLarge`). For larger archives, mint a **multipart** plan instead of a single PUT. Everything else (auth, async restore, polling) is identical; only steps 1–3 change shape.
+
+**Step 1 — multipart mint.** When the declared `size` is at or above your `multipart_threshold_bytes`, return a `multipart` block instead of `upload`:
+
+```jsonc
+{
+  "import_id": "imp_…",
+  "ledger": "<name>",
+  "multipart": {
+    "upload_id": "…",            // your object-store UploadId (opaque to the client)
+    "part_size_bytes": 268435456, // every part but the last is exactly this many bytes
+    "parts": [
+      { "part_number": 1, "url": "https://…UploadPart…partNumber=1…", "headers": { … } },
+      { "part_number": 2, "url": "https://…UploadPart…partNumber=2…", "headers": { … } }
+      // … one entry per part, part_number 1..=N, contiguous
+    ],
+    "expires_at_unix": 1750000000
+  }
+}
+```
+
+To produce this, the backend MUST:
+
+1. Call **`CreateMultipartUpload`** on your bucket/key and keep the returned `UploadId`.
+2. Choose a `part_size` such that `ceil(size / part_size) ≤ 10000` (S3's hard part-count ceiling) and `part_size ≥ 5 MiB`. The reference server starts from `multipart_part_size_bytes` and raises it if the count would exceed 10,000.
+3. Presign one **`UploadPart`** URL per part (`partNumber = 1..=N`, same `UploadId`), and return them in `parts`. You may presign all upfront (≈84 URLs for a 21 GB archive at 256 MiB parts) or fewer at a time — but the client expects the full list in the mint response.
+
+**Step 2 — part PUTs.** The client PUTs each part's byte range to its `url` with a fixed `Content-Length` (never chunked), no bearer token. It reads the **`ETag` response header** from each part PUT (S3 returns it) and remembers `(part_number, etag)`. Parts upload with bounded concurrency and may arrive out of order.
+
+**Step 3 — complete with the part list.** The client POSTs the assembled ETags to `…/complete`:
+
+```jsonc
+{ "parts": [ { "part_number": 1, "etag": "\"…\"" }, { "part_number": 2, "etag": "\"…\"" } ] }
+```
+
+On receipt the backend MUST:
+
+1. Verify the body lists **exactly** parts `1..=N` (reject otherwise → `400`).
+2. Call **`CompleteMultipartUpload`** with the `UploadId` and the `{ PartNumber, ETag }` list (S3 validates the ETags and stitches the object). 
+3. Then begin `restore_ledger` over the now-complete object **asynchronously**, exactly as the single-PUT path does.
+
+> The client sends the part list in `complete`; **you** own `CompleteMultipartUpload`. Don't expect the client to call S3's complete API — it only knows the presigned part URLs and reports back the ETags they returned. (The reference server doesn't run S3 at all: it stages each part to a local file and concatenates them in `part_number` order on `complete`. Per-part ETag re-verification is unnecessary because `restore_ledger` SHA-256-verifies every archive frame regardless.)
+
+A single-PUT `complete` carries an empty body; a multipart `complete` carries `parts`. Branch on the job's recorded upload mode, not on body presence.
+
 ### Required server behavior
 
-1. **`import_id` and the upload URL must be unguessable** — step 2 is authorized by possession of the URL alone.
-2. **Stream step 2 to storage**, never buffer the archive in memory.
+1. **`import_id` and every upload URL must be unguessable** — step 2 (single PUT or any part PUT) is authorized by possession of the URL alone.
+2. **Stream step 2 to storage**, never buffer the archive (or a whole part) in memory.
 3. **Restore asynchronously** in step 3 and report progress via step 4 — the restore can outlast a single request (and your function timeout). Apply the same trust/verify/rollback semantics as the [Ledger Import Contract](#ledger-import-contract) (every frame SHA-256 verified; roll back on failure).
 4. **`complete` before any upload** → `400`. **Unknown `import_id`** → `404` on every step.
 5. Run the actual restore wherever it can take the time it needs (a worker, not necessarily the request handler).
+6. **Multipart specifics:** mint multipart when `size ≥ multipart_threshold_bytes`; pick a part size with `ceil(size / part_size) ≤ 10000`; on `complete`, require exactly parts `1..=N` (else `400`) and call `CompleteMultipartUpload` before restoring. Assemble/complete (for a 21 GB archive, ~84 parts) can itself outlast the request — do it in the same async worker as the restore, not the `complete` handler.
 
 ### Auth
 
-`import-upload` (mint), `…/complete`, and `…/{import_id}` (status) are **admin-protected** (same bracket as `/create`, `/import`). The blob `PUT` (`…/{import_id}/blob` in the reference impl) is **token-authorized via the URL**, not admin auth.
+`import-upload` (mint), `…/complete`, and `…/{import_id}` (status) are **admin-protected** (same bracket as `/create`, `/import`). The blob/part `PUT`s (`…/{import_id}/blob` and `…/{import_id}/part/{n}` in the reference impl) are **token-authorized via the URL**, not admin auth.
 
 ### Reference implementation
 
-The Fluree server ships a reference backend (enable with `FLUREE_IMPORT_PRESIGN_ENABLED=true`) that stages uploads to local disk and points the upload URL back at its own blob endpoint — so the CLI handshake is exercised end-to-end without object storage. A production server mints a real presigned object-store PUT in step 1 instead; the client flow is identical.
+The Fluree server ships a reference backend (enable with `FLUREE_IMPORT_PRESIGN_ENABLED=true`) that stages uploads to local disk and points the upload URLs back at its own blob/part endpoints — so the full handshake (single-PUT **and** multipart) is exercised end-to-end without object storage. A production server mints real presigned object-store URLs instead and drives `CreateMultipartUpload`/`CompleteMultipartUpload`; the client flow is identical. Multipart knobs: `FLUREE_IMPORT_MULTIPART_THRESHOLD_BYTES` (default 5 GiB) and `FLUREE_IMPORT_MULTIPART_PART_SIZE_BYTES` (default 256 MiB).
 
 | Concern | Canonical location |
 |---------|-------------------|
 | Discovery `import` block | `fluree-db-server/src/routes/admin.rs::discovery` |
-| Mint / blob / complete / status routes | `fluree-db-server/src/routes/import.rs` |
-| In-memory job registry | `fluree-db-server/src/import_jobs.rs` |
-| CLI negotiation + upload + poll | `fluree-db-cli/src/commands/create.rs::run_remote_flpack_negotiated`, `fluree-db-cli/src/remote_client.rs` |
+| Mint / blob / part / complete / status routes | `fluree-db-server/src/routes/import.rs` |
+| In-memory job registry (incl. `MultipartPlan`) | `fluree-db-server/src/import_jobs.rs` |
+| CLI negotiation + single/multipart upload + poll | `fluree-db-cli/src/commands/create.rs::run_remote_flpack_negotiated`, `fluree-db-cli/src/remote_client.rs` |
 
 > A production server fronting real object storage persists job state externally (DB / object tags) rather than in process, and mints presigned URLs against its bucket. The contract above is what the CLI depends on; the staging mechanism is the server's choice.
 

@@ -28,7 +28,7 @@ The CLI treats `oidc_device` as "OIDC interactive login": it uses device-code wh
 Implementations MAY also return `api_base_url` to tell the CLI where the Fluree API is mounted (for example,
 when the API is hosted under `/v1/fluree` or on a separate `data` subdomain).
 
-Implementations MAY also return an `import` block advertising `.flpack` import capabilities (`modes`, `direct_max_bytes`) so the CLI can negotiate the upload path — see [Negotiated upload import](#negotiated-upload-import-import-upload).
+Implementations MAY also return an `import` block advertising `.flpack` import capabilities (`modes` incl. `multipart-put`, `direct_max_bytes`, multipart hints) so the CLI can negotiate the upload path — see [Negotiated upload import](#negotiated-upload-import-import-upload).
 
 ### GET {api_base_url}/whoami
 
@@ -714,19 +714,21 @@ For clients that cannot send a large body to `POST /import` (e.g. behind a paylo
 
 ```jsonc
 "import": {
-  "modes": ["direct", "presigned-put"],   // "presigned-put" enables the flow below
-  "direct_max_bytes": 6291456              // archives larger than this negotiate
+  "modes": ["direct", "presigned-put", "multipart-put"],  // negotiated modes
+  "direct_max_bytes": 6291456,             // archives larger than this negotiate
+  "multipart_threshold_bytes": 5368709120, // ≥ this size → multipart (5 GiB PUT cap)
+  "multipart_part_size_bytes": 268435456   // target part size hint (≥ 5 MiB for S3)
 }
 ```
 
 | Step | Endpoint | Result |
 |------|----------|--------|
-| Mint | `POST /import-upload` `{ledger, size?}` | `{ import_id, upload: { method, url, headers, expires_at_unix } }` |
-| Upload | `PUT <upload.url>` (raw `.flpack`) | bytes staged (direct to object storage; **no bearer auth** — the URL is the capability) |
-| Complete | `POST /import-upload/{import_id}/complete` | `202` `{ import_id, status:"running" }` — restore begins asynchronously |
+| Mint | `POST /import-upload` `{ledger, size?}` | single: `{ import_id, upload: { method, url, headers, expires_at_unix } }` — or multipart (when `size ≥ threshold`): `{ import_id, multipart: { upload_id, part_size_bytes, parts:[{part_number,url,headers}], expires_at_unix } }` |
+| Upload | `PUT <upload.url>` (single) **or** `PUT <part.url>` per part (multipart) | bytes staged (direct to object storage; **no bearer auth** — the URL is the capability). Each part PUT returns its `ETag`. |
+| Complete | `POST /import-upload/{import_id}/complete` | body: empty (single) or `{ parts:[{part_number, etag}] }` (multipart) → `202` `{ import_id, status:"running" }` — restore begins asynchronously |
 | Status | `GET /import-upload/{import_id}` | `{ status, result?, error? }`, `status ∈ {awaiting-upload, running, succeeded, failed}` |
 
-Mint / complete / status are **admin-protected**; the blob `PUT` is token-authorized via the minted URL. On `succeeded`, `result` is the same summary as `POST /import`. The Fluree server ships a reference backend behind `FLUREE_IMPORT_PRESIGN_ENABLED=true` (stages to local disk); production servers mint a presigned object-store PUT. See the [Negotiated Upload Import Contract](../cli/server-integration.md#negotiated-upload-import-contract) for the full implementer spec.
+Mint / complete / status are **admin-protected**; the blob/part `PUT`s are token-authorized via the minted URL. The server picks single-PUT vs multipart by the declared `size` (a single S3 PUT caps at 5 GiB). On `succeeded`, `result` is the same summary as `POST /import`. The Fluree server ships a reference backend behind `FLUREE_IMPORT_PRESIGN_ENABLED=true` (stages parts to local disk and concatenates them); production servers mint presigned object-store URLs and drive `CreateMultipartUpload`/`CompleteMultipartUpload`. See the [Negotiated Upload Import Contract](../cli/server-integration.md#negotiated-upload-import-contract) for the full implementer spec.
 
 This is the transport behind `fluree create … --remote … --from big.flpack` when the server is size-capped — the CLI negotiates automatically.
 

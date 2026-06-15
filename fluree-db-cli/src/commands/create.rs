@@ -106,7 +106,6 @@ async fn run_remote_flpack_negotiated(
     size: u64,
 ) -> CliResult<serde_json::Value> {
     use colored::Colorize;
-    use std::collections::HashMap;
 
     eprintln!(
         "Uploading '{}' to remote '{}' via presigned upload ({})...",
@@ -115,7 +114,8 @@ async fn run_remote_flpack_negotiated(
         format_human_bytes(size),
     );
 
-    // 1. Mint an upload slot.
+    // 1. Mint an upload slot. The server picks single-PUT vs multipart by the
+    //    declared size and returns either an `upload` or a `multipart` block.
     let mint = client
         .mint_import_upload(ledger_id, Some(size))
         .await
@@ -124,28 +124,19 @@ async fn run_remote_flpack_negotiated(
         .as_str()
         .ok_or_else(|| CliError::Remote("mint response missing import_id".to_string()))?
         .to_string();
-    let upload = &mint["upload"];
-    let url = upload["url"]
-        .as_str()
-        .ok_or_else(|| CliError::Remote("mint response missing upload.url".to_string()))?;
-    let headers: HashMap<String, String> = upload["headers"]
-        .as_object()
-        .map(|o| {
-            o.iter()
-                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
-                .collect()
-        })
-        .unwrap_or_default();
 
-    // 2. Upload the archive directly to the minted URL.
-    client
-        .put_upload_file(url, &headers, path)
-        .await
-        .map_err(|e| CliError::Remote(format!("failed to upload archive: {e}")))?;
+    // 2. Upload the archive — multipart when the server minted parts, else a
+    //    single streamed PUT.
+    let completed_parts = if mint.get("multipart").is_some() {
+        upload_multipart(client, &mint, path, size).await?
+    } else {
+        upload_single(client, &mint, path).await?
+    };
 
-    // 3. Notify the server to begin the restore.
+    // 3. Notify the server to begin the restore (carrying the part list for
+    //    multipart; an empty slice for single-PUT).
     client
-        .complete_import_upload(&import_id)
+        .complete_import_upload(&import_id, &completed_parts)
         .await
         .map_err(|e| CliError::Remote(format!("failed to start remote import: {e}")))?;
 
@@ -153,6 +144,91 @@ async fn run_remote_flpack_negotiated(
 
     // 4. Poll status to a terminal state.
     poll_remote_import(client, &import_id).await
+}
+
+/// Single-PUT upload: stream the whole archive to the one minted URL.
+async fn upload_single(
+    client: &crate::remote_client::RemoteLedgerClient,
+    mint: &serde_json::Value,
+    path: &Path,
+) -> CliResult<Vec<crate::remote_client::CompletedPart>> {
+    use std::collections::HashMap;
+
+    let upload = &mint["upload"];
+    let url = upload["url"]
+        .as_str()
+        .ok_or_else(|| CliError::Remote("mint response missing upload.url".to_string()))?;
+    let headers: HashMap<String, String> = json_string_map(&upload["headers"]);
+    client
+        .put_upload_file(url, &headers, path)
+        .await
+        .map_err(|e| CliError::Remote(format!("failed to upload archive: {e}")))?;
+    Ok(Vec::new())
+}
+
+/// Multipart upload: PUT each part to its minted URL, returning the completed
+/// `(part_number, etag)` list for the `complete` call.
+async fn upload_multipart(
+    client: &crate::remote_client::RemoteLedgerClient,
+    mint: &serde_json::Value,
+    path: &Path,
+    size: u64,
+) -> CliResult<Vec<crate::remote_client::CompletedPart>> {
+    use crate::remote_client::MintedPart;
+
+    let mp = &mint["multipart"];
+    let part_size = mp["part_size_bytes"]
+        .as_u64()
+        .ok_or_else(|| CliError::Remote("multipart mint missing part_size_bytes".to_string()))?;
+    if part_size == 0 {
+        return Err(CliError::Remote(
+            "multipart mint returned part_size_bytes = 0".to_string(),
+        ));
+    }
+    let parts_json = mp["parts"]
+        .as_array()
+        .ok_or_else(|| CliError::Remote("multipart mint missing parts array".to_string()))?;
+    let parts: Vec<MintedPart> = parts_json
+        .iter()
+        .map(|p| {
+            let part_number = p["part_number"]
+                .as_u64()
+                .ok_or_else(|| CliError::Remote("multipart part missing part_number".to_string()))?
+                as u32;
+            let url = p["url"]
+                .as_str()
+                .ok_or_else(|| CliError::Remote("multipart part missing url".to_string()))?
+                .to_string();
+            Ok(MintedPart {
+                part_number,
+                url,
+                headers: json_string_map(&p["headers"]),
+            })
+        })
+        .collect::<CliResult<Vec<_>>>()?;
+
+    eprintln!(
+        "  uploading {} parts of up to {} each...",
+        parts.len(),
+        format_human_bytes(part_size.min(size)),
+    );
+
+    client
+        .put_upload_parts(&parts, part_size, path)
+        .await
+        .map_err(|e| CliError::Remote(format!("failed to upload archive parts: {e}")))
+}
+
+/// Collect a JSON object of string values into a `HashMap`, dropping non-string
+/// entries. Used for the per-upload `headers` block.
+fn json_string_map(v: &serde_json::Value) -> std::collections::HashMap<String, String> {
+    v.as_object()
+        .map(|o| {
+            o.iter()
+                .filter_map(|(k, val)| val.as_str().map(|s| (k.clone(), s.to_string())))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Poll `import-upload/{id}` until the import reaches a terminal state.

@@ -34,6 +34,23 @@ impl ImportStatus {
     }
 }
 
+/// Multipart upload plan for a single import job.
+///
+/// Present only when the archive exceeded the multipart threshold at mint
+/// time. The reference backend stages each part to a sibling of `staged_path`
+/// and concatenates them in order on `complete`; a production backend would
+/// instead carry the object-store `upload_id` through to
+/// `CompleteMultipartUpload`.
+#[derive(Clone, Debug)]
+pub struct MultipartPlan {
+    /// Opaque upload identity (object-store `UploadId`, or a reference token).
+    pub upload_id: String,
+    /// Byte size of every part except the last.
+    pub part_size: u64,
+    /// Total number of parts the client must upload.
+    pub num_parts: u32,
+}
+
 /// One negotiated-upload import job.
 pub struct ImportJob {
     /// Target ledger name (carried in the mint request, not the URL path).
@@ -41,8 +58,11 @@ pub struct ImportJob {
     /// Single-use capability token embedded in the upload URL. Modeled on a
     /// presigned URL's signature: knowing it authorizes the blob `PUT`.
     pub token: String,
-    /// Where the local backend stages the uploaded archive.
+    /// Where the local backend stages the (assembled) uploaded archive.
     pub staged_path: PathBuf,
+    /// Multipart plan when the archive is uploaded in parts; `None` for a
+    /// single-PUT upload.
+    pub multipart: Option<MultipartPlan>,
     pub status: ImportStatus,
     /// `RestoreResult` JSON once `status == Succeeded`.
     pub result: Option<serde_json::Value>,
@@ -62,19 +82,38 @@ impl ImportJobs {
         self.jobs.insert(import_id, job);
     }
 
-    /// Snapshot the fields needed to authorize and stage a blob upload, without
-    /// holding the map lock across the (async) file write.
-    pub fn upload_target(&self, import_id: &str) -> Option<(String, PathBuf, ImportStatus)> {
-        self.jobs
-            .get(import_id)
-            .map(|j| (j.token.clone(), j.staged_path.clone(), j.status))
+    /// Snapshot the fields needed to authorize and stage a blob/part upload,
+    /// without holding the map lock across the (async) file write. The
+    /// `MultipartPlan` is `Some` for multipart jobs (the part `PUT` handler
+    /// uses it; the single-blob `PUT` handler rejects it, and vice versa).
+    pub fn upload_target(
+        &self,
+        import_id: &str,
+    ) -> Option<(String, PathBuf, ImportStatus, Option<MultipartPlan>)> {
+        self.jobs.get(import_id).map(|j| {
+            (
+                j.token.clone(),
+                j.staged_path.clone(),
+                j.status,
+                j.multipart.clone(),
+            )
+        })
     }
 
-    /// Snapshot `(ledger_id, staged_path, status)` for the `complete` handler.
-    pub fn completion_target(&self, import_id: &str) -> Option<(String, PathBuf, ImportStatus)> {
-        self.jobs
-            .get(import_id)
-            .map(|j| (j.ledger_id.clone(), j.staged_path.clone(), j.status))
+    /// Snapshot `(ledger_id, staged_path, status, multipart)` for the
+    /// `complete` handler.
+    pub fn completion_target(
+        &self,
+        import_id: &str,
+    ) -> Option<(String, PathBuf, ImportStatus, Option<MultipartPlan>)> {
+        self.jobs.get(import_id).map(|j| {
+            (
+                j.ledger_id.clone(),
+                j.staged_path.clone(),
+                j.status,
+                j.multipart.clone(),
+            )
+        })
     }
 
     pub fn set_status(&self, import_id: &str, status: ImportStatus) {
