@@ -181,6 +181,20 @@ pub enum Binding {
     ///   consumed by path functions (`length`, `nodes`) and rendered as a
     ///   JSON array of node IRIs at projection time.
     Path(Vec<Sid>),
+
+    /// First-class list value (ordered sequence of element bindings).
+    ///
+    /// This is the user-visible Cypher list: produced by `collect(x)`, list
+    /// literals (`[a, b]`), and list functions (`tail`, `reverse`). Distinct
+    /// from [`Binding::Grouped`], which is a transient GROUP-BY artifact that
+    /// must never escape aggregation; a `List` is a real value that renders as
+    /// a JSON array at projection time and is consumed by list functions
+    /// (`size`, `head`, `last`, `tail`, `reverse`).
+    ///
+    /// V1 does not yet sort/join/group by a list value (the cypher lowering
+    /// rejects `ORDER BY <list>` and `collect()` in `WITH`), so it is opaque in
+    /// those hot paths.
+    List(Vec<Binding>),
 }
 
 impl Binding {
@@ -739,6 +753,8 @@ impl From<&Binding> for bool {
             Binding::Grouped(_) => false,
             // A bound path is truthy (it exists); an absent path is `Unbound`.
             Binding::Path(_) => true,
+            // Cypher: a non-empty list is truthy, an empty list falsy.
+            Binding::List(items) => !items.is_empty(),
         }
     }
 }
@@ -870,6 +886,7 @@ impl PartialEq for Binding {
 
             (Binding::Grouped(a), Binding::Grouped(b)) => a == b,
             (Binding::Path(a), Binding::Path(b)) => a == b,
+            (Binding::List(a), Binding::List(b)) => a == b,
             _ => false,
         }
     }
@@ -964,6 +981,13 @@ impl std::hash::Hash for Binding {
                 nodes.len().hash(state);
                 for n in nodes {
                     n.hash(state);
+                }
+            }
+            Binding::List(values) => {
+                10u8.hash(state);
+                values.len().hash(state);
+                for v in values {
+                    v.hash(state);
                 }
             }
         }

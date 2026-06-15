@@ -467,6 +467,7 @@ pub(crate) fn binding_to_group_key_owned(binding: &Binding) -> GroupKeyOwned {
         }
         Binding::Grouped(_) => GroupKeyOwned::Absent, // Shouldn't happen
         Binding::Path(_) => GroupKeyOwned::Absent,    // Paths are not group keys
+        Binding::List(_) => GroupKeyOwned::Absent,    // Lists are not group keys (v1)
     }
 }
 

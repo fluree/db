@@ -821,7 +821,10 @@ fn agg_collect(values: &[Binding]) -> Binding {
         .filter(|b| !matches!(b, Binding::Unbound | Binding::Poisoned))
         .cloned()
         .collect();
-    Binding::Grouped(items)
+    // `collect()` yields a first-class list value (not a transient GROUP-BY
+    // `Grouped`), so list functions and the JSON-array formatter treat it as a
+    // real Cypher list.
+    Binding::List(items)
 }
 
 /// Extract numeric values as f64 from bindings.

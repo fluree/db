@@ -238,6 +238,18 @@ fn write_value(out: &mut String, binding: &Binding, compactor: &IriCompactor) ->
             }
             out.push(']');
         }
+        // A list (collect / list literal / list function) renders as a JSON
+        // array of its elements.
+        Binding::List(values) => {
+            out.push('[');
+            for (i, v) in values.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                write_value(out, v, compactor)?;
+            }
+            out.push(']');
+        }
     }
     Ok(())
 }
@@ -544,6 +556,15 @@ pub(crate) fn format_binding(binding: &Binding, compactor: &IriCompactor) -> Res
             let arr: Result<Vec<_>> = nodes
                 .iter()
                 .map(|sid| compactor.compact_id_sid(sid).map(JsonValue::String))
+                .collect();
+            Ok(JsonValue::Array(arr?))
+        }
+
+        // A list renders as a JSON array of its elements.
+        Binding::List(values) => {
+            let arr: Result<Vec<_>> = values
+                .iter()
+                .map(|v| format_binding(v, compactor))
                 .collect();
             Ok(JsonValue::Array(arr?))
         }

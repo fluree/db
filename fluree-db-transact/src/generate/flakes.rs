@@ -260,8 +260,8 @@ impl<'a> FlakeGenerator<'a> {
                         Binding::Grouped(_) => Err(TransactError::InvalidTerm(
                             "Subject cannot be a grouped value (GROUP BY output)".to_string(),
                         )),
-                        Binding::Path(_) => Err(TransactError::InvalidTerm(
-                            "Subject cannot be a path value (shortestPath output)".to_string(),
+                        Binding::Path(_) | Binding::List(_) => Err(TransactError::InvalidTerm(
+                            "Subject cannot be a path or list value".to_string(),
                         )),
                         Binding::Lit { .. } => Err(TransactError::InvalidTerm(
                             "Subject must be a Sid, not a literal".to_string(),
@@ -315,8 +315,8 @@ impl<'a> FlakeGenerator<'a> {
                         Binding::Grouped(_) => Err(TransactError::InvalidTerm(
                             "Predicate cannot be a grouped value (GROUP BY output)".to_string(),
                         )),
-                        Binding::Path(_) => Err(TransactError::InvalidTerm(
-                            "Predicate cannot be a path value (shortestPath output)".to_string(),
+                        Binding::Path(_) | Binding::List(_) => Err(TransactError::InvalidTerm(
+                            "Predicate cannot be a path or list value".to_string(),
                         )),
                         Binding::Lit { .. } => Err(TransactError::InvalidTerm(
                             "Predicate must be a Sid, not a literal".to_string(),
@@ -392,8 +392,8 @@ impl<'a> FlakeGenerator<'a> {
                         Binding::Grouped(_) => Err(TransactError::InvalidTerm(
                             "Object cannot be a grouped value (GROUP BY output)".to_string(),
                         )),
-                        Binding::Path(_) => Err(TransactError::InvalidTerm(
-                            "Object cannot be a path value (shortestPath output)".to_string(),
+                        Binding::Path(_) | Binding::List(_) => Err(TransactError::InvalidTerm(
+                            "Object cannot be a path or list value".to_string(),
                         )),
                         Binding::Iri(_) => Err(TransactError::InvalidTerm(
                             "Raw IRI from graph source cannot be used as object for flake generation".to_string(),

@@ -176,9 +176,10 @@ impl Expression {
                     debug_assert!(false, "Grouped binding in filter evaluation");
                     Ok(None)
                 }
-                // A path is not a scalar — it has no comparable value. Path
-                // functions (`length`) read the binding directly via dispatch.
-                Some(Binding::Path(_)) => Ok(None),
+                // A path or list is not a scalar — no comparable value. The
+                // relevant functions (`length`, `size`/`head`/…) read the
+                // binding directly via dispatch / the binding-producing path.
+                Some(Binding::Path(_) | Binding::List(_)) => Ok(None),
             },
 
             // FlakeValue::Null is the only variant TryFrom rejects (with

@@ -1831,10 +1831,10 @@ fn binding_to_flake_object(
             );
             None
         }
-        Binding::Path(_) => {
+        Binding::Path(_) | Binding::List(_) => {
             debug_assert!(
                 false,
-                "Path binding encountered in flake generation (unexpected)"
+                "Path/List binding encountered in flake generation (unexpected)"
             );
             None
         }

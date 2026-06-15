@@ -408,8 +408,8 @@ impl Materializer {
                 JoinKey::Absent
             }
 
-            // Paths are not hashed/joined/grouped.
-            Binding::Path(_) => JoinKey::Absent,
+            // Paths/lists are not hashed/joined/grouped (v1).
+            Binding::Path(_) | Binding::List(_) => JoinKey::Absent,
         }
     }
 
@@ -461,8 +461,8 @@ impl Materializer {
 
             Binding::Grouped(_) => None,
 
-            // A path is not a scalar comparable value.
-            Binding::Path(_) => None,
+            // A path/list is not a scalar comparable value.
+            Binding::Path(_) | Binding::List(_) => None,
         }
     }
 
@@ -525,8 +525,8 @@ impl Materializer {
 
             Binding::Grouped(_) => None,
 
-            // No canonical string form for a path value.
-            Binding::Path(_) => None,
+            // No canonical string form for a path/list value.
+            Binding::Path(_) | Binding::List(_) => None,
         }
     }
 
@@ -551,7 +551,8 @@ impl Materializer {
             | Binding::Iri(_)
             | Binding::Lit { .. }
             | Binding::Grouped(_)
-            | Binding::Path(_) => binding.clone(),
+            | Binding::Path(_)
+            | Binding::List(_) => binding.clone(),
 
             Binding::EncodedSid { s_id, .. } => {
                 let sid = self.resolve_sid(*s_id);

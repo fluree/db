@@ -219,6 +219,16 @@ fn sparql_table_cell(
             })
             .collect::<Vec<_>>()
             .join("->"),
+
+        // A list (Cypher collect/list value) — semicolon-joined cells; never
+        // reached via the SPARQL surface.
+        Binding::List(values) => {
+            let mut parts = Vec::with_capacity(values.len());
+            for v in values {
+                parts.push(sparql_table_cell(v, compactor, gv)?);
+            }
+            parts.join(";")
+        }
     };
     Ok(s)
 }

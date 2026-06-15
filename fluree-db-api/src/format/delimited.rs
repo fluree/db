@@ -461,6 +461,15 @@ fn write_binding_cell(
                 write_compacted_sid(cell, compactor, sid)?;
             }
         }
+        // A list: semicolon-separated elements (mirrors Grouped).
+        Binding::List(values) => {
+            for (j, val) in values.iter().enumerate() {
+                if j > 0 {
+                    cell.push(b';');
+                }
+                write_binding_cell(cell, val, compactor, gv)?;
+            }
+        }
     }
     Ok(())
 }

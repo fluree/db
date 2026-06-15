@@ -215,6 +215,17 @@ fn write_value(
             }
             out.push(']');
         }
+        // A list renders as a JSON array of its (typed) elements.
+        Binding::List(values) => {
+            out.push('[');
+            for (i, v) in values.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                write_value(out, result, v, compactor)?;
+            }
+            out.push(']');
+        }
         Binding::EncodedLit { .. } | Binding::EncodedSid { .. } | Binding::EncodedPid { .. } => {
             unreachable!("encoded bindings are materialized before write_value")
         }
@@ -499,6 +510,15 @@ pub(crate) fn format_binding(
             let arr: Result<Vec<_>> = nodes
                 .iter()
                 .map(|sid| compactor.compact_id_sid(sid).map(|iri| json!({"@id": iri})))
+                .collect();
+            Ok(JsonValue::Array(arr?))
+        }
+
+        // A list - array of its (typed) elements.
+        Binding::List(values) => {
+            let arr: Result<Vec<_>> = values
+                .iter()
+                .map(|v| format_binding(result, v, compactor))
                 .collect();
             Ok(JsonValue::Array(arr?))
         }
