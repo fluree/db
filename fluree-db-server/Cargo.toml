@@ -47,7 +47,7 @@ otel = [
 # Replicate writes through a Raft cluster. Mounts the follower-forward
 # middleware on leader-only routes and exposes the inter-node RPC +
 # cluster-admin routers on a separate private listener.
-raft = ["fluree-db-consensus/raft"]
+raft = ["fluree-db-consensus/raft", "dep:fluree-db-indexer"]
 
 [dependencies]
 # Fluree DB crates
@@ -56,6 +56,9 @@ fluree-db-connection = { path = "../fluree-db-connection" }
 fluree-db-core = { path = "../fluree-db-core" }
 fluree-db-consensus = { path = "../fluree-db-consensus" }
 fluree-db-credential = { path = "../fluree-db-credential" }
+# Optional; pulled in by the `raft` feature for the leader-aware
+# indexer launcher in `crate::raft::spawn_leader_watcher`'s closure.
+fluree-db-indexer = { path = "../fluree-db-indexer", optional = true }
 fluree-db-nameservice = { path = "../fluree-db-nameservice" }
 fluree-db-nameservice-sync = { path = "../fluree-db-nameservice-sync" }
 fluree-db-peer = { path = "../fluree-db-peer" }

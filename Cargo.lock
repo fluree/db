@@ -3027,6 +3027,7 @@ dependencies = [
  "fluree-db-consensus",
  "fluree-db-core",
  "fluree-db-credential",
+ "fluree-db-indexer",
  "fluree-db-nameservice",
  "fluree-db-nameservice-sync",
  "fluree-db-novelty",

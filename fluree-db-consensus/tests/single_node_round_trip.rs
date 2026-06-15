@@ -30,7 +30,9 @@ use fluree_db_consensus::raft::state_machine::{
 use fluree_db_consensus::raft::state_machine_adapter::StateMachineAdapter;
 use fluree_db_consensus::raft::storage::memory::MemoryRaftStorage;
 use fluree_db_consensus::raft::{ClusterNode, NodeId, TypeConfig};
-use fluree_db_nameservice::{IndexPublisher, NameServiceLookup};
+use fluree_db_nameservice::{
+    IndexPublisher, LedgerEventBus, NameServiceEvent, NameServiceLookup, SubscriptionScope,
+};
 
 struct StubFactory;
 struct StubNetwork;
@@ -221,4 +223,91 @@ async fn single_node_raft_index_publisher_round_trip() {
     }
 
     raft_arc.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn single_node_apply_emits_commit_event_on_bus() {
+    // Wires the state-machine adapter to a LedgerEventBus and
+    // proves that going through the full openraft pipeline (propose
+    // → quorum → apply) results in a `LedgerCommitPublished` event on
+    // the bus — exactly the path the indexer worker subscribes to.
+
+    let storage = Arc::new(MemoryRaftStorage::new());
+    let event_bus = Arc::new(LedgerEventBus::new(16));
+    let log = LogAdapter::new(Arc::clone(&storage));
+    let sm =
+        StateMachineAdapter::new(Arc::clone(&storage)).with_event_bus(Arc::clone(&event_bus));
+
+    let config = Config {
+        cluster_name: "single-node-event-bus".into(),
+        election_timeout_min: 150,
+        election_timeout_max: 300,
+        heartbeat_interval: 50,
+        ..Config::default()
+    };
+    let config = Arc::new(config.validate().unwrap());
+    let raft = Raft::new(1, config, StubFactory, log, sm).await.unwrap();
+
+    let mut members = BTreeMap::new();
+    members.insert(1u64, ClusterNode::default());
+    raft.initialize(members).await.unwrap();
+
+    raft.wait(Some(Duration::from_secs(5)))
+        .state(ServerState::Leader, "leader after self-election")
+        .await
+        .unwrap();
+
+    // Subscribe BEFORE the AdvanceRef proposal so the event lands in
+    // the receiver's buffer when apply emits it.
+    let mut sub = event_bus.subscribe(SubscriptionScope::All);
+
+    raft.client_write(SmCommand::CreateLedger(CreateLedgerArgs {
+        ledger_id: "test/db".into(),
+        initial_branch: "main".into(),
+        initial_head: cid(0),
+        initial_t: 0,
+        governance: cid(0xAA),
+        created_at_millis: 1_000,
+    }))
+    .await
+    .unwrap();
+    // CreateLedger doesn't carry a published-commit semantic — the
+    // bus stays quiet.
+    assert!(
+        sub.receiver.try_recv().is_err(),
+        "CreateLedger should not emit a commit event"
+    );
+
+    raft.client_write(SmCommand::AdvanceRef(AdvanceRefArgs {
+        ledger_id: "test/db".into(),
+        branch: "main".into(),
+        expected_prev: Some(cid(0)),
+        new_head: cid(7),
+        t: 10,
+        applied_at_millis: 2_000,
+        idempotency: None,
+        release: Vec::new(),
+        tally: None,
+    }))
+    .await
+    .unwrap();
+
+    // The AdvanceRef Applied response should have triggered an
+    // emission. Try-recv to keep the test deterministic — the event
+    // is already on the broadcast buffer by the time client_write
+    // returns (apply emits before returning the Response).
+    match sub.receiver.try_recv().expect("commit event present") {
+        NameServiceEvent::LedgerCommitPublished {
+            ledger_id,
+            commit_id,
+            commit_t,
+        } => {
+            assert_eq!(ledger_id, "test/db:main");
+            assert_eq!(commit_id, cid(7));
+            assert_eq!(commit_t, 10);
+        }
+        other => panic!("expected LedgerCommitPublished, got {other:?}"),
+    }
+
+    raft.shutdown().await.unwrap();
 }

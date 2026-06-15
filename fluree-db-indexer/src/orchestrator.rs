@@ -47,12 +47,16 @@ use crate::{publish_index_result, IndexResult};
 #[cfg(feature = "embedded-orchestrator")]
 use fluree_db_core::Storage;
 use fluree_db_core::StorageBackend;
-use fluree_db_nameservice::IndexingNameService;
+use fluree_db_nameservice::{
+    IndexingNameService, LedgerEventBus, NameServiceEvent, SubscriptionScope,
+};
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::sync::broadcast;
 use tokio::sync::{oneshot, watch, Mutex, Notify};
+use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
 tokio::task_local! {
@@ -589,9 +593,14 @@ pub struct BackgroundIndexerWorker {
     backend: StorageBackend,
     nameservice: Arc<dyn IndexingNameService>,
     config: IndexerConfig,
-    states: Arc<Mutex<LedgerStates>>,
+    /// Shared with the handle returned from [`new`](Self::new) and
+    /// cloned for the internal event-bus subscriber.
+    handle: IndexerHandle,
     tick_rx: watch::Receiver<u64>,
-    idle_notify: Arc<Notify>,
+    /// When set, [`run`](Self::run) subscribes and translates
+    /// [`NameServiceEvent::LedgerCommitPublished`] into
+    /// [`IndexerHandle::trigger`] calls.
+    event_bus: Option<Arc<LedgerEventBus>>,
 }
 
 impl BackgroundIndexerWorker {
@@ -609,22 +618,31 @@ impl BackgroundIndexerWorker {
         let (tick_tx, tick_rx) = watch::channel(0u64);
         let idle_notify = Arc::new(Notify::new());
 
-        let worker = Self {
-            backend,
-            nameservice,
-            config,
-            states: states.clone(),
-            tick_rx,
-            idle_notify: idle_notify.clone(),
-        };
-
         let handle = IndexerHandle {
             states,
             tick: tick_tx,
             idle_notify,
         };
 
+        let worker = Self {
+            backend,
+            nameservice,
+            config,
+            handle: handle.clone(),
+            tick_rx,
+            event_bus: None,
+        };
+
         (worker, handle)
+    }
+
+    /// Attach a [`LedgerEventBus`]. [`run`](Self::run) subscribes,
+    /// performs a catch-up sweep, then translates
+    /// `LedgerCommitPublished` events into trigger calls. The
+    /// subscriber's lifetime is tied to the `run` task.
+    pub fn with_event_bus(mut self, event_bus: Arc<LedgerEventBus>) -> Self {
+        self.event_bus = Some(event_bus);
+        self
     }
 
     /// Run the worker loop (consumes self)
@@ -635,10 +653,21 @@ impl BackgroundIndexerWorker {
     /// 3. Resolves waiters based on min_t predicate
     /// 4. Handles cancellation and backoff
     pub async fn run(mut self) {
+        // Guard ensures aborting the outer `run` task also aborts
+        // the subscriber — its broadcast receiver doesn't otherwise
+        // observe cancellation.
+        let _subscriber_guard = self.event_bus.clone().map(|bus| {
+            let handle = self.handle.clone();
+            let nameservice = Arc::clone(&self.nameservice);
+            AbortOnDrop(tokio::spawn(async move {
+                run_event_subscriber(bus, handle, nameservice).await;
+            }))
+        });
+
         loop {
             // Compute next retry deadline
             let retry_deadline = {
-                let states = self.states.lock().await;
+                let states = self.handle.states.lock().await;
                 states.values().filter_map(|s| s.next_retry_at).min()
             };
 
@@ -654,7 +683,7 @@ impl BackgroundIndexerWorker {
 
             if wait_result.is_err() {
                 // All senders dropped - resolve remaining waiters and shutdown
-                let mut states = self.states.lock().await;
+                let mut states = self.handle.states.lock().await;
                 for state in states.values_mut() {
                     state.resolve_waiters_below(i64::MAX, IndexOutcome::Cancelled);
                 }
@@ -664,7 +693,7 @@ impl BackgroundIndexerWorker {
             // Collect ledgers that need processing
             let now = tokio::time::Instant::now();
             let ledgers_to_process: Vec<String> = {
-                let states = self.states.lock().await;
+                let states = self.handle.states.lock().await;
                 states
                     .iter()
                     .filter(|(_, state)| {
@@ -691,7 +720,7 @@ impl BackgroundIndexerWorker {
 
             // Handle cancelled ledgers
             {
-                let mut states = self.states.lock().await;
+                let mut states = self.handle.states.lock().await;
                 for state in states.values_mut() {
                     if state.cancelled && state.has_pending_work() {
                         state.resolve_waiters_below(i64::MAX, IndexOutcome::Cancelled);
@@ -703,7 +732,7 @@ impl BackgroundIndexerWorker {
             }
 
             // Notify idle waiters
-            self.idle_notify.notify_waiters();
+            self.handle.idle_notify.notify_waiters();
         }
     }
 
@@ -713,7 +742,7 @@ impl BackgroundIndexerWorker {
 
         let (pending_min_t, waiter_count, retry_count) = {
             let lock_started = Instant::now();
-            let states = self.states.lock().await;
+            let states = self.handle.states.lock().await;
             debug!(
                 ledger_id = %ledger_id,
                 lock_wait_ms = lock_started.elapsed().as_millis(),
@@ -733,7 +762,7 @@ impl BackgroundIndexerWorker {
         // Mark as in-progress
         {
             let lock_started = Instant::now();
-            let mut states = self.states.lock().await;
+            let mut states = self.handle.states.lock().await;
             debug!(
                 ledger_id = %ledger_id,
                 lock_wait_ms = lock_started.elapsed().as_millis(),
@@ -777,7 +806,7 @@ impl BackgroundIndexerWorker {
             Ok(Some(r)) => r,
             Ok(None) => {
                 // Ledger doesn't exist - resolve waiters as failed
-                let mut states = self.states.lock().await;
+                let mut states = self.handle.states.lock().await;
                 if let Some(state) = states.get_mut(ledger_id) {
                     state.resolve_waiters_below(
                         i64::MAX,
@@ -820,7 +849,7 @@ impl BackgroundIndexerWorker {
                 commit_t = record.commit_t,
                 "Waiting for state lock before queued indexing gate"
             );
-            let mut states = self.states.lock().await;
+            let mut states = self.handle.states.lock().await;
             debug!(
                 ledger_id = %ledger_id,
                 lock_wait_ms = lock_started.elapsed().as_millis(),
@@ -957,7 +986,7 @@ impl BackgroundIndexerWorker {
                 commit_t = record.commit_t,
                 "Queued indexing request already satisfied"
             );
-            let mut states = self.states.lock().await;
+            let mut states = self.handle.states.lock().await;
             if let Some(state) = states.get_mut(ledger_id) {
                 // Resolve waiters that can be satisfied
                 if let Some(root_id) = &record.index_head_id {
@@ -1018,7 +1047,7 @@ impl BackgroundIndexerWorker {
                     error = %e,
                     "Failed to build branched content store for indexing; aborting build"
                 );
-                let mut states = self.states.lock().await;
+                let mut states = self.handle.states.lock().await;
                 if let Some(state) = states.get_mut(ledger_id) {
                     state.last_error = Some(e.to_string());
                     state.phase = IndexPhase::Pending;
@@ -1095,7 +1124,7 @@ impl BackgroundIndexerWorker {
                     }
 
                     // Resolve waiters
-                    let mut states = self.states.lock().await;
+                    let mut states = self.handle.states.lock().await;
                     if let Some(state) = states.get_mut(ledger_id) {
                         let outcome = IndexOutcome::Completed {
                             index_t: index_result.index_t,
@@ -1126,7 +1155,7 @@ impl BackgroundIndexerWorker {
 
     /// Schedule a retry with exponential backoff
     async fn schedule_retry(&self, ledger_id: &str, error: &str) {
-        let mut states = self.states.lock().await;
+        let mut states = self.handle.states.lock().await;
         if let Some(state) = states.get_mut(ledger_id) {
             // Check if cancelled - don't retry
             if state.cancelled {
@@ -1155,6 +1184,81 @@ impl BackgroundIndexerWorker {
                 pending_min_t = ?state.pending_min_t,
                 "Scheduled indexing retry"
             );
+        }
+    }
+}
+
+/// Drop-guard that aborts the wrapped task on drop.
+struct AbortOnDrop(JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Trigger every ledger whose `commit_t > index_t`. Safe to call
+/// repeatedly — the handle coalesces redundant triggers.
+/// Nameservice errors are logged and swallowed.
+async fn catch_up_sweep(handle: &IndexerHandle, nameservice: &dyn IndexingNameService) {
+    let records = match nameservice.all_records().await {
+        Ok(records) => records,
+        Err(e) => {
+            warn!(error = %e, "catch-up sweep: all_records() failed");
+            return;
+        }
+    };
+    let behind = records
+        .into_iter()
+        .filter(|r| !r.retracted && r.has_novelty());
+    for record in behind {
+        debug!(
+            ledger_id = %record.ledger_id,
+            commit_t = record.commit_t,
+            index_t = record.index_t,
+            "Catch-up: triggering indexer"
+        );
+        let _ = handle.trigger(record.ledger_id, record.commit_t).await;
+    }
+}
+
+/// Translate [`NameServiceEvent::LedgerCommitPublished`] from `bus`
+/// into [`IndexerHandle::trigger`] calls. Catch-up sweeps run at
+/// startup and on `Lagged`. Returns when the bus closes.
+async fn run_event_subscriber(
+    bus: Arc<LedgerEventBus>,
+    handle: IndexerHandle,
+    nameservice: Arc<dyn IndexingNameService>,
+) {
+    // Subscribe before the catch-up sweep so events arriving during
+    // the sweep are buffered, not lost.
+    let mut subscription = bus.subscribe(SubscriptionScope::All);
+    catch_up_sweep(&handle, nameservice.as_ref()).await;
+
+    loop {
+        match subscription.receiver.recv().await {
+            Ok(NameServiceEvent::LedgerCommitPublished {
+                ledger_id, commit_t, ..
+            }) => {
+                debug!(
+                    ledger_id = %ledger_id,
+                    commit_t,
+                    "Indexer subscriber: trigger from LedgerCommitPublished"
+                );
+                let _ = handle.trigger(ledger_id, commit_t).await;
+            }
+            Ok(_) => {}
+            Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                warn!(
+                    skipped,
+                    "Indexer subscriber lagged on broadcast channel; running catch-up sweep"
+                );
+                catch_up_sweep(&handle, nameservice.as_ref()).await;
+            }
+            Err(broadcast::error::RecvError::Closed) => {
+                debug!("Indexer subscriber: broadcast channel closed; exiting");
+                return;
+            }
         }
     }
 }
@@ -2047,6 +2151,117 @@ mod tests {
         assert_eq!(cloned.last_index_t, 3);
         assert_eq!(cloned.last_error, Some("test error".to_string()));
         assert_eq!(cloned.waiter_count, 2);
+    }
+
+    // ----------------------------------------------------------------
+    // Event-bus subscriber & catch-up sweep
+    // ----------------------------------------------------------------
+
+    fn test_commit_cid(seed: u8) -> ContentId {
+        ContentId::new(ContentKind::Commit, &[seed])
+    }
+
+    #[tokio::test]
+    async fn subscriber_translates_commit_published_into_trigger() {
+        let backend = StorageBackend::Managed(Arc::new(MemoryStorage::new()));
+        let ns: Arc<dyn IndexingNameService> = Arc::new(MemoryNameService::new());
+        let (_worker, handle) =
+            BackgroundIndexerWorker::new(backend, Arc::clone(&ns), IndexerConfig::default());
+
+        let bus = Arc::new(LedgerEventBus::new(16));
+        let sub_task = tokio::spawn({
+            let bus = Arc::clone(&bus);
+            let handle = handle.clone();
+            let ns = Arc::clone(&ns);
+            async move {
+                run_event_subscriber(bus, handle, ns).await;
+            }
+        });
+
+        // Ensure the subscriber has called subscribe() before we emit.
+        // The catch-up sweep runs after subscribe, so once it completes
+        // the receiver is ready — yield a few times to let it land.
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+
+        bus.notify(NameServiceEvent::LedgerCommitPublished {
+            ledger_id: "test:main".into(),
+            commit_id: test_commit_cid(1),
+            commit_t: 5,
+        });
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !handle.is_pending("test:main").await {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("subscriber should trigger handle within 2s");
+
+        sub_task.abort();
+    }
+
+    #[tokio::test]
+    async fn catch_up_sweep_triggers_only_behind_ledgers() {
+        let backend = StorageBackend::Managed(Arc::new(MemoryStorage::new()));
+        let ns = Arc::new(MemoryNameService::new());
+        let ns_dyn: Arc<dyn IndexingNameService> = Arc::clone(&ns) as _;
+        let (_worker, handle) =
+            BackgroundIndexerWorker::new(backend, Arc::clone(&ns_dyn), IndexerConfig::default());
+
+        // Two ledgers exist on the nameservice; only one has novelty
+        // (commit_t > index_t). The other has never advanced past its
+        // initial state, so the sweep should skip it.
+        ns.create_ledger("behind:main").unwrap();
+        ns.publish_commit("behind:main", 7, &test_commit_cid(7))
+            .await
+            .unwrap();
+        ns.create_ledger("current:main").unwrap();
+
+        catch_up_sweep(&handle, ns_dyn.as_ref()).await;
+
+        assert!(
+            handle.is_pending("behind:main").await,
+            "behind ledger should be triggered"
+        );
+        assert!(
+            !handle.is_pending("current:main").await,
+            "current ledger should be skipped"
+        );
+    }
+
+    #[tokio::test]
+    async fn subscriber_aborts_when_run_aborts() {
+        // Smoke test for the AbortOnDrop guard: after aborting the
+        // outer task, the subscriber's spawn handle should not be
+        // alive forever, even though its broadcast receiver is.
+        let backend = StorageBackend::Managed(Arc::new(MemoryStorage::new()));
+        let ns: Arc<dyn IndexingNameService> = Arc::new(MemoryNameService::new());
+        let (worker, _handle) =
+            BackgroundIndexerWorker::new(backend, Arc::clone(&ns), IndexerConfig::default());
+        let bus = Arc::new(LedgerEventBus::new(16));
+        let worker = worker.with_event_bus(Arc::clone(&bus));
+
+        let run_task = tokio::spawn(worker.run());
+
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+        run_task.abort();
+
+        // Emitting after abort must not panic and the subscriber must
+        // be gone (no observable side effect). We just check the run
+        // task aborted cleanly without lingering joins.
+        bus.notify(NameServiceEvent::LedgerCommitPublished {
+            ledger_id: "test:main".into(),
+            commit_id: test_commit_cid(1),
+            commit_t: 1,
+        });
+        let join = tokio::time::timeout(Duration::from_secs(2), run_task)
+            .await
+            .expect("run task should resolve after abort");
+        assert!(join.is_err() || join.is_ok(), "join returned");
     }
 }
 

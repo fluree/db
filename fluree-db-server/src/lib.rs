@@ -75,6 +75,11 @@ pub struct FlureeServer {
     /// Optional private Raft listener (consensus + admin).
     #[cfg(feature = "raft")]
     raft_listener: Option<RaftListener>,
+    /// Leader-aware indexer watcher. `Some` when raft mode is on.
+    /// Aborted on shutdown so the spawned background tasks tear
+    /// down with the rest of the server.
+    #[cfg(feature = "raft")]
+    raft_indexer_watcher: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl FlureeServer {
@@ -258,6 +263,14 @@ impl FlureeServer {
         if let Some(task) = raft_listener_task {
             task.abort();
         }
+        #[cfg(feature = "raft")]
+        if let Some(task) = self.raft_indexer_watcher {
+            // Aborting the watcher's outer task drops its metrics
+            // receiver; on its way down it also aborts the currently-
+            // running indexer task (if any) — see
+            // `raft::spawn_leader_watcher` for the teardown path.
+            task.abort();
+        }
 
         result
     }
@@ -381,19 +394,34 @@ impl FlureeServerBuilder {
     pub async fn build(self) -> std::result::Result<FlureeServer, fluree_db_api::ApiError> {
         let telemetry_config = TelemetryConfig::with_server_config(&self.config);
 
+        // Construct `RaftNameService` once and reuse it for both the
+        // Fluree read path (downcast to `NameServiceLookup`) and the
+        // leader-aware indexer launcher (upcast to
+        // `IndexingNameService`). Keeping a single Arc keeps reads
+        // and the index publisher coherent — both observe the same
+        // shared state and propose through the same Raft handle.
+        #[cfg(feature = "raft")]
+        let raft_nameservice = self.raft.as_ref().map(|(integration, _)| {
+            std::sync::Arc::new(fluree_db_consensus::raft::nameservice::RaftNameService::new(
+                integration.shared_state.clone(),
+                std::sync::Arc::clone(&integration.raft),
+            ))
+        });
+
         // Build `Fluree` with the right nameservice for the
         // deployment mode. Raft mode wires `RaftNameService` so
         // every node's reads observe replicated state; default mode
         // uses whatever the storage backend implies.
         #[cfg(feature = "raft")]
         let (fluree, cache_stats_handle) =
-            if let Some((integration, _)) = self.raft.as_ref() {
-                let raft_ns = fluree_db_consensus::raft::nameservice::RaftNameService::new(
-                    integration.shared_state.clone(),
-                    std::sync::Arc::clone(&integration.raft),
-                );
-                let ns_mode =
-                    fluree_db_api::NameServiceMode::ReadOnly(std::sync::Arc::new(raft_ns));
+            if let Some(raft_ns) = raft_nameservice.as_ref() {
+                // Method-form `.clone()` returns `Arc<RaftNameService>`
+                // which the let binding coerces to the trait object —
+                // `Arc::clone(...)` would type-bind the generic to the
+                // annotation and reject the concrete argument.
+                let lookup: std::sync::Arc<dyn fluree_db_nameservice::NameServiceLookup> =
+                    raft_ns.clone();
+                let ns_mode = fluree_db_api::NameServiceMode::ReadOnly(lookup);
                 state::build_fluree_with_nameservice(&self.config, ns_mode).await?
             } else {
                 state::build_default_fluree(&self.config).await?
@@ -407,7 +435,7 @@ impl FlureeServerBuilder {
                 .await?;
 
         #[cfg(feature = "raft")]
-        let raft_listener = self.raft.map(|(integration, listen_addr)| {
+        let raft_listener = self.raft.as_ref().map(|(integration, listen_addr)| {
             // Swap the local-only committer for one that proposes
             // through Raft. Leader-side `transact` / `revert` /
             // `merge` / `rebase` / `push` now stage locally, write
@@ -426,12 +454,52 @@ impl FlureeServerBuilder {
             state_inner.committer = Arc::new(
                 fluree_db_consensus::CachingCommitter::wrapping(raft_committer),
             );
-            state_inner.raft = Some(Arc::clone(&integration));
+            state_inner.raft = Some(Arc::clone(integration));
             RaftListener {
                 private_router: integration.private_router(),
-                listen_addr,
+                listen_addr: *listen_addr,
             }
         });
+
+        // Wire the leader-aware indexer launcher. See
+        // `raft::spawn_leader_watcher` for the lifecycle.
+        #[cfg(feature = "raft")]
+        let raft_indexer_watcher =
+            self.raft
+                .as_ref()
+                .map(|(integration, _)| {
+                    let raft_ns = std::sync::Arc::clone(raft_nameservice.as_ref().expect(
+                        "raft_nameservice present whenever self.raft is Some",
+                    ));
+                    let backend = state_inner.fluree.backend().clone();
+                    let indexer_config = fluree_db_indexer::IndexerConfig::default();
+                    let event_bus = Arc::clone(&integration.event_bus);
+                    let spawn_indexer = move || {
+                        let nameservice: std::sync::Arc<
+                            dyn fluree_db_nameservice::IndexingNameService,
+                        > = raft_ns.clone();
+                        let (worker, _handle) = fluree_db_indexer::BackgroundIndexerWorker::new(
+                            backend.clone(),
+                            nameservice,
+                            indexer_config.clone(),
+                        );
+                        let worker = worker.with_event_bus(Arc::clone(&event_bus));
+                        tokio::spawn(worker.run())
+                    };
+                    crate::raft::spawn_leader_watcher(
+                        Arc::clone(&integration.raft),
+                        integration.self_id,
+                        spawn_indexer,
+                    )
+                });
+
+        // The raft tuple is no longer needed beyond this point —
+        // both raft_listener and raft_indexer_watcher captured what
+        // they need. Drop the rest.
+        #[cfg(feature = "raft")]
+        drop(self.raft);
+        #[cfg(feature = "raft")]
+        drop(raft_nameservice);
 
         let state = Arc::new(state_inner);
 
@@ -470,6 +538,8 @@ impl FlureeServerBuilder {
             router,
             #[cfg(feature = "raft")]
             raft_listener,
+            #[cfg(feature = "raft")]
+            raft_indexer_watcher,
         })
     }
 }

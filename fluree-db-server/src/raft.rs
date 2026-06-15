@@ -33,6 +33,7 @@ use fluree_db_consensus::raft::{
     storage::{fs::FsRaftStorage, StorageError},
 };
 use fluree_db_consensus::{NodeId, Raft, RaftConfig, RaftConfigError, RaftFatal, TypeConfig};
+use fluree_db_nameservice::LedgerEventBus;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -45,6 +46,10 @@ pub struct RaftIntegration {
     /// Raft handle. Cloned into the network, admin, and forward
     /// routers; also used by [`RaftCommitter`](fluree_db_consensus::RaftCommitter).
     pub raft: Arc<Raft<TypeConfig>>,
+    /// This node's id. Cached so callers (notably the leader-aware
+    /// indexer watcher) don't have to dip into `raft.metrics()` just
+    /// to ask "is this me?"
+    pub self_id: NodeId,
     /// Follower-forward middleware state. Cloned into the
     /// client-facing router's middleware layer.
     pub forwarder: Arc<LeaderForwarder>,
@@ -53,6 +58,10 @@ pub struct RaftIntegration {
     /// committed log state without going through the openraft RPC
     /// surface.
     pub shared_state: SharedState,
+    /// In-process broadcast bus the state-machine adapter emits
+    /// [`fluree_db_nameservice::NameServiceEvent`]s on after each
+    /// successful apply.
+    pub event_bus: Arc<LedgerEventBus>,
 }
 
 impl RaftIntegration {
@@ -65,6 +74,7 @@ impl RaftIntegration {
         self_id: NodeId,
         http_client: reqwest::Client,
         shared_state: SharedState,
+        event_bus: Arc<LedgerEventBus>,
     ) -> Self {
         let forwarder = Arc::new(LeaderForwarder::new(
             Arc::clone(&raft),
@@ -73,8 +83,10 @@ impl RaftIntegration {
         ));
         Self {
             raft,
+            self_id,
             forwarder,
             shared_state,
+            event_bus,
         }
     }
 
@@ -93,8 +105,10 @@ impl RaftIntegration {
     pub async fn bootstrap(config: RaftBootstrapConfig) -> Result<Self, RaftBootstrapError> {
         let storage = Arc::new(FsRaftStorage::open(config.storage_path).await?);
 
+        let event_bus = Arc::new(LedgerEventBus::new(config.event_bus_capacity));
         let log = LogAdapter::new(Arc::clone(&storage));
-        let sm = StateMachineAdapter::new(Arc::clone(&storage));
+        let sm =
+            StateMachineAdapter::new(Arc::clone(&storage)).with_event_bus(Arc::clone(&event_bus));
         let shared_state = sm.shared_state();
 
         let raft_cfg = Arc::new(config.raft_config.validate()?);
@@ -113,6 +127,7 @@ impl RaftIntegration {
             config.node_id,
             http_client,
             shared_state,
+            event_bus,
         ))
     }
 
@@ -151,6 +166,10 @@ pub struct RaftBootstrapConfig {
     /// Inter-node HTTP transport tuning (per-request and connect
     /// timeouts). Defaults: 500ms RPC, 30s snapshot, 250ms connect.
     pub network_config: NetworkConfig,
+    /// Buffer size of the `LedgerEventBus`. Subscribers that fall
+    /// this far behind receive `RecvError::Lagged` and fall back to
+    /// a catch-up sweep.
+    pub event_bus_capacity: usize,
 }
 
 impl RaftBootstrapConfig {
@@ -164,6 +183,7 @@ impl RaftBootstrapConfig {
             storage_path: storage_path.into(),
             raft_config: RaftConfig::default(),
             network_config: NetworkConfig::default(),
+            event_bus_capacity: 1024,
         }
     }
 }

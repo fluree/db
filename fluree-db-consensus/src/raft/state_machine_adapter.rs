@@ -11,11 +11,13 @@
 //! For now apply just returns the `Response` as-is.
 
 use crate::raft::log_adapter::{from_openraft_log_id, to_openraft_log_id};
-use crate::raft::state_machine::{self, NameServiceState, Response};
+use crate::raft::state_machine::{self, Command, NameServiceState, Response};
 use crate::raft::storage::{
     RaftSnapshotStore, RaftStorage, SnapshotId as OurSnapshotId, SnapshotMeta as OurSnapshotMeta,
 };
 use crate::raft::{ClusterNode, NodeId, TypeConfig};
+use fluree_db_core::ledger_id::format_ledger_id;
+use fluree_db_nameservice::{LedgerEventBus, NameServiceEvent};
 use openraft::storage::{RaftSnapshotBuilder, RaftStateMachine};
 use openraft::{
     AnyError, Entry, EntryPayload, ErrorSubject, ErrorVerb, LogId, Snapshot, SnapshotMeta,
@@ -79,6 +81,9 @@ where
     /// Monotonic counter for snapshot ids — combined with the
     /// last-applied index for uniqueness across rebuilds.
     snapshot_counter: AtomicU64,
+    /// When set, the adapter emits [`NameServiceEvent`]s on this bus
+    /// after each successful apply.
+    event_bus: Option<Arc<LedgerEventBus>>,
 }
 
 impl<S> StateMachineAdapter<S>
@@ -100,12 +105,50 @@ where
             last_membership: StoredMembership::default(),
             storage,
             snapshot_counter: AtomicU64::new(0),
+            event_bus: None,
         }
+    }
+
+    /// Set the [`LedgerEventBus`] this adapter emits commit/index
+    /// events on.
+    pub fn with_event_bus(mut self, event_bus: Arc<LedgerEventBus>) -> Self {
+        self.event_bus = Some(event_bus);
+        self
     }
 
     /// Borrow the shared state handle. Cheap clone (`Arc`).
     pub fn shared_state(&self) -> SharedState {
         Arc::clone(&self.state)
+    }
+}
+
+/// Translate an apply-path `(Command, Response)` pair into the
+/// matching [`NameServiceEvent`]. Returns `None` for pairs that
+/// don't advance head state — non-Applied responses, idempotent
+/// retries (`accepted == 0`), conflicts, no-ops.
+fn event_for(cmd: &Command, response: &Response) -> Option<NameServiceEvent> {
+    match (cmd, response) {
+        (
+            Command::AdvanceRef(args),
+            Response::Applied {
+                head_t,
+                head_id,
+                accepted,
+                ..
+            },
+        ) if *accepted > 0 => Some(NameServiceEvent::LedgerCommitPublished {
+            ledger_id: format_ledger_id(&args.ledger_id, &args.branch),
+            commit_id: head_id.clone(),
+            commit_t: *head_t,
+        }),
+        (Command::AdvanceIndexHead(args), Response::IndexAdvanced { index_t, index_head }) => {
+            Some(NameServiceEvent::LedgerIndexPublished {
+                ledger_id: format_ledger_id(&args.ledger_id, &args.branch),
+                index_id: index_head.clone(),
+                index_t: *index_t,
+            })
+        }
+        _ => None,
     }
 }
 
@@ -128,19 +171,33 @@ where
         I::IntoIter: Send,
     {
         let mut responses = Vec::new();
-        let mut state = self.state.write().await;
-        for entry in entries {
-            let log_id = entry.log_id;
-            self.last_applied = Some(log_id);
-            match entry.payload {
-                EntryPayload::Blank => responses.push(Response::NoOp),
-                EntryPayload::Normal(cmd) => {
-                    responses.push(state_machine::apply(&mut state, cmd, log_id.index));
+        let mut events = Vec::new();
+        {
+            let mut state = self.state.write().await;
+            for entry in entries {
+                let log_id = entry.log_id;
+                self.last_applied = Some(log_id);
+                match entry.payload {
+                    EntryPayload::Blank => responses.push(Response::NoOp),
+                    EntryPayload::Normal(cmd) => {
+                        let response = state_machine::apply(&mut state, cmd.clone(), log_id.index);
+                        if let Some(event) = event_for(&cmd, &response) {
+                            events.push(event);
+                        }
+                        responses.push(response);
+                    }
+                    EntryPayload::Membership(m) => {
+                        self.last_membership = StoredMembership::new(Some(log_id), m);
+                        responses.push(Response::NoOp);
+                    }
                 }
-                EntryPayload::Membership(m) => {
-                    self.last_membership = StoredMembership::new(Some(log_id), m);
-                    responses.push(Response::NoOp);
-                }
+            }
+        }
+        // Emit after the state write lock drops so subscribers
+        // can't block apply progress.
+        if let Some(bus) = self.event_bus.as_ref() {
+            for event in events {
+                bus.notify(event);
             }
         }
         Ok(responses)
@@ -380,6 +437,117 @@ mod tests {
 
         let current = sm.get_current_snapshot().await.unwrap().unwrap();
         assert_eq!(current.meta.snapshot_id, snap.meta.snapshot_id);
+    }
+
+    #[tokio::test]
+    async fn apply_emits_commit_event_on_fresh_advance_ref() {
+        let storage = Arc::new(MemoryRaftStorage::new());
+        let bus = Arc::new(LedgerEventBus::new(16));
+        let mut sm = StateMachineAdapter::new(storage).with_event_bus(Arc::clone(&bus));
+        let mut sub = bus.subscribe(fluree_db_nameservice::SubscriptionScope::All);
+
+        sm.apply([create_ledger_entry(1, "test/db")]).await.unwrap();
+        // CreateLedger is not a published-commit event — bus stays
+        // quiet so the first recv() below sees only the AdvanceRef
+        // emission.
+        sm.apply([advance_entry(2, "test/db", Some(cid(0)), cid(7), 10)])
+            .await
+            .unwrap();
+
+        match sub.receiver.try_recv().expect("event present") {
+            NameServiceEvent::LedgerCommitPublished {
+                ledger_id,
+                commit_id,
+                commit_t,
+            } => {
+                assert_eq!(ledger_id, "test/db:main");
+                assert_eq!(commit_id, cid(7));
+                assert_eq!(commit_t, 10);
+            }
+            other => panic!("expected LedgerCommitPublished, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn apply_emits_nothing_when_no_bus_attached() {
+        let storage = Arc::new(MemoryRaftStorage::new());
+        let mut sm = StateMachineAdapter::new(storage);
+        // Without a bus the apply path must still succeed and return
+        // the same responses — bus is optional.
+        sm.apply([create_ledger_entry(1, "test/db")]).await.unwrap();
+        let responses = sm
+            .apply([advance_entry(2, "test/db", Some(cid(0)), cid(7), 10)])
+            .await
+            .unwrap();
+        assert!(matches!(
+            responses[0],
+            Response::Applied { accepted: 1, .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn apply_emits_nothing_on_idempotent_retry() {
+        use crate::raft::state_machine::IdempotencyContext;
+        use crate::IdempotencyKey;
+
+        let storage = Arc::new(MemoryRaftStorage::new());
+        let bus = Arc::new(LedgerEventBus::new(16));
+        let mut sm = StateMachineAdapter::new(storage).with_event_bus(Arc::clone(&bus));
+        let mut sub = bus.subscribe(fluree_db_nameservice::SubscriptionScope::All);
+
+        sm.apply([create_ledger_entry(1, "test/db")]).await.unwrap();
+
+        // First advance with idempotency context — fresh, accepted=1.
+        let idem = IdempotencyContext {
+            key: crate::IdempotencyCacheKey::new(
+                "test/db:main".to_string(),
+                IdempotencyKey::from("k1"),
+            ),
+            body_hash: [0u8; 32],
+        };
+        let entry = Entry {
+            log_id: log_id(1, 2),
+            payload: EntryPayload::Normal(RaftCommand::AdvanceRef(AdvanceRefArgs {
+                ledger_id: "test/db".into(),
+                branch: "main".into(),
+                expected_prev: Some(cid(0)),
+                new_head: cid(7),
+                t: 10,
+                applied_at_millis: 2_000,
+                idempotency: Some(idem.clone()),
+                release: Vec::new(),
+                tally: None,
+            })),
+        };
+        sm.apply([entry]).await.unwrap();
+        // First apply emits.
+        let _ = sub.receiver.try_recv().expect("first apply emits");
+
+        // Retry of the same idempotency key returns Applied with
+        // accepted=0 (cached). No event should fire.
+        let retry = Entry {
+            log_id: log_id(1, 3),
+            payload: EntryPayload::Normal(RaftCommand::AdvanceRef(AdvanceRefArgs {
+                ledger_id: "test/db".into(),
+                branch: "main".into(),
+                expected_prev: Some(cid(0)),
+                new_head: cid(7),
+                t: 10,
+                applied_at_millis: 2_000,
+                idempotency: Some(idem),
+                release: Vec::new(),
+                tally: None,
+            })),
+        };
+        let responses = sm.apply([retry]).await.unwrap();
+        assert!(matches!(
+            responses[0],
+            Response::Applied { accepted: 0, .. }
+        ));
+        assert!(
+            sub.receiver.try_recv().is_err(),
+            "idempotent retry should not emit"
+        );
     }
 
     #[tokio::test]
