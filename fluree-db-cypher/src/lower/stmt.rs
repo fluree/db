@@ -623,14 +623,21 @@ fn extract_aggregates<E: IriEncoder>(
 ) -> Result<()> {
     match e {
         Expr::Call(call) if is_aggregate(&call.name) => {
+            // `collect()` yields a list (`Binding::Grouped`) that the scalar
+            // expression evaluator can't consume; list-consuming functions are
+            // deferred. Allow it only as a bare final-RETURN item, not nested
+            // in an expression.
+            if call.name.eq_ignore_ascii_case("collect") {
+                return Err(LowerError::unsupported(
+                    "collect() inside an expression is not supported in v1 — use it as a bare \
+                     RETURN item; list functions are deferred",
+                ));
+            }
             let name = format!("?#__agg_{counter}");
             *counter += 1;
             let output_var = ctx.intern_var(&name);
             let input_var = aggregate_input_var(ctx, call, patterns)?;
             let function = build_aggregate_fn(&call.name, call.distinct, input_var)?;
-            if call.name.eq_ignore_ascii_case("collect") {
-                list_outputs.insert(output_var);
-            }
             aggregates.push(AggregateSpec {
                 function,
                 output_var,

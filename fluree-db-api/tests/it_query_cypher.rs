@@ -598,6 +598,65 @@ async fn transact_cypher_unwind_map_param_batches_edge_inserts() {
 }
 
 #[tokio::test]
+async fn transact_cypher_anonymous_create_reifies_for_named_read() {
+    // Every Cypher relationship reifies (LPG identity), so an anonymous CREATE
+    // is visible to a *named* read and carries identity.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let mut l = genesis_ledger(&fluree, "it/cypher:anon-create-reified");
+    for stmt in [
+        r#"CREATE (a:Person {name: "Alice"})"#,
+        r#"CREATE (b:Person {name: "Bob"})"#,
+        r#"MATCH (a:Person {name: "Alice"}), (b:Person {name: "Bob"}) CREATE (a)-[:KNOWS]->(b)"#,
+    ] {
+        l = fluree.transact_cypher(l, stmt).await.expect(stmt).ledger;
+    }
+    let db = graphdb_from_ledger(&l);
+    assert_eq!(
+        fluree
+            .query_cypher(&db, "MATCH (a)-[r:KNOWS]->(b) RETURN r")
+            .await
+            .expect("named read")
+            .row_count(),
+        1,
+        "anonymous CREATE reifies → named read sees it"
+    );
+    assert_eq!(
+        fluree
+            .query_cypher(&db, "MATCH (a)-[:KNOWS]->(b) RETURN a, b")
+            .await
+            .expect("anon read")
+            .row_count(),
+        1,
+        "and the base triple is visible to anonymous reads"
+    );
+}
+
+#[tokio::test]
+async fn cypher_collect_inside_expression_rejected() {
+    // collect() yields a list the scalar evaluator can't consume; allowed only
+    // as a bare RETURN item, not nested in an expression.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = seed_nodes_with_ids(&fluree, "it/cypher:collect-in-expr").await;
+    let db = graphdb_from_ledger(&l);
+
+    for q in [
+        "MATCH (n:Person) RETURN collect(n) + 1",
+        "MATCH (n:Person) RETURN count(n) + collect(n)",
+    ] {
+        let err = fluree
+            .query_cypher(&db, q)
+            .await
+            .expect_err("collect inside expression must be rejected");
+        assert!(format!("{err}").contains("collect()"), "{err}: {q}");
+    }
+    // Bare collect still works.
+    fluree
+        .query_cypher(&db, "MATCH (n:Person) RETURN collect(n) AS xs")
+        .await
+        .expect("bare collect still works");
+}
+
+#[tokio::test]
 async fn cypher_aggregate_composed_into_expression() {
     // Aggregates nested in a larger expression (IC3 total, IC10 score, IC14):
     // `count(*) * 2`, `count(n) + 1`, `count(*) + count(*)`.
@@ -875,9 +934,9 @@ async fn transact_cypher_bare_delete_errors_when_node_has_relationships() {
     for stmt in [
         r#"CREATE (a:Person {name: "Alice"})"#,
         r#"CREATE (b:Person {name: "Bob"})"#,
-        // A property-bearing edge is reified (a Cypher relationship with
-        // identity); the bare-DELETE guard probes reified relationships.
-        r#"MATCH (a:Person {name: "Alice"}), (b:Person {name: "Bob"}) CREATE (a)-[:KNOWS {since: 2000}]->(b)"#,
+        // Every Cypher relationship reifies (LPG identity), so the bare-DELETE
+        // guard (which probes reified relationships) sees it.
+        r#"MATCH (a:Person {name: "Alice"}), (b:Person {name: "Bob"}) CREATE (a)-[:KNOWS]->(b)"#,
     ] {
         l = fluree.transact_cypher(l, stmt).await.expect(stmt).ledger;
     }

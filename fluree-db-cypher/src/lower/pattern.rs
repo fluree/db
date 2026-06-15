@@ -377,6 +377,12 @@ fn build_fixed_chain<E: IriEncoder>(
 /// (`a != b` AND … for all pairs). Returns `None` when there's nothing to
 /// constrain (fewer than two comparable nodes). Pairs of the same variable, or
 /// nodes that aren't a variable/SID, are skipped.
+///
+/// LIMITATION: when the two path *endpoints* are the same variable
+/// (`(a)-[:T*2]-(a)`), that pair is skipped (they're intentionally bound
+/// equal), so an out-and-back walk over one undirected edge isn't excluded.
+/// Full relationship-uniqueness (compare edge identities) would handle it; the
+/// case is uncommon (LDBC traverses between *distinct* persons).
 fn node_distinctness_filter(nodes: &[Ref]) -> Option<Pattern> {
     let mut conds: Vec<Expression> = Vec::new();
     for i in 0..nodes.len() {

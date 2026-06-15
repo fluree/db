@@ -303,12 +303,19 @@ Anonymous variable-length relationships are lowered (2026-06-14):
 Cypher's relationship-uniqueness rule (no edge reused on a walk): by
 forbidding a revisited node it eliminates the edge-reuse artifacts on
 cyclic / undirected graphs — spurious self-rows (`a-b-a`) and
-back-and-forth path multiplicity. It is *node*-uniqueness, slightly
-**stricter** than Cypher's relationship-uniqueness (it also excludes a
-walk that revisits a node via two different edges). For distinct-endpoint
-aggregation — `count(DISTINCT friend)`, the LDBC norm — results match
-Neo4j; raw path-multiplicity counts can differ. **Unbounded** paths
-(via `PropertyPathPattern`) do not yet enforce uniqueness.
+back-and-forth path multiplicity — **when the two endpoints are distinct
+variables**. For distinct-endpoint aggregation (`count(DISTINCT friend)`,
+the LDBC norm) results match Neo4j. Caveats:
+
+- It is *node*-uniqueness, slightly **stricter** than Cypher's
+  relationship-uniqueness (it also excludes a walk that revisits a node
+  via two different edges), so raw path-multiplicity counts can differ.
+- A path whose two endpoints are the **same variable**
+  (`(a)-[:T*2]-(a)`) is **not** constrained — it can still traverse an
+  undirected edge out-and-back. (Uncommon; LDBC traverses between
+  distinct persons. Full relationship-uniqueness would fix it.)
+- **Unbounded** paths (via `PropertyPathPattern`) do not yet enforce
+  uniqueness at all.
 
 **Scope vs. full Cypher.** These produce **endpoint bindings**, not
 first-class path values. Binding a variable to the path (`-[r:T*]->`, a
@@ -519,7 +526,7 @@ standard solution modifiers and a conservative expression sublanguage.**
 |---|---|---|
 | `CREATE (n)` (bare, no labels/props) | ❌ | Rejected — see "Node existence model". |
 | `CREATE (n:Label {p:v})` | ✅ | Node creation; at least one label or property required. |
-| `CREATE (a)-[r:T {p:v}]->(b)` | ✅ | Directed typed relationship. **Reifies** (gets a `f:reifies*` bundle / identity) only when the edge has a **bound variable** or **properties**; an anonymous, property-less `CREATE (a)-[:T]->(b)` is a **plain RDF triple** — consistent with the read/match/delete contract (anonymous `-[:T]->` = plain RDF). Multi-solution CREATE (e.g. batched edges) mints a fresh reifier per solution (SPARQL §3.1.3 blank-node semantics, fixed engine-wide). |
+| `CREATE (a)-[r:T {p:v}]->(b)` | ✅ | Directed typed relationship. **Every Cypher relationship reifies** (gets a `f:reifies*` bundle / identity) — including anonymous, property-less `CREATE (a)-[:T]->(b)` — so it's visible to named reads (`-[r:T]->`), deletable by `DELETE r`, guarded by bare `DELETE n`, and not collapsed with a parallel edge. The base triple makes it visible to anonymous (plain-RDF) reads too. Multi-solution CREATE (e.g. batched edges) mints a fresh reifier per solution (SPARQL §3.1.3 blank-node semantics, fixed engine-wide). |
 | `CREATE` chains and patterns | ✅ | `CREATE (a)-[:T]->(b)-[:T2]->(c)`. |
 | `MATCH ... CREATE ...` | ✅ | WHERE-bound bindings drive template. |
 | `MATCH ... SET n.prop = expr` | ✅ | Single-property update (DELETE+INSERT). |

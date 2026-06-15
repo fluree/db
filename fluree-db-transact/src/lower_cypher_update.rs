@@ -973,19 +973,17 @@ impl<'a> CypherLowering<'a> {
             o.clone(),
         ));
 
-        // Reify only when the relationship carries identity: a bound variable
-        // (so `r` can be matched/updated/deleted) or properties (which need a
-        // reifier to hang the body on). An anonymous, property-less edge is a
-        // plain RDF triple — matching the read-side contract (anonymous
-        // `-[:T]->` sees plain RDF) and, crucially, letting batched edge
-        // inserts (one row per VALUES solution) avoid colliding on a single
-        // template blank node (which isn't freshened per solution).
-        if rel.var.is_some() || rel.props.is_some() {
-            let ann = self.fresh_bnode();
-            self.emit_reifier_bundle(&ann, &s, &type_sid, &o)?;
-            if let Some(props) = &rel.props {
-                self.emit_property_triples(&ann, props)?;
-            }
+        // LPG semantics: every Cypher-created relationship gets identity — a
+        // fresh `f:reifies*` reifier bundle — so it is visible to named reads
+        // (`-[r:T]->`), deletable by `DELETE r`, guarded by bare `DELETE n`,
+        // and not collapsed with a parallel edge. The annotation blank node is
+        // freshened per WHERE solution (SPARQL §3.1.3), so batched edge inserts
+        // mint a distinct annotation per row. The base triple above also makes
+        // the edge visible to anonymous (plain-RDF) reads.
+        let ann = self.fresh_bnode();
+        self.emit_reifier_bundle(&ann, &s, &type_sid, &o)?;
+        if let Some(props) = &rel.props {
+            self.emit_property_triples(&ann, props)?;
         }
 
         Ok(())

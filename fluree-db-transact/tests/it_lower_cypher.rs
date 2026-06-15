@@ -44,13 +44,13 @@ fn create_node_with_properties() {
 }
 
 #[test]
-fn create_anonymous_relationship_emits_plain_base_edge() {
+fn create_directed_relationship_emits_base_and_reifier_bundle() {
     let txn = lower(r#"CREATE (a:Person {name: "Alice"})-[:KNOWS]->(b:Person {name: "Bob"})"#);
-    // Anonymous, property-less edge is plain RDF (no reifier bundle):
-    // 2 labels + 2 props + 1 base edge = 5 templates.
+    // Every Cypher relationship reifies (LPG identity):
+    // 2 labels + 2 props + 1 base edge + 3 reifier bundle triples = 8 templates.
     assert_eq!(
         txn.insert_templates.len(),
-        5,
+        8,
         "templates: {:?}",
         txn.insert_templates
     );
@@ -70,12 +70,13 @@ fn create_relationship_with_properties_adds_body_triples() {
 
 #[test]
 fn create_two_parallel_relationships_mints_distinct_annotation_subjects() {
-    // Parallel relationships need identity, so they carry properties (which
-    // reify); two reifier bundles get distinct annotation subjects.
+    // Every Cypher relationship reifies, so two parallel edges get distinct
+    // annotation subjects (lowering mints distinct template blank nodes; the
+    // generator freshens them per solution).
     let txn = lower(
         r#"CREATE
-              (a:Person {name: "Alice"})-[:KNOWS {since: 2000}]->(b:Person {name: "Bob"}),
-              (a)-[:KNOWS {since: 2010}]->(b)"#,
+              (a:Person {name: "Alice"})-[:KNOWS]->(b:Person {name: "Bob"}),
+              (a)-[:KNOWS]->(b)"#,
     );
     // Verify two distinct annotation subjects appear in the reifies
     // bundle.
@@ -362,10 +363,10 @@ fn match_create_relationship_references_bound_nodes() {
         "where: {:?}",
         txn.where_patterns
     );
-    // CREATE: a plain base edge (anonymous, property-less) = 1 template.
+    // CREATE: base edge + 3 reifier bundle triples = 4 (no new labels).
     assert_eq!(
         txn.insert_templates.len(),
-        1,
+        4,
         "inserts: {:?}",
         txn.insert_templates
     );
