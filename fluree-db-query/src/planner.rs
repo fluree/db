@@ -841,6 +841,10 @@ pub fn estimate_pattern(
 
         Pattern::Filter(_) | Pattern::Bind { .. } => PatternEstimate::Deferred,
 
+        // UNWIND a runtime list — defer until the list expression's vars are
+        // bound (it reads them per row), like a correlated Bind.
+        Pattern::Unwind { .. } => PatternEstimate::Deferred,
+
         Pattern::IndexSearch(isp) => PatternEstimate::Source {
             row_count: isp.limit.map_or(DEFAULT_SEARCH_LIMIT, |l| l as f64),
         },
@@ -1446,9 +1450,14 @@ fn drain_ready_deferred(
                 .last_mut()
                 .is_some_and(|last| try_nest_deferred(last, &dp));
 
-            // BIND produces a new variable; FILTER does not.
-            if let Pattern::Bind { var, .. } = &dp.pattern {
-                bound_vars.insert(*var);
+            // A deferred pattern's produced variables must enter the bound set
+            // so later patterns referencing them place after and correlate.
+            // This covers BIND/UNWIND (their target var) and a deferred
+            // ShortestPath (its path var) — without it, e.g. an UNWIND that
+            // reads a deferred shortestPath's path never becomes ready and
+            // lands after a property accessor on the unwound var, cross-joining.
+            for v in dp.pattern.produced_vars() {
+                bound_vars.insert(v);
             }
 
             if !nested {
@@ -1524,6 +1533,7 @@ fn deferred_required_vars(pattern: &Pattern) -> Vec<VarId> {
     match pattern {
         Pattern::Filter(expr) => expr.referenced_vars(),
         Pattern::Bind { expr, .. } => expr.referenced_vars(),
+        Pattern::Unwind { list, .. } => list.referenced_vars(),
         // Other patterns should not be classified as Deferred, but handle
         // gracefully by returning all referenced variables.
         other => other.referenced_vars(),

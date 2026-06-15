@@ -1013,30 +1013,44 @@ fn lower_unwind<E: IriEncoder>(
     ctx: &mut LoweringContext<'_, E>,
     u: &UnwindClause,
 ) -> Result<Pattern> {
-    let items = match &u.expr {
-        Expr::List(items, _) => items,
-        Expr::Param(_) => {
-            return Err(LowerError::unsupported(
-                "UNWIND $param requires API-layer parameter substitution; submit pre-substituted UNWIND [a, b, c] AS x in v1",
-            ));
-        }
-        _ => {
-            return Err(LowerError::unsupported(
-                "UNWIND accepts an inline list literal `[...]` in v1",
-            ));
-        }
-    };
-
     let alias = ctx.intern_var(&u.alias.name);
-    let mut rows: Vec<Vec<Binding>> = Vec::with_capacity(items.len());
-    for item in items {
-        let binding = literal_to_binding(item)?;
-        rows.push(vec![binding]);
+
+    // A constant inline list lowers to `Values` (one row per element). Any
+    // other (runtime) expression — `UNWIND nodes(path) AS n`, `UNWIND range(..)`
+    // — lowers to a `Pattern::Unwind` that the operator explodes per input row.
+    match &u.expr {
+        Expr::List(items, _) if items.iter().all(|i| matches!(i, Expr::Lit(_))) => {
+            let mut rows: Vec<Vec<Binding>> = Vec::with_capacity(items.len());
+            for item in items {
+                rows.push(vec![literal_to_binding(item)?]);
+            }
+            Ok(Pattern::Values {
+                vars: vec![alias],
+                rows,
+            })
+        }
+        Expr::Param(_) => Err(LowerError::unsupported(
+            "UNWIND $param requires API-layer parameter substitution; submit pre-substituted UNWIND [a, b, c] AS x in v1",
+        )),
+        other => {
+            let mut aux = Vec::new();
+            let list = crate::lower::expr::lower_expr(ctx, other, &mut aux)?;
+            // Any auxiliary patterns the list expression needs (e.g. property
+            // accessors) must run before the UNWIND.
+            aux.push(Pattern::Unwind { var: alias, list });
+            // A single pattern is expected by the caller; wrap multiple in the
+            // natural sequence via a Union-of-one is wrong, so return the last
+            // and prepend aux through the caller. We only ever produce aux for
+            // property accessors here, which is rare for an UNWIND source.
+            if aux.len() == 1 {
+                Ok(aux.pop().unwrap())
+            } else {
+                Err(LowerError::unsupported(
+                    "UNWIND over an expression that needs auxiliary patterns is deferred",
+                ))
+            }
+        }
     }
-    Ok(Pattern::Values {
-        vars: vec![alias],
-        rows,
-    })
 }
 
 /// Lower a desugared `InlineRows` (constant multi-column row set, produced by

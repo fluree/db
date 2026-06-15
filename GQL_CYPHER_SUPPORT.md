@@ -555,7 +555,9 @@ standard solution modifiers and a conservative expression sublanguage.**
 | `WITH ... WHERE ...` | ✅ | Subquery + outer filter. |
 | `WITH ... ORDER BY / SKIP / LIMIT` | ✅ | Modifiers inside subquery. |
 | `UNWIND $list AS x` | ✅ | Parameter-bound lists of scalars or shallow maps. Expression-built lists deferred. |
-| `UNWIND [literal, ...] AS x` | ✅ | Inline literal list. |
+| `UNWIND [literal, ...] AS x` | ✅ | Inline literal list (lowers to `Values`). |
+| `UNWIND <expr> AS x` (runtime list) | ✅ | A non-constant list — `UNWIND nodes(path) AS n`, `UNWIND range(1,5) AS i` — lowers to `Pattern::Unwind`, a correlated operator that fans each input row out over the list elements (empty/null → drops the row). A property accessor on the unwound element (`n.name`) correlates correctly. Constant lists still take the `Values` fast path. |
+| IC14 connection paths as person lists | ✅ | `MATCH p = allShortestPaths((a)-[:KNOWS*]-(b)) UNWIND nodes(p) AS pn RETURN p, collect(pn.id)` — every shortest path, exploded and re-collected per path (a path is a first-class GROUP BY / `collect` key via the `Seq` group key). The interaction-**weight** ranking (`reduce` folding pattern-match counts between path-adjacent nodes) remains deferred — it needs runtime pattern execution inside a fold. |
 | `RETURN ...` | ✅ | Default bag semantics. |
 | `RETURN DISTINCT` | ✅ | Set semantics. |
 | `RETURN ... AS alias` | ✅ | Existing projection alias support. |

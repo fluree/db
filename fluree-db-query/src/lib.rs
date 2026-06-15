@@ -95,6 +95,7 @@ pub mod stats_query;
 pub mod subquery;
 pub mod temporal_mode;
 pub mod union;
+pub mod unwind;
 pub mod values;
 pub mod var_registry;
 pub mod vector;
@@ -157,6 +158,7 @@ pub use seed::{EmptyOperator, SeedOperator};
 pub use sort::{compare_bindings, compare_flake_values, SortDirection, SortOperator, SortSpec};
 pub use stats_query::StatsCountByPredicateOperator;
 pub use subquery::SubqueryOperator;
+pub use unwind::UnwindOperator;
 pub use temporal_mode::{PlanningContext, TemporalMode};
 
 // Re-export DatatypeConstraint from fluree-db-core for convenience

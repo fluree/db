@@ -542,6 +542,7 @@ pub fn format_general_pattern(pattern: &Pattern) -> String {
         Pattern::Triple(tp) => format_pattern(tp),
         Pattern::Filter(expr) => format!("FILTER({expr:?})"),
         Pattern::Bind { var, expr } => format!("BIND({:?} AS ?v{})", expr, var.0),
+        Pattern::Unwind { var, list } => format!("UNWIND({:?} AS ?v{})", list, var.0),
         Pattern::Values { vars, rows } => {
             let var_names: Vec<String> = vars.iter().map(|v| format!("?v{}", v.0)).collect();
             format!("VALUES ({}) {{ {} rows }}", var_names.join(" "), rows.len())

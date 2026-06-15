@@ -96,6 +96,7 @@ pub fn rewrite_patterns_for_r2rml(
             // Preserve other patterns as-is
             Pattern::Filter(_)
             | Pattern::Bind { .. }
+            | Pattern::Unwind { .. }
             | Pattern::Values { .. }
             | Pattern::Subquery(_)
             | Pattern::PropertyPath(_)

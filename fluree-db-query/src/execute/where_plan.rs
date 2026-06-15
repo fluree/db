@@ -102,6 +102,7 @@ pub(crate) fn pattern_tree_has_edge_annotation(patterns: &[Pattern]) -> bool {
         | Pattern::ShortestPath(_)
         | Pattern::Filter(_)
         | Pattern::Bind { .. }
+        | Pattern::Unwind { .. }
         | Pattern::Values { .. }
         | Pattern::IndexSearch(_)
         | Pattern::VectorSearch(_)
@@ -503,6 +504,14 @@ pub fn collect_var_stats(
                     bump_count(counts, *var);
                     vars.insert(*var);
                     for v in expr.referenced_vars() {
+                        bump_count(counts, v);
+                        vars.insert(v);
+                    }
+                }
+                Pattern::Unwind { var, list } => {
+                    bump_count(counts, *var);
+                    vars.insert(*var);
+                    for v in list.referenced_vars() {
                         bump_count(counts, v);
                         vars.insert(v);
                     }
@@ -2139,6 +2148,21 @@ pub fn build_where_operators_seeded_with_needed(
 
                 operator = Some(Box::new(
                     crate::shortest_path::ShortestPathOperator::with_defaults(child, sp.clone())
+                        .with_out_schema(augmented_ref),
+                ));
+                i += 1;
+            }
+
+            Pattern::Unwind { var, list } => {
+                // UNWIND a runtime list expression — fan each input row out over
+                // the list elements. Correlated: the list expr reads bound vars
+                // from the child (seed an empty row if at position 0).
+                let child = get_or_empty_seed(operator.take());
+                let augmented_rwv = augmented_at(i + 1);
+                let augmented_ref = augmented_rwv.as_deref();
+
+                operator = Some(Box::new(
+                    crate::unwind::UnwindOperator::new(child, *var, list.clone())
                         .with_out_schema(augmented_ref),
                 ));
                 i += 1;

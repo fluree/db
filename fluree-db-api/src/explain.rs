@@ -263,6 +263,10 @@ fn logical_node(
             node.insert("kind".into(), json!("bind"));
             node.insert("var".into(), json!(vars.name(*var).to_string()));
         }
+        Pattern::Unwind { var, .. } => {
+            node.insert("kind".into(), json!("unwind"));
+            node.insert("var".into(), json!(vars.name(*var).to_string()));
+        }
         Pattern::Values {
             vars: value_vars,
             rows,

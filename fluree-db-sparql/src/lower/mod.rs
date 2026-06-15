@@ -262,6 +262,7 @@ fn reject_direct_reifies_in_patterns(patterns: &[Pattern]) -> Result<()> {
                 // f:reifies* predicates can't appear inside them.
                 Pattern::Filter(_)
                 | Pattern::Bind { .. }
+                | Pattern::Unwind { .. }
                 | Pattern::IndexSearch(_)
                 | Pattern::VectorSearch(_)
                 | Pattern::R2rml(_)

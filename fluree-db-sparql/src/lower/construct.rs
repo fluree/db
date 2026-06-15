@@ -134,6 +134,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                 // Filters, Binds, Values, PropertyPaths, Subqueries, IndexSearch, Service, and R2rml don't contribute template triples
                 Pattern::Filter(_)
                 | Pattern::Bind { .. }
+                | Pattern::Unwind { .. }
                 | Pattern::Values { .. }
                 | Pattern::PropertyPath(_)
                 | Pattern::ShortestPath(_)

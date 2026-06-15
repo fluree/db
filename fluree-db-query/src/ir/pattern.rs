@@ -297,6 +297,13 @@ pub enum Pattern {
     /// Bind a computed value to a variable
     Bind { var: VarId, expr: Expression },
 
+    /// UNWIND a runtime list-valued expression: for each input row, evaluate
+    /// `list` to a `Binding::List` and emit one output row per element with
+    /// `var` bound to it. An empty/unbound list drops the row (Cypher
+    /// semantics). Cypher `UNWIND <expr> AS var` over a non-constant list
+    /// (e.g. `UNWIND nodes(path) AS n`); a constant list lowers to `Values`.
+    Unwind { var: VarId, list: Expression },
+
     /// Inline values - constant rows to join with
     Values {
         vars: Vec<VarId>,
@@ -538,6 +545,10 @@ impl Pattern {
                 rename(var);
                 expr.substitute_var(old, new);
             }
+            Pattern::Unwind { var, list } => {
+                rename(var);
+                list.substitute_var(old, new);
+            }
             Pattern::Values { vars, .. } => vars.iter_mut().for_each(rename),
             Pattern::Optional(inner)
             | Pattern::Minus(inner)
@@ -650,6 +661,11 @@ impl Pattern {
                 vars.push(*var);
                 vars
             }
+            Pattern::Unwind { var, list } => {
+                let mut vars = list.referenced_vars();
+                vars.push(*var);
+                vars
+            }
             Pattern::Values { vars, .. } => vars.clone(),
             Pattern::Minus(inner) | Pattern::Exists(inner) | Pattern::NotExists(inner) => {
                 inner.iter().flat_map(Pattern::referenced_vars).collect()
@@ -711,6 +727,7 @@ impl Pattern {
                 .flat_map(|branch| branch.iter().flat_map(Pattern::produced_vars))
                 .collect(),
             Pattern::Bind { var, .. } => vec![*var],
+            Pattern::Unwind { var, .. } => vec![*var],
             Pattern::Values { vars, .. } => vars.clone(),
             Pattern::Minus(_) | Pattern::Exists(_) | Pattern::NotExists(_) => Vec::new(),
             Pattern::PropertyPath(pp) => pp.produced_vars(),
@@ -765,6 +782,7 @@ impl Pattern {
         match self {
             Pattern::Filter(expr) => expr.contains_function(target),
             Pattern::Bind { expr, .. } => expr.contains_function(target),
+            Pattern::Unwind { list, .. } => list.contains_function(target),
             Pattern::Exists(inner) | Pattern::NotExists(inner) | Pattern::Minus(inner) => {
                 inner.iter().any(|p| p.contains_function(target))
             }

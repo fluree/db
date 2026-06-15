@@ -151,7 +151,11 @@ ORDER BY / SKIP / LIMIT
   target only in v1; chained accessors (`n.a.b`) are rejected.
 - ORDER BY (variable, property-accessor, or general expression keys —
   e.g. `ORDER BY toInteger(n.id)`), SKIP, LIMIT.
-- `UNWIND [literals] AS x` — inline list literal unwinding.
+- `UNWIND [literals] AS x` — inline list literal unwinding, and
+  `UNWIND <expr> AS x` over a runtime list (`UNWIND nodes(path) AS n`,
+  `UNWIND range(1,5) AS i`) — a correlated operator fans each input row
+  out over the list elements; a property accessor on the element
+  correlates (`n.name`).
 - List functions over a `collect()` list: `size`, `head`, `last`,
   `tail`, `reverse` (and `size`/`reverse` over a string). Usable in the
   final `RETURN` wrapping a collect, e.g. `RETURN size(collect(f.name))`;
