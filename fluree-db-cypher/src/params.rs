@@ -160,11 +160,27 @@ fn expand_unwind_match(ast: &mut CypherAst, params: &ParamMap) -> Result<(), Par
         let Some(found) = found else {
             return Ok(());
         };
-        let has_match = u
+        // The edge-batch desugar needs a *mandatory* MATCH — its endpoints feed
+        // a CREATE, and an OPTIONAL (possibly-unbound) endpoint could assert a
+        // partial reifier bundle. An OPTIONAL-only body is rejected; no match at
+        // all means this isn't the edge case (handled by `expand_unwind_create`
+        // or left to the generic path).
+        let has_mandatory = u
             .read_clauses
             .iter()
-            .any(|c| matches!(c, ReadClause::Match(_) | ReadClause::OptionalMatch(_)));
-        if !has_match {
+            .any(|c| matches!(c, ReadClause::Match(_)));
+        let has_optional = u
+            .read_clauses
+            .iter()
+            .any(|c| matches!(c, ReadClause::OptionalMatch(_)));
+        if !has_mandatory {
+            if has_optional {
+                return Err(unsupported_param(
+                    &found.2,
+                    "OPTIONAL MATCH in an `UNWIND … CREATE` batch is not supported — use a \
+                     mandatory MATCH so the created edge's endpoints are always bound",
+                ));
+            }
             return Ok(());
         }
         found
@@ -200,8 +216,10 @@ fn expand_unwind_match(ast: &mut CypherAst, params: &ParamMap) -> Result<(), Par
         ));
     }
 
-    let col_var = |field: &str| format!("__cyrow_{alias}_{field}");
-    let bare_var = format!("__cyrow_{alias}");
+    // `#` can't appear in a user Cypher identifier, so these synthetic VALUES
+    // columns can't collide with a user variable.
+    let col_var = |field: &str| format!("#__cyrow_{alias}_{field}");
+    let bare_var = format!("#__cyrow_{alias}");
 
     // One VALUES row per element, columns aligned to `fields` (or one bare cell).
     let mut rows: Vec<Vec<Expr>> = Vec::with_capacity(elems.len());

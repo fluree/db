@@ -598,6 +598,27 @@ async fn transact_cypher_unwind_map_param_batches_edge_inserts() {
 }
 
 #[tokio::test]
+async fn transact_cypher_optional_match_before_create_rejected() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = fluree
+        .transact_cypher(
+            genesis_ledger(&fluree, "it/cypher:optional-create"),
+            r#"CREATE (a:Person {name: "Alice"})"#,
+        )
+        .await
+        .expect("seed")
+        .ledger;
+    let err = fluree
+        .transact_cypher(
+            l,
+            r#"MATCH (a:Person {name: "Alice"}) OPTIONAL MATCH (b:Person {name: "Ghost"}) CREATE (a)-[:KNOWS]->(b)"#,
+        )
+        .await
+        .expect_err("OPTIONAL MATCH before CREATE must be rejected");
+    assert!(format!("{err}").contains("OPTIONAL MATCH"), "{err}");
+}
+
+#[tokio::test]
 async fn transact_cypher_anonymous_create_reifies_for_named_read() {
     // Every Cypher relationship reifies (LPG identity), so an anonymous CREATE
     // is visible to a *named* read and carries identity.
@@ -816,6 +837,23 @@ async fn transact_cypher_unwind_edge_missing_id_drops_only_that_row() {
         1,
         "only the 1->2 edge; the 1->99 row found no target and dropped"
     );
+}
+
+#[tokio::test]
+async fn transact_cypher_unwind_optional_match_create_rejected() {
+    // OPTIONAL MATCH endpoints could be unbound → a partial reifier bundle.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = seed_nodes_with_ids(&fluree, "it/cypher:unwind-optional").await;
+    let err = fluree
+        .transact_cypher_with_params(
+            l,
+            "UNWIND $pairs AS p OPTIONAL MATCH (a:Person {id: p.from}), (b:Person {id: p.to}) \
+             CREATE (a)-[:KNOWS]->(b)",
+            json!({ "pairs": [{"from": 1, "to": 2}] }).as_object(),
+        )
+        .await
+        .expect_err("OPTIONAL MATCH in an UNWIND CREATE batch must be rejected");
+    assert!(format!("{err}").contains("OPTIONAL MATCH"), "{err}");
 }
 
 #[tokio::test]

@@ -57,6 +57,41 @@ fn create_directed_relationship_emits_base_and_reifier_bundle() {
 }
 
 #[test]
+fn create_null_property_is_skipped() {
+    // Cypher: a null property value means "no property" — not a stored null.
+    let txn = lower(r#"CREATE (n:Person {name: "Alice", nick: null})"#);
+    // 1 label + 1 name property = 2 (nick: null skipped).
+    assert_eq!(
+        txn.insert_templates.len(),
+        2,
+        "nick:null should be skipped: {:?}",
+        txn.insert_templates
+    );
+}
+
+#[test]
+fn optional_match_before_create_is_rejected() {
+    let out = parse_cypher(
+        r#"MATCH (a:Person {name: "Alice"})
+           OPTIONAL MATCH (b:Person {name: "Ghost"})
+           CREATE (a)-[:KNOWS]->(b)"#,
+    );
+    assert!(!out.has_errors(), "parse should succeed");
+    let ast = out.ast.unwrap();
+    let mut ns = NamespaceRegistry::new();
+    let r = lower_cypher_update(
+        &ast,
+        &mut ns,
+        TxnOpts::default(),
+        CypherLowerOpts::default(),
+    );
+    assert!(
+        r.is_err(),
+        "OPTIONAL MATCH before CREATE should be rejected"
+    );
+}
+
+#[test]
 fn create_relationship_with_properties_adds_body_triples() {
     let txn = lower("CREATE (a:Person)-[:KNOWS {since: 2020}]->(b:Person)");
     // 2 labels + 1 base + 3 bundle + 1 ann body = 7

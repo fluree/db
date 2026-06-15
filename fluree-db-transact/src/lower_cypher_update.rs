@@ -214,6 +214,26 @@ impl<'a> CypherLowering<'a> {
             ));
         }
 
+        // OPTIONAL MATCH before CREATE is unsafe: a CREATE emits a multi-triple
+        // reifier bundle, and a template referencing an optionally-unbound
+        // variable skips per-triple — which could assert only part of the
+        // bundle (a malformed reifier). Require mandatory binding for CREATE.
+        let has_optional = update
+            .read_clauses
+            .iter()
+            .any(|c| matches!(c, ReadClause::OptionalMatch(_)));
+        let has_create = update
+            .write_clauses
+            .iter()
+            .any(|w| matches!(w, WriteClause::Create(_)));
+        if has_optional && has_create {
+            return Err(LowerCypherError::rejected(
+                "OPTIONAL MATCH before CREATE is not supported — a CREATE referencing an \
+                 optionally-unbound variable could assert a partial reifier bundle; bind its \
+                 variables with a mandatory MATCH",
+            ));
+        }
+
         // Lower any leading MATCH / OPTIONAL MATCH into where_patterns.
         // Their presence flips the transaction into Update mode (DELETE /
         // INSERT templates reference the bound variables).
@@ -1024,6 +1044,12 @@ impl<'a> CypherLowering<'a> {
         props: &MapLit,
     ) -> Result<(), LowerCypherError> {
         for (key, val_expr) in &props.entries {
+            // Cypher: a null property value means "no property" — don't store a
+            // null. (A literal `null`, or an UNWIND row's missing field which
+            // lowers to `null`.)
+            if matches!(val_expr, Expr::Lit(Literal::Null(_))) {
+                continue;
+            }
             let pred_iri = self.resolve_predicate(key)?;
             let pred_sid = self.ns.sid_for_iri(&pred_iri);
             let obj = self.expr_to_object(val_expr)?;
