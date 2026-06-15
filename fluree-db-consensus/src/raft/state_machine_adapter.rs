@@ -148,6 +148,12 @@ fn event_for(cmd: &Command, response: &Response) -> Option<NameServiceEvent> {
                 index_t: *index_t,
             })
         }
+        (Command::RetractLedger { .. }, Response::Retracted { ledger_id })
+        | (Command::PurgeLedger { .. }, Response::Purged { ledger_id }) => {
+            Some(NameServiceEvent::LedgerRetracted {
+                ledger_id: ledger_id.clone(),
+            })
+        }
         _ => None,
     }
 }
@@ -352,10 +358,7 @@ mod tests {
             log_id: log_id(1, index),
             payload: EntryPayload::Normal(RaftCommand::CreateLedger(CreateLedgerArgs {
                 ledger_id: ledger_id.into(),
-                initial_branch: "main".into(),
-                initial_head: cid(0),
-                initial_t: 0,
-                governance: cid(0xAA),
+                branch: "main".into(),
                 created_at_millis: 1_000,
             })),
         }
@@ -402,7 +405,7 @@ mod tests {
         let mut sm = StateMachineAdapter::new(storage);
         sm.apply([create_ledger_entry(1, "test/db")]).await.unwrap();
         let responses = sm
-            .apply([advance_entry(2, "test/db", Some(cid(0)), cid(1), 1)])
+            .apply([advance_entry(2, "test/db", None, cid(1), 1)])
             .await
             .unwrap();
         assert!(matches!(
@@ -450,7 +453,7 @@ mod tests {
         // CreateLedger is not a published-commit event — bus stays
         // quiet so the first recv() below sees only the AdvanceRef
         // emission.
-        sm.apply([advance_entry(2, "test/db", Some(cid(0)), cid(7), 10)])
+        sm.apply([advance_entry(2, "test/db", None, cid(7), 10)])
             .await
             .unwrap();
 
@@ -476,7 +479,7 @@ mod tests {
         // the same responses — bus is optional.
         sm.apply([create_ledger_entry(1, "test/db")]).await.unwrap();
         let responses = sm
-            .apply([advance_entry(2, "test/db", Some(cid(0)), cid(7), 10)])
+            .apply([advance_entry(2, "test/db", None, cid(7), 10)])
             .await
             .unwrap();
         assert!(matches!(
@@ -510,7 +513,7 @@ mod tests {
             payload: EntryPayload::Normal(RaftCommand::AdvanceRef(AdvanceRefArgs {
                 ledger_id: "test/db".into(),
                 branch: "main".into(),
-                expected_prev: Some(cid(0)),
+                expected_prev: None,
                 new_head: cid(7),
                 t: 10,
                 applied_at_millis: 2_000,
@@ -530,7 +533,7 @@ mod tests {
             payload: EntryPayload::Normal(RaftCommand::AdvanceRef(AdvanceRefArgs {
                 ledger_id: "test/db".into(),
                 branch: "main".into(),
-                expected_prev: Some(cid(0)),
+                expected_prev: None,
                 new_head: cid(7),
                 t: 10,
                 applied_at_millis: 2_000,
@@ -547,6 +550,114 @@ mod tests {
         assert!(
             sub.receiver.try_recv().is_err(),
             "idempotent retry should not emit"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_emits_retracted_event_on_fresh_retract() {
+        let storage = Arc::new(MemoryRaftStorage::new());
+        let bus = Arc::new(LedgerEventBus::new(16));
+        let mut sm = StateMachineAdapter::new(storage).with_event_bus(Arc::clone(&bus));
+        let mut sub = bus.subscribe(fluree_db_nameservice::SubscriptionScope::All);
+
+        sm.apply([create_ledger_entry(1, "test/db")]).await.unwrap();
+        sm.apply([Entry {
+            log_id: log_id(1, 2),
+            payload: EntryPayload::Normal(RaftCommand::RetractLedger {
+                ledger_id: "test/db".into(),
+                branch: "main".into(),
+            }),
+        }])
+        .await
+        .unwrap();
+
+        match sub.receiver.try_recv().expect("retracted event") {
+            NameServiceEvent::LedgerRetracted { ledger_id } => {
+                assert_eq!(ledger_id, "test/db:main");
+            }
+            other => panic!("expected LedgerRetracted, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn apply_emits_nothing_on_already_retracted() {
+        let storage = Arc::new(MemoryRaftStorage::new());
+        let bus = Arc::new(LedgerEventBus::new(16));
+        let mut sm = StateMachineAdapter::new(storage).with_event_bus(Arc::clone(&bus));
+        let mut sub = bus.subscribe(fluree_db_nameservice::SubscriptionScope::All);
+
+        sm.apply([create_ledger_entry(1, "test/db")]).await.unwrap();
+        sm.apply([Entry {
+            log_id: log_id(1, 2),
+            payload: EntryPayload::Normal(RaftCommand::RetractLedger {
+                ledger_id: "test/db".into(),
+                branch: "main".into(),
+            }),
+        }])
+        .await
+        .unwrap();
+        let _ = sub.receiver.try_recv().expect("first retract emits");
+
+        sm.apply([Entry {
+            log_id: log_id(1, 3),
+            payload: EntryPayload::Normal(RaftCommand::RetractLedger {
+                ledger_id: "test/db".into(),
+                branch: "main".into(),
+            }),
+        }])
+        .await
+        .unwrap();
+        assert!(
+            sub.receiver.try_recv().is_err(),
+            "idempotent retract should not emit"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_emits_retracted_event_on_purge_of_known_branch() {
+        let storage = Arc::new(MemoryRaftStorage::new());
+        let bus = Arc::new(LedgerEventBus::new(16));
+        let mut sm = StateMachineAdapter::new(storage).with_event_bus(Arc::clone(&bus));
+        let mut sub = bus.subscribe(fluree_db_nameservice::SubscriptionScope::All);
+
+        sm.apply([create_ledger_entry(1, "test/db")]).await.unwrap();
+        sm.apply([Entry {
+            log_id: log_id(1, 2),
+            payload: EntryPayload::Normal(RaftCommand::PurgeLedger {
+                ledger_id: "test/db".into(),
+                branch: "main".into(),
+            }),
+        }])
+        .await
+        .unwrap();
+
+        match sub.receiver.try_recv().expect("purge event") {
+            NameServiceEvent::LedgerRetracted { ledger_id } => {
+                assert_eq!(ledger_id, "test/db:main");
+            }
+            other => panic!("expected LedgerRetracted, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn apply_emits_nothing_on_purge_of_missing_branch() {
+        let storage = Arc::new(MemoryRaftStorage::new());
+        let bus = Arc::new(LedgerEventBus::new(16));
+        let mut sm = StateMachineAdapter::new(storage).with_event_bus(Arc::clone(&bus));
+        let mut sub = bus.subscribe(fluree_db_nameservice::SubscriptionScope::All);
+
+        sm.apply([Entry {
+            log_id: log_id(1, 1),
+            payload: EntryPayload::Normal(RaftCommand::PurgeLedger {
+                ledger_id: "ghost".into(),
+                branch: "main".into(),
+            }),
+        }])
+        .await
+        .unwrap();
+        assert!(
+            sub.receiver.try_recv().is_err(),
+            "purge of unknown branch should not emit"
         );
     }
 

@@ -55,7 +55,8 @@
 //! [`LedgerState::load`]: fluree_db_ledger::LedgerState::load
 
 use crate::raft::state_machine::{
-    AdvanceIndexHeadArgs, Command as SmCommand, NameServiceState, RefKey, Response as SmResponse,
+    AdvanceIndexHeadArgs, Command as SmCommand, CreateLedgerArgs, NameServiceState, RefKey,
+    Response as SmResponse,
 };
 use crate::raft::state_machine_adapter::SharedState;
 use crate::raft::TypeConfig;
@@ -64,8 +65,8 @@ use fluree_db_core::ledger_id::split_ledger_id;
 use fluree_db_core::ContentId;
 use fluree_db_nameservice::{
     ConfigLookup, ConfigValue, GraphSourceLookup, GraphSourceRecord, IndexPublisher,
-    NameServiceError, NameServiceLookup, NsLookupResult, NsRecord, RefKind, RefLookup, RefValue,
-    Result, StatusLookup, StatusValue,
+    LedgerLifecycle, NameServiceError, NameServiceLookup, NsLookupResult, NsRecord, RefKind,
+    RefLookup, RefValue, Result, StatusLookup, StatusValue,
 };
 use openraft::error::{ClientWriteError, RaftError};
 use openraft::Raft;
@@ -157,15 +158,16 @@ fn map_advance_index_response(resp: SmResponse) -> Result<()> {
 }
 
 /// Construct an [`NsRecord`] from the state machine's view of a
-/// single branch. Returns `None` if the base ledger has no
-/// [`LedgerRecord`](crate::raft::state_machine::LedgerRecord).
+/// single branch. Returns `None` when no [`LedgerRecord`] exists for
+/// `ledger_name` or the branch isn't registered on it.
 ///
 /// Fields the state machine doesn't track
 /// (`default_context`/`config_id`/`source_branch`/`branches`) fall
 /// back to their `NsRecord::new` defaults — see the module docs for
 /// why that's enough for follower reload.
 fn record_from_state(state: &NameServiceState, ledger_name: &str, branch: &str) -> Option<NsRecord> {
-    if !state.ledgers.contains_key(ledger_name) {
+    let ledger = state.ledgers.get(ledger_name)?;
+    if !ledger.branches.iter().any(|b| b == branch) {
         return None;
     }
     let mut record = NsRecord::new(ledger_name, branch);
@@ -178,6 +180,7 @@ fn record_from_state(state: &NameServiceState, ledger_name: &str, branch: &str) 
             record.index_t = index.t;
         }
     }
+    record.retracted = state.retracted.contains(&ref_key);
     Some(record)
 }
 
@@ -231,6 +234,110 @@ impl IndexPublisher for RaftNameService {
                 "raft fatal during AdvanceIndexHead: {f}"
             ))),
         }
+    }
+}
+
+/// Build the state-machine command for [`LedgerLifecycle::init`].
+fn build_create_command(ledger_id: &str) -> std::result::Result<SmCommand, NameServiceError> {
+    let (ledger_name, branch) = split_ledger_id(ledger_id)?;
+    let applied_at_millis = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    Ok(SmCommand::CreateLedger(CreateLedgerArgs {
+        ledger_id: ledger_name,
+        branch,
+        created_at_millis: applied_at_millis,
+    }))
+}
+
+fn build_retract_command(ledger_id: &str) -> std::result::Result<SmCommand, NameServiceError> {
+    let (ledger_name, branch) = split_ledger_id(ledger_id)?;
+    Ok(SmCommand::RetractLedger {
+        ledger_id: ledger_name,
+        branch,
+    })
+}
+
+fn build_purge_command(ledger_id: &str) -> std::result::Result<SmCommand, NameServiceError> {
+    let (ledger_name, branch) = split_ledger_id(ledger_id)?;
+    Ok(SmCommand::PurgeLedger {
+        ledger_id: ledger_name,
+        branch,
+    })
+}
+
+fn map_create_response(resp: SmResponse) -> Result<()> {
+    match resp {
+        SmResponse::Created { .. } => Ok(()),
+        SmResponse::AlreadyExists { ledger_id } => {
+            Err(NameServiceError::ledger_already_exists(ledger_id))
+        }
+        other => Err(NameServiceError::storage(format!(
+            "unexpected Response variant for CreateLedger: {other:?}"
+        ))),
+    }
+}
+
+fn map_retract_response(resp: SmResponse) -> Result<()> {
+    match resp {
+        SmResponse::Retracted { .. } | SmResponse::AlreadyRetracted { .. } => Ok(()),
+        other => Err(NameServiceError::storage(format!(
+            "unexpected Response variant for RetractLedger: {other:?}"
+        ))),
+    }
+}
+
+fn map_purge_response(resp: SmResponse) -> Result<()> {
+    match resp {
+        SmResponse::Purged { .. } | SmResponse::AlreadyPurged { .. } => Ok(()),
+        other => Err(NameServiceError::storage(format!(
+            "unexpected Response variant for PurgeLedger: {other:?}"
+        ))),
+    }
+}
+
+impl RaftNameService {
+    /// Submit a lifecycle command through Raft and surface the
+    /// response. Maps `ForwardToLeader` to a storage error so callers
+    /// (typically the HTTP route layer) can redirect — silently
+    /// swallowing a lifecycle failure would let the client believe
+    /// the change took effect when it didn't.
+    async fn submit_lifecycle(&self, cmd: SmCommand) -> Result<SmResponse> {
+        match self.raft.client_write(cmd).await {
+            Ok(resp) => Ok(resp.data),
+            Err(RaftError::APIError(ClientWriteError::ForwardToLeader(leader))) => {
+                Err(NameServiceError::storage(format!(
+                    "raft client_write rejected — not leader (leader: {leader:?})"
+                )))
+            }
+            Err(RaftError::APIError(ClientWriteError::ChangeMembershipError(e))) => {
+                Err(NameServiceError::storage(format!(
+                    "unexpected ChangeMembershipError on lifecycle command: {e}"
+                )))
+            }
+            Err(RaftError::Fatal(f)) => Err(NameServiceError::storage(format!(
+                "raft fatal during lifecycle command: {f}"
+            ))),
+        }
+    }
+}
+
+#[async_trait]
+impl LedgerLifecycle for RaftNameService {
+    async fn init(&self, ledger_id: &str) -> Result<()> {
+        let cmd = build_create_command(ledger_id)?;
+        map_create_response(self.submit_lifecycle(cmd).await?)
+    }
+
+    async fn retract(&self, ledger_id: &str) -> Result<()> {
+        let cmd = build_retract_command(ledger_id)?;
+        map_retract_response(self.submit_lifecycle(cmd).await?)
+    }
+
+    async fn purge(&self, ledger_id: &str) -> Result<()> {
+        let cmd = build_purge_command(ledger_id)?;
+        map_purge_response(self.submit_lifecycle(cmd).await?)
     }
 }
 
@@ -349,6 +456,17 @@ mod tests {
     async fn apply_cmd(state: &SharedState, cmd: Command, index: u64) -> Response {
         let mut guard = state.write().await;
         crate::raft::state_machine::apply(&mut guard, cmd, index)
+    }
+
+    /// Slim init command: registers `(ledger_id, branch)` on the
+    /// state machine. Leaves the branch unborn — the caller follows
+    /// with `AdvanceRef(expected_prev=None, …)` to seed the head.
+    fn init_cmd(ledger_id: &str, branch: &str) -> Command {
+        Command::CreateLedger(CreateLedgerArgs {
+            ledger_id: ledger_id.into(),
+            branch: branch.into(),
+            created_at_millis: 1_000,
+        })
     }
 
     /// Network-factory stub. `RaftNameService` tests in this module
@@ -511,25 +629,13 @@ mod tests {
     #[tokio::test]
     async fn lookup_returns_record_with_head_after_advance_ref() {
         let state = fresh_state();
-        let _ = apply_cmd(
-            &state,
-            Command::CreateLedger(CreateLedgerArgs {
-                ledger_id: "test/db".into(),
-                initial_branch: "main".into(),
-                initial_head: cid(0),
-                initial_t: 0,
-                governance: cid(0xAA),
-                created_at_millis: 1_000,
-            }),
-            1,
-        )
-        .await;
+        let _ = apply_cmd(&state, init_cmd("test/db", "main"), 1).await;
         let _ = apply_cmd(
             &state,
             Command::AdvanceRef(AdvanceRefArgs {
                 ledger_id: "test/db".into(),
                 branch: "main".into(),
-                expected_prev: Some(cid(0)),
+                expected_prev: None,
                 new_head: cid(5),
                 t: 7,
                 applied_at_millis: 2_000,
@@ -552,25 +658,13 @@ mod tests {
     #[tokio::test]
     async fn get_ref_returns_head_for_commit_kind() {
         let state = fresh_state();
-        apply_cmd(
-            &state,
-            Command::CreateLedger(CreateLedgerArgs {
-                ledger_id: "test/db".into(),
-                initial_branch: "main".into(),
-                initial_head: cid(0),
-                initial_t: 0,
-                governance: cid(0xAA),
-                created_at_millis: 1_000,
-            }),
-            1,
-        )
-        .await;
+        apply_cmd(&state, init_cmd("test/db", "main"), 1).await;
         apply_cmd(
             &state,
             Command::AdvanceRef(AdvanceRefArgs {
                 ledger_id: "test/db".into(),
                 branch: "main".into(),
-                expected_prev: Some(cid(0)),
+                expected_prev: None,
                 new_head: cid(9),
                 t: 3,
                 applied_at_millis: 2_000,
@@ -605,25 +699,13 @@ mod tests {
     /// the supplied `commit_t`. Returns the shared state.
     async fn ledger_at_commit(commit_head: u8, commit_t: i64) -> SharedState {
         let state = fresh_state();
-        let _ = apply_cmd(
-            &state,
-            Command::CreateLedger(CreateLedgerArgs {
-                ledger_id: "test/db".into(),
-                initial_branch: "main".into(),
-                initial_head: cid(0),
-                initial_t: 0,
-                governance: cid(0xAA),
-                created_at_millis: 1_000,
-            }),
-            1,
-        )
-        .await;
+        let _ = apply_cmd(&state, init_cmd("test/db", "main"), 1).await;
         let _ = apply_cmd(
             &state,
             Command::AdvanceRef(AdvanceRefArgs {
                 ledger_id: "test/db".into(),
                 branch: "main".into(),
-                expected_prev: Some(cid(0)),
+                expected_prev: None,
                 new_head: cid(commit_head),
                 t: commit_t,
                 applied_at_millis: 2_000,
@@ -735,19 +817,7 @@ mod tests {
     #[tokio::test]
     async fn all_records_enumerates_every_branch() {
         let state = fresh_state();
-        apply_cmd(
-            &state,
-            Command::CreateLedger(CreateLedgerArgs {
-                ledger_id: "a/db".into(),
-                initial_branch: "main".into(),
-                initial_head: cid(0),
-                initial_t: 0,
-                governance: cid(0xAA),
-                created_at_millis: 0,
-            }),
-            1,
-        )
-        .await;
+        apply_cmd(&state, init_cmd("a/db", "main"), 1).await;
         apply_cmd(
             &state,
             Command::AdvanceRef(AdvanceRefArgs {

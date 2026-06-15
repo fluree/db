@@ -348,8 +348,11 @@ impl Committer for RaftCommitter {
                 message: format!("ledger not found: {ledger_id}"),
             }),
             SmResponse::Created { .. }
-            | SmResponse::Deleted { .. }
             | SmResponse::AlreadyExists { .. }
+            | SmResponse::Retracted { .. }
+            | SmResponse::AlreadyRetracted { .. }
+            | SmResponse::Purged { .. }
+            | SmResponse::AlreadyPurged { .. }
             | SmResponse::NoOp
             | SmResponse::IndexAdvanced { .. }
             | SmResponse::IndexStale { .. }
@@ -525,8 +528,11 @@ impl Committer for RaftCommitter {
                 message: format!("ledger not found: {ledger_id}"),
             }),
             SmResponse::Created { .. }
-            | SmResponse::Deleted { .. }
             | SmResponse::AlreadyExists { .. }
+            | SmResponse::Retracted { .. }
+            | SmResponse::AlreadyRetracted { .. }
+            | SmResponse::Purged { .. }
+            | SmResponse::AlreadyPurged { .. }
             | SmResponse::NoOp
             | SmResponse::IndexAdvanced { .. }
             | SmResponse::IndexStale { .. }
@@ -700,8 +706,11 @@ impl Committer for RaftCommitter {
                 message: format!("ledger not found: {ledger_id}"),
             }),
             SmResponse::Created { .. }
-            | SmResponse::Deleted { .. }
             | SmResponse::AlreadyExists { .. }
+            | SmResponse::Retracted { .. }
+            | SmResponse::AlreadyRetracted { .. }
+            | SmResponse::Purged { .. }
+            | SmResponse::AlreadyPurged { .. }
             | SmResponse::NoOp
             | SmResponse::IndexAdvanced { .. }
             | SmResponse::IndexStale { .. }
@@ -869,8 +878,11 @@ impl Committer for RaftCommitter {
                 message: format!("ledger not found: {ledger_id}"),
             }),
             SmResponse::Created { .. }
-            | SmResponse::Deleted { .. }
             | SmResponse::AlreadyExists { .. }
+            | SmResponse::Retracted { .. }
+            | SmResponse::AlreadyRetracted { .. }
+            | SmResponse::Purged { .. }
+            | SmResponse::AlreadyPurged { .. }
             | SmResponse::NoOp
             | SmResponse::IndexAdvanced { .. }
             | SmResponse::IndexStale { .. }
@@ -1000,8 +1012,11 @@ impl Committer for RaftCommitter {
                 message: format!("ledger not found: {ledger_id}"),
             }),
             SmResponse::Created { .. }
-            | SmResponse::Deleted { .. }
             | SmResponse::AlreadyExists { .. }
+            | SmResponse::Retracted { .. }
+            | SmResponse::AlreadyRetracted { .. }
+            | SmResponse::Purged { .. }
+            | SmResponse::AlreadyPurged { .. }
             | SmResponse::NoOp
             | SmResponse::IndexAdvanced { .. }
             | SmResponse::IndexStale { .. }

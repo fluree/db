@@ -20,8 +20,9 @@
 use crate::raft::execution_record::ExecutionRecordRef;
 use crate::IdempotencyCacheKey;
 use fluree_db_api::{ContentId, PolicyStats, TrackingTally};
+use fluree_db_core::ledger_id::format_ledger_id;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use thiserror::Error;
 
 /// Postcard-friendly mirror of [`TrackingTally`].
@@ -116,17 +117,16 @@ pub struct RefEntry {
 /// Lifecycle record for one ledger.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LedgerRecord {
-    /// Content id of the governance config blob. Treated opaquely
-    /// here; the config itself lives in the content store.
-    pub governance: ContentId,
     /// Leader-supplied wall-clock at creation, milliseconds since the
     /// Unix epoch. Metadata only.
     pub created_at_millis: u64,
     /// Log index at which the ledger was created.
     pub created_index: u64,
-    /// Branches known on this ledger. Mirrors the ledger's keyspace
-    /// in [`NameServiceState::refs`] so a ledger lookup can enumerate
-    /// branches without scanning the refs map.
+    /// Branches registered on this ledger. Populated by
+    /// [`Command::CreateLedger`] (on init) and the self-healing branch
+    /// add inside [`Command::AdvanceRef`]. Drained by
+    /// [`Command::PurgeLedger`]; an empty `branches` list triggers
+    /// removal of the `LedgerRecord` so the ledger name can be reused.
     pub branches: Vec<String>,
 }
 
@@ -167,6 +167,11 @@ pub struct IdempotencyContext {
 pub struct NameServiceState {
     pub refs: HashMap<RefKey, RefEntry>,
     pub ledgers: HashMap<String, LedgerRecord>,
+    /// Branches marked retracted (soft-dropped) but not yet purged.
+    /// The branch's [`LedgerRecord`] entry and [`RefEntry`] (if born)
+    /// stay in place so the name can't be reused until
+    /// [`Command::PurgeLedger`] runs.
+    pub retracted: HashSet<RefKey>,
     pub idempotency: HashMap<IdempotencyCacheKey, ApplyRecord>,
 }
 
@@ -184,11 +189,19 @@ pub enum Command {
     /// build. Apply enforces strict monotonicity and rejects index
     /// claims for commits the state machine hasn't applied yet.
     AdvanceIndexHead(AdvanceIndexHeadArgs),
-    /// Register a new ledger and set its initial branch head in one
-    /// atomic step.
+    /// Register a branch on a ledger. The branch starts unborn — no
+    /// [`RefEntry`] is created until the first
+    /// [`Command::AdvanceRef`] for the branch.
     CreateLedger(CreateLedgerArgs),
-    /// Remove a ledger and all its refs.
-    DeleteLedger { ledger_id: String },
+    /// Soft-drop a branch: mark it retracted but leave its
+    /// [`LedgerRecord`] and [`RefEntry`] entries in place so the
+    /// alias can't be reused. Idempotent.
+    RetractLedger { ledger_id: String, branch: String },
+    /// Hard-drop a branch: remove its [`RefEntry`], retraction mark,
+    /// and entry from the parent [`LedgerRecord::branches`]. Removes
+    /// the `LedgerRecord` itself when its branches list empties.
+    /// Idempotent.
+    PurgeLedger { ledger_id: String, branch: String },
     /// Signal that the named content blob is no longer referenced
     /// and may be released by the content store. The state machine
     /// doesn't mutate state on this — the entry's role is to let
@@ -245,13 +258,16 @@ pub struct AdvanceIndexHeadArgs {
 }
 
 /// Payload for [`Command::CreateLedger`].
+///
+/// `ledger_id` is the bare ledger name (no branch suffix); `branch`
+/// names the branch to register on that ledger. The trait surface
+/// (`LedgerLifecycle::init`) takes the full `name:branch` form; the
+/// adapter at `RaftNameService::init` splits it before building this
+/// command.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateLedgerArgs {
     pub ledger_id: String,
-    pub initial_branch: String,
-    pub initial_head: ContentId,
-    pub initial_t: i64,
-    pub governance: ContentId,
+    pub branch: String,
     pub created_at_millis: u64,
 }
 
@@ -313,15 +329,27 @@ pub enum Response {
         /// The proposed (rejected) index t.
         proposed_t: i64,
     },
-    /// [`Command::CreateLedger`] succeeded.
+    /// [`Command::CreateLedger`] succeeded. `ledger_id` is the full
+    /// `name:branch` form.
     Created { ledger_id: String },
-    /// [`Command::DeleteLedger`] succeeded.
-    Deleted { ledger_id: String },
-    /// [`Command::CreateLedger`] failed because the ledger already
-    /// exists.
+    /// [`Command::CreateLedger`] failed because the branch is already
+    /// registered (whether retracted or not).
     AlreadyExists { ledger_id: String },
-    /// [`Command::AdvanceRef`] or [`Command::DeleteLedger`] referenced
-    /// a ledger that doesn't exist in the state machine.
+    /// [`Command::RetractLedger`] flipped a branch from active to
+    /// retracted.
+    Retracted { ledger_id: String },
+    /// [`Command::RetractLedger`] was a no-op — the branch was
+    /// already retracted, or didn't exist. Idempotent.
+    AlreadyRetracted { ledger_id: String },
+    /// [`Command::PurgeLedger`] removed a registered branch (any
+    /// retraction state).
+    Purged { ledger_id: String },
+    /// [`Command::PurgeLedger`] was a no-op — the branch wasn't
+    /// registered. Idempotent at the trait layer; carried as a
+    /// distinct variant so event emission can skip it.
+    AlreadyPurged { ledger_id: String },
+    /// [`Command::AdvanceRef`] referenced a ledger that doesn't
+    /// exist in the state machine.
     LedgerNotFound { ledger_id: String },
     /// [`Command::AdvanceRef`] carried an idempotency key already
     /// recorded for a different body. A client bug; surfaces rather
@@ -366,7 +394,8 @@ pub fn apply(state: &mut NameServiceState, command: Command, log_index: u64) -> 
         Command::AdvanceRef(args) => advance_ref(state, log_index, args),
         Command::AdvanceIndexHead(args) => advance_index_head(state, args),
         Command::CreateLedger(args) => create_ledger(state, log_index, args),
-        Command::DeleteLedger { ledger_id } => delete_ledger(state, ledger_id),
+        Command::RetractLedger { ledger_id, branch } => retract_ledger(state, ledger_id, branch),
+        Command::PurgeLedger { ledger_id, branch } => purge_ledger(state, ledger_id, branch),
         Command::ReleaseContent { id: _ } => Response::NoOp,
     }
 }
@@ -472,49 +501,76 @@ fn create_ledger(
 ) -> Response {
     let CreateLedgerArgs {
         ledger_id,
-        initial_branch,
-        initial_head,
-        initial_t,
-        governance,
+        branch,
         created_at_millis,
     } = args;
 
-    if state.ledgers.contains_key(&ledger_id) {
-        return Response::AlreadyExists { ledger_id };
+    let ledger = state.ledgers.entry(ledger_id.clone()).or_insert_with(|| LedgerRecord {
+        created_at_millis,
+        created_index: log_index,
+        branches: Vec::new(),
+    });
+    if ledger.branches.contains(&branch) {
+        return Response::AlreadyExists {
+            ledger_id: format_ledger_id(&ledger_id, &branch),
+        };
     }
-
-    state.ledgers.insert(
-        ledger_id.clone(),
-        LedgerRecord {
-            governance,
-            created_at_millis,
-            created_index: log_index,
-            branches: vec![initial_branch.clone()],
-        },
-    );
-
-    state.refs.insert(
-        RefKey::new(&ledger_id, &initial_branch),
-        RefEntry {
-            head: initial_head,
-            t: initial_t,
-            last_advanced_at_millis: created_at_millis,
-            last_advanced_index: log_index,
-            // No index built yet; the first `AdvanceIndexHead` for
-            // this branch will populate this.
-            index: None,
-        },
-    );
-
-    Response::Created { ledger_id }
+    ledger.branches.push(branch.clone());
+    Response::Created {
+        ledger_id: format_ledger_id(&ledger_id, &branch),
+    }
 }
 
-fn delete_ledger(state: &mut NameServiceState, ledger_id: String) -> Response {
-    if state.ledgers.remove(&ledger_id).is_none() {
-        return Response::LedgerNotFound { ledger_id };
+fn retract_ledger(
+    state: &mut NameServiceState,
+    ledger_id: String,
+    branch: String,
+) -> Response {
+    let key = RefKey::new(&ledger_id, &branch);
+    let full = format_ledger_id(&ledger_id, &branch);
+    let is_known = state
+        .ledgers
+        .get(&ledger_id)
+        .is_some_and(|l| l.branches.contains(&branch));
+    if !is_known {
+        // Missing ledger or branch — idempotent no-op at the trait
+        // boundary. Reuse `AlreadyRetracted` so callers (and event
+        // emission) treat the result uniformly.
+        return Response::AlreadyRetracted { ledger_id: full };
     }
-    state.refs.retain(|key, _| key.ledger_id != ledger_id);
-    Response::Deleted { ledger_id }
+    if state.retracted.insert(key) {
+        Response::Retracted { ledger_id: full }
+    } else {
+        Response::AlreadyRetracted { ledger_id: full }
+    }
+}
+
+fn purge_ledger(
+    state: &mut NameServiceState,
+    ledger_id: String,
+    branch: String,
+) -> Response {
+    let key = RefKey::new(&ledger_id, &branch);
+    let full = format_ledger_id(&ledger_id, &branch);
+    let removed_ref = state.refs.remove(&key).is_some();
+    let removed_retraction = state.retracted.remove(&key);
+    let removed_branch = match state.ledgers.get_mut(&ledger_id) {
+        Some(ledger) => {
+            let before = ledger.branches.len();
+            ledger.branches.retain(|b| b != &branch);
+            let removed = ledger.branches.len() < before;
+            if ledger.branches.is_empty() {
+                state.ledgers.remove(&ledger_id);
+            }
+            removed
+        }
+        None => false,
+    };
+    if removed_ref || removed_retraction || removed_branch {
+        Response::Purged { ledger_id: full }
+    } else {
+        Response::AlreadyPurged { ledger_id: full }
+    }
 }
 
 fn advance_index_head(
@@ -593,14 +649,28 @@ mod tests {
     }
 
     fn create_ledger(ledger_id: &str) -> Command {
+        create_branch_cmd(ledger_id, "main")
+    }
+
+    fn create_branch_cmd(ledger_id: &str, branch: &str) -> Command {
         Command::CreateLedger(CreateLedgerArgs {
             ledger_id: ledger_id.into(),
-            initial_branch: "main".into(),
-            initial_head: cid(0),
-            initial_t: 0,
-            governance: cid(0xAA),
+            branch: branch.into(),
             created_at_millis: 1_000,
         })
+    }
+
+    /// Init the ledger and seed `main` at `t=0, head=cid(0)`. Most
+    /// pre-slim tests assumed init produced this initial ref;
+    /// keeping the helper preserves their semantics with one extra
+    /// `apply` call.
+    fn create_ledger_with_genesis(state: &mut NameServiceState, ledger_id: &str) {
+        apply(state, create_ledger(ledger_id), 1);
+        apply(
+            state,
+            advance(ledger_id, "main", None, cid(0), 0, None),
+            1,
+        );
     }
 
     fn advance(
@@ -652,43 +722,82 @@ mod tests {
     }
 
     #[test]
-    fn create_ledger_registers_record_and_initial_ref() {
+    fn create_ledger_registers_branch_unborn() {
         let mut state = NameServiceState::new();
         let resp = apply(&mut state, create_ledger("test/db"), 1);
         assert_eq!(
             resp,
             Response::Created {
-                ledger_id: "test/db".into()
+                ledger_id: "test/db:main".into()
             }
         );
+        // LedgerRecord is created with the branch registered, but no
+        // RefEntry yet — the branch is unborn until the first
+        // AdvanceRef populates it.
         assert_eq!(state.ledgers.len(), 1);
-        assert_eq!(state.refs.len(), 1);
-        let ref_entry = state
-            .refs
-            .get(&RefKey::new("test/db", "main"))
-            .expect("initial ref present");
-        assert_eq!(ref_entry.t, 0);
-        assert_eq!(ref_entry.last_advanced_index, 1);
+        assert_eq!(state.refs.len(), 0);
+        let ledger = state.ledgers.get("test/db").expect("ledger record present");
+        assert_eq!(ledger.branches, vec!["main".to_string()]);
+        assert_eq!(ledger.created_index, 1);
     }
 
     #[test]
-    fn create_ledger_idempotent_on_duplicate() {
+    fn create_ledger_registers_multiple_branches_on_same_ledger() {
+        let mut state = NameServiceState::new();
+        apply(&mut state, create_branch_cmd("test/db", "main"), 1);
+        let resp = apply(&mut state, create_branch_cmd("test/db", "feature"), 2);
+        assert_eq!(
+            resp,
+            Response::Created {
+                ledger_id: "test/db:feature".into()
+            }
+        );
+        let ledger = state.ledgers.get("test/db").unwrap();
+        assert_eq!(ledger.branches, vec!["main".to_string(), "feature".to_string()]);
+    }
+
+    #[test]
+    fn create_ledger_returns_already_exists_on_duplicate_branch() {
         let mut state = NameServiceState::new();
         apply(&mut state, create_ledger("test/db"), 1);
         let resp = apply(&mut state, create_ledger("test/db"), 2);
         assert_eq!(
             resp,
             Response::AlreadyExists {
-                ledger_id: "test/db".into()
+                ledger_id: "test/db:main".into()
             }
         );
         assert_eq!(state.ledgers.len(), 1);
     }
 
     #[test]
-    fn advance_ref_succeeds_when_expected_prev_matches() {
+    fn create_ledger_returns_already_exists_even_when_branch_is_retracted() {
         let mut state = NameServiceState::new();
         apply(&mut state, create_ledger("test/db"), 1);
+        apply(
+            &mut state,
+            Command::RetractLedger {
+                ledger_id: "test/db".into(),
+                branch: "main".into(),
+            },
+            2,
+        );
+        let resp = apply(&mut state, create_ledger("test/db"), 3);
+        // Trait contract: retracted records hold the alias until
+        // purged. Re-init has to fail so the caller is forced
+        // through purge first.
+        assert_eq!(
+            resp,
+            Response::AlreadyExists {
+                ledger_id: "test/db:main".into()
+            }
+        );
+    }
+
+    #[test]
+    fn advance_ref_succeeds_when_expected_prev_matches() {
+        let mut state = NameServiceState::new();
+        create_ledger_with_genesis(&mut state, "test/db");
         let resp = apply(
             &mut state,
             advance("test/db", "main", Some(cid(0)), cid(1), 1, None),
@@ -712,7 +821,7 @@ mod tests {
     #[test]
     fn advance_ref_returns_conflict_on_cas_mismatch() {
         let mut state = NameServiceState::new();
-        apply(&mut state, create_ledger("test/db"), 1);
+        create_ledger_with_genesis(&mut state, "test/db");
         let resp = apply(
             &mut state,
             advance("test/db", "main", Some(cid(99)), cid(1), 1, None),
@@ -772,7 +881,7 @@ mod tests {
     #[test]
     fn advance_ref_caches_idempotency_outcome() {
         let mut state = NameServiceState::new();
-        apply(&mut state, create_ledger("test/db"), 1);
+        create_ledger_with_genesis(&mut state, "test/db");
 
         let body_hash = [7u8; 32];
         let resp1 = apply(
@@ -831,7 +940,7 @@ mod tests {
     #[test]
     fn advance_ref_rejects_body_hash_collision_on_idempotent_retry() {
         let mut state = NameServiceState::new();
-        apply(&mut state, create_ledger("test/db"), 1);
+        create_ledger_with_genesis(&mut state, "test/db");
 
         apply(
             &mut state,
@@ -862,47 +971,165 @@ mod tests {
     }
 
     #[test]
-    fn delete_ledger_removes_record_and_all_refs() {
+    fn retract_flips_active_branch_to_retracted() {
+        let mut state = NameServiceState::new();
+        apply(&mut state, create_ledger("test/db"), 1);
+        let resp = apply(
+            &mut state,
+            Command::RetractLedger {
+                ledger_id: "test/db".into(),
+                branch: "main".into(),
+            },
+            2,
+        );
+        assert_eq!(
+            resp,
+            Response::Retracted {
+                ledger_id: "test/db:main".into()
+            }
+        );
+        assert!(state.retracted.contains(&RefKey::new("test/db", "main")));
+    }
+
+    #[test]
+    fn retract_already_retracted_is_idempotent_noop() {
         let mut state = NameServiceState::new();
         apply(&mut state, create_ledger("test/db"), 1);
         apply(
             &mut state,
-            advance("test/db", "feature", None, cid(2), 5, None),
+            Command::RetractLedger {
+                ledger_id: "test/db".into(),
+                branch: "main".into(),
+            },
             2,
         );
-        assert_eq!(state.refs.len(), 2);
-
         let resp = apply(
             &mut state,
-            Command::DeleteLedger {
+            Command::RetractLedger {
                 ledger_id: "test/db".into(),
+                branch: "main".into(),
             },
             3,
         );
         assert_eq!(
             resp,
-            Response::Deleted {
-                ledger_id: "test/db".into()
+            Response::AlreadyRetracted {
+                ledger_id: "test/db:main".into()
             }
         );
-        assert!(state.ledgers.is_empty());
-        assert!(state.refs.is_empty());
     }
 
     #[test]
-    fn delete_ledger_returns_not_found_for_missing() {
+    fn retract_unknown_branch_is_idempotent_noop() {
         let mut state = NameServiceState::new();
+        // Even with no ledger record we report AlreadyRetracted so
+        // the trait surface stays Ok.
         let resp = apply(
             &mut state,
-            Command::DeleteLedger {
+            Command::RetractLedger {
                 ledger_id: "missing".into(),
+                branch: "main".into(),
             },
             1,
         );
         assert_eq!(
             resp,
-            Response::LedgerNotFound {
-                ledger_id: "missing".into()
+            Response::AlreadyRetracted {
+                ledger_id: "missing:main".into()
+            }
+        );
+    }
+
+    #[test]
+    fn purge_removes_branch_and_ref_and_retraction_mark() {
+        let mut state = NameServiceState::new();
+        create_ledger_with_genesis(&mut state, "test/db");
+        apply(
+            &mut state,
+            Command::RetractLedger {
+                ledger_id: "test/db".into(),
+                branch: "main".into(),
+            },
+            3,
+        );
+        assert!(state.refs.contains_key(&RefKey::new("test/db", "main")));
+        assert!(state.retracted.contains(&RefKey::new("test/db", "main")));
+
+        let resp = apply(
+            &mut state,
+            Command::PurgeLedger {
+                ledger_id: "test/db".into(),
+                branch: "main".into(),
+            },
+            4,
+        );
+        assert_eq!(
+            resp,
+            Response::Purged {
+                ledger_id: "test/db:main".into()
+            }
+        );
+        assert!(!state.refs.contains_key(&RefKey::new("test/db", "main")));
+        assert!(!state.retracted.contains(&RefKey::new("test/db", "main")));
+        // Last branch on the ledger — the LedgerRecord drops too so
+        // the name can be reused.
+        assert!(!state.ledgers.contains_key("test/db"));
+    }
+
+    #[test]
+    fn purge_keeps_ledger_record_when_other_branches_remain() {
+        let mut state = NameServiceState::new();
+        apply(&mut state, create_branch_cmd("test/db", "main"), 1);
+        apply(&mut state, create_branch_cmd("test/db", "feature"), 2);
+        apply(
+            &mut state,
+            Command::PurgeLedger {
+                ledger_id: "test/db".into(),
+                branch: "feature".into(),
+            },
+            3,
+        );
+        let ledger = state.ledgers.get("test/db").expect("record still present");
+        assert_eq!(ledger.branches, vec!["main".to_string()]);
+    }
+
+    #[test]
+    fn purge_missing_branch_is_idempotent() {
+        let mut state = NameServiceState::new();
+        let resp = apply(
+            &mut state,
+            Command::PurgeLedger {
+                ledger_id: "missing".into(),
+                branch: "main".into(),
+            },
+            1,
+        );
+        assert_eq!(
+            resp,
+            Response::AlreadyPurged {
+                ledger_id: "missing:main".into()
+            }
+        );
+    }
+
+    #[test]
+    fn purge_clears_the_alias_so_init_can_reuse_it() {
+        let mut state = NameServiceState::new();
+        apply(&mut state, create_ledger("test/db"), 1);
+        apply(
+            &mut state,
+            Command::PurgeLedger {
+                ledger_id: "test/db".into(),
+                branch: "main".into(),
+            },
+            2,
+        );
+        // After purge, init succeeds again — the alias was released.
+        let resp = apply(&mut state, create_ledger("test/db"), 3);
+        assert_eq!(
+            resp,
+            Response::Created {
+                ledger_id: "test/db:main".into()
             }
         );
     }
@@ -919,7 +1146,7 @@ mod tests {
     #[test]
     fn snapshot_round_trip_preserves_state() {
         let mut state = NameServiceState::new();
-        apply(&mut state, create_ledger("test/db"), 1);
+        create_ledger_with_genesis(&mut state, "test/db");
         apply(
             &mut state,
             advance("test/db", "main", Some(cid(0)), cid(1), 1, None),
@@ -937,6 +1164,14 @@ mod tests {
             ),
             3,
         );
+        apply(
+            &mut state,
+            Command::RetractLedger {
+                ledger_id: "test/db".into(),
+                branch: "feature".into(),
+            },
+            4,
+        );
 
         let bytes = state.to_snapshot().unwrap();
         let restored = NameServiceState::from_snapshot(&bytes).unwrap();
@@ -946,7 +1181,7 @@ mod tests {
     #[test]
     fn apply_then_snapshot_then_restore_then_apply_continues_correctly() {
         let mut state = NameServiceState::new();
-        apply(&mut state, create_ledger("test/db"), 1);
+        create_ledger_with_genesis(&mut state, "test/db");
 
         let bytes = state.to_snapshot().unwrap();
         let mut restored = NameServiceState::from_snapshot(&bytes).unwrap();
@@ -971,7 +1206,7 @@ mod tests {
     #[test]
     fn release_propagates_to_applied_response() {
         let mut state = NameServiceState::new();
-        apply(&mut state, create_ledger("test/db"), 1);
+        create_ledger_with_genesis(&mut state, "test/db");
 
         let releases = vec![
             ExecutionRecordRef::new(
@@ -1013,7 +1248,7 @@ mod tests {
     #[test]
     fn release_propagates_on_idempotency_hit() {
         let mut state = NameServiceState::new();
-        apply(&mut state, create_ledger("test/db"), 1);
+        create_ledger_with_genesis(&mut state, "test/db");
 
         let body_hash = [7u8; 32];
         // First apply seeds the idempotency cache.
@@ -1067,7 +1302,7 @@ mod tests {
     #[test]
     fn release_is_dropped_on_cas_conflict() {
         let mut state = NameServiceState::new();
-        apply(&mut state, create_ledger("test/db"), 1);
+        create_ledger_with_genesis(&mut state, "test/db");
 
         let releases = vec![ExecutionRecordRef::new(
             IdempotencyCacheKey::new("test/db", IdempotencyKey::new("k_old")),
@@ -1104,7 +1339,7 @@ mod tests {
     /// the index tests below.
     fn ledger_with_commit_at_t10() -> NameServiceState {
         let mut state = NameServiceState::new();
-        apply(&mut state, create_ledger("test/db"), 1);
+        create_ledger_with_genesis(&mut state, "test/db");
         apply(
             &mut state,
             advance("test/db", "main", Some(cid(0)), cid(1), 10, None),

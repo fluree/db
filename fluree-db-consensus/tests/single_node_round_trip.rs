@@ -31,7 +31,8 @@ use fluree_db_consensus::raft::state_machine_adapter::StateMachineAdapter;
 use fluree_db_consensus::raft::storage::memory::MemoryRaftStorage;
 use fluree_db_consensus::raft::{ClusterNode, NodeId, TypeConfig};
 use fluree_db_nameservice::{
-    IndexPublisher, LedgerEventBus, NameServiceEvent, NameServiceLookup, SubscriptionScope,
+    IndexPublisher, LedgerEventBus, LedgerLifecycle, NameServiceError, NameServiceEvent,
+    NameServiceLookup, SubscriptionScope,
 };
 
 struct StubFactory;
@@ -110,15 +111,12 @@ async fn single_node_create_ledger_round_trip() {
 
     let cmd = SmCommand::CreateLedger(CreateLedgerArgs {
         ledger_id: "test/db".into(),
-        initial_branch: "main".into(),
-        initial_head: cid(0),
-        initial_t: 0,
-        governance: cid(0xAA),
+        branch: "main".into(),
         created_at_millis: 1_000,
     });
     let resp = raft.client_write(cmd).await.unwrap();
     match resp.data {
-        Response::Created { ref ledger_id } => assert_eq!(ledger_id, "test/db"),
+        Response::Created { ref ledger_id } => assert_eq!(ledger_id, "test/db:main"),
         other => panic!("expected Created, got {other:?}"),
     }
 
@@ -156,10 +154,7 @@ async fn single_node_raft_index_publisher_round_trip() {
     // something to attach to.
     raft.client_write(SmCommand::CreateLedger(CreateLedgerArgs {
         ledger_id: "test/db".into(),
-        initial_branch: "main".into(),
-        initial_head: cid(0),
-        initial_t: 0,
-        governance: cid(0xAA),
+        branch: "main".into(),
         created_at_millis: 1_000,
     }))
     .await
@@ -168,7 +163,7 @@ async fn single_node_raft_index_publisher_round_trip() {
     raft.client_write(SmCommand::AdvanceRef(AdvanceRefArgs {
         ledger_id: "test/db".into(),
         branch: "main".into(),
-        expected_prev: Some(cid(0)),
+        expected_prev: None,
         new_head: cid(7),
         t: 10,
         applied_at_millis: 2_000,
@@ -263,10 +258,7 @@ async fn single_node_apply_emits_commit_event_on_bus() {
 
     raft.client_write(SmCommand::CreateLedger(CreateLedgerArgs {
         ledger_id: "test/db".into(),
-        initial_branch: "main".into(),
-        initial_head: cid(0),
-        initial_t: 0,
-        governance: cid(0xAA),
+        branch: "main".into(),
         created_at_millis: 1_000,
     }))
     .await
@@ -281,7 +273,7 @@ async fn single_node_apply_emits_commit_event_on_bus() {
     raft.client_write(SmCommand::AdvanceRef(AdvanceRefArgs {
         ledger_id: "test/db".into(),
         branch: "main".into(),
-        expected_prev: Some(cid(0)),
+        expected_prev: None,
         new_head: cid(7),
         t: 10,
         applied_at_millis: 2_000,
@@ -308,6 +300,102 @@ async fn single_node_apply_emits_commit_event_on_bus() {
         }
         other => panic!("expected LedgerCommitPublished, got {other:?}"),
     }
+
+    raft.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn single_node_ledger_lifecycle_round_trip() {
+    // init → retract → purge → init (alias reusable) — driven
+    // entirely through the LedgerLifecycle trait surface on
+    // RaftNameService, so the test exercises the same path
+    // production HTTP routes will.
+
+    let storage = Arc::new(MemoryRaftStorage::new());
+    let bus = Arc::new(LedgerEventBus::new(16));
+    let log = LogAdapter::new(Arc::clone(&storage));
+    let sm =
+        StateMachineAdapter::new(Arc::clone(&storage)).with_event_bus(Arc::clone(&bus));
+    let shared_state = sm.shared_state();
+
+    let config = Config {
+        cluster_name: "single-node-lifecycle".into(),
+        election_timeout_min: 150,
+        election_timeout_max: 300,
+        heartbeat_interval: 50,
+        ..Config::default()
+    };
+    let config = Arc::new(config.validate().unwrap());
+    let raft = Arc::new(Raft::new(1, config, StubFactory, log, sm).await.unwrap());
+
+    let mut members = BTreeMap::new();
+    members.insert(1u64, ClusterNode::default());
+    raft.initialize(members).await.unwrap();
+
+    raft.wait(Some(Duration::from_secs(5)))
+        .state(ServerState::Leader, "leader after self-election")
+        .await
+        .unwrap();
+
+    let ns = RaftNameService::new(shared_state.clone(), Arc::clone(&raft));
+    let mut sub = bus.subscribe(SubscriptionScope::All);
+
+    // init registers the branch unborn.
+    ns.init("test/db:main").await.expect("init ok");
+    let record = ns.lookup("test/db:main").await.unwrap().expect("record");
+    assert_eq!(record.ledger_id, "test/db:main");
+    assert_eq!(record.commit_head_id, None);
+    assert!(!record.retracted);
+
+    // Duplicate init returns the typed LedgerAlreadyExists error.
+    match ns.init("test/db:main").await {
+        Err(NameServiceError::LedgerAlreadyExists(id)) => {
+            assert_eq!(id, "test/db:main");
+        }
+        other => panic!("expected LedgerAlreadyExists, got {other:?}"),
+    }
+
+    // retract flips the record to retracted; lookup keeps returning
+    // it (with the flag) until purge clears it.
+    ns.retract("test/db:main").await.expect("retract ok");
+    let record = ns.lookup("test/db:main").await.unwrap().expect("record");
+    assert!(record.retracted);
+
+    // The first event on the bus is the retract.
+    match sub.receiver.try_recv().expect("event present") {
+        NameServiceEvent::LedgerRetracted { ledger_id } => {
+            assert_eq!(ledger_id, "test/db:main");
+        }
+        other => panic!("expected LedgerRetracted, got {other:?}"),
+    }
+
+    // Idempotent retract is Ok and emits nothing.
+    ns.retract("test/db:main").await.expect("retract idempotent");
+    assert!(sub.receiver.try_recv().is_err());
+
+    // Init still refuses while the record is retracted.
+    match ns.init("test/db:main").await {
+        Err(NameServiceError::LedgerAlreadyExists(_)) => {}
+        other => panic!("expected LedgerAlreadyExists, got {other:?}"),
+    }
+
+    // purge clears the alias. Emits LedgerRetracted again since the
+    // branch transitioned from "present" to "absent".
+    ns.purge("test/db:main").await.expect("purge ok");
+    assert!(ns.lookup("test/db:main").await.unwrap().is_none());
+    match sub.receiver.try_recv().expect("event present") {
+        NameServiceEvent::LedgerRetracted { ledger_id } => {
+            assert_eq!(ledger_id, "test/db:main");
+        }
+        other => panic!("expected LedgerRetracted, got {other:?}"),
+    }
+
+    // Idempotent purge of an already-purged branch is Ok and silent.
+    ns.purge("test/db:main").await.expect("purge idempotent");
+    assert!(sub.receiver.try_recv().is_err());
+
+    // The alias is reusable now.
+    ns.init("test/db:main").await.expect("init after purge");
 
     raft.shutdown().await.unwrap();
 }
