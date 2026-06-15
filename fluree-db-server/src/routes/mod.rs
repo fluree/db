@@ -6,6 +6,7 @@ mod commits;
 mod context;
 mod events;
 mod export;
+mod import;
 #[cfg(feature = "iceberg")]
 mod iceberg;
 mod ledger;
@@ -49,7 +50,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/revert", post(ledger::revert))
         // RDF export bypasses per-flake policy filtering today, so it lives in
         // the admin-protected bracket alongside other root-level operations.
-        .route("/export/*ledger", post(export::export_ledger_tail));
+        .route("/export/*ledger", post(export::export_ledger_tail))
+        // Wholesale .flpack restore: creates a new ledger from a trusted
+        // archive. Writes prebuilt index artifacts, so admin-gated.
+        .route("/import/*ledger", post(import::import_ledger_tail));
 
     #[cfg(feature = "iceberg")]
     let v1_admin_protected_routes =
