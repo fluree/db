@@ -800,8 +800,17 @@ fn aggregate_input_var<E: IriEncoder>(
             let var = crate::lower::expr::resolve_property_accessor(ctx, target, key, aux)?;
             Ok(Some(var))
         }
+        // A list-literal argument (structured `collect([a, b])`) lowers to a
+        // pre-aggregation Bind that builds the per-row list, then the aggregate
+        // gathers those list values into a list of tuples.
+        Expr::List(..) => {
+            let expr = crate::lower::expr::lower_expr(ctx, &call.args[0], aux)?;
+            let var = ctx.fresh_synth();
+            aux.push(Pattern::Bind { var, expr });
+            Ok(Some(var))
+        }
         _ => Err(LowerError::unsupported(format!(
-            "{}() argument must be a bare variable or property accessor in v1 — other expressions are deferred",
+            "{}() argument must be a bare variable, property accessor, or list literal in v1 — other expressions are deferred",
             call.name
         ))),
     }

@@ -155,6 +155,9 @@ ORDER BY / SKIP / LIMIT
   `tail`, `reverse` (and `size`/`reverse` over a string). Usable in the
   final `RETURN` wrapping a collect, e.g. `RETURN size(collect(f.name))`;
   `collect()` nested in arithmetic is rejected.
+- List literals `[a, b, …]` and structured `collect([a, b])` — collect
+  per-row tuples into a list of lists (e.g.
+  `RETURN collect([n.id, n.name])`).
 - Aggregates: `count(*)`, `count(x)`, `count(DISTINCT x)`,
   `sum(x)`, `avg(x)`, `min(x)`, `max(x)`. Arguments may be a bare
   variable (`count(n)`) or a property accessor (`avg(n.age)`);

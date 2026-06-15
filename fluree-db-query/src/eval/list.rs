@@ -131,6 +131,15 @@ pub fn eval_list_fn_to_binding<R: RowAccess>(
     ctx: Option<&ExecutionContext<'_>>,
 ) -> Result<Option<Binding>> {
     match func {
+        Function::MakeList => {
+            // Build a list from each argument's binding value (preserving order
+            // and nulls, so structured `collect([a, b])` keeps tuple shape).
+            let mut items = Vec::with_capacity(args.len());
+            for a in args {
+                items.push(a.try_eval_to_binding(row, ctx)?);
+            }
+            Ok(Some(Binding::List(items)))
+        }
         Function::Tail => {
             let arg = arity1(args, "tail")?;
             match resolve_arg_binding(arg, row, ctx)? {

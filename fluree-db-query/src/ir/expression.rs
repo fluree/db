@@ -596,6 +596,8 @@ pub enum Function {
     Tail,
     /// `reverse(list|string)` — reversed list or string.
     Reverse,
+    /// List constructor `[a, b, …]` — builds a list value from its arguments.
+    MakeList,
 
     // =========================================================================
     // Custom/unknown function

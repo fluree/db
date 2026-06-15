@@ -2549,3 +2549,74 @@ async fn cypher_size_of_string() {
     .await;
     assert_eq!(v, json!(5), "len(\"Alice\") = 5: {v}");
 }
+
+#[tokio::test]
+async fn cypher_list_literal_expression() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = seed_nodes_with_ids(&fluree, "it/cypher:list-literal").await;
+    let db = graphdb_from_ledger(&l);
+
+    // A list literal mixing a node id and name.
+    let pair = fluree
+        .query_cypher(&db, r#"MATCH (n:Person {id:1}) RETURN [n.id, n.name] AS pair"#)
+        .await
+        .expect("list literal")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    assert_eq!(pair[0][0], json!([1, "Alice"]), "mixed-type list literal: {pair}");
+
+    // A bare scalar list literal.
+    let nums = fluree
+        .query_cypher(&db, r#"MATCH (n:Person {id:1}) RETURN [1, 2, 3] AS nums"#)
+        .await
+        .expect("scalar list literal")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    assert_eq!(nums[0][0], json!([1, 2, 3]), "scalar list literal: {nums}");
+}
+
+#[tokio::test]
+async fn cypher_structured_collect_of_tuples() {
+    // IC1's collect tier: collecting per-row tuples into a list of lists.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = seed_nodes_with_ids(&fluree, "it/cypher:struct-collect").await; // ids 1,2,3
+    let db = graphdb_from_ledger(&l);
+
+    let pairs = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (n:Person) RETURN collect([n.id, n.name]) AS pairs"#,
+        )
+        .await
+        .expect("structured collect")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    assert_eq!(
+        pairs[0][0],
+        json!([[1, "Alice"], [2, "Bob"], [3, "Carol"]]),
+        "list of [id, name] tuples: {pairs}"
+    );
+}
+
+#[tokio::test]
+async fn cypher_size_of_structured_collect() {
+    // List functions compose over a structured collect.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = seed_nodes_with_ids(&fluree, "it/cypher:size-struct-collect").await;
+    let db = graphdb_from_ledger(&l);
+
+    let n = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (n:Person) RETURN size(collect([n.id, n.name])) AS v"#,
+        )
+        .await
+        .expect("size of structured collect")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    assert_eq!(n[0][0], json!(3), "three tuples collected: {n}");
+}

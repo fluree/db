@@ -186,8 +186,9 @@ impl Function {
             Function::Head => list::eval_head(args, row, ctx),
             Function::Last => list::eval_last(args, row, ctx),
             Function::Reverse => list::eval_reverse_string(args, row, ctx),
-            // `tail` is list-returning only; in a scalar context it has no value.
-            Function::Tail => Ok(None),
+            // List-returning only; no scalar value (handled by the
+            // binding-producing path in `try_eval_to_binding`).
+            Function::Tail | Function::MakeList => Ok(None),
 
             // Unknown function
             Function::Custom(name) => Err(QueryError::InvalidFilter(format!(

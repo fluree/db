@@ -122,9 +122,15 @@ pub fn lower_expr<E: IriEncoder>(
                 negated: false,
             })
         }
-        Expr::List(_, _) => Err(LowerError::unsupported(
-            "list literals in expressions are deferred (no list-value type yet)",
-        )),
+        Expr::List(items, _) => {
+            // A list literal `[a, b, …]` builds a `Binding::List` value via the
+            // `MakeList` constructor. Enables structured `collect([a, b])`.
+            let args = items
+                .iter()
+                .map(|it| lower_expr(ctx, it, aux))
+                .collect::<Result<Vec<_>>>()?;
+            Ok(Expression::call(Function::MakeList, args))
+        }
         Expr::Call(call) => {
             let name = call.name.to_ascii_lowercase();
             let args: std::result::Result<Vec<_>, _> =
