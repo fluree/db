@@ -655,7 +655,10 @@ fn extract_aggregates<E: IriEncoder>(
             extract_aggregates(ctx, l, patterns, aggregates, list_outputs, counter)?;
             extract_aggregates(ctx, r, patterns, aggregates, list_outputs, counter)
         }
-        Expr::UnaryOp(_, x, _) | Expr::IsNull(x, _) | Expr::IsNotNull(x, _) => {
+        Expr::UnaryOp(_, x, _)
+        | Expr::IsNull(x, _)
+        | Expr::IsNotNull(x, _)
+        | Expr::Prop(x, _, _) => {
             extract_aggregates(ctx, x, patterns, aggregates, list_outputs, counter)
         }
         Expr::List(items, _) => {
@@ -664,8 +667,8 @@ fn extract_aggregates<E: IriEncoder>(
             }
             Ok(())
         }
-        Expr::Prop(_, _, _) | Expr::Case(_) | Expr::Exists(_, _) => Err(LowerError::unsupported(
-            "aggregates inside this expression position are not supported in v1",
+        Expr::Case(_) | Expr::Exists(_, _) => Err(LowerError::unsupported(
+            "aggregates inside CASE / EXISTS are not supported in v1",
         )),
         Expr::Var(_) | Expr::Lit(_) | Expr::Param(_) => Ok(()),
     }

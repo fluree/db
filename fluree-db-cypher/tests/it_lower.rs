@@ -140,11 +140,19 @@ fn bounded_variable_length_lowers_to_union_of_chains() {
         })
         .expect("expected a Union of chains");
     assert_eq!(union.len(), 3, "one chain per length 1..3");
-    // The k-hop chain has k triples (k-1 fresh intermediates).
-    let lens: Vec<usize> = union.iter().map(Vec::len).collect();
-    assert!(
-        lens.contains(&1) && lens.contains(&2) && lens.contains(&3),
-        "{lens:?}"
+    // The 1-hop chain is a single triple; each k≥2 chain has k triples plus a
+    // node-distinctness Filter (relationship-uniqueness): lengths 1, 3, 4.
+    let mut lens: Vec<usize> = union.iter().map(Vec::len).collect();
+    lens.sort_unstable();
+    assert_eq!(lens, vec![1, 3, 4], "{lens:?}");
+    // Every k≥2 chain ends with a Filter.
+    let filters = union
+        .iter()
+        .filter(|c| c.iter().any(|p| matches!(p, Pattern::Filter(_))))
+        .count();
+    assert_eq!(
+        filters, 2,
+        "the 2- and 3-hop chains carry a distinctness filter"
     );
 }
 

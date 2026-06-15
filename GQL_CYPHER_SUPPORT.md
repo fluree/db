@@ -151,7 +151,7 @@ this plan.
 | Relationship variable `-[r]->` binds | The annotation SID. Only matches relationships that have a reifier bundle — see "Relationship lowering rule" below. |
 | Parallel relationships | Two annotation SIDs attached to the same `(s, p, o)` edge key. Already supported (multimap forward attachment index). |
 | Undirected `-[r]-` | **Landed** — forward∪reverse `Union` (reverse via the `Opst` index). |
-| Variable-length `-[:T*1..5]->` | **Landed** (anonymous, single-typed) — see "Variable-length paths" below; not relationship-uniqueness compliant on cyclic graphs. Binding a variable to the path (`-[r:T*1..5]->`, a relationship *list*) is still deferred. |
+| Variable-length `-[:T*1..5]->` | **Landed** (anonymous, single-typed) — see "Variable-length paths" below. **Bounded** ranges enforce node-uniqueness (no revisited node → no edge-reuse artifacts; matches Neo4j for distinct-endpoint queries). Binding a variable to the path (`-[r:T*1..5]->`, a relationship *list*) is still deferred. |
 | Path value `p = (a)-[r]->(b)-[r2]->(c)` | First-class path object. **Deferred.** |
 | `RETURN n, r, m` | SELECT projection. Bag semantics by default (no DISTINCT). |
 | `RETURN DISTINCT` | Lower to existing DISTINCT modifier. |
@@ -286,32 +286,37 @@ the rule is transparent: bag semantics work as Cypher users expect.
 | `(a)-[:T {p:v}]->(b)` | Bag (per occurrence) | No |
 | `MATCH ... RETURN DISTINCT a, b` | Set | (irrelevant — DISTINCT) |
 
-### Variable-length paths — landed (endpoint-reachability semantics)
+### Variable-length paths — landed
 
-Anonymous variable-length relationships are now lowered (2026-06-14):
+Anonymous variable-length relationships are lowered (2026-06-14):
 
 - **Bounded** `-[:T*m..n]->` expands to a `Union` of fixed-length join
   chains (one chain per length, each with `k-1` fresh intermediate
   nodes), honoring direction — undirected hops emit a forward∪reverse
-  `Union`. Capped at 16 hops.
+  `Union`. Capped at 16 hops. For `k ≥ 2` each chain carries a
+  **node-distinctness `Filter`** so the walk can't revisit a node.
 - **Unbounded** `-[:T*]->` / `-[:T*0..]->` reuses the existing transitive
   `PropertyPathPattern` (`*`→`OneOrMore`, `*0..`→`ZeroOrMore`). Directed
   only; unbounded-undirected and `*N..` (N>1) remain deferred.
 
+**Uniqueness (bounded).** The node-distinctness filter approximates
+Cypher's relationship-uniqueness rule (no edge reused on a walk): by
+forbidding a revisited node it eliminates the edge-reuse artifacts on
+cyclic / undirected graphs — spurious self-rows (`a-b-a`) and
+back-and-forth path multiplicity. It is *node*-uniqueness, slightly
+**stricter** than Cypher's relationship-uniqueness (it also excludes a
+walk that revisits a node via two different edges). For distinct-endpoint
+aggregation — `count(DISTINCT friend)`, the LDBC norm — results match
+Neo4j; raw path-multiplicity counts can differ. **Unbounded** paths
+(via `PropertyPathPattern`) do not yet enforce uniqueness.
+
 **Scope vs. full Cypher.** These produce **endpoint bindings**, not
-first-class path values, and the bounded chain expansion does **not**
-enforce Cypher's relationship-uniqueness rule (no repeated edge on a
-walk). It is therefore **openCypher-compliant only for acyclic /
-tree-shaped traversal**. On cyclic or undirected graphs a walk may
-revisit an edge, which not only over-counts but can surface endpoint
-rows that should not exist at all (e.g. an exact-length `*k` path that
-reuses one edge). Treat this as an endpoint-reachability / bounded-
-neighborhood feature, not a compliant path matcher. Binding a variable
-to the path (`-[r:T*]->`, a relationship *list*) and path values
-(`p = (...)`, `nodes()/relationships()/length(p)`) still need
-list/path-valued bindings — deferred. A true path-enumerating operator
-(one row per distinct walk, with relationship-uniqueness and
-parallel-edge multiplicity) remains future work.
+first-class path values. Binding a variable to the path (`-[r:T*]->`, a
+relationship *list*) and path values (`p = (...)`,
+`nodes()/relationships()/length(p)`) still need list/path-valued
+bindings — deferred. A true path-enumerating operator (one row per
+distinct walk, full relationship-uniqueness, parallel-edge multiplicity)
+remains future work.
 
 A relationship *type* whose namespace isn't registered in the ledger
 encodes to no predicate; such a path yields **zero rows**, not an error
@@ -483,7 +488,7 @@ standard solution modifiers and a conservative expression sublanguage.**
 | `MATCH (a)-[r:T1\|T2]->(b)` | ✅ | Type alternatives via `Union`. |
 | `MATCH (a)<-[r:T]-(b)` | ✅ | Inverse direction (swap subject/object). |
 | `MATCH (a)-[:T]-(b)` (undirected) | ✅ | Forward∪reverse `Union` (reverse via the `Opst` object index). A bound rel var works for single-hop undirected. |
-| `MATCH (a)-[:T*m..n]->(b)` (bounded var-length) | ✅ | Expands to a `Union` of fixed-length join chains; honors direction incl. undirected hops. Anonymous rel only (a bound rel var binds a *list* — deferred). **Caveat:** does not enforce relationship-uniqueness, so it is openCypher-compliant **only for acyclic/tree traversal**; on cyclic/undirected graphs it can both over-count and surface rows that shouldn't exist. Endpoint-reachability feature, not a compliant path matcher. |
+| `MATCH (a)-[:T*m..n]->(b)` (bounded var-length) | ✅ | Expands to a `Union` of fixed-length join chains; honors direction incl. undirected hops. Anonymous rel only (a bound rel var binds a *list* — deferred). Each `k≥2` chain carries a **node-distinctness filter** (no revisited node), so cyclic/undirected walks don't produce edge-reuse artifacts — matches Neo4j for distinct-endpoint queries; *node*-uniqueness is slightly stricter than Cypher's relationship-uniqueness for raw path counts. |
 | `MATCH (a)-[:T*]->(b)` / `*0..` (unbounded var-length) | ✅ | Reuses the transitive `PropertyPathPattern` (`*`→OneOrMore, `*0..`→ZeroOrMore). Directed only; unbounded-undirected and `*N..` (N>1) deferred. |
 | `MATCH p = ...` (path value), `nodes()/relationships()/length(p)` | ❌ | Deferred — needs path-value IR + binding. |
 | `MATCH p = ...` (path value) | ❌ | Deferred — needs path-value IR. |

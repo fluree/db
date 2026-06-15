@@ -1607,6 +1607,50 @@ async fn cypher_var_length_unregistered_namespace_returns_no_rows() {
 }
 
 #[tokio::test]
+async fn cypher_var_length_relationship_uniqueness_no_self_rows() {
+    // Bounded var-length on a cyclic/undirected graph must not return spurious
+    // self-rows from edge reuse (`a-b-a`). Graph: a(1)-knows-b(2)-knows-c(3).
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/cypher:varlen-uniq");
+    let l = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": ctx(),
+                "@graph": [
+                    {"@id": "ex:a", "@type": "ex:Person", "ex:id": 1, "ex:KNOWS": {"@id": "ex:b"}},
+                    {"@id": "ex:b", "@type": "ex:Person", "ex:id": 2, "ex:KNOWS": {"@id": "ex:c"}},
+                    {"@id": "ex:c", "@type": "ex:Person", "ex:id": 3},
+                ]
+            }),
+        )
+        .await
+        .expect("seed")
+        .ledger;
+    let db = graphdb_from_ledger(&l);
+
+    // Undirected *2..2 from a: only c (id 3); NOT a itself (the a-b-a walk
+    // reuses the a-b edge and is excluded).
+    let rows = fluree
+        .query_cypher(
+            &db,
+            "MATCH (a:Person {id: 1})-[:KNOWS*2..2]-(x) RETURN x.id AS id",
+        )
+        .await
+        .expect("var-length uniqueness")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    let ids: Vec<i64> = rows
+        .as_array()
+        .expect("rows")
+        .iter()
+        .filter_map(|r| r[0].as_i64())
+        .collect();
+    assert_eq!(ids, vec![3], "only c; no spurious self-row for a: {rows}");
+}
+
+#[tokio::test]
 async fn cypher_var_length_exact_hops() {
     let fluree = FlureeBuilder::memory().build_memory();
     let l = seed_knows_chain(&fluree, "it/cypher:varlen-exact").await;

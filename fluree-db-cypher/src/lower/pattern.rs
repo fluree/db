@@ -1,6 +1,9 @@
 //! Pattern lowering — Cypher MATCH patterns → fluree-db-query Pattern.
 
-use fluree_db_query::ir::{PathModifier, Pattern, PropertyPathPattern, Ref, Term, TriplePattern};
+use fluree_db_core::FlakeValue;
+use fluree_db_query::ir::{
+    Expression, Function, PathModifier, Pattern, PropertyPathPattern, Ref, Term, TriplePattern,
+};
 use fluree_db_query::parse::encode::IriEncoder;
 
 use crate::ast::{
@@ -332,6 +335,15 @@ fn lower_var_length_rel<E: IriEncoder>(
 /// Build a `k`-hop chain from `s` to `o` through `k - 1` fresh intermediate
 /// nodes, each hop honoring `direction`. Uses string-IRI predicate triples so
 /// an absent relationship type yields no rows rather than erroring.
+///
+/// For `k ≥ 2` a node-distinctness `Filter` is appended so the walk can't
+/// revisit a node — approximating Cypher's relationship-uniqueness rule (no
+/// edge reused on a walk). This eliminates the edge-reuse artifacts on cyclic /
+/// undirected graphs (spurious self-rows from `a-b-a`, back-and-forth path
+/// multiplicity). It is *node*-uniqueness, slightly stricter than Cypher's
+/// relationship-uniqueness: it also excludes paths that revisit a node via
+/// different edges. For distinct-endpoint aggregation (the LDBC norm) the
+/// results match Neo4j; raw path-multiplicity counts can differ.
 fn build_fixed_chain<E: IriEncoder>(
     ctx: &mut LoweringContext<'_, E>,
     s: &Ref,
@@ -341,6 +353,7 @@ fn build_fixed_chain<E: IriEncoder>(
     direction: Direction,
 ) -> Result<Vec<Pattern>> {
     let mut chain = Vec::new();
+    let mut nodes: Vec<Ref> = vec![s.clone()];
     let mut prev = s.clone();
     for hop in 0..k {
         let next = if hop == k - 1 {
@@ -349,9 +362,47 @@ fn build_fixed_chain<E: IriEncoder>(
             Ref::Var(ctx.fresh_synth())
         };
         push_hop(&prev, &next, type_iri, direction, &mut chain);
+        nodes.push(next.clone());
         prev = next;
     }
+    if k >= 2 {
+        if let Some(filter) = node_distinctness_filter(&nodes) {
+            chain.push(filter);
+        }
+    }
     Ok(chain)
+}
+
+/// A `Filter` requiring every node in a walk to be pairwise distinct
+/// (`a != b` AND … for all pairs). Returns `None` when there's nothing to
+/// constrain (fewer than two comparable nodes). Pairs of the same variable, or
+/// nodes that aren't a variable/SID, are skipped.
+fn node_distinctness_filter(nodes: &[Ref]) -> Option<Pattern> {
+    let mut conds: Vec<Expression> = Vec::new();
+    for i in 0..nodes.len() {
+        for j in (i + 1)..nodes.len() {
+            if let (Ref::Var(a), Ref::Var(b)) = (&nodes[i], &nodes[j]) {
+                if a == b {
+                    continue;
+                }
+            }
+            if let (Some(a), Some(b)) = (ref_to_expr(&nodes[i]), ref_to_expr(&nodes[j])) {
+                conds.push(Expression::ne(a, b));
+            }
+        }
+    }
+    let mut iter = conds.into_iter();
+    let first = iter.next()?;
+    let combined = iter.fold(first, |acc, c| Expression::binary(Function::And, acc, c));
+    Some(Pattern::Filter(combined))
+}
+
+fn ref_to_expr(r: &Ref) -> Option<Expression> {
+    match r {
+        Ref::Var(v) => Some(Expression::Var(*v)),
+        Ref::Sid(s) => Some(Expression::Const(FlakeValue::Ref(s.clone()))),
+        Ref::Iri(_) => None,
+    }
 }
 
 /// An always-empty result over the path's endpoint variables — used when a
