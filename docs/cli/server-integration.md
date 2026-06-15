@@ -4,8 +4,8 @@ This document is for implementers building a custom server (for example in `../s
 
 The CLI supports two broad categories of remote operations:
 
-- **Data API**: query / update / insert / upsert / info / exists / show / log / history / context / explain, plus admin operations like create / drop / reindex / branch (create / drop / rebase / merge) / publish / export.
-- **Replication / sync**: clone / pull / fetch (content-addressed replication by CID, via pack + storage proxy) and ledger-archive (`export --format ledger`).
+- **Data API**: query / update / insert / upsert / info / exists / show / log / history / context / explain, plus admin operations like create / drop / reindex / branch (create / drop / rebase / merge) / publish / export / import.
+- **Replication / sync**: clone / pull / fetch (content-addressed replication by CID, via pack + storage proxy), ledger-archive (`export --format ledger`), and wholesale restore (`create --remote --from <archive>.flpack`, via `POST /import`).
 
 ## Base URL And Discovery
 
@@ -73,11 +73,12 @@ The `commit` query parameter accepts the same identifiers as the local `fluree s
 - `404 Not Found` — ledger or commit not found
 - `501 Not Implemented` — proxy storage mode (no local index available for decoding)
 
-### `fluree create <ledger> --remote <name>` (admin-protected, empty ledger only)
+### `fluree create <ledger> --remote <name>` (admin-protected)
 
-- `POST {api_base_url}/create` with `{"ledger": "<ledger>"}`
+- `POST {api_base_url}/create` with `{"ledger": "<ledger>"}` (empty ledger), **or**
+- `POST {api_base_url}/import/*ledger` with a raw `.flpack` body (when `--from <archive>.flpack` is also given — see [Ledger Import Contract](#ledger-import-contract))
 
-Creates an **empty** ledger on the remote server. The CLI rejects `--remote` together with `--from` / `--memory` (those import paths require local data ingestion); the suggested workflow is to create + populate locally, then run `fluree publish <remote> <ledger>` which calls `/exists`, `/create`, and `/push` in sequence.
+With no `--from`, creates an **empty** ledger on the remote server. With `--from <archive>.flpack`, the CLI streams the archive to the import endpoint to restore a full ledger remotely (commits + txns + prebuilt index) under the given name. The CLI still rejects `--remote` together with a **non-`.flpack`** `--from`, or with `--memory` (those bulk-import paths require local data ingestion); for those, populate locally then run `fluree publish <remote> <ledger>` (which calls `/exists`, `/create`, and `/push` in sequence), or export to `.flpack` first.
 
 `--remote` does not touch local state — neither the active-ledger pointer nor the local storage tree. The CLI does not require a project-local `.fluree/` for `create --remote`; it falls back to global config (`$FLUREE_HOME` or the platform default) for remote registration lookups. Auto-routing through a local server is **not** done for `create`; you must pass `--remote <name>` explicitly. Without `--remote`, `fluree create` is local-only and does require a project `.fluree/`.
 
@@ -151,9 +152,10 @@ Active-ledger handling:
 
 ### `fluree create <name> --from <file>.flpack` (native ledger import)
 
-- No server endpoint required (local-only operation)
+- **Local mode (default):** no server endpoint required.
+- **Remote mode (`--remote <name>`):** `POST {api_base_url}/import/*ledger` with the raw `.flpack` body — see [Ledger Import Contract](#ledger-import-contract).
 
-Imports a `.flpack` file (native ledger pack) into a new local ledger. The `.flpack` format uses the same `fluree-pack-v1` wire format as `POST /pack`. See [Ledger portability](#ledger-portability-flpack-files) below.
+Imports a `.flpack` file (native ledger pack) into a new ledger — locally, or onto a remote server with `--remote`. The `.flpack` format uses the same `fluree-pack-v1` wire format as `POST /pack`. See [Ledger portability](#ledger-portability-flpack-files) below.
 
 ### `fluree export --format ledger`
 
@@ -1263,6 +1265,69 @@ Clients verify integrity:
 
 **Graceful fallback:** If you do not implement pack yet, return `404 Not Found`, `405 Method Not Allowed`, `406 Not Acceptable`, or `501 Not Implemented`. The CLI treats those as "pack not supported" and falls back to `GET /commits` plus `GET /storage/objects/:cid`.
 
+## Ledger Import Contract
+
+The inbound counterpart of the pack export endpoint. `fluree create <ledger> --remote <name> --from <archive>.flpack` streams a local `.flpack` archive to:
+
+```
+POST {api_base_url}/import/*ledger
+Content-Type: application/x-fluree-pack
+Authorization: Bearer <token>
+
+<body = raw .flpack byte stream>
+```
+
+The server creates a **new** ledger named by the path tail and restores it wholesale from the archive — it does not require, and must not expect, the ledger to already exist. The path name is independent of whatever ledger the archive was exported from, so the same archive can be restored under any name.
+
+### Required server behavior
+
+1. **Stream the body**, do not buffer it whole — production archives can be many gigabytes. Decode `fluree-pack-v1` frames incrementally (preamble → mandatory Header → Data/Manifest frames → mandatory End).
+2. **Verify every object's integrity** before writing it to storage, using the same rules as the pack client: commit-v2 blobs (`FCV2` magic) hash over their canonical sub-range; all other objects are full-bytes SHA-256 verified against the CID. Reject the archive on any mismatch.
+3. **Finalize the heads from the embedded `phase: "nameservice"` manifest** — set the commit head (`commit_head_id` / `commit_t`) and, when the archive carries index artifacts, the index head (`index_head_id` / `index_t`). Verify those head CIDs were actually present in the archive before pointing the nameservice at them, so a truncated or mismatched archive cannot produce a dangling head.
+4. **Trust the archive byte-for-byte** — unlike `POST /push`, do not replay or re-validate (no sequencing/policy/SHACL re-checks) and do not reindex; the prebuilt index rides along so the restored ledger is immediately queryable.
+5. **Roll back on any failure** — a partially-ingested ledger must not be left live. (The reference server soft-drops the just-created ledger.)
+6. **Normalize a bare name** (`mydb` → `mydb:main`) consistently across ingest, head finalization, and the response.
+
+### Auth
+
+**Admin-protected** — same bracket as `/create`, `/drop`, `/reindex`, `/export`. The body carries prebuilt index artifacts the server did not produce, so this is an admin-grade operation (not the `fluree.storage.*` replication bracket used by `/pack`).
+
+### Response (`201 Created`)
+
+```jsonc
+{
+  "ledger_id": "restored-db:main",
+  "commits": 12,
+  "txn_blobs": 12,
+  "index_artifacts": 34,   // 0 for a commits-only (--no-indexes) archive
+  "commit_t": 12,
+  "index_t": 12            // omitted when the archive carried no index
+}
+```
+
+The CLI reads `ledger_id`, `commits`, `txn_blobs`, and `index_artifacts` for its success line.
+
+### Error responses
+
+| Status | When |
+|--------|------|
+| `201` | Ledger restored. |
+| `400` | Malformed archive: bad preamble/frame, missing Header/End, missing nameservice manifest, or a manifest head CID not present in the archive. |
+| `409` | A ledger with that name already exists. |
+| `401` / `403` | Admin token required and absent/invalid. |
+| `5xx` | Storage / nameservice errors during ingest or head finalization. |
+
+**Graceful fallback:** A server that does not implement import returns `404` / `405` / `501`; the CLI surfaces this as a remote error. There is no automatic client-side fallback (unlike pack → commits), since wholesale restore has no per-object equivalent over the data API.
+
+### Reference implementation
+
+| Concern | Canonical location |
+|---------|-------------------|
+| HTTP route + auth | `fluree-db-server/src/routes/import.rs::import_ledger_tail` |
+| Streaming restore + head finalization + rollback | `fluree-db-api/src/commit_transfer.rs::restore_ledger` |
+| CLI dispatch + streaming upload | `fluree-db-cli/src/commands/create.rs::run_remote_flpack_import`, `fluree-db-cli/src/remote_client.rs::import_ledger` |
+| Archive export (producing the body) | `fluree-db-api/src/lib.rs::archive_ledger` |
+
 ## Storage Proxy Contract
 
 These endpoints exist so a client can fetch bytes by CID without knowing storage layout:
@@ -1784,14 +1849,17 @@ WHERE {
 
 ## Ledger Portability (.flpack Files)
 
-The CLI supports exporting and importing full native ledgers as `.flpack` files using the `fluree-pack-v1` wire format. This enables ledger portability without a running server.
+The CLI supports exporting and importing full native ledgers as `.flpack` files using the `fluree-pack-v1` wire format. This enables ledger portability with or without a running server.
 
 ```bash
 # Export a ledger (all commits + indexes + dictionaries)
 fluree export mydb --format ledger -o mydb.flpack
 
-# Import into a new instance (can use a different ledger name)
+# Import into a new LOCAL instance (can use a different ledger name)
 fluree create imported-db --from mydb.flpack
+
+# Restore directly onto a REMOTE server (streams to POST /import)
+fluree create imported-db --remote prod --from mydb.flpack
 ```
 
 The `.flpack` format is identical to the binary stream served by `POST /pack/{ledger}`, with the addition of a **nameservice manifest frame** that carries the metadata needed to reconstruct the nameservice record on import:
@@ -1811,18 +1879,26 @@ The `.flpack` format is identical to the binary stream served by `POST /pack/{le
 
 **Aliasing on import:** The ledger name provided to `fluree create` determines the local storage path. The data itself is content-addressed (CIDs), so a ledger can be imported under any name. The `ledger_id` inside the index root binary is informational and does not affect CAS resolution.
 
-**Combined with publish:** A typical workflow for moving a ledger from one environment to another:
+**Moving a ledger to a server:** restore the archive straight onto the server in one step — no local staging instance:
 
 ```bash
 # On source machine: export
 fluree export mydb --format ledger -o mydb.flpack
 
-# On target machine: import and publish to server
-fluree create mydb --from mydb.flpack
+# Restore directly onto the server (POST /import)
 fluree remote add prod https://prod.example.com
 fluree auth login --remote prod
+fluree create mydb --remote prod --from mydb.flpack
+```
+
+Alternatively, stage locally first and then `publish` (useful when you also want a local working copy):
+
+```bash
+fluree create mydb --from mydb.flpack
 fluree publish prod mydb
 ```
+
+The difference: `--remote --from` restores a trusted snapshot wholesale (byte-for-byte, index included, no replay), while `publish` re-validates and re-pushes the local commit chain. Use import to materialize a ledger from an archive; use publish to push ongoing local work.
 
 ## Quick Validation Script
 
