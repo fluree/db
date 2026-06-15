@@ -42,6 +42,7 @@ pub mod config_resolver;
 #[cfg(feature = "credential")]
 pub mod credential;
 pub mod cross_ledger;
+pub mod csv_import;
 pub mod cypher_write;
 pub mod dataset;
 mod error;

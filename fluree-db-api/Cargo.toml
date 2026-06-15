@@ -86,6 +86,8 @@ hex.workspace = true
 # Fast integer/float formatting for TSV output (zero-alloc)
 itoa.workspace = true
 ryu.workspace = true
+# CSV bulk import (neo4j-admin header convention → JSON-LD front-end)
+csv = "1.4"
 
 # Opt-in AWS + LocalStack testing deps (feature-gated)
 testcontainers = { version = "0.23", optional = true }
