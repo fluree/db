@@ -1,23 +1,46 @@
-//! Read-side `NameService` adapter over the replicated state machine.
+//! `NameService` adapter over the replicated state machine.
 //!
-//! Followers (and the leader, before its local cache catches up) need
-//! a way to resolve current ledger heads without going through
-//! openraft's RPC surface. [`RaftNameService`] holds the same shared
-//! [`SharedState`](super::state_machine_adapter::SharedState) the
-//! state-machine adapter writes to under apply, so reads always
-//! observe committed state.
+//! Cluster nodes need a way to resolve current ledger heads and to
+//! publish index-build results without faking the broader nameservice
+//! trait surface. [`RaftNameService`] does both:
+//!
+//! - **Reads** ([`NameServiceLookup`]) go straight to the shared
+//!   [`SharedState`](super::state_machine_adapter::SharedState) the
+//!   state-machine adapter writes to under apply — followers (and
+//!   the leader, before its local cache catches up) observe
+//!   committed log state without an openraft RPC.
+//! - **Writes** ([`IndexPublisher`]) propose
+//!   [`Command::AdvanceIndexHead`](super::state_machine::Command::AdvanceIndexHead)
+//!   through Raft via the held handle. Every node's state machine
+//!   then updates its
+//!   [`RefEntry::index`](super::state_machine::RefEntry::index) under
+//!   apply, so subsequent reads observe the new index head as soon
+//!   as the entry commits.
+//!
+//! The combined surface implements
+//! [`IndexingNameService`](fluree_db_nameservice::IndexingNameService) —
+//! the narrow trait indexing reaches through — without the
+//! orchestrator needing to thread two separate Arcs.
 //!
 //! # Scope
 //!
-//! Reads only. The trait surface is wide because
-//! [`NameService`](fluree_db_nameservice::NameService) bundles several
-//! supertraits, but the write-shaped methods
-//! ([`create_branch`](fluree_db_nameservice::NameService::create_branch),
-//! [`drop_branch`](fluree_db_nameservice::NameService::drop_branch),
-//! [`reset_head`](fluree_db_nameservice::NameService::reset_head))
-//! return [`NameServiceError::Storage`] pointing the caller at the
-//! openraft proposal path. The state machine is the source of truth
-//! for refs and ledger metadata; mutations must flow through Raft.
+//! Reads + index-head publish. The other write-shaped trait methods
+//! ([`create_branch`](fluree_db_nameservice::BranchLifecycle::create_branch),
+//! commit publishing, etc.) are deliberately not implemented here —
+//! they have their own paths (commit publishes flow through
+//! `RaftCommitter::transact` proposing `Command::AdvanceRef`; branch
+//! lifecycle is not yet a state-machine command). Trying to call
+//! them through a `RaftNameService` would be a type error at the
+//! call site, which is the design we want.
+//!
+//! # Stale-publish handling
+//!
+//! Only the current leader has a meaningful publish path. A
+//! stepped-down leader whose in-flight indexer build finishes a tick
+//! after the transition hits openraft's
+//! [`ClientWriteError::ForwardToLeader`] — we map that to `Ok(())`
+//! because the new leader will run its own build against its own
+//! state, and rejecting the call would just produce log noise.
 //!
 //! # What's NOT tracked here
 //!
@@ -31,34 +54,105 @@
 //!
 //! [`LedgerState::load`]: fluree_db_ledger::LedgerState::load
 
-use crate::raft::state_machine::{NameServiceState, RefKey};
+use crate::raft::state_machine::{
+    AdvanceIndexHeadArgs, Command as SmCommand, NameServiceState, RefKey, Response as SmResponse,
+};
 use crate::raft::state_machine_adapter::SharedState;
+use crate::raft::TypeConfig;
 use async_trait::async_trait;
 use fluree_db_core::ledger_id::split_ledger_id;
+use fluree_db_core::ContentId;
 use fluree_db_nameservice::{
-    ConfigLookup, ConfigValue, GraphSourceLookup, GraphSourceRecord, NameServiceLookup,
-    NsLookupResult, NsRecord, RefKind, RefLookup, RefValue, Result, StatusLookup, StatusValue,
+    ConfigLookup, ConfigValue, GraphSourceLookup, GraphSourceRecord, IndexPublisher,
+    NameServiceError, NameServiceLookup, NsLookupResult, NsRecord, RefKind, RefLookup, RefValue,
+    Result, StatusLookup, StatusValue,
 };
+use openraft::error::{ClientWriteError, RaftError};
+use openraft::Raft;
 use std::fmt;
+use std::sync::Arc;
+use std::time::SystemTime;
 
-/// Read-side `NameService` adapter over the replicated state machine.
+/// `NameService` adapter over the replicated state machine — reads
+/// the shared state directly, writes the index head through Raft.
 ///
-/// Construct with the same [`SharedState`] handle the state machine
-/// adapter was constructed with — both then observe the same
-/// committed log.
+/// Construct with the same [`SharedState`] handle the state-machine
+/// adapter holds and the same `Arc<Raft<TypeConfig>>` the rest of
+/// the integration uses; the type owns its references so it's safe
+/// to clone freely.
 pub struct RaftNameService {
     state: SharedState,
+    raft: Arc<Raft<TypeConfig>>,
 }
 
 impl RaftNameService {
-    pub fn new(state: SharedState) -> Self {
-        Self { state }
+    pub fn new(state: SharedState, raft: Arc<Raft<TypeConfig>>) -> Self {
+        Self { state, raft }
     }
 }
 
 impl fmt::Debug for RaftNameService {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("RaftNameService").finish()
+    }
+}
+
+/// Build the state-machine command an `IndexPublisher::publish_index`
+/// call translates into. Extracted so the construction is testable
+/// without spinning up a Raft instance.
+fn build_advance_index_command(
+    ledger_id: &str,
+    index_t: i64,
+    index_id: &ContentId,
+) -> std::result::Result<SmCommand, NameServiceError> {
+    let (ledger_name, branch) = split_ledger_id(ledger_id)?;
+    let applied_at_millis = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    Ok(SmCommand::AdvanceIndexHead(AdvanceIndexHeadArgs {
+        ledger_id: ledger_name,
+        branch,
+        new_index_head: index_id.clone(),
+        t: index_t,
+        applied_at_millis,
+    }))
+}
+
+/// Translate the apply outcome into the `IndexPublisher::publish_index`
+/// result.
+///
+/// - [`SmResponse::IndexAdvanced`] / [`SmResponse::IndexStale`] →
+///   `Ok(())`. Stale is the racing-indexer case: another publisher
+///   landed at a `t` ≥ ours. The cluster's view of the latest index
+///   is already at-least-as-fresh as the one we tried to publish.
+/// - [`SmResponse::IndexAhead`] → `Err(Storage)`. The proposer's view
+///   of `commit_t` was wrong (almost always: a leadership transition
+///   where the new leader had reset to an older state). The caller's
+///   indexer should re-stage against the current commit head.
+/// - [`SmResponse::LedgerNotFound`] → `Err(not_found)`. Ledger gone
+///   mid-build (drop / membership change).
+/// - Anything else → `Err(Storage)` "unexpected variant". None of the
+///   other variants are reachable for this command; if one appears
+///   it's a state-machine bug worth surfacing rather than swallowing.
+fn map_advance_index_response(resp: SmResponse) -> Result<()> {
+    match resp {
+        SmResponse::IndexAdvanced { .. } => Ok(()),
+        // Stale = concurrent indexer published a t >= ours. The
+        // cluster's view of the latest index is already at-least-as
+        // fresh; nothing to surface.
+        SmResponse::IndexStale { .. } => Ok(()),
+        SmResponse::IndexAhead {
+            commit_t,
+            proposed_t,
+        } => Err(NameServiceError::storage(format!(
+            "raft AdvanceIndexHead rejected: index_t={proposed_t} > commit_t={commit_t} \
+             (proposer ran ahead of applied state; re-stage from current commit head)"
+        ))),
+        SmResponse::LedgerNotFound { ledger_id } => Err(NameServiceError::not_found(ledger_id)),
+        other => Err(NameServiceError::storage(format!(
+            "unexpected Response variant for AdvanceIndexHead: {other:?}"
+        ))),
     }
 }
 
@@ -106,6 +200,37 @@ impl NameServiceLookup for RaftNameService {
             }
         }
         Ok(records)
+    }
+}
+
+#[async_trait]
+impl IndexPublisher for RaftNameService {
+    async fn publish_index(
+        &self,
+        ledger_id: &str,
+        index_t: i64,
+        index_id: &ContentId,
+    ) -> Result<()> {
+        let cmd = build_advance_index_command(ledger_id, index_t, index_id)?;
+
+        match self.raft.client_write(cmd).await {
+            Ok(resp) => map_advance_index_response(resp.data),
+            // A stepped-down leader's straggling publish call. The
+            // new leader will run its own build; nothing for us to
+            // do except not propagate the error.
+            Err(RaftError::APIError(ClientWriteError::ForwardToLeader(_))) => Ok(()),
+            // ChangeMembershipError can't surface here — this
+            // command isn't a membership change. Treat as
+            // unreachable but report rather than panic.
+            Err(RaftError::APIError(ClientWriteError::ChangeMembershipError(e))) => {
+                Err(NameServiceError::storage(format!(
+                    "unexpected ChangeMembershipError on AdvanceIndexHead: {e}"
+                )))
+            }
+            Err(RaftError::Fatal(f)) => Err(NameServiceError::storage(format!(
+                "raft fatal during AdvanceIndexHead: {f}"
+            ))),
+        }
     }
 }
 
@@ -182,11 +307,34 @@ impl ConfigLookup for RaftNameService {
 
 #[cfg(test)]
 mod tests {
+    //! Two test surfaces here:
+    //!
+    //! - **Pure helpers** ([`build_advance_index_command`],
+    //!   [`map_advance_index_response`]) — synchronous, no Raft, no
+    //!   state. Verify the command construction and outcome mapping
+    //!   the publisher side of `IndexPublisher` translates through.
+    //! - **`NameServiceLookup` impl** — drive `SharedState`
+    //!   directly via the state-machine's `apply` function, then
+    //!   exercise `lookup` / `get_ref` / `all_records`. Each test
+    //!   needs a `RaftNameService`, which now requires an
+    //!   `Arc<Raft<TypeConfig>>`. We bootstrap a stub Raft once
+    //!   per test via [`stub_raft`]; the publish-time roundtrip
+    //!   through a live Raft cluster lives in
+    //!   `tests/single_node_round_trip.rs`.
+
     use super::*;
     use crate::raft::state_machine::{
         AdvanceIndexHeadArgs, AdvanceRefArgs, Command, CreateLedgerArgs, NameServiceState, Response,
     };
+    use crate::raft::{ClusterNode, NodeId};
     use fluree_db_api::{ContentId, ContentKind};
+    use openraft::error::{InstallSnapshotError, RPCError, RaftError};
+    use openraft::network::{RPCOption, RaftNetwork, RaftNetworkFactory};
+    use openraft::raft::{
+        AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest,
+        InstallSnapshotResponse, VoteRequest, VoteResponse,
+    };
+    use openraft::Config;
     use std::sync::Arc;
     use tokio::sync::RwLock;
 
@@ -203,9 +351,160 @@ mod tests {
         crate::raft::state_machine::apply(&mut guard, cmd, index)
     }
 
+    /// Network-factory stub. `RaftNameService` tests in this module
+    /// only exercise the read paths and the pure publisher helpers
+    /// — the constructed `Raft` is never asked to make outbound RPC
+    /// calls. If openraft ever does invoke one of these in a unit
+    /// test, that's a real bug to investigate and a panic surfaces
+    /// it louder than a quiet stub.
+    struct StubFactory;
+    struct StubNetwork;
+
+    impl RaftNetworkFactory<crate::raft::TypeConfig> for StubFactory {
+        type Network = StubNetwork;
+
+        async fn new_client(&mut self, _target: NodeId, _node: &ClusterNode) -> Self::Network {
+            StubNetwork
+        }
+    }
+
+    impl RaftNetwork<crate::raft::TypeConfig> for StubNetwork {
+        async fn append_entries(
+            &mut self,
+            _rpc: AppendEntriesRequest<crate::raft::TypeConfig>,
+            _option: RPCOption,
+        ) -> std::result::Result<
+            AppendEntriesResponse<NodeId>,
+            RPCError<NodeId, ClusterNode, RaftError<NodeId>>,
+        > {
+            panic!("unit-test Raft should not invoke append_entries");
+        }
+
+        async fn install_snapshot(
+            &mut self,
+            _rpc: InstallSnapshotRequest<crate::raft::TypeConfig>,
+            _option: RPCOption,
+        ) -> std::result::Result<
+            InstallSnapshotResponse<NodeId>,
+            RPCError<NodeId, ClusterNode, RaftError<NodeId, InstallSnapshotError>>,
+        > {
+            panic!("unit-test Raft should not invoke install_snapshot");
+        }
+
+        async fn vote(
+            &mut self,
+            _rpc: VoteRequest<NodeId>,
+            _option: RPCOption,
+        ) -> std::result::Result<
+            VoteResponse<NodeId>,
+            RPCError<NodeId, ClusterNode, RaftError<NodeId>>,
+        > {
+            panic!("unit-test Raft should not invoke vote");
+        }
+    }
+
+    /// Build an idle `Raft` handle for read-side tests. The
+    /// returned handle is never initialized into a cluster — the
+    /// tests only exercise the data path that reads `SharedState`,
+    /// not the openraft consensus loop.
+    async fn stub_raft() -> Arc<Raft<crate::raft::TypeConfig>> {
+        use crate::raft::log_adapter::LogAdapter;
+        use crate::raft::state_machine_adapter::StateMachineAdapter;
+        use crate::raft::storage::memory::MemoryRaftStorage;
+
+        let storage = Arc::new(MemoryRaftStorage::new());
+        let log = LogAdapter::new(Arc::clone(&storage));
+        let sm = StateMachineAdapter::new(Arc::clone(&storage));
+        let config = Arc::new(Config::default().validate().expect("config validates"));
+        Arc::new(
+            Raft::new(1, config, StubFactory, log, sm)
+                .await
+                .expect("stub raft constructs"),
+        )
+    }
+
+    // ----------------------------------------------------------------
+    // Pure publish-helper tests
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn build_advance_index_command_splits_ledger_id_into_name_and_branch() {
+        let cmd = build_advance_index_command("test/db:main", 7, &cid(42)).expect("build");
+        let SmCommand::AdvanceIndexHead(args) = cmd else {
+            panic!("expected AdvanceIndexHead");
+        };
+        assert_eq!(args.ledger_id, "test/db");
+        assert_eq!(args.branch, "main");
+        assert_eq!(args.new_index_head, cid(42));
+        assert_eq!(args.t, 7);
+        assert!(args.applied_at_millis > 0);
+    }
+
+    #[test]
+    fn build_advance_index_command_defaults_branch_when_omitted() {
+        let cmd = build_advance_index_command("test/db", 7, &cid(42)).expect("build");
+        let SmCommand::AdvanceIndexHead(args) = cmd else {
+            panic!("expected AdvanceIndexHead");
+        };
+        assert_eq!(args.ledger_id, "test/db");
+        assert_eq!(args.branch, "main");
+    }
+
+    #[test]
+    fn build_advance_index_command_rejects_empty_ledger_id() {
+        assert!(build_advance_index_command("", 7, &cid(42)).is_err());
+    }
+
+    #[test]
+    fn map_advance_index_response_advanced_is_ok() {
+        let r = map_advance_index_response(SmResponse::IndexAdvanced {
+            index_t: 5,
+            index_head: cid(1),
+        });
+        assert!(r.is_ok());
+    }
+
+    #[test]
+    fn map_advance_index_response_stale_is_ok() {
+        let r = map_advance_index_response(SmResponse::IndexStale { current_t: 9 });
+        assert!(r.is_ok());
+    }
+
+    #[test]
+    fn map_advance_index_response_ahead_is_err_with_both_t_values_in_message() {
+        let r = map_advance_index_response(SmResponse::IndexAhead {
+            commit_t: 3,
+            proposed_t: 9,
+        });
+        let msg = r.expect_err("ahead is error").to_string();
+        assert!(msg.contains("commit_t=3"), "got: {msg}");
+        assert!(msg.contains("index_t=9"), "got: {msg}");
+    }
+
+    #[test]
+    fn map_advance_index_response_ledger_not_found_is_err() {
+        let r = map_advance_index_response(SmResponse::LedgerNotFound {
+            ledger_id: "gone/db".into(),
+        });
+        let msg = r.expect_err("ledger not found is error").to_string();
+        assert!(msg.contains("gone/db"), "got: {msg}");
+    }
+
+    #[test]
+    fn map_advance_index_response_unexpected_variant_is_err() {
+        // `NoOp` can't be the state-machine reply to AdvanceIndexHead,
+        // but if it ever were, the publisher should surface rather
+        // than swallow.
+        assert!(map_advance_index_response(SmResponse::NoOp).is_err());
+    }
+
+    // ----------------------------------------------------------------
+    // NameServiceLookup tests
+    // ----------------------------------------------------------------
+
     #[tokio::test]
     async fn lookup_returns_none_when_ledger_missing() {
-        let ns = RaftNameService::new(fresh_state());
+        let ns = RaftNameService::new(fresh_state(), stub_raft().await);
         assert!(ns.lookup("test/db:main").await.unwrap().is_none());
     }
 
@@ -242,7 +541,7 @@ mod tests {
         )
         .await;
 
-        let ns = RaftNameService::new(state);
+        let ns = RaftNameService::new(state, stub_raft().await);
         let record = ns.lookup("test/db:main").await.unwrap().expect("record");
         assert_eq!(record.ledger_id, "test/db:main");
         assert_eq!(record.commit_head_id, Some(cid(5)));
@@ -283,7 +582,7 @@ mod tests {
         )
         .await;
 
-        let ns = RaftNameService::new(state);
+        let ns = RaftNameService::new(state, stub_raft().await);
         let ref_value = ns
             .get_ref("test/db:main", RefKind::CommitHead)
             .await
@@ -354,7 +653,7 @@ mod tests {
         )
         .await;
 
-        let ns = RaftNameService::new(state);
+        let ns = RaftNameService::new(state, stub_raft().await);
         let record = ns.lookup("test/db:main").await.unwrap().expect("record");
         assert_eq!(record.commit_head_id, Some(cid(7)));
         assert_eq!(record.commit_t, 10);
@@ -378,7 +677,7 @@ mod tests {
         )
         .await;
 
-        let ns = RaftNameService::new(state);
+        let ns = RaftNameService::new(state, stub_raft().await);
         let ref_value = ns
             .get_ref("test/db:main", RefKind::IndexHead)
             .await
@@ -424,7 +723,7 @@ mod tests {
         )
         .await;
 
-        let ns = RaftNameService::new(state);
+        let ns = RaftNameService::new(state, stub_raft().await);
         let record = ns.lookup("test/db:main").await.unwrap().expect("record");
         assert_eq!(record.commit_head_id, Some(cid(8)));
         assert_eq!(record.commit_t, 20);
@@ -466,7 +765,7 @@ mod tests {
         )
         .await;
 
-        let ns = RaftNameService::new(state);
+        let ns = RaftNameService::new(state, stub_raft().await);
         let mut ids: Vec<_> = ns
             .all_records()
             .await

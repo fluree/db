@@ -22,15 +22,15 @@ use openraft::raft::{
 };
 use openraft::{Config, Raft, ServerState};
 
-use fluree_db_consensus::raft::index_publisher::RaftIndexPublisher;
 use fluree_db_consensus::raft::log_adapter::LogAdapter;
+use fluree_db_consensus::raft::nameservice::RaftNameService;
 use fluree_db_consensus::raft::state_machine::{
     AdvanceRefArgs, Command as SmCommand, CreateLedgerArgs, RefKey, Response,
 };
 use fluree_db_consensus::raft::state_machine_adapter::StateMachineAdapter;
 use fluree_db_consensus::raft::storage::memory::MemoryRaftStorage;
 use fluree_db_consensus::raft::{ClusterNode, NodeId, TypeConfig};
-use fluree_db_nameservice::IndexPublisher;
+use fluree_db_nameservice::{IndexPublisher, NameServiceLookup};
 
 struct StubFactory;
 struct StubNetwork;
@@ -177,10 +177,10 @@ async fn single_node_raft_index_publisher_round_trip() {
     .await
     .unwrap();
 
-    // Publish through the IndexPublisher trait, end-to-end.
-    let publisher = RaftIndexPublisher::new(Arc::new(raft));
-    publisher
-        .publish_index("test/db:main", 10, &cid(42))
+    // Publish through the combined RaftNameService.
+    let raft_arc = Arc::new(raft);
+    let ns = RaftNameService::new(shared_state.clone(), Arc::clone(&raft_arc));
+    ns.publish_index("test/db:main", 10, &cid(42))
         .await
         .expect("publish_index ok");
 
@@ -196,10 +196,19 @@ async fn single_node_raft_index_publisher_round_trip() {
         assert_eq!(index.t, 10);
     }
 
+    // The same handle's `lookup` observes the new index head — the
+    // combined type unifies reads and writes.
+    let record = ns
+        .lookup("test/db:main")
+        .await
+        .expect("lookup ok")
+        .expect("record");
+    assert_eq!(record.index_head_id, Some(cid(42)));
+    assert_eq!(record.index_t, 10);
+
     // A second publish at the same t is treated as stale and
     // surfaces as Ok — the cluster's view is unchanged.
-    publisher
-        .publish_index("test/db:main", 10, &cid(99))
+    ns.publish_index("test/db:main", 10, &cid(99))
         .await
         .expect("stale publish is ok");
     {
@@ -211,5 +220,5 @@ async fn single_node_raft_index_publisher_round_trip() {
         assert_eq!(index.t, 10);
     }
 
-    publisher.raft().shutdown().await.unwrap();
+    raft_arc.shutdown().await.unwrap();
 }

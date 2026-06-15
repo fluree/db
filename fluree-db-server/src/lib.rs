@@ -390,6 +390,7 @@ impl FlureeServerBuilder {
             if let Some((integration, _)) = self.raft.as_ref() {
                 let raft_ns = fluree_db_consensus::raft::nameservice::RaftNameService::new(
                     integration.shared_state.clone(),
+                    std::sync::Arc::clone(&integration.raft),
                 );
                 let ns_mode =
                     fluree_db_api::NameServiceMode::ReadOnly(std::sync::Arc::new(raft_ns));

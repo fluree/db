@@ -47,7 +47,7 @@ use crate::{publish_index_result, IndexResult};
 #[cfg(feature = "embedded-orchestrator")]
 use fluree_db_core::Storage;
 use fluree_db_core::StorageBackend;
-use fluree_db_nameservice::ReadWriteNameService;
+use fluree_db_nameservice::IndexingNameService;
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::sync::Arc;
@@ -275,15 +275,21 @@ use fluree_db_ledger::{IndexConfig, LedgerState};
 /// (e.g., `LocalSet`) or manage threading at a higher level.
 pub struct IndexerOrchestrator {
     backend: StorageBackend,
-    nameservice: Arc<dyn ReadWriteNameService>,
+    nameservice: Arc<dyn IndexingNameService>,
     config: IndexerConfig,
 }
 
 impl IndexerOrchestrator {
-    /// Create a new indexer orchestrator
+    /// Create a new indexer orchestrator.
+    ///
+    /// `nameservice` is the combined ledger-discovery + index-head
+    /// publishing surface ([`IndexingNameService`]). Every backend
+    /// that implements both halves natively (file, memory, S3
+    /// DynamoDB, the Raft state-machine adapter) picks the combined
+    /// trait up via blanket impl.
     pub fn new(
         backend: StorageBackend,
-        nameservice: Arc<dyn ReadWriteNameService>,
+        nameservice: Arc<dyn IndexingNameService>,
         config: IndexerConfig,
     ) -> Self {
         Self {
@@ -352,8 +358,8 @@ impl IndexerOrchestrator {
         &self.backend
     }
 
-    /// Get a reference to the nameservice
-    pub fn nameservice(&self) -> &Arc<dyn ReadWriteNameService> {
+    /// Get a reference to the nameservice.
+    pub fn nameservice(&self) -> &Arc<dyn IndexingNameService> {
         &self.nameservice
     }
 
@@ -581,7 +587,7 @@ impl IndexerHandle {
 /// - Clean shutdown when all handles are dropped
 pub struct BackgroundIndexerWorker {
     backend: StorageBackend,
-    nameservice: Arc<dyn ReadWriteNameService>,
+    nameservice: Arc<dyn IndexingNameService>,
     config: IndexerConfig,
     states: Arc<Mutex<LedgerStates>>,
     tick_rx: watch::Receiver<u64>,
@@ -589,10 +595,14 @@ pub struct BackgroundIndexerWorker {
 }
 
 impl BackgroundIndexerWorker {
-    /// Create a new worker and its associated handle
+    /// Create a new worker and its associated handle.
+    ///
+    /// `nameservice` is the combined ledger-discovery + index-head
+    /// publishing surface ([`IndexingNameService`]). See
+    /// [`IndexerOrchestrator::new`] for the rationale.
     pub fn new(
         backend: StorageBackend,
-        nameservice: Arc<dyn ReadWriteNameService>,
+        nameservice: Arc<dyn IndexingNameService>,
         config: IndexerConfig,
     ) -> (Self, IndexerHandle) {
         let states = Arc::new(Mutex::new(BTreeMap::new()));
@@ -1198,7 +1208,7 @@ fn current_ns_record(ledger: &LedgerState) -> Option<&fluree_db_nameservice::NsR
 #[cfg(feature = "embedded-orchestrator")]
 pub async fn maybe_refresh_after_commit<S>(
     storage: &S,
-    nameservice: &dyn ReadWriteNameService,
+    nameservice: &dyn IndexingNameService,
     mut ledger: LedgerState,
     index_config: &IndexConfig,
     indexer_config: IndexerConfig,
@@ -1336,7 +1346,7 @@ where
 #[cfg(feature = "embedded-orchestrator")]
 pub async fn require_refresh_before_commit<S>(
     storage: &S,
-    nameservice: &dyn ReadWriteNameService,
+    nameservice: &dyn IndexingNameService,
     mut ledger: LedgerState,
     indexer_config: IndexerConfig,
     _target_t: i64,

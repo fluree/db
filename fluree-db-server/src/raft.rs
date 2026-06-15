@@ -37,6 +37,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
+use tokio::task::JoinHandle;
 
 /// Per-node Raft integration. Cheap to clone; everything is `Arc`.
 #[derive(Clone)]

@@ -635,9 +635,31 @@ impl<T> Publisher for T where T: IndexPublisher + CommitPublisher + LedgerLifecy
 /// and commit/index publishing ([`Publisher`]) access through a single
 /// `dyn` reference. All types that implement the three automatically
 /// implement this trait via the blanket impl.
-pub trait ReadWriteNameService: NameServiceLookup + BranchLifecycle + Publisher {}
+/// Combined surface indexing reaches through: ledger discovery plus
+/// index-head publishing. Carved off the broader
+/// [`ReadWriteNameService`] because indexing only needs reads and
+/// the one write — letting a replicated implementation (e.g.
+/// `RaftNameService` in `fluree-db-consensus`) implement both
+/// natively without having to fake the rest of the write surface.
+///
+/// All types that implement both halves automatically implement
+/// this trait via the blanket impl.
+pub trait IndexingNameService: NameServiceLookup + IndexPublisher {}
 
-impl<T> ReadWriteNameService for T where T: NameServiceLookup + BranchLifecycle + Publisher {}
+impl<T> IndexingNameService for T where T: NameServiceLookup + IndexPublisher + ?Sized {}
+
+/// Combined read-write nameservice. Declared as
+/// [`IndexingNameService`] + [`BranchLifecycle`] + [`Publisher`]
+/// rather than [`NameServiceLookup`] + ... so that `dyn
+/// ReadWriteNameService` upcasts to `dyn IndexingNameService`
+/// directly — the embedder-friendly path for handing the same
+/// nameservice to the indexer alongside the broader write paths.
+/// (The constituent traits are unchanged; `IndexingNameService`
+/// already requires `NameServiceLookup`, and `Publisher` requires
+/// `IndexPublisher`, so the bound is materially the same.)
+pub trait ReadWriteNameService: IndexingNameService + BranchLifecycle + Publisher {}
+
+impl<T> ReadWriteNameService for T where T: IndexingNameService + BranchLifecycle + Publisher {}
 
 /// Admin-level publisher operations
 ///

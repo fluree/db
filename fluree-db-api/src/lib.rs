@@ -2163,6 +2163,12 @@ impl FlureeBuilder {
                 .indexer_config
                 .clone()
                 .with_fulltext_config_provider(provider);
+            // BackgroundIndexerWorker takes an
+            // `Arc<dyn IndexingNameService>` — the combined lookup
+            // + index-publish surface. `ReadWriteNameService`
+            // declares `IndexingNameService` as a supertrait, so
+            // `Arc<dyn ReadWriteNameService>` upcasts directly.
+            let nameservice: Arc<dyn fluree_db_nameservice::IndexingNameService> = nameservice;
             let (worker, handle) =
                 BackgroundIndexerWorker::new(backend.clone(), nameservice, indexer_config);
             tokio::spawn(worker.run());
