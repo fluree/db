@@ -2852,6 +2852,59 @@ async fn cypher_unwind_runtime_list() {
 }
 
 #[tokio::test]
+async fn cypher_alternation_transitive_path() {
+    // LDBC IC12 shape: `[:HAS_TYPE|IS_SUBCLASS_OF*0..]` — an alternation inside a
+    // transitive path. The closure follows HAS_TYPE once, then IS_SUBCLASS_OF up
+    // the class hierarchy. tagA -HAS_TYPE-> tc1 -IS_SUBCLASS_OF-> tc2 -> tcRoot.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/cypher:alt-transitive");
+    let l = fluree
+        .insert(ledger0, &json!({"@context": ctx(), "@graph": [
+            {"@id":"ex:tagA","@type":"ex:Tag","ex:name":"A","ex:HAS_TYPE":{"@id":"ex:tc1"}},
+            {"@id":"ex:tc1","@type":"ex:TagClass","ex:name":"C1","ex:IS_SUBCLASS_OF":{"@id":"ex:tc2"}},
+            {"@id":"ex:tc2","@type":"ex:TagClass","ex:name":"C2","ex:IS_SUBCLASS_OF":{"@id":"ex:tcRoot"}},
+            {"@id":"ex:tcRoot","@type":"ex:TagClass","ex:name":"Root"},
+        ]}))
+        .await
+        .expect("seed tag hierarchy")
+        .ledger;
+    let db = graphdb_from_ledger(&l);
+
+    // Every TagClass reachable from tagA via HAS_TYPE-then-IS_SUBCLASS_OF*.
+    let out = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (t:Tag {name:"A"})-[:HAS_TYPE|IS_SUBCLASS_OF*0..]->(base:TagClass)
+               RETURN base.name AS cls ORDER BY cls"#,
+        )
+        .await
+        .expect("alternation-transitive path")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    assert_eq!(
+        out,
+        json!([["C1"], ["C2"], ["Root"]]),
+        "closure spans both predicates (HAS_TYPE then IS_SUBCLASS_OF*): {out}"
+    );
+
+    // A single branch alone cannot reach the class hierarchy: IS_SUBCLASS_OF*
+    // from a Tag finds nothing (the first hop is HAS_TYPE, not IS_SUBCLASS_OF).
+    let single = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (t:Tag {name:"A"})-[:IS_SUBCLASS_OF*1..]->(base:TagClass)
+               RETURN base.name AS cls ORDER BY cls"#,
+        )
+        .await
+        .expect("single-branch path")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    assert_eq!(single, json!([]), "single predicate misses the alternation: {single}");
+}
+
+#[tokio::test]
 async fn cypher_path_pairs_and_list_indexing() {
     // pathPairs(p) explodes a path into consecutive node pairs; pair[0]/pair[1]
     // index each two-element pair. The building block for IC14 per-edge weight.

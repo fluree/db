@@ -2385,7 +2385,7 @@ mod tests {
             Pattern::PropertyPath(pp) => {
                 assert!(matches!(pp.modifier, PathModifier::OneOrMore));
                 assert_eq!(pp.subject.as_var().map(|v| vars.name(v)), Some("?s"));
-                assert_eq!(pp.predicate.name_str(), "a");
+                assert_eq!(pp.single_predicate().unwrap().name_str(), "a");
                 assert_eq!(pp.object.as_var().map(|v| vars.name(v)), Some("?__pp0"));
             }
             other => panic!("Expected PropertyPath, got {other:?}"),

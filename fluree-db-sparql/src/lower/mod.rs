@@ -217,8 +217,12 @@ fn reject_direct_reifies_in_patterns(patterns: &[Pattern]) -> Result<()> {
                     }
                 }
                 Pattern::PropertyPath(pp) => {
-                    if fluree_db_core::is_reserved_reifies_predicate(&pp.predicate) {
-                        return Err(reject_predicate_string(format!("{}", pp.predicate)));
+                    if let Some(reserved) = pp
+                        .predicates
+                        .iter()
+                        .find(|p| fluree_db_core::is_reserved_reifies_predicate(p))
+                    {
+                        return Err(reject_predicate_string(format!("{reserved}")));
                     }
                 }
                 // ShortestPath also carries a predicate Sid; apply the same
@@ -2479,16 +2483,24 @@ mod tests {
     }
 
     #[test]
-    fn test_property_path_nested_alternative_under_transitive_errors() {
-        let result = lower_query(
+    fn test_property_path_alternation_transitive_lowers_to_multi_predicate() {
+        // `(a|b)+` is an alternation-transitive path: the closure follows an
+        // edge of either predicate per hop. Lowers to one PropertyPath carrying
+        // both predicates.
+        let query = lower_query(
             "PREFIX ex: <http://example.org/>
              SELECT ?x WHERE { ?s (ex:a|ex:b)+ ?x }",
-        );
+        )
+        .unwrap();
 
-        // Transitive requires simple predicate, not complex expression
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(matches!(err, LowerError::InvalidPropertyPath { .. }));
+        assert_eq!(query.patterns.len(), 1);
+        match &query.patterns[0] {
+            Pattern::PropertyPath(pp) => {
+                assert_eq!(pp.predicates.len(), 2, "both branches traversed: {pp:?}");
+                assert!(pp.single_predicate().is_none());
+            }
+            other => panic!("expected PropertyPath, got {other:?}"),
+        }
     }
 
     #[test]

@@ -2049,7 +2049,8 @@ fn detect_transitive_path_plus_count_all(query: &Query) -> Option<(Ref, Ref, Var
         return None;
     };
 
-    Some((p1, Ref::Sid(pp.predicate.clone()), out_var))
+    // Single-predicate only — an alternation path falls back to the operator.
+    Some((p1, Ref::Sid(pp.single_predicate()?.clone()), out_var))
 }
 
 fn detect_property_path_plus_fixed_subject_count_all(
@@ -2071,7 +2072,7 @@ fn detect_property_path_plus_fixed_subject_count_all(
     let Ref::Var(_o) = &pp.object else {
         return None;
     };
-    Some((pp.predicate.clone(), pp.subject.clone(), out_var))
+    Some((pp.single_predicate()?.clone(), pp.subject.clone(), out_var))
 }
 
 fn detect_union_star_count_all(

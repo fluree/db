@@ -328,10 +328,9 @@ fn lower_var_length_rel<E: IriEncoder>(
             "property filters on a variable-length relationship are deferred",
         ));
     }
-    if rel.types.len() != 1 {
+    if rel.types.is_empty() {
         return Err(LowerError::unsupported(
-            "variable-length paths need exactly one relationship type (`-[:T*m..n]->`); untyped \
-             and alternation forms are deferred",
+            "untyped variable-length paths (`-[*m..n]->`) are deferred; name a relationship type",
         ));
     }
 
@@ -344,11 +343,13 @@ fn lower_var_length_rel<E: IriEncoder>(
 
     let left_ref = lookup_node_ref(ctx, left);
     let right_ref = lookup_node_ref(ctx, right);
-    let type_iri = ctx.resolve_predicate(&rel.types[0].name)?;
 
     match hi {
         // Unbounded — reuse the transitive PropertyPath operator. Cypher `*`
         // means one-or-more (lower bound defaults to 1); `*0..` is zero-or-more.
+        // A type alternation `[:A|B*]` becomes an alternation-transitive path
+        // whose closure follows an edge of any listed type per hop (LDBC IC12's
+        // `[:HAS_TYPE|IS_SUBCLASS_OF*0..]`).
         None => {
             let modifier = match lo {
                 0 => PathModifier::ZeroOrMore,
@@ -371,19 +372,37 @@ fn lower_var_length_rel<E: IriEncoder>(
                 Direction::Incoming => (right_ref, left_ref),
                 Direction::Either => unreachable!(),
             };
-            match ctx.encoder.encode_iri(&type_iri) {
-                Some(predicate) => out.push(Pattern::PropertyPath(PropertyPathPattern::new(
-                    s, predicate, modifier, o,
-                ))),
-                // Unknown relationship type ⇒ no such edges ⇒ no rows, matching
-                // how absent labels/types and the bounded (string-IRI) path
-                // behave — a missing predicate is empty, not a query error.
-                None => out.push(empty_path_result(&s, &o)),
+            // Resolve each named type to a predicate Sid. An unknown type
+            // contributes no edges (matching absent-predicate semantics), so it
+            // is simply dropped; only if EVERY type is unknown is the path empty.
+            let mut predicates = Vec::with_capacity(rel.types.len());
+            for t in &rel.types {
+                let iri = ctx.resolve_predicate(&t.name)?;
+                if let Some(sid) = ctx.encoder.encode_iri(&iri) {
+                    predicates.push(sid);
+                }
+            }
+            if predicates.is_empty() {
+                out.push(empty_path_result(&s, &o));
+            } else {
+                out.push(Pattern::PropertyPath(PropertyPathPattern::new_alternatives(
+                    s, predicates, modifier, o,
+                )));
             }
             Ok(())
         }
         // Bounded — expand to a UNION of fixed-length join chains.
         Some(hi) => {
+            // Bounded alternation would need a per-hop union inside each fixed
+            // chain (combinatorial); only the unbounded transitive form supports
+            // alternation today. Single-type bounded ranges expand as before.
+            if rel.types.len() != 1 {
+                return Err(LowerError::unsupported(
+                    "bounded variable-length paths over a type alternation (`[:A|B*m..n]`) are \
+                     deferred; use an unbounded `[:A|B*]` or a single type",
+                ));
+            }
+            let type_iri = ctx.resolve_predicate(&rel.types[0].name)?;
             if lo == 0 {
                 return Err(LowerError::unsupported(
                     "zero-length bounded paths (`*0..M`) are deferred; use `*1..M`",

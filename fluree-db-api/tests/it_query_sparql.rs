@@ -2627,24 +2627,25 @@ async fn sparql_property_path_alternative_duplicate_semantics() {
 }
 
 #[tokio::test]
-async fn sparql_property_path_nested_alternative_under_transitive_errors() {
+async fn sparql_property_path_alternation_under_transitive() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger = sparql_seed_knows_chain(&fluree, "sparql/path-alt-trans-err:main").await;
+    let ledger = sparql_seed_knows_chain(&fluree, "sparql/path-alt-trans:main").await;
 
-    // (ex:knows|ex:likes)+ — alternative inside transitive is not supported
+    // `(ex:knows|ex:likes)+` — an alternation inside a transitive path follows
+    // an edge of either predicate per hop. Here only `knows` edges exist
+    // (a→b→{c,d}, d→e), so the closure from ex:a is {b, c, d, e}.
     let query = "\
         PREFIX ex: <http://example.org/>
         SELECT ?o WHERE { ex:a (ex:knows|ex:likes)+ ?o }";
 
-    let result = support::query_sparql(&fluree, &ledger, query).await;
-    assert!(
-        result.is_err(),
-        "Nested alternative under transitive should error"
-    );
-    let msg = format!("{}", result.unwrap_err());
-    assert!(
-        msg.contains("simple predicate IRI"),
-        "Error should mention 'simple predicate IRI', got: {msg}"
+    let result = support::query_sparql(&fluree, &ledger, query)
+        .await
+        .expect("alternation under transitive now supported");
+    let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    assert_eq!(
+        normalize_rows(&jsonld),
+        normalize_rows(&json!([["ex:b"], ["ex:c"], ["ex:d"], ["ex:e"]])),
+        "(knows|likes)+ closure over the knows chain: {jsonld}"
     );
 }
 
@@ -4864,5 +4865,54 @@ async fn sparql_group_by_expression_via_bind_workaround() {
     assert_eq!(
         normalize_rows(&jsonld),
         normalize_rows(&json!([["usd", 5], ["cad", 3], ["eur", 2]]))
+    );
+}
+
+#[tokio::test]
+async fn sparql_alternation_transitive_path() {
+    // `(ex:a|ex:b)*` — an alternation inside a transitive path. The closure
+    // follows an edge of EITHER predicate per hop. Chain mixing both:
+    //   n0 -a-> n1 -b-> n2 -a-> n3
+    // From n0, `(a|b)*` reaches n0 (zero hops), n1, n2, n3. Neither `a*` nor
+    // `b*` alone reaches past the first heterogeneous hop.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/sparql:alt-transitive");
+    let insert = json!({
+        "@context": {"ex":"http://example.org/"},
+        "@graph": [
+            {"@id":"ex:n0","ex:a":{"@id":"ex:n1"}},
+            {"@id":"ex:n1","ex:b":{"@id":"ex:n2"}},
+            {"@id":"ex:n2","ex:a":{"@id":"ex:n3"}},
+        ]
+    });
+    let ledger = fluree.insert(ledger0, &insert).await.unwrap().ledger;
+
+    let query = r#"
+        PREFIX ex: <http://example.org/>
+        SELECT ?x WHERE { ex:n0 (ex:a|ex:b)* ?x }
+    "#;
+    let result = support::query_sparql(&fluree, &ledger, query)
+        .await
+        .expect("alternation-transitive sparql");
+    let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    assert_eq!(
+        normalize_rows(&jsonld),
+        normalize_rows(&json!([["ex:n0"], ["ex:n1"], ["ex:n2"], ["ex:n3"]])),
+        "closure follows either predicate per hop: {jsonld}"
+    );
+
+    // `ex:a*` alone stops at n1 (the n1->n2 hop is ex:b).
+    let single = r#"
+        PREFIX ex: <http://example.org/>
+        SELECT ?x WHERE { ex:n0 ex:a* ?x }
+    "#;
+    let r2 = support::query_sparql(&fluree, &ledger, single)
+        .await
+        .expect("single-predicate star");
+    let j2 = r2.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    assert_eq!(
+        normalize_rows(&j2),
+        normalize_rows(&json!([["ex:n0"], ["ex:n1"]])),
+        "single predicate stops at the heterogeneous hop: {j2}"
     );
 }

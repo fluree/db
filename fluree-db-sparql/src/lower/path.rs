@@ -76,16 +76,28 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                         span,
                     ));
                 }
-                let iri = self.extract_simple_predicate_iri(inner, span)?;
+                // A transitive over an alternation of simple predicates —
+                // `(a|b)*` / `(a|b)+` — becomes an alternation-transitive path
+                // whose closure follows an edge of any branch per hop.
+                let iris = self.extract_transitive_predicate_iris(inner, span)?;
                 let modifier = match effective_path {
                     SparqlPropertyPath::OneOrMore { .. } => PathModifier::OneOrMore,
                     _ => PathModifier::ZeroOrMore,
                 };
-                let predicate_sid = self
-                    .encoder
-                    .encode_iri(&iri)
-                    .ok_or_else(|| LowerError::unknown_namespace(&iri, span))?;
-                let pp = PropertyPathPattern::new(s.clone(), predicate_sid, modifier, o.clone());
+                let mut predicate_sids = Vec::with_capacity(iris.len());
+                for iri in &iris {
+                    predicate_sids.push(
+                        self.encoder
+                            .encode_iri(iri)
+                            .ok_or_else(|| LowerError::unknown_namespace(iri, span))?,
+                    );
+                }
+                let pp = PropertyPathPattern::new_alternatives(
+                    s.clone(),
+                    predicate_sids,
+                    modifier,
+                    o.clone(),
+                );
                 Ok(vec![Pattern::PropertyPath(pp)])
             }
 
@@ -734,6 +746,30 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
     /// Extract a simple predicate IRI from a property path.
     ///
     /// The path must be a simple IRI or the `a` keyword.
+    /// Predicate IRIs traversed by a transitive path (`+`/`*`). A simple inner
+    /// predicate yields one IRI; an alternation of simple predicates `(a|b|…)`
+    /// yields one per branch (for an alternation-transitive `(a|b)*`). Each
+    /// branch must be a simple predicate (`Iri`/`a`, possibly grouped); a
+    /// non-simple branch (inverse, sequence, nested modifier) is rejected.
+    fn extract_transitive_predicate_iris(
+        &mut self,
+        path: &SparqlPropertyPath,
+        span: SourceSpan,
+    ) -> Result<Vec<String>> {
+        let unwrapped = Self::unwrap_group(path);
+        match unwrapped {
+            SparqlPropertyPath::Alternative { .. } => {
+                let leaves = Self::collect_alt_leaves(unwrapped);
+                let mut iris = Vec::with_capacity(leaves.len());
+                for leaf in leaves {
+                    iris.push(self.extract_simple_predicate_iri(leaf, span)?);
+                }
+                Ok(iris)
+            }
+            _ => Ok(vec![self.extract_simple_predicate_iri(unwrapped, span)?]),
+        }
+    }
+
     fn extract_simple_predicate_iri(
         &mut self,
         path: &SparqlPropertyPath,

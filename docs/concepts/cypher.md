@@ -120,6 +120,11 @@ ORDER BY / SKIP / LIMIT
 - Variable-length paths `-[:T*]->`, `-[:T*m..n]->` (unbounded reuses
   the transitive `PropertyPath` operator; bounded ranges expand to a
   `Union` of fixed-length chains with relationship-uniqueness filters).
+  An **unbounded** range may name a type *alternation*
+  (`-[:A|B*]->`, `-[:A|B*0..]->`): the closure follows an edge of any
+  listed type per hop (LDBC IC12's
+  `[:HAS_TYPE|IS_SUBCLASS_OF*0..]`). Bounded alternation
+  (`-[:A|B*1..3]->`) is still deferred — use the unbounded form.
 - Undirected relationships `-[:T]-` (forward ∪ reverse `Union`).
 - Path finding: `MATCH p = shortestPath((a)-[:T*]-(b))` and
   `allShortestPaths(...)`. Anchored (both endpoints bound by a

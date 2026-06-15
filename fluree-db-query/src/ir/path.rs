@@ -23,8 +23,11 @@ pub enum PathModifier {
 pub struct PropertyPathPattern {
     /// Subject ref (Var or Sid — literals not allowed)
     pub subject: Ref,
-    /// Predicate to traverse (always resolved to Sid)
-    pub predicate: Sid,
+    /// Predicate(s) to traverse, all resolved to Sids. A single entry is the
+    /// ordinary `p*` / `p+`; multiple entries are an alternation-transitive
+    /// path `(a|b|…)*` — the closure follows an edge of ANY listed predicate at
+    /// each hop (SPARQL `(a|b)*`, Cypher `[:A|B*]`). Never empty.
+    pub predicates: Vec<Sid>,
     /// Path modifier (+ or *)
     pub modifier: PathModifier,
     /// Object ref (Var or Sid — literals not allowed)
@@ -32,13 +35,42 @@ pub struct PropertyPathPattern {
 }
 
 impl PropertyPathPattern {
-    /// Create a new property path pattern
+    /// Create a single-predicate property path pattern (`p*` / `p+`).
     pub fn new(subject: Ref, predicate: Sid, modifier: PathModifier, object: Ref) -> Self {
         Self {
             subject,
-            predicate,
+            predicates: vec![predicate],
             modifier,
             object,
+        }
+    }
+
+    /// Create an alternation-transitive path `(a|b|…)*` over `predicates`
+    /// (the closure follows an edge of any listed predicate per hop). The
+    /// caller must pass a non-empty list.
+    pub fn new_alternatives(
+        subject: Ref,
+        predicates: Vec<Sid>,
+        modifier: PathModifier,
+        object: Ref,
+    ) -> Self {
+        debug_assert!(!predicates.is_empty(), "property path needs ≥1 predicate");
+        Self {
+            subject,
+            predicates,
+            modifier,
+            object,
+        }
+    }
+
+    /// The single traversed predicate, if this path has exactly one — used by
+    /// count/scan fast paths that only handle the single-predicate shape.
+    /// Returns `None` for an alternation path so callers fall back to the
+    /// general traversal operator.
+    pub fn single_predicate(&self) -> Option<&Sid> {
+        match self.predicates.as_slice() {
+            [p] => Some(p),
+            _ => None,
         }
     }
 
