@@ -2288,16 +2288,22 @@ mod tests {
     }
 
     #[test]
-    fn test_property_path_both_constants_error() {
-        let result = lower_query(
+    fn test_property_path_both_constants_is_reachability() {
+        // Both endpoints constant is a reachability test, not an error: it
+        // lowers to a PropertyPath whose both-Sid arm emits one empty solution
+        // iff a path exists (W3C `:a :p+ :b`).
+        let query = lower_query(
             "PREFIX ex: <http://example.org/>
              SELECT * WHERE { ex:alice ex:parent+ ex:bob }",
-        );
-
-        // Should error because both subject and object are bound
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(matches!(err, LowerError::InvalidPropertyPath { .. }));
+        )
+        .unwrap();
+        assert_eq!(query.patterns.len(), 1);
+        match &query.patterns[0] {
+            Pattern::PropertyPath(pp) => {
+                assert!(pp.subject.is_bound() && pp.object.is_bound());
+            }
+            other => panic!("expected PropertyPath, got {other:?}"),
+        }
     }
 
     #[test]
@@ -2369,17 +2375,16 @@ mod tests {
     }
 
     #[test]
-    fn test_property_path_inverse_transitive_both_constants_error() {
-        let result = lower_query(
+    fn test_property_path_inverse_transitive_both_constants_is_reachability() {
+        // `:a ^:p+ :b` both-constant inverse transitive is also a reachability
+        // test (lowers to a PropertyPath with swapped, both-bound endpoints).
+        let query = lower_query(
             "PREFIX ex: <http://example.org/>
              SELECT * WHERE { ex:alice ^ex:knows+ ex:bob }",
-        );
-
-        assert!(result.is_err());
-        assert!(matches!(
-            result.unwrap_err(),
-            LowerError::InvalidPropertyPath { .. }
-        ));
+        )
+        .unwrap();
+        assert_eq!(query.patterns.len(), 1);
+        assert!(matches!(&query.patterns[0], Pattern::PropertyPath(_)));
     }
 
     #[test]

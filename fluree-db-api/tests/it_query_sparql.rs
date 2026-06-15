@@ -4916,3 +4916,35 @@ async fn sparql_alternation_transitive_path() {
         "single predicate stops at the heterogeneous hop: {j2}"
     );
 }
+
+#[tokio::test]
+async fn sparql_both_bound_path_reachability() {
+    // `:a :p+ :c` with BOTH endpoints bound is a reachability test (W3C pp36
+    // shape). With a sibling variable it yields one row iff reachable, none if
+    // not. Chain a->b->c via ex:p.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/sparql:both-bound");
+    let insert = json!({
+        "@context": {"ex":"http://example.org/"},
+        "@graph": [
+            {"@id":"ex:a","ex:p":{"@id":"ex:b"},"ex:tag":"A"},
+            {"@id":"ex:b","ex:p":{"@id":"ex:c"}},
+            {"@id":"ex:z","ex:tag":"Z"},
+        ]
+    });
+    let ledger = fluree.insert(ledger0, &insert).await.unwrap().ledger;
+
+    // Reachable a -> c: one row (the sibling tag binds).
+    let q1 = r#"PREFIX ex: <http://example.org/>
+        SELECT ?t WHERE { ex:a ex:p+ ex:c . ex:a ex:tag ?t }"#;
+    let r1 = support::query_sparql(&fluree, &ledger, q1).await.expect("reachable");
+    let j1 = r1.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    assert_eq!(normalize_rows(&j1), normalize_rows(&json!([["A"]])), "a reaches c: {j1}");
+
+    // Not reachable a -> z: zero rows.
+    let q2 = r#"PREFIX ex: <http://example.org/>
+        SELECT ?t WHERE { ex:a ex:p+ ex:z . ex:a ex:tag ?t }"#;
+    let r2 = support::query_sparql(&fluree, &ledger, q2).await.expect("unreachable");
+    let j2 = r2.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    assert_eq!(normalize_rows(&j2), normalize_rows(&json!([])), "a cannot reach z: {j2}");
+}
