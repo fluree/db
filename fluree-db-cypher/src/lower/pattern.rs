@@ -2,13 +2,13 @@
 
 use fluree_db_core::FlakeValue;
 use fluree_db_query::ir::{
-    Expression, Function, PathDirection, PathModifier, Pattern, PropertyPathPattern,
-    ShortestPathMode, ShortestPathPattern, Ref, Term, TriplePattern,
+    Expression, Function, PathDirection, PathModifier, Pattern, PropertyPathPattern, Ref,
+    ShortestPathMode, ShortestPathPattern, Term, TriplePattern,
 };
 use fluree_db_query::parse::encode::IriEncoder;
 
 use crate::ast::{
-    Direction, Expr, Label, MapLit, NodePattern, Pattern as CypherPattern, PathSearch, PatternPart,
+    Direction, Expr, Label, MapLit, NodePattern, PathSearch, Pattern as CypherPattern, PatternPart,
     RelPattern, Variable,
 };
 
@@ -385,9 +385,9 @@ fn lower_var_length_rel<E: IriEncoder>(
             if predicates.is_empty() {
                 out.push(empty_path_result(&s, &o));
             } else {
-                out.push(Pattern::PropertyPath(PropertyPathPattern::new_alternatives(
-                    s, predicates, modifier, o,
-                )));
+                out.push(Pattern::PropertyPath(
+                    PropertyPathPattern::new_alternatives(s, predicates, modifier, o),
+                ));
             }
             Ok(())
         }

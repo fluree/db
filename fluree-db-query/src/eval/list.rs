@@ -161,9 +161,9 @@ pub fn eval_list_index<R: RowAccess>(
     row: &R,
     ctx: Option<&ExecutionContext<'_>>,
 ) -> Result<Option<ComparableValue>> {
-    Ok(element_to_comparable(
-        &eval_list_index_to_binding(args, row, ctx)?,
-    ))
+    Ok(element_to_comparable(&eval_list_index_to_binding(
+        args, row, ctx,
+    )?))
 }
 
 /// Binding-producing evaluation for the list-*returning* functions

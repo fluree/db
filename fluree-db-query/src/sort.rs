@@ -216,10 +216,11 @@ pub fn compare_bindings(a: &Binding, b: &Binding) -> Ordering {
 
         // List sorts last, element-wise (cypher rejects ORDER BY <list>, so
         // this is only a defensive total order).
-        (Binding::List(x), Binding::List(y)) => {
-            x.iter().map(Some).chain(std::iter::repeat(None)).zip(
-                y.iter().map(Some).chain(std::iter::repeat(None)),
-            )
+        (Binding::List(x), Binding::List(y)) => x
+            .iter()
+            .map(Some)
+            .chain(std::iter::repeat(None))
+            .zip(y.iter().map(Some).chain(std::iter::repeat(None)))
             .take(x.len().max(y.len()))
             .map(|(a, b)| match (a, b) {
                 (Some(a), Some(b)) => compare_bindings(a, b),
@@ -228,8 +229,7 @@ pub fn compare_bindings(a: &Binding, b: &Binding) -> Ordering {
                 (None, None) => Ordering::Equal,
             })
             .find(|o| *o != Ordering::Equal)
-            .unwrap_or(Ordering::Equal)
-        }
+            .unwrap_or(Ordering::Equal),
         (_, Binding::List(_)) => Ordering::Less,
         (Binding::List(_), _) => Ordering::Greater,
 

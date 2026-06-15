@@ -41,7 +41,11 @@ impl UnwindOperator {
         let child_schema = child.schema();
         let (schema, var_position, is_new_var): (Arc<[VarId]>, usize, bool) =
             match child_schema.iter().position(|&v| v == var) {
-                Some(pos) => (Arc::from(child_schema.to_vec().into_boxed_slice()), pos, false),
+                Some(pos) => (
+                    Arc::from(child_schema.to_vec().into_boxed_slice()),
+                    pos,
+                    false,
+                ),
                 None => {
                     let mut s = child_schema.to_vec();
                     let pos = s.len();

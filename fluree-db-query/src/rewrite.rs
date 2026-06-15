@@ -276,7 +276,7 @@ fn rewrite_single_pattern(
         // Non-expandable patterns
         Pattern::Filter(_)
         | Pattern::Bind { .. }
-            | Pattern::Unwind { .. }
+        | Pattern::Unwind { .. }
         | Pattern::Values { .. }
         | Pattern::PropertyPath(_)
         | Pattern::ShortestPath(_)

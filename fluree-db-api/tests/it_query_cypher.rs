@@ -1924,7 +1924,11 @@ async fn cypher_all_shortest_paths_returns_each_minimal_path() {
         .await
         .expect("jsonld");
     let rows = out.as_array().expect("rows");
-    assert_eq!(rows.len(), 2, "two distinct 2-hop paths a→b→d, a→c→d: {out}");
+    assert_eq!(
+        rows.len(),
+        2,
+        "two distinct 2-hop paths a→b→d, a→c→d: {out}"
+    );
     assert!(
         rows.iter().all(|r| r[0] == json!(2)),
         "both minimal paths are length 2: {out}"
@@ -2008,7 +2012,11 @@ async fn cypher_shortest_path_single_honors_lower_hop_bound() {
         .to_jsonld_async(db.as_graph_db_ref())
         .await
         .expect("jsonld");
-    assert_eq!(out[0][0], json!(2), "shortest qualifying path is length 2: {out}");
+    assert_eq!(
+        out[0][0],
+        json!(2),
+        "shortest qualifying path is length 2: {out}"
+    );
 }
 
 /// Seed 4 persons with `ex:id` 1..4 where person 1 KNOWS persons 3 and 4.
@@ -2045,7 +2053,7 @@ async fn cypher_exists_bare_pattern_form() {
     let out = fluree
         .query_cypher(
             &db,
-            r#"MATCH (p:Person {id: 1}) WHERE EXISTS { (p)-[:KNOWS]-(x:Person) } RETURN p.id AS id"#,
+            r"MATCH (p:Person {id: 1}) WHERE EXISTS { (p)-[:KNOWS]-(x:Person) } RETURN p.id AS id",
         )
         .await
         .expect("exists bare")
@@ -2065,7 +2073,7 @@ async fn cypher_exists_subquery_match_form() {
     let out = fluree
         .query_cypher(
             &db,
-            r#"MATCH (p:Person {id: 1}) WHERE EXISTS { MATCH (p)-[:KNOWS]-(x:Person) } RETURN p.id AS id"#,
+            r"MATCH (p:Person {id: 1}) WHERE EXISTS { MATCH (p)-[:KNOWS]-(x:Person) } RETURN p.id AS id",
         )
         .await
         .expect("exists match-form")
@@ -2086,16 +2094,20 @@ async fn cypher_exists_subquery_inner_where() {
     let out = fluree
         .query_cypher(
             &db,
-            r#"MATCH (p:Person {id: 1})
+            r"MATCH (p:Person {id: 1})
                WHERE EXISTS { MATCH (p)-[:KNOWS]-(x) WHERE x.id > 2 }
-               RETURN p.id AS id"#,
+               RETURN p.id AS id",
         )
         .await
         .expect("exists inner-where")
         .to_jsonld_async(db.as_graph_db_ref())
         .await
         .expect("jsonld");
-    assert_eq!(out[0][0], json!(1), "person 1 has a friend with id > 2: {out}");
+    assert_eq!(
+        out[0][0],
+        json!(1),
+        "person 1 has a friend with id > 2: {out}"
+    );
 }
 
 #[tokio::test]
@@ -2109,9 +2121,9 @@ async fn cypher_exists_inner_where_excludes_when_unmet() {
     let rows = fluree
         .query_cypher(
             &db,
-            r#"MATCH (p:Person {id: 1})
+            r"MATCH (p:Person {id: 1})
                WHERE EXISTS { MATCH (p)-[:KNOWS]-(x) WHERE x.id > 100 }
-               RETURN p.id AS id"#,
+               RETURN p.id AS id",
         )
         .await
         .expect("exists inner-where unmet");
@@ -2129,16 +2141,20 @@ async fn cypher_not_exists_subquery_inner_where() {
     let out = fluree
         .query_cypher(
             &db,
-            r#"MATCH (p:Person {id: 1})
+            r"MATCH (p:Person {id: 1})
                WHERE NOT EXISTS { MATCH (p)-[:KNOWS]-(x) WHERE x.id > 100 }
-               RETURN p.id AS id"#,
+               RETURN p.id AS id",
         )
         .await
         .expect("not exists inner-where")
         .to_jsonld_async(db.as_graph_db_ref())
         .await
         .expect("jsonld");
-    assert_eq!(out[0][0], json!(1), "no friend with id > 100 → NOT EXISTS holds: {out}");
+    assert_eq!(
+        out[0][0],
+        json!(1),
+        "no friend with id > 100 → NOT EXISTS holds: {out}"
+    );
 }
 
 #[tokio::test]
@@ -2150,7 +2166,7 @@ async fn cypher_create_list_valued_property_stores_each_element() {
     let committed = fluree
         .transact_cypher(
             ledger0,
-            r#"CREATE (n:Person {id: 1, email: ['a@x.com', 'b@y.com']})"#,
+            r"CREATE (n:Person {id: 1, email: ['a@x.com', 'b@y.com']})",
         )
         .await
         .expect("list-valued create");
@@ -2160,7 +2176,7 @@ async fn cypher_create_list_valued_property_stores_each_element() {
     let rows = fluree
         .query_cypher(
             &db,
-            r#"MATCH (n:Person {id: 1}) RETURN n.email AS email ORDER BY email"#,
+            r"MATCH (n:Person {id: 1}) RETURN n.email AS email ORDER BY email",
         )
         .await
         .expect("read emails")
@@ -2197,14 +2213,18 @@ async fn cypher_create_empty_list_property_stores_nothing() {
     let rows = fluree
         .query_cypher(
             &db,
-            r#"MATCH (n:Person {id: 1}) WHERE n.email IS NULL RETURN n.name AS name"#,
+            r"MATCH (n:Person {id: 1}) WHERE n.email IS NULL RETURN n.name AS name",
         )
         .await
         .expect("read")
         .to_jsonld_async(db.as_graph_db_ref())
         .await
         .expect("jsonld");
-    assert_eq!(rows[0][0], json!("Alice"), "empty list stored no email: {rows}");
+    assert_eq!(
+        rows[0][0],
+        json!("Alice"),
+        "empty list stored no email: {rows}"
+    );
 }
 
 #[tokio::test]
@@ -2226,14 +2246,18 @@ async fn cypher_iu8_friendship_with_edge_property() {
     let out = fluree
         .query_cypher(
             &db,
-            r#"MATCH (a:Person {id: 1})-[k:KNOWS]->(b:Person {id: 2}) RETURN k.creationDate AS cd"#,
+            r"MATCH (a:Person {id: 1})-[k:KNOWS]->(b:Person {id: 2}) RETURN k.creationDate AS cd",
         )
         .await
         .expect("read friendship")
         .to_jsonld_async(db.as_graph_db_ref())
         .await
         .expect("jsonld");
-    assert_eq!(out[0][0], json!("2020-01-01"), "edge property stored: {out}");
+    assert_eq!(
+        out[0][0],
+        json!("2020-01-01"),
+        "edge property stored: {out}"
+    );
 }
 
 #[tokio::test]
@@ -2245,7 +2269,7 @@ async fn cypher_iu1_inline_relationship_with_edge_property() {
     let committed = fluree
         .transact_cypher(
             ledger0,
-            r#"CREATE (p:Person {id: 30})-[:STUDY_AT {classYear: 2011}]->(u:University {id: 40})"#,
+            r"CREATE (p:Person {id: 30})-[:STUDY_AT {classYear: 2011}]->(u:University {id: 40})",
         )
         .await
         .expect("inline edge-prop create");
@@ -2254,7 +2278,7 @@ async fn cypher_iu1_inline_relationship_with_edge_property() {
     let out = fluree
         .query_cypher(
             &db,
-            r#"MATCH (p:Person {id: 30})-[s:STUDY_AT]->(u) RETURN s.classYear AS y"#,
+            r"MATCH (p:Person {id: 30})-[s:STUDY_AT]->(u) RETURN s.classYear AS y",
         )
         .await
         .expect("read studyAt")
@@ -2273,9 +2297,9 @@ async fn cypher_multi_clause_create_builds_node_then_edges() {
     let committed = fluree
         .transact_cypher(
             ledger0,
-            r#"CREATE (p:Person {id: 10})
+            r"CREATE (p:Person {id: 10})
                CREATE (u:University {id: 20})
-               CREATE (p)-[:STUDY_AT]->(u)"#,
+               CREATE (p)-[:STUDY_AT]->(u)",
         )
         .await
         .expect("multi-clause create");
@@ -2284,11 +2308,15 @@ async fn cypher_multi_clause_create_builds_node_then_edges() {
     let rows = fluree
         .query_cypher(
             &db,
-            r#"MATCH (p:Person {id: 10})-[:STUDY_AT]->(u:University {id: 20}) RETURN u"#,
+            r"MATCH (p:Person {id: 10})-[:STUDY_AT]->(u:University {id: 20}) RETURN u",
         )
         .await
         .expect("read multi-create relationship");
-    assert_eq!(rows.row_count(), 1, "node-node-edge chain across CREATE clauses");
+    assert_eq!(
+        rows.row_count(),
+        1,
+        "node-node-edge chain across CREATE clauses"
+    );
 }
 
 #[tokio::test]
@@ -2317,7 +2345,7 @@ async fn cypher_unwind_batch_list_valued_field() {
     let out = fluree
         .query_cypher(
             &db,
-            r#"MATCH (n:Person {id: 1}) RETURN n.email AS email ORDER BY email"#,
+            r"MATCH (n:Person {id: 1}) RETURN n.email AS email ORDER BY email",
         )
         .await
         .expect("read")
@@ -2330,7 +2358,11 @@ async fn cypher_unwind_batch_list_valued_field() {
         .iter()
         .filter_map(|r| r[0].as_str())
         .collect();
-    assert_eq!(emails, vec!["a@x.com", "b@y.com"], "both batch emails stored: {out}");
+    assert_eq!(
+        emails,
+        vec!["a@x.com", "b@y.com"],
+        "both batch emails stored: {out}"
+    );
 }
 
 #[tokio::test]
@@ -2341,7 +2373,7 @@ async fn cypher_set_list_valued_property_replaces() {
     let l = fluree
         .transact_cypher(
             ledger0,
-            r#"CREATE (n:Person {id: 1, email: ['old1@x.com', 'old2@x.com']})"#,
+            r"CREATE (n:Person {id: 1, email: ['old1@x.com', 'old2@x.com']})",
         )
         .await
         .expect("create")
@@ -2349,7 +2381,7 @@ async fn cypher_set_list_valued_property_replaces() {
     let committed = fluree
         .transact_cypher(
             l,
-            r#"MATCH (n:Person {id: 1}) SET n.email = ['new@x.com', 'also@x.com']"#,
+            r"MATCH (n:Person {id: 1}) SET n.email = ['new@x.com', 'also@x.com']",
         )
         .await
         .expect("set list");
@@ -2358,7 +2390,7 @@ async fn cypher_set_list_valued_property_replaces() {
     let out = fluree
         .query_cypher(
             &db,
-            r#"MATCH (n:Person {id: 1}) RETURN n.email AS email ORDER BY email"#,
+            r"MATCH (n:Person {id: 1}) RETURN n.email AS email ORDER BY email",
         )
         .await
         .expect("read")
@@ -2391,7 +2423,7 @@ async fn cypher_set_plus_equals_list_valued_property() {
     let committed = fluree
         .transact_cypher(
             l,
-            r#"MATCH (n:Person {id: 1}) SET n += {speaks: ['en', 'fr', 'de']}"#,
+            r"MATCH (n:Person {id: 1}) SET n += {speaks: ['en', 'fr', 'de']}",
         )
         .await
         .expect("set += list");
@@ -2400,7 +2432,7 @@ async fn cypher_set_plus_equals_list_valued_property() {
     let out = fluree
         .query_cypher(
             &db,
-            r#"MATCH (n:Person {id: 1}) RETURN n.speaks AS s ORDER BY s"#,
+            r"MATCH (n:Person {id: 1}) RETURN n.speaks AS s ORDER BY s",
         )
         .await
         .expect("read")
@@ -2413,7 +2445,11 @@ async fn cypher_set_plus_equals_list_valued_property() {
         .iter()
         .filter_map(|r| r[0].as_str())
         .collect();
-    assert_eq!(langs, vec!["de", "en", "fr"], "all three languages stored: {out}");
+    assert_eq!(
+        langs,
+        vec!["de", "en", "fr"],
+        "all three languages stored: {out}"
+    );
 }
 
 #[tokio::test]
@@ -2425,7 +2461,7 @@ async fn cypher_merge_on_create_set_list_valued_property() {
     let committed = fluree
         .transact_cypher(
             ledger0,
-            r#"MERGE (n:Person {id: 1}) ON CREATE SET n.email = ['a@x.com', 'b@y.com']"#,
+            r"MERGE (n:Person {id: 1}) ON CREATE SET n.email = ['a@x.com', 'b@y.com']",
         )
         .await
         .expect("merge on create set list");
@@ -2434,7 +2470,7 @@ async fn cypher_merge_on_create_set_list_valued_property() {
     let out = fluree
         .query_cypher(
             &db,
-            r#"MATCH (n:Person {id: 1}) RETURN n.email AS email ORDER BY email"#,
+            r"MATCH (n:Person {id: 1}) RETURN n.email AS email ORDER BY email",
         )
         .await
         .expect("read")
@@ -2447,7 +2483,11 @@ async fn cypher_merge_on_create_set_list_valued_property() {
         .iter()
         .filter_map(|r| r[0].as_str())
         .collect();
-    assert_eq!(emails, vec!["a@x.com", "b@y.com"], "on-create list stored: {out}");
+    assert_eq!(
+        emails,
+        vec!["a@x.com", "b@y.com"],
+        "on-create list stored: {out}"
+    );
 }
 
 /// Seed Alice KNOWS Bob, Carol, Dave (3 named friends) for list-function tests.
@@ -2558,17 +2598,24 @@ async fn cypher_list_literal_expression() {
 
     // A list literal mixing a node id and name.
     let pair = fluree
-        .query_cypher(&db, r#"MATCH (n:Person {id:1}) RETURN [n.id, n.name] AS pair"#)
+        .query_cypher(
+            &db,
+            r"MATCH (n:Person {id:1}) RETURN [n.id, n.name] AS pair",
+        )
         .await
         .expect("list literal")
         .to_jsonld_async(db.as_graph_db_ref())
         .await
         .expect("jsonld");
-    assert_eq!(pair[0][0], json!([1, "Alice"]), "mixed-type list literal: {pair}");
+    assert_eq!(
+        pair[0][0],
+        json!([1, "Alice"]),
+        "mixed-type list literal: {pair}"
+    );
 
     // A bare scalar list literal.
     let nums = fluree
-        .query_cypher(&db, r#"MATCH (n:Person {id:1}) RETURN [1, 2, 3] AS nums"#)
+        .query_cypher(&db, r"MATCH (n:Person {id:1}) RETURN [1, 2, 3] AS nums")
         .await
         .expect("scalar list literal")
         .to_jsonld_async(db.as_graph_db_ref())
@@ -2587,7 +2634,7 @@ async fn cypher_structured_collect_of_tuples() {
     let pairs = fluree
         .query_cypher(
             &db,
-            r#"MATCH (n:Person) RETURN collect([n.id, n.name]) AS pairs"#,
+            r"MATCH (n:Person) RETURN collect([n.id, n.name]) AS pairs",
         )
         .await
         .expect("structured collect")
@@ -2611,7 +2658,7 @@ async fn cypher_size_of_structured_collect() {
     let n = fluree
         .query_cypher(
             &db,
-            r#"MATCH (n:Person) RETURN size(collect([n.id, n.name])) AS v"#,
+            r"MATCH (n:Person) RETURN size(collect([n.id, n.name])) AS v",
         )
         .await
         .expect("size of structured collect")
@@ -2698,7 +2745,7 @@ async fn cypher_order_by_expression_key() {
     let out = fluree
         .query_cypher(
             &db,
-            r#"MATCH (n:Person) RETURN n.name AS name ORDER BY toInteger(n.sid)"#,
+            r"MATCH (n:Person) RETURN n.name AS name ORDER BY toInteger(n.sid)",
         )
         .await
         .expect("order by toInteger")
@@ -2711,7 +2758,11 @@ async fn cypher_order_by_expression_key() {
         .iter()
         .filter_map(|r| r[0].as_str())
         .collect();
-    assert_eq!(names, vec!["B", "A", "C"], "numeric id order (2,10,30): {out}");
+    assert_eq!(
+        names,
+        vec!["B", "A", "C"],
+        "numeric id order (2,10,30): {out}"
+    );
 }
 
 #[tokio::test]
@@ -2754,7 +2805,10 @@ async fn cypher_nodes_of_path_and_range() {
 
     // range() builds an inclusive integer list, with an optional step.
     let r = fluree
-        .query_cypher(&db, r#"MATCH (n:Person {name:"Alice"}) RETURN range(1, 5) AS r"#)
+        .query_cypher(
+            &db,
+            r#"MATCH (n:Person {name:"Alice"}) RETURN range(1, 5) AS r"#,
+        )
         .await
         .expect("range")
         .to_jsonld_async(db.as_graph_db_ref())
@@ -2763,7 +2817,10 @@ async fn cypher_nodes_of_path_and_range() {
     assert_eq!(r[0][0], json!([1, 2, 3, 4, 5]), "range(1,5): {r}");
 
     let r2 = fluree
-        .query_cypher(&db, r#"MATCH (n:Person {name:"Alice"}) RETURN range(0, 10, 2) AS r"#)
+        .query_cypher(
+            &db,
+            r#"MATCH (n:Person {name:"Alice"}) RETURN range(0, 10, 2) AS r"#,
+        )
         .await
         .expect("range step")
         .to_jsonld_async(db.as_graph_db_ref())
@@ -2809,7 +2866,8 @@ async fn cypher_ic14_connection_paths_via_all_shortest() {
     assert_eq!(rows.len(), 2, "two shortest connection paths: {out}");
     // Each path has 3 nodes (A, middle, D).
     assert!(
-        rows.iter().all(|r| r[0].as_array().map(|a| a.len()) == Some(3)),
+        rows.iter()
+            .all(|r| r[0].as_array().map(std::vec::Vec::len) == Some(3)),
         "each path is A→mid→D = 3 nodes: {out}"
     );
 }
@@ -2824,7 +2882,10 @@ async fn cypher_unwind_runtime_list() {
 
     // UNWIND range(1,3).
     let xs = fluree
-        .query_cypher(&db, r#"MATCH (n:Person {name:"Alice"}) UNWIND range(1,3) AS x RETURN x"#)
+        .query_cypher(
+            &db,
+            r#"MATCH (n:Person {name:"Alice"}) UNWIND range(1,3) AS x RETURN x"#,
+        )
         .await
         .expect("unwind range")
         .to_jsonld_async(db.as_graph_db_ref())
@@ -2847,8 +2908,17 @@ async fn cypher_unwind_runtime_list() {
         .to_jsonld_async(db.as_graph_db_ref())
         .await
         .expect("jsonld");
-    let got: Vec<&str> = names.as_array().unwrap().iter().filter_map(|r| r[0].as_str()).collect();
-    assert_eq!(got, vec!["Alice", "Bob", "Carol", "Dave"], "one name per path node: {names}");
+    let got: Vec<&str> = names
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|r| r[0].as_str())
+        .collect();
+    assert_eq!(
+        got,
+        vec!["Alice", "Bob", "Carol", "Dave"],
+        "one name per path node: {names}"
+    );
 }
 
 #[tokio::test]
@@ -2901,7 +2971,11 @@ async fn cypher_alternation_transitive_path() {
         .to_jsonld_async(db.as_graph_db_ref())
         .await
         .expect("jsonld");
-    assert_eq!(single, json!([]), "single predicate misses the alternation: {single}");
+    assert_eq!(
+        single,
+        json!([]),
+        "single predicate misses the alternation: {single}"
+    );
 }
 
 #[tokio::test]
@@ -3097,9 +3171,7 @@ async fn cypher_ic14_faithful_ldbc_weight() {
     //     path p0-p2-p3 weight = 2.0
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger0 = genesis_ledger(&fluree, "it/cypher:ic14-faithful");
-    let person = |id: &str, knows: JsonValue| {
-        json!({"@id": format!("ex:{id}"), "@type":"ex:Person", "ex:pid": id, "ex:KNOWS": knows})
-    };
+    let person = |id: &str, knows: JsonValue| json!({"@id": format!("ex:{id}"), "@type":"ex:Person", "ex:pid": id, "ex:KNOWS": knows});
     // Comment `c` by `creator` replying to message `target`.
     let comment = |c: &str, creator: &str, target: &str| {
         json!({"@id": format!("ex:{c}"), "@type":"ex:Comment",
@@ -3160,10 +3232,7 @@ async fn cypher_ic14_faithful_ldbc_weight() {
         .expect("jsonld");
     assert_eq!(
         out,
-        json!([
-            [["p0", "p1", "p3"], 2.5],
-            [["p0", "p2", "p3"], 2.0],
-        ]),
+        json!([[["p0", "p1", "p3"], 2.5], [["p0", "p2", "p3"], 2.0],]),
         "LDBC IC14 weighted paths, descending: {out}"
     );
 }
@@ -3286,7 +3355,11 @@ async fn cypher_var_length_relationship_uniqueness_allows_cycle_closure() {
         .to_jsonld_async(db.as_graph_db_ref())
         .await
         .expect("jsonld");
-    assert_eq!(cycle[0][0], json!("A"), "3-hop cycle A-B-C-A closes: {cycle}");
+    assert_eq!(
+        cycle[0][0],
+        json!("A"),
+        "3-hop cycle A-B-C-A closes: {cycle}"
+    );
 
     // But a 2-hop out-and-back over one edge reuses that edge → excluded.
     let back = fluree
@@ -3296,5 +3369,9 @@ async fn cypher_var_length_relationship_uniqueness_allows_cycle_closure() {
         )
         .await
         .expect("out-and-back");
-    assert_eq!(back.row_count(), 0, "2-hop out-and-back reuses an edge → excluded");
+    assert_eq!(
+        back.row_count(),
+        0,
+        "2-hop out-and-back reuses an edge → excluded"
+    );
 }

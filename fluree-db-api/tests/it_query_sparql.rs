@@ -4887,10 +4887,10 @@ async fn sparql_alternation_transitive_path() {
     });
     let ledger = fluree.insert(ledger0, &insert).await.unwrap().ledger;
 
-    let query = r#"
+    let query = r"
         PREFIX ex: <http://example.org/>
         SELECT ?x WHERE { ex:n0 (ex:a|ex:b)* ?x }
-    "#;
+    ";
     let result = support::query_sparql(&fluree, &ledger, query)
         .await
         .expect("alternation-transitive sparql");
@@ -4902,10 +4902,10 @@ async fn sparql_alternation_transitive_path() {
     );
 
     // `ex:a*` alone stops at n1 (the n1->n2 hop is ex:b).
-    let single = r#"
+    let single = r"
         PREFIX ex: <http://example.org/>
         SELECT ?x WHERE { ex:n0 ex:a* ?x }
-    "#;
+    ";
     let r2 = support::query_sparql(&fluree, &ledger, single)
         .await
         .expect("single-predicate star");
@@ -4935,16 +4935,28 @@ async fn sparql_both_bound_path_reachability() {
     let ledger = fluree.insert(ledger0, &insert).await.unwrap().ledger;
 
     // Reachable a -> c: one row (the sibling tag binds).
-    let q1 = r#"PREFIX ex: <http://example.org/>
-        SELECT ?t WHERE { ex:a ex:p+ ex:c . ex:a ex:tag ?t }"#;
-    let r1 = support::query_sparql(&fluree, &ledger, q1).await.expect("reachable");
+    let q1 = r"PREFIX ex: <http://example.org/>
+        SELECT ?t WHERE { ex:a ex:p+ ex:c . ex:a ex:tag ?t }";
+    let r1 = support::query_sparql(&fluree, &ledger, q1)
+        .await
+        .expect("reachable");
     let j1 = r1.to_jsonld(&ledger.snapshot).expect("to_jsonld");
-    assert_eq!(normalize_rows(&j1), normalize_rows(&json!([["A"]])), "a reaches c: {j1}");
+    assert_eq!(
+        normalize_rows(&j1),
+        normalize_rows(&json!([["A"]])),
+        "a reaches c: {j1}"
+    );
 
     // Not reachable a -> z: zero rows.
-    let q2 = r#"PREFIX ex: <http://example.org/>
-        SELECT ?t WHERE { ex:a ex:p+ ex:z . ex:a ex:tag ?t }"#;
-    let r2 = support::query_sparql(&fluree, &ledger, q2).await.expect("unreachable");
+    let q2 = r"PREFIX ex: <http://example.org/>
+        SELECT ?t WHERE { ex:a ex:p+ ex:z . ex:a ex:tag ?t }";
+    let r2 = support::query_sparql(&fluree, &ledger, q2)
+        .await
+        .expect("unreachable");
     let j2 = r2.to_jsonld(&ledger.snapshot).expect("to_jsonld");
-    assert_eq!(normalize_rows(&j2), normalize_rows(&json!([])), "a cannot reach z: {j2}");
+    assert_eq!(
+        normalize_rows(&j2),
+        normalize_rows(&json!([])),
+        "a cannot reach z: {j2}"
+    );
 }

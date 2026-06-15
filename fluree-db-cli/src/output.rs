@@ -214,9 +214,7 @@ fn sparql_table_cell(
         // via the SPARQL surface).
         Binding::Path(nodes) => nodes
             .iter()
-            .map(|sid| {
-                compact_bnode_strip(compactor.compact_sid_for_display(sid).ok())
-            })
+            .map(|sid| compact_bnode_strip(compactor.compact_sid_for_display(sid).ok()))
             .collect::<Vec<_>>()
             .join("->"),
 

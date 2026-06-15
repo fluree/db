@@ -245,7 +245,11 @@ fn exists_accepts_bare_match_and_subquery_forms() {
         "MATCH (p:Person) WHERE NOT EXISTS { MATCH (p)-[:KNOWS]-(x) WHERE x.id > 2 } RETURN p",
     ] {
         let out = parse_cypher(src);
-        assert!(!out.has_errors(), "should parse: {src}\n{:?}", out.diagnostics);
+        assert!(
+            !out.has_errors(),
+            "should parse: {src}\n{:?}",
+            out.diagnostics
+        );
         // The inner-WHERE form must lower (inner filter ANDed into the test).
         let ast = out.ast.expect("ast");
         let mut vars = VarRegistry::new();

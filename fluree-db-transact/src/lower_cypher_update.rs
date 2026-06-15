@@ -1079,7 +1079,10 @@ impl<'a> CypherLowering<'a> {
     /// value, a null element, and an empty list all yield no term (Cypher: null
     /// = "no property"). Shared by CREATE, SET (`=` / `+=`), and MERGE ON CREATE
     /// SET so list-valued properties behave identically across all write ops.
-    fn expr_to_object_terms(&mut self, value: &Expr) -> Result<Vec<TemplateTerm>, LowerCypherError> {
+    fn expr_to_object_terms(
+        &mut self,
+        value: &Expr,
+    ) -> Result<Vec<TemplateTerm>, LowerCypherError> {
         let items: Vec<&Expr> = match value {
             Expr::List(items, _) => items.iter().collect(),
             other => vec![other],
