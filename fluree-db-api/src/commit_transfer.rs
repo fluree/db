@@ -53,6 +53,24 @@ impl Base64Bytes {
     }
 }
 
+/// Per-frame payload ceiling used when decoding a `.flpack` during restore.
+///
+/// Each data frame carries one whole CAS object (commit, dict pack, index
+/// leaf). The indexer packs dictionaries to a 256 MiB *target*
+/// (`DEFAULT_RUN_BUDGET_BYTES`), so a pack legitimately lands a little over
+/// 256 MiB once the last entry tips it across — which collides exactly with
+/// the conservative pull-path default (`DEFAULT_MAX_PAYLOAD`, also 256 MiB) and
+/// makes the archive's producer emit frames its own reader would refuse.
+///
+/// Restore reads a trusted, admin-supplied archive and SHA-256-verifies every
+/// frame, and the frame length is a `u32` (the real format bound), so the cap
+/// here is only a sanity ceiling against a corrupt length field — not a
+/// security boundary. 1 GiB sits 4× above the dict target: it absorbs the
+/// last-entry overshoot (and modest operator increases to the run budget)
+/// without re-breaking on the next larger ledger, while still bounding how far
+/// the streaming reader will buffer for a single malformed frame.
+const RESTORE_MAX_FRAME_PAYLOAD: u32 = 1024 * 1024 * 1024;
+
 /// Summary of a `.flpack` restore — the import counterpart of
 /// [`Fluree::archive_ledger`]'s [`crate::pack::PackStreamResult`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -95,20 +113,27 @@ async fn ingest_cas_object<S: ContentAddressedWrite>(
 
     let is_commit_v2 = cid.codec() == CODEC_FLUREE_COMMIT && bytes.starts_with(b"FCV2");
     let integrity_ok = if is_commit_v2 {
-        verify_commit_blob(bytes).map(|d| d == *cid).unwrap_or(false)
+        verify_commit_blob(bytes)
+            .map(|d| d == *cid)
+            .unwrap_or(false)
     } else {
         cid.verify(bytes)
     };
     if !integrity_ok {
-        return Err(ApiError::http(400, format!("integrity check failed for {cid}")));
+        return Err(ApiError::http(
+            400,
+            format!("integrity check failed for {cid}"),
+        ));
     }
 
     // Commit-v2 blobs persist under their canonical (sub-range) digest; all
     // other kinds use the CID digest directly.
     let digest_hex = if kind == ContentKind::Commit {
-        verify_commit_blob(bytes).map(|d| d.digest_hex()).map_err(|e| {
-            ApiError::internal(format!("failed to derive commit digest for {cid}: {e}"))
-        })?
+        verify_commit_blob(bytes)
+            .map(|d| d.digest_hex())
+            .map_err(|e| {
+                ApiError::internal(format!("failed to derive commit digest for {cid}: {e}"))
+            })?
     } else {
         cid.digest_hex()
     };
@@ -1456,8 +1481,7 @@ impl Fluree {
                 // `drop_ledger` takes the bare name, so strip the branch suffix.
                 match fluree_db_core::ledger_id::split_ledger_id(new_ledger_id) {
                     Ok((name, _branch)) => {
-                        if let Err(drop_err) =
-                            self.drop_ledger(&name, crate::DropMode::Soft).await
+                        if let Err(drop_err) = self.drop_ledger(&name, crate::DropMode::Soft).await
                         {
                             error!(
                                 ledger = %new_ledger_id,
@@ -1491,14 +1515,14 @@ impl Fluree {
         R: tokio::io::AsyncRead + Unpin + Send,
     {
         use fluree_db_core::pack::{
-            decode_frame, read_stream_preamble, PackError, PackFrame, DEFAULT_MAX_PAYLOAD,
-            PREAMBLE_SIZE,
+            decode_frame, read_stream_preamble, PackError, PackFrame, PREAMBLE_SIZE,
         };
         use tokio::io::AsyncReadExt as _;
 
-        let storage = self.backend().admin_storage_cloned().ok_or_else(|| {
-            ApiError::config("restore_ledger requires a managed storage backend")
-        })?;
+        let storage = self
+            .backend()
+            .admin_storage_cloned()
+            .ok_or_else(|| ApiError::config("restore_ledger requires a managed storage backend"))?;
 
         // Frames are decoded out of a growing byte buffer; `read` appends and
         // `drain` consumes whole frames as they complete. Never holds more than
@@ -1516,9 +1540,8 @@ impl Fluree {
         'read: loop {
             // Strip the preamble once enough bytes have arrived.
             if !preamble_consumed && buf.len() >= PREAMBLE_SIZE {
-                read_stream_preamble(&buf).map_err(|e| {
-                    ApiError::http(400, format!("invalid .flpack preamble: {e}"))
-                })?;
+                read_stream_preamble(&buf)
+                    .map_err(|e| ApiError::http(400, format!("invalid .flpack preamble: {e}")))?;
                 buf.drain(..PREAMBLE_SIZE);
                 preamble_consumed = true;
             }
@@ -1526,68 +1549,66 @@ impl Fluree {
             // Drain every complete frame currently in the buffer.
             if preamble_consumed {
                 loop {
-                    match decode_frame(&buf, DEFAULT_MAX_PAYLOAD) {
-                    Ok((frame, consumed)) => {
-                        match frame {
-                            PackFrame::Header(_) => {
-                                if saw_header {
+                    match decode_frame(&buf, RESTORE_MAX_FRAME_PAYLOAD) {
+                        Ok((frame, consumed)) => {
+                            match frame {
+                                PackFrame::Header(_) => {
+                                    if saw_header {
+                                        return Err(ApiError::http(
+                                            400,
+                                            "invalid .flpack: duplicate Header frame",
+                                        ));
+                                    }
+                                    saw_header = true;
+                                }
+                                PackFrame::Data { cid, payload } => {
+                                    if !saw_header {
+                                        return Err(ApiError::http(
+                                            400,
+                                            "invalid .flpack: Data frame before Header",
+                                        ));
+                                    }
+                                    ingest_cas_object(&storage, &cid, &payload, new_ledger_id)
+                                        .await?;
+                                    match cid.content_kind() {
+                                        Some(ContentKind::Commit) => commits += 1,
+                                        Some(ContentKind::Txn) => txn_blobs += 1,
+                                        _ => index_artifacts += 1,
+                                    }
+                                }
+                                PackFrame::Manifest(json) => {
+                                    if json.get("phase").and_then(|v| v.as_str())
+                                        == Some("nameservice")
+                                    {
+                                        ns_manifest = Some(json);
+                                    }
+                                }
+                                PackFrame::Error(msg) => {
                                     return Err(ApiError::http(
                                         400,
-                                        "invalid .flpack: duplicate Header frame",
+                                        format!(".flpack contains error frame: {msg}"),
                                     ));
                                 }
-                                saw_header = true;
-                            }
-                            PackFrame::Data { cid, payload } => {
-                                if !saw_header {
-                                    return Err(ApiError::http(
-                                        400,
-                                        "invalid .flpack: Data frame before Header",
-                                    ));
-                                }
-                                ingest_cas_object(&storage, &cid, &payload, new_ledger_id)
-                                    .await?;
-                                match cid.content_kind() {
-                                    Some(ContentKind::Commit) => commits += 1,
-                                    Some(ContentKind::Txn) => txn_blobs += 1,
-                                    _ => index_artifacts += 1,
+                                PackFrame::End => {
+                                    ended = true;
+                                    break 'read;
                                 }
                             }
-                            PackFrame::Manifest(json) => {
-                                if json.get("phase").and_then(|v| v.as_str())
-                                    == Some("nameservice")
-                                {
-                                    ns_manifest = Some(json);
-                                }
-                            }
-                            PackFrame::Error(msg) => {
-                                return Err(ApiError::http(
-                                    400,
-                                    format!(".flpack contains error frame: {msg}"),
-                                ));
-                            }
-                            PackFrame::End => {
-                                ended = true;
-                                break 'read;
-                            }
-                        }
                             buf.drain(..consumed);
                         }
                         // Not enough bytes for the next frame yet — go read more.
                         Err(PackError::Incomplete(_)) => break,
                         Err(e) => {
-                            return Err(ApiError::http(
-                                400,
-                                format!("invalid .flpack frame: {e}"),
-                            ));
+                            return Err(ApiError::http(400, format!("invalid .flpack frame: {e}")));
                         }
                     }
                 }
             }
 
-            let n = reader.read(&mut read_chunk).await.map_err(|e| {
-                ApiError::internal(format!("error reading .flpack stream: {e}"))
-            })?;
+            let n = reader
+                .read(&mut read_chunk)
+                .await
+                .map_err(|e| ApiError::internal(format!("error reading .flpack stream: {e}")))?;
             if n == 0 {
                 break;
             }
@@ -1619,9 +1640,7 @@ impl Fluree {
         let commit_head_id = manifest
             .get("commit_head_id")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| {
-                ApiError::http(400, ".flpack manifest is missing commit_head_id")
-            })?;
+            .ok_or_else(|| ApiError::http(400, ".flpack manifest is missing commit_head_id"))?;
         let commit_cid: ContentId = commit_head_id
             .parse()
             .map_err(|e| ApiError::http(400, format!("invalid commit CID in manifest: {e}")))?;
@@ -1692,20 +1711,18 @@ impl Fluree {
                                 "failed to write re-stamped index root: {e}"
                             ))
                         })?;
-                    ContentId::from_hex_digest(
-                        ContentKind::IndexRoot.to_codec(),
-                        &res.content_hash,
-                    )
-                    .ok_or_else(|| {
-                        ApiError::internal(format!(
-                            "re-stamped index root produced an invalid content hash '{}'",
-                            res.content_hash
-                        ))
-                    })?
+                    ContentId::from_hex_digest(ContentKind::IndexRoot.to_codec(), &res.content_hash)
+                        .ok_or_else(|| {
+                            ApiError::internal(format!(
+                                "re-stamped index root produced an invalid content hash '{}'",
+                                res.content_hash
+                            ))
+                        })?
                 }
             };
 
-            self.set_index_head(&handle, &head_index_cid, index_t).await?;
+            self.set_index_head(&handle, &head_index_cid, index_t)
+                .await?;
             index_t_out = Some(index_t);
         }
 
@@ -1723,7 +1740,9 @@ impl Fluree {
                 ));
             }
             let bytes = content.get(&ctx_cid).await.map_err(|e| {
-                ApiError::internal(format!("failed to read default context blob {ctx_cid}: {e}"))
+                ApiError::internal(format!(
+                    "failed to read default context blob {ctx_cid}: {e}"
+                ))
             })?;
             let ctx_json: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| {
                 ApiError::http(400, format!("default context blob is not valid JSON: {e}"))
