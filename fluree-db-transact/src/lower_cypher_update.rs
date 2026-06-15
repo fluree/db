@@ -1052,12 +1052,26 @@ impl<'a> CypherLowering<'a> {
             }
             let pred_iri = self.resolve_predicate(key)?;
             let pred_sid = self.ns.sid_for_iri(&pred_iri);
-            let obj = self.expr_to_object(val_expr)?;
-            self.insert_templates.push(TripleTemplate::new(
-                subj.clone(),
-                TemplateTerm::Sid(pred_sid),
-                obj,
-            ));
+
+            // A list-valued property (`{email: ['a', 'b']}`, IU1's email[] /
+            // language[]) is a multi-valued RDF predicate: emit one triple per
+            // element. An empty list stores nothing (like a null). Nested
+            // lists/maps as elements are still rejected by `expr_to_object`.
+            let values: Vec<&Expr> = match val_expr {
+                Expr::List(items, _) => items.iter().collect(),
+                other => vec![other],
+            };
+            for value in values {
+                if matches!(value, Expr::Lit(Literal::Null(_))) {
+                    continue;
+                }
+                let obj = self.expr_to_object(value)?;
+                self.insert_templates.push(TripleTemplate::new(
+                    subj.clone(),
+                    TemplateTerm::Sid(pred_sid.clone()),
+                    obj,
+                ));
+            }
         }
         Ok(())
     }

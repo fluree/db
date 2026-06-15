@@ -2139,3 +2139,153 @@ async fn cypher_not_exists_subquery_inner_where() {
         .expect("jsonld");
     assert_eq!(out[0][0], json!(1), "no friend with id > 100 → NOT EXISTS holds: {out}");
 }
+
+#[tokio::test]
+async fn cypher_create_list_valued_property_stores_each_element() {
+    // IU1 (AddPerson) shape: a node with a list-valued literal property
+    // (email[]) becomes a multi-valued RDF predicate — one flake per element.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/cypher:list-prop");
+    let committed = fluree
+        .transact_cypher(
+            ledger0,
+            r#"CREATE (n:Person {id: 1, email: ['a@x.com', 'b@y.com']})"#,
+        )
+        .await
+        .expect("list-valued create");
+    let db = graphdb_from_ledger(&committed.ledger);
+
+    // Both emails are stored; matching the property yields one row per value.
+    let rows = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (n:Person {id: 1}) RETURN n.email AS email ORDER BY email"#,
+        )
+        .await
+        .expect("read emails")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    let emails: Vec<&str> = rows
+        .as_array()
+        .expect("rows")
+        .iter()
+        .filter_map(|r| r[0].as_str())
+        .collect();
+    assert_eq!(
+        emails,
+        vec!["a@x.com", "b@y.com"],
+        "both list elements stored as separate values: {rows}"
+    );
+}
+
+#[tokio::test]
+async fn cypher_create_empty_list_property_stores_nothing() {
+    // An empty list property stores no flake (like a null).
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/cypher:empty-list-prop");
+    let committed = fluree
+        .transact_cypher(
+            ledger0,
+            r#"CREATE (n:Person {id: 1, name: "Alice", email: []})"#,
+        )
+        .await
+        .expect("empty-list create");
+    let db = graphdb_from_ledger(&committed.ledger);
+
+    let rows = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (n:Person {id: 1}) WHERE n.email IS NULL RETURN n.name AS name"#,
+        )
+        .await
+        .expect("read")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    assert_eq!(rows[0][0], json!("Alice"), "empty list stored no email: {rows}");
+}
+
+#[tokio::test]
+async fn cypher_iu8_friendship_with_edge_property() {
+    // IU8 (AddFriendship): MATCH two persons, CREATE a KNOWS edge carrying a
+    // creationDate property; read the edge property back.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = seed_nodes_with_ids(&fluree, "it/cypher:iu8").await;
+    let committed = fluree
+        .transact_cypher(
+            l,
+            r#"MATCH (a:Person {id: 1}), (b:Person {id: 2})
+               CREATE (a)-[:KNOWS {creationDate: "2020-01-01"}]->(b)"#,
+        )
+        .await
+        .expect("iu8 friendship create");
+    let db = graphdb_from_ledger(&committed.ledger);
+
+    let out = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (a:Person {id: 1})-[k:KNOWS]->(b:Person {id: 2}) RETURN k.creationDate AS cd"#,
+        )
+        .await
+        .expect("read friendship")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    assert_eq!(out[0][0], json!("2020-01-01"), "edge property stored: {out}");
+}
+
+#[tokio::test]
+async fn cypher_iu1_inline_relationship_with_edge_property() {
+    // IU1 (AddPerson) shape: a single CREATE joining new nodes with a typed
+    // relationship that carries a property (studyAt classYear).
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/cypher:iu1-inline-edge");
+    let committed = fluree
+        .transact_cypher(
+            ledger0,
+            r#"CREATE (p:Person {id: 30})-[:STUDY_AT {classYear: 2011}]->(u:University {id: 40})"#,
+        )
+        .await
+        .expect("inline edge-prop create");
+    let db = graphdb_from_ledger(&committed.ledger);
+
+    let out = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (p:Person {id: 30})-[s:STUDY_AT]->(u) RETURN s.classYear AS y"#,
+        )
+        .await
+        .expect("read studyAt")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    assert_eq!(out[0][0], json!(2011), "studyAt classYear stored: {out}");
+}
+
+#[tokio::test]
+async fn cypher_multi_clause_create_builds_node_then_edges() {
+    // IU1 builds a node then links it; verify multiple CREATE clauses in one
+    // statement compose (node, node, then the relationship between them).
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/cypher:multi-create");
+    let committed = fluree
+        .transact_cypher(
+            ledger0,
+            r#"CREATE (p:Person {id: 10})
+               CREATE (u:University {id: 20})
+               CREATE (p)-[:STUDY_AT]->(u)"#,
+        )
+        .await
+        .expect("multi-clause create");
+    let db = graphdb_from_ledger(&committed.ledger);
+
+    let rows = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (p:Person {id: 10})-[:STUDY_AT]->(u:University {id: 20}) RETURN u"#,
+        )
+        .await
+        .expect("read multi-create relationship");
+    assert_eq!(rows.row_count(), 1, "node-node-edge chain across CREATE clauses");
+}

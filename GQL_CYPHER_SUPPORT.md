@@ -576,6 +576,7 @@ standard solution modifiers and a conservative expression sublanguage.**
 |---|---|---|
 | `CREATE (n)` (bare, no labels/props) | ❌ | Rejected — see "Node existence model". |
 | `CREATE (n:Label {p:v})` | ✅ | Node creation; at least one label or property required. A **null** property value (`{x: null}`, or an UNWIND row's missing field) means "no property" — it is **skipped**, not stored as a null. |
+| `CREATE (n {prop: [a, b, …]})` (list-valued property) | ✅ | A list-valued literal property (IU1's `email[]` / `language[]`) becomes a **multi-valued RDF predicate** — one flake per element. An empty list `[]` stores nothing (like null). Nested lists/maps as elements are rejected. |
 | `CREATE (a)-[r:T {p:v}]->(b)` | ✅ | Directed typed relationship. **Every Cypher relationship reifies** (gets a `f:reifies*` bundle / identity) — including anonymous, property-less `CREATE (a)-[:T]->(b)` — so it's visible to named reads (`-[r:T]->`), deletable by `DELETE r`, guarded by bare `DELETE n`, and not collapsed with a parallel edge. The base triple makes it visible to anonymous (plain-RDF) reads too. Multi-solution CREATE (e.g. batched edges) mints a fresh reifier per solution (SPARQL §3.1.3 blank-node semantics, fixed engine-wide). |
 | `CREATE` chains and patterns | ✅ | `CREATE (a)-[:T]->(b)-[:T2]->(c)`. |
 | `MATCH ... CREATE ...` | ✅ | WHERE-bound bindings drive template. |
