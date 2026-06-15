@@ -9,7 +9,7 @@ use super::adapters::{
 };
 use super::expression::{Expression, Function};
 use super::grouping::Grouping;
-use super::path::PropertyPathPattern;
+use super::path::{PropertyPathPattern, ShortestPathPattern};
 use super::triple::{Ref, TriplePattern};
 use crate::binding::Binding;
 use crate::sort::SortSpec;
@@ -316,6 +316,12 @@ pub enum Pattern {
     /// Property path pattern (transitive traversal)
     PropertyPath(PropertyPathPattern),
 
+    /// Anchored shortest-path pattern (Cypher `shortestPath`/`allShortestPaths`).
+    ///
+    /// Both endpoints must be bound by a preceding pattern; binds a path value
+    /// to `path_var` via bidirectional BFS. See [`ShortestPathPattern`].
+    ShortestPath(ShortestPathPattern),
+
     /// Subquery pattern - nested query with result merging
     ///
     /// Executes a nested query and merges results with the parent solution.
@@ -568,6 +574,10 @@ impl Pattern {
             Pattern::PropertyPath(pp) => {
                 debug_assert!(!pp.referenced_vars().contains(&old), "{UNHANDLED}");
             }
+            Pattern::ShortestPath(sp) => {
+                debug_assert!(!sp.referenced_vars().contains(&old), "{UNHANDLED}");
+                debug_assert!(sp.path_var != old, "{UNHANDLED}");
+            }
             Pattern::IndexSearch(p) => {
                 debug_assert!(!p.referenced_vars().contains(&old), "{UNHANDLED}");
             }
@@ -645,6 +655,7 @@ impl Pattern {
                 inner.iter().flat_map(Pattern::referenced_vars).collect()
             }
             Pattern::PropertyPath(pp) => pp.referenced_vars(),
+            Pattern::ShortestPath(sp) => sp.referenced_vars(),
             Pattern::Subquery(sq) => sq.referenced_vars(),
             Pattern::IndexSearch(isp) => isp.referenced_vars(),
             Pattern::VectorSearch(vsp) => vsp.referenced_vars(),
@@ -703,6 +714,7 @@ impl Pattern {
             Pattern::Values { vars, .. } => vars.clone(),
             Pattern::Minus(_) | Pattern::Exists(_) | Pattern::NotExists(_) => Vec::new(),
             Pattern::PropertyPath(pp) => pp.produced_vars(),
+            Pattern::ShortestPath(sp) => sp.produced_vars(),
             Pattern::Subquery(sq) => sq.produced_vars(),
             Pattern::IndexSearch(isp) => isp.produced_vars(),
             Pattern::VectorSearch(vsp) => vsp.produced_vars(),

@@ -99,6 +99,7 @@ pub fn rewrite_patterns_for_r2rml(
             | Pattern::Values { .. }
             | Pattern::Subquery(_)
             | Pattern::PropertyPath(_)
+            | Pattern::ShortestPath(_)
             | Pattern::IndexSearch(_)
             | Pattern::VectorSearch(_)
             | Pattern::R2rml(_)

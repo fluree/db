@@ -1831,6 +1831,13 @@ fn binding_to_flake_object(
             );
             None
         }
+        Binding::Path(_) => {
+            debug_assert!(
+                false,
+                "Path binding encountered in flake generation (unexpected)"
+            );
+            None
+        }
         Binding::Iri(_) => {
             debug_assert!(
                 false,

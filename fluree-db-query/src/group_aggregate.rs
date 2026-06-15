@@ -466,6 +466,7 @@ pub(crate) fn binding_to_group_key_owned(binding: &Binding) -> GroupKeyOwned {
             GroupKeyOwned::MaterializedSid(0, iri.clone())
         }
         Binding::Grouped(_) => GroupKeyOwned::Absent, // Shouldn't happen
+        Binding::Path(_) => GroupKeyOwned::Absent,    // Paths are not group keys
     }
 }
 

@@ -452,6 +452,15 @@ fn write_binding_cell(
                 write_binding_cell(cell, val, compactor, gv)?;
             }
         }
+        // A path: arrow-separated node IRIs for pragmatic consumption.
+        Binding::Path(nodes) => {
+            for (j, sid) in nodes.iter().enumerate() {
+                if j > 0 {
+                    cell.extend_from_slice(b"->");
+                }
+                write_compacted_sid(cell, compactor, sid)?;
+            }
+        }
     }
     Ok(())
 }

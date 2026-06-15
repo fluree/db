@@ -564,6 +564,7 @@ fn rewrite_owl_ql_single_pattern(
         | Pattern::Bind { .. }
         | Pattern::Values { .. }
         | Pattern::PropertyPath(_)
+        | Pattern::ShortestPath(_)
         | Pattern::Subquery(_)
         | Pattern::IndexSearch(_)
         | Pattern::VectorSearch(_)

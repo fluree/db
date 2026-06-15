@@ -117,6 +117,19 @@ ORDER BY / SKIP / LIMIT
 - Untyped relationships (`[r]`) — predicate is variable, system
   facts hidden via the existing `include_system_facts = false`
   filter.
+- Variable-length paths `-[:T*]->`, `-[:T*m..n]->` (unbounded reuses
+  the transitive `PropertyPath` operator; bounded ranges expand to a
+  `Union` of fixed-length chains with node-distinctness filters).
+- Undirected relationships `-[:T]-` (forward ∪ reverse `Union`).
+- Path finding: `MATCH p = shortestPath((a)-[:T*]-(b))` and
+  `allShortestPaths(...)`. Anchored (both endpoints bound by a
+  preceding MATCH); unweighted bidirectional BFS over a single typed
+  predicate, lowered to `Pattern::ShortestPath` and executed by
+  `ShortestPathOperator`. `Single` mode binds one shortest path per
+  input row; `All` mode emits one row per minimal-length path. The
+  path binds to a `Binding::Path` (node sequence); `length(p)` is its
+  hop count and `p IS NULL` (under `OPTIONAL MATCH`) detects "no path"
+  — the IC13 shape. `nodes(p)` / `relationships(p)` are deferred.
 - `WHERE` expressions: comparison, AND/OR/NOT, arithmetic +/-/*//,
   STARTS WITH / ENDS WITH / CONTAINS, IS NULL / IS NOT NULL,
   `expr IN [a, b, ...]`, `CASE WHEN ... THEN ... END` (simple and
@@ -174,17 +187,16 @@ let result = fluree.transact_cypher(ledger, cypher).await?;
 These produce a clear error today and land in follow-on slices.
 
 - `MATCH (n)` without label/property/relationship constraint.
-- Undirected relationships `-[r]-`.
-- Variable-length paths `-[*N..M]->`.
-- Path values `MATCH p = (...)`.
-- `shortestPath`, `allShortestPaths`.
-- `UNWIND $param AS x` (parameter-bound list — needs API-layer
-  parameter substitution).
-- `collect(x)` aggregate (needs list-valued bindings/result format).
+- Free path values `MATCH p = (...)` without a `shortestPath` /
+  `allShortestPaths` wrapper (the path binding needs general
+  list-valued path semantics).
+- Binding a relationship variable to a variable-length path
+  (`-[r:T*]->`) — needs list-valued bindings.
 - Expression-valued aggregate arguments (`sum(n + 1)`) — needs a
   pre-aggregation `Bind`.
-- `collect(...)`, `labels(...)`, `keys(...)`, `properties(...)`,
-  `type(r)`, `id(...)`, list/map functions generally.
+- `nodes(p)` / `relationships(p)`, `labels(...)`, `keys(...)`,
+  `properties(...)`, `type(r)`, `id(...)`, list/map functions
+  generally.
 - `SET / REMOVE / DELETE / DETACH DELETE`.
 - `MERGE` — Cypher's find-or-create needs a search-first phase that
   the existing `TxnType` variants don't model. A v1.1 implementation

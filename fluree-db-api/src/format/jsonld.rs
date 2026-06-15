@@ -227,6 +227,17 @@ fn write_value(out: &mut String, binding: &Binding, compactor: &IriCompactor) ->
             }
             out.push(']');
         }
+        // A path renders as an array of its node IRIs (start → end).
+        Binding::Path(nodes) => {
+            out.push('[');
+            for (i, sid) in nodes.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                push_json_string(out, &compactor.compact_id_sid(sid)?);
+            }
+            out.push(']');
+        }
     }
     Ok(())
 }
@@ -524,6 +535,15 @@ pub(crate) fn format_binding(binding: &Binding, compactor: &IriCompactor) -> Res
             let arr: Result<Vec<_>> = values
                 .iter()
                 .map(|v| format_binding(v, compactor))
+                .collect();
+            Ok(JsonValue::Array(arr?))
+        }
+
+        // A path renders as an array of its node IRIs (start → end).
+        Binding::Path(nodes) => {
+            let arr: Result<Vec<_>> = nodes
+                .iter()
+                .map(|sid| compactor.compact_id_sid(sid).map(JsonValue::String))
                 .collect();
             Ok(JsonValue::Array(arr?))
         }

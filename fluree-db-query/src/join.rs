@@ -976,6 +976,10 @@ impl NestedLoopJoinOperator {
                             debug_assert!(false, "Grouped binding in join bind");
                             // Leave as variable
                         }
+                        Binding::Path(_) => {
+                            // A path value is never a join key — leave as variable.
+                            debug_assert!(false, "Path binding in join bind");
+                        }
                     }
                 }
             }

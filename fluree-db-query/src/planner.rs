@@ -877,6 +877,11 @@ pub fn estimate_pattern(
             PatternEstimate::Source { row_count }
         }
 
+        // Anchored shortest-path must run after both endpoints are bound.
+        // Defer it on its referenced (endpoint) vars, like a correlated
+        // subquery, so reorder never hoists it ahead of its inputs.
+        Pattern::ShortestPath(_) => PatternEstimate::Deferred,
+
         Pattern::R2rml(_) => PatternEstimate::Source {
             row_count: DEFAULT_PROPERTY_SCAN_SELECTIVITY,
         },

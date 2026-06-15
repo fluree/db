@@ -407,6 +407,9 @@ impl Materializer {
                 debug_assert!(false, "Grouped binding in join_key");
                 JoinKey::Absent
             }
+
+            // Paths are not hashed/joined/grouped.
+            Binding::Path(_) => JoinKey::Absent,
         }
     }
 
@@ -457,6 +460,9 @@ impl Materializer {
             },
 
             Binding::Grouped(_) => None,
+
+            // A path is not a scalar comparable value.
+            Binding::Path(_) => None,
         }
     }
 
@@ -518,6 +524,9 @@ impl Materializer {
                 .map(|v| Arc::from(v.to_string())),
 
             Binding::Grouped(_) => None,
+
+            // No canonical string form for a path value.
+            Binding::Path(_) => None,
         }
     }
 
@@ -541,7 +550,8 @@ impl Materializer {
             | Binding::IriMatch { .. }
             | Binding::Iri(_)
             | Binding::Lit { .. }
-            | Binding::Grouped(_) => binding.clone(),
+            | Binding::Grouped(_)
+            | Binding::Path(_) => binding.clone(),
 
             Binding::EncodedSid { s_id, .. } => {
                 let sid = self.resolve_sid(*s_id);

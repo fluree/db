@@ -55,7 +55,7 @@ DELETE/INSERT templates sharing variable ids via the shared
 | Untyped / alternation / property-filtered relationships in a **write** MATCH | Write MATCH supports directed single-typed relationships, anonymous or named (named binds `r` for `SET r.prop`). Untyped (`-[r]->`), alternation (`-[:A\|B]->`), and inline relationship property filters in a write MATCH are still deferred. |
 | Whole-map node params (`(n $props)`); `$map.field` outside UNWIND; nested/map field values | Standalone map-valued params (not via `UNWIND … CREATE`/`MATCH`) still need a map-valued `Expr` the AST doesn't carry; deferred. |
 | HTTP tracking (reads) / delimited / agent-json for Cypher | The Cypher HTTP routes return JSON-LD only and don't negotiate delimited (TSV/CSV) or agent-json output, and read-side tracking isn't surfaced yet. **Policy/identity enforcement IS applied** (resolved identity + header policy fields → `wrap_policy` on reads, `PolicyContext` on writes), and write-side tracking headers are honored. Remaining gap is output-format negotiation + read tracking. |
-| Path values, `shortestPath`, list-*consuming* functions (`head/tail/size`), reflection (`labels/type/keys/properties/id`), bare `(n)`, `LOAD CSV`, `FOREACH`, `CALL proc`, schema DDL, multi-statement | Per the original plan's deferral list below (engine work or product decisions). Undirected, variable-length paths, and `collect()` have since landed (see status table). |
+| Free path values (`p = (...)` without `shortestPath`), `nodes()/relationships()`, list-*consuming* functions (`head/tail/size`), reflection (`labels/type/keys/properties/id`), bare `(n)`, `LOAD CSV`, `FOREACH`, `CALL proc`, schema DDL, multi-statement | Per the original plan's deferral list below (engine work or product decisions). Undirected, variable-length paths, `collect()`, and **`shortestPath`/`allShortestPaths` + `length(p)`** have since landed (see status table). |
 
 ---
 
@@ -79,8 +79,12 @@ existing `include_system_facts = false` filter for Cypher untyped
 relationship matches, and (b) any new IR variants ride the existing
 operator infrastructure. List-valued aggregation (`collect()`) landed
 by reusing the existing `Binding::Grouped` carrier — no new operator.
-Path *enumeration* (`shortestPath`, first-class path values) still needs
-a new executor operator and is deferred.
+Anchored path *search* (`shortestPath`/`allShortestPaths`) landed as a
+dedicated `ShortestPathOperator` (bidirectional BFS) producing a new
+`Binding::Path` value, with `length(p)` as `Function::PathLength`.
+First-class *free* path values (`p = (...)` without a search wrapper)
+and `nodes()/relationships()` still need general path-value IR and are
+deferred.
 
 ## Why now
 
@@ -152,7 +156,8 @@ this plan.
 | Parallel relationships | Two annotation SIDs attached to the same `(s, p, o)` edge key. Already supported (multimap forward attachment index). |
 | Undirected `-[r]-` | **Landed** — forward∪reverse `Union` (reverse via the `Opst` index). |
 | Variable-length `-[:T*1..5]->` | **Landed** (anonymous, single-typed) — see "Variable-length paths" below. **Bounded** ranges enforce node-uniqueness (no revisited node → no edge-reuse artifacts; matches Neo4j for distinct-endpoint queries). Binding a variable to the path (`-[r:T*1..5]->`, a relationship *list*) is still deferred. |
-| Path value `p = (a)-[r]->(b)-[r2]->(c)` | First-class path object. **Deferred.** |
+| Path value `p = (a)-[r]->(b)-[r2]->(c)` | Free path object. **Deferred** (only `shortestPath`/`allShortestPaths`-wrapped paths bind today). |
+| `p = shortestPath((a)-[:T*]-(b))` / `allShortestPaths(...)` | **Landed** — anchored bidirectional-BFS `ShortestPathOperator` binds `p` to a `Binding::Path` node sequence; `length(p)` + `p IS NULL` supported. See "Shortest paths" below. |
 | `RETURN n, r, m` | SELECT projection. Bag semantics by default (no DISTINCT). |
 | `RETURN DISTINCT` | Lower to existing DISTINCT modifier. |
 | `WHERE` predicate | Lower to existing `Filter` patterns. |
@@ -319,17 +324,50 @@ the LDBC norm) results match Neo4j. Caveats:
 
 **Scope vs. full Cypher.** These produce **endpoint bindings**, not
 first-class path values. Binding a variable to the path (`-[r:T*]->`, a
-relationship *list*) and path values (`p = (...)`,
-`nodes()/relationships()/length(p)`) still need list/path-valued
-bindings — deferred. A true path-enumerating operator (one row per
-distinct walk, full relationship-uniqueness, parallel-edge multiplicity)
-remains future work.
+relationship *list*) and free path values (`p = (...)`,
+`nodes()/relationships()`) still need list/path-valued bindings —
+deferred. Anchored `shortestPath`/`allShortestPaths` *do* bind a path
+(see below).
 
 A relationship *type* whose namespace isn't registered in the ledger
 encodes to no predicate; such a path yields **zero rows**, not an error
 (the same as an absent label). Bound rel-var var-length, unbounded
 undirected, and unbounded `*N..` (N>1) are still rejected at lower time
 with a clear message.
+
+### Shortest paths — landed
+
+`MATCH p = shortestPath((a)-[:T*]-(b))` and `allShortestPaths(...)`
+lower to `Pattern::ShortestPath` and execute on a dedicated
+`ShortestPathOperator` (`fluree-db-query/src/shortest_path.rs`):
+
+- **Anchored only (v1):** both endpoints must be bound by a preceding
+  mandatory MATCH. The planner classifies `ShortestPath` as `Deferred`
+  on its endpoint vars (like a correlated subquery), so it always runs
+  after they are bound. An unresolved endpoint yields zero rows.
+- **`Single` mode** (`shortestPath`) runs **bidirectional BFS** —
+  frontiers expand from both endpoints, alternating the smaller, until
+  they meet — and reconstructs one shortest path from the predecessor
+  maps. **`All` mode** (`allShortestPaths`) runs a layered forward BFS
+  recording the full predecessor set, then enumerates every
+  minimal-length path (one output row each, capped).
+- Neighbour expansion reuses the `property_path` index access: `Spot`
+  (subject→object) and `Post` (object→subject) range scans, ref-only
+  edges, single active graph. Direction maps to which index(es) to
+  probe per frontier (`Either` = both → undirected, the IC13 `KNOWS`
+  case). Safety caps: `DEFAULT_MAX_VISITED` (100k nodes), `DEFAULT_MAX_PATHS`
+  (1k paths, `All` mode).
+- The path binds to a new `Binding::Path(Vec<Sid>)` (node sequence,
+  start→end). `length(p)` (`Function::PathLength`) is its hop count
+  (`nodes − 1`); `p IS NULL` under `OPTIONAL MATCH` detects "no path"
+  — together these are the IC13 shape
+  (`CASE WHEN p IS NULL THEN -1 ELSE length(p) END`). No path under a
+  *mandatory* MATCH drops the row.
+- Inner pattern must be node–relationship–node over a **single typed**
+  predicate, anonymous rel (no rel var / property filter). `nodes(p)` /
+  `relationships(p)` and free (unwrapped) path values remain deferred.
+  `Binding::Path` renders as a node-IRI array in JSON-LD/typed output;
+  SPARQL/CONSTRUCT formatters reject it (Cypher-only type).
 
 ### LPG mode is the default for Cypher writes
 
@@ -497,8 +535,9 @@ standard solution modifiers and a conservative expression sublanguage.**
 | `MATCH (a)-[:T]-(b)` (undirected) | ✅ | Forward∪reverse `Union` (reverse via the `Opst` object index). A bound rel var works for single-hop undirected. |
 | `MATCH (a)-[:T*m..n]->(b)` (bounded var-length) | ✅ | Expands to a `Union` of fixed-length join chains; honors direction incl. undirected hops. Anonymous rel only (a bound rel var binds a *list* — deferred). Each `k≥2` chain carries a **node-distinctness filter** (no revisited node), so cyclic/undirected walks don't produce edge-reuse artifacts — matches Neo4j for distinct-endpoint queries; *node*-uniqueness is slightly stricter than Cypher's relationship-uniqueness for raw path counts. |
 | `MATCH (a)-[:T*]->(b)` / `*0..` (unbounded var-length) | ✅ | Reuses the transitive `PropertyPathPattern` (`*`→OneOrMore, `*0..`→ZeroOrMore). Directed only; unbounded-undirected and `*N..` (N>1) deferred. |
-| `MATCH p = ...` (path value), `nodes()/relationships()/length(p)` | ❌ | Deferred — needs path-value IR + binding. |
-| `MATCH p = ...` (path value) | ❌ | Deferred — needs path-value IR. |
+| `MATCH p = shortestPath((a)-[:T*]-(b))` / `allShortestPaths(...)` | ✅ | Anchored bidirectional-BFS path search → `Pattern::ShortestPath` / `ShortestPathOperator`. Both endpoints must be bound by a preceding MATCH; single typed predicate; directed/undirected. `Single` binds one shortest path per row, `All` one row per minimal-length path. Binds `Binding::Path` (node sequence). |
+| `length(p)` | ✅ | Hop count of a path value (`Function::PathLength`); `p IS NULL` under `OPTIONAL MATCH` detects "no path" (IC13). |
+| `MATCH p = ...` (free path value, no `shortestPath` wrapper), `nodes()/relationships()` | ❌ | Deferred — needs general path-value IR + list bindings. |
 | `OPTIONAL MATCH` | ✅ | Lowers to `Optional`. |
 | `WHERE expr` | ✅ | Conservative expression sublanguage — see "Expressions in v1" below. |
 | `WITH ... AS ...` | ✅ | Lowers to subquery boundary. |

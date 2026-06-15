@@ -1798,3 +1798,134 @@ async fn cypher_var_length_unbounded_transitive() {
         "zero-or-more includes Alice: +Bob, Carol, Dave"
     );
 }
+
+#[tokio::test]
+async fn cypher_shortest_path_length_directed() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = seed_knows_chain(&fluree, "it/cypher:sp-directed").await;
+    let db = graphdb_from_ledger(&l);
+
+    // Alice -> Bob -> Carol -> Dave; directed shortestPath Alice→Dave = 3 hops.
+    let out = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (a:Person {name: "Alice"}), (d:Person {name: "Dave"})
+               MATCH p = shortestPath((a)-[:KNOWS*]->(d))
+               RETURN length(p) AS len"#,
+        )
+        .await
+        .expect("shortestPath length")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    assert_eq!(out[0][0], json!(3), "Alice→Dave is 3 KNOWS hops: {out}");
+}
+
+#[tokio::test]
+async fn cypher_shortest_path_length_undirected() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = seed_knows_chain(&fluree, "it/cypher:sp-undirected").await;
+    let db = graphdb_from_ledger(&l);
+
+    // Undirected search from the middle reaches Alice in 1 hop (Bob<-Alice).
+    let out = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (b:Person {name: "Bob"}), (a:Person {name: "Alice"})
+               MATCH p = shortestPath((b)-[:KNOWS*]-(a))
+               RETURN length(p) AS len"#,
+        )
+        .await
+        .expect("undirected shortestPath")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    assert_eq!(out[0][0], json!(1), "Bob and Alice are adjacent: {out}");
+}
+
+#[tokio::test]
+async fn cypher_shortest_path_no_path_drops_row() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = seed_knows_chain(&fluree, "it/cypher:sp-nopath").await;
+    let db = graphdb_from_ledger(&l);
+
+    // Directed Dave→Alice has no path (chain is one-way). Mandatory MATCH
+    // drops the row.
+    let rows = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (d:Person {name: "Dave"}), (a:Person {name: "Alice"})
+               MATCH p = shortestPath((d)-[:KNOWS*]->(a))
+               RETURN length(p) AS len"#,
+        )
+        .await
+        .expect("no-path shortestPath");
+    assert_eq!(rows.row_count(), 0, "no directed Dave→Alice path");
+}
+
+#[tokio::test]
+async fn cypher_shortest_path_optional_null_for_missing() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = seed_knows_chain(&fluree, "it/cypher:sp-optional").await;
+    let db = graphdb_from_ledger(&l);
+
+    // IC13 shape: OPTIONAL MATCH keeps the row with a null path when no path
+    // exists; CASE maps that to -1.
+    let out = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (d:Person {name: "Dave"}), (a:Person {name: "Alice"})
+               OPTIONAL MATCH p = shortestPath((d)-[:KNOWS*]->(a))
+               RETURN CASE WHEN p IS NULL THEN -1 ELSE length(p) END AS len"#,
+        )
+        .await
+        .expect("optional shortestPath")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    assert_eq!(out[0][0], json!(-1), "no path → -1 via CASE: {out}");
+}
+
+#[tokio::test]
+async fn cypher_all_shortest_paths_returns_each_minimal_path() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/cypher:all-sp");
+    // Diamond: a→b→d and a→c→d are two distinct 2-hop shortest paths a..d.
+    let l = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": ctx(),
+                "@graph": [
+                    {"@id": "ex:a", "@type": "ex:Person", "ex:name": "A",
+                     "ex:KNOWS": [{"@id": "ex:b"}, {"@id": "ex:c"}]},
+                    {"@id": "ex:b", "@type": "ex:Person", "ex:name": "B", "ex:KNOWS": {"@id": "ex:d"}},
+                    {"@id": "ex:c", "@type": "ex:Person", "ex:name": "C", "ex:KNOWS": {"@id": "ex:d"}},
+                    {"@id": "ex:d", "@type": "ex:Person", "ex:name": "D"},
+                ]
+            }),
+        )
+        .await
+        .expect("seed diamond")
+        .ledger;
+    let db = graphdb_from_ledger(&l);
+
+    let out = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (a:Person {name: "A"}), (d:Person {name: "D"})
+               MATCH p = allShortestPaths((a)-[:KNOWS*]->(d))
+               RETURN length(p) AS len"#,
+        )
+        .await
+        .expect("allShortestPaths")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    let rows = out.as_array().expect("rows");
+    assert_eq!(rows.len(), 2, "two distinct 2-hop paths a→b→d, a→c→d: {out}");
+    assert!(
+        rows.iter().all(|r| r[0] == json!(2)),
+        "both minimal paths are length 2: {out}"
+    );
+}

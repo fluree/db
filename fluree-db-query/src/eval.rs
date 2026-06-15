@@ -27,6 +27,7 @@ mod hash;
 mod helpers;
 mod logical;
 mod numeric;
+mod path;
 mod rdf;
 mod string;
 mod types;
@@ -175,6 +176,9 @@ impl Expression {
                     debug_assert!(false, "Grouped binding in filter evaluation");
                     Ok(None)
                 }
+                // A path is not a scalar — it has no comparable value. Path
+                // functions (`length`) read the binding directly via dispatch.
+                Some(Binding::Path(_)) => Ok(None),
             },
 
             // FlakeValue::Null is the only variant TryFrom rejects (with

@@ -11,8 +11,8 @@ use super::value::ComparableValue;
 use crate::ir::{ArithmeticOp, CompareOp};
 
 use super::{
-    arithmetic, cast, conditional, datetime, fluree, fulltext, geo, hash, logical, numeric, rdf,
-    string, types, uuid, vector,
+    arithmetic, cast, conditional, datetime, fluree, fulltext, geo, hash, logical, numeric, path,
+    rdf, string, types, uuid, vector,
 };
 
 impl Function {
@@ -176,6 +176,9 @@ impl Function {
             Function::XsdDouble => cast::eval_xsd_double(args, row, ctx),
             Function::XsdDecimal => cast::eval_xsd_decimal(args, row, ctx),
             Function::XsdString => cast::eval_xsd_string(args, row, ctx),
+
+            // Path functions
+            Function::PathLength => path::eval_path_length(args, row),
 
             // Unknown function
             Function::Custom(name) => Err(QueryError::InvalidFilter(format!(

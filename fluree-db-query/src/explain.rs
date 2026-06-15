@@ -573,6 +573,16 @@ pub fn format_general_pattern(pattern: &Pattern) -> String {
             format_ref(&pp.subject),
             pp.modifier
         ),
+        Pattern::ShortestPath(sp) => format!(
+            "SHORTEST PATH {} {} -> {} {:?}",
+            match sp.mode {
+                crate::ir::ShortestPathMode::Single => "shortestPath",
+                crate::ir::ShortestPathMode::All => "allShortestPaths",
+            },
+            format_ref(&sp.start),
+            format_ref(&sp.end),
+            sp.direction
+        ),
         Pattern::IndexSearch(isp) => {
             format!("INDEX SEARCH {}", isp.graph_source_id)
         }

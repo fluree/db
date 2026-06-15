@@ -284,6 +284,17 @@ fn logical_node(
                 json!(ref_to_user_string(&pp.subject, vars, compactor)),
             );
         }
+        Pattern::ShortestPath(sp) => {
+            node.insert("kind".into(), json!("shortest-path"));
+            node.insert(
+                "start".into(),
+                json!(ref_to_user_string(&sp.start, vars, compactor)),
+            );
+            node.insert(
+                "end".into(),
+                json!(ref_to_user_string(&sp.end, vars, compactor)),
+            );
+        }
         Pattern::Graph { patterns, .. } => {
             node.insert("kind".into(), json!("graph"));
             node.insert("patterns".into(), children(patterns));

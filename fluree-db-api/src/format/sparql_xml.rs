@@ -236,6 +236,11 @@ fn write_term(
                 "Binding::Grouped should be disaggregated before SPARQL XML formatting".to_string(),
             ));
         }
+        Binding::Path(_) => {
+            return Err(FormatError::InvalidBinding(
+                "SPARQL results have no path type (Binding::Path is Cypher-only)".to_string(),
+            ));
+        }
         // Skipped by the caller; unreachable here.
         Binding::Unbound | Binding::Poisoned => {}
     }

@@ -2,13 +2,14 @@
 
 use fluree_db_core::FlakeValue;
 use fluree_db_query::ir::{
-    Expression, Function, PathModifier, Pattern, PropertyPathPattern, Ref, Term, TriplePattern,
+    Expression, Function, PathDirection, PathModifier, Pattern, PropertyPathPattern,
+    ShortestPathMode, ShortestPathPattern, Ref, Term, TriplePattern,
 };
 use fluree_db_query::parse::encode::IriEncoder;
 
 use crate::ast::{
-    Direction, Expr, Label, MapLit, NodePattern, Pattern as CypherPattern, PatternPart, RelPattern,
-    Variable,
+    Direction, Expr, Label, MapLit, NodePattern, Pattern as CypherPattern, PathSearch, PatternPart,
+    RelPattern, Variable,
 };
 
 use super::context::LoweringContext;
@@ -40,13 +41,8 @@ fn lower_part<E: IriEncoder>(
     part: &PatternPart,
     out: &mut Vec<Pattern>,
 ) -> Result<()> {
-    if part.path_search.is_some() {
-        // Parser accepts `p = shortestPath((a)-[:T*]->(b))`; the dedicated
-        // bidirectional-BFS operator that executes it is being built.
-        return Err(LowerError::unsupported(
-            "shortestPath / allShortestPaths are parsed but their execution operator is not \
-             yet wired up",
-        ));
+    if let Some(search) = part.path_search {
+        return lower_shortest_path(ctx, part, search, out);
     }
 
     // Head node anchored. If tail is empty (single node) and the node
@@ -66,6 +62,90 @@ fn lower_part<E: IriEncoder>(
         lower_node(ctx, next, out)?;
         lower_rel(ctx, &prev, rel, next, out)?;
         prev = next.clone();
+    }
+    Ok(())
+}
+
+/// Lower `p = shortestPath((a)-[:T*]-(b))` / `allShortestPaths(...)` into a
+/// [`Pattern::ShortestPath`]. V1 contract: the inner pattern is exactly
+/// node–relationship–node over a single typed predicate; both endpoints must be
+/// bound by a preceding mandatory MATCH (the planner defers the operator until
+/// they are). The relationship variable / property filters and multi-hop inner
+/// patterns are rejected (they need list-valued / richer path semantics).
+fn lower_shortest_path<E: IriEncoder>(
+    ctx: &mut LoweringContext<'_, E>,
+    part: &PatternPart,
+    search: PathSearch,
+    out: &mut Vec<Pattern>,
+) -> Result<()> {
+    let path_var = part.path_var.as_ref().ok_or_else(|| {
+        LowerError::unsupported("shortestPath must bind a path variable (`p = shortestPath(...)`)")
+    })?;
+
+    if part.tail.len() != 1 {
+        return Err(LowerError::unsupported(
+            "shortestPath inner pattern must be exactly `(a)-[:T*]-(b)` (single relationship)",
+        ));
+    }
+    let (rel, end_node) = &part.tail[0];
+
+    if rel.var.is_some() {
+        return Err(LowerError::unsupported(
+            "binding a relationship variable inside shortestPath needs list-valued path bindings \
+             (deferred)",
+        ));
+    }
+    if rel.props.is_some() {
+        return Err(LowerError::unsupported(
+            "property filters on a shortestPath relationship are deferred",
+        ));
+    }
+    if rel.types.len() != 1 {
+        return Err(LowerError::unsupported(
+            "shortestPath needs exactly one relationship type (`-[:T*]-`); untyped and \
+             alternation forms are deferred",
+        ));
+    }
+
+    // Emit any label / inline-prop constraints on the endpoint nodes (no-ops
+    // for bare `(p1)` / `(p2)` references), then take their refs.
+    lower_node(ctx, &part.head, out)?;
+    lower_node(ctx, end_node, out)?;
+    let start_ref = lookup_node_ref(ctx, &part.head);
+    let end_ref = lookup_node_ref(ctx, end_node);
+    let path_var_id = ctx.intern_var(&path_var.name);
+
+    let direction = match rel.direction {
+        Direction::Outgoing => PathDirection::Outgoing,
+        Direction::Incoming => PathDirection::Incoming,
+        Direction::Either => PathDirection::Either,
+    };
+    let mode = match search {
+        PathSearch::Shortest => ShortestPathMode::Single,
+        PathSearch::AllShortest => ShortestPathMode::All,
+    };
+    // A bare `-[:T]-` (no `*`) inside shortestPath is a fixed single hop.
+    let (min_hops, max_hops) = match &rel.length {
+        Some(len) => (len.min, len.max),
+        None => (Some(1), Some(1)),
+    };
+
+    let type_iri = ctx.resolve_predicate(&rel.types[0].name)?;
+    match ctx.encoder.encode_iri(&type_iri) {
+        Some(predicate) => out.push(Pattern::ShortestPath(ShortestPathPattern {
+            start: start_ref,
+            end: end_ref,
+            predicate,
+            direction,
+            mode,
+            path_var: path_var_id,
+            min_hops,
+            max_hops,
+        })),
+        // Unknown relationship type ⇒ no edges ⇒ no path. An empty result over
+        // the endpoints yields no rows (mandatory MATCH drops; an OPTIONAL
+        // wrapper restores the row with the path var null).
+        None => out.push(empty_path_result(&start_ref, &end_ref)),
     }
     Ok(())
 }

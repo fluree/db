@@ -199,10 +199,30 @@ fn shortest_path_parses_with_path_var_and_search_mode() {
     assert_eq!(part.path_var.as_ref().map(|v| v.name.as_str()), Some("p"));
     assert_eq!(part.tail.len(), 1, "inner (a)-[:KNOWS*]->(b)");
 
-    // Lowering is pending (the BFS operator isn't wired yet).
-    let encoder = NoEncoder;
+    // Lowering now produces a ShortestPath pattern (encoder resolves KNOWS).
+    let encoder = ConstEncoder;
     let mut vars = VarRegistry::new();
-    assert!(lower_cypher(&ast, &encoder, &mut vars).is_err());
+    let q = lower_cypher(&ast, &encoder, &mut vars).expect("lower shortestPath");
+    let sp = q
+        .patterns
+        .iter()
+        .find_map(|p| match p {
+            Pattern::ShortestPath(sp) => Some(sp),
+            _ => None,
+        })
+        .expect("expected a ShortestPath pattern");
+    assert_eq!(sp.mode, fluree_db_query::ir::ShortestPathMode::Single);
+    assert_eq!(sp.direction, fluree_db_query::ir::PathDirection::Outgoing);
+    assert!(matches!(sp.start, Ref::Var(_)) && matches!(sp.end, Ref::Var(_)));
+}
+
+/// Encoder that maps every IRI to a fixed SID so lowering produces encoded
+/// patterns (`NoEncoder` returns `None`, collapsing paths to empty results).
+struct ConstEncoder;
+impl fluree_db_query::parse::encode::IriEncoder for ConstEncoder {
+    fn encode_iri(&self, _iri: &str) -> Option<fluree_db_core::Sid> {
+        Some(fluree_db_core::Sid::new(42, "KNOWS"))
+    }
 }
 
 #[test]

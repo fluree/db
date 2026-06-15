@@ -168,6 +168,19 @@ pub enum Binding {
     /// - Should never appear in join/scan codepaths
     /// - Consumed by aggregate functions (count, sum, avg, etc.)
     Grouped(Vec<Binding>),
+
+    /// Path value (node sequence) produced by a shortest-path search.
+    ///
+    /// Holds the ordered node SIDs of a single matched path, start to end
+    /// inclusive. Hop count (`length(p)` in Cypher) is `nodes.len() - 1`.
+    ///
+    /// # Invariants
+    ///
+    /// - Only produced by [`crate::shortest_path::ShortestPathOperator`].
+    /// - Opaque to join/scan/sort hot paths (treated as an atomic value);
+    ///   consumed by path functions (`length`, `nodes`) and rendered as a
+    ///   JSON array of node IRIs at projection time.
+    Path(Vec<Sid>),
 }
 
 impl Binding {
@@ -724,6 +737,8 @@ impl From<&Binding> for bool {
             Binding::EncodedPid { .. } => true,
             Binding::Unbound | Binding::Poisoned => false,
             Binding::Grouped(_) => false,
+            // A bound path is truthy (it exists); an absent path is `Unbound`.
+            Binding::Path(_) => true,
         }
     }
 }
@@ -854,6 +869,7 @@ impl PartialEq for Binding {
             (Binding::IriMatch { .. } | Binding::Iri(_), Binding::EncodedPid { .. }) => false,
 
             (Binding::Grouped(a), Binding::Grouped(b)) => a == b,
+            (Binding::Path(a), Binding::Path(b)) => a == b,
             _ => false,
         }
     }
@@ -941,6 +957,13 @@ impl std::hash::Hash for Binding {
                 values.len().hash(state);
                 for v in values {
                     v.hash(state);
+                }
+            }
+            Binding::Path(nodes) => {
+                9u8.hash(state);
+                nodes.len().hash(state);
+                for n in nodes {
+                    n.hash(state);
                 }
             }
         }

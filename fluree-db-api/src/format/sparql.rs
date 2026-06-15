@@ -269,6 +269,11 @@ fn write_term(out: &mut String, binding: &Binding, compactor: &IriCompactor) -> 
                 "Binding::Grouped should be disaggregated before formatting".to_string(),
             ));
         }
+        Binding::Path(_) => {
+            return Err(FormatError::InvalidBinding(
+                "SPARQL results have no path type (Binding::Path is Cypher-only)".to_string(),
+            ));
+        }
         Binding::EncodedLit { .. } | Binding::EncodedSid { .. } | Binding::EncodedPid { .. } => {
             unreachable!("encoded bindings are materialized before write_term")
         }
@@ -601,6 +606,10 @@ fn format_binding(
         // Grouped values should be disaggregated before reaching here
         Binding::Grouped(_) => Err(FormatError::InvalidBinding(
             "Binding::Grouped should be disaggregated before formatting".to_string(),
+        )),
+
+        Binding::Path(_) => Err(FormatError::InvalidBinding(
+            "SPARQL results have no path type (Binding::Path is Cypher-only)".to_string(),
         )),
 
         Binding::EncodedLit { .. } | Binding::EncodedSid { .. } | Binding::EncodedPid { .. } => {

@@ -202,6 +202,19 @@ fn write_value(
             }
             out.push(']');
         }
+        // A path renders as an array of `{"@id": ...}` node references.
+        Binding::Path(nodes) => {
+            out.push('[');
+            for (i, sid) in nodes.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                out.push_str(r#"{"@id":"#);
+                push_json_string(out, &compactor.compact_id_sid(sid)?);
+                out.push('}');
+            }
+            out.push(']');
+        }
         Binding::EncodedLit { .. } | Binding::EncodedSid { .. } | Binding::EncodedPid { .. } => {
             unreachable!("encoded bindings are materialized before write_value")
         }
@@ -477,6 +490,15 @@ pub(crate) fn format_binding(
             let arr: Result<Vec<_>> = values
                 .iter()
                 .map(|v| format_binding(result, v, compactor))
+                .collect();
+            Ok(JsonValue::Array(arr?))
+        }
+
+        // A path - array of `{"@id": ...}` node references.
+        Binding::Path(nodes) => {
+            let arr: Result<Vec<_>> = nodes
+                .iter()
+                .map(|sid| compactor.compact_id_sid(sid).map(|iri| json!({"@id": iri})))
                 .collect();
             Ok(JsonValue::Array(arr?))
         }

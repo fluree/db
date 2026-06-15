@@ -123,7 +123,10 @@ pub fn lower_expr<E: IriEncoder>(
             let func = match name.as_str() {
                 "coalesce" => Function::Coalesce,
                 "abs" => Function::Abs,
-                "length" => Function::Strlen,
+                // Cypher `length(p)` is a path's hop count; `size(x)` is the
+                // string/list length (Cypher 9 split these).
+                "length" => Function::PathLength,
+                "size" => Function::Strlen,
                 "tostring" => Function::Str,
                 _ => {
                     return Err(LowerError::unsupported(format!(

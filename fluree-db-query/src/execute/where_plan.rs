@@ -99,6 +99,7 @@ pub(crate) fn pattern_tree_has_edge_annotation(patterns: &[Pattern]) -> bool {
         Pattern::DefaultGraphSource { patterns } => pattern_tree_has_edge_annotation(patterns),
         Pattern::Triple(_)
         | Pattern::PropertyPath(_)
+        | Pattern::ShortestPath(_)
         | Pattern::Filter(_)
         | Pattern::Bind { .. }
         | Pattern::Values { .. }
@@ -540,6 +541,14 @@ pub fn collect_var_stats(
                         bump_count(counts, v);
                         vars.insert(v);
                     }
+                }
+                Pattern::ShortestPath(sp) => {
+                    for v in sp.referenced_vars() {
+                        bump_count(counts, v);
+                        vars.insert(v);
+                    }
+                    bump_count(counts, sp.path_var);
+                    vars.insert(sp.path_var);
                 }
                 // The DefaultGraphSource wrapper is structurally
                 // transparent — its inner patterns are part of the
@@ -2115,6 +2124,21 @@ pub fn build_where_operators_seeded_with_needed(
 
                 operator = Some(Box::new(
                     PropertyPathOperator::new(operator, pp.clone(), DEFAULT_MAX_VISITED)
+                        .with_out_schema(augmented_ref),
+                ));
+                i += 1;
+            }
+
+            Pattern::ShortestPath(sp) => {
+                // Anchored shortest-path search. Endpoints come from a preceding
+                // pattern; seed an empty child if this somehow lands at pos 0
+                // (constant endpoints) so the operator always has an input row.
+                let child = get_or_empty_seed(operator.take());
+                let augmented_rwv = augmented_at(i + 1);
+                let augmented_ref = augmented_rwv.as_deref();
+
+                operator = Some(Box::new(
+                    crate::shortest_path::ShortestPathOperator::with_defaults(child, sp.clone())
                         .with_out_schema(augmented_ref),
                 ));
                 i += 1;

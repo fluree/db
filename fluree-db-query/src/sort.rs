@@ -209,6 +209,11 @@ pub fn compare_bindings(a: &Binding, b: &Binding) -> Ordering {
         (_, Binding::Grouped(_)) => Ordering::Less,
         (Binding::Grouped(_), _) => Ordering::Greater,
 
+        // Path sorts last by node sequence (rarely sorted directly).
+        (Binding::Path(x), Binding::Path(y)) => x.cmp(y),
+        (_, Binding::Path(_)) => Ordering::Less,
+        (Binding::Path(_), _) => Ordering::Greater,
+
         // IRI types vs Lit types: IRI sorts before Lit
         (
             Binding::Sid { .. }
