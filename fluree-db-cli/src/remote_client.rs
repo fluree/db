@@ -193,6 +193,48 @@ pub struct RemoteLedgerClient {
     policy: PolicyArgs,
 }
 
+/// `.flpack` import capabilities advertised by the server's discovery doc
+/// (`/.well-known/fluree.json` → `import`).
+#[derive(Debug, Clone)]
+pub struct ImportCapability {
+    /// Supported upload modes, e.g. `["direct", "presigned-put"]`.
+    pub modes: Vec<String>,
+    /// Max body size accepted on the direct `POST /import` path, when advertised.
+    pub direct_max_bytes: Option<u64>,
+}
+
+impl ImportCapability {
+    /// Back-compatible default for servers that don't advertise import
+    /// capabilities: direct streaming only.
+    fn direct_only() -> Self {
+        Self {
+            modes: vec!["direct".to_string()],
+            direct_max_bytes: None,
+        }
+    }
+
+    fn supports_presigned_put(&self) -> bool {
+        self.modes.iter().any(|m| m == "presigned-put")
+    }
+
+    /// Whether an archive of `size` bytes should take the negotiated upload
+    /// path: presigned-put must be offered, and either direct isn't offered at
+    /// all or the archive exceeds the advertised direct cap.
+    pub fn needs_negotiated_upload(&self, size: u64) -> bool {
+        if !self.supports_presigned_put() {
+            return false;
+        }
+        let direct_offered = self.modes.iter().any(|m| m == "direct");
+        if !direct_offered {
+            return true;
+        }
+        match self.direct_max_bytes {
+            Some(max) => size > max,
+            None => false,
+        }
+    }
+}
+
 impl fmt::Debug for RemoteLedgerClient {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("RemoteLedgerClient")
@@ -1249,6 +1291,130 @@ impl RemoteLedgerClient {
             .send()
             .await
             .map_err(Self::map_network_error)
+    }
+
+    // ========================================================================
+    // Negotiated upload import (for size-capped servers)
+    // ========================================================================
+
+    /// Read the server's `.flpack` import capabilities from discovery.
+    ///
+    /// Best-effort: any failure (old server, no discovery, parse error) yields
+    /// the back-compatible default — direct streaming only.
+    pub async fn fetch_import_capability(&self) -> ImportCapability {
+        let Ok(disco_url) = reqwest::Url::parse(&self.base_url)
+            .and_then(|u| u.join("/.well-known/fluree.json"))
+        else {
+            return ImportCapability::direct_only();
+        };
+        let resp = match self.add_auth(self.client.get(disco_url)).send().await {
+            Ok(r) if r.status().is_success() => r,
+            _ => return ImportCapability::direct_only(),
+        };
+        let Ok(doc) = resp.json::<serde_json::Value>().await else {
+            return ImportCapability::direct_only();
+        };
+        let import = &doc["import"];
+        if !import.is_object() {
+            return ImportCapability::direct_only();
+        }
+        let modes = import["modes"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_else(|| vec!["direct".to_string()]);
+        let direct_max_bytes = import["direct_max_bytes"].as_u64();
+        ImportCapability {
+            modes,
+            direct_max_bytes,
+        }
+    }
+
+    /// Mint an upload slot: `POST {base_url}/import-upload`.
+    ///
+    /// Returns the raw JSON response (`import_id` + `upload` descriptor).
+    pub async fn mint_import_upload(
+        &self,
+        ledger: &str,
+        size: Option<u64>,
+    ) -> Result<serde_json::Value, RemoteLedgerError> {
+        let url = self.op_url_root("import-upload");
+        let mut body = serde_json::json!({ "ledger": ledger });
+        if let Some(size) = size {
+            body["size"] = serde_json::Value::from(size);
+        }
+        self.send_json(
+            reqwest::Method::POST,
+            &url,
+            "application/json",
+            Some(RequestBody::Json(&body)),
+        )
+        .await
+    }
+
+    /// PUT a `.flpack` file to a minted upload URL.
+    ///
+    /// `url` may be absolute (a real presigned object-store URL) or relative
+    /// (the reference backend's own blob endpoint) — relative URLs resolve
+    /// against the server origin. The minted URL is the capability, so **no
+    /// bearer auth** is attached (it would break a presigned signature); only
+    /// the server-specified `headers` are sent.
+    pub async fn put_upload_file(
+        &self,
+        url: &str,
+        headers: &std::collections::HashMap<String, String>,
+        file_path: &std::path::Path,
+    ) -> Result<(), RemoteLedgerError> {
+        let resolved = if url.starts_with("http://") || url.starts_with("https://") {
+            url.to_string()
+        } else {
+            reqwest::Url::parse(&self.base_url)
+                .and_then(|u| u.join(url))
+                .map_err(|e| {
+                    RemoteLedgerError::InvalidResponse(format!("invalid upload url '{url}': {e}"))
+                })?
+                .to_string()
+        };
+
+        let file = tokio::fs::File::open(file_path).await.map_err(|e| {
+            RemoteLedgerError::InvalidRequest(format!("failed to open {}: {e}", file_path.display()))
+        })?;
+        let body = reqwest::Body::wrap_stream(tokio_util::io::ReaderStream::new(file));
+
+        let mut req = self.client.put(&resolved).body(body);
+        for (k, v) in headers {
+            req = req.header(k, v);
+        }
+        let resp = req.send().await.map_err(Self::map_network_error)?;
+        if resp.status().is_success() {
+            Ok(())
+        } else {
+            Err(Self::map_error(resp).await)
+        }
+    }
+
+    /// Notify the server that the upload is complete and the restore may begin:
+    /// `POST {base_url}/import-upload/{import_id}/complete`.
+    pub async fn complete_import_upload(
+        &self,
+        import_id: &str,
+    ) -> Result<serde_json::Value, RemoteLedgerError> {
+        let url = format!("{}/import-upload/{}/complete", self.base_url, import_id);
+        self.send_json(reqwest::Method::POST, &url, "application/json", None)
+            .await
+    }
+
+    /// Poll import status: `GET {base_url}/import-upload/{import_id}`.
+    pub async fn import_upload_status(
+        &self,
+        import_id: &str,
+    ) -> Result<serde_json::Value, RemoteLedgerError> {
+        let url = format!("{}/import-upload/{}", self.base_url, import_id);
+        self.send_json(reqwest::Method::GET, &url, "application/json", None)
+            .await
     }
 
     /// Drop a ledger or graph source on the remote server.

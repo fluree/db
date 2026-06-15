@@ -75,6 +75,11 @@ pub struct AppState {
     /// Handle for the background leaflet cache stats logger task.
     /// Aborted on drop so the `Arc<LeafletCache>` doesn't outlive the server.
     cache_stats_handle: Option<tokio::task::JoinHandle<()>>,
+
+    /// Registry of in-flight negotiated-upload import jobs (reference impl of
+    /// the presigned `.flpack` upload flow). Empty/unused unless
+    /// `config.import_presign_enabled`.
+    pub import_jobs: Arc<crate::import_jobs::ImportJobs>,
 }
 
 impl AppState {
@@ -193,6 +198,7 @@ impl AppState {
             refresh_counter: AtomicU64::new(0),
             query_refresh_last_checked: DashMap::new(),
             cache_stats_handle: Some(cache_stats_handle),
+            import_jobs: Arc::new(crate::import_jobs::ImportJobs::default()),
         })
     }
 

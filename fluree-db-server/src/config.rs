@@ -446,6 +446,25 @@ pub struct ServerConfig {
     #[arg(long, env = "FLUREE_QUERY_REFRESH_TTL_MS", default_value_t = server_defaults::DEFAULT_QUERY_REFRESH_TTL_MS)]
     pub query_refresh_ttl_ms: u64,
 
+    /// Enable the negotiated presigned-upload import path (for clients that
+    /// cannot send a large body to `POST /import`, e.g. behind a payload-capped
+    /// gateway). Advertised in discovery; the reference impl stages uploads to
+    /// `import_staging_dir` and restores from there.
+    #[arg(long, env = "FLUREE_IMPORT_PRESIGN_ENABLED", default_value_t = false)]
+    pub import_presign_enabled: bool,
+
+    /// Max body size (bytes) accepted on the direct `POST /import` path,
+    /// advertised as `import.direct_max_bytes`. Clients with an archive larger
+    /// than this use the negotiated upload flow. Only meaningful when presign
+    /// is enabled.
+    #[arg(long, env = "FLUREE_IMPORT_DIRECT_MAX_BYTES", default_value_t = 6_291_456)]
+    pub import_direct_max_bytes: usize,
+
+    /// Directory the reference presigned-upload backend stages archives in
+    /// before restoring. Defaults to the system temp dir when unset.
+    #[arg(long, env = "FLUREE_IMPORT_STAGING_DIR")]
+    pub import_staging_dir: Option<std::path::PathBuf>,
+
     /// Log level (trace, debug, info, warn, error)
     #[arg(long, env = "FLUREE_LOG_LEVEL", default_value = server_defaults::DEFAULT_LOG_LEVEL)]
     pub log_level: String,
@@ -694,6 +713,9 @@ impl Default for ServerConfig {
             query_min_t_timeout_ms: server_defaults::DEFAULT_QUERY_MIN_T_TIMEOUT_MS,
             query_refresh_enabled: server_defaults::DEFAULT_QUERY_REFRESH_ENABLED,
             query_refresh_ttl_ms: server_defaults::DEFAULT_QUERY_REFRESH_TTL_MS,
+            import_presign_enabled: false,
+            import_direct_max_bytes: 6_291_456,
+            import_staging_dir: None,
             log_level: server_defaults::DEFAULT_LOG_LEVEL.to_string(),
             events_auth_mode: EventsAuthMode::None,
             events_auth_audience: None,

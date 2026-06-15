@@ -294,6 +294,20 @@ pub async fn discovery(State(state): State<Arc<AppState>>) -> Json<serde_json::V
         });
     }
 
+    // Advertise `.flpack` import capabilities so clients can negotiate the
+    // upload path. `direct` is always available (streaming POST /import);
+    // `presigned-put` is offered when the operator enables the negotiated
+    // upload flow for size-capped clients. `direct_max_bytes` only gates the
+    // choice when `presigned-put` is also offered.
+    let mut import_modes = vec!["direct"];
+    if config.import_presign_enabled {
+        import_modes.push("presigned-put");
+    }
+    doc["import"] = serde_json::json!({
+        "modes": import_modes,
+        "direct_max_bytes": config.import_direct_max_bytes,
+    });
+
     Json(doc)
 }
 

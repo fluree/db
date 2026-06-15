@@ -39,56 +39,166 @@ pub async fn run_remote(ledger: &str, remote_name: &str, dirs: &FlureeDir) -> Cl
 }
 
 /// `fluree create <ledger> --remote <name> --from <archive>.flpack` — restore a
-/// ledger onto a remote server by streaming a local `.flpack` archive to its
-/// `POST /import/<ledger>` endpoint. The remote creates the ledger under
-/// `ledger` (which may differ from the archived ledger's name). No local state
-/// is written — remote storage is separate from local.
+/// ledger onto a remote server from a local `.flpack` archive. The remote
+/// creates the ledger under `ledger` (which may differ from the archived
+/// ledger's name). No local state is written — remote storage is separate.
+///
+/// Picks the upload path from the server's advertised capabilities: a direct
+/// streamed `POST /import` by default, or the negotiated presigned-upload flow
+/// when the server is size-capped and the archive exceeds its direct limit.
 pub async fn run_remote_flpack_import(
     ledger: &str,
     remote_name: &str,
     path: &Path,
     dirs: &FlureeDir,
 ) -> CliResult<()> {
-    use colored::Colorize;
-
     let meta = std::fs::metadata(path)
         .map_err(|e| CliError::Input(format!("failed to stat {}: {e}", path.display())))?;
+    let size = meta.len();
 
     let client = context::build_remote_client(remote_name, dirs).await?;
     let ledger_id = context::to_ledger_id(ledger);
 
+    let cap = client.fetch_import_capability().await;
+    let result = if cap.needs_negotiated_upload(size) {
+        run_remote_flpack_negotiated(&client, ledger, &ledger_id, remote_name, path, size).await?
+    } else {
+        run_remote_flpack_direct(&client, ledger, &ledger_id, remote_name, path, size).await?
+    };
+    context::persist_refreshed_tokens(&client, remote_name, dirs).await;
+
+    print_remote_import_summary(remote_name, &ledger_id, &result);
+    Ok(())
+}
+
+/// Direct path: stream the archive straight to `POST /import/<ledger>`.
+async fn run_remote_flpack_direct(
+    client: &crate::remote_client::RemoteLedgerClient,
+    ledger: &str,
+    ledger_id: &str,
+    remote_name: &str,
+    path: &Path,
+    size: u64,
+) -> CliResult<serde_json::Value> {
+    use colored::Colorize;
     eprintln!(
         "Importing '{}' to remote '{}' from {} ({})...",
         ledger.cyan(),
         remote_name,
         path.display(),
-        format_human_bytes(meta.len()),
+        format_human_bytes(size),
     );
-
-    let response = client.import_ledger(&ledger_id, path).await.map_err(|e| {
+    client.import_ledger(ledger_id, path).await.map_err(|e| {
         CliError::Remote(format!(
             "failed to import '{ledger}' to remote '{remote_name}': {e}"
         ))
-    })?;
-    context::persist_refreshed_tokens(&client, remote_name, dirs).await;
+    })
+}
 
-    let resolved = response
-        .get("ledger_id")
-        .and_then(|v| v.as_str())
-        .unwrap_or(&ledger_id);
-    let commits = response
-        .get("commits")
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or(0);
-    let txn_blobs = response
-        .get("txn_blobs")
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or(0);
-    let index_artifacts = response
-        .get("index_artifacts")
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or(0);
+/// Negotiated path: mint an upload slot, PUT the archive out-of-band, notify
+/// `complete`, then poll status to a terminal state.
+async fn run_remote_flpack_negotiated(
+    client: &crate::remote_client::RemoteLedgerClient,
+    ledger: &str,
+    ledger_id: &str,
+    remote_name: &str,
+    path: &Path,
+    size: u64,
+) -> CliResult<serde_json::Value> {
+    use colored::Colorize;
+    use std::collections::HashMap;
 
+    eprintln!(
+        "Uploading '{}' to remote '{}' via presigned upload ({})...",
+        ledger.cyan(),
+        remote_name,
+        format_human_bytes(size),
+    );
+
+    // 1. Mint an upload slot.
+    let mint = client
+        .mint_import_upload(ledger_id, Some(size))
+        .await
+        .map_err(|e| CliError::Remote(format!("failed to start upload to '{remote_name}': {e}")))?;
+    let import_id = mint["import_id"]
+        .as_str()
+        .ok_or_else(|| CliError::Remote("mint response missing import_id".to_string()))?
+        .to_string();
+    let upload = &mint["upload"];
+    let url = upload["url"]
+        .as_str()
+        .ok_or_else(|| CliError::Remote("mint response missing upload.url".to_string()))?;
+    let headers: HashMap<String, String> = upload["headers"]
+        .as_object()
+        .map(|o| {
+            o.iter()
+                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // 2. Upload the archive directly to the minted URL.
+    client
+        .put_upload_file(url, &headers, path)
+        .await
+        .map_err(|e| CliError::Remote(format!("failed to upload archive: {e}")))?;
+
+    // 3. Notify the server to begin the restore.
+    client
+        .complete_import_upload(&import_id)
+        .await
+        .map_err(|e| CliError::Remote(format!("failed to start remote import: {e}")))?;
+
+    eprintln!("Upload complete; restoring on '{remote_name}'...");
+
+    // 4. Poll status to a terminal state.
+    poll_remote_import(client, &import_id).await
+}
+
+/// Poll `import-upload/{id}` until the import reaches a terminal state.
+async fn poll_remote_import(
+    client: &crate::remote_client::RemoteLedgerClient,
+    import_id: &str,
+) -> CliResult<serde_json::Value> {
+    use std::time::{Duration, Instant};
+
+    let deadline = Instant::now() + Duration::from_secs(1800);
+    let mut backoff = Duration::from_millis(500);
+    loop {
+        let status = client
+            .import_upload_status(import_id)
+            .await
+            .map_err(|e| CliError::Remote(format!("failed to poll import status: {e}")))?;
+        match status["status"].as_str() {
+            Some("succeeded") => return Ok(status["result"].clone()),
+            Some("failed") => {
+                let err = status["error"].as_str().unwrap_or("unknown error");
+                return Err(CliError::Remote(format!("remote import failed: {err}")));
+            }
+            Some("running" | "awaiting-upload") => {}
+            other => {
+                return Err(CliError::Remote(format!(
+                    "unexpected remote import status: {other:?}"
+                )));
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(CliError::Remote(
+                "timed out waiting for remote import to complete".to_string(),
+            ));
+        }
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(Duration::from_secs(3));
+    }
+}
+
+/// Print the shared success summary for a remote import (both paths).
+fn print_remote_import_summary(remote_name: &str, ledger_id: &str, result: &serde_json::Value) {
+    use colored::Colorize;
+    let resolved = result["ledger_id"].as_str().unwrap_or(ledger_id);
+    let commits = result["commits"].as_u64().unwrap_or(0);
+    let txn_blobs = result["txn_blobs"].as_u64().unwrap_or(0);
+    let index_artifacts = result["index_artifacts"].as_u64().unwrap_or(0);
     println!(
         "{} Imported '{}' to remote '{}' — {} commits, {} txn blobs, {} index artifacts",
         "✓".green(),
@@ -98,7 +208,6 @@ pub async fn run_remote_flpack_import(
         txn_blobs,
         index_artifacts,
     );
-    Ok(())
 }
 
 pub async fn run(
