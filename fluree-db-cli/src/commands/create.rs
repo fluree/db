@@ -13,6 +13,10 @@ pub struct ImportOpts {
     pub chunk_size_mb: usize,
     pub leaflet_rows: usize,
     pub leaflets_per_leaf: usize,
+    /// CSV import: how relationship (edge) properties are encoded.
+    pub edge_policy: fluree_db_api::csv_import::EdgePolicy,
+    /// CSV import: base IRI namespace for minted ids/predicates/classes.
+    pub base_iri: String,
 }
 
 /// `fluree create <ledger> --remote <name>` — create an empty ledger on the
@@ -60,6 +64,12 @@ pub async fn run(
     match from {
         Some(path) if is_flpack_path(path) => {
             run_flpack_import(&fluree, ledger, path, dirs).await?;
+        }
+        // CSV (single file or a directory containing .csv) is converted to
+        // JSON-LD and loaded through the JSON-LD insert path. Checked before the
+        // directory / bulk branches, which only understand RDF/JSON-LD.
+        Some(path) if is_csv_input(path) => {
+            run_csv_import(&fluree, ledger, path, dirs, quiet, import_opts).await?;
         }
         Some(path) if path.is_dir() => {
             // Validate directory format (catches mixed formats & empty dirs).
@@ -804,6 +814,98 @@ fn is_import_path(path: &Path) -> CliResult<bool> {
     // Single source of truth with the import pipeline's own discovery rules —
     // a format accepted here is guaranteed to resolve there.
     Ok(fluree_db_api::is_bulk_import_file(path))
+}
+
+/// Whether `--from` points at CSV input: a single `.csv` file, or a directory
+/// containing at least one `.csv` file.
+fn is_csv_input(path: &Path) -> bool {
+    if path.is_dir() {
+        std::fs::read_dir(path)
+            .into_iter()
+            .flatten()
+            .filter_map(std::result::Result::ok)
+            .any(|e| has_csv_extension(&e.path()))
+    } else {
+        has_csv_extension(path)
+    }
+}
+
+fn has_csv_extension(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("csv"))
+}
+
+/// Convert CSV node/relationship files (neo4j-admin header convention) to
+/// JSON-LD and load via the JSON-LD insert path. v1 loads the whole dataset in
+/// one transaction (fine for small scale factors); streaming into the chunked
+/// bulk pipeline is a follow-up.
+async fn run_csv_import(
+    fluree: &fluree_db_api::Fluree,
+    ledger: &str,
+    path: &Path,
+    dirs: &FlureeDir,
+    quiet: bool,
+    import_opts: &ImportOpts,
+) -> CliResult<()> {
+    use fluree_db_api::csv_import::{csv_files_to_jsonld, CsvImportOptions};
+
+    let files: Vec<std::path::PathBuf> = if path.is_dir() {
+        let mut v: Vec<_> = std::fs::read_dir(path)
+            .map_err(|e| CliError::Input(format!("failed to read {}: {e}", path.display())))?
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| has_csv_extension(p))
+            .collect();
+        v.sort();
+        v
+    } else {
+        vec![path.to_path_buf()]
+    };
+    if files.is_empty() {
+        return Err(CliError::Input(format!(
+            "no .csv files found in {}",
+            path.display()
+        )));
+    }
+
+    if !quiet {
+        println!(
+            "Converting {} CSV file(s) → JSON-LD (edge properties: {:?})...",
+            files.len(),
+            import_opts.edge_policy
+        );
+    }
+
+    let texts: Vec<String> = files
+        .iter()
+        .map(|p| {
+            std::fs::read_to_string(p)
+                .map_err(|e| CliError::Input(format!("failed to read {}: {e}", p.display())))
+        })
+        .collect::<CliResult<_>>()?;
+    let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+
+    let opts = CsvImportOptions {
+        edge_policy: import_opts.edge_policy,
+        base_iri: import_opts.base_iri.clone(),
+        ..Default::default()
+    };
+    let doc = csv_files_to_jsonld(&refs, &opts)
+        .map_err(|e| CliError::Input(format!("CSV import: {e}")))?;
+
+    fluree.create_ledger(ledger).await?;
+    let result = fluree
+        .graph(ledger)
+        .transact()
+        .insert(&doc)
+        .commit()
+        .await?;
+    config::write_active_ledger(dirs.data_dir(), ledger)?;
+    println!(
+        "Created ledger '{}' from CSV ({} flakes, t={})",
+        ledger, result.receipt.flake_count, result.receipt.t
+    );
+    Ok(())
 }
 
 /// Replace non-alphanumeric characters with underscores for safe filenames.
