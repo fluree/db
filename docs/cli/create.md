@@ -47,6 +47,8 @@ When `--from` points at a `.flpack` file (produced by `fluree export <ledger> --
 
 Add `--remote <name>` to restore onto a server instead of locally; the archive streams to the server's import endpoint, so no local staging instance is needed. This makes `.flpack` the universal way to move any data onto a server — build a ledger locally in any format, export it, then import it remotely. See [pack archive & restore](../operations/pack-archive-restore.md) for the full workflow.
 
+If the remote is size-capped (e.g. an app behind a payload-limited gateway) and advertises it in discovery, the CLI automatically switches to a negotiated upload: it uploads the archive out-of-band to object storage and the server restores from it asynchronously. No extra flags — the path is chosen from the server's capabilities and the archive size.
+
 ## Examples
 
 ```bash

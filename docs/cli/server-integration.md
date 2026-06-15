@@ -1319,6 +1319,8 @@ The CLI reads `ledger_id`, `commits`, `txn_blobs`, and `index_artifacts` for its
 
 **Graceful fallback:** A server that does not implement import returns `404` / `405` / `501`; the CLI surfaces this as a remote error. There is no automatic client-side fallback (unlike pack → commits), since wholesale restore has no per-object equivalent over the data API.
 
+**Size-capped servers:** if your gateway caps request bodies below a typical archive, implement the [Negotiated Upload Import Contract](#negotiated-upload-import-contract) instead of (or in addition to) this direct endpoint, and advertise it in discovery — the CLI will upload out-of-band automatically.
+
 ### Reference implementation
 
 | Concern | Canonical location |
@@ -1327,6 +1329,62 @@ The CLI reads `ledger_id`, `commits`, `txn_blobs`, and `index_artifacts` for its
 | Streaming restore + head finalization + rollback | `fluree-db-api/src/commit_transfer.rs::restore_ledger` |
 | CLI dispatch + streaming upload | `fluree-db-cli/src/commands/create.rs::run_remote_flpack_import`, `fluree-db-cli/src/remote_client.rs::import_ledger` |
 | Archive export (producing the body) | `fluree-db-api/src/lib.rs::archive_ledger` |
+
+## Negotiated Upload Import Contract
+
+For servers that **cannot accept a large body** on `POST /import` — e.g. an app on AWS Lambda behind API Gateway, where request payloads are capped (~6–10 MB) — the CLI supports an out-of-band upload handshake: the client uploads the `.flpack` directly to object storage (bypassing the size-capped request path), then notifies the server to restore from it. This is **optional**; implement it only if your gateway caps body size.
+
+### Negotiation (discovery)
+
+Advertise import capabilities in the discovery document (`GET /.well-known/fluree.json`):
+
+```jsonc
+"import": {
+  "modes": ["direct", "presigned-put"],
+  "direct_max_bytes": 6291456
+}
+```
+
+- `modes` — `"direct"` (streaming `POST /import`) and/or `"presigned-put"` (the flow below).
+- `direct_max_bytes` — the largest body you accept on `POST /import`. Only gates the choice when `presigned-put` is also offered.
+
+**CLI selection rule:** use the negotiated flow when `presigned-put` is offered **and** either `direct` is not offered or the archive size exceeds `direct_max_bytes`; otherwise stream directly. A server omitting the `import` block is treated as direct-only (back-compatible).
+
+### The handshake
+
+| Step | Call | Server responsibility |
+|------|------|----------------------|
+| 1. Mint | `POST {api_base}/import-upload` `{ "ledger": "<name>", "size"?: <bytes> }` | Allocate an upload slot. Return `{ import_id, upload: { method:"PUT", url, headers, expires_at_unix } }` where `url` is a presigned object-store PUT (absolute) **or** a relative path the client resolves against the server origin. |
+| 2. Upload | `PUT <upload.url>` (raw `.flpack`, streamed) | Receive the bytes into staging (object storage). The URL is the capability — **do not require the API bearer token** on this request; authorize via the presigned signature (or a token embedded in the URL). |
+| 3. Complete | `POST {api_base}/import-upload/{import_id}/complete` | Verify the upload exists, begin `restore_ledger` from it **asynchronously**, return `{ import_id, status:"running" }` (`202`). |
+| 4. Poll | `GET {api_base}/import-upload/{import_id}` | Return `{ status, result?, error? }`, `status ∈ {awaiting-upload, running, succeeded, failed}`. On `succeeded`, `result` is the same summary as the direct import endpoint. |
+
+The CLI carries the bearer token on steps 1, 3, 4 (mint/complete/status are admin-grade) but **not** step 2.
+
+### Required server behavior
+
+1. **`import_id` and the upload URL must be unguessable** — step 2 is authorized by possession of the URL alone.
+2. **Stream step 2 to storage**, never buffer the archive in memory.
+3. **Restore asynchronously** in step 3 and report progress via step 4 — the restore can outlast a single request (and your function timeout). Apply the same trust/verify/rollback semantics as the [Ledger Import Contract](#ledger-import-contract) (every frame SHA-256 verified; roll back on failure).
+4. **`complete` before any upload** → `400`. **Unknown `import_id`** → `404` on every step.
+5. Run the actual restore wherever it can take the time it needs (a worker, not necessarily the request handler).
+
+### Auth
+
+`import-upload` (mint), `…/complete`, and `…/{import_id}` (status) are **admin-protected** (same bracket as `/create`, `/import`). The blob `PUT` (`…/{import_id}/blob` in the reference impl) is **token-authorized via the URL**, not admin auth.
+
+### Reference implementation
+
+The Fluree server ships a reference backend (enable with `FLUREE_IMPORT_PRESIGN_ENABLED=true`) that stages uploads to local disk and points the upload URL back at its own blob endpoint — so the CLI handshake is exercised end-to-end without object storage. A production server mints a real presigned object-store PUT in step 1 instead; the client flow is identical.
+
+| Concern | Canonical location |
+|---------|-------------------|
+| Discovery `import` block | `fluree-db-server/src/routes/admin.rs::discovery` |
+| Mint / blob / complete / status routes | `fluree-db-server/src/routes/import.rs` |
+| In-memory job registry | `fluree-db-server/src/import_jobs.rs` |
+| CLI negotiation + upload + poll | `fluree-db-cli/src/commands/create.rs::run_remote_flpack_negotiated`, `fluree-db-cli/src/remote_client.rs` |
+
+> A production server fronting real object storage persists job state externally (DB / object tags) rather than in process, and mints presigned URLs against its bucket. The contract above is what the CLI depends on; the staging mechanism is the server's choice.
 
 ## Storage Proxy Contract
 

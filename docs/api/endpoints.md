@@ -28,6 +28,8 @@ The CLI treats `oidc_device` as "OIDC interactive login": it uses device-code wh
 Implementations MAY also return `api_base_url` to tell the CLI where the Fluree API is mounted (for example,
 when the API is hosted under `/v1/fluree` or on a separate `data` subdomain).
 
+Implementations MAY also return an `import` block advertising `.flpack` import capabilities (`modes`, `direct_max_bytes`) so the CLI can negotiate the upload path — see [Negotiated upload import](#negotiated-upload-import-import-upload).
+
 ### GET {api_base_url}/whoami
 
 Diagnostic endpoint for Bearer tokens. Returns a summary of the principal:
@@ -705,6 +707,28 @@ curl -X POST "http://localhost:8090/v1/fluree/import/restored-db:main" \
 ```
 
 This is the transport behind `fluree create restored-db --remote origin --from mydb.flpack`.
+
+### Negotiated upload import (`/import-upload`)
+
+For clients that cannot send a large body to `POST /import` (e.g. behind a payload-capped gateway), an optional out-of-band upload handshake lets the client upload the `.flpack` directly to object storage, then have the server restore from it asynchronously. Servers advertise support in discovery (`GET /.well-known/fluree.json`):
+
+```jsonc
+"import": {
+  "modes": ["direct", "presigned-put"],   // "presigned-put" enables the flow below
+  "direct_max_bytes": 6291456              // archives larger than this negotiate
+}
+```
+
+| Step | Endpoint | Result |
+|------|----------|--------|
+| Mint | `POST /import-upload` `{ledger, size?}` | `{ import_id, upload: { method, url, headers, expires_at_unix } }` |
+| Upload | `PUT <upload.url>` (raw `.flpack`) | bytes staged (direct to object storage; **no bearer auth** — the URL is the capability) |
+| Complete | `POST /import-upload/{import_id}/complete` | `202` `{ import_id, status:"running" }` — restore begins asynchronously |
+| Status | `GET /import-upload/{import_id}` | `{ status, result?, error? }`, `status ∈ {awaiting-upload, running, succeeded, failed}` |
+
+Mint / complete / status are **admin-protected**; the blob `PUT` is token-authorized via the minted URL. On `succeeded`, `result` is the same summary as `POST /import`. The Fluree server ships a reference backend behind `FLUREE_IMPORT_PRESIGN_ENABLED=true` (stages to local disk); production servers mint a presigned object-store PUT. See the [Negotiated Upload Import Contract](../cli/server-integration.md#negotiated-upload-import-contract) for the full implementer spec.
+
+This is the transport behind `fluree create … --remote … --from big.flpack` when the server is size-capped — the CLI negotiates automatically.
 
 ## Storage Proxy Endpoints
 
