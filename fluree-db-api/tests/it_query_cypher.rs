@@ -2852,6 +2852,181 @@ async fn cypher_unwind_runtime_list() {
 }
 
 #[tokio::test]
+async fn cypher_path_pairs_and_list_indexing() {
+    // pathPairs(p) explodes a path into consecutive node pairs; pair[0]/pair[1]
+    // index each two-element pair. The building block for IC14 per-edge weight.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = seed_ic1_chain(&fluree, "it/cypher:path-pairs").await; // Alice→Bob→Carol→Dave→Eve
+    let db = graphdb_from_ledger(&l);
+
+    // Alice→Bob→Carol→Dave = 3 edges → 3 pairs; index endpoints as IRIs.
+    let out = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (a:Person {name:"Alice"}),(d:Person {name:"Dave"})
+               MATCH p = shortestPath((a)-[:KNOWS*]->(d))
+               UNWIND pathPairs(p) AS pair
+               RETURN pair[0] AS from, pair[1] AS to"#,
+        )
+        .await
+        .expect("path pairs")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    assert_eq!(
+        out,
+        json!([
+            ["http://example.org/alice", "http://example.org/bob"],
+            ["http://example.org/bob", "http://example.org/carol"],
+            ["http://example.org/carol", "http://example.org/dave"],
+        ]),
+        "consecutive node pairs along the path: {out}"
+    );
+
+    // An indexed pair element correlates as a node ref in a downstream property
+    // accessor (the IC14 shape: pair[0]/pair[1] become MATCH endpoints).
+    let names = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (a:Person {name:"Alice"}),(d:Person {name:"Dave"})
+               MATCH p = shortestPath((a)-[:KNOWS*]->(d))
+               UNWIND pathPairs(p) AS pair
+               WITH pair[0] AS x, pair[1] AS y
+               RETURN x.name AS from, y.name AS to"#,
+        )
+        .await
+        .expect("path pair names")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    assert_eq!(
+        names,
+        json!([["Alice", "Bob"], ["Bob", "Carol"], ["Carol", "Dave"]]),
+        "indexed pair elements resolve as node refs: {names}"
+    );
+
+    // size(pathPairs(p)) = edge count = 3.
+    let n = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (a:Person {name:"Alice"}),(d:Person {name:"Dave"})
+               MATCH p = shortestPath((a)-[:KNOWS*]->(d))
+               RETURN size(pathPairs(p)) AS n"#,
+        )
+        .await
+        .expect("size pathPairs")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    assert_eq!(n[0][0], json!(3), "3 edges → 3 pairs: {n}");
+
+    // Negative index: list[-1] is the last element.
+    let last = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (n:Person {name:"Alice"}) RETURN range(10, 40, 10)[-1] AS last"#,
+        )
+        .await
+        .expect("negative index")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    assert_eq!(last[0][0], json!(40), "range(10,40,10)[-1] = 40: {last}");
+}
+
+#[tokio::test]
+async fn cypher_ic14_weighted_paths() {
+    // IC14 weighted scoring (Option B): the per-edge `reduce` is decomposed into
+    // unwind-pairs → OPTIONAL MATCH interaction → count → sum, grouped by path.
+    // The path `p` is carried through the WITH boundaries (a node sequence
+    // survives projection) and the final id list is a *terminal* collect grouped
+    // by that path — together these sidestep the collect-in-WITH limitation.
+    //
+    // Diamond A→B→D / A→C→D (two 2-hop paths). Each "message" node m links a
+    // sender (SENT_BY) to a receiver (RCVD_BY); the per-pair weight is count(m).
+    //   pair (A,B): 2 msgs   pair (B,D): 1 msg   → path A→B→D weight 3
+    //   pair (A,C): 0 msgs   pair (C,D): 5 msgs  → path A→C→D weight 5
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/cypher:ic14-weight");
+    let mut graph = vec![
+        json!({"@id":"ex:a","@type":"ex:Person","ex:name":"A","ex:KNOWS":[{"@id":"ex:b"},{"@id":"ex:c"}]}),
+        json!({"@id":"ex:b","@type":"ex:Person","ex:name":"B","ex:KNOWS":{"@id":"ex:d"}}),
+        json!({"@id":"ex:c","@type":"ex:Person","ex:name":"C","ex:KNOWS":{"@id":"ex:d"}}),
+        json!({"@id":"ex:d","@type":"ex:Person","ex:name":"D"}),
+    ];
+    // Helper: n messages from `from` to `to`, with globally-unique message ids.
+    let add_msgs = |from: &str, to: &str, n: usize, graph: &mut Vec<JsonValue>| {
+        for i in 0..n {
+            let mid = format!("ex:m_{from}_{to}_{i}");
+            graph.push(json!({
+                "@id": mid,
+                "ex:SENT_BY": {"@id": format!("ex:{from}")},
+                "ex:RCVD_BY": {"@id": format!("ex:{to}")},
+            }));
+        }
+    };
+    add_msgs("a", "b", 2, &mut graph);
+    add_msgs("b", "d", 1, &mut graph);
+    add_msgs("c", "d", 5, &mut graph);
+    let l = fluree
+        .insert(ledger0, &json!({"@context": ctx(), "@graph": graph}))
+        .await
+        .expect("seed interaction graph")
+        .ledger;
+    let db = graphdb_from_ledger(&l);
+
+    let out = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (a:Person {name:"A"}),(z:Person {name:"D"})
+               MATCH p = allShortestPaths((a)-[:KNOWS*]->(z))
+               UNWIND pathPairs(p) AS pair
+               WITH p, pair[0] AS x, pair[1] AS y
+               OPTIONAL MATCH (x)<-[:SENT_BY]-(m)-[:RCVD_BY]->(y)
+               WITH p, x, y, count(m) AS pairWeight
+               WITH p, sum(pairWeight) AS pathWeight
+               RETURN pathWeight
+               ORDER BY pathWeight DESC"#,
+        )
+        .await
+        .expect("ic14 weight pipeline")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    assert_eq!(
+        out,
+        json!([[5], [3]]),
+        "path weights, descending (A→C→D=5, A→B→D=3): {out}"
+    );
+
+    // Full IC14 shape: weight AND the per-path person list together.
+    let full = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (a:Person {name:"A"}),(z:Person {name:"D"})
+               MATCH p = allShortestPaths((a)-[:KNOWS*]->(z))
+               UNWIND pathPairs(p) AS pair
+               WITH p, pair[0] AS x, pair[1] AS y
+               OPTIONAL MATCH (x)<-[:SENT_BY]-(m)-[:RCVD_BY]->(y)
+               WITH p, x, y, count(m) AS pairWeight
+               WITH p, sum(pairWeight) AS pathWeight
+               UNWIND nodes(p) AS pn
+               RETURN pathWeight, collect(pn.name) AS personsInPath
+               ORDER BY pathWeight DESC"#,
+        )
+        .await
+        .expect("ic14 full")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    assert_eq!(
+        full,
+        json!([[5, ["A", "C", "D"]], [3, ["A", "B", "D"]]]),
+        "weight + person list per path, descending: {full}"
+    );
+}
+
+#[tokio::test]
 async fn cypher_ic14_paths_as_name_lists() {
     // IC14 core, full form: every shortest connection path between two persons,
     // returned as a list of the persons' names — `UNWIND nodes(p)` + per-path

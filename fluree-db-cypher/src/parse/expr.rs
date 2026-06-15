@@ -179,12 +179,26 @@ fn parse_unary(s: &mut TokenStream) -> Result<Expr, Diagnostic> {
 
 fn parse_postfix(s: &mut TokenStream) -> Result<Expr, Diagnostic> {
     let mut e = parse_primary(s)?;
-    while let TokenKind::Dot = s.peek_kind() {
-        let start = e.span();
-        s.advance();
-        let prop = parse_ident_or_keyword(s)?;
-        let end = s.peek_span();
-        e = Expr::Prop(Box::new(e), prop, start.union(end));
+    loop {
+        match s.peek_kind() {
+            TokenKind::Dot => {
+                let start = e.span();
+                s.advance();
+                let prop = parse_ident_or_keyword(s)?;
+                let end = s.peek_span();
+                e = Expr::Prop(Box::new(e), prop, start.union(end));
+            }
+            // `expr[index]` — list element access. (A leading `[` at primary
+            // position is a list literal; here it follows an expression.)
+            TokenKind::LBracket => {
+                let start = e.span();
+                s.advance();
+                let index = parse_expr(s)?;
+                let end = s.expect(&TokenKind::RBracket)?;
+                e = Expr::Index(Box::new(e), Box::new(index), start.union(end));
+            }
+            _ => break,
+        }
     }
     Ok(e)
 }

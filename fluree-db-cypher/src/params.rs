@@ -372,7 +372,8 @@ fn collect_alias_in_expr(e: &Expr, alias: &str, fields: &mut Vec<String>, bare: 
         | Expr::In(l, r, _)
         | Expr::StartsWith(l, r, _)
         | Expr::EndsWith(l, r, _)
-        | Expr::Contains(l, r, _) => {
+        | Expr::Contains(l, r, _)
+        | Expr::Index(l, r, _) => {
             collect_alias_in_expr(l, alias, fields, bare);
             collect_alias_in_expr(r, alias, fields, bare);
         }
@@ -507,7 +508,8 @@ fn rewrite_alias_in_expr_to_var<F: Fn(&str) -> String>(
         | Expr::In(l, r, _)
         | Expr::StartsWith(l, r, _)
         | Expr::EndsWith(l, r, _)
-        | Expr::Contains(l, r, _) => {
+        | Expr::Contains(l, r, _)
+        | Expr::Index(l, r, _) => {
             rewrite_alias_in_expr_to_var(l, alias, col_var, bare_var);
             rewrite_alias_in_expr_to_var(r, alias, col_var, bare_var);
         }
@@ -616,7 +618,8 @@ fn replace_alias_in_expr(
         | Expr::In(l, r, _)
         | Expr::StartsWith(l, r, _)
         | Expr::EndsWith(l, r, _)
-        | Expr::Contains(l, r, _) => {
+        | Expr::Contains(l, r, _)
+        | Expr::Index(l, r, _) => {
             replace_alias_in_expr(l, alias, elem, pname)?;
             replace_alias_in_expr(r, alias, elem, pname)
         }
@@ -843,7 +846,8 @@ fn subst_expr(e: &mut Expr, p: &ParamMap) -> Result<(), ParamError> {
         | Expr::In(l, r, _)
         | Expr::StartsWith(l, r, _)
         | Expr::EndsWith(l, r, _)
-        | Expr::Contains(l, r, _) => {
+        | Expr::Contains(l, r, _)
+        | Expr::Index(l, r, _) => {
             subst_expr(l, p)?;
             subst_expr(r, p)
         }

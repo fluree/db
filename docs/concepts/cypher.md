@@ -129,7 +129,9 @@ ORDER BY / SKIP / LIMIT
   input row; `All` mode emits one row per minimal-length path. The
   path binds to a `Binding::Path` (node sequence); `length(p)` is its
   hop count and `p IS NULL` (under `OPTIONAL MATCH`) detects "no path"
-  — the IC13 shape. `nodes(p)` / `relationships(p)` are deferred.
+  — the IC13 shape. `nodes(p)` returns the node sequence and
+  `pathPairs(p)` the consecutive node pairs (both list-valued, for
+  `UNWIND`); `relationships(p)` (edge identities) is deferred.
 - `WHERE` expressions: comparison, AND/OR/NOT, arithmetic +/-/*//,
   STARTS WITH / ENDS WITH / CONTAINS, IS NULL / IS NOT NULL,
   `expr IN [a, b, ...]`, `CASE WHEN ... THEN ... END` (simple and
@@ -163,6 +165,17 @@ ORDER BY / SKIP / LIMIT
 - List literals `[a, b, …]` and structured `collect([a, b])` — collect
   per-row tuples into a list of lists (e.g.
   `RETURN collect([n.id, n.name])`).
+- List indexing `list[i]` — 0-based element access; a negative index
+  counts from the end (`list[-1]` is the last element). Out-of-range,
+  non-integer index, or non-list yields null. An indexed element that is
+  itself a node ref correlates downstream (`WITH pair[0] AS x ... x.name`).
+- `pathPairs(p)` — the consecutive node pairs of a path value
+  (`[[a,b],[b,c],…]`, each pair a two-element list). With `UNWIND`, this
+  drives per-edge aggregation: `UNWIND pathPairs(p) AS pair` then
+  `pair[0]` / `pair[1]` as the edge endpoints. The building block for
+  IC14-style weighted path scoring — `reduce` over per-edge interaction
+  counts becomes unwind-pairs → OPTIONAL MATCH → `count` → `sum`, grouped
+  by the carried path.
 - Aggregates: `count(*)`, `count(x)`, `count(DISTINCT x)`,
   `sum(x)`, `avg(x)`, `min(x)`, `max(x)`. Arguments may be a bare
   variable (`count(n)`) or a property accessor (`avg(n.age)`);
@@ -208,9 +221,10 @@ These produce a clear error today and land in follow-on slices.
   (`-[r:T*]->`) — needs list-valued bindings.
 - Expression-valued aggregate arguments (`sum(n + 1)`) — needs a
   pre-aggregation `Bind`.
-- `nodes(p)` / `relationships(p)`, `labels(...)`, `keys(...)`,
-  `properties(...)`, `type(r)`, `id(...)`, list/map functions
-  generally.
+- `relationships(p)` (edge identities), `labels(...)`, `keys(...)`,
+  `properties(...)`, `type(r)`, `id(...)`, and map functions generally.
+  (`nodes(p)`, `pathPairs(p)`, and list functions are supported — see
+  above.)
 - `SET / REMOVE / DELETE / DETACH DELETE`.
 - `MERGE` — Cypher's find-or-create needs a search-first phase that
   the existing `TxnType` variants don't model. A v1.1 implementation

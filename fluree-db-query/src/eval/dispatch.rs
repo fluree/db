@@ -186,9 +186,14 @@ impl Function {
             Function::Head => list::eval_head(args, row, ctx),
             Function::Last => list::eval_last(args, row, ctx),
             Function::Reverse => list::eval_reverse_string(args, row, ctx),
+            Function::ListIndex => list::eval_list_index(args, row, ctx),
             // List-returning only; no scalar value (handled by the
             // binding-producing path in `try_eval_to_binding`).
-            Function::Tail | Function::MakeList | Function::Nodes | Function::Range => Ok(None),
+            Function::Tail
+            | Function::MakeList
+            | Function::Nodes
+            | Function::Range
+            | Function::PathPairs => Ok(None),
 
             // Unknown function
             Function::Custom(name) => Err(QueryError::InvalidFilter(format!(

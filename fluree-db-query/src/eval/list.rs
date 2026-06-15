@@ -120,6 +120,52 @@ pub fn eval_reverse_string<R: RowAccess>(
     }
 }
 
+/// `list[index]` element access — 0-based, negative indexes count from the end
+/// (`list[-1]` is the last element). A non-list left operand, a non-integer
+/// index, or an out-of-range index yields `Binding::Unbound` (Cypher null).
+///
+/// Returns the element binding directly so a nested-list element survives (e.g.
+/// `pathPairs(p)[0]` is itself a two-element list).
+fn eval_list_index_to_binding<R: RowAccess>(
+    args: &[Expression],
+    row: &R,
+    ctx: Option<&ExecutionContext<'_>>,
+) -> Result<Binding> {
+    if args.len() != 2 {
+        return Err(QueryError::InvalidFilter(format!(
+            "list indexing expects 2 arguments (list, index), got {}",
+            args.len()
+        )));
+    }
+    let items = match resolve_arg_binding(&args[0], row, ctx)? {
+        Some(Binding::List(items)) => items,
+        _ => return Ok(Binding::Unbound),
+    };
+    let idx = match args[1].eval_to_comparable(row, ctx)? {
+        Some(ComparableValue::Long(n)) => n,
+        _ => return Ok(Binding::Unbound),
+    };
+    let len = items.len() as i64;
+    let resolved = if idx < 0 { len + idx } else { idx };
+    if resolved < 0 || resolved >= len {
+        return Ok(Binding::Unbound);
+    }
+    Ok(items[resolved as usize].clone())
+}
+
+/// Scalar (`ComparableValue`) view of `list[index]`, for use in comparison /
+/// arithmetic contexts (`WHERE pair[0] > 5`). A list-valued element collapses
+/// to `None`; scalar contexts reaching one is a query error caught upstream.
+pub fn eval_list_index<R: RowAccess>(
+    args: &[Expression],
+    row: &R,
+    ctx: Option<&ExecutionContext<'_>>,
+) -> Result<Option<ComparableValue>> {
+    Ok(element_to_comparable(
+        &eval_list_index_to_binding(args, row, ctx)?,
+    ))
+}
+
 /// Binding-producing evaluation for the list-*returning* functions
 /// (`tail`, `reverse` of a list). Returns `Ok(None)` for any other function
 /// (or a non-list `reverse`), so `try_eval_to_binding` falls through to the
@@ -131,6 +177,7 @@ pub fn eval_list_fn_to_binding<R: RowAccess>(
     ctx: Option<&ExecutionContext<'_>>,
 ) -> Result<Option<Binding>> {
     match func {
+        Function::ListIndex => Ok(Some(eval_list_index_to_binding(args, row, ctx)?)),
         Function::Nodes => {
             // The node sequence of a path value, as a list of node refs.
             let arg = arity1(args, "nodes")?;
@@ -138,6 +185,26 @@ pub fn eval_list_fn_to_binding<R: RowAccess>(
                 Some(Binding::Path(nodes)) => Ok(Some(Binding::List(
                     nodes.into_iter().map(Binding::sid).collect(),
                 ))),
+                _ => Ok(Some(Binding::Unbound)),
+            }
+        }
+        Function::PathPairs => {
+            // Consecutive node pairs of a path, each a two-element list. The
+            // building block for per-edge aggregation (unwind pairs → match).
+            let arg = arity1(args, "pathPairs")?;
+            match resolve_arg_binding(arg, row, ctx)? {
+                Some(Binding::Path(nodes)) => {
+                    let pairs = nodes
+                        .windows(2)
+                        .map(|w| {
+                            Binding::List(vec![
+                                Binding::sid(w[0].clone()),
+                                Binding::sid(w[1].clone()),
+                            ])
+                        })
+                        .collect();
+                    Ok(Some(Binding::List(pairs)))
+                }
                 _ => Ok(Some(Binding::Unbound)),
             }
         }

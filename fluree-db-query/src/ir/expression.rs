@@ -602,6 +602,12 @@ pub enum Function {
     Nodes,
     /// `range(start, end[, step])` — inclusive integer list.
     Range,
+    /// `pathPairs(path)` — consecutive node pairs `[[a,b],[b,c],…]` along a path
+    /// value, each pair a two-element list. Drives per-edge aggregation (IC14).
+    PathPairs,
+    /// `list[index]` — element access (0-based; negative indexes from the end).
+    /// Out-of-range / non-integer index / non-list → unbound (Cypher null).
+    ListIndex,
 
     // =========================================================================
     // Custom/unknown function

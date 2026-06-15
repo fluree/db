@@ -131,6 +131,12 @@ pub fn lower_expr<E: IriEncoder>(
                 .collect::<Result<Vec<_>>>()?;
             Ok(Expression::call(Function::MakeList, args))
         }
+        Expr::Index(list, index, _) => {
+            // `list[index]` — element access (e.g. `pair[0]`).
+            let list = lower_expr(ctx, list, aux)?;
+            let index = lower_expr(ctx, index, aux)?;
+            Ok(Expression::call(Function::ListIndex, vec![list, index]))
+        }
         Expr::Call(call) => {
             let name = call.name.to_ascii_lowercase();
             let args: std::result::Result<Vec<_>, _> =
@@ -156,6 +162,7 @@ pub fn lower_expr<E: IriEncoder>(
                 // Path / list builders.
                 "nodes" => Function::Nodes,
                 "range" => Function::Range,
+                "pathpairs" => Function::PathPairs,
                 _ => {
                     return Err(LowerError::unsupported(format!(
                         "function `{}` is not in the v1 expression surface",

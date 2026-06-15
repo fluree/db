@@ -55,7 +55,7 @@ DELETE/INSERT templates sharing variable ids via the shared
 | Untyped / alternation / property-filtered relationships in a **write** MATCH | Write MATCH supports directed single-typed relationships, anonymous or named (named binds `r` for `SET r.prop`). Untyped (`-[r]->`), alternation (`-[:A\|B]->`), and inline relationship property filters in a write MATCH are still deferred. |
 | Whole-map node params (`(n $props)`); `$map.field` outside UNWIND; nested/map field values | Standalone map-valued params (not via `UNWIND … CREATE`/`MATCH`) still need a map-valued `Expr` the AST doesn't carry; deferred. |
 | HTTP tracking (reads) / delimited / agent-json for Cypher | The Cypher HTTP routes return JSON-LD only and don't negotiate delimited (TSV/CSV) or agent-json output, and read-side tracking isn't surfaced yet. **Policy/identity enforcement IS applied** (resolved identity + header policy fields → `wrap_policy` on reads, `PolicyContext` on writes), and write-side tracking headers are honored. Remaining gap is output-format negotiation + read tracking. |
-| Free path values (`p = (...)` without `shortestPath`), `nodes()/relationships()`, reflection (`labels/type/keys/properties/id`), `range`/list comprehensions, bare `(n)`, `LOAD CSV`, `FOREACH`, `CALL proc`, schema DDL, multi-statement | Per the original plan's deferral list below (engine work or product decisions). Undirected, variable-length paths, `collect()`, **`shortestPath`/`allShortestPaths` + `length(p)`**, and the **list functions `size`/`head`/`last`/`tail`/`reverse`** have since landed (see status table). |
+| Free path values (`p = (...)` without `shortestPath`), `relationships()`, reflection (`labels/type/keys/properties/id`), list comprehensions, bare `(n)`, `LOAD CSV`, `FOREACH`, `CALL proc`, schema DDL, multi-statement | Per the original plan's deferral list below (engine work or product decisions). Undirected, variable-length paths, `collect()`, **`shortestPath`/`allShortestPaths` + `length(p)`**, the **list functions `size`/`head`/`last`/`tail`/`reverse`**, **`nodes(p)`/`pathPairs(p)` + list indexing `list[i]`**, `range()`, and **IC14 weighted path scoring** have since landed (see status table). |
 
 ---
 
@@ -374,10 +374,11 @@ lower to `Pattern::ShortestPath` and execute on a dedicated
   result on a high-fan-out lattice would look complete while dropping
   paths.
 - Inner pattern must be node–relationship–node over a **single typed**
-  predicate, anonymous rel (no rel var / property filter). `nodes(p)` /
-  `relationships(p)` and free (unwrapped) path values remain deferred.
-  `Binding::Path` renders as a node-IRI array in JSON-LD/typed output;
-  SPARQL/CONSTRUCT formatters reject it (Cypher-only type).
+  predicate, anonymous rel (no rel var / property filter). `nodes(p)` and
+  `pathPairs(p)` are supported; `relationships(p)` (edge identities) and
+  free (unwrapped) path values remain deferred. `Binding::Path` renders as
+  a node-IRI array in JSON-LD/typed output; SPARQL/CONSTRUCT formatters
+  reject it (Cypher-only type).
 
 ### LPG mode is the default for Cypher writes
 
@@ -556,7 +557,9 @@ standard solution modifiers and a conservative expression sublanguage.**
 | `UNWIND $list AS x` | ✅ | Parameter-bound lists of scalars or shallow maps. Expression-built lists deferred. |
 | `UNWIND [literal, ...] AS x` | ✅ | Inline literal list (lowers to `Values`). |
 | `UNWIND <expr> AS x` (runtime list) | ✅ | A non-constant list — `UNWIND nodes(path) AS n`, `UNWIND range(1,5) AS i` — lowers to `Pattern::Unwind`, a correlated operator that fans each input row out over the list elements (empty/null → drops the row). A property accessor on the unwound element (`n.name`) correlates correctly. Constant lists still take the `Values` fast path. |
-| IC14 connection paths as person lists | ✅ | `MATCH p = allShortestPaths((a)-[:KNOWS*]-(b)) UNWIND nodes(p) AS pn RETURN p, collect(pn.id)` — every shortest path, exploded and re-collected per path (a path is a first-class GROUP BY / `collect` key via the `Seq` group key). The interaction-**weight** ranking (`reduce` folding pattern-match counts between path-adjacent nodes) remains deferred — it needs runtime pattern execution inside a fold. |
+| IC14 connection paths as person lists | ✅ | `MATCH p = allShortestPaths((a)-[:KNOWS*]-(b)) UNWIND nodes(p) AS pn RETURN p, collect(pn.id)` — every shortest path, exploded and re-collected per path (a path is a first-class GROUP BY / `collect` key via the `Seq` group key). |
+| IC14 **weighted** path scoring | ✅ | The per-edge `reduce` folding pattern-match counts between path-adjacent nodes — which would need runtime pattern execution inside a fold — is decomposed instead into `UNWIND pathPairs(p) AS pair` → `OPTIONAL MATCH` the interaction between `pair[0]`/`pair[1]` → `count` → `sum`, grouped by the carried path. IC14's weight is additive over consecutive pairs, so unwind + aggregate computes it exactly. The path `p` is carried through the WITH stages (a node sequence survives projection) and the final id list is a *terminal* `collect` grouped by that path — together sidestepping the `collect`-in-`WITH` limitation entirely. No `reduce`, pattern comprehension, or async property access needed. |
+| `pathPairs(p)` + list indexing `list[i]` | ✅ | `pathPairs(p)` returns a path's consecutive node pairs (`[[a,b],[b,c],…]`, each a two-element list) for `UNWIND`; `list[i]` is 0-based element access (negative indexes from the end, out-of-range → null). An indexed node-ref element correlates downstream as a MATCH endpoint / property target. The two engine pieces under IC14 weighted scoring. |
 | `RETURN ...` | ✅ | Default bag semantics. |
 | `RETURN DISTINCT` | ✅ | Set semantics. |
 | `RETURN ... AS alias` | ✅ | Existing projection alias support. |

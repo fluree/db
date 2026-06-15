@@ -44,6 +44,8 @@ pub enum Expr {
     Exists(Box<Pattern>, Option<Box<Expr>>, SourceSpan),
     /// Inline list literal `[expr, expr, ...]`.
     List(Vec<Expr>, SourceSpan),
+    /// `expr[index]` — list element access.
+    Index(Box<Expr>, Box<Expr>, SourceSpan),
 }
 
 impl Expr {
@@ -62,7 +64,8 @@ impl Expr {
             | Expr::EndsWith(_, _, s)
             | Expr::Contains(_, _, s)
             | Expr::Exists(_, _, s)
-            | Expr::List(_, s) => *s,
+            | Expr::List(_, s)
+            | Expr::Index(_, _, s) => *s,
             Expr::Call(c) => c.span,
             Expr::Case(c) => c.span,
         }
