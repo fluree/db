@@ -262,13 +262,14 @@ fn lower_single_branch<E: IriEncoder>(
         }
     }
 
-    let (output, ordering, limit, offset, group_keys, aggregates) =
+    let (output, ordering, limit, offset, group_keys, aggregates, post_binds) =
         lower_return(ctx, &q.return_clause, &mut patterns)?;
 
     // When the projection mixes aggregates with non-aggregate items,
     // the non-aggregates become GROUP BY keys (Cypher's implicit
     // grouping rule). RETURN has no WHERE/HAVING — those live on WITH.
-    let grouping = Grouping::assemble(group_keys, aggregates, Vec::new(), None);
+    // `post_binds` carry aggregate-composite expressions (`count(a)+count(b)`).
+    let grouping = Grouping::assemble(group_keys, aggregates, post_binds, None);
 
     Ok(SingleBranch {
         patterns,
@@ -287,6 +288,7 @@ type LoweredReturn = (
     Option<usize>,
     Vec<VarId>,
     Vec<AggregateSpec>,
+    Vec<(VarId, fluree_db_query::ir::Expression)>,
 );
 
 fn lower_return<E: IriEncoder>(
@@ -333,6 +335,7 @@ fn lower_return<E: IriEncoder>(
         offset,
         group_keys,
         projection.aggregates,
+        projection.post_binds,
     ))
 }
 
@@ -361,6 +364,14 @@ struct ProjectionState {
     /// don't handle, so these vars must not reach ORDER BY (or flow out of a
     /// WITH into a downstream join/sort/group). Tracked here to reject those.
     list_outputs: std::collections::HashSet<VarId>,
+    /// Post-aggregation binds: `output_var = <expr over aggregate outputs and
+    /// literals>`, for aggregates composed into a larger expression
+    /// (`count(a) + count(b)`, `count(m) + 1`, `sum(a) / count(b)`). Fire after
+    /// every aggregate is computed, before HAVING.
+    post_binds: Vec<(VarId, fluree_db_query::ir::Expression)>,
+    /// Counter for synthetic per-aggregate output vars lifted out of composite
+    /// expressions (`?#__agg_N`).
+    agg_name_counter: u32,
 }
 
 impl ProjectionState {
@@ -372,6 +383,8 @@ impl ProjectionState {
             saw_star: false,
             alias_counter: 0,
             list_outputs: std::collections::HashSet::new(),
+            post_binds: Vec::new(),
+            agg_name_counter: 0,
         }
     }
 
@@ -409,6 +422,13 @@ impl ProjectionState {
                 return Ok(());
             }
         }
+        // An aggregate composed into a larger expression (`count(m) + 1`,
+        // `count(a) + count(b)`, `sum(a) / count(b)`): lift each aggregate to
+        // its own spec, then evaluate the surrounding expression as a
+        // post-aggregation bind referencing those outputs.
+        if expr_has_aggregate(&item.expr) {
+            return self.add_aggregate_composite(ctx, patterns, item);
+        }
         let lowered = lower_expr(ctx, &item.expr, patterns)?;
         let alias_id = aggregate_output_var(ctx, &item.alias, &mut self.alias_counter);
         patterns.push(Pattern::Bind {
@@ -417,6 +437,40 @@ impl ProjectionState {
         });
         self.vars.push(alias_id);
         self.group_keys.push(alias_id);
+        Ok(())
+    }
+
+    /// Lower a projection item whose expression *contains* aggregates but isn't
+    /// a bare aggregate call. Each aggregate sub-expression is lifted into a
+    /// spec with a synthetic `?#__agg_N` output; the rewritten expression
+    /// (aggregate outputs + literals) becomes a post-aggregation bind to the
+    /// item's output variable.
+    fn add_aggregate_composite<E: IriEncoder>(
+        &mut self,
+        ctx: &mut LoweringContext<'_, E>,
+        patterns: &mut Vec<Pattern>,
+        item: &ProjectionItem,
+    ) -> Result<()> {
+        let mut rewritten = item.expr.clone();
+        extract_aggregates(
+            ctx,
+            &mut rewritten,
+            patterns,
+            &mut self.aggregates,
+            &mut self.list_outputs,
+            &mut self.agg_name_counter,
+        )?;
+        if composite_references_grouping_value(&rewritten) {
+            return Err(LowerError::unsupported(
+                "an aggregate expression may combine aggregates with literals (e.g. \
+                 `count(a) + count(b)`, `count(m) + 1`); referencing a grouping key inside the \
+                 expression is deferred — project it separately and reference its alias",
+            ));
+        }
+        let lowered = lower_expr(ctx, &rewritten, patterns)?;
+        let output_var = aggregate_output_var(ctx, &item.alias, &mut self.alias_counter);
+        self.post_binds.push((output_var, lowered));
+        self.vars.push(output_var);
         Ok(())
     }
 
@@ -534,6 +588,109 @@ fn expr_touches_list<E: IriEncoder>(
         | Expr::IsNotNull(a, _)
         | Expr::Prop(a, _, _) => expr_touches_list(ctx, a, list_outputs),
         _ => false,
+    }
+}
+
+/// True if `e` contains an aggregate function call anywhere.
+fn expr_has_aggregate(e: &Expr) -> bool {
+    match e {
+        Expr::Call(c) => is_aggregate(&c.name) || c.args.iter().any(expr_has_aggregate),
+        Expr::BinOp(_, l, r, _)
+        | Expr::In(l, r, _)
+        | Expr::StartsWith(l, r, _)
+        | Expr::EndsWith(l, r, _)
+        | Expr::Contains(l, r, _) => expr_has_aggregate(l) || expr_has_aggregate(r),
+        Expr::UnaryOp(_, x, _)
+        | Expr::IsNull(x, _)
+        | Expr::IsNotNull(x, _)
+        | Expr::Prop(x, _, _) => expr_has_aggregate(x),
+        Expr::List(items, _) => items.iter().any(expr_has_aggregate),
+        Expr::Var(_) | Expr::Lit(_) | Expr::Param(_) | Expr::Case(_) | Expr::Exists(_, _) => false,
+    }
+}
+
+/// Replace every aggregate call in `e` with a synthetic `?#__agg_N` variable,
+/// pushing the corresponding [`AggregateSpec`] (its input lowered into
+/// `patterns`, pre-grouping). After this, `e` references aggregate outputs,
+/// literals, and any grouping values left in place.
+fn extract_aggregates<E: IriEncoder>(
+    ctx: &mut LoweringContext<'_, E>,
+    e: &mut Expr,
+    patterns: &mut Vec<Pattern>,
+    aggregates: &mut Vec<AggregateSpec>,
+    list_outputs: &mut std::collections::HashSet<VarId>,
+    counter: &mut u32,
+) -> Result<()> {
+    match e {
+        Expr::Call(call) if is_aggregate(&call.name) => {
+            let name = format!("?#__agg_{counter}");
+            *counter += 1;
+            let output_var = ctx.intern_var(&name);
+            let input_var = aggregate_input_var(ctx, call, patterns)?;
+            let function = build_aggregate_fn(&call.name, call.distinct, input_var)?;
+            if call.name.eq_ignore_ascii_case("collect") {
+                list_outputs.insert(output_var);
+            }
+            aggregates.push(AggregateSpec {
+                function,
+                output_var,
+            });
+            *e = Expr::Var(crate::ast::Variable {
+                name,
+                span: call.span,
+            });
+            Ok(())
+        }
+        Expr::Call(call) => {
+            for a in &mut call.args {
+                extract_aggregates(ctx, a, patterns, aggregates, list_outputs, counter)?;
+            }
+            Ok(())
+        }
+        Expr::BinOp(_, l, r, _)
+        | Expr::In(l, r, _)
+        | Expr::StartsWith(l, r, _)
+        | Expr::EndsWith(l, r, _)
+        | Expr::Contains(l, r, _) => {
+            extract_aggregates(ctx, l, patterns, aggregates, list_outputs, counter)?;
+            extract_aggregates(ctx, r, patterns, aggregates, list_outputs, counter)
+        }
+        Expr::UnaryOp(_, x, _) | Expr::IsNull(x, _) | Expr::IsNotNull(x, _) => {
+            extract_aggregates(ctx, x, patterns, aggregates, list_outputs, counter)
+        }
+        Expr::List(items, _) => {
+            for it in items {
+                extract_aggregates(ctx, it, patterns, aggregates, list_outputs, counter)?;
+            }
+            Ok(())
+        }
+        Expr::Prop(_, _, _) | Expr::Case(_) | Expr::Exists(_, _) => Err(LowerError::unsupported(
+            "aggregates inside this expression position are not supported in v1",
+        )),
+        Expr::Var(_) | Expr::Lit(_) | Expr::Param(_) => Ok(()),
+    }
+}
+
+/// After [`extract_aggregates`], `e` should reference only aggregate outputs
+/// (`?#__agg_*`) and literals. A remaining bare variable or property accessor
+/// means the expression mixes a grouping value in — not yet supported.
+fn composite_references_grouping_value(e: &Expr) -> bool {
+    match e {
+        Expr::Var(v) => !v.name.starts_with("?#__agg_"),
+        Expr::Prop(_, _, _) => true,
+        Expr::BinOp(_, l, r, _)
+        | Expr::In(l, r, _)
+        | Expr::StartsWith(l, r, _)
+        | Expr::EndsWith(l, r, _)
+        | Expr::Contains(l, r, _) => {
+            composite_references_grouping_value(l) || composite_references_grouping_value(r)
+        }
+        Expr::UnaryOp(_, x, _) | Expr::IsNull(x, _) | Expr::IsNotNull(x, _) => {
+            composite_references_grouping_value(x)
+        }
+        Expr::Call(c) => c.args.iter().any(composite_references_grouping_value),
+        Expr::List(items, _) => items.iter().any(composite_references_grouping_value),
+        Expr::Lit(_) | Expr::Param(_) | Expr::Case(_) | Expr::Exists(_, _) => false,
     }
 }
 
@@ -749,7 +906,12 @@ fn lower_with<E: IriEncoder>(
         projection.group_keys
     };
 
-    let grouping = Grouping::assemble(group_keys, projection.aggregates, Vec::new(), having);
+    let grouping = Grouping::assemble(
+        group_keys,
+        projection.aggregates,
+        projection.post_binds,
+        having,
+    );
 
     // ORDER BY may also reference property accessors; emit any
     // resulting auxiliary triples into the subquery body before we

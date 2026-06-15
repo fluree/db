@@ -498,6 +498,7 @@ standard solution modifiers and a conservative expression sublanguage.**
 | `RETURN DISTINCT` | ✅ | Set semantics. |
 | `RETURN ... AS alias` | ✅ | Existing projection alias support. |
 | `RETURN count(*) / count(x) / sum(x) / avg(x) / min(x) / max(x)` | ✅ | Existing aggregate operators. |
+| Aggregates composed into expressions — `count(a) + count(b)`, `count(m) + 1`, `sum(a) / count(b)` | ✅ | Each aggregate sub-expression is lifted to its own spec; the surrounding expression becomes a post-aggregation bind (LDBC IC3 total / IC10 score). Combine aggregates with literals and each other; referencing a *grouping key* inside the expression is deferred (project it separately and use its alias). |
 | `RETURN collect(x)` / `collect(DISTINCT x)` | ✅ | `AggregateFn::Collect` gathers non-null values into a list (Cypher semantics: nulls dropped, empty → `[]`; an implicit aggregation over zero matched rows still yields one row with `[]`). Carried as a `Binding::Grouped`, which the JSON-LD formatter renders as a JSON array (v1 Cypher output is JSON-LD). **Allowed only in the final `RETURN`**, and a collect list **cannot be an `ORDER BY` key** (the list carrier isn't comparable by the sort/join/group key paths) — both `collect()` in `WITH` and `ORDER BY <list>` are rejected with a clear error. `head/tail/size/reverse` over the list still deferred. |
 | `ORDER BY / SKIP / LIMIT` | ✅ | Existing modifiers. |
 | `UNION` / `UNION ALL` | ✅ | Lowers to existing `Union` pattern. |

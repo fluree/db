@@ -3018,10 +3018,16 @@ pub(crate) fn apply_solution_modifiers(
         // The streaming GroupAggregateOperator only outputs GROUP BY keys + aggregate outputs.
         // If the SELECT projects any *grouped* variables (non-key, non-aggregate),
         // we must use the traditional GroupByOperator path so those vars become
-        // `Binding::Grouped(Vec<Binding>)` and remain selectable.
+        // `Binding::Grouped(Vec<Binding>)` and remain selectable. Post-aggregation
+        // bind outputs (e.g. `(count(a)+count(b)) AS total`) are NOT grouped
+        // passthroughs — they are computed by a downstream BindOperator — so they
+        // must not force the traditional path (which would drop the row when the
+        // bind's aggregate inputs aren't themselves projected).
         let select_needs_grouped_vars = select_vars.is_some_and(|vars| {
             vars.iter().any(|v| {
-                !group_by_vec.contains(v) && !aggregates_vec.iter().any(|a| a.output_var == *v)
+                !group_by_vec.contains(v)
+                    && !aggregates_vec.iter().any(|a| a.output_var == *v)
+                    && !post_binds_vec.iter().any(|(out, _)| out == v)
             })
         });
 

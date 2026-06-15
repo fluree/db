@@ -598,6 +598,49 @@ async fn transact_cypher_unwind_map_param_batches_edge_inserts() {
 }
 
 #[tokio::test]
+async fn cypher_aggregate_composed_into_expression() {
+    // Aggregates nested in a larger expression (IC3 total, IC10 score, IC14):
+    // `count(*) * 2`, `count(n) + 1`, `count(*) + count(*)`.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = seed_nodes_with_ids(&fluree, "it/cypher:agg-expr").await; // 3 Person nodes
+    let db = graphdb_from_ledger(&l);
+
+    let doubled = fluree
+        .query_cypher(&db, "MATCH (n:Person) RETURN count(*) * 2 AS doubled")
+        .await
+        .expect("count(*) * 2")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    assert_eq!(doubled[0][0], json!(6), "3 persons * 2 = 6: {doubled}");
+
+    let twice = fluree
+        .query_cypher(&db, "MATCH (n:Person) RETURN count(*) + count(*) AS twice")
+        .await
+        .expect("count(*) + count(*)")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    assert_eq!(twice[0][0], json!(6), "3 + 3 = 6: {twice}");
+
+    let per_group = fluree
+        .query_cypher(
+            &db,
+            "MATCH (n:Person) RETURN n.id AS id, count(n) + 1 AS c ORDER BY id",
+        )
+        .await
+        .expect("count(n) + 1")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    let rows = per_group.as_array().expect("rows");
+    assert_eq!(rows.len(), 3, "one row per id: {per_group}");
+    for row in rows {
+        assert_eq!(row[1], json!(2), "count(n) + 1 = 2 per group: {per_group}");
+    }
+}
+
+#[tokio::test]
 async fn cypher_order_by_property_accessor_grouping_key() {
     // ORDER BY a grouping key written as a property accessor (`f.id`, not its
     // alias) must work under aggregation — it should behave like ORDER BY the
