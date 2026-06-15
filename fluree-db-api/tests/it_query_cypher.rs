@@ -2289,3 +2289,162 @@ async fn cypher_multi_clause_create_builds_node_then_edges() {
         .expect("read multi-create relationship");
     assert_eq!(rows.row_count(), 1, "node-node-edge chain across CREATE clauses");
 }
+
+#[tokio::test]
+async fn cypher_unwind_batch_list_valued_field() {
+    // IU1 documented load shape: one list-of-maps param, an element field that
+    // is itself a JSON array (email[]). The node unroller must accept it and
+    // store one flake per element.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/cypher:unwind-list-field");
+    let params = json!({
+        "people": [
+            {"id": 1, "email": ["a@x.com", "b@y.com"]},
+            {"id": 2, "email": ["c@z.com"]},
+        ]
+    });
+    let committed = fluree
+        .transact_cypher_with_params(
+            ledger0,
+            "UNWIND $people AS row CREATE (n:Person {id: row.id, email: row.email})",
+            params.as_object(),
+        )
+        .await
+        .expect("unwind list-field create");
+    let db = graphdb_from_ledger(&committed.ledger);
+
+    let out = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (n:Person {id: 1}) RETURN n.email AS email ORDER BY email"#,
+        )
+        .await
+        .expect("read")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    let emails: Vec<&str> = out
+        .as_array()
+        .expect("rows")
+        .iter()
+        .filter_map(|r| r[0].as_str())
+        .collect();
+    assert_eq!(emails, vec!["a@x.com", "b@y.com"], "both batch emails stored: {out}");
+}
+
+#[tokio::test]
+async fn cypher_set_list_valued_property_replaces() {
+    // SET n.prop = [...] replaces the multi-valued predicate.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/cypher:set-list");
+    let l = fluree
+        .transact_cypher(
+            ledger0,
+            r#"CREATE (n:Person {id: 1, email: ['old1@x.com', 'old2@x.com']})"#,
+        )
+        .await
+        .expect("create")
+        .ledger;
+    let committed = fluree
+        .transact_cypher(
+            l,
+            r#"MATCH (n:Person {id: 1}) SET n.email = ['new@x.com', 'also@x.com']"#,
+        )
+        .await
+        .expect("set list");
+    let db = graphdb_from_ledger(&committed.ledger);
+
+    let out = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (n:Person {id: 1}) RETURN n.email AS email ORDER BY email"#,
+        )
+        .await
+        .expect("read")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    let emails: Vec<&str> = out
+        .as_array()
+        .expect("rows")
+        .iter()
+        .filter_map(|r| r[0].as_str())
+        .collect();
+    assert_eq!(
+        emails,
+        vec!["also@x.com", "new@x.com"],
+        "old emails replaced by the new list: {out}"
+    );
+}
+
+#[tokio::test]
+async fn cypher_set_plus_equals_list_valued_property() {
+    // SET n += {prop: [...]} also stores a multi-valued predicate.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/cypher:setpluseq-list");
+    let l = fluree
+        .transact_cypher(ledger0, r#"CREATE (n:Person {id: 1, name: "Alice"})"#)
+        .await
+        .expect("create")
+        .ledger;
+    let committed = fluree
+        .transact_cypher(
+            l,
+            r#"MATCH (n:Person {id: 1}) SET n += {speaks: ['en', 'fr', 'de']}"#,
+        )
+        .await
+        .expect("set += list");
+    let db = graphdb_from_ledger(&committed.ledger);
+
+    let out = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (n:Person {id: 1}) RETURN n.speaks AS s ORDER BY s"#,
+        )
+        .await
+        .expect("read")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    let langs: Vec<&str> = out
+        .as_array()
+        .expect("rows")
+        .iter()
+        .filter_map(|r| r[0].as_str())
+        .collect();
+    assert_eq!(langs, vec!["de", "en", "fr"], "all three languages stored: {out}");
+}
+
+#[tokio::test]
+async fn cypher_merge_on_create_set_list_valued_property() {
+    // MERGE ... ON CREATE SET n.prop = [...] stores a multi-valued predicate
+    // when the node is created.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/cypher:merge-oncreate-list");
+    let committed = fluree
+        .transact_cypher(
+            ledger0,
+            r#"MERGE (n:Person {id: 1}) ON CREATE SET n.email = ['a@x.com', 'b@y.com']"#,
+        )
+        .await
+        .expect("merge on create set list");
+    let db = graphdb_from_ledger(&committed.ledger);
+
+    let out = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (n:Person {id: 1}) RETURN n.email AS email ORDER BY email"#,
+        )
+        .await
+        .expect("read")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    let emails: Vec<&str> = out
+        .as_array()
+        .expect("rows")
+        .iter()
+        .filter_map(|r| r[0].as_str())
+        .collect();
+    assert_eq!(emails, vec!["a@x.com", "b@y.com"], "on-create list stored: {out}");
+}

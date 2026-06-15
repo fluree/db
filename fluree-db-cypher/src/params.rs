@@ -587,7 +587,14 @@ fn replace_alias_in_expr(
                     ));
                 };
                 let fv = map.get(field).cloned().unwrap_or(JsonValue::Null);
-                *e = json_scalar_to_expr(&fv, pname, *span)?;
+                // A node/rel CREATE property accepts a list field (IU1's
+                // `email[]` / `language[]` via `CREATE (n {email: row.email})`):
+                // `json_to_expr` builds the `Expr::List` that the CREATE
+                // lowering expands to one triple per element. (The edge-VALUES
+                // desugar path keeps `json_scalar_to_expr` — a VALUES join cell
+                // can't be a list.) Nested lists / map field values stay
+                // rejected by `json_to_expr`.
+                *e = json_to_expr(&fv, pname, *span)?;
                 Ok(())
             } else {
                 replace_alias_in_expr(inner, alias, elem, pname)

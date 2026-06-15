@@ -550,19 +550,22 @@ impl<'a> CypherLowering<'a> {
         let pred_iri = self.resolve_predicate(property)?;
         let pred_sid = self.ns.sid_for_iri(&pred_iri);
 
-        // `SET n.prop = null` removes the property (Cypher semantics) — same
-        // shape as `REMOVE n.prop`: retract any existing value, assert nothing.
-        if matches!(value, Expr::Lit(Literal::Null(_))) {
-            self.push_optional_old_value(target, &pred_iri, &pred_sid);
-            return Ok(());
-        }
-
-        let obj = self.expr_to_object(value)?;
+        // SET replaces: always retract the existing value(s). A multi-valued
+        // predicate produces one OPTIONAL solution per old value, so the delete
+        // template clears all of them. `SET n.prop = null` (and `= []`) then
+        // asserts nothing — the property is removed. A list value asserts one
+        // triple per element (the new multi-valued set); re-asserting a kept
+        // value across the per-solution firings is idempotent.
+        let objs = self.expr_to_object_terms(value)?;
         let subj = self.var_term(target);
-
         self.push_optional_old_value(target, &pred_iri, &pred_sid);
-        self.insert_templates
-            .push(TripleTemplate::new(subj, TemplateTerm::Sid(pred_sid), obj));
+        for obj in objs {
+            self.insert_templates.push(TripleTemplate::new(
+                subj.clone(),
+                TemplateTerm::Sid(pred_sid.clone()),
+                obj,
+            ));
+        }
         Ok(())
     }
 
@@ -802,17 +805,17 @@ impl<'a> CypherLowering<'a> {
                 if identity_keys.contains(property.as_str()) {
                     return Err(merge_identity_override_err(property));
                 }
-                if matches!(value, Expr::Lit(Literal::Null(_))) {
-                    return Ok(()); // null on a new node asserts nothing
-                }
                 let pred_iri = self.resolve_predicate(property)?;
                 let pred_sid = self.ns.sid_for_iri(&pred_iri);
-                let obj = self.expr_to_object(value)?;
-                self.insert_templates.push(TripleTemplate::new(
-                    subj.clone(),
-                    TemplateTerm::Sid(pred_sid),
-                    obj,
-                ));
+                // null / empty list → nothing on a new node; a list → one triple
+                // per element (multi-valued predicate).
+                for obj in self.expr_to_object_terms(value)? {
+                    self.insert_templates.push(TripleTemplate::new(
+                        subj.clone(),
+                        TemplateTerm::Sid(pred_sid.clone()),
+                        obj,
+                    ));
+                }
             }
             SetItem::MapMerge { target, map } => {
                 if !target_ok(target) {
@@ -822,19 +825,17 @@ impl<'a> CypherLowering<'a> {
                     if identity_keys.contains(key.as_str()) {
                         return Err(merge_identity_override_err(key));
                     }
-                    // Consistent with `n.x = null`: a null map entry asserts
-                    // nothing on a new node.
-                    if matches!(val, Expr::Lit(Literal::Null(_))) {
-                        continue;
-                    }
                     let pred_iri = self.resolve_predicate(key)?;
                     let pred_sid = self.ns.sid_for_iri(&pred_iri);
-                    let obj = self.expr_to_object(val)?;
-                    self.insert_templates.push(TripleTemplate::new(
-                        subj.clone(),
-                        TemplateTerm::Sid(pred_sid),
-                        obj,
-                    ));
+                    // null / empty list asserts nothing; a list asserts one
+                    // triple per element.
+                    for obj in self.expr_to_object_terms(val)? {
+                        self.insert_templates.push(TripleTemplate::new(
+                            subj.clone(),
+                            TemplateTerm::Sid(pred_sid.clone()),
+                            obj,
+                        ));
+                    }
                 }
             }
             SetItem::Labels { target, labels } => {
@@ -1044,28 +1045,11 @@ impl<'a> CypherLowering<'a> {
         props: &MapLit,
     ) -> Result<(), LowerCypherError> {
         for (key, val_expr) in &props.entries {
-            // Cypher: a null property value means "no property" — don't store a
-            // null. (A literal `null`, or an UNWIND row's missing field which
-            // lowers to `null`.)
-            if matches!(val_expr, Expr::Lit(Literal::Null(_))) {
-                continue;
-            }
             let pred_iri = self.resolve_predicate(key)?;
             let pred_sid = self.ns.sid_for_iri(&pred_iri);
-
-            // A list-valued property (`{email: ['a', 'b']}`, IU1's email[] /
-            // language[]) is a multi-valued RDF predicate: emit one triple per
-            // element. An empty list stores nothing (like a null). Nested
-            // lists/maps as elements are still rejected by `expr_to_object`.
-            let values: Vec<&Expr> = match val_expr {
-                Expr::List(items, _) => items.iter().collect(),
-                other => vec![other],
-            };
-            for value in values {
-                if matches!(value, Expr::Lit(Literal::Null(_))) {
-                    continue;
-                }
-                let obj = self.expr_to_object(value)?;
+            // Null / empty-list values expand to no term ("no property"); a list
+            // value expands to one term per element (multi-valued predicate).
+            for obj in self.expr_to_object_terms(val_expr)? {
                 self.insert_templates.push(TripleTemplate::new(
                     subj.clone(),
                     TemplateTerm::Sid(pred_sid.clone()),
@@ -1087,6 +1071,27 @@ impl<'a> CypherLowering<'a> {
                 "CREATE property values must be literals or bound variables in v1",
             )),
         }
+    }
+
+    /// Expand a property value into its object terms — **one per element** for a
+    /// list-valued property (a multi-valued RDF predicate: `{email: ['a','b']}`,
+    /// IU1's `email[]` / `language[]`), or a single term otherwise. A null
+    /// value, a null element, and an empty list all yield no term (Cypher: null
+    /// = "no property"). Shared by CREATE, SET (`=` / `+=`), and MERGE ON CREATE
+    /// SET so list-valued properties behave identically across all write ops.
+    fn expr_to_object_terms(&mut self, value: &Expr) -> Result<Vec<TemplateTerm>, LowerCypherError> {
+        let items: Vec<&Expr> = match value {
+            Expr::List(items, _) => items.iter().collect(),
+            other => vec![other],
+        };
+        let mut terms = Vec::with_capacity(items.len());
+        for item in items {
+            if matches!(item, Expr::Lit(Literal::Null(_))) {
+                continue;
+            }
+            terms.push(self.expr_to_object(item)?);
+        }
+        Ok(terms)
     }
 
     fn node_subject(&mut self, n: &NodePattern) -> TemplateTerm {
