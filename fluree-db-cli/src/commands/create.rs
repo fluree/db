@@ -65,11 +65,12 @@ pub async fn run(
         Some(path) if is_flpack_path(path) => {
             run_flpack_import(&fluree, ledger, path, dirs).await?;
         }
-        // CSV (single file or a directory containing .csv) is converted to
-        // JSON-LD and loaded through the JSON-LD insert path. Checked before the
-        // directory / bulk branches, which only understand RDF/JSON-LD.
+        // CSV (single file or a directory containing .csv) is streamed to
+        // newline-delimited JSON-LD and loaded through the chunked bulk-import
+        // pipeline. Checked before the directory / bulk branches, which only
+        // understand RDF/JSON-LD.
         Some(path) if is_csv_input(path) => {
-            run_csv_import(&fluree, ledger, path, dirs, quiet, import_opts).await?;
+            run_csv_import(&fluree, ledger, path, dirs, verbose, quiet, import_opts).await?;
         }
         Some(path) if path.is_dir() => {
             // Validate directory format (catches mixed formats & empty dirs).
@@ -837,18 +838,21 @@ fn has_csv_extension(path: &Path) -> bool {
 }
 
 /// Convert CSV node/relationship files (neo4j-admin header convention) to
-/// JSON-LD and load via the JSON-LD insert path. v1 loads the whole dataset in
-/// one transaction (fine for small scale factors); streaming into the chunked
-/// bulk pipeline is a follow-up.
+/// newline-delimited JSON-LD in a temp directory, then load through the existing
+/// **chunked, parallel bulk-import pipeline** (the same path as `--from data/`
+/// of Turtle/JSON-LD). Streaming the `.jsonl` keeps memory flat and gives a
+/// progress bar + chunk-per-commit, instead of one giant in-memory transaction.
 async fn run_csv_import(
     fluree: &fluree_db_api::Fluree,
     ledger: &str,
     path: &Path,
     dirs: &FlureeDir,
+    verbose: bool,
     quiet: bool,
     import_opts: &ImportOpts,
 ) -> CliResult<()> {
-    use fluree_db_api::csv_import::{csv_files_to_jsonld, CsvImportOptions};
+    use fluree_db_api::csv_import::{write_csv_ndjson, CsvImportOptions};
+    use std::io::{BufReader, BufWriter};
 
     let files: Vec<std::path::PathBuf> = if path.is_dir() {
         let mut v: Vec<_> = std::fs::read_dir(path)
@@ -868,6 +872,17 @@ async fn run_csv_import(
         )));
     }
 
+    let opts = CsvImportOptions {
+        edge_policy: import_opts.edge_policy,
+        base_iri: import_opts.base_iri.clone(),
+        ..Default::default()
+    };
+
+    // Stream each CSV → one `.jsonl` shard in a temp dir (cleaned up on drop,
+    // after the import completes). One shard per source file lets the bulk
+    // pipeline parallelize across them.
+    let tmp = tempfile::tempdir()
+        .map_err(|e| CliError::Input(format!("failed to create temp dir: {e}")))?;
     if !quiet {
         println!(
             "Converting {} CSV file(s) → JSON-LD (edge properties: {:?})...",
@@ -875,37 +890,43 @@ async fn run_csv_import(
             import_opts.edge_policy
         );
     }
+    let mut total_objects = 0usize;
+    for (i, csv_path) in files.iter().enumerate() {
+        let stem = csv_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .map(sanitize_for_filename)
+            .unwrap_or_else(|| format!("part{i}"));
+        let out_path = tmp.path().join(format!("{i:05}_{stem}.jsonl"));
+        let reader =
+            BufReader::new(std::fs::File::open(csv_path).map_err(|e| {
+                CliError::Input(format!("failed to open {}: {e}", csv_path.display()))
+            })?);
+        let mut writer = BufWriter::new(
+            std::fs::File::create(&out_path)
+                .map_err(|e| CliError::Input(format!("failed to write temp jsonl: {e}")))?,
+        );
+        total_objects += write_csv_ndjson(reader, &opts, &mut writer)
+            .map_err(|e| CliError::Input(format!("CSV import ({}): {e}", csv_path.display())))?;
+        writer
+            .into_inner()
+            .map_err(|e| CliError::Input(format!("failed to flush temp jsonl: {e}")))?;
+    }
+    if !quiet {
+        println!("Converted {total_objects} object(s); importing...");
+    }
 
-    let texts: Vec<String> = files
-        .iter()
-        .map(|p| {
-            std::fs::read_to_string(p)
-                .map_err(|e| CliError::Input(format!("failed to read {}: {e}", p.display())))
-        })
-        .collect::<CliResult<_>>()?;
-    let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
-
-    let opts = CsvImportOptions {
-        edge_policy: import_opts.edge_policy,
-        base_iri: import_opts.base_iri.clone(),
-        ..Default::default()
-    };
-    let doc = csv_files_to_jsonld(&refs, &opts)
-        .map_err(|e| CliError::Input(format!("CSV import: {e}")))?;
-
-    fluree.create_ledger(ledger).await?;
-    let result = fluree
-        .graph(ledger)
-        .transact()
-        .insert(&doc)
-        .commit()
-        .await?;
-    config::write_active_ledger(dirs.data_dir(), ledger)?;
-    println!(
-        "Created ledger '{}' from CSV ({} flakes, t={})",
-        ledger, result.receipt.flake_count, result.receipt.t
-    );
-    Ok(())
+    // Hand the temp dir of `.jsonl` to the bulk import (chunked + progress).
+    run_bulk_import(
+        fluree,
+        ledger,
+        tmp.path(),
+        dirs.data_dir(),
+        verbose,
+        quiet,
+        import_opts,
+    )
+    .await
 }
 
 /// Replace non-alphanumeric characters with underscores for safe filenames.

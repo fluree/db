@@ -34,6 +34,7 @@
 //!   triple (pure RDF 1.1).
 
 use serde_json::{Map, Value};
+use std::io::{Read, Write};
 
 /// XSD namespace for typed literals emitted as JSON-LD `@value`/`@type`.
 const XSD: &str = "http://www.w3.org/2001/XMLSchema#";
@@ -109,6 +110,8 @@ pub enum CsvImportError {
          properties); use `annotated` or `plain` for now"
     )]
     NaryDeferred { rel_type: String },
+    #[error("io error writing JSON-LD: {0}")]
+    Io(#[from] std::io::Error),
 }
 
 type Result<T> = std::result::Result<T, CsvImportError>;
@@ -283,14 +286,21 @@ fn mint_iri(base: &str, space: Option<&str>, value: &str) -> String {
     }
 }
 
-/// Convert the text of one CSV file into a list of JSON-LD objects. The file's
-/// header determines whether the rows are nodes or relationships.
-pub fn csv_to_jsonld(csv_text: &str, opts: &CsvImportOptions) -> Result<Vec<Value>> {
+/// Stream one CSV file (a reader), invoking `sink` once per produced JSON-LD
+/// object — without materializing the whole file in memory. The header
+/// determines whether the rows are nodes or relationships. This is the core
+/// shared by [`csv_to_jsonld`] (collects) and [`write_csv_ndjson`] (streams to
+/// a writer).
+fn for_each_object<R: Read>(
+    csv: R,
+    opts: &CsvImportOptions,
+    mut sink: impl FnMut(Value) -> Result<()>,
+) -> Result<()> {
     let mut rdr = csv::ReaderBuilder::new()
         .delimiter(opts.delimiter)
         .has_headers(false)
         .flexible(true)
-        .from_reader(csv_text.as_bytes());
+        .from_reader(csv);
 
     let mut records = rdr.records();
     let header_rec = match records.next() {
@@ -307,7 +317,6 @@ pub fn csv_to_jsonld(csv_text: &str, opts: &CsvImportOptions) -> Result<Vec<Valu
     let shape = classify(&cols)?;
 
     let pred = |name: &str| format!("{}{}", opts.base_iri, name);
-    let mut out = Vec::new();
 
     for (i, rec) in records.enumerate() {
         let rec = rec?;
@@ -321,20 +330,53 @@ pub fn csv_to_jsonld(csv_text: &str, opts: &CsvImportOptions) -> Result<Vec<Valu
         }
 
         match shape {
-            Shape::Node => out.push(node_object(&cols, &rec, row, opts, &pred)?),
+            Shape::Node => sink(node_object(&cols, &rec, row, opts, &pred)?)?,
             Shape::Rel => {
                 if let Some(obj) = rel_object(&cols, &rec, row, opts, &pred)? {
-                    out.push(obj);
+                    sink(obj)?;
                 }
             }
         }
     }
+    Ok(())
+}
+
+/// Convert the text of one CSV file into a list of JSON-LD objects. Collects in
+/// memory — for large datasets prefer [`write_csv_ndjson`] + the chunked bulk
+/// import.
+pub fn csv_to_jsonld(csv_text: &str, opts: &CsvImportOptions) -> Result<Vec<Value>> {
+    let mut out = Vec::new();
+    for_each_object(csv_text.as_bytes(), opts, |obj| {
+        out.push(obj);
+        Ok(())
+    })?;
     Ok(out)
 }
 
+/// Stream a CSV file (a reader) as **newline-delimited JSON-LD** (one object per
+/// line) to `out`, returning the number of objects written. Each object uses
+/// absolute IRIs, so no `@context` line is needed. This is the scalable path:
+/// the output `.jsonl` feeds the chunked, parallel bulk-import pipeline instead
+/// of one giant in-memory document / transaction.
+pub fn write_csv_ndjson<R: Read, W: Write>(
+    csv: R,
+    opts: &CsvImportOptions,
+    out: &mut W,
+) -> Result<usize> {
+    let mut count = 0usize;
+    for_each_object(csv, opts, |obj| {
+        serde_json::to_writer(&mut *out, &obj)
+            .map_err(|e| CsvImportError::Io(std::io::Error::other(e)))?;
+        out.write_all(b"\n")?;
+        count += 1;
+        Ok(())
+    })?;
+    Ok(count)
+}
+
 /// Convert several CSV files (node and relationship files, any order) into a
-/// single JSON-LD `{"@graph": [...]}` document ready for `insert` / import. A
-/// later streaming wiring can yield the objects incrementally instead.
+/// single JSON-LD `{"@graph": [...]}` document. Collects in memory — used by
+/// tests and small inserts; bulk imports use [`write_csv_ndjson`].
 pub fn csv_files_to_jsonld(files: &[&str], opts: &CsvImportOptions) -> Result<Value> {
     let mut graph = Vec::new();
     for text in files {
