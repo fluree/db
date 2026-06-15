@@ -2713,3 +2713,103 @@ async fn cypher_order_by_expression_key() {
         .collect();
     assert_eq!(names, vec!["B", "A", "C"], "numeric id order (2,10,30): {out}");
 }
+
+#[tokio::test]
+async fn cypher_nodes_of_path_and_range() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = seed_ic1_chain(&fluree, "it/cypher:nodes-range").await; // Alice→Bob→Carol→Dave→Eve
+    let db = graphdb_from_ledger(&l);
+
+    // nodes(path) returns the node sequence (as IRIs); a 3-hop path has 4 nodes.
+    let ns = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (a:Person {name:"Alice"}),(d:Person {name:"Dave"})
+               MATCH p = shortestPath((a)-[:KNOWS*]->(d))
+               RETURN nodes(p) AS ns"#,
+        )
+        .await
+        .expect("nodes(path)")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    let nodes = ns[0][0].as_array().expect("node list");
+    assert_eq!(nodes.len(), 4, "Alice→Bob→Carol→Dave = 4 nodes: {ns}");
+    assert_eq!(nodes[0], json!("http://example.org/alice"));
+    assert_eq!(nodes[3], json!("http://example.org/dave"));
+
+    // size(nodes(path)) composes.
+    let n = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (a:Person {name:"Alice"}),(d:Person {name:"Dave"})
+               MATCH p = shortestPath((a)-[:KNOWS*]->(d)) RETURN size(nodes(p)) AS n"#,
+        )
+        .await
+        .expect("size(nodes)")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    assert_eq!(n[0][0], json!(4), "node count: {n}");
+
+    // range() builds an inclusive integer list, with an optional step.
+    let r = fluree
+        .query_cypher(&db, r#"MATCH (n:Person {name:"Alice"}) RETURN range(1, 5) AS r"#)
+        .await
+        .expect("range")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    assert_eq!(r[0][0], json!([1, 2, 3, 4, 5]), "range(1,5): {r}");
+
+    let r2 = fluree
+        .query_cypher(&db, r#"MATCH (n:Person {name:"Alice"}) RETURN range(0, 10, 2) AS r"#)
+        .await
+        .expect("range step")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    assert_eq!(r2[0][0], json!([0, 2, 4, 6, 8, 10]), "range(0,10,2): {r2}");
+}
+
+#[tokio::test]
+async fn cypher_ic14_connection_paths_via_all_shortest() {
+    // IC14 core: every shortest connection path between two persons, returned
+    // as its node sequence. Diamond graph A→B→D and A→C→D → two 2-hop paths.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/cypher:ic14-paths");
+    let l = fluree
+        .insert(
+            ledger0,
+            &json!({"@context": ctx(), "@graph": [
+                {"@id":"ex:a","@type":"ex:Person","ex:name":"A","ex:KNOWS":[{"@id":"ex:b"},{"@id":"ex:c"}]},
+                {"@id":"ex:b","@type":"ex:Person","ex:name":"B","ex:KNOWS":{"@id":"ex:d"}},
+                {"@id":"ex:c","@type":"ex:Person","ex:name":"C","ex:KNOWS":{"@id":"ex:d"}},
+                {"@id":"ex:d","@type":"ex:Person","ex:name":"D"},
+            ]}),
+        )
+        .await
+        .expect("seed diamond")
+        .ledger;
+    let db = graphdb_from_ledger(&l);
+
+    let out = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (a:Person {name:"A"}),(d:Person {name:"D"})
+               MATCH p = allShortestPaths((a)-[:KNOWS*]->(d))
+               RETURN nodes(p) AS pathNodes"#,
+        )
+        .await
+        .expect("ic14 connection paths")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    let rows = out.as_array().expect("rows");
+    assert_eq!(rows.len(), 2, "two shortest connection paths: {out}");
+    // Each path has 3 nodes (A, middle, D).
+    assert!(
+        rows.iter().all(|r| r[0].as_array().map(|a| a.len()) == Some(3)),
+        "each path is A→mid→D = 3 nodes: {out}"
+    );
+}

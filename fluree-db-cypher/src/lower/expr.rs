@@ -153,6 +153,9 @@ pub fn lower_expr<E: IriEncoder>(
                 // toInteger). Reuse the XSD cast functions.
                 "tointeger" => Function::XsdInteger,
                 "tofloat" => Function::XsdDouble,
+                // Path / list builders.
+                "nodes" => Function::Nodes,
+                "range" => Function::Range,
                 _ => {
                     return Err(LowerError::unsupported(format!(
                         "function `{}` is not in the v1 expression surface",

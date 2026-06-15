@@ -131,6 +131,62 @@ pub fn eval_list_fn_to_binding<R: RowAccess>(
     ctx: Option<&ExecutionContext<'_>>,
 ) -> Result<Option<Binding>> {
     match func {
+        Function::Nodes => {
+            // The node sequence of a path value, as a list of node refs.
+            let arg = arity1(args, "nodes")?;
+            match resolve_arg_binding(arg, row, ctx)? {
+                Some(Binding::Path(nodes)) => Ok(Some(Binding::List(
+                    nodes.into_iter().map(Binding::sid).collect(),
+                ))),
+                _ => Ok(Some(Binding::Unbound)),
+            }
+        }
+        Function::Range => {
+            // Inclusive integer range `range(start, end[, step])`.
+            if args.len() != 2 && args.len() != 3 {
+                return Err(QueryError::InvalidFilter(format!(
+                    "range() expects 2 or 3 arguments, got {}",
+                    args.len()
+                )));
+            }
+            let as_i64 = |e: &Expression| -> Result<Option<i64>> {
+                Ok(match e.eval_to_comparable(row, ctx)? {
+                    Some(ComparableValue::Long(n)) => Some(n),
+                    _ => None,
+                })
+            };
+            let (Some(start), Some(end)) = (as_i64(&args[0])?, as_i64(&args[1])?) else {
+                return Ok(Some(Binding::Unbound));
+            };
+            let step = match args.get(2) {
+                Some(e) => match as_i64(e)? {
+                    Some(0) | None => {
+                        return Err(QueryError::InvalidFilter(
+                            "range() step must be a non-zero integer".to_string(),
+                        ))
+                    }
+                    Some(s) => s,
+                },
+                None => 1,
+            };
+            let mut items = Vec::new();
+            let mut cur = start;
+            // Cap to guard against an accidental huge/unbounded range.
+            const MAX_RANGE: usize = 1_000_000;
+            while (step > 0 && cur <= end) || (step < 0 && cur >= end) {
+                items.push(Binding::lit(
+                    fluree_db_core::FlakeValue::Long(cur),
+                    fluree_db_core::Sid::new(fluree_vocab::namespaces::XSD, "integer"),
+                ));
+                if items.len() >= MAX_RANGE {
+                    return Err(QueryError::ResourceLimit(
+                        "range() exceeded 1,000,000 elements".to_string(),
+                    ));
+                }
+                cur += step;
+            }
+            Ok(Some(Binding::List(items)))
+        }
         Function::MakeList => {
             // Build a list from each argument's binding value (preserving order
             // and nulls, so structured `collect([a, b])` keeps tuple shape).

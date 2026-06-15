@@ -598,6 +598,10 @@ pub enum Function {
     Reverse,
     /// List constructor `[a, b, …]` — builds a list value from its arguments.
     MakeList,
+    /// `nodes(path)` — the list of node refs along a path value.
+    Nodes,
+    /// `range(start, end[, step])` — inclusive integer list.
+    Range,
 
     // =========================================================================
     // Custom/unknown function
