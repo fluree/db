@@ -607,7 +607,9 @@ mod tests {
         .unwrap();
         assert_eq!(
             plainish,
-            vec![json!({"@id": "http://ex/Person/10", "http://ex/KNOWS": {"@id": "http://ex/Person/20"}})]
+            vec![
+                json!({"@id": "http://ex/Person/10", "http://ex/KNOWS": {"@id": "http://ex/Person/20"}})
+            ]
         );
     }
 
