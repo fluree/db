@@ -192,16 +192,122 @@ pub enum RaftBootstrapError {
 }
 
 // ============================================================================
+// Leader-aware indexer launcher
+// ============================================================================
+
+/// Lifecycle transition emitted by [`LeaderTracker::tick`].
+///
+/// Driver loop translates these into actual `tokio::spawn` /
+/// `JoinHandle::abort` calls. The state machine itself is pure so we
+/// can unit-test it without touching tokio.
+#[derive(Debug, PartialEq, Eq)]
+enum LeadershipTransition {
+    /// We just won an election — start the indexer.
+    Spawn,
+    /// We just lost the lead — abort the currently-running indexer.
+    Abort,
+    /// No change relevant to the indexer lifecycle.
+    None,
+}
+
+/// Pure state for the leader-aware indexer driver.
+///
+/// Tracks the local node's "was leader last tick" so the driver only
+/// reacts to *transitions*, not to every metrics update. The watcher
+/// loop calls [`tick`](Self::tick) with each new "am I currently
+/// leader?" answer and routes the returned transition.
+#[derive(Debug, Default)]
+struct LeaderTracker {
+    was_leader: bool,
+}
+
+impl LeaderTracker {
+    fn tick(&mut self, is_leader: bool) -> LeadershipTransition {
+        let transition = match (self.was_leader, is_leader) {
+            (false, true) => LeadershipTransition::Spawn,
+            (true, false) => LeadershipTransition::Abort,
+            _ => LeadershipTransition::None,
+        };
+        self.was_leader = is_leader;
+        transition
+    }
+}
+
+/// Spawn a background task that watches `raft.metrics()` and drives
+/// the indexer's lifecycle: spawn it when this node becomes leader,
+/// abort it when it loses the lead.
+///
+/// `spawn_indexer` is invoked each time leadership is gained and must
+/// return the `JoinHandle` of a freshly-spawned background task —
+/// the driver owns the handle and aborts it on leadership loss.
+///
+/// The returned `JoinHandle` is the watcher itself; aborting it
+/// drops the metrics receiver and also aborts the currently-running
+/// indexer task (if any). Shutdown of the server should abort this
+/// handle alongside its other maintenance tasks.
+///
+/// `tokio::sync::watch` is a "latest value" channel, so transient
+/// flips that don't cross the leader/not-leader boundary from this
+/// node's local view (e.g. Leader → Follower → Leader inside one
+/// tick) collapse to "still leader" and are correctly treated as
+/// no-ops — the indexer keeps running and the cluster ends up with
+/// us back at the lead, no spawn/abort churn.
+pub fn spawn_leader_watcher<F>(
+    raft: Arc<Raft<TypeConfig>>,
+    self_id: NodeId,
+    spawn_indexer: F,
+) -> JoinHandle<()>
+where
+    F: Fn() -> JoinHandle<()> + Send + 'static,
+{
+    tokio::spawn(async move {
+        let mut metrics = raft.metrics();
+        let mut tracker = LeaderTracker::default();
+        let mut current_indexer: Option<JoinHandle<()>> = None;
+
+        loop {
+            let is_leader = metrics.borrow().current_leader == Some(self_id);
+            match tracker.tick(is_leader) {
+                LeadershipTransition::Spawn => {
+                    current_indexer = Some(spawn_indexer());
+                }
+                LeadershipTransition::Abort => {
+                    if let Some(h) = current_indexer.take() {
+                        h.abort();
+                    }
+                }
+                LeadershipTransition::None => {}
+            }
+            if metrics.changed().await.is_err() {
+                // Raft handle was dropped — nothing more to observe.
+                break;
+            }
+        }
+
+        // Watcher shutdown: tear down the indexer too.
+        if let Some(h) = current_indexer {
+            h.abort();
+        }
+    })
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
 #[cfg(test)]
 mod tests {
-    //! Smoke test for the bootstrap assembler. End-to-end cluster
-    //! formation (initialize → leader → state-machine write) is
-    //! covered in the multi-node integration test.
+    //! - Smoke test for the bootstrap assembler. End-to-end cluster
+    //!   formation (initialize → leader → state-machine write) is
+    //!   covered in the multi-node integration test.
+    //! - Pure-logic tests for [`LeaderTracker`] — the watcher's
+    //!   transition machine, in isolation.
+    //! - One end-to-end watcher test that bootstraps a real
+    //!   single-node Raft, lets it self-elect, and verifies the
+    //!   indexer spawn closure fired exactly once.
 
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::TempDir;
 
     #[tokio::test]
@@ -221,6 +327,120 @@ mod tests {
 
         // Routers assemble without panicking.
         let _ = integration.private_router();
+    }
+
+    // ----------------------------------------------------------------
+    // LeaderTracker — pure transition logic
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn leader_tracker_initial_state_is_not_leader() {
+        let mut t = LeaderTracker::default();
+        // First tick with `is_leader=false` is a no-op — we weren't
+        // leader before, still aren't.
+        assert_eq!(t.tick(false), LeadershipTransition::None);
+    }
+
+    #[test]
+    fn leader_tracker_gains_leadership_yields_spawn() {
+        let mut t = LeaderTracker::default();
+        assert_eq!(t.tick(true), LeadershipTransition::Spawn);
+    }
+
+    #[test]
+    fn leader_tracker_staying_leader_is_noop() {
+        let mut t = LeaderTracker::default();
+        assert_eq!(t.tick(true), LeadershipTransition::Spawn);
+        assert_eq!(t.tick(true), LeadershipTransition::None);
+        assert_eq!(t.tick(true), LeadershipTransition::None);
+    }
+
+    #[test]
+    fn leader_tracker_losing_leadership_yields_abort() {
+        let mut t = LeaderTracker::default();
+        assert_eq!(t.tick(true), LeadershipTransition::Spawn);
+        assert_eq!(t.tick(false), LeadershipTransition::Abort);
+    }
+
+    #[test]
+    fn leader_tracker_flap_cycle_emits_paired_transitions() {
+        let mut t = LeaderTracker::default();
+        // false → true → false → true → false
+        assert_eq!(t.tick(true), LeadershipTransition::Spawn);
+        assert_eq!(t.tick(false), LeadershipTransition::Abort);
+        assert_eq!(t.tick(true), LeadershipTransition::Spawn);
+        assert_eq!(t.tick(false), LeadershipTransition::Abort);
+    }
+
+    // ----------------------------------------------------------------
+    // spawn_leader_watcher — end-to-end against a real single-node Raft
+    // ----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn watcher_spawns_indexer_when_node_becomes_leader() {
+        let dir = TempDir::new().expect("temp dir");
+        let cfg = RaftBootstrapConfig::new(1, dir.path().to_path_buf());
+        let integration = RaftIntegration::bootstrap(cfg)
+            .await
+            .expect("bootstrap");
+
+        // Counter incremented every time the watcher invokes the
+        // spawn closure. Wrapped in Arc so the closure can keep a
+        // handle to it across multiple invocations.
+        let spawn_count = Arc::new(AtomicUsize::new(0));
+        let count_for_closure = Arc::clone(&spawn_count);
+
+        let watcher = spawn_leader_watcher(
+            Arc::clone(&integration.raft),
+            1, // self_id
+            move || {
+                count_for_closure.fetch_add(1, Ordering::SeqCst);
+                // The spawned "indexer" is just a parked task — we're
+                // testing the lifecycle, not the build pipeline.
+                tokio::spawn(async {
+                    futures::future::pending::<()>().await;
+                })
+            },
+        );
+
+        // Bootstrap as single-voter; node 1 will auto-elect on the
+        // next election tick.
+        let mut members = std::collections::BTreeMap::new();
+        members.insert(
+            1u64,
+            fluree_db_consensus::raft::ClusterNode::default(),
+        );
+        integration
+            .raft
+            .initialize(members)
+            .await
+            .expect("initialize");
+
+        // Wait for the leader transition to land.
+        integration
+            .raft
+            .wait(Some(Duration::from_secs(5)))
+            .state(
+                fluree_db_consensus::RaftServerState::Leader,
+                "leader after self-election",
+            )
+            .await
+            .expect("becomes leader");
+
+        // The metrics watch channel sends an update for the state
+        // transition; the watcher should observe it and invoke the
+        // spawn closure. Give the watcher task a tick to react.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            spawn_count.load(Ordering::SeqCst),
+            1,
+            "indexer should spawn exactly once on the leader transition"
+        );
+
+        // Tear down: aborting the watcher should also abort the
+        // current indexer (no leak), and Raft can shut down cleanly.
+        watcher.abort();
+        let _ = integration.raft.shutdown().await;
     }
 }
 

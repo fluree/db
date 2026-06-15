@@ -42,7 +42,9 @@ pub use raft::{ClusterNode, Command, NodeId, RaftCommitter, Response, TypeConfig
 #[cfg(feature = "raft")]
 pub use openraft::error::Fatal as RaftFatal;
 #[cfg(feature = "raft")]
-pub use openraft::{Config as RaftConfig, ConfigError as RaftConfigError, Raft};
+pub use openraft::{
+    Config as RaftConfig, ConfigError as RaftConfigError, Raft, ServerState as RaftServerState,
+};
 
 use async_trait::async_trait;
 use fluree_db_api::{
