@@ -2453,6 +2453,7 @@ dependencies = [
  "shellexpand",
  "tempfile",
  "tokio",
+ "tokio-util",
  "toml",
  "toml_edit",
  "tracing",

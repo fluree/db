@@ -1194,6 +1194,63 @@ impl RemoteLedgerClient {
         .await
     }
 
+    /// Restore a ledger on the remote from a local `.flpack` archive file.
+    ///
+    /// Streams the file to `POST {base_url}/import/<ledger>` (admin-gated), so
+    /// the server creates a NEW ledger named `ledger` from the archive without
+    /// a local staging instance. The file body is streamed, never buffered
+    /// whole, so multi-gigabyte archives upload without exhausting memory.
+    pub async fn import_ledger(
+        &self,
+        ledger: &str,
+        file_path: &std::path::Path,
+    ) -> Result<serde_json::Value, RemoteLedgerError> {
+        let url = self.op_url("import", ledger);
+
+        let resp = self.send_flpack_file(&url, file_path).await?;
+        if resp.status().is_success() {
+            return resp
+                .json()
+                .await
+                .map_err(|e| RemoteLedgerError::InvalidResponse(e.to_string()));
+        }
+        // A streamed body is consumed on send, so the 401-refresh retry
+        // re-opens the file rather than replaying the request.
+        if resp.status() == StatusCode::UNAUTHORIZED && self.try_refresh().await {
+            let resp2 = self.send_flpack_file(&url, file_path).await?;
+            if resp2.status().is_success() {
+                return resp2
+                    .json()
+                    .await
+                    .map_err(|e| RemoteLedgerError::InvalidResponse(e.to_string()));
+            }
+            return Err(Self::map_error(resp2).await);
+        }
+        Err(Self::map_error(resp).await)
+    }
+
+    /// Open `file_path` and POST it as a streaming `.flpack` body.
+    async fn send_flpack_file(
+        &self,
+        url: &str,
+        file_path: &std::path::Path,
+    ) -> Result<reqwest::Response, RemoteLedgerError> {
+        let file = tokio::fs::File::open(file_path).await.map_err(|e| {
+            RemoteLedgerError::InvalidRequest(format!(
+                "failed to open {}: {e}",
+                file_path.display()
+            ))
+        })?;
+        let stream = tokio_util::io::ReaderStream::new(file);
+        let body = reqwest::Body::wrap_stream(stream);
+        self.add_auth(self.client.post(url))
+            .header("Content-Type", "application/x-fluree-pack")
+            .body(body)
+            .send()
+            .await
+            .map_err(Self::map_network_error)
+    }
+
     /// Drop a ledger or graph source on the remote server.
     ///
     /// Calls `POST {base_url}/drop` with `{"ledger": "<name>", "hard": true|false}`.

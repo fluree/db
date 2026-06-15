@@ -38,6 +38,69 @@ pub async fn run_remote(ledger: &str, remote_name: &str, dirs: &FlureeDir) -> Cl
     Ok(())
 }
 
+/// `fluree create <ledger> --remote <name> --from <archive>.flpack` — restore a
+/// ledger onto a remote server by streaming a local `.flpack` archive to its
+/// `POST /import/<ledger>` endpoint. The remote creates the ledger under
+/// `ledger` (which may differ from the archived ledger's name). No local state
+/// is written — remote storage is separate from local.
+pub async fn run_remote_flpack_import(
+    ledger: &str,
+    remote_name: &str,
+    path: &Path,
+    dirs: &FlureeDir,
+) -> CliResult<()> {
+    use colored::Colorize;
+
+    let meta = std::fs::metadata(path)
+        .map_err(|e| CliError::Input(format!("failed to stat {}: {e}", path.display())))?;
+
+    let client = context::build_remote_client(remote_name, dirs).await?;
+    let ledger_id = context::to_ledger_id(ledger);
+
+    eprintln!(
+        "Importing '{}' to remote '{}' from {} ({})...",
+        ledger.cyan(),
+        remote_name,
+        path.display(),
+        format_human_bytes(meta.len()),
+    );
+
+    let response = client.import_ledger(&ledger_id, path).await.map_err(|e| {
+        CliError::Remote(format!(
+            "failed to import '{ledger}' to remote '{remote_name}': {e}"
+        ))
+    })?;
+    context::persist_refreshed_tokens(&client, remote_name, dirs).await;
+
+    let resolved = response
+        .get("ledger_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or(&ledger_id);
+    let commits = response
+        .get("commits")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let txn_blobs = response
+        .get("txn_blobs")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let index_artifacts = response
+        .get("index_artifacts")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+
+    println!(
+        "{} Imported '{}' to remote '{}' — {} commits, {} txn blobs, {} index artifacts",
+        "✓".green(),
+        resolved,
+        remote_name,
+        commits,
+        txn_blobs,
+        index_artifacts,
+    );
+    Ok(())
+}
+
 pub async fn run(
     ledger: &str,
     from: Option<&Path>,
@@ -531,7 +594,7 @@ async fn run_bulk_import(
 // ============================================================================
 
 /// Whether this path looks like a `.flpack` ledger archive.
-fn is_flpack_path(path: &Path) -> bool {
+pub(crate) fn is_flpack_path(path: &Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
         .is_some_and(|e| e.eq_ignore_ascii_case("flpack"))
