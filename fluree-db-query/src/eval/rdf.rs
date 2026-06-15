@@ -7,85 +7,93 @@ use crate::context::ExecutionContext;
 use crate::error::{QueryError, Result};
 use crate::ir::Expression;
 use fluree_db_binary_index::BinaryIndexStore;
-use fluree_db_core::DatatypeDictId;
+use fluree_db_core::{DatatypeDictId, Sid};
 use std::sync::Arc;
 use uuid::Uuid;
 
-use super::helpers::{check_arity, format_datatype_sid};
+use super::helpers::{check_arity, WELL_KNOWN_DATATYPES};
 use super::value::ComparableValue;
 
+/// Canonical datatype `Sid` for a reserved datatype id, resolved without
+/// consulting the binary store's datatype dictionary. Returns `None` for
+/// datatype ids that aren't pinned to a well-known Sid (the caller then
+/// resolves those via `store.dt_sids()`).
 #[inline]
-fn format_reserved_datatype(dt_id: DatatypeDictId) -> Option<ComparableValue> {
-    // Matches the compact rendering produced by `format_datatype_sid()` for common XSD/RDF types.
-    // For reserved dt_ids, we can answer without consulting the datatype dictionary.
-    let s: &'static str = match dt_id {
-        DatatypeDictId::ID => "@id",
-        DatatypeDictId::STRING => "xsd:string",
-        DatatypeDictId::BOOLEAN => "xsd:boolean",
-        DatatypeDictId::INTEGER => "xsd:integer",
-        DatatypeDictId::LONG => "xsd:long",
-        DatatypeDictId::DECIMAL => "xsd:decimal",
-        DatatypeDictId::DOUBLE => "xsd:double",
-        DatatypeDictId::FLOAT => "xsd:float",
-        DatatypeDictId::DATE_TIME => "xsd:dateTime",
-        DatatypeDictId::DATE => "xsd:date",
-        DatatypeDictId::TIME => "xsd:time",
-        DatatypeDictId::LANG_STRING => "rdf:langString",
-        DatatypeDictId::JSON => "@json",
-        DatatypeDictId::VECTOR => "@vector",
-        DatatypeDictId::FULL_TEXT => "@fulltext",
+fn reserved_datatype_sid(dt_id: DatatypeDictId) -> Option<Sid> {
+    let dts = &*WELL_KNOWN_DATATYPES;
+    let sid = match dt_id {
+        DatatypeDictId::ID => &dts.id_type,
+        DatatypeDictId::STRING => &dts.xsd_string,
+        DatatypeDictId::BOOLEAN => &dts.xsd_boolean,
+        DatatypeDictId::INTEGER => &dts.xsd_integer,
+        DatatypeDictId::LONG => &dts.xsd_long,
+        DatatypeDictId::DECIMAL => &dts.xsd_decimal,
+        DatatypeDictId::DOUBLE => &dts.xsd_double,
+        DatatypeDictId::FLOAT => &dts.xsd_float,
+        DatatypeDictId::DATE_TIME => &dts.xsd_datetime,
+        DatatypeDictId::DATE => &dts.xsd_date,
+        DatatypeDictId::TIME => &dts.xsd_time,
+        DatatypeDictId::JSON => &dts.rdf_json,
+        DatatypeDictId::VECTOR => &dts.fluree_vector,
         _ => return None,
     };
-    Some(ComparableValue::String(Arc::from(s)))
+    Some(sid.clone())
 }
 
+/// SPARQL 1.1 §17.4.2.3 `DATATYPE`: returns the datatype IRI of a literal.
+///
+/// The result is an IRI term (a `Sid`), not a string — so it compares equal to
+/// the same datatype IRI written elsewhere in a query, e.g.
+/// `FILTER(DATATYPE(?v) = xsd:decimal)` where `xsd:decimal` also lowers to a
+/// `Sid`. SPARQL results render it as the full IRI; JSON-LD compacts it against
+/// the active `@context`.
 pub fn eval_datatype<R: RowAccess>(
     args: &[Expression],
     row: &R,
     ctx: Option<&ExecutionContext<'_>>,
 ) -> Result<Option<ComparableValue>> {
     check_arity(args, 1, "DATATYPE")?;
-    if let Expression::Var(var_id) = &args[0] {
-        match row.get(*var_id) {
-            Some(binding) => match binding {
-                Binding::Lit { dtc, .. } => Ok(Some(format_datatype_sid(dtc.datatype()))),
-                Binding::EncodedLit { dt_id, .. } => {
-                    let dt_id = DatatypeDictId::from_u16(*dt_id);
-                    if let Some(v) = format_reserved_datatype(dt_id) {
-                        return Ok(Some(v));
-                    }
-
-                    let Some(store) = ctx.and_then(|c| c.binary_store.as_deref()) else {
-                        return Err(QueryError::InvalidExpression(
-                            "DATATYPE requires a literal or IRI argument".to_string(),
-                        ));
-                    };
-                    let dt_sid = store
-                        .dt_sids()
-                        .get(dt_id.as_u16() as usize)
-                        .cloned()
-                        .ok_or_else(|| {
-                            QueryError::InvalidExpression(format!(
-                                "DATATYPE could not resolve datatype id {}",
-                                dt_id.as_u16()
-                            ))
-                        })?;
-                    Ok(Some(format_datatype_sid(&dt_sid)))
-                }
-                Binding::Sid { sid: _, .. } | Binding::IriMatch { .. } | Binding::Iri(_) => {
-                    Ok(Some(ComparableValue::String(Arc::from("@id"))))
-                }
-                Binding::Unbound | Binding::Poisoned => Ok(None),
-                _ => Err(QueryError::InvalidExpression(
-                    "DATATYPE requires a literal or IRI argument".to_string(),
-                )),
-            },
-            None => Ok(None), // unbound variable
-        }
-    } else {
-        Err(QueryError::InvalidExpression(
+    let Expression::Var(var_id) = &args[0] else {
+        return Err(QueryError::InvalidExpression(
             "DATATYPE requires a variable argument".to_string(),
-        ))
+        ));
+    };
+    match row.get(*var_id) {
+        Some(binding) => match binding {
+            Binding::Lit { dtc, .. } => Ok(Some(ComparableValue::Sid(dtc.datatype().clone()))),
+            Binding::EncodedLit { dt_id, .. } => {
+                let dt_id = DatatypeDictId::from_u16(*dt_id);
+                if let Some(sid) = reserved_datatype_sid(dt_id) {
+                    return Ok(Some(ComparableValue::Sid(sid)));
+                }
+
+                let Some(store) = ctx.and_then(|c| c.binary_store.as_deref()) else {
+                    return Err(QueryError::InvalidExpression(
+                        "DATATYPE requires a literal or IRI argument".to_string(),
+                    ));
+                };
+                let dt_sid = store
+                    .dt_sids()
+                    .get(dt_id.as_u16() as usize)
+                    .cloned()
+                    .ok_or_else(|| {
+                        QueryError::InvalidExpression(format!(
+                            "DATATYPE could not resolve datatype id {}",
+                            dt_id.as_u16()
+                        ))
+                    })?;
+                Ok(Some(ComparableValue::Sid(dt_sid)))
+            }
+            // Fluree extension: DATATYPE of an IRI/ref reports the `@id` ref type.
+            Binding::Sid { .. } | Binding::IriMatch { .. } | Binding::Iri(_) => Ok(Some(
+                ComparableValue::Sid(WELL_KNOWN_DATATYPES.id_type.clone()),
+            )),
+            Binding::Unbound | Binding::Poisoned => Ok(None),
+            _ => Err(QueryError::InvalidExpression(
+                "DATATYPE requires a literal or IRI argument".to_string(),
+            )),
+        },
+        None => Ok(None), // unbound variable
     }
 }
 
