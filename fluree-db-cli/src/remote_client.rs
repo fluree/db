@@ -1379,12 +1379,26 @@ impl RemoteLedgerClient {
                 .to_string()
         };
 
+        // Set Content-Length explicitly so the streamed body is sent
+        // length-delimited. Without it, `wrap_stream` produces an
+        // unknown-length body and reqwest falls back to
+        // `Transfer-Encoding: chunked`, which real S3 presigned PUTs reject
+        // (`NotImplemented: ... Transfer-Encoding`). This keeps the file
+        // streaming (no buffering) while satisfying S3's fixed-length
+        // requirement.
+        let len = tokio::fs::metadata(file_path).await.map_err(|e| {
+            RemoteLedgerError::InvalidRequest(format!("failed to stat {}: {e}", file_path.display()))
+        })?;
         let file = tokio::fs::File::open(file_path).await.map_err(|e| {
             RemoteLedgerError::InvalidRequest(format!("failed to open {}: {e}", file_path.display()))
         })?;
         let body = reqwest::Body::wrap_stream(tokio_util::io::ReaderStream::new(file));
 
-        let mut req = self.client.put(&resolved).body(body);
+        let mut req = self
+            .client
+            .put(&resolved)
+            .header(reqwest::header::CONTENT_LENGTH, len.len())
+            .body(body);
         for (k, v) in headers {
             req = req.header(k, v);
         }
@@ -2326,6 +2340,84 @@ mod tests {
     fn test_client_strips_trailing_slash() {
         let client = RemoteLedgerClient::new("http://localhost:8090/fluree/", None);
         assert_eq!(client.base_url, "http://localhost:8090/fluree");
+    }
+
+    /// `put_upload_file` must send a fixed `Content-Length` and NOT
+    /// `Transfer-Encoding: chunked` — real S3 presigned PUTs reject chunked
+    /// encoding (`NotImplemented: ... Transfer-Encoding`). The reference dev
+    /// backend tolerates chunked, so this asserts the wire shape directly
+    /// against a raw socket that records the request headers.
+    #[tokio::test]
+    async fn put_upload_file_sends_content_length_not_chunked() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = Vec::new();
+            let mut tmp = [0u8; 1024];
+            // Read until the end of the header block.
+            let header_end = loop {
+                let n = sock.read(&mut tmp).await.unwrap();
+                if n == 0 {
+                    break buf.len();
+                }
+                buf.extend_from_slice(&tmp[..n]);
+                if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break pos + 4;
+                }
+            };
+            let header_text = String::from_utf8_lossy(&buf[..header_end]).to_lowercase();
+
+            // Drain the body so the client's write completes cleanly.
+            let content_length: usize = header_text
+                .lines()
+                .find_map(|l| l.strip_prefix("content-length:"))
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(0);
+            while buf.len() < header_end + content_length {
+                let n = sock.read(&mut tmp).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&tmp[..n]);
+            }
+
+            sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .unwrap();
+            sock.flush().await.unwrap();
+            header_text
+        });
+
+        let path =
+            std::env::temp_dir().join(format!("flpack-put-test-{}.bin", std::process::id()));
+        let payload = b"hello flpack archive bytes";
+        std::fs::write(&path, payload).unwrap();
+
+        let client = RemoteLedgerClient::new(&format!("http://{addr}/v1/fluree"), None);
+        let result = client
+            .put_upload_file(
+                &format!("http://{addr}/upload"),
+                &std::collections::HashMap::new(),
+                &path,
+            )
+            .await;
+        let _ = std::fs::remove_file(&path);
+        result.expect("put_upload_file should succeed");
+
+        let headers = server.await.unwrap();
+        assert!(
+            headers.contains(&format!("content-length: {}", payload.len())),
+            "PUT must send a fixed Content-Length; headers were:\n{headers}"
+        );
+        assert!(
+            !headers.contains("transfer-encoding: chunked"),
+            "PUT must not use chunked encoding (S3 presigned PUT rejects it); headers were:\n{headers}"
+        );
     }
 
     #[test]
