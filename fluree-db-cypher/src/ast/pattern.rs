@@ -15,14 +15,26 @@ pub struct Pattern {
 /// One linear pattern in the comma-separated list (e.g., `(a)-[]->(b)`).
 #[derive(Clone, Debug, PartialEq)]
 pub struct PatternPart {
-    /// Path variable assignment (`p = ...`). v1 rejects bound path
-    /// variables since path values aren't a v1 surface; this stays
-    /// `None`.
+    /// Path variable assignment (`p = ...`). Set only for a
+    /// `shortestPath`/`allShortestPaths` part (see `path_search`); plain
+    /// `p = (...)` path values are still deferred.
     pub path_var: Option<Variable>,
+    /// `shortestPath(...)` / `allShortestPaths(...)` wrapper, if any. When
+    /// set, `head`/`tail` are the inner pattern searched for a path.
+    pub path_search: Option<PathSearch>,
     /// The first node and then alternating (rel, node) pairs.
     pub head: NodePattern,
     pub tail: Vec<(RelPattern, NodePattern)>,
     pub span: SourceSpan,
+}
+
+/// Which path-search wraps a `p = …(pattern)` part.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PathSearch {
+    /// `shortestPath((a)-[:T*]->(b))` — one shortest path.
+    Shortest,
+    /// `allShortestPaths((a)-[:T*]->(b))` — all paths at the shortest length.
+    AllShortest,
 }
 
 /// `(var:Label1:Label2 {prop:val})`.

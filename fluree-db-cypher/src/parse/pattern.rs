@@ -1,7 +1,8 @@
 //! Pattern parser.
 
 use crate::ast::{
-    Direction, Label, LengthRange, MapLit, NodePattern, Pattern, PatternPart, RelPattern, RelType,
+    Direction, Label, LengthRange, MapLit, NodePattern, PathSearch, Pattern, PatternPart,
+    RelPattern, RelType, Variable,
 };
 use crate::diag::{DiagCode, Diagnostic};
 use crate::lex::TokenKind;
@@ -29,20 +30,49 @@ pub fn parse_pattern(s: &mut TokenStream) -> Result<Pattern, Diagnostic> {
 fn parse_pattern_part(s: &mut TokenStream) -> Result<PatternPart, Diagnostic> {
     let start = s.peek_span();
 
-    // v1 does not bind path variables; if user writes `p = (...)`,
-    // reject early with a deferred-feature error.
-    if let TokenKind::Ident(_) = s.peek_kind() {
+    // Optional path-variable assignment `p = …`.
+    let mut path_var = None;
+    if let TokenKind::Ident(name) = s.peek_kind() {
         if matches!(s.peek_at(1), TokenKind::Eq) {
-            return Err(Diagnostic {
-                code: DiagCode::DeferredPathValue,
-                severity: crate::diag::Severity::Error,
-                message:
-                    "path variables (e.g., `p = (...)`) are deferred — path values are not in v1"
-                        .to_string(),
-                span: s.peek_span(),
-                help: Some("rewrite without the path binding".to_string()),
-            });
+            let name = name.clone();
+            let span = s.peek_span();
+            s.advance(); // identifier
+            s.advance(); // `=`
+            path_var = Some(Variable { name, span });
         }
+    }
+
+    // Optional `shortestPath(…)` / `allShortestPaths(…)` wrapper.
+    let mut path_search = None;
+    if let TokenKind::Ident(name) = s.peek_kind() {
+        let lname = name.to_ascii_lowercase();
+        if (lname == "shortestpath" || lname == "allshortestpaths")
+            && matches!(s.peek_at(1), TokenKind::LParen)
+        {
+            path_search = Some(if lname == "shortestpath" {
+                PathSearch::Shortest
+            } else {
+                PathSearch::AllShortest
+            });
+            s.advance(); // function name
+            s.expect(&TokenKind::LParen)?;
+        }
+    }
+
+    // A bound path var without a shortestPath wrapper is a first-class path
+    // value — still deferred.
+    if path_var.is_some() && path_search.is_none() {
+        return Err(Diagnostic {
+            code: DiagCode::DeferredPathValue,
+            severity: crate::diag::Severity::Error,
+            message: "path values (`p = (...)`) are deferred — only \
+                      `p = shortestPath((a)-[:T*]->(b))` is supported"
+                .to_string(),
+            span: s.peek_span(),
+            help: Some(
+                "wrap the pattern in shortestPath(...) or drop the path binding".to_string(),
+            ),
+        });
     }
 
     let head = parse_node_pat(s)?;
@@ -56,9 +86,15 @@ fn parse_pattern_part(s: &mut TokenStream) -> Result<PatternPart, Diagnostic> {
         let next = parse_node_pat(s)?;
         tail.push((rel, next));
     }
+
+    if path_search.is_some() {
+        s.expect(&TokenKind::RParen)?; // close shortestPath( … )
+    }
+
     let end = s.peek_span();
     Ok(PatternPart {
-        path_var: None,
+        path_var,
+        path_search,
         head,
         tail,
         span: start.union(end),

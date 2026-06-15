@@ -40,6 +40,15 @@ fn lower_part<E: IriEncoder>(
     part: &PatternPart,
     out: &mut Vec<Pattern>,
 ) -> Result<()> {
+    if part.path_search.is_some() {
+        // Parser accepts `p = shortestPath((a)-[:T*]->(b))`; the dedicated
+        // bidirectional-BFS operator that executes it is being built.
+        return Err(LowerError::unsupported(
+            "shortestPath / allShortestPaths are parsed but their execution operator is not \
+             yet wired up",
+        ));
+    }
+
     // Head node anchored. If tail is empty (single node) and the node
     // has no labels, no inline props, no participating relationships,
     // reject.

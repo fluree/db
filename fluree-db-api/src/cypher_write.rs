@@ -164,6 +164,7 @@ pub(crate) fn build_merge_probe_ast(node: &NodePattern) -> CypherAst {
                 pattern: Pattern {
                     parts: vec![PatternPart {
                         path_var: None,
+                        path_search: None,
                         head: node.clone(),
                         tail: Vec::new(),
                         span,
@@ -258,6 +259,7 @@ pub(crate) fn build_relationship_probe_ast(
     };
     let rel_part = PatternPart {
         path_var: None,
+        path_search: None,
         head,
         tail: vec![(rel, tail_node)],
         span,

@@ -172,6 +172,49 @@ fn bound_variable_length_relationship_is_rejected() {
 }
 
 #[test]
+fn shortest_path_parses_with_path_var_and_search_mode() {
+    use fluree_db_cypher::ast::{PathSearch, ReadClause, Statement};
+    let out = parse_cypher(
+        "MATCH (a:Person), (b:Person) MATCH p = shortestPath((a)-[:KNOWS*]->(b)) RETURN length(p)",
+    );
+    assert!(
+        !out.has_errors(),
+        "shortestPath should parse: {:?}",
+        out.diagnostics
+    );
+    let ast = out.ast.unwrap();
+    let Statement::Query(q) = &ast.statement else {
+        panic!("expected query");
+    };
+    // The second MATCH is the shortestPath part with a bound path var.
+    let part = q.clauses.iter().find_map(|c| match c {
+        ReadClause::Match(m) => m
+            .pattern
+            .parts
+            .iter()
+            .find(|p| p.path_search == Some(PathSearch::Shortest)),
+        _ => None,
+    });
+    let part = part.expect("expected a shortestPath part");
+    assert_eq!(part.path_var.as_ref().map(|v| v.name.as_str()), Some("p"));
+    assert_eq!(part.tail.len(), 1, "inner (a)-[:KNOWS*]->(b)");
+
+    // Lowering is pending (the BFS operator isn't wired yet).
+    let encoder = NoEncoder;
+    let mut vars = VarRegistry::new();
+    assert!(lower_cypher(&ast, &encoder, &mut vars).is_err());
+}
+
+#[test]
+fn plain_path_value_is_still_rejected() {
+    let out = parse_cypher("MATCH p = (a)-[:KNOWS]->(b) RETURN p");
+    assert!(
+        out.has_errors(),
+        "plain path values should be rejected at parse"
+    );
+}
+
+#[test]
 fn inverse_direction() {
     let q = lower("MATCH (a:Person)<-[:KNOWS]-(b:Person) RETURN a, b");
     // 3 patterns; the rel triple should have b's var as subject.
