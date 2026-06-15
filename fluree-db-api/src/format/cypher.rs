@@ -8,7 +8,7 @@
 //! ```
 //!
 //! Scalar rules (the Cypher / Neo4j profile, not RDF):
-//! - long / int / double → JSON number
+//! - long / int / float / double → JSON number
 //! - string → JSON string
 //! - `xsd:date` / `xsd:dateTime` → bare ISO string (NOT a `{"@value":…,"@type":…}`
 //!   value-object — the difference from JSON-LD that openCypher / LDBC tooling
@@ -17,6 +17,9 @@
 //! - IRI / node ref → string IRI
 //! - list → JSON array
 //! - unbound → null
+//! - `xsd:decimal` → bare **string** (it is arbitrary-precision / string-backed
+//!   for accounting accuracy and may not fit a JSON number, so we preserve the
+//!   exact lexical form rather than lose precision)
 //!
 //! There is no openCypher result-serialization standard; this is Fluree's
 //! Neo4j-compatible profile, chosen for openCypher / LDBC interop. The per-cell

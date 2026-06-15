@@ -471,7 +471,9 @@ pub enum Commands {
         #[arg(short = 'f', long = "file")]
         file: Option<PathBuf>,
 
-        /// Output format (json, typed-json, table, csv, or tsv)
+        /// Output format (json/jsonld, typed-json, cypher-json, table, csv, or
+        /// tsv). Cypher queries default to cypher-json (Neo4j-compatible, native
+        /// scalars); pass `--format jsonld` for the RDF JSON-LD form.
         #[arg(long, default_value = "table")]
         format: String,
 

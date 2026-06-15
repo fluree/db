@@ -1767,12 +1767,31 @@ async fn execute_cypher_ledger(
             set_span_error_code(span, "error:InvalidQuery");
             ServerError::Api(e)
         })?;
-    let json = result
-        .to_jsonld_async(view.as_graph_db_ref())
-        .await
-        .map_err(|e| ServerError::Api(e.into()))?;
+    // Cypher defaults to cypher-json (Neo4j-compatible, native scalars);
+    // `Accept: application/ld+json` opts into the RDF JSON-LD form.
+    let (json, content_type) = if headers.wants_jsonld() {
+        (
+            result
+                .to_jsonld_async(view.as_graph_db_ref())
+                .await
+                .map_err(|e| ServerError::Api(e.into()))?,
+            "application/ld+json; charset=utf-8",
+        )
+    } else {
+        (
+            result
+                .to_cypher_json_async(view.as_graph_db_ref())
+                .await
+                .map_err(|e| ServerError::Api(e.into()))?,
+            "application/vnd.fluree.cypher+json; charset=utf-8",
+        )
+    };
     tracing::info!(status = "success", query_kind = "cypher");
-    Ok((HeaderMap::new(), Json(json)).into_response())
+    Ok((
+        [(axum::http::header::CONTENT_TYPE, content_type)],
+        Json(json),
+    )
+        .into_response())
 }
 
 /// Execute a SPARQL query against a specific ledger and return result

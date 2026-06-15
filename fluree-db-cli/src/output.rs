@@ -12,6 +12,9 @@ use fluree_db_query::binding::Binding;
 pub enum OutputFormatKind {
     Json,
     TypedJson,
+    /// Neo4j-compatible Cypher JSON (native scalars). The default for Cypher
+    /// queries; available for any query via `--format cypher-json`.
+    CypherJson,
     Table,
     Csv,
     Tsv,
@@ -22,6 +25,7 @@ impl std::fmt::Display for OutputFormatKind {
         match self {
             Self::Json => f.write_str("json"),
             Self::TypedJson => f.write_str("typed-json"),
+            Self::CypherJson => f.write_str("cypher-json"),
             Self::Table => f.write_str("table"),
             Self::Csv => f.write_str("csv"),
             Self::Tsv => f.write_str("tsv"),
@@ -265,6 +269,19 @@ pub fn format_result(
     match format {
         OutputFormatKind::Json | OutputFormatKind::TypedJson => {
             format_json(json, query_format, limit)
+        }
+        OutputFormatKind::CypherJson => {
+            // Already the final Neo4j-compatible envelope; pretty-print and
+            // count `results[0].data` rows.
+            let total = json
+                .pointer("/results/0/data")
+                .and_then(|d| d.as_array())
+                .map_or(0, Vec::len);
+            let text = serde_json::to_string_pretty(json).unwrap_or_else(|_| json.to_string());
+            Ok(FormatOutput {
+                text,
+                total_rows: total,
+            })
         }
         OutputFormatKind::Table => format_as_table(json, query_format, limit),
         OutputFormatKind::Csv | OutputFormatKind::Tsv => {

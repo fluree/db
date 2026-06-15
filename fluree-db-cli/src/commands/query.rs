@@ -250,14 +250,16 @@ pub async fn run(
 
     // Parse output format
     let output_format = match format_str.to_lowercase().as_str() {
-        "json" => OutputFormatKind::Json,
+        "json" | "jsonld" | "json-ld" => OutputFormatKind::Json,
         "typed-json" | "typed_json" | "typedjson" => OutputFormatKind::TypedJson,
+        "cypher-json" | "cypher_json" | "cypherjson" => OutputFormatKind::CypherJson,
         "table" => OutputFormatKind::Table,
         "csv" => OutputFormatKind::Csv,
         "tsv" => OutputFormatKind::Tsv,
         other => {
             return Err(CliError::Usage(format!(
-                "unknown output format '{other}'; valid formats: json, typed-json, table, csv, tsv"
+                "unknown output format '{other}'; valid formats: json, jsonld, typed-json, \
+                 cypher-json, table, csv, tsv"
             )));
         }
     };
@@ -1007,16 +1009,26 @@ async fn run_cypher_query(
         return Ok(());
     }
 
-    // Cypher results render as JSON-LD by default; `table` falls back to JSON.
-    let formatted_json = if output_format == OutputFormatKind::TypedJson {
-        let config = fluree_db_api::FormatterConfig::typed_json();
-        result.format_async(view.as_graph_db_ref(), &config).await?
-    } else {
-        result.to_jsonld_async(view.as_graph_db_ref()).await?
-    };
-    let display_format = match output_format {
-        OutputFormatKind::TypedJson => OutputFormatKind::TypedJson,
-        _ => OutputFormatKind::Json,
+    // Cypher defaults to cypher-json (Neo4j-compatible, native scalars).
+    // `--format json|jsonld` gives RDF JSON-LD; `--format typed-json` the typed
+    // form. The default global `--format table` (and csv/tsv) → cypher-json,
+    // since Cypher has no tabular renderer of its own.
+    let (formatted_json, display_format) = match output_format {
+        OutputFormatKind::Json => (
+            result.to_jsonld_async(view.as_graph_db_ref()).await?,
+            OutputFormatKind::Json,
+        ),
+        OutputFormatKind::TypedJson => {
+            let config = fluree_db_api::FormatterConfig::typed_json();
+            (
+                result.format_async(view.as_graph_db_ref(), &config).await?,
+                OutputFormatKind::TypedJson,
+            )
+        }
+        _ => (
+            result.to_cypher_json_async(view.as_graph_db_ref()).await?,
+            OutputFormatKind::CypherJson,
+        ),
     };
     let output = output::format_result(
         &formatted_json,
