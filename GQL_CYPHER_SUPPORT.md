@@ -363,6 +363,17 @@ lower to `Pattern::ShortestPath` and execute on a dedicated
   — together these are the IC13 shape
   (`CASE WHEN p IS NULL THEN -1 ELSE length(p) END`). No path under a
   *mandatory* MATCH drops the row.
+- A lower hop bound > 1 (`*2..`) can require a *longer* path than the
+  unconstrained shortest one — which distance-finalizing BFS cannot
+  discover (it pins each node at its minimal distance, so a length-1
+  `A→D` hides the length-2 `A→B→D`). For `min_hops > 1` the operator
+  switches to an iterative-deepening node-distinct DFS that returns the
+  path(s) at the first qualifying length (unbounded `*2..` capped at
+  `UNBOUNDED_DEPTH_CAP = 15` hops).
+- `allShortestPaths` returning more than `DEFAULT_MAX_PATHS` (1000) is a
+  hard `ResourceLimit` error, not a silent truncation — a quietly-capped
+  result on a high-fan-out lattice would look complete while dropping
+  paths.
 - Inner pattern must be node–relationship–node over a **single typed**
   predicate, anonymous rel (no rel var / property filter). `nodes(p)` /
   `relationships(p)` and free (unwrapped) path values remain deferred.

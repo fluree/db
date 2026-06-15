@@ -1929,3 +1929,83 @@ async fn cypher_all_shortest_paths_returns_each_minimal_path() {
         "both minimal paths are length 2: {out}"
     );
 }
+
+#[tokio::test]
+async fn cypher_all_shortest_paths_honors_lower_hop_bound() {
+    // A direct edge A→D (length 1) plus A→B→D (length 2). With `*2..` the
+    // length-1 path is excluded, so the shortest qualifying length is 2 — the
+    // distance-finalizing BFS would otherwise stop at the hidden length-1 path.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/cypher:sp-minhops");
+    let l = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": ctx(),
+                "@graph": [
+                    {"@id": "ex:a", "@type": "ex:Person", "ex:name": "A",
+                     "ex:KNOWS": [{"@id": "ex:b"}, {"@id": "ex:d"}]},
+                    {"@id": "ex:b", "@type": "ex:Person", "ex:name": "B", "ex:KNOWS": {"@id": "ex:d"}},
+                    {"@id": "ex:d", "@type": "ex:Person", "ex:name": "D"},
+                ]
+            }),
+        )
+        .await
+        .expect("seed shortcut+detour")
+        .ledger;
+    let db = graphdb_from_ledger(&l);
+
+    let out = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (a:Person {name: "A"}), (d:Person {name: "D"})
+               MATCH p = allShortestPaths((a)-[:KNOWS*2..]->(d))
+               RETURN length(p) AS len"#,
+        )
+        .await
+        .expect("allShortestPaths *2..")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    let rows = out.as_array().expect("rows");
+    assert_eq!(rows.len(), 1, "only the length-2 detour qualifies: {out}");
+    assert_eq!(rows[0][0], json!(2), "A→B→D, not the excluded A→D: {out}");
+}
+
+#[tokio::test]
+async fn cypher_shortest_path_single_honors_lower_hop_bound() {
+    // Single shortestPath with `*2..` must also skip the length-1 shortcut.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/cypher:sp-single-minhops");
+    let l = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": ctx(),
+                "@graph": [
+                    {"@id": "ex:a", "@type": "ex:Person", "ex:name": "A",
+                     "ex:KNOWS": [{"@id": "ex:b"}, {"@id": "ex:d"}]},
+                    {"@id": "ex:b", "@type": "ex:Person", "ex:name": "B", "ex:KNOWS": {"@id": "ex:d"}},
+                    {"@id": "ex:d", "@type": "ex:Person", "ex:name": "D"},
+                ]
+            }),
+        )
+        .await
+        .expect("seed")
+        .ledger;
+    let db = graphdb_from_ledger(&l);
+
+    let out = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (a:Person {name: "A"}), (d:Person {name: "D"})
+               MATCH p = shortestPath((a)-[:KNOWS*2..]->(d))
+               RETURN length(p) AS len"#,
+        )
+        .await
+        .expect("shortestPath *2..")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    assert_eq!(out[0][0], json!(2), "shortest qualifying path is length 2: {out}");
+}

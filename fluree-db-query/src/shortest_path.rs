@@ -43,6 +43,12 @@ pub const DEFAULT_MAX_VISITED: usize = 100_000;
 /// Safety bound: maximum number of paths returned by `allShortestPaths`.
 pub const DEFAULT_MAX_PATHS: usize = 1_000;
 
+/// Depth cap for an unbounded lower-bounded search (`*min..` with no upper
+/// bound), used by the iterative-deepening path search. A `*2..` shortest
+/// path must stop deepening somewhere; the social-graph diameters this
+/// targets are well under this.
+pub const UNBOUNDED_DEPTH_CAP: u32 = 15;
+
 /// Anchored shortest-path operator (bidirectional BFS).
 pub struct ShortestPathOperator {
     /// Child operator providing bound endpoints (correlated execution).
@@ -404,11 +410,16 @@ impl ShortestPathOperator {
         // Enumerate all shortest paths via DFS over the predecessor sets.
         let mut paths: Vec<Vec<Sid>> = Vec::new();
         let mut suffix: Vec<Sid> = vec![end.clone()];
-        self.enumerate(end, start, &preds, &mut suffix, &mut paths);
+        self.enumerate(end, start, &preds, &mut suffix, &mut paths)?;
         Ok(paths)
     }
 
-    /// DFS over predecessor sets, accumulating start→end paths (capped).
+    /// DFS over predecessor sets, accumulating start→end paths.
+    ///
+    /// `allShortestPaths` promises *every* minimal-length path, so exceeding
+    /// `max_paths` is a hard error rather than a silent truncation — a
+    /// quietly-capped result on a high-fan-out lattice would look complete
+    /// while dropping paths.
     fn enumerate(
         &self,
         node: &Sid,
@@ -416,26 +427,121 @@ impl ShortestPathOperator {
         preds: &HashMap<Sid, Vec<Sid>>,
         suffix: &mut Vec<Sid>,
         out: &mut Vec<Vec<Sid>>,
-    ) {
-        if out.len() >= self.max_paths {
-            return;
-        }
+    ) -> Result<()> {
         if node == start {
             let mut path = suffix.clone();
             path.reverse(); // suffix was built end→start
             out.push(path);
-            return;
+            if out.len() >= self.max_paths {
+                return Err(QueryError::ResourceLimit(format!(
+                    "allShortestPaths exceeded max paths ({})",
+                    self.max_paths
+                )));
+            }
+            return Ok(());
         }
         if let Some(parents) = preds.get(node) {
             for p in parents {
                 suffix.push(p.clone());
-                self.enumerate(p, start, preds, suffix, out);
+                self.enumerate(p, start, preds, suffix, out)?;
                 suffix.pop();
-                if out.len() >= self.max_paths {
-                    return;
-                }
             }
         }
+        Ok(())
+    }
+
+    /// Find the shortest node-distinct path(s) whose hop count is in
+    /// `[min_hops, max_hops]`, used when `min_hops > 1`.
+    ///
+    /// Distance-finalizing BFS pins each node at its minimal distance, so it
+    /// cannot find a qualifying longer path to a node that is also reachable
+    /// more cheaply (e.g. `A→D` length 1 hides `A→B→D` length 2 under `*2..`).
+    /// This iterative-deepening search tries each candidate length from
+    /// `min_hops` upward and returns the path(s) at the first length that
+    /// reaches `end`. `want_all` collects every path at that length.
+    async fn bounded_qualifying_paths(
+        &self,
+        ctx: &ExecutionContext<'_>,
+        start: &Sid,
+        end: &Sid,
+        want_all: bool,
+    ) -> Result<Vec<Vec<Sid>>> {
+        let min_hops = self.pattern.min_hops.unwrap_or(1).max(1);
+        let max_hops = self.pattern.max_hops.unwrap_or(UNBOUNDED_DEPTH_CAP);
+        for target_len in min_hops..=max_hops {
+            let paths = self
+                .exact_length_paths(ctx, start, end, target_len, want_all)
+                .await?;
+            if !paths.is_empty() {
+                return Ok(paths);
+            }
+        }
+        Ok(Vec::new())
+    }
+
+    /// All node-distinct paths of exactly `target_len` hops from `start` to
+    /// `end` (iterative DFS over the live adjacency, honoring direction via
+    /// [`Self::neighbors`]). `want_all = false` returns on the first hit.
+    /// Bounded by `max_visited` (explored states) and `max_paths` (results →
+    /// `ResourceLimit`). Node-distinctness approximates relationship-uniqueness,
+    /// matching the bounded variable-length read path.
+    async fn exact_length_paths(
+        &self,
+        ctx: &ExecutionContext<'_>,
+        start: &Sid,
+        end: &Sid,
+        target_len: u32,
+        want_all: bool,
+    ) -> Result<Vec<Vec<Sid>>> {
+        let mut results: Vec<Vec<Sid>> = Vec::new();
+        let mut stack: Vec<Vec<Sid>> = vec![vec![start.clone()]];
+        let mut states: usize = 0;
+
+        while let Some(path) = stack.pop() {
+            crate::fast_path_common::bail_if_cancelled(&ctx.cancellation)?;
+            let depth = (path.len() - 1) as u32;
+            let last = path.last().expect("path always carries the start node");
+
+            if depth == target_len {
+                if last == end {
+                    results.push(path);
+                    if !want_all {
+                        return Ok(results);
+                    }
+                    if results.len() >= self.max_paths {
+                        return Err(QueryError::ResourceLimit(format!(
+                            "allShortestPaths exceeded max paths ({})",
+                            self.max_paths
+                        )));
+                    }
+                }
+                continue;
+            }
+
+            // On the final hop only `end` can complete a qualifying path —
+            // prune everything else so the last layer doesn't fan out.
+            let final_hop = depth + 1 == target_len;
+            let nbrs = self.neighbors(ctx, last, true).await?;
+            for nb in nbrs {
+                if final_hop && &nb != end {
+                    continue;
+                }
+                if path.contains(&nb) {
+                    continue; // node-distinct
+                }
+                states += 1;
+                if states >= self.max_visited {
+                    return Err(QueryError::ResourceLimit(format!(
+                        "shortestPath exceeded max visited nodes ({})",
+                        self.max_visited
+                    )));
+                }
+                let mut next = path.clone();
+                next.push(nb);
+                stack.push(next);
+            }
+        }
+        Ok(results)
     }
 
     /// Process one child row: resolve endpoints, search, build output rows.
@@ -463,12 +569,21 @@ impl ShortestPathOperator {
             return Ok(Vec::new());
         };
 
-        let paths = match self.pattern.mode {
-            ShortestPathMode::Single => match self.bidirectional(ctx, &start, &end).await? {
+        let want_all = matches!(self.pattern.mode, ShortestPathMode::All);
+        let paths = if self.pattern.min_hops.unwrap_or(1) > 1 {
+            // A lower hop bound > 1 can require a *longer* path than the plain
+            // shortest one, which distance-finalizing BFS cannot discover (it
+            // pins each node at its minimal distance). Use iterative-deepening
+            // node-distinct search instead.
+            self.bounded_qualifying_paths(ctx, &start, &end, want_all)
+                .await?
+        } else if want_all {
+            self.all_shortest(ctx, &start, &end).await?
+        } else {
+            match self.bidirectional(ctx, &start, &end).await? {
                 Some(p) => vec![p],
                 None => Vec::new(),
-            },
-            ShortestPathMode::All => self.all_shortest(ctx, &start, &end).await?,
+            }
         };
 
         let mut rows = Vec::with_capacity(paths.len());
