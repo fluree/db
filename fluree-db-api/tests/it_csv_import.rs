@@ -72,7 +72,10 @@ async fn csv_import_round_trips_to_cypher_and_sparql() {
         .expect("jsonld");
     assert_eq!(
         weighted,
-        json!([["Alice", "Bob", 1_577_934_245], ["Bob", "Carol", 1_580_000_000]]),
+        json!([
+            ["Alice", "Bob", 1_577_934_245],
+            ["Bob", "Carol", 1_580_000_000]
+        ]),
         "edge property read via annotation: {weighted}"
     );
 
@@ -145,5 +148,76 @@ async fn csv_import_plain_policy_yields_pure_rdf_edges() {
         rows["results"]["bindings"].as_array().map(Vec::len),
         Some(0),
         "plain policy keeps edges property-free: {rows}"
+    );
+}
+
+#[tokio::test]
+async fn cypher_json_emits_native_scalars_not_rdf_value_objects() {
+    // The cypher-json format: Neo4j-compatible envelope, native scalars — a
+    // `birthday:date` is a bare ISO string and a `creationDate:long` a bare
+    // number, NOT JSON-LD `{"@value":…,"@type":…}` value-objects.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/csv:cypher-json");
+    let persons = "id:ID(Person),name:string,birthday:date,:LABEL\n10,Alice,1990-11-23,Person\n";
+    let doc = csv_files_to_jsonld(&[persons], &opts()).expect("csv");
+    let l = fluree.insert(ledger0, &doc).await.expect("insert").ledger;
+    let db = graphdb_from_ledger(&l);
+
+    let res = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (p:Person {name:"Alice"}) RETURN p.name AS firstName, p.birthday AS birthday"#,
+        )
+        .await
+        .expect("query");
+
+    // cypher-json: Neo4j envelope, bare scalars (date is a plain string).
+    let cj = res
+        .to_cypher_json_async(db.as_graph_db_ref())
+        .await
+        .expect("cypher json");
+    assert_eq!(
+        cj,
+        json!({
+            "results": [{
+                "columns": ["firstName", "birthday"],
+                "data": [{ "row": ["Alice", "1990-11-23"], "meta": [null, null] }]
+            }]
+        }),
+        "{cj}"
+    );
+
+    // Contrast: JSON-LD renders the same date as an RDF value-object.
+    let jl = res
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    assert_eq!(
+        jl[0][1]["@type"].as_str().map(|s| s.ends_with("#date")),
+        Some(true),
+        "JSON-LD dates are value-objects (the snag cypher-json fixes): {jl}"
+    );
+
+    // A long renders as a bare number in cypher-json.
+    let l2 = {
+        let ledger0 = genesis_ledger(&fluree, "it/csv:cypher-json-long");
+        let doc = csv_files_to_jsonld(&[PERSONS, KNOWS], &opts()).expect("csv");
+        fluree.insert(ledger0, &doc).await.expect("insert").ledger
+    };
+    let db2 = graphdb_from_ledger(&l2);
+    let cj2 = fluree
+        .query_cypher(
+            &db2,
+            r#"MATCH (a:Person {name:"Alice"})-[r:KNOWS]->(b) RETURN r.creationDate AS since"#,
+        )
+        .await
+        .expect("query")
+        .to_cypher_json_async(db2.as_graph_db_ref())
+        .await
+        .expect("cypher json");
+    assert_eq!(
+        cj2["results"][0]["data"][0]["row"][0],
+        json!(1_577_934_245),
+        "long is a bare number: {cj2}"
     );
 }
