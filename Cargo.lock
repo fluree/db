@@ -2436,7 +2436,6 @@ dependencies = [
  "hex",
  "indicatif",
  "libc",
- "memmap2",
  "open",
  "opentelemetry",
  "opentelemetry-otlp",

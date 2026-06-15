@@ -1428,6 +1428,15 @@ impl Fluree {
     where
         R: tokio::io::AsyncRead + Unpin + Send,
     {
+        // Normalize to canonical `name:branch` form up front so the ingest,
+        // content-store namespace, head finalization, and rollback all agree —
+        // callers may pass a bare `name` (the CLI does), which `create_ledger`
+        // would register as `name:main` while raw-id storage writes would land
+        // in the wrong namespace.
+        let new_ledger_id = fluree_db_core::ledger_id::normalize_ledger_id(new_ledger_id)
+            .unwrap_or_else(|_| new_ledger_id.to_string());
+        let new_ledger_id = new_ledger_id.as_str();
+
         // Create the empty target first. `create_ledger` errors if the name is
         // already taken — callers map that to a 409 / usage error.
         self.create_ledger(new_ledger_id).await?;

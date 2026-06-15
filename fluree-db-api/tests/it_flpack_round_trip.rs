@@ -582,6 +582,68 @@ async fn flpack_restore_ledger_api_round_trip() {
     assert_eq!(dst_json.as_array().expect("array").len(), 2);
 }
 
+/// Restoring under a bare name (no `:branch` suffix) must normalize to
+/// `name:main` consistently across ingest, head finalization, and load.
+#[tokio::test]
+async fn flpack_restore_bare_name_normalizes_to_main() {
+    let src_dir = tempfile::TempDir::new().expect("src tempdir");
+    let dst_dir = tempfile::TempDir::new().expect("dst tempdir");
+
+    let src_ledger = "flpack-test/bare-source:main";
+    let src_fluree = FlureeBuilder::file(src_dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build source");
+    let src_db = fluree_db_core::LedgerSnapshot::genesis(src_ledger);
+    let src_state = fluree_db_api::LedgerState::new(src_db, fluree_db_api::Novelty::new(0));
+    let insert = json!({
+        "@context": {"ex": "http://example.org/ns/"},
+        "@id": "ex:test", "ex:value": "hello"
+    });
+    src_fluree.insert(src_state, &insert).await.expect("insert");
+    let pack_bytes = export_ledger_to_bytes(&src_fluree, src_ledger).await;
+
+    let dst_fluree = FlureeBuilder::file(dst_dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build destination");
+    let mut reader = std::io::Cursor::new(pack_bytes);
+    // Bare name — no ":main".
+    let result = dst_fluree
+        .restore_ledger("bare-restored", &mut reader)
+        .await
+        .expect("restore_ledger with bare name");
+    assert_eq!(result.ledger_id, "bare-restored:main");
+    assert_eq!(result.commit_t, 1);
+
+    // The commit head was finalized under the *normalized* name (proving the
+    // ingest namespace, content-store, and head-set all agreed on it).
+    let rec = dst_fluree
+        .nameservice()
+        .lookup("bare-restored:main")
+        .await
+        .expect("lookup")
+        .expect("record exists under normalized name");
+    assert_eq!(rec.commit_t, 1, "commit head set under bare-restored:main");
+
+    // And it loads + queries under the normalized id.
+    let handle = dst_fluree
+        .ledger("bare-restored:main")
+        .await
+        .expect("load restored ledger");
+    let q = json!({
+        "select": ["?v"],
+        "where": { "@id": "ex:test", "ex:value": "?v" },
+        "@context": {"ex": "http://example.org/ns/"}
+    });
+    let db = fluree_db_api::GraphDb::from_ledger_state(&handle);
+    let out = dst_fluree
+        .query(&db, &q)
+        .await
+        .expect("query")
+        .to_jsonld(&handle.snapshot)
+        .expect("to_jsonld");
+    assert_eq!(out.as_array().expect("array").len(), 1);
+}
+
 /// A truncated archive (missing the End frame) must fail and leave no ledger
 /// behind — the half-created ledger is rolled back.
 #[tokio::test]

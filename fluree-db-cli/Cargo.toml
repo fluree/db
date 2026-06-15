@@ -102,9 +102,6 @@ urlencoding = { workspace = true }
 percent-encoding = "2"
 open = "5"
 
-# Memory-mapped file I/O (flpack import)
-memmap2 = "0.9"
-
 # Sync command dependencies
 fluree-db-nameservice-sync = { path = "../fluree-db-nameservice-sync" }
 async-trait.workspace = true
