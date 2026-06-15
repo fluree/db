@@ -76,9 +76,10 @@ The `commit` query parameter accepts the same identifiers as the local `fluree s
 ### `fluree create <ledger> --remote <name>` (admin-protected)
 
 - `POST {api_base_url}/create` with `{"ledger": "<ledger>"}` (empty ledger), **or**
-- `POST {api_base_url}/import/*ledger` with a raw `.flpack` body (when `--from <archive>.flpack` is also given — see [Ledger Import Contract](#ledger-import-contract))
+- `POST {api_base_url}/import/*ledger` with a raw `.flpack` body (when `--from <archive>.flpack` is given — see [Ledger Import Contract](#ledger-import-contract)), **or**
+- the `/import-upload` handshake when the server is size-capped (see [Negotiated Upload Import Contract](#negotiated-upload-import-contract))
 
-With no `--from`, creates an **empty** ledger on the remote server. With `--from <archive>.flpack`, the CLI streams the archive to the import endpoint to restore a full ledger remotely (commits + txns + prebuilt index) under the given name. The CLI still rejects `--remote` together with a **non-`.flpack`** `--from`, or with `--memory` (those bulk-import paths require local data ingestion); for those, populate locally then run `fluree publish <remote> <ledger>` (which calls `/exists`, `/create`, and `/push` in sequence), or export to `.flpack` first.
+With no `--from`, creates an **empty** ledger on the remote server. With `--from <archive>.flpack`, the CLI restores a full ledger remotely (commits + txns + prebuilt index) under the given name — streaming directly to `POST /import` by default, or via the negotiated out-of-band upload when the server advertises a body-size cap below the archive. The CLI still rejects `--remote` together with a **non-`.flpack`** `--from`, or with `--memory` (those bulk-import paths require local data ingestion); for those, populate locally then run `fluree publish <remote> <ledger>` (which calls `/exists`, `/create`, and `/push` in sequence), or export to `.flpack` first.
 
 `--remote` does not touch local state — neither the active-ledger pointer nor the local storage tree. The CLI does not require a project-local `.fluree/` for `create --remote`; it falls back to global config (`$FLUREE_HOME` or the platform default) for remote registration lookups. Auto-routing through a local server is **not** done for `create`; you must pass `--remote <name>` explicitly. Without `--remote`, `fluree create` is local-only and does require a project `.fluree/`.
 
