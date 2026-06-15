@@ -502,6 +502,132 @@ async fn flpack_export_import_round_trip_with_index() {
         .await;
 }
 
+/// Round-trip through the public streaming API: export → `restore_ledger`
+/// (the path the CLI and server both use) reading from an in-memory stream.
+#[tokio::test]
+async fn flpack_restore_ledger_api_round_trip() {
+    let src_dir = tempfile::TempDir::new().expect("src tempdir");
+    let dst_dir = tempfile::TempDir::new().expect("dst tempdir");
+
+    let src_ledger = "flpack-test/api-source:main";
+    let dst_ledger = "flpack-test/api-restored:main";
+
+    let src_fluree = FlureeBuilder::file(src_dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build source");
+
+    let src_db = fluree_db_core::LedgerSnapshot::genesis(src_ledger);
+    let src_state = fluree_db_api::LedgerState::new(src_db, fluree_db_api::Novelty::new(0));
+
+    let insert_data = json!({
+        "@context": { "ex": "http://example.org/ns/", "schema": "http://schema.org/" },
+        "@graph": [
+            { "@id": "ex:alice", "@type": "ex:User", "schema:name": "Alice" },
+            { "@id": "ex:bob", "@type": "ex:User", "schema:name": "Bob" }
+        ]
+    });
+    let committed = src_fluree
+        .insert(src_state, &insert_data)
+        .await
+        .expect("insert");
+    assert_eq!(committed.receipt.t, 1);
+
+    let query = json!({
+        "select": ["?name"],
+        "where": { "@id": "?s", "@type": "ex:User", "schema:name": "?name" },
+        "orderBy": "?name",
+        "@context": { "ex": "http://example.org/ns/", "schema": "http://schema.org/" }
+    });
+    let src_db = fluree_db_api::GraphDb::from_ledger_state(&committed.ledger);
+    let src_json = src_fluree
+        .query(&src_db, &query)
+        .await
+        .expect("src query")
+        .to_jsonld(&committed.ledger.snapshot)
+        .expect("src to_jsonld");
+
+    let pack_bytes = export_ledger_to_bytes(&src_fluree, src_ledger).await;
+
+    // Restore via the public streaming API, reading from an in-memory cursor
+    // (stands in for a file/S3/HTTP `AsyncRead`). `restore_ledger` creates the
+    // target ledger itself, so we do not pre-create it.
+    let dst_fluree = FlureeBuilder::file(dst_dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build destination");
+
+    let mut reader = std::io::Cursor::new(pack_bytes);
+    let result = dst_fluree
+        .restore_ledger(dst_ledger, &mut reader)
+        .await
+        .expect("restore_ledger");
+    assert_eq!(result.commits, 1, "one commit restored");
+    assert_eq!(result.commit_t, 1);
+
+    let dst_handle = dst_fluree
+        .ledger(dst_ledger)
+        .await
+        .expect("load restored ledger");
+    let dst_db = fluree_db_api::GraphDb::from_ledger_state(&dst_handle);
+    let dst_json = dst_fluree
+        .query(&dst_db, &query)
+        .await
+        .expect("dst query")
+        .to_jsonld(&dst_handle.snapshot)
+        .expect("dst to_jsonld");
+
+    assert_eq!(
+        src_json, dst_json,
+        "query results should match after restore_ledger round-trip"
+    );
+    assert_eq!(dst_json.as_array().expect("array").len(), 2);
+}
+
+/// A truncated archive (missing the End frame) must fail and leave no ledger
+/// behind — the half-created ledger is rolled back.
+#[tokio::test]
+async fn flpack_restore_rolls_back_on_truncated_stream() {
+    let dst_dir = tempfile::TempDir::new().expect("dst tempdir");
+    let src_dir = tempfile::TempDir::new().expect("src tempdir");
+    let src_ledger = "flpack-test/rollback-source:main";
+    let dst_ledger = "flpack-test/rollback-restored:main";
+
+    let src_fluree = FlureeBuilder::file(src_dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build source");
+    let src_db = fluree_db_core::LedgerSnapshot::genesis(src_ledger);
+    let src_state = fluree_db_api::LedgerState::new(src_db, fluree_db_api::Novelty::new(0));
+    let insert = json!({
+        "@context": {"ex": "http://example.org/ns/"},
+        "@id": "ex:test", "ex:value": "hello"
+    });
+    src_fluree.insert(src_state, &insert).await.expect("insert");
+
+    let mut pack_bytes = export_ledger_to_bytes(&src_fluree, src_ledger).await;
+    // Lop off the trailing End frame (and a bit more) to simulate truncation.
+    pack_bytes.truncate(pack_bytes.len() / 2);
+
+    let dst_fluree = FlureeBuilder::file(dst_dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build destination");
+    let mut reader = std::io::Cursor::new(pack_bytes);
+    let err = dst_fluree.restore_ledger(dst_ledger, &mut reader).await;
+    assert!(err.is_err(), "truncated archive should fail");
+
+    // Rollback hard-drops the half-created ledger. A drop leaves a retracted
+    // tombstone rather than purging the nameservice entry, so the guarantee is
+    // "no live ledger": the record is either absent or marked retracted (never
+    // a queryable head pointing at partially-ingested data).
+    let record = dst_fluree
+        .nameservice()
+        .lookup(dst_ledger)
+        .await
+        .expect("lookup");
+    assert!(
+        record.is_none_or(|r| r.retracted),
+        "failed restore must leave no live ledger (rolled back / retracted)"
+    );
+}
+
 /// Verify that the pack stream can be decoded frame-by-frame.
 #[tokio::test]
 async fn flpack_stream_structure_is_valid() {

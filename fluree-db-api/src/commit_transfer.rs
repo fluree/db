@@ -53,6 +53,73 @@ impl Base64Bytes {
     }
 }
 
+/// Summary of a `.flpack` restore — the import counterpart of
+/// [`Fluree::archive_ledger`]'s [`crate::pack::PackStreamResult`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RestoreResult {
+    /// Name the ledger was restored under (independent of the source name).
+    pub ledger_id: String,
+    /// Commit blobs ingested.
+    pub commits: usize,
+    /// Transaction blobs ingested.
+    pub txn_blobs: usize,
+    /// Index artifact blobs ingested (0 for a commits-only archive).
+    pub index_artifacts: usize,
+    /// `t` the restored commit head was set to.
+    pub commit_t: i64,
+    /// `t` the restored index head was set to, when the archive carried one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub index_t: Option<i64>,
+}
+
+/// Verify a single CAS object from a `.flpack` data frame and write it to
+/// storage under `ledger_id`.
+///
+/// Mirrors the integrity rules the pull path uses: a commit-v2 blob hashes
+/// over its canonical sub-range (so the digest is derived via
+/// `verify_commit_blob`), while every other content kind is a full-bytes
+/// SHA-256 verified against the CID. Reimplemented here (rather than reusing
+/// `fluree-db-nameservice-sync::ingest_pack_frame`) so the API lib does not
+/// pull that crate's `reqwest` tree out of dev-dependencies.
+async fn ingest_cas_object<S: ContentAddressedWrite>(
+    storage: &S,
+    cid: &ContentId,
+    bytes: &[u8],
+    ledger_id: &str,
+) -> Result<()> {
+    use fluree_db_core::commit::codec::verify_commit_blob;
+
+    let kind = cid
+        .content_kind()
+        .ok_or_else(|| ApiError::http(400, format!("unknown content kind for CID {cid}")))?;
+
+    let is_commit_v2 = cid.codec() == CODEC_FLUREE_COMMIT && bytes.starts_with(b"FCV2");
+    let integrity_ok = if is_commit_v2 {
+        verify_commit_blob(bytes).map(|d| d == *cid).unwrap_or(false)
+    } else {
+        cid.verify(bytes)
+    };
+    if !integrity_ok {
+        return Err(ApiError::http(400, format!("integrity check failed for {cid}")));
+    }
+
+    // Commit-v2 blobs persist under their canonical (sub-range) digest; all
+    // other kinds use the CID digest directly.
+    let digest_hex = if kind == ContentKind::Commit {
+        verify_commit_blob(bytes).map(|d| d.digest_hex()).map_err(|e| {
+            ApiError::internal(format!("failed to derive commit digest for {cid}: {e}"))
+        })?
+    } else {
+        cid.digest_hex()
+    };
+
+    storage
+        .content_write_bytes_with_hash(kind, ledger_id, &digest_hex, bytes)
+        .await
+        .map_err(|e| ApiError::internal(format!("failed to write {cid}: {e}")))?;
+    Ok(())
+}
+
 impl Serialize for Base64Bytes {
     fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
     where
@@ -1332,6 +1399,264 @@ impl Fluree {
                 ),
             )),
         }
+    }
+
+    /// Restore a ledger from a `.flpack` archive stream, creating a new
+    /// ledger under `new_ledger_id`.
+    ///
+    /// This is the wholesale-restore counterpart of [`Fluree::archive_ledger`]:
+    /// it streams pack frames from `reader` — a file, an HTTP body, an S3
+    /// `GetObject` body, anything `AsyncRead` — verifies each CAS object's
+    /// integrity, writes it to storage, and finalizes the commit (and, when
+    /// present, index) head from the embedded `phase: "nameservice"` manifest.
+    /// Unlike the push path it does **not** re-validate or replay commits; the
+    /// archive is trusted byte-for-byte (every frame is SHA-256 verified) and
+    /// the prebuilt index rides along, so the restored ledger is immediately
+    /// queryable.
+    ///
+    /// The new name is independent of the source ledger's name — CAS objects
+    /// are content-addressed, so only the nameservice pointer uses the name.
+    ///
+    /// On any failure after the empty ledger is created, the half-created
+    /// ledger is hard-dropped so a partial restore never leaves a head
+    /// pointing at incompletely-ingested data.
+    pub async fn restore_ledger<R>(
+        &self,
+        new_ledger_id: &str,
+        reader: &mut R,
+    ) -> Result<RestoreResult>
+    where
+        R: tokio::io::AsyncRead + Unpin + Send,
+    {
+        // Create the empty target first. `create_ledger` errors if the name is
+        // already taken — callers map that to a 409 / usage error.
+        self.create_ledger(new_ledger_id).await?;
+
+        match self.restore_into_created(new_ledger_id, reader).await {
+            Ok(result) => Ok(result),
+            Err(e) => {
+                // Roll back so we never leave a ledger whose head points at
+                // partially-ingested data. `restore_ledger` only reaches here
+                // after `create_ledger` succeeded, which means the name did not
+                // previously exist — so dropping the whole name removes only
+                // what this restore created, never a pre-existing sibling.
+                // Soft drop (retract the nameservice pointer) is the right
+                // rollback: it cannot fail on file deletion, and any CAS blobs
+                // already written are harmless content-addressed orphans (a
+                // retry rewrites identical bytes; GC reclaims them otherwise).
+                // `drop_ledger` takes the bare name, so strip the branch suffix.
+                match fluree_db_core::ledger_id::split_ledger_id(new_ledger_id) {
+                    Ok((name, _branch)) => {
+                        if let Err(drop_err) =
+                            self.drop_ledger(&name, crate::DropMode::Soft).await
+                        {
+                            error!(
+                                ledger = %new_ledger_id,
+                                error = %drop_err,
+                                "failed to roll back partially-restored ledger after restore error"
+                            );
+                        }
+                    }
+                    Err(parse_err) => {
+                        error!(
+                            ledger = %new_ledger_id,
+                            error = %parse_err,
+                            "could not parse ledger id to roll back partially-restored ledger"
+                        );
+                    }
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// Stream-decode a `.flpack` into the already-created `new_ledger_id` and
+    /// finalize its heads. Split out from [`Fluree::restore_ledger`] so the
+    /// caller can roll back on any error returned here.
+    async fn restore_into_created<R>(
+        &self,
+        new_ledger_id: &str,
+        reader: &mut R,
+    ) -> Result<RestoreResult>
+    where
+        R: tokio::io::AsyncRead + Unpin + Send,
+    {
+        use fluree_db_core::pack::{
+            decode_frame, read_stream_preamble, PackError, PackFrame, DEFAULT_MAX_PAYLOAD,
+            PREAMBLE_SIZE,
+        };
+        use tokio::io::AsyncReadExt as _;
+
+        let storage = self.backend().admin_storage_cloned().ok_or_else(|| {
+            ApiError::config("restore_ledger requires a managed storage backend")
+        })?;
+
+        // Frames are decoded out of a growing byte buffer; `read` appends and
+        // `drain` consumes whole frames as they complete. Never holds more than
+        // one in-flight frame plus the unparsed tail.
+        let mut buf: Vec<u8> = Vec::with_capacity(64 * 1024);
+        let mut read_chunk = [0u8; 64 * 1024];
+        let mut preamble_consumed = false;
+        let mut saw_header = false;
+        let mut ended = false;
+        let mut commits = 0usize;
+        let mut txn_blobs = 0usize;
+        let mut index_artifacts = 0usize;
+        let mut ns_manifest: Option<serde_json::Value> = None;
+
+        'read: loop {
+            // Strip the preamble once enough bytes have arrived.
+            if !preamble_consumed && buf.len() >= PREAMBLE_SIZE {
+                read_stream_preamble(&buf).map_err(|e| {
+                    ApiError::http(400, format!("invalid .flpack preamble: {e}"))
+                })?;
+                buf.drain(..PREAMBLE_SIZE);
+                preamble_consumed = true;
+            }
+
+            // Drain every complete frame currently in the buffer.
+            if preamble_consumed {
+                loop {
+                    match decode_frame(&buf, DEFAULT_MAX_PAYLOAD) {
+                    Ok((frame, consumed)) => {
+                        match frame {
+                            PackFrame::Header(_) => {
+                                if saw_header {
+                                    return Err(ApiError::http(
+                                        400,
+                                        "invalid .flpack: duplicate Header frame",
+                                    ));
+                                }
+                                saw_header = true;
+                            }
+                            PackFrame::Data { cid, payload } => {
+                                if !saw_header {
+                                    return Err(ApiError::http(
+                                        400,
+                                        "invalid .flpack: Data frame before Header",
+                                    ));
+                                }
+                                ingest_cas_object(&storage, &cid, &payload, new_ledger_id)
+                                    .await?;
+                                match cid.content_kind() {
+                                    Some(ContentKind::Commit) => commits += 1,
+                                    Some(ContentKind::Txn) => txn_blobs += 1,
+                                    _ => index_artifacts += 1,
+                                }
+                            }
+                            PackFrame::Manifest(json) => {
+                                if json.get("phase").and_then(|v| v.as_str())
+                                    == Some("nameservice")
+                                {
+                                    ns_manifest = Some(json);
+                                }
+                            }
+                            PackFrame::Error(msg) => {
+                                return Err(ApiError::http(
+                                    400,
+                                    format!(".flpack contains error frame: {msg}"),
+                                ));
+                            }
+                            PackFrame::End => {
+                                ended = true;
+                                break 'read;
+                            }
+                        }
+                            buf.drain(..consumed);
+                        }
+                        // Not enough bytes for the next frame yet — go read more.
+                        Err(PackError::Incomplete(_)) => break,
+                        Err(e) => {
+                            return Err(ApiError::http(
+                                400,
+                                format!("invalid .flpack frame: {e}"),
+                            ));
+                        }
+                    }
+                }
+            }
+
+            let n = reader.read(&mut read_chunk).await.map_err(|e| {
+                ApiError::internal(format!("error reading .flpack stream: {e}"))
+            })?;
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&read_chunk[..n]);
+        }
+
+        if !saw_header {
+            return Err(ApiError::http(400, "invalid .flpack: no Header frame"));
+        }
+        if !ended {
+            return Err(ApiError::http(
+                400,
+                "unexpected end of .flpack stream (missing End frame)",
+            ));
+        }
+
+        let manifest = ns_manifest.ok_or_else(|| {
+            ApiError::http(
+                400,
+                ".flpack is missing its nameservice manifest — cannot determine commit/index heads",
+            )
+        })?;
+
+        // Resolve the head CIDs from the manifest, then verify they were
+        // actually ingested before pointing the nameservice at them — a
+        // truncated or mismatched archive must not yield a dangling head.
+        let content = self.content_store(new_ledger_id);
+
+        let commit_head_id = manifest
+            .get("commit_head_id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                ApiError::http(400, ".flpack manifest is missing commit_head_id")
+            })?;
+        let commit_cid: ContentId = commit_head_id
+            .parse()
+            .map_err(|e| ApiError::http(400, format!("invalid commit CID in manifest: {e}")))?;
+        if !content.has(&commit_cid).await.unwrap_or(false) {
+            return Err(ApiError::http(
+                400,
+                format!(".flpack manifest names commit head {commit_cid} that the archive did not contain"),
+            ));
+        }
+        let commit_t = manifest
+            .get("commit_t")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(0);
+
+        let handle = self.ledger_cached(new_ledger_id).await?;
+        self.set_commit_head(&handle, &commit_cid, commit_t).await?;
+
+        let mut index_t_out = None;
+        if let Some(index_cid_str) = manifest.get("index_head_id").and_then(|v| v.as_str()) {
+            let index_cid: ContentId = index_cid_str
+                .parse()
+                .map_err(|e| ApiError::http(400, format!("invalid index CID in manifest: {e}")))?;
+            if !content.has(&index_cid).await.unwrap_or(false) {
+                return Err(ApiError::http(
+                    400,
+                    format!(".flpack manifest names index head {index_cid} that the archive did not contain"),
+                ));
+            }
+            let index_t = manifest
+                .get("index_t")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(0);
+            self.set_index_head(&handle, &index_cid, index_t).await?;
+            index_t_out = Some(index_t);
+        }
+
+        Ok(RestoreResult {
+            ledger_id: new_ledger_id.to_string(),
+            commits,
+            txn_blobs,
+            index_artifacts,
+            commit_t,
+            index_t: index_t_out,
+        })
     }
 
     /// Incrementally import commits (pull path).
