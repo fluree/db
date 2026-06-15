@@ -1504,12 +1504,26 @@ fn subquery_correlation_vars(
     }
     // Variables the subquery binds in EVERY solution on its own — but only when
     // no inner slice makes per-row seeding result-sensitive. Restricted to
-    // top-level required producers (triples / property paths) so a var that is
-    // only conditionally bound (UNION branch, OPTIONAL) is NOT declassified.
+    // top-level UNCONDITIONAL producers so a var that is only conditionally
+    // bound (UNION branch, OPTIONAL) is NOT declassified. Besides triples /
+    // property paths this must include the WITH-pipeline binders — UNWIND, BIND,
+    // VALUES — otherwise a var the subquery produces via one of them is
+    // mistaken for an external correlation, the subquery is deferred on a var
+    // only it can bind (so it never becomes ready and is placed last), and a
+    // consuming OPTIONAL/Filter runs first uncorrelated, clobbering that var.
     let self_produced: HashSet<VarId> = if sq.limit.is_none() && sq.offset.is_none() {
         sq.patterns
             .iter()
-            .filter(|p| matches!(p, Pattern::Triple(_) | Pattern::PropertyPath(_)))
+            .filter(|p| {
+                matches!(
+                    p,
+                    Pattern::Triple(_)
+                        | Pattern::PropertyPath(_)
+                        | Pattern::Unwind { .. }
+                        | Pattern::Bind { .. }
+                        | Pattern::Values { .. }
+                )
+            })
             .flat_map(Pattern::produced_vars)
             .collect()
     } else {

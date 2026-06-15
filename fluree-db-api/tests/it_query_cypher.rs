@@ -3027,6 +3027,95 @@ async fn cypher_ic14_weighted_paths() {
 }
 
 #[tokio::test]
+async fn cypher_ic14_faithful_ldbc_weight() {
+    // Faithful LDBC SNB IC14: bidirectional KNOWS shortest paths, weighted by
+    // reply interactions between path-adjacent persons. A Comment replying to a
+    // Post = 1.0; a Comment replying to a Comment = 0.5; both directions count.
+    // The four interaction patterns per pair are independent OPTIONAL MATCHes —
+    // count(DISTINCT c) avoids the cross-product over-count between them.
+    //
+    // KNOWS diamond (undirected): p0-p1-p3 and p0-p2-p3.
+    //   (p0,p1): p0's Comment replies to p1's Post                  → 1.0
+    //   (p1,p3): p1's Comment replies to p3's Comment (0.5) AND
+    //            p3's Comment (base_p3) replies to p1's Post (1.0)  → 1.5
+    //     path p0-p1-p3 weight = 2.5  → ranks first (bidirectional pair)
+    //   (p0,p2): none                                               → 0.0
+    //   (p2,p3): two of p3's Comments reply to p2's Posts           → 2.0
+    //     path p0-p2-p3 weight = 2.0
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/cypher:ic14-faithful");
+    let person = |id: &str, knows: JsonValue| {
+        json!({"@id": format!("ex:{id}"), "@type":"ex:Person", "ex:pid": id, "ex:KNOWS": knows})
+    };
+    // Comment `c` by `creator` replying to message `target`.
+    let comment = |c: &str, creator: &str, target: &str| {
+        json!({"@id": format!("ex:{c}"), "@type":"ex:Comment",
+               "ex:HAS_CREATOR":{"@id":format!("ex:{creator}")},
+               "ex:REPLY_OF":{"@id":format!("ex:{target}")}})
+    };
+    let message = |m: &str, ty: &str, creator: &str| {
+        json!({"@id": format!("ex:{m}"), "@type": format!("ex:{ty}"),
+               "ex:HAS_CREATOR":{"@id":format!("ex:{creator}")}})
+    };
+    let graph = json!([
+        person("p0", json!([{"@id":"ex:p1"},{"@id":"ex:p2"}])),
+        person("p1", json!([{"@id":"ex:p3"}])),
+        person("p2", json!([{"@id":"ex:p3"}])),
+        person("p3", json!([])),
+        // (p0,p1): p0 comment → p1 post  (1.0)
+        message("post_p1", "Post", "p1"),
+        comment("c_p0", "p0", "post_p1"),
+        // (p1,p3): p1 comment → p3 comment (0.5)
+        comment("base_p3", "p3", "post_p1"),
+        comment("c_p1", "p1", "base_p3"),
+        // (p2,p3): two of p3's comments → p2's posts (2.0)
+        message("post_p2a", "Post", "p2"),
+        message("post_p2b", "Post", "p2"),
+        comment("c_p3a", "p3", "post_p2a"),
+        comment("c_p3b", "p3", "post_p2b"),
+    ]);
+    let l = fluree
+        .insert(ledger0, &json!({"@context": ctx(), "@graph": graph}))
+        .await
+        .expect("seed ldbc-ish graph")
+        .ledger;
+    let db = graphdb_from_ledger(&l);
+
+    let out = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (a:Person {pid:"p0"}),(z:Person {pid:"p3"})
+               MATCH p = allShortestPaths((a)-[:KNOWS*]-(z))
+               UNWIND pathPairs(p) AS pair
+               WITH p, pair[0] AS x, pair[1] AS y
+               OPTIONAL MATCH (x)<-[:HAS_CREATOR]-(cp1:Comment)-[:REPLY_OF]->(:Post)-[:HAS_CREATOR]->(y)
+               OPTIONAL MATCH (x)<-[:HAS_CREATOR]-(cc1:Comment)-[:REPLY_OF]->(:Comment)-[:HAS_CREATOR]->(y)
+               OPTIONAL MATCH (y)<-[:HAS_CREATOR]-(cp2:Comment)-[:REPLY_OF]->(:Post)-[:HAS_CREATOR]->(x)
+               OPTIONAL MATCH (y)<-[:HAS_CREATOR]-(cc2:Comment)-[:REPLY_OF]->(:Comment)-[:HAS_CREATOR]->(x)
+               WITH p, x, y,
+                    count(DISTINCT cp1) * 1.0 + count(DISTINCT cc1) * 0.5 +
+                    count(DISTINCT cp2) * 1.0 + count(DISTINCT cc2) * 0.5 AS pairWeight
+               WITH p, sum(pairWeight) AS pathWeight
+               UNWIND nodes(p) AS pn
+               RETURN collect(pn.pid) AS personIdsInPath, pathWeight
+               ORDER BY pathWeight DESC"#,
+        )
+        .await
+        .expect("ic14 faithful")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    assert_eq!(
+        out,
+        json!([
+            [["p0", "p1", "p3"], 2.5],
+            [["p0", "p2", "p3"], 2.0],
+        ]),
+        "LDBC IC14 weighted paths, descending: {out}"
+    );
+}
+
+#[tokio::test]
 async fn cypher_ic14_paths_as_name_lists() {
     // IC14 core, full form: every shortest connection path between two persons,
     // returned as a list of the persons' names — `UNWIND nodes(p)` + per-path
