@@ -2936,3 +2936,48 @@ async fn cypher_unwind_single_path_collect() {
         "the path as a name list: {out}"
     );
 }
+
+#[tokio::test]
+async fn cypher_var_length_relationship_uniqueness_allows_cycle_closure() {
+    // Directed triangle A→B→C→A. A 3-hop path back to A (A-B-C-A) reuses no
+    // edge, so relationship-uniqueness allows it (Neo4j parity) — node-
+    // uniqueness wrongly excluded it (revisits node A).
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/cypher:triangle");
+    let l = fluree
+        .insert(
+            ledger0,
+            &json!({"@context": ctx(), "@graph": [
+                {"@id":"ex:a","@type":"ex:Person","ex:name":"A","ex:KNOWS":{"@id":"ex:b"}},
+                {"@id":"ex:b","@type":"ex:Person","ex:name":"B","ex:KNOWS":{"@id":"ex:c"}},
+                {"@id":"ex:c","@type":"ex:Person","ex:name":"C","ex:KNOWS":{"@id":"ex:a"}},
+            ]}),
+        )
+        .await
+        .expect("seed triangle")
+        .ledger;
+    let db = graphdb_from_ledger(&l);
+
+    // A 3-hop directed cycle returns A to itself.
+    let cycle = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (a:Person {name:"A"})-[:KNOWS*3..3]->(a) RETURN a.name AS n"#,
+        )
+        .await
+        .expect("cycle closure")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    assert_eq!(cycle[0][0], json!("A"), "3-hop cycle A-B-C-A closes: {cycle}");
+
+    // But a 2-hop out-and-back over one edge reuses that edge → excluded.
+    let back = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (a:Person {name:"A"})-[:KNOWS*2..2]-(a) RETURN a.name AS n"#,
+        )
+        .await
+        .expect("out-and-back");
+    assert_eq!(back.row_count(), 0, "2-hop out-and-back reuses an edge → excluded");
+}

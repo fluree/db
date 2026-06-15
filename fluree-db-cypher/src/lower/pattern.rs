@@ -425,14 +425,14 @@ fn lower_var_length_rel<E: IriEncoder>(
 /// nodes, each hop honoring `direction`. Uses string-IRI predicate triples so
 /// an absent relationship type yields no rows rather than erroring.
 ///
-/// For `k ≥ 2` a node-distinctness `Filter` is appended so the walk can't
-/// revisit a node — approximating Cypher's relationship-uniqueness rule (no
-/// edge reused on a walk). This eliminates the edge-reuse artifacts on cyclic /
-/// undirected graphs (spurious self-rows from `a-b-a`, back-and-forth path
-/// multiplicity). It is *node*-uniqueness, slightly stricter than Cypher's
-/// relationship-uniqueness: it also excludes paths that revisit a node via
-/// different edges. For distinct-endpoint aggregation (the LDBC norm) the
-/// results match Neo4j; raw path-multiplicity counts can differ.
+/// For `k ≥ 2` a **relationship-uniqueness** `Filter` is appended so the walk
+/// can't reuse a relationship — Cypher's actual rule (no edge traversed twice;
+/// a node *may* be revisited via different edges). This matches Neo4j on cyclic
+/// graphs: a triangle closure `a-b-c-a` is allowed (three distinct edges),
+/// while an out-and-back `a-b-a` over one edge is excluded (the edge would be
+/// reused). The filter compares consecutive-node *pairs* (edges); for an
+/// undirected hop an edge is the unordered pair, so the reverse orientation is
+/// forbidden too.
 fn build_fixed_chain<E: IriEncoder>(
     ctx: &mut LoweringContext<'_, E>,
     s: &Ref,
@@ -455,34 +455,29 @@ fn build_fixed_chain<E: IriEncoder>(
         prev = next;
     }
     if k >= 2 {
-        if let Some(filter) = node_distinctness_filter(&nodes) {
+        if let Some(filter) = relationship_distinctness_filter(&nodes, direction) {
             chain.push(filter);
         }
     }
     Ok(chain)
 }
 
-/// A `Filter` requiring every node in a walk to be pairwise distinct
-/// (`a != b` AND … for all pairs). Returns `None` when there's nothing to
-/// constrain (fewer than two comparable nodes). Pairs of the same variable, or
-/// nodes that aren't a variable/SID, are skipped.
-///
-/// LIMITATION: when the two path *endpoints* are the same variable
-/// (`(a)-[:T*2]-(a)`), that pair is skipped (they're intentionally bound
-/// equal), so an out-and-back walk over one undirected edge isn't excluded.
-/// Full relationship-uniqueness (compare edge identities) would handle it; the
-/// case is uncommon (LDBC traverses between *distinct* persons).
-fn node_distinctness_filter(nodes: &[Ref]) -> Option<Pattern> {
+/// A `Filter` enforcing Cypher relationship-uniqueness: every pair of hops on
+/// the walk must be a *different* edge. Each edge `i` spans `nodes[i]..nodes[i+1]`;
+/// two edges are the same when their endpoint nodes match (ordered for a
+/// directed hop, unordered for an undirected one). Equalities evaluate at
+/// runtime, so `nodes[i] != nodes[j]` over the same variable is simply `false`
+/// — no static analysis is needed. Returns `None` with fewer than two edges.
+fn relationship_distinctness_filter(nodes: &[Ref], direction: Direction) -> Option<Pattern> {
+    let edge_count = nodes.len().saturating_sub(1);
+    if edge_count < 2 {
+        return None;
+    }
     let mut conds: Vec<Expression> = Vec::new();
-    for i in 0..nodes.len() {
-        for j in (i + 1)..nodes.len() {
-            if let (Ref::Var(a), Ref::Var(b)) = (&nodes[i], &nodes[j]) {
-                if a == b {
-                    continue;
-                }
-            }
-            if let (Some(a), Some(b)) = (ref_to_expr(&nodes[i]), ref_to_expr(&nodes[j])) {
-                conds.push(Expression::ne(a, b));
+    for i in 0..edge_count {
+        for j in (i + 1)..edge_count {
+            if let Some(c) = edges_differ(nodes, i, j, direction) {
+                conds.push(c);
             }
         }
     }
@@ -490,6 +485,36 @@ fn node_distinctness_filter(nodes: &[Ref]) -> Option<Pattern> {
     let first = iter.next()?;
     let combined = iter.fold(first, |acc, c| Expression::binary(Function::And, acc, c));
     Some(Pattern::Filter(combined))
+}
+
+/// "Edge `i` and edge `j` are different relationships." Directed: distinct
+/// ordered `(source, target)` pairs. Undirected: distinct *unordered* pairs
+/// (the reverse orientation is the same edge, so it's forbidden too).
+fn edges_differ(nodes: &[Ref], i: usize, j: usize, direction: Direction) -> Option<Expression> {
+    let (si, ti) = (&nodes[i], &nodes[i + 1]);
+    let (sj, tj) = (&nodes[j], &nodes[j + 1]);
+    let forward = ne_or(si, sj, ti, tj)?; // (si != sj) OR (ti != tj)
+    match direction {
+        Direction::Either => {
+            let reverse = ne_or(si, tj, ti, sj)?; // (si != tj) OR (ti != sj)
+            Some(Expression::binary(Function::And, forward, reverse))
+        }
+        _ => Some(forward),
+    }
+}
+
+/// `(a != b) OR (c != d)`, skipping any comparison whose refs aren't
+/// comparable (only IRI refs, which don't arise on the var-length chain).
+fn ne_or(a: &Ref, b: &Ref, c: &Ref, d: &Ref) -> Option<Expression> {
+    let pair = |x: &Ref, y: &Ref| match (ref_to_expr(x), ref_to_expr(y)) {
+        (Some(ex), Some(ey)) => Some(Expression::ne(ex, ey)),
+        _ => None,
+    };
+    match (pair(a, b), pair(c, d)) {
+        (Some(l), Some(r)) => Some(Expression::binary(Function::Or, l, r)),
+        (Some(x), None) | (None, Some(x)) => Some(x),
+        (None, None) => None,
+    }
 }
 
 fn ref_to_expr(r: &Ref) -> Option<Expression> {

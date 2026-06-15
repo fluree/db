@@ -119,7 +119,7 @@ ORDER BY / SKIP / LIMIT
   filter.
 - Variable-length paths `-[:T*]->`, `-[:T*m..n]->` (unbounded reuses
   the transitive `PropertyPath` operator; bounded ranges expand to a
-  `Union` of fixed-length chains with node-distinctness filters).
+  `Union` of fixed-length chains with relationship-uniqueness filters).
 - Undirected relationships `-[:T]-` (forward ∪ reverse `Union`).
 - Path finding: `MATCH p = shortestPath((a)-[:T*]-(b))` and
   `allShortestPaths(...)`. Anchored (both endpoints bound by a

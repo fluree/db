@@ -155,7 +155,7 @@ this plan.
 | Relationship variable `-[r]->` binds | The annotation SID. Only matches relationships that have a reifier bundle — see "Relationship lowering rule" below. |
 | Parallel relationships | Two annotation SIDs attached to the same `(s, p, o)` edge key. Already supported (multimap forward attachment index). |
 | Undirected `-[r]-` | **Landed** — forward∪reverse `Union` (reverse via the `Opst` index). |
-| Variable-length `-[:T*1..5]->` | **Landed** (anonymous, single-typed) — see "Variable-length paths" below. **Bounded** ranges enforce node-uniqueness (no revisited node → no edge-reuse artifacts; matches Neo4j for distinct-endpoint queries). Binding a variable to the path (`-[r:T*1..5]->`, a relationship *list*) is still deferred. |
+| Variable-length `-[:T*1..5]->` | **Landed** (anonymous, single-typed) — see "Variable-length paths" below. **Bounded** ranges enforce Cypher **relationship-uniqueness** (no reused edge; a node may be revisited via different edges — triangle closures allowed, edge-reuse out-and-backs excluded; matches Neo4j on cyclic graphs). Binding a variable to the path (`-[r:T*1..5]->`, a relationship *list*) is still deferred. |
 | Path value `p = (a)-[r]->(b)-[r2]->(c)` | Free path object. **Deferred** (only `shortestPath`/`allShortestPaths`-wrapped paths bind today). |
 | `p = shortestPath((a)-[:T*]-(b))` / `allShortestPaths(...)` | **Landed** — anchored bidirectional-BFS `ShortestPathOperator` binds `p` to a `Binding::Path` node sequence; `length(p)` + `p IS NULL` supported. See "Shortest paths" below. |
 | `RETURN n, r, m` | SELECT projection. Bag semantics by default (no DISTINCT). |
@@ -299,28 +299,27 @@ Anonymous variable-length relationships are lowered (2026-06-14):
   chains (one chain per length, each with `k-1` fresh intermediate
   nodes), honoring direction — undirected hops emit a forward∪reverse
   `Union`. Capped at 16 hops. For `k ≥ 2` each chain carries a
-  **node-distinctness `Filter`** so the walk can't revisit a node.
+  **relationship-uniqueness `Filter`** so the walk can't reuse an edge.
 - **Unbounded** `-[:T*]->` / `-[:T*0..]->` reuses the existing transitive
   `PropertyPathPattern` (`*`→`OneOrMore`, `*0..`→`ZeroOrMore`). Directed
   only; unbounded-undirected and `*N..` (N>1) remain deferred.
 
-**Uniqueness (bounded).** The node-distinctness filter approximates
-Cypher's relationship-uniqueness rule (no edge reused on a walk): by
-forbidding a revisited node it eliminates the edge-reuse artifacts on
-cyclic / undirected graphs — spurious self-rows (`a-b-a`) and
-back-and-forth path multiplicity — **when the two endpoints are distinct
-variables**. For distinct-endpoint aggregation (`count(DISTINCT friend)`,
-the LDBC norm) results match Neo4j. Caveats:
+**Uniqueness (bounded).** The filter enforces Cypher's actual
+**relationship-uniqueness** rule (no edge traversed twice; a node *may*
+be revisited via different edges), comparing consecutive-node *pairs*
+(edges) rather than individual nodes — for an undirected hop an edge is
+the unordered pair, so the reverse orientation is forbidden too. This
+matches Neo4j on cyclic graphs:
 
-- It is *node*-uniqueness, slightly **stricter** than Cypher's
-  relationship-uniqueness (it also excludes a walk that revisits a node
-  via two different edges), so raw path-multiplicity counts can differ.
-- A path whose two endpoints are the **same variable**
-  (`(a)-[:T*2]-(a)`) is **not** constrained — it can still traverse an
-  undirected edge out-and-back. (Uncommon; LDBC traverses between
-  distinct persons. Full relationship-uniqueness would fix it.)
-- **Unbounded** paths (via `PropertyPathPattern`) do not yet enforce
-  uniqueness at all.
+- A triangle closure `a-b-c-a` is **allowed** (three distinct edges) —
+  node-uniqueness wrongly excluded it.
+- An out-and-back `a-b-a` over one edge is **excluded** (the edge would
+  be reused), including the same-endpoint case `(a)-[:T*2]-(a)`.
+
+`nodes[i] != nodes[j]` evaluates at runtime, so a comparison over the
+same variable is simply `false` — no static analysis. Caveat:
+**Unbounded** paths (via `PropertyPathPattern`) still enforce no
+uniqueness.
 
 **Scope vs. full Cypher.** These produce **endpoint bindings**, not
 first-class path values. Binding a variable to the path (`-[r:T*]->`, a
@@ -544,7 +543,7 @@ standard solution modifiers and a conservative expression sublanguage.**
 | `MATCH (a)-[r:T1\|T2]->(b)` | ✅ | Type alternatives via `Union`. |
 | `MATCH (a)<-[r:T]-(b)` | ✅ | Inverse direction (swap subject/object). |
 | `MATCH (a)-[:T]-(b)` (undirected) | ✅ | Forward∪reverse `Union` (reverse via the `Opst` object index). A bound rel var works for single-hop undirected. |
-| `MATCH (a)-[:T*m..n]->(b)` (bounded var-length) | ✅ | Expands to a `Union` of fixed-length join chains; honors direction incl. undirected hops. Anonymous rel only (a bound rel var binds a *list* — deferred). Each `k≥2` chain carries a **node-distinctness filter** (no revisited node), so cyclic/undirected walks don't produce edge-reuse artifacts — matches Neo4j for distinct-endpoint queries; *node*-uniqueness is slightly stricter than Cypher's relationship-uniqueness for raw path counts. |
+| `MATCH (a)-[:T*m..n]->(b)` (bounded var-length) | ✅ | Expands to a `Union` of fixed-length join chains; honors direction incl. undirected hops. Anonymous rel only (a bound rel var binds a *list* — deferred). Each `k≥2` chain carries a **relationship-uniqueness filter** (no reused edge — compares consecutive-node pairs; undirected forbids the reverse orientation too), matching Neo4j on cyclic graphs (triangle closures allowed, edge-reuse out-and-backs excluded). |
 | `MATCH (a)-[:T*]->(b)` / `*0..` (unbounded var-length) | ✅ | Reuses the transitive `PropertyPathPattern` (`*`→OneOrMore, `*0..`→ZeroOrMore). Directed only; unbounded-undirected and `*N..` (N>1) deferred. |
 | `MATCH p = shortestPath((a)-[:T*]-(b))` / `allShortestPaths(...)` | ✅ | Anchored bidirectional-BFS path search → `Pattern::ShortestPath` / `ShortestPathOperator`. Both endpoints must be bound by a preceding MATCH; single typed predicate; directed/undirected. `Single` binds one shortest path per row, `All` one row per minimal-length path. Binds `Binding::Path` (node sequence). |
 | `length(p)` | ✅ | Hop count of a path value (`Function::PathLength`); `p IS NULL` under `OPTIONAL MATCH` detects "no path" (IC13). |
@@ -698,8 +697,9 @@ reviewable.
 | M5.7 | Tests, docs, openCypher TCK subset | 🟡 Partial — lowering + end-to-end round-trip tests for the shipped surface; TCK subset not yet |
 
 Variable-length paths have since **landed** (anonymous, single-typed
-`-[:T*m..n]->` / `-[:T*]->`; endpoint-reachability semantics, not
-relationship-uniqueness compliant) — see "Variable-length paths —
+`-[:T*m..n]->` / `-[:T*]->`); **bounded** ranges are now
+relationship-uniqueness compliant (Neo4j parity on cyclic graphs),
+unbounded is endpoint-reachability — see "Variable-length paths —
 landed" in the semantic model. Bound rel-var var-length and first-class
 path values remain deferred.
 
