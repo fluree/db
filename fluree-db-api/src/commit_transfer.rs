@@ -71,6 +71,26 @@ impl Base64Bytes {
 /// the streaming reader will buffer for a single malformed frame.
 const RESTORE_MAX_FRAME_PAYLOAD: u32 = 1024 * 1024 * 1024;
 
+/// Maximum number of CAS object writes a restore keeps in flight at once.
+///
+/// A `.flpack` for a large ledger holds tens of thousands of CAS objects
+/// (e.g. DBLP: ~74k index artifacts). Writing them one-at-a-time makes the
+/// restore wall-clock the *sum* of per-object storage round-trips — minutes of
+/// pure latency on a remote backend like S3, enough to blow a serverless time
+/// budget. Decoding stays sequential (it is CPU-cheap); the slow per-object
+/// writes are dispatched into a bounded pool so they overlap. 32 is a balance
+/// between latency-hiding and not exhausting the backend's connection pool.
+const RESTORE_MAX_WRITES_IN_FLIGHT: usize = 32;
+
+/// Maximum total bytes of pending write payloads held in memory at once.
+///
+/// The concurrency pool also bounds by bytes so a burst of large objects (a
+/// 256 MiB–1 GiB dictionary pack) can't balloon memory. Small objects (the
+/// common case) parallelize up to [`RESTORE_MAX_WRITES_IN_FLIGHT`]; large ones
+/// throttle here instead. A single object larger than this cap is still
+/// admitted once the pool drains, so it never deadlocks.
+const RESTORE_MAX_BYTES_IN_FLIGHT: usize = 512 * 1024 * 1024;
+
 /// Summary of a `.flpack` restore — the import counterpart of
 /// [`Fluree::archive_ledger`]'s [`crate::pack::PackStreamResult`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1517,6 +1537,7 @@ impl Fluree {
         use fluree_db_core::pack::{
             decode_frame, read_stream_preamble, PackError, PackFrame, PREAMBLE_SIZE,
         };
+        use futures::stream::{FuturesUnordered, StreamExt as _};
         use tokio::io::AsyncReadExt as _;
 
         let storage = self
@@ -1525,8 +1546,10 @@ impl Fluree {
             .ok_or_else(|| ApiError::config("restore_ledger requires a managed storage backend"))?;
 
         // Frames are decoded out of a growing byte buffer; `read` appends and
-        // `drain` consumes whole frames as they complete. Never holds more than
-        // one in-flight frame plus the unparsed tail.
+        // `drain` consumes whole frames as they complete. Decoding stays
+        // sequential, but the slow per-object storage writes are dispatched
+        // into `in_flight` so they overlap (see `RESTORE_MAX_WRITES_IN_FLIGHT`).
+        // Memory is bounded by `in_flight`'s payloads plus the unparsed tail.
         let mut buf: Vec<u8> = Vec::with_capacity(64 * 1024);
         let mut read_chunk = [0u8; 64 * 1024];
         let mut preamble_consumed = false;
@@ -1536,6 +1559,13 @@ impl Fluree {
         let mut txn_blobs = 0usize;
         let mut index_artifacts = 0usize;
         let mut ns_manifest: Option<serde_json::Value> = None;
+
+        // Concurrent CAS writer pool. Each future owns its `(cid, payload)` and
+        // returns the byte count it frees on completion; errors propagate (and
+        // roll the restore back via the caller). `bytes_in_flight` throttles
+        // large payloads independently of the count cap.
+        let mut in_flight: FuturesUnordered<_> = FuturesUnordered::new();
+        let mut bytes_in_flight: usize = 0;
 
         'read: loop {
             // Strip the preamble once enough bytes have arrived.
@@ -1568,13 +1598,41 @@ impl Fluree {
                                             "invalid .flpack: Data frame before Header",
                                         ));
                                     }
-                                    ingest_cas_object(&storage, &cid, &payload, new_ledger_id)
-                                        .await?;
+                                    // Count at dispatch: any write failure aborts the
+                                    // whole restore (and rolls it back), so only the
+                                    // success path ever returns these counts.
                                     match cid.content_kind() {
                                         Some(ContentKind::Commit) => commits += 1,
                                         Some(ContentKind::Txn) => txn_blobs += 1,
                                         _ => index_artifacts += 1,
                                     }
+                                    // Backpressure: drain completed writes until this one
+                                    // fits within both the count and byte budgets. The
+                                    // `!in_flight.is_empty()` guard still admits a single
+                                    // object larger than the byte budget once the pool
+                                    // drains, so an oversized frame never deadlocks.
+                                    let len = payload.len();
+                                    while in_flight.len() >= RESTORE_MAX_WRITES_IN_FLIGHT
+                                        || (bytes_in_flight + len > RESTORE_MAX_BYTES_IN_FLIGHT
+                                            && !in_flight.is_empty())
+                                    {
+                                        match in_flight.next().await {
+                                            Some(res) => bytes_in_flight -= res?,
+                                            None => break,
+                                        }
+                                    }
+                                    bytes_in_flight += len;
+                                    let storage_ref = &storage;
+                                    in_flight.push(async move {
+                                        ingest_cas_object(
+                                            storage_ref,
+                                            &cid,
+                                            &payload,
+                                            new_ledger_id,
+                                        )
+                                        .await?;
+                                        Ok::<usize, ApiError>(len)
+                                    });
                                 }
                                 PackFrame::Manifest(json) => {
                                     if json.get("phase").and_then(|v| v.as_str())
@@ -1613,6 +1671,14 @@ impl Fluree {
                 break;
             }
             buf.extend_from_slice(&read_chunk[..n]);
+        }
+
+        // Flush every write still in flight before finalizing heads — the
+        // manifest CID `content.has` checks below require each CAS object to be
+        // durable, and a failed write must surface here (rolling the restore
+        // back) rather than leaving a head pointing at an unwritten object.
+        while let Some(res) = in_flight.next().await {
+            res?;
         }
 
         if !saw_header {
