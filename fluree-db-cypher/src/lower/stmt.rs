@@ -408,7 +408,8 @@ impl ProjectionState {
         }
         if let Expr::Call(call) = &item.expr {
             if is_aggregate(&call.name) {
-                let output_var = aggregate_output_var(ctx, &item.alias, &mut self.alias_counter);
+                let output_var =
+                    aggregate_output_var(ctx, &item.alias, &item.expr, &mut self.alias_counter);
                 let input_var = aggregate_input_var(ctx, call, patterns)?;
                 let function = build_aggregate_fn(&call.name, call.distinct, input_var)?;
                 if call.name.eq_ignore_ascii_case("collect") {
@@ -430,7 +431,7 @@ impl ProjectionState {
             return self.add_aggregate_composite(ctx, patterns, item);
         }
         let lowered = lower_expr(ctx, &item.expr, patterns)?;
-        let alias_id = aggregate_output_var(ctx, &item.alias, &mut self.alias_counter);
+        let alias_id = aggregate_output_var(ctx, &item.alias, &item.expr, &mut self.alias_counter);
         patterns.push(Pattern::Bind {
             var: alias_id,
             expr: lowered,
@@ -467,7 +468,8 @@ impl ProjectionState {
             ));
         }
         let lowered = lower_expr(ctx, &rewritten, patterns)?;
-        let output_var = aggregate_output_var(ctx, &item.alias, &mut self.alias_counter);
+        let output_var =
+            aggregate_output_var(ctx, &item.alias, &item.expr, &mut self.alias_counter);
         self.post_binds.push((output_var, lowered));
         self.vars.push(output_var);
         Ok(())
@@ -820,19 +822,50 @@ fn aggregate_input_var<E: IriEncoder>(
 }
 
 /// Mint the output VarId for a projection item: the user's alias if
-/// provided, otherwise a fresh synthetic.
+/// provided, otherwise the projected expression's surface text so the
+/// rendered column reads as Neo4j does (`a.name`, `count(m)`). The
+/// surface label always contains a `.`, `(`, or operator and so can never
+/// collide with a user variable (a bare identifier). Falls back to a
+/// synthetic `?#__ret_N` only for expressions we can't render — those
+/// still project correctly (the formatter emits every explicit column),
+/// they just carry an opaque label.
 fn aggregate_output_var<E: IriEncoder>(
     ctx: &mut LoweringContext<'_, E>,
     alias: &Option<crate::ast::Variable>,
+    expr: &Expr,
     counter: &mut u32,
 ) -> VarId {
     match alias {
         Some(a) => ctx.intern_var(&a.name),
-        None => {
-            let name = format!("?#__ret_{counter}");
-            *counter += 1;
-            ctx.intern_var(&name)
+        None => match projection_label(expr) {
+            Some(label) => ctx.intern_var(&label),
+            None => {
+                let name = format!("?#__ret_{counter}");
+                *counter += 1;
+                ctx.intern_var(&name)
+            }
+        },
+    }
+}
+
+/// Render a projected expression to its Neo4j column label. Covers the
+/// surface forms LDBC / openCypher actually project unaliased; returns
+/// `None` for shapes with no obvious textual label.
+fn projection_label(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Var(v) => Some(v.name.clone()),
+        Expr::Prop(target, key, _) => Some(format!("{}.{}", projection_label(target)?, key)),
+        Expr::Call(call) => {
+            let args = call
+                .args
+                .iter()
+                .map(|a| projection_label(a).unwrap_or_else(|| "…".to_string()))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let distinct = if call.distinct { "DISTINCT " } else { "" };
+            Some(format!("{}({distinct}{args})", call.name))
         }
+        _ => None,
     }
 }
 

@@ -2320,6 +2320,7 @@ dependencies = [
  "bigdecimal 0.4.10",
  "chrono",
  "criterion",
+ "csv",
  "dirs 5.0.1",
  "ed25519-dalek",
  "flate2",

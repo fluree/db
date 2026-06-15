@@ -221,3 +221,40 @@ async fn cypher_json_emits_native_scalars_not_rdf_value_objects() {
         "long is a bare number: {cj2}"
     );
 }
+
+#[tokio::test]
+async fn cypher_json_unaliased_projection_keeps_columns_and_values() {
+    // Regression: an unaliased `RETURN p.name` lowers to a synthetic
+    // `?#__ret_N` output var. The cypher-json formatter used to filter that as
+    // an "internal" var, dropping BOTH the column and its row value (every
+    // default-format Cypher query came back with empty columns/rows). The fix:
+    // explicit projections emit verbatim, and the column reads as Neo4j does
+    // (the projected expression's surface text).
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/csv:cypher-json-unaliased");
+    let persons = "id:ID(Person),name:string,birthday:date,:LABEL\n10,Alice,1990-11-23,Person\n";
+    let doc = csv_files_to_jsonld(&[persons], &opts()).expect("csv");
+    let l = fluree.insert(ledger0, &doc).await.expect("insert").ledger;
+    let db = graphdb_from_ledger(&l);
+
+    let cj = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (p:Person {name:"Alice"}) RETURN p.name, p.birthday"#,
+        )
+        .await
+        .expect("query")
+        .to_cypher_json_async(db.as_graph_db_ref())
+        .await
+        .expect("cypher json");
+    assert_eq!(
+        cj,
+        json!({
+            "results": [{
+                "columns": ["p.name", "p.birthday"],
+                "data": [{ "row": ["Alice", "1990-11-23"], "meta": [null, null] }]
+            }]
+        }),
+        "unaliased columns must keep their surface-text labels and values: {cj}"
+    );
+}
