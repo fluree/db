@@ -11,8 +11,8 @@ use super::value::ComparableValue;
 use crate::ir::{ArithmeticOp, CompareOp};
 
 use super::{
-    arithmetic, cast, conditional, datetime, fluree, fulltext, geo, hash, logical, numeric, path,
-    rdf, string, types, uuid, vector,
+    arithmetic, cast, conditional, datetime, fluree, fulltext, geo, hash, list, logical, numeric,
+    path, rdf, string, types, uuid, vector,
 };
 
 impl Function {
@@ -179,6 +179,15 @@ impl Function {
 
             // Path functions
             Function::PathLength => path::eval_path_length(args, row),
+
+            // List functions (scalar-returning; tail/list-reverse use the
+            // binding-producing path in `try_eval_to_binding`).
+            Function::Size => list::eval_size(args, row, ctx),
+            Function::Head => list::eval_head(args, row, ctx),
+            Function::Last => list::eval_last(args, row, ctx),
+            Function::Reverse => list::eval_reverse_string(args, row, ctx),
+            // `tail` is list-returning only; in a scalar context it has no value.
+            Function::Tail => Ok(None),
 
             // Unknown function
             Function::Custom(name) => Err(QueryError::InvalidFilter(format!(

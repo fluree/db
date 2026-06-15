@@ -654,8 +654,9 @@ async fn transact_cypher_anonymous_create_reifies_for_named_read() {
 
 #[tokio::test]
 async fn cypher_collect_inside_expression_rejected() {
-    // collect() yields a list the scalar evaluator can't consume; allowed only
-    // as a bare RETURN item, not nested in an expression.
+    // collect() is list-valued: it can be a bare RETURN item or the argument of
+    // a list function (`size(collect(x))`), but not nested in arithmetic /
+    // comparison where it would silently evaluate to null.
     let fluree = FlureeBuilder::memory().build_memory();
     let l = seed_nodes_with_ids(&fluree, "it/cypher:collect-in-expr").await;
     let db = graphdb_from_ledger(&l);
@@ -2447,4 +2448,104 @@ async fn cypher_merge_on_create_set_list_valued_property() {
         .filter_map(|r| r[0].as_str())
         .collect();
     assert_eq!(emails, vec!["a@x.com", "b@y.com"], "on-create list stored: {out}");
+}
+
+/// Seed Alice KNOWS Bob, Carol, Dave (3 named friends) for list-function tests.
+async fn seed_alice_friends(
+    fluree: &fluree_db_api::Fluree,
+    ledger_id: &str,
+) -> fluree_db_api::LedgerState {
+    let ledger0 = genesis_ledger(fluree, ledger_id);
+    fluree
+        .insert(
+            ledger0,
+            &json!({"@context": ctx(), "@graph": [
+                {"@id": "ex:a", "@type": "ex:Person", "ex:name": "Alice",
+                 "ex:KNOWS": [{"@id": "ex:b"}, {"@id": "ex:c"}, {"@id": "ex:d"}]},
+                {"@id": "ex:b", "@type": "ex:Person", "ex:name": "Bob"},
+                {"@id": "ex:c", "@type": "ex:Person", "ex:name": "Carol"},
+                {"@id": "ex:d", "@type": "ex:Person", "ex:name": "Dave"},
+            ]}),
+        )
+        .await
+        .expect("seed friends")
+        .ledger
+}
+
+async fn list_fn_value(fluree: &fluree_db_api::Fluree, ledger_id: &str, query: &str) -> JsonValue {
+    let l = seed_alice_friends(fluree, ledger_id).await;
+    let db = graphdb_from_ledger(&l);
+    let out = fluree
+        .query_cypher(&db, query)
+        .await
+        .expect("list fn query")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    out[0][0].clone()
+}
+
+#[tokio::test]
+async fn cypher_size_of_collect() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let v = list_fn_value(
+        &fluree,
+        "it/cypher:size-collect",
+        r#"MATCH (a:Person {name:"Alice"})-[:KNOWS]->(f) RETURN size(collect(f.name)) AS v"#,
+    )
+    .await;
+    assert_eq!(v, json!(3), "Alice has 3 friends: {v}");
+}
+
+#[tokio::test]
+async fn cypher_head_and_last_of_collect() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let h = list_fn_value(
+        &fluree,
+        "it/cypher:head-collect",
+        r#"MATCH (a:Person {name:"Alice"})-[:KNOWS]->(f) RETURN head(collect(f.name)) AS v"#,
+    )
+    .await;
+    assert_eq!(h, json!("Bob"), "first collected name: {h}");
+
+    let last = list_fn_value(
+        &fluree,
+        "it/cypher:last-collect",
+        r#"MATCH (a:Person {name:"Alice"})-[:KNOWS]->(f) RETURN last(collect(f.name)) AS v"#,
+    )
+    .await;
+    assert_eq!(last, json!("Dave"), "last collected name: {last}");
+}
+
+#[tokio::test]
+async fn cypher_reverse_and_tail_of_collect() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let rev = list_fn_value(
+        &fluree,
+        "it/cypher:reverse-collect",
+        r#"MATCH (a:Person {name:"Alice"})-[:KNOWS]->(f) RETURN reverse(collect(f.name)) AS v"#,
+    )
+    .await;
+    assert_eq!(rev, json!(["Dave", "Carol", "Bob"]), "reversed list: {rev}");
+
+    let tail = list_fn_value(
+        &fluree,
+        "it/cypher:tail-collect",
+        r#"MATCH (a:Person {name:"Alice"})-[:KNOWS]->(f) RETURN tail(collect(f.name)) AS v"#,
+    )
+    .await;
+    assert_eq!(tail, json!(["Carol", "Dave"]), "list without head: {tail}");
+}
+
+#[tokio::test]
+async fn cypher_size_of_string() {
+    // size() also works on a string (Cypher's list/string length).
+    let fluree = FlureeBuilder::memory().build_memory();
+    let v = list_fn_value(
+        &fluree,
+        "it/cypher:size-string",
+        r#"MATCH (a:Person {name:"Alice"}) RETURN size(a.name) AS v"#,
+    )
+    .await;
+    assert_eq!(v, json!(5), "len(\"Alice\") = 5: {v}");
 }

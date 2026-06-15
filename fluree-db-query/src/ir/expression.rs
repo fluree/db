@@ -584,6 +584,20 @@ pub enum Function {
     PathLength,
 
     // =========================================================================
+    // List functions (Cypher list values)
+    // =========================================================================
+    /// `size(list|string)` — element count of a list or length of a string.
+    Size,
+    /// `head(list)` — first element (null if empty).
+    Head,
+    /// `last(list)` — last element (null if empty).
+    Last,
+    /// `tail(list)` — the list without its first element.
+    Tail,
+    /// `reverse(list|string)` — reversed list or string.
+    Reverse,
+
+    // =========================================================================
     // Custom/unknown function
     // =========================================================================
     Custom(String),

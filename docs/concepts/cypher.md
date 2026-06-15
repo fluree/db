@@ -151,6 +151,10 @@ ORDER BY / SKIP / LIMIT
   target only in v1; chained accessors (`n.a.b`) are rejected.
 - ORDER BY (variable or property-accessor keys), SKIP, LIMIT.
 - `UNWIND [literals] AS x` — inline list literal unwinding.
+- List functions over a `collect()` list: `size`, `head`, `last`,
+  `tail`, `reverse` (and `size`/`reverse` over a string). Usable in the
+  final `RETURN` wrapping a collect, e.g. `RETURN size(collect(f.name))`;
+  `collect()` nested in arithmetic is rejected.
 - Aggregates: `count(*)`, `count(x)`, `count(DISTINCT x)`,
   `sum(x)`, `avg(x)`, `min(x)`, `max(x)`. Arguments may be a bare
   variable (`count(n)`) or a property accessor (`avg(n.age)`);

@@ -621,16 +621,28 @@ fn extract_aggregates<E: IriEncoder>(
     aggregates: &mut Vec<AggregateSpec>,
     counter: &mut u32,
 ) -> Result<()> {
+    // `collect()` is list-valued, so it can only be nested inside a *list*
+    // function (`size`/`head`/…) — never in arithmetic / comparison, where it
+    // would silently evaluate to null. The flag tracks whether the current
+    // position is a direct argument of a list function (propagated through
+    // nested list functions like `size(reverse(collect(x)))`).
+    extract_aggregates_inner(ctx, e, patterns, aggregates, counter, false)
+}
+
+fn extract_aggregates_inner<E: IriEncoder>(
+    ctx: &mut LoweringContext<'_, E>,
+    e: &mut Expr,
+    patterns: &mut Vec<Pattern>,
+    aggregates: &mut Vec<AggregateSpec>,
+    counter: &mut u32,
+    collect_allowed: bool,
+) -> Result<()> {
     match e {
         Expr::Call(call) if is_aggregate(&call.name) => {
-            // `collect()` yields a list (`Binding::Grouped`) that the scalar
-            // expression evaluator can't consume; list-consuming functions are
-            // deferred. Allow it only as a bare final-RETURN item, not nested
-            // in an expression.
-            if call.name.eq_ignore_ascii_case("collect") {
+            if call.name.eq_ignore_ascii_case("collect") && !collect_allowed {
                 return Err(LowerError::unsupported(
-                    "collect() inside an expression is not supported in v1 — use it as a bare \
-                     RETURN item; list functions are deferred",
+                    "collect() inside an expression is only supported as the argument of a \
+                     list function (size/head/last/tail/reverse) — e.g. `size(collect(x))`",
                 ));
             }
             let name = format!("?#__agg_{counter}");
@@ -649,8 +661,11 @@ fn extract_aggregates<E: IriEncoder>(
             Ok(())
         }
         Expr::Call(call) => {
+            // A list function's direct arguments may contain a collect; any
+            // other function's arguments may not.
+            let allow = is_list_function(&call.name);
             for a in &mut call.args {
-                extract_aggregates(ctx, a, patterns, aggregates, counter)?;
+                extract_aggregates_inner(ctx, a, patterns, aggregates, counter, allow)?;
             }
             Ok(())
         }
@@ -659,18 +674,18 @@ fn extract_aggregates<E: IriEncoder>(
         | Expr::StartsWith(l, r, _)
         | Expr::EndsWith(l, r, _)
         | Expr::Contains(l, r, _) => {
-            extract_aggregates(ctx, l, patterns, aggregates, counter)?;
-            extract_aggregates(ctx, r, patterns, aggregates, counter)
+            extract_aggregates_inner(ctx, l, patterns, aggregates, counter, false)?;
+            extract_aggregates_inner(ctx, r, patterns, aggregates, counter, false)
         }
         Expr::UnaryOp(_, x, _)
         | Expr::IsNull(x, _)
         | Expr::IsNotNull(x, _)
         | Expr::Prop(x, _, _) => {
-            extract_aggregates(ctx, x, patterns, aggregates, counter)
+            extract_aggregates_inner(ctx, x, patterns, aggregates, counter, false)
         }
         Expr::List(items, _) => {
             for it in items {
-                extract_aggregates(ctx, it, patterns, aggregates, counter)?;
+                extract_aggregates_inner(ctx, it, patterns, aggregates, counter, false)?;
             }
             Ok(())
         }
@@ -679,6 +694,15 @@ fn extract_aggregates<E: IriEncoder>(
         )),
         Expr::Var(_) | Expr::Lit(_) | Expr::Param(_) => Ok(()),
     }
+}
+
+/// Cypher list functions that consume a list value (and may therefore wrap a
+/// `collect()` in an expression).
+fn is_list_function(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "size" | "head" | "last" | "tail" | "reverse"
+    )
 }
 
 /// After [`extract_aggregates`], `e` should reference only aggregate outputs
@@ -862,12 +886,15 @@ fn lower_with<E: IriEncoder>(
         ));
     }
     if !projection.list_outputs.is_empty() {
-        // A `collect()` result projected by WITH becomes a variable that flows
-        // out of this subquery into the outer query, where it may be joined,
-        // sorted, or grouped — none of which handle the list carrier. Allow
-        // collect() only in the final RETURN until list semantics land.
+        // A `collect()` projected by WITH flows out as a `Binding::List`. List
+        // functions over it work in the final RETURN (`RETURN size(collect(x))`),
+        // but projecting the raw list *through* the WITH subquery boundary
+        // currently nulls it (the subquery result projection drops the List —
+        // a separate fix). Rather than return a silent null, keep collect() in
+        // WITH deferred with a clear error.
         return Err(LowerError::unsupported(
-            "collect() in WITH is deferred in v1 — use it only in the final RETURN",
+            "collect() in WITH is deferred in v1 — wrap it in the final RETURN, \
+             e.g. `RETURN size(collect(x))`",
         ));
     }
 

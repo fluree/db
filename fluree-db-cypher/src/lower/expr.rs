@@ -134,9 +134,14 @@ pub fn lower_expr<E: IriEncoder>(
                 "coalesce" => Function::Coalesce,
                 "abs" => Function::Abs,
                 // Cypher `length(p)` is a path's hop count; `size(x)` is the
-                // string/list length (Cypher 9 split these).
+                // list/string length (Cypher 9 split these).
                 "length" => Function::PathLength,
-                "size" => Function::Strlen,
+                "size" => Function::Size,
+                // List functions over `collect()` lists.
+                "head" => Function::Head,
+                "last" => Function::Last,
+                "tail" => Function::Tail,
+                "reverse" => Function::Reverse,
                 "tostring" => Function::Str,
                 _ => {
                     return Err(LowerError::unsupported(format!(

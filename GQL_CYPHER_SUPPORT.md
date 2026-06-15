@@ -55,7 +55,7 @@ DELETE/INSERT templates sharing variable ids via the shared
 | Untyped / alternation / property-filtered relationships in a **write** MATCH | Write MATCH supports directed single-typed relationships, anonymous or named (named binds `r` for `SET r.prop`). Untyped (`-[r]->`), alternation (`-[:A\|B]->`), and inline relationship property filters in a write MATCH are still deferred. |
 | Whole-map node params (`(n $props)`); `$map.field` outside UNWIND; nested/map field values | Standalone map-valued params (not via `UNWIND … CREATE`/`MATCH`) still need a map-valued `Expr` the AST doesn't carry; deferred. |
 | HTTP tracking (reads) / delimited / agent-json for Cypher | The Cypher HTTP routes return JSON-LD only and don't negotiate delimited (TSV/CSV) or agent-json output, and read-side tracking isn't surfaced yet. **Policy/identity enforcement IS applied** (resolved identity + header policy fields → `wrap_policy` on reads, `PolicyContext` on writes), and write-side tracking headers are honored. Remaining gap is output-format negotiation + read tracking. |
-| Free path values (`p = (...)` without `shortestPath`), `nodes()/relationships()`, list-*consuming* functions (`head/tail/size`), reflection (`labels/type/keys/properties/id`), bare `(n)`, `LOAD CSV`, `FOREACH`, `CALL proc`, schema DDL, multi-statement | Per the original plan's deferral list below (engine work or product decisions). Undirected, variable-length paths, `collect()`, and **`shortestPath`/`allShortestPaths` + `length(p)`** have since landed (see status table). |
+| Free path values (`p = (...)` without `shortestPath`), `nodes()/relationships()`, reflection (`labels/type/keys/properties/id`), `range`/list comprehensions, bare `(n)`, `LOAD CSV`, `FOREACH`, `CALL proc`, schema DDL, multi-statement | Per the original plan's deferral list below (engine work or product decisions). Undirected, variable-length paths, `collect()`, **`shortestPath`/`allShortestPaths` + `length(p)`**, and the **list functions `size`/`head`/`last`/`tail`/`reverse`** have since landed (see status table). |
 
 ---
 
@@ -561,7 +561,8 @@ standard solution modifiers and a conservative expression sublanguage.**
 | `RETURN ... AS alias` | ✅ | Existing projection alias support. |
 | `RETURN count(*) / count(x) / sum(x) / avg(x) / min(x) / max(x)` | ✅ | Existing aggregate operators. |
 | Aggregates composed into expressions — `count(a) + count(b)`, `count(m) + 1`, `sum(a) / count(b)` | ✅ | Each aggregate sub-expression is lifted to its own spec; the surrounding expression becomes a post-aggregation bind (LDBC IC3 total / IC10 score). Combine aggregates with literals and each other; referencing a *grouping key* inside the expression is deferred (project it separately and use its alias). |
-| `RETURN collect(x)` / `collect(DISTINCT x)` | ✅ | `AggregateFn::Collect` gathers non-null values into a list (Cypher semantics: nulls dropped, empty → `[]`; an implicit aggregation over zero matched rows still yields one row with `[]`). Carried as a `Binding::Grouped`, which the JSON-LD formatter renders as a JSON array (v1 Cypher output is JSON-LD). **Allowed only in the final `RETURN`**, and a collect list **cannot be an `ORDER BY` key** (the list carrier isn't comparable by the sort/join/group key paths) — both `collect()` in `WITH` and `ORDER BY <list>` are rejected with a clear error. `head/tail/size/reverse` over the list still deferred. |
+| `RETURN collect(x)` / `collect(DISTINCT x)` | ✅ | `AggregateFn::Collect` gathers non-null values into a list (Cypher semantics: nulls dropped, empty → `[]`; an implicit aggregation over zero matched rows still yields one row with `[]`). Produces a first-class `Binding::List` (distinct from the transient `Binding::Grouped`), rendered as a JSON array by the JSON-LD / typed formatters (v1 Cypher output). A collect list **cannot be an `ORDER BY` key**, and `collect()` in `WITH` is still deferred (projecting the raw list through the subquery boundary nulls it — a separate fix); use it in the final `RETURN`. |
+| List functions `size` / `head` / `last` / `tail` / `reverse` | ✅ | Over a `collect()` list (and `size`/`reverse` also over a string). `size`/`head`/`last` return scalars; `tail`/`reverse` return lists (via the binding-producing eval path). Usable in the final `RETURN` wrapping a collect — `RETURN size(collect(f.name))` — extracted as a list-valued aggregate with the list function as a post-aggregation bind. A `collect()` nested in arithmetic/comparison (`collect(x) + 1`) is still rejected (it would evaluate to null). |
 | `ORDER BY / SKIP / LIMIT` | ✅ | Existing modifiers. |
 | `UNION` / `UNION ALL` | ✅ | Lowers to existing `Union` pattern. |
 | `CALL { subquery }` (read-only) | ✅ | Lowers to `Subquery`. |
@@ -629,10 +630,9 @@ labels/properties, predicate-name reverse lookup) is deferred.
 
 - `XOR` — no direct IR variant; users write `(a OR b) AND NOT (a AND b)`.
 - `%` modulus, `^` exponent — pending IR confirmation.
-- `head, tail, size, reverse, range` and other list functions — these
-  consume a list value; `collect(x)` now produces one (carried as
-  `Binding::Grouped`), but list-*consuming* functions still need
-  expression-language support over the list carrier.
+- `size`, `head`, `last`, `tail`, `reverse` over a `collect()` list have
+  **landed** (consuming `Binding::List`). `range` and the remaining list
+  builders/comprehensions are still deferred.
 - `labels(n)`, `keys(n)`, `properties(n)`, `type(r)` — dynamic
   reflection over a node/relationship's facts; needs snapshot-time
   lookup expressions.
