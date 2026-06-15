@@ -55,8 +55,8 @@
 //! [`LedgerState::load`]: fluree_db_ledger::LedgerState::load
 
 use crate::raft::state_machine::{
-    AdvanceIndexHeadArgs, Command as SmCommand, CreateLedgerArgs, NameServiceState, RefKey,
-    Response as SmResponse,
+    AdvanceIndexHeadArgs, Command as SmCommand, CreateBranchArgs, CreateLedgerArgs,
+    NameServiceState, RefKey, ResetHeadSnapshot, Response as SmResponse,
 };
 use crate::raft::state_machine_adapter::SharedState;
 use crate::raft::TypeConfig;
@@ -64,9 +64,9 @@ use async_trait::async_trait;
 use fluree_db_core::ledger_id::split_ledger_id;
 use fluree_db_core::ContentId;
 use fluree_db_nameservice::{
-    ConfigLookup, ConfigValue, GraphSourceLookup, GraphSourceRecord, IndexPublisher,
-    LedgerLifecycle, NameServiceError, NameServiceLookup, NsLookupResult, NsRecord, RefKind,
-    RefLookup, RefValue, Result, StatusLookup, StatusValue,
+    BranchLifecycle, ConfigLookup, ConfigValue, GraphSourceLookup, GraphSourceRecord,
+    IndexPublisher, LedgerLifecycle, NameServiceError, NameServiceLookup, NsLookupResult,
+    NsRecord, NsRecordSnapshot, RefKind, RefLookup, RefValue, Result, StatusLookup, StatusValue,
 };
 use openraft::error::{ClientWriteError, RaftError};
 use openraft::Raft;
@@ -162,9 +162,9 @@ fn map_advance_index_response(resp: SmResponse) -> Result<()> {
 /// `ledger_name` or the branch isn't registered on it.
 ///
 /// Fields the state machine doesn't track
-/// (`default_context`/`config_id`/`source_branch`/`branches`) fall
-/// back to their `NsRecord::new` defaults — see the module docs for
-/// why that's enough for follower reload.
+/// (`default_context`/`config_id`) fall back to their `NsRecord::new`
+/// defaults — see the module docs for why that's enough for
+/// follower reload.
 fn record_from_state(state: &NameServiceState, ledger_name: &str, branch: &str) -> Option<NsRecord> {
     let ledger = state.ledgers.get(ledger_name)?;
     if !ledger.branches.iter().any(|b| b == branch) {
@@ -179,6 +179,8 @@ fn record_from_state(state: &NameServiceState, ledger_name: &str, branch: &str) 
             record.index_head_id = Some(index.head.clone());
             record.index_t = index.t;
         }
+        record.source_branch = entry.source_branch.clone();
+        record.branches = entry.branches;
     }
     record.retracted = state.retracted.contains(&ref_key);
     Some(record)
@@ -338,6 +340,118 @@ impl LedgerLifecycle for RaftNameService {
     async fn purge(&self, ledger_id: &str) -> Result<()> {
         let cmd = build_purge_command(ledger_id)?;
         map_purge_response(self.submit_lifecycle(cmd).await?)
+    }
+}
+
+fn build_create_branch_command(
+    ledger_name: &str,
+    new_branch: &str,
+    source_branch: &str,
+    at_commit: Option<(ContentId, i64)>,
+) -> std::result::Result<SmCommand, NameServiceError> {
+    let applied_at_millis = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    Ok(SmCommand::CreateBranch(CreateBranchArgs {
+        ledger_id: ledger_name.into(),
+        branch: new_branch.into(),
+        source_branch: source_branch.into(),
+        at_commit,
+        applied_at_millis,
+    }))
+}
+
+fn build_drop_branch_command(ledger_id: &str) -> std::result::Result<SmCommand, NameServiceError> {
+    let (ledger_name, branch) = split_ledger_id(ledger_id)?;
+    Ok(SmCommand::DropBranch {
+        ledger_id: ledger_name,
+        branch,
+    })
+}
+
+fn build_reset_head_command(
+    ledger_id: &str,
+    snapshot: NsRecordSnapshot,
+) -> std::result::Result<SmCommand, NameServiceError> {
+    let (ledger_name, branch) = split_ledger_id(ledger_id)?;
+    Ok(SmCommand::ResetHead {
+        ledger_id: ledger_name,
+        branch,
+        snapshot: ResetHeadSnapshot {
+            commit_head_id: snapshot.commit_head_id,
+            commit_t: snapshot.commit_t,
+            index_head_id: snapshot.index_head_id,
+            index_t: snapshot.index_t,
+        },
+    })
+}
+
+fn map_create_branch_response(resp: SmResponse) -> Result<()> {
+    match resp {
+        SmResponse::BranchCreated { .. } => Ok(()),
+        SmResponse::AlreadyExists { ledger_id } => {
+            Err(NameServiceError::ledger_already_exists(ledger_id))
+        }
+        SmResponse::LedgerNotFound { ledger_id }
+        | SmResponse::SourceBranchNotFound { ledger_id } => {
+            Err(NameServiceError::not_found(ledger_id))
+        }
+        other => Err(NameServiceError::storage(format!(
+            "unexpected Response variant for CreateBranch: {other:?}"
+        ))),
+    }
+}
+
+fn map_drop_branch_response(resp: SmResponse) -> Result<Option<u32>> {
+    match resp {
+        SmResponse::BranchDropped {
+            parent_branches, ..
+        } => Ok(parent_branches),
+        SmResponse::BranchHasChildren {
+            ledger_id,
+            children,
+        } => Err(NameServiceError::storage(format!(
+            "drop_branch refused: {ledger_id} still has {children} child branch(es)"
+        ))),
+        SmResponse::LedgerNotFound { ledger_id } => Err(NameServiceError::not_found(ledger_id)),
+        other => Err(NameServiceError::storage(format!(
+            "unexpected Response variant for DropBranch: {other:?}"
+        ))),
+    }
+}
+
+fn map_reset_head_response(resp: SmResponse) -> Result<()> {
+    match resp {
+        SmResponse::HeadReset { .. } => Ok(()),
+        SmResponse::LedgerNotFound { ledger_id } => Err(NameServiceError::not_found(ledger_id)),
+        other => Err(NameServiceError::storage(format!(
+            "unexpected Response variant for ResetHead: {other:?}"
+        ))),
+    }
+}
+
+#[async_trait]
+impl BranchLifecycle for RaftNameService {
+    async fn create_branch(
+        &self,
+        ledger_name: &str,
+        new_branch: &str,
+        source_branch: &str,
+        at_commit: Option<(ContentId, i64)>,
+    ) -> Result<()> {
+        let cmd = build_create_branch_command(ledger_name, new_branch, source_branch, at_commit)?;
+        map_create_branch_response(self.submit_lifecycle(cmd).await?)
+    }
+
+    async fn drop_branch(&self, ledger_id: &str) -> Result<Option<u32>> {
+        let cmd = build_drop_branch_command(ledger_id)?;
+        map_drop_branch_response(self.submit_lifecycle(cmd).await?)
+    }
+
+    async fn reset_head(&self, ledger_id: &str, snapshot: NsRecordSnapshot) -> Result<()> {
+        let cmd = build_reset_head_command(ledger_id, snapshot)?;
+        map_reset_head_response(self.submit_lifecycle(cmd).await?)
     }
 }
 

@@ -149,11 +149,24 @@ fn event_for(cmd: &Command, response: &Response) -> Option<NameServiceEvent> {
             })
         }
         (Command::RetractLedger { .. }, Response::Retracted { ledger_id })
-        | (Command::PurgeLedger { .. }, Response::Purged { ledger_id }) => {
+        | (Command::PurgeLedger { .. }, Response::Purged { ledger_id })
+        | (Command::DropBranch { .. }, Response::BranchDropped { ledger_id, .. }) => {
             Some(NameServiceEvent::LedgerRetracted {
                 ledger_id: ledger_id.clone(),
             })
         }
+        (
+            Command::CreateBranch(_),
+            Response::BranchCreated {
+                ledger_id,
+                head,
+                t,
+            },
+        ) => Some(NameServiceEvent::LedgerCommitPublished {
+            ledger_id: ledger_id.clone(),
+            commit_id: head.clone(),
+            commit_t: *t,
+        }),
         _ => None,
     }
 }
@@ -659,6 +672,96 @@ mod tests {
             sub.receiver.try_recv().is_err(),
             "purge of unknown branch should not emit"
         );
+    }
+
+    #[tokio::test]
+    async fn apply_emits_commit_event_on_create_branch() {
+        let storage = Arc::new(MemoryRaftStorage::new());
+        let bus = Arc::new(LedgerEventBus::new(16));
+        let mut sm = StateMachineAdapter::new(storage).with_event_bus(Arc::clone(&bus));
+        let mut sub = bus.subscribe(fluree_db_nameservice::SubscriptionScope::All);
+
+        sm.apply([create_ledger_entry(1, "test/db")]).await.unwrap();
+        sm.apply([advance_entry(2, "test/db", None, cid(7), 10)])
+            .await
+            .unwrap();
+        // Drain the AdvanceRef commit event.
+        let _ = sub.receiver.try_recv().expect("commit event");
+
+        sm.apply([Entry {
+            log_id: log_id(1, 3),
+            payload: EntryPayload::Normal(RaftCommand::CreateBranch(
+                crate::raft::state_machine::CreateBranchArgs {
+                    ledger_id: "test/db".into(),
+                    branch: "feature".into(),
+                    source_branch: "main".into(),
+                    at_commit: None,
+                    applied_at_millis: 3_000,
+                },
+            )),
+        }])
+        .await
+        .unwrap();
+
+        match sub.receiver.try_recv().expect("create-branch event") {
+            NameServiceEvent::LedgerCommitPublished {
+                ledger_id,
+                commit_id,
+                commit_t,
+            } => {
+                assert_eq!(ledger_id, "test/db:feature");
+                assert_eq!(commit_id, cid(7));
+                assert_eq!(commit_t, 10);
+            }
+            other => panic!("expected LedgerCommitPublished, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn apply_emits_retracted_event_on_drop_branch() {
+        let storage = Arc::new(MemoryRaftStorage::new());
+        let bus = Arc::new(LedgerEventBus::new(16));
+        let mut sm = StateMachineAdapter::new(storage).with_event_bus(Arc::clone(&bus));
+        let mut sub = bus.subscribe(fluree_db_nameservice::SubscriptionScope::All);
+
+        sm.apply([create_ledger_entry(1, "test/db")]).await.unwrap();
+        sm.apply([advance_entry(2, "test/db", None, cid(7), 10)])
+            .await
+            .unwrap();
+        sm.apply([Entry {
+            log_id: log_id(1, 3),
+            payload: EntryPayload::Normal(RaftCommand::CreateBranch(
+                crate::raft::state_machine::CreateBranchArgs {
+                    ledger_id: "test/db".into(),
+                    branch: "feature".into(),
+                    source_branch: "main".into(),
+                    at_commit: None,
+                    applied_at_millis: 3_000,
+                },
+            )),
+        }])
+        .await
+        .unwrap();
+        // Drain the commit + create-branch events.
+        let _ = sub.receiver.try_recv().expect("commit event");
+        let _ = sub.receiver.try_recv().expect("create-branch event");
+
+        sm.apply([Entry {
+            log_id: log_id(1, 4),
+            payload: EntryPayload::Normal(RaftCommand::DropBranch {
+                ledger_id: "test/db".into(),
+                branch: "feature".into(),
+            }),
+        }])
+        .await
+        .unwrap();
+
+        match sub.receiver.try_recv().expect("drop-branch event") {
+            NameServiceEvent::LedgerRetracted { ledger_id } => {
+                assert_eq!(ledger_id, "test/db:feature");
+            }
+            other => panic!("expected LedgerRetracted, got {other:?}"),
+        }
     }
 
     #[tokio::test]

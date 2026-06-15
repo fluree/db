@@ -349,6 +349,11 @@ impl Committer for RaftCommitter {
             }),
             SmResponse::Created { .. }
             | SmResponse::AlreadyExists { .. }
+            | SmResponse::BranchCreated { .. }
+            | SmResponse::SourceBranchNotFound { .. }
+            | SmResponse::BranchDropped { .. }
+            | SmResponse::BranchHasChildren { .. }
+            | SmResponse::HeadReset { .. }
             | SmResponse::Retracted { .. }
             | SmResponse::AlreadyRetracted { .. }
             | SmResponse::Purged { .. }
@@ -529,6 +534,11 @@ impl Committer for RaftCommitter {
             }),
             SmResponse::Created { .. }
             | SmResponse::AlreadyExists { .. }
+            | SmResponse::BranchCreated { .. }
+            | SmResponse::SourceBranchNotFound { .. }
+            | SmResponse::BranchDropped { .. }
+            | SmResponse::BranchHasChildren { .. }
+            | SmResponse::HeadReset { .. }
             | SmResponse::Retracted { .. }
             | SmResponse::AlreadyRetracted { .. }
             | SmResponse::Purged { .. }
@@ -707,6 +717,11 @@ impl Committer for RaftCommitter {
             }),
             SmResponse::Created { .. }
             | SmResponse::AlreadyExists { .. }
+            | SmResponse::BranchCreated { .. }
+            | SmResponse::SourceBranchNotFound { .. }
+            | SmResponse::BranchDropped { .. }
+            | SmResponse::BranchHasChildren { .. }
+            | SmResponse::HeadReset { .. }
             | SmResponse::Retracted { .. }
             | SmResponse::AlreadyRetracted { .. }
             | SmResponse::Purged { .. }
@@ -879,6 +894,11 @@ impl Committer for RaftCommitter {
             }),
             SmResponse::Created { .. }
             | SmResponse::AlreadyExists { .. }
+            | SmResponse::BranchCreated { .. }
+            | SmResponse::SourceBranchNotFound { .. }
+            | SmResponse::BranchDropped { .. }
+            | SmResponse::BranchHasChildren { .. }
+            | SmResponse::HeadReset { .. }
             | SmResponse::Retracted { .. }
             | SmResponse::AlreadyRetracted { .. }
             | SmResponse::Purged { .. }
@@ -1013,6 +1033,11 @@ impl Committer for RaftCommitter {
             }),
             SmResponse::Created { .. }
             | SmResponse::AlreadyExists { .. }
+            | SmResponse::BranchCreated { .. }
+            | SmResponse::SourceBranchNotFound { .. }
+            | SmResponse::BranchDropped { .. }
+            | SmResponse::BranchHasChildren { .. }
+            | SmResponse::HeadReset { .. }
             | SmResponse::Retracted { .. }
             | SmResponse::AlreadyRetracted { .. }
             | SmResponse::Purged { .. }

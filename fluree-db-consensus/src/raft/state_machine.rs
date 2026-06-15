@@ -112,6 +112,15 @@ pub struct RefEntry {
     /// [`Command::AdvanceIndexHead`] (typically driven by the
     /// indexer running on the current leader).
     pub index: Option<IndexState>,
+    /// Branch this one was forked from, or `None` for roots and for
+    /// branches that came into being through [`Command::AdvanceRef`]'s
+    /// self-healing path. Always serialized — postcard is positional
+    /// and would drop a `skip_serializing_if` field on the wire.
+    pub source_branch: Option<String>,
+    /// Count of child branches forked from this one via
+    /// [`Command::CreateBranch`]. [`Command::DropBranch`] refuses to
+    /// remove a branch whose `branches` count is non-zero.
+    pub branches: u32,
 }
 
 /// Lifecycle record for one ledger.
@@ -193,6 +202,27 @@ pub enum Command {
     /// [`RefEntry`] is created until the first
     /// [`Command::AdvanceRef`] for the branch.
     CreateLedger(CreateLedgerArgs),
+    /// Fork a new branch from an existing one. Increments the
+    /// source branch's child counter and records parentage on the
+    /// new [`RefEntry`]. The new branch is born with the source's
+    /// current head (or `at_commit` if supplied).
+    CreateBranch(CreateBranchArgs),
+    /// Drop a branch created via [`Command::CreateBranch`] (or
+    /// implicit branch creation through [`Command::AdvanceRef`]),
+    /// decrementing the parent's child counter when applicable.
+    /// Refuses to remove a branch whose own `branches` count is
+    /// non-zero. Unlike [`Command::PurgeLedger`], not idempotent on
+    /// missing branches — returns `LedgerNotFound`.
+    DropBranch { ledger_id: String, branch: String },
+    /// Non-monotonic head reset for rebase/merge rollback. Sets
+    /// head, t, and index from the supplied snapshot regardless of
+    /// the branch's current values. A `commit_head_id: None`
+    /// snapshot removes the [`RefEntry`] (branch becomes unborn).
+    ResetHead {
+        ledger_id: String,
+        branch: String,
+        snapshot: ResetHeadSnapshot,
+    },
     /// Soft-drop a branch: mark it retracted but leave its
     /// [`LedgerRecord`] and [`RefEntry`] entries in place so the
     /// alias can't be reused. Idempotent.
@@ -271,6 +301,35 @@ pub struct CreateLedgerArgs {
     pub created_at_millis: u64,
 }
 
+/// Payload for [`Command::CreateBranch`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateBranchArgs {
+    pub ledger_id: String,
+    /// New branch name to create.
+    pub branch: String,
+    /// Existing branch this one forks from. Must have a born
+    /// [`RefEntry`] or apply returns `SourceBranchNotFound`.
+    pub source_branch: String,
+    /// Optional starting commit. `None` means "fork from source's
+    /// current head"; `Some((id, t))` overrides with a specific
+    /// historical commit on the source's chain.
+    pub at_commit: Option<(ContentId, i64)>,
+    /// Leader's wall-clock at proposal, milliseconds since epoch.
+    pub applied_at_millis: u64,
+}
+
+/// Payload for [`Command::ResetHead`]. Mirrors
+/// [`fluree_db_nameservice::NsRecordSnapshot`] in a postcard-friendly
+/// shape so the apply path can reconstruct the desired state without
+/// taking a direct dependency on the read-side type.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResetHeadSnapshot {
+    pub commit_head_id: Option<ContentId>,
+    pub commit_t: i64,
+    pub index_head_id: Option<ContentId>,
+    pub index_t: i64,
+}
+
 /// State-machine apply outcome. The leader's pipeline builds a typed
 /// caller-facing receipt from this plus its pipeline-local context.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -332,9 +391,33 @@ pub enum Response {
     /// [`Command::CreateLedger`] succeeded. `ledger_id` is the full
     /// `name:branch` form.
     Created { ledger_id: String },
-    /// [`Command::CreateLedger`] failed because the branch is already
-    /// registered (whether retracted or not).
+    /// [`Command::CreateLedger`] or [`Command::CreateBranch`] failed
+    /// because the branch is already registered (whether retracted
+    /// or not).
     AlreadyExists { ledger_id: String },
+    /// [`Command::CreateBranch`] succeeded.
+    BranchCreated {
+        ledger_id: String,
+        head: ContentId,
+        t: i64,
+    },
+    /// [`Command::CreateBranch`] couldn't find a born source branch
+    /// to fork from.
+    SourceBranchNotFound { ledger_id: String },
+    /// [`Command::DropBranch`] succeeded. `parent_branches` is the
+    /// updated child count of the dropped branch's source (or `None`
+    /// if the dropped branch had no recorded parent — root or
+    /// self-healed).
+    BranchDropped {
+        ledger_id: String,
+        parent_branches: Option<u32>,
+    },
+    /// [`Command::DropBranch`] refused because the branch still has
+    /// children forked from it. Caller must drop the children first.
+    BranchHasChildren { ledger_id: String, children: u32 },
+    /// [`Command::ResetHead`] succeeded — the branch's head, t, and
+    /// index were rewritten from the supplied snapshot.
+    HeadReset { ledger_id: String },
     /// [`Command::RetractLedger`] flipped a branch from active to
     /// retracted.
     Retracted { ledger_id: String },
@@ -394,6 +477,13 @@ pub fn apply(state: &mut NameServiceState, command: Command, log_index: u64) -> 
         Command::AdvanceRef(args) => advance_ref(state, log_index, args),
         Command::AdvanceIndexHead(args) => advance_index_head(state, args),
         Command::CreateLedger(args) => create_ledger(state, log_index, args),
+        Command::CreateBranch(args) => create_branch(state, log_index, args),
+        Command::DropBranch { ledger_id, branch } => drop_branch(state, ledger_id, branch),
+        Command::ResetHead {
+            ledger_id,
+            branch,
+            snapshot,
+        } => reset_head(state, ledger_id, branch, snapshot),
         Command::RetractLedger { ledger_id, branch } => retract_ledger(state, ledger_id, branch),
         Command::PurgeLedger { ledger_id, branch } => purge_ledger(state, ledger_id, branch),
         Command::ReleaseContent { id: _ } => Response::NoOp,
@@ -457,10 +547,15 @@ fn advance_ref(
         ledger.branches.push(branch.clone());
     }
 
-    // Carry the existing index forward across commit advances — the
-    // new commit doesn't index itself; that happens later via
-    // `AdvanceIndexHead`.
-    let prior_index = state.refs.get(&ref_key).and_then(|r| r.index.clone());
+    // Carry the existing index and lineage forward across commit
+    // advances — the new commit doesn't index itself (that happens
+    // later via `AdvanceIndexHead`), and it doesn't change parentage
+    // or child count.
+    let (prior_index, prior_source, prior_branches) = state
+        .refs
+        .get(&ref_key)
+        .map(|r| (r.index.clone(), r.source_branch.clone(), r.branches))
+        .unwrap_or_default();
     state.refs.insert(
         ref_key,
         RefEntry {
@@ -469,6 +564,8 @@ fn advance_ref(
             last_advanced_at_millis: applied_at_millis,
             last_advanced_index: log_index,
             index: prior_index,
+            source_branch: prior_source,
+            branches: prior_branches,
         },
     );
 
@@ -552,7 +649,9 @@ fn purge_ledger(
 ) -> Response {
     let key = RefKey::new(&ledger_id, &branch);
     let full = format_ledger_id(&ledger_id, &branch);
-    let removed_ref = state.refs.remove(&key).is_some();
+    let removed_source = state.refs.remove(&key).and_then(|r| r.source_branch);
+    let removed_ref = removed_source.is_some()
+        || state.refs.get(&key).is_some();
     let removed_retraction = state.retracted.remove(&key);
     let removed_branch = match state.ledgers.get_mut(&ledger_id) {
         Some(ledger) => {
@@ -566,10 +665,185 @@ fn purge_ledger(
         }
         None => false,
     };
+    if let Some(parent) = removed_source {
+        decrement_child_count(state, &ledger_id, &parent);
+    }
     if removed_ref || removed_retraction || removed_branch {
         Response::Purged { ledger_id: full }
     } else {
         Response::AlreadyPurged { ledger_id: full }
+    }
+}
+
+fn create_branch(
+    state: &mut NameServiceState,
+    log_index: u64,
+    args: CreateBranchArgs,
+) -> Response {
+    let CreateBranchArgs {
+        ledger_id,
+        branch,
+        source_branch,
+        at_commit,
+        applied_at_millis,
+    } = args;
+    let full = format_ledger_id(&ledger_id, &branch);
+
+    let Some(ledger) = state.ledgers.get_mut(&ledger_id) else {
+        return Response::LedgerNotFound { ledger_id };
+    };
+    if ledger.branches.contains(&branch) {
+        return Response::AlreadyExists { ledger_id: full };
+    }
+
+    let source_key = RefKey::new(&ledger_id, &source_branch);
+    let Some(source) = state.refs.get(&source_key) else {
+        return Response::SourceBranchNotFound {
+            ledger_id: format_ledger_id(&ledger_id, &source_branch),
+        };
+    };
+    let (head, t) = at_commit.unwrap_or_else(|| (source.head.clone(), source.t));
+
+    // Update LedgerRecord first so the borrow on `source` from
+    // `state.refs` releases before we mutate refs further.
+    state
+        .ledgers
+        .get_mut(&ledger_id)
+        .expect("ledger checked above")
+        .branches
+        .push(branch.clone());
+
+    // Bump the source's child count.
+    if let Some(src) = state.refs.get_mut(&source_key) {
+        src.branches = src.branches.saturating_add(1);
+    }
+
+    state.refs.insert(
+        RefKey::new(&ledger_id, &branch),
+        RefEntry {
+            head: head.clone(),
+            t,
+            last_advanced_at_millis: applied_at_millis,
+            last_advanced_index: log_index,
+            index: None,
+            source_branch: Some(source_branch),
+            branches: 0,
+        },
+    );
+
+    Response::BranchCreated {
+        ledger_id: full,
+        head,
+        t,
+    }
+}
+
+fn drop_branch(
+    state: &mut NameServiceState,
+    ledger_id: String,
+    branch: String,
+) -> Response {
+    let key = RefKey::new(&ledger_id, &branch);
+    let full = format_ledger_id(&ledger_id, &branch);
+
+    let ledger_known = state
+        .ledgers
+        .get(&ledger_id)
+        .is_some_and(|l| l.branches.iter().any(|b| b == &branch));
+    if !ledger_known {
+        return Response::LedgerNotFound { ledger_id: full };
+    }
+
+    if let Some(entry) = state.refs.get(&key) {
+        if entry.branches > 0 {
+            return Response::BranchHasChildren {
+                ledger_id: full,
+                children: entry.branches,
+            };
+        }
+    }
+
+    let removed_source = state.refs.remove(&key).and_then(|r| r.source_branch);
+    state.retracted.remove(&key);
+    if let Some(ledger) = state.ledgers.get_mut(&ledger_id) {
+        ledger.branches.retain(|b| b != &branch);
+        if ledger.branches.is_empty() {
+            state.ledgers.remove(&ledger_id);
+        }
+    }
+    let parent_branches = removed_source
+        .as_deref()
+        .map(|parent| decrement_child_count(state, &ledger_id, parent));
+
+    Response::BranchDropped {
+        ledger_id: full,
+        parent_branches,
+    }
+}
+
+fn reset_head(
+    state: &mut NameServiceState,
+    ledger_id: String,
+    branch: String,
+    snapshot: ResetHeadSnapshot,
+) -> Response {
+    let key = RefKey::new(&ledger_id, &branch);
+    let full = format_ledger_id(&ledger_id, &branch);
+    let ledger_known = state
+        .ledgers
+        .get(&ledger_id)
+        .is_some_and(|l| l.branches.iter().any(|b| b == &branch));
+    if !ledger_known {
+        return Response::LedgerNotFound { ledger_id: full };
+    }
+
+    let ResetHeadSnapshot {
+        commit_head_id,
+        commit_t,
+        index_head_id,
+        index_t,
+    } = snapshot;
+
+    let Some(head) = commit_head_id else {
+        // Snapshot is unborn — remove the RefEntry; the branch keeps
+        // its slot on `LedgerRecord.branches`.
+        state.refs.remove(&key);
+        return Response::HeadReset { ledger_id: full };
+    };
+
+    let (prior_source, prior_branches) = state
+        .refs
+        .get(&key)
+        .map(|r| (r.source_branch.clone(), r.branches))
+        .unwrap_or_default();
+    let index = index_head_id.map(|head| IndexState { head, t: index_t });
+    state.refs.insert(
+        key,
+        RefEntry {
+            head,
+            t: commit_t,
+            last_advanced_at_millis: 0,
+            last_advanced_index: 0,
+            index,
+            source_branch: prior_source,
+            branches: prior_branches,
+        },
+    );
+    Response::HeadReset { ledger_id: full }
+}
+
+/// Saturating decrement of a parent branch's child counter. Returns
+/// the post-decrement count, or `0` if the parent is gone.
+fn decrement_child_count(
+    state: &mut NameServiceState,
+    ledger_id: &str,
+    parent_branch: &str,
+) -> u32 {
+    if let Some(parent) = state.refs.get_mut(&RefKey::new(ledger_id, parent_branch)) {
+        parent.branches = parent.branches.saturating_sub(1);
+        parent.branches
+    } else {
+        0
     }
 }
 
@@ -1130,6 +1404,353 @@ mod tests {
             resp,
             Response::Created {
                 ledger_id: "test/db:main".into()
+            }
+        );
+    }
+
+    // ------------------------------------------------------------
+    // CreateBranch / DropBranch / ResetHead
+    // ------------------------------------------------------------
+
+    fn create_branch_cmd_helper(
+        ledger_id: &str,
+        new_branch: &str,
+        source_branch: &str,
+        at_commit: Option<(ContentId, i64)>,
+    ) -> Command {
+        Command::CreateBranch(CreateBranchArgs {
+            ledger_id: ledger_id.into(),
+            branch: new_branch.into(),
+            source_branch: source_branch.into(),
+            at_commit,
+            applied_at_millis: 2_000,
+        })
+    }
+
+    #[test]
+    fn create_branch_forks_from_source_head_when_at_commit_is_none() {
+        let mut state = NameServiceState::new();
+        create_ledger_with_genesis(&mut state, "test/db");
+        apply(
+            &mut state,
+            advance("test/db", "main", Some(cid(0)), cid(1), 7, None),
+            2,
+        );
+
+        let resp = apply(
+            &mut state,
+            create_branch_cmd_helper("test/db", "feature", "main", None),
+            3,
+        );
+        assert_eq!(
+            resp,
+            Response::BranchCreated {
+                ledger_id: "test/db:feature".into(),
+                head: cid(1),
+                t: 7,
+            }
+        );
+        let feature = state.refs.get(&RefKey::new("test/db", "feature")).unwrap();
+        assert_eq!(feature.head, cid(1));
+        assert_eq!(feature.source_branch, Some("main".to_string()));
+        let main = state.refs.get(&RefKey::new("test/db", "main")).unwrap();
+        assert_eq!(main.branches, 1);
+    }
+
+    #[test]
+    fn create_branch_uses_at_commit_when_supplied() {
+        let mut state = NameServiceState::new();
+        create_ledger_with_genesis(&mut state, "test/db");
+        apply(
+            &mut state,
+            advance("test/db", "main", Some(cid(0)), cid(1), 7, None),
+            2,
+        );
+
+        let resp = apply(
+            &mut state,
+            create_branch_cmd_helper("test/db", "feature", "main", Some((cid(0), 0))),
+            3,
+        );
+        assert_eq!(
+            resp,
+            Response::BranchCreated {
+                ledger_id: "test/db:feature".into(),
+                head: cid(0),
+                t: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn create_branch_rejects_when_ledger_missing() {
+        let mut state = NameServiceState::new();
+        let resp = apply(
+            &mut state,
+            create_branch_cmd_helper("missing", "feature", "main", None),
+            1,
+        );
+        assert_eq!(
+            resp,
+            Response::LedgerNotFound {
+                ledger_id: "missing".into()
+            }
+        );
+    }
+
+    #[test]
+    fn create_branch_rejects_when_source_unborn() {
+        // The source branch exists in `LedgerRecord.branches` but
+        // has no RefEntry yet — it's unborn, so it has no head to
+        // fork from.
+        let mut state = NameServiceState::new();
+        apply(&mut state, create_ledger("test/db"), 1);
+        let resp = apply(
+            &mut state,
+            create_branch_cmd_helper("test/db", "feature", "main", None),
+            2,
+        );
+        assert_eq!(
+            resp,
+            Response::SourceBranchNotFound {
+                ledger_id: "test/db:main".into()
+            }
+        );
+    }
+
+    #[test]
+    fn create_branch_rejects_duplicate() {
+        let mut state = NameServiceState::new();
+        create_ledger_with_genesis(&mut state, "test/db");
+        apply(
+            &mut state,
+            create_branch_cmd_helper("test/db", "feature", "main", None),
+            2,
+        );
+        let resp = apply(
+            &mut state,
+            create_branch_cmd_helper("test/db", "feature", "main", None),
+            3,
+        );
+        assert_eq!(
+            resp,
+            Response::AlreadyExists {
+                ledger_id: "test/db:feature".into()
+            }
+        );
+    }
+
+    #[test]
+    fn drop_branch_removes_record_and_decrements_parent_counter() {
+        let mut state = NameServiceState::new();
+        create_ledger_with_genesis(&mut state, "test/db");
+        apply(
+            &mut state,
+            create_branch_cmd_helper("test/db", "feature", "main", None),
+            2,
+        );
+        let resp = apply(
+            &mut state,
+            Command::DropBranch {
+                ledger_id: "test/db".into(),
+                branch: "feature".into(),
+            },
+            3,
+        );
+        assert_eq!(
+            resp,
+            Response::BranchDropped {
+                ledger_id: "test/db:feature".into(),
+                parent_branches: Some(0),
+            }
+        );
+        assert!(!state.refs.contains_key(&RefKey::new("test/db", "feature")));
+        let main = state.refs.get(&RefKey::new("test/db", "main")).unwrap();
+        assert_eq!(main.branches, 0);
+    }
+
+    #[test]
+    fn drop_branch_refuses_when_branch_has_children() {
+        let mut state = NameServiceState::new();
+        create_ledger_with_genesis(&mut state, "test/db");
+        apply(
+            &mut state,
+            create_branch_cmd_helper("test/db", "feature", "main", None),
+            2,
+        );
+        // `main` has one child now — can't drop until the child is
+        // dropped first.
+        let resp = apply(
+            &mut state,
+            Command::DropBranch {
+                ledger_id: "test/db".into(),
+                branch: "main".into(),
+            },
+            3,
+        );
+        assert_eq!(
+            resp,
+            Response::BranchHasChildren {
+                ledger_id: "test/db:main".into(),
+                children: 1,
+            }
+        );
+        // State untouched.
+        assert!(state.refs.contains_key(&RefKey::new("test/db", "main")));
+    }
+
+    #[test]
+    fn drop_branch_errors_when_branch_missing() {
+        let mut state = NameServiceState::new();
+        let resp = apply(
+            &mut state,
+            Command::DropBranch {
+                ledger_id: "missing".into(),
+                branch: "main".into(),
+            },
+            1,
+        );
+        assert_eq!(
+            resp,
+            Response::LedgerNotFound {
+                ledger_id: "missing:main".into()
+            }
+        );
+    }
+
+    #[test]
+    fn drop_branch_returns_none_parent_for_root() {
+        let mut state = NameServiceState::new();
+        create_ledger_with_genesis(&mut state, "test/db");
+        // `main` was added via CreateLedger + AdvanceRef — no
+        // recorded parent.
+        let resp = apply(
+            &mut state,
+            Command::DropBranch {
+                ledger_id: "test/db".into(),
+                branch: "main".into(),
+            },
+            2,
+        );
+        assert_eq!(
+            resp,
+            Response::BranchDropped {
+                ledger_id: "test/db:main".into(),
+                parent_branches: None,
+            }
+        );
+        // Last branch on the ledger — LedgerRecord drops too.
+        assert!(!state.ledgers.contains_key("test/db"));
+    }
+
+    #[test]
+    fn purge_decrements_parent_counter_when_branch_has_a_source() {
+        let mut state = NameServiceState::new();
+        create_ledger_with_genesis(&mut state, "test/db");
+        apply(
+            &mut state,
+            create_branch_cmd_helper("test/db", "feature", "main", None),
+            2,
+        );
+        apply(
+            &mut state,
+            Command::PurgeLedger {
+                ledger_id: "test/db".into(),
+                branch: "feature".into(),
+            },
+            3,
+        );
+        let main = state.refs.get(&RefKey::new("test/db", "main")).unwrap();
+        assert_eq!(main.branches, 0);
+    }
+
+    #[test]
+    fn reset_head_rewrites_branch_state_from_snapshot() {
+        let mut state = NameServiceState::new();
+        create_ledger_with_genesis(&mut state, "test/db");
+        apply(
+            &mut state,
+            advance("test/db", "main", Some(cid(0)), cid(5), 10, None),
+            2,
+        );
+        apply(
+            &mut state,
+            advance_index("test/db", "main", cid(42), 10),
+            3,
+        );
+
+        let resp = apply(
+            &mut state,
+            Command::ResetHead {
+                ledger_id: "test/db".into(),
+                branch: "main".into(),
+                snapshot: ResetHeadSnapshot {
+                    commit_head_id: Some(cid(0)),
+                    commit_t: 0,
+                    index_head_id: None,
+                    index_t: 0,
+                },
+            },
+            4,
+        );
+        assert_eq!(
+            resp,
+            Response::HeadReset {
+                ledger_id: "test/db:main".into()
+            }
+        );
+        let entry = state.refs.get(&RefKey::new("test/db", "main")).unwrap();
+        assert_eq!(entry.head, cid(0));
+        assert_eq!(entry.t, 0);
+        assert_eq!(entry.index, None);
+    }
+
+    #[test]
+    fn reset_head_to_unborn_removes_the_ref_entry() {
+        let mut state = NameServiceState::new();
+        create_ledger_with_genesis(&mut state, "test/db");
+        apply(
+            &mut state,
+            Command::ResetHead {
+                ledger_id: "test/db".into(),
+                branch: "main".into(),
+                snapshot: ResetHeadSnapshot {
+                    commit_head_id: None,
+                    commit_t: 0,
+                    index_head_id: None,
+                    index_t: 0,
+                },
+            },
+            2,
+        );
+        assert!(!state.refs.contains_key(&RefKey::new("test/db", "main")));
+        // The LedgerRecord still has the branch registered, so it's
+        // considered unborn — lookup still surfaces it.
+        let ledger = state.ledgers.get("test/db").unwrap();
+        assert!(ledger.branches.contains(&"main".to_string()));
+    }
+
+    #[test]
+    fn reset_head_returns_not_found_for_unknown_branch() {
+        let mut state = NameServiceState::new();
+        let resp = apply(
+            &mut state,
+            Command::ResetHead {
+                ledger_id: "missing".into(),
+                branch: "main".into(),
+                snapshot: ResetHeadSnapshot {
+                    commit_head_id: Some(cid(0)),
+                    commit_t: 0,
+                    index_head_id: None,
+                    index_t: 0,
+                },
+            },
+            1,
+        );
+        assert_eq!(
+            resp,
+            Response::LedgerNotFound {
+                ledger_id: "missing:main".into()
             }
         );
     }
