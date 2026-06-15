@@ -18,7 +18,8 @@ fluree create <LEDGER> [OPTIONS]
 
 | Option | Description |
 |--------|-------------|
-| `--from <PATH>` | Import data from a file (Turtle, N-Triples, N-Quads, TriG, or JSON-LD), optionally `.gz`- or `.zst`-compressed. N-Triples (`.nt`) parses as Turtle; N-Quads (`.nq`) converts to TriG (named graphs supported). |
+| `--from <PATH>` | Import data from a file (Turtle, N-Triples, N-Quads, TriG, or JSON-LD), optionally `.gz`- or `.zst`-compressed. N-Triples (`.nt`) parses as Turtle; N-Quads (`.nq`) converts to TriG (named graphs supported). A `.flpack` archive (see [export](export.md)) is restored wholesale instead — full ledger including its prebuilt index. |
+| `--remote <NAME>` | Create on a remote server instead of locally. With no `--from`, creates an empty ledger. With `--from <archive>.flpack`, streams the archive to the server's import endpoint to restore the ledger remotely. Other `--from` formats are not supported remotely — export to `.flpack` first, or create locally then [publish](publish.md). |
 | `--memory [PATH]` | Import memory history from a git-tracked `.fluree-memory/` directory. Defaults to the current repo if no path is given. Mutually exclusive with `--from`. |
 | `--no-user` | Exclude user-scoped memories (`.local/user.ttl`) from `--memory` import |
 | `--chunk-size-mb <MB>` | Chunk size in MB for splitting large Turtle files (0 = derive from memory budget). Only used when `--from` points to a `.ttl` or `.nt` file. |
@@ -40,6 +41,12 @@ Use `--from` to create a ledger pre-populated with data from a Turtle, N-Triples
 
 Use `--memory` to import your project's developer memory history into a time-travel-capable Fluree ledger. Each git commit that touched `.fluree-memory/repo.ttl` (and `.local/user.ttl` unless `--no-user` is set) becomes a Fluree transaction. The git commit message, SHA, and author date are stored as transaction metadata, so you can correlate Fluree `t` values with git history.
 
+### Restoring from a `.flpack` archive
+
+When `--from` points at a `.flpack` file (produced by `fluree export <ledger> --format ledger`), the ledger is restored *wholesale* rather than bulk-imported: every commit, transaction blob, and prebuilt index artifact is streamed straight into storage and the heads are set from the archive — the restored ledger is byte-for-byte identical and immediately queryable, under whatever name you choose.
+
+Add `--remote <name>` to restore onto a server instead of locally; the archive streams to the server's import endpoint, so no local staging instance is needed. This makes `.flpack` the universal way to move any data onto a server — build a ledger locally in any format, export it, then import it remotely. See [pack archive & restore](../operations/pack-archive-restore.md) for the full workflow.
+
 ## Examples
 
 ```bash
@@ -54,6 +61,12 @@ fluree create mydb --from initial.jsonld
 
 # Create with explicit memory and parallelism for a large Turtle file
 fluree create mydb --from large.ttl --memory-budget-mb 4096 --parallelism 8
+
+# Restore a .flpack archive into a new local ledger (any name)
+fluree create restored-db --from mydb.flpack
+
+# Restore a .flpack archive onto a remote server
+fluree create restored-db --remote origin --from mydb.flpack
 
 # Import memory history from the current repo
 fluree create memories --memory

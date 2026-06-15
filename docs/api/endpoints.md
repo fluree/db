@@ -633,6 +633,79 @@ curl -X POST "http://localhost:8090/v1/fluree/pack/mydb:main" \
   --output pack.bin
 ```
 
+### POST /import/*ledger
+
+Create a **new** ledger by restoring a `.flpack` archive — the inbound
+counterpart of `POST /pack/*ledger`. The request body is the raw `.flpack`
+stream (as produced by `fluree export <ledger> --format ledger` or
+`Fluree::archive_ledger`). The server streams the archive into storage — commits,
+transaction blobs, and any prebuilt index artifacts — then finalizes the commit
+and index heads from the archive's embedded nameservice manifest.
+
+The new ledger is named by the URL path and is **independent of the source
+ledger's name**, so the same archive can be restored under any name. Unlike
+`/push`, the archive is trusted byte-for-byte (every frame is SHA-256 verified)
+and not replayed, and the prebuilt index rides along — so the restored ledger is
+immediately queryable with no reindex.
+
+**Admin-protected** (same bracket as `/create` and `/drop`): the body carries
+prebuilt index artifacts the server did not produce, so this is an admin-grade
+operation. The archive is decoded frame-by-frame and never buffered whole, so
+multi-gigabyte archives restore without exhausting server memory.
+
+**URL:**
+
+```
+POST /import/<ledger...>
+```
+
+**Request Headers:**
+
+```http
+Content-Type: application/x-fluree-pack
+Authorization: Bearer <token>   (admin token when configured)
+```
+
+**Request Body:** the raw `.flpack` byte stream.
+
+**Response:** `201 Created` with a JSON summary:
+
+```json
+{
+  "ledger_id": "restored-db:main",
+  "commits": 12,
+  "txn_blobs": 12,
+  "index_artifacts": 34,
+  "commit_t": 12,
+  "index_t": 12
+}
+```
+
+`index_artifacts` is `0` and `index_t` is omitted for a commits-only archive
+(exported with `--no-indexes`); such a ledger replays from commits on first load.
+
+**Status codes:**
+
+- `201 Created`: ledger restored
+- `400 Bad Request`: malformed archive (bad preamble/frame, missing manifest, or a manifest head CID not present in the archive)
+- `409 Conflict`: a ledger with that name already exists
+- `401 Unauthorized`: missing or invalid admin token
+
+On any mid-stream failure the partially-created ledger is rolled back, so a
+failed import never leaves a live, half-ingested ledger behind.
+
+**Example:**
+
+```bash
+# Restore an archive into a brand-new ledger named "restored-db:main"
+curl -X POST "http://localhost:8090/v1/fluree/import/restored-db:main" \
+  -H "Content-Type: application/x-fluree-pack" \
+  -H "Authorization: Bearer $TOKEN" \
+  --data-binary @mydb.flpack
+```
+
+This is the transport behind `fluree create restored-db --remote origin --from mydb.flpack`.
+
 ## Storage Proxy Endpoints
 
 These endpoints are intended for peer mode and `fluree clone`/`pull` workflows. They require the storage proxy to be enabled on the server and use replication-grade Bearer tokens (`fluree.storage.*` claims).
