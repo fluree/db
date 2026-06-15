@@ -149,7 +149,8 @@ ORDER BY / SKIP / LIMIT
   filter to age-bearing nodes above 30 (the `>` comparison on an
   unbound binding yields filter-context false). Bare-variable
   target only in v1; chained accessors (`n.a.b`) are rejected.
-- ORDER BY (variable or property-accessor keys), SKIP, LIMIT.
+- ORDER BY (variable, property-accessor, or general expression keys —
+  e.g. `ORDER BY toInteger(n.id)`), SKIP, LIMIT.
 - `UNWIND [literals] AS x` — inline list literal unwinding.
 - List functions over a `collect()` list: `size`, `head`, `last`,
   `tail`, `reverse` (and `size`/`reverse` over a string). Usable in the

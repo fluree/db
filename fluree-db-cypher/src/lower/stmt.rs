@@ -850,10 +850,24 @@ fn lower_order_by<E: IriEncoder>(
             Expr::Prop(target, key, _) => {
                 crate::lower::expr::resolve_property_accessor(ctx, target, key, aux)?
             }
-            _ => {
+            // An aggregate ORDER BY key must reference a projected alias (the
+            // aggregate is computed by grouping, not re-derivable in a sort
+            // Bind). `align_order_by_with_projection` already rewrites a key
+            // that matches a projected item to its alias.
+            other if expr_has_aggregate(other) => {
                 return Err(LowerError::unsupported(
-                    "ORDER BY accepts a variable or a property accessor in v1 (e.g., `ORDER BY n` or `ORDER BY n.age`) — richer expression-keyed ordering needs an explicit `WITH expr AS alias ORDER BY alias`",
+                    "ORDER BY over an aggregate must reference its projected alias \
+                     (e.g. `RETURN count(x) AS c ORDER BY c`)",
                 ));
+            }
+            // A general expression key (`ORDER BY toInteger(n.id)`, arithmetic,
+            // etc.): lower it to a synthetic pre-sort Bind and order by that var.
+            // Property accessors inside it emit their own aux patterns.
+            other => {
+                let expr = crate::lower::expr::lower_expr(ctx, other, aux)?;
+                let var = ctx.fresh_synth();
+                aux.push(Pattern::Bind { var, expr });
+                var
             }
         };
         let direction = match it.direction {

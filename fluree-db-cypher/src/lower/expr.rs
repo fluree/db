@@ -149,6 +149,10 @@ pub fn lower_expr<E: IriEncoder>(
                 "tail" => Function::Tail,
                 "reverse" => Function::Reverse,
                 "tostring" => Function::Str,
+                // Cypher numeric casts (LDBC orders string ids numerically via
+                // toInteger). Reuse the XSD cast functions.
+                "tointeger" => Function::XsdInteger,
+                "tofloat" => Function::XsdDouble,
                 _ => {
                     return Err(LowerError::unsupported(format!(
                         "function `{}` is not in the v1 expression surface",

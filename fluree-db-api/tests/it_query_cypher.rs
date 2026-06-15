@@ -2620,3 +2620,96 @@ async fn cypher_size_of_structured_collect() {
         .expect("jsonld");
     assert_eq!(n[0][0], json!(3), "three tuples collected: {n}");
 }
+
+/// Seed a KNOWS chain Alice→Bob→Carol→Dave→Eve where Bob/Carol/Dave/Eve all
+/// share fname "Friend" (distances 1..4 from Alice).
+async fn seed_ic1_chain(
+    fluree: &fluree_db_api::Fluree,
+    ledger_id: &str,
+) -> fluree_db_api::LedgerState {
+    let ledger0 = genesis_ledger(fluree, ledger_id);
+    fluree
+        .insert(
+            ledger0,
+            &json!({"@context": ctx(), "@graph": [
+                {"@id":"ex:alice","@type":"ex:Person","ex:name":"Alice","ex:fname":"Start","ex:KNOWS":{"@id":"ex:bob"}},
+                {"@id":"ex:bob","@type":"ex:Person","ex:name":"Bob","ex:fname":"Friend","ex:KNOWS":{"@id":"ex:carol"}},
+                {"@id":"ex:carol","@type":"ex:Person","ex:name":"Carol","ex:fname":"Friend","ex:KNOWS":{"@id":"ex:dave"}},
+                {"@id":"ex:dave","@type":"ex:Person","ex:name":"Dave","ex:fname":"Friend","ex:KNOWS":{"@id":"ex:eve"}},
+                {"@id":"ex:eve","@type":"ex:Person","ex:name":"Eve","ex:fname":"Friend"},
+            ]}),
+        )
+        .await
+        .expect("seed ic1 chain")
+        .ledger
+}
+
+#[tokio::test]
+async fn cypher_ic1_distance_ranking() {
+    // IC1 core: friends bound by a (non-unique) property, ranked by shortest
+    // KNOWS distance within 1..3 hops via length(shortestPath(...)). Eve (4
+    // hops) is excluded; ordered by distance.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = seed_ic1_chain(&fluree, "it/cypher:ic1-distance").await;
+    let db = graphdb_from_ledger(&l);
+
+    let out = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (p:Person {name:"Alice"}), (friend:Person {fname:"Friend"})
+               WHERE p <> friend
+               MATCH path = shortestPath((p)-[:KNOWS*1..3]-(friend))
+               RETURN friend.name AS name, length(path) AS distance
+               ORDER BY distance ASC, friend.name ASC
+               LIMIT 20"#,
+        )
+        .await
+        .expect("ic1 distance ranking")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    assert_eq!(
+        out,
+        json!([["Bob", 1], ["Carol", 2], ["Dave", 3]]),
+        "friends ranked by shortest distance, Eve (4 hops) excluded: {out}"
+    );
+}
+
+#[tokio::test]
+async fn cypher_order_by_expression_key() {
+    // ORDER BY a general expression key (IC1's `toInteger(id)` tiebreaker).
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/cypher:order-expr");
+    let l = fluree
+        .insert(
+            ledger0,
+            &json!({"@context": ctx(), "@graph": [
+                {"@id":"ex:n1","@type":"ex:Person","ex:sid":"10","ex:name":"A"},
+                {"@id":"ex:n2","@type":"ex:Person","ex:sid":"2","ex:name":"B"},
+                {"@id":"ex:n3","@type":"ex:Person","ex:sid":"30","ex:name":"C"},
+            ]}),
+        )
+        .await
+        .expect("seed")
+        .ledger;
+    let db = graphdb_from_ledger(&l);
+
+    // String ids "10","2","30" sort numerically as 2, 10, 30 via toInteger.
+    let out = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (n:Person) RETURN n.name AS name ORDER BY toInteger(n.sid)"#,
+        )
+        .await
+        .expect("order by toInteger")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    let names: Vec<&str> = out
+        .as_array()
+        .expect("rows")
+        .iter()
+        .filter_map(|r| r[0].as_str())
+        .collect();
+    assert_eq!(names, vec!["B", "A", "C"], "numeric id order (2,10,30): {out}");
+}
