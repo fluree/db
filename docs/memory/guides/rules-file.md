@@ -1,6 +1,6 @@
 # Customizing the rules file
 
-When you run `fluree memory mcp-install`, a short "rules file" gets written alongside the MCP server config. This file tells your AI tool *when and how* to use the memory tools — things the tool definitions alone don't express.
+When you run `fluree mcp install`, a short "rules file" gets written alongside the MCP server config. This file tells your AI tool *when and how* to use the memory tools — things the tool definitions alone don't express.
 
 ## Where it lives
 

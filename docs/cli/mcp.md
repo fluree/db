@@ -12,7 +12,8 @@ fluree mcp <COMMAND>
 
 | Command | Description |
 |---------|-------------|
-| `serve` | Start the MCP server |
+| `serve` | Start the developer-memory MCP server |
+| `install` | Register Fluree's MCP servers (memory and/or docs) with an IDE |
 
 ## fluree mcp serve
 
@@ -47,10 +48,12 @@ The server auto-initializes the memory store on first tool call. No separate `fl
 
 ### IDE configuration
 
-The easiest way to configure your IDE is with `fluree memory mcp-install`:
+The easiest way to configure your IDE is with [`fluree mcp install`](#fluree-mcp-install),
+which registers this memory server **and** the [`fluree-docs`](docs.md)
+documentation server in one step:
 
 ```bash
-fluree memory mcp-install --ide cursor
+fluree mcp install --ide cursor
 ```
 
 Or manually add to your IDE's MCP config:
@@ -86,8 +89,39 @@ printf '%s\n' \
 
 CLI tracing is disabled when running `fluree mcp serve` to avoid any log output on stderr that could interfere with the JSON-RPC protocol.
 
+## fluree mcp install
+
+Register Fluree's MCP servers with an IDE so its agent can use them. By default
+it installs **both** servers — `fluree-memory` (this server) and
+[`fluree-docs`](docs.md) — in one step.
+
+```bash
+fluree mcp install [--ide <IDE>] [--server <SERVER>]
+```
+
+### Options
+
+| Option | Description |
+|--------|-------------|
+| `--ide <IDE>` | Target IDE: `claude-code`, `vscode`, `cursor`, `windsurf`, `zed` (auto-detected if omitted) |
+| `--server <SERVER>` | Which server(s) to register: `memory`, `docs`, or `all` (default) |
+
+`--server docs` is handy in a project that doesn't use Fluree Memory — the docs
+server is stateless, so it needs no `.fluree/` directory:
+
+```bash
+fluree mcp install --ide cursor --server docs
+```
+
+For the per-IDE config shapes this writes, see
+[Memory: IDE setup](../memory/cli/mcp-install.md).
+
+> The older `fluree memory mcp-install` is a back-compat alias for
+> `fluree mcp install` (it always installs both servers).
+
 ## See Also
 
+- [docs](docs.md) — search the embedded documentation; the separate `fluree-docs` MCP server
 - [memory](memory.md) — CLI commands for memory management
 - [Memory: MCP server](../memory/concepts/mcp.md) — what the MCP server exposes and how agents use it
 - [Memory getting started](../memory/getting-started/README.md) — per-IDE setup (Claude Code, Cursor, VS Code, Windsurf, Zed)

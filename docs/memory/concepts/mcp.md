@@ -8,7 +8,13 @@ Fluree Memory exposes its functionality over [Model Context Protocol](https://mo
 fluree mcp serve --transport stdio
 ```
 
-In practice you never start it manually — your IDE launches it. `fluree memory mcp-install` writes the IDE-specific config that does the spawning. See [mcp-install](../cli/mcp-install.md) for the per-IDE details.
+In practice you never start it manually — your IDE launches it. `fluree mcp install` writes the IDE-specific config that does the spawning. See [mcp-install](../cli/mcp-install.md) for the per-IDE details.
+
+> **Companion server: `fluree-docs`.** `mcp-install` also registers a second,
+> independent MCP server that exposes version-pinned Fluree documentation
+> (`docs_search` / `docs_get` / `docs_examples`). It's read-only over embedded
+> content and shares nothing with the memory store. See
+> [fluree docs](../../cli/docs.md).
 
 ## Tools exposed
 

@@ -29,7 +29,7 @@ If memory ends up in a platform-global store instead of `<repo>/.fluree-memory/`
 3. **Home-dir marker** — `~/.cursor`, `~/.vscode`, `~/.codeium/windsurf`, `~/.zed`, `~/.config/zed`, `~/.claude`, `~/.claude.json`.
 4. **User-config dir** — `<config>/Code`, `<config>/Cursor`, `<config>/Windsurf`, `<config>/Zed`, where `<config>` is `~/.config` (Linux), `~/Library/Application Support` (macOS), or `%APPDATA%` (Windows). VS Code on Linux, for example, stores its first-launch marker as `~/.config/Code/`, not `~/.vscode/`.
 
-A freshly installed IDE that has never been launched **and** isn't on `PATH` may go undetected. If `init` misses your IDE, install MCP for it directly: `fluree memory mcp-install --ide <tool>`.
+A freshly installed IDE that has never been launched **and** isn't on `PATH` may go undetected. If `init` misses your IDE, install MCP for it directly: `fluree mcp install --ide <tool>`.
 
 ## Known gotchas
 

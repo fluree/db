@@ -37,7 +37,7 @@ Each IDE is detected via a combination of these signals — any one is enough:
 If `init` reports **"No AI coding tools detected"** but you do have one installed, the most likely cause is that none of those markers exist yet (e.g. a fresh install that's never been launched). You can install MCP for it directly:
 
 ```bash
-fluree memory mcp-install --ide <tool>
+fluree mcp install --ide <tool>
 # tool ∈ claude-code, cursor, vscode, windsurf, zed
 ```
 

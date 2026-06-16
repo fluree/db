@@ -4,6 +4,7 @@ pub mod completions;
 pub mod config_cmd;
 pub mod context_cmd;
 pub mod create;
+pub mod docs;
 pub mod drop;
 pub mod export;
 pub mod graph;

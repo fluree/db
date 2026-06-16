@@ -9,6 +9,13 @@ use fluree_db_memory::{
 
 mod ide;
 
+/// Install MCP config for an IDE, registering the selected Fluree MCP server(s)
+/// (`memory` / `docs` / `all`). Backs both `fluree mcp install` and the
+/// `fluree memory mcp-install` alias; needs no `.fluree/` directory.
+pub fn mcp_install(ide: Option<&str>, server: &str) -> CliResult<()> {
+    ide::run_mcp_install(ide, server)
+}
+
 pub async fn run(action: MemoryAction, dirs: &FlureeDir) -> CliResult<()> {
     match action {
         MemoryAction::Init { yes, no_mcp } => run_init(dirs, yes, no_mcp).await,
@@ -57,7 +64,12 @@ pub async fn run(action: MemoryAction, dirs: &FlureeDir) -> CliResult<()> {
         MemoryAction::Status => run_status(dirs).await,
         MemoryAction::Export => run_export(dirs).await,
         MemoryAction::Import { file } => run_import(&file, dirs).await,
-        MemoryAction::McpInstall { ide: ide_arg } => ide::run_mcp_install(ide_arg.as_deref()),
+        MemoryAction::McpInstall { ide: ide_arg } => {
+            eprintln!(
+                "note: `fluree memory mcp-install` is now `fluree mcp install` (this alias still works)."
+            );
+            mcp_install(ide_arg.as_deref(), "all")
+        }
     }
 }
 

@@ -48,6 +48,9 @@ fluree-db-binary-index = { path = "../fluree-db-binary-index" }
 # Developer memory layer
 fluree-db-memory = { path = "../fluree-db-memory", features = ["mcp"] }
 
+# Embedded docs lookup (CLI subcommand + standalone fluree-docs MCP server)
+fluree-db-docs = { path = "../fluree-db-docs", features = ["mcp"] }
+
 # MCP stdio server
 rmcp = { workspace = true }
 

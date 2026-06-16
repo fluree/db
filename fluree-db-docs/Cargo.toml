@@ -1,0 +1,29 @@
+[package]
+name = "fluree-db-docs"
+description = "Embedded, version-pinned Fluree documentation lookup (search/get/examples) for the CLI and MCP surfaces"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+# Optional rmcp-backed `DocsToolService` for the standalone `fluree-docs` MCP server.
+mcp = ["dep:rmcp", "dep:schemars"]
+
+[dependencies]
+# `include-exclude` enables the #[exclude] attribute; `compression` shrinks the
+# ~2 MB embedded corpus to ~0.6 MB in release builds.
+rust-embed = { version = "8", features = ["include-exclude", "compression"] }
+pulldown-cmark = "0.12"
+# Snowball stemming so "property path" matches the "Property Paths" heading, etc.
+rust-stemmers = "1"
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# MCP support (optional) — mirrors fluree-db-memory's `mcp` feature.
+rmcp = { workspace = true, optional = true }
+schemars = { workspace = true, optional = true }
+
+[lints]
+workspace = true

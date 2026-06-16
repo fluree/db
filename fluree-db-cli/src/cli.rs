@@ -886,6 +886,12 @@ pub enum Commands {
         action: McpAction,
     },
 
+    /// Search the embedded, version-pinned Fluree documentation
+    Docs {
+        #[command(subcommand)]
+        action: DocsAction,
+    },
+
     /// Manage Apache Iceberg table connections
     Iceberg {
         #[command(subcommand)]
@@ -1288,7 +1294,72 @@ pub enum MemoryAction {
 /// MCP subcommands.
 #[derive(Subcommand)]
 pub enum McpAction {
-    /// Start the MCP server (stdio transport for IDE integration)
+    /// Start the developer-memory MCP server (stdio transport for IDE integration)
+    Serve {
+        /// Transport: stdio (default) — reads JSON-RPC from stdin, writes to stdout
+        #[arg(long, default_value = "stdio")]
+        transport: String,
+    },
+
+    /// Register Fluree's MCP servers with an IDE (memory and/or docs)
+    Install {
+        /// Target: claude-code, vscode, cursor, windsurf, zed (auto-detected if omitted)
+        #[arg(long)]
+        ide: Option<String>,
+
+        /// Which server(s) to register: memory, docs, or all (default)
+        #[arg(long, default_value = "all")]
+        server: String,
+    },
+}
+
+/// Docs subcommands. The docs are embedded in this binary, so these work
+/// offline and are version-exact for this build.
+#[derive(Subcommand)]
+pub enum DocsAction {
+    /// Search the docs — ranked, section-level hits
+    Search {
+        /// Topic keywords, e.g. "property paths"
+        query: String,
+        /// Max hits
+        #[arg(long, default_value_t = 10)]
+        limit: usize,
+        /// Emit JSON instead of human-readable text
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print a page (or one heading-scoped section) as markdown
+    Get {
+        /// Book-relative page path, e.g. "query/sparql.md"
+        path: String,
+        /// Heading anchor to return just that section, e.g. "property-paths"
+        #[arg(long)]
+        anchor: Option<String>,
+        /// Emit JSON instead of raw markdown
+        #[arg(long)]
+        json: bool,
+    },
+    /// Extract code examples for a topic
+    Examples {
+        /// Topic keywords, e.g. "insert transaction"
+        query: String,
+        /// Filter by language, e.g. "json", "sparql"
+        #[arg(long)]
+        lang: Option<String>,
+        /// Max examples
+        #[arg(long, default_value_t = 10)]
+        limit: usize,
+        /// Emit JSON instead of human-readable text
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print the documentation table of contents
+    Tree {
+        /// Emit JSON instead of an indented tree
+        #[arg(long)]
+        json: bool,
+    },
+    /// Start the standalone `fluree-docs` MCP server (stdio transport)
     Serve {
         /// Transport: stdio (default) — reads JSON-RPC from stdin, writes to stdout
         #[arg(long, default_value = "stdio")]
