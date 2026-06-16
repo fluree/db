@@ -62,7 +62,12 @@ pub struct ServerFileConfig {
     pub cors_enabled: Option<bool>,
     pub body_limit: Option<usize>,
     pub query_timeout_ms: Option<u64>,
+    pub query_min_t_timeout_ms: Option<u64>,
     pub cache_max_mb: Option<usize>,
+
+    /// `[server.query_refresh]`
+    #[serde(default)]
+    pub query_refresh: Option<QueryRefreshFileConfig>,
 
     /// `[server.indexing]`
     #[serde(default)]
@@ -90,6 +95,12 @@ pub struct IndexingFileConfig {
     pub enabled: Option<bool>,
     pub reindex_min_bytes: Option<usize>,
     pub reindex_max_bytes: Option<usize>,
+}
+
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
+pub struct QueryRefreshFileConfig {
+    pub enabled: Option<bool>,
+    pub ttl_ms: Option<u64>,
 }
 
 #[derive(Debug, Default, Clone, Deserialize, Serialize)]
@@ -377,6 +388,9 @@ pub const CONFIG_FILE_ARG_IDS: &[&str] = &[
     "cors_enabled",
     "body_limit",
     "query_timeout_ms",
+    "query_min_t_timeout_ms",
+    "query_refresh_enabled",
+    "query_refresh_ttl_ms",
     "cache_max_mb",
     "indexing_enabled",
     "reindex_min_bytes",
@@ -486,9 +500,28 @@ pub fn apply_to_server_config(
             config.query_timeout_ms = v;
         }
     }
+    if is_default("query_min_t_timeout_ms") {
+        if let Some(v) = file.query_min_t_timeout_ms {
+            config.query_min_t_timeout_ms = v;
+        }
+    }
     if is_default("cache_max_mb") {
         if let Some(v) = file.cache_max_mb {
             config.cache_max_mb = Some(v);
+        }
+    }
+
+    // --- Query-time refresh ---
+    if let Some(ref refresh) = file.query_refresh {
+        if is_default("query_refresh_enabled") {
+            if let Some(v) = refresh.enabled {
+                config.query_refresh_enabled = v;
+            }
+        }
+        if is_default("query_refresh_ttl_ms") {
+            if let Some(v) = refresh.ttl_ms {
+                config.query_refresh_ttl_ms = v;
+            }
         }
     }
 
@@ -890,7 +923,12 @@ listen_addr = "127.0.0.1:9090"
 storage_path = "/var/lib/fluree"
 log_level = "debug"
 cors_enabled = false
+query_min_t_timeout_ms = 5000
 cache_max_mb = 5000
+
+[server.query_refresh]
+enabled = true
+ttl_ms = 200
 
 [server.indexing]
 enabled = true
@@ -912,7 +950,12 @@ default_policy_class = "ex:DefaultPolicy"
         assert_eq!(server.storage_path.as_deref(), Some("/var/lib/fluree"));
         assert_eq!(server.log_level.as_deref(), Some("debug"));
         assert_eq!(server.cors_enabled, Some(false));
+        assert_eq!(server.query_min_t_timeout_ms, Some(5000));
         assert_eq!(server.cache_max_mb, Some(5000));
+
+        let refresh = server.query_refresh.unwrap();
+        assert_eq!(refresh.enabled, Some(true));
+        assert_eq!(refresh.ttl_ms, Some(200));
 
         let idx = server.indexing.unwrap();
         assert_eq!(idx.enabled, Some(true));
