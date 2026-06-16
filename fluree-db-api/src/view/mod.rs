@@ -61,11 +61,13 @@ mod dataset;
 mod dataset_builder;
 mod dataset_query;
 mod fluree_ext;
-mod query;
+pub(crate) mod query;
 mod query_builder;
 mod query_input;
+mod stream_query;
 mod types;
 
 pub use dataset::DataSetDb;
 pub use query_input::QueryInput;
+pub use stream_query::{OwnedStreamQuery, StreamQueryPlan};
 pub use types::{ConfigReasoningBudget, DerivedFactsHandle, GraphDb, ReasoningModePrecedence};

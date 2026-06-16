@@ -18,6 +18,7 @@ mod push;
 pub(crate) mod query;
 mod show;
 mod storage_proxy;
+mod stream_query;
 mod stubs;
 mod transact;
 
@@ -94,6 +95,12 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             get(query::query_ledger_tail).post(query::query_ledger_tail),
         )
         .route("/multi-query", post(query::multi_query))
+        // Streaming SELECT results as NDJSON (ledger in greedy tail). Separate
+        // route so the standard /query path is untouched.
+        .route(
+            "/stream/query/*ledger",
+            post(stream_query::stream_query_ledger_tail),
+        )
         .route("/explain", get(query::explain).post(query::explain))
         .route(
             "/explain/*ledger",

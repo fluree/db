@@ -458,7 +458,7 @@ impl Fluree {
     ///
     /// A GraphDb is single-ledger; dataset clauses would conflict with
     /// the db's ledger alias.
-    fn validate_sparql_for_view(&self, sparql: &str) -> Result<()> {
+    pub(crate) fn validate_sparql_for_view(&self, sparql: &str) -> Result<()> {
         let ast = parse_and_validate_sparql(sparql)?;
 
         // Check for dataset clauses
@@ -488,7 +488,7 @@ impl Fluree {
     /// `f:schemaSource` (with optional `owl:imports` closure), the resolved
     /// schema bundle is attached to `options.schema_bundle` so the runner
     /// can layer it as a `SchemaBundleOverlay` at prep time.
-    async fn build_executable_for_view(
+    pub(crate) async fn build_executable_for_view(
         &self,
         db: &GraphDb,
         parsed: &fluree_db_query::ir::Query,

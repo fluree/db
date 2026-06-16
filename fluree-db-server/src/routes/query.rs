@@ -242,7 +242,10 @@ pub struct SparqlParams {
 /// If a `?query=` URL parameter is present and the credential body is empty,
 /// return the query param value as the SPARQL string. Otherwise fall back to
 /// the credential body.
-fn resolve_sparql_text(params: &SparqlParams, credential: &MaybeCredential) -> Result<String> {
+pub(crate) fn resolve_sparql_text(
+    params: &SparqlParams,
+    credential: &MaybeCredential,
+) -> Result<String> {
     // Prefer ?query= parameter when body is empty (standard SPARQL Protocol GET)
     if let Some(ref q) = params.query {
         let body = credential.body_string().unwrap_or_default();
@@ -256,7 +259,7 @@ fn resolve_sparql_text(params: &SparqlParams, credential: &MaybeCredential) -> R
 
 /// Check if the request should be treated as SPARQL based on headers OR the
 /// presence of a `?query=` URL parameter.
-fn is_sparql_request(
+pub(crate) fn is_sparql_request(
     headers: &FlureeHeaders,
     credential: &MaybeCredential,
     params: &SparqlParams,
@@ -314,7 +317,7 @@ fn has_tracking_opts(query_json: &JsonValue) -> bool {
 /// Returns true when `opts.identity` or `opts.policy-class` is present.
 /// These fields trigger policy lookup in the connection execution path;
 /// the plain GraphDb path does not process them.
-fn has_policy_opts(query_json: &JsonValue) -> bool {
+pub(crate) fn has_policy_opts(query_json: &JsonValue) -> bool {
     let Some(opts) = query_json.get("opts") else {
         return false;
     };
@@ -430,7 +433,7 @@ fn enforce_bearer_dataset_scope(
 }
 
 /// Helper to extract ledger ID from request (for JSON-LD queries)
-fn get_ledger_id(
+pub(crate) fn get_ledger_id(
     path_ledger: Option<&str>,
     headers: &FlureeHeaders,
     body: &JsonValue,
