@@ -3375,3 +3375,88 @@ async fn cypher_var_length_relationship_uniqueness_allows_cycle_closure() {
         "2-hop out-and-back reuses an edge → excluded"
     );
 }
+
+#[tokio::test]
+async fn cypher_with_limit_then_match_truncates_and_drives_downstream() {
+    // Regression: a non-final `WITH … LIMIT` (the canonical "top-N then expand"
+    // pattern, LDBC IS2) used to silently break the following MATCH. The limited
+    // WITH lowers to a subquery; the trailing MATCH re-produces the WITH's output
+    // var, which `subquery_correlation_vars` mis-read as an external correlation
+    // (a slice empties `self_produced`), deferring the WITH behind its own
+    // consumer — so the MATCH ran first as an unseeded scan: empty results, or an
+    // ignored limit. The fix restricts correlation inputs to PRECEDING siblings.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/cypher:with-limit-match");
+
+    // hub KNOWS m1,m2,m3 ; each mN KNOWS exactly one xN.
+    let txn = json!({
+        "@context": ctx(),
+        "@graph": [
+            {"@id": "ex:hub", "@type": "ex:Person", "ex:id": 0,
+             "ex:KNOWS": [{"@id": "ex:m1"}, {"@id": "ex:m2"}, {"@id": "ex:m3"}]},
+            {"@id": "ex:m1", "@type": "ex:Person", "ex:id": 1, "ex:KNOWS": {"@id": "ex:x1"}},
+            {"@id": "ex:m2", "@type": "ex:Person", "ex:id": 2, "ex:KNOWS": {"@id": "ex:x2"}},
+            {"@id": "ex:m3", "@type": "ex:Person", "ex:id": 3, "ex:KNOWS": {"@id": "ex:x3"}},
+            {"@id": "ex:x1", "@type": "ex:Person", "ex:id": 11},
+            {"@id": "ex:x2", "@type": "ex:Person", "ex:id": 12},
+            {"@id": "ex:x3", "@type": "ex:Person", "ex:id": 13},
+        ]
+    });
+    let l = fluree.insert(ledger0, &txn).await.expect("seed").ledger;
+    let db = graphdb_from_ledger(&l);
+
+    let rows = |q: &'static str| {
+        let fluree = &fluree;
+        let db = &db;
+        async move {
+            fluree
+                .query_cypher(db, q)
+                .await
+                .expect("cypher")
+                .to_jsonld_async(db.as_graph_db_ref())
+                .await
+                .expect("jsonld")
+        }
+    };
+
+    // Baseline (no limit): all three m's expand → 3 rows.
+    let base = rows(
+        "MATCH (:Person {id:0})-[:KNOWS]->(m) WITH m \
+         MATCH (m)-[:KNOWS]->(x) RETURN m.id AS mid, x.id AS xid ORDER BY mid",
+    )
+    .await;
+    assert_eq!(
+        base,
+        json!([[1, 11], [2, 12], [3, 13]]),
+        "no-limit baseline expands every friend: {base}"
+    );
+
+    // ORDER BY + LIMIT 2: the two smallest-id friends drive the downstream MATCH.
+    let limited = rows(
+        "MATCH (:Person {id:0})-[:KNOWS]->(m) WITH m ORDER BY m.id LIMIT 2 \
+         MATCH (m)-[:KNOWS]->(x) RETURN m.id AS mid, x.id AS xid ORDER BY mid",
+    )
+    .await;
+    assert_eq!(
+        limited,
+        json!([[1, 11], [2, 12]]),
+        "WITH ORDER BY LIMIT 2 truncates before the second MATCH: {limited}"
+    );
+
+    // Plain LIMIT (no ORDER BY): the limit still truncates to at most 2 driving
+    // m's, and each row's downstream x is that m's real edge (m.id+10).
+    let plain = rows(
+        "MATCH (:Person {id:0})-[:KNOWS]->(m) WITH m LIMIT 2 \
+         MATCH (m)-[:KNOWS]->(x) RETURN m.id AS mid, x.id AS xid",
+    )
+    .await;
+    let plain_rows = plain.as_array().expect("rows");
+    assert_eq!(plain_rows.len(), 2, "plain LIMIT 2 yields 2 rows: {plain}");
+    for row in plain_rows {
+        assert_eq!(
+            row[1].as_i64().expect("xid"),
+            row[0].as_i64().expect("mid") + 10,
+            "each driven m joins to its own edge: {plain}"
+        );
+    }
+}

@@ -1529,11 +1529,21 @@ fn subquery_correlation_vars(
     } else {
         HashSet::new()
     };
+    // A correlation input must be bound BEFORE the subquery runs, so only a
+    // PRECEDING sibling can supply one. A following sibling that re-produces a
+    // select var is a downstream CONSUMER, not a correlation — e.g. the Cypher
+    // WITH pipeline `… WITH m [ORDER BY m.x] LIMIT n  MATCH (m)-…`: the WITH
+    // lowers to this subquery and the trailing MATCH (plus the deterministic
+    // `?#__prop_m_x` accessor a later `RETURN m.x` shares) re-produces `m`/`m.x`
+    // AFTER it. Without the position guard those looked like correlations on a
+    // sliced subquery (slice empties `self_produced`), so the WITH was deferred
+    // behind its own consumer and the consuming MATCH ran first as an unseeded
+    // scan — silently empty results or an ignored limit. Restricting to
+    // preceding siblings keeps a genuinely correlated sliced sub-SELECT (its
+    // producer precedes it) per-row while letting the WITH producer lead.
     let mut corr = HashSet::new();
-    for (j, p) in siblings.iter().enumerate() {
-        if j == self_idx {
-            continue;
-        }
+    for (j, p) in siblings.iter().enumerate().take(self_idx) {
+        debug_assert!(j < self_idx);
         for v in p.produced_vars() {
             if select.contains(&v) && !self_produced.contains(&v) {
                 corr.insert(v);
