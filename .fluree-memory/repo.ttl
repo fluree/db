@@ -1188,6 +1188,150 @@ mem:decision-01krvht9hdmca3m5j1rz761g46 a mem:Decision ;
     mem:rationale "Named-graph data is interleaved in the same index/leaves/dicts as the rest of the ledger — there is no storage prefix to wipe the way drop_branch/drop_ledger do. A transactional retract is the only approach that composes cleanly with branches, rebases, replication, and Fluree's immutable history model. Alternative: structural drop + reindex (rejected as a needless rewrite of history)." ;
     mem:alternatives "structural drop with graph_registry mark + reindex skip; soft/hard mode like drop_ledger" .
 
+mem:constraint-01kv5g47r2z640tkx6nxd1d8qm a mem:Constraint ;
+    mem:content "To roll back / delete a freshly-created ledger you must call `drop_ledger(name, mode)` with the BARE name (it rejects a `:branch` suffix), NOT `drop_branch` — drop_branch refuses the root branch (source_branch=None). Use `split_ledger_id(id)` to strip the branch. Also: after a commits-only restore, `handle.snapshot.t` is the INDEX t (0, no index built), not the commit-head t — assert restore success via `nameservice().lookup(id).commit_t` or a query, not snapshot.t." ;
+    mem:tag "drop" ;
+    mem:tag "gotcha" ;
+    mem:tag "ledger" ;
+    mem:tag "nameservice" ;
+    mem:tag "rollback" ;
+    mem:tag "snapshot" ;
+    mem:scope mem:repo ;
+    mem:severity "should" ;
+    mem:artifactRef "fluree-db-api/src/admin.rs" ;
+    mem:artifactRef "fluree-db-api/src/commit_transfer.rs" ;
+    mem:artifactRef "fluree-db-core/src/ledger_id.rs" ;
+    mem:branch "feature/flpack-server-import" ;
+    mem:createdAt "2026-06-15T11:19:34.402368+00:00"^^xsd:dateTime .
+
+mem:constraint-01kv5xfff7s53v2zrawppjeg51 a mem:Constraint ;
+    mem:content "When PUTting a file body to an S3 presigned URL via reqwest, you MUST set an explicit `Content-Length` header. `reqwest::Body::wrap_stream` (used to stream a file without buffering) produces an unknown-length body, so reqwest sends `Transfer-Encoding: chunked`, which real S3 presigned PUTs reject with `NotImplemented: ... Header: Transfer-Encoding`. Stat the file and set `header(CONTENT_LENGTH, len)` — the body still streams, just length-delimited. Gotcha: the flpack reference dev backend (axum) tolerates chunked, so integration tests pass while live S3 fails; test the wire shape against a raw socket." ;
+    mem:tag "content-length" ;
+    mem:tag "flpack" ;
+    mem:tag "gotcha" ;
+    mem:tag "presigned" ;
+    mem:tag "reqwest" ;
+    mem:tag "s3" ;
+    mem:tag "upload" ;
+    mem:scope mem:repo ;
+    mem:severity "must" ;
+    mem:artifactRef "fluree-db-cli/src/remote_client.rs" ;
+    mem:branch "feature/flpack-server-import" ;
+    mem:createdAt "2026-06-15T15:12:54.247579+00:00"^^xsd:dateTime .
+
+mem:constraint-01kv6381pw05a3nw3cmmrtkmwm a mem:Constraint ;
+    mem:content ".flpack restore to a NEW ledger name must re-stamp the FIR6 index root's inline `ledger_id` field and re-write the root under a fresh CID before set_index_head. The source name is baked into the root; cold query loads trust it and work, but the write/reload path (apply_loaded_db, fluree-db-ledger lib.rs:554) asserts root.ledger_id == live ledger id — a mismatch loops every write as retryable and leaves the restored ledger silently read-only. Only the head root carries the name (all_cas_ids excludes prev_index); branches/leaves/dicts are name-independent. Fix is at index-head finalization in restore_into_created." ;
+    mem:tag "apply-loaded-db" ;
+    mem:tag "flpack" ;
+    mem:tag "index-root" ;
+    mem:tag "ledger-rename" ;
+    mem:tag "restore" ;
+    mem:scope mem:repo ;
+    mem:severity "must" ;
+    mem:artifactRef "fluree-db-api/src/commit_transfer.rs" ;
+    mem:artifactRef "fluree-db-binary-index/src/format/index_root.rs" ;
+    mem:artifactRef "fluree-db-ledger/src/lib.rs" ;
+    mem:branch "feature/flpack-server-import" ;
+    mem:createdAt "2026-06-15T16:53:42.236148+00:00"^^xsd:dateTime ;
+    mem:rationale "Third independent flpack restore-to-new-name bug (after default-context drop and chunked-PUT). The ledger_id embedding in FIR6 is the one name-dependent index artifact." .
+
+mem:decision-01kv65wecd75ns7ysjftyc5q36 a mem:Decision ;
+    mem:content "Negotiated .flpack upload supports multipart for archives >5 GiB (single S3 PUT cap). The SERVER picks single-PUT vs multipart by declared `size` vs import_multipart_threshold_bytes at mint time; CLI just reacts to the mint response shape (`upload` vs `multipart` key). App owns S3: it does CreateMultipartUpload, presigns one UploadPart URL per part, and CompleteMultipartUpload — the CLI only PUTs part byte-ranges (fixed Content-Length, bounded concurrency) and reports ETags back on `complete`. Part size adapts up to stay ≤10k parts. Reference server stages parts to sibling files + concatenates on complete (no per-part ETag re-verify; restore_ledger hashes every frame anyway)." ;
+    mem:tag "cli" ;
+    mem:tag "flpack" ;
+    mem:tag "import" ;
+    mem:tag "multipart" ;
+    mem:tag "negotiated-upload" ;
+    mem:tag "s3" ;
+    mem:tag "server" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "docs/cli/server-integration.md" ;
+    mem:artifactRef "fluree-db-cli/src/commands/create.rs" ;
+    mem:artifactRef "fluree-db-cli/src/remote_client.rs" ;
+    mem:artifactRef "fluree-db-server/src/import_jobs.rs" ;
+    mem:artifactRef "fluree-db-server/src/routes/import.rs" ;
+    mem:branch "feature/flpack-server-import" ;
+    mem:createdAt "2026-06-15T17:39:47.725400+00:00"^^xsd:dateTime ;
+    mem:rationale "DBLP-scale migration (~21 GB archive) exceeds the 5 GiB single-PUT limit; this is the general fix. 'App owns S3, app completes MPU' keeps all object-store ownership in the upstream app per the established negotiated-upload model." .
+
+mem:fact-01kv5g46054cwjpky834823fkx a mem:Fact ;
+    mem:content ".flpack wholesale restore = `Fluree::restore_ledger` (commit_transfer.rs): streams over `AsyncRead`, ingests+verifies frames, sets heads from the embedded `phase:nameservice` manifest, rolls back on failure. Server `POST /import/*ledger` (routes/import.rs, admin route group) adapts the body via StreamReader and calls it; CLI `create --remote --from x.flpack` (RemoteLedgerClient::import_ledger streams the file) and local `--from x.flpack` both route through it. Distinct from /push (which replays+revalidates+reindexes). Reimplements ingest against fluree-db-core because fluree-db-nameservice-sync is a DEV-dependency of fluree-db-api (keeps reqwest out of the lib)." ;
+    mem:tag "cli" ;
+    mem:tag "flpack" ;
+    mem:tag "import" ;
+    mem:tag "pack" ;
+    mem:tag "restore" ;
+    mem:tag "server" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "docs/operations/pack-archive-restore.md" ;
+    mem:artifactRef "fluree-db-api/src/commit_transfer.rs" ;
+    mem:artifactRef "fluree-db-cli/src/commands/create.rs" ;
+    mem:artifactRef "fluree-db-cli/src/remote_client.rs" ;
+    mem:artifactRef "fluree-db-server/src/routes/import.rs" ;
+    mem:branch "feature/flpack-server-import" ;
+    mem:createdAt "2026-06-15T11:19:32.613138+00:00"^^xsd:dateTime .
+
+mem:fact-01kv5m1266d9qr9h8q83kppfy5 a mem:Fact ;
+    mem:content "Negotiated `.flpack` upload (size-capped clients e.g. Lambda): discovery `/.well-known/fluree.json` carries `import:{modes,direct_max_bytes}`; CLI picks direct-vs-negotiated by size. Handshake: `POST /import-upload` (mint, ledger in BODY) → `PUT /import-upload/:id/blob?token=` (token-in-URL auth, NOT admin) → `POST .../complete` (async restore on a spawned task) → `GET /import-upload/:id` (poll). Uses a SEPARATE `/import-upload` prefix because `/import/*ledger` is a greedy axum tail that would swallow `/uploads`. Reference backend gated by FLUREE_IMPORT_PRESIGN_ENABLED, stages to local disk, in-memory ImportJobs; a prod app mints a real presigned S3 PUT." ;
+    mem:tag "flpack" ;
+    mem:tag "import" ;
+    mem:tag "lambda" ;
+    mem:tag "negotiation" ;
+    mem:tag "presigned" ;
+    mem:tag "upload" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "docs/cli/server-integration.md" ;
+    mem:artifactRef "fluree-db-cli/src/commands/create.rs" ;
+    mem:artifactRef "fluree-db-cli/src/remote_client.rs" ;
+    mem:artifactRef "fluree-db-server/src/import_jobs.rs" ;
+    mem:artifactRef "fluree-db-server/src/routes/import.rs" ;
+    mem:branch "feature/flpack-server-import" ;
+    mem:createdAt "2026-06-15T12:27:44.710230+00:00"^^xsd:dateTime .
+
+mem:fact-01kv5v3j9svb78b9nh0mp1911m a mem:Fact ;
+    mem:content "A ledger's default JSON-LD context is a `LedgerConfig` CAS blob pointed to by `NsRecord.default_context`/`ConfigPayload.default_context` (+`configV`). It is NOT reachable from the commit chain or index root, so any pack/sync/archive that only walks commits+index artifacts silently drops it. The `.flpack` export now ships it: `archive_ledger` adds `default_context_id` to the nameservice manifest and `stream_archive` emits the blob as a data frame; `restore_ledger` re-points via `set_default_context`. The REMOTE `export --remote` path (server /pack) still omits it. set_default_context writes ConfigPayload; the file nameservice mirrors it onto NsRecord.default_context so lookup() exposes it." ;
+    mem:tag "config" ;
+    mem:tag "default-context" ;
+    mem:tag "flpack" ;
+    mem:tag "gotcha" ;
+    mem:tag "pack" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/src/commit_transfer.rs" ;
+    mem:artifactRef "fluree-db-api/src/lib.rs" ;
+    mem:artifactRef "fluree-db-api/src/pack.rs" ;
+    mem:branch "feature/flpack-server-import" ;
+    mem:createdAt "2026-06-15T14:31:26.777370+00:00"^^xsd:dateTime .
+
+mem:fact-01kv6d6e7p8ys5h6gcxaqsjx9h a mem:Fact ;
+    mem:content ".flpack restore frame cap collided with the indexer's dict pack target: each data frame is one whole CAS object, dicts pack to a 256 MiB target (DEFAULT_RUN_BUDGET_BYTES), so a pack lands just over 256 MiB and the producer emits a frame its own reader (DEFAULT_MAX_PAYLOAD = 256 MiB) refuses — fails restore of any large ledger, transport-independent. Fix: restore_into_created now decodes with RESTORE_MAX_FRAME_PAYLOAD = 1 GiB (commit_transfer.rs); frame length is u32 + every frame SHA-256-verified, so the cap is only a sanity ceiling. DEFAULT_MAX_PAYLOAD stays 256 MiB for the pull path. The clone/pull (nameservice-sync ingest) path still has the 256 MiB cap and would hit this on a large clone." ;
+    mem:tag "dict-pack" ;
+    mem:tag "flpack" ;
+    mem:tag "import" ;
+    mem:tag "indexer" ;
+    mem:tag "pack-frame" ;
+    mem:tag "restore" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/src/commit_transfer.rs" ;
+    mem:artifactRef "fluree-db-core/src/pack.rs" ;
+    mem:artifactRef "fluree-db-indexer/src/config.rs" ;
+    mem:branch "feature/flpack-server-import" ;
+    mem:createdAt "2026-06-15T19:47:35.286342+00:00"^^xsd:dateTime ;
+    mem:rationale "DBLP 21 GB archive failed restore on the first oversized dict frame after multipart upload+stitch succeeded. The cap/target both being 256 MiB is the precise bug; a future session touching pull/clone should raise that path's cap too." .
+
+mem:fact-01kv6sahj5se39hv5hkmjytznz a mem:Fact ;
+    mem:content "restore_into_created (commit_transfer.rs) parallelizes CAS writes: decode stays sequential, per-object PUTs dispatch into a bounded FuturesUnordered pool — RESTORE_MAX_WRITES_IN_FLIGHT=32 AND RESTORE_MAX_BYTES_IN_FLIGHT=512 MiB. Byte bound is restore-specific (frames vary 290 KB leaf .. 1 GiB dict; count-only would balloon memory; indexer leaf-upload bounds count only since leaves are uniform ~187 KB). Oversized single frame admitted once pool drains (no deadlock); all writes flushed before head finalization; error aborts+rolls back. Ceiling remains: archive is read as ONE sequential stream, so a huge restore still can't fit a 15-min Lambda — needs a long-lived worker." ;
+    mem:tag "cas-write" ;
+    mem:tag "flpack" ;
+    mem:tag "import" ;
+    mem:tag "lambda" ;
+    mem:tag "performance" ;
+    mem:tag "restore" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/src/commit_transfer.rs" ;
+    mem:branch "feature/flpack-server-import" ;
+    mem:createdAt "2026-06-15T23:19:32.677756+00:00"^^xsd:dateTime ;
+    mem:rationale "Serial writes (summed S3 round-trips) blew the 15-min Lambda cap on a real 21 GB/74k-artifact DBLP restore; user chose the parallelize-writes fix. Sequential-stream-read ceiling is still unaddressed." .
+
 mem:fact-01kjg3zmevnz6mdn53wkqn08p0 a mem:Fact ;
     mem:content "Fluree uses CIDv1 for all content-addressed blobs. Implementation in fluree-db-core/src/content_id.rs wrapping `cid` crate.\n\nFormat: CIDv1 = version(1) + multicodec + multihash(SHA2-256, 32 bytes). Multicodec values in private-use range 0x300000+: Commit(0x300001), Txn(0x300002), IndexRoot(0x300003), IndexBranch/Leaf, DictBlob, Garbage, LedgerConfig, StatsSketch, GraphSourceSnapshot, SpatialIndex.\n\nKey APIs: ContentId::new(kind, bytes) hashes with SHA-256; verify(bytes) re-hashes and compares (NOT valid for commit-v2 which excludes trailing hash+sig); digest_hex() returns 64-char hex; Display uses base32-lower multibase." ;
     mem:tag "CIDv1" ;
@@ -1289,6 +1433,42 @@ mem:fact-01kj8k5nzpe59p5vp7zrehbrr9 a mem:Fact ;
     mem:branch "feature/memory" ;
     mem:createdAt "2026-02-24T19:49:14.358637+00:00"^^xsd:dateTime .
 
+mem:decision-01kv5jegwe2h3fmsrbygh9j644 a mem:Decision ;
+    mem:content "DATATYPE(?v) now returns the datatype IRI as ComparableValue::Sid (SPARQL 1.1 §17.4.2.3), not the old compact string (\"xsd:decimal\"). eval_datatype maps Lit→dtc.datatype() Sid, EncodedLit→reserved_datatype_sid() fast path or store.dt_sids(), IRI bindings→id_type Sid. Removed format_datatype_sid/format_reserved_datatype. Comparison works because filter-side xsd:decimal lowers via IRI()→encode_iri_strict→same Sid. Serialization: SPARQL results = full IRI; JSON-LD compacts via @context (so xsd prefix → \"xsd:decimal\"). JSON-LD s-expr filters can't express IRIs as bare prefixed names — must use (iri \"<full-iri>\"); STR(DATATYPE()) now yields the FULL IRI, breaking old \"xsd:decimal\" string workarounds." ;
+    mem:tag "datatype" ;
+    mem:tag "eval" ;
+    mem:tag "jsonld" ;
+    mem:tag "query" ;
+    mem:tag "rdf-term-functions" ;
+    mem:tag "sparql" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/tests/it_query_datatype.rs" ;
+    mem:artifactRef "fluree-db-query/src/eval/helpers.rs" ;
+    mem:artifactRef "fluree-db-query/src/eval/rdf.rs" ;
+    mem:branch "fix/datatype-returns-iri" ;
+    mem:createdAt "2026-06-15T12:00:08.590823+00:00"^^xsd:dateTime ;
+    mem:rationale "Old behavior silently returned 0 rows for FILTER(DATATYPE(?v)=xsd:decimal) instead of erroring — a correctness bug reported against 4.0.6. Future work touching datatype()/eval must know it's an IRI term now, and that the JSON-LD compact-string convention was intentionally removed (unify-on-IRI decision)." .
+
+mem:fact-01ktyzzbs4ewxqpgvssvj72tt5 a mem:Fact ;
+    mem:content "Branch fix/decimal-exactness (17 commits, June 2026) fixed DECIMAL_AUDIT.md priorities 1-5: exact ingestion everywhere (SPARQL/UPDATE/JSON-number/json-ld adapter/trig GRAPH), >i64 ints promote to BigInt (was 0), SUM/AVG+GROUP_CONCAT NUM_BIG, SHACL numeric_cmp, COUNT fast-path defer, FlakeValue Hash matches Eq for non-integer doubles, NumBig arena keys normalized (legacy NBA1 loads positionally w/ dual reprs), GROUP BY/DISTINCT/MINUS/joins key NUM_BIG by decoded value (EqualityNorm = store+gv), GRAPH-scope NUM_BIG materializes on exit (per-graph arenas), r2rml format_decimal sign fix, datalog BindingValue/ObjectMatch gained exact Decimal/BigInt + numeric_cmp equality. Remaining: priority 6 (B3 AVG fastpath dt, B8-B12 spec semantics, F2 XML datatype, Iceberg G3)." ;
+    mem:tag "aggregate" ;
+    mem:tag "audit" ;
+    mem:tag "bigint" ;
+    mem:tag "branch" ;
+    mem:tag "decimal" ;
+    mem:tag "exactness" ;
+    mem:tag "shacl" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "DECIMAL_AUDIT.md" ;
+    mem:artifactRef "fluree-db-api/tests/it_decimal_exactness.rs" ;
+    mem:artifactRef "fluree-db-core/src/coerce.rs" ;
+    mem:artifactRef "fluree-db-query/src/aggregate.rs" ;
+    mem:artifactRef "fluree-db-query/src/fast_count.rs" ;
+    mem:artifactRef "fluree-db-sparql/src/lower/term.rs" ;
+    mem:branch "fix/decimal-exactness" ;
+    mem:createdAt "2026-06-12T22:41:50.884413+00:00"^^xsd:dateTime ;
+    mem:rationale "Continuation point for the decimal fix series; the remaining priority-4 cluster (canonical identity) is the prerequisite for issues #1324/#1325." .
+
 mem:fact-01kta2t986nsjneban0hgbwzq7 a mem:Fact ;
     mem:content "RDF term/fact identity in Fluree is (s, p, o, dt, m) where m=FlakeMeta{lang, i} — matching Flake::eq/hash. Any dedup/stale-removal key that omits m collapses distinct facts: langString variants sharing a value (\"animal\"@en vs @fr), and @list members repeating a value at different indices. Issue #1273 was range::remove_stale_flakes (overlay-only/genesis read path) keying on (s,p,o,dt) only; the binary-scan stale-removal (binary_scan.rs FactKeyRef) already included m. Including m also correctly scopes retraction cancellation per variant." ;
     mem:tag "dedup" ;
@@ -1350,6 +1530,24 @@ mem:fact-01kqfy6txdrjppaf6756xzdz25 a mem:Fact ;
     mem:branch "fix/reindex-pre-build-perf-regression" ;
     mem:createdAt "2026-04-30T19:35:16.653062+00:00"^^xsd:dateTime ;
     mem:rationale "Captures the design contract and arena-bloat semantics from PR #1211 so future callers of bulk_apply_commits don't accidentally wire it into a hot-path mutation site." .
+
+mem:constraint-01kv3h37ky6wpm8c8jdvpnamjk a mem:Constraint ;
+    mem:content "A present WHERE that yields zero solutions is now a strict no-op for INSERT in the shared staging layer (commit 79e8fd4fe): the old fallback that fired all-literal INSERT templates (constants only, no WHERE-bound vars) against a synthetic empty solution was removed, so SPARQL UPDATE and JSON-LD update both follow SPARQL 1.1 Update §3.1.3. Unaffected paths: (1) NO WHERE at all still fires templates once via the SingleEmpty cursor in stream_where_into_accumulator; (2) INSERT DATA/DELETE DATA; (3) the OPTIONAL-based \"insert-if-not-exists/always-insert\" idiom yields ONE row (probe var unbound), not zero, so it still fires." ;
+    mem:tag "compliance" ;
+    mem:tag "insert" ;
+    mem:tag "jsonld" ;
+    mem:tag "sparql-update" ;
+    mem:tag "stage" ;
+    mem:tag "transact" ;
+    mem:tag "where" ;
+    mem:scope mem:repo ;
+    mem:severity "must" ;
+    mem:artifactRef "docs/transactions/conditional-updates.md" ;
+    mem:artifactRef "fluree-db-api/tests/it_transact_conditional.rs" ;
+    mem:artifactRef "fluree-db-transact/src/stage.rs" ;
+    mem:branch "fix/sparql-update-strict-where-inserts" ;
+    mem:createdAt "2026-06-14T16:58:01.214124+00:00"^^xsd:dateTime ;
+    mem:rationale "Non-obvious behavior change: distinguishing \"WHERE matched nothing\" (no-op) from \"no WHERE clause\" (fire once) and the OPTIONAL=1-row subtlety prevents future regressions or confusion when touching stage.rs." .
 
 mem:constraint-01kjte29y3cp8mae56xy6yfv2n a mem:Constraint ;
     mem:content "SPARQL↔JSON-LD Parity: both compile to the same IR (fluree-db-query/src/ir.rs) and share the entire execution engine. When adding SPARQL features: (1) shared IR changes already affect JSON-LD — verify JSON-LD tests pass, (2) if expressible in JSON-LD, add parallel tests, (3) execution path missing in JSON-LD lower → track follow-up.\n\nSPARQL tests: it_query_sparql.rs | JSON-LD tests: it_query.rs, it_query_analytical.rs, it_query_grouping.rs\nValidate: `cd testsuite-sparql && make test-eval-cat CAT=<cat>` then `cargo test -p fluree-db-api --test it_query`" ;
@@ -1450,7 +1648,7 @@ mem:fact-01kjte1yw4jyrqvnpq27mr2m9v a mem:Fact ;
     mem:createdAt "2026-03-03T18:06:09.284115+00:00"^^xsd:dateTime .
 
 mem:fact-01ks1m2nn2exrjt7tjkmzgqtg2 a mem:Fact ;
-    mem:content "SUM/AVG aggregates use a shared `NumericAcc` in fluree-db-query/src/aggregate.rs that handles xsd:integer/decimal/double + BigInt with W3C type promotion (Integer→Decimal→Double, sticky upward). Inputs flow through `binding_to_numeric` (Lit + inline-encoded NUM_INT/NUM_F64) or `extract_numeric_with_gv` in group_aggregate.rs (also decodes NUM_BIG via BinaryGraphView). AVG of integer/decimal inputs yields xsd:decimal (W3C op:numeric-divide), with division precision capped at AVG_DECIMAL_PRECISION=34 (decimal128) to bound output. Both streaming (group_aggregate.rs AggState::Sum/Avg) and non-streaming (aggregate.rs agg_sum/agg_avg) paths share the accumulator." ;
+    mem:content "SUM/AVG aggregates use a shared `NumericAcc` in fluree-db-query/src/aggregate.rs with W3C type promotion (Integer→Decimal→Double); inputs via `binding_to_numeric` (Lit + inline NUM_INT/NUM_F64) or `extract_numeric_with_gv` in group_aggregate.rs (also decodes NUM_BIG via BinaryGraphView). AVG of integer/decimal yields xsd:decimal, division capped at AVG_DECIMAL_PRECISION=34. KNOWN GAP (decimal audit June 2026, DECIMAL_AUDIT.md B1): the NON-streaming path's decode gate (aggregate.rs:311) excludes Sum/Avg and binding_to_numeric has no NUM_BIG arm — arena-backed (indexed) decimals contribute NOTHING to non-streaming SUM/AVG. Only the streaming group_aggregate path decodes them." ;
     mem:tag "aggregate" ;
     mem:tag "avg" ;
     mem:tag "decimal" ;
@@ -1463,6 +1661,27 @@ mem:fact-01ks1m2nn2exrjt7tjkmzgqtg2 a mem:Fact ;
     mem:branch "main" ;
     mem:createdAt "2026-05-20T02:40:16.034976+00:00"^^xsd:dateTime ;
     mem:rationale "Pre-fix the extractors only handled Long/Double/Boolean and silently dropped FlakeValue::Decimal, causing SUM(decimal)=0 and AVG(decimal)=Unbound. The shared NumericAcc keeps the streaming and non-streaming paths in sync and prevents future drift between them." .
+
+mem:fact-01ktys13s07fm2mphwxqnr339h a mem:Fact ;
+    mem:content "Decimal audit (DECIMAL_AUDIT.md, repo root, June 2026): most ingest paths destroy xsd:decimal via f64 before storage — SPARQL constants (lower/term.rs:138), SPARQL UPDATE (lower_sparql_update.rs:752/892), JSON-number @value (coerce.rs:582/257), bulk-import JSON-LD (adapter.rs:399), TriG GRAPH blocks (trig_meta.rs:873). Only JSON-LD string @value and default-graph Turtle are exact. Also: non-streaming SUM/AVG drop NUM_BIG EncodedLits (aggregate.rs:311), SHACL range facets unconditionally fail all decimals (fluree-db-shacl value.rs:94), both lexers turn >i64 integers into 0, R2RML format_decimal drops sign for -1<x<0, datalog ObjectMatch has no Decimal arm." ;
+    mem:tag "aggregate" ;
+    mem:tag "audit" ;
+    mem:tag "decimal" ;
+    mem:tag "ingestion" ;
+    mem:tag "numbig" ;
+    mem:tag "precision" ;
+    mem:tag "shacl" ;
+    mem:tag "xsd-decimal" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "DECIMAL_AUDIT.md" ;
+    mem:artifactRef "fluree-db-core/src/coerce.rs" ;
+    mem:artifactRef "fluree-db-query/src/aggregate.rs" ;
+    mem:artifactRef "fluree-db-shacl/src/constraints/value.rs" ;
+    mem:artifactRef "fluree-db-sparql/src/lower/term.rs" ;
+    mem:artifactRef "fluree-db-transact/src/lower_sparql_update.rs" ;
+    mem:branch "main" ;
+    mem:createdAt "2026-06-12T20:40:28.192512+00:00"^^xsd:dateTime ;
+    mem:rationale "46 panel-confirmed findings from a 260-agent audit; fixing engine lanes is pointless until ingestion stops corrupting values — any future decimal work should start from DECIMAL_AUDIT.md's priority list." .
 
 mem:constraint-01kp8yczz09ndt54ztchbheeyb a mem:Constraint ;
     mem:content "JSON-LD transaction parsing does NOT auto-promote bare string values to IRI references. User data becomes an IRI only when wrapped in `{\"@id\": \"...\"}` or when the property has `@type: \"@id\"` in `@context`. The former `looks_like_iri` heuristic (three sites in parse/jsonld.rs) was removed — it silently promoted strings starting with `http://`/`https://`/`did:`/`fluree:`/`urn:` to IRIs, which violated the JSON-LD spec (especially for `{\"@value\": \"...\"}`, explicitly a literal)." ;
