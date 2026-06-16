@@ -507,7 +507,7 @@ fn write_flake_value(cell: &mut Vec<u8>, val: &FlakeValue, compactor: &IriCompac
         }
         FlakeValue::Null => {}
         FlakeValue::BigInt(n) => cell.extend_from_slice(n.to_string().as_bytes()),
-        FlakeValue::Decimal(d) => cell.extend_from_slice(d.to_string().as_bytes()),
+        FlakeValue::Decimal(d) => cell.extend_from_slice(d.to_plain_string().as_bytes()),
         FlakeValue::DateTime(dt) => cell.extend_from_slice(dt.to_string().as_bytes()),
         FlakeValue::Date(d) => cell.extend_from_slice(d.to_string().as_bytes()),
         FlakeValue::Time(t) => cell.extend_from_slice(t.to_string().as_bytes()),

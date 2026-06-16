@@ -340,16 +340,31 @@ fn count_rows_for_predicate_numeric_compare_post(
         // Same o_type at both ends ⇒ uniform o_type (POST sorts o_type before o_key).
         if min_ot == max_ot {
             let otype = OType::from_u16(min_ot);
-            if matches!(otype, OType::XSD_INTEGER | OType::XSD_DOUBLE) {
-                if let Some(threshold_key) = encode_numeric_threshold_for_otype(otype, threshold)? {
-                    if leaflet_fully_excluded(compare, min_ok, max_ok, threshold_key) {
-                        return Ok(Some(0));
-                    }
-                    if leaflet_fully_matches(compare, min_ok, max_ok, threshold_key) {
-                        return Ok(Some(count_rows_for_predicate_psot(store, g_id, p_id)?));
-                    }
-                }
+            if !matches!(otype, OType::XSD_INTEGER | OType::XSD_DOUBLE) {
+                // Uniformly unsupported (e.g. all-decimal predicate): the leaf
+                // scan below would bail on its first leaflet anyway — defer
+                // now without opening any leaves.
+                return Ok(None);
             }
+            let Some(threshold_key) = encode_numeric_threshold_for_otype(otype, threshold)? else {
+                // Threshold not encodable for the uniform o_type (e.g. a
+                // decimal constant over integer rows): same doomed scan.
+                return Ok(None);
+            };
+            if leaflet_fully_excluded(compare, min_ok, max_ok, threshold_key) {
+                return Ok(Some(0));
+            }
+            if leaflet_fully_matches(compare, min_ok, max_ok, threshold_key) {
+                return Ok(Some(count_rows_for_predicate_psot(store, g_id, p_id)?));
+            }
+        } else if otype_unsupported_numeric(min_ot) || otype_unsupported_numeric(max_ot) {
+            // Mixed-type predicate whose extent BOUNDARY is an unsupported
+            // numeric (e.g. integer rows + decimals: NUM_BIG sorts last among
+            // the numerics, so it lands on the max boundary): those rows are
+            // guaranteed present and the scan below is doomed — defer now.
+            // An unsupported numeric strictly interior to the extent still
+            // falls through and is caught by the per-leaflet bail.
+            return Ok(None);
         }
     }
 
@@ -370,6 +385,15 @@ fn count_rows_for_predicate_numeric_compare_post(
 /// per-leaflet directory must be consulted for this predicate's first/last key).
 /// Returns `None` if there are no leaves (an empty predicate — the caller's total is
 /// 0) or, defensively, if a boundary leaf yields no matching leaflet.
+/// True if this o_type is numeric but cannot be compared by encoded o_key in
+/// the numeric-COUNT lanes (non-canonical integer widths, floats, decimals,
+/// arena-keyed NUM_BIG): rows of these kinds force the count to defer.
+fn otype_unsupported_numeric(raw: u16) -> bool {
+    let ot = OType::from_u16(raw);
+    (ot.is_numeric() || ot == OType::NUM_BIG_OVERFLOW)
+        && !matches!(ot, OType::XSD_INTEGER | OType::XSD_DOUBLE)
+}
+
 fn predicate_post_global_extent(
     store: &BinaryIndexStore,
     p_id: u32,
@@ -622,24 +646,71 @@ fn count_numeric_compare_overlay_parallel(
 ) -> Result<Option<u64>> {
     let tk_int = encode_numeric_threshold_for_otype(OType::XSD_INTEGER, threshold)?;
     let tk_dbl = encode_numeric_threshold_for_otype(OType::XSD_DOUBLE, threshold)?;
-    parallel_overlay_psot_filter_count(
+
+    // Pre-check the base predicate's POST extent: if the base rows are
+    // uniformly an unsupported o_type (e.g. all-decimal), or the threshold
+    // can't encode for the uniform supported type, the full scan below is
+    // doomed — defer immediately instead of scanning every partition first.
+    // (Unsupported values arriving only via novelty are still caught by the
+    // per-row flag; novelty is small, so that residual pass is bounded.)
+    let post_leaves = leaf_entries_for_predicate(store, g_id, RunSortOrder::Post, p_id);
+    if let Some((min_ot, _, max_ot, _)) = predicate_post_global_extent(store, p_id, post_leaves)? {
+        if min_ot == max_ot {
+            match OType::from_u16(min_ot) {
+                OType::XSD_INTEGER if tk_int.is_none() => return Ok(None),
+                OType::XSD_DOUBLE if tk_dbl.is_none() => return Ok(None),
+                OType::XSD_INTEGER | OType::XSD_DOUBLE => {}
+                ot if ot.is_numeric() || ot == OType::NUM_BIG_OVERFLOW => return Ok(None),
+                _ => {}
+            }
+        } else if otype_unsupported_numeric(min_ot) || otype_unsupported_numeric(max_ot) {
+            // Mixed base with an unsupported-numeric boundary (e.g. integer
+            // rows + decimals): doomed regardless of novelty — defer before
+            // scanning any partition.
+            return Ok(None);
+        }
+    }
+
+    // Numeric o_types this lane can't compare by o_key (other integer-family
+    // widths, floats, decimals — arena-keyed NUM_BIG has no value order at
+    // all) must defer the whole count: treating them as non-matches would
+    // silently undercount. Mirrors the base lane's per-leaflet Ok(None) bail.
+    let saw_unsupported_numeric = std::sync::atomic::AtomicBool::new(false);
+    let count = parallel_overlay_psot_filter_count(
         ctx,
         store,
         g_id,
         pred_sid,
         p_id,
-        move |_s, o_type, o_key| {
-            let tk = match OType::from_u16(o_type) {
+        |_s, o_type, o_key| {
+            let ot = OType::from_u16(o_type);
+            let tk = match ot {
                 OType::XSD_INTEGER => tk_int,
                 OType::XSD_DOUBLE => tk_dbl,
-                _ => return false, // non-numeric object: comparison errors => not a match
+                _ if ot.is_numeric() || ot == OType::NUM_BIG_OVERFLOW => {
+                    saw_unsupported_numeric.store(true, std::sync::atomic::Ordering::Relaxed);
+                    return false;
+                }
+                // Genuinely non-numeric object: comparison errors => not a match
+                _ => return false,
             };
             match tk {
                 Some(tk) => okey_matches(compare, o_key, tk),
-                None => false,
+                None => {
+                    // Threshold not encodable for this row's o_type (e.g. a
+                    // decimal threshold against integer rows): the comparison
+                    // is still numerically valid, so defer rather than
+                    // undercount — mirrors the base lane.
+                    saw_unsupported_numeric.store(true, std::sync::atomic::Ordering::Relaxed);
+                    false
+                }
             }
         },
-    )
+    )?;
+    if saw_unsupported_numeric.load(std::sync::atomic::Ordering::Relaxed) {
+        return Ok(None);
+    }
+    Ok(count)
 }
 
 /// Fast-path: parallel `COUNT(?s)` / `COUNT(*)` for a single predicate `?s <p> ?o`

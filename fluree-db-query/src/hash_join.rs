@@ -493,7 +493,11 @@ enum JoinKeyClass {
 
 /// Classify a binding's join key, normalising refs to a `u64` s_id when a store is
 /// available. Unbound → wildcard; Poisoned → dead (drop); everything else → keyed.
-fn join_key(binding: &Binding, store: Option<&BinaryIndexStore>) -> JoinKeyClass {
+fn join_key(
+    binding: &Binding,
+    store: Option<&BinaryIndexStore>,
+    gv: Option<&fluree_db_binary_index::BinaryGraphView>,
+) -> JoinKeyClass {
     let keyed_ref_or_group = |sid: &fluree_db_core::Sid| {
         store
             .and_then(|s| {
@@ -515,7 +519,7 @@ fn join_key(binding: &Binding, store: Option<&BinaryIndexStore>) -> JoinKeyClass
         // Normalize decoded literals to their encoded form so they key
         // identically to late-materialized scan output.
         other => JoinKeyClass::Keyed(JoinKey::Other(binding_to_group_key_normalized(
-            other, store,
+            other, store, gv,
         ))),
     }
 }
@@ -644,6 +648,7 @@ impl HashJoinOperator {
         mut build: BoxedOperator,
     ) -> Result<()> {
         let store = ctx.binary_store.as_deref();
+        let gv = ctx.graph_view();
         let ncols = self.build_schema.len();
         build.open(ctx).await?;
         while let Some(batch) = build.next_batch(ctx).await? {
@@ -651,7 +656,11 @@ impl HashJoinOperator {
                 let row_vals: Vec<Binding> = (0..ncols)
                     .map(|c| batch.get_by_col(row, c).clone())
                     .collect();
-                match join_key(batch.get_by_col(row, self.build_key_col), store) {
+                match join_key(
+                    batch.get_by_col(row, self.build_key_col),
+                    store,
+                    gv.as_ref(),
+                ) {
                     JoinKeyClass::Keyed(key) => self.table.entry(key).or_default().push(row_vals),
                     // Unbound join var: unconstrained, matches every probe row.
                     JoinKeyClass::Wildcard => self.wildcard_rows.push(row_vals),
@@ -738,6 +747,7 @@ impl Operator for HashJoinOperator {
             return fallback.next_batch(ctx).await;
         }
         let store = ctx.binary_store.as_deref();
+        let gv = ctx.graph_view();
         let ncols = self.full_schema.len();
         let build_cols = self.build_schema.len();
         let probe = self.probe.as_mut().expect("hash join probe");
@@ -769,7 +779,7 @@ impl Operator for HashJoinOperator {
                 // The probe scan always binds the join var, so a non-keyed probe row
                 // (unbound/poisoned) cannot match — skip it.
                 let JoinKeyClass::Keyed(key) =
-                    join_key(pb.get_by_col(row, self.probe_key_col), store)
+                    join_key(pb.get_by_col(row, self.probe_key_col), store, gv.as_ref())
                 else {
                     continue;
                 };
@@ -845,15 +855,18 @@ impl Operator for HashJoinOperator {
             return fallback.drain_count(ctx).await;
         }
         let store = ctx.binary_store.as_deref();
+        let gv = ctx.graph_view();
         let probe = self.probe.as_mut().expect("hash join probe");
         let mut count: u64 = 0;
         loop {
             match probe.next_batch(ctx).await? {
                 Some(batch) if !batch.is_empty() => {
                     for row in 0..batch.len() {
-                        let JoinKeyClass::Keyed(key) =
-                            join_key(batch.get_by_col(row, self.probe_key_col), store)
-                        else {
+                        let JoinKeyClass::Keyed(key) = join_key(
+                            batch.get_by_col(row, self.probe_key_col),
+                            store,
+                            gv.as_ref(),
+                        ) else {
                             continue;
                         };
                         // Each probe row matches its keyed build rows plus every
@@ -894,16 +907,17 @@ mod tests {
         // Unbound => matches every probe row; Poisoned => blocks matching (drop).
         // Collapsing both to one class is the bug this guards against.
         assert!(matches!(
-            join_key(&Binding::Unbound, None),
+            join_key(&Binding::Unbound, None, None),
             JoinKeyClass::Wildcard
         ));
         assert!(matches!(
-            join_key(&Binding::Poisoned, None),
+            join_key(&Binding::Poisoned, None, None),
             JoinKeyClass::Dead
         ));
         assert!(matches!(
             join_key(
                 &Binding::lit(fluree_db_core::FlakeValue::Long(1), Sid::new(2, "long")),
+                None,
                 None
             ),
             JoinKeyClass::Keyed(_)

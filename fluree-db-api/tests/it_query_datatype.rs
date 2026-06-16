@@ -1151,9 +1151,11 @@ async fn decimal_string_input_becomes_bigdecimal_preserves_precision() {
 }
 
 #[tokio::test]
-async fn decimal_json_number_input_becomes_double() {
-    // JSON number input with xsd:decimal → Double (lossy, per policy)
-    // JSON parsing already lost precision, so we keep it as f64
+async fn decimal_json_number_input_is_exact() {
+    // JSON number input with xsd:decimal → exact BigDecimal. The written
+    // lexical is recovered via the shortest round-trip f64 representation,
+    // so 3.13 stores as the exact decimal 3.13, not the nearest binary
+    // double.
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger0 = genesis_ledger(&fluree, "decimal-test:json-number");
     let ctx = json!({
@@ -1167,13 +1169,11 @@ async fn decimal_json_number_input_becomes_double() {
         "@graph": [
             {
                 "@id": "ex:item1",
-                // JSON number 3.13 loses precision during JSON parsing
-                // Per policy: JSON numbers with xsd:decimal become Double
                 "ex:value": {"@value": 3.13, "@type": "xsd:decimal"}
             },
             {
                 "@id": "ex:item2",
-                // Integer JSON number with xsd:decimal → also Double
+                // Integer JSON number with xsd:decimal → exact decimal 42
                 "ex:value": {"@value": 42, "@type": "xsd:decimal"}
             }
         ]
@@ -1197,15 +1197,35 @@ async fn decimal_json_number_input_becomes_double() {
         .unwrap();
     let arr = rows.as_array().unwrap();
 
+    // BigDecimal serializes via string to preserve precision; accept either
+    // the bare string or the {"@value": ...} object form.
+    fn decimal_lexical(v: &serde_json::Value) -> String {
+        if let Some(s) = v.as_str() {
+            s.to_string()
+        } else if let Some(obj) = v.as_object() {
+            obj.get("@value")
+                .and_then(|v| v.as_str())
+                .expect("@value string")
+                .to_string()
+        } else {
+            panic!("expected exact decimal rendering, got: {v}");
+        }
+    }
+
     assert_eq!(arr.len(), 2);
-    // JSON numbers become Double, which serializes as JSON number
     assert_eq!(arr[0][0], "ex:item1");
-    // 3.13 as f64 should round-trip to 3.13
-    assert_eq!(arr[0][1].as_f64(), Some(3.13), "item1 value should be 3.13");
+    assert_eq!(
+        decimal_lexical(&arr[0][1]),
+        "3.13",
+        "item1 value should be the exact decimal 3.13"
+    );
 
     assert_eq!(arr[1][0], "ex:item2");
-    // Integer 42 as Double - JSON may serialize as 42 or 42.0
-    assert_eq!(arr[1][1].as_f64(), Some(42.0), "item2 value should be 42.0");
+    assert_eq!(
+        decimal_lexical(&arr[1][1]),
+        "42",
+        "item2 value should be the exact decimal 42"
+    );
 
     // Verify explicit datatype xsd:decimal is preserved even when value is Double
     let dt1 = arr[0][2].as_str().unwrap();

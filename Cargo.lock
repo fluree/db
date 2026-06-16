@@ -2828,10 +2828,12 @@ name = "fluree-db-reasoner"
 version = "4.0.6"
 dependencies = [
  "async-trait",
+ "bigdecimal 0.4.10",
  "fluree-db-core",
  "fluree-vocab",
  "hashbrown 0.16.1",
  "lru 0.12.5",
+ "num-bigint",
  "parking_lot",
  "smallvec",
  "thiserror 1.0.69",
@@ -2918,11 +2920,13 @@ dependencies = [
 name = "fluree-db-sparql"
 version = "4.0.6"
 dependencies = [
+ "bigdecimal 0.4.10",
  "fluree-db-core",
  "fluree-db-query",
  "fluree-graph-json-ld",
  "fluree-vocab",
  "insta",
+ "num-bigint",
  "serde",
  "serde_json",
  "thiserror 1.0.69",

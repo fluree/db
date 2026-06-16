@@ -405,6 +405,7 @@ impl TokenStream {
                 | TokenKind::PrefixedNameNs(_)
                 | TokenKind::String(_)
                 | TokenKind::Integer(_)
+                | TokenKind::BigInteger(_)
                 | TokenKind::Decimal(_)
                 | TokenKind::Double(_)
                 | TokenKind::BlankNodeLabel(_)

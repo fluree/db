@@ -19,7 +19,7 @@ use crate::error::{QueryError, Result};
 use crate::execute::build_where_operators_seeded;
 use crate::group_aggregate::{binding_to_group_key_normalized, CompositeGroupKey};
 use crate::ir::Pattern;
-use crate::object_binding::equality_norm_store;
+use crate::object_binding::{equality_norm, EqualityNorm};
 use crate::operator::{BoxedOperator, Operator, OperatorState};
 use crate::seed::{EmptyOperator, SeedOperator};
 use crate::temporal_mode::PlanningContext;
@@ -53,7 +53,7 @@ pub struct SemijoinOperator {
     /// Store for normalizing decoded bindings to encoded form on both sides,
     /// so mixed-representation rows key identically. `None` outside
     /// single-ledger binary execution.
-    norm_store: Option<Arc<fluree_db_binary_index::BinaryIndexStore>>,
+    norm: Option<EqualityNorm>,
 }
 
 impl SemijoinOperator {
@@ -74,7 +74,7 @@ impl SemijoinOperator {
             schema,
             state: OperatorState::Created,
             key_set: FxHashSet::default(),
-            norm_store: None,
+            norm: None,
             key_col_indices: Vec::new(),
             stats,
             planning,
@@ -87,10 +87,8 @@ impl SemijoinOperator {
             .key_col_indices
             .iter()
             .map(|&ci| {
-                binding_to_group_key_normalized(
-                    batch.get_by_col(row_idx, ci),
-                    self.norm_store.as_deref(),
-                )
+                let (store, gv) = EqualityNorm::parts(&self.norm);
+                binding_to_group_key_normalized(batch.get_by_col(row_idx, ci), store, gv)
             })
             .collect();
         CompositeGroupKey(keys)
@@ -151,8 +149,8 @@ impl Operator for SemijoinOperator {
                 "SemijoinOperator::open() called in invalid state".into(),
             ));
         }
-        if self.norm_store.is_none() {
-            self.norm_store = equality_norm_store(ctx);
+        if self.norm.is_none() {
+            self.norm = equality_norm(ctx);
         }
 
         // Build phase: execute inner patterns once, collect distinct key tuples.
@@ -187,10 +185,8 @@ impl Operator for SemijoinOperator {
                 let key = inner_key_col_indices
                     .iter()
                     .map(|&ci| {
-                        binding_to_group_key_normalized(
-                            batch.get_by_col(row_idx, ci),
-                            self.norm_store.as_deref(),
-                        )
+                        let (store, gv) = EqualityNorm::parts(&self.norm);
+                        binding_to_group_key_normalized(batch.get_by_col(row_idx, ci), store, gv)
                     })
                     .collect();
                 self.key_set.insert(CompositeGroupKey(key));
