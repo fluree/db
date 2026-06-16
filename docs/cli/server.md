@@ -228,10 +228,12 @@ fluree server run
 # error: server support not compiled. Rebuild with `--features server`.
 ```
 
-For S3/DynamoDB support via `--connection-config`, the `aws` feature must be enabled:
+S3/DynamoDB support via `--connection-config` requires the `aws` feature, which
+is **on by default** for the CLI (and the published Docker image). It is dormant
+unless an AWS backend is configured. To build a CLI *without* it:
 
 ```bash
-cargo build -p fluree-db-cli --features aws
+cargo build -p fluree-db-cli --no-default-features --features server,iceberg,shacl
 ```
 
 Without this feature, S3 storage configs in the connection config will produce a clear error at startup.
