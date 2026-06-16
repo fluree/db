@@ -38,9 +38,11 @@ use crate::error::{Result, ServerError};
 use crate::extract::{FlureeHeaders, MaybeCredential, MaybeDataBearer};
 use crate::query_control::QueryDisconnectGuard;
 use crate::routes::query::{
-    effective_identity, enforce_bearer_dataset_scope, has_policy_opts, inject_headers_into_query,
-    is_sparql_request, load_ledger_for_query, normalize_ledger_scoped_from, requires_dataset_features,
-    resolve_sparql_text, SparqlParams,
+    await_query_min_t_requirements, collect_jsonld_min_t_requirements,
+    collect_sparql_min_t_requirements, effective_identity, enforce_bearer_dataset_scope,
+    has_policy_opts, inject_default_context_if_requested, inject_headers_into_query,
+    is_sparql_request, load_ledger_for_query, normalize_ledger_scoped_from,
+    requires_dataset_features, resolve_sparql_text, SparqlParams,
 };
 use crate::state::AppState;
 
@@ -108,14 +110,21 @@ async fn stream_query_inner(
             }
         }
         // SPARQL streaming has no per-request policy resolution yet, so refuse
-        // anything that would impose identity/policy scoping (use /query).
+        // anything that would impose identity/policy scoping (use /query):
+        // server default policy class, an authenticated identity, or any of the
+        // `Fluree-Identity` / `Fluree-Policy*` / `Fluree-Default-Allow` headers
+        // that `/query` would fold into connection options.
         // FROM/FROM NAMED and unsupported shapes are rejected by the planner.
         if data_auth.default_policy_class.is_some()
             || effective_identity(&credential, &bearer).is_some()
-            || headers.identity.is_some()
+            || request_carries_policy(&headers)
         {
             return Err(policy_unsupported());
         }
+        // Freshness barrier parity with /query (header / `@t:` min-t).
+        let min_t = collect_sparql_min_t_requirements(headers.min_t, &sparql, Some(&ledger))?;
+        await_query_min_t_requirements(state.as_ref(), min_t).await?;
+
         let input = OwnedStreamQuery::Sparql(sparql);
         let ledger_state = load_ledger_for_query(state.as_ref(), &ledger, &span).await?;
         let plan = {
@@ -131,6 +140,16 @@ async fn stream_query_inner(
         )
     } else {
         let mut query_json: JsonValue = credential.body_json()?;
+
+        // History queries (top-level `to`) use a distinct execution path that
+        // neither streaming path implements; planning here would silently read
+        // the current view. Reject — use /query.
+        if query_json.get("to").is_some() {
+            return Err(ServerError::bad_request(
+                "history queries (`to`) are not supported on the streaming endpoint; \
+                 use /v1/fluree/query",
+            ));
+        }
 
         // Mirror /query's ledger-scoped preprocessing: normalize `from` against
         // the path ledger, fold header opts in, enforce bearer scope over the
@@ -153,6 +172,18 @@ async fn stream_query_inner(
             data_auth.default_policy_class.as_deref(),
         )
         .await;
+
+        // Freshness barrier + stored-default-context injection, before planning,
+        // to match /query's request controls.
+        let min_t = collect_jsonld_min_t_requirements(&headers, &query_json, Some(&ledger))?;
+        await_query_min_t_requirements(state.as_ref(), min_t).await?;
+        inject_default_context_if_requested(
+            state.as_ref(),
+            &ledger,
+            &mut query_json,
+            params.default_context,
+        )
+        .await?;
 
         let tracker = stream_tracker(Some(&query_json));
 
@@ -234,6 +265,17 @@ enum StreamPlan {
         dataset: DataSetDb,
         plan: StreamDatasetPlan,
     },
+}
+
+/// True if the request carries any policy-scoping signal `/query` would fold
+/// into connection options: `Fluree-Identity`, `Fluree-Policy`,
+/// `Fluree-Policy-Class`, `Fluree-Policy-Values`, or `Fluree-Default-Allow`.
+fn request_carries_policy(headers: &FlureeHeaders) -> bool {
+    headers.identity.is_some()
+        || headers.policy.is_some()
+        || !headers.policy_class.is_empty()
+        || headers.policy_values.is_some()
+        || headers.default_allow
 }
 
 /// Error for query shapes whose policy scoping the streaming endpoint cannot

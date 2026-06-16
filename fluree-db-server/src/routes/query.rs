@@ -98,7 +98,7 @@ fn merge_min_t_requirement(requirements: &mut BTreeMap<String, i64>, ledger_id: 
     }
 }
 
-async fn await_query_min_t_requirements(
+pub(crate) async fn await_query_min_t_requirements(
     state: &AppState,
     requirements: BTreeMap<String, i64>,
 ) -> Result<()> {
@@ -492,7 +492,7 @@ fn jsonld_query_has_context(query: &JsonValue) -> bool {
     query.get("@context").is_some() || query.get("context").is_some()
 }
 
-async fn inject_default_context_if_requested(
+pub(crate) async fn inject_default_context_if_requested(
     state: &AppState,
     ledger_id: &str,
     query: &mut JsonValue,
@@ -1597,7 +1597,7 @@ fn collect_jsonld_time_min_t(value: &JsonValue, requirements: &mut BTreeMap<Stri
     }
 }
 
-fn collect_jsonld_min_t_requirements(
+pub(crate) fn collect_jsonld_min_t_requirements(
     headers: &FlureeHeaders,
     query: &JsonValue,
     default_ledger: Option<&str>,
@@ -1630,7 +1630,7 @@ fn collect_jsonld_min_t_requirements(
     Ok(requirements)
 }
 
-fn collect_sparql_min_t_requirements(
+pub(crate) fn collect_sparql_min_t_requirements(
     header_min_t: Option<i64>,
     sparql: &str,
     default_ledger: Option<&str>,
