@@ -77,7 +77,12 @@ async fn ndjson_records(
         .get(http::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
-    let bytes = resp.into_body().collect().await.expect("collect").to_bytes();
+    let bytes = resp
+        .into_body()
+        .collect()
+        .await
+        .expect("collect")
+        .to_bytes();
     let text = String::from_utf8(bytes.to_vec()).expect("utf-8 body");
     let records = text
         .lines()
@@ -435,7 +440,12 @@ async fn policy_identity_filters_streamed_rows() {
     };
 
     // Restricted identity → only the public doc streams.
-    let resp = stream_jsonld(&app, "strm:pol-enf", &docs_query("http://example.org/public-user")).await;
+    let resp = stream_jsonld(
+        &app,
+        "strm:pol-enf",
+        &docs_query("http://example.org/public-user"),
+    )
+    .await;
     let (status, _ct, records) = ndjson_records(resp).await;
     assert_eq!(status, StatusCode::OK);
     let public_rows: Vec<&str> = records
@@ -443,17 +453,32 @@ async fn policy_identity_filters_streamed_rows() {
         .filter(|r| r["type"] == "row")
         .filter_map(|r| r["row"]["name"]["value"].as_str())
         .collect();
-    assert_eq!(public_rows, vec!["Public"], "public-user sees only the public doc");
+    assert_eq!(
+        public_rows,
+        vec!["Public"],
+        "public-user sees only the public doc"
+    );
 
     // Manager identity (f:allow true) → all three stream.
-    let resp = stream_jsonld(&app, "strm:pol-enf", &docs_query("http://example.org/manager-user")).await;
+    let resp = stream_jsonld(
+        &app,
+        "strm:pol-enf",
+        &docs_query("http://example.org/manager-user"),
+    )
+    .await;
     let (_status, _ct, records) = ndjson_records(resp).await;
     let manager_count = records.iter().filter(|r| r["type"] == "row").count();
-    assert_eq!(manager_count, 3, "manager sees all docs; policy upgrade enforced on stream");
+    assert_eq!(
+        manager_count, 3,
+        "manager sees all docs; policy upgrade enforced on stream"
+    );
 }
 
 fn now_secs() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
 }
 
 fn create_jws(claims: &JsonValue, key: &SigningKey) -> String {
@@ -588,7 +613,11 @@ async fn fuel_overrun_emits_error_code_terminal() {
     });
     let resp = stream_jsonld(&app, "strm:fuel", &query).await;
     let (status, _ct, records) = ndjson_records(resp).await;
-    assert_eq!(status, StatusCode::OK, "stream is committed before execution");
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "stream is committed before execution"
+    );
 
     let terminal = records.last().expect("a terminal record");
     assert_eq!(terminal["type"], "error");

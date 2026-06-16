@@ -618,8 +618,10 @@ impl Fluree {
         options: &QueryExecutionOptions,
     ) -> Result<Vec<crate::Batch>> {
         let mut sink = crate::view::stream_query::CollectSink::default();
-        self.execute_dataset_into_with_r2rml(dataset, vars, executable, tracker, r2rml, options, &mut sink)
-            .await?;
+        self.execute_dataset_into_with_r2rml(
+            dataset, vars, executable, tracker, r2rml, options, &mut sink,
+        )
+        .await?;
         Ok(sink.batches)
     }
 

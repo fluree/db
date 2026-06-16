@@ -89,7 +89,11 @@ mod tests {
 
     fn parse(line: &str) -> Value {
         assert!(line.ends_with('\n'), "record must be newline-terminated");
-        assert_eq!(line.matches('\n').count(), 1, "record must be a single line");
+        assert_eq!(
+            line.matches('\n').count(),
+            1,
+            "record must be a single line"
+        );
         serde_json::from_str(line.trim_end()).expect("record must be valid JSON")
     }
 
@@ -127,7 +131,11 @@ mod tests {
 
     #[test]
     fn error_reports_code_and_partial_rows() {
-        let v = parse(&error_record("fuel_exhausted", "fuel limit exceeded", 50213));
+        let v = parse(&error_record(
+            "fuel_exhausted",
+            "fuel limit exceeded",
+            50213,
+        ));
         assert_eq!(v["type"], "error");
         assert_eq!(v["error"]["code"], "fuel_exhausted");
         assert_eq!(v["error"]["message"], "fuel limit exceeded");

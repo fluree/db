@@ -312,9 +312,8 @@ fn ndjson_response(
 ) -> Response {
     let body = match heartbeat {
         None => {
-            let stream = futures::stream::unfold(
-                (rx, guard),
-                move |(mut rx, mut guard)| async move {
+            let stream =
+                futures::stream::unfold((rx, guard), move |(mut rx, mut guard)| async move {
                     match rx.recv().await {
                         Some(bytes) => Some((Ok::<Bytes, std::io::Error>(bytes), (rx, guard))),
                         None => {
@@ -324,8 +323,7 @@ fn ndjson_response(
                             None
                         }
                     }
-                },
-            );
+                });
             Body::from_stream(stream)
         }
         Some(period) => {

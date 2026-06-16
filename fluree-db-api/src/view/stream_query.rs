@@ -87,14 +87,12 @@ impl Fluree {
         let input = input.as_input();
 
         let (vars, mut parsed) = match &input {
-            QueryInput::JsonLd(json) => {
-                crate::query::helpers::parse_jsonld_query(
-                    json,
-                    &db.snapshot,
-                    db.default_context.as_ref(),
-                    None,
-                )?
-            }
+            QueryInput::JsonLd(json) => crate::query::helpers::parse_jsonld_query(
+                json,
+                &db.snapshot,
+                db.default_context.as_ref(),
+                None,
+            )?,
             QueryInput::Sparql(sparql) => {
                 self.validate_sparql_for_view(sparql)?;
                 crate::query::helpers::parse_sparql_to_ir(
@@ -186,7 +184,14 @@ impl Fluree {
         };
 
         let exec = self
-            .execute_view_streaming(&graph, &meta.vars, &plan.executable, &tracker, &options, &mut sink)
+            .execute_view_streaming(
+                &graph,
+                &meta.vars,
+                &plan.executable,
+                &tracker,
+                &options,
+                &mut sink,
+            )
             .await;
 
         let terminal = match exec {
@@ -220,9 +225,12 @@ impl Fluree {
     ) -> std::result::Result<(), fluree_db_query::QueryError> {
         let db_ref = db.as_graph_db_ref();
         let prepare_config = PrepareConfig::current(db.binary_store.as_ref());
-        let prepared =
-            fluree_db_query::execute::prepare_execution_with_config(db_ref, executable, &prepare_config)
-                .await?;
+        let prepared = fluree_db_query::execute::prepare_execution_with_config(
+            db_ref,
+            executable,
+            &prepare_config,
+        )
+        .await?;
 
         let spatial_map = db.binary_store.as_ref().map(|s| s.spatial_provider_map());
         let uses_fulltext = executable.uses_fulltext();
@@ -232,7 +240,9 @@ impl Fluree {
             None
         };
         let english_lang_id = if uses_fulltext {
-            db.binary_store.as_ref().and_then(|s| s.resolve_lang_id("en"))
+            db.binary_store
+                .as_ref()
+                .and_then(|s| s.resolve_lang_id("en"))
         } else {
             None
         };

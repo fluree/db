@@ -140,10 +140,7 @@ async fn seed_named(fluree: &support::MemoryFluree, ledger_id: &str, name: &str)
 
 /// Run a streaming dataset/connection query (build dataset → plan → run) and
 /// return the parsed NDJSON records.
-async fn collect_dataset_records(
-    fluree: &support::MemoryFluree,
-    query_json: Value,
-) -> Vec<Value> {
+async fn collect_dataset_records(fluree: &support::MemoryFluree, query_json: Value) -> Vec<Value> {
     let dataset = fluree
         .build_stream_dataset(&query_json)
         .await
