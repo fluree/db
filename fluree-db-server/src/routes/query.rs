@@ -21,17 +21,187 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use fluree_db_api::dataset::GraphSelector;
 use fluree_db_api::{
-    DatasetSpec, FreshnessCheck, FreshnessSource, GraphDb, GraphSource, LedgerState,
-    QueryExecutionOptions, TimeSpec, TrackingTally,
+    ApiError, DatasetSpec, FreshnessCheck, FreshnessSource, GraphDb, GraphSource, LedgerState,
+    QueryExecutionOptions, RefreshOpts, TimeSpec, TrackingTally,
 };
+use rand::Rng;
 use serde::Deserialize;
 use serde_json::Value as JsonValue;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tracing::Instrument;
 
 fn query_execution_options(state: &AppState) -> QueryExecutionOptions {
     crate::query_control::current_query_execution_options(state.config.query_timeout_ms)
+}
+
+async fn maybe_refresh_ledger_for_query(state: &AppState, ledger_id: &str) {
+    let Some(refresh_ledger_id) = refreshable_ledger_id(ledger_id) else {
+        return;
+    };
+    if !state.mark_query_refresh_due(&refresh_ledger_id) {
+        return;
+    }
+
+    match state
+        .fluree
+        .refresh(&refresh_ledger_id, RefreshOpts::default())
+        .await
+    {
+        Ok(Some(result)) => {
+            tracing::debug!(
+                ledger_id = refresh_ledger_id,
+                t = result.t,
+                action = ?result.action,
+                "query-time ledger refresh completed"
+            );
+        }
+        Ok(None) => {
+            tracing::debug!(
+                ledger_id = refresh_ledger_id,
+                "query-time refresh found no nameservice record"
+            );
+        }
+        Err(error) => {
+            // Query-time refresh is a freshness hint. Preserve availability and
+            // let the normal query path surface any load/parse errors.
+            tracing::warn!(
+                ledger_id = refresh_ledger_id,
+                error = %error,
+                "query-time ledger refresh failed; continuing with cached state"
+            );
+        }
+    }
+}
+
+async fn maybe_refresh_query_ledgers<I>(state: &AppState, ledger_ids: I)
+where
+    I: IntoIterator<Item = String>,
+{
+    let ledgers: BTreeSet<String> = ledger_ids.into_iter().filter(|id| !id.is_empty()).collect();
+    for ledger_id in ledgers {
+        maybe_refresh_ledger_for_query(state, &ledger_id).await;
+    }
+}
+
+fn merge_min_t_requirement(requirements: &mut BTreeMap<String, i64>, ledger_id: &str, min_t: i64) {
+    if min_t < 0 {
+        return;
+    }
+    if let Some(base) = refreshable_ledger_id(ledger_id) {
+        requirements
+            .entry(base)
+            .and_modify(|existing| *existing = (*existing).max(min_t))
+            .or_insert(min_t);
+    }
+}
+
+async fn await_query_min_t_requirements(
+    state: &AppState,
+    requirements: BTreeMap<String, i64>,
+) -> Result<()> {
+    if requirements.is_empty() {
+        return Ok(());
+    }
+
+    if state.config.is_proxy_storage_mode() {
+        for (ledger_id, min_t) in requirements {
+            let ledger = state
+                .fluree
+                .ledger(&ledger_id)
+                .await
+                .map_err(ServerError::Api)?;
+            let current = ledger.t();
+            if current < min_t {
+                // A proxy peer tracks head passively via its SSE subscription and
+                // cannot refresh on demand, so report a behind head as a
+                // read-after-write timeout (HTTP 408) — consistent with the
+                // non-proxy wait path — rather than a misleading "not implemented".
+                return Err(ServerError::Api(ApiError::AwaitTNotReached {
+                    requested: min_t,
+                    current,
+                }));
+            }
+        }
+        return Ok(());
+    }
+
+    let configured_timeout = Duration::from_millis(state.config.query_min_t_timeout_ms);
+    let timeout = if state.config.query_timeout_ms == 0 {
+        configured_timeout
+    } else {
+        configured_timeout.min(Duration::from_millis(state.config.query_timeout_ms))
+    };
+    let started = Instant::now();
+
+    for (ledger_id, min_t) in requirements {
+        // `refresh()` does not cold-load. Ensure a cache entry exists before
+        // enforcing min_t so first request on a warm process can still wait.
+        state
+            .fluree
+            .ledger_cached(&ledger_id)
+            .await
+            .map_err(ServerError::Api)?;
+
+        let mut delay = Duration::from_millis(25);
+        loop {
+            let current_after_attempt = match state
+                .fluree
+                .refresh(&ledger_id, RefreshOpts { min_t: Some(min_t) })
+                .await
+            {
+                Ok(Some(result)) if result.t >= min_t => {
+                    state.mark_query_refresh_checked(&ledger_id);
+                    break;
+                }
+                Ok(Some(result)) => result.t,
+                Ok(None) => {
+                    return Err(ServerError::not_found(format!(
+                        "Ledger not found: {ledger_id}"
+                    )));
+                }
+                Err(ApiError::AwaitTNotReached { current, .. }) => current,
+                Err(err) => return Err(ServerError::Api(err)),
+            };
+
+            let elapsed = started.elapsed();
+            if elapsed >= timeout {
+                return Err(ServerError::Api(ApiError::AwaitTNotReached {
+                    requested: min_t,
+                    current: current_after_attempt,
+                }));
+            }
+
+            let remaining = timeout.saturating_sub(elapsed);
+            let jitter_ms = {
+                let upper = (delay.as_millis() / 4).min(u128::from(u64::MAX)) as u64;
+                rand::thread_rng().gen_range(0..=upper)
+            };
+            let sleep_for = (delay + Duration::from_millis(jitter_ms)).min(remaining);
+            tokio::time::sleep(sleep_for).await;
+            delay = (delay * 2).min(Duration::from_millis(500));
+        }
+    }
+
+    Ok(())
+}
+
+async fn refresh_ledgers_without_min_t<I>(
+    state: &AppState,
+    ledger_ids: I,
+    requirements: &BTreeMap<String, i64>,
+) where
+    I: IntoIterator<Item = String>,
+{
+    let ledgers = ledger_ids
+        .into_iter()
+        .filter_map(|id| refreshable_ledger_id(&id))
+        .filter(|id| !requirements.contains_key(id))
+        .collect::<BTreeSet<_>>();
+
+    maybe_refresh_query_ledgers(state, ledgers).await;
 }
 
 // ============================================================================
@@ -474,6 +644,22 @@ pub async fn query(
             }
         }
 
+        let min_t_requirements = collect_sparql_min_t_requirements(headers.min_t, &sparql, None)?;
+        if min_t_requirements.is_empty() {
+            if let Ok(ledger_ids) = fluree_db_api::sparql_dataset_ledger_ids(&sparql) {
+                maybe_refresh_query_ledgers(state.as_ref(), ledger_ids).await;
+            }
+        } else {
+            let ledger_ids = fluree_db_api::sparql_dataset_ledger_ids(&sparql).unwrap_or_default();
+            await_query_min_t_requirements(state.as_ref(), min_t_requirements.clone()).await?;
+            refresh_ledgers_without_min_t(
+                state.as_ref(),
+                ledger_ids,
+                &min_t_requirements,
+            )
+            .await;
+        }
+
         // AgentJson: connection-scoped SPARQL with agent-optimized envelope
         if headers.wants_agent_json() {
             let parsed = fluree_db_sparql::parse_sparql(&sparql);
@@ -686,6 +872,10 @@ pub async fn query(
         // representative id). Parity with the multi-query envelope path.
         enforce_bearer_dataset_scope(&query_json, &bearer, credential.is_signed(), &span)?;
 
+        let min_t_requirements =
+            collect_jsonld_min_t_requirements(&headers, &query_json, Some(&ledger_id))?;
+        await_query_min_t_requirements(state.as_ref(), min_t_requirements).await?;
+
         // Apply bearer identity + server-default policy-class to opts, honoring
         // the root-identity impersonation semantic (see routes::policy_auth).
         let identity = effective_identity(&credential, &bearer);
@@ -805,6 +995,9 @@ pub async fn query_ledger(
             headers.identity.as_deref(),
         )
         .await;
+        let min_t_requirements =
+            collect_sparql_min_t_requirements(headers.min_t, &sparql, Some(&ledger))?;
+        await_query_min_t_requirements(state.as_ref(), min_t_requirements).await?;
         return execute_sparql_ledger(
             &state,
             &ledger,
@@ -858,6 +1051,10 @@ pub async fn query_ledger(
     // references — a scoped token must not reach an out-of-scope ledger via a
     // named graph even on the ledger-scoped endpoint.
     enforce_bearer_dataset_scope(&query_json, &bearer, credential.is_signed(), &span)?;
+
+    let min_t_requirements =
+        collect_jsonld_min_t_requirements(&headers, &query_json, Some(&ledger_id))?;
+    await_query_min_t_requirements(state.as_ref(), min_t_requirements).await?;
 
     // Apply bearer identity + server-default policy-class to opts, honoring
     // the root-identity impersonation semantic (see routes::policy_auth).
@@ -1010,6 +1207,10 @@ pub async fn explain_ledger(
                     }
                 }
 
+                let min_t_requirements =
+                    collect_sparql_min_t_requirements(headers.min_t, &sparql, Some(&ledger))?;
+                await_query_min_t_requirements(state.as_ref(), min_t_requirements).await?;
+
                 // Route through the connection-explain path so the time-travel
                 // suffix on FROM <ledger@t:N> drives snapshot selection.
                 let result = state
@@ -1024,6 +1225,10 @@ pub async fn explain_ledger(
                 );
                 return Ok(Json(result));
             }
+
+            let min_t_requirements =
+                collect_sparql_min_t_requirements(headers.min_t, &sparql, Some(&ledger))?;
+            await_query_min_t_requirements(state.as_ref(), min_t_requirements).await?;
 
             let ledger_id = ledger.clone();
             let loaded = if state.config.is_proxy_storage_mode() {
@@ -1076,6 +1281,10 @@ pub async fn explain_ledger(
                 return Err(ServerError::not_found("Ledger not found"));
             }
         }
+
+        let min_t_requirements =
+            collect_jsonld_min_t_requirements(&headers, &query_json, Some(&ledger_id))?;
+        await_query_min_t_requirements(state.as_ref(), min_t_requirements).await?;
 
         // Apply bearer identity + server-default policy-class to opts, honoring
         // the root-identity impersonation semantic (see routes::policy_auth).
@@ -1275,6 +1484,215 @@ fn base_ledger_id(s: &str) -> Result<String> {
     Ok(base)
 }
 
+fn refreshable_ledger_id(s: &str) -> Option<String> {
+    if matches!(s, "default" | "txn-meta") || s.contains("://") || s.starts_with("urn:") {
+        return None;
+    }
+    let (no_frag, _frag) = split_graph_fragment(s);
+    fluree_db_core::ledger_id::split_time_travel_suffix(no_frag)
+        .ok()
+        .map(|(base, _time)| base)
+        .filter(|base| !base.is_empty())
+}
+
+fn refreshable_ledger_id_and_t(s: &str) -> Option<(String, Option<i64>)> {
+    if matches!(s, "default" | "txn-meta") || s.contains("://") || s.starts_with("urn:") {
+        return None;
+    }
+    let (no_frag, _frag) = split_graph_fragment(s);
+    let (base, time) = fluree_db_core::ledger_id::split_time_travel_suffix(no_frag).ok()?;
+    let min_t = match time {
+        Some(fluree_db_core::ledger_id::LedgerIdTimeSpec::AtT(t)) => Some(t),
+        _ => None,
+    };
+    if base.is_empty() {
+        None
+    } else {
+        Some((base, min_t))
+    }
+}
+
+fn collect_refreshable_jsonld_ledgers(query: &JsonValue) -> Vec<String> {
+    let mut raw_ids = Vec::new();
+    if let Some(from) = query.get("from") {
+        collect_ledger_identifiers(from, &mut raw_ids);
+    }
+    if let Some(named) = query.get("fromNamed").or_else(|| query.get("from-named")) {
+        collect_ledger_identifiers(named, &mut raw_ids);
+    }
+    raw_ids
+        .into_iter()
+        .filter_map(|id| refreshable_ledger_id(&id))
+        .collect()
+}
+
+fn parse_non_negative_i64(value: &JsonValue, field: &str) -> Result<i64> {
+    let parsed = if let Some(n) = value.as_i64() {
+        n
+    } else if let Some(s) = value.as_str() {
+        s.parse::<i64>().map_err(|_| {
+            ServerError::bad_request(format!("{field} must be a non-negative integer"))
+        })?
+    } else {
+        return Err(ServerError::bad_request(format!(
+            "{field} must be a non-negative integer"
+        )));
+    };
+    if parsed < 0 {
+        return Err(ServerError::bad_request(format!(
+            "{field} must be non-negative"
+        )));
+    }
+    Ok(parsed)
+}
+
+fn min_t_from_opts(opts: Option<&JsonValue>) -> Result<Option<i64>> {
+    let Some(obj) = opts.and_then(JsonValue::as_object) else {
+        return Ok(None);
+    };
+    for key in ["min-t", "min_t", "minT"] {
+        if let Some(value) = obj.get(key) {
+            return parse_non_negative_i64(value, &format!("opts.{key}")).map(Some);
+        }
+    }
+    Ok(None)
+}
+
+fn collect_jsonld_time_min_t(value: &JsonValue, requirements: &mut BTreeMap<String, i64>) {
+    match value {
+        JsonValue::String(raw) => {
+            if let Some((ledger_id, Some(t))) = refreshable_ledger_id_and_t(raw) {
+                merge_min_t_requirement(requirements, &ledger_id, t);
+            }
+        }
+        JsonValue::Array(items) => {
+            for item in items {
+                collect_jsonld_time_min_t(item, requirements);
+            }
+        }
+        JsonValue::Object(obj) => {
+            if let Some(raw) = obj
+                .get("@id")
+                .or_else(|| obj.get("id"))
+                .and_then(JsonValue::as_str)
+            {
+                if let Some((ledger_id, suffix_t)) = refreshable_ledger_id_and_t(raw) {
+                    if let Some(t) = obj.get("t").and_then(JsonValue::as_i64).or(suffix_t) {
+                        merge_min_t_requirement(requirements, &ledger_id, t);
+                    }
+                }
+            } else {
+                for entry in obj.values() {
+                    collect_jsonld_time_min_t(entry, requirements);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_jsonld_min_t_requirements(
+    headers: &FlureeHeaders,
+    query: &JsonValue,
+    default_ledger: Option<&str>,
+) -> Result<BTreeMap<String, i64>> {
+    let mut requirements = BTreeMap::new();
+
+    if let Some(from) = query.get("from") {
+        collect_jsonld_time_min_t(from, &mut requirements);
+    }
+    if let Some(named) = query.get("fromNamed").or_else(|| query.get("from-named")) {
+        collect_jsonld_time_min_t(named, &mut requirements);
+    }
+    if let Some(to) = query.get("to") {
+        collect_jsonld_time_min_t(to, &mut requirements);
+    }
+
+    let explicit_min_t = min_t_from_opts(query.get("opts"))?.or(headers.min_t);
+    if let Some(min_t) = explicit_min_t {
+        let mut ledgers = collect_refreshable_jsonld_ledgers(query);
+        if ledgers.is_empty() {
+            if let Some(ledger_id) = default_ledger {
+                ledgers.push(ledger_id.to_string());
+            }
+        }
+        for ledger_id in ledgers {
+            merge_min_t_requirement(&mut requirements, &ledger_id, min_t);
+        }
+    }
+
+    Ok(requirements)
+}
+
+fn collect_sparql_min_t_requirements(
+    header_min_t: Option<i64>,
+    sparql: &str,
+    default_ledger: Option<&str>,
+) -> Result<BTreeMap<String, i64>> {
+    // A min-t requirement can only come from a `Fluree-Min-T` header or an
+    // `@t:` snapshot pin in the query. When neither is present there is nothing
+    // to collect, so skip the SPARQL parses below — ordinary current-head
+    // traffic must not pay the freshness feature's parse cost on every request.
+    if header_min_t.is_none() && !sparql.contains("@t:") {
+        return Ok(BTreeMap::new());
+    }
+
+    let mut requirements = BTreeMap::new();
+    let ledger_ids = fluree_db_api::sparql_dataset_ledger_ids(sparql).unwrap_or_default();
+
+    let parsed = fluree_db_sparql::parse_sparql(sparql);
+    if let Some(ast) = parsed.ast.as_ref() {
+        let dataset = match &ast.body {
+            fluree_db_sparql::ast::QueryBody::Select(q) => q.dataset.as_ref(),
+            fluree_db_sparql::ast::QueryBody::Construct(q) => q.dataset.as_ref(),
+            fluree_db_sparql::ast::QueryBody::Ask(q) => q.dataset.as_ref(),
+            fluree_db_sparql::ast::QueryBody::Describe(q) => q.dataset.as_ref(),
+            fluree_db_sparql::ast::QueryBody::Update(_) => None,
+        };
+        if let Some(dataset) = dataset {
+            for iri in dataset
+                .default_graphs
+                .iter()
+                .chain(dataset.named_graphs.iter())
+                .chain(dataset.to_graph.iter())
+            {
+                let raw = iri_to_string(iri);
+                if let Some((ledger_id, Some(t))) = refreshable_ledger_id_and_t(&raw) {
+                    merge_min_t_requirement(&mut requirements, &ledger_id, t);
+                }
+            }
+        }
+    }
+
+    for raw in &ledger_ids {
+        if let Some((ledger_id, Some(t))) = refreshable_ledger_id_and_t(raw) {
+            merge_min_t_requirement(&mut requirements, &ledger_id, t);
+        }
+    }
+
+    if let Some(min_t) = header_min_t {
+        if ledger_ids.is_empty() {
+            match default_ledger {
+                Some(ledger_id) => merge_min_t_requirement(&mut requirements, ledger_id, min_t),
+                // A read-after-write header with no resolvable ledger would be
+                // silently dropped; fail fast instead so the guarantee is never
+                // quietly ignored.
+                None => {
+                    return Err(ServerError::bad_request(
+                        "Fluree-Min-T requires a target ledger; add a FROM clause or use a ledger-scoped endpoint",
+                    ));
+                }
+            }
+        } else {
+            for ledger_id in ledger_ids {
+                merge_min_t_requirement(&mut requirements, &ledger_id, min_t);
+            }
+        }
+    }
+
+    Ok(requirements)
+}
+
 fn looks_like_graph_selector_only(s: &str) -> bool {
     // Ledger IDs typically look like `name:branch` and do NOT include `://`.
     // Graph IRIs commonly include `://` or `urn:` and should be treated as selectors.
@@ -1338,8 +1756,90 @@ fn normalize_ledger_scoped_from(ledger_id: &str, query: &mut JsonValue) -> Resul
 
 #[cfg(test)]
 mod ledger_scoped_from_tests {
-    use super::{normalize_ledger_scoped_from, requires_dataset_features};
+    use super::{
+        collect_jsonld_min_t_requirements, collect_sparql_min_t_requirements,
+        normalize_ledger_scoped_from, refreshable_ledger_id, requires_dataset_features,
+    };
+    use crate::extract::FlureeHeaders;
     use serde_json::json;
+
+    #[test]
+    fn refreshable_ledger_id_strips_time_and_graph_selectors() {
+        assert_eq!(
+            refreshable_ledger_id("books:main@t:42#txn-meta").as_deref(),
+            Some("books:main")
+        );
+        assert_eq!(refreshable_ledger_id("books").as_deref(), Some("books"));
+        assert!(refreshable_ledger_id("txn-meta").is_none());
+        assert!(refreshable_ledger_id("https://example.org/graph").is_none());
+    }
+
+    #[test]
+    fn jsonld_min_t_requirements_include_header_opts_and_time_pins() {
+        let headers = FlureeHeaders {
+            min_t: Some(7),
+            ..Default::default()
+        };
+        let q = json!({
+            "from": [
+                "books:main@t:42",
+                {"@id": "users:main", "t": 9}
+            ],
+            "opts": { "min-t": 11 }
+        });
+
+        let requirements =
+            collect_jsonld_min_t_requirements(&headers, &q, Some("fallback:main")).unwrap();
+
+        assert_eq!(requirements.get("books:main"), Some(&42));
+        assert_eq!(requirements.get("users:main"), Some(&11));
+        assert!(!requirements.contains_key("fallback:main"));
+    }
+
+    #[test]
+    fn jsonld_min_t_header_applies_to_default_ledger() {
+        let headers = FlureeHeaders {
+            min_t: Some(12),
+            ..Default::default()
+        };
+        let q = json!({ "select": ["*"] });
+
+        let requirements =
+            collect_jsonld_min_t_requirements(&headers, &q, Some("books:main")).unwrap();
+
+        assert_eq!(requirements.get("books:main"), Some(&12));
+    }
+
+    #[test]
+    fn sparql_min_t_requirements_include_header_and_from_t() {
+        let headers = FlureeHeaders {
+            min_t: Some(15),
+            ..Default::default()
+        };
+        let sparql = "SELECT * FROM <books:main@t:42> WHERE { ?s ?p ?o }";
+
+        let requirements = collect_sparql_min_t_requirements(headers.min_t, sparql, None).unwrap();
+
+        assert_eq!(requirements.get("books:main"), Some(&42));
+    }
+
+    #[test]
+    fn sparql_min_t_header_without_target_ledger_errors() {
+        let sparql = "SELECT * WHERE { ?s ?p ?o }";
+
+        let result = collect_sparql_min_t_requirements(Some(15), sparql, None);
+
+        assert!(result.is_err(), "min-t header with no ledger must error");
+    }
+
+    #[test]
+    fn sparql_min_t_without_header_or_pin_skips_collection() {
+        let sparql = "SELECT * WHERE { ?s ?p ?o }";
+
+        let requirements = collect_sparql_min_t_requirements(None, sparql, None).unwrap();
+
+        assert!(requirements.is_empty());
+    }
 
     #[test]
     fn normalize_from_txn_meta_string_rewrites_to_object() {
@@ -1821,6 +2321,7 @@ async fn execute_sparql_ledger(
                     fmt.name().to_uppercase()
                 )));
             }
+            maybe_refresh_ledger_for_query(state, ledger_id).await;
             let view = state.fluree.db_with_policy(ledger_id, &qc_opts).await
                 .inspect_err(|_| { set_span_error_code(&span, "error:QueryFailed"); })?;
             let view = attach_default_context_to_graph(state, ledger_id, view, use_default_context)
@@ -2480,6 +2981,10 @@ pub async fn explain(
                 }
             }
 
+            let min_t_requirements =
+                collect_sparql_min_t_requirements(headers.min_t, &sparql, Some(&ledger_id))?;
+            await_query_min_t_requirements(state.as_ref(), min_t_requirements).await?;
+
             // If FROM carries a time-travel suffix, route through the
             // dataset-aware connection-explain path so snapshot selection
             // honors `@t:N` / ISO / commit-prefix. Otherwise keep the
@@ -2561,6 +3066,10 @@ pub async fn explain(
             }
         }
 
+        let min_t_requirements =
+            collect_jsonld_min_t_requirements(&headers, &query_json, Some(&ledger_id))?;
+        await_query_min_t_requirements(state.as_ref(), min_t_requirements).await?;
+
         // Apply bearer identity + server-default policy-class to opts, honoring
         // the root-identity impersonation semantic (see routes::policy_auth).
         let identity = effective_identity(&credential, &bearer);
@@ -2638,6 +3147,8 @@ pub(crate) async fn load_ledger_for_query(
     span: &tracing::Span,
 ) -> Result<LedgerState> {
     let fluree = &state.fluree;
+
+    maybe_refresh_ledger_for_query(state, ledger_id).await;
 
     // Get cached handle (loads if not cached)
     let handle = fluree.ledger_cached(ledger_id).await.map_err(|e| {
@@ -2823,6 +3334,8 @@ async fn execute_dataset_query(
         }
     }
 
+    maybe_refresh_query_ledgers(state, collect_refreshable_jsonld_ledgers(&query)).await;
+
     // Delegate the actual execution to the connection-scoped sub-query helper —
     // the same path the multi-query dispatcher uses for each sub-query alias.
     let tracked = has_tracking_opts(&query);
@@ -2880,9 +3393,70 @@ async fn execute_dataset_query(
 
 use fluree_db_api::query::multi::MultiQueryError;
 use fluree_db_api::query::multi::{
-    MultiQueryBounds, MultiQueryRequest, MultiQuerySubquery, MultiQueryValidationError,
+    AsOf, MultiQueryBounds, MultiQueryRequest, MultiQuerySubquery, MultiQueryValidationError,
     SubqueryLanguage,
 };
+
+fn collect_multi_query_min_t_requirements(
+    headers: &FlureeHeaders,
+    envelope: &MultiQueryRequest,
+    distinct_ledgers: &BTreeSet<String>,
+) -> Result<BTreeMap<String, i64>> {
+    let mut requirements = BTreeMap::new();
+
+    let envelope_min_t = min_t_from_opts(envelope.opts.as_ref())?.or(headers.min_t);
+    if let Some(min_t) = envelope_min_t {
+        for ledger_id in distinct_ledgers {
+            merge_min_t_requirement(&mut requirements, ledger_id, min_t);
+        }
+    }
+
+    if let Some(AsOf::T(t)) = envelope.as_of.as_ref() {
+        for ledger_id in distinct_ledgers {
+            merge_min_t_requirement(&mut requirements, ledger_id, *t);
+        }
+    }
+
+    for sub in envelope.queries.values() {
+        let sub_min_t = min_t_from_opts(sub.opts.as_ref())?;
+        match sub.language {
+            SubqueryLanguage::JsonLd => {
+                let mut sub_requirements =
+                    collect_jsonld_min_t_requirements(headers, &sub.query, None)?;
+                if let Some(min_t) = sub_min_t {
+                    let ledgers = collect_refreshable_jsonld_ledgers(&sub.query);
+                    for ledger_id in ledgers {
+                        merge_min_t_requirement(&mut sub_requirements, &ledger_id, min_t);
+                    }
+                }
+                for (ledger_id, min_t) in sub_requirements {
+                    merge_min_t_requirement(&mut requirements, &ledger_id, min_t);
+                }
+            }
+            SubqueryLanguage::Sparql => {
+                if let Some(sparql) = sub.query.as_str() {
+                    // The envelope already applied any `Fluree-Min-T` header to
+                    // every distinct ledger; the sub-collector only needs to pick
+                    // up per-query `@t:` pins, so pass no header here.
+                    let mut sub_requirements =
+                        collect_sparql_min_t_requirements(None, sparql, None)?;
+                    if let Some(min_t) = sub_min_t {
+                        if let Ok(ledgers) = fluree_db_api::sparql_dataset_ledger_ids(sparql) {
+                            for ledger_id in ledgers {
+                                merge_min_t_requirement(&mut sub_requirements, &ledger_id, min_t);
+                            }
+                        }
+                    }
+                    for (ledger_id, min_t) in sub_requirements {
+                        merge_min_t_requirement(&mut requirements, &ledger_id, min_t);
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(requirements)
+}
 
 /// `POST /v1/fluree/multi-query`
 ///
@@ -3003,6 +3577,20 @@ pub async fn multi_query(
                         }
                     }
                 }
+            }
+
+            let min_t_requirements =
+                collect_multi_query_min_t_requirements(&headers, &envelope, &distinct_ledgers)?;
+            if min_t_requirements.is_empty() {
+                maybe_refresh_query_ledgers(state.as_ref(), distinct_ledgers.iter().cloned()).await;
+            } else {
+                await_query_min_t_requirements(state.as_ref(), min_t_requirements.clone()).await?;
+                refresh_ledgers_without_min_t(
+                    state.as_ref(),
+                    distinct_ledgers.iter().cloned(),
+                    &min_t_requirements,
+                )
+                .await;
             }
 
             // Per-sub-query identity / default-policy-class injection runs

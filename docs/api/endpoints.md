@@ -28,6 +28,8 @@ The CLI treats `oidc_device` as "OIDC interactive login": it uses device-code wh
 Implementations MAY also return `api_base_url` to tell the CLI where the Fluree API is mounted (for example,
 when the API is hosted under `/v1/fluree` or on a separate `data` subdomain).
 
+Implementations MAY also return an `import` block advertising `.flpack` import capabilities (`modes` incl. `multipart-put`, `direct_max_bytes`, multipart hints) so the CLI can negotiate the upload path — see [Negotiated upload import](#negotiated-upload-import-import-upload).
+
 ### GET {api_base_url}/whoami
 
 Diagnostic endpoint for Bearer tokens. Returns a summary of the principal:
@@ -633,6 +635,103 @@ curl -X POST "http://localhost:8090/v1/fluree/pack/mydb:main" \
   --output pack.bin
 ```
 
+### POST /import/*ledger
+
+Create a **new** ledger by restoring a `.flpack` archive — the inbound
+counterpart of `POST /pack/*ledger`. The request body is the raw `.flpack`
+stream (as produced by `fluree export <ledger> --format ledger` or
+`Fluree::archive_ledger`). The server streams the archive into storage — commits,
+transaction blobs, and any prebuilt index artifacts — then finalizes the commit
+and index heads from the archive's embedded nameservice manifest.
+
+The new ledger is named by the URL path and is **independent of the source
+ledger's name**, so the same archive can be restored under any name. Unlike
+`/push`, the archive is trusted byte-for-byte (every frame is SHA-256 verified)
+and not replayed, and the prebuilt index rides along — so the restored ledger is
+immediately queryable with no reindex.
+
+**Admin-protected** (same bracket as `/create` and `/drop`): the body carries
+prebuilt index artifacts the server did not produce, so this is an admin-grade
+operation. The archive is decoded frame-by-frame and never buffered whole, so
+multi-gigabyte archives restore without exhausting server memory.
+
+**URL:**
+
+```
+POST /import/<ledger...>
+```
+
+**Request Headers:**
+
+```http
+Content-Type: application/x-fluree-pack
+Authorization: Bearer <token>   (admin token when configured)
+```
+
+**Request Body:** the raw `.flpack` byte stream.
+
+**Response:** `201 Created` with a JSON summary:
+
+```json
+{
+  "ledger_id": "restored-db:main",
+  "commits": 12,
+  "txn_blobs": 12,
+  "index_artifacts": 34,
+  "commit_t": 12,
+  "index_t": 12
+}
+```
+
+`index_artifacts` is `0` and `index_t` is omitted for a commits-only archive
+(exported with `--no-indexes`); such a ledger replays from commits on first load.
+
+**Status codes:**
+
+- `201 Created`: ledger restored
+- `400 Bad Request`: malformed archive (bad preamble/frame, missing manifest, or a manifest head CID not present in the archive)
+- `409 Conflict`: a ledger with that name already exists
+- `401 Unauthorized`: missing or invalid admin token
+
+On any mid-stream failure the partially-created ledger is rolled back, so a
+failed import never leaves a live, half-ingested ledger behind.
+
+**Example:**
+
+```bash
+# Restore an archive into a brand-new ledger named "restored-db:main"
+curl -X POST "http://localhost:8090/v1/fluree/import/restored-db:main" \
+  -H "Content-Type: application/x-fluree-pack" \
+  -H "Authorization: Bearer $TOKEN" \
+  --data-binary @mydb.flpack
+```
+
+This is the transport behind `fluree create restored-db --remote origin --from mydb.flpack`.
+
+### Negotiated upload import (`/import-upload`)
+
+For clients that cannot send a large body to `POST /import` (e.g. behind a payload-capped gateway), an optional out-of-band upload handshake lets the client upload the `.flpack` directly to object storage, then have the server restore from it asynchronously. Servers advertise support in discovery (`GET /.well-known/fluree.json`):
+
+```jsonc
+"import": {
+  "modes": ["direct", "presigned-put", "multipart-put"],  // negotiated modes
+  "direct_max_bytes": 6291456,             // archives larger than this negotiate
+  "multipart_threshold_bytes": 5368709120, // ≥ this size → multipart (5 GiB PUT cap)
+  "multipart_part_size_bytes": 268435456   // target part size hint (≥ 5 MiB for S3)
+}
+```
+
+| Step | Endpoint | Result |
+|------|----------|--------|
+| Mint | `POST /import-upload` `{ledger, size?}` | single: `{ import_id, upload: { method, url, headers, expires_at_unix } }` — or multipart (when `size ≥ threshold`): `{ import_id, multipart: { upload_id, part_size_bytes, parts:[{part_number,url,headers}], expires_at_unix } }` |
+| Upload | `PUT <upload.url>` (single) **or** `PUT <part.url>` per part (multipart) | bytes staged (direct to object storage; **no bearer auth** — the URL is the capability). Each part PUT returns its `ETag`. |
+| Complete | `POST /import-upload/{import_id}/complete` | body: empty (single) or `{ parts:[{part_number, etag}] }` (multipart) → `202` `{ import_id, status:"running" }` — restore begins asynchronously |
+| Status | `GET /import-upload/{import_id}` | `{ status, result?, error? }`, `status ∈ {awaiting-upload, running, succeeded, failed}` |
+
+Mint / complete / status are **admin-protected**; the blob/part `PUT`s are token-authorized via the minted URL. The server picks single-PUT vs multipart by the declared `size` (a single S3 PUT caps at 5 GiB). On `succeeded`, `result` is the same summary as `POST /import`. The Fluree server ships a reference backend behind `FLUREE_IMPORT_PRESIGN_ENABLED=true` (stages parts to local disk and concatenates them); production servers mint presigned object-store URLs and drive `CreateMultipartUpload`/`CompleteMultipartUpload`. See the [Negotiated Upload Import Contract](../cli/server-integration.md#negotiated-upload-import-contract) for the full implementer spec.
+
+This is the transport behind `fluree create … --remote … --from big.flpack` when the server is size-capped — the CLI negotiates automatically.
+
 ## Storage Proxy Endpoints
 
 These endpoints are intended for peer mode and `fluree clone`/`pull` workflows. They require the storage proxy to be enabled on the server and use replication-grade Bearer tokens (`fluree.storage.*` claims).
@@ -901,13 +1000,17 @@ The `GET` form is provided for W3C SPARQL Protocol compliance. It accepts SPARQL
 ```http
 Content-Type: application/json
 Accept: application/json
+Fluree-Min-T: 42  # optional read-after-write guarantee
 ```
 
 Or for SPARQL:
 ```http
 Content-Type: application/sparql-query
 Accept: application/sparql-results+json
+Fluree-Min-T: 42  # optional read-after-write guarantee
 ```
+
+`Fluree-Min-T` makes the server refresh the referenced ledger(s) until they have reached at least that transaction time before executing the query. JSON-LD bodies can also send `opts.min-t`, `opts.min_t`, or `opts.minT`; body opts take precedence over the header.
 
 **Request Body (JSON-LD Query):**
 

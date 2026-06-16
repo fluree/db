@@ -927,7 +927,12 @@ async fn update_where_bind_rdf_term_functions() {
     assert_eq!(result.get("ex:isIRI"), Some(&json!(true)));
     assert_eq!(result.get("ex:isLiteral"), Some(&json!(true)));
     assert_eq!(result.get("ex:lang"), Some(&json!("es")));
-    assert_eq!(result.get("ex:datatype"), Some(&json!("rdf:langString")));
+    // DATATYPE returns the datatype IRI (SPARQL 1.1 §17.4.2.3), so binding it
+    // and inserting stores an IRI reference, not a plain string.
+    assert_eq!(
+        result.get("ex:datatype"),
+        Some(&json!({"@id": "rdf:langString"}))
+    );
     assert_eq!(
         result.get("ex:strdt"),
         Some(&json!({"@value": "Abcdefg", "@type": "ex:mystring"}))

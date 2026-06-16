@@ -410,6 +410,10 @@ impl SubqueryOperator {
             return Ok(None);
         }
 
+        // Number of rows about to be drained — needed to size an empty-schema
+        // batch, where there are no columns to infer the row count from.
+        let drained = self.result_buffer.len() - self.buffer_pos;
+
         // Build batch from buffer
         let num_cols = self.in_schema.len();
         let mut columns: Vec<Vec<Binding>> = (0..num_cols).map(|_| Vec::new()).collect();
@@ -424,7 +428,16 @@ impl SubqueryOperator {
 
         self.buffer_pos = self.result_buffer.len();
 
-        if columns.is_empty() || columns[0].is_empty() {
+        // A variable-free subquery (e.g. `{ SELECT * WHERE { :a :p "1" } }`)
+        // produces an empty schema; a match is still one empty-binding solution
+        // per row. Emit an empty-schema batch with the row count rather than
+        // collapsing to zero rows (out_schema is also empty here, so there is
+        // nothing to trim).
+        if num_cols == 0 {
+            return Ok(Some(Batch::empty_schema_with_len(drained)));
+        }
+
+        if columns[0].is_empty() {
             Ok(None)
         } else {
             let batch = Batch::new(self.in_schema.clone(), columns)?;

@@ -170,9 +170,16 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
         // Expression GROUP BY like `GROUP BY (expr AS ?alias)` desugars to
         // a pre-group BIND pattern + GROUP BY on the alias variable.
         if let Some(ref group_by_clause) = modifiers.group_by {
+            // Map of structural key → alias var for non-aggregate SELECT
+            // expressions, so an unaliased `GROUP BY (expr)` whose expression is
+            // also projected as `(expr AS ?k)` can group on ?k directly rather
+            // than on a fresh synthetic var (SPARQL 1.1 §11.2 — a projected
+            // grouping expression yields the group value).
+            let select_expr_aliases = self.select_expr_alias_map(select);
             let mut group_vars = Vec::with_capacity(group_by_clause.conditions.len());
             for cond in &group_by_clause.conditions {
-                let (var_id, bind_pattern) = self.lower_group_condition(cond)?;
+                let (var_id, bind_pattern) =
+                    self.lower_group_condition(cond, &select_expr_aliases)?;
                 group_vars.push(var_id);
                 if let Some(pattern) = bind_pattern {
                     pre_group_binds.push(pattern);
@@ -357,14 +364,44 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
         }
     }
 
+    /// Build a map from structural expression key → alias `VarId` for every
+    /// non-aggregate `(expr AS ?alias)` in the SELECT clause.
+    ///
+    /// Used to recognize when an unaliased `GROUP BY (expr)` groups on an
+    /// expression that the SELECT also projects, so both can share one variable.
+    /// The alias vars are already registered by `lower_select_expression_binds`;
+    /// `register_var` returns the existing id.
+    fn select_expr_alias_map(&mut self, select: &SelectClause) -> HashMap<String, VarId> {
+        let mut map = HashMap::new();
+        if let SelectVariables::Explicit(vars) = &select.variables {
+            for var in vars {
+                if let SelectVariable::Expr { expr, alias, .. } = var {
+                    if matches!(expr, AstExpression::Aggregate { .. }) {
+                        continue;
+                    }
+                    let key = Self::expr_key_no_span(expr);
+                    let var_id = self.register_var(alias);
+                    map.entry(key).or_insert(var_id);
+                }
+            }
+        }
+        map
+    }
+
     /// Lower a GROUP BY condition to a variable ID and optional pre-GROUP-BY BIND.
     ///
     /// Returns `(var_id, Option<Pattern::Bind>)`:
     /// - `GROUP BY ?x`              → variable reference, no BIND needed
     /// - `GROUP BY (?x)`            → parenthesized variable, unwrapped to plain variable
     /// - `GROUP BY (expr AS ?alias)` → desugared to BIND(expr AS ?alias) + GROUP BY ?alias
-    /// - `GROUP BY (expr)`          → same, but with a synthetic `?__group_expr_N` alias
-    fn lower_group_condition(&mut self, cond: &GroupCondition) -> Result<(VarId, Option<Pattern>)> {
+    /// - `GROUP BY (expr)` projected as `(expr AS ?k)` → group on ?k (already
+    ///   bound by the SELECT pre-bind), no new BIND
+    /// - `GROUP BY (expr)`          → otherwise, a synthetic `?__group_expr_N` alias
+    fn lower_group_condition(
+        &mut self,
+        cond: &GroupCondition,
+        select_expr_aliases: &HashMap<String, VarId>,
+    ) -> Result<(VarId, Option<Pattern>)> {
         match cond {
             GroupCondition::Var(var) => Ok((self.register_var(var), None)),
             GroupCondition::Expr { expr, alias, .. } => {
@@ -372,15 +409,34 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                 match expr.unwrap_bracketed() {
                     AstExpression::Var(var) => Ok((self.register_var(var), None)),
                     _ => {
-                        // Expression-based GROUP BY: desugar to BIND + GROUP BY alias
+                        // Explicit `GROUP BY (expr AS ?alias)`: desugar to
+                        // BIND(expr AS ?alias) + GROUP BY ?alias.
+                        if let Some(alias_var) = alias {
+                            let lowered = self.lower_expression(expr)?;
+                            let var_id = self.register_var(alias_var);
+                            return Ok((
+                                var_id,
+                                Some(Pattern::Bind {
+                                    var: var_id,
+                                    expr: lowered,
+                                }),
+                            ));
+                        }
+
+                        // Unaliased `GROUP BY (expr)`: if the SELECT projects the
+                        // same expression as `(expr AS ?k)`, group on ?k. The
+                        // SELECT pre-bind already computes `?k = expr` in the
+                        // WHERE patterns, so no new BIND is needed and the
+                        // projected variable equals the group value. Otherwise
+                        // synthesize a fresh group var + BIND.
+                        let key = Self::expr_key_no_span(expr);
+                        if let Some(&alias_var) = select_expr_aliases.get(&key) {
+                            return Ok((alias_var, None));
+                        }
+
                         let lowered = self.lower_expression(expr)?;
-                        let var_id = if let Some(alias_var) = alias {
-                            self.register_var(alias_var)
-                        } else {
-                            // No alias — generate a synthetic variable
-                            let name = format!("?__group_expr_{}", self.vars.len());
-                            self.vars.get_or_insert(&name)
-                        };
+                        let name = format!("?__group_expr_{}", self.vars.len());
+                        let var_id = self.vars.get_or_insert(&name);
                         Ok((
                             var_id,
                             Some(Pattern::Bind {

@@ -205,12 +205,6 @@ pub async fn stage(
         let new_t = ledger.t() + 1;
         tracing::debug!(new_t = new_t, "computed new transaction t");
 
-        // Track whether this transaction has an explicit WHERE clause, before
-        // execute_where consumes the patterns. Needed to distinguish "WHERE that
-        // matched nothing" (→ no-op) from "no WHERE at all" (→ fire templates once).
-        let has_where_clause =
-            !txn.where_patterns.is_empty() || txn.values.is_some() || txn.sparql_where.is_some();
-
         // Pure-DELETE fast path: no INSERT templates and not an Upsert. Skips
         // assertion generation and the assertion/retraction cancellation hashmap;
         // a sort-and-dedup pass over retractions is sufficient since all
@@ -294,31 +288,14 @@ pub async fn stage(
         .instrument(where_span)
         .await?;
 
-        // Per SPARQL 1.1 Update spec (§3.1.3): INSERT/DELETE templates are
-        // instantiated once per solution row from WHERE. Zero solutions = zero
-        // instantiations *except* for all-literal INSERT templates, which
-        // must still fire once against a single empty solution (supports the
-        // common "delete-if-exists, always insert" pattern).
-        //
-        // The signal must be "total emitted rows == 0", not "cursor yielded
-        // any batch". Operators like VALUES, geo/vector search, and some
-        // join/optional shapes legitimately emit `Some(empty_batch)` to
-        // represent a zero-row result while still signalling completion —
-        // the old eager path detected this via `bindings.is_empty()` on the
-        // merged batch. Using `saw_any_batch` would flip that semantic and
-        // suppress the post-loop fallback for valid zero-row cases.
-        //
-        // has_where_clause gates the fallback so the no-WHERE case (where
-        // the SingleEmpty cursor emits an empty-schema-empty batch that
-        // already fires all-literal templates once via the in-loop path)
-        // doesn't double-fire.
-        let where_returned_no_rows = has_where_clause && stream_stats.total_binding_rows == 0;
-        if where_returned_no_rows && !pure_delete {
-            let empty_solution = Batch::single_empty();
-            let assertions =
-                generator.generate_assertions(&txn.insert_templates, &empty_solution)?;
-            acc.push_assertions(assertions);
-        }
+        // Per SPARQL 1.1 Update §3.1.3: INSERT/DELETE templates are instantiated
+        // once per WHERE solution, so a WHERE that matches zero solutions is a
+        // no-op. The no-WHERE case (no patterns, no VALUES) is handled inside
+        // `stream_where_into_accumulator`: the cursor's SingleEmpty variant emits
+        // one empty-schema-empty batch, which generators interpret as a single
+        // empty solution, firing all-literal templates exactly once. A present
+        // WHERE that yields no rows therefore correctly inserts nothing — we do
+        // NOT fall back to a synthetic empty solution here.
 
         // Upsert second wave: retractions derived from direct ledger lookups
         // (not WHERE). These flakes already carry correct `m` from the
@@ -673,14 +650,8 @@ fn collect_template_vars(template_groups: &[&[TripleTemplate]]) -> Vec<VarId> {
 
 /// Stats collected while streaming the WHERE result into the accumulator.
 ///
-/// - `total_binding_rows` is the sum of row counts across all batches. The
-///   caller uses this (combined with `has_where_clause`) to decide whether
-///   all-literal INSERT templates should fire once post-loop against
-///   `Batch::single_empty()`. Using the emitted-row total rather than
-///   "any batch arrived" is important: operators like VALUES, geo/vector
-///   search, and some join/optional shapes legitimately emit an empty
-///   batch to signal a zero-row result, and those cases must be treated
-///   as "WHERE matched nothing" for fallback purposes.
+/// - `total_binding_rows` is the sum of row counts across all batches, recorded
+///   on the `where_exec` span for tracing.
 /// - `retraction_count` / `assertion_count` are the pre-dedup totals pushed
 ///   into the accumulator (for tracing).
 struct WhereStreamStats {

@@ -322,6 +322,10 @@ impl GraphOperator {
             return Ok(None);
         }
 
+        // Number of rows about to be drained — needed to size an empty-schema
+        // batch, where there are no columns to infer the row count from.
+        let drained = self.result_buffer.len() - self.buffer_pos;
+
         // Build batch from buffer
         let num_cols = self.schema.len();
         let mut columns: Vec<Vec<Binding>> = (0..num_cols).map(|_| Vec::new()).collect();
@@ -336,7 +340,16 @@ impl GraphOperator {
 
         self.buffer_pos = self.result_buffer.len();
 
-        if columns.is_empty() || columns[0].is_empty() {
+        // A ground GRAPH body (e.g. `GRAPH <g> { :a :p "1" }`) produces no
+        // variables, so the schema is empty. Each matched row is still one
+        // empty-binding solution and must be preserved — emit an empty-schema
+        // batch carrying the row count rather than collapsing to zero rows
+        // (which would wrongly turn a satisfied existence check into a no-match).
+        if num_cols == 0 {
+            return Ok(Some(Batch::empty_schema_with_len(drained)));
+        }
+
+        if columns[0].is_empty() {
             Ok(None)
         } else {
             Ok(Some(Batch::new(self.schema.clone(), columns)?))

@@ -1822,6 +1822,43 @@ mod tests {
     }
 
     #[test]
+    fn test_group_by_expression_reuses_matching_select_alias() {
+        // Field P0: `SELECT (LCASE(?cur) AS ?k) ... GROUP BY (LCASE(?cur))` must
+        // group on ?k (the SELECT alias), NOT on a fresh synthetic var. Grouping
+        // on a synthetic var left ?k as an ungrouped per-row variable, which the
+        // formatter then exploded into one row per input binding (LIMIT ignored).
+        let (query, vars) = lower_query_with_vars(
+            "PREFIX ex: <http://example.org/>
+             SELECT (LCASE(?cur) AS ?k) (COUNT(?s) AS ?n)
+             WHERE { ?s ex:currency ?cur } GROUP BY (LCASE(?cur))",
+        )
+        .unwrap();
+
+        assert_eq!(group_by_of(&query).len(), 1);
+        let group_var = group_by_of(&query)[0];
+
+        // The group key is the SELECT alias ?k, not a synthetic ?__group_expr_N.
+        assert_eq!(vars.name(group_var), "?k");
+
+        // Exactly one BIND targets ?k (the SELECT pre-bind); GROUP BY adds none.
+        let binds_to_k = query
+            .patterns
+            .iter()
+            .filter(|p| matches!(p, Pattern::Bind { var, .. } if *var == group_var))
+            .count();
+        assert_eq!(
+            binds_to_k, 1,
+            "expected exactly one BIND to the shared group/alias var"
+        );
+
+        // No synthetic group-expression var should have been created.
+        let has_synthetic = query.patterns.iter().any(
+            |p| matches!(p, Pattern::Bind { var, .. } if vars.name(*var).starts_with("?__group_expr_")),
+        );
+        assert!(!has_synthetic, "no synthetic group var should be generated");
+    }
+
+    #[test]
     fn test_group_by_bracketed_var_produces_no_bind() {
         // GROUP BY (?var) should NOT produce a BIND pattern — just unwrap the parens
         let query = lower_query(

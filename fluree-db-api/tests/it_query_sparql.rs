@@ -840,6 +840,41 @@ async fn sparql_subquery_expression_order_by_with_limit() {
     assert_eq!(normalize_rows(&jsonld), normalize_rows(&json!([[99]])));
 }
 
+/// Regression: a variable-free subquery (`{ SELECT * WHERE { <ground> } }`)
+/// produces an empty schema. When the ground pattern matches it is one
+/// empty-binding solution and must NOT collapse to zero rows — otherwise it
+/// would wrongly wipe out the joined outer pattern. Guards
+/// `SubqueryOperator::drain_buffer`'s empty-schema handling.
+#[tokio::test]
+async fn sparql_ground_subquery_does_not_wipe_outer_pattern() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_people(&fluree, "people:main").await;
+
+    // Outer pattern matches exactly one row (jdoe's full name). The inner
+    // subquery is fully ground (jdoe's handle is "jdoe"), projects no variables,
+    // and exists — so the join must preserve the single outer row.
+    let query = r#"
+        PREFIX ex: <http://example.org/ns/>
+        PREFIX person: <http://example.org/Person#>
+        SELECT ?fullName
+        WHERE {
+          ex:jdoe person:fullName ?fullName .
+          { SELECT * WHERE { ex:jdoe person:handle "jdoe" } }
+        }
+    "#;
+
+    let result = support::query_sparql(&fluree, &ledger, query)
+        .await
+        .unwrap();
+    let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    assert_eq!(
+        normalize_rows(&jsonld),
+        normalize_rows(&json!([["Jane Doe"]])),
+        "ground matching subquery must yield one empty solution, not zero"
+    );
+}
+
 #[tokio::test]
 async fn sparql_subquery_aggregate_order_by_with_limit() {
     // Pattern 2: aggregate ORDER BY `DESC(COUNT(?favNum))` inside a subquery.
@@ -4721,5 +4756,113 @@ async fn sparql_service_remote_no_executor_errors() {
     assert!(
         err.contains("No remote service executor configured"),
         "Error should mention missing executor, got: {err}"
+    );
+}
+
+// =========================================================================
+// Field report repro: GROUP BY over an expression must collapse + honor LIMIT
+// =========================================================================
+
+/// Seed line items across three currencies (mixed case) so that
+/// `GROUP BY (LCASE(?cur))` collapses to exactly three groups.
+async fn seed_currency_line_items(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
+    let ledger0 = genesis_ledger(fluree, ledger_id);
+
+    // 5 USD, 3 CAD, 2 EUR (mixed case to exercise LCASE collapsing).
+    let currencies = [("USD", 5usize), ("Cad", 3usize), ("eur", 2usize)];
+    let mut graph = Vec::new();
+    let mut idx = 0usize;
+    for (cur, n) in currencies {
+        for _ in 0..n {
+            graph.push(json!({
+                "@id": format!("ex:item{idx}"),
+                "@type": "ex:LineItem",
+                "ex:currency": cur,
+            }));
+            idx += 1;
+        }
+    }
+
+    let insert = json!({
+        "@context": { "ex": "http://example.org/ns/" },
+        "@graph": graph,
+    });
+
+    fluree
+        .insert(ledger0, &insert)
+        .await
+        .expect("insert currency line items")
+        .ledger
+}
+
+#[tokio::test]
+async fn sparql_group_by_expression_collapses_and_honors_limit() {
+    // Field P0 repro: `GROUP BY (LCASE(?cur))` with the same expression aliased
+    // in the SELECT must collapse to one row per distinct expression value, and
+    // LIMIT must bound the result. The buggy behavior returned one row per input
+    // binding (10 rows) with LIMIT ignored.
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_currency_line_items(&fluree, "currency:main").await;
+
+    let query = r"
+        PREFIX ex: <http://example.org/ns/>
+        SELECT (LCASE(?cur) AS ?k) (COUNT(?s) AS ?n)
+        WHERE { ?s a ex:LineItem ; ex:currency ?cur }
+        GROUP BY (LCASE(?cur))
+        ORDER BY DESC(?n)
+        LIMIT 15
+    ";
+
+    let result = support::query_sparql(&fluree, &ledger, query)
+        .await
+        .unwrap();
+
+    // SPARQL-results JSON: exactly 3 binding rows (one per distinct group), not
+    // one per input line item. This is the format the field observed exploding.
+    let sparql_json = result
+        .to_sparql_json(&ledger.snapshot)
+        .expect("to_sparql_json");
+    let bindings = support::normalize_sparql_bindings(&sparql_json);
+    assert_eq!(
+        bindings.len(),
+        3,
+        "GROUP BY (expr) must collapse to one row per group, got {} rows: {bindings:#?}",
+        bindings.len()
+    );
+
+    let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    // Expected per SPARQL 1.1: three groups — usd 5, cad 3, eur 2.
+    assert_eq!(
+        normalize_rows(&jsonld),
+        normalize_rows(&json!([["usd", 5], ["cad", 3], ["eur", 2]]))
+    );
+}
+
+#[tokio::test]
+async fn sparql_group_by_expression_via_bind_workaround() {
+    // Control: the BIND-then-GROUP-BY-?k workaround the field is using. This is
+    // expected to already pass; it isolates the bug to the GROUP-BY-expression
+    // desugar path.
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_currency_line_items(&fluree, "currency:main").await;
+
+    let query = r"
+        PREFIX ex: <http://example.org/ns/>
+        SELECT ?k (COUNT(?s) AS ?n)
+        WHERE { ?s a ex:LineItem ; ex:currency ?cur . BIND(LCASE(?cur) AS ?k) }
+        GROUP BY ?k
+        ORDER BY DESC(?n)
+        LIMIT 15
+    ";
+
+    let result = support::query_sparql(&fluree, &ledger, query)
+        .await
+        .unwrap();
+    let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    assert_eq!(
+        normalize_rows(&jsonld),
+        normalize_rows(&json!([["usd", 5], ["cad", 3], ["eur", 2]]))
     );
 }

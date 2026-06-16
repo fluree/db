@@ -38,6 +38,254 @@ pub async fn run_remote(ledger: &str, remote_name: &str, dirs: &FlureeDir) -> Cl
     Ok(())
 }
 
+/// `fluree create <ledger> --remote <name> --from <archive>.flpack` — restore a
+/// ledger onto a remote server from a local `.flpack` archive. The remote
+/// creates the ledger under `ledger` (which may differ from the archived
+/// ledger's name). No local state is written — remote storage is separate.
+///
+/// Picks the upload path from the server's advertised capabilities: a direct
+/// streamed `POST /import` by default, or the negotiated presigned-upload flow
+/// when the server is size-capped and the archive exceeds its direct limit.
+pub async fn run_remote_flpack_import(
+    ledger: &str,
+    remote_name: &str,
+    path: &Path,
+    dirs: &FlureeDir,
+) -> CliResult<()> {
+    let meta = std::fs::metadata(path)
+        .map_err(|e| CliError::Input(format!("failed to stat {}: {e}", path.display())))?;
+    let size = meta.len();
+
+    let client = context::build_remote_client(remote_name, dirs).await?;
+    let ledger_id = context::to_ledger_id(ledger);
+
+    let cap = client.fetch_import_capability().await;
+    let result = if cap.needs_negotiated_upload(size) {
+        run_remote_flpack_negotiated(&client, ledger, &ledger_id, remote_name, path, size).await?
+    } else {
+        run_remote_flpack_direct(&client, ledger, &ledger_id, remote_name, path, size).await?
+    };
+    context::persist_refreshed_tokens(&client, remote_name, dirs).await;
+
+    print_remote_import_summary(remote_name, &ledger_id, &result);
+    Ok(())
+}
+
+/// Direct path: stream the archive straight to `POST /import/<ledger>`.
+async fn run_remote_flpack_direct(
+    client: &crate::remote_client::RemoteLedgerClient,
+    ledger: &str,
+    ledger_id: &str,
+    remote_name: &str,
+    path: &Path,
+    size: u64,
+) -> CliResult<serde_json::Value> {
+    use colored::Colorize;
+    eprintln!(
+        "Importing '{}' to remote '{}' from {} ({})...",
+        ledger.cyan(),
+        remote_name,
+        path.display(),
+        format_human_bytes(size),
+    );
+    client.import_ledger(ledger_id, path).await.map_err(|e| {
+        CliError::Remote(format!(
+            "failed to import '{ledger}' to remote '{remote_name}': {e}"
+        ))
+    })
+}
+
+/// Negotiated path: mint an upload slot, PUT the archive out-of-band, notify
+/// `complete`, then poll status to a terminal state.
+async fn run_remote_flpack_negotiated(
+    client: &crate::remote_client::RemoteLedgerClient,
+    ledger: &str,
+    ledger_id: &str,
+    remote_name: &str,
+    path: &Path,
+    size: u64,
+) -> CliResult<serde_json::Value> {
+    use colored::Colorize;
+
+    eprintln!(
+        "Uploading '{}' to remote '{}' via presigned upload ({})...",
+        ledger.cyan(),
+        remote_name,
+        format_human_bytes(size),
+    );
+
+    // 1. Mint an upload slot. The server picks single-PUT vs multipart by the
+    //    declared size and returns either an `upload` or a `multipart` block.
+    let mint = client
+        .mint_import_upload(ledger_id, Some(size))
+        .await
+        .map_err(|e| CliError::Remote(format!("failed to start upload to '{remote_name}': {e}")))?;
+    let import_id = mint["import_id"]
+        .as_str()
+        .ok_or_else(|| CliError::Remote("mint response missing import_id".to_string()))?
+        .to_string();
+
+    // 2. Upload the archive — multipart when the server minted parts, else a
+    //    single streamed PUT.
+    let completed_parts = if mint.get("multipart").is_some() {
+        upload_multipart(client, &mint, path, size).await?
+    } else {
+        upload_single(client, &mint, path).await?
+    };
+
+    // 3. Notify the server to begin the restore (carrying the part list for
+    //    multipart; an empty slice for single-PUT).
+    client
+        .complete_import_upload(&import_id, &completed_parts)
+        .await
+        .map_err(|e| CliError::Remote(format!("failed to start remote import: {e}")))?;
+
+    eprintln!("Upload complete; restoring on '{remote_name}'...");
+
+    // 4. Poll status to a terminal state.
+    poll_remote_import(client, &import_id).await
+}
+
+/// Single-PUT upload: stream the whole archive to the one minted URL.
+async fn upload_single(
+    client: &crate::remote_client::RemoteLedgerClient,
+    mint: &serde_json::Value,
+    path: &Path,
+) -> CliResult<Vec<crate::remote_client::CompletedPart>> {
+    use std::collections::HashMap;
+
+    let upload = &mint["upload"];
+    let url = upload["url"]
+        .as_str()
+        .ok_or_else(|| CliError::Remote("mint response missing upload.url".to_string()))?;
+    let headers: HashMap<String, String> = json_string_map(&upload["headers"]);
+    client
+        .put_upload_file(url, &headers, path)
+        .await
+        .map_err(|e| CliError::Remote(format!("failed to upload archive: {e}")))?;
+    Ok(Vec::new())
+}
+
+/// Multipart upload: PUT each part to its minted URL, returning the completed
+/// `(part_number, etag)` list for the `complete` call.
+async fn upload_multipart(
+    client: &crate::remote_client::RemoteLedgerClient,
+    mint: &serde_json::Value,
+    path: &Path,
+    size: u64,
+) -> CliResult<Vec<crate::remote_client::CompletedPart>> {
+    use crate::remote_client::MintedPart;
+
+    let mp = &mint["multipart"];
+    let part_size = mp["part_size_bytes"]
+        .as_u64()
+        .ok_or_else(|| CliError::Remote("multipart mint missing part_size_bytes".to_string()))?;
+    if part_size == 0 {
+        return Err(CliError::Remote(
+            "multipart mint returned part_size_bytes = 0".to_string(),
+        ));
+    }
+    let parts_json = mp["parts"]
+        .as_array()
+        .ok_or_else(|| CliError::Remote("multipart mint missing parts array".to_string()))?;
+    let parts: Vec<MintedPart> = parts_json
+        .iter()
+        .map(|p| {
+            let part_number = p["part_number"]
+                .as_u64()
+                .ok_or_else(|| CliError::Remote("multipart part missing part_number".to_string()))?
+                as u32;
+            let url = p["url"]
+                .as_str()
+                .ok_or_else(|| CliError::Remote("multipart part missing url".to_string()))?
+                .to_string();
+            Ok(MintedPart {
+                part_number,
+                url,
+                headers: json_string_map(&p["headers"]),
+            })
+        })
+        .collect::<CliResult<Vec<_>>>()?;
+
+    eprintln!(
+        "  uploading {} parts of up to {} each...",
+        parts.len(),
+        format_human_bytes(part_size.min(size)),
+    );
+
+    client
+        .put_upload_parts(&parts, part_size, path)
+        .await
+        .map_err(|e| CliError::Remote(format!("failed to upload archive parts: {e}")))
+}
+
+/// Collect a JSON object of string values into a `HashMap`, dropping non-string
+/// entries. Used for the per-upload `headers` block.
+fn json_string_map(v: &serde_json::Value) -> std::collections::HashMap<String, String> {
+    v.as_object()
+        .map(|o| {
+            o.iter()
+                .filter_map(|(k, val)| val.as_str().map(|s| (k.clone(), s.to_string())))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Poll `import-upload/{id}` until the import reaches a terminal state.
+async fn poll_remote_import(
+    client: &crate::remote_client::RemoteLedgerClient,
+    import_id: &str,
+) -> CliResult<serde_json::Value> {
+    use std::time::{Duration, Instant};
+
+    let deadline = Instant::now() + Duration::from_secs(1800);
+    let mut backoff = Duration::from_millis(500);
+    loop {
+        let status = client
+            .import_upload_status(import_id)
+            .await
+            .map_err(|e| CliError::Remote(format!("failed to poll import status: {e}")))?;
+        match status["status"].as_str() {
+            Some("succeeded") => return Ok(status["result"].clone()),
+            Some("failed") => {
+                let err = status["error"].as_str().unwrap_or("unknown error");
+                return Err(CliError::Remote(format!("remote import failed: {err}")));
+            }
+            Some("running" | "awaiting-upload") => {}
+            other => {
+                return Err(CliError::Remote(format!(
+                    "unexpected remote import status: {other:?}"
+                )));
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(CliError::Remote(
+                "timed out waiting for remote import to complete".to_string(),
+            ));
+        }
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(Duration::from_secs(3));
+    }
+}
+
+/// Print the shared success summary for a remote import (both paths).
+fn print_remote_import_summary(remote_name: &str, ledger_id: &str, result: &serde_json::Value) {
+    use colored::Colorize;
+    let resolved = result["ledger_id"].as_str().unwrap_or(ledger_id);
+    let commits = result["commits"].as_u64().unwrap_or(0);
+    let txn_blobs = result["txn_blobs"].as_u64().unwrap_or(0);
+    let index_artifacts = result["index_artifacts"].as_u64().unwrap_or(0);
+    println!(
+        "{} Imported '{}' to remote '{}' — {} commits, {} txn blobs, {} index artifacts",
+        "✓".green(),
+        resolved,
+        remote_name,
+        commits,
+        txn_blobs,
+        index_artifacts,
+    );
+}
+
 pub async fn run(
     ledger: &str,
     from: Option<&Path>,
@@ -531,17 +779,17 @@ async fn run_bulk_import(
 // ============================================================================
 
 /// Whether this path looks like a `.flpack` ledger archive.
-fn is_flpack_path(path: &Path) -> bool {
+pub(crate) fn is_flpack_path(path: &Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
         .is_some_and(|e| e.eq_ignore_ascii_case("flpack"))
 }
 
-/// Import a native ledger pack file (`.flpack`).
+/// Import a native ledger pack file (`.flpack`) into the local store.
 ///
-/// Reads the pack stream from a local file, writes all CAS objects into the
-/// local storage under the given `ledger` name, then sets the commit and index
-/// heads from the embedded nameservice manifest.
+/// Streams the archive into `Fluree::restore_ledger`, which creates the ledger,
+/// ingests all CAS objects (verifying each), and finalizes the commit/index
+/// heads from the embedded nameservice manifest — rolling back on any failure.
 async fn run_flpack_import(
     fluree: &fluree_db_api::Fluree,
     ledger: &str,
@@ -549,24 +797,11 @@ async fn run_flpack_import(
     dirs: &FlureeDir,
 ) -> CliResult<()> {
     use colored::Colorize;
-    use fluree_db_core::pack::{
-        decode_frame, read_stream_preamble, PackFrame, DEFAULT_MAX_PAYLOAD,
-    };
-    use fluree_db_core::ContentKind;
-    use fluree_db_nameservice_sync::ingest_pack_frame;
 
-    let file = std::fs::File::open(path)
-        .map_err(|e| CliError::Input(format!("failed to open {}: {e}", path.display())))?;
-    let file_size = file
-        .metadata()
+    let file_size = std::fs::metadata(path)
         .map_err(|e| CliError::Input(format!("failed to stat {}: {e}", path.display())))?
         .len();
 
-    // Safety: the file is read-only and not modified during import.
-    let data = unsafe {
-        memmap2::Mmap::map(&file)
-            .map_err(|e| CliError::Input(format!("failed to mmap {}: {e}", path.display())))?
-    };
     eprintln!(
         "Importing ledger '{}' from {} ({})...",
         ledger.cyan(),
@@ -574,141 +809,25 @@ async fn run_flpack_import(
         format_human_bytes(file_size),
     );
 
-    // Create the local ledger first.
-    fluree
-        .create_ledger(ledger)
+    let mut file = tokio::fs::File::open(path)
         .await
-        .map_err(|e| CliError::Config(format!("failed to create ledger: {e}")))?;
+        .map_err(|e| CliError::Input(format!("failed to open {}: {e}", path.display())))?;
 
-    let ledger_id = crate::context::to_ledger_id(ledger);
-
-    // Decode the pack stream.
-    let mut pos = read_stream_preamble(&data)
-        .map_err(|e| CliError::Input(format!("invalid .flpack file (bad preamble): {e}")))?;
-
-    let mut saw_header = false;
-    let mut commits_stored = 0usize;
-    let mut txn_blobs_stored = 0usize;
-    let mut index_artifacts_stored = 0usize;
-    let mut ns_manifest: Option<serde_json::Value> = None;
-
-    loop {
-        if pos >= data.len() {
-            return Err(CliError::Input(
-                "unexpected end of .flpack file (missing End frame)".to_string(),
-            ));
-        }
-
-        let (frame, consumed) = decode_frame(&data[pos..], DEFAULT_MAX_PAYLOAD)
-            .map_err(|e| CliError::Input(format!("invalid .flpack frame at offset {pos}: {e}")))?;
-        pos += consumed;
-
-        match frame {
-            PackFrame::Header(_header) => {
-                if saw_header {
-                    return Err(CliError::Input(
-                        "invalid .flpack: duplicate Header frame".to_string(),
-                    ));
-                }
-                saw_header = true;
-            }
-            PackFrame::Data { cid, payload } => {
-                if !saw_header {
-                    return Err(CliError::Input(
-                        "invalid .flpack: Data frame before Header".to_string(),
-                    ));
-                }
-                ingest_pack_frame(
-                    &cid,
-                    &payload,
-                    &fluree.backend().admin_storage_cloned().ok_or_else(|| {
-                        CliError::Config("create requires managed storage backend".into())
-                    })?,
-                    &ledger_id,
-                )
-                .await
-                .map_err(|e| CliError::Config(format!("failed to ingest object {cid}: {e}")))?;
-
-                match cid.content_kind() {
-                    Some(ContentKind::Commit) => commits_stored += 1,
-                    Some(ContentKind::Txn) => txn_blobs_stored += 1,
-                    _ => index_artifacts_stored += 1,
-                }
-
-                let total = commits_stored + txn_blobs_stored + index_artifacts_stored;
-                if total.is_multiple_of(100) {
-                    eprint!("  {total} objects...\r");
-                }
-            }
-            PackFrame::Manifest(json) => {
-                if json.get("phase").and_then(|v| v.as_str()) == Some("nameservice") {
-                    ns_manifest = Some(json);
-                }
-            }
-            PackFrame::Error(msg) => {
-                return Err(CliError::Config(format!(
-                    ".flpack contains error frame: {msg}"
-                )));
-            }
-            PackFrame::End => break,
-        }
-    }
-
-    // Set commit head from the nameservice manifest.
-    let handle = fluree
-        .ledger_cached(&ledger_id)
+    let result = fluree
+        .restore_ledger(ledger, &mut file)
         .await
-        .map_err(|e| CliError::Config(format!("failed to load ledger handle: {e}")))?;
-
-    if let Some(ref manifest) = ns_manifest {
-        // Parse commit head.
-        if let Some(commit_cid_str) = manifest.get("commit_head_id").and_then(|v| v.as_str()) {
-            let commit_cid: fluree_db_core::ContentId = commit_cid_str
-                .parse()
-                .map_err(|e| CliError::Config(format!("invalid commit CID in manifest: {e}")))?;
-            let commit_t = manifest
-                .get("commit_t")
-                .and_then(serde_json::Value::as_i64)
-                .unwrap_or(0);
-
-            fluree
-                .set_commit_head(&handle, &commit_cid, commit_t)
-                .await
-                .map_err(|e| CliError::Config(format!("failed to set commit head: {e}")))?;
-        }
-
-        // Parse index head.
-        if let Some(index_cid_str) = manifest.get("index_head_id").and_then(|v| v.as_str()) {
-            let index_cid: fluree_db_core::ContentId = index_cid_str
-                .parse()
-                .map_err(|e| CliError::Config(format!("invalid index CID in manifest: {e}")))?;
-            let index_t = manifest
-                .get("index_t")
-                .and_then(serde_json::Value::as_i64)
-                .unwrap_or(0);
-
-            fluree
-                .set_index_head(&handle, &index_cid, index_t)
-                .await
-                .map_err(|e| CliError::Config(format!("failed to set index head: {e}")))?;
-        }
-    } else {
-        return Err(CliError::Input(
-            ".flpack file is missing nameservice manifest — cannot determine commit/index heads"
-                .to_string(),
-        ));
-    }
+        .map_err(|e| CliError::Config(format!("failed to restore ledger from .flpack: {e}")))?;
 
     config::write_active_ledger(dirs.data_dir(), ledger)?;
 
-    let objects = commits_stored + txn_blobs_stored + index_artifacts_stored;
+    let objects = result.commits + result.txn_blobs + result.index_artifacts;
     println!(
         "{} Imported '{}' — {} commits, {} txn blobs, {} index artifacts ({} objects)",
         "✓".green(),
-        ledger,
-        commits_stored,
-        txn_blobs_stored,
-        index_artifacts_stored,
+        result.ledger_id,
+        result.commits,
+        result.txn_blobs,
+        result.index_artifacts,
         objects,
     );
 
