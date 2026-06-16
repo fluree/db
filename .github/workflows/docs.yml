@@ -34,6 +34,12 @@ jobs:
       - name: Build
         run: mdbook build docs
 
+      # The [preprocessor.llms] step (docs/scripts/llms_preproc.py) ran during
+      # the build above and staged llms.txt, llms-full.txt, and a raw .md mirror
+      # into docs/.llms-staging. Copy them into the published site root.
+      - name: Stage llms.txt artifacts into the published site
+        run: cp -R docs/.llms-staging/. docs/book/
+
       - name: Configure Pages
         uses: actions/configure-pages@v5
 

@@ -4,6 +4,16 @@ authors = ["Fluree"]
 language = "en"
 src = "."
 
+# Emits llms.txt / llms-full.txt and a raw .md mirror into docs/.llms-staging
+# (a pass-through preprocessor -- it never modifies the book). The docs.yml
+# workflow copies that staging dir into the published site. See
+# docs/scripts/llms_preproc.py.
+# Command is relative to the book root (docs/), which is mdBook's cwd when it
+# invokes a preprocessor.
+[preprocessor.llms]
+command = "python3 scripts/llms_preproc.py"
+renderers = ["html"]
+
 [output.html]
 git-repository-url = "https://github.com/fluree/db"
 edit-url-template = "https://github.com/fluree/db/edit/main/docs/{path}"
