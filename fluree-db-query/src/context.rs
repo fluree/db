@@ -1225,6 +1225,10 @@ pub struct WellKnownDatatypes {
     pub fluree_vector: Sid,
     /// rdf:JSON (@json datatype)
     pub rdf_json: Sid,
+    /// rdf:langString (datatype of lang-tagged literals)
+    pub rdf_lang_string: Sid,
+    /// fluree:fullText (@fulltext datatype)
+    pub fluree_full_text: Sid,
     /// geo:wktLiteral (http://www.opengis.net/ont/geosparql#wktLiteral)
     pub geo_wkt_literal: Sid,
 }
@@ -1263,6 +1267,8 @@ impl WellKnownDatatypes {
             id_type: Sid::new(JSON_LD, "id"),
             fluree_vector: Sid::new(FLUREE_DB, "vector"),
             rdf_json: Sid::new(RDF, "JSON"),
+            rdf_lang_string: Sid::new(RDF, "langString"),
+            fluree_full_text: Sid::new(FLUREE_DB, "fullText"),
             geo_wkt_literal: Sid::new(OGC_GEO, geo_names::WKT_LITERAL),
         }
     }

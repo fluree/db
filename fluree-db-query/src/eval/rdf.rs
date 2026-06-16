@@ -33,8 +33,10 @@ fn reserved_datatype_sid(dt_id: DatatypeDictId) -> Option<Sid> {
         DatatypeDictId::DATE_TIME => &dts.xsd_datetime,
         DatatypeDictId::DATE => &dts.xsd_date,
         DatatypeDictId::TIME => &dts.xsd_time,
+        DatatypeDictId::LANG_STRING => &dts.rdf_lang_string,
         DatatypeDictId::JSON => &dts.rdf_json,
         DatatypeDictId::VECTOR => &dts.fluree_vector,
+        DatatypeDictId::FULL_TEXT => &dts.fluree_full_text,
         _ => return None,
     };
     Some(sid.clone())
