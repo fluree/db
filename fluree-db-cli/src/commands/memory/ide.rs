@@ -572,15 +572,18 @@ fn fluree_server_entries(
 ) -> Vec<(&'static str, serde_json::Value)> {
     let mut entries = Vec::new();
     if sel.wants_memory() {
-        let env = memory_env
-            .then(|| serde_json::json!({ "FLUREE_HOME": "${workspaceFolder}/.fluree" }));
+        let env =
+            memory_env.then(|| serde_json::json!({ "FLUREE_HOME": "${workspaceFolder}/.fluree" }));
         entries.push((
             "fluree-memory",
             stdio_entry(fluree_bin, MEMORY_ARGS, typed, env),
         ));
     }
     if sel.wants_docs() {
-        entries.push(("fluree-docs", stdio_entry(fluree_bin, DOCS_ARGS, typed, None)));
+        entries.push((
+            "fluree-docs",
+            stdio_entry(fluree_bin, DOCS_ARGS, typed, None),
+        ));
     }
     entries
 }
@@ -653,7 +656,10 @@ fn merge_mcp_entries(
     top_key: &str,
     entries: &[(&str, serde_json::Value)],
 ) {
-    if !config.get(top_key).is_some_and(serde_json::Value::is_object) {
+    if !config
+        .get(top_key)
+        .is_some_and(serde_json::Value::is_object)
+    {
         if let Some(obj) = config.as_object_mut() {
             obj.insert(top_key.to_string(), serde_json::json!({}));
         }
@@ -836,12 +842,7 @@ fn append_claude_md_instructions(project_root: &Path, sel: ServerSel) -> CliResu
 
 /// Register one MCP server with Claude Code via `claude mcp add` (local scope).
 /// Returns whether registration succeeded; prints a manual-fallback hint if not.
-fn claude_mcp_add(
-    project_root: &Path,
-    name: &str,
-    fluree_bin: &str,
-    server_args: &[&str],
-) -> bool {
+fn claude_mcp_add(project_root: &Path, name: &str, fluree_bin: &str, server_args: &[&str]) -> bool {
     let mut args = vec!["mcp", "add", "--transport", "stdio", name, "--", fluree_bin];
     args.extend_from_slice(server_args);
     let result = std::process::Command::new("claude")
@@ -1030,7 +1031,9 @@ pub(super) fn run_mcp_phase(yes: bool) -> CliResult<()> {
 /// (`memory` / `docs` / `all`); needs no `.fluree/` directory.
 pub(super) fn run_mcp_install(ide: Option<&str>, server: &str) -> CliResult<()> {
     let sel = ServerSel::parse(server).ok_or_else(|| {
-        CliError::Usage(format!("unknown --server '{server}'; valid: memory, docs, all"))
+        CliError::Usage(format!(
+            "unknown --server '{server}'; valid: memory, docs, all"
+        ))
     })?;
 
     let fluree_bin = std::env::current_exe()
@@ -1565,7 +1568,11 @@ mod tests {
         // Cursor (typed + memory_env): memory gets type+FLUREE_HOME, docs gets
         // type but no env (the docs corpus is embedded, stateless).
         let entries = fluree_server_entries("fluree", true, true, ServerSel::All);
-        let mem = &entries.iter().find(|(n, _)| *n == "fluree-memory").unwrap().1;
+        let mem = &entries
+            .iter()
+            .find(|(n, _)| *n == "fluree-memory")
+            .unwrap()
+            .1;
         let docs = &entries.iter().find(|(n, _)| *n == "fluree-docs").unwrap().1;
         assert_eq!(mem["type"], "stdio");
         assert!(mem["env"]["FLUREE_HOME"].is_string());

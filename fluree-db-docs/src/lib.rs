@@ -21,7 +21,7 @@ mod search;
 pub mod mcp;
 
 pub use index::DocsIndex;
-pub use model::{CodeBlock, DocsTree, Example, Page, Section, SearchHit, TreeNode, VERSION};
+pub use model::{CodeBlock, DocsTree, Example, Page, SearchHit, Section, TreeNode, VERSION};
 
 use std::sync::OnceLock;
 
@@ -75,7 +75,9 @@ mod tests {
         assert!(page.content.len() > 1000);
         assert_eq!(page.anchor, None);
 
-        let slice = index().get("query/sparql.md", Some("property-paths")).unwrap();
+        let slice = index()
+            .get("query/sparql.md", Some("property-paths"))
+            .unwrap();
         assert_eq!(slice.anchor.as_deref(), Some("property-paths"));
         assert!(slice.content.len() < page.content.len());
         assert!(slice.content.to_lowercase().contains("path"));
@@ -92,7 +94,10 @@ mod tests {
         // intro prose. "## Query Forms" parents SELECT/CONSTRUCT/ASK/DESCRIBE.
         let page = index().get("query/sparql.md", Some("query-forms")).unwrap();
         let body = page.content.to_lowercase();
-        assert!(body.contains("select"), "subtree should include child sections");
+        assert!(
+            body.contains("select"),
+            "subtree should include child sections"
+        );
         assert!(body.contains("construct"));
     }
 
@@ -102,7 +107,8 @@ mod tests {
         // though the page (graph-crawl.md) is full of "property path" mentions.
         let hits = index().search("property path", 10);
         assert!(
-            hits.iter().all(|h| h.title.to_lowercase() != "related documentation"),
+            hits.iter()
+                .all(|h| h.title.to_lowercase() != "related documentation"),
             "nav sections should be excluded, got: {:?}",
             hits.iter().map(|h| &h.title).collect::<Vec<_>>()
         );
@@ -130,6 +136,8 @@ mod tests {
 
         // Language filter only returns matching blocks.
         let json_only = index().examples("query", Some("json"), 10);
-        assert!(json_only.iter().all(|e| e.lang.eq_ignore_ascii_case("json")));
+        assert!(json_only
+            .iter()
+            .all(|e| e.lang.eq_ignore_ascii_case("json")));
     }
 }

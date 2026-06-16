@@ -16,7 +16,9 @@ use serde::{Deserialize, Serialize};
 /// Request parameters for the `docs_search` tool.
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct DocsSearchRequest {
-    #[schemars(description = "Topic keywords, e.g. 'property paths', 'policy enforcement', 'time travel'")]
+    #[schemars(
+        description = "Topic keywords, e.g. 'property paths', 'policy enforcement', 'time travel'"
+    )]
     pub query: String,
     #[schemars(description = "Max hits (default 10)")]
     pub limit: Option<usize>,
@@ -25,16 +27,22 @@ pub struct DocsSearchRequest {
 /// Request parameters for the `docs_get` tool.
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct DocsGetRequest {
-    #[schemars(description = "Book-relative page path, e.g. 'query/sparql.md' (from a docs_search hit)")]
+    #[schemars(
+        description = "Book-relative page path, e.g. 'query/sparql.md' (from a docs_search hit)"
+    )]
     pub path: String,
-    #[schemars(description = "Optional heading anchor to return just that section, e.g. 'property-paths'")]
+    #[schemars(
+        description = "Optional heading anchor to return just that section, e.g. 'property-paths'"
+    )]
     pub anchor: Option<String>,
 }
 
 /// Request parameters for the `docs_examples` tool.
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct DocsExamplesRequest {
-    #[schemars(description = "Topic keywords to pull code examples for, e.g. 'insert transaction'")]
+    #[schemars(
+        description = "Topic keywords to pull code examples for, e.g. 'insert transaction'"
+    )]
     pub query: String,
     #[schemars(description = "Optional language filter, e.g. 'json', 'sparql', 'rust'")]
     pub lang: Option<String>,

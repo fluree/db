@@ -38,7 +38,11 @@ fn search(query: &str, limit: usize, json: bool) -> CliResult<()> {
         return Ok(());
     }
 
-    println!("docs v{} — {} result(s) for \"{query}\"\n", version(), hits.len());
+    println!(
+        "docs v{} — {} result(s) for \"{query}\"\n",
+        version(),
+        hits.len()
+    );
     for (i, h) in hits.iter().enumerate() {
         let n = i + 1;
         println!("{n}. {}#{}  (score {:.2})", h.path, h.anchor, h.score);
@@ -85,7 +89,11 @@ fn examples(query: &str, lang: Option<&str>, limit: usize, json: bool) -> CliRes
         return Ok(());
     }
 
-    println!("docs v{} — {} example(s) for \"{query}\"\n", version(), examples.len());
+    println!(
+        "docs v{} — {} example(s) for \"{query}\"\n",
+        version(),
+        examples.len()
+    );
     for (i, e) in examples.iter().enumerate() {
         let n = i + 1;
         let lang = if e.lang.is_empty() { "text" } else { &e.lang };
@@ -148,5 +156,8 @@ fn print_footer() {
 }
 
 fn print_hint() {
-    println!("Read a hit: fluree docs get <path> [--anchor <anchor>]   (docs v{})", version());
+    println!(
+        "Read a hit: fluree docs get <path> [--anchor <anchor>]   (docs v{})",
+        version()
+    );
 }

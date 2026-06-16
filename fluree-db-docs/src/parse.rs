@@ -282,7 +282,9 @@ mod tests {
         assert_eq!(titles, vec!["Title", "Real Heading"]);
         // The code block belongs to the first section and kept its `#` line.
         assert_eq!(secs[0].code_blocks.len(), 1);
-        assert!(secs[0].code_blocks[0].code.contains("# this is a shell comment"));
+        assert!(secs[0].code_blocks[0]
+            .code
+            .contains("# this is a shell comment"));
         assert_eq!(secs[0].code_blocks[0].lang, "bash");
     }
 

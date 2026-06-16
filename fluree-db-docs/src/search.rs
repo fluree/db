@@ -135,7 +135,11 @@ impl DocsIndex {
     /// The documentation table of contents (from the curated `SUMMARY.md`),
     /// for cheap browse/orientation.
     pub fn tree(&self) -> DocsTree {
-        let nodes = self.summary.as_deref().map(parse_summary).unwrap_or_default();
+        let nodes = self
+            .summary
+            .as_deref()
+            .map(parse_summary)
+            .unwrap_or_default();
         DocsTree {
             nodes,
             version: VERSION,
@@ -182,7 +186,10 @@ fn snippet(body: &str, query: &str) -> String {
     let start = floor_boundary(body, first.saturating_sub(LEAD));
     let end = ceil_boundary(body, (start + WINDOW).min(body.len()));
 
-    let mut out = body[start..end].split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut out = body[start..end]
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
     if start > 0 {
         out.insert(0, '…');
     }
