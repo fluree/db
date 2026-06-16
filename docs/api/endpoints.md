@@ -1280,6 +1280,29 @@ WHERE {
 ORDER BY ?t'
 ```
 
+### POST /stream/query/{ledger}
+
+Stream SELECT results incrementally as newline-delimited JSON
+(`application/x-ndjson`) instead of buffering the whole result into one
+response body, with a heartbeat that keeps long-running queries alive past
+proxy idle timeouts. Same content-type negotiation as `/query` (JSON-LD or
+`application/sparql-query`); ledger in the greedy path tail.
+
+```bash
+curl -N -X POST http://localhost:8090/v1/fluree/stream/query/my/ledger \
+  -H 'Content-Type: application/json' \
+  -d '{"@context":{"ex":"http://example.org/"},"select":["?name"],"where":{"@id":"?s","ex:name":"?name"}}'
+```
+
+The response is one self-describing JSON record per line (`head` → `row`* with
+interleaved `heartbeat`s → a terminal `end` or `error`). SELECT only; ASK,
+CONSTRUCT/DESCRIBE, `selectOne`, hydration, history (`to`), and SPARQL
+`FROM`/policy are rejected with `4xx`. JSON-LD policy/`from`/multi-ledger
+queries are enforced identically to `/query`. See
+**[Streaming query (NDJSON)](streaming-query.md)** for the full record
+protocol, the terminal-record (truncation) contract, policy behavior, and
+client examples.
+
 ### POST /multi-query
 
 Execute a bundle of independent JSON-LD and/or SPARQL queries in parallel against a single shared snapshot moment, with envelope-level `@context` / `opts` defaults that lift into each sub-query.
