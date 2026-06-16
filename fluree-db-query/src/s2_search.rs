@@ -276,7 +276,7 @@ impl Operator for S2SearchOperator {
         let provider: &dyn SpatialIndexProvider = match &self.pattern.predicate {
             Some(pred_iri) => {
                 // Look up by graph-scoped key: "g{g_id}:{predicate}"
-                let key = format!("g{g_id}:{pred_iri}");
+                let key = format!("g{}:{pred_iri}", g_id.as_u16());
                 if let Some(p) = providers.get(&key) {
                     p.as_ref()
                 } else if g_id != GraphId(0) {
@@ -306,7 +306,7 @@ impl Operator for S2SearchOperator {
             }
             None => {
                 // No predicate specified - filter to current graph first
-                let graph_prefix = format!("g{g_id}:");
+                let graph_prefix = format!("g{}:", g_id.as_u16());
                 let graph_keys: Vec<_> = providers
                     .keys()
                     .filter(|k| k.starts_with(&graph_prefix))

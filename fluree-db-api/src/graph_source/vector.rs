@@ -3,7 +3,6 @@
 //! This module provides APIs for creating, loading, syncing, and dropping
 //! embedded vector similarity search indexes.
 
-#[cfg(feature = "vector")]
 use crate::graph_source::config::VectorCreateConfig;
 #[cfg(feature = "vector")]
 use crate::graph_source::helpers::{
@@ -15,6 +14,8 @@ use crate::graph_source::result::{
 };
 #[cfg(feature = "vector")]
 use crate::Result;
+#[cfg(feature = "vector")]
+use fluree_db_core::GraphId;
 #[cfg(feature = "vector")]
 use fluree_db_core::{ledger_id::split_ledger_id, ContentId, ContentStore};
 #[cfg(feature = "vector")]
@@ -250,7 +251,7 @@ impl crate::Fluree {
 
         let executable = ExecutableQuery::simple(parsed_for_exec);
 
-        let db = ledger.as_graph_db_ref(0);
+        let db = ledger.as_graph_db_ref(GraphId(0));
         let batches = execute(db, &vars, &executable, ContextConfig::default()).await?;
 
         // Format using the standard JSON-LD formatter
@@ -263,7 +264,9 @@ impl crate::Fluree {
             None,
         );
 
-        let json = result.to_jsonld_async(ledger.as_graph_db_ref(0)).await?;
+        let json = result
+            .to_jsonld_async(ledger.as_graph_db_ref(GraphId(0)))
+            .await?;
         match json {
             JsonValue::Array(arr) => Ok(arr),
             JsonValue::Object(_) => Ok(vec![json]),

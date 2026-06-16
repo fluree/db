@@ -54,7 +54,7 @@ pub(crate) async fn build_and_upload_spatial_indexes<S: Storage>(
         let pred_iri = predicates.resolve(p_id).unwrap_or("unknown").to_string();
 
         let config = fluree_db_spatial::SpatialCreateConfig::new(
-            format!("spatial:g{g_id}p{p_id}"),
+            format!("spatial:g{}p{p_id}", g_id.as_u16()),
             ledger_id.to_string(),
             pred_iri.clone(),
         );

@@ -1141,7 +1141,7 @@ async fn enforce_unique_constraints(
                             .iri_for_graph_id(*g_id)
                             .map(std::string::ToString::to_string)
                     })
-                    .unwrap_or_else(|| format!("g_id={g_id}"))
+                    .unwrap_or_else(|| format!("g_id={}", g_id.as_u16()))
             };
             let value_str = format!("{o:?}");
 

@@ -4428,7 +4428,7 @@ where
                 if per_pred.is_empty() {
                     continue;
                 }
-                let nb_dir = run_dir.join(format!("g_{g_id}")).join("numbig");
+                let nb_dir = run_dir.join(format!("g_{}", g_id.as_u16())).join("numbig");
                 std::fs::create_dir_all(&nb_dir)?;
                 for (&p_id, arena) in per_pred {
                     fluree_db_binary_index::arena::numbig::write_numbig_arena(
@@ -4462,7 +4462,7 @@ where
                 if per_pred.is_empty() {
                     continue;
                 }
-                let vec_dir = run_dir.join(format!("g_{g_id}")).join("vectors");
+                let vec_dir = run_dir.join(format!("g_{}", g_id.as_u16())).join("vectors");
                 std::fs::create_dir_all(&vec_dir)?;
                 for (&p_id, arena) in per_pred {
                     if arena.is_empty() {

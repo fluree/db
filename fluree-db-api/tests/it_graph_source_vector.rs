@@ -694,7 +694,7 @@ async fn vector_idx_query_syntax_e2e() {
         .await
         .unwrap();
     let formatted = result
-        .to_jsonld_async(ledger.as_graph_db_ref(0))
+        .to_jsonld_async(ledger.as_graph_db_ref(fluree_db_core::GraphId(0)))
         .await
         .unwrap();
 

@@ -223,7 +223,7 @@ async fn s3_testcontainers_basic_test() {
     let results = support::query_jsonld(&fluree, &ledger1, &q)
         .await
         .expect("query")
-        .to_jsonld_async(ledger1.as_graph_db_ref(0))
+        .to_jsonld_async(ledger1.as_graph_db_ref(fluree_db_core::GraphId(0)))
         .await
         .expect("to_jsonld_async");
 
@@ -236,7 +236,7 @@ async fn s3_testcontainers_basic_test() {
     let reload_results = support::query_jsonld(&fluree2, &reloaded, &q)
         .await
         .expect("query reload")
-        .to_jsonld_async(reloaded.as_graph_db_ref(0))
+        .to_jsonld_async(reloaded.as_graph_db_ref(fluree_db_core::GraphId(0)))
         .await
         .expect("to_jsonld_async");
     assert_eq!(results, reload_results);

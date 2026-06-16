@@ -1637,7 +1637,7 @@ impl BinaryIndexStore {
         let mut map = HashMap::new();
         for (g_id, gi) in &self.graph_indexes {
             for (p_id, provider) in &gi.spatial {
-                let key = format!("{g_id}:{p_id}");
+                let key = format!("{}:{p_id}", g_id.as_u16());
                 map.insert(key, Arc::clone(provider));
             }
         }

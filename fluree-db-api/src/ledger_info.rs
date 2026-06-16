@@ -397,7 +397,7 @@ fn graph_display_name(g_id: GraphId, store: Option<&BinaryIndexStore>) -> String
             return iri.to_string();
         }
     }
-    format!("g:{g_id}")
+    format!("g:{}", g_id.as_u16())
 }
 
 // ============================================================================
