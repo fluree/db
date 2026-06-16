@@ -20,7 +20,7 @@ This creates:
 
 `init` is idempotent; running it again is safe.
 
-It will also detect any installed AI coding tools (Claude Code, Cursor, VS Code, Windsurf, Zed) and offer to wire up MCP. You can say no here and run [`fluree mcp install`](../cli/mcp-install.md) later.
+It will also detect any installed AI coding tools (Claude Code, Cursor, VS Code, Windsurf, Zed) and offer to wire up MCP. You can say no here and run [`fluree memory mcp-install`](../cli/mcp-install.md) later.
 
 ## 2. Add a memory
 

@@ -11,7 +11,7 @@ fluree memory init
 Accept the Zed prompt, or run:
 
 ```bash
-fluree mcp install --ide zed
+fluree memory mcp-install --ide zed
 ```
 
 ## What gets written
@@ -28,10 +28,6 @@ fluree mcp install --ide zed
   }
 }
 ```
-
-> Also use the Fluree database? `fluree mcp install` additionally registers a
-> `fluree-docs` server for version-pinned documentation lookup — see
-> [fluree docs](../../cli/docs.md).
 
 No `FLUREE_HOME` is set by default — the MCP server walks up from Zed's spawn CWD to find the workspace's `.fluree/`. If you need to pin it explicitly, add an `env` block alongside `command`/`args` with an absolute path.
 

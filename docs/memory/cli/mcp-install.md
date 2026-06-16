@@ -1,29 +1,16 @@
-# fluree mcp install
+# fluree memory mcp-install
 
-Install MCP configuration for an IDE so its agent can use Fluree's MCP servers.
-By default this registers **two** servers in one step:
-
-- **`fluree-memory`** — the developer-memory tools (`fluree mcp serve`)
-- **`fluree-docs`** — version-pinned documentation lookup (`fluree docs serve`,
-  see [fluree docs](../../cli/docs.md))
+Install MCP configuration for an IDE so its agent can use memory tools.
 
 ```bash
-fluree mcp install [--ide <IDE>] [--server <SERVER>]
+fluree memory mcp-install [--ide <IDE>]
 ```
-
-> `fluree memory mcp-install` is the memory-namespace installer — it registers
-> the **memory server only** (equivalent to `fluree mcp install --server memory`).
 
 ## Options
 
 | Option | Description |
 |---|---|
 | `--ide <IDE>` | Target IDE (auto-detected if omitted) |
-| `--server <SERVER>` | Which server(s) to register: `memory`, `docs`, or `all` (default) |
-
-Use `--server docs` to register only the documentation server — it's stateless,
-so it works in any project, including ones that don't use Fluree (no `.fluree/`
-directory required).
 
 ## Supported IDEs
 
@@ -44,23 +31,19 @@ When `--ide` is omitted, the first **unconfigured** detected tool is used; defau
 ## Example
 
 ```bash
-fluree mcp install --ide cursor
+fluree memory mcp-install --ide cursor
 ```
 
 Output:
 
 ```
-  Installed: .cursor/mcp.json (fluree-memory, fluree-docs)
+  Installed: .cursor/mcp.json
   Installed: .cursor/rules/fluree_rules.md
 ```
 
 ## Per-IDE config shape
 
 The JSON `mcp-install` writes differs per IDE:
-
-Both servers are written together. Only the `fluree-memory` entry takes a
-`FLUREE_HOME` env (it has a per-repo store); `fluree-docs` is stateless (the
-corpus is embedded), so it never needs one.
 
 **Cursor** (`.cursor/mcp.json`) is the only target that sets `FLUREE_HOME` by default. It uses `${workspaceFolder}` interpolation to pin the memory store to the current workspace regardless of where Cursor spawns the process from:
 
@@ -72,26 +55,21 @@ corpus is embedded), so it never needs one.
       "command": "fluree",
       "args": ["mcp", "serve", "--transport", "stdio"],
       "env": { "FLUREE_HOME": "${workspaceFolder}/.fluree" }
-    },
-    "fluree-docs": {
-      "type": "stdio",
-      "command": "fluree",
-      "args": ["docs", "serve", "--transport", "stdio"]
     }
   }
 }
 ```
 
-**VS Code, Windsurf, Zed, Claude Code** get simpler entries with no `env` — for example:
+**VS Code, Windsurf, Zed, Claude Code** get a simpler entry with no `env`:
 
 ```json
 {
-  "fluree-memory": { "command": "fluree", "args": ["mcp", "serve", "--transport", "stdio"] },
-  "fluree-docs":   { "command": "fluree", "args": ["docs", "serve", "--transport", "stdio"] }
+  "command": "fluree",
+  "args": ["mcp", "serve", "--transport", "stdio"]
 }
 ```
 
-(The top-level wrapper key differs — `servers` for VS Code, `mcpServers` for Windsurf, `context_servers` for Zed. Claude Code's entries are registered globally via `claude mcp add`.)
+(The top-level wrapper key differs — `servers` for VS Code, `mcpServers` for Windsurf, `context_servers` for Zed. Claude Code's entry is registered globally via `claude mcp add`.)
 
 These rely on the MCP server's walk-up behavior: on start, it looks for `.fluree/` beginning at its spawn CWD. That's usually the workspace, but if the IDE starts it elsewhere memory may land in a global store. See the troubleshooting section below.
 

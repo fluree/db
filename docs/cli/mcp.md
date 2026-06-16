@@ -113,8 +113,10 @@ server is stateless, so it needs no `.fluree/` directory:
 fluree mcp install --ide cursor --server docs
 ```
 
-For the per-IDE config shapes this writes, see
-[Memory: IDE setup](../memory/cli/mcp-install.md).
+For the per-IDE config file paths and keys, see
+[Memory: IDE support matrix](../memory/reference/ide-matrix.md). Each server is a
+stdio entry under that IDE's key — `fluree-memory` runs `mcp serve`, `fluree-docs`
+runs `docs serve` (see [fluree docs](docs.md#ide-configuration) for the docs entry).
 
 > `fluree memory mcp-install` is the memory-namespace installer — it registers
 > the memory server only (equivalent to `fluree mcp install --server memory`).

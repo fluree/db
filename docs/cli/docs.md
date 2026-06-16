@@ -171,4 +171,4 @@ printf '%s\n' \
 ## See Also
 
 - [mcp](mcp.md) — the developer-memory MCP server (`fluree mcp serve`) and `fluree mcp install`
-- [Memory: IDE setup](../memory/cli/mcp-install.md) — per-IDE config shapes for both MCP servers
+- [Memory: IDE support matrix](../memory/reference/ide-matrix.md) — per-IDE MCP config file paths and keys

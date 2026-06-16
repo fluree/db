@@ -13,7 +13,7 @@ fluree memory init
 Accept the VS Code prompt, or run:
 
 ```bash
-fluree mcp install --ide vscode
+fluree memory mcp-install --ide vscode
 ```
 
 ## What gets written
@@ -32,10 +32,6 @@ fluree mcp install --ide vscode
   }
 }
 ```
-
-> Also use the Fluree database? `fluree mcp install` additionally registers a
-> `fluree-docs` server for version-pinned documentation lookup — see
-> [fluree docs](../../cli/docs.md).
 
 Unlike the Cursor config, this entry does not set `FLUREE_HOME` — VS Code normally spawns the server from the workspace root, so the walk-up logic in `fluree mcp serve` finds `.fluree/` on its own. If you need to pin the location explicitly (e.g. the server is ending up in a global store), add an `env` block pointing at the absolute path to `<repo>/.fluree/`.
 

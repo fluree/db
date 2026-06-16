@@ -20,7 +20,7 @@ Install MCP config for Cursor? [Y/n]
 Or, at any time:
 
 ```bash
-fluree mcp install --ide cursor
+fluree memory mcp-install --ide cursor
 ```
 
 ## What gets written
@@ -43,10 +43,6 @@ fluree mcp install --ide cursor
 }
 ```
 
-> Also use the Fluree database? `fluree mcp install` additionally registers a
-> `fluree-docs` server for version-pinned documentation lookup — see
-> [fluree docs](../../cli/docs.md).
-
 `${workspaceFolder}` is a Cursor config-interpolation token — the MCP server is always launched with `FLUREE_HOME` pointing at the current project, so memories stay scoped to the repo even if Cursor spawns the process from a different working directory.
 
 ## Verify
@@ -67,6 +63,6 @@ tail -f .fluree-memory/.local/mcp.log
 
 You should see a `client initialized` line within a few seconds of Cursor startup. If not, check `.cursor/mcp.json` exists and is valid JSON, then restart Cursor.
 
-**Memories going to a global store on macOS.** If you see memories landing in `~/Library/Application Support/.fluree-memory/` instead of `<repo>/.fluree-memory/`, `FLUREE_HOME` isn't being honored. Re-run `fluree mcp install --ide cursor` from inside the repo and restart Cursor fully.
+**Memories going to a global store on macOS.** If you see memories landing in `~/Library/Application Support/.fluree-memory/` instead of `<repo>/.fluree-memory/`, `FLUREE_HOME` isn't being honored. Re-run `fluree memory mcp-install --ide cursor` from inside the repo and restart Cursor fully.
 
 **Rules file ignored.** Cursor picks up `.cursor/rules/*.md` on project open. After editing, reload the window.
