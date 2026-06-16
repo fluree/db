@@ -132,6 +132,17 @@ pub const DEFAULT_MCP_AGENT_JSON_MAX_BYTES: usize = 32_768;
 /// Default timeout for MCP `sparql_query` execution (5 minutes).
 pub const DEFAULT_MCP_QUERY_TIMEOUT_MS: u64 = 5 * 60 * 1000;
 
+/// Leaflet-cache budget (MB) for the `fluree mcp serve` / `fluree memory`
+/// helper processes.
+///
+/// Unlike `fluree server`, these are lightweight, per-IDE stdio helpers backing
+/// a small developer-memory store, and several can run at once (one per editor
+/// window / agent session). Letting each inherit the server's RAM-tiered cache
+/// (~35% of system memory) means N helpers could collectively reserve a huge
+/// ceiling for a workload that never needs it. A small fixed cap keeps every
+/// helper cheap and composable; the memory store is tiny, so this is ample.
+pub const DEFAULT_MEMORY_HELPER_CACHE_MAX_MB: usize = 256;
+
 // ── Peer ────────────────────────────────────────────────────────────
 
 pub const DEFAULT_PEER_ROLE: &str = "transaction";

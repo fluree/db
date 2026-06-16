@@ -41,9 +41,10 @@ fn materialize_encoded_binding(
 ) -> std::io::Result<Binding> {
     let store = gv.store();
     match binding {
+        // Novelty-aware: subjects first seen after the index snapshot resolve
+        // from DictNovelty (watermark routing), not the persisted packs.
         Binding::EncodedSid { s_id, .. } => {
-            let iri = store.resolve_subject_iri(*s_id)?;
-            let sid = store.encode_iri(&iri);
+            let sid = gv.resolve_subject_sid(*s_id)?;
             Ok(Binding::sid(sid))
         }
         Binding::EncodedPid { p_id } => match store.resolve_predicate_iri(*p_id) {
