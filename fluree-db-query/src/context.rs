@@ -1265,7 +1265,7 @@ impl WellKnownDatatypes {
             xsd_day_time_duration: Sid::new(XSD, xsd_names::DAY_TIME_DURATION),
             xsd_year_month_duration: Sid::new(XSD, xsd_names::YEAR_MONTH_DURATION),
             id_type: Sid::new(JSON_LD, "id"),
-            fluree_vector: Sid::new(FLUREE_DB, "vector"),
+            fluree_vector: Sid::new(FLUREE_DB, "embeddingVector"),
             rdf_json: Sid::new(RDF, "JSON"),
             rdf_lang_string: Sid::new(RDF, "langString"),
             fluree_full_text: Sid::new(FLUREE_DB, "fullText"),
