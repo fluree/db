@@ -1,7 +1,33 @@
 # Fluree DB — Architecture & Rust-Practice Audit
 
-**Date:** 2026-06-11
+**Date:** 2026-06-11 (audit) · **Progress ledger updated:** 2026-06-16
 **Scope:** Full workspace (38 crates, ~460k lines of non-test Rust; ~594k total). Seven parallel deep-explorations: crate layering, core data model & ID spaces, binary-index/overlay contract, query engine organization, state lifecycle, write path, and a metrics-driven hygiene sweep. Load-bearing claims were verified directly against source.
+
+---
+
+## 0. Progress ledger
+
+Living status of the §4 roadmap. **A new session should read this first**, then the phase detail in §4 and §6. The work is landing as a **stack of draft PRs off `main`**, each branch based on the previous: `bench/phase0-baseline-guardrails` (#1311) → `test/phase0-differential-harness` (#1313) → `fix/fastpath-divergences` (#1314) → `fix/lifecycle-state-gaps` (#1315) → `refactor/phase0-newtypes` (#1316). Continue new work by branching from the **stack head** (`refactor/phase0-newtypes`) unless a phase is logically independent. All PRs are draft pending the user's review; do not merge.
+
+| Phase | Item | Status | PR / branch |
+|---|---|---|---|
+| 0.0 | Performance guardrails: `bench-baseline` capture/compare, `fluree-bench-alloc` tracking allocator, `query_overlay_matrix` base/overlay/novelty bench, `scenario_mem` gating | **Done** | #1311 (+`scenario_mem` refinement in #1314) |
+| 0.7 | Differential fast-path harness (`it_differential_fastpath.rs`) + planner kill switch (`set_fast_paths_disabled`) | **Done** — found FD-1/2/3 on first run | #1313 |
+| — | FD-1 (AVG datatype), FD-2 (MIN/MAX-string lex gate), FD-3 (per-predicate count from leaf directories) | **Done** — all three enforced by the harness | #1314 |
+| 0.3 | Confirm-then-fix lifecycle candidates | **Done** — 1 real fix (export WARN-drop, = item 0.5), 1 regression pin (graph-registry `apply_loaded_db`), 2 false positives cleared (`apply_index_v2` TOCTOU, reload `t()` race) | #1315 |
+| 0.5 | Export-path WARN-and-drop → keep raw flakes | **Done** (folded into #1315) | #1315 |
+| 0.1 | ID-space newtypes | **Partial** — `GraphId` done (incl. wire-boundary `.as_u16()` fix `ffe90b60b`); **`NsCode(u16)` with snapshot-space/store-space tagging NOT STARTED** (this is the one that maps to the historical namespace-after-index-attach bug); **`TxnGraphId` NOT STARTED** (transaction-local graph-id space surfaced during the GraphId migration — see #1316 `build_reverse_graph_lookup`) | #1316 (GraphId only) |
+| 0.2 | Unify datatype code width | **Done — by deletion.** The `u32`-vs-`u16` mismatch lived only in dead pre-V3 types in `binary-index/src/types.rs`; live V3 types are already width-coherent. Deleted. | #1316 |
+| 0.4 | Concurrency regression tests | **Partial / mostly NOT STARTED.** `it_graph_registry_apply_loaded_db` (sequential) landed in #1315. The real targets — **refresh-while-querying, commit-during-refresh, reload-vs-commit, detached-`dict_novelty` detection** — are NOT written. | — |
+| 0.6 | `# Invariants` rustdoc on `LedgerSnapshot`/`LedgerState`/`DictNovelty`/`Binding`; `SAFETY:`/invariant comments on ~20 unsafes + `join.rs` unwraps | **NOT STARTED** | — |
+| 1 | Single overlay-merge chokepoint (the highest correctness ROI; `query_overlay_matrix` shows ~9–128× base→overlay headroom) | **NOT STARTED** | — |
+| 2 | `CoherentLedgerState` + `ArcSwap` (retires `TypeErasedStore`, the Arc-identity class) | **NOT STARTED** | — |
+| 3 | `PlanCapabilities` + fast-path registry + EXPLAIN-actual-path | **NOT STARTED** | — |
+| 4 | Org refactors (split `where_plan.rs`/`import.rs`, extract `format/`, mandatory policy at commit chokepoint, `fluree-db-query/tests/` suite) | **NOT STARTED** | — |
+
+**Suggested next steps**, in order: (a) finish **0.1** — `NsCode` newtype (maps directly to a real historical bug; grep path/key interpolations up front per the newtype pitfall lesson) and `TxnGraphId`; (b) **0.4** concurrency regression tests (the safety net Phase 2 depends on); (c) **0.6** invariants/SAFETY docs (cheap, low-risk); then begin **Phase 1**, the overlay chokepoint, which is the biggest correctness win and is what the Phase 0.0 + 0.7 harnesses were built to make safe.
+
+**Process invariants for this work (learned the hard way — see repo memory):** unsigned commits via `git -c commit.gpgsign=false …` on *every* history-creating op (commit, rebase, amend); no AI-attribution trailers in commits or PR bodies; gate "done" on `cargo test --workspace --all-targets --all-features` **plus** the relevant integration suite (feature-gated + runtime round-trip bugs escape a plain `cargo check`); run the `bench-baseline` compare vs a pre-phase baseline before closing a phase.
 
 ---
 
