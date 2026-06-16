@@ -149,7 +149,10 @@ mod tests {
         // searchable, not silently dropped.
         let cli = index().get("cli/README.md", None).expect("cli/README.md");
         assert!(cli.content.to_lowercase().contains("command-line"));
-        assert!(index().get("README.md", None).is_some(), "root Introduction");
+        assert!(
+            index().get("README.md", None).is_some(),
+            "root Introduction"
+        );
     }
 
     #[test]
