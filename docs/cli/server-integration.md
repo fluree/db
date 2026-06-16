@@ -1368,6 +1368,8 @@ Advertise import capabilities in the discovery document (`GET /.well-known/flure
 
 The CLI carries the bearer token on steps 1, 3, 4 (mint/complete/status are admin-grade) but **not** step 2.
 
+**Slot lifecycle / expiry.** `expires_at_unix` is a contract, not a hint: an upload or `complete` against a slot past its expiry MUST be rejected, and the backend SHOULD reclaim the slot and any staged bytes once expired so abandoned uploads do not accumulate. The reference server uses a 1-hour TTL, enforces it on the upload/part/complete calls, and sweeps expired jobs (and their staged files) when the next slot is minted — except a slot whose restore is still `running`, which is spared until it finishes. A production backend typically delegates this to an object-store lifecycle rule on the staging prefix.
+
 ### Multipart upload (archives over 5 GB)
 
 A single S3 PUT rejects bodies over 5 GiB (`EntityTooLarge`). For larger archives, mint a **multipart** plan instead of a single PUT. Everything else (auth, async restore, polling) is identical; only steps 1–3 change shape.

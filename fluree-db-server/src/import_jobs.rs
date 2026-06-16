@@ -8,7 +8,20 @@
 
 use dashmap::DashMap;
 use std::path::PathBuf;
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+/// How long a minted upload job (and its staged files) lives before it is
+/// reclaimed. The mint response advertises this same window as
+/// `expires_at_unix`, so both derive from one source of truth.
+pub const IMPORT_JOB_TTL: Duration = Duration::from_secs(3600);
+
+/// Filesystem residue of a swept job that the (async) caller deletes *off* the
+/// map lock: the staged archive plus, for a multipart job, the part files that
+/// may still be sitting beside it.
+pub struct StagedResidue {
+    pub staged_path: PathBuf,
+    pub num_parts: Option<u32>,
+}
 
 /// Lifecycle of one negotiated-upload import.
 ///
@@ -89,13 +102,20 @@ impl ImportJobs {
     pub fn upload_target(
         &self,
         import_id: &str,
-    ) -> Option<(String, PathBuf, ImportStatus, Option<MultipartPlan>)> {
+    ) -> Option<(
+        String,
+        PathBuf,
+        ImportStatus,
+        Option<MultipartPlan>,
+        Instant,
+    )> {
         self.jobs.get(import_id).map(|j| {
             (
                 j.token.clone(),
                 j.staged_path.clone(),
                 j.status,
                 j.multipart.clone(),
+                j.created_at,
             )
         })
     }
@@ -105,15 +125,43 @@ impl ImportJobs {
     pub fn completion_target(
         &self,
         import_id: &str,
-    ) -> Option<(String, PathBuf, ImportStatus, Option<MultipartPlan>)> {
+    ) -> Option<(
+        String,
+        PathBuf,
+        ImportStatus,
+        Option<MultipartPlan>,
+        Instant,
+    )> {
         self.jobs.get(import_id).map(|j| {
             (
                 j.ledger_id.clone(),
                 j.staged_path.clone(),
                 j.status,
                 j.multipart.clone(),
+                j.created_at,
             )
         })
+    }
+
+    /// Drop jobs older than `ttl` and return their staged-file residue for the
+    /// caller to delete. A `Running` job is spared regardless of age — a
+    /// background restore may still be reading its staged archive. Called on
+    /// each mint so the registry and staging dir never grow without bound and
+    /// the advertised `expires_at_unix` is actually reclaimed.
+    pub fn sweep_expired(&self, ttl: Duration) -> Vec<StagedResidue> {
+        let mut residue = Vec::new();
+        self.jobs.retain(|_id, job| {
+            if job.created_at.elapsed() > ttl && job.status != ImportStatus::Running {
+                residue.push(StagedResidue {
+                    staged_path: job.staged_path.clone(),
+                    num_parts: job.multipart.as_ref().map(|p| p.num_parts),
+                });
+                false
+            } else {
+                true
+            }
+        });
+        residue
     }
 
     pub fn set_status(&self, import_id: &str, status: ImportStatus) {
@@ -144,5 +192,53 @@ impl ImportJobs {
         self.jobs
             .get(import_id)
             .map(|j| (j.status, j.result.clone(), j.error.clone()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn job(status: ImportStatus) -> ImportJob {
+        ImportJob {
+            ledger_id: "books:main".into(),
+            token: "tok".into(),
+            staged_path: PathBuf::from("/tmp/x.flpack"),
+            multipart: None,
+            status,
+            result: None,
+            error: None,
+            created_at: Instant::now(),
+        }
+    }
+
+    #[test]
+    fn sweep_drops_expired_jobs_but_spares_running() {
+        let jobs = ImportJobs::default();
+        jobs.insert("await".into(), job(ImportStatus::AwaitingUpload));
+        jobs.insert("done".into(), job(ImportStatus::Succeeded));
+        jobs.insert("running".into(), job(ImportStatus::Running));
+
+        // A zero TTL means everything minted before this instant is expired.
+        std::thread::sleep(Duration::from_millis(5));
+        let residue = jobs.sweep_expired(Duration::ZERO);
+
+        // Awaiting + terminal jobs are reaped; the running restore is spared so
+        // its staged archive is not pulled out from under it.
+        assert_eq!(residue.len(), 2);
+        assert!(jobs.upload_target("await").is_none());
+        assert!(jobs.upload_target("done").is_none());
+        assert!(jobs.upload_target("running").is_some());
+    }
+
+    #[test]
+    fn sweep_keeps_fresh_jobs() {
+        let jobs = ImportJobs::default();
+        jobs.insert("fresh".into(), job(ImportStatus::AwaitingUpload));
+
+        let residue = jobs.sweep_expired(IMPORT_JOB_TTL);
+
+        assert!(residue.is_empty());
+        assert!(jobs.upload_target("fresh").is_some());
     }
 }

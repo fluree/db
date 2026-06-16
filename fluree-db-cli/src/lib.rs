@@ -93,9 +93,7 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
                          or create locally then `fluree publish <remote> <ledger>`."
                             .to_string(),
                     )),
-                    None => {
-                        commands::create::run_remote(&ledger, &remote_name, &fluree_dir).await
-                    }
+                    None => commands::create::run_remote(&ledger, &remote_name, &fluree_dir).await,
                 };
             }
 
