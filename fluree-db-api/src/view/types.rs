@@ -552,13 +552,16 @@ impl GraphDb {
 
     /// Build a `BinaryGraphView` combining the binary store with the view's graph ID.
     ///
-    /// Returns `None` if no binary store is attached.
+    /// Returns `None` if no binary store is attached. The view carries
+    /// `dict_novelty` so encoded IDs allocated after the index snapshot
+    /// (novelty-only subjects/strings) resolve via watermark routing instead
+    /// of failing against the persisted forward packs.
     pub fn binary_graph(&self) -> Option<BinaryGraphView> {
         self.binary_store.as_ref().map(|store| {
             // `shared_namespaces()` is a refcount bump on the snapshot's already-Arc
             // namespace table; `namespaces().clone()` would deep-copy the whole map
             // on every query (a dominant per-query cost on large ledgers).
-            BinaryGraphView::new(store.clone(), self.graph_id)
+            BinaryGraphView::with_novelty(store.clone(), self.graph_id, self.dict_novelty.clone())
                 .with_namespace_codes_fallback(Some(self.snapshot.shared_namespaces()))
         })
     }
