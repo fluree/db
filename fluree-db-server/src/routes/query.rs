@@ -115,9 +115,14 @@ async fn await_query_min_t_requirements(
                 .map_err(ServerError::Api)?;
             let current = ledger.t();
             if current < min_t {
-                return Err(ServerError::not_implemented(format!(
-                    "fluree-min-t requires t={min_t}, but proxy storage mode can only observe current t={current} and cannot perform local read-after-write refresh"
-                )));
+                // A proxy peer tracks head passively via its SSE subscription and
+                // cannot refresh on demand, so report a behind head as a
+                // read-after-write timeout (HTTP 408) — consistent with the
+                // non-proxy wait path — rather than a misleading "not implemented".
+                return Err(ServerError::Api(ApiError::AwaitTNotReached {
+                    requested: min_t,
+                    current,
+                }));
             }
         }
         return Ok(());
