@@ -32,8 +32,8 @@ pub struct DocsIndex {
 
 impl DocsIndex {
     /// Build the index from the embedded `docs/` corpus. Called once, lazily
-    /// (see [`crate::index`]). Skips non-markdown, `SUMMARY.md`/`README.md`, and
-    /// the `book/` build output.
+    /// (see [`crate::index`]). Skips non-markdown, `SUMMARY.md` (the TOC), and
+    /// the `book/` build output. `README.md` section-index pages are kept.
     pub fn build() -> Self {
         let mut sections: Vec<Section> = Vec::new();
         let mut pages: HashMap<String, String> = HashMap::new();
@@ -49,8 +49,14 @@ impl DocsIndex {
             if p.starts_with("book/") || p.split('/').any(|seg| seg.starts_with('.')) {
                 continue;
             }
+            // Skip only SUMMARY.md — it's the curated TOC, surfaced separately
+            // via `tree`, not a content page. README.md files ARE content: in
+            // mdBook they're the section index pages, and SUMMARY.md links to
+            // them by path (e.g. `cli/README.md`), so they must be indexable
+            // (search) and fetchable (get). Navigational README slices are
+            // filtered at section granularity by `is_nav`, not dropped wholesale.
             let base = p.rsplit('/').next().unwrap_or(p);
-            if base.eq_ignore_ascii_case("SUMMARY.md") || base.eq_ignore_ascii_case("README.md") {
+            if base.eq_ignore_ascii_case("SUMMARY.md") {
                 continue;
             }
             let Some(file) = DocsAssets::get(p) else {

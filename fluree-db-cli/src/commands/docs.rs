@@ -98,7 +98,7 @@ fn examples(query: &str, lang: Option<&str>, limit: usize, json: bool) -> CliRes
         let n = i + 1;
         let lang = if e.lang.is_empty() { "text" } else { &e.lang };
         println!("{n}. {}#{}  [{lang}]", e.path, e.anchor);
-        println!("```{}", e.lang);
+        println!("```{lang}");
         println!("{}", e.code.trim_end());
         println!("```\n");
     }

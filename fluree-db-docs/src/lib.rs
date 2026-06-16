@@ -115,6 +115,44 @@ mod tests {
     }
 
     #[test]
+    fn every_tree_path_is_fetchable() {
+        // The tree (from SUMMARY.md) advertises page paths for browse/orient;
+        // each must resolve via `get`. Regression: README.md section-index
+        // pages used to be excluded from the index, so paths the tree exposed
+        // (e.g. `cli/README.md`, the root `README.md`) returned None.
+        fn collect<'a>(nodes: &'a [TreeNode], out: &mut Vec<&'a str>) {
+            for n in nodes {
+                out.push(&n.path);
+                collect(&n.children, out);
+            }
+        }
+        let tree = index().tree();
+        let mut paths = Vec::new();
+        collect(&tree.nodes, &mut paths);
+        assert!(paths.len() > 100, "expected a populated TOC, got {paths:?}");
+
+        let unfetchable: Vec<&str> = paths
+            .iter()
+            .copied()
+            .filter(|p| index().get(p, None).is_none())
+            .collect();
+        assert!(
+            unfetchable.is_empty(),
+            "tree advertises paths that `get` can't resolve: {unfetchable:?}"
+        );
+    }
+
+    #[test]
+    fn readme_section_index_pages_are_indexed() {
+        // README.md pages carry real content (e.g. the CLI overview's
+        // Installation / Quick Start). They must be both fetchable and
+        // searchable, not silently dropped.
+        let cli = index().get("cli/README.md", None).expect("cli/README.md");
+        assert!(cli.content.to_lowercase().contains("command-line"));
+        assert!(index().get("README.md", None).is_some(), "root Introduction");
+    }
+
+    #[test]
     fn tree_reflects_summary_toc() {
         let tree = index().tree();
         assert!(!tree.nodes.is_empty());
