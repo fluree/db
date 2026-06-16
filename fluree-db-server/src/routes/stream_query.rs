@@ -46,10 +46,6 @@ use crate::routes::query::{
 };
 use crate::state::AppState;
 
-/// Interval between heartbeat records when no rows are flowing. Chosen well
-/// under the typical 60s proxy idle timeout.
-const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
-
 /// Backpressure depth of the producer→transport channel. A full channel
 /// suspends the producer at its next `send`, pausing execution.
 const STREAM_CHANNEL_DEPTH: usize = 64;
@@ -248,8 +244,11 @@ async fn stream_query_inner(
         }
     }
 
+    let heartbeat = (state.config.stream_heartbeat_ms > 0)
+        .then(|| Duration::from_millis(state.config.stream_heartbeat_ms));
+
     tracing::info!(status = "start", ledger = %ledger, "streaming query started");
-    Ok(ndjson_response(rx, tracker, disconnect_guard))
+    Ok(ndjson_response(rx, tracker, disconnect_guard, heartbeat))
 }
 
 /// The two streaming execution shapes resolved by the handler. Constructed
@@ -297,63 +296,89 @@ fn stream_tracker(query_json: Option<&JsonValue>) -> Tracker {
     Tracker::new(opts)
 }
 
-/// Assemble the response body: forward producer records and inject a heartbeat
-/// whenever no record has flowed for [`HEARTBEAT_INTERVAL`]. The heartbeat
-/// reads the live fuel total from `tracker` (a lock-free atomic load).
+/// Assemble the response body: forward producer records and, when `heartbeat`
+/// is set, inject a heartbeat whenever no record has flowed for that interval.
+/// The heartbeat reads the live fuel total from `tracker` (a lock-free atomic
+/// load). `heartbeat = None` disables heartbeats entirely.
+///
+/// `guard` lives in the stream state: if the client drops the response body
+/// mid-stream it is dropped while armed and cancels the producer; on normal
+/// completion we disarm it before the stream ends.
 fn ndjson_response(
     rx: mpsc::Receiver<Bytes>,
     tracker: Tracker,
     guard: Option<QueryDisconnectGuard>,
+    heartbeat: Option<Duration>,
 ) -> Response {
-    let start = Instant::now();
-    let mut ticker = interval(HEARTBEAT_INTERVAL);
-    // Don't pile up heartbeats after a slow stretch, and don't fire one immediately.
-    ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
-
-    // `guard` lives in the stream state: if the client drops the response body
-    // mid-stream it is dropped while armed and cancels the producer. On normal
-    // completion we disarm it before the stream ends.
-    let stream = futures::stream::unfold(
-        (rx, ticker, tracker, start, guard),
-        move |(mut rx, mut ticker, tracker, start, mut guard)| async move {
-            loop {
-                tokio::select! {
-                    msg = rx.recv() => {
-                        match msg {
-                            Some(bytes) => {
+    let body = match heartbeat {
+        None => {
+            let stream = futures::stream::unfold(
+                (rx, guard),
+                move |(mut rx, mut guard)| async move {
+                    match rx.recv().await {
+                        Some(bytes) => Some((Ok::<Bytes, std::io::Error>(bytes), (rx, guard))),
+                        None => {
+                            if let Some(g) = guard.as_mut() {
+                                g.disarm();
+                            }
+                            None
+                        }
+                    }
+                },
+            );
+            Body::from_stream(stream)
+        }
+        Some(period) => {
+            let start = Instant::now();
+            let mut ticker = interval(period);
+            // Don't pile up heartbeats after a slow stretch.
+            ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+            let stream = futures::stream::unfold(
+                (rx, ticker, tracker, start, period, guard),
+                move |(mut rx, mut ticker, tracker, start, period, mut guard)| async move {
+                    loop {
+                        tokio::select! {
+                            msg = rx.recv() => {
+                                match msg {
+                                    Some(bytes) => {
+                                        return Some((
+                                            Ok::<Bytes, std::io::Error>(bytes),
+                                            (rx, ticker, tracker, start, period, guard),
+                                        ));
+                                    }
+                                    None => {
+                                        // Producer finished (terminal already sent).
+                                        if let Some(g) = guard.as_mut() {
+                                            g.disarm();
+                                        }
+                                        return None;
+                                    }
+                                }
+                            }
+                            _ = ticker.tick() => {
+                                // The interval's first tick fires immediately; skip
+                                // it so we never emit a heartbeat before the head.
+                                if start.elapsed() < period {
+                                    continue;
+                                }
+                                let elapsed_ms = start.elapsed().as_millis() as u64;
+                                let hb = ndjson_stream::heartbeat_record(
+                                    elapsed_ms,
+                                    tracker.current_fuel(),
+                                );
                                 return Some((
-                                    Ok::<Bytes, std::io::Error>(bytes),
-                                    (rx, ticker, tracker, start, guard),
+                                    Ok(Bytes::from(hb)),
+                                    (rx, ticker, tracker, start, period, guard),
                                 ));
                             }
-                            None => {
-                                // Producer finished (terminal record already sent).
-                                if let Some(g) = guard.as_mut() {
-                                    g.disarm();
-                                }
-                                return None;
-                            }
                         }
                     }
-                    _ = ticker.tick() => {
-                        // The interval's first tick fires immediately; skip it so
-                        // we never emit a heartbeat before the head record.
-                        if start.elapsed() < HEARTBEAT_INTERVAL {
-                            continue;
-                        }
-                        let elapsed_ms = start.elapsed().as_millis() as u64;
-                        let hb = ndjson_stream::heartbeat_record(elapsed_ms, tracker.current_fuel());
-                        return Some((
-                            Ok(Bytes::from(hb)),
-                            (rx, ticker, tracker, start, guard),
-                        ));
-                    }
-                }
-            }
-        },
-    );
+                },
+            );
+            Body::from_stream(stream)
+        }
+    };
 
-    let body = Body::from_stream(stream);
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, ndjson_stream::NDJSON_CONTENT_TYPE)

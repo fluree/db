@@ -124,6 +124,46 @@ async fn stream_sparql(
         .unwrap()
 }
 
+async fn state_no_heartbeat() -> (TempDir, Arc<AppState>) {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let cfg = ServerConfig {
+        cors_enabled: false,
+        indexing_enabled: false,
+        storage_path: Some(tmp.path().to_path_buf()),
+        stream_heartbeat_ms: 0, // disabled
+        ..Default::default()
+    };
+    let telemetry = TelemetryConfig::with_server_config(&cfg);
+    let state = Arc::new(AppState::new(cfg, telemetry).await.expect("AppState::new"));
+    (tmp, state)
+}
+
+#[tokio::test]
+async fn heartbeat_disabled_still_streams() {
+    let (_tmp, state) = state_no_heartbeat().await;
+    let app = build_router(state);
+    create_ledger(&app, "strm:nohb").await;
+    insert_name(&app, "strm:nohb", "ex:x", "Xavier").await;
+
+    let query = json!({
+        "@context": { "ex": "http://example.org/" },
+        "select": ["?name"],
+        "where": { "@id": "?s", "ex:name": "?name" }
+    });
+    let resp = stream_jsonld(&app, "strm:nohb", &query).await;
+    let (status, ct, records) = ndjson_records(resp).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(ct.as_deref(), Some("application/x-ndjson"));
+    assert_eq!(records.first().unwrap()["type"], "head");
+    assert_eq!(records.last().unwrap()["type"], "end");
+    assert_eq!(records.last().unwrap()["rows"], 1);
+    assert_eq!(
+        records.iter().filter(|r| r["type"] == "heartbeat").count(),
+        0,
+        "no heartbeat records when disabled"
+    );
+}
+
 #[tokio::test]
 async fn jsonld_select_streams_ndjson() {
     let (_tmp, state) = test_state().await;

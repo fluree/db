@@ -16,6 +16,10 @@ pub const DEFAULT_CORS_ENABLED: bool = true;
 pub const DEFAULT_BODY_LIMIT: usize = 52_428_800; // 50 MB
 pub const DEFAULT_QUERY_TIMEOUT_MS: u64 = 15 * 60 * 1000; // 15 minutes
 pub const DEFAULT_QUERY_MIN_T_TIMEOUT_MS: u64 = 5_000; // 5 seconds
+/// Interval between keep-alive heartbeats on the streaming query endpoint.
+/// Default 15s — comfortably under common proxy idle timeouts (CloudFront/ALB
+/// ~60s). Tune down for stricter proxies.
+pub const DEFAULT_STREAM_HEARTBEAT_MS: u64 = 15_000; // 15 seconds
 pub const DEFAULT_QUERY_REFRESH_ENABLED: bool = false;
 pub const DEFAULT_QUERY_REFRESH_TTL_MS: u64 = 1000;
 

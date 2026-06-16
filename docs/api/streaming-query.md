@@ -108,10 +108,12 @@ stream starts: parse errors and [unsupported shapes](#unsupported-shapes).)
 
 ### Heartbeats
 
-When no record has flowed for ~15s, the server emits a `heartbeat` record. This
-is driven by a wall-clock timer in the transport layer, independent of query
-execution, so it fires even while a blocking operator (a large `ORDER BY` /
-`GROUP BY` drain) is producing no rows. When the query was submitted with fuel
+When no record has flowed for the heartbeat interval (default 15s, configurable
+via `FLUREE_STREAM_HEARTBEAT_MS` / `--stream-heartbeat-ms`; `0` disables), the
+server emits a `heartbeat` record. This is driven by a wall-clock timer in the
+transport layer, independent of query execution, so it fires even while a
+blocking operator (a large `ORDER BY` / `GROUP BY` drain) is producing no rows.
+Set the interval below your fronting proxy's idle timeout. When the query was submitted with fuel
 tracking, the heartbeat carries the live running `fuel` total, which climbs as
 scans charge — a useful "still making progress" signal during a long stall.
 
