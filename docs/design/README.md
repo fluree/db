@@ -44,6 +44,10 @@ How a single **model ledger** can hold the ontology, SHACL shapes, policy rules,
 
 Storage trait architecture: `StorageRead`, `StorageWrite`, `ContentAddressedWrite`, `Storage`, and `NameService` trait design with guidance for implementing new backends.
 
+### [Reasoning Roadmap](reasoning-roadmap.md)
+
+Two-axis plan for OWL reasoning: (A) static OWL2RL materialization performance (rule compilation, parallel fixpoint, post-import pass) and incremental maintenance via FBF with derived facts persisted in a branch-plumbing-based "reasoned index head"; (B) practitioner UX/DX (explanations from a provenance sidecar, ROBOT-style workflows, `versionIRI ↔ t` mapping, virtual RDF-star lineage).
+
 ## Related Documentation
 
 - [Crate Map](../reference/crate-map.md) - Workspace architecture
