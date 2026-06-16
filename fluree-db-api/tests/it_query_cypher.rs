@@ -3460,3 +3460,64 @@ async fn cypher_with_limit_then_match_truncates_and_drives_downstream() {
         );
     }
 }
+
+#[tokio::test]
+async fn cypher_var_length_then_with_distinct_multivar_drives_downstream() {
+    // Regression (LDBC IC6): a variable-length traversal feeding a multi-var
+    // `WITH DISTINCT friend, knownTag` whose outputs are consumed by a later
+    // self-join under-counted (4 → 1). The reorder placed the cheap consuming
+    // triples ahead of the var-length WITH (its cost estimate is high), turning
+    // an uncorrelated producer into a per-row correlated subquery over its own
+    // consumer and collapsing the consumer's bindings. The fix defers a consumer
+    // of an uncorrelated subquery's output vars until after the subquery.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/cypher:ic6-var-length-with");
+
+    // hub(0) reaches friend(100) via 3 KNOWS*1..2 paths (direct + via 1 + via 2).
+    // friend authored 4 posts, each tagged Knot AND DavidFoster.
+    let txn = json!({
+        "@context": ctx(),
+        "@graph": [
+            {"@id": "ex:p0", "@type": "ex:Person", "ex:id": 0,
+             "ex:KNOWS": [{"@id": "ex:p100"}, {"@id": "ex:p1"}, {"@id": "ex:p2"}]},
+            {"@id": "ex:p1", "@type": "ex:Person", "ex:id": 1, "ex:KNOWS": {"@id": "ex:p100"}},
+            {"@id": "ex:p2", "@type": "ex:Person", "ex:id": 2, "ex:KNOWS": {"@id": "ex:p100"}},
+            {"@id": "ex:p100", "@type": "ex:Person", "ex:id": 100},
+            {"@id": "ex:tKnot", "@type": "ex:Tag", "ex:name": "Knot"},
+            {"@id": "ex:tDF", "@type": "ex:Tag", "ex:name": "DavidFoster"},
+            {"@id": "ex:m0", "@type": "ex:Post", "ex:id": 1000,
+             "ex:HAS_CREATOR": {"@id": "ex:p100"}, "ex:HAS_TAG": [{"@id": "ex:tKnot"}, {"@id": "ex:tDF"}]},
+            {"@id": "ex:m1", "@type": "ex:Post", "ex:id": 1001,
+             "ex:HAS_CREATOR": {"@id": "ex:p100"}, "ex:HAS_TAG": [{"@id": "ex:tKnot"}, {"@id": "ex:tDF"}]},
+            {"@id": "ex:m2", "@type": "ex:Post", "ex:id": 1002,
+             "ex:HAS_CREATOR": {"@id": "ex:p100"}, "ex:HAS_TAG": [{"@id": "ex:tKnot"}, {"@id": "ex:tDF"}]},
+            {"@id": "ex:m3", "@type": "ex:Post", "ex:id": 1003,
+             "ex:HAS_CREATOR": {"@id": "ex:p100"}, "ex:HAS_TAG": [{"@id": "ex:tKnot"}, {"@id": "ex:tDF"}]},
+        ]
+    });
+    let l = fluree.insert(ledger0, &txn).await.expect("seed").ledger;
+    let db = graphdb_from_ledger(&l);
+
+    let jsonld = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (knownTag:Tag {name: "Knot"})
+               MATCH (person:Person {id: 0})-[:KNOWS*1..2]-(friend) WHERE NOT friend = person
+               WITH DISTINCT friend, knownTag
+               MATCH (friend)<-[:HAS_CREATOR]-(post:Post)-[:HAS_TAG]->(knownTag)
+               MATCH (post)-[:HAS_TAG]->(commonTag) WHERE NOT commonTag = knownTag
+               RETURN commonTag.name AS name, count(post) AS cnt ORDER BY cnt DESC, name"#,
+        )
+        .await
+        .expect("ic6")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+
+    // All 4 of friend's Knot-tagged posts also carry DavidFoster → count is 4.
+    assert_eq!(
+        jsonld,
+        json!([["DavidFoster", 4]]),
+        "var-length WITH output must drive the downstream count: {jsonld}"
+    );
+}

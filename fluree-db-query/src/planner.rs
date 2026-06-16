@@ -1097,6 +1097,26 @@ pub fn reorder_patterns(
 
     let mut bound_vars = initial_bound_vars.clone();
 
+    // Outputs of UNCORRELATED sibling subqueries (Cypher WITH-pipeline
+    // producers). A pattern consuming one of these must be placed AFTER the
+    // producing subquery — otherwise the greedy source race can place the
+    // consumer first (e.g. a cheap `?post a :Post` scan ahead of a var-length
+    // WITH whose cost estimate is high), which turns the uncorrelated producer
+    // into a per-row correlated subquery over its own consumer and silently
+    // collapses the consumer's bindings. Correlated subqueries are excluded:
+    // their own outputs are handled by the correlation deferral below.
+    let subquery_output_vars: HashSet<VarId> = patterns
+        .iter()
+        .enumerate()
+        .filter_map(|(i, p)| match p {
+            Pattern::Subquery(sq) if subquery_correlation_vars(sq, patterns, i).is_empty() => {
+                Some(subquery_produced_select_vars(sq))
+            }
+            _ => None,
+        })
+        .flatten()
+        .collect();
+
     // Classify each pattern by its cardinality category.
     let mut sources: Vec<RankedPattern> = Vec::new();
     let mut reducers: Vec<RankedPattern> = Vec::new();
@@ -1147,6 +1167,22 @@ pub fn reorder_patterns(
                 deferred.push(DeferredPattern {
                     orig_index: i,
                     required_vars: corr,
+                    pattern: pattern.clone(),
+                });
+                continue;
+            }
+        } else {
+            // Consumer of an uncorrelated WITH-subquery's output: defer it on
+            // those vars so the producing subquery is placed first.
+            let needs: HashSet<VarId> = pattern
+                .referenced_vars()
+                .into_iter()
+                .filter(|v| subquery_output_vars.contains(v))
+                .collect();
+            if !needs.is_empty() {
+                deferred.push(DeferredPattern {
+                    orig_index: i,
+                    required_vars: needs,
                     pattern: pattern.clone(),
                 });
                 continue;
@@ -1551,6 +1587,18 @@ fn subquery_correlation_vars(
         }
     }
     corr
+}
+
+/// Variables a subquery binds itself and exposes in its SELECT — its
+/// WITH-pipeline outputs. A sibling that consumes one of these must run after
+/// the subquery (see the call site in `reorder_patterns`).
+fn subquery_produced_select_vars(sq: &SubqueryPattern) -> HashSet<VarId> {
+    let select: HashSet<VarId> = sq.select.iter().copied().collect();
+    sq.patterns
+        .iter()
+        .flat_map(Pattern::produced_vars)
+        .filter(|v| select.contains(v))
+        .collect()
 }
 
 fn deferred_required_vars(pattern: &Pattern) -> Vec<VarId> {
