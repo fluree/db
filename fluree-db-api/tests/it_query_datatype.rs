@@ -257,7 +257,9 @@ async fn datatype_filter_with_datatype_function() {
         "where": [
             {"ex:name":"?name","ex:age":"?age"},
             ["bind","?dt",["expr",["datatype","?age"]]],
-            ["filter", "(= \"xsd:integer\" ?dt)"]
+            // DATATYPE returns the datatype IRI (SPARQL 1.1 §17.4.2.3), so the
+            // filter compares against the xsd:integer IRI, not a compact string.
+            ["filter", "(= ?dt (iri \"http://www.w3.org/2001/XMLSchema#integer\"))"]
         ]
     });
 
@@ -267,6 +269,46 @@ async fn datatype_filter_with_datatype_function() {
         .to_jsonld(&ledger.snapshot)
         .unwrap();
     assert_eq!(rows, json!([["Homer", 36, "xsd:integer"]]));
+}
+
+/// Regression: `FILTER(DATATYPE(?v) = xsd:decimal)` in SPARQL must match
+/// decimal-typed literals. SPARQL 1.1 §17.4.2.3 requires DATATYPE to return the
+/// datatype *IRI*, so the comparison is IRI-vs-IRI. Previously DATATYPE returned
+/// a compact string (`"xsd:decimal"`) and this filter matched nothing.
+#[tokio::test]
+async fn datatype_function_compares_against_xsd_iri_in_sparql() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "dt-iri:main");
+    fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": ctx_datatype(),
+                "@graph": [
+                    {"@id":"ex:a","ex:price":{"@value":"1.50","@type":"xsd:decimal"}},
+                    {"@id":"ex:b","ex:price":{"@value":"2.75","@type":"xsd:decimal"}},
+                    {"@id":"ex:c","ex:price":{"@value":42,"@type":"xsd:integer"}}
+                ]
+            }),
+        )
+        .await
+        .expect("insert");
+
+    let db = fluree.db("dt-iri:main").await.expect("indexed view");
+    let q = "PREFIX ex: <http://example.org/ns/>\n\
+             PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>\n\
+             SELECT ?s WHERE { ?s ex:price ?v FILTER(DATATYPE(?v) = xsd:decimal) } ORDER BY ?s";
+    let rows = fluree
+        .query(&db, QueryInput::Sparql(q))
+        .await
+        .expect("sparql query")
+        .to_jsonld(&db.snapshot)
+        .expect("to_jsonld");
+    // Only the two xsd:decimal subjects match; the xsd:integer one does not.
+    assert_eq!(
+        normalize_rows(&rows),
+        normalize_rows(&json!([["ex:a"], ["ex:b"]]))
+    );
 }
 
 #[tokio::test]
@@ -895,7 +937,8 @@ async fn json_datatype_insert_query_and_filter() {
         "where": [
             {"ex:name": "?name", "ex:data": "?data"},
             ["bind", "?dt", ["expr", ["datatype", "?data"]]],
-            ["filter", "(= \"@json\" ?dt)"]
+            // DATATYPE returns the datatype IRI; @json is rdf:JSON.
+            ["filter", "(= ?dt (iri \"http://www.w3.org/1999/02/22-rdf-syntax-ns#JSON\"))"]
         ]
     });
     let rows2 = support::query_jsonld(&fluree, &ledger, &q2)
@@ -1797,7 +1840,9 @@ async fn indexed_inline_numerics_roundtrip_through_distinct_filter_sum() {
         .await,
         normalize_rows(&json!([[70]]))
     );
-    // DATATYPE round-trips to xsd:integer (dt_id resolves back to the o_type).
+    // DATATYPE round-trips to the xsd:integer IRI (dt_id resolves back to the
+    // o_type). No xsd prefix is in scope for this serialization, so it renders
+    // as the full datatype IRI.
     assert_eq!(
         rows(
             &fluree,
@@ -1805,7 +1850,7 @@ async fn indexed_inline_numerics_roundtrip_through_distinct_filter_sum() {
             &format!("{P} SELECT DISTINCT (DATATYPE(?age) AS ?dt) WHERE {{ ?s ex:age ?age }}")
         )
         .await,
-        normalize_rows(&json!([["xsd:integer"]]))
+        normalize_rows(&json!([["http://www.w3.org/2001/XMLSchema#integer"]]))
     );
     // Inline doubles encode (NUM_F64) and DISTINCT-dedup too.
     assert_eq!(
