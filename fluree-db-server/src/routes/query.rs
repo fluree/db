@@ -276,7 +276,10 @@ pub(crate) fn is_sparql_request(
 /// Precedence:
 /// 1) Signed request DID (credential)
 /// 2) Bearer token identity (fluree.identity ?? sub)
-fn effective_identity(credential: &MaybeCredential, bearer: &MaybeDataBearer) -> Option<String> {
+pub(crate) fn effective_identity(
+    credential: &MaybeCredential,
+    bearer: &MaybeDataBearer,
+) -> Option<String> {
     credential
         .did()
         .map(std::string::ToString::to_string)
@@ -433,7 +436,7 @@ fn enforce_bearer_dataset_scope(
 }
 
 /// Helper to extract ledger ID from request (for JSON-LD queries)
-pub(crate) fn get_ledger_id(
+fn get_ledger_id(
     path_ledger: Option<&str>,
     headers: &FlureeHeaders,
     body: &JsonValue,
