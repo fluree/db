@@ -17,7 +17,7 @@
 
 use crate::config::ServerRole;
 use crate::error::{Result, ServerError};
-use crate::import_jobs::{ImportJob, ImportStatus, MultipartPlan};
+use crate::import_jobs::{ImportJob, ImportStatus, MultipartPlan, StagedResidue, IMPORT_JOB_TTL};
 use crate::state::AppState;
 use axum::extract::{Path, Query, Request, State};
 use axum::http::StatusCode;
@@ -213,6 +213,10 @@ pub async fn mint_upload(State(state): State<Arc<AppState>>, request: Request) -
 async fn mint_upload_local(state: Arc<AppState>, request: Request) -> Result<Response> {
     ensure_presign_enabled(&state)?;
 
+    // Reclaim expired jobs (and their staged files) before minting a new one so
+    // the in-process registry and the staging dir cannot grow without bound.
+    purge_staged(&state.import_jobs.sweep_expired(IMPORT_JOB_TTL)).await;
+
     let body = axum::body::to_bytes(request.into_body(), 64 * 1024)
         .await
         .map_err(|e| ServerError::bad_request(format!("failed to read body: {e}")))?;
@@ -238,7 +242,7 @@ async fn mint_upload_local(state: Arc<AppState>, request: Request) -> Result<Res
 
     let expires_at_unix = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() + 3600)
+        .map(|d| d.as_secs() + IMPORT_JOB_TTL.as_secs())
         .unwrap_or(0);
 
     // An archive at or above the multipart threshold is uploaded in parts: a
@@ -353,7 +357,7 @@ async fn put_blob_local(
 ) -> Result<Response> {
     ensure_presign_enabled(&state)?;
 
-    let (expected_token, staged_path, status, multipart) = state
+    let (expected_token, staged_path, status, multipart, created_at) = state
         .import_jobs
         .upload_target(&import_id)
         .ok_or_else(|| ServerError::not_found("unknown import_id"))?;
@@ -362,6 +366,9 @@ async fn put_blob_local(
     // avoid confirming the import_id exists.
     if token != expected_token {
         return Err(ServerError::not_found("unknown import_id"));
+    }
+    if created_at.elapsed() > IMPORT_JOB_TTL {
+        return Err(ServerError::bad_request("upload slot has expired"));
     }
     if multipart.is_some() {
         return Err(ServerError::bad_request(
@@ -412,13 +419,16 @@ async fn put_part_local(
 ) -> Result<Response> {
     ensure_presign_enabled(&state)?;
 
-    let (expected_token, staged_path, status, multipart) = state
+    let (expected_token, staged_path, status, multipart, created_at) = state
         .import_jobs
         .upload_target(&import_id)
         .ok_or_else(|| ServerError::not_found("unknown import_id"))?;
 
     if token != expected_token {
         return Err(ServerError::not_found("unknown import_id"));
+    }
+    if created_at.elapsed() > IMPORT_JOB_TTL {
+        return Err(ServerError::bad_request("upload slot has expired"));
     }
     let Some(plan) = multipart else {
         return Err(ServerError::bad_request(
@@ -505,10 +515,14 @@ async fn complete_upload_local(
 ) -> Result<Response> {
     ensure_presign_enabled(&state)?;
 
-    let (ledger_id, staged_path, status, multipart) = state
+    let (ledger_id, staged_path, status, multipart, created_at) = state
         .import_jobs
         .completion_target(&import_id)
         .ok_or_else(|| ServerError::not_found("unknown import_id"))?;
+
+    if created_at.elapsed() > IMPORT_JOB_TTL {
+        return Err(ServerError::bad_request("upload slot has expired"));
+    }
 
     match status {
         ImportStatus::AwaitingUpload => {}
@@ -604,6 +618,21 @@ async fn complete_upload_local(
 
     let response = serde_json::json!({ "import_id": import_id, "status": "running" });
     Ok((StatusCode::ACCEPTED, Json(response)).into_response())
+}
+
+/// Best-effort deletion of the staged residue of swept (expired) jobs: the
+/// assembled archive and, for a multipart job, any part files still beside it.
+/// Missing files are ignored — a completed job's archive is already gone.
+async fn purge_staged(residue: &[StagedResidue]) {
+    for r in residue {
+        let _ = tokio::fs::remove_file(&r.staged_path).await;
+        if let Some(num_parts) = r.num_parts {
+            for part_number in 1..=num_parts {
+                let _ =
+                    tokio::fs::remove_file(part_staging_path(&r.staged_path, part_number)).await;
+            }
+        }
+    }
 }
 
 /// Concatenate staged parts `1..=num_parts` into `staged_path` (in order), then
