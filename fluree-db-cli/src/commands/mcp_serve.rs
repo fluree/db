@@ -60,7 +60,10 @@ fn init_mcp_tracing(memory_dir: Option<&Path>) {
 /// `fluree mcp serve --transport stdio` and communicates via JSON-RPC
 /// over stdin/stdout.
 async fn run_stdio(dirs: &FlureeDir) -> CliResult<()> {
-    let fluree = context::build_fluree(dirs)?;
+    // Process-private in-memory ledger: many MCP helpers can run at once
+    // (one per IDE/agent session) over the same `.fluree-memory` files, so the
+    // ledger cache must not be shared on disk. See `context::build_memory_fluree`.
+    let fluree = context::build_memory_fluree();
 
     // Determine memory_dir: .fluree-memory/ at the project root (same logic as CLI).
     // Always enable in unified mode — MemoryStore creates the directory structure on init.
@@ -76,7 +79,10 @@ async fn run_stdio(dirs: &FlureeDir) -> CliResult<()> {
 
     tracing::info!("MCP server starting");
 
-    let store = MemoryStore::new(fluree, memory_dir);
+    // Ephemeral (in-memory) ledger: rebuilt from the `.ttl` files on startup,
+    // never seeded from the shared on-disk hash, so concurrent MCP processes
+    // never corrupt each other's cache.
+    let store = MemoryStore::new_ephemeral_ledger(fluree, memory_dir);
     let service = MemoryToolService::new(store);
 
     let transport = rmcp::transport::io::stdio();
