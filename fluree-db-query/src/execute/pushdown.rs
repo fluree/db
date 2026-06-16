@@ -191,6 +191,7 @@ mod tests {
     use super::*;
     use crate::ir::triple::{Ref, Term};
     use crate::ir::FlakeValue;
+    use fluree_db_core::NsCode;
     use fluree_db_core::Sid;
 
     use crate::ir::Function;
@@ -198,7 +199,7 @@ mod tests {
     fn make_pattern(s_var: VarId, p_name: &str, o_var: VarId) -> TriplePattern {
         TriplePattern::new(
             Ref::Var(s_var),
-            Ref::Sid(Sid::new(100, p_name)),
+            Ref::Sid(Sid::new(NsCode(100), p_name)),
             Term::Var(o_var),
         )
     }

@@ -167,7 +167,7 @@ impl DictOverlay {
             if let Some(id) = self
                 .dict_novelty
                 .subjects
-                .find_subject(sid.namespace_code, &sid.name)
+                .find_subject(sid.namespace_code.as_u16(), &sid.name)
             {
                 return Ok(id);
             }
@@ -176,7 +176,7 @@ impl DictOverlay {
         let sid = self.graph_view.store().encode_iri(iri);
         Ok(self
             .ext_subjects
-            .assign_or_lookup(sid.namespace_code, sid.name.as_ref()))
+            .assign_or_lookup(sid.namespace_code.as_u16(), sid.name.as_ref()))
     }
 
     /// Assign a subject ID from a Sid (avoids IRI construction).
@@ -189,7 +189,7 @@ impl DictOverlay {
         if let Some(id) = self
             .graph_view
             .store()
-            .find_subject_id_by_parts(sid.namespace_code, &sid.name)?
+            .find_subject_id_by_parts(sid.namespace_code.as_u16(), &sid.name)?
         {
             return Ok(id);
         }
@@ -198,7 +198,7 @@ impl DictOverlay {
             if let Some(id) = self
                 .dict_novelty
                 .subjects
-                .find_subject(sid.namespace_code, &sid.name)
+                .find_subject(sid.namespace_code.as_u16(), &sid.name)
             {
                 return Ok(id);
             }
@@ -206,7 +206,7 @@ impl DictOverlay {
         // 3. Ephemeral fallback (for range provider path)
         Ok(self
             .ext_subjects
-            .assign_or_lookup(sid.namespace_code, sid.name.as_ref()))
+            .assign_or_lookup(sid.namespace_code.as_u16(), sid.name.as_ref()))
     }
 
     /// Resolve a subject ID back to an IRI string.
@@ -222,7 +222,8 @@ impl DictOverlay {
             }
             // Ephemeral fallback: namespace-aware sid64 allocation
             if let Some((ns_code, suffix)) = self.ext_subjects.resolve_subject(id) {
-                if ns_code == namespaces::EMPTY || ns_code == namespaces::OVERFLOW {
+                if ns_code == namespaces::EMPTY.as_u16() || ns_code == namespaces::OVERFLOW.as_u16()
+                {
                     return Ok(suffix.to_string());
                 }
                 let prefix = self.graph_view.namespace_prefix(ns_code)?;
@@ -242,7 +243,7 @@ impl DictOverlay {
         }
         // Novel — DictNovelty forward
         if let Some((ns_code, suffix)) = self.dict_novelty.subjects.resolve_subject(id) {
-            if ns_code == namespaces::EMPTY || ns_code == namespaces::OVERFLOW {
+            if ns_code == namespaces::EMPTY.as_u16() || ns_code == namespaces::OVERFLOW.as_u16() {
                 return Ok(suffix.to_string());
             }
             let prefix = self.graph_view.namespace_prefix(ns_code)?;
@@ -253,7 +254,7 @@ impl DictOverlay {
         // may allocate into ext_subjects in certain view paths (e.g., historical overlays
         // where DictNovelty is present but doesn't contain the entry).
         if let Some((ns_code, suffix)) = self.ext_subjects.resolve_subject(id) {
-            if ns_code == namespaces::EMPTY || ns_code == namespaces::OVERFLOW {
+            if ns_code == namespaces::EMPTY.as_u16() || ns_code == namespaces::OVERFLOW.as_u16() {
                 return Ok(suffix.to_string());
             }
             let prefix = self.graph_view.namespace_prefix(ns_code)?;
@@ -663,7 +664,7 @@ impl DictOverlay {
             .dt_sids()
             .get(dt_id as usize)
             .cloned()
-            .unwrap_or_else(|| Sid::new(0, ""))
+            .unwrap_or_else(|| Sid::new(fluree_db_core::NsCode(0), ""))
     }
 
     /// Decode lang_id and i_val into FlakeMeta.

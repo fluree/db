@@ -97,7 +97,7 @@ impl IriEncoder for MemoryEncoder {
     fn encode_iri(&self, iri: &str) -> Option<Sid> {
         let (prefix, suffix) = canonical_split(iri, self.split_mode);
         if let Some(&code) = self.namespaces.get(prefix) {
-            Some(Sid::new(code, suffix))
+            Some(Sid::new(fluree_db_core::NsCode::from_u16(code), suffix))
         } else {
             Some(Sid::new(fluree_vocab::namespaces::EMPTY, iri))
         }
@@ -108,7 +108,7 @@ impl IriEncoder for MemoryEncoder {
         self.namespaces
             .get(prefix)
             .copied()
-            .map(|code| Sid::new(code, suffix))
+            .map(|code| Sid::new(fluree_db_core::NsCode::from_u16(code), suffix))
     }
 }
 
@@ -128,7 +128,7 @@ mod tests {
         encoder.add_namespace("http://example.org/", 100);
 
         let sid = encoder.encode_iri("http://example.org/Person").unwrap();
-        assert_eq!(sid.namespace_code, 100);
+        assert_eq!(sid.namespace_code, fluree_db_core::NsCode(100));
         assert_eq!(sid.name.as_ref(), "Person");
 
         // Unknown namespace falls back to EMPTY namespace (code 0) with full IRI as name
@@ -142,11 +142,11 @@ mod tests {
         let encoder = MemoryEncoder::with_common_namespaces();
 
         let xsd_string = encoder.encode_iri(xsd::STRING).unwrap();
-        assert_eq!(xsd_string.namespace_code, 2);
+        assert_eq!(xsd_string.namespace_code, fluree_db_core::NsCode(2));
         assert_eq!(xsd_string.name.as_ref(), "string");
 
         let rdf_type = encoder.encode_iri(rdf::TYPE).unwrap();
-        assert_eq!(rdf_type.namespace_code, 3);
+        assert_eq!(rdf_type.namespace_code, fluree_db_core::NsCode(3));
         assert_eq!(rdf_type.name.as_ref(), "type");
     }
 
@@ -159,12 +159,12 @@ mod tests {
         // canonical_split(MostGranular) splits at last '/' → prefix = "http://example.org/ns/"
         // Exact lookup finds code 101
         let sid = encoder.encode_iri("http://example.org/ns/Thing").unwrap();
-        assert_eq!(sid.namespace_code, 101);
+        assert_eq!(sid.namespace_code, fluree_db_core::NsCode(101));
         assert_eq!(sid.name.as_ref(), "Thing");
 
         // canonical_split for "http://example.org/Other" → prefix = "http://example.org/"
         let sid2 = encoder.encode_iri("http://example.org/Other").unwrap();
-        assert_eq!(sid2.namespace_code, 100);
+        assert_eq!(sid2.namespace_code, fluree_db_core::NsCode(100));
         assert_eq!(sid2.name.as_ref(), "Other");
     }
 }

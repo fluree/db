@@ -62,6 +62,7 @@ mod tests {
     use super::*;
     use crate::binding::{Batch, Binding};
     use crate::var_registry::VarId;
+    use fluree_db_core::NsCode;
     use fluree_db_core::{GeoPointBits, Sid};
     use fluree_vocab::namespaces::OGC_GEO;
     use std::sync::Arc;
@@ -108,11 +109,11 @@ mod tests {
         let schema: Arc<[VarId]> = Arc::from(vec![VarId(0), VarId(1)].into_boxed_slice());
         let col0 = vec![Binding::lit(
             FlakeValue::String("POINT(2.3522 48.8566)".to_string()), // Paris (lng, lat)
-            Sid::new(2, "string"),
+            Sid::new(NsCode(2), "string"),
         )];
         let col1 = vec![Binding::lit(
             FlakeValue::String("POINT(-0.1278 51.5074)".to_string()), // London (lng, lat)
-            Sid::new(2, "string"),
+            Sid::new(NsCode(2), "string"),
         )];
         let batch = Batch::new(schema, vec![col0, col1]).unwrap();
         let row = batch.row_view(0).unwrap();
@@ -140,11 +141,11 @@ mod tests {
         let schema: Arc<[VarId]> = Arc::from(vec![VarId(0), VarId(1)].into_boxed_slice());
         let col0 = vec![Binding::lit(
             FlakeValue::String("LINESTRING(0 0, 1 1, 2 2)".to_string()),
-            Sid::new(2, "string"),
+            Sid::new(NsCode(2), "string"),
         )];
         let col1 = vec![Binding::lit(
             FlakeValue::String("POINT(2.3522 48.8566)".to_string()),
-            Sid::new(2, "string"),
+            Sid::new(NsCode(2), "string"),
         )];
         let batch = Batch::new(schema, vec![col0, col1]).unwrap();
         let row = batch.row_view(0).unwrap();

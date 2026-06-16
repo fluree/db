@@ -196,6 +196,7 @@ mod tests {
     use super::*;
     use crate::ir::triple::Ref;
     use crate::var_registry::VarId;
+    use fluree_db_core::NsCode;
     use fluree_db_core::{is_rdf_type, Sid};
     use fluree_vocab::namespaces::RDF;
 
@@ -205,7 +206,7 @@ mod tests {
         let rdf_type_sid = Sid::new(RDF, "type");
         assert!(is_rdf_type(&rdf_type_sid));
 
-        let not_type_sid = Sid::new(100, "name");
+        let not_type_sid = Sid::new(NsCode(100), "name");
         assert!(!is_rdf_type(&not_type_sid));
     }
 

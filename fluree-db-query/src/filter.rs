@@ -353,7 +353,7 @@ fn try_eval_simple_exists_semijoin(
     };
 
     let s_id = store
-        .find_subject_id_by_parts(sid.namespace_code, sid.name.as_ref())
+        .find_subject_id_by_parts(sid.namespace_code.as_u16(), sid.name.as_ref())
         .map_err(|e| crate::error::QueryError::Internal(format!("sid->s_id: {e}")))?;
 
     let has_match = s_id.is_some_and(|id| subjects.contains(&id));
@@ -601,6 +601,7 @@ mod tests {
     use super::*;
     use crate::ir::triple::{Ref, Term, TriplePattern};
     use crate::ir::FlakeValue;
+    use fluree_db_core::NsCode;
     use fluree_db_core::Sid;
 
     #[test]
@@ -675,7 +676,7 @@ mod tests {
         // EXISTS { ?z :p ?w } where batch schema is [?x, ?y]
         let patterns = vec![Pattern::Triple(TriplePattern::new(
             Ref::Var(VarId(10)),
-            Ref::Sid(Sid::new(100, "p")),
+            Ref::Sid(Sid::new(NsCode(100), "p")),
             Term::Var(VarId(11)),
         ))];
         let schema = &[VarId(0), VarId(1)];
@@ -687,7 +688,7 @@ mod tests {
         // EXISTS { ?x :p ?w } where batch schema is [?x, ?y]
         let patterns = vec![Pattern::Triple(TriplePattern::new(
             Ref::Var(VarId(0)), // shared with schema
-            Ref::Sid(Sid::new(100, "p")),
+            Ref::Sid(Sid::new(NsCode(100), "p")),
             Term::Var(VarId(11)),
         ))];
         let schema = &[VarId(0), VarId(1)];

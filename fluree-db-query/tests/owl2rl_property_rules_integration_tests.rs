@@ -12,7 +12,7 @@ use fluree_db_core::flake::Flake;
 use fluree_db_core::overlay::OverlayProvider;
 use fluree_db_core::range::{range_with_overlay, RangeMatch, RangeOptions, RangeTest};
 use fluree_db_core::value::FlakeValue;
-use fluree_db_core::{GraphDbRef, GraphId, LedgerSnapshot, Sid};
+use fluree_db_core::{GraphDbRef, GraphId, LedgerSnapshot, NsCode, Sid};
 use fluree_db_query::binding::{Binding, RowAccess};
 use fluree_db_query::execute::{execute, ContextConfig, ExecutableQuery};
 use fluree_db_query::ir::ReasoningConfig;
@@ -133,23 +133,23 @@ impl OverlayProvider for SortedOverlay {
 }
 
 fn ref_dt() -> Sid {
-    Sid::new(1, "id")
+    Sid::new(NsCode(1), "id")
 }
 
 fn sid_ex(local: &str) -> Sid {
-    Sid::new(100, local)
+    Sid::new(NsCode(100), local)
 }
 
 fn sid_rdf(local: &str) -> Sid {
-    Sid::new(3, local)
+    Sid::new(NsCode(3), local)
 }
 
 fn sid_rdfs(local: &str) -> Sid {
-    Sid::new(4, local)
+    Sid::new(NsCode(4), local)
 }
 
 fn sid_owl(local: &str) -> Sid {
-    Sid::new(6, local)
+    Sid::new(NsCode(6), local)
 }
 
 fn flake_ref(s: Sid, p: Sid, o: Sid, t: i64) -> Flake {
@@ -161,7 +161,7 @@ fn flake_str(s: Sid, p: Sid, o: &str, t: i64) -> Flake {
         s,
         p,
         FlakeValue::String(o.into()),
-        Sid::new(2, "string"),
+        Sid::new(NsCode(2), "string"),
         t,
         true,
         None,

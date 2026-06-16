@@ -594,7 +594,7 @@ async fn revert_records_reverted_commit_ids_in_txn_meta() {
         .txn_meta
         .iter()
         .filter(|e| {
-            e.predicate_ns == fluree_vocab::namespaces::FLUREE_DB
+            e.predicate_ns == fluree_vocab::namespaces::FLUREE_DB.as_u16()
                 && e.predicate_name == fluree_vocab::db::REVERTS
         })
         .map(|e| &e.value)

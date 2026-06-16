@@ -21,7 +21,7 @@
 //! with existing databases. User-supplied namespaces start at `USER_START`.
 
 use fluree_db_core::ns_encoding::{canonical_split, NamespaceCodes, NsAllocError, NsSplitMode};
-use fluree_db_core::{LedgerSnapshot, Sid};
+use fluree_db_core::{LedgerSnapshot, NsCode, Sid};
 use fluree_vocab::namespaces::{BLANK_NODE, OVERFLOW, USER_START};
 use parking_lot::RwLock;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -31,7 +31,7 @@ use std::sync::Arc;
 
 /// First code available for user-defined namespaces.
 /// Re-exported from `fluree_vocab::namespaces::USER_START`.
-pub const USER_NS_START: u16 = USER_START;
+pub const USER_NS_START: u16 = USER_START.as_u16();
 
 /// Blank node prefix (standard RDF blank node syntax)
 pub const BLANK_NODE_PREFIX: &str = "_:";
@@ -131,27 +131,27 @@ impl NamespaceRegistry {
     /// `Sid(OVERFLOW, full_iri)` which is lossy but not a crash.
     pub fn get_or_allocate(&mut self, prefix: &str) -> u16 {
         match self.codes.allocate_prefix(prefix) {
-            Ok(code) => code,
-            Err(NsAllocError::Overflow) => OVERFLOW,
+            Ok(code) => code.as_u16(),
+            Err(NsAllocError::Overflow) => OVERFLOW.as_u16(),
             Err(e @ (NsAllocError::CodeConflict { .. } | NsAllocError::PrefixConflict { .. })) => {
                 tracing::error!(
                     error = %e,
                     "namespace bimap conflict — corrupted namespace state or invalid \
                      commit history; encoding IRI as OVERFLOW to avoid crash"
                 );
-                OVERFLOW
+                OVERFLOW.as_u16()
             }
         }
     }
 
     /// Get the namespace code for blank nodes.
     pub fn blank_node_code(&self) -> u16 {
-        BLANK_NODE
+        BLANK_NODE.as_u16()
     }
 
     /// Look up a code without allocating
     pub fn get_code(&self, prefix: &str) -> Option<u16> {
-        self.codes.get_code(prefix)
+        self.codes.get_code(prefix).map(NsCode::as_u16)
     }
 
     /// Look up the `Sid` for an IRI without allocating a fresh
@@ -171,7 +171,7 @@ impl NamespaceRegistry {
 
     /// Look up a prefix by code
     pub fn get_prefix(&self, code: u16) -> Option<&str> {
-        self.codes.get_prefix(code)
+        self.codes.get_prefix(NsCode::from_u16(code))
     }
 
     /// Check if a prefix is registered
@@ -218,11 +218,11 @@ impl NamespaceRegistry {
         let (prefix, suffix) = canonical_split(iri, self.split_mode);
 
         let code = self.get_or_allocate(prefix);
-        if code == OVERFLOW {
+        if code == OVERFLOW.as_u16() {
             // Overflow: store the full IRI as name, no prefix splitting
             Sid::new(OVERFLOW, iri)
         } else {
-            Sid::new(code, suffix)
+            Sid::new(NsCode::from_u16(code), suffix)
         }
     }
 
@@ -234,7 +234,7 @@ impl NamespaceRegistry {
     /// are ignored since they are pure sentinels and should never be registered.
     /// Returns `Err` on a namespace bimap conflict.
     pub fn ensure_code(&mut self, code: u16, prefix: &str) -> Result<(), NsAllocError> {
-        if code >= OVERFLOW {
+        if code >= OVERFLOW.as_u16() {
             return Ok(()); // OVERFLOW is a sentinel, never register it
         }
         let mut delta = HashMap::new();
@@ -339,23 +339,23 @@ impl SharedNamespaceAllocator {
         {
             let inner = self.inner.read();
             if let Some(code) = inner.get_code(prefix) {
-                return code;
+                return code.as_u16();
             }
         }
         // Slow path: write lock with double-check
         let mut inner = self.inner.write();
         if let Some(code) = inner.get_code(prefix) {
-            return code;
+            return code.as_u16();
         }
         match inner.allocate_prefix(prefix) {
-            Ok(code) => code,
-            Err(NsAllocError::Overflow) => OVERFLOW,
+            Ok(code) => code.as_u16(),
+            Err(NsAllocError::Overflow) => OVERFLOW.as_u16(),
             Err(e @ (NsAllocError::CodeConflict { .. } | NsAllocError::PrefixConflict { .. })) => {
                 tracing::error!(
                     error = %e,
                     "namespace bimap conflict — encoding IRI as OVERFLOW to avoid crash"
                 );
-                OVERFLOW
+                OVERFLOW.as_u16()
             }
         }
     }
@@ -364,10 +364,10 @@ impl SharedNamespaceAllocator {
     pub fn sid_for_iri(&self, iri: &str) -> Sid {
         let (prefix, suffix) = canonical_split(iri, self.split_mode());
         let code = self.get_or_allocate(prefix);
-        if code == OVERFLOW {
+        if code == OVERFLOW.as_u16() {
             Sid::new(OVERFLOW, iri)
         } else {
-            Sid::new(code, suffix)
+            Sid::new(NsCode::from_u16(code), suffix)
         }
     }
 
@@ -386,8 +386,8 @@ impl SharedNamespaceAllocator {
         let inner = self.inner.read();
         let mut result = HashMap::with_capacity(codes.len());
         for &code in codes {
-            debug_assert!(code < OVERFLOW, "OVERFLOW must never be published");
-            if let Some(prefix) = inner.get_prefix(code) {
+            debug_assert!(code < OVERFLOW.as_u16(), "OVERFLOW must never be published");
+            if let Some(prefix) = inner.get_prefix(NsCode::from_u16(code)) {
                 result.insert(code, prefix.to_string());
             } else {
                 // Should never happen — every code in the set was allocated
@@ -405,7 +405,7 @@ impl SharedNamespaceAllocator {
     pub fn get_prefix(&self, code: u16) -> Option<String> {
         self.inner
             .read()
-            .get_prefix(code)
+            .get_prefix(NsCode::from_u16(code))
             .map(std::string::ToString::to_string)
     }
 
@@ -487,10 +487,10 @@ impl WorkerCache {
         let (prefix, suffix) = canonical_split(iri, self.split_mode);
 
         let code = self.get_or_allocate(prefix);
-        if code == OVERFLOW {
+        if code == OVERFLOW.as_u16() {
             Sid::new(OVERFLOW, iri)
         } else {
-            Sid::new(code, suffix)
+            Sid::new(NsCode::from_u16(code), suffix)
         }
     }
 
@@ -506,7 +506,7 @@ impl WorkerCache {
         let code = self.alloc.get_or_allocate(prefix);
 
         // Update local state
-        if code < OVERFLOW {
+        if code < OVERFLOW.as_u16() {
             self.local_codes.insert(prefix.to_string(), code);
             self.track_code(code);
         }
@@ -530,7 +530,7 @@ impl WorkerCache {
     /// after our snapshot.
     #[inline]
     fn track_code(&mut self, code: u16) {
-        if code >= self.snapshot_next_code && code < OVERFLOW {
+        if code >= self.snapshot_next_code && code < OVERFLOW.as_u16() {
             self.new_codes.insert(code);
         }
     }
@@ -601,18 +601,18 @@ mod tests {
         let registry = NamespaceRegistry::new();
 
         // Check predefined codes are present
-        assert_eq!(registry.get_code(""), Some(EMPTY));
-        assert_eq!(registry.get_code("@"), Some(JSON_LD));
+        assert_eq!(registry.get_code(""), Some(EMPTY.as_u16()));
+        assert_eq!(registry.get_code("@"), Some(JSON_LD.as_u16()));
         assert_eq!(
             registry.get_code("http://www.w3.org/2001/XMLSchema#"),
-            Some(XSD)
+            Some(XSD.as_u16())
         );
-        assert_eq!(registry.get_code("_:"), Some(BLANK_NODE));
+        assert_eq!(registry.get_code("_:"), Some(BLANK_NODE.as_u16()));
 
         // Check reverse lookup
-        assert_eq!(registry.get_prefix(BLANK_NODE), Some("_:"));
+        assert_eq!(registry.get_prefix(BLANK_NODE.as_u16()), Some("_:"));
         assert_eq!(
-            registry.get_prefix(XSD),
+            registry.get_prefix(XSD.as_u16()),
             Some("http://www.w3.org/2001/XMLSchema#")
         );
     }
@@ -620,7 +620,7 @@ mod tests {
     #[test]
     fn test_blank_node_code_is_fixed() {
         let registry = NamespaceRegistry::new();
-        assert_eq!(registry.blank_node_code(), BLANK_NODE);
+        assert_eq!(registry.blank_node_code(), BLANK_NODE.as_u16());
     }
 
     #[test]
@@ -789,8 +789,10 @@ mod tests {
         }
 
         // Different threads have different host prefixes → different codes.
-        let codes: std::collections::HashSet<u16> =
-            all_sids.iter().map(|sids| sids[0].namespace_code).collect();
+        let codes: std::collections::HashSet<u16> = all_sids
+            .iter()
+            .map(|sids| sids[0].namespace_code.as_u16())
+            .collect();
         assert_eq!(
             codes.len(),
             8,

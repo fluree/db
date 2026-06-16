@@ -785,6 +785,7 @@ fn extract_cardinality_value(value: &FlakeValue) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fluree_db_core::NsCode;
 
     #[test]
     fn test_restriction_index_empty() {
@@ -795,9 +796,9 @@ mod tests {
 
     #[test]
     fn test_restriction_value_equality() {
-        let sid1 = Sid::new(100, "test1");
-        let sid2 = Sid::new(100, "test1");
-        let sid3 = Sid::new(100, "test2");
+        let sid1 = Sid::new(NsCode(100), "test1");
+        let sid2 = Sid::new(NsCode(100), "test1");
+        let sid3 = Sid::new(NsCode(100), "test2");
 
         let rv1 = RestrictionValue::Ref(sid1);
         let rv2 = RestrictionValue::Ref(sid2);
@@ -809,7 +810,7 @@ mod tests {
 
     #[test]
     fn test_class_ref() {
-        let sid = Sid::new(100, "MyClass");
+        let sid = Sid::new(NsCode(100), "MyClass");
         let class_ref = ClassRef::Named(sid.clone());
 
         if let ClassRef::Named(s) = class_ref {

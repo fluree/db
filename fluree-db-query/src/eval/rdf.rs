@@ -171,7 +171,7 @@ fn fast_same_term_encoded_ids<R: RowAccess>(
                 };
                 let rhs_s_id_opt = match other {
                     ComparableValue::Sid(sid) => store
-                        .find_subject_id_by_parts(sid.namespace_code, sid.name.as_ref())
+                        .find_subject_id_by_parts(sid.namespace_code.as_u16(), sid.name.as_ref())
                         .map_err(|e| QueryError::Internal(format!("find_subject_id: {e}")))?,
                     ComparableValue::Iri(iri) => store
                         .find_subject_id(iri.as_ref())
@@ -296,6 +296,7 @@ mod tests {
     use crate::binding::Batch;
     use crate::var_registry::VarId;
     use fluree_db_core::value::FlakeValue;
+    use fluree_db_core::NsCode;
     use fluree_db_core::Sid;
 
     #[test]
@@ -321,7 +322,7 @@ mod tests {
     fn eval_iri_sid_passthrough() {
         // IRI() of a Sid should return the Sid unchanged
         let schema: Arc<[VarId]> = Arc::from(vec![VarId(0)].into_boxed_slice());
-        let sid = Sid::new(100, "x");
+        let sid = Sid::new(NsCode(100), "x");
         let col = vec![Binding::sid(sid.clone())];
         let batch = Batch::new(schema, vec![col]).unwrap();
         let row = batch.row_view(0).unwrap();

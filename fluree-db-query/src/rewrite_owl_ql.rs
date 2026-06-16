@@ -885,6 +885,7 @@ mod tests {
     use super::*;
     use crate::ir::triple::Ref;
     use crate::rewrite::{EntailmentMode, PlanLimits};
+    use fluree_db_core::NsCode;
     use fluree_db_core::SidInterner;
     use fluree_vocab::namespaces::RDF;
 
@@ -896,16 +897,16 @@ mod tests {
         let interner = SidInterner::new();
 
         // hasFriend inverseOf hasFriendOf
-        let has_friend = interner.intern(100, "hasFriend");
-        let has_friend_of = interner.intern(100, "hasFriendOf");
+        let has_friend = interner.intern(NsCode(100), "hasFriend");
+        let has_friend_of = interner.intern(NsCode(100), "hasFriendOf");
 
         // worksAt has domain Person
-        let works_at = interner.intern(100, "worksAt");
-        let person = interner.intern(100, "Person");
+        let works_at = interner.intern(NsCode(100), "worksAt");
+        let person = interner.intern(NsCode(100), "Person");
 
         // locatedIn has range Location
-        let located_in = interner.intern(100, "locatedIn");
-        let location = interner.intern(100, "Location");
+        let located_in = interner.intern(NsCode(100), "locatedIn");
+        let location = interner.intern(NsCode(100), "Location");
 
         let mut inverse_of = HashMap::new();
         inverse_of.insert(has_friend.clone(), vec![has_friend_of.clone()]);
@@ -934,7 +935,7 @@ mod tests {
     #[test]
     fn test_empty_ontology_no_hydration() {
         let interner = SidInterner::new();
-        let has_friend = interner.intern(100, "hasFriend");
+        let has_friend = interner.intern(NsCode(100), "hasFriend");
 
         let pattern = Pattern::Triple(TriplePattern::new(
             Ref::Var(VarId(0)),
@@ -953,7 +954,7 @@ mod tests {
     #[test]
     fn test_inverse_of_hydration() {
         let interner = SidInterner::new();
-        let has_friend = interner.intern(100, "hasFriend");
+        let has_friend = interner.intern(NsCode(100), "hasFriend");
 
         let pattern = Pattern::Triple(TriplePattern::new(
             Ref::Var(VarId(0)),
@@ -980,7 +981,7 @@ mod tests {
     #[test]
     fn test_no_inverse_expansion_for_unknown_property() {
         let interner = SidInterner::new();
-        let unknown_prop = interner.intern(100, "unknownProp");
+        let unknown_prop = interner.intern(NsCode(100), "unknownProp");
 
         let pattern = Pattern::Triple(TriplePattern::new(
             Ref::Var(VarId(0)),
@@ -999,7 +1000,7 @@ mod tests {
     #[test]
     fn test_domain_type_query_hydration() {
         let interner = SidInterner::new();
-        let person = interner.intern(100, "Person");
+        let person = interner.intern(NsCode(100), "Person");
 
         // Query: ?s rdf:type Person
         let pattern = Pattern::Triple(TriplePattern::new(
@@ -1025,7 +1026,7 @@ mod tests {
     #[test]
     fn test_range_type_query_hydration() {
         let interner = SidInterner::new();
-        let location = interner.intern(100, "Location");
+        let location = interner.intern(NsCode(100), "Location");
 
         // Query: ?s rdf:type Location
         let pattern = Pattern::Triple(TriplePattern::new(
@@ -1051,7 +1052,7 @@ mod tests {
     #[test]
     fn test_no_type_expansion_for_unknown_class() {
         let interner = SidInterner::new();
-        let unknown_class = interner.intern(100, "UnknownClass");
+        let unknown_class = interner.intern(NsCode(100), "UnknownClass");
 
         let pattern = Pattern::Triple(TriplePattern::new(
             Ref::Var(VarId(0)),
@@ -1070,7 +1071,7 @@ mod tests {
     #[test]
     fn test_no_expansion_without_ontology() {
         let interner = SidInterner::new();
-        let has_friend = interner.intern(100, "hasFriend");
+        let has_friend = interner.intern(NsCode(100), "hasFriend");
 
         let pattern = Pattern::Triple(TriplePattern::new(
             Ref::Var(VarId(0)),
@@ -1101,7 +1102,7 @@ mod tests {
     #[test]
     fn test_nested_pattern_hydration() {
         let interner = SidInterner::new();
-        let has_friend = interner.intern(100, "hasFriend");
+        let has_friend = interner.intern(NsCode(100), "hasFriend");
 
         let inner_pattern = Pattern::Triple(TriplePattern::new(
             Ref::Var(VarId(0)),

@@ -438,6 +438,7 @@ pub fn execute_rule_with_bindings(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fluree_db_core::NsCode;
 
     #[test]
     fn test_rule_term_var() {
@@ -448,7 +449,7 @@ mod tests {
 
     #[test]
     fn test_rule_term_sid() {
-        let sid = Sid::new(100, "Person");
+        let sid = Sid::new(NsCode(100), "Person");
         let term = RuleTerm::sid(sid.clone());
         assert!(!term.is_var());
         assert_eq!(term.var_name(), None);
@@ -457,15 +458,15 @@ mod tests {
     #[test]
     fn test_datalog_rule_variables() {
         let rule = DatalogRule::new(
-            Sid::new(1, "rule1"),
+            Sid::new(NsCode(1), "rule1"),
             vec![RuleTriplePattern {
                 subject: RuleTerm::var("?person"),
-                predicate: RuleTerm::sid(Sid::new(100, "type")),
+                predicate: RuleTerm::sid(Sid::new(NsCode(100), "type")),
                 object: RuleTerm::var("?type"),
             }],
             vec![RuleTriplePattern {
                 subject: RuleTerm::var("?person"),
-                predicate: RuleTerm::sid(Sid::new(100, "derived")),
+                predicate: RuleTerm::sid(Sid::new(NsCode(100), "derived")),
                 object: RuleTerm::var("?type"),
             }],
         );
@@ -481,7 +482,7 @@ mod tests {
         let mut rule_set = DatalogRuleSet::new();
         assert!(rule_set.is_empty());
 
-        let rule = DatalogRule::new(Sid::new(1, "rule1"), vec![], vec![]);
+        let rule = DatalogRule::new(Sid::new(NsCode(1), "rule1"), vec![], vec![]);
         rule_set.add_rule(rule);
 
         assert_eq!(rule_set.len(), 1);

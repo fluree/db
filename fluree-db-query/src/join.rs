@@ -1292,13 +1292,13 @@ impl Operator for NestedLoopJoinOperator {
                     match left_batch.get_by_col(left_row, left_col) {
                         Binding::EncodedSid { s_id, .. } => Some(*s_id),
                         Binding::Sid { sid, .. } => store.and_then(|s| {
-                            s.find_subject_id_by_parts(sid.namespace_code, &sid.name)
+                            s.find_subject_id_by_parts(sid.namespace_code.as_u16(), &sid.name)
                                 .ok()
                                 .flatten()
                         }),
                         Binding::IriMatch { primary_sid, .. } => store.and_then(|s| {
                             s.find_subject_id_by_parts(
-                                primary_sid.namespace_code,
+                                primary_sid.namespace_code.as_u16(),
                                 &primary_sid.name,
                             )
                             .ok()
@@ -3223,6 +3223,7 @@ pub(crate) fn batched_subject_star_spot(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fluree_db_core::NsCode;
     use fluree_db_core::Sid;
 
     #[test]
@@ -3233,7 +3234,7 @@ mod tests {
         // Right pattern: ?s :age ?age (shares ?s with left)
         let _right_pattern = TriplePattern::new(
             Ref::Var(VarId(0)), // ?s - shared
-            Ref::Sid(Sid::new(100, "age")),
+            Ref::Sid(Sid::new(NsCode(100), "age")),
             Term::Var(VarId(2)), // ?age - new
         );
 
@@ -3259,7 +3260,7 @@ mod tests {
         let left_schema: Arc<[VarId]> = Arc::from(vec![VarId(0)].into_boxed_slice());
         let right_pattern = TriplePattern::new(
             Ref::Var(VarId(0)), // ?s - shared
-            Ref::Sid(Sid::new(100, "name")),
+            Ref::Sid(Sid::new(NsCode(100), "name")),
             Term::Var(VarId(1)), // ?name - new
         );
 
@@ -3291,7 +3292,7 @@ mod tests {
         let left_schema: Arc<[VarId]> = Arc::from(vec![VarId(0)].into_boxed_slice());
         let right_pattern = TriplePattern::new(
             Ref::Var(VarId(0)),
-            Ref::Sid(Sid::new(100, "date")),
+            Ref::Sid(Sid::new(NsCode(100), "date")),
             Term::Var(VarId(1)),
         );
 
@@ -3317,7 +3318,7 @@ mod tests {
         let left_schema: Arc<[VarId]> = Arc::from(vec![VarId(0), VarId(1)].into_boxed_slice());
         let right_pattern = TriplePattern::new(
             Ref::Var(VarId(0)), // ?s at right position 0
-            Ref::Sid(Sid::new(100, "age")),
+            Ref::Sid(Sid::new(NsCode(100), "age")),
             Term::Var(VarId(2)), // ?age at right position 1
         );
 
@@ -3355,7 +3356,7 @@ mod tests {
         let left_schema: Arc<[VarId]> = Arc::from(vec![VarId(0), VarId(1)].into_boxed_slice());
         let right_pattern = TriplePattern::new(
             Ref::Var(VarId(0)),
-            Ref::Sid(Sid::new(100, "age")),
+            Ref::Sid(Sid::new(NsCode(100), "age")),
             Term::Var(VarId(2)),
         );
 
@@ -3390,7 +3391,7 @@ mod tests {
             vec![Binding::Poisoned],
             vec![Binding::lit(
                 FlakeValue::String("Alice".to_string()),
-                Sid::new(2, "string"),
+                Sid::new(NsCode(2), "string"),
             )],
         ];
         let batch_poisoned = Batch::new(left_schema.clone(), columns_poisoned).unwrap();
@@ -3400,10 +3401,10 @@ mod tests {
 
         // Create a batch with one row that has NO Poisoned bindings
         let columns_normal = vec![
-            vec![Binding::sid(Sid::new(1, "alice"))],
+            vec![Binding::sid(Sid::new(NsCode(1), "alice"))],
             vec![Binding::lit(
                 FlakeValue::String("Alice".to_string()),
-                Sid::new(2, "string"),
+                Sid::new(NsCode(2), "string"),
             )],
         ];
         let batch_normal = Batch::new(left_schema.clone(), columns_normal).unwrap();
@@ -3413,7 +3414,7 @@ mod tests {
 
         // Create a batch where Poisoned is in position 1 (NOT used for binding)
         let columns_poisoned_unused = vec![
-            vec![Binding::sid(Sid::new(1, "alice"))],
+            vec![Binding::sid(Sid::new(NsCode(1), "alice"))],
             vec![Binding::Poisoned], // This is in position 1, not used for binding ?s
         ];
         let batch_poisoned_unused = Batch::new(left_schema, columns_poisoned_unused).unwrap();
@@ -3446,8 +3447,11 @@ mod tests {
         // Left schema: [?v]
         let left_schema: Arc<[VarId]> = Arc::from(vec![v].into_boxed_slice());
         // Right pattern: ?x p ?v (shared ?v at Object position)
-        let right_pattern =
-            TriplePattern::new(Ref::Var(x), Ref::Sid(Sid::new(100, "p")), Term::Var(v));
+        let right_pattern = TriplePattern::new(
+            Ref::Var(x),
+            Ref::Sid(Sid::new(NsCode(100), "p")),
+            Term::Var(v),
+        );
 
         // Mock left operator (unused; we inject batches directly into join state).
         struct MockOp;
@@ -3484,7 +3488,10 @@ mod tests {
         // Left batch: ?v = 1
         let left_batch = Batch::new(
             left_schema,
-            vec![vec![Binding::lit(FlakeValue::Long(1), Sid::new(2, "long"))]],
+            vec![vec![Binding::lit(
+                FlakeValue::Long(1),
+                Sid::new(NsCode(2), "long"),
+            )]],
         )
         .unwrap();
 
@@ -3495,7 +3502,7 @@ mod tests {
             right_schema,
             vec![vec![Binding::lit(
                 FlakeValue::Long(10),
-                Sid::new(2, "long"),
+                Sid::new(NsCode(2), "long"),
             )]],
         )
         .unwrap();
@@ -3521,7 +3528,7 @@ mod tests {
         let left_schema: Arc<[VarId]> = Arc::from(vec![VarId(0)].into_boxed_slice());
         let right_pattern = TriplePattern::new(
             Ref::Var(VarId(0)),
-            Ref::Sid(Sid::new(100, "name")),
+            Ref::Sid(Sid::new(NsCode(100), "name")),
             Term::Var(VarId(1)),
         );
 
@@ -3570,8 +3577,8 @@ mod tests {
         let left_schema: Arc<[VarId]> = Arc::from(vec![VarId(0)].into_boxed_slice());
         let right_pattern = TriplePattern::new(
             Ref::Var(VarId(0)),
-            Ref::Sid(Sid::new(100, "type")),
-            Term::Sid(Sid::new(101, "Person")),
+            Ref::Sid(Sid::new(NsCode(100), "type")),
+            Term::Sid(Sid::new(NsCode(101), "Person")),
         );
 
         struct MockOp;
@@ -3616,7 +3623,7 @@ mod tests {
         let left_schema: Arc<[VarId]> = Arc::from(vec![VarId(0)].into_boxed_slice());
         let right_pattern = TriplePattern::new(
             Ref::Var(VarId(0)),
-            Ref::Sid(Sid::new(100, "name")),
+            Ref::Sid(Sid::new(NsCode(100), "name")),
             Term::Var(VarId(1)),
         );
 
@@ -3689,8 +3696,11 @@ mod tests {
         let left_schema: Arc<[VarId]> = Arc::from(vec![s].into_boxed_slice());
         // Right pattern: ?s p ?x with separate object ?y
         // Actually let's test: ?x p ?y where neither is in left schema
-        let right_pattern =
-            TriplePattern::new(Ref::Var(x), Ref::Sid(Sid::new(100, "p")), Term::Var(y));
+        let right_pattern = TriplePattern::new(
+            Ref::Var(x),
+            Ref::Sid(Sid::new(NsCode(100), "p")),
+            Term::Var(y),
+        );
 
         struct MockOp;
         #[async_trait]
@@ -3723,7 +3733,7 @@ mod tests {
         // Left batch: ?s = some:subject (a Sid)
         let left_batch = Batch::new(
             left_schema,
-            vec![vec![Binding::sid(Sid::new(1, "some:subject"))]],
+            vec![vec![Binding::sid(Sid::new(NsCode(1), "some:subject"))]],
         )
         .unwrap();
 
@@ -3732,8 +3742,11 @@ mod tests {
         let right_batch = Batch::new(
             right_schema,
             vec![
-                vec![Binding::sid(Sid::new(1, "some:other"))],
-                vec![Binding::lit(FlakeValue::Long(42), Sid::new(2, "long"))],
+                vec![Binding::sid(Sid::new(NsCode(1), "some:other"))],
+                vec![Binding::lit(
+                    FlakeValue::Long(42),
+                    Sid::new(NsCode(2), "long"),
+                )],
             ],
         )
         .unwrap();

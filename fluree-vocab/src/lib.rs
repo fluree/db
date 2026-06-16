@@ -1401,6 +1401,60 @@ pub mod fluree {
     pub const COMMIT_THIS_SCHEME: &str = "fluree:commit:this";
 }
 
+/// A namespace code (`u16`): a compact handle for a namespace prefix, valid
+/// only relative to the namespace table that issued it.
+///
+/// A newtype (not an alias) so namespace codes cannot be cross-assigned with
+/// the system's other pervasive `u16` ID spaces (graph ids, language ids,
+/// datatype dict ids — all formerly bare `u16`). `#[repr(transparent)]` +
+/// `Copy`: wrapping costs nothing at runtime.
+///
+/// ## Spaces (caveat)
+///
+/// The *same* `u16` denotes different prefixes in different tables: a
+/// `LedgerSnapshot`'s namespace table ("snapshot space") and a
+/// `BinaryIndexStore`'s table ("store space") allocate user codes
+/// (`>= USER_START`) independently, so they diverge once a commit introduces a
+/// namespace after the index was built. Reserved codes (`0..USER_START`) are
+/// identical in every table. This type does **not** yet distinguish the two
+/// spaces — never use a code from one table against another without decoding
+/// to an IRI and re-encoding. (Space typing at the binary-scan boundary is a
+/// separate, follow-up step.)
+///
+/// Wire formats store the raw `u16` via [`as_u16`](NsCode::as_u16) /
+/// [`from_u16`](NsCode::from_u16) at the codec boundary; in-memory structs
+/// carry `NsCode`.
+#[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug, Default)]
+#[repr(transparent)]
+pub struct NsCode(pub u16);
+
+impl NsCode {
+    /// The raw `u16`. Use **only** at wire / path / key / dict-key boundaries
+    /// that persist or hash the code; in-memory code should keep the `NsCode`.
+    #[inline]
+    pub const fn as_u16(self) -> u16 {
+        self.0
+    }
+
+    /// Wrap a raw `u16` (e.g. decoded from a wire format).
+    #[inline]
+    pub const fn from_u16(v: u16) -> Self {
+        Self(v)
+    }
+
+    /// For indexing per-namespace tables.
+    #[inline]
+    pub fn as_usize(self) -> usize {
+        self.0 as usize
+    }
+}
+
+impl std::fmt::Display for NsCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "NsCode({})", self.0)
+    }
+}
+
 /// Namespace codes for IRI encoding
 ///
 /// Codes 0 through `USER_START - 1` are reserved for built-in namespaces.
@@ -1408,51 +1462,53 @@ pub mod fluree {
 /// Code `OVERFLOW` (0xFFFF) is reserved for IRIs whose namespace could not
 /// be assigned a code (full IRI stored as the SID name).
 pub mod namespaces {
+    use super::NsCode;
+
     /// Code 0: empty / relative IRI prefix (@base resolution)
-    pub const EMPTY: u16 = 0;
+    pub const EMPTY: NsCode = NsCode(0);
 
     /// Code 1: JSON-LD keywords / internal "@" namespace
-    pub const JSON_LD: u16 = 1;
+    pub const JSON_LD: NsCode = NsCode(1);
 
     /// Code 2: XSD datatypes
-    pub const XSD: u16 = 2;
+    pub const XSD: NsCode = NsCode(2);
 
     /// Code 3: RDF
-    pub const RDF: u16 = 3;
+    pub const RDF: NsCode = NsCode(3);
 
     /// Code 4: RDFS
-    pub const RDFS: u16 = 4;
+    pub const RDFS: NsCode = NsCode(4);
 
     /// Code 5: SHACL
-    pub const SHACL: u16 = 5;
+    pub const SHACL: NsCode = NsCode(5);
 
     /// Code 6: OWL
-    pub const OWL: u16 = 6;
+    pub const OWL: NsCode = NsCode(6);
 
     /// Code 7: Fluree DB system namespace (https://ns.flur.ee/db#)
-    pub const FLUREE_DB: u16 = 7;
+    pub const FLUREE_DB: NsCode = NsCode(7);
 
     /// Code 8: DID key prefix
-    pub const DID_KEY: u16 = 8;
+    pub const DID_KEY: NsCode = NsCode(8);
 
     /// Code 9: Fluree commit content address prefix
-    pub const FLUREE_COMMIT: u16 = 9;
+    pub const FLUREE_COMMIT: NsCode = NsCode(9);
 
     /// Code 10: blank nodes (_:)
-    pub const BLANK_NODE: u16 = 10;
+    pub const BLANK_NODE: NsCode = NsCode(10);
 
     /// Code 11: OGC GeoSPARQL namespace (geo:)
-    pub const OGC_GEO: u16 = 11;
+    pub const OGC_GEO: NsCode = NsCode(11);
 
     /// Code 12: Fluree URN prefix (urn:fluree:) for ledger-scoped identifiers.
     ///
     /// Used for txn-meta graph IRIs: `urn:fluree:{ledger_id}#txn-meta`.
     /// `encode_iri` decomposes as `Sid::new(FLUREE_URN, "{ledger_id}#txn-meta")`.
-    pub const FLUREE_URN: u16 = 12;
+    pub const FLUREE_URN: NsCode = NsCode(12);
 
     /// First code available for user-defined namespaces.
     /// Built-in codes occupy 0..=12.
-    pub const USER_START: u16 = 13;
+    pub const USER_START: NsCode = NsCode(13);
 
     /// Overflow namespace code (0xFFFE).
     /// Assigned when all user codes are exhausted. The SID name stores the
@@ -1460,7 +1516,7 @@ pub mod namespaces {
     ///
     /// Note: 0xFFFF is reserved for `Sid::max()` sentinel, so overflow
     /// uses 0xFFFE.
-    pub const OVERFLOW: u16 = 0xFFFE;
+    pub const OVERFLOW: NsCode = NsCode(0xFFFE);
 }
 
 /// Common predicate local names (for schema extraction, validation, etc.)
@@ -2165,7 +2221,7 @@ pub mod datatype {
         ///
         /// `ns_code` is a Fluree namespace code (see `namespaces::XSD`, etc.);
         /// `local` is the trailing local-name portion of the IRI.
-        pub fn from_ns_and_local(ns_code: u16, local: &str) -> Option<Self> {
+        pub fn from_ns_and_local(ns_code: super::NsCode, local: &str) -> Option<Self> {
             use super::namespaces;
             match ns_code {
                 namespaces::XSD => Self::from_xsd_local(local),

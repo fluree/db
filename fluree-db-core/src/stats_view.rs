@@ -7,6 +7,7 @@ use crate::ids::{GraphId, RuntimePredicateId};
 use crate::index_stats::IndexStats;
 use crate::sid::Sid;
 use crate::value_id::ValueTypeTag;
+use fluree_vocab::NsCode;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -127,7 +128,7 @@ impl StatsView {
         if let Some(ref props) = stats.properties {
             for entry in props {
                 // entry.sid is (namespace_code, name) - directly usable
-                let sid = Sid::new(entry.sid.0, &entry.sid.1);
+                let sid = Sid::new(NsCode::from_u16(entry.sid.0), &entry.sid.1);
                 view.properties.insert(
                     sid.clone(),
                     PropertyStatData {
@@ -192,7 +193,7 @@ impl StatsView {
         // Derive IRI-keyed property stats.
         // If a SID's namespace code is missing, skip it.
         for (sid, data) in &view.properties {
-            if let Some(prefix) = namespace_codes.get(&sid.namespace_code) {
+            if let Some(prefix) = namespace_codes.get(&sid.namespace_code.as_u16()) {
                 let iri: Arc<str> = Arc::from(format!("{}{}", prefix, sid.name));
                 view.properties_by_iri.insert(iri, *data);
             }
@@ -200,7 +201,7 @@ impl StatsView {
 
         // Derive IRI-keyed class stats.
         for (sid, count) in &view.classes {
-            if let Some(prefix) = namespace_codes.get(&sid.namespace_code) {
+            if let Some(prefix) = namespace_codes.get(&sid.namespace_code.as_u16()) {
                 let iri: Arc<str> = Arc::from(format!("{}{}", prefix, sid.name));
                 view.classes_by_iri.insert(iri, *count);
             }
@@ -208,7 +209,7 @@ impl StatsView {
 
         // Derive IRI-keyed ref-only flags.
         for (sid, ref_only) in &view.property_ref_only {
-            if let Some(prefix) = namespace_codes.get(&sid.namespace_code) {
+            if let Some(prefix) = namespace_codes.get(&sid.namespace_code.as_u16()) {
                 let iri: Arc<str> = Arc::from(format!("{}{}", prefix, sid.name));
                 view.property_ref_only_by_iri.insert(iri, *ref_only);
             }
@@ -325,7 +326,7 @@ mod tests {
         let view = StatsView::from_db_stats(&stats);
         assert!(view.has_property_stats());
 
-        let sid = Sid::new(1, "name");
+        let sid = Sid::new(NsCode(1), "name");
         let prop = view.get_property(&sid).unwrap();
         assert_eq!(prop.count, 50);
         assert_eq!(prop.ndv_values, 40);
@@ -334,7 +335,7 @@ mod tests {
 
     #[test]
     fn test_class_lookup() {
-        let class_sid = Sid::new(2, "Person");
+        let class_sid = Sid::new(NsCode(2), "Person");
         let stats = IndexStats {
             flakes: 100,
             size: 1000,

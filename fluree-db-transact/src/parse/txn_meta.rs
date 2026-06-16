@@ -59,7 +59,7 @@ use serde_json::Value;
 /// Why check by namespace code (not IRI string): the code is already resolved
 /// at the call site, comparison is O(1), and it's immune to IRI encoding
 /// tricks (percent-encoding, alternate prefixes, etc.).
-const RESERVED_PREDICATE_NAMESPACES: &[u16] = &[FLUREE_COMMIT, FLUREE_URN];
+const RESERVED_PREDICATE_NAMESPACES: &[u16] = &[FLUREE_COMMIT.as_u16(), FLUREE_URN.as_u16()];
 
 /// Local names in the `FLUREE_DB` namespace that users *may* set as txn-meta.
 ///
@@ -185,7 +185,7 @@ fn extract_one_entry(
     let (expanded_iri, _) = details_with_policy(key, context, strict)?;
 
     let sid = ns_registry.sid_for_iri(&expanded_iri);
-    let predicate_ns = sid.namespace_code;
+    let predicate_ns = sid.namespace_code.as_u16();
     let predicate_name = sid.name.to_string();
 
     if RESERVED_PREDICATE_NAMESPACES.contains(&predicate_ns) {
@@ -194,7 +194,9 @@ fn extract_one_entry(
         )));
     }
 
-    if predicate_ns == FLUREE_DB && !FLUREE_DB_USER_ALLOWED.contains(&predicate_name.as_str()) {
+    if predicate_ns == FLUREE_DB.as_u16()
+        && !FLUREE_DB_USER_ALLOWED.contains(&predicate_name.as_str())
+    {
         return Err(TransactError::Parse(format!(
             "txn-meta predicate '{key}' (expanded: '{expanded_iri}') uses Fluree-reserved namespace and would collide with system provenance; only f:message and f:author are user-settable"
         )));
@@ -285,7 +287,7 @@ fn json_to_single_txn_meta_value(
                 let (expanded, _) = details_with_policy(id_str, context, strict)?;
                 let sid = ns_registry.sid_for_iri(&expanded);
                 return Ok(TxnMetaValue::Ref {
-                    ns: sid.namespace_code,
+                    ns: sid.namespace_code.as_u16(),
                     name: sid.name.to_string(),
                 });
             }
@@ -336,7 +338,7 @@ fn parse_value_object(
 
         return Ok(TxnMetaValue::TypedLiteral {
             value: value_str.to_string(),
-            dt_ns: dt_sid.namespace_code,
+            dt_ns: dt_sid.namespace_code.as_u16(),
             dt_name: dt_sid.name.to_string(),
         });
     }

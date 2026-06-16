@@ -2021,7 +2021,10 @@ pub async fn incremental_index(
                         // Try novelty subjects first.
                         if let Some(suffix) = new_subs.get(&(sid.ns_code(), sid.local_id())) {
                             resolve_class_sid_novelty_hits.fetch_add(1, Ordering::Relaxed);
-                            return fluree_db_core::Sid::new(sid.ns_code(), suffix.as_str());
+                            return fluree_db_core::Sid::new(
+                                fluree_db_core::NsCode::from_u16(sid.ns_code()),
+                                suffix.as_str(),
+                            );
                         }
                         // Try store resolution.
                         if let Some(s) = store {
@@ -2032,7 +2035,10 @@ pub async fn incremental_index(
                         }
                         // Fallback: ns_code + local_id (will be opaque but stable).
                         resolve_class_sid_fallbacks.fetch_add(1, Ordering::Relaxed);
-                        fluree_db_core::Sid::new(sid.ns_code(), sid.local_id().to_string())
+                        fluree_db_core::Sid::new(
+                            fluree_db_core::NsCode::from_u16(sid.ns_code()),
+                            sid.local_id().to_string(),
+                        )
                     };
 
                 let new_subject_suffix: std::collections::HashMap<(u16, u64), String> = novelty
@@ -2841,7 +2847,7 @@ pub async fn incremental_index(
                                 .flatten()
                                 .map(|entry| {
                                     (
-                                        entry.class_sid.namespace_code,
+                                        entry.class_sid.namespace_code.as_u16(),
                                         entry.class_sid.name.to_string(),
                                     )
                                 })
@@ -2865,7 +2871,7 @@ pub async fn incremental_index(
                                         .as_ref()
                                         .and_then(|s| {
                                             s.find_subject_id_by_parts(
-                                                entry.class_sid.namespace_code,
+                                                entry.class_sid.namespace_code.as_u16(),
                                                 &entry.class_sid.name,
                                             )
                                             .ok()
@@ -2923,7 +2929,7 @@ pub async fn incremental_index(
                         .iter()
                         .filter_map(|(&(_, class_sid64), entry)| {
                             if entry.class_sid.name.is_empty()
-                                && entry.class_sid.namespace_code == 0
+                                && entry.class_sid.namespace_code.as_u16() == 0
                             {
                                 None
                             } else {
@@ -3013,7 +3019,7 @@ pub async fn incremental_index(
                                     novelty
                                         .shared
                                         .ns_prefixes
-                                        .get(&pu.property_sid.namespace_code)
+                                        .get(&pu.property_sid.namespace_code.as_u16())
                                         .map(std::string::String::as_str)
                                         .unwrap_or(""),
                                     pu.property_sid.name
@@ -3046,7 +3052,7 @@ pub async fn incremental_index(
                                     novelty
                                         .shared
                                         .ns_prefixes
-                                        .get(&pu.property_sid.namespace_code)
+                                        .get(&pu.property_sid.namespace_code.as_u16())
                                         .map(std::string::String::as_str)
                                         .unwrap_or(""),
                                     pu.property_sid.name
@@ -3062,8 +3068,11 @@ pub async fn incremental_index(
                         for &cp_id in &prop_set {
                             let iri = novelty.shared.predicates.resolve(cp_id).unwrap_or("");
                             let p_sid = match trie.longest_match(iri) {
-                                Some((code, plen)) => fluree_db_core::Sid::new(code, &iri[plen..]),
-                                None => fluree_db_core::Sid::new(0, iri),
+                                Some((code, plen)) => fluree_db_core::Sid::new(
+                                    fluree_db_core::NsCode::from_u16(code),
+                                    &iri[plen..],
+                                ),
+                                None => fluree_db_core::Sid::new(fluree_db_core::NsCode(0), iri),
                             };
                             let base_pu = base_prop_by_pid.get(&cp_id).copied();
 
@@ -3139,12 +3148,15 @@ pub async fn incremental_index(
                                         {
                                             resolve_class_sid_novelty_hits
                                                 .fetch_add(1, Ordering::Relaxed);
-                                            fluree_db_core::Sid::new(sid.ns_code(), suffix.as_str())
+                                            fluree_db_core::Sid::new(
+                                                fluree_db_core::NsCode::from_u16(sid.ns_code()),
+                                                suffix.as_str(),
+                                            )
                                         } else {
                                             resolve_class_sid_fallbacks
                                                 .fetch_add(1, Ordering::Relaxed);
                                             fluree_db_core::Sid::new(
-                                                sid.ns_code(),
+                                                fluree_db_core::NsCode::from_u16(sid.ns_code()),
                                                 sid.local_id().to_string(),
                                             )
                                         };
@@ -3225,7 +3237,9 @@ pub async fn incremental_index(
                         }
                     }
                     // Resolve class SID if still placeholder.
-                    if entry.class_sid.name.is_empty() && entry.class_sid.namespace_code == 0 {
+                    if entry.class_sid.name.is_empty()
+                        && entry.class_sid.namespace_code.as_u16() == 0
+                    {
                         entry.class_sid = resolve_class_sid(
                             class_sid64,
                             store_opt.as_deref(),
@@ -3373,7 +3387,7 @@ pub async fn incremental_index(
                         let ns_code = sid.ns_code();
                         let local_id = sid.local_id();
                         if let Some(suffix) = new_subject_suffix.get(&(ns_code, local_id)) {
-                            return Some(Sid::new(ns_code, suffix));
+                            return Some(Sid::new(fluree_db_core::NsCode::from_u16(ns_code), suffix));
                         }
                         store
                             .resolve_subject_iri(sid64)
@@ -3410,7 +3424,7 @@ pub async fn incremental_index(
                             s_sid,
                             p_sid,
                             FlakeValue::Ref(o_sid),
-                            Sid::new(0, ""),
+                            Sid::new(fluree_db_core::NsCode(0), ""),
                             record.t as i64,
                             novelty.ops[i] != 0,
                             None,

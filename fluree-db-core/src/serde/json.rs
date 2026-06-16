@@ -8,6 +8,7 @@ use crate::value::FlakeValue;
 use bigdecimal::BigDecimal;
 use fluree_vocab::namespaces::{JSON_LD, RDF, XSD};
 use fluree_vocab::xsd_names;
+use fluree_vocab::NsCode;
 use num_bigint::BigInt;
 use serde::Deserialize;
 use std::str::FromStr;
@@ -90,7 +91,7 @@ pub fn deserialize_sid(value: &serde_json::Value) -> Result<Sid> {
                 .as_str()
                 .ok_or_else(|| Error::other("SID name must be string"))?
                 .to_string();
-            Ok(Sid::new(ns_code, name))
+            Ok(Sid::new(NsCode::from_u16(ns_code), name))
         }
         _ => Err(Error::other(format!(
             "SID must be [namespace_code, name] array, got {value:?}"
@@ -256,7 +257,7 @@ mod tests {
     fn test_deserialize_sid() {
         let json = serde_json::json!([42, "example"]);
         let sid = deserialize_sid(&json).unwrap();
-        assert_eq!(sid.namespace_code, 42);
+        assert_eq!(sid.namespace_code, NsCode(42));
         assert_eq!(sid.name.as_ref(), "example");
     }
 
@@ -275,7 +276,7 @@ mod tests {
         let raw: RawFlake = serde_json::from_value(json).unwrap();
         let flake = raw.to_flake().unwrap();
 
-        assert_eq!(flake.s.namespace_code, 1);
+        assert_eq!(flake.s.namespace_code, NsCode(1));
         assert_eq!(flake.s.name.as_ref(), "alice");
         assert_eq!(flake.p.name.as_ref(), "name");
         assert!(matches!(flake.o, FlakeValue::String(ref s) if s == "Alice"));
@@ -344,7 +345,7 @@ mod tests {
         assert!(flake.is_ref());
         match &flake.o {
             FlakeValue::Ref(sid) => {
-                assert_eq!(sid.namespace_code, 1);
+                assert_eq!(sid.namespace_code, NsCode(1));
                 assert_eq!(sid.name.as_ref(), "bob");
             }
             _ => panic!("Expected Ref"),

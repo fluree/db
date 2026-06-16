@@ -94,7 +94,7 @@ pub fn eval_is_blank<R: RowAccess>(
                 }
                 Some(Binding::Iri(iri)) => iri.as_ref().starts_with("_:"),
                 Some(Binding::EncodedSid { s_id, .. }) => {
-                    SubjectId::from_u64(*s_id).ns_code() == namespaces::BLANK_NODE
+                    SubjectId::from_u64(*s_id).ns_code() == namespaces::BLANK_NODE.as_u16()
                 }
                 _ => false,
             };
@@ -111,6 +111,7 @@ mod tests {
     use super::*;
     use crate::binding::Batch;
     use crate::var_registry::VarId;
+    use fluree_db_core::NsCode;
     use fluree_db_core::{FlakeValue, Sid};
     use std::sync::Arc;
 
@@ -118,7 +119,7 @@ mod tests {
         let schema: Arc<[VarId]> = Arc::from(vec![VarId(0)].into_boxed_slice());
         let col = vec![Binding::lit(
             FlakeValue::String("Hello World".to_string()),
-            Sid::new(2, "string"),
+            Sid::new(NsCode(2), "string"),
         )];
         Batch::new(schema, vec![col]).unwrap()
     }
@@ -145,7 +146,7 @@ mod tests {
         //   "_:" prefix branch (Binding::Iri -> ComparableValue::Iri), which is how a
         //     scanned EncodedSid blank node resolves (BLANK_NODE ns prefix is "_:"):
         //     VarId(2): ordinary IRI string; VarId(3): "_:"-prefixed blank node.
-        let iri_sid = vec![Binding::sid(Sid::new(7, "Person"))];
+        let iri_sid = vec![Binding::sid(Sid::new(NsCode(7), "Person"))];
         let bnode_sid = vec![Binding::sid(Sid::new(namespaces::BLANK_NODE, "b0"))];
         let iri_str = vec![Binding::Iri(Arc::from("http://example.org/ns/Person"))];
         let bnode_str = vec![Binding::Iri(Arc::from("_:b0"))];

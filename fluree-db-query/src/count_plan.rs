@@ -1029,11 +1029,12 @@ mod tests {
     use crate::ir::AggregateFn;
     use crate::ir::{QueryOutput, ReasoningConfig};
     use crate::var_registry::VarRegistry;
+    use fluree_db_core::NsCode;
     use fluree_db_core::Sid;
     use fluree_graph_json_ld::ParsedContext;
 
     fn make_sid(id: u16, name: &str) -> Ref {
-        Ref::Sid(Sid::new(id, name))
+        Ref::Sid(Sid::new(NsCode(id), name))
     }
 
     fn make_query(patterns: Vec<Pattern>, out_var: VarId) -> Query {

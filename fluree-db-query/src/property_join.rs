@@ -620,7 +620,7 @@ impl Operator for PropertyJoinOperator {
             .iter()
             .map(|p| {
                 let name = match &p.pred_ref {
-                    Ref::Sid(sid) => format!("{}:{}", sid.namespace_code, sid.name),
+                    Ref::Sid(sid) => format!("{}:{}", sid.namespace_code.as_u16(), sid.name),
                     Ref::Iri(iri) => iri.to_string(),
                     Ref::Var(v) => format!("?v{}", v.0),
                 };
@@ -1057,18 +1057,19 @@ impl Operator for PropertyJoinOperator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fluree_db_core::NsCode;
     use fluree_db_core::Sid;
 
     fn make_property_join_patterns() -> Vec<TriplePattern> {
         vec![
             TriplePattern::new(
                 Ref::Var(VarId(0)),
-                Ref::Sid(Sid::new(100, "name")),
+                Ref::Sid(Sid::new(NsCode(100), "name")),
                 Term::Var(VarId(1)),
             ),
             TriplePattern::new(
                 Ref::Var(VarId(0)),
-                Ref::Sid(Sid::new(101, "age")),
+                Ref::Sid(Sid::new(NsCode(101), "age")),
                 Term::Var(VarId(2)),
             ),
         ]
@@ -1078,17 +1079,17 @@ mod tests {
         vec![
             TriplePattern::new(
                 Ref::Var(VarId(0)),
-                Ref::Sid(Sid::new(100, "type")),
-                Term::Sid(Sid::new(100, "Deal")),
+                Ref::Sid(Sid::new(NsCode(100), "type")),
+                Term::Sid(Sid::new(NsCode(100), "Deal")),
             ),
             TriplePattern::new(
                 Ref::Var(VarId(0)),
-                Ref::Sid(Sid::new(100, "name")),
+                Ref::Sid(Sid::new(NsCode(100), "name")),
                 Term::Var(VarId(1)),
             ),
             TriplePattern::new(
                 Ref::Var(VarId(0)),
-                Ref::Sid(Sid::new(101, "stage")),
+                Ref::Sid(Sid::new(NsCode(101), "stage")),
                 Term::Var(VarId(2)),
             ),
         ]
@@ -1153,11 +1154,11 @@ mod tests {
         let op =
             PropertyJoinOperator::new(&patterns, HashMap::new(), TemporalMode::Current).unwrap();
 
-        let subject_sid = Sid::new(1, "alice");
+        let subject_sid = Sid::new(NsCode(1), "alice");
         let subject_binding = Binding::sid(subject_sid.clone());
         let values = vec![
-            vec![Binding::sid(Sid::new(200, "Alice"))], // name
-            vec![Binding::sid(Sid::new(201, "30"))],    // age
+            vec![Binding::sid(Sid::new(NsCode(200), "Alice"))], // name
+            vec![Binding::sid(Sid::new(NsCode(201), "30"))],    // age
         ];
 
         let rows = PropertyJoinOperator::generate_rows(
@@ -1177,16 +1178,16 @@ mod tests {
         let op =
             PropertyJoinOperator::new(&patterns, HashMap::new(), TemporalMode::Current).unwrap();
 
-        let subject_binding = Binding::sid(Sid::new(1, "alice"));
+        let subject_binding = Binding::sid(Sid::new(NsCode(1), "alice"));
         let values = vec![
             vec![
-                Binding::sid(Sid::new(200, "Alice")),
-                Binding::sid(Sid::new(201, "Alicia")),
+                Binding::sid(Sid::new(NsCode(200), "Alice")),
+                Binding::sid(Sid::new(NsCode(201), "Alicia")),
             ], // 2 names
             vec![
-                Binding::sid(Sid::new(300, "30")),
-                Binding::sid(Sid::new(301, "31")),
-                Binding::sid(Sid::new(302, "32")),
+                Binding::sid(Sid::new(NsCode(300), "30")),
+                Binding::sid(Sid::new(NsCode(301), "31")),
+                Binding::sid(Sid::new(NsCode(302), "32")),
             ], // 3 ages
         ];
 
@@ -1206,10 +1207,10 @@ mod tests {
         let op =
             PropertyJoinOperator::new(&patterns, HashMap::new(), TemporalMode::Current).unwrap();
 
-        let subject_binding = Binding::sid(Sid::new(1, "alice"));
+        let subject_binding = Binding::sid(Sid::new(NsCode(1), "alice"));
         let values = vec![
-            vec![Binding::sid(Sid::new(200, "Alice"))], // has name
-            vec![],                                     // no age
+            vec![Binding::sid(Sid::new(NsCode(200), "Alice"))], // has name
+            vec![],                                             // no age
         ];
 
         let rows = PropertyJoinOperator::generate_rows(
@@ -1224,10 +1225,10 @@ mod tests {
 
     #[test]
     fn test_generate_rows_missing_optional_uses_poisoned() {
-        let subject_binding = Binding::sid(Sid::new(1, "alice"));
+        let subject_binding = Binding::sid(Sid::new(NsCode(1), "alice"));
         let values = vec![
-            vec![Binding::sid(Sid::new(200, "Alice"))], // required name
-            vec![],                                     // optional probability
+            vec![Binding::sid(Sid::new(NsCode(200), "Alice"))], // required name
+            vec![],                                             // optional probability
         ];
 
         let rows =
@@ -1249,12 +1250,12 @@ mod tests {
         let patterns = vec![
             TriplePattern::new(
                 Ref::Var(VarId(0)),
-                Ref::Sid(Sid::new(100, "name")),
+                Ref::Sid(Sid::new(NsCode(100), "name")),
                 Term::Var(VarId(1)),
             ),
             TriplePattern::new(
                 Ref::Var(VarId(2)), // Different subject!
-                Ref::Sid(Sid::new(101, "age")),
+                Ref::Sid(Sid::new(NsCode(101), "age")),
                 Term::Var(VarId(3)),
             ),
         ];

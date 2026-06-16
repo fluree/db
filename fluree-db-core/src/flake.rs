@@ -500,14 +500,15 @@ impl fmt::Display for Flake {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fluree_vocab::NsCode;
 
     #[test]
     fn test_flake_creation() {
         let flake = Flake::new(
-            Sid::new(1, "alice"),
-            Sid::new(2, "name"),
+            Sid::new(NsCode(1), "alice"),
+            Sid::new(NsCode(2), "name"),
             FlakeValue::String("Alice".to_string()),
-            Sid::new(3, "string"),
+            Sid::new(NsCode(3), "string"),
             1,
             true,
             None,
@@ -522,7 +523,7 @@ mod tests {
 
     #[test]
     fn test_min_max_for_subject() {
-        let subject = Sid::new(100, "test");
+        let subject = Sid::new(NsCode(100), "test");
         let min = Flake::min_for_subject(subject.clone());
         let max = Flake::max_for_subject(subject.clone());
 
@@ -535,20 +536,20 @@ mod tests {
     #[test]
     fn test_flake_equality() {
         let f1 = Flake::new(
-            Sid::new(1, "s"),
-            Sid::new(2, "p"),
+            Sid::new(NsCode(1), "s"),
+            Sid::new(NsCode(2), "p"),
             FlakeValue::Long(42),
-            Sid::new(3, "long"),
+            Sid::new(NsCode(3), "long"),
             1,
             true,
             None,
         );
 
         let f2 = Flake::new(
-            Sid::new(1, "s"),
-            Sid::new(2, "p"),
+            Sid::new(NsCode(1), "s"),
+            Sid::new(NsCode(2), "p"),
             FlakeValue::Long(42),
-            Sid::new(3, "long"),
+            Sid::new(NsCode(3), "long"),
             2,     // Different t
             false, // Different op
             None,
@@ -561,10 +562,10 @@ mod tests {
     #[test]
     fn test_retraction() {
         let flake = Flake::new(
-            Sid::new(1, "s"),
-            Sid::new(2, "p"),
+            Sid::new(NsCode(1), "s"),
+            Sid::new(NsCode(2), "p"),
             FlakeValue::Long(42),
-            Sid::new(3, "long"),
+            Sid::new(NsCode(3), "long"),
             1,
             true,
             None,
@@ -582,20 +583,20 @@ mod tests {
     #[test]
     fn test_is_ref() {
         let ref_flake = Flake::new(
-            Sid::new(1, "s"),
-            Sid::new(2, "p"),
-            FlakeValue::Ref(Sid::new(1, "target")),
-            Sid::new(1, "id"), // $id datatype
+            Sid::new(NsCode(1), "s"),
+            Sid::new(NsCode(2), "p"),
+            FlakeValue::Ref(Sid::new(NsCode(1), "target")),
+            Sid::new(NsCode(1), "id"), // $id datatype
             1,
             true,
             None,
         );
 
         let string_flake = Flake::new(
-            Sid::new(1, "s"),
-            Sid::new(2, "p"),
+            Sid::new(NsCode(1), "s"),
+            Sid::new(NsCode(2), "p"),
             FlakeValue::String("value".to_string()),
-            Sid::new(3, "string"),
+            Sid::new(NsCode(3), "string"),
             1,
             true,
             None,

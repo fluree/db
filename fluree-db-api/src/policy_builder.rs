@@ -1183,7 +1183,9 @@ fn parse_inline_policy(
 /// Using the EMPTY fallback keeps policy enforcement consistent with how queries and
 /// transactions encode such IRIs.
 fn resolve_iri_to_sid(snapshot: &LedgerSnapshot, iri: &str) -> Result<Sid> {
-    Ok(snapshot.encode_iri(iri).unwrap_or_else(|| Sid::new(0, iri)))
+    Ok(snapshot
+        .encode_iri(iri)
+        .unwrap_or_else(|| Sid::new(fluree_db_core::NsCode(0), iri)))
 }
 
 /// Resolve an identity IRI to a SID **strictly**.

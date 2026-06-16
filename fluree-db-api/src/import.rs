@@ -3141,7 +3141,7 @@ where
         let unpublished: FxHashSet<u16> = new_codes
             .iter()
             .copied()
-            .filter(|c| *c < OVERFLOW && !published.contains(c))
+            .filter(|c| *c < OVERFLOW.as_u16() && !published.contains(c))
             .collect();
         let delta = if unpublished.is_empty() {
             std::collections::HashMap::new()
@@ -4022,8 +4022,10 @@ where
             let mut records: Vec<RunRecord> = Vec::with_capacity(commit_metas.len() * 8);
 
             for cm in &commit_metas {
-                let commit_s = meta_subjects
-                    .get_or_insert(namespaces::FLUREE_COMMIT, cm.commit_hash_hex.as_bytes());
+                let commit_s = meta_subjects.get_or_insert(
+                    namespaces::FLUREE_COMMIT.as_u16(),
+                    cm.commit_hash_hex.as_bytes(),
+                );
                 let t = cm.t as u32;
 
                 let mut push =
@@ -4101,8 +4103,8 @@ where
 
                 // db:previous — REF_ID (only if this commit has a predecessor)
                 if let Some(ref prev_hex) = cm.previous_commit_hex {
-                    let prev_s =
-                        meta_subjects.get_or_insert(namespaces::FLUREE_COMMIT, prev_hex.as_bytes());
+                    let prev_s = meta_subjects
+                        .get_or_insert(namespaces::FLUREE_COMMIT.as_u16(), prev_hex.as_bytes());
                     push(
                         commit_s,
                         p_previous,

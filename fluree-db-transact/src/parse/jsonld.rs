@@ -1829,6 +1829,7 @@ fn parse_single_list_item_with_ctx(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fluree_db_core::NsCode;
     use serde_json::json;
 
     fn test_registry() -> NamespaceRegistry {
@@ -2039,7 +2040,7 @@ mod tests {
         let template = &txn.insert_templates[0];
         // Predicate should be rdf:type
         if let TemplateTerm::Sid(sid) = &template.predicate {
-            assert_eq!(sid.namespace_code, 3); // NS_RDF
+            assert_eq!(sid.namespace_code, NsCode(3)); // NS_RDF
             assert_eq!(sid.name.as_ref(), "type");
         } else {
             panic!("Expected Sid for predicate");
@@ -2107,7 +2108,7 @@ mod tests {
             TemplateTerm::Value(FlakeValue::String(ref s)) if s == "before"
         ));
         let dtc = result.dtc.as_ref().expect("should have dtc");
-        assert_eq!(dtc.datatype().namespace_code, 2);
+        assert_eq!(dtc.datatype().namespace_code, NsCode(2));
         assert_eq!(dtc.datatype().name.as_ref(), "string");
     }
 

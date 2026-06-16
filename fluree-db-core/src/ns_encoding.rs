@@ -31,6 +31,7 @@ use crate::namespaces::default_namespace_codes;
 use crate::prefix_trie::PrefixTrie;
 use crate::sid::Sid;
 use fluree_vocab::namespaces::{EMPTY, OVERFLOW, USER_START};
+use fluree_vocab::NsCode;
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::LazyLock;
@@ -480,11 +481,11 @@ impl NamespaceCodes {
 
         let max_code = code_to_prefix
             .keys()
-            .filter(|&&c| c < OVERFLOW)
+            .filter(|&&c| c < OVERFLOW.as_u16())
             .max()
             .copied()
             .unwrap_or(0);
-        let next_code = (max_code + 1).max(USER_START);
+        let next_code = (max_code + 1).max(USER_START.as_u16());
 
         Ok(Self {
             prefix_to_code,
@@ -496,15 +497,18 @@ impl NamespaceCodes {
 
     /// Look up the code for a prefix.
     #[inline]
-    pub fn get_code(&self, prefix: &str) -> Option<u16> {
-        self.prefix_to_code.get(prefix).copied()
+    pub fn get_code(&self, prefix: &str) -> Option<NsCode> {
+        self.prefix_to_code
+            .get(prefix)
+            .copied()
+            .map(NsCode::from_u16)
     }
 
     /// Look up the prefix for a code.
     #[inline]
-    pub fn get_prefix(&self, code: u16) -> Option<&str> {
+    pub fn get_prefix(&self, code: NsCode) -> Option<&str> {
         self.code_to_prefix
-            .get(&code)
+            .get(&code.as_u16())
             .map(std::string::String::as_str)
     }
 
@@ -516,14 +520,14 @@ impl NamespaceCodes {
     /// - `Err(NsAllocError::Overflow)` — no more allocatable codes
     /// - `Err(NsAllocError::CodeConflict)` — namespace bimap conflict (should not
     ///   happen in well-formed usage since we check prefix first)
-    pub fn allocate_prefix(&mut self, prefix: &str) -> Result<u16, NsAllocError> {
+    pub fn allocate_prefix(&mut self, prefix: &str) -> Result<NsCode, NsAllocError> {
         // Fast path: prefix already registered
         if let Some(&code) = self.prefix_to_code.get(prefix) {
-            return Ok(code);
+            return Ok(NsCode::from_u16(code));
         }
 
         // Check for overflow
-        if self.next_code >= OVERFLOW {
+        if self.next_code >= OVERFLOW.as_u16() {
             return Err(NsAllocError::Overflow);
         }
 
@@ -534,7 +538,7 @@ impl NamespaceCodes {
         self.code_to_prefix.insert(code, prefix.to_string());
         self.delta.insert(code, prefix.to_string());
 
-        Ok(code)
+        Ok(NsCode::from_u16(code))
     }
 
     /// Encode an IRI to a SID, allocating a new namespace code if needed.
@@ -597,7 +601,7 @@ impl NamespaceCodes {
             // New mapping — insert
             self.prefix_to_code.insert(prefix.clone(), code);
             self.code_to_prefix.insert(code, prefix.clone());
-            if code >= self.next_code && code < OVERFLOW {
+            if code >= self.next_code && code < OVERFLOW.as_u16() {
                 self.next_code = code + 1;
             }
         }
@@ -649,7 +653,7 @@ impl NamespaceCodes {
             self.prefix_to_code.insert(prefix.clone(), code);
             self.code_to_prefix.insert(code, prefix.clone());
             self.delta.insert(code, prefix.clone());
-            if code >= self.next_code && code < OVERFLOW {
+            if code >= self.next_code && code < OVERFLOW.as_u16() {
                 self.next_code = code + 1;
             }
         }
@@ -724,10 +728,10 @@ impl Default for NamespaceCodes {
 /// deterministic IRI encoding.
 pub trait NsLookup {
     /// Look up the code for a prefix.
-    fn code_for_prefix(&self, prefix: &str) -> Option<u16>;
+    fn code_for_prefix(&self, prefix: &str) -> Option<NsCode>;
 
     /// Look up the prefix for a code.
-    fn prefix_for_code(&self, code: u16) -> Option<&str>;
+    fn prefix_for_code(&self, code: NsCode) -> Option<&str>;
 
     /// Encode an IRI to a SID using canonical splitting and exact-prefix lookup.
     ///
@@ -756,12 +760,12 @@ pub trait NsLookup {
 
 impl NsLookup for NamespaceCodes {
     #[inline]
-    fn code_for_prefix(&self, prefix: &str) -> Option<u16> {
+    fn code_for_prefix(&self, prefix: &str) -> Option<NsCode> {
         self.get_code(prefix)
     }
 
     #[inline]
-    fn prefix_for_code(&self, code: u16) -> Option<&str> {
+    fn prefix_for_code(&self, code: NsCode) -> Option<&str> {
         self.get_prefix(code)
     }
 }
@@ -1061,7 +1065,7 @@ mod tests {
         assert_eq!(code, code2);
 
         // Delta tracks the new allocation
-        assert!(codes.delta().contains_key(&code));
+        assert!(codes.delta().contains_key(&code.as_u16()));
     }
 
     #[test]
@@ -1072,8 +1076,14 @@ mod tests {
         delta.insert(101u16, "https://other.example.org/".to_string());
 
         codes.merge_delta(&delta).unwrap();
-        assert_eq!(codes.get_code("https://new.example.org/"), Some(100));
-        assert_eq!(codes.get_code("https://other.example.org/"), Some(101));
+        assert_eq!(
+            codes.get_code("https://new.example.org/"),
+            Some(NsCode(100))
+        );
+        assert_eq!(
+            codes.get_code("https://other.example.org/"),
+            Some(NsCode(101))
+        );
     }
 
     #[test]
@@ -1111,7 +1121,7 @@ mod tests {
 
         // Same mapping again — should be fine
         codes.merge_delta(&delta).unwrap();
-        assert_eq!(codes.get_code("https://a.example.org/"), Some(100));
+        assert_eq!(codes.get_code("https://a.example.org/"), Some(NsCode(100)));
     }
 
     #[test]
@@ -1144,10 +1154,10 @@ mod tests {
         // Lookup tables updated
         assert_eq!(
             codes.get_code("https://new.example.org/"),
-            Some(next_code_before)
+            Some(NsCode::from_u16(next_code_before))
         );
         assert_eq!(
-            codes.get_prefix(next_code_before),
+            codes.get_prefix(NsCode::from_u16(next_code_before)),
             Some("https://new.example.org/")
         );
 
@@ -1174,7 +1184,7 @@ mod tests {
 
         // The next allocate_prefix should land at 201.
         let new_code = codes.allocate_prefix("https://after.example.org/").unwrap();
-        assert_eq!(new_code, 201);
+        assert_eq!(new_code, NsCode(201));
     }
 
     #[test]
@@ -1189,7 +1199,10 @@ mod tests {
         let next_code_after_first = codes.next_code;
         codes.adopt_delta_for_persistence(&delta).unwrap();
         assert_eq!(codes.next_code, next_code_after_first);
-        assert_eq!(codes.get_code("https://idem.example.org/"), Some(150));
+        assert_eq!(
+            codes.get_code("https://idem.example.org/"),
+            Some(NsCode(150))
+        );
     }
 
     #[test]
@@ -1261,11 +1274,11 @@ mod tests {
         assert!(!codes.has_delta());
 
         let mut delta = HashMap::new();
-        delta.insert(code, prefix.to_string());
+        delta.insert(code.as_u16(), prefix.to_string());
         codes.adopt_delta_for_persistence(&delta).unwrap();
 
         let taken = codes.take_delta();
-        assert_eq!(taken.get(&code).map(String::as_str), Some(prefix));
+        assert_eq!(taken.get(&code.as_u16()).map(String::as_str), Some(prefix));
     }
 
     // ---- NsLookup trait ----
@@ -1303,7 +1316,7 @@ mod tests {
     #[test]
     fn test_ns_lookup_decode_unknown_code() {
         let codes = NamespaceCodes::new();
-        let sid = Sid::new(9999, "suffix");
+        let sid = Sid::new(NsCode(9999), "suffix");
         assert!(codes.decode_sid_strict(&sid).is_none());
     }
 

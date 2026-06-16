@@ -37,7 +37,7 @@ use fluree_db_novelty::{
     generate_commit_flakes, stamp_graph_on_commit_flakes, trace_commits_by_id, Novelty,
 };
 use fluree_vocab::namespaces::{FLUREE_COMMIT, JSON_LD, RDF, XSD};
-use fluree_vocab::{rdf_names, xsd_names};
+use fluree_vocab::{rdf_names, xsd_names, NsCode};
 use futures::StreamExt;
 use std::sync::Arc;
 
@@ -319,7 +319,8 @@ impl HistoricalLedgerView {
             if let Some(dtm) = deferred_txn_meta {
                 if let Some(ref txn_graph) = txn_meta_graph_sid {
                     for entry in &dtm.entries {
-                        let p = Sid::new(entry.predicate_ns, &entry.predicate_name);
+                        let p =
+                            Sid::new(NsCode::from_u16(entry.predicate_ns), &entry.predicate_name);
                         let (o, dt, m) = match &entry.value {
                             fluree_db_novelty::TxnMetaValue::String(s) => (
                                 FlakeValue::String(s.clone()),
@@ -340,7 +341,7 @@ impl HistoricalLedgerView {
                                 None,
                             ),
                             fluree_db_novelty::TxnMetaValue::Ref { ns, name } => (
-                                FlakeValue::Ref(Sid::new(*ns, name)),
+                                FlakeValue::Ref(Sid::new(NsCode::from_u16(*ns), name)),
                                 Sid::new(JSON_LD, "id"),
                                 None,
                             ),
@@ -355,7 +356,7 @@ impl HistoricalLedgerView {
                                 dt_name,
                             } => (
                                 FlakeValue::String(value.clone()),
-                                Sid::new(*dt_ns, dt_name),
+                                Sid::new(NsCode::from_u16(*dt_ns), dt_name),
                                 None,
                             ),
                         };
@@ -501,16 +502,16 @@ impl OverlayProvider for HistoricalLedgerView {
 mod tests {
     use super::*;
     use fluree_db_core::{
-        content_store_for, ContentKind, ContentStore, FlakeValue, MemoryStorage, Sid,
+        content_store_for, ContentKind, ContentStore, FlakeValue, MemoryStorage, NsCode, Sid,
     };
     use fluree_db_nameservice::memory::MemoryNameService;
 
     fn make_flake(s: u16, p: u16, o: i64, t: i64) -> Flake {
         Flake::new(
-            Sid::new(s, format!("s{s}")),
-            Sid::new(p, format!("p{p}")),
+            Sid::new(NsCode(s), format!("s{s}")),
+            Sid::new(NsCode(p), format!("p{p}")),
             FlakeValue::Long(o),
-            Sid::new(2, "long"),
+            Sid::new(NsCode(2), "long"),
             t,
             true,
             None,
@@ -581,7 +582,7 @@ mod tests {
         );
 
         // Should only see flakes at t=1 and t=5, not t=10
-        assert_eq!(collected, vec![1, 2]);
+        assert_eq!(collected, vec![NsCode(1), NsCode(2)]);
     }
 
     #[tokio::test]

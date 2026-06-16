@@ -374,7 +374,8 @@ impl ComparableValue {
             ComparableValue::Iri(s) => Some(ComparableValue::String(s)),
             ComparableValue::Sid(sid) => Some(ComparableValue::String(Arc::from(format!(
                 "{}:{}",
-                sid.namespace_code, sid.name
+                sid.namespace_code.as_u16(),
+                sid.name
             )))),
             ComparableValue::Long(n) => Some(ComparableValue::String(Arc::from(n.to_string()))),
             ComparableValue::Double(d) => Some(ComparableValue::String(Arc::from(d.to_string()))),
@@ -416,7 +417,9 @@ impl ComparableValue {
     ) -> Option<ComparableValue> {
         match &self {
             ComparableValue::Sid(sid) => {
-                if let Some(prefix) = namespace_codes.and_then(|ns| ns.get(&sid.namespace_code)) {
+                if let Some(prefix) =
+                    namespace_codes.and_then(|ns| ns.get(&sid.namespace_code.as_u16()))
+                {
                     Some(ComparableValue::String(Arc::from(format!(
                         "{}{}",
                         prefix, sid.name
@@ -676,6 +679,7 @@ impl From<&ComparableValue> for FlakeValue {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fluree_db_core::NsCode;
     use fluree_db_core::Sid;
 
     #[test]
@@ -884,7 +888,7 @@ mod tests {
     #[test]
     fn test_into_string_value_sid_internal_form() {
         // Without namespace codes, SID falls back to internal code:name form
-        let sid = Sid::new(21, "packageType");
+        let sid = Sid::new(NsCode(21), "packageType");
         let cv = ComparableValue::Sid(sid);
         let sv = cv.into_string_value();
         assert_eq!(
@@ -900,7 +904,7 @@ mod tests {
         ns.insert(21u16, "https://taxo.cbcrc.ca/ns/".to_string());
         ns.insert(2u16, "http://www.w3.org/2001/XMLSchema#".to_string());
 
-        let sid = Sid::new(21, "packageType");
+        let sid = Sid::new(NsCode(21), "packageType");
         let cv = ComparableValue::Sid(sid);
         let sv = cv.into_string_value_with_namespaces(Some(&ns));
         assert_eq!(
@@ -916,7 +920,7 @@ mod tests {
         use std::collections::HashMap;
         let ns = HashMap::new(); // empty — code 21 not found
 
-        let sid = Sid::new(21, "packageType");
+        let sid = Sid::new(NsCode(21), "packageType");
         let cv = ComparableValue::Sid(sid);
         let sv = cv.into_string_value_with_namespaces(Some(&ns));
         // Falls back to internal form
@@ -928,7 +932,7 @@ mod tests {
 
     #[test]
     fn test_into_string_value_with_namespaces_none_fallback() {
-        let sid = Sid::new(21, "packageType");
+        let sid = Sid::new(NsCode(21), "packageType");
         let cv = ComparableValue::Sid(sid);
         let sv = cv.into_string_value_with_namespaces(None);
         // Falls back to internal form

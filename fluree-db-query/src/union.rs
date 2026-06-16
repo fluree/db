@@ -362,6 +362,7 @@ mod tests {
     use crate::values::ValuesOperator;
     use crate::var_registry::VarRegistry;
     use fluree_db_core::FlakeValue;
+    use fluree_db_core::NsCode;
     use fluree_db_core::Sid;
     use std::sync::Arc;
 
@@ -376,12 +377,12 @@ mod tests {
         let branches = vec![
             vec![Pattern::Triple(crate::ir::triple::TriplePattern::new(
                 crate::ir::triple::Ref::Var(VarId(0)),
-                crate::ir::triple::Ref::Sid(Sid::new(100, "name")),
+                crate::ir::triple::Ref::Sid(Sid::new(NsCode(100), "name")),
                 crate::ir::triple::Term::Var(VarId(1)),
             ))],
             vec![Pattern::Triple(crate::ir::triple::TriplePattern::new(
                 crate::ir::triple::Ref::Var(VarId(0)),
-                crate::ir::triple::Ref::Sid(Sid::new(100, "email")),
+                crate::ir::triple::Ref::Sid(Sid::new(NsCode(100), "email")),
                 crate::ir::triple::Term::Var(VarId(2)),
             ))],
         ];
@@ -424,12 +425,12 @@ mod tests {
         let branches = vec![
             vec![Pattern::Triple(crate::ir::triple::TriplePattern::new(
                 crate::ir::triple::Ref::Var(VarId(0)),
-                crate::ir::triple::Ref::Sid(Sid::new(100, "name")),
+                crate::ir::triple::Ref::Sid(Sid::new(NsCode(100), "name")),
                 crate::ir::triple::Term::Var(VarId(1)),
             ))],
             vec![Pattern::Triple(crate::ir::triple::TriplePattern::new(
                 crate::ir::triple::Ref::Var(VarId(0)),
-                crate::ir::triple::Ref::Sid(Sid::new(100, "email")),
+                crate::ir::triple::Ref::Sid(Sid::new(NsCode(100), "email")),
                 crate::ir::triple::Term::Var(VarId(2)),
             ))],
         ];
@@ -455,7 +456,7 @@ mod tests {
         let branches = vec![vec![Pattern::Triple(
             crate::ir::triple::TriplePattern::new(
                 crate::ir::triple::Ref::Var(VarId(0)),
-                crate::ir::triple::Ref::Sid(Sid::new(100, "name")),
+                crate::ir::triple::Ref::Sid(Sid::new(NsCode(100), "name")),
                 crate::ir::triple::Term::Var(VarId(1)),
             ),
         )]];
@@ -482,9 +483,18 @@ mod tests {
             Box::new(EmptyOperator::new()),
             vec![VarId(0)],
             vec![
-                vec![Binding::lit(FlakeValue::Long(1), Sid::new(2, "long"))],
-                vec![Binding::lit(FlakeValue::Long(2), Sid::new(2, "long"))],
-                vec![Binding::lit(FlakeValue::Long(3), Sid::new(2, "long"))],
+                vec![Binding::lit(
+                    FlakeValue::Long(1),
+                    Sid::new(NsCode(2), "long"),
+                )],
+                vec![Binding::lit(
+                    FlakeValue::Long(2),
+                    Sid::new(NsCode(2), "long"),
+                )],
+                vec![Binding::lit(
+                    FlakeValue::Long(3),
+                    Sid::new(NsCode(2), "long"),
+                )],
             ],
         ));
 
@@ -492,15 +502,21 @@ mod tests {
             vec![Pattern::Values {
                 vars: vec![VarId(1)],
                 rows: vec![
-                    vec![Binding::lit(FlakeValue::Long(10), Sid::new(2, "long"))],
-                    vec![Binding::lit(FlakeValue::Long(20), Sid::new(2, "long"))],
+                    vec![Binding::lit(
+                        FlakeValue::Long(10),
+                        Sid::new(NsCode(2), "long"),
+                    )],
+                    vec![Binding::lit(
+                        FlakeValue::Long(20),
+                        Sid::new(NsCode(2), "long"),
+                    )],
                 ],
             }],
             vec![Pattern::Values {
                 vars: vec![VarId(1)],
                 rows: vec![vec![Binding::lit(
                     FlakeValue::Long(30),
-                    Sid::new(2, "long"),
+                    Sid::new(NsCode(2), "long"),
                 )]],
             }],
         ];

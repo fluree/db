@@ -521,6 +521,7 @@ impl Operator for DatasetOperator {
 mod tests {
     use super::*;
     use crate::var_registry::VarId;
+    use fluree_db_core::NsCode;
 
     /// Verify ScanDatasetBuilder produces operators with consistent schema.
     #[test]
@@ -530,8 +531,11 @@ mod tests {
 
         let s = VarId(0);
         let o = VarId(1);
-        let pattern =
-            TriplePattern::new(Ref::Var(s), Ref::Sid(Sid::new(100, "name")), Term::Var(o));
+        let pattern = TriplePattern::new(
+            Ref::Var(s),
+            Ref::Sid(Sid::new(NsCode(100), "name")),
+            Term::Var(o),
+        );
 
         let builder = ScanDatasetBuilder::new(
             pattern,

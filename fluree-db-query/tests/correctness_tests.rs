@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use fluree_db_core::{LedgerSnapshot, Sid};
+use fluree_db_core::{LedgerSnapshot, NsCode, Sid};
 
 use fluree_db_query::binary_scan::EmitMask;
 use fluree_db_query::binding::{Batch, Binding};
@@ -102,7 +102,7 @@ async fn test_optional_poison_blocks_subsequent() {
     let required_schema: Arc<[VarId]> = Arc::from(vec![s].into_boxed_slice());
     let required_batch = Batch::new(
         required_schema.clone(),
-        vec![vec![Binding::sid(Sid::new(100, "alice"))]],
+        vec![vec![Binding::sid(Sid::new(NsCode(100), "alice"))]],
     )
     .unwrap();
 
@@ -135,7 +135,7 @@ async fn test_optional_poison_blocks_subsequent() {
 
     let right_pattern = TriplePattern::new(
         Ref::Var(opt), // correlation var (poisoned) used for binding
-        Ref::Sid(Sid::new(100, "p")),
+        Ref::Sid(Sid::new(NsCode(100), "p")),
         Term::Var(o),
     );
 

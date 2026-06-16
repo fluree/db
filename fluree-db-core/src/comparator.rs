@@ -228,13 +228,14 @@ mod tests {
     use super::*;
     use crate::sid::Sid;
     use crate::value::FlakeValue;
+    use fluree_vocab::NsCode;
 
     fn make_flake(s: u16, p: u16, o: i64, t: i64) -> Flake {
         Flake::new(
-            Sid::new(s, format!("s{s}")),
-            Sid::new(p, format!("p{p}")),
+            Sid::new(NsCode::from_u16(s), format!("s{s}")),
+            Sid::new(NsCode::from_u16(p), format!("p{p}")),
             FlakeValue::Long(o),
-            Sid::new(2, "long"),
+            Sid::new(NsCode(2), "long"),
             t,
             true,
             None,

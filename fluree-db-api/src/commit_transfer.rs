@@ -500,7 +500,7 @@ fn derive_graph_routing(state: &LedgerState, flakes: &[&Flake]) -> GraphRoutingR
                 Some(iri) => iri,
                 None => {
                     tracing::error!(
-                        ns_code = g_sid.namespace_code,
+                        ns_code = g_sid.namespace_code.as_u16(),
                         suffix = %g_sid.name,
                         "sid_to_iri failed for graph SID — namespace code not in binary store"
                     );

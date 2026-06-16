@@ -100,6 +100,7 @@ fn infer_node_kind(value: &FlakeValue) -> Option<NodeKind> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fluree_db_core::NsCode;
     use fluree_vocab::namespaces::XSD;
     use fluree_vocab::xsd_names;
 
@@ -121,7 +122,7 @@ mod tests {
 
     #[test]
     fn test_node_kind_iri() {
-        let value = FlakeValue::Ref(Sid::new(100, "example"));
+        let value = FlakeValue::Ref(Sid::new(NsCode(100), "example"));
         assert!(validate_node_kind(&value, NodeKind::IRI).is_none());
         assert!(validate_node_kind(&value, NodeKind::BlankNodeOrIRI).is_none());
         assert!(validate_node_kind(&value, NodeKind::IRIOrLiteral).is_none());

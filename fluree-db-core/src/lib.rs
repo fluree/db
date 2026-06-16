@@ -101,6 +101,9 @@ pub use db::{load_ledger_snapshot, LedgerSnapshot, LedgerSnapshotMetadata};
 pub use dict_novelty::DictNovelty;
 pub use error::{Error, Result};
 pub use flake::{Flake, FlakeMeta};
+/// Re-export the namespace-code newtype so crates that depend on `fluree-db-core`
+/// can refer to `fluree_db_core::NsCode` without a direct `fluree-vocab` dep.
+pub use fluree_vocab::NsCode;
 pub use graph_db_ref::GraphDbRef;
 pub use graph_registry::{
     config_graph_iri, txn_meta_graph_iri, GraphRegistry, CONFIG_GRAPH_ID, DEFAULT_GRAPH_ID,

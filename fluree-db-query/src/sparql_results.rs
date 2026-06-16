@@ -434,7 +434,7 @@ mod tests {
             Binding::Lit { val, dtc, .. } => {
                 assert!(matches!(val, FlakeValue::String(s) if s == "custom-value"));
                 let sid = dtc.datatype();
-                assert_eq!(sid.namespace_code, 0);
+                assert_eq!(sid.namespace_code, fluree_db_core::NsCode(0));
                 assert_eq!(&*sid.name, "http://example.org/myType");
             }
             other => panic!("expected Lit, got {other:?}"),

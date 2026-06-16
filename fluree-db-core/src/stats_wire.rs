@@ -10,6 +10,7 @@ use crate::index_stats::{
     IndexStats, PropertyStatEntry,
 };
 use crate::sid::Sid;
+use fluree_vocab::NsCode;
 use std::io;
 
 // ---- Binary helpers ----
@@ -84,7 +85,7 @@ fn read_sid(data: &[u8], pos: usize) -> io::Result<(Sid, usize)> {
         )
     })?;
     p += suffix_len;
-    Ok((Sid::new(ns_code, suffix), p))
+    Ok((Sid::new(NsCode::from_u16(ns_code), suffix), p))
 }
 
 fn read_sid_tuple(data: &[u8], pos: usize) -> io::Result<((u16, String), usize)> {

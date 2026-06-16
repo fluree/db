@@ -609,12 +609,13 @@ impl Pattern {
 mod tests {
     use super::*;
     use crate::ir::triple::{Ref, Term};
+    use fluree_db_core::NsCode;
     use fluree_db_core::Sid;
 
     fn test_pattern() -> TriplePattern {
         TriplePattern::new(
             Ref::Var(VarId(0)),
-            Ref::Sid(Sid::new(100, "name")),
+            Ref::Sid(Sid::new(NsCode(100), "name")),
             Term::Var(VarId(1)),
         )
     }

@@ -86,7 +86,7 @@ fn property_count(snapshot: &LedgerSnapshot, iri: &str) -> Option<u64> {
     let stats = snapshot.stats.as_ref()?;
     let props = stats.properties.as_ref()?;
     for p in props {
-        let sid = fluree_db_core::Sid::new(p.sid.0, &p.sid.1);
+        let sid = fluree_db_core::Sid::new(fluree_db_core::NsCode(p.sid.0), &p.sid.1);
         if let Some(full) = snapshot.decode_sid(&sid) {
             if full == iri {
                 return Some(p.count);
@@ -2138,7 +2138,8 @@ async fn ndv_cardinality_estimates_are_accurate() {
                 .and_then(|s| s.properties.as_ref())
                 .and_then(|props| {
                     props.iter().find(|p| {
-                        let sid = fluree_db_core::Sid::new(p.sid.0, &p.sid.1);
+                        let sid =
+                            fluree_db_core::Sid::new(fluree_db_core::NsCode(p.sid.0), &p.sid.1);
                         loaded
                             .decode_sid(&sid)
                             .map(|iri| iri == "http://example.org/name")
@@ -2154,7 +2155,8 @@ async fn ndv_cardinality_estimates_are_accurate() {
                 .and_then(|s| s.properties.as_ref())
                 .and_then(|props| {
                     props.iter().find(|p| {
-                        let sid = fluree_db_core::Sid::new(p.sid.0, &p.sid.1);
+                        let sid =
+                            fluree_db_core::Sid::new(fluree_db_core::NsCode(p.sid.0), &p.sid.1);
                         loaded
                             .decode_sid(&sid)
                             .map(|iri| iri == "http://example.org/name")
@@ -2179,7 +2181,8 @@ async fn ndv_cardinality_estimates_are_accurate() {
                 .and_then(|s| s.properties.as_ref())
                 .and_then(|props| {
                     props.iter().find(|p| {
-                        let sid = fluree_db_core::Sid::new(p.sid.0, &p.sid.1);
+                        let sid =
+                            fluree_db_core::Sid::new(fluree_db_core::NsCode(p.sid.0), &p.sid.1);
                         loaded
                             .decode_sid(&sid)
                             .map(|iri| iri == "http://example.org/status")
@@ -2195,7 +2198,8 @@ async fn ndv_cardinality_estimates_are_accurate() {
                 .and_then(|s| s.properties.as_ref())
                 .and_then(|props| {
                     props.iter().find(|p| {
-                        let sid = fluree_db_core::Sid::new(p.sid.0, &p.sid.1);
+                        let sid =
+                            fluree_db_core::Sid::new(fluree_db_core::NsCode(p.sid.0), &p.sid.1);
                         loaded
                             .decode_sid(&sid)
                             .map(|iri| iri == "http://example.org/status")
@@ -2661,7 +2665,8 @@ async fn large_dataset_statistics_accuracy() {
                 .and_then(|s| s.properties.as_ref())
                 .and_then(|props| {
                     props.iter().find(|p| {
-                        let sid = fluree_db_core::Sid::new(p.sid.0, &p.sid.1);
+                        let sid =
+                            fluree_db_core::Sid::new(fluree_db_core::NsCode(p.sid.0), &p.sid.1);
                         loaded
                             .decode_sid(&sid)
                             .map(|iri| iri == "http://example.org/name")
@@ -2688,7 +2693,8 @@ async fn large_dataset_statistics_accuracy() {
                 .and_then(|s| s.properties.as_ref())
                 .and_then(|props| {
                     props.iter().find(|p| {
-                        let sid = fluree_db_core::Sid::new(p.sid.0, &p.sid.1);
+                        let sid =
+                            fluree_db_core::Sid::new(fluree_db_core::NsCode(p.sid.0), &p.sid.1);
                         loaded
                             .decode_sid(&sid)
                             .map(|iri| iri == "http://example.org/department")

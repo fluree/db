@@ -216,7 +216,7 @@ pub fn resolve_trig_meta(
         for obj in &triple.objects {
             let value = raw_object_to_txn_meta_value(obj, &raw.prefixes, ns_registry)?;
             entries.push(TxnMetaEntry::new(
-                pred_sid.namespace_code,
+                pred_sid.namespace_code.as_u16(),
                 pred_sid.name.to_string(),
                 value,
             ));
@@ -260,7 +260,7 @@ fn raw_object_to_txn_meta_value(
         RawObject::Iri(iri) => {
             let sid = ns_registry.sid_for_iri(iri);
             Ok(TxnMetaValue::Ref {
-                ns: sid.namespace_code,
+                ns: sid.namespace_code.as_u16(),
                 name: sid.name.to_string(),
             })
         }
@@ -268,7 +268,7 @@ fn raw_object_to_txn_meta_value(
             let iri = expand_prefixed_name(prefixes, prefix, local)?;
             let sid = ns_registry.sid_for_iri(&iri);
             Ok(TxnMetaValue::Ref {
-                ns: sid.namespace_code,
+                ns: sid.namespace_code.as_u16(),
                 name: sid.name.to_string(),
             })
         }
@@ -280,7 +280,7 @@ fn raw_object_to_txn_meta_value(
             let dt_sid = ns_registry.sid_for_iri(datatype);
             Ok(TxnMetaValue::TypedLiteral {
                 value: value.clone(),
-                dt_ns: dt_sid.namespace_code,
+                dt_ns: dt_sid.namespace_code.as_u16(),
                 dt_name: dt_sid.name.to_string(),
             })
         }
@@ -1014,7 +1014,7 @@ impl<'a> TrigMetaParser<'a> {
                     for obj in &triple.objects {
                         let value = self.object_to_txn_meta_value(obj, ns_registry)?;
                         txn_meta.push(TxnMetaEntry::new(
-                            pred_sid.namespace_code,
+                            pred_sid.namespace_code.as_u16(),
                             pred_sid.name.to_string(),
                             value,
                         ));
@@ -1150,7 +1150,7 @@ impl<'a> TrigMetaParser<'a> {
             ObjectValue::Iri(iri) => {
                 let sid = ns_registry.sid_for_iri(iri);
                 Ok(TxnMetaValue::Ref {
-                    ns: sid.namespace_code,
+                    ns: sid.namespace_code.as_u16(),
                     name: sid.name.to_string(),
                 })
             }
@@ -1158,7 +1158,7 @@ impl<'a> TrigMetaParser<'a> {
                 let iri = self.expand_prefixed_name(prefix, local)?;
                 let sid = ns_registry.sid_for_iri(&iri);
                 Ok(TxnMetaValue::Ref {
-                    ns: sid.namespace_code,
+                    ns: sid.namespace_code.as_u16(),
                     name: sid.name.to_string(),
                 })
             }
@@ -1173,7 +1173,7 @@ impl<'a> TrigMetaParser<'a> {
                 let dt_sid = ns_registry.sid_for_iri(datatype);
                 Ok(TxnMetaValue::TypedLiteral {
                     value: value.clone(),
-                    dt_ns: dt_sid.namespace_code,
+                    dt_ns: dt_sid.namespace_code.as_u16(),
                     dt_name: dt_sid.name.to_string(),
                 })
             }

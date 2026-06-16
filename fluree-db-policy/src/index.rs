@@ -213,10 +213,10 @@ pub fn compute_class_check_needed(
 mod tests {
     use super::*;
     use crate::types::PolicyValue;
-    use fluree_db_core::{ClassPropertyUsage, ClassStatEntry};
+    use fluree_db_core::{ClassPropertyUsage, ClassStatEntry, NsCode};
 
     fn make_sid(ns: u16, name: &str) -> Sid {
-        Sid::new(ns, name)
+        Sid::new(NsCode(ns), name)
     }
 
     fn make_prop_restriction(id: &str, property: Sid) -> PolicyRestriction {

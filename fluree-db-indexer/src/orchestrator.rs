@@ -1703,7 +1703,8 @@ where
 mod tests {
     use super::*;
     use fluree_db_core::{
-        ContentAddressedWrite, ContentId, ContentKind, Flake, FlakeValue, MemoryStorage, Sid,
+        ContentAddressedWrite, ContentId, ContentKind, Flake, FlakeValue, MemoryStorage, NsCode,
+        Sid,
     };
     use fluree_db_nameservice::memory::MemoryNameService;
     use fluree_db_nameservice::{NameService, Publisher};
@@ -1712,10 +1713,10 @@ mod tests {
 
     fn make_flake(s_code: u16, s_name: &str, p_code: u16, p_name: &str, val: i64, t: i64) -> Flake {
         Flake::new(
-            Sid::new(s_code, s_name),
-            Sid::new(p_code, p_name),
+            Sid::new(NsCode(s_code), s_name),
+            Sid::new(NsCode(p_code), p_name),
             FlakeValue::Long(val),
-            Sid::new(2, "xsd:long"),
+            Sid::new(NsCode(2), "xsd:long"),
             t,
             true,
             None,
@@ -2660,7 +2661,7 @@ mod embedded_tests {
     use super::*;
     use fluree_db_core::{
         ContentAddressedWrite, ContentId, ContentKind, Flake, FlakeValue, LedgerSnapshot,
-        MemoryStorage, Sid,
+        MemoryStorage, NsCode, Sid,
     };
     use fluree_db_ledger::LedgerState;
     use fluree_db_nameservice::memory::MemoryNameService;
@@ -2670,10 +2671,10 @@ mod embedded_tests {
 
     fn make_flake(s_code: u16, s_name: &str, p_code: u16, p_name: &str, val: i64, t: i64) -> Flake {
         Flake::new(
-            Sid::new(s_code, s_name),
-            Sid::new(p_code, p_name),
+            Sid::new(NsCode(s_code), s_name),
+            Sid::new(NsCode(p_code), p_name),
             FlakeValue::Long(val),
-            Sid::new(2, "xsd:long"),
+            Sid::new(NsCode(2), "xsd:long"),
             t,
             true,
             None,
@@ -2683,10 +2684,10 @@ mod embedded_tests {
     fn make_large_flake(t: i64, size_hint: usize) -> Flake {
         let big_value = "x".repeat(size_hint);
         Flake::new(
-            Sid::new(1, "ex:entity"),
-            Sid::new(1, "ex:data"),
+            Sid::new(NsCode(1), "ex:entity"),
+            Sid::new(NsCode(1), "ex:data"),
             FlakeValue::String(big_value),
-            Sid::new(2, "xsd:string"),
+            Sid::new(NsCode(2), "xsd:string"),
             t,
             true,
             None,

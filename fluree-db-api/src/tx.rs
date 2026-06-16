@@ -614,10 +614,16 @@ fn format_violations(violations: &[fluree_db_shacl::ValidationResult]) -> String
         let _ = writeln!(
             out,
             "     Focus node: {}{}",
-            v.focus_node.namespace_code, v.focus_node.name
+            v.focus_node.namespace_code.as_u16(),
+            v.focus_node.name
         );
         if let Some(path) = &v.result_path {
-            let _ = writeln!(out, "     Path: {}{}", path.namespace_code, path.name);
+            let _ = writeln!(
+                out,
+                "     Path: {}{}",
+                path.namespace_code.as_u16(),
+                path.name
+            );
         }
     }
     out

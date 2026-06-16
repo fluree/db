@@ -1654,7 +1654,7 @@ pub struct ValidationResult {
 mod tests {
     use super::*;
     use crate::cache::ShaclCacheKey;
-    use fluree_db_core::GraphDbRef;
+    use fluree_db_core::{GraphDbRef, NsCode};
 
     /// Regression: `rescope_to_schema_graph` — used by the `sh:class` fallback
     /// subclass walk — must preserve the caller's tracker (and other
@@ -1729,8 +1729,10 @@ mod tests {
 
         let interner = SidInterner::new();
         let shape = CompiledShape {
-            id: interner.intern(100, "TestShape"),
-            targets: vec![TargetType::Node(vec![interner.intern(100, "ex:alice")])],
+            id: interner.intern(NsCode(100), "TestShape"),
+            targets: vec![TargetType::Node(vec![
+                interner.intern(NsCode(100), "ex:alice")
+            ])],
             property_shapes: vec![],
             node_constraints: vec![],
             structural_constraints: vec![],
@@ -1767,8 +1769,8 @@ mod tests {
 
         // Even with subjects to validate, should return conforming immediately
         let mut modified_subjects = HashSet::new();
-        modified_subjects.insert(Sid::new(100, "ex:alice"));
-        modified_subjects.insert(Sid::new(100, "ex:bob"));
+        modified_subjects.insert(Sid::new(NsCode(100), "ex:alice"));
+        modified_subjects.insert(Sid::new(NsCode(100), "ex:bob"));
 
         let db = GraphDbRef::new(&snapshot, GraphId(0), &NoOverlay, snapshot.t);
         let report = engine
@@ -1791,8 +1793,8 @@ mod tests {
         use crate::compile::{CompiledShape, TargetType};
 
         let shape = CompiledShape {
-            id: Sid::new(100, "TestShape"),
-            targets: vec![TargetType::Class(Sid::new(100, "ex:Person"))],
+            id: Sid::new(NsCode(100), "TestShape"),
+            targets: vec![TargetType::Class(Sid::new(NsCode(100), "ex:Person"))],
             property_shapes: vec![],
             node_constraints: vec![],
             structural_constraints: vec![],

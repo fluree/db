@@ -581,7 +581,7 @@ mod tests {
     // ------------------------------------------------------------------
 
     use crate::QueryResult;
-    use fluree_db_core::{FlakeValue, Sid};
+    use fluree_db_core::{FlakeValue, NsCode, Sid};
     use fluree_db_query::binding::Binding;
     use fluree_db_query::var_registry::VarRegistry;
     use std::collections::HashMap as StdHashMap;
@@ -635,16 +635,16 @@ mod tests {
             &["?s", "?n", "?d"],
             vec![
                 vec![
-                    Binding::sid(Sid::new(100, "alice")),
+                    Binding::sid(Sid::new(NsCode(100), "alice")),
                     Binding::lit(
                         FlakeValue::String("Alice & co".to_string()),
-                        Sid::new(2, "string"),
+                        Sid::new(NsCode(2), "string"),
                     ),
-                    Binding::lit(FlakeValue::Double(3.13), Sid::new(2, "double")),
+                    Binding::lit(FlakeValue::Double(3.13), Sid::new(NsCode(2), "double")),
                 ],
                 vec![
-                    Binding::sid(Sid::new(100, "bob")),
-                    Binding::lit(FlakeValue::Long(42), Sid::new(2, "long")),
+                    Binding::sid(Sid::new(NsCode(100), "bob")),
+                    Binding::lit(FlakeValue::Long(42), Sid::new(NsCode(2), "long")),
                     Binding::Unbound,
                 ],
             ],
@@ -658,10 +658,13 @@ mod tests {
         let r = make_result(
             &["?v"],
             vec![
-                vec![Binding::lit(FlakeValue::Long(1), Sid::new(2, "long"))],
+                vec![Binding::lit(
+                    FlakeValue::Long(1),
+                    Sid::new(NsCode(2), "long"),
+                )],
                 vec![Binding::lit(
                     FlakeValue::String("x".to_string()),
-                    Sid::new(2, "string"),
+                    Sid::new(NsCode(2), "string"),
                 )],
             ],
         );
@@ -679,10 +682,10 @@ mod tests {
         let mut r = make_result(
             &["?s", "?g"],
             vec![vec![
-                Binding::sid(Sid::new(100, "a")),
+                Binding::sid(Sid::new(NsCode(100), "a")),
                 Binding::Grouped(vec![
-                    Binding::lit(FlakeValue::Long(1), Sid::new(2, "long")),
-                    Binding::lit(FlakeValue::Long(2), Sid::new(2, "long")),
+                    Binding::lit(FlakeValue::Long(1), Sid::new(NsCode(2), "long")),
+                    Binding::lit(FlakeValue::Long(2), Sid::new(NsCode(2), "long")),
                 ]),
             ]],
         );
@@ -697,24 +700,24 @@ mod tests {
             &["?s", "?label"],
             vec![
                 vec![
-                    Binding::sid(Sid::new(100, "a")),
+                    Binding::sid(Sid::new(NsCode(100), "a")),
                     Binding::lit(
                         FlakeValue::String("first row label".to_string()),
-                        Sid::new(2, "string"),
+                        Sid::new(NsCode(2), "string"),
                     ),
                 ],
                 vec![
-                    Binding::sid(Sid::new(100, "b")),
+                    Binding::sid(Sid::new(NsCode(100), "b")),
                     Binding::lit(
                         FlakeValue::String("second row label".to_string()),
-                        Sid::new(2, "string"),
+                        Sid::new(NsCode(2), "string"),
                     ),
                 ],
                 vec![
-                    Binding::sid(Sid::new(100, "c")),
+                    Binding::sid(Sid::new(NsCode(100), "c")),
                     Binding::lit(
                         FlakeValue::String("third row label".to_string()),
-                        Sid::new(2, "string"),
+                        Sid::new(NsCode(2), "string"),
                     ),
                 ],
             ],
@@ -729,9 +732,9 @@ mod tests {
         let r = make_result(
             &["?s"],
             vec![
-                vec![Binding::sid(Sid::new(100, "a"))],
-                vec![Binding::sid(Sid::new(100, "b"))],
-                vec![Binding::sid(Sid::new(100, "c"))],
+                vec![Binding::sid(Sid::new(NsCode(100), "a"))],
+                vec![Binding::sid(Sid::new(NsCode(100), "b"))],
+                vec![Binding::sid(Sid::new(NsCode(100), "c"))],
             ],
         );
         let mut config = super::super::config::FormatterConfig::agent_json();
@@ -752,9 +755,12 @@ mod tests {
             vec![vec![
                 Binding::lit(
                     FlakeValue::Json(r#"{"k":[1,2]}"#.to_string()),
-                    Sid::new(3, "JSON"),
+                    Sid::new(NsCode(3), "JSON"),
                 ),
-                Binding::lit(FlakeValue::Vector(vec![1.0, -2.5]), Sid::new(2, "double")),
+                Binding::lit(
+                    FlakeValue::Vector(vec![1.0, -2.5]),
+                    Sid::new(NsCode(2), "double"),
+                ),
             ]],
         );
         assert_parity(&r, &super::super::config::FormatterConfig::agent_json());

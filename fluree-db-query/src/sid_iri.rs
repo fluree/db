@@ -11,7 +11,7 @@ use std::io;
 /// (common for novelty-only subjects or post-index namespace allocations).
 #[inline]
 pub(crate) fn sid_to_store_s_id(store: &BinaryIndexStore, sid: &Sid) -> io::Result<Option<u64>> {
-    if let Some(s_id) = store.find_subject_id_by_parts(sid.namespace_code, &sid.name)? {
+    if let Some(s_id) = store.find_subject_id_by_parts(sid.namespace_code.as_u16(), &sid.name)? {
         return Ok(Some(s_id));
     }
     match store.sid_to_iri(sid) {

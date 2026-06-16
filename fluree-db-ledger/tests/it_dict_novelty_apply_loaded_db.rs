@@ -5,7 +5,7 @@
 //! then re-populate `DictNovelty` from the remaining novelty flakes; otherwise
 //! novelty-only subject/string IDs can’t be decoded later (e.g. "string id N not found").
 
-use fluree_db_core::{Flake, FlakeValue, LedgerSnapshot, Sid};
+use fluree_db_core::{Flake, FlakeValue, LedgerSnapshot, NsCode, Sid};
 use fluree_db_ledger::LedgerState;
 use fluree_db_novelty::Novelty;
 
@@ -27,9 +27,9 @@ fn apply_loaded_db_repopulates_dict_novelty_for_remaining_overlay_strings() {
     let mut state = LedgerState::new(snapshot, Novelty::new(1));
     let reverse_graph = state.snapshot.build_reverse_graph().unwrap_or_default();
 
-    let s = Sid::new(0, "ex:s");
-    let p = Sid::new(0, "ex:p");
-    let dt = Sid::new(2, "string");
+    let s = Sid::new(NsCode(0), "ex:s");
+    let p = Sid::new(NsCode(0), "ex:p");
+    let dt = Sid::new(NsCode(2), "string");
 
     let flakes_t2 = vec![Flake::new(
         s.clone(),

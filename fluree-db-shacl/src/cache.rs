@@ -189,12 +189,12 @@ mod tests {
     use super::*;
     use crate::compile::{Severity, TargetType};
     use fluree_db_core::SidInterner;
-    use fluree_db_core::{IndexSchema, SchemaPredicateInfo, SchemaPredicates};
+    use fluree_db_core::{IndexSchema, NsCode, SchemaPredicateInfo, SchemaPredicates};
 
     fn make_test_shape(id_name: &str, target_class: Sid) -> CompiledShape {
         let interner = SidInterner::new();
         CompiledShape {
-            id: interner.intern(100, id_name),
+            id: interner.intern(NsCode(100), id_name),
             targets: vec![TargetType::Class(target_class)],
             property_shapes: vec![],
             node_constraints: vec![],
@@ -214,10 +214,10 @@ mod tests {
         let vals: Vec<SchemaPredicateInfo> = entries
             .into_iter()
             .map(|(ns, name, subclass_of)| {
-                let id = interner.intern(ns, name);
+                let id = interner.intern(NsCode(ns), name);
                 let subclass_of: Vec<Sid> = subclass_of
                     .into_iter()
-                    .map(|(ns, name)| interner.intern(ns, name))
+                    .map(|(ns, name)| interner.intern(NsCode(ns), name))
                     .collect();
                 SchemaPredicateInfo {
                     id,
@@ -247,8 +247,8 @@ mod tests {
     #[test]
     fn test_cache_without_hierarchy() {
         let interner = SidInterner::new();
-        let animal = interner.intern(100, "Animal");
-        let dog = interner.intern(100, "Dog");
+        let animal = interner.intern(NsCode(100), "Animal");
+        let dog = interner.intern(NsCode(100), "Dog");
 
         let shape = make_test_shape("AnimalShape", animal.clone());
         let key = ShaclCacheKey::new("test", 1);
@@ -264,9 +264,9 @@ mod tests {
         // Dog rdfs:subClassOf Animal
         let (hierarchy, interner) = make_hierarchy(vec![(100, "Dog", vec![(100, "Animal")])]);
 
-        let animal = interner.intern(100, "Animal");
-        let dog = interner.intern(100, "Dog");
-        let cat = interner.intern(100, "Cat"); // Not in hierarchy
+        let animal = interner.intern(NsCode(100), "Animal");
+        let dog = interner.intern(NsCode(100), "Dog");
+        let cat = interner.intern(NsCode(100), "Cat"); // Not in hierarchy
 
         let shape = make_test_shape("AnimalShape", animal.clone());
         let key = ShaclCacheKey::new("test", 1);
@@ -287,9 +287,9 @@ mod tests {
             (100, "Dog", vec![(100, "Animal")]),
         ]);
 
-        let animal = interner.intern(100, "Animal");
-        let dog = interner.intern(100, "Dog");
-        let poodle = interner.intern(100, "Poodle");
+        let animal = interner.intern(NsCode(100), "Animal");
+        let dog = interner.intern(NsCode(100), "Dog");
+        let poodle = interner.intern(NsCode(100), "Poodle");
 
         let shape = make_test_shape("AnimalShape", animal.clone());
         let key = ShaclCacheKey::new("test", 1);
@@ -306,8 +306,8 @@ mod tests {
         // Dog rdfs:subClassOf Animal
         let (hierarchy, interner) = make_hierarchy(vec![(100, "Dog", vec![(100, "Animal")])]);
 
-        let animal = interner.intern(100, "Animal");
-        let dog = interner.intern(100, "Dog");
+        let animal = interner.intern(NsCode(100), "Animal");
+        let dog = interner.intern(NsCode(100), "Dog");
 
         // Two shapes: one targeting Animal, one targeting Dog
         let animal_shape = make_test_shape("AnimalShape", animal.clone());
@@ -338,10 +338,10 @@ mod tests {
             (100, "C", vec![(100, "A")]),
         ]);
 
-        let a = interner.intern(100, "A");
-        let b = interner.intern(100, "B");
-        let c = interner.intern(100, "C");
-        let d = interner.intern(100, "D");
+        let a = interner.intern(NsCode(100), "A");
+        let b = interner.intern(NsCode(100), "B");
+        let c = interner.intern(NsCode(100), "C");
+        let d = interner.intern(NsCode(100), "D");
 
         let shape = make_test_shape("AShape", a.clone());
         let key = ShaclCacheKey::new("test", 1);

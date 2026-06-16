@@ -53,14 +53,14 @@ pub fn dedup_retractions(retractions: Vec<Flake>) -> Vec<Flake> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fluree_db_core::{FlakeValue, Sid};
+    use fluree_db_core::{FlakeValue, NsCode, Sid};
 
     fn make_flake(s: u16, p: u16, o: i64, t: i64, op: bool) -> Flake {
         Flake::new(
-            Sid::new(s, format!("s{s}")),
-            Sid::new(p, format!("p{p}")),
+            Sid::new(NsCode(s), format!("s{s}")),
+            Sid::new(NsCode(p), format!("p{p}")),
             FlakeValue::Long(o),
-            Sid::new(2, "long"),
+            Sid::new(NsCode(2), "long"),
             t,
             op,
             None,
@@ -117,9 +117,9 @@ mod tests {
 
         // Should be sorted by SPOT (subject first)
         assert_eq!(result.len(), 3);
-        assert_eq!(result[0].s.namespace_code, 1);
-        assert_eq!(result[1].s.namespace_code, 2);
-        assert_eq!(result[2].s.namespace_code, 3);
+        assert_eq!(result[0].s.namespace_code, NsCode(1));
+        assert_eq!(result[1].s.namespace_code, NsCode(2));
+        assert_eq!(result[2].s.namespace_code, NsCode(3));
     }
 
     #[test]
@@ -135,7 +135,7 @@ mod tests {
         let result = apply_cancellation(flakes);
 
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0].s.namespace_code, 3);
+        assert_eq!(result[0].s.namespace_code, NsCode(3));
     }
 
     #[test]

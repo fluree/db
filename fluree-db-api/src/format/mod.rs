@@ -625,7 +625,7 @@ mod tests {
     // large-scale parity check.
     // ====================================================================
 
-    use fluree_db_core::{FlakeValue, Sid};
+    use fluree_db_core::{FlakeValue, NsCode, Sid};
     use fluree_db_query::binding::{Batch, Binding};
     use std::hint::black_box;
     use std::sync::Arc;
@@ -641,10 +641,10 @@ mod tests {
     /// Build an `n`-row `QueryResult` for one of the data shapes.
     fn bench_result(shape: &str, n: usize) -> QueryResult {
         let mut vars = VarRegistry::new();
-        let xsd_long = Sid::new(2, "long");
-        let xsd_double = Sid::new(2, "double");
-        let xsd_string = Sid::new(2, "string");
-        let xsd_bool = Sid::new(2, "boolean");
+        let xsd_long = Sid::new(NsCode(2), "long");
+        let xsd_double = Sid::new(NsCode(2), "double");
+        let xsd_string = Sid::new(NsCode(2), "string");
+        let xsd_bool = Sid::new(NsCode(2), "boolean");
 
         let (names, cols): (Vec<&str>, Vec<Vec<Binding>>) = match shape {
             // All numeric literals (Long + Double).
@@ -665,7 +665,7 @@ mod tests {
             "strings" => {
                 let names = vec!["?id", "?name", "?desc"];
                 let id = (0..n)
-                    .map(|i| Binding::sid(Sid::new(100, format!("item{i}"))))
+                    .map(|i| Binding::sid(Sid::new(NsCode(100), format!("item{i}"))))
                     .collect();
                 let name = (0..n)
                     .map(|i| {
@@ -688,7 +688,7 @@ mod tests {
             _mixed => {
                 let names = vec!["?id", "?name", "?age", "?score", "?active"];
                 let id = (0..n)
-                    .map(|i| Binding::sid(Sid::new(100, format!("person{i}"))))
+                    .map(|i| Binding::sid(Sid::new(NsCode(100), format!("person{i}"))))
                     .collect();
                 let name = (0..n)
                     .map(|i| {

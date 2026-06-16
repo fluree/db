@@ -1491,11 +1491,16 @@ mod tests {
     use super::*;
     use crate::ir::triple::Term;
     use crate::ir::GraphName;
+    use fluree_db_core::NsCode;
     use fluree_db_core::{PropertyStatData, Sid, StatsView};
     use std::sync::Arc;
 
     fn make_pattern(s: VarId, p_name: &str, o: VarId) -> TriplePattern {
-        TriplePattern::new(Ref::Var(s), Ref::Sid(Sid::new(100, p_name)), Term::Var(o))
+        TriplePattern::new(
+            Ref::Var(s),
+            Ref::Sid(Sid::new(NsCode(100), p_name)),
+            Term::Var(o),
+        )
     }
 
     #[test]
@@ -1508,8 +1513,8 @@ mod tests {
 
         // Anchored at a constant subject => bounded closure (selective).
         let anchored = Pattern::PropertyPath(PropertyPathPattern::new(
-            Ref::Sid(Sid::new(9, "c912")),
-            Sid::new(1, "broader"),
+            Ref::Sid(Sid::new(NsCode(9), "c912")),
+            Sid::new(NsCode(1), "broader"),
             PathModifier::OneOrMore,
             Ref::Var(b),
         ));
@@ -1521,7 +1526,7 @@ mod tests {
         // Both endpoints free => genuinely unbounded, keep the world-scan estimate.
         let unanchored = Pattern::PropertyPath(PropertyPathPattern::new(
             Ref::Var(VarId(2)),
-            Sid::new(1, "broader"),
+            Sid::new(NsCode(1), "broader"),
             PathModifier::OneOrMore,
             Ref::Var(b),
         ));
@@ -1534,12 +1539,12 @@ mod tests {
         // when written after it — otherwise the planner full-scans prefLabel (88s).
         let pref = Pattern::Triple(TriplePattern::new(
             Ref::Var(b),
-            Ref::Sid(Sid::new(2, "prefLabel")),
+            Ref::Sid(Sid::new(NsCode(2), "prefLabel")),
             Term::Var(lbl),
         ));
         let mut stats = StatsView::default();
         stats.properties.insert(
-            Sid::new(2, "prefLabel"),
+            Sid::new(NsCode(2), "prefLabel"),
             PropertyStatData {
                 count: 150_000,
                 ndv_values: 150_000,
@@ -1629,16 +1634,22 @@ mod tests {
         let y = VarId(3);
 
         // Joinable with seed (?s)
-        let joinable =
-            TriplePattern::new(Ref::Var(s), Ref::Sid(Sid::new(100, "wide")), Term::Var(o1));
+        let joinable = TriplePattern::new(
+            Ref::Var(s),
+            Ref::Sid(Sid::new(NsCode(100), "wide")),
+            Term::Var(o1),
+        );
 
         // Not joinable with seed, but extremely selective
-        let non_joining =
-            TriplePattern::new(Ref::Var(x), Ref::Sid(Sid::new(100, "narrow")), Term::Var(y));
+        let non_joining = TriplePattern::new(
+            Ref::Var(x),
+            Ref::Sid(Sid::new(NsCode(100), "narrow")),
+            Term::Var(y),
+        );
 
         let mut stats = StatsView::default();
         stats.properties.insert(
-            Sid::new(100, "wide"),
+            Sid::new(NsCode(100), "wide"),
             fluree_db_core::PropertyStatData {
                 count: 1_000_000,
                 ndv_values: 1_000_000,
@@ -1646,7 +1657,7 @@ mod tests {
             },
         );
         stats.properties.insert(
-            Sid::new(100, "narrow"),
+            Sid::new(NsCode(100), "narrow"),
             fluree_db_core::PropertyStatData {
                 count: 1,
                 ndv_values: 1,
@@ -1687,20 +1698,24 @@ mod tests {
         let review = VarId(2);
         let reviewer = VarId(3);
         let pat = |s: VarId, p: &str, o: Term| {
-            Pattern::Triple(TriplePattern::new(Ref::Var(s), Ref::Sid(Sid::new(1, p)), o))
+            Pattern::Triple(TriplePattern::new(
+                Ref::Var(s),
+                Ref::Sid(Sid::new(NsCode(1), p)),
+                o,
+            ))
         };
         let patterns = vec![
             pat(product, "producer", Term::Var(producer)),
-            pat(producer, "country", Term::Sid(Sid::new(9, "DE"))),
+            pat(producer, "country", Term::Sid(Sid::new(NsCode(9), "DE"))),
             pat(review, "reviewFor", Term::Var(product)),
             pat(review, "reviewer", Term::Var(reviewer)),
-            pat(reviewer, "country", Term::Sid(Sid::new(9, "US"))),
+            pat(reviewer, "country", Term::Sid(Sid::new(NsCode(9), "US"))),
         ];
 
         let mut stats = StatsView::default();
         let mut put = |name: &str, count: u64, ndv_values: u64| {
             stats.properties.insert(
-                Sid::new(1, name),
+                Sid::new(NsCode(1), name),
                 PropertyStatData {
                     count,
                     ndv_values,
@@ -1775,7 +1790,7 @@ mod tests {
         // If stats were consulted during planning, p_z should be ordered first.
         let mut stats = StatsView::default();
         stats.properties.insert(
-            Sid::new(100, "a"),
+            Sid::new(NsCode(100), "a"),
             PropertyStatData {
                 count: 1000,
                 ndv_values: 1000,
@@ -1783,7 +1798,7 @@ mod tests {
             },
         );
         stats.properties.insert(
-            Sid::new(100, "z"),
+            Sid::new(NsCode(100), "z"),
             PropertyStatData {
                 count: 1,
                 ndv_values: 1,
@@ -1838,8 +1853,8 @@ mod tests {
         // Bound-object existence predicates are allowed when the star still shares one subject.
         let p2_bound = TriplePattern::new(
             Ref::Var(VarId(0)),
-            Ref::Sid(Sid::new(100, "type")),
-            Term::Sid(Sid::new(100, "Deal")),
+            Ref::Sid(Sid::new(NsCode(100), "type")),
+            Term::Sid(Sid::new(NsCode(100), "Deal")),
         );
         assert!(is_property_join(&[p1.clone(), p2_bound]));
 
@@ -2582,9 +2597,18 @@ mod tests {
         let values = Pattern::Values {
             vars: vec![VarId(0)],
             rows: vec![
-                vec![Binding::lit(FlakeValue::Long(1), Sid::new(2, "long"))],
-                vec![Binding::lit(FlakeValue::Long(2), Sid::new(2, "long"))],
-                vec![Binding::lit(FlakeValue::Long(3), Sid::new(2, "long"))],
+                vec![Binding::lit(
+                    FlakeValue::Long(1),
+                    Sid::new(NsCode(2), "long"),
+                )],
+                vec![Binding::lit(
+                    FlakeValue::Long(2),
+                    Sid::new(NsCode(2), "long"),
+                )],
+                vec![Binding::lit(
+                    FlakeValue::Long(3),
+                    Sid::new(NsCode(2), "long"),
+                )],
             ],
         };
 
@@ -2600,7 +2624,7 @@ mod tests {
         // UNION of two branches with known property selectivity
         let mut stats = StatsView::default();
         stats.properties.insert(
-            Sid::new(100, "a"),
+            Sid::new(NsCode(100), "a"),
             PropertyStatData {
                 count: 100,
                 ndv_values: 50,
@@ -2608,7 +2632,7 @@ mod tests {
             },
         );
         stats.properties.insert(
-            Sid::new(100, "b"),
+            Sid::new(NsCode(100), "b"),
             PropertyStatData {
                 count: 200,
                 ndv_values: 100,
@@ -2753,7 +2777,7 @@ mod tests {
         // Selective union: single small branch
         let union = Pattern::Union(vec![vec![Pattern::Triple(TriplePattern::new(
             Ref::Var(s),
-            Ref::Sid(Sid::new(100, "rare")),
+            Ref::Sid(Sid::new(NsCode(100), "rare")),
             Term::Value(FlakeValue::String("specific".to_string())),
         ))]]);
 
@@ -2762,7 +2786,7 @@ mod tests {
 
         let mut stats = StatsView::default();
         stats.properties.insert(
-            Sid::new(100, "rare"),
+            Sid::new(NsCode(100), "rare"),
             PropertyStatData {
                 count: 5,
                 ndv_values: 5,
@@ -2770,7 +2794,7 @@ mod tests {
             },
         );
         stats.properties.insert(
-            Sid::new(100, "wide"),
+            Sid::new(NsCode(100), "wide"),
             PropertyStatData {
                 count: 1_000_000,
                 ndv_values: 500_000,
@@ -2809,7 +2833,7 @@ mod tests {
     fn test_estimate_branch_cardinality() {
         let mut stats = StatsView::default();
         stats.properties.insert(
-            Sid::new(100, "name"),
+            Sid::new(NsCode(100), "name"),
             PropertyStatData {
                 count: 1000,
                 ndv_values: 500,

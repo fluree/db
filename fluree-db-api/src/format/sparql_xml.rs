@@ -436,7 +436,7 @@ fn strip_question_mark(var_name: &str) -> String {
 mod tests {
     use super::*;
 
-    use fluree_db_core::Sid;
+    use fluree_db_core::{NsCode, Sid};
     use fluree_db_query::binding::Batch;
     use fluree_db_query::var_registry::VarRegistry;
 
@@ -447,7 +447,10 @@ mod tests {
         namespaces.insert(2, "http://www.w3.org/2001/XMLSchema#".to_string());
         // BLANK_NODE (code 10) is registered with the "_:" prefix in production
         // (default_namespace_codes); mirror that so blank-node Sids resolve.
-        namespaces.insert(fluree_vocab::namespaces::BLANK_NODE, "_:".to_string());
+        namespaces.insert(
+            fluree_vocab::namespaces::BLANK_NODE.as_u16(),
+            "_:".to_string(),
+        );
         IriCompactor::from_namespaces(std::sync::Arc::new(namespaces))
     }
 
@@ -485,7 +488,7 @@ mod tests {
         result.output = fluree_db_query::ir::QueryOutput::select_all(vec![s_var]);
 
         let schema = std::sync::Arc::from(vec![s_var].into_boxed_slice());
-        let sid = Sid::new(100, "alice");
+        let sid = Sid::new(NsCode(100), "alice");
         let batch = Batch::single_row(schema, vec![Binding::sid(sid)]).unwrap();
         result.batches = vec![batch];
 
@@ -535,7 +538,7 @@ mod tests {
             &["?v"],
             vec![vec![Binding::lit(
                 FlakeValue::String("Alice".to_string()),
-                Sid::new(2, "string"),
+                Sid::new(NsCode(2), "string"),
             )]],
         );
         let xml = fmt(&r, &c);
@@ -552,7 +555,7 @@ mod tests {
             &["?v"],
             vec![vec![Binding::lit(
                 FlakeValue::Long(42),
-                Sid::new(2, "long"),
+                Sid::new(NsCode(2), "long"),
             )]],
         );
         let xml = fmt(&r, &c);
@@ -567,7 +570,7 @@ mod tests {
             &["?v"],
             vec![vec![Binding::lit(
                 FlakeValue::String("2024-01-15".to_string()),
-                Sid::new(2, "date"),
+                Sid::new(NsCode(2), "date"),
             )]],
         );
         let xml = fmt(&r, &c);
@@ -601,7 +604,10 @@ mod tests {
     fn blank_node_stripped_and_framed() {
         let c = make_test_compactor();
         // EMPTY namespace (code 0) carries the verbatim IRI, here a `_:` label.
-        let r = make_result(&["?v"], vec![vec![Binding::sid(Sid::new(0, "_:b1"))]]);
+        let r = make_result(
+            &["?v"],
+            vec![vec![Binding::sid(Sid::new(NsCode(0), "_:b1"))]],
+        );
         let xml = fmt(&r, &c);
         assert!(xml.contains("<bnode>b1</bnode>"), "{xml}");
         assert!(!xml.contains("<uri>"), "{xml}");
@@ -637,7 +643,7 @@ mod tests {
                 &["?v"],
                 vec![vec![Binding::lit(
                     FlakeValue::Double(d),
-                    Sid::new(2, "double"),
+                    Sid::new(NsCode(2), "double"),
                 )]],
             );
             let xml = fmt(&r, &c);
@@ -650,7 +656,10 @@ mod tests {
         let c = make_test_compactor();
         let r = make_result(
             &["?a", "?b"],
-            vec![vec![Binding::sid(Sid::new(100, "x")), Binding::Unbound]],
+            vec![vec![
+                Binding::sid(Sid::new(NsCode(100), "x")),
+                Binding::Unbound,
+            ]],
         );
         let xml = fmt(&r, &c);
         assert!(xml.contains(r#"<binding name="a">"#), "{xml}");
@@ -664,8 +673,8 @@ mod tests {
         let r = make_result(
             &["?zebra", "?apple"],
             vec![vec![
-                Binding::sid(Sid::new(100, "z")),
-                Binding::sid(Sid::new(100, "a")),
+                Binding::sid(Sid::new(NsCode(100), "z")),
+                Binding::sid(Sid::new(NsCode(100), "a")),
             ]],
         );
         let xml = fmt(&r, &c);
@@ -681,7 +690,7 @@ mod tests {
             &["?v"],
             vec![vec![Binding::lit(
                 FlakeValue::String("a & b < c > d".to_string()),
-                Sid::new(2, "string"),
+                Sid::new(NsCode(2), "string"),
             )]],
         );
         let xml = fmt(&r, &c);
@@ -696,12 +705,12 @@ mod tests {
             &["?a", "?b"],
             vec![vec![
                 Binding::Grouped(vec![
-                    Binding::lit(FlakeValue::Long(10), Sid::new(2, "long")),
-                    Binding::lit(FlakeValue::Long(20), Sid::new(2, "long")),
+                    Binding::lit(FlakeValue::Long(10), Sid::new(NsCode(2), "long")),
+                    Binding::lit(FlakeValue::Long(20), Sid::new(NsCode(2), "long")),
                 ]),
                 Binding::Grouped(vec![
-                    Binding::lit(FlakeValue::Long(1), Sid::new(2, "long")),
-                    Binding::lit(FlakeValue::Long(2), Sid::new(2, "long")),
+                    Binding::lit(FlakeValue::Long(1), Sid::new(NsCode(2), "long")),
+                    Binding::lit(FlakeValue::Long(2), Sid::new(NsCode(2), "long")),
                 ]),
             ]],
         );
@@ -739,9 +748,9 @@ mod tests {
         let mut r = make_result(
             &["?s"],
             vec![
-                vec![Binding::sid(Sid::new(100, "a"))],
-                vec![Binding::sid(Sid::new(100, "b"))],
-                vec![Binding::sid(Sid::new(100, "c"))],
+                vec![Binding::sid(Sid::new(NsCode(100), "a"))],
+                vec![Binding::sid(Sid::new(NsCode(100), "b"))],
+                vec![Binding::sid(Sid::new(NsCode(100), "c"))],
             ],
         );
         let s_var = r.vars.get_or_insert("?s");

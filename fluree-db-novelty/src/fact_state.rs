@@ -80,13 +80,14 @@ impl NoveltyFactState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fluree_db_core::NsCode;
 
     fn mk(s: u16, op: bool, lang: Option<&str>) -> Flake {
         Flake::new(
-            Sid::new(1, format!("s{s}")),
-            Sid::new(1, "p"),
+            Sid::new(NsCode(1), format!("s{s}")),
+            Sid::new(NsCode(1), "p"),
             FlakeValue::Long(7),
-            Sid::new(2, "long"),
+            Sid::new(NsCode(2), "long"),
             1,
             op,
             lang.map(FlakeMeta::with_lang),

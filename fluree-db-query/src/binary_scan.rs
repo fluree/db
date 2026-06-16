@@ -240,7 +240,7 @@ impl EncodedPreFilter {
                     return false;
                 }
                 fluree_db_core::subject_id::SubjectId::from_u64(o_key).ns_code()
-                    == fluree_vocab::namespaces::BLANK_NODE
+                    == fluree_vocab::namespaces::BLANK_NODE.as_u16()
             }
             EncodedPreFilter::SubjectEqObjectRef => {
                 let is_ref = o_type == fluree_db_core::o_type::OType::IRI_REF.as_u16()
@@ -1006,7 +1006,7 @@ impl BinaryScanOperator {
         }
         dict_novelty
             .subjects
-            .find_subject(sid.namespace_code, sid.name.as_ref())
+            .find_subject(sid.namespace_code.as_u16(), sid.name.as_ref())
     }
 
     /// Resolve s_id → Sid with caching.
@@ -1033,7 +1033,7 @@ impl BinaryScanOperator {
         self.p_sids
             .get(p_id as usize)
             .cloned()
-            .unwrap_or_else(|| Sid::new(0, ""))
+            .unwrap_or_else(|| Sid::new(fluree_db_core::NsCode(0), ""))
     }
 
     /// Filter: skip internal db: predicates when predicate is a variable.
@@ -1950,7 +1950,8 @@ impl Operator for BinaryScanOperator {
             for (sid, ep_id) in &ephemeral_preds {
                 let idx = *ep_id as usize;
                 if idx >= self.p_sids.len() {
-                    self.p_sids.resize(idx + 1, Sid::new(0, ""));
+                    self.p_sids
+                        .resize(idx + 1, Sid::new(fluree_db_core::NsCode(0), ""));
                 }
                 self.p_sids[idx] = sid.clone();
             }
@@ -2381,13 +2382,16 @@ fn resolve_subject_v3(
     dict_novelty: Option<&Arc<fluree_db_core::dict_novelty::DictNovelty>>,
 ) -> std::io::Result<u64> {
     // 1. Persisted (canonical encoding guarantees exact-parts match)
-    if let Some(id) = store.find_subject_id_by_parts(sid.namespace_code, &sid.name)? {
+    if let Some(id) = store.find_subject_id_by_parts(sid.namespace_code.as_u16(), &sid.name)? {
         return Ok(id);
     }
     // 2. DictNovelty
     if let Some(dn) = dict_novelty {
         if dn.is_initialized() {
-            if let Some(id) = dn.subjects.find_subject(sid.namespace_code, &sid.name) {
+            if let Some(id) = dn
+                .subjects
+                .find_subject(sid.namespace_code.as_u16(), &sid.name)
+            {
                 return Ok(id);
             }
         }

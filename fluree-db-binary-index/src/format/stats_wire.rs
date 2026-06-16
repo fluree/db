@@ -30,7 +30,7 @@ use std::io;
 
 /// Encode a `Sid` as `(ns_code: u16 LE, suffix_len: u16 LE, suffix_bytes)`.
 fn write_sid(buf: &mut Vec<u8>, sid: &Sid) {
-    buf.extend_from_slice(&sid.namespace_code.to_le_bytes());
+    buf.extend_from_slice(&sid.namespace_code.as_u16().to_le_bytes());
     let name_bytes = sid.name.as_bytes();
     buf.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
     buf.extend_from_slice(name_bytes);
@@ -60,7 +60,10 @@ fn read_sid(data: &[u8], pos: usize) -> io::Result<(Sid, usize)> {
         )
     })?;
     p += suffix_len;
-    Ok((Sid::new(ns_code, suffix), p))
+    Ok((
+        Sid::new(fluree_db_core::NsCode::from_u16(ns_code), suffix),
+        p,
+    ))
 }
 
 /// Decode a `(ns_code, suffix_string)` tuple. Returns `((ns_code, suffix), bytes_consumed)`.
@@ -820,9 +823,10 @@ pub fn decode_schema_with_len(data: &[u8]) -> io::Result<(IndexSchema, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fluree_db_core::NsCode;
 
     fn sid(ns: u16, name: &str) -> Sid {
-        Sid::new(ns, name)
+        Sid::new(NsCode::from_u16(ns), name)
     }
 
     // ---- Stats tests ----

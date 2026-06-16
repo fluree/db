@@ -1442,17 +1442,18 @@ impl RowAccess for BindingRow<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fluree_db_core::NsCode;
 
     fn test_sid() -> Sid {
-        Sid::new(100, "test")
+        Sid::new(NsCode(100), "test")
     }
 
     fn xsd_long() -> Sid {
-        Sid::new(2, "long")
+        Sid::new(NsCode(2), "long")
     }
 
     fn xsd_string() -> Sid {
-        Sid::new(2, "string")
+        Sid::new(NsCode(2), "string")
     }
 
     #[test]
@@ -1530,8 +1531,8 @@ mod tests {
         let schema: Arc<[VarId]> = Arc::from(vec![VarId(0), VarId(1)].into_boxed_slice());
         let columns = vec![
             vec![
-                Binding::sid(Sid::new(1, "a")),
-                Binding::sid(Sid::new(1, "b")),
+                Binding::sid(Sid::new(NsCode(1), "a")),
+                Binding::sid(Sid::new(NsCode(1), "b")),
             ],
             vec![
                 Binding::lit(FlakeValue::Long(10), xsd_long()),
@@ -1898,7 +1899,7 @@ mod tests {
         // Same ledger alias (Arc pointer equality) and same SID -> should match
         let alias: Arc<str> = Arc::from("test/ledger");
         let iri: Arc<str> = Arc::from("http://example.org/person/1");
-        let sid = Sid::new(100, "person1");
+        let sid = Sid::new(NsCode(100), "person1");
 
         let a = Binding::IriMatch {
             primary_sid: sid.clone(),
@@ -1918,8 +1919,8 @@ mod tests {
     fn test_eq_for_join_same_ledger_different_sid() {
         // Same ledger alias but different SIDs -> should NOT match
         let alias: Arc<str> = Arc::from("test/ledger");
-        let sid_a = Sid::new(100, "person1");
-        let sid_b = Sid::new(100, "person2");
+        let sid_a = Sid::new(NsCode(100), "person1");
+        let sid_b = Sid::new(NsCode(100), "person2");
 
         let a = Binding::IriMatch {
             primary_sid: sid_a,
@@ -1941,7 +1942,7 @@ mod tests {
         // Tests that we don't just rely on Arc::ptr_eq
         let alias_a: Arc<str> = Arc::from("test/ledger");
         let alias_b: Arc<str> = Arc::from("test/ledger"); // Different Arc, same value
-        let sid = Sid::new(100, "person1");
+        let sid = Sid::new(NsCode(100), "person1");
         let iri: Arc<str> = Arc::from("http://example.org/person/1");
 
         let a = Binding::IriMatch {
@@ -1967,8 +1968,8 @@ mod tests {
         let iri: Arc<str> = Arc::from("http://example.org/shared/entity");
 
         // Note: Different SIDs because namespace_codes are per-ledger
-        let sid_a = Sid::new(100, "entity"); // namespace 100 in ledger_a
-        let sid_b = Sid::new(200, "entity"); // namespace 200 in ledger_b (different!)
+        let sid_a = Sid::new(NsCode(100), "entity"); // namespace 100 in ledger_a
+        let sid_b = Sid::new(NsCode(200), "entity"); // namespace 200 in ledger_b (different!)
 
         let a = Binding::IriMatch {
             primary_sid: sid_a,
@@ -1993,12 +1994,12 @@ mod tests {
         let alias_b: Arc<str> = Arc::from("ledger_b");
 
         let a = Binding::IriMatch {
-            primary_sid: Sid::new(100, "entity1"),
+            primary_sid: Sid::new(NsCode(100), "entity1"),
             ledger_alias: alias_a,
             iri: Arc::from("http://example.org/entity/1"),
         };
         let b = Binding::IriMatch {
-            primary_sid: Sid::new(100, "entity2"),
+            primary_sid: Sid::new(NsCode(100), "entity2"),
             ledger_alias: alias_b,
             iri: Arc::from("http://example.org/entity/2"),
         };
@@ -2019,7 +2020,7 @@ mod tests {
         assert!(a.eq_for_join(&b));
 
         // Different SIDs should not match
-        let c = Binding::sid(Sid::new(999, "other"));
+        let c = Binding::sid(Sid::new(NsCode(999), "other"));
         assert!(!a.eq_for_join(&c));
     }
 

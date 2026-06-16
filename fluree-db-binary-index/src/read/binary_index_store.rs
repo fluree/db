@@ -20,7 +20,7 @@ use fluree_db_core::GraphId;
 use fluree_db_core::{
     ContentId, ContentStore, FlakeMeta, FlakeValue, PrefixTrie, RuntimeSmallDicts, Sid,
 };
-use fluree_vocab::{geo_names, jsonld_names, namespaces, rdf_names, xsd_names};
+use fluree_vocab::{geo_names, jsonld_names, namespaces, rdf_names, xsd_names, NsCode};
 use parking_lot::RwLock;
 
 use crate::dict::forward_pack::{KIND_STRING_FWD, KIND_SUBJECT_FWD};
@@ -830,7 +830,7 @@ impl BinaryIndexStore {
                 // Blank node: o_key is an opaque bnode integer, not a subject dict ID.
                 // Synthesize a blank node IRI `_:b{o_key}` and encode as a Sid.
                 let bnode_iri = format!("_:b{o_key}");
-                Ok(FlakeValue::Ref(Sid::new(0, &bnode_iri)))
+                Ok(FlakeValue::Ref(Sid::new(NsCode(0), &bnode_iri)))
             }
             DecodeKind::IriRef => {
                 let iri = self.resolve_subject_iri(o_key).map_err(|e| {
@@ -1078,7 +1078,7 @@ impl BinaryIndexStore {
                 format!("subject local_id {local_id} not found in ns {ns_code}"),
             )
         })?;
-        if ns_code == namespaces::EMPTY || ns_code == namespaces::OVERFLOW {
+        if ns_code == namespaces::EMPTY.as_u16() || ns_code == namespaces::OVERFLOW.as_u16() {
             return Ok(suffix);
         }
         let prefix = self.dicts.namespace_codes.get(&ns_code).ok_or_else(|| {
@@ -1240,9 +1240,9 @@ impl BinaryIndexStore {
         );
         let (canonical_prefix, canonical_suffix) = canonical_split(iri, self.ns_split_mode);
         if let Some(&code) = self.dicts.namespace_reverse.get(canonical_prefix) {
-            return Sid::new(code, canonical_suffix);
+            return Sid::new(NsCode::from_u16(code), canonical_suffix);
         }
-        Sid::new(0, iri)
+        Sid::new(NsCode(0), iri)
     }
 
     /// Resolve language ID to BCP 47 tag string.
@@ -1367,12 +1367,12 @@ impl BinaryIndexStore {
     /// - Unknown code: returns `None`.
     pub fn sid_to_iri(&self, sid: &Sid) -> Option<String> {
         // EMPTY (0) and OVERFLOW (0xFFFE) store the full IRI as sid.name
-        if sid.namespace_code == 0 || sid.namespace_code == 0xFFFE {
+        if sid.namespace_code == namespaces::EMPTY || sid.namespace_code == namespaces::OVERFLOW {
             return Some(sid.name.to_string());
         }
         self.dicts
             .namespace_codes
-            .get(&sid.namespace_code)
+            .get(&sid.namespace_code.as_u16())
             .map(|prefix| format!("{}{}", prefix, sid.name))
     }
 
@@ -1387,7 +1387,7 @@ impl BinaryIndexStore {
     }
 
     fn find_full_iri_subject_fallback(&self, iri: &str) -> io::Result<Option<(u16, u64)>> {
-        for ns_code in [namespaces::EMPTY, namespaces::OVERFLOW] {
+        for ns_code in [namespaces::EMPTY.as_u16(), namespaces::OVERFLOW.as_u16()] {
             if !self.dicts.subject_forward_packs.contains_key(&ns_code) {
                 continue;
             }
@@ -1425,12 +1425,12 @@ impl BinaryIndexStore {
                 .reverse_lookup_subject_key(ns_code, canonical_suffix.as_bytes())?
                 .is_some()
             {
-                return Ok(Some(Sid::new(ns_code, canonical_suffix)));
+                return Ok(Some(Sid::new(NsCode::from_u16(ns_code), canonical_suffix)));
             }
         }
         Ok(self
             .find_full_iri_subject_fallback(iri)?
-            .map(|(ns_code, _s_id)| Sid::new(ns_code, iri)))
+            .map(|(ns_code, _s_id)| Sid::new(NsCode::from_u16(ns_code), iri)))
     }
 
     /// Translate a `Sid` to `p_id` via the predicate reverse map.
@@ -1881,14 +1881,18 @@ fn compare_prefix_suffix_bytes(
 // ============================================================================
 
 impl NsLookup for BinaryIndexStore {
-    fn code_for_prefix(&self, prefix: &str) -> Option<u16> {
-        self.dicts.namespace_reverse.get(prefix).copied()
+    fn code_for_prefix(&self, prefix: &str) -> Option<NsCode> {
+        self.dicts
+            .namespace_reverse
+            .get(prefix)
+            .copied()
+            .map(NsCode::from_u16)
     }
 
-    fn prefix_for_code(&self, code: u16) -> Option<&str> {
+    fn prefix_for_code(&self, code: NsCode) -> Option<&str> {
         self.dicts
             .namespace_codes
-            .get(&code)
+            .get(&code.as_u16())
             .map(std::string::String::as_str)
     }
 }
@@ -2183,7 +2187,7 @@ impl BinaryGraphView {
         // This avoids format!("{prefix}{suffix}") + encode_iri() trie lookup.
         dn.subjects
             .resolve_subject(s_id)
-            .map(|(ns_code, suffix)| Sid::new(ns_code, suffix))
+            .map(|(ns_code, suffix)| Sid::new(NsCode::from_u16(ns_code), suffix))
     }
 
     /// If `s_id` is above the watermark, resolve from DictNovelty to a full
@@ -2351,9 +2355,9 @@ async fn build_dictionary_set(
         .map(|iri| {
             let (canonical_prefix, canonical_suffix) = canonical_split(iri, root.ns_split_mode);
             if let Some(&code) = namespace_reverse.get(canonical_prefix) {
-                Sid::new(code, canonical_suffix)
+                Sid::new(NsCode::from_u16(code), canonical_suffix)
             } else {
-                Sid::new(0, iri)
+                Sid::new(NsCode(0), iri)
             }
         })
         .collect();
@@ -2859,17 +2863,17 @@ mod tests {
         let mut store = empty_store(Arc::new(MemoryContentStore::new()), cache_dir);
 
         let full_iri = "https://dblp.org/streams/conf/IEEEpact";
-        let s_id = SubjectId::new(namespaces::OVERFLOW, 7).as_u64();
+        let s_id = SubjectId::new(namespaces::OVERFLOW.as_u16(), 7).as_u64();
 
         store.dicts.subject_reverse_tree = Some(build_reverse_reader(vec![ReverseEntry {
             key: crate::dict::reverse_leaf::subject_reverse_key(
-                namespaces::OVERFLOW,
+                namespaces::OVERFLOW.as_u16(),
                 full_iri.as_bytes(),
             ),
             id: s_id,
         }]));
         store.dicts.subject_forward_packs.insert(
-            namespaces::OVERFLOW,
+            namespaces::OVERFLOW.as_u16(),
             ForwardPackReader::from_memory(vec![Arc::from(
                 make_subject_pack_bytes(&[(7, full_iri.as_bytes())]).into_boxed_slice(),
             )])

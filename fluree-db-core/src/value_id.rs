@@ -21,7 +21,7 @@
 //! remain distinguishable.
 
 use crate::Sid;
-use fluree_vocab::{jsonld_names, namespaces, rdf_names, xsd_names};
+use fluree_vocab::{jsonld_names, namespaces, rdf_names, xsd_names, NsCode};
 use std::fmt;
 use std::sync::OnceLock;
 
@@ -632,7 +632,7 @@ impl ValueTypeTag {
     /// This is the primary entry point for the resolver. Matches against
     /// well-known `fluree_vocab` namespace codes and local names.
     #[inline]
-    pub fn from_ns_name(ns_code: u16, name: &str) -> Self {
+    pub fn from_ns_name(ns_code: NsCode, name: &str) -> Self {
         match ns_code {
             namespaces::XSD => Self::from_xsd_name(name),
             namespaces::RDF => Self::from_rdf_name(name),
@@ -1570,7 +1570,7 @@ mod tests {
             ValueTypeTag::UNKNOWN
         );
         assert_eq!(
-            ValueTypeTag::from_ns_name(99, "anything"),
+            ValueTypeTag::from_ns_name(NsCode(99), "anything"),
             ValueTypeTag::UNKNOWN
         );
     }

@@ -796,6 +796,7 @@ impl Operator for PropertyPathOperator {
 mod tests {
     use super::*;
     use crate::ir::triple::Ref;
+    use fluree_db_core::NsCode;
     use fluree_db_core::Sid;
 
     fn make_pattern(subj: Ref, pred: Sid, modifier: PathModifier, obj: Ref) -> PropertyPathPattern {
@@ -806,8 +807,8 @@ mod tests {
     fn test_property_path_schema_forward() {
         // Subject constant, object variable -> schema has only object var
         let pattern = make_pattern(
-            Ref::Sid(Sid::new(1, "alice")),
-            Sid::new(2, "knows"),
+            Ref::Sid(Sid::new(NsCode(1), "alice")),
+            Sid::new(NsCode(2), "knows"),
             PathModifier::OneOrMore,
             Ref::Var(VarId(0)),
         );
@@ -822,9 +823,9 @@ mod tests {
         // Subject variable, object constant -> schema has only subject var
         let pattern = make_pattern(
             Ref::Var(VarId(0)),
-            Sid::new(2, "knows"),
+            Sid::new(NsCode(2), "knows"),
             PathModifier::ZeroOrMore,
-            Ref::Sid(Sid::new(1, "bob")),
+            Ref::Sid(Sid::new(NsCode(1), "bob")),
         );
 
         let op: PropertyPathOperator = PropertyPathOperator::with_defaults(None, pattern);
@@ -837,7 +838,7 @@ mod tests {
         // Both subject and object are variables
         let pattern = make_pattern(
             Ref::Var(VarId(0)),
-            Sid::new(2, "knows"),
+            Sid::new(NsCode(2), "knows"),
             PathModifier::OneOrMore,
             Ref::Var(VarId(1)),
         );
@@ -850,8 +851,8 @@ mod tests {
     #[test]
     fn test_property_path_max_visited_configurable() {
         let pattern = make_pattern(
-            Ref::Sid(Sid::new(1, "alice")),
-            Sid::new(2, "knows"),
+            Ref::Sid(Sid::new(NsCode(1), "alice")),
+            Sid::new(NsCode(2), "knows"),
             PathModifier::OneOrMore,
             Ref::Var(VarId(0)),
         );

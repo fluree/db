@@ -141,6 +141,7 @@ mod tests {
     use super::*;
     use crate::sid::Sid;
     use crate::value::FlakeValue;
+    use fluree_vocab::NsCode;
 
     /// Test overlay that stores a fixed set of flakes
     struct TestOverlay {
@@ -177,10 +178,10 @@ mod tests {
 
     fn make_flake(s: u16, t: i64) -> Flake {
         Flake::new(
-            Sid::new(s, format!("s{s}")),
-            Sid::new(1, "p"),
+            Sid::new(NsCode::from_u16(s), format!("s{s}")),
+            Sid::new(NsCode(1), "p"),
             FlakeValue::Long(100),
-            Sid::new(2, "long"),
+            Sid::new(NsCode(2), "long"),
             t,
             true,
             None,
@@ -225,7 +226,7 @@ mod tests {
             true,
             100,
             &mut |f| {
-                collected.push(f.s.namespace_code);
+                collected.push(f.s.namespace_code.as_u16());
             },
         );
         assert_eq!(collected, vec![1, 2, 3]);
@@ -246,7 +247,7 @@ mod tests {
             None,
             true,
             2, // Only include t <= 2
-            &mut |f| collected.push(f.s.namespace_code),
+            &mut |f| collected.push(f.s.namespace_code.as_u16()),
         );
         assert_eq!(collected, vec![1, 2]);
     }

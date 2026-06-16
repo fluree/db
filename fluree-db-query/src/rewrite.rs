@@ -513,6 +513,7 @@ mod tests {
     use super::*;
     use crate::ir::triple::Ref;
     use crate::var_registry::VarId;
+    use fluree_db_core::NsCode;
     use fluree_db_core::{IndexSchema, SchemaPredicateInfo, SchemaPredicates};
     use fluree_db_core::{Sid, SidInterner};
     use fluree_vocab::namespaces::RDF;
@@ -527,14 +528,14 @@ mod tests {
         // Dog and Cat are subclasses of Animal
         let vals = vec![
             SchemaPredicateInfo {
-                id: interner.intern(100, "Dog"),
-                subclass_of: vec![interner.intern(100, "Animal")],
+                id: interner.intern(NsCode(100), "Dog"),
+                subclass_of: vec![interner.intern(NsCode(100), "Animal")],
                 parent_props: vec![],
                 child_props: vec![],
             },
             SchemaPredicateInfo {
-                id: interner.intern(100, "Cat"),
-                subclass_of: vec![interner.intern(100, "Animal")],
+                id: interner.intern(NsCode(100), "Cat"),
+                subclass_of: vec![interner.intern(NsCode(100), "Animal")],
                 parent_props: vec![],
                 child_props: vec![],
             },
@@ -566,7 +567,7 @@ mod tests {
         let pattern = Pattern::Triple(TriplePattern::new(
             Ref::Var(VarId(0)),
             Ref::Sid(make_rdf_type()),
-            Term::Sid(Sid::new(100, "Animal")),
+            Term::Sid(Sid::new(NsCode(100), "Animal")),
         ));
 
         let ctx = PlanContext {
@@ -586,7 +587,7 @@ mod tests {
         let pattern = Pattern::Triple(TriplePattern::new(
             Ref::Var(VarId(0)),
             Ref::Sid(make_rdf_type()),
-            Term::Sid(Sid::new(100, "Animal")),
+            Term::Sid(Sid::new(NsCode(100), "Animal")),
         ));
 
         let ctx = PlanContext {
@@ -605,7 +606,7 @@ mod tests {
     #[test]
     fn test_type_hydration() {
         let interner = SidInterner::new();
-        let animal = interner.intern(100, "Animal");
+        let animal = interner.intern(NsCode(100), "Animal");
 
         let pattern = Pattern::Triple(TriplePattern::new(
             Ref::Var(VarId(0)),
@@ -661,8 +662,8 @@ mod tests {
 
         let pattern = Pattern::Triple(TriplePattern::new(
             Ref::Var(VarId(0)),
-            Ref::Sid(interner.intern(100, "name")), // Not rdf:type
-            Term::Sid(interner.intern(100, "Animal")),
+            Ref::Sid(interner.intern(NsCode(100), "name")), // Not rdf:type
+            Term::Sid(interner.intern(NsCode(100), "Animal")),
         ));
 
         let ctx = PlanContext {
@@ -683,11 +684,11 @@ mod tests {
         let interner = SidInterner::new();
 
         // Create a hierarchy with many subclasses
-        let animal = interner.intern(100, "Animal");
+        let animal = interner.intern(NsCode(100), "Animal");
         let mut vals = Vec::new();
         for i in 0..100 {
             vals.push(SchemaPredicateInfo {
-                id: interner.intern(100, &format!("SubClass{i}")),
+                id: interner.intern(NsCode(100), &format!("SubClass{i}")),
                 subclass_of: vec![animal.clone()],
                 parent_props: vec![],
                 child_props: vec![],
@@ -742,7 +743,7 @@ mod tests {
     #[test]
     fn test_optional_pattern_hydration() {
         let interner = SidInterner::new();
-        let animal = interner.intern(100, "Animal");
+        let animal = interner.intern(NsCode(100), "Animal");
 
         let inner_pattern = Pattern::Triple(TriplePattern::new(
             Ref::Var(VarId(0)),
@@ -780,14 +781,14 @@ mod tests {
         let interner = SidInterner::new();
 
         // Create a hierarchy with many subclasses for two different classes
-        let class_a = interner.intern(100, "ClassA");
-        let class_b = interner.intern(100, "ClassB");
+        let class_a = interner.intern(NsCode(100), "ClassA");
+        let class_b = interner.intern(NsCode(100), "ClassB");
 
         let mut vals = Vec::new();
         // 30 subclasses of ClassA
         for i in 0..30 {
             vals.push(SchemaPredicateInfo {
-                id: interner.intern(100, &format!("SubA{i}")),
+                id: interner.intern(NsCode(100), &format!("SubA{i}")),
                 subclass_of: vec![class_a.clone()],
                 parent_props: vec![],
                 child_props: vec![],
@@ -796,7 +797,7 @@ mod tests {
         // 30 subclasses of ClassB
         for i in 0..30 {
             vals.push(SchemaPredicateInfo {
-                id: interner.intern(100, &format!("SubB{i}")),
+                id: interner.intern(NsCode(100), &format!("SubB{i}")),
                 subclass_of: vec![class_b.clone()],
                 parent_props: vec![],
                 child_props: vec![],
@@ -857,7 +858,7 @@ mod tests {
     #[test]
     fn test_zero_global_budget_never_emits_empty_union() {
         let interner = SidInterner::new();
-        let animal = interner.intern(100, "Animal");
+        let animal = interner.intern(NsCode(100), "Animal");
 
         let pattern = Pattern::Triple(TriplePattern::new(
             Ref::Var(VarId(0)),
@@ -891,15 +892,15 @@ mod tests {
         // hasFurColor and hasSkinColor are subproperties of hasColor
         let vals = vec![
             SchemaPredicateInfo {
-                id: interner.intern(100, "hasFurColor"),
+                id: interner.intern(NsCode(100), "hasFurColor"),
                 subclass_of: vec![],
-                parent_props: vec![interner.intern(100, "hasColor")],
+                parent_props: vec![interner.intern(NsCode(100), "hasColor")],
                 child_props: vec![],
             },
             SchemaPredicateInfo {
-                id: interner.intern(100, "hasSkinColor"),
+                id: interner.intern(NsCode(100), "hasSkinColor"),
                 subclass_of: vec![],
-                parent_props: vec![interner.intern(100, "hasColor")],
+                parent_props: vec![interner.intern(NsCode(100), "hasColor")],
                 child_props: vec![],
             },
         ];
@@ -923,7 +924,7 @@ mod tests {
     #[test]
     fn test_predicate_hydration() {
         let interner = SidInterner::new();
-        let has_color = interner.intern(100, "hasColor");
+        let has_color = interner.intern(NsCode(100), "hasColor");
 
         let pattern = Pattern::Triple(TriplePattern::new(
             Ref::Var(VarId(0)),
@@ -981,7 +982,7 @@ mod tests {
 
         let pattern = Pattern::Triple(TriplePattern::new(
             Ref::Var(VarId(0)),
-            Ref::Sid(interner.intern(100, "unknownProp")), // No subproperties
+            Ref::Sid(interner.intern(NsCode(100), "unknownProp")), // No subproperties
             Term::Var(VarId(1)),
         ));
 
@@ -1004,11 +1005,11 @@ mod tests {
         let interner = SidInterner::new();
 
         // Create a hierarchy with many subproperties
-        let has_attr = interner.intern(100, "hasAttr");
+        let has_attr = interner.intern(NsCode(100), "hasAttr");
         let mut vals = Vec::new();
         for i in 0..100 {
             vals.push(SchemaPredicateInfo {
-                id: interner.intern(100, &format!("subProp{i}")),
+                id: interner.intern(NsCode(100), &format!("subProp{i}")),
                 subclass_of: vec![],
                 parent_props: vec![has_attr.clone()],
                 child_props: vec![],
@@ -1066,20 +1067,20 @@ mod tests {
         let interner = SidInterner::new();
 
         // Create hierarchy with both class and property hierarchies
-        let animal = interner.intern(100, "Animal");
-        let has_color = interner.intern(100, "hasColor");
+        let animal = interner.intern(NsCode(100), "Animal");
+        let has_color = interner.intern(NsCode(100), "hasColor");
 
         let vals = vec![
             // Dog is a subclass of Animal
             SchemaPredicateInfo {
-                id: interner.intern(100, "Dog"),
+                id: interner.intern(NsCode(100), "Dog"),
                 subclass_of: vec![animal.clone()],
                 parent_props: vec![],
                 child_props: vec![],
             },
             // hasFurColor is a subproperty of hasColor
             SchemaPredicateInfo {
-                id: interner.intern(100, "hasFurColor"),
+                id: interner.intern(NsCode(100), "hasFurColor"),
                 subclass_of: vec![],
                 parent_props: vec![has_color.clone()],
                 child_props: vec![],

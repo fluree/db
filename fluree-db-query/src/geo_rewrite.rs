@@ -309,11 +309,12 @@ fn apply_rewrites(patterns: Vec<Pattern>, mut candidates: Vec<GeoCandidate>) -> 
 mod tests {
     use super::*;
     use crate::var_registry::VarRegistry;
+    use fluree_db_core::NsCode;
 
     fn mock_encoder(iri: &str) -> Option<Sid> {
         match iri {
-            "http://example.org/location" => Some(Sid::new(1, "location")),
-            "http://example.org/name" => Some(Sid::new(2, "name")),
+            "http://example.org/location" => Some(Sid::new(NsCode(1), "location")),
+            "http://example.org/name" => Some(Sid::new(NsCode(2), "name")),
             _ => None,
         }
     }
@@ -388,7 +389,7 @@ mod tests {
         let loc_var = vars.get_or_insert("?loc");
         let dist_var = vars.get_or_insert("?dist");
 
-        let pred_sid = Sid::new(1, "location");
+        let pred_sid = Sid::new(NsCode(1), "location");
 
         // Build: Triple(?place, location, ?loc), Bind(?dist = distance), Filter(?dist < 1000)
         let patterns = vec![
@@ -435,7 +436,7 @@ mod tests {
         let loc_var = vars.get_or_insert("?loc");
         let dist_var = vars.get_or_insert("?dist");
 
-        let pred_sid = Sid::new(1, "location");
+        let pred_sid = Sid::new(NsCode(1), "location");
 
         // Build patterns where ?loc is also used in another pattern
         let patterns = vec![
@@ -487,7 +488,7 @@ mod tests {
         let loc_var = vars.get_or_insert("?loc");
         let dist_var = vars.get_or_insert("?dist");
 
-        let pred_sid = Sid::new(1, "location");
+        let pred_sid = Sid::new(NsCode(1), "location");
 
         // Build: Triple + Bind without Filter
         let patterns = vec![
@@ -634,7 +635,7 @@ mod tests {
         let loc_var = vars.get_or_insert("?loc");
         let dist_var = vars.get_or_insert("?dist");
 
-        let pred_sid = Sid::new(1, "location");
+        let pred_sid = Sid::new(NsCode(1), "location");
 
         // Build pattern inside Optional
         let inner_patterns = vec![

@@ -263,14 +263,15 @@ fn bindings_compatible_for_values(ctx: &ExecutionContext<'_>, a: &Binding, b: &B
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fluree_db_core::NsCode;
     use fluree_db_core::{FlakeValue, Sid};
 
     fn xsd_long() -> Sid {
-        Sid::new(2, "long")
+        Sid::new(NsCode(2), "long")
     }
 
     fn xsd_string() -> Sid {
-        Sid::new(2, "string")
+        Sid::new(NsCode(2), "string")
     }
 
     #[test]

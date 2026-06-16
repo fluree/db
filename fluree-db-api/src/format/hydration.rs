@@ -1655,10 +1655,11 @@ impl<'a> HydrationFormatter<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fluree_db_core::NsCode;
 
     #[test]
     fn test_cache_key_different_depths() {
-        let sid = Sid::new(100, "alice");
+        let sid = Sid::new(NsCode(100), "alice");
         let spec_hash = 12345u64;
         let view_a = 0usize;
 
@@ -1712,8 +1713,8 @@ mod tests {
 
     #[test]
     fn level_hash_distinguishes_properties() {
-        let pred1 = Sid::new(1, "name");
-        let pred2 = Sid::new(2, "age");
+        let pred1 = Sid::new(NsCode(1), "name");
+        let pred2 = Sid::new(NsCode(2), "age");
 
         let hash1 = compute_level_hash(&explicit(vec![ForwardItem::Property {
             predicate: pred1.clone(),
@@ -1735,7 +1736,7 @@ mod tests {
 
     #[test]
     fn level_hash_distinguishes_reverse() {
-        let rev_pred = Sid::new(10, "friendOf");
+        let rev_pred = Sid::new(NsCode(10), "friendOf");
 
         let hash_no_reverse = compute_level_hash(&wildcard());
 

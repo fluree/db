@@ -325,7 +325,10 @@ impl Materializer {
                 match self.mode {
                     JoinKeyMode::SingleLedger => {
                         // In single-ledger mode, (namespace_code, name) is a valid key
-                        JoinKey::MaterializedSid(sid.namespace_code, Cow::Borrowed(&sid.name))
+                        JoinKey::MaterializedSid(
+                            sid.namespace_code.as_u16(),
+                            Cow::Borrowed(&sid.name),
+                        )
                     }
                     JoinKeyMode::MultiLedger => {
                         // In multi-ledger mode, namespace codes may differ across ledgers,
@@ -335,7 +338,7 @@ impl Materializer {
                             Some(iri) => JoinKey::IriOwned(Arc::from(iri)),
                             None => {
                                 tracing::error!(
-                                    ns_code = sid.namespace_code,
+                                    ns_code = sid.namespace_code.as_u16(),
                                     suffix = %sid.name,
                                     "sid_to_iri: unknown namespace code in materializer join_key \
                                      — this is a data corruption signal"
@@ -480,7 +483,7 @@ impl Materializer {
                     Some(iri) => Some(Arc::from(iri)),
                     None => {
                         tracing::error!(
-                            ns_code = sid.namespace_code,
+                            ns_code = sid.namespace_code.as_u16(),
                             suffix = %sid.name,
                             "sid_to_iri: unknown namespace code in materializer as_string \
                              — this is a data corruption signal"
@@ -573,7 +576,7 @@ impl Materializer {
                         .dt_sids()
                         .get(*dt_id as usize)
                         .cloned()
-                        .unwrap_or_else(|| Sid::new(0, ""));
+                        .unwrap_or_else(|| Sid::new(fluree_db_core::NsCode(0), ""));
                     let meta = self.graph_view.store().decode_meta(*lang_id, *i_val);
                     let dtc = match meta.and_then(|m| m.lang.map(Arc::from)) {
                         Some(lang) => DatatypeConstraint::LangTag(lang),
@@ -631,7 +634,7 @@ impl Materializer {
 
         let sid = match self.graph_view.resolve_subject_sid(s_id) {
             Ok(sid) => sid,
-            Err(_) => Sid::new(0, format!("_:unknown_{s_id}")),
+            Err(_) => Sid::new(fluree_db_core::NsCode(0), format!("_:unknown_{s_id}")),
         };
 
         self.sid_cache.insert(s_id, sid.clone());
@@ -651,7 +654,7 @@ impl Materializer {
                     p_id,
                     "resolve_predicate_iri failed — fabricating placeholder predicate"
                 );
-                Sid::new(0, format!("_:unknown_p_{p_id}"))
+                Sid::new(fluree_db_core::NsCode(0), format!("_:unknown_p_{p_id}"))
             }
         };
 

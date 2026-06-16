@@ -5,7 +5,7 @@
 //! - BIND expression evaluation
 //! - UNION branch execution
 
-use fluree_db_core::{FlakeValue, GraphDbRef, GraphId, LedgerSnapshot, NoOverlay, Sid};
+use fluree_db_core::{FlakeValue, GraphDbRef, GraphId, LedgerSnapshot, NoOverlay, NsCode, Sid};
 use fluree_db_query::binding::Binding;
 use fluree_db_query::context::ExecutionContext;
 use fluree_db_query::execute::{execute, ContextConfig, ExecutableQuery};
@@ -27,7 +27,7 @@ fn make_test_snapshot() -> LedgerSnapshot {
 fn make_triple_pattern(s_var: VarId, p_name: &str, o_var: VarId) -> TriplePattern {
     TriplePattern::new(
         Ref::Var(s_var),
-        Ref::Sid(Sid::new(100, p_name)),
+        Ref::Sid(Sid::new(NsCode(100), p_name)),
         Term::Var(o_var),
     )
 }
@@ -54,7 +54,7 @@ fn make_query(select: Vec<VarId>, patterns: Vec<Pattern>) -> Query {
 }
 
 fn xsd_long() -> Sid {
-    Sid::new(2, "long")
+    Sid::new(NsCode(2), "long")
 }
 
 /// Test VALUES at position 0 followed by a triple pattern
@@ -69,8 +69,8 @@ async fn test_values_first_then_join() {
     let vars = VarRegistry::new();
 
     // VALUES ?s { :sid1 :sid2 } followed by (?s :name ?n)
-    let sid1 = Sid::new(100, "alice");
-    let sid2 = Sid::new(100, "bob");
+    let sid1 = Sid::new(NsCode(100), "alice");
+    let sid2 = Sid::new(NsCode(100), "bob");
 
     let query = make_query(
         vec![VarId(0), VarId(1)], // SELECT ?s ?n

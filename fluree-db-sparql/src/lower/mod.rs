@@ -341,6 +341,7 @@ impl<'a, E: IriEncoder> LoweringContext<'a, E> {
 mod tests {
     use super::*;
     use crate::parse::parse_sparql;
+    use fluree_db_core::NsCode;
     use fluree_db_query::ir::triple::{Ref, Term};
     use fluree_db_query::ir::{AggregateFn, AggregateSpec, InputSemantics};
     use fluree_db_query::ir::{Expression, Grouping, PathModifier, Pattern};
@@ -676,7 +677,7 @@ mod tests {
         assert_eq!(query.patterns.len(), 1);
         if let Pattern::Triple(tp) = &query.patterns[0] {
             if let Ref::Sid(sid) = &tp.p {
-                assert_eq!(sid.namespace_code, 102); // foaf namespace
+                assert_eq!(sid.namespace_code, NsCode(102)); // foaf namespace
                 assert_eq!(sid.name.as_ref(), "name");
             } else {
                 panic!("Expected Sid for predicate");

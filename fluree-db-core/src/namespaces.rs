@@ -188,20 +188,28 @@ pub fn is_schema_class(cls: &Sid) -> bool {
 }
 
 /// Baseline namespace codes (code -> prefix) matching Fluree's reserved codepoints.
+///
+/// Keyed by the raw `u16` (the persisted/wire form of a namespace code), not
+/// `NsCode`: this map is consumed directly by `NamespaceCodes::from_code_to_prefix`
+/// and `PrefixTrie::from_namespace_codes`, both of which store codes in their
+/// raw form.
 pub fn default_namespace_codes() -> HashMap<u16, String> {
     let mut map = HashMap::new();
-    map.insert(EMPTY, String::new());
-    map.insert(JSON_LD, "@".to_string());
-    map.insert(XSD, fluree_vocab::xsd::NS.to_string());
-    map.insert(RDF, fluree_vocab::rdf::NS.to_string());
-    map.insert(RDFS, fluree_vocab::rdfs::NS.to_string());
-    map.insert(SHACL, fluree_vocab::shacl::NS.to_string());
-    map.insert(OWL, fluree_vocab::owl::NS.to_string());
-    map.insert(FLUREE_DB, fluree_vocab::fluree::DB.to_string());
-    map.insert(DID_KEY, "did:key:".to_string());
-    map.insert(FLUREE_COMMIT, fluree_vocab::fluree::COMMIT.to_string());
-    map.insert(BLANK_NODE, "_:".to_string());
-    map.insert(OGC_GEO, fluree_vocab::geo::NS.to_string());
-    map.insert(FLUREE_URN, fluree_vocab::fluree::URN.to_string());
+    map.insert(EMPTY.as_u16(), String::new());
+    map.insert(JSON_LD.as_u16(), "@".to_string());
+    map.insert(XSD.as_u16(), fluree_vocab::xsd::NS.to_string());
+    map.insert(RDF.as_u16(), fluree_vocab::rdf::NS.to_string());
+    map.insert(RDFS.as_u16(), fluree_vocab::rdfs::NS.to_string());
+    map.insert(SHACL.as_u16(), fluree_vocab::shacl::NS.to_string());
+    map.insert(OWL.as_u16(), fluree_vocab::owl::NS.to_string());
+    map.insert(FLUREE_DB.as_u16(), fluree_vocab::fluree::DB.to_string());
+    map.insert(DID_KEY.as_u16(), "did:key:".to_string());
+    map.insert(
+        FLUREE_COMMIT.as_u16(),
+        fluree_vocab::fluree::COMMIT.to_string(),
+    );
+    map.insert(BLANK_NODE.as_u16(), "_:".to_string());
+    map.insert(OGC_GEO.as_u16(), fluree_vocab::geo::NS.to_string());
+    map.insert(FLUREE_URN.as_u16(), fluree_vocab::fluree::URN.to_string());
     map
 }

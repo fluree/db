@@ -183,6 +183,7 @@ mod tests {
     use super::*;
     use crate::error::QueryError;
     use crate::var_registry::VarRegistry;
+    use fluree_db_core::NsCode;
     use fluree_db_core::{FlakeValue, LedgerSnapshot, Sid};
 
     /// Mock operator that emits predefined batches
@@ -252,7 +253,7 @@ mod tests {
     fn make_batch_with_values(schema: Arc<[VarId]>, values: Vec<i64>) -> Batch {
         let columns = vec![values
             .into_iter()
-            .map(|v| Binding::lit(FlakeValue::Long(v), Sid::new(1, "long")))
+            .map(|v| Binding::lit(FlakeValue::Long(v), Sid::new(NsCode(1), "long")))
             .collect()];
         Batch::new(schema, columns).unwrap()
     }
@@ -261,10 +262,10 @@ mod tests {
         assert_eq!(col1.len(), col2.len());
         let columns = vec![
             col1.into_iter()
-                .map(|v| Binding::lit(FlakeValue::Long(v), Sid::new(1, "long")))
+                .map(|v| Binding::lit(FlakeValue::Long(v), Sid::new(NsCode(1), "long")))
                 .collect(),
             col2.into_iter()
-                .map(|v| Binding::lit(FlakeValue::Long(v), Sid::new(1, "long")))
+                .map(|v| Binding::lit(FlakeValue::Long(v), Sid::new(NsCode(1), "long")))
                 .collect(),
         ];
         Batch::new(schema, columns).unwrap()
@@ -438,10 +439,10 @@ mod tests {
 
         let schema: Arc<[VarId]> = Arc::from(vec![VarId(0)].into_boxed_slice());
         let columns = vec![vec![
-            Binding::lit(FlakeValue::Long(1), Sid::new(1, "long")),
+            Binding::lit(FlakeValue::Long(1), Sid::new(NsCode(1), "long")),
             Binding::Unbound,
-            Binding::lit(FlakeValue::Long(1), Sid::new(1, "long")), // dupe of first
-            Binding::Unbound,                                       // dupe of second Unbound
+            Binding::lit(FlakeValue::Long(1), Sid::new(NsCode(1), "long")), // dupe of first
+            Binding::Unbound, // dupe of second Unbound
         ]];
         let batch = Batch::new(schema.clone(), columns).unwrap();
         let mock = MockOperator::new(vec![batch]);
@@ -463,10 +464,10 @@ mod tests {
 
         let schema: Arc<[VarId]> = Arc::from(vec![VarId(0)].into_boxed_slice());
         let columns = vec![vec![
-            Binding::lit(FlakeValue::Long(1), Sid::new(1, "long")),
+            Binding::lit(FlakeValue::Long(1), Sid::new(NsCode(1), "long")),
             Binding::Poisoned,
             Binding::Poisoned, // dupe of first Poisoned
-            Binding::lit(FlakeValue::Long(1), Sid::new(1, "long")), // dupe of first
+            Binding::lit(FlakeValue::Long(1), Sid::new(NsCode(1), "long")), // dupe of first
         ]];
         let batch = Batch::new(schema.clone(), columns).unwrap();
         let mock = MockOperator::new(vec![batch]);
@@ -493,7 +494,7 @@ mod tests {
                     .map(|row| {
                         Binding::lit(
                             FlakeValue::Long((col * 10 + row) as i64),
-                            Sid::new(1, "long"),
+                            Sid::new(NsCode(1), "long"),
                         )
                     })
                     .collect()

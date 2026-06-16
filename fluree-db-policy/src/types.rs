@@ -383,9 +383,10 @@ impl PolicyWrapper {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fluree_db_core::NsCode;
 
     fn make_sid(ns: u16, name: &str) -> Sid {
-        Sid::new(ns, name)
+        Sid::new(NsCode(ns), name)
     }
 
     #[test]

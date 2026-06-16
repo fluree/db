@@ -3204,13 +3204,14 @@ mod tests {
     use crate::ir::ReasoningConfig;
     use crate::ir::{Query, QueryOutput};
     use crate::sort::SortSpec;
+    use fluree_db_core::NsCode;
     use fluree_db_core::Sid;
     use fluree_graph_json_ld::ParsedContext;
 
     fn make_pattern(s_var: VarId, p_name: &str, o_var: VarId) -> TriplePattern {
         TriplePattern::new(
             Ref::Var(s_var),
-            Ref::Sid(Sid::new(100, p_name)),
+            Ref::Sid(Sid::new(NsCode(100), p_name)),
             Term::Var(o_var),
         )
     }
@@ -3291,10 +3292,10 @@ mod tests {
         let label = VarId(1);
         let v = VarId(2);
 
-        let p_label = Ref::Sid(Sid::new(100, "label"));
-        let p_num = Ref::Sid(Sid::new(100, "num"));
-        let p_c1 = Ref::Sid(Sid::new(100, "c1"));
-        let p_c2 = Ref::Sid(Sid::new(100, "c2"));
+        let p_label = Ref::Sid(Sid::new(NsCode(100), "label"));
+        let p_num = Ref::Sid(Sid::new(NsCode(100), "num"));
+        let p_c1 = Ref::Sid(Sid::new(NsCode(100), "c1"));
+        let p_c2 = Ref::Sid(Sid::new(NsCode(100), "c2"));
 
         let patterns = vec![
             Pattern::Triple(TriplePattern::new(
@@ -3305,12 +3306,12 @@ mod tests {
             Pattern::Triple(TriplePattern::new(
                 Ref::Var(s),
                 p_c1.clone(),
-                Term::Sid(Sid::new(100, "o1")),
+                Term::Sid(Sid::new(NsCode(100), "o1")),
             )),
             Pattern::Triple(TriplePattern::new(
                 Ref::Var(s),
                 p_c2.clone(),
-                Term::Sid(Sid::new(100, "o2")),
+                Term::Sid(Sid::new(NsCode(100), "o2")),
             )),
             Pattern::Triple(TriplePattern::new(Ref::Var(s), p_num.clone(), Term::Var(v))),
             Pattern::Filter(crate::ir::Expression::gt(
@@ -3421,8 +3422,8 @@ mod tests {
         let exists_o = VarId(1);
         let counted_o = VarId(2);
         let out = VarId(3);
-        let exists_pred = Ref::Sid(Sid::new(100, "rdf:type"));
-        let count_pred = Ref::Sid(Sid::new(100, "sourceLink"));
+        let exists_pred = Ref::Sid(Sid::new(NsCode(100), "rdf:type"));
+        let count_pred = Ref::Sid(Sid::new(NsCode(100), "sourceLink"));
 
         let make_grouping = || {
             Some(Grouping::Implicit {
@@ -3503,7 +3504,7 @@ mod tests {
         let o = VarId(1);
         let synth = VarId(2);
         let out = VarId(3);
-        let pred = Ref::Sid(Sid::new(100, "numberOfCreators"));
+        let pred = Ref::Sid(Sid::new(NsCode(100), "numberOfCreators"));
 
         // SELECT (SUM(?synth) AS ?out) WHERE { ?s <pred> ?o . BIND(?o > 0 AS ?synth) }
         let make_query = |function: AggregateFn| Query {
@@ -3566,9 +3567,9 @@ mod tests {
     fn test_detect_post_order_desc_limit() {
         let s = VarId(0);
         let o = VarId(1);
-        let date_pred = Ref::Sid(Sid::new(100, "dateModified"));
+        let date_pred = Ref::Sid(Sid::new(NsCode(100), "dateModified"));
         let rdf_type = Ref::Iri(std::sync::Arc::from(fluree_vocab::rdf::TYPE));
-        let class = Term::Sid(Sid::new(13, "Conversation"));
+        let class = Term::Sid(Sid::new(NsCode(13), "Conversation"));
 
         let anchor = Pattern::Triple(TriplePattern::new(Ref::Var(s), date_pred, Term::Var(o)));
         let type_tp = Pattern::Triple(TriplePattern::new(Ref::Var(s), rdf_type, class));
@@ -3700,14 +3701,14 @@ mod tests {
 
     #[test]
     fn test_post_order_class_profitability_gate() {
-        let pred = Ref::Sid(Sid::new(100, "dateModified"));
-        let class_sid = Sid::new(13, "Conversation");
+        let pred = Ref::Sid(Sid::new(NsCode(100), "dateModified"));
+        let class_sid = Sid::new(NsCode(13), "Conversation");
         let class = Term::Sid(class_sid.clone());
 
         let mk = |ndv_subjects: u64, class_count: u64| {
             let mut s = fluree_db_core::StatsView::default();
             s.properties.insert(
-                Sid::new(100, "dateModified"),
+                Sid::new(NsCode(100), "dateModified"),
                 fluree_db_core::PropertyStatData {
                     count: ndv_subjects,
                     ndv_values: ndv_subjects,

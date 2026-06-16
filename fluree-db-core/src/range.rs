@@ -375,11 +375,12 @@ fn remove_stale_flakes(flakes: Vec<Flake>) -> Vec<Flake> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fluree_vocab::NsCode;
 
     #[test]
     fn test_range_match_builders() {
-        let s = Sid::new(1, "test");
-        let p = Sid::new(2, "prop");
+        let s = Sid::new(NsCode(1), "test");
+        let p = Sid::new(NsCode(2), "prop");
 
         let m1 = RangeMatch::subject(s.clone());
         assert_eq!(m1.s, Some(s.clone()));

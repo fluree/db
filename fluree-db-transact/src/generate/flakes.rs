@@ -472,6 +472,7 @@ pub fn infer_datatype(val: &FlakeValue) -> Sid {
 mod tests {
     use super::*;
     use fluree_db_core::DatatypeConstraint;
+    use fluree_db_core::NsCode;
     use fluree_db_query::VarId;
     use std::sync::Arc;
 
@@ -486,8 +487,8 @@ mod tests {
         let mut generator = FlakeGenerator::new(1, &mut registry, "txn1".to_string());
 
         let templates = vec![TripleTemplate::new(
-            TemplateTerm::Sid(Sid::new(1, "ex:alice")),
-            TemplateTerm::Sid(Sid::new(1, "ex:name")),
+            TemplateTerm::Sid(Sid::new(NsCode(1), "ex:alice")),
+            TemplateTerm::Sid(Sid::new(NsCode(1), "ex:name")),
             TemplateTerm::Value(FlakeValue::String("Alice".to_string())),
         )];
 
@@ -506,8 +507,8 @@ mod tests {
         let mut generator = FlakeGenerator::new(1, &mut registry, "txn1".to_string());
 
         let templates = vec![TripleTemplate::new(
-            TemplateTerm::Sid(Sid::new(1, "ex:alice")),
-            TemplateTerm::Sid(Sid::new(1, "ex:name")),
+            TemplateTerm::Sid(Sid::new(NsCode(1), "ex:alice")),
+            TemplateTerm::Sid(Sid::new(NsCode(1), "ex:name")),
             TemplateTerm::Value(FlakeValue::String("Alice".to_string())),
         )];
 
@@ -525,7 +526,7 @@ mod tests {
 
         let templates = vec![TripleTemplate::new(
             TemplateTerm::BlankNode("_:b1".to_string()),
-            TemplateTerm::Sid(Sid::new(1, "ex:name")),
+            TemplateTerm::Sid(Sid::new(NsCode(1), "ex:name")),
             TemplateTerm::Value(FlakeValue::String("Test".to_string())),
         )];
 
@@ -567,20 +568,20 @@ mod tests {
         // Create templates with list indices
         let templates = vec![
             TripleTemplate::new(
-                TemplateTerm::Sid(Sid::new(1, "ex:alice")),
-                TemplateTerm::Sid(Sid::new(1, "ex:colors")),
+                TemplateTerm::Sid(Sid::new(NsCode(1), "ex:alice")),
+                TemplateTerm::Sid(Sid::new(NsCode(1), "ex:colors")),
                 TemplateTerm::Value(FlakeValue::String("red".to_string())),
             )
             .with_list_index(0),
             TripleTemplate::new(
-                TemplateTerm::Sid(Sid::new(1, "ex:alice")),
-                TemplateTerm::Sid(Sid::new(1, "ex:colors")),
+                TemplateTerm::Sid(Sid::new(NsCode(1), "ex:alice")),
+                TemplateTerm::Sid(Sid::new(NsCode(1), "ex:colors")),
                 TemplateTerm::Value(FlakeValue::String("green".to_string())),
             )
             .with_list_index(1),
             TripleTemplate::new(
-                TemplateTerm::Sid(Sid::new(1, "ex:alice")),
-                TemplateTerm::Sid(Sid::new(1, "ex:colors")),
+                TemplateTerm::Sid(Sid::new(NsCode(1), "ex:alice")),
+                TemplateTerm::Sid(Sid::new(NsCode(1), "ex:colors")),
                 TemplateTerm::Value(FlakeValue::String("blue".to_string())),
             )
             .with_list_index(2),
@@ -609,8 +610,8 @@ mod tests {
 
         // Create template with both language and list_index
         let templates = vec![TripleTemplate::new(
-            TemplateTerm::Sid(Sid::new(1, "ex:alice")),
-            TemplateTerm::Sid(Sid::new(1, "ex:names")),
+            TemplateTerm::Sid(Sid::new(NsCode(1), "ex:alice")),
+            TemplateTerm::Sid(Sid::new(NsCode(1), "ex:names")),
             TemplateTerm::Value(FlakeValue::String("Alice".to_string())),
         )
         .with_dtc(DatatypeConstraint::LangTag(Arc::from("en")))

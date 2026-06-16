@@ -870,7 +870,7 @@ impl std::fmt::Debug for DerivedFactsHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fluree_db_core::{RuntimeSmallDicts, Sid};
+    use fluree_db_core::{NsCode, RuntimeSmallDicts, Sid};
 
     fn make_test_snapshot() -> LedgerSnapshot {
         LedgerSnapshot::genesis("test:main")
@@ -1022,7 +1022,7 @@ mod tests {
         let snapshot = make_test_snapshot();
         let mut historical = HistoricalLedgerView::new(snapshot, None, 7);
         let runtime_small_dicts = Arc::new(RuntimeSmallDicts::from_seeded_sids(
-            [Sid::new(10, "name")],
+            [Sid::new(NsCode(10), "name")],
             [Sid::new(
                 fluree_vocab::namespaces::XSD,
                 fluree_vocab::xsd_names::STRING,
@@ -1035,7 +1035,7 @@ mod tests {
         assert_eq!(
             view.runtime_small_dicts
                 .as_ref()
-                .and_then(|dicts| dicts.predicate_id(&Sid::new(10, "name"))),
+                .and_then(|dicts| dicts.predicate_id(&Sid::new(NsCode(10), "name"))),
             Some(fluree_db_core::RuntimePredicateId::from_u32(0))
         );
     }

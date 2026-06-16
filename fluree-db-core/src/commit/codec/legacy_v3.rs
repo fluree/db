@@ -80,6 +80,7 @@ use super::varint::{read_exact, read_u8};
 use crate::sid::Sid;
 use crate::{Commit, CommitEnvelope, ContentId, TxnMetaEntry, TxnMetaValue, CODEC_FLUREE_COMMIT};
 use fluree_vocab::namespaces;
+use fluree_vocab::NsCode;
 use sha2::{Digest, Sha256};
 use std::sync::Once;
 
@@ -518,7 +519,7 @@ fn decode_sig_block_v3(data: &[u8]) -> Result<Vec<CommitSignature>, CommitCodecE
 /// Allowlists are intentionally narrow: only well-known vocabulary locals are
 /// accepted. Unknown locals pass through (they may be legitimate custom
 /// datatypes or unrelated strings).
-fn canonicalize_empty_curie_name(name: &str) -> Option<(u16, &'static str)> {
+fn canonicalize_empty_curie_name(name: &str) -> Option<(NsCode, &'static str)> {
     let (prefix, local) = name.split_once(':')?;
     match prefix {
         "xsd" => known_xsd_local(local).map(|l| (namespaces::XSD, l)),
@@ -552,7 +553,7 @@ fn known_rdfs_local(local: &str) -> Option<&'static str> {
 }
 
 /// Canonicalize an exact-match JSON-LD shorthand keyword (no other forms).
-fn canonicalize_jsonld_shorthand(name: &str) -> Option<(u16, &'static str)> {
+fn canonicalize_jsonld_shorthand(name: &str) -> Option<(NsCode, &'static str)> {
     match name {
         "@json" => Some((namespaces::RDF, "JSON")),
         "@vector" => Some((namespaces::FLUREE_DB, "embeddingVector")),
@@ -615,19 +616,23 @@ pub(in crate::commit::codec) fn canonicalize_dt_parts_static(
     dt_ns: u16,
     dt_name: &str,
 ) -> Option<(u16, &'static str)> {
-    match dt_ns {
-        namespaces::EMPTY => canonicalize_empty_curie_name(dt_name)
-            .or_else(|| canonicalize_jsonld_shorthand(dt_name)),
-        namespaces::JSON_LD => {
-            // Earlier aliasing: @json was sometimes encoded as
-            // `(JSON_LD, "json")` instead of `(RDF, "JSON")`.
-            if dt_name == "json" {
-                Some((namespaces::RDF, "JSON"))
-            } else {
-                None
-            }
+    // `dt_ns` is a raw wire namespace code (txn-meta parts representation), so
+    // this helper works in raw `u16`: the canonicalizers below yield `NsCode`,
+    // which is unwrapped back to the wire `u16` at the return boundary.
+    if dt_ns == namespaces::EMPTY.as_u16() {
+        canonicalize_empty_curie_name(dt_name)
+            .or_else(|| canonicalize_jsonld_shorthand(dt_name))
+            .map(|(ns, local)| (ns.as_u16(), local))
+    } else if dt_ns == namespaces::JSON_LD.as_u16() {
+        // Earlier aliasing: @json was sometimes encoded as
+        // `(JSON_LD, "json")` instead of `(RDF, "JSON")`.
+        if dt_name == "json" {
+            Some((namespaces::RDF.as_u16(), "JSON"))
+        } else {
+            None
         }
-        _ => None,
+    } else {
+        None
     }
 }
 
@@ -720,7 +725,7 @@ mod tests {
     fn canonicalize_sid_dynamic_prefix_is_none() {
         // Dynamic-prefix corruption (ns_code=14 etc.) is NOT handled here —
         // that's the resolver's job during replay.
-        let s = Sid::new(14, "string");
+        let s = Sid::new(NsCode(14), "string");
         assert!(canonicalize_dt_sid(&s).is_none());
     }
 
@@ -785,14 +790,14 @@ mod tests {
 
     #[test]
     fn canonicalize_parts_empty_xsd_curie() {
-        let (ns, name) = canonicalize_dt_parts(namespaces::EMPTY, "xsd:integer").unwrap();
-        assert_eq!(ns, namespaces::XSD);
+        let (ns, name) = canonicalize_dt_parts(namespaces::EMPTY.as_u16(), "xsd:integer").unwrap();
+        assert_eq!(ns, namespaces::XSD.as_u16());
         assert_eq!(name, "integer");
     }
 
     #[test]
     fn canonicalize_parts_already_canonical_is_none() {
-        assert!(canonicalize_dt_parts(namespaces::XSD, "string").is_none());
+        assert!(canonicalize_dt_parts(namespaces::XSD.as_u16(), "string").is_none());
     }
 
     #[test]
@@ -802,7 +807,7 @@ mod tests {
             predicate_name: "custom".to_string(),
             value: TxnMetaValue::TypedLiteral {
                 value: "42".to_string(),
-                dt_ns: namespaces::EMPTY,
+                dt_ns: namespaces::EMPTY.as_u16(),
                 dt_name: "xsd:integer".to_string(),
             },
         }];
@@ -810,7 +815,7 @@ mod tests {
         assert_eq!(count, 1);
         match &entries[0].value {
             TxnMetaValue::TypedLiteral { dt_ns, dt_name, .. } => {
-                assert_eq!(*dt_ns, namespaces::XSD);
+                assert_eq!(*dt_ns, namespaces::XSD.as_u16());
                 assert_eq!(dt_name, "integer");
             }
             _ => panic!("expected TypedLiteral"),
@@ -926,8 +931,8 @@ mod tests {
     /// Build a single flake with a given datatype Sid, for corruption tests.
     fn test_flake(dt: Sid, t: i64) -> Flake {
         Flake::new(
-            Sid::new(100, "s1"), // subject
-            Sid::new(100, "p1"), // predicate
+            Sid::new(NsCode(100), "s1"), // subject
+            Sid::new(NsCode(100), "p1"), // predicate
             FlakeValue::String("hello".to_string()),
             dt,
             t,
@@ -960,13 +965,13 @@ mod tests {
         // Dynamic-prefix corruption: ns_code=14 pointing at some dynamically
         // allocated prefix. The decoder MUST NOT rewrite this — it's the
         // resolver's job at replay time with chain context.
-        let corrupted_dt = Sid::new(14, "string");
+        let corrupted_dt = Sid::new(NsCode(14), "string");
         let flake = test_flake(corrupted_dt.clone(), 1);
         let blob = build_v3_test_blob(&[flake], 1);
 
         let commit = crate::commit::codec::read_commit(&blob).unwrap();
         // Decoder preserves the on-disk shape.
-        assert_eq!(commit.flakes[0].dt.namespace_code, 14);
+        assert_eq!(commit.flakes[0].dt.namespace_code, NsCode(14));
         assert_eq!(commit.flakes[0].dt.name.as_ref(), "string");
     }
 
@@ -998,7 +1003,7 @@ mod tests {
     fn v3_load_commit_ops_round_trip_passes_through_dynamic_prefix() {
         // Raw-op path is pass-through — dynamic-prefix datatypes survive
         // unchanged so the resolver can canonicalize during replay.
-        let corrupted_dt = Sid::new(14, "string");
+        let corrupted_dt = Sid::new(NsCode(14), "string");
         let flake = test_flake(corrupted_dt, 7);
         let blob = build_v3_test_blob(&[flake], 7);
 

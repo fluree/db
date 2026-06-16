@@ -275,11 +275,12 @@ impl TriplePattern {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fluree_db_core::NsCode;
 
     #[test]
     fn test_ref_is_var() {
         let var = Ref::Var(VarId(0));
-        let sid = Ref::Sid(Sid::new(1, "test"));
+        let sid = Ref::Sid(Sid::new(NsCode(1), "test"));
 
         assert!(var.is_var());
         assert!(!sid.is_var());
@@ -291,7 +292,7 @@ mod tests {
     #[test]
     fn test_term_is_var() {
         let var = Term::Var(VarId(0));
-        let sid = Term::Sid(Sid::new(1, "test"));
+        let sid = Term::Sid(Sid::new(NsCode(1), "test"));
         let val = Term::Value(FlakeValue::Long(42));
 
         assert!(var.is_var());
@@ -305,9 +306,9 @@ mod tests {
 
     #[test]
     fn test_ref_to_term_conversion() {
-        let r = Ref::Sid(Sid::new(1, "test"));
+        let r = Ref::Sid(Sid::new(NsCode(1), "test"));
         let t: Term = r.into();
-        assert_eq!(t, Term::Sid(Sid::new(1, "test")));
+        assert_eq!(t, Term::Sid(Sid::new(NsCode(1), "test")));
     }
 
     #[test]
@@ -324,7 +325,7 @@ mod tests {
     fn test_triple_pattern_variables() {
         let pattern = TriplePattern::new(
             Ref::Var(VarId(0)),
-            Ref::Sid(Sid::new(1, "name")),
+            Ref::Sid(Sid::new(NsCode(1), "name")),
             Term::Var(VarId(1)),
         );
 
@@ -338,7 +339,7 @@ mod tests {
     fn test_triple_pattern_bound_checks() {
         let pattern = TriplePattern::new(
             Ref::Var(VarId(0)),
-            Ref::Sid(Sid::new(1, "name")),
+            Ref::Sid(Sid::new(NsCode(1), "name")),
             Term::Value(FlakeValue::Long(42)),
         );
 

@@ -23,7 +23,7 @@
 use chrono::DateTime;
 use fluree_db_core::{Flake, FlakeValue, Sid};
 use fluree_vocab::namespaces::{FLUREE_COMMIT, FLUREE_DB, JSON_LD, XSD};
-use fluree_vocab::{db, xsd_names};
+use fluree_vocab::{db, xsd_names, NsCode};
 
 use crate::Commit;
 
@@ -193,7 +193,7 @@ pub fn generate_commit_flakes(commit: &Commit, ledger_id: &str, t: i64) -> Vec<F
 
     // 11+. txn_meta entries (user-provided and system-generated metadata)
     for entry in &commit.txn_meta {
-        let pred_sid = Sid::new(entry.predicate_ns, &entry.predicate_name);
+        let pred_sid = Sid::new(NsCode::from_u16(entry.predicate_ns), &entry.predicate_name);
         let (value, dt) = match &entry.value {
             crate::TxnMetaValue::String(s) => (FlakeValue::String(s.clone()), string_dt.clone()),
             crate::TxnMetaValue::TypedLiteral {
@@ -201,15 +201,16 @@ pub fn generate_commit_flakes(commit: &Commit, ledger_id: &str, t: i64) -> Vec<F
                 dt_ns,
                 dt_name,
             } => {
-                let dt_sid = Sid::new(*dt_ns, dt_name);
+                let dt_sid = Sid::new(NsCode::from_u16(*dt_ns), dt_name);
                 (FlakeValue::String(value.clone()), dt_sid)
             }
             crate::TxnMetaValue::LangString { value, lang: _ } => {
                 (FlakeValue::String(value.clone()), string_dt.clone())
             }
-            crate::TxnMetaValue::Ref { ns, name } => {
-                (FlakeValue::Ref(Sid::new(*ns, name)), ref_dt.clone())
-            }
+            crate::TxnMetaValue::Ref { ns, name } => (
+                FlakeValue::Ref(Sid::new(NsCode::from_u16(*ns), name)),
+                ref_dt.clone(),
+            ),
             crate::TxnMetaValue::Long(n) => (FlakeValue::Long(*n), long_dt.clone()),
             crate::TxnMetaValue::Double(n) => {
                 (FlakeValue::Double(*n), Sid::new(XSD, xsd_names::DOUBLE))

@@ -73,6 +73,7 @@ mod tests {
     use crate::planner::reorder_patterns;
     use crate::sort::SortSpec;
     use crate::var_registry::{VarId, VarRegistry};
+    use fluree_db_core::NsCode;
     use fluree_db_core::{
         FlakeValue, GraphDbRef, LedgerSnapshot, NoOverlay, PropertyStatData, Sid, StatsView,
     };
@@ -87,7 +88,7 @@ mod tests {
     fn make_pattern(s_var: VarId, p_name: &str, o_var: VarId) -> TriplePattern {
         TriplePattern::new(
             Ref::Var(s_var),
-            Ref::Sid(Sid::new(100, p_name)),
+            Ref::Sid(Sid::new(NsCode(100), p_name)),
             Term::Var(o_var),
         )
     }
@@ -232,12 +233,12 @@ mod tests {
             )),
             Pattern::Triple(TriplePattern::new(
                 Ref::Var(score),
-                Ref::Sid(Sid::new(100, "refersInstance")),
+                Ref::Sid(Sid::new(NsCode(100), "refersInstance")),
                 Term::Var(concept),
             )),
             Pattern::Triple(TriplePattern::new(
                 Ref::Var(concept),
-                Ref::Sid(Sid::new(100, "notation")),
+                Ref::Sid(Sid::new(NsCode(100), "notation")),
                 Term::Value(FlakeValue::String("LVL1".to_string())),
             )),
         ];
@@ -255,7 +256,7 @@ mod tests {
 
         let mut stats = StatsView::default();
         stats.properties.insert(
-            Sid::new(100, "notation"),
+            Sid::new(NsCode(100), "notation"),
             PropertyStatData {
                 count: 1_000_000,
                 ndv_values: 1_000_000,
@@ -263,7 +264,7 @@ mod tests {
             },
         );
         stats.properties.insert(
-            Sid::new(100, "hasScore"),
+            Sid::new(NsCode(100), "hasScore"),
             PropertyStatData {
                 count: 1_000_000_000,
                 ndv_values: 900_000_000,
@@ -271,7 +272,7 @@ mod tests {
             },
         );
         stats.properties.insert(
-            Sid::new(100, "refersInstance"),
+            Sid::new(NsCode(100), "refersInstance"),
             PropertyStatData {
                 count: 800_000_000,
                 ndv_values: 700_000_000,

@@ -891,7 +891,7 @@ pub fn commit_to_summary(commit: &Commit) -> CommitSummary {
     }
 
     let message = commit.txn_meta.iter().find_map(|entry| {
-        if entry.predicate_ns == fluree_vocab::namespaces::FLUREE_DB
+        if entry.predicate_ns == fluree_vocab::namespaces::FLUREE_DB.as_u16()
             && entry.predicate_name == "message"
         {
             if let TxnMetaValue::String(s) = &entry.value {
@@ -941,6 +941,7 @@ pub async fn walk_commit_summaries<C: ContentStore>(
 mod tests {
     use super::*;
     use crate::{ContentKind, Flake, FlakeValue, MemoryContentStore, Sid};
+    use fluree_vocab::NsCode;
 
     fn make_test_content_id(kind: ContentKind, label: &str) -> ContentId {
         ContentId::new(kind, label.as_bytes())
@@ -948,10 +949,10 @@ mod tests {
 
     fn make_test_flake(s: i64, p: i64, o: i64, t: i64) -> Flake {
         Flake::new(
-            Sid::new(s as u16, format!("s{s}")),
-            Sid::new(p as u16, format!("p{p}")),
+            Sid::new(NsCode::from_u16(s as u16), format!("s{s}")),
+            Sid::new(NsCode::from_u16(p as u16), format!("p{p}")),
             FlakeValue::Long(o),
-            Sid::new(2, "long"),
+            Sid::new(NsCode(2), "long"),
             t,
             true,
             None,
@@ -1353,10 +1354,10 @@ mod tests {
 
     fn make_retract_flake(s: i64, p: i64, o: i64, t: i64) -> Flake {
         Flake::new(
-            Sid::new(s as u16, format!("s{s}")),
-            Sid::new(p as u16, format!("p{p}")),
+            Sid::new(NsCode::from_u16(s as u16), format!("s{s}")),
+            Sid::new(NsCode::from_u16(p as u16), format!("p{p}")),
             FlakeValue::Long(o),
-            Sid::new(2, "long"),
+            Sid::new(NsCode(2), "long"),
             t,
             false,
             None,
@@ -1393,7 +1394,7 @@ mod tests {
         let mut commit = Commit::new(3, vec![]);
         commit.id = Some(cid);
         commit.txn_meta = vec![TxnMetaEntry::new(
-            fluree_vocab::namespaces::FLUREE_DB,
+            fluree_vocab::namespaces::FLUREE_DB.as_u16(),
             "message",
             TxnMetaValue::string("initial commit"),
         )];
@@ -1408,7 +1409,7 @@ mod tests {
         let mut commit = Commit::new(3, vec![]);
         commit.id = Some(cid);
         commit.txn_meta = vec![TxnMetaEntry::new(
-            fluree_vocab::namespaces::FLUREE_DB,
+            fluree_vocab::namespaces::FLUREE_DB.as_u16(),
             "message",
             TxnMetaValue::long(42),
         )];

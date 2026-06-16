@@ -311,13 +311,14 @@ mod tests {
     use crate::ir::{
         AggregateFn, AggregateSpec, Grouping, Query, QueryOutput, ReasoningConfig, TriplePattern,
     };
+    use fluree_db_core::NsCode;
     use fluree_db_core::Sid;
     use fluree_graph_json_ld::ParsedContext;
 
     const FEAT: u16 = 100;
 
     fn feature_pred() -> Sid {
-        Sid::new(FEAT, "feature")
+        Sid::new(NsCode(FEAT), "feature")
     }
 
     // `<p1> feature ?f1 . ?other feature ?f2 . FILTER(?f1 <op> ?f2)` GROUP BY
@@ -330,7 +331,7 @@ mod tests {
         let feat = feature_pred();
         let patterns = vec![
             Pattern::Triple(TriplePattern::new(
-                Ref::Sid(Sid::new(FEAT, "p1")),
+                Ref::Sid(Sid::new(NsCode(FEAT), "p1")),
                 Ref::Sid(feat.clone()),
                 Term::Var(f1),
             )),

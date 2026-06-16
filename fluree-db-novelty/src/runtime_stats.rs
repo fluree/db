@@ -261,7 +261,7 @@ fn assemble_fast_stats_inner(
             continue;
         }
 
-        let sid_key = (flake.p.namespace_code, flake.p.name.to_string());
+        let sid_key = (flake.p.namespace_code.as_u16(), flake.p.name.to_string());
         *property_counts.entry(sid_key.clone()).or_insert(0) += delta;
         *property_datatype_deltas
             .entry(sid_key)
@@ -717,11 +717,11 @@ mod tests {
     use super::*;
     use crate::Novelty;
     use fluree_db_core::{
-        Flake, GraphStatsEntry, PropertyStatEntry, RuntimePredicateId, ValueTypeTag,
+        Flake, GraphStatsEntry, NsCode, PropertyStatEntry, RuntimePredicateId, ValueTypeTag,
     };
 
     fn sid(ns: u16, name: &str) -> Sid {
-        Sid::new(ns, name)
+        Sid::new(NsCode(ns), name)
     }
 
     fn prop_flake(subject: Sid, property: Sid, value: i64, t: i64) -> Flake {

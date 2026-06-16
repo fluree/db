@@ -263,9 +263,10 @@ impl Default for FrozenSameAs {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fluree_db_core::NsCode;
 
     fn sid(n: u16) -> Sid {
-        Sid::new(n, format!("test:{n}"))
+        Sid::new(NsCode::from_u16(n), format!("test:{n}"))
     }
 
     #[test]

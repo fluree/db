@@ -258,12 +258,12 @@ fn binary_range_eq_v3(
         // this subject to an s_id, there are no base rows to scan; return
         // overlay-only matches.
         match resolve_or_novelty(
-            store.find_subject_id_by_parts(s_sid.namespace_code, &s_sid.name)?,
+            store.find_subject_id_by_parts(s_sid.namespace_code.as_u16(), &s_sid.name)?,
             dict_novelty,
             || {
                 dict_novelty
                     .subjects
-                    .find_subject(s_sid.namespace_code, &s_sid.name)
+                    .find_subject(s_sid.namespace_code.as_u16(), &s_sid.name)
             },
         ) {
             Some(id) => filter.s_id = Some(id),
@@ -285,12 +285,12 @@ fn binary_range_eq_v3(
             fluree_db_core::FlakeValue::Ref(sid) => {
                 // Resolve ref object to an s_id (persisted → DictNovelty).
                 let o_id = match resolve_or_novelty(
-                    store.find_subject_id_by_parts(sid.namespace_code, &sid.name)?,
+                    store.find_subject_id_by_parts(sid.namespace_code.as_u16(), &sid.name)?,
                     dict_novelty,
                     || {
                         dict_novelty
                             .subjects
-                            .find_subject(sid.namespace_code, &sid.name)
+                            .find_subject(sid.namespace_code.as_u16(), &sid.name)
                     },
                 ) {
                     Some(id) => id,
@@ -527,7 +527,7 @@ fn binary_range_eq_v3(
             // Resolve datatype.
             let dt = store
                 .resolve_datatype_sid(o_type)
-                .unwrap_or_else(|| Sid::new(0, ""));
+                .unwrap_or_else(|| Sid::new(fluree_db_core::NsCode(0), ""));
             // Language tag.
             let lang = store
                 .resolve_lang_tag(o_type)
@@ -699,14 +699,16 @@ fn binary_lookup_subject_predicate_refs_batched_v3(
     let mut s_ids: Vec<u64> = Vec::with_capacity(subjects.len());
     let mut s_id_to_sid: HashMap<u64, Sid> = HashMap::with_capacity(subjects.len());
     for sid in subjects {
-        if let Ok(Some(s_id)) = store.find_subject_id_by_parts(sid.namespace_code, &sid.name) {
+        if let Ok(Some(s_id)) =
+            store.find_subject_id_by_parts(sid.namespace_code.as_u16(), &sid.name)
+        {
             s_id_to_sid.entry(s_id).or_insert_with(|| sid.clone());
             s_ids.push(s_id);
         } else if dict_novelty.is_initialized() {
             // Try DictNovelty for uncommitted subjects.
             if let Some(s_id) = dict_novelty
                 .subjects
-                .find_subject(sid.namespace_code, &sid.name)
+                .find_subject(sid.namespace_code.as_u16(), &sid.name)
             {
                 s_id_to_sid.entry(s_id).or_insert_with(|| sid.clone());
                 s_ids.push(s_id);
@@ -996,7 +998,7 @@ fn binary_range_bounded_v3(
     let effective_to_t = opts.to_t.unwrap_or_else(|| store.max_t());
 
     // Step 1: Find persisted subjects in the IRI prefix range via reverse tree.
-    let matching_s_ids = store.find_subjects_by_prefix(ns_code, start_name)?;
+    let matching_s_ids = store.find_subjects_by_prefix(ns_code.as_u16(), start_name)?;
     let mut s_id_set: HashSet<u64> = matching_s_ids.into_iter().collect();
 
     // Step 2: Translate overlay flakes and collect novelty-only subject s_ids
@@ -1039,12 +1041,12 @@ fn binary_range_bounded_v3(
             continue;
         }
         if let Some(s_id) = resolve_or_novelty(
-            store.find_subject_id_by_parts(flake.s.namespace_code, &flake.s.name)?,
+            store.find_subject_id_by_parts(flake.s.namespace_code.as_u16(), &flake.s.name)?,
             dict_novelty,
             || {
                 dict_novelty
                     .subjects
-                    .find_subject(flake.s.namespace_code, &flake.s.name)
+                    .find_subject(flake.s.namespace_code.as_u16(), &flake.s.name)
             },
         ) {
             s_id_set.insert(s_id);
@@ -1171,7 +1173,7 @@ fn binary_range_bounded_v3(
             let o_val = view.decode_value(o_type, o_key, p_id)?;
             let dt = store
                 .resolve_datatype_sid(o_type)
-                .unwrap_or_else(|| Sid::new(0, ""));
+                .unwrap_or_else(|| Sid::new(fluree_db_core::NsCode(0), ""));
             let lang = store
                 .resolve_lang_tag(o_type)
                 .map(std::string::ToString::to_string);

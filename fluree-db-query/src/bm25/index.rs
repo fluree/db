@@ -1080,6 +1080,7 @@ impl Bm25Index {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fluree_db_core::NsCode;
 
     #[test]
     fn test_doc_key_equality() {
@@ -1525,8 +1526,8 @@ mod tests {
         // Mock encode_iri function - simulates ledger namespace encoding
         let encode_iri = |iri: &str| -> Option<Sid> {
             match iri {
-                "http://schema.org/name" => Some(Sid::new(100, "name")),
-                "http://schema.org/description" => Some(Sid::new(100, "description")),
+                "http://schema.org/name" => Some(Sid::new(NsCode(100), "name")),
+                "http://schema.org/description" => Some(Sid::new(NsCode(100), "description")),
                 _ => None, // Unknown IRI
             }
         };
@@ -1537,11 +1538,11 @@ mod tests {
         assert_eq!(compiled.len(), 2);
 
         // Should contain the encoded SIDs
-        assert!(compiled.contains(&Sid::new(100, "name")));
-        assert!(compiled.contains(&Sid::new(100, "description")));
+        assert!(compiled.contains(&Sid::new(NsCode(100), "name")));
+        assert!(compiled.contains(&Sid::new(NsCode(100), "description")));
 
         // Should not contain unknown IRI
-        assert!(!compiled.contains(&Sid::new(100, "unknown")));
+        assert!(!compiled.contains(&Sid::new(NsCode(100), "unknown")));
     }
 
     #[test]
@@ -1553,10 +1554,10 @@ mod tests {
         deps.add("http://schema.org/name");
         deps.add("http://schema.org/title");
 
-        let name_sid = Sid::new(100, "name");
-        let title_sid = Sid::new(100, "title");
-        let other_sid = Sid::new(100, "other");
-        let dt_string = Sid::new(3, "string");
+        let name_sid = Sid::new(NsCode(100), "name");
+        let title_sid = Sid::new(NsCode(100), "title");
+        let other_sid = Sid::new(NsCode(100), "other");
+        let dt_string = Sid::new(NsCode(3), "string");
 
         let encode_iri = |iri: &str| -> Option<Sid> {
             match iri {
@@ -1569,9 +1570,9 @@ mod tests {
         let compiled = CompiledPropertyDeps::compile(&deps, encode_iri);
 
         // Create test flakes
-        let subject1 = Sid::new(1, "alice");
-        let subject2 = Sid::new(1, "bob");
-        let subject3 = Sid::new(1, "charlie");
+        let subject1 = Sid::new(NsCode(1), "alice");
+        let subject2 = Sid::new(NsCode(1), "bob");
+        let subject3 = Sid::new(NsCode(1), "charlie");
 
         let flakes = vec![
             // alice has name changed - should be affected
@@ -1618,9 +1619,9 @@ mod tests {
     fn test_affected_subjects_deduplication() {
         use fluree_db_core::{Flake, FlakeValue, Sid};
 
-        let name_sid = Sid::new(100, "name");
-        let dt_string = Sid::new(3, "string");
-        let subject1 = Sid::new(1, "alice");
+        let name_sid = Sid::new(NsCode(100), "name");
+        let dt_string = Sid::new(NsCode(3), "string");
+        let subject1 = Sid::new(NsCode(1), "alice");
 
         let mut compiled = CompiledPropertyDeps::new();
         compiled.predicate_sids.insert(name_sid.clone());
@@ -1658,11 +1659,11 @@ mod tests {
     fn test_affected_subjects_in_range() {
         use fluree_db_core::{Flake, FlakeValue, Sid};
 
-        let name_sid = Sid::new(100, "name");
-        let dt_string = Sid::new(3, "string");
-        let subject1 = Sid::new(1, "alice");
-        let subject2 = Sid::new(1, "bob");
-        let subject3 = Sid::new(1, "charlie");
+        let name_sid = Sid::new(NsCode(100), "name");
+        let dt_string = Sid::new(NsCode(3), "string");
+        let subject1 = Sid::new(NsCode(1), "alice");
+        let subject2 = Sid::new(NsCode(1), "bob");
+        let subject3 = Sid::new(NsCode(1), "charlie");
 
         let mut compiled = CompiledPropertyDeps::new();
         compiled.predicate_sids.insert(name_sid.clone());
@@ -1715,9 +1716,9 @@ mod tests {
 
         let compiled = CompiledPropertyDeps::new();
 
-        let name_sid = Sid::new(100, "name");
-        let dt_string = Sid::new(3, "string");
-        let subject1 = Sid::new(1, "alice");
+        let name_sid = Sid::new(NsCode(100), "name");
+        let dt_string = Sid::new(NsCode(3), "string");
+        let subject1 = Sid::new(NsCode(1), "alice");
 
         let flakes = vec![Flake::new(
             subject1.clone(),

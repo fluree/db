@@ -157,12 +157,12 @@ impl DictNovelty {
         for flake in flakes {
             // Subject
             self.subjects
-                .assign_or_lookup(flake.s.namespace_code, &flake.s.name);
+                .assign_or_lookup(flake.s.namespace_code.as_u16(), &flake.s.name);
 
             // Object references
             if let FlakeValue::Ref(ref sid) = flake.o {
                 self.subjects
-                    .assign_or_lookup(sid.namespace_code, &sid.name);
+                    .assign_or_lookup(sid.namespace_code.as_u16(), &sid.name);
             }
 
             // String values

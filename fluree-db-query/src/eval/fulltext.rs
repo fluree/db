@@ -743,6 +743,7 @@ fn score_tf_saturation(doc_text: &str, query_text: &str) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fluree_db_core::NsCode;
 
     #[test]
     fn test_score_basic_match() {
@@ -1035,8 +1036,8 @@ mod tests {
         // Without list_index in the key, these would collapse to a single entry.
         use fluree_db_core::flake::{Flake, FlakeMeta};
 
-        let subject = Sid::new(0, "ex:item1");
-        let pred = Sid::new(0, "ex:content");
+        let subject = Sid::new(NsCode(0), "ex:item1");
+        let pred = Sid::new(NsCode(0), "ex:content");
         let fulltext_dt = Sid::new(FLUREE_DB, "fullText");
         let text = "cargo nextest runner".to_string();
 

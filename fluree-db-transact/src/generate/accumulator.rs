@@ -225,14 +225,14 @@ fn push_into_mixed(map: &mut FxHashMap<Flake, FlakeBucket>, flake: Flake) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fluree_db_core::{FlakeValue, Sid};
+    use fluree_db_core::{FlakeValue, NsCode, Sid};
 
     fn flake(s: u16, p: u16, o: i64, t: i64, op: bool) -> Flake {
         Flake::new(
-            Sid::new(s, format!("s{s}")),
-            Sid::new(p, format!("p{p}")),
+            Sid::new(NsCode(s), format!("s{s}")),
+            Sid::new(NsCode(p), format!("p{p}")),
             FlakeValue::Long(o),
-            Sid::new(2, "long"),
+            Sid::new(NsCode(2), "long"),
             t,
             op,
             None,
@@ -265,9 +265,9 @@ mod tests {
         let out = acc.finalize();
         assert_eq!(out.len(), 3);
         // SPOT order: by subject namespace_code first
-        assert_eq!(out[0].s.namespace_code, 1);
-        assert_eq!(out[1].s.namespace_code, 2);
-        assert_eq!(out[2].s.namespace_code, 3);
+        assert_eq!(out[0].s.namespace_code, NsCode(1));
+        assert_eq!(out[1].s.namespace_code, NsCode(2));
+        assert_eq!(out[2].s.namespace_code, NsCode(3));
     }
 
     #[test]
@@ -360,9 +360,9 @@ mod tests {
         ]);
         let out = acc.finalize();
         assert_eq!(out.len(), 3);
-        assert_eq!(out[0].s.namespace_code, 1);
-        assert_eq!(out[1].s.namespace_code, 2);
-        assert_eq!(out[2].s.namespace_code, 3);
+        assert_eq!(out[0].s.namespace_code, NsCode(1));
+        assert_eq!(out[1].s.namespace_code, NsCode(2));
+        assert_eq!(out[2].s.namespace_code, NsCode(3));
     }
 
     // ---- Multi-feed: retractions can arrive from several pushes -------------
@@ -398,11 +398,11 @@ mod tests {
 
     fn flake_in_graph(g: u16, s: u16, p: u16, o: i64, t: i64, op: bool) -> Flake {
         Flake::new_in_graph(
-            Sid::new(g, format!("g{g}")),
-            Sid::new(s, format!("s{s}")),
-            Sid::new(p, format!("p{p}")),
+            Sid::new(NsCode(g), format!("g{g}")),
+            Sid::new(NsCode(s), format!("s{s}")),
+            Sid::new(NsCode(p), format!("p{p}")),
             FlakeValue::Long(o),
-            Sid::new(2, "long"),
+            Sid::new(NsCode(2), "long"),
             t,
             op,
             None,

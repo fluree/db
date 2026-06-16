@@ -223,7 +223,10 @@ impl<'a> TryFrom<RawObject<'a>> for crate::FlakeValue {
         }
 
         match raw {
-            RawObject::Ref { ns_code, name } => Ok(FlakeValue::Ref(Sid::new(ns_code, name))),
+            RawObject::Ref { ns_code, name } => Ok(FlakeValue::Ref(Sid::new(
+                fluree_vocab::NsCode::from_u16(ns_code),
+                name,
+            ))),
             RawObject::Long(n) => Ok(FlakeValue::Long(n)),
             RawObject::Double(n) => Ok(FlakeValue::Double(n)),
             RawObject::Str(s) => Ok(FlakeValue::String(s.to_string())),
@@ -579,6 +582,7 @@ mod tests {
     use crate::commit::codec::format::{CommitFooter, CommitHeader, FOOTER_LEN, HEADER_LEN};
     use crate::commit::codec::op_codec::{encode_op, CommitDicts};
     use crate::{Flake, FlakeMeta, FlakeValue, Sid};
+    use fluree_vocab::NsCode;
     use std::collections::HashMap;
 
     /// Build a minimal commit blob from flakes for testing.
@@ -671,10 +675,10 @@ mod tests {
     #[test]
     fn test_load_and_iterate_single_op() {
         let flake = Flake::new(
-            Sid::new(101, "Alice"),
-            Sid::new(101, "age"),
+            Sid::new(NsCode(101), "Alice"),
+            Sid::new(NsCode(101), "age"),
             FlakeValue::Long(30),
-            Sid::new(2, "integer"),
+            Sid::new(NsCode(2), "integer"),
             1,
             true,
             None,
@@ -712,102 +716,102 @@ mod tests {
         let flakes = vec![
             // Long
             Flake::new(
-                Sid::new(101, "x"),
-                Sid::new(101, "long_val"),
+                Sid::new(NsCode(101), "x"),
+                Sid::new(NsCode(101), "long_val"),
                 FlakeValue::Long(42),
-                Sid::new(2, "long"),
+                Sid::new(NsCode(2), "long"),
                 1,
                 true,
                 None,
             ),
             // Double
             Flake::new(
-                Sid::new(101, "x"),
-                Sid::new(101, "dbl_val"),
+                Sid::new(NsCode(101), "x"),
+                Sid::new(NsCode(101), "dbl_val"),
                 FlakeValue::Double(3.13),
-                Sid::new(2, "double"),
+                Sid::new(NsCode(2), "double"),
                 1,
                 true,
                 None,
             ),
             // String
             Flake::new(
-                Sid::new(101, "x"),
-                Sid::new(101, "str_val"),
+                Sid::new(NsCode(101), "x"),
+                Sid::new(NsCode(101), "str_val"),
                 FlakeValue::String("hello world".into()),
-                Sid::new(2, "string"),
+                Sid::new(NsCode(2), "string"),
                 1,
                 true,
                 None,
             ),
             // Boolean
             Flake::new(
-                Sid::new(101, "x"),
-                Sid::new(101, "bool_val"),
+                Sid::new(NsCode(101), "x"),
+                Sid::new(NsCode(101), "bool_val"),
                 FlakeValue::Boolean(true),
-                Sid::new(2, "boolean"),
+                Sid::new(NsCode(2), "boolean"),
                 1,
                 true,
                 None,
             ),
             // Ref
             Flake::new(
-                Sid::new(101, "x"),
-                Sid::new(101, "ref_val"),
-                FlakeValue::Ref(Sid::new(101, "y")),
-                Sid::new(1, "id"),
+                Sid::new(NsCode(101), "x"),
+                Sid::new(NsCode(101), "ref_val"),
+                FlakeValue::Ref(Sid::new(NsCode(101), "y")),
+                Sid::new(NsCode(1), "id"),
                 1,
                 true,
                 None,
             ),
             // Null
             Flake::new(
-                Sid::new(101, "x"),
-                Sid::new(101, "null_val"),
+                Sid::new(NsCode(101), "x"),
+                Sid::new(NsCode(101), "null_val"),
                 FlakeValue::Null,
-                Sid::new(2, "string"),
+                Sid::new(NsCode(2), "string"),
                 1,
                 true,
                 None,
             ),
             // DateTime
             Flake::new(
-                Sid::new(101, "x"),
-                Sid::new(101, "dt_val"),
+                Sid::new(NsCode(101), "x"),
+                Sid::new(NsCode(101), "dt_val"),
                 FlakeValue::DateTime(Box::new(
                     crate::DateTime::parse("2024-01-15T10:30:00Z").unwrap(),
                 )),
-                Sid::new(2, "dateTime"),
+                Sid::new(NsCode(2), "dateTime"),
                 1,
                 true,
                 None,
             ),
             // Date
             Flake::new(
-                Sid::new(101, "x"),
-                Sid::new(101, "date_val"),
+                Sid::new(NsCode(101), "x"),
+                Sid::new(NsCode(101), "date_val"),
                 FlakeValue::Date(Box::new(crate::Date::parse("2024-01-15").unwrap())),
-                Sid::new(2, "date"),
+                Sid::new(NsCode(2), "date"),
                 1,
                 true,
                 None,
             ),
             // Time
             Flake::new(
-                Sid::new(101, "x"),
-                Sid::new(101, "time_val"),
+                Sid::new(NsCode(101), "x"),
+                Sid::new(NsCode(101), "time_val"),
                 FlakeValue::Time(Box::new(crate::Time::parse("10:30:00").unwrap())),
-                Sid::new(2, "time"),
+                Sid::new(NsCode(2), "time"),
                 1,
                 true,
                 None,
             ),
             // Json
             Flake::new(
-                Sid::new(101, "x"),
-                Sid::new(101, "json_val"),
+                Sid::new(NsCode(101), "x"),
+                Sid::new(NsCode(101), "json_val"),
                 FlakeValue::Json(r#"{"key":"val"}"#.into()),
-                Sid::new(3, "JSON"),
+                Sid::new(NsCode(3), "JSON"),
                 1,
                 true,
                 None,
@@ -858,30 +862,30 @@ mod tests {
         let flakes = vec![
             // With lang tag
             Flake::new(
-                Sid::new(101, "x"),
-                Sid::new(101, "name"),
+                Sid::new(NsCode(101), "x"),
+                Sid::new(NsCode(101), "name"),
                 FlakeValue::String("Alice".into()),
-                Sid::new(3, "langString"),
+                Sid::new(NsCode(3), "langString"),
                 1,
                 true,
                 Some(FlakeMeta::with_lang("en")),
             ),
             // With list index
             Flake::new(
-                Sid::new(101, "x"),
-                Sid::new(101, "scores"),
+                Sid::new(NsCode(101), "x"),
+                Sid::new(NsCode(101), "scores"),
                 FlakeValue::Long(100),
-                Sid::new(2, "integer"),
+                Sid::new(NsCode(2), "integer"),
                 1,
                 true,
                 Some(FlakeMeta::with_index(3)),
             ),
             // With both lang and index
             Flake::new(
-                Sid::new(101, "x"),
-                Sid::new(101, "labels"),
+                Sid::new(NsCode(101), "x"),
+                Sid::new(NsCode(101), "labels"),
                 FlakeValue::String("hello".into()),
-                Sid::new(3, "langString"),
+                Sid::new(NsCode(3), "langString"),
                 1,
                 true,
                 Some(FlakeMeta {
@@ -920,10 +924,10 @@ mod tests {
     #[test]
     fn test_retract_op() {
         let flake = Flake::new(
-            Sid::new(101, "x"),
-            Sid::new(101, "age"),
+            Sid::new(NsCode(101), "x"),
+            Sid::new(NsCode(101), "age"),
             FlakeValue::Long(30),
-            Sid::new(2, "integer"),
+            Sid::new(NsCode(2), "integer"),
             1,
             false, // retract
             None,
@@ -943,29 +947,29 @@ mod tests {
     fn test_multiple_subjects_shared_dict() {
         let flakes = vec![
             Flake::new(
-                Sid::new(101, "Alice"),
-                Sid::new(101, "age"),
+                Sid::new(NsCode(101), "Alice"),
+                Sid::new(NsCode(101), "age"),
                 FlakeValue::Long(30),
-                Sid::new(2, "integer"),
+                Sid::new(NsCode(2), "integer"),
                 1,
                 true,
                 None,
             ),
             Flake::new(
-                Sid::new(101, "Bob"),
-                Sid::new(101, "age"),
+                Sid::new(NsCode(101), "Bob"),
+                Sid::new(NsCode(101), "age"),
                 FlakeValue::Long(25),
-                Sid::new(2, "integer"),
+                Sid::new(NsCode(2), "integer"),
                 1,
                 true,
                 None,
             ),
             // Alice again — same dict entry
             Flake::new(
-                Sid::new(101, "Alice"),
-                Sid::new(101, "name"),
+                Sid::new(NsCode(101), "Alice"),
+                Sid::new(NsCode(101), "name"),
                 FlakeValue::String("Alice".into()),
-                Sid::new(2, "string"),
+                Sid::new(NsCode(2), "string"),
                 1,
                 true,
                 None,

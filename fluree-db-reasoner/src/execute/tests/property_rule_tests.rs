@@ -15,6 +15,7 @@
 use super::*;
 use crate::same_as::SameAsTracker;
 use crate::types::{ChainElement, PropertyChain};
+use fluree_db_core::NsCode;
 use fluree_vocab::namespaces::{OWL, RDF};
 use fluree_vocab::predicates::RDF_TYPE;
 
@@ -149,7 +150,7 @@ fn test_domain_rule() {
     assert_eq!(type_flake.s, sid(1)); // subject of original fact
     assert_eq!(type_flake.p.namespace_code, RDF);
     assert_eq!(type_flake.p.name.as_ref(), RDF_TYPE);
-    assert_eq!(type_flake.dt, Sid::new(1, "id")); // rdf:type object is a Ref → dt must be $id
+    assert_eq!(type_flake.dt, Sid::new(NsCode(1), "id")); // rdf:type object is a Ref → dt must be $id
     if let FlakeValue::Ref(class) = &type_flake.o {
         assert_eq!(*class, sid(100)); // domain class
     } else {
@@ -212,7 +213,7 @@ fn test_domain_rule_sets_dt_id_even_for_literal_objects() {
     let type_flake = new_delta.iter().next().unwrap();
     assert_eq!(type_flake.p.namespace_code, RDF);
     assert_eq!(type_flake.p.name.as_ref(), RDF_TYPE);
-    assert_eq!(type_flake.dt, Sid::new(1, "id")); // must be $id since object is Ref
+    assert_eq!(type_flake.dt, Sid::new(NsCode(1), "id")); // must be $id since object is Ref
     assert!(matches!(type_flake.o, FlakeValue::Ref(_)));
 }
 

@@ -266,7 +266,7 @@ pub fn decode_leaf_block(
                 .map_err(BlockFetchError::LeafDecode)?;
             let s = snapshot
                 .encode_iri(&s_iri)
-                .unwrap_or_else(|| fluree_db_core::Sid::new(0, s_iri));
+                .unwrap_or_else(|| fluree_db_core::Sid::new(fluree_db_core::NsCode(0), s_iri));
 
             // Predicate: resolve IRI then encode to Sid.
             let p_iri = store.resolve_predicate_iri(p_id).ok_or_else(|| {
@@ -277,7 +277,7 @@ pub fn decode_leaf_block(
             })?;
             let p = snapshot
                 .encode_iri(p_iri)
-                .unwrap_or_else(|| fluree_db_core::Sid::new(0, p_iri));
+                .unwrap_or_else(|| fluree_db_core::Sid::new(fluree_db_core::NsCode(0), p_iri));
 
             // Object: graph-scoped decode (routes specialty kinds through arenas).
             let mut o = gv
@@ -289,32 +289,33 @@ pub fn decode_leaf_block(
                         std::io::ErrorKind::InvalidData,
                         format!(
                             "sid_to_iri failed: unknown namespace code {} for object ref {:?}",
-                            sid.namespace_code, sid.name
+                            sid.namespace_code.as_u16(),
+                            sid.name
                         ),
                     ))
                 })?;
-                o = fluree_db_core::FlakeValue::Ref(
-                    snapshot
-                        .encode_iri(&iri)
-                        .unwrap_or_else(|| fluree_db_core::Sid::new(0, iri)),
-                );
+                o =
+                    fluree_db_core::FlakeValue::Ref(snapshot.encode_iri(&iri).unwrap_or_else(
+                        || fluree_db_core::Sid::new(fluree_db_core::NsCode(0), iri),
+                    ));
             }
 
             let dt = match store.resolve_datatype_sid(o_type) {
-                None => fluree_db_core::Sid::new(0, ""),
+                None => fluree_db_core::Sid::new(fluree_db_core::NsCode(0), ""),
                 Some(sid) => {
                     let iri = store.sid_to_iri(&sid).ok_or_else(|| {
                         BlockFetchError::LeafDecode(std::io::Error::new(
                             std::io::ErrorKind::InvalidData,
                             format!(
                                 "sid_to_iri failed: unknown namespace code {} for datatype {:?}",
-                                sid.namespace_code, sid.name
+                                sid.namespace_code.as_u16(),
+                                sid.name
                             ),
                         ))
                     })?;
                     snapshot
                         .encode_iri(&iri)
-                        .unwrap_or_else(|| fluree_db_core::Sid::new(0, iri))
+                        .unwrap_or_else(|| fluree_db_core::Sid::new(fluree_db_core::NsCode(0), iri))
                 }
             };
 

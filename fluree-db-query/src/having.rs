@@ -130,10 +130,11 @@ mod tests {
     use super::*;
     use crate::binding::Binding;
     use crate::seed::SeedOperator;
+    use fluree_db_core::NsCode;
     use fluree_db_core::{LedgerSnapshot, Sid};
 
     fn xsd_long() -> Sid {
-        Sid::new(2, "long")
+        Sid::new(NsCode(2), "long")
     }
 
     fn make_test_snapshot() -> LedgerSnapshot {
@@ -154,10 +155,22 @@ mod tests {
         let schema: Arc<[VarId]> = Arc::from(vec![VarId(0), VarId(1)].into_boxed_slice());
         let columns = vec![
             vec![
-                Binding::lit(FlakeValue::String("NYC".into()), Sid::new(2, "string")),
-                Binding::lit(FlakeValue::String("LA".into()), Sid::new(2, "string")),
-                Binding::lit(FlakeValue::String("CHI".into()), Sid::new(2, "string")),
-                Binding::lit(FlakeValue::String("SF".into()), Sid::new(2, "string")),
+                Binding::lit(
+                    FlakeValue::String("NYC".into()),
+                    Sid::new(NsCode(2), "string"),
+                ),
+                Binding::lit(
+                    FlakeValue::String("LA".into()),
+                    Sid::new(NsCode(2), "string"),
+                ),
+                Binding::lit(
+                    FlakeValue::String("CHI".into()),
+                    Sid::new(NsCode(2), "string"),
+                ),
+                Binding::lit(
+                    FlakeValue::String("SF".into()),
+                    Sid::new(NsCode(2), "string"),
+                ),
             ],
             vec![
                 Binding::lit(FlakeValue::Long(5), xsd_long()),
@@ -239,8 +252,14 @@ mod tests {
         let schema: Arc<[VarId]> = Arc::from(vec![VarId(0), VarId(1)].into_boxed_slice());
         let columns = vec![
             vec![
-                Binding::lit(FlakeValue::String("A".into()), Sid::new(2, "string")),
-                Binding::lit(FlakeValue::String("B".into()), Sid::new(2, "string")),
+                Binding::lit(
+                    FlakeValue::String("A".into()),
+                    Sid::new(NsCode(2), "string"),
+                ),
+                Binding::lit(
+                    FlakeValue::String("B".into()),
+                    Sid::new(NsCode(2), "string"),
+                ),
             ],
             vec![
                 Binding::lit(FlakeValue::Long(1), xsd_long()),
@@ -337,14 +356,20 @@ mod tests {
         let schema: Arc<[VarId]> = Arc::from(vec![VarId(0), VarId(1)].into_boxed_slice());
         let columns = vec![
             vec![
-                Binding::lit(FlakeValue::String("NYC".into()), Sid::new(2, "string")),
-                Binding::lit(FlakeValue::String("LA".into()), Sid::new(2, "string")),
+                Binding::lit(
+                    FlakeValue::String("NYC".into()),
+                    Sid::new(NsCode(2), "string"),
+                ),
+                Binding::lit(
+                    FlakeValue::String("LA".into()),
+                    Sid::new(NsCode(2), "string"),
+                ),
             ],
             vec![
                 Binding::lit(FlakeValue::Long(15), xsd_long()),
                 Binding::lit(
                     FlakeValue::String("not_a_number".into()),
-                    Sid::new(2, "string"),
+                    Sid::new(NsCode(2), "string"),
                 ),
             ],
         ];

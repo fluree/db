@@ -483,7 +483,7 @@ fn write_flake_value(cell: &mut Vec<u8>, val: &FlakeValue, compactor: &IriCompac
                 Err(_) => {
                     // Fallback: code:name
                     let mut buf = itoa::Buffer::new();
-                    cell.extend_from_slice(buf.format(sid.namespace_code).as_bytes());
+                    cell.extend_from_slice(buf.format(sid.namespace_code.as_u16()).as_bytes());
                     cell.push(b':');
                     cell.extend_from_slice(sid.name.as_bytes());
                 }
@@ -580,7 +580,7 @@ fn flush_cell_csv(out: &mut Vec<u8>, cell: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fluree_db_core::Sid;
+    use fluree_db_core::{NsCode, Sid};
     use fluree_db_query::VarRegistry;
     use fluree_graph_json_ld::ParsedContext;
     use serde_json::json;
@@ -658,7 +658,10 @@ mod tests {
     fn test_tsv_sid_binding_no_context() {
         // Without @context, Sid outputs full IRI (no compaction possible)
         let snapshot = make_test_snapshot();
-        let result = make_result(&["?s"], vec![vec![Binding::sid(Sid::new(100, "alice"))]]);
+        let result = make_result(
+            &["?s"],
+            vec![vec![Binding::sid(Sid::new(NsCode(100), "alice"))]],
+        );
         let tsv = format_tsv(&result, &snapshot).unwrap();
         assert_eq!(tsv, "s\nhttp://example.org/alice\n");
     }
@@ -669,7 +672,7 @@ mod tests {
         let snapshot = make_test_snapshot();
         let result = make_result_with_context(
             &["?s"],
-            vec![vec![Binding::sid(Sid::new(100, "alice"))]],
+            vec![vec![Binding::sid(Sid::new(NsCode(100), "alice"))]],
             make_test_context(),
         );
         let tsv = format_tsv(&result, &snapshot).unwrap();
@@ -684,9 +687,9 @@ mod tests {
             vec![vec![
                 Binding::lit(
                     FlakeValue::String("Alice".to_string()),
-                    Sid::new(2, "string"),
+                    Sid::new(NsCode(2), "string"),
                 ),
-                Binding::lit(FlakeValue::Long(30), Sid::new(2, "long")),
+                Binding::lit(FlakeValue::Long(30), Sid::new(NsCode(2), "long")),
             ]],
         );
         let tsv = format_tsv(&result, &snapshot).unwrap();
@@ -700,7 +703,7 @@ mod tests {
             &["?val"],
             vec![vec![Binding::lit(
                 FlakeValue::String("hello\tworld\nfoo\rbar".to_string()),
-                Sid::new(2, "string"),
+                Sid::new(NsCode(2), "string"),
             )]],
         );
         let tsv = format_tsv(&result, &snapshot).unwrap();
@@ -712,7 +715,10 @@ mod tests {
         let snapshot = make_test_snapshot();
         let result = make_result(
             &["?a", "?b"],
-            vec![vec![Binding::sid(Sid::new(100, "x")), Binding::Unbound]],
+            vec![vec![
+                Binding::sid(Sid::new(NsCode(100), "x")),
+                Binding::Unbound,
+            ]],
         );
         let tsv = format_tsv(&result, &snapshot).unwrap();
         assert_eq!(tsv, "a\tb\nhttp://example.org/x\t\n");
@@ -724,9 +730,9 @@ mod tests {
         let result = make_result(
             &["?s"],
             vec![
-                vec![Binding::sid(Sid::new(100, "a"))],
-                vec![Binding::sid(Sid::new(100, "b"))],
-                vec![Binding::sid(Sid::new(100, "c"))],
+                vec![Binding::sid(Sid::new(NsCode(100), "a"))],
+                vec![Binding::sid(Sid::new(NsCode(100), "b"))],
+                vec![Binding::sid(Sid::new(NsCode(100), "c"))],
             ],
         );
         let tsv = format_tsv(&result, &snapshot).unwrap();
@@ -742,9 +748,9 @@ mod tests {
         let result = make_result(
             &["?s"],
             vec![
-                vec![Binding::sid(Sid::new(100, "a"))],
-                vec![Binding::sid(Sid::new(100, "b"))],
-                vec![Binding::sid(Sid::new(100, "c"))],
+                vec![Binding::sid(Sid::new(NsCode(100), "a"))],
+                vec![Binding::sid(Sid::new(NsCode(100), "b"))],
+                vec![Binding::sid(Sid::new(NsCode(100), "c"))],
             ],
         );
         let (tsv, total) = format_tsv_limited(&result, &snapshot, 2).unwrap();
@@ -758,8 +764,8 @@ mod tests {
         let result = make_result(
             &["?flag", "?score"],
             vec![vec![
-                Binding::lit(FlakeValue::Boolean(true), Sid::new(2, "boolean")),
-                Binding::lit(FlakeValue::Double(3.125), Sid::new(2, "double")),
+                Binding::lit(FlakeValue::Boolean(true), Sid::new(NsCode(2), "boolean")),
+                Binding::lit(FlakeValue::Double(3.125), Sid::new(NsCode(2), "double")),
             ]],
         );
         let tsv = format_tsv(&result, &snapshot).unwrap();
@@ -798,9 +804,9 @@ mod tests {
         let result = make_result(
             &["?vals"],
             vec![vec![Binding::Grouped(vec![
-                Binding::lit(FlakeValue::Long(1), Sid::new(2, "long")),
-                Binding::lit(FlakeValue::Long(2), Sid::new(2, "long")),
-                Binding::lit(FlakeValue::Long(3), Sid::new(2, "long")),
+                Binding::lit(FlakeValue::Long(1), Sid::new(NsCode(2), "long")),
+                Binding::lit(FlakeValue::Long(2), Sid::new(NsCode(2), "long")),
+                Binding::lit(FlakeValue::Long(3), Sid::new(NsCode(2), "long")),
             ])]],
         );
         let tsv = format_tsv(&result, &snapshot).unwrap();
@@ -825,9 +831,9 @@ mod tests {
             vec![vec![
                 Binding::lit(
                     FlakeValue::String("Alice".to_string()),
-                    Sid::new(2, "string"),
+                    Sid::new(NsCode(2), "string"),
                 ),
-                Binding::lit(FlakeValue::Long(30), Sid::new(2, "long")),
+                Binding::lit(FlakeValue::Long(30), Sid::new(NsCode(2), "long")),
             ]],
         );
         let csv = format_csv(&result, &snapshot).unwrap();
@@ -841,7 +847,7 @@ mod tests {
             &["?val"],
             vec![vec![Binding::lit(
                 FlakeValue::String("hello, world".to_string()),
-                Sid::new(2, "string"),
+                Sid::new(NsCode(2), "string"),
             )]],
         );
         let csv = format_csv(&result, &snapshot).unwrap();
@@ -855,7 +861,7 @@ mod tests {
             &["?val"],
             vec![vec![Binding::lit(
                 FlakeValue::String("say \"hello\"".to_string()),
-                Sid::new(2, "string"),
+                Sid::new(NsCode(2), "string"),
             )]],
         );
         let csv = format_csv(&result, &snapshot).unwrap();
@@ -869,7 +875,7 @@ mod tests {
             &["?val"],
             vec![vec![Binding::lit(
                 FlakeValue::String("line1\nline2".to_string()),
-                Sid::new(2, "string"),
+                Sid::new(NsCode(2), "string"),
             )]],
         );
         let csv = format_csv(&result, &snapshot).unwrap();
@@ -881,7 +887,7 @@ mod tests {
         let snapshot = make_test_snapshot();
         let result = make_result_with_context(
             &["?s"],
-            vec![vec![Binding::sid(Sid::new(100, "alice"))]],
+            vec![vec![Binding::sid(Sid::new(NsCode(100), "alice"))]],
             make_test_context(),
         );
         let csv = format_csv(&result, &snapshot).unwrap();
@@ -894,9 +900,18 @@ mod tests {
         let result = make_result(
             &["?n"],
             vec![
-                vec![Binding::lit(FlakeValue::Long(1), Sid::new(2, "long"))],
-                vec![Binding::lit(FlakeValue::Long(2), Sid::new(2, "long"))],
-                vec![Binding::lit(FlakeValue::Long(3), Sid::new(2, "long"))],
+                vec![Binding::lit(
+                    FlakeValue::Long(1),
+                    Sid::new(NsCode(2), "long"),
+                )],
+                vec![Binding::lit(
+                    FlakeValue::Long(2),
+                    Sid::new(NsCode(2), "long"),
+                )],
+                vec![Binding::lit(
+                    FlakeValue::Long(3),
+                    Sid::new(NsCode(2), "long"),
+                )],
             ],
         );
         let (csv, total) = format_csv_limited(&result, &snapshot, 2).unwrap();

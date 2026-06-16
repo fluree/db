@@ -82,7 +82,9 @@ impl SpatialHook {
     pub fn on_op(&mut self, raw_op: &RawOp<'_>, g_id: GraphId, subject_id: u64, p_id: u32, t: i64) {
         // Check if datatype is geo:wktLiteral - must match BOTH namespace code AND local name
         // to avoid false positives from user-defined datatypes with same local name
-        if raw_op.dt_ns_code != namespaces::OGC_GEO || raw_op.dt_name != geo_names::WKT_LITERAL {
+        if raw_op.dt_ns_code != namespaces::OGC_GEO.as_u16()
+            || raw_op.dt_name != geo_names::WKT_LITERAL
+        {
             return;
         }
 

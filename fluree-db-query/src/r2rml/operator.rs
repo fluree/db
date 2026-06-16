@@ -150,7 +150,8 @@ impl R2rmlScanOperator {
                     return Ok(Binding::lit_lang(val, lang.as_ref()));
                 }
 
-                let xsd_string_fallback = fluree_db_core::Sid::new(2, "string");
+                let xsd_string_fallback =
+                    fluree_db_core::Sid::new(fluree_db_core::NsCode(2), "string");
                 let dt_sid = match dtc {
                     Some(UnresolvedDatatypeConstraint::Explicit(dt_iri)) => {
                         ctx.active_snapshot.encode_iri(dt_iri).unwrap_or_else(|| {

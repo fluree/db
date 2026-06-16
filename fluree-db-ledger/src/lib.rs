@@ -812,17 +812,17 @@ impl LedgerState {
 mod tests {
     use super::*;
     use fluree_db_core::{
-        content_store_for, ContentId, ContentKind, Flake, FlakeValue, MemoryStorage, Sid,
+        content_store_for, ContentId, ContentKind, Flake, FlakeValue, MemoryStorage, NsCode, Sid,
     };
     use fluree_db_nameservice::memory::MemoryNameService;
     use std::collections::HashMap;
 
     fn make_flake(s: u16, p: u16, o: i64, t: i64) -> Flake {
         Flake::new(
-            Sid::new(s, format!("s{s}")),
-            Sid::new(p, format!("p{p}")),
+            Sid::new(NsCode(s), format!("s{s}")),
+            Sid::new(NsCode(p), format!("p{p}")),
             FlakeValue::Long(o),
-            Sid::new(2, "long"),
+            Sid::new(NsCode(2), "long"),
             t,
             true,
             None,
@@ -1048,9 +1048,9 @@ mod tests {
         let mut state = LedgerState::new(snapshot, Novelty::new(1));
         let reverse_graph = state.snapshot.build_reverse_graph().unwrap_or_default();
 
-        let s = Sid::new(0, "ex:s");
-        let p = Sid::new(0, "ex:p");
-        let dt = Sid::new(2, "string"); // xsd:string (default namespace codes)
+        let s = Sid::new(NsCode(0), "ex:s");
+        let p = Sid::new(NsCode(0), "ex:p");
+        let dt = Sid::new(NsCode(2), "string"); // xsd:string (default namespace codes)
 
         let flakes_t2 = vec![Flake::new(
             s.clone(),
@@ -1420,9 +1420,9 @@ mod tests {
         let mut state = LedgerState::new(snapshot, Novelty::new(0));
 
         // Commit with a string flake
-        let s = Sid::new(0, "ex:s1");
-        let p = Sid::new(0, "ex:p1");
-        let dt = Sid::new(2, "string");
+        let s = Sid::new(NsCode(0), "ex:s1");
+        let p = Sid::new(NsCode(0), "ex:p1");
+        let dt = Sid::new(NsCode(2), "string");
         let flake = Flake::new(
             s,
             p,

@@ -98,6 +98,7 @@ pub(crate) fn cached_stats_view_for_db(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fluree_db_core::NsCode;
     use fluree_db_core::{Flake, IndexStats, PropertyStatEntry, Sid};
 
     fn prop_flake(subject: Sid, property: Sid, value: i64, t: i64) -> Flake {
@@ -137,8 +138,8 @@ mod tests {
         novelty
             .apply_commit(
                 vec![prop_flake(
-                    Sid::new(10, "alice"),
-                    Sid::new(10, "score"),
+                    Sid::new(NsCode(10), "alice"),
+                    Sid::new(NsCode(10), "score"),
                     42,
                     2,
                 )],
@@ -151,7 +152,7 @@ mod tests {
         let first = cached_stats_view_for_db(db, None).expect("first stats view");
         assert_eq!(
             first
-                .get_property(&Sid::new(10, "score"))
+                .get_property(&Sid::new(NsCode(10), "score"))
                 .expect("property stat")
                 .count,
             2

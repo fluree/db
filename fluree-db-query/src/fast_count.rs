@@ -1185,7 +1185,7 @@ pub fn count_blank_node_subjects_operator(
 }
 
 fn blank_subject_range() -> (u64, u64) {
-    let ns = namespaces::BLANK_NODE;
+    let ns = namespaces::BLANK_NODE.as_u16();
     let min = SubjectId::new(ns, 0).as_u64();
     let max = SubjectId::new(ns, 0x0000_FFFF_FFFF_FFFF).as_u64();
     (min, max)

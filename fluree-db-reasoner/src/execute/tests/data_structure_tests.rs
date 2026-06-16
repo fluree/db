@@ -124,7 +124,7 @@ fn test_recanonicalize_no_change_when_already_canonical() {
     // Create delta with already-canonical subject
     let mut delta = DeltaSet::new();
     delta.push(make_ref_flake(
-        canonical.namespace_code,
+        canonical.namespace_code.as_u16(),
         10,
         5, // object not in any equivalence class
         1,

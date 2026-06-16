@@ -14,7 +14,7 @@
 //! 2026-06 architecture audit as a suspected gap; the preservation logic
 //! exists in `apply_loaded_db` — this test pins it.)
 
-use fluree_db_core::{Flake, FlakeValue, IndexType, LedgerSnapshot, Sid};
+use fluree_db_core::{Flake, FlakeValue, IndexType, LedgerSnapshot, NsCode, Sid};
 use fluree_db_ledger::LedgerState;
 use fluree_db_novelty::Novelty;
 use std::sync::Arc;
@@ -37,9 +37,9 @@ fn apply_loaded_db_preserves_novelty_graph_registrations_and_ids() {
     snapshot.t = 1;
     let mut state = LedgerState::new(snapshot, Novelty::new(1));
 
-    let s = Sid::new(0, "ex:s");
-    let p = Sid::new(0, "ex:p");
-    let dt = Sid::new(2, "string");
+    let s = Sid::new(NsCode(0), "ex:s");
+    let p = Sid::new(NsCode(0), "ex:p");
+    let dt = Sid::new(NsCode(2), "string");
 
     // t=2: ordinary default-graph commit.
     let reverse_graph = state.snapshot.build_reverse_graph().unwrap_or_default();

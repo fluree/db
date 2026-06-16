@@ -13,7 +13,7 @@ use std::cmp::Ordering;
 use fluree_db_core::comparator::IndexType;
 use fluree_db_core::flake::Flake;
 use fluree_db_core::value::FlakeValue;
-use fluree_db_core::{GraphDbRef, GraphId, LedgerSnapshot, OverlayProvider, Sid};
+use fluree_db_core::{GraphDbRef, GraphId, LedgerSnapshot, NsCode, OverlayProvider, Sid};
 use fluree_db_reasoner::{reason_owl2rl, ReasoningCache, ReasoningOptions};
 
 struct SortedOverlay {
@@ -85,24 +85,24 @@ impl OverlayProvider for SortedOverlay {
 }
 
 fn rdf(l: &str) -> Sid {
-    Sid::new(3, l)
+    Sid::new(NsCode(3), l)
 }
 fn rdfs(l: &str) -> Sid {
-    Sid::new(4, l)
+    Sid::new(NsCode(4), l)
 }
 fn owl(l: &str) -> Sid {
-    Sid::new(6, l)
+    Sid::new(NsCode(6), l)
 }
 fn ex(l: &str) -> Sid {
-    Sid::new(100, l)
+    Sid::new(NsCode(100), l)
 }
 // Blank-node namespace (code 10, "_:") — list/restriction nodes are blank nodes
 // in the real Univ-Bench ontology.
 fn bn(l: &str) -> Sid {
-    Sid::new(10, l)
+    Sid::new(NsCode(10), l)
 }
 fn ref_dt() -> Sid {
-    Sid::new(1, "id")
+    Sid::new(NsCode(1), "id")
 }
 fn tf(s: Sid, p: Sid, o: Sid) -> Flake {
     Flake::new(s, p, FlakeValue::Ref(o), ref_dt(), 1, true, None)

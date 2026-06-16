@@ -315,14 +315,15 @@ impl Operator for GroupByOperator {
 mod tests {
     use super::*;
     use crate::seed::SeedOperator;
+    use fluree_db_core::NsCode;
     use fluree_db_core::{FlakeValue, LedgerSnapshot, Sid};
 
     fn xsd_long() -> Sid {
-        Sid::new(2, "long")
+        Sid::new(NsCode(2), "long")
     }
 
     fn xsd_string() -> Sid {
-        Sid::new(2, "string")
+        Sid::new(NsCode(2), "string")
     }
 
     fn make_test_snapshot() -> LedgerSnapshot {
@@ -335,7 +336,7 @@ mod tests {
         let schema: Arc<[VarId]> = Arc::from(vec![VarId(0), VarId(1), VarId(2)].into_boxed_slice());
         let columns = vec![
             vec![Binding::lit(FlakeValue::String("NYC".into()), xsd_string())],
-            vec![Binding::sid(Sid::new(100, "alice"))],
+            vec![Binding::sid(Sid::new(NsCode(100), "alice"))],
             vec![Binding::lit(FlakeValue::Long(30), xsd_long())],
         ];
         let batch = Batch::new(schema.clone(), columns).unwrap();
@@ -376,7 +377,7 @@ mod tests {
         let schema: Arc<[VarId]> = Arc::from(vec![VarId(0), VarId(1), VarId(2)].into_boxed_slice());
         let columns = vec![
             vec![Binding::lit(FlakeValue::String("NYC".into()), xsd_string())],
-            vec![Binding::sid(Sid::new(100, "alice"))],
+            vec![Binding::sid(Sid::new(NsCode(100), "alice"))],
             vec![Binding::lit(FlakeValue::Long(30), xsd_long())],
         ];
         let batch = Batch::new(schema.clone(), columns).unwrap();
@@ -386,7 +387,7 @@ mod tests {
 
         let row = vec![
             Binding::lit(FlakeValue::String("NYC".into()), xsd_string()),
-            Binding::sid(Sid::new(100, "alice")),
+            Binding::sid(Sid::new(NsCode(100), "alice")),
             Binding::lit(FlakeValue::Long(30), xsd_long()),
         ];
 
@@ -416,9 +417,9 @@ mod tests {
                 Binding::lit(FlakeValue::String("NYC".into()), xsd_string()),
             ],
             vec![
-                Binding::sid(Sid::new(100, "alice")),
-                Binding::sid(Sid::new(100, "bob")),
-                Binding::sid(Sid::new(100, "carol")),
+                Binding::sid(Sid::new(NsCode(100), "alice")),
+                Binding::sid(Sid::new(NsCode(100), "bob")),
+                Binding::sid(Sid::new(NsCode(100), "carol")),
             ],
             vec![
                 Binding::lit(FlakeValue::Long(30), xsd_long()),
@@ -504,10 +505,10 @@ mod tests {
                 Binding::lit(FlakeValue::String("LA".into()), xsd_string()),
             ],
             vec![
-                Binding::sid(Sid::new(100, "alice")),
-                Binding::sid(Sid::new(100, "bob")),
-                Binding::sid(Sid::new(100, "carol")),
-                Binding::sid(Sid::new(100, "dan")),
+                Binding::sid(Sid::new(NsCode(100), "alice")),
+                Binding::sid(Sid::new(NsCode(100), "bob")),
+                Binding::sid(Sid::new(NsCode(100), "carol")),
+                Binding::sid(Sid::new(NsCode(100), "dan")),
             ],
             vec![
                 Binding::lit(FlakeValue::Long(30), xsd_long()),

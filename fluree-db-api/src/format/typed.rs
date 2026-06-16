@@ -557,7 +557,7 @@ fn format_row_wildcard(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fluree_db_core::Sid;
+    use fluree_db_core::{NsCode, Sid};
     use fluree_graph_json_ld::ParsedContext;
     use std::collections::HashMap;
 
@@ -588,7 +588,7 @@ mod tests {
     fn test_format_binding_sid_id_not_vocab_compacted() {
         let compactor = make_vocab_compactor();
         let result = make_test_result();
-        let binding = Binding::sid(Sid::new(100, "summer")); // http://example.org/lists/summer
+        let binding = Binding::sid(Sid::new(NsCode(100), "summer")); // http://example.org/lists/summer
         let formatted = format_binding(&result, &binding, &compactor).unwrap();
         assert_eq!(formatted, json!({"@id": "http://example.org/lists/summer"}));
     }
@@ -612,7 +612,7 @@ mod tests {
     fn test_format_binding_sid() {
         let compactor = make_test_compactor();
         let result = make_test_result();
-        let binding = Binding::sid(Sid::new(100, "alice"));
+        let binding = Binding::sid(Sid::new(NsCode(100), "alice"));
         let formatted = format_binding(&result, &binding, &compactor).unwrap();
         assert_eq!(formatted, json!({"@id": "http://example.org/alice"}));
     }
@@ -623,7 +623,7 @@ mod tests {
         let result = make_test_result();
         let binding = Binding::lit(
             FlakeValue::String("Alice".to_string()),
-            Sid::new(2, "string"),
+            Sid::new(NsCode(2), "string"),
         );
         let formatted = format_binding(&result, &binding, &compactor).unwrap();
         assert_eq!(
@@ -636,7 +636,7 @@ mod tests {
     fn test_format_binding_long() {
         let compactor = make_test_compactor();
         let result = make_test_result();
-        let binding = Binding::lit(FlakeValue::Long(42), Sid::new(2, "long"));
+        let binding = Binding::lit(FlakeValue::Long(42), Sid::new(NsCode(2), "long"));
         let formatted = format_binding(&result, &binding, &compactor).unwrap();
         assert_eq!(
             formatted,
@@ -648,7 +648,7 @@ mod tests {
     fn test_format_binding_double() {
         let compactor = make_test_compactor();
         let result = make_test_result();
-        let binding = Binding::lit(FlakeValue::Double(3.5), Sid::new(2, "double"));
+        let binding = Binding::lit(FlakeValue::Double(3.5), Sid::new(NsCode(2), "double"));
         let formatted = format_binding(&result, &binding, &compactor).unwrap();
         assert_eq!(
             formatted,
@@ -660,7 +660,7 @@ mod tests {
     fn test_format_binding_boolean() {
         let compactor = make_test_compactor();
         let result = make_test_result();
-        let binding = Binding::lit(FlakeValue::Boolean(true), Sid::new(2, "boolean"));
+        let binding = Binding::lit(FlakeValue::Boolean(true), Sid::new(NsCode(2), "boolean"));
         let formatted = format_binding(&result, &binding, &compactor).unwrap();
         assert_eq!(
             formatted,
@@ -692,8 +692,8 @@ mod tests {
         let compactor = make_test_compactor();
         let result = make_test_result();
         let binding = Binding::Grouped(vec![
-            Binding::lit(FlakeValue::Long(1), Sid::new(2, "long")),
-            Binding::lit(FlakeValue::Long(2), Sid::new(2, "long")),
+            Binding::lit(FlakeValue::Long(1), Sid::new(NsCode(2), "long")),
+            Binding::lit(FlakeValue::Long(2), Sid::new(NsCode(2), "long")),
         ]);
         let formatted = format_binding(&result, &binding, &compactor).unwrap();
         assert_eq!(
@@ -752,18 +752,18 @@ mod tests {
         let r = make_result(
             &["?id", "?s", "?n", "?d", "?b", "?lang", "?date"],
             vec![vec![
-                Binding::sid(Sid::new(100, "alice")),
+                Binding::sid(Sid::new(NsCode(100), "alice")),
                 Binding::lit(
                     FlakeValue::String("A \"quoted\"\tval".to_string()),
-                    Sid::new(2, "string"),
+                    Sid::new(NsCode(2), "string"),
                 ),
-                Binding::lit(FlakeValue::Long(-42), Sid::new(2, "long")),
-                Binding::lit(FlakeValue::Double(3.13), Sid::new(2, "double")),
-                Binding::lit(FlakeValue::Boolean(false), Sid::new(2, "boolean")),
+                Binding::lit(FlakeValue::Long(-42), Sid::new(NsCode(2), "long")),
+                Binding::lit(FlakeValue::Double(3.13), Sid::new(NsCode(2), "double")),
+                Binding::lit(FlakeValue::Boolean(false), Sid::new(NsCode(2), "boolean")),
                 Binding::lit_lang(FlakeValue::String("Hola".to_string()), "es"),
                 Binding::lit(
                     FlakeValue::String("2024-01-15".to_string()),
-                    Sid::new(2, "date"),
+                    Sid::new(NsCode(2), "date"),
                 ),
             ]],
         );
@@ -786,7 +786,7 @@ mod tests {
                 &["?d"],
                 vec![vec![Binding::lit(
                     FlakeValue::Double(d),
-                    Sid::new(2, "double"),
+                    Sid::new(NsCode(2), "double"),
                 )]],
             );
             assert_parity(&r, &c);
@@ -799,10 +799,10 @@ mod tests {
         let r = make_result(
             &["?a", "?b"],
             vec![
-                vec![Binding::sid(Sid::new(100, "a")), Binding::Unbound],
+                vec![Binding::sid(Sid::new(NsCode(100), "a")), Binding::Unbound],
                 vec![
                     Binding::Unbound,
-                    Binding::lit(FlakeValue::Long(2), Sid::new(2, "long")),
+                    Binding::lit(FlakeValue::Long(2), Sid::new(NsCode(2), "long")),
                 ],
             ],
         );
@@ -815,10 +815,10 @@ mod tests {
         let mut r = make_result(
             &["?s", "?g"],
             vec![vec![
-                Binding::sid(Sid::new(100, "a")),
+                Binding::sid(Sid::new(NsCode(100), "a")),
                 Binding::Grouped(vec![
-                    Binding::lit(FlakeValue::Long(1), Sid::new(2, "long")),
-                    Binding::lit(FlakeValue::Long(2), Sid::new(2, "long")),
+                    Binding::lit(FlakeValue::Long(1), Sid::new(NsCode(2), "long")),
+                    Binding::lit(FlakeValue::Long(2), Sid::new(NsCode(2), "long")),
                 ]),
             ]],
         );
@@ -834,11 +834,11 @@ mod tests {
             vec![vec![
                 Binding::lit(
                     FlakeValue::Json(r#"{"k":[1,2],"s":"x"}"#.to_string()),
-                    Sid::new(3, "JSON"),
+                    Sid::new(NsCode(3), "JSON"),
                 ),
                 Binding::lit(
                     FlakeValue::Vector(vec![1.0, 2.5, -3.0]),
-                    Sid::new(2, "double"),
+                    Sid::new(NsCode(2), "double"),
                 ),
             ]],
         );
@@ -855,15 +855,15 @@ mod tests {
             vec![vec![
                 Binding::lit(
                     coerce_string_value("99999999999999999999999999", xsd::INTEGER).unwrap(),
-                    Sid::new(2, "integer"),
+                    Sid::new(NsCode(2), "integer"),
                 ),
                 Binding::lit(
                     coerce_string_value("3.14159265358979", xsd::DECIMAL).unwrap(),
-                    Sid::new(2, "decimal"),
+                    Sid::new(NsCode(2), "decimal"),
                 ),
                 Binding::lit(
                     coerce_string_value("2024-01-15T10:30:00Z", xsd::DATE_TIME).unwrap(),
-                    Sid::new(2, "dateTime"),
+                    Sid::new(NsCode(2), "dateTime"),
                 ),
             ]],
         );
@@ -876,7 +876,7 @@ mod tests {
         let result = make_test_result();
 
         // NaN
-        let binding = Binding::lit(FlakeValue::Double(f64::NAN), Sid::new(2, "double"));
+        let binding = Binding::lit(FlakeValue::Double(f64::NAN), Sid::new(NsCode(2), "double"));
         let formatted = format_binding(&result, &binding, &compactor).unwrap();
         assert_eq!(
             formatted,
@@ -884,7 +884,10 @@ mod tests {
         );
 
         // Infinity
-        let binding = Binding::lit(FlakeValue::Double(f64::INFINITY), Sid::new(2, "double"));
+        let binding = Binding::lit(
+            FlakeValue::Double(f64::INFINITY),
+            Sid::new(NsCode(2), "double"),
+        );
         let formatted = format_binding(&result, &binding, &compactor).unwrap();
         assert_eq!(
             formatted,

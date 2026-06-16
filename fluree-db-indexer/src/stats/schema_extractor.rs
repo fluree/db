@@ -187,20 +187,21 @@ impl SchemaExtractor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fluree_db_core::NsCode;
 
     fn make_schema_flake(
         subject: &str,
-        predicate_ns: u16,
+        predicate_ns: NsCode,
         predicate_name: &str,
         object: &str,
         t: i64,
         op: bool,
     ) -> Flake {
         Flake::new(
-            Sid::new(100, subject),
+            Sid::new(NsCode(100), subject),
             Sid::new(predicate_ns, predicate_name),
-            FlakeValue::Ref(Sid::new(100, object)),
-            Sid::new(0, ""), // dt not relevant for schema
+            FlakeValue::Ref(Sid::new(NsCode(100), object)),
+            Sid::new(NsCode(0), ""), // dt not relevant for schema
             t,
             op,
             None,
@@ -336,8 +337,8 @@ mod tests {
                     "childProps".to_string(),
                 ],
                 vals: vec![SchemaPredicateInfo {
-                    id: Sid::new(100, "Person"),
-                    subclass_of: vec![Sid::new(100, "Thing")],
+                    id: Sid::new(NsCode(100), "Person"),
+                    subclass_of: vec![Sid::new(NsCode(100), "Thing")],
                     parent_props: vec![],
                     child_props: vec![],
                 }],

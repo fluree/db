@@ -240,7 +240,7 @@ impl StreamingCommitWriter {
 mod tests {
     use super::*;
     use fluree_db_core::commit::codec::read_commit;
-    use fluree_db_core::{FlakeMeta, FlakeValue, Sid};
+    use fluree_db_core::{FlakeMeta, FlakeValue, NsCode, Sid};
     use std::collections::HashMap;
 
     fn make_envelope(t: i64) -> CodecEnvelope {
@@ -259,10 +259,10 @@ mod tests {
 
     fn make_flake(s_name: &str, p_name: &str, value: FlakeValue, dt_name: &str, t: i64) -> Flake {
         Flake::new(
-            Sid::new(101, s_name),
-            Sid::new(101, p_name),
+            Sid::new(NsCode(101), s_name),
+            Sid::new(NsCode(101), p_name),
             value,
-            Sid::new(2, dt_name),
+            Sid::new(NsCode(2), dt_name),
             t,
             true,
             None,
@@ -343,7 +343,7 @@ mod tests {
             } else if i % 3 == 1 {
                 FlakeValue::String(format!("value_{i}"))
             } else {
-                FlakeValue::Ref(Sid::new(101, format!("ref_{i}")))
+                FlakeValue::Ref(Sid::new(NsCode(101), format!("ref_{i}")))
             };
             let dt = if i % 3 == 2 {
                 "id"
@@ -354,10 +354,10 @@ mod tests {
             };
             writer
                 .push_flake(&Flake::new(
-                    Sid::new(101, format!("s_{i}")),
-                    Sid::new(101, format!("p_{}", i % 10)),
+                    Sid::new(NsCode(101), format!("s_{i}")),
+                    Sid::new(NsCode(101), format!("p_{}", i % 10)),
                     value,
-                    Sid::new(if i % 3 == 2 { 1 } else { 2 }, dt),
+                    Sid::new(if i % 3 == 2 { NsCode(1) } else { NsCode(2) }, dt),
                     42,
                     i % 5 != 0,
                     None,
@@ -411,10 +411,10 @@ mod tests {
             .unwrap();
         writer
             .push_flake(&Flake::new(
-                Sid::new(101, "x"),
-                Sid::new(101, "ref"),
-                FlakeValue::Ref(Sid::new(101, "y")),
-                Sid::new(1, "id"),
+                Sid::new(NsCode(101), "x"),
+                Sid::new(NsCode(101), "ref"),
+                FlakeValue::Ref(Sid::new(NsCode(101), "y")),
+                Sid::new(NsCode(1), "id"),
                 1,
                 true,
                 None,
@@ -433,10 +433,10 @@ mod tests {
         // Language-tagged literal
         writer
             .push_flake(&Flake::new(
-                Sid::new(101, "x"),
-                Sid::new(101, "name"),
+                Sid::new(NsCode(101), "x"),
+                Sid::new(NsCode(101), "name"),
                 FlakeValue::String("Alice".into()),
-                Sid::new(3, "langString"),
+                Sid::new(NsCode(3), "langString"),
                 1,
                 true,
                 Some(FlakeMeta::with_lang("en")),
@@ -446,10 +446,10 @@ mod tests {
         // List item
         writer
             .push_flake(&Flake::new(
-                Sid::new(101, "x"),
-                Sid::new(101, "items"),
+                Sid::new(NsCode(101), "x"),
+                Sid::new(NsCode(101), "items"),
                 FlakeValue::Long(42),
-                Sid::new(2, "integer"),
+                Sid::new(NsCode(2), "integer"),
                 1,
                 true,
                 Some(FlakeMeta::with_index(0)),

@@ -238,6 +238,7 @@ where
 mod tests {
     use super::*;
     use crate::types::PropertyPolicyEntry;
+    use fluree_db_core::NsCode;
     use std::collections::HashMap;
 
     /// Build an IRI→Sid resolver from a static map.
@@ -250,7 +251,7 @@ mod tests {
     }
 
     fn sid(ns: u16, name: &str) -> Sid {
-        Sid::new(ns, name)
+        Sid::new(NsCode(ns), name)
     }
 
     fn wire_origin() -> WireOrigin {

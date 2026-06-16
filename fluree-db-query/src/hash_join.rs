@@ -428,7 +428,7 @@ fn join_key(binding: &Binding, store: Option<&BinaryIndexStore>) -> JoinKeyClass
     let keyed_ref_or_group = |sid: &fluree_db_core::Sid| {
         store
             .and_then(|s| {
-                s.find_subject_id_by_parts(sid.namespace_code, &sid.name)
+                s.find_subject_id_by_parts(sid.namespace_code.as_u16(), &sid.name)
                     .ok()
                     .flatten()
             })
@@ -814,6 +814,7 @@ impl Operator for HashJoinOperator {
 mod tests {
     use super::*;
     use crate::ir::triple::{Ref, Term};
+    use fluree_db_core::NsCode;
     use fluree_db_core::{PropertyStatData, Sid};
 
     #[test]
@@ -830,7 +831,10 @@ mod tests {
         ));
         assert!(matches!(
             join_key(
-                &Binding::lit(fluree_db_core::FlakeValue::Long(1), Sid::new(2, "long")),
+                &Binding::lit(
+                    fluree_db_core::FlakeValue::Long(1),
+                    Sid::new(NsCode(2), "long")
+                ),
                 None
             ),
             JoinKeyClass::Keyed(_)
@@ -873,9 +877,9 @@ mod tests {
         let s = vars.get_or_insert("?s");
         let ctx = ExecutionContext::new(&snapshot, &vars);
 
-        let key = || Binding::lit(FlakeValue::Long(1), Sid::new(2, "long"));
-        let d_ok = Binding::lit(FlakeValue::Long(10), Sid::new(2, "long"));
-        let d_poisoned = Binding::lit(FlakeValue::Long(20), Sid::new(2, "long"));
+        let key = || Binding::lit(FlakeValue::Long(1), Sid::new(NsCode(2), "long"));
+        let d_ok = Binding::lit(FlakeValue::Long(10), Sid::new(NsCode(2), "long"));
+        let d_poisoned = Binding::lit(FlakeValue::Long(20), Sid::new(NsCode(2), "long"));
 
         // Build (driving) side, columns [?x, ?driver]: row0 has a POISONED ?x, row1 keyed.
         let build_schema: Arc<[VarId]> = Arc::from(vec![x, driver].into_boxed_slice());
@@ -895,15 +899,18 @@ mod tests {
             vec![
                 vec![key(), key()], // ?x column
                 vec![
-                    Binding::lit(FlakeValue::Long(100), Sid::new(2, "long")),
-                    Binding::lit(FlakeValue::Long(200), Sid::new(2, "long")),
+                    Binding::lit(FlakeValue::Long(100), Sid::new(NsCode(2), "long")),
+                    Binding::lit(FlakeValue::Long(200), Sid::new(NsCode(2), "long")),
                 ], // ?s column
             ],
         )
         .unwrap();
 
-        let right_pattern =
-            TriplePattern::new(Ref::Var(s), Ref::Sid(Sid::new(1, "p")), Term::Var(x));
+        let right_pattern = TriplePattern::new(
+            Ref::Var(s),
+            Ref::Sid(Sid::new(NsCode(1), "p")),
+            Term::Var(x),
+        );
         let mut hj = HashJoinOperator::new(
             Box::new(OnceOp {
                 schema: build_schema,
@@ -943,12 +950,12 @@ mod tests {
         let left_schema = [review]; // subject bound, object new
         let tp = TriplePattern::new(
             Ref::Var(review),
-            Ref::Sid(Sid::new(1, "reviewer")),
+            Ref::Sid(Sid::new(NsCode(1), "reviewer")),
             Term::Var(reviewer),
         );
         let mut stats = StatsView::default();
         stats.properties.insert(
-            Sid::new(1, "reviewer"),
+            Sid::new(NsCode(1), "reviewer"),
             PropertyStatData {
                 count: 2_848_260,
                 ndv_values: 570_000,

@@ -280,7 +280,7 @@ pub fn build_class_stat_entries(
         } else {
             iri
         };
-        Some(Sid::new(ns_code, suffix))
+        Some(Sid::new(fluree_db_core::NsCode::from_u16(ns_code), suffix))
     };
 
     // Sort by (g_id, class_sid64) for deterministic output.
@@ -330,7 +330,8 @@ pub fn build_class_stat_entries(
                     .iter()
                     .filter_map(|&(&p_id, dt_map)| {
                         let psid_pair = predicate_sids.get(p_id as usize)?;
-                        let property_sid = Sid::new(psid_pair.0, &psid_pair.1);
+                        let property_sid =
+                            Sid::new(fluree_db_core::NsCode::from_u16(psid_pair.0), &psid_pair.1);
 
                         // Build per-datatype counts. The collector stores
                         // `ValueTypeTag::as_u8() as u16` (or `DT_REF_ID` for

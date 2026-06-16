@@ -525,6 +525,7 @@ mod tests {
     use super::*;
     use crate::ir::triple::{Ref, Term, TriplePattern};
     use crate::var_registry::VarRegistry;
+    use fluree_db_core::NsCode;
     use fluree_db_core::{LedgerSnapshot, Sid};
 
     // Helper test struct for creating operators with specific schemas
@@ -558,7 +559,7 @@ mod tests {
 
         let patterns = vec![Pattern::Triple(TriplePattern::new(
             Ref::Var(VarId(0)),
-            Ref::Sid(Sid::new(100, "age")),
+            Ref::Sid(Sid::new(NsCode(100), "age")),
             Term::Var(VarId(2)), // New variable
         ))];
 
@@ -584,7 +585,7 @@ mod tests {
 
         let patterns = vec![Pattern::Triple(TriplePattern::new(
             Ref::Var(VarId(0)),
-            Ref::Sid(Sid::new(100, "name")),
+            Ref::Sid(Sid::new(NsCode(100), "name")),
             Term::Var(VarId(1)),
         ))];
 
@@ -616,7 +617,7 @@ mod tests {
         );
 
         // Cross-ledger IriMatch carries the canonical IRI
-        let binding = Binding::iri_match("urn:other", Sid::new(2, "x"), "other:main");
+        let binding = Binding::iri_match("urn:other", Sid::new(NsCode(2), "x"), "other:main");
         assert_eq!(
             GraphOperator::extract_graph_iri_from_binding(&ctx, &binding),
             Some(Arc::from("urn:other"))
@@ -625,7 +626,7 @@ mod tests {
         // String literal still accepted for back-compat
         let binding = Binding::Lit {
             val: FlakeValue::String("http://example.org/graph1".to_string()),
-            dtc: DatatypeConstraint::Explicit(Sid::new(2, "string")),
+            dtc: DatatypeConstraint::Explicit(Sid::new(NsCode(2), "string")),
             t: None,
             op: None,
             p_id: None,
@@ -638,7 +639,7 @@ mod tests {
         // Non-string literal and Unbound return None
         let binding = Binding::Lit {
             val: FlakeValue::Long(42),
-            dtc: DatatypeConstraint::Explicit(Sid::new(2, "long")),
+            dtc: DatatypeConstraint::Explicit(Sid::new(NsCode(2), "long")),
             t: None,
             op: None,
             p_id: None,

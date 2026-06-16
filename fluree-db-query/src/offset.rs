@@ -145,6 +145,7 @@ mod tests {
     use super::*;
     use crate::error::QueryError;
     use crate::var_registry::VarRegistry;
+    use fluree_db_core::NsCode;
     use fluree_db_core::{FlakeValue, LedgerSnapshot, Sid};
 
     /// Mock operator that emits predefined batches
@@ -219,7 +220,7 @@ mod tests {
                     .map(|row| {
                         Binding::lit(
                             FlakeValue::Long((start_value + col * 100 + row) as i64),
-                            Sid::new(1, "long"),
+                            Sid::new(NsCode(1), "long"),
                         )
                     })
                     .collect()

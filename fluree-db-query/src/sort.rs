@@ -66,7 +66,7 @@ fn materialize_encoded_for_sort(
                         .dt_sids()
                         .get(*dt_id as usize)
                         .cloned()
-                        .unwrap_or_else(|| Sid::new(0, ""));
+                        .unwrap_or_else(|| Sid::new(fluree_db_core::NsCode(0), ""));
                     let meta = gv.store().decode_meta(*lang_id, *i_val);
                     let dtc = match meta.and_then(|m| m.lang.map(Arc::from)) {
                         Some(lang) => DatatypeConstraint::LangTag(lang),
@@ -769,6 +769,7 @@ mod tests {
     use crate::error::QueryError;
     use crate::var_registry::VarRegistry;
     use fluree_db_core::LedgerSnapshot;
+    use fluree_db_core::NsCode;
 
     /// Mock operator that emits predefined batches
     struct MockOperator {
@@ -837,7 +838,7 @@ mod tests {
     fn make_batch_with_values(schema: Arc<[VarId]>, values: Vec<i64>) -> Batch {
         let columns = vec![values
             .into_iter()
-            .map(|v| Binding::lit(FlakeValue::Long(v), Sid::new(1, "long")))
+            .map(|v| Binding::lit(FlakeValue::Long(v), Sid::new(NsCode(1), "long")))
             .collect()];
         Batch::new(schema, columns).unwrap()
     }
@@ -846,10 +847,10 @@ mod tests {
         assert_eq!(col1.len(), col2.len());
         let columns = vec![
             col1.into_iter()
-                .map(|v| Binding::lit(FlakeValue::Long(v), Sid::new(1, "long")))
+                .map(|v| Binding::lit(FlakeValue::Long(v), Sid::new(NsCode(1), "long")))
                 .collect(),
             col2.into_iter()
-                .map(|v| Binding::lit(FlakeValue::Long(v), Sid::new(1, "long")))
+                .map(|v| Binding::lit(FlakeValue::Long(v), Sid::new(NsCode(1), "long")))
                 .collect(),
         ];
         Batch::new(schema, columns).unwrap()
@@ -882,13 +883,13 @@ mod tests {
         assert_eq!(
             compare_bindings(
                 &Binding::Unbound,
-                &Binding::lit(FlakeValue::Long(1), Sid::new(1, "long"))
+                &Binding::lit(FlakeValue::Long(1), Sid::new(NsCode(1), "long"))
             ),
             Ordering::Less
         );
         assert_eq!(
             compare_bindings(
-                &Binding::lit(FlakeValue::Long(1), Sid::new(1, "long")),
+                &Binding::lit(FlakeValue::Long(1), Sid::new(NsCode(1), "long")),
                 &Binding::Unbound
             ),
             Ordering::Greater
@@ -912,7 +913,7 @@ mod tests {
         assert_eq!(
             compare_bindings(
                 &Binding::Poisoned,
-                &Binding::lit(FlakeValue::Long(1), Sid::new(1, "long"))
+                &Binding::lit(FlakeValue::Long(1), Sid::new(NsCode(1), "long"))
             ),
             Ordering::Less
         );
@@ -920,9 +921,9 @@ mod tests {
 
     #[test]
     fn test_compare_bindings_sid() {
-        let sid1 = Binding::sid(Sid::new(1, "apple"));
-        let sid2 = Binding::sid(Sid::new(1, "banana"));
-        let sid3 = Binding::sid(Sid::new(2, "apple"));
+        let sid1 = Binding::sid(Sid::new(NsCode(1), "apple"));
+        let sid2 = Binding::sid(Sid::new(NsCode(1), "banana"));
+        let sid3 = Binding::sid(Sid::new(NsCode(2), "apple"));
 
         assert_eq!(compare_bindings(&sid1, &sid1), Ordering::Equal);
         assert_eq!(compare_bindings(&sid1, &sid2), Ordering::Less); // apple < banana
@@ -931,8 +932,8 @@ mod tests {
 
     #[test]
     fn test_compare_bindings_long() {
-        let a = Binding::lit(FlakeValue::Long(1), Sid::new(1, "long"));
-        let b = Binding::lit(FlakeValue::Long(2), Sid::new(1, "long"));
+        let a = Binding::lit(FlakeValue::Long(1), Sid::new(NsCode(1), "long"));
+        let b = Binding::lit(FlakeValue::Long(2), Sid::new(NsCode(1), "long"));
 
         assert_eq!(compare_bindings(&a, &a), Ordering::Equal);
         assert_eq!(compare_bindings(&a, &b), Ordering::Less);
@@ -941,8 +942,8 @@ mod tests {
 
     #[test]
     fn test_compare_bindings_double() {
-        let a = Binding::lit(FlakeValue::Double(1.5), Sid::new(1, "double"));
-        let b = Binding::lit(FlakeValue::Double(2.5), Sid::new(1, "double"));
+        let a = Binding::lit(FlakeValue::Double(1.5), Sid::new(NsCode(1), "double"));
+        let b = Binding::lit(FlakeValue::Double(2.5), Sid::new(NsCode(1), "double"));
 
         assert_eq!(compare_bindings(&a, &a), Ordering::Equal);
         assert_eq!(compare_bindings(&a, &b), Ordering::Less);
@@ -950,8 +951,8 @@ mod tests {
 
     #[test]
     fn test_compare_bindings_nan() {
-        let nan = Binding::lit(FlakeValue::Double(f64::NAN), Sid::new(1, "double"));
-        let num = Binding::lit(FlakeValue::Double(1.0), Sid::new(1, "double"));
+        let nan = Binding::lit(FlakeValue::Double(f64::NAN), Sid::new(NsCode(1), "double"));
+        let num = Binding::lit(FlakeValue::Double(1.0), Sid::new(NsCode(1), "double"));
 
         // NaN sorts last
         assert_eq!(compare_bindings(&nan, &num), Ordering::Greater);
@@ -961,9 +962,9 @@ mod tests {
 
     #[test]
     fn test_compare_bindings_numeric_promotion() {
-        let long_1 = Binding::lit(FlakeValue::Long(1), Sid::new(1, "long"));
-        let double_1 = Binding::lit(FlakeValue::Double(1.0), Sid::new(1, "double"));
-        let double_2 = Binding::lit(FlakeValue::Double(2.0), Sid::new(1, "double"));
+        let long_1 = Binding::lit(FlakeValue::Long(1), Sid::new(NsCode(1), "long"));
+        let double_1 = Binding::lit(FlakeValue::Double(1.0), Sid::new(NsCode(1), "double"));
+        let double_2 = Binding::lit(FlakeValue::Double(2.0), Sid::new(NsCode(1), "double"));
 
         assert_eq!(compare_bindings(&long_1, &double_1), Ordering::Equal);
         assert_eq!(compare_bindings(&long_1, &double_2), Ordering::Less);
@@ -973,11 +974,11 @@ mod tests {
     fn test_compare_bindings_string() {
         let a = Binding::lit(
             FlakeValue::String("apple".to_string()),
-            Sid::new(1, "string"),
+            Sid::new(NsCode(1), "string"),
         );
         let b = Binding::lit(
             FlakeValue::String("banana".to_string()),
-            Sid::new(1, "string"),
+            Sid::new(NsCode(1), "string"),
         );
 
         assert_eq!(compare_bindings(&a, &a), Ordering::Equal);
@@ -987,10 +988,13 @@ mod tests {
     #[test]
     fn test_compare_bindings_cross_type() {
         // Type order: Null < Boolean < Long < Double < String < Ref
-        let null = Binding::lit(FlakeValue::Null, Sid::new(1, "null"));
-        let bool_val = Binding::lit(FlakeValue::Boolean(true), Sid::new(1, "bool"));
-        let long_val = Binding::lit(FlakeValue::Long(1), Sid::new(1, "long"));
-        let string_val = Binding::lit(FlakeValue::String("x".to_string()), Sid::new(1, "string"));
+        let null = Binding::lit(FlakeValue::Null, Sid::new(NsCode(1), "null"));
+        let bool_val = Binding::lit(FlakeValue::Boolean(true), Sid::new(NsCode(1), "bool"));
+        let long_val = Binding::lit(FlakeValue::Long(1), Sid::new(NsCode(1), "long"));
+        let string_val = Binding::lit(
+            FlakeValue::String("x".to_string()),
+            Sid::new(NsCode(1), "string"),
+        );
 
         assert_eq!(compare_bindings(&null, &bool_val), Ordering::Less);
         assert_eq!(compare_bindings(&bool_val, &long_val), Ordering::Less);
@@ -1077,9 +1081,9 @@ mod tests {
 
         let schema: Arc<[VarId]> = Arc::from(vec![VarId(0)].into_boxed_slice());
         let columns = vec![vec![
-            Binding::lit(FlakeValue::Long(3), Sid::new(1, "long")),
+            Binding::lit(FlakeValue::Long(3), Sid::new(NsCode(1), "long")),
             Binding::Unbound,
-            Binding::lit(FlakeValue::Long(1), Sid::new(1, "long")),
+            Binding::lit(FlakeValue::Long(1), Sid::new(NsCode(1), "long")),
             Binding::Unbound,
         ]];
         let batch = Batch::new(schema.clone(), columns).unwrap();
@@ -1189,7 +1193,7 @@ mod tests {
                     .map(|row| {
                         Binding::lit(
                             FlakeValue::Long((col * 10 + row) as i64),
-                            Sid::new(1, "long"),
+                            Sid::new(NsCode(1), "long"),
                         )
                     })
                     .collect()

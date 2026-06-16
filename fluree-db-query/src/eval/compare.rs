@@ -160,7 +160,7 @@ fn fast_eq_ne_for_iri_bindings<R: RowAccess>(
                         let key = match &r {
                             Ref::Iri(iri) => crate::context::ConstSidKey::Iri(iri.as_ref().into()),
                             Ref::Sid(sid) => crate::context::ConstSidKey::Sid(
-                                sid.namespace_code,
+                                sid.namespace_code.as_u16(),
                                 sid.name.as_ref().into(),
                             ),
                             Ref::Var(_) => unreachable!("other_ref is never a Var"),

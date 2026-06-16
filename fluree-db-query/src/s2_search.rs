@@ -113,7 +113,7 @@ impl S2SearchOperator {
                                 // (geo:wktLiteral uses namespace OGC_GEO=11 with local name "wktLiteral")
                                 if dt.namespace_code != fluree_vocab::namespaces::OGC_GEO {
                                     tracing::debug!(
-                                        ns = dt.namespace_code,
+                                        ns = dt.namespace_code.as_u16(),
                                         name = %dt.name,
                                         "S2Search: Lit binding has non-geo:wktLiteral datatype, attempting WKT parse anyway"
                                     );

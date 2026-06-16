@@ -1257,7 +1257,7 @@ fn lower_hydration<E: IriEncoder>(
             // (raw id string). This supports ids like "foo" and "foaf:bar" without requiring @base/@vocab.
             let sid = encoder
                 .encode_iri(expanded_iri)
-                .unwrap_or_else(|| Sid::new(0, expanded_iri));
+                .unwrap_or_else(|| Sid::new(fluree_db_core::NsCode(0), expanded_iri));
             Root::Sid(sid)
         }
     };
@@ -1865,7 +1865,7 @@ mod tests {
         let DatatypeConstraint::Explicit(sid) = lowered.dtc.expect("should have dtc") else {
             panic!("should be Explicit");
         };
-        assert_eq!(sid.namespace_code, 2);
+        assert_eq!(sid.namespace_code, fluree_db_core::NsCode(2));
         assert_eq!(sid.name.as_ref(), "integer");
     }
 

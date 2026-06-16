@@ -13,10 +13,11 @@ mod restriction_rule_tests;
 
 use super::*;
 use crate::owl;
+use fluree_db_core::NsCode;
 
 /// Create a test SID from a namespace code.
 pub(crate) fn sid(n: u16) -> Sid {
-    Sid::new(n, format!("test:{n}"))
+    Sid::new(NsCode::from_u16(n), format!("test:{n}"))
 }
 
 /// Create a reference flake for testing.

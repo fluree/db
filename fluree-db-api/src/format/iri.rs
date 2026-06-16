@@ -120,8 +120,8 @@ impl IriCompactor {
         }
         let prefix = self
             .namespace_codes
-            .get(&sid.namespace_code)
-            .ok_or(FormatError::UnknownNamespace(sid.namespace_code))?;
+            .get(&sid.namespace_code.as_u16())
+            .ok_or(FormatError::UnknownNamespace(sid.namespace_code.as_u16()))?;
         Ok(format!("{}{}", prefix, sid.name))
     }
 
@@ -143,9 +143,9 @@ impl IriCompactor {
             return Ok(None);
         }
         self.namespace_codes
-            .get(&sid.namespace_code)
+            .get(&sid.namespace_code.as_u16())
             .map(|p| Some(p.as_str()))
-            .ok_or(FormatError::UnknownNamespace(sid.namespace_code))
+            .ok_or(FormatError::UnknownNamespace(sid.namespace_code.as_u16()))
     }
 
     /// Compact a **forward** predicate / @type IRI using the @context (vocab rules).
@@ -261,7 +261,7 @@ impl IriCompactor {
                 best = Some((code, local, prefix.len()));
             }
         }
-        best.map(|(code, local, _)| Sid::new(code, local))
+        best.map(|(code, local, _)| Sid::new(fluree_db_core::NsCode::from_u16(code), local))
     }
 
     /// Check if a namespace code is registered
@@ -477,6 +477,7 @@ fn derive_prefix_name(ns_iri: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fluree_db_core::NsCode;
     use fluree_vocab::{rdf, xsd};
     use serde_json::json;
 
@@ -507,20 +508,20 @@ mod tests {
     fn test_decode_sid() {
         let compactor = IriCompactor::from_namespaces(Arc::new(make_test_namespaces()));
 
-        let sid = Sid::new(2, "string");
+        let sid = Sid::new(NsCode(2), "string");
         assert_eq!(
             compactor.decode_sid(&sid).unwrap(),
             "http://www.w3.org/2001/XMLSchema#string".to_string()
         );
 
-        let sid = Sid::new(100, "Person");
+        let sid = Sid::new(NsCode(100), "Person");
         assert_eq!(
             compactor.decode_sid(&sid).unwrap(),
             "http://example.org/Person".to_string()
         );
 
         // Unknown namespace
-        let sid = Sid::new(999, "unknown");
+        let sid = Sid::new(NsCode(999), "unknown");
         assert!(matches!(
             compactor.decode_sid(&sid),
             Err(FormatError::UnknownNamespace(999))
@@ -563,10 +564,10 @@ mod tests {
         let compactor = IriCompactor::new(Arc::new(make_test_namespaces()), &make_test_context());
 
         // Known namespace with @context prefix
-        let sid = Sid::new(2, "string");
+        let sid = Sid::new(NsCode(2), "string");
         assert_eq!(compactor.compact_sid(&sid).unwrap(), "xsd:string");
 
-        let sid = Sid::new(17, "Person");
+        let sid = Sid::new(NsCode(17), "Person");
         assert_eq!(compactor.compact_sid(&sid).unwrap(), "schema:Person");
     }
 
@@ -575,7 +576,7 @@ mod tests {
         let compactor = IriCompactor::from_namespaces(Arc::new(make_test_namespaces()));
 
         // No @context and no fallback — IRIs come through uncompacted
-        let sid = Sid::new(2, "string");
+        let sid = Sid::new(NsCode(2), "string");
         assert_eq!(
             compactor.compact_sid(&sid).unwrap(),
             "http://www.w3.org/2001/XMLSchema#string"
@@ -665,7 +666,7 @@ mod tests {
         let compactor = IriCompactor::new(Arc::new(namespaces), &context);
 
         // SID under @vocab: the @id path must NOT collapse it to the bare term.
-        let summer = Sid::new(100, "summer"); // http://example.org/lists/summer
+        let summer = Sid::new(NsCode(100), "summer"); // http://example.org/lists/summer
         assert_eq!(
             compactor.compact_id_sid(&summer).unwrap(),
             "http://example.org/lists/summer"
@@ -674,11 +675,11 @@ mod tests {
         assert_eq!(compactor.compact_sid(&summer).unwrap(), "summer");
 
         // @id still honors explicit prefixes.
-        let q1 = Sid::new(101, "q1"); // http://example.org/items/q1
+        let q1 = Sid::new(NsCode(101), "q1"); // http://example.org/items/q1
         assert_eq!(compactor.compact_id_sid(&q1).unwrap(), "items:q1");
 
         // @id still honors @base (relative form).
-        let thing = Sid::new(102, "thing"); // http://base.example/thing
+        let thing = Sid::new(NsCode(102), "thing"); // http://base.example/thing
         assert_eq!(compactor.compact_id_sid(&thing).unwrap(), "thing");
 
         // The IRI-string variant matches the SID variant for @id positions.
@@ -716,8 +717,8 @@ mod tests {
         .unwrap();
         let compactor = IriCompactor::new(Arc::new(namespaces), &context);
 
-        let under_base = Sid::new(100, "alice"); // https://flur.ee/base/alice
-        let under_vocab = Sid::new(101, "bob"); //  https://flur.ee/vocab/bob
+        let under_base = Sid::new(NsCode(100), "alice"); // https://flur.ee/base/alice
+        let under_vocab = Sid::new(NsCode(101), "bob"); //  https://flur.ee/vocab/bob
 
         // @id position: @base applies (relative form); @vocab must NOT.
         assert_eq!(compactor.compact_id_sid(&under_base).unwrap(), "alice");

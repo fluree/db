@@ -249,7 +249,11 @@ fn capture_selectivity_inputs(
     if let Some(s) = stats {
         // Prefer SID formatting when available (stable + compact).
         if let Some(pred_sid) = pattern.p.as_sid() {
-            inputs.property_sid = Some(format!("{}:{}", pred_sid.namespace_code, &pred_sid.name));
+            inputs.property_sid = Some(format!(
+                "{}:{}",
+                pred_sid.namespace_code.as_u16(),
+                &pred_sid.name
+            ));
             if let Some(prop) = s.get_property(pred_sid) {
                 inputs.count = Some(prop.count);
                 inputs.ndv_values = Some(prop.ndv_values);
@@ -334,7 +338,7 @@ pub fn format_pattern(pattern: &TriplePattern) -> String {
 fn format_ref(r: &Ref) -> String {
     match r {
         Ref::Var(v) => format!("?v{}", v.0),
-        Ref::Sid(sid) => format!("<{}:{}>", sid.namespace_code, &sid.name),
+        Ref::Sid(sid) => format!("<{}:{}>", sid.namespace_code.as_u16(), &sid.name),
         Ref::Iri(iri) => format!("<{iri}>"),
     }
 }
@@ -343,7 +347,7 @@ fn format_ref(r: &Ref) -> String {
 fn format_term(term: &Term) -> String {
     match term {
         Term::Var(v) => format!("?v{}", v.0),
-        Term::Sid(sid) => format!("<{}:{}>", sid.namespace_code, &sid.name),
+        Term::Sid(sid) => format!("<{}:{}>", sid.namespace_code.as_u16(), &sid.name),
         Term::Iri(iri) => format!("<{iri}>"),
         Term::Value(val) => format!("{val:?}"),
     }
@@ -658,12 +662,13 @@ impl fmt::Display for GeneralExplainPlan {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fluree_db_core::NsCode;
     use fluree_db_core::Sid;
 
     fn make_pattern(s: VarId, pred_name: &str, o: VarId) -> TriplePattern {
         TriplePattern::new(
             Ref::Var(s),
-            Ref::Sid(Sid::new(100, pred_name)),
+            Ref::Sid(Sid::new(NsCode(100), pred_name)),
             Term::Var(o),
         )
     }
@@ -671,7 +676,7 @@ mod tests {
     fn make_bound_subject_pattern(s_sid: Sid, pred_name: &str, o: VarId) -> TriplePattern {
         TriplePattern::new(
             Ref::Sid(s_sid),
-            Ref::Sid(Sid::new(100, pred_name)),
+            Ref::Sid(Sid::new(NsCode(100), pred_name)),
             Term::Var(o),
         )
     }
@@ -693,7 +698,7 @@ mod tests {
         // p1: ?s :name ?name (PropertyScan, fallback score=1000)
         // p2: ex:person1 :age ?age (BoundSubject, fallback score=10)
         let p1 = make_pattern(VarId(0), "name", VarId(1));
-        let p2 = make_bound_subject_pattern(Sid::new(50, "person1"), "age", VarId(2));
+        let p2 = make_bound_subject_pattern(Sid::new(NsCode(50), "person1"), "age", VarId(2));
 
         let patterns = vec![p1, p2];
         let explain = explain_patterns(&patterns, None);
@@ -712,7 +717,7 @@ mod tests {
 
         let mut properties = HashMap::new();
         properties.insert(
-            Sid::new(100, "name"),
+            Sid::new(NsCode(100), "name"),
             PropertyStatData {
                 count: 5000,
                 ndv_values: 4500,
@@ -720,7 +725,7 @@ mod tests {
             },
         );
         properties.insert(
-            Sid::new(100, "age"),
+            Sid::new(NsCode(100), "age"),
             PropertyStatData {
                 count: 100,
                 ndv_values: 80,
@@ -756,7 +761,7 @@ mod tests {
 
         // Only class stats, no property stats
         let mut classes = HashMap::new();
-        classes.insert(Sid::new(200, "Person"), 500);
+        classes.insert(Sid::new(NsCode(200), "Person"), 500);
 
         let stats = StatsView {
             properties: HashMap::new(),
@@ -799,7 +804,7 @@ mod tests {
         );
 
         // BoundSubject: s :p ?o
-        let p2 = make_bound_subject_pattern(Sid::new(50, "person1"), "name", VarId(1));
+        let p2 = make_bound_subject_pattern(Sid::new(NsCode(50), "person1"), "name", VarId(1));
         assert_eq!(
             classify_pattern(&p2, &HashSet::new()),
             PatternType::BoundSubject
@@ -808,7 +813,7 @@ mod tests {
         // BoundObject: ?s :p o
         let p3 = TriplePattern::new(
             Ref::Var(VarId(0)),
-            Ref::Sid(Sid::new(100, "name")),
+            Ref::Sid(Sid::new(NsCode(100), "name")),
             Term::Value(fluree_db_core::FlakeValue::String("Alice".into())),
         );
         assert_eq!(
@@ -818,8 +823,8 @@ mod tests {
 
         // ExactMatch: s :p o
         let p4 = TriplePattern::new(
-            Ref::Sid(Sid::new(50, "person1")),
-            Ref::Sid(Sid::new(100, "name")),
+            Ref::Sid(Sid::new(NsCode(50), "person1")),
+            Ref::Sid(Sid::new(NsCode(100), "name")),
             Term::Value(fluree_db_core::FlakeValue::String("Alice".into())),
         );
         assert_eq!(
@@ -835,7 +840,7 @@ mod tests {
 
         let mut properties = HashMap::new();
         properties.insert(
-            Sid::new(100, "name"),
+            Sid::new(NsCode(100), "name"),
             PropertyStatData {
                 count: 5000,
                 ndv_values: 4500,
@@ -885,8 +890,8 @@ mod tests {
         let patterns = vec![
             Pattern::Triple(TriplePattern::new(
                 Ref::Var(s),
-                Ref::Sid(Sid::new(100, "type")),
-                Term::Sid(Sid::new(100, "Deal")),
+                Ref::Sid(Sid::new(NsCode(100), "type")),
+                Term::Sid(Sid::new(NsCode(100), "Deal")),
             )),
             Pattern::Triple(make_pattern(s, "name", VarId(1))),
             Pattern::Triple(make_pattern(s, "amount", VarId(2))),

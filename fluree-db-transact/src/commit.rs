@@ -330,11 +330,11 @@ where
         // Strip any user-supplied f:identity claim so the system-controlled
         // value is the only one recorded.
         txn_meta.retain(|entry| {
-            !(entry.predicate_ns == fluree_vocab::namespaces::FLUREE_DB
+            !(entry.predicate_ns == fluree_vocab::namespaces::FLUREE_DB.as_u16()
                 && entry.predicate_name == fluree_vocab::db::IDENTITY)
         });
         txn_meta.push(TxnMetaEntry::new(
-            fluree_vocab::namespaces::FLUREE_DB,
+            fluree_vocab::namespaces::FLUREE_DB.as_u16(),
             fluree_vocab::db::IDENTITY,
             TxnMetaValue::String(identity_val.clone()),
         ));
@@ -846,7 +846,8 @@ mod tests {
     use crate::ir::{TemplateTerm, TripleTemplate, Txn};
     use crate::stage::{stage, StageOptions};
     use fluree_db_core::{
-        content_store_for, FlakeValue, LedgerSnapshot, MemoryStorage, Sid, CODEC_FLUREE_COMMIT,
+        content_store_for, FlakeValue, LedgerSnapshot, MemoryStorage, NsCode, Sid,
+        CODEC_FLUREE_COMMIT,
     };
     use fluree_db_nameservice::memory::MemoryNameService;
     use fluree_db_nameservice::{
@@ -1028,8 +1029,8 @@ mod tests {
 
         // Stage an insert
         let txn = Txn::insert().with_insert(TripleTemplate::new(
-            TemplateTerm::Sid(Sid::new(1, "ex:alice")),
-            TemplateTerm::Sid(Sid::new(1, "ex:name")),
+            TemplateTerm::Sid(Sid::new(NsCode(1), "ex:alice")),
+            TemplateTerm::Sid(Sid::new(NsCode(1), "ex:name")),
             TemplateTerm::Value(FlakeValue::String("Alice".to_string())),
         ));
 
@@ -1114,8 +1115,8 @@ mod tests {
 
         // First commit
         let txn1 = Txn::insert().with_insert(TripleTemplate::new(
-            TemplateTerm::Sid(Sid::new(1, "ex:alice")),
-            TemplateTerm::Sid(Sid::new(1, "ex:name")),
+            TemplateTerm::Sid(Sid::new(NsCode(1), "ex:alice")),
+            TemplateTerm::Sid(Sid::new(NsCode(1), "ex:name")),
             TemplateTerm::Value(FlakeValue::String("Alice".to_string())),
         ));
 
@@ -1138,8 +1139,8 @@ mod tests {
 
         // Second commit
         let txn2 = Txn::insert().with_insert(TripleTemplate::new(
-            TemplateTerm::Sid(Sid::new(1, "ex:bob")),
-            TemplateTerm::Sid(Sid::new(1, "ex:name")),
+            TemplateTerm::Sid(Sid::new(NsCode(1), "ex:bob")),
+            TemplateTerm::Sid(Sid::new(NsCode(1), "ex:name")),
             TemplateTerm::Value(FlakeValue::String("Bob".to_string())),
         ));
 
@@ -1180,8 +1181,8 @@ mod tests {
         // Create a transaction with a large string value
         let big_value = "x".repeat(1000);
         let txn = Txn::insert().with_insert(TripleTemplate::new(
-            TemplateTerm::Sid(Sid::new(1, "ex:alice")),
-            TemplateTerm::Sid(Sid::new(1, "ex:bio")),
+            TemplateTerm::Sid(Sid::new(NsCode(1), "ex:alice")),
+            TemplateTerm::Sid(Sid::new(NsCode(1), "ex:bio")),
             TemplateTerm::Value(FlakeValue::String(big_value)),
         ));
 
@@ -1228,8 +1229,8 @@ mod tests {
         };
 
         let txn = Txn::insert().with_insert(TripleTemplate::new(
-            TemplateTerm::Sid(Sid::new(1, "ex:alice")),
-            TemplateTerm::Sid(Sid::new(1, "ex:name")),
+            TemplateTerm::Sid(Sid::new(NsCode(1), "ex:alice")),
+            TemplateTerm::Sid(Sid::new(NsCode(1), "ex:name")),
             TemplateTerm::Value(FlakeValue::String("Alice".to_string())),
         ));
 

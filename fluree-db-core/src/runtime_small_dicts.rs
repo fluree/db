@@ -179,9 +179,10 @@ fn runtime_datatype_id_from_index(v: u32) -> RuntimeDatatypeId {
 mod tests {
     use super::*;
     use crate::FlakeValue;
+    use fluree_vocab::NsCode;
 
     fn sid(ns: u16, name: &str) -> Sid {
-        Sid::new(ns, name)
+        Sid::new(NsCode::from_u16(ns), name)
     }
 
     #[test]

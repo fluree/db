@@ -17,6 +17,7 @@ use crate::schema_hierarchy::SchemaHierarchy;
 use crate::sid::Sid;
 use crate::storage::StorageRead;
 use fluree_vocab::namespaces::{EMPTY, OVERFLOW};
+use fluree_vocab::NsCode;
 use once_cell::sync::OnceCell;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -303,7 +304,7 @@ impl LedgerSnapshot {
     fn encode_iri_inner(&self, iri: &str) -> Sid {
         let (canonical_prefix, canonical_suffix) = canonical_split(iri, self.ns_split_mode);
         if let Some(&code) = self.namespace_reverse.get(canonical_prefix) {
-            return Sid::new(code, canonical_suffix);
+            return Sid::new(NsCode::from_u16(code), canonical_suffix);
         }
         Sid::new(EMPTY, iri)
     }
@@ -347,7 +348,7 @@ impl LedgerSnapshot {
             return Some(sid.name.to_string());
         }
         self.namespace_codes
-            .get(&sid.namespace_code)
+            .get(&sid.namespace_code.as_u16())
             .map(|prefix| format!("{}{}", prefix, sid.name))
     }
 
@@ -475,9 +476,9 @@ impl LedgerSnapshot {
     /// Once user codes exist, the `ns_split_mode` is locked — changing it would
     /// re-split existing IRIs differently, breaking decode consistency.
     pub fn has_user_namespace_codes(&self) -> bool {
-        self.namespace_codes
-            .keys()
-            .any(|&code| (fluree_vocab::namespaces::USER_START..OVERFLOW).contains(&code))
+        self.namespace_codes.keys().any(|&code| {
+            (fluree_vocab::namespaces::USER_START.as_u16()..OVERFLOW.as_u16()).contains(&code)
+        })
     }
 
     /// Get the schema hierarchy for RDFS reasoning.
@@ -907,7 +908,7 @@ mod tests {
         .unwrap();
 
         let sid = db.encode_iri("http://example.org/Alice").unwrap();
-        assert_eq!(sid.namespace_code, 100);
+        assert_eq!(sid.namespace_code, NsCode(100));
         assert_eq!(sid.name.as_ref(), "Alice");
 
         let iri = db.decode_sid(&sid).unwrap();
@@ -947,7 +948,7 @@ mod tests {
         db2.insert_namespace_code(100, "urn:fluree:mydb:main#".to_string())
             .unwrap();
         let sid2 = db2.encode_iri(&txn_meta_iri).unwrap();
-        assert_eq!(sid2.namespace_code, 100);
+        assert_eq!(sid2.namespace_code, NsCode(100));
         assert_eq!(sid2.name.as_ref(), "txn-meta");
         assert_eq!(db2.decode_sid(&sid2).unwrap(), txn_meta_iri);
     }

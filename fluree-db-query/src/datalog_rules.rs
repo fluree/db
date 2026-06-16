@@ -120,9 +120,9 @@ fn parse_query_time_rule(
 
         // Get rule ID from @id, or generate one
         let rule_id = if let Some(id_str) = json.get("@id").and_then(|v| v.as_str()) {
-            Sid::new(0, id_str)
+            Sid::new(fluree_db_core::NsCode(0), id_str)
         } else {
-            Sid::new(0, format!("_:query_rule_{index}"))
+            Sid::new(fluree_db_core::NsCode(0), format!("_:query_rule_{index}"))
         };
 
         return parse_rule_definition(&rule_id, rule_value, snapshot);
@@ -130,7 +130,7 @@ fn parse_query_time_rule(
 
     // Direct rule format
     // Generate a synthetic rule ID
-    let rule_id = Sid::new(0, format!("_:query_rule_{index}"));
+    let rule_id = Sid::new(fluree_db_core::NsCode(0), format!("_:query_rule_{index}"));
     parse_rule_definition(&rule_id, json, snapshot)
 }
 

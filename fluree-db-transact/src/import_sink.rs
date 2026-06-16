@@ -233,7 +233,7 @@ mod inner {
         /// xxh3_128 hashing of `(ns_code, name_bytes)`.
         fn assign_subject_id(&mut self, sid: &Sid) -> u64 {
             self.subjects
-                .get_or_insert(sid.namespace_code, sid.name.as_bytes())
+                .get_or_insert(sid.namespace_code.as_u16(), sid.name.as_bytes())
         }
 
         /// Assign a global predicate ID via `DictWorkerCache`.
@@ -244,7 +244,7 @@ mod inner {
             // Important: avoid returning a `&str` from a `&mut self` helper here,
             // because that would borrow the whole `SpoolContext` mutably and
             // prevent a simultaneous mutable borrow of `self.predicates`.
-            let code = sid.namespace_code;
+            let code = sid.namespace_code.as_u16();
             if !self.ns_prefix_cache.contains_key(&code) {
                 let prefix = self.ns_alloc.get_prefix(code).unwrap_or_default();
                 self.ns_prefix_cache.insert(code, prefix);
@@ -259,7 +259,7 @@ mod inner {
 
         /// Assign a global datatype ID via `DictWorkerCache`.
         fn assign_datatype_id(&mut self, sid: &Sid) -> u16 {
-            let code = sid.namespace_code;
+            let code = sid.namespace_code.as_u16();
             if !self.ns_prefix_cache.contains_key(&code) {
                 let prefix = self.ns_alloc.get_prefix(code).unwrap_or_default();
                 self.ns_prefix_cache.insert(code, prefix);

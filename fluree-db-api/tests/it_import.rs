@@ -241,7 +241,7 @@ fn property_count(snapshot: &LedgerSnapshot, iri: &str) -> Option<u64> {
     let stats = snapshot.stats.as_ref()?;
     let props = stats.properties.as_ref()?;
     for p in props {
-        let sid = Sid::new(p.sid.0, &p.sid.1);
+        let sid = Sid::new(fluree_db_core::NsCode(p.sid.0), &p.sid.1);
         if let Some(full) = snapshot.decode_sid(&sid) {
             if full == iri {
                 return Some(p.count);

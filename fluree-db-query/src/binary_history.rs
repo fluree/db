@@ -560,7 +560,7 @@ fn decode_event_to_flake(
         .map_err(|e| QueryError::from_io("history decode decode_value", e))?;
     let dt = store
         .resolve_datatype_sid(o_type)
-        .unwrap_or_else(|| Sid::new(0, ""));
+        .unwrap_or_else(|| Sid::new(fluree_db_core::NsCode(0), ""));
     let lang = store
         .resolve_lang_tag(o_type)
         .map(std::string::ToString::to_string);

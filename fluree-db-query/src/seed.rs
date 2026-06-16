@@ -213,14 +213,15 @@ impl Operator for EmptyOperator {
 mod tests {
     use super::*;
     use crate::binding::Binding;
+    use fluree_db_core::NsCode;
     use fluree_db_core::{FlakeValue, Sid};
 
     fn xsd_long() -> Sid {
-        Sid::new(2, "long")
+        Sid::new(NsCode(2), "long")
     }
 
     fn xsd_string() -> Sid {
-        Sid::new(2, "string")
+        Sid::new(NsCode(2), "string")
     }
 
     fn make_test_batch() -> Batch {

@@ -1206,12 +1206,13 @@ fn count_significant_digits(s: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fluree_vocab::NsCode;
 
     #[test]
     fn test_type_ordering() {
         // Type ordering: Null < Ref < Boolean < Numeric < Temporal < String < Json < Vector
         let null = FlakeValue::Null;
-        let ref_val = FlakeValue::Ref(Sid::new(1, "test"));
+        let ref_val = FlakeValue::Ref(Sid::new(NsCode(1), "test"));
         let bool_val = FlakeValue::Boolean(true);
         let long_val = FlakeValue::Long(42);
         let double_val = FlakeValue::Double(3.13);
@@ -1318,8 +1319,8 @@ mod tests {
         assert!(FlakeValue::Boolean(false) < FlakeValue::Boolean(true));
 
         // Refs
-        let ref1 = FlakeValue::Ref(Sid::new(1, "a"));
-        let ref2 = FlakeValue::Ref(Sid::new(1, "b"));
+        let ref1 = FlakeValue::Ref(Sid::new(NsCode(1), "a"));
+        let ref2 = FlakeValue::Ref(Sid::new(NsCode(1), "b"));
         assert!(ref1 < ref2);
     }
 
@@ -1477,8 +1478,8 @@ mod tests {
                 FlakeValue::String(String::new()),
                 FlakeValue::String("a".to_string()),
                 FlakeValue::String("b".to_string()),
-                FlakeValue::Ref(Sid::new(1, "test")),
-                FlakeValue::Ref(Sid::new(2, "test")),
+                FlakeValue::Ref(Sid::new(NsCode(1), "test")),
+                FlakeValue::Ref(Sid::new(NsCode(2), "test")),
             ];
 
             let hashes: Vec<u64> = values

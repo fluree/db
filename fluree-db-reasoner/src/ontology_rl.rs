@@ -872,6 +872,7 @@ pub async fn load_same_as_assertions(db: GraphDbRef<'_>) -> Result<Vec<(Sid, Sid
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fluree_db_core::NsCode;
 
     #[test]
     fn test_empty_ontology() {
@@ -883,21 +884,27 @@ mod tests {
     #[test]
     fn test_ontology_with_data() {
         let mut symmetric = HashSet::new();
-        symmetric.insert(Sid::new(100, "knows"));
+        symmetric.insert(Sid::new(NsCode(100), "knows"));
 
         let mut transitive = HashSet::new();
-        transitive.insert(Sid::new(100, "ancestorOf"));
+        transitive.insert(Sid::new(NsCode(100), "ancestorOf"));
 
         let mut inverse = HashMap::new();
-        inverse.insert(Sid::new(100, "hasParent"), vec![Sid::new(100, "hasChild")]);
+        inverse.insert(
+            Sid::new(NsCode(100), "hasParent"),
+            vec![Sid::new(NsCode(100), "hasChild")],
+        );
 
         let ont = OntologyRL::new(symmetric, transitive, inverse, 42);
 
         assert!(!ont.is_empty());
         assert_eq!(ont.epoch(), 42);
-        assert!(ont.is_symmetric(&Sid::new(100, "knows")));
-        assert!(!ont.is_symmetric(&Sid::new(100, "likes")));
-        assert!(ont.is_transitive(&Sid::new(100, "ancestorOf")));
-        assert_eq!(ont.inverses_of(&Sid::new(100, "hasParent")).len(), 1);
+        assert!(ont.is_symmetric(&Sid::new(NsCode(100), "knows")));
+        assert!(!ont.is_symmetric(&Sid::new(NsCode(100), "likes")));
+        assert!(ont.is_transitive(&Sid::new(NsCode(100), "ancestorOf")));
+        assert_eq!(
+            ont.inverses_of(&Sid::new(NsCode(100), "hasParent")).len(),
+            1
+        );
     }
 }

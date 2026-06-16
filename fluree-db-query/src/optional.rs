@@ -285,7 +285,7 @@ impl PatternOptionalBuilder {
         match binding {
             Binding::EncodedSid { s_id, .. } => Ok(Some(*s_id)),
             Binding::Sid { sid, .. } => store
-                .find_subject_id_by_parts(sid.namespace_code, &sid.name)
+                .find_subject_id_by_parts(sid.namespace_code.as_u16(), &sid.name)
                 .map_err(|e| QueryError::execution(format!("find_subject_id_by_parts: {e}"))),
             _ => Ok(None),
         }
@@ -548,7 +548,7 @@ impl OptionalBuilder for PatternOptionalBuilder {
                     // Fallback stable key: namespace code + suffix bytes.
                     let mut v = Vec::with_capacity(1 + 2 + sid.name_str().len());
                     v.push(b's');
-                    v.extend_from_slice(&sid.namespace_code.to_le_bytes());
+                    v.extend_from_slice(&sid.namespace_code.as_u16().to_le_bytes());
                     v.extend_from_slice(sid.name_str().as_bytes());
                     Ok(Some(v.into_boxed_slice()))
                 }
@@ -659,7 +659,7 @@ impl GroupedPatternOptionalBuilder {
         match binding {
             Binding::EncodedSid { s_id, .. } => Ok(Some(*s_id)),
             Binding::Sid { sid, .. } => store
-                .find_subject_id_by_parts(sid.namespace_code, &sid.name)
+                .find_subject_id_by_parts(sid.namespace_code.as_u16(), &sid.name)
                 .map_err(|e| QueryError::execution(format!("find_subject_id_by_parts: {e}"))),
             _ => Ok(None),
         }
@@ -912,7 +912,7 @@ impl OptionalBuilder for GroupedPatternOptionalBuilder {
             Binding::Sid { sid, .. } => {
                 let mut v = Vec::with_capacity(1 + 2 + sid.name_str().len());
                 v.push(b's');
-                v.extend_from_slice(&sid.namespace_code.to_le_bytes());
+                v.extend_from_slice(&sid.namespace_code.as_u16().to_le_bytes());
                 v.extend_from_slice(sid.name_str().as_bytes());
                 Ok(Some(v.into_boxed_slice()))
             }
@@ -1699,13 +1699,14 @@ impl Operator for OptionalOperator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fluree_db_core::NsCode;
     use fluree_db_core::Sid;
 
     fn make_optional_pattern() -> TriplePattern {
         // ?s :email ?email
         TriplePattern::new(
             Ref::Var(VarId(0)),
-            Ref::Sid(Sid::new(101, "email")),
+            Ref::Sid(Sid::new(NsCode(101), "email")),
             Term::Var(VarId(2)),
         )
     }
@@ -1796,7 +1797,7 @@ mod tests {
             vec![Binding::Poisoned],
             vec![Binding::lit(
                 FlakeValue::String("Alice".to_string()),
-                Sid::new(2, "string"),
+                Sid::new(NsCode(2), "string"),
             )],
         ];
         let batch_poisoned = Batch::new(required_schema.clone(), columns_poisoned).unwrap();
@@ -1806,10 +1807,10 @@ mod tests {
 
         // Create a batch with normal bindings
         let columns_normal = vec![
-            vec![Binding::sid(Sid::new(1, "alice"))],
+            vec![Binding::sid(Sid::new(NsCode(1), "alice"))],
             vec![Binding::lit(
                 FlakeValue::String("Alice".to_string()),
-                Sid::new(2, "string"),
+                Sid::new(NsCode(2), "string"),
             )],
         ];
         let batch_normal = Batch::new(required_schema, columns_normal).unwrap();
@@ -1849,10 +1850,10 @@ mod tests {
 
         // Create a required batch with one row
         let columns = vec![
-            vec![Binding::sid(Sid::new(1, "alice"))],
+            vec![Binding::sid(Sid::new(NsCode(1), "alice"))],
             vec![Binding::lit(
                 FlakeValue::String("Alice".to_string()),
-                Sid::new(2, "string"),
+                Sid::new(NsCode(2), "string"),
             )],
         ];
         let batch = Batch::new(required_schema, columns).unwrap();

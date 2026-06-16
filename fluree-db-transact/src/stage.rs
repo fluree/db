@@ -17,7 +17,7 @@ use crate::namespace::NamespaceRegistry;
 use fluree_db_core::tracking::schedule::TXN_BASELINE_MICRO_FUEL;
 use fluree_db_core::OverlayProvider;
 use fluree_db_core::Tracker;
-use fluree_db_core::{Flake, FlakeValue, GraphId, Sid};
+use fluree_db_core::{Flake, FlakeValue, GraphId, NsCode, Sid};
 use fluree_db_ledger::{IndexConfig, LedgerState, StagedLedger};
 use fluree_db_policy::{
     is_schema_flake, populate_class_cache, PolicyContext, PolicyDecision, PolicyError,
@@ -1141,7 +1141,7 @@ fn materialize_one_binding(
                         .dt_sids()
                         .get(dt_id as usize)
                         .cloned()
-                        .unwrap_or_else(|| Sid::new(0, ""));
+                        .unwrap_or_else(|| Sid::new(NsCode::from_u16(0), ""));
                     let dt_iri = store_ref.sid_to_iri(&dt_sid).ok_or_else(|| {
                         TransactError::Query(fluree_db_query::QueryError::Internal(format!(
                             "sid_to_iri failed: unknown namespace code {} for datatype {:?}",
@@ -1217,10 +1217,14 @@ fn binding_to_flake_object(
     materializer: Option<&mut fluree_db_query::Materializer>,
 ) -> Option<(FlakeValue, Sid)> {
     match binding {
-        Binding::Sid { sid, .. } => Some((FlakeValue::Ref(sid.clone()), Sid::new(1, "id"))),
-        Binding::IriMatch { primary_sid, .. } => {
-            Some((FlakeValue::Ref(primary_sid.clone()), Sid::new(1, "id")))
-        }
+        Binding::Sid { sid, .. } => Some((
+            FlakeValue::Ref(sid.clone()),
+            Sid::new(NsCode::from_u16(1), "id"),
+        )),
+        Binding::IriMatch { primary_sid, .. } => Some((
+            FlakeValue::Ref(primary_sid.clone()),
+            Sid::new(NsCode::from_u16(1), "id"),
+        )),
         Binding::Lit { val, dtc, .. } => Some((val.clone(), dtc.datatype().clone())),
         Binding::EncodedLit { .. } | Binding::EncodedSid { .. } | Binding::EncodedPid { .. } => {
             match materializer {
@@ -1834,7 +1838,7 @@ fn format_shacl_report(report: &ValidationReport) -> String {
 mod tests {
     use super::*;
     use crate::ir::{TemplateTerm, TripleTemplate, Txn};
-    use fluree_db_core::{FlakeValue, LedgerSnapshot, MemoryStorage, Sid};
+    use fluree_db_core::{FlakeValue, LedgerSnapshot, MemoryStorage, NsCode, Sid};
     use fluree_db_novelty::Novelty;
     use fluree_db_query::parse::{UnresolvedTerm, UnresolvedTriplePattern};
 
@@ -1847,7 +1851,7 @@ mod tests {
     fn column_needs_materialization_detects_each_encoded_variant() {
         // Already-concrete bindings — must NOT trigger rewrite.
         let concrete = vec![
-            Binding::sid(Sid::new(1, "a")),
+            Binding::sid(Sid::new(NsCode(1), "a")),
             Binding::Unbound,
             Binding::Poisoned,
         ];
@@ -1870,7 +1874,7 @@ mod tests {
 
         // A column with a single encoded entry among many concrete entries
         // must still trigger — early-exit on first hit.
-        let mut mixed = vec![Binding::sid(Sid::new(1, "a")); 8];
+        let mut mixed = vec![Binding::sid(Sid::new(NsCode(1), "a")); 8];
         mixed.push(Binding::encoded_sid(1));
         mixed.extend(std::iter::repeat_n(Binding::Unbound, 4));
         assert!(column_needs_materialization(&mixed));
@@ -1884,8 +1888,8 @@ mod tests {
 
         // Create a simple insert transaction
         let txn = Txn::insert().with_insert(TripleTemplate::new(
-            TemplateTerm::Sid(Sid::new(1, "ex:alice")),
-            TemplateTerm::Sid(Sid::new(1, "ex:name")),
+            TemplateTerm::Sid(Sid::new(NsCode(1), "ex:alice")),
+            TemplateTerm::Sid(Sid::new(NsCode(1), "ex:name")),
             TemplateTerm::Value(FlakeValue::String("Alice".to_string())),
         ));
 
@@ -1906,13 +1910,13 @@ mod tests {
         // Insert multiple triples
         let txn = Txn::insert()
             .with_insert(TripleTemplate::new(
-                TemplateTerm::Sid(Sid::new(1, "ex:alice")),
-                TemplateTerm::Sid(Sid::new(1, "ex:name")),
+                TemplateTerm::Sid(Sid::new(NsCode(1), "ex:alice")),
+                TemplateTerm::Sid(Sid::new(NsCode(1), "ex:name")),
                 TemplateTerm::Value(FlakeValue::String("Alice".to_string())),
             ))
             .with_insert(TripleTemplate::new(
-                TemplateTerm::Sid(Sid::new(1, "ex:alice")),
-                TemplateTerm::Sid(Sid::new(1, "ex:age")),
+                TemplateTerm::Sid(Sid::new(NsCode(1), "ex:alice")),
+                TemplateTerm::Sid(Sid::new(NsCode(1), "ex:age")),
                 TemplateTerm::Value(FlakeValue::Long(30)),
             ));
 
@@ -1933,7 +1937,7 @@ mod tests {
         // Insert with blank node
         let txn = Txn::insert().with_insert(TripleTemplate::new(
             TemplateTerm::BlankNode("_:b1".to_string()),
-            TemplateTerm::Sid(Sid::new(1, "ex:name")),
+            TemplateTerm::Sid(Sid::new(NsCode(1), "ex:name")),
             TemplateTerm::Value(FlakeValue::String("Anonymous".to_string())),
         ));
 
@@ -1958,10 +1962,10 @@ mod tests {
         // Add a lot of flakes to exceed the limit
         for i in 0..1000 {
             let flake = Flake::new(
-                Sid::new(1, format!("s{i}")),
-                Sid::new(1, "p"),
+                Sid::new(NsCode(1), format!("s{i}")),
+                Sid::new(NsCode(1), "p"),
                 FlakeValue::Long(i),
-                Sid::new(2, "long"),
+                Sid::new(NsCode(2), "long"),
                 1,
                 true,
                 None,
@@ -1980,8 +1984,8 @@ mod tests {
         };
 
         let txn = Txn::insert().with_insert(TripleTemplate::new(
-            TemplateTerm::Sid(Sid::new(1, "ex:alice")),
-            TemplateTerm::Sid(Sid::new(1, "ex:name")),
+            TemplateTerm::Sid(Sid::new(NsCode(1), "ex:alice")),
+            TemplateTerm::Sid(Sid::new(NsCode(1), "ex:name")),
             TemplateTerm::Value(FlakeValue::String("Alice".to_string())),
         ));
 
@@ -2002,7 +2006,7 @@ mod tests {
 
         let txn = Txn::insert().with_insert(TripleTemplate::new(
             TemplateTerm::BlankNode("_:b1".to_string()),
-            TemplateTerm::Sid(Sid::new(1, "ex:name")),
+            TemplateTerm::Sid(Sid::new(NsCode(1), "ex:name")),
             TemplateTerm::Value(FlakeValue::String("Test".to_string())),
         ));
 
@@ -2032,8 +2036,8 @@ mod tests {
 
         // First: insert ex:alice with name="Alice"
         let txn1 = Txn::insert().with_insert(TripleTemplate::new(
-            TemplateTerm::Sid(Sid::new(1, "ex:alice")),
-            TemplateTerm::Sid(Sid::new(1, "ex:name")),
+            TemplateTerm::Sid(Sid::new(NsCode(1), "ex:alice")),
+            TemplateTerm::Sid(Sid::new(NsCode(1), "ex:name")),
             TemplateTerm::Value(FlakeValue::String("Alice".to_string())),
         ));
 
@@ -2054,8 +2058,8 @@ mod tests {
 
         // Now: upsert ex:alice with name="Alicia" (should replace)
         let txn2 = Txn::upsert().with_insert(TripleTemplate::new(
-            TemplateTerm::Sid(Sid::new(1, "ex:alice")),
-            TemplateTerm::Sid(Sid::new(1, "ex:name")),
+            TemplateTerm::Sid(Sid::new(NsCode(1), "ex:alice")),
+            TemplateTerm::Sid(Sid::new(NsCode(1), "ex:name")),
             TemplateTerm::Value(FlakeValue::String("Alicia".to_string())),
         ));
 
@@ -2094,8 +2098,8 @@ mod tests {
         let ledger = LedgerState::new(db, novelty);
 
         let txn = Txn::upsert().with_insert(TripleTemplate::new(
-            TemplateTerm::Sid(Sid::new(1, "ex:alice")),
-            TemplateTerm::Sid(Sid::new(1, "ex:name")),
+            TemplateTerm::Sid(Sid::new(NsCode(1), "ex:alice")),
+            TemplateTerm::Sid(Sid::new(NsCode(1), "ex:name")),
             TemplateTerm::Value(FlakeValue::String("Alice".to_string())),
         ));
 
@@ -2388,11 +2392,11 @@ mod tests {
             vec![s_var, name_var],
             vec![
                 vec![
-                    TemplateTerm::Sid(Sid::new(1, "ex:alice")),
+                    TemplateTerm::Sid(Sid::new(NsCode(1), "ex:alice")),
                     TemplateTerm::Value(FlakeValue::String("Alice".to_string())),
                 ],
                 vec![
-                    TemplateTerm::Sid(Sid::new(1, "ex:bob")),
+                    TemplateTerm::Sid(Sid::new(NsCode(1), "ex:bob")),
                     TemplateTerm::Value(FlakeValue::String("Bob".to_string())),
                 ],
             ],
@@ -2401,7 +2405,7 @@ mod tests {
         let txn = Txn::insert()
             .with_insert(TripleTemplate::new(
                 TemplateTerm::Var(s_var),
-                TemplateTerm::Sid(Sid::new(1, "ex:name")),
+                TemplateTerm::Sid(Sid::new(NsCode(1), "ex:name")),
                 TemplateTerm::Var(name_var),
             ))
             .with_values(values)

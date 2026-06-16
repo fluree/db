@@ -21,8 +21,8 @@ fn sid_to_iri(sid: &Sid, codes: &std::collections::HashMap<u16, String>) -> Stri
         return sid.name_str().to_string();
     }
     let prefix = codes
-        .get(&sid.namespace_code)
-        .unwrap_or_else(|| panic!("missing namespace code {}", sid.namespace_code));
+        .get(&sid.namespace_code.as_u16())
+        .unwrap_or_else(|| panic!("missing namespace code {}", sid.namespace_code.as_u16()));
     format!("{prefix}{}", sid.name_str())
 }
 
@@ -141,14 +141,14 @@ async fn repro_upsert_repeated_ids_create_duplicate_subject_ids() {
             let member_iri = "https://ns.flur.ee/messaging/member/m1";
             let member_sid = store.encode_iri(member_iri);
             let persisted_id = store
-                .find_subject_id_by_parts(member_sid.namespace_code, member_sid.name_str())
+                .find_subject_id_by_parts(member_sid.namespace_code.as_u16(), member_sid.name_str())
                 .expect("find_subject_id_by_parts io")
                 .expect("member should exist in persisted dict after indexing t=1");
 
             let novelty_id = ledger2_loaded
                 .dict_novelty
                 .subjects
-                .find_subject(member_sid.namespace_code, member_sid.name_str());
+                .find_subject(member_sid.namespace_code.as_u16(), member_sid.name_str());
             assert!(
                 novelty_id.is_none(),
                 "dict_novelty must not allocate IDs for persisted subjects"

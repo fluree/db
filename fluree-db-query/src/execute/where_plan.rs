@@ -2205,6 +2205,7 @@ mod tests {
     use super::*;
     use crate::ir::triple::{Ref, Term};
     use crate::ir::{Expression, Pattern};
+    use fluree_db_core::NsCode;
     use fluree_db_core::{FlakeValue, PropertyStatData, Sid, StatsView};
     use std::collections::HashSet;
     use std::sync::Arc;
@@ -2267,7 +2268,7 @@ mod tests {
     fn make_pattern(s_var: VarId, p_name: &str, o_var: VarId) -> TriplePattern {
         TriplePattern::new(
             Ref::Var(s_var),
-            Ref::Sid(Sid::new(100, p_name)),
+            Ref::Sid(Sid::new(NsCode(100), p_name)),
             Term::Var(o_var),
         )
     }
@@ -2319,7 +2320,10 @@ mod tests {
         let patterns = vec![
             Pattern::Values {
                 vars: vec![VarId(9)],
-                rows: vec![vec![Binding::lit(FlakeValue::Long(0), Sid::new(2, "long"))]],
+                rows: vec![vec![Binding::lit(
+                    FlakeValue::Long(0),
+                    Sid::new(NsCode(2), "long"),
+                )]],
             },
             Pattern::Triple(make_pattern(VarId(0), "date", VarId(1))),
             Pattern::Triple(make_pattern(VarId(0), "vec", VarId(2))),
@@ -2366,12 +2370,12 @@ mod tests {
             )),
             Pattern::Triple(TriplePattern::new(
                 Ref::Var(score),
-                Ref::Sid(Sid::new(100, "refersInstance")),
+                Ref::Sid(Sid::new(NsCode(100), "refersInstance")),
                 Term::Var(concept),
             )),
             Pattern::Triple(TriplePattern::new(
                 Ref::Var(concept),
-                Ref::Sid(Sid::new(100, "notation")),
+                Ref::Sid(Sid::new(NsCode(100), "notation")),
                 Term::Value(FlakeValue::String("LVL1".to_string())),
             )),
         ];
@@ -2390,7 +2394,7 @@ mod tests {
         // Stats: make "notation" look far more selective than the score predicates.
         let mut stats = StatsView::default();
         stats.properties.insert(
-            Sid::new(100, "notation"),
+            Sid::new(NsCode(100), "notation"),
             PropertyStatData {
                 count: 1_000_000,
                 ndv_values: 1_000_000, // selectivity ~ 1
@@ -2398,7 +2402,7 @@ mod tests {
             },
         );
         stats.properties.insert(
-            Sid::new(100, "hasScore"),
+            Sid::new(NsCode(100), "hasScore"),
             PropertyStatData {
                 count: 1_000_000_000, // very unselective property scan
                 ndv_values: 900_000_000,
@@ -2406,7 +2410,7 @@ mod tests {
             },
         );
         stats.properties.insert(
-            Sid::new(100, "refersInstance"),
+            Sid::new(NsCode(100), "refersInstance"),
             PropertyStatData {
                 count: 800_000_000, // unselective property scan
                 ndv_values: 700_000_000,
@@ -2434,7 +2438,10 @@ mod tests {
         let patterns = vec![
             Pattern::Values {
                 vars: vec![VarId(0)],
-                rows: vec![vec![Binding::lit(FlakeValue::Long(1), Sid::new(2, "long"))]],
+                rows: vec![vec![Binding::lit(
+                    FlakeValue::Long(1),
+                    Sid::new(NsCode(2), "long"),
+                )]],
             },
             Pattern::Filter(Expression::eq(
                 Expression::Var(VarId(0)),
@@ -2442,7 +2449,7 @@ mod tests {
             )),
             Pattern::Triple(TriplePattern::new(
                 Ref::Var(VarId(1)),
-                Ref::Sid(Sid::new(100, "p")),
+                Ref::Sid(Sid::new(NsCode(100), "p")),
                 Term::Var(VarId(0)),
             )),
         ];
@@ -2517,7 +2524,7 @@ mod tests {
             vars: vec![VarId(0)],
             rows: vec![vec![Binding::lit(
                 FlakeValue::Long(42),
-                Sid::new(2, "long"),
+                Sid::new(NsCode(2), "long"),
             )]],
         }];
         let result = build_where_operators(&patterns, None);
@@ -2568,8 +2575,14 @@ mod tests {
             Pattern::Values {
                 vars: vec![VarId(0)],
                 rows: vec![
-                    vec![Binding::lit(FlakeValue::Long(1), Sid::new(2, "long"))],
-                    vec![Binding::lit(FlakeValue::Long(2), Sid::new(2, "long"))],
+                    vec![Binding::lit(
+                        FlakeValue::Long(1),
+                        Sid::new(NsCode(2), "long"),
+                    )],
+                    vec![Binding::lit(
+                        FlakeValue::Long(2),
+                        Sid::new(NsCode(2), "long"),
+                    )],
                 ],
             },
             Pattern::Triple(make_pattern(VarId(0), "name", VarId(1))),
@@ -2938,7 +2951,7 @@ mod tests {
         let trailing = vec![Pattern::Optional(vec![Pattern::Triple(
             TriplePattern::new(
                 Ref::Var(VarId(9)),
-                Ref::Sid(Sid::new(100, "other")),
+                Ref::Sid(Sid::new(NsCode(100), "other")),
                 Term::Var(VarId(10)),
             ),
         )])];
@@ -3393,7 +3406,7 @@ mod tests {
     fn test_scan_index_hint_prefers_opst_for_prefix_filter() {
         let tp = TriplePattern::new(
             Ref::Var(VarId(0)),
-            Ref::Sid(fluree_db_core::Sid::new(100, "name")),
+            Ref::Sid(fluree_db_core::Sid::new(NsCode(100), "name")),
             Term::Var(VarId(1)),
         );
         let filter = InlineOperator::Filter(PreparedBoolExpression::new(Expression::call(
@@ -3412,7 +3425,7 @@ mod tests {
     fn test_scan_index_hint_prefers_opst_for_str_wrapper_with_string_dtc() {
         let tp = TriplePattern {
             s: Ref::Var(VarId(0)),
-            p: Ref::Sid(fluree_db_core::Sid::new(100, "name")),
+            p: Ref::Sid(fluree_db_core::Sid::new(NsCode(100), "name")),
             o: Term::Var(VarId(1)),
             dtc: Some(fluree_db_core::DatatypeConstraint::Explicit(
                 fluree_db_core::Sid::new(
@@ -3437,7 +3450,7 @@ mod tests {
     fn test_scan_index_hint_rejects_str_wrapper_without_string_dtc() {
         let tp = TriplePattern::new(
             Ref::Var(VarId(0)),
-            Ref::Sid(fluree_db_core::Sid::new(100, "name")),
+            Ref::Sid(fluree_db_core::Sid::new(NsCode(100), "name")),
             Term::Var(VarId(1)),
         );
         let filter = InlineOperator::Filter(PreparedBoolExpression::new(Expression::call(

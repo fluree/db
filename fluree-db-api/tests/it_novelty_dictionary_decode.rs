@@ -150,8 +150,14 @@ SELECT ?o WHERE { ex:s ex:label ?o }
             let mut vars = VarRegistry::new();
             let o_var = vars.get_or_insert("?o");
             let patterns = vec![Pattern::Triple(TriplePattern::new(
-                Ref::Sid(fluree_db_core::Sid::new(0, "http://example.org/s")),
-                Ref::Sid(fluree_db_core::Sid::new(0, "http://example.org/label")),
+                Ref::Sid(fluree_db_core::Sid::new(
+                    fluree_db_core::NsCode(0),
+                    "http://example.org/s",
+                )),
+                Ref::Sid(fluree_db_core::Sid::new(
+                    fluree_db_core::NsCode(0),
+                    "http://example.org/label",
+                )),
                 Term::Var(o_var),
             ))];
             let batches = execute_where(after.as_graph_db_ref(GraphId(0)), &vars, &patterns, None)

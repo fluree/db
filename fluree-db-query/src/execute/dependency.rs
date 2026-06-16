@@ -132,6 +132,7 @@ mod tests {
     };
     use crate::parse::SelectMode;
     use crate::sort::SortSpec;
+    use fluree_db_core::NsCode;
     use fluree_db_core::Sid;
     use fluree_graph_json_ld::ParsedContext;
     use std::collections::HashMap;
@@ -175,7 +176,11 @@ mod tests {
     }
 
     fn make_tp(s: VarId, p: &str, o: VarId) -> TriplePattern {
-        TriplePattern::new(Ref::Var(s), Ref::Sid(Sid::new(100, p)), Term::Var(o))
+        TriplePattern::new(
+            Ref::Var(s),
+            Ref::Sid(Sid::new(NsCode(100), p)),
+            Term::Var(o),
+        )
     }
 
     #[test]
@@ -386,7 +391,7 @@ mod tests {
         let query = make_query_with_selections(vec![
             crate::ir::Column::Var(VarId(1)),
             crate::ir::Column::Hydration(crate::ir::HydrationSpec::new(
-                crate::ir::Root::Sid(Sid::new(100, "alice")),
+                crate::ir::Root::Sid(Sid::new(NsCode(100), "alice")),
                 crate::ir::NestedSelectSpec::Explicit {
                     forward: vec![],
                     reverse: HashMap::new(),

@@ -869,7 +869,7 @@ fn merge_batch_into_index(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fluree_db_core::{FlakeMeta, FlakeValue, Sid};
+    use fluree_db_core::{FlakeMeta, FlakeValue, NsCode, Sid};
 
     /// Empty reverse_graph — all flakes go to default graph (g_id=0)
     fn no_graphs() -> HashMap<Sid, GraphId> {
@@ -878,10 +878,10 @@ mod tests {
 
     fn make_flake(s: u16, p: u16, o: i64, t: i64, op: bool) -> Flake {
         Flake::new(
-            Sid::new(s, format!("s{s}")),
-            Sid::new(p, format!("p{p}")),
+            Sid::new(NsCode(s), format!("s{s}")),
+            Sid::new(NsCode(p), format!("p{p}")),
             FlakeValue::Long(o),
-            Sid::new(2, "long"),
+            Sid::new(NsCode(2), "long"),
             t,
             op,
             None,
@@ -897,10 +897,10 @@ mod tests {
         m: Option<FlakeMeta>,
     ) -> Flake {
         Flake::new(
-            Sid::new(s, format!("s{s}")),
-            Sid::new(p, format!("p{p}")),
+            Sid::new(NsCode(s), format!("s{s}")),
+            Sid::new(NsCode(p), format!("p{p}")),
             FlakeValue::Long(o),
-            Sid::new(2, "long"),
+            Sid::new(NsCode(2), "long"),
             t,
             op,
             m,
@@ -909,10 +909,10 @@ mod tests {
 
     fn make_ref_flake(s: u16, p: u16, o_sid: u16, t: i64) -> Flake {
         Flake::new(
-            Sid::new(s, format!("s{s}")),
-            Sid::new(p, format!("p{p}")),
-            FlakeValue::Ref(Sid::new(o_sid, format!("s{o_sid}"))),
-            Sid::new(1, "id"), // $id datatype marks it as a ref
+            Sid::new(NsCode(s), format!("s{s}")),
+            Sid::new(NsCode(p), format!("p{p}")),
+            FlakeValue::Ref(Sid::new(NsCode(o_sid), format!("s{o_sid}"))),
+            Sid::new(NsCode(1), "id"), // $id datatype marks it as a ref
             t,
             true,
             None,
@@ -922,10 +922,10 @@ mod tests {
     /// Make a flake assigned to a named graph via its `g` field
     fn make_graph_flake(s: u16, p: u16, o: i64, t: i64, g_sid: Sid) -> Flake {
         let mut f = Flake::new(
-            Sid::new(s, format!("s{s}")),
-            Sid::new(p, format!("p{p}")),
+            Sid::new(NsCode(s), format!("s{s}")),
+            Sid::new(NsCode(p), format!("p{p}")),
             FlakeValue::Long(o),
-            Sid::new(2, "long"),
+            Sid::new(NsCode(2), "long"),
             t,
             true,
             None,
@@ -959,7 +959,7 @@ mod tests {
         // graph: the old in-place code would have bumped t/epoch and pushed the
         // good flake before erroring on the second.
         let good = make_flake(2, 2, 2, 2, true);
-        let bad = make_graph_flake(3, 3, 3, 2, Sid::new(9, "g-unknown"));
+        let bad = make_graph_flake(3, 3, 3, 2, Sid::new(NsCode(9), "g-unknown"));
         let err = novelty.apply_commit(vec![good, bad], 2, &no_graphs());
 
         assert!(err.is_err(), "unknown graph Sid must error");
@@ -975,7 +975,13 @@ mod tests {
         // can_apply reports the same routing failure without mutating.
         assert!(novelty
             .can_apply(
-                &[make_graph_flake(4, 4, 4, 3, Sid::new(9, "g-unknown"))],
+                &[make_graph_flake(
+                    4,
+                    4,
+                    4,
+                    3,
+                    Sid::new(NsCode(9), "g-unknown")
+                )],
                 &no_graphs()
             )
             .is_err());
@@ -1348,7 +1354,7 @@ mod tests {
         let mut novelty = Novelty::new(0);
 
         // Set up: graph 2 mapped to Sid("g", "graph2")
-        let g2_sid = Sid::new(100, "graph2");
+        let g2_sid = Sid::new(NsCode(100), "graph2");
         let mut rg = HashMap::new();
         rg.insert(g2_sid.clone(), GraphId(2));
 
@@ -1392,7 +1398,7 @@ mod tests {
         let rg = no_graphs(); // No named graphs registered
 
         // Flake with a graph Sid that isn't in reverse_graph
-        let unknown_g = Sid::new(200, "unknown");
+        let unknown_g = Sid::new(NsCode(200), "unknown");
         let flakes = vec![make_graph_flake(1, 1, 100, 1, unknown_g)];
 
         let result = novelty.apply_commit(flakes, 1, &rg);
@@ -1416,8 +1422,8 @@ mod tests {
         assert_eq!(id2, 1);
         assert_eq!(store.len(), 2);
 
-        assert_eq!(store.get(0).s.namespace_code, 1);
-        assert_eq!(store.get(1).s.namespace_code, 2);
+        assert_eq!(store.get(0).s.namespace_code, NsCode(1));
+        assert_eq!(store.get(1).s.namespace_code, NsCode(2));
     }
 
     /// Drift guard: the file-local `cmp_object` / `cmp_meta` /
@@ -1500,11 +1506,11 @@ mod tests {
         // `cmp_object` mixes value and datatype: equal value + differing
         // datatype must order. Use distinct datatype Sids on otherwise
         // identical flakes.
-        let dt_long = Sid::new(2, "long");
-        let dt_int = Sid::new(2, "integer");
+        let dt_long = Sid::new(NsCode(2), "long");
+        let dt_int = Sid::new(NsCode(2), "integer");
         let with_long = Flake::new(
-            Sid::new(101, "s101"),
-            Sid::new(200, "p200"),
+            Sid::new(NsCode(101), "s101"),
+            Sid::new(NsCode(200), "p200"),
             FlakeValue::Long(42),
             dt_long,
             1,
@@ -1512,8 +1518,8 @@ mod tests {
             None,
         );
         let with_int = Flake::new(
-            Sid::new(101, "s101"),
-            Sid::new(200, "p200"),
+            Sid::new(NsCode(101), "s101"),
+            Sid::new(NsCode(200), "p200"),
             FlakeValue::Long(42),
             dt_int,
             1,
@@ -1551,8 +1557,8 @@ mod tests {
 
     fn eq_reverse_graph() -> HashMap<Sid, GraphId> {
         let mut m = HashMap::new();
-        m.insert(Sid::new(8, "g1"), GraphId(1));
-        m.insert(Sid::new(8, "g2"), GraphId(2));
+        m.insert(Sid::new(NsCode(8), "g1"), GraphId(1));
+        m.insert(Sid::new(NsCode(8), "g2"), GraphId(2));
         m
     }
 
@@ -1572,17 +1578,17 @@ mod tests {
             None
         };
         let mut f = Flake::new(
-            Sid::new(1, format!("s{s}")),
-            Sid::new(1, format!("p{p}")),
+            Sid::new(NsCode(1), format!("s{s}")),
+            Sid::new(NsCode(1), format!("p{p}")),
             FlakeValue::Long(o),
-            Sid::new(2, "long"),
+            Sid::new(NsCode(2), "long"),
             t,
             op,
             m,
         );
         match gsel {
-            1 => f.g = Some(Sid::new(8, "g1")),
-            2 => f.g = Some(Sid::new(8, "g2")),
+            1 => f.g = Some(Sid::new(NsCode(8), "g1")),
+            2 => f.g = Some(Sid::new(NsCode(8), "g2")),
             _ => {}
         }
         f
@@ -1717,13 +1723,19 @@ mod tests {
         // Golden digests pin the observable contract; the segmented rewrite must
         // reproduce these exactly. Regenerate intentionally only when novelty
         // semantics change on purpose.
+        //
+        // Regenerated 2026-06 for the `NsCode(u16)` newtype migration: the digest
+        // folds `format!("{:?}", flake)`, and `Sid`'s derived `Debug` now renders
+        // its namespace code as `NsCode(N)` instead of a bare `N`. The flake data,
+        // ordering, and wire forms are unchanged (verified by the serde/codec
+        // round-trip suites) — only the Debug string representation differs.
         const EXPECTED: &[u64] = &[
-            17_085_636_203_747_601_083,
-            17_735_258_564_421_583_015,
-            10_042_115_320_558_787_806,
-            10_849_888_332_386_873_009,
-            17_714_828_874_643_605_845,
-            5_823_289_256_863_810_933,
+            158_026_713_868_370_439,
+            1_374_856_872_519_595_328,
+            11_292_018_877_754_234_555,
+            5_761_585_255_294_257_563,
+            7_932_421_962_912_334_894,
+            15_317_204_633_370_409_554,
         ];
         let mut got = Vec::new();
         for &s in &SEEDS {

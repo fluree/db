@@ -7,7 +7,7 @@
 //! - sh:lessThanOrEquals - values must be less than or equal to
 
 use crate::constraints::{Constraint, ConstraintViolation};
-use fluree_db_core::FlakeValue;
+use fluree_db_core::{FlakeValue, NsCode};
 use std::cmp::Ordering;
 
 /// Validate sh:equals constraint
@@ -38,7 +38,7 @@ pub fn validate_equals(
 
         return Some(ConstraintViolation {
             constraint: Constraint::Equals(fluree_db_core::Sid {
-                namespace_code: 0,
+                namespace_code: NsCode(0),
                 name: other_path.into(),
             }),
             value: None,
@@ -70,7 +70,7 @@ pub fn validate_disjoint(
     if !intersection.is_empty() {
         return Some(ConstraintViolation {
             constraint: Constraint::Disjoint(fluree_db_core::Sid {
-                namespace_code: 0,
+                namespace_code: NsCode(0),
                 name: other_path.into(),
             }),
             value: intersection.first().map(|v| (**v).clone()),
@@ -97,7 +97,7 @@ pub fn validate_less_than(
             if ord != Ordering::Less {
                 return Some(ConstraintViolation {
                     constraint: Constraint::LessThan(fluree_db_core::Sid {
-                        namespace_code: 0,
+                        namespace_code: NsCode(0),
                         name: other_path.into(),
                     }),
                     value: Some(value.clone()),
@@ -110,7 +110,7 @@ pub fn validate_less_than(
             // Incomparable types
             return Some(ConstraintViolation {
                 constraint: Constraint::LessThan(fluree_db_core::Sid {
-                    namespace_code: 0,
+                    namespace_code: NsCode(0),
                     name: other_path.into(),
                 }),
                 value: Some(value.clone()),
@@ -138,7 +138,7 @@ pub fn validate_less_than_or_equals(
             if ord == Ordering::Greater {
                 return Some(ConstraintViolation {
                     constraint: Constraint::LessThanOrEquals(fluree_db_core::Sid {
-                        namespace_code: 0,
+                        namespace_code: NsCode(0),
                         name: other_path.into(),
                     }),
                     value: Some(value.clone()),
@@ -151,7 +151,7 @@ pub fn validate_less_than_or_equals(
             // Incomparable types
             return Some(ConstraintViolation {
                 constraint: Constraint::LessThanOrEquals(fluree_db_core::Sid {
-                    namespace_code: 0,
+                    namespace_code: NsCode(0),
                     name: other_path.into(),
                 }),
                 value: Some(value.clone()),

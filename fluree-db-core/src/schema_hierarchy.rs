@@ -218,6 +218,7 @@ mod tests {
     use super::*;
     use crate::index_schema::{SchemaPredicateInfo, SchemaPredicates};
     use crate::sid::SidInterner;
+    use fluree_vocab::NsCode;
 
     /// A schema entry tuple: (namespace, name, subclass_of entries, parent_props entries)
     type SchemaEntry<'a> = (u16, &'a str, Vec<(u16, &'a str)>, Vec<(u16, &'a str)>);
@@ -227,14 +228,14 @@ mod tests {
         let vals: Vec<SchemaPredicateInfo> = entries
             .into_iter()
             .map(|(ns, name, subclass_of, parent_props)| {
-                let id = interner.intern(ns, name);
+                let id = interner.intern(NsCode::from_u16(ns), name);
                 let subclass_of: Vec<Sid> = subclass_of
                     .into_iter()
-                    .map(|(ns, name)| interner.intern(ns, name))
+                    .map(|(ns, name)| interner.intern(NsCode::from_u16(ns), name))
                     .collect();
                 let parent_props: Vec<Sid> = parent_props
                     .into_iter()
-                    .map(|(ns, name)| interner.intern(ns, name))
+                    .map(|(ns, name)| interner.intern(NsCode::from_u16(ns), name))
                     .collect();
                 SchemaPredicateInfo {
                     id,
@@ -268,7 +269,7 @@ mod tests {
         assert_eq!(hierarchy.epoch(), 0);
 
         let interner = SidInterner::new();
-        let animal = interner.intern(100, "Animal");
+        let animal = interner.intern(NsCode(100), "Animal");
         assert!(hierarchy.subclasses_of(&animal).is_empty());
     }
 
@@ -284,9 +285,9 @@ mod tests {
         let hierarchy = SchemaHierarchy::from_db_root_schema(&schema);
         let interner = SidInterner::new();
 
-        let animal = interner.intern(100, "Animal");
-        let dog = interner.intern(100, "Dog");
-        let cat = interner.intern(100, "Cat");
+        let animal = interner.intern(NsCode(100), "Animal");
+        let dog = interner.intern(NsCode(100), "Dog");
+        let cat = interner.intern(NsCode(100), "Cat");
 
         let subclasses = hierarchy.subclasses_of(&animal);
         assert_eq!(subclasses.len(), 2);
@@ -310,9 +311,9 @@ mod tests {
         let hierarchy = SchemaHierarchy::from_db_root_schema(&schema);
         let interner = SidInterner::new();
 
-        let animal = interner.intern(100, "Animal");
-        let dog = interner.intern(100, "Dog");
-        let poodle = interner.intern(100, "Poodle");
+        let animal = interner.intern(NsCode(100), "Animal");
+        let dog = interner.intern(NsCode(100), "Dog");
+        let poodle = interner.intern(NsCode(100), "Poodle");
 
         // Animal has Dog and Poodle as descendants
         let animal_subclasses = hierarchy.subclasses_of(&animal);
@@ -346,10 +347,10 @@ mod tests {
         let hierarchy = SchemaHierarchy::from_db_root_schema(&schema);
         let interner = SidInterner::new();
 
-        let a = interner.intern(100, "A");
-        let b = interner.intern(100, "B");
-        let c = interner.intern(100, "C");
-        let d = interner.intern(100, "D");
+        let a = interner.intern(NsCode(100), "A");
+        let b = interner.intern(NsCode(100), "B");
+        let c = interner.intern(NsCode(100), "C");
+        let d = interner.intern(NsCode(100), "D");
 
         // A has B, C, D as descendants
         let a_subclasses = hierarchy.subclasses_of(&a);
@@ -385,9 +386,9 @@ mod tests {
         let hierarchy = SchemaHierarchy::from_db_root_schema(&schema);
         let interner = SidInterner::new();
 
-        let a = interner.intern(100, "A");
-        let b = interner.intern(100, "B");
-        let c = interner.intern(100, "C");
+        let a = interner.intern(NsCode(100), "A");
+        let b = interner.intern(NsCode(100), "B");
+        let c = interner.intern(NsCode(100), "C");
 
         // In a cycle, all nodes are reachable from each other (including
         // eventually reaching back to start through the cycle).
@@ -427,9 +428,9 @@ mod tests {
         let hierarchy = SchemaHierarchy::from_db_root_schema(&schema);
         let interner = SidInterner::new();
 
-        let has_color = interner.intern(100, "hasColor");
-        let has_fur_color = interner.intern(100, "hasFurColor");
-        let has_skin_color = interner.intern(100, "hasSkinColor");
+        let has_color = interner.intern(NsCode(100), "hasColor");
+        let has_fur_color = interner.intern(NsCode(100), "hasFurColor");
+        let has_skin_color = interner.intern(NsCode(100), "hasSkinColor");
 
         let subprops = hierarchy.subproperties_of(&has_color);
         assert_eq!(subprops.len(), 2);
@@ -448,9 +449,9 @@ mod tests {
         let hierarchy = SchemaHierarchy::from_db_root_schema(&schema);
         let interner = SidInterner::new();
 
-        let a = interner.intern(100, "A");
-        let b = interner.intern(100, "B");
-        let c = interner.intern(100, "C");
+        let a = interner.intern(NsCode(100), "A");
+        let b = interner.intern(NsCode(100), "B");
+        let c = interner.intern(NsCode(100), "C");
 
         // Direct: A -> [B], B -> [C]
         let a_direct = hierarchy.direct_subclasses_of(&a);

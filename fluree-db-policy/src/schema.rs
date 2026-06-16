@@ -82,15 +82,16 @@ pub fn is_schema_flake(predicate: &Sid, object: &FlakeValue) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fluree_db_core::NsCode;
 
-    fn make_sid(ns: u16, name: &str) -> Sid {
+    fn make_sid(ns: NsCode, name: &str) -> Sid {
         Sid::new(ns, name)
     }
 
     #[test]
     fn test_is_schema_flake_subclass() {
         let rdfs_subclassof = make_sid(RDFS, "subClassOf");
-        let some_object = FlakeValue::Ref(make_sid(100, "SomeClass"));
+        let some_object = FlakeValue::Ref(make_sid(NsCode(100), "SomeClass"));
 
         assert!(is_schema_flake(&rdfs_subclassof, &some_object));
     }
@@ -114,7 +115,7 @@ mod tests {
     #[test]
     fn test_not_schema_flake_regular_type() {
         let rdf_type = make_sid(RDF, "type");
-        let person = FlakeValue::Ref(make_sid(100, "Person"));
+        let person = FlakeValue::Ref(make_sid(NsCode(100), "Person"));
 
         // Regular type assertion is NOT a schema flake
         assert!(!is_schema_flake(&rdf_type, &person));
@@ -122,7 +123,7 @@ mod tests {
 
     #[test]
     fn test_not_schema_flake_regular_property() {
-        let name_prop = make_sid(100, "name");
+        let name_prop = make_sid(NsCode(100), "name");
         let value = FlakeValue::String("Alice".to_string());
 
         // Regular property assertion is NOT a schema flake

@@ -14,7 +14,7 @@ fn subject_is_persisted(store: &BinaryIndexStore, sid: &Sid) -> io::Result<bool>
     // correctly, `find_subject_id_by_parts` will find it. No IRI-reconstruction
     // fallback is needed (no legacy data to accommodate).
     Ok(store
-        .find_subject_id_by_parts(sid.namespace_code, &sid.name)?
+        .find_subject_id_by_parts(sid.namespace_code.as_u16(), &sid.name)?
         .is_some())
 }
 
@@ -46,12 +46,12 @@ pub fn populate_dict_novelty_safe<'a>(
         if !persisted
             && dict_novelty
                 .subjects
-                .find_subject(s.namespace_code, &s.name)
+                .find_subject(s.namespace_code.as_u16(), &s.name)
                 .is_none()
         {
             dict_novelty
                 .subjects
-                .assign_or_lookup(s.namespace_code, &s.name);
+                .assign_or_lookup(s.namespace_code.as_u16(), &s.name);
         }
 
         // Object references
@@ -63,12 +63,12 @@ pub fn populate_dict_novelty_safe<'a>(
             if !persisted
                 && dict_novelty
                     .subjects
-                    .find_subject(sid.namespace_code, &sid.name)
+                    .find_subject(sid.namespace_code.as_u16(), &sid.name)
                     .is_none()
             {
                 dict_novelty
                     .subjects
-                    .assign_or_lookup(sid.namespace_code, &sid.name);
+                    .assign_or_lookup(sid.namespace_code.as_u16(), &sid.name);
             }
         }
 

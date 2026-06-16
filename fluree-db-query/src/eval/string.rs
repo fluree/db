@@ -589,13 +589,14 @@ mod tests {
     use crate::binding::Batch;
     use crate::var_registry::VarId;
     use fluree_db_core::value::FlakeValue;
+    use fluree_db_core::NsCode;
     use fluree_db_core::Sid;
 
     fn make_string_batch() -> Batch {
         let schema: Arc<[VarId]> = Arc::from(vec![VarId(0)].into_boxed_slice());
         let col = vec![Binding::lit(
             FlakeValue::String("Hello World".to_string()),
-            Sid::new(2, "string"),
+            Sid::new(NsCode(2), "string"),
         )];
         Batch::new(schema, vec![col]).unwrap()
     }

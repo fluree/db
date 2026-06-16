@@ -180,7 +180,7 @@ fn materialize_for_minmax(binding: &Binding, gv: Option<&BinaryGraphView>) -> Bi
                         .dt_sids()
                         .get(*dt_id as usize)
                         .cloned()
-                        .unwrap_or_else(|| Sid::new(0, ""));
+                        .unwrap_or_else(|| Sid::new(fluree_db_core::NsCode(0), ""));
                     let meta = store.decode_meta(*lang_id, *i_val);
                     let dtc = meta
                         .as_ref()
@@ -427,7 +427,7 @@ pub(crate) fn binding_to_group_key_owned(binding: &Binding) -> GroupKeyOwned {
             lang_id: *lang_id,
         },
         Binding::Sid { sid, .. } => {
-            GroupKeyOwned::MaterializedSid(sid.namespace_code, sid.name.clone())
+            GroupKeyOwned::MaterializedSid(sid.namespace_code.as_u16(), sid.name.clone())
         }
         Binding::Lit { val, dtc, .. } => {
             GroupKeyOwned::MaterializedLit(flake_value_to_key(val, dtc))
@@ -970,6 +970,7 @@ fn extract_numeric_with_gv(
 mod tests {
     use super::*;
     use fluree_db_core::LedgerSnapshot;
+    use fluree_db_core::NsCode;
 
     fn make_test_snapshot() -> LedgerSnapshot {
         LedgerSnapshot::genesis("test/main")
@@ -989,25 +990,25 @@ mod tests {
         let columns = vec![
             // ?venue
             vec![
-                Binding::sid(Sid::new(100, "venueA")),
-                Binding::sid(Sid::new(100, "venueA")),
-                Binding::sid(Sid::new(100, "venueA")),
-                Binding::sid(Sid::new(100, "venueA")),
-                Binding::sid(Sid::new(100, "venueA")),
-                Binding::sid(Sid::new(100, "venueB")),
-                Binding::sid(Sid::new(100, "venueB")),
-                Binding::sid(Sid::new(100, "venueB")),
+                Binding::sid(Sid::new(NsCode(100), "venueA")),
+                Binding::sid(Sid::new(NsCode(100), "venueA")),
+                Binding::sid(Sid::new(NsCode(100), "venueA")),
+                Binding::sid(Sid::new(NsCode(100), "venueA")),
+                Binding::sid(Sid::new(NsCode(100), "venueA")),
+                Binding::sid(Sid::new(NsCode(100), "venueB")),
+                Binding::sid(Sid::new(NsCode(100), "venueB")),
+                Binding::sid(Sid::new(NsCode(100), "venueB")),
             ],
             // ?paper
             vec![
-                Binding::sid(Sid::new(200, "paper1")),
-                Binding::sid(Sid::new(200, "paper2")),
-                Binding::sid(Sid::new(200, "paper3")),
-                Binding::sid(Sid::new(200, "paper4")),
-                Binding::sid(Sid::new(200, "paper5")),
-                Binding::sid(Sid::new(200, "paper6")),
-                Binding::sid(Sid::new(200, "paper7")),
-                Binding::sid(Sid::new(200, "paper8")),
+                Binding::sid(Sid::new(NsCode(200), "paper1")),
+                Binding::sid(Sid::new(NsCode(200), "paper2")),
+                Binding::sid(Sid::new(NsCode(200), "paper3")),
+                Binding::sid(Sid::new(NsCode(200), "paper4")),
+                Binding::sid(Sid::new(NsCode(200), "paper5")),
+                Binding::sid(Sid::new(NsCode(200), "paper6")),
+                Binding::sid(Sid::new(NsCode(200), "paper7")),
+                Binding::sid(Sid::new(NsCode(200), "paper8")),
             ],
         ];
         let batch = Batch::new(schema.clone(), columns).unwrap();
@@ -1106,11 +1107,11 @@ mod tests {
         let columns = vec![
             // ?category
             vec![
-                Binding::sid(Sid::new(100, "catA")),
-                Binding::sid(Sid::new(100, "catA")),
-                Binding::sid(Sid::new(100, "catA")),
-                Binding::sid(Sid::new(100, "catB")),
-                Binding::sid(Sid::new(100, "catB")),
+                Binding::sid(Sid::new(NsCode(100), "catA")),
+                Binding::sid(Sid::new(NsCode(100), "catA")),
+                Binding::sid(Sid::new(NsCode(100), "catA")),
+                Binding::sid(Sid::new(NsCode(100), "catB")),
+                Binding::sid(Sid::new(NsCode(100), "catB")),
             ],
             // ?value
             vec![

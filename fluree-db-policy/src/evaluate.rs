@@ -14,7 +14,7 @@ use crate::types::{
     TargetMode,
 };
 use crate::Result;
-use fluree_db_core::{FlakeValue, Sid, Tracker};
+use fluree_db_core::{FlakeValue, NsCode, Sid, Tracker};
 use std::collections::HashSet;
 use std::sync::{Arc, RwLock};
 use uuid::Uuid;
@@ -736,7 +736,7 @@ fn ensure_ground_identity(identity: Option<Sid>) -> Sid {
         // Using URN format ensures it's a valid IRI
         let random_iri = format!("{}{}", UNBOUND_IDENTITY_PREFIX, Uuid::new_v4());
         // Use namespace code 0 with the full URN as the local name
-        Sid::new(0, random_iri)
+        Sid::new(NsCode(0), random_iri)
     })
 }
 
@@ -776,7 +776,7 @@ mod tests {
     use crate::types::{PolicyAction, PolicySet, PropertyPolicyEntry, TargetMode};
     use fluree_vocab::namespaces::RDFS;
 
-    fn make_sid(ns: u16, name: &str) -> Sid {
+    fn make_sid(ns: NsCode, name: &str) -> Sid {
         Sid::new(ns, name)
     }
 
@@ -803,7 +803,7 @@ mod tests {
 
     #[test]
     fn test_ensure_ground_identity_with_identity() {
-        let identity = make_sid(100, "alice");
+        let identity = make_sid(NsCode(100), "alice");
         let result = ensure_ground_identity(Some(identity.clone()));
         assert_eq!(result, identity);
     }
@@ -812,14 +812,14 @@ mod tests {
     fn test_ensure_ground_identity_without_identity() {
         let result = ensure_ground_identity(None);
         // Should have namespace code 0 and random UUID-based name
-        assert_eq!(result.namespace_code, 0);
+        assert_eq!(result.namespace_code, NsCode(0));
         assert!(result.name.as_ref().starts_with(UNBOUND_IDENTITY_PREFIX));
     }
 
     #[test]
     fn test_filter_by_required_no_required() {
-        let r1 = make_allow_restriction("r1", make_sid(100, "name"));
-        let r2 = make_deny_restriction("r2", make_sid(100, "age"));
+        let r1 = make_allow_restriction("r1", make_sid(NsCode(100), "name"));
+        let r2 = make_deny_restriction("r2", make_sid(NsCode(100), "age"));
         let candidates = vec![&r1, &r2];
 
         let filtered = filter_by_required(candidates);
@@ -828,8 +828,8 @@ mod tests {
 
     #[test]
     fn test_filter_by_required_with_required() {
-        let r1 = make_allow_restriction("r1", make_sid(100, "name"));
-        let mut r2 = make_deny_restriction("r2", make_sid(100, "age"));
+        let r1 = make_allow_restriction("r1", make_sid(NsCode(100), "name"));
+        let mut r2 = make_deny_restriction("r2", make_sid(NsCode(100), "age"));
         r2.required = true;
 
         let candidates = vec![&r1, &r2];
@@ -841,8 +841,8 @@ mod tests {
 
     #[test]
     fn test_build_policy_values_clause() {
-        let subject = make_sid(100, "alice");
-        let identity = make_sid(100, "bob");
+        let subject = make_sid(NsCode(100), "alice");
+        let identity = make_sid(NsCode(100), "bob");
         let wrapper_values = std::collections::HashMap::new();
 
         let values = build_policy_values_clause(&subject, &identity, &wrapper_values);
@@ -853,9 +853,9 @@ mod tests {
 
     #[test]
     fn test_build_policy_values_clause_with_wrapper_values() {
-        let subject = make_sid(100, "alice");
-        let identity = make_sid(100, "bob");
-        let custom_var = make_sid(100, "custom_value");
+        let subject = make_sid(NsCode(100), "alice");
+        let identity = make_sid(NsCode(100), "bob");
+        let custom_var = make_sid(NsCode(100), "custom_value");
 
         let mut wrapper_values = std::collections::HashMap::new();
         wrapper_values.insert("?myVar".to_string(), custom_var.clone());
@@ -872,9 +872,9 @@ mod tests {
     #[test]
     fn test_build_policy_values_clause_override() {
         // Test that ?$this and ?$identity override any wrapper values with same names
-        let subject = make_sid(100, "alice");
-        let identity = make_sid(100, "bob");
-        let wrong_identity = make_sid(100, "wrong");
+        let subject = make_sid(NsCode(100), "alice");
+        let identity = make_sid(NsCode(100), "bob");
+        let wrong_identity = make_sid(NsCode(100), "wrong");
 
         let mut wrapper_values = std::collections::HashMap::new();
         wrapper_values.insert("?$identity".to_string(), wrong_identity);
@@ -892,8 +892,8 @@ mod tests {
 
         let result = ctx
             .allow_view_flake(
-                &make_sid(100, "alice"),
-                &make_sid(100, "ssn"),
+                &make_sid(NsCode(100), "alice"),
+                &make_sid(NsCode(100), "ssn"),
                 &FlakeValue::String("123-45-6789".to_string()),
                 &[],
             )
@@ -908,12 +908,12 @@ mod tests {
         // Tests "Deny Overrides" combining algorithm: if any policy denies, access is denied
         let mut set = PolicySet::new();
 
-        let deny = make_deny_restriction("deny", make_sid(100, "name"));
-        let allow = make_allow_restriction("allow", make_sid(100, "name"));
+        let deny = make_deny_restriction("deny", make_sid(NsCode(100), "name"));
+        let allow = make_allow_restriction("allow", make_sid(NsCode(100), "name"));
 
         set.restrictions.push(deny);
         set.by_property
-            .entry(make_sid(100, "name"))
+            .entry(make_sid(NsCode(100), "name"))
             .or_default()
             .push(PropertyPolicyEntry {
                 idx: 0,
@@ -922,7 +922,7 @@ mod tests {
 
         set.restrictions.push(allow);
         set.by_property
-            .entry(make_sid(100, "name"))
+            .entry(make_sid(NsCode(100), "name"))
             .or_default()
             .push(PropertyPolicyEntry {
                 idx: 1,
@@ -942,8 +942,8 @@ mod tests {
         // With "Deny Overrides" combining: Deny wins even if Allow also exists
         let result = ctx
             .allow_view_flake(
-                &make_sid(100, "alice"),
-                &make_sid(100, "name"),
+                &make_sid(NsCode(100), "alice"),
+                &make_sid(NsCode(100), "name"),
                 &FlakeValue::String("Alice".to_string()),
                 &[],
             )
@@ -969,8 +969,8 @@ mod tests {
 
         let result = ctx
             .allow_view_flake(
-                &make_sid(100, "alice"),
-                &make_sid(100, "name"),
+                &make_sid(NsCode(100), "alice"),
+                &make_sid(NsCode(100), "name"),
                 &FlakeValue::String("Alice".to_string()),
                 &[],
             )
@@ -983,7 +983,7 @@ mod tests {
     fn test_schema_flake_always_allowed() {
         // Create deny-all policy
         let mut set = PolicySet::new();
-        let mut deny_all = make_deny_restriction("deny-all", make_sid(4, "subClassOf"));
+        let mut deny_all = make_deny_restriction("deny-all", make_sid(NsCode(4), "subClassOf"));
         deny_all.target_mode = TargetMode::Default;
         deny_all.targets.clear();
         set.restrictions.push(deny_all);
@@ -1002,9 +1002,9 @@ mod tests {
         // rdfs:subClassOf should be allowed regardless of policy
         let result = ctx
             .allow_view_flake(
-                &make_sid(100, "Person"),
+                &make_sid(NsCode(100), "Person"),
                 &make_sid(RDFS, "subClassOf"),
-                &FlakeValue::Ref(make_sid(100, "Thing")),
+                &FlakeValue::Ref(make_sid(NsCode(100), "Thing")),
                 &[],
             )
             .unwrap();

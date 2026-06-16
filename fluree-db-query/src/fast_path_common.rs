@@ -2409,7 +2409,7 @@ pub fn subject_ref_to_s_id(
             .map_err(|e| QueryError::Internal(format!("find_subject_id: {e}")))?),
         Ref::Sid(sid) => {
             if let Some(s_id) = store
-                .find_subject_id_by_parts(sid.namespace_code, &sid.name)
+                .find_subject_id_by_parts(sid.namespace_code.as_u16(), &sid.name)
                 .map_err(|e| QueryError::Internal(format!("find_subject_id_by_parts: {e}")))?
             {
                 return Ok(Some(s_id));
@@ -2649,7 +2649,7 @@ pub fn term_to_ref_s_id(
     };
     let sid = store.encode_iri(iri.as_ref());
     store
-        .find_subject_id_by_parts(sid.namespace_code, &sid.name)
+        .find_subject_id_by_parts(sid.namespace_code.as_u16(), &sid.name)
         .map_err(|e| QueryError::execution(format!("find_subject_id_by_parts: {e}")))
 }
 

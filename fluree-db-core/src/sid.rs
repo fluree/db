@@ -23,6 +23,7 @@
 
 use fluree_vocab::namespaces::{self, EMPTY};
 use fluree_vocab::xsd_names;
+use fluree_vocab::NsCode;
 use hashbrown::HashMap;
 use parking_lot::RwLock;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -37,13 +38,13 @@ use std::sync::Arc;
 /// Serializes as `[namespace_code, name]` tuple in JSON.
 #[derive(Clone, Debug)]
 pub struct Sid {
-    pub namespace_code: u16,
+    pub namespace_code: NsCode,
     pub name: Arc<str>,
 }
 
 impl Sid {
     /// Create a new SID
-    pub fn new(namespace_code: u16, name: impl AsRef<str>) -> Self {
+    pub fn new(namespace_code: NsCode, name: impl AsRef<str>) -> Self {
         Self {
             namespace_code,
             name: Arc::from(name.as_ref()),
@@ -53,7 +54,7 @@ impl Sid {
     /// Create a new SID with a pre-interned name
     ///
     /// Use this when you already have an `Arc<str>` from an interner.
-    pub fn with_arc(namespace_code: u16, name: Arc<str>) -> Self {
+    pub fn with_arc(namespace_code: NsCode, name: Arc<str>) -> Self {
         Self {
             namespace_code,
             name,
@@ -66,7 +67,7 @@ impl Sid {
     /// any valid SID.
     pub fn min() -> Self {
         Self {
-            namespace_code: 0,
+            namespace_code: EMPTY,
             name: Arc::from(""),
         }
     }
@@ -77,7 +78,7 @@ impl Sid {
     /// The name is empty because we only need to exceed the namespace_code.
     pub fn max() -> Self {
         Self {
-            namespace_code: u16::MAX,
+            namespace_code: NsCode(u16::MAX),
             name: Arc::from(""),
         }
     }
@@ -89,7 +90,7 @@ impl Sid {
 
     /// Check if this is the maximum sentinel
     pub fn is_max(&self) -> bool {
-        self.namespace_code == u16::MAX
+        self.namespace_code == NsCode(u16::MAX)
     }
 
     /// Get the name as a string slice
@@ -140,7 +141,7 @@ impl Sid {
     pub fn canonical_hash(&self) -> u64 {
         use xxhash_rust::xxh64::Xxh64;
         let mut hasher = Xxh64::new(0);
-        hasher.update(&self.namespace_code.to_le_bytes());
+        hasher.update(&self.namespace_code.as_u16().to_le_bytes());
         hasher.update(self.name.as_bytes());
         hasher.digest()
     }
@@ -180,7 +181,7 @@ impl Hash for Sid {
 
 impl fmt::Display for Sid {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "[{}:{}]", self.namespace_code, self.name)
+        write!(f, "[{}:{}]", self.namespace_code.as_u16(), self.name)
     }
 }
 
@@ -193,7 +194,8 @@ impl Serialize for Sid {
     {
         use serde::ser::SerializeTuple;
         let mut tuple = serializer.serialize_tuple(2)?;
-        tuple.serialize_element(&self.namespace_code)?;
+        // Wire form is the raw `u16` code (unchanged by the NsCode newtype).
+        tuple.serialize_element(&self.namespace_code.as_u16())?;
         tuple.serialize_element(self.name.as_ref())?;
         tuple.end()
     }
@@ -204,10 +206,11 @@ impl<'de> Deserialize<'de> for Sid {
     where
         D: Deserializer<'de>,
     {
-        // Deserialize as (u16, String) tuple, then convert to Arc<str>
+        // Deserialize as (u16, String) tuple, then convert to Arc<str>.
+        // The wire form is the raw `u16` code; wrap it back into `NsCode`.
         let (namespace_code, name): (u16, String) = Deserialize::deserialize(deserializer)?;
         Ok(Sid {
-            namespace_code,
+            namespace_code: NsCode::from_u16(namespace_code),
             name: Arc::from(name),
         })
     }
@@ -224,10 +227,11 @@ impl<'de> Deserialize<'de> for Sid {
 ///
 /// ```
 /// use fluree_db_core::sid::{Sid, SidInterner};
+/// use fluree_vocab::NsCode;
 ///
 /// let interner = SidInterner::new();
-/// let sid1 = interner.intern(100, "Person");
-/// let sid2 = interner.intern(100, "Person");
+/// let sid1 = interner.intern(NsCode(100), "Person");
+/// let sid2 = interner.intern(NsCode(100), "Person");
 ///
 /// // Same Arc pointer - no extra allocation
 /// assert!(std::sync::Arc::ptr_eq(&sid1.name, &sid2.name));
@@ -236,7 +240,7 @@ impl<'de> Deserialize<'de> for Sid {
 pub struct SidInterner {
     /// Map from (namespace_code, name) to interned Arc<str>
     /// Uses Arc<str> as key to avoid allocation on cache hits via raw_entry API
-    names: RwLock<HashMap<(u16, Arc<str>), ()>>,
+    names: RwLock<HashMap<(NsCode, Arc<str>), ()>>,
 }
 
 impl Default for SidInterner {
@@ -261,7 +265,7 @@ impl SidInterner {
     }
 
     /// Compute hash using the map's hasher
-    fn hash_key(map: &HashMap<(u16, Arc<str>), ()>, namespace_code: u16, name: &str) -> u64 {
+    fn hash_key(map: &HashMap<(NsCode, Arc<str>), ()>, namespace_code: NsCode, name: &str) -> u64 {
         use std::hash::BuildHasher;
         let mut hasher = map.hasher().build_hasher();
         namespace_code.hash(&mut hasher);
@@ -276,7 +280,7 @@ impl SidInterner {
     /// Arc<str> and caches it.
     ///
     /// Uses raw_entry API to avoid allocating on cache hits.
-    pub fn intern(&self, namespace_code: u16, name: &str) -> Sid {
+    pub fn intern(&self, namespace_code: NsCode, name: &str) -> Sid {
         let mut names = self.names.write();
         let hash = Self::hash_key(&names, namespace_code, name);
 
@@ -363,9 +367,9 @@ mod tests {
 
     #[test]
     fn test_sid_ordering() {
-        let a = Sid::new(1, "foo");
-        let b = Sid::new(1, "bar");
-        let c = Sid::new(2, "foo");
+        let a = Sid::new(NsCode(1), "foo");
+        let b = Sid::new(NsCode(1), "bar");
+        let c = Sid::new(NsCode(2), "foo");
 
         // Same namespace: compare by name
         assert!(b < a); // "bar" < "foo"
@@ -378,7 +382,7 @@ mod tests {
     fn test_sid_min_max() {
         let min = Sid::min();
         let max = Sid::max();
-        let regular = Sid::new(100, "test");
+        let regular = Sid::new(NsCode(100), "test");
 
         assert!(min < regular);
         assert!(regular < max);
@@ -387,8 +391,9 @@ mod tests {
 
     #[test]
     fn test_sid_serde_roundtrip() {
-        let sid = Sid::new(42, "example");
+        let sid = Sid::new(NsCode(42), "example");
         let json = serde_json::to_string(&sid).unwrap();
+        // Wire form is the raw `u16` code, unchanged by the NsCode newtype.
         assert_eq!(json, "[42,\"example\"]");
 
         let parsed: Sid = serde_json::from_str(&json).unwrap();
@@ -397,9 +402,9 @@ mod tests {
 
     #[test]
     fn test_sid_equality() {
-        let a = Sid::new(1, "test");
-        let b = Sid::new(1, "test");
-        let c = Sid::new(1, "other");
+        let a = Sid::new(NsCode(1), "test");
+        let b = Sid::new(NsCode(1), "test");
+        let c = Sid::new(NsCode(1), "other");
 
         assert_eq!(a, b);
         assert_ne!(a, c);
@@ -407,7 +412,10 @@ mod tests {
 
     #[test]
     fn test_sid_clone_is_cheap() {
-        let sid = Sid::new(100, "this_is_a_longer_name_to_demonstrate_arc_sharing");
+        let sid = Sid::new(
+            NsCode(100),
+            "this_is_a_longer_name_to_demonstrate_arc_sharing",
+        );
         let cloned = sid.clone();
 
         // Both point to the same Arc<str>
@@ -420,10 +428,10 @@ mod tests {
     fn test_interner_deduplicates() {
         let interner = SidInterner::new();
 
-        let sid1 = interner.intern(100, "Person");
-        let sid2 = interner.intern(100, "Person");
-        let sid3 = interner.intern(100, "Company"); // Different name
-        let sid4 = interner.intern(200, "Person"); // Different namespace
+        let sid1 = interner.intern(NsCode(100), "Person");
+        let sid2 = interner.intern(NsCode(100), "Person");
+        let sid3 = interner.intern(NsCode(100), "Company"); // Different name
+        let sid4 = interner.intern(NsCode(200), "Person"); // Different namespace
 
         // Same (namespace, name) should share Arc
         assert!(Arc::ptr_eq(&sid1.name, &sid2.name));
@@ -446,10 +454,10 @@ mod tests {
         let interner = SidInterner::new();
 
         // First, intern via string
-        let sid1 = interner.intern(100, "Test");
+        let sid1 = interner.intern(NsCode(100), "Test");
 
         // Now intern an existing SID
-        let external_sid = Sid::new(100, "Test");
+        let external_sid = Sid::new(NsCode(100), "Test");
         let sid2 = interner.intern_sid(&external_sid);
 
         // Should share the same Arc from sid1
@@ -466,15 +474,15 @@ mod tests {
         assert_eq!(interner.len(), 0);
         assert!(interner.is_empty());
 
-        interner.intern(1, "a");
-        interner.intern(1, "b");
-        interner.intern(2, "a");
+        interner.intern(NsCode(1), "a");
+        interner.intern(NsCode(1), "b");
+        interner.intern(NsCode(2), "a");
 
         assert_eq!(interner.len(), 3);
         assert!(!interner.is_empty());
 
         // Duplicate doesn't increase count
-        interner.intern(1, "a");
+        interner.intern(NsCode(1), "a");
         assert_eq!(interner.len(), 3);
 
         interner.clear();
@@ -489,24 +497,24 @@ mod tests {
         #[test]
         fn test_sid_canonical_hash_deterministic() {
             // Same SID should always produce same hash
-            let sid1 = Sid::new(100, "Person");
-            let sid2 = Sid::new(100, "Person");
+            let sid1 = Sid::new(NsCode(100), "Person");
+            let sid2 = Sid::new(NsCode(100), "Person");
             assert_eq!(sid1.canonical_hash(), sid2.canonical_hash());
         }
 
         #[test]
         fn test_sid_canonical_hash_different_namespace() {
             // Same name, different namespace should produce different hash
-            let sid1 = Sid::new(100, "Person");
-            let sid2 = Sid::new(200, "Person");
+            let sid1 = Sid::new(NsCode(100), "Person");
+            let sid2 = Sid::new(NsCode(200), "Person");
             assert_ne!(sid1.canonical_hash(), sid2.canonical_hash());
         }
 
         #[test]
         fn test_sid_canonical_hash_different_name() {
             // Same namespace, different name should produce different hash
-            let sid1 = Sid::new(100, "Person");
-            let sid2 = Sid::new(100, "Company");
+            let sid1 = Sid::new(NsCode(100), "Person");
+            let sid2 = Sid::new(NsCode(100), "Company");
             assert_ne!(sid1.canonical_hash(), sid2.canonical_hash());
         }
 
@@ -514,13 +522,13 @@ mod tests {
         fn test_sid_canonical_hash_uniqueness() {
             // Various SIDs should produce unique hashes
             let sids = [
-                Sid::new(0, ""),
-                Sid::new(0, "a"),
-                Sid::new(1, ""),
-                Sid::new(1, "a"),
-                Sid::new(100, "Person"),
-                Sid::new(100, "Company"),
-                Sid::new(200, "Person"),
+                Sid::new(NsCode(0), ""),
+                Sid::new(NsCode(0), "a"),
+                Sid::new(NsCode(1), ""),
+                Sid::new(NsCode(1), "a"),
+                Sid::new(NsCode(100), "Person"),
+                Sid::new(NsCode(100), "Company"),
+                Sid::new(NsCode(200), "Person"),
             ];
 
             let hashes: Vec<u64> = sids.iter().map(super::super::Sid::canonical_hash).collect();

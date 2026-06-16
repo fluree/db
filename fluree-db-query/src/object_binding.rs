@@ -80,7 +80,7 @@ pub(crate) fn late_materialized_object_binding(
             op,
         }),
         DecodeKind::BlankNode => Some(Binding::Sid {
-            sid: Sid::new(0, format!("_:b{o_key}")),
+            sid: Sid::new(fluree_db_core::NsCode(0), format!("_:b{o_key}")),
             t: Some(t),
             op,
         }),
@@ -163,7 +163,7 @@ pub(crate) fn materialized_object_binding(
                 None => DatatypeConstraint::Explicit(
                     store
                         .resolve_datatype_sid(o_type)
-                        .unwrap_or_else(|| Sid::new(0, "")),
+                        .unwrap_or_else(|| Sid::new(fluree_db_core::NsCode(0), "")),
                 ),
             };
             Binding::Lit {

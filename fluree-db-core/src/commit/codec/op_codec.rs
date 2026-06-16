@@ -19,6 +19,7 @@ use super::format::{OTag, OP_FLAG_ASSERT, OP_FLAG_HAS_I, OP_FLAG_HAS_LANG};
 use super::string_dict::{StringDict, StringDictBuilder};
 use super::varint::{decode_varint, encode_varint, read_exact, read_u8, zigzag_encode};
 use crate::{Flake, FlakeMeta, FlakeValue, Sid};
+use fluree_vocab::NsCode;
 
 // =============================================================================
 // CommitDicts — dictionary set for writing
@@ -79,7 +80,7 @@ pub fn encode_op(
 ) -> Result<(), CommitCodecError> {
     // Graph: None = default graph (0, 0), Some(Sid) = named graph
     if let Some(ref g) = flake.g {
-        encode_varint(g.namespace_code as u64, buf);
+        encode_varint(g.namespace_code.as_u16() as u64, buf);
         let g_name_id = dicts.graph.insert(g.name.as_ref());
         encode_varint(g_name_id as u64, buf);
     } else {
@@ -88,17 +89,17 @@ pub fn encode_op(
     }
 
     // Subject
-    encode_varint(flake.s.namespace_code as u64, buf);
+    encode_varint(flake.s.namespace_code.as_u16() as u64, buf);
     let s_name_id = dicts.subject.insert(flake.s.name.as_ref());
     encode_varint(s_name_id as u64, buf);
 
     // Predicate
-    encode_varint(flake.p.namespace_code as u64, buf);
+    encode_varint(flake.p.namespace_code.as_u16() as u64, buf);
     let p_name_id = dicts.predicate.insert(flake.p.name.as_ref());
     encode_varint(p_name_id as u64, buf);
 
     // Datatype
-    encode_varint(flake.dt.namespace_code as u64, buf);
+    encode_varint(flake.dt.namespace_code.as_u16() as u64, buf);
     let dt_name_id = dicts.datatype.insert(flake.dt.name.as_ref());
     encode_varint(dt_name_id as u64, buf);
 
@@ -146,7 +147,7 @@ fn encode_object(
     match value {
         FlakeValue::Ref(sid) => {
             buf.push(OTag::Ref as u8);
-            encode_varint(sid.namespace_code as u64, buf);
+            encode_varint(sid.namespace_code.as_u16() as u64, buf);
             let name_id = dicts.object_ref.insert(sid.name.as_ref());
             encode_varint(name_id as u64, buf);
         }
@@ -306,9 +307,10 @@ fn decode_len_prefixed_str(data: &[u8], pos: &mut usize) -> Result<String, Commi
 
 /// Decode a varint as a u16 namespace code, returning an error if the value
 /// exceeds `u16::MAX`.
-fn decode_ns_code(data: &[u8], pos: &mut usize) -> Result<u16, CommitCodecError> {
+fn decode_ns_code(data: &[u8], pos: &mut usize) -> Result<NsCode, CommitCodecError> {
     let raw = decode_varint(data, pos)?;
     u16::try_from(raw)
+        .map(NsCode::from_u16)
         .map_err(|_| CommitCodecError::InvalidOp(format!("namespace code {raw} exceeds u16::MAX")))
 }
 
@@ -325,7 +327,7 @@ pub fn decode_op(
     // Graph: (0, 0) = default graph; otherwise named graph Sid encoded as (ns_code, name_id)
     let g_ns_code = decode_ns_code(data, pos)?;
     let g_name_id = decode_varint(data, pos)? as u32;
-    let g = if g_ns_code == 0 && g_name_id == 0 {
+    let g = if g_ns_code == NsCode(0) && g_name_id == 0 {
         None
     } else {
         if g_name_id == 0 {
@@ -430,10 +432,10 @@ mod tests {
         t: i64,
     ) -> Flake {
         Flake::new(
-            Sid::new(s_code, s_name),
-            Sid::new(p_code, p_name),
+            Sid::new(NsCode::from_u16(s_code), s_name),
+            Sid::new(NsCode::from_u16(p_code), p_name),
             FlakeValue::Long(val),
-            Sid::new(2, "integer"),
+            Sid::new(NsCode(2), "integer"),
             t,
             true,
             None,
@@ -462,11 +464,11 @@ mod tests {
         let decoded = decode_op(&buf, &mut pos, &read_dicts, 1).unwrap();
         assert_eq!(pos, buf.len());
 
-        assert_eq!(decoded.s.namespace_code, 101);
+        assert_eq!(decoded.s.namespace_code, NsCode(101));
         assert_eq!(decoded.s.name.as_ref(), "Alice");
-        assert_eq!(decoded.p.namespace_code, 101);
+        assert_eq!(decoded.p.namespace_code, NsCode(101));
         assert_eq!(decoded.p.name.as_ref(), "age");
-        assert_eq!(decoded.dt.namespace_code, 2);
+        assert_eq!(decoded.dt.namespace_code, NsCode(2));
         assert_eq!(decoded.dt.name.as_ref(), "integer");
         assert!(decoded.op); // assert
         assert!(decoded.m.is_none());
@@ -476,10 +478,10 @@ mod tests {
     #[test]
     fn test_round_trip_with_lang() {
         let flake = Flake::new(
-            Sid::new(101, "Alice"),
-            Sid::new(101, "name"),
+            Sid::new(NsCode(101), "Alice"),
+            Sid::new(NsCode(101), "name"),
             FlakeValue::String("Alice".to_string()),
-            Sid::new(3, "langString"),
+            Sid::new(NsCode(3), "langString"),
             1,
             true,
             Some(FlakeMeta::with_lang("en")),
@@ -503,10 +505,10 @@ mod tests {
     #[test]
     fn test_round_trip_with_list_index() {
         let flake = Flake::new(
-            Sid::new(101, "Alice"),
-            Sid::new(101, "scores"),
+            Sid::new(NsCode(101), "Alice"),
+            Sid::new(NsCode(101), "scores"),
             FlakeValue::Long(42),
-            Sid::new(2, "integer"),
+            Sid::new(NsCode(2), "integer"),
             1,
             true,
             Some(FlakeMeta::with_index(3)),
@@ -528,10 +530,10 @@ mod tests {
     #[test]
     fn test_round_trip_retract() {
         let flake = Flake::new(
-            Sid::new(101, "Alice"),
-            Sid::new(101, "age"),
+            Sid::new(NsCode(101), "Alice"),
+            Sid::new(NsCode(101), "age"),
             FlakeValue::Long(30),
-            Sid::new(2, "integer"),
+            Sid::new(NsCode(2), "integer"),
             1,
             false, // retract
             None,
@@ -550,10 +552,10 @@ mod tests {
     #[test]
     fn test_round_trip_ref() {
         let flake = Flake::new(
-            Sid::new(101, "Alice"),
-            Sid::new(101, "knows"),
-            FlakeValue::Ref(Sid::new(101, "Bob")),
-            Sid::new(1, "id"),
+            Sid::new(NsCode(101), "Alice"),
+            Sid::new(NsCode(101), "knows"),
+            FlakeValue::Ref(Sid::new(NsCode(101), "Bob")),
+            Sid::new(NsCode(1), "id"),
             1,
             true,
             None,
@@ -570,7 +572,7 @@ mod tests {
         // Ref objects are decoded directly as FlakeValue::Ref(Sid)
         match &decoded.o {
             FlakeValue::Ref(sid) => {
-                assert_eq!(sid.namespace_code, 101);
+                assert_eq!(sid.namespace_code, NsCode(101));
                 assert_eq!(sid.name.as_ref(), "Bob");
             }
             other => panic!("expected Ref, got {other:?}"),
@@ -580,10 +582,10 @@ mod tests {
     #[test]
     fn test_round_trip_double() {
         let flake = Flake::new(
-            Sid::new(101, "x"),
-            Sid::new(101, "val"),
+            Sid::new(NsCode(101), "x"),
+            Sid::new(NsCode(101), "val"),
             FlakeValue::Double(3.13159),
-            Sid::new(2, "double"),
+            Sid::new(NsCode(2), "double"),
             1,
             true,
             None,
@@ -606,10 +608,10 @@ mod tests {
     fn test_round_trip_boolean() {
         for val in [true, false] {
             let flake = Flake::new(
-                Sid::new(101, "x"),
-                Sid::new(101, "active"),
+                Sid::new(NsCode(101), "x"),
+                Sid::new(NsCode(101), "active"),
                 FlakeValue::Boolean(val),
-                Sid::new(2, "boolean"),
+                Sid::new(NsCode(2), "boolean"),
                 1,
                 true,
                 None,
@@ -654,10 +656,10 @@ mod tests {
     #[test]
     fn test_round_trip_vector() {
         let flake = Flake::new(
-            Sid::new(101, "x"),
-            Sid::new(101, "embedding"),
+            Sid::new(NsCode(101), "x"),
+            Sid::new(NsCode(101), "embedding"),
             FlakeValue::Vector(vec![1.0, 2.5, -3.7]),
-            Sid::new(2, "vector"),
+            Sid::new(NsCode(2), "vector"),
             1,
             true,
             None,
@@ -685,10 +687,10 @@ mod tests {
     #[test]
     fn test_round_trip_empty_vector() {
         let flake = Flake::new(
-            Sid::new(101, "x"),
-            Sid::new(101, "embedding"),
+            Sid::new(NsCode(101), "x"),
+            Sid::new(NsCode(101), "embedding"),
             FlakeValue::Vector(vec![]),
-            Sid::new(2, "vector"),
+            Sid::new(NsCode(2), "vector"),
             1,
             true,
             None,

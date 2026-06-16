@@ -306,6 +306,7 @@ mod tests {
     use super::*;
     use crate::binding::Batch;
     use crate::var_registry::VarId;
+    use fluree_db_core::NsCode;
     use fluree_db_core::{FlakeValue, Sid};
 
     fn make_test_batch() -> Batch {
@@ -313,25 +314,28 @@ mod tests {
             Arc::from(vec![VarId(0), VarId(1)].into_boxed_slice());
 
         let age_col = vec![
-            Binding::lit(FlakeValue::Long(25), Sid::new(2, "long")),
-            Binding::lit(FlakeValue::Long(30), Sid::new(2, "long")),
-            Binding::lit(FlakeValue::Long(18), Sid::new(2, "long")),
+            Binding::lit(FlakeValue::Long(25), Sid::new(NsCode(2), "long")),
+            Binding::lit(FlakeValue::Long(30), Sid::new(NsCode(2), "long")),
+            Binding::lit(FlakeValue::Long(18), Sid::new(NsCode(2), "long")),
             Binding::Unbound,
         ];
 
         let name_col = vec![
             Binding::lit(
                 FlakeValue::String("Alice".to_string()),
-                Sid::new(2, "string"),
+                Sid::new(NsCode(2), "string"),
             ),
-            Binding::lit(FlakeValue::String("Bob".to_string()), Sid::new(2, "string")),
+            Binding::lit(
+                FlakeValue::String("Bob".to_string()),
+                Sid::new(NsCode(2), "string"),
+            ),
             Binding::lit(
                 FlakeValue::String("Carol".to_string()),
-                Sid::new(2, "string"),
+                Sid::new(NsCode(2), "string"),
             ),
             Binding::lit(
                 FlakeValue::String("Dave".to_string()),
-                Sid::new(2, "string"),
+                Sid::new(NsCode(2), "string"),
             ),
         ];
 

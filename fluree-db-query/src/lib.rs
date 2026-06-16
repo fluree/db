@@ -368,6 +368,7 @@ pub async fn execute_where<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fluree_db_core::NsCode;
 
     #[test]
     fn test_public_api() {
@@ -378,7 +379,7 @@ mod tests {
 
         let _pattern = TriplePattern::new(
             Ref::Var(s),
-            Ref::Sid(fluree_db_core::Sid::new(100, "name")),
+            Ref::Sid(fluree_db_core::Sid::new(NsCode(100), "name")),
             Term::Var(o),
         );
     }

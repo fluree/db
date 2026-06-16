@@ -160,14 +160,14 @@ impl IndexStatsHook for NoOpStatsHook {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fluree_db_core::{FlakeValue, Sid};
+    use fluree_db_core::{FlakeValue, NsCode, Sid};
 
     fn make_test_flake(t: i64) -> Flake {
         Flake::new(
-            Sid::new(1, "s"),
-            Sid::new(2, "p"),
+            Sid::new(NsCode(1), "s"),
+            Sid::new(NsCode(2), "p"),
             FlakeValue::Long(42),
-            Sid::new(3, "long"),
+            Sid::new(NsCode(3), "long"),
             t,
             true,
             None,

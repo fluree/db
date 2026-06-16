@@ -22,6 +22,7 @@ use crate::sid::{Sid, SidInterner};
 use crate::temporal::{Date, DateTime, Time};
 use crate::value::FlakeValue;
 use bigdecimal::BigDecimal;
+use fluree_vocab::NsCode;
 use num_bigint::BigInt;
 use serde::{Deserialize, Serialize};
 
@@ -69,7 +70,7 @@ pub struct TransportSid {
 impl From<&Sid> for TransportSid {
     fn from(sid: &Sid) -> Self {
         TransportSid {
-            ns: sid.namespace_code,
+            ns: sid.namespace_code.as_u16(),
             name: sid.name.to_string(),
         }
     }
@@ -78,7 +79,7 @@ impl From<&Sid> for TransportSid {
 impl TransportSid {
     /// Reconstruct a Sid using the given interner
     pub fn to_sid(&self, interner: &SidInterner) -> Sid {
-        interner.intern(self.ns, &self.name)
+        interner.intern(NsCode::from_u16(self.ns), &self.name)
     }
 }
 
@@ -337,7 +338,7 @@ mod tests {
     use super::*;
 
     fn make_sid(ns: u16, name: &str) -> Sid {
-        Sid::new(ns, name)
+        Sid::new(NsCode::from_u16(ns), name)
     }
 
     fn make_flake(s: Sid, p: Sid, o: FlakeValue, dt: Sid, t: i64, op: bool) -> Flake {
@@ -502,7 +503,7 @@ mod tests {
         let decoded = decode_flakes_interned(&encoded, &interner).unwrap();
 
         assert_eq!(decoded.len(), 1);
-        assert_eq!(decoded[0].s.namespace_code, 1);
+        assert_eq!(decoded[0].s.namespace_code, NsCode(1));
         assert_eq!(decoded[0].s.name.as_ref(), "subject");
         assert_eq!(decoded[0].t, 100);
     }
@@ -528,7 +529,7 @@ mod tests {
         });
         let fv = tv.to_flake_value(&interner).unwrap();
         if let FlakeValue::Ref(sid) = fv {
-            assert_eq!(sid.namespace_code, 100);
+            assert_eq!(sid.namespace_code, NsCode(100));
             assert_eq!(sid.name.as_ref(), "test");
         } else {
             panic!("Expected Ref");

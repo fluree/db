@@ -333,15 +333,15 @@ impl OverlayProvider for StagedLedger {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fluree_db_core::{FlakeValue, Sid};
+    use fluree_db_core::{FlakeValue, NsCode, Sid};
     use fluree_db_novelty::Novelty;
 
     fn make_flake(s: u16, p: u16, o: i64, t: i64) -> Flake {
         Flake::new(
-            Sid::new(s, format!("s{s}")),
-            Sid::new(p, format!("p{p}")),
+            Sid::new(NsCode(s), format!("s{s}")),
+            Sid::new(NsCode(p), format!("p{p}")),
             FlakeValue::Long(o),
-            Sid::new(2, "long"),
+            Sid::new(NsCode(2), "long"),
             t,
             true,
             None,
@@ -368,7 +368,7 @@ mod tests {
         let spot_subjects: Vec<u16> = staged
             .spot
             .iter()
-            .map(|&id| staged.store.get(id).s.namespace_code)
+            .map(|&id| staged.store.get(id).s.namespace_code.as_u16())
             .collect();
         assert_eq!(spot_subjects, vec![1, 2, 3]);
     }
@@ -410,7 +410,7 @@ mod tests {
         );
 
         // Should be merged in sorted order
-        assert_eq!(collected, vec![1, 2, 3, 4]);
+        assert_eq!(collected, vec![NsCode(1), NsCode(2), NsCode(3), NsCode(4)]);
     }
 
     #[test]
@@ -454,13 +454,13 @@ mod tests {
     fn test_staged_overlay_unknown_graph_sid_errors() {
         use fluree_db_core::Flake;
 
-        let graph_sid = Sid::new(99, "unknown:graph");
+        let graph_sid = Sid::new(NsCode(99), "unknown:graph");
         let flakes = vec![Flake::new_in_graph(
             graph_sid,
-            Sid::new(1, "s1"),
-            Sid::new(2, "p1"),
+            Sid::new(NsCode(1), "s1"),
+            Sid::new(NsCode(2), "p1"),
             FlakeValue::Long(100),
-            Sid::new(3, "long"),
+            Sid::new(NsCode(3), "long"),
             1,
             true,
             None,

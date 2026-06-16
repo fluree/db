@@ -32,7 +32,11 @@ use fluree_vocab::{db, fluree};
 /// fluree-db-transact rejects them at parse time. This list is duplicated
 /// (not imported) to avoid adding a transact → indexer layering inversion;
 /// the two sites are asserted in sync by the debug_assert in emit paths.
-const RESERVED_PREDICATE_NAMESPACES: &[u16] = &[FLUREE_DB, FLUREE_COMMIT, FLUREE_URN];
+const RESERVED_PREDICATE_NAMESPACES: &[u16] = &[
+    FLUREE_DB.as_u16(),
+    FLUREE_COMMIT.as_u16(),
+    FLUREE_URN.as_u16(),
+];
 use num_bigint::BigInt;
 use rustc_hash::FxHashMap;
 use std::collections::HashMap;
@@ -171,7 +175,7 @@ impl CommitResolver {
                 // not `fluree_db_core::ValueTypeTag`. For stats we want stable datatypes,
                 // so derive ValueTypeTag from the commit's declared datatype IRI.
                 let dt = fluree_db_core::value_id::ValueTypeTag::from_ns_name(
-                    raw_op.dt_ns_code,
+                    fluree_db_core::NsCode::from_u16(raw_op.dt_ns_code),
                     raw_op.dt_name,
                 );
                 hook.on_record(&crate::stats::StatsRecord {
@@ -307,9 +311,10 @@ impl CommitResolver {
 
         // 3. Resolve commit subject: "fluree:commit:sha256:<hex>"
         let commit_iri = format!("{}{}", fluree::COMMIT, hex);
-        let commit_s_id = dicts
-            .subjects
-            .get_or_insert(&commit_iri, fluree_vocab::namespaces::FLUREE_COMMIT)?;
+        let commit_s_id = dicts.subjects.get_or_insert(
+            &commit_iri,
+            fluree_vocab::namespaces::FLUREE_COMMIT.as_u16(),
+        )?;
 
         // 4. Resolve predicate p_ids
         let p_address = dicts
@@ -421,9 +426,10 @@ impl CommitResolver {
         for parent in &envelope.parents {
             // Use CID digest hex as the subject name in FLUREE_COMMIT namespace
             let prev_digest = parent.digest_hex();
-            let prev_s_id = dicts
-                .subjects
-                .get_or_insert(&prev_digest, fluree_vocab::namespaces::FLUREE_COMMIT)?;
+            let prev_s_id = dicts.subjects.get_or_insert(
+                &prev_digest,
+                fluree_vocab::namespaces::FLUREE_COMMIT.as_u16(),
+            )?;
             push(
                 commit_s_id,
                 p_previous,
@@ -1307,7 +1313,10 @@ impl SharedResolverState {
         let dt_id = self.datatypes.get_or_insert_parts(prefix, name);
         // Grow dt_tags if this is a new entry.
         if dt_id as usize >= self.dt_tags.len() {
-            let tag = fluree_db_core::value_id::ValueTypeTag::from_ns_name(ns_code, name);
+            let tag = fluree_db_core::value_id::ValueTypeTag::from_ns_name(
+                fluree_db_core::NsCode::from_u16(ns_code),
+                name,
+            );
             self.dt_tags.resize(dt_id as usize + 1, tag);
         }
         dt_id
@@ -1406,17 +1415,24 @@ impl SharedResolverState {
             // Schema extraction (rebuild only): capture class/property hierarchy
             // directly from commit ops before dict remap.
             if let Some(ref mut schema) = self.schema_hook {
-                if raw_op.p_ns_code == fluree_vocab::namespaces::RDFS
+                if raw_op.p_ns_code == fluree_vocab::namespaces::RDFS.as_u16()
                     && (raw_op.p_name == "subClassOf" || raw_op.p_name == "subPropertyOf")
                 {
                     if let RawObject::Ref { ns_code, name } = raw_op.o {
                         let flake = fluree_db_core::Flake::new(
-                            fluree_db_core::Sid::new(raw_op.s_ns_code, raw_op.s_name),
-                            fluree_db_core::Sid::new(raw_op.p_ns_code, raw_op.p_name),
+                            fluree_db_core::Sid::new(
+                                fluree_db_core::NsCode::from_u16(raw_op.s_ns_code),
+                                raw_op.s_name,
+                            ),
+                            fluree_db_core::Sid::new(
+                                fluree_db_core::NsCode::from_u16(raw_op.p_ns_code),
+                                raw_op.p_name,
+                            ),
                             fluree_db_core::FlakeValue::Ref(fluree_db_core::Sid::new(
-                                ns_code, name,
+                                fluree_db_core::NsCode::from_u16(ns_code),
+                                name,
                             )),
-                            fluree_db_core::Sid::new(0, ""),
+                            fluree_db_core::Sid::new(fluree_db_core::NsCode(0), ""),
                             t as i64,
                             raw_op.op,
                             None,
@@ -1835,7 +1851,7 @@ impl SharedResolverState {
         let commit_ns_code = fluree_vocab::namespaces::FLUREE_COMMIT;
         let commit_s_id = chunk
             .subjects
-            .get_or_insert(commit_ns_code, commit_hash_hex.as_bytes());
+            .get_or_insert(commit_ns_code.as_u16(), commit_hash_hex.as_bytes());
 
         // Resolve predicate p_ids (global)
         let p_address = self.predicates.get_or_insert_parts(fluree::DB, db::ADDRESS);
@@ -1933,7 +1949,7 @@ impl SharedResolverState {
         for parent in &envelope.parents {
             let prev_digest = parent.digest_hex();
             let prev_s_id = chunk.subjects.get_or_insert(
-                fluree_vocab::namespaces::FLUREE_COMMIT,
+                fluree_vocab::namespaces::FLUREE_COMMIT.as_u16(),
                 prev_digest.as_bytes(),
             );
             push(
@@ -2219,7 +2235,10 @@ fn split_iri_to_value_type_tag(
         }
     }
     match best_code {
-        Some(code) => fluree_db_core::value_id::ValueTypeTag::from_ns_name(code, &iri[best_len..]),
+        Some(code) => fluree_db_core::value_id::ValueTypeTag::from_ns_name(
+            fluree_db_core::NsCode::from_u16(code),
+            &iri[best_len..],
+        ),
         None => fluree_db_core::value_id::ValueTypeTag::UNKNOWN,
     }
 }
@@ -2239,7 +2258,7 @@ mod tests {
     };
     use fluree_db_core::commit::codec::load_commit_ops;
     use fluree_db_core::commit::codec::op_codec::{encode_op, CommitDicts};
-    use fluree_db_core::{Flake, FlakeMeta, FlakeValue, Sid};
+    use fluree_db_core::{Flake, FlakeMeta, FlakeValue, NsCode, Sid};
 
     /// In-memory V1 record collector for tests.
     ///
@@ -2351,28 +2370,28 @@ mod tests {
     fn test_resolve_basic_ops() {
         let flakes = vec![
             Flake::new(
-                Sid::new(101, "Alice"),
-                Sid::new(101, "age"),
+                Sid::new(NsCode(101), "Alice"),
+                Sid::new(NsCode(101), "age"),
                 FlakeValue::Long(30),
-                Sid::new(2, "integer"),
+                Sid::new(NsCode(2), "integer"),
                 1,
                 true,
                 None,
             ),
             Flake::new(
-                Sid::new(101, "Alice"),
-                Sid::new(101, "name"),
+                Sid::new(NsCode(101), "Alice"),
+                Sid::new(NsCode(101), "name"),
                 FlakeValue::String("Alice".into()),
-                Sid::new(2, "string"),
+                Sid::new(NsCode(2), "string"),
                 1,
                 true,
                 None,
             ),
             Flake::new(
-                Sid::new(101, "Bob"),
-                Sid::new(101, "age"),
+                Sid::new(NsCode(101), "Bob"),
+                Sid::new(NsCode(101), "age"),
                 FlakeValue::Long(25),
-                Sid::new(2, "integer"),
+                Sid::new(NsCode(2), "integer"),
                 1,
                 true,
                 None,
@@ -2411,20 +2430,20 @@ mod tests {
         let flakes = vec![
             // Alice knows Bob (Ref)
             Flake::new(
-                Sid::new(101, "Alice"),
-                Sid::new(101, "knows"),
-                FlakeValue::Ref(Sid::new(101, "Bob")),
-                Sid::new(1, "id"),
+                Sid::new(NsCode(101), "Alice"),
+                Sid::new(NsCode(101), "knows"),
+                FlakeValue::Ref(Sid::new(NsCode(101), "Bob")),
+                Sid::new(NsCode(1), "id"),
                 1,
                 true,
                 None,
             ),
             // Bob's age
             Flake::new(
-                Sid::new(101, "Bob"),
-                Sid::new(101, "age"),
+                Sid::new(NsCode(101), "Bob"),
+                Sid::new(NsCode(101), "age"),
                 FlakeValue::Long(25),
-                Sid::new(2, "integer"),
+                Sid::new(NsCode(2), "integer"),
                 1,
                 true,
                 None,
@@ -2453,10 +2472,10 @@ mod tests {
     #[test]
     fn test_resolve_datetime() {
         let flakes = vec![Flake::new(
-            Sid::new(101, "x"),
-            Sid::new(101, "created"),
+            Sid::new(NsCode(101), "x"),
+            Sid::new(NsCode(101), "created"),
             FlakeValue::DateTime(Box::new(DateTime::parse("2024-01-15T10:30:00Z").unwrap())),
-            Sid::new(2, "dateTime"),
+            Sid::new(NsCode(2), "dateTime"),
             1,
             true,
             None,
@@ -2489,19 +2508,19 @@ mod tests {
     fn test_resolve_boolean_and_null() {
         let flakes = vec![
             Flake::new(
-                Sid::new(101, "x"),
-                Sid::new(101, "active"),
+                Sid::new(NsCode(101), "x"),
+                Sid::new(NsCode(101), "active"),
                 FlakeValue::Boolean(true),
-                Sid::new(2, "boolean"),
+                Sid::new(NsCode(2), "boolean"),
                 1,
                 true,
                 None,
             ),
             Flake::new(
-                Sid::new(101, "x"),
-                Sid::new(101, "deleted"),
+                Sid::new(NsCode(101), "x"),
+                Sid::new(NsCode(101), "deleted"),
                 FlakeValue::Null,
-                Sid::new(2, "string"),
+                Sid::new(NsCode(2), "string"),
                 1,
                 true,
                 None,
@@ -2536,19 +2555,19 @@ mod tests {
     fn test_resolve_with_lang_tag() {
         let flakes = vec![
             Flake::new(
-                Sid::new(101, "x"),
-                Sid::new(101, "label"),
+                Sid::new(NsCode(101), "x"),
+                Sid::new(NsCode(101), "label"),
                 FlakeValue::String("hello".into()),
-                Sid::new(3, "langString"),
+                Sid::new(NsCode(3), "langString"),
                 1,
                 true,
                 Some(FlakeMeta::with_lang("en")),
             ),
             Flake::new(
-                Sid::new(101, "x"),
-                Sid::new(101, "label"),
+                Sid::new(NsCode(101), "x"),
+                Sid::new(NsCode(101), "label"),
                 FlakeValue::String("bonjour".into()),
-                Sid::new(3, "langString"),
+                Sid::new(NsCode(3), "langString"),
                 1,
                 true,
                 Some(FlakeMeta::with_lang("fr")),

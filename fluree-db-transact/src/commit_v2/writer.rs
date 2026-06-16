@@ -13,7 +13,7 @@ pub use fluree_db_core::commit::codec::{write_commit, CommitWriteResult};
 mod tests {
     use super::*;
     use fluree_db_core::commit::codec::{read_commit, read_commit_envelope, MAGIC};
-    use fluree_db_core::{ContentId, ContentKind, Flake, FlakeMeta, FlakeValue, Sid};
+    use fluree_db_core::{ContentId, ContentKind, Flake, FlakeMeta, FlakeValue, NsCode, Sid};
     use fluree_db_novelty::Commit;
     use std::collections::HashMap;
 
@@ -48,19 +48,19 @@ mod tests {
     fn test_round_trip_basic() {
         let flakes = vec![
             Flake::new(
-                Sid::new(101, "Alice"),
-                Sid::new(101, "name"),
+                Sid::new(NsCode(101), "Alice"),
+                Sid::new(NsCode(101), "name"),
                 FlakeValue::String("Alice Smith".to_string()),
-                Sid::new(2, "string"),
+                Sid::new(NsCode(2), "string"),
                 1,
                 true,
                 None,
             ),
             Flake::new(
-                Sid::new(101, "Alice"),
-                Sid::new(101, "age"),
+                Sid::new(NsCode(101), "Alice"),
+                Sid::new(NsCode(101), "age"),
                 FlakeValue::Long(30),
-                Sid::new(2, "integer"),
+                Sid::new(NsCode(2), "integer"),
                 1,
                 true,
                 None,
@@ -85,10 +85,10 @@ mod tests {
         let flakes: Vec<Flake> = (0..100)
             .map(|i| {
                 Flake::new(
-                    Sid::new(101, format!("node{i}")),
-                    Sid::new(101, "value"),
+                    Sid::new(NsCode(101), format!("node{i}")),
+                    Sid::new(NsCode(101), "value"),
                     FlakeValue::Long(i),
-                    Sid::new(2, "integer"),
+                    Sid::new(NsCode(2), "integer"),
                     5,
                     true,
                     None,
@@ -121,10 +121,10 @@ mod tests {
     #[test]
     fn test_round_trip_ref_values() {
         let flakes = vec![Flake::new(
-            Sid::new(101, "Alice"),
-            Sid::new(101, "knows"),
-            FlakeValue::Ref(Sid::new(101, "Bob")),
-            Sid::new(1, "id"),
+            Sid::new(NsCode(101), "Alice"),
+            Sid::new(NsCode(101), "knows"),
+            FlakeValue::Ref(Sid::new(NsCode(101), "Bob")),
+            Sid::new(NsCode(1), "id"),
             1,
             true,
             None,
@@ -136,7 +136,7 @@ mod tests {
 
         match &decoded.flakes[0].o {
             FlakeValue::Ref(sid) => {
-                assert_eq!(sid.namespace_code, 101);
+                assert_eq!(sid.namespace_code, NsCode(101));
                 assert_eq!(sid.name.as_ref(), "Bob");
             }
             other => panic!("expected Ref, got {other:?}"),
@@ -147,46 +147,46 @@ mod tests {
     fn test_round_trip_mixed_value_types() {
         let flakes = vec![
             Flake::new(
-                Sid::new(101, "x"),
-                Sid::new(101, "str"),
+                Sid::new(NsCode(101), "x"),
+                Sid::new(NsCode(101), "str"),
                 FlakeValue::String("hello".into()),
-                Sid::new(2, "string"),
+                Sid::new(NsCode(2), "string"),
                 1,
                 true,
                 None,
             ),
             Flake::new(
-                Sid::new(101, "x"),
-                Sid::new(101, "num"),
+                Sid::new(NsCode(101), "x"),
+                Sid::new(NsCode(101), "num"),
                 FlakeValue::Long(-42),
-                Sid::new(2, "long"),
+                Sid::new(NsCode(2), "long"),
                 1,
                 true,
                 None,
             ),
             Flake::new(
-                Sid::new(101, "x"),
-                Sid::new(101, "dbl"),
+                Sid::new(NsCode(101), "x"),
+                Sid::new(NsCode(101), "dbl"),
                 FlakeValue::Double(3.13),
-                Sid::new(2, "double"),
+                Sid::new(NsCode(2), "double"),
                 1,
                 true,
                 None,
             ),
             Flake::new(
-                Sid::new(101, "x"),
-                Sid::new(101, "flag"),
+                Sid::new(NsCode(101), "x"),
+                Sid::new(NsCode(101), "flag"),
                 FlakeValue::Boolean(true),
-                Sid::new(2, "boolean"),
+                Sid::new(NsCode(2), "boolean"),
                 1,
                 true,
                 None,
             ),
             Flake::new(
-                Sid::new(101, "x"),
-                Sid::new(101, "empty"),
+                Sid::new(NsCode(101), "x"),
+                Sid::new(NsCode(101), "empty"),
                 FlakeValue::Null,
-                Sid::new(2, "string"),
+                Sid::new(NsCode(2), "string"),
                 1,
                 false,
                 None,
@@ -207,28 +207,28 @@ mod tests {
     fn test_round_trip_with_metadata() {
         let flakes = vec![
             Flake::new(
-                Sid::new(101, "x"),
-                Sid::new(101, "name"),
+                Sid::new(NsCode(101), "x"),
+                Sid::new(NsCode(101), "name"),
                 FlakeValue::String("Alice".into()),
-                Sid::new(3, "langString"),
+                Sid::new(NsCode(3), "langString"),
                 1,
                 true,
                 Some(FlakeMeta::with_lang("en")),
             ),
             Flake::new(
-                Sid::new(101, "x"),
-                Sid::new(101, "items"),
+                Sid::new(NsCode(101), "x"),
+                Sid::new(NsCode(101), "items"),
                 FlakeValue::Long(42),
-                Sid::new(2, "integer"),
+                Sid::new(NsCode(2), "integer"),
                 1,
                 true,
                 Some(FlakeMeta::with_index(0)),
             ),
             Flake::new(
-                Sid::new(101, "x"),
-                Sid::new(101, "items"),
+                Sid::new(NsCode(101), "x"),
+                Sid::new(NsCode(101), "items"),
                 FlakeValue::Long(99),
-                Sid::new(2, "integer"),
+                Sid::new(NsCode(2), "integer"),
                 1,
                 true,
                 Some(FlakeMeta {
@@ -252,10 +252,10 @@ mod tests {
     fn test_envelope_only_read() {
         let mut commit = make_test_commit(
             vec![Flake::new(
-                Sid::new(101, "x"),
-                Sid::new(101, "v"),
+                Sid::new(NsCode(101), "x"),
+                Sid::new(NsCode(101), "v"),
                 FlakeValue::Long(1),
-                Sid::new(2, "integer"),
+                Sid::new(NsCode(2), "integer"),
                 5,
                 true,
                 None,
@@ -277,10 +277,10 @@ mod tests {
     #[test]
     fn test_hash_integrity() {
         let flakes = vec![Flake::new(
-            Sid::new(101, "x"),
-            Sid::new(101, "v"),
+            Sid::new(NsCode(101), "x"),
+            Sid::new(NsCode(101), "v"),
             FlakeValue::Long(1),
-            Sid::new(2, "integer"),
+            Sid::new(NsCode(2), "integer"),
             1,
             true,
             None,
@@ -307,10 +307,10 @@ mod tests {
         commit.txn = Some(txn_cid.clone());
 
         commit.flakes.push(Flake::new(
-            Sid::new(101, "x"),
-            Sid::new(101, "v"),
+            Sid::new(NsCode(101), "x"),
+            Sid::new(NsCode(101), "v"),
             FlakeValue::Long(1),
-            Sid::new(2, "integer"),
+            Sid::new(NsCode(2), "integer"),
             10,
             true,
             None,
@@ -333,18 +333,18 @@ mod tests {
                 } else if i % 3 == 1 {
                     FlakeValue::String(format!("value_{i}"))
                 } else {
-                    FlakeValue::Ref(Sid::new(101, format!("ref_{i}")))
+                    FlakeValue::Ref(Sid::new(NsCode(101), format!("ref_{i}")))
                 };
                 let dt = if i % 3 == 2 {
-                    Sid::new(1, "id")
+                    Sid::new(NsCode(1), "id")
                 } else if i % 3 == 0 {
-                    Sid::new(2, "integer")
+                    Sid::new(NsCode(2), "integer")
                 } else {
-                    Sid::new(2, "string")
+                    Sid::new(NsCode(2), "string")
                 };
                 Flake::new(
-                    Sid::new(101, format!("s_{i}")),
-                    Sid::new(101, format!("p_{}", i % 10)),
+                    Sid::new(NsCode(101), format!("s_{i}")),
+                    Sid::new(NsCode(101), format!("p_{}", i % 10)),
                     value,
                     dt,
                     42,

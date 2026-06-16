@@ -374,7 +374,7 @@ impl crate::Fluree {
             .iter()
             .map(|commit_id| {
                 TxnMetaEntry::new(
-                    FLUREE_DB,
+                    FLUREE_DB.as_u16(),
                     fluree_vocab::db::REVERTS,
                     TxnMetaValue::string(commit_id.to_string()),
                 )

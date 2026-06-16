@@ -528,6 +528,7 @@ impl TxnOpts {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fluree_db_core::NsCode;
 
     #[test]
     fn test_txn_builder() {
@@ -540,12 +541,12 @@ mod tests {
         let txn = Txn::update()
             .with_delete(TripleTemplate::new(
                 TemplateTerm::Var(s_var),
-                TemplateTerm::Sid(Sid::new(1, "ex:name")),
+                TemplateTerm::Sid(Sid::new(NsCode(1), "ex:name")),
                 TemplateTerm::Var(p_var),
             ))
             .with_insert(TripleTemplate::new(
                 TemplateTerm::Var(s_var),
-                TemplateTerm::Sid(Sid::new(1, "ex:name")),
+                TemplateTerm::Sid(Sid::new(NsCode(1), "ex:name")),
                 TemplateTerm::Value(FlakeValue::String("New Name".to_string())),
             ))
             .with_vars(vars)
@@ -561,7 +562,7 @@ mod tests {
     #[test]
     fn test_template_term_checks() {
         let var_term = TemplateTerm::Var(VarId(0));
-        let sid_term = TemplateTerm::Sid(Sid::new(1, "ex:test"));
+        let sid_term = TemplateTerm::Sid(Sid::new(NsCode(1), "ex:test"));
         let blank_term = TemplateTerm::BlankNode("_:b1".to_string());
 
         assert!(var_term.is_var());

@@ -81,7 +81,7 @@ fn materialize_encoded_lit(binding: &Binding, gv: &BinaryGraphView) -> std::io::
                 .dt_sids()
                 .get(*dt_id as usize)
                 .cloned()
-                .unwrap_or_else(|| Sid::new(0, ""));
+                .unwrap_or_else(|| Sid::new(fluree_db_core::NsCode(0), ""));
             let meta = store.decode_meta(*lang_id, *i_val);
             let dtc = match meta.and_then(|m| m.lang.map(std::sync::Arc::from)) {
                 Some(lang) => DatatypeConstraint::LangTag(lang),
