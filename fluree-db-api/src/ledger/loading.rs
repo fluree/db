@@ -121,8 +121,10 @@ impl Fluree {
         let ledger_id = normalize_ledger_id(ledger_id).unwrap_or_else(|_| ledger_id.to_string());
         info!(ledger_id = %ledger_id, "Creating ledger");
 
-        // 2. Register in nameservice via Publisher (fails if already exists)
-        match self.publisher()?.init(&ledger_id).await {
+        // 2. Register in nameservice via the ledger-admin surface
+        //    (fails if already exists). Works for both ReadWrite and
+        //    Replicated nameservices; the latter goes through Raft.
+        match self.ledger_admin()?.init(&ledger_id).await {
             Ok(()) => {}
             Err(NameServiceError::LedgerAlreadyExists(a)) => {
                 return Err(ApiError::ledger_exists(a));
@@ -221,7 +223,7 @@ impl Fluree {
 
         let is_historical = at_commit.is_some();
 
-        self.publisher()?
+        self.branch_admin()?
             .create_branch(ledger_name, new_branch, source, at_commit)
             .await
             .map_err(|e| match e {
@@ -244,7 +246,7 @@ impl Fluree {
                         "failed to copy index to branch; branch will replay from genesis"
                     );
                 } else {
-                    self.publisher()?
+                    self.index_publisher()?
                         .publish_index(&new_id, source_record.index_t, index_cid)
                         .await?;
                 }

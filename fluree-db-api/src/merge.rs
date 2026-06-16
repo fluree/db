@@ -146,7 +146,7 @@ impl crate::Fluree {
                         "merge failed, rolling back nameservice state"
                     );
                     if let Err(rollback_err) = self
-                        .publisher()?
+                        .branch_admin()?
                         .reset_head(&target_id, target_snapshot)
                         .await
                     {

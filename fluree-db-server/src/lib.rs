@@ -415,13 +415,21 @@ impl FlureeServerBuilder {
         #[cfg(feature = "raft")]
         let (fluree, cache_stats_handle) =
             if let Some(raft_ns) = raft_nameservice.as_ref() {
-                // Method-form `.clone()` returns `Arc<RaftNameService>`
-                // which the let binding coerces to the trait object —
-                // `Arc::clone(...)` would type-bind the generic to the
-                // annotation and reject the concrete argument.
-                let lookup: std::sync::Arc<dyn fluree_db_nameservice::NameServiceLookup> =
+                // RaftNameService satisfies both LifecycleNameService
+                // (NameServiceLookup + LedgerLifecycle + BranchLifecycle)
+                // and IndexingNameService (NameServiceLookup +
+                // IndexPublisher), so both Lifecycle fields hold a
+                // clone of the same Arc. Method-form `.clone()`
+                // returns `Arc<RaftNameService>` which each let
+                // binding coerces to its target trait object.
+                let lifecycle: std::sync::Arc<dyn fluree_db_api::LifecycleNameService> =
                     raft_ns.clone();
-                let ns_mode = fluree_db_api::NameServiceMode::ReadOnly(lookup);
+                let indexing: std::sync::Arc<dyn fluree_db_nameservice::IndexingNameService> =
+                    raft_ns.clone();
+                let ns_mode = fluree_db_api::NameServiceMode::Lifecycle {
+                    lifecycle,
+                    indexing,
+                };
                 state::build_fluree_with_nameservice(&self.config, ns_mode).await?
             } else {
                 state::build_default_fluree(&self.config).await?

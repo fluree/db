@@ -283,7 +283,7 @@ impl crate::Fluree {
                     error = %e,
                     "revert failed, rolling back nameservice state"
                 );
-                if let Err(rollback_err) = self.publisher()?.reset_head(&branch_id, snapshot).await
+                if let Err(rollback_err) = self.branch_admin()?.reset_head(&branch_id, snapshot).await
                 {
                     tracing::error!(
                         branch = %branch_id,

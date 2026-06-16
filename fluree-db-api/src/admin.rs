@@ -567,7 +567,12 @@ impl crate::Fluree {
         // 4. Drop each branch (artifacts + nameservice). `@shared/dicts/` is
         // intentionally NOT wiped here — it lives at the ledger level and
         // gets cleaned in the next step, once every branch is gone.
-        let publisher = self.publisher()?;
+        // Soft mode uses `LedgerLifecycle::retract`; hard mode uses
+        // `BranchLifecycle::drop_branch` so the parent's child count is
+        // decremented atomically — both surfaces are available on
+        // ReadWrite and Replicated nameservices.
+        let ledger_admin = self.ledger_admin()?;
+        let branch_admin = self.branch_admin()?;
         for branch in &branches {
             let mut br = BranchDropReport {
                 ledger_id: branch.ledger_id.clone(),
@@ -592,7 +597,7 @@ impl crate::Fluree {
             // records still have an accurate child count rather than a
             // stale one. Soft mode just retracts.
             let ns_result = if matches!(mode, DropMode::Hard) {
-                publisher
+                branch_admin
                     .drop_branch(&branch.ledger_id)
                     .await
                     .map(|_| ())
@@ -608,7 +613,7 @@ impl crate::Fluree {
                         }
                     })
             } else {
-                publisher.retract(&branch.ledger_id).await
+                ledger_admin.retract(&branch.ledger_id).await
             };
             // Cache disconnect runs unconditionally — the artifact deletion
             // and any nameservice mutation already happened above, so even
@@ -719,7 +724,7 @@ impl crate::Fluree {
 
         if record.branches > 0 {
             // Has children — retract but preserve storage
-            self.publisher()?.retract(&ledger_id).await?;
+            self.ledger_admin()?.retract(&ledger_id).await?;
             report.deferred = true;
 
             // Disconnect from cache
@@ -944,7 +949,7 @@ impl crate::Fluree {
         report.artifacts_deleted += count;
         report.warnings.extend(warnings);
 
-        let parent_new_count = self.publisher()?.drop_branch(ledger_id).await?;
+        let parent_new_count = self.branch_admin()?.drop_branch(ledger_id).await?;
 
         if let Some(mgr) = &self.ledger_manager {
             mgr.disconnect(ledger_id).await;

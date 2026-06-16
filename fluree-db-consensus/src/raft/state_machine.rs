@@ -649,9 +649,9 @@ fn purge_ledger(
 ) -> Response {
     let key = RefKey::new(&ledger_id, &branch);
     let full = format_ledger_id(&ledger_id, &branch);
-    let removed_source = state.refs.remove(&key).and_then(|r| r.source_branch);
-    let removed_ref = removed_source.is_some()
-        || state.refs.get(&key).is_some();
+    let removed_entry = state.refs.remove(&key);
+    let removed_ref = removed_entry.is_some();
+    let removed_source = removed_entry.and_then(|r| r.source_branch);
     let removed_retraction = state.retracted.remove(&key);
     let removed_branch = match state.ledgers.get_mut(&ledger_id) {
         Some(ledger) => {

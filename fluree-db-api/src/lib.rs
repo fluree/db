@@ -226,7 +226,8 @@ pub use fluree_db_ledger::{
 };
 pub use fluree_db_nameservice::{
     BranchLifecycle, ConfigCasResult, ConfigPayload, ConfigPublisher, ConfigValue,
-    GraphSourceLookup, GraphSourcePublisher, NameServiceLookup, NsRecord, Publisher,
+    GraphSourceLookup, GraphSourcePublisher, IndexPublisher, IndexingNameService,
+    LedgerLifecycle, NameServiceLookup, NsRecord, Publisher,
 };
 pub use fluree_db_novelty::Novelty;
 pub use fluree_db_query::{
@@ -283,9 +284,26 @@ pub use fluree_graph_json_ld::ParsedContext;
 // Re-export the combined read-write nameservice trait from the nameservice crate.
 pub use fluree_db_nameservice::NameServicePublisher;
 
+/// Nameservice surface for record-lifecycle mutations: reads,
+/// ledger-level lifecycle ([`LedgerLifecycle`]), and branch-level
+/// lifecycle ([`BranchLifecycle`]). Pairs with [`IndexingNameService`]
+/// (lookup + [`IndexPublisher`]) on
+/// [`NameServiceMode::Lifecycle`] — the two surfaces are kept
+/// separate because publishing an index head isn't part of a
+/// record's lifecycle, even though one implementation may back both.
+pub trait LifecycleNameService:
+    NameServiceLookup + LedgerLifecycle + BranchLifecycle
+{
+}
+impl<T> LifecycleNameService for T where
+    T: NameServiceLookup + LedgerLifecycle + BranchLifecycle + ?Sized
+{
+}
+
 /// Runtime nameservice selection.
 ///
-/// Encodes whether this Fluree instance has full read-write nameservice access
+/// Encodes whether this Fluree instance has full read-write nameservice access,
+/// a lifecycle + indexing surface (e.g. a Raft-replicated nameservice),
 /// or is a read-only proxy that forwards writes to a remote transaction server.
 ///
 /// Analogous to [`StorageBackend`] for storage.
@@ -293,6 +311,15 @@ pub use fluree_db_nameservice::NameServicePublisher;
 pub enum NameServiceMode {
     /// Full read-write nameservice (File, Memory, S3, DynamoDB).
     ReadWrite(Arc<dyn NameServicePublisher>),
+    /// Nameservice that supports record lifecycle and index
+    /// publishing but not the full [`NameServicePublisher`] surface
+    /// (no commit publishing, graph sources, status, config, refs).
+    /// The two arcs are independent in principle; one implementation
+    /// may satisfy both and hand the same `Arc` to each field.
+    Lifecycle {
+        lifecycle: Arc<dyn LifecycleNameService>,
+        indexing: Arc<dyn IndexingNameService>,
+    },
     /// Read-only proxy nameservice.
     /// Writes are forwarded to the remote transaction server via HTTP.
     ReadOnly(Arc<dyn NameServiceLookup>),
@@ -302,6 +329,11 @@ impl std::fmt::Debug for NameServiceMode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::ReadWrite(ns) => f.debug_tuple("ReadWrite").field(ns).finish(),
+            Self::Lifecycle { lifecycle, indexing } => f
+                .debug_struct("Lifecycle")
+                .field("lifecycle", lifecycle)
+                .field("indexing", indexing)
+                .finish(),
             Self::ReadOnly(ns) => f.debug_tuple("ReadOnly").field(ns).finish(),
         }
     }
@@ -312,6 +344,7 @@ impl NameServiceMode {
     pub fn reader(&self) -> &dyn NameServiceLookup {
         match self {
             Self::ReadWrite(ns) => ns.as_ref(),
+            Self::Lifecycle { lifecycle, .. } => lifecycle.as_ref(),
             Self::ReadOnly(ns) => ns.as_ref(),
         }
     }
@@ -325,15 +358,21 @@ impl NameServiceMode {
                 let cloned: Arc<dyn NameServicePublisher> = Arc::clone(ns);
                 cloned
             }
+            Self::Lifecycle { lifecycle, .. } => {
+                let cloned: Arc<dyn LifecycleNameService> = Arc::clone(lifecycle);
+                cloned
+            }
             Self::ReadOnly(ns) => Arc::clone(ns),
         }
     }
 
-    /// Get read-write nameservice access (only for ReadWrite mode).
+    /// Get the full read-write nameservice surface. Only available
+    /// for [`Self::ReadWrite`]; [`Self::Lifecycle`] satisfies a
+    /// narrower set of surfaces and returns `None` here.
     pub fn publisher(&self) -> Option<&dyn NameServicePublisher> {
         match self {
             Self::ReadWrite(ns) => Some(ns.as_ref()),
-            Self::ReadOnly(_) => None,
+            Self::Lifecycle { .. } | Self::ReadOnly(_) => None,
         }
     }
 
@@ -344,6 +383,40 @@ impl NameServiceMode {
     pub fn publisher_arc(&self) -> Option<Arc<dyn NameServicePublisher>> {
         match self {
             Self::ReadWrite(ns) => Some(Arc::clone(ns)),
+            Self::Lifecycle { .. } | Self::ReadOnly(_) => None,
+        }
+    }
+
+    /// Get the ledger-admin surface ([`LedgerLifecycle`] — init,
+    /// retract, purge). Available in [`Self::ReadWrite`] and
+    /// [`Self::Lifecycle`].
+    pub fn ledger_admin(&self) -> Option<&dyn LedgerLifecycle> {
+        match self {
+            Self::ReadWrite(ns) => Some(ns.as_ref()),
+            Self::Lifecycle { lifecycle, .. } => Some(lifecycle.as_ref()),
+            Self::ReadOnly(_) => None,
+        }
+    }
+
+    /// Get the branch-admin surface ([`BranchLifecycle`] —
+    /// create_branch, drop_branch, reset_head). Available in
+    /// [`Self::ReadWrite`] and [`Self::Lifecycle`].
+    pub fn branch_admin(&self) -> Option<&dyn BranchLifecycle> {
+        match self {
+            Self::ReadWrite(ns) => Some(ns.as_ref()),
+            Self::Lifecycle { lifecycle, .. } => Some(lifecycle.as_ref()),
+            Self::ReadOnly(_) => None,
+        }
+    }
+
+    /// Get the [`IndexPublisher`] surface. Available in
+    /// [`Self::ReadWrite`] and [`Self::Lifecycle`] (the latter via
+    /// its `indexing` field, which satisfies
+    /// [`IndexingNameService`]).
+    pub fn index_publisher(&self) -> Option<&dyn IndexPublisher> {
+        match self {
+            Self::ReadWrite(ns) => Some(ns.as_ref()),
+            Self::Lifecycle { indexing, .. } => Some(indexing.as_ref()),
             Self::ReadOnly(_) => None,
         }
     }
@@ -456,26 +529,6 @@ impl fluree_db_nameservice::StatusLookup for NameServiceMode {
 }
 
 #[async_trait]
-impl fluree_db_nameservice::StatusPublisher for NameServiceMode {
-    async fn push_status(
-        &self,
-        ledger_id: &str,
-        expected: Option<&fluree_db_nameservice::StatusValue>,
-        new: &fluree_db_nameservice::StatusValue,
-    ) -> std::result::Result<
-        fluree_db_nameservice::StatusCasResult,
-        fluree_db_nameservice::NameServiceError,
-    > {
-        match self {
-            Self::ReadWrite(ns) => ns.push_status(ledger_id, expected, new).await,
-            Self::ReadOnly(_) => Err(fluree_db_nameservice::NameServiceError::Storage(
-                "push_status not available on read-only nameservice".into(),
-            )),
-        }
-    }
-}
-
-#[async_trait]
 impl fluree_db_nameservice::RefLookup for NameServiceMode {
     async fn get_ref(
         &self,
@@ -486,107 +539,6 @@ impl fluree_db_nameservice::RefLookup for NameServiceMode {
         fluree_db_nameservice::NameServiceError,
     > {
         self.reader().get_ref(ledger_id, kind).await
-    }
-}
-
-#[async_trait]
-impl fluree_db_nameservice::RefPublisher for NameServiceMode {
-    async fn compare_and_set_ref(
-        &self,
-        ledger_id: &str,
-        kind: fluree_db_nameservice::RefKind,
-        expected: Option<&fluree_db_nameservice::RefValue>,
-        new: &fluree_db_nameservice::RefValue,
-    ) -> std::result::Result<
-        fluree_db_nameservice::CasResult,
-        fluree_db_nameservice::NameServiceError,
-    > {
-        match self {
-            Self::ReadWrite(ns) => ns.compare_and_set_ref(ledger_id, kind, expected, new).await,
-            Self::ReadOnly(_) => Err(fluree_db_nameservice::NameServiceError::Storage(
-                "compare_and_set_ref not available on read-only nameservice".into(),
-            )),
-        }
-    }
-}
-
-#[async_trait]
-impl fluree_db_nameservice::LedgerLifecycle for NameServiceMode {
-    async fn init(
-        &self,
-        ledger_id: &str,
-    ) -> std::result::Result<(), fluree_db_nameservice::NameServiceError> {
-        match self {
-            Self::ReadWrite(ns) => ns.init(ledger_id).await,
-            Self::ReadOnly(_) => Err(fluree_db_nameservice::NameServiceError::Storage(
-                "init not available on read-only nameservice".into(),
-            )),
-        }
-    }
-
-    async fn retract(
-        &self,
-        ledger_id: &str,
-    ) -> std::result::Result<(), fluree_db_nameservice::NameServiceError> {
-        match self {
-            Self::ReadWrite(ns) => ns.retract(ledger_id).await,
-            Self::ReadOnly(_) => Err(fluree_db_nameservice::NameServiceError::Storage(
-                "retract not available on read-only nameservice".into(),
-            )),
-        }
-    }
-
-    async fn purge(
-        &self,
-        ledger_id: &str,
-    ) -> std::result::Result<(), fluree_db_nameservice::NameServiceError> {
-        match self {
-            Self::ReadWrite(ns) => ns.purge(ledger_id).await,
-            Self::ReadOnly(_) => Err(fluree_db_nameservice::NameServiceError::Storage(
-                "purge not available on read-only nameservice".into(),
-            )),
-        }
-    }
-}
-
-#[async_trait]
-impl fluree_db_nameservice::CommitPublisher for NameServiceMode {
-    async fn publish_commit(
-        &self,
-        ledger_id: &str,
-        commit_t: i64,
-        commit_id: &fluree_db_core::ContentId,
-    ) -> std::result::Result<(), fluree_db_nameservice::NameServiceError> {
-        match self {
-            Self::ReadWrite(ns) => ns.publish_commit(ledger_id, commit_t, commit_id).await,
-            Self::ReadOnly(_) => Err(fluree_db_nameservice::NameServiceError::Storage(
-                "publish_commit not available on read-only nameservice".into(),
-            )),
-        }
-    }
-
-    fn publishing_ledger_id(&self, ledger_id: &str) -> Option<String> {
-        match self {
-            Self::ReadWrite(ns) => ns.publishing_ledger_id(ledger_id),
-            Self::ReadOnly(_) => None,
-        }
-    }
-}
-
-#[async_trait]
-impl fluree_db_nameservice::IndexPublisher for NameServiceMode {
-    async fn publish_index(
-        &self,
-        ledger_id: &str,
-        index_t: i64,
-        index_id: &fluree_db_core::ContentId,
-    ) -> std::result::Result<(), fluree_db_nameservice::NameServiceError> {
-        match self {
-            Self::ReadWrite(ns) => ns.publish_index(ledger_id, index_t, index_id).await,
-            Self::ReadOnly(_) => Err(fluree_db_nameservice::NameServiceError::Storage(
-                "publish_index not available on read-only nameservice".into(),
-            )),
-        }
     }
 }
 
@@ -2650,10 +2602,44 @@ impl Fluree {
     }
 
     /// Get read-write nameservice access, or error if read-only.
+    ///
+    /// Returns the full [`NameServicePublisher`] surface — only available
+    /// from [`NameServiceMode::ReadWrite`]. In replicated (Raft) mode,
+    /// callers should use the narrower capability accessors
+    /// ([`ledger_admin`](Self::ledger_admin),
+    /// [`branch_admin`](Self::branch_admin),
+    /// [`index_publisher`](Self::index_publisher)) — those are
+    /// supported in both `ReadWrite` and `Replicated` modes.
     pub fn publisher(&self) -> Result<&dyn NameServicePublisher> {
         self.nameservice_mode
             .publisher()
             .ok_or_else(|| ApiError::internal("write operations require a read-write nameservice"))
+    }
+
+    /// Get the ledger-admin write surface ([`LedgerLifecycle`] —
+    /// init, retract, purge). Available from both `ReadWrite` and
+    /// `Replicated` nameservices; errors only from `ReadOnly` proxies.
+    pub fn ledger_admin(&self) -> Result<&dyn LedgerLifecycle> {
+        self.nameservice_mode
+            .ledger_admin()
+            .ok_or_else(|| ApiError::internal("ledger admin requires a writable nameservice"))
+    }
+
+    /// Get the branch-admin write surface ([`BranchLifecycle`] —
+    /// create_branch, drop_branch, reset_head). Available from both
+    /// `ReadWrite` and `Replicated` nameservices.
+    pub fn branch_admin(&self) -> Result<&dyn BranchLifecycle> {
+        self.nameservice_mode
+            .branch_admin()
+            .ok_or_else(|| ApiError::internal("branch admin requires a writable nameservice"))
+    }
+
+    /// Get the [`IndexPublisher`] write surface. Available from both
+    /// `ReadWrite` and `Replicated` nameservices.
+    pub fn index_publisher(&self) -> Result<&dyn IndexPublisher> {
+        self.nameservice_mode
+            .index_publisher()
+            .ok_or_else(|| ApiError::internal("index publishing requires a writable nameservice"))
     }
 
     /// Get the raw nameservice mode (for mode checks or `publisher_arc()`).
