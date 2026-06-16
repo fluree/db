@@ -502,6 +502,381 @@ async fn flpack_export_import_round_trip_with_index() {
         .await;
 }
 
+/// Round-trip through the public streaming API: export → `restore_ledger`
+/// (the path the CLI and server both use) reading from an in-memory stream.
+#[tokio::test]
+async fn flpack_restore_ledger_api_round_trip() {
+    let src_dir = tempfile::TempDir::new().expect("src tempdir");
+    let dst_dir = tempfile::TempDir::new().expect("dst tempdir");
+
+    let src_ledger = "flpack-test/api-source:main";
+    let dst_ledger = "flpack-test/api-restored:main";
+
+    let src_fluree = FlureeBuilder::file(src_dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build source");
+
+    let src_db = fluree_db_core::LedgerSnapshot::genesis(src_ledger);
+    let src_state = fluree_db_api::LedgerState::new(src_db, fluree_db_api::Novelty::new(0));
+
+    let insert_data = json!({
+        "@context": { "ex": "http://example.org/ns/", "schema": "http://schema.org/" },
+        "@graph": [
+            { "@id": "ex:alice", "@type": "ex:User", "schema:name": "Alice" },
+            { "@id": "ex:bob", "@type": "ex:User", "schema:name": "Bob" }
+        ]
+    });
+    let committed = src_fluree
+        .insert(src_state, &insert_data)
+        .await
+        .expect("insert");
+    assert_eq!(committed.receipt.t, 1);
+
+    let query = json!({
+        "select": ["?name"],
+        "where": { "@id": "?s", "@type": "ex:User", "schema:name": "?name" },
+        "orderBy": "?name",
+        "@context": { "ex": "http://example.org/ns/", "schema": "http://schema.org/" }
+    });
+    let src_db = fluree_db_api::GraphDb::from_ledger_state(&committed.ledger);
+    let src_json = src_fluree
+        .query(&src_db, &query)
+        .await
+        .expect("src query")
+        .to_jsonld(&committed.ledger.snapshot)
+        .expect("src to_jsonld");
+
+    let pack_bytes = export_ledger_to_bytes(&src_fluree, src_ledger).await;
+
+    // Restore via the public streaming API, reading from an in-memory cursor
+    // (stands in for a file/S3/HTTP `AsyncRead`). `restore_ledger` creates the
+    // target ledger itself, so we do not pre-create it.
+    let dst_fluree = FlureeBuilder::file(dst_dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build destination");
+
+    let mut reader = std::io::Cursor::new(pack_bytes);
+    let result = dst_fluree
+        .restore_ledger(dst_ledger, &mut reader)
+        .await
+        .expect("restore_ledger");
+    assert_eq!(result.commits, 1, "one commit restored");
+    assert_eq!(result.commit_t, 1);
+
+    let dst_handle = dst_fluree
+        .ledger(dst_ledger)
+        .await
+        .expect("load restored ledger");
+    let dst_db = fluree_db_api::GraphDb::from_ledger_state(&dst_handle);
+    let dst_json = dst_fluree
+        .query(&dst_db, &query)
+        .await
+        .expect("dst query")
+        .to_jsonld(&dst_handle.snapshot)
+        .expect("dst to_jsonld");
+
+    assert_eq!(
+        src_json, dst_json,
+        "query results should match after restore_ledger round-trip"
+    );
+    assert_eq!(dst_json.as_array().expect("array").len(), 2);
+}
+
+/// Restoring under a bare name (no `:branch` suffix) must normalize to
+/// `name:main` consistently across ingest, head finalization, and load.
+#[tokio::test]
+async fn flpack_restore_bare_name_normalizes_to_main() {
+    let src_dir = tempfile::TempDir::new().expect("src tempdir");
+    let dst_dir = tempfile::TempDir::new().expect("dst tempdir");
+
+    let src_ledger = "flpack-test/bare-source:main";
+    let src_fluree = FlureeBuilder::file(src_dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build source");
+    let src_db = fluree_db_core::LedgerSnapshot::genesis(src_ledger);
+    let src_state = fluree_db_api::LedgerState::new(src_db, fluree_db_api::Novelty::new(0));
+    let insert = json!({
+        "@context": {"ex": "http://example.org/ns/"},
+        "@id": "ex:test", "ex:value": "hello"
+    });
+    src_fluree.insert(src_state, &insert).await.expect("insert");
+    let pack_bytes = export_ledger_to_bytes(&src_fluree, src_ledger).await;
+
+    let dst_fluree = FlureeBuilder::file(dst_dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build destination");
+    let mut reader = std::io::Cursor::new(pack_bytes);
+    // Bare name — no ":main".
+    let result = dst_fluree
+        .restore_ledger("bare-restored", &mut reader)
+        .await
+        .expect("restore_ledger with bare name");
+    assert_eq!(result.ledger_id, "bare-restored:main");
+    assert_eq!(result.commit_t, 1);
+
+    // The commit head was finalized under the *normalized* name (proving the
+    // ingest namespace, content-store, and head-set all agreed on it).
+    let rec = dst_fluree
+        .nameservice()
+        .lookup("bare-restored:main")
+        .await
+        .expect("lookup")
+        .expect("record exists under normalized name");
+    assert_eq!(rec.commit_t, 1, "commit head set under bare-restored:main");
+
+    // And it loads + queries under the normalized id.
+    let handle = dst_fluree
+        .ledger("bare-restored:main")
+        .await
+        .expect("load restored ledger");
+    let q = json!({
+        "select": ["?v"],
+        "where": { "@id": "ex:test", "ex:value": "?v" },
+        "@context": {"ex": "http://example.org/ns/"}
+    });
+    let db = fluree_db_api::GraphDb::from_ledger_state(&handle);
+    let out = dst_fluree
+        .query(&db, &q)
+        .await
+        .expect("query")
+        .to_jsonld(&handle.snapshot)
+        .expect("to_jsonld");
+    assert_eq!(out.as_array().expect("array").len(), 1);
+}
+
+/// The ledger's stored default JSON-LD context must survive an
+/// `archive_ledger` → `restore_ledger` round-trip (regression: the config
+/// blob + nameservice pointer were dropped, breaking queries that omit an
+/// inline `@context`).
+#[tokio::test]
+async fn flpack_preserves_default_context() {
+    let src_dir = tempfile::TempDir::new().expect("src tempdir");
+    let dst_dir = tempfile::TempDir::new().expect("dst tempdir");
+    let src_ledger = "flpack-test/ctx-source:main";
+    let dst_ledger = "flpack-test/ctx-restored:main";
+
+    let src_fluree = FlureeBuilder::file(src_dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build source");
+
+    // Populate, then set a default context on the source.
+    let src_db = fluree_db_core::LedgerSnapshot::genesis(src_ledger);
+    let src_state = fluree_db_api::LedgerState::new(src_db, fluree_db_api::Novelty::new(0));
+    let insert = json!({
+        "@context": {"ex": "http://example.org/ns/"},
+        "@id": "ex:a", "ex:v": "1"
+    });
+    src_fluree.insert(src_state, &insert).await.expect("insert");
+
+    let ctx = json!({ "ex": "http://example.org/ns/", "schema": "http://schema.org/" });
+    src_fluree
+        .set_default_context(src_ledger, &ctx)
+        .await
+        .expect("set default context");
+    let src_ctx = src_fluree
+        .get_default_context(src_ledger)
+        .await
+        .expect("get src context");
+    assert!(src_ctx.is_some(), "source should have a default context");
+
+    // Archive via the real export path (Vec<u8> is an AsyncWrite sink).
+    let mut archive: Vec<u8> = Vec::new();
+    src_fluree
+        .archive_ledger(src_ledger, true, &mut archive)
+        .await
+        .expect("archive");
+
+    // Restore into a separate instance under a different name.
+    let dst_fluree = FlureeBuilder::file(dst_dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build destination");
+    let mut reader = std::io::Cursor::new(archive);
+    dst_fluree
+        .restore_ledger(dst_ledger, &mut reader)
+        .await
+        .expect("restore");
+
+    // The restored ledger must carry the same default context.
+    let dst_ctx = dst_fluree
+        .get_default_context(dst_ledger)
+        .await
+        .expect("get dst context");
+    assert!(
+        dst_ctx.is_some(),
+        "restored default context must not be null (regression)"
+    );
+    assert_eq!(
+        dst_ctx, src_ctx,
+        "default context should be byte-identical after the round-trip"
+    );
+}
+
+/// Restoring an *indexed* ledger under a different name must re-stamp the FIR6
+/// index root's embedded `ledger_id`. The root carries the source name as an
+/// inline identity field; left unchanged, `apply_loaded_db` rejects it on the
+/// write/reload path ("Index ledger_id '<src>' does not match expected
+/// '<dst>'") — queries still work (cold load trusts the root's own name) but
+/// every write loops as retryable, leaving the ledger silently read-only.
+#[tokio::test]
+async fn flpack_restore_restamps_index_root_ledger_id() {
+    use support::{start_background_indexer_local, trigger_index_and_wait};
+
+    let src_dir = tempfile::TempDir::new().expect("src tempdir");
+    let dst_dir = tempfile::TempDir::new().expect("dst tempdir");
+
+    let src_ledger = "flpack-test/restamp-source:main";
+    let dst_ledger = "flpack-test/restamp-restored:main";
+
+    let mut src_fluree = FlureeBuilder::file(src_dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build source");
+
+    let (local, handle) = start_background_indexer_local(
+        src_fluree.backend().clone(),
+        Arc::new(src_fluree.nameservice_mode().clone()),
+        fluree_db_indexer::IndexerConfig::small(),
+    );
+    src_fluree.set_indexing_mode(fluree_db_api::tx::IndexingMode::Background(handle.clone()));
+
+    local
+        .run_until(async {
+            let src_db = fluree_db_core::LedgerSnapshot::genesis(src_ledger);
+            let src_state = fluree_db_api::LedgerState::new(src_db, fluree_db_api::Novelty::new(0));
+            let insert = json!({
+                "@context": {"ex": "http://example.org/ns/"},
+                "@graph": [
+                    {"@id": "ex:alice", "@type": "ex:User", "ex:name": "Alice"},
+                    {"@id": "ex:bob", "@type": "ex:User", "ex:name": "Bob"}
+                ]
+            });
+            let committed = src_fluree.insert(src_state, &insert).await.expect("insert");
+            trigger_index_and_wait(&handle, src_ledger, committed.receipt.t).await;
+
+            // Archive the indexed source via the real export path.
+            let mut archive: Vec<u8> = Vec::new();
+            src_fluree
+                .archive_ledger(src_ledger, true, &mut archive)
+                .await
+                .expect("archive");
+
+            // Restore into a fresh instance under a *different* name.
+            let dst_fluree = FlureeBuilder::file(dst_dir.path().to_string_lossy().to_string())
+                .build()
+                .expect("build destination");
+            let mut reader = std::io::Cursor::new(archive);
+            let result = dst_fluree
+                .restore_ledger(dst_ledger, &mut reader)
+                .await
+                .expect("restore");
+            assert!(
+                result.index_t.is_some(),
+                "restored archive carried an index head"
+            );
+
+            // The index head the nameservice now points at must decode to a
+            // FIR6 root whose embedded ledger_id is the *restore* name, not the
+            // source name — proof the re-stamp happened.
+            let rec = dst_fluree
+                .nameservice()
+                .lookup(dst_ledger)
+                .await
+                .expect("lookup")
+                .expect("restored record");
+            let index_id = rec.index_head_id.expect("restored index head id");
+            let root_bytes = dst_fluree
+                .content_store(dst_ledger)
+                .get(&index_id)
+                .await
+                .expect("read restored index root");
+            let root = fluree_db_binary_index::IndexRoot::decode(&root_bytes)
+                .expect("decode restored root");
+            assert_eq!(
+                root.ledger_id, dst_ledger,
+                "restored index root must be re-stamped with the destination ledger id"
+            );
+
+            // Functional proof it is not read-only: a write must succeed (the
+            // pre-fix failure path looped this as a retryable apply_loaded_db
+            // error). Load fresh, transact a second commit, query the union.
+            let dst_handle = dst_fluree.ledger(dst_ledger).await.expect("load restored");
+            let write = json!({
+                "@context": {"ex": "http://example.org/ns/"},
+                "@id": "ex:carol", "@type": "ex:User", "ex:name": "Carol"
+            });
+            let committed2 = dst_fluree
+                .insert(dst_handle, &write)
+                .await
+                .expect("write to restored ledger must succeed (not read-only)");
+            assert_eq!(committed2.receipt.t, 2, "second commit lands at t=2");
+
+            let query = json!({
+                "select": ["?name"],
+                "where": { "@id": "?s", "@type": "ex:User", "ex:name": "?name" },
+                "orderBy": "?name",
+                "@context": {"ex": "http://example.org/ns/"}
+            });
+            let db2 = fluree_db_api::GraphDb::from_ledger_state(&committed2.ledger);
+            let out = dst_fluree
+                .query(&db2, &query)
+                .await
+                .expect("query restored + written ledger")
+                .to_jsonld(&committed2.ledger.snapshot)
+                .expect("to_jsonld");
+            assert_eq!(
+                out.as_array().expect("array").len(),
+                3,
+                "restored two users + one written user = three"
+            );
+        })
+        .await;
+}
+
+/// A truncated archive (missing the End frame) must fail and leave no ledger
+/// behind — the half-created ledger is rolled back.
+#[tokio::test]
+async fn flpack_restore_rolls_back_on_truncated_stream() {
+    let dst_dir = tempfile::TempDir::new().expect("dst tempdir");
+    let src_dir = tempfile::TempDir::new().expect("src tempdir");
+    let src_ledger = "flpack-test/rollback-source:main";
+    let dst_ledger = "flpack-test/rollback-restored:main";
+
+    let src_fluree = FlureeBuilder::file(src_dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build source");
+    let src_db = fluree_db_core::LedgerSnapshot::genesis(src_ledger);
+    let src_state = fluree_db_api::LedgerState::new(src_db, fluree_db_api::Novelty::new(0));
+    let insert = json!({
+        "@context": {"ex": "http://example.org/ns/"},
+        "@id": "ex:test", "ex:value": "hello"
+    });
+    src_fluree.insert(src_state, &insert).await.expect("insert");
+
+    let mut pack_bytes = export_ledger_to_bytes(&src_fluree, src_ledger).await;
+    // Lop off the trailing End frame (and a bit more) to simulate truncation.
+    pack_bytes.truncate(pack_bytes.len() / 2);
+
+    let dst_fluree = FlureeBuilder::file(dst_dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build destination");
+    let mut reader = std::io::Cursor::new(pack_bytes);
+    let err = dst_fluree.restore_ledger(dst_ledger, &mut reader).await;
+    assert!(err.is_err(), "truncated archive should fail");
+
+    // Rollback hard-drops the half-created ledger. A drop leaves a retracted
+    // tombstone rather than purging the nameservice entry, so the guarantee is
+    // "no live ledger": the record is either absent or marked retracted (never
+    // a queryable head pointing at partially-ingested data).
+    let record = dst_fluree
+        .nameservice()
+        .lookup(dst_ledger)
+        .await
+        .expect("lookup");
+    assert!(
+        record.is_none_or(|r| r.retracted),
+        "failed restore must leave no live ledger (rolled back / retracted)"
+    );
+}
+
 /// Verify that the pack stream can be decoded frame-by-frame.
 #[tokio::test]
 async fn flpack_stream_structure_is_valid() {

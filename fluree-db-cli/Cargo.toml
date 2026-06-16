@@ -93,14 +93,14 @@ rand.workspace = true
 sha2.workspace = true
 
 # Remote ledger client (track mode) + OIDC discovery/exchange
-reqwest = { workspace = true }
+# `stream` enables streaming a .flpack file body to POST /import without
+# buffering the whole archive; `tokio-util` io gives ReaderStream for it.
+reqwest = { workspace = true, features = ["stream"] }
+tokio-util = { version = "0.7", features = ["io"] }
 bytes.workspace = true
 urlencoding = { workspace = true }
 percent-encoding = "2"
 open = "5"
-
-# Memory-mapped file I/O (flpack import)
-memmap2 = "0.9"
 
 # Sync command dependencies
 fluree-db-nameservice-sync = { path = "../fluree-db-nameservice-sync" }
