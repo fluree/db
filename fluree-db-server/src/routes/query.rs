@@ -639,7 +639,7 @@ pub async fn query(
             }
         }
 
-        let min_t_requirements = collect_sparql_min_t_requirements(&headers, &sparql, None);
+        let min_t_requirements = collect_sparql_min_t_requirements(headers.min_t, &sparql, None)?;
         if min_t_requirements.is_empty() {
             if let Ok(ledger_ids) = fluree_db_api::sparql_dataset_ledger_ids(&sparql) {
                 maybe_refresh_query_ledgers(state.as_ref(), ledger_ids).await;
@@ -990,7 +990,8 @@ pub async fn query_ledger(
             headers.identity.as_deref(),
         )
         .await;
-        let min_t_requirements = collect_sparql_min_t_requirements(&headers, &sparql, Some(&ledger));
+        let min_t_requirements =
+            collect_sparql_min_t_requirements(headers.min_t, &sparql, Some(&ledger))?;
         await_query_min_t_requirements(state.as_ref(), min_t_requirements).await?;
         return execute_sparql_ledger(
             &state,
@@ -1202,7 +1203,7 @@ pub async fn explain_ledger(
                 }
 
                 let min_t_requirements =
-                    collect_sparql_min_t_requirements(&headers, &sparql, Some(&ledger));
+                    collect_sparql_min_t_requirements(headers.min_t, &sparql, Some(&ledger))?;
                 await_query_min_t_requirements(state.as_ref(), min_t_requirements).await?;
 
                 // Route through the connection-explain path so the time-travel
@@ -1221,7 +1222,7 @@ pub async fn explain_ledger(
             }
 
             let min_t_requirements =
-                collect_sparql_min_t_requirements(&headers, &sparql, Some(&ledger));
+                collect_sparql_min_t_requirements(headers.min_t, &sparql, Some(&ledger))?;
             await_query_min_t_requirements(state.as_ref(), min_t_requirements).await?;
 
             let ledger_id = ledger.clone();
@@ -1619,10 +1620,18 @@ fn collect_jsonld_min_t_requirements(
 }
 
 fn collect_sparql_min_t_requirements(
-    headers: &FlureeHeaders,
+    header_min_t: Option<i64>,
     sparql: &str,
     default_ledger: Option<&str>,
-) -> BTreeMap<String, i64> {
+) -> Result<BTreeMap<String, i64>> {
+    // A min-t requirement can only come from a `Fluree-Min-T` header or an
+    // `@t:` snapshot pin in the query. When neither is present there is nothing
+    // to collect, so skip the SPARQL parses below — ordinary current-head
+    // traffic must not pay the freshness feature's parse cost on every request.
+    if header_min_t.is_none() && !sparql.contains("@t:") {
+        return Ok(BTreeMap::new());
+    }
+
     let mut requirements = BTreeMap::new();
     let ledger_ids = fluree_db_api::sparql_dataset_ledger_ids(sparql).unwrap_or_default();
 
@@ -1656,10 +1665,18 @@ fn collect_sparql_min_t_requirements(
         }
     }
 
-    if let Some(min_t) = headers.min_t {
+    if let Some(min_t) = header_min_t {
         if ledger_ids.is_empty() {
-            if let Some(ledger_id) = default_ledger {
-                merge_min_t_requirement(&mut requirements, ledger_id, min_t);
+            match default_ledger {
+                Some(ledger_id) => merge_min_t_requirement(&mut requirements, ledger_id, min_t),
+                // A read-after-write header with no resolvable ledger would be
+                // silently dropped; fail fast instead so the guarantee is never
+                // quietly ignored.
+                None => {
+                    return Err(ServerError::bad_request(
+                        "Fluree-Min-T requires a target ledger; add a FROM clause or use a ledger-scoped endpoint",
+                    ));
+                }
             }
         } else {
             for ledger_id in ledger_ids {
@@ -1668,7 +1685,7 @@ fn collect_sparql_min_t_requirements(
         }
     }
 
-    requirements
+    Ok(requirements)
 }
 
 fn looks_like_graph_selector_only(s: &str) -> bool {
@@ -1796,9 +1813,27 @@ mod ledger_scoped_from_tests {
         };
         let sparql = "SELECT * FROM <books:main@t:42> WHERE { ?s ?p ?o }";
 
-        let requirements = collect_sparql_min_t_requirements(&headers, sparql, None);
+        let requirements = collect_sparql_min_t_requirements(headers.min_t, sparql, None).unwrap();
 
         assert_eq!(requirements.get("books:main"), Some(&42));
+    }
+
+    #[test]
+    fn sparql_min_t_header_without_target_ledger_errors() {
+        let sparql = "SELECT * WHERE { ?s ?p ?o }";
+
+        let result = collect_sparql_min_t_requirements(Some(15), sparql, None);
+
+        assert!(result.is_err(), "min-t header with no ledger must error");
+    }
+
+    #[test]
+    fn sparql_min_t_without_header_or_pin_skips_collection() {
+        let sparql = "SELECT * WHERE { ?s ?p ?o }";
+
+        let requirements = collect_sparql_min_t_requirements(None, sparql, None).unwrap();
+
+        assert!(requirements.is_empty());
     }
 
     #[test]
@@ -2942,7 +2977,7 @@ pub async fn explain(
             }
 
             let min_t_requirements =
-                collect_sparql_min_t_requirements(&headers, &sparql, Some(&ledger_id));
+                collect_sparql_min_t_requirements(headers.min_t, &sparql, Some(&ledger_id))?;
             await_query_min_t_requirements(state.as_ref(), min_t_requirements).await?;
 
             // If FROM carries a time-travel suffix, route through the
@@ -3395,8 +3430,11 @@ fn collect_multi_query_min_t_requirements(
             }
             SubqueryLanguage::Sparql => {
                 if let Some(sparql) = sub.query.as_str() {
+                    // The envelope already applied any `Fluree-Min-T` header to
+                    // every distinct ledger; the sub-collector only needs to pick
+                    // up per-query `@t:` pins, so pass no header here.
                     let mut sub_requirements =
-                        collect_sparql_min_t_requirements(headers, sparql, None);
+                        collect_sparql_min_t_requirements(None, sparql, None)?;
                     if let Some(min_t) = sub_min_t {
                         if let Ok(ledgers) = fluree_db_api::sparql_dataset_ledger_ids(sparql) {
                             for ledger_id in ledgers {

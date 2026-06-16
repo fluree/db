@@ -193,6 +193,8 @@ Before executing the request, the server refreshes the referenced ledger(s) unti
 
 Numeric time-travel snapshots such as `from: "ledger:main@t:42"` also wait until that `t` is visible, then query that pinned snapshot. `Fluree-Min-T` is useful when the query itself reads current HEAD but must not run until a known transaction has arrived.
 
+The header must resolve to at least one target ledger. On a ledger-scoped endpoint the endpoint's ledger is used; on the connection-scoped query endpoint the target comes from the query's `FROM` clause. Sending `Fluree-Min-T` to the connection-scoped endpoint with no `FROM` (and no other resolvable ledger) is rejected with `400 Bad Request` rather than silently ignored.
+
 ## Response Headers
 
 ### Content-Type
