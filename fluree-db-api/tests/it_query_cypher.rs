@@ -3238,6 +3238,92 @@ async fn cypher_ic14_faithful_ldbc_weight() {
 }
 
 #[tokio::test]
+async fn cypher_ic14_equal_weight_paths_stay_separate() {
+    // Regression: when two distinct shortest paths score the SAME pathWeight,
+    // the final `collect(pn.id)` must NOT merge them. Grouping by `pathWeight`
+    // alone (the only non-aggregate key) fuses their node lists into one
+    // concatenated row. Projecting the path `p` as an extra grouping key keeps
+    // them separate. This is the shape validated against the real LDBC golden;
+    // a distinct-weight fixture (cypher_ic14_faithful_ldbc_weight) can't catch
+    // the fusion because the weights already separate the rows.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/cypher:ic14-equal-weight");
+    let person = |id: &str, knows: JsonValue| json!({"@id": format!("ex:{id}"), "@type":"ex:Person", "ex:pid": id, "ex:KNOWS": knows});
+    let comment = |c: &str, creator: &str, target: &str| {
+        json!({"@id": format!("ex:{c}"), "@type":"ex:Comment",
+               "ex:HAS_CREATOR":{"@id":format!("ex:{creator}")},
+               "ex:REPLY_OF":{"@id":format!("ex:{target}")}})
+    };
+    let post = |m: &str, creator: &str| {
+        json!({"@id": format!("ex:{m}"), "@type":"ex:Post",
+               "ex:HAS_CREATOR":{"@id":format!("ex:{creator}")}})
+    };
+    // Diamond p0-p1-p3 / p0-p2-p3; each route scores exactly 1.0:
+    //   (p0,p1): p0 comment → p1 post (1.0); (p1,p3): none  → path 1.0
+    //   (p2,p3): p2 comment → p3 post (1.0); (p0,p2): none  → path 1.0
+    let graph = json!([
+        person("p0", json!([{"@id":"ex:p1"},{"@id":"ex:p2"}])),
+        person("p1", json!([{"@id":"ex:p3"}])),
+        person("p2", json!([{"@id":"ex:p3"}])),
+        person("p3", json!([])),
+        post("post_p1", "p1"),
+        comment("c_p0", "p0", "post_p1"),
+        post("post_p3", "p3"),
+        comment("c_p2", "p2", "post_p3"),
+    ]);
+    let l = fluree
+        .insert(ledger0, &json!({"@context": ctx(), "@graph": graph}))
+        .await
+        .expect("seed equal-weight diamond")
+        .ledger;
+    let db = graphdb_from_ledger(&l);
+
+    let out = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (a:Person {pid:"p0"}),(z:Person {pid:"p3"})
+               MATCH p = allShortestPaths((a)-[:KNOWS*0..]-(z))
+               UNWIND pathPairs(p) AS pair
+               WITH p, pair[0] AS x, pair[1] AS y
+               OPTIONAL MATCH (x)<-[:HAS_CREATOR]-(cp1:Comment)-[:REPLY_OF]->(:Post)-[:HAS_CREATOR]->(y)
+               OPTIONAL MATCH (y)<-[:HAS_CREATOR]-(cp2:Comment)-[:REPLY_OF]->(:Post)-[:HAS_CREATOR]->(x)
+               WITH p, x, y, count(DISTINCT cp1) * 1.0 + count(DISTINCT cp2) * 1.0 AS pairWeight
+               WITH p, sum(pairWeight) AS pathWeight
+               UNWIND nodes(p) AS pn
+               RETURN collect(pn.pid) AS personIdsInPath, pathWeight, p
+               ORDER BY pathWeight DESC"#,
+        )
+        .await
+        .expect("ic14 equal-weight")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    // Two separate 3-node paths, each weight 1.0 — NOT one fused 6-node row.
+    let mut paths: Vec<Vec<String>> = out
+        .as_array()
+        .expect("rows")
+        .iter()
+        .map(|r| {
+            assert_eq!(r[1], json!(1.0), "each path weight 1.0: {out}");
+            r[0].as_array()
+                .unwrap()
+                .iter()
+                .map(|n| n.as_str().unwrap().to_string())
+                .collect()
+        })
+        .collect();
+    paths.sort();
+    assert_eq!(
+        paths,
+        vec![
+            vec!["p0".to_string(), "p1".to_string(), "p3".to_string()],
+            vec!["p0".to_string(), "p2".to_string(), "p3".to_string()],
+        ],
+        "equal-weight paths stay separate, not fused: {out}"
+    );
+}
+
+#[tokio::test]
 async fn cypher_ic14_paths_as_name_lists() {
     // IC14 core, full form: every shortest connection path between two persons,
     // returned as a list of the persons' names — `UNWIND nodes(p)` + per-path
