@@ -4,9 +4,9 @@
 
 use clap::{CommandFactory, FromArgMatches};
 use fluree_db_server::{
-    FlureeServer, ServerConfig,
     config_file::{config_error_is_fatal, load_and_merge_config},
-    telemetry::{TelemetryConfig, init_logging, shutdown_tracer},
+    telemetry::{init_logging, shutdown_tracer, TelemetryConfig},
+    FlureeServer, ServerConfig,
 };
 
 #[tokio::main]
