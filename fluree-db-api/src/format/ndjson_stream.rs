@@ -71,10 +71,10 @@ pub fn end_record(rows: u64, t: Option<i64>, fuel: Option<f64>, time: Option<&st
 /// `error` record: failure terminator. Carries the rows already emitted so the
 /// client knows how far the (now-aborted) stream got. Emitted *instead of*
 /// `end` — never both, never a row after it.
-pub fn error_record(message: &str, rows: u64) -> String {
+pub fn error_record(code: &str, message: &str, rows: u64) -> String {
     let mut line = json!({
         "type": "error",
-        "error": { "message": message },
+        "error": { "code": code, "message": message },
         "rows": rows,
     })
     .to_string();
@@ -126,9 +126,10 @@ mod tests {
     }
 
     #[test]
-    fn error_reports_partial_rows() {
-        let v = parse(&error_record("fuel limit exceeded", 50213));
+    fn error_reports_code_and_partial_rows() {
+        let v = parse(&error_record("fuel_exhausted", "fuel limit exceeded", 50213));
         assert_eq!(v["type"], "error");
+        assert_eq!(v["error"]["code"], "fuel_exhausted");
         assert_eq!(v["error"]["message"], "fuel limit exceeded");
         assert_eq!(v["rows"], 50213);
     }

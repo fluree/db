@@ -529,6 +529,32 @@ async fn bearer_scope_enforced_on_stream() {
     assert_eq!(records.last().unwrap()["rows"], 1);
 }
 
+/// A fuel overrun surfaces as a terminal `error` record carrying a
+/// machine-readable `code`. A `max-fuel` below the 1.0 floor trips the floor
+/// charge before any row, so the stream is a single error terminal (the 200 is
+/// already committed when the body starts).
+#[tokio::test]
+async fn fuel_overrun_emits_error_code_terminal() {
+    let (_tmp, state) = test_state().await;
+    let app = build_router(state);
+    create_ledger(&app, "strm:fuel").await;
+    insert_name(&app, "strm:fuel", "ex:x", "Xavier").await;
+
+    let query = json!({
+        "@context": { "ex": "http://example.org/" },
+        "opts": { "max-fuel": 0.5 },
+        "select": ["?name"],
+        "where": { "@id": "?s", "ex:name": "?name" }
+    });
+    let resp = stream_jsonld(&app, "strm:fuel", &query).await;
+    let (status, _ct, records) = ndjson_records(resp).await;
+    assert_eq!(status, StatusCode::OK, "stream is committed before execution");
+
+    let terminal = records.last().expect("a terminal record");
+    assert_eq!(terminal["type"], "error");
+    assert_eq!(terminal["error"]["code"], "fuel_exhausted");
+}
+
 #[tokio::test]
 async fn unknown_ledger_streams_error_terminal_or_4xx() {
     let (_tmp, state) = test_state().await;

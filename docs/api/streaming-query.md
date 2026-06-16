@@ -62,7 +62,7 @@ The response is a stream of newline-terminated JSON objects, one per line. The
 | `row` | `{"type":"row","row":{ ... }}` | One result row. The `row` body is a [SPARQL-Results-JSON binding object](https://www.w3.org/TR/sparql11-results-json/) (`{"name":{"type":"literal","value":"Alice"}}`) — byte-identical to the `bindings` entries `/query` would return. |
 | `heartbeat` | `{"type":"heartbeat","t_ms":14982,"fuel":84.213}` | Keep-alive emitted during stalls. `fuel` is present only when fuel tracking is active. |
 | `end` | `{"type":"end","rows":2,"t":42,"fuel":1.01,"time":"3.4ms"}` | **Success terminator.** Final row count plus `t`/`fuel`/`time` when tracked. |
-| `error` | `{"type":"error","error":{"message":"..."},"rows":1}` | **Failure terminator.** Carries rows emitted before the failure. Emitted *instead of* `end`. |
+| `error` | `{"type":"error","error":{"code":"timeout","message":"..."},"rows":1}` | **Failure terminator.** Carries a machine-readable `code` (see below), a human `message`, and rows emitted before the failure. Emitted *instead of* `end`. |
 
 Example stream:
 
@@ -85,6 +85,26 @@ network failure, server crash), the bytes received so far are
 indistinguishable from a complete result *unless* you require the explicit
 terminator. Do not assume "connection closed cleanly" means "all rows
 received" — require `end`.
+
+### Error codes
+
+The `error` record's `error.code` is a stable, machine-readable string so
+clients can branch on the failure kind without parsing the message:
+
+| `code` | Meaning |
+|--------|---------|
+| `timeout` | The server query timeout fired (the query ran too long). |
+| `fuel_exhausted` | The query exceeded its `max-fuel` budget. |
+| `cancelled` | The query was cancelled (e.g. the client disconnected). |
+| `invalid_query` | The query was rejected at plan/validation time. |
+| `resource_limit` | A non-fuel resource limit was hit. |
+| `internal` | An unexpected server-side error. |
+
+A `code` you don't recognize should be treated as a generic failure. Note that
+because the `200 OK` is committed before execution, even a request that fails
+the fuel floor immediately is reported as a single `error` terminal on a `200`
+stream — not as a `4xx`. (`4xx` is reserved for failures detected *before* the
+stream starts: parse errors and [unsupported shapes](#unsupported-shapes).)
 
 ### Heartbeats
 

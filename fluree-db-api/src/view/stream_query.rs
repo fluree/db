@@ -141,6 +141,7 @@ impl Fluree {
         if let Err(e) = crate::query::helpers::charge_query_floor(&tracker) {
             let _ = tx
                 .send(bytes::Bytes::from(ndjson_stream::error_record(
+                    "fuel_exhausted",
                     &e.to_string(),
                     0,
                 )))
@@ -195,7 +196,9 @@ impl Fluree {
                 tracker.current_fuel(),
                 tracker.tally().and_then(|t| t.time).as_deref(),
             ),
-            Err(err) => ndjson_stream::error_record(&err.to_string(), sink.rows),
+            Err(err) => {
+                ndjson_stream::error_record(query_error_code(&err), &err.to_string(), sink.rows)
+            }
         };
         let _ = tx.send(Bytes::from(terminal)).await;
     }
@@ -320,7 +323,11 @@ impl Fluree {
     ) {
         if let Err(e) = crate::query::helpers::charge_query_floor(&tracker) {
             let _ = tx
-                .send(Bytes::from(ndjson_stream::error_record(&e.to_string(), 0)))
+                .send(Bytes::from(ndjson_stream::error_record(
+                    "fuel_exhausted",
+                    &e.to_string(),
+                    0,
+                )))
                 .await;
             return;
         }
@@ -328,6 +335,7 @@ impl Fluree {
         let Some(primary) = dataset.primary() else {
             let _ = tx
                 .send(Bytes::from(ndjson_stream::error_record(
+                    "internal",
                     "dataset has no graphs",
                     0,
                 )))
@@ -390,9 +398,37 @@ impl Fluree {
                 tracker.current_fuel(),
                 tracker.tally().and_then(|t| t.time).as_deref(),
             ),
-            Err(err) => ndjson_stream::error_record(&err.to_string(), sink.rows),
+            Err(err) => {
+                ndjson_stream::error_record(api_error_code(&err), &err.to_string(), sink.rows)
+            }
         };
         let _ = tx.send(Bytes::from(terminal)).await;
+    }
+}
+
+/// Machine-readable terminal `error` code for a query-engine error, so clients
+/// can distinguish a timeout from fuel exhaustion from an invalid query.
+fn query_error_code(e: &fluree_db_query::QueryError) -> &'static str {
+    use fluree_db_core::QueryCancellationReason as Reason;
+    use fluree_db_query::QueryError as QE;
+    match e {
+        QE::FuelLimitExceeded(_) => "fuel_exhausted",
+        QE::Cancelled {
+            reason: Reason::Timeout,
+        } => "timeout",
+        QE::Cancelled { .. } => "cancelled",
+        QE::ResourceLimit(_) => "resource_limit",
+        QE::InvalidQuery(_) | QE::InvalidFilter(_) | QE::InvalidExpression(_) => "invalid_query",
+        _ => "internal",
+    }
+}
+
+/// Terminal `error` code for the dataset path, whose errors are `ApiError`
+/// (usually wrapping a `QueryError`).
+fn api_error_code(e: &ApiError) -> &'static str {
+    match e {
+        ApiError::Query(qe) => query_error_code(qe),
+        _ => "internal",
     }
 }
 
