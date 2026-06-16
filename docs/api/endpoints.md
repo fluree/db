@@ -1296,12 +1296,12 @@ curl -N -X POST http://localhost:8090/v1/fluree/stream/query/my/ledger \
 
 The response is one self-describing JSON record per line (`head` → `row`* with
 interleaved `heartbeat`s → a terminal `end` or `error`). SELECT only; ASK,
-CONSTRUCT/DESCRIBE, `selectOne`, hydration, history (`to`), and SPARQL
-`FROM`/policy are rejected with `4xx`. JSON-LD policy/`from`/multi-ledger
-queries are enforced identically to `/query`. See
-**[Streaming query (NDJSON)](streaming-query.md)** for the full record
-protocol, the terminal-record (truncation) contract, policy behavior, and
-client examples.
+CONSTRUCT/DESCRIBE, `selectOne`, hydration, and history (JSON-LD `to` / SPARQL
+`FROM … TO …`) are rejected with `4xx`. Policy, `from`/`fromNamed`, SPARQL
+`FROM`, and multi-ledger queries (JSON-LD and SPARQL) are enforced identically
+to `/query`. See **[Streaming query (NDJSON)](streaming-query.md)** for the full
+record protocol, the terminal-record (truncation) contract, policy behavior,
+and client examples.
 
 ### POST /multi-query
 

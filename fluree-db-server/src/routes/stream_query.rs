@@ -105,35 +105,92 @@ async fn stream_query_inner(
                 return Err(ServerError::not_found("Ledger not found"));
             }
         }
-        // SPARQL streaming has no per-request policy resolution yet, so refuse
-        // anything that would impose identity/policy scoping (use /query):
-        // server default policy class, an authenticated identity, or any of the
-        // `Fluree-Identity` / `Fluree-Policy*` / `Fluree-Default-Allow` headers
-        // that `/query` would fold into connection options.
-        // FROM/FROM NAMED and unsupported shapes are rejected by the planner.
-        if data_auth.default_policy_class.is_some()
-            || effective_identity(&credential, &bearer).is_some()
-            || request_carries_policy(&headers)
-        {
-            return Err(policy_unsupported());
-        }
+        // Resolve identity + policy the same way /query's SPARQL path does:
+        // SPARQL has no body `opts`, so policy arrives via the resolved identity
+        // (bearer/header), the server default policy class, and the
+        // `Fluree-Policy*` / `Fluree-Default-Allow` headers.
+        let bearer_identity = effective_identity(&credential, &bearer);
+        let identity = crate::routes::policy_auth::resolve_sparql_identity(
+            state.as_ref(),
+            &ledger,
+            bearer_identity.as_deref(),
+            headers.identity.as_deref(),
+        )
+        .await;
+        let qc_opts = crate::routes::query::sparql_qc_opts(identity.as_deref(), &headers)?;
+
+        // Detect FROM/FROM NAMED dataset clauses.
+        let parsed = fluree_db_sparql::parse_sparql(&sparql);
+        let dataset_clause = parsed.ast.as_ref().and_then(|ast| match &ast.body {
+            fluree_db_sparql::ast::QueryBody::Select(q) => q.dataset.as_ref(),
+            fluree_db_sparql::ast::QueryBody::Construct(q) => q.dataset.as_ref(),
+            fluree_db_sparql::ast::QueryBody::Ask(q) => q.dataset.as_ref(),
+            fluree_db_sparql::ast::QueryBody::Describe(q) => q.dataset.as_ref(),
+            fluree_db_sparql::ast::QueryBody::Update(_) => None,
+        });
+        let has_dataset = dataset_clause
+            .map(|d| {
+                !d.default_graphs.is_empty() || !d.named_graphs.is_empty() || d.to_graph.is_some()
+            })
+            .unwrap_or(false);
+
         // Freshness barrier parity with /query (header / `@t:` min-t).
         let min_t = collect_sparql_min_t_requirements(headers.min_t, &sparql, Some(&ledger))?;
         await_query_min_t_requirements(state.as_ref(), min_t).await?;
 
-        let input = OwnedStreamQuery::Sparql(sparql);
-        let ledger_state = load_ledger_for_query(state.as_ref(), &ledger, &span).await?;
-        let plan = {
-            let graph = GraphDb::from_ledger_state(&ledger_state);
-            fluree
-                .plan_stream_query(&graph, &input)
+        if qc_opts.has_any_policy_inputs() || has_dataset {
+            // Policy and/or FROM → connection/dataset streaming path (enforces
+            // policy exactly like /query). History range FROM..TO is a distinct
+            // path neither streaming path implements.
+            if dataset_clause.and_then(|d| d.to_graph.as_ref()).is_some() {
+                return Err(ServerError::bad_request(
+                    "SPARQL history range (FROM <...> TO <...>) is not supported on the \
+                     streaming endpoint; use /v1/fluree/query",
+                ));
+            }
+            let spec = if has_dataset {
+                crate::routes::query::ledger_scoped_sparql_dataset_spec(
+                    &ledger,
+                    dataset_clause.expect("has_dataset implies a clause"),
+                )?
+            } else {
+                let mut spec = fluree_db_api::DatasetSpec::new();
+                spec.default_graphs.push(
+                    fluree_db_api::GraphSource::new(&ledger)
+                        .with_graph(fluree_db_api::dataset::GraphSelector::Default),
+                );
+                spec
+            };
+            // Ensure the head is fresh before view loading (shared storage).
+            if !state.config.is_proxy_storage_mode() {
+                let _ = load_ledger_for_query(state.as_ref(), &ledger, &span).await?;
+            }
+            let dataset = fluree
+                .build_stream_dataset_from_spec(&spec, &qc_opts)
                 .await
-                .map_err(ServerError::Api)?
-        };
-        (
-            StreamPlan::Single { ledger_state, plan },
-            stream_tracker(None),
-        )
+                .map_err(ServerError::Api)?;
+            let input = OwnedStreamQuery::Sparql(sparql);
+            let plan = fluree
+                .plan_stream_query_dataset(&dataset, &input)
+                .await
+                .map_err(ServerError::Api)?;
+            (StreamPlan::Dataset { dataset, plan }, stream_tracker(None))
+        } else {
+            // Plain single-ledger SPARQL (no policy, no FROM).
+            let input = OwnedStreamQuery::Sparql(sparql);
+            let ledger_state = load_ledger_for_query(state.as_ref(), &ledger, &span).await?;
+            let plan = {
+                let graph = GraphDb::from_ledger_state(&ledger_state);
+                fluree
+                    .plan_stream_query(&graph, &input)
+                    .await
+                    .map_err(ServerError::Api)?
+            };
+            (
+                StreamPlan::Single { ledger_state, plan },
+                stream_tracker(None),
+            )
+        }
     } else {
         let mut query_json: JsonValue = credential.body_json()?;
 
@@ -264,26 +321,6 @@ enum StreamPlan {
         dataset: DataSetDb,
         plan: StreamDatasetPlan,
     },
-}
-
-/// True if the request carries any policy-scoping signal `/query` would fold
-/// into connection options: `Fluree-Identity`, `Fluree-Policy`,
-/// `Fluree-Policy-Class`, `Fluree-Policy-Values`, or `Fluree-Default-Allow`.
-fn request_carries_policy(headers: &FlureeHeaders) -> bool {
-    headers.identity.is_some()
-        || headers.policy.is_some()
-        || !headers.policy_class.is_empty()
-        || headers.policy_values.is_some()
-        || headers.default_allow
-}
-
-/// Error for query shapes whose policy scoping the streaming endpoint cannot
-/// enforce as strongly as `/query`.
-fn policy_unsupported() -> ServerError {
-    ServerError::bad_request(
-        "identity/policy-scoped queries are not supported on the streaming endpoint; \
-         use /v1/fluree/query",
-    )
 }
 
 /// A fuel + time tracker for the streaming endpoint, honoring any `max-fuel`

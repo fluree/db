@@ -280,6 +280,18 @@ impl Fluree {
         self.build_dataset_for_connection(&spec, &qc_opts).await
     }
 
+    /// Build a policy-wrapped `DataSetDb` from an explicit spec + connection
+    /// options. Used by the streaming SPARQL path, where the server builds the
+    /// `DatasetSpec` from `FROM`/`FROM NAMED` clauses and the
+    /// `QueryConnectionOptions` from the resolved identity + policy headers.
+    pub async fn build_stream_dataset_from_spec(
+        &self,
+        spec: &crate::DatasetSpec,
+        qc_opts: &crate::QueryConnectionOptions,
+    ) -> Result<DataSetDb> {
+        self.build_dataset_for_connection(spec, qc_opts).await
+    }
+
     /// Parse, validate, and plan a streaming SELECT against a dataset. SPARQL
     /// FROM/FROM NAMED are allowed here (validated at dataset build); the
     /// unsupported shapes ([`ensure_streamable`]) are still rejected.

@@ -316,27 +316,60 @@ async fn history_to_query_rejected() {
     );
 }
 
+/// A SPARQL `FROM` clause is no longer rejected — it routes through the
+/// connection/dataset streaming path (FROM selects graphs within the ledger).
 #[tokio::test]
-async fn sparql_policy_header_rejected() {
+async fn sparql_from_clause_streams() {
     let (_tmp, state) = test_state().await;
     let app = build_router(state);
-    create_ledger(&app, "strm:pol").await;
-    insert_name(&app, "strm:pol", "ex:x", "Xavier").await;
+    create_ledger(&app, "strm:from").await;
+    insert_name(&app, "strm:from", "ex:x", "Xavier").await;
+    insert_name(&app, "strm:from", "ex:y", "Yolanda").await;
 
-    // A SPARQL request carrying a policy header must be refused (the streaming
-    // SPARQL path has no per-request policy resolution) rather than running the
-    // raw unpoliced plan.
     let resp = stream_sparql(
         &app,
-        "strm:pol",
-        "SELECT ?name WHERE { ?s <http://example.org/name> ?name }",
-        Some(("fluree-policy-class", "http://example.org/RestrictedPolicy")),
+        "strm:from",
+        "SELECT ?name FROM <strm:from> WHERE { ?s <http://example.org/name> ?name }",
+        None,
     )
     .await;
+    let (status, _ct, records) = ndjson_records(resp).await;
+    assert_eq!(status, StatusCode::OK, "SPARQL FROM streams (not refused)");
+    assert_eq!(records.last().unwrap()["type"], "end");
     assert_eq!(
-        resp.status(),
-        StatusCode::BAD_REQUEST,
-        "SPARQL + policy header is refused"
+        records.iter().filter(|r| r["type"] == "row").count(),
+        2,
+        "both rows stream via the dataset path"
+    );
+}
+
+/// A SPARQL request carrying a `Fluree-Policy-Class` header is enforced (not
+/// refused): it routes through the connection/dataset streaming path with the
+/// policy applied, so only rows the class permits are streamed.
+#[tokio::test]
+async fn sparql_policy_class_header_enforced() {
+    let (_tmp, state) = policy_state().await;
+    let app = build_router(state);
+    setup_policy_ledger(&app, "strm:sparql-pol").await;
+
+    let resp = stream_sparql(
+        &app,
+        "strm:sparql-pol",
+        "SELECT ?name WHERE { ?d <http://example.org/name> ?name }",
+        Some(("fluree-policy-class", "http://example.org/PublicClass")),
+    )
+    .await;
+    let (status, _ct, records) = ndjson_records(resp).await;
+    assert_eq!(status, StatusCode::OK, "SPARQL + policy header streams");
+    let names: Vec<&str> = records
+        .iter()
+        .filter(|r| r["type"] == "row")
+        .filter_map(|r| r["row"]["name"]["value"].as_str())
+        .collect();
+    assert_eq!(
+        names,
+        vec!["Public"],
+        "policy-class header filters to the public doc"
     );
 }
 
@@ -373,19 +406,14 @@ async fn insert(app: &axum::Router, ledger: &str, tx: &JsonValue) {
     assert_eq!(resp.status(), StatusCode::OK, "insert into {ledger}");
 }
 
-/// Policy enforcement must apply on the streaming path: a query carrying
-/// `opts.identity` upgrades to the connection/dataset streaming path, which
-/// enforces the identity's policy class — so a restricted identity streams
-/// fewer rows than an unrestricted one.
-#[tokio::test]
-async fn policy_identity_filters_streamed_rows() {
-    let (_tmp, state) = policy_state().await;
-    let app = build_router(state);
-    create_ledger(&app, "strm:pol-enf").await;
-
+/// Create a ledger with three classification-tagged docs and per-class
+/// policies (`ex:PublicClass` → public only, `ex:ManagerClass` → f:allow true)
+/// plus identity→class bindings. Shared by the JSON-LD and SPARQL policy tests.
+async fn setup_policy_ledger(app: &axum::Router, ledger: &str) {
+    create_ledger(app, ledger).await;
     insert(
-        &app,
-        "strm:pol-enf",
+        app,
+        ledger,
         &json!({
             "@context": { "ex": "http://example.org/" },
             "insert": [
@@ -397,8 +425,8 @@ async fn policy_identity_filters_streamed_rows() {
     )
     .await;
     insert(
-        &app,
-        "strm:pol-enf",
+        app,
+        ledger,
         &json!({
             "@context": { "f": "https://ns.flur.ee/db#", "ex": "http://example.org/" },
             "insert": [
@@ -426,6 +454,17 @@ async fn policy_identity_filters_streamed_rows() {
         }),
     )
     .await;
+}
+
+/// Policy enforcement must apply on the streaming path: a query carrying
+/// `opts.identity` upgrades to the connection/dataset streaming path, which
+/// enforces the identity's policy class — so a restricted identity streams
+/// fewer rows than an unrestricted one.
+#[tokio::test]
+async fn policy_identity_filters_streamed_rows() {
+    let (_tmp, state) = policy_state().await;
+    let app = build_router(state);
+    setup_policy_ledger(&app, "strm:pol-enf").await;
 
     let docs_query = |identity: &str| {
         json!({

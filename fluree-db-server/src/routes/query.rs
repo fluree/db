@@ -2169,6 +2169,140 @@ async fn execute_query_proxy(
     Ok((HeaderMap::new(), Json(result)).into_response())
 }
 
+/// Build `QueryConnectionOptions` for a ledger-scoped SPARQL request from the
+/// resolved identity plus header-supplied policy fields. SPARQL has no body
+/// `opts` block, so headers are the only transport for `policy-class`,
+/// `policy`, `policy-values`, and `default-allow`.
+pub(crate) fn sparql_qc_opts(
+    identity: Option<&str>,
+    headers: &FlureeHeaders,
+) -> Result<fluree_db_api::QueryConnectionOptions> {
+    let policy_values_map = headers.policy_values_map()?;
+    Ok(fluree_db_api::QueryConnectionOptions {
+        identity: identity.map(String::from),
+        policy_class: if headers.policy_class.is_empty() {
+            None
+        } else {
+            Some(headers.policy_class.clone())
+        },
+        policy: headers.policy.clone(),
+        policy_values: policy_values_map,
+        default_allow: headers.default_allow,
+        ..Default::default()
+    })
+}
+
+/// Build a `DatasetSpec` from a ledger-scoped SPARQL `FROM`/`FROM NAMED` clause.
+///
+/// FROM/FROM NAMED select named graphs *within this ledger*: a bare graph IRI
+/// is a graph selector, a ledger-ref form (`name:branch`, `@t:`, `#frag`) must
+/// resolve to the same base ledger (else a mismatch error), and an empty
+/// default-graph clause falls back to this ledger's default graph. Shared by
+/// `/query` and the streaming endpoint so both interpret FROM identically.
+pub(crate) fn ledger_scoped_sparql_dataset_spec(
+    ledger_id: &str,
+    dc: &fluree_db_sparql::ast::DatasetClause,
+) -> Result<DatasetSpec> {
+    let base_path = base_ledger_id(ledger_id)?;
+    let mut spec = DatasetSpec::new();
+
+    let mut add_default = |raw: &str| -> Result<()> {
+        if raw == ledger_id {
+            spec.default_graphs
+                .push(GraphSource::new(ledger_id).with_graph(GraphSelector::Default));
+            return Ok(());
+        }
+        let looks_like_ledger_ref = raw.contains('@')
+            || raw.contains('#')
+            || (raw.contains(':') && !raw.contains("://") && !raw.starts_with("urn:"));
+        if looks_like_ledger_ref {
+            let (no_frag, frag) = split_graph_fragment(raw);
+            let (base, time) = fluree_db_core::ledger_id::split_time_travel_suffix(no_frag)
+                .map_err(|e| {
+                    ServerError::bad_request(format!("Invalid time travel in FROM: {e}"))
+                })?;
+            if base != base_path {
+                return Err(ServerError::bad_request(format!(
+                    "Ledger mismatch: endpoint ledger is '{ledger_id}' but SPARQL FROM targets '{raw}'"
+                )));
+            }
+            let time_spec = time.map(|t| match t {
+                fluree_db_core::ledger_id::LedgerIdTimeSpec::AtT(t) => TimeSpec::AtT(t),
+                fluree_db_core::ledger_id::LedgerIdTimeSpec::AtIso(iso) => TimeSpec::AtTime(iso),
+                fluree_db_core::ledger_id::LedgerIdTimeSpec::AtCommit(c) => TimeSpec::AtCommit(c),
+            });
+            let selector = frag
+                .map(GraphSelector::from_str)
+                .unwrap_or(GraphSelector::Default);
+            let mut src = GraphSource::new(ledger_id).with_graph(selector);
+            if let Some(ts) = time_spec {
+                src = src.with_time(ts);
+            }
+            spec.default_graphs.push(src);
+            return Ok(());
+        }
+        let selector = GraphSelector::from_str(raw);
+        spec.default_graphs
+            .push(GraphSource::new(ledger_id).with_graph(selector));
+        Ok(())
+    };
+
+    let mut add_named = |raw: &str| -> Result<()> {
+        let looks_like_ledger_ref = raw.contains('@')
+            || raw.contains('#')
+            || (raw.contains(':') && !raw.contains("://") && !raw.starts_with("urn:"));
+        if looks_like_ledger_ref {
+            let (no_frag, frag) = split_graph_fragment(raw);
+            let (base, time) = fluree_db_core::ledger_id::split_time_travel_suffix(no_frag)
+                .map_err(|e| {
+                    ServerError::bad_request(format!("Invalid time travel in FROM NAMED: {e}"))
+                })?;
+            if base != base_path {
+                return Err(ServerError::bad_request(format!(
+                    "Ledger mismatch: endpoint ledger is '{ledger_id}' but SPARQL FROM NAMED targets '{raw}'"
+                )));
+            }
+            let time_spec = time.map(|t| match t {
+                fluree_db_core::ledger_id::LedgerIdTimeSpec::AtT(t) => TimeSpec::AtT(t),
+                fluree_db_core::ledger_id::LedgerIdTimeSpec::AtIso(iso) => TimeSpec::AtTime(iso),
+                fluree_db_core::ledger_id::LedgerIdTimeSpec::AtCommit(c) => TimeSpec::AtCommit(c),
+            });
+            let selector = frag
+                .map(GraphSelector::from_str)
+                .unwrap_or(GraphSelector::Default);
+            let mut src = GraphSource::new(ledger_id)
+                .with_graph(selector)
+                .with_alias(raw);
+            if let Some(ts) = time_spec {
+                src = src.with_time(ts);
+            }
+            spec.named_graphs.push(src);
+            return Ok(());
+        }
+        let selector = GraphSelector::from_str(raw);
+        spec.named_graphs.push(
+            GraphSource::new(ledger_id)
+                .with_graph(selector)
+                .with_alias(raw),
+        );
+        Ok(())
+    };
+
+    if dc.default_graphs.is_empty() {
+        spec.default_graphs
+            .push(GraphSource::new(ledger_id).with_graph(GraphSelector::Default));
+    } else {
+        for iri in &dc.default_graphs {
+            add_default(&iri_to_string(iri))?;
+        }
+    }
+    for iri in &dc.named_graphs {
+        add_named(&iri_to_string(iri))?;
+    }
+
+    Ok(spec)
+}
+
 /// Execute a SPARQL query against a specific ledger and return result
 async fn execute_sparql_ledger(
     state: &AppState,
@@ -2214,23 +2348,10 @@ async fn execute_sparql_ledger(
         // Build QueryConnectionOptions from the resolved identity plus header-supplied
         // policy fields. SPARQL has no body `opts` block, so headers are the only
         // transport for `policy-class`, `policy`, `policy-values`, and `default-allow`.
-        let policy_values_map = headers.policy_values_map().map_err(|e| {
+        let qc_opts = sparql_qc_opts(identity, headers).inspect_err(|e| {
             set_span_error_code(&span, "error:BadRequest");
             tracing::warn!(error = %e, "invalid fluree-policy-values header");
-            e
         })?;
-        let qc_opts = fluree_db_api::QueryConnectionOptions {
-            identity: identity.map(String::from),
-            policy_class: if headers.policy_class.is_empty() {
-                None
-            } else {
-                Some(headers.policy_class.clone())
-            },
-            policy: headers.policy.clone(),
-            policy_values: policy_values_map,
-            default_allow: headers.default_allow,
-            ..Default::default()
-        };
 
         let wants_sparql_xml = headers.wants_sparql_results_xml();
         let wants_rdf_xml = headers.wants_rdf_xml();
@@ -2374,105 +2495,7 @@ async fn execute_sparql_ledger(
                 let _ = load_ledger_for_query(state, ledger_id, &span).await?;
             }
 
-            let base_path = base_ledger_id(ledger_id)?;
-
-            let mut spec = DatasetSpec::new();
-
-            let mut add_default = |raw: &str| -> Result<()> {
-                // If FROM explicitly names this ledger, treat as default graph.
-                if raw == ledger_id {
-                    spec.default_graphs.push(GraphSource::new(ledger_id).with_graph(GraphSelector::Default));
-                    return Ok(());
-                }
-
-                // If it looks like a ledger ref (name:branch or has @ / #), enforce mismatch rules.
-                let looks_like_ledger_ref = raw.contains('@')
-                    || raw.contains('#')
-                    || (raw.contains(':') && !raw.contains("://") && !raw.starts_with("urn:"));
-
-                if looks_like_ledger_ref {
-                    let (no_frag, frag) = split_graph_fragment(raw);
-                    let (base, time) = fluree_db_core::ledger_id::split_time_travel_suffix(no_frag)
-                        .map_err(|e| ServerError::bad_request(format!("Invalid time travel in FROM: {e}")))?;
-                    if base != base_path {
-                        return Err(ServerError::bad_request(format!(
-                            "Ledger mismatch: endpoint ledger is '{ledger_id}' but SPARQL FROM targets '{raw}'"
-                        )));
-                    }
-                    let time_spec = time.map(|t| match t {
-                        fluree_db_core::ledger_id::LedgerIdTimeSpec::AtT(t) => TimeSpec::AtT(t),
-                        fluree_db_core::ledger_id::LedgerIdTimeSpec::AtIso(iso) => TimeSpec::AtTime(iso),
-                        fluree_db_core::ledger_id::LedgerIdTimeSpec::AtCommit(c) => TimeSpec::AtCommit(c),
-                    });
-                    let selector = frag.map(GraphSelector::from_str).unwrap_or(GraphSelector::Default);
-                    let mut src = GraphSource::new(ledger_id).with_graph(selector);
-                    if let Some(ts) = time_spec {
-                        src = src.with_time(ts);
-                    }
-                    spec.default_graphs.push(src);
-                    return Ok(());
-                }
-
-                // Otherwise treat as a graph selector within this ledger.
-                let selector = GraphSelector::from_str(raw);
-                spec.default_graphs
-                    .push(GraphSource::new(ledger_id).with_graph(selector));
-                Ok(())
-            };
-
-            let mut add_named = |raw: &str| -> Result<()> {
-                let looks_like_ledger_ref = raw.contains('@')
-                    || raw.contains('#')
-                    || (raw.contains(':') && !raw.contains("://") && !raw.starts_with("urn:"));
-
-                if looks_like_ledger_ref {
-                    let (no_frag, frag) = split_graph_fragment(raw);
-                    let (base, time) = fluree_db_core::ledger_id::split_time_travel_suffix(no_frag)
-                        .map_err(|e| ServerError::bad_request(format!("Invalid time travel in FROM NAMED: {e}")))?;
-                    if base != base_path {
-                        return Err(ServerError::bad_request(format!(
-                            "Ledger mismatch: endpoint ledger is '{ledger_id}' but SPARQL FROM NAMED targets '{raw}'"
-                        )));
-                    }
-                    let time_spec = time.map(|t| match t {
-                        fluree_db_core::ledger_id::LedgerIdTimeSpec::AtT(t) => TimeSpec::AtT(t),
-                        fluree_db_core::ledger_id::LedgerIdTimeSpec::AtIso(iso) => TimeSpec::AtTime(iso),
-                        fluree_db_core::ledger_id::LedgerIdTimeSpec::AtCommit(c) => TimeSpec::AtCommit(c),
-                    });
-                    let selector = frag.map(GraphSelector::from_str).unwrap_or(GraphSelector::Default);
-                    let mut src = GraphSource::new(ledger_id)
-                        .with_graph(selector)
-                        .with_alias(raw);
-                    if let Some(ts) = time_spec {
-                        src = src.with_time(ts);
-                    }
-                    spec.named_graphs.push(src);
-                    return Ok(());
-                }
-
-                // Named graph selector within this ledger; alias must match query's GRAPH IRI.
-                let selector = GraphSelector::from_str(raw);
-                spec.named_graphs.push(
-                    GraphSource::new(ledger_id)
-                        .with_graph(selector)
-                        .with_alias(raw),
-                );
-                Ok(())
-            };
-
-            // Default graphs: if none specified, use this ledger's default graph.
-            if dc.default_graphs.is_empty() {
-                spec.default_graphs
-                    .push(GraphSource::new(ledger_id).with_graph(GraphSelector::Default));
-            } else {
-                for iri in &dc.default_graphs {
-                    add_default(&iri_to_string(iri))?;
-                }
-            }
-
-            for iri in &dc.named_graphs {
-                add_named(&iri_to_string(iri))?;
-            }
+            let spec = ledger_scoped_sparql_dataset_spec(ledger_id, dc)?;
 
             // Tracked dataset query: if tracking headers are present, use tracked path
             if headers.has_tracking() {

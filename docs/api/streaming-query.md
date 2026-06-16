@@ -131,37 +131,35 @@ error, not a `200` stream), and should use [`/query`](endpoints.md#post-query):
 - **`selectOne`** — single-object JSON-LD shape.
 - **JSON-LD hydration** — needs async per-row database expansion during
   formatting.
-- **History (`to`)** — a top-level JSON-LD `to` uses a distinct history
-  execution path.
-- **SPARQL `FROM` / `FROM NAMED`** and **SPARQL policy** — see below.
+- **History (`to` / `FROM … TO …`)** — top-level JSON-LD `to` and the SPARQL
+  history range use a distinct history execution path.
 
 ## Auth, policy, and dataset behavior
 
 The streaming endpoint enforces policy identically to `/query`, by routing to
-the same execution path.
+the same execution path. This applies to **both JSON-LD and SPARQL**.
 
-- **JSON-LD, no policy / single ledger** — runs the lean single-ledger path.
-- **JSON-LD with `from`/`fromNamed`, multi-ledger, or any policy input**
-  (request `opts.identity` / `opts.policy-class`, a server
-  `default_policy_class`, or `Fluree-Policy*` / `Fluree-Identity` headers) —
-  **upgrades to the connection/dataset path**, which builds a policy-wrapped
-  dataset and enforces per-graph policy exactly as `/query` does. A restricted
-  identity streams strictly fewer rows than an unrestricted one.
+- **No policy, single ledger** — runs the lean single-ledger path.
+- **`from`/`fromNamed` (JSON-LD), SPARQL `FROM`/`FROM NAMED`, multi-ledger, or
+  any policy input** — **routes to the connection/dataset path**, which builds a
+  policy-wrapped dataset and enforces per-graph policy exactly as `/query` does.
+  A restricted identity/policy-class streams strictly fewer rows than an
+  unrestricted one.
+  - JSON-LD policy inputs: `opts.identity` / `opts.policy-class`, a server
+    `default_policy_class`, or `Fluree-Policy*` / `Fluree-Identity` headers.
+  - SPARQL policy inputs: SPARQL has no body `opts`, so policy arrives via the
+    resolved identity (bearer / `Fluree-Identity`), the server
+    `default_policy_class`, and the `Fluree-Policy*` / `Fluree-Default-Allow`
+    headers. SPARQL `FROM`/`FROM NAMED` select named graphs *within* the path
+    ledger.
 - **Bearer scope** — a token must be authorized for the path ledger and every
   ledger referenced via `from`/`fromNamed`; out-of-scope requests return `404`
   (no existence leak), same as `/query`.
 - **`fluree-min-t`** freshness barriers and the stored default-context
   injection are applied before planning, matching `/query`.
 
-### SPARQL + policy is not yet supported
-
-A **SPARQL** request that carries any policy-scoping signal — a server
-`default_policy_class`, an authenticated identity, or any
-`Fluree-Identity` / `Fluree-Policy` / `Fluree-Policy-Class` /
-`Fluree-Policy-Values` / `Fluree-Default-Allow` header — is **refused** with a
-`4xx` rather than run unpoliced. SPARQL `FROM` / `FROM NAMED` is likewise
-rejected. Use [`/query`](endpoints.md#post-query) for policy-scoped or
-multi-ledger SPARQL. (JSON-LD policy streaming is fully supported, as above.)
+The only SPARQL dataset feature still rejected is the **history range**
+(`FROM <…> TO <…>`) — use [`/query`](endpoints.md#post-query) for that.
 
 ## Fuel and tracking
 
@@ -251,5 +249,6 @@ anyhow::ensure!(saw_terminal, "stream truncated before terminal record");
 
 `/stream/query/<ledger>` is purpose-built for incremental delivery; it does not
 replace [`/query`](endpoints.md#post-query). The standard endpoint remains the
-path for ASK/CONSTRUCT/DESCRIBE, hydration, history, SPARQL policy/`FROM`, and
-any client that wants a single buffered JSON (or TSV/CSV/XML) document.
+path for ASK/CONSTRUCT/DESCRIBE, hydration, history (JSON-LD `to` or SPARQL
+`FROM … TO …`), and any client that wants a single buffered JSON (or
+TSV/CSV/XML) document.
