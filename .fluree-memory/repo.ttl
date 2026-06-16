@@ -1906,13 +1906,14 @@ mem:fact-01ktcfdrpyfq8btp10mf75cmp5 a mem:Fact ;
     mem:rationale "Candidate 3 lever is scatter/sort assembly, not join grouping or DISTINCT which are already optimized." .
 
 mem:fact-01ktxag4v0tctpgwfww6dgbp2c a mem:Fact ;
-    mem:content "GraphId is now a #[repr(transparent)] newtype (was bare u16 alias) — PR #1316, audit Phase 0.1/0.2. Wire formats unchanged (#[serde(transparent)]; manual codecs use as_u16/from_u16). The migration surfaced two id-space seams the alias hid: (1) txn.graph_delta keys are TRANSACTION-LOCAL graph ids — kept raw u16 in transact; staging adopts txn-local numbering as ledger numbering at one commented GraphId() wrap in build_reverse_graph_lookup; (2) commit_transfer replay resolves ledger GraphIds but feeds envelope-keyed u16 staging APIs — now an explicit conversion. Also deleted dead pre-V3 types in binary-index src/types.rs, resolving the audit's dt-width mismatch by deletion. Bench gate: 0 breaches, scenario_mem ±0.06%." ;
+    mem:content "GraphId is now a #[repr(transparent)] newtype (was bare u16 alias) — PR #1316, audit Phase 0.1/0.2. Wire formats unchanged (#[serde(transparent)]; manual codecs + ALL path/key/CAS string interpolations use .as_u16()). Two seams the alias hid: txn.graph_delta keys are TRANSACTION-LOCAL (kept raw u16; staging adopts at one GraphId() wrap); commit_transfer replay does an explicit ledger-GraphId→u16 conversion. Also deleted dead pre-V3 types in binary-index src/types.rs (resolved the dt-width mismatch). GOTCHA (fix ffe90b60b): newtype Display is \"GraphId(N)\" not \"N\" — format!(\"g_{g_id}\") silently broke import arena dir round-trips (no NumBig arena error); feature-gated files were missed until --all-features. See newtype-display-wire-pitfall memory." ;
     mem:tag "audit" ;
+    mem:tag "gotcha" ;
     mem:tag "graphid" ;
     mem:tag "id-space" ;
     mem:tag "newtype" ;
     mem:tag "refactor" ;
-    mem:tag "txn-local" ;
+    mem:tag "wire-format" ;
     mem:scope mem:repo ;
     mem:artifactRef "fluree-db-api/src/commit_transfer.rs" ;
     mem:artifactRef "fluree-db-binary-index/src/types.rs" ;
