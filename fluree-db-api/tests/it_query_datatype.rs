@@ -279,7 +279,7 @@ async fn datatype_filter_with_datatype_function() {
 async fn datatype_function_compares_against_xsd_iri_in_sparql() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger0 = genesis_ledger(&fluree, "dt-iri:main");
-    let ledger = fluree
+    fluree
         .insert(
             ledger0,
             &json!({
@@ -292,8 +292,7 @@ async fn datatype_function_compares_against_xsd_iri_in_sparql() {
             }),
         )
         .await
-        .expect("insert")
-        .ledger;
+        .expect("insert");
 
     let db = fluree.db("dt-iri:main").await.expect("indexed view");
     let q = "PREFIX ex: <http://example.org/ns/>\n\
