@@ -128,6 +128,100 @@ async fn sparql_select_streams_rows() {
     assert_eq!(row_count, 3);
 }
 
+/// Seed a single named subject into `ledger_id` on a shared Fluree instance.
+async fn seed_named(fluree: &support::MemoryFluree, ledger_id: &str, name: &str) {
+    let ledger0 = support::genesis_ledger(fluree, ledger_id);
+    let seed = json!({
+        "@context": { "a": "http://a.co/" },
+        "@graph": [{ "@id": format!("http://a.co/{name}"), "a:name": name }]
+    });
+    fluree.insert(ledger0, &seed).await.expect("seed");
+}
+
+/// Run a streaming dataset/connection query (build dataset → plan → run) and
+/// return the parsed NDJSON records.
+async fn collect_dataset_records(
+    fluree: &support::MemoryFluree,
+    query_json: Value,
+) -> Vec<Value> {
+    let dataset = fluree
+        .build_stream_dataset(&query_json)
+        .await
+        .expect("dataset build should succeed");
+    let input = OwnedStreamQuery::JsonLd(query_json);
+    let plan = fluree
+        .plan_stream_query_dataset(&dataset, &input)
+        .await
+        .expect("dataset plan should succeed");
+
+    let (tx, mut rx) = mpsc::channel(1024);
+    fluree
+        .run_stream_query_dataset(
+            dataset,
+            plan,
+            stream_tracker(),
+            QueryExecutionOptions::default(),
+            tx,
+        )
+        .await;
+
+    let mut bytes = Vec::new();
+    while let Some(chunk) = rx.recv().await {
+        bytes.extend_from_slice(&chunk);
+    }
+    String::from_utf8(bytes)
+        .expect("ndjson is utf-8")
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(|l| serde_json::from_str::<Value>(l).expect("valid JSON"))
+        .collect()
+}
+
+#[tokio::test]
+async fn dataset_select_streams_via_from() {
+    let (fluree, _ledger) = seed_three().await;
+
+    // `from` routes through the connection/dataset streaming path.
+    let query = json!({
+        "@context": { "a": "http://a.co/" },
+        "from": "stream/sel:main",
+        "select": ["?name"],
+        "where": { "@id": "?s", "a:name": "?name" }
+    });
+
+    let records = collect_dataset_records(&fluree, query).await;
+    assert_eq!(records[0]["type"], "head");
+    assert_eq!(records.last().unwrap()["type"], "end");
+    assert_eq!(records.last().unwrap()["rows"], 3);
+    assert_eq!(records.iter().filter(|r| r["type"] == "row").count(), 3);
+}
+
+#[tokio::test]
+async fn multi_ledger_dataset_streams_union() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    seed_named(&fluree, "stream/a:main", "Alice").await;
+    seed_named(&fluree, "stream/b:main", "Bob").await;
+
+    let query = json!({
+        "@context": { "a": "http://a.co/" },
+        "from": ["stream/a:main", "stream/b:main"],
+        "select": ["?name"],
+        "where": { "@id": "?s", "a:name": "?name" }
+    });
+
+    let records = collect_dataset_records(&fluree, query).await;
+    assert_eq!(records[0]["type"], "head");
+    assert_eq!(records.last().unwrap()["type"], "end");
+
+    let mut names: Vec<String> = records
+        .iter()
+        .filter(|r| r["type"] == "row")
+        .map(|r| r["row"]["name"]["value"].as_str().unwrap().to_string())
+        .collect();
+    names.sort();
+    assert_eq!(names, vec!["Alice", "Bob"], "union of both ledgers");
+}
+
 #[tokio::test]
 async fn ask_query_is_rejected_before_streaming() {
     let (fluree, ledger) = seed_three().await;

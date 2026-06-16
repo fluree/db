@@ -176,7 +176,7 @@ pub use tx::{
 pub use tx_builder::{OwnedTransactBuilder, RefTransactBuilder, Staged};
 pub use view::{
     ConfigReasoningBudget, DataSetDb, GraphDb, OwnedStreamQuery, QueryInput,
-    ReasoningModePrecedence, StreamQueryPlan,
+    ReasoningModePrecedence, StreamDatasetPlan, StreamQueryPlan,
 };
 
 #[cfg(feature = "iceberg")]

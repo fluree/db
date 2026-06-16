@@ -69,5 +69,5 @@ mod types;
 
 pub use dataset::DataSetDb;
 pub use query_input::QueryInput;
-pub use stream_query::{OwnedStreamQuery, StreamQueryPlan};
+pub use stream_query::{OwnedStreamQuery, StreamDatasetPlan, StreamQueryPlan};
 pub use types::{ConfigReasoningBudget, DerivedFactsHandle, GraphDb, ReasoningModePrecedence};

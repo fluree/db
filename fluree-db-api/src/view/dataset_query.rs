@@ -495,7 +495,7 @@ impl Fluree {
     /// Applies reasoning from the primary view if set. When reasoning config
     /// on the primary view declares `f:schemaSource`, resolves the schema
     /// bundle closure and attaches it to `executable.reasoning.schema_bundle`.
-    async fn build_executable_for_dataset(
+    pub(crate) async fn build_executable_for_dataset(
         &self,
         dataset: &DataSetDb,
         parsed: &fluree_db_query::ir::Query,
@@ -617,6 +617,29 @@ impl Fluree {
         r2rml: crate::R2rmlProviders<'_>,
         options: &QueryExecutionOptions,
     ) -> Result<Vec<crate::Batch>> {
+        let mut sink = crate::view::stream_query::CollectSink::default();
+        self.execute_dataset_into_with_r2rml(dataset, vars, executable, tracker, r2rml, options, &mut sink)
+            .await?;
+        Ok(sink.batches)
+    }
+
+    /// Sink-generic core shared by the buffered
+    /// [`execute_dataset_internal_with_r2rml`] and the streaming dataset
+    /// producer. Builds the runtime dataset (carrying per-graph policy
+    /// enforcers) and the execution context exactly once, then drives
+    /// `execute_prepared_streaming` so buffered and streaming dataset execution
+    /// can never diverge in setup.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn execute_dataset_into_with_r2rml<S: fluree_db_query::execute::BatchSink>(
+        &self,
+        dataset: &DataSetDb,
+        vars: &crate::VarRegistry,
+        executable: &ExecutableQuery,
+        tracker: &Tracker,
+        r2rml: crate::R2rmlProviders<'_>,
+        options: &QueryExecutionOptions,
+        sink: &mut S,
+    ) -> Result<()> {
         let primary = dataset
             .primary()
             .ok_or_else(|| ApiError::query("Dataset has no default graphs"))?;
@@ -716,7 +739,7 @@ impl Fluree {
         };
 
         let exec_db = db.with_t(to_t);
-        execute_prepared(exec_db, vars, prepared, config)
+        fluree_db_query::execute::execute_prepared_streaming(exec_db, vars, prepared, config, sink)
             .await
             .map_err(query_error_to_api_error)
     }

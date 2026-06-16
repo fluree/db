@@ -23,8 +23,8 @@ use crate::format::sparql;
 use crate::query::helpers::build_query_result;
 use crate::view::{GraphDb, QueryInput};
 use crate::{
-    ApiError, ExecutableQuery, Fluree, LedgerState, QueryExecutionOptions, QueryResult, Result,
-    Tracker, VarRegistry,
+    ApiError, DataSetDb, ExecutableQuery, Fluree, LedgerState, QueryExecutionOptions, QueryResult,
+    Result, Tracker, VarRegistry,
 };
 
 use fluree_db_query::execute::{
@@ -57,6 +57,15 @@ impl OwnedStreamQuery {
 /// [`Fluree::run_stream_query`]. All fields are owned so the plan can move into
 /// a spawned task.
 pub struct StreamQueryPlan {
+    vars: VarRegistry,
+    parsed: fluree_db_query::ir::Query,
+    executable: ExecutableQuery,
+}
+
+/// A parsed, validated, planned streaming query against a dataset (connection /
+/// multi-ledger / policy path). Produced by [`Fluree::plan_stream_query_dataset`]
+/// and consumed by [`Fluree::run_stream_query_dataset`].
+pub struct StreamDatasetPlan {
     vars: VarRegistry,
     parsed: fluree_db_query::ir::Query,
     executable: ExecutableQuery,
@@ -242,9 +251,168 @@ impl Fluree {
 
         execute_prepared_streaming(db_ref, vars, prepared, config, sink).await
     }
+
+    /// Build a policy-wrapped `DataSetDb` for a streaming connection/dataset
+    /// query (handles `from`/`fromNamed`, multi-ledger, and identity/policy via
+    /// the same builder as `/query`'s connection path). Always returns a dataset
+    /// — single-source specs yield a single-graph dataset — so the streaming
+    /// producer is uniform.
+    pub async fn build_stream_dataset(&self, query_json: &serde_json::Value) -> Result<DataSetDb> {
+        let (spec, qc_opts) = crate::query::helpers::parse_dataset_spec(query_json)?;
+        if spec.is_empty() {
+            return Err(ApiError::query(
+                "Missing ledger specification in connection query",
+            ));
+        }
+        self.build_dataset_for_connection(&spec, &qc_opts).await
+    }
+
+    /// Parse, validate, and plan a streaming SELECT against a dataset. SPARQL
+    /// FROM/FROM NAMED are allowed here (validated at dataset build); the
+    /// unsupported shapes ([`ensure_streamable`]) are still rejected.
+    pub async fn plan_stream_query_dataset(
+        &self,
+        dataset: &DataSetDb,
+        input: &OwnedStreamQuery,
+    ) -> Result<StreamDatasetPlan> {
+        let primary = dataset
+            .primary()
+            .ok_or_else(|| ApiError::query("Dataset has no graphs for query execution"))?;
+        let input = input.as_input();
+
+        let (vars, mut parsed) = match &input {
+            QueryInput::JsonLd(json) => crate::query::helpers::parse_jsonld_query(
+                json,
+                &primary.snapshot,
+                primary.default_context.as_ref(),
+                None,
+            )?,
+            QueryInput::Sparql(sparql) => crate::query::helpers::parse_sparql_to_ir(
+                sparql,
+                &primary.snapshot,
+                primary.default_context.as_ref(),
+            )?,
+        };
+
+        super::query::maybe_wrap_for_graph_source(primary, &mut parsed);
+        ensure_streamable(&parsed.output)?;
+
+        let executable = self.build_executable_for_dataset(dataset, &parsed).await?;
+        Ok(StreamDatasetPlan {
+            vars,
+            parsed,
+            executable,
+        })
+    }
+
+    /// Execute a planned streaming dataset query, emitting NDJSON records into
+    /// `tx`. Same record protocol as [`run_stream_query`](Self::run_stream_query);
+    /// policy enforcers ride on the runtime dataset's per-graph refs and are
+    /// applied identically to the buffered dataset path. Owns the `DataSetDb`
+    /// (Arc-backed) so it can run in a spawned task.
+    pub async fn run_stream_query_dataset(
+        &self,
+        dataset: DataSetDb,
+        plan: StreamDatasetPlan,
+        tracker: Tracker,
+        options: QueryExecutionOptions,
+        tx: mpsc::Sender<Bytes>,
+    ) {
+        if let Err(e) = crate::query::helpers::charge_query_floor(&tracker) {
+            let _ = tx
+                .send(Bytes::from(ndjson_stream::error_record(&e.to_string(), 0)))
+                .await;
+            return;
+        }
+
+        let Some(primary) = dataset.primary() else {
+            let _ = tx
+                .send(Bytes::from(ndjson_stream::error_record(
+                    "dataset has no graphs",
+                    0,
+                )))
+                .await;
+            return;
+        };
+
+        // Metadata-only result with the dataset-wide t/overlay and the primary
+        // view's binary graph + namespaces — matching how the buffered dataset
+        // path builds its result and formats SELECT rows against the primary.
+        let meta = build_query_result(
+            plan.vars,
+            plan.parsed,
+            Vec::new(),
+            dataset.result_t(),
+            dataset.composite_overlay(),
+            primary.binary_graph(),
+        );
+        let (var_names, head_vars) = sparql::compute_head(&meta);
+        let compactor = IriCompactor::new(primary.snapshot.shared_namespaces(), &meta.context);
+
+        if tx
+            .send(Bytes::from(ndjson_stream::head_record(&var_names)))
+            .await
+            .is_err()
+        {
+            return;
+        }
+
+        let mut sink = NdjsonRowSink {
+            result: &meta,
+            compactor: &compactor,
+            head_vars: &head_vars,
+            var_names: &var_names,
+            tx: tx.clone(),
+            rows: 0,
+            buf: String::new(),
+        };
+
+        let noop = crate::NoOpR2rmlProvider::new();
+        let exec = self
+            .execute_dataset_into_with_r2rml(
+                &dataset,
+                &meta.vars,
+                &plan.executable,
+                &tracker,
+                crate::R2rmlProviders {
+                    provider: &noop,
+                    table_provider: &noop,
+                },
+                &options,
+                &mut sink,
+            )
+            .await;
+
+        let terminal = match exec {
+            Ok(()) => ndjson_stream::end_record(
+                sink.rows,
+                meta.t,
+                tracker.current_fuel(),
+                tracker.tally().and_then(|t| t.time).as_deref(),
+            ),
+            Err(err) => ndjson_stream::error_record(&err.to_string(), sink.rows),
+        };
+        let _ = tx.send(Bytes::from(terminal)).await;
+    }
 }
 
+/// Buffered [`BatchSink`] that collects batches into a `Vec` — the dataset
+/// buffered path's collector, mirroring the query crate's internal `VecSink`.
+#[derive(Default)]
+pub(crate) struct CollectSink {
+    pub(crate) batches: Vec<fluree_db_query::binding::Batch>,
+}
 
+#[async_trait::async_trait]
+impl BatchSink for CollectSink {
+    async fn push(
+        &mut self,
+        batch: fluree_db_query::binding::Batch,
+    ) -> std::result::Result<(), fluree_db_query::QueryError> {
+        self.batches.push(batch);
+        Ok(())
+    }
+}
 
 /// Reject query shapes the streaming endpoint does not support.
 fn ensure_streamable(output: &fluree_db_query::ir::QueryOutput) -> Result<()> {

@@ -28,14 +28,18 @@ use tokio::sync::mpsc;
 use tokio::time::{interval, MissedTickBehavior};
 
 use fluree_db_api::format::ndjson_stream;
-use fluree_db_api::{GraphDb, OwnedStreamQuery, Tracker, TrackingOptions};
+use fluree_db_api::{
+    DataSetDb, GraphDb, LedgerState, OwnedStreamQuery, StreamDatasetPlan, StreamQueryPlan, Tracker,
+    TrackingOptions,
+};
 use serde_json::Value as JsonValue;
 
 use crate::error::{Result, ServerError};
 use crate::extract::{FlureeHeaders, MaybeCredential, MaybeDataBearer};
 use crate::query_control::QueryDisconnectGuard;
 use crate::routes::query::{
-    effective_identity, has_policy_opts, is_sparql_request, load_ledger_for_query,
+    effective_identity, enforce_bearer_dataset_scope, has_policy_opts, inject_headers_into_query,
+    is_sparql_request, load_ledger_for_query, normalize_ledger_scoped_from, requires_dataset_features,
     resolve_sparql_text, SparqlParams,
 };
 use crate::state::AppState;
@@ -90,50 +94,56 @@ async fn stream_query_inner(
         ));
     }
 
-    // The single-ledger streaming path enforces only ledger-configured policy —
-    // it does NOT run the per-request connection/dataset policy path. So if the
-    // server's data-auth or this request would impose identity/policy-class
-    // scoping, refuse rather than run weaker than `/query`.
-    let (input, tracker) = if is_sparql_request(&headers, &credential, &params) {
+    // Resolve into one of two execution shapes, planned before the 200 stream
+    // commits so parse errors / unsupported shapes return a clean 4xx:
+    //  - Single: the lean single-ledger GraphDb path (common case).
+    //  - Dataset: the connection/dataset path (policy, `from`/`fromNamed`,
+    //    multi-ledger), which enforces per-request policy exactly like `/query`.
+    let fluree = state.fluree.clone();
+    let (stream_plan, tracker) = if is_sparql_request(&headers, &credential, &params) {
         let sparql = resolve_sparql_text(&params, &credential)?;
         if let Some(p) = bearer.0.as_ref() {
             if !credential.is_signed() && !p.can_read(&ledger) {
                 return Err(ServerError::not_found("Ledger not found"));
             }
         }
-        // Conservative: any request that could carry identity/policy scoping is
-        // refused on the SPARQL streaming path (it has no per-request policy
-        // resolution). FROM/FROM NAMED and unsupported shapes are rejected by
-        // `plan_stream_query`.
+        // SPARQL streaming has no per-request policy resolution yet, so refuse
+        // anything that would impose identity/policy scoping (use /query).
+        // FROM/FROM NAMED and unsupported shapes are rejected by the planner.
         if data_auth.default_policy_class.is_some()
             || effective_identity(&credential, &bearer).is_some()
             || headers.identity.is_some()
         {
             return Err(policy_unsupported());
         }
-        (OwnedStreamQuery::Sparql(sparql), stream_tracker(None))
+        let input = OwnedStreamQuery::Sparql(sparql);
+        let ledger_state = load_ledger_for_query(state.as_ref(), &ledger, &span).await?;
+        let plan = {
+            let graph = GraphDb::from_ledger_state(&ledger_state);
+            fluree
+                .plan_stream_query(&graph, &input)
+                .await
+                .map_err(ServerError::Api)?
+        };
+        (
+            StreamPlan::Single { ledger_state, plan },
+            stream_tracker(None),
+        )
     } else {
         let mut query_json: JsonValue = credential.body_json()?;
 
-        // `from`/`fromNamed` are dataset/named-graph selectors: a `from` may
-        // target a different ledger or carry an `@t:` time-travel suffix that
-        // the single-ledger streaming plan would silently ignore. Reject.
-        if query_json.get("from").is_some() || query_json.get("fromNamed").is_some() {
-            return Err(ServerError::bad_request(
-                "`from`/`fromNamed` selectors are not supported on the streaming endpoint; \
-                 use /v1/fluree/query",
-            ));
-        }
-
+        // Mirror /query's ledger-scoped preprocessing: normalize `from` against
+        // the path ledger, fold header opts in, enforce bearer scope over the
+        // path ledger and every referenced graph, then apply auth-derived
+        // identity + default policy class.
+        normalize_ledger_scoped_from(&ledger, &mut query_json)?;
+        inject_headers_into_query(&mut query_json, &headers);
         if let Some(p) = bearer.0.as_ref() {
             if !credential.is_signed() && !p.can_read(&ledger) {
                 return Err(ServerError::not_found("Ledger not found"));
             }
         }
-
-        // Apply the same auth-derived identity + default policy class as
-        // `/query`, then refuse if any policy results. This guarantees the
-        // streaming endpoint never enforces less than `/query` would.
+        enforce_bearer_dataset_scope(&query_json, &bearer, credential.is_signed(), &span)?;
         let identity = effective_identity(&credential, &bearer);
         crate::routes::policy_auth::apply_auth_identity_to_opts(
             state.as_ref(),
@@ -143,24 +153,40 @@ async fn stream_query_inner(
             data_auth.default_policy_class.as_deref(),
         )
         .await;
-        if has_policy_opts(&query_json) {
-            return Err(policy_unsupported());
-        }
 
         let tracker = stream_tracker(Some(&query_json));
-        (OwnedStreamQuery::JsonLd(query_json), tracker)
-    };
 
-    // Load the ledger (owned) and plan before committing to the 200 stream, so
-    // parse errors / unsupported shapes surface as a clean 4xx.
-    let ledger_state = load_ledger_for_query(state.as_ref(), &ledger, &span).await?;
-    let graph = GraphDb::from_ledger_state(&ledger_state);
-    let plan = state
-        .fluree
-        .plan_stream_query(&graph, &input)
-        .await
-        .map_err(ServerError::Api)?;
-    drop(graph);
+        if requires_dataset_features(&query_json) || has_policy_opts(&query_json) {
+            // Dataset path: ensure the spec carries the path ledger as a default
+            // graph, build the policy-wrapped dataset, then plan against it.
+            if query_json.get("from").is_none() {
+                if let Some(obj) = query_json.as_object_mut() {
+                    obj.insert("from".to_string(), JsonValue::String(ledger.clone()));
+                }
+            }
+            let dataset = fluree
+                .build_stream_dataset(&query_json)
+                .await
+                .map_err(ServerError::Api)?;
+            let input = OwnedStreamQuery::JsonLd(query_json);
+            let plan = fluree
+                .plan_stream_query_dataset(&dataset, &input)
+                .await
+                .map_err(ServerError::Api)?;
+            (StreamPlan::Dataset { dataset, plan }, tracker)
+        } else {
+            let input = OwnedStreamQuery::JsonLd(query_json);
+            let ledger_state = load_ledger_for_query(state.as_ref(), &ledger, &span).await?;
+            let plan = {
+                let graph = GraphDb::from_ledger_state(&ledger_state);
+                fluree
+                    .plan_stream_query(&graph, &input)
+                    .await
+                    .map_err(ServerError::Api)?
+            };
+            (StreamPlan::Single { ledger_state, plan }, tracker)
+        }
+    };
 
     let options =
         crate::query_control::current_query_execution_options(state.config.query_timeout_ms);
@@ -172,19 +198,42 @@ async fn stream_query_inner(
         .clone()
         .map(crate::query_control::QueryDisconnectGuard::new);
 
-    // Producer task: owns the ledger state and drives execution, formatting and
-    // flushing each batch as NDJSON records.
     let (tx, rx) = mpsc::channel::<Bytes>(STREAM_CHANNEL_DEPTH);
-    let fluree = state.fluree.clone();
     let producer_tracker = tracker.clone();
-    tokio::spawn(async move {
-        fluree
-            .run_stream_query(ledger_state, plan, producer_tracker, options, tx)
-            .await;
-    });
+    match stream_plan {
+        StreamPlan::Single { ledger_state, plan } => {
+            tokio::spawn(async move {
+                fluree
+                    .run_stream_query(ledger_state, plan, producer_tracker, options, tx)
+                    .await;
+            });
+        }
+        StreamPlan::Dataset { dataset, plan } => {
+            tokio::spawn(async move {
+                fluree
+                    .run_stream_query_dataset(dataset, plan, producer_tracker, options, tx)
+                    .await;
+            });
+        }
+    }
 
     tracing::info!(status = "start", ledger = %ledger, "streaming query started");
     Ok(ndjson_response(rx, tracker, disconnect_guard))
+}
+
+/// The two streaming execution shapes resolved by the handler. Constructed
+/// once and matched immediately, so the inter-variant size difference is not
+/// worth a heap indirection.
+#[allow(clippy::large_enum_variant)]
+enum StreamPlan {
+    Single {
+        ledger_state: LedgerState,
+        plan: StreamQueryPlan,
+    },
+    Dataset {
+        dataset: DataSetDb,
+        plan: StreamDatasetPlan,
+    },
 }
 
 /// Error for query shapes whose policy scoping the streaming endpoint cannot

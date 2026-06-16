@@ -399,7 +399,7 @@ fn collect_ledger_identifiers(value: &JsonValue, out: &mut Vec<String>) {
 ///
 /// No-op for signed requests and unauthenticated (no-bearer) requests; those
 /// are handled by the surrounding data-auth gate and per-ledger policy.
-fn enforce_bearer_dataset_scope(
+pub(crate) fn enforce_bearer_dataset_scope(
     query_json: &JsonValue,
     bearer: &MaybeDataBearer,
     is_signed: bool,
@@ -475,7 +475,7 @@ fn get_ledger_id(
 }
 
 /// Inject header values into query JSON (modifies the query in place)
-fn inject_headers_into_query(query: &mut JsonValue, headers: &FlureeHeaders) {
+pub(crate) fn inject_headers_into_query(query: &mut JsonValue, headers: &FlureeHeaders) {
     if let Some(obj) = query.as_object_mut() {
         // Get or create opts object
         let opts = obj
@@ -1386,7 +1386,7 @@ pub async fn explain_ledger_tail(
 /// - `fromNamed` / `from-named`: Named graphs in the dataset
 /// - `from` as array: Multiple default graphs
 /// - `from` as object with special fields: graph selector, alias, time-travel
-fn requires_dataset_features(query: &JsonValue) -> bool {
+pub(crate) fn requires_dataset_features(query: &JsonValue) -> bool {
     // Check for fromNamed (new) or from-named (legacy)
     if query.get("fromNamed").is_some() || query.get("from-named").is_some() {
         return true;
@@ -1708,7 +1708,7 @@ fn looks_like_graph_selector_only(s: &str) -> bool {
         || (!s.contains(':') && !s.contains('@') && !s.contains('#'))
 }
 
-fn normalize_ledger_scoped_from(ledger_id: &str, query: &mut JsonValue) -> Result<()> {
+pub(crate) fn normalize_ledger_scoped_from(ledger_id: &str, query: &mut JsonValue) -> Result<()> {
     let Some(obj) = query.as_object_mut() else {
         return Ok(());
     };
