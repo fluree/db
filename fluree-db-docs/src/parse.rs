@@ -90,10 +90,8 @@ pub fn parse_sections(path: &str, md: &str) -> Vec<Section> {
                     code_buf.push_str(&t);
                 }
             }
-            Event::Code(t) => {
-                if in_heading {
-                    heading_text.push_str(&t);
-                }
+            Event::Code(t) if in_heading => {
+                heading_text.push_str(&t);
             }
             _ => {}
         }

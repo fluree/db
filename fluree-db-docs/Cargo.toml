@@ -12,9 +12,11 @@ default = []
 mcp = ["dep:rmcp", "dep:schemars"]
 
 [dependencies]
-# `include-exclude` enables the #[exclude] attribute; `compression` shrinks the
-# ~2 MB embedded corpus to ~0.6 MB in release builds.
-rust-embed = { version = "8", features = ["include-exclude", "compression"] }
+# `include-exclude` enables the #[exclude] attribute. NOTE: do not enable the
+# `compression` feature — Cargo unifies it onto every rust-embed user in the
+# workspace (e.g. utoipa-swagger-ui via fluree-db-server), and it rejects the
+# absolute OUT_DIR folder paths those crates use, breaking their build.
+rust-embed = { version = "8", features = ["include-exclude"] }
 pulldown-cmark = "0.12"
 # Snowball stemming so "property path" matches the "Property Paths" heading, etc.
 rust-stemmers = "1"
