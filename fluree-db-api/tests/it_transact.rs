@@ -571,8 +571,11 @@ async fn no_where_solutions() {
 
     let ledger1 = fluree.update(ledger0, &insert_txn).await.unwrap().ledger;
 
-    // Update with WHERE that matches nothing (no existing description)
-    // Should still insert the new description
+    // A required WHERE pattern that matches nothing yields zero solutions, so
+    // the INSERT does NOT fire — even though its template is all-literal. This
+    // is the compliant behavior (SPARQL 1.1 Update §3.1.3): zero solutions =
+    // no-op. To insert-if-absent, use OPTIONAL so WHERE still yields a row
+    // (see the insert-if-not-exists patterns in it_transact_conditional.rs).
     let update_txn = json!({
         "@context": {"ex": "http://example.org/ns/", "schema": "http://schema.org/"},
         "where": {"@id": "ex:andrew", "schema:description": "?o"},
@@ -598,7 +601,10 @@ async fn no_where_solutions() {
     let andrew = jsonld.as_object().unwrap();
     assert_eq!(andrew["@id"], "ex:andrew");
     assert_eq!(andrew["schema:name"], "Andrew");
-    assert_eq!(andrew["schema:description"], "He's great!");
+    assert!(
+        andrew.get("schema:description").is_none(),
+        "all-literal INSERT must not fire when the required WHERE matched nothing"
+    );
 }
 
 #[tokio::test]
