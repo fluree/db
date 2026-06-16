@@ -170,7 +170,15 @@ pub struct BinaryScanOperator {
     store: Option<Arc<BinaryIndexStore>>,
     g_id: GraphId,
     cursor: Option<BinaryCursor>,
-    /// Pre-computed p_id → Sid (all predicates, done once at open).
+    /// Pre-computed `p_id → Sid` decode table, built once at `open()`.
+    ///
+    /// **Namespace-space:** intentionally *space-blended*. Low (persisted)
+    /// indices hold store-space Sids (`store.encode_iri`); the table is then
+    /// extended in place with novelty-only predicate Sids in *snapshot* space
+    /// (ephemeral p_ids, see `open()`). Sound because the table is only ever used
+    /// to *decode* a p_id back to a Sid for output binding — where both spaces
+    /// resolve to the same IRI — never to compare codes across spaces. See the
+    /// namespace-space invariants on `extract_bound_terms_snapshot`.
     p_sids: Vec<Sid>,
     /// Cached s_id → Sid for amortized IRI resolution.
     sid_cache: HashMap<u64, Sid>,
@@ -919,12 +927,39 @@ impl BinaryScanOperator {
 
     /// Extract bound terms from the pattern in the *snapshot* namespace space.
     ///
-    /// Important invariants:
-    /// - Novelty / overlay flakes carry `Sid`s in the snapshot's namespace-code space.
-    /// - The binary index store carries its own namespace table and prefix trie (from the index root).
+    /// # Namespace-space invariants (the contract for this whole boundary)
     ///
-    /// Therefore, we keep the bound SIDs in snapshot space for overlay matching, and only
-    /// translate into store space (via full IRI strings) when constructing persisted ID filters.
+    /// A namespace code is only meaningful relative to a namespace table, and
+    /// there are **two** tables in play during a binary scan:
+    ///
+    /// - **Snapshot space** — `LedgerSnapshot`'s table, kept current by commit
+    ///   deltas. Novelty/overlay flakes and all *bound pattern terms* live here.
+    /// - **Store space** — `BinaryIndexStore`'s table, frozen at the index root.
+    ///
+    /// The two are reconciled **by construction**, not by conversion at every
+    /// use:
+    ///
+    /// 1. **Canonical agreement.** Codes are allocated deterministically from
+    ///    genesis, so for any prefix present at index time the snapshot and the
+    ///    store assign it the *same* `u16`. This is what lets the persisted-ID
+    ///    fast path (`sid_iri::sid_to_store_s_id` → `find_subject_id_by_parts`)
+    ///    look up a snapshot Sid's code directly in the store without
+    ///    reconstructing an IRI. `build_filter_from_snapshot_sids`
+    ///    `debug_assert`s this agreement.
+    /// 2. **Post-index divergence is a snapshot *superset*, never a conflict.**
+    ///    A namespace introduced *after* the index was built exists only in the
+    ///    snapshot; the store has no code for it. The fast path's by-parts lookup
+    ///    misses, and the conversion falls back to decode→re-encode through the
+    ///    full IRI (`snapshot.decode_sid` → `store.find_subject_id`), or returns
+    ///    `Ok(None)` so the row is served from novelty. A *same code → different
+    ///    prefix* mismatch never occurs and would be a canonical-encoding bug.
+    /// 3. **The output `p_sids` table is deliberately space-blended** — see its
+    ///    field doc; safe because it is only ever used to *decode* a p_id to a
+    ///    Sid for binding, not to compare codes across the two spaces.
+    ///
+    /// Therefore bound SIDs are kept in **snapshot space** for overlay matching,
+    /// and translated to store space (via the rules above) only when building
+    /// persisted-ID filters. This function performs no store-space translation.
     pub(crate) fn extract_bound_terms_snapshot(
         snapshot: &LedgerSnapshot,
         pattern: &TriplePattern,
@@ -964,7 +999,54 @@ impl BinaryScanOperator {
         (s_sid, p_sid, o_val)
     }
 
-    /// Build a `BinaryFilter` from bound pattern terms.
+    /// Debug-only guard for the **canonical namespace-space agreement** that the
+    /// snapshot→store by-parts fast path relies on (see invariant #1 on
+    /// [`extract_bound_terms_snapshot`](Self::extract_bound_terms_snapshot)).
+    ///
+    /// For any code known to BOTH tables, snapshot and store must map it to the
+    /// same prefix. A code present on only one side is the benign post-index
+    /// case (snapshot superset → IRI-reencode fallback). A *same-code,
+    /// different-prefix* mismatch means canonical encoding was broken upstream
+    /// and store-space by-parts lookups would silently resolve the wrong
+    /// subject — the historical "namespace after index attach" bug class.
+    #[inline]
+    fn debug_assert_ns_space_agreement(
+        snapshot: &LedgerSnapshot,
+        store: &BinaryIndexStore,
+        sid: &Sid,
+    ) {
+        #[cfg(debug_assertions)]
+        {
+            let code = sid.namespace_code.as_u16();
+            if let (Some(snap_prefix), Some(store_prefix)) = (
+                snapshot.namespaces().get(&code),
+                store.namespace_codes().get(&code),
+            ) {
+                assert_eq!(
+                    snap_prefix, store_prefix,
+                    "namespace-space disagreement for code {code}: snapshot maps it to \
+                     {snap_prefix:?} but the store maps it to {store_prefix:?} — canonical \
+                     encoding broken; store-space by-parts lookups would resolve the wrong subject"
+                );
+            }
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            let _ = (snapshot, store, sid);
+        }
+    }
+
+    /// Build a `BinaryFilter` (store-space integer IDs) from snapshot-space bound
+    /// pattern terms.
+    ///
+    /// This is the sanctioned snapshot→store translation chokepoint. Subject and
+    /// predicate Sids are matched against the store's persisted dictionaries
+    /// using the rules documented on
+    /// [`extract_bound_terms_snapshot`](Self::extract_bound_terms_snapshot):
+    /// the by-parts fast path (canonical code agreement) with an IRI-reencode
+    /// fallback (`snapshot.decode_sid` → `store.find_subject_id`) for post-index
+    /// namespaces. `s_id == None` here means "not persisted" — the caller serves
+    /// it from novelty, never as an empty result.
     pub(crate) fn build_filter_from_snapshot_sids(
         snapshot: &LedgerSnapshot,
         pattern: &TriplePattern,
@@ -972,6 +1054,13 @@ impl BinaryScanOperator {
         s_sid: &Option<Sid>,
         p_sid: &Option<Sid>,
     ) -> std::io::Result<BinaryFilter> {
+        // Guard the canonical-agreement assumption the by-parts fast path makes.
+        if let Some(sid) = s_sid.as_ref() {
+            Self::debug_assert_ns_space_agreement(snapshot, store, sid);
+        }
+        if let Some(sid) = p_sid.as_ref() {
+            Self::debug_assert_ns_space_agreement(snapshot, store, sid);
+        }
         let s_id = match (&pattern.s, s_sid.as_ref()) {
             (Ref::Iri(iri), _) => store.find_subject_id(iri)?,
             (Ref::Sid(query_sid), Some(sid)) => {
