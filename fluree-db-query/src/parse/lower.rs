@@ -445,6 +445,8 @@ fn lower_values_cell<E: IriEncoder>(cell: &UnresolvedValue, encoder: &E) -> Resu
                 LiteralValue::String(s) => FlakeValue::String(s.as_ref().to_string()),
                 LiteralValue::Long(i) => FlakeValue::Long(*i),
                 LiteralValue::Double(f) => FlakeValue::Double(*f),
+                LiteralValue::Decimal(d) => FlakeValue::Decimal(d.clone()),
+                LiteralValue::BigInt(n) => FlakeValue::BigInt(n.clone()),
                 LiteralValue::Boolean(b) => FlakeValue::Boolean(*b),
                 LiteralValue::Vector(v) => FlakeValue::Vector(v.clone()),
             };
@@ -471,6 +473,8 @@ fn lower_values_cell<E: IriEncoder>(cell: &UnresolvedValue, encoder: &E) -> Resu
                         LiteralValue::String(_) => dts.xsd_string,
                         LiteralValue::Long(_) => dts.xsd_long,
                         LiteralValue::Double(_) => dts.xsd_double,
+                        LiteralValue::Decimal(_) => dts.xsd_decimal,
+                        LiteralValue::BigInt(_) => dts.xsd_integer,
                         LiteralValue::Boolean(_) => dts.xsd_boolean,
                         LiteralValue::Vector(_) => dts.fluree_vector,
                     };
@@ -1667,6 +1671,8 @@ fn lower_literal(lit: &LiteralValue) -> FlakeValue {
         LiteralValue::String(s) => FlakeValue::String(s.to_string()),
         LiteralValue::Long(l) => FlakeValue::Long(*l),
         LiteralValue::Double(d) => FlakeValue::Double(*d),
+        LiteralValue::Decimal(d) => FlakeValue::Decimal(d.clone()),
+        LiteralValue::BigInt(n) => FlakeValue::BigInt(n.clone()),
         LiteralValue::Boolean(b) => FlakeValue::Boolean(*b),
         LiteralValue::Vector(v) => FlakeValue::Vector(v.clone()),
     }

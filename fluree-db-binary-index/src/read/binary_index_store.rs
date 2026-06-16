@@ -1496,7 +1496,23 @@ impl BinaryIndexStore {
         let arena = self.graph_indexes.get(&g_id)?.numbig.get(&p_id)?;
         match val {
             fluree_db_core::value::FlakeValue::BigInt(bi) => arena.find_bigint(bi),
-            fluree_db_core::value::FlakeValue::Decimal(bd) => arena.find_bigdec(bd),
+            fluree_db_core::value::FlakeValue::Decimal(bd) => {
+                if arena.has_duplicate_handles() {
+                    // Legacy pre-normalization arena: the value may exist
+                    // under several handles (scale variants), and a single
+                    // handle cannot represent its identity — a translated
+                    // retract keyed on one handle would miss base rows under
+                    // another. Decline so callers fall back to decoded-value
+                    // comparison, which is handle-agnostic.
+                    let handles = arena.find_bigdec_handles(bd);
+                    return if handles.len() == 1 {
+                        Some(handles[0])
+                    } else {
+                        None
+                    };
+                }
+                arena.find_bigdec(bd)
+            }
             _ => None,
         }
     }

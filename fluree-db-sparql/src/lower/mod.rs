@@ -621,6 +621,177 @@ mod tests {
     }
 
     // =========================================================================
+    // Numeric literal lowering
+    // =========================================================================
+
+    fn object_of(query: &Query, idx: usize) -> &Term {
+        let Pattern::Triple(t) = &query.patterns[idx] else {
+            panic!("expected triple pattern, got {:?}", query.patterns[idx]);
+        };
+        &t.o
+    }
+
+    #[test]
+    fn test_overflowing_integer_literal_promotes_to_bigint() {
+        // xsd:integer is unbounded; beyond i64 must promote, not corrupt.
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?s WHERE { ?s ex:serial 123456789012345678901234567890 }",
+        )
+        .unwrap();
+
+        let Term::Value(fluree_db_core::FlakeValue::BigInt(n)) = object_of(&query, 0) else {
+            panic!(
+                "expected BigInt object for overflowing integer, got {:?}",
+                object_of(&query, 0)
+            );
+        };
+        assert_eq!(n.to_string(), "123456789012345678901234567890");
+    }
+
+    #[test]
+    fn test_negative_overflowing_integer_literal_promotes_to_bigint() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?s WHERE { ?s ex:serial -123456789012345678901234567890 }",
+        )
+        .unwrap();
+
+        let Term::Value(fluree_db_core::FlakeValue::BigInt(n)) = object_of(&query, 0) else {
+            panic!(
+                "expected BigInt object for overflowing integer, got {:?}",
+                object_of(&query, 0)
+            );
+        };
+        assert_eq!(n.to_string(), "-123456789012345678901234567890");
+    }
+
+    #[test]
+    fn test_typed_overflowing_integer_literal_promotes_to_bigint() {
+        // Typed lexical form: xsd:integer is unbounded, so this must promote,
+        // not error.
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+             SELECT ?s WHERE { ?s ex:serial \"123456789012345678901234567890\"^^xsd:integer }",
+        )
+        .unwrap();
+
+        let Term::Value(fluree_db_core::FlakeValue::BigInt(n)) = object_of(&query, 0) else {
+            panic!(
+                "expected BigInt object for typed overflowing integer, got {:?}",
+                object_of(&query, 0)
+            );
+        };
+        assert_eq!(n.to_string(), "123456789012345678901234567890");
+    }
+
+    #[test]
+    fn test_bare_decimal_literal_is_exact() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?s WHERE { ?s ex:price 19.99 }",
+        )
+        .unwrap();
+
+        let Term::Value(fluree_db_core::FlakeValue::Decimal(d)) = object_of(&query, 0) else {
+            panic!(
+                "expected exact decimal object, got {:?}",
+                object_of(&query, 0)
+            );
+        };
+        assert_eq!(d.to_string(), "19.99");
+    }
+
+    #[test]
+    fn test_negative_decimal_literal_is_exact() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?s WHERE { ?s ex:delta -0.5 }",
+        )
+        .unwrap();
+
+        let Term::Value(fluree_db_core::FlakeValue::Decimal(d)) = object_of(&query, 0) else {
+            panic!(
+                "expected exact decimal object, got {:?}",
+                object_of(&query, 0)
+            );
+        };
+        assert_eq!(d.to_string(), "-0.5");
+    }
+
+    #[test]
+    fn test_typed_decimal_literal_is_exact() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+             SELECT ?s WHERE { ?s ex:price \"1234567890123456789.0123456789\"^^xsd:decimal }",
+        )
+        .unwrap();
+
+        let Term::Value(fluree_db_core::FlakeValue::Decimal(d)) = object_of(&query, 0) else {
+            panic!(
+                "expected exact decimal object, got {:?}",
+                object_of(&query, 0)
+            );
+        };
+        // Round-tripping through f64 would lose these digits
+        assert_eq!(d.to_string(), "1234567890123456789.0123456789");
+    }
+
+    #[test]
+    fn test_double_literal_stays_double() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?s WHERE { ?s ex:price 1.5e2 }",
+        )
+        .unwrap();
+
+        assert!(
+            matches!(
+                object_of(&query, 0),
+                Term::Value(fluree_db_core::FlakeValue::Double(_))
+            ),
+            "exponent-form literal is xsd:double, got {:?}",
+            object_of(&query, 0)
+        );
+    }
+
+    #[test]
+    fn test_filter_decimal_constant_is_exact() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?s WHERE { ?s ex:price ?p . FILTER(?p > 10.25) }",
+        )
+        .unwrap();
+
+        let rendered = format!("{:?}", query.patterns);
+        assert!(
+            rendered.contains("Decimal"),
+            "FILTER constant should be an exact decimal: {rendered}"
+        );
+        assert!(
+            !rendered.contains("Double(10.25)"),
+            "FILTER constant must not round-trip through f64: {rendered}"
+        );
+    }
+
+    #[test]
+    fn test_values_decimal_constant_is_exact() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?p WHERE { VALUES ?p { 19.99 } ?s ex:price ?p }",
+        )
+        .unwrap();
+
+        let rendered = format!("{:?}", query.patterns);
+        assert!(
+            rendered.contains("Decimal"),
+            "VALUES constant should be an exact decimal: {rendered}"
+        );
+    }
+
+    // =========================================================================
     // Basic SELECT tests
     // =========================================================================
 

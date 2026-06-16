@@ -386,8 +386,7 @@ fn write_binding_cell(
         }
         Binding::EncodedSid { s_id, .. } => {
             let gv = require_graph_view(gv)?;
-            let store = gv.store();
-            let iri = store.resolve_subject_iri(*s_id).map_err(|e| {
+            let iri = gv.resolve_subject_iri(*s_id).map_err(|e| {
                 FormatError::InvalidBinding(format!(
                     "Failed to resolve subject IRI for s_id {s_id}: {e}"
                 ))
@@ -417,15 +416,21 @@ fn write_binding_cell(
             let gv = require_graph_view(gv)?;
             let store = gv.store();
             if *o_kind == ObjKind::LEX_ID.as_u8() || *o_kind == ObjKind::JSON_ID.as_u8() {
-                store
-                    .write_string_value_bytes(*o_key as u32, cell)
-                    .map_err(|e| {
-                        FormatError::InvalidBinding(format!(
-                            "Failed to resolve string (kind={o_kind}, key={o_key}): {e}"
-                        ))
-                    })?;
+                // Zero-copy persisted lookup first; novelty string IDs sit above
+                // the pack watermark so the store lookup fails cleanly (without
+                // writing) and the novelty-aware decode takes over.
+                if store.write_string_value_bytes(*o_key as u32, cell).is_err() {
+                    let val = gv
+                        .decode_value_from_kind(*o_kind, *o_key, *p_id, *dt_id, *lang_id)
+                        .map_err(|e| {
+                            FormatError::InvalidBinding(format!(
+                                "Failed to resolve string (kind={o_kind}, key={o_key}): {e}"
+                            ))
+                        })?;
+                    write_flake_value(cell, &val, compactor);
+                }
             } else if *o_kind == ObjKind::REF_ID.as_u8() {
-                let iri = store.resolve_subject_iri(*o_key).map_err(|e| {
+                let iri = gv.resolve_subject_iri(*o_key).map_err(|e| {
                     FormatError::InvalidBinding(format!(
                         "Failed to resolve ref IRI for s_id {o_key}: {e}"
                     ))
@@ -520,7 +525,7 @@ fn write_flake_value(cell: &mut Vec<u8>, val: &FlakeValue, compactor: &IriCompac
         }
         FlakeValue::Null => {}
         FlakeValue::BigInt(n) => cell.extend_from_slice(n.to_string().as_bytes()),
-        FlakeValue::Decimal(d) => cell.extend_from_slice(d.to_string().as_bytes()),
+        FlakeValue::Decimal(d) => cell.extend_from_slice(d.to_plain_string().as_bytes()),
         FlakeValue::DateTime(dt) => cell.extend_from_slice(dt.to_string().as_bytes()),
         FlakeValue::Date(d) => cell.extend_from_slice(d.to_string().as_bytes()),
         FlakeValue::Time(t) => cell.extend_from_slice(t.to_string().as_bytes()),

@@ -258,6 +258,19 @@ fn bindings_compatible_for_values(ctx: &ExecutionContext<'_>, a: &Binding, b: &B
         }
     }
 
+    // Arena-backed NUM_BIG scan output vs a decoded decimal/bigint constant:
+    // the constant can't encode (handles are per-predicate), so decode the
+    // encoded side and compare by value.
+    if crate::object_binding::is_numbig_encoded(a) || crate::object_binding::is_numbig_encoded(b) {
+        if let Some(gv) = ctx.graph_view() {
+            let am = crate::group_aggregate::materialize_encoded(a, Some(&gv));
+            let bm = crate::group_aggregate::materialize_encoded(b, Some(&gv));
+            if am == bm {
+                return true;
+            }
+        }
+    }
+
     match (a, b) {
         // Compare SID to IRI-bearing bindings by decoding SID via primary db.
         (Binding::Sid { sid, .. }, Binding::Iri(iri) | Binding::IriMatch { iri, .. })

@@ -357,7 +357,7 @@ fn write_scalar(out: &mut String, val: &FlakeValue, json_as_string: bool) -> Res
             ));
         }
         FlakeValue::BigInt(n) => push_json_string(out, &n.to_string()),
-        FlakeValue::Decimal(d) => push_json_string(out, &d.to_string()),
+        FlakeValue::Decimal(d) => push_json_string(out, &d.to_plain_string()),
         // Temporal types + GeoPoint: original lexical string (FlakeValue Display
         // delegates to the inner value's Display for these variants).
         other => push_json_string(out, &other.to_string()),
@@ -457,7 +457,7 @@ pub(crate) fn format_binding(binding: &Binding, compactor: &IriCompactor) -> Res
                     )),
                     // Extended numeric types - serialize as string
                     FlakeValue::BigInt(n) => Ok(JsonValue::String(n.to_string())),
-                    FlakeValue::Decimal(d) => Ok(JsonValue::String(d.to_string())),
+                    FlakeValue::Decimal(d) => Ok(JsonValue::String(d.to_plain_string())),
                     // Temporal types - serialize as original string
                     FlakeValue::DateTime(dt) => Ok(JsonValue::String(dt.to_string())),
                     FlakeValue::Date(d) => Ok(JsonValue::String(d.to_string())),
@@ -506,7 +506,7 @@ pub(crate) fn format_binding(binding: &Binding, compactor: &IriCompactor) -> Res
                 }
                 // Extended numeric types - serialize as string with @type
                 FlakeValue::BigInt(n) => JsonValue::String(n.to_string()),
-                FlakeValue::Decimal(d) => JsonValue::String(d.to_string()),
+                FlakeValue::Decimal(d) => JsonValue::String(d.to_plain_string()),
                 // Temporal types - serialize as original string with @type
                 FlakeValue::DateTime(dt) => JsonValue::String(dt.to_string()),
                 FlakeValue::Date(d) => JsonValue::String(d.to_string()),

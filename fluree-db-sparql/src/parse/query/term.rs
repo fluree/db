@@ -287,6 +287,12 @@ impl super::Parser<'_> {
                 self.stream.advance();
                 return Some(Literal::integer(n, span));
             }
+            TokenKind::BigInteger(_) => {
+                let token = self.stream.consume();
+                if let TokenKind::BigInteger(s) = token.kind {
+                    return Some(Literal::big_integer(s.as_ref(), span));
+                }
+            }
             TokenKind::Decimal(_) => {
                 let token = self.stream.consume();
                 if let TokenKind::Decimal(s) = token.kind {
@@ -343,6 +349,18 @@ impl super::Parser<'_> {
                 let num_span = self.stream.current_span();
                 self.stream.advance();
                 Some(Literal::integer(n, sign_span.union(num_span)))
+            }
+            TokenKind::BigInteger(_) => {
+                let token = self.stream.consume();
+                let TokenKind::BigInteger(s) = token.kind else {
+                    unreachable!("already matched BigInteger")
+                };
+                let mut signed = String::new();
+                if is_neg {
+                    signed.push('-');
+                }
+                signed.push_str(s.as_ref());
+                Some(Literal::big_integer(&signed, sign_span.union(token.span)))
             }
             TokenKind::Decimal(_) => {
                 let token = self.stream.consume();

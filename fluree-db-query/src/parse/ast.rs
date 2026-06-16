@@ -25,6 +25,10 @@ pub enum LiteralValue {
     Long(i64),
     /// Float literal (parsed from JSON number)
     Double(f64),
+    /// Exact decimal literal (xsd:decimal — must not round-trip through f64)
+    Decimal(Box<bigdecimal::BigDecimal>),
+    /// Integer literal beyond i64 (xsd:integer is unbounded)
+    BigInt(Box<num_bigint::BigInt>),
     /// Boolean literal
     Boolean(bool),
     /// Vector literal (fluree:vector)

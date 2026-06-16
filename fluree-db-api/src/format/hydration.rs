@@ -1804,7 +1804,7 @@ impl<'a> HydrationFormatter<'a> {
                 }
                 // Extended numeric types - serialize as string
                 FlakeValue::BigInt(n) => Ok(JsonValue::String(n.to_string())),
-                FlakeValue::Decimal(d) => Ok(JsonValue::String(d.to_string())),
+                FlakeValue::Decimal(d) => Ok(JsonValue::String(d.to_plain_string())),
                 // Temporal types - serialize as original string
                 FlakeValue::DateTime(dt) => Ok(JsonValue::String(dt.to_string())),
                 FlakeValue::Date(d) => Ok(JsonValue::String(d.to_string())),
@@ -1848,7 +1848,7 @@ impl<'a> HydrationFormatter<'a> {
             }
             // Extended numeric types - serialize as string with @type
             FlakeValue::BigInt(n) => JsonValue::String(n.to_string()),
-            FlakeValue::Decimal(d) => JsonValue::String(d.to_string()),
+            FlakeValue::Decimal(d) => JsonValue::String(d.to_plain_string()),
             // Temporal types - serialize as original string with @type
             FlakeValue::DateTime(dt) => JsonValue::String(dt.to_string()),
             FlakeValue::Date(d) => JsonValue::String(d.to_string()),
@@ -1947,7 +1947,7 @@ impl<'a> HydrationFormatter<'a> {
                 return Ok(json!({ "@id": self.compactor.compact_id_sid(sid)? }))
             }
             FlakeValue::BigInt(n) => json!(n.to_string()),
-            FlakeValue::Decimal(d) => json!(d.to_string()),
+            FlakeValue::Decimal(d) => json!(d.to_plain_string()),
             FlakeValue::DateTime(dt) => json!(dt.to_string()),
             FlakeValue::Date(d) => json!(d.to_string()),
             FlakeValue::Time(t) => json!(t.to_string()),
@@ -2067,7 +2067,7 @@ impl<'a> HydrationFormatter<'a> {
             FlakeValue::Null => Ok(JsonValue::Null),
             FlakeValue::Ref(sid) => Ok(json!({ "@id": self.compactor.compact_id_sid(sid)? })),
             FlakeValue::BigInt(n) => Ok(JsonValue::String(n.to_string())),
-            FlakeValue::Decimal(d) => Ok(JsonValue::String(d.to_string())),
+            FlakeValue::Decimal(d) => Ok(JsonValue::String(d.to_plain_string())),
             FlakeValue::DateTime(dt) => Ok(JsonValue::String(dt.to_string())),
             FlakeValue::Date(d) => Ok(JsonValue::String(d.to_string())),
             FlakeValue::Time(t) => Ok(JsonValue::String(t.to_string())),

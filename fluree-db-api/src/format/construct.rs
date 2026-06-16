@@ -395,7 +395,7 @@ fn binding_to_ir_term(
                     language: None,
                 })),
                 FlakeValue::Decimal(d) => Ok(Some(IrTerm::Literal {
-                    value: LiteralValue::String(Arc::from(d.to_string())),
+                    value: LiteralValue::String(Arc::from(d.to_plain_string())),
                     datatype: Datatype::from_iri(&dt_iri),
                     language: None,
                 })),
@@ -528,7 +528,7 @@ fn flake_value_to_ir_term(val: &FlakeValue) -> Result<Option<IrTerm>> {
             language: None,
         }),
         FlakeValue::Decimal(d) => Some(IrTerm::Literal {
-            value: LiteralValue::String(Arc::from(d.to_string())),
+            value: LiteralValue::String(Arc::from(d.to_plain_string())),
             datatype: Datatype::xsd_decimal(),
             language: None,
         }),

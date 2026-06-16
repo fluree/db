@@ -8,6 +8,7 @@ mod events;
 mod export;
 #[cfg(feature = "iceberg")]
 mod iceberg;
+mod import;
 mod ledger;
 mod log;
 mod nameservice_refs;
@@ -49,7 +50,18 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/revert", post(ledger::revert))
         // RDF export bypasses per-flake policy filtering today, so it lives in
         // the admin-protected bracket alongside other root-level operations.
-        .route("/export/*ledger", post(export::export_ledger_tail));
+        .route("/export/*ledger", post(export::export_ledger_tail))
+        // Wholesale .flpack restore: creates a new ledger from a trusted
+        // archive. Writes prebuilt index artifacts, so admin-gated.
+        .route("/import/*ledger", post(import::import_ledger_tail))
+        // Negotiated upload flow for size-capped clients (mint/complete/status
+        // are admin-gated; the blob PUT below is token-authorized).
+        .route("/import-upload", post(import::mint_upload))
+        .route(
+            "/import-upload/:import_id/complete",
+            post(import::complete_upload),
+        )
+        .route("/import-upload/:import_id", get(import::import_status));
 
     #[cfg(feature = "iceberg")]
     let v1_admin_protected_routes =
@@ -109,6 +121,18 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/commits/*ledger", get(commits::commits_ledger_tail))
         // Binary pack stream endpoint (efficient clone/pull)
         .route("/pack/*ledger", post(pack::pack_ledger_tail))
+        // Negotiated-upload blob sink (token-authorized via the minted URL, so
+        // it sits outside the admin bracket — the URL is the capability).
+        .route(
+            "/import-upload/:import_id/blob",
+            axum::routing::put(import::put_blob),
+        )
+        // Negotiated-upload multipart part sink (also token-authorized via the
+        // minted URL, so it sits outside the admin bracket).
+        .route(
+            "/import-upload/:import_id/part/:part_number",
+            axum::routing::put(import::put_part),
+        )
         // SSE event streaming
         .route("/events", get(events::events))
         // Storage proxy endpoints (for peer mode)

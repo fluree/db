@@ -322,7 +322,7 @@ fn write_lit(
 fn stringified(val: &FlakeValue) -> String {
     match val {
         FlakeValue::BigInt(n) => n.to_string(),
-        FlakeValue::Decimal(d) => d.to_string(),
+        FlakeValue::Decimal(d) => d.to_plain_string(),
         other => other.to_string(),
     }
 }
@@ -434,7 +434,7 @@ pub(crate) fn format_binding(
                     "@type": dt_iri
                 })),
                 FlakeValue::Decimal(d) => Ok(json!({
-                    "@value": d.to_string(),
+                    "@value": d.to_plain_string(),
                     "@type": dt_iri
                 })),
                 // Temporal types - serialize as original string with datatype

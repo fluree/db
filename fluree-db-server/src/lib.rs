@@ -29,6 +29,7 @@ pub mod config;
 pub mod config_file;
 pub mod error;
 pub mod extract;
+pub mod import_jobs;
 #[cfg(feature = "oidc")]
 pub mod jwks;
 pub mod mcp;

@@ -101,24 +101,79 @@ pub struct MemoryStore {
     /// read-modify-write sequence concurrently can leave the file watermark and
     /// cache diverged, causing rebuild storms.
     mutation_lock: Mutex<()>,
+    /// Hash of the `.ttl` file content that **this process's** ledger cache
+    /// currently reflects (`None` until the first sync).
+    ///
+    /// The on-disk `.local/build-hash` is shared by every process, so it only
+    /// records who wrote the files *last* — it cannot tell a long-lived process
+    /// that another process changed the files out from under its in-memory
+    /// ledger. This per-process watermark closes that gap: it is advanced only
+    /// by our own rebuilds and mutations, so when the live file hash diverges
+    /// from it we know our ledger is stale and must rebuild before reading.
+    synced_hash: std::sync::Mutex<Option<String>>,
+    /// Whether the first sync may seed [`Self::synced_hash`] from the on-disk
+    /// `build-hash` instead of forcing a rebuild.
+    ///
+    /// True for a **persistent** (file-backed) ledger: at startup the loaded
+    /// ledger is consistent with the on-disk hash, so seeding avoids a needless
+    /// rebuild on every short-lived CLI invocation. False for an **ephemeral**
+    /// (in-memory) ledger: a fresh process starts empty and must rebuild from
+    /// the files before it can answer queries, so it must not trust the shared
+    /// on-disk hash.
+    seed_watermark_from_disk: bool,
 }
 
 impl MemoryStore {
-    /// Create a new memory store wrapping a Fluree instance.
+    /// Create a memory store backed by a **persistent** (file-backed) ledger.
     ///
     /// Pass `memory_dir` to enable file-based sync (e.g., `.fluree-memory/`).
     /// Pass `None` for legacy behavior (ledger-only, no file sharing).
     pub fn new(fluree: Fluree, memory_dir: Option<PathBuf>) -> Self {
+        Self::build(fluree, memory_dir, true)
+    }
+
+    /// Create a memory store backed by an **ephemeral** (in-memory) ledger.
+    ///
+    /// Use this when the ledger is a process-private cache that does not persist
+    /// across restarts (e.g. `mcp serve`, where many processes share one
+    /// `.fluree-memory` directory). The ledger is rebuilt from the `.ttl` files
+    /// on first use, so the watermark must not be seeded from the shared
+    /// on-disk hash.
+    pub fn new_ephemeral_ledger(fluree: Fluree, memory_dir: Option<PathBuf>) -> Self {
+        Self::build(fluree, memory_dir, false)
+    }
+
+    fn build(fluree: Fluree, memory_dir: Option<PathBuf>, seed_watermark_from_disk: bool) -> Self {
         Self {
             fluree,
             memory_dir,
             mutation_lock: Mutex::new(()),
+            synced_hash: std::sync::Mutex::new(None),
+            seed_watermark_from_disk,
         }
+    }
+
+    /// Whether the first sync may seed the watermark from the on-disk hash.
+    pub(crate) fn seed_watermark_from_disk(&self) -> bool {
+        self.seed_watermark_from_disk
     }
 
     /// The memory directory path, if file-based sync is enabled.
     pub fn memory_dir(&self) -> Option<&Path> {
         self.memory_dir.as_deref()
+    }
+
+    /// The file-content hash this process's ledger currently reflects.
+    pub(crate) fn synced_hash(&self) -> Option<String> {
+        self.synced_hash
+            .lock()
+            .expect("synced_hash poisoned")
+            .clone()
+    }
+
+    /// Record the file-content hash this process's ledger now reflects.
+    pub(crate) fn set_synced_hash(&self, hash: Option<String>) {
+        *self.synced_hash.lock().expect("synced_hash poisoned") = hash;
     }
 
     /// Check if the memory ledger has been initialized.
@@ -221,6 +276,10 @@ impl MemoryStore {
     /// Drop and reinitialize the `__memory` ledger while the caller already
     /// holds the store mutation lock.
     pub(crate) async fn drop_and_reinit_unlocked(&self) -> Result<()> {
+        // The ledger is about to be emptied, so it no longer reflects any file
+        // content. Clear the watermark so the next sync rebuilds from the files.
+        self.set_synced_hash(None);
+
         // Delete the ledger if it exists
         if self.is_initialized().await? {
             debug!("Dropping __memory ledger for rebuild");
@@ -256,6 +315,22 @@ impl MemoryStore {
         Ok(())
     }
 
+    /// Rebuild the ledger from files if this process's ledger is stale,
+    /// assuming the caller **already holds** the mutation lock and the
+    /// cross-process file lock.
+    ///
+    /// Mutations call this after taking both locks and before reading the
+    /// current memory set, so the sync-from-file and the subsequent file
+    /// rewrite happen in one uninterrupted critical section. That closes the
+    /// window where another process could write the files in between, which
+    /// would otherwise be silently overwritten by the stale-ledger rewrite.
+    async fn sync_under_lock(&self) -> Result<()> {
+        if let Some(dir) = &self.memory_dir {
+            crate::file_sync::rebuild_if_stale_unlocked(self, dir).await?;
+        }
+        Ok(())
+    }
+
     /// Insert a JSON-LD document into the memory ledger (used by rebuild).
     pub async fn transact_insert(&self, doc: &Value) -> Result<()> {
         self.fluree
@@ -279,6 +354,7 @@ impl MemoryStore {
         let _guard = self.mutation_lock.lock().await;
         let file_lock = self.acquire_file_lock().await?;
         self.initialize().await?;
+        self.sync_under_lock().await?;
 
         let id = crate::id::generate_memory_id(input.kind);
         let created_at = Utc::now().to_rfc3339();
@@ -328,7 +404,8 @@ impl MemoryStore {
 
         // Update the file watermark only after cache commit succeeds.
         if let Some(dir) = &self.memory_dir {
-            crate::file_sync::update_hash(dir)?;
+            let hash = crate::file_sync::update_hash(dir)?;
+            self.set_synced_hash(Some(hash));
         }
 
         debug!(id = %id, kind = %mem.kind, "Memory added");
@@ -377,6 +454,7 @@ WHERE {{\n\
         let _guard = self.mutation_lock.lock().await;
         let file_lock = self.acquire_file_lock().await?;
         self.initialize().await?;
+        self.sync_under_lock().await?;
 
         let expanded = expand_id(id);
         let compact = compact_id(&expanded);
@@ -449,7 +527,8 @@ WHERE {{\n\
 
         // Update the file watermark only after cache commits succeed.
         if let Some(dir) = &self.memory_dir {
-            crate::file_sync::update_hash(dir)?;
+            let hash = crate::file_sync::update_hash(dir)?;
+            self.set_synced_hash(Some(hash));
         }
 
         debug!(id = %compact, "Memory updated in place");
@@ -465,6 +544,7 @@ WHERE {{\n\
         let _guard = self.mutation_lock.lock().await;
         let file_lock = self.acquire_file_lock().await?;
         self.initialize().await?;
+        self.sync_under_lock().await?;
 
         let expanded = expand_id(id);
         let compact = compact_id(&expanded);
@@ -518,7 +598,8 @@ WHERE {{\n\
 
         // Update the file watermark only after cache commit succeeds.
         if let Some(dir) = &self.memory_dir {
-            crate::file_sync::update_hash(dir)?;
+            let hash = crate::file_sync::update_hash(dir)?;
+            self.set_synced_hash(Some(hash));
         }
 
         debug!(id = %id, "Memory forgotten");

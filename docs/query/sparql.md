@@ -567,7 +567,7 @@ the graphs listed.
 
 - `STRDT(?str, ?datatype)` - String to typed literal
 - `STRLANG(?str, ?lang)` - String with language
-- `DATATYPE(?literal)` - Datatype
+- `DATATYPE(?literal)` - Datatype IRI of a literal (per W3C SPARQL 1.1 §17.4.2.3, an IRI term — e.g. the `xsd:decimal` IRI, **not** the string `"xsd:decimal"`). Compare it against a datatype IRI directly, e.g. `FILTER(DATATYPE(?v) = xsd:decimal)`. SPARQL results render it as the full IRI; JSON-LD results compact it against the active `@context`.
 - `IRI(?str)` - IRI from string
 - `URI(?str)` - URI from string
 - `BNODE(?str)` - Blank node

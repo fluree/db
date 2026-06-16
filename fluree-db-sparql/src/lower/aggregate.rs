@@ -42,6 +42,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                     format!("\"{}\"^^{}", value, Self::iri_key(datatype))
                 }
                 LiteralValue::Integer(i) => format!("{i}"),
+                LiteralValue::BigInteger(s) => format!("{s}"),
                 LiteralValue::Decimal(d) => format!("{d}"),
                 LiteralValue::Double(d) => format!("{d}"),
                 LiteralValue::Boolean(b) => format!("{b}"),

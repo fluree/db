@@ -187,8 +187,26 @@ async fn shutdown_tracer() {
     }
 }
 
-#[tokio::main]
-async fn main() {
+/// Worker-thread stack size for the CLI runtime.
+///
+/// The default Tokio worker stack is 2 MB. The `fluree memory` / `mcp serve`
+/// subsystem composes a deep async chain when it rebuilds its ledger cache from
+/// the `.ttl` files inside a mutation's locked critical section
+/// (`add` → file-sync → `transact` → `commit`), which can exceed 2 MB and abort
+/// the worker. A larger stack covers that bounded depth; stacks are committed
+/// lazily, so the unused headroom costs no resident memory.
+const WORKER_STACK_SIZE: usize = 8 * 1024 * 1024;
+
+fn main() {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(WORKER_STACK_SIZE)
+        .build()
+        .expect("failed to build Tokio runtime")
+        .block_on(async_main());
+}
+
+async fn async_main() {
     let cli = Cli::parse();
 
     // Disable color when --no-color flag or NO_COLOR env var is set.

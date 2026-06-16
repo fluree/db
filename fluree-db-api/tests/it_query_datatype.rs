@@ -257,7 +257,9 @@ async fn datatype_filter_with_datatype_function() {
         "where": [
             {"ex:name":"?name","ex:age":"?age"},
             ["bind","?dt",["expr",["datatype","?age"]]],
-            ["filter", "(= \"xsd:integer\" ?dt)"]
+            // DATATYPE returns the datatype IRI (SPARQL 1.1 §17.4.2.3), so the
+            // filter compares against the xsd:integer IRI, not a compact string.
+            ["filter", "(= ?dt (iri \"http://www.w3.org/2001/XMLSchema#integer\"))"]
         ]
     });
 
@@ -267,6 +269,46 @@ async fn datatype_filter_with_datatype_function() {
         .to_jsonld(&ledger.snapshot)
         .unwrap();
     assert_eq!(rows, json!([["Homer", 36, "xsd:integer"]]));
+}
+
+/// Regression: `FILTER(DATATYPE(?v) = xsd:decimal)` in SPARQL must match
+/// decimal-typed literals. SPARQL 1.1 §17.4.2.3 requires DATATYPE to return the
+/// datatype *IRI*, so the comparison is IRI-vs-IRI. Previously DATATYPE returned
+/// a compact string (`"xsd:decimal"`) and this filter matched nothing.
+#[tokio::test]
+async fn datatype_function_compares_against_xsd_iri_in_sparql() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "dt-iri:main");
+    fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": ctx_datatype(),
+                "@graph": [
+                    {"@id":"ex:a","ex:price":{"@value":"1.50","@type":"xsd:decimal"}},
+                    {"@id":"ex:b","ex:price":{"@value":"2.75","@type":"xsd:decimal"}},
+                    {"@id":"ex:c","ex:price":{"@value":42,"@type":"xsd:integer"}}
+                ]
+            }),
+        )
+        .await
+        .expect("insert");
+
+    let db = fluree.db("dt-iri:main").await.expect("indexed view");
+    let q = "PREFIX ex: <http://example.org/ns/>\n\
+             PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>\n\
+             SELECT ?s WHERE { ?s ex:price ?v FILTER(DATATYPE(?v) = xsd:decimal) } ORDER BY ?s";
+    let rows = fluree
+        .query(&db, QueryInput::Sparql(q))
+        .await
+        .expect("sparql query")
+        .to_jsonld(&db.snapshot)
+        .expect("to_jsonld");
+    // Only the two xsd:decimal subjects match; the xsd:integer one does not.
+    assert_eq!(
+        normalize_rows(&rows),
+        normalize_rows(&json!([["ex:a"], ["ex:b"]]))
+    );
 }
 
 #[tokio::test]
@@ -895,7 +937,8 @@ async fn json_datatype_insert_query_and_filter() {
         "where": [
             {"ex:name": "?name", "ex:data": "?data"},
             ["bind", "?dt", ["expr", ["datatype", "?data"]]],
-            ["filter", "(= \"@json\" ?dt)"]
+            // DATATYPE returns the datatype IRI; @json is rdf:JSON.
+            ["filter", "(= ?dt (iri \"http://www.w3.org/1999/02/22-rdf-syntax-ns#JSON\"))"]
         ]
     });
     let rows2 = support::query_jsonld(&fluree, &ledger, &q2)
@@ -1108,9 +1151,11 @@ async fn decimal_string_input_becomes_bigdecimal_preserves_precision() {
 }
 
 #[tokio::test]
-async fn decimal_json_number_input_becomes_double() {
-    // JSON number input with xsd:decimal → Double (lossy, per policy)
-    // JSON parsing already lost precision, so we keep it as f64
+async fn decimal_json_number_input_is_exact() {
+    // JSON number input with xsd:decimal → exact BigDecimal. The written
+    // lexical is recovered via the shortest round-trip f64 representation,
+    // so 3.13 stores as the exact decimal 3.13, not the nearest binary
+    // double.
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger0 = genesis_ledger(&fluree, "decimal-test:json-number");
     let ctx = json!({
@@ -1124,13 +1169,11 @@ async fn decimal_json_number_input_becomes_double() {
         "@graph": [
             {
                 "@id": "ex:item1",
-                // JSON number 3.13 loses precision during JSON parsing
-                // Per policy: JSON numbers with xsd:decimal become Double
                 "ex:value": {"@value": 3.13, "@type": "xsd:decimal"}
             },
             {
                 "@id": "ex:item2",
-                // Integer JSON number with xsd:decimal → also Double
+                // Integer JSON number with xsd:decimal → exact decimal 42
                 "ex:value": {"@value": 42, "@type": "xsd:decimal"}
             }
         ]
@@ -1154,15 +1197,35 @@ async fn decimal_json_number_input_becomes_double() {
         .unwrap();
     let arr = rows.as_array().unwrap();
 
+    // BigDecimal serializes via string to preserve precision; accept either
+    // the bare string or the {"@value": ...} object form.
+    fn decimal_lexical(v: &serde_json::Value) -> String {
+        if let Some(s) = v.as_str() {
+            s.to_string()
+        } else if let Some(obj) = v.as_object() {
+            obj.get("@value")
+                .and_then(|v| v.as_str())
+                .expect("@value string")
+                .to_string()
+        } else {
+            panic!("expected exact decimal rendering, got: {v}");
+        }
+    }
+
     assert_eq!(arr.len(), 2);
-    // JSON numbers become Double, which serializes as JSON number
     assert_eq!(arr[0][0], "ex:item1");
-    // 3.13 as f64 should round-trip to 3.13
-    assert_eq!(arr[0][1].as_f64(), Some(3.13), "item1 value should be 3.13");
+    assert_eq!(
+        decimal_lexical(&arr[0][1]),
+        "3.13",
+        "item1 value should be the exact decimal 3.13"
+    );
 
     assert_eq!(arr[1][0], "ex:item2");
-    // Integer 42 as Double - JSON may serialize as 42 or 42.0
-    assert_eq!(arr[1][1].as_f64(), Some(42.0), "item2 value should be 42.0");
+    assert_eq!(
+        decimal_lexical(&arr[1][1]),
+        "42",
+        "item2 value should be the exact decimal 42"
+    );
 
     // Verify explicit datatype xsd:decimal is preserved even when value is Double
     let dt1 = arr[0][2].as_str().unwrap();
@@ -1797,7 +1860,9 @@ async fn indexed_inline_numerics_roundtrip_through_distinct_filter_sum() {
         .await,
         normalize_rows(&json!([[70]]))
     );
-    // DATATYPE round-trips to xsd:integer (dt_id resolves back to the o_type).
+    // DATATYPE round-trips to the xsd:integer IRI (dt_id resolves back to the
+    // o_type). No xsd prefix is in scope for this serialization, so it renders
+    // as the full datatype IRI.
     assert_eq!(
         rows(
             &fluree,
@@ -1805,7 +1870,7 @@ async fn indexed_inline_numerics_roundtrip_through_distinct_filter_sum() {
             &format!("{P} SELECT DISTINCT (DATATYPE(?age) AS ?dt) WHERE {{ ?s ex:age ?age }}")
         )
         .await,
-        normalize_rows(&json!([["xsd:integer"]]))
+        normalize_rows(&json!([["http://www.w3.org/2001/XMLSchema#integer"]]))
     );
     // Inline doubles encode (NUM_F64) and DISTINCT-dedup too.
     assert_eq!(
