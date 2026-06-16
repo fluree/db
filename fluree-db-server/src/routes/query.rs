@@ -8,17 +8,17 @@
 
 use crate::config::ServerRole;
 use crate::error::{Result, ServerError};
-use crate::extract::{FlureeHeaders, MaybeCredential, MaybeDataBearer, tracking_headers};
+use crate::extract::{tracking_headers, FlureeHeaders, MaybeCredential, MaybeDataBearer};
 // Note: NeedsRefresh is no longer used - replaced by FreshnessSource trait
 use crate::state::AppState;
 use crate::telemetry::{
     create_request_span, extract_request_id, extract_trace_id, log_query_text, set_span_error_code,
     should_log_query_text,
 };
-use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
+use axum::Json;
 use fluree_db_api::dataset::GraphSelector;
 use fluree_db_api::{
     ApiError, DatasetSpec, FreshnessCheck, FreshnessSource, GraphDb, GraphSource, LedgerState,
@@ -28,8 +28,8 @@ use rand::Rng;
 use serde::Deserialize;
 use serde_json::Value as JsonValue;
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::Instrument;
 

@@ -23,8 +23,8 @@ use dashmap::DashMap;
 use fluree_db_api::{Fluree, FlureeBuilder, IndexConfig, NameServiceMode};
 use fluree_db_core::ledger_id::normalize_ledger_id;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Application state shared across all request handlers
