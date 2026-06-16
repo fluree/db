@@ -415,26 +415,26 @@ impl BatchSink for CollectSink {
 }
 
 /// Reject query shapes the streaming endpoint does not support.
+///
+/// Uses `QueryError::InvalidQuery` (not `ApiError::query`, which maps to a 500)
+/// so these client mistakes surface as a `4xx`.
 fn ensure_streamable(output: &fluree_db_query::ir::QueryOutput) -> Result<()> {
+    let reject = |what: &str| {
+        Err(ApiError::Query(fluree_db_query::QueryError::InvalidQuery(
+            format!("{what} queries are not supported on the streaming endpoint; use /query"),
+        )))
+    };
     if output.is_ask() {
-        return Err(ApiError::query(
-            "ASK queries are not supported on the streaming endpoint; use /query",
-        ));
+        return reject("ASK");
     }
     if output.construct_template().is_some() {
-        return Err(ApiError::query(
-            "CONSTRUCT/DESCRIBE queries are not supported on the streaming endpoint; use /query",
-        ));
+        return reject("CONSTRUCT/DESCRIBE");
     }
     if output.is_select_one() {
-        return Err(ApiError::query(
-            "selectOne queries are not supported on the streaming endpoint; use /query",
-        ));
+        return reject("selectOne");
     }
     if output.has_hydration() {
-        return Err(ApiError::query(
-            "hydration queries are not supported on the streaming endpoint; use /query",
-        ));
+        return reject("hydration");
     }
     Ok(())
 }
