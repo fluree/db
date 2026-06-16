@@ -11,8 +11,8 @@ By default this registers **two** servers in one step:
 fluree mcp install [--ide <IDE>] [--server <SERVER>]
 ```
 
-> `fluree memory mcp-install` is a back-compat alias for this command (it always
-> installs both servers).
+> `fluree memory mcp-install` is the memory-namespace installer — it registers
+> the **memory server only** (equivalent to `fluree mcp install --server memory`).
 
 ## Options
 

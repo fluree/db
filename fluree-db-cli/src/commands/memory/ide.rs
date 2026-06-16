@@ -986,8 +986,9 @@ pub(super) fn run_mcp_phase(yes: bool) -> CliResult<()> {
             ));
 
         if confirmed {
-            // `memory init` wires up both servers.
-            match install_tool(dt.tool, &fluree_bin, ServerSel::All) {
+            // The memory namespace installs the memory server only; the docs
+            // server is set up via `fluree mcp install` (the unified installer).
+            match install_tool(dt.tool, &fluree_bin, ServerSel::Memory) {
                 Ok(InstallOutcome::Installed) => {
                     installed_count += 1;
                 }

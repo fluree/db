@@ -24,18 +24,14 @@ fluree mcp install --ide zed
     "fluree-memory": {
       "command": "fluree",
       "args": ["mcp", "serve", "--transport", "stdio"]
-    },
-    "fluree-docs": {
-      "command": "fluree",
-      "args": ["docs", "serve", "--transport", "stdio"]
     }
   }
 }
 ```
 
-`fluree mcp install` registers two servers: `fluree-memory` and `fluree-docs`,
-the latter giving the agent version-pinned documentation lookup (`docs_search` /
-`docs_get` / `docs_examples`) — see [fluree docs](../../cli/docs.md).
+> Also use the Fluree database? `fluree mcp install` additionally registers a
+> `fluree-docs` server for version-pinned documentation lookup — see
+> [fluree docs](../../cli/docs.md).
 
 No `FLUREE_HOME` is set by default — the MCP server walks up from Zed's spawn CWD to find the workspace's `.fluree/`. If you need to pin it explicitly, add an `env` block alongside `command`/`args` with an absolute path.
 

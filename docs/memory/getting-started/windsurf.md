@@ -26,18 +26,14 @@ Windsurf uses a **global** MCP config:
     "fluree-memory": {
       "command": "fluree",
       "args": ["mcp", "serve", "--transport", "stdio"]
-    },
-    "fluree-docs": {
-      "command": "fluree",
-      "args": ["docs", "serve", "--transport", "stdio"]
     }
   }
 }
 ```
 
-`fluree mcp install` registers two servers: `fluree-memory` and `fluree-docs`,
-the latter giving the agent version-pinned documentation lookup (`docs_search` /
-`docs_get` / `docs_examples`) — see [fluree docs](../../cli/docs.md).
+> Also use the Fluree database? `fluree mcp install` additionally registers a
+> `fluree-docs` server for version-pinned documentation lookup — see
+> [fluree docs](../../cli/docs.md).
 
 Because the config is global, it's wired once and every Windsurf project can use it. The MCP server figures out which repo it's serving by walking up from its spawn CWD until it finds a `.fluree/` directory; in normal use Windsurf spawns it from the workspace root so this works without extra configuration. No `FLUREE_HOME` is set by default.
 

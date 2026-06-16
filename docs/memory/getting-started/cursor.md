@@ -38,21 +38,14 @@ fluree mcp install --ide cursor
       "env": {
         "FLUREE_HOME": "${workspaceFolder}/.fluree"
       }
-    },
-    "fluree-docs": {
-      "type": "stdio",
-      "command": "fluree",
-      "args": ["docs", "serve", "--transport", "stdio"]
     }
   }
 }
 ```
 
-`mcp-install` registers two servers: `fluree-memory` (above) and `fluree-docs`,
-which gives the agent version-pinned documentation lookup (`docs_search` /
-`docs_get` / `docs_examples`) — see [fluree docs](../../cli/docs.md). Only
-`fluree-memory` needs `FLUREE_HOME`; the docs corpus is embedded, so `fluree-docs`
-is stateless.
+> Also use the Fluree database? `fluree mcp install` additionally registers a
+> `fluree-docs` server for version-pinned documentation lookup — see
+> [fluree docs](../../cli/docs.md).
 
 `${workspaceFolder}` is a Cursor config-interpolation token — the MCP server is always launched with `FLUREE_HOME` pointing at the current project, so memories stay scoped to the repo even if Cursor spawns the process from a different working directory.
 

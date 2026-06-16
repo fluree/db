@@ -294,11 +294,11 @@ fluree memory import memories.json
 
 ## fluree memory mcp-install
 
-> Back-compat alias for [`fluree mcp install`](mcp.md#fluree-mcp-install). It
-> always installs **both** the `fluree-memory` and `fluree-docs` servers. Prefer
-> `fluree mcp install`, which also supports `--server memory|docs|all`.
+> Registers the **memory server only**. To also set up the version-pinned docs
+> server, use [`fluree mcp install`](mcp.md#fluree-mcp-install) (installs both by
+> default, or use `--server memory|docs|all` to scope).
 
-Install MCP configuration for an IDE so agents can use the memory (and docs) tools.
+Install MCP configuration for an IDE so agents can use the memory tools.
 
 ```bash
 fluree memory mcp-install [--ide <IDE>]

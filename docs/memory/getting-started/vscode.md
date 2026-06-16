@@ -28,21 +28,16 @@ fluree mcp install --ide vscode
       "type": "stdio",
       "command": "fluree",
       "args": ["mcp", "serve", "--transport", "stdio"]
-    },
-    "fluree-docs": {
-      "type": "stdio",
-      "command": "fluree",
-      "args": ["docs", "serve", "--transport", "stdio"]
     }
   }
 }
 ```
 
-`fluree mcp install` registers two servers: `fluree-memory` and `fluree-docs`,
-the latter giving the agent version-pinned documentation lookup (`docs_search` /
-`docs_get` / `docs_examples`) — see [fluree docs](../../cli/docs.md).
+> Also use the Fluree database? `fluree mcp install` additionally registers a
+> `fluree-docs` server for version-pinned documentation lookup — see
+> [fluree docs](../../cli/docs.md).
 
-Unlike the Cursor config, the `fluree-memory` entry does not set `FLUREE_HOME` — VS Code normally spawns the server from the workspace root, so the walk-up logic in `fluree mcp serve` finds `.fluree/` on its own. If you need to pin the location explicitly (e.g. the server is ending up in a global store), add an `env` block pointing at the absolute path to `<repo>/.fluree/`.
+Unlike the Cursor config, this entry does not set `FLUREE_HOME` — VS Code normally spawns the server from the workspace root, so the walk-up logic in `fluree mcp serve` finds `.fluree/` on its own. If you need to pin the location explicitly (e.g. the server is ending up in a global store), add an `env` block pointing at the absolute path to `<repo>/.fluree/`.
 
 ## Verify
 

@@ -116,8 +116,8 @@ fluree mcp install --ide cursor --server docs
 For the per-IDE config shapes this writes, see
 [Memory: IDE setup](../memory/cli/mcp-install.md).
 
-> The older `fluree memory mcp-install` is a back-compat alias for
-> `fluree mcp install` (it always installs both servers).
+> `fluree memory mcp-install` is the memory-namespace installer — it registers
+> the memory server only (equivalent to `fluree mcp install --server memory`).
 
 ## See Also
 

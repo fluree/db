@@ -65,10 +65,9 @@ pub async fn run(action: MemoryAction, dirs: &FlureeDir) -> CliResult<()> {
         MemoryAction::Export => run_export(dirs).await,
         MemoryAction::Import { file } => run_import(&file, dirs).await,
         MemoryAction::McpInstall { ide: ide_arg } => {
-            eprintln!(
-                "note: `fluree memory mcp-install` is now `fluree mcp install` (this alias still works)."
-            );
-            mcp_install(ide_arg.as_deref(), "all")
+            // Memory namespace installs the memory server only. `fluree mcp
+            // install` is the unified installer that also sets up Fluree docs.
+            mcp_install(ide_arg.as_deref(), "memory")
         }
     }
 }
