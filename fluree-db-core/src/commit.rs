@@ -19,7 +19,7 @@ use crate::error::{Error, Result};
 use crate::{CommitId, ContentId, ContentStore, Flake};
 use codec::format::CommitSignature;
 use futures::stream::{self, Stream};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 /// Transaction signature — audit record of who submitted a transaction.
@@ -27,7 +27,7 @@ use std::collections::HashMap;
 /// The raw signed transaction (JWS/VC) is stored separately via content-addressed
 /// storage. The `txn_id` provides a content-addressed reference to retrieve and
 /// re-verify the original signed transaction.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TxnSignature {
     /// Verified signer identity (did:key:z6Mk...)
     pub signer: String,
@@ -53,7 +53,7 @@ pub const MAX_TXN_META_BYTES: usize = 65536;
 ///
 /// Stored in the commit envelope for replay-safe persistence, then emitted to
 /// the txn-meta graph (`g_id=1`) during indexing.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TxnMetaEntry {
     /// Predicate namespace code
     pub predicate_ns: u16,
@@ -78,7 +78,7 @@ impl TxnMetaEntry {
 ///
 /// Supports the same value types as normal RDF literals and references,
 /// using ns_code + name for compact encoding.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum TxnMetaValue {
     /// Plain string literal (xsd:string)
     String(String),

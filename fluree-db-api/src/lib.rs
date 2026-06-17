@@ -240,9 +240,9 @@ pub use fluree_db_query::{Term, TriplePattern};
 pub use fluree_db_query::ir::Query;
 pub use fluree_db_query::parse::ParseError;
 pub use fluree_db_transact::{
-    build_commit, lower_sparql_update, lower_sparql_update_ast, CommitOpts, CommitReceipt,
-    LowerError as SparqlUpdateLowerError, NamespaceRegistry, StagedCommit, TransactError, TxnOpts,
-    TxnType,
+    build_commit, lower_sparql_update, lower_sparql_update_ast, CommitOpts, CommitOptsRequest,
+    CommitReceipt, LowerError as SparqlUpdateLowerError, NamespaceRegistry, StagedCommit,
+    TransactError, TxnOpts, TxnType,
 };
 
 // Re-export SPARQL types (product feature; always enabled)

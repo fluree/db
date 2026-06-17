@@ -30,6 +30,7 @@ use fluree_db_nameservice::{CasResult, NameServiceLookup, RefKind, RefPublisher,
 use fluree_db_novelty::{generate_commit_flakes, stamp_graph_on_commit_flakes};
 use fluree_db_novelty::{Commit, SigningKey, TxnMetaEntry, TxnMetaValue, TxnSignature};
 use fluree_db_query::BinaryRangeProvider;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::Instrument;
@@ -304,6 +305,74 @@ impl CommitOpts {
     pub fn with_timestamp(mut self, ts: impl Into<String>) -> Self {
         self.timestamp = Some(ts.into());
         self
+    }
+}
+
+/// Serializable subset of [`CommitOpts`] carrying only the fields a
+/// transactor client supplies at submission time.
+///
+/// Used to round-trip a transaction request through content-addressed
+/// storage (e.g. the Raft command queue): the leader extracts this
+/// projection from the incoming `CommitOpts`, writes the enclosing
+/// envelope to CAS, and the worker rehydrates a runtime [`CommitOpts`]
+/// via [`Self::into_commit_opts`].
+///
+/// Fields excluded by design:
+/// - `signing_key` — node-level credential resolved worker-side from
+///   local config, never transmitted with the request.
+/// - `raw_txn_upload` — runtime task; the worker re-spawns it from the
+///   body bytes.
+/// - `graph_delta` / `namespace_delta` / `skip_backpressure` /
+///   `skip_sequencing` / `merge_parents` — populated during staging or
+///   reserved for the rebase/merge paths, which carry their own
+///   request envelopes when they join the queue.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct CommitOptsRequest {
+    pub identity: Option<String>,
+    pub txn_signature: Option<TxnSignature>,
+    pub txn_meta: Vec<TxnMetaEntry>,
+    pub timestamp: Option<String>,
+}
+
+impl CommitOptsRequest {
+    /// Lift the request-side projection into a runtime [`CommitOpts`].
+    /// Node-side and staging-side fields stay at their defaults; the
+    /// worker layers them in (e.g. attaching `signing_key` from local
+    /// config or spawning the `raw_txn_upload`) before passing the opts
+    /// to the staging path.
+    pub fn into_commit_opts(self) -> CommitOpts {
+        CommitOpts {
+            identity: self.identity,
+            raw_txn_upload: None,
+            signing_key: None,
+            txn_signature: self.txn_signature,
+            txn_meta: self.txn_meta,
+            graph_delta: HashMap::new(),
+            namespace_delta: None,
+            skip_backpressure: false,
+            skip_sequencing: false,
+            merge_parents: Vec::new(),
+            timestamp: self.timestamp,
+        }
+    }
+}
+
+impl From<CommitOptsRequest> for CommitOpts {
+    fn from(req: CommitOptsRequest) -> Self {
+        req.into_commit_opts()
+    }
+}
+
+impl From<&CommitOpts> for CommitOptsRequest {
+    /// Extract the serializable client-supplied subset. Node-side and
+    /// staging-side fields are dropped.
+    fn from(opts: &CommitOpts) -> Self {
+        Self {
+            identity: opts.identity.clone(),
+            txn_signature: opts.txn_signature.clone(),
+            txn_meta: opts.txn_meta.clone(),
+            timestamp: opts.timestamp.clone(),
+        }
     }
 }
 

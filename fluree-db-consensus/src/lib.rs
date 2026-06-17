@@ -51,7 +51,7 @@ use fluree_db_api::{
     CommitId, ConflictStrategy, GovernanceOptions, IndexingStatus, RevertSelection,
     TrackingOptions, TrackingTally,
 };
-use fluree_db_transact::{CommitOpts, CommitReceipt, TxnOpts};
+use fluree_db_transact::{CommitOpts, CommitOptsRequest, CommitReceipt, TxnOpts};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
@@ -123,6 +123,7 @@ impl IdempotencyCacheKey {
 /// semantics, so invalid combinations (e.g. Turtle-Update, TriG-Insert)
 /// are unrepresentable at the type level. SPARQL UPDATE encodes its own
 /// semantics in the query and so has no per-op variants.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum TransactionBody {
     /// JSON-LD document staged as pure insert (no retractions).
     JsonLdInsert(JsonValue),
@@ -202,6 +203,29 @@ impl TransactionBody {
         }
         hasher.finalize().into()
     }
+}
+
+/// Serializable envelope a consensus-coordinated committer writes to
+/// shared content-addressed storage before enqueueing a transaction.
+///
+/// The CID of this blob is what travels through the Raft command queue
+/// (as `EnqueueCommandArgs::request_cid`); the worker reads the blob
+/// back to recover everything it needs to stage the commit. Bundling
+/// the per-request context here means the queue itself stays thin
+/// (one CID + a body-kind discriminator) and we don't have to
+/// replicate large opaque values through the Raft log.
+///
+/// Fields mirror the request-side projection of [`TransactionRequest`].
+/// Node-side concerns (signing keys, in-flight upload handles) live on
+/// the runtime [`CommitOpts`] and are rehydrated worker-side — they do
+/// not travel through CAS.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueuedRequest {
+    pub body: TransactionBody,
+    pub txn_opts: TxnOpts,
+    pub commit_opts: CommitOptsRequest,
+    pub tracking: Option<TrackingOptions>,
+    pub governance: GovernanceOptions,
 }
 
 /// Transaction submission payload.

@@ -148,15 +148,15 @@ pub struct ApplyRecord {
     /// SHA-256 of the request body. Lets a retry detect "same key,
     /// different body" — a client bug that should surface rather
     /// than silently dedup. Populated by the legacy [`Command::AdvanceRef`]
-    /// path. Queue-mediated commits use [`Self::body_cid`] instead.
+    /// path. Queue-mediated commits use [`Self::request_cid`] instead.
     pub body_hash: [u8; 32],
-    /// CAS identifier of the request body for queue-mediated commits
-    /// (see `Command::EnqueueCommand`). `None` for legacy AdvanceRef
-    /// applies. During the migration window both fields coexist; the
-    /// AdvanceRef path goes away in a later step and this becomes
-    /// the sole body identity.
+    /// CAS identifier of the [`crate::QueuedRequest`] envelope this
+    /// commit was staged from (see `Command::EnqueueCommand`). `None`
+    /// for legacy AdvanceRef applies. During the migration window
+    /// both fields coexist; the AdvanceRef path goes away in a later
+    /// step and this becomes the sole request identity.
     #[serde(default)]
-    pub body_cid: Option<ContentId>,
+    pub request_cid: Option<ContentId>,
     /// Wall-clock at which the cache entry was recorded, milliseconds
     /// since the Unix epoch. Used by `Command::EvictIdempotency` to
     /// age out entries past their TTL.
@@ -187,7 +187,7 @@ pub struct IdempotencyContext {
 /// [`NameServiceState::idempotency`] by its [`IdempotencyCacheKey`].
 /// One enum spanning both success and failure cases — `K` was
 /// processed once, here's what happened. Retries with the same
-/// `K` and matching `body_cid` short-circuit to the cached
+/// `K` and matching `request_cid` short-circuit to the cached
 /// outcome without re-running.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ApplyOutcome {
@@ -204,10 +204,10 @@ impl ApplyOutcome {
     /// Body CID this outcome was recorded against. `None` only
     /// for legacy [`Command::AdvanceRef`] applies that pre-date
     /// the queue work; goes away when AdvanceRef is removed.
-    pub fn body_cid(&self) -> Option<&ContentId> {
+    pub fn request_cid(&self) -> Option<&ContentId> {
         match self {
-            ApplyOutcome::Applied(r) => r.body_cid.as_ref(),
-            ApplyOutcome::Failed(r) => Some(&r.body_cid),
+            ApplyOutcome::Applied(r) => r.request_cid.as_ref(),
+            ApplyOutcome::Failed(r) => Some(&r.request_cid),
         }
     }
 
@@ -244,11 +244,13 @@ pub struct QueueEntry {
     /// the Unix epoch.
     pub enqueued_at_millis: u64,
     /// Idempotency key if the caller supplied one. The matching
-    /// `body_cid` check uses [`Self::body_cid`].
+    /// `request_cid` check uses [`Self::request_cid`].
     pub idempotency: Option<IdempotencyCacheKey>,
-    /// CAS identifier for the request body. Always Some — the
-    /// leader writes the body to CAS before proposing.
-    pub body_cid: ContentId,
+    /// CAS identifier of the [`crate::QueuedRequest`] envelope
+    /// holding the body and per-request context. Written by the
+    /// proposing committer before the [`Command::EnqueueCommand`]
+    /// proposal — guaranteed present once the entry lands.
+    pub request_cid: ContentId,
     /// Discriminator the worker uses to choose its processing
     /// path (stage vs verify-pushed-chain).
     pub body_kind: BodyKind,
@@ -277,7 +279,7 @@ pub enum BodyKind {
 /// so the two cases are unambiguous at lookup time.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PoisonRecord {
-    pub body_cid: ContentId,
+    pub request_cid: ContentId,
     pub reason: PoisonReason,
     pub recorded_index: u64,
     pub recorded_at_millis: u64,
@@ -359,7 +361,7 @@ pub struct NameServiceState {
     /// [`Command::PurgeLedger`] runs.
     pub retracted: HashSet<RefKey>,
     /// One cache spanning successful and failed applies — see
-    /// [`ApplyOutcome`]. A retry of `K` with matching `body_cid`
+    /// [`ApplyOutcome`]. A retry of `K` with matching `request_cid`
     /// returns the cached variant without re-running.
     pub idempotency: HashMap<IdempotencyCacheKey, ApplyOutcome>,
     /// Per-branch FIFO of transactor work pending worker processing.
@@ -468,9 +470,10 @@ pub struct EnqueueCommandArgs {
     pub ledger_id: String,
     pub branch: String,
     pub idempotency: Option<IdempotencyCacheKey>,
-    /// CAS identifier for the body the leader wrote before
-    /// proposing. The worker reads this back to dispatch.
-    pub body_cid: ContentId,
+    /// CAS identifier of the [`crate::QueuedRequest`] envelope the
+    /// leader wrote before proposing. The worker reads it back to
+    /// recover the body and per-request context.
+    pub request_cid: ContentId,
     pub body_kind: BodyKind,
     pub applied_at_millis: u64,
 }
@@ -744,12 +747,12 @@ pub enum Response {
         reason: PoisonReason,
     },
     /// [`Command::EvictIdempotency`] removed `removed` entries.
-    /// `released_body_cids` carries CIDs the wrapper should fan
+    /// `released_request_cids` carries CIDs the wrapper should fan
     /// out as `Command::ReleaseContent` (or piggyback on the next
     /// `ApplyHead`).
     EvictionApplied {
         removed: usize,
-        released_body_cids: Vec<ContentId>,
+        released_request_cids: Vec<ContentId>,
     },
     /// Command was understood but no state change resulted (e.g.,
     /// [`Command::ReleaseContent`]).
@@ -933,7 +936,7 @@ fn advance_ref(
             ctx.key,
             ApplyOutcome::Applied(ApplyRecord {
                 body_hash: ctx.body_hash,
-                body_cid: None,
+                request_cid: None,
                 recorded_at_millis: applied_at_millis,
                 head: new_head.clone(),
                 t,
@@ -1307,7 +1310,7 @@ fn apply_enqueue_command(
         ledger_id,
         branch,
         idempotency,
-        body_cid,
+        request_cid,
         body_kind,
         applied_at_millis,
     } = args;
@@ -1315,15 +1318,15 @@ fn apply_enqueue_command(
     let ref_key = RefKey::new(&ledger_id, &branch);
 
     // 1. Idempotency cache — one lookup, branch on outcome
-    //    variant. The body_cid must match; mismatched bodies
+    //    variant. The request_cid must match; mismatched bodies
     //    under the same key are a client bug we surface rather
     //    than silently dedup. Legacy AdvanceRef-populated success
-    //    entries have `body_cid: None`; any queue retry against
+    //    entries have `request_cid: None`; any queue retry against
     //    one of those can't safely match and surfaces as a
     //    BodyHashMismatch (the comparison is undefined).
     if let Some(key) = idempotency.as_ref() {
         if let Some(outcome) = state.idempotency.get(key) {
-            if outcome.body_cid() != Some(&body_cid) {
+            if outcome.request_cid() != Some(&request_cid) {
                 return Response::BodyHashMismatch;
             }
             return match outcome {
@@ -1340,7 +1343,7 @@ fn apply_enqueue_command(
         if let Some(queue) = state.queues.get(&ref_key) {
             for entry in queue {
                 if entry.idempotency.as_ref() == Some(key) {
-                    return if entry.body_cid == body_cid {
+                    return if entry.request_cid == request_cid {
                         Response::InFlight {
                             ledger_id: full_ledger_id,
                             queue_id: entry.queue_id,
@@ -1387,7 +1390,7 @@ fn apply_enqueue_command(
         enqueued_index: log_index,
         enqueued_at_millis: applied_at_millis,
         idempotency,
-        body_cid,
+        request_cid,
         body_kind,
     };
     state.queues.entry(ref_key).or_default().push_back(entry);
@@ -1506,7 +1509,7 @@ fn apply_head(
             key,
             ApplyOutcome::Applied(ApplyRecord {
                 body_hash: [0u8; 32],
-                body_cid: Some(entry.body_cid),
+                request_cid: Some(entry.request_cid),
                 recorded_at_millis: applied_at_millis,
                 head: commit_id.clone(),
                 t: commit_t,
@@ -1547,7 +1550,7 @@ fn apply_poison_queue_entry(
         state.idempotency.insert(
             key,
             ApplyOutcome::Failed(PoisonRecord {
-                body_cid: entry.body_cid,
+                request_cid: entry.request_cid,
                 reason: reason.clone(),
                 recorded_index: log_index,
                 recorded_at_millis: applied_at_millis,
@@ -1586,16 +1589,16 @@ fn apply_evict_idempotency(state: &mut NameServiceState, cutoff_millis: u64) -> 
     expired.sort_by_key(|(at, idx, _)| (*at, *idx));
     expired.truncate(EVICT_BATCH_SIZE);
 
-    let mut released_body_cids = Vec::with_capacity(expired.len());
+    let mut released_request_cids = Vec::with_capacity(expired.len());
     for (_, _, key) in &expired {
         match state.idempotency.remove(key) {
             Some(ApplyOutcome::Applied(record)) => {
-                if let Some(cid) = record.body_cid {
-                    released_body_cids.push(cid);
+                if let Some(cid) = record.request_cid {
+                    released_request_cids.push(cid);
                 }
             }
             Some(ApplyOutcome::Failed(record)) => {
-                released_body_cids.push(record.body_cid);
+                released_request_cids.push(record.request_cid);
             }
             None => {}
         }
@@ -1605,7 +1608,7 @@ fn apply_evict_idempotency(state: &mut NameServiceState, cutoff_millis: u64) -> 
 
     Response::EvictionApplied {
         removed,
-        released_body_cids,
+        released_request_cids,
     }
 }
 
@@ -2809,7 +2812,7 @@ mod tests {
             ledger_id: ledger_id.into(),
             branch: branch.into(),
             idempotency: idempotency.map(|c| c.key),
-            body_cid: cid(body_seed),
+            request_cid: cid(body_seed),
             body_kind: BodyKind::JsonLdInsert,
             applied_at_millis: 1_000,
         })
@@ -2834,7 +2837,7 @@ mod tests {
         assert_eq!(state.queues.get(&key).unwrap().len(), 1);
         let front = state.queues.get(&key).unwrap().front().unwrap();
         assert_eq!(front.queue_id, queue_id);
-        assert_eq!(front.body_cid, cid(7));
+        assert_eq!(front.request_cid, cid(7));
         assert_eq!(state.next_queue_id, queue_id + 1);
     }
 
@@ -2842,12 +2845,12 @@ mod tests {
     fn enqueue_idempotency_hit_short_circuits_on_cached_success() {
         let mut state = NameServiceState::new();
         let key = body_kid("k1");
-        // Pre-populate a cached success record with body_cid set.
+        // Pre-populate a cached success record with request_cid set.
         state.idempotency.insert(
             key.clone(),
             ApplyOutcome::Applied(ApplyRecord {
                 body_hash: [0u8; 32],
-                body_cid: Some(cid(7)),
+                request_cid: Some(cid(7)),
                 recorded_at_millis: 500,
                 head: cid(42),
                 t: 5,
@@ -2887,7 +2890,7 @@ mod tests {
             key.clone(),
             ApplyOutcome::Applied(ApplyRecord {
                 body_hash: [0u8; 32],
-                body_cid: Some(cid(7)),
+                request_cid: Some(cid(7)),
                 recorded_at_millis: 500,
                 head: cid(42),
                 t: 5,
@@ -3069,12 +3072,12 @@ mod tests {
         let ledger = state.ledgers.get("test/db").unwrap();
         assert!(ledger.branches.contains(&"main".to_string()));
 
-        // Idempotency cached with body_cid set (the new queue path).
+        // Idempotency cached with request_cid set (the new queue path).
         let record = match state.idempotency.get(&key).expect("idempotency cached") {
             ApplyOutcome::Applied(r) => r,
             ApplyOutcome::Failed(_) => panic!("expected Applied outcome"),
         };
-        assert_eq!(record.body_cid.as_ref(), Some(&cid(7)));
+        assert_eq!(record.request_cid.as_ref(), Some(&cid(7)));
         assert_eq!(record.head, cid(42));
     }
 
@@ -3261,7 +3264,7 @@ mod tests {
             ApplyOutcome::Failed(r) => r,
             ApplyOutcome::Applied(_) => panic!("expected Failed outcome"),
         };
-        assert_eq!(record.body_cid, cid(7));
+        assert_eq!(record.request_cid, cid(7));
         assert_eq!(record.recorded_index, 3);
         assert!(matches!(
             record.reason,
@@ -3366,13 +3369,13 @@ mod tests {
     // ====================================================================
 
     fn applied_outcome(
-        body_cid: Option<ContentId>,
+        request_cid: Option<ContentId>,
         recorded_at_millis: u64,
         recorded_index: u64,
     ) -> ApplyOutcome {
         ApplyOutcome::Applied(ApplyRecord {
             body_hash: [0u8; 32],
-            body_cid,
+            request_cid,
             recorded_at_millis,
             head: cid(99),
             t: 1,
@@ -3382,12 +3385,12 @@ mod tests {
     }
 
     fn failed_outcome(
-        body_cid: ContentId,
+        request_cid: ContentId,
         recorded_at_millis: u64,
         recorded_index: u64,
     ) -> ApplyOutcome {
         ApplyOutcome::Failed(PoisonRecord {
-            body_cid,
+            request_cid,
             reason: PoisonReason::BodyMalformed {
                 error: "test".into(),
             },
@@ -3418,10 +3421,10 @@ mod tests {
         match resp {
             Response::EvictionApplied {
                 removed,
-                released_body_cids,
+                released_request_cids,
             } => {
                 assert_eq!(removed, 2);
-                let cids: HashSet<_> = released_body_cids.into_iter().collect();
+                let cids: HashSet<_> = released_request_cids.into_iter().collect();
                 assert_eq!(cids, HashSet::from([cid(1), cid(2)]));
             }
             other => panic!("expected EvictionApplied, got {other:?}"),
@@ -3450,8 +3453,8 @@ mod tests {
     }
 
     #[test]
-    fn evict_skips_applied_entries_with_no_body_cid() {
-        // Legacy AdvanceRef applies set `body_cid: None`. Eviction
+    fn evict_skips_applied_entries_with_no_request_cid() {
+        // Legacy AdvanceRef applies set `request_cid: None`. Eviction
         // still removes the entry but the released list stays empty.
         let mut state = NameServiceState::new();
         install_outcome(&mut state, "legacy", applied_outcome(None, 100, 1));
@@ -3460,10 +3463,10 @@ mod tests {
         match resp {
             Response::EvictionApplied {
                 removed,
-                released_body_cids,
+                released_request_cids,
             } => {
                 assert_eq!(removed, 1);
-                assert!(released_body_cids.is_empty());
+                assert!(released_request_cids.is_empty());
             }
             other => panic!("expected EvictionApplied, got {other:?}"),
         }
@@ -3512,10 +3515,10 @@ mod tests {
         match resp {
             Response::EvictionApplied {
                 removed,
-                released_body_cids,
+                released_request_cids,
             } => {
                 assert_eq!(removed, 0);
-                assert!(released_body_cids.is_empty());
+                assert!(released_request_cids.is_empty());
             }
             other => panic!("expected EvictionApplied, got {other:?}"),
         }

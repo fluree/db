@@ -37,7 +37,7 @@ pub fn fuel_to_micro(fuel: f64) -> u64 {
 }
 
 /// Tracking options parsed from query `opts`
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TrackingOptions {
     pub track_time: bool,
     pub track_fuel: bool,
