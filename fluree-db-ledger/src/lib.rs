@@ -77,6 +77,32 @@ pub struct IndexConfig {
 /// Provides a consistent view of the ledger by combining:
 /// - The persisted index (LedgerSnapshot)
 /// - In-memory uncommitted changes (Novelty)
+///
+/// # Invariants
+///
+/// The four copy-on-write `Arc` fields below (`snapshot`, `novelty`,
+/// `dict_novelty`, `runtime_small_dicts`) form ONE coherent bundle but are
+/// mutated independently via `Arc::make_mut`, so their consistency is
+/// hand-maintained at every mutation site — the chronic stateful-bug surface
+/// the 2026-06 audit (§3.3) flagged, which Phase 2's `CoherentLedgerState`
+/// exists to retire:
+///
+/// - **Coherent time/watermarks:** `snapshot.t`, the `novelty` overlaid on it,
+///   and the watermarks `dict_novelty` / `runtime_small_dicts` were built with
+///   must all describe the same point in the commit chain. Applying a commit or
+///   an index must advance all four together.
+/// - **Arc IDENTITY of `dict_novelty` (load-bearing, invisible to the compiler):**
+///   when a `BinaryRangeProvider` is attached (inside `snapshot.range_provider`)
+///   it is constructed with `Arc::clone(&self.dict_novelty)` and must remain the
+///   **same Arc instance**. A later `Arc::make_mut(&mut self.dict_novelty)`
+///   copies-on-write *precisely because the provider still holds a ref*, silently
+///   detaching the provider's copy — overlay translation then misses
+///   post-refresh novelty ids (the disappearing-properties bug class). Whenever
+///   `dict_novelty` is replaced, rebuild the provider from the same bundle;
+///   never mutate one without the other.
+/// - **`binary_store` ↔ `snapshot` agreement:** the type-erased store, when set,
+///   indexes the same `t` and namespace space as `snapshot`, and is attached
+///   together with `range_provider`.
 #[derive(Debug, Clone)]
 pub struct LedgerState {
     /// The indexed snapshot.

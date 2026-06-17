@@ -56,6 +56,17 @@ pub fn subject_reverse_key(ns_code: u16, suffix: &str) -> Box<[u8]> {
 ///
 /// Populated during commit, read during queries, discarded at index build.
 /// Uses watermark routing to partition persisted vs novel entries.
+///
+/// # Invariants
+///
+/// - **Watermark partition / initialization** — see the module-level docs:
+///   `initialized` must be true before any commit on a non-genesis ledger
+///   (`ensure_initialized()` panics unconditionally otherwise), and the
+///   watermarks must equal the paired [`LedgerSnapshot`](crate::LedgerSnapshot)'s.
+/// - **Arc identity** — once shared into a `BinaryRangeProvider` this must stay
+///   the same `Arc` instance as the owning `LedgerState.dict_novelty` (see the
+///   Arc-identity invariant on `LedgerState`). A detached copy makes overlay
+///   translation miss post-refresh novelty ids.
 #[derive(Clone, Debug)]
 pub struct DictNovelty {
     pub subjects: SubjectDictNovelty,

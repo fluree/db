@@ -18,6 +18,14 @@ use std::sync::Arc;
 /// - `Lit` variant NEVER contains `FlakeValue::Ref` - all references use `Sid` variant
 /// - Conversion from flake enforces this
 /// - `Grouped` variant is only produced by GROUP BY and consumed by aggregate functions
+/// - `Poisoned` **blocks** matching (yields no rows), unlike `Unbound`: any
+///   pattern that uses a Poisoned variable matches nothing. Enforced by every
+///   operator's match path, not by the type.
+/// - The late-materialized `Encoded*` variants (`EncodedSid`, `EncodedPid`,
+///   `EncodedLit`) compare by **raw integer id and are single-ledger only** —
+///   valid because `DatasetOperator` decodes them to canonical IRIs at the
+///   cross-ledger boundary. Raw-id comparison across ledgers is wrong and is
+///   prevented by construction, not by the type.
 ///
 /// # Multi-Ledger Support
 ///

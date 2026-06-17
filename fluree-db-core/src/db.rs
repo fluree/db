@@ -62,6 +62,33 @@ pub struct LedgerSnapshotMetadata {
 ///
 /// A pure value type — no storage backend reference. All I/O (loading,
 /// writing) happens at the call site, not inside `Db`.
+///
+/// # Invariants
+///
+/// Held by every mutation path and assumed by every reader; nothing but review
+/// currently enforces them (audit §3.1):
+///
+/// - **Time bounds:** `base_t <= t`. The snapshot answers index queries for any
+///   `target_t` in `base_t..=t`; genesis has `base_t == t == 0`.
+/// - **Namespace bimap:** `namespace_codes` (code→prefix) and `namespace_reverse`
+///   (prefix→code) are exact inverses. Mutate only through the namespace methods,
+///   never the private fields directly.
+/// - **`ns_split_mode` is write-once:** immutable once the first user namespace
+///   code is allocated — changing it would re-split existing IRIs and break
+///   SID decode round-trips.
+/// - **Watermarks mirror the dictionary partition:** `subject_watermarks[code]`
+///   and `string_watermark` are the max persisted local/string ids from the
+///   index root and MUST equal the watermarks the paired
+///   [`DictNovelty`](crate::dict_novelty::DictNovelty) was built with — they are
+///   the boundary that routes a lookup to the persisted
+///   dictionary vs the novel overlay. A snapshot and its `DictNovelty` carrying
+///   different watermarks misroute ids.
+/// - **`graph_registry` mirrors the commit chain:** seeded from the index root
+///   and advanced by `apply_envelope_deltas` for every novelty commit replayed
+///   on top; it must reflect exactly the graph IRIs visible at `t`.
+/// - **`range_provider`, when set, is built from this snapshot's dictionaries**
+///   — see the Arc-identity invariant on `LedgerState` that couples it to
+///   `DictNovelty`.
 pub struct LedgerSnapshot {
     /// Ledger ID (e.g., "mydb:main")
     pub ledger_id: String,
