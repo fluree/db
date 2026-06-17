@@ -1,0 +1,91 @@
+{
+  "schema_version": 1,
+  "label": "phase-1-pre",
+  "git_sha": "62ef96c8e",
+  "captured_at": "2026-06-17T15:57:39.992960+00:00",
+  "profile": "quick",
+  "scale": "small",
+  "entries": {
+    "query_overlay_matrix/count_base/small": {
+      "mean_ns": 37182.97975775928,
+      "median_ns": 36915.2,
+      "mem": {
+        "peak_bytes": 5679054,
+        "scenario_peak_bytes": 5033131,
+        "total_allocated_bytes": 18685722112
+      }
+    },
+    "query_overlay_matrix/count_novelty/small": {
+      "mean_ns": 15795247.13125,
+      "median_ns": 15762634.109375,
+      "mem": {
+        "peak_bytes": 31008393,
+        "scenario_peak_bytes": 9502081,
+        "total_allocated_bytes": 33002670441
+      }
+    },
+    "query_overlay_matrix/count_overlay/small": {
+      "mean_ns": 2490419.4162436547,
+      "median_ns": 2482851.736040609,
+      "mem": {
+        "peak_bytes": 9247551,
+        "scenario_peak_bytes": 5304396,
+        "total_allocated_bytes": 6929299899
+      }
+    },
+    "query_overlay_matrix/groupby_base/small": {
+      "mean_ns": 888095.9301247771,
+      "median_ns": 886992.8698752228,
+      "mem": {
+        "peak_bytes": 6278754,
+        "scenario_peak_bytes": 5249607,
+        "total_allocated_bytes": 39400976971
+      }
+    },
+    "query_overlay_matrix/groupby_novelty/small": {
+      "mean_ns": 3746405321.0,
+      "median_ns": 3743371979.5,
+      "mem": {
+        "peak_bytes": 31764026,
+        "scenario_peak_bytes": 10257541,
+        "total_allocated_bytes": 206025105429
+      }
+    },
+    "query_overlay_matrix/groupby_overlay/small": {
+      "mean_ns": 1808589537.3,
+      "median_ns": 1806758145.5,
+      "mem": {
+        "peak_bytes": 10209653,
+        "scenario_peak_bytes": 4800611,
+        "total_allocated_bytes": 19002513710
+      }
+    },
+    "query_overlay_matrix/star_base/small": {
+      "mean_ns": 645680.5822997417,
+      "median_ns": 646097.4909560723,
+      "mem": {
+        "peak_bytes": 5829429,
+        "scenario_peak_bytes": 4951043,
+        "total_allocated_bytes": 73224831486
+      }
+    },
+    "query_overlay_matrix/star_novelty/small": {
+      "mean_ns": 7636493054.2,
+      "median_ns": 7619608812.5,
+      "mem": {
+        "peak_bytes": 33200679,
+        "scenario_peak_bytes": 11694126,
+        "total_allocated_bytes": 446871848299
+      }
+    },
+    "query_overlay_matrix/star_overlay/small": {
+      "mean_ns": 3796779000.0,
+      "median_ns": 3775757875.0,
+      "mem": {
+        "peak_bytes": 10208684,
+        "scenario_peak_bytes": 5761415,
+        "total_allocated_bytes": 31140053243
+      }
+    }
+  }
+}
