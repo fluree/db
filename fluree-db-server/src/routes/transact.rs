@@ -1578,7 +1578,63 @@ async fn execute_turtle_transaction(
             }
         };
 
-        let did = author.map(String::from);
+        // Build a PolicyContext so f:modify enforcement runs on Turtle/TriG
+        // writes, mirroring the JSON route. Turtle bodies carry no `opts`, so
+        // policy inputs come from the fluree-identity / fluree-policy /
+        // fluree-policy-class / fluree-policy-values / fluree-default-allow
+        // headers, gated through the same root-impersonation check.
+        let mut opts_carrier = JsonValue::Object(serde_json::Map::new());
+        if let Some(opts_obj) = opts_carrier
+            .as_object_mut()
+            .and_then(|o| {
+                o.entry("opts")
+                    .or_insert_with(|| JsonValue::Object(serde_json::Map::new()))
+                    .as_object_mut()
+            })
+        {
+            headers.inject_into_opts(opts_obj);
+        }
+        let default_policy_class = state.config.data_auth().default_policy_class.clone();
+        crate::routes::policy_auth::apply_auth_identity_to_opts(
+            state,
+            ledger_id,
+            &mut opts_carrier,
+            author,
+            default_policy_class.as_deref(),
+        )
+        .await;
+        let qc_opts =
+            fluree_db_api::QueryConnectionOptions::from_json(&opts_carrier).unwrap_or_default();
+
+        let policy_ctx = if qc_opts.has_any_policy_inputs() {
+            let snap = handle.snapshot().await;
+            match fluree_db_api::build_policy_context(
+                &snap.snapshot,
+                snap.novelty.as_ref(),
+                Some(snap.novelty.as_ref()),
+                snap.t,
+                &qc_opts,
+            )
+            .await
+            {
+                Ok(ctx) => Some(ctx),
+                Err(e) => {
+                    let server_error = ServerError::Api(e);
+                    set_span_error_code(&span, "error:PolicyBuildFailed");
+                    tracing::error!(error = %server_error, "failed to build policy context");
+                    return Err(server_error);
+                }
+            }
+        } else {
+            None
+        };
+
+        // Effective author: prefer the (possibly-impersonated) opts.identity so
+        // the commit records who the transaction was executed AS.
+        let did = qc_opts
+            .identity
+            .clone()
+            .or_else(|| author.map(String::from));
 
         let txn_opts = TxnOpts::default();
 
@@ -1616,6 +1672,9 @@ async fn execute_turtle_transaction(
         }
         if headers.has_tracking() {
             builder = builder.tracking(headers.to_tracking_options());
+        }
+        if let Some(ctx) = policy_ctx {
+            builder = builder.policy(ctx);
         }
 
         let correlation = index_request_correlation(

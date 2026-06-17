@@ -81,6 +81,8 @@ Every modification path runs the same `f:modify` policy check on its staged flak
 
 Crucially, the policy is checked against the **flakes**, not the operation type. A transaction that retracts a flake the identity can't modify is rejected just like an insert that asserts one.
 
+Enforcement is also independent of the **wire format**: the check runs on the staged flakes, so JSON-LD, SPARQL UPDATE, and Turtle / TriG / N-Triples writes are all governed by the same `f:modify` policy. Sending data as Turtle is not a way to bypass write policy.
+
 ## Targeting patterns
 
 ### Whitelist a property to a role

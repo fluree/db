@@ -114,6 +114,7 @@ fn pregen(
                     TxnOpts::default(),
                     CommitOpts::default(),
                     index_config,
+                    None,
                 )
                 .await
                 .unwrap();
@@ -172,6 +173,7 @@ async fn run_turtle_inserts(
                 TxnOpts::default(),
                 CommitOpts::default(),
                 index_config,
+                None,
             )
             .await
             .unwrap();

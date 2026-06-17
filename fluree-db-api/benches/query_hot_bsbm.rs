@@ -128,6 +128,7 @@ async fn setup_indexed(n_products: usize) -> (tempfile::TempDir, Fluree, String)
             TxnOpts::default(),
             CommitOpts::default(),
             &index_config,
+            None,
         )
         .await
         .expect("populate insert");

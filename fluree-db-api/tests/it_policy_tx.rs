@@ -610,3 +610,86 @@ async fn where_read_respects_view_policy() {
         "WHERE over a viewable property must still match (no over-filtering): {greeted:#?}"
     );
 }
+
+/// W1/W2 regression: writing data as Turtle must enforce f:modify policy, just
+/// like the JSON-LD/SPARQL paths. Before the fix the Turtle write path never
+/// carried the PolicyContext into staging, so an authorized writer could bypass
+/// fine-grained modify rules entirely by sending the same data as Turtle.
+#[tokio::test]
+async fn turtle_insert_enforces_modify_policy() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "policy/turtle-modify:main");
+
+    // Seed ex:secret so the property exists in the namespace table; the policy
+    // must encode the same SID the write produces.
+    let seed = json!({
+        "@context": {"ex": "http://example.org/ns/"},
+        "@graph": [{"@id": "ex:item0", "ex:secret": "existing"}]
+    });
+    let ledger = fluree.insert(ledger0, &seed).await.unwrap().ledger;
+
+    // Deny modifying ex:secret; everything else writable (default-allow: true),
+    // so the only thing blocking the write is the f:modify rule on ex:secret.
+    let policy = json!([{
+        "@id": "ex:noSecretWrite",
+        "f:required": true,
+        "f:onProperty": [{"@id": "http://example.org/ns/secret"}],
+        "f:action": "f:modify",
+        "f:allow": false
+    }]);
+    let qc_opts = QueryConnectionOptions {
+        policy: Some(policy),
+        default_allow: true,
+        ..Default::default()
+    };
+    let policy_ctx = policy_builder::build_policy_context_from_opts(
+        &ledger.snapshot,
+        ledger.novelty.as_ref(),
+        Some(ledger.novelty.as_ref()),
+        ledger.t(),
+        &qc_opts,
+        &[0],
+    )
+    .await
+    .expect("build policy context");
+
+    let turtle = "@prefix ex: <http://example.org/ns/> .\nex:item1 ex:secret \"classified\" .\n";
+    let cfg = IndexConfig {
+        reindex_min_bytes: 100_000,
+        reindex_max_bytes: 1_000_000_000,
+    };
+
+    // With the modify policy: the Turtle write touches a denied property → rejected.
+    let denied = fluree
+        .insert_turtle_with_opts(
+            ledger.clone(),
+            turtle,
+            TxnOpts::default(),
+            CommitOpts::default(),
+            &cfg,
+            Some(&policy_ctx),
+        )
+        .await;
+    assert!(
+        denied.is_err(),
+        "Turtle write of a modify-denied property must be rejected, got: {denied:?}"
+    );
+
+    // Without a policy (root): the identical Turtle write succeeds.
+    let ok = fluree
+        .insert_turtle_with_opts(
+            ledger,
+            turtle,
+            TxnOpts::default(),
+            CommitOpts::default(),
+            &cfg,
+            None,
+        )
+        .await;
+    assert!(
+        ok.is_ok(),
+        "Turtle write must succeed without a modify policy, got: {:?}",
+        ok.err()
+    );
+}
