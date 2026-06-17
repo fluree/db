@@ -331,10 +331,6 @@ pub struct NameServiceState {
     /// success cache on every `Command::EnqueueCommand`.
     #[serde(default)]
     pub poisoned: HashMap<IdempotencyCacheKey, PoisonRecord>,
-    /// Lifetime count of poison events per branch — operator
-    /// signal for "is this branch healthy."
-    #[serde(default)]
-    pub poisoned_count: HashMap<RefKey, u64>,
     /// Lifetime count of idempotency entries removed by
     /// `Command::EvictIdempotency`.
     #[serde(default)]
@@ -788,7 +784,7 @@ pub fn apply(state: &mut NameServiceState, command: Command, log_index: u64) -> 
         // Queue-related commands. Apply paths land in subsequent
         // commits; see docs/design/raft-command-queue.md.
         Command::EnqueueCommand(args) => apply_enqueue_command(state, log_index, args),
-        Command::ApplyHead(_) => todo!("apply_head"),
+        Command::ApplyHead(args) => apply_head(state, log_index, args),
         Command::PoisonQueueEntry(_) => todo!("apply_poison_queue_entry"),
         Command::EvictIdempotency { .. } => todo!("apply_evict_idempotency"),
     }
@@ -1317,6 +1313,122 @@ fn apply_enqueue_command(
     Response::Enqueued {
         ledger_id: full_ledger_id,
         queue_id,
+    }
+}
+
+fn apply_head(
+    state: &mut NameServiceState,
+    log_index: u64,
+    args: ApplyHeadArgs,
+) -> Response {
+    let ApplyHeadArgs {
+        ledger_id,
+        branch,
+        queue_id,
+        commit_id,
+        commit_t,
+        applied_at_millis,
+    } = args;
+    let full_ledger_id = format_ledger_id(&ledger_id, &branch);
+    let ref_key = RefKey::new(&ledger_id, &branch);
+
+    // 1. Admin command preempted between worker stage and apply.
+    //    The marker is one-shot — consume it as we report.
+    if let Some(clear_reason) = state.recently_cleared.remove(&ref_key) {
+        return Response::QueueDesync {
+            ledger_id: full_ledger_id,
+            requested_queue_id: queue_id,
+            reason: DesyncReason::QueueCleared {
+                reason: clear_reason,
+            },
+        };
+    }
+
+    // 2. Queue must exist with an entry. An empty or missing queue
+    //    without a `recently_cleared` marker is a state-machine
+    //    invariant violation — log loudly rather than recover.
+    let queue = match state.queues.get_mut(&ref_key) {
+        Some(q) if !q.is_empty() => q,
+        _ => {
+            return Response::QueueDesync {
+                ledger_id: full_ledger_id,
+                requested_queue_id: queue_id,
+                reason: DesyncReason::InvariantViolated {
+                    description: "queue missing or empty without recently_cleared marker"
+                        .into(),
+                },
+            };
+        }
+    };
+
+    // 3. Front must match `queue_id`. Mismatch usually means a
+    //    former leader's worker already applied this one.
+    let actual_front = queue.front().expect("non-empty checked above").queue_id;
+    if actual_front != queue_id {
+        return Response::QueueDesync {
+            ledger_id: full_ledger_id,
+            requested_queue_id: queue_id,
+            reason: DesyncReason::WrongFront {
+                actual_queue_id: actual_front,
+            },
+        };
+    }
+
+    // 4. Pop the front. Front carries the metadata we need for
+    //    idempotency caching (key + body_cid).
+    let entry = queue.pop_front().expect("non-empty checked above");
+
+    // 5. Advance the branch's `RefEntry`, carrying forward index
+    //    + lineage state from any existing entry (matches the
+    //    self-healing pattern in `advance_ref`).
+    let (prior_index, prior_source, prior_branches) = state
+        .refs
+        .get(&ref_key)
+        .map(|r| (r.index.clone(), r.source_branch.clone(), r.branches))
+        .unwrap_or_default();
+    state.refs.insert(
+        ref_key.clone(),
+        RefEntry {
+            head: commit_id.clone(),
+            t: commit_t,
+            last_advanced_at_millis: applied_at_millis,
+            last_advanced_index: log_index,
+            index: prior_index,
+            source_branch: prior_source,
+            branches: prior_branches,
+        },
+    );
+
+    // 6. Self-healing branch registration on the `LedgerRecord`.
+    //    Matches `advance_ref`'s behaviour so the queue path
+    //    doesn't diverge.
+    if let Some(ledger) = state.ledgers.get_mut(&ledger_id) {
+        if !ledger.branches.contains(&branch) {
+            ledger.branches.push(branch.clone());
+        }
+    }
+
+    // 7. Record the success in the idempotency cache, keyed by
+    //    the entry's idempotency key (if any).
+    if let Some(key) = entry.idempotency {
+        state.idempotency.insert(
+            key,
+            ApplyRecord {
+                body_hash: [0u8; 32],
+                body_cid: Some(entry.body_cid),
+                recorded_at_millis: applied_at_millis,
+                head: commit_id.clone(),
+                t: commit_t,
+                recorded_index: log_index,
+                tally: None,
+            },
+        );
+    }
+
+    Response::HeadApplied {
+        ledger_id: full_ledger_id,
+        commit_id,
+        commit_t,
     }
 }
 
@@ -2708,5 +2820,191 @@ mod tests {
             } => {}
             other => panic!("expected global QueueFull, got {other:?}"),
         }
+    }
+
+    // ====================================================================
+    // ApplyHead
+    // ====================================================================
+
+    fn apply_head_cmd(ledger_id: &str, branch: &str, queue_id: u64, commit: ContentId, t: i64) -> Command {
+        Command::ApplyHead(ApplyHeadArgs {
+            ledger_id: ledger_id.into(),
+            branch: branch.into(),
+            queue_id,
+            commit_id: commit,
+            commit_t: t,
+            applied_at_millis: 2_000,
+        })
+    }
+
+    #[test]
+    fn apply_head_advances_ref_and_caches_idempotency() {
+        let mut state = NameServiceState::new();
+        apply(&mut state, create_ledger("test/db"), 1);
+        let key = body_kid("k1");
+        let enq = apply(
+            &mut state,
+            enqueue(
+                "test/db",
+                "main",
+                7,
+                Some(IdempotencyContext {
+                    key: key.clone(),
+                    body_hash: [0u8; 32],
+                }),
+            ),
+            2,
+        );
+        let queue_id = match enq {
+            Response::Enqueued { queue_id, .. } => queue_id,
+            other => panic!("not Enqueued: {other:?}"),
+        };
+
+        let resp = apply(
+            &mut state,
+            apply_head_cmd("test/db", "main", queue_id, cid(42), 10),
+            3,
+        );
+        match resp {
+            Response::HeadApplied {
+                ledger_id,
+                commit_id,
+                commit_t,
+            } => {
+                assert_eq!(ledger_id, "test/db:main");
+                assert_eq!(commit_id, cid(42));
+                assert_eq!(commit_t, 10);
+            }
+            other => panic!("expected HeadApplied, got {other:?}"),
+        }
+
+        // Queue front popped.
+        let ref_key = RefKey::new("test/db", "main");
+        assert!(state.queues.get(&ref_key).map(VecDeque::is_empty).unwrap_or(true));
+
+        // RefEntry advanced.
+        let entry = state.refs.get(&ref_key).expect("ref present");
+        assert_eq!(entry.head, cid(42));
+        assert_eq!(entry.t, 10);
+        assert_eq!(entry.last_advanced_index, 3);
+
+        // Self-healing branch registration.
+        let ledger = state.ledgers.get("test/db").unwrap();
+        assert!(ledger.branches.contains(&"main".to_string()));
+
+        // Idempotency cached with body_cid set (the new queue path).
+        let record = state.idempotency.get(&key).expect("idempotency cached");
+        assert_eq!(record.body_cid.as_ref(), Some(&cid(7)));
+        assert_eq!(record.head, cid(42));
+    }
+
+    #[test]
+    fn apply_head_carries_index_forward_across_queue_commits() {
+        let mut state = NameServiceState::new();
+        create_ledger_with_genesis(&mut state, "test/db");
+        // Establish an index head via the existing advance_index path.
+        apply(&mut state, advance_index("test/db", "main", cid(42), 0), 2);
+
+        // Enqueue + apply via the queue path. The index should
+        // carry forward to the new RefEntry.
+        let enq = apply(&mut state, enqueue("test/db", "main", 7, None), 3);
+        let qid = match enq {
+            Response::Enqueued { queue_id, .. } => queue_id,
+            other => panic!("not Enqueued: {other:?}"),
+        };
+        apply(
+            &mut state,
+            apply_head_cmd("test/db", "main", qid, cid(99), 20),
+            4,
+        );
+
+        let entry = ref_entry(&state, "test/db", "main");
+        assert_eq!(entry.head, cid(99));
+        assert_eq!(entry.t, 20);
+        assert_eq!(
+            entry.index,
+            Some(IndexState {
+                head: cid(42),
+                t: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn apply_head_wrong_front_when_queue_id_mismatches() {
+        let mut state = NameServiceState::new();
+        apply(&mut state, create_ledger("test/db"), 1);
+        apply(&mut state, enqueue("test/db", "main", 7, None), 2);
+
+        // Worker proposes ApplyHead with the wrong queue_id (off by one).
+        let resp = apply(
+            &mut state,
+            apply_head_cmd("test/db", "main", 9_999, cid(42), 10),
+            3,
+        );
+        match resp {
+            Response::QueueDesync {
+                reason: DesyncReason::WrongFront { actual_queue_id },
+                ..
+            } => assert_eq!(actual_queue_id, 0),
+            other => panic!("expected WrongFront, got {other:?}"),
+        }
+        // Front still in place.
+        let ref_key = RefKey::new("test/db", "main");
+        assert_eq!(state.queues.get(&ref_key).unwrap().len(), 1);
+        // No RefEntry advance.
+        assert!(state.refs.get(&ref_key).is_none());
+    }
+
+    #[test]
+    fn apply_head_queue_cleared_when_admin_preempted() {
+        let mut state = NameServiceState::new();
+        apply(&mut state, create_ledger("test/db"), 1);
+        apply(&mut state, enqueue("test/db", "main", 7, None), 2);
+
+        // Simulate an admin command (e.g. DropBranch) clearing the
+        // queue and recording a `recently_cleared` marker. This
+        // mirrors what Task #74's admin-side change will do.
+        let ref_key = RefKey::new("test/db", "main");
+        state.queues.remove(&ref_key);
+        state.recently_cleared
+            .insert(ref_key.clone(), ClearReason::BranchDropped);
+
+        let resp = apply(
+            &mut state,
+            apply_head_cmd("test/db", "main", 0, cid(42), 10),
+            3,
+        );
+        match resp {
+            Response::QueueDesync {
+                reason: DesyncReason::QueueCleared {
+                    reason: ClearReason::BranchDropped,
+                },
+                ..
+            } => {}
+            other => panic!("expected QueueCleared(BranchDropped), got {other:?}"),
+        }
+        // Marker is one-shot.
+        assert!(state.recently_cleared.get(&ref_key).is_none());
+    }
+
+    #[test]
+    fn apply_head_invariant_violated_when_queue_empty_without_marker() {
+        let mut state = NameServiceState::new();
+        apply(&mut state, create_ledger("test/db"), 1);
+        // No EnqueueCommand, no recently_cleared marker — should
+        // never happen in real flow.
+        let resp = apply(
+            &mut state,
+            apply_head_cmd("test/db", "main", 0, cid(42), 10),
+            2,
+        );
+        assert!(matches!(
+            resp,
+            Response::QueueDesync {
+                reason: DesyncReason::InvariantViolated { .. },
+                ..
+            }
+        ));
     }
 }
