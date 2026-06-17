@@ -210,6 +210,25 @@ impl ApplyOutcome {
             ApplyOutcome::Failed(r) => Some(&r.body_cid),
         }
     }
+
+    /// Wall-clock the entry was recorded at, in millis since epoch.
+    pub fn recorded_at_millis(&self) -> u64 {
+        match self {
+            ApplyOutcome::Applied(r) => r.recorded_at_millis,
+            ApplyOutcome::Failed(r) => r.recorded_at_millis,
+        }
+    }
+
+    /// Raft log index that recorded the entry. Unique across
+    /// idempotency cache entries (each apply produces at most one),
+    /// so it doubles as a deterministic tiebreaker for eviction
+    /// ordering.
+    pub fn recorded_index(&self) -> u64 {
+        match self {
+            ApplyOutcome::Applied(r) => r.recorded_index,
+            ApplyOutcome::Failed(r) => r.recorded_index,
+        }
+    }
 }
 
 /// One pending transactor request awaiting worker processing. The
@@ -812,7 +831,9 @@ pub fn apply(state: &mut NameServiceState, command: Command, log_index: u64) -> 
         Command::EnqueueCommand(args) => apply_enqueue_command(state, log_index, args),
         Command::ApplyHead(args) => apply_head(state, log_index, args),
         Command::PoisonQueueEntry(args) => apply_poison_queue_entry(state, log_index, args),
-        Command::EvictIdempotency { .. } => todo!("apply_evict_idempotency"),
+        Command::EvictIdempotency { cutoff_millis } => {
+            apply_evict_idempotency(state, cutoff_millis)
+        }
     }
 }
 
@@ -1356,46 +1377,48 @@ fn apply_enqueue_command(
 /// Both `ApplyHead` and `PoisonQueueEntry` consume the same front entry
 /// after the same three-step check (admin-preemption marker, queue
 /// existence, front-id match). On any mismatch this returns the
-/// `Response::QueueDesync` the caller should propagate.
+/// `Response::QueueDesync` the caller should propagate. The `Response`
+/// is boxed because the `Ok` path is the hot one and `Response` is
+/// large; only the rare desync branch pays the allocation.
 fn pop_validated_front(
     state: &mut NameServiceState,
     ref_key: &RefKey,
     full_ledger_id: &str,
     requested_queue_id: u64,
-) -> Result<QueueEntry, Response> {
+) -> Result<QueueEntry, Box<Response>> {
     if let Some(clear_reason) = state.recently_cleared.remove(ref_key) {
-        return Err(Response::QueueDesync {
+        return Err(Box::new(Response::QueueDesync {
             ledger_id: full_ledger_id.into(),
             requested_queue_id,
             reason: DesyncReason::QueueCleared {
                 reason: clear_reason,
             },
-        });
+        }));
     }
 
     let queue = match state.queues.get_mut(ref_key) {
         Some(q) if !q.is_empty() => q,
         _ => {
-            return Err(Response::QueueDesync {
+            return Err(Box::new(Response::QueueDesync {
                 ledger_id: full_ledger_id.into(),
                 requested_queue_id,
                 reason: DesyncReason::InvariantViolated {
                     description: "queue missing or empty without recently_cleared marker"
                         .into(),
                 },
-            });
+            }));
         }
     };
 
     let actual_front = queue.front().expect("non-empty checked above").queue_id;
     if actual_front != requested_queue_id {
-        return Err(Response::QueueDesync {
+        return Err(Box::new(Response::QueueDesync {
             ledger_id: full_ledger_id.into(),
             requested_queue_id,
             reason: DesyncReason::WrongFront {
                 actual_queue_id: actual_front,
             },
-        });
+        }));
     }
 
     Ok(queue.pop_front().expect("non-empty checked above"))
@@ -1419,7 +1442,7 @@ fn apply_head(
 
     let entry = match pop_validated_front(state, &ref_key, &full_ledger_id, queue_id) {
         Ok(entry) => entry,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
 
     // Advance the branch's `RefEntry`, carrying forward index +
@@ -1491,7 +1514,7 @@ fn apply_poison_queue_entry(
 
     let entry = match pop_validated_front(state, &ref_key, &full_ledger_id, queue_id) {
         Ok(entry) => entry,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
 
     if let Some(key) = entry.idempotency {
@@ -1510,6 +1533,53 @@ fn apply_poison_queue_entry(
         ledger_id: full_ledger_id,
         queue_id,
         reason,
+    }
+}
+
+/// Maximum entries removed by a single [`Command::EvictIdempotency`]
+/// apply. Bounds the work each follower replays so a large backlog
+/// can't stall replication; the periodic evictor schedules
+/// additional commands when more remain.
+const EVICT_BATCH_SIZE: usize = 1024;
+
+fn apply_evict_idempotency(state: &mut NameServiceState, cutoff_millis: u64) -> Response {
+    // HashMap iteration order is non-deterministic across replicas,
+    // so we materialize the expired candidates and sort by
+    // (recorded_at_millis, recorded_index) before truncating to the
+    // batch cap. recorded_index is unique across cache entries —
+    // each apply records at most one — so the sort is total.
+    let mut expired: Vec<(u64, u64, IdempotencyCacheKey)> = state
+        .idempotency
+        .iter()
+        .filter_map(|(key, outcome)| {
+            let recorded_at = outcome.recorded_at_millis();
+            (recorded_at < cutoff_millis)
+                .then(|| (recorded_at, outcome.recorded_index(), key.clone()))
+        })
+        .collect();
+    expired.sort_by_key(|(at, idx, _)| (*at, *idx));
+    expired.truncate(EVICT_BATCH_SIZE);
+
+    let mut released_body_cids = Vec::with_capacity(expired.len());
+    for (_, _, key) in &expired {
+        match state.idempotency.remove(key) {
+            Some(ApplyOutcome::Applied(record)) => {
+                if let Some(cid) = record.body_cid {
+                    released_body_cids.push(cid);
+                }
+            }
+            Some(ApplyOutcome::Failed(record)) => {
+                released_body_cids.push(record.body_cid);
+            }
+            None => {}
+        }
+    }
+    let removed = expired.len();
+    state.evicted_idempotency_count += removed as u64;
+
+    Response::EvictionApplied {
+        removed,
+        released_body_cids,
     }
 }
 
@@ -3037,7 +3107,7 @@ mod tests {
         let ref_key = RefKey::new("test/db", "main");
         assert_eq!(state.queues.get(&ref_key).unwrap().len(), 1);
         // No RefEntry advance.
-        assert!(state.refs.get(&ref_key).is_none());
+        assert!(!state.refs.contains_key(&ref_key));
     }
 
     #[test]
@@ -3069,7 +3139,7 @@ mod tests {
             other => panic!("expected QueueCleared(BranchDropped), got {other:?}"),
         }
         // Marker is one-shot.
-        assert!(state.recently_cleared.get(&ref_key).is_none());
+        assert!(!state.recently_cleared.contains_key(&ref_key));
     }
 
     #[test]
@@ -3159,7 +3229,7 @@ mod tests {
         let ref_key = RefKey::new("test/db", "main");
         assert!(state.queues.get(&ref_key).map(VecDeque::is_empty).unwrap_or(true));
         // Ref untouched — no head advance on poison.
-        assert!(state.refs.get(&ref_key).is_none());
+        assert!(!state.refs.contains_key(&ref_key));
 
         let record = match state.idempotency.get(&key).expect("idempotency cached") {
             ApplyOutcome::Failed(r) => r,
@@ -3244,7 +3314,7 @@ mod tests {
             } => {}
             other => panic!("expected QueueCleared(BranchPurged), got {other:?}"),
         }
-        assert!(state.recently_cleared.get(&ref_key).is_none());
+        assert!(!state.recently_cleared.contains_key(&ref_key));
     }
 
     #[test]
@@ -3263,5 +3333,166 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    // ====================================================================
+    // EvictIdempotency
+    // ====================================================================
+
+    fn applied_outcome(
+        body_cid: Option<ContentId>,
+        recorded_at_millis: u64,
+        recorded_index: u64,
+    ) -> ApplyOutcome {
+        ApplyOutcome::Applied(ApplyRecord {
+            body_hash: [0u8; 32],
+            body_cid,
+            recorded_at_millis,
+            head: cid(99),
+            t: 1,
+            recorded_index,
+            tally: None,
+        })
+    }
+
+    fn failed_outcome(
+        body_cid: ContentId,
+        recorded_at_millis: u64,
+        recorded_index: u64,
+    ) -> ApplyOutcome {
+        ApplyOutcome::Failed(PoisonRecord {
+            body_cid,
+            reason: PoisonReason::BodyMalformed {
+                error: "test".into(),
+            },
+            recorded_index,
+            recorded_at_millis,
+        })
+    }
+
+    fn evict(cutoff_millis: u64) -> Command {
+        Command::EvictIdempotency { cutoff_millis }
+    }
+
+    fn install_outcome(state: &mut NameServiceState, key: &str, outcome: ApplyOutcome) {
+        state
+            .idempotency
+            .insert(body_kid(key), outcome);
+    }
+
+    #[test]
+    fn evict_removes_entries_below_cutoff_and_returns_released_cids() {
+        let mut state = NameServiceState::new();
+        install_outcome(&mut state, "old_applied", applied_outcome(Some(cid(1)), 100, 1));
+        install_outcome(&mut state, "old_failed", failed_outcome(cid(2), 150, 2));
+        install_outcome(&mut state, "fresh_applied", applied_outcome(Some(cid(3)), 500, 3));
+
+        let resp = apply(&mut state, evict(200), 4);
+
+        match resp {
+            Response::EvictionApplied {
+                removed,
+                released_body_cids,
+            } => {
+                assert_eq!(removed, 2);
+                let cids: HashSet<_> = released_body_cids.into_iter().collect();
+                assert_eq!(cids, HashSet::from([cid(1), cid(2)]));
+            }
+            other => panic!("expected EvictionApplied, got {other:?}"),
+        }
+
+        // Fresh entry survives.
+        assert!(state.idempotency.contains_key(&body_kid("fresh_applied")));
+        assert!(!state.idempotency.contains_key(&body_kid("old_applied")));
+        assert!(!state.idempotency.contains_key(&body_kid("old_failed")));
+        assert_eq!(state.evicted_idempotency_count, 2);
+    }
+
+    #[test]
+    fn evict_excludes_entries_at_or_above_cutoff() {
+        // The cutoff is strict: entries with `recorded_at_millis == cutoff`
+        // are still considered fresh.
+        let mut state = NameServiceState::new();
+        install_outcome(&mut state, "boundary", applied_outcome(Some(cid(1)), 200, 1));
+
+        let resp = apply(&mut state, evict(200), 2);
+        match resp {
+            Response::EvictionApplied { removed, .. } => assert_eq!(removed, 0),
+            other => panic!("expected EvictionApplied, got {other:?}"),
+        }
+        assert!(state.idempotency.contains_key(&body_kid("boundary")));
+    }
+
+    #[test]
+    fn evict_skips_applied_entries_with_no_body_cid() {
+        // Legacy AdvanceRef applies set `body_cid: None`. Eviction
+        // still removes the entry but the released list stays empty.
+        let mut state = NameServiceState::new();
+        install_outcome(&mut state, "legacy", applied_outcome(None, 100, 1));
+
+        let resp = apply(&mut state, evict(200), 2);
+        match resp {
+            Response::EvictionApplied {
+                removed,
+                released_body_cids,
+            } => {
+                assert_eq!(removed, 1);
+                assert!(released_body_cids.is_empty());
+            }
+            other => panic!("expected EvictionApplied, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn evict_caps_at_batch_size_and_takes_oldest_first() {
+        let mut state = NameServiceState::new();
+        // Insert EVICT_BATCH_SIZE + 50 expired entries. Use ascending
+        // recorded_at_millis so we can verify the oldest 1024 leave
+        // and the youngest 50 stay.
+        let total = EVICT_BATCH_SIZE + 50;
+        for i in 0..total {
+            let key = format!("k_{i}");
+            install_outcome(
+                &mut state,
+                &key,
+                applied_outcome(Some(cid(i as u8 % 200)), i as u64, i as u64),
+            );
+        }
+
+        let resp = apply(&mut state, evict(u64::MAX), (total + 1) as u64);
+        match resp {
+            Response::EvictionApplied { removed, .. } => {
+                assert_eq!(removed, EVICT_BATCH_SIZE);
+            }
+            other => panic!("expected EvictionApplied, got {other:?}"),
+        }
+        assert_eq!(state.idempotency.len(), 50);
+        assert_eq!(state.evicted_idempotency_count, EVICT_BATCH_SIZE as u64);
+
+        // The 50 survivors should be the *youngest* (largest
+        // recorded_at_millis) — oldest-first ordering.
+        for i in EVICT_BATCH_SIZE..total {
+            assert!(
+                state.idempotency.contains_key(&body_kid(&format!("k_{i}"))),
+                "expected k_{i} to survive"
+            );
+        }
+    }
+
+    #[test]
+    fn evict_empty_cache_is_noop() {
+        let mut state = NameServiceState::new();
+        let resp = apply(&mut state, evict(1_000), 1);
+        match resp {
+            Response::EvictionApplied {
+                removed,
+                released_body_cids,
+            } => {
+                assert_eq!(removed, 0);
+                assert!(released_body_cids.is_empty());
+            }
+            other => panic!("expected EvictionApplied, got {other:?}"),
+        }
+        assert_eq!(state.evicted_idempotency_count, 0);
     }
 }
