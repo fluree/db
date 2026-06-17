@@ -139,7 +139,7 @@ impl CommitWorker {
         // process under a kind the queue didn't declare.
         check_envelope_kind(entry.body_kind, &envelope)?;
 
-        let receipt = match envelope {
+        let StagedOutcome { receipt, install } = match envelope {
             QueuedRequest::Transact(transact) => self.stage_and_persist(ref_key, transact).await?,
             QueuedRequest::Push(push) => self.process_push(ref_key, push).await?,
             QueuedRequest::Revert(revert) => self.process_revert(ref_key, revert).await?,
@@ -149,18 +149,47 @@ impl CommitWorker {
         let commit_id = receipt.commit_id().clone();
         let commit_t = receipt.commit_t();
 
-        // Stash the typed receipt for the adapter to pick up on
-        // apply, then propose. On propose failure (most commonly a
-        // stepped-down leader getting ForwardToLeader), take the
-        // stash back so we don't leak per-process state.
+        // Stash the typed receipt, then propose. On propose failure
+        // (stepped-down leader, QueueDesync, fatal), take the stash
+        // back AND drop `install` so the local Fluree cache stays at
+        // its pre-stage state. Only after a successful propose do we
+        // install the new state through the held write guard — this
+        // keeps `state.refs` (replicated) and the local Fluree cache
+        // in lockstep.
         self.staged_receipts.stash(entry.queue_id, receipt);
         match self.publish_head_advance(ref_key, commit_id, commit_t).await {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                if let Some(install) = install {
+                    self.finalize_local_state(install).await?;
+                }
+                Ok(())
+            }
             Err(err) => {
                 self.staged_receipts.take(entry.queue_id);
+                // `install` drops here: write_guard releases without
+                // calling `replace`, so this node's Fluree handle
+                // stays at its pre-stage head — same as every other
+                // node.
                 Err(err)
             }
         }
+    }
+
+    /// Install staged ledger state through the held write guard
+    /// after the head advance has been replicated. Called only on
+    /// the publish-success path so the local cache never gets ahead
+    /// of consensus.
+    async fn finalize_local_state(&self, install: StagedStateInstall) -> Result<(), WorkerError> {
+        let StagedStateInstall {
+            write_guard,
+            new_state,
+            commit_t,
+        } = install;
+        let needs_reindex = new_state.should_reindex(&self.index_config);
+        self.fluree
+            .finalize_commit(write_guard, new_state, commit_t, needs_reindex)
+            .await
+            .map_err(api_error_to_stage)
     }
 
     async fn load_envelope(
@@ -188,14 +217,15 @@ impl CommitWorker {
     }
 
     /// Resolve the ledger handle, dispatch on body kind, stage the
-    /// commit, write the commit blob to CAS, and finalize local
-    /// state. Returns the per-op [`AppliedReceipt`] the caller
-    /// stashes before proposing `ApplyHead`.
+    /// commit, and write the commit blob to CAS. Returns a
+    /// [`StagedOutcome`] carrying the typed receipt plus the
+    /// deferred local-state install — `try_advance_head` only
+    /// finalizes the install after the publish succeeds.
     async fn stage_and_persist(
         &self,
         ref_key: &RefKey,
         transact: QueuedTransact,
-    ) -> Result<AppliedReceipt, WorkerError> {
+    ) -> Result<StagedOutcome, WorkerError> {
         let QueuedTransact {
             body,
             txn_opts,
@@ -271,25 +301,27 @@ impl CommitWorker {
                 .map_err(|e| stage_failure(&format!("referenced blob write failed: {e}")))?;
         }
 
-        // Local state install. Mirrors `RaftCommitter::transact` on
-        // the Applied branch: derives post-commit state from the
-        // staged commit and finalizes it through the held write guard
-        // so this node's cached view doesn't lag the head we're
-        // about to propose.
+        // Derive post-commit state but do NOT call finalize_commit
+        // here — local install runs after the publish confirms the
+        // head landed in the cluster. If publish fails, the
+        // write_guard drops without `replace`, leaving the local
+        // Fluree handle at its pre-stage head.
         let (_receipt, new_state) = staged_commit
             .finalize_state()
             .map_err(|e| stage_failure(&format!("finalize_state failed: {e}")))?;
-        let needs_reindex = new_state.should_reindex(&self.index_config);
-        self.fluree
-            .finalize_commit(write_guard, new_state, commit_t, needs_reindex)
-            .await
-            .map_err(api_error_to_stage)?;
 
-        Ok(AppliedReceipt::Transact(TransactApplied {
-            commit_id: commit_cid,
-            commit_t,
-            tally,
-        }))
+        Ok(StagedOutcome {
+            receipt: AppliedReceipt::Transact(TransactApplied {
+                commit_id: commit_cid,
+                commit_t,
+                tally,
+            }),
+            install: Some(StagedStateInstall {
+                write_guard,
+                new_state,
+                commit_t,
+            }),
+        })
     }
 
     /// Re-stage the revert worker-side, write the inverse commit
@@ -305,7 +337,7 @@ impl CommitWorker {
         &self,
         ref_key: &RefKey,
         revert: QueuedRevert,
-    ) -> Result<AppliedReceipt, WorkerError> {
+    ) -> Result<StagedOutcome, WorkerError> {
         use fluree_db_api::GuardedStagedCommit;
 
         let QueuedRevert {
@@ -336,15 +368,18 @@ impl CommitWorker {
         }) = commit
         else {
             // NoOp short-circuit: nothing changes. Return the current
-            // head so `publish_commit` reads the same value the state
-            // machine already holds.
-            return Ok(AppliedReceipt::Revert(RevertApplied {
-                commit_id: current_head_id,
-                commit_t: current_head_t,
-                reverted_commits,
-                conflict_count,
-                strategy: applied_strategy,
-            }));
+            // head with `install: None` so we don't touch the local
+            // Fluree state and don't trigger a re-finalize.
+            return Ok(StagedOutcome {
+                receipt: AppliedReceipt::Revert(RevertApplied {
+                    commit_id: current_head_id,
+                    commit_t: current_head_t,
+                    reverted_commits,
+                    conflict_count,
+                    strategy: applied_strategy,
+                }),
+                install: None,
+            });
         };
 
         let commit_cid = staged_commit
@@ -370,21 +405,21 @@ impl CommitWorker {
         let (_receipt, new_state) = staged_commit
             .finalize_state()
             .map_err(|e| stage_failure(&format!("revert finalize_state failed: {e}")))?;
-        if let Some(guard) = write_guard {
-            let needs_reindex = new_state.should_reindex(&self.index_config);
-            self.fluree
-                .finalize_commit(guard, new_state, commit_t, needs_reindex)
-                .await
-                .map_err(api_error_to_stage)?;
-        }
 
-        Ok(AppliedReceipt::Revert(RevertApplied {
-            commit_id: commit_cid,
-            commit_t,
-            reverted_commits,
-            conflict_count,
-            strategy: applied_strategy,
-        }))
+        Ok(StagedOutcome {
+            receipt: AppliedReceipt::Revert(RevertApplied {
+                commit_id: commit_cid,
+                commit_t,
+                reverted_commits,
+                conflict_count,
+                strategy: applied_strategy,
+            }),
+            install: write_guard.map(|guard| StagedStateInstall {
+                write_guard: guard,
+                new_state,
+                commit_t,
+            }),
+        })
     }
 
     /// Decode the queued push, hand it to `Fluree::prepare_push` for
@@ -395,7 +430,7 @@ impl CommitWorker {
         &self,
         ref_key: &RefKey,
         push: QueuedPush,
-    ) -> Result<AppliedReceipt, WorkerError> {
+    ) -> Result<StagedOutcome, WorkerError> {
         let QueuedPush {
             commit_cids,
             blobs,
@@ -435,18 +470,19 @@ impl CommitWorker {
             .await
             .map_err(|e| stage_failure(&format!("prepare_push failed: {e}")))?;
 
-        let needs_reindex = final_state.should_reindex(&self.index_config);
-        self.fluree
-            .finalize_commit(write_guard, final_state, new_head_t, needs_reindex)
-            .await
-            .map_err(api_error_to_stage)?;
-
-        Ok(AppliedReceipt::Push(PushApplied {
-            commit_id: new_head_id,
-            commit_t: new_head_t,
-            accepted,
-            indexing: indexing_status,
-        }))
+        Ok(StagedOutcome {
+            receipt: AppliedReceipt::Push(PushApplied {
+                commit_id: new_head_id,
+                commit_t: new_head_t,
+                accepted,
+                indexing: indexing_status,
+            }),
+            install: Some(StagedStateInstall {
+                write_guard,
+                new_state: final_state,
+                commit_t: new_head_t,
+            }),
+        })
     }
 
     /// Re-stage the merge worker-side. Fast-forward merges have no
@@ -458,7 +494,7 @@ impl CommitWorker {
         &self,
         ref_key: &RefKey,
         merge: QueuedMerge,
-    ) -> Result<AppliedReceipt, WorkerError> {
+    ) -> Result<StagedOutcome, WorkerError> {
         use fluree_db_api::GuardedStagedCommit;
 
         let QueuedMerge {
@@ -502,7 +538,13 @@ impl CommitWorker {
             }));
         }
 
-        if let Some(GuardedStagedCommit {
+        // General-merge paths produce a commit blob and a state
+        // delta; fast-forward merges have neither (the source's
+        // commits are already in the target namespace). The
+        // `install` slot reflects that — Some for general merges
+        // that earned both a write_guard and post-commit state,
+        // None otherwise.
+        let install = if let Some(GuardedStagedCommit {
             write_guard,
             staged,
         }) = commit
@@ -525,23 +567,26 @@ impl CommitWorker {
             let (_receipt, new_state) = staged
                 .finalize_state()
                 .map_err(|e| stage_failure(&format!("merge finalize_state failed: {e}")))?;
-            if let Some(guard) = write_guard {
-                let needs_reindex = new_state.should_reindex(&self.index_config);
-                self.fluree
-                    .finalize_commit(guard, new_state, new_head_t, needs_reindex)
-                    .await
-                    .map_err(api_error_to_stage)?;
-            }
-        }
+            write_guard.map(|guard| StagedStateInstall {
+                write_guard: guard,
+                new_state,
+                commit_t: new_head_t,
+            })
+        } else {
+            None
+        };
 
-        Ok(AppliedReceipt::Merge(MergeApplied {
-            commit_id: new_head_id,
-            commit_t: new_head_t,
-            fast_forward,
-            commits_copied,
-            conflict_count,
-            strategy: applied_strategy.unwrap_or(strategy),
-        }))
+        Ok(StagedOutcome {
+            receipt: AppliedReceipt::Merge(MergeApplied {
+                commit_id: new_head_id,
+                commit_t: new_head_t,
+                fast_forward,
+                commits_copied,
+                conflict_count,
+                strategy: applied_strategy.unwrap_or(strategy),
+            }),
+            install,
+        })
     }
 
     /// Re-stage the rebase worker-side. Writes any replay blobs to
@@ -554,7 +599,7 @@ impl CommitWorker {
         &self,
         ref_key: &RefKey,
         rebase: QueuedRebase,
-    ) -> Result<AppliedReceipt, WorkerError> {
+    ) -> Result<StagedOutcome, WorkerError> {
         let QueuedRebase { strategy } = rebase;
         let ledger_name = ref_key.ledger_id.clone();
         let branch = ref_key.branch.clone();
@@ -605,27 +650,26 @@ impl CommitWorker {
                 .map_err(|e| stage_failure(&format!("rebase commit blob write failed: {e}")))?;
         }
 
-        if let Some(guard) = write_guard {
-            let needs_reindex = final_state.should_reindex(&self.index_config);
-            self.fluree
-                .finalize_commit(guard, final_state, advance_t, needs_reindex)
-                .await
-                .map_err(api_error_to_stage)?;
-        }
-
-        Ok(AppliedReceipt::Rebase(RebaseApplied {
-            commit_id: advance_to,
-            commit_t: advance_t,
-            fast_forward,
-            replayed,
-            skipped,
-            conflicts: conflicts.len(),
-            failures: 0,
-            total_commits,
-            source_head_t,
-            source_head_id,
-            strategy,
-        }))
+        Ok(StagedOutcome {
+            receipt: AppliedReceipt::Rebase(RebaseApplied {
+                commit_id: advance_to,
+                commit_t: advance_t,
+                fast_forward,
+                replayed,
+                skipped,
+                conflicts: conflicts.len(),
+                failures: 0,
+                total_commits,
+                source_head_t,
+                source_head_id,
+                strategy,
+            }),
+            install: write_guard.map(|guard| StagedStateInstall {
+                write_guard: guard,
+                new_state: final_state,
+                commit_t: advance_t,
+            }),
+        })
     }
 
     async fn publish_head_advance(
@@ -799,6 +843,27 @@ pub enum WorkerError {
     Stage(PoisonReason),
     #[error("raft propose: {0}")]
     Raft(String),
+}
+
+/// Output of a per-op staging path before consensus has confirmed
+/// the head advance. Carries the typed receipt the adapter delivers
+/// through the waiter map plus any local state install the worker
+/// should run *after* the publish succeeds — never before, so a
+/// failed publish leaves this node's Fluree cache at its pre-stage
+/// head.
+pub(crate) struct StagedOutcome {
+    receipt: AppliedReceipt,
+    install: Option<StagedStateInstall>,
+}
+
+/// Local state install owed once the publish succeeds. `None` when
+/// nothing changed locally (fast-forward merge, no-op rebase or
+/// revert) — in those cases there's no write guard to release and
+/// no new LedgerState to swap in.
+pub(crate) struct StagedStateInstall {
+    write_guard: fluree_db_api::LedgerWriteGuard,
+    new_state: fluree_db_ledger::LedgerState,
+    commit_t: i64,
 }
 
 #[cfg(test)]

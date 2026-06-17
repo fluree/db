@@ -342,10 +342,19 @@ impl CommitPublisher for RaftNameService {
         match self.raft.client_write(cmd).await {
             Ok(resp) => map_apply_head_response(resp.data),
             // Stepped-down leader: the new leader's worker will
-            // observe the same queue entry and re-stage. Drop the
-            // straggling publish silently rather than reporting a
-            // bogus failure to the caller.
-            Err(RaftError::APIError(ClientWriteError::ForwardToLeader(_))) => Ok(()),
+            // observe the same queue entry and re-stage. We must
+            // surface this as an error (unlike `publish_index`) so
+            // the caller's stash-cleanup runs — silently returning
+            // Ok would tell the worker the head landed, leaving the
+            // staged receipt in place to later override the
+            // genuinely-committed receipt from the new leader.
+            Err(RaftError::APIError(ClientWriteError::ForwardToLeader(_))) => {
+                Err(NameServiceError::storage(
+                    "ApplyHead forwarded to leader (stepped down between stage and propose); \
+                     caller should drop the stash and let the new leader's worker re-stage"
+                        .to_string(),
+                ))
+            }
             Err(RaftError::APIError(ClientWriteError::ChangeMembershipError(e))) => {
                 Err(NameServiceError::storage(format!(
                     "unexpected ChangeMembershipError on ApplyHead: {e}"
