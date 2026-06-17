@@ -81,6 +81,17 @@ SELECT ?name ?salary WHERE {
 
 Now Alice sees both names, with `?salary` unbound — exactly the behavior an application expects when a property is suppressed by policy.
 
+## Enforcement across query operations
+
+Filtering happens wherever the plan reads flakes, so every query operation enforces the same per-flake policy — not just basic triple patterns:
+
+- **Triple patterns / BGPs** — the common case shown above; each matched flake is checked.
+- **OPTIONAL, joins, aggregates, `COUNT`** — these operate over already-filtered flakes, so a hidden flake is absent from joins and excluded from counts. `SELECT (COUNT(?o) ...) WHERE { ?s ex:salary ?o }` counts only the salary flakes the identity may view.
+- **Property paths** (`?x :knows+ ?y`, `:reportsTo*`, sequence/alternation) — traversal only follows edges the identity can view. A hidden `:knows` flake is not walked, so nodes reachable *only* through hidden edges do not appear in the result. You traverse exactly the graph you can see.
+- **Full-text and vector search** (embedded indexes) — a search hit is returned only if the identity can view the indexed content that produced the match. If the policy hides the indexed property's flake for a subject, that subject is dropped from the search results — even when selecting only the hit id/score with no constraining pattern. (This applies to Fluree's embedded search indexes; an external/dedicated search service enforces its own access controls.)
+
+In every case the rule is the same: the engine never emits — or traverses, or counts, or returns as a search hit — a flake the identity is not allowed to see.
+
 ## Targeting patterns
 
 ### Property-level (`f:onProperty`)
@@ -202,6 +213,7 @@ Two phases: load the policy set once per request; apply it to each touched flake
 - **Keep `f:query` cheap.** It runs once per flake-target. Lean on identity-side properties already loaded (`@type`, `f:policyClass`, role flags) rather than deep traversals.
 - **Avoid deep recursion in `f:query`.** Each level of indirection multiplies the per-flake cost.
 - **Required policies short-circuit.** If a required policy denies, no further required policies are checked for that flake.
+- **Targeted policies keep fast paths fast.** Cardinality and scalar-aggregate fast paths (e.g. a bare `COUNT` over a single predicate) still answer directly from index metadata when the active policy provably cannot restrict the scanned predicate — a policy that only targets `ex:salary` does not slow a `COUNT` over `schema:name`. A policy that *could* apply to the scanned predicate (including any default/subject-targeted policy) forces the per-flake filtered scan instead. This is another reason to prefer targeted policies.
 
 For complex deployments, the [explain plan](../query/explain.md) shows whether a query is dominated by policy filtering and which policies contribute.
 
