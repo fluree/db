@@ -267,6 +267,24 @@ pub fn cmp_row_vs_overlay(
     }
 }
 
+/// True when a decoded row (from a `ColumnBatch`) and an overlay op identify the
+/// **same fact** — equality over the full [`FactKeyV3`] tuple
+/// `(s_id, p_id, o_type, o_key, o_i)`. The single definition of "same fact" for
+/// the two-pointer merge's equal-sort-position branch; it takes the row's
+/// columns directly so the hot loop never constructs a key. Mirror
+/// [`FactKeyV3`]'s field set if it ever changes.
+#[inline]
+pub fn eq_row_vs_overlay(
+    s_id: u64,
+    p_id: u32,
+    o_type: u16,
+    o_key: u64,
+    o_i: u32,
+    ov: &OverlayOp,
+) -> bool {
+    s_id == ov.s_id && p_id == ov.p_id && o_type == ov.o_type && o_key == ov.o_key && o_i == ov.o_i
+}
+
 /// Compare an overlay op against a `RunRecordV2` branch key.
 ///
 /// Used for per-leaf overlay slicing: binary-search overlay ops against

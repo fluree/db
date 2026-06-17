@@ -18,7 +18,7 @@ use crate::format::run_record::RunSortOrder;
 use crate::format::run_record_v2::cmp_v2_for_order;
 use crate::format::run_record_v2::{read_ordered_key_v2, RunRecordV2};
 use crate::read::types::cmp_overlay_vs_record;
-use crate::read::types::{cmp_row_vs_overlay, OverlayOp};
+use crate::read::types::{cmp_row_vs_overlay, eq_row_vs_overlay, OverlayOp};
 
 use super::binary_index_store::BinaryIndexStore;
 use super::column_loader::load_columns_cached_via_handle;
@@ -559,12 +559,8 @@ impl BinaryCursor {
                     self.overlay_pos += 1;
                 }
                 std::cmp::Ordering::Equal => {
-                    // Same sort position — check full identity (all 5 fields).
-                    let same_identity = r_s == ov.s_id
-                        && r_p == ov.p_id
-                        && r_ot == ov.o_type
-                        && r_ok == ov.o_key
-                        && r_oi == ov.o_i;
+                    // Same sort position — check full FactKeyV3 identity.
+                    let same_identity = eq_row_vs_overlay(r_s, r_p, r_ot, r_ok, r_oi, ov);
 
                     if same_identity {
                         // Same fact: assert → overlay replaces row; retract → omit row.
