@@ -6,6 +6,7 @@
 
 use crate::binding::{Batch, Binding};
 use crate::context::ExecutionContext;
+use crate::policy::PredicateCoverage;
 use crate::error::{QueryError, Result};
 use crate::ir::triple::Ref;
 use crate::operator::{BoxedOperator, Operator, OperatorState};
@@ -3479,6 +3480,62 @@ pub fn allow_cursor_fast_path(ctx: &ExecutionContext<'_>) -> bool {
     !ctx.is_multi_ledger() && ctx.from_t.is_none() && ctx.allow_unfiltered()
 }
 
+/// Verdict for a single-predicate cursor fast path under a view policy, returned
+/// by [`cursor_fast_path_for_predicate`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PredicateFastPath {
+    /// Run the fast path as usual: no policy / root, or the scanned predicate is
+    /// provably uncovered by the view policy and the effective default is allow.
+    Allow,
+    /// The scanned predicate is uncovered and the effective default is deny:
+    /// every matching flake is hidden, so the operator should emit its empty
+    /// result (count 0 / aggregate identity / no rows) without scanning.
+    Empty,
+    /// A restriction may apply, or the query is otherwise fast-path-ineligible
+    /// (multi-ledger / historical): fall back to the filtered scan path.
+    Decline,
+}
+
+/// Per-predicate relaxation of [`allow_cursor_fast_path`]: under an active
+/// non-root view policy, a single-predicate cursor fast path can still run when
+/// its one statically-known scanned predicate `pred_sid` is provably uncovered
+/// by the policy, instead of bailing to the filtered scan for *any* non-root
+/// policy.
+///
+/// - [`PredicateFastPath::Allow`] — run the fast path (no policy / root, or
+///   uncovered + default-allow).
+/// - [`PredicateFastPath::Empty`] — uncovered + default-deny: emit the empty
+///   result for this predicate without scanning.
+/// - [`PredicateFastPath::Decline`] — a restriction may apply, or the query is
+///   multi-ledger / historical: take the filtered fallback.
+///
+/// Only valid for an operator that scans exactly one ground predicate; multi- or
+/// wildcard-predicate fast paths must keep using [`allow_cursor_fast_path`]
+/// (they would have to clear *every* touched predicate).
+#[inline]
+pub fn cursor_fast_path_for_predicate(
+    ctx: &ExecutionContext<'_>,
+    pred_sid: &Sid,
+) -> PredicateFastPath {
+    if ctx.is_multi_ledger() || ctx.from_t.is_some() {
+        return PredicateFastPath::Decline;
+    }
+    // No policy or root: nothing to filter, run the fast path unfiltered.
+    if ctx.allow_unfiltered() {
+        return PredicateFastPath::Allow;
+    }
+    // allow_unfiltered() == false implies a Some(non-root) enforcer; the None arm
+    // is unreachable but kept total.
+    match ctx.policy_enforcer.as_ref() {
+        Some(enforcer) => match enforcer.classify_view_predicate(pred_sid) {
+            PredicateCoverage::Covered => PredicateFastPath::Decline,
+            PredicateCoverage::UncoveredAllow => PredicateFastPath::Allow,
+            PredicateCoverage::UncoveredDeny => PredicateFastPath::Empty,
+        },
+        None => PredicateFastPath::Allow,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 11. Generic fast-path operator
 // ---------------------------------------------------------------------------
@@ -3623,6 +3680,72 @@ mod tests {
     use super::*;
     use fluree_db_core::comparator::IndexType;
     use fluree_db_core::Flake;
+
+    /// `cursor_fast_path_for_predicate` must: run unfiltered with no policy;
+    /// decline for a covered predicate under a non-root policy; keep the fast
+    /// path for an uncovered predicate when the default is allow; and short to
+    /// Empty for an uncovered predicate when the default is deny.
+    #[test]
+    fn cursor_fast_path_for_predicate_uses_coverage() {
+        use crate::policy::QueryPolicyEnforcer;
+        use crate::var_registry::VarRegistry;
+        use fluree_db_core::LedgerSnapshot;
+        use fluree_db_policy::{PolicyContext, PolicySet, PolicyWrapper, PropertyPolicyEntry};
+        use std::collections::HashMap;
+
+        let snapshot = LedgerSnapshot::genesis("test/main");
+        let vars = VarRegistry::new();
+        let ssn = Sid::new(100, "ssn"); // covered by the view policy
+        let name = Sid::new(100, "name"); // uncovered
+
+        // No policy at all => always Allow.
+        let ctx_none = ExecutionContext::new(&snapshot, &vars);
+        assert_eq!(
+            cursor_fast_path_for_predicate(&ctx_none, &ssn),
+            PredicateFastPath::Allow
+        );
+
+        // Build a non-root view policy that only covers `ssn` (a single
+        // by_property entry), parameterized by default_allow.
+        let make_ctx = |default_allow: bool| {
+            let mut view = PolicySet::default();
+            view.by_property.entry(ssn.clone()).or_default().push(
+                PropertyPolicyEntry {
+                    idx: 0,
+                    class_check_needed: false,
+                },
+            );
+            let wrapper = PolicyWrapper::new(
+                view,
+                PolicySet::default(),
+                false, // root
+                default_allow,
+                HashMap::new(),
+            );
+            let enforcer =
+                Arc::new(QueryPolicyEnforcer::new(Arc::new(PolicyContext::new(wrapper, None))));
+            // SAFETY: snapshot/vars outlive the returned ctx within each assert.
+            ExecutionContext::new(&snapshot, &vars).with_policy_enforcer(enforcer)
+        };
+
+        // Covered predicate => decline regardless of default_allow.
+        let ctx_allow = make_ctx(true);
+        assert_eq!(
+            cursor_fast_path_for_predicate(&ctx_allow, &ssn),
+            PredicateFastPath::Decline
+        );
+        // Uncovered predicate + default-allow => keep the fast path.
+        assert_eq!(
+            cursor_fast_path_for_predicate(&ctx_allow, &name),
+            PredicateFastPath::Allow
+        );
+        // Uncovered predicate + default-deny => short-circuit to Empty.
+        let ctx_deny = make_ctx(false);
+        assert_eq!(
+            cursor_fast_path_for_predicate(&ctx_deny, &name),
+            PredicateFastPath::Empty
+        );
+    }
 
     /// `predicate_walk_bounds` must bracket every possible flake of the
     /// predicate in both predicate-leading orders: `first` strictly below all

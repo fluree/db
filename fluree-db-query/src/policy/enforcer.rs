@@ -4,9 +4,28 @@
 
 use super::QueryPolicyExecutor;
 use crate::error::Result;
-use fluree_db_core::{Flake, LedgerSnapshot, OverlayProvider, Tracker};
+use fluree_db_core::{Flake, LedgerSnapshot, OverlayProvider, Sid, Tracker};
 use fluree_db_policy::{is_schema_flake, PolicyContext};
 use std::sync::Arc;
+
+/// Plan-time-style verdict for a single statically-known scanned predicate under
+/// an enforcer's *view* policy.
+///
+/// Lets a single-predicate fast path skip the per-flake policy filter when the
+/// predicate is provably uncovered by the view policy
+/// (see [`PolicySet::covers_predicate`](fluree_db_policy::PolicySet::covers_predicate)).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PredicateCoverage {
+    /// A view restriction may apply to flakes with this predicate; the per-flake
+    /// filtered scan fallback is required.
+    Covered,
+    /// No restriction can apply and the effective default is allow — every flake
+    /// with this predicate is visible, so a fast path may run unfiltered.
+    UncoveredAllow,
+    /// No restriction can apply and the effective default is deny — every flake
+    /// with this predicate is hidden, so the result for it is empty.
+    UncoveredDeny,
+}
 
 /// Policy enforcer for query execution
 ///
@@ -39,6 +58,28 @@ impl QueryPolicyEnforcer {
     /// Check if this is a root policy (bypasses all checks)
     pub fn is_root(&self) -> bool {
         self.policy.wrapper().is_root()
+    }
+
+    /// Classify a single statically-known scanned predicate against the *view*
+    /// policy, amortizing the wrapper/view/default_allow walk into one call.
+    ///
+    /// A root enforcer reports [`PredicateCoverage::Covered`]: callers are
+    /// expected to short-circuit the no-policy / root case via
+    /// [`ExecutionContext::allow_unfiltered`](crate::context::ExecutionContext::allow_unfiltered)
+    /// before reaching here, so the root arm is only a defensive fallback (it
+    /// forces the filtered path, which is correct — just slower — for root).
+    pub fn classify_view_predicate(&self, predicate: &Sid) -> PredicateCoverage {
+        let wrapper = self.policy.wrapper();
+        if wrapper.is_root() {
+            return PredicateCoverage::Covered;
+        }
+        if wrapper.view().covers_predicate(predicate) {
+            PredicateCoverage::Covered
+        } else if wrapper.default_allow() {
+            PredicateCoverage::UncoveredAllow
+        } else {
+            PredicateCoverage::UncoveredDeny
+        }
     }
 
     /// Filter a batch of flakes by policy using explicit graph parameters.

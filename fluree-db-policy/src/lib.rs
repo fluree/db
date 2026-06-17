@@ -56,7 +56,7 @@ pub use evaluate::{
 };
 pub use index::{build_policy_set, compute_class_check_needed, get_all_classes_for_property};
 pub use query_eval::{NoOpQueryExecutor, PolicyQueryExecutor, PolicyQueryFut};
-pub use schema::is_schema_flake;
+pub use schema::{is_schema_flake, is_schema_predicate};
 pub use types::{
     FlakePolicyEntry, PolicyAction, PolicyDecision, PolicyQuery, PolicyRestriction, PolicySet,
     PolicyValue, PolicyWrapper, PropertyPolicyEntry, TargetMode,

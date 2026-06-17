@@ -10,10 +10,11 @@ use crate::context::ExecutionContext;
 use crate::error::{QueryError, Result};
 use crate::fast_path_common::{
     allow_cursor_fast_path, build_count_batch, count_predicate_overlay_delta,
-    count_rows_for_predicate_psot, count_to_i64, fast_path_store, leaf_entries_for_predicate,
-    normalize_pred_sid, parallel_leaf_chunk_count, parallel_leaf_chunk_reduce,
-    parallel_overlay_psot_filter_count, projection_okey_only, projection_otype_only,
-    projection_sid_only, projection_sid_otype_okey, FastPathOperator,
+    count_rows_for_predicate_psot, count_to_i64, cursor_fast_path_for_predicate, fast_path_store,
+    leaf_entries_for_predicate, normalize_pred_sid, parallel_leaf_chunk_count,
+    parallel_leaf_chunk_reduce, parallel_overlay_psot_filter_count, projection_okey_only,
+    projection_otype_only, projection_sid_only, projection_sid_otype_okey, FastPathOperator,
+    PredicateFastPath,
 };
 use crate::ir::triple::{Ref, TriplePattern};
 use crate::operator::inline::InlineOperator;
@@ -28,7 +29,7 @@ use fluree_db_binary_index::BinaryIndexStore;
 use fluree_db_core::o_type::OType;
 use fluree_db_core::subject_id::SubjectId;
 use fluree_db_core::value_id::{ObjKey, ValueTypeTag};
-use fluree_db_core::{FlakeValue, GraphId};
+use fluree_db_core::{FlakeValue, GraphId, OverlayProvider};
 use fluree_vocab::namespaces;
 use std::sync::Arc;
 
@@ -45,43 +46,49 @@ pub fn count_rows_operator(
     FastPathOperator::new(
         out_var,
         move |ctx| {
-            // HEAD: metadata-only predicate row count (instant).
-            if let Some(store) = fast_path_store(ctx) {
-                let pred_sid = normalize_pred_sid(store, &predicate)?;
-                let Some(p_id) = store.sid_to_p_id(&pred_sid) else {
-                    return Ok(Some(build_count_batch(out_var, 0)?));
-                };
+            let Some(store) = ctx.binary_store.as_ref() else {
+                return Ok(None); // no binary store => general/filtered fallback
+            };
+            let pred_sid = normalize_pred_sid(store, &predicate)?;
+
+            // O1: under a non-root view policy, a single-predicate count can keep
+            // the fast path when the scanned predicate is provably uncovered by
+            // the policy. `Decline` (covered, multi-ledger, or historical) falls
+            // back to the filtered scan; an uncovered default-deny predicate is
+            // wholly hidden, so its count is 0. With no policy / root this is
+            // always `Allow`, preserving the original behavior.
+            match cursor_fast_path_for_predicate(ctx, &pred_sid) {
+                PredicateFastPath::Decline => return Ok(None),
+                PredicateFastPath::Empty => return Ok(Some(build_count_batch(out_var, 0)?)),
+                PredicateFastPath::Allow => {}
+            }
+
+            let Some(p_id) = store.sid_to_p_id(&pred_sid) else {
+                return Ok(Some(build_count_batch(out_var, 0)?)); // predicate absent => 0
+            };
+
+            // Lane 1 — metadata-only predicate row count (instant) when there is
+            // no novelty overlay and the target is the indexed head.
+            let overlay_free = ctx.overlay.map(OverlayProvider::epoch).unwrap_or(0) == 0;
+            if overlay_free && ctx.to_t == store.max_t() {
                 let count = count_rows_for_predicate_psot(store, ctx.binary_g_id, p_id)?;
                 return Ok(Some(build_count_batch(
                     out_var,
                     count_to_i64(count, "COUNT rows")?,
                 )?));
             }
-            // Novelty at HEAD (no time-travel): metadata base count + a novelty delta
-            // that rescans only the leaves novelty touches, instead of the whole
-            // predicate. Time-travel (to_t < max_t) needs base replay — defer.
-            if allow_cursor_fast_path(ctx) {
-                if let Some(store) = ctx.binary_store.as_ref() {
-                    // to_t >= max_t: at-or-above the indexed head (novelty folds on
-                    // top). Time-travel BELOW max_t needs base replay — defer.
-                    if ctx.to_t >= store.max_t() {
-                        let pred_sid = normalize_pred_sid(store, &predicate)?;
-                        let Some(p_id) = store.sid_to_p_id(&pred_sid) else {
-                            return Ok(None); // novelty-only predicate => defer
-                        };
-                        if let Some(count) = count_predicate_overlay_delta(
-                            ctx,
-                            store,
-                            ctx.binary_g_id,
-                            pred_sid,
-                            p_id,
-                        )? {
-                            return Ok(Some(build_count_batch(
-                                out_var,
-                                count_to_i64(count, "COUNT rows")?,
-                            )?));
-                        }
-                    }
+
+            // Lane 2 — base metadata count + a novelty delta that rescans only the
+            // leaves novelty touches, when the target is at or above the indexed
+            // head. Time-travel below the head needs base replay — defer.
+            if ctx.to_t >= store.max_t() {
+                if let Some(count) =
+                    count_predicate_overlay_delta(ctx, store, ctx.binary_g_id, pred_sid, p_id)?
+                {
+                    return Ok(Some(build_count_batch(
+                        out_var,
+                        count_to_i64(count, "COUNT rows")?,
+                    )?));
                 }
             }
             Ok(None)
