@@ -2469,7 +2469,7 @@ pub enum ProbeLanePlan {
 /// `filter_flakes` policy filtering that scan operators apply — engaging
 /// them under a restrictive policy would leak rows the policy hides.
 pub(crate) fn root_or_no_policy(ctx: &ExecutionContext<'_>) -> bool {
-    ctx.policy_enforcer.as_ref().is_none_or(|p| p.is_root())
+    ctx.allow_unfiltered()
 }
 
 /// Plan a single-predicate PSOT subject probe under the active overlay.
@@ -3443,7 +3443,7 @@ fn allow_fast_path(ctx: &ExecutionContext<'_>) -> bool {
     // paths for correctness unless/until they are made dataset-aware.
     !ctx.is_multi_ledger()
         && ctx.from_t.is_none()
-        && ctx.policy_enforcer.as_ref().is_none_or(|p| p.is_root())
+        && ctx.allow_unfiltered()
         && ctx
             .overlay
             .map(fluree_db_core::OverlayProvider::epoch)
@@ -3476,9 +3476,7 @@ pub fn fast_path_store<'a>(ctx: &'a ExecutionContext<'_>) -> Option<&'a Arc<Bina
 /// at the planner level.
 #[inline]
 pub fn allow_cursor_fast_path(ctx: &ExecutionContext<'_>) -> bool {
-    !ctx.is_multi_ledger()
-        && ctx.from_t.is_none()
-        && ctx.policy_enforcer.as_ref().is_none_or(|p| p.is_root())
+    !ctx.is_multi_ledger() && ctx.from_t.is_none() && ctx.allow_unfiltered()
 }
 
 // ---------------------------------------------------------------------------
