@@ -465,3 +465,148 @@ async fn modify_query_always_false_denies() {
         "Error should be the custom f:exMessage"
     );
 }
+
+/// V4 regression: a transaction WHERE clause is a READ and must be filtered by
+/// the requesting identity's view policy. Otherwise a writer with modify access
+/// to some property can launder hidden values by conditionally writing based on
+/// a WHERE match against data they cannot view — e.g.
+/// `INSERT { ?s ex:exposed true } WHERE { ?s ex:salary ?sal }` reveals which
+/// subjects have a salary even though the identity can't view `ex:salary`.
+///
+/// The fix attaches the view enforcer to the WHERE dataset, so the match phase
+/// sees only viewable flakes. This test isolates the read filter: there is NO
+/// modify restriction, so the writes themselves are always permitted — only the
+/// WHERE read is constrained.
+#[tokio::test]
+async fn where_read_respects_view_policy() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "where_view_policy");
+
+    // Seed two users with a hidden salary and a visible name.
+    let seed = json!({
+        "@context": {"ex": "http://example.org/ns/"},
+        "@graph": [
+            {"@id": "ex:alice", "@type": "ex:User", "ex:name": "Alice", "ex:salary": 100},
+            {"@id": "ex:bob",   "@type": "ex:User", "ex:name": "Bob",   "ex:salary": 500}
+        ]
+    });
+    let ledger = fluree.insert(ledger0, &seed).await.unwrap().ledger;
+
+    let index_cfg = IndexConfig {
+        reindex_min_bytes: 100_000,
+        reindex_max_bytes: 1_000_000_000,
+    };
+
+    // --- Baseline (no policy): the salary-probe WHERE matches both users and
+    // writes the flag, confirming the attack query is valid and WOULD leak
+    // without view enforcement. ---
+    let baseline = json!({
+        "@context": {"ex": "http://example.org/ns/"},
+        "where":  {"@id": "?s", "ex:salary": "?sal"},
+        "insert": {"@id": "?s", "ex:rootexposed": true}
+    });
+    let ledger = fluree.update(ledger, &baseline).await.unwrap().ledger;
+    let rootexposed = support::query_jsonld(
+        &fluree,
+        &ledger,
+        &json!({"select": "?s", "where": {"@id": "?s", "http://example.org/ns/rootexposed": "?e"}}),
+    )
+    .await
+    .unwrap()
+    .to_jsonld(&ledger.snapshot)
+    .unwrap();
+    assert_eq!(
+        rootexposed.as_array().map(Vec::len).unwrap_or(0),
+        2,
+        "baseline: an unrestricted salary-probe WHERE must match both users: {rootexposed:#?}"
+    );
+
+    // Everything is viewable + modifiable by default EXCEPT ex:salary, which a
+    // required view-deny hides. No modify policy → writes are unconstrained, so
+    // any blocked write is purely the WHERE read being filtered.
+    let policy = json!([{
+        "@id": "ex:salaryHidden",
+        "f:required": true,
+        "f:onProperty": [{"@id": "http://example.org/ns/salary"}],
+        "f:action": [{"@id": "f:view"}],
+        "f:allow": false
+    }]);
+    let qc_opts = QueryConnectionOptions {
+        policy: Some(policy),
+        default_allow: true,
+        ..Default::default()
+    };
+
+    // --- Attack under the restricted identity: salary is view-denied, so the
+    // WHERE matches nothing → no flakes → an empty transaction. The flag is
+    // never written. (Before the fix the WHERE matched both users and committed
+    // ex:exposed.) The attack errors and does not advance the ledger, so the
+    // control below runs on a clone of the pre-attack state. ---
+    let policy_ctx = policy_builder::build_policy_context_from_opts(
+        &ledger.snapshot,
+        ledger.novelty.as_ref(),
+        Some(ledger.novelty.as_ref()),
+        ledger.t(),
+        &qc_opts,
+        &[0],
+    )
+    .await
+    .expect("build policy context (attack)");
+
+    let attack = json!({
+        "@context": {"ex": "http://example.org/ns/"},
+        "where":  {"@id": "?s", "ex:salary": "?sal"},
+        "insert": {"@id": "?s", "ex:exposed": true}
+    });
+    let input = TrackedTransactionInput::new(TxnType::Update, &attack, TxnOpts::default(), &policy_ctx);
+    let attack_result = fluree
+        .transact_tracked_with_policy(ledger.clone(), input, CommitOpts::default(), &index_cfg)
+        .await;
+    let err = attack_result.expect_err("salary-probe WHERE must be fully view-filtered (empty tx)");
+    assert!(
+        err.error.contains("Empty transaction") || err.error.contains("no flakes"),
+        "expected an empty transaction (WHERE matched nothing under view policy), got: {}",
+        err.error
+    );
+
+    // --- Control: probe a VIEWABLE property; the WHERE must still match both
+    // users (no over-filtering). ---
+    let policy_ctx = policy_builder::build_policy_context_from_opts(
+        &ledger.snapshot,
+        ledger.novelty.as_ref(),
+        Some(ledger.novelty.as_ref()),
+        ledger.t(),
+        &qc_opts,
+        &[0],
+    )
+    .await
+    .expect("build policy context (control)");
+
+    let control = json!({
+        "@context": {"ex": "http://example.org/ns/"},
+        "where":  {"@id": "?s", "ex:name": "?n"},
+        "insert": {"@id": "?s", "ex:greeted": true}
+    });
+    let input = TrackedTransactionInput::new(TxnType::Update, &control, TxnOpts::default(), &policy_ctx);
+    let (control_result, _) = fluree
+        .transact_tracked_with_policy(ledger, input, CommitOpts::default(), &index_cfg)
+        .await
+        .expect("control transaction should succeed (ex:name is viewable)");
+    let ledger = control_result.ledger;
+
+    let greeted = support::query_jsonld(
+        &fluree,
+        &ledger,
+        &json!({"select": "?s", "where": {"@id": "?s", "http://example.org/ns/greeted": "?g"}}),
+    )
+    .await
+    .unwrap()
+    .to_jsonld(&ledger.snapshot)
+    .unwrap();
+    assert_eq!(
+        greeted.as_array().map(Vec::len).unwrap_or(0),
+        2,
+        "WHERE over a viewable property must still match (no over-filtering): {greeted:#?}"
+    );
+}

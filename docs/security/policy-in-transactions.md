@@ -187,7 +187,10 @@ When no `f:exMessage` is set, a generic message is returned (`"policy denied"`);
 
 ## WHERE/DELETE/INSERT semantics with policy
 
-A WHERE/DELETE/INSERT transaction proceeds in three phases — match → retract → assert. Policy enforcement is on the staged flakes from phases 2 and 3:
+A WHERE/DELETE/INSERT transaction proceeds in three phases — match → retract → assert. The two policy actions apply at different phases:
+
+- **`f:view` filters the match phase.** The WHERE clause is a *read*, so it binds only the flakes the requesting identity may view — exactly as the same patterns would in a query. An identity therefore cannot conditionally match on data it can't see: `INSERT { ?s ex:flag true } WHERE { ?s ex:salary ?v . FILTER(?v > 100000) }` binds nothing when `ex:salary` isn't viewable, so a conditional write can't be used to probe hidden values.
+- **`f:modify` rejects the write.** Enforcement runs on the staged flakes from the retract/assert phases; any flake the identity can't modify rejects the whole transaction.
 
 ```sparql
 PREFIX ex:     <http://example.org/>
@@ -198,12 +201,16 @@ DELETE { ?u schema:email ?old }
 INSERT { ?u schema:email "new@flur.ee" }
 ```
 
-When run by an identity that lacks modify rights on `?u`'s email:
+Run by an identity that **can view** Jane's email but lacks **modify** rights on it:
 
-- The WHERE pattern still binds normally — policy doesn't filter the *match phase*.
+- The WHERE binds Jane's email (it is viewable), so the DELETE/INSERT are staged.
 - The DELETE retraction stages a flake the identity can't modify — **rejected**.
 
-To prevent accidental no-op rejections (the WHERE matches but the DELETE/INSERT can't proceed), pair transaction-time `f:modify` policies with the same shape `f:view` policies, so the WHERE itself sees a filtered view.
+Run by an identity that **cannot view** Jane's email:
+
+- The WHERE binds nothing — the hidden value is never read, so it can't be inferred from whether the write succeeded. A WHERE/DELETE/INSERT that matches no rows produces no flakes and is reported as an empty transaction.
+
+So pairing an `f:modify` policy with a same-shape `f:view` policy turns a would-be modify *rejection* into a clean no-op: the WHERE stops matching the protected rows, so nothing is staged to reject.
 
 ## Signed transactions and impersonation
 
