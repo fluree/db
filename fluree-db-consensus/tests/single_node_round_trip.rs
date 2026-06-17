@@ -171,6 +171,7 @@ async fn single_node_raft_index_publisher_round_trip() {
             branch: "main".into(),
             idempotency: None,
             request_cid: cid(99),
+            body_cid: cid(99),
             body_kind: BodyKind::JsonLdInsert,
             applied_at_millis: 1_500,
         }))
@@ -187,6 +188,7 @@ async fn single_node_raft_index_publisher_round_trip() {
         commit_id: cid(7),
         commit_t: 10,
         applied_at_millis: 2_000,
+        tally: None,
     }))
     .await
     .unwrap();
@@ -297,6 +299,7 @@ async fn single_node_apply_emits_commit_event_on_bus() {
             branch: "main".into(),
             idempotency: None,
             request_cid: cid(99),
+            body_cid: cid(99),
             body_kind: BodyKind::JsonLdInsert,
             applied_at_millis: 1_500,
         }))
@@ -313,6 +316,7 @@ async fn single_node_apply_emits_commit_event_on_bus() {
         commit_id: cid(7),
         commit_t: 10,
         applied_at_millis: 2_000,
+        tally: None,
     }))
     .await
     .unwrap();
@@ -476,6 +480,7 @@ async fn single_node_branch_lifecycle_round_trip() {
             branch: "main".into(),
             idempotency: None,
             request_cid: cid(99),
+            body_cid: cid(99),
             body_kind: BodyKind::JsonLdInsert,
             applied_at_millis: 500,
         }))
@@ -492,6 +497,7 @@ async fn single_node_branch_lifecycle_round_trip() {
         commit_id: cid(1),
         commit_t: 5,
         applied_at_millis: 1_000,
+        tally: None,
     }))
     .await
     .unwrap();

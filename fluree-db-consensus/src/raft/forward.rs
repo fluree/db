@@ -54,6 +54,15 @@ const HOP_BY_HOP_HEADERS: &[&str] = &[
     "upgrade",
 ];
 
+/// Upper bound on the request body the follower will buffer before
+/// forwarding it to the leader. A follower that's still in catch-up
+/// shouldn't be coerced into allocating arbitrary memory by a hostile
+/// caller — anything beyond this returns 413 Payload Too Large. 64
+/// MiB comfortably covers the bulk-import paths Fluree exposes today;
+/// callers running larger imports should split the payload or address
+/// the leader directly.
+const MAX_FORWARDED_BODY_BYTES: usize = 64 * 1024 * 1024;
+
 // ============================================================================
 // State
 // ============================================================================
@@ -205,7 +214,7 @@ async fn forward_request(
         path_and_query
     );
 
-    let body_bytes = axum::body::to_bytes(body, usize::MAX)
+    let body_bytes = axum::body::to_bytes(body, MAX_FORWARDED_BODY_BYTES)
         .await
         .map_err(ForwardError::ReadBody)?;
 

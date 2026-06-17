@@ -145,10 +145,15 @@ pub struct LedgerRecord {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ApplyRecord {
     /// CAS identifier of the [`crate::QueuedRequest`] envelope this
-    /// commit was staged from (see `Command::EnqueueCommand`). Sole
-    /// request identity — comparing CIDs detects "same key,
-    /// different body" misuse.
+    /// commit was staged from (see `Command::EnqueueCommand`). Held
+    /// so the adapter can release the envelope blob on cache eviction.
     pub request_cid: ContentId,
+    /// Idempotency comparison key — a hash over the canonical body
+    /// only (see [`QueuedRequest::canonical_body_bytes`]). Compared
+    /// against the new submission's body CID under the same
+    /// idempotency key; a mismatch surfaces as
+    /// [`Response::BodyHashMismatch`].
+    pub body_cid: ContentId,
     /// Wall-clock at which the cache entry was recorded, milliseconds
     /// since the Unix epoch. Used by `Command::EvictIdempotency` to
     /// age out entries past their TTL.
@@ -183,13 +188,22 @@ pub enum ApplyOutcome {
 }
 
 impl ApplyOutcome {
-    /// Envelope CID this outcome was recorded against. Mismatched
-    /// CIDs under the same idempotency key are surfaced as a client
-    /// bug rather than silently deduped.
+    /// Envelope CID held by this outcome — the full
+    /// [`crate::QueuedRequest`] blob the adapter releases on
+    /// idempotency eviction.
     pub fn request_cid(&self) -> &ContentId {
         match self {
             ApplyOutcome::Applied(r) => &r.request_cid,
             ApplyOutcome::Failed(r) => &r.request_cid,
+        }
+    }
+
+    /// Canonical-body CID used to detect "same key, different body"
+    /// misuse at idempotency-cache lookup time.
+    pub fn body_cid(&self) -> &ContentId {
+        match self {
+            ApplyOutcome::Applied(r) => &r.body_cid,
+            ApplyOutcome::Failed(r) => &r.body_cid,
         }
     }
 
@@ -226,13 +240,19 @@ pub struct QueueEntry {
     /// the Unix epoch.
     pub enqueued_at_millis: u64,
     /// Idempotency key if the caller supplied one. The matching
-    /// `request_cid` check uses [`Self::request_cid`].
+    /// body-CID check uses [`Self::body_cid`].
     pub idempotency: Option<IdempotencyCacheKey>,
     /// CAS identifier of the [`crate::QueuedRequest`] envelope
     /// holding the body and per-request context. Written by the
     /// proposing committer before the [`Command::EnqueueCommand`]
     /// proposal — guaranteed present once the entry lands.
     pub request_cid: ContentId,
+    /// Hash over the canonical body bytes (see
+    /// [`crate::QueuedRequest::canonical_body_bytes`]). Used for
+    /// the in-flight "same key, different body" check so callers
+    /// can retry without their transient per-request fields
+    /// (timestamps, tracking) tripping a false mismatch.
+    pub body_cid: ContentId,
     /// Discriminator the worker uses to choose its processing
     /// path (stage vs verify-pushed-chain).
     pub body_kind: BodyKind,
@@ -289,6 +309,9 @@ impl From<&crate::TransactionBody> for BodyKind {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PoisonRecord {
     pub request_cid: ContentId,
+    /// Canonical-body CID for idempotency comparison. See
+    /// [`ApplyRecord::body_cid`] — same semantics.
+    pub body_cid: ContentId,
     pub reason: PoisonReason,
     pub recorded_index: u64,
     pub recorded_at_millis: u64,
@@ -480,6 +503,13 @@ pub struct EnqueueCommandArgs {
     /// leader wrote before proposing. The worker reads it back to
     /// recover the body and per-request context.
     pub request_cid: ContentId,
+    /// Hash over the canonical body bytes (see
+    /// [`crate::QueuedRequest::canonical_body_bytes`]). The state
+    /// machine compares this — not [`Self::request_cid`] — against
+    /// the cached or in-flight entry's `body_cid` when checking
+    /// idempotency, so per-request transient fields in the envelope
+    /// don't trip a false [`Response::BodyHashMismatch`] on retry.
+    pub body_cid: ContentId,
     pub body_kind: BodyKind,
     pub applied_at_millis: u64,
 }
@@ -496,6 +526,13 @@ pub struct ApplyHeadArgs {
     pub commit_id: ContentId,
     pub commit_t: i64,
     pub applied_at_millis: u64,
+    /// Optional tracking tally from the staging run. Only meaningful
+    /// for transact submissions and recorded in the idempotency
+    /// cache so a later [`IdempotencyHit`] returns the same tally
+    /// the original submission produced — without it, retries see
+    /// `tally: None` even when the first call observed one.
+    #[serde(default)]
+    pub tally: Option<RecordedTally>,
 }
 
 /// Payload for [`Command::PoisonQueueEntry`].
@@ -1177,19 +1214,37 @@ fn apply_enqueue_command(
         branch,
         idempotency,
         request_cid,
+        body_cid,
         body_kind,
         applied_at_millis,
     } = args;
     let full_ledger_id = format_ledger_id(&ledger_id, &branch);
     let ref_key = RefKey::new(&ledger_id, &branch);
 
-    // 1. Idempotency cache — one lookup, branch on outcome
-    //    variant. The request_cid must match; mismatched envelopes
-    //    under the same key are a client bug we surface rather
-    //    than silently dedup.
+    // 0. Reject submissions targeting a ledger/branch the state
+    //    machine doesn't know. Without this the entry would sit in
+    //    the queue and only fail at staging time (LedgerNotFound),
+    //    burning a full propose + worker round trip for a check the
+    //    state machine can answer immediately.
+    let ledger_known = state
+        .ledgers
+        .get(&ledger_id)
+        .is_some_and(|l| l.branches.iter().any(|b| b == &branch));
+    if !ledger_known {
+        return Response::LedgerNotFound {
+            ledger_id: full_ledger_id,
+        };
+    }
+
+    // 1. Idempotency cache — one lookup, branch on outcome variant.
+    //    The body CID must match; mismatched bodies under the same
+    //    key are a client bug we surface rather than silently dedup.
+    //    Comparison uses the canonical body CID (not the full
+    //    envelope's `request_cid`) so retries with per-request
+    //    transient fields don't trip a false mismatch.
     if let Some(key) = idempotency.as_ref() {
         if let Some(outcome) = state.idempotency.get(key) {
-            if outcome.request_cid() != &request_cid {
+            if outcome.body_cid() != &body_cid {
                 return Response::BodyHashMismatch;
             }
             return match outcome {
@@ -1206,7 +1261,7 @@ fn apply_enqueue_command(
         if let Some(queue) = state.queues.get(&ref_key) {
             for entry in queue {
                 if entry.idempotency.as_ref() == Some(key) {
-                    return if entry.request_cid == request_cid {
+                    return if entry.body_cid == body_cid {
                         Response::InFlight {
                             ledger_id: full_ledger_id,
                             queue_id: entry.queue_id,
@@ -1254,6 +1309,7 @@ fn apply_enqueue_command(
         enqueued_at_millis: applied_at_millis,
         idempotency,
         request_cid,
+        body_cid,
         body_kind,
     };
     state.queues.entry(ref_key).or_default().push_back(entry);
@@ -1328,6 +1384,7 @@ fn apply_head(
         commit_id,
         commit_t,
         applied_at_millis,
+        tally,
     } = args;
     let full_ledger_id = format_ledger_id(&ledger_id, &branch);
     let ref_key = RefKey::new(&ledger_id, &branch);
@@ -1372,11 +1429,12 @@ fn apply_head(
             key,
             ApplyOutcome::Applied(ApplyRecord {
                 request_cid: entry.request_cid,
+                body_cid: entry.body_cid,
                 recorded_at_millis: applied_at_millis,
                 head: commit_id.clone(),
                 t: commit_t,
                 recorded_index: log_index,
-                tally: None,
+                tally,
             }),
         );
     }
@@ -1413,6 +1471,7 @@ fn apply_poison_queue_entry(
             key,
             ApplyOutcome::Failed(PoisonRecord {
                 request_cid: entry.request_cid,
+                body_cid: entry.body_cid,
                 reason: reason.clone(),
                 recorded_index: log_index,
                 recorded_at_millis: applied_at_millis,
@@ -2139,6 +2198,7 @@ mod tests {
             IdempotencyCacheKey::new("test/db", IdempotencyKey::new("k1")),
             ApplyOutcome::Applied(ApplyRecord {
                 request_cid: cid(7),
+                body_cid: cid(7),
                 recorded_at_millis: 2_000,
                 head: cid(2),
                 t: 5,
@@ -2322,6 +2382,7 @@ mod tests {
             branch: branch.into(),
             idempotency,
             request_cid: cid(body_seed),
+            body_cid: cid(body_seed),
             body_kind: BodyKind::JsonLdInsert,
             applied_at_millis: 1_000,
         })
@@ -2334,6 +2395,7 @@ mod tests {
     #[test]
     fn enqueue_appends_entry_and_returns_queue_id() {
         let mut state = NameServiceState::new();
+        apply(&mut state, create_ledger("test/db"), 0);
         let resp = apply(&mut state, enqueue("test/db", "main", 7, None), 1);
         let queue_id = match resp {
             Response::Enqueued { ledger_id, queue_id } => {
@@ -2353,12 +2415,14 @@ mod tests {
     #[test]
     fn enqueue_idempotency_hit_short_circuits_on_cached_success() {
         let mut state = NameServiceState::new();
+        apply(&mut state, create_ledger("test/db"), 0);
         let key = body_kid("k1");
         // Pre-populate a cached success record with request_cid set.
         state.idempotency.insert(
             key.clone(),
             ApplyOutcome::Applied(ApplyRecord {
                 request_cid: cid(7),
+                body_cid: cid(7),
                 recorded_at_millis: 500,
                 head: cid(42),
                 t: 5,
@@ -2390,11 +2454,13 @@ mod tests {
     #[test]
     fn enqueue_body_hash_mismatch_on_same_key_different_body() {
         let mut state = NameServiceState::new();
+        apply(&mut state, create_ledger("test/db"), 0);
         let key = body_kid("k1");
         state.idempotency.insert(
             key.clone(),
             ApplyOutcome::Applied(ApplyRecord {
                 request_cid: cid(7),
+                body_cid: cid(7),
                 recorded_at_millis: 500,
                 head: cid(42),
                 t: 5,
@@ -2418,6 +2484,7 @@ mod tests {
     #[test]
     fn enqueue_in_flight_when_key_already_queued() {
         let mut state = NameServiceState::new();
+        apply(&mut state, create_ledger("test/db"), 0);
         let key = body_kid("k1");
         let first = apply(
             &mut state,
@@ -2461,6 +2528,7 @@ mod tests {
     #[test]
     fn enqueue_returns_queue_full_per_branch_when_cap_reached() {
         let mut state = NameServiceState::new();
+        apply(&mut state, create_ledger("test/db"), 0);
         state.queue_config = QueueConfig {
             per_branch_cap: 2,
             global_cap: 100,
@@ -2481,6 +2549,9 @@ mod tests {
     #[test]
     fn enqueue_returns_queue_full_global_when_summed_cap_reached() {
         let mut state = NameServiceState::new();
+        apply(&mut state, create_ledger("a/db"), 0);
+        apply(&mut state, create_ledger("b/db"), 0);
+        apply(&mut state, create_ledger("c/db"), 0);
         state.queue_config = QueueConfig {
             per_branch_cap: 10,
             global_cap: 2,
@@ -2509,6 +2580,7 @@ mod tests {
             commit_id: commit,
             commit_t: t,
             applied_at_millis: 2_000,
+            tally: None,
         })
     }
 
@@ -2863,6 +2935,7 @@ mod tests {
         recorded_index: u64,
     ) -> ApplyOutcome {
         ApplyOutcome::Applied(ApplyRecord {
+            body_cid: request_cid.clone(),
             request_cid,
             recorded_at_millis,
             head: cid(99),
@@ -2878,6 +2951,7 @@ mod tests {
         recorded_index: u64,
     ) -> ApplyOutcome {
         ApplyOutcome::Failed(PoisonRecord {
+            body_cid: request_cid.clone(),
             request_cid,
             reason: PoisonReason::BodyMalformed {
                 error: "test".into(),

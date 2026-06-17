@@ -414,10 +414,13 @@ impl FlureeServerBuilder {
         // shared state and propose through the same Raft handle.
         #[cfg(feature = "raft")]
         let raft_nameservice = self.raft.as_ref().map(|(integration, _)| {
-            std::sync::Arc::new(fluree_db_consensus::raft::nameservice::RaftNameService::new(
-                integration.shared_state.clone(),
-                std::sync::Arc::clone(&integration.raft),
-            ))
+            std::sync::Arc::new(
+                fluree_db_consensus::raft::nameservice::RaftNameService::new(
+                    integration.shared_state.clone(),
+                    std::sync::Arc::clone(&integration.raft),
+                )
+                .with_staged_receipts(std::sync::Arc::clone(&integration.staged_receipts)),
+            )
         });
 
         // Build `Fluree` with the right nameservice for the

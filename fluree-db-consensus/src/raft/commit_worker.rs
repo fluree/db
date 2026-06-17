@@ -156,7 +156,8 @@ impl CommitWorker {
         // install the new state through the held write guard — this
         // keeps `state.refs` (replicated) and the local Fluree cache
         // in lockstep.
-        self.staged_receipts.stash(entry.queue_id, receipt);
+        self.staged_receipts
+            .stash(entry.queue_id, ref_key.clone(), receipt);
         match self.publish_head_advance(ref_key, commit_id, commit_t).await {
             Ok(()) => {
                 if let Some(install) = install {
@@ -952,6 +953,7 @@ mod tests {
                 "test/db",
                 IdempotencyKey::new("k1"),
             )),
+            body_cid: request_cid.clone(),
             request_cid,
             body_kind: kind,
         }

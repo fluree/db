@@ -47,9 +47,11 @@
 //!
 //! [`LedgerState::load`]: fluree_db_ledger::LedgerState::load
 
+use crate::raft::staged_receipt::StagedReceiptMap;
 use crate::raft::state_machine::{
     AdvanceIndexHeadArgs, ApplyHeadArgs, Command as SmCommand, CreateBranchArgs, CreateLedgerArgs,
-    DesyncReason, NameServiceState, RefKey, ResetHeadSnapshot, Response as SmResponse,
+    DesyncReason, NameServiceState, RecordedTally, RefKey, ResetHeadSnapshot,
+    Response as SmResponse,
 };
 use crate::raft::state_machine_adapter::SharedState;
 use crate::raft::TypeConfig;
@@ -78,11 +80,32 @@ use std::time::SystemTime;
 pub struct RaftNameService {
     state: SharedState,
     raft: Arc<Raft<TypeConfig>>,
+    /// When set, `publish_commit` peeks the staged receipt for the
+    /// queue front and threads its tally into [`ApplyHeadArgs::tally`]
+    /// so the cached idempotency record carries the same tally a
+    /// later retry would expect to see. Off → tally lands as `None`,
+    /// which only affects metric reporting on idempotent retries.
+    staged_receipts: Option<Arc<StagedReceiptMap>>,
 }
 
 impl RaftNameService {
     pub fn new(state: SharedState, raft: Arc<Raft<TypeConfig>>) -> Self {
-        Self { state, raft }
+        Self {
+            state,
+            raft,
+            staged_receipts: None,
+        }
+    }
+
+    /// Wire the [`StagedReceiptMap`] this nameservice peeks for
+    /// per-queue tally values. Pair it with the same handle the
+    /// [`CommitWorker`](super::commit_worker::CommitWorker) stashes
+    /// into and the
+    /// [`StateMachineAdapter`](super::state_machine_adapter::StateMachineAdapter)
+    /// consumes from.
+    pub fn with_staged_receipts(mut self, staged_receipts: Arc<StagedReceiptMap>) -> Self {
+        self.staged_receipts = Some(staged_receipts);
+        self
     }
 }
 
@@ -249,6 +272,7 @@ fn build_apply_head_command(
     ledger_id: &str,
     commit_t: i64,
     commit_id: &ContentId,
+    staged_receipts: Option<&StagedReceiptMap>,
 ) -> std::result::Result<SmCommand, NameServiceError> {
     let (ledger_name, branch) = split_ledger_id(ledger_id)?;
     let ref_key = RefKey::new(&ledger_name, &branch);
@@ -267,6 +291,10 @@ fn build_apply_head_command(
         .duration_since(SystemTime::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
+    let tally = staged_receipts
+        .and_then(|s| s.peek_transact_tally(queue_id))
+        .as_ref()
+        .map(RecordedTally::from);
     Ok(SmCommand::ApplyHead(ApplyHeadArgs {
         ledger_id: ledger_name,
         branch,
@@ -274,6 +302,7 @@ fn build_apply_head_command(
         commit_id: commit_id.clone(),
         commit_t,
         applied_at_millis,
+        tally,
     }))
 }
 
@@ -336,7 +365,13 @@ impl CommitPublisher for RaftNameService {
         // the state machine validates the queue_id at apply time.
         let cmd = {
             let state = self.state.read().await;
-            build_apply_head_command(&state, ledger_id, commit_t, commit_id)?
+            build_apply_head_command(
+                &state,
+                ledger_id,
+                commit_t,
+                commit_id,
+                self.staged_receipts.as_deref(),
+            )?
         };
 
         match self.raft.client_write(cmd).await {
@@ -883,6 +918,7 @@ mod tests {
             enqueued_at_millis: 1_000,
             idempotency: None,
             request_cid: cid(0),
+            body_cid: cid(0),
             body_kind: BodyKind::JsonLdInsert,
         });
         state.queues.insert(RefKey::new(&ledger_name, &branch), queue);
@@ -893,7 +929,8 @@ mod tests {
         let mut state = NameServiceState::default();
         install_queue_front(&mut state, "test/db:main", 42);
 
-        let cmd = build_apply_head_command(&state, "test/db:main", 7, &cid(99)).expect("build");
+        let cmd =
+            build_apply_head_command(&state, "test/db:main", 7, &cid(99), None).expect("build");
         let SmCommand::ApplyHead(args) = cmd else {
             panic!("expected ApplyHead");
         };
@@ -912,7 +949,7 @@ mod tests {
         // empty queue means somebody routed a stage through here
         // without enqueueing first, which is a bug worth surfacing.
         let state = NameServiceState::default();
-        let err = build_apply_head_command(&state, "test/db:main", 7, &cid(99))
+        let err = build_apply_head_command(&state, "test/db:main", 7, &cid(99), None)
             .expect_err("expected empty-queue error");
         assert!(
             err.to_string().contains("queue is empty"),
@@ -923,7 +960,7 @@ mod tests {
     #[test]
     fn build_apply_head_command_rejects_invalid_ledger_id() {
         let state = NameServiceState::default();
-        assert!(build_apply_head_command(&state, "", 7, &cid(99)).is_err());
+        assert!(build_apply_head_command(&state, "", 7, &cid(99), None).is_err());
     }
 
     #[test]

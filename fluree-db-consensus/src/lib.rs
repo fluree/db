@@ -259,6 +259,31 @@ impl QueuedRequest {
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, QueuedRequestCodecError> {
         Ok(serde_json::from_slice(bytes)?)
     }
+
+    /// Canonical bytes used to derive the idempotency body CID. Skips
+    /// per-request transient context (commit-opts timestamp, tracking
+    /// flags, governance metadata) so a retry of the same logical
+    /// request produces the same body CID even when the client recomputes
+    /// those fields between attempts. The full envelope still carries
+    /// them — only the idempotency comparison is normalized.
+    pub fn canonical_body_bytes(&self) -> Result<Vec<u8>, QueuedRequestCodecError> {
+        match self {
+            // Transact: the transaction body is the only semantically
+            // identifying field. txn_opts / commit_opts / tracking /
+            // governance can drift between retries (timestamps, request
+            // IDs, observability toggles) without changing what the
+            // commit means.
+            QueuedRequest::Transact(t) => Ok(serde_json::to_vec(&t.body)?),
+            // Push / Revert / Merge / Rebase envelopes already contain
+            // only stable fields (content-addressed commit ids, selection
+            // / strategy descriptors, branch names). Hashing the full
+            // envelope is equivalent to hashing the canonical body.
+            QueuedRequest::Push(p) => Ok(serde_json::to_vec(p)?),
+            QueuedRequest::Revert(r) => Ok(serde_json::to_vec(r)?),
+            QueuedRequest::Merge(m) => Ok(serde_json::to_vec(m)?),
+            QueuedRequest::Rebase(r) => Ok(serde_json::to_vec(r)?),
+        }
+    }
 }
 
 /// Transact-side envelope payload. Fields mirror the request-side

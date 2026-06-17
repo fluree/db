@@ -18,6 +18,7 @@
 //! callers fall back to conservative defaults — same recovery shape
 //! as the [`WaiterMap`](super::waiter::WaiterMap) itself.
 
+use crate::raft::state_machine::RefKey;
 use dashmap::DashMap;
 use fluree_db_api::{ConflictStrategy, IndexingStatus, TrackingTally};
 use fluree_db_core::{CommitId, ContentId};
@@ -121,10 +122,13 @@ pub struct RebaseApplied {
 /// Concurrent map from queue_id → stashed [`AppliedReceipt`].
 ///
 /// Held jointly by the state-machine adapter (consumer) and the
-/// commit worker (producer) via `Arc`.
+/// commit worker (producer) via `Arc`. Each entry is tagged with
+/// the branch it was staged for so admin-driven branch aborts can
+/// drain every receipt that belonged to the cleared queue without
+/// scanning under per-`queue_id` lookups.
 #[derive(Default)]
 pub struct StagedReceiptMap {
-    receipts: DashMap<u64, AppliedReceipt>,
+    receipts: DashMap<u64, (RefKey, AppliedReceipt)>,
 }
 
 impl StagedReceiptMap {
@@ -133,9 +137,11 @@ impl StagedReceiptMap {
     }
 
     /// Park a receipt under `queue_id`. Called by the worker after
-    /// staging and before proposing `ApplyHead`.
-    pub fn stash(&self, queue_id: u64, receipt: AppliedReceipt) {
-        self.receipts.insert(queue_id, receipt);
+    /// staging and before proposing `ApplyHead`. `ref_key` is
+    /// recorded so [`take_for_ref_key`](Self::take_for_ref_key) can
+    /// drain every receipt belonging to a cleared branch.
+    pub fn stash(&self, queue_id: u64, ref_key: RefKey, receipt: AppliedReceipt) {
+        self.receipts.insert(queue_id, (ref_key, receipt));
     }
 
     /// Remove and return the receipt for `queue_id`. The state-
@@ -143,7 +149,38 @@ impl StagedReceiptMap {
     /// matching apply; the worker also calls it for cleanup when a
     /// propose fails after a stash.
     pub fn take(&self, queue_id: u64) -> Option<AppliedReceipt> {
-        self.receipts.remove(&queue_id).map(|(_, v)| v)
+        self.receipts.remove(&queue_id).map(|(_, (_, v))| v)
+    }
+
+    /// Drain every receipt stashed under `ref_key`. Called by the
+    /// adapter when an admin command (drop, purge, head-reset)
+    /// clears the per-branch queue: without this drain the receipts
+    /// would live in the map until process restart, since no
+    /// `ApplyHead` will ever land for their queue_ids.
+    pub fn take_for_ref_key(&self, ref_key: &RefKey) -> Vec<AppliedReceipt> {
+        let matching: Vec<u64> = self
+            .receipts
+            .iter()
+            .filter(|entry| &entry.value().0 == ref_key)
+            .map(|entry| *entry.key())
+            .collect();
+        matching
+            .into_iter()
+            .filter_map(|qid| self.receipts.remove(&qid).map(|(_, (_, v))| v))
+            .collect()
+    }
+
+    /// Non-destructively read the tally from a stashed
+    /// [`AppliedReceipt::Transact`]. Returns `None` for any other
+    /// variant or when the slot is empty. Used by `publish_commit`
+    /// to thread the tally into [`ApplyHeadArgs`] without consuming
+    /// the receipt the adapter still needs for waiter resolution.
+    pub fn peek_transact_tally(&self, queue_id: u64) -> Option<TrackingTally> {
+        let entry = self.receipts.get(&queue_id)?;
+        match &entry.value().1 {
+            AppliedReceipt::Transact(r) => r.tally.clone(),
+            _ => None,
+        }
     }
 
     /// Number of stashed receipts. Test-only.
@@ -167,6 +204,7 @@ mod tests {
         let map = StagedReceiptMap::new();
         map.stash(
             7,
+            RefKey::new("test/db", "main"),
             AppliedReceipt::Transact(TransactApplied {
                 commit_id: cid(1),
                 commit_t: 10,
@@ -181,6 +219,45 @@ mod tests {
             other => panic!("expected Transact, got {other:?}"),
         }
         assert_eq!(map.len(), 0);
+    }
+
+    #[test]
+    fn take_for_ref_key_drains_only_matching_branch() {
+        let map = StagedReceiptMap::new();
+        let main = RefKey::new("test/db", "main");
+        let feature = RefKey::new("test/db", "feature");
+        map.stash(
+            1,
+            main.clone(),
+            AppliedReceipt::Transact(TransactApplied {
+                commit_id: cid(1),
+                commit_t: 1,
+                tally: None,
+            }),
+        );
+        map.stash(
+            2,
+            main.clone(),
+            AppliedReceipt::Transact(TransactApplied {
+                commit_id: cid(2),
+                commit_t: 2,
+                tally: None,
+            }),
+        );
+        map.stash(
+            3,
+            feature.clone(),
+            AppliedReceipt::Transact(TransactApplied {
+                commit_id: cid(3),
+                commit_t: 3,
+                tally: None,
+            }),
+        );
+
+        let drained = map.take_for_ref_key(&main);
+        assert_eq!(drained.len(), 2);
+        assert_eq!(map.len(), 1);
+        assert!(map.take(3).is_some());
     }
 
     #[test]

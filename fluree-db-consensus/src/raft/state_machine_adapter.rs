@@ -390,9 +390,23 @@ where
                         waiters.resolve_applied(queue_id, receipt);
                     }
                     WaiterResolution::Aborted { queue_id, reason } => {
+                        // The receipt is stale — the queue entry won't
+                        // produce an `ApplyHead` now. Drop it so the
+                        // map doesn't accumulate one entry per poison
+                        // for the lifetime of the process.
+                        if let Some(s) = self.staged_receipts.as_ref() {
+                            s.take(queue_id);
+                        }
                         waiters.resolve_aborted(queue_id, reason)
                     }
                     WaiterResolution::AbortBranch { ref_key, reason } => {
+                        // Admin clear blew away every queue entry on
+                        // the branch — drain their stashed receipts
+                        // too. Same reasoning as the `Aborted` arm:
+                        // no `ApplyHead` will ever consume them.
+                        if let Some(s) = self.staged_receipts.as_ref() {
+                            let _ = s.take_for_ref_key(&ref_key);
+                        }
                         waiters.abort_all_for_branch(&ref_key, reason)
                     }
                 }
@@ -878,6 +892,7 @@ mod tests {
                 branch: branch.into(),
                 idempotency: None,
                 request_cid: cid(0),
+                body_cid: cid(0),
                 body_kind: BodyKind::JsonLdInsert,
                 applied_at_millis: 1_500,
             })),
@@ -901,6 +916,7 @@ mod tests {
                 commit_id: commit,
                 commit_t,
                 applied_at_millis: 2_000,
+                tally: None,
             })),
         }
     }
@@ -986,6 +1002,7 @@ mod tests {
         let rx = waiter_map.register(0, RefKey::new("test/db", "main"));
         staged.stash(
             0,
+            RefKey::new("test/db", "main"),
             AppliedReceipt::Transact(TransactApplied {
                 commit_id: cid(42),
                 commit_t: 10,

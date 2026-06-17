@@ -23,6 +23,7 @@ use crate::raft::state_machine::{
     ApplyRecord, BodyKind, Command as SmCommand, EnqueueCommandArgs, PoisonRecord, RefKey,
     Response as SmResponse,
 };
+use fluree_db_core::ContentId;
 use crate::raft::staged_receipt::AppliedReceipt;
 use crate::raft::state_machine_adapter::SharedState;
 use crate::raft::waiter::{AbortReason, WaiterMap, WaiterOutcome};
@@ -98,9 +99,12 @@ impl QueuedTransactor {
     }
 
     /// Override the retry budget for idempotency-keyed submissions
-    /// (default 3 attempts total).
+    /// (default 3 attempts total). Floored at 1 — a budget of zero
+    /// would skip the propose loop entirely and surface every
+    /// submission as `stranded` without ever talking to Raft, which
+    /// is never what callers want.
     pub fn with_max_retries(mut self, max_retries: usize) -> Self {
-        self.max_retries = max_retries;
+        self.max_retries = max_retries.max(1);
         self
     }
 
@@ -213,6 +217,21 @@ impl QueuedTransactor {
         }
     }
 
+    /// Hash the envelope's canonical body bytes into a comparison-only
+    /// `ContentId`. Distinct from the `request_cid` returned by the
+    /// CAS put: the envelope as-stored includes per-request transient
+    /// fields (timestamps, tracking) whereas the body CID covers only
+    /// what defines the request semantically.
+    fn canonical_body_cid(envelope: &QueuedRequest) -> Result<ContentId, SubmissionError> {
+        let bytes = envelope
+            .canonical_body_bytes()
+            .map_err(|e| SubmissionError::Execution {
+                status: 500,
+                message: format!("canonical body encode failed: {e}"),
+            })?;
+        Ok(ContentId::new(ContentKind::Txn, &bytes))
+    }
+
     /// Decrement (or remove) an orphaned envelope's CAS entry. The
     /// content store's `release` is idempotent, so a double-release
     /// on the same CID is harmless — log on failure but don't escalate
@@ -221,7 +240,7 @@ impl QueuedTransactor {
     async fn release_envelope(
         &self,
         ledger_id: &str,
-        request_cid: &fluree_db_core::ContentId,
+        request_cid: &ContentId,
     ) {
         if let Err(err) = self
             .fluree
@@ -303,12 +322,14 @@ impl Committer for QueuedTransactor {
                 message: format!("QueuedRequest CAS write failed: {e}"),
             })?;
 
+        let body_cid = Self::canonical_body_cid(&envelope)?;
         let retry_eligible = idempotency_cache_key.is_some();
         let args = EnqueueCommandArgs {
             ledger_id: ledger_name,
             branch,
             idempotency: idempotency_cache_key,
             request_cid,
+            body_cid,
             body_kind,
             applied_at_millis: current_millis(),
         };
@@ -372,12 +393,14 @@ impl Committer for QueuedTransactor {
                 message: format!("QueuedRequest CAS write failed: {e}"),
             })?;
 
+        let body_cid = Self::canonical_body_cid(&envelope)?;
         let retry_eligible = idempotency_cache_key.is_some();
         let args = EnqueueCommandArgs {
             ledger_id: ledger_name,
             branch: branch.clone(),
             idempotency: idempotency_cache_key,
             request_cid,
+            body_cid,
             body_kind: BodyKind::Revert,
             applied_at_millis: current_millis(),
         };
@@ -468,12 +491,14 @@ impl Committer for QueuedTransactor {
                 message: format!("QueuedRequest CAS write failed: {e}"),
             })?;
 
+        let body_cid = Self::canonical_body_cid(&envelope)?;
         let retry_eligible = idempotency_cache_key.is_some();
         let args = EnqueueCommandArgs {
             ledger_id: ledger_name,
             branch: target_for_queue.clone(),
             idempotency: idempotency_cache_key,
             request_cid,
+            body_cid,
             body_kind: BodyKind::Merge,
             applied_at_millis: current_millis(),
         };
@@ -539,12 +564,14 @@ impl Committer for QueuedTransactor {
                 message: format!("QueuedRequest CAS write failed: {e}"),
             })?;
 
+        let body_cid = Self::canonical_body_cid(&envelope)?;
         let retry_eligible = idempotency_cache_key.is_some();
         let args = EnqueueCommandArgs {
             ledger_id: ledger_name,
             branch: branch.clone(),
             idempotency: idempotency_cache_key,
             request_cid,
+            body_cid,
             body_kind: BodyKind::Rebase,
             applied_at_millis: current_millis(),
         };
@@ -632,12 +659,14 @@ impl Committer for QueuedTransactor {
                 message: format!("QueuedRequest CAS write failed: {e}"),
             })?;
 
+        let body_cid = Self::canonical_body_cid(&envelope)?;
         let retry_eligible = idempotency_cache_key.is_some();
         let args = EnqueueCommandArgs {
             ledger_id: ledger_name,
             branch,
             idempotency: idempotency_cache_key,
             request_cid,
+            body_cid,
             body_kind: BodyKind::Pushed,
             applied_at_millis: current_millis(),
         };
@@ -873,13 +902,23 @@ fn rebase_receipt_from(
             source_head_id,
             strategy,
         }),
+        // Fallback for stranded staged-receipts (former-leader path):
+        // we only know the resulting head, not whether this was a
+        // fast-forward or an actual replay. Reporting `fast_forward:
+        // true` keeps the receipt internally consistent — in a true
+        // fast-forward `source_head_id` equals the branch's new head,
+        // which is what `commit_id` carries here. The counters at
+        // their defaults (0 replayed / skipped / conflicts) line up
+        // with that interpretation; the alternative would mislabel
+        // the result head as the source head under a non-fast-forward
+        // rebase.
         AppliedReceipt::Minimal {
             commit_id,
             commit_t,
         } => Ok(RebaseReceipt {
             idempotency_key,
             branch,
-            fast_forward: false,
+            fast_forward: true,
             replayed: 0,
             skipped: 0,
             conflicts: 0,
