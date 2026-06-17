@@ -228,6 +228,35 @@ pub struct QueuedRequest {
     pub governance: GovernanceOptions,
 }
 
+impl QueuedRequest {
+    /// Encode the envelope for content-addressed storage. The leader
+    /// writes these bytes to CAS; the resulting `ContentId` becomes
+    /// the `request_cid` in `EnqueueCommandArgs`.
+    ///
+    /// JSON is used here (not postcard like state-machine snapshots)
+    /// because the body and several option fields carry
+    /// `serde_json::Value`, which postcard refuses to round-trip —
+    /// its arbitrary-precision `Number` shape needs a self-describing
+    /// format. The envelope is one-shot (one write, one read) so the
+    /// size overhead is negligible compared to the body itself.
+    pub fn to_bytes(&self) -> Result<Vec<u8>, QueuedRequestCodecError> {
+        Ok(serde_json::to_vec(self)?)
+    }
+
+    /// Decode the envelope retrieved from CAS by `request_cid`. Used
+    /// worker-side to recover body + per-request context.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, QueuedRequestCodecError> {
+        Ok(serde_json::from_slice(bytes)?)
+    }
+}
+
+/// Error encoding or decoding a [`QueuedRequest`].
+#[derive(Debug, Error)]
+pub enum QueuedRequestCodecError {
+    #[error("json codec: {0}")]
+    Json(#[from] serde_json::Error),
+}
+
 /// Transaction submission payload.
 ///
 /// Carries the transaction itself plus everything an implementation needs to

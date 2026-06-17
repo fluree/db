@@ -274,6 +274,21 @@ pub enum BodyKind {
     Pushed,
 }
 
+impl From<&crate::TransactionBody> for BodyKind {
+    fn from(body: &crate::TransactionBody) -> Self {
+        use crate::TransactionBody;
+        match body {
+            TransactionBody::JsonLdInsert(_) => BodyKind::JsonLdInsert,
+            TransactionBody::JsonLdUpsert(_) => BodyKind::JsonLdUpsert,
+            TransactionBody::JsonLdUpdate(_) => BodyKind::JsonLdUpdate,
+            TransactionBody::TurtleInsert(_) => BodyKind::TurtleInsert,
+            TransactionBody::TurtleUpsert(_) => BodyKind::TurtleUpsert,
+            TransactionBody::TrigUpsert(_) => BodyKind::TrigUpsert,
+            TransactionBody::Sparql(_) => BodyKind::Sparql,
+        }
+    }
+}
+
 /// Failure outcome recorded when a worker poisons a queue entry.
 /// Distinct from [`ApplyRecord`] (which only records successes)
 /// so the two cases are unambiguous at lookup time.
