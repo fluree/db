@@ -152,6 +152,21 @@ impl<'a> PrepareConfig<'a> {
         }
     }
 
+    /// Current-state config that vouches whether semantic stats-based rewrites
+    /// (e.g. redundant-`rdf:type` elision) are sound for this execution. Pass
+    /// `true` only from a single-ledger, root-policy path; see
+    /// [`crate::temporal_mode::PlanningContext::allow_semantic_elision`]. Dataset
+    /// and non-root-policy callers must use [`Self::current`] (vouch = false).
+    pub fn current_with_semantic_elision(
+        binary_store: Option<&'a Arc<BinaryIndexStore>>,
+        allow: bool,
+    ) -> Self {
+        Self {
+            binary_store,
+            planning: crate::temporal_mode::PlanningContext::current().with_semantic_elision(allow),
+        }
+    }
+
     /// Construct a config for history-range queries with the given binary store.
     ///
     /// Canonical root for history-range planning. Detection happens at the
@@ -424,7 +439,8 @@ pub async fn prepare_execution_with_config(
             )
             .entered();
 
-            let stats_view = cached_stats_view_for_db(db, binary_store);
+            let stats_view =
+                cached_stats_view_for_db(db, binary_store, planning.allow_semantic_elision);
             build_operator_tree(&rewritten_query, stats_view, &planning)?
         };
 

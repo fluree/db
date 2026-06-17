@@ -18,10 +18,14 @@
 //!   purely an execution-context switch (`with_graph_ref`); rows
 //!   carry only inner-subplan bindings.
 //!
-//! In single-source default-graph mode the operator runs the inner
-//! subplan exactly once with the single graph as scope — equivalent
-//! to no wrapper at all. The cost of always wrapping is therefore
-//! one extra `with_graph_ref` call per parent row in that case.
+//! In single-source default-graph mode (no dataset attached) the
+//! wrapper is a no-op: [`DefaultGraphSourceOperator::open`] builds the
+//! inner subplan **once**, seeded by the whole child stream, and
+//! streams it directly. This lets the base edge hash-join the child
+//! instead of replanning + re-executing the inner subplan per parent
+//! row — the latter made an annotated object-join O(parent rows) and
+//! was the cause of IC5's timeout. The per-row, per-source path is
+//! used only when a multi-source dataset is actually attached.
 
 use crate::binding::{Batch, Binding};
 use crate::context::ExecutionContext;
@@ -29,10 +33,11 @@ use crate::error::Result;
 use crate::execute::build_where_operators_seeded;
 use crate::ir::Pattern;
 use crate::operator::{BoxedOperator, Operator, OperatorState};
-use crate::seed::SeedOperator;
+use crate::seed::{EmptyOperator, SeedOperator};
 use crate::temporal_mode::PlanningContext;
 use crate::var_registry::VarId;
 use async_trait::async_trait;
+use fluree_db_core::StatsView;
 use std::sync::Arc;
 
 pub struct DefaultGraphSourceOperator {
@@ -43,6 +48,17 @@ pub struct DefaultGraphSourceOperator {
     result_buffer: Vec<Vec<Binding>>,
     buffer_pos: usize,
     planning: PlanningContext,
+    /// Planner stats for the inner subplan build. Without these the base edge
+    /// cannot be costed and falls back to a per-driving-row object scan of the
+    /// whole edge predicate instead of an object→subject hash join — the inner
+    /// build previously passed `None`, which is what kept the annotated
+    /// `HAS_MEMBER` join slow even once it was built once.
+    stats: Option<Arc<StatsView>>,
+    /// Single default-graph fast path: when no dataset is attached the
+    /// per-source correlation is unnecessary, so the inner subplan is built
+    /// ONCE seeded by the whole child stream (base edge can hash-join) and
+    /// streamed directly, instead of replanning + re-executing per parent row.
+    single_graph_delegate: Option<BoxedOperator>,
 }
 
 impl DefaultGraphSourceOperator {
@@ -50,6 +66,7 @@ impl DefaultGraphSourceOperator {
         child: BoxedOperator,
         inner_patterns: Vec<Pattern>,
         planning: PlanningContext,
+        stats: Option<Arc<StatsView>>,
     ) -> Self {
         let parent_schema: std::collections::HashSet<VarId> =
             child.schema().iter().copied().collect();
@@ -77,6 +94,8 @@ impl DefaultGraphSourceOperator {
             result_buffer: Vec::new(),
             buffer_pos: 0,
             planning,
+            stats,
+            single_graph_delegate: None,
         }
     }
 
@@ -118,7 +137,7 @@ impl DefaultGraphSourceOperator {
         let mut inner = build_where_operators_seeded(
             Some(Box::new(seed)),
             &self.inner_patterns,
-            None,
+            self.stats.clone(),
             None,
             &self.planning,
         )?;
@@ -193,7 +212,27 @@ impl Operator for DefaultGraphSourceOperator {
     }
 
     async fn open(&mut self, ctx: &ExecutionContext<'_>) -> Result<()> {
-        self.child.open(ctx).await?;
+        // Single default-graph (no dataset): the per-source correlation this
+        // wrapper exists for is a no-op, so build the inner subplan ONCE seeded
+        // by the whole child stream. The base edge + f:reifies* triples then plan
+        // as one normal join block — the base edge can hash-join the child — and
+        // stream directly, instead of replanning and re-executing per parent row
+        // (which made an annotated object-join O(parent rows): IC5's 65s cliff).
+        // Multi-source datasets keep the per-row, per-source path below.
+        if ctx.dataset.is_none() {
+            let child = std::mem::replace(&mut self.child, Box::new(EmptyOperator::new()));
+            let mut delegate = build_where_operators_seeded(
+                Some(child),
+                &self.inner_patterns,
+                self.stats.clone(),
+                None,
+                &self.planning,
+            )?;
+            delegate.open(ctx).await?;
+            self.single_graph_delegate = Some(delegate);
+        } else {
+            self.child.open(ctx).await?;
+        }
         self.state = OperatorState::Open;
         self.result_buffer.clear();
         self.buffer_pos = 0;
@@ -203,6 +242,11 @@ impl Operator for DefaultGraphSourceOperator {
     async fn next_batch(&mut self, ctx: &ExecutionContext<'_>) -> Result<Option<Batch>> {
         if self.state != OperatorState::Open {
             return Ok(None);
+        }
+
+        // Single-graph fast path: stream the once-built inner subplan directly.
+        if let Some(delegate) = self.single_graph_delegate.as_mut() {
+            return delegate.next_batch(ctx).await;
         }
 
         if self.buffer_pos < self.result_buffer.len() {
@@ -254,7 +298,11 @@ impl Operator for DefaultGraphSourceOperator {
     }
 
     fn close(&mut self) {
-        self.child.close();
+        if let Some(delegate) = self.single_graph_delegate.as_mut() {
+            delegate.close();
+        } else {
+            self.child.close();
+        }
         self.result_buffer.clear();
         self.state = OperatorState::Closed;
     }

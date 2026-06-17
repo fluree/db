@@ -1757,6 +1757,8 @@ impl Operator for BinaryScanOperator {
                 )
                 .with_runtime_small_dicts_opt(ctx.runtime_small_dicts),
                 self.store.as_ref(),
+                // Scan-time datatype narrowing only — never semantic elision.
+                false,
             );
             let inferred_dt_sid = if dt_sid.is_none() && lang.is_none() {
                 filter.p_id.and_then(|p_id| {

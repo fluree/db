@@ -1612,6 +1612,83 @@ pub fn build_where_operators_seeded(
     )
 }
 
+/// Drop provably-redundant `?s rdf:type <C>` filters from a conjunctive block.
+///
+/// When `?s` is the subject of a concrete predicate `P` elsewhere in the block
+/// and stats prove every subject of `P` is an instance of `C`
+/// (`predicate_subjects_all_in_class_by_iri` — the count of `P`-flakes from
+/// `C`-typed subjects equals `P`'s total flake count), the `rdf:type` triple
+/// matches every row and binds nothing new (constant class object; `?s` stays
+/// bound by `P`), so it is sound to remove. The stats method is itself gated to
+/// trustworthy current-state coverage; this adds the current-state plan gate and
+/// the structural "`?s` is otherwise bound by `P`" requirement.
+///
+/// Operates only on the supplied top-level conjunctive list — nested
+/// GRAPH/OPTIONAL/UNION/subquery scopes are left untouched. Returns `None` when
+/// nothing is elided so callers can keep borrowing the original slice.
+fn elide_redundant_type_filters(
+    patterns: &[Pattern],
+    stats: Option<&StatsView>,
+    planning: &PlanningContext,
+) -> Option<Vec<Pattern>> {
+    if planning.is_history() {
+        return None;
+    }
+    let stats = stats?;
+    if !stats.class_coverage_trustworthy {
+        return None;
+    }
+
+    // Concrete (IRI) predicates each variable is the SUBJECT of, excluding rdf:type.
+    let mut subject_preds: HashMap<VarId, Vec<Arc<str>>> = HashMap::new();
+    for p in patterns {
+        if let Pattern::Triple(tp) = p {
+            if let (Ref::Var(s), Ref::Iri(pred)) = (&tp.s, &tp.p) {
+                if !tp.p.is_rdf_type() {
+                    subject_preds.entry(*s).or_default().push(pred.clone());
+                }
+            }
+        }
+    }
+    if subject_preds.is_empty() {
+        return None;
+    }
+
+    let mut remove = vec![false; patterns.len()];
+    let mut any = false;
+    for (i, p) in patterns.iter().enumerate() {
+        let Pattern::Triple(tp) = p else { continue };
+        if !tp.p.is_rdf_type() {
+            continue;
+        }
+        let Ref::Var(s) = &tp.s else { continue };
+        let Term::Iri(class_iri) = &tp.o else {
+            continue;
+        };
+        let Some(preds) = subject_preds.get(s) else {
+            continue;
+        };
+        if preds
+            .iter()
+            .any(|pred| stats.predicate_subjects_all_in_class_by_iri(pred, class_iri))
+        {
+            remove[i] = true;
+            any = true;
+        }
+    }
+    if !any {
+        return None;
+    }
+    Some(
+        patterns
+            .iter()
+            .zip(remove)
+            .filter(|(_, drop)| !drop)
+            .map(|(p, _)| p.clone())
+            .collect(),
+    )
+}
+
 /// Build WHERE operators with an optional initial seed operator and explicit needed-vars + GROUP BY keys.
 ///
 /// Handles all pattern types: Triple, VALUES, BIND, FILTER, OPTIONAL, UNION,
@@ -1670,6 +1747,12 @@ pub fn build_where_operators_seeded_with_needed(
             std::borrow::Cow::Borrowed(patterns)
         };
     let patterns: &[Pattern] = &expanded_storage;
+
+    // Drop provably-redundant `?s rdf:type <C>` filters before planning. The
+    // membership check costs a per-row index seek over the whole block but
+    // removes no rows when stats prove the predicate's subjects are all `C`.
+    let elided_storage = elide_redundant_type_filters(patterns, stats.as_deref(), planning);
+    let patterns: &[Pattern] = elided_storage.as_deref().unwrap_or(patterns);
 
     // Apply generalized pattern reordering upfront for all pattern lists.
     //
@@ -2275,6 +2358,7 @@ pub fn build_where_operators_seeded_with_needed(
                         child,
                         inner_patterns.clone(),
                         *planning,
+                        stats.clone(),
                     ),
                 ));
                 i += 1;
@@ -2702,6 +2786,103 @@ mod tests {
             Ref::Sid(Sid::new(100, p_name)),
             Term::Var(o_var),
         )
+    }
+
+    // --- redundant rdf:type elision ---------------------------------------
+
+    fn coverage_stats(pred: &str, class: &str, total: u64, covered: u64, trust: bool) -> StatsView {
+        let mut v = StatsView::default();
+        v.class_coverage_trustworthy = trust;
+        v.properties_by_iri.insert(
+            Arc::from(pred),
+            PropertyStatData {
+                count: total,
+                ndv_values: 0,
+                ndv_subjects: 0,
+            },
+        );
+        let mut by_class = HashMap::new();
+        by_class.insert(Arc::from(class), covered);
+        v.predicate_class_subject_counts_by_iri
+            .insert(Arc::from(pred), by_class);
+        v
+    }
+
+    /// `?0 P ?1 . ?0 rdf:type <C>` — `?0` is the subject of `P` and bound by it.
+    fn pred_then_type(pred: &str, class: &str) -> Vec<Pattern> {
+        vec![
+            Pattern::Triple(TriplePattern::new(
+                Ref::Var(VarId(0)),
+                Ref::Iri(Arc::from(pred)),
+                Term::Var(VarId(1)),
+            )),
+            Pattern::Triple(TriplePattern::new(
+                Ref::Var(VarId(0)),
+                Ref::Iri(Arc::from(fluree_vocab::rdf::TYPE)),
+                Term::Iri(Arc::from(class)),
+            )),
+        ]
+    }
+
+    #[test]
+    fn elides_redundant_type_when_predicate_subjects_all_in_class() {
+        let stats = coverage_stats("ex:p", "ex:C", 10, 10, true);
+        let patterns = pred_then_type("ex:p", "ex:C");
+        let out =
+            elide_redundant_type_filters(&patterns, Some(&stats), &PlanningContext::current())
+                .expect("redundant rdf:type should be elided");
+        assert_eq!(out.len(), 1, "the rdf:type triple should be dropped");
+        assert!(
+            matches!(&out[0], Pattern::Triple(tp) if !tp.p.is_rdf_type()),
+            "the surviving triple is the binding predicate, not rdf:type"
+        );
+    }
+
+    #[test]
+    fn keeps_selective_type_filter() {
+        // Predicate has 10 flakes but only 5 from class C -> not covering -> keep.
+        let stats = coverage_stats("ex:p", "ex:C", 10, 5, true);
+        let patterns = pred_then_type("ex:p", "ex:C");
+        assert!(
+            elide_redundant_type_filters(&patterns, Some(&stats), &PlanningContext::current())
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn no_elision_when_coverage_untrustworthy() {
+        let stats = coverage_stats("ex:p", "ex:C", 10, 10, false);
+        let patterns = pred_then_type("ex:p", "ex:C");
+        assert!(
+            elide_redundant_type_filters(&patterns, Some(&stats), &PlanningContext::current())
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn no_elision_in_history_mode() {
+        let stats = coverage_stats("ex:p", "ex:C", 10, 10, true);
+        let patterns = pred_then_type("ex:p", "ex:C");
+        assert!(
+            elide_redundant_type_filters(&patterns, Some(&stats), &PlanningContext::history())
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn no_elision_when_type_is_sole_binder() {
+        // `?0 rdf:type <C>` with no other predicate on ?0: the type triple is the
+        // only thing binding ?0, so dropping it would change semantics.
+        let stats = coverage_stats("ex:p", "ex:C", 10, 10, true);
+        let patterns = vec![Pattern::Triple(TriplePattern::new(
+            Ref::Var(VarId(0)),
+            Ref::Iri(Arc::from(fluree_vocab::rdf::TYPE)),
+            Term::Iri(Arc::from("ex:C")),
+        ))];
+        assert!(
+            elide_redundant_type_filters(&patterns, Some(&stats), &PlanningContext::current())
+                .is_none()
+        );
     }
 
     #[test]

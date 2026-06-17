@@ -44,6 +44,22 @@ pub struct StatsView {
     pub property_ref_only: HashMap<Sid, bool>,
     /// Property IRI -> ref-only flag (see [`Self::property_ref_only`]).
     pub property_ref_only_by_iri: HashMap<Arc<str>, bool>,
+    /// Predicate IRI -> (class IRI -> count of that predicate's flakes whose
+    /// SUBJECT is an instance of the class), summed across graphs. Sourced from
+    /// `IndexStats.classes[*].properties[*].datatypes`.
+    ///
+    /// Enables sound elision of a redundant `?s rdf:type <C>`: when `?s` is the
+    /// subject of predicate P and the count here for `(P, C)` equals P's total
+    /// flake count, every P-subject is provably a C, so the type filter removes
+    /// nothing. The aggregate (cross-graph) equality implies per-graph coverage,
+    /// so it is sound for any single-graph current-state read. Only consult via
+    /// [`Self::predicate_subjects_all_in_class_by_iri`], which honors the gate.
+    pub predicate_class_subject_counts_by_iri: HashMap<Arc<str>, HashMap<Arc<str>, u64>>,
+    /// True only when the class/property counts reflect exact current state with
+    /// no overlay gap — novelty empty and no policy visibility layer. Set by the
+    /// query stats-cache builder; defaults `false` so any caller that does not
+    /// explicitly vouch for current-state exactness never triggers elision.
+    pub class_coverage_trustworthy: bool,
 }
 
 /// Per-property statistics within a graph, keyed by numeric IDs.
@@ -110,12 +126,25 @@ impl StatsView {
             })
             .sum::<usize>();
 
+        let predicate_class_subject_counts = self
+            .predicate_class_subject_counts_by_iri
+            .iter()
+            .map(|(pred, by_class)| {
+                pred.len()
+                    + by_class
+                        .keys()
+                        .map(|cls| cls.len() + size_of::<u64>())
+                        .sum::<usize>()
+            })
+            .sum::<usize>();
+
         size_of::<Self>()
             + properties
             + classes
             + properties_by_iri
             + classes_by_iri
             + graph_properties
+            + predicate_class_subject_counts
     }
 
     /// Build from IndexStats.
@@ -215,7 +244,66 @@ impl StatsView {
             }
         }
 
+        // Derive predicate -> (class -> subject-flake count) from the raw
+        // per-class property usage. `from_db_stats` keeps only class instance
+        // counts, so read the usage straight off `stats.classes` here, where the
+        // namespace table is available to resolve both SIDs to IRIs.
+        let iri_for = |sid: &Sid| -> Option<Arc<str>> {
+            namespace_codes
+                .get(&sid.namespace_code)
+                .map(|prefix| Arc::<str>::from(format!("{}{}", prefix, sid.name)))
+        };
+        if let Some(ref classes) = stats.classes {
+            for class in classes {
+                let Some(class_iri) = iri_for(&class.class_sid) else {
+                    continue;
+                };
+                for prop in &class.properties {
+                    let Some(pred_iri) = iri_for(&prop.property_sid) else {
+                        continue;
+                    };
+                    let count: u64 = prop.datatypes.iter().map(|&(_, c)| c).sum();
+                    if count == 0 {
+                        continue;
+                    }
+                    *view
+                        .predicate_class_subject_counts_by_iri
+                        .entry(pred_iri)
+                        .or_default()
+                        .entry(class_iri.clone())
+                        .or_insert(0) += count;
+                }
+            }
+        }
+
         view
+    }
+
+    /// Whether stats prove that **every** subject of `pred_iri` is an instance of
+    /// `class_iri` at exact current state — i.e. the count of `pred_iri` flakes
+    /// contributed by `class_iri` instances equals `pred_iri`'s total flake count
+    /// (both non-zero). When true, a `?s rdf:type <class_iri>` filter on a subject
+    /// already bound by `pred_iri` is provably redundant and safe to elide.
+    ///
+    /// Returns `false` unless [`Self::class_coverage_trustworthy`] is set, so a
+    /// stale/overlay/policy-affected view never licenses elision.
+    pub fn predicate_subjects_all_in_class_by_iri(&self, pred_iri: &str, class_iri: &str) -> bool {
+        if !self.class_coverage_trustworthy {
+            return false;
+        }
+        let Some(total) = self.get_property_by_iri(pred_iri).map(|p| p.count) else {
+            return false;
+        };
+        if total == 0 {
+            return false;
+        }
+        let covered = self
+            .predicate_class_subject_counts_by_iri
+            .get(pred_iri)
+            .and_then(|by_class| by_class.get(class_iri))
+            .copied()
+            .unwrap_or(0);
+        covered == total
     }
 
     /// Whether every object of this property (by SID) is a node/IRI ref —
