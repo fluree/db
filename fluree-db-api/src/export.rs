@@ -9,7 +9,9 @@ use fluree_db_binary_index::{
 use fluree_db_core::dict_novelty::DictNovelty;
 use fluree_db_core::value::FlakeValue;
 use fluree_db_core::{DecodeKind, Flake, GraphId, OType, OverlayProvider, Sid};
-use fluree_db_query::binary_scan::{resolve_overlay, EphemeralPredicateMap};
+use fluree_db_query::binary_scan::{
+    resolve_overlay, resolve_overlay_retractions, EphemeralPredicateMap,
+};
 use fluree_vocab::xsd;
 use std::collections::{BTreeMap, HashMap};
 use std::io::{self, Write};
@@ -96,29 +98,13 @@ fn apply_time_travel(
             cursor.set_overlay_ops(ops);
             cursor.set_epoch(overlay.epoch());
         }
-        (ephemeral_preds, surviving_untranslated(untranslated))
+        // The untranslated raw-flake lane shares the single row-world resolver
+        // with the binary-scan post-pass (latest-t-wins per (s,p,o,dt,m), keep
+        // asserts).
+        (ephemeral_preds, resolve_overlay_retractions(untranslated))
     } else {
         (HashMap::new(), Vec::new())
     }
-}
-
-/// Resolve assert/retract set-semantics among the untranslated overlay flakes.
-///
-/// Untranslated flakes bypass the cursor's overlay merge, so we apply the same
-/// rule here: for each fact identity `(s, p, o, dt, m)` keep the highest-`t`
-/// flake and emit it only if it is an assertion. `Flake`'s `Eq`/`Hash` key on
-/// fact identity (ignoring `t`/`op`), so the map collapses each identity.
-fn surviving_untranslated(flakes: Vec<Flake>) -> Vec<Flake> {
-    let mut latest: HashMap<Flake, Flake> = HashMap::with_capacity(flakes.len());
-    for f in flakes {
-        match latest.get(&f) {
-            Some(existing) if existing.t >= f.t => {}
-            _ => {
-                latest.insert(f.clone(), f);
-            }
-        }
-    }
-    latest.into_values().filter(|f| f.op).collect()
 }
 
 // ---------------------------------------------------------------------------

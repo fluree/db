@@ -1536,17 +1536,25 @@ impl BinaryScanOperator {
     }
 }
 
-/// Resolve assert/retract pairs in overlay flakes.
+/// The shared `RawPostPass` resolver: resolve assert/retract lifecycles among
+/// raw row-world overlay flakes (the untranslated lane). The row-world
+/// counterpart to `resolve_overlay_ops` (which resolves the translated V3 lane)
+/// — both implement latest-`t`-wins over their respective identity domains (see
+/// `FactKeyV3` for why the two domains exist).
 ///
-/// For each distinct fact `(s, p, o, dt, m)`, the latest entry (highest `t`)
-/// determines the current state: if it's an assertion, the fact is kept;
-/// if it's a retraction, the fact is excluded from query results.
+/// For each distinct fact `(s, p, o, dt, m)` the latest entry (highest `t`)
+/// determines current state: a surviving fact is kept iff its latest entry is an
+/// assertion. **Order-preserving** (survivors appear in input order) and
+/// **ordering-independent** (latest-`t` is found explicitly), so callers need
+/// not pre-sort: the binary-scan raw post-pass passes sorted flakes (output
+/// stays sorted) and export passes translation-order flakes (output is
+/// deterministic rather than hash-ordered).
 ///
 /// Novelty enforces RDF set semantics at write time (`apply_commit`), so
-/// duplicate assertions for the same fact cannot exist. This function only
-/// needs to resolve assert/retract lifecycles, not deduplicate.
-fn resolve_overlay_retractions(flakes: Vec<Flake>) -> Vec<Flake> {
-    use std::collections::HashSet;
+/// duplicate assertions for the same fact cannot exist; this only resolves
+/// lifecycles, it does not deduplicate.
+pub fn resolve_overlay_retractions(flakes: Vec<Flake>) -> Vec<Flake> {
+    use std::collections::HashMap;
 
     // Full fact identity includes metadata (lang tags, list indices).
     // Two flakes with same (s, p, o, dt) but different `m` are distinct facts.
@@ -1559,12 +1567,10 @@ fn resolve_overlay_retractions(flakes: Vec<Flake>) -> Vec<Flake> {
         m: &'a Option<FlakeMeta>,
     }
 
-    let mut seen: HashSet<FactKeyRef<'_>> = HashSet::new();
-    let mut keep = vec![false; flakes.len()];
-
-    // Walk in reverse (highest t first). First occurrence per fact key is
-    // the latest state. Keep it only if it's an assertion.
-    for (idx, f) in flakes.iter().enumerate().rev() {
+    // Index of the latest-`t` flake per fact identity. No input ordering is
+    // assumed — the latest entry is found by explicit `t` comparison.
+    let mut latest: HashMap<FactKeyRef<'_>, usize> = HashMap::with_capacity(flakes.len());
+    for (idx, f) in flakes.iter().enumerate() {
         let key = FactKeyRef {
             s: &f.s,
             p: &f.p,
@@ -1572,13 +1578,23 @@ fn resolve_overlay_retractions(flakes: Vec<Flake>) -> Vec<Flake> {
             dt: &f.dt,
             m: &f.m,
         };
-        if !seen.insert(key) {
-            continue;
+        match latest.get(&key) {
+            Some(&prev) if flakes[prev].t >= f.t => {}
+            _ => {
+                latest.insert(key, idx);
+            }
         }
-        if f.op {
+    }
+
+    // Keep each fact's latest entry iff it is an assertion; the mask + zip below
+    // preserves input order.
+    let mut keep = vec![false; flakes.len()];
+    for &idx in latest.values() {
+        if flakes[idx].op {
             keep[idx] = true;
         }
     }
+    drop(latest);
 
     flakes
         .into_iter()
@@ -2313,6 +2329,35 @@ impl Translation {
             Err(e) => Translation::Untranslated(UntranslatedReason::from_io_kind(e.kind())),
         }
     }
+}
+
+/// The four overlay-merge strategies that consume [`resolve_overlay`]'s output —
+/// a documented, exhaustive enumeration of *how* the resolved overlay is merged.
+/// Not a dispatch table: each is a hand-written kernel with a genuinely different
+/// output type, so there is no uniform `merge()` (a capability registry is
+/// Phase 3 of the audit). All four share the single producer and the two
+/// fact-identity domains (`FactKeyV3` for the translated lane; row-world
+/// `Flake (s,p,o,dt,m)` for the raw post-pass).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OverlayMergeStrategy {
+    /// Streaming two-pointer merge of base columns with overlay ops →
+    /// `ColumnBatch`. `binary_cursor::merge_overlay_into_batch`, identity via
+    /// `eq_row_vs_overlay`. The general scan path.
+    RowMerge,
+    /// Descending top-k merge for `ORDER BY DESC(?o) LIMIT k` → `Vec<TopKRow>`.
+    /// `fast_post_order_limit::collect_post_desc_topk_overlay`, identity via the
+    /// gated `OvRow` projection of `FactKeyV3`.
+    OrderedMerge,
+    /// Per-predicate `COUNT(*)` via novelty-delta arithmetic
+    /// (`base − base(touched) + merged(touched)`) → `u64`.
+    /// `fast_path_common::count_predicate_overlay_delta`; owns no merge logic —
+    /// it delegates the per-range merge to a `RowMerge` cursor.
+    CountDelta,
+    /// Raw row-world post-pass for flakes that cannot be encoded in V3 (export /
+    /// graph-crawl) → `Vec<Flake>`, lifecycle-resolved by
+    /// [`resolve_overlay_retractions`] over the full `Flake (s,p,o,dt,m)`
+    /// identity.
+    RawPostPass,
 }
 
 /// The single overlay producer: translate novelty flakes into **resolved** V3
