@@ -361,7 +361,16 @@ impl Committer for RaftCommitter {
             | SmResponse::NoOp
             | SmResponse::IndexAdvanced { .. }
             | SmResponse::IndexStale { .. }
-            | SmResponse::IndexAhead { .. } => Err(SubmissionError::Execution {
+            | SmResponse::IndexAhead { .. }
+            | SmResponse::Enqueued { .. }
+            | SmResponse::IdempotencyHit { .. }
+            | SmResponse::IdempotencyFailed { .. }
+            | SmResponse::InFlight { .. }
+            | SmResponse::QueueFull { .. }
+            | SmResponse::HeadApplied { .. }
+            | SmResponse::QueueDesync { .. }
+            | SmResponse::Poisoned { .. }
+            | SmResponse::EvictionApplied { .. } => Err(SubmissionError::Execution {
                 status: 500,
                 message: "unexpected Response variant for AdvanceRef".into(),
             }),
@@ -546,7 +555,16 @@ impl Committer for RaftCommitter {
             | SmResponse::NoOp
             | SmResponse::IndexAdvanced { .. }
             | SmResponse::IndexStale { .. }
-            | SmResponse::IndexAhead { .. } => Err(SubmissionError::Execution {
+            | SmResponse::IndexAhead { .. }
+            | SmResponse::Enqueued { .. }
+            | SmResponse::IdempotencyHit { .. }
+            | SmResponse::IdempotencyFailed { .. }
+            | SmResponse::InFlight { .. }
+            | SmResponse::QueueFull { .. }
+            | SmResponse::HeadApplied { .. }
+            | SmResponse::QueueDesync { .. }
+            | SmResponse::Poisoned { .. }
+            | SmResponse::EvictionApplied { .. } => Err(SubmissionError::Execution {
                 status: 500,
                 message: "unexpected Response variant for AdvanceRef".into(),
             }),
@@ -729,7 +747,16 @@ impl Committer for RaftCommitter {
             | SmResponse::NoOp
             | SmResponse::IndexAdvanced { .. }
             | SmResponse::IndexStale { .. }
-            | SmResponse::IndexAhead { .. } => Err(SubmissionError::Execution {
+            | SmResponse::IndexAhead { .. }
+            | SmResponse::Enqueued { .. }
+            | SmResponse::IdempotencyHit { .. }
+            | SmResponse::IdempotencyFailed { .. }
+            | SmResponse::InFlight { .. }
+            | SmResponse::QueueFull { .. }
+            | SmResponse::HeadApplied { .. }
+            | SmResponse::QueueDesync { .. }
+            | SmResponse::Poisoned { .. }
+            | SmResponse::EvictionApplied { .. } => Err(SubmissionError::Execution {
                 status: 500,
                 message: "unexpected Response variant for AdvanceRef".into(),
             }),
@@ -906,7 +933,16 @@ impl Committer for RaftCommitter {
             | SmResponse::NoOp
             | SmResponse::IndexAdvanced { .. }
             | SmResponse::IndexStale { .. }
-            | SmResponse::IndexAhead { .. } => Err(SubmissionError::Execution {
+            | SmResponse::IndexAhead { .. }
+            | SmResponse::Enqueued { .. }
+            | SmResponse::IdempotencyHit { .. }
+            | SmResponse::IdempotencyFailed { .. }
+            | SmResponse::InFlight { .. }
+            | SmResponse::QueueFull { .. }
+            | SmResponse::HeadApplied { .. }
+            | SmResponse::QueueDesync { .. }
+            | SmResponse::Poisoned { .. }
+            | SmResponse::EvictionApplied { .. } => Err(SubmissionError::Execution {
                 status: 500,
                 message: "unexpected Response variant for AdvanceRef".into(),
             }),
@@ -1045,7 +1081,16 @@ impl Committer for RaftCommitter {
             | SmResponse::NoOp
             | SmResponse::IndexAdvanced { .. }
             | SmResponse::IndexStale { .. }
-            | SmResponse::IndexAhead { .. } => Err(SubmissionError::Execution {
+            | SmResponse::IndexAhead { .. }
+            | SmResponse::Enqueued { .. }
+            | SmResponse::IdempotencyHit { .. }
+            | SmResponse::IdempotencyFailed { .. }
+            | SmResponse::InFlight { .. }
+            | SmResponse::QueueFull { .. }
+            | SmResponse::HeadApplied { .. }
+            | SmResponse::QueueDesync { .. }
+            | SmResponse::Poisoned { .. }
+            | SmResponse::EvictionApplied { .. } => Err(SubmissionError::Execution {
                 status: 500,
                 message: "unexpected Response variant for AdvanceRef".into(),
             }),

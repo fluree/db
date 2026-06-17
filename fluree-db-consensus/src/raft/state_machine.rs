@@ -22,7 +22,7 @@ use crate::IdempotencyCacheKey;
 use fluree_db_api::{ContentId, PolicyStats, TrackingTally};
 use fluree_db_core::ledger_id::format_ledger_id;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use thiserror::Error;
 
 /// Postcard-friendly mirror of [`TrackingTally`].
@@ -147,8 +147,21 @@ pub struct LedgerRecord {
 pub struct ApplyRecord {
     /// SHA-256 of the request body. Lets a retry detect "same key,
     /// different body" — a client bug that should surface rather
-    /// than silently dedup.
+    /// than silently dedup. Populated by the legacy [`Command::AdvanceRef`]
+    /// path. Queue-mediated commits use [`Self::body_cid`] instead.
     pub body_hash: [u8; 32],
+    /// CAS identifier of the request body for queue-mediated commits
+    /// (see `Command::EnqueueCommand`). `None` for legacy AdvanceRef
+    /// applies. During the migration window both fields coexist; the
+    /// AdvanceRef path goes away in a later step and this becomes
+    /// the sole body identity.
+    #[serde(default)]
+    pub body_cid: Option<ContentId>,
+    /// Wall-clock at which the cache entry was recorded, milliseconds
+    /// since the Unix epoch. Used by `Command::EvictIdempotency` to
+    /// age out entries past their TTL.
+    #[serde(default)]
+    pub recorded_at_millis: u64,
     /// Head commit produced by the original submission.
     pub head: ContentId,
     /// Logical time of that commit.
@@ -170,6 +183,122 @@ pub struct IdempotencyContext {
     pub body_hash: [u8; 32],
 }
 
+/// One pending transactor request awaiting worker processing. The
+/// body itself lives in shared CAS — only the CID and a kind
+/// discriminator travel through Raft. See the design doc for the
+/// full rationale.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueueEntry {
+    pub queue_id: u64,
+    /// Log index at which [`Command::EnqueueCommand`] applied.
+    pub enqueued_index: u64,
+    /// Leader-supplied wall-clock at enqueue, milliseconds since
+    /// the Unix epoch.
+    pub enqueued_at_millis: u64,
+    /// Idempotency key if the caller supplied one. The matching
+    /// `body_cid` check uses [`Self::body_cid`].
+    pub idempotency: Option<IdempotencyCacheKey>,
+    /// CAS identifier for the request body. Always Some — the
+    /// leader writes the body to CAS before proposing.
+    pub body_cid: ContentId,
+    /// Discriminator the worker uses to choose its processing
+    /// path (stage vs verify-pushed-chain).
+    pub body_kind: BodyKind,
+}
+
+/// Mirror of [`crate::TransactionBody`]'s discriminator,
+/// carried inline on the queue entry so the worker can route
+/// without first parsing the body from CAS.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BodyKind {
+    JsonLdInsert,
+    JsonLdUpsert,
+    JsonLdUpdate,
+    TurtleInsert,
+    TurtleUpsert,
+    TrigUpsert,
+    Sparql,
+    /// Body decodes as `Vec<ContentId>` — a pushed commit chain
+    /// already present in CAS. Worker verifies the chain rather
+    /// than restaging.
+    Pushed,
+}
+
+/// Failure outcome recorded when a worker poisons a queue entry.
+/// Distinct from [`ApplyRecord`] (which only records successes)
+/// so the two cases are unambiguous at lookup time.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PoisonRecord {
+    pub body_cid: ContentId,
+    pub reason: PoisonReason,
+    pub recorded_index: u64,
+    pub recorded_at_millis: u64,
+}
+
+/// Why a queue entry was poisoned. Carried in [`PoisonRecord`]
+/// and in [`crate::SubmissionError`] flavours surfaced to clients.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PoisonReason {
+    /// Worker exhausted its retry budget on transient errors.
+    StagingFailed { error: String, attempts: u32 },
+    /// Body refused at staging time — invalid JSON-LD / Turtle /
+    /// SPARQL, schema violation, etc.
+    BodyMalformed { error: String },
+    /// Policy or SHACL rejected the staged commit.
+    PolicyViolation { error: String },
+    /// Body referenced a ledger that doesn't exist.
+    LedgerNotFound { ledger_id: String },
+    /// Push body's `commit_chain[0].parent` didn't match the
+    /// branch's head at worker check time.
+    PushCasFailed {
+        head_at_worker: Option<ContentId>,
+        expected_by_chain: Option<ContentId>,
+    },
+    /// Worker panicked. Last-resort variant; the rest are typed
+    /// to encourage operator-friendly error reporting.
+    WorkerPanic { message: String },
+}
+
+/// Reason a head-mutating admin command cleared a per-branch
+/// queue. Recorded in [`NameServiceState::recently_cleared`]
+/// so the next worker's [`Command::ApplyHead`] sees a meaningful
+/// [`DesyncReason::QueueCleared`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ClearReason {
+    BranchDropped,
+    BranchPurged,
+    BranchHeadReset,
+}
+
+/// Bounds the replicated cost of the per-branch queues. Held on
+/// [`NameServiceState`] so the apply path consults the same
+/// values on every node (configured at bootstrap time via
+/// `RaftBootstrapConfig`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueueConfig {
+    /// Maximum queue depth per `RefKey`. Isolates branches from
+    /// each other.
+    pub per_branch_cap: usize,
+    /// Maximum sum across every branch. Safety net for "N branches
+    /// each at cap."
+    pub global_cap: usize,
+}
+
+impl QueueConfig {
+    /// Defaults documented in `docs/design/raft-command-queue.md`.
+    pub const DEFAULT_PER_BRANCH: usize = 1024;
+    pub const DEFAULT_GLOBAL: usize = 16384;
+}
+
+impl Default for QueueConfig {
+    fn default() -> Self {
+        Self {
+            per_branch_cap: Self::DEFAULT_PER_BRANCH,
+            global_cap: Self::DEFAULT_GLOBAL,
+        }
+    }
+}
+
 /// State machine state. Serializable as a single blob for
 /// snapshotting (see [`NameServiceState::to_snapshot`]).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -182,6 +311,38 @@ pub struct NameServiceState {
     /// [`Command::PurgeLedger`] runs.
     pub retracted: HashSet<RefKey>,
     pub idempotency: HashMap<IdempotencyCacheKey, ApplyRecord>,
+    /// Per-branch FIFO of transactor work pending worker processing.
+    /// See `docs/design/raft-command-queue.md`.
+    #[serde(default)]
+    pub queues: HashMap<RefKey, VecDeque<QueueEntry>>,
+    /// Monotonic generator for [`QueueEntry::queue_id`]. State-machine
+    /// local; never exposed to clients.
+    #[serde(default)]
+    pub next_queue_id: u64,
+    /// Short-lived markers a head-mutating admin command leaves so
+    /// the next [`Command::ApplyHead`] for that branch reports a
+    /// meaningful [`DesyncReason::QueueCleared`]. Cleared by the
+    /// `ApplyHead` apply that observes them.
+    #[serde(default)]
+    pub recently_cleared: HashMap<RefKey, ClearReason>,
+    /// Failed-outcome idempotency entries, keyed alongside the
+    /// successful [`Self::idempotency`] cache. Populated by
+    /// `Command::PoisonQueueEntry`; consulted alongside the
+    /// success cache on every `Command::EnqueueCommand`.
+    #[serde(default)]
+    pub poisoned: HashMap<IdempotencyCacheKey, PoisonRecord>,
+    /// Lifetime count of poison events per branch — operator
+    /// signal for "is this branch healthy."
+    #[serde(default)]
+    pub poisoned_count: HashMap<RefKey, u64>,
+    /// Lifetime count of idempotency entries removed by
+    /// `Command::EvictIdempotency`.
+    #[serde(default)]
+    pub evicted_idempotency_count: u64,
+    /// Queue depth limits. Configured at bootstrap and replicated
+    /// in state so every node enforces the same caps.
+    #[serde(default)]
+    pub queue_config: QueueConfig,
 }
 
 /// Replicated commands the state machine accepts.
@@ -237,6 +398,64 @@ pub enum Command {
     /// doesn't mutate state on this — the entry's role is to let
     /// every node's content store act in sync.
     ReleaseContent { id: ContentId },
+    /// Append a transactor request to the per-branch queue. Apply
+    /// checks idempotency, the in-flight queue, and the queue
+    /// depth caps; on success appends a [`QueueEntry`] and returns
+    /// [`Response::Enqueued`]. See `docs/design/raft-command-queue.md`.
+    EnqueueCommand(EnqueueCommandArgs),
+    /// Advance a branch head from a worker-staged commit. Pops the
+    /// per-branch queue front (must match `queue_id`), records the
+    /// idempotency outcome from the entry, and signals waiters.
+    /// Replaces the role of `Command::AdvanceRef` in the queue
+    /// migration path.
+    ApplyHead(ApplyHeadArgs),
+    /// Worker gave up on a queue entry. Pops the front, records
+    /// the failure in the poisoned-idempotency map keyed by the
+    /// entry's idempotency key, and signals the waiter with an
+    /// abort outcome.
+    PoisonQueueEntry(PoisonQueueEntryArgs),
+    /// Periodic leader-proposed eviction of stale idempotency
+    /// records. Removes entries whose `recorded_at_millis` is
+    /// older than `cutoff_millis`, bounded per apply by an
+    /// internal batch size.
+    EvictIdempotency { cutoff_millis: u64 },
+}
+
+/// Payload for [`Command::EnqueueCommand`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EnqueueCommandArgs {
+    pub ledger_id: String,
+    pub branch: String,
+    pub idempotency: Option<IdempotencyCacheKey>,
+    /// CAS identifier for the body the leader wrote before
+    /// proposing. The worker reads this back to dispatch.
+    pub body_cid: ContentId,
+    pub body_kind: BodyKind,
+    pub applied_at_millis: u64,
+}
+
+/// Payload for [`Command::ApplyHead`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApplyHeadArgs {
+    pub ledger_id: String,
+    pub branch: String,
+    /// Queue entry this commit was staged from. Apply rejects
+    /// with [`DesyncReason::WrongFront`] if this doesn't match
+    /// the per-branch queue's front.
+    pub queue_id: u64,
+    pub commit_id: ContentId,
+    pub commit_t: i64,
+    pub applied_at_millis: u64,
+}
+
+/// Payload for [`Command::PoisonQueueEntry`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PoisonQueueEntryArgs {
+    pub ledger_id: String,
+    pub branch: String,
+    pub queue_id: u64,
+    pub reason: PoisonReason,
+    pub applied_at_millis: u64,
 }
 
 /// Payload for [`Command::AdvanceRef`].
@@ -438,9 +657,88 @@ pub enum Response {
     /// recorded for a different body. A client bug; surfaces rather
     /// than silently dedup.
     BodyHashMismatch,
+    /// [`Command::EnqueueCommand`] appended a fresh entry to the
+    /// per-branch queue. Worker will pick it up.
+    Enqueued { ledger_id: String, queue_id: u64 },
+    /// [`Command::EnqueueCommand`] short-circuited on a cached
+    /// outcome from a previous successful apply. The caller's
+    /// idempotency key matched and the body CID matched.
+    IdempotencyHit { record: ApplyRecord },
+    /// [`Command::EnqueueCommand`] short-circuited on a cached
+    /// failure outcome. Same matching rules as
+    /// [`Self::IdempotencyHit`].
+    IdempotencyFailed { record: PoisonRecord },
+    /// [`Command::EnqueueCommand`] found the same idempotency key
+    /// (and matching body CID) already in flight in the queue.
+    /// Caller waits on the existing `queue_id`.
+    InFlight { ledger_id: String, queue_id: u64 },
+    /// [`Command::EnqueueCommand`] was rejected because the queue
+    /// depth cap is reached. Caller backs off and retries.
+    QueueFull {
+        ledger_id: String,
+        depth: usize,
+        cap: usize,
+        scope: QueueFullScope,
+    },
+    /// [`Command::ApplyHead`] popped the queue front and advanced
+    /// the branch head.
+    HeadApplied {
+        ledger_id: String,
+        commit_id: ContentId,
+        commit_t: i64,
+    },
+    /// [`Command::ApplyHead`] or [`Command::PoisonQueueEntry`]
+    /// found the queue front didn't match `queue_id`. State
+    /// unchanged; worker recovers per `reason`.
+    QueueDesync {
+        ledger_id: String,
+        requested_queue_id: u64,
+        reason: DesyncReason,
+    },
+    /// [`Command::PoisonQueueEntry`] popped the front and
+    /// recorded the failure.
+    Poisoned {
+        ledger_id: String,
+        queue_id: u64,
+        reason: PoisonReason,
+    },
+    /// [`Command::EvictIdempotency`] removed `removed` entries.
+    /// `released_body_cids` carries CIDs the wrapper should fan
+    /// out as `Command::ReleaseContent` (or piggyback on the next
+    /// `ApplyHead`).
+    EvictionApplied {
+        removed: usize,
+        released_body_cids: Vec<ContentId>,
+    },
     /// Command was understood but no state change resulted (e.g.,
     /// [`Command::ReleaseContent`]).
     NoOp,
+}
+
+/// Which cap [`Response::QueueFull`] tripped — useful so clients
+/// can distinguish "this branch is hot" from "the cluster is
+/// saturated."
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum QueueFullScope {
+    PerBranch,
+    Global,
+}
+
+/// Why [`Response::QueueDesync`] fired. See the design doc.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DesyncReason {
+    /// Some other proposal popped the entry the worker was
+    /// trying to apply. `actual_queue_id` is whatever's at the
+    /// front now (which may be the next entry, or 0 if empty).
+    WrongFront { actual_queue_id: u64 },
+    /// Per-branch queue was drained by a head-mutating admin
+    /// command between the worker's stage and apply.
+    QueueCleared { reason: ClearReason },
+    /// State-machine invariant violation — apply was reached
+    /// without a matching admin clear marker, but the queue is
+    /// missing or empty. Surfaces as an error for investigation
+    /// rather than silent recovery.
+    InvariantViolated { description: String },
 }
 
 /// Errors raised during snapshot serialization or restore.
@@ -487,6 +785,12 @@ pub fn apply(state: &mut NameServiceState, command: Command, log_index: u64) -> 
         Command::RetractLedger { ledger_id, branch } => retract_ledger(state, ledger_id, branch),
         Command::PurgeLedger { ledger_id, branch } => purge_ledger(state, ledger_id, branch),
         Command::ReleaseContent { id: _ } => Response::NoOp,
+        // Queue-related commands. Apply paths land in subsequent
+        // commits; see docs/design/raft-command-queue.md.
+        Command::EnqueueCommand(args) => apply_enqueue_command(state, log_index, args),
+        Command::ApplyHead(_) => todo!("apply_head"),
+        Command::PoisonQueueEntry(_) => todo!("apply_poison_queue_entry"),
+        Command::EvictIdempotency { .. } => todo!("apply_evict_idempotency"),
     }
 }
 
@@ -574,6 +878,8 @@ fn advance_ref(
             ctx.key,
             ApplyRecord {
                 body_hash: ctx.body_hash,
+                body_cid: None,
+                recorded_at_millis: applied_at_millis,
                 head: new_head.clone(),
                 t,
                 recorded_index: log_index,
@@ -908,6 +1214,109 @@ fn advance_index_head(
     Response::IndexAdvanced {
         index_t: t,
         index_head: new_index_head,
+    }
+}
+
+fn apply_enqueue_command(
+    state: &mut NameServiceState,
+    log_index: u64,
+    args: EnqueueCommandArgs,
+) -> Response {
+    let EnqueueCommandArgs {
+        ledger_id,
+        branch,
+        idempotency,
+        body_cid,
+        body_kind,
+        applied_at_millis,
+    } = args;
+    let full_ledger_id = format_ledger_id(&ledger_id, &branch);
+    let ref_key = RefKey::new(&ledger_id, &branch);
+
+    // 1. Idempotency cache — short-circuit on hit. The body_cid
+    //    must match; mismatched bodies under the same key are a
+    //    client bug we surface rather than silently dedup.
+    if let Some(key) = idempotency.as_ref() {
+        if let Some(record) = state.idempotency.get(key) {
+            return match record.body_cid.as_ref() {
+                Some(cached) if cached == &body_cid => {
+                    Response::IdempotencyHit { record: record.clone() }
+                }
+                Some(_) => Response::BodyHashMismatch,
+                // Legacy AdvanceRef-populated entries lack body_cid.
+                // A queue-mediated retry that finds one of those
+                // can't safely match; treat as a body collision
+                // since the comparison is undefined.
+                None => Response::BodyHashMismatch,
+            };
+        }
+        if let Some(record) = state.poisoned.get(key) {
+            return if record.body_cid == body_cid {
+                Response::IdempotencyFailed { record: record.clone() }
+            } else {
+                Response::BodyHashMismatch
+            };
+        }
+        // 2. In-flight queue scan. Same key + same body → ride the
+        //    existing entry. Same key + different body → collision.
+        if let Some(queue) = state.queues.get(&ref_key) {
+            for entry in queue {
+                if entry.idempotency.as_ref() == Some(key) {
+                    return if entry.body_cid == body_cid {
+                        Response::InFlight {
+                            ledger_id: full_ledger_id,
+                            queue_id: entry.queue_id,
+                        }
+                    } else {
+                        Response::BodyHashMismatch
+                    };
+                }
+            }
+        }
+    }
+
+    // 3. Cap checks. Per-branch first (most isolation), then global.
+    let per_branch_cap = state.queue_config.per_branch_cap;
+    let per_branch_depth = state
+        .queues
+        .get(&ref_key)
+        .map(VecDeque::len)
+        .unwrap_or(0);
+    if per_branch_depth >= per_branch_cap {
+        return Response::QueueFull {
+            ledger_id: full_ledger_id,
+            depth: per_branch_depth,
+            cap: per_branch_cap,
+            scope: QueueFullScope::PerBranch,
+        };
+    }
+    let global_cap = state.queue_config.global_cap;
+    let global_depth: usize = state.queues.values().map(VecDeque::len).sum();
+    if global_depth >= global_cap {
+        return Response::QueueFull {
+            ledger_id: full_ledger_id,
+            depth: global_depth,
+            cap: global_cap,
+            scope: QueueFullScope::Global,
+        };
+    }
+
+    // 4. Append.
+    let queue_id = state.next_queue_id;
+    state.next_queue_id = state.next_queue_id.wrapping_add(1);
+    let entry = QueueEntry {
+        queue_id,
+        enqueued_index: log_index,
+        enqueued_at_millis: applied_at_millis,
+        idempotency,
+        body_cid,
+        body_kind,
+    };
+    state.queues.entry(ref_key).or_default().push_back(entry);
+
+    Response::Enqueued {
+        ledger_id: full_ledger_id,
+        queue_id,
     }
 }
 
@@ -2095,5 +2504,209 @@ mod tests {
                 t: 10
             })
         );
+    }
+
+    // ====================================================================
+    // EnqueueCommand
+    // ====================================================================
+
+    fn enqueue(
+        ledger_id: &str,
+        branch: &str,
+        body_seed: u8,
+        idempotency: Option<IdempotencyContext>,
+    ) -> Command {
+        Command::EnqueueCommand(EnqueueCommandArgs {
+            ledger_id: ledger_id.into(),
+            branch: branch.into(),
+            idempotency: idempotency.map(|c| c.key),
+            body_cid: cid(body_seed),
+            body_kind: BodyKind::JsonLdInsert,
+            applied_at_millis: 1_000,
+        })
+    }
+
+    fn body_kid(key: &str) -> IdempotencyCacheKey {
+        IdempotencyCacheKey::new("test/db:main", IdempotencyKey::new(key))
+    }
+
+    #[test]
+    fn enqueue_appends_entry_and_returns_queue_id() {
+        let mut state = NameServiceState::new();
+        let resp = apply(&mut state, enqueue("test/db", "main", 7, None), 1);
+        let queue_id = match resp {
+            Response::Enqueued { ledger_id, queue_id } => {
+                assert_eq!(ledger_id, "test/db:main");
+                queue_id
+            }
+            other => panic!("expected Enqueued, got {other:?}"),
+        };
+        let key = RefKey::new("test/db", "main");
+        assert_eq!(state.queues.get(&key).unwrap().len(), 1);
+        let front = state.queues.get(&key).unwrap().front().unwrap();
+        assert_eq!(front.queue_id, queue_id);
+        assert_eq!(front.body_cid, cid(7));
+        assert_eq!(state.next_queue_id, queue_id + 1);
+    }
+
+    #[test]
+    fn enqueue_idempotency_hit_short_circuits_on_cached_success() {
+        let mut state = NameServiceState::new();
+        let key = body_kid("k1");
+        // Pre-populate a cached success record with body_cid set.
+        state.idempotency.insert(
+            key.clone(),
+            ApplyRecord {
+                body_hash: [0u8; 32],
+                body_cid: Some(cid(7)),
+                recorded_at_millis: 500,
+                head: cid(42),
+                t: 5,
+                recorded_index: 9,
+                tally: None,
+            },
+        );
+        let resp = apply(
+            &mut state,
+            enqueue(
+                "test/db",
+                "main",
+                7,
+                Some(IdempotencyContext {
+                    key: key.clone(),
+                    body_hash: [0u8; 32],
+                }),
+            ),
+            10,
+        );
+        match resp {
+            Response::IdempotencyHit { record } => {
+                assert_eq!(record.head, cid(42));
+                assert_eq!(record.t, 5);
+            }
+            other => panic!("expected IdempotencyHit, got {other:?}"),
+        }
+        // Nothing appended.
+        assert!(state.queues.is_empty());
+    }
+
+    #[test]
+    fn enqueue_body_hash_mismatch_on_same_key_different_body() {
+        let mut state = NameServiceState::new();
+        let key = body_kid("k1");
+        state.idempotency.insert(
+            key.clone(),
+            ApplyRecord {
+                body_hash: [0u8; 32],
+                body_cid: Some(cid(7)),
+                recorded_at_millis: 500,
+                head: cid(42),
+                t: 5,
+                recorded_index: 9,
+                tally: None,
+            },
+        );
+        let resp = apply(
+            &mut state,
+            enqueue(
+                "test/db",
+                "main",
+                8, // different body
+                Some(IdempotencyContext {
+                    key,
+                    body_hash: [0u8; 32],
+                }),
+            ),
+            10,
+        );
+        assert_eq!(resp, Response::BodyHashMismatch);
+    }
+
+    #[test]
+    fn enqueue_in_flight_when_key_already_queued() {
+        let mut state = NameServiceState::new();
+        let key = body_kid("k1");
+        let first = apply(
+            &mut state,
+            enqueue(
+                "test/db",
+                "main",
+                7,
+                Some(IdempotencyContext {
+                    key: key.clone(),
+                    body_hash: [0u8; 32],
+                }),
+            ),
+            1,
+        );
+        let queue_id = match first {
+            Response::Enqueued { queue_id, .. } => queue_id,
+            other => panic!("first enqueue not Enqueued: {other:?}"),
+        };
+        let second = apply(
+            &mut state,
+            enqueue(
+                "test/db",
+                "main",
+                7,
+                Some(IdempotencyContext {
+                    key,
+                    body_hash: [0u8; 32],
+                }),
+            ),
+            2,
+        );
+        match second {
+            Response::InFlight {
+                queue_id: q,
+                ledger_id,
+            } => {
+                assert_eq!(q, queue_id);
+                assert_eq!(ledger_id, "test/db:main");
+            }
+            other => panic!("expected InFlight, got {other:?}"),
+        }
+        // Still only one entry in the queue.
+        let key = RefKey::new("test/db", "main");
+        assert_eq!(state.queues.get(&key).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn enqueue_returns_queue_full_per_branch_when_cap_reached() {
+        let mut state = NameServiceState::new();
+        state.queue_config = QueueConfig {
+            per_branch_cap: 2,
+            global_cap: 100,
+        };
+        apply(&mut state, enqueue("test/db", "main", 1, None), 1);
+        apply(&mut state, enqueue("test/db", "main", 2, None), 2);
+        let resp = apply(&mut state, enqueue("test/db", "main", 3, None), 3);
+        match resp {
+            Response::QueueFull {
+                cap,
+                scope: QueueFullScope::PerBranch,
+                ..
+            } => assert_eq!(cap, 2),
+            other => panic!("expected per-branch QueueFull, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn enqueue_returns_queue_full_global_when_summed_cap_reached() {
+        let mut state = NameServiceState::new();
+        state.queue_config = QueueConfig {
+            per_branch_cap: 10,
+            global_cap: 2,
+        };
+        apply(&mut state, enqueue("a/db", "main", 1, None), 1);
+        apply(&mut state, enqueue("b/db", "main", 2, None), 2);
+        let resp = apply(&mut state, enqueue("c/db", "main", 3, None), 3);
+        match resp {
+            Response::QueueFull {
+                scope: QueueFullScope::Global,
+                ..
+            } => {}
+            other => panic!("expected global QueueFull, got {other:?}"),
+        }
     }
 }
