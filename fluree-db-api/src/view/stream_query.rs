@@ -281,8 +281,8 @@ impl Fluree {
     }
 
     /// Build a policy-wrapped `DataSetDb` from an explicit spec + connection
-    /// options. Used by the streaming SPARQL path, where the server builds the
-    /// `DatasetSpec` from `FROM`/`FROM NAMED` clauses and the
+    /// options. Used by the ledger-scoped streaming SPARQL path, where the
+    /// server builds the `DatasetSpec` from `FROM`/`FROM NAMED` clauses and the
     /// `QueryConnectionOptions` from the resolved identity + policy headers.
     pub async fn build_stream_dataset_from_spec(
         &self,
@@ -290,6 +290,24 @@ impl Fluree {
         qc_opts: &crate::QueryConnectionOptions,
     ) -> Result<DataSetDb> {
         self.build_dataset_for_connection(spec, qc_opts).await
+    }
+
+    /// Build a policy-wrapped `DataSetDb` for a connection-scoped SPARQL query
+    /// by extracting the (cross-ledger) dataset from its `FROM`/`FROM NAMED`
+    /// clauses — the no-ledger `/stream/query` SPARQL form.
+    pub async fn build_stream_dataset_for_sparql(
+        &self,
+        sparql: &str,
+        qc_opts: &crate::QueryConnectionOptions,
+    ) -> Result<DataSetDb> {
+        let ast = crate::query::helpers::parse_and_validate_sparql(sparql)?;
+        let spec = crate::query::helpers::extract_sparql_dataset_spec(&ast)?;
+        if spec.is_empty() {
+            return Err(ApiError::query(
+                "Missing dataset specification in SPARQL connection query (no FROM / FROM NAMED)",
+            ));
+        }
+        self.build_dataset_for_connection(&spec, qc_opts).await
     }
 
     /// Parse, validate, and plan a streaming SELECT against a dataset. SPARQL

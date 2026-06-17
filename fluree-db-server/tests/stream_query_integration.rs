@@ -129,6 +129,125 @@ async fn stream_sparql(
         .unwrap()
 }
 
+async fn stream_jsonld_connection(app: &axum::Router, query: &JsonValue) -> http::Response<Body> {
+    app.clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/stream/query")
+                .header("content-type", "application/json")
+                .body(Body::from(query.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+}
+
+async fn stream_sparql_connection(
+    app: &axum::Router,
+    sparql: &str,
+    extra_header: Option<(&str, &str)>,
+) -> http::Response<Body> {
+    let mut builder = Request::builder()
+        .method("POST")
+        .uri("/v1/fluree/stream/query")
+        .header("content-type", "application/sparql-query");
+    if let Some((k, v)) = extra_header {
+        builder = builder.header(k, v);
+    }
+    app.clone()
+        .oneshot(builder.body(Body::from(sparql.to_string())).unwrap())
+        .await
+        .unwrap()
+}
+
+/// Connection-scoped (no path ledger): JSON-LD `from: [a, b]` unions both.
+#[tokio::test]
+async fn connection_jsonld_from_streams_union() {
+    let (_tmp, state) = test_state().await;
+    let app = build_router(state);
+    create_ledger(&app, "strm:ca").await;
+    create_ledger(&app, "strm:cb").await;
+    insert_name(&app, "strm:ca", "ex:p", "Alice").await;
+    insert_name(&app, "strm:cb", "ex:q", "Bob").await;
+
+    let query = json!({
+        "@context": { "ex": "http://example.org/" },
+        "from": ["strm:ca", "strm:cb"],
+        "select": ["?name"],
+        "where": { "@id": "?s", "ex:name": "?name" }
+    });
+    let resp = stream_jsonld_connection(&app, &query).await;
+    let (status, ct, records) = ndjson_records(resp).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(ct.as_deref(), Some("application/x-ndjson"));
+    assert_eq!(records.last().unwrap()["type"], "end");
+    let mut names: Vec<String> = records
+        .iter()
+        .filter(|r| r["type"] == "row")
+        .map(|r| r["row"]["name"]["value"].as_str().unwrap().to_string())
+        .collect();
+    names.sort();
+    assert_eq!(names, vec!["Alice", "Bob"]);
+}
+
+/// Connection-scoped SPARQL with `FROM` streams.
+#[tokio::test]
+async fn connection_sparql_from_streams() {
+    let (_tmp, state) = test_state().await;
+    let app = build_router(state);
+    create_ledger(&app, "strm:csp").await;
+    insert_name(&app, "strm:csp", "ex:x", "Xavier").await;
+
+    let resp = stream_sparql_connection(
+        &app,
+        "SELECT ?name FROM <strm:csp> WHERE { ?s <http://example.org/name> ?name }",
+        None,
+    )
+    .await;
+    let (status, _ct, records) = ndjson_records(resp).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(records.last().unwrap()["type"], "end");
+    assert_eq!(records.last().unwrap()["rows"], 1);
+}
+
+/// Connection-scoped JSON-LD without any ledger spec (no `from`) → 4xx.
+#[tokio::test]
+async fn connection_missing_ledger_spec_rejected() {
+    let (_tmp, state) = test_state().await;
+    let app = build_router(state);
+
+    let query = json!({
+        "@context": { "ex": "http://example.org/" },
+        "select": ["?name"],
+        "where": { "@id": "?s", "ex:name": "?name" }
+    });
+    let resp = stream_jsonld_connection(&app, &query).await;
+    assert!(
+        resp.status().is_client_error(),
+        "missing ledger spec should be 4xx, got {}",
+        resp.status()
+    );
+}
+
+/// Connection-scoped SPARQL refuses policy signals (no multi-ledger identity
+/// resolution); use the ledger-scoped route or /query.
+#[tokio::test]
+async fn connection_sparql_policy_refused() {
+    let (_tmp, state) = test_state().await;
+    let app = build_router(state);
+    create_ledger(&app, "strm:cpr").await;
+    insert_name(&app, "strm:cpr", "ex:x", "Xavier").await;
+
+    let resp = stream_sparql_connection(
+        &app,
+        "SELECT ?name FROM <strm:cpr> WHERE { ?s <http://example.org/name> ?name }",
+        Some(("fluree-policy-class", "http://example.org/PublicClass")),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
 async fn state_no_heartbeat() -> (TempDir, Arc<AppState>) {
     let tmp = tempfile::tempdir().expect("tempdir");
     let cfg = ServerConfig {

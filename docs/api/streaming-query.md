@@ -1,6 +1,9 @@
 # Streaming query (NDJSON)
 
-> **Endpoint:** `POST /v1/fluree/stream/query/<ledger...>`
+> **Endpoints:**
+> - `POST /v1/fluree/stream/query/<ledger...>` — ledger-scoped (ledger in path)
+> - `POST /v1/fluree/stream/query` — connection-scoped (ledger from `from`/`FROM`)
+>
 > **Content type (response):** `application/x-ndjson`
 > **Status:** v1 — SELECT only; some shapes explicitly rejected (see [Unsupported shapes](#unsupported-shapes)).
 
@@ -32,24 +35,41 @@ standard buffered query path is unchanged.
 
 ## Request
 
-The ledger is taken from the greedy path tail (`/stream/query/<ledger...>`),
-exactly like [`/query/<ledger...>`](endpoints.md#post-query). The query body is
-content-type-negotiated, same as `/query`:
+Two forms, mirroring `/query`:
+
+- **Ledger-scoped** — `POST /stream/query/<ledger...>`. The ledger is the greedy
+  path tail, exactly like [`/query/<ledger...>`](endpoints.md#post-query).
+- **Connection-scoped** — `POST /stream/query` (no path ledger). The ledger(s)
+  come entirely from the request: JSON-LD `from`/`fromNamed` (or the
+  `Fluree-Ledger` header), or SPARQL `FROM`/`FROM NAMED`. This is always the
+  connection/dataset path; a request with no ledger spec is rejected `4xx`.
+
+Either form is content-type-negotiated:
 
 - `Content-Type: application/json` — a JSON-LD query document.
 - `Content-Type: application/sparql-query` — a raw SPARQL `SELECT` string.
 
 ```bash
+# Ledger-scoped
 curl -N -X POST http://localhost:8090/v1/fluree/stream/query/my/ledger \
   -H 'Content-Type: application/json' \
-  -d '{
-        "@context": { "ex": "http://example.org/" },
-        "select": ["?name"],
-        "where": { "@id": "?s", "ex:name": "?name" }
-      }'
+  -d '{"@context":{"ex":"http://example.org/"},
+       "select":["?name"],"where":{"@id":"?s","ex:name":"?name"}}'
+
+# Connection-scoped (ledgers from `from`)
+curl -N -X POST http://localhost:8090/v1/fluree/stream/query \
+  -H 'Content-Type: application/json' \
+  -d '{"@context":{"ex":"http://example.org/"},"from":["a:main","b:main"],
+       "select":["?name"],"where":{"@id":"?s","ex:name":"?name"}}'
 ```
 
 > `curl -N` disables output buffering so records print as they arrive.
+
+> **Note:** connection-scoped **SPARQL** does not apply per-request identity
+> policy (it has no single ledger to resolve against), so a `/stream/query`
+> SPARQL request carrying policy signals is rejected — use the ledger-scoped
+> `/stream/query/<ledger>` (which enforces SPARQL policy) or `/query`.
+> Connection-scoped **JSON-LD** policy is enforced normally.
 
 ## Response: the NDJSON record protocol
 

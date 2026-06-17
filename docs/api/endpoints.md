@@ -1280,13 +1280,15 @@ WHERE {
 ORDER BY ?t'
 ```
 
-### POST /stream/query/{ledger}
+### POST /stream/query and /stream/query/{ledger}
 
 Stream SELECT results incrementally as newline-delimited JSON
 (`application/x-ndjson`) instead of buffering the whole result into one
 response body, with a heartbeat that keeps long-running queries alive past
 proxy idle timeouts. Same content-type negotiation as `/query` (JSON-LD or
-`application/sparql-query`); ledger in the greedy path tail.
+`application/sparql-query`). Two forms: ledger-scoped (ledger in the greedy
+path tail) and connection-scoped (`POST /stream/query`, no path ledger — the
+ledger(s) come from JSON-LD `from`/`fromNamed` or SPARQL `FROM`).
 
 ```bash
 curl -N -X POST http://localhost:8090/v1/fluree/stream/query/my/ledger \

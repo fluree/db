@@ -436,7 +436,7 @@ pub(crate) fn enforce_bearer_dataset_scope(
 }
 
 /// Helper to extract ledger ID from request (for JSON-LD queries)
-fn get_ledger_id(
+pub(crate) fn get_ledger_id(
     path_ledger: Option<&str>,
     headers: &FlureeHeaders,
     body: &JsonValue,
