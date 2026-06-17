@@ -81,6 +81,13 @@ pub struct FlureeServer {
     /// the rest of the server.
     #[cfg(feature = "raft")]
     raft_leader_watcher: Option<tokio::task::JoinHandle<()>>,
+    /// Per-node release task that drains the state-machine adapter's
+    /// CAS release channel. Runs on every node (not just the leader)
+    /// so admin-cleared queue entries and idempotency-evicted
+    /// envelopes don't orphan their bodies in the content store.
+    /// Aborted on shutdown.
+    #[cfg(feature = "raft")]
+    raft_release_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl FlureeServer {
@@ -270,6 +277,10 @@ impl FlureeServer {
             // receiver; on its way down it also aborts every
             // currently-running leader task — see
             // `raft::spawn_leader_watcher` for the teardown path.
+            task.abort();
+        }
+        #[cfg(feature = "raft")]
+        if let Some(task) = self.raft_release_task {
             task.abort();
         }
 
@@ -465,6 +476,38 @@ impl FlureeServerBuilder {
             }
         });
 
+        // Per-node CAS release task. The state-machine adapter pushes
+        // `(ledger_id, request_cid)` pairs through the integration's
+        // release channel whenever an apply surfaces evictable
+        // envelopes (idempotency eviction, admin clears). Followers
+        // see the same applies as the leader, so running this task on
+        // every node keeps the content store consistent across the
+        // cluster.
+        #[cfg(feature = "raft")]
+        let raft_release_task = match self.raft.as_ref() {
+            Some((integration, _)) => {
+                let rx = integration.take_release_receiver().await;
+                rx.map(|mut rx| {
+                    let fluree = Arc::clone(&state_inner.fluree);
+                    tokio::spawn(async move {
+                        while let Some((ledger_id, cid)) = rx.recv().await {
+                            if let Err(err) =
+                                fluree.content_store(&ledger_id).release(&cid).await
+                            {
+                                tracing::warn!(
+                                    %ledger_id,
+                                    %cid,
+                                    error = %err,
+                                    "failed to release envelope from content store"
+                                );
+                            }
+                        }
+                    })
+                })
+            }
+            None => None,
+        };
+
         // Wire the leader-aware launcher. Bundles both the background
         // indexer and the commit-queue worker so they share one
         // metrics watcher and one spawn/abort lifecycle. See
@@ -501,7 +544,6 @@ impl FlureeServerBuilder {
                     let eviction_scheduler =
                         fluree_db_consensus::raft::eviction_scheduler::EvictionScheduler::new(
                             Arc::clone(&integration.raft),
-                            Arc::clone(&state_inner.fluree),
                         );
                     let spawn_leader_tasks = move || {
                         let nameservice: std::sync::Arc<
@@ -573,6 +615,8 @@ impl FlureeServerBuilder {
             raft_listener,
             #[cfg(feature = "raft")]
             raft_leader_watcher,
+            #[cfg(feature = "raft")]
+            raft_release_task,
         })
     }
 }

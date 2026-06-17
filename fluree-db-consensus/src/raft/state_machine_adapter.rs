@@ -29,6 +29,7 @@ use openraft::{
 use std::io::Cursor;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::RwLock;
 
 /// Handle to the replicated nameservice state used by the apply
@@ -100,6 +101,14 @@ where
     /// entry → fall back to [`AppliedReceipt::Minimal`] (the
     /// stranded-on-former-leader path).
     staged_receipts: Option<Arc<StagedReceiptMap>>,
+    /// When set, the adapter forwards `(ledger_id, request_cid)` pairs
+    /// surfaced by `Response::EvictionApplied`, `Purged`,
+    /// `BranchDropped`, and `HeadReset` to a per-node release task.
+    /// The task owns the `Fluree` handle and calls
+    /// `content_store(&ledger_id).release(&cid)` — running on every
+    /// node so admin clears and idempotency eviction don't orphan
+    /// envelope blobs on followers.
+    release_tx: Option<UnboundedSender<(String, ContentId)>>,
 }
 
 impl<S> StateMachineAdapter<S>
@@ -124,6 +133,7 @@ where
             event_bus: None,
             waiter_map: None,
             staged_receipts: None,
+            release_tx: None,
         }
     }
 
@@ -150,6 +160,14 @@ where
     /// per-op staging detail into.
     pub fn with_staged_receipts(mut self, staged_receipts: Arc<StagedReceiptMap>) -> Self {
         self.staged_receipts = Some(staged_receipts);
+        self
+    }
+
+    /// Set the channel the adapter forwards CAS release work to.
+    /// Pair the receiver with a per-node task that owns the `Fluree`
+    /// handle and calls `content_store(&ledger_id).release(&cid)`.
+    pub fn with_release_sender(mut self, tx: UnboundedSender<(String, ContentId)>) -> Self {
+        self.release_tx = Some(tx);
         self
     }
 
@@ -253,7 +271,7 @@ fn event_for(cmd: &Command, response: &Response) -> Option<NameServiceEvent> {
             })
         }
         (Command::RetractLedger { .. }, Response::Retracted { ledger_id })
-        | (Command::PurgeLedger { .. }, Response::Purged { ledger_id })
+        | (Command::PurgeLedger { .. }, Response::Purged { ledger_id, .. })
         | (Command::DropBranch { .. }, Response::BranchDropped { ledger_id, .. }) => {
             Some(NameServiceEvent::LedgerRetracted {
                 ledger_id: ledger_id.clone(),
@@ -272,6 +290,29 @@ fn event_for(cmd: &Command, response: &Response) -> Option<NameServiceEvent> {
             commit_t: *t,
         }),
         _ => None,
+    }
+}
+
+/// Drain the `(ledger_id, request_cid)` pairs the state machine has
+/// flagged for content-store release. Covers idempotency eviction
+/// and the three head-mutating admin commands that clear pending
+/// queue entries. Returning `Vec` (not a `&[..]`) lets the adapter
+/// move the pairs into the release channel without an extra copy.
+fn drain_releases(response: &mut Response) -> Vec<(String, ContentId)> {
+    match response {
+        Response::EvictionApplied {
+            released_envelopes, ..
+        }
+        | Response::Purged {
+            released_envelopes, ..
+        }
+        | Response::BranchDropped {
+            released_envelopes, ..
+        }
+        | Response::HeadReset {
+            released_envelopes, ..
+        } => std::mem::take(released_envelopes),
+        _ => Vec::new(),
     }
 }
 
@@ -296,6 +337,7 @@ where
         let mut responses = Vec::new();
         let mut events = Vec::new();
         let mut resolutions = Vec::new();
+        let mut releases: Vec<(String, ContentId)> = Vec::new();
         {
             let mut state = self.state.write().await;
             for entry in entries {
@@ -304,13 +346,15 @@ where
                 match entry.payload {
                     EntryPayload::Blank => responses.push(Response::NoOp),
                     EntryPayload::Normal(cmd) => {
-                        let response = state_machine::apply(&mut state, cmd.clone(), log_id.index);
+                        let mut response =
+                            state_machine::apply(&mut state, cmd.clone(), log_id.index);
                         if let Some(event) = event_for(&cmd, &response) {
                             events.push(event);
                         }
                         if let Some(resolution) = waiter_resolution_for(&cmd, &response) {
                             resolutions.push(resolution);
                         }
+                        releases.extend(drain_releases(&mut response));
                         responses.push(response);
                     }
                     EntryPayload::Membership(m) => {
@@ -352,6 +396,13 @@ where
                         waiters.abort_all_for_branch(&ref_key, reason)
                     }
                 }
+            }
+        }
+        if let Some(tx) = self.release_tx.as_ref() {
+            for release in releases {
+                // Receiver dropped → release task gone. Nothing the
+                // adapter can do; let send_release fail silently.
+                let _ = tx.send(release);
             }
         }
         Ok(responses)

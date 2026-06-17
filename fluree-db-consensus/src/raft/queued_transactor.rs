@@ -115,22 +115,36 @@ impl QueuedTransactor {
     /// `retry_eligible` should mirror whether the command carries
     /// an idempotency key: without one, re-proposing would create a
     /// duplicate queue entry rather than hitting the cache.
+    ///
+    /// When the state machine rejects the propose (`BodyHashMismatch`,
+    /// `QueueFull`, `LedgerNotFound`, unexpected variants, or the raft
+    /// layer itself errors), the envelope at `request_cid` is orphaned
+    /// in CAS — nothing else references it. This function releases it
+    /// before returning. `Enqueued`/`InFlight`/`IdempotencyHit`/
+    /// `IdempotencyFailed` paths leave the envelope owned by the
+    /// queue or idempotency cache; eviction / admin clear releases it
+    /// via the state-machine adapter's release channel.
     async fn submit_and_await(
         &self,
-        cmd: SmCommand,
+        args: EnqueueCommandArgs,
         ref_key: RefKey,
         retry_eligible: bool,
     ) -> Result<SubmissionOutcome, SubmissionError> {
+        let request_cid = args.request_cid.clone();
+        let full_ledger_id = format!("{}:{}", args.ledger_id, args.branch);
+        let cmd = SmCommand::EnqueueCommand(args);
         let attempts_allowed = if retry_eligible { self.max_retries } else { 1 };
         for attempt in 0..attempts_allowed {
-            let response = self
-                .raft
-                .client_write(cmd.clone())
-                .await
-                .map_err(|e| SubmissionError::Execution {
-                    status: 500,
-                    message: format!("raft client_write failed: {e}"),
-                })?;
+            let response = match self.raft.client_write(cmd.clone()).await {
+                Ok(response) => response,
+                Err(e) => {
+                    self.release_envelope(&full_ledger_id, &request_cid).await;
+                    return Err(SubmissionError::Execution {
+                        status: 500,
+                        message: format!("raft client_write failed: {e}"),
+                    });
+                }
+            };
             match response.data {
                 SmResponse::Enqueued { queue_id, .. } | SmResponse::InFlight { queue_id, .. } => {
                     let rx = self.waiter_map.register(queue_id, ref_key.clone());
@@ -159,15 +173,23 @@ impl QueuedTransactor {
                 SmResponse::IdempotencyFailed { record } => {
                     return Ok(SubmissionOutcome::CachedFailure(record));
                 }
-                SmResponse::BodyHashMismatch => return Err(SubmissionError::KeyCollision),
-                SmResponse::QueueFull { .. } => return Err(SubmissionError::Overloaded),
+                SmResponse::BodyHashMismatch => {
+                    self.release_envelope(&full_ledger_id, &request_cid).await;
+                    return Err(SubmissionError::KeyCollision);
+                }
+                SmResponse::QueueFull { .. } => {
+                    self.release_envelope(&full_ledger_id, &request_cid).await;
+                    return Err(SubmissionError::Overloaded);
+                }
                 SmResponse::LedgerNotFound { ledger_id } => {
+                    self.release_envelope(&full_ledger_id, &request_cid).await;
                     return Err(SubmissionError::Execution {
                         status: 404,
                         message: format!("ledger not found: {ledger_id}"),
                     });
                 }
                 other => {
+                    self.release_envelope(&full_ledger_id, &request_cid).await;
                     return Err(SubmissionError::Execution {
                         status: 500,
                         message: format!(
@@ -188,6 +210,31 @@ impl QueuedTransactor {
             } else {
                 "submission stranded by leader transition; retry with an idempotency key".into()
             },
+        }
+    }
+
+    /// Decrement (or remove) an orphaned envelope's CAS entry. The
+    /// content store's `release` is idempotent, so a double-release
+    /// on the same CID is harmless — log on failure but don't escalate
+    /// to the caller, since the submission has already returned its
+    /// terminal status.
+    async fn release_envelope(
+        &self,
+        ledger_id: &str,
+        request_cid: &fluree_db_core::ContentId,
+    ) {
+        if let Err(err) = self
+            .fluree
+            .content_store(ledger_id)
+            .release(request_cid)
+            .await
+        {
+            tracing::warn!(
+                %ledger_id,
+                cid = %request_cid,
+                error = %err,
+                "failed to release orphaned QueuedRequest envelope"
+            );
         }
     }
 }
@@ -257,16 +304,16 @@ impl Committer for QueuedTransactor {
             })?;
 
         let retry_eligible = idempotency_cache_key.is_some();
-        let cmd = SmCommand::EnqueueCommand(EnqueueCommandArgs {
+        let args = EnqueueCommandArgs {
             ledger_id: ledger_name,
             branch,
             idempotency: idempotency_cache_key,
             request_cid,
             body_kind,
             applied_at_millis: current_millis(),
-        });
+        };
 
-        match self.submit_and_await(cmd, ref_key, retry_eligible).await? {
+        match self.submit_and_await(args, ref_key, retry_eligible).await? {
             SubmissionOutcome::Waiter(WaiterOutcome::Applied(receipt)) => {
                 transaction_receipt_from(idempotency_key, receipt)
             }
@@ -326,16 +373,16 @@ impl Committer for QueuedTransactor {
             })?;
 
         let retry_eligible = idempotency_cache_key.is_some();
-        let cmd = SmCommand::EnqueueCommand(EnqueueCommandArgs {
+        let args = EnqueueCommandArgs {
             ledger_id: ledger_name,
             branch: branch.clone(),
             idempotency: idempotency_cache_key,
             request_cid,
             body_kind: BodyKind::Revert,
             applied_at_millis: current_millis(),
-        });
+        };
 
-        match self.submit_and_await(cmd, ref_key, retry_eligible).await? {
+        match self.submit_and_await(args, ref_key, retry_eligible).await? {
             SubmissionOutcome::Waiter(WaiterOutcome::Applied(receipt)) => {
                 revert_receipt_from(idempotency_key, branch, strategy, receipt)
             }
@@ -422,16 +469,16 @@ impl Committer for QueuedTransactor {
             })?;
 
         let retry_eligible = idempotency_cache_key.is_some();
-        let cmd = SmCommand::EnqueueCommand(EnqueueCommandArgs {
+        let args = EnqueueCommandArgs {
             ledger_id: ledger_name,
             branch: target_for_queue.clone(),
             idempotency: idempotency_cache_key,
             request_cid,
             body_kind: BodyKind::Merge,
             applied_at_millis: current_millis(),
-        });
+        };
 
-        match self.submit_and_await(cmd, ref_key, retry_eligible).await? {
+        match self.submit_and_await(args, ref_key, retry_eligible).await? {
             SubmissionOutcome::Waiter(WaiterOutcome::Applied(receipt)) => merge_receipt_from(
                 idempotency_key,
                 source_branch,
@@ -493,16 +540,16 @@ impl Committer for QueuedTransactor {
             })?;
 
         let retry_eligible = idempotency_cache_key.is_some();
-        let cmd = SmCommand::EnqueueCommand(EnqueueCommandArgs {
+        let args = EnqueueCommandArgs {
             ledger_id: ledger_name,
             branch: branch.clone(),
             idempotency: idempotency_cache_key,
             request_cid,
             body_kind: BodyKind::Rebase,
             applied_at_millis: current_millis(),
-        });
+        };
 
-        match self.submit_and_await(cmd, ref_key, retry_eligible).await? {
+        match self.submit_and_await(args, ref_key, retry_eligible).await? {
             SubmissionOutcome::Waiter(WaiterOutcome::Applied(receipt)) => {
                 rebase_receipt_from(idempotency_key, branch, strategy, receipt)
             }
@@ -586,16 +633,16 @@ impl Committer for QueuedTransactor {
             })?;
 
         let retry_eligible = idempotency_cache_key.is_some();
-        let cmd = SmCommand::EnqueueCommand(EnqueueCommandArgs {
+        let args = EnqueueCommandArgs {
             ledger_id: ledger_name,
             branch,
             idempotency: idempotency_cache_key,
             request_cid,
             body_kind: BodyKind::Pushed,
             applied_at_millis: current_millis(),
-        });
+        };
 
-        match self.submit_and_await(cmd, ref_key, retry_eligible).await? {
+        match self.submit_and_await(args, ref_key, retry_eligible).await? {
             SubmissionOutcome::Waiter(WaiterOutcome::Applied(receipt)) => {
                 push_receipt_from(idempotency_key, ledger_id, receipt)
             }

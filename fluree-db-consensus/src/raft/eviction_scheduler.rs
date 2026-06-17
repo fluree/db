@@ -5,8 +5,10 @@
 //! [`Command::EvictIdempotency`]. This scheduler runs on the current
 //! leader (spawned by the same leader watcher as the
 //! [`CommitWorker`](super::commit_worker::CommitWorker)), sleeps
-//! `eviction_interval`, proposes the eviction command, then releases
-//! each returned envelope CID from its per-ledger content store.
+//! `eviction_interval`, and proposes the eviction command. The actual
+//! CAS releases happen on every node: the state-machine adapter
+//! drains `Response::EvictionApplied.released_envelopes` into a
+//! per-node release task so followers free their local blobs too.
 //!
 //! Per-process scope: a leader transition strands the loop on the
 //! former leader (the leader watcher aborts the task). The new
@@ -17,7 +19,6 @@
 
 use crate::raft::state_machine::{Command as SmCommand, Response as SmResponse};
 use crate::raft::TypeConfig;
-use fluree_db_api::Fluree;
 use openraft::Raft;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -37,16 +38,14 @@ pub const DEFAULT_EVICTION_INTERVAL: Duration = Duration::from_secs(60);
 #[derive(Clone)]
 pub struct EvictionScheduler {
     raft: Arc<Raft<TypeConfig>>,
-    fluree: Arc<Fluree>,
     interval: Duration,
     ttl: Duration,
 }
 
 impl EvictionScheduler {
-    pub fn new(raft: Arc<Raft<TypeConfig>>, fluree: Arc<Fluree>) -> Self {
+    pub fn new(raft: Arc<Raft<TypeConfig>>) -> Self {
         Self {
             raft,
-            fluree,
             interval: DEFAULT_EVICTION_INTERVAL,
             ttl: DEFAULT_IDEMPOTENCY_TTL,
         }
@@ -68,8 +67,8 @@ impl EvictionScheduler {
 
     /// Drive periodic eviction until the leader watcher aborts the
     /// task. Each tick: sleep for the interval, compute the cutoff,
-    /// propose `EvictIdempotency`, fan out CAS releases for each
-    /// returned envelope CID.
+    /// propose `EvictIdempotency`. The actual CAS release fan-out
+    /// happens inside the state-machine adapter on every node.
     pub async fn run(self) {
         loop {
             tokio::time::sleep(self.interval).await;
@@ -90,33 +89,11 @@ impl EvictionScheduler {
                 return;
             }
         };
-        match resp.data {
-            SmResponse::EvictionApplied {
-                removed,
-                released_envelopes,
-            } => {
-                if removed == 0 {
-                    return;
-                }
-                self.release_envelopes(released_envelopes).await;
-            }
-            other => warn!(
-                ?other,
+        if !matches!(resp.data, SmResponse::EvictionApplied { .. }) {
+            warn!(
+                response = ?resp.data,
                 "unexpected response from EvictIdempotency apply"
-            ),
-        }
-    }
-
-    async fn release_envelopes(&self, envelopes: Vec<(String, fluree_db_api::ContentId)>) {
-        for (ledger_id, cid) in envelopes {
-            if let Err(err) = self.fluree.content_store(&ledger_id).release(&cid).await {
-                warn!(
-                    %ledger_id,
-                    %cid,
-                    error = %err,
-                    "failed to release evicted envelope from content store"
-                );
-            }
+            );
         }
     }
 }

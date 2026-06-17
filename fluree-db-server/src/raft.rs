@@ -35,12 +35,22 @@ use fluree_db_consensus::raft::{
     waiter::WaiterMap,
 };
 use fluree_db_consensus::{NodeId, Raft, RaftConfig, RaftConfigError, RaftFatal, TypeConfig};
+use fluree_db_core::ContentId;
 use fluree_db_nameservice::LedgerEventBus;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
+
+/// Channel pair the state-machine adapter pushes evicted /
+/// admin-cleared envelope CIDs through. The receiver is consumed
+/// once by a per-node release task; on every node, that task owns
+/// the `Fluree` handle and calls `content_store(&ledger_id).release`.
+pub type ReleaseSender = UnboundedSender<(String, ContentId)>;
+pub type ReleaseReceiver = UnboundedReceiver<(String, ContentId)>;
 
 /// Per-node Raft integration. Cheap to clone; everything is `Arc`.
 #[derive(Clone)]
@@ -78,6 +88,14 @@ pub struct RaftIntegration {
     /// them during waiter resolution so transactors see staged-time
     /// detail instead of falling back to `Minimal`.
     pub staged_receipts: Arc<StagedReceiptMap>,
+    /// One-shot slot holding the [`ReleaseReceiver`] half of the
+    /// adapter's CAS release channel. Server startup
+    /// [`take_release_receiver`](Self::take_release_receiver)s the
+    /// receiver and spawns a per-node task that owns the `Fluree`
+    /// handle and dispatches releases. The slot is wrapped in
+    /// `Arc<Mutex<Option<_>>>` so `RaftIntegration` can stay `Clone`
+    /// without giving up single-consumer semantics on the receiver.
+    release_rx: Arc<Mutex<Option<ReleaseReceiver>>>,
 }
 
 impl RaftIntegration {
@@ -93,6 +111,7 @@ impl RaftIntegration {
         event_bus: Arc<LedgerEventBus>,
         waiter_map: Arc<WaiterMap>,
         staged_receipts: Arc<StagedReceiptMap>,
+        release_rx: ReleaseReceiver,
     ) -> Self {
         let forwarder = Arc::new(LeaderForwarder::new(
             Arc::clone(&raft),
@@ -107,7 +126,15 @@ impl RaftIntegration {
             event_bus,
             waiter_map,
             staged_receipts,
+            release_rx: Arc::new(Mutex::new(Some(release_rx))),
         }
+    }
+
+    /// Hand the release receiver to the caller. Returns `None` on
+    /// subsequent calls — single-consumer semantics. Server startup
+    /// calls this once and spawns a task that pulls releases off it.
+    pub async fn take_release_receiver(&self) -> Option<ReleaseReceiver> {
+        self.release_rx.lock().await.take()
     }
 
     /// One-call cluster bootstrap: open storage, wire adapters, build
@@ -128,11 +155,13 @@ impl RaftIntegration {
         let event_bus = Arc::new(LedgerEventBus::new(config.event_bus_capacity));
         let waiter_map = Arc::new(WaiterMap::new());
         let staged_receipts = Arc::new(StagedReceiptMap::new());
+        let (release_tx, release_rx) = tokio::sync::mpsc::unbounded_channel();
         let log = LogAdapter::new(Arc::clone(&storage));
         let sm = StateMachineAdapter::new(Arc::clone(&storage))
             .with_event_bus(Arc::clone(&event_bus))
             .with_waiter_map(Arc::clone(&waiter_map))
-            .with_staged_receipts(Arc::clone(&staged_receipts));
+            .with_staged_receipts(Arc::clone(&staged_receipts))
+            .with_release_sender(release_tx);
         let shared_state = sm.shared_state();
 
         let raft_cfg = Arc::new(config.raft_config.validate()?);
@@ -154,6 +183,7 @@ impl RaftIntegration {
             event_bus,
             waiter_map,
             staged_receipts,
+            release_rx,
         ))
     }
 

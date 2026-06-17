@@ -621,17 +621,24 @@ pub enum Response {
     /// [`Command::DropBranch`] succeeded. `parent_branches` is the
     /// updated child count of the dropped branch's source (or `None`
     /// if the dropped branch had no recorded parent — root or
-    /// self-healed).
+    /// self-healed). `released_envelopes` carries
+    /// `(ledger_id, request_cid)` pairs from queue entries cleared
+    /// by the admin action; the wrapper releases them on every node.
     BranchDropped {
         ledger_id: String,
         parent_branches: Option<u32>,
+        released_envelopes: Vec<(String, ContentId)>,
     },
     /// [`Command::DropBranch`] refused because the branch still has
     /// children forked from it. Caller must drop the children first.
     BranchHasChildren { ledger_id: String, children: u32 },
     /// [`Command::ResetHead`] succeeded — the branch's head, t, and
-    /// index were rewritten from the supplied snapshot.
-    HeadReset { ledger_id: String },
+    /// index were rewritten from the supplied snapshot. See
+    /// [`Self::BranchDropped`] for `released_envelopes` semantics.
+    HeadReset {
+        ledger_id: String,
+        released_envelopes: Vec<(String, ContentId)>,
+    },
     /// [`Command::RetractLedger`] flipped a branch from active to
     /// retracted.
     Retracted { ledger_id: String },
@@ -639,8 +646,12 @@ pub enum Response {
     /// already retracted, or didn't exist. Idempotent.
     AlreadyRetracted { ledger_id: String },
     /// [`Command::PurgeLedger`] removed a registered branch (any
-    /// retraction state).
-    Purged { ledger_id: String },
+    /// retraction state). See [`Self::BranchDropped`] for
+    /// `released_envelopes` semantics.
+    Purged {
+        ledger_id: String,
+        released_envelopes: Vec<(String, ContentId)>,
+    },
     /// [`Command::PurgeLedger`] was a no-op — the branch wasn't
     /// registered. Idempotent at the trait layer; carried as a
     /// distinct variant so event emission can skip it.
@@ -866,9 +877,12 @@ fn purge_ledger(
     if let Some(parent) = removed_source {
         decrement_child_count(state, &ledger_id, &parent);
     }
-    clear_queue_for_admin(state, &key, ClearReason::BranchPurged);
+    let released_envelopes = clear_queue_for_admin(state, &key, ClearReason::BranchPurged);
     if removed_ref || removed_retraction || removed_branch {
-        Response::Purged { ledger_id: full }
+        Response::Purged {
+            ledger_id: full,
+            released_envelopes,
+        }
     } else {
         Response::AlreadyPurged { ledger_id: full }
     }
@@ -973,11 +987,12 @@ fn drop_branch(
     let parent_branches = removed_source
         .as_deref()
         .map(|parent| decrement_child_count(state, &ledger_id, parent));
-    clear_queue_for_admin(state, &key, ClearReason::BranchDropped);
+    let released_envelopes = clear_queue_for_admin(state, &key, ClearReason::BranchDropped);
 
     Response::BranchDropped {
         ledger_id: full,
         parent_branches,
+        released_envelopes,
     }
 }
 
@@ -1008,8 +1023,12 @@ fn reset_head(
         // Snapshot is unborn — remove the RefEntry; the branch keeps
         // its slot on `LedgerRecord.branches`.
         state.refs.remove(&key);
-        clear_queue_for_admin(state, &key, ClearReason::BranchHeadReset);
-        return Response::HeadReset { ledger_id: full };
+        let released_envelopes =
+            clear_queue_for_admin(state, &key, ClearReason::BranchHeadReset);
+        return Response::HeadReset {
+            ledger_id: full,
+            released_envelopes,
+        };
     };
 
     let (prior_source, prior_branches) = state
@@ -1030,8 +1049,11 @@ fn reset_head(
             branches: prior_branches,
         },
     );
-    clear_queue_for_admin(state, &key, ClearReason::BranchHeadReset);
-    Response::HeadReset { ledger_id: full }
+    let released_envelopes = clear_queue_for_admin(state, &key, ClearReason::BranchHeadReset);
+    Response::HeadReset {
+        ledger_id: full,
+        released_envelopes,
+    }
 }
 
 /// Clear a per-branch queue as a side effect of a head-mutating
@@ -1041,19 +1063,29 @@ fn reset_head(
 /// `InvariantViolated`. The marker is only stamped when the queue
 /// actually held entries; an empty queue leaves the marker map
 /// alone so the `InvariantViolated` signal stays diagnostic.
+///
+/// Drained entries' `request_cid` envelopes are returned so the
+/// adapter can fan out CAS releases on every node — otherwise
+/// admin-cleared envelopes leak in the content store with no path
+/// to GC. Returns an empty vec when the queue was empty (no marker
+/// stamped, no releases owed).
 fn clear_queue_for_admin(
     state: &mut NameServiceState,
     ref_key: &RefKey,
     reason: ClearReason,
-) {
-    let had_entries = state
-        .queues
-        .remove(ref_key)
-        .map(|q| !q.is_empty())
-        .unwrap_or(false);
-    if had_entries {
-        state.recently_cleared.insert(ref_key.clone(), reason);
+) -> Vec<(String, ContentId)> {
+    let Some(queue) = state.queues.remove(ref_key) else {
+        return Vec::new();
+    };
+    if queue.is_empty() {
+        return Vec::new();
     }
+    state.recently_cleared.insert(ref_key.clone(), reason);
+    let ledger_id = format_ledger_id(&ref_key.ledger_id, &ref_key.branch);
+    queue
+        .into_iter()
+        .map(|entry| (ledger_id.clone(), entry.request_cid))
+        .collect()
 }
 
 /// Saturating decrement of a parent branch's child counter. Returns
@@ -1679,7 +1711,8 @@ mod tests {
         assert_eq!(
             resp,
             Response::Purged {
-                ledger_id: "test/db:main".into()
+                ledger_id: "test/db:main".into(),
+                released_envelopes: Vec::new(),
             }
         );
         assert!(!state.refs.contains_key(&RefKey::new("test/db", "main")));
@@ -1893,6 +1926,7 @@ mod tests {
             Response::BranchDropped {
                 ledger_id: "test/db:feature".into(),
                 parent_branches: Some(0),
+                released_envelopes: Vec::new(),
             }
         );
         assert!(!state.refs.contains_key(&RefKey::new("test/db", "feature")));
@@ -1968,6 +2002,7 @@ mod tests {
             Response::BranchDropped {
                 ledger_id: "test/db:main".into(),
                 parent_branches: None,
+                released_envelopes: Vec::new(),
             }
         );
         // Last branch on the ledger — LedgerRecord drops too.
@@ -2023,7 +2058,8 @@ mod tests {
         assert_eq!(
             resp,
             Response::HeadReset {
-                ledger_id: "test/db:main".into()
+                ledger_id: "test/db:main".into(),
+                released_envelopes: Vec::new(),
             }
         );
         let entry = state.refs.get(&RefKey::new("test/db", "main")).unwrap();
@@ -3124,7 +3160,13 @@ mod tests {
         );
         // The branch was registered via CreateLedger so the canonical
         // state genuinely had something to remove.
-        assert_eq!(resp, Response::Purged { ledger_id: "test/db:main".into() });
+        assert_eq!(
+            resp,
+            Response::Purged {
+                ledger_id: "test/db:main".into(),
+                released_envelopes: vec![("test/db:main".into(), cid(7))],
+            }
+        );
     }
 
     #[test]
