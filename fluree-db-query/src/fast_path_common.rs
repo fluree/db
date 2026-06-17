@@ -1787,68 +1787,28 @@ pub fn collect_resolved_overlay_ops(
     order: RunSortOrder,
     pred_sid: &Sid,
 ) -> Result<Option<Vec<fluree_db_binary_index::read::types::OverlayOp>>> {
-    use std::collections::HashMap;
+    // Thin policy wrapper over the single overlay producer: translate only this
+    // predicate's overlay flakes (sorted + resolved inside resolve_overlay), then
+    // defer to the generic pipeline if any flake couldn't be encoded in V3.
     let dn = ctx.dict_novelty.clone().unwrap_or_else(|| {
         Arc::new(fluree_db_core::dict_novelty::DictNovelty::new_uninitialized())
     });
-    let mut ephemeral_preds = HashMap::new();
-    let mut next_ep = store.predicate_count();
-    let mut ops = Vec::new();
-    let mut translate_failed = false;
-    let mut translate_fail_count: u32 = 0;
-
-    ctx.overlay().for_each_overlay_flake(
-        g_id,
-        crate::binary_scan::sort_order_to_index_type(order),
-        None,
-        None,
-        true,
+    let (ops, untranslated, _ephemeral) = crate::binary_scan::resolve_overlay(
+        ctx.overlay(),
+        store,
+        Some(&dn),
+        ctx.runtime_small_dicts,
         ctx.to_t,
-        &mut |flake| {
-            if flake.p != *pred_sid {
-                return;
-            }
-            match crate::binary_scan::Translation::classify(
-                crate::binary_scan::translate_one_flake_v3_pub(
-                    flake,
-                    store,
-                    Some(&dn),
-                    ctx.runtime_small_dicts,
-                    &mut ephemeral_preds,
-                    &mut next_ep,
-                    g_id,
-                ),
-            ) {
-                crate::binary_scan::Translation::Translated(op) => ops.push(op),
-                crate::binary_scan::Translation::Untranslated(reason) => {
-                    translate_failed = true;
-                    translate_fail_count = translate_fail_count.saturating_add(1);
-                    if translate_fail_count == 1 {
-                        tracing::warn!(
-                            ?reason,
-                            s = %flake.s,
-                            p = %flake.p,
-                            t = flake.t,
-                            op = flake.op,
-                            "fast-path cursor: overlay flake translation failed; disabling fast path for correctness"
-                        );
-                    }
-                }
-            }
-        },
+        g_id,
+        order,
+        Some(pred_sid),
     );
-
-    if translate_failed {
+    if !untranslated.is_empty() {
         tracing::debug!(
-            failures = translate_fail_count,
+            failures = untranslated.len(),
             "fast-path cursor: falling back due to overlay translation failures"
         );
         return Ok(None);
-    }
-
-    if !ops.is_empty() {
-        fluree_db_binary_index::read::types::sort_overlay_ops(&mut ops, order);
-        fluree_db_binary_index::read::types::resolve_overlay_ops(&mut ops);
     }
     Ok(Some(ops))
 }

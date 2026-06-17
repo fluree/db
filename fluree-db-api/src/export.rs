@@ -88,6 +88,7 @@ fn apply_time_travel(
             config.to_t,
             config.g_id,
             RunSortOrder::Spot,
+            None,
         );
         if !ops.is_empty() {
             // resolve_overlay already sorted + resolved assert/retract lifecycles

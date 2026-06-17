@@ -2032,6 +2032,7 @@ impl Operator for BinaryScanOperator {
                 ctx.to_t,
                 self.g_id,
                 order,
+                None,
             );
 
             // Extend p_sids table with novelty-only predicates so that ephemeral
@@ -2329,6 +2330,7 @@ impl Translation {
 /// and novelty-only language tags, #1273) are returned in the untranslated list
 /// for the caller's raw-flake post-pass. The ephemeral-predicate map lets
 /// callers extend their p_id → Sid tables so novelty-only predicates decode.
+#[allow(clippy::too_many_arguments)]
 pub fn resolve_overlay(
     overlay: &dyn OverlayProvider,
     store: &Arc<BinaryIndexStore>,
@@ -2337,6 +2339,7 @@ pub fn resolve_overlay(
     to_t: i64,
     g_id: GraphId,
     order: RunSortOrder,
+    predicate: Option<&Sid>,
 ) -> (Vec<OverlayOp>, Vec<Flake>, HashMap<Sid, u32>) {
     let mut ops = Vec::new();
     let mut untranslated = Vec::new();
@@ -2352,37 +2355,44 @@ pub fn resolve_overlay(
         None,
         true,
         to_t,
-        &mut |flake| match Translation::classify(translate_one_flake_v3_pub(
-            flake,
-            store,
-            dict_novelty,
-            runtime_small_dicts,
-            &mut ephemeral_preds,
-            &mut next_ephemeral_p_id,
-            g_id,
-        )) {
-            Translation::Translated(op) => ops.push(op),
-            Translation::Untranslated(reason) => {
-                // EVERY failed translation keeps the raw flake: the callers'
-                // untranslated post-pass (lifecycle-resolve, filter, stream
-                // after the cursor) makes it visible to results. `Unsupported`
-                // is the expected lane (e.g. @vector values); anything else —
-                // NotFound from a stale/detached DictNovelty, InvalidData —
-                // indicates degraded state and is warned, but the fact must
-                // not silently vanish. Dropping here previously caused
-                // disappearing properties in export under exactly the state
-                // the warning describes (same bug class fixed earlier in
-                // graph crawl). Failures only occur for identities the
-                // persisted dicts can't resolve, so the matching base rows —
-                // which always translate — are unaffected, and assert/retract
-                // pairs fail together and resolve within the raw set.
-                if reason != UntranslatedReason::Unsupported {
-                    tracing::warn!(
-                        ?reason,
-                        "overlay flake failed V3 translation; keeping raw flake"
-                    );
+        &mut |flake| {
+            if let Some(p) = predicate {
+                if flake.p != *p {
+                    return;
                 }
-                untranslated.push(flake.clone());
+            }
+            match Translation::classify(translate_one_flake_v3_pub(
+                flake,
+                store,
+                dict_novelty,
+                runtime_small_dicts,
+                &mut ephemeral_preds,
+                &mut next_ephemeral_p_id,
+                g_id,
+            )) {
+                Translation::Translated(op) => ops.push(op),
+                Translation::Untranslated(reason) => {
+                    // EVERY failed translation keeps the raw flake: the callers'
+                    // untranslated post-pass (lifecycle-resolve, filter, stream
+                    // after the cursor) makes it visible to results. `Unsupported`
+                    // is the expected lane (e.g. @vector values); anything else —
+                    // NotFound from a stale/detached DictNovelty, InvalidData —
+                    // indicates degraded state and is warned, but the fact must
+                    // not silently vanish. Dropping here previously caused
+                    // disappearing properties in export under exactly the state
+                    // the warning describes (same bug class fixed earlier in
+                    // graph crawl). Failures only occur for identities the
+                    // persisted dicts can't resolve, so the matching base rows —
+                    // which always translate — are unaffected, and assert/retract
+                    // pairs fail together and resolve within the raw set.
+                    if reason != UntranslatedReason::Unsupported {
+                        tracing::warn!(
+                            ?reason,
+                            "overlay flake failed V3 translation; keeping raw flake"
+                        );
+                    }
+                    untranslated.push(flake.clone());
+                }
             }
         },
     );
