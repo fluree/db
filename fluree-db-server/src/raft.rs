@@ -31,6 +31,7 @@ use fluree_db_consensus::raft::{
     network::{self as raft_network, HttpRaftNetworkFactory, NetworkConfig},
     state_machine_adapter::{SharedState, StateMachineAdapter},
     storage::{fs::FsRaftStorage, StorageError},
+    waiter::WaiterMap,
 };
 use fluree_db_consensus::{NodeId, Raft, RaftConfig, RaftConfigError, RaftFatal, TypeConfig};
 use fluree_db_nameservice::LedgerEventBus;
@@ -62,6 +63,11 @@ pub struct RaftIntegration {
     /// [`fluree_db_nameservice::NameServiceEvent`]s on after each
     /// successful apply.
     pub event_bus: Arc<LedgerEventBus>,
+    /// Per-process map the state-machine adapter resolves after each
+    /// queue-related apply. Shared with the
+    /// [`QueuedTransactor`](fluree_db_consensus::raft::queued_transactor::QueuedTransactor)
+    /// so submission-side registrations meet apply-side resolutions.
+    pub waiter_map: Arc<WaiterMap>,
 }
 
 impl RaftIntegration {
@@ -75,6 +81,7 @@ impl RaftIntegration {
         http_client: reqwest::Client,
         shared_state: SharedState,
         event_bus: Arc<LedgerEventBus>,
+        waiter_map: Arc<WaiterMap>,
     ) -> Self {
         let forwarder = Arc::new(LeaderForwarder::new(
             Arc::clone(&raft),
@@ -87,6 +94,7 @@ impl RaftIntegration {
             forwarder,
             shared_state,
             event_bus,
+            waiter_map,
         }
     }
 
@@ -106,9 +114,11 @@ impl RaftIntegration {
         let storage = Arc::new(FsRaftStorage::open(config.storage_path).await?);
 
         let event_bus = Arc::new(LedgerEventBus::new(config.event_bus_capacity));
+        let waiter_map = Arc::new(WaiterMap::new());
         let log = LogAdapter::new(Arc::clone(&storage));
-        let sm =
-            StateMachineAdapter::new(Arc::clone(&storage)).with_event_bus(Arc::clone(&event_bus));
+        let sm = StateMachineAdapter::new(Arc::clone(&storage))
+            .with_event_bus(Arc::clone(&event_bus))
+            .with_waiter_map(Arc::clone(&waiter_map));
         let shared_state = sm.shared_state();
 
         let raft_cfg = Arc::new(config.raft_config.validate()?);
@@ -128,6 +138,7 @@ impl RaftIntegration {
             http_client,
             shared_state,
             event_bus,
+            waiter_map,
         ))
     }
 

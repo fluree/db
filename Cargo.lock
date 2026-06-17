@@ -2638,6 +2638,7 @@ version = "4.0.4"
 dependencies = [
  "async-trait",
  "axum",
+ "dashmap",
  "fluree-db-api",
  "fluree-db-core",
  "fluree-db-ledger",
