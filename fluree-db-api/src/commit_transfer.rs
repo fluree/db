@@ -28,7 +28,7 @@ use fluree_db_binary_index::BinaryIndexStore;
 use fluree_db_core::ContentId;
 use fluree_db_core::{
     range_with_overlay, ContentAddressedWrite, ContentKind, Flake, GraphId, IndexType, Sid,
-    TXN_META_GRAPH_ID,
+    TxnGraphId, TXN_META_GRAPH_ID,
 };
 use fluree_db_core::{RangeMatch, RangeOptions, RangeTest, Storage};
 use fluree_db_core::{CODEC_FLUREE_COMMIT, CODEC_FLUREE_TXN};
@@ -167,10 +167,13 @@ impl Fluree {
         // transact's staging APIs key graph maps by raw (envelope-local) u16
         // ids; replay routing carries ledger `GraphId`s with the same
         // numbering. The conversion below makes that adoption explicit.
-        let routing_sids_raw: HashMap<u16, Sid> = routing
+        // Replay routing carries ledger `GraphId`s, but staging consumes
+        // transaction-local ids — on the replay path the two numberings
+        // coincide, so adopt the ledger numbering as txn-local here.
+        let routing_sids_raw: HashMap<TxnGraphId, Sid> = routing
             .graph_sids
             .iter()
-            .map(|(g, s)| (g.as_u16(), s.clone()))
+            .map(|(g, s)| (TxnGraphId::from_u16(g.as_u16()), s.clone()))
             .collect();
         let routing_iris_raw: rustc_hash::FxHashMap<u16, String> = routing
             .graph_iris
@@ -686,7 +689,7 @@ async fn stage_commit_flakes(
     flakes: &[Flake],
     index_config: &IndexConfig,
     policy_ctx: &PolicyContext,
-    graph_sids: &HashMap<u16, Sid>,
+    graph_sids: &HashMap<TxnGraphId, Sid>,
 ) -> std::result::Result<fluree_db_ledger::StagedLedger, PushError> {
     let mut options = fluree_db_transact::StageOptions::new()
         .with_index_config(index_config)

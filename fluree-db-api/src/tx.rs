@@ -13,7 +13,7 @@ use fluree_db_core::ledger_config::LedgerConfig;
 use fluree_db_core::DatatypeConstraint;
 use fluree_db_core::{
     range_with_overlay, ContentId, ContentKind, FlakeValue, GraphId, IndexType, RangeMatch,
-    RangeOptions, RangeTest, Sid,
+    RangeOptions, RangeTest, Sid, TxnGraphId,
 };
 use fluree_db_indexer::IndexerHandle;
 use fluree_db_ledger::{IndexConfig, LedgerState, StagedLedger};
@@ -248,7 +248,7 @@ pub(crate) struct StagedShaclContext<'a> {
     /// `GraphId → Sid` mapping used by [`validate_view_with_shacl`] to route
     /// each staged flake to the correct per-graph validator. Pass `None` to
     /// fall back to default-graph validation (see `validate_staged_nodes`).
-    pub graph_sids: Option<&'a HashMap<u16, Sid>>,
+    pub graph_sids: Option<&'a HashMap<TxnGraphId, Sid>>,
 
     /// Optional tracker for SHACL fuel accounting during validation.
     pub tracker: Option<&'a fluree_db_core::Tracker>,
@@ -693,9 +693,9 @@ async fn stage_with_config_shacl(
         None
     };
 
-    let graph_sids: HashMap<u16, Sid> = graph_delta
+    let graph_sids: HashMap<TxnGraphId, Sid> = graph_delta
         .iter()
-        .map(|(&g_id, iri)| (g_id, ns_registry.sid_for_iri(iri)))
+        .map(|(&g_id, iri)| (TxnGraphId::from_u16(g_id), ns_registry.sid_for_iri(iri)))
         .collect();
 
     apply_shacl_policy_to_staged_view(
@@ -1383,7 +1383,7 @@ fn convert_named_graphs_to_templates(
                 let (object_term, dtc) = convert_object(obj, &block.prefixes, ns_registry)?;
                 let mut template =
                     TripleTemplate::new(subject_term.clone(), predicate_term.clone(), object_term);
-                template = template.with_graph_id(g_id);
+                template = template.with_graph_id(TxnGraphId::from_u16(g_id));
                 if let Some(dtc) = dtc {
                     template = template.with_dtc(dtc);
                 }

@@ -6,7 +6,7 @@
 use crate::error::{Result, TransactError};
 use crate::ir::{TemplateTerm, TripleTemplate};
 use crate::namespace::NamespaceRegistry;
-use fluree_db_core::{Flake, FlakeMeta, FlakeValue, Sid};
+use fluree_db_core::{Flake, FlakeMeta, FlakeValue, Sid, TxnGraphId};
 use fluree_db_query::{Batch, Binding};
 use fluree_vocab::namespaces::{FLUREE_DB, JSON_LD, OGC_GEO, RDF, XSD};
 use once_cell::sync::Lazy;
@@ -61,7 +61,7 @@ pub struct FlakeGenerator<'a> {
     /// When a template has a `graph_id`, this map provides the corresponding
     /// graph Sid for `Flake::new_in_graph()`. Graph IDs 0 (default) and 1 (txn-meta)
     /// are reserved and should not appear in this map.
-    graph_sids: HashMap<u16, Sid>,
+    graph_sids: HashMap<TxnGraphId, Sid>,
 }
 
 impl<'a> FlakeGenerator<'a> {
@@ -85,7 +85,7 @@ impl<'a> FlakeGenerator<'a> {
     /// The map should contain entries for user-defined named graphs (g_id >= 2).
     /// Templates with a `graph_id` matching an entry in this map will produce
     /// flakes in the corresponding named graph.
-    pub fn with_graph_sids(mut self, graph_sids: HashMap<u16, Sid>) -> Self {
+    pub fn with_graph_sids(mut self, graph_sids: HashMap<TxnGraphId, Sid>) -> Self {
         self.graph_sids = graph_sids;
         self
     }
@@ -208,8 +208,9 @@ impl<'a> FlakeGenerator<'a> {
         let flake = if let Some(g_id) = template.graph_id {
             let g_sid = self.graph_sids.get(&g_id).ok_or_else(|| {
                 TransactError::FlakeGeneration(format!(
-                    "template references graph_id {g_id} but no graph Sid was provided; \
-                     this indicates a bug in graph delta/sid wiring"
+                    "template references graph_id {} but no graph Sid was provided; \
+                     this indicates a bug in graph delta/sid wiring",
+                    g_id.as_u16()
                 ))
             })?;
             Flake::new_in_graph(g_sid.clone(), s, p, o, dt, self.t, op, meta)

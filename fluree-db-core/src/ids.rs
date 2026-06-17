@@ -121,6 +121,81 @@ impl fmt::Display for GraphId {
 }
 
 // ---------------------------------------------------------------------------
+// TxnGraphId
+// ---------------------------------------------------------------------------
+
+/// Transaction-local graph ID (u16).
+///
+/// Scoped to a single transaction envelope: `0` = default graph, `1` = txn-meta,
+/// `2+` = named graphs registered in this transaction's `graph_delta`. It is
+/// **not ledger-stable** — the same graph IRI can map to a different [`GraphId`]
+/// in the ledger's graph registry. The correct translation is
+/// `txn-local id → graph IRI (Txn.graph_delta) → ledger GraphId (GraphRegistry)`;
+/// do it before any per-graph index/range query.
+///
+/// A distinct newtype (not [`GraphId`], not a bare `u16`) so the transaction-local
+/// space cannot be silently cross-assigned with ledger graph ids — the confusion
+/// class surfaced during the GraphId migration. `#[repr(transparent)]` + `Copy`:
+/// zero runtime cost. Wire forms (the commit envelope's `graph_delta`) store the
+/// raw `u16` via `as_u16`/`from_u16` at the codec boundary.
+#[derive(
+    Copy,
+    Clone,
+    Eq,
+    PartialEq,
+    Ord,
+    PartialOrd,
+    Hash,
+    Debug,
+    Default,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+#[repr(transparent)]
+#[serde(transparent)]
+pub struct TxnGraphId(pub u16);
+
+impl TxnGraphId {
+    /// The default graph (id 0).
+    pub const DEFAULT: TxnGraphId = TxnGraphId(0);
+    /// The transaction-metadata graph (id 1).
+    pub const TXN_META: TxnGraphId = TxnGraphId(1);
+
+    #[inline]
+    pub const fn as_u16(self) -> u16 {
+        self.0
+    }
+    #[inline]
+    pub const fn from_u16(v: u16) -> Self {
+        Self(v)
+    }
+    /// For indexing per-graph tables.
+    #[inline]
+    pub fn as_usize(self) -> usize {
+        self.0 as usize
+    }
+
+    /// Adopt this transaction-local id **directly** as a ledger [`GraphId`],
+    /// without IRI translation.
+    ///
+    /// Sound only on the novelty-routing path, where staging adopts the
+    /// transaction-local numbering as the ledger numbering for the commit being
+    /// staged (see `build_reverse_graph_lookup`). Anywhere the two numberings
+    /// can differ (e.g. upsert against pre-existing named graphs), translate via
+    /// the graph IRI + `GraphRegistry` instead — never call this.
+    #[inline]
+    pub fn adopt_as_ledger(self) -> GraphId {
+        GraphId(self.0)
+    }
+}
+
+impl fmt::Display for TxnGraphId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "TxnGraphId({})", self.0)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // TxnT
 // ---------------------------------------------------------------------------
 

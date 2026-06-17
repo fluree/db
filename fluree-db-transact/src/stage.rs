@@ -17,7 +17,7 @@ use crate::namespace::NamespaceRegistry;
 use fluree_db_core::tracking::schedule::TXN_BASELINE_MICRO_FUEL;
 use fluree_db_core::OverlayProvider;
 use fluree_db_core::Tracker;
-use fluree_db_core::{Flake, FlakeValue, GraphId, NsCode, Sid};
+use fluree_db_core::{Flake, FlakeValue, GraphId, NsCode, Sid, TxnGraphId};
 use fluree_db_ledger::{IndexConfig, LedgerState, StagedLedger};
 use fluree_db_policy::{
     is_schema_flake, populate_class_cache, PolicyContext, PolicyDecision, PolicyError,
@@ -49,10 +49,10 @@ use fluree_db_shacl::{ShaclCache, ShaclEngine, ValidationReport};
 /// that the `GraphId` newtype now makes visible instead of implicit. The
 /// upsert path translates txn-local → ledger ids explicitly where the two
 /// can differ (see `generate_upsert_deletions`).
-fn build_reverse_graph_lookup(graph_sids: &HashMap<u16, Sid>) -> HashMap<Sid, GraphId> {
+fn build_reverse_graph_lookup(graph_sids: &HashMap<TxnGraphId, Sid>) -> HashMap<Sid, GraphId> {
     graph_sids
         .iter()
-        .map(|(&g_id, sid)| (sid.clone(), GraphId(g_id)))
+        .map(|(&g_id, sid)| (sid.clone(), g_id.adopt_as_ledger()))
         .collect()
 }
 
@@ -98,7 +98,7 @@ pub struct StageOptions<'a> {
     /// named-graph flakes are present, `stage_flakes` will return an error.
     ///
     /// The normal `stage()` path builds this internally from `txn.graph_delta`.
-    pub graph_sids: Option<&'a HashMap<u16, Sid>>,
+    pub graph_sids: Option<&'a HashMap<TxnGraphId, Sid>>,
 }
 
 impl<'a> StageOptions<'a> {
@@ -126,7 +126,7 @@ impl<'a> StageOptions<'a> {
     }
 
     /// Set the graph routing map for named-graph flakes
-    pub fn with_graph_sids(mut self, graph_sids: &'a HashMap<u16, Sid>) -> Self {
+    pub fn with_graph_sids(mut self, graph_sids: &'a HashMap<TxnGraphId, Sid>) -> Self {
         self.graph_sids = Some(graph_sids);
         self
     }
@@ -238,10 +238,10 @@ pub async fn stage(
         let txn_id = generate_txn_id();
 
         // Convert graph_delta (g_id -> IRI) to graph_sids (g_id -> Sid) for named graph support
-        let graph_sids: HashMap<u16, Sid> = txn
+        let graph_sids: HashMap<TxnGraphId, Sid> = txn
             .graph_delta
             .iter()
-            .map(|(&g_id, iri)| (g_id, ns_registry.sid_for_iri(iri)))
+            .map(|(&g_id, iri)| (TxnGraphId::from_u16(g_id), ns_registry.sid_for_iri(iri)))
             .collect();
         // Build reverse graph routing for novelty application.
         //
@@ -1294,7 +1294,7 @@ async fn generate_upsert_deletions(
     ledger: &LedgerState,
     txn: &Txn,
     new_t: i64,
-    graph_sids: &std::collections::HashMap<u16, Sid>,
+    graph_sids: &std::collections::HashMap<TxnGraphId, Sid>,
 ) -> Result<Vec<fluree_db_core::Flake>> {
     use fluree_db_binary_index::BinaryGraphView;
     use fluree_db_core::Flake;
@@ -1303,7 +1303,7 @@ async fn generate_upsert_deletions(
 
     // Collect unique (subject, predicate, graph_id) tuples from insert templates
     // Include graph_id to ensure retractions are created in the correct graph
-    let mut spg_tuples: HashSet<(Sid, Sid, Option<u16>)> = HashSet::new();
+    let mut spg_tuples: HashSet<(Sid, Sid, Option<TxnGraphId>)> = HashSet::new();
     for template in &txn.insert_templates {
         if let (TemplateTerm::Sid(s), TemplateTerm::Sid(p)) =
             (&template.subject, &template.predicate)
@@ -1340,8 +1340,10 @@ async fn generate_upsert_deletions(
         //
         // txn_local_g_id -> graph IRI (txn.graph_delta) -> ledger g_id (GraphRegistry)
         let ledger_g_id: Option<GraphId> = graph_id.and_then(|txn_g_id| {
+            // `graph_delta` is the wire map (raw txn-local u16 → IRI); index it with
+            // the raw code, then resolve the IRI to a ledger-stable GraphId.
             txn.graph_delta
-                .get(&txn_g_id)
+                .get(&txn_g_id.as_u16())
                 .and_then(|iri| ledger.snapshot.graph_registry.graph_id_for_iri(iri))
         });
 
@@ -1391,8 +1393,8 @@ async fn generate_upsert_deletions(
             Some(txn_g_id) => Some(
                 graph_sids.get(&txn_g_id).cloned().ok_or_else(|| {
                     TransactError::FlakeGeneration(format!(
-                        "upsert deletion generation references graph_id {txn_g_id} but no graph Sid was provided; \
-                         this indicates a bug in graph delta/sid wiring"
+                        "upsert deletion generation references graph_id {} but no graph Sid was provided; \
+                         this indicates a bug in graph delta/sid wiring", txn_g_id.as_u16()
                     ))
                 })?,
             ),
@@ -1537,9 +1539,9 @@ pub async fn stage_with_shacl(
     // Rebuild graph_sids from the cloned graph_delta + returned ns_registry.
     // These IRIs were already resolved during stage(), so sid_for_iri will find
     // the prefix already registered — no new allocations.
-    let graph_sids: HashMap<u16, Sid> = graph_delta
+    let graph_sids: HashMap<TxnGraphId, Sid> = graph_delta
         .iter()
-        .map(|(&g_id, iri)| (g_id, ns_registry.sid_for_iri(iri)))
+        .map(|(&g_id, iri)| (TxnGraphId::from_u16(g_id), ns_registry.sid_for_iri(iri)))
         .collect();
 
     // Create SHACL engine from cache
@@ -1608,7 +1610,7 @@ impl ShaclValidationOutcome {
 pub async fn validate_view_with_shacl(
     view: &StagedLedger,
     shacl_cache: &ShaclCache,
-    graph_sids: Option<&HashMap<u16, Sid>>,
+    graph_sids: Option<&HashMap<TxnGraphId, Sid>>,
     tracker: Option<&fluree_db_core::Tracker>,
     per_graph_policy: Option<&HashMap<GraphId, ShaclGraphPolicy>>,
 ) -> Result<ShaclValidationOutcome> {
@@ -1663,7 +1665,7 @@ pub async fn validate_view_with_shacl(
 async fn validate_staged_nodes(
     view: &StagedLedger,
     engine: &ShaclEngine,
-    graph_sids: Option<&HashMap<u16, Sid>>,
+    graph_sids: Option<&HashMap<TxnGraphId, Sid>>,
     tracker: Option<&fluree_db_core::Tracker>,
     enabled_graphs: Option<&HashSet<GraphId>>,
 ) -> Result<ValidationReport> {

@@ -18,7 +18,7 @@
 //!   not match patterns.
 
 use fluree_db_core::DatatypeConstraint;
-use fluree_db_core::{FlakeValue, Sid};
+use fluree_db_core::{FlakeValue, Sid, TxnGraphId};
 use fluree_db_novelty::TxnMetaEntry;
 use fluree_db_query::parse::UnresolvedPattern;
 use fluree_db_query::{VarId, VarRegistry};
@@ -332,8 +332,9 @@ pub struct TripleTemplate {
     /// IMPORTANT: this ID is scoped to the transaction envelope (see `Txn.graph_delta`).
     /// It is **not** ledger-stable and must be translated via:
     /// `txn_local_id -> graph IRI (Txn.graph_delta) -> ledger GraphId (GraphRegistry)`
-    /// before doing any per-graph index/range queries.
-    pub graph_id: Option<u16>,
+    /// before doing any per-graph index/range queries. The [`TxnGraphId`] newtype
+    /// keeps it from being cross-assigned with a ledger `GraphId`.
+    pub graph_id: Option<TxnGraphId>,
 }
 
 impl TripleTemplate {
@@ -366,7 +367,7 @@ impl TripleTemplate {
     /// - `0`: default graph
     /// - `1`: txn-meta graph (reserved for commit metadata)
     /// - `2+`: user-defined named graphs
-    pub fn with_graph_id(mut self, graph_id: u16) -> Self {
+    pub fn with_graph_id(mut self, graph_id: TxnGraphId) -> Self {
         self.graph_id = Some(graph_id);
         self
     }

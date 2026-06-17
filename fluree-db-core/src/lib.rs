@@ -111,7 +111,7 @@ pub use graph_registry::{
 };
 pub use ids::{
     DatatypeDictId, GraphId, LangId, ListIndex, PredicateId, RuntimeDatatypeId, RuntimePredicateId,
-    StringId, TxnT,
+    StringId, TxnGraphId, TxnT,
 };
 pub use index_schema::{IndexSchema, SchemaPredicateInfo, SchemaPredicates};
 pub use index_stats::{

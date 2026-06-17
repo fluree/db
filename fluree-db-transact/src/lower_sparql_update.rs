@@ -40,6 +40,7 @@ use std::sync::Arc;
 
 use fluree_db_core::DatatypeConstraint;
 use fluree_db_core::FlakeValue;
+use fluree_db_core::TxnGraphId;
 use fluree_db_query::parse::{
     LiteralValue, UnresolvedDatatypeConstraint, UnresolvedPattern, UnresolvedTerm,
     UnresolvedTriplePattern,
@@ -128,9 +129,9 @@ impl TemplateGraphIds {
         }
     }
 
-    fn get_or_assign(&mut self, iri: String) -> u16 {
+    fn get_or_assign(&mut self, iri: String) -> TxnGraphId {
         if let Some(id) = self.iri_to_local.get(&iri) {
-            return *id;
+            return TxnGraphId::from_u16(*id);
         }
         let id = self.next;
         self.next = self
@@ -138,8 +139,9 @@ impl TemplateGraphIds {
             .checked_add(1)
             .expect("txn-local graph id overflow");
         self.iri_to_local.insert(iri.clone(), id);
+        // `delta` is the wire form persisted in the commit envelope — keep raw u16.
         self.delta.insert(id, iri);
-        id
+        TxnGraphId::from_u16(id)
     }
 
     fn delta(&self) -> FxHashMap<u16, String> {
@@ -462,7 +464,7 @@ fn lower_modify(
         Vec::new()
     };
 
-    let default_template_graph_id: Option<u16> = with_graph_iri
+    let default_template_graph_id: Option<TxnGraphId> = with_graph_iri
         .as_ref()
         .map(|iri| graph_ids.get_or_assign(iri.clone()));
 
@@ -528,7 +530,7 @@ fn lower_quad_pattern_to_templates(
     vars: &mut VarRegistry,
     bnodes: &mut BlankNodeCounter,
     graph_ids: &mut TemplateGraphIds,
-    default_graph_id: Option<u16>,
+    default_graph_id: Option<TxnGraphId>,
 ) -> Result<Vec<TripleTemplate>, LowerError> {
     let mut out: Vec<TripleTemplate> = Vec::new();
     for el in elements {
