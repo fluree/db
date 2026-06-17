@@ -22,10 +22,14 @@
 //! 1. **Schema bypass**: Schema flakes (rdfs:subClassOf, etc.) always allowed
 //! 2. **Candidate collection**: Policies gathered in order (property → subject → default)
 //! 3. **Class filtering**: Class policies filtered by subject membership
-//! 4. **Required subset**: If any `f:required` policy applies, only evaluate required policies
-//! 5. **Ordered evaluation**: Return `true` on first `Allow` or successful `Query`
-//! 6. **No short-circuit on Deny**: `Deny` continues to next policy, doesn't fail immediately
-//! 7. **Default fallback**: If no policies match, use `default_allow` setting
+//! 4. **Required subset**: if any `f:required` policy applies, only required
+//!    policies are evaluated (non-required allows cannot override a gate)
+//! 5. **Deny overrides**: an explicit `f:allow: false` denies immediately
+//! 6. **Combining**: required policies are AND gates — *every* required policy
+//!    must grant, so a missing allow or an `f:query` returning no rows denies
+//!    regardless of order; non-required policies use allow-overrides, where the
+//!    first `Allow` (or passing `f:query`) grants
+//! 7. **Default fallback**: if no policies match, use `default_allow` setting
 //!
 //! # Usage
 //!

@@ -225,7 +225,7 @@ Two phases: load the policy set once per request; apply it to each touched flake
 - **Target policies whenever possible.** A policy with `f:onProperty` only runs against flakes whose predicate matches. Default policies (no targeting) run against every flake.
 - **Keep `f:query` cheap.** It runs once per flake-target. Lean on identity-side properties already loaded (`@type`, `f:policyClass`, role flags) rather than deep traversals.
 - **Avoid deep recursion in `f:query`.** Each level of indirection multiplies the per-flake cost.
-- **Required policies short-circuit.** If a required policy denies, no further required policies are checked for that flake.
+- **Required policies short-circuit on the first failed gate.** Required policies are AND gates — every one must grant. As soon as any required gate fails (an explicit deny, or an `f:query` returning no rows), the flake is denied and the remaining required policies are skipped.
 - **Targeted policies keep fast paths fast.** Cardinality and scalar-aggregate fast paths (e.g. a bare `COUNT` over a single predicate) still answer directly from index metadata when the active policy provably cannot restrict the scanned predicate — a policy that only targets `ex:salary` does not slow a `COUNT` over `schema:name`. A policy that *could* apply to the scanned predicate (including any default/subject-targeted policy) forces the per-flake filtered scan instead. This is another reason to prefer targeted policies.
 
 For complex deployments, the [explain plan](../query/explain.md) shows whether a query is dominated by policy filtering and which policies contribute.

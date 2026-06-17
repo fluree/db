@@ -471,3 +471,85 @@ async fn policy_property_path_filters_hidden_edges() {
         "property path must not traverse hidden edges; got: {jsonld:#?}"
     );
 }
+
+/// C1 regression: required policies are AND gates. When two REQUIRED view
+/// policies target the same flake — one `f:allow: true` and one `f:query` that
+/// returns no rows — access must be DENIED regardless of policy order. The old
+/// combining algorithm returned on the first Allow (OR semantics), so a required
+/// failing query could be bypassed by a co-located required allow that happened
+/// to be evaluated first (order-dependent fail-open).
+#[tokio::test]
+async fn required_policies_are_and_gated() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "policy/required-and:main";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let seed = json!({
+        "@context": {"ex": "http://example.org/ns/"},
+        "@graph": [{"@id": "ex:item1", "@type": "ex:Item", "ex:secret": "classified"}]
+    });
+    fluree.insert(ledger0, &seed).await.unwrap();
+
+    let req_allow = json!({
+        "@id": "ex:reqAllow",
+        "f:required": true,
+        "f:onProperty": [{"@id": "http://example.org/ns/secret"}],
+        "f:action": "f:view",
+        "f:allow": true
+    });
+    // A required gate whose f:query never matches → returns no rows → a gate
+    // that "applied but did not permit", so access must be denied.
+    let req_query_false = json!({
+        "@id": "ex:reqQueryFalse",
+        "f:required": true,
+        "f:onProperty": [{"@id": "http://example.org/ns/secret"}],
+        "f:action": "f:view",
+        "f:query": serde_json::to_string(&json!({
+            "where": {"@id": "?$this", "http://example.org/ns/nonexistent": "?x"}
+        })).unwrap()
+    });
+
+    // Order A: [allow, query-false] — the old code returned at the first allow.
+    let q_a = json!({
+        "@context": {"ex": "http://example.org/ns/"},
+        "from": ledger_id,
+        "opts": {"policy": [req_allow.clone(), req_query_false.clone()], "default-allow": false},
+        "select": "?secret",
+        "where": {"@id": "ex:item1", "http://example.org/ns/secret": "?secret"}
+    });
+    let rows_a = normalize_rows(
+        &fluree
+            .query_connection(&q_a)
+            .await
+            .expect("query A")
+            .to_jsonld(&fluree.ledger(ledger_id).await.unwrap().snapshot)
+            .unwrap(),
+    );
+    assert_eq!(
+        rows_a,
+        normalize_rows(&json!([])),
+        "a failing required f:query must deny even after a required allow, got {rows_a:?}"
+    );
+
+    // Order B: [query-false, allow] — must also deny (order-independent).
+    let q_b = json!({
+        "@context": {"ex": "http://example.org/ns/"},
+        "from": ledger_id,
+        "opts": {"policy": [req_query_false, req_allow], "default-allow": false},
+        "select": "?secret",
+        "where": {"@id": "ex:item1", "http://example.org/ns/secret": "?secret"}
+    });
+    let rows_b = normalize_rows(
+        &fluree
+            .query_connection(&q_b)
+            .await
+            .expect("query B")
+            .to_jsonld(&fluree.ledger(ledger_id).await.unwrap().snapshot)
+            .unwrap(),
+    );
+    assert_eq!(
+        rows_b,
+        normalize_rows(&json!([])),
+        "required AND gate must be order-independent, got {rows_b:?}"
+    );
+}
