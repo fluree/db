@@ -227,6 +227,18 @@ pub enum QueuedRequest {
     /// worker decodes via `Fluree::prepare_push`, advances the head
     /// to the chain's final commit.
     Push(QueuedPush),
+    /// `revert` — selection + conflict strategy. The worker
+    /// re-runs `Fluree::prepare_revert` and advances the head to
+    /// the resulting inverse commit (or NoOp short-circuits when
+    /// the conflict strategy drops every reverted flake).
+    Revert(QueuedRevert),
+    /// `merge` — source / target branches + conflict strategy.
+    /// The worker re-runs `Fluree::prepare_merge` and advances the
+    /// target branch's head.
+    Merge(QueuedMerge),
+    /// `rebase` — branch + conflict strategy. The worker re-runs
+    /// `Fluree::prepare_rebase` and advances the branch's head.
+    Rebase(QueuedRebase),
 }
 
 impl QueuedRequest {
@@ -279,6 +291,36 @@ pub struct QueuedPush {
     pub commits: Vec<Vec<u8>>,
     pub blobs: HashMap<String, Vec<u8>>,
     pub governance: GovernanceOptions,
+}
+
+/// Revert-side envelope payload. Mirrors the fields of
+/// [`RevertRequest`] the worker needs to re-run `prepare_revert`. The
+/// branch + ledger come from the `EnqueueCommandArgs` shell so we
+/// don't duplicate them in the envelope.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueuedRevert {
+    pub selection: RevertSelection,
+    pub strategy: ConflictStrategy,
+}
+
+/// Merge-side envelope payload. The queue entry rides on the target
+/// branch (the one whose head the merge mutates); the source branch
+/// is named here. When `target_branch` is `None`, the worker resolves
+/// it the same way the legacy committer does — falling back to the
+/// source's parent branch.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueuedMerge {
+    pub source_branch: String,
+    pub target_branch: Option<String>,
+    pub strategy: ConflictStrategy,
+}
+
+/// Rebase-side envelope payload. The queue entry rides on the branch
+/// being rebased (the one whose head shifts to the source's HEAD plus
+/// replayed commits).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueuedRebase {
+    pub strategy: ConflictStrategy,
 }
 
 /// Error encoding or decoding a [`QueuedRequest`].

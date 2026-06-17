@@ -25,8 +25,14 @@ use crate::raft::state_machine::{
 };
 use crate::raft::state_machine_adapter::SharedState;
 use crate::raft::TypeConfig;
-use crate::{QueuedPush, QueuedRequest, QueuedTransact, SubmissionError, TransactionBody};
-use fluree_db_api::{ApiError, Base64Bytes, Fluree, PushCommitsRequest, StagedPush};
+use crate::{
+    QueuedMerge, QueuedPush, QueuedRebase, QueuedRequest, QueuedRevert, QueuedTransact,
+    SubmissionError, TransactionBody,
+};
+use fluree_db_api::{
+    ApiError, Base64Bytes, Fluree, PushCommitsRequest, StagedMerge, StagedPush, StagedRebase,
+    StagedRevert,
+};
 use fluree_db_core::ContentId;
 use fluree_db_ledger::IndexConfig;
 use fluree_db_nameservice::CommitPublisher;
@@ -124,6 +130,9 @@ impl CommitWorker {
         let (commit_id, commit_t) = match envelope {
             QueuedRequest::Transact(transact) => self.stage_and_persist(ref_key, transact).await?,
             QueuedRequest::Push(push) => self.process_push(ref_key, push).await?,
+            QueuedRequest::Revert(revert) => self.process_revert(ref_key, revert).await?,
+            QueuedRequest::Merge(merge) => self.process_merge(ref_key, merge).await?,
+            QueuedRequest::Rebase(rebase) => self.process_rebase(ref_key, rebase).await?,
         };
         self.publish_head_advance(ref_key, commit_id, commit_t).await
     }
@@ -247,6 +256,88 @@ impl CommitWorker {
         Ok((commit_cid, commit_t))
     }
 
+    /// Re-stage the revert worker-side, write the inverse commit
+    /// blob to CAS, finalize local state, and return the new head
+    /// identity. NoOp short-circuits (the conflict strategy dropped
+    /// every reverted flake) republish the existing head so the
+    /// queue entry completes cleanly without advancing — `ApplyHead`
+    /// against the same head is a stale-write that the state machine
+    /// surfaces via `QueueDesync::WrongFront` only if another
+    /// transactor jumped ahead, which is exactly the race the queue
+    /// already serializes against.
+    async fn process_revert(
+        &self,
+        ref_key: &RefKey,
+        revert: QueuedRevert,
+    ) -> Result<(ContentId, i64), WorkerError> {
+        use fluree_db_api::GuardedStagedCommit;
+
+        let QueuedRevert {
+            selection,
+            strategy,
+        } = revert;
+
+        let ledger_name = ref_key.ledger_id.clone();
+        let branch = ref_key.branch.clone();
+        let StagedRevert {
+            rollback_snapshot: _,
+            current_head_t,
+            current_head_id,
+            commit,
+            ..
+        } = self
+            .fluree
+            .prepare_revert(&ledger_name, &branch, selection, strategy)
+            .await
+            .map_err(|e| stage_failure(&format!("prepare_revert failed: {e}")))?;
+
+        let Some(GuardedStagedCommit {
+            write_guard,
+            staged: staged_commit,
+        }) = commit
+        else {
+            // NoOp short-circuit: nothing changes. Return the current
+            // head so `publish_commit` reads the same value the state
+            // machine already holds — the apply records the same
+            // head it already had, the queue entry completes, no
+            // observable mutation.
+            return Ok((current_head_id, current_head_t));
+        };
+
+        let commit_cid = staged_commit
+            .commit
+            .id
+            .clone()
+            .expect("prepare_revert guarantees commit.id is set");
+        let commit_t = staged_commit.commit.t;
+
+        let ledger_id = format_full_ledger_id(ref_key);
+        let content_store = self.fluree.content_store(&ledger_id);
+        content_store
+            .put_with_id(&commit_cid, &staged_commit.commit_bytes)
+            .await
+            .map_err(|e| stage_failure(&format!("revert commit blob write failed: {e}")))?;
+        for (cid, bytes) in &staged_commit.referenced_bytes {
+            content_store
+                .put_with_id(cid, bytes)
+                .await
+                .map_err(|e| stage_failure(&format!("revert referenced blob write failed: {e}")))?;
+        }
+
+        let (_receipt, new_state) = staged_commit
+            .finalize_state()
+            .map_err(|e| stage_failure(&format!("revert finalize_state failed: {e}")))?;
+        if let Some(guard) = write_guard {
+            let needs_reindex = new_state.should_reindex(&self.index_config);
+            self.fluree
+                .finalize_commit(guard, new_state, commit_t, needs_reindex)
+                .await
+                .map_err(api_error_to_stage)?;
+        }
+
+        Ok((commit_cid, commit_t))
+    }
+
     /// Decode the queued push, hand it to `Fluree::prepare_push` for
     /// validation + CAS persistence + local state derivation, then
     /// finalize through the held write guard so this node's cache
@@ -285,6 +376,155 @@ impl CommitWorker {
             .map_err(api_error_to_stage)?;
 
         Ok((new_head_id, new_head_t))
+    }
+
+    /// Re-stage the merge worker-side. Fast-forward merges have no
+    /// new commit body (the source's commits are already in the
+    /// target namespace from the build phase); general merges write
+    /// the merge commit blob. Either path produces a `(new_head_id,
+    /// new_head_t)` pair for the publisher.
+    async fn process_merge(
+        &self,
+        ref_key: &RefKey,
+        merge: QueuedMerge,
+    ) -> Result<(ContentId, i64), WorkerError> {
+        use fluree_db_api::GuardedStagedCommit;
+
+        let QueuedMerge {
+            source_branch,
+            target_branch,
+            strategy,
+        } = merge;
+        let ledger_name = ref_key.ledger_id.clone();
+        let StagedMerge {
+            target,
+            target_id,
+            new_head_id,
+            new_head_t,
+            commit,
+            ..
+        } = self
+            .fluree
+            .prepare_merge(
+                &ledger_name,
+                &source_branch,
+                target_branch.as_deref(),
+                strategy,
+            )
+            .await
+            .map_err(|e| stage_failure(&format!("prepare_merge failed: {e}")))?;
+
+        // Defensive: if the worker resolves a different target than
+        // the queue entry's branch, the transactor and worker
+        // disagree about which queue the entry belongs on. Poison
+        // rather than advance the wrong branch.
+        if target != ref_key.branch {
+            return Err(WorkerError::Stage(PoisonReason::BodyMalformed {
+                error: format!(
+                    "queue entry on branch {} but prepare_merge resolved target to {target}",
+                    ref_key.branch
+                ),
+            }));
+        }
+
+        if let Some(GuardedStagedCommit {
+            write_guard,
+            staged,
+        }) = commit
+        {
+            let commit_cid = staged
+                .commit
+                .id
+                .clone()
+                .expect("build_merge_general guarantees commit.id is set");
+            let content_store = self.fluree.content_store(&target_id);
+            content_store
+                .put_with_id(&commit_cid, &staged.commit_bytes)
+                .await
+                .map_err(|e| stage_failure(&format!("merge commit blob write failed: {e}")))?;
+            for (cid, bytes) in &staged.referenced_bytes {
+                content_store.put_with_id(cid, bytes).await.map_err(|e| {
+                    stage_failure(&format!("merge referenced blob write failed: {e}"))
+                })?;
+            }
+            let (_receipt, new_state) = staged
+                .finalize_state()
+                .map_err(|e| stage_failure(&format!("merge finalize_state failed: {e}")))?;
+            if let Some(guard) = write_guard {
+                let needs_reindex = new_state.should_reindex(&self.index_config);
+                self.fluree
+                    .finalize_commit(guard, new_state, new_head_t, needs_reindex)
+                    .await
+                    .map_err(api_error_to_stage)?;
+            }
+        }
+
+        Ok((new_head_id, new_head_t))
+    }
+
+    /// Re-stage the rebase worker-side. Writes any replay blobs to
+    /// CAS, finalizes local state, and returns the head identity to
+    /// publish. No-op rebases (every conflicting commit dropped by
+    /// `Skip`, or every replay had empty flakes) republish the
+    /// pre-rebase head so the queue entry completes without
+    /// observable mutation.
+    async fn process_rebase(
+        &self,
+        ref_key: &RefKey,
+        rebase: QueuedRebase,
+    ) -> Result<(ContentId, i64), WorkerError> {
+        let QueuedRebase { strategy } = rebase;
+        let ledger_name = ref_key.ledger_id.clone();
+        let branch = ref_key.branch.clone();
+        let StagedRebase {
+            branch_id,
+            pre_rebase_head_id,
+            pre_rebase_head_t,
+            new_head_id,
+            new_head_t,
+            write_guard,
+            final_state,
+            pending_replays,
+            ..
+        } = self
+            .fluree
+            .prepare_rebase(&ledger_name, &branch, strategy)
+            .await
+            .map_err(|e| stage_failure(&format!("prepare_rebase failed: {e}")))?;
+
+        // No advance: every replay was skipped or had no effect.
+        // Republish the pre-rebase head so the queue entry completes
+        // without observable mutation. If the branch was at genesis
+        // with no head to fall back to, the situation is anomalous
+        // — poison rather than fabricate a head.
+        let (advance_to, advance_t) = match (new_head_id, pre_rebase_head_id) {
+            (Some(head), _) => (head, new_head_t),
+            (None, Some(head)) => (head, pre_rebase_head_t),
+            (None, None) => {
+                return Err(WorkerError::Stage(PoisonReason::WorkerPanic {
+                    message: "rebase produced no advance and the branch had no pre-rebase head"
+                        .into(),
+                }));
+            }
+        };
+
+        let content_store = self.fluree.content_store(&branch_id);
+        for replay in &pending_replays {
+            content_store
+                .put_with_id(&replay.commit_id, &replay.commit_bytes)
+                .await
+                .map_err(|e| stage_failure(&format!("rebase commit blob write failed: {e}")))?;
+        }
+
+        if let Some(guard) = write_guard {
+            let needs_reindex = final_state.should_reindex(&self.index_config);
+            self.fluree
+                .finalize_commit(guard, final_state, advance_t, needs_reindex)
+                .await
+                .map_err(api_error_to_stage)?;
+        }
+
+        Ok((advance_to, advance_t))
     }
 
     async fn publish_head_advance(
@@ -402,6 +642,9 @@ fn check_envelope_kind(
     let expected = match envelope {
         QueuedRequest::Transact(t) => BodyKind::from(&t.body),
         QueuedRequest::Push(_) => BodyKind::Pushed,
+        QueuedRequest::Revert(_) => BodyKind::Revert,
+        QueuedRequest::Merge(_) => BodyKind::Merge,
+        QueuedRequest::Rebase(_) => BodyKind::Rebase,
     };
     if expected == body_kind {
         Ok(())

@@ -272,6 +272,18 @@ pub enum BodyKind {
     /// already present in CAS. Worker verifies the chain rather
     /// than restaging.
     Pushed,
+    /// Body decodes as a `QueuedRevert` carrying selection +
+    /// conflict strategy. Worker re-runs `prepare_revert` and
+    /// advances the head to the inverse commit.
+    Revert,
+    /// Body decodes as a `QueuedMerge` carrying source / target
+    /// branches + conflict strategy. Worker re-runs `prepare_merge`
+    /// and advances the target's head.
+    Merge,
+    /// Body decodes as a `QueuedRebase` carrying the branch +
+    /// conflict strategy. Worker re-runs `prepare_rebase` and
+    /// advances the branch's head.
+    Rebase,
 }
 
 impl From<&crate::TransactionBody> for BodyKind {

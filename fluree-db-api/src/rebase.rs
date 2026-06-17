@@ -17,7 +17,7 @@ use fluree_db_novelty::compute_delta_keys;
 use fluree_db_transact::{CommitOpts, NamespaceRegistry, StagedCommit};
 use futures::TryStreamExt;
 use rustc_hash::FxHashSet;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tracing::Instrument;
 
 // ---------------------------------------------------------------------------
@@ -26,7 +26,7 @@ use tracing::Instrument;
 
 /// Strategy for resolving conflicts when branch and source modifications
 /// overlap on the same (subject, predicate, graph) tuple.
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ConflictStrategy {
     /// Replay as-is, both values coexist (multi-cardinality). Default.
     #[default]

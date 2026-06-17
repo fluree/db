@@ -35,7 +35,7 @@ use fluree_db_transact::{CommitOpts, NamespaceRegistry};
 use fluree_vocab::namespaces::FLUREE_DB;
 use futures::TryStreamExt;
 use rustc_hash::{FxHashMap, FxHashSet};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tracing::Instrument;
 
 // ---------------------------------------------------------------------------
@@ -549,7 +549,7 @@ impl crate::Fluree {
 
 /// Caller-supplied source of the commit list, with [`CommitRef`]s still
 /// unresolved.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum RevertSelection {
     Commits(NonEmpty<CommitRef>),
     Range { from: CommitRef, to: CommitRef },

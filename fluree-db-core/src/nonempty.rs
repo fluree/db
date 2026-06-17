@@ -1,5 +1,7 @@
 //! `NonEmpty<T>`: a sequence with a type-level guarantee of at least one element.
 
+use serde::{Deserialize, Serialize};
+
 /// Construct a `NonEmpty<T>` from a comma-separated list of values.
 ///
 /// Statically requires at least one expression — `nonempty![]` is a
@@ -23,7 +25,7 @@ macro_rules! nonempty {
 ///
 /// The invariant is structural: `head` is always present. Downstream code
 /// can rely on `first`, `iter`, etc. without empty-checks.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct NonEmpty<T> {
     /// First element. Always present by construction.
     pub head: T,
