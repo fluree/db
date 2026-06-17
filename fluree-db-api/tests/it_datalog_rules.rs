@@ -1026,3 +1026,70 @@ async fn datalog_query_time_rules_merged_with_db_rules() {
         "Query-time aunt rule should chain with DB uncle rule. Got: {results:?}"
     );
 }
+
+/// Security: query-time datalog rule injection is admin-only. Under a non-root
+/// view policy, caller-supplied `rules` are stripped — a rule with a viewable
+/// head could otherwise launder hidden data the policy author never anticipated
+/// (the derived flake is filtered only by its own (s,p,o), not provenance, and
+/// a caller-invented predicate can't be pre-denied). DB-stored rules and OWL
+/// reasoning are admin-controlled and unaffected.
+#[tokio::test]
+async fn datalog_query_time_rules_stripped_under_non_root_policy() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "datalog/query-time-rules-policy";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+    let family = json!({
+        "@context": {"ex": "http://example.org/"},
+        "@graph": [
+            {"@id": "ex:alice", "ex:parent": {"@id": "ex:bob"}},
+            {"@id": "ex:bob",   "ex:parent": {"@id": "ex:charlie"}}
+        ]
+    });
+    fluree.insert(ledger0, &family).await.unwrap();
+
+    let rules = json!([{
+        "@context": {"ex": "http://example.org/"},
+        "where": {"@id": "?person", "ex:parent": {"ex:parent": "?grandparent"}},
+        "insert": {"@id": "?person", "ex:grandparent": {"@id": "?grandparent"}}
+    }]);
+
+    // Control (root / no policy): the query-time rule fires → grandparent derived.
+    let base_q = json!({
+        "@context": {"ex": "http://example.org/"},
+        "from": ledger_id,
+        "select": "?grandparent",
+        "where": {"@id": "ex:alice", "ex:grandparent": "?grandparent"},
+        "reasoning": "datalog",
+        "rules": rules.clone()
+    });
+    let base = fluree.query_connection(&base_q).await.expect("base query");
+    let ledger = fluree.ledger(ledger_id).await.unwrap();
+    let base_rows = normalize_rows(&base.to_jsonld(&ledger.snapshot).unwrap());
+    assert!(
+        base_rows.contains(&json!("ex:charlie")),
+        "control: query-time rule should fire without a policy, got {base_rows:?}"
+    );
+
+    // Under a permissive but NON-ROOT view policy (allow-all, so base data is
+    // fully visible), the rule is stripped → no derived grandparent. The only
+    // reason it can't fire is the strip, not data filtering.
+    let policy_q = json!({
+        "@context": {"ex": "http://example.org/"},
+        "from": ledger_id,
+        "opts": {
+            "policy": [{"f:action": "f:view", "f:allow": true}],
+            "default-allow": true
+        },
+        "select": "?grandparent",
+        "where": {"@id": "ex:alice", "ex:grandparent": "?grandparent"},
+        "reasoning": "datalog",
+        "rules": rules
+    });
+    let policed = fluree.query_connection(&policy_q).await.expect("policed query");
+    let policed_rows = normalize_rows(&policed.to_jsonld(&ledger.snapshot).unwrap());
+    assert!(
+        !policed_rows.contains(&json!("ex:charlie")),
+        "query-time datalog rules must be stripped under a non-root view policy, got {policed_rows:?}"
+    );
+}
