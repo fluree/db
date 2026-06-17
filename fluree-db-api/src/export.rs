@@ -3,7 +3,7 @@
 //! Writes N-Triples, Turtle, N-Quads, or TriG directly to a `Write` sink,
 //! one leaflet-batch at a time.  Memory usage is O(leaflet_size), not O(dataset).
 
-use fluree_db_binary_index::read::types::sort_overlay_ops;
+use fluree_db_binary_index::read::types::{resolve_overlay_ops, sort_overlay_ops};
 use fluree_db_binary_index::{
     BinaryCursor, BinaryFilter, BinaryIndexStore, ColumnBatch, ColumnProjection, RunSortOrder,
 };
@@ -93,6 +93,14 @@ fn apply_time_travel(
         );
         if !ops.is_empty() {
             sort_overlay_ops(&mut ops, RunSortOrder::Spot);
+            // Collapse assert/retract lifecycles to one op per fact key before
+            // handing ops to the cursor. An insert-then-upsert held entirely in
+            // novelty places a fact's assert and its retract both in the overlay
+            // (same FactKeyV3); `set_overlay_ops` requires — and debug-asserts —
+            // at most one op per fact key, and `merge_overlay_into_batch` would
+            // otherwise process both and leak the stale value. Mirrors the query
+            // fast path's `collect_resolved_overlay_ops`.
+            resolve_overlay_ops(&mut ops);
             cursor.set_overlay_ops(ops);
             cursor.set_epoch(overlay.epoch());
         }

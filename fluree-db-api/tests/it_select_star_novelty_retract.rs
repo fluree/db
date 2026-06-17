@@ -536,6 +536,82 @@ async fn expansion_novelty_retractions_fresh_reader() {
     );
 }
 
+// =============================================================================
+// Export analog: the RDF export path must also resolve intra-overlay
+// assert/retract pairs for the same fact.
+// =============================================================================
+
+/// Export twin of [`expansion_applies_novelty_retractions`].
+///
+/// The export path (`apply_time_travel` → `BinaryCursor::set_overlay_ops`)
+/// translates and sorts overlay flakes but — unlike the query fast path
+/// (`collect_resolved_overlay_ops`) — historically skipped
+/// `resolve_overlay_ops`. So an insert-then-upsert held entirely in novelty
+/// leaves the original value's assert (t=2) and its retract (t=3) unresolved in
+/// the cursor overlay (they share one `FactKeyV3`), tripping
+/// `set_overlay_ops`'s duplicate-fact-key debug-assert in debug builds, or
+/// leaking the stale value in release. Exported N-Triples must contain only the
+/// post-upsert value.
+#[tokio::test]
+async fn export_applies_novelty_retractions() {
+    use fluree_db_api::export::ExportFormat;
+
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let path = tmp.path().to_str().unwrap();
+
+    let fluree = FlureeBuilder::file(path).build().expect("build");
+    let ledger0 = fluree.create_ledger("test:main").await.expect("create");
+
+    // t=1: schema, then force index so later transactions are novelty-only.
+    let receipt = fluree.insert(ledger0, &schema()).await.expect("schema");
+    let _index = fluree.reindex("test:main", ReindexOptions::default()).await;
+
+    // t=2: insert the task entity (novelty only).
+    let insert_txn = json!({
+        "@context": test_context(),
+        "@id": TASK_IRI,
+        "@type": "ex:Task",
+        "ex:description": "original description",
+        "ex:status": "pending"
+    });
+    let receipt = fluree
+        .insert(receipt.ledger, &insert_txn)
+        .await
+        .expect("insert task");
+
+    // t=3: upsert the description — retract "original" + assert "updated", both
+    // in novelty. The "original" assert (t=2) and retract (t=3) share one
+    // FactKeyV3, so the cursor overlay holds an unresolved assert/retract pair.
+    let upsert_txn = json!({
+        "@context": test_context(),
+        "@id": TASK_IRI,
+        "ex:description": "updated description"
+    });
+    let _receipt = fluree
+        .upsert(receipt.ledger, &upsert_txn)
+        .await
+        .expect("upsert task");
+
+    // Export to N-Triples (reads the base index + the unresolved novelty overlay).
+    let mut buf = Vec::new();
+    fluree
+        .export("test:main")
+        .format(ExportFormat::NTriples)
+        .write_to(&mut buf)
+        .await
+        .expect("export ntriples");
+    let output = String::from_utf8(buf).expect("export output is utf-8");
+
+    assert!(
+        output.contains("updated description"),
+        "export must contain the post-upsert value.\n--- export ---\n{output}"
+    );
+    assert!(
+        !output.contains("original description"),
+        "export must NOT contain the retracted pre-upsert value (stale overlay leak).\n--- export ---\n{output}"
+    );
+}
+
 /// Memory-backed baseline: same scenario without binary index.
 /// This should always pass because the overlay-only path uses `remove_stale_flakes`.
 #[tokio::test]
