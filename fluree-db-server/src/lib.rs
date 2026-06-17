@@ -445,27 +445,16 @@ impl FlureeServerBuilder {
 
         #[cfg(feature = "raft")]
         let raft_listener = self.raft.as_ref().map(|(integration, listen_addr)| {
-            // Compose the consensus-side committer stack. The legacy
-            // `RaftCommitter` (proposes `AdvanceRef`) still covers
-            // `revert` / `merge` / `rebase` / `push` while those
-            // paths migrate onto the queue; `QueuedTransactor` wraps
-            // it and routes `transact` through `EnqueueCommand` plus
-            // the per-process `WaiterMap`. `CachingCommitter` stays
-            // on top so keyed retries dedupe before either pipeline.
-            let raft_committer = fluree_db_consensus::RaftCommitter::new(
-                Arc::clone(&integration.raft),
-                Arc::clone(&state_inner.fluree),
-                state_inner
-                    .index_config
-                    .clone()
-                    .expect("index_config set by AppState::new"),
-            );
-            let fallback: Arc<dyn fluree_db_consensus::Committer> = Arc::new(raft_committer);
+            // Consensus-side committer stack: `QueuedTransactor`
+            // routes all five `Committer` methods through
+            // `EnqueueCommand` plus the per-process `WaiterMap` and
+            // `StagedReceiptMap`; `CachingCommitter` sits on top so
+            // keyed retries dedupe before the queue propose.
             let queued = fluree_db_consensus::raft::queued_transactor::QueuedTransactor::new(
                 Arc::clone(&integration.raft),
                 Arc::clone(&state_inner.fluree),
                 Arc::clone(&integration.waiter_map),
-                fallback,
+                integration.shared_state.clone(),
             );
             state_inner.committer =
                 Arc::new(fluree_db_consensus::CachingCommitter::wrapping(queued));

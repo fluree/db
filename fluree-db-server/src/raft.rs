@@ -46,7 +46,9 @@ use tokio::task::JoinHandle;
 #[derive(Clone)]
 pub struct RaftIntegration {
     /// Raft handle. Cloned into the network, admin, and forward
-    /// routers; also used by [`RaftCommitter`](fluree_db_consensus::RaftCommitter).
+    /// routers; also used by
+    /// [`QueuedTransactor`](fluree_db_consensus::raft::queued_transactor::QueuedTransactor)
+    /// and the [`CommitWorker`](fluree_db_consensus::raft::commit_worker::CommitWorker).
     pub raft: Arc<Raft<TypeConfig>>,
     /// This node's id. Cached so callers (notably the leader-aware
     /// indexer watcher) don't have to dip into `raft.metrics()` just

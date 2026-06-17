@@ -50,7 +50,7 @@ pub struct AppState {
     /// forward writes elsewhere). The concrete committer behind the
     /// trait object is selected at server construction time —
     /// `CachingCommitter` over `LocalCommitter` for single-node /
-    /// peer mode, or over `RaftCommitter` for Raft mode.
+    /// peer mode, or over `QueuedTransactor` for Raft mode.
     pub committer: Arc<dyn SubmittingCommitter>,
 
     /// Ledger registry for tracking loaded ledgers and their watermarks

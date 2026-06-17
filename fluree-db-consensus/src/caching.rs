@@ -82,8 +82,9 @@ impl<C: Committer> CachingCommitter<C> {
     /// Wrap an arbitrary inner [`Committer`] with this committer's
     /// admission control and idempotency cache. Use when you want to
     /// compose this layer over something other than the default
-    /// [`LocalCommitter`] (e.g. on top of `RaftCommitter` so keyed
-    /// retries dedup before they hit the Raft log).
+    /// [`LocalCommitter`] (e.g. on top of the Raft-side
+    /// `QueuedTransactor` so keyed retries dedup before they hit the
+    /// Raft log).
     pub fn wrapping(executor: C) -> Self {
         Self::wrapping_with_ttl(executor, DEFAULT_IDEMPOTENCY_TTL)
     }

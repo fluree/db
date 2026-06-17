@@ -23,6 +23,7 @@ use crate::raft::state_machine::{
     BodyKind, Command as SmCommand, EnqueueCommandArgs, RefKey, Response as SmResponse,
 };
 use crate::raft::staged_receipt::AppliedReceipt;
+use crate::raft::state_machine_adapter::SharedState;
 use crate::raft::waiter::{AbortReason, WaiterMap, WaiterOutcome};
 use crate::raft::TypeConfig;
 use crate::{
@@ -50,10 +51,11 @@ pub struct QueuedTransactor {
     raft: Arc<Raft<TypeConfig>>,
     fluree: Arc<Fluree>,
     waiter_map: Arc<WaiterMap>,
-    /// Non-transact submissions still flow through the legacy
-    /// `RaftCommitter`. Each path migrates onto the queue
-    /// independently; until then the fallback covers them.
-    fallback: Arc<dyn Committer>,
+    /// Read-only view of the replicated state machine. Used by
+    /// `merge` to resolve a missing `target_branch` to the source's
+    /// parent before deciding which per-branch queue the entry rides
+    /// on.
+    shared_state: SharedState,
 }
 
 impl QueuedTransactor {
@@ -61,13 +63,13 @@ impl QueuedTransactor {
         raft: Arc<Raft<TypeConfig>>,
         fluree: Arc<Fluree>,
         waiter_map: Arc<WaiterMap>,
-        fallback: Arc<dyn Committer>,
+        shared_state: SharedState,
     ) -> Self {
         Self {
             raft,
             fluree,
             waiter_map,
-            fallback,
+            shared_state,
         }
     }
 }
@@ -320,23 +322,30 @@ impl Committer for QueuedTransactor {
             strategy,
         } = request;
 
-        // The queue is per-branch and we have to commit the entry to
-        // a specific branch up front. Resolving "merge into source's
-        // parent" without staging would mean a separate lookup; for
-        // now require the caller to specify `target_branch` for the
-        // queue path and delegate the unresolved case to the legacy
-        // committer.
-        let Some(target_for_queue) = target_branch.clone() else {
-            return self
-                .fallback
-                .merge(MergeRequest {
-                    idempotency_key,
-                    ledger_name,
-                    source_branch,
-                    target_branch,
-                    strategy,
-                })
-                .await;
+        // The queue is per-branch, so the entry must be routed to a
+        // concrete target up front. When the caller omits
+        // `target_branch`, fall back to the source's recorded
+        // parent — same semantic the legacy committer's
+        // `prepare_merge` used to default to.
+        let target_for_queue = match target_branch.clone() {
+            Some(t) => t,
+            None => {
+                let state = self.shared_state.read().await;
+                let source_ref =
+                    state.refs.get(&RefKey::new(&ledger_name, &source_branch));
+                match source_ref.and_then(|r| r.source_branch.clone()) {
+                    Some(parent) => parent,
+                    None => {
+                        return Err(SubmissionError::Execution {
+                            status: 400,
+                            message: format!(
+                                "merge target unresolved: source branch '{source_branch}' has \
+                                 no recorded parent; specify target_branch explicitly"
+                            ),
+                        });
+                    }
+                }
+            }
         };
 
         let ref_key = RefKey::new(&ledger_name, &target_for_queue);

@@ -34,7 +34,7 @@ pub use local::LocalCommitter;
 // `SubmittingCommitter` is the combined surface AppState typically
 // holds; `Committer` and `SubmissionLookup` are the constituents.
 #[cfg(feature = "raft")]
-pub use raft::{ClusterNode, Command, NodeId, RaftCommitter, Response, TypeConfig};
+pub use raft::{ClusterNode, Command, NodeId, Response, TypeConfig};
 
 /// Re-exports from openraft so embedders can construct a
 /// [`Raft<TypeConfig>`] handle without taking a direct openraft
@@ -215,9 +215,7 @@ impl TransactionBody {
 /// (one CID + a body-kind discriminator) and we don't have to
 /// replicate large opaque values through the Raft log.
 ///
-/// One variant per supported `Committer` method that's been migrated
-/// onto the queue. Pre-migration paths stay on the legacy
-/// `RaftCommitter` → `Command::AdvanceRef` route.
+/// One variant per `Committer` method.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum QueuedRequest {
     /// `transact` — body, opts, tracking, governance to stage and
@@ -598,11 +596,12 @@ pub trait SubmissionLookup: Send + Sync {
 /// Combined committer + lookup trait. Lets callers (notably
 /// `fluree-db-server::AppState`) hold a single
 /// `Arc<dyn SubmittingCommitter>` whose concrete type can swap
-/// between [`LocalCommitter`]-backed and [`RaftCommitter`]-backed
-/// flavours at server-construction time.
+/// between [`LocalCommitter`] and the Raft-side
+/// [`QueuedTransactor`](crate::raft::queued_transactor::QueuedTransactor)
+/// at server-construction time.
 ///
 /// Blanket-implemented for every type that already implements both
 /// parent traits, so no manual impl is needed on
-/// [`CachingCommitter`] / [`LocalCommitter`] / [`RaftCommitter`].
+/// [`CachingCommitter`] / [`LocalCommitter`] / `QueuedTransactor`.
 pub trait SubmittingCommitter: Committer + SubmissionLookup {}
 impl<T> SubmittingCommitter for T where T: Committer + SubmissionLookup + ?Sized {}
