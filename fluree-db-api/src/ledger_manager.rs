@@ -34,8 +34,9 @@ use fluree_db_core::{ledger_id::normalize_ledger_id, ContentId, ContentStore, St
 use fluree_db_ledger::{LedgerState, TypeErasedStore};
 use fluree_db_nameservice::NsRecord;
 
-use crate::coherent_state::{AttachedIndex, CoherentLedgerState};
-use tokio::sync::{oneshot, RwLock};
+use crate::coherent_state::CoherentLedgerState;
+use arc_swap::ArcSwap;
+use tokio::sync::{oneshot, Mutex, RwLock};
 
 use crate::error::{ApiError, Result};
 use crate::ledger_view::LedgerView;
@@ -68,35 +69,38 @@ fn monotonic_secs() -> u64 {
 /// Transactions hold this guard across stage+commit to serialize writes
 /// to the same ledger.
 pub struct LedgerWriteGuard<'a> {
-    guard: tokio::sync::RwLockWriteGuard<'a, CoherentLedgerState>,
+    /// Held for the whole stage+commit to serialize writers (readers never take
+    /// it). Dropping it admits the next writer.
+    _permit: tokio::sync::MutexGuard<'a, ()>,
+    /// Where a published bundle is stored.
+    state: &'a ArcSwap<CoherentLedgerState>,
+    /// Snapshot of the current bundle, taken at lock time and advanced by
+    /// `replace`. Reads (`state`/`clone_state`) serve from here; because the
+    /// `_permit` serializes writers, no other writer can move the published
+    /// bundle out from under us between lock and publish.
+    current: Arc<CoherentLedgerState>,
 }
 
 impl LedgerWriteGuard<'_> {
     /// Get reference to current state
     pub fn state(&self) -> &LedgerState {
-        &self.guard.core
+        &self.current.core
     }
 
     /// Clone current state for passing to stage (which consumes by value)
     pub fn clone_state(&self) -> LedgerState {
-        self.guard.core.clone()
+        self.current.core.clone()
     }
 
-    /// Get mutable reference to current state for in-place updates.
-    ///
-    /// In-place mutation that does NOT change the attached binary store (e.g.
-    /// applying commits to novelty) keeps the bundle coherent; paths that swap
-    /// the store publish a whole new bundle via [`Self::replace`].
-    pub fn state_mut(&mut self) -> &mut LedgerState {
-        &mut self.guard.core
-    }
-
-    /// Replace state with new state after a successful commit, re-deriving the
-    /// coherent typed index from `new_state.binary_store`. This is what retires
-    /// the old `sync_binary_store_from_state` step: the state and its store swap
-    /// together, atomically, so a reader can never see one without the other.
+    /// Publish a new state after a successful commit, re-deriving the coherent
+    /// typed index from `new_state.binary_store`. The whole bundle is swapped
+    /// into the `ArcSwap` atomically, so a concurrent reader's `load()` sees
+    /// either the old or the new bundle — never a torn mix, and never blocked.
+    /// `current` advances so a subsequent `state()` reflects the publish.
     pub fn replace(&mut self, new_state: LedgerState) {
-        *self.guard = CoherentLedgerState::from_core(new_state);
+        let bundle = Arc::new(CoherentLedgerState::from_core(new_state));
+        self.state.store(Arc::clone(&bundle));
+        self.current = bundle;
     }
 }
 
@@ -123,19 +127,22 @@ impl Clone for LedgerHandle {
 }
 
 struct LedgerHandleInner {
-    /// Guards the whole ledger state — the `core` [`LedgerState`] and its
-    /// coherent typed binary index — as one [`CoherentLedgerState`] bundle. A
-    /// single `RwLock` (was two, plus an out-of-band `binary_store` lock + a
-    /// hand-maintained sync invariant): concurrent reads (every query takes a
-    /// brief shared `read()` to clone a cheap, Arc-backed snapshot) run in
-    /// parallel; transactions take an exclusive `write()` for the stage+commit
-    /// duration. (P2b swaps this `RwLock` for an `ArcSwap`, retiring the read
-    /// lock entirely so readers never block.)
-    state: RwLock<CoherentLedgerState>,
+    /// The whole ledger state — the `core` [`LedgerState`] and its coherent
+    /// typed binary index — as one immutable [`CoherentLedgerState`] bundle,
+    /// published via `ArcSwap`. Readers `load()` it lock-free and never block,
+    /// even mid-commit; each load sees one atomic, internally-coherent bundle,
+    /// so torn states are impossible by construction. Writers build a new
+    /// bundle and `store()` it, serialized by `write_lock`.
+    state: ArcSwap<CoherentLedgerState>,
     /// Ledger ID (e.g., "mydb:main")
     ledger_id: String,
     /// Last access time (monotonic secs since process start)
     last_access: AtomicU64,
+    /// Serializes writers — transactions hold it across stage+commit; index
+    /// apply / reload hold it for their swap. Readers never take it (they
+    /// `state.load()` lock-free); it is the one-writer-at-a-time gate that
+    /// replaces the old `state` write lock.
+    write_lock: Mutex<()>,
 }
 
 impl LedgerHandle {
@@ -147,9 +154,10 @@ impl LedgerHandle {
     ) -> Self {
         Self {
             inner: Arc::new(LedgerHandleInner {
-                state: RwLock::new(CoherentLedgerState::new(state, binary_store)),
+                state: ArcSwap::from_pointee(CoherentLedgerState::new(state, binary_store)),
                 ledger_id,
                 last_access: AtomicU64::new(monotonic_secs()),
+                write_lock: Mutex::new(()),
             }),
         }
     }
@@ -168,7 +176,9 @@ impl LedgerHandle {
     /// The snapshot is a cheap clone; the lock is released immediately after.
     pub async fn snapshot(&self) -> LedgerView {
         self.touch();
-        let bundle = self.inner.state.read().await;
+        // Lock-free: one atomic load of the current coherent bundle. Never
+        // blocks, even while a writer is mid-commit.
+        let bundle = self.inner.state.load();
         let mut snap = LedgerView::from_state(&bundle.core);
         snap.binary_store = bundle.store().map(Arc::clone);
         debug_assert!(
@@ -176,14 +186,21 @@ impl LedgerHandle {
             "range_provider and binary_store must be coherent"
         );
         snap
-        // Lock released here
     }
 
-    /// Acquire exclusive access for transaction (hold lock for stage+commit)
+    /// Acquire exclusive write access for a transaction (held across stage+commit).
+    ///
+    /// Takes the writer-serialization `write_lock` — NOT a lock on `state`, so
+    /// readers stay lock-free — and snapshots the current published bundle for
+    /// the writer to stage from.
     pub async fn lock_for_write(&self) -> LedgerWriteGuard<'_> {
         self.touch();
+        let permit = self.inner.write_lock.lock().await;
+        let current = self.inner.state.load_full();
         LedgerWriteGuard {
-            guard: self.inner.state.write().await,
+            _permit: permit,
+            state: &self.inner.state,
+            current,
         }
     }
 
@@ -206,7 +223,7 @@ impl LedgerHandle {
 
     /// Check if currently locked (for eviction - skip if in use)
     pub fn is_locked(&self) -> bool {
-        self.inner.state.try_write().is_err()
+        self.inner.write_lock.try_lock().is_err()
     }
 
     /// Get current index_t (brief lock to read)
@@ -214,8 +231,7 @@ impl LedgerHandle {
     /// This returns the indexed DB's t value, NOT including novelty.
     /// For freshness checking against remote watermarks, use this method.
     pub async fn index_t(&self) -> i64 {
-        let state = self.inner.state.read().await;
-        state.core.index_t()
+        self.inner.state.load().core.index_t()
     }
 
     /// Get current t value (max of db.t and novelty.t)
@@ -223,19 +239,18 @@ impl LedgerHandle {
     /// This returns the ledger's current t including any unindexed novelty.
     /// Use this for comparing against nameservice commit_t to detect staleness.
     pub async fn t(&self) -> i64 {
-        let state = self.inner.state.read().await;
-        state.core.t()
+        self.inner.state.load().core.t()
     }
 
     /// Get state metrics for update planning
     ///
     /// Returns (t, index_t, index_head_id) needed for UpdatePlan::plan()
     pub async fn state_metrics(&self) -> (i64, i64, Option<ContentId>) {
-        let state = self.inner.state.read().await;
+        let bundle = self.inner.state.load();
         (
-            state.core.t(),
-            state.core.index_t(),
-            state
+            bundle.core.t(),
+            bundle.core.index_t(),
+            bundle
                 .core
                 .ns_record
                 .as_ref()
@@ -308,33 +323,32 @@ impl LedgerHandle {
         // then wire up range_provider with the correct dict_novelty.
         // Lock ordering: state → binary_store (same as snapshot()).
         {
-            let mut bundle = self.inner.state.write().await;
+            let mut guard = self.lock_for_write().await;
+            let mut core = guard.clone_state();
 
             // apply_loaded_db: validates, trims novelty, rebuilds dict_novelty
-            bundle
-                .core
-                .apply_loaded_db(db, Some(index_id))
+            core.apply_loaded_db(db, Some(index_id))
                 .map_err(|e| ApiError::internal(format!("apply_loaded_db failed: {e}")))?;
 
             // Sync namespace codes between store and snapshot (bimap validation).
             crate::ns_helpers::sync_store_and_snapshot_ns(
                 &mut store,
-                Arc::make_mut(&mut bundle.core.snapshot),
+                Arc::make_mut(&mut core.snapshot),
             )?;
 
             let arc_store = Arc::new(store);
-            crate::runtime_dicts::reseed_runtime_small_dicts(&mut bundle.core, &arc_store);
+            crate::runtime_dicts::reseed_runtime_small_dicts(&mut core, &arc_store);
 
             // (Re)build range_provider coherent with the dict_novelty that
             // apply_loaded_db just rebuilt.
-            attach_range_provider(&mut bundle.core, &arc_store);
+            attach_range_provider(&mut core, &arc_store);
 
-            // Swap in the new store: the type-erased copy on the core (for the
-            // transact path) and the typed index cache (for readers) together —
-            // one bundle, so a reader never sees the new snapshot with the old store.
+            // Stamp the type-erased store on the core; `replace` re-derives the
+            // typed index from it and publishes the whole bundle atomically, so a
+            // reader never sees the new snapshot with the old store.
             let te_store: Arc<dyn std::any::Any + Send + Sync> = arc_store.clone();
-            bundle.core.binary_store = Some(TypeErasedStore(te_store));
-            bundle.index = Some(AttachedIndex { store: arc_store });
+            core.binary_store = Some(TypeErasedStore(te_store));
+            guard.replace(core);
         }
 
         Ok(())
@@ -1663,27 +1677,30 @@ impl LedgerManager {
                         self.reload(&input.ledger_id).await?;
                         return Ok(NotifyResult::Reloaded);
                     }
+                    // Apply the commits to a working copy of the core, then publish
+                    // the whole bundle once (ArcSwap has no in-place mutation). This
+                    // is also all-or-nothing: a mid-loop failure discards the working
+                    // copy and leaves the live published state intact.
+                    let mut core = write_guard.clone_state();
                     for commit in commits {
-                        write_guard
-                            .state_mut()
-                            .apply_single_commit(commit, &ledger_id_canonical)
+                        core.apply_single_commit(commit, &ledger_id_canonical)
                             .map_err(|e| ApiError::internal(format!("apply commit: {e}")))?;
                     }
 
-                    // `apply_single_commit` replaced `state.dict_novelty` with a new
-                    // Arc; re-attach the provider through the one chokepoint so it
-                    // points at the current dict_novelty (else overlay translation
-                    // misses novelty-only strings/subjects — the detached-Arc bug).
-                    if let Some(store) = write_guard
-                        .state()
+                    // `apply_single_commit` replaced `dict_novelty` with a new Arc;
+                    // re-attach the provider through the one chokepoint so it points
+                    // at the current dict_novelty (else overlay translation misses
+                    // novelty-only strings/subjects — the detached-Arc bug).
+                    if let Some(store) = core
                         .snapshot
                         .range_provider
                         .as_ref()
                         .and_then(|rp| rp.as_any().downcast_ref::<BinaryRangeProvider>())
                         .map(|brp| Arc::clone(brp.store()))
                     {
-                        attach_range_provider(write_guard.state_mut(), &store);
+                        attach_range_provider(&mut core, &store);
                     }
+                    write_guard.replace(core);
                 }
 
                 // Apply index update if present (after commits so novelty has latest flakes).

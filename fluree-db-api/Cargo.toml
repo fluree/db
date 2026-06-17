@@ -66,6 +66,7 @@ fluree-db-shacl = { path = "../fluree-db-shacl", optional = true }
 fluree-vocab = { path = "../fluree-vocab" }
 fluree-graph-json-ld = { path = "../fluree-graph-json-ld" }
 
+arc-swap = "1"
 async-trait.workspace = true
 chrono.workspace = true
 futures.workspace = true
