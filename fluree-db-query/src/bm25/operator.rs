@@ -23,10 +23,8 @@
 //! - The operator is correlated: it consumes a child stream (often an EmptyOperator seed)
 //!   and may read the query target from an input variable.
 
-use crate::binary_scan::BinaryScanOperator;
 use crate::binding::{Batch, Binding, RowAccess};
 use crate::bm25::{Analyzer, Bm25Index, Bm25Scorer};
-use crate::dataset::ActiveGraphs;
 use crate::context::{ExecutionContext, WellKnownDatatypes};
 use crate::error::{QueryError, Result};
 use crate::ir::{IndexSearchPattern, IndexSearchTarget};
@@ -35,9 +33,7 @@ use crate::operator::{
 };
 use crate::var_registry::VarId;
 use async_trait::async_trait;
-use fluree_db_core::{
-    range_with_overlay, FlakeValue, IndexType, RangeMatch, RangeOptions, RangeTest,
-};
+use fluree_db_core::FlakeValue;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -243,84 +239,21 @@ impl Bm25SearchOperator {
     /// check against). The indexed-flake read runs in the single active graph;
     /// under a non-root policy in multi-graph mode the hit is conservatively
     /// hidden (no leak). No-op for root / no policy.
+    /// Indexed-flake readability for a BM25 hit: visible iff the identity can
+    /// view at least one of the subject's flakes on a BM25-indexed property (the
+    /// text that could have produced the match). Only the inline (local index)
+    /// path is checked; the dedicated search-provider path loads no index here.
     async fn hit_readable(&self, ctx: &ExecutionContext<'_>, subject_iri: &str) -> Result<bool> {
-        // Only the inline (local index) path can be checked against local flakes;
-        // the dedicated search-provider path loads no index here.
         let Some(index) = self.index.as_ref() else {
             return Ok(true);
         };
-        // The view-policy enforcer lives on the active graph. In dataset mode
-        // that is the per-graph `GraphRef` (not the top-level ctx), so fold into
-        // a single-graph context that carries the graph's enforcer before
-        // checking.
-        match ctx.active_graphs() {
-            ActiveGraphs::Single => self.indexed_flake_visible(ctx, subject_iri, index).await,
-            ActiveGraphs::Many(graphs) => {
-                if graphs.len() == 1 {
-                    let graph_ctx = ctx.with_graph_ref(graphs[0]);
-                    self.indexed_flake_visible(&graph_ctx, subject_iri, index)
-                        .await
-                } else if graphs.iter().any(|g| g.has_policy()) {
-                    // Multi-graph indexed-flake checks aren't supported; under a
-                    // policy, conservatively hide rather than leak.
-                    Ok(false)
-                } else {
-                    Ok(true)
-                }
-            }
-        }
-    }
-
-    /// Whether the identity can view at least one of `subject_iri`'s flakes on an
-    /// indexed property, evaluated against a single-graph context carrying the
-    /// graph's view-policy enforcer. No-op (visible) for root / no policy.
-    async fn indexed_flake_visible(
-        &self,
-        ctx: &ExecutionContext<'_>,
-        subject_iri: &str,
-        index: &Bm25Index,
-    ) -> Result<bool> {
-        if ctx.allow_unfiltered() {
-            return Ok(true);
-        }
-        let snapshot = ctx.active_snapshot;
-        let overlay = ctx.overlay();
-        let to_t = ctx.to_t;
-        let Some(subject_sid) = ctx.encode_iri(subject_iri) else {
-            // Subject not resolvable in this graph => cannot verify => hide.
-            return Ok(false);
-        };
-        for prop_iri in &index.property_deps.property_iris {
-            let Some(pred_sid) = ctx.encode_iri(prop_iri.as_ref()) else {
-                continue;
-            };
-            let range_match = RangeMatch::new()
-                .with_subject(subject_sid.clone())
-                .with_predicate(pred_sid);
-            let flakes = range_with_overlay(
-                snapshot,
-                ctx.binary_g_id,
-                overlay,
-                IndexType::Spot,
-                RangeTest::Eq,
-                range_match,
-                RangeOptions::new().with_to_t(to_t),
-            )
-            .await?;
-            let visible = BinaryScanOperator::filter_flakes_by_policy(
-                ctx,
-                snapshot,
-                overlay,
-                to_t,
-                ctx.binary_g_id,
-                flakes,
-            )
-            .await?;
-            if !visible.is_empty() {
-                return Ok(true);
-            }
-        }
-        Ok(false)
+        let pred_iris: Vec<&str> = index
+            .property_deps
+            .property_iris
+            .iter()
+            .map(std::convert::AsRef::as_ref)
+            .collect();
+        crate::search_readability::search_hit_readable(ctx, subject_iri, &pred_iris).await
     }
 
     fn resolve_target_from_row(
