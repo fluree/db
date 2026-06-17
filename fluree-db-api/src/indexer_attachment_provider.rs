@@ -133,13 +133,23 @@ impl AttachmentEventsProvider for ApiAttachmentEventsProvider {
         // non-annotation ledgers pay nothing even if the cheap
         // checks pass.
         if result.events.is_empty() {
+            // Escape hatch: a provider-less reindex/index pass sets
+            // `had_annotation_arena=true` even when no arena was ever
+            // sealed (root_assembly sets it whenever `has_annotations`),
+            // which permanently blocks the bulk-import bootstrap below.
+            // For a known-fresh import with no retract history a
+            // base-index scan is still authoritative, so allow forcing
+            // past the sticky-bit gate. EXPERIMENTAL — not a substitute
+            // for fixing the bit to track actual seals/retracts.
+            let force_bootstrap = std::env::var("FLUREE_FORCE_ANNOTATION_BOOTSTRAP")
+                .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
             let load_view = manager.get_loaded_view(ledger_id).await;
             let bootstrap_eligible = load_view
                 .as_ref()
                 .map(|v| {
                     v.snapshot.has_annotations
                         && v.snapshot.annotation_index.is_none()
-                        && !v.snapshot.had_annotation_arena
+                        && (force_bootstrap || !v.snapshot.had_annotation_arena)
                 })
                 .unwrap_or(false);
             if bootstrap_eligible {
