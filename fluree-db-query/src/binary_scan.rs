@@ -2285,6 +2285,16 @@ impl UntranslatedReason {
 /// fall back to the generic merge — but the failure is always carried in the
 /// type, so no lane can silently drop a flake the way the (now-removed)
 /// `translate_overlay_flakes` once did.
+///
+/// This is the seam between the two overlay fact-identity domains. A
+/// [`Translated`](Translation::Translated) op lives in the **encoded V3**
+/// domain, keyed by `fluree_db_binary_index::read::types::FactKeyV3`
+/// `(s_id, p_id, o_type, o_key, o_i)`. An
+/// [`Untranslated`](Translation::Untranslated) flake stays in the **row-world**
+/// domain, keyed by the full `Flake` `(s, p, o, dt, m)`; its post-pass must
+/// dedup it there and never against a V3 key, because the encoded key cannot
+/// express a language tag (`"x"@en` and `"x"@fr` collapse to one V3 identity).
+/// See `FactKeyV3`'s rustdoc and #1273 for the full contract.
 pub enum Translation {
     /// Translated into binary-index space.
     Translated(OverlayOp),
