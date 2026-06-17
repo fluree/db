@@ -400,3 +400,4 @@ benchmarks/sparqloscope/queries/union-constraint-from-star.sparql
 benchmarks/sparqloscope/queries/union-constraint-large-join.sparql
 benchmarks/sparqloscope/queries/union-constraint-small-join.sparql
 benchmarks/sparqloscope/queries/union-no-constraint.sparql
+.claude/worktrees/
