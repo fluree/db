@@ -144,8 +144,13 @@ impl QueryPolicyEnforcer {
                 .await
             {
                 Ok(true) => result.push(flake),
-                Ok(false) => {} // Filtered out
-                Err(_) => {}    // On error, conservatively deny
+                Ok(false) => {} // Filtered out by policy (a genuine deny is Ok(false))
+                // An Err here is an execution failure (malformed f:query, storage
+                // IO, cooperative cancellation, or fuel exhaustion mid-scan), not a
+                // policy denial. Propagate it: silently dropping the flake would
+                // turn "too expensive"/"transient failure" into a successful
+                // response with fewer rows than the identity is authorized to see.
+                Err(e) => return Err(crate::error::QueryError::Policy(e.to_string())),
             }
         }
 
