@@ -15,11 +15,9 @@ use fluree_db_binary_index::format::history_sidecar::HistEntryV2;
 use fluree_db_binary_index::format::run_record::RunSortOrder;
 use fluree_db_binary_index::format::run_record_v2::RunRecordV2;
 use fluree_db_binary_index::read::column_types::ColumnBatch;
+use fluree_db_binary_index::read::types::{FactKeyV3, OI_NONE};
 use fluree_db_core::subject_id::SubjectId;
 use std::cmp::Ordering;
-
-/// Sentinel for o_i when no list index is present.
-const OI_NONE: u32 = u32::MAX;
 
 // ============================================================================
 // MergeInput / MergeOutput
@@ -154,29 +152,6 @@ fn cmp_batch_row_vs_record(
 // ============================================================================
 // History assembly
 // ============================================================================
-
-/// Fact identity key for history dedup (V3).
-#[derive(PartialEq, Eq)]
-struct FactKeyV3 {
-    s_id: u64,
-    p_id: u32,
-    o_type: u16,
-    o_key: u64,
-    o_i: u32,
-}
-
-impl FactKeyV3 {
-    #[inline]
-    fn from_hist(e: &HistEntryV2) -> Self {
-        Self {
-            s_id: e.s_id.as_u64(),
-            p_id: e.p_id,
-            o_type: e.o_type,
-            o_key: e.o_key,
-            o_i: e.o_i,
-        }
-    }
-}
 
 /// Assemble the final history list from new merge entries + existing history.
 ///

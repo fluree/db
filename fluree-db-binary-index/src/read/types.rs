@@ -4,17 +4,49 @@
 //! `sort_overlay_ops`) but use the V3 identity model:
 //! `(s_id, p_id, o_type, o_key, o_i)` instead of `(s_id, p_id, o_kind, o_key, dt)`.
 
+use crate::format::history_sidecar::HistEntryV2;
 use crate::format::run_record::RunSortOrder;
+use crate::read::column_types::ColumnBatch;
 use std::cmp::Ordering;
+
+/// Sentinel `o_i` for a fact with no `@list` index — the V3 "absent list index"
+/// marker shared by every consumer of [`FactKeyV3`].
+pub const OI_NONE: u32 = u32::MAX;
 
 // ============================================================================
 // FactKeyV3 — fact identity
 // ============================================================================
 
-/// Fact identity key for the V3 format.
+/// The single canonical fact-identity key for the V3 columnar/overlay world.
 ///
-/// Two facts with the same `FactKeyV3` are the same fact (differ only in `t`).
-/// Used for dedup, overlay merge, and replay membership sets.
+/// Two facts with the same `FactKeyV3` are the same fact (they differ only in
+/// `t`). This one tuple — `(s_id, p_id, o_type, o_key, o_i)` — is the identity
+/// used by every V3 consumer: the overlay cursor merge ([`resolve_overlay_ops`]),
+/// time-travel replay membership sets (`read::replay`), and index-build history
+/// dedup (`fluree-db-indexer`'s `novelty_merge`). It is deliberately the *only*
+/// definition: three structurally-identical copies once lived here, in
+/// `read::replay`, and in the indexer, and nothing stopped them from drifting.
+///
+/// # The two overlay fact-identity domains
+///
+/// Overlay merge spans two deliberately distinct identity domains; a value
+/// translated into one must never be deduped against the other:
+///
+/// 1. **Translated / encoded — this type.** Row-world `Flake`s are translated
+///    into integer-ID space ([`OverlayOp`]) and keyed by `FactKeyV3`: datatype
+///    and value fold into `o_type`/`o_key`, and the `@list` index into `o_i`.
+///    This is the hot lane (cursor two-pointer merge, replay, index build).
+/// 2. **Row-world `Flake` `(s, p, o, dt, m)`** — the raw-flake post-pass used by
+///    export / graph-crawl, where `m = FlakeMeta { lang, i }`. This domain is
+///    *required* because `FactKeyV3` cannot express a **language tag**: two
+///    novelty-only langString flakes (`"animal"@en` vs `"animal"@fr`) collapse
+///    to one `(s_id, p_id, o_type, o_key, o_i)` and would collide here.
+///    Translation therefore *declines* such values (`UntranslatedReason::Unsupported`,
+///    issue #1273) and the caller serves them from a raw-`Flake` post-pass keyed
+///    on the full `(s, p, o, dt, m)` so the variants stay distinct.
+///
+/// In short: `FactKeyV3` is identity for everything the index can encode; the
+/// raw-`Flake` tuple is identity for the residue it cannot.
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub struct FactKeyV3 {
     pub s_id: u64,
@@ -22,6 +54,32 @@ pub struct FactKeyV3 {
     pub o_type: u16,
     pub o_key: u64,
     pub o_i: u32,
+}
+
+impl FactKeyV3 {
+    /// Identity key for a decoded base/overlay row at `row` in a `ColumnBatch`.
+    #[inline]
+    pub fn from_batch(batch: &ColumnBatch, row: usize) -> Self {
+        Self {
+            s_id: batch.s_id.get(row),
+            p_id: batch.p_id.get(row),
+            o_type: batch.o_type.get(row),
+            o_key: batch.o_key.get(row),
+            o_i: batch.o_i.get_or(row, OI_NONE),
+        }
+    }
+
+    /// Identity key from a history-sidecar entry.
+    #[inline]
+    pub fn from_hist(entry: &HistEntryV2) -> Self {
+        Self {
+            s_id: entry.s_id.as_u64(),
+            p_id: entry.p_id,
+            o_type: entry.o_type,
+            o_key: entry.o_key,
+            o_i: entry.o_i,
+        }
+    }
 }
 
 // ============================================================================

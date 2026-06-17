@@ -21,46 +21,7 @@ use crate::format::leaf::LeafletDirEntryV3;
 use crate::format::run_record::RunSortOrder;
 use crate::format::run_record_v2::{cmp_v2_for_order, RunRecordV2};
 use crate::read::column_types::{ColumnBatch, ColumnData};
-
-/// Sentinel for o_i when no list index is present.
-const OI_NONE: u32 = u32::MAX;
-
-// ============================================================================
-// V3 Fact Key (identity for replay)
-// ============================================================================
-
-#[derive(Clone, Hash, Eq, PartialEq)]
-struct FactKeyV3 {
-    s_id: u64,
-    p_id: u32,
-    o_type: u16,
-    o_key: u64,
-    o_i: u32,
-}
-
-impl FactKeyV3 {
-    #[inline]
-    fn from_batch(batch: &ColumnBatch, row: usize) -> Self {
-        Self {
-            s_id: batch.s_id.get(row),
-            p_id: batch.p_id.get(row),
-            o_type: batch.o_type.get(row),
-            o_key: batch.o_key.get(row),
-            o_i: batch.o_i.get_or(row, OI_NONE),
-        }
-    }
-
-    #[inline]
-    fn from_hist(entry: &HistEntryV2) -> Self {
-        Self {
-            s_id: entry.s_id.as_u64(),
-            p_id: entry.p_id,
-            o_type: entry.o_type,
-            o_key: entry.o_key,
-            o_i: entry.o_i,
-        }
-    }
-}
+use crate::read::types::{FactKeyV3, OI_NONE};
 
 // ============================================================================
 // Undo event
@@ -240,7 +201,7 @@ pub fn replay_leaflet(
     let mut fact_states: HashMap<FactKeyV3, FactState> = HashMap::new();
 
     for event in &events {
-        let state = fact_states.entry(event.key.clone()).or_insert(FactState {
+        let state = fact_states.entry(event.key).or_insert(FactState {
             present: membership.contains_key(&event.key),
             include_src: None,
         });
