@@ -3439,12 +3439,25 @@ pub fn term_to_ref_s_id(
 /// so this runtime gate doesn't repeat that check.
 #[inline]
 fn allow_fast_path(ctx: &ExecutionContext<'_>) -> bool {
-    // Fast paths rely on a single binary index + single-ledger semantics for encoded IDs.
-    // Dataset (multi-ledger) execution can span multiple ledgers/graphs, so disable fast
-    // paths for correctness unless/until they are made dataset-aware.
+    fast_path_eligible_no_policy(ctx) && ctx.allow_unfiltered()
+}
+
+/// The non-policy half of [`allow_fast_path`]: single-ledger, no `from_t`, no
+/// uncommitted overlay.
+///
+/// Fast paths rely on a single binary index + single-ledger semantics for
+/// encoded IDs; dataset (multi-ledger) execution can span multiple
+/// ledgers/graphs, so they are disabled there. History mode is filtered at the
+/// planner level, so this runtime gate doesn't repeat that check.
+///
+/// Split out so single-predicate O1 callers can reuse the structural conditions
+/// after discharging the view policy themselves via
+/// [`cursor_fast_path_for_predicate`] (an uncovered predicate is safe to read
+/// unfiltered).
+#[inline]
+fn fast_path_eligible_no_policy(ctx: &ExecutionContext<'_>) -> bool {
     !ctx.is_multi_ledger()
         && ctx.from_t.is_none()
-        && ctx.allow_unfiltered()
         && ctx
             .overlay
             .map(fluree_db_core::OverlayProvider::epoch)
@@ -3465,6 +3478,22 @@ pub fn fast_path_store<'a>(ctx: &'a ExecutionContext<'_>) -> Option<&'a Arc<Bina
         return None;
     }
     Some(store)
+}
+
+/// Like [`fast_path_store`] but with the view-policy clause **already
+/// discharged by the caller** — use only after [`cursor_fast_path_for_predicate`]
+/// returned [`PredicateFastPath::Allow`] for the operator's single scanned
+/// predicate. Same structural metadata-lane conditions otherwise: single-ledger,
+/// no `from_t`, overlay-free, store present, `to_t == max_t`.
+#[inline]
+pub fn fast_path_store_policy_cleared<'a>(
+    ctx: &'a ExecutionContext<'_>,
+) -> Option<&'a Arc<BinaryIndexStore>> {
+    if !fast_path_eligible_no_policy(ctx) {
+        return None;
+    }
+    let store = ctx.binary_store.as_ref()?;
+    (ctx.to_t == store.max_t()).then_some(store)
 }
 
 /// Cursor-flavored fast-path gate (strategy (b)).
