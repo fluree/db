@@ -17,7 +17,6 @@
 //! a [`Command`], and the log index the command was committed at;
 //! returns a [`Response`] describing the outcome.
 
-use crate::raft::execution_record::ExecutionRecordRef;
 use crate::IdempotencyCacheKey;
 use fluree_db_api::{ContentId, PolicyStats, TrackingTally};
 use fluree_db_core::ledger_id::format_ledger_id;
@@ -145,22 +144,14 @@ pub struct LedgerRecord {
 /// receipts, so this layer doesn't promise them.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ApplyRecord {
-    /// SHA-256 of the request body. Lets a retry detect "same key,
-    /// different body" — a client bug that should surface rather
-    /// than silently dedup. Populated by the legacy [`Command::AdvanceRef`]
-    /// path. Queue-mediated commits use [`Self::request_cid`] instead.
-    pub body_hash: [u8; 32],
     /// CAS identifier of the [`crate::QueuedRequest`] envelope this
-    /// commit was staged from (see `Command::EnqueueCommand`). `None`
-    /// for legacy AdvanceRef applies. During the migration window
-    /// both fields coexist; the AdvanceRef path goes away in a later
-    /// step and this becomes the sole request identity.
-    #[serde(default)]
-    pub request_cid: Option<ContentId>,
+    /// commit was staged from (see `Command::EnqueueCommand`). Sole
+    /// request identity — comparing CIDs detects "same key,
+    /// different body" misuse.
+    pub request_cid: ContentId,
     /// Wall-clock at which the cache entry was recorded, milliseconds
     /// since the Unix epoch. Used by `Command::EvictIdempotency` to
     /// age out entries past their TTL.
-    #[serde(default)]
     pub recorded_at_millis: u64,
     /// Head commit produced by the original submission.
     pub head: ContentId,
@@ -172,15 +163,6 @@ pub struct ApplyRecord {
     /// the original didn't request tracking; carried so idempotent
     /// retries return what the original asked for.
     pub tally: Option<RecordedTally>,
-}
-
-/// Idempotency context attached to [`Command::AdvanceRef`]. The
-/// leader supplies it so the state machine can populate the
-/// replicated cache atomically with the ref advancement.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct IdempotencyContext {
-    pub key: IdempotencyCacheKey,
-    pub body_hash: [u8; 32],
 }
 
 /// Cached outcome of a previously-processed request, keyed in
@@ -201,13 +183,13 @@ pub enum ApplyOutcome {
 }
 
 impl ApplyOutcome {
-    /// Body CID this outcome was recorded against. `None` only
-    /// for legacy [`Command::AdvanceRef`] applies that pre-date
-    /// the queue work; goes away when AdvanceRef is removed.
-    pub fn request_cid(&self) -> Option<&ContentId> {
+    /// Envelope CID this outcome was recorded against. Mismatched
+    /// CIDs under the same idempotency key are surfaced as a client
+    /// bug rather than silently deduped.
+    pub fn request_cid(&self) -> &ContentId {
         match self {
-            ApplyOutcome::Applied(r) => r.request_cid.as_ref(),
-            ApplyOutcome::Failed(r) => Some(&r.request_cid),
+            ApplyOutcome::Applied(r) => &r.request_cid,
+            ApplyOutcome::Failed(r) => &r.request_cid,
         }
     }
 
@@ -421,9 +403,6 @@ pub struct NameServiceState {
 /// straightforward to reason about.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Command {
-    /// CAS-advance a branch head. Apply checks `expected_prev`
-    /// against the current head before writing.
-    AdvanceRef(AdvanceRefArgs),
     /// Advance the published index head for a branch. Driven by the
     /// indexer running on the current leader after it finishes a
     /// build. Apply enforces strict monotonicity and rejects index
@@ -431,7 +410,7 @@ pub enum Command {
     AdvanceIndexHead(AdvanceIndexHeadArgs),
     /// Register a branch on a ledger. The branch starts unborn — no
     /// [`RefEntry`] is created until the first
-    /// [`Command::AdvanceRef`] for the branch.
+    /// [`Command::ApplyHead`] for the branch.
     CreateLedger(CreateLedgerArgs),
     /// Fork a new branch from an existing one. Increments the
     /// source branch's child counter and records parentage on the
@@ -439,7 +418,7 @@ pub enum Command {
     /// current head (or `at_commit` if supplied).
     CreateBranch(CreateBranchArgs),
     /// Drop a branch created via [`Command::CreateBranch`] (or
-    /// implicit branch creation through [`Command::AdvanceRef`]),
+    /// implicit branch creation through [`Command::ApplyHead`]),
     /// decrementing the parent's child counter when applicable.
     /// Refuses to remove a branch whose own `branches` count is
     /// non-zero. Unlike [`Command::PurgeLedger`], not idempotent on
@@ -529,36 +508,6 @@ pub struct PoisonQueueEntryArgs {
     pub applied_at_millis: u64,
 }
 
-/// Payload for [`Command::AdvanceRef`].
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AdvanceRefArgs {
-    pub ledger_id: String,
-    pub branch: String,
-    /// Current head the leader observed. `None` only when the
-    /// branch is being newly created. Apply returns
-    /// [`Response::Conflict`] when this doesn't match the
-    /// state machine's current head for the branch.
-    pub expected_prev: Option<ContentId>,
-    /// New head to write.
-    pub new_head: ContentId,
-    /// Logical time of the new head.
-    pub t: i64,
-    /// Leader's wall-clock at proposal, millis since epoch.
-    pub applied_at_millis: u64,
-    /// Optional idempotency context — present iff the request
-    /// carried an idempotency key.
-    pub idempotency: Option<IdempotencyContext>,
-    /// Execution records to release after this advance is committed.
-    /// Piggybacked from the leader's pending-releases buffer so we
-    /// don't need a separate Raft round-trip for cleanup. Echoed back
-    /// in [`Response::Applied`] so the wrapper performs the deletes.
-    pub release: Vec<ExecutionRecordRef>,
-    /// Tracking accounting from staging. `Some` iff the request had
-    /// tracking enabled. Stored in the idempotency cache so retries
-    /// return what the original requested.
-    pub tally: Option<RecordedTally>,
-}
-
 /// Payload for [`Command::AdvanceIndexHead`].
 ///
 /// Strict monotonic update: the new `t` must be greater than the
@@ -624,31 +573,6 @@ pub struct ResetHeadSnapshot {
 /// caller-facing receipt from this plus its pipeline-local context.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Response {
-    /// The command was applied. For [`Command::AdvanceRef`],
-    /// `accepted == 1` on a fresh advancement and `0` on an
-    /// idempotent retry (the cached outcome was returned instead).
-    Applied {
-        head_t: i64,
-        head_id: ContentId,
-        accepted: usize,
-        /// Execution records the wrapper should release after this
-        /// response. Echoed from [`AdvanceRefArgs::release`] so apply
-        /// stays pure — the side-effecting deletes happen at the
-        /// adapter layer above.
-        release: Vec<ExecutionRecordRef>,
-        /// Tracking accounting — fresh apply returns what staging
-        /// produced; idempotent retry returns the cached tally from
-        /// the original submission. `None` when tracking wasn't
-        /// requested.
-        tally: Option<RecordedTally>,
-    },
-    /// CAS check failed — `expected_prev` didn't match the current
-    /// head. Caller's writer needs to re-stage against the
-    /// returned head.
-    Conflict {
-        current_head: Option<ContentId>,
-        current_t: Option<i64>,
-    },
     /// [`Command::AdvanceIndexHead`] succeeded. Carries the new
     /// index head + t so the proposing publisher can confirm what
     /// was committed.
@@ -721,12 +645,12 @@ pub enum Response {
     /// registered. Idempotent at the trait layer; carried as a
     /// distinct variant so event emission can skip it.
     AlreadyPurged { ledger_id: String },
-    /// [`Command::AdvanceRef`] referenced a ledger that doesn't
-    /// exist in the state machine.
+    /// Command referenced a ledger that doesn't exist in the state
+    /// machine.
     LedgerNotFound { ledger_id: String },
-    /// [`Command::AdvanceRef`] carried an idempotency key already
-    /// recorded for a different body. A client bug; surfaces rather
-    /// than silently dedup.
+    /// [`Command::EnqueueCommand`] carried an idempotency key already
+    /// recorded for a different envelope CID. A client bug; surfaces
+    /// rather than silently dedup.
     BodyHashMismatch,
     /// [`Command::EnqueueCommand`] appended a fresh entry to the
     /// per-branch queue. Worker will pick it up.
@@ -774,12 +698,11 @@ pub enum Response {
         reason: PoisonReason,
     },
     /// [`Command::EvictIdempotency`] removed `removed` entries.
-    /// `released_request_cids` carries CIDs the wrapper should fan
-    /// out as `Command::ReleaseContent` (or piggyback on the next
-    /// `ApplyHead`).
+    /// `released_envelopes` carries `(ledger_id, request_cid)` pairs
+    /// the wrapper releases from the per-ledger content store.
     EvictionApplied {
         removed: usize,
-        released_request_cids: Vec<ContentId>,
+        released_envelopes: Vec<(String, ContentId)>,
     },
     /// Command was understood but no state change resulted (e.g.,
     /// [`Command::ReleaseContent`]).
@@ -843,7 +766,6 @@ impl NameServiceState {
 /// time for any state-machine bookkeeping that needs it.
 pub fn apply(state: &mut NameServiceState, command: Command, log_index: u64) -> Response {
     match command {
-        Command::AdvanceRef(args) => advance_ref(state, log_index, args),
         Command::AdvanceIndexHead(args) => advance_index_head(state, args),
         Command::CreateLedger(args) => create_ledger(state, log_index, args),
         Command::CreateBranch(args) => create_branch(state, log_index, args),
@@ -864,121 +786,6 @@ pub fn apply(state: &mut NameServiceState, command: Command, log_index: u64) -> 
         Command::EvictIdempotency { cutoff_millis } => {
             apply_evict_idempotency(state, cutoff_millis)
         }
-    }
-}
-
-fn advance_ref(
-    state: &mut NameServiceState,
-    log_index: u64,
-    args: AdvanceRefArgs,
-) -> Response {
-    let AdvanceRefArgs {
-        ledger_id,
-        branch,
-        expected_prev,
-        new_head,
-        t,
-        applied_at_millis,
-        idempotency,
-        release,
-        tally,
-    } = args;
-
-    // Idempotency hit takes precedence — return the cached outcome
-    // (including the original submission's tally) without re-applying
-    // so a duplicate proposal is a no-op. Release list still flows
-    // through: it's about *other* submissions' cleanup, independent
-    // of this command's apply outcome.
-    //
-    // AdvanceRef only matches `Applied` cached outcomes — a
-    // `Failed` cache entry under the same key means the caller
-    // shouldn't be using AdvanceRef (the queue path is what
-    // produces Failed entries). Treat as a body-hash mismatch
-    // since the comparison is undefined.
-    if let Some(ctx) = &idempotency {
-        match state.idempotency.get(&ctx.key) {
-            Some(ApplyOutcome::Applied(existing)) => {
-                if existing.body_hash != ctx.body_hash {
-                    return Response::BodyHashMismatch;
-                }
-                return Response::Applied {
-                    head_t: existing.t,
-                    head_id: existing.head.clone(),
-                    accepted: 0,
-                    release,
-                    tally: existing.tally.clone(),
-                };
-            }
-            Some(ApplyOutcome::Failed(_)) => {
-                return Response::BodyHashMismatch;
-            }
-            None => {}
-        }
-    }
-
-    let Some(ledger) = state.ledgers.get_mut(&ledger_id) else {
-        return Response::LedgerNotFound { ledger_id };
-    };
-
-    let ref_key = RefKey::new(&ledger_id, &branch);
-    let current = state.refs.get(&ref_key);
-    let current_head = current.map(|r| r.head.clone());
-    let current_t = current.map(|r| r.t);
-
-    if expected_prev != current_head {
-        return Response::Conflict {
-            current_head,
-            current_t,
-        };
-    }
-
-    if !ledger.branches.contains(&branch) {
-        ledger.branches.push(branch.clone());
-    }
-
-    // Carry the existing index and lineage forward across commit
-    // advances — the new commit doesn't index itself (that happens
-    // later via `AdvanceIndexHead`), and it doesn't change parentage
-    // or child count.
-    let (prior_index, prior_source, prior_branches) = state
-        .refs
-        .get(&ref_key)
-        .map(|r| (r.index.clone(), r.source_branch.clone(), r.branches))
-        .unwrap_or_default();
-    state.refs.insert(
-        ref_key,
-        RefEntry {
-            head: new_head.clone(),
-            t,
-            last_advanced_at_millis: applied_at_millis,
-            last_advanced_index: log_index,
-            index: prior_index,
-            source_branch: prior_source,
-            branches: prior_branches,
-        },
-    );
-
-    if let Some(ctx) = idempotency {
-        state.idempotency.insert(
-            ctx.key,
-            ApplyOutcome::Applied(ApplyRecord {
-                body_hash: ctx.body_hash,
-                request_cid: None,
-                recorded_at_millis: applied_at_millis,
-                head: new_head.clone(),
-                t,
-                recorded_index: log_index,
-                tally: tally.clone(),
-            }),
-        );
-    }
-
-    Response::Applied {
-        head_t: t,
-        head_id: new_head,
-        accepted: 1,
-        release,
-        tally,
     }
 }
 
@@ -1345,15 +1152,12 @@ fn apply_enqueue_command(
     let ref_key = RefKey::new(&ledger_id, &branch);
 
     // 1. Idempotency cache — one lookup, branch on outcome
-    //    variant. The request_cid must match; mismatched bodies
+    //    variant. The request_cid must match; mismatched envelopes
     //    under the same key are a client bug we surface rather
-    //    than silently dedup. Legacy AdvanceRef-populated success
-    //    entries have `request_cid: None`; any queue retry against
-    //    one of those can't safely match and surfaces as a
-    //    BodyHashMismatch (the comparison is undefined).
+    //    than silently dedup.
     if let Some(key) = idempotency.as_ref() {
         if let Some(outcome) = state.idempotency.get(key) {
-            if outcome.request_cid() != Some(&request_cid) {
+            if outcome.request_cid() != &request_cid {
                 return Response::BodyHashMismatch;
             }
             return match outcome {
@@ -1535,8 +1339,7 @@ fn apply_head(
         state.idempotency.insert(
             key,
             ApplyOutcome::Applied(ApplyRecord {
-                body_hash: [0u8; 32],
-                request_cid: Some(entry.request_cid),
+                request_cid: entry.request_cid,
                 recorded_at_millis: applied_at_millis,
                 head: commit_id.clone(),
                 t: commit_t,
@@ -1616,16 +1419,15 @@ fn apply_evict_idempotency(state: &mut NameServiceState, cutoff_millis: u64) -> 
     expired.sort_by_key(|(at, idx, _)| (*at, *idx));
     expired.truncate(EVICT_BATCH_SIZE);
 
-    let mut released_request_cids = Vec::with_capacity(expired.len());
+    let mut released_envelopes = Vec::with_capacity(expired.len());
     for (_, _, key) in &expired {
+        let ledger_id = key.ledger_id.clone();
         match state.idempotency.remove(key) {
             Some(ApplyOutcome::Applied(record)) => {
-                if let Some(cid) = record.request_cid {
-                    released_request_cids.push(cid);
-                }
+                released_envelopes.push((ledger_id, record.request_cid));
             }
             Some(ApplyOutcome::Failed(record)) => {
-                released_request_cids.push(record.request_cid);
+                released_envelopes.push((ledger_id, record.request_cid));
             }
             None => {}
         }
@@ -1635,7 +1437,7 @@ fn apply_evict_idempotency(state: &mut NameServiceState, cutoff_millis: u64) -> 
 
     Response::EvictionApplied {
         removed,
-        released_request_cids,
+        released_envelopes,
     }
 }
 
@@ -1668,59 +1470,44 @@ mod tests {
     /// `apply` call.
     fn create_ledger_with_genesis(state: &mut NameServiceState, ledger_id: &str) {
         apply(state, create_ledger(ledger_id), 1);
-        apply(
-            state,
-            advance(ledger_id, "main", None, cid(0), 0, None),
-            1,
-        );
+        seed_head(state, ledger_id, "main", cid(0), 0);
     }
 
-    fn advance(
+    /// Direct state mutation that mirrors what `Command::ApplyHead`
+    /// did for the legacy `Command::AdvanceRef` path — seeds a
+    /// branch's head without going through the queue. Used by tests
+    /// that need a populated branch head as setup but aren't
+    /// exercising the apply pipeline itself.
+    fn seed_head(
+        state: &mut NameServiceState,
         ledger_id: &str,
         branch: &str,
-        expected_prev: Option<ContentId>,
-        new_head: ContentId,
+        head: ContentId,
         t: i64,
-        idempotency: Option<IdempotencyContext>,
-    ) -> Command {
-        advance_with_release(
-            ledger_id,
-            branch,
-            expected_prev,
-            new_head,
-            t,
-            idempotency,
-            Vec::new(),
-        )
-    }
-
-    fn advance_with_release(
-        ledger_id: &str,
-        branch: &str,
-        expected_prev: Option<ContentId>,
-        new_head: ContentId,
-        t: i64,
-        idempotency: Option<IdempotencyContext>,
-        release: Vec<ExecutionRecordRef>,
-    ) -> Command {
-        Command::AdvanceRef(AdvanceRefArgs {
-            ledger_id: ledger_id.into(),
-            branch: branch.into(),
-            expected_prev,
-            new_head,
-            t,
-            applied_at_millis: 2_000,
-            idempotency,
-            release,
-            tally: None,
-        })
-    }
-
-    fn ctx(ledger_id: &str, key: &str, body_hash: [u8; 32]) -> IdempotencyContext {
-        IdempotencyContext {
-            key: IdempotencyCacheKey::new(ledger_id, IdempotencyKey::new(key)),
-            body_hash,
+    ) {
+        if let Some(ledger) = state.ledgers.get_mut(ledger_id) {
+            if !ledger.branches.iter().any(|b| b == branch) {
+                ledger.branches.push(branch.to_string());
+            }
         }
+        let ref_key = RefKey::new(ledger_id, branch);
+        let (prior_index, prior_source, prior_branches) = state
+            .refs
+            .get(&ref_key)
+            .map(|r| (r.index.clone(), r.source_branch.clone(), r.branches))
+            .unwrap_or_default();
+        state.refs.insert(
+            ref_key,
+            RefEntry {
+                head,
+                t,
+                last_advanced_at_millis: 2_000,
+                last_advanced_index: 1,
+                index: prior_index,
+                source_branch: prior_source,
+                branches: prior_branches,
+            },
+        );
     }
 
     #[test]
@@ -1794,182 +1581,6 @@ mod tests {
                 ledger_id: "test/db:main".into()
             }
         );
-    }
-
-    #[test]
-    fn advance_ref_succeeds_when_expected_prev_matches() {
-        let mut state = NameServiceState::new();
-        create_ledger_with_genesis(&mut state, "test/db");
-        let resp = apply(
-            &mut state,
-            advance("test/db", "main", Some(cid(0)), cid(1), 1, None),
-            2,
-        );
-        assert_eq!(
-            resp,
-            Response::Applied {
-                head_t: 1,
-                head_id: cid(1),
-                accepted: 1,
-                release: vec![],
-                tally: None,
-            }
-        );
-        let ref_entry = state.refs.get(&RefKey::new("test/db", "main")).unwrap();
-        assert_eq!(ref_entry.head, cid(1));
-        assert_eq!(ref_entry.last_advanced_index, 2);
-    }
-
-    #[test]
-    fn advance_ref_returns_conflict_on_cas_mismatch() {
-        let mut state = NameServiceState::new();
-        create_ledger_with_genesis(&mut state, "test/db");
-        let resp = apply(
-            &mut state,
-            advance("test/db", "main", Some(cid(99)), cid(1), 1, None),
-            2,
-        );
-        assert_eq!(
-            resp,
-            Response::Conflict {
-                current_head: Some(cid(0)),
-                current_t: Some(0),
-            }
-        );
-        // Ref untouched.
-        let ref_entry = state.refs.get(&RefKey::new("test/db", "main")).unwrap();
-        assert_eq!(ref_entry.head, cid(0));
-    }
-
-    #[test]
-    fn advance_ref_creates_new_branch_when_expected_prev_is_none() {
-        let mut state = NameServiceState::new();
-        apply(&mut state, create_ledger("test/db"), 1);
-        let resp = apply(
-            &mut state,
-            advance("test/db", "feature", None, cid(2), 5, None),
-            3,
-        );
-        assert_eq!(
-            resp,
-            Response::Applied {
-                head_t: 5,
-                head_id: cid(2),
-                accepted: 1,
-                release: vec![],
-                tally: None,
-            }
-        );
-        let ledger = state.ledgers.get("test/db").unwrap();
-        assert!(ledger.branches.contains(&"feature".to_string()));
-    }
-
-    #[test]
-    fn advance_ref_returns_ledger_not_found_for_unknown_ledger() {
-        let mut state = NameServiceState::new();
-        let resp = apply(
-            &mut state,
-            advance("missing/db", "main", None, cid(1), 1, None),
-            1,
-        );
-        assert_eq!(
-            resp,
-            Response::LedgerNotFound {
-                ledger_id: "missing/db".into()
-            }
-        );
-    }
-
-    #[test]
-    fn advance_ref_caches_idempotency_outcome() {
-        let mut state = NameServiceState::new();
-        create_ledger_with_genesis(&mut state, "test/db");
-
-        let body_hash = [7u8; 32];
-        let resp1 = apply(
-            &mut state,
-            advance(
-                "test/db",
-                "main",
-                Some(cid(0)),
-                cid(1),
-                1,
-                Some(ctx("test/db", "k1", body_hash)),
-            ),
-            2,
-        );
-        assert_eq!(
-            resp1,
-            Response::Applied {
-                head_t: 1,
-                head_id: cid(1),
-                accepted: 1,
-                release: vec![],
-                tally: None,
-            }
-        );
-
-        // Retry with the same key + body — no re-apply, cached
-        // outcome returned, accepted == 0.
-        let resp2 = apply(
-            &mut state,
-            advance(
-                "test/db",
-                "main",
-                Some(cid(1)),
-                cid(2),
-                2,
-                Some(ctx("test/db", "k1", body_hash)),
-            ),
-            3,
-        );
-        assert_eq!(
-            resp2,
-            Response::Applied {
-                head_t: 1,
-                head_id: cid(1),
-                accepted: 0,
-                release: vec![],
-                tally: None,
-            }
-        );
-
-        // Head unchanged.
-        let ref_entry = state.refs.get(&RefKey::new("test/db", "main")).unwrap();
-        assert_eq!(ref_entry.head, cid(1));
-    }
-
-    #[test]
-    fn advance_ref_rejects_body_hash_collision_on_idempotent_retry() {
-        let mut state = NameServiceState::new();
-        create_ledger_with_genesis(&mut state, "test/db");
-
-        apply(
-            &mut state,
-            advance(
-                "test/db",
-                "main",
-                Some(cid(0)),
-                cid(1),
-                1,
-                Some(ctx("test/db", "k1", [7u8; 32])),
-            ),
-            2,
-        );
-
-        let resp = apply(
-            &mut state,
-            advance(
-                "test/db",
-                "main",
-                Some(cid(1)),
-                cid(2),
-                2,
-                Some(ctx("test/db", "k1", [8u8; 32])),
-            ),
-            3,
-        );
-        assert_eq!(resp, Response::BodyHashMismatch);
     }
 
     #[test]
@@ -2159,11 +1770,7 @@ mod tests {
     fn create_branch_forks_from_source_head_when_at_commit_is_none() {
         let mut state = NameServiceState::new();
         create_ledger_with_genesis(&mut state, "test/db");
-        apply(
-            &mut state,
-            advance("test/db", "main", Some(cid(0)), cid(1), 7, None),
-            2,
-        );
+        seed_head(&mut state, "test/db", "main", cid(1), 7);
 
         let resp = apply(
             &mut state,
@@ -2189,11 +1796,7 @@ mod tests {
     fn create_branch_uses_at_commit_when_supplied() {
         let mut state = NameServiceState::new();
         create_ledger_with_genesis(&mut state, "test/db");
-        apply(
-            &mut state,
-            advance("test/db", "main", Some(cid(0)), cid(1), 7, None),
-            2,
-        );
+        seed_head(&mut state, "test/db", "main", cid(1), 7);
 
         let resp = apply(
             &mut state,
@@ -2396,11 +1999,7 @@ mod tests {
     fn reset_head_rewrites_branch_state_from_snapshot() {
         let mut state = NameServiceState::new();
         create_ledger_with_genesis(&mut state, "test/db");
-        apply(
-            &mut state,
-            advance("test/db", "main", Some(cid(0)), cid(5), 10, None),
-            2,
-        );
+        seed_head(&mut state, "test/db", "main", cid(5), 10);
         apply(
             &mut state,
             advance_index("test/db", "main", cid(42), 10),
@@ -2496,22 +2095,20 @@ mod tests {
     fn snapshot_round_trip_preserves_state() {
         let mut state = NameServiceState::new();
         create_ledger_with_genesis(&mut state, "test/db");
-        apply(
-            &mut state,
-            advance("test/db", "main", Some(cid(0)), cid(1), 1, None),
-            2,
-        );
-        apply(
-            &mut state,
-            advance(
-                "test/db",
-                "feature",
-                None,
-                cid(2),
-                5,
-                Some(ctx("test/db", "k1", [7u8; 32])),
-            ),
-            3,
+        seed_head(&mut state, "test/db", "main", cid(1), 1);
+        seed_head(&mut state, "test/db", "feature", cid(2), 5);
+        // Seed an idempotency entry too so the snapshot covers that
+        // dimension of the state shape.
+        state.idempotency.insert(
+            IdempotencyCacheKey::new("test/db", IdempotencyKey::new("k1")),
+            ApplyOutcome::Applied(ApplyRecord {
+                request_cid: cid(7),
+                recorded_at_millis: 2_000,
+                head: cid(2),
+                t: 5,
+                recorded_index: 3,
+                tally: None,
+            }),
         );
         apply(
             &mut state,
@@ -2525,149 +2122,6 @@ mod tests {
         let bytes = state.to_snapshot().unwrap();
         let restored = NameServiceState::from_snapshot(&bytes).unwrap();
         assert_eq!(state, restored);
-    }
-
-    #[test]
-    fn apply_then_snapshot_then_restore_then_apply_continues_correctly() {
-        let mut state = NameServiceState::new();
-        create_ledger_with_genesis(&mut state, "test/db");
-
-        let bytes = state.to_snapshot().unwrap();
-        let mut restored = NameServiceState::from_snapshot(&bytes).unwrap();
-
-        let resp = apply(
-            &mut restored,
-            advance("test/db", "main", Some(cid(0)), cid(1), 1, None),
-            2,
-        );
-        assert_eq!(
-            resp,
-            Response::Applied {
-                head_t: 1,
-                head_id: cid(1),
-                accepted: 1,
-                release: vec![],
-                tally: None,
-            }
-        );
-    }
-
-    #[test]
-    fn release_propagates_to_applied_response() {
-        let mut state = NameServiceState::new();
-        create_ledger_with_genesis(&mut state, "test/db");
-
-        let releases = vec![
-            ExecutionRecordRef::new(
-                IdempotencyCacheKey::new("test/db", IdempotencyKey::new("k_old1")),
-                [1u8; 32],
-            ),
-            ExecutionRecordRef::new(
-                IdempotencyCacheKey::new("test/db", IdempotencyKey::new("k_old2")),
-                [2u8; 32],
-            ),
-        ];
-
-        let resp = apply(
-            &mut state,
-            advance_with_release(
-                "test/db",
-                "main",
-                Some(cid(0)),
-                cid(1),
-                1,
-                None,
-                releases.clone(),
-            ),
-            2,
-        );
-
-        assert_eq!(
-            resp,
-            Response::Applied {
-                head_t: 1,
-                head_id: cid(1),
-                accepted: 1,
-                release: releases,
-                tally: None,
-            }
-        );
-    }
-
-    #[test]
-    fn release_propagates_on_idempotency_hit() {
-        let mut state = NameServiceState::new();
-        create_ledger_with_genesis(&mut state, "test/db");
-
-        let body_hash = [7u8; 32];
-        // First apply seeds the idempotency cache.
-        apply(
-            &mut state,
-            advance(
-                "test/db",
-                "main",
-                Some(cid(0)),
-                cid(1),
-                1,
-                Some(ctx("test/db", "k1", body_hash)),
-            ),
-            2,
-        );
-
-        // Second apply with the same key + body hits the cache. The
-        // release list it carries should still flow through to the
-        // response so the wrapper performs the cleanup.
-        let releases = vec![ExecutionRecordRef::new(
-            IdempotencyCacheKey::new("test/db", IdempotencyKey::new("k_old")),
-            [42u8; 32],
-        )];
-
-        let resp = apply(
-            &mut state,
-            advance_with_release(
-                "test/db",
-                "main",
-                Some(cid(1)),
-                cid(2),
-                2,
-                Some(ctx("test/db", "k1", body_hash)),
-                releases.clone(),
-            ),
-            3,
-        );
-
-        assert_eq!(
-            resp,
-            Response::Applied {
-                head_t: 1,
-                head_id: cid(1),
-                accepted: 0,
-                release: releases,
-                tally: None,
-            }
-        );
-    }
-
-    #[test]
-    fn release_is_dropped_on_cas_conflict() {
-        let mut state = NameServiceState::new();
-        create_ledger_with_genesis(&mut state, "test/db");
-
-        let releases = vec![ExecutionRecordRef::new(
-            IdempotencyCacheKey::new("test/db", IdempotencyKey::new("k_old")),
-            [99u8; 32],
-        )];
-
-        // Wrong expected_prev → Conflict, which has no release
-        // field. The leader's buffer retains the releases and retries
-        // them on the next successful proposal.
-        let resp = apply(
-            &mut state,
-            advance_with_release("test/db", "main", Some(cid(99)), cid(1), 1, None, releases),
-            2,
-        );
-
-        assert!(matches!(resp, Response::Conflict { .. }));
     }
 
     // -------------------------------------------------------------
@@ -2689,11 +2143,7 @@ mod tests {
     fn ledger_with_commit_at_t10() -> NameServiceState {
         let mut state = NameServiceState::new();
         create_ledger_with_genesis(&mut state, "test/db");
-        apply(
-            &mut state,
-            advance("test/db", "main", Some(cid(0)), cid(1), 10, None),
-            2,
-        );
+        seed_head(&mut state, "test/db", "main", cid(1), 10);
         state
     }
 
@@ -2806,11 +2256,7 @@ mod tests {
         // pointer to the latest index either.
         let mut state = ledger_with_commit_at_t10();
         apply(&mut state, advance_index("test/db", "main", cid(42), 10), 3);
-        apply(
-            &mut state,
-            advance("test/db", "main", Some(cid(1)), cid(2), 20, None),
-            4,
-        );
+        seed_head(&mut state, "test/db", "main", cid(2), 20);
 
         let entry = ref_entry(&state, "test/db", "main");
         assert_eq!(entry.head, cid(2));
@@ -2833,12 +2279,12 @@ mod tests {
         ledger_id: &str,
         branch: &str,
         body_seed: u8,
-        idempotency: Option<IdempotencyContext>,
+        idempotency: Option<IdempotencyCacheKey>,
     ) -> Command {
         Command::EnqueueCommand(EnqueueCommandArgs {
             ledger_id: ledger_id.into(),
             branch: branch.into(),
-            idempotency: idempotency.map(|c| c.key),
+            idempotency,
             request_cid: cid(body_seed),
             body_kind: BodyKind::JsonLdInsert,
             applied_at_millis: 1_000,
@@ -2876,8 +2322,7 @@ mod tests {
         state.idempotency.insert(
             key.clone(),
             ApplyOutcome::Applied(ApplyRecord {
-                body_hash: [0u8; 32],
-                request_cid: Some(cid(7)),
+                request_cid: cid(7),
                 recorded_at_millis: 500,
                 head: cid(42),
                 t: 5,
@@ -2891,10 +2336,7 @@ mod tests {
                 "test/db",
                 "main",
                 7,
-                Some(IdempotencyContext {
-                    key: key.clone(),
-                    body_hash: [0u8; 32],
-                }),
+                Some(key.clone()),
             ),
             10,
         );
@@ -2916,8 +2358,7 @@ mod tests {
         state.idempotency.insert(
             key.clone(),
             ApplyOutcome::Applied(ApplyRecord {
-                body_hash: [0u8; 32],
-                request_cid: Some(cid(7)),
+                request_cid: cid(7),
                 recorded_at_millis: 500,
                 head: cid(42),
                 t: 5,
@@ -2931,10 +2372,7 @@ mod tests {
                 "test/db",
                 "main",
                 8, // different body
-                Some(IdempotencyContext {
-                    key,
-                    body_hash: [0u8; 32],
-                }),
+                Some(key),
             ),
             10,
         );
@@ -2951,10 +2389,7 @@ mod tests {
                 "test/db",
                 "main",
                 7,
-                Some(IdempotencyContext {
-                    key: key.clone(),
-                    body_hash: [0u8; 32],
-                }),
+                Some(key.clone()),
             ),
             1,
         );
@@ -2968,10 +2403,7 @@ mod tests {
                 "test/db",
                 "main",
                 7,
-                Some(IdempotencyContext {
-                    key,
-                    body_hash: [0u8; 32],
-                }),
+                Some(key),
             ),
             2,
         );
@@ -3055,10 +2487,7 @@ mod tests {
                 "test/db",
                 "main",
                 7,
-                Some(IdempotencyContext {
-                    key: key.clone(),
-                    body_hash: [0u8; 32],
-                }),
+                Some(key.clone()),
             ),
             2,
         );
@@ -3104,7 +2533,7 @@ mod tests {
             ApplyOutcome::Applied(r) => r,
             ApplyOutcome::Failed(_) => panic!("expected Applied outcome"),
         };
-        assert_eq!(record.request_cid.as_ref(), Some(&cid(7)));
+        assert_eq!(record.request_cid, cid(7));
         assert_eq!(record.head, cid(42));
     }
 
@@ -3252,10 +2681,7 @@ mod tests {
                 "test/db",
                 "main",
                 7,
-                Some(IdempotencyContext {
-                    key: key.clone(),
-                    body_hash: [0u8; 32],
-                }),
+                Some(key.clone()),
             ),
             2,
         );
@@ -3396,12 +2822,11 @@ mod tests {
     // ====================================================================
 
     fn applied_outcome(
-        request_cid: Option<ContentId>,
+        request_cid: ContentId,
         recorded_at_millis: u64,
         recorded_index: u64,
     ) -> ApplyOutcome {
         ApplyOutcome::Applied(ApplyRecord {
-            body_hash: [0u8; 32],
             request_cid,
             recorded_at_millis,
             head: cid(99),
@@ -3439,19 +2864,20 @@ mod tests {
     #[test]
     fn evict_removes_entries_below_cutoff_and_returns_released_cids() {
         let mut state = NameServiceState::new();
-        install_outcome(&mut state, "old_applied", applied_outcome(Some(cid(1)), 100, 1));
+        install_outcome(&mut state, "old_applied", applied_outcome(cid(1), 100, 1));
         install_outcome(&mut state, "old_failed", failed_outcome(cid(2), 150, 2));
-        install_outcome(&mut state, "fresh_applied", applied_outcome(Some(cid(3)), 500, 3));
+        install_outcome(&mut state, "fresh_applied", applied_outcome(cid(3), 500, 3));
 
         let resp = apply(&mut state, evict(200), 4);
 
         match resp {
             Response::EvictionApplied {
                 removed,
-                released_request_cids,
+                released_envelopes,
             } => {
                 assert_eq!(removed, 2);
-                let cids: HashSet<_> = released_request_cids.into_iter().collect();
+                let cids: HashSet<_> =
+                    released_envelopes.into_iter().map(|(_, cid)| cid).collect();
                 assert_eq!(cids, HashSet::from([cid(1), cid(2)]));
             }
             other => panic!("expected EvictionApplied, got {other:?}"),
@@ -3469,7 +2895,7 @@ mod tests {
         // The cutoff is strict: entries with `recorded_at_millis == cutoff`
         // are still considered fresh.
         let mut state = NameServiceState::new();
-        install_outcome(&mut state, "boundary", applied_outcome(Some(cid(1)), 200, 1));
+        install_outcome(&mut state, "boundary", applied_outcome(cid(1), 200, 1));
 
         let resp = apply(&mut state, evict(200), 2);
         match resp {
@@ -3480,20 +2906,22 @@ mod tests {
     }
 
     #[test]
-    fn evict_skips_applied_entries_with_no_request_cid() {
-        // Legacy AdvanceRef applies set `request_cid: None`. Eviction
-        // still removes the entry but the released list stays empty.
+    fn evict_releases_request_cid_for_applied_entries() {
+        // Queue-mediated applies always carry a request_cid.
+        // Eviction surfaces it in the released list so the GC layer
+        // can release the envelope from CAS.
         let mut state = NameServiceState::new();
-        install_outcome(&mut state, "legacy", applied_outcome(None, 100, 1));
+        install_outcome(&mut state, "queued", applied_outcome(cid(11), 100, 1));
 
         let resp = apply(&mut state, evict(200), 2);
         match resp {
             Response::EvictionApplied {
                 removed,
-                released_request_cids,
+                released_envelopes,
             } => {
                 assert_eq!(removed, 1);
-                assert!(released_request_cids.is_empty());
+                assert_eq!(released_envelopes.len(), 1);
+                assert_eq!(released_envelopes[0].1, cid(11));
             }
             other => panic!("expected EvictionApplied, got {other:?}"),
         }
@@ -3511,7 +2939,7 @@ mod tests {
             install_outcome(
                 &mut state,
                 &key,
-                applied_outcome(Some(cid(i as u8 % 200)), i as u64, i as u64),
+                applied_outcome(cid(i as u8 % 200), i as u64, i as u64),
             );
         }
 
@@ -3542,10 +2970,10 @@ mod tests {
         match resp {
             Response::EvictionApplied {
                 removed,
-                released_request_cids,
+                released_envelopes,
             } => {
                 assert_eq!(removed, 0);
-                assert!(released_request_cids.is_empty());
+                assert!(released_envelopes.is_empty());
             }
             other => panic!("expected EvictionApplied, got {other:?}"),
         }
@@ -3703,11 +3131,7 @@ mod tests {
     fn reset_head_clears_queue_and_stamps_marker() {
         let mut state = NameServiceState::new();
         create_ledger_with_genesis(&mut state, "test/db");
-        apply(
-            &mut state,
-            advance("test/db", "main", Some(cid(0)), cid(5), 10, None),
-            2,
-        );
+        seed_head(&mut state, "test/db", "main", cid(5), 10);
         apply(&mut state, enqueue("test/db", "main", 7, None), 3);
 
         apply(

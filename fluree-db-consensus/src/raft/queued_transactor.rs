@@ -20,7 +20,8 @@
 //! legacy `RaftCommitter` while we move call sites onto the queue.
 
 use crate::raft::state_machine::{
-    BodyKind, Command as SmCommand, EnqueueCommandArgs, RefKey, Response as SmResponse,
+    ApplyRecord, BodyKind, Command as SmCommand, EnqueueCommandArgs, PoisonRecord, RefKey,
+    Response as SmResponse,
 };
 use crate::raft::staged_receipt::AppliedReceipt;
 use crate::raft::state_machine_adapter::SharedState;
@@ -39,7 +40,20 @@ use fluree_db_core::ContentKind;
 use fluree_db_transact::CommitOptsRequest;
 use openraft::Raft;
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
+
+/// How long a single waiter `await` blocks before the transactor
+/// considers the call stranded by a leader transition and either
+/// re-issues (idempotent submissions) or errors out (anonymous
+/// submissions). Conservative — the typical Raft round-trip is
+/// sub-second; this is the budget for "something went wrong."
+const DEFAULT_WAIT_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// Number of (propose → register waiter → await) attempts before the
+/// transactor gives up on an idempotent submission. Each attempt
+/// re-proposes the same `EnqueueCommand`; the state machine's
+/// idempotency cache makes repeats safe.
+const DEFAULT_MAX_RETRIES: usize = 3;
 
 /// Committer that routes transactions through the per-branch Raft
 /// queue.
@@ -56,6 +70,8 @@ pub struct QueuedTransactor {
     /// parent before deciding which per-branch queue the entry rides
     /// on.
     shared_state: SharedState,
+    wait_timeout: Duration,
+    max_retries: usize,
 }
 
 impl QueuedTransactor {
@@ -70,8 +86,122 @@ impl QueuedTransactor {
             fluree,
             waiter_map,
             shared_state,
+            wait_timeout: DEFAULT_WAIT_TIMEOUT,
+            max_retries: DEFAULT_MAX_RETRIES,
         }
     }
+
+    /// Override the per-attempt waiter timeout (default 8s).
+    pub fn with_wait_timeout(mut self, timeout: Duration) -> Self {
+        self.wait_timeout = timeout;
+        self
+    }
+
+    /// Override the retry budget for idempotency-keyed submissions
+    /// (default 3 attempts total).
+    pub fn with_max_retries(mut self, max_retries: usize) -> Self {
+        self.max_retries = max_retries;
+        self
+    }
+
+    /// Submit an `EnqueueCommand`, register a waiter on
+    /// `Enqueued`/`InFlight` responses, and await the outcome with a
+    /// bounded timeout. On timeout — or on a stale waiter whose
+    /// channel got overridden — re-propose the same command iff
+    /// `retry_eligible` is true; the state machine's idempotency
+    /// cache short-circuits to `IdempotencyHit` once the original
+    /// processing completes.
+    ///
+    /// `retry_eligible` should mirror whether the command carries
+    /// an idempotency key: without one, re-proposing would create a
+    /// duplicate queue entry rather than hitting the cache.
+    async fn submit_and_await(
+        &self,
+        cmd: SmCommand,
+        ref_key: RefKey,
+        retry_eligible: bool,
+    ) -> Result<SubmissionOutcome, SubmissionError> {
+        let attempts_allowed = if retry_eligible { self.max_retries } else { 1 };
+        for attempt in 0..attempts_allowed {
+            let response = self
+                .raft
+                .client_write(cmd.clone())
+                .await
+                .map_err(|e| SubmissionError::Execution {
+                    status: 500,
+                    message: format!("raft client_write failed: {e}"),
+                })?;
+            match response.data {
+                SmResponse::Enqueued { queue_id, .. } | SmResponse::InFlight { queue_id, .. } => {
+                    let rx = self.waiter_map.register(queue_id, ref_key.clone());
+                    match tokio::time::timeout(self.wait_timeout, rx).await {
+                        Ok(Ok(outcome)) => return Ok(SubmissionOutcome::Waiter(outcome)),
+                        Ok(Err(_recv)) => {
+                            // The sender for this queue_id was
+                            // dropped — most likely a duplicate
+                            // `register` overrode it. Treat the same
+                            // as a timeout: retry if eligible, error
+                            // otherwise.
+                            if attempt + 1 >= attempts_allowed {
+                                return Err(self.stranded_error(retry_eligible));
+                            }
+                        }
+                        Err(_elapsed) => {
+                            if attempt + 1 >= attempts_allowed {
+                                return Err(self.stranded_error(retry_eligible));
+                            }
+                        }
+                    }
+                }
+                SmResponse::IdempotencyHit { record } => {
+                    return Ok(SubmissionOutcome::Cached(record));
+                }
+                SmResponse::IdempotencyFailed { record } => {
+                    return Ok(SubmissionOutcome::CachedFailure(record));
+                }
+                SmResponse::BodyHashMismatch => return Err(SubmissionError::KeyCollision),
+                SmResponse::QueueFull { .. } => return Err(SubmissionError::Overloaded),
+                SmResponse::LedgerNotFound { ledger_id } => {
+                    return Err(SubmissionError::Execution {
+                        status: 404,
+                        message: format!("ledger not found: {ledger_id}"),
+                    });
+                }
+                other => {
+                    return Err(SubmissionError::Execution {
+                        status: 500,
+                        message: format!(
+                            "unexpected Response variant for EnqueueCommand: {other:?}"
+                        ),
+                    });
+                }
+            }
+        }
+        Err(self.stranded_error(retry_eligible))
+    }
+
+    fn stranded_error(&self, retry_eligible: bool) -> SubmissionError {
+        SubmissionError::Execution {
+            status: 504,
+            message: if retry_eligible {
+                "submission retry budget exhausted while waiting for queue resolution".into()
+            } else {
+                "submission stranded by leader transition; retry with an idempotency key".into()
+            },
+        }
+    }
+}
+
+/// Internal result shape `submit_and_await` returns to each
+/// `Committer` method. The method matches on the variants to build
+/// its operation-specific receipt or error.
+enum SubmissionOutcome {
+    /// Waiter resolved with an outcome (success or abort).
+    Waiter(WaiterOutcome),
+    /// Idempotency cache had a recorded success for the key.
+    Cached(ApplyRecord),
+    /// Idempotency cache had a recorded poison for the key.
+    CachedFailure(PoisonRecord),
 }
 
 #[async_trait]
@@ -126,6 +256,7 @@ impl Committer for QueuedTransactor {
                 message: format!("QueuedRequest CAS write failed: {e}"),
             })?;
 
+        let retry_eligible = idempotency_cache_key.is_some();
         let cmd = SmCommand::EnqueueCommand(EnqueueCommandArgs {
             ledger_id: ledger_name,
             branch,
@@ -135,64 +266,26 @@ impl Committer for QueuedTransactor {
             applied_at_millis: current_millis(),
         });
 
-        let response = self
-            .raft
-            .client_write(cmd)
-            .await
-            .map_err(|e| SubmissionError::Execution {
+        match self.submit_and_await(cmd, ref_key, retry_eligible).await? {
+            SubmissionOutcome::Waiter(WaiterOutcome::Applied(receipt)) => {
+                transaction_receipt_from(idempotency_key, receipt)
+            }
+            SubmissionOutcome::Waiter(WaiterOutcome::Aborted(reason)) => {
+                Err(submission_error_from_abort(reason))
+            }
+            SubmissionOutcome::Cached(record) => Ok(TransactionReceipt {
+                idempotency_key,
+                commit: CommitReceipt {
+                    commit_id: record.head,
+                    t: record.t,
+                    flake_count: 0,
+                },
+                tally: record.tally.map(Into::into),
+            }),
+            SubmissionOutcome::CachedFailure(record) => Err(SubmissionError::Execution {
                 status: 500,
-                message: format!("raft client_write failed: {e}"),
-            })?;
-
-        let waiter_rx = match response.data {
-            SmResponse::Enqueued { queue_id, .. } | SmResponse::InFlight { queue_id, .. } => {
-                self.waiter_map.register(queue_id, ref_key)
-            }
-            SmResponse::IdempotencyHit { record } => {
-                return Ok(TransactionReceipt {
-                    idempotency_key,
-                    commit: CommitReceipt {
-                        commit_id: record.head,
-                        t: record.t,
-                        flake_count: 0,
-                    },
-                    tally: record.tally.map(Into::into),
-                });
-            }
-            SmResponse::IdempotencyFailed { record } => {
-                return Err(SubmissionError::Execution {
-                    status: 500,
-                    message: format!("cached failure: {:?}", record.reason),
-                });
-            }
-            SmResponse::BodyHashMismatch => return Err(SubmissionError::KeyCollision),
-            SmResponse::QueueFull { .. } => return Err(SubmissionError::Overloaded),
-            SmResponse::LedgerNotFound { ledger_id } => {
-                return Err(SubmissionError::Execution {
-                    status: 404,
-                    message: format!("ledger not found: {ledger_id}"),
-                });
-            }
-            other => {
-                return Err(SubmissionError::Execution {
-                    status: 500,
-                    message: format!("unexpected Response variant for EnqueueCommand: {other:?}"),
-                });
-            }
-        };
-
-        let outcome = waiter_rx
-            .await
-            .map_err(|_| SubmissionError::Execution {
-                status: 503,
-                message: "queue waiter dropped before outcome — leader transition stranded the \
-                          submission; retry with the same idempotency key"
-                    .into(),
-            })?;
-
-        match outcome {
-            WaiterOutcome::Applied(receipt) => Ok(transaction_receipt_from(idempotency_key, receipt)?),
-            WaiterOutcome::Aborted(reason) => Err(submission_error_from_abort(reason)),
+                message: format!("cached failure: {:?}", record.reason),
+            }),
         }
     }
 
@@ -232,6 +325,7 @@ impl Committer for QueuedTransactor {
                 message: format!("QueuedRequest CAS write failed: {e}"),
             })?;
 
+        let retry_eligible = idempotency_cache_key.is_some();
         let cmd = SmCommand::EnqueueCommand(EnqueueCommandArgs {
             ledger_id: ledger_name,
             branch: branch.clone(),
@@ -241,75 +335,26 @@ impl Committer for QueuedTransactor {
             applied_at_millis: current_millis(),
         });
 
-        let response = self
-            .raft
-            .client_write(cmd)
-            .await
-            .map_err(|e| SubmissionError::Execution {
-                status: 500,
-                message: format!("raft client_write failed: {e}"),
-            })?;
-
-        let waiter_rx = match response.data {
-            SmResponse::Enqueued { queue_id, .. } | SmResponse::InFlight { queue_id, .. } => {
-                self.waiter_map.register(queue_id, ref_key)
+        match self.submit_and_await(cmd, ref_key, retry_eligible).await? {
+            SubmissionOutcome::Waiter(WaiterOutcome::Applied(receipt)) => {
+                revert_receipt_from(idempotency_key, branch, strategy, receipt)
             }
-            SmResponse::IdempotencyHit { record } => {
-                // Revert idempotency hit: the original revert produced
-                // this head. The cache record doesn't carry
-                // `reverted_commits` / `conflict_count` / strategy
-                // detail — surface conservative defaults the client
-                // can ignore or refresh with a query against the
-                // branch.
-                return Ok(RevertReceipt {
-                    idempotency_key,
-                    branch,
-                    reverted_commits: Vec::new(),
-                    conflict_count: 0,
-                    strategy,
-                    new_head_t: record.t,
-                    new_head_id: record.head,
-                });
+            SubmissionOutcome::Waiter(WaiterOutcome::Aborted(reason)) => {
+                Err(submission_error_from_abort(reason))
             }
-            SmResponse::IdempotencyFailed { record } => {
-                return Err(SubmissionError::Execution {
-                    status: 500,
-                    message: format!("cached failure: {:?}", record.reason),
-                });
-            }
-            SmResponse::BodyHashMismatch => return Err(SubmissionError::KeyCollision),
-            SmResponse::QueueFull { .. } => return Err(SubmissionError::Overloaded),
-            SmResponse::LedgerNotFound { ledger_id } => {
-                return Err(SubmissionError::Execution {
-                    status: 404,
-                    message: format!("ledger not found: {ledger_id}"),
-                });
-            }
-            other => {
-                return Err(SubmissionError::Execution {
-                    status: 500,
-                    message: format!("unexpected Response variant for EnqueueCommand: {other:?}"),
-                });
-            }
-        };
-
-        let outcome = waiter_rx
-            .await
-            .map_err(|_| SubmissionError::Execution {
-                status: 503,
-                message: "queue waiter dropped before outcome — leader transition stranded the \
-                          revert; retry with the same idempotency key"
-                    .into(),
-            })?;
-
-        match outcome {
-            WaiterOutcome::Applied(receipt) => Ok(revert_receipt_from(
+            SubmissionOutcome::Cached(record) => Ok(RevertReceipt {
                 idempotency_key,
                 branch,
+                reverted_commits: Vec::new(),
+                conflict_count: 0,
                 strategy,
-                receipt,
-            )?),
-            WaiterOutcome::Aborted(reason) => Err(submission_error_from_abort(reason)),
+                new_head_t: record.t,
+                new_head_id: record.head,
+            }),
+            SubmissionOutcome::CachedFailure(record) => Err(SubmissionError::Execution {
+                status: 500,
+                message: format!("cached failure: {:?}", record.reason),
+            }),
         }
     }
 
@@ -376,6 +421,7 @@ impl Committer for QueuedTransactor {
                 message: format!("QueuedRequest CAS write failed: {e}"),
             })?;
 
+        let retry_eligible = idempotency_cache_key.is_some();
         let cmd = SmCommand::EnqueueCommand(EnqueueCommandArgs {
             ledger_id: ledger_name,
             branch: target_for_queue.clone(),
@@ -385,72 +431,32 @@ impl Committer for QueuedTransactor {
             applied_at_millis: current_millis(),
         });
 
-        let response = self
-            .raft
-            .client_write(cmd)
-            .await
-            .map_err(|e| SubmissionError::Execution {
-                status: 500,
-                message: format!("raft client_write failed: {e}"),
-            })?;
-
-        let waiter_rx = match response.data {
-            SmResponse::Enqueued { queue_id, .. } | SmResponse::InFlight { queue_id, .. } => {
-                self.waiter_map.register(queue_id, ref_key)
-            }
-            SmResponse::IdempotencyHit { record } => {
-                return Ok(MergeReceipt {
-                    idempotency_key,
-                    source: source_branch,
-                    target: target_for_queue,
-                    fast_forward: false,
-                    new_head_t: record.t,
-                    new_head_id: record.head,
-                    commits_copied: 0,
-                    conflict_count: 0,
-                    strategy,
-                });
-            }
-            SmResponse::IdempotencyFailed { record } => {
-                return Err(SubmissionError::Execution {
-                    status: 500,
-                    message: format!("cached failure: {:?}", record.reason),
-                });
-            }
-            SmResponse::BodyHashMismatch => return Err(SubmissionError::KeyCollision),
-            SmResponse::QueueFull { .. } => return Err(SubmissionError::Overloaded),
-            SmResponse::LedgerNotFound { ledger_id } => {
-                return Err(SubmissionError::Execution {
-                    status: 404,
-                    message: format!("ledger not found: {ledger_id}"),
-                });
-            }
-            other => {
-                return Err(SubmissionError::Execution {
-                    status: 500,
-                    message: format!("unexpected Response variant for EnqueueCommand: {other:?}"),
-                });
-            }
-        };
-
-        let outcome = waiter_rx
-            .await
-            .map_err(|_| SubmissionError::Execution {
-                status: 503,
-                message: "queue waiter dropped before outcome — leader transition stranded the \
-                          merge; retry with the same idempotency key"
-                    .into(),
-            })?;
-
-        match outcome {
-            WaiterOutcome::Applied(receipt) => Ok(merge_receipt_from(
+        match self.submit_and_await(cmd, ref_key, retry_eligible).await? {
+            SubmissionOutcome::Waiter(WaiterOutcome::Applied(receipt)) => merge_receipt_from(
                 idempotency_key,
                 source_branch,
                 target_for_queue,
                 strategy,
                 receipt,
-            )?),
-            WaiterOutcome::Aborted(reason) => Err(submission_error_from_abort(reason)),
+            ),
+            SubmissionOutcome::Waiter(WaiterOutcome::Aborted(reason)) => {
+                Err(submission_error_from_abort(reason))
+            }
+            SubmissionOutcome::Cached(record) => Ok(MergeReceipt {
+                idempotency_key,
+                source: source_branch,
+                target: target_for_queue,
+                fast_forward: false,
+                new_head_t: record.t,
+                new_head_id: record.head,
+                commits_copied: 0,
+                conflict_count: 0,
+                strategy,
+            }),
+            SubmissionOutcome::CachedFailure(record) => Err(SubmissionError::Execution {
+                status: 500,
+                message: format!("cached failure: {:?}", record.reason),
+            }),
         }
     }
 
@@ -486,6 +492,7 @@ impl Committer for QueuedTransactor {
                 message: format!("QueuedRequest CAS write failed: {e}"),
             })?;
 
+        let retry_eligible = idempotency_cache_key.is_some();
         let cmd = SmCommand::EnqueueCommand(EnqueueCommandArgs {
             ledger_id: ledger_name,
             branch: branch.clone(),
@@ -495,73 +502,30 @@ impl Committer for QueuedTransactor {
             applied_at_millis: current_millis(),
         });
 
-        let response = self
-            .raft
-            .client_write(cmd)
-            .await
-            .map_err(|e| SubmissionError::Execution {
-                status: 500,
-                message: format!("raft client_write failed: {e}"),
-            })?;
-
-        let waiter_rx = match response.data {
-            SmResponse::Enqueued { queue_id, .. } | SmResponse::InFlight { queue_id, .. } => {
-                self.waiter_map.register(queue_id, ref_key)
+        match self.submit_and_await(cmd, ref_key, retry_eligible).await? {
+            SubmissionOutcome::Waiter(WaiterOutcome::Applied(receipt)) => {
+                rebase_receipt_from(idempotency_key, branch, strategy, receipt)
             }
-            SmResponse::IdempotencyHit { record } => {
-                return Ok(RebaseReceipt {
-                    idempotency_key,
-                    branch,
-                    fast_forward: false,
-                    replayed: 0,
-                    skipped: 0,
-                    conflicts: 0,
-                    failures: 0,
-                    total_commits: 0,
-                    source_head_t: record.t,
-                    source_head_id: record.head,
-                    strategy,
-                });
+            SubmissionOutcome::Waiter(WaiterOutcome::Aborted(reason)) => {
+                Err(submission_error_from_abort(reason))
             }
-            SmResponse::IdempotencyFailed { record } => {
-                return Err(SubmissionError::Execution {
-                    status: 500,
-                    message: format!("cached failure: {:?}", record.reason),
-                });
-            }
-            SmResponse::BodyHashMismatch => return Err(SubmissionError::KeyCollision),
-            SmResponse::QueueFull { .. } => return Err(SubmissionError::Overloaded),
-            SmResponse::LedgerNotFound { ledger_id } => {
-                return Err(SubmissionError::Execution {
-                    status: 404,
-                    message: format!("ledger not found: {ledger_id}"),
-                });
-            }
-            other => {
-                return Err(SubmissionError::Execution {
-                    status: 500,
-                    message: format!("unexpected Response variant for EnqueueCommand: {other:?}"),
-                });
-            }
-        };
-
-        let outcome = waiter_rx
-            .await
-            .map_err(|_| SubmissionError::Execution {
-                status: 503,
-                message: "queue waiter dropped before outcome — leader transition stranded the \
-                          rebase; retry with the same idempotency key"
-                    .into(),
-            })?;
-
-        match outcome {
-            WaiterOutcome::Applied(receipt) => Ok(rebase_receipt_from(
+            SubmissionOutcome::Cached(record) => Ok(RebaseReceipt {
                 idempotency_key,
                 branch,
+                fast_forward: false,
+                replayed: 0,
+                skipped: 0,
+                conflicts: 0,
+                failures: 0,
+                total_commits: 0,
+                source_head_t: record.t,
+                source_head_id: record.head,
                 strategy,
-                receipt,
-            )?),
-            WaiterOutcome::Aborted(reason) => Err(submission_error_from_abort(reason)),
+            }),
+            SubmissionOutcome::CachedFailure(record) => Err(SubmissionError::Execution {
+                status: 500,
+                message: format!("cached failure: {:?}", record.reason),
+            }),
         }
     }
 
@@ -586,8 +550,24 @@ impl Committer for QueuedTransactor {
             .as_ref()
             .map(|k| IdempotencyCacheKey::new(ledger_id.clone(), k.clone()));
 
+        // Upload each commit's bytes to the per-ledger content store
+        // and record its CID. The envelope carries only the CIDs;
+        // the worker reads the bytes back when staging.
+        let content_store = self.fluree.content_store(&ledger_id);
+        let mut commit_cids = Vec::with_capacity(commits.len());
+        for commit_bytes in &commits {
+            let cid = content_store
+                .put(ContentKind::Commit, commit_bytes)
+                .await
+                .map_err(|e| SubmissionError::Execution {
+                    status: 500,
+                    message: format!("push commit CAS write failed: {e}"),
+                })?;
+            commit_cids.push(cid);
+        }
+
         let envelope = QueuedRequest::Push(QueuedPush {
-            commits,
+            commit_cids,
             blobs,
             governance,
         });
@@ -597,9 +577,7 @@ impl Committer for QueuedTransactor {
                 status: 500,
                 message: format!("QueuedRequest encode failed: {e}"),
             })?;
-        let request_cid = self
-            .fluree
-            .content_store(&ledger_id)
+        let request_cid = content_store
             .put(ContentKind::Txn, &bytes)
             .await
             .map_err(|e| SubmissionError::Execution {
@@ -607,6 +585,7 @@ impl Committer for QueuedTransactor {
                 message: format!("QueuedRequest CAS write failed: {e}"),
             })?;
 
+        let retry_eligible = idempotency_cache_key.is_some();
         let cmd = SmCommand::EnqueueCommand(EnqueueCommandArgs {
             ledger_id: ledger_name,
             branch,
@@ -616,73 +595,33 @@ impl Committer for QueuedTransactor {
             applied_at_millis: current_millis(),
         });
 
-        let response = self
-            .raft
-            .client_write(cmd)
-            .await
-            .map_err(|e| SubmissionError::Execution {
-                status: 500,
-                message: format!("raft client_write failed: {e}"),
-            })?;
-
-        let waiter_rx = match response.data {
-            SmResponse::Enqueued { queue_id, .. } | SmResponse::InFlight { queue_id, .. } => {
-                self.waiter_map.register(queue_id, ref_key)
+        match self.submit_and_await(cmd, ref_key, retry_eligible).await? {
+            SubmissionOutcome::Waiter(WaiterOutcome::Applied(receipt)) => {
+                push_receipt_from(idempotency_key, ledger_id, receipt)
             }
-            SmResponse::IdempotencyHit { record } => {
+            SubmissionOutcome::Waiter(WaiterOutcome::Aborted(reason)) => {
+                Err(submission_error_from_abort(reason))
+            }
+            SubmissionOutcome::Cached(record) => {
                 // Push idempotency hit: the original push produced
-                // this head. We don't track the `accepted` count or
-                // a fresh `IndexingStatus` from the cache record, so
-                // surface conservative defaults (0 / Idle) — clients
-                // that need an exact `accepted` count on retry can
-                // resubmit with a fresh key.
-                return Ok(PushReceipt {
+                // this head. The cache record doesn't carry
+                // `accepted` or a fresh `IndexingStatus`, so surface
+                // conservative defaults — clients that need an
+                // exact `accepted` count on retry can resubmit with
+                // a fresh key.
+                Ok(PushReceipt {
                     idempotency_key,
                     ledger: ledger_id,
                     accepted: 0,
                     head_t: record.t,
                     head_id: record.head,
                     indexing: idle_indexing_status(record.t),
-                });
+                })
             }
-            SmResponse::IdempotencyFailed { record } => {
-                return Err(SubmissionError::Execution {
-                    status: 500,
-                    message: format!("cached failure: {:?}", record.reason),
-                });
-            }
-            SmResponse::BodyHashMismatch => return Err(SubmissionError::KeyCollision),
-            SmResponse::QueueFull { .. } => return Err(SubmissionError::Overloaded),
-            SmResponse::LedgerNotFound { ledger_id } => {
-                return Err(SubmissionError::Execution {
-                    status: 404,
-                    message: format!("ledger not found: {ledger_id}"),
-                });
-            }
-            other => {
-                return Err(SubmissionError::Execution {
-                    status: 500,
-                    message: format!("unexpected Response variant for EnqueueCommand: {other:?}"),
-                });
-            }
-        };
-
-        let outcome = waiter_rx
-            .await
-            .map_err(|_| SubmissionError::Execution {
-                status: 503,
-                message: "queue waiter dropped before outcome — leader transition stranded the \
-                          push; retry with the same idempotency key"
-                    .into(),
-            })?;
-
-        match outcome {
-            WaiterOutcome::Applied(receipt) => Ok(push_receipt_from(
-                idempotency_key,
-                ledger_id,
-                receipt,
-            )?),
-            WaiterOutcome::Aborted(reason) => Err(submission_error_from_abort(reason)),
+            SubmissionOutcome::CachedFailure(record) => Err(SubmissionError::Execution {
+                status: 500,
+                message: format!("cached failure: {:?}", record.reason),
+            }),
         }
     }
 }

@@ -498,6 +498,11 @@ impl FlureeServerBuilder {
                         integration.shared_state.clone(),
                         Arc::clone(&integration.staged_receipts),
                     );
+                    let eviction_scheduler =
+                        fluree_db_consensus::raft::eviction_scheduler::EvictionScheduler::new(
+                            Arc::clone(&integration.raft),
+                            Arc::clone(&state_inner.fluree),
+                        );
                     let spawn_leader_tasks = move || {
                         let nameservice: std::sync::Arc<
                             dyn fluree_db_nameservice::IndexingNameService,
@@ -511,6 +516,7 @@ impl FlureeServerBuilder {
                         vec![
                             tokio::spawn(worker.run()),
                             tokio::spawn(commit_worker.clone().run()),
+                            tokio::spawn(eviction_scheduler.clone().run()),
                         ]
                     };
                     crate::raft::spawn_leader_watcher(

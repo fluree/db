@@ -25,7 +25,7 @@
 
 pub mod admin;
 pub mod commit_worker;
-pub mod execution_record;
+pub mod eviction_scheduler;
 pub mod forward;
 pub mod log_adapter;
 pub mod nameservice;

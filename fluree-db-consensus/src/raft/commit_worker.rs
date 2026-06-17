@@ -252,6 +252,12 @@ impl CommitWorker {
             .clone()
             .expect("build_commit guarantees commit.id is set");
         let commit_t = staged_commit.commit.t;
+        // Pull tally out before `finalize_state` consumes the staged
+        // commit. The receipt the worker hands back through the side
+        // channel carries it so clients that requested tracking get
+        // the same fuel/time/policy snapshot the staging path
+        // produced.
+        let tally = staged_commit.tally.clone();
 
         let content_store = self.fluree.content_store(&ledger_id);
         content_store
@@ -282,7 +288,7 @@ impl CommitWorker {
         Ok(AppliedReceipt::Transact(TransactApplied {
             commit_id: commit_cid,
             commit_t,
-            tally: None,
+            tally,
         }))
     }
 
@@ -391,13 +397,28 @@ impl CommitWorker {
         push: QueuedPush,
     ) -> Result<AppliedReceipt, WorkerError> {
         let QueuedPush {
-            commits,
+            commit_cids,
             blobs,
             governance,
         } = push;
         let ledger_id = format_full_ledger_id(ref_key);
+        let content_store = self.fluree.content_store(&ledger_id);
+        // Read each commit's bytes back from CAS by CID. The
+        // transactor wrote them before enqueueing so they're
+        // guaranteed present unless something has GC'd them out from
+        // under us — surface that as a malformed-body poison rather
+        // than silently re-fetch.
+        let mut commits = Vec::with_capacity(commit_cids.len());
+        for cid in &commit_cids {
+            let bytes = content_store.get(cid).await.map_err(|e| {
+                WorkerError::Stage(PoisonReason::BodyMalformed {
+                    error: format!("push commit {cid} missing from CAS: {e}"),
+                })
+            })?;
+            commits.push(Base64Bytes(bytes));
+        }
         let payload = PushCommitsRequest {
-            commits: commits.into_iter().map(Base64Bytes).collect(),
+            commits,
             blobs: blobs.into_iter().map(|(k, v)| (k, Base64Bytes(v))).collect(),
         };
         let StagedPush {
@@ -808,7 +829,7 @@ mod tests {
 
     fn sample_push_envelope() -> QueuedRequest {
         QueuedRequest::Push(QueuedPush {
-            commits: vec![vec![1, 2, 3, 4]],
+            commit_cids: vec![cid(5)],
             blobs: std::collections::HashMap::new(),
             governance: GovernanceOptions::default(),
         })
@@ -836,8 +857,8 @@ mod tests {
         let decoded = QueuedRequest::from_bytes(&bytes).expect("decode");
         match decoded {
             QueuedRequest::Push(p) => {
-                assert_eq!(p.commits.len(), 1);
-                assert_eq!(p.commits[0], vec![1, 2, 3, 4]);
+                assert_eq!(p.commit_cids.len(), 1);
+                assert_eq!(p.commit_cids[0], cid(5));
             }
             other => panic!("expected Push, got {other:?}"),
         }

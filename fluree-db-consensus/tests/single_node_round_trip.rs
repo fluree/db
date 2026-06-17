@@ -25,7 +25,8 @@ use openraft::{Config, Raft, ServerState};
 use fluree_db_consensus::raft::log_adapter::LogAdapter;
 use fluree_db_consensus::raft::nameservice::RaftNameService;
 use fluree_db_consensus::raft::state_machine::{
-    AdvanceRefArgs, Command as SmCommand, CreateLedgerArgs, RefKey, Response,
+    ApplyHeadArgs, BodyKind, Command as SmCommand, CreateLedgerArgs, EnqueueCommandArgs, RefKey,
+    Response,
 };
 use fluree_db_consensus::raft::state_machine_adapter::StateMachineAdapter;
 use fluree_db_consensus::raft::storage::memory::MemoryRaftStorage;
@@ -160,16 +161,32 @@ async fn single_node_raft_index_publisher_round_trip() {
     .await
     .unwrap();
 
-    raft.client_write(SmCommand::AdvanceRef(AdvanceRefArgs {
+    // Drive the queue path end-to-end: enqueue a fake transaction
+    // envelope, then apply its head. Equivalent setup to the
+    // previously-used `AdvanceRef` but exercising the real
+    // post-migration code path.
+    let enqueue_resp = raft
+        .client_write(SmCommand::EnqueueCommand(EnqueueCommandArgs {
+            ledger_id: "test/db".into(),
+            branch: "main".into(),
+            idempotency: None,
+            request_cid: cid(99),
+            body_kind: BodyKind::JsonLdInsert,
+            applied_at_millis: 1_500,
+        }))
+        .await
+        .unwrap();
+    let queue_id = match enqueue_resp.data {
+        Response::Enqueued { queue_id, .. } => queue_id,
+        other => panic!("expected Enqueued, got {other:?}"),
+    };
+    raft.client_write(SmCommand::ApplyHead(ApplyHeadArgs {
         ledger_id: "test/db".into(),
         branch: "main".into(),
-        expected_prev: None,
-        new_head: cid(7),
-        t: 10,
+        queue_id,
+        commit_id: cid(7),
+        commit_t: 10,
         applied_at_millis: 2_000,
-        idempotency: None,
-        release: Vec::new(),
-        tally: None,
     }))
     .await
     .unwrap();
@@ -270,16 +287,32 @@ async fn single_node_apply_emits_commit_event_on_bus() {
         "CreateLedger should not emit a commit event"
     );
 
-    raft.client_write(SmCommand::AdvanceRef(AdvanceRefArgs {
+    // Drive the queue path end-to-end: enqueue a fake transaction
+    // envelope, then apply its head. Equivalent setup to the
+    // previously-used `AdvanceRef` but exercising the real
+    // post-migration code path.
+    let enqueue_resp = raft
+        .client_write(SmCommand::EnqueueCommand(EnqueueCommandArgs {
+            ledger_id: "test/db".into(),
+            branch: "main".into(),
+            idempotency: None,
+            request_cid: cid(99),
+            body_kind: BodyKind::JsonLdInsert,
+            applied_at_millis: 1_500,
+        }))
+        .await
+        .unwrap();
+    let queue_id = match enqueue_resp.data {
+        Response::Enqueued { queue_id, .. } => queue_id,
+        other => panic!("expected Enqueued, got {other:?}"),
+    };
+    raft.client_write(SmCommand::ApplyHead(ApplyHeadArgs {
         ledger_id: "test/db".into(),
         branch: "main".into(),
-        expected_prev: None,
-        new_head: cid(7),
-        t: 10,
+        queue_id,
+        commit_id: cid(7),
+        commit_t: 10,
         applied_at_millis: 2_000,
-        idempotency: None,
-        release: Vec::new(),
-        tally: None,
     }))
     .await
     .unwrap();
@@ -435,18 +468,30 @@ async fn single_node_branch_lifecycle_round_trip() {
     let mut sub = bus.subscribe(SubscriptionScope::All);
 
     // Set up: init main and seed it with a head so create_branch
-    // has something to fork from.
+    // has something to fork from. Drive the queue path end-to-end.
     ns.init("test/db:main").await.expect("init main");
-    raft.client_write(SmCommand::AdvanceRef(AdvanceRefArgs {
+    let enqueue_resp = raft
+        .client_write(SmCommand::EnqueueCommand(EnqueueCommandArgs {
+            ledger_id: "test/db".into(),
+            branch: "main".into(),
+            idempotency: None,
+            request_cid: cid(99),
+            body_kind: BodyKind::JsonLdInsert,
+            applied_at_millis: 500,
+        }))
+        .await
+        .unwrap();
+    let queue_id = match enqueue_resp.data {
+        Response::Enqueued { queue_id, .. } => queue_id,
+        other => panic!("expected Enqueued, got {other:?}"),
+    };
+    raft.client_write(SmCommand::ApplyHead(ApplyHeadArgs {
         ledger_id: "test/db".into(),
         branch: "main".into(),
-        expected_prev: None,
-        new_head: cid(1),
-        t: 5,
+        queue_id,
+        commit_id: cid(1),
+        commit_t: 5,
         applied_at_millis: 1_000,
-        idempotency: None,
-        release: Vec::new(),
-        tally: None,
     }))
     .await
     .unwrap();

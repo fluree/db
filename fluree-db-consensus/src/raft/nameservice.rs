@@ -673,7 +673,7 @@ mod tests {
 
     use super::*;
     use crate::raft::state_machine::{
-        AdvanceIndexHeadArgs, AdvanceRefArgs, Command, CreateLedgerArgs, NameServiceState, Response,
+        AdvanceIndexHeadArgs, Command, CreateLedgerArgs, NameServiceState, RefEntry, Response,
     };
     use crate::raft::{ClusterNode, NodeId};
     use fluree_db_api::{ContentId, ContentKind};
@@ -999,6 +999,42 @@ mod tests {
     // NameServiceLookup tests
     // ----------------------------------------------------------------
 
+    /// Direct state mutation that seeds a branch head without going
+    /// through the queue. Used by lookup-side tests that need a
+    /// populated head but aren't exercising the apply pipeline.
+    async fn seed_head(
+        state: &SharedState,
+        ledger_id: &str,
+        branch: &str,
+        head: ContentId,
+        t: i64,
+    ) {
+        let mut guard = state.write().await;
+        if let Some(ledger) = guard.ledgers.get_mut(ledger_id) {
+            if !ledger.branches.iter().any(|b| b == branch) {
+                ledger.branches.push(branch.to_string());
+            }
+        }
+        let ref_key = RefKey::new(ledger_id, branch);
+        let (prior_index, prior_source, prior_branches) = guard
+            .refs
+            .get(&ref_key)
+            .map(|r| (r.index.clone(), r.source_branch.clone(), r.branches))
+            .unwrap_or_default();
+        guard.refs.insert(
+            ref_key,
+            RefEntry {
+                head,
+                t,
+                last_advanced_at_millis: 2_000,
+                last_advanced_index: 1,
+                index: prior_index,
+                source_branch: prior_source,
+                branches: prior_branches,
+            },
+        );
+    }
+
     #[tokio::test]
     async fn lookup_returns_none_when_ledger_missing() {
         let ns = RaftNameService::new(fresh_state(), stub_raft().await);
@@ -1006,25 +1042,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn lookup_returns_record_with_head_after_advance_ref() {
+    async fn lookup_returns_record_with_head() {
         let state = fresh_state();
         let _ = apply_cmd(&state, init_cmd("test/db", "main"), 1).await;
-        let _ = apply_cmd(
-            &state,
-            Command::AdvanceRef(AdvanceRefArgs {
-                ledger_id: "test/db".into(),
-                branch: "main".into(),
-                expected_prev: None,
-                new_head: cid(5),
-                t: 7,
-                applied_at_millis: 2_000,
-                idempotency: None,
-                release: Vec::new(),
-                tally: None,
-            }),
-            2,
-        )
-        .await;
+        seed_head(&state, "test/db", "main", cid(5), 7).await;
 
         let ns = RaftNameService::new(state, stub_raft().await);
         let record = ns.lookup("test/db:main").await.unwrap().expect("record");
@@ -1038,22 +1059,7 @@ mod tests {
     async fn get_ref_returns_head_for_commit_kind() {
         let state = fresh_state();
         apply_cmd(&state, init_cmd("test/db", "main"), 1).await;
-        apply_cmd(
-            &state,
-            Command::AdvanceRef(AdvanceRefArgs {
-                ledger_id: "test/db".into(),
-                branch: "main".into(),
-                expected_prev: None,
-                new_head: cid(9),
-                t: 3,
-                applied_at_millis: 2_000,
-                idempotency: None,
-                release: Vec::new(),
-                tally: None,
-            }),
-            2,
-        )
-        .await;
+        seed_head(&state, "test/db", "main", cid(9), 3).await;
 
         let ns = RaftNameService::new(state, stub_raft().await);
         let ref_value = ns
@@ -1073,28 +1079,12 @@ mod tests {
         assert_eq!(index_ref.t, 0);
     }
 
-    /// Convenience for the index-head tests: create a ledger at
-    /// `initial_head = cid(0)`, advance commit to `new_head = cid(c)` at
-    /// the supplied `commit_t`. Returns the shared state.
+    /// Convenience for the index-head tests: create a ledger and
+    /// seed its commit head + t. Returns the shared state.
     async fn ledger_at_commit(commit_head: u8, commit_t: i64) -> SharedState {
         let state = fresh_state();
         let _ = apply_cmd(&state, init_cmd("test/db", "main"), 1).await;
-        let _ = apply_cmd(
-            &state,
-            Command::AdvanceRef(AdvanceRefArgs {
-                ledger_id: "test/db".into(),
-                branch: "main".into(),
-                expected_prev: None,
-                new_head: cid(commit_head),
-                t: commit_t,
-                applied_at_millis: 2_000,
-                idempotency: None,
-                release: Vec::new(),
-                tally: None,
-            }),
-            2,
-        )
-        .await;
+        seed_head(&state, "test/db", "main", cid(commit_head), commit_t).await;
         state
     }
 
@@ -1167,22 +1157,7 @@ mod tests {
             3,
         )
         .await;
-        let _ = apply_cmd(
-            &state,
-            Command::AdvanceRef(AdvanceRefArgs {
-                ledger_id: "test/db".into(),
-                branch: "main".into(),
-                expected_prev: Some(cid(7)),
-                new_head: cid(8),
-                t: 20,
-                applied_at_millis: 4_000,
-                idempotency: None,
-                release: Vec::new(),
-                tally: None,
-            }),
-            4,
-        )
-        .await;
+        seed_head(&state, "test/db", "main", cid(8), 20).await;
 
         let ns = RaftNameService::new(state, stub_raft().await);
         let record = ns.lookup("test/db:main").await.unwrap().expect("record");
@@ -1197,22 +1172,7 @@ mod tests {
     async fn all_records_enumerates_every_branch() {
         let state = fresh_state();
         apply_cmd(&state, init_cmd("a/db", "main"), 1).await;
-        apply_cmd(
-            &state,
-            Command::AdvanceRef(AdvanceRefArgs {
-                ledger_id: "a/db".into(),
-                branch: "feat".into(),
-                expected_prev: None,
-                new_head: cid(1),
-                t: 1,
-                applied_at_millis: 0,
-                idempotency: None,
-                release: Vec::new(),
-                tally: None,
-            }),
-            2,
-        )
-        .await;
+        seed_head(&state, "a/db", "feat", cid(1), 1).await;
 
         let ns = RaftNameService::new(state, stub_raft().await);
         let mut ids: Vec<_> = ns

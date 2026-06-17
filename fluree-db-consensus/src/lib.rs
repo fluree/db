@@ -274,19 +274,24 @@ pub struct QueuedTransact {
     pub governance: GovernanceOptions,
 }
 
-/// Push-side envelope payload. Holds the raw client-supplied commit
-/// chain bytes plus any auxiliary blobs the chain references; the
-/// worker hands them to [`Fluree::prepare_push`] to decode, validate,
-/// and write to CAS, then advances the branch head to the chain's
-/// final commit.
+/// Push-side envelope payload.
 ///
-/// Carrying raw bytes rather than CIDs keeps the migration mechanical:
-/// the existing `PushRequest` API stays unchanged, and the worker's
-/// push path reuses the same `prepare_push` pipeline the legacy
-/// committer used.
+/// Commits are content-addressed: the [`QueuedTransactor`] writes
+/// each commit's bytes to the per-ledger content store before
+/// enqueueing and records only the resulting [`ContentId`]s here.
+/// That keeps the envelope small (no commit bytes inline) and lines
+/// up with the design's "commits already in CAS when the worker
+/// picks up the entry" assumption — the worker reads them back by
+/// CID and reconstructs the [`fluree_db_api::PushCommitsRequest`]
+/// the existing `prepare_push` pipeline expects.
+///
+/// Auxiliary `blobs` stay keyed by their client-supplied address
+/// (which may be a CID or a legacy hex address) and travel as raw
+/// bytes — the keys are reference targets the commits rely on, so
+/// the server can't recompute them via `ContentId::new(...)`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueuedPush {
-    pub commits: Vec<Vec<u8>>,
+    pub commit_cids: Vec<CommitId>,
     pub blobs: HashMap<String, Vec<u8>>,
     pub governance: GovernanceOptions,
 }
