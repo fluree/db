@@ -75,11 +75,12 @@ pub struct FlureeServer {
     /// Optional private Raft listener (consensus + admin).
     #[cfg(feature = "raft")]
     raft_listener: Option<RaftListener>,
-    /// Leader-aware indexer watcher. `Some` when raft mode is on.
-    /// Aborted on shutdown so the spawned background tasks tear
-    /// down with the rest of the server.
+    /// Leader-aware watcher driving every leader-only background
+    /// task (indexer, commit-queue worker). `Some` when raft mode is
+    /// on. Aborted on shutdown so the spawned tasks tear down with
+    /// the rest of the server.
     #[cfg(feature = "raft")]
-    raft_indexer_watcher: Option<tokio::task::JoinHandle<()>>,
+    raft_leader_watcher: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl FlureeServer {
@@ -264,10 +265,10 @@ impl FlureeServer {
             task.abort();
         }
         #[cfg(feature = "raft")]
-        if let Some(task) = self.raft_indexer_watcher {
+        if let Some(task) = self.raft_leader_watcher {
             // Aborting the watcher's outer task drops its metrics
-            // receiver; on its way down it also aborts the currently-
-            // running indexer task (if any) — see
+            // receiver; on its way down it also aborts every
+            // currently-running leader task — see
             // `raft::spawn_leader_watcher` for the teardown path.
             task.abort();
         }
@@ -469,10 +470,12 @@ impl FlureeServerBuilder {
             }
         });
 
-        // Wire the leader-aware indexer launcher. See
-        // `raft::spawn_leader_watcher` for the lifecycle.
+        // Wire the leader-aware launcher. Bundles both the background
+        // indexer and the commit-queue worker so they share one
+        // metrics watcher and one spawn/abort lifecycle. See
+        // `raft::spawn_leader_watcher` for the contract.
         #[cfg(feature = "raft")]
-        let raft_indexer_watcher =
+        let raft_leader_watcher =
             self.raft
                 .as_ref()
                 .map(|(integration, _)| {
@@ -482,7 +485,16 @@ impl FlureeServerBuilder {
                     let backend = state_inner.fluree.backend().clone();
                     let indexer_config = fluree_db_indexer::IndexerConfig::default();
                     let event_bus = Arc::clone(&integration.event_bus);
-                    let spawn_indexer = move || {
+                    let commit_worker = fluree_db_consensus::raft::commit_worker::CommitWorker::new(
+                        Arc::clone(&integration.raft),
+                        Arc::clone(&state_inner.fluree),
+                        state_inner
+                            .index_config
+                            .clone()
+                            .expect("index_config set by AppState::new"),
+                        integration.shared_state.clone(),
+                    );
+                    let spawn_leader_tasks = move || {
                         let nameservice: std::sync::Arc<
                             dyn fluree_db_nameservice::IndexingNameService,
                         > = raft_ns.clone();
@@ -492,17 +504,20 @@ impl FlureeServerBuilder {
                             indexer_config.clone(),
                         );
                         let worker = worker.with_event_bus(Arc::clone(&event_bus));
-                        tokio::spawn(worker.run())
+                        vec![
+                            tokio::spawn(worker.run()),
+                            tokio::spawn(commit_worker.clone().run()),
+                        ]
                     };
                     crate::raft::spawn_leader_watcher(
                         Arc::clone(&integration.raft),
                         integration.self_id,
-                        spawn_indexer,
+                        spawn_leader_tasks,
                     )
                 });
 
         // The raft tuple is no longer needed beyond this point —
-        // both raft_listener and raft_indexer_watcher captured what
+        // both raft_listener and raft_leader_watcher captured what
         // they need. Drop the rest.
         #[cfg(feature = "raft")]
         drop(self.raft);
@@ -547,7 +562,7 @@ impl FlureeServerBuilder {
             #[cfg(feature = "raft")]
             raft_listener,
             #[cfg(feature = "raft")]
-            raft_indexer_watcher,
+            raft_leader_watcher,
         })
     }
 }

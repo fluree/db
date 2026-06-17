@@ -254,47 +254,48 @@ impl LeaderTracker {
 }
 
 /// Spawn a background task that watches `raft.metrics()` and drives
-/// the indexer's lifecycle: spawn it when this node becomes leader,
-/// abort it when it loses the lead.
+/// the lifecycle of every leader-only task: spawn them when this
+/// node becomes leader, abort them when it loses the lead.
 ///
-/// `spawn_indexer` is invoked each time leadership is gained and must
-/// return the `JoinHandle` of a freshly-spawned background task —
-/// the driver owns the handle and aborts it on leadership loss.
+/// `spawn_leader_tasks` is invoked each time leadership is gained
+/// and must return the `JoinHandle`s of the freshly-spawned tasks —
+/// the driver owns the handles and aborts every one on leadership
+/// loss. Callers bundle as many tasks as belong to the leader
+/// (indexer, commit-queue worker, periodic idempotency evictor, …)
+/// into the returned `Vec`.
 ///
 /// The returned `JoinHandle` is the watcher itself; aborting it
-/// drops the metrics receiver and also aborts the currently-running
-/// indexer task (if any). Shutdown of the server should abort this
-/// handle alongside its other maintenance tasks.
+/// drops the metrics receiver and also aborts any currently-running
+/// leader tasks. Shutdown of the server should abort this handle
+/// alongside its other maintenance tasks.
 ///
 /// `tokio::sync::watch` is a "latest value" channel, so transient
 /// flips that don't cross the leader/not-leader boundary from this
 /// node's local view (e.g. Leader → Follower → Leader inside one
 /// tick) collapse to "still leader" and are correctly treated as
-/// no-ops — the indexer keeps running and the cluster ends up with
-/// us back at the lead, no spawn/abort churn.
+/// no-ops — the leader tasks keep running and the cluster ends up
+/// with us back at the lead, no spawn/abort churn.
 pub fn spawn_leader_watcher<F>(
     raft: Arc<Raft<TypeConfig>>,
     self_id: NodeId,
-    spawn_indexer: F,
+    spawn_leader_tasks: F,
 ) -> JoinHandle<()>
 where
-    F: Fn() -> JoinHandle<()> + Send + 'static,
+    F: Fn() -> Vec<JoinHandle<()>> + Send + 'static,
 {
     tokio::spawn(async move {
         let mut metrics = raft.metrics();
         let mut tracker = LeaderTracker::default();
-        let mut current_indexer: Option<JoinHandle<()>> = None;
+        let mut current_tasks: Vec<JoinHandle<()>> = Vec::new();
 
         loop {
             let is_leader = metrics.borrow().current_leader == Some(self_id);
             match tracker.tick(is_leader) {
                 LeadershipTransition::Spawn => {
-                    current_indexer = Some(spawn_indexer());
+                    current_tasks = spawn_leader_tasks();
                 }
                 LeadershipTransition::Abort => {
-                    if let Some(h) = current_indexer.take() {
-                        h.abort();
-                    }
+                    abort_all(&mut current_tasks);
                 }
                 LeadershipTransition::None => {}
             }
@@ -304,11 +305,15 @@ where
             }
         }
 
-        // Watcher shutdown: tear down the indexer too.
-        if let Some(h) = current_indexer {
-            h.abort();
-        }
+        // Watcher shutdown: tear down any in-flight leader tasks.
+        abort_all(&mut current_tasks);
     })
+}
+
+fn abort_all(handles: &mut Vec<JoinHandle<()>>) {
+    for handle in handles.drain(..) {
+        handle.abort();
+    }
 }
 
 // ============================================================================
@@ -397,7 +402,7 @@ mod tests {
     // ----------------------------------------------------------------
 
     #[tokio::test]
-    async fn watcher_spawns_indexer_when_node_becomes_leader() {
+    async fn watcher_spawns_leader_tasks_when_node_becomes_leader() {
         let dir = TempDir::new().expect("temp dir");
         let cfg = RaftBootstrapConfig::new(1, dir.path().to_path_buf());
         let integration = RaftIntegration::bootstrap(cfg)
@@ -415,11 +420,17 @@ mod tests {
             1, // self_id
             move || {
                 count_for_closure.fetch_add(1, Ordering::SeqCst);
-                // The spawned "indexer" is just a parked task — we're
-                // testing the lifecycle, not the build pipeline.
-                tokio::spawn(async {
-                    futures::future::pending::<()>().await;
-                })
+                // Two parked tasks stand in for the indexer + commit
+                // worker pair. We're testing the multi-task lifecycle,
+                // not the build pipelines.
+                vec![
+                    tokio::spawn(async {
+                        futures::future::pending::<()>().await;
+                    }),
+                    tokio::spawn(async {
+                        futures::future::pending::<()>().await;
+                    }),
+                ]
             },
         );
 
@@ -454,11 +465,12 @@ mod tests {
         assert_eq!(
             spawn_count.load(Ordering::SeqCst),
             1,
-            "indexer should spawn exactly once on the leader transition"
+            "leader tasks should spawn exactly once on the leader transition"
         );
 
-        // Tear down: aborting the watcher should also abort the
-        // current indexer (no leak), and Raft can shut down cleanly.
+        // Tear down: aborting the watcher should also abort every
+        // current leader task (no leak), and Raft can shut down
+        // cleanly.
         watcher.abort();
         let _ = integration.raft.shutdown().await;
     }
