@@ -438,6 +438,7 @@ fn build_purge_command(ledger_id: &str) -> std::result::Result<SmCommand, NameSe
     Ok(SmCommand::PurgeLedger {
         ledger_id: ledger_name,
         branch,
+        applied_at_millis: current_millis(),
     })
 }
 
@@ -539,6 +540,7 @@ fn build_drop_branch_command(ledger_id: &str) -> std::result::Result<SmCommand, 
     Ok(SmCommand::DropBranch {
         ledger_id: ledger_name,
         branch,
+        applied_at_millis: current_millis(),
     })
 }
 
@@ -556,7 +558,15 @@ fn build_reset_head_command(
             index_head_id: snapshot.index_head_id,
             index_t: snapshot.index_t,
         },
+        applied_at_millis: current_millis(),
     })
+}
+
+fn current_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 fn map_create_branch_response(resp: SmResponse) -> Result<()> {

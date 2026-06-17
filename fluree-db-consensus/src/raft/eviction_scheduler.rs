@@ -30,6 +30,13 @@ use tracing::warn;
 /// deployments.
 pub const DEFAULT_IDEMPOTENCY_TTL: Duration = Duration::from_secs(60 * 60);
 
+/// TTL applied to `recently_cleared` admin-clear markers. Bounded
+/// well above any realistic worker propose window — the only
+/// in-flight workers a marker informs are those that already had a
+/// stage in flight when the admin clear landed; they either land
+/// within seconds or strand at a leader transition.
+pub const DEFAULT_MARKER_TTL: Duration = Duration::from_secs(5 * 60);
+
 /// Default interval between [`Command::EvictIdempotency`] proposals.
 pub const DEFAULT_EVICTION_INTERVAL: Duration = Duration::from_secs(60);
 
@@ -40,6 +47,7 @@ pub struct EvictionScheduler {
     raft: Arc<Raft<TypeConfig>>,
     interval: Duration,
     ttl: Duration,
+    marker_ttl: Duration,
 }
 
 impl EvictionScheduler {
@@ -48,6 +56,7 @@ impl EvictionScheduler {
             raft,
             interval: DEFAULT_EVICTION_INTERVAL,
             ttl: DEFAULT_IDEMPOTENCY_TTL,
+            marker_ttl: DEFAULT_MARKER_TTL,
         }
     }
 
@@ -65,6 +74,13 @@ impl EvictionScheduler {
         self
     }
 
+    /// Override the TTL applied to `recently_cleared` markers
+    /// (default 5 minutes). See [`DEFAULT_MARKER_TTL`].
+    pub fn with_marker_ttl(mut self, ttl: Duration) -> Self {
+        self.marker_ttl = ttl;
+        self
+    }
+
     /// Drive periodic eviction until the leader watcher aborts the
     /// task. Each tick: sleep for the interval, compute the cutoff,
     /// propose `EvictIdempotency`. The actual CAS release fan-out
@@ -77,11 +93,17 @@ impl EvictionScheduler {
     }
 
     async fn tick(&self) {
-        let cutoff_millis = match cutoff_millis(self.ttl) {
-            Some(c) => c,
-            None => return,
+        let Some(idempotency_cutoff) = cutoff_millis(self.ttl) else {
+            return;
         };
-        let cmd = SmCommand::EvictIdempotency { cutoff_millis };
+        // Markers have a shorter TTL than idempotency entries, so we
+        // compute them independently. The state machine evicts each
+        // map against its matching cutoff in a single apply.
+        let marker_cutoff = cutoff_millis(self.marker_ttl).unwrap_or(0);
+        let cmd = SmCommand::EvictIdempotency {
+            cutoff_millis: idempotency_cutoff,
+            marker_cutoff_millis: marker_cutoff,
+        };
         let resp = match self.raft.client_write(cmd).await {
             Ok(resp) => resp,
             Err(err) => {

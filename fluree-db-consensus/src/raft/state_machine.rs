@@ -342,14 +342,28 @@ pub enum PoisonReason {
 }
 
 /// Reason a head-mutating admin command cleared a per-branch
-/// queue. Recorded in [`NameServiceState::recently_cleared`]
-/// so the next worker's [`Command::ApplyHead`] sees a meaningful
+/// queue. Recorded inside [`ClearMarker`] so the next worker's
+/// [`Command::ApplyHead`] sees a meaningful
 /// [`DesyncReason::QueueCleared`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ClearReason {
     BranchDropped,
     BranchPurged,
     BranchHeadReset,
+}
+
+/// Short-lived marker a head-mutating admin command stamps when
+/// it clears a non-empty queue. [`Command::ApplyHead`] /
+/// [`Command::PoisonQueueEntry`] consume it to surface a
+/// meaningful [`DesyncReason::QueueCleared`] instead of the
+/// fallback `InvariantViolated`. `applied_at_millis` lets
+/// [`Command::EvictIdempotency`] sweep markers that no worker ever
+/// consumed (no in-flight propose at clear time) so the map can't
+/// grow unbounded across cluster lifetime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClearMarker {
+    pub reason: ClearReason,
+    pub applied_at_millis: u64,
 }
 
 /// Bounds the replicated cost of the per-branch queues. Held on
@@ -407,9 +421,10 @@ pub struct NameServiceState {
     /// Short-lived markers a head-mutating admin command leaves so
     /// the next [`Command::ApplyHead`] for that branch reports a
     /// meaningful [`DesyncReason::QueueCleared`]. Cleared by the
-    /// `ApplyHead` apply that observes them.
+    /// `ApplyHead` apply that observes them, or swept by
+    /// [`Command::EvictIdempotency`] past their TTL.
     #[serde(default)]
-    pub recently_cleared: HashMap<RefKey, ClearReason>,
+    pub recently_cleared: HashMap<RefKey, ClearMarker>,
     /// Lifetime count of idempotency entries removed by
     /// `Command::EvictIdempotency`.
     #[serde(default)]
@@ -446,7 +461,16 @@ pub enum Command {
     /// Refuses to remove a branch whose own `branches` count is
     /// non-zero. Unlike [`Command::PurgeLedger`], not idempotent on
     /// missing branches — returns `LedgerNotFound`.
-    DropBranch { ledger_id: String, branch: String },
+    DropBranch {
+        ledger_id: String,
+        branch: String,
+        /// Leader-supplied wall-clock at proposal time. Stamped into
+        /// the [`recently_cleared`](NameServiceState::recently_cleared)
+        /// marker so [`Command::EvictIdempotency`] can age out
+        /// markers no worker ever consumed.
+        #[serde(default)]
+        applied_at_millis: u64,
+    },
     /// Non-monotonic head reset for rebase/merge rollback. Sets
     /// head, t, and index from the supplied snapshot regardless of
     /// the branch's current values. A `commit_head_id: None`
@@ -455,6 +479,9 @@ pub enum Command {
         ledger_id: String,
         branch: String,
         snapshot: ResetHeadSnapshot,
+        /// See [`Command::DropBranch::applied_at_millis`].
+        #[serde(default)]
+        applied_at_millis: u64,
     },
     /// Soft-drop a branch: mark it retracted but leave its
     /// [`LedgerRecord`] and [`RefEntry`] entries in place so the
@@ -464,7 +491,13 @@ pub enum Command {
     /// and entry from the parent [`LedgerRecord::branches`]. Removes
     /// the `LedgerRecord` itself when its branches list empties.
     /// Idempotent.
-    PurgeLedger { ledger_id: String, branch: String },
+    PurgeLedger {
+        ledger_id: String,
+        branch: String,
+        /// See [`Command::DropBranch::applied_at_millis`].
+        #[serde(default)]
+        applied_at_millis: u64,
+    },
     /// Signal that the named content blob is no longer referenced
     /// and may be released by the content store. The state machine
     /// doesn't mutate state on this — the entry's role is to let
@@ -490,7 +523,19 @@ pub enum Command {
     /// records. Removes entries whose `recorded_at_millis` is
     /// older than `cutoff_millis`, bounded per apply by an
     /// internal batch size.
-    EvictIdempotency { cutoff_millis: u64 },
+    ///
+    /// `marker_cutoff_millis` bounds a parallel sweep over
+    /// [`NameServiceState::recently_cleared`]: any marker stamped
+    /// before this watermark is dropped on the assumption that
+    /// every worker propose racing the original admin clear has
+    /// already landed or stranded. Held separately from
+    /// `cutoff_millis` because markers have a much shorter useful
+    /// life than idempotency cache entries.
+    EvictIdempotency {
+        cutoff_millis: u64,
+        #[serde(default)]
+        marker_cutoff_millis: u64,
+    },
 }
 
 /// Payload for [`Command::EnqueueCommand`].
@@ -817,23 +862,33 @@ pub fn apply(state: &mut NameServiceState, command: Command, log_index: u64) -> 
         Command::AdvanceIndexHead(args) => advance_index_head(state, args),
         Command::CreateLedger(args) => create_ledger(state, log_index, args),
         Command::CreateBranch(args) => create_branch(state, log_index, args),
-        Command::DropBranch { ledger_id, branch } => drop_branch(state, ledger_id, branch),
+        Command::DropBranch {
+            ledger_id,
+            branch,
+            applied_at_millis,
+        } => drop_branch(state, ledger_id, branch, applied_at_millis),
         Command::ResetHead {
             ledger_id,
             branch,
             snapshot,
-        } => reset_head(state, ledger_id, branch, snapshot),
+            applied_at_millis,
+        } => reset_head(state, ledger_id, branch, snapshot, applied_at_millis),
         Command::RetractLedger { ledger_id, branch } => retract_ledger(state, ledger_id, branch),
-        Command::PurgeLedger { ledger_id, branch } => purge_ledger(state, ledger_id, branch),
+        Command::PurgeLedger {
+            ledger_id,
+            branch,
+            applied_at_millis,
+        } => purge_ledger(state, ledger_id, branch, applied_at_millis),
         Command::ReleaseContent { id: _ } => Response::NoOp,
         // Queue-related commands. Apply paths land in subsequent
         // commits; see docs/design/raft-command-queue.md.
         Command::EnqueueCommand(args) => apply_enqueue_command(state, log_index, args),
         Command::ApplyHead(args) => apply_head(state, log_index, args),
         Command::PoisonQueueEntry(args) => apply_poison_queue_entry(state, log_index, args),
-        Command::EvictIdempotency { cutoff_millis } => {
-            apply_evict_idempotency(state, cutoff_millis)
-        }
+        Command::EvictIdempotency {
+            cutoff_millis,
+            marker_cutoff_millis,
+        } => apply_evict_idempotency(state, cutoff_millis, marker_cutoff_millis),
     }
 }
 
@@ -892,6 +947,7 @@ fn purge_ledger(
     state: &mut NameServiceState,
     ledger_id: String,
     branch: String,
+    applied_at_millis: u64,
 ) -> Response {
     let key = RefKey::new(&ledger_id, &branch);
     let full = format_ledger_id(&ledger_id, &branch);
@@ -914,7 +970,12 @@ fn purge_ledger(
     if let Some(parent) = removed_source {
         decrement_child_count(state, &ledger_id, &parent);
     }
-    let released_envelopes = clear_queue_for_admin(state, &key, ClearReason::BranchPurged);
+    let released_envelopes = clear_queue_for_admin(
+        state,
+        &key,
+        ClearReason::BranchPurged,
+        applied_at_millis,
+    );
     if removed_ref || removed_retraction || removed_branch {
         Response::Purged {
             ledger_id: full,
@@ -992,6 +1053,7 @@ fn drop_branch(
     state: &mut NameServiceState,
     ledger_id: String,
     branch: String,
+    applied_at_millis: u64,
 ) -> Response {
     let key = RefKey::new(&ledger_id, &branch);
     let full = format_ledger_id(&ledger_id, &branch);
@@ -1024,7 +1086,12 @@ fn drop_branch(
     let parent_branches = removed_source
         .as_deref()
         .map(|parent| decrement_child_count(state, &ledger_id, parent));
-    let released_envelopes = clear_queue_for_admin(state, &key, ClearReason::BranchDropped);
+    let released_envelopes = clear_queue_for_admin(
+        state,
+        &key,
+        ClearReason::BranchDropped,
+        applied_at_millis,
+    );
 
     Response::BranchDropped {
         ledger_id: full,
@@ -1038,6 +1105,7 @@ fn reset_head(
     ledger_id: String,
     branch: String,
     snapshot: ResetHeadSnapshot,
+    applied_at_millis: u64,
 ) -> Response {
     let key = RefKey::new(&ledger_id, &branch);
     let full = format_ledger_id(&ledger_id, &branch);
@@ -1060,8 +1128,12 @@ fn reset_head(
         // Snapshot is unborn — remove the RefEntry; the branch keeps
         // its slot on `LedgerRecord.branches`.
         state.refs.remove(&key);
-        let released_envelopes =
-            clear_queue_for_admin(state, &key, ClearReason::BranchHeadReset);
+        let released_envelopes = clear_queue_for_admin(
+            state,
+            &key,
+            ClearReason::BranchHeadReset,
+            applied_at_millis,
+        );
         return Response::HeadReset {
             ledger_id: full,
             released_envelopes,
@@ -1086,7 +1158,12 @@ fn reset_head(
             branches: prior_branches,
         },
     );
-    let released_envelopes = clear_queue_for_admin(state, &key, ClearReason::BranchHeadReset);
+    let released_envelopes = clear_queue_for_admin(
+        state,
+        &key,
+        ClearReason::BranchHeadReset,
+        applied_at_millis,
+    );
     Response::HeadReset {
         ledger_id: full,
         released_envelopes,
@@ -1110,6 +1187,7 @@ fn clear_queue_for_admin(
     state: &mut NameServiceState,
     ref_key: &RefKey,
     reason: ClearReason,
+    applied_at_millis: u64,
 ) -> Vec<(String, ContentId)> {
     let Some(queue) = state.queues.remove(ref_key) else {
         return Vec::new();
@@ -1117,7 +1195,13 @@ fn clear_queue_for_admin(
     if queue.is_empty() {
         return Vec::new();
     }
-    state.recently_cleared.insert(ref_key.clone(), reason);
+    state.recently_cleared.insert(
+        ref_key.clone(),
+        ClearMarker {
+            reason,
+            applied_at_millis,
+        },
+    );
     let ledger_id = format_ledger_id(&ref_key.ledger_id, &ref_key.branch);
     queue
         .into_iter()
@@ -1334,12 +1418,12 @@ fn pop_validated_front(
     full_ledger_id: &str,
     requested_queue_id: u64,
 ) -> Result<QueueEntry, Box<Response>> {
-    if let Some(clear_reason) = state.recently_cleared.remove(ref_key) {
+    if let Some(marker) = state.recently_cleared.remove(ref_key) {
         return Err(Box::new(Response::QueueDesync {
             ledger_id: full_ledger_id.into(),
             requested_queue_id,
             reason: DesyncReason::QueueCleared {
-                reason: clear_reason,
+                reason: marker.reason,
             },
         }));
     }
@@ -1492,7 +1576,11 @@ fn apply_poison_queue_entry(
 /// additional commands when more remain.
 const EVICT_BATCH_SIZE: usize = 1024;
 
-fn apply_evict_idempotency(state: &mut NameServiceState, cutoff_millis: u64) -> Response {
+fn apply_evict_idempotency(
+    state: &mut NameServiceState,
+    cutoff_millis: u64,
+    marker_cutoff_millis: u64,
+) -> Response {
     // HashMap iteration order is non-deterministic across replicas,
     // so we materialize the expired candidates and sort by
     // (recorded_at_millis, recorded_index) before truncating to the
@@ -1525,6 +1613,14 @@ fn apply_evict_idempotency(state: &mut NameServiceState, cutoff_millis: u64) -> 
     }
     let removed = expired.len();
     state.evicted_idempotency_count += removed as u64;
+
+    // Sweep stale `recently_cleared` markers in the same tick. No
+    // batch cap: markers are tiny and capped at one per cleared
+    // branch, so the sweep cost is bounded by cluster cardinality
+    // rather than workload.
+    state
+        .recently_cleared
+        .retain(|_, marker| marker.applied_at_millis >= marker_cutoff_millis);
 
     Response::EvictionApplied {
         removed,
@@ -1764,6 +1860,7 @@ mod tests {
             Command::PurgeLedger {
                 ledger_id: "test/db".into(),
                 branch: "main".into(),
+                applied_at_millis: 0,
             },
             4,
         );
@@ -1791,6 +1888,7 @@ mod tests {
             Command::PurgeLedger {
                 ledger_id: "test/db".into(),
                 branch: "feature".into(),
+                applied_at_millis: 0,
             },
             3,
         );
@@ -1806,6 +1904,7 @@ mod tests {
             Command::PurgeLedger {
                 ledger_id: "missing".into(),
                 branch: "main".into(),
+                applied_at_millis: 0,
             },
             1,
         );
@@ -1826,6 +1925,7 @@ mod tests {
             Command::PurgeLedger {
                 ledger_id: "test/db".into(),
                 branch: "main".into(),
+                applied_at_millis: 0,
             },
             2,
         );
@@ -1977,6 +2077,7 @@ mod tests {
             Command::DropBranch {
                 ledger_id: "test/db".into(),
                 branch: "feature".into(),
+                applied_at_millis: 0,
             },
             3,
         );
@@ -2009,6 +2110,7 @@ mod tests {
             Command::DropBranch {
                 ledger_id: "test/db".into(),
                 branch: "main".into(),
+                applied_at_millis: 0,
             },
             3,
         );
@@ -2031,6 +2133,7 @@ mod tests {
             Command::DropBranch {
                 ledger_id: "missing".into(),
                 branch: "main".into(),
+                applied_at_millis: 0,
             },
             1,
         );
@@ -2053,6 +2156,7 @@ mod tests {
             Command::DropBranch {
                 ledger_id: "test/db".into(),
                 branch: "main".into(),
+                applied_at_millis: 0,
             },
             2,
         );
@@ -2082,6 +2186,7 @@ mod tests {
             Command::PurgeLedger {
                 ledger_id: "test/db".into(),
                 branch: "feature".into(),
+                applied_at_millis: 0,
             },
             3,
         );
@@ -2111,6 +2216,7 @@ mod tests {
                     index_head_id: None,
                     index_t: 0,
                 },
+                applied_at_millis: 0,
             },
             4,
         );
@@ -2142,6 +2248,7 @@ mod tests {
                     index_head_id: None,
                     index_t: 0,
                 },
+                applied_at_millis: 0,
             },
             2,
         );
@@ -2166,6 +2273,7 @@ mod tests {
                     index_head_id: None,
                     index_t: 0,
                 },
+                applied_at_millis: 0,
             },
             1,
         );
@@ -2714,8 +2822,13 @@ mod tests {
         // mirrors what Task #74's admin-side change will do.
         let ref_key = RefKey::new("test/db", "main");
         state.queues.remove(&ref_key);
-        state.recently_cleared
-            .insert(ref_key.clone(), ClearReason::BranchDropped);
+        state.recently_cleared.insert(
+            ref_key.clone(),
+            ClearMarker {
+                reason: ClearReason::BranchDropped,
+                applied_at_millis: 0,
+            },
+        );
 
         let resp = apply(
             &mut state,
@@ -2886,9 +2999,13 @@ mod tests {
 
         let ref_key = RefKey::new("test/db", "main");
         state.queues.remove(&ref_key);
-        state
-            .recently_cleared
-            .insert(ref_key.clone(), ClearReason::BranchPurged);
+        state.recently_cleared.insert(
+            ref_key.clone(),
+            ClearMarker {
+                reason: ClearReason::BranchPurged,
+                applied_at_millis: 0,
+            },
+        );
 
         let resp = apply(
             &mut state,
@@ -2962,7 +3079,10 @@ mod tests {
     }
 
     fn evict(cutoff_millis: u64) -> Command {
-        Command::EvictIdempotency { cutoff_millis }
+        Command::EvictIdempotency {
+            cutoff_millis,
+            marker_cutoff_millis: 0,
+        }
     }
 
     fn install_outcome(state: &mut NameServiceState, key: &str, outcome: ApplyOutcome) {
@@ -3098,6 +3218,7 @@ mod tests {
         Command::DropBranch {
             ledger_id: ledger_id.into(),
             branch: branch.into(),
+            applied_at_millis: 0,
         }
     }
 
@@ -3105,6 +3226,7 @@ mod tests {
         Command::PurgeLedger {
             ledger_id: ledger_id.into(),
             branch: branch.into(),
+            applied_at_millis: 0,
         }
     }
 
@@ -3118,6 +3240,7 @@ mod tests {
                 index_head_id: None,
                 index_t: 0,
             },
+            applied_at_millis: 0,
         }
     }
 
@@ -3137,8 +3260,8 @@ mod tests {
         let ref_key = RefKey::new("test/db", "feature");
         assert!(!state.queues.contains_key(&ref_key));
         assert_eq!(
-            state.recently_cleared.get(&ref_key),
-            Some(&ClearReason::BranchDropped)
+            state.recently_cleared.get(&ref_key).map(|m| m.reason),
+            Some(ClearReason::BranchDropped)
         );
     }
 
@@ -3209,8 +3332,8 @@ mod tests {
         let ref_key = RefKey::new("test/db", "main");
         assert!(!state.queues.contains_key(&ref_key));
         assert_eq!(
-            state.recently_cleared.get(&ref_key),
-            Some(&ClearReason::BranchPurged)
+            state.recently_cleared.get(&ref_key).map(|m| m.reason),
+            Some(ClearReason::BranchPurged)
         );
     }
 
@@ -3229,8 +3352,8 @@ mod tests {
         let ref_key = RefKey::new("test/db", "main");
         assert!(!state.queues.contains_key(&ref_key));
         assert_eq!(
-            state.recently_cleared.get(&ref_key),
-            Some(&ClearReason::BranchPurged)
+            state.recently_cleared.get(&ref_key).map(|m| m.reason),
+            Some(ClearReason::BranchPurged)
         );
         // The branch was registered via CreateLedger so the canonical
         // state genuinely had something to remove.
@@ -3261,6 +3384,7 @@ mod tests {
                     index_head_id: None,
                     index_t: 0,
                 },
+                applied_at_millis: 0,
             },
             4,
         );
@@ -3268,8 +3392,8 @@ mod tests {
         let ref_key = RefKey::new("test/db", "main");
         assert!(!state.queues.contains_key(&ref_key));
         assert_eq!(
-            state.recently_cleared.get(&ref_key),
-            Some(&ClearReason::BranchHeadReset)
+            state.recently_cleared.get(&ref_key).map(|m| m.reason),
+            Some(ClearReason::BranchHeadReset)
         );
     }
 
@@ -3284,8 +3408,8 @@ mod tests {
         let ref_key = RefKey::new("test/db", "main");
         assert!(!state.queues.contains_key(&ref_key));
         assert_eq!(
-            state.recently_cleared.get(&ref_key),
-            Some(&ClearReason::BranchHeadReset)
+            state.recently_cleared.get(&ref_key).map(|m| m.reason),
+            Some(ClearReason::BranchHeadReset)
         );
     }
 
@@ -3304,6 +3428,7 @@ mod tests {
                     index_head_id: None,
                     index_t: 0,
                 },
+                applied_at_millis: 0,
             },
             1,
         );

@@ -221,13 +221,13 @@ fn waiter_resolution_for(cmd: &Command, response: &Response) -> Option<WaiterRes
                 reason: AbortReason::Poisoned(reason.clone()),
             })
         }
-        (Command::DropBranch { ledger_id, branch }, Response::BranchDropped { .. }) => {
+        (Command::DropBranch { ledger_id, branch, .. }, Response::BranchDropped { .. }) => {
             Some(WaiterResolution::AbortBranch {
                 ref_key: RefKey::new(ledger_id, branch),
                 reason: AbortReason::BranchDropped,
             })
         }
-        (Command::PurgeLedger { ledger_id, branch }, Response::Purged { .. }) => {
+        (Command::PurgeLedger { ledger_id, branch, .. }, Response::Purged { .. }) => {
             Some(WaiterResolution::AbortBranch {
                 ref_key: RefKey::new(ledger_id, branch),
                 reason: AbortReason::BranchPurged,
@@ -728,6 +728,7 @@ mod tests {
             payload: EntryPayload::Normal(RaftCommand::PurgeLedger {
                 ledger_id: "test/db".into(),
                 branch: "main".into(),
+                applied_at_millis: 0,
             }),
         }])
         .await
@@ -753,6 +754,7 @@ mod tests {
             payload: EntryPayload::Normal(RaftCommand::PurgeLedger {
                 ledger_id: "ghost".into(),
                 branch: "main".into(),
+                applied_at_millis: 0,
             }),
         }])
         .await
@@ -833,6 +835,7 @@ mod tests {
             payload: EntryPayload::Normal(RaftCommand::DropBranch {
                 ledger_id: "test/db".into(),
                 branch: "feature".into(),
+                applied_at_millis: 0,
             }),
         }])
         .await
@@ -946,6 +949,7 @@ mod tests {
             payload: EntryPayload::Normal(RaftCommand::DropBranch {
                 ledger_id: ledger_id.into(),
                 branch: branch.into(),
+                applied_at_millis: 0,
             }),
         }
     }
@@ -1096,6 +1100,7 @@ mod tests {
                         index_head_id: None,
                         index_t: 0,
                     },
+                    applied_at_millis: 0,
                 }),
             }])
             .await
