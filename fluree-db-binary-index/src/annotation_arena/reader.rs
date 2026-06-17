@@ -120,6 +120,64 @@ impl<'a, S: ContentStore + ?Sized> AnnotationArenaReader<'a, S> {
         Ok(out)
     }
 
+    /// Batched forward lookup: live annotations for many edges in one
+    /// merge-scan of the forward arena. Returns a vector index-aligned
+    /// with `edges` (entry `i` holds the live annotation SIDs for
+    /// `edges[i]`, empty when the edge has none).
+    ///
+    /// This is the physical counterpart to a Cypher relationship binding
+    /// over a stream of base edges: instead of `N` independent point
+    /// lookups (each re-walking the branch and re-scanning a leaf), we
+    /// sort the probe keys and co-iterate them with the
+    /// `EdgeKey`-sorted branch, touching each covering leaf once while
+    /// it is hot in the cache. Cost is `O(edges·log edges + covered
+    /// leaves)` rather than `O(edges · leaf_size)`.
+    ///
+    /// Arena-only: novelty is **not** merged here. Callers with a
+    /// non-empty attachment overlay must fall back to the per-edge
+    /// [`Self::current_annotations_merged`]; on a freshly indexed
+    /// snapshot (empty annotation novelty) this result is authoritative.
+    pub async fn current_annotations_batch(
+        &self,
+        edges: &[EdgeKey],
+        as_of_t: i64,
+    ) -> CoreResult<Vec<Vec<Sid>>> {
+        let mut out: Vec<Vec<Sid>> = vec![Vec::new(); edges.len()];
+        if edges.is_empty() {
+            return Ok(out);
+        }
+        let branch = self.load_forward_branch().await?;
+
+        // Probe keys in `EdgeKey` order; the branch is sorted by
+        // `first_edge`, so a single monotonic cursor over branch entries
+        // suffices.
+        let mut order: Vec<usize> = (0..edges.len()).collect();
+        order.sort_by(|&a, &b| edges[a].cmp(&edges[b]));
+
+        let leaves = &branch.leaves;
+        let mut bi = 0usize;
+        for &idx in &order {
+            let edge = &edges[idx];
+            // Advance past leaves that end before this edge.
+            while bi < leaves.len() && leaves[bi].last_edge < *edge {
+                bi += 1;
+            }
+            // An edge's annotations can span consecutive leaves (one
+            // edge with enough annotations to cross a leaf boundary), so
+            // visit every entry that covers it without disturbing the
+            // monotonic `bi` cursor.
+            let mut j = bi;
+            while j < leaves.len() && leaves[j].first_edge <= *edge {
+                if leaves[j].last_edge >= *edge {
+                    let leaf = self.load_forward_leaf(&leaves[j].leaf_cid).await?;
+                    collect_live_anns_from_forward_leaf(&leaf, edge, as_of_t, &mut out[idx]);
+                }
+                j += 1;
+            }
+        }
+        Ok(out)
+    }
+
     /// Edges whose latest event at or before `as_of_t` for the given
     /// annotation is `op = true`. Multiple results are possible if the
     /// annotation has been re-pointed across history (legitimate or
@@ -895,5 +953,67 @@ mod tests {
             let live = reader.current_annotations_for(&edge, 100).await.unwrap();
             assert_eq!(live, vec![ann_sid(ann)], "edge {s} → {ann}");
         }
+    }
+
+    fn edge_of(s: &str, p: &str, o: &str) -> EdgeKey {
+        EdgeKey {
+            g: None,
+            s: ref_sid(s),
+            p: ref_sid(p),
+            o: FlakeValue::Ref(ref_sid(o)),
+            dt: id_dt(),
+            lang: None,
+            list_i: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn current_annotations_batch_matches_point_lookups_across_leaves() {
+        // Several edges spread across multiple leaves (tiny leaf size
+        // forces branch traversal), one edge retracted, plus a probe for
+        // an edge with no annotation. The batch result must equal the
+        // per-edge point lookups, index-aligned, with the missing and
+        // retracted edges empty.
+        let mut flakes = Vec::new();
+        flakes.extend(make_bundle("ann1", "alice", "knows", "bob", 1, true));
+        flakes.extend(make_bundle("ann2", "carol", "knows", "dave", 1, true));
+        flakes.extend(make_bundle("ann3", "erin", "knows", "frank", 1, true));
+        flakes.extend(make_bundle("ann4", "gina", "knows", "hank", 1, true));
+        // Retract ann3's edge.
+        flakes.extend(make_bundle("ann3", "erin", "knows", "frank", 4, false));
+
+        let store = MemoryContentStore::new();
+        // Two rows per leaf → multiple forward leaves, exercising the
+        // monotonic branch cursor.
+        let root = build_and_store(&flakes, 2, &store).await;
+        let reader = AnnotationArenaReader::new(&root, &store);
+
+        // Intentionally unsorted probe order, with a miss interleaved.
+        let probes = vec![
+            edge_of("gina", "knows", "hank"),    // ann4
+            edge_of("nobody", "knows", "zztop"), // miss
+            edge_of("alice", "knows", "bob"),    // ann1
+            edge_of("erin", "knows", "frank"),   // retracted → empty
+            edge_of("carol", "knows", "dave"),   // ann2
+        ];
+
+        let batch = reader
+            .current_annotations_batch(&probes, 100)
+            .await
+            .unwrap();
+        assert_eq!(batch.len(), probes.len());
+        for (i, e) in probes.iter().enumerate() {
+            let point = reader.current_annotations_for(e, 100).await.unwrap();
+            assert_eq!(batch[i], point, "batch vs point mismatch at index {i}");
+        }
+        assert_eq!(batch[0], vec![ann_sid("ann4")]);
+        assert!(batch[1].is_empty(), "missing edge");
+        assert_eq!(batch[2], vec![ann_sid("ann1")]);
+        assert!(batch[3].is_empty(), "retracted edge");
+        assert_eq!(batch[4], vec![ann_sid("ann2")]);
+
+        // Empty input is a clean no-op.
+        let empty = reader.current_annotations_batch(&[], 100).await.unwrap();
+        assert!(empty.is_empty());
     }
 }

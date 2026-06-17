@@ -31,14 +31,27 @@ use crate::binding::{Batch, Binding};
 use crate::context::ExecutionContext;
 use crate::error::Result;
 use crate::execute::build_where_operators_seeded;
-use crate::ir::Pattern;
+use crate::ir::{Pattern, Ref};
 use crate::operator::{BoxedOperator, Operator, OperatorState};
 use crate::seed::{EmptyOperator, SeedOperator};
 use crate::temporal_mode::PlanningContext;
 use crate::var_registry::VarId;
 use async_trait::async_trait;
-use fluree_db_core::StatsView;
+use fluree_db_core::{Sid, StatsView};
 use std::sync::Arc;
+
+/// Resolve a recognized relationship predicate ref to a concrete `Sid`
+/// for this snapshot. Cypher lowers relationship types to `Ref::Iri`, so
+/// the common case is an IRI encode; `None` means the predicate isn't
+/// present in this ledger's namespace table (no edges → generic
+/// fallback, which yields the same empty result more slowly).
+fn resolve_pred_sid(p: &Ref, ctx: &ExecutionContext<'_>) -> Option<Sid> {
+    match p {
+        Ref::Sid(sid) => Some(sid.clone()),
+        Ref::Iri(iri) => ctx.active_snapshot.encode_iri(iri),
+        Ref::Var(_) => None,
+    }
+}
 
 pub struct DefaultGraphSourceOperator {
     child: BoxedOperator,
@@ -97,6 +110,76 @@ impl DefaultGraphSourceOperator {
             stats,
             single_graph_delegate: None,
         }
+    }
+
+    /// Build the single-graph inner subplan. When the chain is a
+    /// recognized edge-annotation shape and every fast-path gate holds,
+    /// replace the three generic `f:reifies*` joins with a forward-arena
+    /// probe (the physical counterpart to a Cypher relationship binding);
+    /// otherwise fall back to the ordinary join chain — same results,
+    /// just the slower generic path.
+    fn build_single_graph_delegate(
+        &self,
+        child: BoxedOperator,
+        ctx: &ExecutionContext<'_>,
+    ) -> Result<BoxedOperator> {
+        if self.annotation_probe_gates_pass(ctx) {
+            if let Some(shape) =
+                crate::annotation_edge_probe::recognize_annotation_edge(&self.inner_patterns)
+            {
+                // Resolve the relationship predicate to a concrete Sid
+                // (Cypher lowers it to an IRI). If it can't be encoded for
+                // this snapshot the predicate has no data here — fall back
+                // to the generic chain rather than guess.
+                if let Some(p_sid) = resolve_pred_sid(&shape.p_pred, ctx) {
+                    // Base edge plans normally (visibility + policy), seeded
+                    // by the whole child stream.
+                    let base = build_where_operators_seeded(
+                        Some(child),
+                        std::slice::from_ref(&shape.base),
+                        self.stats.clone(),
+                        None,
+                        &self.planning,
+                    )?;
+                    let probe = Box::new(
+                        crate::annotation_edge_probe::AnnotationEdgeProbeOperator::new(
+                            base,
+                            shape.ann_var,
+                            shape.s_pos,
+                            p_sid,
+                            shape.o_pos,
+                        ),
+                    );
+                    // Body (relationship-property reads, filters) plans
+                    // normally on top, with the reifier var now bound.
+                    return build_where_operators_seeded(
+                        Some(probe),
+                        &shape.body,
+                        self.stats.clone(),
+                        None,
+                        &self.planning,
+                    );
+                }
+            }
+        }
+        build_where_operators_seeded(
+            Some(child),
+            &self.inner_patterns,
+            self.stats.clone(),
+            None,
+            &self.planning,
+        )
+    }
+
+    /// Eligibility for the forward-arena probe fast path. All checked
+    /// against the live execution context so no plan-time vouch is
+    /// needed. See `annotation_edge_probe` for why each matters.
+    fn annotation_probe_gates_pass(&self, ctx: &ExecutionContext<'_>) -> bool {
+        ctx.active_snapshot.annotation_index.is_some()
+            && ctx.active_snapshot.content_store.is_some()
+            && !self.planning.is_history()
+            && ctx.overlay().is_effectively_empty()
+            && ctx.policy_enforcer.as_ref().is_none_or(|p| p.is_root())
     }
 
     /// Run the inner subplan against a single source graph and merge
@@ -212,6 +295,7 @@ impl Operator for DefaultGraphSourceOperator {
     }
 
     async fn open(&mut self, ctx: &ExecutionContext<'_>) -> Result<()> {
+        // (see build_single_graph_delegate for the recognition/fallback split)
         // Single default-graph (no dataset): the per-source correlation this
         // wrapper exists for is a no-op, so build the inner subplan ONCE seeded
         // by the whole child stream. The base edge + f:reifies* triples then plan
@@ -221,13 +305,7 @@ impl Operator for DefaultGraphSourceOperator {
         // Multi-source datasets keep the per-row, per-source path below.
         if ctx.dataset.is_none() {
             let child = std::mem::replace(&mut self.child, Box::new(EmptyOperator::new()));
-            let mut delegate = build_where_operators_seeded(
-                Some(child),
-                &self.inner_patterns,
-                self.stats.clone(),
-                None,
-                &self.planning,
-            )?;
+            let mut delegate = self.build_single_graph_delegate(child, ctx)?;
             delegate.open(ctx).await?;
             self.single_graph_delegate = Some(delegate);
         } else {
