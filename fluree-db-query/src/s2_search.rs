@@ -86,6 +86,23 @@ impl S2SearchOperator {
         self
     }
 
+    /// View-policy readability for a spatial hit. The S2 operator emits matched
+    /// subjects from the spatial index with no per-flake policy filtering, so a
+    /// hit is kept only if the identity can view at least one of the subject's
+    /// flakes on the searched spatial predicate. When the pattern carries no
+    /// predicate the searched property is ambiguous, so under a policy the hit is
+    /// hidden conservatively (empty predicate list => `search_hit_readable`
+    /// allows with no policy, hides under one). No-op for root / no policy.
+    async fn hit_visible(&self, ctx: &ExecutionContext<'_>, subject_id: u64) -> Result<bool> {
+        let subject_iri = match ctx.resolve_subject_iri(subject_id) {
+            Some(Ok(iri)) => iri,
+            // Unresolvable subject: fail-closed under a policy, allow otherwise.
+            _ => String::new(),
+        };
+        let preds: Vec<&str> = self.pattern.predicate.as_deref().into_iter().collect();
+        crate::search_readability::search_hit_readable(ctx, &subject_iri, &preds).await
+    }
+
     /// Resolve query geometry from pattern (constant or variable binding).
     ///
     /// For `EncodedLit` bindings, requires `binary_store` in context to decode.
@@ -417,6 +434,9 @@ impl Operator for S2SearchOperator {
 
                     // Build output rows
                     for result in results {
+                        if !self.hit_visible(ctx, result.subject_id).await? {
+                            continue;
+                        }
                         let mut row = vec![Binding::Unbound; num_cols];
 
                         // Copy child columns
@@ -459,6 +479,9 @@ impl Operator for S2SearchOperator {
                         })?;
 
                     for result in results {
+                        if !self.hit_visible(ctx, result.subject_id).await? {
+                            continue;
+                        }
                         let mut row = vec![Binding::Unbound; num_cols];
 
                         for (col_idx, &var) in child_schema.iter().enumerate() {
@@ -488,6 +511,9 @@ impl Operator for S2SearchOperator {
                         })?;
 
                     for result in results {
+                        if !self.hit_visible(ctx, result.subject_id).await? {
+                            continue;
+                        }
                         let mut row = vec![Binding::Unbound; num_cols];
 
                         for (col_idx, &var) in child_schema.iter().enumerate() {
@@ -517,6 +543,9 @@ impl Operator for S2SearchOperator {
                         })?;
 
                     for result in results {
+                        if !self.hit_visible(ctx, result.subject_id).await? {
+                            continue;
+                        }
                         let mut row = vec![Binding::Unbound; num_cols];
 
                         for (col_idx, &var) in child_schema.iter().enumerate() {
