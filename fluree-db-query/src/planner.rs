@@ -808,7 +808,9 @@ fn subquery_body_has_constant_anchor(patterns: &[Pattern]) -> bool {
         Pattern::PropertyPath(pp) => {
             !matches!(pp.subject, Ref::Var(_)) || !matches!(pp.object, Ref::Var(_))
         }
-        Pattern::Union(branches) => branches.iter().any(|b| subquery_body_has_constant_anchor(b)),
+        Pattern::Union(branches) => branches
+            .iter()
+            .any(|b| subquery_body_has_constant_anchor(b)),
         Pattern::Optional(ps) | Pattern::Graph { patterns: ps, .. } => {
             subquery_body_has_constant_anchor(ps)
         }
@@ -1269,7 +1271,13 @@ pub fn reorder_patterns(
     // Greedy loop: place patterns by priority
     while !sources.is_empty() || !reducers.is_empty() || !expanders.is_empty() {
         let placed = try_place_reducer(&mut reducers, &mut bound_vars, stats, &mut result)
-            || try_place_source(&mut sources, &mut bound_vars, stats, &mut result)
+            || try_place_source(
+                &mut sources,
+                &mut bound_vars,
+                stats,
+                &mut result,
+                &subquery_output_vars,
+            )
             || try_place_expander(&mut expanders, &mut bound_vars, stats, &mut result);
 
         if !placed {
@@ -1381,12 +1389,73 @@ fn unlocked_object_hash_scan(
         .unwrap_or(0)
 }
 
+/// A disconnected `?x rdf:type <const>` class anchor: a `rdf:type` triple whose
+/// object is a constant class and whose subject variable is part of neither the
+/// bound set nor the producer component. Seeding/placing from such a triple
+/// drives the join backward off the (often broad) class extension — e.g. `home
+/// rdf:type Country` reverse-scanning `IS_PART_OF`/`IS_LOCATED_IN` for every
+/// city. Only class anchors are matched: a selective property-value anchor such
+/// as `?c name "X"` (cardinality 1) is a *good* disconnected seed and is left
+/// alone. See [`try_place_source`].
+fn is_disconnected_class_anchor(
+    pattern: &Pattern,
+    bound_vars: &HashSet<VarId>,
+    anchor_vars: &HashSet<VarId>,
+) -> bool {
+    let Pattern::Triple(tp) = pattern else {
+        return false;
+    };
+    if !tp.p.is_rdf_type() || !matches!(tp.o, Term::Iri(_) | Term::Sid(_)) {
+        return false;
+    }
+    match &tp.s {
+        Ref::Var(v) => !bound_vars.contains(v) && !anchor_vars.contains(v),
+        _ => false,
+    }
+}
+
+/// A broad RDF-star annotation *sidecar* triple: `?ann f:reifiesSubject ?s` or
+/// `?ann f:reifiesObject ?o`. These index every annotated edge in the ledger, so
+/// seeding from one (e.g. `?ann f:reifiesObject ?friend`) scans the whole
+/// annotation sidecar before the concrete base edge or the `f:reifiesPredicate`
+/// discriminator narrows it to one predicate — like scanning a global secondary
+/// index before choosing the table. `f:reifiesPredicate` is deliberately NOT
+/// matched: its object is the concrete base predicate, so it *is* the
+/// discriminator and a good driver. Demoted from the seed pool by
+/// [`try_place_source`] whenever a connected alternative (the base edge) exists.
+fn is_broad_annotation_sidecar(pattern: &Pattern) -> bool {
+    let Pattern::Triple(tp) = pattern else {
+        return false;
+    };
+    match &tp.p {
+        Ref::Sid(sid) => {
+            sid.namespace_code == fluree_vocab::namespaces::FLUREE_DB
+                && (sid.name.as_ref() == fluree_vocab::db::REIFIES_SUBJECT
+                    || sid.name.as_ref() == fluree_vocab::db::REIFIES_OBJECT)
+        }
+        _ => false,
+    }
+}
+
 /// Try to place the best source. Returns true if one was placed.
+///
+/// `anchor_vars` are the outputs of uncorrelated WITH-subquery producers (see
+/// `reorder_patterns`) — a pseudo-bound pipeline component. At every placement,
+/// when a pipeline exists (bound vars or a producer) and some other candidate is
+/// connected to it, a disconnected `rdf:type <const>` class anchor is dropped
+/// from the pool so it cannot flip the chain into a scattered reverse
+/// object-drive (the IC3 `home:Country` case). This is deliberately narrow:
+/// only class anchors are demoted, only when a connected alternative exists, and
+/// selective property-value anchors (`?c name "X"`) are never touched — so
+/// IC6/IC11-style queries that legitimately seed from a constant entity, and
+/// genuine class-anchored queries (no producer, no bound pipeline), are
+/// unaffected.
 fn try_place_source(
     remaining: &mut Vec<RankedPattern>,
     bound_vars: &mut HashSet<VarId>,
     stats: Option<&StatsView>,
     result: &mut Vec<Pattern>,
+    anchor_vars: &HashSet<VarId>,
 ) -> bool {
     if remaining.is_empty() {
         return false;
@@ -1394,19 +1463,57 @@ fn try_place_source(
 
     let has_bound = !bound_vars.is_empty();
 
-    // Prefer joinable sources (share variables with bound set)
-    let candidates: Vec<usize> = remaining
+    // Base pool: prefer sources joinable with the bound set; if none are (e.g.
+    // the only forward continuation is a not-yet-placed producer), fall back to
+    // all sources.
+    let connected: Vec<usize> = remaining
         .iter()
         .enumerate()
         .filter(|(_, rp)| !has_bound || pattern_shares_variables(&rp.pattern, bound_vars))
         .map(|(idx, _)| idx)
         .collect();
-
-    // Fall back to all sources if none are joinable
-    let pool = if candidates.is_empty() {
+    let base_pool = if connected.is_empty() {
         (0..remaining.len()).collect::<Vec<_>>()
     } else {
-        candidates
+        connected
+    };
+
+    // Demote "broad index" sources from whichever pool we use — including the
+    // fall-back-to-all pool — so they cannot win the seed when a concrete
+    // connected alternative exists:
+    //   * disconnected `rdf:type <const>` class anchors (the IC3 chain-A
+    //     `home:Country` reverse-drive), and
+    //   * RDF-star annotation sidecars `?ann f:reifiesSubject/Object ?x`, which
+    //     index every annotated edge — seeding from one scans the whole sidecar
+    //     instead of driving the concrete base edge / `f:reifiesPredicate`
+    //     discriminator (the IC5 `HAS_MEMBER` reified-edge case).
+    // Only applies when a pipeline exists with a connected alternative, so
+    // selective property-value anchors, the base edge, the discriminator, and
+    // genuine class-anchored queries are untouched. If demotion would empty the
+    // pool, keep the base pool.
+    let pipeline_active = has_bound || !anchor_vars.is_empty();
+    let has_connected_alt = pipeline_active
+        && remaining.iter().any(|rp| {
+            pattern_shares_variables(&rp.pattern, bound_vars)
+                || pattern_shares_variables(&rp.pattern, anchor_vars)
+        });
+    let pool: Vec<usize> = if has_connected_alt {
+        let demoted: Vec<usize> = base_pool
+            .iter()
+            .copied()
+            .filter(|&i| {
+                let p = &remaining[i].pattern;
+                !is_disconnected_class_anchor(p, bound_vars, anchor_vars)
+                    && !is_broad_annotation_sidecar(p)
+            })
+            .collect();
+        if demoted.is_empty() {
+            base_pool
+        } else {
+            demoted
+        }
+    } else {
+        base_pool
     };
 
     let best_idx = pool.into_iter().min_by(|&i, &j| {
@@ -3353,5 +3460,234 @@ mod tests {
         // Age filter is pushed into UNION branches.
         assert_eq!(count_patterns(&reordered, is_filter), 1);
         assert_union_branches_contain(&reordered, is_filter, "should contain pushed-in age filter");
+    }
+
+    // --- seed-time WITH-producer vs disconnected class anchor ------------------
+
+    fn type_anchor(subject: VarId, class: &str) -> Pattern {
+        Pattern::Triple(TriplePattern::new(
+            Ref::Var(subject),
+            Ref::Sid(Sid::new(
+                fluree_vocab::namespaces::RDF,
+                fluree_vocab::predicates::RDF_TYPE,
+            )),
+            Term::Sid(Sid::new(100, class)),
+        ))
+    }
+
+    fn with_producer(out: VarId) -> Pattern {
+        use crate::ir::SubqueryPattern;
+        Pattern::Subquery(SubqueryPattern::new(
+            vec![out],
+            vec![Pattern::Triple(make_pattern(out, "knows", VarId(99)))],
+        ))
+    }
+
+    #[test]
+    fn with_producer_seeds_before_disconnected_class_anchor() {
+        // IC3 Stage 2 shape: WITH-subquery produces `friend`; `home rdf:type
+        // Country` is a tiny (111) but disconnected class anchor. Without the
+        // guard, Country seeds #0 and drives the chain backward (50s plan).
+        let (friend, city, home) = (VarId(0), VarId(1), VarId(2));
+        let mut stats = StatsView::default();
+        stats.classes.insert(Sid::new(100, "Country"), 111);
+        // Realistic shape: the location predicates are broad scans, the producer
+        // body (`knows`) is comparatively small — so once the disconnected Country
+        // anchor is dropped from the seed pool, the producer wins the seed.
+        for (p, c) in [
+            ("IS_PART_OF", 10_000),
+            ("IS_LOCATED_IN", 10_000),
+            ("knows", 50),
+        ] {
+            stats.properties.insert(
+                Sid::new(100, p),
+                PropertyStatData {
+                    count: c,
+                    ndv_values: c,
+                    ndv_subjects: c,
+                },
+            );
+        }
+
+        let patterns = vec![
+            type_anchor(home, "Country"),
+            Pattern::Triple(make_pattern(city, "IS_PART_OF", home)),
+            Pattern::Triple(make_pattern(friend, "IS_LOCATED_IN", city)), // consumes friend
+            with_producer(friend),
+        ];
+        let ordered = reorder_patterns(&patterns, Some(&stats), &HashSet::new());
+
+        let sub_pos = ordered
+            .iter()
+            .position(|p| matches!(p, Pattern::Subquery(_)))
+            .expect("subquery present");
+        let anchor_pos = ordered
+            .iter()
+            .position(|p| matches!(p, Pattern::Triple(tp) if tp.p.is_rdf_type()))
+            .expect("rdf:type anchor present");
+        assert!(
+            sub_pos < anchor_pos,
+            "WITH producer must seed before the disconnected class anchor: {ordered:?}"
+        );
+        assert!(
+            !matches!(&ordered[0], Pattern::Triple(tp) if tp.p.is_rdf_type()),
+            "class anchor must not seed the block: {ordered:?}"
+        );
+    }
+
+    #[test]
+    fn pure_class_anchor_seeds_without_producer() {
+        // No WITH producer: `home rdf:type Country` is the genuine anchor and must
+        // still seed (the guard must not penalize class anchors in general).
+        let (home, city, p) = (VarId(0), VarId(1), VarId(2));
+        let mut stats = StatsView::default();
+        stats.classes.insert(Sid::new(100, "Country"), 111);
+
+        let patterns = vec![
+            type_anchor(home, "Country"),
+            Pattern::Triple(make_pattern(city, "IS_PART_OF", home)),
+            Pattern::Triple(make_pattern(p, "IS_LOCATED_IN", city)),
+        ];
+        let ordered = reorder_patterns(&patterns, Some(&stats), &HashSet::new());
+        assert!(
+            matches!(&ordered[0], Pattern::Triple(tp) if tp.p.is_rdf_type()),
+            "with no producer the class anchor still seeds first: {ordered:?}"
+        );
+    }
+
+    #[test]
+    fn class_anchor_demoted_in_fallback_when_producer_continues() {
+        // IC3 mid-block shape: a selective chain has already bound `cx`, so no
+        // remaining source shares the bound set — the only forward continuation
+        // is the WITH producer (connected via `friend`, an anchor var). A cheap
+        // disconnected `home rdf:type Country` is also available. The producer
+        // must win: the class anchor must not seed a reverse drive out of the
+        // fall-back-to-all pool. (The seed-only demotion failed this.)
+        let (friend, cx, mx, home) = (VarId(0), VarId(1), VarId(2), VarId(4));
+        let mut stats = StatsView::default();
+        stats.classes.insert(Sid::new(100, "Country"), 111);
+
+        let patterns = vec![
+            type_anchor(home, "Country"),
+            with_producer(friend),
+            Pattern::Triple(make_pattern(mx, "HAS_CREATOR", friend)), // consumer of friend
+        ];
+        let mut bound = HashSet::new();
+        bound.insert(cx); // pretend the selective chain already bound `cx`
+        let ordered = reorder_patterns(&patterns, Some(&stats), &bound);
+
+        let sub_pos = ordered
+            .iter()
+            .position(|p| matches!(p, Pattern::Subquery(_)))
+            .expect("subquery present");
+        let anchor_pos = ordered
+            .iter()
+            .position(|p| matches!(p, Pattern::Triple(tp) if tp.p.is_rdf_type()))
+            .expect("rdf:type anchor present");
+        assert!(
+            sub_pos < anchor_pos,
+            "producer must beat the class anchor in the fall-back pool: {ordered:?}"
+        );
+    }
+
+    #[test]
+    fn annotation_sidecar_demoted_for_base_edge() {
+        // RDF-star reified edge (IC5 shape): `?ann f:reifiesObject ?friend` is a
+        // broad annotation sidecar; `?forum HAS_MEMBER ?friend` is the concrete
+        // base edge. Both are object-bound on `friend`. The base edge must seed —
+        // not the sidecar — even though the sidecar is written first (and would
+        // otherwise win the orig-index tie).
+        let (friend, forum, ann) = (VarId(0), VarId(1), VarId(2));
+        let reifies_object = Pattern::Triple(TriplePattern::new(
+            Ref::Var(ann),
+            Ref::Sid(Sid::new(
+                fluree_vocab::namespaces::FLUREE_DB,
+                fluree_vocab::db::REIFIES_OBJECT,
+            )),
+            Term::Var(friend),
+        ));
+        let base_edge = Pattern::Triple(make_pattern(forum, "HAS_MEMBER", friend));
+        let patterns = vec![reifies_object, base_edge];
+        let mut bound = HashSet::new();
+        bound.insert(friend);
+        let ordered = reorder_patterns(&patterns, None, &bound);
+        assert!(
+            matches!(&ordered[0], Pattern::Triple(tp)
+                if matches!(&tp.p, Ref::Sid(s) if s.name.as_ref() == "HAS_MEMBER")),
+            "concrete base edge must seed before the f:reifiesObject sidecar: {ordered:?}"
+        );
+    }
+
+    #[test]
+    fn full_reifies_chain_drives_base_edge_first() {
+        // The REAL delegate path: the expanded edge-annotation chain (base edge +
+        // three `f:reifies*` sidecars) reordered with the child's `friend` already
+        // bound — exactly what `DefaultGraphSourceOperator` feeds to
+        // `build_where_operators_seeded` -> `reorder_patterns`. The base
+        // `HAS_MEMBER` edge must be placed before `f:reifiesObject`, otherwise the
+        // plan scans the global annotation sidecar.
+        let (friend, forum, ann) = (VarId(0), VarId(1), VarId(2));
+        let sid = |name| Ref::Sid(Sid::new(fluree_vocab::namespaces::FLUREE_DB, name));
+        let base_edge = Pattern::Triple(make_pattern(forum, "HAS_MEMBER", friend));
+        let reifies_subject = Pattern::Triple(TriplePattern::new(
+            Ref::Var(ann),
+            sid(fluree_vocab::db::REIFIES_SUBJECT),
+            Term::Var(forum),
+        ));
+        let reifies_predicate = Pattern::Triple(TriplePattern::new(
+            Ref::Var(ann),
+            sid(fluree_vocab::db::REIFIES_PREDICATE),
+            Term::Sid(Sid::new(100, "HAS_MEMBER")),
+        ));
+        let reifies_object = Pattern::Triple(TriplePattern::new(
+            Ref::Var(ann),
+            sid(fluree_vocab::db::REIFIES_OBJECT),
+            Term::Var(friend),
+        ));
+        // Emission order as produced by `expand_edge_annotation_patterns`.
+        let patterns = vec![
+            base_edge,
+            reifies_subject,
+            reifies_predicate,
+            reifies_object,
+        ];
+        let mut bound = HashSet::new();
+        bound.insert(friend); // the delegate's seeded child binds `friend`
+        let ordered = reorder_patterns(&patterns, None, &bound);
+
+        let pos = |pred: &str| {
+            ordered
+                .iter()
+                .position(|p| {
+                    matches!(p, Pattern::Triple(tp)
+                    if matches!(&tp.p, Ref::Sid(s) if s.name.as_ref() == pred))
+                })
+                .unwrap_or(usize::MAX)
+        };
+        assert!(
+            pos("HAS_MEMBER") < pos(fluree_vocab::db::REIFIES_OBJECT),
+            "base edge must drive before the f:reifiesObject sidecar: {ordered:?}"
+        );
+    }
+
+    #[test]
+    fn producer_then_consumer_order_not_regressed() {
+        // IC9 shape: the WITH producer seeds, then its consumer (`HAS_CREATOR`,
+        // which references `friend`) drains immediately after.
+        let (friend, message) = (VarId(0), VarId(1));
+        let patterns = vec![
+            Pattern::Triple(make_pattern(message, "HAS_CREATOR", friend)),
+            with_producer(friend),
+        ];
+        let ordered = reorder_patterns(&patterns, None, &HashSet::new());
+        assert!(
+            matches!(&ordered[0], Pattern::Subquery(_)),
+            "producer seeds first: {ordered:?}"
+        );
+        assert!(
+            matches!(&ordered[1], Pattern::Triple(tp)
+                if matches!(&tp.p, Ref::Sid(s) if s.name.as_ref() == "HAS_CREATOR")),
+            "consumer drains right after the producer: {ordered:?}"
+        );
     }
 }
