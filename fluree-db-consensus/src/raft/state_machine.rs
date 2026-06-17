@@ -1029,6 +1029,7 @@ fn purge_ledger(
     if let Some(parent) = removed_source {
         decrement_child_count(state, &ledger_id, &parent);
     }
+    clear_queue_for_admin(state, &key, ClearReason::BranchPurged);
     if removed_ref || removed_retraction || removed_branch {
         Response::Purged { ledger_id: full }
     } else {
@@ -1135,6 +1136,7 @@ fn drop_branch(
     let parent_branches = removed_source
         .as_deref()
         .map(|parent| decrement_child_count(state, &ledger_id, parent));
+    clear_queue_for_admin(state, &key, ClearReason::BranchDropped);
 
     Response::BranchDropped {
         ledger_id: full,
@@ -1169,6 +1171,7 @@ fn reset_head(
         // Snapshot is unborn — remove the RefEntry; the branch keeps
         // its slot on `LedgerRecord.branches`.
         state.refs.remove(&key);
+        clear_queue_for_admin(state, &key, ClearReason::BranchHeadReset);
         return Response::HeadReset { ledger_id: full };
     };
 
@@ -1179,7 +1182,7 @@ fn reset_head(
         .unwrap_or_default();
     let index = index_head_id.map(|head| IndexState { head, t: index_t });
     state.refs.insert(
-        key,
+        key.clone(),
         RefEntry {
             head,
             t: commit_t,
@@ -1190,7 +1193,30 @@ fn reset_head(
             branches: prior_branches,
         },
     );
+    clear_queue_for_admin(state, &key, ClearReason::BranchHeadReset);
     Response::HeadReset { ledger_id: full }
+}
+
+/// Clear a per-branch queue as a side effect of a head-mutating
+/// admin command, and stamp a `recently_cleared` marker so any
+/// in-flight `ApplyHead` / `PoisonQueueEntry` for the branch
+/// surfaces a meaningful `QueueCleared` reason instead of
+/// `InvariantViolated`. The marker is only stamped when the queue
+/// actually held entries; an empty queue leaves the marker map
+/// alone so the `InvariantViolated` signal stays diagnostic.
+fn clear_queue_for_admin(
+    state: &mut NameServiceState,
+    ref_key: &RefKey,
+    reason: ClearReason,
+) {
+    let had_entries = state
+        .queues
+        .remove(ref_key)
+        .map(|q| !q.is_empty())
+        .unwrap_or(false);
+    if had_entries {
+        state.recently_cleared.insert(ref_key.clone(), reason);
+    }
 }
 
 /// Saturating decrement of a parent branch's child counter. Returns
@@ -3494,5 +3520,263 @@ mod tests {
             other => panic!("expected EvictionApplied, got {other:?}"),
         }
         assert_eq!(state.evicted_idempotency_count, 0);
+    }
+
+    // ====================================================================
+    // Admin commands: queue clearing + ClearReason marker
+    // ====================================================================
+
+    fn drop_branch_cmd(ledger_id: &str, branch: &str) -> Command {
+        Command::DropBranch {
+            ledger_id: ledger_id.into(),
+            branch: branch.into(),
+        }
+    }
+
+    fn purge_ledger_cmd(ledger_id: &str, branch: &str) -> Command {
+        Command::PurgeLedger {
+            ledger_id: ledger_id.into(),
+            branch: branch.into(),
+        }
+    }
+
+    fn reset_head_to_unborn_cmd(ledger_id: &str, branch: &str) -> Command {
+        Command::ResetHead {
+            ledger_id: ledger_id.into(),
+            branch: branch.into(),
+            snapshot: ResetHeadSnapshot {
+                commit_head_id: None,
+                commit_t: 0,
+                index_head_id: None,
+                index_t: 0,
+            },
+        }
+    }
+
+    #[test]
+    fn drop_branch_clears_queue_and_stamps_marker() {
+        let mut state = NameServiceState::new();
+        create_ledger_with_genesis(&mut state, "test/db");
+        apply(
+            &mut state,
+            create_branch_cmd_helper("test/db", "feature", "main", None),
+            2,
+        );
+        apply(&mut state, enqueue("test/db", "feature", 7, None), 3);
+
+        apply(&mut state, drop_branch_cmd("test/db", "feature"), 4);
+
+        let ref_key = RefKey::new("test/db", "feature");
+        assert!(!state.queues.contains_key(&ref_key));
+        assert_eq!(
+            state.recently_cleared.get(&ref_key),
+            Some(&ClearReason::BranchDropped)
+        );
+    }
+
+    #[test]
+    fn drop_branch_does_not_stamp_marker_when_queue_was_empty() {
+        let mut state = NameServiceState::new();
+        create_ledger_with_genesis(&mut state, "test/db");
+        apply(
+            &mut state,
+            create_branch_cmd_helper("test/db", "feature", "main", None),
+            2,
+        );
+
+        apply(&mut state, drop_branch_cmd("test/db", "feature"), 3);
+
+        let ref_key = RefKey::new("test/db", "feature");
+        assert!(!state.recently_cleared.contains_key(&ref_key));
+    }
+
+    #[test]
+    fn drop_branch_leaves_other_branch_queues_untouched() {
+        let mut state = NameServiceState::new();
+        create_ledger_with_genesis(&mut state, "test/db");
+        apply(
+            &mut state,
+            create_branch_cmd_helper("test/db", "feature", "main", None),
+            2,
+        );
+        apply(&mut state, enqueue("test/db", "main", 7, None), 3);
+        apply(&mut state, enqueue("test/db", "feature", 8, None), 4);
+
+        apply(&mut state, drop_branch_cmd("test/db", "feature"), 5);
+
+        let main_key = RefKey::new("test/db", "main");
+        let feature_key = RefKey::new("test/db", "feature");
+        assert_eq!(state.queues.get(&main_key).unwrap().len(), 1);
+        assert!(!state.queues.contains_key(&feature_key));
+        assert!(!state.recently_cleared.contains_key(&main_key));
+    }
+
+    #[test]
+    fn drop_branch_failure_does_not_clear_queue() {
+        // BranchHasChildren returns early — no clearing.
+        let mut state = NameServiceState::new();
+        create_ledger_with_genesis(&mut state, "test/db");
+        apply(
+            &mut state,
+            create_branch_cmd_helper("test/db", "feature", "main", None),
+            2,
+        );
+        apply(&mut state, enqueue("test/db", "main", 7, None), 3);
+
+        apply(&mut state, drop_branch_cmd("test/db", "main"), 4);
+
+        let main_key = RefKey::new("test/db", "main");
+        assert_eq!(state.queues.get(&main_key).unwrap().len(), 1);
+        assert!(!state.recently_cleared.contains_key(&main_key));
+    }
+
+    #[test]
+    fn purge_ledger_clears_queue_and_stamps_marker() {
+        let mut state = NameServiceState::new();
+        create_ledger_with_genesis(&mut state, "test/db");
+        apply(&mut state, enqueue("test/db", "main", 7, None), 2);
+
+        apply(&mut state, purge_ledger_cmd("test/db", "main"), 3);
+
+        let ref_key = RefKey::new("test/db", "main");
+        assert!(!state.queues.contains_key(&ref_key));
+        assert_eq!(
+            state.recently_cleared.get(&ref_key),
+            Some(&ClearReason::BranchPurged)
+        );
+    }
+
+    #[test]
+    fn purge_ledger_clears_queue_for_unborn_branch() {
+        // Branches with queue entries but no RefEntry can exist (enqueue
+        // does not require the branch to be live). A purge of such a
+        // branch is otherwise AlreadyPurged but still has to drain the
+        // queue so pending workers see the clear.
+        let mut state = NameServiceState::new();
+        apply(&mut state, create_ledger("test/db"), 1);
+        apply(&mut state, enqueue("test/db", "main", 7, None), 2);
+
+        let resp = apply(&mut state, purge_ledger_cmd("test/db", "main"), 3);
+
+        let ref_key = RefKey::new("test/db", "main");
+        assert!(!state.queues.contains_key(&ref_key));
+        assert_eq!(
+            state.recently_cleared.get(&ref_key),
+            Some(&ClearReason::BranchPurged)
+        );
+        // The branch was registered via CreateLedger so the canonical
+        // state genuinely had something to remove.
+        assert_eq!(resp, Response::Purged { ledger_id: "test/db:main".into() });
+    }
+
+    #[test]
+    fn reset_head_clears_queue_and_stamps_marker() {
+        let mut state = NameServiceState::new();
+        create_ledger_with_genesis(&mut state, "test/db");
+        apply(
+            &mut state,
+            advance("test/db", "main", Some(cid(0)), cid(5), 10, None),
+            2,
+        );
+        apply(&mut state, enqueue("test/db", "main", 7, None), 3);
+
+        apply(
+            &mut state,
+            Command::ResetHead {
+                ledger_id: "test/db".into(),
+                branch: "main".into(),
+                snapshot: ResetHeadSnapshot {
+                    commit_head_id: Some(cid(0)),
+                    commit_t: 0,
+                    index_head_id: None,
+                    index_t: 0,
+                },
+            },
+            4,
+        );
+
+        let ref_key = RefKey::new("test/db", "main");
+        assert!(!state.queues.contains_key(&ref_key));
+        assert_eq!(
+            state.recently_cleared.get(&ref_key),
+            Some(&ClearReason::BranchHeadReset)
+        );
+    }
+
+    #[test]
+    fn reset_head_to_unborn_clears_queue() {
+        let mut state = NameServiceState::new();
+        create_ledger_with_genesis(&mut state, "test/db");
+        apply(&mut state, enqueue("test/db", "main", 7, None), 2);
+
+        apply(&mut state, reset_head_to_unborn_cmd("test/db", "main"), 3);
+
+        let ref_key = RefKey::new("test/db", "main");
+        assert!(!state.queues.contains_key(&ref_key));
+        assert_eq!(
+            state.recently_cleared.get(&ref_key),
+            Some(&ClearReason::BranchHeadReset)
+        );
+    }
+
+    #[test]
+    fn reset_head_failure_does_not_clear_queue() {
+        // LedgerNotFound returns early — no clearing.
+        let mut state = NameServiceState::new();
+        let resp = apply(
+            &mut state,
+            Command::ResetHead {
+                ledger_id: "missing".into(),
+                branch: "main".into(),
+                snapshot: ResetHeadSnapshot {
+                    commit_head_id: Some(cid(0)),
+                    commit_t: 0,
+                    index_head_id: None,
+                    index_t: 0,
+                },
+            },
+            1,
+        );
+        assert!(matches!(resp, Response::LedgerNotFound { .. }));
+        assert!(state.recently_cleared.is_empty());
+    }
+
+    #[test]
+    fn apply_head_after_admin_clear_observes_queue_cleared() {
+        // End-to-end check: enqueue, drop the branch, then apply_head
+        // with the original queue_id should surface QueueCleared with
+        // the correct ClearReason and consume the marker.
+        let mut state = NameServiceState::new();
+        create_ledger_with_genesis(&mut state, "test/db");
+        apply(
+            &mut state,
+            create_branch_cmd_helper("test/db", "feature", "main", None),
+            2,
+        );
+        let enq = apply(&mut state, enqueue("test/db", "feature", 7, None), 3);
+        let queue_id = match enq {
+            Response::Enqueued { queue_id, .. } => queue_id,
+            other => panic!("not Enqueued: {other:?}"),
+        };
+
+        apply(&mut state, drop_branch_cmd("test/db", "feature"), 4);
+
+        let resp = apply(
+            &mut state,
+            apply_head_cmd("test/db", "feature", queue_id, cid(42), 10),
+            5,
+        );
+        match resp {
+            Response::QueueDesync {
+                reason: DesyncReason::QueueCleared {
+                    reason: ClearReason::BranchDropped,
+                },
+                ..
+            } => {}
+            other => panic!("expected QueueCleared(BranchDropped), got {other:?}"),
+        }
+        // Marker is one-shot.
+        let ref_key = RefKey::new("test/db", "feature");
+        assert!(!state.recently_cleared.contains_key(&ref_key));
     }
 }
