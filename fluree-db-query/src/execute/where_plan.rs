@@ -1359,7 +1359,11 @@ fn build_sequential_join_block(
 
     // Tracks the running driving-chain cardinality across steps for the hash-join
     // cost model; `before_step` snapshots it against the live `bound` set per pattern.
-    let mut hash_planner = HashJoinPlanner::new(ctx.stats);
+    // Seed it from the incoming LEFT operator's estimate (e.g. a subquery producing
+    // `WITH DISTINCT friend`) so the first probe is costed against the producer size,
+    // not 1 — otherwise a large object predicate falsely trips scan-ratio-too-high.
+    let mut hash_planner = HashJoinPlanner::new(ctx.stats)
+        .with_left_estimate(operator.as_ref().and_then(|o| o.estimated_rows()));
     for (k, tp) in triples.iter().enumerate() {
         hash_planner.before_step(tp, &bound);
         let mut vars_after: HashSet<VarId> = bound.clone();
@@ -2502,8 +2506,14 @@ fn build_sequential_triple_chain(
 
     // Drives the hash-join cost model; snapshots cardinality against `seen_vars`
     // (the chain bound so far) before each pattern — see build_sequential_join_block.
-    let mut seen_vars: HashSet<VarId> = HashSet::new();
-    let mut hash_planner = HashJoinPlanner::new(ctx.stats);
+    // Both seed from the incoming LEFT operator: `seen_vars` from its bound schema
+    // (so the first probe is correctly costed as object-bound, not a full scan)
+    // and the driving estimate from its row estimate (e.g. a `WITH DISTINCT
+    // friend` subquery's ~producer size) — otherwise the first probe is weighed
+    // against 1 and a large object predicate falsely trips scan-ratio-too-high.
+    let mut seen_vars: HashSet<VarId> = bound_vars_from_operator(&operator);
+    let mut hash_planner = HashJoinPlanner::new(ctx.stats)
+        .with_left_estimate(operator.as_ref().and_then(|o| o.estimated_rows()));
     for (k, pattern) in triples.iter().enumerate() {
         hash_planner.before_step(pattern, &seen_vars);
         seen_vars.extend(pattern.produced_vars());

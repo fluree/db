@@ -398,8 +398,12 @@ impl Operator for SubqueryOperator {
     }
 
     fn estimated_rows(&self) -> Option<usize> {
-        // Subqueries can multiply rows; hard to estimate
-        None
+        // The subquery's OWN output estimate (uncorrelated producers — the common
+        // `WITH DISTINCT friend` case — emit this many rows). Seeds the downstream
+        // object→subject hash join's driving estimate so a `(message HAS_CREATOR
+        // friend)` probe is costed against the ~producer size, not 1. Shared with
+        // the planner's join-ordering estimate for consistency.
+        Some(crate::planner::estimate_subquery_output(&self.subquery, self.stats.as_deref()).round() as usize)
     }
 }
 

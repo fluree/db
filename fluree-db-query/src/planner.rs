@@ -57,6 +57,20 @@ const DEFAULT_PROPERTY_SCAN_SELECTIVITY: f64 = 1_000_000.0;
 /// probes the joined predicate by the produced var) instead of letting a
 /// high-cardinality predicate scan run first. See issue #1287.
 const ANCHORED_PROPERTY_PATH_SELECTIVITY: f64 = 100.0;
+/// A `WITH DISTINCT <one var>` subquery anchored by a constant in its body
+/// (e.g. `MATCH (p {id: $x})-[:KNOWS*1..2]-(friend) WITH DISTINCT friend`) emits
+/// the projected distinct rows reachable from that anchor — NOT the body's join
+/// product. The product wildly overestimates (a 2-hop KNOWS reads ~792M) and
+/// pushes the producer behind unrelated sources in join ordering. Estimate such
+/// an anchored producer at this small bounded value so it is placed first and
+/// binds its output before consumers are ranked.
+///
+/// Tuned above the pure-ordering minimum: it ALSO seeds the object→subject
+/// hash-join driving estimate for a downstream consumer (a `(message
+/// HAS_CREATOR friend)` probe), so it must stay realistic enough that
+/// `probe_count / driving_est` clears [`hash_join`'s scan-ratio cap](crate::hash_join)
+/// — too small (e.g. 100) re-rejects the very hash join this ordering unlocks.
+const DISTINCT_SUBQUERY_PRODUCER_SELECTIVITY: f64 = 500.0;
 /// Full scan - all variables unbound
 const FULL_SCAN: f64 = 1e12;
 
@@ -778,6 +792,61 @@ impl PatternEstimate {
     }
 }
 
+/// Does this subquery body contain a constant anchor — a specific starting node
+/// (`<const> p ?x`) or a property-value lookup that pins a subject
+/// (`?x p <const>`, e.g. `?root id $personId`) — that bounds the traversal to a
+/// small reachable set? Used to recognize an anchored `DISTINCT` producer (see
+/// [`DISTINCT_SUBQUERY_PRODUCER_SELECTIVITY`]). A broad `?x rdf:type Class` is
+/// NOT an anchor: it constrains membership, not a starting point.
+fn subquery_body_has_constant_anchor(patterns: &[Pattern]) -> bool {
+    patterns.iter().any(|p| match p {
+        Pattern::Triple(tp) => {
+            let const_subject = !matches!(tp.s, Ref::Var(_));
+            let pins_subject = tp.o.as_var().is_none() && !tp.p.is_rdf_type();
+            const_subject || pins_subject
+        }
+        Pattern::PropertyPath(pp) => {
+            !matches!(pp.subject, Ref::Var(_)) || !matches!(pp.object, Ref::Var(_))
+        }
+        Pattern::Union(branches) => branches.iter().any(|b| subquery_body_has_constant_anchor(b)),
+        Pattern::Optional(ps) | Pattern::Graph { patterns: ps, .. } => {
+            subquery_body_has_constant_anchor(ps)
+        }
+        Pattern::Subquery(inner) => subquery_body_has_constant_anchor(&inner.patterns),
+        _ => false,
+    })
+}
+
+/// Estimate a subquery's OUTPUT cardinality (what join ordering and the
+/// hash-join driving estimate care about) — NOT the size of its internal scan.
+///
+/// - A scalar aggregate (implicit `GROUP BY`) emits exactly one row.
+/// - A `DISTINCT` producer of a single var anchored by a constant in its body
+///   (`WITH DISTINCT friend` over an `{id: $x}`-anchored traversal) emits the
+///   projected distinct rows reachable from the anchor, not the body product —
+///   estimated at [`DISTINCT_SUBQUERY_PRODUCER_SELECTIVITY`].
+/// - Everything else keeps the body cardinality as an upper bound.
+///
+/// Shared by [`estimate_pattern`] (join ordering) and
+/// `SubqueryOperator::estimated_rows` (seeding the downstream hash join), so the
+/// producer's estimate is consistent in both places.
+pub(crate) fn estimate_subquery_output(sq: &SubqueryPattern, stats: Option<&StatsView>) -> f64 {
+    let rows = match &sq.grouping {
+        Some(Grouping::Implicit { .. }) => HIGHLY_SELECTIVE,
+        _ if sq.distinct
+            && sq.select.len() == 1
+            && sq.limit.is_none()
+            && subquery_body_has_constant_anchor(&sq.patterns) =>
+        {
+            DISTINCT_SUBQUERY_PRODUCER_SELECTIVITY
+        }
+        _ => estimate_branch_cardinality(&sq.patterns, stats),
+    };
+    // A LIMIT caps the output regardless of grouping.
+    let rows = sq.limit.map_or(rows, |l| rows.min(l as f64));
+    rows.max(HIGHLY_SELECTIVE)
+}
+
 /// Estimate cardinality for any pattern type.
 ///
 /// The `bound_vars` parameter indicates which variables are already bound from
@@ -808,28 +877,9 @@ pub fn estimate_pattern(
             }
         }
 
-        Pattern::Subquery(sq) => {
-            // Join ordering cares about a subquery's OUTPUT cardinality, not the
-            // size of its internal scan. A scalar aggregate (no `GROUP BY`) emits
-            // exactly one row. Estimating it by the (large) body cardinality
-            // wrongly ranks the subquery as a huge source and pushes it to the
-            // END of the join order — precisely where, if it is uncorrelated, it
-            // gets re-executed once per parent row (see `SubqueryOperator`'s
-            // uncorrelated fast-path). Treat a scalar-aggregate subquery as a
-            // single row so the planner places it early.
-            let rows = match &sq.grouping {
-                Some(Grouping::Implicit { .. }) => HIGHLY_SELECTIVE,
-                // `Explicit` GROUP BY emits one row per distinct key combination
-                // and `None` emits one row per solution; absent per-key NDV we
-                // keep the body estimate (an upper bound) for these.
-                _ => estimate_branch_cardinality(&sq.patterns, stats),
-            };
-            // A LIMIT caps the output regardless of grouping.
-            let rows = sq.limit.map_or(rows, |l| rows.min(l as f64));
-            PatternEstimate::Source {
-                row_count: rows.max(HIGHLY_SELECTIVE),
-            }
-        }
+        Pattern::Subquery(sq) => PatternEstimate::Source {
+            row_count: estimate_subquery_output(sq, stats),
+        },
 
         Pattern::Optional(_) => PatternEstimate::Expander { multiplier: 1.0 },
 
