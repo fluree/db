@@ -336,15 +336,9 @@ impl LedgerHandle {
             let arc_store = Arc::new(store);
             crate::runtime_dicts::reseed_runtime_small_dicts(&mut state, &arc_store);
 
-            // Build range_provider with the real dict_novelty (rebuilt by apply_loaded_db)
-            let ns_fallback = Some(state.snapshot.shared_namespaces());
-            let provider = BinaryRangeProvider::new(
-                Arc::clone(&arc_store),
-                Arc::clone(&state.dict_novelty),
-                Arc::clone(&state.runtime_small_dicts),
-                ns_fallback,
-            );
-            Arc::make_mut(&mut state.snapshot).range_provider = Some(Arc::new(provider));
+            // (Re)build range_provider coherent with the dict_novelty that
+            // apply_loaded_db just rebuilt.
+            attach_range_provider(&mut state, &arc_store);
 
             let te_store: Arc<dyn std::any::Any + Send + Sync> = arc_store.clone();
             state.binary_store = Some(TypeErasedStore(te_store));
@@ -596,6 +590,35 @@ impl Default for LedgerManagerConfig {
 
 use fluree_db_query::BinaryRangeProvider;
 
+/// The single construction site for a `LedgerState`'s `BinaryRangeProvider`.
+///
+/// Builds the provider from the state's OWN `dict_novelty` + `runtime_small_dicts`
+/// (plus the given `store` and the snapshot's namespace fallback) and stamps it
+/// into `state.snapshot.range_provider`. This is the chokepoint for the
+/// load-bearing Arc-identity contract documented on `LedgerState`: the provider
+/// must hold the *same* `dict_novelty` Arc the state keeps mutating via
+/// `Arc::make_mut`, or overlay translation silently loses post-index novelty ids
+/// (the "disappearing properties" bug). Every lifecycle transition that resets or
+/// mutates `dict_novelty`/`runtime_small_dicts`/the store re-attaches through here,
+/// so no caller can mutate novelty and forget to rebuild.
+///
+/// (Phase 2: the immutable `CoherentLedgerState` bundle will make this
+/// unforgettable by construction; this helper is its single inner builder.)
+fn attach_range_provider(state: &mut LedgerState, store: &Arc<BinaryIndexStore>) {
+    let ns_fallback = Some(state.snapshot.shared_namespaces());
+    let provider = BinaryRangeProvider::new(
+        Arc::clone(store),
+        Arc::clone(&state.dict_novelty),
+        Arc::clone(&state.runtime_small_dicts),
+        ns_fallback,
+    );
+    debug_assert!(
+        Arc::ptr_eq(provider.dict_novelty(), &state.dict_novelty),
+        "range provider must share the state's dict_novelty Arc (identity contract)"
+    );
+    Arc::make_mut(&mut state.snapshot).range_provider = Some(Arc::new(provider));
+}
+
 /// Load BinaryIndexStore from a v2 index root, attach range_provider
 /// to the LedgerState's LedgerSnapshot, and return the Arc'd store.
 ///
@@ -684,16 +707,9 @@ pub(crate) async fn load_and_attach_binary_store(
 
     let arc_store = Arc::new(store);
     crate::runtime_dicts::reseed_runtime_small_dicts(state, &arc_store);
-    let ns_fallback = Some(state.snapshot.shared_namespaces());
-    let provider = BinaryRangeProvider::new(
-        Arc::clone(&arc_store),
-        Arc::clone(&state.dict_novelty),
-        Arc::clone(&state.runtime_small_dicts),
-        ns_fallback,
-    );
-    // Always rebuild the provider here so it is coherent with the freshly
+    // Always (re)build the provider here so it is coherent with the freshly
     // loaded BinaryIndexStore, DictNovelty, and runtime dictionary state.
-    Arc::make_mut(&mut state.snapshot).range_provider = Some(Arc::new(provider));
+    attach_range_provider(state, &arc_store);
     // Also attach the type-erased store to the state so transaction staging
     // (which clones LedgerState under the write lock) can construct
     // graph-scoped BinaryRangeProviders (needed for named-graph upsert deletions).
@@ -1661,26 +1677,19 @@ impl LedgerManager {
                             .map_err(|e| ApiError::internal(format!("apply commit: {e}")))?;
                     }
 
-                    // If a binary range provider is attached, refresh it to point at the
-                    // updated DictNovelty. `apply_single_commit` replaces `state.dict_novelty`
-                    // with a new Arc; without re-attaching here, the provider holds a stale
-                    // Arc and overlay translation will fail for novelty-only strings/subjects.
-                    if let Some(rp) = write_guard.state().snapshot.range_provider.as_ref() {
-                        if let Some(brp) = rp.as_any().downcast_ref::<BinaryRangeProvider>() {
-                            let store = Arc::clone(brp.store());
-                            let dn = Arc::clone(&write_guard.state().dict_novelty);
-                            let runtime_small_dicts =
-                                Arc::clone(&write_guard.state().runtime_small_dicts);
-                            let ns_fallback =
-                                Some(write_guard.state().snapshot.shared_namespaces());
-                            Arc::make_mut(&mut write_guard.state_mut().snapshot).range_provider =
-                                Some(Arc::new(BinaryRangeProvider::new(
-                                    store,
-                                    dn,
-                                    runtime_small_dicts,
-                                    ns_fallback,
-                                )));
-                        }
+                    // `apply_single_commit` replaced `state.dict_novelty` with a new
+                    // Arc; re-attach the provider through the one chokepoint so it
+                    // points at the current dict_novelty (else overlay translation
+                    // misses novelty-only strings/subjects — the detached-Arc bug).
+                    if let Some(store) = write_guard
+                        .state()
+                        .snapshot
+                        .range_provider
+                        .as_ref()
+                        .and_then(|rp| rp.as_any().downcast_ref::<BinaryRangeProvider>())
+                        .map(|brp| Arc::clone(brp.store()))
+                    {
+                        attach_range_provider(write_guard.state_mut(), &store);
                     }
                 }
 
