@@ -33,6 +33,8 @@ use fluree_db_core::trace_commits_by_id;
 use fluree_db_core::{ledger_id::normalize_ledger_id, ContentId, ContentStore, StorageBackend};
 use fluree_db_ledger::{LedgerState, TypeErasedStore};
 use fluree_db_nameservice::NsRecord;
+
+use crate::coherent_state::{AttachedIndex, CoherentLedgerState};
 use tokio::sync::{oneshot, RwLock};
 
 use crate::error::{ApiError, Result};
@@ -66,28 +68,35 @@ fn monotonic_secs() -> u64 {
 /// Transactions hold this guard across stage+commit to serialize writes
 /// to the same ledger.
 pub struct LedgerWriteGuard<'a> {
-    guard: tokio::sync::RwLockWriteGuard<'a, LedgerState>,
+    guard: tokio::sync::RwLockWriteGuard<'a, CoherentLedgerState>,
 }
 
 impl LedgerWriteGuard<'_> {
     /// Get reference to current state
     pub fn state(&self) -> &LedgerState {
-        &self.guard
+        &self.guard.core
     }
 
     /// Clone current state for passing to stage (which consumes by value)
     pub fn clone_state(&self) -> LedgerState {
-        self.guard.clone()
+        self.guard.core.clone()
     }
 
-    /// Get mutable reference to current state for in-place updates
+    /// Get mutable reference to current state for in-place updates.
+    ///
+    /// In-place mutation that does NOT change the attached binary store (e.g.
+    /// applying commits to novelty) keeps the bundle coherent; paths that swap
+    /// the store publish a whole new bundle via [`Self::replace`].
     pub fn state_mut(&mut self) -> &mut LedgerState {
-        &mut self.guard
+        &mut self.guard.core
     }
 
-    /// Replace state with new state after successful commit
+    /// Replace state with new state after a successful commit, re-deriving the
+    /// coherent typed index from `new_state.binary_store`. This is what retires
+    /// the old `sync_binary_store_from_state` step: the state and its store swap
+    /// together, atomically, so a reader can never see one without the other.
     pub fn replace(&mut self, new_state: LedgerState) {
-        *self.guard = new_state;
+        *self.guard = CoherentLedgerState::from_core(new_state);
     }
 }
 
@@ -113,24 +122,20 @@ impl Clone for LedgerHandle {
     }
 }
 
-/// Lock ordering invariant: always acquire `state` before `binary_store`.
-/// All paths that touch both locks (snapshot, apply_index_v2, reload)
-/// follow this order to prevent deadlock and ensure coherence.
 struct LedgerHandleInner {
-    /// Guards all access to the ledger state. A `RwLock` so concurrent reads
-    /// (every query takes a brief shared `read()` to clone a cheap, Arc-backed
-    /// snapshot) run in parallel instead of serializing; transactions take an
-    /// exclusive `write()` for the stage+commit duration.
-    state: RwLock<LedgerState>,
+    /// Guards the whole ledger state — the `core` [`LedgerState`] and its
+    /// coherent typed binary index — as one [`CoherentLedgerState`] bundle. A
+    /// single `RwLock` (was two, plus an out-of-band `binary_store` lock + a
+    /// hand-maintained sync invariant): concurrent reads (every query takes a
+    /// brief shared `read()` to clone a cheap, Arc-backed snapshot) run in
+    /// parallel; transactions take an exclusive `write()` for the stage+commit
+    /// duration. (P2b swaps this `RwLock` for an `ArcSwap`, retiring the read
+    /// lock entirely so readers never block.)
+    state: RwLock<CoherentLedgerState>,
     /// Ledger ID (e.g., "mydb:main")
     ledger_id: String,
     /// Last access time (monotonic secs since process start)
     last_access: AtomicU64,
-    /// Binary columnar index store (v2 only).
-    ///
-    /// Always coherent with `state.snapshot.range_provider` — writers hold
-    /// the `state` lock while updating this.
-    binary_store: RwLock<Option<Arc<BinaryIndexStore>>>,
 }
 
 impl LedgerHandle {
@@ -142,10 +147,9 @@ impl LedgerHandle {
     ) -> Self {
         Self {
             inner: Arc::new(LedgerHandleInner {
-                state: RwLock::new(state),
+                state: RwLock::new(CoherentLedgerState::new(state, binary_store)),
                 ledger_id,
                 last_access: AtomicU64::new(monotonic_secs()),
-                binary_store: RwLock::new(binary_store),
             }),
         }
     }
@@ -164,16 +168,15 @@ impl LedgerHandle {
     /// The snapshot is a cheap clone; the lock is released immediately after.
     pub async fn snapshot(&self) -> LedgerView {
         self.touch();
-        let state = self.inner.state.read().await;
-        let binary_store = self.inner.binary_store.read().await.clone();
-        let mut snap = LedgerView::from_state(&state);
-        snap.binary_store = binary_store;
+        let bundle = self.inner.state.read().await;
+        let mut snap = LedgerView::from_state(&bundle.core);
+        snap.binary_store = bundle.store().map(Arc::clone);
         debug_assert!(
             snap.snapshot.range_provider.is_some() == snap.binary_store.is_some(),
             "range_provider and binary_store must be coherent"
         );
         snap
-        // Locks released here
+        // Lock released here
     }
 
     /// Acquire exclusive access for transaction (hold lock for stage+commit)
@@ -182,22 +185,6 @@ impl LedgerHandle {
         LedgerWriteGuard {
             guard: self.inner.state.write().await,
         }
-    }
-
-    /// Keep the out-of-band cached binary store coherent with the current state.
-    ///
-    /// Call this while holding the state lock, **before** `guard.replace()`,
-    /// passing `&new_state`. This ensures the binary_store is updated before
-    /// the new state becomes visible to concurrent readers via `snapshot()`,
-    /// preventing a TOCTOU window where a reader could observe the new state
-    /// paired with the old binary_store.
-    pub async fn sync_binary_store_from_state(&self, state: &LedgerState) {
-        let binary_store = state.binary_store.as_ref().and_then(|te| {
-            std::sync::Arc::clone(&te.0)
-                .downcast::<BinaryIndexStore>()
-                .ok()
-        });
-        *self.inner.binary_store.write().await = binary_store;
     }
 
     /// Update last access time
@@ -228,7 +215,7 @@ impl LedgerHandle {
     /// For freshness checking against remote watermarks, use this method.
     pub async fn index_t(&self) -> i64 {
         let state = self.inner.state.read().await;
-        state.index_t()
+        state.core.index_t()
     }
 
     /// Get current t value (max of db.t and novelty.t)
@@ -237,7 +224,7 @@ impl LedgerHandle {
     /// Use this for comparing against nameservice commit_t to detect staleness.
     pub async fn t(&self) -> i64 {
         let state = self.inner.state.read().await;
-        state.t()
+        state.core.t()
     }
 
     /// Get state metrics for update planning
@@ -246,9 +233,10 @@ impl LedgerHandle {
     pub async fn state_metrics(&self) -> (i64, i64, Option<ContentId>) {
         let state = self.inner.state.read().await;
         (
-            state.t(),
-            state.index_t(),
+            state.core.t(),
+            state.core.index_t(),
             state
+                .core
                 .ns_record
                 .as_ref()
                 .and_then(|r| r.index_head_id.clone()),
@@ -320,29 +308,33 @@ impl LedgerHandle {
         // then wire up range_provider with the correct dict_novelty.
         // Lock ordering: state → binary_store (same as snapshot()).
         {
-            let mut state = self.inner.state.write().await;
+            let mut bundle = self.inner.state.write().await;
 
             // apply_loaded_db: validates, trims novelty, rebuilds dict_novelty
-            state
+            bundle
+                .core
                 .apply_loaded_db(db, Some(index_id))
                 .map_err(|e| ApiError::internal(format!("apply_loaded_db failed: {e}")))?;
 
             // Sync namespace codes between store and snapshot (bimap validation).
             crate::ns_helpers::sync_store_and_snapshot_ns(
                 &mut store,
-                Arc::make_mut(&mut state.snapshot),
+                Arc::make_mut(&mut bundle.core.snapshot),
             )?;
 
             let arc_store = Arc::new(store);
-            crate::runtime_dicts::reseed_runtime_small_dicts(&mut state, &arc_store);
+            crate::runtime_dicts::reseed_runtime_small_dicts(&mut bundle.core, &arc_store);
 
             // (Re)build range_provider coherent with the dict_novelty that
             // apply_loaded_db just rebuilt.
-            attach_range_provider(&mut state, &arc_store);
+            attach_range_provider(&mut bundle.core, &arc_store);
 
+            // Swap in the new store: the type-erased copy on the core (for the
+            // transact path) and the typed index cache (for readers) together —
+            // one bundle, so a reader never sees the new snapshot with the old store.
             let te_store: Arc<dyn std::any::Any + Send + Sync> = arc_store.clone();
-            state.binary_store = Some(TypeErasedStore(te_store));
-            *self.inner.binary_store.write().await = Some(arc_store);
+            bundle.core.binary_store = Some(TypeErasedStore(te_store));
+            bundle.index = Some(AttachedIndex { store: arc_store });
         }
 
         Ok(())
@@ -1137,7 +1129,7 @@ impl LedgerManager {
                 let result = match loaded {
                     Ok(mut new_state) => {
                         // Attempt to load binary index store (v2 only) — still off-lock.
-                        let new_binary_store = match load_and_attach_binary_store(
+                        let _new_binary_store = match load_and_attach_binary_store(
                             &self.backend,
                             self.nameservice_mode.reader(),
                             &mut new_state,
@@ -1171,9 +1163,10 @@ impl LedgerManager {
                         // index, which the next reload picks up. Never clobber a
                         // newer in-memory commit to adopt a newer index.
                         if new_state.t() >= write_guard.state().t() {
-                            let mut bs_guard = handle.inner.binary_store.write().await;
+                            // `replace` re-derives the typed index from
+                            // new_state.binary_store (set by load_and_attach above),
+                            // so state and store swap together atomically.
                             write_guard.replace(new_state);
-                            *bs_guard = new_binary_store;
                         } else {
                             // A concurrent commit advanced the in-memory state
                             // past the reloaded storage HEAD (a txn took the

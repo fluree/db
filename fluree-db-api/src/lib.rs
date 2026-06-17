@@ -86,6 +86,7 @@ pub mod view;
 pub mod wire;
 
 // Ledger caching and management
+pub(crate) mod coherent_state;
 pub mod ledger_manager;
 pub mod ledger_view;
 

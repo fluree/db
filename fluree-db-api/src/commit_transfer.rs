@@ -385,9 +385,8 @@ impl Fluree {
             commit_t: final_head.t,
         };
 
-        // Sync binary_store BEFORE replacing state so that concurrent readers
-        // (via snapshot()) never see the new state with a stale binary_store.
-        handle.sync_binary_store_from_state(&new_state).await;
+        // `replace` re-derives the coherent typed index from
+        // new_state.binary_store, so state and store swap together atomically.
         guard.replace(new_state);
 
         // 9) Trigger background indexing if enabled and needed.
@@ -1473,9 +1472,8 @@ impl Fluree {
             commit_t: final_head.t,
         };
 
-        // Sync binary_store BEFORE replacing state so that concurrent readers
-        // (via snapshot()) never see the new state with a stale binary_store.
-        handle.sync_binary_store_from_state(&new_state).await;
+        // `replace` re-derives the coherent typed index from
+        // new_state.binary_store, so state and store swap together atomically.
         guard.replace(new_state);
 
         // 10) Trigger background indexing if enabled and needed.

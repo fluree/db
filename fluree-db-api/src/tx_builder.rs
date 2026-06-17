@@ -960,9 +960,8 @@ pub(crate) async fn commit_with_handle(
             .await?;
         }
 
-        // Update cache — sync binary_store BEFORE replacing state so that
-        // concurrent readers never see the new state with a stale binary_store.
-        handle.sync_binary_store_from_state(&new_state).await;
+        // Update cache. `replace` re-derives the coherent typed index from
+        // new_state.binary_store, so state and store swap together atomically.
         write_guard.replace(new_state);
 
         // Trigger background indexing if needed (outside cache update is fine here)
@@ -1171,9 +1170,8 @@ pub(crate) async fn commit_with_handle(
             .await?;
         }
 
-        // Update cache — sync binary_store BEFORE replacing state so that
-        // concurrent readers never see the new state with a stale binary_store.
-        handle.sync_binary_store_from_state(&new_state).await;
+        // Update cache. `replace` re-derives the coherent typed index from
+        // new_state.binary_store, so state and store swap together atomically.
         write_guard.replace(new_state);
         drop(write_guard);
 
