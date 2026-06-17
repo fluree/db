@@ -485,8 +485,16 @@ impl FlureeServerBuilder {
                     let backend = state_inner.fluree.backend().clone();
                     let indexer_config = fluree_db_indexer::IndexerConfig::default();
                     let event_bus = Arc::clone(&integration.event_bus);
+                    // Same `RaftNameService` doubles as the
+                    // `CommitPublisher` so the worker's head advance
+                    // goes through `publish_commit` → `ApplyHead`
+                    // under the queue front it sampled.
+                    let publisher: std::sync::Arc<
+                        dyn fluree_db_nameservice::CommitPublisher,
+                    > = std::sync::Arc::clone(&raft_ns) as _;
                     let commit_worker = fluree_db_consensus::raft::commit_worker::CommitWorker::new(
                         Arc::clone(&integration.raft),
+                        publisher,
                         Arc::clone(&state_inner.fluree),
                         state_inner
                             .index_config

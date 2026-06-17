@@ -9,29 +9,22 @@
 //!   state-machine adapter writes to under apply — followers (and
 //!   the leader, before its local cache catches up) observe
 //!   committed log state without an openraft RPC.
-//! - **Writes** ([`IndexPublisher`]) propose
+//! - **Index publishing** ([`IndexPublisher`]) proposes
 //!   [`Command::AdvanceIndexHead`](super::state_machine::Command::AdvanceIndexHead)
 //!   through Raft via the held handle. Every node's state machine
 //!   then updates its
 //!   [`RefEntry::index`](super::state_machine::RefEntry::index) under
 //!   apply, so subsequent reads observe the new index head as soon
 //!   as the entry commits.
-//!
-//! The combined surface implements
-//! [`IndexingNameService`](fluree_db_nameservice::IndexingNameService) —
-//! the narrow trait indexing reaches through — without the
-//! orchestrator needing to thread two separate Arcs.
-//!
-//! # Scope
-//!
-//! Reads + index-head publish. The other write-shaped trait methods
-//! ([`create_branch`](fluree_db_nameservice::BranchLifecycle::create_branch),
-//! commit publishing, etc.) are deliberately not implemented here —
-//! they have their own paths (commit publishes flow through
-//! `RaftCommitter::transact` proposing `Command::AdvanceRef`; branch
-//! lifecycle is not yet a state-machine command). Trying to call
-//! them through a `RaftNameService` would be a type error at the
-//! call site, which is the design we want.
+//! - **Commit publishing** ([`CommitPublisher`]) proposes
+//!   [`Command::ApplyHead`](super::state_machine::Command::ApplyHead)
+//!   against the current per-branch queue front. The caller (the
+//!   queue worker) stages and writes the commit blob before invoking
+//!   `publish_commit`; the trait method only handles the head
+//!   advance. The `queue_id` is sampled from the shared state at
+//!   call time — the state machine validates the front matches at
+//!   apply time and returns [`QueueDesync`](super::state_machine::DesyncReason)
+//!   on a race.
 //!
 //! # Stale-publish handling
 //!
@@ -55,8 +48,8 @@
 //! [`LedgerState::load`]: fluree_db_ledger::LedgerState::load
 
 use crate::raft::state_machine::{
-    AdvanceIndexHeadArgs, Command as SmCommand, CreateBranchArgs, CreateLedgerArgs,
-    NameServiceState, RefKey, ResetHeadSnapshot, Response as SmResponse,
+    AdvanceIndexHeadArgs, ApplyHeadArgs, Command as SmCommand, CreateBranchArgs, CreateLedgerArgs,
+    DesyncReason, NameServiceState, RefKey, ResetHeadSnapshot, Response as SmResponse,
 };
 use crate::raft::state_machine_adapter::SharedState;
 use crate::raft::TypeConfig;
@@ -64,9 +57,10 @@ use async_trait::async_trait;
 use fluree_db_core::ledger_id::split_ledger_id;
 use fluree_db_core::ContentId;
 use fluree_db_nameservice::{
-    BranchLifecycle, ConfigLookup, ConfigValue, GraphSourceLookup, GraphSourceRecord,
-    IndexPublisher, LedgerLifecycle, NameServiceError, NameServiceLookup, NsLookupResult,
-    NsRecord, NsRecordSnapshot, RefKind, RefLookup, RefValue, Result, StatusLookup, StatusValue,
+    BranchLifecycle, CommitPublisher, ConfigLookup, ConfigValue, GraphSourceLookup,
+    GraphSourceRecord, IndexPublisher, LedgerLifecycle, NameServiceError, NameServiceLookup,
+    NsLookupResult, NsRecord, NsRecordSnapshot, RefKind, RefLookup, RefValue, Result, StatusLookup,
+    StatusValue,
 };
 use openraft::error::{ClientWriteError, RaftError};
 use openraft::Raft;
@@ -236,6 +230,140 @@ impl IndexPublisher for RaftNameService {
                 "raft fatal during AdvanceIndexHead: {f}"
             ))),
         }
+    }
+}
+
+/// Build the state-machine command a [`CommitPublisher::publish_commit`]
+/// call translates into.
+///
+/// The `queue_id` is sampled from the current per-branch queue front:
+/// the worker only ever calls `publish_commit` after staging the entry
+/// currently at the front, so peeking here recovers the queue_id the
+/// caller observed without requiring it to thread through the trait.
+/// If the front shifts between peek and apply (admin clear, leader
+/// change), the state machine returns [`SmResponse::QueueDesync`] and
+/// the caller surfaces it as an error — the race is the same one
+/// `QueueDesync` was designed to catch.
+fn build_apply_head_command(
+    state: &NameServiceState,
+    ledger_id: &str,
+    commit_t: i64,
+    commit_id: &ContentId,
+) -> std::result::Result<SmCommand, NameServiceError> {
+    let (ledger_name, branch) = split_ledger_id(ledger_id)?;
+    let ref_key = RefKey::new(&ledger_name, &branch);
+    let queue_id = state
+        .queues
+        .get(&ref_key)
+        .and_then(|q| q.front())
+        .map(|entry| entry.queue_id)
+        .ok_or_else(|| {
+            NameServiceError::storage(format!(
+                "publish_commit on {ledger_id}: per-branch queue is empty — \
+                 nothing staged for this branch"
+            ))
+        })?;
+    let applied_at_millis = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    Ok(SmCommand::ApplyHead(ApplyHeadArgs {
+        ledger_id: ledger_name,
+        branch,
+        queue_id,
+        commit_id: commit_id.clone(),
+        commit_t,
+        applied_at_millis,
+    }))
+}
+
+/// Translate the apply outcome into the `CommitPublisher::publish_commit`
+/// result.
+///
+/// - [`SmResponse::HeadApplied`] → `Ok(())`.
+/// - [`SmResponse::QueueDesync`] → `Err(Storage)` with the reason
+///   inlined so callers can decide whether to retry. Common causes are
+///   admin preemption (`QueueCleared`), former-leader straggler
+///   proposals (`WrongFront`), or a state-machine invariant break.
+/// - [`SmResponse::LedgerNotFound`] → `Err(not_found)`.
+/// - Anything else → `Err(Storage)`. None of the other variants are
+///   reachable for an ApplyHead command; if one appears it's a
+///   state-machine bug worth surfacing rather than swallowing.
+fn map_apply_head_response(resp: SmResponse) -> Result<()> {
+    match resp {
+        SmResponse::HeadApplied { .. } => Ok(()),
+        SmResponse::QueueDesync {
+            ledger_id,
+            requested_queue_id,
+            reason,
+        } => Err(NameServiceError::storage(format!(
+            "raft ApplyHead desynced on {ledger_id} (queue_id={requested_queue_id}): \
+             {}",
+            describe_desync_reason(&reason)
+        ))),
+        SmResponse::LedgerNotFound { ledger_id } => Err(NameServiceError::not_found(ledger_id)),
+        other => Err(NameServiceError::storage(format!(
+            "unexpected Response variant for ApplyHead: {other:?}"
+        ))),
+    }
+}
+
+fn describe_desync_reason(reason: &DesyncReason) -> String {
+    match reason {
+        DesyncReason::WrongFront { actual_queue_id } => {
+            format!("queue front is now {actual_queue_id}")
+        }
+        DesyncReason::QueueCleared { reason } => {
+            format!("queue cleared by admin command ({reason:?})")
+        }
+        DesyncReason::InvariantViolated { description } => {
+            format!("state-machine invariant violated: {description}")
+        }
+    }
+}
+
+#[async_trait]
+impl CommitPublisher for RaftNameService {
+    async fn publish_commit(
+        &self,
+        ledger_id: &str,
+        commit_t: i64,
+        commit_id: &ContentId,
+    ) -> Result<()> {
+        // Peek the queue front under the read lock; `client_write`
+        // happens after the lock drops so we don't hold it across an
+        // async wait. The lock-then-propose sequence is safe because
+        // the state machine validates the queue_id at apply time.
+        let cmd = {
+            let state = self.state.read().await;
+            build_apply_head_command(&state, ledger_id, commit_t, commit_id)?
+        };
+
+        match self.raft.client_write(cmd).await {
+            Ok(resp) => map_apply_head_response(resp.data),
+            // Stepped-down leader: the new leader's worker will
+            // observe the same queue entry and re-stage. Drop the
+            // straggling publish silently rather than reporting a
+            // bogus failure to the caller.
+            Err(RaftError::APIError(ClientWriteError::ForwardToLeader(_))) => Ok(()),
+            Err(RaftError::APIError(ClientWriteError::ChangeMembershipError(e))) => {
+                Err(NameServiceError::storage(format!(
+                    "unexpected ChangeMembershipError on ApplyHead: {e}"
+                )))
+            }
+            Err(RaftError::Fatal(f)) => Err(NameServiceError::storage(format!(
+                "raft fatal during ApplyHead: {f}"
+            ))),
+        }
+    }
+
+    /// The state-machine carries every published commit under its
+    /// `ledger_id:branch` alias, so the alias to write into the
+    /// commit's `ns` field is the same string the caller passed in.
+    /// Private publishing isn't a concept here — the cluster is the
+    /// only nameservice.
+    fn publishing_ledger_id(&self, ledger_id: &str) -> Option<String> {
+        Some(ledger_id.to_string())
     }
 }
 
@@ -728,6 +856,143 @@ mod tests {
         // but if it ever were, the publisher should surface rather
         // than swallow.
         assert!(map_advance_index_response(SmResponse::NoOp).is_err());
+    }
+
+    // ----------------------------------------------------------------
+    // build_apply_head_command + map_apply_head_response
+    // ----------------------------------------------------------------
+
+    fn install_queue_front(state: &mut NameServiceState, ledger_id: &str, queue_id: u64) {
+        use crate::raft::state_machine::{BodyKind, QueueEntry};
+        use std::collections::VecDeque;
+        let (ledger_name, branch) =
+            split_ledger_id(ledger_id).expect("test ledger_id parses");
+        let mut queue = VecDeque::new();
+        queue.push_back(QueueEntry {
+            queue_id,
+            enqueued_index: 1,
+            enqueued_at_millis: 1_000,
+            idempotency: None,
+            request_cid: cid(0),
+            body_kind: BodyKind::JsonLdInsert,
+        });
+        state.queues.insert(RefKey::new(&ledger_name, &branch), queue);
+    }
+
+    #[test]
+    fn build_apply_head_command_samples_queue_front_queue_id() {
+        let mut state = NameServiceState::default();
+        install_queue_front(&mut state, "test/db:main", 42);
+
+        let cmd = build_apply_head_command(&state, "test/db:main", 7, &cid(99)).expect("build");
+        let SmCommand::ApplyHead(args) = cmd else {
+            panic!("expected ApplyHead");
+        };
+        assert_eq!(args.ledger_id, "test/db");
+        assert_eq!(args.branch, "main");
+        assert_eq!(args.queue_id, 42);
+        assert_eq!(args.commit_id, cid(99));
+        assert_eq!(args.commit_t, 7);
+        assert!(args.applied_at_millis > 0);
+    }
+
+    #[test]
+    fn build_apply_head_command_errors_when_queue_empty() {
+        // The state machine guarantees that worker calls to
+        // publish_commit happen only when a queue entry exists; an
+        // empty queue means somebody routed a stage through here
+        // without enqueueing first, which is a bug worth surfacing.
+        let state = NameServiceState::default();
+        let err = build_apply_head_command(&state, "test/db:main", 7, &cid(99))
+            .expect_err("expected empty-queue error");
+        assert!(
+            err.to_string().contains("queue is empty"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn build_apply_head_command_rejects_invalid_ledger_id() {
+        let state = NameServiceState::default();
+        assert!(build_apply_head_command(&state, "", 7, &cid(99)).is_err());
+    }
+
+    #[test]
+    fn map_apply_head_response_head_applied_is_ok() {
+        let r = map_apply_head_response(SmResponse::HeadApplied {
+            ledger_id: "test/db:main".into(),
+            commit_id: cid(1),
+            commit_t: 1,
+        });
+        assert!(r.is_ok());
+    }
+
+    #[test]
+    fn map_apply_head_response_wrong_front_surfaces_actual_queue_id() {
+        let r = map_apply_head_response(SmResponse::QueueDesync {
+            ledger_id: "test/db:main".into(),
+            requested_queue_id: 7,
+            reason: DesyncReason::WrongFront {
+                actual_queue_id: 12,
+            },
+        });
+        let msg = r.expect_err("desync is error").to_string();
+        assert!(msg.contains("queue_id=7"), "got: {msg}");
+        assert!(msg.contains("12"), "got: {msg}");
+    }
+
+    #[test]
+    fn map_apply_head_response_queue_cleared_surfaces_clear_reason() {
+        use crate::raft::state_machine::ClearReason;
+        let r = map_apply_head_response(SmResponse::QueueDesync {
+            ledger_id: "test/db:main".into(),
+            requested_queue_id: 7,
+            reason: DesyncReason::QueueCleared {
+                reason: ClearReason::BranchDropped,
+            },
+        });
+        let msg = r.expect_err("desync is error").to_string();
+        assert!(msg.contains("BranchDropped"), "got: {msg}");
+    }
+
+    #[test]
+    fn map_apply_head_response_invariant_violated_surfaces_description() {
+        let r = map_apply_head_response(SmResponse::QueueDesync {
+            ledger_id: "test/db:main".into(),
+            requested_queue_id: 0,
+            reason: DesyncReason::InvariantViolated {
+                description: "queue missing".into(),
+            },
+        });
+        let msg = r.expect_err("desync is error").to_string();
+        assert!(msg.contains("queue missing"), "got: {msg}");
+    }
+
+    #[test]
+    fn map_apply_head_response_ledger_not_found_is_err() {
+        let r = map_apply_head_response(SmResponse::LedgerNotFound {
+            ledger_id: "gone/db".into(),
+        });
+        let msg = r.expect_err("not-found is error").to_string();
+        assert!(msg.contains("gone/db"), "got: {msg}");
+    }
+
+    #[test]
+    fn map_apply_head_response_unexpected_variant_is_err() {
+        assert!(map_apply_head_response(SmResponse::NoOp).is_err());
+    }
+
+    // ----------------------------------------------------------------
+    // CommitPublisher::publishing_ledger_id
+    // ----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn publishing_ledger_id_echoes_input() {
+        let ns = RaftNameService::new(fresh_state(), stub_raft().await);
+        assert_eq!(
+            ns.publishing_ledger_id("test/db:main"),
+            Some("test/db:main".to_string())
+        );
     }
 
     // ----------------------------------------------------------------

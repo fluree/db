@@ -21,8 +21,7 @@
 
 use crate::local::build_policy_context;
 use crate::raft::state_machine::{
-    ApplyHeadArgs, BodyKind, Command as SmCommand, PoisonQueueEntryArgs, PoisonReason, QueueEntry,
-    RefKey, Response as SmResponse,
+    BodyKind, Command as SmCommand, PoisonQueueEntryArgs, PoisonReason, QueueEntry, RefKey,
 };
 use crate::raft::state_machine_adapter::SharedState;
 use crate::raft::TypeConfig;
@@ -30,6 +29,7 @@ use crate::{QueuedRequest, SubmissionError, TransactionBody};
 use fluree_db_api::{ApiError, Fluree};
 use fluree_db_core::ContentId;
 use fluree_db_ledger::IndexConfig;
+use fluree_db_nameservice::CommitPublisher;
 use openraft::Raft;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -49,9 +49,16 @@ const RAFT_BACKOFF: Duration = Duration::from_millis(250);
 ///
 /// Cloning is cheap (`Arc` clones); a single worker instance is
 /// driven by the leader watcher.
+///
+/// Head advances flow through `publisher.publish_commit` — a Raft
+/// deployment supplies a [`RaftNameService`](crate::raft::nameservice::RaftNameService)
+/// here, which proposes `ApplyHead` against the current per-branch
+/// queue front. Poisoning still goes direct to Raft because there's
+/// no trait surface for "fail this queue entry."
 #[derive(Clone)]
 pub struct CommitWorker {
     raft: Arc<Raft<TypeConfig>>,
+    publisher: Arc<dyn CommitPublisher>,
     fluree: Arc<Fluree>,
     index_config: IndexConfig,
     shared_state: SharedState,
@@ -60,12 +67,14 @@ pub struct CommitWorker {
 impl CommitWorker {
     pub fn new(
         raft: Arc<Raft<TypeConfig>>,
+        publisher: Arc<dyn CommitPublisher>,
         fluree: Arc<Fluree>,
         index_config: IndexConfig,
         shared_state: SharedState,
     ) -> Self {
         Self {
             raft,
+            publisher,
             fluree,
             index_config,
             shared_state,
@@ -81,18 +90,18 @@ impl CommitWorker {
     /// Process a single queue entry end-to-end.
     ///
     /// Reads the [`QueuedRequest`] envelope from CAS, stages the
-    /// commit, writes the commit blob, and proposes
-    /// [`Command::ApplyHead`]. On staging failure, proposes
-    /// [`Command::PoisonQueueEntry`] instead. Returns the apply
-    /// response so the caller can decide whether to keep draining
-    /// (`QueueDesync` means another node took over).
+    /// commit, writes the commit blob, and publishes the head
+    /// advance through the [`CommitPublisher`]. On staging failure,
+    /// proposes [`Command::PoisonQueueEntry`] instead. Returns once
+    /// the entry has reached a terminal state in the queue (advanced
+    /// or poisoned).
     pub async fn process_entry(
         &self,
         ref_key: &RefKey,
         entry: QueueEntry,
-    ) -> Result<SmResponse, WorkerError> {
+    ) -> Result<(), WorkerError> {
         match self.try_advance_head(ref_key, &entry).await {
-            Ok(resp) => Ok(resp),
+            Ok(()) => Ok(()),
             Err(WorkerError::Stage(reason)) => {
                 self.propose_poison(ref_key, entry.queue_id, reason).await
             }
@@ -104,7 +113,7 @@ impl CommitWorker {
         &self,
         ref_key: &RefKey,
         entry: &QueueEntry,
-    ) -> Result<SmResponse, WorkerError> {
+    ) -> Result<(), WorkerError> {
         // BodyKind::Pushed routes through verify-the-chain — deferred.
         if matches!(entry.body_kind, BodyKind::Pushed) {
             return Err(WorkerError::Stage(PoisonReason::WorkerPanic {
@@ -128,8 +137,7 @@ impl CommitWorker {
         }
 
         let (commit_id, commit_t) = self.stage_and_persist(ref_key, envelope).await?;
-        self.propose_apply_head(ref_key, entry.queue_id, commit_id, commit_t)
-            .await
+        self.publish_head_advance(ref_key, commit_id, commit_t).await
     }
 
     async fn load_envelope(
@@ -251,27 +259,17 @@ impl CommitWorker {
         Ok((commit_cid, commit_t))
     }
 
-    async fn propose_apply_head(
+    async fn publish_head_advance(
         &self,
         ref_key: &RefKey,
-        queue_id: u64,
         commit_id: ContentId,
         commit_t: i64,
-    ) -> Result<SmResponse, WorkerError> {
-        let cmd = SmCommand::ApplyHead(ApplyHeadArgs {
-            ledger_id: ref_key.ledger_id.clone(),
-            branch: ref_key.branch.clone(),
-            queue_id,
-            commit_id,
-            commit_t,
-            applied_at_millis: current_millis(),
-        });
-        let resp = self
-            .raft
-            .client_write(cmd)
+    ) -> Result<(), WorkerError> {
+        let full_ledger_id = format_full_ledger_id(ref_key);
+        self.publisher
+            .publish_commit(&full_ledger_id, commit_t, &commit_id)
             .await
-            .map_err(|e| WorkerError::Raft(format!("ApplyHead propose failed: {e}")))?;
-        Ok(resp.data)
+            .map_err(|e| WorkerError::Raft(format!("publish_commit failed: {e}")))
     }
 
     async fn propose_poison(
@@ -279,7 +277,7 @@ impl CommitWorker {
         ref_key: &RefKey,
         queue_id: u64,
         reason: PoisonReason,
-    ) -> Result<SmResponse, WorkerError> {
+    ) -> Result<(), WorkerError> {
         let cmd = SmCommand::PoisonQueueEntry(PoisonQueueEntryArgs {
             ledger_id: ref_key.ledger_id.clone(),
             branch: ref_key.branch.clone(),
@@ -287,12 +285,15 @@ impl CommitWorker {
             reason,
             applied_at_millis: current_millis(),
         });
-        let resp = self
-            .raft
+        // The state-machine response (`Poisoned` vs `QueueDesync`) is
+        // informational once the poison is durably proposed — either
+        // way the entry is done from the worker's perspective. Only
+        // surface Raft-side failures.
+        self.raft
             .client_write(cmd)
             .await
-            .map_err(|e| WorkerError::Raft(format!("PoisonQueueEntry propose failed: {e}")))?;
-        Ok(resp.data)
+            .map(|_| ())
+            .map_err(|e| WorkerError::Raft(format!("PoisonQueueEntry propose failed: {e}")))
     }
 
     /// Drain per-branch queues until aborted by the caller.
@@ -319,21 +320,10 @@ impl CommitWorker {
             for (ref_key, entry) in pending {
                 let queue_id = entry.queue_id;
                 // `process_entry` consumes `Stage` failures by
-                // proposing `PoisonQueueEntry` and returning the
-                // resulting response, so only `Raft` propagates.
+                // proposing `PoisonQueueEntry`, so only `Raft`
+                // propagates here.
                 match self.process_entry(&ref_key, entry).await {
-                    Ok(SmResponse::HeadApplied { .. })
-                    | Ok(SmResponse::Poisoned { .. })
-                    | Ok(SmResponse::QueueDesync { .. }) => {}
-                    Ok(other) => {
-                        warn!(
-                            ledger_id = %ref_key.ledger_id,
-                            branch = %ref_key.branch,
-                            queue_id,
-                            ?other,
-                            "unexpected state machine response from queue worker"
-                        );
-                    }
+                    Ok(()) => {}
                     Err(WorkerError::Stage(_)) => {
                         unreachable!("process_entry maps Stage failures to PoisonQueueEntry")
                     }
@@ -343,7 +333,7 @@ impl CommitWorker {
                             branch = %ref_key.branch,
                             queue_id,
                             error = %error,
-                            "raft propose failed; backing off and re-polling"
+                            "raft publish failed; backing off and re-polling"
                         );
                         raft_blocked = true;
                         break;
