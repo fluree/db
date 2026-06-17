@@ -1808,22 +1808,24 @@ pub fn collect_resolved_overlay_ops(
             if flake.p != *pred_sid {
                 return;
             }
-            match crate::binary_scan::translate_one_flake_v3_pub(
-                flake,
-                store,
-                Some(&dn),
-                ctx.runtime_small_dicts,
-                &mut ephemeral_preds,
-                &mut next_ep,
-                g_id,
+            match crate::binary_scan::Translation::classify(
+                crate::binary_scan::translate_one_flake_v3_pub(
+                    flake,
+                    store,
+                    Some(&dn),
+                    ctx.runtime_small_dicts,
+                    &mut ephemeral_preds,
+                    &mut next_ep,
+                    g_id,
+                ),
             ) {
-                Ok(op) => ops.push(op),
-                Err(e) => {
+                crate::binary_scan::Translation::Translated(op) => ops.push(op),
+                crate::binary_scan::Translation::Untranslated(reason) => {
                     translate_failed = true;
                     translate_fail_count = translate_fail_count.saturating_add(1);
                     if translate_fail_count == 1 {
                         tracing::warn!(
-                            error = %e,
+                            ?reason,
                             s = %flake.s,
                             p = %flake.p,
                             t = flake.t,

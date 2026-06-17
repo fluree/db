@@ -2243,44 +2243,66 @@ impl Operator for BinaryScanOperator {
 /// novelty-only predicates can be resolved back to IRIs during decode.
 pub type EphemeralPredicateMap = HashMap<Sid, u32>;
 
-pub fn translate_overlay_flakes(
-    overlay: &dyn OverlayProvider,
-    store: &Arc<BinaryIndexStore>,
-    dict_novelty: Option<&Arc<fluree_db_core::dict_novelty::DictNovelty>>,
-    runtime_small_dicts: Option<&RuntimeSmallDicts>,
-    to_t: i64,
-    g_id: GraphId,
-) -> (Vec<OverlayOp>, EphemeralPredicateMap) {
-    let mut ops = Vec::new();
-    let mut ephemeral_preds: EphemeralPredicateMap = HashMap::new();
-    let mut next_ephemeral_p_id = runtime_small_dicts
-        .map(|dicts| dicts.predicate_count().max(store.predicate_count()))
-        .unwrap_or_else(|| store.predicate_count());
+/// Why a row-world `Flake` could not be translated into a binary-index
+/// `OverlayOp` (see [`Translation`]).
+///
+/// Every variant is **recoverable**: the caller serves the flake from a raw
+/// row-world post-pass (export) or declines the fast path and falls back to the
+/// generic merge — none is a hard error, and none may silently drop the flake.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UntranslatedReason {
+    /// No binary encoding for this value in the V3 fast path — `@vector` and
+    /// other custom datatypes, or a novelty-only language tag declined to avoid
+    /// a V3 identity collision (issue #1273). The expected, benign lane.
+    Unsupported,
+    /// An id (subject, predicate, or object ref) was not found in the persisted
+    /// dictionary or the (possibly stale/detached) `DictNovelty`. Often signals
+    /// degraded state and is worth a warning.
+    NotFound,
+    /// The flake's value could not be encoded (malformed structure).
+    InvalidData,
+    /// Any other unexpected translation error — bucketed as recoverable so a
+    /// fact is never silently dropped even on an unforeseen failure kind.
+    Other,
+}
 
-    overlay.for_each_overlay_flake(
-        g_id,
-        fluree_db_core::IndexType::Spot,
-        None,
-        None,
-        true,
-        to_t,
-        &mut |flake| match translate_one_flake_v3_pub(
-            flake,
-            store,
-            dict_novelty,
-            runtime_small_dicts,
-            &mut ephemeral_preds,
-            &mut next_ephemeral_p_id,
-            g_id,
-        ) {
-            Ok(op) => ops.push(op),
-            Err(e) => {
-                tracing::warn!(error = %e, "failed to translate overlay flake to V3");
-            }
-        },
-    );
+impl UntranslatedReason {
+    fn from_io_kind(kind: std::io::ErrorKind) -> Self {
+        match kind {
+            std::io::ErrorKind::Unsupported => Self::Unsupported,
+            std::io::ErrorKind::NotFound => Self::NotFound,
+            std::io::ErrorKind::InvalidData => Self::InvalidData,
+            _ => Self::Other,
+        }
+    }
+}
 
-    (ops, ephemeral_preds)
+/// The single typed outcome of translating one overlay `Flake` into
+/// binary-index space — the overlay-contract entry every lane shares.
+///
+/// A caller chooses a *policy* for [`Untranslated`](Translation::Untranslated)
+/// — keep the raw flake for a row-world post-pass, or decline the fast path and
+/// fall back to the generic merge — but the failure is always carried in the
+/// type, so no lane can silently drop a flake the way the (now-removed)
+/// `translate_overlay_flakes` once did.
+pub enum Translation {
+    /// Translated into binary-index space.
+    Translated(OverlayOp),
+    /// Could not be translated; the reason is preserved (the caller still holds
+    /// the original `&Flake` and decides what to do with it).
+    Untranslated(UntranslatedReason),
+}
+
+impl Translation {
+    /// Classify a low-level [`translate_one_flake_v3_pub`] result into the typed
+    /// outcome.
+    #[inline]
+    pub(crate) fn classify(result: std::io::Result<OverlayOp>) -> Translation {
+        match result {
+            Ok(op) => Translation::Translated(op),
+            Err(e) => Translation::Untranslated(UntranslatedReason::from_io_kind(e.kind())),
+        }
+    }
 }
 
 /// Translate overlay flakes to V3 overlay ops, also returning flakes that cannot be translated
@@ -2315,7 +2337,7 @@ pub fn translate_overlay_flakes_with_untranslated(
         None,
         true,
         to_t,
-        &mut |flake| match translate_one_flake_v3_pub(
+        &mut |flake| match Translation::classify(translate_one_flake_v3_pub(
             flake,
             store,
             dict_novelty,
@@ -2323,9 +2345,9 @@ pub fn translate_overlay_flakes_with_untranslated(
             &mut ephemeral_preds,
             &mut next_ephemeral_p_id,
             g_id,
-        ) {
-            Ok(op) => ops.push(op),
-            Err(e) => {
+        )) {
+            Translation::Translated(op) => ops.push(op),
+            Translation::Untranslated(reason) => {
                 // EVERY failed translation keeps the raw flake: the callers'
                 // untranslated post-pass (lifecycle-resolve, filter, stream
                 // after the cursor) makes it visible to results. `Unsupported`
@@ -2339,9 +2361,9 @@ pub fn translate_overlay_flakes_with_untranslated(
                 // persisted dicts can't resolve, so the matching base rows —
                 // which always translate — are unaffected, and assert/retract
                 // pairs fail together and resolve within the raw set.
-                if e.kind() != std::io::ErrorKind::Unsupported {
+                if reason != UntranslatedReason::Unsupported {
                     tracing::warn!(
-                        error = %e,
+                        ?reason,
                         "overlay flake failed V3 translation; keeping raw flake"
                     );
                 }
