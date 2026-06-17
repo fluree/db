@@ -559,7 +559,8 @@ async fn where_read_respects_view_policy() {
         "where":  {"@id": "?s", "ex:salary": "?sal"},
         "insert": {"@id": "?s", "ex:exposed": true}
     });
-    let input = TrackedTransactionInput::new(TxnType::Update, &attack, TxnOpts::default(), &policy_ctx);
+    let input =
+        TrackedTransactionInput::new(TxnType::Update, &attack, TxnOpts::default(), &policy_ctx);
     let attack_result = fluree
         .transact_tracked_with_policy(ledger.clone(), input, CommitOpts::default(), &index_cfg)
         .await;
@@ -588,7 +589,8 @@ async fn where_read_respects_view_policy() {
         "where":  {"@id": "?s", "ex:name": "?n"},
         "insert": {"@id": "?s", "ex:greeted": true}
     });
-    let input = TrackedTransactionInput::new(TxnType::Update, &control, TxnOpts::default(), &policy_ctx);
+    let input =
+        TrackedTransactionInput::new(TxnType::Update, &control, TxnOpts::default(), &policy_ctx);
     let (control_result, _) = fluree
         .transact_tracked_with_policy(ledger, input, CommitOpts::default(), &index_cfg)
         .await

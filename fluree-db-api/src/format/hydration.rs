@@ -52,8 +52,8 @@ use fluree_db_core::value::FlakeValue;
 use fluree_db_core::{Flake, GraphDbRef, Sid, Tracker};
 use fluree_db_policy::{is_schema_flake, PolicyContext};
 use fluree_db_query::binding::Binding;
-use fluree_db_query::QueryPolicyEnforcer;
 use fluree_db_query::ir::{Column, ForwardItem, HydrationSpec, NestedSelectSpec, Root};
+use fluree_db_query::QueryPolicyEnforcer;
 use fluree_vocab::namespaces::JSON_LD;
 use fluree_vocab::rdf::{self, TYPE as RDF_TYPE_IRI};
 use futures::future::BoxFuture;
@@ -1637,14 +1637,18 @@ impl<'a> HydrationFormatter<'a> {
         enforcer
             .populate_class_cache_for_graph(self.db, &subjects)
             .await
-            .map_err(|e| {
-                FormatError::InvalidBinding(format!("policy class lookup failed: {e}"))
-            })?;
+            .map_err(|e| FormatError::InvalidBinding(format!("policy class lookup failed: {e}")))?;
 
         let disabled = Tracker::disabled();
         let tracker = self.tracker.unwrap_or(&disabled);
         enforcer
-            .filter_flakes_for_graph(self.db.snapshot, self.db.overlay, self.db.t, tracker, flakes)
+            .filter_flakes_for_graph(
+                self.db.snapshot,
+                self.db.overlay,
+                self.db.t,
+                tracker,
+                flakes,
+            )
             .await
             .map_err(|e| FormatError::InvalidBinding(format!("policy filtering failed: {e}")))
     }

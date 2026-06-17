@@ -131,7 +131,8 @@ impl Operator for StatsCountByPredicateOperator {
         if Self::policy_active(ctx) {
             let fallback = self.fallback.as_mut().ok_or_else(|| {
                 QueryError::Policy(
-                    "stats count-by-predicate fast path has no policy-enforced fallback".to_string(),
+                    "stats count-by-predicate fast path has no policy-enforced fallback"
+                        .to_string(),
                 )
             })?;
             fallback.open(ctx).await?;

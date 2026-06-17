@@ -1086,7 +1086,10 @@ async fn datalog_query_time_rules_stripped_under_non_root_policy() {
         "reasoning": "datalog",
         "rules": rules
     });
-    let policed = fluree.query_connection(&policy_q).await.expect("policed query");
+    let policed = fluree
+        .query_connection(&policy_q)
+        .await
+        .expect("policed query");
     let policed_rows = normalize_rows(&policed.to_jsonld(&ledger.snapshot).unwrap());
     assert!(
         !policed_rows.contains(&json!("ex:charlie")),

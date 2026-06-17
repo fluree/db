@@ -26,8 +26,8 @@ use crate::error::{QueryError, Result};
 use crate::fast_path_common::{
     bail_if_cancelled, build_count_batch, build_i64_singleton_batch, count_rows_for_predicate_psot,
     count_to_i64, cursor_fast_path_for_predicate, fast_path_store_policy_cleared,
-    leaf_entries_for_predicate, normalize_pred_sid, parallel_leaf_chunk_count, projection_okey_only,
-    projection_otype_okey, FastPathOperator, PredicateFastPath,
+    leaf_entries_for_predicate, normalize_pred_sid, parallel_leaf_chunk_count,
+    projection_okey_only, projection_otype_okey, FastPathOperator, PredicateFastPath,
 };
 use crate::ir::triple::Ref;
 use crate::operator::BoxedOperator;

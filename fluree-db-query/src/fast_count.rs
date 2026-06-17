@@ -932,9 +932,10 @@ pub fn count_rows_lang_filter_operator(
             // The O1 gate above already cleared single-ledger / no-from_t / policy.
             if let Some(store) = ctx.binary_store.as_ref() {
                 let pred_sid = normalize_pred_sid(store, &predicate)?;
-                let (Some(p_id), Some(lang_id)) =
-                    (store.sid_to_p_id(&pred_sid), store.resolve_lang_id(&lang_tag))
-                else {
+                let (Some(p_id), Some(lang_id)) = (
+                    store.sid_to_p_id(&pred_sid),
+                    store.resolve_lang_id(&lang_tag),
+                ) else {
                     return Ok(None);
                 };
                 let required_otype = OType::lang_string(lang_id).as_u16();

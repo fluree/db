@@ -305,7 +305,9 @@ impl<'a, 'g> CommitBuilder<'a, 'g> {
                 subjects.sort();
                 subjects.dedup();
                 let db = fluree_db_core::GraphDbRef::new(&snapshot.snapshot, 0, overlay, commit.t);
-                enforcer.populate_class_cache_for_graph(db, &subjects).await?;
+                enforcer
+                    .populate_class_cache_for_graph(db, &subjects)
+                    .await?;
 
                 commit.flakes = enforcer
                     .filter_flakes_for_graph(

@@ -759,7 +759,13 @@ async fn vector_search_enforces_view_policy_on_embedding_flake() {
         "where": [{ "@id": "?x", "@type": "ex:Doc" }],
         "select": { "?x": ["@id", "ex:embedding"] }
     });
-    let cfg = VectorCreateConfig::new("policy-vec-idx", ledger_id, indexing_query, "ex:embedding", 3);
+    let cfg = VectorCreateConfig::new(
+        "policy-vec-idx",
+        ledger_id,
+        indexing_query,
+        "ex:embedding",
+        3,
+    );
     let created = fluree.create_vector_index(cfg).await.expect("create index");
 
     let search_where = json!([{

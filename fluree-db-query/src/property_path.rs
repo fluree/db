@@ -155,15 +155,8 @@ impl PropertyPathOperator {
         flakes: Vec<Flake>,
     ) -> Result<Vec<Flake>> {
         let (db, overlay, to_t) = ctx.require_single_graph()?;
-        BinaryScanOperator::filter_flakes_by_policy(
-            ctx,
-            db,
-            overlay,
-            to_t,
-            ctx.binary_g_id,
-            flakes,
-        )
-        .await
+        BinaryScanOperator::filter_flakes_by_policy(ctx, db, overlay, to_t, ctx.binary_g_id, flakes)
+            .await
     }
 
     /// Traverse forward from a starting node (subject bound)

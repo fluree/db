@@ -6,10 +6,10 @@
 
 use crate::binding::{Batch, Binding};
 use crate::context::ExecutionContext;
-use crate::policy::PredicateCoverage;
 use crate::error::{QueryError, Result};
 use crate::ir::triple::Ref;
 use crate::operator::{BoxedOperator, Operator, OperatorState};
+use crate::policy::PredicateCoverage;
 use crate::var_registry::VarId;
 use async_trait::async_trait;
 use fluree_db_binary_index::format::branch::LeafEntry;
@@ -3738,12 +3738,13 @@ mod tests {
         // by_property entry), parameterized by default_allow.
         let make_ctx = |default_allow: bool| {
             let mut view = PolicySet::default();
-            view.by_property.entry(ssn.clone()).or_default().push(
-                PropertyPolicyEntry {
+            view.by_property
+                .entry(ssn.clone())
+                .or_default()
+                .push(PropertyPolicyEntry {
                     idx: 0,
                     class_check_needed: false,
-                },
-            );
+                });
             let wrapper = PolicyWrapper::new(
                 view,
                 PolicySet::default(),
@@ -3751,8 +3752,9 @@ mod tests {
                 default_allow,
                 HashMap::new(),
             );
-            let enforcer =
-                Arc::new(QueryPolicyEnforcer::new(Arc::new(PolicyContext::new(wrapper, None))));
+            let enforcer = Arc::new(QueryPolicyEnforcer::new(Arc::new(PolicyContext::new(
+                wrapper, None,
+            ))));
             // SAFETY: snapshot/vars outlive the returned ctx within each assert.
             ExecutionContext::new(&snapshot, &vars).with_policy_enforcer(enforcer)
         };

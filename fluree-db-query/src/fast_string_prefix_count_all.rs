@@ -14,8 +14,8 @@ use crate::context::ExecutionContext;
 use crate::error::{QueryError, Result};
 use crate::fast_path_common::{
     build_count_batch, build_i64_singleton_batch, build_range_cursor, contiguous_id_range,
-    cursor_fast_path_for_predicate, fast_path_store_policy_cleared, normalize_pred_sid, ref_to_p_id,
-    FastPathOperator, PredicateFastPath,
+    cursor_fast_path_for_predicate, fast_path_store_policy_cleared, normalize_pred_sid,
+    ref_to_p_id, FastPathOperator, PredicateFastPath,
 };
 use crate::ir::triple::Ref;
 use crate::operator::BoxedOperator;

@@ -425,7 +425,10 @@ async fn policy_property_path_filters_hidden_edges() {
             { "@id": "ex:c", "ex:knows": { "@id": "ex:d" } }
         ]
     });
-    let _ = fluree.insert(ledger, &seed).await.expect("seed should succeed");
+    let _ = fluree
+        .insert(ledger, &seed)
+        .await
+        .expect("seed should succeed");
 
     let policy = json!([{
         "@id": "ex:knowsPolicy",
