@@ -142,8 +142,12 @@ async fn query_during_refresh_never_sees_torn_state() {
     let path = tmp.path().to_string_lossy().to_string();
     let ledger_id = "it/lifecycle-query-during-refresh:main";
 
-    let fa = FlureeBuilder::file(path.clone()).build().expect("build A (writer)");
-    let fb = FlureeBuilder::file(path.clone()).build().expect("build B (reader)");
+    let fa = FlureeBuilder::file(path.clone())
+        .build()
+        .expect("build A (writer)");
+    let fb = FlureeBuilder::file(path.clone())
+        .build()
+        .expect("build B (reader)");
 
     // Genesis + t=1 via A so B has something to cache.
     let l0 = fa.create_ledger(ledger_id).await.expect("create");
@@ -189,9 +193,14 @@ async fn query_during_refresh_never_sees_torn_state() {
     let (head_t, (), _max_seen) = tokio::join!(writer, refresher, querier);
 
     // After the race, B can catch all the way up and see every item.
-    fb.refresh(ledger_id, RefreshOpts { min_t: Some(head_t) })
-        .await
-        .expect("final catch-up refresh");
+    fb.refresh(
+        ledger_id,
+        RefreshOpts {
+            min_t: Some(head_t),
+        },
+    )
+    .await
+    .expect("final catch-up refresh");
     let lb = hb.snapshot().await.to_ledger_state();
     assert_eq!(
         item_count(&fb, &lb).await,

@@ -1915,13 +1915,97 @@ mem:fact-01ktxag4v0tctpgwfww6dgbp2c a mem:Fact ;
     mem:tag "refactor" ;
     mem:tag "wire-format" ;
     mem:scope mem:repo ;
-    mem:artifactRef "fluree-db-api/src/commit_transfer.rs" ;
-    mem:artifactRef "fluree-db-binary-index/src/types.rs" ;
-    mem:artifactRef "fluree-db-core/src/ids.rs" ;
-    mem:artifactRef "fluree-db-transact/src/stage.rs" ;
+    mem:artifactRef "fluree-db-api/src/format/delimited.rs" ;
+    mem:artifactRef "fluree-db-api/src/format/sparql_xml.rs" ;
+    mem:artifactRef "fluree-db-api/tests/it_indexing_stats.rs" ;
+    mem:artifactRef "fluree-db-api/tests/it_revert.rs" ;
+    mem:artifactRef "fluree-db-api/tests/it_upsert_duplicate_ids_repro.rs" ;
+    mem:artifactRef "fluree-db-core/src/sid.rs" ;
+    mem:artifactRef "fluree-vocab/src/lib.rs" ;
     mem:branch "refactor/phase0-newtypes" ;
     mem:createdAt "2026-06-12T07:07:17.728499+00:00"^^xsd:dateTime ;
-    mem:rationale "NsCode newtype (with snapshot/store space tagging) and TxnGraphId remain open Phase 0 items; the adoption seams documented here are where they'd land." .
+    mem:rationale "NsCode plain newtype is now DONE (commit 97f064a0a) — see the dedicated NsCode memory. The remaining open Phase 0.1 items are the snapshot/store-space NsCode tagging at the binary_scan boundary and TxnGraphId; the adoption seams documented here are where TxnGraphId would land." .
+
+mem:fact-01kv9a0nvjaq38bkmwtxkx18e2 a mem:Fact ;
+    mem:content "NsCode(u16) #[repr(transparent)] newtype DONE (branch refactor/phase0-nscode, commit 97f064a0a, audit Phase 0.1 plain-newtype half): Sid.namespace_code + fluree_vocab namespace consts + NamespaceCodes/NsLookup API are NsCode (re-exported fluree_db_core::NsCode). \"Option B\": storage stays raw u16 (the HashMap<u16,String> ns tables, commit ns delta, SubjectId, TransportSid, TxnMeta wire fields) — NsCode appears only at single-code API boundaries, converting via .as_u16()/from_u16() at the seam. Remaining Phase 0.1: snapshot/store space-tagging at the binary_scan boundary (the historical namespace-after-index-attach bug) + TxnGraphId; SubjectId kept u16." ;
+    mem:tag "audit" ;
+    mem:tag "gotcha" ;
+    mem:tag "id-space" ;
+    mem:tag "namespace" ;
+    mem:tag "newtype" ;
+    mem:tag "nscode" ;
+    mem:tag "refactor" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-core/src/ns_encoding.rs" ;
+    mem:artifactRef "fluree-db-core/src/sid.rs" ;
+    mem:artifactRef "fluree-db-query/src/eval/value.rs" ;
+    mem:artifactRef "fluree-vocab/src/lib.rs" ;
+    mem:branch "refactor/phase0-nscode" ;
+    mem:createdAt "2026-06-16T22:49:44.050955+00:00"^^xsd:dateTime ;
+    mem:rationale "Display/Debug trap recurred: NsCode renders \"NsCode(N)\" not \"N\", silently corrupting format! in property_join/explain/block_fetch/eval::value(STR fallback)/api::tx — a line-based grep misses multi-line macros (use rg -U --pcre2); these compiled clean and surfaced only as failing unit tests, so gate on cargo test not check. The space-tagging + TxnGraphId follow-ups build directly on this." .
+
+mem:fact-01kv9gn5ae1nq1hvkzrz9zaqsc a mem:Fact ;
+    mem:content "Phase 0 of the 2026-06 audit is COMPLETE (branch refactor/phase0-nscode / PR #1344). KEY FINDING: at the binary_scan snapshot/store boundary a space-tagging newtype (StoreSid) is the WRONG tool — the input fast path (sid_to_store_s_id) EXPLOITS canonical snapshot==store code agreement, and the output p_sids table deliberately BLENDS store+novelty spaces for uniform p_id→Sid decoding. So that distinction is documented as # Invariants + a live debug_assert (commit 830657ddb), not a type. Contrast: TxnGraphId(u16) (commit 733ec0fb7) IS a real newtype because txn-local vs ledger graph ids genuinely differ." ;
+    mem:tag "audit" ;
+    mem:tag "binary-scan" ;
+    mem:tag "invariants" ;
+    mem:tag "namespace" ;
+    mem:tag "phase-0" ;
+    mem:tag "txngraphid" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "docs/audit/2026-06-architecture-audit.md" ;
+    mem:artifactRef "fluree-db-core/src/ids.rs" ;
+    mem:artifactRef "fluree-db-query/src/binary_scan.rs" ;
+    mem:branch "refactor/phase0-nscode" ;
+    mem:createdAt "2026-06-17T00:45:46.702943+00:00"^^xsd:dateTime ;
+    mem:rationale "Other #1344 finalization commits: abb5fbbd3 # Invariants on LedgerSnapshot/LedgerState/DictNovelty/Binding (incl. dict_novelty Arc-identity); 82a57f879 0.4 concurrency tests (it_lifecycle_concurrency.rs: detached-dict_novelty + query-during-refresh). Next: Phase 1 overlay chokepoint. Read before further binary_scan/namespace-space or graph-id work." .
+
+mem:constraint-01kv9szffanvgbrqtt7hs1zmva a mem:Constraint ;
+    mem:content "NEVER git add (especially git add -A from repo root) paths under .claude/worktrees/ — those are ephemeral Claude-Code agent worktrees, each with its own .git, so the outer repo records them as mode-160000 gitlinks. With no .gitmodules entry they break CI's recursive submodule init for the whole branch and every PR stacked on it. They are now gitignored (.gitignore has .claude/worktrees/). If they reappear as tracked gitlinks: `git rm -r --cached --ignore-unmatch .claude/worktrees` + ensure the gitignore line, additive commit per affected branch (no force-push). The ONLY real submodule in this repo is testsuite-sparql/rdf-tests." ;
+    mem:tag "ci" ;
+    mem:tag "git" ;
+    mem:tag "gotcha" ;
+    mem:tag "submodule" ;
+    mem:tag "worktree" ;
+    mem:scope mem:repo ;
+    mem:severity "must" ;
+    mem:artifactRef ".gitignore" ;
+    mem:branch "refactor/phase1-translation-contract" ;
+    mem:createdAt "2026-06-17T03:28:41.962901+00:00"^^xsd:dateTime ;
+    mem:rationale "Commit fe2208cba (tip of #1316) accidentally committed 6 .claude/worktrees gitlinks; CI failed across the #1316->#1344->#1346 stack until cleaned (9b56e8d61/5e14b2a49/07366691a). Stage code explicitly (git add fluree-* docs/...), never the repo root with -A." .
+
+mem:constraint-01kvb2pqdrdjg4czf8m4vm2yjg a mem:Constraint ;
+    mem:content "The V3 fact-identity key FactKeyV3 (s_id,p_id,o_type,o_key,o_i) has ONE canonical definition at fluree-db-binary-index read/types.rs (with from_batch/from_hist constructors + a shared pub OI_NONE sentinel). Phase 1B (#1347) collapsed three structurally-identical copies into it — besides read/replay.rs, an easily-missed third lived build-side in fluree-db-indexer run_index/build/novelty_merge.rs. Both downstream crates (query, indexer) depend on binary-index; reuse the canonical type, never redefine the tuple." ;
+    mem:tag "audit-phase1" ;
+    mem:tag "binary-index" ;
+    mem:tag "fact-identity" ;
+    mem:tag "factkeyv3" ;
+    mem:tag "overlay" ;
+    mem:tag "refactor" ;
+    mem:scope mem:repo ;
+    mem:severity "should" ;
+    mem:artifactRef "fluree-db-binary-index/src/read/replay.rs" ;
+    mem:artifactRef "fluree-db-binary-index/src/read/types.rs" ;
+    mem:artifactRef "fluree-db-indexer/src/run_index/build/novelty_merge.rs" ;
+    mem:artifactRef "fluree-db-query/src/binary_scan.rs" ;
+    mem:branch "refactor/phase1b-factkey" ;
+    mem:createdAt "2026-06-17T15:20:26.808938+00:00"^^xsd:dateTime ;
+    mem:rationale "Three copies had already drifted in their derives; a future V3 fact-identity use must extend the canonical type, not spawn a fourth copy." .
+
+mem:fact-01kvb2pvkqvs25tysq6dd626tj a mem:Fact ;
+    mem:content "V3 overlay merge spans two legitimate fact-identity domains: encoded FactKeyV3 (s_id,p_id,o_type,o_key,o_i) for the translated lane vs row-world Flake (s,p,o,dt,m) for the raw-post-pass/export lane. The V3 key FOLDS DATATYPE into o_type/o_key, so 30^^int vs 30.0^^float do NOT collide. But the V3 key CANNOT express a language tag — novelty-only langStrings (x@en vs x@fr) collapse to one V3 identity, so translation declines them as UntranslatedReason::Unsupported and they dedup on the full Flake tuple instead (#1273)." ;
+    mem:tag "binary-index" ;
+    mem:tag "fact-identity" ;
+    mem:tag "factkeyv3" ;
+    mem:tag "issue-1273" ;
+    mem:tag "langstring" ;
+    mem:tag "overlay" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-binary-index/src/read/types.rs" ;
+    mem:artifactRef "fluree-db-query/src/binary_scan.rs" ;
+    mem:branch "refactor/phase1b-factkey" ;
+    mem:createdAt "2026-06-17T15:20:31.095619+00:00"^^xsd:dateTime ;
+    mem:rationale "Corrects an imprecise prior belief (a handoff note claimed int-vs-float collide in V3 — wrong; the language tag is the actual collision). Recall before reasoning about why overlay translation returns Unsupported or before touching FactKeyV3." .
 
 mem:fact-01ktwjrjrvj60k0v0q7gstwknz a mem:Fact ;
     mem:content "Differential fast-path harness (Phase 0.7) found 3 fast≠generic divergences on first run (2026-06-11); ALL THREE FIXED same-day in PR #1314 and now hard-enforced by the harness: FD-1 AVG fast path now mirrors generic finalize_avg per number kind (exact i64+BigDecimal for integers → xsd:decimal, plain non-Kahan f64 for doubles); FD-2 MIN/MAX-string gated on lex_sorted_string_ids (was returning insertion-order extremes on reindex-built ledgers); FD-3 per-predicate counts rewritten to exact POST leaf-directory row_count sums at epoch-0 (StatsView numbers are estimates — never use as query answers). Cross-condition axis (generic: base≡overlay≡novelty) passed throughout. Kill switch: set_fast_paths_disabled / FLUREE_DISABLE_QUERY_FAST_PATHS." ;
