@@ -444,11 +444,14 @@ pub async fn prepare_execution_with_config(
 /// formats and flushes each batch as it arrives. Both drive the exact same
 /// [`run_operator_into`] loop, so execution behaviour (tracing, cancellation,
 /// fuel) can never drift between them.
-#[async_trait::async_trait]
+///
+/// `push` is a native async-fn-in-trait returning `impl Future` (not
+/// `#[async_trait]`), so the buffered `Vec` path pays no per-batch boxing —
+/// the future is monomorphized and inlined.
 pub trait BatchSink: Send {
     /// Accept one result batch. Returning `Err` aborts execution — the
     /// streaming sink uses this to stop work when the client disconnects.
-    async fn push(&mut self, batch: Batch) -> Result<()>;
+    fn push(&mut self, batch: Batch) -> impl std::future::Future<Output = Result<()>> + Send;
 }
 
 /// Buffered sink: collects every batch into a `Vec` (the standard,
@@ -458,7 +461,6 @@ struct VecSink {
     batches: Vec<Batch>,
 }
 
-#[async_trait::async_trait]
 impl BatchSink for VecSink {
     async fn push(&mut self, batch: Batch) -> Result<()> {
         self.batches.push(batch);

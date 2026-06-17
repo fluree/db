@@ -435,6 +435,29 @@ async fn history_to_query_rejected() {
     );
 }
 
+/// SPARQL `max-fuel` arrives via the `Fluree-Max-Fuel` header (no body opts).
+/// A sub-floor value trips the fuel floor → `fuel_exhausted` error terminal.
+#[tokio::test]
+async fn sparql_max_fuel_header_emits_error_code() {
+    let (_tmp, state) = test_state().await;
+    let app = build_router(state);
+    create_ledger(&app, "strm:sfuel").await;
+    insert_name(&app, "strm:sfuel", "ex:x", "Xavier").await;
+
+    let resp = stream_sparql(
+        &app,
+        "strm:sfuel",
+        "SELECT ?name WHERE { ?s <http://example.org/name> ?name }",
+        Some(("fluree-max-fuel", "0.5")),
+    )
+    .await;
+    let (status, _ct, records) = ndjson_records(resp).await;
+    assert_eq!(status, StatusCode::OK, "stream committed before execution");
+    let terminal = records.last().expect("a terminal record");
+    assert_eq!(terminal["type"], "error");
+    assert_eq!(terminal["error"]["code"], "fuel_exhausted");
+}
+
 /// A SPARQL `FROM` clause is no longer rejected — it routes through the
 /// connection/dataset streaming path (FROM selects graphs within the ledger).
 #[tokio::test]

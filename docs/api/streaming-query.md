@@ -156,37 +156,51 @@ error, not a `200` stream), and should use [`/query`](endpoints.md#post-query):
 
 ## Auth, policy, and dataset behavior
 
-The streaming endpoint enforces policy identically to `/query`, by routing to
-the same execution path. This applies to **both JSON-LD and SPARQL**.
+The streaming endpoint routes through the same execution path as `/query` and
+enforces policy the same way `/query` does — which differs by query language and
+route, exactly as on `/query`:
 
 - **No policy, single ledger** — runs the lean single-ledger path.
-- **`from`/`fromNamed` (JSON-LD), SPARQL `FROM`/`FROM NAMED`, multi-ledger, or
-  any policy input** — **routes to the connection/dataset path**, which builds a
-  policy-wrapped dataset and enforces per-graph policy exactly as `/query` does.
-  A restricted identity/policy-class streams strictly fewer rows than an
-  unrestricted one.
-  - JSON-LD policy inputs: `opts.identity` / `opts.policy-class`, a server
-    `default_policy_class`, or `Fluree-Policy*` / `Fluree-Identity` headers.
-  - SPARQL policy inputs: SPARQL has no body `opts`, so policy arrives via the
-    resolved identity (bearer / `Fluree-Identity`), the server
-    `default_policy_class`, and the `Fluree-Policy*` / `Fluree-Default-Allow`
-    headers. SPARQL `FROM`/`FROM NAMED` select named graphs *within* the path
-    ledger.
+- **`from`/`fromNamed` (JSON-LD), SPARQL `FROM`/`FROM NAMED`, multi-ledger, or a
+  policy input** — **routes to the connection/dataset path**, which builds a
+  policy-wrapped dataset and enforces per-graph policy. A restricted
+  identity/policy-class streams strictly fewer rows than an unrestricted one.
+
+**JSON-LD policy** is enforced on both endpoint forms (ledger-scoped and
+connection). Inputs: `opts.identity` / `opts.policy-class`, the server
+`default_policy_class`, or `Fluree-Policy*` / `Fluree-Identity` headers.
+
+**SPARQL policy** is enforced **only on the ledger-scoped route**
+(`/stream/query/<ledger>`). SPARQL has no body `opts`, so policy arrives via the
+resolved identity (bearer / `Fluree-Identity`) and the `Fluree-Policy*` /
+`Fluree-Default-Allow` headers; `FROM`/`FROM NAMED` select named graphs *within*
+the path ledger. The **connection-scoped** SPARQL form has no single ledger to
+resolve an identity against, so it **rejects** explicit policy signals (the
+`Fluree-Identity` / `Fluree-Policy*` / `Fluree-Default-Allow` headers) rather
+than run them unenforced — use the ledger-scoped route or `/query`. This matches
+`/query`, where connection SPARQL is likewise not identity-policy-scoped.
+
+> **`default_policy_class`** is a JSON-LD-path setting: it is applied to JSON-LD
+> queries (on both `/query` and streaming) but **not** to SPARQL on either
+> endpoint. (Making it global across query languages would be a separate change
+> affecting `/query` too.)
+
 - **Bearer scope** — a token must be authorized for the path ledger and every
-  ledger referenced via `from`/`fromNamed`; out-of-scope requests return `404`
-  (no existence leak), same as `/query`.
+  ledger referenced via `from`/`fromNamed` / SPARQL `FROM`; out-of-scope
+  requests return `404` (no existence leak), same as `/query`.
 - **`fluree-min-t`** freshness barriers and the stored default-context
   injection are applied before planning, matching `/query`.
 
-The only SPARQL dataset feature still rejected is the **history range**
+The only SPARQL dataset feature still rejected outright is the **history range**
 (`FROM <…> TO <…>`) — use [`/query`](endpoints.md#post-query) for that.
 
 ## Fuel and tracking
 
-The endpoint tracks fuel and time by default (honoring `max-fuel` from JSON-LD
-`opts`). The running fuel total rides on `heartbeat` records and the final
-total on the `end` record. A `max-fuel` overrun surfaces as an `error`
-terminal.
+The endpoint tracks fuel and time by default. `max-fuel` is honored from JSON-LD
+`opts.max-fuel` and, for SPARQL (which has no body `opts`), from the
+`Fluree-Max-Fuel` header. The running fuel total rides on `heartbeat` records
+and the final total on the `end` record; a `max-fuel` overrun surfaces as a
+`{"type":"error","error":{"code":"fuel_exhausted"}}` terminal.
 
 ## Compression
 

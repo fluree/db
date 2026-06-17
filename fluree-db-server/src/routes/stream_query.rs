@@ -114,13 +114,16 @@ async fn stream_query_connection_inner(
     let (stream_plan, tracker) = if is_sparql_request(&headers, &credential, &params) {
         let sparql = resolve_sparql_text(&params, &credential)?;
 
-        // Connection SPARQL applies no per-request identity policy (parity with
-        // /query). Rather than silently ignore policy signals, refuse them and
+        // Connection SPARQL has no single ledger to resolve a per-request
+        // identity against, so it cannot enforce identity policy (parity with
+        // /query, which runs connection SPARQL unpoliced). Rather than silently
+        // ignore an *explicit* policy request, refuse the explicit policy
+        // headers (Fluree-Identity / Fluree-Policy* / Fluree-Default-Allow) and
         // point at the ledger-scoped route (which does enforce SPARQL policy).
-        if data_auth.default_policy_class.is_some()
-            || effective_identity(&credential, &bearer).is_some()
-            || request_carries_policy(&headers)
-        {
+        // A plain bearer token (auth only) and the server `default_policy_class`
+        // are not per-request policy requests and do not apply to SPARQL, so
+        // they do not trigger a refusal here — same as /query.
+        if request_carries_policy(&headers) {
             return Err(ServerError::bad_request(
                 "policy-scoped SPARQL is not supported on the connection-scoped streaming \
                  endpoint; use /v1/fluree/stream/query/<ledger> or /v1/fluree/query",
@@ -155,7 +158,10 @@ async fn stream_query_connection_inner(
             .plan_stream_query_dataset(&dataset, &input)
             .await
             .map_err(ServerError::Api)?;
-        (StreamPlan::Dataset { dataset, plan }, stream_tracker(None))
+        (
+            StreamPlan::Dataset { dataset, plan },
+            stream_tracker_from_headers(&headers),
+        )
     } else {
         let mut query_json: JsonValue = credential.body_json()?;
 
@@ -330,7 +336,10 @@ async fn stream_query_inner(
                 .plan_stream_query_dataset(&dataset, &input)
                 .await
                 .map_err(ServerError::Api)?;
-            (StreamPlan::Dataset { dataset, plan }, stream_tracker(None))
+            (
+                StreamPlan::Dataset { dataset, plan },
+                stream_tracker_from_headers(&headers),
+            )
         } else {
             // Plain single-ledger SPARQL (no policy, no FROM).
             let input = OwnedStreamQuery::Sparql(sparql);
@@ -344,7 +353,7 @@ async fn stream_query_inner(
             };
             (
                 StreamPlan::Single { ledger_state, plan },
-                stream_tracker(None),
+                stream_tracker_from_headers(&headers),
             )
         }
     } else {
@@ -507,6 +516,15 @@ fn request_carries_policy(headers: &FlureeHeaders) -> bool {
 /// fuel total and the `end` record reports both.
 fn stream_tracker(query_json: Option<&JsonValue>) -> Tracker {
     let mut opts = TrackingOptions::from_opts_value(query_json.and_then(|j| j.get("opts")));
+    opts.track_fuel = true;
+    opts.track_time = true;
+    Tracker::new(opts)
+}
+
+/// SPARQL has no body `opts`, so its `max-fuel` arrives via the
+/// `Fluree-Max-Fuel` header (parity with `/query`). Fuel/time forced on.
+fn stream_tracker_from_headers(headers: &FlureeHeaders) -> Tracker {
+    let mut opts = headers.to_tracking_options();
     opts.track_fuel = true;
     opts.track_time = true;
     Tracker::new(opts)

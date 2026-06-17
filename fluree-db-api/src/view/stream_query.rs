@@ -479,7 +479,6 @@ pub(crate) struct CollectSink {
     pub(crate) batches: Vec<fluree_db_query::binding::Batch>,
 }
 
-#[async_trait::async_trait]
 impl BatchSink for CollectSink {
     async fn push(
         &mut self,
@@ -527,7 +526,6 @@ struct NdjsonRowSink<'a> {
     buf: String,
 }
 
-#[async_trait::async_trait]
 impl BatchSink for NdjsonRowSink<'_> {
     async fn push(
         &mut self,
