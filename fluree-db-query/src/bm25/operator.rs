@@ -23,8 +23,10 @@
 //! - The operator is correlated: it consumes a child stream (often an EmptyOperator seed)
 //!   and may read the query target from an input variable.
 
+use crate::binary_scan::BinaryScanOperator;
 use crate::binding::{Batch, Binding, RowAccess};
 use crate::bm25::{Analyzer, Bm25Index, Bm25Scorer};
+use crate::dataset::ActiveGraphs;
 use crate::context::{ExecutionContext, WellKnownDatatypes};
 use crate::error::{QueryError, Result};
 use crate::ir::{IndexSearchPattern, IndexSearchTarget};
@@ -33,7 +35,9 @@ use crate::operator::{
 };
 use crate::var_registry::VarId;
 use async_trait::async_trait;
-use fluree_db_core::FlakeValue;
+use fluree_db_core::{
+    range_with_overlay, FlakeValue, IndexType, RangeMatch, RangeOptions, RangeTest,
+};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -223,6 +227,100 @@ impl Bm25SearchOperator {
     pub fn with_out_schema(mut self, downstream_vars: Option<&[VarId]>) -> Self {
         self.out_schema = compute_trimmed_vars(&self.in_schema, downstream_vars);
         self
+    }
+
+    /// Indexed-flake readability check for a search hit under a view policy.
+    ///
+    /// A BM25 hit is a matched document subject, not a flake, so the search
+    /// operator bypasses the per-flake policy filtering that scans apply. Here a
+    /// hit is visible iff the identity can view at least one of the subject's
+    /// flakes on an indexed property — the text that could have produced the
+    /// match. If every indexed-property flake of the subject is hidden, the hit
+    /// is dropped.
+    ///
+    /// Scope: enforced only on the inline (local index) path; the dedicated
+    /// search-provider path is out of scope (the engine has no local flakes to
+    /// check against). The indexed-flake read runs in the single active graph;
+    /// under a non-root policy in multi-graph mode the hit is conservatively
+    /// hidden (no leak). No-op for root / no policy.
+    async fn hit_readable(&self, ctx: &ExecutionContext<'_>, subject_iri: &str) -> Result<bool> {
+        // Only the inline (local index) path can be checked against local flakes;
+        // the dedicated search-provider path loads no index here.
+        let Some(index) = self.index.as_ref() else {
+            return Ok(true);
+        };
+        // The view-policy enforcer lives on the active graph. In dataset mode
+        // that is the per-graph `GraphRef` (not the top-level ctx), so fold into
+        // a single-graph context that carries the graph's enforcer before
+        // checking.
+        match ctx.active_graphs() {
+            ActiveGraphs::Single => self.indexed_flake_visible(ctx, subject_iri, index).await,
+            ActiveGraphs::Many(graphs) => {
+                if graphs.len() == 1 {
+                    let graph_ctx = ctx.with_graph_ref(graphs[0]);
+                    self.indexed_flake_visible(&graph_ctx, subject_iri, index)
+                        .await
+                } else if graphs.iter().any(|g| g.has_policy()) {
+                    // Multi-graph indexed-flake checks aren't supported; under a
+                    // policy, conservatively hide rather than leak.
+                    Ok(false)
+                } else {
+                    Ok(true)
+                }
+            }
+        }
+    }
+
+    /// Whether the identity can view at least one of `subject_iri`'s flakes on an
+    /// indexed property, evaluated against a single-graph context carrying the
+    /// graph's view-policy enforcer. No-op (visible) for root / no policy.
+    async fn indexed_flake_visible(
+        &self,
+        ctx: &ExecutionContext<'_>,
+        subject_iri: &str,
+        index: &Bm25Index,
+    ) -> Result<bool> {
+        if ctx.allow_unfiltered() {
+            return Ok(true);
+        }
+        let snapshot = ctx.active_snapshot;
+        let overlay = ctx.overlay();
+        let to_t = ctx.to_t;
+        let Some(subject_sid) = ctx.encode_iri(subject_iri) else {
+            // Subject not resolvable in this graph => cannot verify => hide.
+            return Ok(false);
+        };
+        for prop_iri in &index.property_deps.property_iris {
+            let Some(pred_sid) = ctx.encode_iri(prop_iri.as_ref()) else {
+                continue;
+            };
+            let range_match = RangeMatch::new()
+                .with_subject(subject_sid.clone())
+                .with_predicate(pred_sid);
+            let flakes = range_with_overlay(
+                snapshot,
+                ctx.binary_g_id,
+                overlay,
+                IndexType::Spot,
+                RangeTest::Eq,
+                range_match,
+                RangeOptions::new().with_to_t(to_t),
+            )
+            .await?;
+            let visible = BinaryScanOperator::filter_flakes_by_policy(
+                ctx,
+                snapshot,
+                overlay,
+                to_t,
+                ctx.binary_g_id,
+                flakes,
+            )
+            .await?;
+            if !visible.is_empty() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     fn resolve_target_from_row(
@@ -549,6 +647,11 @@ impl Operator for Bm25SearchOperator {
 
             // For each BM25 result row, merge with the child row.
             for (subject_iri, ledger_alias, score) in hits {
+                // View-policy enforcement: drop hits whose indexed text the
+                // identity cannot view (inline index path only).
+                if !self.hit_readable(ctx, subject_iri.as_ref()).await? {
+                    continue;
+                }
                 // Create IriMatch binding for correct cross-ledger joins.
                 // IMPORTANT: Encode SID using the hit's source ledger (not primary db)
                 // so that primary_sid is consistent with ledger_alias.
