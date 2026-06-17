@@ -404,3 +404,70 @@ async fn policy_fquery_empty_where_allows() {
         "Empty f:query should allow all items"
     );
 }
+
+/// Property-path traversal must enforce view policy on the edges it reads:
+/// hidden edges are not traversed, so nodes reachable only through them are not
+/// emitted. Regression for the V1 leak (the property-path operator read raw
+/// edges via `range_with_overlay` with no policy filtering).
+#[tokio::test]
+async fn policy_property_path_filters_hidden_edges() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    let ledger = genesis_ledger(&fluree, "policy/fquery-path:main");
+    // Chain a -> b -> c -> d. Only ex:a can share, so only the a->b edge is
+    // viewable; the b->c and c->d edges are hidden.
+    let seed = json!({
+        "@context": { "ex": "http://example.org/ns/" },
+        "@graph": [
+            { "@id": "ex:a", "ex:canShare": true, "ex:knows": { "@id": "ex:b" } },
+            { "@id": "ex:b", "ex:knows": { "@id": "ex:c" } },
+            { "@id": "ex:c", "ex:knows": { "@id": "ex:d" } }
+        ]
+    });
+    let _ = fluree.insert(ledger, &seed).await.expect("seed should succeed");
+
+    let policy = json!([{
+        "@id": "ex:knowsPolicy",
+        "@type": "f:AccessPolicy",
+        "f:action": "f:view",
+        // Only governs ex:knows edges; an edge is viewable iff its subject can share.
+        "f:onProperty": [{ "@id": "http://example.org/ns/knows" }],
+        "f:query": {
+            "@type": "@json",
+            "@value": {
+                "@context": { "ex": "http://example.org/ns/" },
+                "where": [{ "@id": "?$this", "ex:canShare": true }]
+            }
+        }
+    }]);
+
+    let query = json!({
+        "@context": {
+            "ex": "http://example.org/ns/",
+            "knowsPlus": { "@path": "ex:knows+" }
+        },
+        "from": "policy/fquery-path:main",
+        "opts": { "policy": policy, "default-allow": false },
+        "where": [{ "@id": "ex:a", "knowsPlus": "?who" }],
+        "select": ["?who"]
+    });
+
+    let result = fluree
+        .query_connection(&query)
+        .await
+        .expect("query_connection");
+    let ledger = fluree
+        .ledger("policy/fquery-path:main")
+        .await
+        .expect("ledger");
+    let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+
+    // Only ex:b is reachable. Without edge filtering the traversal would walk
+    // the hidden b->c and c->d edges and leak ex:c and ex:d.
+    assert_eq!(
+        normalize_rows(&jsonld),
+        normalize_rows(&json!([["ex:b"]])),
+        "property path must not traverse hidden edges; got: {jsonld:#?}"
+    );
+}
