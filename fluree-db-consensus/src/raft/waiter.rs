@@ -15,21 +15,26 @@
 //! idempotency-keyed re-issue (see the design doc, "Leader
 //! transition mid-flight").
 
+use crate::raft::staged_receipt::AppliedReceipt;
 use crate::raft::state_machine::{PoisonReason, RefKey};
 use dashmap::DashMap;
-use fluree_db_core::ContentId;
 use tokio::sync::oneshot;
 
 /// Outcome the state-machine adapter sends back through the channel
 /// the transactor parked on.
 ///
 /// `Applied` is the success path — the head advanced under the
-/// queue_id the transactor handed in. `Aborted` covers every way
-/// the entry left the queue without a head advance (poison + admin
-/// preemption).
+/// queue_id the transactor handed in. The carried [`AppliedReceipt`]
+/// gives the transactor the per-op staging detail it needs to build
+/// a faithful receipt (commit count, conflict count, etc.); it
+/// falls back to [`AppliedReceipt::Minimal`] when the side-channel
+/// stash was lost (typically a former-leader scenario).
+///
+/// `Aborted` covers every way the entry left the queue without a
+/// head advance (poison + admin preemption).
 #[derive(Debug)]
 pub enum WaiterOutcome {
-    Applied { commit_id: ContentId, commit_t: i64 },
+    Applied(AppliedReceipt),
     Aborted(AbortReason),
 }
 
@@ -89,11 +94,9 @@ impl WaiterMap {
 
     /// Resolve `queue_id` with the head advance the worker landed.
     /// No-op if no waiter is registered (e.g. the caller timed out).
-    pub fn resolve_applied(&self, queue_id: u64, commit_id: ContentId, commit_t: i64) {
+    pub fn resolve_applied(&self, queue_id: u64, receipt: AppliedReceipt) {
         if let Some((_, slot)) = self.waiters.remove(&queue_id) {
-            let _ = slot
-                .sender
-                .send(WaiterOutcome::Applied { commit_id, commit_t });
+            let _ = slot.sender.send(WaiterOutcome::Applied(receipt));
         }
     }
 
@@ -131,7 +134,7 @@ impl WaiterMap {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fluree_db_core::ContentKind;
+    use fluree_db_core::{ContentId, ContentKind};
 
     fn cid(seed: u8) -> ContentId {
         ContentId::new(ContentKind::Commit, &[seed])
@@ -141,18 +144,28 @@ mod tests {
         RefKey::new("test/db", branch)
     }
 
+    fn minimal(seed: u8, commit_t: i64) -> AppliedReceipt {
+        AppliedReceipt::Minimal {
+            commit_id: cid(seed),
+            commit_t,
+        }
+    }
+
     #[tokio::test]
     async fn register_then_resolve_applied_delivers_head() {
         let map = WaiterMap::new();
         let rx = map.register(7, ref_key("main"));
-        map.resolve_applied(7, cid(42), 10);
+        map.resolve_applied(7, minimal(42, 10));
 
         match rx.await.expect("receive") {
-            WaiterOutcome::Applied { commit_id, commit_t } => {
+            WaiterOutcome::Applied(AppliedReceipt::Minimal {
+                commit_id,
+                commit_t,
+            }) => {
                 assert_eq!(commit_id, cid(42));
                 assert_eq!(commit_t, 10);
             }
-            other => panic!("expected Applied, got {other:?}"),
+            other => panic!("expected Applied(Minimal), got {other:?}"),
         }
         assert_eq!(map.len(), 0);
     }
@@ -177,7 +190,7 @@ mod tests {
     #[tokio::test]
     async fn resolve_on_unknown_queue_id_is_noop() {
         let map = WaiterMap::new();
-        map.resolve_applied(9_999, cid(1), 1);
+        map.resolve_applied(9_999, minimal(1, 1));
         map.resolve_aborted(9_999, AbortReason::BranchDropped);
         assert_eq!(map.len(), 0);
     }
@@ -216,14 +229,14 @@ mod tests {
         let stale_rx = map.register(7, ref_key("main"));
         let fresh_rx = map.register(7, ref_key("main"));
 
-        map.resolve_applied(7, cid(42), 10);
+        map.resolve_applied(7, minimal(42, 10));
 
         // The stale receiver sees the channel closed (no outcome).
         assert!(stale_rx.await.is_err());
         // The fresh one gets the outcome.
         assert!(matches!(
             fresh_rx.await.unwrap(),
-            WaiterOutcome::Applied { .. }
+            WaiterOutcome::Applied(_)
         ));
     }
 }

@@ -20,6 +20,10 @@
 //! lifecycle as the indexer launcher in `fluree-db-server`).
 
 use crate::local::build_policy_context;
+use crate::raft::staged_receipt::{
+    AppliedReceipt, MergeApplied, PushApplied, RebaseApplied, RevertApplied, StagedReceiptMap,
+    TransactApplied,
+};
 use crate::raft::state_machine::{
     BodyKind, Command as SmCommand, PoisonQueueEntryArgs, PoisonReason, QueueEntry, RefKey,
 };
@@ -68,6 +72,12 @@ pub struct CommitWorker {
     fluree: Arc<Fluree>,
     index_config: IndexConfig,
     shared_state: SharedState,
+    /// Side channel paired with the state-machine adapter's
+    /// `StagedReceiptMap`. The worker stashes a typed
+    /// [`AppliedReceipt`] here before proposing `ApplyHead`; the
+    /// adapter takes it during waiter resolution. Cleanup on
+    /// propose failure prevents stale receipts from accumulating.
+    staged_receipts: Arc<StagedReceiptMap>,
 }
 
 impl CommitWorker {
@@ -77,6 +87,7 @@ impl CommitWorker {
         fluree: Arc<Fluree>,
         index_config: IndexConfig,
         shared_state: SharedState,
+        staged_receipts: Arc<StagedReceiptMap>,
     ) -> Self {
         Self {
             raft,
@@ -84,6 +95,7 @@ impl CommitWorker {
             fluree,
             index_config,
             shared_state,
+            staged_receipts,
         }
     }
 
@@ -127,14 +139,28 @@ impl CommitWorker {
         // process under a kind the queue didn't declare.
         check_envelope_kind(entry.body_kind, &envelope)?;
 
-        let (commit_id, commit_t) = match envelope {
+        let receipt = match envelope {
             QueuedRequest::Transact(transact) => self.stage_and_persist(ref_key, transact).await?,
             QueuedRequest::Push(push) => self.process_push(ref_key, push).await?,
             QueuedRequest::Revert(revert) => self.process_revert(ref_key, revert).await?,
             QueuedRequest::Merge(merge) => self.process_merge(ref_key, merge).await?,
             QueuedRequest::Rebase(rebase) => self.process_rebase(ref_key, rebase).await?,
         };
-        self.publish_head_advance(ref_key, commit_id, commit_t).await
+        let commit_id = receipt.commit_id().clone();
+        let commit_t = receipt.commit_t();
+
+        // Stash the typed receipt for the adapter to pick up on
+        // apply, then propose. On propose failure (most commonly a
+        // stepped-down leader getting ForwardToLeader), take the
+        // stash back so we don't leak per-process state.
+        self.staged_receipts.stash(entry.queue_id, receipt);
+        match self.publish_head_advance(ref_key, commit_id, commit_t).await {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                self.staged_receipts.take(entry.queue_id);
+                Err(err)
+            }
+        }
     }
 
     async fn load_envelope(
@@ -162,14 +188,14 @@ impl CommitWorker {
     }
 
     /// Resolve the ledger handle, dispatch on body kind, stage the
-    /// commit, and write the commit blob to CAS. Returns the new head
-    /// CID + t pair on success; the surrounding caller proposes
-    /// [`Command::ApplyHead`].
+    /// commit, write the commit blob to CAS, and finalize local
+    /// state. Returns the per-op [`AppliedReceipt`] the caller
+    /// stashes before proposing `ApplyHead`.
     async fn stage_and_persist(
         &self,
         ref_key: &RefKey,
         transact: QueuedTransact,
-    ) -> Result<(ContentId, i64), WorkerError> {
+    ) -> Result<AppliedReceipt, WorkerError> {
         let QueuedTransact {
             body,
             txn_opts,
@@ -253,7 +279,11 @@ impl CommitWorker {
             .await
             .map_err(api_error_to_stage)?;
 
-        Ok((commit_cid, commit_t))
+        Ok(AppliedReceipt::Transact(TransactApplied {
+            commit_id: commit_cid,
+            commit_t,
+            tally: None,
+        }))
     }
 
     /// Re-stage the revert worker-side, write the inverse commit
@@ -269,7 +299,7 @@ impl CommitWorker {
         &self,
         ref_key: &RefKey,
         revert: QueuedRevert,
-    ) -> Result<(ContentId, i64), WorkerError> {
+    ) -> Result<AppliedReceipt, WorkerError> {
         use fluree_db_api::GuardedStagedCommit;
 
         let QueuedRevert {
@@ -280,6 +310,9 @@ impl CommitWorker {
         let ledger_name = ref_key.ledger_id.clone();
         let branch = ref_key.branch.clone();
         let StagedRevert {
+            reverted_commits,
+            conflict_count,
+            strategy: applied_strategy,
             rollback_snapshot: _,
             current_head_t,
             current_head_id,
@@ -298,10 +331,14 @@ impl CommitWorker {
         else {
             // NoOp short-circuit: nothing changes. Return the current
             // head so `publish_commit` reads the same value the state
-            // machine already holds — the apply records the same
-            // head it already had, the queue entry completes, no
-            // observable mutation.
-            return Ok((current_head_id, current_head_t));
+            // machine already holds.
+            return Ok(AppliedReceipt::Revert(RevertApplied {
+                commit_id: current_head_id,
+                commit_t: current_head_t,
+                reverted_commits,
+                conflict_count,
+                strategy: applied_strategy,
+            }));
         };
 
         let commit_cid = staged_commit
@@ -335,7 +372,13 @@ impl CommitWorker {
                 .map_err(api_error_to_stage)?;
         }
 
-        Ok((commit_cid, commit_t))
+        Ok(AppliedReceipt::Revert(RevertApplied {
+            commit_id: commit_cid,
+            commit_t,
+            reverted_commits,
+            conflict_count,
+            strategy: applied_strategy,
+        }))
     }
 
     /// Decode the queued push, hand it to `Fluree::prepare_push` for
@@ -346,7 +389,7 @@ impl CommitWorker {
         &self,
         ref_key: &RefKey,
         push: QueuedPush,
-    ) -> Result<(ContentId, i64), WorkerError> {
+    ) -> Result<AppliedReceipt, WorkerError> {
         let QueuedPush {
             commits,
             blobs,
@@ -358,10 +401,12 @@ impl CommitWorker {
             blobs: blobs.into_iter().map(|(k, v)| (k, Base64Bytes(v))).collect(),
         };
         let StagedPush {
+            accepted,
             new_head_id,
             new_head_t,
             write_guard,
             final_state,
+            indexing_status,
             ..
         } = self
             .fluree
@@ -375,7 +420,12 @@ impl CommitWorker {
             .await
             .map_err(api_error_to_stage)?;
 
-        Ok((new_head_id, new_head_t))
+        Ok(AppliedReceipt::Push(PushApplied {
+            commit_id: new_head_id,
+            commit_t: new_head_t,
+            accepted,
+            indexing: indexing_status,
+        }))
     }
 
     /// Re-stage the merge worker-side. Fast-forward merges have no
@@ -387,7 +437,7 @@ impl CommitWorker {
         &self,
         ref_key: &RefKey,
         merge: QueuedMerge,
-    ) -> Result<(ContentId, i64), WorkerError> {
+    ) -> Result<AppliedReceipt, WorkerError> {
         use fluree_db_api::GuardedStagedCommit;
 
         let QueuedMerge {
@@ -399,6 +449,10 @@ impl CommitWorker {
         let StagedMerge {
             target,
             target_id,
+            fast_forward,
+            conflict_count,
+            commits_copied,
+            strategy: applied_strategy,
             new_head_id,
             new_head_t,
             commit,
@@ -459,7 +513,14 @@ impl CommitWorker {
             }
         }
 
-        Ok((new_head_id, new_head_t))
+        Ok(AppliedReceipt::Merge(MergeApplied {
+            commit_id: new_head_id,
+            commit_t: new_head_t,
+            fast_forward,
+            commits_copied,
+            conflict_count,
+            strategy: applied_strategy.unwrap_or(strategy),
+        }))
     }
 
     /// Re-stage the rebase worker-side. Writes any replay blobs to
@@ -472,12 +533,19 @@ impl CommitWorker {
         &self,
         ref_key: &RefKey,
         rebase: QueuedRebase,
-    ) -> Result<(ContentId, i64), WorkerError> {
+    ) -> Result<AppliedReceipt, WorkerError> {
         let QueuedRebase { strategy } = rebase;
         let ledger_name = ref_key.ledger_id.clone();
         let branch = ref_key.branch.clone();
         let StagedRebase {
             branch_id,
+            source_head_id,
+            source_head_t,
+            fast_forward,
+            total_commits,
+            replayed,
+            skipped,
+            conflicts,
             pre_rebase_head_id,
             pre_rebase_head_t,
             new_head_id,
@@ -524,7 +592,19 @@ impl CommitWorker {
                 .map_err(api_error_to_stage)?;
         }
 
-        Ok((advance_to, advance_t))
+        Ok(AppliedReceipt::Rebase(RebaseApplied {
+            commit_id: advance_to,
+            commit_t: advance_t,
+            fast_forward,
+            replayed,
+            skipped,
+            conflicts: conflicts.len(),
+            failures: 0,
+            total_commits,
+            source_head_t,
+            source_head_id,
+            strategy,
+        }))
     }
 
     async fn publish_head_advance(

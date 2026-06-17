@@ -15,6 +15,7 @@ use crate::raft::state_machine::{self, Command, NameServiceState, RefKey, Respon
 use crate::raft::storage::{
     RaftSnapshotStore, RaftStorage, SnapshotId as OurSnapshotId, SnapshotMeta as OurSnapshotMeta,
 };
+use crate::raft::staged_receipt::{AppliedReceipt, StagedReceiptMap};
 use crate::raft::waiter::{AbortReason, WaiterMap};
 use crate::raft::{ClusterNode, NodeId, TypeConfig};
 use fluree_db_core::ledger_id::format_ledger_id;
@@ -92,6 +93,13 @@ where
     /// leader, which the proposer recovers from with timeout +
     /// idempotency-keyed retry.
     waiter_map: Option<Arc<WaiterMap>>,
+    /// Companion to [`waiter_map`](Self::waiter_map): the worker
+    /// stashes per-op staging detail here before proposing
+    /// `ApplyHead`; the adapter takes it during waiter resolution
+    /// and sends it through as part of [`AppliedReceipt`]. Absent
+    /// entry → fall back to [`AppliedReceipt::Minimal`] (the
+    /// stranded-on-former-leader path).
+    staged_receipts: Option<Arc<StagedReceiptMap>>,
 }
 
 impl<S> StateMachineAdapter<S>
@@ -115,6 +123,7 @@ where
             snapshot_counter: AtomicU64::new(0),
             event_bus: None,
             waiter_map: None,
+            staged_receipts: None,
         }
     }
 
@@ -131,6 +140,16 @@ where
     /// registers waiters on.
     pub fn with_waiter_map(mut self, waiter_map: Arc<WaiterMap>) -> Self {
         self.waiter_map = Some(waiter_map);
+        self
+    }
+
+    /// Set the [`StagedReceiptMap`] the adapter reads from when
+    /// constructing an [`AppliedReceipt`] for a resolved waiter.
+    /// Pair it with the same handle the
+    /// [`CommitWorker`](super::commit_worker::CommitWorker) stashes
+    /// per-op staging detail into.
+    pub fn with_staged_receipts(mut self, staged_receipts: Arc<StagedReceiptMap>) -> Self {
+        self.staged_receipts = Some(staged_receipts);
         self
     }
 
@@ -317,7 +336,17 @@ where
                         queue_id,
                         commit_id,
                         commit_t,
-                    } => waiters.resolve_applied(queue_id, commit_id, commit_t),
+                    } => {
+                        let receipt = self
+                            .staged_receipts
+                            .as_ref()
+                            .and_then(|s| s.take(queue_id))
+                            .unwrap_or(AppliedReceipt::Minimal {
+                                commit_id,
+                                commit_t,
+                            });
+                        waiters.resolve_applied(queue_id, receipt);
+                    }
                     WaiterResolution::Aborted { queue_id, reason } => {
                         waiters.resolve_aborted(queue_id, reason)
                     }
@@ -996,13 +1025,55 @@ mod tests {
             .await
             .unwrap();
 
+        // No StagedReceiptMap is configured on the adapter, so the
+        // resolution falls back to Minimal — confirming the absent-
+        // entry path delivers commit_id / commit_t without panicking.
         match rx.await.expect("receive") {
-            WaiterOutcome::Applied { commit_id, commit_t } => {
+            WaiterOutcome::Applied(AppliedReceipt::Minimal {
+                commit_id,
+                commit_t,
+            }) => {
                 assert_eq!(commit_id, cid(42));
                 assert_eq!(commit_t, 10);
             }
-            other => panic!("expected Applied, got {other:?}"),
+            other => panic!("expected Applied(Minimal), got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn apply_head_reads_stashed_receipt_when_present() {
+        use crate::raft::staged_receipt::{StagedReceiptMap, TransactApplied};
+        let storage = Arc::new(MemoryRaftStorage::new());
+        let waiter_map = Arc::new(WaiterMap::new());
+        let staged = Arc::new(StagedReceiptMap::new());
+        let mut adapter = StateMachineAdapter::new(storage)
+            .with_waiter_map(Arc::clone(&waiter_map))
+            .with_staged_receipts(Arc::clone(&staged));
+        adapter.apply([create_ledger_entry(1, "test/db")]).await.unwrap();
+        adapter.apply([enqueue_entry(2, "test/db", "main")]).await.unwrap();
+
+        let rx = waiter_map.register(0, RefKey::new("test/db", "main"));
+        staged.stash(
+            0,
+            AppliedReceipt::Transact(TransactApplied {
+                commit_id: cid(42),
+                commit_t: 10,
+                tally: None,
+            }),
+        );
+        adapter
+            .apply([apply_head_entry(3, "test/db", "main", 0, cid(42), 10)])
+            .await
+            .unwrap();
+
+        match rx.await.expect("receive") {
+            WaiterOutcome::Applied(AppliedReceipt::Transact(r)) => {
+                assert_eq!(r.commit_id, cid(42));
+                assert_eq!(r.commit_t, 10);
+            }
+            other => panic!("expected Applied(Transact), got {other:?}"),
+        }
+        assert_eq!(staged.len(), 0, "adapter must take from the map");
     }
 
     #[tokio::test]

@@ -43,6 +43,7 @@ pub mod log_adapter;
 pub mod nameservice;
 pub mod network;
 pub mod queued_transactor;
+pub mod staged_receipt;
 pub mod state_machine;
 pub mod state_machine_adapter;
 pub mod storage;

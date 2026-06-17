@@ -22,6 +22,7 @@
 use crate::raft::state_machine::{
     BodyKind, Command as SmCommand, EnqueueCommandArgs, RefKey, Response as SmResponse,
 };
+use crate::raft::staged_receipt::AppliedReceipt;
 use crate::raft::waiter::{AbortReason, WaiterMap, WaiterOutcome};
 use crate::raft::TypeConfig;
 use crate::{
@@ -188,15 +189,7 @@ impl Committer for QueuedTransactor {
             })?;
 
         match outcome {
-            WaiterOutcome::Applied { commit_id, commit_t } => Ok(TransactionReceipt {
-                idempotency_key,
-                commit: CommitReceipt {
-                    commit_id,
-                    t: commit_t,
-                    flake_count: 0,
-                },
-                tally: None,
-            }),
+            WaiterOutcome::Applied(receipt) => Ok(transaction_receipt_from(idempotency_key, receipt)?),
             WaiterOutcome::Aborted(reason) => Err(submission_error_from_abort(reason)),
         }
     }
@@ -308,15 +301,12 @@ impl Committer for QueuedTransactor {
             })?;
 
         match outcome {
-            WaiterOutcome::Applied { commit_id, commit_t } => Ok(RevertReceipt {
+            WaiterOutcome::Applied(receipt) => Ok(revert_receipt_from(
                 idempotency_key,
                 branch,
-                reverted_commits: Vec::new(),
-                conflict_count: 0,
                 strategy,
-                new_head_t: commit_t,
-                new_head_id: commit_id,
-            }),
+                receipt,
+            )?),
             WaiterOutcome::Aborted(reason) => Err(submission_error_from_abort(reason)),
         }
     }
@@ -444,17 +434,13 @@ impl Committer for QueuedTransactor {
             })?;
 
         match outcome {
-            WaiterOutcome::Applied { commit_id, commit_t } => Ok(MergeReceipt {
+            WaiterOutcome::Applied(receipt) => Ok(merge_receipt_from(
                 idempotency_key,
-                source: source_branch,
-                target: target_for_queue,
-                fast_forward: false,
-                new_head_t: commit_t,
-                new_head_id: commit_id,
-                commits_copied: 0,
-                conflict_count: 0,
+                source_branch,
+                target_for_queue,
                 strategy,
-            }),
+                receipt,
+            )?),
             WaiterOutcome::Aborted(reason) => Err(submission_error_from_abort(reason)),
         }
     }
@@ -560,19 +546,12 @@ impl Committer for QueuedTransactor {
             })?;
 
         match outcome {
-            WaiterOutcome::Applied { commit_id, commit_t } => Ok(RebaseReceipt {
+            WaiterOutcome::Applied(receipt) => Ok(rebase_receipt_from(
                 idempotency_key,
                 branch,
-                fast_forward: false,
-                replayed: 0,
-                skipped: 0,
-                conflicts: 0,
-                failures: 0,
-                total_commits: 0,
-                source_head_t: commit_t,
-                source_head_id: commit_id,
                 strategy,
-            }),
+                receipt,
+            )?),
             WaiterOutcome::Aborted(reason) => Err(submission_error_from_abort(reason)),
         }
     }
@@ -689,14 +668,11 @@ impl Committer for QueuedTransactor {
             })?;
 
         match outcome {
-            WaiterOutcome::Applied { commit_id, commit_t } => Ok(PushReceipt {
+            WaiterOutcome::Applied(receipt) => Ok(push_receipt_from(
                 idempotency_key,
-                ledger: ledger_id,
-                accepted: 0,
-                head_t: commit_t,
-                head_id: commit_id,
-                indexing: idle_indexing_status(commit_t),
-            }),
+                ledger_id,
+                receipt,
+            )?),
             WaiterOutcome::Aborted(reason) => Err(submission_error_from_abort(reason)),
         }
     }
@@ -720,6 +696,205 @@ fn idle_indexing_status(commit_t: i64) -> fluree_db_api::IndexingStatus {
         novelty_size: 0,
         index_t: commit_t,
         commit_t,
+    }
+}
+
+/// Error surfaced when the adapter delivers a receipt variant whose
+/// operation type doesn't match the one the transactor submitted.
+/// Should never happen — same queue_id can't belong to two
+/// operations — so it's a state machine / wiring bug.
+fn variant_mismatch(expected: &'static str, got: &AppliedReceipt) -> SubmissionError {
+    SubmissionError::Execution {
+        status: 500,
+        message: format!(
+            "applied receipt mismatch: expected {expected}, got {got:?}"
+        ),
+    }
+}
+
+fn transaction_receipt_from(
+    idempotency_key: Option<crate::IdempotencyKey>,
+    receipt: AppliedReceipt,
+) -> Result<TransactionReceipt, SubmissionError> {
+    use crate::raft::staged_receipt::TransactApplied;
+    let (commit_id, commit_t, tally) = match receipt {
+        AppliedReceipt::Transact(TransactApplied {
+            commit_id,
+            commit_t,
+            tally,
+        }) => (commit_id, commit_t, tally),
+        AppliedReceipt::Minimal {
+            commit_id,
+            commit_t,
+        } => (commit_id, commit_t, None),
+        other => return Err(variant_mismatch("Transact", &other)),
+    };
+    Ok(TransactionReceipt {
+        idempotency_key,
+        commit: CommitReceipt {
+            commit_id,
+            t: commit_t,
+            flake_count: 0,
+        },
+        tally: tally.map(Into::into),
+    })
+}
+
+fn push_receipt_from(
+    idempotency_key: Option<crate::IdempotencyKey>,
+    ledger_id: String,
+    receipt: AppliedReceipt,
+) -> Result<PushReceipt, SubmissionError> {
+    use crate::raft::staged_receipt::PushApplied;
+    let (commit_id, commit_t, accepted, indexing) = match receipt {
+        AppliedReceipt::Push(PushApplied {
+            commit_id,
+            commit_t,
+            accepted,
+            indexing,
+        }) => (commit_id, commit_t, accepted, indexing),
+        AppliedReceipt::Minimal {
+            commit_id,
+            commit_t,
+        } => (commit_id, commit_t, 0, idle_indexing_status(commit_t)),
+        other => return Err(variant_mismatch("Push", &other)),
+    };
+    Ok(PushReceipt {
+        idempotency_key,
+        ledger: ledger_id,
+        accepted,
+        head_t: commit_t,
+        head_id: commit_id,
+        indexing,
+    })
+}
+
+fn revert_receipt_from(
+    idempotency_key: Option<crate::IdempotencyKey>,
+    branch: String,
+    strategy: fluree_db_api::ConflictStrategy,
+    receipt: AppliedReceipt,
+) -> Result<RevertReceipt, SubmissionError> {
+    use crate::raft::staged_receipt::RevertApplied;
+    let (commit_id, commit_t, reverted_commits, conflict_count, strategy_out) = match receipt {
+        AppliedReceipt::Revert(RevertApplied {
+            commit_id,
+            commit_t,
+            reverted_commits,
+            conflict_count,
+            strategy,
+        }) => (commit_id, commit_t, reverted_commits, conflict_count, strategy),
+        AppliedReceipt::Minimal {
+            commit_id,
+            commit_t,
+        } => (commit_id, commit_t, Vec::new(), 0, strategy),
+        other => return Err(variant_mismatch("Revert", &other)),
+    };
+    Ok(RevertReceipt {
+        idempotency_key,
+        branch,
+        reverted_commits,
+        conflict_count,
+        strategy: strategy_out,
+        new_head_t: commit_t,
+        new_head_id: commit_id,
+    })
+}
+
+fn merge_receipt_from(
+    idempotency_key: Option<crate::IdempotencyKey>,
+    source: String,
+    target: String,
+    strategy: fluree_db_api::ConflictStrategy,
+    receipt: AppliedReceipt,
+) -> Result<MergeReceipt, SubmissionError> {
+    use crate::raft::staged_receipt::MergeApplied;
+    let (commit_id, commit_t, fast_forward, commits_copied, conflict_count, strategy_out) =
+        match receipt {
+            AppliedReceipt::Merge(MergeApplied {
+                commit_id,
+                commit_t,
+                fast_forward,
+                commits_copied,
+                conflict_count,
+                strategy,
+            }) => (
+                commit_id,
+                commit_t,
+                fast_forward,
+                commits_copied,
+                conflict_count,
+                strategy,
+            ),
+            AppliedReceipt::Minimal {
+                commit_id,
+                commit_t,
+            } => (commit_id, commit_t, false, 0, 0, strategy),
+            other => return Err(variant_mismatch("Merge", &other)),
+        };
+    Ok(MergeReceipt {
+        idempotency_key,
+        source,
+        target,
+        fast_forward,
+        new_head_t: commit_t,
+        new_head_id: commit_id,
+        commits_copied,
+        conflict_count,
+        strategy: strategy_out,
+    })
+}
+
+fn rebase_receipt_from(
+    idempotency_key: Option<crate::IdempotencyKey>,
+    branch: String,
+    strategy: fluree_db_api::ConflictStrategy,
+    receipt: AppliedReceipt,
+) -> Result<RebaseReceipt, SubmissionError> {
+    use crate::raft::staged_receipt::RebaseApplied;
+    match receipt {
+        AppliedReceipt::Rebase(RebaseApplied {
+            commit_id: _,
+            commit_t: _,
+            fast_forward,
+            replayed,
+            skipped,
+            conflicts,
+            failures,
+            total_commits,
+            source_head_t,
+            source_head_id,
+            strategy,
+        }) => Ok(RebaseReceipt {
+            idempotency_key,
+            branch,
+            fast_forward,
+            replayed,
+            skipped,
+            conflicts,
+            failures,
+            total_commits,
+            source_head_t,
+            source_head_id,
+            strategy,
+        }),
+        AppliedReceipt::Minimal {
+            commit_id,
+            commit_t,
+        } => Ok(RebaseReceipt {
+            idempotency_key,
+            branch,
+            fast_forward: false,
+            replayed: 0,
+            skipped: 0,
+            conflicts: 0,
+            failures: 0,
+            total_commits: 0,
+            source_head_t: commit_t,
+            source_head_id: commit_id,
+            strategy,
+        }),
+        other => Err(variant_mismatch("Rebase", &other)),
     }
 }
 

@@ -29,6 +29,7 @@ use fluree_db_consensus::raft::{
     forward::LeaderForwarder,
     log_adapter::LogAdapter,
     network::{self as raft_network, HttpRaftNetworkFactory, NetworkConfig},
+    staged_receipt::StagedReceiptMap,
     state_machine_adapter::{SharedState, StateMachineAdapter},
     storage::{fs::FsRaftStorage, StorageError},
     waiter::WaiterMap,
@@ -68,6 +69,13 @@ pub struct RaftIntegration {
     /// [`QueuedTransactor`](fluree_db_consensus::raft::queued_transactor::QueuedTransactor)
     /// so submission-side registrations meet apply-side resolutions.
     pub waiter_map: Arc<WaiterMap>,
+    /// Per-process side channel the
+    /// [`CommitWorker`](fluree_db_consensus::raft::commit_worker::CommitWorker)
+    /// stashes typed [`AppliedReceipt`](fluree_db_consensus::raft::staged_receipt::AppliedReceipt)
+    /// values into before proposing `ApplyHead`; the adapter takes
+    /// them during waiter resolution so transactors see staged-time
+    /// detail instead of falling back to `Minimal`.
+    pub staged_receipts: Arc<StagedReceiptMap>,
 }
 
 impl RaftIntegration {
@@ -82,6 +90,7 @@ impl RaftIntegration {
         shared_state: SharedState,
         event_bus: Arc<LedgerEventBus>,
         waiter_map: Arc<WaiterMap>,
+        staged_receipts: Arc<StagedReceiptMap>,
     ) -> Self {
         let forwarder = Arc::new(LeaderForwarder::new(
             Arc::clone(&raft),
@@ -95,6 +104,7 @@ impl RaftIntegration {
             shared_state,
             event_bus,
             waiter_map,
+            staged_receipts,
         }
     }
 
@@ -115,10 +125,12 @@ impl RaftIntegration {
 
         let event_bus = Arc::new(LedgerEventBus::new(config.event_bus_capacity));
         let waiter_map = Arc::new(WaiterMap::new());
+        let staged_receipts = Arc::new(StagedReceiptMap::new());
         let log = LogAdapter::new(Arc::clone(&storage));
         let sm = StateMachineAdapter::new(Arc::clone(&storage))
             .with_event_bus(Arc::clone(&event_bus))
-            .with_waiter_map(Arc::clone(&waiter_map));
+            .with_waiter_map(Arc::clone(&waiter_map))
+            .with_staged_receipts(Arc::clone(&staged_receipts));
         let shared_state = sm.shared_state();
 
         let raft_cfg = Arc::new(config.raft_config.validate()?);
@@ -139,6 +151,7 @@ impl RaftIntegration {
             shared_state,
             event_bus,
             waiter_map,
+            staged_receipts,
         ))
     }
 

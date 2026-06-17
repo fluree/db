@@ -507,6 +507,7 @@ impl FlureeServerBuilder {
                             .clone()
                             .expect("index_config set by AppState::new"),
                         integration.shared_state.clone(),
+                        Arc::clone(&integration.staged_receipts),
                     );
                     let spawn_leader_tasks = move || {
                         let nameservice: std::sync::Arc<
