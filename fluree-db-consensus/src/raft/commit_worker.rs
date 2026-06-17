@@ -25,8 +25,8 @@ use crate::raft::state_machine::{
 };
 use crate::raft::state_machine_adapter::SharedState;
 use crate::raft::TypeConfig;
-use crate::{QueuedRequest, SubmissionError, TransactionBody};
-use fluree_db_api::{ApiError, Fluree};
+use crate::{QueuedPush, QueuedRequest, QueuedTransact, SubmissionError, TransactionBody};
+use fluree_db_api::{ApiError, Base64Bytes, Fluree, PushCommitsRequest, StagedPush};
 use fluree_db_core::ContentId;
 use fluree_db_ledger::IndexConfig;
 use fluree_db_nameservice::CommitPublisher;
@@ -114,29 +114,17 @@ impl CommitWorker {
         ref_key: &RefKey,
         entry: &QueueEntry,
     ) -> Result<(), WorkerError> {
-        // BodyKind::Pushed routes through verify-the-chain — deferred.
-        if matches!(entry.body_kind, BodyKind::Pushed) {
-            return Err(WorkerError::Stage(PoisonReason::WorkerPanic {
-                message: "BodyKind::Pushed is not yet supported by the worker".into(),
-            }));
-        }
-
         let envelope = self.load_envelope(ref_key, entry).await?;
         // The state machine doesn't introspect the envelope at enqueue
         // time, so the inline discriminator could disagree with what
         // the leader actually wrote. Bail explicitly rather than
-        // restage under a different kind than the queue declared.
-        let observed_kind = BodyKind::from(&envelope.body);
-        if observed_kind != entry.body_kind {
-            return Err(WorkerError::Stage(PoisonReason::BodyMalformed {
-                error: format!(
-                    "queue entry body_kind {:?} does not match envelope body {:?}",
-                    entry.body_kind, observed_kind
-                ),
-            }));
-        }
+        // process under a kind the queue didn't declare.
+        check_envelope_kind(entry.body_kind, &envelope)?;
 
-        let (commit_id, commit_t) = self.stage_and_persist(ref_key, envelope).await?;
+        let (commit_id, commit_t) = match envelope {
+            QueuedRequest::Transact(transact) => self.stage_and_persist(ref_key, transact).await?,
+            QueuedRequest::Push(push) => self.process_push(ref_key, push).await?,
+        };
         self.publish_head_advance(ref_key, commit_id, commit_t).await
     }
 
@@ -171,15 +159,15 @@ impl CommitWorker {
     async fn stage_and_persist(
         &self,
         ref_key: &RefKey,
-        envelope: QueuedRequest,
+        transact: QueuedTransact,
     ) -> Result<(ContentId, i64), WorkerError> {
-        let QueuedRequest {
+        let QueuedTransact {
             body,
             txn_opts,
             commit_opts,
             tracking,
             governance,
-        } = envelope;
+        } = transact;
 
         let ledger_id = format_full_ledger_id(ref_key);
         let ledger_manager =
@@ -257,6 +245,46 @@ impl CommitWorker {
             .map_err(api_error_to_stage)?;
 
         Ok((commit_cid, commit_t))
+    }
+
+    /// Decode the queued push, hand it to `Fluree::prepare_push` for
+    /// validation + CAS persistence + local state derivation, then
+    /// finalize through the held write guard so this node's cache
+    /// catches up with the head we're about to publish.
+    async fn process_push(
+        &self,
+        ref_key: &RefKey,
+        push: QueuedPush,
+    ) -> Result<(ContentId, i64), WorkerError> {
+        let QueuedPush {
+            commits,
+            blobs,
+            governance,
+        } = push;
+        let ledger_id = format_full_ledger_id(ref_key);
+        let payload = PushCommitsRequest {
+            commits: commits.into_iter().map(Base64Bytes).collect(),
+            blobs: blobs.into_iter().map(|(k, v)| (k, Base64Bytes(v))).collect(),
+        };
+        let StagedPush {
+            new_head_id,
+            new_head_t,
+            write_guard,
+            final_state,
+            ..
+        } = self
+            .fluree
+            .prepare_push(&ledger_id, payload, &governance, &self.index_config)
+            .await
+            .map_err(|e| stage_failure(&format!("prepare_push failed: {e}")))?;
+
+        let needs_reindex = final_state.should_reindex(&self.index_config);
+        self.fluree
+            .finalize_commit(write_guard, final_state, new_head_t, needs_reindex)
+            .await
+            .map_err(api_error_to_stage)?;
+
+        Ok((new_head_id, new_head_t))
     }
 
     async fn publish_head_advance(
@@ -363,6 +391,29 @@ fn format_full_ledger_id(ref_key: &RefKey) -> String {
     format!("{}:{}", ref_key.ledger_id, ref_key.branch)
 }
 
+/// Cross-check the queue entry's inline discriminator against the
+/// envelope payload variant. A mismatch is a state-machine /
+/// committer bug — surface loudly so the entry poisons rather than
+/// processing under the wrong path.
+fn check_envelope_kind(
+    body_kind: BodyKind,
+    envelope: &QueuedRequest,
+) -> Result<(), WorkerError> {
+    let expected = match envelope {
+        QueuedRequest::Transact(t) => BodyKind::from(&t.body),
+        QueuedRequest::Push(_) => BodyKind::Pushed,
+    };
+    if expected == body_kind {
+        Ok(())
+    } else {
+        Err(WorkerError::Stage(PoisonReason::BodyMalformed {
+            error: format!(
+                "queue entry body_kind {body_kind:?} does not match envelope variant {expected:?}"
+            ),
+        }))
+    }
+}
+
 fn current_millis() -> u64 {
     SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
@@ -422,24 +473,65 @@ mod tests {
         ContentId::new(ContentKind::Commit, &[seed])
     }
 
-    fn sample_envelope() -> QueuedRequest {
-        QueuedRequest {
+    fn sample_transact_envelope() -> QueuedRequest {
+        QueuedRequest::Transact(QueuedTransact {
             body: TransactionBody::JsonLdInsert(json!({"@id": "ex:s", "ex:p": "ex:o"})),
             txn_opts: TxnOpts::default(),
             commit_opts: CommitOptsRequest::default(),
             tracking: Some(TrackingOptions::default()),
             governance: GovernanceOptions::default(),
+        })
+    }
+
+    fn sample_push_envelope() -> QueuedRequest {
+        QueuedRequest::Push(QueuedPush {
+            commits: vec![vec![1, 2, 3, 4]],
+            blobs: std::collections::HashMap::new(),
+            governance: GovernanceOptions::default(),
+        })
+    }
+
+    #[test]
+    fn queued_transact_roundtrips_through_codec() {
+        let envelope = sample_transact_envelope();
+        let bytes = envelope.to_bytes().expect("encode");
+        let decoded = QueuedRequest::from_bytes(&bytes).expect("decode");
+
+        match decoded {
+            QueuedRequest::Transact(t) => {
+                assert!(matches!(t.body, TransactionBody::JsonLdInsert(_)));
+                assert!(t.tracking.is_some());
+            }
+            other => panic!("expected Transact, got {other:?}"),
         }
     }
 
     #[test]
-    fn queued_request_roundtrips_through_codec() {
-        let envelope = sample_envelope();
+    fn queued_push_roundtrips_through_codec() {
+        let envelope = sample_push_envelope();
         let bytes = envelope.to_bytes().expect("encode");
         let decoded = QueuedRequest::from_bytes(&bytes).expect("decode");
+        match decoded {
+            QueuedRequest::Push(p) => {
+                assert_eq!(p.commits.len(), 1);
+                assert_eq!(p.commits[0], vec![1, 2, 3, 4]);
+            }
+            other => panic!("expected Push, got {other:?}"),
+        }
+    }
 
-        assert!(matches!(decoded.body, TransactionBody::JsonLdInsert(_)));
-        assert!(decoded.tracking.is_some());
+    #[test]
+    fn check_envelope_kind_accepts_matching_pair() {
+        assert!(check_envelope_kind(BodyKind::JsonLdInsert, &sample_transact_envelope()).is_ok());
+        assert!(check_envelope_kind(BodyKind::Pushed, &sample_push_envelope()).is_ok());
+    }
+
+    #[test]
+    fn check_envelope_kind_rejects_mismatched_pair() {
+        // Transact envelope marked as Pushed
+        assert!(check_envelope_kind(BodyKind::Pushed, &sample_transact_envelope()).is_err());
+        // Push envelope marked as a JSON-LD insert
+        assert!(check_envelope_kind(BodyKind::JsonLdInsert, &sample_push_envelope()).is_err());
     }
 
     fn enqueued_entry(queue_id: u64, request_cid: ContentId, kind: BodyKind) -> QueueEntry {

@@ -26,8 +26,8 @@ use crate::raft::waiter::{AbortReason, WaiterMap, WaiterOutcome};
 use crate::raft::TypeConfig;
 use crate::{
     Committer, IdempotencyCacheKey, MergeReceipt, MergeRequest, PushReceipt, PushRequest,
-    QueuedRequest, RebaseReceipt, RebaseRequest, RevertReceipt, RevertRequest, SubmissionError,
-    TransactionReceipt, TransactionRequest,
+    QueuedPush, QueuedRequest, QueuedTransact, RebaseReceipt, RebaseRequest, RevertReceipt,
+    RevertRequest, SubmissionError, TransactionReceipt, TransactionRequest,
 };
 use async_trait::async_trait;
 use fluree_db_api::{CommitReceipt, Fluree};
@@ -99,13 +99,13 @@ impl Committer for QueuedTransactor {
             .map(|k| IdempotencyCacheKey::new(ledger_id.clone(), k.clone()));
 
         let body_kind = BodyKind::from(&body);
-        let envelope = QueuedRequest {
+        let envelope = QueuedRequest::Transact(QueuedTransact {
             body,
             txn_opts,
             commit_opts: CommitOptsRequest::from(&commit_opts),
             tracking,
             governance,
-        };
+        });
         let bytes = envelope
             .to_bytes()
             .map_err(|e| SubmissionError::Execution {
@@ -213,7 +213,127 @@ impl Committer for QueuedTransactor {
     }
 
     async fn push(&self, request: PushRequest) -> Result<PushReceipt, SubmissionError> {
-        self.fallback.push(request).await
+        let PushRequest {
+            idempotency_key,
+            ledger_id,
+            commits,
+            blobs,
+            governance,
+        } = request;
+
+        let (ledger_name, branch) = split_ledger_id(&ledger_id).map_err(|e| {
+            SubmissionError::Execution {
+                status: 400,
+                message: format!("invalid ledger_id: {e}"),
+            }
+        })?;
+        let ref_key = RefKey::new(&ledger_name, &branch);
+
+        let idempotency_cache_key = idempotency_key
+            .as_ref()
+            .map(|k| IdempotencyCacheKey::new(ledger_id.clone(), k.clone()));
+
+        let envelope = QueuedRequest::Push(QueuedPush {
+            commits,
+            blobs,
+            governance,
+        });
+        let bytes = envelope
+            .to_bytes()
+            .map_err(|e| SubmissionError::Execution {
+                status: 500,
+                message: format!("QueuedRequest encode failed: {e}"),
+            })?;
+        let request_cid = self
+            .fluree
+            .content_store(&ledger_id)
+            .put(ContentKind::Txn, &bytes)
+            .await
+            .map_err(|e| SubmissionError::Execution {
+                status: 500,
+                message: format!("QueuedRequest CAS write failed: {e}"),
+            })?;
+
+        let cmd = SmCommand::EnqueueCommand(EnqueueCommandArgs {
+            ledger_id: ledger_name,
+            branch,
+            idempotency: idempotency_cache_key,
+            request_cid,
+            body_kind: BodyKind::Pushed,
+            applied_at_millis: current_millis(),
+        });
+
+        let response = self
+            .raft
+            .client_write(cmd)
+            .await
+            .map_err(|e| SubmissionError::Execution {
+                status: 500,
+                message: format!("raft client_write failed: {e}"),
+            })?;
+
+        let waiter_rx = match response.data {
+            SmResponse::Enqueued { queue_id, .. } | SmResponse::InFlight { queue_id, .. } => {
+                self.waiter_map.register(queue_id, ref_key)
+            }
+            SmResponse::IdempotencyHit { record } => {
+                // Push idempotency hit: the original push produced
+                // this head. We don't track the `accepted` count or
+                // a fresh `IndexingStatus` from the cache record, so
+                // surface conservative defaults (0 / Idle) — clients
+                // that need an exact `accepted` count on retry can
+                // resubmit with a fresh key.
+                return Ok(PushReceipt {
+                    idempotency_key,
+                    ledger: ledger_id,
+                    accepted: 0,
+                    head_t: record.t,
+                    head_id: record.head,
+                    indexing: idle_indexing_status(record.t),
+                });
+            }
+            SmResponse::IdempotencyFailed { record } => {
+                return Err(SubmissionError::Execution {
+                    status: 500,
+                    message: format!("cached failure: {:?}", record.reason),
+                });
+            }
+            SmResponse::BodyHashMismatch => return Err(SubmissionError::KeyCollision),
+            SmResponse::QueueFull { .. } => return Err(SubmissionError::Overloaded),
+            SmResponse::LedgerNotFound { ledger_id } => {
+                return Err(SubmissionError::Execution {
+                    status: 404,
+                    message: format!("ledger not found: {ledger_id}"),
+                });
+            }
+            other => {
+                return Err(SubmissionError::Execution {
+                    status: 500,
+                    message: format!("unexpected Response variant for EnqueueCommand: {other:?}"),
+                });
+            }
+        };
+
+        let outcome = waiter_rx
+            .await
+            .map_err(|_| SubmissionError::Execution {
+                status: 503,
+                message: "queue waiter dropped before outcome — leader transition stranded the \
+                          push; retry with the same idempotency key"
+                    .into(),
+            })?;
+
+        match outcome {
+            WaiterOutcome::Applied { commit_id, commit_t } => Ok(PushReceipt {
+                idempotency_key,
+                ledger: ledger_id,
+                accepted: 0,
+                head_t: commit_t,
+                head_id: commit_id,
+                indexing: idle_indexing_status(commit_t),
+            }),
+            WaiterOutcome::Aborted(reason) => Err(submission_error_from_abort(reason)),
+        }
     }
 }
 
@@ -222,6 +342,20 @@ fn current_millis() -> u64 {
         .duration_since(SystemTime::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+/// Conservative `IndexingStatus` for paths that don't observe the
+/// worker's post-stage novelty / index-t snapshot — used by the
+/// idempotency-hit branch and by the queued push receipt until the
+/// worker surfaces those fields through the waiter map.
+fn idle_indexing_status(commit_t: i64) -> fluree_db_api::IndexingStatus {
+    fluree_db_api::IndexingStatus {
+        enabled: false,
+        needed: false,
+        novelty_size: 0,
+        index_t: commit_t,
+        commit_t,
+    }
 }
 
 fn submission_error_from_abort(reason: AbortReason) -> SubmissionError {

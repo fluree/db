@@ -206,26 +206,27 @@ impl TransactionBody {
 }
 
 /// Serializable envelope a consensus-coordinated committer writes to
-/// shared content-addressed storage before enqueueing a transaction.
+/// shared content-addressed storage before enqueueing work.
 ///
 /// The CID of this blob is what travels through the Raft command queue
 /// (as `EnqueueCommandArgs::request_cid`); the worker reads the blob
-/// back to recover everything it needs to stage the commit. Bundling
+/// back to recover everything it needs to advance the head. Bundling
 /// the per-request context here means the queue itself stays thin
 /// (one CID + a body-kind discriminator) and we don't have to
 /// replicate large opaque values through the Raft log.
 ///
-/// Fields mirror the request-side projection of [`TransactionRequest`].
-/// Node-side concerns (signing keys, in-flight upload handles) live on
-/// the runtime [`CommitOpts`] and are rehydrated worker-side — they do
-/// not travel through CAS.
+/// One variant per supported `Committer` method that's been migrated
+/// onto the queue. Pre-migration paths stay on the legacy
+/// `RaftCommitter` → `Command::AdvanceRef` route.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct QueuedRequest {
-    pub body: TransactionBody,
-    pub txn_opts: TxnOpts,
-    pub commit_opts: CommitOptsRequest,
-    pub tracking: Option<TrackingOptions>,
-    pub governance: GovernanceOptions,
+pub enum QueuedRequest {
+    /// `transact` — body, opts, tracking, governance to stage and
+    /// commit through the worker.
+    Transact(QueuedTransact),
+    /// `push` — raw commit-chain bytes the client supplied. The
+    /// worker decodes via `Fluree::prepare_push`, advances the head
+    /// to the chain's final commit.
+    Push(QueuedPush),
 }
 
 impl QueuedRequest {
@@ -244,10 +245,40 @@ impl QueuedRequest {
     }
 
     /// Decode the envelope retrieved from CAS by `request_cid`. Used
-    /// worker-side to recover body + per-request context.
+    /// worker-side to recover the request context.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, QueuedRequestCodecError> {
         Ok(serde_json::from_slice(bytes)?)
     }
+}
+
+/// Transact-side envelope payload. Fields mirror the request-side
+/// projection of [`TransactionRequest`]. Node-side concerns (signing
+/// keys, in-flight upload handles) live on the runtime [`CommitOpts`]
+/// and are rehydrated worker-side — they do not travel through CAS.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueuedTransact {
+    pub body: TransactionBody,
+    pub txn_opts: TxnOpts,
+    pub commit_opts: CommitOptsRequest,
+    pub tracking: Option<TrackingOptions>,
+    pub governance: GovernanceOptions,
+}
+
+/// Push-side envelope payload. Holds the raw client-supplied commit
+/// chain bytes plus any auxiliary blobs the chain references; the
+/// worker hands them to [`Fluree::prepare_push`] to decode, validate,
+/// and write to CAS, then advances the branch head to the chain's
+/// final commit.
+///
+/// Carrying raw bytes rather than CIDs keeps the migration mechanical:
+/// the existing `PushRequest` API stays unchanged, and the worker's
+/// push path reuses the same `prepare_push` pipeline the legacy
+/// committer used.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueuedPush {
+    pub commits: Vec<Vec<u8>>,
+    pub blobs: HashMap<String, Vec<u8>>,
+    pub governance: GovernanceOptions,
 }
 
 /// Error encoding or decoding a [`QueuedRequest`].
