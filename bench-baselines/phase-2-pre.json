@@ -1,0 +1,123 @@
+{
+  "schema_version": 1,
+  "label": "phase-2-pre",
+  "git_sha": "fbf366dea",
+  "captured_at": "2026-06-17T20:15:41.571147+00:00",
+  "profile": "quick",
+  "scale": "small",
+  "entries": {
+    "novelty_replay/replay_chain/small": {
+      "mean_ns": 11854976.0625,
+      "median_ns": 11847489.5625
+    },
+    "query_cold_reload/cold_load/small": {
+      "mean_ns": 6634002.5,
+      "median_ns": 6661133.8125
+    },
+    "query_cold_reload/cold_load_plus_query/small": {
+      "mean_ns": 15325719.588235294,
+      "median_ns": 15184523.294117648
+    },
+    "query_hot_bsbm/q3/small": {
+      "mean_ns": 400038.91656050953,
+      "median_ns": 399353.78503184713
+    },
+    "query_hot_bsbm/q5/small": {
+      "mean_ns": 619842.9246287129,
+      "median_ns": 619918.4715346535
+    },
+    "query_hot_bsbm/q9/small": {
+      "mean_ns": 905092.117870036,
+      "median_ns": 902747.0297833936
+    },
+    "query_overlay_matrix/count_base/small": {
+      "mean_ns": 36136.14053387494,
+      "median_ns": 36107.52607717975,
+      "mem": {
+        "peak_bytes": 7337896,
+        "scenario_peak_bytes": 6689721,
+        "total_allocated_bytes": 19142318664
+      }
+    },
+    "query_overlay_matrix/count_novelty/small": {
+      "mean_ns": 14431198.736363638,
+      "median_ns": 14393461.484848484,
+      "mem": {
+        "peak_bytes": 31010484,
+        "scenario_peak_bytes": 9502081,
+        "total_allocated_bytes": 33626976258
+      }
+    },
+    "query_overlay_matrix/count_overlay/small": {
+      "mean_ns": 2433365.2980392156,
+      "median_ns": 2433519.095588235,
+      "mem": {
+        "peak_bytes": 10903960,
+        "scenario_peak_bytes": 6961890,
+        "total_allocated_bytes": 7096163760
+      }
+    },
+    "query_overlay_matrix/groupby_base/small": {
+      "mean_ns": 884547.2443262411,
+      "median_ns": 884143.284574468,
+      "mem": {
+        "peak_bytes": 7935163,
+        "scenario_peak_bytes": 6905997,
+        "total_allocated_bytes": 39570818530
+      }
+    },
+    "query_overlay_matrix/groupby_novelty/small": {
+      "mean_ns": 3657433279.3,
+      "median_ns": 3657450458.5,
+      "mem": {
+        "peak_bytes": 31766117,
+        "scenario_peak_bytes": 10257541,
+        "total_allocated_bytes": 206075590512
+      }
+    },
+    "query_overlay_matrix/groupby_overlay/small": {
+      "mean_ns": 1724522712.5,
+      "median_ns": 1725035979.0,
+      "mem": {
+        "peak_bytes": 11867166,
+        "scenario_peak_bytes": 6456033,
+        "total_allocated_bytes": 17971683618
+      }
+    },
+    "query_overlay_matrix/star_base/small": {
+      "mean_ns": 630023.471210191,
+      "median_ns": 629373.1159235669,
+      "mem": {
+        "peak_bytes": 7484870,
+        "scenario_peak_bytes": 6603289,
+        "total_allocated_bytes": 73777934270
+      }
+    },
+    "query_overlay_matrix/star_novelty/small": {
+      "mean_ns": 7499766100.0,
+      "median_ns": 7497933583.0,
+      "mem": {
+        "peak_bytes": 33202770,
+        "scenario_peak_bytes": 11694126,
+        "total_allocated_bytes": 446920884989
+      }
+    },
+    "query_overlay_matrix/star_overlay/small": {
+      "mean_ns": 3696177495.8,
+      "median_ns": 3692366896.5,
+      "mem": {
+        "peak_bytes": 11866197,
+        "scenario_peak_bytes": 7417941,
+        "total_allocated_bytes": 31189775353
+      }
+    },
+    "transact_commit/fresh_ledger/small": {
+      "mean_ns": 217608.93286746988,
+      "median_ns": 217385.37638554216
+    },
+    "transact_commit/populated_ledger/small": {
+      "mean_ns": 416748.88095238095,
+      "median_ns": 420386.5555555555
+    }
+  }
+}
