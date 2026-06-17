@@ -2250,6 +2250,12 @@ where
 /// `epoch != 0`; the base manifest count is the current-state base count only then.
 /// Returns `Ok(None)` to defer (overlay flake failed to translate). Returns the
 /// plain manifest count when there is no novelty for the predicate.
+///
+/// **Overlay contract:** the `CountDelta` strategy owns no merge logic of its
+/// own — translation goes through the single `resolve_overlay` producer (via
+/// [`collect_resolved_overlay_ops`]) and the per-range merge is the `RowMerge`
+/// cursor (`build_overlay_cursor_for_subject_range` → `merge_overlay_into_batch`);
+/// this function only layers the count arithmetic on top.
 pub fn count_predicate_overlay_delta(
     ctx: &ExecutionContext<'_>,
     store: &Arc<BinaryIndexStore>,

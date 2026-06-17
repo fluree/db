@@ -83,9 +83,14 @@ const SCAN_BUDGET: usize = 200_000;
 /// A collected result row: `(o_type, o_key, s_id)` in descending value order.
 type TopKRow = (u16, u64, u64);
 
-/// Overlay-lane working row: the full V3 fact identity (within a single proven
-/// `o_type`). `o_i` is carried so dedup/retract operate on whole facts —
-/// repeated/list values share `(s_id, o_key)` but differ in `o_i`.
+/// Overlay-lane working row: a deliberately **gated projection** of the
+/// canonical `FactKeyV3` identity `(s_id, p_id, o_type, o_key, o_i)` down to
+/// `(o_key, s_id, o_i)`. The reverse-POST fast path runs within one predicate and
+/// one proven `o_type` (`combined_orderable_o_type`), so `p_id`/`o_type` are
+/// constant and carrying them per row would be dead weight — this is the same
+/// fact identity as `FactKeyV3`, just with the constant columns elided. `o_i` is
+/// kept so dedup/retract operate on whole facts: repeated/`@list` values share
+/// `(s_id, o_key)` but differ in `o_i`.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 struct OvRow {
     o_key: u64,
