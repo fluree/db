@@ -2,89 +2,89 @@
   "schema_version": 1,
   "label": "phase-1-pre",
   "git_sha": "62ef96c8e",
-  "captured_at": "2026-06-17T15:57:39.992960+00:00",
+  "captured_at": "2026-06-17T17:05:49.381087+00:00",
   "profile": "quick",
   "scale": "small",
   "entries": {
     "query_overlay_matrix/count_base/small": {
-      "mean_ns": 37182.97975775928,
-      "median_ns": 36915.2,
+      "mean_ns": 38600.32984244671,
+      "median_ns": 38895.57746370096,
       "mem": {
-        "peak_bytes": 5679054,
-        "scenario_peak_bytes": 5033131,
-        "total_allocated_bytes": 18685722112
+        "peak_bytes": 7335109,
+        "scenario_peak_bytes": 6689336,
+        "total_allocated_bytes": 18550393007
       }
     },
     "query_overlay_matrix/count_novelty/small": {
-      "mean_ns": 15795247.13125,
-      "median_ns": 15762634.109375,
+      "mean_ns": 15478207.072727274,
+      "median_ns": 15410225.393939396,
       "mem": {
-        "peak_bytes": 31008393,
+        "peak_bytes": 31012820,
         "scenario_peak_bytes": 9502081,
-        "total_allocated_bytes": 33002670441
+        "total_allocated_bytes": 33625942518
       }
     },
     "query_overlay_matrix/count_overlay/small": {
-      "mean_ns": 2490419.4162436547,
-      "median_ns": 2482851.736040609,
+      "mean_ns": 2463414.0886138612,
+      "median_ns": 2455096.641089109,
       "mem": {
-        "peak_bytes": 9247551,
-        "scenario_peak_bytes": 5304396,
-        "total_allocated_bytes": 6929299899
+        "peak_bytes": 10906840,
+        "scenario_peak_bytes": 6962434,
+        "total_allocated_bytes": 7065548748
       }
     },
     "query_overlay_matrix/groupby_base/small": {
-      "mean_ns": 888095.9301247771,
-      "median_ns": 886992.8698752228,
+      "mean_ns": 891149.977935943,
+      "median_ns": 890488.1370106762,
       "mem": {
-        "peak_bytes": 6278754,
-        "scenario_peak_bytes": 5249607,
-        "total_allocated_bytes": 39400976971
+        "peak_bytes": 7938043,
+        "scenario_peak_bytes": 6906133,
+        "total_allocated_bytes": 39492971038
       }
     },
     "query_overlay_matrix/groupby_novelty/small": {
-      "mean_ns": 3746405321.0,
-      "median_ns": 3743371979.5,
+      "mean_ns": 3671858241.8,
+      "median_ns": 3670381396.0,
       "mem": {
-        "peak_bytes": 31764026,
+        "peak_bytes": 31768997,
         "scenario_peak_bytes": 10257541,
-        "total_allocated_bytes": 206025105429
+        "total_allocated_bytes": 206075690328
       }
     },
     "query_overlay_matrix/groupby_overlay/small": {
-      "mean_ns": 1808589537.3,
-      "median_ns": 1806758145.5,
+      "mean_ns": 1783503358.2,
+      "median_ns": 1784424125.0,
       "mem": {
-        "peak_bytes": 10209653,
-        "scenario_peak_bytes": 4800611,
-        "total_allocated_bytes": 19002513710
+        "peak_bytes": 11870046,
+        "scenario_peak_bytes": 6456033,
+        "total_allocated_bytes": 19051447597
       }
     },
     "query_overlay_matrix/star_base/small": {
-      "mean_ns": 645680.5822997417,
-      "median_ns": 646097.4909560723,
+      "mean_ns": 646657.3064184852,
+      "median_ns": 645385.5372272143,
       "mem": {
-        "peak_bytes": 5829429,
-        "scenario_peak_bytes": 4951043,
-        "total_allocated_bytes": 73224831486
+        "peak_bytes": 7487614,
+        "scenario_peak_bytes": 6607569,
+        "total_allocated_bytes": 73503631516
       }
     },
     "query_overlay_matrix/star_novelty/small": {
-      "mean_ns": 7636493054.2,
-      "median_ns": 7619608812.5,
+      "mean_ns": 7442337900.1,
+      "median_ns": 7432051208.0,
       "mem": {
-        "peak_bytes": 33200679,
-        "scenario_peak_bytes": 11694126,
-        "total_allocated_bytes": 446871848299
+        "peak_bytes": 33205650,
+        "scenario_peak_bytes": 11694670,
+        "total_allocated_bytes": 446921690206
       }
     },
     "query_overlay_matrix/star_overlay/small": {
-      "mean_ns": 3796779000.0,
-      "median_ns": 3775757875.0,
+      "mean_ns": 3734013004.2,
+      "median_ns": 3706487812.5,
       "mem": {
-        "peak_bytes": 10208684,
-        "scenario_peak_bytes": 5761415,
-        "total_allocated_bytes": 31140053243
+        "peak_bytes": 11869077,
+        "scenario_peak_bytes": 7417941,
+        "total_allocated_bytes": 31189856852
       }
     }
   }
