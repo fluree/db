@@ -183,6 +183,35 @@ pub struct IdempotencyContext {
     pub body_hash: [u8; 32],
 }
 
+/// Cached outcome of a previously-processed request, keyed in
+/// [`NameServiceState::idempotency`] by its [`IdempotencyCacheKey`].
+/// One enum spanning both success and failure cases — `K` was
+/// processed once, here's what happened. Retries with the same
+/// `K` and matching `body_cid` short-circuit to the cached
+/// outcome without re-running.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum ApplyOutcome {
+    /// Request applied successfully; head advanced to the
+    /// referenced commit.
+    Applied(ApplyRecord),
+    /// Request was poisoned — permanent failure or retry budget
+    /// exhausted. Future retries with the same `K` get the
+    /// cached failure.
+    Failed(PoisonRecord),
+}
+
+impl ApplyOutcome {
+    /// Body CID this outcome was recorded against. `None` only
+    /// for legacy [`Command::AdvanceRef`] applies that pre-date
+    /// the queue work; goes away when AdvanceRef is removed.
+    pub fn body_cid(&self) -> Option<&ContentId> {
+        match self {
+            ApplyOutcome::Applied(r) => r.body_cid.as_ref(),
+            ApplyOutcome::Failed(r) => Some(&r.body_cid),
+        }
+    }
+}
+
 /// One pending transactor request awaiting worker processing. The
 /// body itself lives in shared CAS — only the CID and a kind
 /// discriminator travel through Raft. See the design doc for the
@@ -310,7 +339,10 @@ pub struct NameServiceState {
     /// stay in place so the name can't be reused until
     /// [`Command::PurgeLedger`] runs.
     pub retracted: HashSet<RefKey>,
-    pub idempotency: HashMap<IdempotencyCacheKey, ApplyRecord>,
+    /// One cache spanning successful and failed applies — see
+    /// [`ApplyOutcome`]. A retry of `K` with matching `body_cid`
+    /// returns the cached variant without re-running.
+    pub idempotency: HashMap<IdempotencyCacheKey, ApplyOutcome>,
     /// Per-branch FIFO of transactor work pending worker processing.
     /// See `docs/design/raft-command-queue.md`.
     #[serde(default)]
@@ -325,12 +357,6 @@ pub struct NameServiceState {
     /// `ApplyHead` apply that observes them.
     #[serde(default)]
     pub recently_cleared: HashMap<RefKey, ClearReason>,
-    /// Failed-outcome idempotency entries, keyed alongside the
-    /// successful [`Self::idempotency`] cache. Populated by
-    /// `Command::PoisonQueueEntry`; consulted alongside the
-    /// success cache on every `Command::EnqueueCommand`.
-    #[serde(default)]
-    pub poisoned: HashMap<IdempotencyCacheKey, PoisonRecord>,
     /// Lifetime count of idempotency entries removed by
     /// `Command::EvictIdempotency`.
     #[serde(default)]
@@ -785,7 +811,7 @@ pub fn apply(state: &mut NameServiceState, command: Command, log_index: u64) -> 
         // commits; see docs/design/raft-command-queue.md.
         Command::EnqueueCommand(args) => apply_enqueue_command(state, log_index, args),
         Command::ApplyHead(args) => apply_head(state, log_index, args),
-        Command::PoisonQueueEntry(_) => todo!("apply_poison_queue_entry"),
+        Command::PoisonQueueEntry(args) => apply_poison_queue_entry(state, log_index, args),
         Command::EvictIdempotency { .. } => todo!("apply_evict_idempotency"),
     }
 }
@@ -812,18 +838,30 @@ fn advance_ref(
     // so a duplicate proposal is a no-op. Release list still flows
     // through: it's about *other* submissions' cleanup, independent
     // of this command's apply outcome.
+    //
+    // AdvanceRef only matches `Applied` cached outcomes — a
+    // `Failed` cache entry under the same key means the caller
+    // shouldn't be using AdvanceRef (the queue path is what
+    // produces Failed entries). Treat as a body-hash mismatch
+    // since the comparison is undefined.
     if let Some(ctx) = &idempotency {
-        if let Some(existing) = state.idempotency.get(&ctx.key) {
-            if existing.body_hash != ctx.body_hash {
+        match state.idempotency.get(&ctx.key) {
+            Some(ApplyOutcome::Applied(existing)) => {
+                if existing.body_hash != ctx.body_hash {
+                    return Response::BodyHashMismatch;
+                }
+                return Response::Applied {
+                    head_t: existing.t,
+                    head_id: existing.head.clone(),
+                    accepted: 0,
+                    release,
+                    tally: existing.tally.clone(),
+                };
+            }
+            Some(ApplyOutcome::Failed(_)) => {
                 return Response::BodyHashMismatch;
             }
-            return Response::Applied {
-                head_t: existing.t,
-                head_id: existing.head.clone(),
-                accepted: 0,
-                release,
-                tally: existing.tally.clone(),
-            };
+            None => {}
         }
     }
 
@@ -872,7 +910,7 @@ fn advance_ref(
     if let Some(ctx) = idempotency {
         state.idempotency.insert(
             ctx.key,
-            ApplyRecord {
+            ApplyOutcome::Applied(ApplyRecord {
                 body_hash: ctx.body_hash,
                 body_cid: None,
                 recorded_at_millis: applied_at_millis,
@@ -880,7 +918,7 @@ fn advance_ref(
                 t,
                 recorded_index: log_index,
                 tally: tally.clone(),
-            },
+            }),
         );
     }
 
@@ -1229,28 +1267,25 @@ fn apply_enqueue_command(
     let full_ledger_id = format_ledger_id(&ledger_id, &branch);
     let ref_key = RefKey::new(&ledger_id, &branch);
 
-    // 1. Idempotency cache — short-circuit on hit. The body_cid
-    //    must match; mismatched bodies under the same key are a
-    //    client bug we surface rather than silently dedup.
+    // 1. Idempotency cache — one lookup, branch on outcome
+    //    variant. The body_cid must match; mismatched bodies
+    //    under the same key are a client bug we surface rather
+    //    than silently dedup. Legacy AdvanceRef-populated success
+    //    entries have `body_cid: None`; any queue retry against
+    //    one of those can't safely match and surfaces as a
+    //    BodyHashMismatch (the comparison is undefined).
     if let Some(key) = idempotency.as_ref() {
-        if let Some(record) = state.idempotency.get(key) {
-            return match record.body_cid.as_ref() {
-                Some(cached) if cached == &body_cid => {
+        if let Some(outcome) = state.idempotency.get(key) {
+            if outcome.body_cid() != Some(&body_cid) {
+                return Response::BodyHashMismatch;
+            }
+            return match outcome {
+                ApplyOutcome::Applied(record) => {
                     Response::IdempotencyHit { record: record.clone() }
                 }
-                Some(_) => Response::BodyHashMismatch,
-                // Legacy AdvanceRef-populated entries lack body_cid.
-                // A queue-mediated retry that finds one of those
-                // can't safely match; treat as a body collision
-                // since the comparison is undefined.
-                None => Response::BodyHashMismatch,
-            };
-        }
-        if let Some(record) = state.poisoned.get(key) {
-            return if record.body_cid == body_cid {
-                Response::IdempotencyFailed { record: record.clone() }
-            } else {
-                Response::BodyHashMismatch
+                ApplyOutcome::Failed(record) => {
+                    Response::IdempotencyFailed { record: record.clone() }
+                }
             };
         }
         // 2. In-flight queue scan. Same key + same body → ride the
@@ -1316,6 +1351,56 @@ fn apply_enqueue_command(
     }
 }
 
+/// Validate the queue front against the worker's claim and pop it.
+///
+/// Both `ApplyHead` and `PoisonQueueEntry` consume the same front entry
+/// after the same three-step check (admin-preemption marker, queue
+/// existence, front-id match). On any mismatch this returns the
+/// `Response::QueueDesync` the caller should propagate.
+fn pop_validated_front(
+    state: &mut NameServiceState,
+    ref_key: &RefKey,
+    full_ledger_id: &str,
+    requested_queue_id: u64,
+) -> Result<QueueEntry, Response> {
+    if let Some(clear_reason) = state.recently_cleared.remove(ref_key) {
+        return Err(Response::QueueDesync {
+            ledger_id: full_ledger_id.into(),
+            requested_queue_id,
+            reason: DesyncReason::QueueCleared {
+                reason: clear_reason,
+            },
+        });
+    }
+
+    let queue = match state.queues.get_mut(ref_key) {
+        Some(q) if !q.is_empty() => q,
+        _ => {
+            return Err(Response::QueueDesync {
+                ledger_id: full_ledger_id.into(),
+                requested_queue_id,
+                reason: DesyncReason::InvariantViolated {
+                    description: "queue missing or empty without recently_cleared marker"
+                        .into(),
+                },
+            });
+        }
+    };
+
+    let actual_front = queue.front().expect("non-empty checked above").queue_id;
+    if actual_front != requested_queue_id {
+        return Err(Response::QueueDesync {
+            ledger_id: full_ledger_id.into(),
+            requested_queue_id,
+            reason: DesyncReason::WrongFront {
+                actual_queue_id: actual_front,
+            },
+        });
+    }
+
+    Ok(queue.pop_front().expect("non-empty checked above"))
+}
+
 fn apply_head(
     state: &mut NameServiceState,
     log_index: u64,
@@ -1332,55 +1417,14 @@ fn apply_head(
     let full_ledger_id = format_ledger_id(&ledger_id, &branch);
     let ref_key = RefKey::new(&ledger_id, &branch);
 
-    // 1. Admin command preempted between worker stage and apply.
-    //    The marker is one-shot — consume it as we report.
-    if let Some(clear_reason) = state.recently_cleared.remove(&ref_key) {
-        return Response::QueueDesync {
-            ledger_id: full_ledger_id,
-            requested_queue_id: queue_id,
-            reason: DesyncReason::QueueCleared {
-                reason: clear_reason,
-            },
-        };
-    }
-
-    // 2. Queue must exist with an entry. An empty or missing queue
-    //    without a `recently_cleared` marker is a state-machine
-    //    invariant violation — log loudly rather than recover.
-    let queue = match state.queues.get_mut(&ref_key) {
-        Some(q) if !q.is_empty() => q,
-        _ => {
-            return Response::QueueDesync {
-                ledger_id: full_ledger_id,
-                requested_queue_id: queue_id,
-                reason: DesyncReason::InvariantViolated {
-                    description: "queue missing or empty without recently_cleared marker"
-                        .into(),
-                },
-            };
-        }
+    let entry = match pop_validated_front(state, &ref_key, &full_ledger_id, queue_id) {
+        Ok(entry) => entry,
+        Err(resp) => return resp,
     };
 
-    // 3. Front must match `queue_id`. Mismatch usually means a
-    //    former leader's worker already applied this one.
-    let actual_front = queue.front().expect("non-empty checked above").queue_id;
-    if actual_front != queue_id {
-        return Response::QueueDesync {
-            ledger_id: full_ledger_id,
-            requested_queue_id: queue_id,
-            reason: DesyncReason::WrongFront {
-                actual_queue_id: actual_front,
-            },
-        };
-    }
-
-    // 4. Pop the front. Front carries the metadata we need for
-    //    idempotency caching (key + body_cid).
-    let entry = queue.pop_front().expect("non-empty checked above");
-
-    // 5. Advance the branch's `RefEntry`, carrying forward index
-    //    + lineage state from any existing entry (matches the
-    //    self-healing pattern in `advance_ref`).
+    // Advance the branch's `RefEntry`, carrying forward index +
+    // lineage state from any existing entry (matches the
+    // self-healing pattern in `advance_ref`).
     let (prior_index, prior_source, prior_branches) = state
         .refs
         .get(&ref_key)
@@ -1399,21 +1443,19 @@ fn apply_head(
         },
     );
 
-    // 6. Self-healing branch registration on the `LedgerRecord`.
-    //    Matches `advance_ref`'s behaviour so the queue path
-    //    doesn't diverge.
+    // Self-healing branch registration on the `LedgerRecord`,
+    // matching `advance_ref`'s behaviour so the queue path doesn't
+    // diverge.
     if let Some(ledger) = state.ledgers.get_mut(&ledger_id) {
         if !ledger.branches.contains(&branch) {
             ledger.branches.push(branch.clone());
         }
     }
 
-    // 7. Record the success in the idempotency cache, keyed by
-    //    the entry's idempotency key (if any).
     if let Some(key) = entry.idempotency {
         state.idempotency.insert(
             key,
-            ApplyRecord {
+            ApplyOutcome::Applied(ApplyRecord {
                 body_hash: [0u8; 32],
                 body_cid: Some(entry.body_cid),
                 recorded_at_millis: applied_at_millis,
@@ -1421,7 +1463,7 @@ fn apply_head(
                 t: commit_t,
                 recorded_index: log_index,
                 tally: None,
-            },
+            }),
         );
     }
 
@@ -1429,6 +1471,45 @@ fn apply_head(
         ledger_id: full_ledger_id,
         commit_id,
         commit_t,
+    }
+}
+
+fn apply_poison_queue_entry(
+    state: &mut NameServiceState,
+    log_index: u64,
+    args: PoisonQueueEntryArgs,
+) -> Response {
+    let PoisonQueueEntryArgs {
+        ledger_id,
+        branch,
+        queue_id,
+        reason,
+        applied_at_millis,
+    } = args;
+    let full_ledger_id = format_ledger_id(&ledger_id, &branch);
+    let ref_key = RefKey::new(&ledger_id, &branch);
+
+    let entry = match pop_validated_front(state, &ref_key, &full_ledger_id, queue_id) {
+        Ok(entry) => entry,
+        Err(resp) => return resp,
+    };
+
+    if let Some(key) = entry.idempotency {
+        state.idempotency.insert(
+            key,
+            ApplyOutcome::Failed(PoisonRecord {
+                body_cid: entry.body_cid,
+                reason: reason.clone(),
+                recorded_index: log_index,
+                recorded_at_millis: applied_at_millis,
+            }),
+        );
+    }
+
+    Response::Poisoned {
+        ledger_id: full_ledger_id,
+        queue_id,
+        reason,
     }
 }
 
@@ -2668,7 +2749,7 @@ mod tests {
         // Pre-populate a cached success record with body_cid set.
         state.idempotency.insert(
             key.clone(),
-            ApplyRecord {
+            ApplyOutcome::Applied(ApplyRecord {
                 body_hash: [0u8; 32],
                 body_cid: Some(cid(7)),
                 recorded_at_millis: 500,
@@ -2676,7 +2757,7 @@ mod tests {
                 t: 5,
                 recorded_index: 9,
                 tally: None,
-            },
+            }),
         );
         let resp = apply(
             &mut state,
@@ -2708,7 +2789,7 @@ mod tests {
         let key = body_kid("k1");
         state.idempotency.insert(
             key.clone(),
-            ApplyRecord {
+            ApplyOutcome::Applied(ApplyRecord {
                 body_hash: [0u8; 32],
                 body_cid: Some(cid(7)),
                 recorded_at_millis: 500,
@@ -2716,7 +2797,7 @@ mod tests {
                 t: 5,
                 recorded_index: 9,
                 tally: None,
-            },
+            }),
         );
         let resp = apply(
             &mut state,
@@ -2893,7 +2974,10 @@ mod tests {
         assert!(ledger.branches.contains(&"main".to_string()));
 
         // Idempotency cached with body_cid set (the new queue path).
-        let record = state.idempotency.get(&key).expect("idempotency cached");
+        let record = match state.idempotency.get(&key).expect("idempotency cached") {
+            ApplyOutcome::Applied(r) => r,
+            ApplyOutcome::Failed(_) => panic!("expected Applied outcome"),
+        };
         assert_eq!(record.body_cid.as_ref(), Some(&cid(7)));
         assert_eq!(record.head, cid(42));
     }
@@ -2997,6 +3081,179 @@ mod tests {
         let resp = apply(
             &mut state,
             apply_head_cmd("test/db", "main", 0, cid(42), 10),
+            2,
+        );
+        assert!(matches!(
+            resp,
+            Response::QueueDesync {
+                reason: DesyncReason::InvariantViolated { .. },
+                ..
+            }
+        ));
+    }
+
+    // ====================================================================
+    // PoisonQueueEntry
+    // ====================================================================
+
+    fn poison_cmd(
+        ledger_id: &str,
+        branch: &str,
+        queue_id: u64,
+        reason: PoisonReason,
+    ) -> Command {
+        Command::PoisonQueueEntry(PoisonQueueEntryArgs {
+            ledger_id: ledger_id.into(),
+            branch: branch.into(),
+            queue_id,
+            reason,
+            applied_at_millis: 2_000,
+        })
+    }
+
+    fn body_malformed(msg: &str) -> PoisonReason {
+        PoisonReason::BodyMalformed { error: msg.into() }
+    }
+
+    #[test]
+    fn apply_poison_pops_front_and_caches_failure() {
+        let mut state = NameServiceState::new();
+        apply(&mut state, create_ledger("test/db"), 1);
+        let key = body_kid("k1");
+        let enq = apply(
+            &mut state,
+            enqueue(
+                "test/db",
+                "main",
+                7,
+                Some(IdempotencyContext {
+                    key: key.clone(),
+                    body_hash: [0u8; 32],
+                }),
+            ),
+            2,
+        );
+        let queue_id = match enq {
+            Response::Enqueued { queue_id, .. } => queue_id,
+            other => panic!("not Enqueued: {other:?}"),
+        };
+
+        let resp = apply(
+            &mut state,
+            poison_cmd("test/db", "main", queue_id, body_malformed("bad turtle")),
+            3,
+        );
+        match resp {
+            Response::Poisoned {
+                ledger_id,
+                queue_id: qid,
+                reason: PoisonReason::BodyMalformed { error },
+            } => {
+                assert_eq!(ledger_id, "test/db:main");
+                assert_eq!(qid, queue_id);
+                assert_eq!(error, "bad turtle");
+            }
+            other => panic!("expected Poisoned, got {other:?}"),
+        }
+
+        let ref_key = RefKey::new("test/db", "main");
+        assert!(state.queues.get(&ref_key).map(VecDeque::is_empty).unwrap_or(true));
+        // Ref untouched — no head advance on poison.
+        assert!(state.refs.get(&ref_key).is_none());
+
+        let record = match state.idempotency.get(&key).expect("idempotency cached") {
+            ApplyOutcome::Failed(r) => r,
+            ApplyOutcome::Applied(_) => panic!("expected Failed outcome"),
+        };
+        assert_eq!(record.body_cid, cid(7));
+        assert_eq!(record.recorded_index, 3);
+        assert!(matches!(
+            record.reason,
+            PoisonReason::BodyMalformed { .. }
+        ));
+    }
+
+    #[test]
+    fn apply_poison_without_idempotency_still_pops_front() {
+        let mut state = NameServiceState::new();
+        apply(&mut state, create_ledger("test/db"), 1);
+        let enq = apply(&mut state, enqueue("test/db", "main", 7, None), 2);
+        let queue_id = match enq {
+            Response::Enqueued { queue_id, .. } => queue_id,
+            other => panic!("not Enqueued: {other:?}"),
+        };
+
+        apply(
+            &mut state,
+            poison_cmd("test/db", "main", queue_id, body_malformed("nope")),
+            3,
+        );
+
+        let ref_key = RefKey::new("test/db", "main");
+        assert!(state.queues.get(&ref_key).map(VecDeque::is_empty).unwrap_or(true));
+        // No idempotency key means nothing recorded — the cache stays empty.
+        assert!(state.idempotency.is_empty());
+    }
+
+    #[test]
+    fn apply_poison_wrong_front_when_queue_id_mismatches() {
+        let mut state = NameServiceState::new();
+        apply(&mut state, create_ledger("test/db"), 1);
+        apply(&mut state, enqueue("test/db", "main", 7, None), 2);
+
+        let resp = apply(
+            &mut state,
+            poison_cmd("test/db", "main", 9_999, body_malformed("x")),
+            3,
+        );
+        match resp {
+            Response::QueueDesync {
+                reason: DesyncReason::WrongFront { actual_queue_id },
+                ..
+            } => assert_eq!(actual_queue_id, 0),
+            other => panic!("expected WrongFront, got {other:?}"),
+        }
+        let ref_key = RefKey::new("test/db", "main");
+        assert_eq!(state.queues.get(&ref_key).unwrap().len(), 1);
+        assert!(state.idempotency.is_empty());
+    }
+
+    #[test]
+    fn apply_poison_queue_cleared_when_admin_preempted() {
+        let mut state = NameServiceState::new();
+        apply(&mut state, create_ledger("test/db"), 1);
+        apply(&mut state, enqueue("test/db", "main", 7, None), 2);
+
+        let ref_key = RefKey::new("test/db", "main");
+        state.queues.remove(&ref_key);
+        state
+            .recently_cleared
+            .insert(ref_key.clone(), ClearReason::BranchPurged);
+
+        let resp = apply(
+            &mut state,
+            poison_cmd("test/db", "main", 0, body_malformed("x")),
+            3,
+        );
+        match resp {
+            Response::QueueDesync {
+                reason: DesyncReason::QueueCleared {
+                    reason: ClearReason::BranchPurged,
+                },
+                ..
+            } => {}
+            other => panic!("expected QueueCleared(BranchPurged), got {other:?}"),
+        }
+        assert!(state.recently_cleared.get(&ref_key).is_none());
+    }
+
+    #[test]
+    fn apply_poison_invariant_violated_when_queue_empty_without_marker() {
+        let mut state = NameServiceState::new();
+        apply(&mut state, create_ledger("test/db"), 1);
+        let resp = apply(
+            &mut state,
+            poison_cmd("test/db", "main", 0, body_malformed("x")),
             2,
         );
         assert!(matches!(
