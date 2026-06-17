@@ -3,16 +3,13 @@
 //! Writes N-Triples, Turtle, N-Quads, or TriG directly to a `Write` sink,
 //! one leaflet-batch at a time.  Memory usage is O(leaflet_size), not O(dataset).
 
-use fluree_db_binary_index::read::types::{resolve_overlay_ops, sort_overlay_ops};
 use fluree_db_binary_index::{
     BinaryCursor, BinaryFilter, BinaryIndexStore, ColumnBatch, ColumnProjection, RunSortOrder,
 };
 use fluree_db_core::dict_novelty::DictNovelty;
 use fluree_db_core::value::FlakeValue;
 use fluree_db_core::{DecodeKind, Flake, GraphId, OType, OverlayProvider, Sid};
-use fluree_db_query::binary_scan::{
-    translate_overlay_flakes_with_untranslated, EphemeralPredicateMap,
-};
+use fluree_db_query::binary_scan::{resolve_overlay, EphemeralPredicateMap};
 use fluree_vocab::xsd;
 use std::collections::{BTreeMap, HashMap};
 use std::io::{self, Write};
@@ -83,24 +80,18 @@ fn apply_time_travel(
 ) -> (EphemeralPredicateMap, Vec<Flake>) {
     cursor.set_to_t(config.to_t);
     if let Some(overlay) = config.overlay {
-        let (mut ops, untranslated, ephemeral_preds) = translate_overlay_flakes_with_untranslated(
+        let (ops, untranslated, ephemeral_preds) = resolve_overlay(
             overlay,
             store,
             config.dict_novelty,
             None, // no runtime_small_dicts during export
             config.to_t,
             config.g_id,
+            RunSortOrder::Spot,
         );
         if !ops.is_empty() {
-            sort_overlay_ops(&mut ops, RunSortOrder::Spot);
-            // Collapse assert/retract lifecycles to one op per fact key before
-            // handing ops to the cursor. An insert-then-upsert held entirely in
-            // novelty places a fact's assert and its retract both in the overlay
-            // (same FactKeyV3); `set_overlay_ops` requires — and debug-asserts —
-            // at most one op per fact key, and `merge_overlay_into_batch` would
-            // otherwise process both and leak the stale value. Mirrors the query
-            // fast path's `collect_resolved_overlay_ops`.
-            resolve_overlay_ops(&mut ops);
+            // resolve_overlay already sorted + resolved assert/retract lifecycles
+            // (one op per FactKeyV3), so the ops are ready for the cursor.
             cursor.set_overlay_ops(ops);
             cursor.set_epoch(overlay.epoch());
         }

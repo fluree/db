@@ -2024,15 +2024,15 @@ impl Operator for BinaryScanOperator {
 
         // Overlay: translate novelty flakes to OverlayOp and attach to cursor.
         if ctx.overlay.is_some() {
-            let (mut ops, mut untranslated, ephemeral_preds) =
-                translate_overlay_flakes_with_untranslated(
-                    ctx.overlay(),
-                    &store_arc,
-                    ctx.dict_novelty.as_ref(),
-                    ctx.runtime_small_dicts,
-                    ctx.to_t,
-                    self.g_id,
-                );
+            let (ops, mut untranslated, ephemeral_preds) = resolve_overlay(
+                ctx.overlay(),
+                &store_arc,
+                ctx.dict_novelty.as_ref(),
+                ctx.runtime_small_dicts,
+                ctx.to_t,
+                self.g_id,
+                order,
+            );
 
             // Extend p_sids table with novelty-only predicates so that ephemeral
             // p_ids from overlay ops can be decoded back to Sids during row binding.
@@ -2046,8 +2046,7 @@ impl Operator for BinaryScanOperator {
             }
 
             if !ops.is_empty() {
-                sort_overlay_ops(&mut ops, order);
-                resolve_overlay_ops(&mut ops);
+                // resolve_overlay already sorted + resolved the ops.
                 let epoch = ctx.overlay().epoch();
                 cursor.set_overlay_ops(ops);
                 cursor.set_epoch(epoch);
@@ -2315,23 +2314,29 @@ impl Translation {
     }
 }
 
-/// Translate overlay flakes to V3 overlay ops, also returning flakes that cannot be translated
-/// and the mapping of novelty-only predicate IRIs to ephemeral p_ids.
+/// The single overlay producer: translate novelty flakes into **resolved** V3
+/// overlay ops, returning flakes that cannot be encoded plus the novelty-only
+/// predicate IRI → ephemeral p_id map.
 ///
-/// Some FlakeValue variants (notably `FlakeValue::Vector`) are not representable in the V3
-/// overlay encoding. Those flakes are returned as fully materialized overlay-only rows so the
-/// query engine can still see them (after the indexed cursor is exhausted).
+/// Each flake is translated to an `OverlayOp`; the ops are then sorted by
+/// `order` and run through `resolve_overlay_ops` so at most one op survives per
+/// `FactKeyV3` (latest-t-wins). Callers hand the result straight to
+/// `BinaryCursor::set_overlay_ops` — the resolve step is internal and can no
+/// longer be skipped at a call site (the omission that let export leak stale
+/// upsert values; see `it_select_star_novelty_retract`).
 ///
-/// The `ephemeral_preds` map contains predicate IRI → ephemeral p_id for predicates that
-/// don't exist in the persisted index dictionary. Callers must use this to extend their
-/// p_id → Sid lookup tables so that novelty-only predicates can be resolved during decode.
-pub fn translate_overlay_flakes_with_untranslated(
+/// `FlakeValue` variants not representable in V3 (notably `FlakeValue::Vector`,
+/// and novelty-only language tags, #1273) are returned in the untranslated list
+/// for the caller's raw-flake post-pass. The ephemeral-predicate map lets
+/// callers extend their p_id → Sid tables so novelty-only predicates decode.
+pub fn resolve_overlay(
     overlay: &dyn OverlayProvider,
     store: &Arc<BinaryIndexStore>,
     dict_novelty: Option<&Arc<fluree_db_core::dict_novelty::DictNovelty>>,
     runtime_small_dicts: Option<&RuntimeSmallDicts>,
     to_t: i64,
     g_id: GraphId,
+    order: RunSortOrder,
 ) -> (Vec<OverlayOp>, Vec<Flake>, HashMap<Sid, u32>) {
     let mut ops = Vec::new();
     let mut untranslated = Vec::new();
@@ -2342,7 +2347,7 @@ pub fn translate_overlay_flakes_with_untranslated(
 
     overlay.for_each_overlay_flake(
         g_id,
-        fluree_db_core::IndexType::Spot,
+        sort_order_to_index_type(order),
         None,
         None,
         true,
@@ -2381,6 +2386,13 @@ pub fn translate_overlay_flakes_with_untranslated(
             }
         },
     );
+
+    // Sort + resolve lifecycles here so no consumer can skip it: at most one op
+    // per FactKeyV3 (latest-t-wins), ready for BinaryCursor::set_overlay_ops.
+    if !ops.is_empty() {
+        sort_overlay_ops(&mut ops, order);
+        resolve_overlay_ops(&mut ops);
+    }
 
     (ops, untranslated, ephemeral_preds)
 }
