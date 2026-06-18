@@ -378,6 +378,108 @@ async fn main() -> Result<()> {
 }
 ```
 
+### Streaming Query Results (NDJSON)
+
+The buffered `.query()` paths above collect the whole result set into a
+`QueryResult` before returning. For large result sets or long-running queries,
+the streaming API instead formats each batch as a newline-delimited JSON
+("NDJSON") record and pushes it through an `mpsc` channel, so rows reach the
+consumer incrementally and bytes keep flowing while the query runs. This is the
+in-process producer behind the server's
+[`/stream/query` endpoint](../api/streaming-query.md); see that reference for
+the record protocol (`head` → `row`* → terminal `end`/`error`) and the stable
+error codes.
+
+The flow is two steps, mirroring the server handler:
+
+1. **`plan_stream_query(&db, &input)`** — parse, validate, and plan. Parse
+   errors and shapes the streaming path does not support (ASK,
+   CONSTRUCT/DESCRIBE, `selectOne`, JSON-LD hydration, history) surface here,
+   *before* any record is emitted — so a caller can map them to a clean error
+   up front.
+2. **`run_stream_query(ledger, plan, tracker, options, tx)`** — typically
+   `tokio::spawn`ed. It sends a `head` record, then one `row` record per result
+   row as batches arrive, then exactly one terminal record (`end` on success,
+   `error` on failure). It takes an owned `LedgerState` so it can outlive the
+   call site. Backpressure is natural: a full channel suspends the producer.
+
+```rust
+use fluree_db_api::{
+    FlureeBuilder, GraphDb, OwnedStreamQuery, QueryExecutionOptions, Result, Tracker,
+    TrackingOptions,
+};
+use bytes::Bytes;
+use std::sync::Arc;
+use tokio::sync::mpsc;
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let fluree = Arc::new(FlureeBuilder::file("./data").build()?);
+
+    // Plan against a borrowed GraphDb, then move the owned LedgerState into the
+    // spawned producer (GraphDb borrows the state, so plan first).
+    let ledger_state = fluree
+        .ledger_cached("mydb:main")
+        .await?
+        .snapshot()
+        .await
+        .to_ledger_state();
+
+    let input = OwnedStreamQuery::Sparql(
+        "SELECT ?s ?name WHERE { ?s <http://schema.org/name> ?name }".to_string(),
+    );
+    // JSON-LD form: OwnedStreamQuery::JsonLd(serde_json::Value)
+
+    let plan = {
+        let db = GraphDb::from_ledger_state(&ledger_state);
+        fluree.plan_stream_query(&db, &input).await? // 4xx-worthy errors surface here
+    };
+
+    let (tx, mut rx) = mpsc::channel::<Bytes>(64);
+    let producer = Arc::clone(&fluree);
+    tokio::spawn(async move {
+        producer
+            .run_stream_query(
+                ledger_state,
+                plan,
+                Tracker::new(TrackingOptions::all_enabled()), // time + fuel on records
+                QueryExecutionOptions::new(),                 // optional cancellation handle
+                tx,
+            )
+            .await;
+    });
+
+    // Each `Bytes` is one (or more) NDJSON line(s). Treat the absence of a
+    // terminal `end`/`error` record as a truncated stream, not success.
+    while let Some(chunk) = rx.recv().await {
+        print!("{}", String::from_utf8_lossy(&chunk));
+    }
+    Ok(())
+}
+```
+
+> **Heartbeats** are injected by the *transport* layer (the HTTP server), not by
+> `run_stream_query`. An embedder consuming the channel directly gets only
+> `head`/`row`/terminal records; add your own keep-alive if you tunnel the
+> stream through an idle-timing proxy.
+
+**Multi-ledger / `from` / policy queries** use the dataset variant. Build a
+policy-wrapped `DataSetDb` first, then plan and run against it:
+
+```rust
+// JSON-LD with `from`/`fromNamed`, multi-ledger, or an identity/policy input:
+let dataset = fluree.build_stream_dataset(&query_json).await?;
+let input = OwnedStreamQuery::JsonLd(query_json);
+let plan = fluree.plan_stream_query_dataset(&dataset, &input).await?;
+// fluree.run_stream_query_dataset(dataset, plan, tracker, options, tx).await;
+```
+
+`build_stream_dataset` reads the spec from the query body's `from`/`fromNamed`;
+`build_stream_dataset_from_spec` / `build_stream_dataset_for_sparql` take an
+explicit `DatasetSpec` or extract one from SPARQL `FROM`/`FROM NAMED`. Per-graph
+policy rides on the runtime dataset and is enforced identically to the buffered
+dataset path.
+
 ### Update Data
 
 ```rust

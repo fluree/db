@@ -251,6 +251,12 @@ if (!sawTerminal) throw new Error("stream truncated before terminal record");
 
 ### Rust (reqwest)
 
+This is an HTTP *client* consuming the endpoint over the wire. To produce the
+same NDJSON stream **in-process** from the `fluree-db-api` library (without the
+HTTP server), use `Fluree::plan_stream_query` + `run_stream_query` — see
+[Streaming query results (NDJSON)](../getting-started/rust-api.md#streaming-query-results-ndjson)
+in the Rust library guide.
+
 ```rust
 let resp = client
     .post(format!("{base}/v1/fluree/stream/query/{ledger}"))
