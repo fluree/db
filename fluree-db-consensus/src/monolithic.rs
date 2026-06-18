@@ -194,15 +194,18 @@ impl MonolithicCommitter {
         match &request.body {
             TransactionBody::JsonLdInsert(json) => {
                 hasher.update(b"jsonld-insert");
-                hasher.update(json.to_string().as_bytes());
+                serde_json::to_writer(&mut hasher, json)
+                    .expect("Sha256 write is infallible; a parsed Value re-serializes");
             }
             TransactionBody::JsonLdUpsert(json) => {
                 hasher.update(b"jsonld-upsert");
-                hasher.update(json.to_string().as_bytes());
+                serde_json::to_writer(&mut hasher, json)
+                    .expect("Sha256 write is infallible; a parsed Value re-serializes");
             }
             TransactionBody::JsonLdUpdate(json) => {
                 hasher.update(b"jsonld-update");
-                hasher.update(json.to_string().as_bytes());
+                serde_json::to_writer(&mut hasher, json)
+                    .expect("Sha256 write is infallible; a parsed Value re-serializes");
             }
             TransactionBody::TurtleInsert(text) => {
                 hasher.update(b"turtle-insert");
