@@ -160,6 +160,9 @@ impl ValuesOperator {
 
 #[async_trait]
 impl Operator for ValuesOperator {
+    fn plan_children(&self) -> Vec<crate::plan_node::PlanChild<'_>> {
+        vec![crate::plan_node::PlanChild::child(self.child.as_ref())]
+    }
     fn schema(&self) -> &[VarId] {
         &self.schema
     }
@@ -243,6 +246,29 @@ impl Operator for ValuesOperator {
 fn bindings_compatible_for_values(ctx: &ExecutionContext<'_>, a: &Binding, b: &Binding) -> bool {
     if a == b {
         return true;
+    }
+
+    // Encoded scan output vs decoded VALUES constants: normalize the decoded
+    // side to its encoded form and retry the structural comparison.
+    if let Some(store) = crate::object_binding::equality_norm_store(ctx) {
+        let an = crate::object_binding::encoded_equivalent(a, &store);
+        let bn = crate::object_binding::encoded_equivalent(b, &store);
+        if (an.is_some() || bn.is_some()) && an.as_ref().unwrap_or(a) == bn.as_ref().unwrap_or(b) {
+            return true;
+        }
+    }
+
+    // Arena-backed NUM_BIG scan output vs a decoded decimal/bigint constant:
+    // the constant can't encode (handles are per-predicate), so decode the
+    // encoded side and compare by value.
+    if crate::object_binding::is_numbig_encoded(a) || crate::object_binding::is_numbig_encoded(b) {
+        if let Some(gv) = ctx.graph_view() {
+            let am = crate::group_aggregate::materialize_encoded(a, Some(&gv));
+            let bm = crate::group_aggregate::materialize_encoded(b, Some(&gv));
+            if am == bm {
+                return true;
+            }
+        }
     }
 
     match (a, b) {

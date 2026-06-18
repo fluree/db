@@ -77,6 +77,9 @@ pub enum TokenKind {
     /// Integer literal
     Integer(i64),
 
+    /// Integer literal beyond i64 (stored as string; xsd:integer is unbounded)
+    BigInteger(Arc<str>),
+
     /// Decimal literal (stored as string to preserve precision)
     Decimal(Arc<str>),
 
@@ -619,6 +622,7 @@ impl std::fmt::Display for TokenKind {
             TokenKind::Var(s) => write!(f, "?{s}"),
             TokenKind::String(s) => write!(f, "\"{s}\""),
             TokenKind::Integer(n) => write!(f, "{n}"),
+            TokenKind::BigInteger(s) => write!(f, "{s}"),
             TokenKind::Decimal(s) => write!(f, "{s}"),
             TokenKind::Double(n) => write!(f, "{n:e}"),
             TokenKind::LangTag(s) => write!(f, "@{s}"),

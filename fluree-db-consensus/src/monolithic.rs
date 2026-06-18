@@ -14,7 +14,7 @@ use crate::{
 use async_trait::async_trait;
 use fluree_db_api::{
     ApiError, Base64Bytes, CommitRef, Fluree, GovernanceOptions, LedgerHandle, LedgerManager,
-    PolicyContext, PushCommitsRequest,
+    PolicyContext, PushCommitsRequest, RefreshOpts, TransactError,
 };
 use fluree_db_ledger::IndexConfig;
 use moka::future::Cache;
@@ -30,6 +30,44 @@ fn execution_failure(err: ApiError) -> SubmissionError {
         status: err.status_code(),
         message: err.to_string(),
     }
+}
+
+/// Conflicts that heal by reconciling the cached writer state to the durable
+/// nameservice head and re-staging against the fresh state.
+///
+/// A single [`MonolithicCommitter`] with no external writers cannot produce
+/// any of these — the per-ledger write lock + atomic cache replace after
+/// publish keep `verify_sequencing`'s `base.t()` equal to the durable
+/// `head_t`, the head-record CAS uncontended, and namespace allocations
+/// process-serialized. They become reachable only when something outside
+/// this committer's lock writes to the same durable backend:
+///
+/// * **Multiple processes / instances sharing the same nameservice +
+///   storage.** Each instance has its own in-memory cache; their per-ledger
+///   locks don't see each other. `CommitConflict` fires when another
+///   instance advanced the head between this writer's snapshot and its
+///   verify-sequencing read; `PublishLostRace` fires when both reach the
+///   head CAS and one loses; `NamespaceConflict` fires when both allocate
+///   the same first-time namespace code against snapshots that didn't see
+///   the other's commit yet.
+/// * **Out-of-band cache invalidation.** Storage mutated outside this
+///   process (manual restore, point-in-time recovery, sidecar tooling)
+///   leaves the in-memory cache trailing the durable head.
+/// * **Future `Committer` implementations** (Raft, BFT) where concurrent
+///   writers are the design.
+///
+/// In all three, `refresh()` applies the missing commit(s) so the next
+/// attempt targets the real head, and the re-stage picks namespace codes
+/// against the updated registry.
+fn is_retryable_txn_conflict(e: &ApiError) -> bool {
+    matches!(
+        e,
+        ApiError::Transact(
+            TransactError::CommitConflict { .. }
+                | TransactError::PublishLostRace { .. }
+                | TransactError::NamespaceConflict(_)
+        )
+    )
 }
 
 /// Build a [`PolicyContext`] from the request's policy inputs.
@@ -215,41 +253,87 @@ impl MonolithicCommitter {
             .await
             .map_err(execution_failure)?;
 
-        let policy_ctx = build_policy_context(&ledger_handle, &governance).await?;
+        // Bounded reconcile-and-retry around stage + commit.
+        //
+        // Unreachable for a single instance with no external writers — the
+        // per-ledger write lock plus atomic cache replace after publish keep
+        // `verify_sequencing` consistent. See [`is_retryable_txn_conflict`]
+        // for the scenarios this defends (multi-instance shared backends,
+        // out-of-band cache invalidation, future concurrent-writer
+        // `Committer` implementations); in those, `refresh()` applies the
+        // missing commit(s) so the next attempt targets the real head.
+        //
+        // Each attempt rebuilds the policy context (against the post-refresh
+        // snapshot) and the builder from scratch — the body itself is
+        // borrowed each pass, so the per-iteration cost is one extra
+        // `Clone` of `TxnOpts` / `CommitOpts` / `TrackingOptions`.
+        const MAX_TXN_RETRIES: usize = 16;
+        let mut last_error: Option<ApiError> = None;
+        for attempt in 1..=MAX_TXN_RETRIES {
+            let policy_ctx = build_policy_context(&ledger_handle, &governance).await?;
 
-        // The builder API holds the ledger write lock and replaces the cached
-        // state internally for the duration of stage + commit — no manual
-        // lock/clone/replace dance is needed here. Each body variant fixes
-        // both the parser path and the insert/upsert/update semantics.
-        let staged = self.fluree.stage(&ledger_handle);
-        let staged = match &body {
-            TransactionBody::JsonLdInsert(json) => staged.insert(json),
-            TransactionBody::JsonLdUpsert(json) => staged.upsert(json),
-            TransactionBody::JsonLdUpdate(json) => staged.update(json),
-            TransactionBody::TurtleInsert(text) => staged.insert_turtle(text.as_str()),
-            TransactionBody::TurtleUpsert(text) | TransactionBody::TrigUpsert(text) => {
-                staged.upsert_turtle(text.as_str())
+            // The builder API holds the ledger write lock and replaces the cached
+            // state internally for the duration of stage + commit — no manual
+            // lock/clone/replace dance is needed here. Each body variant fixes
+            // both the parser path and the insert/upsert/update semantics.
+            let staged = self.fluree.stage(&ledger_handle);
+            let staged = match &body {
+                TransactionBody::JsonLdInsert(json) => staged.insert(json),
+                TransactionBody::JsonLdUpsert(json) => staged.upsert(json),
+                TransactionBody::JsonLdUpdate(json) => staged.update(json),
+                TransactionBody::TurtleInsert(text) => staged.insert_turtle(text.as_str()),
+                TransactionBody::TurtleUpsert(text) | TransactionBody::TrigUpsert(text) => {
+                    staged.upsert_turtle(text.as_str())
+                }
+                TransactionBody::Sparql(query) => staged.sparql_update(query.as_str()),
+            };
+            let mut builder = staged
+                .txn_opts(txn_opts.clone())
+                .commit_opts(commit_opts.clone())
+                .index_config(self.index_config.clone());
+            if let Some(tracking) = tracking.clone() {
+                builder = builder.tracking(tracking);
             }
-            TransactionBody::Sparql(query) => staged.sparql_update(query.as_str()),
-        };
-        let mut builder = staged
-            .txn_opts(txn_opts)
-            .commit_opts(commit_opts)
-            .index_config(self.index_config.clone());
-        if let Some(tracking) = tracking {
-            builder = builder.tracking(tracking);
-        }
-        if let Some(policy) = policy_ctx {
-            builder = builder.policy(policy);
+            if let Some(policy) = policy_ctx {
+                builder = builder.policy(policy);
+            }
+
+            match builder.execute().await {
+                Ok(result) => {
+                    return Ok(TransactionReceipt {
+                        idempotency_key,
+                        commit: result.receipt,
+                        tally: result.tally,
+                    });
+                }
+                Err(e) if attempt < MAX_TXN_RETRIES && is_retryable_txn_conflict(&e) => {
+                    tracing::warn!(
+                        attempt,
+                        max_attempts = MAX_TXN_RETRIES,
+                        error = %e,
+                        "transaction commit conflict; reconciling cached state and retrying"
+                    );
+                    if let Err(refresh_err) = self
+                        .fluree
+                        .refresh(&ledger_id, RefreshOpts::default())
+                        .await
+                    {
+                        tracing::warn!(
+                            attempt,
+                            error = %refresh_err,
+                            "refresh during commit-conflict retry failed; retrying anyway"
+                        );
+                    }
+                    last_error = Some(e);
+                    continue;
+                }
+                Err(e) => return Err(execution_failure(e)),
+            }
         }
 
-        let result = builder.execute().await.map_err(execution_failure)?;
-
-        Ok(TransactionReceipt {
-            idempotency_key,
-            commit: result.receipt,
-            tally: result.tally,
-        })
+        Err(execution_failure(last_error.unwrap_or_else(|| {
+            ApiError::internal("transaction failed after retries with no captured error")
+        })))
     }
 
     /// Atomically claim an idempotency slot in the cache.

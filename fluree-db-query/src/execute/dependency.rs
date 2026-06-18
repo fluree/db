@@ -5,7 +5,7 @@
 //! and GROUP BY. Variables without downstream dependencies are dead and can
 //! be projected away early.
 
-use crate::ir::{Grouping, Query};
+use crate::ir::{Grouping, Pattern, Query};
 use crate::var_registry::VarId;
 use std::collections::HashSet;
 
@@ -48,6 +48,16 @@ pub fn compute_variable_deps(query: &Query) -> Option<VariableDeps> {
         deps.insert(spec.var);
     }
     let required_sort_vars: Vec<VarId> = deps.iter().copied().collect();
+
+    // Expression-based ORDER BY binds run as a dedicated stage AFTER the
+    // post-aggregation binds, so they are traced FIRST in this backward walk:
+    // tracing their expression inputs keeps the referenced GROUP BY keys,
+    // aggregate outputs, and post-binds alive through grouping/trimming.
+    for (var, expr) in query.order_binds.iter().rev() {
+        if deps.remove(var) {
+            deps.extend(expr.referenced_vars());
+        }
+    }
 
     // Post-aggregation binds (reverse order): trace expression inputs.
     // Record deps BEFORE processing each bind backward, since that
@@ -99,6 +109,13 @@ pub fn compute_variable_deps(query: &Query) -> Option<VariableDeps> {
         deps.extend(group_by.iter().copied());
     }
 
+    // Post-query VALUES joins its rows against the WHERE output directly
+    // above the WHERE tree, so its vars must survive WHERE-level trimming
+    // (otherwise the join degenerates to a cross product).
+    if let Some(Pattern::Values { vars, .. }) = &query.post_values {
+        deps.extend(vars.iter().copied());
+    }
+
     // deps now contains the full set of WHERE-produced variables needed downstream.
     let required_where_vars: Vec<VarId> = deps.iter().copied().collect();
 
@@ -141,6 +158,7 @@ mod tests {
             reasoning: ReasoningConfig::default(),
             grouping: None,
             ordering: Vec::new(),
+            order_binds: Vec::new(),
             limit: None,
             offset: None,
             post_values: None,
@@ -156,6 +174,7 @@ mod tests {
             reasoning: ReasoningConfig::default(),
             grouping: None,
             ordering: Vec::new(),
+            order_binds: Vec::new(),
             limit: None,
             offset: None,
             post_values: None,
@@ -296,6 +315,7 @@ mod tests {
             reasoning: ReasoningConfig::default(),
             grouping: None,
             ordering: Vec::new(),
+            order_binds: Vec::new(),
             limit: None,
             offset: None,
             post_values: None,
@@ -320,6 +340,7 @@ mod tests {
             reasoning: ReasoningConfig::default(),
             grouping: None,
             ordering: Vec::new(),
+            order_binds: Vec::new(),
             limit: None,
             offset: None,
             post_values: None,

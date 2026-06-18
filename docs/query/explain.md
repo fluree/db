@@ -157,45 +157,186 @@ last among sources, minimizing data sent to the remote endpoint.
 
 ## Reading Explain Output
 
-The explain plan shows two sections: the original pattern order and the
-optimized order. Each pattern is annotated with its category and estimate.
+Explain returns a JSON object `{ "query": <echo>, "plan": { ... } }`. The
+`plan` object contains:
 
-Example output for a multi-pattern query:
+| Field                  | Meaning |
+| ---------------------- | ------- |
+| `optimization`         | `"reordered"`, `"unchanged"`, or `"none"` (no statistics) |
+| `statistics-available` | whether HLL statistics were available for cost estimation |
+| `statistics`           | summary stats (e.g. `total-flakes`) |
+| `logical`              | the **compound-aware** join order the planner produces (see below) |
+| `physical`             | the **planned physical operator tree** the executor will build (see below) |
+| `original`             | the query's triple patterns in original order, with selectivity inputs |
+| `optimized`            | the same triples in the planner's chosen order |
+| `execution-hints`      | specialized execution strategies the executor will use (see [Execution Hints](#execution-hints)) |
 
-```
-=== Query Optimization Explain (Generalized) ===
+The `original` and `optimized` arrays are a flattened, triple-level view. The
+`optimized` order is produced by the **same** `reorder_patterns` routine the
+executor uses, so the order shown is the order that runs — there is no separate
+explain-only ordering algorithm.
 
-Statistics available: yes
-Optimization: patterns reordered
+### The `logical` plan
 
---- Original Pattern Order ---
-  [1] ?s :age ?age | category=Source row_count=5000
-  [2] ?s :name ?name | category=Source row_count=10000
-  [3] FILTER((> ?age 25)) | category=Deferred
-  [4] OPTIONAL { ?s :email ?email } | category=Expander multiplier=1.00
+`logical` is the recommended view. Unlike `original`/`optimized` (which flatten
+all triples into one list), it preserves compound structure — `OPTIONAL`,
+`UNION`, `MINUS`, `EXISTS`, subqueries — and shows each node in the planner's
+chosen execution order. It is present even when statistics are unavailable
+(the planner falls back to heuristic estimates). Each node carries:
 
---- Optimized Pattern Order ---
-  [1] ?s :age ?age | category=Source row_count=5000
-  [2] FILTER((> ?age 25)) | category=Deferred
-  [3] ?s :name ?name | category=Source row_count=10000
-  [4] OPTIONAL { ?s :email ?email } | category=Expander multiplier=1.00
+- `kind`: `triple`, `optional`, `union`, `minus`, `exists`, `not-exists`,
+  `subquery`, `filter`, `bind`, `values`, `property-path`, `graph`, `service`,
+  or a search kind.
+- `category`: `source` (produces rows), `reducer` (shrinks), `expander`
+  (grows — e.g. `OPTIONAL`), or `deferred` (`FILTER`/`BIND`).
+- `estimate`: `{ "row-count": N }` for sources, `{ "multiplier": M }` for
+  reducers/expanders.
+- For triples, a `pattern` object (`subject`/`property`/`object`); for compound
+  nodes, a `patterns` array (or `branches` for `UNION`) of child nodes.
+
+Example (`?person :name ?name . OPTIONAL { ?person :email ?email }`):
+
+```jsonc
+"logical": [
+  { "kind": "triple",   "category": "source",
+    "estimate": { "row-count": 50 },
+    "pattern": { "subject": "?person", "property": "ex:name", "object": "?name" } },
+  { "kind": "optional", "category": "expander",
+    "estimate": { "multiplier": 1.0 },
+    "patterns": [
+      { "kind": "triple", "category": "source",
+        "estimate": { "row-count": 50 },
+        "pattern": { "subject": "?person", "property": "ex:email", "object": "?email" } }
+    ] }
+]
 ```
 
 Key things to look for:
 
-- **Source row_count**: Lower values are placed first. If a pattern with a
-  high row count appears early, it may indicate missing statistics or an
-  inherently broad pattern.
-- **Reducer multiplier**: Values below 1.0 indicate the fraction of rows
-  that survive. A MINUS with multiplier 0.90 removes ~10% of rows.
+- **Source `row-count`**: Lower values are placed first. A high row count early
+  in the plan may indicate missing statistics or an inherently broad pattern.
+- **Reducer `multiplier`**: Values below 1.0 indicate the fraction of rows that
+  survive. A MINUS with multiplier 0.90 removes ~10% of rows.
 - **Deferred placement**: FILTERs and BINDs appear immediately after all of
   their input variables become bound. BIND outputs cascade — a BIND placed
   early can enable subsequent FILTERs or BINDs that depend on its target
   variable. If a FILTER appears late, check whether its variables could be
   bound sooner.
-- **Statistics available: no**: Without statistics, the planner uses
-  conservative heuristics. Run at least one indexing cycle to enable
-  statistics-based optimization.
+- **`optimization: "none"`**: No statistics were available, so cost-based
+  reordering is skipped for the `original`/`optimized` arrays. The `logical`
+  view still shows the planner's heuristic order. Run at least one indexing
+  cycle to enable statistics-based optimization.
+
+### The `physical` plan
+
+`physical` is the operator tree the executor will actually build — the
+"join plan". It is produced by building the **real** operator tree (the same
+`build_operator_tree` execution uses) and walking it; the query is **not
+executed** (no scans, no joins run). Because the fast-path / count-planner /
+fold selection happens at build time, `physical` shows what `logical` cannot:
+the chosen physical operators.
+
+Each node has:
+
+- `op`: the operator (e.g. `ProjectOperator`, `HashJoinOperator`,
+  `PropertyJoinOperator`, `CyclicBgpOperator`, `NestedLoopJoinOperator`,
+  `DatasetOperator`, a count or other fast-path operator).
+- `est-rows`: build-time cardinality estimate, when the operator exposes one.
+- `details`: operator-specific attributes (e.g. a scan's `pattern` and planned
+  `index-hint`; a `PropertyJoinOperator`'s fused `predicates`).
+- `children`: child edges, each `{ "rel": ..., "node": { ... } }`.
+
+For an object→subject join, the node carries the planner's hash-join decision,
+so you can see **whether** a hash join was chosen and **why**:
+
+- `hash-join-chosen`: `true` on a `HashJoinOperator`, `false` on a
+  `NestedLoopJoinOperator` that was a hash-join candidate but lost.
+- `hash-join-reason`: `forced-on` / `forced-off` (the `FLUREE_HASH_JOIN` env),
+  `cost-wins`, `probe-too-small`, `scan-ratio-too-high`, `no-probe-stats`, or
+  `subject-driven-forward-join`.
+- `probe-count`, `driving-est`, `scan-ratio`: the cost inputs the planner
+  weighed (present when statistics are available).
+
+For eligible fixed-predicate triangle/square BGPs, the physical plan may show
+`CyclicBgpOperator`. This is a conservative fast path for cyclic joins that
+would otherwise be planned as left-deep nested-loop joins. Its `details` include:
+
+- `strategy`: `cyclic_bgp_join`
+- `shape`: `triangle` or `square`
+- `predicates`: predicates in the detected cyclic block
+- `predicate-row-estimates`: per-predicate row-count estimates, aligned with
+  `predicates`; `null` when statistics are unavailable
+- `enabled`: whether `FLUREE_CYCLIC_BGP` allows the fast path
+- `max-predicate-rows`: the per-predicate row cap used by the fast path
+- `object-only-values`: `iri-ref` for the raw SID-only cycle path, or `encoded`
+  when object-only cycle variables can join on late-materialized encoded object
+  values, not just IRI references
+- `pruning`: `semi_join` when the runtime fast path prunes each edge to values
+  supported by the other edge incident to the same cycle variable
+- `driver-selection`: how the runtime driver edge is selected after pruning
+- `square-strategy`: `wedge_pair_hash` when an encoded square uses exact wedge
+  pair sizing, hashes the smaller opposite-vertex wedge, and streams the other
+  wedge by center
+- `square-build-pairs` / `square-probe-pairs`: exact wedge pair counts for the
+  chosen square decomposition, present after the fast path has opened
+- `square-wedge-pair-cap`: the hard cap for materializing the build wedge
+- `bounded-probe-strategy`: `cascading_subject_probe` when at least one edge
+  was loaded by per-subject PSOT probes instead of a full predicate scan. The
+  cascade scans the cheapest edge first, then repeatedly probes any remaining
+  edge whose subject variable is bounded to a small frontier by the relations
+  already loaded (each new relation tightens the frontiers), falling back to a
+  full scan per edge when the probe-vs-scan gate fails
+- `bounded-probe-edges`: how many edges were loaded by probing
+- `bounded-probe-subject-cap`: the maximum frontier size eligible for probing
+- `bounded-probe-scan-ratio`: minimum estimated scan rows per probe required
+  to probe instead of scanning
+- `raw-relation-rows` / `pruned-relation-rows`: runtime row totals, present when
+  a plan is described after the fast path has opened
+
+Set `FLUREE_CYCLIC_BGP=0` (or `false`) to disable this operator for A/B
+testing. `FLUREE_CYCLIC_BGP_MAX_ROWS` can lower or raise the per-predicate row
+cap. `FLUREE_CYCLIC_BGP_MAX_WEDGE_PAIRS` controls the encoded-square build-side
+wedge cap (default 5,000,000 pairs); when both exact wedge decompositions exceed
+the cap, the operator falls back to the regular cyclic enumerator.
+`FLUREE_CYCLIC_BGP_MAX_BOUNDED_SUBJECTS` controls the per-edge frontier cap for
+bounded subject probing (default 65,536 subjects), and
+`FLUREE_CYCLIC_BGP_PROBE_SCAN_RATIO` controls the probe-vs-scan gate (default
+64: probe only when the edge's estimated row count is at least 64× the frontier
+size). Probing requires HEAD execution (no overlay, `to_t == max_t`); otherwise
+every edge is loaded by a full overlay-correct scan as before. Setting
+`FLUREE_CYCLIC_BGP_MAX_BOUNDED_SUBJECTS=0` disables probing without disabling
+the operator. When statistics prove no probe can ever pass the subject cap
+(every edge's subject variable is only exposed by edges whose distinct counts
+exceed the cap with margin), the edge scans and relation-index builds run
+concurrently on the shared worker pool instead of the sequential cascade. The node exposes the old nested-loop
+plan as a `fallback` child; the fallback runs when the runtime mode is
+unsupported by the fast path.
+
+The edge `rel` distinguishes a real input from an alternative:
+
+| `rel`         | Meaning |
+| ------------- | ------- |
+| `child`       | a real input the operator consumes |
+| `fallback`    | a correctness fallback run *instead* of the fast path when it bails at open (overlay/history/policy/multi-graph). Only one of the two executes. |
+| `conditional` | a path chosen at runtime |
+
+Example — a same-subject star collapses to a single fused operator:
+
+```jsonc
+"physical": {
+  "op": "ProjectOperator",
+  "children": [
+    { "rel": "child", "node": { "op": "PropertyJoinOperator" } }
+  ]
+}
+```
+
+**Planned vs. actual.** `physical` is the *planned* tree. A few decisions are
+finalized only at execution `open()` and are **not** reflected here: the
+multi-graph hash-join → nested-loop downgrade, whether a fast path takes its
+fallback, and the exact index permutation (SPOT/POST/OPST/PSOT) a scan chooses.
+Surfacing those requires actually running the query (a future `EXPLAIN ANALYZE`
+mode), which `EXPLAIN` deliberately does not do.
 
 ### Execution Hints
 

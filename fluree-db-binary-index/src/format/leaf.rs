@@ -72,6 +72,12 @@ pub struct LeafInfo {
     pub first_key: RunRecordV2,
     /// Last routing key of the leaf.
     pub last_key: RunRecordV2,
+    /// Number of leaflets in this leaf that were freshly (re-)encoded, as
+    /// opposed to passthrough byte-copies of an existing leaflet. Drives the
+    /// per-leaflet portion of indexer CAS-write fuel charges. For full-rebuild
+    /// output this equals the total leaflet count; for incremental updates it
+    /// counts only the leaflets that were merged + re-encoded.
+    pub re_encoded_leaflet_count: u32,
 }
 
 // ── Writer ─────────────────────────────────────────────────────────────
@@ -206,6 +212,21 @@ impl LeafWriter {
         self.sidecar_builder.push_entry(entry);
     }
 
+    /// Drain the leaves completed so far, transferring ownership to the caller
+    /// while preserving the internal buffer's allocation (so repeated draining
+    /// does not reallocate).
+    ///
+    /// A leaf is "completed" the moment `flush_leaf()` runs — i.e. when the
+    /// leaf-level row threshold is crossed during `push_record`. Callers that
+    /// want to bound memory (e.g. the indexer's `PersistingLeafWriter`) drain
+    /// after every `push_record` and stream each completed leaf's blob to disk,
+    /// instead of retaining every compressed leaf for the whole order. The
+    /// trailing leaf is only flushed by `finish()`, so a final drain of its
+    /// return value is still required.
+    pub fn drain_completed_leaves(&mut self) -> std::vec::Drain<'_, LeafInfo> {
+        self.completed_leaves.drain(..)
+    }
+
     /// Consume the writer, flushing any remaining data, and return all
     /// produced leaves.
     pub fn finish(mut self) -> io::Result<Vec<LeafInfo>> {
@@ -286,6 +307,7 @@ impl LeafWriter {
 
         // 2. Build the leaf blob.
         let leaflets = std::mem::take(&mut self.encoded_leaflets);
+        let re_encoded_leaflet_count = leaflets.len() as u32;
         let leaf_bytes = build_leaf_blob(
             self.order,
             &leaflets,
@@ -305,6 +327,7 @@ impl LeafWriter {
             total_rows,
             first_key: first_record,
             last_key: last_record,
+            re_encoded_leaflet_count,
         });
 
         // Reset for next leaf.
@@ -548,6 +571,19 @@ pub struct DecodedLeafDirV3 {
     /// Byte offset in the leaf blob where payload data starts
     /// (= header size + directory size). Authoritative — do not recompute.
     pub payload_base: usize,
+}
+
+impl DecodedLeafDirV3 {
+    /// Approximate in-memory byte size (for cache weighing).
+    pub fn byte_size(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + self.entries.capacity() * std::mem::size_of::<LeafletDirEntryV3>()
+            + self
+                .entries
+                .iter()
+                .map(|e| e.column_refs.capacity() * std::mem::size_of::<ColumnBlockRef>())
+                .sum::<usize>()
+    }
 }
 
 /// Decode the leaflet directory from a V3 leaf blob, returning the directory

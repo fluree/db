@@ -96,8 +96,19 @@ impl ServerError {
             ServerError::Json(_) => errors::JSON_PARSE,
 
             // Query/Transaction errors
+            ServerError::Api(ApiError::AwaitTNotReached { .. }) => errors::READ_AFTER_WRITE_TIMEOUT,
+            ServerError::Api(ApiError::Query(fluree_db_query::QueryError::Cancelled {
+                ..
+            })) => errors::QUERY_CANCELLED,
             ServerError::Api(ApiError::Query(_)) => errors::INVALID_QUERY,
             ServerError::Api(ApiError::Batch(_)) => errors::INVALID_QUERY,
+            // Optimistic-concurrency conflicts: a distinct, retryable class so
+            // clients can branch on `@type` (and the 409 status below).
+            ServerError::Api(ApiError::Transact(
+                fluree_db_api::TransactError::CommitConflict { .. }
+                | fluree_db_api::TransactError::PublishLostRace { .. }
+                | fluree_db_api::TransactError::NamespaceConflict(_),
+            )) => errors::COMMIT_CONFLICT,
             ServerError::Api(ApiError::Transact(_)) => errors::INVALID_TRANSACTION,
 
             // API-level errors
@@ -153,9 +164,21 @@ impl ServerError {
 
             // 409 - Conflict
             ServerError::Api(ApiError::LedgerExists(_)) => StatusCode::CONFLICT,
+            // Optimistic-concurrency / namespace-allocation conflicts are
+            // retryable: 409 lets clients distinguish "retry" from a 400 "bad
+            // request". (After server-side reconcile-and-retry these only reach
+            // the client when the bounded retry budget is exhausted.)
+            ServerError::Api(ApiError::Transact(
+                fluree_db_api::TransactError::CommitConflict { .. }
+                | fluree_db_api::TransactError::PublishLostRace { .. }
+                | fluree_db_api::TransactError::NamespaceConflict(_),
+            )) => StatusCode::CONFLICT,
 
             // 400 - Bad Request (client errors)
             ServerError::Api(ApiError::Parse(_)) => StatusCode::BAD_REQUEST,
+            ServerError::Api(ApiError::Query(fluree_db_query::QueryError::Cancelled {
+                ..
+            })) => StatusCode::REQUEST_TIMEOUT,
             ServerError::Api(ApiError::Query(_)) => StatusCode::BAD_REQUEST,
             ServerError::Api(ApiError::Batch(_)) => StatusCode::BAD_REQUEST,
             ServerError::Api(ApiError::Transact(_)) => StatusCode::BAD_REQUEST,
@@ -164,6 +187,7 @@ impl ServerError {
             ServerError::Api(ApiError::SparqlLower(_)) => StatusCode::BAD_REQUEST,
             ServerError::Api(ApiError::Config(_)) => StatusCode::BAD_REQUEST,
             ServerError::Api(ApiError::Format(_)) => StatusCode::BAD_REQUEST,
+            ServerError::Api(ApiError::AwaitTNotReached { .. }) => StatusCode::REQUEST_TIMEOUT,
             ServerError::MissingLedger => StatusCode::BAD_REQUEST,
             ServerError::Json(_) => StatusCode::BAD_REQUEST,
             ServerError::BadRequest(_) => StatusCode::BAD_REQUEST,

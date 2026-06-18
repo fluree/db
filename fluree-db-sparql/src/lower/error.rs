@@ -43,9 +43,13 @@ pub enum LowerError {
     #[error("Invalid integer literal '{value}'")]
     InvalidInteger { value: String, span: SourceSpan },
 
-    /// Unsupported ORDER BY expression (MVP only supports variables)
-    #[error("Expression-based ORDER BY is not yet supported; use a variable")]
-    UnsupportedOrderByExpression { span: SourceSpan },
+    /// Invalid `# PRAGMA ...` directive value
+    #[error("Invalid PRAGMA {pragma}: {message}")]
+    InvalidPragma {
+        pragma: String,
+        message: String,
+        span: SourceSpan,
+    },
 
     /// Aggregate without alias (SELECT COUNT(?x) without AS ?var)
     #[error("Aggregate expressions must have an alias (AS ?var)")]
@@ -131,9 +135,17 @@ impl LowerError {
         }
     }
 
-    /// Create an unsupported ORDER BY expression error.
-    pub fn unsupported_order_by_expr(span: SourceSpan) -> Self {
-        Self::UnsupportedOrderByExpression { span }
+    /// Create an invalid pragma error.
+    pub fn invalid_pragma(
+        pragma: impl Into<String>,
+        message: impl Into<String>,
+        span: SourceSpan,
+    ) -> Self {
+        Self::InvalidPragma {
+            pragma: pragma.into(),
+            message: message.into(),
+            span,
+        }
     }
 
     /// Create an aggregate without alias error.
@@ -179,7 +191,7 @@ impl LowerError {
             Self::UnsupportedQueryForm { span, .. } => *span,
             Self::InvalidDecimal { span, .. } => *span,
             Self::InvalidInteger { span, .. } => *span,
-            Self::UnsupportedOrderByExpression { span } => *span,
+            Self::InvalidPragma { span, .. } => *span,
             Self::AggregateWithoutAlias { span } => *span,
             Self::UnsupportedCountStar { span } => *span,
             Self::InvalidPropertyPath { span, .. } => *span,

@@ -29,15 +29,19 @@ use crate::binding::Batch;
 use crate::context::ExecutionContext;
 use crate::error::{QueryError, Result};
 use crate::fast_path_common::{
-    build_count_batch, build_psot_cursor_for_predicate, count_to_i64, cursor_projection_sid_only,
-    cursor_projection_sid_otype_okey, normalize_pred_sid,
+    build_count_batch, build_overlay_cursor_for_subject_range, build_psot_cursor_for_predicate,
+    cached_overlay_ops, count_predicate_overlay_delta, count_rows_for_predicate_psot, count_to_i64,
+    cursor_projection_sid_only, cursor_projection_sid_otype_okey, leaf_entries_for_predicate,
+    normalize_pred_sid, slice_overlay_ops_by_subject, CursorSubjectCountStream,
+    PsotSubjectCountIter, SharedOverlayOps,
 };
 use crate::ir::triple::Ref;
 use crate::operator::{BoxedOperator, Operator, OperatorState};
 use crate::var_registry::VarId;
 use async_trait::async_trait;
-use fluree_db_binary_index::BinaryCursor;
+use fluree_db_binary_index::{BinaryCursor, RunSortOrder};
 use fluree_db_core::o_type::OType;
+use fluree_db_core::QueryCancellation;
 use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -82,6 +86,12 @@ impl UnionStarCountAllOperator {
 
 #[async_trait]
 impl Operator for UnionStarCountAllOperator {
+    fn plan_children(&self) -> Vec<crate::plan_node::PlanChild<'_>> {
+        self.fallback
+            .as_deref()
+            .map(|fb| vec![crate::plan_node::PlanChild::fallback(fb)])
+            .unwrap_or_default()
+    }
     fn schema(&self) -> &[VarId] {
         std::slice::from_ref(&self.out_var)
     }
@@ -102,6 +112,7 @@ impl Operator for UnionStarCountAllOperator {
             && ctx.policy_enforcer.as_ref().is_none_or(|p| p.is_root());
         if allow_fast {
             if let Some(store) = ctx.binary_store.as_ref() {
+                let started = std::time::Instant::now();
                 let Some(n) = count_union_star(
                     store,
                     ctx,
@@ -123,6 +134,12 @@ impl Operator for UnionStarCountAllOperator {
                     self.state = OperatorState::Open;
                     return Ok(());
                 };
+                tracing::debug!(
+                    count = n,
+                    mode = ?self.mode,
+                    elapsed_us = started.elapsed().as_micros() as u64,
+                    "union-star count fast path executed"
+                );
                 self.result = Some(count_to_i64(n, "COUNT(*) UNION-star")?);
                 self.emitted = false;
                 self.state = OperatorState::Open;
@@ -169,64 +186,6 @@ impl Operator for UnionStarCountAllOperator {
         self.state = OperatorState::Closed;
         self.emitted = false;
         self.result = None;
-    }
-}
-
-/// Stream of `(s_id, count)` groups from PSOT for a single predicate.
-struct SubjectCountStreamV6 {
-    cursor: BinaryCursor,
-    current: Option<fluree_db_binary_index::ColumnBatch>,
-    row: usize,
-    cur_s: Option<u64>,
-    cur_count: u64,
-}
-
-impl SubjectCountStreamV6 {
-    fn new(cursor: BinaryCursor) -> Self {
-        Self {
-            cursor,
-            current: None,
-            row: 0,
-            cur_s: None,
-            cur_count: 0,
-        }
-    }
-
-    fn next_group(&mut self) -> Result<Option<(u64, u64)>> {
-        loop {
-            if self.current.is_none() {
-                self.current = self
-                    .cursor
-                    .next_batch()
-                    .map_err(|e| QueryError::Internal(format!("cursor batch: {e}")))?;
-                self.row = 0;
-                if self.current.is_none() {
-                    if let Some(s) = self.cur_s.take() {
-                        let n = std::mem::take(&mut self.cur_count);
-                        return Ok(Some((s, n)));
-                    }
-                    return Ok(None);
-                }
-            }
-
-            let batch = self.current.as_ref().unwrap();
-            if self.row >= batch.row_count {
-                self.current = None;
-                continue;
-            }
-            let s = batch.s_id.get(self.row);
-            if self.cur_s.is_none() {
-                self.cur_s = Some(s);
-                self.cur_count = 0;
-            } else if self.cur_s != Some(s) {
-                let out_s = self.cur_s.replace(s).unwrap();
-                let out_n = std::mem::replace(&mut self.cur_count, 0);
-                // don't advance row; let loop consume this row into new group
-                return Ok(Some((out_s, out_n)));
-            }
-            self.cur_count += 1;
-            self.row += 1;
-        }
     }
 }
 
@@ -301,6 +260,381 @@ impl SubjectSelfLoopCountStreamV6 {
     }
 }
 
+/// A `(subject, count)` group stream in ascending subject order — either the base
+/// metadata iterator (HEAD) or the overlay-merging cursor stream (novelty/time
+/// travel). Lets the union/extra merge helpers serve both lanes.
+trait SubjectCountGroups {
+    fn next_subject_group(&mut self) -> Result<Option<(u64, u64)>>;
+}
+impl SubjectCountGroups for PsotSubjectCountIter<'_> {
+    #[inline]
+    fn next_subject_group(&mut self) -> Result<Option<(u64, u64)>> {
+        self.next_group()
+    }
+}
+impl SubjectCountGroups for CursorSubjectCountStream {
+    #[inline]
+    fn next_subject_group(&mut self) -> Result<Option<(u64, u64)>> {
+        self.next_group()
+    }
+}
+
+/// Min-merge over union-branch iterators: returns `(s_min, Σ counts at s_min)` and
+/// advances the iterators at `s_min`. Bag semantics — a subject under multiple
+/// branches sums their counts.
+fn next_union_group<T: SubjectCountGroups>(
+    iters: &mut [T],
+    cur: &mut [Option<(u64, u64)>],
+) -> Result<Option<(u64, u64)>> {
+    if cur.iter().all(std::option::Option::is_none) {
+        return Ok(None);
+    }
+    let s_min = cur.iter().filter_map(|c| c.map(|(s, _)| s)).min().unwrap();
+    let mut sum: u64 = 0;
+    for (i, it) in iters.iter_mut().enumerate() {
+        if let Some((s, n)) = cur[i] {
+            if s == s_min {
+                sum = sum.saturating_add(n);
+                cur[i] = it.next_subject_group()?;
+            }
+        }
+    }
+    Ok(Some((s_min, sum)))
+}
+
+/// Max-merge over the constraint (extra) iterators: returns the next subject present
+/// in ALL of them with the product of their counts; subjects missing from any
+/// constraint predicate are skipped.
+fn next_extra_product_group<T: SubjectCountGroups>(
+    iters: &mut [T],
+    cur: &mut [Option<(u64, u64)>],
+) -> Result<Option<(u64, u64)>> {
+    loop {
+        if cur.iter().any(std::option::Option::is_none) {
+            return Ok(None);
+        }
+        let target = cur.iter().filter_map(|c| c.map(|(s, _)| s)).max().unwrap();
+        let mut advanced = false;
+        for (i, it) in iters.iter_mut().enumerate() {
+            while let Some((s, _)) = cur[i] {
+                if s < target {
+                    cur[i] = it.next_subject_group()?;
+                    advanced = true;
+                    if cur[i].is_none() {
+                        return Ok(None);
+                    }
+                } else {
+                    break;
+                }
+            }
+        }
+        if advanced {
+            continue;
+        }
+        let mut prod: u64 = 1;
+        for c in cur.iter() {
+            prod = prod.saturating_mul(c.unwrap().1);
+        }
+        for (i, it) in iters.iter_mut().enumerate() {
+            cur[i] = it.next_subject_group()?;
+        }
+        return Ok(Some((target, prod)));
+    }
+}
+
+/// Per-partition partial for `(UNION of union_pids) ⋈ (AND of extra_pids)` COUNT(*)
+/// over `[lo, hi)`: `Σ_s (Σ_b count_b(s)) × (Π_e count_e(s))` for subjects in any
+/// union branch AND all extra predicates. BASE index only.
+fn merge_union_constraint_count_range(
+    store: &fluree_db_binary_index::BinaryIndexStore,
+    g_id: fluree_db_core::GraphId,
+    union_pids: &[u32],
+    extra_pids: &[u32],
+    cancellation: &QueryCancellation,
+    lo: u64,
+    hi: u64,
+) -> Result<u128> {
+    let mut u_iters: Vec<PsotSubjectCountIter<'_>> = Vec::with_capacity(union_pids.len());
+    for &p in union_pids {
+        u_iters.push(
+            PsotSubjectCountIter::new_bounded(store, g_id, p, lo, hi)?
+                .with_cancellation(cancellation),
+        );
+    }
+    let mut u_cur: Vec<Option<(u64, u64)>> = Vec::with_capacity(u_iters.len());
+    for it in &mut u_iters {
+        u_cur.push(it.next_group()?);
+    }
+    let mut e_iters: Vec<PsotSubjectCountIter<'_>> = Vec::with_capacity(extra_pids.len());
+    for &p in extra_pids {
+        e_iters.push(
+            PsotSubjectCountIter::new_bounded(store, g_id, p, lo, hi)?
+                .with_cancellation(cancellation),
+        );
+    }
+    let mut e_cur: Vec<Option<(u64, u64)>> = Vec::with_capacity(e_iters.len());
+    for it in &mut e_iters {
+        e_cur.push(it.next_group()?);
+    }
+
+    let mut u = next_union_group(&mut u_iters, &mut u_cur)?;
+    let mut e = next_extra_product_group(&mut e_iters, &mut e_cur)?;
+    let mut total: u128 = 0;
+    while let (Some((us, usum)), Some((es, eprod))) = (u, e) {
+        if us < es {
+            u = next_union_group(&mut u_iters, &mut u_cur)?;
+            continue;
+        }
+        if es < us {
+            e = next_extra_product_group(&mut e_iters, &mut e_cur)?;
+            continue;
+        }
+        total = total.saturating_add((usum as u128).saturating_mul(eprod as u128));
+        u = next_union_group(&mut u_iters, &mut u_cur)?;
+        e = next_extra_product_group(&mut e_iters, &mut e_cur)?;
+    }
+    Ok(total)
+}
+
+/// Parallel partitioned constrained-union count. Resolves predicate ids, picks the
+/// partition driver, and dispatches to the shared harness. Returns `Ok(None)` to
+/// defer to the cursor merge when a predicate is absent or there are too few rows.
+/// Caller ensures `AllRows`, non-empty `extra_preds`, and HEAD (no overlay/time-travel).
+fn try_union_constraint_parallel(
+    store: &Arc<fluree_db_binary_index::BinaryIndexStore>,
+    g_id: fluree_db_core::GraphId,
+    union_preds: &[Ref],
+    extra_preds: &[Ref],
+    cancellation: &QueryCancellation,
+) -> Result<Option<u64>> {
+    let mut union_pids: Vec<u32> = Vec::with_capacity(union_preds.len());
+    let mut extra_pids: Vec<u32> = Vec::with_capacity(extra_preds.len());
+    let mut total_rows: u64 = 0;
+    // Absent predicate (union or extra) => defer to the cursor merge, which handles
+    // the empty-union / empty-join semantics.
+    for p in union_preds {
+        let sid = normalize_pred_sid(store, p)?;
+        let Some(p_id) = store.sid_to_p_id(&sid) else {
+            return Ok(None);
+        };
+        union_pids.push(p_id);
+        total_rows = total_rows.saturating_add(count_rows_for_predicate_psot(store, g_id, p_id)?);
+    }
+    for p in extra_preds {
+        let sid = normalize_pred_sid(store, p)?;
+        let Some(p_id) = store.sid_to_p_id(&sid) else {
+            return Ok(None);
+        };
+        extra_pids.push(p_id);
+        total_rows = total_rows.saturating_add(count_rows_for_predicate_psot(store, g_id, p_id)?);
+    }
+    if union_pids.is_empty() || extra_pids.is_empty() {
+        return Ok(None);
+    }
+    // Partition driver = the predicate (union or extra) with the most leaves.
+    let driver_p = union_pids
+        .iter()
+        .chain(extra_pids.iter())
+        .copied()
+        .max_by_key(|&p| leaf_entries_for_predicate(store, g_id, RunSortOrder::Psot, p).len())
+        .unwrap();
+
+    crate::count_plan_exec::parallel_partition_count(
+        store,
+        g_id,
+        driver_p,
+        total_rows,
+        cancellation,
+        |lo, hi| {
+            merge_union_constraint_count_range(
+                store,
+                g_id,
+                &union_pids,
+                &extra_pids,
+                cancellation,
+                lo,
+                hi,
+            )
+        },
+    )
+}
+
+/// Overlay/time-travel variant of `merge_union_constraint_count_range` for one
+/// subject partition: `Σ_s (Σ_b count_b(s)) × (Π_e count_e(s))`, every predicate read
+/// through a bounded overlay cursor (its `[lo,hi)` leaves + its novelty ops sliced to
+/// that range). `union_ops`/`extra_ops` mirror `union_pids`/`extra_pids`. A
+/// `s ∈ [lo,hi)` guard on the matched subject counts boundary subjects once.
+#[allow(clippy::too_many_arguments)]
+fn merge_union_constraint_count_range_overlay(
+    store: &Arc<fluree_db_binary_index::BinaryIndexStore>,
+    g_id: fluree_db_core::GraphId,
+    union_pids: &[u32],
+    union_ops: &[SharedOverlayOps],
+    extra_pids: &[u32],
+    extra_ops: &[SharedOverlayOps],
+    to_t: i64,
+    epoch: u64,
+    cancellation: &QueryCancellation,
+    lo: u64,
+    hi: u64,
+) -> Result<u128> {
+    let build = |p_id: u32, ops: &[fluree_db_binary_index::read::types::OverlayOp]| {
+        let sliced = slice_overlay_ops_by_subject(ops, lo, hi);
+        build_overlay_cursor_for_subject_range(
+            store,
+            g_id,
+            p_id,
+            cursor_projection_sid_only(),
+            lo,
+            hi,
+            sliced,
+            to_t,
+            epoch,
+        )
+        .map(|c| CursorSubjectCountStream::new(c).with_cancellation(cancellation))
+    };
+
+    let mut u_streams: Vec<CursorSubjectCountStream> = Vec::with_capacity(union_pids.len());
+    for (i, &p) in union_pids.iter().enumerate() {
+        let Some(s) = build(p, &union_ops[i]) else {
+            return Ok(0);
+        };
+        u_streams.push(s);
+    }
+    let mut u_cur: Vec<Option<(u64, u64)>> = Vec::with_capacity(u_streams.len());
+    for s in &mut u_streams {
+        u_cur.push(s.next_group()?);
+    }
+    let mut e_streams: Vec<CursorSubjectCountStream> = Vec::with_capacity(extra_pids.len());
+    for (i, &p) in extra_pids.iter().enumerate() {
+        let Some(s) = build(p, &extra_ops[i]) else {
+            return Ok(0);
+        };
+        e_streams.push(s);
+    }
+    let mut e_cur: Vec<Option<(u64, u64)>> = Vec::with_capacity(e_streams.len());
+    for s in &mut e_streams {
+        e_cur.push(s.next_group()?);
+    }
+
+    let mut u = next_union_group(&mut u_streams, &mut u_cur)?;
+    let mut e = next_extra_product_group(&mut e_streams, &mut e_cur)?;
+    let mut total: u128 = 0;
+    while let (Some((us, usum)), Some((es, eprod))) = (u, e) {
+        if us < es {
+            u = next_union_group(&mut u_streams, &mut u_cur)?;
+            continue;
+        }
+        if es < us {
+            e = next_extra_product_group(&mut e_streams, &mut e_cur)?;
+            continue;
+        }
+        if us >= lo && us < hi {
+            total = total.saturating_add((usum as u128).saturating_mul(eprod as u128));
+        }
+        u = next_union_group(&mut u_streams, &mut u_cur)?;
+        e = next_extra_product_group(&mut e_streams, &mut e_cur)?;
+    }
+    Ok(total)
+}
+
+/// Overlay/time-travel parallel constrained-union count: like
+/// `try_union_constraint_parallel` but folds novelty per partition (bounded overlay
+/// cursors). Collects each predicate's resolved ops once. Returns `Ok(None)` to defer
+/// to the serial cursor merge for an absent predicate, a translation failure, or too
+/// few rows.
+fn try_union_constraint_overlay_parallel(
+    store: &Arc<fluree_db_binary_index::BinaryIndexStore>,
+    ctx: &ExecutionContext<'_>,
+    g_id: fluree_db_core::GraphId,
+    union_preds: &[Ref],
+    extra_preds: &[Ref],
+) -> Result<Option<u64>> {
+    type ResolvedPreds = (Vec<u32>, Vec<fluree_db_core::Sid>, u64);
+    let resolve = |preds: &[Ref]| -> Result<Option<ResolvedPreds>> {
+        let mut pids = Vec::with_capacity(preds.len());
+        let mut sids = Vec::with_capacity(preds.len());
+        let mut rows = 0u64;
+        for p in preds {
+            let sid = normalize_pred_sid(store, p)?;
+            let Some(p_id) = store.sid_to_p_id(&sid) else {
+                return Ok(None);
+            };
+            rows = rows.saturating_add(count_rows_for_predicate_psot(store, g_id, p_id)?);
+            pids.push(p_id);
+            sids.push(sid);
+        }
+        Ok(Some((pids, sids, rows)))
+    };
+    let Some((union_pids, union_sids, ur)) = resolve(union_preds)? else {
+        return Ok(None);
+    };
+    let Some((extra_pids, extra_sids, er)) = resolve(extra_preds)? else {
+        return Ok(None);
+    };
+    if union_pids.is_empty() || extra_pids.is_empty() {
+        return Ok(None);
+    }
+    let total_rows = ur.saturating_add(er);
+
+    // Pre-gate before walking novelty: the serial cursor-merge fallback re-collects
+    // these ops, so collecting them here only to fail the parallel gate is double work.
+    if !crate::count_plan_exec::parallel_count_gate_open(total_rows) {
+        return Ok(None);
+    }
+
+    let collect = |sids: &[fluree_db_core::Sid]| -> Result<Option<Vec<SharedOverlayOps>>> {
+        let mut out = Vec::with_capacity(sids.len());
+        for sid in sids {
+            let Some(ops) = cached_overlay_ops(ctx, store, g_id, RunSortOrder::Psot, sid)? else {
+                return Ok(None);
+            };
+            out.push(ops);
+        }
+        Ok(Some(out))
+    };
+    let Some(union_ops) = collect(&union_sids)? else {
+        return Ok(None);
+    };
+    let Some(extra_ops) = collect(&extra_sids)? else {
+        return Ok(None);
+    };
+
+    let to_t = ctx.to_t;
+    let epoch = ctx.overlay.as_ref().map(|o| o.epoch()).unwrap_or(0);
+    let driver_p = union_pids
+        .iter()
+        .chain(extra_pids.iter())
+        .copied()
+        .max_by_key(|&p| leaf_entries_for_predicate(store, g_id, RunSortOrder::Psot, p).len())
+        .unwrap();
+
+    let (union_pids, union_ops, extra_pids, extra_ops) =
+        (&union_pids, &union_ops, &extra_pids, &extra_ops);
+    crate::count_plan_exec::parallel_partition_count(
+        store,
+        g_id,
+        driver_p,
+        total_rows,
+        &ctx.cancellation,
+        move |lo, hi| {
+            merge_union_constraint_count_range_overlay(
+                store,
+                g_id,
+                union_pids,
+                union_ops,
+                extra_pids,
+                extra_ops,
+                to_t,
+                epoch,
+                &ctx.cancellation,
+                lo,
+                hi,
+            )
+        },
+    )
+}
+
 fn count_union_star(
     store: &Arc<fluree_db_binary_index::BinaryIndexStore>,
     ctx: &ExecutionContext<'_>,
@@ -318,8 +652,98 @@ fn count_union_star(
         return Ok(Some(0));
     }
 
+    // Metadata fast lane: `{ ?s p1 ?o } UNION { ?s p2 ?o }` under COUNT(*) with no
+    // extra constraint reduces, under bag semantics, to `Σ_p count_rows(p)` — a sum
+    // of leaflet-directory row counts with NO row decode. (count(p1)+count(p2)
+    // double-counts subjects present under both predicates, which is exactly correct
+    // for UNION bag semantics.) Only valid at HEAD with no overlay/time-travel, where
+    // base-leaflet directory counts are exact; otherwise fall through to the
+    // overlay-merging cursor path below.
+    //
+    // Gate matches `count_plan_exec`: epoch != 0 OR to_t != max_t.
+    let time_travel = ctx.to_t != store.max_t();
+    if matches!(mode, UnionCountMode::AllRows)
+        && extra_preds.is_empty()
+        && !overlay_has_rows
+        && !time_travel
+    {
+        let mut total: u64 = 0;
+        for p in union_preds {
+            let sid = normalize_pred_sid(store, p)?;
+            // Absent predicate contributes 0. Safe here: no overlay means there are
+            // no overlay-only rows a missing `p_id` could hide.
+            let Some(p_id) = store.sid_to_p_id(&sid) else {
+                continue;
+            };
+            total = total.saturating_add(count_rows_for_predicate_psot(store, g_id, p_id)?);
+        }
+        return Ok(Some(total));
+    }
+
+    // Novelty at HEAD (no time-travel), no-constraint UNION: bag-semantics sum of
+    // each branch's metadata base count + a novelty delta over only the touched
+    // leaves, instead of a full cursor scan of every branch.
+    if matches!(mode, UnionCountMode::AllRows)
+        && extra_preds.is_empty()
+        && overlay_has_rows
+        && ctx.to_t >= store.max_t()
+    {
+        let mut total: u64 = 0;
+        let mut all_ok = true;
+        for p in union_preds {
+            let sid = normalize_pred_sid(store, p)?;
+            // A union branch present only in novelty (no base id), or a translation
+            // failure, defers the whole count to the cursor merge below.
+            match store.sid_to_p_id(&sid) {
+                Some(p_id) => match count_predicate_overlay_delta(ctx, store, g_id, sid, p_id)? {
+                    Some(n) => total = total.saturating_add(n),
+                    None => {
+                        all_ok = false;
+                        break;
+                    }
+                },
+                None => {
+                    all_ok = false;
+                    break;
+                }
+            }
+        }
+        if all_ok {
+            return Ok(Some(total));
+        }
+    }
+
+    // Parallel partitioned merge for the constrained `AllRows` case:
+    // `{ ?s p1 ?o } UNION { ?s p2 ?o } . ?s e1 ?o2 …` COUNT(*) over large
+    // predicates. HEAD-only (no overlay/time-travel); else the cursor merge below.
+    if matches!(mode, UnionCountMode::AllRows)
+        && !extra_preds.is_empty()
+        && !overlay_has_rows
+        && !time_travel
+    {
+        if let Some(total) =
+            try_union_constraint_parallel(store, g_id, union_preds, extra_preds, &ctx.cancellation)?
+        {
+            return Ok(Some(total));
+        }
+    }
+
+    // Overlay/time-travel constrained-UNION: parallelize the base scan and fold
+    // novelty per partition. Falls through to the serial cursor merge below for
+    // absent predicates, translation failures, or too few rows.
+    if matches!(mode, UnionCountMode::AllRows)
+        && !extra_preds.is_empty()
+        && (overlay_has_rows || time_travel)
+    {
+        if let Some(total) =
+            try_union_constraint_overlay_parallel(store, ctx, g_id, union_preds, extra_preds)?
+        {
+            return Ok(Some(total));
+        }
+    }
+
     // Build union streams.
-    let mut union_streams_all: Vec<SubjectCountStreamV6> = Vec::new();
+    let mut union_streams_all: Vec<CursorSubjectCountStream> = Vec::new();
     let mut union_streams_eq: Vec<SubjectSelfLoopCountStreamV6> = Vec::new();
 
     for p in union_preds {
@@ -342,7 +766,11 @@ fn count_union_star(
             return Ok(None);
         };
         match mode {
-            UnionCountMode::AllRows => union_streams_all.push(SubjectCountStreamV6::new(cursor)),
+            UnionCountMode::AllRows => {
+                union_streams_all.push(
+                    CursorSubjectCountStream::new(cursor).with_cancellation(&ctx.cancellation),
+                );
+            }
             UnionCountMode::SubjectEqObject => {
                 union_streams_eq.push(SubjectSelfLoopCountStreamV6::new(cursor));
             }
@@ -428,7 +856,7 @@ fn count_union_star(
     }
 
     // Build extra streams (per-subject counts).
-    let mut extra_streams: Vec<SubjectCountStreamV6> = Vec::new();
+    let mut extra_streams: Vec<CursorSubjectCountStream> = Vec::new();
     for p in extra_preds {
         let sid = normalize_pred_sid(store, p)?;
         let Some(p_id) = store.sid_to_p_id(&sid) else {
@@ -450,7 +878,8 @@ fn count_union_star(
         else {
             return Ok(None);
         };
-        extra_streams.push(SubjectCountStreamV6::new(cursor));
+        extra_streams
+            .push(CursorSubjectCountStream::new(cursor).with_cancellation(&ctx.cancellation));
     }
     let mut extra_curr: Vec<Option<(u64, u64)>> = Vec::with_capacity(extra_streams.len());
     for s in &mut extra_streams {

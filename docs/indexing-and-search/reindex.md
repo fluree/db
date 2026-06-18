@@ -107,6 +107,7 @@ Key `IndexerConfig` fields:
 | `incremental_enabled` | true | Background indexing: attempt incremental updates before full rebuild |
 | `incremental_max_commits` | 10,000 | Background indexing: max commit window for incremental indexing |
 | `incremental_max_concurrency` | 4 | Background indexing: max concurrent (graph, order) branch updates |
+| `incremental_leaf_upload_concurrency` | 16 | Background indexing: global budget of concurrent leaf/sidecar uploads in Phase 2, shared across all order-tasks |
 
 Note: Reindex is a full rebuild. The `incremental_*` fields are used by background indexing and are not relevant to the semantics of a reindex operation.
 

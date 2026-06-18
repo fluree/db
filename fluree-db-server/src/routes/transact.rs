@@ -111,6 +111,7 @@ fn record_tracking_on_span(span: &tracing::Span, tally: &TrackingTally) {
     }
 }
 
+
 /// Compute transaction ID from request body (SHA-256 hash)
 ///
 /// This matches the legacy derive-tx-id behavior which hashes the JSON-LD normalized data.

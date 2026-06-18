@@ -313,16 +313,4 @@ impl super::Parser<'_> {
             None
         }
     }
-
-    // =========================================================================
-    // Skip helpers for features not yet implemented
-    // =========================================================================
-
-    pub(super) fn skip_parenthesized_content(&mut self) {
-        if !self.stream.match_token(&TokenKind::LParen) {
-            return;
-        }
-        self.stream
-            .skip_balanced(&TokenKind::LParen, &TokenKind::RParen);
-    }
 }

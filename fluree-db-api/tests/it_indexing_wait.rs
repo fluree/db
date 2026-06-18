@@ -21,6 +21,7 @@ use fluree_db_core::{load_ledger_snapshot, LedgerSnapshot};
 use fluree_db_transact::{CommitOpts, TxnOpts};
 use serde_json::json;
 use support::start_background_indexer_local;
+use tokio::time::{sleep, Duration};
 
 #[tokio::test]
 async fn background_indexing_trigger_wait_then_load_index_root() {
@@ -82,7 +83,9 @@ async fn background_indexing_trigger_wait_then_load_index_root() {
 
             // 3) Wait + assert we can load the persisted root
             match completion.wait().await {
-                fluree_db_api::IndexOutcome::Completed { index_t, root_id } => {
+                fluree_db_api::IndexOutcome::Completed {
+                    index_t, root_id, ..
+                } => {
                     assert!(
                         index_t >= commit_t,
                         "index_t ({index_t}) should be >= commit_t ({commit_t})"
@@ -112,4 +115,79 @@ async fn background_indexing_trigger_wait_then_load_index_root() {
             }
         })
         .await;
+}
+
+#[tokio::test]
+async fn cached_handle_applies_local_background_index_publish_without_refresh() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let path = tmp.path().to_string_lossy().to_string();
+
+    let fluree = FlureeBuilder::file(path)
+        .with_indexing_thresholds(1_000_000, 10_000_000)
+        .build()
+        .expect("build file fluree");
+    let indexer = fluree
+        .indexing_mode
+        .handle()
+        .expect("file builder should start background indexing")
+        .clone();
+
+    let ledger_id = "it/local-cache-index-refresh:main";
+    fluree
+        .create_ledger(ledger_id)
+        .await
+        .expect("create ledger");
+    let cached = fluree.ledger_cached(ledger_id).await.expect("cache ledger");
+
+    let tx = json!({
+        "@context": {"ex":"http://example.org/"},
+        "@id": "ex:alice",
+        "ex:name": "Alice"
+    });
+
+    let result = fluree
+        .stage(&cached)
+        .insert(&tx)
+        .execute()
+        .await
+        .expect("cached insert");
+    let commit_t = result.receipt.t;
+
+    let before = cached.snapshot().await;
+    assert_eq!(before.t, commit_t);
+    assert_eq!(before.index_t(), 0, "cached handle starts on genesis index");
+    assert!(
+        before.novelty.size > 0,
+        "cached handle has unindexed novelty before background publish"
+    );
+    drop(before);
+
+    let completion = indexer.trigger(ledger_id, commit_t).await;
+    match completion.wait().await {
+        fluree_db_api::IndexOutcome::Completed { index_t, .. } => {
+            assert!(
+                index_t >= commit_t,
+                "background index_t ({index_t}) should cover commit_t ({commit_t})"
+            );
+        }
+        fluree_db_api::IndexOutcome::Failed(e) => panic!("indexing failed: {e}"),
+        fluree_db_api::IndexOutcome::Cancelled => panic!("indexing cancelled"),
+    }
+
+    let mut last_index_t = 0;
+    let mut last_novelty_size = usize::MAX;
+    for _ in 0..100 {
+        let view = cached.snapshot().await;
+        last_index_t = view.index_t();
+        last_novelty_size = view.novelty.size;
+        if last_index_t >= commit_t && last_novelty_size == 0 {
+            return;
+        }
+        drop(view);
+        sleep(Duration::from_millis(20)).await;
+    }
+
+    panic!(
+        "cached handle did not apply local index event without refresh: index_t={last_index_t}, novelty_size={last_novelty_size}, commit_t={commit_t}"
+    );
 }

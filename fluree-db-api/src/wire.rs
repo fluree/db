@@ -50,6 +50,11 @@ pub struct ReindexResponse {
     pub index_t: i64,
     pub root_id: String,
     pub stats: ReindexStats,
+    /// Total fuel charged for the reindex (decimal). Omitted from the wire
+    /// payload when unavailable (e.g., reindex went through a non-tracking
+    /// path); `/reindex` always populates it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fuel: Option<f64>,
 }
 
 impl From<ReindexResult> for ReindexResponse {
@@ -64,6 +69,7 @@ impl From<ReindexResult> for ReindexResponse {
                 branch_count: r.stats.branch_count,
                 total_bytes: r.stats.total_bytes,
             },
+            fuel: r.fuel,
         }
     }
 }

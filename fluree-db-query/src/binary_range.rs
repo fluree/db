@@ -57,6 +57,9 @@ fn translate_overlay_ops_v3_with_raw(
     let mut ops: Vec<fluree_db_binary_index::OverlayOp> = Vec::new();
     let mut raw: Vec<Flake> = Vec::new();
     let mut failed = false;
+    let mut unsupported_count: u64 = 0;
+    let mut error_count: u64 = 0;
+    let mut first_error: Option<String> = None;
 
     overlay.for_each_overlay_flake(g_id, index, None, None, true, to_t, &mut |flake| {
         if !include(flake) {
@@ -75,7 +78,15 @@ fn translate_overlay_ops_v3_with_raw(
             Err(e) => {
                 failed = true;
                 raw.push(flake.clone());
-                tracing::warn!(
+                if e.kind() == std::io::ErrorKind::Unsupported {
+                    unsupported_count += 1;
+                } else {
+                    error_count += 1;
+                }
+                if first_error.is_none() {
+                    first_error = Some(e.to_string());
+                }
+                tracing::debug!(
                     ctx = warn_ctx,
                     error = %e,
                     s = %flake.s,
@@ -87,6 +98,30 @@ fn translate_overlay_ops_v3_with_raw(
             }
         }
     });
+
+    // One summary per translation call, not one line per flake: a novelty
+    // tail full of untranslatable values (e.g. arena-new decimals) used to
+    // emit a WARN per flake per query — a log storm at INFO. `Unsupported`
+    // is a handled condition (the raw-flake merge is correct), so it stays
+    // at debug; unexpected errors keep a warn.
+    if failed {
+        if error_count > 0 {
+            tracing::warn!(
+                ctx = warn_ctx,
+                unsupported = unsupported_count,
+                errors = error_count,
+                first_error = first_error.as_deref().unwrap_or(""),
+                "some overlay flakes failed V3 translation; merging as raw flakes"
+            );
+        } else {
+            tracing::debug!(
+                ctx = warn_ctx,
+                unsupported = unsupported_count,
+                first_error = first_error.as_deref().unwrap_or(""),
+                "some overlay flakes are not V3-translatable; merging as raw flakes"
+            );
+        }
+    }
 
     let ephemeral_p_id_to_sid: HashMap<u32, Sid> = ephemeral_preds
         .into_iter()
@@ -360,6 +395,23 @@ fn binary_range_eq_v3(
         }
     };
 
+    // Resolve the optional projection-predicate allow-list once.
+    //
+    // `predicate_filter_p_ids` is the row-loop's allow-set of `u32` p_ids.
+    // We seed it with persisted-dict resolutions here; novelty-only
+    // predicates (no persisted p_id yet) get appended below after overlay
+    // translation surfaces their ephemeral p_ids via `ephemeral_p_id_to_sid`.
+    // Without that extension, an overlay assert on a novelty-only selected
+    // predicate would survive the overlay translator's Sid filter, land in
+    // the cursor stream with an ephemeral p_id, and then get silently
+    // dropped here.
+    let mut predicate_filter_p_ids: Option<Vec<u32>> =
+        opts.predicate_filter.as_deref().map(|sids| {
+            sids.iter()
+                .filter_map(|s| store.sid_to_p_id(s))
+                .collect::<Vec<u32>>()
+        });
+
     // Create cursor: use range-narrowed scan when any filter field is bound,
     // matching the pattern in BinaryScanOperator::open. For novelty-only subjects
     // this yields an empty leaf_range, so the cursor drains overlay ops directly
@@ -410,7 +462,12 @@ fn binary_range_eq_v3(
     let effective_to_t = opts.to_t.unwrap_or_else(|| store.max_t());
     cursor.set_to_t(effective_to_t);
 
-    // Overlay translation.
+    // Overlay translation. When the caller supplied a projection-predicate
+    // allow-list, filter overlay flakes by `flake.p` before translation —
+    // this both skips work on discarded overlay rows and ensures the
+    // untranslated raw-fallback set doesn't smuggle non-selected predicates
+    // back in. Sid match (vs persisted p_id) so novel predicates still pass.
+    let predicate_filter_sids = opts.predicate_filter.clone();
     let OverlayTranslateV3Result {
         mut ops,
         raw: untranslated,
@@ -424,16 +481,36 @@ fn binary_range_eq_v3(
         store,
         dict_novelty,
         runtime_small_dicts,
-        |_| true,
+        move |flake| match &predicate_filter_sids {
+            Some(allow) => allow.iter().any(|p| p == &flake.p),
+            None => true,
+        },
         "V3 range",
     );
 
     if !ops.is_empty() {
         fluree_db_binary_index::read::types::sort_overlay_ops(&mut ops, order);
         fluree_db_binary_index::read::types::resolve_overlay_ops(&mut ops);
-        let epoch = overlay.epoch();
-        cursor.set_overlay_ops(ops);
-        cursor.set_epoch(epoch);
+        cursor.set_overlay_ops(ops.into());
+    }
+
+    // Extend the row-loop allow-set with ephemeral p_ids whose mapped Sid is
+    // in the caller's allow-list — these are novelty-only predicates that
+    // have no persisted p_id yet, so they were not captured during the
+    // initial Sid-to-p_id resolution. The overlay translator already let
+    // them through via Sid match; without this step the row loop would
+    // drop them under their cursor-side ephemeral p_id.
+    if let (Some(allow_sids), Some(allow_ids)) = (
+        opts.predicate_filter.as_deref(),
+        predicate_filter_p_ids.as_mut(),
+    ) {
+        for (eph_p_id, sid) in &ephemeral_p_id_to_sid {
+            if allow_sids.iter().any(|s| s == sid) {
+                allow_ids.push(*eph_p_id);
+            }
+        }
+        allow_ids.sort_unstable();
+        allow_ids.dedup();
     }
 
     // Iterate and decode to Flakes.
@@ -445,15 +522,31 @@ fn binary_range_eq_v3(
 
     while let Some(batch) = cursor.next_batch()? {
         for i in 0..batch.row_count {
-            let s_id = batch.s_id.get(i);
             let p_id = batch.p_id.get_or(i, 0);
+
+            // Projection-predicate gate. Skip discarded predicates before any
+            // dict touch (subject resolve, predicate IRI, object decode,
+            // datatype/lang lookups) — purely an integer probe.
+            if let Some(allow) = &predicate_filter_p_ids {
+                if allow.binary_search(&p_id).is_err() {
+                    continue;
+                }
+            }
+
+            let s_id = batch.s_id.get(i);
             let o_type = batch.o_type.get_or(i, 0);
             let o_key = batch.o_key.get(i);
             let t = batch.t.get_or(i, 0) as i64;
             let o_i = batch.o_i.get_or(i, u32::MAX);
 
-            // Resolve subject.
-            let s_sid = resolve_sid(s_id, &view)?;
+            // Resolve subject. Reuse the caller-supplied Sid when present —
+            // the bound `match_val.s` IS the subject for every base row this
+            // scan returns, so the per-row `resolve_subject_sid` (a dict
+            // touch on the persisted path) is redundant.
+            let s_sid = match &match_val.s {
+                Some(sid) => sid.clone(),
+                None => resolve_sid(s_id, &view)?,
+            };
             // Resolve predicate: persisted dict first, then ephemeral overlay map.
             let p_sid = match store.resolve_predicate_iri(p_id) {
                 Some(iri) => store.encode_iri(iri),
@@ -740,8 +833,7 @@ fn binary_lookup_subject_predicate_refs_batched_v3(
     if !ops.is_empty() {
         fluree_db_binary_index::read::types::sort_overlay_ops(&mut ops, RunSortOrder::Psot);
         fluree_db_binary_index::read::types::resolve_overlay_ops(&mut ops);
-        cursor.set_overlay_ops(ops);
-        cursor.set_epoch(overlay.epoch());
+        cursor.set_overlay_ops(ops.into());
     }
 
     // Membership filter for s_id (fast O(1)).
@@ -1062,8 +1154,7 @@ fn binary_range_bounded_v3(
     if !overlay_ops.is_empty() {
         fluree_db_binary_index::read::types::sort_overlay_ops(&mut overlay_ops, order);
         fluree_db_binary_index::read::types::resolve_overlay_ops(&mut overlay_ops);
-        cursor.set_overlay_ops(overlay_ops);
-        cursor.set_epoch(overlay.epoch());
+        cursor.set_overlay_ops(overlay_ops.into());
     }
 
     let view =
@@ -1293,6 +1384,16 @@ fn overlay_only_flakes(
             }
             if let Some(ref o_val) = match_val.o {
                 if flake.o != *o_val {
+                    return;
+                }
+            }
+
+            // Projection-predicate allow-list (parity with the indexed path).
+            // Applied here for novelty-only subjects that bypass the cursor
+            // loop above (subject/predicate/object Sid unresolvable in the
+            // persisted dict, or no branch manifest for this order).
+            if let Some(ref allow) = opts.predicate_filter {
+                if !allow.iter().any(|p| p == &flake.p) {
                     return;
                 }
             }

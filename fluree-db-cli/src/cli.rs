@@ -171,13 +171,14 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub config: Option<PathBuf>,
 
-    /// Memory budget in MB for bulk import (0 = auto: 60% of system RAM).
+    /// Memory budget in MB for bulk import (0 = auto: 80% of system RAM).
     /// Derives chunk size, concurrency limits, and run budget when not set explicitly.
     #[arg(long, global = true, default_value_t = 0)]
     pub memory_budget_mb: usize,
 
     /// Number of parallel parse threads for bulk import.
-    /// 0 = auto (system cores, default cap 6). Explicit values are not capped.
+    /// 0 = auto (most logical cores, capped to fit the memory budget).
+    /// Explicit values are honored as-is (not capped), floored at 1.
     #[arg(long, global = true, default_value_t = 0)]
     pub parallelism: usize,
 
@@ -206,8 +207,11 @@ pub enum Commands {
         ledger: String,
 
         /// Import data from a file or directory.
-        /// Accepts a single .ttl, .json, or .jsonld file, or a directory of
-        /// .ttl/.trig or .jsonld files (bulk import, bypasses novelty).
+        /// Accepts a single .ttl, .nt, .nq, .json, .jsonld, or .jsonl/.ndjson
+        /// file, or a directory of .ttl/.nt/.nq/.trig, .jsonld, or
+        /// .jsonl/.ndjson files (bulk import, bypasses novelty).
+        /// Any of these may carry a `.gz` or `.zst` suffix and is decoded
+        /// transparently (e.g. `data.ttl.gz`, `dump.nq.zst`).
         /// Files in a directory are processed in lexicographic order.
         #[arg(long)]
         from: Option<PathBuf>,
@@ -228,13 +232,14 @@ pub enum Commands {
         #[arg(long, default_value_t = 0)]
         chunk_size_mb: usize,
 
-        /// Memory budget in MB for bulk import (0 = auto: 60% of system RAM).
+        /// Memory budget in MB for bulk import (0 = auto: 80% of system RAM).
         /// Derives chunk size, concurrency limits, and run budget when not set explicitly.
         #[arg(long, default_value_t = 0)]
         memory_budget_mb: usize,
 
         /// Number of parallel parse threads for bulk import.
-        /// 0 = auto (system cores, default cap 6). Explicit values are not capped.
+        /// 0 = auto (most logical cores, capped to fit the memory budget).
+        /// Explicit values are honored as-is (not capped), floored at 1.
         #[arg(long, default_value_t = 0)]
         parallelism: usize,
 
@@ -505,6 +510,60 @@ pub enum Commands {
         /// (e.g. `--max-fuel 1000`). Implies `--track-fuel`.
         #[arg(long)]
         max_fuel: Option<f64>,
+
+        #[command(flatten)]
+        policy: PolicyArgs,
+    },
+
+    /// Execute a multi-query envelope (multiple queries against a shared snapshot)
+    ///
+    /// Bundles N JSON-LD and/or SPARQL queries into a single request that
+    /// runs them in parallel against one resolved snapshot moment. Each
+    /// sub-query declares its own `from`; envelope-level `@context` /
+    /// `opts` / `asOf` lift into every sub-query as defaults.
+    ///
+    /// Examples:
+    ///   fluree multi-query envelope.json --remote origin
+    ///   cat envelope.json | fluree multi-query --remote origin
+    ///   fluree multi-query -e '{"queries":{"a":{"language":"jsonld","query":{"from":"mydb","select":["?s"],"where":{"@id":"?s"}}}}}'
+    ///
+    /// See `docs/api/multi-query.md` for the full envelope wire format.
+    #[command(name = "multi-query")]
+    MultiQuery {
+        /// Optional path to envelope JSON file. With 0 args reads from
+        /// stdin (or use -e / -f).
+        #[arg(num_args = 0..=1)]
+        args: Vec<String>,
+
+        /// Inline envelope JSON.
+        #[arg(short = 'e', long = "expr")]
+        expr: Option<String>,
+
+        /// Read envelope from a file.
+        #[arg(short = 'f', long = "file")]
+        file: Option<PathBuf>,
+
+        /// Per-alias result format (`json` or `typed-json`). Matches the
+        /// same flag on `fluree query`. Applies to every alias's result
+        /// inside the envelope's `results` map.
+        #[arg(long, default_value = "json")]
+        format: String,
+
+        /// Normalize arrays: always wrap multi-value JSON-LD properties in
+        /// arrays. Matches the same flag on `fluree query`; applies to
+        /// JSON-LD aliases.
+        #[arg(long)]
+        normalize_arrays: bool,
+
+        /// Envelope display format. `json` (default) prints the response
+        /// envelope as-is; `pretty` indents it; `aliases` prints per-alias
+        /// result sections with status/errors at the top.
+        #[arg(long, default_value = "json")]
+        output: String,
+
+        /// Execute against a remote server (by remote name, e.g., "origin").
+        #[arg(long)]
+        remote: Option<String>,
 
         #[command(flatten)]
         policy: PolicyArgs,

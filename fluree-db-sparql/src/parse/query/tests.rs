@@ -394,7 +394,7 @@ fn test_subquery_with_limit() {
     let ast = assert_parses("SELECT * WHERE { { SELECT ?x WHERE { ?x ?p ?o } LIMIT 10 } }");
     if let QueryBody::Select(q) = &ast.body {
         if let GraphPattern::SubSelect { query, .. } = &q.where_clause.pattern {
-            assert_eq!(query.limit, Some(10));
+            assert_eq!(query.modifiers.limit.as_ref().map(|l| l.value), Some(10));
         } else {
             panic!("Expected SubSelect pattern");
         }
@@ -406,9 +406,17 @@ fn test_subquery_with_order_by() {
     let ast = assert_parses("SELECT * WHERE { { SELECT ?x WHERE { ?x ?p ?o } ORDER BY ?x } }");
     if let QueryBody::Select(q) = &ast.body {
         if let GraphPattern::SubSelect { query, .. } = &q.where_clause.pattern {
-            assert_eq!(query.order_by.len(), 1);
-            assert_eq!(query.order_by[0].var.name.as_ref(), "x");
-            assert!(!query.order_by[0].descending);
+            let order = query
+                .modifiers
+                .order_by
+                .as_ref()
+                .expect("Expected ORDER BY");
+            assert_eq!(order.conditions.len(), 1);
+            assert_eq!(order.conditions[0].direction, OrderDirection::Asc);
+            match &order.conditions[0].expr {
+                OrderExpr::Var(v) => assert_eq!(v.name.as_ref(), "x"),
+                other => panic!("Expected bare variable ORDER BY, got {other:?}"),
+            }
         } else {
             panic!("Expected SubSelect pattern");
         }
@@ -421,8 +429,13 @@ fn test_subquery_with_order_by_desc() {
         assert_parses("SELECT * WHERE { { SELECT ?x WHERE { ?x ?p ?o } ORDER BY DESC(?x) } }");
     if let QueryBody::Select(q) = &ast.body {
         if let GraphPattern::SubSelect { query, .. } = &q.where_clause.pattern {
-            assert_eq!(query.order_by.len(), 1);
-            assert!(query.order_by[0].descending);
+            let order = query
+                .modifiers
+                .order_by
+                .as_ref()
+                .expect("Expected ORDER BY");
+            assert_eq!(order.conditions.len(), 1);
+            assert_eq!(order.conditions[0].direction, OrderDirection::Desc);
         } else {
             panic!("Expected SubSelect pattern");
         }
@@ -1489,7 +1502,7 @@ fn test_insert_data_simple() {
         assert_parses("INSERT DATA { <http://example.org/s> <http://example.org/p> \"value\" }");
     match &ast.body {
         QueryBody::Update(UpdateOperation::InsertData(insert)) => {
-            assert_eq!(insert.data.triples.len(), 1);
+            assert_eq!(insert.data.quads.len(), 1);
         }
         _ => panic!("Expected INSERT DATA"),
     }
@@ -1502,7 +1515,7 @@ fn test_insert_data_multiple_triples() {
     );
     match &ast.body {
         QueryBody::Update(UpdateOperation::InsertData(insert)) => {
-            assert_eq!(insert.data.triples.len(), 2);
+            assert_eq!(insert.data.quads.len(), 2);
         }
         _ => panic!("Expected INSERT DATA"),
     }
@@ -1513,7 +1526,7 @@ fn test_insert_data_prefixed() {
     let ast = assert_parses("PREFIX ex: <http://example.org/> INSERT DATA { ex:s ex:p \"value\" }");
     match &ast.body {
         QueryBody::Update(UpdateOperation::InsertData(insert)) => {
-            assert_eq!(insert.data.triples.len(), 1);
+            assert_eq!(insert.data.quads.len(), 1);
         }
         _ => panic!("Expected INSERT DATA"),
     }
@@ -1525,7 +1538,70 @@ fn test_delete_data_simple() {
         assert_parses("DELETE DATA { <http://example.org/s> <http://example.org/p> \"value\" }");
     match &ast.body {
         QueryBody::Update(UpdateOperation::DeleteData(delete)) => {
-            assert_eq!(delete.data.triples.len(), 1);
+            assert_eq!(delete.data.quads.len(), 1);
+        }
+        _ => panic!("Expected DELETE DATA"),
+    }
+}
+
+#[test]
+fn test_insert_data_graph_block() {
+    // Issue #1288: INSERT DATA { GRAPH <g> { ... } } (QuadsNotTriples).
+    use crate::ast::pattern::GraphName;
+    use crate::ast::QuadPatternElement;
+    let ast = assert_parses(
+        "INSERT DATA { GRAPH <https://example.org/g/1> { <https://example.org/s/1> <https://example.org/p> \"v\" } }"
+    );
+    match &ast.body {
+        QueryBody::Update(UpdateOperation::InsertData(insert)) => {
+            assert_eq!(insert.data.quads.len(), 1);
+            match &insert.data.quads[0] {
+                QuadPatternElement::Graph { name, triples, .. } => {
+                    assert!(matches!(name, GraphName::Iri(_)));
+                    assert_eq!(triples.len(), 1);
+                }
+                _ => panic!("Expected a GRAPH block in INSERT DATA"),
+            }
+        }
+        _ => panic!("Expected INSERT DATA"),
+    }
+}
+
+#[test]
+fn test_insert_data_mixed_default_and_graph() {
+    use crate::ast::QuadPatternElement;
+    let ast = assert_parses(
+        "PREFIX ex: <http://example.org/> INSERT DATA { ex:a ex:p \"d\" . GRAPH <urn:g> { ex:b ex:p \"n\" } }"
+    );
+    match &ast.body {
+        QueryBody::Update(UpdateOperation::InsertData(insert)) => {
+            assert_eq!(insert.data.quads.len(), 2);
+            assert!(matches!(
+                insert.data.quads[0],
+                QuadPatternElement::Triple(_)
+            ));
+            assert!(matches!(
+                insert.data.quads[1],
+                QuadPatternElement::Graph { .. }
+            ));
+        }
+        _ => panic!("Expected INSERT DATA"),
+    }
+}
+
+#[test]
+fn test_delete_data_graph_block() {
+    use crate::ast::QuadPatternElement;
+    let ast = assert_parses(
+        "DELETE DATA { GRAPH <urn:g> { <http://example.org/s> <http://example.org/p> \"v\" } }",
+    );
+    match &ast.body {
+        QueryBody::Update(UpdateOperation::DeleteData(delete)) => {
+            assert_eq!(delete.data.quads.len(), 1);
+            assert!(matches!(
+                delete.data.quads[0],
+                QuadPatternElement::Graph { .. }
+            ));
         }
         _ => panic!("Expected DELETE DATA"),
     }
@@ -1876,4 +1952,77 @@ fn test_service_fluree_ledger_endpoint() {
             other => panic!("expected Service, got {other:?}"),
         }
     }
+}
+
+#[test]
+fn test_pragma_reasoning_single_mode() {
+    let ast = assert_parses("# PRAGMA reasoning: owl2rl\nSELECT * WHERE { }");
+    assert_eq!(ast.pragmas.reasoning, Some(vec!["owl2rl".to_string()]));
+}
+
+#[test]
+fn test_pragma_reasoning_case_insensitive_and_no_colon() {
+    let ast = assert_parses("#pragma Reasoning owl2rl\nSELECT * WHERE { }");
+    assert_eq!(ast.pragmas.reasoning, Some(vec!["owl2rl".to_string()]));
+}
+
+#[test]
+fn test_pragma_reasoning_multiple_modes() {
+    let ast = assert_parses("# PRAGMA reasoning: rdfs, datalog\nSELECT * WHERE { }");
+    assert_eq!(
+        ast.pragmas.reasoning,
+        Some(vec!["rdfs".to_string(), "datalog".to_string()])
+    );
+}
+
+#[test]
+fn test_pragma_reasoning_last_wins() {
+    let ast =
+        assert_parses("# PRAGMA reasoning: rdfs\n# PRAGMA reasoning: owl2rl\nSELECT * WHERE { }");
+    assert_eq!(ast.pragmas.reasoning, Some(vec!["owl2rl".to_string()]));
+}
+
+#[test]
+fn test_pragma_reasoning_empty_value_preserved() {
+    let ast = assert_parses("# PRAGMA reasoning:\nSELECT * WHERE { }");
+    assert_eq!(ast.pragmas.reasoning, Some(Vec::new()));
+}
+
+#[test]
+fn test_ordinary_comments_are_not_pragmas() {
+    let ast =
+        assert_parses("# just a comment about reasoning\n# PRAGMATIC note\nSELECT * WHERE { }");
+    assert_eq!(ast.pragmas.reasoning, None);
+}
+
+#[test]
+fn test_unknown_pragma_ignored() {
+    let ast = assert_parses("# PRAGMA timeout: 30\nSELECT * WHERE { }");
+    assert_eq!(ast.pragmas.reasoning, None);
+}
+
+#[test]
+fn test_pragma_after_query_body_line() {
+    // Pragmas are honored anywhere as full-line comments.
+    let ast = assert_parses("SELECT * WHERE { }\n# PRAGMA reasoning: rdfs");
+    assert_eq!(ast.pragmas.reasoning, Some(vec!["rdfs".to_string()]));
+}
+
+#[test]
+fn test_pragma_inside_string_literal_ignored() {
+    // A '#' line inside a long string literal is data, not a comment —
+    // it must never be interpreted as a pragma.
+    let ast = assert_parses("SELECT * WHERE { ?s ?p \"\"\"\n# PRAGMA reasoning: owl2rl\n\"\"\" }");
+    assert_eq!(ast.pragmas.reasoning, None);
+
+    // Same for single-line strings containing a '#'.
+    let ast = assert_parses("SELECT * WHERE { ?s ?p \"# PRAGMA reasoning: owl2rl\" }");
+    assert_eq!(ast.pragmas.reasoning, None);
+}
+
+#[test]
+fn test_pragma_in_trailing_comment_honored() {
+    // A genuine trailing comment is a comment; the lexer identifies it.
+    let ast = assert_parses("SELECT * WHERE { } # PRAGMA reasoning: rdfs");
+    assert_eq!(ast.pragmas.reasoning, Some(vec!["rdfs".to_string()]));
 }

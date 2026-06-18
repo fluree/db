@@ -79,8 +79,14 @@ pub struct IndexConfig {
 /// - In-memory uncommitted changes (Novelty)
 #[derive(Debug, Clone)]
 pub struct LedgerState {
-    /// The indexed snapshot
-    pub snapshot: LedgerSnapshot,
+    /// The indexed snapshot.
+    ///
+    /// `Arc`-wrapped so cloning a `LedgerState` (and deriving read views /
+    /// query snapshots from it — the per-query hot path) is a cheap refcount
+    /// bump rather than a deep copy of the namespace maps, stats, schema, and
+    /// graph registry. Mutations go through `Arc::make_mut` (copy-on-write),
+    /// which is fine because writers are rare and already serialized.
+    pub snapshot: Arc<LedgerSnapshot>,
     /// In-memory overlay of uncommitted transactions
     pub novelty: Arc<Novelty>,
     /// Dictionary novelty layer for subjects and strings.
@@ -219,7 +225,7 @@ impl LedgerState {
                         .map(|id| novelty_overlay.get_flake(id)),
                 );
                 return Ok(Self {
-                    snapshot,
+                    snapshot: Arc::new(snapshot),
                     novelty: Arc::new(novelty_overlay),
                     dict_novelty: Arc::new(dict_novelty),
                     runtime_small_dicts: Arc::new(runtime_small_dicts),
@@ -236,7 +242,7 @@ impl LedgerState {
         let head_index_id = record.index_head_id.clone();
         let novelty_t = snapshot.t;
         Ok(Self {
-            snapshot,
+            snapshot: Arc::new(snapshot),
             novelty: Arc::new(Novelty::new(novelty_t)),
             dict_novelty: Arc::new(dict_novelty),
             runtime_small_dicts: Arc::new(RuntimeSmallDicts::new()),
@@ -367,7 +373,7 @@ impl LedgerState {
                 .map(|id| novelty.get_flake(id)),
         );
         Self {
-            snapshot,
+            snapshot: Arc::new(snapshot),
             novelty: Arc::new(novelty),
             dict_novelty: Arc::new(dict_novelty),
             runtime_small_dicts: Arc::new(runtime_small_dicts),
@@ -493,7 +499,10 @@ impl LedgerState {
         );
         // Re-populate dict_novelty with any remaining novelty flakes (t > index_t)
         // so overlay translation can resolve newly-introduced subject/string IDs.
-        if !new_novelty.is_empty() {
+        // Note: use `size > 0` not `is_empty()` — after clear_up_to the arena still
+        // holds dead flakes, but `size` tracks only active bytes.
+        let has_remaining_novelty = new_novelty.size > 0;
+        if has_remaining_novelty {
             new_dict_novelty.populate_from_flakes_iter(
                 new_novelty
                     .iter_index(fluree_db_core::IndexType::Post)
@@ -502,7 +511,7 @@ impl LedgerState {
         }
 
         let mut new_runtime_small_dicts = RuntimeSmallDicts::new();
-        if !new_novelty.is_empty() {
+        if has_remaining_novelty {
             new_runtime_small_dicts.populate_from_flakes_iter(
                 new_novelty
                     .iter_index(fluree_db_core::IndexType::Post)
@@ -511,7 +520,7 @@ impl LedgerState {
         }
 
         // Update state
-        self.snapshot = new_snapshot;
+        self.snapshot = Arc::new(new_snapshot);
         self.novelty = Arc::new(new_novelty);
         self.dict_novelty = Arc::new(new_dict_novelty);
         self.runtime_small_dicts = Arc::new(new_runtime_small_dicts);
@@ -613,7 +622,7 @@ impl LedgerState {
         }
 
         // Update state
-        self.snapshot = merged_snapshot;
+        self.snapshot = Arc::new(merged_snapshot);
         self.novelty = Arc::new(new_novelty);
         self.dict_novelty = Arc::new(new_dict_novelty);
         self.runtime_small_dicts = Arc::new(new_runtime_small_dicts);
@@ -664,11 +673,11 @@ impl LedgerState {
         // declaring a non-default mode doesn't fail the immutability check
         // when its namespace codes are inserted under the wrong mode.
         if let Some(mode) = commit.ns_split_mode {
-            self.snapshot.set_ns_split_mode(mode, commit_t)?;
+            Arc::make_mut(&mut self.snapshot).set_ns_split_mode(mode, commit_t)?;
         }
 
         // Apply namespace + graph deltas to snapshot
-        self.snapshot
+        Arc::make_mut(&mut self.snapshot)
             .apply_envelope_deltas(&commit.namespace_delta, &graph_iris)?;
 
         // Generate commit metadata flakes
@@ -691,21 +700,22 @@ impl LedgerState {
             reverse_graph.entry(g_sid).or_insert(TXN_META_GRAPH_ID);
         }
 
-        // Clone and extend dict_novelty (existing entries still valid)
-        let mut new_dict_novelty = (*self.dict_novelty).clone();
-        new_dict_novelty.populate_from_flakes(&all_flakes);
+        // Validate the batch before mutating any state: this state may be the
+        // live, cache-shared ledger under a write lock, so a routing/overflow
+        // error must not leave it partially updated. After can_apply succeeds the
+        // in-place extends below are all infallible, restoring the all-or-nothing
+        // semantics the previous clone-then-swap provided — without the clone.
+        self.novelty.can_apply(&all_flakes, &reverse_graph)?;
 
-        let mut new_runtime_small_dicts = (*self.runtime_small_dicts).clone();
-        new_runtime_small_dicts.populate_from_flakes(&all_flakes);
-
-        // Clone and extend novelty
-        let mut new_novelty = (*self.novelty).clone();
-        new_novelty.apply_commit(all_flakes, commit_t, &reverse_graph)?;
+        // Extend dict_novelty / small dicts / novelty in place when this state
+        // uniquely owns them (Arc::make_mut), copy-on-write only when a reader or
+        // cache still holds the prior Arc. Matches the snapshot handling above and
+        // avoids the unconditional deep clone the previous clone-then-swap forced.
+        Arc::make_mut(&mut self.dict_novelty).populate_from_flakes(&all_flakes);
+        Arc::make_mut(&mut self.runtime_small_dicts).populate_from_flakes(&all_flakes);
+        Arc::make_mut(&mut self.novelty).apply_commit(all_flakes, commit_t, &reverse_graph)?;
 
         // Update state
-        self.novelty = Arc::new(new_novelty);
-        self.dict_novelty = Arc::new(new_dict_novelty);
-        self.runtime_small_dicts = Arc::new(new_runtime_small_dicts);
         self.head_commit_id = Some(commit_id.clone());
 
         // Update ns_record
@@ -1452,8 +1462,7 @@ mod tests {
         let mut state = LedgerState::new(snapshot, Novelty::new(0));
 
         // Simulate commit t=1: add namespace code + flake
-        state
-            .snapshot
+        Arc::make_mut(&mut state.snapshot)
             .insert_namespace_code(100, "http://example.org/ns/".to_string())
             .unwrap();
         let reverse_graph = state.snapshot.build_reverse_graph().unwrap_or_default();
@@ -1505,8 +1514,7 @@ mod tests {
 
         // Register a custom graph in the old snapshot (simulating commit t=1)
         let graph_iri = "http://example.org/graph/test";
-        state
-            .snapshot
+        Arc::make_mut(&mut state.snapshot)
             .graph_registry
             .apply_delta(&[graph_iri.to_string()]);
 
@@ -1561,8 +1569,7 @@ mod tests {
         let mut state = LedgerState::new(snapshot, Novelty::new(0));
 
         // Add custom namespace to old snapshot
-        state
-            .snapshot
+        Arc::make_mut(&mut state.snapshot)
             .insert_namespace_code(200, "http://old.example.org/".to_string())
             .unwrap();
 

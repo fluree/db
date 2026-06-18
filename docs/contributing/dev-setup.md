@@ -331,17 +331,29 @@ View results: `target/criterion/report/index.html`
 
 ### Flamegraphs
 
-Generate flamegraph:
+> **A stock `--release` flamegraph is blank.** `[profile.release]` sets
+> `strip = true` with no `debug`, so symbols are gone and every frame shows as
+> `[unknown]`. Override `strip`/`debug` for the build and add frame pointers —
+> this keeps release's `lto = true, codegen-units = 1` (so you profile the same
+> program CI ships) while making stacks symbolize:
 
 ```bash
 # Install tools (Linux)
 sudo apt install linux-tools-common linux-tools-generic
+cargo install flamegraph
 
-# Generate flamegraph
-cargo flamegraph --bin fluree-db-server
+# Generate flamegraph with symbols (env overrides, no Cargo.toml change needed)
+CARGO_PROFILE_RELEASE_STRIP=false \
+CARGO_PROFILE_RELEASE_DEBUG=line-tables-only \
+RUSTFLAGS="-C force-frame-pointers=yes" \
+  cargo flamegraph --bin fluree-db-server
 
 # Open flamegraph.svg in browser
 ```
+
+To isolate one operation inside a long-lived process, attach `perf` to a
+window: `perf record -g --call-graph fp -F 997 -p <pid> -- sleep <secs>`, then
+`perf script | inferno-collapse-perf | inferno-flamegraph > out.svg`.
 
 ### perf (Linux)
 

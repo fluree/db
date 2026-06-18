@@ -1692,6 +1692,231 @@ async fn sparql_single_db_graph_variable_bound_non_matching() {
     assert_eq!(jsonld, json!([]));
 }
 
+// -----------------------------------------------------------------------------
+// Issue #1279: user-registered named graphs are visible to GRAPH patterns in
+// single-db mode WITHOUT an explicit `FROM NAMED`.
+// -----------------------------------------------------------------------------
+
+/// Seed a ledger via TriG upsert: "Alice" in the default graph and "Bob" in the
+/// user named graph `<urn:probegraph>` (registered at g_id >= FIRST_USER_GRAPH_ID).
+async fn seed_named_graph_ledger(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
+    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let trig = r#"
+        @prefix ex: <http://example.org/ns/> .
+        @prefix schema: <http://schema.org/> .
+
+        ex:alice schema:name "Alice" .
+
+        GRAPH <urn:probegraph> {
+            ex:bob schema:name "Bob" .
+        }
+    "#;
+    fluree
+        .stage_owned(ledger0)
+        .upsert_turtle(trig)
+        .execute()
+        .await
+        .expect("trig upsert should succeed")
+        .ledger
+}
+
+/// Concrete `GRAPH <user-iri>` with NO `FROM NAMED` returns the named graph's
+/// data (issue #1279 reproducer, step 2). Previously returned empty.
+#[tokio::test]
+async fn sparql_single_db_graph_user_named_concrete() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_named_graph_ledger(&fluree, "ngquirk:main").await;
+
+    let sparql = r"
+        PREFIX schema: <http://schema.org/>
+        SELECT ?name
+        WHERE {
+            GRAPH <urn:probegraph> {
+                ?s schema:name ?name
+            }
+        }
+    ";
+    let result = support::query_sparql(&fluree, &ledger, sparql)
+        .await
+        .expect("query should succeed");
+    let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+
+    // Only the named-graph subject (Bob) — Alice lives in the default graph.
+    assert_eq!(normalize_rows(&jsonld), normalize_rows(&json!([["Bob"]])));
+}
+
+/// `GRAPH ?g` discovers user-registered named graphs (plus the ledger alias for
+/// the default graph) and EXCLUDES system graphs txn-meta/config (issue #1279
+/// reproducer, step 4 + open decision #1).
+#[tokio::test]
+async fn sparql_single_db_graph_variable_discovers_user_graphs() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_named_graph_ledger(&fluree, "ngquirk:main").await;
+
+    let sparql = r"
+        SELECT DISTINCT ?g
+        WHERE {
+            GRAPH ?g { ?s ?p ?o }
+        }
+    ";
+    let result = support::query_sparql(&fluree, &ledger, sparql)
+        .await
+        .expect("query should succeed");
+    let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+
+    let mut graphs: Vec<String> = normalize_rows(&jsonld)
+        .into_iter()
+        .map(|row| row[0].as_str().expect("?g is a string").to_string())
+        .collect();
+    graphs.sort();
+
+    // The user named graph and the ledger alias (default graph), and nothing
+    // else — the reserved txn-meta (g_id=1) / config (g_id=2) graphs are not
+    // auto-exposed.
+    assert_eq!(
+        graphs,
+        vec!["ngquirk:main".to_string(), "urn:probegraph".to_string()]
+    );
+}
+
+/// Bound `GRAPH ?g` to a user named graph resolves without `FROM NAMED`.
+#[tokio::test]
+async fn sparql_single_db_graph_variable_bound_user_graph() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_named_graph_ledger(&fluree, "ngquirk:main").await;
+
+    let sparql = r#"
+        PREFIX schema: <http://schema.org/>
+        SELECT ?name
+        WHERE {
+            VALUES ?g { "urn:probegraph" }
+            GRAPH ?g { ?s schema:name ?name }
+        }
+    "#;
+    let result = support::query_sparql(&fluree, &ledger, sparql)
+        .await
+        .expect("query should succeed");
+    let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+
+    assert_eq!(normalize_rows(&jsonld), normalize_rows(&json!([["Bob"]])));
+}
+
+/// Unregistered graph IRI still returns empty (registry resolution must not
+/// match arbitrary IRIs).
+#[tokio::test]
+async fn sparql_single_db_graph_unregistered_iri_empty() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_named_graph_ledger(&fluree, "ngquirk:main").await;
+
+    let sparql = r"
+        SELECT ?s
+        WHERE {
+            GRAPH <urn:does-not-exist> { ?s ?p ?o }
+        }
+    ";
+    let result = support::query_sparql(&fluree, &ledger, sparql)
+        .await
+        .expect("query should succeed");
+    let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+
+    assert_eq!(jsonld, json!([]));
+}
+
+/// Idiomatic bound `GRAPH ?g` using an IRI term (`VALUES ?g { <iri> }`, which
+/// lowers to a Sid/Iri binding, not a string literal) resolves the user named
+/// graph without `FROM NAMED`.
+#[tokio::test]
+async fn sparql_single_db_graph_variable_bound_user_graph_iri() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_named_graph_ledger(&fluree, "ngquirk:main").await;
+
+    let sparql = r"
+        PREFIX schema: <http://schema.org/>
+        SELECT ?name
+        WHERE {
+            VALUES ?g { <urn:probegraph> }
+            GRAPH ?g { ?s schema:name ?name }
+        }
+    ";
+    let result = support::query_sparql(&fluree, &ledger, sparql)
+        .await
+        .expect("query should succeed");
+    let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+
+    assert_eq!(normalize_rows(&jsonld), normalize_rows(&json!([["Bob"]])));
+}
+
+/// The ledger alias addresses the **default** graph even when a user graph is
+/// registered with an IRI equal to the ledger ID: alias resolution must win so
+/// `GRAPH <ledger-id>` never gets shadowed by the colliding named graph.
+#[tokio::test]
+async fn sparql_single_db_graph_alias_wins_over_colliding_named_graph() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    let ledger0 = genesis_ledger(&fluree, "ngquirk:main");
+    let trig = r#"
+        @prefix ex: <http://example.org/ns/> .
+        @prefix schema: <http://schema.org/> .
+
+        ex:alice schema:name "Alice" .
+
+        GRAPH <ngquirk:main> {
+            ex:bob schema:name "Bob" .
+        }
+    "#;
+    let ledger = fluree
+        .stage_owned(ledger0)
+        .upsert_turtle(trig)
+        .execute()
+        .await
+        .expect("trig upsert should succeed")
+        .ledger;
+
+    // GRAPH <ngquirk:main> must read the default graph (Alice), never the
+    // colliding named graph (Bob).
+    let sparql = r"
+        PREFIX schema: <http://schema.org/>
+        SELECT ?name
+        WHERE {
+            GRAPH <ngquirk:main> { ?s schema:name ?name }
+        }
+    ";
+    let result = support::query_sparql(&fluree, &ledger, sparql)
+        .await
+        .expect("query should succeed");
+    let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+
+    assert_eq!(normalize_rows(&jsonld), normalize_rows(&json!([["Alice"]])));
+}
+
+/// JSON-LD parity: `["graph", "<iri>", {...}]` resolves a user named graph in
+/// single-db mode without `FROM NAMED`, matching the SPARQL `GRAPH` behavior.
+#[tokio::test]
+async fn fql_single_db_graph_user_named_concrete() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_named_graph_ledger(&fluree, "ngquirk:main").await;
+
+    let query = json!({
+        "@context": {"schema": "http://schema.org/"},
+        "select": "?name",
+        "where": [
+            ["graph", "urn:probegraph", {"@id": "?s", "schema:name": "?name"}]
+        ]
+    });
+    let jsonld = support::query_jsonld_formatted(&fluree, &ledger, &query)
+        .await
+        .expect("query should succeed");
+
+    assert_eq!(jsonld, json!(["Bob"]));
+}
+
 #[tokio::test]
 async fn dataset_multi_ledger_time_travel_parsing() {
     assert_index_defaults();

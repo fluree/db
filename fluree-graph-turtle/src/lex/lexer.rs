@@ -39,6 +39,7 @@ impl<'a> Lexer<'a> {
     /// Returns an error immediately on the first invalid token, providing
     /// a clear error message with line/column and source context.
     pub fn tokenize(self) -> Result<Vec<Token>> {
+        crate::error::check_input_len(self.input.len())?;
         let mut tokens = Vec::new();
         let mut input = LocatingSlice::new(self.input);
 
@@ -758,8 +759,12 @@ fn parse_integer(input: &mut Input<'_>) -> ModalResult<TokenKind> {
     }
     num_str.push_str(digits);
 
-    let value = num_str.parse::<i64>().unwrap_or(0);
-    Ok(TokenKind::Integer(value))
+    // xsd:integer is unbounded: values past i64 promote to BigInt downstream
+    // (span-based token, like Decimal) instead of silently corrupting.
+    match num_str.parse::<i64>() {
+        Ok(value) => Ok(TokenKind::Integer(value)),
+        Err(_) => Ok(TokenKind::IntegerOverflow),
+    }
 }
 
 /// Parse a decimal literal.

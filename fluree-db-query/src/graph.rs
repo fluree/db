@@ -12,10 +12,14 @@
 //!
 //! # Single-DB Mode
 //!
-//! When there is no dataset (single-db mode), the db's alias acts as its "graph name":
-//! - `GRAPH <iri> { ... }`: Only executes if `iri == db.alias`; else empty result
-//! - `GRAPH ?g { ... }` with ?g bound: Only executes if bound value == db.alias
-//! - `GRAPH ?g { ... }` with ?g unbound: Binds ?g to db.alias and executes
+//! In single-db mode (no dataset) every graph of the ledger lives in one
+//! snapshot, partitioned by `g_id`. Named graphs resolve against the snapshot's
+//! graph registry (user graphs, `g_id >= FIRST_USER_GRAPH_ID`) without an
+//! explicit `FROM NAMED` (issue #1279); the ledger alias addresses the default
+//! graph, and reserved system graphs (txn-meta, config) stay private.
+//! - `GRAPH <iri>` / bound `GRAPH ?g`: executes for a registered user graph,
+//!   the ledger alias, or an R2RML graph source; otherwise empty
+//! - unbound `GRAPH ?g`: binds ?g to each registered user graph and the alias
 //!
 //! # Architecture
 //!
@@ -120,16 +124,23 @@ impl GraphOperator {
         }
     }
 
-    /// Extract graph IRI from a binding (for "?g already bound" check)
-    ///
-    /// Accepts `Binding::Lit { val: FlakeValue::String(s), .. }` and returns the string.
-    fn extract_graph_iri_from_binding(binding: &Binding) -> Option<Arc<str>> {
+    /// Extract a graph IRI from a bound `?g`. Handles the IRI-typed forms a
+    /// normal query produces — `<iri>` lowered to a `Sid` (decoded against the
+    /// active snapshot), a raw `Iri`, or a cross-ledger `IriMatch` — and also a
+    /// plain string literal for back-compat.
+    fn extract_graph_iri_from_binding(
+        ctx: &ExecutionContext<'_>,
+        binding: &Binding,
+    ) -> Option<Arc<str>> {
+        if let Some(iri) = binding.get_iri() {
+            return Some(Arc::clone(iri));
+        }
         match binding {
+            Binding::Sid { sid, .. } => ctx.active_snapshot.decode_sid(sid).map(Arc::from),
             Binding::Lit {
                 val: FlakeValue::String(s),
                 ..
             } => Some(Arc::from(s.as_str())),
-            // Could extend to handle Sid-based IRIs if needed
             _ => None,
         }
     }
@@ -144,7 +155,33 @@ impl GraphOperator {
         bind_graph_var: Option<VarId>,
     ) -> Result<()> {
         // Switch to the named graph context
-        let graph_ctx = ctx.with_active_graph(graph_iri.clone());
+        let mut graph_ctx = ctx.with_active_graph(graph_iri.clone());
+
+        // Cross-ledger provenance for GRAPH patterns.
+        //
+        // Inside a `GRAPH <iri> { .. }` scope only one graph is active, so the
+        // inner `DatasetOperator`'s multi-ledger check (which compares the
+        // *active* graphs) is always false and it never stamps. The inner scan
+        // therefore emits plain `Binding::Sid` values encoded against this
+        // graph's namespace table. If the surrounding dataset spans multiple
+        // ledgers, those SIDs would later be decoded against the formatter's
+        // primary view (a different ledger), silently mis-decoding the IRI.
+        //
+        // When the dataset is multi-ledger, stamp inner results with this
+        // graph's home ledger so they carry `Binding::IriMatch` provenance —
+        // matching what `DatasetOperator` produces for the union (non-GRAPH)
+        // path. Forcing eager materialization makes the inner scan resolve
+        // `Binding::Sid` rather than late-materialized `Binding::EncodedSid`,
+        // which `stamp_provenance` cannot decode without the binary store.
+        let stamp_ledger_id: Option<Arc<str>> = match &ctx.dataset {
+            Some(ds) if ds.spans_multiple_ledgers() => ds
+                .named_graph(graph_iri.as_ref())
+                .map(|g| Arc::clone(&g.ledger_id)),
+            _ => None,
+        };
+        if stamp_ledger_id.is_some() {
+            graph_ctx.eager_materialization = true;
+        }
 
         // Check if this graph is backed by an R2RML mapping.
         // Prefer the precomputed set (populated in runner.rs for dataset queries),
@@ -152,6 +189,9 @@ impl GraphOperator {
         // single-source path where the GRAPH IRI may differ from the ledger_id.
         let is_r2rml_gs = if ctx.r2rml_graph_ids.contains(graph_iri.as_ref()) {
             true
+        } else if ctx.single_db_user_graph_id(&graph_iri).is_some() {
+            // Registered native graph — never R2RML; skip the per-graph probe.
+            false
         } else if let Some(provider) = ctx.r2rml_provider {
             provider.has_r2rml_mapping(&graph_iri).await
         } else {
@@ -196,7 +236,30 @@ impl GraphOperator {
 
         inner.open(&graph_ctx).await?;
 
+        // NumBig arena handles are scoped per (graph, predicate). When this
+        // GRAPH scope runs against a different g_id than the surrounding
+        // query, encoded NUM_BIG bindings escaping the scope would later be
+        // decoded against the OUTER graph's arena — silently producing wrong
+        // values. Materialize them here, against this graph's view, before
+        // they leave the scope. (Subject/string/predicate dictionaries are
+        // store-global, so all other encoded kinds escape safely.)
+        let numbig_exit_gv = if graph_ctx.binary_g_id != ctx.binary_g_id {
+            graph_ctx.graph_view()
+        } else {
+            None
+        };
+
         while let Some(batch) = inner.next_batch(&graph_ctx).await? {
+            graph_ctx.check_cancelled()?;
+            // Stamp cross-ledger provenance before merging so the formatter
+            // decodes SIDs against this graph's home ledger (see above).
+            let batch = match &stamp_ledger_id {
+                Some(ledger_id) => {
+                    crate::dataset_operator::stamp_provenance(batch, ledger_id, &graph_ctx)?
+                }
+                None => batch,
+            };
+
             // Merge each inner result with parent row
             for inner_row_idx in 0..batch.len() {
                 let mut merged_row = Vec::with_capacity(self.schema.len());
@@ -230,12 +293,23 @@ impl GraphOperator {
                             .get(inner_row_idx, *var)
                             .cloned()
                             .unwrap_or(Binding::Unbound);
+                        let binding = if numbig_exit_gv.is_some()
+                            && crate::object_binding::is_numbig_encoded(&binding)
+                        {
+                            crate::group_aggregate::materialize_encoded(
+                                &binding,
+                                numbig_exit_gv.as_ref(),
+                            )
+                        } else {
+                            binding
+                        };
                         merged_row.push(binding);
                     }
                 }
 
                 self.result_buffer.push(merged_row);
             }
+            graph_ctx.check_cancelled()?;
         }
 
         inner.close();
@@ -247,6 +321,10 @@ impl GraphOperator {
         if self.buffer_pos >= self.result_buffer.len() {
             return Ok(None);
         }
+
+        // Number of rows about to be drained — needed to size an empty-schema
+        // batch, where there are no columns to infer the row count from.
+        let drained = self.result_buffer.len() - self.buffer_pos;
 
         // Build batch from buffer
         let num_cols = self.schema.len();
@@ -262,7 +340,16 @@ impl GraphOperator {
 
         self.buffer_pos = self.result_buffer.len();
 
-        if columns.is_empty() || columns[0].is_empty() {
+        // A ground GRAPH body (e.g. `GRAPH <g> { :a :p "1" }`) produces no
+        // variables, so the schema is empty. Each matched row is still one
+        // empty-binding solution and must be preserved — emit an empty-schema
+        // batch carrying the row count rather than collapsing to zero rows
+        // (which would wrongly turn a satisfied existence check into a no-match).
+        if num_cols == 0 {
+            return Ok(Some(Batch::empty_schema_with_len(drained)));
+        }
+
+        if columns[0].is_empty() {
             Ok(None)
         } else {
             Ok(Some(Batch::new(self.schema.clone(), columns)?))
@@ -272,6 +359,9 @@ impl GraphOperator {
 
 #[async_trait]
 impl Operator for GraphOperator {
+    fn plan_children(&self) -> Vec<crate::plan_node::PlanChild<'_>> {
+        vec![crate::plan_node::PlanChild::child(self.child.as_ref())]
+    }
     fn schema(&self) -> &[VarId] {
         &self.schema
     }
@@ -331,17 +421,21 @@ impl Operator for GraphOperator {
                             }
                             // else: graph not found → no output for this row
                         } else {
-                            // No dataset — check R2RML precomputed set, then provider fallback
-                            let is_r2rml_gs = if ctx.r2rml_graph_ids.contains(iri.as_ref()) {
-                                true
-                            } else if let Some(provider) = ctx.r2rml_provider {
-                                provider.has_r2rml_mapping(iri).await
-                            } else {
-                                false
-                            };
+                            // Single-db: a registered user graph, the ledger
+                            // alias (default graph), or an R2RML graph source.
+                            let is_user_graph = ctx.single_db_user_graph_id(iri).is_some();
+                            let is_alias = iri.as_ref() == ctx.active_snapshot.ledger_id;
+                            let is_r2rml_gs = !is_user_graph
+                                && !is_alias
+                                && if ctx.r2rml_graph_ids.contains(iri.as_ref()) {
+                                    true
+                                } else if let Some(provider) = ctx.r2rml_provider {
+                                    provider.has_r2rml_mapping(iri).await
+                                } else {
+                                    false
+                                };
 
-                            // Execute if R2RML graph source or if graph name matches db's alias
-                            if is_r2rml_gs || iri.as_ref() == ctx.active_snapshot.ledger_id {
+                            if is_user_graph || is_alias || is_r2rml_gs {
                                 self.execute_in_graph(
                                     ctx,
                                     &parent_batch,
@@ -351,13 +445,14 @@ impl Operator for GraphOperator {
                                 )
                                 .await?;
                             }
-                            // else: graph name doesn't match alias and not R2RML graph source → no output
                         }
                     }
                     GraphName::Var(var) => {
                         // Check if ?g is already bound in parent row
                         if let Some(binding) = parent_batch.get(row_idx, *var) {
-                            if let Some(bound_iri) = Self::extract_graph_iri_from_binding(binding) {
+                            if let Some(bound_iri) =
+                                Self::extract_graph_iri_from_binding(ctx, binding)
+                            {
                                 // ?g already bound: use only that graph
                                 if let Some(ds) = &ctx.dataset {
                                     if ds.has_named_graph(&bound_iri) {
@@ -372,9 +467,14 @@ impl Operator for GraphOperator {
                                     }
                                     // else: graph not found → no output
                                 } else {
-                                    // No dataset — check R2RML precomputed set, then provider fallback
-                                    let is_r2rml_gs =
-                                        if ctx.r2rml_graph_ids.contains(bound_iri.as_ref()) {
+                                    // Single-db: same resolution as the concrete arm.
+                                    let is_user_graph =
+                                        ctx.single_db_user_graph_id(&bound_iri).is_some();
+                                    let is_alias =
+                                        bound_iri.as_ref() == ctx.active_snapshot.ledger_id;
+                                    let is_r2rml_gs = !is_user_graph
+                                        && !is_alias
+                                        && if ctx.r2rml_graph_ids.contains(bound_iri.as_ref()) {
                                             true
                                         } else if let Some(provider) = ctx.r2rml_provider {
                                             provider.has_r2rml_mapping(&bound_iri).await
@@ -382,10 +482,7 @@ impl Operator for GraphOperator {
                                             false
                                         };
 
-                                    // Execute if R2RML graph source or alias match
-                                    if is_r2rml_gs
-                                        || bound_iri.as_ref() == ctx.active_snapshot.ledger_id
-                                    {
+                                    if is_user_graph || is_alias || is_r2rml_gs {
                                         self.execute_in_graph(
                                             ctx,
                                             &parent_batch,
@@ -395,7 +492,6 @@ impl Operator for GraphOperator {
                                         )
                                         .await?;
                                     }
-                                    // else: bound IRI doesn't match alias and not R2RML graph source → no output
                                 }
                             }
                             // else: binding exists but isn't a string IRI → no output
@@ -413,8 +509,19 @@ impl Operator for GraphOperator {
                                     .await?;
                                 }
                             } else {
-                                // No dataset - single-db mode:
-                                // Bind ?g to db's alias and execute
+                                // Single-db: bind ?g to each registered user graph
+                                // (empty graphs emit no rows), then to the ledger
+                                // alias for the default graph.
+                                for iri in ctx.single_db_user_graph_iris() {
+                                    self.execute_in_graph(
+                                        ctx,
+                                        &parent_batch,
+                                        row_idx,
+                                        iri,
+                                        Some(*var),
+                                    )
+                                    .await?;
+                                }
                                 let alias_iri: Arc<str> =
                                     Arc::from(ctx.active_snapshot.ledger_id.as_str());
                                 self.execute_in_graph(
@@ -422,7 +529,7 @@ impl Operator for GraphOperator {
                                     &parent_batch,
                                     row_idx,
                                     alias_iri,
-                                    Some(*var), // Bind ?g to db alias
+                                    Some(*var),
                                 )
                                 .await?;
                             }
@@ -455,7 +562,8 @@ impl Operator for GraphOperator {
 mod tests {
     use super::*;
     use crate::ir::triple::{Ref, Term, TriplePattern};
-    use fluree_db_core::Sid;
+    use crate::var_registry::VarRegistry;
+    use fluree_db_core::{LedgerSnapshot, Sid};
 
     // Helper test struct for creating operators with specific schemas
     struct TestChildOperator {
@@ -534,7 +642,25 @@ mod tests {
 
     #[test]
     fn test_extract_graph_iri_from_binding() {
-        // Valid string binding
+        let snapshot = LedgerSnapshot::genesis("test/main");
+        let vars = VarRegistry::new();
+        let ctx = ExecutionContext::new(&snapshot, &vars);
+
+        // Raw IRI binding — the idiomatic `VALUES ?g { <iri> }` form
+        let binding = Binding::Iri(Arc::from("urn:probegraph"));
+        assert_eq!(
+            GraphOperator::extract_graph_iri_from_binding(&ctx, &binding),
+            Some(Arc::from("urn:probegraph"))
+        );
+
+        // Cross-ledger IriMatch carries the canonical IRI
+        let binding = Binding::iri_match("urn:other", Sid::new(2, "x"), "other:main");
+        assert_eq!(
+            GraphOperator::extract_graph_iri_from_binding(&ctx, &binding),
+            Some(Arc::from("urn:other"))
+        );
+
+        // String literal still accepted for back-compat
         let binding = Binding::Lit {
             val: FlakeValue::String("http://example.org/graph1".to_string()),
             dtc: DatatypeConstraint::Explicit(Sid::new(2, "string")),
@@ -542,10 +668,12 @@ mod tests {
             op: None,
             p_id: None,
         };
-        let iri = GraphOperator::extract_graph_iri_from_binding(&binding);
-        assert_eq!(iri, Some(Arc::from("http://example.org/graph1")));
+        assert_eq!(
+            GraphOperator::extract_graph_iri_from_binding(&ctx, &binding),
+            Some(Arc::from("http://example.org/graph1"))
+        );
 
-        // Non-string binding returns None
+        // Non-string literal and Unbound return None
         let binding = Binding::Lit {
             val: FlakeValue::Long(42),
             dtc: DatatypeConstraint::Explicit(Sid::new(2, "long")),
@@ -553,11 +681,13 @@ mod tests {
             op: None,
             p_id: None,
         };
-        let iri = GraphOperator::extract_graph_iri_from_binding(&binding);
-        assert_eq!(iri, None);
-
-        // Unbound returns None
-        let iri = GraphOperator::extract_graph_iri_from_binding(&Binding::Unbound);
-        assert_eq!(iri, None);
+        assert_eq!(
+            GraphOperator::extract_graph_iri_from_binding(&ctx, &binding),
+            None
+        );
+        assert_eq!(
+            GraphOperator::extract_graph_iri_from_binding(&ctx, &Binding::Unbound),
+            None
+        );
     }
 }

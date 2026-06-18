@@ -509,6 +509,26 @@ Fluree also exposes a built-in named graph inside each ledger for transaction / 
 
 See [Datasets](datasets.md) for details.
 
+### GRAPH patterns without `FROM NAMED`
+
+On the ledger-scoped query endpoint (`POST /query/{ledger}`), `GRAPH` patterns
+resolve the ledger's registered named graphs by default — no `FROM NAMED` is
+required:
+
+```sparql
+# Returns the named graph's triples even with no FROM NAMED
+SELECT ?s ?p ?o WHERE { GRAPH <urn:probegraph> { ?s ?p ?o } }
+
+# Discovers every user-registered named graph (plus the ledger alias,
+# which addresses the default graph)
+SELECT DISTINCT ?g WHERE { GRAPH ?g { ?s ?p ?o } }
+```
+
+Only user-registered named graphs are exposed this way; the reserved system
+graphs (`#txn-meta`, `#config`) remain addressable only via an explicit
+`FROM NAMED`. Supplying `FROM NAMED` still narrows `GRAPH` resolution to exactly
+the graphs listed.
+
 ## SPARQL Functions
 
 ### String Functions
@@ -547,7 +567,7 @@ See [Datasets](datasets.md) for details.
 
 - `STRDT(?str, ?datatype)` - String to typed literal
 - `STRLANG(?str, ?lang)` - String with language
-- `DATATYPE(?literal)` - Datatype
+- `DATATYPE(?literal)` - Datatype IRI of a literal (per W3C SPARQL 1.1 §17.4.2.3, an IRI term — e.g. the `xsd:decimal` IRI, **not** the string `"xsd:decimal"`). Compare it against a datatype IRI directly, e.g. `FILTER(DATATYPE(?v) = xsd:decimal)`. SPARQL results render it as the full IRI; JSON-LD results compact it against the active `@context`.
 - `IRI(?str)` - IRI from string
 - `URI(?str)` - URI from string
 - `BNODE(?str)` - Blank node

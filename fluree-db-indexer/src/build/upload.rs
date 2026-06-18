@@ -5,13 +5,18 @@
 //! `upload_indexes_to_cas` function for uploading index branches and leaves.
 
 use fluree_db_binary_index::RunSortOrder;
+use fluree_db_core::tracking::Tracker;
 use fluree_db_core::{ContentId, ContentKind, ContentStore, GraphId};
 
 use crate::error::{IndexerError, Result};
+use crate::fuel::charge_extra_leaflets;
 
 use super::types::UploadedIndexes;
 
 /// Upload a single dict blob (already in memory) to the content store and return its CID.
+///
+/// The base per-write fuel is charged by [`crate::fuel::MeteredContentStore`]
+/// when `cs` is the metered wrapper; this helper does not need a tracker.
 pub(crate) async fn upload_dict_blob(
     cs: &dyn ContentStore,
     dict: fluree_db_core::DictKind,
@@ -46,8 +51,15 @@ pub(crate) async fn upload_dict_file(
 ///
 /// Default graph (g_id=0) collects inline `LeafEntry` for root embedding.
 /// Named graphs upload branch manifests and return branch CIDs.
+///
+/// The base per-write fuel for every CAS write is charged by
+/// [`crate::fuel::MeteredContentStore`] when `cs` is the metered wrapper.
+/// The `tracker` param is used here only for the additional per-leaflet
+/// charge on FLI3 leaf writes (passthrough leaflets are not charged because
+/// no zstd encoding work was performed).
 pub(crate) async fn upload_indexes_to_cas(
     cs: &dyn ContentStore,
+    tracker: &Tracker,
     build_result: &crate::BuildResult,
 ) -> Result<UploadedIndexes> {
     use fluree_db_binary_index::format::branch::LeafEntry;
@@ -102,6 +114,7 @@ pub(crate) async fn upload_indexes_to_cas(
                 cs.put_with_id(&leaf_info.leaf_cid, &leaf_bytes)
                     .await
                     .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
+                charge_extra_leaflets(tracker, leaf_info.re_encoded_leaflet_count)?;
             }
 
             // Upload branch manifest for named graphs.

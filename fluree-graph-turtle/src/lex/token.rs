@@ -101,6 +101,11 @@ pub enum TokenKind {
     /// Integer literal (parsed inline).
     Integer(i64),
 
+    /// Integer literal that overflows i64 (xsd:integer is unbounded).
+    /// Span covers the numeric text; promoted to BigInt downstream.
+    /// Text: `&input[start..end]`
+    IntegerOverflow,
+
     /// Decimal literal.
     /// Span covers the numeric text.
     /// Text: `&input[start..end]`
@@ -186,6 +191,7 @@ impl std::fmt::Display for TokenKind {
             TokenKind::LongString => write!(f, "\"\"\"string\"\"\""),
             TokenKind::StringEscaped(s) => write!(f, "\"{s}\""),
             TokenKind::Integer(n) => write!(f, "{n}"),
+            TokenKind::IntegerOverflow => write!(f, "integer"),
             TokenKind::Decimal => write!(f, "decimal"),
             TokenKind::Double(n) => write!(f, "{n:e}"),
             TokenKind::LangTag => write!(f, "@lang"),

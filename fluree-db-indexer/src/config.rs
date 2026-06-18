@@ -150,6 +150,19 @@ pub struct IndexerConfig {
     /// Default: 4 (one per sort order in a single-graph workload)
     pub incremental_max_concurrency: usize,
 
+    /// Global budget of concurrent leaf/sidecar CAS uploads during incremental
+    /// Phase 2, shared across ALL (graph, order) branch-update tasks.
+    ///
+    /// Unlike [`incremental_max_concurrency`](Self::incremental_max_concurrency),
+    /// which bounds how many branch-update tasks run at once, this bounds the
+    /// total number of in-flight `put`s for new leaf/sidecar blobs across the
+    /// whole fold. A single semaphore enforces it so a skewed workload (most
+    /// leaves landing in one order-task) still parallelizes its uploads without
+    /// multiplying outer×inner concurrency.
+    ///
+    /// Default: 16.
+    pub incremental_leaf_upload_concurrency: usize,
+
     /// Target rows per leaflet (FLI3).
     ///
     /// This is primarily a build-format tuning knob. Smaller values produce
@@ -174,6 +187,16 @@ pub struct IndexerConfig {
     /// `None` means no limit (backwards-compatible default).
     pub incremental_max_commit_bytes: Option<usize>,
 
+    /// Maximum number of *existing* subjects whose `rdf:type` set may change in
+    /// a single incremental batch before incremental indexing aborts and defers
+    /// to a full rebuild. Re-typing (or deleting) an existing subject forces a
+    /// base-index re-scan to move its class-scoped property/ref stats (issue
+    /// #1266); above this count, recomputing class stats from scratch via the
+    /// rebuild SPOT pass is cheaper and simpler. Counts only subjects that
+    /// existed in the base index (new-subject inserts are free). Default
+    /// [`DEFAULT_INCREMENTAL_RETYPE_MAX_SUBJECTS`].
+    pub incremental_retype_max_subjects: usize,
+
     /// Configured full-text properties for this indexing run.
     ///
     /// Caller-computed (typically by `fluree-db-api` resolving the ledger's
@@ -197,6 +220,22 @@ pub struct IndexerConfig {
     /// `None` by default. The api layer wires its own resolver via
     /// [`IndexerConfig::with_fulltext_config_provider`].
     pub fulltext_config_provider: Option<Arc<dyn FulltextConfigProvider>>,
+
+    /// Pre-discovered commit CIDs (`t`, cid) with `t > index_t`, sorted
+    /// ascending by `t`, supplied by the nameservice's commit-CID index.
+    ///
+    /// Transient per-build data, not durable config: it lets incremental
+    /// indexing skip the serial commit-DAG walk and fetch bodies in parallel.
+    /// `None` means "no index available" — the indexer walks the DAG as
+    /// before. Populated only by the NS-aware entry point
+    /// (`build_index_for_ledger_with_tracker`); other entries leave it `None`.
+    pub pending_commit_cids: Option<Vec<(i64, fluree_db_core::ContentId)>>,
+
+    /// Force the serial commit-DAG walk baseline by skipping the commit-CID
+    /// index fast path. When `true`, the NS-aware entry point leaves
+    /// `pending_commit_cids` unset so discovery falls back to the serial walk.
+    /// Used to A/B the fast path against its baseline on the same backlog.
+    pub force_serial_commit_walk: bool,
 }
 
 /// Default run-sort budget: 256 MB.
@@ -207,6 +246,14 @@ pub const DEFAULT_INCREMENTAL_MAX_COMMITS: usize = 10_000;
 
 /// Default max concurrency for incremental branch updates.
 pub const DEFAULT_INCREMENTAL_MAX_CONCURRENCY: usize = 4;
+
+/// Default global budget of concurrent leaf/sidecar uploads in incremental
+/// Phase 2.
+pub const DEFAULT_INCREMENTAL_LEAF_UPLOAD_CONCURRENCY: usize = 16;
+
+/// Default cap on existing-subject `rdf:type` changes per incremental batch
+/// before deferring to full rebuild (issue #1266 ref/class-stat re-attribution).
+pub const DEFAULT_INCREMENTAL_RETYPE_MAX_SUBJECTS: usize = 100_000;
 
 impl Default for IndexerConfig {
     fn default() -> Self {
@@ -222,11 +269,15 @@ impl Default for IndexerConfig {
             incremental_enabled: true,
             incremental_max_commits: DEFAULT_INCREMENTAL_MAX_COMMITS,
             incremental_max_concurrency: DEFAULT_INCREMENTAL_MAX_CONCURRENCY,
+            incremental_leaf_upload_concurrency: DEFAULT_INCREMENTAL_LEAF_UPLOAD_CONCURRENCY,
             leaflet_rows: 25_000,
             leaflets_per_leaf: 10,
             incremental_max_commit_bytes: None,
+            incremental_retype_max_subjects: DEFAULT_INCREMENTAL_RETYPE_MAX_SUBJECTS,
             fulltext_configured_properties: Vec::new(),
             fulltext_config_provider: None,
+            pending_commit_cids: None,
+            force_serial_commit_walk: false,
         }
     }
 }
@@ -251,11 +302,15 @@ impl IndexerConfig {
             incremental_enabled: true,
             incremental_max_commits: DEFAULT_INCREMENTAL_MAX_COMMITS,
             incremental_max_concurrency: DEFAULT_INCREMENTAL_MAX_CONCURRENCY,
+            incremental_leaf_upload_concurrency: DEFAULT_INCREMENTAL_LEAF_UPLOAD_CONCURRENCY,
             leaflet_rows: 25_000,
             leaflets_per_leaf: 10,
             incremental_max_commit_bytes: None,
+            incremental_retype_max_subjects: DEFAULT_INCREMENTAL_RETYPE_MAX_SUBJECTS,
             fulltext_configured_properties: Vec::new(),
             fulltext_config_provider: None,
+            pending_commit_cids: None,
+            force_serial_commit_walk: false,
         }
     }
 
@@ -273,11 +328,15 @@ impl IndexerConfig {
             incremental_enabled: true,
             incremental_max_commits: DEFAULT_INCREMENTAL_MAX_COMMITS,
             incremental_max_concurrency: DEFAULT_INCREMENTAL_MAX_CONCURRENCY,
+            incremental_leaf_upload_concurrency: DEFAULT_INCREMENTAL_LEAF_UPLOAD_CONCURRENCY,
             leaflet_rows: 25_000,
             leaflets_per_leaf: 10,
             incremental_max_commit_bytes: None,
+            incremental_retype_max_subjects: DEFAULT_INCREMENTAL_RETYPE_MAX_SUBJECTS,
             fulltext_configured_properties: Vec::new(),
             fulltext_config_provider: None,
+            pending_commit_cids: None,
+            force_serial_commit_walk: false,
         }
     }
 
@@ -295,11 +354,15 @@ impl IndexerConfig {
             incremental_enabled: true,
             incremental_max_commits: DEFAULT_INCREMENTAL_MAX_COMMITS,
             incremental_max_concurrency: DEFAULT_INCREMENTAL_MAX_CONCURRENCY,
+            incremental_leaf_upload_concurrency: DEFAULT_INCREMENTAL_LEAF_UPLOAD_CONCURRENCY,
             leaflet_rows: 25_000,
             leaflets_per_leaf: 10,
             incremental_max_commit_bytes: None,
+            incremental_retype_max_subjects: DEFAULT_INCREMENTAL_RETYPE_MAX_SUBJECTS,
             fulltext_configured_properties: Vec::new(),
             fulltext_config_provider: None,
+            pending_commit_cids: None,
+            force_serial_commit_walk: false,
         }
     }
 
@@ -369,6 +432,20 @@ impl IndexerConfig {
     /// Builder method to set the maximum concurrency for incremental branch updates
     pub fn with_incremental_max_concurrency(mut self, max_concurrency: usize) -> Self {
         self.incremental_max_concurrency = max_concurrency.max(1);
+        self
+    }
+
+    /// Builder method to set the global leaf/sidecar upload concurrency budget
+    /// for incremental Phase 2.
+    pub fn with_incremental_leaf_upload_concurrency(mut self, budget: usize) -> Self {
+        self.incremental_leaf_upload_concurrency = budget.max(1);
+        self
+    }
+
+    /// Builder method to set the per-batch cap on existing-subject `rdf:type`
+    /// changes before incremental indexing defers to a full rebuild (#1266).
+    pub fn with_incremental_retype_max_subjects(mut self, max_subjects: usize) -> Self {
+        self.incremental_retype_max_subjects = max_subjects;
         self
     }
 }

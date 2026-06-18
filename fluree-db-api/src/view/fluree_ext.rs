@@ -13,6 +13,7 @@ use fluree_db_core::ids::GraphId;
 use fluree_db_core::{ContentStore, DictNovelty, IndexType, DEFAULT_GRAPH_ID, TXN_META_GRAPH_ID};
 use fluree_db_query::ir::ReasoningModes;
 use fluree_db_query::BinaryRangeProvider;
+use tracing::Instrument;
 
 // ============================================================================
 // View Loading
@@ -91,7 +92,7 @@ impl Fluree {
             let runtime_small_dicts = view.runtime_small_dicts.clone().unwrap_or_else(|| {
                 crate::runtime_dicts::build_runtime_small_dicts(&store, view.novelty.as_ref())
             });
-            let ns_fallback = Some(Arc::new(view.snapshot.namespaces().clone()));
+            let ns_fallback = Some(view.snapshot.shared_namespaces());
             let provider =
                 BinaryRangeProvider::new(store, dict_novelty, runtime_small_dicts, ns_fallback);
             let mut db = (*view.snapshot).clone();
@@ -175,6 +176,29 @@ impl Fluree {
         ledger_id: &str,
         include_default_context: bool,
     ) -> Result<GraphDb> {
+        // This is the multi-second phase between a request span and
+        // query_prepare on cold ledgers (commit/novelty load + binary index
+        // attach) — span it so traces can attribute that gap.
+        let span = tracing::debug_span!(
+            "ledger_view_load",
+            ledger_id = ledger_id,
+            cold_binary_store = tracing::field::Empty,
+        );
+        async move {
+            let span = tracing::Span::current();
+            self.load_graph_db_inner(ledger_id, include_default_context, &span)
+                .await
+        }
+        .instrument(span)
+        .await
+    }
+
+    async fn load_graph_db_inner(
+        &self,
+        ledger_id: &str,
+        include_default_context: bool,
+        span: &tracing::Span,
+    ) -> Result<GraphDb> {
         let handle = self.ledger_cached(ledger_id).await?;
         let mut snapshot = handle.snapshot().await;
 
@@ -188,6 +212,7 @@ impl Fluree {
                 .and_then(|r| r.index_head_id.as_ref())
                 .cloned()
             {
+                span.record("cold_binary_store", true);
                 // Branch-aware store so leaf/branch/history blobs inherited
                 // from the source branch namespace resolve on a fresh branch.
                 let cs = self
@@ -211,7 +236,10 @@ impl Fluree {
                 .map_err(|e| ApiError::internal(format!("load binary index: {e}")))?;
 
                 // Sync namespace codes between store and snapshot (bimap validation).
-                crate::ns_helpers::sync_store_and_snapshot_ns(&mut store, &mut snapshot.snapshot)?;
+                crate::ns_helpers::sync_store_and_snapshot_ns(
+                    &mut store,
+                    Arc::make_mut(&mut snapshot.snapshot),
+                )?;
 
                 let arc_store = Arc::new(store);
                 let dn = snapshot.dict_novelty.clone();
@@ -219,14 +247,14 @@ impl Fluree {
                     &arc_store,
                     Some(&snapshot.novelty),
                 );
-                let ns_fallback = Some(Arc::new(snapshot.snapshot.namespaces().clone()));
+                let ns_fallback = Some(snapshot.snapshot.shared_namespaces());
                 let provider = BinaryRangeProvider::new(
                     Arc::clone(&arc_store),
                     dn,
                     Arc::clone(&runtime_small_dicts),
                     ns_fallback,
                 );
-                snapshot.snapshot.range_provider = Some(Arc::new(provider));
+                Arc::make_mut(&mut snapshot.snapshot).range_provider = Some(Arc::new(provider));
                 snapshot.binary_store = Some(arc_store);
                 snapshot.runtime_small_dicts = runtime_small_dicts;
             }
@@ -383,7 +411,7 @@ impl Fluree {
                                     view.novelty.as_ref(),
                                 )
                             });
-                        let ns_fallback = Some(Arc::new(view.snapshot.namespaces().clone()));
+                        let ns_fallback = Some(view.snapshot.shared_namespaces());
                         let provider = BinaryRangeProvider::new(
                             Arc::clone(&store),
                             dict_novelty,
@@ -823,7 +851,13 @@ impl Fluree {
             None => return view,
         };
 
-        match config_resolver::merge_reasoning(resolved, server_identity) {
+        // The materialization budget applies independently of mode defaults:
+        // a ledger can cap (or extend) the OWL2-RL budget without forcing
+        // reasoning on, and the cap must hold even when the query brings its
+        // own modes.
+        let budget = config_resolver::config_reasoning_budget(resolved, server_identity);
+
+        let view = match config_resolver::merge_reasoning(resolved, server_identity) {
             Some((mode_strings, precedence)) => {
                 let modes = ReasoningModes::from_mode_strings(&mode_strings);
                 // Always wrap if modes has enabled flags or explicit_none=true
@@ -835,6 +869,11 @@ impl Fluree {
                     view
                 }
             }
+            None => view,
+        };
+
+        match budget {
+            Some(budget) => view.with_config_reasoning_budget(budget),
             None => view,
         }
     }

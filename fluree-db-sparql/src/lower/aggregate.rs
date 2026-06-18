@@ -30,7 +30,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
     ///
     /// This is used to de-duplicate aggregate-input BINDs and to build stable
     /// aggregate alias keys (HAVING → SELECT aggregate lookup).
-    fn expr_key_no_span(expr: &Expression) -> String {
+    pub(super) fn expr_key_no_span(expr: &Expression) -> String {
         use crate::ast::term::LiteralValue;
 
         match expr.unwrap_bracketed() {
@@ -42,6 +42,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                     format!("\"{}\"^^{}", value, Self::iri_key(datatype))
                 }
                 LiteralValue::Integer(i) => format!("{i}"),
+                LiteralValue::BigInteger(s) => format!("{s}"),
                 LiteralValue::Decimal(d) => format!("{d}"),
                 LiteralValue::Double(d) => format!("{d}"),
                 LiteralValue::Boolean(b) => format!("{b}"),
@@ -268,7 +269,47 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
         })
     }
 
-    pub(super) fn collect_having_aggregates(
+    /// Returns `true` if `expr` contains an inline aggregate call anywhere
+    /// (e.g. `COUNT(?x)` inside `DESC(COUNT(?x) / 2)`). Used to decide whether an
+    /// ORDER BY expression must be deferred until aggregate hoisting has run.
+    pub(super) fn expr_contains_aggregate(&self, expr: &Expression) -> bool {
+        match expr.unwrap_bracketed() {
+            Expression::Aggregate { .. } => true,
+            Expression::Unary { operand, .. } => self.expr_contains_aggregate(operand),
+            Expression::Binary { left, right, .. } => {
+                self.expr_contains_aggregate(left) || self.expr_contains_aggregate(right)
+            }
+            Expression::FunctionCall { args, .. } | Expression::Coalesce { args, .. } => {
+                args.iter().any(|a| self.expr_contains_aggregate(a))
+            }
+            Expression::If {
+                condition,
+                then_expr,
+                else_expr,
+                ..
+            } => {
+                self.expr_contains_aggregate(condition)
+                    || self.expr_contains_aggregate(then_expr)
+                    || self.expr_contains_aggregate(else_expr)
+            }
+            Expression::In { expr, list, .. } => {
+                self.expr_contains_aggregate(expr)
+                    || list.iter().any(|a| self.expr_contains_aggregate(a))
+            }
+            Expression::Var(_)
+            | Expression::Literal(_)
+            | Expression::Iri(_)
+            | Expression::Exists { .. }
+            | Expression::NotExists { .. }
+            | Expression::Bracketed { .. } => false,
+        }
+    }
+
+    /// Collect (hoist) every inline aggregate found anywhere in `expr` into
+    /// `aggregates` + the `aliases` map (deduped by aggregate key), rewriting is
+    /// left to [`Self::lower_expression`] once `self.aggregate_aliases` is set.
+    /// Shared by HAVING and expression-based ORDER BY lowering.
+    pub(super) fn collect_inline_aggregates(
         &mut self,
         expr: &Expression,
         aliases: &mut HashMap<String, VarId>,
@@ -281,7 +322,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                 if !aliases.contains_key(&key) {
                     let output_var = self
                         .vars
-                        .get_or_insert(&format!("?__having_agg_{}", aliases.len()));
+                        .get_or_insert(&format!("?__inline_agg_{}", aliases.len()));
                     let spec = self.aggregate_spec_from_expr(agg, output_var, pre_binds)?;
                     aliases.insert(key, output_var);
                     aggregates.push(spec);
@@ -289,16 +330,16 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                 Ok(())
             }
             Expression::Binary { left, right, .. } => {
-                self.collect_having_aggregates(left, aliases, aggregates, pre_binds)?;
-                self.collect_having_aggregates(right, aliases, aggregates, pre_binds)?;
+                self.collect_inline_aggregates(left, aliases, aggregates, pre_binds)?;
+                self.collect_inline_aggregates(right, aliases, aggregates, pre_binds)?;
                 Ok(())
             }
             Expression::Unary { operand, .. } => {
-                self.collect_having_aggregates(operand, aliases, aggregates, pre_binds)
+                self.collect_inline_aggregates(operand, aliases, aggregates, pre_binds)
             }
             Expression::FunctionCall { args, .. } => {
                 for arg in args {
-                    self.collect_having_aggregates(arg, aliases, aggregates, pre_binds)?;
+                    self.collect_inline_aggregates(arg, aliases, aggregates, pre_binds)?;
                 }
                 Ok(())
             }
@@ -308,20 +349,20 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                 else_expr,
                 ..
             } => {
-                self.collect_having_aggregates(condition, aliases, aggregates, pre_binds)?;
-                self.collect_having_aggregates(then_expr, aliases, aggregates, pre_binds)?;
-                self.collect_having_aggregates(else_expr, aliases, aggregates, pre_binds)
+                self.collect_inline_aggregates(condition, aliases, aggregates, pre_binds)?;
+                self.collect_inline_aggregates(then_expr, aliases, aggregates, pre_binds)?;
+                self.collect_inline_aggregates(else_expr, aliases, aggregates, pre_binds)
             }
             Expression::Coalesce { args, .. } => {
                 for arg in args {
-                    self.collect_having_aggregates(arg, aliases, aggregates, pre_binds)?;
+                    self.collect_inline_aggregates(arg, aliases, aggregates, pre_binds)?;
                 }
                 Ok(())
             }
             Expression::In { expr, list, .. } => {
-                self.collect_having_aggregates(expr, aliases, aggregates, pre_binds)?;
+                self.collect_inline_aggregates(expr, aliases, aggregates, pre_binds)?;
                 for arg in list {
-                    self.collect_having_aggregates(arg, aliases, aggregates, pre_binds)?;
+                    self.collect_inline_aggregates(arg, aliases, aggregates, pre_binds)?;
                 }
                 Ok(())
             }

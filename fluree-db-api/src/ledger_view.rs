@@ -69,8 +69,10 @@ impl CommitRef {
 /// Holds no locks. Safe to clone, pass to subtasks, or keep across `.await`
 /// points. Underlying state is Arc-shared, so cloning is cheap.
 pub struct LedgerView {
-    /// The indexed database snapshot (cheap clone - Arc fields)
-    pub snapshot: LedgerSnapshot,
+    /// The indexed database snapshot. `Arc`-shared so deriving a view from the
+    /// cached `LedgerState` (the per-query hot path) is a refcount bump, not a
+    /// deep copy of the namespace maps / stats / schema / graph registry.
+    pub snapshot: Arc<LedgerSnapshot>,
     /// In-memory overlay of uncommitted transactions
     pub novelty: Arc<Novelty>,
     /// Dictionary novelty layer (subjects and strings since last index build)
@@ -99,7 +101,10 @@ impl LedgerView {
     /// binary store must set it after construction (see `LedgerHandle::snapshot()`).
     pub(crate) fn from_state(state: &LedgerState) -> Self {
         Self {
-            snapshot: state.snapshot.clone(),
+            // Arc::clone — refcount bump, not a deep snapshot copy. This is the
+            // per-query hot path; the old `state.snapshot.clone()` deep-copied
+            // the namespace maps / stats / schema under the state lock.
+            snapshot: Arc::clone(&state.snapshot),
             novelty: Arc::clone(&state.novelty),
             dict_novelty: Arc::clone(&state.dict_novelty),
             runtime_small_dicts: Arc::clone(&state.runtime_small_dicts),

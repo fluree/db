@@ -63,6 +63,12 @@ pub enum QueryError {
     #[error(transparent)]
     FuelLimitExceeded(#[from] fluree_db_core::FuelExceededError),
 
+    /// Query execution was cancelled cooperatively.
+    #[error("Query cancelled: {reason}")]
+    Cancelled {
+        reason: fluree_db_core::QueryCancellationReason,
+    },
+
     /// Internal error (should not happen in normal operation)
     #[error("Internal error: {0}")]
     Internal(String),

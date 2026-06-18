@@ -6,6 +6,7 @@
 use crate::binding::{Batch, Binding};
 use crate::context::ExecutionContext;
 use crate::error::Result;
+use crate::object_binding::{equality_norm, normalize_for_key, EqualityNorm};
 use crate::operator::{BoxedOperator, Operator, OperatorState};
 use crate::var_registry::VarId;
 use async_trait::async_trait;
@@ -34,6 +35,10 @@ pub struct DistinctOperator {
     schema: Arc<[VarId]>,
     /// Operator state
     state: OperatorState,
+    /// Store for normalizing decoded bindings to their encoded form before
+    /// hashing, so mixed-representation streams (scan ∪ VALUES/BIND) dedup
+    /// correctly. `None` outside single-ledger binary execution.
+    norm: Option<EqualityNorm>,
 }
 
 impl DistinctOperator {
@@ -49,6 +54,7 @@ impl DistinctOperator {
             seen: HashMap::with_hasher(FxBuildHasher),
             schema,
             state: OperatorState::Created,
+            norm: None,
         }
     }
 
@@ -81,6 +87,9 @@ impl DistinctOperator {
 
 #[async_trait]
 impl Operator for DistinctOperator {
+    fn plan_children(&self) -> Vec<crate::plan_node::PlanChild<'_>> {
+        vec![crate::plan_node::PlanChild::child(self.child.as_ref())]
+    }
     fn schema(&self) -> &[VarId] {
         &self.schema
     }
@@ -95,6 +104,9 @@ impl Operator for DistinctOperator {
 
         self.child.open(ctx).await?;
         self.seen.clear();
+        if self.norm.is_none() {
+            self.norm = equality_norm(ctx);
+        }
         self.state = OperatorState::Open;
         Ok(())
     }
@@ -127,6 +139,30 @@ impl Operator for DistinctOperator {
             let mut columns: Vec<Vec<Binding>> = (0..num_cols).map(|_| Vec::new()).collect();
 
             for row_idx in 0..batch.len() {
+                if self.norm.is_some() {
+                    let (store, gv) = EqualityNorm::parts(&self.norm);
+                    // Normalize decoded bindings to encoded form so mixed
+                    // representations of the same value dedup (encoded
+                    // bindings pass through untouched).
+                    let signature: RowSignature = (0..num_cols)
+                        .map(|col| normalize_for_key(batch.get_by_col(row_idx, col), store, gv))
+                        .collect();
+                    let mut h = FxHasher::default();
+                    signature.hash(&mut h);
+                    let hash = h.finish();
+                    let entry = self
+                        .seen
+                        .raw_entry_mut()
+                        .from_hash(hash, |sig| *sig == signature);
+                    if let hashbrown::hash_map::RawEntryMut::Vacant(v) = entry {
+                        v.insert_hashed_nocheck(hash, signature, ());
+                        for (col_idx, col) in columns.iter_mut().enumerate() {
+                            col.push(batch.get_by_col(row_idx, col_idx).clone());
+                        }
+                    }
+                    continue;
+                }
+
                 let hash = Self::row_hash_with_len(&batch, row_idx, num_cols);
                 let entry = self.seen.raw_entry_mut().from_hash(hash, |sig| {
                     if sig.len() != num_cols {

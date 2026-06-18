@@ -56,6 +56,12 @@ pub trait DatasetBuilder: Send + Sync {
 
     /// Output schema. Must be stable across all `build()` calls.
     fn schema(&self) -> &[VarId];
+
+    /// Plan-introspection details for `EXPLAIN` (e.g. predicate, planned index
+    /// hint). Default: none. Scan builders override to expose the access path.
+    fn plan_details(&self) -> serde_json::Map<String, serde_json::Value> {
+        serde_json::Map::new()
+    }
 }
 
 // =============================================================================
@@ -110,6 +116,21 @@ impl ScanDatasetBuilder {
 }
 
 impl DatasetBuilder for ScanDatasetBuilder {
+    fn plan_details(&self) -> serde_json::Map<String, serde_json::Value> {
+        let mut m = serde_json::Map::new();
+        m.insert(
+            "pattern".into(),
+            crate::explain::format_pattern(&self.pattern).into(),
+        );
+        if let Some(idx) = self.index_hint {
+            m.insert("index-hint".into(), format!("{idx:?}").into());
+        }
+        if self.object_bounds.is_some() {
+            m.insert("object-bounds".into(), true.into());
+        }
+        m
+    }
+
     fn build(&self) -> Result<BoxedOperator> {
         match self.mode {
             TemporalMode::History => Ok(Box::new(
@@ -209,7 +230,7 @@ impl DatasetOperator {
 /// - `Binding::IriMatch` → passed through unchanged (supports nested
 ///   `DatasetOperator` composition).
 /// - All other binding types → unchanged.
-fn stamp_provenance(
+pub(crate) fn stamp_provenance(
     batch: Batch,
     ledger_id: &Arc<str>,
     ctx: &ExecutionContext<'_>,
@@ -296,10 +317,32 @@ fn sid_to_iri_match(
     ))
 }
 
+/// Count a single member to exhaustion, preferring its `drain_count`
+/// (count-only, no binding materialization) and falling back to a streaming
+/// `next_batch` row count when the member declines count-only mode.
+async fn count_member(op: &mut BoxedOperator, ctx: &ExecutionContext<'_>) -> Result<u64> {
+    if let Some(n) = op.drain_count(ctx).await? {
+        return Ok(n);
+    }
+    let mut n: u64 = 0;
+    while let Some(batch) = op.next_batch(ctx).await? {
+        ctx.check_cancelled()?;
+        n = n
+            .checked_add(batch.len() as u64)
+            .ok_or_else(|| QueryError::execution("COUNT(*) overflow in dataset drain_count"))?;
+    }
+    ctx.check_cancelled()?;
+    Ok(n)
+}
+
 #[async_trait]
 impl Operator for DatasetOperator {
     fn schema(&self) -> &[VarId] {
         self.builder.schema()
+    }
+
+    fn plan_details(&self) -> serde_json::Map<String, serde_json::Value> {
+        self.builder.plan_details()
     }
 
     async fn open(&mut self, ctx: &ExecutionContext<'_>) -> Result<()> {
@@ -412,6 +455,54 @@ impl Operator for DatasetOperator {
         // All members exhausted.
         self.state = OperatorState::Exhausted;
         Ok(None)
+    }
+
+    /// Count-only drain across all member graphs.
+    ///
+    /// Counts are invariant under provenance stamping (it rewrites binding
+    /// values, never row counts), so this skips stamping entirely and sums each
+    /// member's count. Each member is counted independently via its own
+    /// `drain_count` (or a streaming fallback), so mixed count-only support
+    /// across graphs is fine. `COUNT(*)` over a multi-graph dataset is the bag
+    /// union of per-graph row counts.
+    async fn drain_count(&mut self, ctx: &ExecutionContext<'_>) -> Result<Option<u64>> {
+        if !self.state.can_next() {
+            if self.state == OperatorState::Created {
+                return Err(QueryError::OperatorNotOpened);
+            }
+            return Ok(None);
+        }
+
+        let graphs = ctx.active_graphs();
+
+        debug_assert!(
+            match &graphs {
+                ActiveGraphs::Many(g) => g.len() == self.members.len(),
+                ActiveGraphs::Single => self.members.len() == 1,
+            },
+            "active_graphs() returned a different number of graphs than open() saw"
+        );
+
+        let mut total: u64 = 0;
+        while self.current_member < self.members.len() {
+            let n = match &graphs {
+                ActiveGraphs::Many(g) => {
+                    let graph_ctx = ctx.with_graph_ref(g[self.current_member]);
+                    count_member(&mut self.members[self.current_member].operator, &graph_ctx)
+                        .await?
+                }
+                ActiveGraphs::Single => {
+                    count_member(&mut self.members[self.current_member].operator, ctx).await?
+                }
+            };
+            total = total
+                .checked_add(n)
+                .ok_or_else(|| QueryError::execution("COUNT(*) overflow in dataset drain_count"))?;
+            self.current_member += 1;
+        }
+
+        self.state = OperatorState::Exhausted;
+        Ok(Some(total))
     }
 
     fn close(&mut self) {

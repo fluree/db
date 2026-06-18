@@ -17,6 +17,7 @@
 //! - `DictLeaf`: keyed by `xxh3_128(cas_address)`. Content-addressed and
 //!   immutable — no epoch/time dimension needed.
 
+use crate::format::leaf::DecodedLeafDirV3;
 use fluree_db_core::subject_id::SubjectIdColumn;
 use fluree_db_core::{ListIndex, StatsView};
 use moka::sync::Cache;
@@ -169,6 +170,10 @@ enum CacheKey {
     R2(LeafletCacheKey),
     /// Key = xxh3_128(CAS address). Content-addressed → immutable.
     DictLeaf(u128),
+    /// Decoded leaf directory (header+dir only, no payload). Key =
+    /// xxh3_128(leaf CID bytes) — content-addressed → immutable,
+    /// no epoch/time dimension needed.
+    LeafDir(u128),
     /// BM25 posting leaflet. Key = xxh3_128(CAS CID bytes).
     /// Content-addressed → immutable, no epoch/time dimension needed.
     Bm25Leaflet(u128),
@@ -202,6 +207,11 @@ pub struct V3BatchCacheKey {
     pub leaf_id: u128,
     /// Leaflet slot within the leaf (0..leaflet_count).
     pub leaflet_idx: u32,
+    /// `ColumnSet` bitmask of the columns decoded into this cached batch.
+    /// Projection-aware: a narrow batch (e.g. one decoded without the `t`
+    /// column for a current-time scan) caches under a different key than a full
+    /// decode, so it is never served to a query that needs the omitted column.
+    pub columns: u16,
 }
 
 // ============================================================================
@@ -285,6 +295,7 @@ enum CachedEntry {
     R1(CachedRegion1),
     R2(CachedRegion2),
     DictLeaf(Arc<[u8]>),
+    LeafDir(Arc<DecodedLeafDirV3>),
     Bm25Leaflet(Arc<[u8]>),
     VectorShard(Arc<crate::arena::vector::VectorShard>),
     LedgerInfo(Arc<[u8]>),
@@ -300,6 +311,7 @@ impl CachedEntry {
             CachedEntry::R1(r1) => r1.byte_size(),
             CachedEntry::R2(r2) => r2.byte_size(),
             CachedEntry::DictLeaf(bytes) => bytes.len(),
+            CachedEntry::LeafDir(dir) => dir.byte_size(),
             CachedEntry::Bm25Leaflet(bytes) => bytes.len(),
             CachedEntry::VectorShard(shard) => {
                 // Use capacity() for conservative accounting — correct even if
@@ -329,6 +341,29 @@ pub struct LeafletCache {
     inner: Cache<CacheKey, CachedEntry>,
 }
 
+/// Run a moka single-flight call (`get_with`/`try_get_with`) under a Tokio
+/// blocking region when on a multi-thread runtime.
+///
+/// moka single-flight is **synchronous**: when N callers contend on the same
+/// key, one runs the initializer and the other N-1 **block the calling thread**
+/// waiting for it — with no `block_in_place` of their own. On a small (e.g.
+/// AWS Lambda 2-worker) runtime those waiters park every worker, so nothing is
+/// left to drive the IO reactor; the leader's `block_on` CAS fetch then never
+/// completes and the moka key stays locked forever — a hard, permanent wedge
+/// (one envelope's sub-queries, contending the same cold dict/column key, burn
+/// the container). Running the wait inside `block_in_place` converts the
+/// waiting worker so tokio promotes a replacement that keeps the reactor live.
+///
+/// Callers MUST peek the cache first (non-blocking `get`) and only enter this
+/// region on a miss, so plain cache hits never pay the conversion cost (every
+/// scan flows through these methods).
+fn in_blocking_region<T>(f: impl FnOnce() -> T) -> T {
+    match tokio::runtime::Handle::try_current().map(|h| h.runtime_flavor()) {
+        Ok(tokio::runtime::RuntimeFlavor::MultiThread) => tokio::task::block_in_place(f),
+        _ => f(),
+    }
+}
+
 macro_rules! region_cache_methods {
     ($get_or:ident, $get:ident, $contains:ident, $cache_key_variant:ident, $entry_variant:ident, $ty:ty) => {
         /// Get or decode a leaflet region for the given key.
@@ -339,8 +374,16 @@ macro_rules! region_cache_methods {
         where
             F: FnOnce() -> $ty,
         {
-            let entry = self.inner.get_with(CacheKey::$cache_key_variant(key), || {
-                CachedEntry::$entry_variant(decode_fn())
+            // Fast path: a plain hit must not pay the block_in_place cost.
+            if let Some(v) = self.$get(&key) {
+                return v;
+            }
+            // Miss: run the single-flight wait/init in a blocking region so a
+            // waiter promotes a replacement worker (see in_blocking_region).
+            let entry = in_blocking_region(|| {
+                self.inner.get_with(CacheKey::$cache_key_variant(key), || {
+                    CachedEntry::$entry_variant(decode_fn())
+                })
             });
             match entry {
                 CachedEntry::$entry_variant(v) => v,
@@ -434,12 +477,61 @@ impl LeafletCache {
     where
         F: FnOnce() -> io::Result<Arc<[u8]>>,
     {
-        let result = self.inner.try_get_with(CacheKey::DictLeaf(key), || {
-            load_fn().map(CachedEntry::DictLeaf)
+        // Fast path: a plain hit must not pay the block_in_place cost.
+        if let Some(bytes) = self.get_dict_leaf(key) {
+            return Ok(bytes);
+        }
+        // Miss: run the single-flight wait/init in a blocking region so a
+        // waiter promotes a replacement worker (see in_blocking_region).
+        let result = in_blocking_region(|| {
+            self.inner.try_get_with(CacheKey::DictLeaf(key), || {
+                load_fn().map(CachedEntry::DictLeaf)
+            })
         });
         match result {
             Ok(CachedEntry::DictLeaf(bytes)) => Ok(bytes),
             Ok(_) => unreachable!("DictLeaf key always maps to DictLeaf entry"),
+            Err(arc_err) => Err(io::Error::new(arc_err.kind(), arc_err.to_string())),
+        }
+    }
+
+    // ========================================================================
+    // Decoded leaf directory cache
+    // ========================================================================
+
+    /// Check if a decoded leaf directory is cached (read-only, no insertion).
+    pub fn get_leaf_dir(&self, key: u128) -> Option<Arc<DecodedLeafDirV3>> {
+        match self.inner.get(&CacheKey::LeafDir(key)) {
+            Some(CachedEntry::LeafDir(dir)) => Some(dir),
+            _ => None,
+        }
+    }
+
+    /// Get or load a decoded leaf directory with single-flight and error
+    /// propagation.
+    ///
+    /// Key should be `xxh3_128(leaf_cid.to_bytes())` — content-addressed, so
+    /// entries are immutable and self-invalidating on leaf rewrite.
+    pub fn try_get_or_load_leaf_dir<F>(
+        &self,
+        key: u128,
+        load_fn: F,
+    ) -> io::Result<Arc<DecodedLeafDirV3>>
+    where
+        F: FnOnce() -> io::Result<Arc<DecodedLeafDirV3>>,
+    {
+        // Fast path: a plain hit must not pay the block_in_place cost.
+        if let Some(dir) = self.get_leaf_dir(key) {
+            return Ok(dir);
+        }
+        let result = in_blocking_region(|| {
+            self.inner.try_get_with(CacheKey::LeafDir(key), || {
+                load_fn().map(CachedEntry::LeafDir)
+            })
+        });
+        match result {
+            Ok(CachedEntry::LeafDir(dir)) => Ok(dir),
+            Ok(_) => unreachable!("LeafDir key always maps to LeafDir entry"),
             Err(arc_err) => Err(io::Error::new(arc_err.kind(), arc_err.to_string())),
         }
     }
@@ -502,8 +594,16 @@ impl LeafletCache {
     where
         F: FnOnce() -> io::Result<Arc<crate::arena::vector::VectorShard>>,
     {
-        let result = self.inner.try_get_with(CacheKey::VectorShard(key), || {
-            load_fn().map(CachedEntry::VectorShard)
+        // Fast path: a plain hit must not pay the block_in_place cost.
+        if let Some(shard) = self.get_vector_shard(key) {
+            return Ok(shard);
+        }
+        // Miss: run the single-flight wait/init in a blocking region so a
+        // waiter promotes a replacement worker (see in_blocking_region).
+        let result = in_blocking_region(|| {
+            self.inner.try_get_with(CacheKey::VectorShard(key), || {
+                load_fn().map(CachedEntry::VectorShard)
+            })
         });
         match result {
             Ok(CachedEntry::VectorShard(shard)) => Ok(shard),
@@ -547,8 +647,16 @@ impl LeafletCache {
     where
         F: FnOnce() -> Arc<StatsView>,
     {
-        let entry = self.inner.get_with(CacheKey::StatsView(key), || {
-            CachedEntry::StatsView(build_fn())
+        // Fast path: a plain hit must not pay the block_in_place cost.
+        if let Some(view) = self.get_stats_view(key) {
+            return view;
+        }
+        // Miss: run the single-flight wait/init in a blocking region so a
+        // waiter promotes a replacement worker (see in_blocking_region).
+        let entry = in_blocking_region(|| {
+            self.inner.get_with(CacheKey::StatsView(key), || {
+                CachedEntry::StatsView(build_fn())
+            })
         });
         match entry {
             CachedEntry::StatsView(view) => view,
@@ -581,8 +689,16 @@ impl LeafletCache {
     where
         F: FnOnce() -> io::Result<super::column_types::ColumnBatch>,
     {
-        let result = self.inner.try_get_with(CacheKey::V3Batch(key), || {
-            decode_fn().map(CachedEntry::V3Batch)
+        // Fast path: a plain hit must not pay the block_in_place cost.
+        if let Some(batch) = self.get_v3_batch(&key) {
+            return Ok(batch);
+        }
+        // Run the single-flight wait/init in a blocking region so a
+        // waiter promotes a replacement worker (see in_blocking_region).
+        let result = in_blocking_region(|| {
+            self.inner.try_get_with(CacheKey::V3Batch(key), || {
+                decode_fn().map(CachedEntry::V3Batch)
+            })
         });
         match result {
             Ok(CachedEntry::V3Batch(batch)) => Ok(batch),

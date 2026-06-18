@@ -22,12 +22,21 @@ use crate::read::types::{cmp_row_vs_overlay, OverlayOp};
 
 use super::binary_index_store::BinaryIndexStore;
 use super::column_loader::load_columns_cached_via_handle;
-use super::column_types::{BinaryFilter, ColumnBatch, ColumnData, ColumnProjection};
+use super::column_types::{BinaryFilter, ColumnBatch, ColumnData, ColumnProjection, ColumnSet};
 use super::replay::{batch_has_rows_above_t, replay_leaflet};
+use crate::format::column_block::ColumnId;
 
 // ============================================================================
 // BinaryCursor
 // ============================================================================
+
+/// Shared empty overlay-ops slice: cursors are built far more often than they
+/// carry overlay ops, so the no-overlay default is a refcount bump, not an
+/// allocation.
+fn empty_overlay_ops() -> Arc<[OverlayOp]> {
+    static EMPTY: std::sync::OnceLock<Arc<[OverlayOp]>> = std::sync::OnceLock::new();
+    Arc::clone(EMPTY.get_or_init(|| Arc::from(Vec::new())))
+}
 
 /// V3 columnar cursor: iterates leaflets across leaves in a branch manifest.
 ///
@@ -46,19 +55,27 @@ pub struct BinaryCursor {
     /// Index of the next leaflet within the current leaf.
     current_leaflet_idx: usize,
     exhausted: bool,
-    /// Overlay ops sorted by this cursor's sort order.
-    overlay_ops: Vec<OverlayOp>,
+    /// Overlay ops sorted by this cursor's sort order. Shared (`Arc`) so
+    /// per-query caches can hand the same translated ops to many cursors
+    /// without copying; this cursor consumes only `[overlay_pos, overlay_end)`.
+    overlay_ops: Arc<[OverlayOp]>,
     /// Start position in overlay_ops for the current leaf (set per-leaf via slicing).
     overlay_pos: usize,
+    /// Exclusive end of this cursor's overlay window. Ops at or beyond this
+    /// are outside the cursor's key range and never consumed.
+    overlay_end: usize,
     /// Exclusive end position in overlay_ops for the current leaf.
     /// Ops beyond this belong to a later leaf and must not be consumed.
     leaf_overlay_end: usize,
-    /// Overlay epoch for cache key differentiation.
-    epoch: u64,
     /// Time bound for overlay ops (only emit ops with t <= to_t).
     to_t: i64,
-    /// Optional fuel tracker. When set, charges 1 fuel per leaflet returned.
+    /// Optional fuel tracker. When set, charges one index touch per leaflet returned.
     tracker: Option<Tracker>,
+    /// Key-range bounds for range cursors (`None` for full scans). Used to
+    /// seek to the first in-range leaflet of each leaf and to early-break
+    /// once past the range, instead of walking every directory entry.
+    range_min: Option<RunRecordV2>,
+    range_max: Option<RunRecordV2>,
 }
 
 /// State for a leaf that's been opened via `LeafHandle`.
@@ -92,12 +109,14 @@ impl BinaryCursor {
             // Don't mark exhausted when leaf_range is empty — overlay-only path
             // may still have ops to emit.
             exhausted: false,
-            overlay_ops: Vec::new(),
+            overlay_ops: empty_overlay_ops(),
             overlay_pos: 0,
+            overlay_end: 0,
             leaf_overlay_end: 0,
-            epoch: 0,
             to_t: i64::MAX,
             tracker: None,
+            range_min: Some(*min_key),
+            range_max: Some(*max_key),
         }
     }
 
@@ -121,17 +140,20 @@ impl BinaryCursor {
             current_leaf: None,
             current_leaflet_idx: 0,
             exhausted: false,
-            overlay_ops: Vec::new(),
+            overlay_ops: empty_overlay_ops(),
             overlay_pos: 0,
+            overlay_end: 0,
             leaf_overlay_end: 0,
-            epoch: 0,
             to_t: i64::MAX,
             tracker: None,
+            range_min: None,
+            range_max: None,
         }
     }
 
-    /// Attach a fuel tracker. Charges 1 fuel (1000 micro-fuel) per leaflet
-    /// returned by `next_batch` (regardless of cache hit/miss).
+    /// Attach a fuel tracker. Charges one index touch
+    /// (`schedule::INDEX_TOUCH_MICRO_FUEL`) per leaflet returned by
+    /// `next_batch` (regardless of cache hit/miss).
     pub fn with_tracker(mut self, tracker: Tracker) -> Self {
         if tracker.is_enabled() {
             self.tracker = Some(tracker);
@@ -144,21 +166,61 @@ impl BinaryCursor {
     /// **Contract:** ops must be pre-sorted by this cursor's sort order AND
     /// assert/retract lifecycles must be resolved (at most one op per fact key).
     /// Use [`sort_overlay_ops`] then [`resolve_overlay_ops`] before calling.
-    pub fn set_overlay_ops(&mut self, ops: Vec<OverlayOp>) {
+    ///
+    /// Takes `Arc<[OverlayOp]>` so callers holding cached translated ops share
+    /// them across cursors without copying; `Vec<OverlayOp>` converts via
+    /// `.into()`.
+    pub fn set_overlay_ops(&mut self, ops: Arc<[OverlayOp]>) {
+        let len = ops.len();
+        self.set_overlay_ops_window(ops, 0, len);
+    }
+
+    /// Set overlay ops from a shared, pre-translated slice.
+    ///
+    /// Alias of [`Self::set_overlay_ops`], kept for callers predating the
+    /// signature unification.
+    pub fn set_overlay_ops_shared(&mut self, ops: Arc<[OverlayOp]>) {
+        self.set_overlay_ops(ops);
+    }
+
+    /// Set overlay ops from a shared slice, consuming only `[start, end)`.
+    ///
+    /// Same contract as [`Self::set_overlay_ops`]. Use with
+    /// [`overlay_window_for_range`](crate::read::types::overlay_window_for_range)
+    /// so a range-bounded cursor carries only the ops that can intersect its
+    /// key range: ops outside the window cost an O(overlay) merge walk per
+    /// cursor and defeat leaflet pre-skips.
+    pub fn set_overlay_ops_window(&mut self, ops: Arc<[OverlayOp]>, start: usize, end: usize) {
         debug_assert!(
             ops.windows(2).all(|w| w[0].fact_key() != w[1].fact_key()),
             "overlay ops contain duplicate fact keys — caller must resolve \
              assert/retract lifecycles via resolve_overlay_ops() before set_overlay_ops()"
         );
-        let len = ops.len();
+        // `merge_overlay_into_batch` compares each base row against overlay ops
+        // on the FULL V3 identity (s_id, p_id, o_type, o_key, o_i). If the
+        // projection omits any of these, the base column reads as `AbsentDefault`
+        // (p_id→0, o_type→0, o_i→u32::MAX), corrupting the sort/identity compare
+        // and over/under-counting. Production masks this because the leaflet
+        // cache always loads `ColumnProjection::all()`, but a cache-less store
+        // would miscount — so require the identity columns explicitly here.
+        debug_assert!(
+            ops.is_empty() || {
+                let eff = self.projection.effective();
+                eff.contains(ColumnId::SId)
+                    && eff.contains(ColumnId::PId)
+                    && eff.contains(ColumnId::OType)
+                    && eff.contains(ColumnId::OKey)
+                    && eff.contains(ColumnId::OI)
+            },
+            "overlay merge requires the full V3 identity (SId, PId, OType, OKey, OI) \
+             in the cursor projection; got {:?}",
+            self.projection
+        );
+        debug_assert!(start <= end && end <= ops.len());
         self.overlay_ops = ops;
-        self.overlay_pos = 0;
-        self.leaf_overlay_end = len; // default: all ops visible (refined per-leaf)
-    }
-
-    /// Set the overlay epoch for cache key differentiation.
-    pub fn set_epoch(&mut self, epoch: u64) {
-        self.epoch = epoch;
+        self.overlay_pos = start;
+        self.overlay_end = end;
+        self.leaf_overlay_end = end; // default: all window ops visible (refined per-leaf)
     }
 
     /// Set the time bound for overlay ops.
@@ -176,15 +238,47 @@ impl BinaryCursor {
         self.to_t < self.store.max_t()
     }
 
+    /// Columns to decode for the current leaflet (projection-aware).
+    ///
+    /// Trusts the cursor's `projection` (which already carries output + internal
+    /// filter/order columns, exactly as the no-cache decode path consumes it),
+    /// but widens it defensively so a narrowed decode can never starve a
+    /// downstream read:
+    /// - `has_ov`: the overlay merge reads every base column → decode ALL.
+    /// - non-empty filter: `filter_batch` reads s/p/o_type/o_key/o_i (mostly
+    ///   `Const`/absent, so free to include).
+    /// - `need_replay`: leaflet replay reads `t`.
+    ///
+    /// For a plain current-time scan this drops `t` (and any other unprojected
+    /// column), so its `Block` is neither decoded nor allocated. The leaflet
+    /// cache keys on this set, keeping narrow and full batches distinct.
+    fn leaflet_decode_set(&self, has_ov: bool) -> ColumnSet {
+        if has_ov {
+            return ColumnSet::ALL;
+        }
+        let mut set = self.projection.effective();
+        if !self.filter.is_empty() {
+            set.insert(ColumnId::SId);
+            set.insert(ColumnId::OKey);
+            set.insert(ColumnId::PId);
+            set.insert(ColumnId::OType);
+            set.insert(ColumnId::OI);
+        }
+        if self.need_replay() {
+            set.insert(ColumnId::T);
+        }
+        set
+    }
+
     /// Whether any overlay ops remain globally (for overlay-only path).
     fn has_any_overlay(&self) -> bool {
-        self.overlay_pos < self.overlay_ops.len()
+        self.overlay_pos < self.overlay_end
     }
 
     /// Slice overlay ops for the leaf at `leaf_idx` using branch manifest keys.
     /// Sets `overlay_pos` and `leaf_overlay_end` for this leaf.
     fn slice_overlay_for_leaf(&mut self, leaf_idx: usize) {
-        let ops = &self.overlay_ops[self.overlay_pos..];
+        let ops = &self.overlay_ops[self.overlay_pos..self.overlay_end];
         if ops.is_empty() {
             self.leaf_overlay_end = self.overlay_pos;
             return;
@@ -224,7 +318,35 @@ impl BinaryCursor {
 
                     // Pre-skip by directory metadata (only when no overlay —
                     // overlay merge may add rows to otherwise-skippable leaflets).
-                    let has_ov = self.has_overlay();
+                    // Overlay rules apply to this leaflet only when the next
+                    // unconsumed op sorts at or before its last key; later ops
+                    // are handled by later leaflets (or the overlay-only tail),
+                    // so the pure-base pre-skips below remain valid here.
+                    let has_ov = self.has_overlay() && {
+                        let leaflet_last_key: RunRecordV2 =
+                            read_ordered_key_v2(self.order, &entry.last_key);
+                        cmp_overlay_vs_record(
+                            &self.overlay_ops[self.overlay_pos],
+                            &leaflet_last_key,
+                            self.order,
+                        ) != std::cmp::Ordering::Greater
+                    };
+                    // Range early-break: leaflets are key-ordered, so once a
+                    // leaflet starts past `range_max` no later leaflet in this
+                    // leaf can match. Only valid when no overlay op is pending
+                    // for this leaflet (those must drain through the merge or
+                    // the overlay-only tail) and no time-travel replay could
+                    // resurrect rows outside the current key bounds.
+                    if !has_ov && !self.need_replay() {
+                        if let Some(max_key) = &self.range_max {
+                            let first = read_ordered_key_v2(self.order, &entry.first_key);
+                            if cmp_v2_for_order(self.order)(&first, max_key)
+                                == std::cmp::Ordering::Greater
+                            {
+                                break;
+                            }
+                        }
+                    }
                     if !has_ov && self.filter.skip_leaflet(entry.p_const, entry.o_type_const) {
                         continue;
                     }
@@ -240,25 +362,47 @@ impl BinaryCursor {
                         continue;
                     }
 
+                    // Key-range pre-skip: drop leaflets whose [first_key, last_key]
+                    // provably cannot contain a row matching the filter's bound
+                    // order-leading prefix, before paying any decode + per-row
+                    // filter. Same safety guards as the metadata skip above
+                    // (no overlay merge; no time-travel history replay).
+                    if !has_ov
+                        && !needs_history_replay
+                        && self.filter.leaflet_out_of_range(
+                            self.order,
+                            &entry.first_key,
+                            &entry.last_key,
+                        )
+                    {
+                        continue;
+                    }
+
                     // Load columns via LeafHandle (cached when LeafletCache is available).
                     let mut batch = if entry.row_count > 0 {
                         let leaflet_idx = self.current_leaflet_idx - 1;
+                        let decode_set = self.leaflet_decode_set(has_ov);
                         if let Some(cache) = self.store.leaflet_cache() {
                             load_columns_cached_via_handle(
                                 leaf.handle.as_ref(),
-                                leaflet_idx,
-                                self.order,
                                 cache,
-                                leaf.handle.leaf_id(),
-                                u32::try_from(leaflet_idx).map_err(|_| {
-                                    std::io::Error::other(format!(
-                                        "leaflet index {leaflet_idx} exceeds u32::MAX"
-                                    ))
-                                })?,
+                                super::column_loader::LeafletDecodeSpec {
+                                    leaf_id: leaf.handle.leaf_id(),
+                                    leaflet_idx: u32::try_from(leaflet_idx).map_err(|_| {
+                                        std::io::Error::other(format!(
+                                            "leaflet index {leaflet_idx} exceeds u32::MAX"
+                                        ))
+                                    })?,
+                                    order: self.order,
+                                    decode_set,
+                                },
                             )?
                         } else {
-                            leaf.handle
-                                .load_columns(leaflet_idx, &self.projection, self.order)?
+                            let proj = ColumnProjection {
+                                output: decode_set,
+                                internal: ColumnSet::EMPTY,
+                            };
+                            leaf.handle.load_columns(leaflet_idx, &proj, self.order)?
                         }
                     } else {
                         ColumnBatch::empty()
@@ -317,11 +461,13 @@ impl BinaryCursor {
                         continue;
                     }
 
-                    // Charge 1 fuel per leaflet returned (per-touch, regardless
-                    // of cache state). Caller can downcast the io::Error to
-                    // recover the original FuelExceededError.
+                    // Charge one index touch per leaflet returned (per-touch,
+                    // regardless of cache state). Caller can downcast the
+                    // io::Error to recover the original FuelExceededError.
                     if let Some(tracker) = &self.tracker {
-                        if let Err(e) = tracker.consume_fuel(1000) {
+                        if let Err(e) = tracker.consume_fuel(
+                            fluree_db_core::tracking::schedule::INDEX_TOUCH_MICRO_FUEL,
+                        ) {
                             return Err(io::Error::other(e));
                         }
                     }
@@ -336,8 +482,8 @@ impl BinaryCursor {
             // Open the next leaf.
             if self.current_leaf_idx >= self.leaf_range.end {
                 // All indexed leaves exhausted. Try overlay-only path.
-                // Reset leaf_overlay_end to cover all remaining ops.
-                self.leaf_overlay_end = self.overlay_ops.len();
+                // Reset leaf_overlay_end to cover all remaining window ops.
+                self.leaf_overlay_end = self.overlay_end;
                 if self.has_any_overlay() {
                     let batch = self.emit_overlay_only();
                     self.exhausted = true;
@@ -355,7 +501,7 @@ impl BinaryCursor {
             self.current_leaf_idx += 1;
 
             // Slice overlay ops for this leaf (binary search on branch keys).
-            if !self.overlay_ops.is_empty() {
+            if self.has_any_overlay() {
                 self.slice_overlay_for_leaf(leaf_idx);
             }
 
@@ -363,8 +509,25 @@ impl BinaryCursor {
             let handle =
                 self.store
                     .open_leaf_handle(&leaf_cid, sidecar_cid.as_ref(), self.need_replay())?;
+
+            // Range seek: skip directory entries wholly before `range_min`
+            // instead of walking them one by one. Safe only when no replay
+            // could resurrect rows outside current key bounds and no pending
+            // overlay op sorts into the skipped span (window ops are >=
+            // range_min, and skipped leaflets end below it).
+            let mut start_leaflet = 0;
+            if !self.need_replay() {
+                if let Some(min_key) = &self.range_min {
+                    let cmp = cmp_v2_for_order(self.order);
+                    start_leaflet = handle.dir().entries.partition_point(|e| {
+                        cmp(&read_ordered_key_v2(self.order, &e.last_key), min_key)
+                            == std::cmp::Ordering::Less
+                    });
+                }
+            }
+
             self.current_leaf = Some(OpenLeaf { handle });
-            self.current_leaflet_idx = 0;
+            self.current_leaflet_idx = start_leaflet;
         }
     }
 

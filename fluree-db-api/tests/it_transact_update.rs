@@ -637,7 +637,14 @@ async fn update_where_bind_numeric_and_math_functions() {
     .await
     .expect("to_jsonld_async");
 
-    let num_val = |v: &serde_json::Value| v.as_i64().map(|n| n as f64).or_else(|| v.as_f64());
+    // xsd:decimal results render as a JSON string (to preserve exactness), so
+    // also accept a numeric string here.
+    let num_val = |v: &serde_json::Value| {
+        v.as_i64()
+            .map(|n| n as f64)
+            .or_else(|| v.as_f64())
+            .or_else(|| v.as_str().and_then(|s| s.parse::<f64>().ok()))
+    };
     assert_eq!(numeric.get("ex:abs").and_then(num_val), Some(2.0));
     assert_eq!(numeric.get("ex:round").and_then(num_val), Some(1.0));
     assert_eq!(numeric.get("ex:ceil").and_then(num_val), Some(2.0));
@@ -920,7 +927,12 @@ async fn update_where_bind_rdf_term_functions() {
     assert_eq!(result.get("ex:isIRI"), Some(&json!(true)));
     assert_eq!(result.get("ex:isLiteral"), Some(&json!(true)));
     assert_eq!(result.get("ex:lang"), Some(&json!("es")));
-    assert_eq!(result.get("ex:datatype"), Some(&json!("rdf:langString")));
+    // DATATYPE returns the datatype IRI (SPARQL 1.1 §17.4.2.3), so binding it
+    // and inserting stores an IRI reference, not a plain string.
+    assert_eq!(
+        result.get("ex:datatype"),
+        Some(&json!({"@id": "rdf:langString"}))
+    );
     assert_eq!(
         result.get("ex:strdt"),
         Some(&json!({"@value": "Abcdefg", "@type": "ex:mystring"}))

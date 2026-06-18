@@ -151,6 +151,8 @@ struct LoweringContext<'a, E> {
     agg_counter: u32,
     /// Monotonic counter for generating intermediate property-path join variables (`?__pp0`, `?__pp1`, …).
     pp_counter: u32,
+    /// Monotonic counter for generating expression-based ORDER BY bind variables (`?__order_by_0`, …).
+    order_counter: u32,
     /// Original SPARQL source text (for extracting SERVICE body text).
     source_text: Option<&'a str>,
 }
@@ -181,8 +183,79 @@ impl<'a, E: IriEncoder> LoweringContext<'a, E> {
             agg_expr_binds: HashMap::new(),
             agg_counter: 0,
             pp_counter: 0,
+            order_counter: 0,
             source_text,
         }
+    }
+
+    /// Build the query's `ReasoningConfig` from the `# PRAGMA reasoning: ...`
+    /// directive, if present.
+    ///
+    /// Mirrors the JSON-LD `"reasoning"` option: no pragma means
+    /// `ReasoningConfig::default()` (ledger/config defaults apply); an
+    /// explicit pragma sets the query-level modes, which take precedence
+    /// under `DefaultUnlessQueryOverrides`. Unknown mode names error.
+    fn reasoning_config(&self) -> Result<ReasoningConfig> {
+        use fluree_db_query::ir::ReasoningModes;
+
+        let mut modes = match &self.ast.pragmas.reasoning {
+            None => ReasoningModes::default(),
+            Some(mode_strs) => {
+                if mode_strs.is_empty() {
+                    return Err(LowerError::invalid_pragma(
+                        "reasoning",
+                        "expected at least one mode: none, rdfs, owl2ql, owl2rl, datalog, owl-datalog",
+                        self.ast.span,
+                    ));
+                }
+                if mode_strs.len() > 1 && mode_strs.iter().any(|m| m.eq_ignore_ascii_case("none")) {
+                    return Err(LowerError::invalid_pragma(
+                        "reasoning",
+                        "'none' cannot be combined with other modes",
+                        self.ast.span,
+                    ));
+                }
+
+                let value = if mode_strs.len() == 1 {
+                    serde_json::Value::String(mode_strs[0].clone())
+                } else {
+                    serde_json::Value::Array(
+                        mode_strs
+                            .iter()
+                            .map(|m| serde_json::Value::String(m.clone()))
+                            .collect(),
+                    )
+                };
+                ReasoningModes::from_json(&value)
+                    .map_err(|e| LowerError::invalid_pragma("reasoning", e, self.ast.span))?
+            }
+        };
+
+        // Budget pragmas don't flip any mode flag — they only take effect
+        // when a reasoning mode runs (from this query or a ledger default).
+        modes.max_facts = self.budget_pragma_value(
+            "reasoning-max-facts",
+            self.ast.pragmas.reasoning_max_facts.as_deref(),
+        )?;
+        modes.max_seconds = self.budget_pragma_value(
+            "reasoning-max-seconds",
+            self.ast.pragmas.reasoning_max_seconds.as_deref(),
+        )?;
+
+        if modes == ReasoningModes::default() {
+            return Ok(ReasoningConfig::default());
+        }
+        Ok(ReasoningConfig::new().with_modes(modes))
+    }
+
+    /// Validate a `# PRAGMA reasoning-max-*: <n>` value as a non-negative integer.
+    fn budget_pragma_value(&self, name: &'static str, raw: Option<&str>) -> Result<Option<u64>> {
+        let Some(raw) = raw else {
+            return Ok(None);
+        };
+        raw.parse::<u64>().map(Some).map_err(|_| {
+            LowerError::invalid_pragma(name, "expected a non-negative integer", self.ast.span)
+        })
     }
 
     /// Main entry point for lowering.
@@ -230,12 +303,20 @@ impl<'a, E: IriEncoder> LoweringContext<'a, E> {
                     limit,
                     offset,
                     ordering,
+                    order_binds,
+                    // Consumed in `lower_solution_modifiers` (lowered into
+                    // `order_binds` after aggregate hoisting); empty here.
+                    deferred_order_exprs: _,
                 } = lowered_modifiers.base;
                 let distinct = lowered_modifiers.distinct;
 
                 // Assemble the grouping phase from the lowered components.
-                // Post-aggregation binds (`select_binds.post`) ride inside the
-                // aggregation stage when one exists.
+                // SELECT post-binds (`select_binds.post`) ride inside the
+                // aggregation stage. Expression-based ORDER BY binds ride on
+                // `Query.order_binds` (a dedicated post-grouping stage in the
+                // operator tree) so they evaluate uniformly with or without
+                // grouping — including dedup-only GROUP BY, which has no
+                // aggregation stage to carry binds.
                 let grouping = Grouping::assemble(
                     lowered_modifiers.group_by,
                     lowered_modifiers.aggregates,
@@ -267,9 +348,10 @@ impl<'a, E: IriEncoder> LoweringContext<'a, E> {
                     patterns,
                     grouping,
                     ordering,
+                    order_binds,
                     limit,
                     offset,
-                    reasoning: ReasoningConfig::default(),
+                    reasoning: self.reasoning_config()?,
                     post_values,
                 })
             }
@@ -383,6 +465,177 @@ mod tests {
         let mut vars = VarRegistry::new();
         let query = lower_sparql(&ast, &encoder, &mut vars)?;
         Ok((query, vars))
+    }
+
+    // =========================================================================
+    // Numeric literal lowering
+    // =========================================================================
+
+    fn object_of(query: &Query, idx: usize) -> &Term {
+        let Pattern::Triple(t) = &query.patterns[idx] else {
+            panic!("expected triple pattern, got {:?}", query.patterns[idx]);
+        };
+        &t.o
+    }
+
+    #[test]
+    fn test_overflowing_integer_literal_promotes_to_bigint() {
+        // xsd:integer is unbounded; beyond i64 must promote, not corrupt.
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?s WHERE { ?s ex:serial 123456789012345678901234567890 }",
+        )
+        .unwrap();
+
+        let Term::Value(fluree_db_core::FlakeValue::BigInt(n)) = object_of(&query, 0) else {
+            panic!(
+                "expected BigInt object for overflowing integer, got {:?}",
+                object_of(&query, 0)
+            );
+        };
+        assert_eq!(n.to_string(), "123456789012345678901234567890");
+    }
+
+    #[test]
+    fn test_negative_overflowing_integer_literal_promotes_to_bigint() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?s WHERE { ?s ex:serial -123456789012345678901234567890 }",
+        )
+        .unwrap();
+
+        let Term::Value(fluree_db_core::FlakeValue::BigInt(n)) = object_of(&query, 0) else {
+            panic!(
+                "expected BigInt object for overflowing integer, got {:?}",
+                object_of(&query, 0)
+            );
+        };
+        assert_eq!(n.to_string(), "-123456789012345678901234567890");
+    }
+
+    #[test]
+    fn test_typed_overflowing_integer_literal_promotes_to_bigint() {
+        // Typed lexical form: xsd:integer is unbounded, so this must promote,
+        // not error.
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+             SELECT ?s WHERE { ?s ex:serial \"123456789012345678901234567890\"^^xsd:integer }",
+        )
+        .unwrap();
+
+        let Term::Value(fluree_db_core::FlakeValue::BigInt(n)) = object_of(&query, 0) else {
+            panic!(
+                "expected BigInt object for typed overflowing integer, got {:?}",
+                object_of(&query, 0)
+            );
+        };
+        assert_eq!(n.to_string(), "123456789012345678901234567890");
+    }
+
+    #[test]
+    fn test_bare_decimal_literal_is_exact() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?s WHERE { ?s ex:price 19.99 }",
+        )
+        .unwrap();
+
+        let Term::Value(fluree_db_core::FlakeValue::Decimal(d)) = object_of(&query, 0) else {
+            panic!(
+                "expected exact decimal object, got {:?}",
+                object_of(&query, 0)
+            );
+        };
+        assert_eq!(d.to_string(), "19.99");
+    }
+
+    #[test]
+    fn test_negative_decimal_literal_is_exact() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?s WHERE { ?s ex:delta -0.5 }",
+        )
+        .unwrap();
+
+        let Term::Value(fluree_db_core::FlakeValue::Decimal(d)) = object_of(&query, 0) else {
+            panic!(
+                "expected exact decimal object, got {:?}",
+                object_of(&query, 0)
+            );
+        };
+        assert_eq!(d.to_string(), "-0.5");
+    }
+
+    #[test]
+    fn test_typed_decimal_literal_is_exact() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+             SELECT ?s WHERE { ?s ex:price \"1234567890123456789.0123456789\"^^xsd:decimal }",
+        )
+        .unwrap();
+
+        let Term::Value(fluree_db_core::FlakeValue::Decimal(d)) = object_of(&query, 0) else {
+            panic!(
+                "expected exact decimal object, got {:?}",
+                object_of(&query, 0)
+            );
+        };
+        // Round-tripping through f64 would lose these digits
+        assert_eq!(d.to_string(), "1234567890123456789.0123456789");
+    }
+
+    #[test]
+    fn test_double_literal_stays_double() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?s WHERE { ?s ex:price 1.5e2 }",
+        )
+        .unwrap();
+
+        assert!(
+            matches!(
+                object_of(&query, 0),
+                Term::Value(fluree_db_core::FlakeValue::Double(_))
+            ),
+            "exponent-form literal is xsd:double, got {:?}",
+            object_of(&query, 0)
+        );
+    }
+
+    #[test]
+    fn test_filter_decimal_constant_is_exact() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?s WHERE { ?s ex:price ?p . FILTER(?p > 10.25) }",
+        )
+        .unwrap();
+
+        let rendered = format!("{:?}", query.patterns);
+        assert!(
+            rendered.contains("Decimal"),
+            "FILTER constant should be an exact decimal: {rendered}"
+        );
+        assert!(
+            !rendered.contains("Double(10.25)"),
+            "FILTER constant must not round-trip through f64: {rendered}"
+        );
+    }
+
+    #[test]
+    fn test_values_decimal_constant_is_exact() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?p WHERE { VALUES ?p { 19.99 } ?s ex:price ?p }",
+        )
+        .unwrap();
+
+        let rendered = format!("{:?}", query.patterns);
+        assert!(
+            rendered.contains("Decimal"),
+            "VALUES constant should be an exact decimal: {rendered}"
+        );
     }
 
     // =========================================================================
@@ -1365,16 +1618,132 @@ mod tests {
     }
 
     #[test]
-    fn test_order_by_expr_unsupported() {
-        let result = lower_query(
+    fn test_order_by_expression_desugars_to_order_bind() {
+        // `ORDER BY (?o + 1)` desugars to a synthetic `(?__order_by_N, expr)`
+        // carried on `query.order_binds` and sorts on that synthetic var.
+        let (query, vars) = lower_query_with_vars(
             "PREFIX ex: <http://example.org/>
              SELECT ?s ?o WHERE { ?s ex:p ?o } ORDER BY (?o + 1)",
-        );
+        )
+        .unwrap();
 
-        assert!(matches!(
-            result,
-            Err(LowerError::UnsupportedOrderByExpression { .. })
-        ));
+        assert_eq!(query.ordering.len(), 1);
+        let sort_var = query.ordering[0].var;
+        assert!(
+            vars.name(sort_var).starts_with("?__order_by_"),
+            "expected synthetic ORDER BY var, got: {}",
+            vars.name(sort_var)
+        );
+        // The desugared bind rides on `order_binds`, never in WHERE patterns.
+        assert!(
+            query.order_binds.iter().any(|(var, _)| *var == sort_var),
+            "expected an order bind for the ORDER BY expression"
+        );
+        assert!(
+            !query
+                .patterns
+                .iter()
+                .any(|p| matches!(p, Pattern::Bind { var, .. } if *var == sort_var)),
+            "ORDER BY bind must not leak into WHERE patterns"
+        );
+        assert!(
+            query.grouping.is_none(),
+            "no aggregation expected for this query"
+        );
+    }
+
+    #[test]
+    fn test_order_by_desc_expression() {
+        // The BSBM ratio shape: ORDER BY DESC(expr) , ?var.
+        let (query, vars) = lower_query_with_vars(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?s ?a ?b WHERE { ?s ex:a ?a . ?s ex:b ?b }
+             ORDER BY DESC(?a / ?b) ?s",
+        )
+        .unwrap();
+
+        assert_eq!(query.ordering.len(), 2);
+        assert_eq!(query.ordering[0].direction, SortDirection::Descending);
+        // First key is the synthetic expression var, second is the bare ?s.
+        assert!(vars.name(query.ordering[0].var).starts_with("?__order_by_"));
+        assert_eq!(vars.name(query.ordering[1].var), "?s");
+    }
+
+    #[test]
+    fn test_order_by_expression_over_aggregate_uses_order_bind() {
+        // `ORDER BY DESC(?c * 2)` over an aggregate output is carried on
+        // `order_binds` (a dedicated post-grouping stage), not in WHERE patterns
+        // and not in the aggregation stage's own post-binds.
+        let (query, vars) = lower_query_with_vars(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?type (COUNT(?s) AS ?c) WHERE { ?s ex:type ?type }
+             GROUP BY ?type ORDER BY DESC(?c * 2)",
+        )
+        .unwrap();
+
+        assert_eq!(query.ordering.len(), 1);
+        let sort_var = query.ordering[0].var;
+        assert!(vars.name(sort_var).starts_with("?__order_by_"));
+
+        // Carried on order_binds.
+        assert!(
+            query.order_binds.iter().any(|(var, _)| *var == sort_var),
+            "expected the aggregate-referencing ORDER BY to be an order bind"
+        );
+        // Not a WHERE bind, and not in the grouping phase's post-binds.
+        assert!(
+            !query
+                .patterns
+                .iter()
+                .any(|p| matches!(p, Pattern::Bind { var, .. } if *var == sort_var)),
+            "order bind must not be a pre-WHERE bind"
+        );
+        let grouping = query.grouping.as_ref().expect("aggregation expected");
+        assert!(
+            !grouping.binds().any(|(var, _)| *var == sort_var),
+            "order bind must not be merged into the aggregation post-binds"
+        );
+    }
+
+    #[test]
+    fn test_order_by_inline_aggregate_dedups_with_select_alias() {
+        // `ORDER BY DESC(COUNT(?s))` reuses the SELECT alias's aggregate, so
+        // exactly one aggregate is computed and the order bind references it.
+        let (query, _vars) = lower_query_with_vars(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?type (COUNT(?s) AS ?c) WHERE { ?s ex:type ?type }
+             GROUP BY ?type ORDER BY DESC(COUNT(?s))",
+        )
+        .unwrap();
+
+        assert_eq!(
+            aggregates_of(&query).len(),
+            1,
+            "COUNT(?s) must not be computed twice"
+        );
+        assert_eq!(query.order_binds.len(), 1, "expected one ORDER BY bind");
+        assert_eq!(query.ordering.len(), 1);
+        let (bind_var, _) = &query.order_binds[0];
+        assert_eq!(query.ordering[0].var, *bind_var);
+    }
+
+    #[test]
+    fn test_order_by_inline_aggregate_hoisted_when_not_selected() {
+        // `ORDER BY DESC(COUNT(?s))` with no aggregate in SELECT hoists a new
+        // aggregate into the grouping phase with a synthetic output var.
+        let (query, vars) = lower_query_with_vars(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?type WHERE { ?s ex:type ?type }
+             GROUP BY ?type ORDER BY DESC(COUNT(?s))",
+        )
+        .unwrap();
+
+        let aggs = aggregates_of(&query);
+        assert_eq!(aggs.len(), 1, "expected one hoisted aggregate");
+        assert!(vars.name(aggs[0].output_var).starts_with("?__inline_agg_"));
+        assert_eq!(query.order_binds.len(), 1);
+        let (bind_var, _) = &query.order_binds[0];
+        assert_eq!(query.ordering[0].var, *bind_var);
     }
 
     #[test]
@@ -1450,6 +1819,43 @@ mod tests {
             has_bind,
             "expected a BIND pattern for synthetic GROUP BY expression"
         );
+    }
+
+    #[test]
+    fn test_group_by_expression_reuses_matching_select_alias() {
+        // Field P0: `SELECT (LCASE(?cur) AS ?k) ... GROUP BY (LCASE(?cur))` must
+        // group on ?k (the SELECT alias), NOT on a fresh synthetic var. Grouping
+        // on a synthetic var left ?k as an ungrouped per-row variable, which the
+        // formatter then exploded into one row per input binding (LIMIT ignored).
+        let (query, vars) = lower_query_with_vars(
+            "PREFIX ex: <http://example.org/>
+             SELECT (LCASE(?cur) AS ?k) (COUNT(?s) AS ?n)
+             WHERE { ?s ex:currency ?cur } GROUP BY (LCASE(?cur))",
+        )
+        .unwrap();
+
+        assert_eq!(group_by_of(&query).len(), 1);
+        let group_var = group_by_of(&query)[0];
+
+        // The group key is the SELECT alias ?k, not a synthetic ?__group_expr_N.
+        assert_eq!(vars.name(group_var), "?k");
+
+        // Exactly one BIND targets ?k (the SELECT pre-bind); GROUP BY adds none.
+        let binds_to_k = query
+            .patterns
+            .iter()
+            .filter(|p| matches!(p, Pattern::Bind { var, .. } if *var == group_var))
+            .count();
+        assert_eq!(
+            binds_to_k, 1,
+            "expected exactly one BIND to the shared group/alias var"
+        );
+
+        // No synthetic group-expression var should have been created.
+        let has_synthetic = query.patterns.iter().any(
+            |p| matches!(p, Pattern::Bind { var, .. } if vars.name(*var).starts_with("?__group_expr_")),
+        );
+        assert!(!has_synthetic, "no synthetic group var should be generated");
     }
 
     #[test]
@@ -3145,5 +3551,149 @@ mod tests {
             "Expected PropertyPath, got {:?}",
             query.patterns[0]
         );
+    }
+}
+
+#[cfg(test)]
+mod pragma_tests {
+    use super::*;
+    use crate::parse::parse_sparql;
+    use fluree_db_query::parse::encode::MemoryEncoder;
+
+    fn lower_query(sparql: &str) -> Result<Query> {
+        let output = parse_sparql(sparql);
+        assert!(
+            output.ast.is_some(),
+            "Parse failed: {:?}",
+            output.diagnostics
+        );
+        let mut encoder = MemoryEncoder::with_common_namespaces();
+        encoder.add_namespace("http://example.org/", 100);
+        let mut vars = VarRegistry::new();
+        lower_sparql(&output.ast.unwrap(), &encoder, &mut vars)
+    }
+
+    #[test]
+    fn pragma_reasoning_owl2rl_sets_query_modes() {
+        let query = lower_query(
+            "# PRAGMA reasoning: owl2rl
+             PREFIX ex: <http://example.org/>
+             SELECT ?s WHERE { ?s a ex:Student }",
+        )
+        .unwrap();
+        assert!(query.reasoning.modes.owl2rl);
+        assert!(query.reasoning.has_reasoning());
+    }
+
+    #[test]
+    fn pragma_reasoning_none_disables() {
+        let query = lower_query(
+            "# PRAGMA reasoning: none
+             SELECT * WHERE { ?s ?p ?o }",
+        )
+        .unwrap();
+        assert!(query.reasoning.is_reasoning_disabled());
+    }
+
+    #[test]
+    fn pragma_reasoning_multi_mode_merges() {
+        let query = lower_query(
+            "# PRAGMA reasoning: rdfs, datalog
+             SELECT * WHERE { ?s ?p ?o }",
+        )
+        .unwrap();
+        assert!(query.reasoning.modes.rdfs);
+        assert!(query.reasoning.modes.datalog);
+        assert!(!query.reasoning.modes.owl2rl);
+    }
+
+    #[test]
+    fn no_pragma_leaves_default_config() {
+        let query = lower_query("SELECT * WHERE { ?s ?p ?o }").unwrap();
+        assert!(!query.reasoning.has_reasoning());
+    }
+
+    #[test]
+    fn pragma_reasoning_applies_to_ask() {
+        let query = lower_query(
+            "# PRAGMA reasoning: owl2rl
+             ASK { ?s ?p ?o }",
+        )
+        .unwrap();
+        assert!(query.reasoning.modes.owl2rl);
+    }
+
+    #[test]
+    fn pragma_reasoning_unknown_mode_errors() {
+        let err = lower_query(
+            "# PRAGMA reasoning: owl3xl
+             SELECT * WHERE { ?s ?p ?o }",
+        )
+        .unwrap_err();
+        assert!(matches!(err, LowerError::InvalidPragma { .. }), "{err}");
+    }
+
+    #[test]
+    fn pragma_reasoning_empty_errors() {
+        let err = lower_query(
+            "# PRAGMA reasoning:
+             SELECT * WHERE { ?s ?p ?o }",
+        )
+        .unwrap_err();
+        assert!(matches!(err, LowerError::InvalidPragma { .. }), "{err}");
+    }
+
+    #[test]
+    fn pragma_reasoning_none_combined_errors() {
+        let err = lower_query(
+            "# PRAGMA reasoning: none, rdfs
+             SELECT * WHERE { ?s ?p ?o }",
+        )
+        .unwrap_err();
+        assert!(matches!(err, LowerError::InvalidPragma { .. }), "{err}");
+    }
+
+    #[test]
+    fn pragma_reasoning_budget_sets_modes() {
+        let query = lower_query(
+            "# PRAGMA reasoning: owl2rl
+             # PRAGMA reasoning-max-facts: 20000000
+             # PRAGMA reasoning-max-seconds: 300
+             SELECT * WHERE { ?s ?p ?o }",
+        )
+        .unwrap();
+        assert!(query.reasoning.modes.owl2rl);
+        assert_eq!(query.reasoning.modes.max_facts, Some(20_000_000));
+        assert_eq!(query.reasoning.modes.max_seconds, Some(300));
+    }
+
+    #[test]
+    fn pragma_reasoning_budget_without_mode_is_carried() {
+        // A budget pragma alone doesn't enable reasoning, but it must survive
+        // lowering so a ledger-config default mode runs under it.
+        let query = lower_query(
+            "# PRAGMA reasoning-max-facts: 5
+             SELECT * WHERE { ?s ?p ?o }",
+        )
+        .unwrap();
+        assert!(!query.reasoning.modes.has_any_enabled());
+        assert_eq!(query.reasoning.modes.max_facts, Some(5));
+    }
+
+    #[test]
+    fn pragma_reasoning_budget_invalid_number_errors() {
+        let err = lower_query(
+            "# PRAGMA reasoning-max-facts: lots
+             SELECT * WHERE { ?s ?p ?o }",
+        )
+        .unwrap_err();
+        assert!(matches!(err, LowerError::InvalidPragma { .. }), "{err}");
+
+        let err = lower_query(
+            "# PRAGMA reasoning-max-seconds:
+             SELECT * WHERE { ?s ?p ?o }",
+        )
+        .unwrap_err();
+        assert!(matches!(err, LowerError::InvalidPragma { .. }), "{err}");
     }
 }

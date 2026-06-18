@@ -54,13 +54,18 @@ Cost ladder (per event):
 
 | Event | Cost (fuel) |
 |---|---|
-| Index leaflet touched (per scan batch, regardless of cache state) | 1.000 |
-| Forward-dict touch (per dict-backed value resolved during result materialization) | 1.000 |
+| Query floor (once per query, charged at entry before parsing) | 1.000 |
+| Index leaflet touched (per scan batch, regardless of cache state) | 0.010 |
+| Forward-dict touch (per dict-backed value resolved during result materialization) | 0.010 |
+| History-scan leaflet base (per leaflet; per-row costs below add on top) | 0.010 |
 | Flake returned from a `db.range` call (e.g. SHACL graph reads, graph crawl) | 0.001 |
 | Overlay/novelty row materialized | 0.001 |
+| History row scanned (base + in-range sidecar rows) | 0.001 |
 | R2RML row emitted (Iceberg/Parquet) | 0.001 |
-| Transaction commit baseline (once per commit, including each bulk-import chunk) | 100.000 |
+| Transaction commit baseline (once per commit, including each bulk-import chunk) | 10.000 |
 | Staged flake (per flake in a transaction or bulk-import chunk) | 0.001 |
+| Indexer CAS write (per successful `ContentStore::put` / `put_with_id` made by an index build) | 1.000 |
+| Re-encoded leaflet inside an FLI3 leaf write (passthrough leaflets are not charged) | 1.000 |
 | `REGEX` / `REPLACE` evaluation | 0.001 |
 | Hash function (`MD5`, `SHA1`, `SHA256`, `SHA384`, `SHA512`) | 0.001 |
 | `UUID` / `STRUUID` | 0.001 |
@@ -69,6 +74,41 @@ Cost ladder (per event):
 | `Fulltext` (per-row BM25 scoring) | 0.005 |
 
 Cheap operations (comparisons, arithmetic, type checks, simple string ops, datetime extraction, etc.) cost zero — instrumentation overhead would dwarf the actual cost.
+
+The **query floor** guarantees every fuel-tracked query reports at least `1.000` fuel: a query touching no persisted data still costs the floor, and a query that errors during parsing/planning still reports it. I/O "touches" cost `0.010` each, so a scan-dominated query reports roughly `1.000 + 0.010 × (leaflet/dict touches)`. The fuel schedule above is defined in one place — `fluree-db-core/src/tracking.rs` (`tracking::schedule`).
+
+#### Graph-crawl projection: materialization fuel scales with selected predicates
+
+When a JSON-LD query's projection lists explicit forward predicates (e.g. `select: {"?x": ["@id", "ex:a", "ex:b"]}`), the range provider receives a predicate allow-list via `RangeOptions::predicate_filter` and drops base flakes for non-listed predicates **before** decoding the object value, resolving the subject Sid, or charging dict-touch fuel.
+
+What this changes:
+- **Per-flake (`0.001`), subject-resolve, object-decode, and dict-touch (`0.010`) fuel** all scale with the number of selected predicates rather than the subject's total predicate count.
+
+What this does **not** change:
+- **Index leaflet touches (`0.010` each)** still scale with the cursor's scanned subject range. For K ≥ 2 the cursor opens `SPOT(s,*,*)` and pays one `INDEX_TOUCH` per leaflet batch returned, the same as a full crawl over the subject — the filter narrows which rows get *materialized*, not how many leaflets get *read*. For K = 1 the cursor opens `SPOT(s,p,*)` directly via `RangeMatch::subject_predicate`, which narrows the leaflet key-range to the `(s, p)` prefix — same `INDEX_TOUCH` count for small subjects (one batch either way), strictly fewer touches for subjects whose flakes span multiple batches.
+
+Wildcard projections (`select: {"?x": ["*"]}`) take the unchanged decode-everything path — every flake on the subject is materialized and charged. Refinements on a wildcard level (e.g. `{"ex:friend": ["*"]}` inside a `["*", ...]` selection) keep the parent level wildcard; only the explicit-list form opts into the filter.
+
+Explicit projections with no forward predicates (e.g. `["@id"]` or reverse-only) skip the forward SPOT scan entirely — no cursor, no `INDEX_TOUCH`. `@id` is derived from the subject Sid and reverse properties go through a dedicated POST scan.
+
+The overlay path also honors the filter, so per-subject hydration over a ledger with uncommitted novelty pays only for retracts / asserts on predicates the projection cares about. Novelty-only predicates (no persisted p_id yet) are honored too: the row-loop allow-set is extended with ephemeral p_ids the overlay translator assigned for any selected predicate Sid.
+
+### Indexing Fuel
+
+Indexer CAS writes are billed through a `MeteredContentStore` wrapper that the build entry points install around the caller-supplied content store. Every successful `ContentStore::put` / `put_with_id` charges the base **1.000 fuel** rate — including index leaves, branch manifests, root manifests, dict packs / reverse-tree nodes, history sidecars, garbage records, stats sketches, and (incremental) spatial / fulltext arenas. The lower-level `Storage::content_write_bytes` is **not** currently wrapped; the only indexer code path that uses it is the dead-code spatial rebuild helper. If that path is wired up, add a storage-level wrapper first (or migrate it to `ContentStore::put`).
+
+FLI3 leaf writes carry an additional per-leaflet charge of **1.000 fuel per re-encoded leaflet**. Passthrough leaflets (byte-copies carried forward from a prior leaf during an incremental update) are **not** charged because no zstd encoding work was performed — so a 100-leaflet leaf where only two leaflets were touched by novelty bills `1 + 2 = 3` fuel, not `1 + 100`. The two FLI3 leaf upload sites (`build::upload::upload_indexes_to_cas` for full rebuild, `build::incremental::upload_leaf_blobs` for incremental) compute the count from `LeafInfo::re_encoded_leaflet_count`.
+
+Indexing fuel is **measurement only**: indexer trackers are no-limit. A partial index is worse than a slow one, so the indexer never aborts mid-build on a fuel limit. The plain public entry points (`build_index_for_record`, `rebuild_index_from_commits`) pass a disabled tracker and report `fuel: None`. The `*_with_tracker` variants wrap the store, propagate a fuel-enabled tracker, and stamp the final tally on `IndexResult::fuel` — `Some(0.0)` for an already-current build, `Some(N)` for one that did real work.
+
+Where fuel surfaces depends on who initiated the build:
+
+- **`/reindex` (standalone, user-triggered):** the API creates a per-request fuel tracker, returns `ReindexResponse.fuel`. CLI prints `Fuel: N.NNN`.
+- **`trigger_index` (standalone, waits for background completion):** the orchestrator creates a per-build tracker; `TriggerIndexResult.fuel` carries the result. **Coalesced trigger callers** all receive the fuel of the single build that satisfied them.
+- **Background indexer (no caller waiting):** the orchestrator still creates a per-build tracker and logs the tally on the completion `info!` line (`fuel = ...`), but does not return it anywhere.
+- **Combined transactor + post-commit indexing (`maybe_refresh_after_commit` / `require_refresh_before_commit`):** measured with a per-build tracker and logged on the completion line; intentionally **not** attributed to the transaction's tracking response.
+
+`IndexOutcome::Completed` carries `fuel: Option<f64>` so `wait()` callers and waiter handles see the same value. Already-satisfied early-returns (waiter satisfied by a previously-published index) report `Some(0.0)` so callers can distinguish "no work" from "not tracked".
 
 ### Setting Fuel Limits
 
@@ -86,6 +126,12 @@ Set fuel limits via `opts.max-fuel` (decimal allowed). Setting a fuel limit impl
 ```
 
 You can also use `"maxFuel"` or `"max_fuel"` as alternative key names. The HTTP equivalent is the `fluree-max-fuel` header.
+
+Because the `1.000` query floor is charged before execution and counts toward the limit, `max-fuel` must leave room for it:
+
+- `max-fuel: 1` permits exactly the floor — a query that needs even one persisted touch is rejected.
+- `max-fuel: 1.01` permits the floor plus one persisted touch.
+- `max-fuel` below `1.0` (e.g. `0.5`) is rejected up front, before parsing.
 
 ### Fuel Limit Behavior
 
@@ -114,6 +160,28 @@ When tracking is enabled, the response includes tracking information as top-leve
 ```
 
 The `fuel` value is decimal with up to 3 places of precision. The HTTP `x-fdb-fuel` response header carries the same value.
+
+When a reasoning mode ran (e.g. `"reasoning": "owl2rl"`), tracked responses
+also include a top-level `reasoning` block describing the OWL2-RL
+materialization — most importantly whether it was **capped** (hit its budget
+before reaching fixpoint, meaning results may be missing entailments):
+
+```json
+{
+  "status": 200,
+  "result": [...],
+  "reasoning": {
+    "capped": false,
+    "derived_facts": 47213,
+    "iterations": 4,
+    "duration_ms": 380
+  }
+}
+```
+
+The same JSON rides the `x-fdb-reasoning` response header. See
+[Reasoning — materialization budget](reasoning.md#materialization-budget)
+for budget configuration.
 
 Tracked transaction responses (`/insert`, `/upsert`, `/update`, including Turtle/TriG and SPARQL UPDATE when tracking headers are used) expose the same top-level `time`, `fuel`, and `policy` fields when present, alongside the transaction receipt fields.
 

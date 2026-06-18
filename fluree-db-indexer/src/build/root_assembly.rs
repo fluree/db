@@ -150,6 +150,8 @@ pub(crate) async fn encode_and_write_root(
             total_bytes: root_bytes.len(),
             ..result_stats
         },
+        // Outer entry point fills fuel from the tracker tally.
+        fuel: None,
     })
 }
 
@@ -356,6 +358,8 @@ pub(crate) async fn encode_and_write_root_v6(
             total_bytes: root_bytes.len(),
             ..result_stats
         },
+        // Outer entry point fills fuel from the tracker tally.
+        fuel: None,
     })
 }
 

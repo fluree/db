@@ -4,8 +4,8 @@ This document is for implementers building a custom server (for example in `../s
 
 The CLI supports two broad categories of remote operations:
 
-- **Data API**: query / update / insert / upsert / info / exists / show / log / history / context / explain, plus admin operations like create / drop / reindex / branch (create / drop / rebase / merge) / publish / export.
-- **Replication / sync**: clone / pull / fetch (content-addressed replication by CID, via pack + storage proxy) and ledger-archive (`export --format ledger`).
+- **Data API**: query / update / insert / upsert / info / exists / show / log / history / context / explain, plus admin operations like create / drop / reindex / branch (create / drop / rebase / merge) / publish / export / import.
+- **Replication / sync**: clone / pull / fetch (content-addressed replication by CID, via pack + storage proxy), ledger-archive (`export --format ledger`), and wholesale restore (`create --remote --from <archive>.flpack`, via `POST /import`).
 
 ## Base URL And Discovery
 
@@ -73,11 +73,13 @@ The `commit` query parameter accepts the same identifiers as the local `fluree s
 - `404 Not Found` — ledger or commit not found
 - `501 Not Implemented` — proxy storage mode (no local index available for decoding)
 
-### `fluree create <ledger> --remote <name>` (admin-protected, empty ledger only)
+### `fluree create <ledger> --remote <name>` (admin-protected)
 
-- `POST {api_base_url}/create` with `{"ledger": "<ledger>"}`
+- `POST {api_base_url}/create` with `{"ledger": "<ledger>"}` (empty ledger), **or**
+- `POST {api_base_url}/import/*ledger` with a raw `.flpack` body (when `--from <archive>.flpack` is given — see [Ledger Import Contract](#ledger-import-contract)), **or**
+- the `/import-upload` handshake when the server is size-capped (see [Negotiated Upload Import Contract](#negotiated-upload-import-contract))
 
-Creates an **empty** ledger on the remote server. The CLI rejects `--remote` together with `--from` / `--memory` (those import paths require local data ingestion); the suggested workflow is to create + populate locally, then run `fluree publish <remote> <ledger>` which calls `/exists`, `/create`, and `/push` in sequence.
+With no `--from`, creates an **empty** ledger on the remote server. With `--from <archive>.flpack`, the CLI restores a full ledger remotely (commits + txns + prebuilt index) under the given name — streaming directly to `POST /import` by default, or via the negotiated out-of-band upload when the server advertises a body-size cap below the archive. The CLI still rejects `--remote` together with a **non-`.flpack`** `--from`, or with `--memory` (those bulk-import paths require local data ingestion); for those, populate locally then run `fluree publish <remote> <ledger>` (which calls `/exists`, `/create`, and `/push` in sequence), or export to `.flpack` first.
 
 `--remote` does not touch local state — neither the active-ledger pointer nor the local storage tree. The CLI does not require a project-local `.fluree/` for `create --remote`; it falls back to global config (`$FLUREE_HOME` or the platform default) for remote registration lookups. Auto-routing through a local server is **not** done for `create`; you must pass `--remote <name>` explicitly. Without `--remote`, `fluree create` is local-only and does require a project `.fluree/`.
 
@@ -151,9 +153,10 @@ Active-ledger handling:
 
 ### `fluree create <name> --from <file>.flpack` (native ledger import)
 
-- No server endpoint required (local-only operation)
+- **Local mode (default):** no server endpoint required.
+- **Remote mode (`--remote <name>`):** `POST {api_base_url}/import/*ledger` with the raw `.flpack` body — see [Ledger Import Contract](#ledger-import-contract).
 
-Imports a `.flpack` file (native ledger pack) into a new local ledger. The `.flpack` format uses the same `fluree-pack-v1` wire format as `POST /pack`. See [Ledger portability](#ledger-portability-flpack-files) below.
+Imports a `.flpack` file (native ledger pack) into a new ledger — locally, or onto a remote server with `--remote`. The `.flpack` format uses the same `fluree-pack-v1` wire format as `POST /pack`. See [Ledger portability](#ledger-portability-flpack-files) below.
 
 ### `fluree export --format ledger`
 
@@ -210,6 +213,39 @@ requested `t`. Note that Fluree maintains one set of index stats
 independent of `t` — the value of `--at --explain` is in honoring the
 contract and consistency with the query path, not in producing
 materially different plans.
+
+### `fluree multi-query`
+
+- `POST {api_base_url}/multi-query`
+
+Bundles N JSON-LD and/or SPARQL sub-queries into a single envelope that
+the server runs in parallel against one resolved snapshot moment. The
+CLI reads the envelope JSON (file / stdin / `-e` inline) and POSTs it
+to the connection-scoped `/multi-query` endpoint — each sub-query
+declares its own `from`, so there is no ledger-scoped variant.
+
+`fluree multi-query` resolves its transport in the same priority as `fluree query`:
+
+- **`--remote <name>`** — explicit; routes through the named remote's configured `base_url`. OIDC token refresh is persisted back to `config.toml` after a successful round-trip (same code path `fluree query --remote` uses via [`context::persist_refreshed_tokens`]).
+- **Auto-route to a locally running `fluree server`** — used when `--remote` is omitted and `server.meta.json` reports a live pid; bypassed by `--direct`. No token persistence on this branch (the local server doesn't require auth).
+- **In-process local** — when neither of the above applies (no remote, no running server, or `--direct` with no remote), the CLI calls `Fluree::multi_query()` directly against the storage tree configured for this `.fluree/` directory. Same code path the server handler ultimately invokes; the only thing that changes is the boundary at which the request enters the api crate. No HTTP, no auth, no impersonation gate — the caller already has direct authority over the local storage.
+
+**Authentication** uses the same `MaybeCredential` + `MaybeDataBearer`
+extractor stack as `/query` — Bearer tokens (JWT/JWS) and signed
+requests (JWS/VC) both work. **Bearer ledger-scope is enforced on
+every distinct ledger referenced in the envelope**: any out-of-scope
+ledger triggers a 404 on the whole envelope (existence-leak avoidance
+matching `/query`'s behavior), *not* a per-alias error.
+
+**Envelope-resident knobs replace some single-query CLI flags.** Multi-query doesn't take `--at` (use envelope-level `asOf`) or `--track-*` / `--max-fuel` (use envelope-level `opts.meta` and per-sub-query `opts.max-fuel`). It **does** accept the full `--policy*` flag bundle (`--as`, `--policy-class`, `--policy`, `--policy-file`, `--policy-values`, `--policy-values-file`, `--default-allow`) — the same surface `fluree query` exposes. The headers ride through the transport identically; each sub-query carries its own `from`, so policy applies per-ledger via the standard server-side policy path. See [Multi-query envelope](../api/multi-query.md) for the full envelope contract, response shape, merge rules, bounds, and current limitations (history queries rejected, envelope `max-fuel` rejected, response cap enforced at assembly, SPARQL policy parity gap).
+
+**Output formatting** uses two independent CLI flags:
+
+- `--format json|typed-json` selects the per-alias result shape (server-side formatter applied to each alias's entry inside `results`). Mirrors the `--format` flag on `fluree query`.
+- `--normalize-arrays` wraps single-valued JSON-LD properties in arrays. Composes with `--format` on JSON-LD aliases; on SPARQL aliases it is a no-op (SPARQL Results JSON has its own binding shape).
+- `--output json|pretty|aliases` controls how the CLI prints the response **envelope** on the terminal; it doesn't affect alias results.
+
+On the wire, `--format` / `--normalize-arrays` ride as `Fluree-Output-Format` / `Fluree-Normalize-Arrays` headers when going through `--remote` or auto-route; the in-process path wires them straight into the api crate's `MultiQueryBuilder::format(...)`. The server reads them with precedence `Fluree-Output-Format > Fluree-Normalize-Arrays alone > Accept-header content negotiation`. Unknown `Fluree-Output-Format` values return **400 Bad Request**; `Accept` values that produce byte/string payloads (TSV / CSV / SPARQL XML / RDF XML) return **406 Not Acceptable** when no explicit `Fluree-Output-Format` is set. `--format typed-json` is cross-language (applied to every alias); `--format json` (the default) keeps SPARQL aliases on SPARQL Results JSON. See [Multi-query envelope → Output formatting](../api/multi-query.md#output-formatting) for the full table.
 
 ### `fluree branch list` (read-only)
 
@@ -309,6 +345,17 @@ should treat header values as defaults that body values override.
 For SPARQL requests (`Content-Type: application/sparql-query`,
 `application/sparql-update`), headers are the only transport — the SPARQL body
 has no opts block.
+
+For `POST /multi-query`, the CLI **does not** inject policy fields into the
+envelope body — it sends headers only. The server folds the headers into the
+envelope's top-level `opts` **before validation** (so envelope-level
+rejections like `max-fuel` apply to header-supplied values too), and the
+standard envelope → sub-query opts merge then carries them into every alias.
+
+**Per-language effect:**
+
+- **JSON-LD sub-queries** consume the merged `opts.identity` / `opts.policy-class` / `opts.policy` / `opts.policy-values` / `opts.default-allow` via `apply_auth_identity_to_opts` and the regular connection-scoped JSON-LD dispatch path — same code path `POST /query` uses for single queries.
+- **SPARQL sub-queries** match the single-query connection-scoped SPARQL behaviour of `POST /query` with `Content-Type: application/sparql-query` and an inline `FROM`: bearer-scope reads apply, but identity threading via `QueryConnectionOptions` (`opts.identity`, `opts.policy-class`, etc.) is not currently consumed by that path. The headers still ride through the transport, and the envelope-level fold still happens, but the SPARQL dispatcher (`query_from().sparql()`) does not act on policy opts. This gap is the same one documented for connection-scoped SPARQL today. See [Multi-query envelope → Limitations](../api/multi-query.md#limitations) for the canonical list.
 
 ### Required server behavior
 
@@ -1219,6 +1266,183 @@ Clients verify integrity:
 
 **Graceful fallback:** If you do not implement pack yet, return `404 Not Found`, `405 Method Not Allowed`, `406 Not Acceptable`, or `501 Not Implemented`. The CLI treats those as "pack not supported" and falls back to `GET /commits` plus `GET /storage/objects/:cid`.
 
+## Ledger Import Contract
+
+The inbound counterpart of the pack export endpoint. `fluree create <ledger> --remote <name> --from <archive>.flpack` streams a local `.flpack` archive to:
+
+```
+POST {api_base_url}/import/*ledger
+Content-Type: application/x-fluree-pack
+Authorization: Bearer <token>
+
+<body = raw .flpack byte stream>
+```
+
+The server creates a **new** ledger named by the path tail and restores it wholesale from the archive — it does not require, and must not expect, the ledger to already exist. The path name is independent of whatever ledger the archive was exported from, so the same archive can be restored under any name.
+
+### Required server behavior
+
+1. **Stream the body**, do not buffer it whole — production archives can be many gigabytes. Decode `fluree-pack-v1` frames incrementally (preamble → mandatory Header → Data/Manifest frames → mandatory End).
+2. **Verify every object's integrity** before writing it to storage, using the same rules as the pack client: commit-v2 blobs (`FCV2` magic) hash over their canonical sub-range; all other objects are full-bytes SHA-256 verified against the CID. Reject the archive on any mismatch.
+3. **Finalize the heads from the embedded `phase: "nameservice"` manifest** — set the commit head (`commit_head_id` / `commit_t`) and, when the archive carries index artifacts, the index head (`index_head_id` / `index_t`). Verify those head CIDs were actually present in the archive before pointing the nameservice at them, so a truncated or mismatched archive cannot produce a dangling head.
+4. **Trust the archive byte-for-byte** — unlike `POST /push`, do not replay or re-validate (no sequencing/policy/SHACL re-checks) and do not reindex; the prebuilt index rides along so the restored ledger is immediately queryable.
+5. **Roll back on any failure** — a partially-ingested ledger must not be left live. (The reference server soft-drops the just-created ledger.)
+6. **Normalize a bare name** (`mydb` → `mydb:main`) consistently across ingest, head finalization, and the response.
+
+### Auth
+
+**Admin-protected** — same bracket as `/create`, `/drop`, `/reindex`, `/export`. The body carries prebuilt index artifacts the server did not produce, so this is an admin-grade operation (not the `fluree.storage.*` replication bracket used by `/pack`).
+
+### Response (`201 Created`)
+
+```jsonc
+{
+  "ledger_id": "restored-db:main",
+  "commits": 12,
+  "txn_blobs": 12,
+  "index_artifacts": 34,   // 0 for a commits-only (--no-indexes) archive
+  "commit_t": 12,
+  "index_t": 12            // omitted when the archive carried no index
+}
+```
+
+The CLI reads `ledger_id`, `commits`, `txn_blobs`, and `index_artifacts` for its success line.
+
+### Error responses
+
+| Status | When |
+|--------|------|
+| `201` | Ledger restored. |
+| `400` | Malformed archive: bad preamble/frame, missing Header/End, missing nameservice manifest, or a manifest head CID not present in the archive. |
+| `409` | A ledger with that name already exists. |
+| `401` / `403` | Admin token required and absent/invalid. |
+| `5xx` | Storage / nameservice errors during ingest or head finalization. |
+
+**Graceful fallback:** A server that does not implement import returns `404` / `405` / `501`; the CLI surfaces this as a remote error. There is no automatic client-side fallback (unlike pack → commits), since wholesale restore has no per-object equivalent over the data API.
+
+**Size-capped servers:** if your gateway caps request bodies below a typical archive, implement the [Negotiated Upload Import Contract](#negotiated-upload-import-contract) instead of (or in addition to) this direct endpoint, and advertise it in discovery — the CLI will upload out-of-band automatically.
+
+### Reference implementation
+
+| Concern | Canonical location |
+|---------|-------------------|
+| HTTP route + auth | `fluree-db-server/src/routes/import.rs::import_ledger_tail` |
+| Streaming restore + head finalization + rollback | `fluree-db-api/src/commit_transfer.rs::restore_ledger` |
+| CLI dispatch + streaming upload | `fluree-db-cli/src/commands/create.rs::run_remote_flpack_import`, `fluree-db-cli/src/remote_client.rs::import_ledger` |
+| Archive export (producing the body) | `fluree-db-api/src/lib.rs::archive_ledger` |
+
+## Negotiated Upload Import Contract
+
+For servers that **cannot accept a large body** on `POST /import` — e.g. an app on AWS Lambda behind API Gateway, where request payloads are capped (~6–10 MB) — the CLI supports an out-of-band upload handshake: the client uploads the `.flpack` directly to object storage (bypassing the size-capped request path), then notifies the server to restore from it. This is **optional**; implement it only if your gateway caps body size.
+
+### Negotiation (discovery)
+
+Advertise import capabilities in the discovery document (`GET /.well-known/fluree.json`):
+
+```jsonc
+"import": {
+  "modes": ["direct", "presigned-put", "multipart-put"],
+  "direct_max_bytes": 6291456,
+  "multipart_threshold_bytes": 5368709120,
+  "multipart_part_size_bytes": 268435456
+}
+```
+
+- `modes` — `"direct"` (streaming `POST /import`), `"presigned-put"` (single out-of-band PUT), and/or `"multipart-put"` (chunked out-of-band upload, below).
+- `direct_max_bytes` — the largest body you accept on `POST /import`. Only gates the direct-vs-negotiated choice.
+- `multipart_threshold_bytes` *(informational)* — the archive size at or above which **you** mint a multipart plan instead of a single PUT. A single S3 PUT caps at 5 GiB, so this should be ≤ 5 GiB.
+- `multipart_part_size_bytes` *(informational)* — the part size you intend to hand out. Must be ≥ 5 MiB for S3 (its minimum part size, except the last part).
+
+**CLI selection rule:** use the negotiated flow when `presigned-put` **or** `multipart-put` is offered **and** either `direct` is not offered or the archive size exceeds `direct_max_bytes`; otherwise stream directly. A server omitting the `import` block is treated as direct-only (back-compatible).
+
+**Single-PUT vs multipart is the server's call, not the client's.** The CLI sends its archive `size` in the mint request and reacts to whichever shape you return (`upload` for single PUT, `multipart` for parts). The threshold/part-size hints exist only so operators can see what the server will do; the client does not pre-decide.
+
+### The handshake
+
+| Step | Call | Server responsibility |
+|------|------|----------------------|
+| 1. Mint | `POST {api_base}/import-upload` `{ "ledger": "<name>", "size"?: <bytes> }` | Allocate an upload slot. Return `{ import_id, upload: { method:"PUT", url, headers, expires_at_unix } }` where `url` is a presigned object-store PUT (absolute) **or** a relative path the client resolves against the server origin. For `size` at or above your multipart threshold, return a `multipart` block instead — see [Multipart upload](#multipart-upload-archives-over-5-gb). |
+| 2. Upload | `PUT <upload.url>` (raw `.flpack`, streamed) | Receive the bytes into staging (object storage). The URL is the capability — **do not require the API bearer token** on this request; authorize via the presigned signature (or a token embedded in the URL). |
+| 3. Complete | `POST {api_base}/import-upload/{import_id}/complete` | Verify the upload exists, begin `restore_ledger` from it **asynchronously**, return `{ import_id, status:"running" }` (`202`). |
+| 4. Poll | `GET {api_base}/import-upload/{import_id}` | Return `{ status, result?, error? }`, `status ∈ {awaiting-upload, running, succeeded, failed}`. On `succeeded`, `result` is the same summary as the direct import endpoint. |
+
+The CLI carries the bearer token on steps 1, 3, 4 (mint/complete/status are admin-grade) but **not** step 2.
+
+**Slot lifecycle / expiry.** `expires_at_unix` is a contract, not a hint: an upload or `complete` against a slot past its expiry MUST be rejected, and the backend SHOULD reclaim the slot and any staged bytes once expired so abandoned uploads do not accumulate. The reference server uses a 1-hour TTL, enforces it on the upload/part/complete calls, and sweeps expired jobs (and their staged files) when the next slot is minted — except a slot whose restore is still `running`, which is spared until it finishes. A production backend typically delegates this to an object-store lifecycle rule on the staging prefix.
+
+### Multipart upload (archives over 5 GB)
+
+A single S3 PUT rejects bodies over 5 GiB (`EntityTooLarge`). For larger archives, mint a **multipart** plan instead of a single PUT. Everything else (auth, async restore, polling) is identical; only steps 1–3 change shape.
+
+**Step 1 — multipart mint.** When the declared `size` is at or above your `multipart_threshold_bytes`, return a `multipart` block instead of `upload`:
+
+```jsonc
+{
+  "import_id": "imp_…",
+  "ledger": "<name>",
+  "multipart": {
+    "upload_id": "…",            // your object-store UploadId (opaque to the client)
+    "part_size_bytes": 268435456, // every part but the last is exactly this many bytes
+    "parts": [
+      { "part_number": 1, "url": "https://…UploadPart…partNumber=1…", "headers": { … } },
+      { "part_number": 2, "url": "https://…UploadPart…partNumber=2…", "headers": { … } }
+      // … one entry per part, part_number 1..=N, contiguous
+    ],
+    "expires_at_unix": 1750000000
+  }
+}
+```
+
+To produce this, the backend MUST:
+
+1. Call **`CreateMultipartUpload`** on your bucket/key and keep the returned `UploadId`.
+2. Choose a `part_size` such that `ceil(size / part_size) ≤ 10000` (S3's hard part-count ceiling) and `part_size ≥ 5 MiB`. The reference server starts from `multipart_part_size_bytes` and raises it if the count would exceed 10,000.
+3. Presign one **`UploadPart`** URL per part (`partNumber = 1..=N`, same `UploadId`), and return them in `parts`. You may presign all upfront (≈84 URLs for a 21 GB archive at 256 MiB parts) or fewer at a time — but the client expects the full list in the mint response.
+
+**Step 2 — part PUTs.** The client PUTs each part's byte range to its `url` with a fixed `Content-Length` (never chunked), no bearer token. It reads the **`ETag` response header** from each part PUT (S3 returns it) and remembers `(part_number, etag)`. Parts upload with bounded concurrency and may arrive out of order.
+
+**Step 3 — complete with the part list.** The client POSTs the assembled ETags to `…/complete`:
+
+```jsonc
+{ "parts": [ { "part_number": 1, "etag": "\"…\"" }, { "part_number": 2, "etag": "\"…\"" } ] }
+```
+
+On receipt the backend MUST:
+
+1. Verify the body lists **exactly** parts `1..=N` (reject otherwise → `400`).
+2. Call **`CompleteMultipartUpload`** with the `UploadId` and the `{ PartNumber, ETag }` list (S3 validates the ETags and stitches the object). 
+3. Then begin `restore_ledger` over the now-complete object **asynchronously**, exactly as the single-PUT path does.
+
+> The client sends the part list in `complete`; **you** own `CompleteMultipartUpload`. Don't expect the client to call S3's complete API — it only knows the presigned part URLs and reports back the ETags they returned. (The reference server doesn't run S3 at all: it stages each part to a local file and concatenates them in `part_number` order on `complete`. Per-part ETag re-verification is unnecessary because `restore_ledger` SHA-256-verifies every archive frame regardless.)
+
+A single-PUT `complete` carries an empty body; a multipart `complete` carries `parts`. Branch on the job's recorded upload mode, not on body presence.
+
+### Required server behavior
+
+1. **`import_id` and every upload URL must be unguessable** — step 2 (single PUT or any part PUT) is authorized by possession of the URL alone.
+2. **Stream step 2 to storage**, never buffer the archive (or a whole part) in memory.
+3. **Restore asynchronously** in step 3 and report progress via step 4 — the restore can outlast a single request (and your function timeout). Apply the same trust/verify/rollback semantics as the [Ledger Import Contract](#ledger-import-contract) (every frame SHA-256 verified; roll back on failure).
+4. **`complete` before any upload** → `400`. **Unknown `import_id`** → `404` on every step.
+5. Run the actual restore wherever it can take the time it needs (a worker, not necessarily the request handler).
+6. **Multipart specifics:** mint multipart when `size ≥ multipart_threshold_bytes`; pick a part size with `ceil(size / part_size) ≤ 10000`; on `complete`, require exactly parts `1..=N` (else `400`) and call `CompleteMultipartUpload` before restoring. Assemble/complete (for a 21 GB archive, ~84 parts) can itself outlast the request — do it in the same async worker as the restore, not the `complete` handler.
+
+### Auth
+
+`import-upload` (mint), `…/complete`, and `…/{import_id}` (status) are **admin-protected** (same bracket as `/create`, `/import`). The blob/part `PUT`s (`…/{import_id}/blob` and `…/{import_id}/part/{n}` in the reference impl) are **token-authorized via the URL**, not admin auth.
+
+### Reference implementation
+
+The Fluree server ships a reference backend (enable with `FLUREE_IMPORT_PRESIGN_ENABLED=true`) that stages uploads to local disk and points the upload URLs back at its own blob/part endpoints — so the full handshake (single-PUT **and** multipart) is exercised end-to-end without object storage. A production server mints real presigned object-store URLs instead and drives `CreateMultipartUpload`/`CompleteMultipartUpload`; the client flow is identical. Multipart knobs: `FLUREE_IMPORT_MULTIPART_THRESHOLD_BYTES` (default 5 GiB) and `FLUREE_IMPORT_MULTIPART_PART_SIZE_BYTES` (default 256 MiB).
+
+| Concern | Canonical location |
+|---------|-------------------|
+| Discovery `import` block | `fluree-db-server/src/routes/admin.rs::discovery` |
+| Mint / blob / part / complete / status routes | `fluree-db-server/src/routes/import.rs` |
+| In-memory job registry (incl. `MultipartPlan`) | `fluree-db-server/src/import_jobs.rs` |
+| CLI negotiation + single/multipart upload + poll | `fluree-db-cli/src/commands/create.rs::run_remote_flpack_negotiated`, `fluree-db-cli/src/remote_client.rs` |
+
+> A production server fronting real object storage persists job state externally (DB / object tags) rather than in process, and mints presigned URLs against its bucket. The contract above is what the CLI depends on; the staging mechanism is the server's choice.
+
 ## Storage Proxy Contract
 
 These endpoints exist so a client can fetch bytes by CID without knowing storage layout:
@@ -1740,14 +1964,17 @@ WHERE {
 
 ## Ledger Portability (.flpack Files)
 
-The CLI supports exporting and importing full native ledgers as `.flpack` files using the `fluree-pack-v1` wire format. This enables ledger portability without a running server.
+The CLI supports exporting and importing full native ledgers as `.flpack` files using the `fluree-pack-v1` wire format. This enables ledger portability with or without a running server.
 
 ```bash
 # Export a ledger (all commits + indexes + dictionaries)
 fluree export mydb --format ledger -o mydb.flpack
 
-# Import into a new instance (can use a different ledger name)
+# Import into a new LOCAL instance (can use a different ledger name)
 fluree create imported-db --from mydb.flpack
+
+# Restore directly onto a REMOTE server (streams to POST /import)
+fluree create imported-db --remote prod --from mydb.flpack
 ```
 
 The `.flpack` format is identical to the binary stream served by `POST /pack/{ledger}`, with the addition of a **nameservice manifest frame** that carries the metadata needed to reconstruct the nameservice record on import:
@@ -1761,24 +1988,35 @@ The `.flpack` format is identical to the binary stream served by `POST /pack/{le
   "commit_head_id": "bafybeig...commitHead",
   "commit_t": 42,
   "index_head_id": "bafybeig...indexRoot",
-  "index_t": 40
+  "index_t": 40,
+  "default_context_id": "bafybeig...contextBlob"
 }
 ```
 
+`index_head_id` / `index_t` appear only when the archive carries index artifacts; `default_context_id` appears only when the ledger has a stored default JSON-LD context — its blob is shipped as a data frame and the importer re-points the restored ledger's config at it (so queries that omit an inline `@context` keep working).
+
 **Aliasing on import:** The ledger name provided to `fluree create` determines the local storage path. The data itself is content-addressed (CIDs), so a ledger can be imported under any name. The `ledger_id` inside the index root binary is informational and does not affect CAS resolution.
 
-**Combined with publish:** A typical workflow for moving a ledger from one environment to another:
+**Moving a ledger to a server:** restore the archive straight onto the server in one step — no local staging instance:
 
 ```bash
 # On source machine: export
 fluree export mydb --format ledger -o mydb.flpack
 
-# On target machine: import and publish to server
-fluree create mydb --from mydb.flpack
+# Restore directly onto the server (POST /import)
 fluree remote add prod https://prod.example.com
 fluree auth login --remote prod
+fluree create mydb --remote prod --from mydb.flpack
+```
+
+Alternatively, stage locally first and then `publish` (useful when you also want a local working copy):
+
+```bash
+fluree create mydb --from mydb.flpack
 fluree publish prod mydb
 ```
+
+The difference: `--remote --from` restores a trusted snapshot wholesale (byte-for-byte, index included, no replay), while `publish` re-validates and re-pushes the local commit chain. Use import to materialize a ledger from an archive; use publish to push ongoing local work.
 
 ## Quick Validation Script
 

@@ -19,8 +19,10 @@ use crate::config::{ServerConfig, ServerRole};
 use crate::peer::{ForwardingClient, PeerState, ProxyNameService, ProxyStorage};
 use crate::registry::LedgerRegistry;
 use crate::telemetry::TelemetryConfig;
+use dashmap::DashMap;
 use fluree_db_api::{Fluree, FlureeBuilder, IndexConfig, NameServiceMode};
 use fluree_db_consensus::MonolithicCommitter;
+use fluree_db_core::ledger_id::normalize_ledger_id;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
@@ -69,9 +71,21 @@ pub struct AppState {
     /// Incremented when a ledger is actually reloaded (not for coalesced requests)
     pub refresh_counter: AtomicU64,
 
+    /// Last query-time nameservice refresh attempt per canonical ledger id.
+    ///
+    /// This gates optional DynamoDB nameservice checks on long-running query
+    /// servers. It stores attempts, not successes, to prevent bursty failures
+    /// from stampeding the nameservice.
+    query_refresh_last_checked: DashMap<String, Instant>,
+
     /// Handle for the background leaflet cache stats logger task.
     /// Aborted on drop so the `Arc<LeafletCache>` doesn't outlive the server.
     cache_stats_handle: Option<tokio::task::JoinHandle<()>>,
+
+    /// Registry of in-flight negotiated-upload import jobs (reference impl of
+    /// the presigned `.flpack` upload flow). Empty/unused unless
+    /// `config.import_presign_enabled`.
+    pub import_jobs: Arc<crate::import_jobs::ImportJobs>,
 }
 
 impl AppState {
@@ -194,8 +208,51 @@ impl AppState {
             peer_state,
             forwarding_client,
             refresh_counter: AtomicU64::new(0),
+            query_refresh_last_checked: DashMap::new(),
             cache_stats_handle: Some(cache_stats_handle),
+            import_jobs: Arc::new(crate::import_jobs::ImportJobs::default()),
         })
+    }
+
+    /// Return true when this query should perform a nameservice refresh check.
+    ///
+    /// The gate is per process and per canonical ledger id. A TTL of 0 means
+    /// "check on every request"; otherwise a request updates the timestamp
+    /// before doing I/O so concurrent requests within the same window coalesce.
+    pub fn mark_query_refresh_due(&self, ledger_id: &str) -> bool {
+        if !self.config.query_refresh_enabled || self.config.is_proxy_storage_mode() {
+            return false;
+        }
+
+        let canonical = normalize_ledger_id(ledger_id).unwrap_or_else(|_| ledger_id.to_string());
+        let now = Instant::now();
+        let ttl = Duration::from_millis(self.config.query_refresh_ttl_ms);
+
+        match self.query_refresh_last_checked.entry(canonical) {
+            dashmap::mapref::entry::Entry::Occupied(mut entry) => {
+                if !ttl.is_zero() && entry.get().elapsed() < ttl {
+                    false
+                } else {
+                    entry.insert(now);
+                    true
+                }
+            }
+            dashmap::mapref::entry::Entry::Vacant(entry) => {
+                entry.insert(now);
+                true
+            }
+        }
+    }
+
+    /// Record that a query path has already performed a nameservice refresh.
+    pub fn mark_query_refresh_checked(&self, ledger_id: &str) {
+        if !self.config.query_refresh_enabled || self.config.is_proxy_storage_mode() {
+            return;
+        }
+
+        let canonical = normalize_ledger_id(ledger_id).unwrap_or_else(|_| ledger_id.to_string());
+        self.query_refresh_last_checked
+            .insert(canonical, Instant::now());
     }
 
     /// Create a direct-storage Fluree instance (file, S3, DynamoDB, etc.)

@@ -353,6 +353,8 @@ These predicates define ledger-level configuration stored in the config graph. S
 |-----------|----------|-------------|
 | `f:reasoningModes` | `https://ns.flur.ee/db#reasoningModes` | Reasoning modes: `f:RDFS`, `f:OWL2QL`, `f:OWL2RL`, `f:Datalog` |
 | `f:schemaSource` | `https://ns.flur.ee/db#schemaSource` | Graph containing schema triples (GraphRef) |
+| `f:reasoningMaxFacts` | `https://ns.flur.ee/db#reasoningMaxFacts` | OWL2-RL materialization budget: max derived facts (integer) |
+| `f:reasoningMaxSeconds` | `https://ns.flur.ee/db#reasoningMaxSeconds` | OWL2-RL materialization budget: max wall-clock seconds (integer) |
 
 ### Datalog fields
 

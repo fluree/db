@@ -343,7 +343,9 @@ async fn s3_testcontainers_indexing_test() {
                 .trigger(result.ledger.ledger_id(), result.receipt.t)
                 .await;
             match completion.wait().await {
-                fluree_db_api::IndexOutcome::Completed { index_t, root_id } => {
+                fluree_db_api::IndexOutcome::Completed {
+                    index_t, root_id, ..
+                } => {
                     assert!(index_t >= result.receipt.t);
                     assert!(root_id.is_some(), "expected root_id after indexing");
                 }

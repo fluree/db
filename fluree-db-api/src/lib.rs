@@ -70,7 +70,7 @@ mod overlay;
 pub mod pack;
 pub mod policy_builder;
 pub mod policy_view;
-mod query;
+pub mod query;
 mod rebase;
 pub mod remote_service;
 mod revert;
@@ -112,7 +112,7 @@ pub use block_fetch::{
 };
 pub use commit_transfer::{
     Base64Bytes, BulkImportResult, CommitImportResult, ExportCommitsRequest, ExportCommitsResponse,
-    PushCommitsRequest, PushCommitsResponse, PushedHead,
+    PushCommitsRequest, PushCommitsResponse, PushedHead, RestoreResult,
 };
 pub use dataset::{
     sparql_dataset_ledger_ids, DatasetParseError, DatasetSpec, GovernanceOptions, GraphSource,
@@ -123,7 +123,7 @@ pub use fluree_db_core::ledger_id::format_ledger_id;
 pub use fluree_db_core::RemoteObject;
 pub use fluree_db_core::{
     commit_to_summary, find_common_ancestor, walk_commit_summaries, CommitSummary, CommonAncestor,
-    ConflictKey,
+    ConflictKey, QueryCancellation, QueryCancellationReason,
 };
 pub use fluree_db_core::{CommitId, ContentId};
 pub use format::{AgentJsonContext, FormatError, FormatterConfig, OutputFormat, QueryOutput};
@@ -137,8 +137,9 @@ pub use graph_source::{
 };
 pub use graph_transact_builder::{GraphTransactBuilder, StagedGraph};
 pub use import::{
-    scan_directory_format, CreateBuilder, DirectoryFormat, EffectiveImportSettings, ImportBuilder,
-    ImportConfig, ImportError, ImportPhase, ImportResult, ImportSummary, RemoteSource,
+    is_bulk_import_file, scan_directory_format, CreateBuilder, DirectoryFormat,
+    EffectiveImportSettings, ImportBuilder, ImportConfig, ImportError, ImportPhase, ImportResult,
+    ImportSummary, RemoteSource,
 };
 pub use ledger_info::LedgerInfoBuilder;
 pub use ledger_manager::{
@@ -165,7 +166,7 @@ pub use query::builder::{
     DatasetQueryBuilder, FromQueryBuilder, GraphSourceMode, ViewQueryBuilder,
 };
 pub use query::nameservice_builder::NameserviceQueryBuilder;
-pub use query::{QueryResult, TrackedErrorResponse, TrackedQueryResponse};
+pub use query::{QueryExecutionOptions, QueryResult, TrackedErrorResponse, TrackedQueryResponse};
 pub use rebase::{ConflictStrategy, RebaseConflict, RebaseFailure, RebaseReport};
 pub use revert::{RevertReport, RevertSelection};
 pub use revert_preview::{RevertConflictSummary, RevertPreview, RevertPreviewOpts};
@@ -174,7 +175,7 @@ pub use tx::{
     TransactResultRef,
 };
 pub use tx_builder::{OwnedTransactBuilder, RefTransactBuilder, Staged};
-pub use view::{DataSetDb, GraphDb, QueryInput, ReasoningModePrecedence};
+pub use view::{ConfigReasoningBudget, DataSetDb, GraphDb, QueryInput, ReasoningModePrecedence};
 
 #[cfg(feature = "iceberg")]
 pub use graph_source::{
@@ -258,6 +259,15 @@ pub use fluree_db_policy::{
 // Re-export tracking types for query/transaction metrics
 pub use fluree_db_core::{FuelExceededError, PolicyStats, Tracker, TrackingOptions, TrackingTally};
 
+/// Bundles the two R2RML provider references that always travel together.
+///
+/// Reduces function-arity on the eight `*_with_r2rml*` helpers that would
+/// otherwise exceed the clippy `too_many_arguments` threshold.
+pub(crate) struct R2rmlProviders<'a> {
+    pub(crate) provider: &'a dyn fluree_db_query::r2rml::R2rmlProvider,
+    pub(crate) table_provider: &'a dyn fluree_db_query::r2rml::R2rmlTableProvider,
+}
+
 use async_trait::async_trait;
 use fluree_db_core::{ContentStore, StorageBackend};
 #[cfg(feature = "native")]
@@ -270,6 +280,10 @@ use std::sync::Arc;
 // Re-export encryption types for convenient access
 pub use fluree_db_crypto::{EncryptedStorage, EncryptionKey, StaticKeyProvider};
 pub use fluree_graph_json_ld::ParsedContext;
+// Appears in `ImportConfig` / `ImportBuilder::ndjson_first_line_context`, so
+// API consumers must be able to name it without a direct dependency on the
+// internal fluree-graph-json-ld crate.
+pub use fluree_graph_json_ld::FirstLineContextPolicy;
 
 // ============================================================================
 // Dynamic runtime wrappers (single JSON-LD "source of truth")
@@ -392,6 +406,25 @@ impl fluree_db_nameservice::NameService for NameServiceMode {
         snapshot: fluree_db_nameservice::NsRecordSnapshot,
     ) -> std::result::Result<(), fluree_db_nameservice::NameServiceError> {
         self.reader().reset_head(ledger_id, snapshot).await
+    }
+
+    async fn pending_commit_cids(
+        &self,
+        ledger_id: &str,
+        since_t: i64,
+    ) -> std::result::Result<
+        Option<Vec<(i64, fluree_db_core::ContentId)>>,
+        fluree_db_nameservice::NameServiceError,
+    > {
+        self.reader().pending_commit_cids(ledger_id, since_t).await
+    }
+
+    async fn prune_commit_index(
+        &self,
+        ledger_id: &str,
+        up_to_t: i64,
+    ) -> std::result::Result<(), fluree_db_nameservice::NameServiceError> {
+        self.reader().prune_commit_index(ledger_id, up_to_t).await
     }
 }
 
@@ -740,6 +773,11 @@ where
         }
     }
 
+    fn supports_ranged_reads(&self) -> bool {
+        // No address to route on — claim support only if both tiers have it.
+        self.commit.supports_ranged_reads() && self.index.supports_ranged_reads()
+    }
+
     async fn exists(&self, address: &str) -> std::result::Result<bool, fluree_db_core::Error> {
         if Self::route_to_commit(address) {
             self.commit.exists(address).await
@@ -923,6 +961,16 @@ impl StorageRead for AddressIdentifierResolverStorage {
         range: std::ops::Range<u64>,
     ) -> std::result::Result<Vec<u8>, fluree_db_core::Error> {
         self.route(address).read_byte_range(address, range).await
+    }
+
+    fn supports_ranged_reads(&self) -> bool {
+        // No address to route on — claim support only if every routable
+        // storage has it.
+        self.default.supports_ranged_reads()
+            && self
+                .identifier_map
+                .values()
+                .all(fluree_db_core::StorageRead::supports_ranged_reads)
     }
 
     async fn exists(&self, address: &str) -> std::result::Result<bool, fluree_db_core::Error> {
@@ -1302,6 +1350,66 @@ struct RuntimeParts {
     event_bus: Arc<fluree_db_nameservice::LedgerEventBus>,
     indexing_mode: tx::IndexingMode,
     index_config: IndexConfig,
+}
+
+fn spawn_local_cache_event_listener(
+    event_bus: Arc<fluree_db_nameservice::LedgerEventBus>,
+    ledger_manager: Arc<LedgerManager>,
+) {
+    tokio::spawn(async move {
+        let mut subscription = event_bus.subscribe(fluree_db_nameservice::SubscriptionScope::all());
+        drop(event_bus);
+
+        loop {
+            match subscription.receiver.recv().await {
+                Ok(fluree_db_nameservice::NameServiceEvent::LedgerIndexPublished {
+                    ledger_id,
+                    ..
+                }) => {
+                    match ledger_manager
+                        .notify(NsNotify {
+                            ledger_id: ledger_id.clone(),
+                            record: None,
+                        })
+                        .await
+                    {
+                        Ok(result) => {
+                            tracing::debug!(
+                                alias = %ledger_id,
+                                ?result,
+                                "local cache event listener reconciled ledger"
+                            );
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                alias = %ledger_id,
+                                error = %error,
+                                "local cache event listener failed to reconcile ledger"
+                            );
+                        }
+                    }
+                }
+                Ok(fluree_db_nameservice::NameServiceEvent::LedgerRetracted { ledger_id }) => {
+                    ledger_manager.disconnect(&ledger_id).await;
+                    tracing::debug!(
+                        alias = %ledger_id,
+                        "local cache event listener disconnected retracted ledger"
+                    );
+                }
+                Ok(_) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                    tracing::warn!(
+                        skipped,
+                        "local cache event listener lagged behind nameservice events"
+                    );
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    tracing::debug!("local cache event listener stopped");
+                    break;
+                }
+            }
+        }
+    });
 }
 
 impl FlureeBuilder {
@@ -2101,6 +2209,104 @@ impl FlureeBuilder {
         ))
     }
 
+    /// Build a Fluree instance on S3 storage + a DynamoDB nameservice.
+    ///
+    /// Unlike [`build_s3`](Self::build_s3) (which uses an S3 storage-backed
+    /// nameservice), this pairs S3 object storage with a DynamoDB-backed
+    /// nameservice — the production AWS topology. The DynamoDB table is created
+    /// if absent (`ensure_table`) so the commit-CID index items have somewhere
+    /// to land.
+    ///
+    /// Notes:
+    /// - Requires the `aws` feature.
+    /// - Uses the AWS default credential/region chain.
+    /// - `region`/`endpoint` are passed straight through to the DynamoDB client.
+    #[cfg(feature = "aws")]
+    pub async fn build_s3_dynamo(
+        self,
+        dynamo_table: impl Into<String>,
+        region: Option<String>,
+        endpoint: Option<String>,
+    ) -> Result<Fluree> {
+        use fluree_db_connection::aws;
+        use fluree_db_connection::config::S3StorageConfig;
+        use fluree_db_storage_aws::{DynamoDbConfig, DynamoDbNameService, S3Config, S3Storage};
+
+        let s3_cfg: &S3StorageConfig =
+            match &self.config.index_storage.storage_type {
+                StorageType::S3(s3) => s3,
+                _ => return Err(ApiError::config(
+                    "build_s3_dynamo requires FlureeBuilder::s3(...) or an S3 indexStorage config",
+                )),
+            };
+
+        let timeout_ms = s3_cfg
+            .read_timeout_ms
+            .into_iter()
+            .chain(s3_cfg.write_timeout_ms)
+            .chain(s3_cfg.list_timeout_ms)
+            .max();
+
+        let sdk_config = aws::get_or_init_sdk_config().await?;
+
+        let storage = S3Storage::new(
+            sdk_config,
+            S3Config {
+                bucket: s3_cfg.bucket.to_string(),
+                prefix: s3_cfg.prefix.as_ref().map(std::string::ToString::to_string),
+                // Treat an empty endpoint as unset (use the AWS default endpoint).
+                endpoint: s3_cfg
+                    .endpoint
+                    .as_ref()
+                    .map(std::string::ToString::to_string)
+                    .filter(|e| !e.is_empty()),
+                timeout_ms,
+                max_retries: s3_cfg.max_retries.map(|n| n as u32),
+                retry_base_delay_ms: s3_cfg.retry_base_delay_ms,
+                retry_max_delay_ms: s3_cfg.retry_max_delay_ms,
+                max_concurrent_requests: s3_cfg.max_concurrent_requests,
+            },
+        )
+        .await
+        .map_err(|e| ApiError::config(format!("Failed to create S3 storage: {e}")))?;
+
+        let dynamo_ns = DynamoDbNameService::new(
+            sdk_config,
+            DynamoDbConfig {
+                table_name: dynamo_table.into(),
+                region,
+                endpoint,
+                timeout_ms,
+            },
+        )
+        .await
+        .map_err(|e| ApiError::config(format!("Failed to create DynamoDB nameservice: {e}")))?;
+        dynamo_ns
+            .ensure_table()
+            .await
+            .map_err(|e| ApiError::config(format!("Failed to ensure DynamoDB table: {e}")))?;
+
+        let event_bus = Arc::new(fluree_db_nameservice::LedgerEventBus::new(1024));
+        let notifying =
+            fluree_db_nameservice::NotifyingNameService::new(dynamo_ns, event_bus.clone());
+        let ns_mode = NameServiceMode::ReadWrite(Arc::new(notifying.clone()));
+        let index_config = self.derive_indexing();
+        let backend = StorageBackend::Managed(Arc::new(storage));
+        let indexing_mode = self.start_background_indexing(&backend, &notifying);
+        Ok(Self::finalize_with_backend(
+            self.ledger_cache_config,
+            self.config,
+            RuntimeParts {
+                backend,
+                nameservice: ns_mode,
+                event_bus,
+                indexing_mode,
+                index_config,
+            },
+            self.remote_connections,
+        ))
+    }
+
     /// Build an S3-backed Fluree instance with AES-256-GCM encryption.
     ///
     /// All data written to S3 is transparently encrypted before upload,
@@ -2293,6 +2499,12 @@ impl FlureeBuilder {
             ))
         });
 
+        if indexing_mode.is_enabled() {
+            if let Some(manager) = &ledger_manager {
+                spawn_local_cache_event_listener(Arc::clone(&event_bus), Arc::clone(manager));
+            }
+        }
+
         Fluree {
             config,
             backend,
@@ -2454,14 +2666,15 @@ impl FlureeBuilder {
             .wrap_address_identifiers_aws(base_storage, aws_handle.config())
             .await?;
 
-        let ns_arc: Arc<dyn NameServicePublisher> = aws_handle.nameservice_arc().clone();
+        let ns_arc = aws_handle.nameservice_arc().clone();
         let event_bus = Arc::new(fluree_db_nameservice::LedgerEventBus::new(1024));
-        let ns_mode = NameServiceMode::ReadWrite(ns_arc.clone());
+        let notifying = fluree_db_nameservice::NotifyingNameService::new(ns_arc, event_bus.clone());
+        let ns_mode = NameServiceMode::ReadWrite(Arc::new(notifying.clone()));
 
         let index_config = self.derive_indexing();
         let backend = StorageBackend::Managed(storage);
         let ns_rw: Arc<dyn fluree_db_nameservice::ReadWriteNameService> =
-            aws_handle.nameservice_arc().clone();
+            Arc::new(notifying.clone());
         let indexing_mode = self.start_background_indexing_dyn(&backend, ns_rw);
         Ok(Self::finalize_with_backend(
             self.ledger_cache_config,
@@ -3352,6 +3565,13 @@ impl Fluree {
         if let Some(cid) = archived_index.as_ref() {
             manifest["index_head_id"] = serde_json::Value::String(cid.to_string());
             manifest["index_t"] = serde_json::Value::from(view.index_t());
+        }
+        // Carry the ledger's stored default JSON-LD context so the restored
+        // ledger keeps it. `stream_archive` ships the referenced blob as a data
+        // frame; the importer re-points the new ledger's config at it. Only set
+        // when present — `stream_archive` keys blob inclusion off this field.
+        if let Some(ctx_cid) = record.default_context.as_ref() {
+            manifest["default_context_id"] = serde_json::Value::String(ctx_cid.to_string());
         }
 
         let (tx, mut rx) = tokio::sync::mpsc::channel::<pack::PackChunk>(64);

@@ -16,7 +16,7 @@ use fluree_db_query::binding::Binding;
 use fluree_db_query::ir::triple::{Ref, Term, TriplePattern};
 use fluree_db_query::ir::{
     ConstructTemplate as QueryConstructTemplate, Expression, Pattern, Query, QueryOutput,
-    ReasoningConfig, SubqueryPattern,
+    SubqueryPattern,
 };
 use fluree_db_query::parse::encode::IriEncoder;
 use fluree_db_query::var_registry::VarId;
@@ -141,9 +141,10 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
             orig_context: Some(ctx_val),
             output: QueryOutput::Construct(template),
             patterns,
-            reasoning: ReasoningConfig::default(),
+            reasoning: self.reasoning_config()?,
             grouping: None,
             ordering: Vec::new(),
+            order_binds: Vec::new(),
             limit: None,
             offset: None,
             post_values: None,
@@ -195,7 +196,19 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
             limit,
             offset,
             ordering,
+            order_binds,
+            deferred_order_exprs,
         } = self.lower_base_modifiers(modifiers)?;
+
+        // DESCRIBE restricts ORDER BY to target variables (see below); an
+        // expression-based ORDER BY (aggregate-free or aggregate-bearing) would
+        // sort on a synthetic, non-target var.
+        if !order_binds.is_empty() || !deferred_order_exprs.is_empty() {
+            return Err(LowerError::unsupported_form(
+                "DESCRIBE ORDER BY by expression",
+                span,
+            ));
+        }
 
         // For simplicity and predictable performance, require ORDER BY vars to be part of the subquery select list.
         for spec in &ordering {

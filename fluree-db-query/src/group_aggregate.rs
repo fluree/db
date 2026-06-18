@@ -151,12 +151,12 @@ fn compare_for_minmax(
 
     // General path: materialize then use SPARQL ordering comparator.
     // BinaryGraphView handles novelty watermark routing internally.
-    let am = materialize_for_minmax(a, Some(gv));
-    let bm = materialize_for_minmax(b, Some(gv));
+    let am = materialize_encoded(a, Some(gv));
+    let bm = materialize_encoded(b, Some(gv));
     crate::sort::compare_bindings(&am, &bm)
 }
 
-fn materialize_for_minmax(binding: &Binding, gv: Option<&BinaryGraphView>) -> Binding {
+pub(crate) fn materialize_encoded(binding: &Binding, gv: Option<&BinaryGraphView>) -> Binding {
     let Some(gv) = gv else {
         return binding.clone();
     };
@@ -252,8 +252,14 @@ impl AggState {
             }
             AggState::CountDistinct { seen } => {
                 if !matches!(binding, Binding::Unbound | Binding::Poisoned) {
-                    // Convert binding to owned group key for HashSet
-                    let key = binding_to_group_key_owned(binding);
+                    // Convert binding to owned group key for HashSet,
+                    // normalizing decoded bindings so mixed-representation
+                    // streams count as one value.
+                    let key = binding_to_group_key_normalized(
+                        binding,
+                        gv.map(BinaryGraphView::store),
+                        gv,
+                    );
                     seen.insert(key);
                 }
             }
@@ -311,7 +317,11 @@ impl AggState {
                 }
             }
             AggState::Collect { values } => {
-                values.push(binding.clone());
+                // Median/Variance/Stddev/GroupConcat fold over decoded values;
+                // encoded bindings would be silently dropped by the value
+                // matchers in `aggregate.rs` (e.g. GROUP_CONCAT returned
+                // Unbound for every indexed-ledger string).
+                values.push(materialize_encoded(binding, gv));
             }
         }
     }
@@ -402,6 +412,34 @@ impl Hash for MaterializedLitKey {
     }
 }
 
+/// [`binding_to_group_key_owned`] with representation normalization, so
+/// mixed-representation streams (encoded scan output meeting decoded
+/// VALUES/UNION/BIND bindings) key identically. Pass the store whenever the
+/// stream may contain late-materialized bindings; pass the graph view so
+/// arena-backed NUM_BIG values key by decoded numeric value (handles are
+/// per-(graph, predicate) and not canonical across representations).
+pub(crate) fn binding_to_group_key_normalized(
+    binding: &Binding,
+    store: Option<&fluree_db_binary_index::BinaryIndexStore>,
+    gv: Option<&BinaryGraphView>,
+) -> GroupKeyOwned {
+    if crate::object_binding::is_numbig_encoded(binding) {
+        if let Some(gv) = gv {
+            let materialized = materialize_encoded(binding, Some(gv));
+            if !matches!(materialized, Binding::EncodedLit { .. }) {
+                return binding_to_group_key_owned(&materialized);
+            }
+        }
+        return binding_to_group_key_owned(binding);
+    }
+    if let Some(store) = store {
+        if let Some(normalized) = crate::object_binding::encoded_equivalent(binding, store) {
+            return binding_to_group_key_owned(&normalized);
+        }
+    }
+    binding_to_group_key_owned(binding)
+}
+
 /// Convert a binding to an owned group key.
 /// Also used by SemijoinOperator for EXISTS hash probing.
 pub(crate) fn binding_to_group_key_owned(binding: &Binding) -> GroupKeyOwned {
@@ -473,6 +511,23 @@ fn flake_value_to_key(val: &FlakeValue, dtc: &DatatypeConstraint) -> Materialize
             string_val: None,
             number_bits: None,
             bool_val: Some(*b),
+            dtc: dtc.clone(),
+        },
+        // Decimals key on the normalized lexical: 1.5 and 1.50 are one
+        // xsd:decimal value and must land in one group. (The Debug catch-all
+        // below is scale-sensitive and structurally fragile.)
+        FlakeValue::Decimal(d) => MaterializedLitKey {
+            discriminant: 5,
+            string_val: Some(Arc::from(d.normalized().to_string())),
+            number_bits: None,
+            bool_val: None,
+            dtc: dtc.clone(),
+        },
+        FlakeValue::BigInt(n) => MaterializedLitKey {
+            discriminant: 6,
+            string_val: Some(Arc::from(n.to_string())),
+            number_bits: None,
+            bool_val: None,
             dtc: dtc.clone(),
         },
         _ => MaterializedLitKey {
@@ -620,12 +675,13 @@ impl GroupAggregateOperator {
 
     /// Extract composite group key from a row
     fn extract_group_key(&self, batch: &Batch, row_idx: usize) -> CompositeGroupKey {
+        let store = self.graph_view.as_ref().map(BinaryGraphView::store);
         let keys: Vec<GroupKeyOwned> = self
             .group_key_indices
             .iter()
             .map(|&col_idx| {
                 let binding = batch.get_by_col(row_idx, col_idx);
-                binding_to_group_key_owned(binding)
+                binding_to_group_key_normalized(binding, store, self.graph_view.as_ref())
             })
             .collect();
         CompositeGroupKey(keys)
@@ -642,6 +698,9 @@ impl GroupAggregateOperator {
 
 #[async_trait]
 impl Operator for GroupAggregateOperator {
+    fn plan_children(&self) -> Vec<crate::plan_node::PlanChild<'_>> {
+        vec![crate::plan_node::PlanChild::child(self.child.as_ref())]
+    }
     fn schema(&self) -> &[VarId] {
         effective_schema(&self.out_schema, &self.in_schema)
     }

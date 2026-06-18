@@ -16,7 +16,11 @@ name = "fluree_db_cli"
 path = "src/lib.rs"
 
 [features]
-default = ["server", "iceberg", "shacl"]
+# `aws` is on by default so the shipped CLI (incl. the Docker image, which
+# reuses the dist binary) can use S3 storage + DynamoDB nameservice via
+# connection config. Dormant unless configured; ~+2 MB over the AWS SDK that
+# `iceberg` already pulls in.
+default = ["server", "iceberg", "shacl", "aws"]
 server = ["dep:fluree-db-server"]
 iceberg = ["fluree-db-api/iceberg"]
 aws = ["fluree-db-server/aws"]
@@ -89,14 +93,14 @@ rand.workspace = true
 sha2.workspace = true
 
 # Remote ledger client (track mode) + OIDC discovery/exchange
-reqwest = { workspace = true }
+# `stream` enables streaming a .flpack file body to POST /import without
+# buffering the whole archive; `tokio-util` io gives ReaderStream for it.
+reqwest = { workspace = true, features = ["stream"] }
+tokio-util = { version = "0.7", features = ["io"] }
 bytes.workspace = true
 urlencoding = { workspace = true }
 percent-encoding = "2"
 open = "5"
-
-# Memory-mapped file I/O (flpack import)
-memmap2 = "0.9"
 
 # Sync command dependencies
 fluree-db-nameservice-sync = { path = "../fluree-db-nameservice-sync" }
@@ -107,6 +111,9 @@ parking_lot = "0.12"
 assert_cmd = "2"
 predicates = "3"
 tempfile = "3"
+# Used by `create --from` integration tests to produce .gz / .zst fixtures inline.
+flate2 = { workspace = true }
+zstd = { workspace = true }
 
 [lints]
 workspace = true

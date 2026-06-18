@@ -37,7 +37,13 @@ Example `config.toml`:
 listen_addr = "0.0.0.0:8090"
 storage_path = "/var/lib/fluree"
 log_level = "info"
-# cache_max_mb = 4096  # global cache budget (MB); default: tiered fraction of RAM (30% <4GB, 40% 4-8GB, 50% ≥8GB)
+query_timeout_ms = 900000  # 15 minutes; set to 0 to disable
+query_min_t_timeout_ms = 5000
+# cache_max_mb = 4096  # global cache budget (MB); default: tiered by RAM (<4GB: 30%, 4-8GB: 40%, >=8GB: 35%)
+
+[server.query_refresh]
+enabled = false
+ttl_ms = 1000
 
 [server.indexing]
 enabled = true
@@ -140,6 +146,13 @@ export FLUREE_LOG_LEVEL=info
 
 fluree-server
 ```
+
+A few operational knobs are environment-only (no CLI flag):
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `FLUREE_REASONING_MAX_FACTS` | 1,000,000 | Server-wide default OWL2-RL materialization budget (max derived facts). Overridden per ledger by `f:reasoningMaxFacts` and per query by `"reasoningBudget"`; see [Reasoning](../query/reasoning.md#materialization-budget). |
+| `FLUREE_REASONING_MAX_SECONDS` | 30 | Server-wide default OWL2-RL materialization budget (wall-clock seconds). Same override chain as above. |
 
 ### Precedence
 
@@ -288,6 +301,48 @@ Maximum request body size in bytes:
 | -------------- | ------------------- | ----------------- |
 | `--body-limit` | `FLUREE_BODY_LIMIT` | `52428800` (50MB) |
 
+### Query Timeout
+
+Maximum query execution time in milliseconds. The server starts a timeout task
+that signals query cancellation when the limit elapses; query execution observes
+that signal at I/O boundaries — operator batch handoffs, leaflet refills in the
+fused COUNT fast paths, and parallel-partition starts — never inside per-row
+loops (in-loop checks measurably perturb hot-loop codegen). Cancellation
+latency is bounded by one leaflet/batch of work, typically well under 10ms. Set to `0` to disable the server-side
+timeout. If an HTTP client disconnects while a query is still running, the
+server signals cancellation through the same cooperative handle so long-running
+operators can stop at the next checkpoint.
+
+| Flag                 | Env Var                    | Default                  |
+| -------------------- | -------------------------- | ------------------------ |
+| `--query-timeout-ms` | `FLUREE_QUERY_TIMEOUT_MS`  | `900000` (15 minutes)    |
+| `--query-min-t-timeout-ms` | `FLUREE_QUERY_MIN_T_TIMEOUT_MS` | `5000` (5 seconds) |
+
+`query_min_t_timeout_ms` caps HTTP read-after-write waits from `Fluree-Min-T`, `opts.min-t`, and numeric `@t` snapshot pins. It remains enforced even when `query_timeout_ms = 0`.
+
+### Query-Time Refresh
+
+Long-running query servers can opt in to a bounded nameservice freshness check before current-head queries. When enabled, the server calls the same `Fluree::refresh()` API used by serverless query handlers, but gates the call by a per-process, per-ledger TTL so high-QPS traffic does not check DynamoDB on every request.
+
+This is demand-driven, not a background poller: the first current-head query for a ledger after its TTL window expires pays the nameservice round-trip, and idle ledgers are not refreshed.
+
+This is useful for split deployments where writers update a shared DynamoDB nameservice but query servers do not subscribe to a transaction server's SSE event stream.
+
+For a hard read-after-write guarantee when the client knows the transaction `t`, send `Fluree-Min-T` (or JSON-LD `opts.min-t`) on the query request. TTL refresh bounds ordinary staleness; `min-t` waits for a specific transaction time.
+
+| Flag | Env Var | Default | Description |
+| ---- | ------- | ------- | ----------- |
+| `--query-refresh-enabled` | `FLUREE_QUERY_REFRESH_ENABLED` | `false` | Enable TTL-gated nameservice refresh before current-head query execution |
+| `--query-refresh-ttl-ms` | `FLUREE_QUERY_REFRESH_TTL_MS` | `1000` | Minimum interval between refresh checks for the same ledger in one server process; set `0` to check every request |
+
+Config file equivalent:
+
+```toml
+[server.query_refresh]
+enabled = true
+ttl_ms = 200
+```
+
 ### Log Level
 
 Logging verbosity:
@@ -304,7 +359,7 @@ Global cache budget (MB):
 
 | Flag              | Env Var              | Default                |
 | ----------------- | -------------------- | ---------------------- |
-| `--cache-max-mb`  | `FLUREE_CACHE_MAX_MB`| `30/40/50% of RAM (tiered: <4GB / 4-8GB / ≥8GB)`    |
+| `--cache-max-mb`  | `FLUREE_CACHE_MAX_MB`| Tiered by RAM: `<4GB: 30%, 4-8GB: 40%, >=8GB: 35%`    |
 
 ### Background Indexing
 
@@ -515,14 +570,28 @@ fluree-server \
 
 If no admin-specific issuers are configured, falls back to `--events-auth-trusted-issuer`.
 
-### MCP Endpoint Authentication
+### MCP Endpoint
 
-Protect the `/mcp` Model Context Protocol endpoint:
+Protect and tune the `/mcp` Model Context Protocol endpoint:
 
-| Flag                        | Env Var                           | Default |
-| --------------------------- | --------------------------------- | ------- |
-| `--mcp-enabled`             | `FLUREE_MCP_ENABLED`              | `false` |
-| `--mcp-auth-trusted-issuer` | `FLUREE_MCP_AUTH_TRUSTED_ISSUERS` | None    |
+| Flag                         | Env Var                           | Default                |
+| ---------------------------- | --------------------------------- | ---------------------- |
+| `--mcp-enabled`              | `FLUREE_MCP_ENABLED`              | `false`                |
+| `--mcp-auth-trusted-issuer`  | `FLUREE_MCP_AUTH_TRUSTED_ISSUERS` | None                   |
+| `--mcp-agent-json-max-bytes` | `FLUREE_MCP_AGENT_JSON_MAX_BYTES` | `32768`                |
+| `--mcp-query-timeout-ms`     | `FLUREE_MCP_QUERY_TIMEOUT_MS`     | `300000` (5 minutes)   |
+
+`--mcp-agent-json-max-bytes` (config file: `[server.mcp] agent_json_max_bytes`) is the byte
+budget for the MCP `sparql_query` tool's Agent JSON result. Results larger than this are
+truncated and the envelope sets `hasMore: true`; an agent paginates by re-running with the
+returned `t`, an `ORDER BY`, and `OFFSET` advanced by the returned `rowCount`.
+
+`--mcp-query-timeout-ms` (config file: `[server.mcp] query_timeout_ms`) is the
+server-side timeout for MCP `sparql_query` execution. It uses the same
+cooperative cancellation mechanism as HTTP queries, but defaults lower because
+MCP tool calls are usually interactive. Set to `0` to disable the MCP timeout.
+This setting does not apply to `get_data_model`, which may perform schema/stat
+collection without this query timeout.
 
 ```bash
 fluree-server \
@@ -749,8 +818,12 @@ fluree server run \
 | `FLUREE_INDEXING_ENABLED`               | Enable background indexing                      | `true`                                                                  |
 | `FLUREE_REINDEX_MIN_BYTES`              | Soft reindex threshold (bytes)                  | `100000`                                                                |
 | `FLUREE_REINDEX_MAX_BYTES`              | Hard reindex threshold (bytes)                  | 20% of system RAM (256 MB fallback)                                      |
-| `FLUREE_CACHE_MAX_MB`                   | Global cache budget (MB)                        | `30/40/50% of RAM (tiered: <4GB / 4-8GB / ≥8GB)`                                                     |
+| `FLUREE_CACHE_MAX_MB`                   | Global cache budget (MB)                        | Tiered by RAM: `<4GB: 30%, 4-8GB: 40%, >=8GB: 35%`                                                     |
 | `FLUREE_BODY_LIMIT`                     | Max request body bytes                          | `52428800`                                                              |
+| `FLUREE_QUERY_TIMEOUT_MS`               | Max query execution time in milliseconds (`0` disables) | `900000`                                                     |
+| `FLUREE_QUERY_MIN_T_TIMEOUT_MS`         | Max read-after-write min-t wait in milliseconds | `5000`                                                                  |
+| `FLUREE_QUERY_REFRESH_ENABLED`          | Enable TTL-gated nameservice refresh before current-head queries | `false`                                                       |
+| `FLUREE_QUERY_REFRESH_TTL_MS`           | Query-time refresh interval per ledger per process (`0` checks every request) | `1000`                                           |
 | `FLUREE_LOG_LEVEL`                      | Log level                                       | `info`                                                                  |
 | `FLUREE_SERVER_ROLE`                    | Server role                                     | `transaction`                                                           |
 | `FLUREE_TX_SERVER_URL`                  | Transaction server URL                          | None                                                                    |
@@ -764,6 +837,8 @@ fluree server run \
 | `FLUREE_ADMIN_AUTH_TRUSTED_ISSUERS`     | Admin trusted issuers                           | None                                                                    |
 | `FLUREE_MCP_ENABLED`                    | Enable MCP endpoint                             | `false`                                                                 |
 | `FLUREE_MCP_AUTH_TRUSTED_ISSUERS`       | MCP trusted issuers                             | None                                                                    |
+| `FLUREE_MCP_AGENT_JSON_MAX_BYTES`       | MCP `sparql_query` Agent JSON byte budget       | `32768`                                                                 |
+| `FLUREE_MCP_QUERY_TIMEOUT_MS`           | MCP `sparql_query` execution timeout            | `300000`                                                                |
 | `FLUREE_STORAGE_ACCESS_MODE`            | Peer storage mode                               | `shared`                                                                |
 | `FLUREE_STORAGE_PROXY_ENABLED`          | Enable storage proxy                            | `false`                                                                 |
 

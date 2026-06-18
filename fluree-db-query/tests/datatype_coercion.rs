@@ -144,9 +144,11 @@ fn coerce_datetime() {
 
 #[test]
 fn coerce_decimal() {
+    // JSON-number input coerces to an exact decimal (rendered as a string),
+    // not an f64 round-trip.
     assert_eq!(
         coerce(serde_json::json!(3.13), xsd::DECIMAL),
-        Some(serde_json::json!(3.13))
+        Some(serde_json::json!("3.13"))
     );
     assert_eq!(
         coerce(serde_json::json!("3.14"), xsd::DECIMAL),

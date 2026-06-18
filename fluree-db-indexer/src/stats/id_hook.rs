@@ -392,8 +392,13 @@ impl IdStatsHook {
                         .entry(rec.o_key)
                         .or_insert(0) += delta;
                 }
-            } else if !self.hll_only && rec.op {
-                // Non-rdf:type property assertion: track per-subject and per-class
+            } else if !self.hll_only {
+                // Non-rdf:type property flake: track per-subject property presence on
+                // BOTH assertions and retractions. Recording retractions here (issue
+                // #1266) lets the incremental class-stat merge revisit a class whose
+                // only change this batch is a retraction, so its datatype/lang/ref
+                // decrement is applied instead of silently dropped. The set is now
+                // "properties touched this batch", not "asserted this batch".
                 self.subject_props
                     .entry((rec.g_id, rec.s_id))
                     .or_default()
@@ -482,6 +487,27 @@ impl IdStatsHook {
             }
             for (key, props) in other.subject_props {
                 self.subject_props.entry(key).or_default().extend(props);
+            }
+            // Merge per-subject, per-property datatype/language deltas. (These
+            // were previously dropped here, leaving class→property→datatype/lang
+            // attribution empty after any multi-worker accumulation.)
+            for (key, per_prop) in other.subject_prop_dts {
+                let entry = self.subject_prop_dts.entry(key).or_default();
+                for (p_id, dts) in per_prop {
+                    let dt_entry = entry.entry(p_id).or_default();
+                    for (dt, delta) in dts {
+                        *dt_entry.entry(dt).or_insert(0) += delta;
+                    }
+                }
+            }
+            for (key, per_prop) in other.subject_prop_langs {
+                let entry = self.subject_prop_langs.entry(key).or_default();
+                for (p_id, langs) in per_prop {
+                    let lang_entry = entry.entry(p_id).or_default();
+                    for (lang, delta) in langs {
+                        *lang_entry.entry(lang).or_insert(0) += delta;
+                    }
+                }
             }
         }
         // Merge per-subject ref history.

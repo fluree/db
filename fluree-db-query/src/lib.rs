@@ -14,6 +14,7 @@
 //! Build a `TriplePattern` with a `VarRegistry`, then call `execute_pattern` with a `GraphDbRef` to get result batches.
 
 pub mod aggregate;
+pub(crate) mod aggregate_complement_fold;
 pub mod binary_history;
 pub mod binary_range;
 pub mod binary_scan;
@@ -24,6 +25,7 @@ pub mod context;
 pub(crate) mod count_plan;
 pub(crate) mod count_plan_exec;
 pub(crate) mod count_rows;
+pub(crate) mod cyclic_bgp;
 pub mod datalog_rules;
 pub mod dataset;
 pub mod dataset_operator;
@@ -36,25 +38,26 @@ pub mod exists;
 pub mod explain;
 pub(crate) mod fast_count;
 pub(crate) mod fast_exists_join_count_distinct_object;
-pub(crate) mod fast_fused_scan_sum;
 pub(crate) mod fast_group_count_firsts;
 pub(crate) mod fast_label_regex_type;
 pub(crate) mod fast_min_max_string;
-pub(crate) mod fast_multicolumn_join_count_all;
-pub(crate) mod fast_optional_chain_head_count_all;
 pub(crate) mod fast_path_common;
-pub(crate) mod fast_property_path_plus_count_all;
+pub(crate) mod fast_path_plus_count_all;
+pub(crate) mod fast_post_order_limit;
+pub(crate) mod fast_predicate_scalar_agg;
 pub(crate) mod fast_star_const_order_topk;
+pub(crate) mod fast_string_fold;
 pub(crate) mod fast_string_prefix_count_all;
 pub(crate) mod fast_sum_strlen_group_concat;
-pub(crate) mod fast_transitive_path_plus_count_all;
 pub(crate) mod fast_union_star_count_all;
 pub mod filter;
+pub(crate) mod filter_fold;
 pub mod geo_rewrite;
 pub mod geo_search;
 pub mod graph;
 pub mod group_aggregate;
 pub mod groupby;
+pub mod hash_join;
 pub mod having;
 pub mod ir;
 pub mod join;
@@ -66,6 +69,7 @@ pub mod offset;
 pub mod operator;
 pub mod optional;
 pub mod parse;
+pub mod plan_node;
 pub mod planner;
 pub mod policy;
 pub mod project;
@@ -130,6 +134,7 @@ pub use minus::MinusOperator;
 pub use offset::OffsetOperator;
 pub use operator::{BoxedOperator, Operator, OperatorState};
 pub use optional::OptionalOperator;
+pub use plan_node::{PlanEdge, PlanEdgeRel, PlanNode};
 pub use planner::{
     extract_object_bounds_for_var, extract_range_constraints, is_property_join, PatternType,
     RangeConstraint, RangeValue,

@@ -198,6 +198,22 @@ impl TriplePattern {
         Self { s, p, o, dtc: None }
     }
 
+    /// Rename every occurrence of variable `old` to `new` in s/p/o.
+    ///
+    /// Used by the equijoin-filter fold ([`crate::filter_fold`]) to unify two
+    /// variables proven equal by a `FILTER(?x = ?y)` (or `sameTerm`).
+    pub fn substitute_var(&mut self, old: VarId, new: VarId) {
+        if matches!(self.s, Ref::Var(v) if v == old) {
+            self.s = Ref::Var(new);
+        }
+        if matches!(self.p, Ref::Var(v) if v == old) {
+            self.p = Ref::Var(new);
+        }
+        if matches!(self.o, Term::Var(v) if v == old) {
+            self.o = Term::Var(new);
+        }
+    }
+
     /// Variables this pattern mentions, in order: s, p, o.
     ///
     /// For a triple pattern, every variable position is both *referenced*

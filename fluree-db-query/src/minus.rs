@@ -15,6 +15,7 @@ use crate::context::ExecutionContext;
 use crate::error::{QueryError, Result};
 use crate::execute::build_where_operators_seeded;
 use crate::ir::Pattern;
+use crate::object_binding::{equality_norm, normalize_for_key, EqualityNorm};
 use crate::operator::{BoxedOperator, Operator, OperatorState};
 use crate::seed::EmptyOperator;
 use crate::temporal_mode::PlanningContext;
@@ -82,6 +83,10 @@ pub struct MinusOperator {
     /// Minus rows with >= 1 unbound shared var (wildcard rows, rare)
     /// Each entry is a Vec of Option<Binding>: Some(b) for matchable, None for unbound
     minus_wildcards: Vec<Vec<Option<Binding>>>,
+    /// Store for normalizing decoded bindings to encoded form on both sides
+    /// of the anti-join, so mixed-representation rows match. `None` outside
+    /// single-ledger binary execution.
+    norm: Option<EqualityNorm>,
 }
 
 impl MinusOperator {
@@ -118,6 +123,7 @@ impl MinusOperator {
             planning,
             minus_hash: HashSet::new(),
             minus_wildcards: Vec::new(),
+            norm: None,
         }
     }
 
@@ -132,7 +138,10 @@ impl MinusOperator {
                     let binding = batch.column(var).map(|col| &col[row_idx]);
                     match binding {
                         Some(b) if b.is_matchable() => {
-                            key_bindings.push(Some(b.clone()));
+                            key_bindings.push(Some({
+                                let (store, gv) = EqualityNorm::parts(&self.norm);
+                                normalize_for_key(b, store, gv)
+                            }));
                         }
                         _ => {
                             key_bindings.push(None);
@@ -176,7 +185,10 @@ impl MinusOperator {
             let binding = input_batch.column(var).map(|col| &col[row_idx]);
             match binding {
                 Some(b) if b.is_matchable() => {
-                    input_bindings.push(Some(b.clone()));
+                    input_bindings.push(Some({
+                        let (store, gv) = EqualityNorm::parts(&self.norm);
+                        normalize_for_key(b, store, gv)
+                    }));
                 }
                 _ => {
                     input_bindings.push(None);
@@ -303,11 +315,17 @@ fn rows_match(
 
 #[async_trait]
 impl Operator for MinusOperator {
+    fn plan_children(&self) -> Vec<crate::plan_node::PlanChild<'_>> {
+        vec![crate::plan_node::PlanChild::child(self.child.as_ref())]
+    }
     fn schema(&self) -> &[VarId] {
         &self.schema
     }
 
     async fn open(&mut self, ctx: &ExecutionContext<'_>) -> Result<()> {
+        if self.norm.is_none() {
+            self.norm = equality_norm(ctx);
+        }
         // Materialize the MINUS subtree once with an empty seed (fresh scope).
         // MINUS is always uncorrelated — the subtree doesn't see outer variables.
         if !self.shared_vars.is_empty() {
@@ -325,9 +343,11 @@ impl Operator for MinusOperator {
 
             let mut batches = Vec::new();
             while let Some(batch) = minus_op.next_batch(ctx).await? {
+                ctx.check_cancelled()?;
                 if !batch.is_empty() {
                     batches.push(batch);
                 }
+                ctx.check_cancelled()?;
             }
 
             minus_op.close();
@@ -549,6 +569,7 @@ mod tests {
             planning: crate::temporal_mode::PlanningContext::current(),
             minus_hash: HashSet::new(),
             minus_wildcards: Vec::new(),
+            norm: None,
         }
     }
 

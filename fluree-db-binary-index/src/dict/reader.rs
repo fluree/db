@@ -267,6 +267,45 @@ impl DictTreeReader {
         Ok(result)
     }
 
+    /// Distinct leaf `address`es the given keys map to, via the in-memory
+    /// branch routing (no I/O). Lets a caller learn which leaves a batched
+    /// reverse lookup will touch so it can prewarm them concurrently before
+    /// the sync lookup runs. Preserves first-seen order; deduplicated.
+    pub fn touched_leaf_addresses<'a, I>(&self, keys: I) -> Vec<&str>
+    where
+        I: IntoIterator<Item = &'a [u8]>,
+    {
+        let mut seen = vec![false; self.branch.leaves.len()];
+        let mut addresses = Vec::new();
+        for key in keys {
+            if let Some(leaf_idx) = self.branch.find_leaf(key) {
+                if !seen[leaf_idx] {
+                    seen[leaf_idx] = true;
+                    addresses.push(self.branch.leaves[leaf_idx].address.as_str());
+                }
+            }
+        }
+        addresses
+    }
+
+    /// The remote CID for a leaf `address`, if this reader fetches that leaf
+    /// from CAS on demand (i.e. it is not a local file). Returns `None` for
+    /// local/in-memory leaves and for unknown addresses. Used to prewarm the
+    /// disk artifact cache before a sync reverse lookup.
+    pub fn remote_leaf_cid(&self, address: &str) -> Option<&ContentId> {
+        match &self.leaf_source {
+            LeafSource::CasOnDemand { remote_cids, .. } => remote_cids.get(address),
+            _ => None,
+        }
+    }
+
+    /// The disk-backed artifact cache directory this reader reads prewarmed
+    /// leaves from, if configured. A prefetch must write to this same dir for
+    /// `load_leaf` to find the bytes.
+    pub fn disk_cache_dir(&self) -> Option<&std::path::Path> {
+        self.disk_cache_dir.as_deref()
+    }
+
     /// Batched reverse lookup: find IDs by key bytes while loading each touched
     /// leaf at most once for the batch.
     pub fn reverse_lookup_many<'a, I>(&self, keys: I) -> io::Result<Vec<Option<u64>>>
@@ -403,47 +442,46 @@ impl DictTreeReader {
             cid: ContentId,
             disk_cache_dir: Option<PathBuf>,
         ) -> io::Result<Vec<u8>> {
-            // DictTreeReader is sync, but ContentStore::get is async.
+            // DictTreeReader is sync, but ContentStore::get is async. Bridge via
+            // the shared `run_sync_on_runtime` helper, which uses
+            // `block_in_place(handle.block_on)` on a multi-thread runtime (so a
+            // replacement worker keeps driving the reactor while this thread
+            // blocks) and a self-contained helper runtime on current-thread.
             //
-            // We intentionally avoid `block_in_place` here because this code can run on
-            // runtimes that don't support it (e.g., current-thread). Instead we spawn a
-            // short-lived OS thread and block on the Tokio handle there.
-            let handle = tokio::runtime::Handle::try_current().map_err(|_| {
-                io::Error::other("dict tree: remote leaf fetch requires a Tokio runtime")
-            })?;
-
-            let (tx, rx) = std::sync::mpsc::sync_channel::<Result<Vec<u8>, String>>(1);
-            let fetch_cid = cid.clone();
-            std::thread::Builder::new()
-                .name("dict-leaf-fetch".to_owned())
-                .spawn(move || {
-                    let res = handle
-                        .block_on(async {
-                            if let Some(cache_dir) = disk_cache_dir {
-                                crate::read::artifact_cache::fetch_cached_bytes_cid(
-                                    cs.as_ref(),
-                                    &fetch_cid,
-                                    &cache_dir,
-                                )
-                                .await
-                                .map_err(|e| e.to_string())
-                            } else {
-                                cs.get(&fetch_cid).await.map_err(|e| e.to_string())
-                            }
-                        })
-                        .map_err(|e| e.to_string());
-                    let _ = tx.send(res);
-                })
-                .map_err(|err| {
-                    io::Error::other(format!(
-                        "dict tree: failed to spawn remote leaf fetch thread: {err}"
-                    ))
-                })?;
-
-            match rx.recv() {
-                Ok(res) => res.map_err(io::Error::other),
-                Err(_) => Err(io::Error::other("dict tree: fetch thread died")),
-            }
+            // The previous hand-rolled `thread::spawn` + outer-`Handle::block_on`
+            // + `rx.recv()` re-injected the fetch onto the OUTER runtime with no
+            // `block_in_place`: on a small (e.g. 2-worker) runtime every worker
+            // could park in `recv()` with no thread left to drive the reactor,
+            // so the fetch never completed — a hard wedge under query fan-out.
+            let timeout = crate::read::binary_index_store::cas_sync_timeout();
+            crate::read::binary_index_store::run_sync_on_runtime(async move {
+                let fetch = async {
+                    if let Some(cache_dir) = disk_cache_dir {
+                        crate::read::artifact_cache::fetch_cached_bytes_cid(
+                            cs.as_ref(),
+                            &cid,
+                            &cache_dir,
+                        )
+                        .await
+                        .map_err(|e| io::Error::other(e.to_string()))
+                    } else {
+                        cs.get(&cid)
+                            .await
+                            .map_err(|e| io::Error::other(e.to_string()))
+                    }
+                };
+                // Optional per-fetch ceiling (FLUREE_CAS_SYNC_TIMEOUT_MS): a
+                // stalled dict-leaf fetch self-aborts instead of blocking.
+                match timeout {
+                    Some(dur) => tokio::time::timeout(dur, fetch).await.map_err(|_| {
+                        io::Error::other(format!(
+                            "dict leaf CAS fetch timed out after {}ms",
+                            dur.as_millis()
+                        ))
+                    })?,
+                    None => fetch.await,
+                }
+            })
         }
 
         let load_started = Instant::now();

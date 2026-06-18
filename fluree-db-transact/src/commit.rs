@@ -412,7 +412,7 @@ where
 
         // Apply envelope deltas (namespace + graph) to the in-memory LedgerSnapshot.
         // This must happen before novelty apply so encode_iri() works for graph routing.
-        base.snapshot.apply_envelope_deltas(
+        Arc::make_mut(&mut base.snapshot).apply_envelope_deltas(
             &ns_delta,
             graph_delta.values().map(std::string::String::as_str),
         )?;
@@ -643,8 +643,15 @@ where
         let mut all_flakes = std::mem::take(&mut commit_record.flakes);
         all_flakes.extend(commit_metadata_flakes);
 
-        // 10.1 Populate DictNovelty with subjects/strings from this commit
-        let mut dict_novelty = base.dict_novelty.clone();
+        // Capture the ledger id before moving novelty fields out of `base`:
+        // after a partial move we can no longer call &self methods on `base`.
+        let base_ledger_id = base.ledger_id().to_string();
+
+        // 10.1 Populate DictNovelty with subjects/strings from this commit.
+        // Move the Arc out of `base` (instead of Arc::clone) so `make_mut` can
+        // mutate in place when this commit uniquely owns the prior state, and
+        // copy-on-write only when a reader/cache still holds it.
+        let mut dict_novelty = base.dict_novelty;
         {
             let span = tracing::debug_span!("commit_populate_dict_novelty");
             let _g = span.enter();
@@ -668,16 +675,16 @@ where
             )?;
         }
 
-        let mut runtime_small_dicts = Arc::clone(&base.runtime_small_dicts);
+        let mut runtime_small_dicts = base.runtime_small_dicts;
         Arc::make_mut(&mut runtime_small_dicts).populate_from_flakes(&all_flakes);
 
-        let mut new_novelty = Arc::clone(&base.novelty);
+        let mut new_novelty = base.novelty;
         {
             let span = tracing::debug_span!("commit_apply_to_novelty");
             let _g = span.enter();
             let mut reverse_graph = base.snapshot.build_reverse_graph()?;
             // Ensure txn-meta graph is always routable for commit metadata flakes.
-            let txn_meta_iri = fluree_db_core::txn_meta_graph_iri(base.ledger_id());
+            let txn_meta_iri = fluree_db_core::txn_meta_graph_iri(&base_ledger_id);
             if let Some(g_sid) = base.snapshot.encode_iri(&txn_meta_iri) {
                 reverse_graph.entry(g_sid).or_insert(TXN_META_GRAPH_ID);
             }
@@ -688,16 +695,26 @@ where
         // updated `dict_novelty` so overlay translation can resolve newly-introduced
         // subject/string IDs (otherwise the provider holds a stale Arc).
         let mut snapshot = base.snapshot;
-        if let Some(provider) = snapshot.range_provider.as_ref() {
-            if let Some(brp) = provider.as_any().downcast_ref::<BinaryRangeProvider>() {
-                let ns_fallback = Some(Arc::new(snapshot.namespaces().clone()));
-                snapshot.range_provider = Some(Arc::new(BinaryRangeProvider::new(
-                    Arc::clone(brp.store()),
-                    Arc::clone(&dict_novelty),
-                    Arc::clone(&runtime_small_dicts),
-                    ns_fallback,
-                )));
-            }
+        // Build the re-attached provider first so the read-borrow of `snapshot`
+        // ends before the `Arc::make_mut` (copy-on-write) assignment below.
+        let new_range_provider: Option<Arc<dyn fluree_db_core::range_provider::RangeProvider>> =
+            snapshot.range_provider.as_ref().and_then(|provider| {
+                provider
+                    .as_any()
+                    .downcast_ref::<BinaryRangeProvider>()
+                    .map(|brp| {
+                        let ns_fallback = Some(snapshot.shared_namespaces());
+                        Arc::new(BinaryRangeProvider::new(
+                            Arc::clone(brp.store()),
+                            Arc::clone(&dict_novelty),
+                            Arc::clone(&runtime_small_dicts),
+                            ns_fallback,
+                        ))
+                            as Arc<dyn fluree_db_core::range_provider::RangeProvider>
+                    })
+            });
+        if let Some(rp) = new_range_provider {
+            Arc::make_mut(&mut snapshot).range_provider = Some(rp);
         }
 
         let new_state = LedgerState {

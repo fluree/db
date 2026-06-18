@@ -58,6 +58,7 @@ pub struct Parser<'a, 'input, S> {
 impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
     /// Create a new parser.
     pub fn new(input: &'input str, sink: &'a mut S) -> Result<Self> {
+        crate::error::check_input_len(input.len())?;
         let mut lexer = StreamingLexer::new(input);
         let current_token = lexer.next_token()?;
 
@@ -635,9 +636,10 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
             TokenKind::String | TokenKind::LongString | TokenKind::StringEscaped(_) => {
                 self.parse_literal()
             }
-            TokenKind::Integer(_) | TokenKind::Decimal | TokenKind::Double(_) => {
-                self.parse_literal()
-            }
+            TokenKind::Integer(_)
+            | TokenKind::IntegerOverflow
+            | TokenKind::Decimal
+            | TokenKind::Double(_) => self.parse_literal(),
             TokenKind::KwTrue | TokenKind::KwFalse => self.parse_literal(),
             _ => Err(TurtleError::parse(
                 self.current().start as usize,
@@ -668,6 +670,14 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
             TokenKind::Integer(n) => {
                 self.advance()?;
                 Ok(self.sink_term_literal_value(LiteralValue::Integer(n), Datatype::xsd_integer()))
+            }
+            TokenKind::IntegerOverflow => {
+                // Beyond i64: keep the lexical so downstream promotes to BigInt.
+                let s = self.current().start;
+                let e = self.current().end;
+                let text = self.decimal_content(s, e);
+                self.advance()?;
+                Ok(self.sink_term_literal(text, Datatype::xsd_integer(), None))
             }
             TokenKind::Decimal => {
                 let s = self.current().start;
@@ -1140,6 +1150,32 @@ mod tests {
         assert!(
             matches!(&triple.p, Term::Iri(iri) if iri.as_ref() == "http://xmlns.com/foaf/0.1/name")
         );
+    }
+
+    #[test]
+    fn test_integer_overflowing_i64_keeps_lexical_as_xsd_integer() {
+        // xsd:integer is unbounded; a literal past i64 must keep its lexical
+        // (typed-string lane promotes to BigInt downstream), never become 0.
+        let input = r"
+            @prefix ex: <http://example.org/> .
+            ex:item ex:serial 123456789012345678901234567890 .
+        ";
+        let graph = parse_to_graph(input).unwrap();
+
+        assert_eq!(graph.len(), 1);
+        let triple = graph.iter().next().unwrap();
+        match &triple.o {
+            Term::Literal {
+                value, datatype, ..
+            } => {
+                assert_eq!(
+                    datatype.as_iri(),
+                    "http://www.w3.org/2001/XMLSchema#integer"
+                );
+                assert_eq!(value.lexical(), "123456789012345678901234567890");
+            }
+            other => panic!("expected literal, got {other:?}"),
+        }
     }
 
     #[test]

@@ -460,3 +460,87 @@ async fn subquery_with_values_filters_results() {
         normalize_rows(&json!(["ex:alice", "ex:liam"]))
     );
 }
+
+#[tokio::test]
+async fn subquery_having_groups_jsonld() {
+    // HAVING inside a JSON-LD subquery: counts favNums per name, keeps groups
+    // with more than one. Exercises the unified grouping/HAVING path.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_people(&fluree, "subquery:people").await;
+    let ctx = context_ex_schema();
+
+    let q = json!({
+        "@context": ctx,
+        "select": ["?name", "?count"],
+        "where": [
+            ["query", {
+                "@context": ctx,
+                "select": ["?name", "(as (count ?favNums) ?count)"],
+                "where": [
+                    {"@id":"?s","schema:name":"?name"},
+                    {"@id":"?s","ex:favNums":"?favNums"}
+                ],
+                "groupBy": ["?name"],
+                "having": [">", ["count", "?favNums"], 1]
+            }]
+        ]
+    });
+
+    let rows = support::query_jsonld(&fluree, &ledger, &q)
+        .await
+        .unwrap()
+        .to_jsonld(&ledger.snapshot)
+        .unwrap();
+    // Counts: Brian 1, Alice 3, Cam 2, Liam 2 → HAVING(count > 1) drops Brian.
+    assert_eq!(
+        normalize_rows(&rows),
+        normalize_rows(&json!([["Alice", 3], ["Cam", 2], ["Liam", 2]]))
+    );
+}
+
+#[tokio::test]
+async fn subquery_post_aggregation_bind_jsonld() {
+    // Post-aggregation SELECT bind inside a JSON-LD subquery — previously
+    // REJECTED ("post-aggregation BINDs are not supported inside subqueries").
+    // `(as (+ ?count 100) ?bumped)` references the aggregate alias `?count`, so
+    // it now rides in the grouping's aggregation stage like a top-level query.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_people(&fluree, "subquery:people").await;
+    let ctx = context_ex_schema();
+
+    let q = json!({
+        "@context": ctx,
+        "select": ["?name", "?bumped"],
+        "where": [
+            ["query", {
+                "@context": ctx,
+                "select": [
+                    "?name",
+                    "(as (count ?favNums) ?count)",
+                    "(as (+ ?count 100) ?bumped)"
+                ],
+                "where": [
+                    {"@id":"?s","schema:name":"?name"},
+                    {"@id":"?s","ex:favNums":"?favNums"}
+                ],
+                "groupBy": ["?name"]
+            }]
+        ]
+    });
+
+    let rows = support::query_jsonld(&fluree, &ledger, &q)
+        .await
+        .unwrap()
+        .to_jsonld(&ledger.snapshot)
+        .unwrap();
+    // Counts: Brian 1, Alice 3, Cam 2, Liam 2 → bumped = count + 100.
+    assert_eq!(
+        normalize_rows(&rows),
+        normalize_rows(&json!([
+            ["Brian", 101],
+            ["Alice", 103],
+            ["Cam", 102],
+            ["Liam", 102]
+        ]))
+    );
+}

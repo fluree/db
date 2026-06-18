@@ -368,3 +368,37 @@ async fn construct_value_metadata_displays() {
 
     assert_eq!(actual, expected);
 }
+
+/// Regression for issue #1274: a SPARQL CONSTRUCT executed through the default
+/// formatted path (no explicit `.format()`) must NOT error with "CONSTRUCT
+/// queries only support JSON-LD output format". The SPARQL default is
+/// SPARQL-results JSON, but a graph has no binding-table form, so the formatter
+/// coerces the result to JSON-LD instead of rejecting it.
+#[tokio::test]
+async fn sparql_construct_default_format_yields_jsonld_graph() {
+    let (fluree, ledger) = seed_people().await;
+    let db = support::graphdb_from_ledger(&ledger);
+
+    let sparql = "PREFIX person: <http://example.org/Person#> \
+                  CONSTRUCT { ?s person:fullName ?n } WHERE { ?s person:fullName ?n }";
+
+    // Default path — exactly what the server's no-Accept / application/json /
+    // application/ld+json branches drive.
+    let out = db
+        .query(&fluree)
+        .sparql(sparql)
+        .execute_formatted()
+        .await
+        .expect("CONSTRUCT default format must not 400");
+
+    // JSON-LD graph shape: an object carrying an @graph array of nodes.
+    let graph = out
+        .get("@graph")
+        .and_then(JsonValue::as_array)
+        .expect("CONSTRUCT output is a JSON-LD @graph object");
+    assert!(!graph.is_empty(), "expected constructed triples");
+    assert!(
+        graph.iter().all(|node| node.get("@id").is_some()),
+        "each constructed node carries an @id"
+    );
+}
