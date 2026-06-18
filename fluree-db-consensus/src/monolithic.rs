@@ -6,7 +6,7 @@
 //! do not need cross-node coordination.
 
 use crate::{
-    Committer, IdempotencyKey, MergeReceipt, MergeRequest, OperationReceipt, PushReceipt,
+    CommitId, Committer, IdempotencyKey, MergeReceipt, MergeRequest, OperationReceipt, PushReceipt,
     PushRequest, RebaseReceipt, RebaseRequest, RevertReceipt, RevertRequest, RevertSelection,
     SubmissionError, SubmissionLookup, SubmissionState, TransactionBody, TransactionReceipt,
     TransactionRequest,
@@ -14,11 +14,13 @@ use crate::{
 use async_trait::async_trait;
 use fluree_db_api::{
     ApiError, Base64Bytes, CommitRef, Fluree, GovernanceOptions, LedgerHandle, LedgerManager,
-    PolicyContext, PushCommitsRequest, RefreshOpts, TransactError,
+    PolicyContext, PolicyStats, PushCommitsRequest, RefreshOpts, TrackingTally, TransactError,
 };
 use fluree_db_ledger::IndexConfig;
 use moka::future::Cache;
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
+use std::mem;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -106,9 +108,16 @@ async fn build_policy_context(
 /// body, and status lookups for the expired key return [`SubmissionState::Unknown`].
 pub const DEFAULT_IDEMPOTENCY_TTL: Duration = Duration::from_secs(3600);
 
-/// Upper bound on idempotency cache entries, so sustained keyed traffic
-/// can't grow the cache without limit between TTL evictions.
-const IDEMPOTENCY_CACHE_CAPACITY: u64 = 100_000;
+/// Total byte budget for the idempotency cache across all entries.
+///
+/// Bounded by bytes rather than entry count because `CachedSubmission` size
+/// is highly variable: a tracking-enabled `TransactionReceipt` carrying a
+/// `TrackingTally` (with its per-policy `HashMap<String, PolicyStats>`) is
+/// typically a few KB; a bare `RevertReceipt` is on the order of bytes. A
+/// fixed entry count would let resident memory drift far above what the
+/// count suggests under sustained tracked traffic. 256 MiB sized to absorb
+/// ~100k tracking-heavy entries before evictions start.
+pub const DEFAULT_IDEMPOTENCY_CACHE_MAX_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Default cap on in-flight submissions; calls beyond this count are
 /// refused with [`SubmissionError::Overloaded`]. Bounding the in-flight
@@ -127,6 +136,90 @@ type SubmissionCacheKey = (String, IdempotencyKey);
 struct CachedSubmission {
     state: SubmissionState,
     body_hash: [u8; 32],
+}
+
+/// Estimated bytes a cache entry holds, used by moka as the weight for
+/// capacity accounting.
+///
+/// Stack footprint of the key tuple and `CachedSubmission` plus the heap the
+/// variant payloads own. The dominant variable cost — `TrackingTally::policy`,
+/// a `HashMap<String, PolicyStats>` — is walked explicitly so a heavy entry
+/// registers at its true memory cost rather than as a single slot. Fixed-size
+/// inline structs (e.g. `CommitId`'s `Cid`) contribute through the base
+/// `size_of` term, which is exact for them.
+fn weigh_cached_submission(key: &SubmissionCacheKey, value: &CachedSubmission) -> u32 {
+    let base = mem::size_of::<SubmissionCacheKey>() + mem::size_of::<CachedSubmission>();
+    let key_heap = key.0.capacity() + key.1.as_str().len();
+    let state_heap = weigh_submission_state(&value.state);
+    base.saturating_add(key_heap)
+        .saturating_add(state_heap)
+        .min(u32::MAX as usize) as u32
+}
+
+fn weigh_submission_state(state: &SubmissionState) -> usize {
+    match state {
+        SubmissionState::Unknown | SubmissionState::InFlight => 0,
+        SubmissionState::Committed(receipt) => weigh_operation_receipt(receipt),
+        SubmissionState::Failed(err) => weigh_submission_error(err),
+    }
+}
+
+fn weigh_operation_receipt(receipt: &OperationReceipt) -> usize {
+    match receipt {
+        OperationReceipt::Transaction(tr) => {
+            weigh_idempotency_key(tr.idempotency_key.as_ref())
+                + tr.tally.as_ref().map(weigh_tracking_tally).unwrap_or(0)
+        }
+        OperationReceipt::Revert(rr) => {
+            weigh_idempotency_key(rr.idempotency_key.as_ref())
+                + rr.branch.capacity()
+                + rr.reverted_commits.capacity() * mem::size_of::<CommitId>()
+        }
+        OperationReceipt::Merge(mr) => {
+            weigh_idempotency_key(mr.idempotency_key.as_ref())
+                + mr.source.capacity()
+                + mr.target.capacity()
+        }
+        OperationReceipt::Rebase(rr) => {
+            weigh_idempotency_key(rr.idempotency_key.as_ref()) + rr.branch.capacity()
+        }
+        OperationReceipt::Push(pr) => {
+            weigh_idempotency_key(pr.idempotency_key.as_ref()) + pr.ledger.capacity()
+        }
+    }
+}
+
+fn weigh_idempotency_key(key: Option<&IdempotencyKey>) -> usize {
+    key.map(|k| k.as_str().len()).unwrap_or(0)
+}
+
+fn weigh_tracking_tally(tally: &TrackingTally) -> usize {
+    let time = tally.time.as_ref().map(String::capacity).unwrap_or(0);
+    let policy = tally.policy.as_ref().map(weigh_policy_map).unwrap_or(0);
+    let reasoning = tally
+        .reasoning
+        .as_ref()
+        .and_then(|r| r.capped_reason.as_ref())
+        .map(String::capacity)
+        .unwrap_or(0);
+    time + policy + reasoning
+}
+
+fn weigh_policy_map(map: &HashMap<String, PolicyStats>) -> usize {
+    // Hashbrown's open-addressing layout costs roughly one control byte plus
+    // one `(K, V)` slot per entry; capacity (not len) is what's allocated.
+    const SLOT: usize = mem::size_of::<(String, PolicyStats)>() + 1;
+    map.capacity().saturating_mul(SLOT)
+        + map.keys().map(|k| k.capacity()).sum::<usize>()
+}
+
+fn weigh_submission_error(err: &SubmissionError) -> usize {
+    match err {
+        SubmissionError::Execution { message, .. } => message.capacity(),
+        SubmissionError::KeyCollision
+        | SubmissionError::AlreadyInFlight
+        | SubmissionError::Overloaded => 0,
+    }
 }
 
 /// Monolithic consensus over the local Fluree transaction infrastructure.
@@ -156,7 +249,8 @@ impl MonolithicCommitter {
     pub fn with_ttl(fluree: Arc<Fluree>, index_config: IndexConfig, ttl: Duration) -> Self {
         let cache = Cache::builder()
             .time_to_live(ttl)
-            .max_capacity(IDEMPOTENCY_CACHE_CAPACITY)
+            .max_capacity(DEFAULT_IDEMPOTENCY_CACHE_MAX_BYTES)
+            .weigher(weigh_cached_submission)
             .build();
         Self {
             fluree,
@@ -172,6 +266,29 @@ impl MonolithicCommitter {
     /// [`SubmissionError::Overloaded`] rather than queued.
     pub fn with_pending_limit(mut self, limit: usize) -> Self {
         self.admission = Arc::new(Semaphore::new(limit));
+        self
+    }
+
+    /// Override the idempotency cache's byte budget (defaults to
+    /// [`DEFAULT_IDEMPOTENCY_CACHE_MAX_BYTES`]). Entry weight is the per-entry
+    /// memory footprint; moka evicts the least-recently-used entries once the
+    /// total exceeds the budget. Tune up to absorb more sustained keyed
+    /// traffic before evictions start, or down to fit a tighter memory
+    /// envelope.
+    ///
+    /// Rebuilds the cache; safe to call only at construction time, before
+    /// any submissions have been recorded — existing entries are discarded.
+    pub fn with_cache_capacity_bytes(mut self, max_bytes: u64) -> Self {
+        let ttl = self
+            .cache
+            .policy()
+            .time_to_live()
+            .unwrap_or(DEFAULT_IDEMPOTENCY_TTL);
+        self.cache = Cache::builder()
+            .time_to_live(ttl)
+            .max_capacity(max_bytes)
+            .weigher(weigh_cached_submission)
+            .build();
         self
     }
 
@@ -1547,6 +1664,29 @@ ex:alice ex:name "Alice" ."#;
             matches!(err, SubmissionError::Overloaded),
             "expected Overloaded, got {err:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn cache_capacity_override_preserves_idempotency() {
+        // A custom byte budget swaps the underlying moka cache. Confirm a
+        // keyed submission still records into the rebuilt cache and is
+        // recoverable via `status` — i.e. the override doesn't sever the
+        // claim-then-record path.
+        let (_fluree, consensus, ledger_id) = setup().await;
+        let consensus = consensus.with_cache_capacity_bytes(64 * 1024);
+        let key = "01J5OVERRIDEKEY00000";
+
+        let receipt = consensus
+            .transact(request(&ledger_id, Some(key), sample_insert("octavia")))
+            .await
+            .expect("keyed submission to succeed under custom budget");
+        assert_eq!(receipt.idempotency_key.as_ref().map(IdempotencyKey::as_str), Some(key));
+
+        let key = IdempotencyKey::new(key);
+        match consensus.status(&ledger_id, &key).await {
+            SubmissionState::Committed(OperationReceipt::Transaction(_)) => {}
+            other => panic!("expected Committed transaction in cache, got {other:?}"),
+        }
     }
 
     #[tokio::test]
