@@ -1141,7 +1141,7 @@ mod tests {
 
     fn request(ledger_id: &str, key: Option<&str>, body: JsonValue) -> TransactionRequest {
         TransactionRequest {
-            idempotency_key: key.map(IdempotencyKey::new),
+            idempotency_key: key.map(|k| IdempotencyKey::new(k).expect("test key fits cap")),
             ledger_id: ledger_id.to_string(),
             body: TransactionBody::JsonLdInsert(body),
             txn_opts: TxnOpts::default(),
@@ -1167,7 +1167,7 @@ mod tests {
     #[tokio::test]
     async fn keyed_submission_is_visible_via_status_lookup() {
         let (_fluree, consensus, ledger_id) = setup().await;
-        let key = IdempotencyKey::new("01J5XAMPLE001");
+        let key = IdempotencyKey::new("01J5XAMPLE001").expect("test key fits cap");
 
         let receipt = consensus
             .transact(request(
@@ -1191,7 +1191,7 @@ mod tests {
     #[tokio::test]
     async fn status_returns_unknown_for_unseen_key() {
         let (_fluree, consensus, ledger_id) = setup().await;
-        let key = IdempotencyKey::new("01J5UNKNOWN");
+        let key = IdempotencyKey::new("01J5UNKNOWN").expect("test key fits cap");
 
         assert!(matches!(
             consensus.status(&ledger_id, &key).await,
@@ -1202,7 +1202,7 @@ mod tests {
     #[tokio::test]
     async fn idempotent_retry_returns_cached_receipt() {
         let (_fluree, consensus, ledger_id) = setup().await;
-        let key = IdempotencyKey::new("01J5RETRY001");
+        let key = IdempotencyKey::new("01J5RETRY001").expect("test key fits cap");
         let body = sample_insert("alice");
 
         let first = consensus
@@ -1224,7 +1224,7 @@ mod tests {
     #[tokio::test]
     async fn key_collision_with_different_body_errors() {
         let (_fluree, consensus, ledger_id) = setup().await;
-        let key = IdempotencyKey::new("01J5COLLIDE001");
+        let key = IdempotencyKey::new("01J5COLLIDE001").expect("test key fits cap");
 
         consensus
             .transact(request(
@@ -1261,7 +1261,7 @@ mod tests {
 
         // A fresh keyed submission with any body should succeed — no anonymous
         // entry should sit in the cache to clash with it.
-        let key = IdempotencyKey::new("01J5FRESH001");
+        let key = IdempotencyKey::new("01J5FRESH001").expect("test key fits cap");
         consensus
             .transact(request(
                 &ledger_id,
@@ -1363,7 +1363,7 @@ mod tests {
     #[tokio::test]
     async fn failed_submission_is_recorded_as_failed() {
         let (_fluree, consensus, _ledger_id) = setup().await;
-        let key = IdempotencyKey::new("01J5FAILED001");
+        let key = IdempotencyKey::new("01J5FAILED001").expect("test key fits cap");
         let missing = "test/missing-ledger:main";
 
         let err = consensus
@@ -1457,7 +1457,7 @@ ex:alice ex:name "Alice" ."#;
     #[tokio::test]
     async fn failed_submission_can_be_retried() {
         let (fluree, consensus, _ledger_id) = setup().await;
-        let key = IdempotencyKey::new("01J5RETRYAFTERFAIL");
+        let key = IdempotencyKey::new("01J5RETRYAFTERFAIL").expect("test key fits cap");
         let ledger = "test/created-later:main";
         let body = sample_insert("alice");
 
@@ -1499,7 +1499,7 @@ ex:alice ex:name "Alice" ."#;
         strategy: ConflictStrategy,
     ) -> RevertRequest {
         RevertRequest {
-            idempotency_key: key.map(IdempotencyKey::new),
+            idempotency_key: key.map(|k| IdempotencyKey::new(k).expect("test key fits cap")),
             ledger_name: "test/consensus".to_string(),
             branch: "main".to_string(),
             selection: RevertSelection::single(CommitRef::Exact(commit)),
@@ -1551,7 +1551,7 @@ ex:alice ex:name "Alice" ."#;
     async fn keyed_revert_is_visible_via_status_lookup() {
         let (_fluree, consensus, ledger_id) = setup().await;
         let commit = seed_commit(&consensus, &ledger_id, "alice").await;
-        let key = IdempotencyKey::new("01J5REVERTSTATUS");
+        let key = IdempotencyKey::new("01J5REVERTSTATUS").expect("test key fits cap");
 
         let receipt = consensus
             .revert(revert_request(
@@ -1625,7 +1625,7 @@ ex:alice ex:name "Alice" ."#;
 
     fn merge_request(key: Option<&str>) -> MergeRequest {
         MergeRequest {
-            idempotency_key: key.map(IdempotencyKey::new),
+            idempotency_key: key.map(|k| IdempotencyKey::new(k).expect("test key fits cap")),
             ledger_name: "test/consensus".to_string(),
             source_branch: "feature".to_string(),
             target_branch: Some("main".to_string()),
@@ -1675,7 +1675,7 @@ ex:alice ex:name "Alice" ."#;
     #[tokio::test]
     async fn keyed_merge_is_visible_via_status_lookup() {
         let (_fluree, consensus) = setup_with_feature_branch().await;
-        let key = IdempotencyKey::new("01J5MERGESTATUS");
+        let key = IdempotencyKey::new("01J5MERGESTATUS").expect("test key fits cap");
 
         let receipt = consensus
             .merge(merge_request(Some(key.as_str())))
@@ -1721,7 +1721,7 @@ ex:alice ex:name "Alice" ."#;
 
     fn rebase_request(key: Option<&str>) -> RebaseRequest {
         RebaseRequest {
-            idempotency_key: key.map(IdempotencyKey::new),
+            idempotency_key: key.map(|k| IdempotencyKey::new(k).expect("test key fits cap")),
             ledger_name: "test/consensus".to_string(),
             branch: "feature".to_string(),
             strategy: ConflictStrategy::default(),
@@ -1764,7 +1764,7 @@ ex:alice ex:name "Alice" ."#;
     #[tokio::test]
     async fn keyed_rebase_is_visible_via_status_lookup() {
         let (_fluree, consensus) = setup_with_feature_branch().await;
-        let key = IdempotencyKey::new("01J5REBASESTATUS");
+        let key = IdempotencyKey::new("01J5REBASESTATUS").expect("test key fits cap");
 
         let receipt = consensus
             .rebase(rebase_request(Some(key.as_str())))
@@ -1810,7 +1810,7 @@ ex:alice ex:name "Alice" ."#;
 
     fn push_request(key: Option<&str>, commits: Vec<Vec<u8>>) -> PushRequest {
         PushRequest {
-            idempotency_key: key.map(IdempotencyKey::new),
+            idempotency_key: key.map(|k| IdempotencyKey::new(k).expect("test key fits cap")),
             ledger_id: "test/consensus:main".to_string(),
             commits,
             blobs: std::collections::HashMap::new(),
@@ -1923,7 +1923,7 @@ ex:alice ex:name "Alice" ."#;
             .expect("keyed submission to succeed under custom budget");
         assert_eq!(receipt.idempotency_key.as_ref().map(IdempotencyKey::as_str), Some(key));
 
-        let key = IdempotencyKey::new(key);
+        let key = IdempotencyKey::new(key).expect("test key fits cap");
         match consensus.status(&ledger_id, &key).await {
             SubmissionState::Committed(OperationReceipt::Transaction(_)) => {}
             other => panic!("expected Committed transaction in cache, got {other:?}"),

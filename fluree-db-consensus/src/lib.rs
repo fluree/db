@@ -28,23 +28,59 @@ use fluree_db_api::{
     TrackingOptions, TrackingTally,
 };
 use fluree_db_transact::{CommitOpts, CommitReceipt, TxnOpts};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
 use std::fmt;
 use thiserror::Error;
+
+/// Maximum byte length of an [`IdempotencyKey`]. Anything longer is rejected
+/// at construction time so it can't reach the cache.
+///
+/// Caps the per-entry footprint of the idempotency cache key. Without the
+/// cap a misbehaving client could send a multi-MB `Idempotency-Key` header
+/// and pin that much memory in moka for the TTL window. Enforced by
+/// [`IdempotencyKey::new`] — the type's only constructor — so every code
+/// path that produces an `IdempotencyKey` honors the limit, independent of
+/// any per-layer header-size config the front-end might tighten or loosen.
+pub const MAX_IDEMPOTENCY_KEY_LEN: usize = 128;
+
+/// Error returned by [`IdempotencyKey::new`] when the input violates one of
+/// the key's invariants.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum InvalidIdempotencyKey {
+    #[error("idempotency key is empty")]
+    Empty,
+    #[error("idempotency key is {len} bytes; the cap is {MAX_IDEMPOTENCY_KEY_LEN}")]
+    TooLong { len: usize },
+}
 
 /// Caller-provided identifier for a transaction submission.
 ///
 /// Used both for idempotent retry (retries with the same key collapse to one
 /// outcome) and for status lookup via [`SubmissionLookup`]. Callers typically
 /// generate a ULID before submission so they can recover after a disconnect.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+///
+/// `IdempotencyKey` has no public field and no infallible constructor: all
+/// instances flow through [`IdempotencyKey::new`], which enforces a non-empty,
+/// length-capped invariant ([`MAX_IDEMPOTENCY_KEY_LEN`]). `Deserialize` is
+/// deliberately not derived — re-introducing it must come with a validating
+/// impl, not the default `String`-newtype one.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 pub struct IdempotencyKey(String);
 
 impl IdempotencyKey {
-    pub fn new(key: impl Into<String>) -> Self {
-        Self(key.into())
+    /// Build an [`IdempotencyKey`], rejecting empty input and anything longer
+    /// than [`MAX_IDEMPOTENCY_KEY_LEN`] bytes.
+    pub fn new(key: impl Into<String>) -> Result<Self, InvalidIdempotencyKey> {
+        let key = key.into();
+        if key.is_empty() {
+            return Err(InvalidIdempotencyKey::Empty);
+        }
+        if key.len() > MAX_IDEMPOTENCY_KEY_LEN {
+            return Err(InvalidIdempotencyKey::TooLong { len: key.len() });
+        }
+        Ok(Self(key))
     }
 
     pub fn as_str(&self) -> &str {
@@ -55,18 +91,6 @@ impl IdempotencyKey {
 impl fmt::Display for IdempotencyKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
-    }
-}
-
-impl From<String> for IdempotencyKey {
-    fn from(value: String) -> Self {
-        Self(value)
-    }
-}
-
-impl From<&str> for IdempotencyKey {
-    fn from(value: &str) -> Self {
-        Self(value.to_string())
     }
 }
 
@@ -374,4 +398,31 @@ pub trait Committer: Send + Sync {
 #[async_trait]
 pub trait SubmissionLookup: Send + Sync {
     async fn status(&self, ledger_id: &str, key: &IdempotencyKey) -> SubmissionState;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_accepts_typical_lengths() {
+        IdempotencyKey::new("01J5ULIDLOOKINGKEY").expect("ULID-shaped key fits cap");
+        let max = "x".repeat(MAX_IDEMPOTENCY_KEY_LEN);
+        IdempotencyKey::new(max).expect("input exactly at cap is allowed");
+    }
+
+    #[test]
+    fn new_rejects_empty() {
+        assert_eq!(IdempotencyKey::new(""), Err(InvalidIdempotencyKey::Empty));
+    }
+
+    #[test]
+    fn new_rejects_over_cap() {
+        let len = MAX_IDEMPOTENCY_KEY_LEN + 1;
+        let over = "x".repeat(len);
+        assert_eq!(
+            IdempotencyKey::new(over),
+            Err(InvalidIdempotencyKey::TooLong { len })
+        );
+    }
 }

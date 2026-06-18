@@ -134,7 +134,11 @@ pub async fn submission_status(
         }
     }
 
-    let key = IdempotencyKey::new(params.key);
+    // Validate the URL-borne key through the same constructor that gates
+    // header-borne keys, so an over-long path segment is rejected at the
+    // boundary before it can be hashed into a cache lookup.
+    let key = IdempotencyKey::new(params.key)
+        .map_err(|e| ServerError::BadRequest(format!("invalid idempotency key: {e}")))?;
     let lookup_state = state.consensus.status(&params.ledger, &key).await;
     Ok(Json(SubmissionStateResponse::from(lookup_state)).into_response())
 }

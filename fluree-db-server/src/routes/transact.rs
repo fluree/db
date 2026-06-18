@@ -130,15 +130,30 @@ fn compute_tx_id_sparql(sparql: &str) -> String {
 
 /// Extract an [`IdempotencyKey`] from the `Idempotency-Key` request header.
 ///
-/// Returns `None` when the header is absent or empty. Non-UTF-8 header values
-/// are also treated as absent — the consensus layer can only key on strings.
-pub(crate) fn extract_idempotency_key(headers: &HeaderMap) -> Option<IdempotencyKey> {
-    headers
-        .get("Idempotency-Key")
-        .and_then(|v| v.to_str().ok())
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(IdempotencyKey::new)
+/// Returns `Ok(None)` when the header is absent, empty, or non-UTF-8; the
+/// caller proceeds as if no idempotency key was supplied. Returns
+/// `Err(ServerError::BadRequest)` when the header is present and rejected
+/// by the type's validating constructor (currently: bytes over
+/// [`fluree_db_consensus::MAX_IDEMPOTENCY_KEY_LEN`]). Surfacing the rejection
+/// as a 400 — rather than silently dropping the key — prevents the client
+/// from believing a too-long key was accepted and stops the oversize value
+/// from ever reaching the cache.
+pub(crate) fn extract_idempotency_key(
+    headers: &HeaderMap,
+) -> std::result::Result<Option<IdempotencyKey>, ServerError> {
+    let Some(raw) = headers.get("Idempotency-Key") else {
+        return Ok(None);
+    };
+    let Ok(text) = raw.to_str() else {
+        return Ok(None);
+    };
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    IdempotencyKey::new(trimmed)
+        .map(Some)
+        .map_err(|e| ServerError::BadRequest(format!("invalid Idempotency-Key: {e}")))
 }
 
 /// Tracking options requested via headers, or `None` when none were requested.
@@ -1420,7 +1435,7 @@ async fn execute_transaction(
     author: Option<&str>,
     headers: &FlureeHeaders,
 ) -> Result<Response> {
-    let idempotency_key = extract_idempotency_key(&credential.headers);
+    let idempotency_key = extract_idempotency_key(&credential.headers)?;
     let prepared_transaction =
         prepare_transaction_body(state, ledger_id, body, headers, author).await;
 
@@ -1651,7 +1666,7 @@ async fn execute_turtle_transaction(
             TransactionBody::TurtleUpsert(turtle.to_string())
         };
         let request = TransactionRequest {
-            idempotency_key: extract_idempotency_key(&credential.headers),
+            idempotency_key: extract_idempotency_key(&credential.headers)?,
             ledger_id: ledger_id.to_string(),
             body,
             txn_opts: TxnOpts::default(),
@@ -1772,7 +1787,7 @@ async fn execute_sparql_update_request(
     // is gone. Tracking is header-driven for SPARQL.
     let tracking = tracking_from_headers(headers);
     let request = TransactionRequest {
-        idempotency_key: extract_idempotency_key(&credential.headers),
+        idempotency_key: extract_idempotency_key(&credential.headers)?,
         ledger_id: ledger_id.clone(),
         body: TransactionBody::Sparql(sparql),
         txn_opts: TxnOpts::default(),
