@@ -23,7 +23,7 @@ use std::collections::HashMap;
 use std::mem;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{Semaphore, SemaphorePermit};
 
 /// Map a transaction-pipeline error into a [`SubmissionError`], preserving
 /// the HTTP status so the caller can render an accurate response.
@@ -296,9 +296,14 @@ impl MonolithicCommitter {
     /// submission outright when the cap is reached. The returned permit
     /// drops (and releases its slot) when the caller's submission future
     /// completes.
-    fn try_admit(&self) -> Result<OwnedSemaphorePermit, SubmissionError> {
-        Arc::clone(&self.admission)
-            .try_acquire_owned()
+    ///
+    /// The permit borrows from `self.admission` rather than owning an Arc
+    /// clone — callers hold `&self` across the entire submission body and
+    /// don't move the permit into a spawned task. Switch to
+    /// `try_acquire_owned` if a future caller ever needs `'static` lifetime.
+    fn try_admit(&self) -> Result<SemaphorePermit<'_>, SubmissionError> {
+        self.admission
+            .try_acquire()
             .map_err(|_| SubmissionError::Overloaded)
     }
 
