@@ -483,13 +483,11 @@ impl DictOverlay {
             FlakeValue::Long(n) => Ok((ObjKind::NUM_INT, ObjKey::encode_i64(*n))),
 
             FlakeValue::Double(d) => {
-                // Integer-valued doubles that fit i64 → NUM_INT
-                if d.is_finite() && d.fract() == 0.0 {
-                    let as_i64 = *d as i64;
-                    if (as_i64 as f64) == *d {
-                        return Ok((ObjKind::NUM_INT, ObjKey::encode_i64(as_i64)));
-                    }
-                }
+                // Do NOT optimize integral doubles to NUM_INT: when paired with a
+                // float/double datatype the decode resolves an F64 OType and runs
+                // decode_f64 over the i64-encoded bits, corrupting the value to a
+                // tiny subnormal. Mirrors value_to_otype_okey and the encode-side
+                // guards in resolver.rs / import_sink.rs. (fluree/db-r#142)
                 if d.is_finite() {
                     match ObjKey::encode_f64(*d) {
                         Ok(key) => Ok((ObjKind::NUM_F64, key)),

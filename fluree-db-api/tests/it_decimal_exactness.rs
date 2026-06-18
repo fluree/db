@@ -889,3 +889,77 @@ async fn sparql_delete_data_decimal_retracts_exactly() {
         "deleted decimal fact must not survive"
     );
 }
+
+#[tokio::test]
+async fn integer_valued_double_over_indexed_predicate_is_not_corrupted() {
+    // Regression (fluree/db-r#142): an integer-valued double inserted into a
+    // predicate that already has INDEXED double/float data was silently
+    // corrupted to a tiny subnormal. The novelty overlay encoder paired the
+    // datatype-derived OType (F64 decode) with an i64-encoded key, so the
+    // reader ran decode_f64 over integer bits (55000.0 -> 2.71736e-319).
+    // The trigger needs a persisted index for the predicate; novelty-only
+    // ledgers encode the value correctly.
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(fluree_db_api::LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "double/indexed-overlay:main";
+
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        Arc::new(fluree.nameservice_mode().clone()),
+        fluree_db_indexer::IndexerConfig::small(),
+    );
+
+    local
+        .run_until(async move {
+            let ledger = genesis_ledger(&fluree, ledger_id);
+
+            // Seed + index an integer-valued double for ex:amount.
+            let result = run_sparql_update(
+                &fluree,
+                ledger,
+                r#"
+                PREFIX ex: <http://example.org/>
+                PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+                INSERT DATA { ex:seed ex:amount "28575.0"^^xsd:double . }
+                "#,
+            )
+            .await;
+            trigger_index_and_wait(&handle, ledger_id, result.receipt.t).await;
+            let ledger = fluree.ledger(ledger_id).await.expect("load ledger");
+
+            // Insert a NEW integer-valued double into the now-indexed predicate;
+            // it lands in novelty and is read back through the overlay merge.
+            let result = run_sparql_update(
+                &fluree,
+                ledger,
+                r#"
+                PREFIX ex: <http://example.org/>
+                PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+                INSERT DATA { ex:a ex:amount "55000.0"^^xsd:double . }
+                "#,
+            )
+            .await;
+            let ledger = result.ledger;
+
+            let query = r"
+                PREFIX ex: <http://example.org/>
+                SELECT ?amount WHERE { ex:a ex:amount ?amount . }
+            ";
+            let result = support::query_sparql(&fluree, &ledger, query)
+                .await
+                .expect("query");
+            let sparql_json = result
+                .to_sparql_json(&ledger.snapshot)
+                .expect("to_sparql_json");
+            let values = binding_values(&sparql_json, "amount");
+            assert_eq!(values.len(), 1, "expected exactly one row, got {values:?}");
+            let got: f64 = values[0].parse().expect("double result");
+            assert_eq!(
+                got, 55000.0,
+                "integer-valued double over an indexed predicate must round-trip \
+                 exactly (was corrupted to a subnormal), got {got:e}"
+            );
+        })
+        .await;
+}
