@@ -617,6 +617,23 @@ impl<'a> ExecutionContext<'a> {
             .unwrap_or(false)
     }
 
+    /// True when no view-policy filtering is required for this context — the
+    /// enforcer is absent or is the root (unrestricted) policy. The exact
+    /// negation of [`has_policy`](Self::has_policy).
+    ///
+    /// This is the single canonical predicate that protects view-policy
+    /// enforcement. The only operator that actually removes policy-hidden rows
+    /// is the range-fallback scan ([`BinaryScanOperator::filter_flakes_by_policy`]);
+    /// every fast path and raw-leaflet reader that does *not* route emitted
+    /// flakes through that filter MUST gate on `allow_unfiltered()` and decline
+    /// (fall back to the filtered scan) when it returns false. Adding a new
+    /// data-emitting operator that reads the index directly without consulting
+    /// this — or applying its own filter — is a policy leak.
+    #[inline]
+    pub fn allow_unfiltered(&self) -> bool {
+        !self.has_policy()
+    }
+
     /// Get the effective overlay (NoOverlay if none set)
     pub fn overlay(&self) -> &'a dyn OverlayProvider {
         self.overlay.unwrap_or(&NoOverlay)

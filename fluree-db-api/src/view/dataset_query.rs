@@ -536,6 +536,14 @@ impl Fluree {
             Self::attach_dataset_schema_bundle(primary, &mut executable).await?;
         }
 
+        // Query-time datalog rule injection is admin-only: if any source of the
+        // dataset carries a non-root view policy, drop caller-supplied rules.
+        // See `view/query.rs::build_executable_for_view` for the rationale.
+        if dataset.any_non_root_policy() && !executable.reasoning.modes.rules.is_empty() {
+            tracing::debug!("stripping query-time datalog rules under non-root view policy");
+            executable.reasoning.modes.rules.clear();
+        }
+
         Ok(executable)
     }
 

@@ -393,6 +393,18 @@ pub async fn apply_policy_filter(
     let enforcer = QueryPolicyEnforcer::new(Arc::new(policy_ctx));
     let tracker = Tracker::disabled();
 
+    // Populate subject class membership (at to_t) before filtering — otherwise
+    // filter_flakes_for_graph reads an empty class cache and every f:onClass
+    // restriction silently drops to default_allow.
+    let mut subjects: Vec<_> = flakes.iter().map(|f| f.s.clone()).collect();
+    subjects.sort();
+    subjects.dedup();
+    let db = fluree_db_core::GraphDbRef::new(snapshot, 0, overlay, to_t);
+    enforcer
+        .populate_class_cache_for_graph(db, &subjects)
+        .await
+        .map_err(|e| BlockFetchError::PolicyFilter(e.to_string()))?;
+
     let filtered = enforcer
         .filter_flakes_for_graph(snapshot, overlay, to_t, &tracker, flakes)
         .await

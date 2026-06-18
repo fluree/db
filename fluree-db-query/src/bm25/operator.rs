@@ -225,6 +225,37 @@ impl Bm25SearchOperator {
         self
     }
 
+    /// Indexed-flake readability check for a search hit under a view policy.
+    ///
+    /// A BM25 hit is a matched document subject, not a flake, so the search
+    /// operator bypasses the per-flake policy filtering that scans apply. Here a
+    /// hit is visible iff the identity can view at least one of the subject's
+    /// flakes on an indexed property — the text that could have produced the
+    /// match. If every indexed-property flake of the subject is hidden, the hit
+    /// is dropped.
+    ///
+    /// Scope: enforced only on the inline (local index) path; the dedicated
+    /// search-provider path is out of scope (the engine has no local flakes to
+    /// check against). The indexed-flake read runs in the single active graph;
+    /// under a non-root policy in multi-graph mode the hit is conservatively
+    /// hidden (no leak). No-op for root / no policy.
+    /// Indexed-flake readability for a BM25 hit: visible iff the identity can
+    /// view at least one of the subject's flakes on a BM25-indexed property (the
+    /// text that could have produced the match). Only the inline (local index)
+    /// path is checked; the dedicated search-provider path loads no index here.
+    async fn hit_readable(&self, ctx: &ExecutionContext<'_>, subject_iri: &str) -> Result<bool> {
+        let Some(index) = self.index.as_ref() else {
+            return Ok(true);
+        };
+        let pred_iris: Vec<&str> = index
+            .property_deps
+            .property_iris
+            .iter()
+            .map(std::convert::AsRef::as_ref)
+            .collect();
+        crate::search_readability::search_hit_readable(ctx, subject_iri, &pred_iris).await
+    }
+
     fn resolve_target_from_row(
         &self,
         ctx: &ExecutionContext<'_>,
@@ -549,6 +580,11 @@ impl Operator for Bm25SearchOperator {
 
             // For each BM25 result row, merge with the child row.
             for (subject_iri, ledger_alias, score) in hits {
+                // View-policy enforcement: drop hits whose indexed text the
+                // identity cannot view (inline index path only).
+                if !self.hit_readable(ctx, subject_iri.as_ref()).await? {
+                    continue;
+                }
                 // Create IriMatch binding for correct cross-ledger joins.
                 // IMPORTANT: Encode SID using the hit's source ledger (not primary db)
                 // so that primary_sid is consistent with ledger_alias.

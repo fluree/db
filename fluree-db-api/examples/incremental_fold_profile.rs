@@ -143,6 +143,7 @@ async fn insert_commit(fluree: &Fluree, ledger: LedgerState, turtle: &str) -> Le
             TxnOpts::default(),
             CommitOpts::default(),
             &index_config,
+            None,
         )
         .await
         .expect("insert commit")

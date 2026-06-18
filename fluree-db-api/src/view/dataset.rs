@@ -112,6 +112,16 @@ impl DataSetDb {
         self.default.is_empty() && self.named.is_empty()
     }
 
+    /// True if any graph view (default or named) carries a non-root view
+    /// policy. Used to gate admin-only behavior (e.g. query-time datalog rule
+    /// injection) across every source of a dataset query.
+    pub fn any_non_root_policy(&self) -> bool {
+        self.default
+            .iter()
+            .chain(self.named.values())
+            .any(|g| !g.is_root())
+    }
+
     /// Get a "primary" graph view for parsing/formatting.
     ///
     /// Primary selection behavior:

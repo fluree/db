@@ -336,6 +336,18 @@ The budget is configurable at three levels (highest precedence first):
 - The materialization cache is invalidated when the underlying data changes
   (new transactions), so the first query after a write will re-materialize.
 
+## Reasoning under access policy
+
+Reasoning composes with view policy, but mind the contract when both are on:
+
+- **OWL 2 QL** and **RDFS** rewrite the query and execute under your identity, so they are filtered like any normal query.
+- **OWL 2 RL** and **datalog** materialize derived facts into the query overlay; those facts are filtered by the **same per-flake view policy as base data**. A derived flake you may not view is dropped.
+- The engine filters a derived fact by its own `(subject, predicate, object)` — **not** by the base facts it was derived from. A rule or ontology axiom can therefore re-express hidden data under a viewable predicate (e.g. `ex:ssn rdfs:subPropertyOf ex:identifier`, or a rule deriving `ex:isHighEarner` from a hidden `ex:salary`) and the derived value will surface.
+
+**If you run reasoning under a non-root policy, your policy must cover the derived properties and classes** — deny them, or use `default-allow: false` so anything not explicitly allowed (including reasoning-introduced predicates) stays hidden.
+
+**Query-time rules are admin-only.** Under a non-root view policy, caller-supplied `rules` are stripped before execution — a restricted caller cannot inject inference rules (a rule with a viewable head could launder hidden data). Database-stored `f:rule` definitions and OWL/RDFS reasoning are administrator-controlled and still apply. See [Policy in queries → Reasoning](../security/policy-in-queries.md#reasoning-rdfs--owl--datalog).
+
 ## Related pages
 
 | Topic | Page |
@@ -344,3 +356,4 @@ The budget is configurable at three levels (highest precedence first):
 | Custom inference rules | [Datalog rules](datalog-rules.md) |
 | Supported OWL & RDFS constructs | [OWL & RDFS reference](../reference/owl-rdfs-support.md) |
 | Ledger-wide reasoning config | [Setting groups](../ledger-config/setting-groups.md) |
+| Reasoning under access policy | [Policy in queries](../security/policy-in-queries.md#reasoning-rdfs--owl--datalog) |

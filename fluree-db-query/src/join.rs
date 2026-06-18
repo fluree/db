@@ -1581,6 +1581,15 @@ impl NestedLoopJoinOperator {
     /// object. Decline cases route to the overlay-correct per-row fallback
     /// BEFORE any accumulation, so a flush never reroutes mid-stream.
     fn compute_batched_overlay_mode(&self, ctx: &ExecutionContext<'_>) -> Result<ProbeLanePlan> {
+        // BEFORE the overlay-free return: the batched lanes read raw leaflets in
+        // `Clean` mode too and never run per-leaf `filter_flakes` policy
+        // filtering, so a restrictive policy must decline regardless of novelty
+        // state. This mirrors the same ordering in `subject_probe_lane_plan` /
+        // `object_probe_lane_plan`; without it this early `Clean` return would
+        // bypass their (correctly gated) decision.
+        if !ctx.allow_unfiltered() {
+            return Ok(ProbeLanePlan::Decline);
+        }
         if ctx.overlay_free_single_graph() {
             return Ok(ProbeLanePlan::Clean);
         }
@@ -3972,6 +3981,95 @@ mod tests {
         assert_eq!(batch.len(), 1);
         // Output schema is [?v, ?x] (left vars + new right vars)
         assert_eq!(batch.schema(), &[v, x]);
+    }
+
+    /// `compute_batched_overlay_mode` must decline under a non-root view policy,
+    /// even on an overlay-free single graph where it otherwise returns `Clean`
+    /// and lets the batched lane read raw leaflets (which never run per-leaf
+    /// `filter_flakes` policy filtering). Pins the policy-before-overlay-free
+    /// ordering directly: the integration tripwire
+    /// (`policy_batched_join_lane_declines_index_only`) can't reach this line
+    /// because current routing keeps such shapes off the join's batched lane.
+    #[test]
+    fn compute_batched_overlay_mode_declines_under_nonroot_policy() {
+        use crate::context::ExecutionContext;
+        use crate::policy::QueryPolicyEnforcer;
+        use crate::var_registry::VarRegistry;
+        use fluree_db_core::LedgerSnapshot;
+        use fluree_db_policy::{PolicyContext, PolicySet, PolicyWrapper};
+        use std::collections::HashMap;
+
+        struct MockOp;
+        #[async_trait]
+        impl Operator for MockOp {
+            fn schema(&self) -> &[VarId] {
+                &[]
+            }
+            async fn open(&mut self, _: &ExecutionContext<'_>) -> Result<()> {
+                Ok(())
+            }
+            async fn next_batch(&mut self, _: &ExecutionContext<'_>) -> Result<Option<Batch>> {
+                Ok(None)
+            }
+            fn close(&mut self) {}
+        }
+
+        // Batched-eligible subject-probe shape: ?s :age ?age (shared ?s).
+        let left_schema: Arc<[VarId]> = Arc::from(vec![VarId(0)].into_boxed_slice());
+        let make_join = || {
+            NestedLoopJoinOperator::new(
+                Box::new(MockOp),
+                left_schema.clone(),
+                TriplePattern::new(
+                    Ref::Var(VarId(0)),
+                    Ref::Sid(Sid::new(100, "age")),
+                    Term::Var(VarId(1)),
+                ),
+                None,
+                Vec::new(),
+                EmitMask::ALL,
+                crate::temporal_mode::TemporalMode::Current,
+            )
+        };
+
+        let snapshot = LedgerSnapshot::genesis("test/main");
+        let vars = VarRegistry::new();
+
+        // Root / no policy on an overlay-free single graph => Clean (the batched
+        // lane is permitted), establishing that policy is what flips the verdict.
+        let join_root = make_join();
+        let ctx_root = ExecutionContext::new(&snapshot, &vars);
+        assert!(
+            matches!(
+                join_root.compute_batched_overlay_mode(&ctx_root).unwrap(),
+                ProbeLanePlan::Clean
+            ),
+            "overlay-free single graph with no policy should permit the batched Clean lane"
+        );
+
+        // Non-root view policy => Decline regardless of overlay-free state, so the
+        // join falls back to the per-row scan path that applies filter_flakes.
+        let wrapper = PolicyWrapper::new(
+            PolicySet::default(),
+            PolicySet::default(),
+            false, // root
+            false, // default_allow
+            HashMap::new(),
+        );
+        let enforcer = Arc::new(QueryPolicyEnforcer::new(Arc::new(PolicyContext::new(
+            wrapper, None,
+        ))));
+        let ctx_policy = ExecutionContext::new(&snapshot, &vars).with_policy_enforcer(enforcer);
+        let join_policy = make_join();
+        assert!(
+            matches!(
+                join_policy
+                    .compute_batched_overlay_mode(&ctx_policy)
+                    .unwrap(),
+                ProbeLanePlan::Decline
+            ),
+            "non-root view policy must decline the batched lane (force the filtered per-row fallback)"
+        );
     }
 
     #[test]

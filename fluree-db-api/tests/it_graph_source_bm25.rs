@@ -827,3 +827,99 @@ async fn bm25_federated_query_with_aggregation() {
         "expected no rust books in 2019"
     );
 }
+
+/// A non-root view policy must hide inline BM25 search hits whose indexed text
+/// the identity cannot view (indexed-flake readability). Regression for the C3
+/// leak: the inline BM25 operator emitted matched subjects with no policy
+/// filtering, so a bare search (no constraining BGP) leaked restricted docs.
+#[tokio::test]
+async fn bm25_search_enforces_view_policy_on_indexed_flake() {
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    let ledger_id = "bm25/policy:main";
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let tx = json!({
+        "@context": { "ex": "http://example.org/" },
+        "@graph": [
+            { "@id": "ex:doc1", "@type": "ex:Doc", "ex:title": "Rust programming guide", "ex:author": "Alice" },
+            { "@id": "ex:doc2", "@type": "ex:Doc", "ex:title": "Rust and WebAssembly", "ex:author": "Bob" }
+        ]
+    });
+    let _ = fluree.insert(ledger0, &tx).await.expect("insert");
+
+    let index_query = json!({
+        "@context": { "ex": "http://example.org/" },
+        "where": [{ "@id": "?x", "@type": "ex:Doc", "ex:title": "?title" }],
+        "select": { "?x": ["@id", "ex:title"] }
+    });
+    let cfg = Bm25CreateConfig::new("policy-search", ledger_id, index_query);
+    let created = fluree
+        .create_full_text_index(cfg)
+        .await
+        .expect("create index");
+
+    // Bare search for "rust" (no constraining BGP), selecting only the doc.
+    let search_where = json!([{
+        "f:graphSource": &created.graph_source_id,
+        "f:searchText": "rust",
+        "f:searchLimit": 10,
+        "f:searchResult": { "f:resultId": "?doc" }
+    }]);
+
+    // Control: no policy => both rust docs match.
+    let control = json!({
+        "@context": { "ex": "http://example.org/", "f": "https://ns.flur.ee/db#" },
+        "from": ledger_id,
+        "where": search_where.clone(),
+        "select": ["?doc"]
+    });
+    let control_res = fluree
+        .query_connection_with_bm25(&control)
+        .await
+        .expect("control query");
+    let control_total: usize = control_res
+        .batches
+        .iter()
+        .map(fluree_db_api::Batch::len)
+        .sum();
+    assert_eq!(control_total, 2, "control: both rust docs should match");
+
+    // Policy: ex:title is viewable only for Alice-authored docs (doc1). doc2's
+    // indexed title is hidden, so its search hit must be dropped.
+    let policy = json!([{
+        "@id": "ex:titlePolicy",
+        "@type": "f:AccessPolicy",
+        "f:action": "f:view",
+        "f:onProperty": [{ "@id": "http://example.org/title" }],
+        "f:query": {
+            "@type": "@json",
+            "@value": {
+                "@context": { "ex": "http://example.org/" },
+                "where": [{ "@id": "?$this", "ex:author": "Alice" }]
+            }
+        }
+    }]);
+    let policy_query = json!({
+        "@context": { "ex": "http://example.org/", "f": "https://ns.flur.ee/db#" },
+        "from": ledger_id,
+        "opts": { "policy": policy, "default-allow": false },
+        "where": search_where,
+        "select": ["?doc"]
+    });
+    let result = fluree
+        .query_connection_with_bm25(&policy_query)
+        .await
+        .expect("policy query");
+    let ledger = fluree.ledger(ledger_id).await.expect("ledger");
+    let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+
+    let rendered = jsonld.to_string();
+    assert!(
+        rendered.contains("doc1"),
+        "doc1 (viewable title) must remain in search results; got: {jsonld:#?}"
+    );
+    assert!(
+        !rendered.contains("doc2"),
+        "doc2 (hidden title) must not leak through inline BM25 search; got: {jsonld:#?}"
+    );
+}

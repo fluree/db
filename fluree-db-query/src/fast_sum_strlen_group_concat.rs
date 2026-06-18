@@ -31,8 +31,8 @@ use crate::binding::{Batch, Binding};
 use crate::error::{QueryError, Result};
 use crate::fast_count::count_distinct_subjects_for_predicate;
 use crate::fast_path_common::{
-    count_rows_for_predicate_psot, count_to_i64, fast_path_store, normalize_pred_sid,
-    FastPathOperator,
+    count_rows_for_predicate_psot, count_to_i64, cursor_fast_path_for_predicate,
+    fast_path_store_policy_cleared, normalize_pred_sid, FastPathOperator, PredicateFastPath,
 };
 use crate::fast_string_fold::sum_strlen_any_string_dict;
 use crate::ir::triple::Ref;
@@ -52,7 +52,19 @@ pub fn sum_strlen_group_concat_operator(
     FastPathOperator::new(
         out_var,
         move |ctx| {
-            let Some(store) = fast_path_store(ctx) else {
+            // O1: keep the fast path only when the scanned predicate is provably
+            // uncovered by the view policy; otherwise defer to the fallback, which
+            // computes the correct aggregate over the policy-filtered input.
+            if let Some(store) = ctx.binary_store.as_ref() {
+                let pred_sid = normalize_pred_sid(store, &predicate)?;
+                if !matches!(
+                    cursor_fast_path_for_predicate(ctx, &pred_sid),
+                    PredicateFastPath::Allow
+                ) {
+                    return Ok(None);
+                }
+            }
+            let Some(store) = fast_path_store_policy_cleared(ctx) else {
                 return Ok(None);
             };
             let outcome = sum_strlen_group_concat_fold(
