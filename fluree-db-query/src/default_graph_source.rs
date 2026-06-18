@@ -81,19 +81,24 @@ impl DefaultGraphSourceOperator {
         planning: PlanningContext,
         stats: Option<Arc<StatsView>>,
     ) -> Self {
-        let parent_schema: std::collections::HashSet<VarId> =
-            child.schema().iter().copied().collect();
+        let mut seen: std::collections::HashSet<VarId> = child.schema().iter().copied().collect();
 
-        let mut inner_vars: std::collections::HashSet<VarId> = std::collections::HashSet::new();
+        // New vars in deterministic first-occurrence order across the inner
+        // patterns. A `HashSet` here makes the output column order vary per
+        // process (HashSet iteration is seeded randomly), and the inner
+        // subplan emits batches in pattern order — the mismatch silently
+        // dropped whole result batches ~half the time. Pattern order is what
+        // the inner subplan (generic chain or the edge-annotation probe)
+        // actually produces, so the reported schema and the emitted batches
+        // agree.
+        let mut new_vars: Vec<VarId> = Vec::new();
         for p in &inner_patterns {
-            inner_vars.extend(p.produced_vars());
+            for v in p.produced_vars() {
+                if seen.insert(v) {
+                    new_vars.push(v);
+                }
+            }
         }
-
-        let new_vars: Vec<VarId> = inner_vars
-            .iter()
-            .copied()
-            .filter(|v| !parent_schema.contains(v))
-            .collect();
 
         let mut schema_vec: Vec<VarId> = child.schema().to_vec();
         schema_vec.extend(&new_vars);

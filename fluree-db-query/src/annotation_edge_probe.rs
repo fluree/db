@@ -245,17 +245,17 @@ impl AnnotationEdgeProbeOperator {
     /// semantics (an unbound edge position matches no `f:reifies*` row).
     fn edge_key_for_row(
         &self,
-        ctx: &ExecutionContext<'_>,
         batch: &Batch,
         row: usize,
+        view: Option<&fluree_db_binary_index::BinaryGraphView>,
     ) -> Result<Option<EdgeKey>> {
-        let Some(s) = self.resolve_ref(ctx, batch, row, &self.s_pos)? else {
+        let Some(s) = self.resolve_ref(batch, row, &self.s_pos, view)? else {
             return Ok(None);
         };
         // Object: ref-valued for a relationship edge. Resolve to a Sid
         // and wrap as a ref FlakeValue with the `@id` datatype, matching
         // how the arena stored the edge.
-        let Some(o) = self.resolve_ref(ctx, batch, row, &self.o_pos)? else {
+        let Some(o) = self.resolve_ref(batch, row, &self.o_pos, view)? else {
             return Ok(None);
         };
         Ok(Some(EdgeKey {
@@ -271,25 +271,37 @@ impl AnnotationEdgeProbeOperator {
 
     /// Resolve an edge position to a concrete `Sid`. Handles the two
     /// ref-valued binding representations a base-edge scan can emit:
-    /// eagerly-resolved `Sid` and late-materialized `EncodedSid`.
+    /// eagerly-resolved `Sid` and late-materialized `EncodedSid`. The
+    /// latter is decoded **directly** through the subject dictionary
+    /// (`BinaryGraphView::resolve_subject_sid`) — an IRI round-trip
+    /// (`resolve_subject_iri` + `encode_iri`) silently returns `None` for
+    /// subjects whose IRI doesn't re-encode, which would drop rows
+    /// non-deterministically (a subject may arrive eager or late depending
+    /// on scan timing). A failure here is a loud error, never a dropped row.
     fn resolve_ref(
         &self,
-        ctx: &ExecutionContext<'_>,
         batch: &Batch,
         row: usize,
         pos: &EdgePos,
+        view: Option<&fluree_db_binary_index::BinaryGraphView>,
     ) -> Result<Option<Sid>> {
         match pos {
             EdgePos::Const(sid) => Ok(Some(sid.clone())),
             EdgePos::Var(v) => match batch.get(row, *v) {
                 Some(Binding::Sid { sid, .. }) => Ok(Some(sid.clone())),
-                Some(Binding::EncodedSid { s_id, .. }) => match ctx.resolve_subject_iri(*s_id) {
-                    Some(Ok(iri)) => Ok(ctx.active_snapshot.encode_iri(&iri)),
-                    Some(Err(e)) => Err(QueryError::execution(format!(
-                        "annotation edge probe: resolve encoded subject {s_id}: {e}"
-                    ))),
-                    None => Ok(None),
-                },
+                Some(Binding::EncodedSid { s_id, .. }) => {
+                    let view = view.ok_or_else(|| {
+                        QueryError::execution(
+                            "annotation edge probe: encoded subject with no binary graph view",
+                        )
+                    })?;
+                    let sid = view.resolve_subject_sid(*s_id).map_err(|e| {
+                        QueryError::execution(format!(
+                            "annotation edge probe: resolve encoded subject {s_id}: {e}"
+                        ))
+                    })?;
+                    Ok(Some(sid))
+                }
                 Some(Binding::Unbound | Binding::Poisoned) | None => Ok(None),
                 // A non-ref binding in an edge ref position means the
                 // recognized shape's invariant was violated. Surface it
@@ -364,6 +376,9 @@ impl AnnotationEdgeProbeOperator {
         let mut saved_rows: Vec<Vec<Binding>> = Vec::new();
         let mut edges: Vec<EdgeKey> = Vec::new();
         let mut edge_of_row: Vec<Option<usize>> = Vec::new();
+        // One subject-dictionary view for the whole pass — decoding an
+        // EncodedSid edge endpoint goes straight through it.
+        let view = ctx.graph_view();
         while let Some(batch) = self.child.next_batch(ctx).await? {
             if batch.is_empty() {
                 continue;
@@ -373,7 +388,7 @@ impl AnnotationEdgeProbeOperator {
                 for var in self.child.schema() {
                     rb.push(batch.get(row, *var).cloned().unwrap_or(Binding::Unbound));
                 }
-                match self.edge_key_for_row(ctx, &batch, row)? {
+                match self.edge_key_for_row(&batch, row, view.as_ref())? {
                     Some(ek) => {
                         edge_of_row.push(Some(edges.len()));
                         edges.push(ek);
