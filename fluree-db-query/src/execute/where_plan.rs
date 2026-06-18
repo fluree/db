@@ -1006,6 +1006,7 @@ fn apply_eligible_binds(
     pending_binds: Vec<BindPattern>,
     mut pending_filters: Vec<FilterPattern>,
     filter_idxs_consumed: &[usize],
+    planning: &PlanningContext,
 ) -> (BoxedOperator, Vec<BindPattern>, Vec<FilterPattern>) {
     let mut remaining_binds = Vec::new();
 
@@ -1017,12 +1018,10 @@ fn apply_eligible_binds(
                 partition_eligible_filters(pending_filters, bound, filter_idxs_consumed);
             pending_filters = still_pending;
 
-            child = Box::new(BindOperator::new(
-                child,
-                pending.var,
-                pending.expr,
-                bind_filters,
-            ));
+            child = Box::new(
+                BindOperator::new(child, pending.var, pending.expr, bind_filters)
+                    .with_planning(*planning),
+            );
         } else {
             remaining_binds.push(pending);
         }
@@ -1049,6 +1048,7 @@ fn apply_deferred_patterns(
         pending_binds,
         pending_filters,
         filter_idxs_consumed,
+        planning,
     );
 
     let (ready, remaining_filters) =
@@ -1080,6 +1080,7 @@ fn apply_all_remaining(
         pending_binds,
         pending_filters,
         filter_idxs_consumed,
+        planning,
     );
     for pending in remaining_filters {
         if !filter_idxs_consumed.contains(&pending.original_idx) {
@@ -1108,12 +1109,9 @@ fn build_single_pattern(
     match pattern {
         Pattern::Bind { var, expr } => {
             let child = get_or_empty_seed(operator);
-            Some(Box::new(BindOperator::new(
-                child,
-                *var,
-                expr.clone(),
-                vec![],
-            )))
+            Some(Box::new(
+                BindOperator::new(child, *var, expr.clone(), vec![]).with_planning(*planning),
+            ))
         }
         Pattern::Values { vars, rows } => {
             let child = get_or_empty_seed(operator);

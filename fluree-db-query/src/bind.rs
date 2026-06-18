@@ -51,6 +51,14 @@ pub struct BindOperator {
     state: OperatorState,
     /// Variables required by downstream operators; if set, output is trimmed.
     out_schema: Option<Arc<[VarId]>>,
+    /// True when `expr` contains an `EXISTS { ... }` subexpression, which must
+    /// be resolved per-row (seeded with the row's bindings) before the value
+    /// is computed — projection/BIND counterpart to the FilterOperator path.
+    /// The common case (no EXISTS) keeps the fast synchronous eval.
+    has_exists: bool,
+    /// Temporal context for any per-row EXISTS resolution. Defaults to
+    /// current-state; EXISTS inside a BIND of a history query is out of scope.
+    planning: crate::temporal_mode::PlanningContext,
 }
 
 impl BindOperator {
@@ -92,6 +100,8 @@ impl BindOperator {
             }
         };
 
+        let has_exists = crate::filter::contains_exists(&expr);
+
         Self {
             child,
             var,
@@ -105,7 +115,16 @@ impl BindOperator {
             is_new_var,
             state: OperatorState::Created,
             out_schema: None,
+            has_exists,
+            planning: crate::temporal_mode::PlanningContext::current(),
         }
+    }
+
+    /// Set the temporal context used when resolving a per-row `EXISTS` inside
+    /// the bound expression. Only meaningful when `expr` contains EXISTS.
+    pub fn with_planning(mut self, planning: crate::temporal_mode::PlanningContext) -> Self {
+        self.planning = planning;
+        self
     }
 
     /// Trim output to only the specified downstream variables.
@@ -167,15 +186,33 @@ impl Operator for BindOperator {
 
             // Process each row
             for row_idx in 0..input_batch.len() {
+                // Resolve any EXISTS subexpression against this row first (it
+                // needs the row's bindings to correlate); otherwise evaluate
+                // the expression directly. `Cow` keeps the no-EXISTS path
+                // allocation-free.
+                let expr: std::borrow::Cow<'_, Expression> = if self.has_exists {
+                    std::borrow::Cow::Owned(
+                        crate::filter::resolve_row_exists(
+                            &self.expr,
+                            &input_batch,
+                            row_idx,
+                            ctx,
+                            &self.planning,
+                        )
+                        .await?,
+                    )
+                } else {
+                    std::borrow::Cow::Borrowed(&self.expr)
+                };
+
                 let row_view = input_batch.row_view(row_idx).unwrap();
 
                 // Evaluate expression. Non-strict mode still propagates fatal
                 // execution issues such as dictionary lookup failures.
                 let computed = if ctx.strict_bind_errors {
-                    self.expr.try_eval_to_binding(&row_view, Some(ctx))?
+                    expr.try_eval_to_binding(&row_view, Some(ctx))?
                 } else {
-                    self.expr
-                        .try_eval_to_binding_non_strict(&row_view, Some(ctx))?
+                    expr.try_eval_to_binding_non_strict(&row_view, Some(ctx))?
                 };
 
                 // Check clobber prevention if variable already exists
