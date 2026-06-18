@@ -720,7 +720,7 @@ impl LazyVectorArena {
         // Sync→async bridge via the shared `run_sync_on_runtime` helper, which
         // uses `block_in_place(handle.block_on)` on a multi-thread runtime (a
         // replacement worker keeps driving the reactor while this thread
-        // blocks) and a self-contained helper runtime on current-thread. The
+        // blocks) and a process-wide helper runtime when needed. The
         // previous `std::thread::spawn` + outer-`Handle::block_on` + `rx.recv()`
         // had no `block_in_place`, so on a small runtime every worker could park
         // in `recv()` with no thread left to drive the reactor — the same wedge
