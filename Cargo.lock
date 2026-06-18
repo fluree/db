@@ -2532,6 +2532,7 @@ name = "fluree-db-consensus"
 version = "4.0.7"
 dependencies = [
  "async-trait",
+ "dashmap",
  "fluree-db-api",
  "fluree-db-ledger",
  "fluree-db-transact",
