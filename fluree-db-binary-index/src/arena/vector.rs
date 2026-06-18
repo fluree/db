@@ -46,8 +46,32 @@ use serde::{Deserialize, Serialize};
 use std::io;
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+
+/// Write `bytes` to `path` atomically: stage in a uniquely-named temp file in
+/// the same directory, then `rename` it onto `path`. A POSIX rename is atomic,
+/// so concurrent readers never observe a partially-written file. The temp name
+/// is unique per (pid, monotonic counter) so concurrent writers of the same
+/// shard never collide on the staging file.
+fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let pid = std::process::id();
+    let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("shard");
+    let tmp = match path.parent() {
+        Some(dir) => dir.join(format!(".{file_name}.tmp.{pid}.{seq}")),
+        None => PathBuf::from(format!(".{file_name}.tmp.{pid}.{seq}")),
+    };
+    std::fs::write(&tmp, bytes)?;
+    match std::fs::rename(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
+}
 
 /// Maximum vectors per shard. At 768-dim f32 each shard ≈ 9 MB.
 pub const SHARD_CAPACITY: u32 = 3072;
@@ -737,7 +761,14 @@ impl LazyVectorArena {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(&path, &bytes)?;
+        // Publish atomically: write to a unique temp file in the same directory,
+        // then rename onto the final path. Without this, two concurrent
+        // `ensure_on_disk` calls for the same shard (e.g. a cached `lookup_vector`
+        // racing a transient streaming scan) both `fs::write` the same path, and a
+        // reader can observe a half-written file — surfacing as
+        // "vector shard too small for header". A POSIX rename is atomic, so a
+        // reader always sees a complete shard once this returns.
+        write_atomic(&path, &bytes)?;
         source.on_disk.store(true, Ordering::Release);
         Ok(())
     }
