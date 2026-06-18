@@ -44,11 +44,22 @@ use fluree_db_novelty::{
 use futures::StreamExt;
 use std::sync::Arc;
 
-/// Type-erased binary index store for query engine access.
+/// Type-erased binary index store (concrete type: `Arc<BinaryIndexStore>`).
 ///
-/// Allows `LedgerState` to carry a `BinaryIndexStore` without
-/// depending on `fluree-db-indexer`. The API layer downcasts to
-/// the concrete type when building `ContextConfig` for queries.
+/// `LedgerState` carries the store erased rather than typed because
+/// `fluree-db-ledger` **cannot** name `BinaryIndexStore` without forming a Cargo
+/// dependency cycle: `fluree-db-binary-index` embeds spatial providers (so it
+/// depends on `fluree-db-spatial`), and `fluree-db-spatial` depends back on
+/// `fluree-db-ledger` (its `embedded` feature) — a typed `ledger -> binary-index`
+/// edge would close `ledger -> binary-index -> spatial -> ledger`, which Cargo
+/// forbids. So the erasure is a layering **necessity**, not a smell. Consumers
+/// that can name the type (`fluree-db-api` / `fluree-db-transact`) downcast back
+/// to the concrete store.
+///
+/// Phase 2 (2026-06) made the query/reader path typed — `coherent_state::AttachedIndex`
+/// holds `Arc<BinaryIndexStore>` directly and the provider is rebuilt coherently
+/// in one chokepoint — so this field is now only the erased cross-crate carrier,
+/// no longer the dict_novelty coherence hazard the audit flagged.
 #[derive(Clone)]
 pub struct TypeErasedStore(pub Arc<dyn std::any::Any + Send + Sync>);
 
