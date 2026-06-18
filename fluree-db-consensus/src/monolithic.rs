@@ -12,12 +12,12 @@ use crate::{
     TransactionRequest,
 };
 use async_trait::async_trait;
+use dashmap::DashMap;
 use fluree_db_api::{
     ApiError, Base64Bytes, CommitOpts, CommitReceipt, CommitRef, Fluree, GovernanceOptions,
     IndexingStatus, LedgerHandle, LedgerManager, PolicyContext, PolicyStats, PushCommitsRequest,
     RefreshOpts, TrackingOptions, TrackingTally, TransactError, TxnOpts,
 };
-use dashmap::DashMap;
 use fluree_db_ledger::IndexConfig;
 use moka::future::Cache;
 use sha2::{Digest, Sha256};
@@ -252,8 +252,7 @@ fn weigh_policy_map(map: &HashMap<String, PolicyStats>) -> usize {
     // Hashbrown's open-addressing layout costs roughly one control byte plus
     // one `(K, V)` slot per entry; capacity (not len) is what's allocated.
     const SLOT: usize = mem::size_of::<(String, PolicyStats)>() + 1;
-    map.capacity().saturating_mul(SLOT)
-        + map.keys().map(|k| k.capacity()).sum::<usize>()
+    map.capacity().saturating_mul(SLOT) + map.keys().map(String::capacity).sum::<usize>()
 }
 
 fn weigh_submission_error(err: &SubmissionError) -> usize {
@@ -535,10 +534,8 @@ impl MonolithicCommitter {
                         error = %e,
                         "transaction commit conflict; reconciling cached state and retrying"
                     );
-                    if let Err(refresh_err) = self
-                        .fluree
-                        .refresh(ledger_id, RefreshOpts::default())
-                        .await
+                    if let Err(refresh_err) =
+                        self.fluree.refresh(ledger_id, RefreshOpts::default()).await
                     {
                         tracing::warn!(
                             attempt,
@@ -897,7 +894,14 @@ impl Committer for MonolithicCommitter {
         // entirely — no retry-collapse and no later status lookup.
         let Some(idempotency_key) = idempotency_key else {
             let (commit, tally) = self
-                .execute_transaction(&ledger_id, body, txn_opts, commit_opts, tracking, governance)
+                .execute_transaction(
+                    &ledger_id,
+                    body,
+                    txn_opts,
+                    commit_opts,
+                    tracking,
+                    governance,
+                )
                 .await?;
             return Ok(TransactionReceipt {
                 idempotency_key: None,
@@ -972,13 +976,10 @@ impl Committer for MonolithicCommitter {
             };
         }
 
-        let outcome = self
-            .execute_revert(request)
-            .await
-            .map(|mut r| {
-                r.idempotency_key = Some(cache_key.1.clone());
-                r
-            });
+        let outcome = self.execute_revert(request).await.map(|mut r| {
+            r.idempotency_key = Some(cache_key.1.clone());
+            r
+        });
         self.record_outcome(cache_key, body_hash, &outcome, OperationReceipt::Revert)
             .await;
         outcome
@@ -1006,13 +1007,10 @@ impl Committer for MonolithicCommitter {
             };
         }
 
-        let outcome = self
-            .execute_merge(request)
-            .await
-            .map(|mut r| {
-                r.idempotency_key = Some(cache_key.1.clone());
-                r
-            });
+        let outcome = self.execute_merge(request).await.map(|mut r| {
+            r.idempotency_key = Some(cache_key.1.clone());
+            r
+        });
         self.record_outcome(cache_key, body_hash, &outcome, OperationReceipt::Merge)
             .await;
         outcome
@@ -1921,7 +1919,10 @@ ex:alice ex:name "Alice" ."#;
             .transact(request(&ledger_id, Some(key), sample_insert("octavia")))
             .await
             .expect("keyed submission to succeed under custom budget");
-        assert_eq!(receipt.idempotency_key.as_ref().map(IdempotencyKey::as_str), Some(key));
+        assert_eq!(
+            receipt.idempotency_key.as_ref().map(IdempotencyKey::as_str),
+            Some(key)
+        );
 
         let key = IdempotencyKey::new(key).expect("test key fits cap");
         match consensus.status(&ledger_id, &key).await {

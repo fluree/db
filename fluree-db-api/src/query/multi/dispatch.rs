@@ -759,10 +759,8 @@ async fn execute_subquery(
             // the caller (HTTP handler) resolved through its impersonation gate
             // — this layer stays authn/authz-agnostic, mirroring JSON-LD.
             let policy_opts = match &merged_opts_val {
-                Some(opts) => {
-                    GovernanceOptions::from_json(&serde_json::json!({ "opts": opts }))
-                        .map_err(|e| ApiError::query(format!("invalid sub-query opts: {e}")))?
-                }
+                Some(opts) => GovernanceOptions::from_json(&serde_json::json!({ "opts": opts }))
+                    .map_err(|e| ApiError::query(format!("invalid sub-query opts: {e}")))?,
                 None => GovernanceOptions::default(),
             };
             run_sparql_subquery(

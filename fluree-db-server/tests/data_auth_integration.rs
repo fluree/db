@@ -229,7 +229,9 @@ async fn submission_status_rejects_oversize_key_as_bad_request() {
         .oneshot(
             Request::builder()
                 .method("GET")
-                .uri(format!("/v1/fluree/submissions/{oversize_key}/sub-cap:test"))
+                .uri(format!(
+                    "/v1/fluree/submissions/{oversize_key}/sub-cap:test"
+                ))
                 .header("authorization", format!("Bearer {token}"))
                 .body(Body::empty())
                 .unwrap(),
@@ -356,7 +358,10 @@ async fn submission_status_in_scope_returns_unknown_for_missing_key() {
         .unwrap();
     let (status, json) = json_body(resp).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(json.get("state").and_then(JsonValue::as_str), Some("unknown"));
+    assert_eq!(
+        json.get("state").and_then(JsonValue::as_str),
+        Some("unknown")
+    );
 }
 
 #[tokio::test]
