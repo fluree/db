@@ -28,6 +28,17 @@ pub fn lower_expr<E: IriEncoder>(
             "parameter substitution is wired at the API layer, not the lowering layer; submit pre-substituted Cypher in v1",
         )),
         Expr::Prop(target, key, _) => {
+            // Temporal accessor (`<date>.month`, `<datetime>.year`, …): when
+            // the target is a *value* expression — e.g. another property
+            // access `friend.birthday` — rather than a bare node variable,
+            // lower to the matching extraction function. `n.month` where `n`
+            // is a node stays an ordinary property accessor.
+            if !matches!(target.as_ref(), Expr::Var(_)) {
+                if let Some(func) = temporal_field_function(key) {
+                    let inner = lower_expr(ctx, target, aux)?;
+                    return Ok(Expression::call(func, vec![inner]));
+                }
+            }
             let prop_var = resolve_property_accessor(ctx, target, key, aux)?;
             Ok(Expression::Var(prop_var))
         }
@@ -172,6 +183,20 @@ pub fn lower_expr<E: IriEncoder>(
             };
             Ok(Expression::call(func, args))
         }
+    }
+}
+
+/// Map a temporal-component accessor name to its extraction function.
+/// `<date>.month` / `<datetime>.year` etc. mirror SPARQL's YEAR/MONTH/DAY.
+fn temporal_field_function(key: &str) -> Option<Function> {
+    match key.to_ascii_lowercase().as_str() {
+        "year" => Some(Function::Year),
+        "month" => Some(Function::Month),
+        "day" => Some(Function::Day),
+        "hour" => Some(Function::Hours),
+        "minute" => Some(Function::Minutes),
+        "second" => Some(Function::Seconds),
+        _ => None,
     }
 }
 
