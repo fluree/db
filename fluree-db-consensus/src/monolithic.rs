@@ -13,8 +13,9 @@ use crate::{
 };
 use async_trait::async_trait;
 use fluree_db_api::{
-    ApiError, Base64Bytes, CommitRef, Fluree, GovernanceOptions, LedgerHandle, LedgerManager,
-    PolicyContext, PolicyStats, PushCommitsRequest, RefreshOpts, TrackingTally, TransactError,
+    ApiError, Base64Bytes, CommitOpts, CommitReceipt, CommitRef, Fluree, GovernanceOptions,
+    IndexingStatus, LedgerHandle, LedgerManager, PolicyContext, PolicyStats, PushCommitsRequest,
+    RefreshOpts, TrackingOptions, TrackingTally, TransactError, TxnOpts,
 };
 use fluree_db_ledger::IndexConfig;
 use moka::future::Cache;
@@ -136,6 +137,29 @@ type SubmissionCacheKey = (String, IdempotencyKey);
 struct CachedSubmission {
     state: SubmissionState,
     body_hash: [u8; 32],
+}
+
+/// Bare per-push outcome returned by [`MonolithicCommitter::execute_push`] —
+/// the umbrella [`PushReceipt`] is assembled by the caller, who supplies the
+/// idempotency key to echo. Splitting the construction lets `execute_push`
+/// borrow `ledger_id` while the caller retains ownership for cache keying.
+struct PushOutcome {
+    ledger: String,
+    accepted: usize,
+    head_t: i64,
+    head_id: CommitId,
+    indexing: IndexingStatus,
+}
+
+fn push_receipt(idempotency_key: Option<IdempotencyKey>, outcome: PushOutcome) -> PushReceipt {
+    PushReceipt {
+        idempotency_key,
+        ledger: outcome.ledger,
+        accepted: outcome.accepted,
+        head_t: outcome.head_t,
+        head_id: outcome.head_id,
+        indexing: outcome.indexing,
+    }
 }
 
 /// Estimated bytes a cache entry holds, used by moka as the weight for
@@ -358,23 +382,22 @@ impl MonolithicCommitter {
             })
     }
 
+    /// Execute the stage + commit pipeline, returning the bare commit and
+    /// tally — the caller assembles the [`TransactionReceipt`] with whatever
+    /// idempotency key it needs to echo. Borrowing `ledger_id` here lets the
+    /// caller keep ownership for cache key insertion.
     async fn execute_transaction(
         &self,
-        request: TransactionRequest,
-    ) -> Result<TransactionReceipt, SubmissionError> {
-        let TransactionRequest {
-            idempotency_key,
-            ledger_id,
-            body,
-            txn_opts,
-            commit_opts,
-            tracking,
-            governance,
-        } = request;
-
+        ledger_id: &str,
+        body: TransactionBody,
+        txn_opts: TxnOpts,
+        commit_opts: CommitOpts,
+        tracking: Option<TrackingOptions>,
+        governance: GovernanceOptions,
+    ) -> Result<(CommitReceipt, Option<TrackingTally>), SubmissionError> {
         let ledger_handle = self
             .ledger_manager()?
-            .get_or_load(&ledger_id)
+            .get_or_load(ledger_id)
             .await
             .map_err(execution_failure)?;
 
@@ -424,13 +447,7 @@ impl MonolithicCommitter {
             }
 
             match builder.execute().await {
-                Ok(result) => {
-                    return Ok(TransactionReceipt {
-                        idempotency_key,
-                        commit: result.receipt,
-                        tally: result.tally,
-                    });
-                }
+                Ok(result) => return Ok((result.receipt, result.tally)),
                 Err(e) if attempt < MAX_TXN_RETRIES && is_retryable_txn_conflict(&e) => {
                     tracing::warn!(
                         attempt,
@@ -440,7 +457,7 @@ impl MonolithicCommitter {
                     );
                     if let Err(refresh_err) = self
                         .fluree
-                        .refresh(&ledger_id, RefreshOpts::default())
+                        .refresh(ledger_id, RefreshOpts::default())
                         .await
                     {
                         tracing::warn!(
@@ -470,7 +487,7 @@ impl MonolithicCommitter {
     /// when another caller's execution is still running.
     async fn try_claim_slot(
         &self,
-        cache_key: SubmissionCacheKey,
+        cache_key: &SubmissionCacheKey,
         body_hash: [u8; 32],
     ) -> Result<Option<OperationReceipt>, SubmissionError> {
         // `or_insert_with_if` writes a fresh `InFlight` marker when the key
@@ -478,9 +495,13 @@ impl MonolithicCommitter {
         // failures are re-attemptable. Concurrent submissions for the same
         // key see `is_fresh() == false` and collapse onto the existing
         // submission; only the caller that wins the claim goes on to execute.
+        //
+        // `entry_by_ref` borrows the key on the hot path and only clones it
+        // (via `ToOwned`) when an insert actually happens, so the steady-state
+        // claim-collapse case takes no allocations.
         let claim = self
             .cache
-            .entry(cache_key)
+            .entry_by_ref(cache_key)
             .or_insert_with_if(
                 std::future::ready(CachedSubmission {
                     state: SubmissionState::InFlight,
@@ -718,15 +739,17 @@ impl MonolithicCommitter {
         hasher.finalize().into()
     }
 
-    async fn execute_push(&self, request: PushRequest) -> Result<PushReceipt, SubmissionError> {
-        let PushRequest {
-            idempotency_key,
-            ledger_id,
-            commits,
-            blobs,
-            governance,
-        } = request;
-
+    /// Push the supplied commit blobs and return the bare per-push outcome —
+    /// the caller assembles the [`PushReceipt`] with whatever idempotency key
+    /// it needs to echo. Borrowing `ledger_id` here lets the caller keep
+    /// ownership for cache key insertion.
+    async fn execute_push(
+        &self,
+        ledger_id: &str,
+        commits: Vec<Vec<u8>>,
+        blobs: HashMap<String, Vec<u8>>,
+        governance: GovernanceOptions,
+    ) -> Result<PushOutcome, SubmissionError> {
         let payload = PushCommitsRequest {
             commits: commits.into_iter().map(Base64Bytes).collect(),
             blobs: blobs
@@ -737,12 +760,11 @@ impl MonolithicCommitter {
 
         let response = self
             .fluree
-            .push_commits(&ledger_id, payload, &governance, &self.index_config)
+            .push_commits(ledger_id, payload, &governance, &self.index_config)
             .await
             .map_err(execution_failure)?;
 
-        Ok(PushReceipt {
-            idempotency_key,
+        Ok(PushOutcome {
             ledger: response.ledger,
             accepted: response.accepted,
             head_t: response.head.t,
@@ -778,23 +800,60 @@ impl Committer for MonolithicCommitter {
     ) -> Result<TransactionReceipt, SubmissionError> {
         let _permit = self.try_admit()?;
 
+        // `hash_request_body` borrows the body, so compute the digest before
+        // we destructure and move the body into the execution pipeline.
+        let body_hash = Self::hash_request_body(&request);
+        let TransactionRequest {
+            idempotency_key,
+            ledger_id,
+            body,
+            txn_opts,
+            commit_opts,
+            tracking,
+            governance,
+        } = request;
+
         // Anonymous submissions (no idempotency key) skip the cache
         // entirely — no retry-collapse and no later status lookup.
-        let Some(idempotency_key) = request.idempotency_key.clone() else {
-            return self.execute_transaction(request).await;
+        let Some(idempotency_key) = idempotency_key else {
+            let (commit, tally) = self
+                .execute_transaction(&ledger_id, body, txn_opts, commit_opts, tracking, governance)
+                .await?;
+            return Ok(TransactionReceipt {
+                idempotency_key: None,
+                commit,
+                tally,
+            });
         };
 
-        let cache_key = (request.ledger_id.clone(), idempotency_key);
-        let body_hash = Self::hash_request_body(&request);
+        // Move `ledger_id` and the key into the cache key — no `String`
+        // clones on the hot path. `cache_key.0` is then the only owned
+        // ledger_id, borrowed into `execute_transaction` and consumed by
+        // `record_outcome`.
+        let cache_key = (ledger_id, idempotency_key);
 
-        if let Some(receipt) = self.try_claim_slot(cache_key.clone(), body_hash).await? {
+        if let Some(receipt) = self.try_claim_slot(&cache_key, body_hash).await? {
             return match receipt {
                 OperationReceipt::Transaction(r) => Ok(r),
                 _ => Err(SubmissionError::KeyCollision),
             };
         }
 
-        let outcome = self.execute_transaction(request).await;
+        let outcome = self
+            .execute_transaction(
+                &cache_key.0,
+                body,
+                txn_opts,
+                commit_opts,
+                tracking,
+                governance,
+            )
+            .await
+            .map(|(commit, tally)| TransactionReceipt {
+                idempotency_key: Some(cache_key.1.clone()),
+                commit,
+                tally,
+            });
         self.record_outcome(
             cache_key,
             body_hash,
@@ -805,10 +864,16 @@ impl Committer for MonolithicCommitter {
         outcome
     }
 
-    async fn revert(&self, request: RevertRequest) -> Result<RevertReceipt, SubmissionError> {
+    async fn revert(&self, mut request: RevertRequest) -> Result<RevertReceipt, SubmissionError> {
         let _permit = self.try_admit()?;
 
-        let Some(idempotency_key) = request.idempotency_key.clone() else {
+        // `take()` moves the key out without allocating — `execute_revert`
+        // sees `None` and returns a receipt with `idempotency_key: None`,
+        // which is filled in below when the cache miss path produces a
+        // fresh outcome. Cache-hit / collision paths short-circuit before
+        // the fill, so the allocation only happens when we actually return
+        // a freshly-computed receipt.
+        let Some(idempotency_key) = request.idempotency_key.take() else {
             return self.execute_revert(request).await;
         };
 
@@ -818,23 +883,29 @@ impl Committer for MonolithicCommitter {
         let cache_key = (ledger_id, idempotency_key);
         let body_hash = Self::hash_revert_body(&request);
 
-        if let Some(receipt) = self.try_claim_slot(cache_key.clone(), body_hash).await? {
+        if let Some(receipt) = self.try_claim_slot(&cache_key, body_hash).await? {
             return match receipt {
                 OperationReceipt::Revert(r) => Ok(r),
                 _ => Err(SubmissionError::KeyCollision),
             };
         }
 
-        let outcome = self.execute_revert(request).await;
+        let outcome = self
+            .execute_revert(request)
+            .await
+            .map(|mut r| {
+                r.idempotency_key = Some(cache_key.1.clone());
+                r
+            });
         self.record_outcome(cache_key, body_hash, &outcome, OperationReceipt::Revert)
             .await;
         outcome
     }
 
-    async fn merge(&self, request: MergeRequest) -> Result<MergeReceipt, SubmissionError> {
+    async fn merge(&self, mut request: MergeRequest) -> Result<MergeReceipt, SubmissionError> {
         let _permit = self.try_admit()?;
 
-        let Some(idempotency_key) = request.idempotency_key.clone() else {
+        let Some(idempotency_key) = request.idempotency_key.take() else {
             return self.execute_merge(request).await;
         };
 
@@ -846,23 +917,29 @@ impl Committer for MonolithicCommitter {
         let cache_key = (ledger_id, idempotency_key);
         let body_hash = Self::hash_merge_body(&request);
 
-        if let Some(receipt) = self.try_claim_slot(cache_key.clone(), body_hash).await? {
+        if let Some(receipt) = self.try_claim_slot(&cache_key, body_hash).await? {
             return match receipt {
                 OperationReceipt::Merge(r) => Ok(r),
                 _ => Err(SubmissionError::KeyCollision),
             };
         }
 
-        let outcome = self.execute_merge(request).await;
+        let outcome = self
+            .execute_merge(request)
+            .await
+            .map(|mut r| {
+                r.idempotency_key = Some(cache_key.1.clone());
+                r
+            });
         self.record_outcome(cache_key, body_hash, &outcome, OperationReceipt::Merge)
             .await;
         outcome
     }
 
-    async fn rebase(&self, request: RebaseRequest) -> Result<RebaseReceipt, SubmissionError> {
+    async fn rebase(&self, mut request: RebaseRequest) -> Result<RebaseReceipt, SubmissionError> {
         let _permit = self.try_admit()?;
 
-        let Some(idempotency_key) = request.idempotency_key.clone() else {
+        let Some(idempotency_key) = request.idempotency_key.take() else {
             return self.execute_rebase(request).await;
         };
 
@@ -873,14 +950,17 @@ impl Committer for MonolithicCommitter {
         let cache_key = (ledger_id, idempotency_key);
         let body_hash = Self::hash_rebase_body(&request);
 
-        if let Some(receipt) = self.try_claim_slot(cache_key.clone(), body_hash).await? {
+        if let Some(receipt) = self.try_claim_slot(&cache_key, body_hash).await? {
             return match receipt {
                 OperationReceipt::Rebase(r) => Ok(r),
                 _ => Err(SubmissionError::KeyCollision),
             };
         }
 
-        let outcome = self.execute_rebase(request).await;
+        let outcome = self.execute_rebase(request).await.map(|mut r| {
+            r.idempotency_key = Some(cache_key.1.clone());
+            r
+        });
         self.record_outcome(cache_key, body_hash, &outcome, OperationReceipt::Rebase)
             .await;
         outcome
@@ -889,23 +969,41 @@ impl Committer for MonolithicCommitter {
     async fn push(&self, request: PushRequest) -> Result<PushReceipt, SubmissionError> {
         let _permit = self.try_admit()?;
 
-        let Some(idempotency_key) = request.idempotency_key.clone() else {
-            return self.execute_push(request).await;
+        // `hash_push_body` borrows the request, so compute the digest before
+        // we destructure and move the commits/blobs into the execution
+        // pipeline.
+        let body_hash = Self::hash_push_body(&request);
+        let PushRequest {
+            idempotency_key,
+            ledger_id,
+            commits,
+            blobs,
+            governance,
+        } = request;
+
+        let Some(idempotency_key) = idempotency_key else {
+            let outcome = self
+                .execute_push(&ledger_id, commits, blobs, governance)
+                .await?;
+            return Ok(push_receipt(None, outcome));
         };
 
         // Push targets a fully-qualified `ledger:branch` directly, so the
-        // cache key matches `transact` namespacing.
-        let cache_key = (request.ledger_id.clone(), idempotency_key);
-        let body_hash = Self::hash_push_body(&request);
+        // cache key matches `transact` namespacing. Move both halves in to
+        // avoid the per-submission `ledger_id` clone.
+        let cache_key = (ledger_id, idempotency_key);
 
-        if let Some(receipt) = self.try_claim_slot(cache_key.clone(), body_hash).await? {
+        if let Some(receipt) = self.try_claim_slot(&cache_key, body_hash).await? {
             return match receipt {
                 OperationReceipt::Push(r) => Ok(r),
                 _ => Err(SubmissionError::KeyCollision),
             };
         }
 
-        let outcome = self.execute_push(request).await;
+        let outcome = self
+            .execute_push(&cache_key.0, commits, blobs, governance)
+            .await
+            .map(|outcome| push_receipt(Some(cache_key.1.clone()), outcome));
         self.record_outcome(cache_key, body_hash, &outcome, OperationReceipt::Push)
             .await;
         outcome
