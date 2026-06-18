@@ -89,16 +89,20 @@ fn confirm_large_transfer(estimated_bytes: u64) -> bool {
     trimmed.is_empty() || trimmed == "y" || trimmed == "yes"
 }
 
-fn map_sync_auth_error(remote: &str, err: &str) -> Option<CliError> {
-    // `fluree-db-nameservice-sync` reports remote failures as strings; match the common
-    // permission-related server errors and provide a clearer CLI message.
-    if err.contains("401")
+/// Whether a remote error string indicates an auth/permission failure
+/// (expired or insufficient token). `fluree-db-nameservice-sync` reports
+/// remote failures as strings, so we match on the common server messages.
+fn is_replication_auth_error(err: &str) -> bool {
+    err.contains("401")
         || err.contains("403")
         || err.contains("Bearer token required")
         || err.contains("Untrusted issuer")
         || err.contains("Token lacks storage proxy permissions")
         || err.contains("Storage proxy not enabled")
-    {
+}
+
+fn map_sync_auth_error(remote: &str, err: &str) -> Option<CliError> {
+    if is_replication_auth_error(err) {
         Some(replication_permission_error(remote))
     } else {
         None
@@ -472,6 +476,15 @@ pub async fn run_pull(ledger: Option<&str>, no_indexes: bool, dirs: &FlureeDir) 
                                         return Ok(());
                                     }
                                     Err(e) => {
+                                        let msg = e.to_string();
+                                        if is_replication_auth_error(&msg) {
+                                            // Token expired mid-transfer: falling back to a
+                                            // paginated export would just 401 again. Fail fast
+                                            // with the re-login guidance.
+                                            return Err(replication_permission_error(
+                                                upstream.remote.as_str(),
+                                            ));
+                                        }
                                         eprintln!(
                                             "  {} pack import failed: {e}, falling back to paginated export",
                                             "warning:".yellow().bold()
@@ -1176,6 +1189,13 @@ pub async fn run_clone(
                                         eprint!("  fetched {objects} object(s) via pack\r");
                                     }
                                     Err(e) => {
+                                        let msg = e.to_string();
+                                        if is_replication_auth_error(&msg) {
+                                            // Token expired mid-transfer: falling back to a
+                                            // paginated export would just 401 again. Fail fast
+                                            // with the re-login guidance.
+                                            return Err(replication_permission_error(remote_name));
+                                        }
                                         eprintln!(
                                             "  {} pack import failed: {e}, falling back to paginated export",
                                             "warning:".yellow().bold()

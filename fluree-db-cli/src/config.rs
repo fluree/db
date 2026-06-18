@@ -11,6 +11,52 @@ const PREFIXES_FILE: &str = "prefixes.json";
 /// within the CLI codebase.
 pub type ConfigFileFormat = ConfigFormat;
 
+/// Restrict a file to owner read/write only (`0o600`) on Unix.
+///
+/// The config file can hold OIDC bearer and refresh tokens, so it must not
+/// be group/world-readable. `fs::write` honors the process umask (typically
+/// `0o644`), so we tighten permissions explicitly after writing. No-op on
+/// non-Unix platforms, where filesystem ACLs are managed differently.
+fn restrict_file_to_owner(path: &Path) -> CliResult<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).map_err(|e| {
+            CliError::Config(format!(
+                "failed to restrict permissions on {}: {e}",
+                path.display()
+            ))
+        })?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+    Ok(())
+}
+
+/// Restrict a directory to owner access only (`0o700`) on Unix.
+///
+/// Protects token-bearing config files even during the brief window between
+/// creation and [`restrict_file_to_owner`]. No-op on non-Unix platforms.
+fn restrict_dir_to_owner(path: &Path) -> CliResult<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(|e| {
+            CliError::Config(format!(
+                "failed to restrict permissions on {}: {e}",
+                path.display()
+            ))
+        })?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+    Ok(())
+}
+
 /// Detect which config file exists in a `.fluree/` directory.
 ///
 /// Checks for `config.toml` first, then `config.jsonld`. If both exist,
@@ -171,6 +217,8 @@ pub fn init_fluree_dir(
             dirs.config_dir().display()
         ))
     })?;
+    // The config file may later hold auth tokens; keep the directory owner-only.
+    restrict_dir_to_owner(dirs.config_dir())?;
 
     // Write config template if config file doesn't already exist
     let config_path = dirs.config_dir().join(config_filename);
@@ -178,6 +226,7 @@ pub fn init_fluree_dir(
         fs::write(&config_path, config_template).map_err(|e| {
             CliError::Config(format!("failed to create {}: {e}", config_path.display()))
         })?;
+        restrict_file_to_owner(&config_path)?;
     }
 
     Ok(())
@@ -536,7 +585,9 @@ impl TomlSyncConfigStore {
         let pretty =
             serde_json::to_string_pretty(&doc).map_err(|e| CliError::Config(e.to_string()))?;
         fs::write(path, pretty)
-            .map_err(|e| CliError::Config(format!("failed to write config: {e}")))
+            .map_err(|e| CliError::Config(format!("failed to write config: {e}")))?;
+        // May contain auth tokens; restrict to owner read/write.
+        restrict_file_to_owner(path)
     }
 
     /// Write sync config to a TOML file using toml_edit to preserve other keys.
@@ -681,7 +732,9 @@ impl TomlSyncConfigStore {
         }
 
         fs::write(path, doc.to_string())
-            .map_err(|e| CliError::Config(format!("failed to write config: {e}")))
+            .map_err(|e| CliError::Config(format!("failed to write config: {e}")))?;
+        // May contain auth tokens; restrict to owner read/write.
+        restrict_file_to_owner(path)
     }
 }
 
@@ -951,5 +1004,29 @@ mod tests {
         let dirs = FlureeDir::unified(fluree_dir.clone());
         let result = resolve_storage_path(&dirs);
         assert_eq!(result, fluree_dir.join("storage"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn init_fluree_dir_restricts_token_file_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = FlureeDir::unified(tmp.path().join(".fluree"));
+        init_fluree_dir(&dirs, "# config\n", CONFIG_FILE_TOML).unwrap();
+
+        let dir_mode = fs::metadata(dirs.config_dir())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(dir_mode, 0o700, "config dir should be owner-only");
+
+        let config_path = dirs.config_dir().join(CONFIG_FILE_TOML);
+        let file_mode = fs::metadata(&config_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            file_mode, 0o600,
+            "config file should be owner read/write only"
+        );
     }
 }
