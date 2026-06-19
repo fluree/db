@@ -102,6 +102,33 @@ async fn list_accessor_functions() {
     );
 }
 
+/// A list bound by `bind` survives across later binds that read it (the
+/// cookbook "working with list values" chain).
+#[tokio::test]
+async fn list_value_survives_across_binds() {
+    let fluree = fluree_db_api::FlureeBuilder::memory().build_memory();
+    let ledger = seed(&fluree, "it/listfns:chain").await;
+    let db = graphdb_from_ledger(&ledger);
+    let q = json!({
+        "@context": ctx(),
+        "select": ["?count", "?first", "?last"],
+        "where": [
+            ["bind", "?nums", "(range 1 100)"],
+            ["bind", "?count", "(size ?nums)"],
+            ["bind", "?first", "(head ?nums)"],
+            ["bind", "?last", "(nth ?nums -1)"]
+        ]
+    });
+    let result = fluree.query(&db, &q).await.expect("chain query");
+    let rows = result
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("rows");
+    let row = rows.as_array().expect("array")[0].as_array().expect("row");
+    let cols: Vec<i64> = row.iter().map(|c| c.as_i64().expect("i64")).collect();
+    assert_eq!(cols, vec![100, 1, 100]);
+}
+
 /// `nth` with an out-of-range index yields unbound (the row is dropped from a
 /// projection of just that variable).
 #[tokio::test]

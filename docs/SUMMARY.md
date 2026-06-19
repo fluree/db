@@ -63,6 +63,7 @@
   - [Reasoning and inference](concepts/reasoning.md)
 
 - [Guides (cookbooks)](guides/README.md)
+  - [Query patterns](guides/cookbook-query-patterns.md)
   - [Full-text and vector search](guides/cookbook-search.md)
   - [Time travel patterns](guides/cookbook-time-travel.md)
   - [Branching and merging](guides/cookbook-branching.md)
