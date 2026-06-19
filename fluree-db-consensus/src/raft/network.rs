@@ -305,18 +305,20 @@ where
 ///     .nest("/raft", fluree_db_consensus::raft::network::router(raft));
 /// ```
 pub fn router(raft: Arc<Raft<TypeConfig>>) -> Router {
+    // Axum's default body limit is 2 MiB — fine for `vote` (a few
+    // hundred bytes) but well below realistic catch-up traffic on
+    // `append-entries` (a batch of log entries replicating to a
+    // lagging follower) and `install-snapshot` (a full state-machine
+    // image). Disable at the router so all three RPC bodies are
+    // bounded by the per-call timeouts in `NetworkConfig` instead of
+    // a static byte cap. The Raft network listens on a private port
+    // we already trust to the same extent as the data we replicate
+    // through it.
     Router::new()
         .route(PATH_APPEND_ENTRIES, post(handle_append_entries))
         .route(PATH_VOTE, post(handle_vote))
-        .route(
-            PATH_INSTALL_SNAPSHOT,
-            // Axum's default body limit is 2 MiB — well below a
-            // realistic state-machine snapshot. The Raft network
-            // listens on a private port we trust, so disable the
-            // cap entirely and let the per-call snapshot timeout
-            // (in `NetworkConfig`) bound the transfer instead.
-            post(handle_install_snapshot).layer(DefaultBodyLimit::disable()),
-        )
+        .route(PATH_INSTALL_SNAPSHOT, post(handle_install_snapshot))
+        .layer(DefaultBodyLimit::disable())
         .with_state(raft)
 }
 
