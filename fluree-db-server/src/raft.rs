@@ -323,21 +323,67 @@ impl LeaderTracker {
     }
 }
 
+/// Handle returned by [`spawn_leader_watcher`]. Holds the watcher's
+/// `JoinHandle` plus a `CancellationToken` the caller uses to signal
+/// shutdown. Callers should use [`Self::shutdown`] (graceful) on the
+/// normal server-shutdown path so the watcher reaches its leader-
+/// task cleanup; [`Self::abort`] is a defensive last resort that
+/// drops the watcher mid-await and leaks any still-running leader
+/// tasks.
+pub struct LeaderWatcherHandle {
+    join: JoinHandle<()>,
+    cancel: tokio_util::sync::CancellationToken,
+}
+
+impl LeaderWatcherHandle {
+    /// Cooperatively shut the watcher down. Cancels the watcher's
+    /// internal token so its `select!` loop exits naturally, runs the
+    /// trailing `abort_and_await` over any in-flight leader tasks,
+    /// and awaits the watcher's own `JoinHandle` so the function
+    /// returns only after every leader task this node spawned has
+    /// stopped.
+    ///
+    /// This is the path the server's shutdown sequence uses. Without
+    /// it (e.g. `JoinHandle::abort` straight on the watcher) the
+    /// watcher's Future is dropped mid-await and its cleanup code
+    /// never runs — leader tasks keep ticking on a runtime that's
+    /// about to disappear.
+    pub async fn shutdown(self) {
+        self.cancel.cancel();
+        // The watcher catches the cancel, drains its leader tasks,
+        // and returns. `JoinError` here would mean the watcher
+        // panicked — log via `_` since shutdown has no caller to
+        // surface it to.
+        let _ = self.join.await;
+    }
+
+    /// Hard abort: signal cancellation *and* abort the watcher's
+    /// JoinHandle without awaiting. Test-only escape hatch — leaves
+    /// the cleanup invariants to whoever's tearing the runtime down.
+    #[cfg(test)]
+    pub fn abort(self) {
+        self.cancel.cancel();
+        self.join.abort();
+    }
+}
+
 /// Spawn a background task that watches `raft.metrics()` and drives
 /// the lifecycle of every leader-only task: spawn them when this
-/// node becomes leader, abort them when it loses the lead.
+/// node becomes leader, abort *and await* them when it loses the
+/// lead, so a fast leader flap doesn't double-spawn before the
+/// previous tasks reach a yield point.
 ///
 /// `spawn_leader_tasks` is invoked each time leadership is gained
 /// and must return the `JoinHandle`s of the freshly-spawned tasks —
-/// the driver owns the handles and aborts every one on leadership
-/// loss. Callers bundle as many tasks as belong to the leader
-/// (indexer, commit-queue worker, periodic idempotency evictor, …)
-/// into the returned `Vec`.
+/// the driver owns the handles and tears every one down on
+/// leadership loss. Callers bundle as many tasks as belong to the
+/// leader (indexer, commit-queue worker, periodic idempotency
+/// evictor, …) into the returned `Vec`.
 ///
-/// The returned `JoinHandle` is the watcher itself; aborting it
-/// drops the metrics receiver and also aborts any currently-running
-/// leader tasks. Shutdown of the server should abort this handle
-/// alongside its other maintenance tasks.
+/// The returned [`LeaderWatcherHandle`] is the watcher itself.
+/// Shutdown should call [`LeaderWatcherHandle::shutdown`] — cancels
+/// the token, lets the watcher reach its cleanup code, and awaits
+/// completion.
 ///
 /// `tokio::sync::watch` is a "latest value" channel, so transient
 /// flips that don't cross the leader/not-leader boundary from this
@@ -349,11 +395,13 @@ pub fn spawn_leader_watcher<F>(
     raft: Arc<Raft<TypeConfig>>,
     self_id: NodeId,
     spawn_leader_tasks: F,
-) -> JoinHandle<()>
+) -> LeaderWatcherHandle
 where
     F: Fn() -> Vec<JoinHandle<()>> + Send + 'static,
 {
-    tokio::spawn(async move {
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let cancel_inner = cancel.clone();
+    let join = tokio::spawn(async move {
         let mut metrics = raft.metrics();
         let mut tracker = LeaderTracker::default();
         let mut current_tasks: Vec<JoinHandle<()>> = Vec::new();
@@ -365,24 +413,48 @@ where
                     current_tasks = spawn_leader_tasks();
                 }
                 LeadershipTransition::Abort => {
-                    abort_all(&mut current_tasks);
+                    // Await the abort so the next Spawn (a rapid
+                    // leader flap) can't race with still-running
+                    // tasks from the previous reign.
+                    abort_and_await(std::mem::take(&mut current_tasks)).await;
                 }
                 LeadershipTransition::None => {}
             }
-            if metrics.changed().await.is_err() {
-                // Raft handle was dropped — nothing more to observe.
-                break;
+            tokio::select! {
+                changed = metrics.changed() => {
+                    if changed.is_err() {
+                        // Raft handle was dropped — nothing more to observe.
+                        break;
+                    }
+                }
+                () = cancel_inner.cancelled() => {
+                    break;
+                }
             }
         }
 
         // Watcher shutdown: tear down any in-flight leader tasks.
-        abort_all(&mut current_tasks);
-    })
+        // Awaiting here is what guarantees `shutdown()` returns only
+        // after every leader task has actually stopped.
+        abort_and_await(std::mem::take(&mut current_tasks)).await;
+    });
+    LeaderWatcherHandle { join, cancel }
 }
 
-fn abort_all(handles: &mut Vec<JoinHandle<()>>) {
-    for handle in handles.drain(..) {
+/// Abort every handle and wait for the joins to resolve. `abort` is
+/// best-effort — the task only stops at the next `.await` point —
+/// and the `await` after it is what gives the caller a "they've all
+/// actually stopped" guarantee, which the leader-flap path needs to
+/// avoid double-spawn.
+async fn abort_and_await(handles: Vec<JoinHandle<()>>) {
+    for handle in &handles {
         handle.abort();
+    }
+    for handle in handles {
+        // `JoinError::Cancelled` is the expected outcome after `abort`;
+        // a panicked task surfaces here too — log via `_` because the
+        // caller (watcher loop) has no useful action beyond moving on.
+        let _ = handle.await;
     }
 }
 
@@ -537,6 +609,76 @@ mod tests {
         // current leader task (no leak), and Raft can shut down
         // cleanly.
         watcher.abort();
+        let _ = integration.raft.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn watcher_shutdown_waits_for_leader_tasks_to_stop() {
+        // Verifies the cooperative shutdown path: cancelling the
+        // watcher's token must drive the leader-task cleanup to
+        // completion before `shutdown()` returns. A naked
+        // `JoinHandle::abort` on the outer watcher (the pre-token
+        // behavior) used to drop the cleanup mid-await, leaving
+        // leader tasks alive on the runtime.
+
+        let dir = TempDir::new().expect("temp dir");
+        let cfg = RaftBootstrapConfig::new(1, dir.path().to_path_buf());
+        let integration = RaftIntegration::bootstrap(cfg).await.expect("bootstrap");
+
+        // The leader task flips this flag to false in its Drop impl,
+        // giving the test a deterministic signal that the task has
+        // actually stopped (vs being merely signalled to stop).
+        let alive = Arc::new(AtomicUsize::new(0));
+        let alive_for_closure = Arc::clone(&alive);
+
+        struct AliveGuard(Arc<AtomicUsize>);
+        impl Drop for AliveGuard {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+
+        let watcher = spawn_leader_watcher(
+            Arc::clone(&integration.raft),
+            1,
+            move || {
+                alive_for_closure.fetch_add(1, Ordering::SeqCst);
+                let guard = AliveGuard(Arc::clone(&alive_for_closure));
+                vec![tokio::spawn(async move {
+                    let _g = guard;
+                    futures::future::pending::<()>().await;
+                })]
+            },
+        );
+
+        let mut members = std::collections::BTreeMap::new();
+        members.insert(1u64, fluree_db_consensus::raft::ClusterNode::default());
+        integration
+            .raft
+            .initialize(members)
+            .await
+            .expect("initialize");
+        integration
+            .raft
+            .wait(Some(Duration::from_secs(5)))
+            .state(
+                fluree_db_consensus::RaftServerState::Leader,
+                "leader after self-election",
+            )
+            .await
+            .expect("becomes leader");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(alive.load(Ordering::SeqCst), 1, "leader task spawned");
+
+        // The contract: when `shutdown().await` returns, the leader
+        // task's Drop has already run — `alive` is back to 0.
+        watcher.shutdown().await;
+        assert_eq!(
+            alive.load(Ordering::SeqCst),
+            0,
+            "leader task drop should run before shutdown() returns"
+        );
+
         let _ = integration.raft.shutdown().await;
     }
 }

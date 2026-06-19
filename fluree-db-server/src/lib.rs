@@ -82,7 +82,7 @@ pub struct FlureeServer {
     /// on. Aborted on shutdown so the spawned tasks tear down with
     /// the rest of the server.
     #[cfg(feature = "raft")]
-    raft_leader_watcher: Option<tokio::task::JoinHandle<()>>,
+    raft_leader_watcher: Option<crate::raft::LeaderWatcherHandle>,
     /// Per-node release task that drains the state-machine adapter's
     /// CAS release channel. Runs on every node (not just the leader)
     /// so admin-cleared queue entries and idempotency-evicted
@@ -304,12 +304,15 @@ impl FlureeServer {
             task.abort();
         }
         #[cfg(feature = "raft")]
-        if let Some(task) = self.raft_leader_watcher {
-            // Aborting the watcher's outer task drops its metrics
-            // receiver; on its way down it also aborts every
-            // currently-running leader task — see
-            // `raft::spawn_leader_watcher` for the teardown path.
-            task.abort();
+        if let Some(handle) = self.raft_leader_watcher {
+            // Cooperative shutdown: cancel the watcher's token, then
+            // await its `JoinHandle`. The watcher exits its select
+            // loop, abort-and-awaits every in-flight leader task,
+            // and only then returns — so this `await` resolves with
+            // a guarantee that every leader-only task (indexer,
+            // commit worker, eviction scheduler) has actually
+            // stopped, not just been signalled.
+            handle.shutdown().await;
         }
         #[cfg(feature = "raft")]
         if let Some(task) = self.raft_release_task {
