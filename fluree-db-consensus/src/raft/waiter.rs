@@ -53,19 +53,47 @@ pub enum AbortReason {
     Poisoned(PoisonReason),
 }
 
-struct WaiterSlot {
-    ref_key: RefKey,
-    sender: oneshot::Sender<WaiterOutcome>,
+/// Per-queue_id slot. Either a parked sender (the proposer made it
+/// here before the worker resolved) or a buffered outcome (the worker
+/// resolved before the proposer parked its waiter — the race the
+/// pre-buffer design fixes).
+enum WaiterSlot {
+    /// Proposer parked first. The next `resolve_*` call sends through
+    /// `sender` and removes the slot.
+    Parked {
+        ref_key: RefKey,
+        sender: oneshot::Sender<WaiterOutcome>,
+    },
+    /// Worker resolved first. The next `register` call pulls the
+    /// outcome out, delivers it on the new sender, and removes the
+    /// slot.
+    ///
+    /// Buffered slots have no `ref_key` because the resolve already
+    /// happened — there's no waiter for an admin clear to sweep, only
+    /// a value to hand off to the eventual register.
+    Resolved(WaiterOutcome),
 }
 
-/// Concurrent map from queue_id → parked waiter.
+/// Concurrent map from queue_id → parked waiter or buffered outcome.
 ///
-/// Held by the state-machine adapter and shared with the
-/// transactor (via `Arc`). Registrations insert; the adapter
-/// resolves on apply.
+/// Held by the state-machine adapter and shared with the transactor
+/// (via `Arc`). Designed to be order-agnostic: a `resolve_*` call that
+/// lands before the matching `register` buffers the outcome, and the
+/// late-arriving `register` picks it up and completes immediately.
+/// Without that buffering, a fast leader (worker proposes `ApplyHead`
+/// before the original `EnqueueCommand` response reaches the
+/// transactor) would resolve to a nonexistent slot and the transactor
+/// would time out on the still-empty receiver — silently re-proposing
+/// under a fresh `request_cid` and producing a duplicate commit on
+/// retry.
+///
+/// Buffered slots leak only when a transactor's `client_write` is
+/// dropped between commit and resolve (rare network failure mid-RPC).
+/// The footprint is one [`WaiterOutcome`] per leaked slot; if a
+/// production load exposes this we can add a TTL sweep.
 #[derive(Default)]
 pub struct WaiterMap {
-    waiters: DashMap<u64, WaiterSlot>,
+    slots: DashMap<u64, WaiterSlot>,
 }
 
 impl WaiterMap {
@@ -73,46 +101,102 @@ impl WaiterMap {
         Self::default()
     }
 
-    /// Park a waiter on `queue_id` and return the receiver the
-    /// caller awaits. `ref_key` is recorded alongside so admin
-    /// commands can sweep every waiter for a branch in one pass.
+    /// Park a waiter on `queue_id` and return the receiver the caller
+    /// awaits. `ref_key` is recorded alongside so admin commands can
+    /// sweep every waiter for a branch in one pass.
     ///
-    /// If the same queue_id is already registered (a stale
-    /// registration from a former leader, say) the prior sender is
-    /// dropped — its receiver gets a [`oneshot::error::RecvError`],
-    /// which the caller treats as "the waiter is gone, restart by
-    /// re-issuing the idempotency key."
+    /// If a [`WaiterSlot::Resolved`] is already buffered for this id
+    /// (the worker beat the caller back from `client_write`) the
+    /// buffered outcome is delivered to the new sender immediately
+    /// and the slot is removed.
+    ///
+    /// If a [`WaiterSlot::Parked`] is already there (a stale
+    /// registration from a former leader) the prior sender is dropped
+    /// — its receiver gets a [`oneshot::error::RecvError`], which the
+    /// caller treats as "the waiter is gone, restart by re-issuing
+    /// the idempotency key."
     pub fn register(&self, queue_id: u64, ref_key: RefKey) -> oneshot::Receiver<WaiterOutcome> {
         let (sender, receiver) = oneshot::channel();
-        self.waiters
-            .insert(queue_id, WaiterSlot { ref_key, sender });
+        use dashmap::mapref::entry::Entry;
+        match self.slots.entry(queue_id) {
+            Entry::Vacant(v) => {
+                v.insert(WaiterSlot::Parked { ref_key, sender });
+            }
+            Entry::Occupied(mut o) => {
+                if matches!(o.get(), WaiterSlot::Resolved(_)) {
+                    // Pre-buffered outcome — deliver and remove.
+                    if let WaiterSlot::Resolved(outcome) = o.remove() {
+                        let _ = sender.send(outcome);
+                    }
+                } else {
+                    // Duplicate register; the prior sender drops.
+                    *o.get_mut() = WaiterSlot::Parked { ref_key, sender };
+                }
+            }
+        }
         receiver
     }
 
     /// Resolve `queue_id` with the head advance the worker landed.
-    /// No-op if no waiter is registered (e.g. the caller timed out).
+    ///
+    /// If a [`WaiterSlot::Parked`] is registered, send the outcome to
+    /// the parked sender and remove the slot. If no slot exists yet
+    /// (the worker beat the proposer's `register` call), buffer the
+    /// outcome on the slot — the eventual `register` will pick it up.
     pub fn resolve_applied(&self, queue_id: u64, receipt: AppliedReceipt) {
-        if let Some((_, slot)) = self.waiters.remove(&queue_id) {
-            let _ = slot.sender.send(WaiterOutcome::Applied(receipt));
-        }
+        self.resolve_with(queue_id, WaiterOutcome::Applied(receipt));
     }
 
-    /// Resolve `queue_id` with an abort outcome. No-op if no waiter
-    /// is registered.
+    /// Resolve `queue_id` with an abort outcome. Same buffering rule
+    /// as [`Self::resolve_applied`] — buffered if no waiter is
+    /// registered yet.
     pub fn resolve_aborted(&self, queue_id: u64, reason: AbortReason) {
-        if let Some((_, slot)) = self.waiters.remove(&queue_id) {
-            let _ = slot.sender.send(WaiterOutcome::Aborted(reason));
+        self.resolve_with(queue_id, WaiterOutcome::Aborted(reason));
+    }
+
+    fn resolve_with(&self, queue_id: u64, outcome: WaiterOutcome) {
+        use dashmap::mapref::entry::Entry;
+        match self.slots.entry(queue_id) {
+            Entry::Vacant(v) => {
+                // Race: resolve arrived before register. Buffer for
+                // late-arriving register.
+                v.insert(WaiterSlot::Resolved(outcome));
+            }
+            Entry::Occupied(mut o) => {
+                if matches!(o.get(), WaiterSlot::Parked { .. }) {
+                    if let WaiterSlot::Parked { sender, .. } = o.remove() {
+                        let _ = sender.send(outcome);
+                    }
+                } else {
+                    // Already resolved — latest wins. This shouldn't
+                    // happen in normal operation (one queue_id maps
+                    // to one apply outcome) but is defended against
+                    // here so a duplicate adapter call doesn't drop
+                    // either outcome on the floor silently.
+                    *o.get_mut() = WaiterSlot::Resolved(outcome);
+                }
+            }
         }
     }
 
     /// Abort every waiter parked on the given branch with the same
     /// reason. Called when head-mutating admin commands (Drop /
     /// Purge / ResetHead) clear the per-branch queue.
+    ///
+    /// Only [`WaiterSlot::Parked`] slots are swept — buffered
+    /// resolutions are left alone because their underlying queue
+    /// entry already completed before the admin clear; the
+    /// late-arriving `register` should still see the success.
     pub fn abort_all_for_branch(&self, ref_key: &RefKey, reason: AbortReason) {
         let to_resolve: Vec<u64> = self
-            .waiters
+            .slots
             .iter()
-            .filter(|entry| &entry.value().ref_key == ref_key)
+            .filter(|entry| {
+                matches!(
+                    entry.value(),
+                    WaiterSlot::Parked { ref_key: rk, .. } if rk == ref_key
+                )
+            })
             .map(|entry| *entry.key())
             .collect();
         for queue_id in to_resolve {
@@ -120,19 +204,19 @@ impl WaiterMap {
         }
     }
 
-    /// Number of parked waiters. Used by tests; not part of the
-    /// stable surface.
+    /// Number of slots (parked + buffered). Used by tests; not part
+    /// of the stable surface.
     #[cfg(test)]
     pub fn len(&self) -> usize {
-        self.waiters.len()
+        self.slots.len()
     }
 
-    /// True when no waiters are parked. Test-only; paired with
+    /// True when no slots are populated. Test-only; paired with
     /// [`Self::len`] so clippy's `len_without_is_empty` doesn't flag
     /// the helper.
     #[cfg(test)]
     pub fn is_empty(&self) -> bool {
-        self.waiters.is_empty()
+        self.slots.is_empty()
     }
 }
 
@@ -196,11 +280,52 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolve_on_unknown_queue_id_is_noop() {
+    async fn resolve_on_unknown_queue_id_buffers_for_late_register() {
         let map = WaiterMap::new();
+        // Worker resolves before the proposer's register call lands.
         map.resolve_applied(9_999, minimal(1, 1));
-        map.resolve_aborted(9_999, AbortReason::BranchDropped);
+        assert_eq!(map.len(), 1, "buffered slot stays until register picks it up");
+
+        // Late-arriving register pulls the buffered outcome out and
+        // delivers it on the new receiver.
+        let rx = map.register(9_999, ref_key("main"));
+        match rx.await.expect("buffered outcome delivered") {
+            WaiterOutcome::Applied(AppliedReceipt::Minimal { commit_id, commit_t }) => {
+                assert_eq!(commit_id, cid(1));
+                assert_eq!(commit_t, 1);
+            }
+            other => panic!("expected Applied(Minimal), got {other:?}"),
+        }
+        assert_eq!(map.len(), 0, "slot drained after delivery");
+    }
+
+    #[tokio::test]
+    async fn resolve_aborted_before_register_also_buffers() {
+        let map = WaiterMap::new();
+        map.resolve_aborted(7, AbortReason::BranchDropped);
+        let rx = map.register(7, ref_key("main"));
+        assert!(matches!(
+            rx.await.expect("buffered abort"),
+            WaiterOutcome::Aborted(AbortReason::BranchDropped)
+        ));
         assert_eq!(map.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn abort_all_does_not_disturb_buffered_resolves() {
+        let map = WaiterMap::new();
+        // Worker resolved first, buffered.
+        map.resolve_applied(7, minimal(42, 10));
+        // Admin clear fires before the proposer registers — should
+        // not touch the buffered Applied (the work completed before
+        // the clear was proposed).
+        map.abort_all_for_branch(&ref_key("main"), AbortReason::BranchDropped);
+        // Register still picks up the Applied outcome.
+        let rx = map.register(7, ref_key("main"));
+        assert!(matches!(
+            rx.await.expect("buffered applied"),
+            WaiterOutcome::Applied(_)
+        ));
     }
 
     #[tokio::test]
