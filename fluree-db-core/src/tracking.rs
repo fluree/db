@@ -361,7 +361,7 @@ pub struct TrackingTally {
 /// `capped: true` means the closure hit its budget before reaching fixpoint —
 /// query results may be missing entailments. Clients should treat capped
 /// results as incomplete, not merely slow.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReasoningTally {
     /// Whether materialization was capped before reaching fixpoint.
     pub capped: bool,

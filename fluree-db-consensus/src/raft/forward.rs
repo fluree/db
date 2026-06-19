@@ -32,7 +32,7 @@
 
 use crate::raft::{NodeId, TypeConfig};
 use axum::body::Body;
-use axum::extract::{Request, State};
+use axum::extract::{OriginalUri, Request, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
@@ -197,15 +197,27 @@ impl IntoResponse for ForwardError {
 
 /// Rebuild `req` as an outbound HTTP call to `leader_base_url`,
 /// preserving the path+query, method, body, and (most) headers.
+///
+/// Path resolution prefers `OriginalUri` over `parts.uri` so the
+/// forwarded request carries the full public path the client used,
+/// not the prefix-stripped path the inner nested router sees. Axum
+/// rewrites `parts.uri` when it dispatches into a `nest`ed sub-router
+/// (e.g. `/v1/fluree/create` becomes `/create` once inside the
+/// `v1` router), but stashes the original path in the
+/// `OriginalUri` extension so middleware can recover it. Without
+/// this, a follower mounted under `/v1/fluree` would forward
+/// `POST /create` to the leader's root and get a 404 — the leader
+/// only mounts the routes under `/v1/fluree`.
 async fn forward_request(
     client: &reqwest::Client,
     leader_base_url: &str,
     req: Request,
 ) -> Result<Response, ForwardError> {
     let (parts, body) = req.into_parts();
-    let path_and_query = parts
-        .uri
-        .path_and_query()
+    let original_uri = parts.extensions.get::<OriginalUri>().map(|o| &o.0);
+    let path_and_query = original_uri
+        .and_then(|uri| uri.path_and_query())
+        .or_else(|| parts.uri.path_and_query())
         .map(|pq| pq.as_str())
         .unwrap_or("/");
     let leader_url = format!(

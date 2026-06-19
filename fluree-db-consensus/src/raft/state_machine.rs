@@ -38,6 +38,7 @@ pub struct RecordedTally {
     pub time: Option<String>,
     pub fuel: Option<f64>,
     pub policy: Option<HashMap<String, PolicyStats>>,
+    pub reasoning: Option<fluree_db_core::tracking::ReasoningTally>,
 }
 
 impl From<&TrackingTally> for RecordedTally {
@@ -46,6 +47,7 @@ impl From<&TrackingTally> for RecordedTally {
             time: t.time.clone(),
             fuel: t.fuel,
             policy: t.policy.clone(),
+            reasoning: t.reasoning.clone(),
         }
     }
 }
@@ -56,6 +58,7 @@ impl From<RecordedTally> for TrackingTally {
             time: r.time,
             fuel: r.fuel,
             policy: r.policy,
+            reasoning: r.reasoning,
         }
     }
 }
