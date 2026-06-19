@@ -558,6 +558,7 @@ impl SubqueryOperator {
             self.subquery.limit,
             false,
             None,
+            &self.planning,
         )
     }
 
@@ -600,6 +601,7 @@ impl SubqueryOperator {
             self.subquery.limit,
             false,
             None,
+            &self.planning,
         )?;
 
         // Execute and collect results
