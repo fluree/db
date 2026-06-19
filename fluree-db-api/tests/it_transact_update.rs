@@ -1911,7 +1911,10 @@ async fn update_values_wildcard_delete_index_plus_novelty() {
 
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        fluree.nameservice_mode().publisher_arc().expect("test setup requires ReadWrite nameservice mode"),
+        fluree
+            .nameservice_mode()
+            .publisher_arc()
+            .expect("test setup requires ReadWrite nameservice mode"),
         Default::default(),
     );
 
@@ -2042,7 +2045,10 @@ async fn update_wildcard_delete_duplicate_facts_across_index_and_novelty() {
 
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        fluree.nameservice_mode().publisher_arc().expect("test setup requires ReadWrite nameservice mode"),
+        fluree
+            .nameservice_mode()
+            .publisher_arc()
+            .expect("test setup requires ReadWrite nameservice mode"),
         Default::default(),
     );
 
@@ -2172,7 +2178,10 @@ async fn update_values_wildcard_delete_after_updates_and_indexing() {
 
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        fluree.nameservice_mode().publisher_arc().expect("test setup requires ReadWrite nameservice mode"),
+        fluree
+            .nameservice_mode()
+            .publisher_arc()
+            .expect("test setup requires ReadWrite nameservice mode"),
         Default::default(),
     );
 

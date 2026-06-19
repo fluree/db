@@ -163,7 +163,10 @@ async fn trigger_index_reports_positive_fuel() {
     let mut fluree = FlureeBuilder::memory().build_memory();
     let (local, indexer_handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        fluree.nameservice_mode().as_arc_indexing_nameservice().expect("test fluree has writable nameservice"),
+        fluree
+            .nameservice_mode()
+            .as_arc_indexing_nameservice()
+            .expect("test fluree has writable nameservice"),
         fluree_db_indexer::IndexerConfig::default(),
     );
     fluree.set_indexing_mode(IndexingMode::Background(indexer_handle));

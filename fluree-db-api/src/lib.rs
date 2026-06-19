@@ -143,6 +143,7 @@ pub use import::{
     ImportSummary, RemoteSource,
 };
 pub use ledger_info::LedgerInfoBuilder;
+pub use ledger_manager::GuardedStagedCommit;
 pub use ledger_manager::{
     FreshnessCheck, FreshnessSource, LedgerHandle, LedgerManager, LedgerManagerConfig,
     LedgerWriteGuard, NotifyResult, NsNotify, RefreshOpts, RefreshResult, RemoteWatermark,
@@ -167,7 +168,6 @@ pub use query::builder::{
     DatasetQueryBuilder, FromQueryBuilder, GraphSourceMode, ViewQueryBuilder,
 };
 pub use query::nameservice_builder::NameserviceQueryBuilder;
-pub use ledger_manager::GuardedStagedCommit;
 pub use query::{QueryExecutionOptions, QueryResult, TrackedErrorResponse, TrackedQueryResponse};
 pub use rebase::{
     ConflictStrategy, PendingReplay, RebaseConflict, RebaseFailure, RebaseReport, StagedRebase,
@@ -227,8 +227,8 @@ pub use fluree_db_ledger::{
 };
 pub use fluree_db_nameservice::{
     BranchLifecycle, ConfigCasResult, ConfigPayload, ConfigPublisher, ConfigValue,
-    GraphSourceLookup, GraphSourcePublisher, IndexPublisher, IndexingNameService,
-    LedgerLifecycle, NameServiceLookup, NsRecord, Publisher,
+    GraphSourceLookup, GraphSourcePublisher, IndexPublisher, IndexingNameService, LedgerLifecycle,
+    NameServiceLookup, NsRecord, Publisher,
 };
 pub use fluree_db_novelty::Novelty;
 pub use fluree_db_query::{
@@ -305,10 +305,7 @@ pub use fluree_db_nameservice::NameServicePublisher;
 /// [`NameServiceMode::Lifecycle`] — the two surfaces are kept
 /// separate because publishing an index head isn't part of a
 /// record's lifecycle, even though one implementation may back both.
-pub trait LifecycleNameService:
-    NameServiceLookup + LedgerLifecycle + BranchLifecycle
-{
-}
+pub trait LifecycleNameService: NameServiceLookup + LedgerLifecycle + BranchLifecycle {}
 impl<T> LifecycleNameService for T where
     T: NameServiceLookup + LedgerLifecycle + BranchLifecycle + ?Sized
 {
@@ -343,7 +340,10 @@ impl std::fmt::Debug for NameServiceMode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::ReadWrite(ns) => f.debug_tuple("ReadWrite").field(ns).finish(),
-            Self::Lifecycle { lifecycle, indexing } => f
+            Self::Lifecycle {
+                lifecycle,
+                indexing,
+            } => f
                 .debug_struct("Lifecycle")
                 .field("lifecycle", lifecycle)
                 .field("indexing", indexing)
@@ -530,7 +530,6 @@ impl fluree_db_nameservice::GraphSourceLookup for NameServiceMode {
 // `Arc<dyn NameServicePublisher>` from `ReadWrite` and `None` /
 // `Err(...)` from `ReadOnly` — the variant check happens once at
 // the boundary, and from there the caller has an honest writer.
-
 #[async_trait]
 impl fluree_db_nameservice::ConfigLookup for NameServiceMode {
     async fn get_config(
@@ -2561,10 +2560,7 @@ impl FlureeBuilder {
     /// `Some`, it replaces the AWS-managed nameservice (and the
     /// background indexer that rides along with it).
     #[cfg(feature = "aws")]
-    async fn build_client_s3(
-        self,
-        nameservice: Option<NameServiceMode>,
-    ) -> Result<FlureeClient> {
+    async fn build_client_s3(self, nameservice: Option<NameServiceMode>) -> Result<FlureeClient> {
         // Delegate to fluree_db_connection for AWS SDK init,
         // storage registry sharing, and nameservice creation.
         let handle = fluree_db_connection::connect_from_config(self.config.clone()).await?;

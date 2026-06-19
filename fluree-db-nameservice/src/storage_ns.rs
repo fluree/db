@@ -2095,12 +2095,7 @@ mod tests {
             t: 2,
         };
         let result = ns
-            .compare_and_set_ref(
-                "mydb:main",
-                RefKind::CommitHead,
-                Some(&expected),
-                &new_ref,
-            )
+            .compare_and_set_ref("mydb:main", RefKind::CommitHead, Some(&expected), &new_ref)
             .await
             .unwrap();
         match result {
@@ -2123,12 +2118,7 @@ mod tests {
             t: 2,
         };
         let result = ns
-            .compare_and_set_ref(
-                "mydb:main",
-                RefKind::CommitHead,
-                Some(&expected),
-                &new_ref,
-            )
+            .compare_and_set_ref("mydb:main", RefKind::CommitHead, Some(&expected), &new_ref)
             .await
             .unwrap();
         assert_eq!(result, CasResult::Updated);
@@ -2157,12 +2147,7 @@ mod tests {
             t: 5,
         };
         let result = ns
-            .compare_and_set_ref(
-                "mydb:main",
-                RefKind::CommitHead,
-                Some(&expected),
-                &new_ref,
-            )
+            .compare_and_set_ref("mydb:main", RefKind::CommitHead, Some(&expected), &new_ref)
             .await
             .unwrap();
         match result {
@@ -2187,12 +2172,7 @@ mod tests {
             t: 5,
         };
         let result = ns
-            .compare_and_set_ref(
-                "mydb:main",
-                RefKind::IndexHead,
-                Some(&expected),
-                &new_ref,
-            )
+            .compare_and_set_ref("mydb:main", RefKind::IndexHead, Some(&expected), &new_ref)
             .await
             .unwrap();
         assert_eq!(result, CasResult::Updated);
@@ -2271,12 +2251,7 @@ mod tests {
             t: 2,
         };
         let result = ns
-            .compare_and_set_ref(
-                "mydb:main",
-                RefKind::CommitHead,
-                Some(&expected),
-                &new_ref,
-            )
+            .compare_and_set_ref("mydb:main", RefKind::CommitHead, Some(&expected), &new_ref)
             .await
             .unwrap();
         match result {

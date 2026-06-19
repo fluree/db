@@ -174,10 +174,7 @@ impl RaftAdmin {
 
     /// One-shot cluster bootstrap. Call on a single fresh node when
     /// forming a new cluster; that node becomes the initial leader.
-    pub async fn initialize(
-        &self,
-        members: BTreeMap<NodeId, NodeAddrs>,
-    ) -> Result<(), AdminError> {
+    pub async fn initialize(&self, members: BTreeMap<NodeId, NodeAddrs>) -> Result<(), AdminError> {
         let members: BTreeMap<NodeId, ClusterNode> = members
             .into_iter()
             .map(|(id, addrs)| (id, addrs.into()))
@@ -227,11 +224,7 @@ impl RaftAdmin {
     /// Snapshot of cluster state for status / health endpoints.
     pub fn status(&self) -> ClusterStatus {
         let metrics: RaftMetrics<NodeId, ClusterNode> = self.raft.metrics().borrow().clone();
-        let voters: BTreeSet<NodeId> = metrics
-            .membership_config
-            .membership()
-            .voter_ids()
-            .collect();
+        let voters: BTreeSet<NodeId> = metrics.membership_config.membership().voter_ids().collect();
         let learners: BTreeSet<NodeId> = metrics
             .membership_config
             .membership()
@@ -264,10 +257,7 @@ fn map_initialize_err(
 }
 
 fn map_client_write_err(
-    err: openraft::error::RaftError<
-        NodeId,
-        openraft::error::ClientWriteError<NodeId, ClusterNode>,
-    >,
+    err: openraft::error::RaftError<NodeId, openraft::error::ClientWriteError<NodeId, ClusterNode>>,
 ) -> AdminError {
     use openraft::error::ClientWriteError;
     use openraft::error::RaftError;
@@ -329,7 +319,10 @@ async fn handle_add_learner(
     State(admin): State<RaftAdmin>,
     Json(req): Json<AddLearnerRequest>,
 ) -> Response {
-    match admin.add_learner(req.node_id, req.addrs, req.blocking).await {
+    match admin
+        .add_learner(req.node_id, req.addrs, req.blocking)
+        .await
+    {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => admin_error_response(e),
     }

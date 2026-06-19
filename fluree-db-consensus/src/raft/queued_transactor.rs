@@ -19,12 +19,11 @@
 //! delegate to a fallback `Committer` during the migration — the
 //! legacy `RaftCommitter` while we move call sites onto the queue.
 
+use crate::raft::staged_receipt::AppliedReceipt;
 use crate::raft::state_machine::{
     ApplyRecord, BodyKind, Command as SmCommand, EnqueueCommandArgs, PoisonRecord, RefKey,
     Response as SmResponse,
 };
-use fluree_db_core::ContentId;
-use crate::raft::staged_receipt::AppliedReceipt;
 use crate::raft::state_machine_adapter::SharedState;
 use crate::raft::waiter::{AbortReason, WaiterMap, WaiterOutcome};
 use crate::raft::TypeConfig;
@@ -37,6 +36,7 @@ use crate::{
 use async_trait::async_trait;
 use fluree_db_api::{CommitReceipt, Fluree};
 use fluree_db_core::ledger_id::split_ledger_id;
+use fluree_db_core::ContentId;
 use fluree_db_core::ContentKind;
 use fluree_db_transact::CommitOptsRequest;
 use openraft::Raft;
@@ -237,11 +237,7 @@ impl QueuedTransactor {
     /// on the same CID is harmless — log on failure but don't escalate
     /// to the caller, since the submission has already returned its
     /// terminal status.
-    async fn release_envelope(
-        &self,
-        ledger_id: &str,
-        request_cid: &ContentId,
-    ) {
+    async fn release_envelope(&self, ledger_id: &str, request_cid: &ContentId) {
         if let Err(err) = self
             .fluree
             .content_store(ledger_id)
@@ -286,12 +282,11 @@ impl Committer for QueuedTransactor {
             governance,
         } = request;
 
-        let (ledger_name, branch) = split_ledger_id(&ledger_id).map_err(|e| {
-            SubmissionError::Execution {
+        let (ledger_name, branch) =
+            split_ledger_id(&ledger_id).map_err(|e| SubmissionError::Execution {
                 status: 400,
                 message: format!("invalid ledger_id: {e}"),
-            }
-        })?;
+            })?;
         let ref_key = RefKey::new(&ledger_name, &branch);
 
         let idempotency_cache_key = idempotency_key
@@ -446,8 +441,7 @@ impl Committer for QueuedTransactor {
             Some(t) => t,
             None => {
                 let state = self.shared_state.read().await;
-                let source_ref =
-                    state.refs.get(&RefKey::new(&ledger_name, &source_branch));
+                let source_ref = state.refs.get(&RefKey::new(&ledger_name, &source_branch));
                 match source_ref.and_then(|r| r.source_branch.clone()) {
                     Some(parent) => parent,
                     None => {
@@ -612,12 +606,11 @@ impl Committer for QueuedTransactor {
             governance,
         } = request;
 
-        let (ledger_name, branch) = split_ledger_id(&ledger_id).map_err(|e| {
-            SubmissionError::Execution {
+        let (ledger_name, branch) =
+            split_ledger_id(&ledger_id).map_err(|e| SubmissionError::Execution {
                 status: 400,
                 message: format!("invalid ledger_id: {e}"),
-            }
-        })?;
+            })?;
         let ref_key = RefKey::new(&ledger_name, &branch);
 
         let idempotency_cache_key = idempotency_key
@@ -730,9 +723,7 @@ fn idle_indexing_status(commit_t: i64) -> fluree_db_api::IndexingStatus {
 fn variant_mismatch(expected: &'static str, got: &AppliedReceipt) -> SubmissionError {
     SubmissionError::Execution {
         status: 500,
-        message: format!(
-            "applied receipt mismatch: expected {expected}, got {got:?}"
-        ),
+        message: format!("applied receipt mismatch: expected {expected}, got {got:?}"),
     }
 }
 
@@ -760,7 +751,7 @@ fn transaction_receipt_from(
             t: commit_t,
             flake_count: 0,
         },
-        tally: tally.map(Into::into),
+        tally,
     })
 }
 
@@ -807,7 +798,13 @@ fn revert_receipt_from(
             reverted_commits,
             conflict_count,
             strategy,
-        }) => (commit_id, commit_t, reverted_commits, conflict_count, strategy),
+        }) => (
+            commit_id,
+            commit_t,
+            reverted_commits,
+            conflict_count,
+            strategy,
+        ),
         AppliedReceipt::Minimal {
             commit_id,
             commit_t,
@@ -991,11 +988,9 @@ mod tests {
 
     #[test]
     fn poisoned_maps_to_422_with_reason_in_message() {
-        let err = submission_error_from_abort(AbortReason::Poisoned(
-            PoisonReason::BodyMalformed {
-                error: "bad turtle".into(),
-            },
-        ));
+        let err = submission_error_from_abort(AbortReason::Poisoned(PoisonReason::BodyMalformed {
+            error: "bad turtle".into(),
+        }));
         assert_eq!(status(&err), 422);
         match err {
             SubmissionError::Execution { message, .. } => {

@@ -357,7 +357,10 @@ async fn flpack_export_import_round_trip_with_index() {
 
     let (local, handle) = start_background_indexer_local(
         src_fluree.backend().clone(),
-        src_fluree.nameservice_mode().publisher_arc().expect("test setup requires ReadWrite nameservice mode"),
+        src_fluree
+            .nameservice_mode()
+            .publisher_arc()
+            .expect("test setup requires ReadWrite nameservice mode"),
         fluree_db_indexer::IndexerConfig::small(),
     );
     src_fluree.set_indexing_mode(fluree_db_api::tx::IndexingMode::Background(handle.clone()));
@@ -732,7 +735,10 @@ async fn flpack_restore_restamps_index_root_ledger_id() {
 
     let (local, handle) = start_background_indexer_local(
         src_fluree.backend().clone(),
-        src_fluree.nameservice_mode().as_arc_indexing_nameservice().expect("test fluree has writable nameservice"),
+        src_fluree
+            .nameservice_mode()
+            .as_arc_indexing_nameservice()
+            .expect("test fluree has writable nameservice"),
         fluree_db_indexer::IndexerConfig::small(),
     );
     src_fluree.set_indexing_mode(fluree_db_api::tx::IndexingMode::Background(handle.clone()));

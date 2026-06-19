@@ -13,7 +13,6 @@
 #![cfg(feature = "raft")]
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -119,25 +118,34 @@ impl TestCluster {
         // stays per-node so each node has its own persisted state.
         let shared_data_tmp = TempDir::new().expect("shared data tempdir");
 
-        // Discover one public + one raft port per node up front. We
-        // bind, read back the kernel-assigned port, and drop — the
-        // port is then re-bound when the actual server spins up.
-        // The drop-then-rebind window is short enough that test
-        // collisions on a quiet machine are not a real concern.
-        let mut public_addrs = Vec::with_capacity(count as usize);
-        let mut raft_addrs = Vec::with_capacity(count as usize);
+        // Bind one public + one raft listener per node up front and
+        // hold them across the build → serve handoff. Reserving the
+        // port and dropping the listener (the "discover port" trick)
+        // races against concurrent tests under `cargo test`'s default
+        // parallelism — a sibling test snatches the port in the
+        // drop-then-rebind window and the cluster fails to start.
+        let mut listeners = Vec::with_capacity(count as usize);
         for _ in 0..count {
-            public_addrs.push(reserve_ephemeral_port().await);
-            raft_addrs.push(reserve_ephemeral_port().await);
+            let public = TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind public listener");
+            let raft = TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind raft listener");
+            listeners.push((public, raft));
         }
 
         let mut nodes = Vec::with_capacity(count as usize);
-        for (i, (public_addr, raft_addr)) in
-            public_addrs.into_iter().zip(raft_addrs.into_iter()).enumerate()
-        {
+        for (i, (public_listener, raft_listener)) in listeners.into_iter().enumerate() {
             let node_id = (i as u64) + 1;
             nodes.push(
-                spawn_node(node_id, public_addr, raft_addr, shared_data_tmp.path()).await,
+                spawn_node(
+                    node_id,
+                    public_listener,
+                    raft_listener,
+                    shared_data_tmp.path(),
+                )
+                .await,
             );
         }
 
@@ -229,7 +237,8 @@ impl TestCluster {
         // Wait for every live node to agree on the same leader and
         // see the full voter set — guards against tests that look at
         // a node before it has caught up to membership.
-        self.wait_for_cluster_consensus(&voters, DEFAULT_TIMEOUT).await;
+        self.wait_for_cluster_consensus(&voters, DEFAULT_TIMEOUT)
+            .await;
     }
 
     /// Poll `/cluster/status` on the first live node and return its
@@ -261,7 +270,11 @@ impl TestCluster {
 
     /// Poll until every live node reports the same leader id and the
     /// expected voter set, or the timeout elapses.
-    async fn wait_for_cluster_consensus(&self, expected_voters: &BTreeSet<NodeId>, timeout: Duration) {
+    async fn wait_for_cluster_consensus(
+        &self,
+        expected_voters: &BTreeSet<NodeId>,
+        timeout: Duration,
+    ) {
         let deadline = Instant::now() + timeout;
         loop {
             let mut leaders = BTreeSet::new();
@@ -286,11 +299,10 @@ impl TestCluster {
             if all_have_voters && leaders.len() == 1 {
                 return;
             }
-            if Instant::now() >= deadline {
-                panic!(
-                    "timed out waiting for consensus (leaders={leaders:?}, expected_voters={expected_voters:?})"
-                );
-            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for consensus (leaders={leaders:?}, expected_voters={expected_voters:?})"
+            );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
     }
@@ -436,7 +448,7 @@ impl TestCluster {
         timeout: Duration,
     ) {
         let want: Vec<String> = {
-            let mut v: Vec<String> = expected.iter().map(|s| s.to_string()).collect();
+            let mut v: Vec<String> = expected.iter().map(|s| (*s).to_string()).collect();
             v.sort();
             v
         };
@@ -449,9 +461,7 @@ impl TestCluster {
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        panic!(
-            "timed out waiting for node {via_node} to see {want:?} on {ledger}; last={last:?}"
-        );
+        panic!("timed out waiting for node {via_node} to see {want:?} on {ledger}; last={last:?}");
     }
 }
 
@@ -464,26 +474,21 @@ impl TestNode {
     }
 }
 
-/// Bind `127.0.0.1:0`, read back the kernel-assigned port, drop the
-/// listener so the port is free to re-bind. There's a small race
-/// window before the test re-binds; on a single-tenant CI machine
-/// this is the standard pattern and is reliable enough.
-async fn reserve_ephemeral_port() -> SocketAddr {
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind ephemeral port");
-    listener.local_addr().expect("local_addr")
-}
-
 /// Build a single raft-enabled `FlureeServer`, extract its routers,
-/// and spawn both listeners. The returned `TestNode` keeps the state
-/// + task handles alive.
+/// and spawn both listeners. Caller provides the pre-bound listeners
+/// so the public/raft addresses can be discovered ahead of building
+/// the server (the server needs to know its self-addrs) without ever
+/// dropping the listener (which would race with concurrent tests
+/// for the same kernel-assigned port).
 async fn spawn_node(
     node_id: NodeId,
-    public_addr: SocketAddr,
-    raft_addr: SocketAddr,
+    public_listener: TcpListener,
+    raft_listener: TcpListener,
     shared_data_path: &std::path::Path,
 ) -> TestNode {
+    let public_addr = public_listener.local_addr().expect("public local_addr");
+    let raft_addr = raft_listener.local_addr().expect("raft local_addr");
+
     let raft_tmp = TempDir::new().expect("raft tempdir");
 
     let integration = Arc::new(
@@ -514,17 +519,10 @@ async fn spawn_node(
     let raft_router = integration.private_router();
     // Drop `server` here: that detaches `raft_leader_watcher` (still
     // running on the runtime) and drops the unused `raft_listener`
-    // field. We rebind both listeners ourselves below so the
+    // field. We serve both routers ourselves below so the
     // `shutdown_node` path can abort just the raft side without
     // losing the public side (or vice versa).
     drop(server);
-
-    let public_listener = TcpListener::bind(public_addr)
-        .await
-        .expect("bind public listener");
-    let raft_listener = TcpListener::bind(raft_addr)
-        .await
-        .expect("bind raft listener");
 
     let public_task = tokio::spawn(async move {
         let _ = axum::serve(public_listener, public_router).await;
@@ -585,9 +583,7 @@ async fn happy_path_follower_forwards_to_leader() {
     cluster
         .insert_subject(follower, ledger, "alice", "Alice")
         .await;
-    cluster
-        .insert_subject(follower, ledger, "bob", "Bob")
-        .await;
+    cluster.insert_subject(follower, ledger, "bob", "Bob").await;
 
     // Verify all five nodes see both writes (with bounded wait for
     // followers to apply the committed log).
@@ -607,7 +603,9 @@ async fn concurrent_writes_across_all_nodes() {
     cluster.bootstrap().await;
 
     let ledger = "raft:concurrent";
-    cluster.create_ledger(cluster.nodes[0].node_id, ledger).await;
+    cluster
+        .create_ledger(cluster.nodes[0].node_id, ledger)
+        .await;
 
     // 5 writes per node, each to a distinct subject so there's no
     // intra-ledger CAS contention to muddy what we're testing.
@@ -698,7 +696,9 @@ async fn leader_failover_resumes_writes() {
     cluster.bootstrap().await;
 
     let ledger = "raft:failover";
-    cluster.create_ledger(cluster.nodes[0].node_id, ledger).await;
+    cluster
+        .create_ledger(cluster.nodes[0].node_id, ledger)
+        .await;
     cluster
         .insert_subject(cluster.nodes[0].node_id, ledger, "dave", "Dave")
         .await;
@@ -754,12 +754,7 @@ async fn leader_failover_resumes_writes() {
     // Every surviving node should see both writes.
     for node in cluster.nodes.iter().filter(|n| n.is_alive()) {
         cluster
-            .wait_for_names(
-                node.node_id,
-                ledger,
-                &["Dave", "Erin"],
-                DEFAULT_TIMEOUT,
-            )
+            .wait_for_names(node.node_id, ledger, &["Dave", "Erin"], DEFAULT_TIMEOUT)
             .await;
     }
 }

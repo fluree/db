@@ -632,7 +632,6 @@ impl crate::Fluree {
         })
     }
 
-
     /// Dry-run terminal for rebase: stage `flakes` on top of `state`
     /// and produce a [`StagedCommit`] representing the replay of
     /// `original_commit`, without writing the commit blob or

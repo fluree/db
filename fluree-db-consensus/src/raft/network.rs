@@ -205,10 +205,8 @@ impl RaftNetwork<TypeConfig> for HttpRaftNetwork {
         &mut self,
         rpc: AppendEntriesRequest<TypeConfig>,
         _option: RPCOption,
-    ) -> Result<
-        AppendEntriesResponse<NodeId>,
-        RPCError<NodeId, ClusterNode, RaftError<NodeId>>,
-    > {
+    ) -> Result<AppendEntriesResponse<NodeId>, RPCError<NodeId, ClusterNode, RaftError<NodeId>>>
+    {
         self.post(PATH_APPEND_ENTRIES, &rpc, self.config.rpc_timeout)
             .await
     }

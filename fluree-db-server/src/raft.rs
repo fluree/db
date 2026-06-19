@@ -461,9 +461,7 @@ mod tests {
     async fn watcher_spawns_leader_tasks_when_node_becomes_leader() {
         let dir = TempDir::new().expect("temp dir");
         let cfg = RaftBootstrapConfig::new(1, dir.path().to_path_buf());
-        let integration = RaftIntegration::bootstrap(cfg)
-            .await
-            .expect("bootstrap");
+        let integration = RaftIntegration::bootstrap(cfg).await.expect("bootstrap");
 
         // Counter incremented every time the watcher invokes the
         // spawn closure. Wrapped in Arc so the closure can keep a
@@ -493,10 +491,7 @@ mod tests {
         // Bootstrap as single-voter; node 1 will auto-elect on the
         // next election tick.
         let mut members = std::collections::BTreeMap::new();
-        members.insert(
-            1u64,
-            fluree_db_consensus::raft::ClusterNode::default(),
-        );
+        members.insert(1u64, fluree_db_consensus::raft::ClusterNode::default());
         integration
             .raft
             .initialize(members)
@@ -531,4 +526,3 @@ mod tests {
         let _ = integration.raft.shutdown().await;
     }
 }
-

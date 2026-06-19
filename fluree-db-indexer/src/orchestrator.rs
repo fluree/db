@@ -1505,7 +1505,9 @@ async fn run_event_subscriber(
     loop {
         match subscription.receiver.recv().await {
             Ok(NameServiceEvent::LedgerCommitPublished {
-                ledger_id, commit_t, ..
+                ledger_id,
+                commit_t,
+                ..
             }) => {
                 debug!(
                     ledger_id = %ledger_id,

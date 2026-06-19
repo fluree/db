@@ -1238,12 +1238,14 @@ impl Fluree {
         // apply window, so the staged base IS authoritative. There is
         // no nameservice race to verify against — derive the expected
         // head ref directly from the snapshot we staged on.
-        let expected_head_ref = view.base().head_commit_id.as_ref().map(|cid| {
-            fluree_db_nameservice::RefValue {
-                id: Some(cid.clone()),
-                t: view.base().t(),
-            }
-        });
+        let expected_head_ref =
+            view.base()
+                .head_commit_id
+                .as_ref()
+                .map(|cid| fluree_db_nameservice::RefValue {
+                    id: Some(cid.clone()),
+                    t: view.base().t(),
+                });
 
         let mut staged = fluree_db_transact::build_commit(
             view,

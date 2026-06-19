@@ -1064,10 +1064,7 @@ impl BranchLifecycle for DynamoDbNameService {
 
 #[async_trait]
 impl LedgerLifecycle for DynamoDbNameService {
-    async fn init(
-        &self,
-        ledger_id: &str,
-    ) -> std::result::Result<(), NameServiceError> {
+    async fn init(&self, ledger_id: &str) -> std::result::Result<(), NameServiceError> {
         let pk = Self::normalize(ledger_id);
         let (ledger_name, branch) = split_ledger_id(ledger_id)
             .unwrap_or_else(|_| (ledger_id.to_string(), DEFAULT_BRANCH.to_string()));

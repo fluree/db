@@ -164,7 +164,10 @@ async fn class_property_datatype_decrements_after_delete_non_last_instance() {
 
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        fluree.nameservice_mode().as_arc_indexing_nameservice().expect("test fluree has writable nameservice"),
+        fluree
+            .nameservice_mode()
+            .as_arc_indexing_nameservice()
+            .expect("test fluree has writable nameservice"),
         fluree_db_indexer::IndexerConfig::small(),
     );
     fluree.set_indexing_mode(fluree_db_api::tx::IndexingMode::Background(handle.clone()));
@@ -288,7 +291,10 @@ async fn class_property_reattributed_after_retype() {
 
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        fluree.nameservice_mode().as_arc_indexing_nameservice().expect("test fluree has writable nameservice"),
+        fluree
+            .nameservice_mode()
+            .as_arc_indexing_nameservice()
+            .expect("test fluree has writable nameservice"),
         fluree_db_indexer::IndexerConfig::small(),
     );
     fluree.set_indexing_mode(fluree_db_api::tx::IndexingMode::Background(handle.clone()));
@@ -458,7 +464,10 @@ async fn ref_class_reattributed_after_subject_retype() {
         .expect("build file fluree");
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        fluree.nameservice_mode().as_arc_indexing_nameservice().expect("test fluree has writable nameservice"),
+        fluree
+            .nameservice_mode()
+            .as_arc_indexing_nameservice()
+            .expect("test fluree has writable nameservice"),
         fluree_db_indexer::IndexerConfig::small(),
     );
     fluree.set_indexing_mode(fluree_db_api::tx::IndexingMode::Background(handle.clone()));
@@ -572,7 +581,10 @@ async fn ref_class_reattributed_after_object_retype() {
         .expect("build file fluree");
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        fluree.nameservice_mode().as_arc_indexing_nameservice().expect("test fluree has writable nameservice"),
+        fluree
+            .nameservice_mode()
+            .as_arc_indexing_nameservice()
+            .expect("test fluree has writable nameservice"),
         fluree_db_indexer::IndexerConfig::small(),
     );
     fluree.set_indexing_mode(fluree_db_api::tx::IndexingMode::Background(handle.clone()));
@@ -687,7 +699,10 @@ async fn ref_class_reattributed_after_both_endpoints_retype() {
         .expect("build file fluree");
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        fluree.nameservice_mode().as_arc_indexing_nameservice().expect("test fluree has writable nameservice"),
+        fluree
+            .nameservice_mode()
+            .as_arc_indexing_nameservice()
+            .expect("test fluree has writable nameservice"),
         fluree_db_indexer::IndexerConfig::small(),
     );
     fluree.set_indexing_mode(fluree_db_api::tx::IndexingMode::Background(handle.clone()));
@@ -804,7 +819,10 @@ async fn large_retype_batch_defers_to_rebuild_and_stays_correct() {
     // Threshold of 1: re-typing 2+ existing subjects forces the rebuild fallback.
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        fluree.nameservice_mode().as_arc_indexing_nameservice().expect("test fluree has writable nameservice"),
+        fluree
+            .nameservice_mode()
+            .as_arc_indexing_nameservice()
+            .expect("test fluree has writable nameservice"),
         fluree_db_indexer::IndexerConfig::small().with_incremental_retype_max_subjects(1),
     );
     fluree.set_indexing_mode(fluree_db_api::tx::IndexingMode::Background(handle.clone()));
@@ -921,7 +939,10 @@ async fn property_and_class_statistics_persist_in_db_root() {
 
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        fluree.nameservice_mode().publisher_arc().expect("test setup requires ReadWrite nameservice mode"),
+        fluree
+            .nameservice_mode()
+            .publisher_arc()
+            .expect("test setup requires ReadWrite nameservice mode"),
         fluree_db_indexer::IndexerConfig::small(),
     );
     fluree.set_indexing_mode(fluree_db_api::tx::IndexingMode::Background(handle.clone()));
@@ -1005,7 +1026,10 @@ async fn class_statistics_decrement_after_delete_refresh() {
 
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        fluree.nameservice_mode().publisher_arc().expect("test setup requires ReadWrite nameservice mode"),
+        fluree
+            .nameservice_mode()
+            .publisher_arc()
+            .expect("test setup requires ReadWrite nameservice mode"),
         fluree_db_indexer::IndexerConfig::small(),
     );
     fluree.set_indexing_mode(fluree_db_api::tx::IndexingMode::Background(handle.clone()));
@@ -1087,7 +1111,10 @@ async fn statistics_work_with_memory_storage_when_indexed() {
 
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        fluree.nameservice_mode().publisher_arc().expect("test setup requires ReadWrite nameservice mode"),
+        fluree
+            .nameservice_mode()
+            .publisher_arc()
+            .expect("test setup requires ReadWrite nameservice mode"),
         fluree_db_indexer::IndexerConfig::small(),
     );
     fluree.set_indexing_mode(fluree_db_api::tx::IndexingMode::Background(handle.clone()));
@@ -1177,7 +1204,10 @@ async fn ledger_info_api_returns_expected_structure() {
 
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        fluree.nameservice_mode().publisher_arc().expect("test setup requires ReadWrite nameservice mode"),
+        fluree
+            .nameservice_mode()
+            .publisher_arc()
+            .expect("test setup requires ReadWrite nameservice mode"),
         fluree_db_indexer::IndexerConfig::small(),
     );
     fluree.set_indexing_mode(fluree_db_api::tx::IndexingMode::Background(handle.clone()));
@@ -1442,7 +1472,10 @@ async fn ledger_info_api_with_context_compacts_stats_iris() {
 
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        fluree.nameservice_mode().publisher_arc().expect("test setup requires ReadWrite nameservice mode"),
+        fluree
+            .nameservice_mode()
+            .publisher_arc()
+            .expect("test setup requires ReadWrite nameservice mode"),
         fluree_db_indexer::IndexerConfig::small(),
     );
     fluree.set_indexing_mode(fluree_db_api::tx::IndexingMode::Background(handle.clone()));
@@ -1597,7 +1630,10 @@ async fn ledger_info_property_datatypes_option_merges_novelty() {
 
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        fluree.nameservice_mode().publisher_arc().expect("test setup requires ReadWrite nameservice mode"),
+        fluree
+            .nameservice_mode()
+            .publisher_arc()
+            .expect("test setup requires ReadWrite nameservice mode"),
         fluree_db_indexer::IndexerConfig::small(),
     );
     fluree.set_indexing_mode(fluree_db_api::tx::IndexingMode::Background(handle.clone()));
@@ -1710,7 +1746,10 @@ async fn ledger_info_realtime_edges_merge_novelty_ref_counts() {
 
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        fluree.nameservice_mode().publisher_arc().expect("test setup requires ReadWrite nameservice mode"),
+        fluree
+            .nameservice_mode()
+            .publisher_arc()
+            .expect("test setup requires ReadWrite nameservice mode"),
         fluree_db_indexer::IndexerConfig::small(),
     );
     fluree.set_indexing_mode(fluree_db_api::tx::IndexingMode::Background(handle.clone()));
@@ -1819,7 +1858,10 @@ async fn ledger_info_stats_update_across_novelty_then_second_index_refresh() {
 
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        fluree.nameservice_mode().publisher_arc().expect("test setup requires ReadWrite nameservice mode"),
+        fluree
+            .nameservice_mode()
+            .publisher_arc()
+            .expect("test setup requires ReadWrite nameservice mode"),
         fluree_db_indexer::IndexerConfig::small(),
     );
     fluree.set_indexing_mode(fluree_db_api::tx::IndexingMode::Background(handle.clone()));
@@ -2068,7 +2110,10 @@ async fn ndv_cardinality_estimates_are_accurate() {
 
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        fluree.nameservice_mode().publisher_arc().expect("test setup requires ReadWrite nameservice mode"),
+        fluree
+            .nameservice_mode()
+            .publisher_arc()
+            .expect("test setup requires ReadWrite nameservice mode"),
         fluree_db_indexer::IndexerConfig::small(),
     );
     fluree.set_indexing_mode(fluree_db_api::tx::IndexingMode::Background(handle.clone()));
@@ -2228,7 +2273,10 @@ async fn selectivity_calculation_is_correct() {
 
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        fluree.nameservice_mode().publisher_arc().expect("test setup requires ReadWrite nameservice mode"),
+        fluree
+            .nameservice_mode()
+            .publisher_arc()
+            .expect("test setup requires ReadWrite nameservice mode"),
         fluree_db_indexer::IndexerConfig::small(),
     );
     fluree.set_indexing_mode(fluree_db_api::tx::IndexingMode::Background(handle.clone()));
@@ -2329,7 +2377,10 @@ async fn multi_class_entities_tracked_correctly() {
 
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        fluree.nameservice_mode().publisher_arc().expect("test setup requires ReadWrite nameservice mode"),
+        fluree
+            .nameservice_mode()
+            .publisher_arc()
+            .expect("test setup requires ReadWrite nameservice mode"),
         fluree_db_indexer::IndexerConfig::small(),
     );
     fluree.set_indexing_mode(fluree_db_api::tx::IndexingMode::Background(handle.clone()));
@@ -2442,7 +2493,10 @@ async fn class_property_type_distribution_tracked() {
 
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        fluree.nameservice_mode().publisher_arc().expect("test setup requires ReadWrite nameservice mode"),
+        fluree
+            .nameservice_mode()
+            .publisher_arc()
+            .expect("test setup requires ReadWrite nameservice mode"),
         fluree_db_indexer::IndexerConfig::small(),
     );
     fluree.set_indexing_mode(fluree_db_api::tx::IndexingMode::Background(handle.clone()));
@@ -2564,7 +2618,10 @@ async fn large_dataset_statistics_accuracy() {
 
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        fluree.nameservice_mode().publisher_arc().expect("test setup requires ReadWrite nameservice mode"),
+        fluree
+            .nameservice_mode()
+            .publisher_arc()
+            .expect("test setup requires ReadWrite nameservice mode"),
         fluree_db_indexer::IndexerConfig::small(),
     );
     fluree.set_indexing_mode(fluree_db_api::tx::IndexingMode::Background(handle.clone()));

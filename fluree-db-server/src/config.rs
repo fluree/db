@@ -1024,8 +1024,7 @@ impl ServerConfig {
             }
             if self.is_proxy_storage_mode() {
                 return Err(
-                    "raft.enabled=true is incompatible with storage-access-mode=proxy"
-                        .to_string(),
+                    "raft.enabled=true is incompatible with storage-access-mode=proxy".to_string(),
                 );
             }
         }

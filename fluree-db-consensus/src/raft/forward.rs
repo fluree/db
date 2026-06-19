@@ -152,7 +152,7 @@ pub async fn forward_to_leader(
         ForwardDecision::Forward(leader_url) => {
             forward_request(&forwarder.client, &leader_url, request)
                 .await
-                .unwrap_or_else(|e| e.into_response())
+                .unwrap_or_else(IntoResponse::into_response)
         }
         ForwardDecision::UnknownLeader(id) => (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -218,8 +218,7 @@ async fn forward_request(
     let path_and_query = original_uri
         .and_then(|uri| uri.path_and_query())
         .or_else(|| parts.uri.path_and_query())
-        .map(|pq| pq.as_str())
-        .unwrap_or("/");
+        .map_or("/", axum::http::uri::PathAndQuery::as_str);
     let leader_url = format!(
         "{}{}",
         leader_base_url.trim_end_matches('/'),
@@ -246,10 +245,7 @@ async fn forward_request(
 async fn response_from_upstream(upstream: reqwest::Response) -> Result<Response, ForwardError> {
     let status = upstream.status();
     let upstream_headers = upstream.headers().clone();
-    let body_bytes = upstream
-        .bytes()
-        .await
-        .map_err(ForwardError::ReadResponse)?;
+    let body_bytes = upstream.bytes().await.map_err(ForwardError::ReadResponse)?;
 
     let mut resp = Response::builder()
         .status(status_from_reqwest(status))
@@ -257,7 +253,7 @@ async fn response_from_upstream(upstream: reqwest::Response) -> Result<Response,
         .map_err(ForwardError::BuildResponse)?;
 
     let headers = resp.headers_mut();
-    for (name, value) in upstream_headers.iter() {
+    for (name, value) in &upstream_headers {
         if is_hop_by_hop(name.as_str()) {
             continue;
         }
@@ -329,10 +325,7 @@ mod tests {
 
     #[test]
     fn status_code_round_trips() {
-        assert_eq!(
-            status_from_reqwest(reqwest::StatusCode::OK),
-            StatusCode::OK
-        );
+        assert_eq!(status_from_reqwest(reqwest::StatusCode::OK), StatusCode::OK);
         assert_eq!(
             status_from_reqwest(reqwest::StatusCode::BAD_REQUEST),
             StatusCode::BAD_REQUEST

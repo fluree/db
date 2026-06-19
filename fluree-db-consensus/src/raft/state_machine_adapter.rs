@@ -11,11 +11,11 @@
 //! For now apply just returns the `Response` as-is.
 
 use crate::raft::log_adapter::{from_openraft_log_id, to_openraft_log_id};
+use crate::raft::staged_receipt::{AppliedReceipt, StagedReceiptMap};
 use crate::raft::state_machine::{self, Command, NameServiceState, RefKey, Response};
 use crate::raft::storage::{
     RaftSnapshotStore, RaftStorage, SnapshotId as OurSnapshotId, SnapshotMeta as OurSnapshotMeta,
 };
-use crate::raft::staged_receipt::{AppliedReceipt, StagedReceiptMap};
 use crate::raft::waiter::{AbortReason, WaiterMap};
 use crate::raft::{ClusterNode, NodeId, TypeConfig};
 use fluree_db_core::ledger_id::format_ledger_id;
@@ -195,7 +195,10 @@ enum WaiterResolution {
     /// A head-mutating admin command cleared the per-branch queue —
     /// wake every parked transactor on that branch with the
     /// matching abort reason.
-    AbortBranch { ref_key: RefKey, reason: AbortReason },
+    AbortBranch {
+        ref_key: RefKey,
+        reason: AbortReason,
+    },
 }
 
 /// Translate an apply-path `(Command, Response)` pair into the
@@ -208,31 +211,42 @@ fn waiter_resolution_for(cmd: &Command, response: &Response) -> Option<WaiterRes
         (
             Command::ApplyHead(args),
             Response::HeadApplied {
-                commit_id, commit_t, ..
+                commit_id,
+                commit_t,
+                ..
             },
         ) => Some(WaiterResolution::Applied {
             queue_id: args.queue_id,
             commit_id: commit_id.clone(),
             commit_t: *commit_t,
         }),
-        (Command::PoisonQueueEntry(_), Response::Poisoned { queue_id, reason, .. }) => {
-            Some(WaiterResolution::Aborted {
-                queue_id: *queue_id,
-                reason: AbortReason::Poisoned(reason.clone()),
-            })
-        }
-        (Command::DropBranch { ledger_id, branch, .. }, Response::BranchDropped { .. }) => {
-            Some(WaiterResolution::AbortBranch {
-                ref_key: RefKey::new(ledger_id, branch),
-                reason: AbortReason::BranchDropped,
-            })
-        }
-        (Command::PurgeLedger { ledger_id, branch, .. }, Response::Purged { .. }) => {
-            Some(WaiterResolution::AbortBranch {
-                ref_key: RefKey::new(ledger_id, branch),
-                reason: AbortReason::BranchPurged,
-            })
-        }
+        (
+            Command::PoisonQueueEntry(_),
+            Response::Poisoned {
+                queue_id, reason, ..
+            },
+        ) => Some(WaiterResolution::Aborted {
+            queue_id: *queue_id,
+            reason: AbortReason::Poisoned(reason.clone()),
+        }),
+        (
+            Command::DropBranch {
+                ledger_id, branch, ..
+            },
+            Response::BranchDropped { .. },
+        ) => Some(WaiterResolution::AbortBranch {
+            ref_key: RefKey::new(ledger_id, branch),
+            reason: AbortReason::BranchDropped,
+        }),
+        (
+            Command::PurgeLedger {
+                ledger_id, branch, ..
+            },
+            Response::Purged { .. },
+        ) => Some(WaiterResolution::AbortBranch {
+            ref_key: RefKey::new(ledger_id, branch),
+            reason: AbortReason::BranchPurged,
+        }),
         (
             Command::ResetHead {
                 ledger_id, branch, ..
@@ -263,13 +277,17 @@ fn event_for(cmd: &Command, response: &Response) -> Option<NameServiceEvent> {
             commit_id: commit_id.clone(),
             commit_t: *commit_t,
         }),
-        (Command::AdvanceIndexHead(args), Response::IndexAdvanced { index_t, index_head }) => {
-            Some(NameServiceEvent::LedgerIndexPublished {
-                ledger_id: format_ledger_id(&args.ledger_id, &args.branch),
-                index_id: index_head.clone(),
-                index_t: *index_t,
-            })
-        }
+        (
+            Command::AdvanceIndexHead(args),
+            Response::IndexAdvanced {
+                index_t,
+                index_head,
+            },
+        ) => Some(NameServiceEvent::LedgerIndexPublished {
+            ledger_id: format_ledger_id(&args.ledger_id, &args.branch),
+            index_id: index_head.clone(),
+            index_t: *index_t,
+        }),
         (Command::RetractLedger { .. }, Response::Retracted { ledger_id })
         | (Command::PurgeLedger { .. }, Response::Purged { ledger_id, .. })
         | (Command::DropBranch { .. }, Response::BranchDropped { ledger_id, .. }) => {
@@ -277,18 +295,13 @@ fn event_for(cmd: &Command, response: &Response) -> Option<NameServiceEvent> {
                 ledger_id: ledger_id.clone(),
             })
         }
-        (
-            Command::CreateBranch(_),
-            Response::BranchCreated {
-                ledger_id,
-                head,
-                t,
-            },
-        ) => Some(NameServiceEvent::LedgerCommitPublished {
-            ledger_id: ledger_id.clone(),
-            commit_id: head.clone(),
-            commit_t: *t,
-        }),
+        (Command::CreateBranch(_), Response::BranchCreated { ledger_id, head, t }) => {
+            Some(NameServiceEvent::LedgerCommitPublished {
+                ledger_id: ledger_id.clone(),
+                commit_id: head.clone(),
+                commit_t: *t,
+            })
+        }
         _ => None,
     }
 }
@@ -397,7 +410,7 @@ where
                         if let Some(s) = self.staged_receipts.as_ref() {
                             s.take(queue_id);
                         }
-                        waiters.resolve_aborted(queue_id, reason)
+                        waiters.resolve_aborted(queue_id, reason);
                     }
                     WaiterResolution::AbortBranch { ref_key, reason } => {
                         // Admin clear blew away every queue entry on
@@ -407,7 +420,7 @@ where
                         if let Some(s) = self.staged_receipts.as_ref() {
                             let _ = s.take_for_ref_key(&ref_key);
                         }
-                        waiters.abort_all_for_branch(&ref_key, reason)
+                        waiters.abort_all_for_branch(&ref_key, reason);
                     }
                 }
             }
@@ -577,7 +590,6 @@ mod tests {
         }
     }
 
-
     #[tokio::test]
     async fn apply_routes_create_ledger_to_state_machine() {
         let storage = Arc::new(MemoryRaftStorage::new());
@@ -585,7 +597,12 @@ mod tests {
         let responses = sm.apply([create_ledger_entry(1, "test/db")]).await.unwrap();
         assert_eq!(responses.len(), 1);
         assert!(matches!(responses[0], Response::Created { .. }));
-        assert!(sm.shared_state().read().await.ledgers.contains_key("test/db"));
+        assert!(sm
+            .shared_state()
+            .read()
+            .await
+            .ledgers
+            .contains_key("test/db"));
         let (applied, _) = sm.applied_state().await.unwrap();
         assert_eq!(applied, Some(log_id(1, 1)));
     }
@@ -954,10 +971,7 @@ mod tests {
         }
     }
 
-    async fn adapter_with_waiters() -> (
-        StateMachineAdapter<MemoryRaftStorage>,
-        Arc<WaiterMap>,
-    ) {
+    async fn adapter_with_waiters() -> (StateMachineAdapter<MemoryRaftStorage>, Arc<WaiterMap>) {
         let storage = Arc::new(MemoryRaftStorage::new());
         let waiter_map = Arc::new(WaiterMap::new());
         let adapter = StateMachineAdapter::new(storage).with_waiter_map(Arc::clone(&waiter_map));
@@ -967,8 +981,14 @@ mod tests {
     #[tokio::test]
     async fn apply_head_resolves_waiter_with_applied_outcome() {
         let (mut adapter, waiters) = adapter_with_waiters().await;
-        adapter.apply([create_ledger_entry(1, "test/db")]).await.unwrap();
-        adapter.apply([enqueue_entry(2, "test/db", "main")]).await.unwrap();
+        adapter
+            .apply([create_ledger_entry(1, "test/db")])
+            .await
+            .unwrap();
+        adapter
+            .apply([enqueue_entry(2, "test/db", "main")])
+            .await
+            .unwrap();
 
         let rx = waiters.register(0, RefKey::new("test/db", "main"));
         adapter
@@ -1000,8 +1020,14 @@ mod tests {
         let mut adapter = StateMachineAdapter::new(storage)
             .with_waiter_map(Arc::clone(&waiter_map))
             .with_staged_receipts(Arc::clone(&staged));
-        adapter.apply([create_ledger_entry(1, "test/db")]).await.unwrap();
-        adapter.apply([enqueue_entry(2, "test/db", "main")]).await.unwrap();
+        adapter
+            .apply([create_ledger_entry(1, "test/db")])
+            .await
+            .unwrap();
+        adapter
+            .apply([enqueue_entry(2, "test/db", "main")])
+            .await
+            .unwrap();
 
         let rx = waiter_map.register(0, RefKey::new("test/db", "main"));
         staged.stash(
@@ -1031,8 +1057,14 @@ mod tests {
     #[tokio::test]
     async fn poison_resolves_waiter_with_aborted_poisoned() {
         let (mut adapter, waiters) = adapter_with_waiters().await;
-        adapter.apply([create_ledger_entry(1, "test/db")]).await.unwrap();
-        adapter.apply([enqueue_entry(2, "test/db", "main")]).await.unwrap();
+        adapter
+            .apply([create_ledger_entry(1, "test/db")])
+            .await
+            .unwrap();
+        adapter
+            .apply([enqueue_entry(2, "test/db", "main")])
+            .await
+            .unwrap();
 
         let rx = waiters.register(0, RefKey::new("test/db", "main"));
         adapter
@@ -1059,9 +1091,18 @@ mod tests {
     #[tokio::test]
     async fn drop_branch_resolves_every_pending_waiter_on_that_branch() {
         let (mut adapter, waiters) = adapter_with_waiters().await;
-        adapter.apply([create_ledger_entry(1, "test/db")]).await.unwrap();
-        adapter.apply([enqueue_entry(2, "test/db", "main")]).await.unwrap();
-        adapter.apply([enqueue_entry(3, "test/db", "main")]).await.unwrap();
+        adapter
+            .apply([create_ledger_entry(1, "test/db")])
+            .await
+            .unwrap();
+        adapter
+            .apply([enqueue_entry(2, "test/db", "main")])
+            .await
+            .unwrap();
+        adapter
+            .apply([enqueue_entry(3, "test/db", "main")])
+            .await
+            .unwrap();
 
         let rx_a = waiters.register(0, RefKey::new("test/db", "main"));
         let rx_b = waiters.register(1, RefKey::new("test/db", "main"));
@@ -1084,8 +1125,14 @@ mod tests {
     #[tokio::test]
     async fn reset_head_resolves_waiter_with_branch_head_reset() {
         let (mut adapter, waiters) = adapter_with_waiters().await;
-        adapter.apply([create_ledger_entry(1, "test/db")]).await.unwrap();
-        adapter.apply([enqueue_entry(2, "test/db", "main")]).await.unwrap();
+        adapter
+            .apply([create_ledger_entry(1, "test/db")])
+            .await
+            .unwrap();
+        adapter
+            .apply([enqueue_entry(2, "test/db", "main")])
+            .await
+            .unwrap();
 
         let rx = waiters.register(0, RefKey::new("test/db", "main"));
         adapter

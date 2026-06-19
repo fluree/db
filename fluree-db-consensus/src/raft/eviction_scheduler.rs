@@ -143,10 +143,10 @@ mod tests {
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap()
             .as_millis() as u64;
-        let one_sec = cutoff_millis(Duration::from_secs(1))
-            .expect("system clock is past 1s of epoch");
-        let one_hour = cutoff_millis(Duration::from_secs(60 * 60))
-            .expect("system clock is past 1h of epoch");
+        let one_sec =
+            cutoff_millis(Duration::from_secs(1)).expect("system clock is past 1s of epoch");
+        let one_hour =
+            cutoff_millis(Duration::from_secs(60 * 60)).expect("system clock is past 1h of epoch");
 
         assert!(one_sec <= now);
         assert!(one_hour <= now);

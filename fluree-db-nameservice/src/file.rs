@@ -30,8 +30,8 @@ use crate::{
     check_cas_expectation, deserialize_json, parse_default_context_value, ref_values_match,
     serialize_json, AdminPublisher, CasResult, CommitPublisher, ConfigCasResult, ConfigLookup,
     ConfigPublisher, ConfigValue, GraphSourceLookup, GraphSourcePublisher, GraphSourceRecord,
-    GraphSourceType, IndexPublisher, LedgerLifecycle, NameServiceError, NsLookupResult,
-    NsRecord, RefKind, RefLookup, RefPublisher, RefValue, Result, StatusCasResult, StatusLookup,
+    GraphSourceType, IndexPublisher, LedgerLifecycle, NameServiceError, NsLookupResult, NsRecord,
+    RefKind, RefLookup, RefPublisher, RefValue, Result, StatusCasResult, StatusLookup,
     StatusPublisher, StatusValue,
 };
 use async_trait::async_trait;
@@ -2103,12 +2103,7 @@ mod tests {
             t: 2,
         };
         let result = ns
-            .compare_and_set_ref(
-                "mydb:main",
-                RefKind::CommitHead,
-                Some(&expected),
-                &new_ref,
-            )
+            .compare_and_set_ref("mydb:main", RefKind::CommitHead, Some(&expected), &new_ref)
             .await
             .unwrap();
         match result {
@@ -2134,12 +2129,7 @@ mod tests {
             t: 2,
         };
         let result = ns
-            .compare_and_set_ref(
-                "mydb:main",
-                RefKind::CommitHead,
-                Some(&expected),
-                &new_ref,
-            )
+            .compare_and_set_ref("mydb:main", RefKind::CommitHead, Some(&expected), &new_ref)
             .await
             .unwrap();
         assert_eq!(result, CasResult::Updated);
@@ -2168,12 +2158,7 @@ mod tests {
             t: 5,
         };
         let result = ns
-            .compare_and_set_ref(
-                "mydb:main",
-                RefKind::CommitHead,
-                Some(&expected),
-                &new_ref,
-            )
+            .compare_and_set_ref("mydb:main", RefKind::CommitHead, Some(&expected), &new_ref)
             .await
             .unwrap();
         match result {
@@ -2203,12 +2188,7 @@ mod tests {
             t: 5,
         };
         let result = ns
-            .compare_and_set_ref(
-                "mydb:main",
-                RefKind::IndexHead,
-                Some(&expected),
-                &new_ref,
-            )
+            .compare_and_set_ref("mydb:main", RefKind::IndexHead, Some(&expected), &new_ref)
             .await
             .unwrap();
         assert_eq!(result, CasResult::Updated);

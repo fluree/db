@@ -556,12 +556,13 @@ impl crate::Fluree {
         // With the lock held the staged base is authoritative — derive
         // `expected_head_ref` from it directly, no nameservice round-trip.
         let expected_head_ref =
-            view.base().head_commit_id.as_ref().map(|cid| {
-                fluree_db_nameservice::RefValue {
+            view.base()
+                .head_commit_id
+                .as_ref()
+                .map(|cid| fluree_db_nameservice::RefValue {
                     id: Some(cid.clone()),
                     t: view.base().t(),
-                }
-            });
+                });
 
         let staged_commit = fluree_db_transact::build_commit(
             view,

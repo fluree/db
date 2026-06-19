@@ -652,4 +652,3 @@ async fn rebase_nested_branch() {
     // Feature should NOT see Dave (main-only, not in dev's ancestry at branch time)
     // Note: Dave was added to main after dev was created, and dev hasn't been rebased.
 }
-

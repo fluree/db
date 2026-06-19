@@ -182,7 +182,11 @@ fn map_advance_index_response(resp: SmResponse) -> Result<()> {
 /// (`default_context`/`config_id`) fall back to their `NsRecord::new`
 /// defaults — see the module docs for why that's enough for
 /// follower reload.
-fn record_from_state(state: &NameServiceState, ledger_name: &str, branch: &str) -> Option<NsRecord> {
+fn record_from_state(
+    state: &NameServiceState,
+    ledger_name: &str,
+    branch: &str,
+) -> Option<NsRecord> {
     let ledger = state.ledgers.get(ledger_name)?;
     if !ledger.branches.iter().any(|b| b == branch) {
         return None;
@@ -919,8 +923,7 @@ mod tests {
     fn install_queue_front(state: &mut NameServiceState, ledger_id: &str, queue_id: u64) {
         use crate::raft::state_machine::{BodyKind, QueueEntry};
         use std::collections::VecDeque;
-        let (ledger_name, branch) =
-            split_ledger_id(ledger_id).expect("test ledger_id parses");
+        let (ledger_name, branch) = split_ledger_id(ledger_id).expect("test ledger_id parses");
         let mut queue = VecDeque::new();
         queue.push_back(QueueEntry {
             queue_id,
@@ -931,7 +934,9 @@ mod tests {
             body_cid: cid(0),
             body_kind: BodyKind::JsonLdInsert,
         });
-        state.queues.insert(RefKey::new(&ledger_name, &branch), queue);
+        state
+            .queues
+            .insert(RefKey::new(&ledger_name, &branch), queue);
     }
 
     #[test]
@@ -961,10 +966,7 @@ mod tests {
         let state = NameServiceState::default();
         let err = build_apply_head_command(&state, "test/db:main", 7, &cid(99), None)
             .expect_err("expected empty-queue error");
-        assert!(
-            err.to_string().contains("queue is empty"),
-            "got: {err}"
-        );
+        assert!(err.to_string().contains("queue is empty"), "got: {err}");
     }
 
     #[test]
@@ -1239,9 +1241,6 @@ mod tests {
             .map(|r| r.ledger_id)
             .collect();
         ids.sort();
-        assert_eq!(
-            ids,
-            vec!["a/db:feat".to_string(), "a/db:main".to_string()]
-        );
+        assert_eq!(ids, vec!["a/db:feat".to_string(), "a/db:main".to_string()]);
     }
 }

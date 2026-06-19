@@ -96,7 +96,10 @@ async fn indexed_sparql_custom_predicate_without_type_returns_results() {
 
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        fluree.nameservice_mode().publisher_arc().expect("test setup requires ReadWrite nameservice mode"),
+        fluree
+            .nameservice_mode()
+            .publisher_arc()
+            .expect("test setup requires ReadWrite nameservice mode"),
         fluree_db_indexer::IndexerConfig::small(),
     );
 
@@ -209,7 +212,10 @@ async fn indexed_sparql_union_partial_select_var() {
 
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        fluree.nameservice_mode().publisher_arc().expect("test setup requires ReadWrite nameservice mode"),
+        fluree
+            .nameservice_mode()
+            .publisher_arc()
+            .expect("test setup requires ReadWrite nameservice mode"),
         fluree_db_indexer::IndexerConfig::small(),
     );
 
@@ -282,7 +288,10 @@ async fn indexed_then_insert_novelty_custom_pred_returns_results() {
 
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        fluree.nameservice_mode().publisher_arc().expect("test setup requires ReadWrite nameservice mode"),
+        fluree
+            .nameservice_mode()
+            .publisher_arc()
+            .expect("test setup requires ReadWrite nameservice mode"),
         fluree_db_indexer::IndexerConfig::small(),
     );
 
@@ -384,7 +393,10 @@ async fn indexed_then_insert_expansion_custom_type_returns_properties() {
 
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        fluree.nameservice_mode().publisher_arc().expect("test setup requires ReadWrite nameservice mode"),
+        fluree
+            .nameservice_mode()
+            .publisher_arc()
+            .expect("test setup requires ReadWrite nameservice mode"),
         fluree_db_indexer::IndexerConfig::small(),
     );
 
@@ -484,7 +496,10 @@ async fn indexed_repeated_vars_in_triple_pattern_do_not_duplicate_schema() {
 
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        fluree.nameservice_mode().publisher_arc().expect("test setup requires ReadWrite nameservice mode"),
+        fluree
+            .nameservice_mode()
+            .publisher_arc()
+            .expect("test setup requires ReadWrite nameservice mode"),
         fluree_db_indexer::IndexerConfig::small(),
     );
 
@@ -576,7 +591,10 @@ async fn indexed_multicolumn_join_shared_object_var_executes() {
 
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        fluree.nameservice_mode().publisher_arc().expect("test setup requires ReadWrite nameservice mode"),
+        fluree
+            .nameservice_mode()
+            .publisher_arc()
+            .expect("test setup requires ReadWrite nameservice mode"),
         fluree_db_indexer::IndexerConfig::small(),
     );
 
@@ -652,7 +670,10 @@ async fn indexed_multicolumn_join_counts_pairs_not_product() {
 
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        fluree.nameservice_mode().as_arc_indexing_nameservice().expect("test fluree has writable nameservice"),
+        fluree
+            .nameservice_mode()
+            .as_arc_indexing_nameservice()
+            .expect("test fluree has writable nameservice"),
         fluree_db_indexer::IndexerConfig::small(),
     );
 
@@ -743,7 +764,10 @@ async fn indexed_sum_compare_as_count_matches_value() {
 
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        fluree.nameservice_mode().as_arc_indexing_nameservice().expect("test fluree has writable nameservice"),
+        fluree
+            .nameservice_mode()
+            .as_arc_indexing_nameservice()
+            .expect("test fluree has writable nameservice"),
         fluree_db_indexer::IndexerConfig::small(),
     );
 
@@ -876,7 +900,10 @@ async fn indexed_sum_compare_empty_predicate_matches_general() {
     let ledger_id = "it/indexed-sum-empty:main";
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        fluree.nameservice_mode().as_arc_indexing_nameservice().expect("test fluree has writable nameservice"),
+        fluree
+            .nameservice_mode()
+            .as_arc_indexing_nameservice()
+            .expect("test fluree has writable nameservice"),
         fluree_db_indexer::IndexerConfig::small(),
     );
     local
@@ -935,7 +962,10 @@ async fn indexed_rdf_type_star_count_exact_after_incremental_retraction() {
     let ledger_id = "it/indexed-typestar:main";
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        fluree.nameservice_mode().as_arc_indexing_nameservice().expect("test fluree has writable nameservice"),
+        fluree
+            .nameservice_mode()
+            .as_arc_indexing_nameservice()
+            .expect("test fluree has writable nameservice"),
         fluree_db_indexer::IndexerConfig::small(),
     );
     local
@@ -1027,7 +1057,10 @@ async fn indexed_inline_type_join_aggregate_includes_overlay_multivalue() {
     let ledger_id = "it/indexed-e2d-inline-type-agg:main";
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        fluree.nameservice_mode().as_arc_indexing_nameservice().expect("test fluree has writable nameservice"),
+        fluree
+            .nameservice_mode()
+            .as_arc_indexing_nameservice()
+            .expect("test fluree has writable nameservice"),
         fluree_db_indexer::IndexerConfig::small(),
     );
 
@@ -1177,7 +1210,10 @@ async fn indexed_inline_type_join_aggregate_matches_bare_multivalue() {
     let ledger_id = "it/indexed-e2d-inline-type-agg-full:main";
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        fluree.nameservice_mode().as_arc_indexing_nameservice().expect("test fluree has writable nameservice"),
+        fluree
+            .nameservice_mode()
+            .as_arc_indexing_nameservice()
+            .expect("test fluree has writable nameservice"),
         fluree_db_indexer::IndexerConfig::small(),
     );
 
@@ -1315,7 +1351,10 @@ async fn indexed_inline_type_star_aggregate_with_overlay_multivalue_and_facet() 
     let ledger_id = "it/indexed-e2d-inline-type-agg-facet:main";
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        fluree.nameservice_mode().as_arc_indexing_nameservice().expect("test fluree has writable nameservice"),
+        fluree
+            .nameservice_mode()
+            .as_arc_indexing_nameservice()
+            .expect("test fluree has writable nameservice"),
         fluree_db_indexer::IndexerConfig::small(),
     );
 
@@ -1457,7 +1496,10 @@ async fn indexed_rdf_type_star_count_exact_across_incremental_builds() {
     let ledger_id = "it/indexed-typestar-multi:main";
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        fluree.nameservice_mode().as_arc_indexing_nameservice().expect("test fluree has writable nameservice"),
+        fluree
+            .nameservice_mode()
+            .as_arc_indexing_nameservice()
+            .expect("test fluree has writable nameservice"),
         fluree_db_indexer::IndexerConfig::small(),
     );
     local
@@ -1632,7 +1674,10 @@ async fn indexed_number_of_predicates_from_stats_matches_general() {
     let ledger_id = "it/nop-indexed:main";
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        fluree.nameservice_mode().as_arc_indexing_nameservice().expect("test fluree has writable nameservice"),
+        fluree
+            .nameservice_mode()
+            .as_arc_indexing_nameservice()
+            .expect("test fluree has writable nameservice"),
         fluree_db_indexer::IndexerConfig::small(),
     );
     local
@@ -1757,7 +1802,10 @@ async fn indexed_number_of_subjects_and_objects_matches_general() {
     idx_config.leaf_max_bytes = 16_000;
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        fluree.nameservice_mode().as_arc_indexing_nameservice().expect("test fluree has writable nameservice"),
+        fluree
+            .nameservice_mode()
+            .as_arc_indexing_nameservice()
+            .expect("test fluree has writable nameservice"),
         idx_config,
     );
     local
@@ -1888,7 +1936,10 @@ async fn indexed_parallel_number_of_subjects_objects_matches_general() {
     idx_config.leaf_max_bytes = 8_000;
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        fluree.nameservice_mode().as_arc_indexing_nameservice().expect("test fluree has writable nameservice"),
+        fluree
+            .nameservice_mode()
+            .as_arc_indexing_nameservice()
+            .expect("test fluree has writable nameservice"),
         idx_config,
     );
     local
@@ -1951,7 +2002,10 @@ async fn indexed_parallel_star_join_count_matches_serial() {
     idx_config.leaf_max_bytes = 16_000;
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        fluree.nameservice_mode().as_arc_indexing_nameservice().expect("test fluree has writable nameservice"),
+        fluree
+            .nameservice_mode()
+            .as_arc_indexing_nameservice()
+            .expect("test fluree has writable nameservice"),
         idx_config,
     );
 
@@ -2030,7 +2084,10 @@ async fn indexed_parallel_optional_join_count_matches_serial() {
     idx_config.leaf_max_bytes = 16_000;
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        fluree.nameservice_mode().as_arc_indexing_nameservice().expect("test fluree has writable nameservice"),
+        fluree
+            .nameservice_mode()
+            .as_arc_indexing_nameservice()
+            .expect("test fluree has writable nameservice"),
         idx_config,
     );
 
@@ -2113,7 +2170,10 @@ async fn indexed_parallel_union_constraint_count_matches_serial() {
     idx_config.leaf_max_bytes = 16_000;
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        fluree.nameservice_mode().as_arc_indexing_nameservice().expect("test fluree has writable nameservice"),
+        fluree
+            .nameservice_mode()
+            .as_arc_indexing_nameservice()
+            .expect("test fluree has writable nameservice"),
         idx_config,
     );
 
@@ -2203,7 +2263,10 @@ async fn indexed_parallel_minus_intersect_count_matches_serial() {
     idx_config.leaf_max_bytes = 16_000;
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        fluree.nameservice_mode().as_arc_indexing_nameservice().expect("test fluree has writable nameservice"),
+        fluree
+            .nameservice_mode()
+            .as_arc_indexing_nameservice()
+            .expect("test fluree has writable nameservice"),
         idx_config,
     );
 
@@ -2295,7 +2358,10 @@ async fn indexed_parallel_exists_intersect_count_matches_serial() {
     idx_config.leaf_max_bytes = 16_000;
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        fluree.nameservice_mode().as_arc_indexing_nameservice().expect("test fluree has writable nameservice"),
+        fluree
+            .nameservice_mode()
+            .as_arc_indexing_nameservice()
+            .expect("test fluree has writable nameservice"),
         idx_config,
     );
 
@@ -2381,7 +2447,10 @@ async fn indexed_parallel_encoded_filter_count_matches_serial() {
     idx_config.leaf_max_bytes = 16_000;
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        fluree.nameservice_mode().as_arc_indexing_nameservice().expect("test fluree has writable nameservice"),
+        fluree
+            .nameservice_mode()
+            .as_arc_indexing_nameservice()
+            .expect("test fluree has writable nameservice"),
         idx_config,
     );
 
@@ -2456,7 +2525,10 @@ async fn indexed_parallel_numeric_compare_count_matches_serial() {
     idx_config.leaf_max_bytes = 16_000;
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        fluree.nameservice_mode().as_arc_indexing_nameservice().expect("test fluree has writable nameservice"),
+        fluree
+            .nameservice_mode()
+            .as_arc_indexing_nameservice()
+            .expect("test fluree has writable nameservice"),
         idx_config,
     );
 
@@ -2529,7 +2601,10 @@ async fn indexed_numeric_compare_mixed_int_double_counts_correctly() {
     idx_config.leaflet_rows = 100;
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        fluree.nameservice_mode().as_arc_indexing_nameservice().expect("test fluree has writable nameservice"),
+        fluree
+            .nameservice_mode()
+            .as_arc_indexing_nameservice()
+            .expect("test fluree has writable nameservice"),
         idx_config,
     );
 
@@ -2614,7 +2689,10 @@ async fn indexed_numeric_compare_global_shortcut_counts_correctly() {
     idx_config.leaf_max_bytes = 16_000;
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        fluree.nameservice_mode().as_arc_indexing_nameservice().expect("test fluree has writable nameservice"),
+        fluree
+            .nameservice_mode()
+            .as_arc_indexing_nameservice()
+            .expect("test fluree has writable nameservice"),
         idx_config,
     );
 
@@ -2703,7 +2781,10 @@ async fn overlay_numeric_compare_sum_folds_novelty() {
     let ledger_id = "it/overlay-numeric-compare:main";
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        fluree.nameservice_mode().as_arc_indexing_nameservice().expect("test fluree has writable nameservice"),
+        fluree
+            .nameservice_mode()
+            .as_arc_indexing_nameservice()
+            .expect("test fluree has writable nameservice"),
         fluree_db_indexer::IndexerConfig::small(),
     );
 
@@ -2783,7 +2864,10 @@ async fn overlay_parallel_encoded_filter_count_folds_novelty() {
     idx_config.leaf_max_bytes = 16_000;
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        fluree.nameservice_mode().as_arc_indexing_nameservice().expect("test fluree has writable nameservice"),
+        fluree
+            .nameservice_mode()
+            .as_arc_indexing_nameservice()
+            .expect("test fluree has writable nameservice"),
         idx_config,
     );
 
@@ -2868,7 +2952,10 @@ async fn overlay_parallel_numeric_compare_sum_folds_novelty() {
     idx_config.leaf_max_bytes = 16_000;
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        fluree.nameservice_mode().as_arc_indexing_nameservice().expect("test fluree has writable nameservice"),
+        fluree
+            .nameservice_mode()
+            .as_arc_indexing_nameservice()
+            .expect("test fluree has writable nameservice"),
         idx_config,
     );
 
@@ -2956,7 +3043,10 @@ async fn overlay_parallel_star_join_count_folds_novelty() {
     idx_config.leaf_max_bytes = 16_000;
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        fluree.nameservice_mode().as_arc_indexing_nameservice().expect("test fluree has writable nameservice"),
+        fluree
+            .nameservice_mode()
+            .as_arc_indexing_nameservice()
+            .expect("test fluree has writable nameservice"),
         idx_config,
     );
 
@@ -3044,7 +3134,10 @@ async fn overlay_parallel_optional_join_count_folds_novelty() {
     idx_config.leaf_max_bytes = 16_000;
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        fluree.nameservice_mode().as_arc_indexing_nameservice().expect("test fluree has writable nameservice"),
+        fluree
+            .nameservice_mode()
+            .as_arc_indexing_nameservice()
+            .expect("test fluree has writable nameservice"),
         idx_config,
     );
 
@@ -3135,7 +3228,10 @@ async fn overlay_parallel_union_constraint_count_folds_novelty() {
     idx_config.leaf_max_bytes = 16_000;
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        fluree.nameservice_mode().as_arc_indexing_nameservice().expect("test fluree has writable nameservice"),
+        fluree
+            .nameservice_mode()
+            .as_arc_indexing_nameservice()
+            .expect("test fluree has writable nameservice"),
         idx_config,
     );
 
@@ -3229,7 +3325,10 @@ async fn overlay_parallel_minus_exists_intersect_count_folds_novelty() {
     idx_config.leaf_max_bytes = 16_000;
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        fluree.nameservice_mode().as_arc_indexing_nameservice().expect("test fluree has writable nameservice"),
+        fluree
+            .nameservice_mode()
+            .as_arc_indexing_nameservice()
+            .expect("test fluree has writable nameservice"),
         idx_config,
     );
 
@@ -3350,7 +3449,10 @@ async fn overlay_delta_single_predicate_count_folds_novelty() {
     idx_config.leaf_max_bytes = 16_000;
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        fluree.nameservice_mode().as_arc_indexing_nameservice().expect("test fluree has writable nameservice"),
+        fluree
+            .nameservice_mode()
+            .as_arc_indexing_nameservice()
+            .expect("test fluree has writable nameservice"),
         idx_config,
     );
 
@@ -3444,7 +3546,10 @@ async fn overlay_delta_count_folds_novelty_below_first_leaf() {
     idx_config.leaf_max_bytes = 16_000;
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        fluree.nameservice_mode().as_arc_indexing_nameservice().expect("test fluree has writable nameservice"),
+        fluree
+            .nameservice_mode()
+            .as_arc_indexing_nameservice()
+            .expect("test fluree has writable nameservice"),
         idx_config,
     );
 
@@ -3545,7 +3650,10 @@ async fn overlay_delta_union_count_folds_novelty() {
     idx_config.leaflet_rows = 100;
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        fluree.nameservice_mode().as_arc_indexing_nameservice().expect("test fluree has writable nameservice"),
+        fluree
+            .nameservice_mode()
+            .as_arc_indexing_nameservice()
+            .expect("test fluree has writable nameservice"),
         idx_config,
     );
 
@@ -3640,7 +3748,10 @@ async fn indexed_bound_class_property_count_from_class_stats() {
     let ledger_id = "it/indexed-bound-class-prop:main";
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        fluree.nameservice_mode().as_arc_indexing_nameservice().expect("test fluree has writable nameservice"),
+        fluree
+            .nameservice_mode()
+            .as_arc_indexing_nameservice()
+            .expect("test fluree has writable nameservice"),
         fluree_db_indexer::IndexerConfig::small(),
     );
     local
@@ -3713,7 +3824,10 @@ async fn overlay_lang_filter_count_folds_novelty() {
     let ledger_id = "it/overlay-lang-filter:main";
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        fluree.nameservice_mode().as_arc_indexing_nameservice().expect("test fluree has writable nameservice"),
+        fluree
+            .nameservice_mode()
+            .as_arc_indexing_nameservice()
+            .expect("test fluree has writable nameservice"),
         fluree_db_indexer::IndexerConfig::small(),
     );
 
@@ -3785,7 +3899,10 @@ async fn overlay_encoded_filter_count_folds_novelty() {
     let ledger_id = "it/overlay-encoded-filter:main";
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        fluree.nameservice_mode().as_arc_indexing_nameservice().expect("test fluree has writable nameservice"),
+        fluree
+            .nameservice_mode()
+            .as_arc_indexing_nameservice()
+            .expect("test fluree has writable nameservice"),
         fluree_db_indexer::IndexerConfig::small(),
     );
 
@@ -3864,7 +3981,10 @@ async fn indexed_group_by_object_count_topk_run_spanning() {
 
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        fluree.nameservice_mode().as_arc_indexing_nameservice().expect("test fluree has writable nameservice"),
+        fluree
+            .nameservice_mode()
+            .as_arc_indexing_nameservice()
+            .expect("test fluree has writable nameservice"),
         fluree_db_indexer::IndexerConfig::small(),
     );
 
@@ -3935,7 +4055,10 @@ async fn indexed_predicate_count_excludes_indexed_retractions() {
 
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        fluree.nameservice_mode().as_arc_indexing_nameservice().expect("test fluree has writable nameservice"),
+        fluree
+            .nameservice_mode()
+            .as_arc_indexing_nameservice()
+            .expect("test fluree has writable nameservice"),
         fluree_db_indexer::IndexerConfig::small(),
     );
 
@@ -4018,7 +4141,10 @@ async fn indexed_star_join_seek_strategy_counts_correctly() {
 
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        fluree.nameservice_mode().as_arc_indexing_nameservice().expect("test fluree has writable nameservice"),
+        fluree
+            .nameservice_mode()
+            .as_arc_indexing_nameservice()
+            .expect("test fluree has writable nameservice"),
         fluree_db_indexer::IndexerConfig::small(),
     );
 
@@ -4093,7 +4219,10 @@ async fn indexed_modifier_seek_exists_minus_counts_correctly() {
 
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        fluree.nameservice_mode().as_arc_indexing_nameservice().expect("test fluree has writable nameservice"),
+        fluree
+            .nameservice_mode()
+            .as_arc_indexing_nameservice()
+            .expect("test fluree has writable nameservice"),
         fluree_db_indexer::IndexerConfig::small(),
     );
 
@@ -4190,7 +4319,10 @@ async fn indexed_optional_seek_counts_correctly() {
 
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        fluree.nameservice_mode().as_arc_indexing_nameservice().expect("test fluree has writable nameservice"),
+        fluree
+            .nameservice_mode()
+            .as_arc_indexing_nameservice()
+            .expect("test fluree has writable nameservice"),
         fluree_db_indexer::IndexerConfig::small(),
     );
 
@@ -4276,7 +4408,10 @@ async fn indexed_union_count_all_rows_metadata_lane() {
 
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        fluree.nameservice_mode().as_arc_indexing_nameservice().expect("test fluree has writable nameservice"),
+        fluree
+            .nameservice_mode()
+            .as_arc_indexing_nameservice()
+            .expect("test fluree has writable nameservice"),
         fluree_db_indexer::IndexerConfig::small(),
     );
 
@@ -4346,7 +4481,10 @@ async fn indexed_overlay_union_count_reflects_overlay() {
 
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        fluree.nameservice_mode().as_arc_indexing_nameservice().expect("test fluree has writable nameservice"),
+        fluree
+            .nameservice_mode()
+            .as_arc_indexing_nameservice()
+            .expect("test fluree has writable nameservice"),
         fluree_db_indexer::IndexerConfig::small(),
     );
 
@@ -4445,7 +4583,10 @@ async fn indexed_union_count_time_travel_uses_cursor_path() {
 
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        fluree.nameservice_mode().as_arc_indexing_nameservice().expect("test fluree has writable nameservice"),
+        fluree
+            .nameservice_mode()
+            .as_arc_indexing_nameservice()
+            .expect("test fluree has writable nameservice"),
         fluree_db_indexer::IndexerConfig::small(),
     );
 
@@ -4547,7 +4688,10 @@ async fn indexed_overlay_count_reflects_retract_and_reassert() {
 
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        fluree.nameservice_mode().publisher_arc().expect("test setup requires ReadWrite nameservice mode"),
+        fluree
+            .nameservice_mode()
+            .publisher_arc()
+            .expect("test setup requires ReadWrite nameservice mode"),
         fluree_db_indexer::IndexerConfig::small(),
     );
 
@@ -4686,7 +4830,10 @@ async fn indexed_overlay_count_star_drain_count_reflects_overlay() {
 
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        fluree.nameservice_mode().as_arc_indexing_nameservice().expect("test fluree has writable nameservice"),
+        fluree
+            .nameservice_mode()
+            .as_arc_indexing_nameservice()
+            .expect("test fluree has writable nameservice"),
         fluree_db_indexer::IndexerConfig::small(),
     );
 
@@ -4816,7 +4963,10 @@ async fn indexed_overlay_count_encoded_filter_reflects_overlay() {
 
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        fluree.nameservice_mode().as_arc_indexing_nameservice().expect("test fluree has writable nameservice"),
+        fluree
+            .nameservice_mode()
+            .as_arc_indexing_nameservice()
+            .expect("test fluree has writable nameservice"),
         fluree_db_indexer::IndexerConfig::small(),
     );
 
@@ -4947,7 +5097,10 @@ async fn indexed_overlay_star_join_count_reflects_overlay() {
 
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        fluree.nameservice_mode().as_arc_indexing_nameservice().expect("test fluree has writable nameservice"),
+        fluree
+            .nameservice_mode()
+            .as_arc_indexing_nameservice()
+            .expect("test fluree has writable nameservice"),
         fluree_db_indexer::IndexerConfig::small(),
     );
 
@@ -5077,7 +5230,10 @@ async fn indexed_overlay_minus_subject_count_reflects_overlay() {
 
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        fluree.nameservice_mode().as_arc_indexing_nameservice().expect("test fluree has writable nameservice"),
+        fluree
+            .nameservice_mode()
+            .as_arc_indexing_nameservice()
+            .expect("test fluree has writable nameservice"),
         fluree_db_indexer::IndexerConfig::small(),
     );
 
@@ -5207,7 +5363,10 @@ async fn indexed_overlay_exists_subject_count_reflects_overlay() {
 
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        fluree.nameservice_mode().as_arc_indexing_nameservice().expect("test fluree has writable nameservice"),
+        fluree
+            .nameservice_mode()
+            .as_arc_indexing_nameservice()
+            .expect("test fluree has writable nameservice"),
         fluree_db_indexer::IndexerConfig::small(),
     );
 
@@ -5339,7 +5498,10 @@ async fn indexed_overlay_optional_count_reflects_overlay() {
 
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        fluree.nameservice_mode().as_arc_indexing_nameservice().expect("test fluree has writable nameservice"),
+        fluree
+            .nameservice_mode()
+            .as_arc_indexing_nameservice()
+            .expect("test fluree has writable nameservice"),
         fluree_db_indexer::IndexerConfig::small(),
     );
 
@@ -5470,7 +5632,10 @@ async fn indexed_overlay_composite_join_count_reflects_overlay() {
 
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        fluree.nameservice_mode().as_arc_indexing_nameservice().expect("test fluree has writable nameservice"),
+        fluree
+            .nameservice_mode()
+            .as_arc_indexing_nameservice()
+            .expect("test fluree has writable nameservice"),
         fluree_db_indexer::IndexerConfig::small(),
     );
 
@@ -5603,7 +5768,10 @@ async fn indexed_overlay_object_exists_count_reflects_overlay() {
 
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        fluree.nameservice_mode().as_arc_indexing_nameservice().expect("test fluree has writable nameservice"),
+        fluree
+            .nameservice_mode()
+            .as_arc_indexing_nameservice()
+            .expect("test fluree has writable nameservice"),
         fluree_db_indexer::IndexerConfig::small(),
     );
 
@@ -5731,7 +5899,10 @@ async fn indexed_overlay_object_minus_count_reflects_overlay() {
 
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        fluree.nameservice_mode().as_arc_indexing_nameservice().expect("test fluree has writable nameservice"),
+        fluree
+            .nameservice_mode()
+            .as_arc_indexing_nameservice()
+            .expect("test fluree has writable nameservice"),
         fluree_db_indexer::IndexerConfig::small(),
     );
 
@@ -5860,7 +6031,10 @@ async fn indexed_overlay_object_chain_exists_count_reflects_overlay() {
 
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        fluree.nameservice_mode().as_arc_indexing_nameservice().expect("test fluree has writable nameservice"),
+        fluree
+            .nameservice_mode()
+            .as_arc_indexing_nameservice()
+            .expect("test fluree has writable nameservice"),
         fluree_db_indexer::IndexerConfig::small(),
     );
 
@@ -5994,7 +6168,10 @@ async fn indexed_overlay_chain2_count_reflects_overlay() {
 
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        fluree.nameservice_mode().as_arc_indexing_nameservice().expect("test fluree has writable nameservice"),
+        fluree
+            .nameservice_mode()
+            .as_arc_indexing_nameservice()
+            .expect("test fluree has writable nameservice"),
         fluree_db_indexer::IndexerConfig::small(),
     );
 
@@ -6107,7 +6284,10 @@ async fn indexed_overlay_chain3_count_reflects_overlay() {
 
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        fluree.nameservice_mode().as_arc_indexing_nameservice().expect("test fluree has writable nameservice"),
+        fluree
+            .nameservice_mode()
+            .as_arc_indexing_nameservice()
+            .expect("test fluree has writable nameservice"),
         fluree_db_indexer::IndexerConfig::small(),
     );
 
@@ -6221,7 +6401,10 @@ async fn indexed_overlay_chain_tail_exists_count_reflects_overlay() {
 
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        fluree.nameservice_mode().as_arc_indexing_nameservice().expect("test fluree has writable nameservice"),
+        fluree
+            .nameservice_mode()
+            .as_arc_indexing_nameservice()
+            .expect("test fluree has writable nameservice"),
         fluree_db_indexer::IndexerConfig::small(),
     );
 
@@ -6335,7 +6518,10 @@ async fn indexed_overlay_chain_tail_minus_count_reflects_overlay() {
 
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        fluree.nameservice_mode().as_arc_indexing_nameservice().expect("test fluree has writable nameservice"),
+        fluree
+            .nameservice_mode()
+            .as_arc_indexing_nameservice()
+            .expect("test fluree has writable nameservice"),
         fluree_db_indexer::IndexerConfig::small(),
     );
 
@@ -6452,7 +6638,10 @@ async fn indexed_overlay_optional_chain_head_count_reflects_overlay() {
 
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        fluree.nameservice_mode().as_arc_indexing_nameservice().expect("test fluree has writable nameservice"),
+        fluree
+            .nameservice_mode()
+            .as_arc_indexing_nameservice()
+            .expect("test fluree has writable nameservice"),
         fluree_db_indexer::IndexerConfig::small(),
     );
 
@@ -6572,7 +6761,10 @@ async fn indexed_optional_chain_head_literal_p1_object_counts_once() {
     let ledger_id = "it/opt-chain-literal-p1:main";
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        fluree.nameservice_mode().as_arc_indexing_nameservice().expect("test fluree has writable nameservice"),
+        fluree
+            .nameservice_mode()
+            .as_arc_indexing_nameservice()
+            .expect("test fluree has writable nameservice"),
         fluree_db_indexer::IndexerConfig::small(),
     );
     local
@@ -6662,7 +6854,10 @@ async fn indexed_optional_chain_head_absent_p2_counts_all_p1_rows() {
     let ledger_id = "it/opt-chain-absent-p2:main";
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        fluree.nameservice_mode().as_arc_indexing_nameservice().expect("test fluree has writable nameservice"),
+        fluree
+            .nameservice_mode()
+            .as_arc_indexing_nameservice()
+            .expect("test fluree has writable nameservice"),
         fluree_db_indexer::IndexerConfig::small(),
     );
     local
@@ -6732,7 +6927,10 @@ async fn indexed_overlay_property_path_plus_count_reflects_overlay() {
 
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        fluree.nameservice_mode().as_arc_indexing_nameservice().expect("test fluree has writable nameservice"),
+        fluree
+            .nameservice_mode()
+            .as_arc_indexing_nameservice()
+            .expect("test fluree has writable nameservice"),
         fluree_db_indexer::IndexerConfig::small(),
     );
 
@@ -6869,7 +7067,10 @@ async fn indexed_overlay_property_path_plus_count_subject_in_overlay_only() {
 
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        fluree.nameservice_mode().as_arc_indexing_nameservice().expect("test fluree has writable nameservice"),
+        fluree
+            .nameservice_mode()
+            .as_arc_indexing_nameservice()
+            .expect("test fluree has writable nameservice"),
         fluree_db_indexer::IndexerConfig::small(),
     );
 
@@ -6957,7 +7158,10 @@ async fn indexed_overlay_group_by_count_topk_reflects_overlay() {
 
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        fluree.nameservice_mode().publisher_arc().expect("test setup requires ReadWrite nameservice mode"),
+        fluree
+            .nameservice_mode()
+            .publisher_arc()
+            .expect("test setup requires ReadWrite nameservice mode"),
         fluree_db_indexer::IndexerConfig::small(),
     );
 
@@ -7088,7 +7292,10 @@ async fn indexed_novelty_only_subject_returns_data() {
 
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        fluree.nameservice_mode().publisher_arc().expect("test setup requires ReadWrite nameservice mode"),
+        fluree
+            .nameservice_mode()
+            .publisher_arc()
+            .expect("test setup requires ReadWrite nameservice mode"),
         fluree_db_indexer::IndexerConfig::small(),
     );
 
@@ -7195,7 +7402,10 @@ async fn indexed_novelty_only_string_object_returns_data() {
 
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        fluree.nameservice_mode().publisher_arc().expect("test setup requires ReadWrite nameservice mode"),
+        fluree
+            .nameservice_mode()
+            .publisher_arc()
+            .expect("test setup requires ReadWrite nameservice mode"),
         fluree_db_indexer::IndexerConfig::small(),
     );
 
@@ -7302,7 +7512,10 @@ async fn indexed_string_functions_work_for_indexed_and_overlay_strings() {
 
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        fluree.nameservice_mode().publisher_arc().expect("test setup requires ReadWrite nameservice mode"),
+        fluree
+            .nameservice_mode()
+            .publisher_arc()
+            .expect("test setup requires ReadWrite nameservice mode"),
         fluree_db_indexer::IndexerConfig::small(),
     );
 
@@ -7546,7 +7759,10 @@ async fn indexed_count_with_lang_filter_counts_matching_lang_tag_rows() {
 
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        fluree.nameservice_mode().publisher_arc().expect("test setup requires ReadWrite nameservice mode"),
+        fluree
+            .nameservice_mode()
+            .publisher_arc()
+            .expect("test setup requires ReadWrite nameservice mode"),
         fluree_db_indexer::IndexerConfig::small(),
     );
 
@@ -7620,7 +7836,10 @@ async fn indexed_numeric_sum_fast_paths_work_for_identity_and_add_self() {
 
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        fluree.nameservice_mode().publisher_arc().expect("test setup requires ReadWrite nameservice mode"),
+        fluree
+            .nameservice_mode()
+            .publisher_arc()
+            .expect("test setup requires ReadWrite nameservice mode"),
         fluree_db_indexer::IndexerConfig::small(),
     );
 
@@ -7709,7 +7928,10 @@ async fn indexed_numeric_count_fast_path_handles_threshold_filters() {
 
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        fluree.nameservice_mode().publisher_arc().expect("test setup requires ReadWrite nameservice mode"),
+        fluree
+            .nameservice_mode()
+            .publisher_arc()
+            .expect("test setup requires ReadWrite nameservice mode"),
         fluree_db_indexer::IndexerConfig::small(),
     );
 
@@ -7803,7 +8025,10 @@ async fn indexed_numeric_avg_min_max_fast_paths_work() {
 
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        fluree.nameservice_mode().publisher_arc().expect("test setup requires ReadWrite nameservice mode"),
+        fluree
+            .nameservice_mode()
+            .publisher_arc()
+            .expect("test setup requires ReadWrite nameservice mode"),
         fluree_db_indexer::IndexerConfig::small(),
     );
 
@@ -7907,7 +8132,10 @@ async fn indexed_strstarts_sum_counts_prefix_matches() {
 
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        fluree.nameservice_mode().publisher_arc().expect("test setup requires ReadWrite nameservice mode"),
+        fluree
+            .nameservice_mode()
+            .publisher_arc()
+            .expect("test setup requires ReadWrite nameservice mode"),
         fluree_db_indexer::IndexerConfig::small(),
     );
 
@@ -7985,7 +8213,10 @@ async fn indexed_novelty_only_ref_object_returns_data() {
 
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        fluree.nameservice_mode().publisher_arc().expect("test setup requires ReadWrite nameservice mode"),
+        fluree
+            .nameservice_mode()
+            .publisher_arc()
+            .expect("test setup requires ReadWrite nameservice mode"),
         fluree_db_indexer::IndexerConfig::small(),
     );
 
@@ -8099,7 +8330,10 @@ async fn indexed_iri_ref_and_blank_node_resolve_correctly() {
 
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        fluree.nameservice_mode().publisher_arc().expect("test setup requires ReadWrite nameservice mode"),
+        fluree
+            .nameservice_mode()
+            .publisher_arc()
+            .expect("test setup requires ReadWrite nameservice mode"),
         fluree_db_indexer::IndexerConfig::small(),
     );
 
@@ -8242,7 +8476,10 @@ async fn indexed_count_literal_objects_from_stats() {
 
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        fluree.nameservice_mode().as_arc_indexing_nameservice().expect("test fluree has writable nameservice"),
+        fluree
+            .nameservice_mode()
+            .as_arc_indexing_nameservice()
+            .expect("test fluree has writable nameservice"),
         fluree_db_indexer::IndexerConfig::small(),
     );
 
@@ -8316,7 +8553,10 @@ async fn indexed_count_literal_objects_with_blank_node_object() {
 
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        fluree.nameservice_mode().as_arc_indexing_nameservice().expect("test fluree has writable nameservice"),
+        fluree
+            .nameservice_mode()
+            .as_arc_indexing_nameservice()
+            .expect("test fluree has writable nameservice"),
         fluree_db_indexer::IndexerConfig::small(),
     );
 
@@ -8394,7 +8634,10 @@ async fn indexed_overlay_scalar_agg_reflects_assert_and_retract() {
 
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        fluree.nameservice_mode().as_arc_indexing_nameservice().expect("test fluree has writable nameservice"),
+        fluree
+            .nameservice_mode()
+            .as_arc_indexing_nameservice()
+            .expect("test fluree has writable nameservice"),
         fluree_db_indexer::IndexerConfig::small(),
     );
 
@@ -8558,7 +8801,10 @@ async fn indexed_overlay_count_no_cache_projection_invariant() {
 
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        fluree.nameservice_mode().as_arc_indexing_nameservice().expect("test fluree has writable nameservice"),
+        fluree
+            .nameservice_mode()
+            .as_arc_indexing_nameservice()
+            .expect("test fluree has writable nameservice"),
         fluree_db_indexer::IndexerConfig::small(),
     );
 
@@ -8653,7 +8899,10 @@ async fn indexed_inline_type_star_aggregate_overlay_undercount_regression() {
 
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        fluree.nameservice_mode().as_arc_indexing_nameservice().expect("test fluree has writable nameservice"),
+        fluree
+            .nameservice_mode()
+            .as_arc_indexing_nameservice()
+            .expect("test fluree has writable nameservice"),
         fluree_db_indexer::IndexerConfig::small(),
     );
 

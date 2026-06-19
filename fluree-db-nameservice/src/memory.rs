@@ -7,10 +7,9 @@
 use crate::{
     check_cas_expectation, ref_values_match, AdminPublisher, CasResult, CommitPublisher,
     ConfigCasResult, ConfigLookup, ConfigPublisher, ConfigValue, GraphSourceLookup,
-    GraphSourcePublisher, IndexPublisher, LedgerLifecycle,
-    GraphSourceRecord, GraphSourceType, NsLookupResult, NsRecord,
-    RefKind, RefLookup, RefPublisher, RefValue, Result, StatusCasResult, StatusLookup,
-    StatusPayload, StatusPublisher, StatusValue,
+    GraphSourcePublisher, GraphSourceRecord, GraphSourceType, IndexPublisher, LedgerLifecycle,
+    NsLookupResult, NsRecord, RefKind, RefLookup, RefPublisher, RefValue, Result, StatusCasResult,
+    StatusLookup, StatusPayload, StatusPublisher, StatusValue,
 };
 use async_trait::async_trait;
 use fluree_db_core::format_ledger_id;
@@ -1050,12 +1049,7 @@ mod tests {
             t: 2,
         };
         let result = ns
-            .compare_and_set_ref(
-                "mydb:main",
-                RefKind::CommitHead,
-                Some(&expected),
-                &new_ref,
-            )
+            .compare_and_set_ref("mydb:main", RefKind::CommitHead, Some(&expected), &new_ref)
             .await
             .unwrap();
         match result {
@@ -1082,12 +1076,7 @@ mod tests {
             t: 2,
         };
         let result = ns
-            .compare_and_set_ref(
-                "mydb:main",
-                RefKind::CommitHead,
-                Some(&expected),
-                &new_ref,
-            )
+            .compare_and_set_ref("mydb:main", RefKind::CommitHead, Some(&expected), &new_ref)
             .await
             .unwrap();
         assert_eq!(result, CasResult::Updated);
@@ -1118,12 +1107,7 @@ mod tests {
             t: 5,
         };
         let result = ns
-            .compare_and_set_ref(
-                "mydb:main",
-                RefKind::CommitHead,
-                Some(&expected),
-                &new_ref,
-            )
+            .compare_and_set_ref("mydb:main", RefKind::CommitHead, Some(&expected), &new_ref)
             .await
             .unwrap();
         match result {
@@ -1137,12 +1121,7 @@ mod tests {
             t: 3,
         };
         let result = ns
-            .compare_and_set_ref(
-                "mydb:main",
-                RefKind::CommitHead,
-                Some(&expected),
-                &new_ref,
-            )
+            .compare_and_set_ref("mydb:main", RefKind::CommitHead, Some(&expected), &new_ref)
             .await
             .unwrap();
         match result {
@@ -1171,12 +1150,7 @@ mod tests {
             t: 5,
         };
         let result = ns
-            .compare_and_set_ref(
-                "mydb:main",
-                RefKind::IndexHead,
-                Some(&expected),
-                &new_ref,
-            )
+            .compare_and_set_ref("mydb:main", RefKind::IndexHead, Some(&expected), &new_ref)
             .await
             .unwrap();
         assert_eq!(result, CasResult::Updated);
@@ -1242,12 +1216,7 @@ mod tests {
             t: 2,
         };
         let result = ns
-            .compare_and_set_ref(
-                "mydb:main",
-                RefKind::CommitHead,
-                Some(&expected),
-                &new_ref,
-            )
+            .compare_and_set_ref("mydb:main", RefKind::CommitHead, Some(&expected), &new_ref)
             .await
             .unwrap();
         match result {

@@ -20,6 +20,7 @@
 
 use crate::commit_data::{collect_from_commits, CollectedCommitData};
 use crate::error::{ApiError, Result};
+use crate::ledger_manager::GuardedStagedCommit;
 use crate::ledger_view::{CommitRef, LedgerView};
 use crate::rebase::ConflictStrategy;
 use fluree_db_core::commit::{TxnMetaEntry, TxnMetaValue};
@@ -30,7 +31,6 @@ use fluree_db_core::{
 };
 use fluree_db_ledger::{LedgerState, StagedLedger};
 use fluree_db_nameservice::NsRecordSnapshot;
-use crate::ledger_manager::GuardedStagedCommit;
 use fluree_db_transact::{CommitOpts, NamespaceRegistry};
 use fluree_vocab::namespaces::FLUREE_DB;
 use futures::TryStreamExt;
@@ -283,7 +283,8 @@ impl crate::Fluree {
                     error = %e,
                     "revert failed, rolling back nameservice state"
                 );
-                if let Err(rollback_err) = self.branch_admin()?.reset_head(&branch_id, snapshot).await
+                if let Err(rollback_err) =
+                    self.branch_admin()?.reset_head(&branch_id, snapshot).await
                 {
                     tracing::error!(
                         branch = %branch_id,
@@ -509,12 +510,14 @@ impl crate::Fluree {
 
         // With the lock held the staged base is authoritative — derive
         // `expected_head_ref` from it directly, no nameservice round-trip.
-        let expected_head_ref = view.base().head_commit_id.as_ref().map(|cid| {
-            fluree_db_nameservice::RefValue {
-                id: Some(cid.clone()),
-                t: view.base().t(),
-            }
-        });
+        let expected_head_ref =
+            view.base()
+                .head_commit_id
+                .as_ref()
+                .map(|cid| fluree_db_nameservice::RefValue {
+                    id: Some(cid.clone()),
+                    t: view.base().t(),
+                });
 
         let staged_commit = fluree_db_transact::build_commit(
             view,
@@ -645,7 +648,6 @@ pub struct StagedRevert {
     /// `current_head_t` / `current_head_id` as the no-op result).
     pub commit: Option<GuardedStagedCommit>,
 }
-
 
 // ---------------------------------------------------------------------------
 // Helpers

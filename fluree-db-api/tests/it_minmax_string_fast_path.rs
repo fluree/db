@@ -184,7 +184,10 @@ async fn incremental_index_min_max_is_value_ordered() {
 
     let (local, handle) = support::start_background_indexer_local(
         fluree.backend().clone(),
-        fluree.nameservice_mode().as_arc_indexing_nameservice().expect("test fluree has writable nameservice"),
+        fluree
+            .nameservice_mode()
+            .as_arc_indexing_nameservice()
+            .expect("test fluree has writable nameservice"),
         fluree_db_indexer::IndexerConfig::small(),
     );
 
@@ -279,7 +282,10 @@ async fn min_max_value_ordered_alongside_group_concat() {
 
     let (local, handle) = support::start_background_indexer_local(
         fluree.backend().clone(),
-        fluree.nameservice_mode().as_arc_indexing_nameservice().expect("test fluree has writable nameservice"),
+        fluree
+            .nameservice_mode()
+            .as_arc_indexing_nameservice()
+            .expect("test fluree has writable nameservice"),
         fluree_db_indexer::IndexerConfig::small(),
     );
 
@@ -365,7 +371,10 @@ async fn novelty_above_index_head_is_visible() {
 
     let (local, handle) = support::start_background_indexer_local(
         fluree.backend().clone(),
-        fluree.nameservice_mode().as_arc_indexing_nameservice().expect("test fluree has writable nameservice"),
+        fluree
+            .nameservice_mode()
+            .as_arc_indexing_nameservice()
+            .expect("test fluree has writable nameservice"),
         fluree_db_indexer::IndexerConfig::small(),
     );
 

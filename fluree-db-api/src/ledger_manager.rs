@@ -854,7 +854,8 @@ impl LedgerManager {
                 // Stale: fall through to the load path, which will
                 // re-fetch from nameservice + backend.
                 self.entries.write().await.remove(&canonical_alias);
-            } else if let Some(LoadState::Reloading { handle, .. }) = entries.get(&canonical_alias) {
+            } else if let Some(LoadState::Reloading { handle, .. }) = entries.get(&canonical_alias)
+            {
                 // Handle is valid even during reload
                 return Ok(handle.clone());
             }
@@ -2129,7 +2130,11 @@ mod tests {
             }
         };
         writable
-            .publish_commit("test:main", 12, &ContentId::new(ContentKind::Commit, b"c12"))
+            .publish_commit(
+                "test:main",
+                12,
+                &ContentId::new(ContentKind::Commit, b"c12"),
+            )
             .await
             .unwrap();
         assert!(mgr_on.cached_handle_is_stale(&handle).await);

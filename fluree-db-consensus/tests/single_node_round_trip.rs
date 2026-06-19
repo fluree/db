@@ -52,7 +52,8 @@ impl RaftNetwork<TypeConfig> for StubNetwork {
         &mut self,
         _rpc: AppendEntriesRequest<TypeConfig>,
         _option: RPCOption,
-    ) -> Result<AppendEntriesResponse<NodeId>, RPCError<NodeId, ClusterNode, RaftError<NodeId>>> {
+    ) -> Result<AppendEntriesResponse<NodeId>, RPCError<NodeId, ClusterNode, RaftError<NodeId>>>
+    {
         panic!("single-node Raft should never invoke append_entries");
     }
 
@@ -249,8 +250,7 @@ async fn single_node_apply_emits_commit_event_on_bus() {
     let storage = Arc::new(MemoryRaftStorage::new());
     let event_bus = Arc::new(LedgerEventBus::new(16));
     let log = LogAdapter::new(Arc::clone(&storage));
-    let sm =
-        StateMachineAdapter::new(Arc::clone(&storage)).with_event_bus(Arc::clone(&event_bus));
+    let sm = StateMachineAdapter::new(Arc::clone(&storage)).with_event_bus(Arc::clone(&event_bus));
 
     let config = Config {
         cluster_name: "single-node-event-bus".into(),
@@ -351,8 +351,7 @@ async fn single_node_ledger_lifecycle_round_trip() {
     let storage = Arc::new(MemoryRaftStorage::new());
     let bus = Arc::new(LedgerEventBus::new(16));
     let log = LogAdapter::new(Arc::clone(&storage));
-    let sm =
-        StateMachineAdapter::new(Arc::clone(&storage)).with_event_bus(Arc::clone(&bus));
+    let sm = StateMachineAdapter::new(Arc::clone(&storage)).with_event_bus(Arc::clone(&bus));
     let shared_state = sm.shared_state();
 
     let config = Config {
@@ -407,7 +406,9 @@ async fn single_node_ledger_lifecycle_round_trip() {
     }
 
     // Idempotent retract is Ok and emits nothing.
-    ns.retract("test/db:main").await.expect("retract idempotent");
+    ns.retract("test/db:main")
+        .await
+        .expect("retract idempotent");
     assert!(sub.receiver.try_recv().is_err());
 
     // Init still refuses while the record is retracted.
@@ -446,8 +447,7 @@ async fn single_node_branch_lifecycle_round_trip() {
     let storage = Arc::new(MemoryRaftStorage::new());
     let bus = Arc::new(LedgerEventBus::new(16));
     let log = LogAdapter::new(Arc::clone(&storage));
-    let sm =
-        StateMachineAdapter::new(Arc::clone(&storage)).with_event_bus(Arc::clone(&bus));
+    let sm = StateMachineAdapter::new(Arc::clone(&storage)).with_event_bus(Arc::clone(&bus));
     let shared_state = sm.shared_state();
 
     let config = Config {

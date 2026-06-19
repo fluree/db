@@ -194,7 +194,10 @@ async fn notify_index_only_trims_novelty() {
     // Start a background indexer
     let (local, indexer_handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        fluree.nameservice_mode().publisher_arc().expect("test setup requires ReadWrite nameservice mode"),
+        fluree
+            .nameservice_mode()
+            .publisher_arc()
+            .expect("test setup requires ReadWrite nameservice mode"),
         fluree_db_indexer::IndexerConfig::small(),
     );
 

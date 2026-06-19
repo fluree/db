@@ -460,27 +460,26 @@ impl FlureeServerBuilder {
         // every node's reads observe replicated state; default mode
         // uses whatever the storage backend implies.
         #[cfg(feature = "raft")]
-        let (fluree, cache_stats_handle) =
-            if let Some(raft_ns) = raft_nameservice.as_ref() {
-                // RaftNameService satisfies both LifecycleNameService
-                // (NameServiceLookup + LedgerLifecycle + BranchLifecycle)
-                // and IndexingNameService (NameServiceLookup +
-                // IndexPublisher), so both Lifecycle fields hold a
-                // clone of the same Arc. Method-form `.clone()`
-                // returns `Arc<RaftNameService>` which each let
-                // binding coerces to its target trait object.
-                let lifecycle: std::sync::Arc<dyn fluree_db_api::LifecycleNameService> =
-                    raft_ns.clone();
-                let indexing: std::sync::Arc<dyn fluree_db_nameservice::IndexingNameService> =
-                    raft_ns.clone();
-                let ns_mode = fluree_db_api::NameServiceMode::Lifecycle {
-                    lifecycle,
-                    indexing,
-                };
-                state::build_fluree_with_nameservice(&self.config, ns_mode).await?
-            } else {
-                state::build_default_fluree(&self.config).await?
+        let (fluree, cache_stats_handle) = if let Some(raft_ns) = raft_nameservice.as_ref() {
+            // RaftNameService satisfies both LifecycleNameService
+            // (NameServiceLookup + LedgerLifecycle + BranchLifecycle)
+            // and IndexingNameService (NameServiceLookup +
+            // IndexPublisher), so both Lifecycle fields hold a
+            // clone of the same Arc. Method-form `.clone()`
+            // returns `Arc<RaftNameService>` which each let
+            // binding coerces to its target trait object.
+            let lifecycle: std::sync::Arc<dyn fluree_db_api::LifecycleNameService> =
+                raft_ns.clone();
+            let indexing: std::sync::Arc<dyn fluree_db_nameservice::IndexingNameService> =
+                raft_ns.clone();
+            let ns_mode = fluree_db_api::NameServiceMode::Lifecycle {
+                lifecycle,
+                indexing,
             };
+            state::build_fluree_with_nameservice(&self.config, ns_mode).await?
+        } else {
+            state::build_default_fluree(&self.config).await?
+        };
         #[cfg(not(feature = "raft"))]
         let (fluree, cache_stats_handle) = state::build_default_fluree(&self.config).await?;
 
@@ -526,9 +525,7 @@ impl FlureeServerBuilder {
                     let fluree = Arc::clone(&state_inner.fluree);
                     tokio::spawn(async move {
                         while let Some((ledger_id, cid)) = rx.recv().await {
-                            if let Err(err) =
-                                fluree.content_store(&ledger_id).release(&cid).await
-                            {
+                            if let Err(err) = fluree.content_store(&ledger_id).release(&cid).await {
                                 tracing::warn!(
                                     %ledger_id,
                                     %cid,
@@ -548,60 +545,57 @@ impl FlureeServerBuilder {
         // metrics watcher and one spawn/abort lifecycle. See
         // `raft::spawn_leader_watcher` for the contract.
         #[cfg(feature = "raft")]
-        let raft_leader_watcher =
-            self.raft
-                .as_ref()
-                .map(|(integration, _)| {
-                    let raft_ns = std::sync::Arc::clone(raft_nameservice.as_ref().expect(
-                        "raft_nameservice present whenever self.raft is Some",
-                    ));
-                    let backend = state_inner.fluree.backend().clone();
-                    let indexer_config = fluree_db_indexer::IndexerConfig::default();
-                    let event_bus = Arc::clone(&integration.event_bus);
-                    // Same `RaftNameService` doubles as the
-                    // `CommitPublisher` so the worker's head advance
-                    // goes through `publish_commit` → `ApplyHead`
-                    // under the queue front it sampled.
-                    let publisher: std::sync::Arc<
-                        dyn fluree_db_nameservice::CommitPublisher,
-                    > = std::sync::Arc::clone(&raft_ns) as _;
-                    let commit_worker = fluree_db_consensus::raft::commit_worker::CommitWorker::new(
-                        Arc::clone(&integration.raft),
-                        publisher,
-                        Arc::clone(&state_inner.fluree),
-                        state_inner
-                            .index_config
-                            .clone()
-                            .expect("index_config set by AppState::new"),
-                        integration.shared_state.clone(),
-                        Arc::clone(&integration.staged_receipts),
-                    );
-                    let eviction_scheduler =
-                        fluree_db_consensus::raft::eviction_scheduler::EvictionScheduler::new(
-                            Arc::clone(&integration.raft),
-                        );
-                    let spawn_leader_tasks = move || {
-                        let nameservice: std::sync::Arc<
-                            dyn fluree_db_nameservice::IndexingNameService,
-                        > = raft_ns.clone();
-                        let (worker, _handle) = fluree_db_indexer::BackgroundIndexerWorker::new(
-                            backend.clone(),
-                            nameservice,
-                            indexer_config.clone(),
-                        );
-                        let worker = worker.with_event_bus(Arc::clone(&event_bus));
-                        vec![
-                            tokio::spawn(worker.run()),
-                            tokio::spawn(commit_worker.clone().run()),
-                            tokio::spawn(eviction_scheduler.clone().run()),
-                        ]
-                    };
-                    crate::raft::spawn_leader_watcher(
-                        Arc::clone(&integration.raft),
-                        integration.self_id,
-                        spawn_leader_tasks,
-                    )
-                });
+        let raft_leader_watcher = self.raft.as_ref().map(|(integration, _)| {
+            let raft_ns = std::sync::Arc::clone(
+                raft_nameservice
+                    .as_ref()
+                    .expect("raft_nameservice present whenever self.raft is Some"),
+            );
+            let backend = state_inner.fluree.backend().clone();
+            let indexer_config = fluree_db_indexer::IndexerConfig::default();
+            let event_bus = Arc::clone(&integration.event_bus);
+            // Same `RaftNameService` doubles as the
+            // `CommitPublisher` so the worker's head advance
+            // goes through `publish_commit` → `ApplyHead`
+            // under the queue front it sampled.
+            let publisher: std::sync::Arc<dyn fluree_db_nameservice::CommitPublisher> =
+                std::sync::Arc::clone(&raft_ns) as _;
+            let commit_worker = fluree_db_consensus::raft::commit_worker::CommitWorker::new(
+                Arc::clone(&integration.raft),
+                publisher,
+                Arc::clone(&state_inner.fluree),
+                state_inner
+                    .index_config
+                    .clone()
+                    .expect("index_config set by AppState::new"),
+                integration.shared_state.clone(),
+                Arc::clone(&integration.staged_receipts),
+            );
+            let eviction_scheduler =
+                fluree_db_consensus::raft::eviction_scheduler::EvictionScheduler::new(Arc::clone(
+                    &integration.raft,
+                ));
+            let spawn_leader_tasks = move || {
+                let nameservice: std::sync::Arc<dyn fluree_db_nameservice::IndexingNameService> =
+                    raft_ns.clone();
+                let (worker, _handle) = fluree_db_indexer::BackgroundIndexerWorker::new(
+                    backend.clone(),
+                    nameservice,
+                    indexer_config.clone(),
+                );
+                let worker = worker.with_event_bus(Arc::clone(&event_bus));
+                vec![
+                    tokio::spawn(worker.run()),
+                    tokio::spawn(commit_worker.clone().run()),
+                    tokio::spawn(eviction_scheduler.clone().run()),
+                ]
+            };
+            crate::raft::spawn_leader_watcher(
+                Arc::clone(&integration.raft),
+                integration.self_id,
+                spawn_leader_tasks,
+            )
+        });
 
         // The raft tuple is no longer needed beyond this point —
         // both raft_listener and raft_leader_watcher captured what

@@ -40,7 +40,10 @@ pub enum AppliedReceipt {
     /// didn't stash side-channel data — most commonly a leader
     /// transition where the receipt is stranded on the former
     /// leader. Callers fall back to conservative defaults.
-    Minimal { commit_id: ContentId, commit_t: i64 },
+    Minimal {
+        commit_id: ContentId,
+        commit_t: i64,
+    },
 }
 
 impl AppliedReceipt {
@@ -187,6 +190,14 @@ impl StagedReceiptMap {
     #[cfg(test)]
     pub fn len(&self) -> usize {
         self.receipts.len()
+    }
+
+    /// True when no receipts are stashed. Test-only; paired with
+    /// [`Self::len`] so clippy's `len_without_is_empty` doesn't flag
+    /// the helper.
+    #[cfg(test)]
+    pub fn is_empty(&self) -> bool {
+        self.receipts.is_empty()
     }
 }
 

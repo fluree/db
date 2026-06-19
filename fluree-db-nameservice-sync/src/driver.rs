@@ -203,12 +203,7 @@ impl SyncDriver {
                 // Local doesn't exist yet — create it via CAS
                 let result = self
                     .local
-                    .compare_and_set_ref(
-                        local_alias,
-                        RefKind::CommitHead,
-                        None,
-                        remote_commit,
-                    )
+                    .compare_and_set_ref(local_alias, RefKind::CommitHead, None, remote_commit)
                     .await
                     .map_err(SyncError::Nameservice)?;
                 match result {

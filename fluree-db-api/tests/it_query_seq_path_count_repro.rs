@@ -37,7 +37,6 @@
 
 mod support;
 
-
 use fluree_db_api::{FlureeBuilder, GraphDb, IndexConfig, LedgerManagerConfig, QueryInput};
 use fluree_db_core::LedgerSnapshot;
 use fluree_db_transact::{CommitOpts, TxnOpts};
@@ -194,7 +193,10 @@ async fn seq_path_count_unit_novelty_vs_indexed() {
 
     let (local, handle) = start_background_indexer_local(
         fluree2.backend().clone(),
-        fluree2.nameservice_mode().as_arc_indexing_nameservice().expect("test fluree has writable nameservice"),
+        fluree2
+            .nameservice_mode()
+            .as_arc_indexing_nameservice()
+            .expect("test fluree has writable nameservice"),
         fluree_db_indexer::IndexerConfig::small(),
     );
 

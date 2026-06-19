@@ -188,7 +188,7 @@ async fn promote(
     expect_no_content(resp, "promote").await?;
     let voter_list = members
         .iter()
-        .map(|id| id.to_string())
+        .map(u64::to_string)
         .collect::<Vec<_>>()
         .join(", ");
     println!(
@@ -244,7 +244,7 @@ fn format_id_list(ids: &[u64]) -> String {
         "(none)".into()
     } else {
         ids.iter()
-            .map(|id| id.to_string())
+            .map(u64::to_string)
             .collect::<Vec<_>>()
             .join(", ")
     }

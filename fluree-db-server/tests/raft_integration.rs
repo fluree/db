@@ -22,12 +22,9 @@ async fn builder_with_raft_attaches_integration_to_app_state() {
     let raft_tmp = TempDir::new().expect("raft tempdir");
 
     let integration = Arc::new(
-        RaftIntegration::bootstrap(RaftBootstrapConfig::new(
-            1,
-            raft_tmp.path().to_path_buf(),
-        ))
-        .await
-        .expect("raft bootstrap"),
+        RaftIntegration::bootstrap(RaftBootstrapConfig::new(1, raft_tmp.path().to_path_buf()))
+            .await
+            .expect("raft bootstrap"),
     );
 
     let raft_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
@@ -73,7 +70,9 @@ fn raft_enabled_requires_storage_path() {
         raft_listen_addr: Some("127.0.0.1:9090".parse().unwrap()),
         ..Default::default()
     };
-    let err = config.validate().expect_err("missing storage_path should error");
+    let err = config
+        .validate()
+        .expect_err("missing storage_path should error");
     assert!(err.contains("raft-storage-path"), "got: {err}");
 }
 
@@ -86,7 +85,9 @@ fn raft_enabled_requires_listen_addr() {
         raft_listen_addr: None,
         ..Default::default()
     };
-    let err = config.validate().expect_err("missing listen_addr should error");
+    let err = config
+        .validate()
+        .expect_err("missing listen_addr should error");
     assert!(err.contains("raft-listen-addr"), "got: {err}");
 }
 

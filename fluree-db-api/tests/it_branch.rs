@@ -875,7 +875,10 @@ async fn branch_incremental_index_resolves_pre_fork_parent() {
     let mut fluree = FlureeBuilder::memory().build_memory();
     let (local, indexer_handle) = support::start_background_indexer_local(
         fluree.backend().clone(),
-        fluree.nameservice_mode().publisher_arc().expect("test setup requires ReadWrite nameservice mode"),
+        fluree
+            .nameservice_mode()
+            .publisher_arc()
+            .expect("test setup requires ReadWrite nameservice mode"),
         fluree_db_indexer::IndexerConfig::default(),
     );
     fluree.set_indexing_mode(IndexingMode::Background(indexer_handle));

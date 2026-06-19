@@ -158,7 +158,10 @@ impl CommitWorker {
         // in lockstep.
         self.staged_receipts
             .stash(entry.queue_id, ref_key.clone(), receipt);
-        match self.publish_head_advance(ref_key, commit_id, commit_t).await {
+        match self
+            .publish_head_advance(ref_key, commit_id, commit_t)
+            .await
+        {
             Ok(()) => {
                 if let Some(install) = install {
                     self.finalize_local_state(install).await?;
@@ -236,10 +239,10 @@ impl CommitWorker {
         } = transact;
 
         let ledger_id = format_full_ledger_id(ref_key);
-        let ledger_manager =
-            self.fluree
-                .ledger_manager()
-                .ok_or_else(|| stage_failure("LedgerManager is not configured on Fluree"))?;
+        let ledger_manager = self
+            .fluree
+            .ledger_manager()
+            .ok_or_else(|| stage_failure("LedgerManager is not configured on Fluree"))?;
         let ledger_handle = ledger_manager
             .get_or_load(&ledger_id)
             .await
@@ -455,7 +458,10 @@ impl CommitWorker {
         }
         let payload = PushCommitsRequest {
             commits,
-            blobs: blobs.into_iter().map(|(k, v)| (k, Base64Bytes(v))).collect(),
+            blobs: blobs
+                .into_iter()
+                .map(|(k, v)| (k, Base64Bytes(v)))
+                .collect(),
         };
         let StagedPush {
             accepted,
@@ -781,10 +787,7 @@ fn format_full_ledger_id(ref_key: &RefKey) -> String {
 /// envelope payload variant. A mismatch is a state-machine /
 /// committer bug — surface loudly so the entry poisons rather than
 /// processing under the wrong path.
-fn check_envelope_kind(
-    body_kind: BodyKind,
-    envelope: &QueuedRequest,
-) -> Result<(), WorkerError> {
+fn check_envelope_kind(body_kind: BodyKind, envelope: &QueuedRequest) -> Result<(), WorkerError> {
     let expected = match envelope {
         QueuedRequest::Transact(t) => BodyKind::from(&t.body),
         QueuedRequest::Push(_) => BodyKind::Pushed,
@@ -951,7 +954,7 @@ mod tests {
             enqueued_at_millis: 1_000,
             idempotency: Some(IdempotencyCacheKey::new(
                 "test/db",
-                IdempotencyKey::new("k1"),
+                IdempotencyKey::new("k1").expect("test key fits cap"),
             )),
             body_cid: request_cid.clone(),
             request_cid,

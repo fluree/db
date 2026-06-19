@@ -37,7 +37,10 @@ async fn policy_class_survives_indexing() {
 
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        fluree.nameservice_mode().publisher_arc().expect("test setup requires ReadWrite nameservice mode"),
+        fluree
+            .nameservice_mode()
+            .publisher_arc()
+            .expect("test setup requires ReadWrite nameservice mode"),
         fluree_db_indexer::IndexerConfig::small(),
     );
     fluree.set_indexing_mode(fluree_db_api::tx::IndexingMode::Background(handle.clone()));
@@ -245,7 +248,10 @@ async fn policy_batched_join_lane_declines_index_only() {
     let mut fluree = FlureeBuilder::file(path).build().expect("build");
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        fluree.nameservice_mode().as_arc_indexing_nameservice().expect("test fluree has writable nameservice"),
+        fluree
+            .nameservice_mode()
+            .as_arc_indexing_nameservice()
+            .expect("test fluree has writable nameservice"),
         fluree_db_indexer::IndexerConfig::small(),
     );
     fluree.set_indexing_mode(fluree_db_api::tx::IndexingMode::Background(handle.clone()));

@@ -337,10 +337,7 @@ mod tests {
             .publish_commit("db1:main", 10, &cid1)
             .await
             .unwrap();
-        publisher
-            .publish_commit("db1:dev", 5, &cid2)
-            .await
-            .unwrap();
+        publisher.publish_commit("db1:dev", 5, &cid2).await.unwrap();
         publisher
             .publish_commit("db2:main", 20, &cid3)
             .await

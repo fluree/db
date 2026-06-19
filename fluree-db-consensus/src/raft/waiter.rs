@@ -82,13 +82,10 @@ impl WaiterMap {
     /// dropped — its receiver gets a [`oneshot::error::RecvError`],
     /// which the caller treats as "the waiter is gone, restart by
     /// re-issuing the idempotency key."
-    pub fn register(
-        &self,
-        queue_id: u64,
-        ref_key: RefKey,
-    ) -> oneshot::Receiver<WaiterOutcome> {
+    pub fn register(&self, queue_id: u64, ref_key: RefKey) -> oneshot::Receiver<WaiterOutcome> {
         let (sender, receiver) = oneshot::channel();
-        self.waiters.insert(queue_id, WaiterSlot { ref_key, sender });
+        self.waiters
+            .insert(queue_id, WaiterSlot { ref_key, sender });
         receiver
     }
 
@@ -128,6 +125,14 @@ impl WaiterMap {
     #[cfg(test)]
     pub fn len(&self) -> usize {
         self.waiters.len()
+    }
+
+    /// True when no waiters are parked. Test-only; paired with
+    /// [`Self::len`] so clippy's `len_without_is_empty` doesn't flag
+    /// the helper.
+    #[cfg(test)]
+    pub fn is_empty(&self) -> bool {
+        self.waiters.is_empty()
     }
 }
 
@@ -174,9 +179,12 @@ mod tests {
     async fn register_then_resolve_aborted_delivers_reason() {
         let map = WaiterMap::new();
         let rx = map.register(7, ref_key("main"));
-        map.resolve_aborted(7, AbortReason::Poisoned(PoisonReason::BodyMalformed {
-            error: "bad turtle".into(),
-        }));
+        map.resolve_aborted(
+            7,
+            AbortReason::Poisoned(PoisonReason::BodyMalformed {
+                error: "bad turtle".into(),
+            }),
+        );
 
         match rx.await.expect("receive") {
             WaiterOutcome::Aborted(AbortReason::Poisoned(PoisonReason::BodyMalformed {
@@ -215,12 +223,11 @@ mod tests {
             WaiterOutcome::Aborted(AbortReason::BranchDropped)
         ));
         // The `main` waiter's receiver is still parked.
-        assert!(tokio::time::timeout(
-            std::time::Duration::from_millis(10),
-            main_rx,
-        )
-        .await
-        .is_err());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), main_rx,)
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -234,9 +241,6 @@ mod tests {
         // The stale receiver sees the channel closed (no outcome).
         assert!(stale_rx.await.is_err());
         // The fresh one gets the outcome.
-        assert!(matches!(
-            fresh_rx.await.unwrap(),
-            WaiterOutcome::Applied(_)
-        ));
+        assert!(matches!(fresh_rx.await.unwrap(), WaiterOutcome::Applied(_)));
     }
 }

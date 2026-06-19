@@ -10,8 +10,8 @@ use fluree_db_core::{ContentId, ContentKind, StorageRead, StorageWrite};
 use fluree_db_nameservice::{
     AdminPublisher, CasResult, ConfigCasResult, ConfigLookup, ConfigPayload, ConfigPublisher,
     ConfigValue, GraphSourceLookup, GraphSourcePublisher, GraphSourceType, IndexPublisher,
-    LedgerLifecycle, NameServiceLookup, NsLookupResult, RefKind, RefLookup, RefPublisher,
-    RefValue, StatusCasResult, StatusLookup, StatusPayload, StatusPublisher, StatusValue,
+    LedgerLifecycle, NameServiceLookup, NsLookupResult, RefKind, RefLookup, RefPublisher, RefValue,
+    StatusCasResult, StatusLookup, StatusPayload, StatusPublisher, StatusValue,
 };
 use fluree_db_storage_aws::DynamoDbNameService;
 use fs2::FileExt;

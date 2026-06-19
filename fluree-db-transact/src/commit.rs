@@ -830,8 +830,7 @@ fn finalize_state_with_base(
                         Arc::clone(&dict_novelty),
                         Arc::clone(&runtime_small_dicts),
                         ns_fallback,
-                    ))
-                        as Arc<dyn fluree_db_core::range_provider::RangeProvider>
+                    )) as Arc<dyn fluree_db_core::range_provider::RangeProvider>
                 })
         });
     if let Some(rp) = new_range_provider {
@@ -921,7 +920,9 @@ where
             opts,
         )
         .await?;
-        staged.apply(content_store, nameservice, skip_sequencing).await
+        staged
+            .apply(content_store, nameservice, skip_sequencing)
+            .await
     }
     .instrument(commit_span)
     .await

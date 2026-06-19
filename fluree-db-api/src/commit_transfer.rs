@@ -20,6 +20,7 @@
 
 use crate::dataset::GovernanceOptions;
 use crate::error::{ApiError, Result};
+use crate::ledger_manager::LedgerWriteGuard;
 use crate::policy_builder::build_policy_context_from_opts;
 use crate::tx::{IndexingMode, IndexingStatus};
 use crate::{Fluree, IndexConfig, LedgerHandle};
@@ -33,7 +34,6 @@ use fluree_db_core::{
 use fluree_db_core::{RangeMatch, RangeOptions, RangeTest, Storage};
 use fluree_db_core::{CODEC_FLUREE_COMMIT, CODEC_FLUREE_TXN};
 use fluree_db_ledger::LedgerState;
-use crate::ledger_manager::LedgerWriteGuard;
 use fluree_db_nameservice::{CasResult, NsRecordSnapshot, RefKind, RefValue};
 use fluree_db_novelty::{generate_commit_flakes, stamp_graph_on_commit_flakes, Novelty};
 use fluree_db_policy::PolicyContext;

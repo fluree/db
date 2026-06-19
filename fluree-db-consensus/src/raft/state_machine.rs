@@ -661,10 +661,7 @@ pub enum Response {
     /// [`Command::AdvanceIndexHead`] succeeded. Carries the new
     /// index head + t so the proposing publisher can confirm what
     /// was committed.
-    IndexAdvanced {
-        index_t: i64,
-        index_head: ContentId,
-    },
+    IndexAdvanced { index_t: i64, index_head: ContentId },
     /// [`Command::AdvanceIndexHead`] was no-op'd because the
     /// branch's published index already covers the proposed t (or
     /// further). Not an error — usually means a concurrent indexer
@@ -895,22 +892,21 @@ pub fn apply(state: &mut NameServiceState, command: Command, log_index: u64) -> 
     }
 }
 
-fn create_ledger(
-    state: &mut NameServiceState,
-    log_index: u64,
-    args: CreateLedgerArgs,
-) -> Response {
+fn create_ledger(state: &mut NameServiceState, log_index: u64, args: CreateLedgerArgs) -> Response {
     let CreateLedgerArgs {
         ledger_id,
         branch,
         created_at_millis,
     } = args;
 
-    let ledger = state.ledgers.entry(ledger_id.clone()).or_insert_with(|| LedgerRecord {
-        created_at_millis,
-        created_index: log_index,
-        branches: Vec::new(),
-    });
+    let ledger = state
+        .ledgers
+        .entry(ledger_id.clone())
+        .or_insert_with(|| LedgerRecord {
+            created_at_millis,
+            created_index: log_index,
+            branches: Vec::new(),
+        });
     if ledger.branches.contains(&branch) {
         return Response::AlreadyExists {
             ledger_id: format_ledger_id(&ledger_id, &branch),
@@ -922,11 +918,7 @@ fn create_ledger(
     }
 }
 
-fn retract_ledger(
-    state: &mut NameServiceState,
-    ledger_id: String,
-    branch: String,
-) -> Response {
+fn retract_ledger(state: &mut NameServiceState, ledger_id: String, branch: String) -> Response {
     let key = RefKey::new(&ledger_id, &branch);
     let full = format_ledger_id(&ledger_id, &branch);
     let is_known = state
@@ -973,12 +965,8 @@ fn purge_ledger(
     if let Some(parent) = removed_source {
         decrement_child_count(state, &ledger_id, &parent);
     }
-    let released_envelopes = clear_queue_for_admin(
-        state,
-        &key,
-        ClearReason::BranchPurged,
-        applied_at_millis,
-    );
+    let released_envelopes =
+        clear_queue_for_admin(state, &key, ClearReason::BranchPurged, applied_at_millis);
     if removed_ref || removed_retraction || removed_branch {
         Response::Purged {
             ledger_id: full,
@@ -989,11 +977,7 @@ fn purge_ledger(
     }
 }
 
-fn create_branch(
-    state: &mut NameServiceState,
-    log_index: u64,
-    args: CreateBranchArgs,
-) -> Response {
+fn create_branch(state: &mut NameServiceState, log_index: u64, args: CreateBranchArgs) -> Response {
     let CreateBranchArgs {
         ledger_id,
         branch,
@@ -1089,12 +1073,8 @@ fn drop_branch(
     let parent_branches = removed_source
         .as_deref()
         .map(|parent| decrement_child_count(state, &ledger_id, parent));
-    let released_envelopes = clear_queue_for_admin(
-        state,
-        &key,
-        ClearReason::BranchDropped,
-        applied_at_millis,
-    );
+    let released_envelopes =
+        clear_queue_for_admin(state, &key, ClearReason::BranchDropped, applied_at_millis);
 
     Response::BranchDropped {
         ledger_id: full,
@@ -1131,12 +1111,8 @@ fn reset_head(
         // Snapshot is unborn — remove the RefEntry; the branch keeps
         // its slot on `LedgerRecord.branches`.
         state.refs.remove(&key);
-        let released_envelopes = clear_queue_for_admin(
-            state,
-            &key,
-            ClearReason::BranchHeadReset,
-            applied_at_millis,
-        );
+        let released_envelopes =
+            clear_queue_for_admin(state, &key, ClearReason::BranchHeadReset, applied_at_millis);
         return Response::HeadReset {
             ledger_id: full,
             released_envelopes,
@@ -1161,12 +1137,8 @@ fn reset_head(
             branches: prior_branches,
         },
     );
-    let released_envelopes = clear_queue_for_admin(
-        state,
-        &key,
-        ClearReason::BranchHeadReset,
-        applied_at_millis,
-    );
+    let released_envelopes =
+        clear_queue_for_admin(state, &key, ClearReason::BranchHeadReset, applied_at_millis);
     Response::HeadReset {
         ledger_id: full,
         released_envelopes,
@@ -1227,10 +1199,7 @@ fn decrement_child_count(
     }
 }
 
-fn advance_index_head(
-    state: &mut NameServiceState,
-    args: AdvanceIndexHeadArgs,
-) -> Response {
+fn advance_index_head(state: &mut NameServiceState, args: AdvanceIndexHeadArgs) -> Response {
     let AdvanceIndexHeadArgs {
         ledger_id,
         branch,
@@ -1335,12 +1304,12 @@ fn apply_enqueue_command(
                 return Response::BodyHashMismatch;
             }
             return match outcome {
-                ApplyOutcome::Applied(record) => {
-                    Response::IdempotencyHit { record: record.clone() }
-                }
-                ApplyOutcome::Failed(record) => {
-                    Response::IdempotencyFailed { record: record.clone() }
-                }
+                ApplyOutcome::Applied(record) => Response::IdempotencyHit {
+                    record: record.clone(),
+                },
+                ApplyOutcome::Failed(record) => Response::IdempotencyFailed {
+                    record: record.clone(),
+                },
             };
         }
         // 2. In-flight queue scan. Same key + same body → ride the
@@ -1363,11 +1332,7 @@ fn apply_enqueue_command(
 
     // 3. Cap checks. Per-branch first (most isolation), then global.
     let per_branch_cap = state.queue_config.per_branch_cap;
-    let per_branch_depth = state
-        .queues
-        .get(&ref_key)
-        .map(VecDeque::len)
-        .unwrap_or(0);
+    let per_branch_depth = state.queues.get(&ref_key).map(VecDeque::len).unwrap_or(0);
     if per_branch_depth >= per_branch_cap {
         return Response::QueueFull {
             ledger_id: full_ledger_id,
@@ -1438,8 +1403,7 @@ fn pop_validated_front(
                 ledger_id: full_ledger_id.into(),
                 requested_queue_id,
                 reason: DesyncReason::InvariantViolated {
-                    description: "queue missing or empty without recently_cleared marker"
-                        .into(),
+                    description: "queue missing or empty without recently_cleared marker".into(),
                 },
             }));
         }
@@ -1459,11 +1423,7 @@ fn pop_validated_front(
     Ok(queue.pop_front().expect("non-empty checked above"))
 }
 
-fn apply_head(
-    state: &mut NameServiceState,
-    log_index: u64,
-    args: ApplyHeadArgs,
-) -> Response {
+fn apply_head(state: &mut NameServiceState, log_index: u64, args: ApplyHeadArgs) -> Response {
     let ApplyHeadArgs {
         ledger_id,
         branch,
@@ -1732,7 +1692,10 @@ mod tests {
             }
         );
         let ledger = state.ledgers.get("test/db").unwrap();
-        assert_eq!(ledger.branches, vec!["main".to_string(), "feature".to_string()]);
+        assert_eq!(
+            ledger.branches,
+            vec!["main".to_string(), "feature".to_string()]
+        );
     }
 
     #[test]
@@ -2202,11 +2165,7 @@ mod tests {
         let mut state = NameServiceState::new();
         create_ledger_with_genesis(&mut state, "test/db");
         seed_head(&mut state, "test/db", "main", cid(5), 10);
-        apply(
-            &mut state,
-            advance_index("test/db", "main", cid(42), 10),
-            3,
-        );
+        apply(&mut state, advance_index("test/db", "main", cid(42), 10), 3);
 
         let resp = apply(
             &mut state,
@@ -2306,7 +2265,10 @@ mod tests {
         // Seed an idempotency entry too so the snapshot covers that
         // dimension of the state shape.
         state.idempotency.insert(
-            IdempotencyCacheKey::new("test/db", IdempotencyKey::new("k1")),
+            IdempotencyCacheKey::new(
+                "test/db",
+                IdempotencyKey::new("k1").expect("test key fits cap"),
+            ),
             ApplyOutcome::Applied(ApplyRecord {
                 request_cid: cid(7),
                 body_cid: cid(7),
@@ -2500,7 +2462,10 @@ mod tests {
     }
 
     fn body_kid(key: &str) -> IdempotencyCacheKey {
-        IdempotencyCacheKey::new("test/db:main", IdempotencyKey::new(key))
+        IdempotencyCacheKey::new(
+            "test/db:main",
+            IdempotencyKey::new(key).expect("test key fits cap"),
+        )
     }
 
     #[test]
@@ -2509,7 +2474,10 @@ mod tests {
         apply(&mut state, create_ledger("test/db"), 0);
         let resp = apply(&mut state, enqueue("test/db", "main", 7, None), 1);
         let queue_id = match resp {
-            Response::Enqueued { ledger_id, queue_id } => {
+            Response::Enqueued {
+                ledger_id,
+                queue_id,
+            } => {
                 assert_eq!(ledger_id, "test/db:main");
                 queue_id
             }
@@ -2543,12 +2511,7 @@ mod tests {
         );
         let resp = apply(
             &mut state,
-            enqueue(
-                "test/db",
-                "main",
-                7,
-                Some(key.clone()),
-            ),
+            enqueue("test/db", "main", 7, Some(key.clone())),
             10,
         );
         match resp {
@@ -2599,28 +2562,14 @@ mod tests {
         let key = body_kid("k1");
         let first = apply(
             &mut state,
-            enqueue(
-                "test/db",
-                "main",
-                7,
-                Some(key.clone()),
-            ),
+            enqueue("test/db", "main", 7, Some(key.clone())),
             1,
         );
         let queue_id = match first {
             Response::Enqueued { queue_id, .. } => queue_id,
             other => panic!("first enqueue not Enqueued: {other:?}"),
         };
-        let second = apply(
-            &mut state,
-            enqueue(
-                "test/db",
-                "main",
-                7,
-                Some(key),
-            ),
-            2,
-        );
+        let second = apply(&mut state, enqueue("test/db", "main", 7, Some(key)), 2);
         match second {
             Response::InFlight {
                 queue_id: q,
@@ -2683,7 +2632,13 @@ mod tests {
     // ApplyHead
     // ====================================================================
 
-    fn apply_head_cmd(ledger_id: &str, branch: &str, queue_id: u64, commit: ContentId, t: i64) -> Command {
+    fn apply_head_cmd(
+        ledger_id: &str,
+        branch: &str,
+        queue_id: u64,
+        commit: ContentId,
+        t: i64,
+    ) -> Command {
         Command::ApplyHead(ApplyHeadArgs {
             ledger_id: ledger_id.into(),
             branch: branch.into(),
@@ -2702,12 +2657,7 @@ mod tests {
         let key = body_kid("k1");
         let enq = apply(
             &mut state,
-            enqueue(
-                "test/db",
-                "main",
-                7,
-                Some(key.clone()),
-            ),
+            enqueue("test/db", "main", 7, Some(key.clone())),
             2,
         );
         let queue_id = match enq {
@@ -2735,7 +2685,11 @@ mod tests {
 
         // Queue front popped.
         let ref_key = RefKey::new("test/db", "main");
-        assert!(state.queues.get(&ref_key).map(VecDeque::is_empty).unwrap_or(true));
+        assert!(state
+            .queues
+            .get(&ref_key)
+            .map(VecDeque::is_empty)
+            .unwrap_or(true));
 
         // RefEntry advanced.
         let entry = state.refs.get(&ref_key).expect("ref present");
@@ -2840,9 +2794,10 @@ mod tests {
         );
         match resp {
             Response::QueueDesync {
-                reason: DesyncReason::QueueCleared {
-                    reason: ClearReason::BranchDropped,
-                },
+                reason:
+                    DesyncReason::QueueCleared {
+                        reason: ClearReason::BranchDropped,
+                    },
                 ..
             } => {}
             other => panic!("expected QueueCleared(BranchDropped), got {other:?}"),
@@ -2875,12 +2830,7 @@ mod tests {
     // PoisonQueueEntry
     // ====================================================================
 
-    fn poison_cmd(
-        ledger_id: &str,
-        branch: &str,
-        queue_id: u64,
-        reason: PoisonReason,
-    ) -> Command {
+    fn poison_cmd(ledger_id: &str, branch: &str, queue_id: u64, reason: PoisonReason) -> Command {
         Command::PoisonQueueEntry(PoisonQueueEntryArgs {
             ledger_id: ledger_id.into(),
             branch: branch.into(),
@@ -2901,12 +2851,7 @@ mod tests {
         let key = body_kid("k1");
         let enq = apply(
             &mut state,
-            enqueue(
-                "test/db",
-                "main",
-                7,
-                Some(key.clone()),
-            ),
+            enqueue("test/db", "main", 7, Some(key.clone())),
             2,
         );
         let queue_id = match enq {
@@ -2933,7 +2878,11 @@ mod tests {
         }
 
         let ref_key = RefKey::new("test/db", "main");
-        assert!(state.queues.get(&ref_key).map(VecDeque::is_empty).unwrap_or(true));
+        assert!(state
+            .queues
+            .get(&ref_key)
+            .map(VecDeque::is_empty)
+            .unwrap_or(true));
         // Ref untouched — no head advance on poison.
         assert!(!state.refs.contains_key(&ref_key));
 
@@ -2943,10 +2892,7 @@ mod tests {
         };
         assert_eq!(record.request_cid, cid(7));
         assert_eq!(record.recorded_index, 3);
-        assert!(matches!(
-            record.reason,
-            PoisonReason::BodyMalformed { .. }
-        ));
+        assert!(matches!(record.reason, PoisonReason::BodyMalformed { .. }));
     }
 
     #[test]
@@ -2966,7 +2912,11 @@ mod tests {
         );
 
         let ref_key = RefKey::new("test/db", "main");
-        assert!(state.queues.get(&ref_key).map(VecDeque::is_empty).unwrap_or(true));
+        assert!(state
+            .queues
+            .get(&ref_key)
+            .map(VecDeque::is_empty)
+            .unwrap_or(true));
         // No idempotency key means nothing recorded — the cache stays empty.
         assert!(state.idempotency.is_empty());
     }
@@ -3017,9 +2967,10 @@ mod tests {
         );
         match resp {
             Response::QueueDesync {
-                reason: DesyncReason::QueueCleared {
-                    reason: ClearReason::BranchPurged,
-                },
+                reason:
+                    DesyncReason::QueueCleared {
+                        reason: ClearReason::BranchPurged,
+                    },
                 ..
             } => {}
             other => panic!("expected QueueCleared(BranchPurged), got {other:?}"),
@@ -3089,9 +3040,7 @@ mod tests {
     }
 
     fn install_outcome(state: &mut NameServiceState, key: &str, outcome: ApplyOutcome) {
-        state
-            .idempotency
-            .insert(body_kid(key), outcome);
+        state.idempotency.insert(body_kid(key), outcome);
     }
 
     #[test]
@@ -3109,8 +3058,7 @@ mod tests {
                 released_envelopes,
             } => {
                 assert_eq!(removed, 2);
-                let cids: HashSet<_> =
-                    released_envelopes.into_iter().map(|(_, cid)| cid).collect();
+                let cids: HashSet<_> = released_envelopes.into_iter().map(|(_, cid)| cid).collect();
                 assert_eq!(cids, HashSet::from([cid(1), cid(2)]));
             }
             other => panic!("expected EvictionApplied, got {other:?}"),
@@ -3466,9 +3414,10 @@ mod tests {
         );
         match resp {
             Response::QueueDesync {
-                reason: DesyncReason::QueueCleared {
-                    reason: ClearReason::BranchDropped,
-                },
+                reason:
+                    DesyncReason::QueueCleared {
+                        reason: ClearReason::BranchDropped,
+                    },
                 ..
             } => {}
             other => panic!("expected QueueCleared(BranchDropped), got {other:?}"),
