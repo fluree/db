@@ -197,23 +197,23 @@ Deletes order and all its items.
 
 ## Edge-Annotation Cascade
 
-When a transaction retracts a base edge that has annotations attached (see [Insert: Edge Annotations](insert.md#edge-annotations)), the transactor automatically retracts the `f:reifies*` system bundle that pinned each annotation to that edge. Without this cascade, the durable encoding would carry orphaned attachment pointers and `@reifies` queries would still surface annotations for retracted edges.
+When a transaction retracts a base edge that has annotations attached (see [Insert: Edge Annotations](insert.md#edge-annotations)), the transactor automatically retracts the link that attaches each annotation to that edge. Without this cascade, retracted edges would still surface their annotations through `@reifies` queries.
 
 **Base-edge retract** — fires on every annotated retract:
 
-- The `f:reifies*` bundle for each currently-asserted annotation on the edge is retracted in the same transaction.
-- Anonymous (blank-node) annotation subjects also have their body metadata retracted, since the synthetic SID is unaddressable once the bundle is gone.
+- The attachment linking each currently-asserted annotation to the edge is retracted in the same transaction.
+- Anonymous (blank-node) annotation subjects also have their body metadata retracted, since the synthetic SID is unaddressable once the attachment is gone.
 - Explicit-IRI annotation subjects keep their body metadata as ordinary RDF on the named subject (default RDF mode). To extend cleanup to explicit-IRI annotations as well, set `opts.lpgEdgeLifecycle: true` on the transaction — this matches the property-graph relationship lifecycle.
 
 **Metadata-only retract** — fires when the user retracts every body fact of an annotation subject without touching the base edge:
 
-- The `f:reifies*` bundle is also retracted, so the annotation is fully disposed of and inline `@annotation` queries no longer surface it.
-- Same-transaction replacements (delete one body fact, insert another on the same annotation in a single update) preserve the bundle — the post-transaction metadata set is non-empty, so the cascade reads "the user is updating, not removing."
-- Partial retracts (some body facts gone, others still asserted) preserve the bundle — the annotation is still meaningful.
+- The attachment is also retracted, so the annotation is fully disposed of and inline `@annotation` queries no longer surface it.
+- Same-transaction replacements (delete one body fact, insert another on the same annotation in a single update) keep the attachment — the post-transaction metadata set is non-empty, so the cascade reads "the user is updating, not removing."
+- Partial retracts (some body facts gone, others still asserted) keep the attachment — the annotation is still meaningful.
 
 The cascade is graph-aware: named-graph annotations are retracted in the same named graph as the edge they reify, never by mismatched-graph retracts.
 
-User-authored mention of `https://ns.flur.ee/db#reifies*` IRIs (the system predicates underlying the bundle) is rejected at parse time on every write surface (insert, upsert, update, Turtle ingest, raw transaction upload). Use `@annotation` and the cascade described above to manage annotation lifecycle.
+Manage annotation lifecycle through `@annotation` and the cascade above — the [reserved system predicates](../reference/vocabulary.md#edge-annotation-predicates-reserved) that back annotations can't be written by hand on any surface.
 
 ## Soft Delete vs Hard Retraction
 

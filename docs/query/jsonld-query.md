@@ -880,7 +880,7 @@ Wildcard hydration (`select: {"?s": ["*"]}`) on an annotated subject's base edge
 
 **Reserved predicates:**
 
-The seven `https://ns.flur.ee/db#reifies*` predicates (`reifiesGraph`, `reifiesSubject`, `reifiesPredicate`, `reifiesObject`, `reifiesDatatype`, `reifiesLang`, `reifiesListIndex`) encode the edge an annotation reifies. They are system-controlled — direct user mention in a query (full or compact IRI form) is rejected at parse time. Use `@annotation` / `@reifies` instead. The same predicates are filtered out of variable-predicate scans (`?p`) and wildcard hydration so they never surface as ordinary RDF.
+Annotations are backed by reserved system predicates you can't query directly — use `@annotation` / `@reifies` instead. Naming them in a query is rejected at parse time, and they're hidden from variable-predicate scans (`?p`) and wildcard hydration so they never surface as ordinary RDF. See the [vocabulary reference](../reference/vocabulary.md#edge-annotation-predicates-reserved) for the list.
 
 ## Filter Functions
 

@@ -378,7 +378,7 @@ Inline `@annotation` queries return one row per occurrence.
 - Multi-triple `@reifies` (more than one predicate-object pair under `@reifies`).
 - Annotation-of-annotation (nested `@annotation` inside an annotation body).
 - `@reifies` on the insert side (use the inline `@annotation` form instead).
-- User-authored mention of `https://ns.flur.ee/db#reifies*` IRIs (compact or full form).
+- Hand-authored mention of the [reserved system predicates](../reference/vocabulary.md#edge-annotation-predicates-reserved) that back annotations (compact or full IRI form).
 
 For the full surface — including SPARQL 1.2 / RDF 1.2 annotation tails (`{| |}`), the named reifier (`~`), the cardinality / multiplicity contract, anonymous vs explicit-IRI lifecycle, and named-graph behavior — see the [Edge annotations concept doc](../concepts/edge-annotations.md). For cascade semantics when a base edge or annotation metadata is removed, see [Retractions](retractions.md).
 

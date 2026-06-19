@@ -936,7 +936,7 @@ Annotation tails are supported in `INSERT DATA`, `DELETE DATA`, and `INSERT { } 
 - **Default graph only.** An annotation tail inside an explicit `GRAPH { }` block, or under a `WITH <g>` template, is rejected — SPARQL UPDATE annotations target the default graph. Use the JSON-LD `@annotation` surface to annotate an edge inside a named graph.
 - **Simple-predicate triples only.** `?s ex:p1/ex:p2 ?o {| ... |}` (property-path) is rejected.
 - **Triple terms only as `rdf:reifies` objects**; any other use errors at parse time.
-- **No `f:reifies*` by hand.** User-authored `https://ns.flur.ee/db#reifies*` predicates are rejected on every UPDATE clause; mint annotations only through the `~` / `{| |}` surface.
+- **No reserved predicates by hand.** The [system predicates](../reference/vocabulary.md#edge-annotation-predicates-reserved) that back annotations are rejected on every UPDATE clause; mint annotations only through the `~` / `{| |}` surface.
 - **No annotations in `CONSTRUCT` templates** (the template output form is deferred); a `CONSTRUCT` whose `WHERE` uses annotations to filter still works.
 - **SPARQL 1.2 triple-term functions** (`TRIPLE`, `SUBJECT`, `PREDICATE`, `OBJECT`, `isTRIPLE`, and the `BIND(<<( ?s ?p ?o )>> AS ?t)` constructor) are deferred.
 
