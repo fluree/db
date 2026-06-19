@@ -149,17 +149,20 @@ impl CommitWorker {
         let commit_id = receipt.commit_id().clone();
         let commit_t = receipt.commit_t();
 
-        // Stash the typed receipt, then propose. On propose failure
-        // (stepped-down leader, QueueDesync, fatal), take the stash
-        // back AND drop `install` so the local Fluree cache stays at
-        // its pre-stage state. Only after a successful propose do we
-        // install the new state through the held write guard — this
-        // keeps `state.refs` (replicated) and the local Fluree cache
-        // in lockstep.
+        // Stash the typed receipt, then propose. The error path
+        // can't blindly drop `install` — `publish_head_advance` may
+        // return `Err` (lost response, stepped-down leader after
+        // local apply, post-apply fatal) for an `ApplyHead` that
+        // actually committed and was applied on this node. In that
+        // case the replicated `state.refs` reflects our advance but
+        // dropping the install leaves the local Fluree cache at the
+        // pre-stage head → silent stale reads. So on error we
+        // reconcile against the replicated head and finalize the
+        // install only if our commit landed.
         self.staged_receipts
             .stash(entry.queue_id, ref_key.clone(), receipt);
         match self
-            .publish_head_advance(ref_key, commit_id, commit_t)
+            .publish_head_advance(ref_key, commit_id.clone(), commit_t)
             .await
         {
             Ok(()) => {
@@ -169,14 +172,47 @@ impl CommitWorker {
                 Ok(())
             }
             Err(err) => {
-                self.staged_receipts.take(entry.queue_id);
-                // `install` drops here: write_guard releases without
-                // calling `replace`, so this node's Fluree handle
-                // stays at its pre-stage head — same as every other
-                // node.
-                Err(err)
+                if self.commit_replicated(ref_key, &commit_id).await {
+                    // Apply landed; the adapter already took the
+                    // stash during waiter resolution, so our own
+                    // `take` here is a defensive no-op. Finalize the
+                    // local cache so this node catches up with the
+                    // replicated head.
+                    self.staged_receipts.take(entry.queue_id);
+                    if let Some(install) = install {
+                        self.finalize_local_state(install).await?;
+                    }
+                    Ok(())
+                } else {
+                    // Apply didn't land. Clean up the staged receipt
+                    // and drop `install`: write_guard releases
+                    // without calling `replace`, so this node's
+                    // Fluree handle stays at its pre-stage head —
+                    // same as every other node.
+                    self.staged_receipts.take(entry.queue_id);
+                    Err(err)
+                }
             }
         }
+    }
+
+    /// Read the replicated state to see whether `commit_id` is the
+    /// current head for `ref_key`. Used by [`Self::try_advance_head`]
+    /// to disambiguate a publish error that may have committed
+    /// anyway (lost response, post-apply step-down) from one that
+    /// genuinely failed.
+    ///
+    /// Only an exact head match is treated as "landed." A different
+    /// head — even at a higher `t` — means something other than our
+    /// install reached consensus, so dropping the install is the
+    /// correct outcome (the next drain pass will re-derive state
+    /// from the replicated head).
+    async fn commit_replicated(&self, ref_key: &RefKey, commit_id: &ContentId) -> bool {
+        let state = self.shared_state.read().await;
+        state
+            .refs
+            .get(ref_key)
+            .is_some_and(|entry| &entry.head == commit_id)
     }
 
     /// Install staged ledger state through the held write guard
