@@ -34,7 +34,9 @@ use fluree_db_consensus::raft::{
     storage::{fs::FsRaftStorage, StorageError},
     waiter::WaiterMap,
 };
-use fluree_db_consensus::{NodeId, Raft, RaftConfig, RaftConfigError, RaftFatal, TypeConfig};
+use fluree_db_consensus::{
+    NodeId, Raft, RaftConfig, RaftConfigError, RaftFatal, RaftStorageError, TypeConfig,
+};
 use fluree_db_core::ContentId;
 use fluree_db_nameservice::LedgerEventBus;
 use std::path::PathBuf;
@@ -157,7 +159,13 @@ impl RaftIntegration {
         let staged_receipts = Arc::new(StagedReceiptMap::new());
         let (release_tx, release_rx) = tokio::sync::mpsc::unbounded_channel();
         let log = LogAdapter::new(Arc::clone(&storage));
-        let sm = StateMachineAdapter::new(Arc::clone(&storage))
+        // `open` restores state from storage's current snapshot if one
+        // exists; required on restart so openraft's log replay starts
+        // from `last_applied + 1` instead of index 0 (the latter
+        // would silently lose committed state after a snapshot +
+        // log purge under the default `SnapshotPolicy`).
+        let sm = StateMachineAdapter::open(Arc::clone(&storage))
+            .await?
             .with_event_bus(Arc::clone(&event_bus))
             .with_waiter_map(Arc::clone(&waiter_map))
             .with_staged_receipts(Arc::clone(&staged_receipts))
@@ -260,6 +268,12 @@ pub enum RaftBootstrapError {
     /// proxy environments.
     #[error("building HTTP client: {0}")]
     HttpClient(#[from] reqwest::Error),
+    /// Reading the current snapshot from the state-machine adapter
+    /// failed during the boot-time restore (see
+    /// [`StateMachineAdapter::open`](fluree_db_consensus::raft::state_machine_adapter::StateMachineAdapter::open)).
+    /// Typically a corrupt snapshot file or a deserialization mismatch.
+    #[error("restoring state-machine snapshot: {0}")]
+    SnapshotRestore(#[from] RaftStorageError<NodeId>),
     /// openraft refused to start. The variant carries the node id
     /// the failure originated from. Usually a fatal storage error
     /// surfaced during initial state load.

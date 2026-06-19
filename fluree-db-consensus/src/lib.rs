@@ -42,6 +42,8 @@ pub use raft::{ClusterNode, Command, NodeId, Response, TypeConfig};
 #[cfg(feature = "raft")]
 pub use openraft::error::Fatal as RaftFatal;
 #[cfg(feature = "raft")]
+pub use openraft::StorageError as RaftStorageError;
+#[cfg(feature = "raft")]
 pub use openraft::{
     Config as RaftConfig, ConfigError as RaftConfigError, Raft, ServerState as RaftServerState,
 };

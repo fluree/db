@@ -115,7 +115,11 @@ impl<S> StateMachineAdapter<S>
 where
     S: RaftStorage,
 {
-    /// Construct an adapter with a freshly-allocated [`SharedState`].
+    /// Construct an adapter with a freshly-allocated [`SharedState`]
+    /// and no restored persistence. Tests and fresh-cluster bootstrap
+    /// only — production restart paths must use [`Self::open`] so
+    /// committed state from the last snapshot is loaded before
+    /// openraft replays the post-snapshot log tail.
     pub fn new(storage: Arc<S>) -> Self {
         Self::with_state(storage, Arc::new(RwLock::new(NameServiceState::default())))
     }
@@ -135,6 +139,47 @@ where
             staged_receipts: None,
             release_tx: None,
         }
+    }
+
+    /// Construct an adapter and restore state + `last_applied` +
+    /// `last_membership` from `storage`'s current snapshot if one
+    /// exists. This is the production restart path: without it, the
+    /// adapter would boot with `last_applied = None` and openraft
+    /// would replay the log from index 0 — but after a snapshot +
+    /// log purge (the default `SnapshotPolicy`) the pre-snapshot log
+    /// entries are gone, so committed nameservice state would be
+    /// silently lost. With the snapshot restored here, openraft's
+    /// replay starts at `last_applied + 1` and the apply path skips
+    /// the entries already folded into the snapshot — so the
+    /// post-apply side effects (CAS releases, event-bus emissions)
+    /// never re-fire on recovery.
+    pub async fn open(storage: Arc<S>) -> Result<Self, StorageError<NodeId>> {
+        let mut adapter = Self::new(storage);
+        adapter.restore_from_snapshot().await?;
+        Ok(adapter)
+    }
+
+    /// Load the latest snapshot from storage (if any) into this
+    /// adapter's in-memory state. No-op when storage has no snapshot
+    /// (fresh node). Idempotent — repeated calls overwrite with the
+    /// same snapshot.
+    async fn restore_from_snapshot(&mut self) -> Result<(), StorageError<NodeId>> {
+        let current = self
+            .storage
+            .snapshots()
+            .current()
+            .await
+            .map_err(|e| snapshot_err(ErrorVerb::Read, e))?;
+        let Some((our_meta, bytes)) = current else {
+            return Ok(());
+        };
+        let restored_state = NameServiceState::from_snapshot(&bytes).map_err(read_state_err)?;
+        let last_membership: StoredMembership<NodeId, ClusterNode> =
+            postcard::from_bytes(&our_meta.membership).map_err(read_state_err)?;
+        *self.state.write().await = restored_state;
+        self.last_applied = our_meta.last_applied.map(to_openraft_log_id);
+        self.last_membership = last_membership;
+        Ok(())
     }
 
     /// Set the [`LedgerEventBus`] this adapter emits commit/index
