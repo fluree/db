@@ -1413,19 +1413,125 @@ fn is_disconnected_class_anchor(
     }
 }
 
+/// Seed-candidate pool, phase 1: sources joinable with the bound set, or — when
+/// none are (e.g. the only forward continuation is a not-yet-placed producer) —
+/// every source as a fallback. Returns indices into `remaining`.
+fn connected_or_fallback_pool(
+    remaining: &[RankedPattern],
+    bound_vars: &HashSet<VarId>,
+) -> Vec<usize> {
+    let has_bound = !bound_vars.is_empty();
+    let connected: Vec<usize> = remaining
+        .iter()
+        .enumerate()
+        .filter(|(_, rp)| !has_bound || pattern_shares_variables(&rp.pattern, bound_vars))
+        .map(|(idx, _)| idx)
+        .collect();
+    if connected.is_empty() {
+        (0..remaining.len()).collect()
+    } else {
+        connected
+    }
+}
+
+/// Seed-candidate pool, phase 2: drop disconnected `rdf:type <const>` class
+/// anchors so a broad class extension cannot win the seed and flip the chain
+/// into a scattered reverse object-drive (the IC3 `home:Country` case).
+///
+/// Applies ONLY when a pipeline is active (bound vars or a producer) AND a
+/// connected alternative exists — otherwise the class anchor IS the legitimate
+/// seed and is kept. Deliberately narrow: only class anchors are demoted (a
+/// selective property-value anchor such as `?c name "X"` is never an
+/// [`is_disconnected_class_anchor`] and stays), and demotion never empties the
+/// pool. Returns `base_pool` unchanged when nothing is demoted.
+fn demote_disconnected_class_anchors(
+    base_pool: Vec<usize>,
+    remaining: &[RankedPattern],
+    bound_vars: &HashSet<VarId>,
+    anchor_vars: &HashSet<VarId>,
+) -> Vec<usize> {
+    let pipeline_active = !bound_vars.is_empty() || !anchor_vars.is_empty();
+    let has_connected_alt = pipeline_active
+        && remaining.iter().any(|rp| {
+            pattern_shares_variables(&rp.pattern, bound_vars)
+                || pattern_shares_variables(&rp.pattern, anchor_vars)
+        });
+    if !has_connected_alt {
+        return base_pool;
+    }
+    let demoted: Vec<usize> = base_pool
+        .iter()
+        .copied()
+        .filter(|&i| !is_disconnected_class_anchor(&remaining[i].pattern, bound_vars, anchor_vars))
+        .collect();
+    if demoted.is_empty() {
+        base_pool
+    } else {
+        demoted
+    }
+}
+
+/// Rank two seed candidates `i`/`j` (lower = better). The whole tie-break chain
+/// lives here, one level per `then_with`, in strict priority order:
+///   1. **search-source priority** — only at seed time (no bound vars), so a
+///      search source emits its result IDs/IriMatch bindings before plain
+///      triples consume them;
+///   2. **estimated cardinality** — the primary signal;
+///   3. **unlocked object→subject hash scan** — among EQUAL-cardinality starts
+///      only, prefer the one that keeps the LARGER predicate hash-able rather
+///      than forward-joining over a big intermediate (the BSBM-BI bowtie: 46× on
+///      BI-1's F2);
+///   4. **original position** — stable final tie-break.
+fn rank_seed_candidates(
+    i: usize,
+    j: usize,
+    remaining: &[RankedPattern],
+    bound_vars: &HashSet<VarId>,
+    stats: Option<&StatsView>,
+    has_bound: bool,
+) -> std::cmp::Ordering {
+    let search_priority = |pattern: &Pattern| match pattern {
+        Pattern::IndexSearch(_)
+        | Pattern::VectorSearch(_)
+        | Pattern::GeoSearch(_)
+        | Pattern::S2Search(_) => 0_u8,
+        _ => 1_u8,
+    };
+    let ci = estimate_pattern(&remaining[i].pattern, bound_vars, stats);
+    let cj = estimate_pattern(&remaining[j].pattern, bound_vars, stats);
+
+    // 1. Search sources seed first — but only before anything is bound.
+    let by_search = if has_bound {
+        std::cmp::Ordering::Equal
+    } else {
+        search_priority(&remaining[i].pattern).cmp(&search_priority(&remaining[j].pattern))
+    };
+    by_search
+        // 2. Primary: estimated cardinality.
+        .then_with(|| {
+            ci.row_count()
+                .partial_cmp(&cj.row_count())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        // 3. Equal-cardinality only: keep the larger predicate hash-able.
+        .then_with(|| {
+            let bi = unlocked_object_hash_scan(i, remaining, bound_vars, stats);
+            let bj = unlocked_object_hash_scan(j, remaining, bound_vars, stats);
+            bj.cmp(&bi)
+        })
+        // 4. Stable: original position.
+        .then_with(|| remaining[i].orig_index.cmp(&remaining[j].orig_index))
+}
+
 /// Try to place the best source. Returns true if one was placed.
 ///
-/// `anchor_vars` are the outputs of uncorrelated WITH-subquery producers (see
-/// `reorder_patterns`) — a pseudo-bound pipeline component. At every placement,
-/// when a pipeline exists (bound vars or a producer) and some other candidate is
-/// connected to it, a disconnected `rdf:type <const>` class anchor is dropped
-/// from the pool so it cannot flip the chain into a scattered reverse
-/// object-drive (the IC3 `home:Country` case). This is deliberately narrow:
-/// only class anchors are demoted, only when a connected alternative exists, and
-/// selective property-value anchors (`?c name "X"`) are never touched — so
-/// IC6/IC11-style queries that legitimately seed from a constant entity, and
-/// genuine class-anchored queries (no producer, no bound pipeline), are
-/// unaffected.
+/// Three phases (each a named helper): build the connected/fallback candidate
+/// pool, demote disconnected `rdf:type <const>` class anchors when a connected
+/// alternative exists (the IC3 guard — see [`demote_disconnected_class_anchors`]),
+/// then pick the best by [`rank_seed_candidates`]. `anchor_vars` are the outputs
+/// of uncorrelated WITH-subquery producers (see `reorder_patterns`) — a
+/// pseudo-bound pipeline component for both the connectivity test and the
+/// demotion guard.
 fn try_place_source(
     remaining: &mut Vec<RankedPattern>,
     bound_vars: &mut HashSet<VarId>,
@@ -1438,89 +1544,12 @@ fn try_place_source(
     }
 
     let has_bound = !bound_vars.is_empty();
+    let base_pool = connected_or_fallback_pool(remaining, bound_vars);
+    let pool = demote_disconnected_class_anchors(base_pool, remaining, bound_vars, anchor_vars);
 
-    // Base pool: prefer sources joinable with the bound set; if none are (e.g.
-    // the only forward continuation is a not-yet-placed producer), fall back to
-    // all sources.
-    let connected: Vec<usize> = remaining
-        .iter()
-        .enumerate()
-        .filter(|(_, rp)| !has_bound || pattern_shares_variables(&rp.pattern, bound_vars))
-        .map(|(idx, _)| idx)
-        .collect();
-    let base_pool = if connected.is_empty() {
-        (0..remaining.len()).collect::<Vec<_>>()
-    } else {
-        connected
-    };
-
-    // Demote "broad index" sources from whichever pool we use — including the
-    // fall-back-to-all pool — so they cannot win the seed when a concrete
-    // connected alternative exists: disconnected `rdf:type <const>` class
-    // anchors (the IC3 chain-A `home:Country` reverse-drive).
-    // Only applies when a pipeline exists with a connected alternative, so
-    // selective property-value anchors, the base edge, and genuine
-    // class-anchored queries are untouched. If demotion would empty the pool,
-    // keep the base pool.
-    let pipeline_active = has_bound || !anchor_vars.is_empty();
-    let has_connected_alt = pipeline_active
-        && remaining.iter().any(|rp| {
-            pattern_shares_variables(&rp.pattern, bound_vars)
-                || pattern_shares_variables(&rp.pattern, anchor_vars)
-        });
-    let pool: Vec<usize> = if has_connected_alt {
-        let demoted: Vec<usize> = base_pool
-            .iter()
-            .copied()
-            .filter(|&i| {
-                let p = &remaining[i].pattern;
-                !is_disconnected_class_anchor(p, bound_vars, anchor_vars)
-            })
-            .collect();
-        if demoted.is_empty() {
-            base_pool
-        } else {
-            demoted
-        }
-    } else {
-        base_pool
-    };
-
-    let best_idx = pool.into_iter().min_by(|&i, &j| {
-        let seed_priority = |pattern: &Pattern| match pattern {
-            // Search sources should seed the pipeline before plain triples so
-            // they can emit result IDs/IriMatch bindings that later joins consume.
-            Pattern::IndexSearch(_)
-            | Pattern::VectorSearch(_)
-            | Pattern::GeoSearch(_)
-            | Pattern::S2Search(_) => 0_u8,
-            _ => 1_u8,
-        };
-        let ci = estimate_pattern(&remaining[i].pattern, bound_vars, stats);
-        let cj = estimate_pattern(&remaining[j].pattern, bound_vars, stats);
-        if !has_bound {
-            seed_priority(&remaining[i].pattern).cmp(&seed_priority(&remaining[j].pattern))
-        } else {
-            std::cmp::Ordering::Equal
-        }
-        .then_with(|| {
-            ci.row_count()
-                .partial_cmp(&cj.row_count())
-                .unwrap_or(std::cmp::Ordering::Equal)
-        })
-        // Before falling back to original index: among equally-selective starts,
-        // prefer the one that turns the LARGER predicate into an object→subject
-        // hash join rather than a forward join over a big intermediate. This flips
-        // a BSBM-BI bowtie (two equally-selective country filters, written
-        // producer/DE-first) onto the side whose chain keeps the 2.85M-row
-        // predicate hash-able — 46x on BI-1's F2.
-        .then_with(|| {
-            let bi = unlocked_object_hash_scan(i, &remaining[..], bound_vars, stats);
-            let bj = unlocked_object_hash_scan(j, &remaining[..], bound_vars, stats);
-            bj.cmp(&bi)
-        })
-        .then_with(|| remaining[i].orig_index.cmp(&remaining[j].orig_index))
-    });
+    let best_idx = pool
+        .into_iter()
+        .min_by(|&i, &j| rank_seed_candidates(i, j, remaining, bound_vars, stats, has_bound));
 
     if let Some(idx) = best_idx {
         let rp = remaining.remove(idx);
@@ -3465,6 +3494,98 @@ mod tests {
             matches!(&ordered[1], Pattern::Triple(tp)
                 if matches!(&tp.p, Ref::Sid(s) if s.name.as_ref() == "HAS_CREATOR")),
             "consumer drains right after the producer: {ordered:?}"
+        );
+    }
+
+    /// Position of the first triple whose predicate name is `name`.
+    fn triple_pos(ordered: &[Pattern], name: &str) -> usize {
+        ordered
+            .iter()
+            .position(|p| {
+                matches!(p, Pattern::Triple(tp)
+                    if matches!(&tp.p, Ref::Sid(s) if s.name.as_ref() == name))
+            })
+            .unwrap_or_else(|| panic!("predicate {name} present in {ordered:?}"))
+    }
+
+    #[test]
+    fn demotion_is_class_anchor_specific_property_anchor_survives() {
+        // Companion to `class_anchor_demoted_in_fallback_when_producer_continues`:
+        // the SAME pipeline shape, but the disconnected anchor is a SELECTIVE
+        // property-value anchor (`?home id <x>`), not an rdf:type class anchor.
+        // Demotion targets only class anchors, so the property anchor stays in
+        // the pool and — being more selective than the producer — seeds first.
+        // (If demotion over-reached to property anchors, the producer would win,
+        // exactly as it does for a class anchor.)
+        let (friend, home, mx) = (VarId(0), VarId(2), VarId(3));
+        let patterns = vec![
+            value_anchor(home),
+            with_producer(friend),
+            Pattern::Triple(make_pattern(mx, "HAS_CREATOR", friend)), // consumer of friend
+        ];
+        let ordered = reorder_patterns(&patterns, None, &HashSet::new());
+        assert!(
+            matches!(&ordered[0], Pattern::Triple(tp) if !tp.p.is_rdf_type()),
+            "selective property-value anchor is not demoted and seeds first: {ordered:?}"
+        );
+        assert!(
+            ordered
+                .iter()
+                .position(|p| matches!(p, Pattern::Subquery(_)))
+                .expect("producer present")
+                > 0,
+            "producer does not seed ahead of the surviving property anchor: {ordered:?}"
+        );
+    }
+
+    #[test]
+    fn hash_scan_tiebreak_only_breaks_equal_cardinality_seeds() {
+        // Two seed candidates A (`?x pa ?y`) and B (`?z pb ?w`) plus a large
+        // downstream predicate `?m big ?y` whose object A binds. The hash-scan
+        // tie-break is subordinate to cardinality, so it must decide ONLY when A
+        // and B tie.
+        let (x, y, z, w, m) = (VarId(0), VarId(1), VarId(2), VarId(3), VarId(4));
+        let stat = |c: u64| PropertyStatData {
+            count: c,
+            ndv_values: c,
+            ndv_subjects: c,
+        };
+
+        // Equal cardinality (100 vs 100): the unlocked-object-hash-scan tie-break
+        // prefers A, which keeps the 1M-row `big` predicate hash-able.
+        let mut tied = StatsView::default();
+        tied.properties.insert(Sid::new(100, "pa"), stat(100));
+        tied.properties.insert(Sid::new(100, "pb"), stat(100));
+        tied.properties
+            .insert(Sid::new(100, "big"), stat(1_000_000));
+        let patterns = vec![
+            Pattern::Triple(make_pattern(x, "pa", y)),
+            Pattern::Triple(make_pattern(z, "pb", w)),
+            Pattern::Triple(make_pattern(m, "big", y)),
+        ];
+        let ordered = reorder_patterns(&patterns, Some(&tied), &HashSet::new());
+        assert!(
+            triple_pos(&ordered, "pa") < triple_pos(&ordered, "pb"),
+            "equal cardinality: A unlocks the big hash scan and seeds before B: {ordered:?}"
+        );
+
+        // Break the tie on cardinality (B = 50 < A = 100): cardinality is primary,
+        // so B wins and the hash-scan tie-break is never consulted.
+        let mut skewed = StatsView::default();
+        skewed.properties.insert(Sid::new(100, "pa"), stat(100));
+        skewed.properties.insert(Sid::new(100, "pb"), stat(50));
+        skewed
+            .properties
+            .insert(Sid::new(100, "big"), stat(1_000_000));
+        let patterns = vec![
+            Pattern::Triple(make_pattern(x, "pa", y)),
+            Pattern::Triple(make_pattern(z, "pb", w)),
+            Pattern::Triple(make_pattern(m, "big", y)),
+        ];
+        let ordered = reorder_patterns(&patterns, Some(&skewed), &HashSet::new());
+        assert!(
+            triple_pos(&ordered, "pb") < triple_pos(&ordered, "pa"),
+            "strictly-more-selective B wins; the unlock tie-break does not override cardinality: {ordered:?}"
         );
     }
 
