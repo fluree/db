@@ -334,6 +334,19 @@ impl<'a> HashJoinPlanner<'a> {
         }
     }
 
+    /// Seed the running driving estimate from the block's incoming LEFT operator
+    /// (e.g. a `SubqueryOperator` producing `WITH DISTINCT friend`). Without this
+    /// the first probe in the block is costed against `driving_est = 1` — so a
+    /// large object predicate trips `scan-ratio-too-high` and the hash join is
+    /// wrongly rejected, even though the left side produces hundreds of rows.
+    /// `None` (left side has no estimate) leaves the default 1.0.
+    pub(crate) fn with_left_estimate(mut self, left_est: Option<usize>) -> Self {
+        if let Some(n) = left_est {
+            self.driving_est = (n as f64).max(1.0);
+        }
+        self
+    }
+
     /// Advance the running driving cardinality past one pattern. Call once per
     /// pattern, in chain order, BEFORE building its operator. Snapshots the product
     /// of the patterns to the LEFT of `tp` (this becomes `step_est`, the size the

@@ -28,12 +28,14 @@ use crate::context::ExecutionContext;
 use crate::error::{QueryError, Result};
 use crate::fast_path_common::try_normalize_pred_sid;
 use crate::fast_path_common::{subject_probe_lane_plan, ProbeLanePlan, ProbeOps};
+use crate::group_aggregate::{binding_to_group_key_normalized, GroupKeyOwned};
 use crate::ir::triple::{Ref, Term, TriplePattern};
 use crate::ir::Pattern;
 use crate::join::{
     batched_subject_probe_binary, BindInstruction, PatternPosition, SubjectProbeParams,
     UnifyInstruction,
 };
+use crate::object_binding::{equality_norm, EqualityNorm};
 use crate::operator::{
     compute_trimmed_vars, effective_schema, trim_batch, BoxedOperator, Operator, OperatorState,
 };
@@ -74,6 +76,7 @@ pub type OptionalBatchRow = (usize, Vec<Batch>);
 /// - Substituting bound vars into scan patterns
 /// - Creating a seed `Values` operator with the left row
 /// - Building a join chain that starts from the left bindings
+#[async_trait]
 pub trait OptionalBuilder: Send + Sync {
     /// Build an optional operator for the given required row
     ///
@@ -95,11 +98,16 @@ pub trait OptionalBuilder: Send + Sync {
         ctx: &ExecutionContext<'_>,
     ) -> Result<Option<BoxedOperator>>;
 
-    /// Optionally build all remaining required rows in the current batch in one pass.
+    /// Optionally build *and execute* all remaining required rows in the current
+    /// batch in one pass, returning each row's optional-side result batches.
     ///
-    /// Builders can override this to implement batched probe paths for hot
-    /// correlated OPTIONAL shapes. Default: no batched execution.
-    fn build_batch(
+    /// Builders override this to implement batched paths for hot correlated
+    /// OPTIONAL shapes — either synchronous index probes (see
+    /// `GroupedPatternOptionalBuilder`) or a single seeded subplan execution
+    /// hash-partitioned across rows (see `PlanTreeOptionalBuilder`). The method
+    /// is `async` so the latter can drive a real operator subtree.
+    /// Default: no batched execution (operator falls back to per-row `build`).
+    async fn build_batch(
         &self,
         _required_batch: &Batch,
         _start_row: usize,
@@ -400,6 +408,7 @@ impl PatternOptionalBuilder {
     }
 }
 
+#[async_trait]
 impl OptionalBuilder for PatternOptionalBuilder {
     fn build(
         &self,
@@ -427,7 +436,7 @@ impl OptionalBuilder for PatternOptionalBuilder {
         )))
     }
 
-    fn build_batch(
+    async fn build_batch(
         &self,
         required_batch: &Batch,
         start_row: usize,
@@ -772,6 +781,7 @@ impl GroupedPatternOptionalBuilder {
     }
 }
 
+#[async_trait]
 impl OptionalBuilder for GroupedPatternOptionalBuilder {
     fn build(
         &self,
@@ -782,7 +792,7 @@ impl OptionalBuilder for GroupedPatternOptionalBuilder {
         self.build_fallback_chain(required_batch, row, ctx)
     }
 
-    fn build_batch(
+    async fn build_batch(
         &self,
         required_batch: &Batch,
         start_row: usize,
@@ -1100,6 +1110,7 @@ impl PlanTreeOptionalBuilder {
     }
 }
 
+#[async_trait]
 impl OptionalBuilder for PlanTreeOptionalBuilder {
     fn build(
         &self,
@@ -1136,6 +1147,229 @@ impl OptionalBuilder for PlanTreeOptionalBuilder {
         Ok(Some(op))
     }
 
+    /// Batched correlated OPTIONAL as a hash left-join.
+    ///
+    /// Instead of rebuilding and re-executing the inner subplan once per
+    /// required row, seed it ONCE with the distinct correlation tuples of the
+    /// whole batch, execute it once, then hash-partition the results back to
+    /// each row by correlation key. This collapses the per-driving-row subplan
+    /// rebuild (the LDBC IC5 cliff) into a single inner scan.
+    ///
+    /// Soundness: the inner solutions for a required row depend on the row only
+    /// through its shared (correlation) variables — the sole overlap with the
+    /// inner patterns — so partitioning the single execution by those variables
+    /// reproduces the per-row results exactly. Gated to inner shapes whose
+    /// per-seed evaluation is a pure restriction by the correlation tuple
+    /// (no internal LIMIT / independent correlation / row-multiplying subquery).
+    /// Any unmet gate returns `Ok(None)`, deferring to the per-row `build` path.
+    async fn build_batch(
+        &self,
+        required_batch: &Batch,
+        start_row: usize,
+        ctx: &ExecutionContext<'_>,
+    ) -> Result<Option<Vec<OptionalBatchRow>>> {
+        if start_row >= required_batch.len()
+            || optional_hash_join_disabled()
+            || ctx.is_multi_ledger()
+            || !self
+                .inner_patterns
+                .iter()
+                .all(inner_pattern_is_hash_join_safe)
+        {
+            return Ok(None);
+        }
+
+        // Correlation columns = required columns whose var is referenced anywhere
+        // inside the inner patterns (join keys, filter operands, path endpoints).
+        let req_schema = required_batch.schema();
+        let referenced: HashSet<VarId> = self
+            .inner_patterns
+            .iter()
+            .flat_map(Pattern::referenced_vars)
+            .collect();
+        let corr_cols: Vec<usize> = req_schema
+            .iter()
+            .enumerate()
+            .filter(|(_, v)| referenced.contains(v))
+            .map(|(c, _)| c)
+            .collect();
+        if corr_cols.is_empty() {
+            // Uncorrelated OPTIONAL: leave to the per-row path (rare).
+            return Ok(None);
+        }
+        let corr_vars: Vec<VarId> = corr_cols.iter().map(|&c| req_schema[c]).collect();
+
+        // Seed only the correlation vars that drive the inner subject-first.
+        // A correlation var that appears in the inner SOLELY as a Triple object
+        // is left UNBOUND: the inner then binds it from the subject side (a fast
+        // PSOT scan) instead of object-probing the seeded value through the
+        // scattered global object index — the hash-join drive that fixes the
+        // LDBC IC5 timeout. Correctness is preserved by partitioning on the full
+        // correlation key, so the inner-produced binding is matched back to the
+        // required row's value. Vars used anywhere else (subject/predicate/
+        // filter/path) must be seeded to keep the inner correct.
+        let unbound_corr: HashSet<VarId> = corr_vars
+            .iter()
+            .copied()
+            .filter(|v| corr_var_only_triple_object(*v, &self.inner_patterns))
+            .collect();
+        let seed_cols: Vec<usize> = corr_cols
+            .iter()
+            .copied()
+            .filter(|&c| !unbound_corr.contains(&req_schema[c]))
+            .collect();
+        if seed_cols.is_empty() {
+            // No subject-drivable correlation: seeding nothing would run the
+            // inner uncorrelated (possible explosion). Defer to the per-row path.
+            return Ok(None);
+        }
+        let seed_vars: Vec<VarId> = seed_cols.iter().map(|&c| req_schema[c]).collect();
+
+        let norm = equality_norm(ctx);
+        let (store, gv) = EqualityNorm::parts(&norm);
+
+        // Per row: full correlation key (for matching) + distinct seed tuple
+        // over the seeded subset. A poisoned/unbound correlation var can never
+        // match -> no-match row.
+        let n = required_batch.len();
+        let mut row_keys: Vec<Option<Vec<GroupKeyOwned>>> = Vec::with_capacity(n - start_row);
+        let mut seed_rows: Vec<Vec<Binding>> = Vec::new();
+        let mut seen_seed: HashSet<Vec<GroupKeyOwned>> = HashSet::new();
+        for row in start_row..n {
+            let unmatchable = corr_cols.iter().any(|&c| {
+                let b = required_batch.get_by_col(row, c);
+                b.is_poisoned() || matches!(b, Binding::Unbound)
+            });
+            if unmatchable {
+                row_keys.push(None);
+                continue;
+            }
+            let key: Vec<GroupKeyOwned> = corr_cols
+                .iter()
+                .map(|&c| {
+                    binding_to_group_key_normalized(required_batch.get_by_col(row, c), store, gv)
+                })
+                .collect();
+            let seed_key: Vec<GroupKeyOwned> = seed_cols
+                .iter()
+                .map(|&c| {
+                    binding_to_group_key_normalized(required_batch.get_by_col(row, c), store, gv)
+                })
+                .collect();
+            if seen_seed.insert(seed_key) {
+                seed_rows.push(
+                    seed_cols
+                        .iter()
+                        .map(|&c| required_batch.get_by_col(row, c).clone())
+                        .collect(),
+                );
+            }
+            row_keys.push(Some(key));
+        }
+
+        if seed_rows.is_empty() {
+            // Every row had an unmatchable correlation var.
+            return Ok(Some((start_row..n).map(|row| (row, Vec::new())).collect()));
+        }
+
+        // Build the inner subplan ONCE seeded by the distinct subject-driving
+        // tuples; object-only correlation vars stay unbound so the inner
+        // produces them subject-first.
+        let seed_schema: Arc<[VarId]> = Arc::from(seed_vars.clone().into_boxed_slice());
+        let seed = MaterializedSeedOperator::new(seed_schema, seed_rows, ctx.batch_size);
+        let mut inner = crate::execute::build_where_operators_seeded(
+            Some(Box::new(seed)),
+            &self.inner_patterns,
+            self.stats.clone(),
+            None,
+            &self.planning,
+        )?;
+
+        // The inner output must expose every correlation var (for partitioning)
+        // and every optional-only var (for combine). If emission pruning dropped
+        // one, fall back to the per-row path rather than mis-partition.
+        let inner_schema = inner.schema().to_vec();
+        let mut out_corr_cols: Vec<usize> = Vec::with_capacity(corr_vars.len());
+        for v in &corr_vars {
+            match inner_schema.iter().position(|x| x == v) {
+                Some(c) => out_corr_cols.push(c),
+                None => return Ok(None),
+            }
+        }
+        let mut out_opt_cols: Vec<usize> = Vec::with_capacity(self.optional_only_vars.len());
+        for v in &self.optional_only_vars {
+            match inner_schema.iter().position(|x| x == v) {
+                Some(c) => out_opt_cols.push(c),
+                None => return Ok(None),
+            }
+        }
+        // Optional-side batches carry ONLY the optional-only vars: correlation
+        // equality is already enforced by the partition, so the operator's
+        // per-row unify check is intentionally a no-op here (shared vars absent).
+        let opt_schema: Arc<[VarId]> =
+            Arc::from(self.optional_only_vars.clone().into_boxed_slice());
+
+        // Execute once; hash-partition output rows by the full correlation key.
+        inner.open(ctx).await?;
+        let mut buckets: HashMap<Vec<GroupKeyOwned>, Vec<Vec<Binding>>> = HashMap::new();
+        while let Some(batch) = inner.next_batch(ctx).await? {
+            ctx.check_cancelled()?;
+            for r in 0..batch.len() {
+                let key: Vec<GroupKeyOwned> = out_corr_cols
+                    .iter()
+                    .map(|&c| binding_to_group_key_normalized(batch.get_by_col(r, c), store, gv))
+                    .collect();
+                let projected: Vec<Binding> = out_opt_cols
+                    .iter()
+                    .map(|&c| batch.get_by_col(r, c).clone())
+                    .collect();
+                buckets.entry(key).or_default().push(projected);
+            }
+        }
+        inner.close();
+
+        // One result Batch per correlation key (optional-only columns only),
+        // then assigned to each required row that shares the key.
+        let mut key_batches: HashMap<Vec<GroupKeyOwned>, Batch> = HashMap::new();
+        for (key, rows) in buckets {
+            let batch = if opt_schema.is_empty() {
+                Batch::empty_schema_with_len(rows.len())
+            } else {
+                let mut columns: Vec<Vec<Binding>> = (0..opt_schema.len())
+                    .map(|_| Vec::with_capacity(rows.len()))
+                    .collect();
+                for projected in rows {
+                    for (c, b) in projected.into_iter().enumerate() {
+                        columns[c].push(b);
+                    }
+                }
+                Batch::new(opt_schema.clone(), columns)?
+            };
+            key_batches.insert(key, batch);
+        }
+
+        let mut pending: Vec<OptionalBatchRow> = Vec::with_capacity(n - start_row);
+        for (offset, row) in (start_row..n).enumerate() {
+            let batches = match &row_keys[offset] {
+                Some(key) => key_batches
+                    .get(key)
+                    .map(|b| vec![b.clone()])
+                    .unwrap_or_default(),
+                None => Vec::new(),
+            };
+            pending.push((row, batches));
+        }
+        tracing::debug!(
+            seed_tuples = seen_seed.len(),
+            seed_vars = seed_vars.len(),
+            unbound_corr = unbound_corr.len(),
+            inner_keys = key_batches.len(),
+            rows = pending.len(),
+            "optional batched hash-join complete"
+        );
+        Ok(Some(pending))
+    }
+
     fn schema(&self) -> &[VarId] {
         &self.optional_schema
     }
@@ -1146,6 +1380,128 @@ impl OptionalBuilder for PlanTreeOptionalBuilder {
 
     fn unify_instructions(&self) -> &[UnifyInstruction] {
         &self.unify_instructions
+    }
+}
+
+/// Inner-pattern shapes whose per-row OPTIONAL evaluation is exactly a
+/// restriction by the correlation tuple — safe to evaluate once over all
+/// distinct tuples and hash-partition. Triples, row-local filters, and
+/// property paths from a (possibly seeded) endpoint qualify; subqueries,
+/// nested OPTIONAL/UNION/MINUS, BIND/UNWIND/VALUES, and search patterns do
+/// not (they can carry internal limits or independent correlation).
+fn inner_pattern_is_hash_join_safe(p: &Pattern) -> bool {
+    matches!(
+        p,
+        Pattern::Triple(_) | Pattern::Filter(_) | Pattern::PropertyPath(_)
+    )
+}
+
+/// True iff `v` occurs in the inner patterns ONLY as the object of one or more
+/// Triples (never a subject/predicate, never inside a filter/path/other
+/// pattern). Such a correlation var can be left unbound in the seeded inner so
+/// it is produced subject-first — turning a scattered global object-probe into
+/// a fast subject scan — while the full-key partition still matches the
+/// produced binding back to the required row's value.
+fn corr_var_only_triple_object(v: VarId, patterns: &[Pattern]) -> bool {
+    let mut seen_as_object = false;
+    for p in patterns {
+        match p {
+            Pattern::Triple(t) => {
+                if matches!(&t.s, Ref::Var(x) if *x == v) || matches!(&t.p, Ref::Var(x) if *x == v)
+                {
+                    return false;
+                }
+                if matches!(&t.o, Term::Var(x) if *x == v) {
+                    seen_as_object = true;
+                }
+            }
+            other => {
+                if other.referenced_vars().contains(&v) {
+                    return false;
+                }
+            }
+        }
+    }
+    seen_as_object
+}
+
+/// Kill-switch for the batched OPTIONAL hash-join (`FLUREE_OPTIONAL_HASH_JOIN=0`).
+/// Read once; defaults to enabled.
+fn optional_hash_join_disabled() -> bool {
+    use std::sync::OnceLock;
+    static DISABLED: OnceLock<bool> = OnceLock::new();
+    *DISABLED.get_or_init(|| {
+        std::env::var("FLUREE_OPTIONAL_HASH_JOIN")
+            .map(|v| v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off"))
+            .unwrap_or(false)
+    })
+}
+
+/// Single-shot operator that emits a precomputed set of rows (the distinct
+/// correlation tuples) as the seed of a batched OPTIONAL hash-join, chunked to
+/// the execution batch size.
+struct MaterializedSeedOperator {
+    schema: Arc<[VarId]>,
+    batches: VecDeque<Batch>,
+    state: OperatorState,
+}
+
+impl MaterializedSeedOperator {
+    fn new(schema: Arc<[VarId]>, rows: Vec<Vec<Binding>>, chunk: usize) -> Self {
+        let chunk = chunk.max(1);
+        let ncols = schema.len();
+        let mut batches = VecDeque::new();
+        for chunk_rows in rows.chunks(chunk) {
+            let mut columns: Vec<Vec<Binding>> = (0..ncols)
+                .map(|_| Vec::with_capacity(chunk_rows.len()))
+                .collect();
+            for row in chunk_rows {
+                for (c, b) in row.iter().enumerate() {
+                    columns[c].push(b.clone());
+                }
+            }
+            if let Ok(batch) = Batch::new(schema.clone(), columns) {
+                batches.push_back(batch);
+            }
+        }
+        Self {
+            schema,
+            batches,
+            state: OperatorState::Created,
+        }
+    }
+}
+
+#[async_trait]
+impl Operator for MaterializedSeedOperator {
+    fn schema(&self) -> &[VarId] {
+        &self.schema
+    }
+
+    async fn open(&mut self, _ctx: &ExecutionContext<'_>) -> Result<()> {
+        self.state = OperatorState::Open;
+        Ok(())
+    }
+
+    async fn next_batch(&mut self, _ctx: &ExecutionContext<'_>) -> Result<Option<Batch>> {
+        if self.state != OperatorState::Open {
+            return Ok(None);
+        }
+        match self.batches.pop_front() {
+            Some(batch) => Ok(Some(batch)),
+            None => {
+                self.state = OperatorState::Exhausted;
+                Ok(None)
+            }
+        }
+    }
+
+    fn close(&mut self) {
+        self.state = OperatorState::Closed;
+    }
+
+    fn estimated_rows(&self) -> Option<usize> {
+        Some(self.batches.iter().map(Batch::len).sum())
     }
 }
 
@@ -1547,11 +1903,11 @@ impl Operator for OptionalOperator {
             // Process current required row
             if self.current_required_row < required_batch.len() {
                 if self.pending_output.is_empty() {
-                    if let Some(batched_pending) = self.optional_builder.build_batch(
-                        required_batch,
-                        self.current_required_row,
-                        ctx,
-                    )? {
+                    if let Some(batched_pending) = self
+                        .optional_builder
+                        .build_batch(required_batch, self.current_required_row, ctx)
+                        .await?
+                    {
                         batched_builds += 1;
                         batched_rows += batched_pending.len();
                         required_rows_seen += batched_pending.len();
