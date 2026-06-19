@@ -19,6 +19,7 @@ pub(crate) mod query;
 mod show;
 mod storage_proxy;
 mod stubs;
+mod submissions;
 mod transact;
 
 use crate::state::AppState;
@@ -106,6 +107,11 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/insert/*ledger", post(transact::insert_ledger_tail))
         .route("/upsert", post(transact::upsert))
         .route("/upsert/*ledger", post(transact::upsert_ledger_tail))
+        // Submission status lookup (by idempotency key)
+        .route(
+            "/submissions/:key/*ledger",
+            get(submissions::submission_status),
+        )
         // Default context management
         .route(
             "/context/*ledger",

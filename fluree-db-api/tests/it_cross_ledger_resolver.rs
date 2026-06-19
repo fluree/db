@@ -638,7 +638,7 @@ async fn distinct_namespace_codes_canary_term_translation_still_works() {
     // into D's evaluation), the deny would miss and alice would be
     // visible.
     let wrapped = fluree
-        .db_with_policy(data_id, &fluree_db_api::QueryConnectionOptions::default())
+        .db_with_policy(data_id, &fluree_db_api::GovernanceOptions::default())
         .await
         .expect("db_with_policy under cross-ledger");
 

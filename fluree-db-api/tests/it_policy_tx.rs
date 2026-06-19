@@ -11,8 +11,8 @@ mod support;
 
 use fluree_db_api::policy_builder;
 use fluree_db_api::{
-    CommitOpts, FlureeBuilder, IndexConfig, QueryConnectionOptions, TrackedTransactionInput,
-    TxnOpts, TxnType,
+    CommitOpts, FlureeBuilder, GovernanceOptions, IndexConfig, TrackedTransactionInput, TxnOpts,
+    TxnType,
 };
 use serde_json::json;
 use std::collections::HashMap;
@@ -89,7 +89,7 @@ async fn modify_policy_allows_own_property() {
     ]);
 
     // Build policy context with John as identity
-    let qc_opts = QueryConnectionOptions {
+    let qc_opts = GovernanceOptions {
         policy: Some(policy),
         policy_values: Some(HashMap::from([(
             "?$identity".to_string(),
@@ -210,7 +210,7 @@ async fn modify_policy_denies_other_property() {
     ]);
 
     // Build policy context with Alice as identity
-    let qc_opts = QueryConnectionOptions {
+    let qc_opts = GovernanceOptions {
         policy: Some(policy),
         policy_values: Some(HashMap::from([(
             "?$identity".to_string(),
@@ -312,7 +312,7 @@ async fn view_only_policy_blocks_modify() {
     }]);
 
     // Build policy context (no modify policies)
-    let qc_opts = QueryConnectionOptions {
+    let qc_opts = GovernanceOptions {
         policy: Some(policy),
         default_allow: false,
         ..Default::default()
@@ -412,7 +412,7 @@ async fn modify_query_always_false_denies() {
     ]);
 
     // Build policy context
-    let qc_opts = QueryConnectionOptions {
+    let qc_opts = GovernanceOptions {
         policy: Some(policy),
         default_allow: false,
         ..Default::default()

@@ -19,7 +19,7 @@
 //! }
 //! ```
 
-use crate::dataset::QueryConnectionOptions;
+use crate::dataset::GovernanceOptions;
 use crate::format::iri::IriCompactor;
 use crate::graph::Graph;
 use crate::ledger_view::CommitRef;
@@ -276,7 +276,7 @@ impl<'a, 'g> CommitBuilder<'a, 'g> {
         //    variants (query vs internal) instead of losing them through
         //    BlockFetchError's stringified intermediary.
         if self.identity.is_some() || self.policy_class.is_some() {
-            let opts = QueryConnectionOptions {
+            let opts = GovernanceOptions {
                 identity: self.identity.clone(),
                 policy_class: self.policy_class.as_deref().map(|c| vec![c.to_string()]),
                 ..Default::default()

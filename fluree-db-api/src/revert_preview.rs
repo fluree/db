@@ -10,7 +10,7 @@ use crate::error::{ApiError, Result};
 use crate::ledger_view::CommitRef;
 use crate::merge_preview::{DEFAULT_MAX_COMMITS, DEFAULT_MAX_CONFLICT_KEYS};
 use crate::rebase::ConflictStrategy;
-use crate::revert::{RevertContext, RevertSource};
+use crate::revert::{RevertContext, RevertSelection};
 use fluree_db_core::{commit_to_summary, load_commit_by_id, CommitSummary, ConflictKey};
 use serde::Serialize;
 use tracing::Instrument;
@@ -115,7 +115,7 @@ impl crate::Fluree {
     ) -> Result<RevertPreview> {
         let span = tracing::debug_span!("revert_commit_preview", ledger_name, branch);
         async move {
-            self.revert_preview_inner(ledger_name, branch, RevertSource::single(commit), opts)
+            self.revert_preview_inner(ledger_name, branch, RevertSelection::single(commit), opts)
                 .await
         }
         .instrument(span)
@@ -143,10 +143,10 @@ impl crate::Fluree {
     ) -> Result<RevertPreview> {
         let span = tracing::debug_span!("revert_commits_preview", ledger_name, branch);
         async move {
-            let source = RevertSource::try_set(commits).ok_or_else(|| {
+            let selection = RevertSelection::try_set(commits).ok_or_else(|| {
                 ApiError::InvalidBranch("Revert requires at least one commit".to_string())
             })?;
-            self.revert_preview_inner(ledger_name, branch, source, opts)
+            self.revert_preview_inner(ledger_name, branch, selection, opts)
                 .await
         }
         .instrument(span)
@@ -176,7 +176,7 @@ impl crate::Fluree {
     ) -> Result<RevertPreview> {
         let span = tracing::debug_span!("revert_range_preview", ledger_name, branch);
         async move {
-            self.revert_preview_inner(ledger_name, branch, RevertSource::range(from, to), opts)
+            self.revert_preview_inner(ledger_name, branch, RevertSelection::range(from, to), opts)
                 .await
         }
         .instrument(span)
@@ -187,7 +187,7 @@ impl crate::Fluree {
         &self,
         ledger_name: &str,
         branch: &str,
-        source: RevertSource,
+        selection: RevertSelection,
         opts: RevertPreviewOpts,
     ) -> Result<RevertPreview> {
         match opts.conflict_strategy {
@@ -210,7 +210,7 @@ impl crate::Fluree {
             conflict_keys,
             ..
         } = self
-            .build_revert_context(ledger_name, branch, source)
+            .build_revert_context(ledger_name, branch, selection)
             .await?;
 
         // Build per-commit summaries up to the requested cap. The full count
