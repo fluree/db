@@ -11,15 +11,17 @@ use std::path::Path;
 
 /// Format detected for the update body.
 ///
-/// `update` accepts JSON-LD (with where/delete/insert) and SPARQL UPDATE.
-/// Turtle is not valid here—use `insert` or `upsert` for Turtle data.
+/// `update` accepts JSON-LD (with where/delete/insert), SPARQL UPDATE, and
+/// openCypher writes (CREATE / MATCH…SET / REMOVE). Turtle is not valid
+/// here—use `insert` or `upsert` for Turtle data.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UpdateFormat {
     JsonLd,
     SparqlUpdate,
+    Cypher,
 }
 
-/// Detect whether the input is JSON-LD or SPARQL UPDATE.
+/// Detect whether the input is JSON-LD, SPARQL UPDATE, or Cypher.
 fn detect_update_format(
     path: Option<&Path>,
     content: &str,
@@ -30,8 +32,9 @@ fn detect_update_format(
         return match fmt.to_lowercase().as_str() {
             "jsonld" | "json-ld" | "json" => Ok(UpdateFormat::JsonLd),
             "sparql" | "sparql-update" => Ok(UpdateFormat::SparqlUpdate),
+            "cypher" | "opencypher" => Ok(UpdateFormat::Cypher),
             other => Err(CliError::Usage(format!(
-                "unknown update format '{other}'\n  {} valid formats: jsonld, sparql",
+                "unknown update format '{other}'\n  {} valid formats: jsonld, sparql, cypher",
                 colored::Colorize::bold(colored::Colorize::cyan("help:"))
             ))),
         };
@@ -43,6 +46,7 @@ fn detect_update_format(
             match ext.to_lowercase().as_str() {
                 "json" | "jsonld" => return Ok(UpdateFormat::JsonLd),
                 "rq" | "ru" | "sparql" => return Ok(UpdateFormat::SparqlUpdate),
+                "cypher" | "cyp" | "cql" => return Ok(UpdateFormat::Cypher),
                 _ => {}
             }
         }
@@ -60,6 +64,16 @@ fn sniff_update_format(content: &str) -> CliResult<UpdateFormat> {
 
     let upper = content.trim().to_uppercase();
 
+    // Cypher write leads. `CREATE (` disambiguates Cypher node/edge creation
+    // from SPARQL UPDATE `CREATE GRAPH`.
+    if upper.starts_with("MATCH ")
+        || upper.starts_with("MERGE ")
+        || upper.starts_with("DETACH ")
+        || upper.starts_with("CREATE (")
+    {
+        return Ok(UpdateFormat::Cypher);
+    }
+
     // Check for SPARQL UPDATE keywords
     if upper.starts_with("INSERT")
         || upper.starts_with("DELETE")
@@ -70,7 +84,7 @@ fn sniff_update_format(content: &str) -> CliResult<UpdateFormat> {
     }
 
     Err(CliError::Usage(format!(
-        "could not detect update format\n  {} use --format jsonld or sparql to specify",
+        "could not detect update format\n  {} use --format jsonld, sparql, or cypher to specify",
         colored::Colorize::bold(colored::Colorize::cyan("help:"))
     )))
 }
@@ -121,6 +135,14 @@ pub async fn run(
             remote_name,
             ..
         } => {
+            if txn_format == UpdateFormat::Cypher {
+                return Err(CliError::Usage(
+                    "Cypher writes are only supported on local ledgers; the HTTP Cypher \
+                     endpoint is not yet available.\n  \
+                     Retry with --direct to bypass the server route."
+                        .into(),
+                ));
+            }
             let client = client.with_policy(policy.clone());
             let result = match txn_format {
                 UpdateFormat::SparqlUpdate => client.update_sparql(&remote_alias, &content).await?,
@@ -128,6 +150,7 @@ pub async fn run(
                     let json: serde_json::Value = serde_json::from_str(&content)?;
                     client.update_jsonld(&remote_alias, &json).await?
                 }
+                UpdateFormat::Cypher => unreachable!("cypher rejected above for remote ledgers"),
             };
 
             context::persist_refreshed_tokens(&client, &remote_name, dirs).await;
@@ -161,6 +184,23 @@ pub async fn run(
                 }
                 let result = b.commit().await?;
 
+                println!(
+                    "Committed t={}, {} flakes",
+                    result.receipt.t, result.receipt.flake_count
+                );
+                warn_novelty_if_needed(&result.indexing);
+            }
+            UpdateFormat::Cypher => {
+                if policy.is_set() {
+                    return Err(CliError::Usage(
+                        "policy enforcement is not yet supported for Cypher writes".into(),
+                    ));
+                }
+                let ledger = fluree.ledger(&alias).await?;
+                let (cypher, params) = fluree_db_api::extract_cypher_envelope(&content);
+                let result = fluree
+                    .transact_cypher_with_params(ledger, &cypher, params.as_ref())
+                    .await?;
                 println!(
                     "Committed t={}, {} flakes",
                     result.receipt.t, result.receipt.flake_count

@@ -43,6 +43,7 @@ pub mod config_resolver;
 pub mod credential;
 pub mod cross_ledger;
 pub mod csv_import;
+pub mod cypher_write;
 pub mod dataset;
 mod error;
 pub mod explain;
@@ -253,6 +254,38 @@ pub use fluree_db_sparql::{
     Severity as SparqlSeverity, SourceSpan as SparqlSourceSpan, SparqlAst,
     UpdateOperation as SparqlUpdateOperation,
 };
+
+// Re-export Cypher types (product feature; always enabled).
+pub use fluree_db_cypher::{
+    lower_cypher, parse_cypher, CypherAst, DiagCode as CypherDiagCode,
+    Diagnostic as CypherDiagnostic, LowerError as CypherLowerError, ParamMap as CypherParamMap,
+    ParseOutput as CypherParseOutput, Severity as CypherSeverity, SourceSpan as CypherSourceSpan,
+};
+pub use fluree_db_transact::lower_cypher_update::{
+    lower_cypher_update, CypherLowerOpts, LowerCypherError,
+};
+
+/// Split a Cypher request body into its statement and optional parameters.
+///
+/// Accepts either a raw Cypher string, or a JSON envelope
+/// `{"cypher": "...", "params": {...}}` (the Neo4j-HTTP-style shape). A body
+/// that doesn't parse as a JSON object with a `cypher` key is returned
+/// verbatim as the statement with no params, so plain-text Cypher still works.
+/// Shared by the HTTP routes and the CLI so both accept the same two shapes.
+pub fn extract_cypher_envelope(body: &str) -> (String, Option<CypherParamMap>) {
+    let trimmed = body.trim_start();
+    if trimmed.starts_with('{') {
+        if let Ok(serde_json::Value::Object(obj)) =
+            serde_json::from_str::<serde_json::Value>(trimmed)
+        {
+            if let Some(cypher) = obj.get("cypher").and_then(|v| v.as_str()) {
+                let params = obj.get("params").and_then(|v| v.as_object()).cloned();
+                return (cypher.to_string(), params);
+            }
+        }
+    }
+    (body.to_string(), None)
+}
 
 // Re-export policy types for access control
 pub use fluree_db_policy::{
@@ -3276,6 +3309,320 @@ impl Fluree {
     /// ```
     pub fn stage_owned(&self, ledger: LedgerState) -> OwnedTransactBuilder<'_> {
         OwnedTransactBuilder::new(self, ledger)
+    }
+
+    /// Stage a Cypher write statement.
+    ///
+    /// The Cypher parser produces a Txn that mirrors what the JSON-LD
+    /// `@annotation` lowering produces: base triples plus an
+    /// `f:reifies*` reifier bundle for every directed typed
+    /// relationship (LPG-mode default).
+    ///
+    /// v1 supports CREATE only. SET / REMOVE / DELETE / DETACH
+    /// DELETE / MERGE return clear deferred-feature errors. See
+    /// `docs/concepts/cypher.md` for the surface.
+    ///
+    /// Context resolution: the ledger's configured `default_context`
+    /// (if any) supplies `@vocab` and bare-identifier overrides.
+    /// A CAS read or parse failure on a configured context
+    /// propagates as an error — writes never silently fall back to
+    /// the built-in vocab when a custom context was specified.
+    /// The built-in fallback (`http://example.org/`) applies only
+    /// when (a) the ledger has no nameservice record yet
+    /// (genesis / pre-commit), or (b) the record exists but no
+    /// `default_context` CID is configured.
+    pub async fn transact_cypher(
+        &self,
+        ledger: LedgerState,
+        cypher: &str,
+    ) -> Result<TransactResult> {
+        self.transact_cypher_with_params(ledger, cypher, None).await
+    }
+
+    /// Like [`transact_cypher`](Self::transact_cypher) but substitutes
+    /// `$param` references from `params` before lowering.
+    pub async fn transact_cypher_with_params(
+        &self,
+        ledger: LedgerState,
+        cypher: &str,
+        params: Option<&fluree_db_cypher::ParamMap>,
+    ) -> Result<TransactResult> {
+        let plan = self
+            .cypher_write_plan(cypher, params, ledger.ledger_id(), &ledger.snapshot)
+            .await?;
+        let txn = match plan {
+            crate::cypher_write::WritePlan::Single(txn) => *txn,
+            crate::cypher_write::WritePlan::Conditional(cw) => {
+                let probe = GraphDb::from_ledger_state(&ledger);
+                self.resolve_conditional_cypher(&cw, probe, ledger.ledger_id(), &ledger.snapshot)
+                    .await?
+            }
+        };
+        self.stage_owned(ledger).txn(txn).execute().await
+    }
+
+    /// Parse + param-substitute a Cypher write and classify it as a single
+    /// `Txn` or a conditional write needing a pre-write probe.
+    pub async fn cypher_write_plan(
+        &self,
+        cypher: &str,
+        params: Option<&fluree_db_cypher::ParamMap>,
+        ledger_id: &str,
+        snapshot: &fluree_db_core::LedgerSnapshot,
+    ) -> Result<crate::cypher_write::WritePlan> {
+        let out = fluree_db_cypher::parse_cypher(cypher);
+        if out.has_errors() {
+            let msg = out
+                .diagnostics
+                .iter()
+                .map(|d| format!("{}: {}", d.code, d.message))
+                .collect::<Vec<_>>()
+                .join("; ");
+            return Err(ApiError::cypher(msg, out.diagnostics));
+        }
+        let mut ast = out
+            .ast
+            .ok_or_else(|| ApiError::cypher("Cypher parse returned no AST", Vec::new()))?;
+        let empty = fluree_db_cypher::ParamMap::new();
+        fluree_db_cypher::substitute_params(&mut ast, params.unwrap_or(&empty))
+            .map_err(|e| ApiError::cypher(e.to_string(), Vec::new()))?;
+
+        if let Some(cw) = crate::cypher_write::detect_conditional(&ast) {
+            return Ok(crate::cypher_write::WritePlan::Conditional(Box::new(cw)));
+        }
+        let txn = self
+            .lower_cypher_ast_to_txn(&ast, ledger_id, snapshot)
+            .await?;
+        Ok(crate::cypher_write::WritePlan::Single(Box::new(txn)))
+    }
+
+    /// Resolve a conditional Cypher write by probing the writer view, then
+    /// lowering the chosen branch to a concrete `Txn`. The probe view must
+    /// represent the same pre-write state the resulting `Txn` will commit
+    /// against.
+    pub async fn resolve_conditional_cypher(
+        &self,
+        cw: &crate::cypher_write::ConditionalCypherWrite,
+        probe_view: GraphDb,
+        ledger_id: &str,
+        snapshot: &fluree_db_core::LedgerSnapshot,
+    ) -> Result<fluree_db_transact::ir::Txn> {
+        use crate::cypher_write::ConditionalCypherWrite;
+        // Attach the ledger's default context so the probe resolves bare
+        // identifiers the same way the write does.
+        let default_context = match self.get_default_context(ledger_id).await {
+            Ok(ctx) => ctx,
+            Err(ApiError::NotFound(_)) => None,
+            Err(e) => return Err(e),
+        };
+        let probe_view = probe_view.with_default_context(default_context);
+
+        match cw {
+            ConditionalCypherWrite::MergeOnMatch(merge) => {
+                let node = &merge.pattern.parts[0].head;
+                // ON MATCH SET references the MERGE variable, so the node needs one.
+                if node.var.is_none() {
+                    return Err(ApiError::cypher(
+                        "MERGE … ON MATCH SET requires a node variable".to_string(),
+                        Vec::new(),
+                    ));
+                }
+                let probe = crate::cypher_write::build_merge_probe_ast(node);
+                let exists = self
+                    .query_cypher_ast(&probe_view, &probe)
+                    .await?
+                    .row_count()
+                    > 0;
+                let ast = if exists {
+                    crate::cypher_write::build_on_match_ast(merge)
+                } else {
+                    crate::cypher_write::build_create_ast(merge)
+                };
+                self.lower_cypher_ast_to_txn(&ast, ledger_id, snapshot)
+                    .await
+            }
+            ConditionalCypherWrite::DeleteNode(update) => {
+                let delete = crate::cypher_write::delete_clause(update).ok_or_else(|| {
+                    ApiError::cypher("DELETE plan has no DELETE clause".to_string(), Vec::new())
+                })?;
+                // Cypher requires bare DELETE to fail when a target still has
+                // relationships. Probe each target in both directions.
+                for target in &delete.targets {
+                    // Only mandatorily-bound targets are well-defined here. An
+                    // OPTIONAL-only binding can leave `target` unbound on some
+                    // rows, where the appended relationship hop would bind an
+                    // unrelated node and false-trigger the guard.
+                    if !crate::cypher_write::bound_by_mandatory_match(update, &target.name) {
+                        return Err(ApiError::cypher(
+                            format!(
+                                "DELETE of `{}` requires the node to be bound by a \
+                                 mandatory MATCH (not only OPTIONAL MATCH)",
+                                target.name
+                            ),
+                            Vec::new(),
+                        ));
+                    }
+                    for inbound in [false, true] {
+                        let probe_ast = crate::cypher_write::build_relationship_probe_ast(
+                            &update.read_clauses,
+                            target,
+                            inbound,
+                        );
+                        if self
+                            .query_cypher_ast(&probe_view, &probe_ast)
+                            .await?
+                            .row_count()
+                            > 0
+                        {
+                            return Err(ApiError::cypher(
+                                format!(
+                                    "DELETE of `{}` failed: the node still has relationships; \
+                                     use DETACH DELETE to remove it together with its relationships",
+                                    target.name
+                                ),
+                                Vec::new(),
+                            ));
+                        }
+                    }
+                }
+                // No relationships → the node retraction is identical to
+                // DETACH DELETE.
+                let ast = crate::cypher_write::build_detach_delete_ast(update);
+                self.lower_cypher_ast_to_txn(&ast, ledger_id, snapshot)
+                    .await
+            }
+            ConditionalCypherWrite::DeleteRel(update) => {
+                let delete = crate::cypher_write::delete_clause(update).ok_or_else(|| {
+                    ApiError::cypher("DELETE plan has no DELETE clause".to_string(), Vec::new())
+                })?;
+                // `DELETE r` retracts the relationship's base `(a)-[:T]->(b)`
+                // triple, whose `f:reifies*` cascade removes the bundle. If the
+                // base edge backs a parallel sibling, that retraction would
+                // disturb the sibling — reject. The endpoints must be named so
+                // the probe can group by them.
+                for target in &delete.targets {
+                    let (a, b) = crate::cypher_write::rel_endpoint_vars(update, &target.name)
+                        .ok_or_else(|| {
+                            ApiError::cypher(
+                                format!(
+                                    "DELETE of relationship `{}` requires both endpoint \
+                                     nodes to be named (e.g. `(a)-[{}]->(b)`)",
+                                    target.name, target.name
+                                ),
+                                Vec::new(),
+                            )
+                        })?;
+                    let probe_ast = crate::cypher_write::build_parallel_probe_ast(
+                        &update.read_clauses,
+                        &a,
+                        &b,
+                        &target.name,
+                    );
+                    if self
+                        .query_cypher_ast(&probe_view, &probe_ast)
+                        .await?
+                        .row_count()
+                        > 0
+                    {
+                        return Err(ApiError::cypher(
+                            format!(
+                                "DELETE of relationship `{}` failed: parallel relationships \
+                                 share its underlying edge, so deleting one would affect the \
+                                 others. Per-occurrence DELETE of a parallel relationship is \
+                                 not yet supported.",
+                                target.name
+                            ),
+                            Vec::new(),
+                        ));
+                    }
+                }
+                // No parallel siblings → retracting each base edge removes only
+                // its own reifier bundle. Lower the original DELETE directly.
+                let ast = fluree_db_cypher::CypherAst {
+                    statement: fluree_db_cypher::ast::Statement::Update(update.clone()),
+                    span: update.span,
+                };
+                self.lower_cypher_ast_to_txn(&ast, ledger_id, snapshot)
+                    .await
+            }
+        }
+    }
+
+    /// Parse and lower a Cypher write statement to a `Txn`, resolving bare
+    /// identifiers against the ledger's default context (so writes match the
+    /// read path's IRI mapping). The returned `Txn` carries its own
+    /// `namespace_delta`, so it can be staged against any builder
+    /// (`stage_owned` for the owned-ledger path, or `stage(&handle)` for the
+    /// server's cached-handle path, which keeps the in-memory cache current).
+    pub async fn lower_cypher_to_txn(
+        &self,
+        ledger_id: &str,
+        snapshot: &fluree_db_core::LedgerSnapshot,
+        cypher: &str,
+        params: Option<&fluree_db_cypher::ParamMap>,
+    ) -> Result<fluree_db_transact::ir::Txn> {
+        let out = fluree_db_cypher::parse_cypher(cypher);
+        if out.has_errors() {
+            let msg = out
+                .diagnostics
+                .iter()
+                .map(|d| format!("{}: {}", d.code, d.message))
+                .collect::<Vec<_>>()
+                .join("; ");
+            return Err(ApiError::cypher(msg, out.diagnostics));
+        }
+        let mut ast = out
+            .ast
+            .ok_or_else(|| ApiError::cypher("Cypher parse returned no AST", Vec::new()))?;
+
+        // Substitute `$param` references before lowering. Always run (empty
+        // map when no params were supplied) so an unfilled `$param` reports a
+        // clear missing-parameter error.
+        let empty = fluree_db_cypher::ParamMap::new();
+        fluree_db_cypher::substitute_params(&mut ast, params.unwrap_or(&empty))
+            .map_err(|e| ApiError::cypher(e.to_string(), Vec::new()))?;
+
+        self.lower_cypher_ast_to_txn(&ast, ledger_id, snapshot)
+            .await
+    }
+
+    /// Lower an already-parsed, param-substituted Cypher AST to a `Txn`,
+    /// resolving bare identifiers against the ledger's default context. The
+    /// conditional-write path uses this to lower the constructed branch ASTs
+    /// (create vs on-match) it derives from a probe.
+    pub async fn lower_cypher_ast_to_txn(
+        &self,
+        ast: &fluree_db_cypher::CypherAst,
+        ledger_id: &str,
+        snapshot: &fluree_db_core::LedgerSnapshot,
+    ) -> Result<fluree_db_transact::ir::Txn> {
+        // Pull @vocab and term overrides out of the ledger's default context so
+        // write Cypher resolves bare identifiers the same way `query_cypher`
+        // does. `Ok(None)` (no default_context configured) and
+        // `Err(NotFound)` (genesis / no nameservice record yet) both mean "no
+        // context"; every other error propagates so writes never silently land
+        // under the built-in vocab when a custom context couldn't be loaded.
+        let default_context = match self.get_default_context(ledger_id).await {
+            Ok(ctx) => ctx,
+            Err(ApiError::NotFound(_)) => None,
+            Err(e) => return Err(e),
+        };
+        let (vocab, overrides) =
+            crate::query::helpers::extract_cypher_iri_mapping(default_context.as_ref());
+        let cypher_opts = fluree_db_transact::lower_cypher_update::CypherLowerOpts {
+            vocab: Some(vocab),
+            overrides,
+        };
+
+        let mut ns = NamespaceRegistry::from_db(snapshot);
+        Ok(
+            fluree_db_transact::lower_cypher_update::lower_cypher_update(
+                ast,
+                &mut ns,
+                TxnOpts::default(),
+                cypher_opts,
+            )?,
+        )
     }
 
     /// Create a FROM-driven query builder.

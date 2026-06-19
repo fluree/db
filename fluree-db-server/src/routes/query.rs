@@ -595,6 +595,15 @@ pub async fn query(
         return Err(error);
     }
 
+    // Cypher has no FROM/dataset clause, so the connection-scoped route can't
+    // resolve a ledger — direct callers at the ledger-scoped endpoint.
+    if headers.is_cypher_query() {
+        set_span_error_code(&span, "error:BadRequest");
+        return Err(ServerError::bad_request(
+            "Cypher queries must target a ledger; use the /v1/fluree/query/<ledger> endpoint.",
+        ));
+    }
+
     let delimited = wants_delimited(&headers);
 
     // Handle SPARQL query
@@ -1014,6 +1023,40 @@ pub async fn query_ledger(
             params.default_context,
         )
             .await;
+    }
+
+    // Handle Cypher query (Content-Type: application/cypher) — ledger is
+    // known from the path. JSON-LD output; tracking/delimited/agent-json are
+    // not negotiated yet, but policy/identity are enforced for parity with
+    // the SPARQL/JSON-LD paths.
+    if headers.is_cypher_query() {
+        if let Some(p) = bearer.0.as_ref() {
+            if !credential.is_signed() && !p.can_read(&ledger) {
+                set_span_error_code(&span, "error:Forbidden");
+                return Err(ServerError::not_found("Ledger not found"));
+            }
+        }
+        let cypher = credential.body_string()?;
+        log_query_text(&cypher, &state.telemetry_config, &span);
+        // Resolve the effective identity (impersonation-aware), same as the
+        // SPARQL read path, so policy enforcement applies to Cypher too.
+        let bearer_identity = effective_identity(&credential, &bearer);
+        let identity = crate::routes::policy_auth::resolve_sparql_identity(
+            &state,
+            &ledger,
+            bearer_identity.as_deref(),
+            headers.identity.as_deref(),
+        )
+        .await;
+        return execute_cypher_ledger(
+            &state,
+            &ledger,
+            &cypher,
+            identity.as_deref(),
+            &headers,
+            &span,
+        )
+        .await;
     }
 
     // Handle JSON-LD query (JSON body)
@@ -2169,10 +2212,6 @@ async fn execute_query_proxy(
     Ok((HeaderMap::new(), Json(result)).into_response())
 }
 
-/// Build `GovernanceOptions` for a ledger-scoped SPARQL request from the
-/// resolved identity plus header-supplied policy fields. SPARQL has no body
-/// `opts` block, so headers are the only transport for `policy-class`,
-/// `policy`, `policy-values`, and `default-allow`.
 pub(crate) fn sparql_qc_opts(
     identity: Option<&str>,
     headers: &FlureeHeaders,
@@ -2301,6 +2340,87 @@ pub(crate) fn ledger_scoped_sparql_dataset_spec(
     }
 
     Ok(spec)
+}
+
+async fn execute_cypher_ledger(
+    state: &AppState,
+    ledger_id: &str,
+    cypher: &str,
+    identity: Option<&str>,
+    headers: &FlureeHeaders,
+    span: &tracing::Span,
+) -> Result<Response> {
+    let (cypher, params) = fluree_db_api::extract_cypher_envelope(cypher);
+
+    // Build policy options from the resolved identity + headers. Cypher has no
+    // body `opts` block, so headers are the only transport for `policy-class`,
+    // `policy`, `policy-values`, and `default-allow` (same as SPARQL).
+    let policy_values_map = headers.policy_values_map().inspect_err(|_| {
+        set_span_error_code(span, "error:BadRequest");
+    })?;
+    let qc_opts = fluree_db_api::GovernanceOptions {
+        identity: identity.map(String::from),
+        policy_class: if headers.policy_class.is_empty() {
+            None
+        } else {
+            Some(headers.policy_class.clone())
+        },
+        policy: headers.policy.clone(),
+        policy_values: policy_values_map,
+        default_allow: headers.default_allow,
+        ..Default::default()
+    };
+
+    let view = state
+        .fluree
+        .db_with_default_context(ledger_id)
+        .await
+        .map_err(ServerError::Api)?;
+    // Wrap the view with policy when any policy input is present (identity,
+    // policy-class, inline policy, etc.), so restricted data is filtered.
+    let view = if qc_opts.has_any_policy_inputs() {
+        state
+            .fluree
+            .wrap_policy(view, &qc_opts, None)
+            .await
+            .map_err(ServerError::Api)?
+    } else {
+        view
+    };
+
+    let result = state
+        .fluree
+        .query_cypher_with_params(&view, &cypher, params.as_ref())
+        .await
+        .map_err(|e| {
+            set_span_error_code(span, "error:InvalidQuery");
+            ServerError::Api(e)
+        })?;
+    // Cypher defaults to cypher-json (Neo4j-compatible, native scalars);
+    // `Accept: application/ld+json` opts into the RDF JSON-LD form.
+    let (json, content_type) = if headers.wants_jsonld() {
+        (
+            result
+                .to_jsonld_async(view.as_graph_db_ref())
+                .await
+                .map_err(|e| ServerError::Api(e.into()))?,
+            "application/ld+json; charset=utf-8",
+        )
+    } else {
+        (
+            result
+                .to_cypher_json_async(view.as_graph_db_ref())
+                .await
+                .map_err(|e| ServerError::Api(e.into()))?,
+            "application/vnd.fluree.cypher+json; charset=utf-8",
+        )
+    };
+    tracing::info!(status = "success", query_kind = "cypher");
+    Ok((
+        [(axum::http::header::CONTENT_TYPE, content_type)],
+        Json(json),
+    )
+        .into_response())
 }
 
 /// Execute a SPARQL query against a specific ledger and return result

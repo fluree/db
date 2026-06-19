@@ -2372,6 +2372,7 @@ dependencies = [
  "fluree-db-core",
  "fluree-db-credential",
  "fluree-db-crypto",
+ "fluree-db-cypher",
  "fluree-db-iceberg",
  "fluree-db-indexer",
  "fluree-db-ledger",
@@ -2617,6 +2618,22 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "zeroize",
+]
+
+[[package]]
+name = "fluree-db-cypher"
+version = "4.0.7"
+dependencies = [
+ "fluree-db-core",
+ "fluree-db-query",
+ "fluree-graph-json-ld",
+ "fluree-vocab",
+ "insta",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tracing",
+ "winnow",
 ]
 
 [[package]]
@@ -3089,6 +3106,7 @@ dependencies = [
  "chrono",
  "fluree-db-binary-index",
  "fluree-db-core",
+ "fluree-db-cypher",
  "fluree-db-indexer",
  "fluree-db-ledger",
  "fluree-db-nameservice",

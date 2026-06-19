@@ -42,6 +42,7 @@
 mod agent_json;
 pub mod config;
 mod construct;
+mod cypher;
 pub mod datatype;
 pub mod delimited;
 mod hydration;
@@ -176,6 +177,7 @@ pub fn format_results(
         OutputFormat::SparqlJson => sparql::format(result, &compactor, config),
         OutputFormat::TypedJson => typed::format(result, &compactor, config),
         OutputFormat::AgentJson => agent_json::format(result, &compactor, config),
+        OutputFormat::CypherJson => cypher::format(result, &compactor, config),
         OutputFormat::SparqlXml => Err(FormatError::InvalidBinding(
             "SPARQL XML produces String, not JsonValue. Use format_results_string() instead."
                 .to_string(),
@@ -396,6 +398,7 @@ pub async fn format_results_async(
         OutputFormat::SparqlJson => sparql::format(result, &compactor, config),
         OutputFormat::TypedJson => typed::format(result, &compactor, config),
         OutputFormat::AgentJson => agent_json::format(result, &compactor, config),
+        OutputFormat::CypherJson => cypher::format(result, &compactor, config),
         OutputFormat::SparqlXml => Err(FormatError::InvalidBinding(
             "SPARQL XML produces String, not JsonValue. Use format_results_string_async() instead."
                 .to_string(),

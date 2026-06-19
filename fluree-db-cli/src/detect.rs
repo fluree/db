@@ -106,6 +106,42 @@ pub fn detect_query_format(
     sniff_query_format(content)
 }
 
+/// Whether a query should be treated as Cypher.
+///
+/// Cypher is dispatched out-of-band from the SPARQL/JSON-LD `QueryFormat`
+/// path because it uses a separate API method and result shape. Priority:
+/// explicit `--cypher` flag > `.cypher`/`.cyp`/`.cql` extension > content
+/// sniff. The sniffed lead keywords (`MATCH`/`MERGE`/`UNWIND`/`OPTIONAL`/
+/// `DETACH`/`CREATE`) do not collide with any valid SPARQL query (which
+/// leads with SELECT/ASK/CONSTRUCT/DESCRIBE/PREFIX/BASE) or JSON-LD (which
+/// is JSON), so auto-detection never reinterprets an existing query.
+pub fn detect_is_cypher(path: Option<&Path>, content: &str, cypher_flag: bool) -> bool {
+    if cypher_flag {
+        return true;
+    }
+    if let Some(p) = path {
+        if let Some(ext) = p.extension().and_then(|e| e.to_str()) {
+            if matches!(ext.to_lowercase().as_str(), "cypher" | "cyp" | "cql") {
+                return true;
+            }
+        }
+    }
+    sniff_is_cypher(content)
+}
+
+fn sniff_is_cypher(content: &str) -> bool {
+    let upper = content.trim_start().to_uppercase();
+    const CYPHER_LEAD: [&str; 6] = [
+        "MATCH ",
+        "MERGE ",
+        "UNWIND ",
+        "OPTIONAL ",
+        "DETACH ",
+        "CREATE ",
+    ];
+    CYPHER_LEAD.iter().any(|kw| upper.starts_with(kw))
+}
+
 fn sniff_query_format(content: &str) -> CliResult<QueryFormat> {
     let trimmed = content.trim();
 

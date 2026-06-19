@@ -638,6 +638,15 @@ async fn update_local(
             .await;
         }
 
+        // Cypher needs an explicit ledger; the connection-scoped endpoint
+        // can't resolve one — direct callers at the ledger-scoped route.
+        if headers.is_cypher_query() {
+            set_span_error_code(&span, "error:BadRequest");
+            return Err(ServerError::bad_request(
+                "Cypher writes must target a ledger; use the /v1/fluree/update/<ledger> endpoint.",
+            ));
+        }
+
         // Update does not accept Turtle/TriG. Use /insert or /upsert.
         if credential.is_turtle_or_trig() {
             set_span_error_code(&span, "error:BadRequest");
@@ -780,6 +789,22 @@ async fn update_ledger_local(
                 &credential,
                 &span,
                 bearer.as_ref(),
+            )
+            .await;
+        }
+
+        // Cypher write (Content-Type: application/cypher) — ledger from path.
+        if headers.is_cypher_query() {
+            tracing::info!(status = "start", format = "cypher", "Cypher write request received");
+            let cypher = credential.body_string()?;
+            return execute_cypher_transact(
+                &state,
+                &ledger,
+                &cypher,
+                &headers,
+                bearer.as_ref(),
+                &credential,
+                &span,
             )
             .await;
         }
@@ -1717,7 +1742,176 @@ async fn execute_turtle_transaction(
     .await
 }
 
-// ===== SPARQL UPDATE execution =====
+// ===== Cypher / SPARQL UPDATE execution =====
+
+/// Execute a Cypher write statement (CREATE, SET, REMOVE) against a ledger.
+///
+/// Goes through the same cached-handle commit path as SPARQL UPDATE
+/// (`ledger_cached` plus `stage(&handle)`) so the in-memory ledger cache stays
+/// current, meaning a subsequent read in the same process sees the write. The
+/// Cypher AST is lowered to a `Txn` via the shared `lower_cypher_to_txn`, which
+/// threads the ledger's default context. v1 does a single attempt with no
+/// reconcile/retry loop, so a concurrent-writer conflict surfaces as an error.
+#[allow(clippy::too_many_arguments)]
+async fn execute_cypher_transact(
+    state: &AppState,
+    ledger_id: &str,
+    body: &str,
+    headers: &FlureeHeaders,
+    bearer: Option<&crate::extract::DataPrincipal>,
+    credential: &MaybeCredential,
+    span: &tracing::Span,
+) -> Result<Response> {
+    enforce_write_access(state, ledger_id, bearer, credential)?;
+
+    // Hash the full request body (statement + any params envelope) so two
+    // requests with the same statement but different params get distinct
+    // tx-ids.
+    let tx_id = compute_tx_id_sparql(body);
+    let (cypher, params) = fluree_db_api::extract_cypher_envelope(body);
+
+    // Resolve the effective identity (impersonation-aware) and build policy
+    // options from headers, same as the SPARQL UPDATE path.
+    let bearer_identity = effective_author(credential, bearer);
+    let effective_identity = crate::routes::policy_auth::resolve_sparql_identity(
+        state,
+        ledger_id,
+        bearer_identity.as_deref(),
+        headers.identity.as_deref(),
+    )
+    .await;
+    let policy_values_map = headers.policy_values_map().inspect_err(|_| {
+        set_span_error_code(span, "error:BadRequest");
+    })?;
+    let qc_opts = fluree_db_api::GovernanceOptions {
+        identity: effective_identity.clone(),
+        policy_class: if headers.policy_class.is_empty() {
+            None
+        } else {
+            Some(headers.policy_class.clone())
+        },
+        policy: headers.policy.clone(),
+        policy_values: policy_values_map,
+        default_allow: headers.default_allow,
+    };
+
+    let handle = state
+        .fluree
+        .ledger_cached(ledger_id)
+        .await
+        .map_err(ServerError::Api)?;
+    let cached_state = handle.snapshot().await;
+
+    // Most writes lower to a single Txn; a conditional write (e.g. MERGE … ON
+    // MATCH SET) resolves its branch by probing the cached writer state, then
+    // stages the resulting Txn through the cached-handle builder below.
+    let plan = state
+        .fluree
+        .cypher_write_plan(&cypher, params.as_ref(), ledger_id, &cached_state.snapshot)
+        .await
+        .map_err(|e| {
+            set_span_error_code(span, "error:InvalidTransaction");
+            ServerError::Api(e)
+        })?;
+    let txn = match plan {
+        fluree_db_api::cypher_write::WritePlan::Single(txn) => *txn,
+        fluree_db_api::cypher_write::WritePlan::Conditional(cw) => {
+            // Fresh owned state for the branch-choosing probe (cheap — the
+            // snapshot is Arc-shared); `cached_state` stays borrowed below.
+            let probe_state = handle.snapshot().await.to_ledger_state();
+            let probe = fluree_db_api::GraphDb::from_ledger_state(&probe_state);
+            state
+                .fluree
+                .resolve_conditional_cypher(&cw, probe, ledger_id, &cached_state.snapshot)
+                .await
+                .map_err(|e| {
+                    set_span_error_code(span, "error:InvalidTransaction");
+                    ServerError::Api(e)
+                })?
+        }
+    };
+
+    // Build a PolicyContext when any policy input is present, so writes are
+    // filtered the same way SPARQL UPDATE / JSON-LD writes are. Built from the
+    // pre-lock `cached_state` — identical to the SPARQL/JSON-LD path above —
+    // since policy rules change far more slowly than the write lock turns over
+    // and writes are serialized per ledger. (The branch-choosing probe of a
+    // conditional plan, which *is* order-sensitive, resolves under the lock via
+    // the staged `WritePlan` resolver.)
+    let policy_ctx = if qc_opts.has_any_policy_inputs() {
+        Some(
+            fluree_db_api::build_policy_context(
+                &cached_state.snapshot,
+                cached_state.novelty.as_ref(),
+                Some(cached_state.novelty.as_ref()),
+                cached_state.t,
+                &qc_opts,
+            )
+            .await
+            .map_err(|e| {
+                set_span_error_code(span, "error:PolicyBuildFailed");
+                ServerError::Api(e)
+            })?,
+        )
+    } else {
+        None
+    };
+
+    let mut commit_opts = CommitOpts::default();
+    if let Some(d) = &effective_identity {
+        commit_opts = commit_opts.identity(d.clone());
+    }
+    // Persist the original signed envelope for provenance when present.
+    if let Some(raw_txn) = raw_txn_from_credential(credential) {
+        let content_store = state.fluree.content_store(handle.id());
+        commit_opts = commit_opts.with_raw_txn_spawned(content_store, raw_txn);
+    }
+
+    let mut builder = state
+        .fluree
+        .stage(&handle)
+        .txn(txn)
+        .commit_opts(commit_opts);
+    if let Some(config) = &state.index_config {
+        builder = builder.index_config(config.clone());
+    }
+    if headers.has_tracking() {
+        builder = builder.tracking(headers.to_tracking_options());
+    }
+    if let Some(ctx) = policy_ctx {
+        builder = builder.policy(ctx);
+    }
+    let result = builder.execute().await.map_err(|e| {
+        set_span_error_code(span, "error:InvalidTransaction");
+        ServerError::Api(e)
+    })?;
+
+    tracing::info!(
+        status = "success",
+        format = "cypher",
+        commit_t = result.receipt.t,
+        commit_id = %result.receipt.commit_id,
+        "Cypher write committed"
+    );
+
+    if let Some(tally) = &result.tally {
+        record_tracking_on_span(span, tally);
+    }
+    let response = transact_response(
+        ledger_id.to_string(),
+        result.receipt.t,
+        tx_id,
+        result.receipt.commit_id.to_string(),
+        result.tally.as_ref(),
+    );
+    match &result.tally {
+        Some(tally) => {
+            let hdrs = tracking_headers(tally);
+            Ok((hdrs, Json(response)).into_response())
+        }
+        None => Ok(Json(response).into_response()),
+    }
+}
 
 /// Execute a SPARQL UPDATE request
 ///

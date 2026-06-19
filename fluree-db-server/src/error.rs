@@ -93,6 +93,9 @@ impl ServerError {
             ServerError::Api(ApiError::Turtle(_)) => errors::TURTLE_PARSE,
             ServerError::Api(ApiError::Sparql { .. }) => errors::SPARQL_PARSE,
             ServerError::Api(ApiError::SparqlLower(_)) => errors::SPARQL_LOWER,
+            ServerError::Api(ApiError::Cypher { .. }) => errors::CYPHER_PARSE,
+            ServerError::Api(ApiError::CypherLower(_)) => errors::CYPHER_LOWER,
+            ServerError::Api(ApiError::CypherUpdateLower(_)) => errors::CYPHER_LOWER,
             ServerError::Json(_) => errors::JSON_PARSE,
 
             // Query/Transaction errors
@@ -185,6 +188,9 @@ impl ServerError {
             ServerError::Api(ApiError::Turtle(_)) => StatusCode::BAD_REQUEST,
             ServerError::Api(ApiError::Sparql { .. }) => StatusCode::BAD_REQUEST,
             ServerError::Api(ApiError::SparqlLower(_)) => StatusCode::BAD_REQUEST,
+            ServerError::Api(ApiError::Cypher { .. }) => StatusCode::BAD_REQUEST,
+            ServerError::Api(ApiError::CypherLower(_)) => StatusCode::BAD_REQUEST,
+            ServerError::Api(ApiError::CypherUpdateLower(_)) => StatusCode::BAD_REQUEST,
             ServerError::Api(ApiError::Config(_)) => StatusCode::BAD_REQUEST,
             ServerError::Api(ApiError::Format(_)) => StatusCode::BAD_REQUEST,
             ServerError::Api(ApiError::AwaitTNotReached { .. }) => StatusCode::REQUEST_TIMEOUT,

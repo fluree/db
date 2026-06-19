@@ -218,6 +218,23 @@ impl FlureeHeaders {
             .unwrap_or(false)
     }
 
+    /// Check if this is an openCypher request based on Content-Type.
+    ///
+    /// Matches `application/cypher` or `application/opencypher`
+    /// (case-insensitive). Used by both the query and update routes —
+    /// Cypher is a single surface whose read/write is determined by the
+    /// statement, but the endpoints stay split (query vs update) for parity
+    /// with SPARQL.
+    pub fn is_cypher_query(&self) -> bool {
+        self.content_type
+            .as_ref()
+            .map(|ct| {
+                let lower = ct.to_ascii_lowercase();
+                lower.contains("application/cypher") || lower.contains("application/opencypher")
+            })
+            .unwrap_or(false)
+    }
+
     /// Check if the client explicitly requests TSV output via Accept header.
     ///
     /// Matches `text/tab-separated-values` or `text/tsv` (case-insensitive).

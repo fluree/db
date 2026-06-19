@@ -470,7 +470,11 @@ pub enum Commands {
         #[arg(short = 'f', long = "file")]
         file: Option<PathBuf>,
 
-        /// Output format (json/jsonld, typed-json, table, csv, tsv, or ndjson).
+        /// Output format (json/jsonld, typed-json, cypher-json, table, csv, tsv,
+        /// or ndjson).
+        ///
+        /// Cypher queries default to cypher-json (Neo4j-compatible, native
+        /// scalars); pass `--format jsonld` for the RDF JSON-LD form.
         ///
         /// `ndjson` streams SELECT results incrementally as newline-delimited
         /// JSON (one binding object per line) instead of buffering the whole
@@ -503,6 +507,10 @@ pub enum Commands {
         /// Force JSON-LD query format
         #[arg(long, conflicts_with = "sparql")]
         jsonld: bool,
+
+        /// Force openCypher query format (local ledgers only)
+        #[arg(long, conflicts_with_all = ["sparql", "jsonld"])]
+        cypher: bool,
 
         /// Query at a specific point in time (transaction number, commit hash, or ISO-8601 timestamp)
         #[arg(long)]
