@@ -254,6 +254,17 @@ impl Expression {
         row: &R,
         ctx: Option<&ExecutionContext<'_>>,
     ) -> Result<Binding> {
+        // A bare variable may hold a `List` binding, which can't round-trip
+        // through `ComparableValue` (it would collapse to Unbound). Return it
+        // directly so `UNWIND ?listVar` and the collect→unwind round-trip
+        // preserve the list. Scalars fall through to the comparable path so
+        // their normalization is unchanged.
+        if let Expression::Var(v) = self {
+            if let Some(b @ Binding::List(_)) = row.get(*v) {
+                return Ok(b.clone());
+            }
+        }
+
         // List-*returning* functions (tail, list-reverse) and list literals
         // can't be a `ComparableValue` — evaluate them straight to a `Binding`.
         if let Expression::Call { func, args } = self {

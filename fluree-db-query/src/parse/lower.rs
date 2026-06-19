@@ -263,6 +263,14 @@ pub fn lower_unresolved_pattern<E: IriEncoder>(
                 expr: lowered_expr,
             }])
         }
+        UnresolvedPattern::Unwind { var, expr } => {
+            let var_id = vars.get_or_insert(var);
+            let lowered_expr = lower_filter_expr_with_encoder(expr, vars, encoder, pp_counter)?;
+            Ok(vec![Pattern::Unwind {
+                var: var_id,
+                list: lowered_expr,
+            }])
+        }
         UnresolvedPattern::Values { vars: v, rows } => {
             let var_ids: Vec<VarId> = v.iter().map(|name| vars.get_or_insert(name)).collect();
             let rows: Result<Vec<Vec<Binding>>> = rows
@@ -1577,6 +1585,9 @@ fn lower_function_name(name: &str) -> Function {
         | "http://www.opengis.net/def/function/geosparql/distance" => Function::GeofDistance,
         // Fulltext scoring
         "fulltext" | "full_text" => Function::Fulltext,
+        // List values & generators (drive UNWIND; also usable in BIND/SELECT)
+        "range" => Function::Range,
+        "list" | "make-list" | "makelist" => Function::MakeList,
         // Other
         "bound" => Function::Bound,
         "if" => Function::If,

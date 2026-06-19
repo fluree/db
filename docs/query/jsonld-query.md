@@ -578,6 +578,93 @@ Provide initial bindings:
 }
 ```
 
+### Unwind Patterns
+
+`unwind` expands a **list-valued expression** into one row per element, binding
+each element to a variable. It is the inverse of an aggregate like `collect`:
+where aggregation folds many rows into one list, `unwind` fans one list back out
+into many rows.
+
+```json
+["unwind", "?n", "(range 1 5)"]
+```
+
+The list source is any expression that evaluates to a list:
+
+- **`(range start end)`** / **`(range start end step)`** — an inclusive integer
+  sequence (`(range 1 5)` → `1,2,3,4,5`). `start > end` yields an empty list.
+- **`(list a b c …)`** — a list literal built from its arguments.
+- **a bound list variable** — e.g. a list produced earlier by `bind`, or the
+  result of an aggregate such as `collect`.
+
+Per Cypher/GQL semantics, an **empty list, an unbound value, or a non-list
+value produces zero rows** for that input (it does not error and does not emit a
+null row).
+
+```json
+{
+  "@context": { "ex": "http://example.org/" },
+  "select": ["?n"],
+  "where": [["unwind", "?n", "(range 1 3)"]]
+}
+// → ?n = 1, then 2, then 3
+```
+
+#### When to use `unwind` (and when not to)
+
+`unwind` earns its place in exactly one situation: **generating rows that do not
+exist in the stored data**, from a *computed* list.
+
+- **Do not** use it for a constant set of values — `values` is clearer and
+  cheaper (`["values", "?s", ["a", "b"]]`).
+- **Do not** use it to read a multi-valued predicate — in RDF that is already
+  multiple triples, so a plain pattern `{ "@id": "?s", "ex:tag": "?tag" }`
+  yields one row per value natively.
+- **Do** use it when the driving rows must come from a `range` (a numeric axis,
+  a calendar, buckets, a pagination window) or from a list you computed — none
+  of which `values` (constants only) or triple patterns (stored data only) can
+  produce.
+
+#### Canonical use case: a dense / gap-filled series
+
+A `groupBy` only ever produces keys that occur in the data. To report a value
+for **every** point on an axis — including the empty ones — generate the axis
+with `range` and `unwind`, then LEFT JOIN the data with `optional`:
+
+```json
+{
+  "@context": { "ex": "http://example.org/" },
+  "select": ["?year", "(as (count ?o) ?orders)"],
+  "where": [
+    ["unwind", "?year", "(range 2019 2023)"],
+    ["optional", { "@id": "?o", "@type": "ex:Order", "ex:orderYear": "?year" }]
+  ],
+  "groupBy": ["?year"],
+  "orderBy": ["?year"]
+}
+```
+
+Every year `2019`–`2023` appears in the result, with `0` for years that have no
+orders — because the driving rows came from the generated range and the
+`optional` contributes a count only where matching data exists. The same shape
+fills gaps for any axis the data does not itself contain. Where the bounds are
+themselves derived from the data (e.g. a sub-select computing the min/max year),
+this produces a dynamically-sized dense axis that `values` cannot express.
+
+#### Ordering and correlation
+
+`unwind` is placed after whatever produces the variables its list expression
+reads, so a list computed by an earlier `bind` is expanded correctly:
+
+```json
+{
+  "where": [
+    ["bind", "?nums", "(range 1 3)"],
+    ["unwind", "?n", "?nums"]
+  ]
+}
+```
+
 ### Property Paths
 
 Property paths enable transitive traversal of predicates, following chains of relationships across multiple hops. Define a path alias in `@context` using `@path`, then use the alias as a key in WHERE node-maps.
@@ -924,6 +1011,13 @@ Arithmetic operators accept two or more arguments. With multiple arguments, they
 - `(/ ?x ?y ...)` - Division
 - `(- ?x)` - Unary negation (single argument)
 - `(abs ?x)` - Absolute value
+
+### List Value Functions
+
+Produce list values, chiefly to drive [`unwind`](#unwind-patterns) (also usable in `bind`/`select`):
+
+- `(range ?start ?end)` / `(range ?start ?end ?step)` - Inclusive integer sequence; `?start > ?end` yields an empty list
+- `(list ?a ?b ...)` - List literal from the given arguments
 
 ### Vector Similarity Functions
 

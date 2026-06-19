@@ -971,6 +971,14 @@ pub enum UnresolvedPattern {
         var: Arc<str>,
         expr: UnresolvedExpression,
     },
+    /// Expand a list-valued expression into one row per element, binding each
+    /// element to `var`. The list source is any expression that evaluates to a
+    /// list value (e.g. `range(1, 5)`, `list(…)`, or a bound list). An empty
+    /// list produces zero rows; a non-list / unbound value produces zero rows.
+    Unwind {
+        var: Arc<str>,
+        expr: UnresolvedExpression,
+    },
     /// Inline VALUES block - constant rows to join with the current solution stream
     Values {
         /// Variables defined by VALUES (column order)
@@ -1248,6 +1256,7 @@ impl UnresolvedQuery {
                     }
                     UnresolvedPattern::Filter(_)
                     | UnresolvedPattern::Bind { .. }
+                    | UnresolvedPattern::Unwind { .. }
                     | UnresolvedPattern::Values { .. }
                     | UnresolvedPattern::Path { .. }
                     | UnresolvedPattern::Subquery(_)

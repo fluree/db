@@ -197,6 +197,29 @@ pub fn parse_where_array_element(
             }
             Ok(())
         }
+        "unwind" => {
+            // ["unwind", "?var", expr]
+            //
+            // `expr` evaluates to a list value (e.g. "(range 1 5)", "(list 1 2 3)",
+            // or a bound list variable) and is expanded into one row per element,
+            // each bound to `?var`. Shares the FILTER/BIND expression language.
+            if arr.len() != 3 {
+                return Err(ParseError::InvalidWhere(
+                    "unwind requires exactly two arguments: a variable and a list expression"
+                        .to_string(),
+                ));
+            }
+            let var = arr[1].as_str().ok_or_else(|| {
+                ParseError::InvalidWhere("unwind var must be a string".to_string())
+            })?;
+            validate_var_name(var)?;
+            let expr = parse_filter_value(&arr[2])?;
+            query.patterns.push(UnresolvedPattern::Unwind {
+                var: Arc::from(var),
+                expr,
+            });
+            Ok(())
+        }
         "filter" => {
             // ["filter", expression] or ["filter", expr1, expr2, ...]
             if arr.len() < 2 {

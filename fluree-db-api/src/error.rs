@@ -434,8 +434,3 @@ impl ApiError {
 
 /// Result type alias for API operations
 pub type Result<T> = std::result::Result<T, ApiError>;
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-}
