@@ -285,6 +285,8 @@ impl Bm25SearchOperator {
                     Ok(Some(iri.to_string()))
                 }
                 Some(Binding::Grouped(_)) => Ok(None),
+                // A path or list value is not a search target.
+                Some(Binding::Path(_) | Binding::List(_)) => Ok(None),
                 // EncodedSid/EncodedPid: decode to IRI string if store available
                 Some(Binding::EncodedSid { s_id, .. }) => {
                     // Novelty-aware: use graph_view() for subject resolution.

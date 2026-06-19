@@ -89,8 +89,11 @@ impl<T> NonEmpty<T> {
         1 + self.tail.len()
     }
 
-    /// This method is provided for customary hygiene but, by definition, NonEmpty is never empty.
-    pub fn is_empty(&self) -> bool {
+    /// Always `false`. The type's structural invariant guarantees
+    /// at least one element; included for parity with `len` and
+    /// to satisfy `clippy::len_without_is_empty`.
+    #[allow(clippy::unused_self)]
+    pub const fn is_empty(&self) -> bool {
         false
     }
 

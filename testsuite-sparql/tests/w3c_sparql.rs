@@ -172,12 +172,52 @@ fn sparql11_project_expression() -> Result<()> {
     )
 }
 
+// Runs in the normal suite (not `#[ignore]`d): every unsupported case is
+// explicitly listed below, so the test is green and guards the supported path
+// features (simple `p`/`^p`/`p*`/`p+`, sequence `p1/p2`, alternation `a|b`,
+// alternation-transitive `(a|b)*`/`(a|b)+`, both-bound reachability) against
+// regressions. Each ignored case is grouped by the missing feature so the
+// remaining work is legible; remove an entry as its feature lands.
 #[test]
-#[ignore = "eval: many failures expected — run with --include-ignored"]
 fn sparql11_property_path() -> Result<()> {
+    let base = "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/property-path/manifest#";
+    let ignored: Vec<String> = [
+        // Transitive over a *sequence* — `(:p1/:p2)*` needs closure over a
+        // multi-hop sub-path, not just a predicate set.
+        "pp02",
+        "pp12",
+        "pp37",
+        // Negated property sets — `!:p`, `!(:p|^:q)`: an "any predicate except"
+        // traversal operator (not yet implemented).
+        "pp10",
+        "nps_inverse",
+        "nps_direct_and_inverse",
+        "nps_a",
+        "nps_a_inverse",
+        // Zero-or-one `?` — incl. `(:p/:p)?` over a sequence and over a set
+        // (zero-length-path semantics over arbitrary terms).
+        "pp28a",
+        "zero_or_one_set_start",
+        "zero_or_one_set_end",
+        // Path cardinality / duplicate semantics — results differ in
+        // multiplicity (`p1/p2` path counting vs `*`/`+` distinct nodes).
+        "pp06",
+        "pp16",
+        "pp34",
+        "pp35",
+        // Zero-variable `SELECT *` over a both-bound reachability path — the
+        // path lowers correctly; the empty-solution projection differs.
+        "pp36",
+        // VALUES combined with a path pattern.
+        "values_and_path",
+    ]
+    .iter()
+    .map(|t| format!("{base}{t}"))
+    .collect();
+    let ignored_refs: Vec<&str> = ignored.iter().map(String::as_str).collect();
     check_testsuite(
         "https://w3c.github.io/rdf-tests/sparql/sparql11/property-path/manifest.ttl",
-        &[],
+        &ignored_refs,
     )
 }
 

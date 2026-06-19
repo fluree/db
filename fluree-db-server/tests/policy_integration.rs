@@ -1598,3 +1598,63 @@ async fn multi_query_sparql_alias_policy_manager_sees_all() {
         "manager identity must see all docs through the SPARQL alias; got: {alias}"
     );
 }
+
+/// POST a Cypher read to the ledger-scoped route with an optional Bearer
+/// token, returning (status, raw body text). Cypher returns JSON-LD, so we
+/// assert on substrings of the rendered body.
+async fn cypher_classifications(
+    app: axum::Router,
+    ledger: &str,
+    token: Option<&str>,
+) -> (StatusCode, String) {
+    let mut req = Request::builder()
+        .method("POST")
+        .uri(format!("/v1/fluree/query/{ledger}"))
+        .header("content-type", "application/cypher");
+    if let Some(tok) = token {
+        req = req.header("authorization", format!("Bearer {tok}"));
+    }
+    let resp = app
+        .oneshot(
+            req.body(Body::from("MATCH (d:Document) RETURN d.classification"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    (status, String::from_utf8_lossy(&bytes).to_string())
+}
+
+/// Regression for the Cypher policy-bypass finding: a Cypher read under a
+/// restricted identity must be filtered the same way JSON-LD/SPARQL are.
+#[tokio::test]
+async fn cypher_read_enforces_policy() {
+    let (_tmp, state) = policy_test_state().await;
+    let app = setup_policy_ledger(build_router(state), "cypherpol:main").await;
+
+    let signing_key = SigningKey::from_bytes(&[1u8; 32]);
+
+    // Unauthenticated: no policy inputs → sees everything (baseline).
+    let (status, open) = cypher_classifications(app.clone(), "cypherpol:main", None).await;
+    assert_eq!(status, StatusCode::OK, "open body={open}");
+    assert!(open.contains("confidential"), "baseline sees all: {open}");
+
+    // Public identity → only public classification visible.
+    let token = identity_token(
+        &signing_key,
+        "http://example.org/public-user",
+        "cypherpol:main",
+    );
+    let (status, body) = cypher_classifications(app.clone(), "cypherpol:main", Some(&token)).await;
+    assert_eq!(status, StatusCode::OK, "policy body={body}");
+    assert!(body.contains("public"), "public user sees public: {body}");
+    assert!(
+        !body.contains("internal"),
+        "policy must hide internal from public user: {body}"
+    );
+    assert!(
+        !body.contains("confidential"),
+        "policy must hide confidential from public user: {body}"
+    );
+}

@@ -26,6 +26,76 @@ pub trait FulltextConfigProvider: std::fmt::Debug + Send + Sync {
     ) -> Vec<ConfiguredFulltextProperty>;
 }
 
+/// Coverage envelope for caller-supplied attachment events.
+///
+/// Tells the indexer how to combine the supplied events with the base
+/// root's existing arena (when present). The wrong coverage label
+/// will either drop history (if `Authoritative` is asserted on a
+/// post-reload tail) or double-count rows (if `Augment` is supplied
+/// with already-indexed events that don't deduplicate cleanly), so
+/// providers must be precise.
+#[derive(Debug, Clone)]
+pub enum AttachmentEventCoverage {
+    /// Caller asserts `events` is the **complete** history of every
+    /// `f:reifies*` event the snapshot has ever observed. The indexer
+    /// rebuilds the arena from scratch from this set; the previous
+    /// arena is enumerated only for GC reachability.
+    ///
+    /// Safe only when the caller has seen every commit since
+    /// genesis (or at least since the predicate dictionary first
+    /// observed an `f:reifies*` SID). A long-running ledger with a
+    /// continuously populated `AttachmentNovelty` qualifies; an
+    /// `AttachmentNovelty` reconstructed by `LedgerState::load` from
+    /// post-index commits **does not** — `load_novelty` only walks
+    /// commits with `t > snapshot.t`.
+    Authoritative(Vec<(fluree_db_core::EdgeKey, fluree_db_core::Sid, i64, bool)>),
+
+    /// Caller has events but can't guarantee full-history coverage.
+    /// The indexer concatenates `events` with the previous arena's
+    /// events, deduplicates by `(edge, ann, t, op)` tuple, and
+    /// rebuilds. The dedup step makes this correct regardless of
+    /// whether the caller's events overlap the previous arena.
+    ///
+    /// Safe default for orchestrator-driven providers that read the
+    /// running `AttachmentNovelty.iter_event_pairs()` — that
+    /// overlay's coverage shifts between "full history" (for a
+    /// continuously running ledger) and "post-index tail" (after a
+    /// reload or eviction), and the merge-and-dedupe path stays
+    /// correct in both shapes.
+    Augment(Vec<(fluree_db_core::EdgeKey, fluree_db_core::Sid, i64, bool)>),
+
+    /// Caller couldn't produce events this pass. Indexer treats as
+    /// delta-unknown — when the base root carries an arena, the new
+    /// root drops it (recording old leaves as replaced for GC) and
+    /// hydration falls back to scan until the next pass.
+    Unknown,
+}
+
+/// Per-ledger attachment-events resolver for arena sealing on the
+/// background-indexer path.
+///
+/// Implementations (typically in the api layer) resolve a ledger ID
+/// to a coverage envelope at job-dispatch time. The indexer takes
+/// the resulting [`AttachmentEventCoverage`] and stamps it into a
+/// per-job `IndexerConfig.attachment_events`.
+///
+/// **Return semantics:**
+/// - `Some(Authoritative(events))`: full history; indexer rebuilds
+///   from scratch.
+/// - `Some(Augment(events))`: partial coverage; indexer merges with
+///   previous arena's events and dedupes.
+/// - `Some(Unknown)` or `None`: defensive drop (treated identically).
+///
+/// Implementations should be cheap on the happy path (one privileged
+/// read of the running ledger state) and return
+/// `Some(Unknown)` / `None` rather than panic when the ledger isn't
+/// loaded — a missing ledger shouldn't block the indexing run; the
+/// defensive drop covers correctness.
+#[async_trait]
+pub trait AttachmentEventsProvider: std::fmt::Debug + Send + Sync {
+    async fn attachment_events(&self, ledger_id: &str) -> Option<AttachmentEventCoverage>;
+}
+
 /// Scope of a configured full-text property entry.
 ///
 /// Mirrors the `f:targetGraph` sentinels used in config graph writes:
@@ -187,6 +257,43 @@ pub struct IndexerConfig {
     /// `None` means no limit (backwards-compatible default).
     pub incremental_max_commit_bytes: Option<usize>,
 
+    /// Edge-annotation attachment events to seal into the new arena.
+    ///
+    /// `Some(coverage)` carries an [`AttachmentEventCoverage`]
+    /// envelope that tells the indexer how to combine the events
+    /// with the base root's existing arena:
+    ///
+    /// - `Authoritative(events)`: caller has the complete history;
+    ///   the indexer rebuilds the arena from scratch from this set.
+    /// - `Augment(events)`: caller has partial events; the indexer
+    ///   merges with the previous arena's events, dedupes by
+    ///   `(edge, ann, t, op)`, and rebuilds.
+    /// - `Unknown`: caller couldn't produce events; defensive drop.
+    ///
+    /// `None` is treated identically to `Some(Unknown)`.
+    ///
+    /// Direct callers (CLI tools, tests, custom orchestrators with a
+    /// snapshot in hand) populate this field directly. The
+    /// `BackgroundIndexerWorker` path uses
+    /// [`Self::attachment_events_provider`] to resolve coverage
+    /// per-ledger at job-dispatch time.
+    pub attachment_events: Option<AttachmentEventCoverage>,
+
+    /// Per-ledger attachment-events resolver for orchestrator paths.
+    ///
+    /// `BackgroundIndexerWorker` holds a single `IndexerConfig` for
+    /// its lifetime, so `attachment_events` (a per-job value) can't
+    /// be set on the static config. The worker calls this provider
+    /// at job dispatch time to fetch the running ledger's
+    /// `AttachmentNovelty.iter_event_pairs()` and stamps the result
+    /// into a per-job clone of the config before invoking the
+    /// indexer. `None` (the default) yields the M2a behavior:
+    /// arenas are not sealed via the background path.
+    ///
+    /// See `attachment_events` for the delta-unknown semantics that
+    /// apply when this provider returns `None` for a given ledger.
+    pub attachment_events_provider: Option<Arc<dyn AttachmentEventsProvider>>,
+
     /// Maximum number of *existing* subjects whose `rdf:type` set may change in
     /// a single incremental batch before incremental indexing aborts and defers
     /// to a full rebuild. Re-typing (or deleting) an existing subject forces a
@@ -276,6 +383,8 @@ impl Default for IndexerConfig {
             incremental_retype_max_subjects: DEFAULT_INCREMENTAL_RETYPE_MAX_SUBJECTS,
             fulltext_configured_properties: Vec::new(),
             fulltext_config_provider: None,
+            attachment_events: None,
+            attachment_events_provider: None,
             pending_commit_cids: None,
             force_serial_commit_walk: false,
         }
@@ -309,6 +418,8 @@ impl IndexerConfig {
             incremental_retype_max_subjects: DEFAULT_INCREMENTAL_RETYPE_MAX_SUBJECTS,
             fulltext_configured_properties: Vec::new(),
             fulltext_config_provider: None,
+            attachment_events: None,
+            attachment_events_provider: None,
             pending_commit_cids: None,
             force_serial_commit_walk: false,
         }
@@ -335,6 +446,8 @@ impl IndexerConfig {
             incremental_retype_max_subjects: DEFAULT_INCREMENTAL_RETYPE_MAX_SUBJECTS,
             fulltext_configured_properties: Vec::new(),
             fulltext_config_provider: None,
+            attachment_events: None,
+            attachment_events_provider: None,
             pending_commit_cids: None,
             force_serial_commit_walk: false,
         }
@@ -361,6 +474,8 @@ impl IndexerConfig {
             incremental_retype_max_subjects: DEFAULT_INCREMENTAL_RETYPE_MAX_SUBJECTS,
             fulltext_configured_properties: Vec::new(),
             fulltext_config_provider: None,
+            attachment_events: None,
+            attachment_events_provider: None,
             pending_commit_cids: None,
             force_serial_commit_walk: false,
         }
@@ -378,6 +493,18 @@ impl IndexerConfig {
         provider: Arc<dyn FulltextConfigProvider>,
     ) -> Self {
         self.fulltext_config_provider = Some(provider);
+        self
+    }
+
+    /// Attach a per-ledger attachment-events resolver. The
+    /// `BackgroundIndexerWorker` calls the provider at job dispatch
+    /// time; direct callers (CLI, tests) typically populate
+    /// `attachment_events` instead.
+    pub fn with_attachment_events_provider(
+        mut self,
+        provider: Arc<dyn AttachmentEventsProvider>,
+    ) -> Self {
+        self.attachment_events_provider = Some(provider);
         self
     }
 

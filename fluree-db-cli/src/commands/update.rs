@@ -58,8 +58,9 @@ fn sniff_update_format(content: &str) -> CliResult<UpdateFormat> {
         return Ok(UpdateFormat::JsonLd);
     }
 
-    // Check for SPARQL UPDATE keywords
     let upper = content.trim().to_uppercase();
+
+    // Check for SPARQL UPDATE keywords
     if upper.starts_with("INSERT")
         || upper.starts_with("DELETE")
         || upper.starts_with("PREFIX")
@@ -69,7 +70,7 @@ fn sniff_update_format(content: &str) -> CliResult<UpdateFormat> {
     }
 
     Err(CliError::Usage(format!(
-        "could not detect update format\n  {} use --format jsonld or --format sparql to specify",
+        "could not detect update format\n  {} use --format jsonld or sparql to specify",
         colored::Colorize::bold(colored::Colorize::cyan("help:"))
     )))
 }

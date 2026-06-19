@@ -81,6 +81,15 @@ pub enum QueryError {
     #[error("Unsupported mode: {0}")]
     UnsupportedMode(String),
 
+    /// A syntactically valid query feature is not yet implemented.
+    ///
+    /// Distinguished from [`Self::UnsupportedMode`] (which is mode-bound) and
+    /// [`Self::InvalidQuery`] (which is user-error). Examples: edge
+    /// annotations parsed but no executor wired, deferred property-path
+    /// shapes, etc.
+    #[error("Unsupported feature: {0}")]
+    UnsupportedFeature(String),
+
     /// Requested time range not covered by binary index
     #[error("Time range not covered: requested t={requested_t} but base_t={base_t}")]
     TimeRangeNotCovered { requested_t: i64, base_t: i64 },

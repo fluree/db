@@ -45,6 +45,7 @@
 //! - [`select`] — SELECT clause, solution modifiers, subqueries
 
 mod aggregate;
+mod annotation;
 mod ask;
 mod construct;
 mod describe;
@@ -125,7 +126,158 @@ pub fn lower_sparql_with_source<E: IriEncoder>(
         }
     }
 
+    // Mirror the JSON-LD read-side firewall
+    // (`fluree_db_query::parse::reject_user_authored_reifies_in_query`):
+    // user queries naming `f:reifies*` IRIs directly are rejected
+    // so system facts can't be enumerated through the user surface.
+    // The opt-in `opts.includeSystemFacts: true` only relaxes the
+    // variable-predicate scan filter — direct mention is the
+    // contract-level boundary, identical for SPARQL and JSON-LD.
+    if let Ok(query) = &result {
+        reject_direct_reifies_in_patterns(&query.patterns)?;
+    }
+
     result
+}
+
+/// Walk every triple pattern reachable from `patterns` (recursing
+/// through container patterns) and reject any whose predicate slot is
+/// a system-controlled `f:reifies*` IRI/SID. Called by
+/// `lower_sparql_with_source` after lowering succeeds.
+///
+/// Patterns built via the IR-level `expand_edge_annotation_patterns`
+/// pass also produce `f:reifies*` triples, but that pass runs at
+/// execution time on top of `Pattern::EdgeAnnotation` /
+/// `Pattern::AnnotationTarget`, *after* this firewall. SPARQL has no
+/// surface that produces those container variants today, so any
+/// `f:reifies*` triple visible here came from user input.
+fn reject_direct_reifies_in_patterns(patterns: &[Pattern]) -> Result<()> {
+    use fluree_db_query::ir::triple::Ref;
+    use fluree_vocab::reifies_iris;
+
+    fn is_reifies_ref(p: &Ref) -> bool {
+        match p {
+            Ref::Sid(sid) => fluree_db_core::is_reserved_reifies_predicate(sid),
+            Ref::Iri(iri) => reifies_iris::ALL.iter().any(|known| *known == iri.as_ref()),
+            _ => false,
+        }
+    }
+
+    fn reject_predicate_string(predicate: String) -> LowerError {
+        LowerError::not_implemented(
+            format!(
+                "predicate '{predicate}' is system-controlled; \
+                 read edge annotations through SPARQL-star \
+                 quoted-triple annotation syntax rather than \
+                 naming f:reifies* directly"
+            ),
+            (0..0).into(),
+        )
+    }
+
+    // A VALUES row binding that resolves to an `f:reifies*` IRI: the
+    // user is trying to smuggle a system-controlled predicate in as
+    // data (e.g. `VALUES ?p { f:reifiesSubject } . ?s ?p ?o`) so a
+    // later variable-predicate scan binds it to a constant and leaks
+    // the internal bundle. Returns the offending IRI for the message.
+    fn reifies_values_binding(b: &fluree_db_query::Binding) -> Option<String> {
+        use fluree_db_query::Binding;
+        match b {
+            Binding::Sid { sid, .. } if fluree_db_core::is_reserved_reifies_predicate(sid) => {
+                Some(format!("{sid}"))
+            }
+            Binding::IriMatch {
+                primary_sid, iri, ..
+            } if fluree_db_core::is_reserved_reifies_predicate(primary_sid)
+                || reifies_iris::ALL.iter().any(|known| *known == iri.as_ref()) =>
+            {
+                Some(iri.to_string())
+            }
+            _ => None,
+        }
+    }
+
+    // Exhaustive over `Pattern` so adding a new variant forces a
+    // firewall decision rather than silently slipping through. The
+    // previous wildcard arm let `PropertyPath` (which carries a
+    // predicate Sid) bypass the check — e.g.
+    // `?s f:reifiesSubject+ ?o` was accepted, exposing the
+    // system-controlled chain through transitive paths.
+    fn walk(patterns: &[Pattern]) -> Result<()> {
+        for pattern in patterns {
+            match pattern {
+                Pattern::Triple(tp) => {
+                    if is_reifies_ref(&tp.p) {
+                        let predicate = match &tp.p {
+                            Ref::Iri(iri) => iri.as_ref().to_string(),
+                            Ref::Sid(sid) => format!("{sid}"),
+                            _ => "<f:reifies*>".to_string(),
+                        };
+                        return Err(reject_predicate_string(predicate));
+                    }
+                }
+                Pattern::PropertyPath(pp) => {
+                    if let Some(reserved) = pp
+                        .predicates
+                        .iter()
+                        .find(|p| fluree_db_core::is_reserved_reifies_predicate(p))
+                    {
+                        return Err(reject_predicate_string(format!("{reserved}")));
+                    }
+                }
+                // ShortestPath also carries a predicate Sid; apply the same
+                // firewall (no SPARQL surface produces it today, but stay safe).
+                Pattern::ShortestPath(sp) => {
+                    if fluree_db_core::is_reserved_reifies_predicate(&sp.predicate) {
+                        return Err(reject_predicate_string(format!("{}", sp.predicate)));
+                    }
+                }
+                Pattern::Optional(inner)
+                | Pattern::Minus(inner)
+                | Pattern::Exists(inner)
+                | Pattern::NotExists(inner) => walk(inner)?,
+                Pattern::Union(branches) => {
+                    for branch in branches {
+                        walk(branch)?;
+                    }
+                }
+                Pattern::Graph { patterns, .. } => walk(patterns)?,
+                Pattern::Service(sp) => walk(&sp.patterns)?,
+                Pattern::Subquery(sq) => walk(&sq.patterns)?,
+                Pattern::EdgeAnnotation { body, .. } | Pattern::AnnotationTarget { body, .. } => {
+                    walk(body)?;
+                }
+                Pattern::DefaultGraphSource { patterns } => walk(patterns)?,
+                // VALUES carries no predicate slot, but its row DATA can
+                // bind a variable to an `f:reifies*` IRI which a later
+                // `?s ?p ?o` scan then resolves to a constant predicate,
+                // leaking the internal bundle. Reject the IRI here.
+                Pattern::Values { rows, .. } => {
+                    for row in rows {
+                        for binding in row {
+                            if let Some(iri) = reifies_values_binding(binding) {
+                                return Err(reject_predicate_string(iri));
+                            }
+                        }
+                    }
+                }
+                // Pattern types that don't carry an arbitrary triple
+                // predicate — adapters / search calls / leaf nodes.
+                // f:reifies* predicates can't appear inside them.
+                Pattern::Filter(_)
+                | Pattern::Bind { .. }
+                | Pattern::Unwind { .. }
+                | Pattern::IndexSearch(_)
+                | Pattern::VectorSearch(_)
+                | Pattern::R2rml(_)
+                | Pattern::GeoSearch(_)
+                | Pattern::S2Search(_) => {}
+            }
+        }
+        Ok(())
+    }
+
+    walk(patterns)
 }
 
 /// Context for lowering operations.
@@ -353,6 +505,7 @@ impl<'a, E: IriEncoder> LoweringContext<'a, E> {
                     offset,
                     reasoning: self.reasoning_config()?,
                     post_values,
+                    include_system_facts: false,
                 })
             }
             QueryBody::Construct(construct_query) => self.lower_construct(construct_query),
@@ -641,6 +794,41 @@ mod tests {
     // =========================================================================
     // Basic SELECT tests
     // =========================================================================
+
+    #[test]
+    fn test_rejects_user_authored_reifies_iri() {
+        // Mirrors the JSON-LD read-side firewall: SPARQL queries that
+        // mention `f:reifies*` IRIs directly are rejected at lower
+        // time so users can't enumerate system facts through the
+        // query surface. The opt-in `opts.includeSystemFacts: true`
+        // (JSON-LD only) does not relax this — it only relaxes the
+        // variable-predicate scan filter.
+        let err = lower_query(
+            "PREFIX f: <https://ns.flur.ee/db#>\n\
+             SELECT ?ann ?s WHERE { ?ann f:reifiesSubject ?s }",
+        )
+        .expect_err("direct f:reifiesSubject mention must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("system-controlled") && msg.contains("reifies"),
+            "expected system-controlled rejection; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_rejects_user_authored_reifies_iri_inside_optional() {
+        // Recurse-into-container check: nested mentions inside
+        // OPTIONAL (and by extension UNION/MINUS/etc.) must also be
+        // caught by the post-lower walk.
+        let err = lower_query(
+            "PREFIX ex: <http://example.org/>\n\
+             PREFIX f: <https://ns.flur.ee/db#>\n\
+             SELECT ?ann WHERE { ?ann ex:role \"Engineer\" \
+              OPTIONAL { ?ann f:reifiesObject ?o } }",
+        )
+        .expect_err("nested f:reifies* mention must be rejected");
+        assert!(err.to_string().contains("system-controlled"));
+    }
 
     #[test]
     fn test_simple_select() {
@@ -2271,16 +2459,22 @@ mod tests {
     }
 
     #[test]
-    fn test_property_path_both_constants_error() {
-        let result = lower_query(
+    fn test_property_path_both_constants_is_reachability() {
+        // Both endpoints constant is a reachability test, not an error: it
+        // lowers to a PropertyPath whose both-Sid arm emits one empty solution
+        // iff a path exists (W3C `:a :p+ :b`).
+        let query = lower_query(
             "PREFIX ex: <http://example.org/>
              SELECT * WHERE { ex:alice ex:parent+ ex:bob }",
-        );
-
-        // Should error because both subject and object are bound
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(matches!(err, LowerError::InvalidPropertyPath { .. }));
+        )
+        .unwrap();
+        assert_eq!(query.patterns.len(), 1);
+        match &query.patterns[0] {
+            Pattern::PropertyPath(pp) => {
+                assert!(pp.subject.is_bound() && pp.object.is_bound());
+            }
+            other => panic!("expected PropertyPath, got {other:?}"),
+        }
     }
 
     #[test]
@@ -2352,17 +2546,16 @@ mod tests {
     }
 
     #[test]
-    fn test_property_path_inverse_transitive_both_constants_error() {
-        let result = lower_query(
+    fn test_property_path_inverse_transitive_both_constants_is_reachability() {
+        // `:a ^:p+ :b` both-constant inverse transitive is also a reachability
+        // test (lowers to a PropertyPath with swapped, both-bound endpoints).
+        let query = lower_query(
             "PREFIX ex: <http://example.org/>
              SELECT * WHERE { ex:alice ^ex:knows+ ex:bob }",
-        );
-
-        assert!(result.is_err());
-        assert!(matches!(
-            result.unwrap_err(),
-            LowerError::InvalidPropertyPath { .. }
-        ));
+        )
+        .unwrap();
+        assert_eq!(query.patterns.len(), 1);
+        assert!(matches!(&query.patterns[0], Pattern::PropertyPath(_)));
     }
 
     #[test]
@@ -2466,16 +2659,24 @@ mod tests {
     }
 
     #[test]
-    fn test_property_path_nested_alternative_under_transitive_errors() {
-        let result = lower_query(
+    fn test_property_path_alternation_transitive_lowers_to_multi_predicate() {
+        // `(a|b)+` is an alternation-transitive path: the closure follows an
+        // edge of either predicate per hop. Lowers to one PropertyPath carrying
+        // both predicates.
+        let query = lower_query(
             "PREFIX ex: <http://example.org/>
              SELECT ?x WHERE { ?s (ex:a|ex:b)+ ?x }",
-        );
+        )
+        .unwrap();
 
-        // Transitive requires simple predicate, not complex expression
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(matches!(err, LowerError::InvalidPropertyPath { .. }));
+        assert_eq!(query.patterns.len(), 1);
+        match &query.patterns[0] {
+            Pattern::PropertyPath(pp) => {
+                assert_eq!(pp.predicates.len(), 2, "both branches traversed: {pp:?}");
+                assert!(pp.single_predicate().is_none());
+            }
+            other => panic!("expected PropertyPath, got {other:?}"),
+        }
     }
 
     #[test]
@@ -3550,6 +3751,305 @@ mod tests {
             matches!(query.patterns[0], Pattern::PropertyPath(_)),
             "Expected PropertyPath, got {:?}",
             query.patterns[0]
+        );
+    }
+
+    // =========================================================================
+    // M4.3 — RDF 1.2 annotation lowering
+    // =========================================================================
+
+    #[test]
+    fn m43_annotation_block_lowers_to_edge_annotation_with_body() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT * WHERE { ex:alice ex:worksFor ex:acme {| ex:role \"Engineer\" |} . }",
+        )
+        .expect("lower should succeed");
+        assert_eq!(query.patterns.len(), 1);
+        match &query.patterns[0] {
+            Pattern::EdgeAnnotation {
+                body, annotation, ..
+            } => {
+                assert_eq!(body.len(), 1, "one annotation entry → one body triple");
+                assert!(
+                    matches!(annotation, Ref::Var(_)),
+                    "anonymous reifier mints var"
+                );
+                match &body[0] {
+                    Pattern::Triple(tp) => {
+                        // Body triple's subject is the annotation reifier var.
+                        match (&tp.s, annotation) {
+                            (Ref::Var(a), Ref::Var(b)) => assert_eq!(a, b),
+                            _ => panic!("body subject should match annotation ref"),
+                        }
+                    }
+                    other => panic!("body[0] should be Pattern::Triple, got {other:?}"),
+                }
+            }
+            other => panic!("expected Pattern::EdgeAnnotation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn m43_annotated_plain_string_literal_object_carries_xsd_string_dtc() {
+        // Plain string literal on the base edge of an annotated triple.
+        // `edge.dtc` must be Some(Explicit(xsd:string)) so the scan
+        // matches only xsd:string flakes — not, say, a custom-typed
+        // string with the same lexical value.
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT * WHERE { ex:alice ex:name \"Alice\" {| ex:source \"hr\" |} . }",
+        )
+        .unwrap();
+        match &query.patterns[0] {
+            Pattern::EdgeAnnotation { edge, body, .. } => {
+                match &edge.dtc {
+                    Some(fluree_db_core::DatatypeConstraint::Explicit(_)) => {}
+                    other => panic!("plain string base edge must have Explicit dtc, got {other:?}"),
+                }
+                // Annotation body entry should also carry dtc for its
+                // string literal value.
+                match &body[0] {
+                    Pattern::Triple(tp) => match &tp.dtc {
+                        Some(fluree_db_core::DatatypeConstraint::Explicit(_)) => {}
+                        other => {
+                            panic!("body string literal must have Explicit dtc, got {other:?}")
+                        }
+                    },
+                    other => panic!("body[0] should be Pattern::Triple, got {other:?}"),
+                }
+            }
+            other => panic!("expected Pattern::EdgeAnnotation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn m43_annotated_lang_tagged_literal_object_carries_lang_dtc() {
+        // Language-tagged literal on the base edge. `edge.dtc` must be
+        // Some(LangTag("fr")) so same-lexical literals in different
+        // languages do not cross-match.
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT * WHERE { ex:alice ex:label \"chat\"@fr {| ex:source \"lex\" |} . }",
+        )
+        .unwrap();
+        match &query.patterns[0] {
+            Pattern::EdgeAnnotation { edge, .. } => match &edge.dtc {
+                Some(fluree_db_core::DatatypeConstraint::LangTag(tag)) => {
+                    assert_eq!(tag.as_ref(), "fr");
+                }
+                other => panic!("lang-tagged base edge must have LangTag dtc, got {other:?}"),
+            },
+            other => panic!("expected EdgeAnnotation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn m43_annotated_typed_literal_object_carries_typed_dtc() {
+        // Typed literal — integer in this case. The constraint must be
+        // Some(Explicit(<xsd:integer sid>)) so scans don't cross
+        // datatypes.
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT * WHERE { ex:alice ex:age 30 {| ex:source \"hr\" |} . }",
+        )
+        .unwrap();
+        match &query.patterns[0] {
+            Pattern::EdgeAnnotation { edge, .. } => match &edge.dtc {
+                Some(fluree_db_core::DatatypeConstraint::Explicit(_)) => {}
+                other => panic!("typed literal base edge must have Explicit dtc, got {other:?}"),
+            },
+            other => panic!("expected EdgeAnnotation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn m43_named_iri_reifier_resolves_to_iri_ref() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT * WHERE { ex:alice ex:worksFor ex:acme ~ ex:rel {| ex:role \"x\" |} . }",
+        )
+        .unwrap();
+        match &query.patterns[0] {
+            Pattern::EdgeAnnotation { annotation, .. } => {
+                assert!(
+                    matches!(annotation, Ref::Iri(_) | Ref::Sid(_)),
+                    "explicit IRI reifier resolves to a constant ref, got {annotation:?}"
+                );
+            }
+            other => panic!("expected EdgeAnnotation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn m43_named_var_reifier_resolves_to_var() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT * WHERE { ex:alice ex:worksFor ex:acme ~ ?ann {| ex:role \"x\" |} . }",
+        )
+        .unwrap();
+        match &query.patterns[0] {
+            Pattern::EdgeAnnotation { annotation, .. } => {
+                assert!(matches!(annotation, Ref::Var(_)));
+            }
+            other => panic!("expected EdgeAnnotation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn m43_empty_block_emits_empty_body() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT * WHERE { ex:alice ex:worksFor ex:acme {| |} . }",
+        )
+        .unwrap();
+        match &query.patterns[0] {
+            Pattern::EdgeAnnotation { body, .. } => assert!(body.is_empty()),
+            other => panic!("expected EdgeAnnotation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn m43_bare_tilde_reifier_emits_empty_body() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT * WHERE { ex:alice ex:worksFor ex:acme ~ ?ann . }",
+        )
+        .unwrap();
+        match &query.patterns[0] {
+            Pattern::EdgeAnnotation {
+                body, annotation, ..
+            } => {
+                assert!(body.is_empty());
+                assert!(matches!(annotation, Ref::Var(_)));
+            }
+            other => panic!("expected EdgeAnnotation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn m43_rdf_reifies_lowers_to_annotation_target_with_empty_body() {
+        let query = lower_query(
+            "PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+             PREFIX ex: <http://example.org/>
+             SELECT * WHERE { ?ann rdf:reifies <<( ex:alice ex:worksFor ex:acme )>> . }",
+        )
+        .unwrap();
+        // The pattern list contains exactly one AnnotationTarget. Sibling
+        // triples about ?ann (none in this query) would join via the
+        // standard executor — the AnnotationTarget itself carries no body.
+        let n = query
+            .patterns
+            .iter()
+            .filter(|p| matches!(p, Pattern::AnnotationTarget { .. }))
+            .count();
+        assert_eq!(n, 1, "expected exactly one AnnotationTarget IR pattern");
+        for p in &query.patterns {
+            if let Pattern::AnnotationTarget { body, .. } = p {
+                assert!(body.is_empty(), "M4.3 emits empty body");
+            }
+        }
+    }
+
+    #[test]
+    fn m43_sibling_triples_about_reifier_stay_in_outer_scope() {
+        // ?ann ex:role "Engineer" must remain a regular Pattern::Triple
+        // alongside the AnnotationTarget — NOT folded into body.
+        let query = lower_query(
+            "PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+             PREFIX ex: <http://example.org/>
+             SELECT * WHERE {
+               ?ann rdf:reifies <<( ex:alice ex:worksFor ex:acme )>> .
+               ?ann ex:role \"Engineer\" .
+             }",
+        )
+        .unwrap();
+        let n_target = query
+            .patterns
+            .iter()
+            .filter(|p| matches!(p, Pattern::AnnotationTarget { .. }))
+            .count();
+        let n_triple = query
+            .patterns
+            .iter()
+            .filter(|p| matches!(p, Pattern::Triple(_)))
+            .count();
+        assert_eq!(n_target, 1);
+        assert_eq!(n_triple, 1, "sibling stays as outer Pattern::Triple");
+        // And the body of AnnotationTarget is empty.
+        for p in &query.patterns {
+            if let Pattern::AnnotationTarget { body, .. } = p {
+                assert!(body.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn m43_rebound_rdf_prefix_with_reifies_is_rejected_at_lower_time() {
+        // The parser recognizes `rdf:reifies` lexically. If the user
+        // rebinds `rdf:` to a non-standard namespace, the resulting
+        // IRI is NOT the standard rdf:reifies and must be rejected by
+        // the lower step. Mirrors the JSON-LD path's strict-IRI rule.
+        let err = lower_query(
+            "PREFIX rdf: <http://example.org/fake-rdf#>
+             PREFIX ex:  <http://example.org/>
+             SELECT * WHERE {
+               ?ann rdf:reifies <<( ex:a ex:b ex:c )>> .
+             }",
+        )
+        .expect_err("rebound rdf:reifies must be rejected at lower time");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("does not resolve to rdf:reifies"),
+            "expected prefix-rejection diagnostic, got: {msg}"
+        );
+    }
+
+    // =========================================================================
+    // M4.5 — CONSTRUCT boundary
+    // =========================================================================
+
+    #[test]
+    fn m45_construct_with_annotation_in_template_is_rejected() {
+        let err = lower_query(
+            "PREFIX ex: <http://example.org/>
+             CONSTRUCT { ex:alice ex:worksFor ex:acme {| ex:role \"Engineer\" |} }
+             WHERE { ex:alice ex:worksFor ex:acme }",
+        )
+        .expect_err("annotation in CONSTRUCT template must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("CONSTRUCT projection of edge-annotation"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn m45_construct_without_annotation_in_template_works_with_annotation_where() {
+        // Annotation in WHERE filters the matches; template projects only
+        // ordinary triples. This must succeed.
+        lower_query(
+            "PREFIX ex: <http://example.org/>
+             CONSTRUCT { ?p ex:knows ex:acme }
+             WHERE { ?p ex:worksFor ex:acme {| ex:role \"Engineer\" |} . }",
+        )
+        .expect("CONSTRUCT-without-annotation-in-template + annotation-in-WHERE should lower");
+    }
+
+    #[test]
+    fn m43_does_not_trip_user_authored_reifies_firewall() {
+        // An @annotation lowering legitimately produces internal
+        // f:reifies* fan-out at execute time via
+        // expand_edge_annotation_patterns. The firewall must NOT
+        // reject it at lower time, because the f:reifies* triples
+        // don't appear in the IR yet.
+        let result = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT * WHERE { ex:alice ex:worksFor ex:acme {| ex:role \"x\" |} . }",
+        );
+        assert!(
+            result.is_ok(),
+            "lower should not be rejected by the firewall"
         );
     }
 }

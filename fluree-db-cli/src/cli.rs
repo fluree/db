@@ -210,11 +210,25 @@ pub enum Commands {
         /// Accepts a single .ttl, .nt, .nq, .json, .jsonld, or .jsonl/.ndjson
         /// file, or a directory of .ttl/.nt/.nq/.trig, .jsonld, or
         /// .jsonl/.ndjson files (bulk import, bypasses novelty).
+        /// Also accepts `.csv` node/relationship files (neo4j-admin header
+        /// convention) — a single file or a directory of them.
         /// Any of these may carry a `.gz` or `.zst` suffix and is decoded
         /// transparently (e.g. `data.ttl.gz`, `dump.nq.zst`).
         /// Files in a directory are processed in lexicographic order.
         #[arg(long)]
         from: Option<PathBuf>,
+
+        /// CSV import: how properties on a relationship (edge) are stored.
+        /// `annotated` (default) keeps them as RDF 1.2 / LPG `@annotation`
+        /// (queryable from Cypher and SPARQL); `plain` drops them for pure RDF;
+        /// `nary` (an intermediate node) is not implemented yet.
+        #[arg(long, value_enum, default_value_t = EdgeProperties::Annotated)]
+        edge_properties: EdgeProperties,
+
+        /// CSV import: base IRI namespace for minted ids, predicates, and
+        /// classes (e.g. `--base-iri http://ldbc.example/`).
+        #[arg(long, default_value = "http://example.org/")]
+        base_iri: String,
 
         /// Import memory history from a git-tracked .fluree-memory/ directory.
         /// Each git commit becomes a Fluree transaction, enabling time-travel
@@ -456,7 +470,7 @@ pub enum Commands {
         #[arg(short = 'f', long = "file")]
         file: Option<PathBuf>,
 
-        /// Output format (json, typed-json, table, csv, or tsv)
+        /// Output format (json/jsonld, typed-json, table, csv, or tsv).
         #[arg(long, default_value = "table")]
         format: String,
 
@@ -1613,6 +1627,33 @@ pub enum InitFormat {
     Toml,
     /// JSON-LD format with @context
     Jsonld,
+}
+
+/// How properties on a relationship (edge) are stored when importing CSV — the
+/// only place node/edge data differs between an RDF and an RDF 1.2 / LPG load.
+/// Nodes and property-less edges are always plain RDF either way.
+#[derive(Debug, Clone, Copy, Default, ValueEnum)]
+pub enum EdgeProperties {
+    /// Edge properties → `@annotation` (RDF 1.2 / LPG). The base edge stays a
+    /// plain triple; the property is readable from both Cypher (`r.prop`) and
+    /// SPARQL (`{| … |}`). The default.
+    #[default]
+    Annotated,
+    /// Edge properties → an intermediate node (pure RDF 1.1, no reification).
+    /// Not implemented yet.
+    Nary,
+    /// Drop edge properties — every edge is a plain RDF 1.1 triple.
+    Plain,
+}
+
+impl From<EdgeProperties> for fluree_db_api::csv_import::EdgePolicy {
+    fn from(e: EdgeProperties) -> Self {
+        match e {
+            EdgeProperties::Annotated => Self::Annotated,
+            EdgeProperties::Nary => Self::Nary,
+            EdgeProperties::Plain => Self::Plain,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]

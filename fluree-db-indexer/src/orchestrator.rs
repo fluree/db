@@ -1206,6 +1206,15 @@ impl BackgroundIndexerWorker {
                 return;
             }
         };
+        // Per-job config: clone the worker's static config and stamp
+        // in the running ledger's attachment events when a provider
+        // is attached. The provider returning `None` (e.g. ledger not
+        // loaded into the running registry) becomes "delta unknown"
+        // in the indexer — see `IndexerConfig.attachment_events`.
+        let mut job_config = self.config.clone();
+        if let Some(provider) = self.config.attachment_events_provider.as_ref() {
+            job_config.attachment_events = provider.attachment_events(ledger_id).await;
+        }
         // Always create a fuel-enabled, no-limit tracker per build so each
         // background indexing pass is measured. Indexing never enforces a
         // limit — measurement only. The tally is logged on success and
@@ -1225,8 +1234,7 @@ impl BackgroundIndexerWorker {
         // that the no-NS `build_index_for_record_with_tracker` entry can't
         // populate on its own; errors degrade to `None` (serial fallback).
         // `force_serial_commit_walk` leaves it unset to A/B the serial baseline.
-        let mut build_config = self.config.clone();
-        build_config.pending_commit_cids = if build_config.force_serial_commit_walk {
+        job_config.pending_commit_cids = if job_config.force_serial_commit_walk {
             None
         } else {
             self.nameservice
@@ -1239,7 +1247,7 @@ impl BackgroundIndexerWorker {
             content_store,
             build_tracker.clone(),
             &record,
-            build_config,
+            job_config,
         )
         .await;
 

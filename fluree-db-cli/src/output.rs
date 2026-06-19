@@ -209,6 +209,24 @@ fn sparql_table_cell(
 
         // Grouped values must be disaggregated into multiple rows for SPARQL semantics.
         Binding::Grouped(_) => return Err(SparqlTableFastPath::NeedsDisaggregation),
+
+        // A path renders as arrow-joined node IRIs (Cypher-only; never reached
+        // via the SPARQL surface).
+        Binding::Path(nodes) => nodes
+            .iter()
+            .map(|sid| compact_bnode_strip(compactor.compact_sid_for_display(sid).ok()))
+            .collect::<Vec<_>>()
+            .join("->"),
+
+        // A list (Cypher collect/list value) — semicolon-joined cells; never
+        // reached via the SPARQL surface.
+        Binding::List(values) => {
+            let mut parts = Vec::with_capacity(values.len());
+            for v in values {
+                parts.push(sparql_table_cell(v, compactor, gv)?);
+            }
+            parts.join(";")
+        }
     };
     Ok(s)
 }

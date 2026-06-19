@@ -62,14 +62,14 @@ pub fn format(
                 b.schema()
                     .iter()
                     .copied()
-                    .filter(|&vid| !result.vars.name(vid).starts_with("?__"))
+                    .filter(|&vid| !super::is_internal_var_name(result.vars.name(vid)))
                     .collect()
             })
             .unwrap_or_else(|| {
                 result
                     .vars
                     .iter()
-                    .filter(|(name, _)| !name.starts_with("?__"))
+                    .filter(|(name, _)| !super::is_internal_var_name(name))
                     .map(|(_, id)| id)
                     .collect()
             })
@@ -234,6 +234,11 @@ fn write_term(
         Binding::Grouped(_) => {
             return Err(FormatError::InvalidBinding(
                 "Binding::Grouped should be disaggregated before SPARQL XML formatting".to_string(),
+            ));
+        }
+        Binding::Path(_) | Binding::List(_) => {
+            return Err(FormatError::InvalidBinding(
+                "SPARQL results have no path/list type (Cypher-only)".to_string(),
             ));
         }
         // Skipped by the caller; unreachable here.

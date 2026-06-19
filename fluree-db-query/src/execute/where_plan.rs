@@ -42,6 +42,239 @@ use std::sync::Arc;
 
 use super::pushdown::extract_bounds_from_filters;
 
+// ============================================================================
+// Edge-annotation IR expansion (M1b)
+// ============================================================================
+//
+// `Pattern::EdgeAnnotation { edge, annotation, body }` and
+// `Pattern::AnnotationTarget { annotation, edge, body }` are flattened
+// at planner time into the equivalent triple chain over the
+// `f:reifies*` system predicates. The standard scan / join machinery
+// handles the rest. This avoids a custom operator and exercises the
+// existing visibility / policy / dedup paths automatically — the
+// base edge triple's standard scan provides the visibility check for
+// the reverse direction "for free".
+
+/// Expand every `Pattern::EdgeAnnotation` / `Pattern::AnnotationTarget`
+/// in `patterns` into its triple-chain equivalent, recursing through
+/// every container pattern (`Optional`, `Union`, `Minus`, `Exists`,
+/// `NotExists`, `Graph`, `Service`, `Subquery`).
+///
+/// Each expanded triple chain is wrapped in
+/// [`Pattern::DefaultGraphSource`] so the f:reifies* lookups
+/// correlate per source under multi-source default-graph queries
+/// (`from: [g1, g2]`). The wrapper is suppressed when the expansion
+/// runs inside an explicit `Pattern::Graph` — that wrapper already
+/// scopes execution to a single graph per iteration, so the extra
+/// per-source layer would be redundant.
+///
+/// Exposed at crate scope so `/explain` can run the same expansion
+/// the executor does — otherwise edge-annotation queries would
+/// surface as empty in the explain output.
+pub fn expand_edge_annotation_patterns(patterns: &[Pattern]) -> Vec<Pattern> {
+    let mut out = Vec::with_capacity(patterns.len());
+    for p in patterns {
+        expand_one_into(p.clone(), &mut out, false);
+    }
+    out
+}
+
+/// Cheap, allocation-free check for any `Pattern::EdgeAnnotation` /
+/// `Pattern::AnnotationTarget` anywhere in the tree. Lets the WHERE
+/// planner skip the `expand_edge_annotation_patterns` clone+rebuild on
+/// the common non-RDF-1.2 path. Exhaustive over `Pattern` so a new
+/// container variant forces a decision here rather than silently hiding
+/// an annotation from expansion.
+pub(crate) fn pattern_tree_has_edge_annotation(patterns: &[Pattern]) -> bool {
+    patterns.iter().any(|p| match p {
+        Pattern::EdgeAnnotation { .. } | Pattern::AnnotationTarget { .. } => true,
+        Pattern::Optional(inner)
+        | Pattern::Minus(inner)
+        | Pattern::Exists(inner)
+        | Pattern::NotExists(inner) => pattern_tree_has_edge_annotation(inner),
+        Pattern::Union(branches) => branches.iter().any(|b| pattern_tree_has_edge_annotation(b)),
+        Pattern::Graph { patterns, .. } => pattern_tree_has_edge_annotation(patterns),
+        Pattern::Service(sp) => pattern_tree_has_edge_annotation(&sp.patterns),
+        Pattern::Subquery(sq) => pattern_tree_has_edge_annotation(&sq.patterns),
+        Pattern::DefaultGraphSource { patterns } => pattern_tree_has_edge_annotation(patterns),
+        Pattern::Triple(_)
+        | Pattern::PropertyPath(_)
+        | Pattern::ShortestPath(_)
+        | Pattern::Filter(_)
+        | Pattern::Bind { .. }
+        | Pattern::Unwind { .. }
+        | Pattern::Values { .. }
+        | Pattern::IndexSearch(_)
+        | Pattern::VectorSearch(_)
+        | Pattern::R2rml(_)
+        | Pattern::GeoSearch(_)
+        | Pattern::S2Search(_) => false,
+    })
+}
+
+fn expand_one_into(pattern: Pattern, out: &mut Vec<Pattern>, inside_graph: bool) {
+    match pattern {
+        Pattern::EdgeAnnotation {
+            edge,
+            annotation,
+            body,
+        }
+        | Pattern::AnnotationTarget {
+            annotation,
+            edge,
+            body,
+        } => {
+            // Build the triple chain (base edge + three f:reifies*
+            // triples + recursively expanded body) into a local
+            // vector. The whole chain then gets wrapped in
+            // `Pattern::DefaultGraphSource` so the per-source
+            // iteration correlates them; the wrapper is skipped when
+            // we're already inside an explicit `Pattern::Graph`,
+            // which provides graph correlation by construction.
+            let mut chain: Vec<Pattern> = Vec::new();
+
+            // 1. Base edge triple: provides visibility for both
+            //    directions. The standard scan applies snapshot rules
+            //    + policy filters here, so an `AnnotationTarget`
+            //    operator-style visibility check is redundant.
+            chain.push(Pattern::Triple(edge.clone()));
+
+            // 2. Three required `f:reifies*` lookup triples that bind
+            //    the annotation to the edge.
+            let ann_ref = annotation.clone();
+            let id_dt = fluree_db_core::edge::id_datatype_sid();
+            chain.push(Pattern::Triple(TriplePattern {
+                s: ann_ref.clone(),
+                p: reifies_subject_ref(),
+                o: edge.s.clone().into(),
+                dtc: Some(fluree_db_core::DatatypeConstraint::Explicit(id_dt.clone())),
+            }));
+            chain.push(Pattern::Triple(TriplePattern {
+                s: ann_ref.clone(),
+                p: reifies_predicate_ref(),
+                o: edge.p.clone().into(),
+                dtc: Some(fluree_db_core::DatatypeConstraint::Explicit(id_dt)),
+            }));
+            // f:reifiesObject — preserves the original object's
+            // datatype constraint via `dtc` so typed-equality matches
+            // round-trip. For language-tagged literals
+            // (`DatatypeConstraint::LangTag`) this same clone is the
+            // intended per-language disambiguator: the writer DOES
+            // store the language tag on the f:reifiesObject flake's
+            // `m.lang` (verified by `it_edge_annotations::
+            // cross_language_annotation_does_not_cross_match` —
+            // both flakes carry `dt=rdf:langString,
+            // m.lang=Some(<tag>)`), so the LangTag dtc filter in
+            // `binary_scan` should pick exactly one annotation per
+            // language. This per-language disambiguation is exercised
+            // and green via `it_edge_annotations::
+            // cross_language_annotation_does_not_cross_match` (the
+            // executor honors the `dtc` LangTag filter; the earlier
+            // `#[ignore]`d gap was fixed in commit c3117574e).
+            chain.push(Pattern::Triple(TriplePattern {
+                s: ann_ref,
+                p: reifies_object_ref(),
+                o: edge.o.clone(),
+                dtc: edge.dtc.clone(),
+            }));
+
+            // 3. Body patterns (recursively expanded so nested
+            //    annotations — though M0 rejects them — flatten too).
+            //    The body inherits this expansion's wrapper context
+            //    (already inside the chain we'll wrap below).
+            for inner in body {
+                expand_one_into(inner, &mut chain, true);
+            }
+
+            // f:reifiesGraph is NOT emitted as a separate constraint
+            // triple — the `DefaultGraphSource` wrapper handles
+            // per-source correlation by switching execution context to
+            // one source at a time, so all f:reifies* triples scope to
+            // the same graph per iteration. The cross-graph misjoin
+            // (N×M cross-product under `from: [g1, g2]`) that
+            // motivated this wrapper is resolved by the per-source
+            // iteration.
+
+            if inside_graph {
+                // Already inside a `Pattern::Graph` wrapper — the
+                // existing wrapper scopes the inner subplan to one
+                // graph per iteration, so no extra correlation
+                // layer is needed.
+                out.extend(chain);
+            } else {
+                out.push(Pattern::DefaultGraphSource { patterns: chain });
+            }
+        }
+
+        // Recurse into compound containers so nested EdgeAnnotation
+        // patterns inside Optional/Union/Minus/Exists/NotExists/
+        // Graph/Service/Subquery get expanded too. The `map_subpatterns`
+        // helper rebuilds the surrounding container around the result.
+        Pattern::Graph { .. } => {
+            // Inside an explicit Pattern::Graph, expansion must
+            // suppress the DefaultGraphSource wrapper — propagate
+            // `inside_graph = true`.
+            let expanded = pattern
+                .map_subpatterns(&mut |inner| expand_edge_annotation_patterns_inside_graph(&inner));
+            out.push(expanded);
+        }
+        Pattern::Optional(_)
+        | Pattern::Minus(_)
+        | Pattern::Exists(_)
+        | Pattern::NotExists(_)
+        | Pattern::Union(_)
+        | Pattern::Service(_)
+        | Pattern::Subquery(_)
+        | Pattern::DefaultGraphSource { .. } => {
+            // Container patterns inherit the current `inside_graph`
+            // context.
+            let was_inside = inside_graph;
+            let expanded = pattern.map_subpatterns(&mut |inner| {
+                let mut out = Vec::with_capacity(inner.len());
+                for p in inner {
+                    expand_one_into(p, &mut out, was_inside);
+                }
+                out
+            });
+            out.push(expanded);
+        }
+
+        other => out.push(other),
+    }
+}
+
+/// Recursive entry that propagates `inside_graph = true`. Used by the
+/// `Pattern::Graph` arm above so its inner subtree doesn't synthesize
+/// a redundant `DefaultGraphSource`.
+fn expand_edge_annotation_patterns_inside_graph(patterns: &[Pattern]) -> Vec<Pattern> {
+    let mut out = Vec::with_capacity(patterns.len());
+    for p in patterns {
+        expand_one_into(p.clone(), &mut out, true);
+    }
+    out
+}
+
+fn reifies_subject_ref() -> Ref {
+    Ref::Sid(fluree_db_core::Sid::new(
+        fluree_vocab::namespaces::FLUREE_DB,
+        fluree_vocab::db::REIFIES_SUBJECT,
+    ))
+}
+
+fn reifies_predicate_ref() -> Ref {
+    Ref::Sid(fluree_db_core::Sid::new(
+        fluree_vocab::namespaces::FLUREE_DB,
+        fluree_vocab::db::REIFIES_PREDICATE,
+    ))
+}
+
+fn reifies_object_ref() -> Ref {
+    Ref::Sid(fluree_db_core::Sid::new(
+        fluree_vocab::namespaces::FLUREE_DB,
+        fluree_vocab::db::REIFIES_OBJECT,
+    ))
+}
+
 #[inline]
 fn filter_not_bound_var(expr: &Expression) -> Option<VarId> {
     match expr {
@@ -275,6 +508,14 @@ pub fn collect_var_stats(
                         vars.insert(v);
                     }
                 }
+                Pattern::Unwind { var, list } => {
+                    bump_count(counts, *var);
+                    vars.insert(*var);
+                    for v in list.referenced_vars() {
+                        bump_count(counts, v);
+                        vars.insert(v);
+                    }
+                }
                 Pattern::Filter(expr) => {
                     for v in expr.referenced_vars() {
                         bump_count(counts, v);
@@ -309,6 +550,33 @@ pub fn collect_var_stats(
                         bump_count(counts, v);
                         vars.insert(v);
                     }
+                }
+                Pattern::ShortestPath(sp) => {
+                    for v in sp.referenced_vars() {
+                        bump_count(counts, v);
+                        vars.insert(v);
+                    }
+                    bump_count(counts, sp.path_var);
+                    vars.insert(sp.path_var);
+                }
+                // The DefaultGraphSource wrapper is structurally
+                // transparent — its inner patterns are part of the
+                // surrounding WHERE clause for join / var-counting
+                // purposes. Walking into it is required so vars that
+                // bridge the wrapper (e.g. `?ann` used both inside
+                // the wrapped f:reifies* chain AND in a sibling
+                // triple outside) are counted as join vars and not
+                // pruned from sibling scan outputs.
+                //
+                // Without this, the per-language pinning test
+                // `cross_language_annotation_does_not_cross_match`
+                // mis-joins: the sibling `?ann ex:source ?src` scan
+                // sees `?ann.count == 1` and emits only `?src`,
+                // the wrapper's inner subplan binds `?ann`
+                // independently, and the merge yields a cartesian
+                // product over `?src`.
+                Pattern::DefaultGraphSource { patterns } => {
+                    walk(patterns, counts, vars);
                 }
                 _ => {}
             }
@@ -1342,6 +1610,83 @@ pub fn build_where_operators_seeded(
     )
 }
 
+/// Drop provably-redundant `?s rdf:type <C>` filters from a conjunctive block.
+///
+/// When `?s` is the subject of a concrete predicate `P` elsewhere in the block
+/// and stats prove every subject of `P` is an instance of `C`
+/// (`predicate_subjects_all_in_class_by_iri` — the count of `P`-flakes from
+/// `C`-typed subjects equals `P`'s total flake count), the `rdf:type` triple
+/// matches every row and binds nothing new (constant class object; `?s` stays
+/// bound by `P`), so it is sound to remove. The stats method is itself gated to
+/// trustworthy current-state coverage; this adds the current-state plan gate and
+/// the structural "`?s` is otherwise bound by `P`" requirement.
+///
+/// Operates only on the supplied top-level conjunctive list — nested
+/// GRAPH/OPTIONAL/UNION/subquery scopes are left untouched. Returns `None` when
+/// nothing is elided so callers can keep borrowing the original slice.
+fn elide_redundant_type_filters(
+    patterns: &[Pattern],
+    stats: Option<&StatsView>,
+    planning: &PlanningContext,
+) -> Option<Vec<Pattern>> {
+    if planning.is_history() {
+        return None;
+    }
+    let stats = stats?;
+    if !stats.class_coverage_trustworthy {
+        return None;
+    }
+
+    // Concrete (IRI) predicates each variable is the SUBJECT of, excluding rdf:type.
+    let mut subject_preds: HashMap<VarId, Vec<Arc<str>>> = HashMap::new();
+    for p in patterns {
+        if let Pattern::Triple(tp) = p {
+            if let (Ref::Var(s), Ref::Iri(pred)) = (&tp.s, &tp.p) {
+                if !tp.p.is_rdf_type() {
+                    subject_preds.entry(*s).or_default().push(pred.clone());
+                }
+            }
+        }
+    }
+    if subject_preds.is_empty() {
+        return None;
+    }
+
+    let mut remove = vec![false; patterns.len()];
+    let mut any = false;
+    for (i, p) in patterns.iter().enumerate() {
+        let Pattern::Triple(tp) = p else { continue };
+        if !tp.p.is_rdf_type() {
+            continue;
+        }
+        let Ref::Var(s) = &tp.s else { continue };
+        let Term::Iri(class_iri) = &tp.o else {
+            continue;
+        };
+        let Some(preds) = subject_preds.get(s) else {
+            continue;
+        };
+        if preds
+            .iter()
+            .any(|pred| stats.predicate_subjects_all_in_class_by_iri(pred, class_iri))
+        {
+            remove[i] = true;
+            any = true;
+        }
+    }
+    if !any {
+        return None;
+    }
+    Some(
+        patterns
+            .iter()
+            .zip(remove)
+            .filter(|(_, drop)| !drop)
+            .map(|(p, _)| p.clone())
+            .collect(),
+    )
+}
+
 /// Build WHERE operators with an optional initial seed operator and explicit needed-vars + GROUP BY keys.
 ///
 /// Handles all pattern types: Triple, VALUES, BIND, FILTER, OPTIONAL, UNION,
@@ -1378,6 +1723,34 @@ pub fn build_where_operators_seeded_with_needed(
         // Empty patterns = one row with empty schema
         return Ok(seed.unwrap_or_else(|| Box::new(EmptyOperator::new())));
     }
+
+    // Edge-annotation expansion (M1b): Pattern::EdgeAnnotation /
+    // Pattern::AnnotationTarget are flattened into the equivalent base
+    // edge plus four `f:reifies*` triple lookups plus the body. The
+    // standard scan/join machinery handles the rest. The base-edge
+    // triple is always emitted, which gives the
+    // `Pattern::AnnotationTarget` reverse direction its required
+    // visibility check for free: the base edge must be currently
+    // asserted under the snapshot's normal policy/visibility rules,
+    // or no row survives the join.
+    // Skip the clone+rebuild entirely when the block has no edge-annotation
+    // patterns (the overwhelmingly common, non-RDF-1.2 case): borrow the
+    // original slice instead of allocating an expanded copy. The presence
+    // check is allocation-free and exhaustive, so behavior is identical
+    // whenever annotations are actually present.
+    let expanded_storage: std::borrow::Cow<'_, [Pattern]> =
+        if pattern_tree_has_edge_annotation(patterns) {
+            std::borrow::Cow::Owned(expand_edge_annotation_patterns(patterns))
+        } else {
+            std::borrow::Cow::Borrowed(patterns)
+        };
+    let patterns: &[Pattern] = &expanded_storage;
+
+    // Drop provably-redundant `?s rdf:type <C>` filters before planning. The
+    // membership check costs a per-row index seek over the whole block but
+    // removes no rows when stats prove the predicate's subjects are all `C`.
+    let elided_storage = elide_redundant_type_filters(patterns, stats.as_deref(), planning);
+    let patterns: &[Pattern] = elided_storage.as_deref().unwrap_or(patterns);
 
     // Apply generalized pattern reordering upfront for all pattern lists.
     //
@@ -1850,6 +2223,36 @@ pub fn build_where_operators_seeded_with_needed(
                 i += 1;
             }
 
+            Pattern::ShortestPath(sp) => {
+                // Anchored shortest-path search. Endpoints come from a preceding
+                // pattern; seed an empty child if this somehow lands at pos 0
+                // (constant endpoints) so the operator always has an input row.
+                let child = get_or_empty_seed(operator.take());
+                let augmented_rwv = augmented_at(i + 1);
+                let augmented_ref = augmented_rwv.as_deref();
+
+                operator = Some(Box::new(
+                    crate::shortest_path::ShortestPathOperator::with_defaults(child, sp.clone())
+                        .with_out_schema(augmented_ref),
+                ));
+                i += 1;
+            }
+
+            Pattern::Unwind { var, list } => {
+                // UNWIND a runtime list expression — fan each input row out over
+                // the list elements. Correlated: the list expr reads bound vars
+                // from the child (seed an empty row if at position 0).
+                let child = get_or_empty_seed(operator.take());
+                let augmented_rwv = augmented_at(i + 1);
+                let augmented_ref = augmented_rwv.as_deref();
+
+                operator = Some(Box::new(
+                    crate::unwind::UnwindOperator::new(child, *var, list.clone())
+                        .with_out_schema(augmented_ref),
+                ));
+                i += 1;
+            }
+
             Pattern::Subquery(sq) => {
                 // Subquery - execute nested query and merge results
                 let child = require_child(operator, "SUBQUERY pattern")?;
@@ -1941,6 +2344,24 @@ pub fn build_where_operators_seeded_with_needed(
                 i += 1;
             }
 
+            Pattern::DefaultGraphSource {
+                patterns: inner_patterns,
+            } => {
+                // Internal — synthesized by `expand_edge_annotation_patterns`
+                // to correlate the f:reifies* triple chain with a single
+                // default-graph source under multi-source default queries.
+                let child = require_child(operator, "DEFAULT-GRAPH-SOURCE pattern")?;
+                operator = Some(Box::new(
+                    crate::default_graph_source::DefaultGraphSourceOperator::new(
+                        child,
+                        inner_patterns.clone(),
+                        *planning,
+                        stats.clone(),
+                    ),
+                ));
+                i += 1;
+            }
+
             Pattern::Service(service_pattern) => {
                 // SERVICE pattern - execute patterns against another ledger
                 let child = require_child(operator, "SERVICE pattern")?;
@@ -1950,6 +2371,20 @@ pub fn build_where_operators_seeded_with_needed(
                     *planning,
                 )));
                 i += 1;
+            }
+
+            // Edge-annotation patterns are flattened by
+            // `expand_edge_annotation_patterns` at the top of
+            // `build_where_operators_seeded_with_needed`, so this
+            // dispatch arm is unreachable from any standard entry
+            // point. Keep the guard for safety in case a future
+            // caller bypasses the expansion pass.
+            Pattern::EdgeAnnotation { .. } | Pattern::AnnotationTarget { .. } => {
+                return Err(QueryError::Internal(
+                    "edge-annotation pattern reached the operator dispatch \
+                     without being flattened by expand_edge_annotation_patterns"
+                        .to_string(),
+                ));
             }
         }
     }
@@ -2349,6 +2784,103 @@ mod tests {
             Ref::Sid(Sid::new(100, p_name)),
             Term::Var(o_var),
         )
+    }
+
+    // --- redundant rdf:type elision ---------------------------------------
+
+    fn coverage_stats(pred: &str, class: &str, total: u64, covered: u64, trust: bool) -> StatsView {
+        let mut v = StatsView::default();
+        v.class_coverage_trustworthy = trust;
+        v.properties_by_iri.insert(
+            Arc::from(pred),
+            PropertyStatData {
+                count: total,
+                ndv_values: 0,
+                ndv_subjects: 0,
+            },
+        );
+        let mut by_class = HashMap::new();
+        by_class.insert(Arc::from(class), covered);
+        v.predicate_class_subject_counts_by_iri
+            .insert(Arc::from(pred), by_class);
+        v
+    }
+
+    /// `?0 P ?1 . ?0 rdf:type <C>` — `?0` is the subject of `P` and bound by it.
+    fn pred_then_type(pred: &str, class: &str) -> Vec<Pattern> {
+        vec![
+            Pattern::Triple(TriplePattern::new(
+                Ref::Var(VarId(0)),
+                Ref::Iri(Arc::from(pred)),
+                Term::Var(VarId(1)),
+            )),
+            Pattern::Triple(TriplePattern::new(
+                Ref::Var(VarId(0)),
+                Ref::Iri(Arc::from(fluree_vocab::rdf::TYPE)),
+                Term::Iri(Arc::from(class)),
+            )),
+        ]
+    }
+
+    #[test]
+    fn elides_redundant_type_when_predicate_subjects_all_in_class() {
+        let stats = coverage_stats("ex:p", "ex:C", 10, 10, true);
+        let patterns = pred_then_type("ex:p", "ex:C");
+        let out =
+            elide_redundant_type_filters(&patterns, Some(&stats), &PlanningContext::current())
+                .expect("redundant rdf:type should be elided");
+        assert_eq!(out.len(), 1, "the rdf:type triple should be dropped");
+        assert!(
+            matches!(&out[0], Pattern::Triple(tp) if !tp.p.is_rdf_type()),
+            "the surviving triple is the binding predicate, not rdf:type"
+        );
+    }
+
+    #[test]
+    fn keeps_selective_type_filter() {
+        // Predicate has 10 flakes but only 5 from class C -> not covering -> keep.
+        let stats = coverage_stats("ex:p", "ex:C", 10, 5, true);
+        let patterns = pred_then_type("ex:p", "ex:C");
+        assert!(
+            elide_redundant_type_filters(&patterns, Some(&stats), &PlanningContext::current())
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn no_elision_when_coverage_untrustworthy() {
+        let stats = coverage_stats("ex:p", "ex:C", 10, 10, false);
+        let patterns = pred_then_type("ex:p", "ex:C");
+        assert!(
+            elide_redundant_type_filters(&patterns, Some(&stats), &PlanningContext::current())
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn no_elision_in_history_mode() {
+        let stats = coverage_stats("ex:p", "ex:C", 10, 10, true);
+        let patterns = pred_then_type("ex:p", "ex:C");
+        assert!(
+            elide_redundant_type_filters(&patterns, Some(&stats), &PlanningContext::history())
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn no_elision_when_type_is_sole_binder() {
+        // `?0 rdf:type <C>` with no other predicate on ?0: the type triple is the
+        // only thing binding ?0, so dropping it would change semantics.
+        let stats = coverage_stats("ex:p", "ex:C", 10, 10, true);
+        let patterns = vec![Pattern::Triple(TriplePattern::new(
+            Ref::Var(VarId(0)),
+            Ref::Iri(Arc::from(fluree_vocab::rdf::TYPE)),
+            Term::Iri(Arc::from("ex:C")),
+        ))];
+        assert!(
+            elide_redundant_type_filters(&patterns, Some(&stats), &PlanningContext::current())
+                .is_none()
+        );
     }
 
     #[test]
@@ -3594,6 +4126,105 @@ mod tests {
 
         let hint = scan_index_hint_for_triple(&tp, &[], &[filter]);
         assert_eq!(hint, None);
+    }
+
+    // ---------------------------------------------------------------------
+    // Edge-annotation expansion — `f:reifiesObject` dtc propagation
+    // ---------------------------------------------------------------------
+
+    fn find_reifies_object_triple(chain: &[Pattern]) -> &TriplePattern {
+        let reifies_object = Ref::Sid(Sid::new(
+            fluree_vocab::namespaces::FLUREE_DB,
+            fluree_vocab::db::REIFIES_OBJECT,
+        ));
+        chain
+            .iter()
+            .find_map(|p| match p {
+                Pattern::Triple(tp) if tp.p == reifies_object => Some(tp),
+                _ => None,
+            })
+            .expect("synthesized f:reifiesObject lookup triple must be present in chain")
+    }
+
+    fn unwrap_default_graph_source(p: &Pattern) -> &[Pattern] {
+        match p {
+            Pattern::DefaultGraphSource { patterns } => patterns,
+            other => panic!("expected Pattern::DefaultGraphSource, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn expand_edge_annotation_propagates_explicit_dtc_to_reifies_object() {
+        let xsd_string = fluree_db_core::DatatypeConstraint::Explicit(Sid::new(2, "string"));
+        let edge = TriplePattern {
+            s: Ref::Var(VarId(0)),
+            p: Ref::Sid(Sid::new(100, "name")),
+            o: Term::Value(FlakeValue::String("Alice".to_string())),
+            dtc: Some(xsd_string.clone()),
+        };
+        let patterns = vec![Pattern::EdgeAnnotation {
+            edge,
+            annotation: Ref::Var(VarId(1)),
+            body: Vec::new(),
+        }];
+        let expanded = expand_edge_annotation_patterns(&patterns);
+        assert_eq!(
+            expanded.len(),
+            1,
+            "expansion produces one DefaultGraphSource wrapper"
+        );
+        let chain = unwrap_default_graph_source(&expanded[0]);
+        let reifies_obj = find_reifies_object_triple(chain);
+        assert_eq!(reifies_obj.dtc, Some(xsd_string));
+    }
+
+    #[test]
+    fn expand_edge_annotation_propagates_lang_tag_dtc_to_reifies_object() {
+        // The regression that motivates per-language disambiguation:
+        // a language-tagged literal on the base edge must constrain the
+        // synthesized f:reifiesObject lookup by the same lang tag, or
+        // same-lexical strings in different languages would cross-match.
+        let lang_fr = fluree_db_core::DatatypeConstraint::LangTag(std::sync::Arc::from("fr"));
+        let edge = TriplePattern {
+            s: Ref::Var(VarId(0)),
+            p: Ref::Sid(Sid::new(100, "label")),
+            o: Term::Value(FlakeValue::String("chat".to_string())),
+            dtc: Some(lang_fr.clone()),
+        };
+        let patterns = vec![Pattern::EdgeAnnotation {
+            edge,
+            annotation: Ref::Var(VarId(1)),
+            body: Vec::new(),
+        }];
+        let expanded = expand_edge_annotation_patterns(&patterns);
+        let chain = unwrap_default_graph_source(&expanded[0]);
+        let reifies_obj = find_reifies_object_triple(chain);
+        match &reifies_obj.dtc {
+            Some(fluree_db_core::DatatypeConstraint::LangTag(tag)) => {
+                assert_eq!(tag.as_ref(), "fr");
+            }
+            other => panic!("expected LangTag dtc on f:reifiesObject, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn expand_edge_annotation_no_dtc_when_edge_has_none() {
+        // Ref-object edge: no constraint on either side.
+        let edge = TriplePattern {
+            s: Ref::Var(VarId(0)),
+            p: Ref::Sid(Sid::new(100, "worksFor")),
+            o: Term::Var(VarId(2)),
+            dtc: None,
+        };
+        let patterns = vec![Pattern::EdgeAnnotation {
+            edge,
+            annotation: Ref::Var(VarId(1)),
+            body: Vec::new(),
+        }];
+        let expanded = expand_edge_annotation_patterns(&patterns);
+        let chain = unwrap_default_graph_source(&expanded[0]);
+        let reifies_obj = find_reifies_object_triple(chain);
+        assert!(reifies_obj.dtc.is_none());
     }
 
     // ========================================================================

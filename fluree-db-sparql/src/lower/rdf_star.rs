@@ -48,6 +48,23 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
         for tp in patterns {
             match &tp.subject {
                 SubjectTerm::QuotedTriple(qt) => {
+                    // The legacy quoted-triple path (`<< s p o >> f:t ?t`)
+                    // is the f:t / f:op metadata annotation form — it
+                    // has no representation for an RDF 1.2 annotation
+                    // tail (`{| ... |}`). Silently dropping the tail
+                    // would lose user intent without warning; reject
+                    // explicitly. Users who want annotations on the
+                    // inner triple should write the standard form
+                    // `s p o {| ... |}` instead.
+                    if tp.annotation.is_some() {
+                        return Err(LowerError::not_implemented(
+                            "RDF 1.2 annotation tail (`{| ... |}`) is not supported on \
+                             legacy RDF-star quoted-triple patterns (`<< s p o >> ...`); \
+                             write the annotation directly on the inner triple as \
+                             `s p o {| ... |}` instead",
+                            qt.span,
+                        ));
+                    }
                     // Check if this quoted triple was already processed
                     let object_var = if let Some(&var_id) = processed_quoted_triples.get(&qt.span) {
                         var_id
@@ -100,9 +117,22 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                     }
                 }
                 _ => {
-                    // Regular triple pattern
-                    let lowered = self.lower_triple_pattern(tp)?;
-                    result.push(Pattern::Triple(lowered));
+                    // RDF 1.2 annotation tail: when a triple carries
+                    // `~ reifier? {| ... |}`, lower through the
+                    // annotation path so it becomes a
+                    // `Pattern::EdgeAnnotation` IR node. Otherwise
+                    // lower as an ordinary triple.
+                    if super::annotation::triple_has_annotation(tp) {
+                        let ann = tp
+                            .annotation
+                            .as_ref()
+                            .expect("triple_has_annotation guarantees Some");
+                        let pattern = self.lower_annotated_triple(tp, ann)?;
+                        result.push(pattern);
+                    } else {
+                        let lowered = self.lower_triple_pattern(tp)?;
+                        result.push(Pattern::Triple(lowered));
+                    }
                 }
             }
         }

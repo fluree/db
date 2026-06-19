@@ -919,6 +919,10 @@ pub fn estimate_pattern(
 
         Pattern::Filter(_) | Pattern::Bind { .. } => PatternEstimate::Deferred,
 
+        // UNWIND a runtime list — defer until the list expression's vars are
+        // bound (it reads them per row), like a correlated Bind.
+        Pattern::Unwind { .. } => PatternEstimate::Deferred,
+
         Pattern::IndexSearch(isp) => PatternEstimate::Source {
             row_count: isp.limit.map_or(DEFAULT_SEARCH_LIMIT, |l| l as f64),
         },
@@ -955,12 +959,35 @@ pub fn estimate_pattern(
             PatternEstimate::Source { row_count }
         }
 
+        // Anchored shortest-path must run after both endpoints are bound.
+        // Defer it on its referenced (endpoint) vars, like a correlated
+        // subquery, so reorder never hoists it ahead of its inputs.
+        Pattern::ShortestPath(_) => PatternEstimate::Deferred,
+
         Pattern::R2rml(_) => PatternEstimate::Source {
             row_count: DEFAULT_PROPERTY_SCAN_SELECTIVITY,
         },
 
         Pattern::Service(_) => PatternEstimate::Source {
             row_count: DEFAULT_SERVICE_ROW_COUNT,
+        },
+
+        // Edge-annotation patterns (M0): treated as a `Source` with the
+        // wrapped edge's cardinality as a first approximation. Real
+        // cost-based selection between edge-first and annotation-first
+        // scans arrives in M3 alongside `AnnotationStats`.
+        Pattern::EdgeAnnotation { edge, .. } | Pattern::AnnotationTarget { edge, .. } => {
+            PatternEstimate::Source {
+                row_count: estimate_triple_row_count(edge, bound_vars, stats),
+            }
+        }
+
+        // DefaultGraphSource wraps an inner subplan and runs it once
+        // per default-graph source. Cost is modeled like Graph — the
+        // inner branch's cardinality, scaled implicitly by the source
+        // count at runtime.
+        Pattern::DefaultGraphSource { patterns, .. } => PatternEstimate::Source {
+            row_count: estimate_branch_cardinality(patterns, stats),
         },
     }
 }
@@ -1434,16 +1461,20 @@ fn connected_or_fallback_pool(
     }
 }
 
-/// Seed-candidate pool, phase 2: drop disconnected `rdf:type <const>` class
-/// anchors so a broad class extension cannot win the seed and flip the chain
-/// into a scattered reverse object-drive (the IC3 `home:Country` case).
+/// Seed-candidate pool, phase 2: drop "broad index" sources so they cannot win
+/// the seed and flip the chain into a scattered reverse object-drive:
+///   * disconnected `rdf:type <const>` class anchors (the IC3 chain-A
+///     `home:Country` reverse-drive), and
+///   * RDF-star annotation sidecars `?ann f:reifiesSubject/Object ?x`, which
+///     index every annotated edge — seeding from one scans the whole sidecar
+///     instead of driving the concrete base edge / `f:reifiesPredicate`
+///     discriminator (the IC5 `HAS_MEMBER` reified-edge case).
 ///
 /// Applies ONLY when a pipeline is active (bound vars or a producer) AND a
-/// connected alternative exists — otherwise the class anchor IS the legitimate
-/// seed and is kept. Deliberately narrow: only class anchors are demoted (a
-/// selective property-value anchor such as `?c name "X"` is never an
-/// [`is_disconnected_class_anchor`] and stays), and demotion never empties the
-/// pool. Returns `base_pool` unchanged when nothing is demoted.
+/// connected alternative exists — otherwise the broad source IS the legitimate
+/// seed and is kept. Deliberately narrow: a selective property-value anchor such
+/// as `?c name "X"` is never demoted, and demotion never empties the pool.
+/// Returns `base_pool` unchanged when nothing is demoted.
 fn demote_disconnected_class_anchors(
     base_pool: Vec<usize>,
     remaining: &[RankedPattern],
@@ -1462,7 +1493,11 @@ fn demote_disconnected_class_anchors(
     let demoted: Vec<usize> = base_pool
         .iter()
         .copied()
-        .filter(|&i| !is_disconnected_class_anchor(&remaining[i].pattern, bound_vars, anchor_vars))
+        .filter(|&i| {
+            let p = &remaining[i].pattern;
+            !is_disconnected_class_anchor(p, bound_vars, anchor_vars)
+                && !is_broad_annotation_sidecar(p)
+        })
         .collect();
     if demoted.is_empty() {
         base_pool
@@ -1523,12 +1558,36 @@ fn rank_seed_candidates(
         .then_with(|| remaining[i].orig_index.cmp(&remaining[j].orig_index))
 }
 
+/// A broad RDF-star annotation *sidecar* triple: `?ann f:reifiesSubject ?s` or
+/// `?ann f:reifiesObject ?o`. These index every annotated edge in the ledger, so
+/// seeding from one (e.g. `?ann f:reifiesObject ?friend`) scans the whole
+/// annotation sidecar before the concrete base edge or the `f:reifiesPredicate`
+/// discriminator narrows it to one predicate — like scanning a global secondary
+/// index before choosing the table. `f:reifiesPredicate` is deliberately NOT
+/// matched: its object is the concrete base predicate, so it *is* the
+/// discriminator and a good driver. Demoted from the seed pool by
+/// [`try_place_source`] whenever a connected alternative (the base edge) exists.
+fn is_broad_annotation_sidecar(pattern: &Pattern) -> bool {
+    let Pattern::Triple(tp) = pattern else {
+        return false;
+    };
+    match &tp.p {
+        Ref::Sid(sid) => {
+            sid.namespace_code == fluree_vocab::namespaces::FLUREE_DB
+                && (sid.name.as_ref() == fluree_vocab::db::REIFIES_SUBJECT
+                    || sid.name.as_ref() == fluree_vocab::db::REIFIES_OBJECT)
+        }
+        _ => false,
+    }
+}
+
 /// Try to place the best source. Returns true if one was placed.
 ///
 /// Three phases (each a named helper): build the connected/fallback candidate
-/// pool, demote disconnected `rdf:type <const>` class anchors when a connected
-/// alternative exists (the IC3 guard — see [`demote_disconnected_class_anchors`]),
-/// then pick the best by [`rank_seed_candidates`]. `anchor_vars` are the outputs
+/// pool, demote broad-index sources — disconnected `rdf:type <const>` class
+/// anchors and RDF-star annotation sidecars — when a connected alternative
+/// exists (see [`demote_disconnected_class_anchors`]), then pick the best by
+/// [`rank_seed_candidates`]. `anchor_vars` are the outputs
 /// of uncorrelated WITH-subquery producers (see `reorder_patterns`) — a
 /// pseudo-bound pipeline component for both the connectivity test and the
 /// demotion guard.
@@ -1642,9 +1701,14 @@ fn drain_ready_deferred(
                 .last_mut()
                 .is_some_and(|last| try_nest_deferred(last, &dp));
 
-            // BIND produces a new variable; FILTER does not.
-            if let Pattern::Bind { var, .. } = &dp.pattern {
-                bound_vars.insert(*var);
+            // A deferred pattern's produced variables must enter the bound set
+            // so later patterns referencing them place after and correlate.
+            // This covers BIND/UNWIND (their target var) and a deferred
+            // ShortestPath (its path var) — without it, e.g. an UNWIND that
+            // reads a deferred shortestPath's path never becomes ready and
+            // lands after a property accessor on the unwound var, cross-joining.
+            for v in dp.pattern.produced_vars() {
+                bound_vars.insert(v);
             }
 
             if !nested {
@@ -1691,22 +1755,46 @@ fn subquery_correlation_vars(
     }
     // Variables the subquery binds in EVERY solution on its own — but only when
     // no inner slice makes per-row seeding result-sensitive. Restricted to
-    // top-level required producers (triples / property paths) so a var that is
-    // only conditionally bound (UNION branch, OPTIONAL) is NOT declassified.
+    // top-level UNCONDITIONAL producers so a var that is only conditionally
+    // bound (UNION branch, OPTIONAL) is NOT declassified. Besides triples /
+    // property paths this must include the WITH-pipeline binders — UNWIND, BIND,
+    // VALUES — otherwise a var the subquery produces via one of them is
+    // mistaken for an external correlation, the subquery is deferred on a var
+    // only it can bind (so it never becomes ready and is placed last), and a
+    // consuming OPTIONAL/Filter runs first uncorrelated, clobbering that var.
     let self_produced: HashSet<VarId> = if sq.limit.is_none() && sq.offset.is_none() {
         sq.patterns
             .iter()
-            .filter(|p| matches!(p, Pattern::Triple(_) | Pattern::PropertyPath(_)))
+            .filter(|p| {
+                matches!(
+                    p,
+                    Pattern::Triple(_)
+                        | Pattern::PropertyPath(_)
+                        | Pattern::Unwind { .. }
+                        | Pattern::Bind { .. }
+                        | Pattern::Values { .. }
+                )
+            })
             .flat_map(Pattern::produced_vars)
             .collect()
     } else {
         HashSet::new()
     };
+    // A correlation input must be bound BEFORE the subquery runs, so only a
+    // PRECEDING sibling can supply one. A following sibling that re-produces a
+    // select var is a downstream CONSUMER, not a correlation — e.g. the Cypher
+    // WITH pipeline `… WITH m [ORDER BY m.x] LIMIT n  MATCH (m)-…`: the WITH
+    // lowers to this subquery and the trailing MATCH (plus the deterministic
+    // `?#__prop_m_x` accessor a later `RETURN m.x` shares) re-produces `m`/`m.x`
+    // AFTER it. Without the position guard those looked like correlations on a
+    // sliced subquery (slice empties `self_produced`), so the WITH was deferred
+    // behind its own consumer and the consuming MATCH ran first as an unseeded
+    // scan — silently empty results or an ignored limit. Restricting to
+    // preceding siblings keeps a genuinely correlated sliced sub-SELECT (its
+    // producer precedes it) per-row while letting the WITH producer lead.
     let mut corr = HashSet::new();
-    for (j, p) in siblings.iter().enumerate() {
-        if j == self_idx {
-            continue;
-        }
+    for (j, p) in siblings.iter().enumerate().take(self_idx) {
+        debug_assert!(j < self_idx);
         for v in p.produced_vars() {
             if select.contains(&v) && !self_produced.contains(&v) {
                 corr.insert(v);
@@ -1732,6 +1820,7 @@ fn deferred_required_vars(pattern: &Pattern) -> Vec<VarId> {
     match pattern {
         Pattern::Filter(expr) => expr.referenced_vars(),
         Pattern::Bind { expr, .. } => expr.referenced_vars(),
+        Pattern::Unwind { list, .. } => list.referenced_vars(),
         // Other patterns should not be classified as Deferred, but handle
         // gracefully by returning all referenced variables.
         other => other.referenced_vars(),
@@ -2155,6 +2244,89 @@ mod tests {
             Some("http://example.org/z"),
             "expected stats-driven ordering to pick the most selective predicate first; got ordered[0]={:?}",
             ordered[0]
+        );
+    }
+
+    #[test]
+    fn estimate_uses_merged_annotation_stats_for_reifies_predicates() {
+        // After `StatsView::merge_annotation_stats` runs with per-slot
+        // NDVs, the planner's classifier should produce arena-aligned
+        // BoundObject estimates: `count / ndv_values` for the matching
+        // slot's NDV, not the conservative fallback.
+
+        use fluree_db_core::AnnotationStats;
+        use fluree_vocab::db as p;
+        use fluree_vocab::namespaces::FLUREE_DB;
+
+        let mut stats = StatsView::default();
+        let ann = AnnotationStats {
+            forward_rows: 1_000,
+            reverse_rows: 1_000,
+            distinct_edges: 200,
+            distinct_annotations: 800,
+            live_attachment_pairs: 800,
+            distinct_reified_subjects: 50,
+            distinct_reified_predicates: 4,
+            distinct_reified_objects: 200,
+            ..Default::default()
+        };
+        let mut ns = std::collections::HashMap::new();
+        ns.insert(FLUREE_DB, "https://ns.flur.ee/db#".to_string());
+        stats.merge_annotation_stats(&ann, &ns);
+
+        // PropertyScan: `?ann f:reifiesObject ?o` — total annotations.
+        let scan = TriplePattern::new(
+            Ref::Var(VarId(0)),
+            Ref::Sid(Sid::new(FLUREE_DB, p::REIFIES_OBJECT)),
+            Term::Var(VarId(1)),
+        );
+        let scan_est = estimate_triple_row_count(&scan, &HashSet::new(), Some(&stats));
+        assert_eq!(
+            scan_est, 800.0,
+            "PropertyScan should equal annotation count"
+        );
+
+        // BoundObject: `?ann f:reifiesObject <some_object>`. With per-
+        // slot NDV the estimate is `800 / 200 = 4` — annotations per
+        // pinned object.
+        let bound_o = TriplePattern::new(
+            Ref::Var(VarId(0)),
+            Ref::Sid(Sid::new(FLUREE_DB, p::REIFIES_OBJECT)),
+            Term::Sid(Sid::new(7, "obj1")),
+        );
+        let bound_o_est = estimate_triple_row_count(&bound_o, &HashSet::new(), Some(&stats));
+        assert_eq!(
+            bound_o_est, 4.0,
+            "BoundObject on reifiesObject should be distinct_annotations / distinct_reified_objects"
+        );
+
+        // BoundSubject: a known annotation subject probing its slot.
+        let mut bound_subj_ctx = HashSet::new();
+        bound_subj_ctx.insert(VarId(0));
+        let bound_s = TriplePattern::new(
+            Ref::Var(VarId(0)),
+            Ref::Sid(Sid::new(FLUREE_DB, p::REIFIES_SUBJECT)),
+            Term::Var(VarId(2)),
+        );
+        let bound_s_est = estimate_triple_row_count(&bound_s, &bound_subj_ctx, Some(&stats));
+        assert_eq!(
+            bound_s_est, 1.0,
+            "BoundSubject on reifiesSubject should be ~1 row per known annotation"
+        );
+
+        // BoundObject on reifiesPredicate: 800 / 4 = 200 annotations
+        // per pinned predicate. Larger than reifiesObject's
+        // selectivity here, which is realistic — predicates are
+        // typically a small set even at scale.
+        let bound_p = TriplePattern::new(
+            Ref::Var(VarId(0)),
+            Ref::Sid(Sid::new(FLUREE_DB, p::REIFIES_PREDICATE)),
+            Term::Sid(Sid::new(7, "worksFor")),
+        );
+        let bound_p_est = estimate_triple_row_count(&bound_p, &HashSet::new(), Some(&stats));
+        assert_eq!(
+            bound_p_est, 200.0,
+            "BoundObject on reifiesPredicate should be distinct_annotations / distinct_reified_predicates"
         );
     }
 
@@ -3473,6 +3645,86 @@ mod tests {
         assert!(
             sub_pos < anchor_pos,
             "producer must beat the class anchor in the fall-back pool: {ordered:?}"
+        );
+    }
+
+    #[test]
+    fn annotation_sidecar_demoted_for_base_edge() {
+        // RDF-star reified edge (IC5 shape): `?ann f:reifiesObject ?friend` is a
+        // broad annotation sidecar; `?forum HAS_MEMBER ?friend` is the concrete
+        // base edge. Both are object-bound on `friend`. The base edge must seed —
+        // not the sidecar — even though the sidecar is written first (and would
+        // otherwise win the orig-index tie).
+        let (friend, forum, ann) = (VarId(0), VarId(1), VarId(2));
+        let reifies_object = Pattern::Triple(TriplePattern::new(
+            Ref::Var(ann),
+            Ref::Sid(Sid::new(
+                fluree_vocab::namespaces::FLUREE_DB,
+                fluree_vocab::db::REIFIES_OBJECT,
+            )),
+            Term::Var(friend),
+        ));
+        let base_edge = Pattern::Triple(make_pattern(forum, "HAS_MEMBER", friend));
+        let patterns = vec![reifies_object, base_edge];
+        let mut bound = HashSet::new();
+        bound.insert(friend);
+        let ordered = reorder_patterns(&patterns, None, &bound);
+        assert!(
+            matches!(&ordered[0], Pattern::Triple(tp)
+                if matches!(&tp.p, Ref::Sid(s) if s.name.as_ref() == "HAS_MEMBER")),
+            "concrete base edge must seed before the f:reifiesObject sidecar: {ordered:?}"
+        );
+    }
+
+    #[test]
+    fn full_reifies_chain_drives_base_edge_first() {
+        // The REAL delegate path: the expanded edge-annotation chain (base edge +
+        // three `f:reifies*` sidecars) reordered with the child's `friend` already
+        // bound — exactly what `DefaultGraphSourceOperator` feeds to
+        // `build_where_operators_seeded` -> `reorder_patterns`. The base
+        // `HAS_MEMBER` edge must be placed before `f:reifiesObject`, otherwise the
+        // plan scans the global annotation sidecar.
+        let (friend, forum, ann) = (VarId(0), VarId(1), VarId(2));
+        let sid = |name| Ref::Sid(Sid::new(fluree_vocab::namespaces::FLUREE_DB, name));
+        let base_edge = Pattern::Triple(make_pattern(forum, "HAS_MEMBER", friend));
+        let reifies_subject = Pattern::Triple(TriplePattern::new(
+            Ref::Var(ann),
+            sid(fluree_vocab::db::REIFIES_SUBJECT),
+            Term::Var(forum),
+        ));
+        let reifies_predicate = Pattern::Triple(TriplePattern::new(
+            Ref::Var(ann),
+            sid(fluree_vocab::db::REIFIES_PREDICATE),
+            Term::Sid(Sid::new(100, "HAS_MEMBER")),
+        ));
+        let reifies_object = Pattern::Triple(TriplePattern::new(
+            Ref::Var(ann),
+            sid(fluree_vocab::db::REIFIES_OBJECT),
+            Term::Var(friend),
+        ));
+        // Emission order as produced by `expand_edge_annotation_patterns`.
+        let patterns = vec![
+            base_edge,
+            reifies_subject,
+            reifies_predicate,
+            reifies_object,
+        ];
+        let mut bound = HashSet::new();
+        bound.insert(friend); // the delegate's seeded child binds `friend`
+        let ordered = reorder_patterns(&patterns, None, &bound);
+
+        let pos = |pred: &str| {
+            ordered
+                .iter()
+                .position(|p| {
+                    matches!(p, Pattern::Triple(tp)
+                    if matches!(&tp.p, Ref::Sid(s) if s.name.as_ref() == pred))
+                })
+                .unwrap_or(usize::MAX)
+        };
+        assert!(
+            pos("HAS_MEMBER") < pos(fluree_vocab::db::REIFIES_OBJECT),
+            "base edge must drive before the f:reifiesObject sidecar: {ordered:?}"
         );
     }
 

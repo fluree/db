@@ -949,8 +949,24 @@ mod inner {
             sink.set_spool_context(spool_ctx);
         }
 
-        let doc: serde_json::Value = serde_json::from_str(jsonld)
+        let mut doc: serde_json::Value = serde_json::from_str(jsonld)
             .map_err(|e| TransactError::Parse(format!("JSON parse error: {e}")))?;
+
+        // Edge annotations: rewrite `@annotation` / `@edge` into the seven-fact
+        // `f:reifies*` encoding before expansion, exactly as the transact path
+        // does — otherwise the JSON-LD expander silently drops them and a bulk
+        // import loses every edge property. Gated on a cheap presence check so
+        // the common (non-annotated) bulk import pays nothing. RDF mode
+        // (lpg_mode=false): a non-empty `@annotation` lowers to a reifier
+        // bundle; the CSV/LPG loader never emits an empty `@annotation: {}`.
+        if jsonld.contains("@annotation") || jsonld.contains("@edge") || jsonld.contains("@reifies")
+        {
+            let top_ctx = crate::parse::edge_annotations::top_level_context(&doc)?;
+            crate::parse::edge_annotations::run_user_authored_reifies_firewall(&doc, &top_ctx)?;
+            crate::parse::edge_annotations::lower_edge_annotations_after_firewall(
+                &mut doc, &top_ctx, false,
+            )?;
+        }
 
         // Register @context prefix→IRI mappings in the namespace trie BEFORE
         // expansion. JSON-LD expand() resolves prefixes internally, but the

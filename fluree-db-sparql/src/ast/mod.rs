@@ -22,6 +22,7 @@
 //! // ast is a SparqlAst with source spans on every node
 //! ```
 
+pub mod annotation;
 pub mod expr;
 pub mod path;
 pub mod pattern;
@@ -30,6 +31,7 @@ pub mod term;
 pub mod update;
 
 // Re-export commonly used types at the ast module level
+pub use annotation::{Annotation, AnnotationBlock, AnnotationEntry, ReifierId, TripleTerm};
 pub use expr::{AggregateFunction, BinaryOp, Expression, FunctionName, UnaryOp};
 pub use path::{NegatedPredicate, PropertyPath};
 pub use pattern::{GraphName, GraphPattern, TriplePattern};

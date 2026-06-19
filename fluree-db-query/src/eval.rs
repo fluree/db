@@ -25,8 +25,10 @@ mod fulltext;
 mod geo;
 mod hash;
 mod helpers;
+mod list;
 mod logical;
 mod numeric;
+mod path;
 mod rdf;
 mod string;
 mod types;
@@ -175,6 +177,10 @@ impl Expression {
                     debug_assert!(false, "Grouped binding in filter evaluation");
                     Ok(None)
                 }
+                // A path or list is not a scalar — no comparable value. The
+                // relevant functions (`length`, `size`/`head`/…) read the
+                // binding directly via dispatch / the binding-producing path.
+                Some(Binding::Path(_) | Binding::List(_)) => Ok(None),
             },
 
             // FlakeValue::Null is the only variant TryFrom rejects (with
@@ -248,6 +254,14 @@ impl Expression {
         row: &R,
         ctx: Option<&ExecutionContext<'_>>,
     ) -> Result<Binding> {
+        // List-*returning* functions (tail, list-reverse) and list literals
+        // can't be a `ComparableValue` — evaluate them straight to a `Binding`.
+        if let Expression::Call { func, args } = self {
+            if let Some(binding) = list::eval_list_fn_to_binding(func, args, row, ctx)? {
+                return Ok(binding);
+            }
+        }
+
         let comparable = match self.eval_to_comparable(row, ctx) {
             Ok(Some(val)) => val,
             Ok(None) => {

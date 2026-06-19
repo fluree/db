@@ -676,6 +676,11 @@ pub struct UnresolvedOptions {
     /// When false, bare "?x" object values are literals unless
     /// explicitly wrapped as {"@variable": "?x"}.
     pub object_var_parsing: bool,
+    /// When true, scan operators bypass the variable-predicate filter
+    /// for Fluree-system predicates. Parsed from
+    /// `opts.includeSystemFacts: true`. See
+    /// [`crate::ir::Query::include_system_facts`].
+    pub include_system_facts: bool,
 }
 
 impl UnresolvedOptions {
@@ -697,6 +702,7 @@ impl Default for UnresolvedOptions {
             having: None,
             reasoning: None,
             object_var_parsing: true,
+            include_system_facts: false,
         }
     }
 }
@@ -1035,6 +1041,52 @@ pub enum UnresolvedPattern {
         /// Patterns to execute within the graph
         patterns: Vec<UnresolvedPattern>,
     },
+
+    /// Edge-rooted annotation pattern.
+    ///
+    /// Lowered from JSON-LD where an object position carries an
+    /// `@annotation` (or its `@edge` alias) block. Syntax:
+    /// ```json
+    /// { "@id": "?s", "ex:worksFor": {
+    ///     "@id": "?o",
+    ///     "@annotation": { "ex:role": "Engineer" }
+    /// }}
+    /// ```
+    /// The annotation is a node-map describing the annotation subject —
+    /// `@id` (if present) names the subject; the rest of the body
+    /// produces patterns about that subject.
+    EdgeAnnotation {
+        /// The annotated edge (subject, predicate, object).
+        edge: UnresolvedTriplePattern,
+        /// The annotation subject — variable, anonymous (synthetic var),
+        /// or named IRI.
+        annotation: UnresolvedTerm,
+        /// Patterns about the annotation subject (lowered from the
+        /// non-`@`-keyword properties of the `@annotation` node-map).
+        body: Vec<UnresolvedPattern>,
+    },
+
+    /// Annotation-rooted pattern (reverse direction).
+    ///
+    /// Lowered from a node-map containing `@reifies`. The enclosing node
+    /// is the annotation subject; `@reifies` names the edge it reifies;
+    /// the rest of the node's properties become facts about the
+    /// annotation subject. Syntax:
+    /// ```json
+    /// { "@id": "?ann", "ex:role": "Engineer",
+    ///   "@reifies": { "@id": "?s", "ex:worksFor": { "@id": "?o" } }
+    /// }
+    /// ```
+    AnnotationTarget {
+        /// The annotation subject (variable, anonymous synthetic var,
+        /// or named IRI).
+        annotation: UnresolvedTerm,
+        /// The base edge being reified (subject, predicate, object).
+        edge: UnresolvedTriplePattern,
+        /// Patterns about the annotation subject (lowered from the
+        /// non-`@`-keyword properties of the enclosing node).
+        body: Vec<UnresolvedPattern>,
+    },
 }
 
 impl UnresolvedPattern {
@@ -1189,6 +1241,11 @@ impl UnresolvedQuery {
                     UnresolvedPattern::Graph {
                         patterns: inner, ..
                     } => collect(inner, out),
+                    UnresolvedPattern::EdgeAnnotation { edge, body, .. }
+                    | UnresolvedPattern::AnnotationTarget { edge, body, .. } => {
+                        out.push(edge);
+                        collect(body, out);
+                    }
                     UnresolvedPattern::Filter(_)
                     | UnresolvedPattern::Bind { .. }
                     | UnresolvedPattern::Values { .. }

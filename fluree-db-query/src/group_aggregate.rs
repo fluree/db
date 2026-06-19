@@ -229,7 +229,8 @@ impl AggState {
             AggregateFn::Median { .. }
             | AggregateFn::Variance { .. }
             | AggregateFn::Stddev { .. }
-            | AggregateFn::GroupConcat { .. } => AggState::Collect { values: Vec::new() },
+            | AggregateFn::GroupConcat { .. }
+            | AggregateFn::Collect(..) => AggState::Collect { values: Vec::new() },
             // SAMPLE is explicitly arbitrary in SPARQL; we pick the first observed value.
             AggregateFn::Sample(_) => AggState::Sample { sample: None },
         }
@@ -380,6 +381,9 @@ pub(crate) enum GroupKeyOwned {
     MaterializedSid(u16, Arc<str>),
     /// Materialized literal value
     MaterializedLit(MaterializedLitKey),
+    /// Ordered sequence key — a path's node sequence or a list value, so
+    /// `WITH path, collect(...)` / GROUP BY a list groups per distinct sequence.
+    Seq(Vec<GroupKeyOwned>),
     /// Unbound/Poisoned
     Absent,
 }
@@ -480,6 +484,17 @@ pub(crate) fn binding_to_group_key_owned(binding: &Binding) -> GroupKeyOwned {
             GroupKeyOwned::MaterializedSid(0, iri.clone())
         }
         Binding::Grouped(_) => GroupKeyOwned::Absent, // Shouldn't happen
+        // A path / list groups per distinct element sequence — needed for
+        // `WITH path, collect(...)` over allShortestPaths (IC14).
+        Binding::Path(nodes) => GroupKeyOwned::Seq(
+            nodes
+                .iter()
+                .map(|sid| GroupKeyOwned::MaterializedSid(sid.namespace_code, sid.name.clone()))
+                .collect(),
+        ),
+        Binding::List(items) => {
+            GroupKeyOwned::Seq(items.iter().map(binding_to_group_key_owned).collect())
+        }
     }
 }
 
@@ -669,7 +684,8 @@ impl GroupAggregateOperator {
             AggregateFn::Median { .. }
             | AggregateFn::Variance { .. }
             | AggregateFn::Stddev { .. }
-            | AggregateFn::GroupConcat { .. } => false,
+            | AggregateFn::GroupConcat { .. }
+            | AggregateFn::Collect(..) => false,
         })
     }
 

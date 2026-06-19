@@ -3422,6 +3422,158 @@ pub async fn incremental_index(
         }
     }
 
+    // ---- Phase 3d: Annotation arena seal ----
+    //
+    // Coverage envelope from the caller:
+    //
+    //   Authoritative(events) → events are the complete history;
+    //                            rebuild from scratch. Previous arena
+    //                            participates only for GC.
+    //   Augment(events)       → partial coverage; merge with the
+    //                            previous arena's events, dedupe by
+    //                            (edge, ann, t, op), rebuild. Stays
+    //                            correct under reload/eviction
+    //                            scenarios where the running
+    //                            AttachmentNovelty doesn't cover
+    //                            pre-index history.
+    //   Unknown / None        → defensive drop when base has arena;
+    //                            no-op when base has none.
+    //
+    // Events are clipped to `t <= record.commit_t` so a concurrent
+    // commit's events can't leak into a root whose `index_t` is still
+    // `commit_t`. Keeps `AnnotationIndexRoot.max_t <= IndexRoot.index_t`.
+    let job_t = record.commit_t;
+    use crate::config::AttachmentEventCoverage;
+    let coverage = config.attachment_events.clone();
+    let prev_arena = base_root.annotation_index.as_ref();
+
+    match coverage {
+        Some(AttachmentEventCoverage::Authoritative(mut events)) => {
+            events.retain(|(_, _, t, _)| *t <= job_t);
+            let result = crate::build::annotation_arena::build_and_persist_annotation_arena(
+                content_store.as_ref(),
+                prev_arena,
+                events,
+            )
+            .await?;
+            if let Some(ref ann) = result.new_index {
+                debug_assert!(
+                    ann.max_t <= job_t,
+                    "AnnotationIndexRoot.max_t ({}) must not exceed IndexRoot.index_t ({})",
+                    ann.max_t,
+                    job_t
+                );
+            }
+            root_builder.set_annotation_index(
+                result.new_index,
+                result.replaced_leaf_cids,
+                result.new_leaf_cids,
+            );
+        }
+        Some(AttachmentEventCoverage::Augment(mut events)) => {
+            events.retain(|(_, _, t, _)| *t <= job_t);
+            // Pull the previous arena's events (if any) and merge
+            // with the caller's. Dedupe by full tuple so overlap is
+            // safe — e.g. a continuously-running ledger whose
+            // overlay still holds pre-index events that match the
+            // base arena.
+            //
+            // Coverage gate: `Augment` is only safe to seal when we
+            // can recover historical events from somewhere. With a
+            // base arena, that's the merge source. Without one, the
+            // base might still carry indexed `f:reifies*` facts (the
+            // sticky bit) — sealing from the partial events alone
+            // would publish an incomplete arena and hide history.
+            // Stay in scan-fallback in that case until either:
+            //   - a future pass supplies `Authoritative(events)`, or
+            //   - resolver-side event collection lets the indexer
+            //     produce its own complete history.
+            if prev_arena.is_none() && base_root.has_annotations {
+                tracing::warn!(
+                    ledger_id = %ledger_id,
+                    "incremental indexer received Augment coverage but base \
+                     root has indexed f:reifies* facts without an arena \
+                     (has_annotations=true, annotation_index=None). Augment \
+                     events alone can't recover historical attachments; \
+                     leaving annotation_index=None so hydration uses scan. \
+                     A later pass with Authoritative coverage (or slice \
+                     3h's resolver-side collection) will seal an \
+                     authoritative arena."
+                );
+                root_builder.set_annotation_index(None, Vec::new(), Vec::new());
+            } else {
+                let prev_events: Vec<_> = if let Some(prev) = prev_arena {
+                    let reader =
+                        fluree_db_binary_index::annotation_arena::AnnotationArenaReader::new(
+                            prev,
+                            content_store.as_ref(),
+                        );
+                    reader
+                        .collect_all_forward_events()
+                        .await
+                        .map_err(crate::error::IndexerError::Core)?
+                } else {
+                    Vec::new()
+                };
+                let mut combined: Vec<(fluree_db_core::EdgeKey, fluree_db_core::Sid, i64, bool)> =
+                    Vec::with_capacity(prev_events.len() + events.len());
+                combined.extend(prev_events);
+                combined.extend(events);
+                // Sort + dedup — `(edge, ann, t, op)` tuples already
+                // implement Ord. After this `combined` carries every
+                // distinct event observed across both sources.
+                combined.sort();
+                combined.dedup();
+
+                let result = crate::build::annotation_arena::build_and_persist_annotation_arena(
+                    content_store.as_ref(),
+                    prev_arena,
+                    combined,
+                )
+                .await?;
+                if let Some(ref ann) = result.new_index {
+                    debug_assert!(
+                        ann.max_t <= job_t,
+                        "AnnotationIndexRoot.max_t ({}) must not exceed IndexRoot.index_t ({})",
+                        ann.max_t,
+                        job_t
+                    );
+                }
+                root_builder.set_annotation_index(
+                    result.new_index,
+                    result.replaced_leaf_cids,
+                    result.new_leaf_cids,
+                );
+            }
+        }
+        Some(AttachmentEventCoverage::Unknown) | None => {
+            if let Some(prev) = prev_arena {
+                // Delta unknown but base has an arena — defensively
+                // drop it. Collect the previous leaf CIDs so GC can
+                // reclaim them.
+                let reader = fluree_db_binary_index::annotation_arena::AnnotationArenaReader::new(
+                    prev,
+                    content_store.as_ref(),
+                );
+                let prev_leaf_cids = reader
+                    .all_leaf_cids()
+                    .await
+                    .map_err(crate::error::IndexerError::Core)?;
+                tracing::warn!(
+                    ledger_id = %ledger_id,
+                    "incremental indexer received Unknown / None coverage but \
+                     base root carries an arena; dropping arena on new root \
+                     to avoid publishing stale-but-authoritative attachment \
+                     state. Hydration falls back to scan path until the next \
+                     reindex pass supplies events."
+                );
+                root_builder.set_annotation_index(None, prev_leaf_cids, Vec::new());
+            }
+            // Else: non-annotation ledger fast path, or already in
+            // scan-fallback state. Nothing to do.
+        }
+    }
+
     // ---- Phase 4: Root assembly ----
     let phase4_started = Instant::now();
     tracing::debug!(

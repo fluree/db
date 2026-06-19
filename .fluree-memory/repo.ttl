@@ -1168,6 +1168,20 @@ mem:fact-01km06dhjzpgyvbs1yc5h0h28e a mem:Fact ;
     mem:branch "feature/default-context" ;
     mem:createdAt "2026-03-18T10:03:48.703812+00:00"^^xsd:dateTime .
 
+mem:fact-01krb618x0axad5mj8jev4ej0s a mem:Fact ;
+    mem:content "Annotation hydration arena lookups use full EdgeKey identity. The current read path is HydrationFormatter::arena_lookup_annotations -> AnnotationArenaReader::current_annotations_merged(edge_key, novelty_events, t), with novelty events from collect_forward_events(edge_key). The scan fallback decodes candidate bundles with EdgeKey::from_reifies_facts and compares cand_edge == edge_key, so language-tagged literal lookup depends on writers emitting f:reifiesLang to populate EdgeKey.lang." ;
+    mem:tag "EdgeKey" ;
+    mem:tag "annotation-arena" ;
+    mem:tag "edge-annotations" ;
+    mem:tag "hydration" ;
+    mem:tag "lang" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/src/format/hydration.rs" ;
+    mem:artifactRef "fluree-db-binary-index/src/annotation_arena/reader.rs" ;
+    mem:artifactRef "fluree-db-core/src/edge.rs" ;
+    mem:branch "feature/edge-annotations" ;
+    mem:createdAt "2026-05-11T09:31:32.640122+00:00"^^xsd:dateTime .
+
 mem:decision-01krvht9hdmca3m5j1rz761g46 a mem:Decision ;
     mem:content "`Fluree::drop_named_graph(ledger_id, graph_iri)` is a **transactional, history-preserving, per-branch** retract: it stages a SPARQL `DELETE { GRAPH <iri> { ?s ?p ?o } } WHERE { GRAPH <iri> { ?s ?p ?o } }` through `stage(&handle).txn(...)` and produces one normal commit. System graphs (default, txn-meta g_id=1, config g_id=2) are rejected with 400; unknown graph IRIs return 404 *before* staging so the registry isn't silently extended. `graph_iri` must be an absolute IRI per `validate_absolute_iri` (no whitespace, no C0/DEL controls, no RFC 3987-excluded chars, `<scheme>:<rest>` head). Idempotent: re-dropping an empty graph reports `committed=false`, `retracted=0` without creating a commit. Wire endpoint: `POST /drop-graph` admin-protected; CLI: `fluree graph drop <iri> --ledger <id> [--remote]`; companion read-only `fluree graph list` reads `named-graphs` from `/info`." ;
     mem:tag "admin" ;

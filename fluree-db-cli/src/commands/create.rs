@@ -13,6 +13,10 @@ pub struct ImportOpts {
     pub chunk_size_mb: usize,
     pub leaflet_rows: usize,
     pub leaflets_per_leaf: usize,
+    /// CSV import: how relationship (edge) properties are encoded.
+    pub edge_policy: fluree_db_api::csv_import::EdgePolicy,
+    /// CSV import: base IRI namespace for minted ids/predicates/classes.
+    pub base_iri: String,
 }
 
 /// `fluree create <ledger> --remote <name>` — create an empty ledger on the
@@ -308,6 +312,13 @@ pub async fn run(
     match from {
         Some(path) if is_flpack_path(path) => {
             run_flpack_import(&fluree, ledger, path, dirs).await?;
+        }
+        // CSV (single file or a directory containing .csv) is streamed to
+        // newline-delimited JSON-LD and loaded through the chunked bulk-import
+        // pipeline. Checked before the directory / bulk branches, which only
+        // understand RDF/JSON-LD.
+        Some(path) if is_csv_input(path) => {
+            run_csv_import(&fluree, ledger, path, dirs, verbose, quiet, import_opts).await?;
         }
         Some(path) if path.is_dir() => {
             // Validate directory format (catches mixed formats & empty dirs).
@@ -764,6 +775,47 @@ async fn run_bulk_import(
         println!();
     }
 
+    // Annotation arena auto-seal pass.
+    //
+    // The bulk-import path writes `IndexRoot.annotation_index = None`
+    // even when the imported dataset contains `f:reifies*` flakes —
+    // `build_indexes_from_commits` doesn't drive the annotation
+    // arena builder, so a freshly-imported ledger always lands in
+    // arena-less / scan-fallback state until a reindex.
+    //
+    // To close the workflow gap, we follow a successful annotation-
+    // bearing import with `Fluree::reindex(...)`, which DOES seal the
+    // arena via the api's `AttachmentEventsProvider`. The cost is one
+    // extra index pass on annotation-bearing imports — the same work
+    // a user would otherwise run manually via `fluree index` as a
+    // second step. Non-annotation imports skip this entirely (the
+    // sticky bit gate on `Fluree::reindex` and the early-return in
+    // the indexer's arena builder both make it cheap to be wrong).
+    if result.has_annotations {
+        if !quiet {
+            eprintln!(
+                "{} Sealing annotation arena (one-shot reindex pass) — ledger contains `f:reifies*` flakes…",
+                "info:".cyan().bold()
+            );
+        }
+        match fluree
+            .reindex(ledger, fluree_db_api::ReindexOptions::default())
+            .await
+        {
+            Ok(_) => {
+                if !quiet {
+                    eprintln!("{} Annotation arena sealed.", "info:".cyan().bold());
+                }
+            }
+            Err(e) => {
+                eprintln!(
+                    "{} Annotation arena seal failed (import succeeded; arena will land on the next `fluree index`): {e}",
+                    "warning:".yellow().bold()
+                );
+            }
+        }
+    }
+
     // Success: remove the crash breadcrumb so the presence of files in
     // `<data_dir>/crash/` continues to be a strong signal of *failed/crashed*
     // runs that need investigation.
@@ -882,6 +934,118 @@ fn is_import_path(path: &Path) -> CliResult<bool> {
     // Single source of truth with the import pipeline's own discovery rules —
     // a format accepted here is guaranteed to resolve there.
     Ok(fluree_db_api::is_bulk_import_file(path))
+}
+
+/// Whether `--from` points at CSV input: a single `.csv` file, or a directory
+/// containing at least one `.csv` file.
+fn is_csv_input(path: &Path) -> bool {
+    if path.is_dir() {
+        std::fs::read_dir(path)
+            .into_iter()
+            .flatten()
+            .filter_map(std::result::Result::ok)
+            .any(|e| has_csv_extension(&e.path()))
+    } else {
+        has_csv_extension(path)
+    }
+}
+
+fn has_csv_extension(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("csv"))
+}
+
+/// Convert CSV node/relationship files (neo4j-admin header convention) to
+/// newline-delimited JSON-LD in a temp directory, then load through the existing
+/// **chunked, parallel bulk-import pipeline** (the same path as `--from data/`
+/// of Turtle/JSON-LD). Streaming the `.jsonl` keeps memory flat and gives a
+/// progress bar + chunk-per-commit, instead of one giant in-memory transaction.
+async fn run_csv_import(
+    fluree: &fluree_db_api::Fluree,
+    ledger: &str,
+    path: &Path,
+    dirs: &FlureeDir,
+    verbose: bool,
+    quiet: bool,
+    import_opts: &ImportOpts,
+) -> CliResult<()> {
+    use fluree_db_api::csv_import::{write_csv_ndjson, CsvImportOptions};
+    use std::io::{BufReader, BufWriter};
+
+    let files: Vec<std::path::PathBuf> = if path.is_dir() {
+        let mut v: Vec<_> = std::fs::read_dir(path)
+            .map_err(|e| CliError::Input(format!("failed to read {}: {e}", path.display())))?
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| has_csv_extension(p))
+            .collect();
+        v.sort();
+        v
+    } else {
+        vec![path.to_path_buf()]
+    };
+    if files.is_empty() {
+        return Err(CliError::Input(format!(
+            "no .csv files found in {}",
+            path.display()
+        )));
+    }
+
+    let opts = CsvImportOptions {
+        edge_policy: import_opts.edge_policy,
+        base_iri: import_opts.base_iri.clone(),
+        ..Default::default()
+    };
+
+    // Stream each CSV → one `.jsonl` shard in a temp dir (cleaned up on drop,
+    // after the import completes). One shard per source file lets the bulk
+    // pipeline parallelize across them.
+    let tmp = tempfile::tempdir()
+        .map_err(|e| CliError::Input(format!("failed to create temp dir: {e}")))?;
+    if !quiet {
+        println!(
+            "Converting {} CSV file(s) → JSON-LD (edge properties: {:?})...",
+            files.len(),
+            import_opts.edge_policy
+        );
+    }
+    let mut total_objects = 0usize;
+    for (i, csv_path) in files.iter().enumerate() {
+        let stem = csv_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .map(sanitize_for_filename)
+            .unwrap_or_else(|| format!("part{i}"));
+        let out_path = tmp.path().join(format!("{i:05}_{stem}.jsonl"));
+        let reader =
+            BufReader::new(std::fs::File::open(csv_path).map_err(|e| {
+                CliError::Input(format!("failed to open {}: {e}", csv_path.display()))
+            })?);
+        let mut writer = BufWriter::new(
+            std::fs::File::create(&out_path)
+                .map_err(|e| CliError::Input(format!("failed to write temp jsonl: {e}")))?,
+        );
+        total_objects += write_csv_ndjson(reader, &opts, &mut writer)
+            .map_err(|e| CliError::Input(format!("CSV import ({}): {e}", csv_path.display())))?;
+        writer
+            .into_inner()
+            .map_err(|e| CliError::Input(format!("failed to flush temp jsonl: {e}")))?;
+    }
+    if !quiet {
+        println!("Converted {total_objects} object(s); importing...");
+    }
+
+    // Hand the temp dir of `.jsonl` to the bulk import (chunked + progress).
+    run_bulk_import(
+        fluree,
+        ledger,
+        tmp.path(),
+        dirs.data_dir(),
+        verbose,
+        quiet,
+        import_opts,
+    )
+    .await
 }
 
 /// Replace non-alphanumeric characters with underscores for safe filenames.

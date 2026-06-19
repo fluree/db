@@ -17,13 +17,14 @@ These concepts build on each other. If you're new to Fluree, read them in this o
 4. [Time Travel](time-travel.md) — Query any point in history
 5. [Branching](ledgers-and-nameservice.md#branching) — Git-like branch, merge, and rebase for your data
 6. [Datasets and Named Graphs](datasets-and-named-graphs.md) — Partition and query across graphs
+7. [Edge Annotations](edge-annotations.md) — Properties on relationships, RDF-star, and LPG fidelity
 
 **Differentiating features** (read as needed):
 
-7. [Graph Sources](graph-sources.md) — Integrated search and external data
-8. [Policy Enforcement](policy-enforcement.md) — Fine-grained access control
-9. [Verifiable Data](verifiable-data.md) — Cryptographic signatures and trust
-10. [Reasoning and Inference](reasoning.md) — Derive facts from ontology rules
+8. [Graph Sources](graph-sources.md) — Integrated search and external data
+9. [Policy Enforcement](policy-enforcement.md) — Fine-grained access control
+10. [Verifiable Data](verifiable-data.md) — Cryptographic signatures and trust
+11. [Reasoning and Inference](reasoning.md) — Derive facts from ontology rules
 
 If you're coming from a SQL/relational background, start with [Fluree for SQL Developers](../getting-started/fluree-for-sql-developers.md) before diving into the concepts above.
 
@@ -48,6 +49,10 @@ Learn about ledgers (Fluree's equivalent of databases), how they're organized wi
 ### [Datasets and Named Graphs](datasets-and-named-graphs.md)
 
 Learn about SPARQL datasets, named graphs, and how Fluree supports multi-graph queries across different data sources and time periods.
+
+### [Edge Annotations](edge-annotations.md)
+
+Attach properties to a relationship — role, confidence, since-date — without modeling an intermediate node by hand. Edge annotations cover the property-graph shape, RDF-star / JSON-LD-star asserted-triple annotations, and Cypher relationship properties on a single ergonomic surface, while leaving plain RDF queries untouched.
 
 ### [Graph Sources](graph-sources.md)
 

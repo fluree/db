@@ -542,6 +542,7 @@ pub fn format_general_pattern(pattern: &Pattern) -> String {
         Pattern::Triple(tp) => format_pattern(tp),
         Pattern::Filter(expr) => format!("FILTER({expr:?})"),
         Pattern::Bind { var, expr } => format!("BIND({:?} AS ?v{})", expr, var.0),
+        Pattern::Unwind { var, list } => format!("UNWIND({:?} AS ?v{})", list, var.0),
         Pattern::Values { vars, rows } => {
             let var_names: Vec<String> = vars.iter().map(|v| format!("?v{}", v.0)).collect();
             format!("VALUES ({}) {{ {} rows }}", var_names.join(" "), rows.len())
@@ -573,6 +574,16 @@ pub fn format_general_pattern(pattern: &Pattern) -> String {
             format_ref(&pp.subject),
             pp.modifier
         ),
+        Pattern::ShortestPath(sp) => format!(
+            "SHORTEST PATH {} {} -> {} {:?}",
+            match sp.mode {
+                crate::ir::ShortestPathMode::Single => "shortestPath",
+                crate::ir::ShortestPathMode::All => "allShortestPaths",
+            },
+            format_ref(&sp.start),
+            format_ref(&sp.end),
+            sp.direction
+        ),
         Pattern::IndexSearch(isp) => {
             format!("INDEX SEARCH {}", isp.graph_source_id)
         }
@@ -593,6 +604,23 @@ pub fn format_general_pattern(pattern: &Pattern) -> String {
                 sp.endpoint,
                 sp.patterns.len()
             )
+        }
+        Pattern::EdgeAnnotation { edge, body, .. } => {
+            format!(
+                "EDGE-ANNOTATION {{ {} | {} body patterns }}",
+                format_pattern(edge),
+                body.len()
+            )
+        }
+        Pattern::AnnotationTarget { edge, body, .. } => {
+            format!(
+                "ANNOTATION-TARGET {{ {} | {} body patterns }}",
+                format_pattern(edge),
+                body.len()
+            )
+        }
+        Pattern::DefaultGraphSource { patterns } => {
+            format!("DEFAULT-GRAPH-SOURCE {{ {} patterns }}", patterns.len())
         }
     }
 }

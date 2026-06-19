@@ -251,6 +251,15 @@ impl Operator for GroupByOperator {
                     ctx.check_cancelled()?;
                 }
 
+                // Implicit aggregation (no GROUP BY keys) over zero input rows
+                // still yields exactly one row — one empty group, so the
+                // downstream aggregates produce COUNT(*)=0, collect()=[], etc.
+                // (Mirrors the streaming GroupAggregateOperator; SPARQL/Cypher
+                // semantics.) Explicit GROUP BY keeps emitting zero groups.
+                if self.group_key_indices.is_empty() && self.groups.is_empty() {
+                    self.groups.entry(Vec::new()).or_default();
+                }
+
                 span.record("input_batches", input_batches);
                 span.record("input_rows", input_rows);
                 span.record("groups", self.groups.len() as u64);

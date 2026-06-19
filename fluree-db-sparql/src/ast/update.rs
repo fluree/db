@@ -199,7 +199,12 @@ impl QuadPattern {
 #[derive(Clone, Debug, PartialEq)]
 pub enum QuadPatternElement {
     /// A triple in the default graph.
-    Triple(TriplePattern),
+    ///
+    /// Boxed because `TriplePattern` is ~328 bytes, dominating the
+    /// enum size; the `Graph` variant is ~96 bytes. Boxing keeps the
+    /// stack-resident discriminant + payload small and stops
+    /// `clippy::large_enum_variant` from firing.
+    Triple(Box<TriplePattern>),
     /// A GRAPH block: `GRAPH <iri>|?g { ... }`
     ///
     /// Note: Fluree currently supports only IRI graph names in UPDATE templates.

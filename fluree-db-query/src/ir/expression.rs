@@ -578,6 +578,38 @@ pub enum Function {
     XsdString,
 
     // =========================================================================
+    // Path functions (Cypher shortestPath result values)
+    // =========================================================================
+    /// `length(p)` — hop count of a path value (`nodes - 1`).
+    PathLength,
+
+    // =========================================================================
+    // List functions (Cypher list values)
+    // =========================================================================
+    /// `size(list|string)` — element count of a list or length of a string.
+    Size,
+    /// `head(list)` — first element (null if empty).
+    Head,
+    /// `last(list)` — last element (null if empty).
+    Last,
+    /// `tail(list)` — the list without its first element.
+    Tail,
+    /// `reverse(list|string)` — reversed list or string.
+    Reverse,
+    /// List constructor `[a, b, …]` — builds a list value from its arguments.
+    MakeList,
+    /// `nodes(path)` — the list of node refs along a path value.
+    Nodes,
+    /// `range(start, end[, step])` — inclusive integer list.
+    Range,
+    /// `pathPairs(path)` — consecutive node pairs `[[a,b],[b,c],…]` along a path
+    /// value, each pair a two-element list. Drives per-edge aggregation (IC14).
+    PathPairs,
+    /// `list[index]` — element access (0-based; negative indexes from the end).
+    /// Out-of-range / non-integer index / non-list → unbound (Cypher null).
+    ListIndex,
+
+    // =========================================================================
     // Custom/unknown function
     // =========================================================================
     Custom(String),

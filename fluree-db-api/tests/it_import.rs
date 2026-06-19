@@ -979,6 +979,151 @@ async fn import_single_malformed_jsonld_file_errors() {
 }
 
 // ============================================================================
+// Annotation arena sealing on bulk import
+// ============================================================================
+
+/// Bulk import of a dataset containing `f:reifies*` predicates flips
+/// `ImportResult.has_annotations` to `true`. Pins the upstream signal
+/// the CLI uses to auto-seal the annotation arena after import.
+#[tokio::test]
+async fn import_with_f_reifies_predicates_sets_has_annotations() {
+    let db_dir = tempfile::tempdir().expect("db tmpdir");
+    let data_dir = tempfile::tempdir().expect("data tmpdir");
+
+    // A minimal `f:reifies*` bundle: one anonymous annotation
+    // (`_:ann1`) reifying `ex:alice ex:worksFor ex:acme`. The bundle
+    // alone, without the base edge, is sufficient to push
+    // `f:reifies*` SIDs into the imported ledger's predicate
+    // dictionary — which is what
+    // `has_annotations`/`import_has_annotations` detection scans.
+    let ttl = r"
+@prefix ex: <http://example.org/> .
+@prefix f:  <https://ns.flur.ee/db#> .
+
+ex:alice ex:worksFor ex:acme .
+
+_:ann1 f:reifiesSubject   ex:alice ;
+       f:reifiesPredicate ex:worksFor ;
+       f:reifiesObject    ex:acme .
+";
+    let ttl_path = write_ttl(data_dir.path(), "annotated.ttl", ttl);
+
+    let fluree = FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build file-backed Fluree");
+
+    let result = fluree
+        .create("test/import-annotations:main")
+        .import(&ttl_path)
+        .cleanup(false)
+        .execute()
+        .await
+        .expect("annotation-bearing import should succeed");
+
+    assert!(result.root_id.is_some(), "index should have been built");
+    assert!(
+        result.has_annotations,
+        "import that includes f:reifies* predicates must flip \
+         has_annotations on, so the CLI knows to auto-seal the arena"
+    );
+}
+
+/// Sibling test for the non-annotation path: when the imported TTL
+/// carries no `f:reifies*` predicates, `has_annotations` must stay
+/// `false` so the CLI doesn't pay for a pointless reindex.
+#[tokio::test]
+async fn import_without_f_reifies_predicates_leaves_has_annotations_false() {
+    let db_dir = tempfile::tempdir().expect("db tmpdir");
+    let data_dir = tempfile::tempdir().expect("data tmpdir");
+
+    let ttl = r"
+@prefix ex: <http://example.org/> .
+ex:alice ex:worksFor ex:acme .
+ex:bob   ex:worksFor ex:acme .
+";
+    let ttl_path = write_ttl(data_dir.path(), "plain.ttl", ttl);
+
+    let fluree = FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build file-backed Fluree");
+
+    let result = fluree
+        .create("test/import-no-annotations:main")
+        .import(&ttl_path)
+        .cleanup(false)
+        .execute()
+        .await
+        .expect("plain import should succeed");
+
+    assert!(result.root_id.is_some());
+    assert!(
+        !result.has_annotations,
+        "non-annotation import must NOT flip has_annotations on"
+    );
+}
+
+/// End-to-end: imported annotation-bearing ledger → follow-up
+/// `fluree.reindex(...)` (the same call the CLI's
+/// `fluree create --import` auto-seal step makes) seals the
+/// annotation arena.
+///
+/// Closes the bulk-import seal gap. `ApiAttachmentEventsProvider`
+/// scans the base index for `f:reifies*` flakes when the running
+/// `AttachmentNovelty` overlay is empty but the snapshot's sticky
+/// bit says annotations exist — so the freshly-imported state
+/// (where the f:reifies* flakes live in the base index, not the
+/// overlay) still produces a complete `Authoritative` event set
+/// for the indexer's arena builder.
+#[tokio::test]
+async fn import_then_reindex_seals_annotation_arena() {
+    let db_dir = tempfile::tempdir().expect("db tmpdir");
+    let data_dir = tempfile::tempdir().expect("data tmpdir");
+
+    let ttl = r"
+@prefix ex: <http://example.org/> .
+@prefix f:  <https://ns.flur.ee/db#> .
+
+ex:alice ex:worksFor ex:acme .
+
+_:ann1 f:reifiesSubject   ex:alice ;
+       f:reifiesPredicate ex:worksFor ;
+       f:reifiesObject    ex:acme .
+";
+    let ttl_path = write_ttl(data_dir.path(), "annotated.ttl", ttl);
+
+    let fluree = FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
+        .with_ledger_cache_config(fluree_db_api::LedgerManagerConfig::default())
+        .build()
+        .expect("build file-backed Fluree");
+
+    let ledger_id = "test/import-then-reindex:main";
+    let result = fluree
+        .create(ledger_id)
+        .import(&ttl_path)
+        .cleanup(false)
+        .execute()
+        .await
+        .expect("import should succeed");
+
+    assert!(result.has_annotations, "annotation import must signal");
+
+    // Auto-seal step: same call the CLI's run_bulk_import makes when
+    // `result.has_annotations` is true.
+    fluree
+        .reindex(ledger_id, fluree_db_api::ReindexOptions::default())
+        .await
+        .expect("reindex must succeed");
+
+    let post = fluree.ledger(ledger_id).await.expect("reload");
+    assert!(
+        post.snapshot.has_annotations,
+        "sticky bit must survive the seal pass"
+    );
+    assert!(
+        post.snapshot.annotation_index.is_some(),
+        "annotation arena must be sealed after the auto-seal reindex"
+    );
+}
 // N-Triples (.nt) import tests
 //
 // N-Triples is a strict subset of Turtle, so `.nt` files dispatch to the same

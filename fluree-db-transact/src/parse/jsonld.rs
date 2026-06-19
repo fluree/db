@@ -95,13 +95,67 @@ impl GraphIdAssigner {
 pub fn parse_transaction(
     json: &Value,
     txn_type: TxnType,
-    opts: TxnOpts,
+    mut opts: TxnOpts,
     ns_registry: &mut NamespaceRegistry,
 ) -> Result<Txn> {
+    // M1: lower `@annotation` / `@edge` / `@reifies` into the seven-fact
+    // `f:reifies*` system encoding before JSON-LD expansion. Rejects
+    // user-authored `f:reifies*` IRIs and every deferred shape (literal-
+    // valued annotations, multi-triple reifiers, annotation-of-
+    // annotation) with explicit errors. After this pass the rest of the
+    // parser sees only ordinary IRIs.
+    let mut lowered = json.clone();
+
+    // Pull `lpgEdgeLifecycle` from the transaction's `opts` block when
+    // the programmatic `TxnOpts::lpg_edge_lifecycle` is unset. This
+    // mirrors how `strictCompactIri` is read from the JSON when the
+    // builder doesn't override it.
+    //
+    // Resolved BEFORE the lowering passes so they can branch on it —
+    // an empty `@annotation: {}` is a no-op in RDF mode but mints a
+    // fresh property-less annotation subject in LPG mode (a Cypher
+    // relationship retains identity even without properties).
+    if opts.lpg_edge_lifecycle.is_none() {
+        opts.lpg_edge_lifecycle = json
+            .as_object()
+            .and_then(|m| m.get("opts"))
+            .and_then(|v| v.as_object())
+            .and_then(|o| o.get("lpgEdgeLifecycle"))
+            .and_then(Value::as_bool);
+    }
+    let lpg_mode = opts.lpg_edge_lifecycle.unwrap_or(false);
+
+    // Two-pass lowering for UPDATE transactions:
+    //
+    // 1. Run the user-authored `f:reifies*` firewall against the
+    //    *original* document. Both passes synthesize `f:reifies*`
+    //    IRIs internally; running the firewall a second time would
+    //    falsely flag those.
+    // 2. Run the delete-clause pre-pass. It rewrites `@annotation`
+    //    blocks inside `delete:` into explicit `f:reifies*` retract
+    //    templates so the assertion-shaped lowering below doesn't
+    //    synthesize spurious sibling nodes.
+    // 3. Run the standard assertion-shaped lowering on the rest of
+    //    the document.
+    //
+    // Insert / Upsert paths skip step 2 — their docs don't carry a
+    // `delete` key, so the pre-pass would be a structural no-op
+    // anyway.
+    let top_ctx = super::edge_annotations::top_level_context(&lowered)?;
+    super::edge_annotations::run_user_authored_reifies_firewall(&lowered, &top_ctx)?;
+    if matches!(txn_type, TxnType::Update) {
+        super::edge_annotations::lower_delete_annotation_blocks(&mut lowered)?;
+    }
+    super::edge_annotations::lower_edge_annotations_after_firewall(
+        &mut lowered,
+        &top_ctx,
+        lpg_mode,
+    )?;
+
     match txn_type {
-        TxnType::Insert => parse_insert(json, opts, ns_registry),
-        TxnType::Upsert => parse_upsert(json, opts, ns_registry),
-        TxnType::Update => parse_update(json, opts, ns_registry),
+        TxnType::Insert => parse_insert(&lowered, opts, ns_registry),
+        TxnType::Upsert => parse_upsert(&lowered, opts, ns_registry),
+        TxnType::Update => parse_update(&lowered, opts, ns_registry),
     }
 }
 

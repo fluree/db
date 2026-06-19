@@ -1110,6 +1110,7 @@ where
                 db_stats: Some(db_stats),
                 db_schema,
                 sketch_ref,
+                attachment_events: config.attachment_events.clone(),
             };
 
             let result = super::root_assembly::encode_and_write_root_v6(

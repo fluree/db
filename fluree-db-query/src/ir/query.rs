@@ -269,6 +269,18 @@ pub struct Query {
     /// reorder it relative to OPTIONAL/UNION/etc.  Applied as a final inner-join
     /// constraint after the WHERE operator tree is fully built.
     pub post_values: Option<Pattern>,
+    /// When true, scan operators bypass the **variable-predicate**
+    /// filter that hides Fluree-system predicates (`f:reifies*` in
+    /// every graph; the broader `f:` namespace in the default graph).
+    /// Surfaced via `opts.includeSystemFacts: true` on JSON-LD
+    /// queries; SPARQL has no equivalent option today.
+    ///
+    /// Direct user mention of `f:reifies*` IRIs is rejected at parse
+    /// time (`fluree-db-query` JSON-LD firewall and `fluree-db-sparql`
+    /// post-lower scan) regardless of this flag — the parser
+    /// rejection is the contract-level boundary; this flag only
+    /// relaxes the per-row scan filter for `?p`-shape patterns.
+    pub include_system_facts: bool,
 }
 
 impl Query {
@@ -286,6 +298,7 @@ impl Query {
             offset: None,
             reasoning: ReasoningConfig::default(),
             post_values: None,
+            include_system_facts: false,
         }
     }
 
@@ -306,6 +319,7 @@ impl Query {
             offset: self.offset,
             reasoning: self.reasoning.clone(),
             post_values: self.post_values.clone(),
+            include_system_facts: self.include_system_facts,
         }
     }
 }

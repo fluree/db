@@ -87,15 +87,16 @@ fn compute_head(result: &QueryResult) -> (Vec<String>, Vec<fluree_db_query::VarI
                 b.schema()
                     .iter()
                     .copied()
-                    // Skip internal variables (?__pp0, ?__s0, etc.) from wildcard output.
-                    .filter(|&vid| !result.vars.name(vid).starts_with("?__"))
+                    // Skip internal variables from wildcard output: planner/aggregate
+                    // synthetics (?__pp0, ?__s0, ...) and annotation reifier synthetics (?#...).
+                    .filter(|&vid| !is_internal_var_name(result.vars.name(vid)))
                     .collect()
             })
             .unwrap_or_else(|| {
                 result
                     .vars
                     .iter()
-                    .filter(|(name, _)| !name.starts_with("?__"))
+                    .filter(|(name, _)| !is_internal_var_name(name))
                     .map(|(_, id)| id)
                     .collect()
             })
@@ -268,6 +269,11 @@ fn write_term(out: &mut String, binding: &Binding, compactor: &IriCompactor) -> 
                 "Binding::Grouped should be disaggregated before formatting".to_string(),
             ));
         }
+        Binding::Path(_) | Binding::List(_) => {
+            return Err(FormatError::InvalidBinding(
+                "SPARQL results have no path/list type (Cypher-only)".to_string(),
+            ));
+        }
         Binding::EncodedLit { .. } | Binding::EncodedSid { .. } | Binding::EncodedPid { .. } => {
             unreachable!("encoded bindings are materialized before write_term")
         }
@@ -360,6 +366,8 @@ fn scalar_lexical(val: &FlakeValue) -> String {
 fn strip_question_mark(var_name: &str) -> String {
     var_name.strip_prefix('?').unwrap_or(var_name).to_string()
 }
+
+use super::is_internal_var_name;
 
 /// Format a single binding to SPARQL JSON format
 ///
@@ -598,6 +606,10 @@ fn format_binding(
         // Grouped values should be disaggregated before reaching here
         Binding::Grouped(_) => Err(FormatError::InvalidBinding(
             "Binding::Grouped should be disaggregated before formatting".to_string(),
+        )),
+
+        Binding::Path(_) | Binding::List(_) => Err(FormatError::InvalidBinding(
+            "SPARQL results have no path/list type (Cypher-only)".to_string(),
         )),
 
         Binding::EncodedLit { .. } | Binding::EncodedSid { .. } | Binding::EncodedPid { .. } => {
