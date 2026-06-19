@@ -143,8 +143,11 @@ pub struct LedgerRecord {
 
 /// Replicated idempotency cache entry: enough state to answer a
 /// duplicate submission, but no leader-side details. A different
-/// leader handling a retry can't reconstruct fuel tallies or typed
-/// receipts, so this layer doesn't promise them.
+/// leader handling a retry can't reconstruct full typed receipts
+/// (per-op fields like Merge's `commits_copied` aren't replicated),
+/// so this layer carries a minimal kit — op kind + commit identity
+/// + tally — that's enough for status lookups to answer "yes it
+/// committed" after a leader transition.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ApplyRecord {
     /// CAS identifier of the [`crate::QueuedRequest`] envelope this
@@ -157,6 +160,12 @@ pub struct ApplyRecord {
     /// idempotency key; a mismatch surfaces as
     /// [`Response::BodyHashMismatch`].
     pub body_cid: ContentId,
+    /// Which operation kind staged this commit. Carried so a
+    /// post-leader-transition status lookup can reconstruct the
+    /// right `OperationReceipt` variant from the replicated state;
+    /// the in-process moka cache holds the full typed receipt, this
+    /// only marks the variant.
+    pub body_kind: BodyKind,
     /// Wall-clock at which the cache entry was recorded, milliseconds
     /// since the Unix epoch. Used by `Command::EvictIdempotency` to
     /// age out entries past their TTL.
@@ -261,50 +270,11 @@ pub struct QueueEntry {
     pub body_kind: BodyKind,
 }
 
-/// Mirror of [`crate::TransactionBody`]'s discriminator,
-/// carried inline on the queue entry so the worker can route
-/// without first parsing the body from CAS.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum BodyKind {
-    JsonLdInsert,
-    JsonLdUpsert,
-    JsonLdUpdate,
-    TurtleInsert,
-    TurtleUpsert,
-    TrigUpsert,
-    Sparql,
-    /// Body decodes as `Vec<ContentId>` — a pushed commit chain
-    /// already present in CAS. Worker verifies the chain rather
-    /// than restaging.
-    Pushed,
-    /// Body decodes as a `QueuedRevert` carrying selection +
-    /// conflict strategy. Worker re-runs `prepare_revert` and
-    /// advances the head to the inverse commit.
-    Revert,
-    /// Body decodes as a `QueuedMerge` carrying source / target
-    /// branches + conflict strategy. Worker re-runs `prepare_merge`
-    /// and advances the target's head.
-    Merge,
-    /// Body decodes as a `QueuedRebase` carrying the branch +
-    /// conflict strategy. Worker re-runs `prepare_rebase` and
-    /// advances the branch's head.
-    Rebase,
-}
-
-impl From<&crate::TransactionBody> for BodyKind {
-    fn from(body: &crate::TransactionBody) -> Self {
-        use crate::TransactionBody;
-        match body {
-            TransactionBody::JsonLdInsert(_) => BodyKind::JsonLdInsert,
-            TransactionBody::JsonLdUpsert(_) => BodyKind::JsonLdUpsert,
-            TransactionBody::JsonLdUpdate(_) => BodyKind::JsonLdUpdate,
-            TransactionBody::TurtleInsert(_) => BodyKind::TurtleInsert,
-            TransactionBody::TurtleUpsert(_) => BodyKind::TurtleUpsert,
-            TransactionBody::TrigUpsert(_) => BodyKind::TrigUpsert,
-            TransactionBody::Sparql(_) => BodyKind::Sparql,
-        }
-    }
-}
+// `BodyKind` and `From<&TransactionBody> for BodyKind` live at the
+// crate root so non-raft consumers (e.g. `SubmissionState::Committed`)
+// can reference them without enabling the `raft` feature. The state
+// machine just imports them.
+pub use crate::BodyKind;
 
 /// Failure outcome recorded when a worker poisons a queue entry.
 /// Distinct from [`ApplyRecord`] (which only records successes)
@@ -1477,6 +1447,7 @@ fn apply_head(state: &mut NameServiceState, log_index: u64, args: ApplyHeadArgs)
             ApplyOutcome::Applied(ApplyRecord {
                 request_cid: entry.request_cid,
                 body_cid: entry.body_cid,
+                body_kind: entry.body_kind,
                 recorded_at_millis: applied_at_millis,
                 head: commit_id.clone(),
                 t: commit_t,
@@ -2272,6 +2243,7 @@ mod tests {
             ApplyOutcome::Applied(ApplyRecord {
                 request_cid: cid(7),
                 body_cid: cid(7),
+                body_kind: BodyKind::JsonLdInsert,
                 recorded_at_millis: 2_000,
                 head: cid(2),
                 t: 5,
@@ -2502,6 +2474,7 @@ mod tests {
             ApplyOutcome::Applied(ApplyRecord {
                 request_cid: cid(7),
                 body_cid: cid(7),
+                body_kind: BodyKind::JsonLdInsert,
                 recorded_at_millis: 500,
                 head: cid(42),
                 t: 5,
@@ -2535,6 +2508,7 @@ mod tests {
             ApplyOutcome::Applied(ApplyRecord {
                 request_cid: cid(7),
                 body_cid: cid(7),
+                body_kind: BodyKind::JsonLdInsert,
                 recorded_at_millis: 500,
                 head: cid(42),
                 t: 5,
@@ -3008,6 +2982,7 @@ mod tests {
         ApplyOutcome::Applied(ApplyRecord {
             body_cid: request_cid.clone(),
             request_cid,
+            body_kind: BodyKind::JsonLdInsert,
             recorded_at_millis,
             head: cid(99),
             t: 1,

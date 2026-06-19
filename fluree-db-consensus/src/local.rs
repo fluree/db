@@ -8,9 +8,9 @@
 //! [`Committer`]: crate::Committer
 
 use crate::{
-    Committer, MergeReceipt, MergeRequest, PushReceipt, PushRequest, RebaseReceipt, RebaseRequest,
-    RevertReceipt, RevertRequest, RevertSelection, SubmissionError, TransactionBody,
-    TransactionReceipt, TransactionRequest,
+    Committer, IdempotencyKey, MergeReceipt, MergeRequest, PushReceipt, PushRequest, RebaseReceipt,
+    RebaseRequest, RevertReceipt, RevertRequest, RevertSelection, SubmissionError, SubmissionLookup,
+    SubmissionState, TransactionBody, TransactionReceipt, TransactionRequest,
 };
 use async_trait::async_trait;
 use fluree_db_api::{
@@ -236,6 +236,21 @@ impl Committer for LocalCommitter {
             head_id: response.head.commit_id,
             indexing: response.indexing,
         })
+    }
+}
+
+/// `LocalCommitter` doesn't maintain its own idempotency state — the
+/// caching is wrapped around it by [`CachingCommitter`]. So the
+/// status lookup here is always `Unknown`: the wrapping layer
+/// consults its moka cache first, and only falls through here when
+/// the cache misses. For the Raft path the inner committer is
+/// [`QueuedTransactor`](crate::raft::queued_transactor::QueuedTransactor),
+/// which surfaces a [`SubmissionState::Committed`] from replicated
+/// idempotency state — see its `SubmissionLookup` impl.
+#[async_trait]
+impl SubmissionLookup for LocalCommitter {
+    async fn status(&self, _ledger_id: &str, _key: &IdempotencyKey) -> SubmissionState {
+        SubmissionState::Unknown
     }
 }
 

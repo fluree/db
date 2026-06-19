@@ -139,6 +139,25 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         );
     let v1_leader_only_routes = apply_leader_forward(v1_leader_only_routes, &state);
 
+    // Read-only routes that nonetheless need leader-forward because
+    // their backing state lives in the leader's per-process caches.
+    // Today: submission status, which reads from the
+    // [`CachingCommitter`]'s in-process idempotency cache. A follower
+    // serving this locally returns `Unknown` for a key the leader
+    // accepted (the cache is per-process) — leader-forward closes
+    // that hole. Note that this still has a known gap across leader
+    // transitions: the new leader's cache won't carry entries the
+    // old leader served; clients hitting that gap need to re-issue
+    // (idempotency dedups the actual write) or verify via the commit
+    // log endpoint. Serving from replicated idempotency state would
+    // close the gap entirely but requires adding op-type metadata to
+    // the persisted `ApplyRecord` — tracked as a follow-up.
+    let v1_leader_forwarded_reads = Router::new().route(
+        "/submissions/:key/*ledger",
+        get(submissions::submission_status),
+    );
+    let v1_leader_forwarded_reads = apply_leader_forward(v1_leader_forwarded_reads, &state);
+
     let v1 = Router::new()
         // Admin endpoints (stats and whoami are read-only, no auth required)
         .route("/stats", get(admin::stats))
@@ -166,11 +185,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/explain/*ledger",
             get(query::explain_ledger_tail).post(query::explain_ledger_tail),
         )
-        // Submission status lookup (by idempotency key)
-        .route(
-            "/submissions/:key/*ledger",
-            get(submissions::submission_status),
-        )
+        // Submission status lookup (by idempotency key). Mounted as
+        // a leader-forwarded sub-router above so a follower doesn't
+        // answer from its empty per-process cache.
+        .merge(v1_leader_forwarded_reads)
         // Default context management
         .route(
             "/context/*ledger",

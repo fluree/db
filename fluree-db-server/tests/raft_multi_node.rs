@@ -758,3 +758,186 @@ async fn leader_failover_resumes_writes() {
             .await;
     }
 }
+
+/// Submitting through any node with an idempotency key, then asking
+/// any *other* node for the submission status, must return a
+/// `Committed` answer — not the spurious `Unknown` a follower's empty
+/// per-process cache used to return. The route is leader-forwarded
+/// for exactly this reason.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn submission_status_reachable_from_any_node() {
+    let cluster = TestCluster::spawn(CLUSTER_SIZE).await;
+    cluster.bootstrap().await;
+
+    let ledger = "raft:status";
+    let writer = cluster.pick_follower().await;
+    cluster.create_ledger(writer, ledger).await;
+
+    // Idempotency-keyed insert through a follower (so the leader's
+    // CachingCommitter is the cache holder, not this follower).
+    let key = "01J5STATUSCHECK01";
+    let insert_url = format!("{}/v1/fluree/insert", cluster.public_url(writer));
+    let body = json!({
+        "@context": { "ex": "http://example.org/" },
+        "@id": "ex:status-check",
+        "ex:name": "StatusCheck",
+    });
+    let resp = cluster
+        .client
+        .post(&insert_url)
+        .header("content-type", "application/json")
+        .header("fluree-ledger", ledger)
+        .header("idempotency-key", key)
+        .body(body.to_string())
+        .send()
+        .await
+        .expect("insert request");
+    assert!(
+        resp.status().is_success(),
+        "insert returned {}: {}",
+        resp.status(),
+        resp.text().await.unwrap_or_default()
+    );
+
+    // Every node — leader and every follower — should answer
+    // `Committed` for that key. Without leader-forward, every node
+    // except the leader would answer `Unknown`.
+    for node in &cluster.nodes {
+        let url = format!(
+            "{}/v1/fluree/submissions/{key}/{ledger}",
+            cluster.public_url(node.node_id),
+        );
+        let resp = cluster
+            .client
+            .get(&url)
+            .send()
+            .await
+            .expect("status request");
+        assert!(
+            resp.status().is_success(),
+            "status via node {} returned {}: {}",
+            node.node_id,
+            resp.status(),
+            resp.text().await.unwrap_or_default()
+        );
+        let json: serde_json::Value = resp.json().await.expect("status json");
+        let state = json.get("state").and_then(|v| v.as_str()).unwrap_or("");
+        assert_eq!(
+            state, "committed",
+            "node {} should see the submission as committed, got {state:?} (full body: {json})",
+            node.node_id
+        );
+    }
+}
+
+/// Submission status survives a leader transition: even after the
+/// leader that served the original write is gone (taking its
+/// in-process moka cache with it), the new leader can answer
+/// `committed` from replicated idempotency state. The `detail`
+/// block is `null` on this path because the per-op detail (conflict
+/// counts, branch names, etc.) isn't replicated, but the canonical
+/// kit (`commit_id`, `t`, `kind`) is — enough for clients verifying
+/// "did my submission land?"
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn submission_status_survives_leader_transition() {
+    let mut cluster = TestCluster::spawn(CLUSTER_SIZE).await;
+    cluster.bootstrap().await;
+
+    let ledger = "raft:status-transition";
+    let original_leader = cluster.current_leader().await.expect("leader present");
+    cluster.create_ledger(original_leader, ledger).await;
+
+    let key = "01J5TRANSITIONSTATUS";
+    let insert_url = format!("{}/v1/fluree/insert", cluster.public_url(original_leader));
+    let body = json!({
+        "@context": { "ex": "http://example.org/" },
+        "@id": "ex:transition-check",
+        "ex:name": "TransitionCheck",
+    });
+    let resp = cluster
+        .client
+        .post(&insert_url)
+        .header("content-type", "application/json")
+        .header("fluree-ledger", ledger)
+        .header("idempotency-key", key)
+        .body(body.to_string())
+        .send()
+        .await
+        .expect("insert request");
+    assert!(
+        resp.status().is_success(),
+        "insert via original leader returned {}: {}",
+        resp.status(),
+        resp.text().await.unwrap_or_default()
+    );
+
+    // Kill the leader so the surviving quorum elects a new one. The
+    // new leader's per-process moka cache will be empty for the key
+    // we just used — the replicated idempotency state is the only
+    // source of truth post-transition.
+    cluster.shutdown_node(original_leader).await;
+    let deadline = Instant::now() + DEFAULT_TIMEOUT;
+    let new_leader = loop {
+        if let Some(id) = cluster.current_leader().await {
+            if id != original_leader {
+                break id;
+            }
+        }
+        if Instant::now() >= deadline {
+            panic!("no new leader elected within {DEFAULT_TIMEOUT:?}");
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    assert_ne!(new_leader, original_leader);
+
+    // Any surviving node should answer `committed`. The reply
+    // carries the `minimal` operation variant because the typed
+    // receipt died with the old leader.
+    for node in cluster.nodes.iter().filter(|n| n.is_alive()) {
+        let url = format!(
+            "{}/v1/fluree/submissions/{key}/{ledger}",
+            cluster.public_url(node.node_id),
+        );
+        let resp = cluster
+            .client
+            .get(&url)
+            .send()
+            .await
+            .expect("status request");
+        assert!(
+            resp.status().is_success(),
+            "status via node {} returned {}: {}",
+            node.node_id,
+            resp.status(),
+            resp.text().await.unwrap_or_default()
+        );
+        let json: serde_json::Value = resp.json().await.expect("status json");
+        let state = json.get("state").and_then(|v| v.as_str()).unwrap_or("");
+        assert_eq!(
+            state, "committed",
+            "node {} should see the submission as committed after leader transition; got {state:?} (full body: {json})",
+            node.node_id
+        );
+        // The per-op detail is gone post-transition; `detail` is
+        // absent (`#[serde(skip_serializing_if = "Option::is_none")]`).
+        // The canonical kit — `kind`, `commit_id`, `t` — is
+        // preserved on the `committed` envelope.
+        assert!(
+            json.get("detail").is_none(),
+            "expected detail to be absent post-transition; got {json}"
+        );
+        let kind = json.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+        assert_eq!(
+            kind, "transact",
+            "expected kind=transact, got {kind:?} (full body: {json})"
+        );
+        let commit_id = json
+            .get("commit_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        assert!(
+            !commit_id.is_empty(),
+            "committed envelope should carry the commit_id; got {json}"
+        );
+    }
+}

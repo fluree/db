@@ -15,8 +15,8 @@ use axum::{
     Json,
 };
 use fluree_db_consensus::{
-    IdempotencyKey, MergeReceipt, OperationReceipt, PushReceipt, RebaseReceipt, RevertReceipt,
-    SubmissionState, TransactionReceipt,
+    BodyKind, IdempotencyKey, MergeReceipt, OperationReceipt, PushReceipt, RebaseReceipt,
+    RevertReceipt, SubmissionState, TransactionReceipt,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -32,20 +32,48 @@ pub struct SubmissionStatusParams {
 }
 
 /// JSON response shape for a submission status query.
+///
+/// The `Committed` variant always carries the canonical kit
+/// (`commit_id`, `t`, `kind`, `idempotency_key`) and an optional
+/// `detail` block with the full per-op response. `detail` is `null`
+/// when the in-process receipt cache no longer holds the typed
+/// receipt — typically after a leader transition, a process
+/// restart, or moka TTL eviction. The commit identity above is
+/// already authoritative; clients that want full per-op fields can
+/// chase them through the commit-log endpoint.
 #[derive(Serialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum SubmissionStateResponse {
     Unknown,
     InFlight,
-    Committed { status: OperationStatusResponse },
-    Failed { error: String },
+    Committed {
+        idempotency_key: Option<String>,
+        /// Op kind — `"transact"`, `"push"`, `"revert"`, `"merge"`,
+        /// or `"rebase"`. The seven transact body shapes (JSON-LD
+        /// insert/upsert/update, Turtle insert/upsert, TriG upsert,
+        /// SPARQL) collapse to `"transact"` so clients don't have to
+        /// branch on body format.
+        kind: &'static str,
+        commit_id: String,
+        t: i64,
+        /// Full per-op detail when the originating node still has
+        /// the typed receipt cached. `null` after leader transition
+        /// / restart / cache eviction.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        detail: Option<OperationDetailResponse>,
+    },
+    Failed {
+        error: String,
+    },
 }
 
-/// Polymorphic status response — discriminated by the operation kind that
-/// produced it, so callers can recover the per-op fields after the fact.
+/// Per-op detail block, present on `Committed` when the typed
+/// receipt was recoverable from the in-process cache. Discriminated
+/// on `operation` matching the kit-level `kind`, but carrying the
+/// richer field set.
 #[derive(Serialize)]
 #[serde(tag = "operation", rename_all = "snake_case")]
-pub enum OperationStatusResponse {
+pub enum OperationDetailResponse {
     Transaction(TransactionStatusResponse),
     Revert(RevertStatusResponse),
     Merge(MergeStatusResponse),
@@ -148,8 +176,19 @@ impl From<SubmissionState> for SubmissionStateResponse {
         match state {
             SubmissionState::Unknown => Self::Unknown,
             SubmissionState::InFlight => Self::InFlight,
-            SubmissionState::Committed(receipt) => Self::Committed {
-                status: receipt.into(),
+            SubmissionState::Committed {
+                idempotency_key,
+                kind,
+                commit_id,
+                t,
+                tally: _,
+                receipt,
+            } => Self::Committed {
+                idempotency_key: idempotency_key.map(|k| k.as_str().to_string()),
+                kind: body_kind_tag(kind),
+                commit_id: commit_id.to_string(),
+                t,
+                detail: receipt.map(OperationDetailResponse::from),
             },
             SubmissionState::Failed(err) => Self::Failed {
                 error: err.to_string(),
@@ -158,7 +197,7 @@ impl From<SubmissionState> for SubmissionStateResponse {
     }
 }
 
-impl From<OperationReceipt> for OperationStatusResponse {
+impl From<OperationReceipt> for OperationDetailResponse {
     fn from(receipt: OperationReceipt) -> Self {
         match receipt {
             OperationReceipt::Transaction(r) => Self::Transaction(r.into()),
@@ -167,6 +206,25 @@ impl From<OperationReceipt> for OperationStatusResponse {
             OperationReceipt::Rebase(r) => Self::Rebase(r.into()),
             OperationReceipt::Push(r) => Self::Push(r.into()),
         }
+    }
+}
+
+fn body_kind_tag(kind: BodyKind) -> &'static str {
+    match kind {
+        // The seven transact body shapes share one public tag —
+        // clients branch on `kind` without having to know JSON-LD
+        // vs Turtle vs SPARQL.
+        BodyKind::JsonLdInsert
+        | BodyKind::JsonLdUpsert
+        | BodyKind::JsonLdUpdate
+        | BodyKind::TurtleInsert
+        | BodyKind::TurtleUpsert
+        | BodyKind::TrigUpsert
+        | BodyKind::Sparql => "transact",
+        BodyKind::Pushed => "push",
+        BodyKind::Revert => "revert",
+        BodyKind::Merge => "merge",
+        BodyKind::Rebase => "rebase",
     }
 }
 

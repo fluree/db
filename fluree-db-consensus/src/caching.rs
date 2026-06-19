@@ -15,10 +15,10 @@
 //! adds no operation-pipeline work of its own.
 
 use crate::{
-    Committer, IdempotencyCacheKey, IdempotencyKey, LocalCommitter, MergeReceipt, MergeRequest,
-    OperationReceipt, PushReceipt, PushRequest, RebaseReceipt, RebaseRequest, RevertReceipt,
-    RevertRequest, RevertSelection, SubmissionError, SubmissionLookup, SubmissionState,
-    TransactionReceipt, TransactionRequest,
+    BodyKind, Committer, IdempotencyCacheKey, IdempotencyKey, LocalCommitter, MergeReceipt,
+    MergeRequest, OperationReceipt, PushReceipt, PushRequest, RebaseReceipt, RebaseRequest,
+    RevertReceipt, RevertRequest, RevertSelection, SubmissionError, SubmissionLookup,
+    SubmissionState, TransactionReceipt, TransactionRequest,
 };
 use async_trait::async_trait;
 use fluree_db_api::{CommitRef, Fluree};
@@ -167,28 +167,39 @@ impl<C: Committer> CachingCommitter<C> {
             return Err(SubmissionError::KeyCollision);
         }
         match existing.state {
-            SubmissionState::Committed(receipt) => Ok(Some(receipt)),
+            // Cache entries written by `record_outcome` always carry
+            // a `Some(receipt)` — the `None` arm here is defensive,
+            // covering a hypothetical post-refactor regression. The
+            // `None` case in the wire-level `SubmissionState` is
+            // reserved for the replicated-state fallback in
+            // `SubmissionLookup` (post-leader-transition reads), which
+            // doesn't flow through this map.
+            SubmissionState::Committed {
+                receipt: Some(r), ..
+            } => Ok(Some(r)),
             _ => Err(SubmissionError::AlreadyInFlight),
         }
     }
 
     /// Record the outcome of a freshly-executed claim back into the cache.
     ///
-    /// `wrap` lifts the per-operation receipt into the umbrella
-    /// [`OperationReceipt`] so the cache stays uniform across operation
-    /// kinds.
+    /// `project_committed` lifts the per-operation receipt into a
+    /// fully-populated [`SubmissionState::Committed`] — the caller
+    /// supplies the canonical kit (op kind + commit identity) and
+    /// the typed [`OperationReceipt`] together because both come
+    /// from the same per-op response shape. Failures bypass the
+    /// projection and store directly as [`SubmissionState::Failed`].
     async fn record_outcome<R, F>(
         &self,
         cache_key: IdempotencyCacheKey,
         body_hash: [u8; 32],
         outcome: &Result<R, SubmissionError>,
-        wrap: F,
+        project_committed: F,
     ) where
-        R: Clone,
-        F: FnOnce(R) -> OperationReceipt,
+        F: FnOnce(&R) -> SubmissionState,
     {
         let final_state = match outcome {
-            Ok(receipt) => SubmissionState::Committed(wrap(receipt.clone())),
+            Ok(receipt) => project_committed(receipt),
             Err(err) => SubmissionState::Failed(err.clone()),
         };
         self.cache
@@ -321,13 +332,22 @@ impl<C: Committer> Committer for CachingCommitter<C> {
             };
         }
 
+        // Capture the body discriminator before the move; the
+        // canonical kit on the cached `Committed` state needs it
+        // (`BodyKind` doubles as the public op-kind label on the
+        // wire response).
+        let body_kind = BodyKind::from(&request.body);
         let outcome = self.executor.transact(request).await;
-        self.record_outcome(
-            cache_key,
-            body_hash,
-            &outcome,
-            OperationReceipt::Transaction,
-        )
+        self.record_outcome(cache_key, body_hash, &outcome, |r: &TransactionReceipt| {
+            SubmissionState::Committed {
+                idempotency_key: r.idempotency_key.clone(),
+                kind: body_kind,
+                commit_id: r.commit.commit_id.clone(),
+                t: r.commit.t,
+                tally: r.tally.clone(),
+                receipt: Some(OperationReceipt::Transaction(r.clone())),
+            }
+        })
         .await;
         outcome
     }
@@ -353,8 +373,17 @@ impl<C: Committer> Committer for CachingCommitter<C> {
         }
 
         let outcome = self.executor.revert(request).await;
-        self.record_outcome(cache_key, body_hash, &outcome, OperationReceipt::Revert)
-            .await;
+        self.record_outcome(cache_key, body_hash, &outcome, |r: &RevertReceipt| {
+            SubmissionState::Committed {
+                idempotency_key: r.idempotency_key.clone(),
+                kind: BodyKind::Revert,
+                commit_id: r.new_head_id.clone(),
+                t: r.new_head_t,
+                tally: None,
+                receipt: Some(OperationReceipt::Revert(r.clone())),
+            }
+        })
+        .await;
         outcome
     }
 
@@ -381,8 +410,17 @@ impl<C: Committer> Committer for CachingCommitter<C> {
         }
 
         let outcome = self.executor.merge(request).await;
-        self.record_outcome(cache_key, body_hash, &outcome, OperationReceipt::Merge)
-            .await;
+        self.record_outcome(cache_key, body_hash, &outcome, |r: &MergeReceipt| {
+            SubmissionState::Committed {
+                idempotency_key: r.idempotency_key.clone(),
+                kind: BodyKind::Merge,
+                commit_id: r.new_head_id.clone(),
+                t: r.new_head_t,
+                tally: None,
+                receipt: Some(OperationReceipt::Merge(r.clone())),
+            }
+        })
+        .await;
         outcome
     }
 
@@ -408,8 +446,22 @@ impl<C: Committer> Committer for CachingCommitter<C> {
         }
 
         let outcome = self.executor.rebase(request).await;
-        self.record_outcome(cache_key, body_hash, &outcome, OperationReceipt::Rebase)
-            .await;
+        self.record_outcome(cache_key, body_hash, &outcome, |r: &RebaseReceipt| {
+            // Rebase's "commit identity" is the source's head — the
+            // convergence point the branch was rebased onto. The
+            // branch's own new head (replays on top) isn't recorded
+            // in the receipt; clients that need it follow up via
+            // commit-log.
+            SubmissionState::Committed {
+                idempotency_key: r.idempotency_key.clone(),
+                kind: BodyKind::Rebase,
+                commit_id: r.source_head_id.clone(),
+                t: r.source_head_t,
+                tally: None,
+                receipt: Some(OperationReceipt::Rebase(r.clone())),
+            }
+        })
+        .await;
         outcome
     }
 
@@ -433,20 +485,37 @@ impl<C: Committer> Committer for CachingCommitter<C> {
         }
 
         let outcome = self.executor.push(request).await;
-        self.record_outcome(cache_key, body_hash, &outcome, OperationReceipt::Push)
-            .await;
+        self.record_outcome(cache_key, body_hash, &outcome, |r: &PushReceipt| {
+            SubmissionState::Committed {
+                idempotency_key: r.idempotency_key.clone(),
+                kind: BodyKind::Pushed,
+                commit_id: r.head_id.clone(),
+                t: r.head_t,
+                tally: None,
+                receipt: Some(OperationReceipt::Push(r.clone())),
+            }
+        })
+        .await;
         outcome
     }
 }
 
 #[async_trait]
-impl<C: Committer> SubmissionLookup for CachingCommitter<C> {
+impl<C: Committer + SubmissionLookup> SubmissionLookup for CachingCommitter<C> {
     async fn status(&self, ledger_id: &str, key: &IdempotencyKey) -> SubmissionState {
         let cache_key = IdempotencyCacheKey::new(ledger_id, key.clone());
-        match self.cache.get(&cache_key).await {
-            Some(entry) => entry.state,
-            None => SubmissionState::Unknown,
+        if let Some(entry) = self.cache.get(&cache_key).await {
+            return entry.state;
         }
+        // Local moka miss — fall through to the inner committer's
+        // status. For [`LocalCommitter`] this is a noop (always
+        // `Unknown`); for the Raft path the inner
+        // [`QueuedTransactor`](crate::raft::queued_transactor::QueuedTransactor)
+        // consults the replicated idempotency state and surfaces a
+        // [`OperationReceipt::Minimal`] for entries any node committed
+        // through consensus, including ones a different leader served
+        // before this node took over.
+        self.executor.status(ledger_id, key).await
     }
 }
 
@@ -530,7 +599,10 @@ mod tests {
         assert_eq!(receipt.idempotency_key.as_ref(), Some(&key));
 
         match committer.status(&ledger_id, &key).await {
-            SubmissionState::Committed(OperationReceipt::Transaction(stored)) => {
+            SubmissionState::Committed {
+                receipt: Some(OperationReceipt::Transaction(stored)),
+                ..
+            } => {
                 assert_eq!(stored.commit.t, receipt.commit.t);
                 assert_eq!(stored.commit.commit_id, receipt.commit.commit_id);
             }
@@ -913,7 +985,10 @@ ex:alice ex:name "Alice" ."#;
             .expect("revert to succeed");
 
         match committer.status(&ledger_id, &key).await {
-            SubmissionState::Committed(OperationReceipt::Revert(stored)) => {
+            SubmissionState::Committed {
+                receipt: Some(OperationReceipt::Revert(stored)),
+                ..
+            } => {
                 assert_eq!(stored.new_head_t, receipt.new_head_t);
                 assert_eq!(stored.new_head_id, receipt.new_head_id);
             }
@@ -1035,7 +1110,10 @@ ex:alice ex:name "Alice" ."#;
         // Status namespacing for merge is `ledger:source_branch`.
         let cache_ledger_id = fluree_db_api::format_ledger_id("test/committer", "feature");
         match committer.status(&cache_ledger_id, &key).await {
-            SubmissionState::Committed(OperationReceipt::Merge(stored)) => {
+            SubmissionState::Committed {
+                receipt: Some(OperationReceipt::Merge(stored)),
+                ..
+            } => {
                 assert_eq!(stored.new_head_t, receipt.new_head_t);
                 assert_eq!(stored.new_head_id, receipt.new_head_id);
                 assert_eq!(stored.fast_forward, receipt.fast_forward);
@@ -1124,7 +1202,10 @@ ex:alice ex:name "Alice" ."#;
         // Cache namespace for rebase is `ledger:branch` (the branch being rebased).
         let cache_ledger_id = fluree_db_api::format_ledger_id("test/committer", "feature");
         match committer.status(&cache_ledger_id, &key).await {
-            SubmissionState::Committed(OperationReceipt::Rebase(stored)) => {
+            SubmissionState::Committed {
+                receipt: Some(OperationReceipt::Rebase(stored)),
+                ..
+            } => {
                 assert_eq!(stored.source_head_t, receipt.source_head_t);
                 assert_eq!(stored.source_head_id, receipt.source_head_id);
                 assert_eq!(stored.fast_forward, receipt.fast_forward);

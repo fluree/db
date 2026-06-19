@@ -241,6 +241,56 @@ impl TransactionBody {
     }
 }
 
+/// Discriminator for [`Committer`] submission kinds. The Raft path
+/// stores it alongside each `EnqueueCommandArgs` so the worker can
+/// route without first parsing the body from CAS; status responses
+/// surface it on [`SubmissionState::Committed`] so clients can tell
+/// what kind of submission they're confirming.
+///
+/// The seven transact variants mirror [`TransactionBody`]'s
+/// discriminators (and convert via [`From<&TransactionBody>`]).
+/// The remaining four match the non-transact `Committer` methods.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BodyKind {
+    JsonLdInsert,
+    JsonLdUpsert,
+    JsonLdUpdate,
+    TurtleInsert,
+    TurtleUpsert,
+    TrigUpsert,
+    Sparql,
+    /// Body decodes as `Vec<ContentId>` — a pushed commit chain
+    /// already present in CAS. Worker verifies the chain rather
+    /// than restaging.
+    Pushed,
+    /// Body decodes as a `QueuedRevert` carrying selection +
+    /// conflict strategy. Worker re-runs `prepare_revert` and
+    /// advances the head to the inverse commit.
+    Revert,
+    /// Body decodes as a `QueuedMerge` carrying source / target
+    /// branches + conflict strategy. Worker re-runs `prepare_merge`
+    /// and advances the target's head.
+    Merge,
+    /// Body decodes as a `QueuedRebase` carrying the branch +
+    /// conflict strategy. Worker re-runs `prepare_rebase` and
+    /// advances the branch's head.
+    Rebase,
+}
+
+impl From<&TransactionBody> for BodyKind {
+    fn from(body: &TransactionBody) -> Self {
+        match body {
+            TransactionBody::JsonLdInsert(_) => BodyKind::JsonLdInsert,
+            TransactionBody::JsonLdUpsert(_) => BodyKind::JsonLdUpsert,
+            TransactionBody::JsonLdUpdate(_) => BodyKind::JsonLdUpdate,
+            TransactionBody::TurtleInsert(_) => BodyKind::TurtleInsert,
+            TransactionBody::TurtleUpsert(_) => BodyKind::TurtleUpsert,
+            TransactionBody::TrigUpsert(_) => BodyKind::TrigUpsert,
+            TransactionBody::Sparql(_) => BodyKind::Sparql,
+        }
+    }
+}
+
 /// Serializable envelope a consensus-coordinated committer writes to
 /// shared content-addressed storage before enqueueing work.
 ///
@@ -542,10 +592,17 @@ pub struct PushReceipt {
 
 /// Receipt for any operation submitted through consensus.
 ///
-/// Variants correspond one-to-one with [`Committer`] trait methods. The
-/// umbrella type lets [`SubmissionState`] and the idempotency cache stay
-/// uniform across operation kinds without erasing per-op typing at the
-/// trait methods themselves.
+/// Variants correspond one-to-one with [`Committer`] trait methods.
+/// The umbrella type lets [`SubmissionState::Committed`] and the
+/// in-process idempotency cache carry the full typed receipt
+/// uniformly across operation kinds.
+///
+/// Status lookups that can't recover the typed receipt (after a
+/// leader transition or process restart cleared the cache) surface
+/// [`SubmissionState::Committed`] with `receipt: None` and the
+/// canonical kit (commit identity + body kind + tally) on the
+/// struct variant — [`OperationReceipt`] itself stays aligned with
+/// the [`Committer`] surface.
 #[derive(Debug, Clone)]
 pub enum OperationReceipt {
     Transaction(TransactionReceipt),
@@ -563,7 +620,28 @@ pub enum SubmissionState {
     /// Submission accepted, durability not yet acknowledged.
     InFlight,
     /// Submission durably accepted and committed.
-    Committed(OperationReceipt),
+    ///
+    /// The canonical kit (`commit_id`, `t`, `kind`, `tally`,
+    /// `idempotency_key`) is always populated — it's what a client
+    /// asking "did my submission land?" actually needs, and it's
+    /// recoverable from either the in-process idempotency cache or
+    /// the Raft-replicated state.
+    ///
+    /// `receipt` is `Some` when the originating node still has the
+    /// typed [`OperationReceipt`] cached (the moka entry hasn't been
+    /// evicted and the process hasn't restarted). It's `None` after
+    /// a leader transition / restart / cache eviction — clients that
+    /// want full per-op detail can chase it through the commit log
+    /// endpoint, but the commit identity above is already
+    /// authoritative.
+    Committed {
+        idempotency_key: Option<IdempotencyKey>,
+        kind: BodyKind,
+        commit_id: CommitId,
+        t: i64,
+        tally: Option<TrackingTally>,
+        receipt: Option<OperationReceipt>,
+    },
     /// Submission attempted but failed.
     Failed(SubmissionError),
 }

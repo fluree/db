@@ -21,17 +21,17 @@
 
 use crate::raft::staged_receipt::AppliedReceipt;
 use crate::raft::state_machine::{
-    ApplyRecord, BodyKind, Command as SmCommand, EnqueueCommandArgs, PoisonRecord, RefKey,
-    Response as SmResponse,
+    ApplyOutcome, ApplyRecord, BodyKind, Command as SmCommand, EnqueueCommandArgs, PoisonRecord,
+    RefKey, Response as SmResponse,
 };
 use crate::raft::state_machine_adapter::SharedState;
 use crate::raft::waiter::{AbortReason, WaiterMap, WaiterOutcome};
 use crate::raft::TypeConfig;
 use crate::{
-    Committer, IdempotencyCacheKey, MergeReceipt, MergeRequest, PushReceipt, PushRequest,
-    QueuedMerge, QueuedPush, QueuedRebase, QueuedRequest, QueuedRevert, QueuedTransact,
-    RebaseReceipt, RebaseRequest, RevertReceipt, RevertRequest, SubmissionError,
-    TransactionReceipt, TransactionRequest,
+    Committer, IdempotencyCacheKey, IdempotencyKey, MergeReceipt, MergeRequest, PushReceipt,
+    PushRequest, QueuedMerge, QueuedPush, QueuedRebase, QueuedRequest, QueuedRevert, QueuedTransact,
+    RebaseReceipt, RebaseRequest, RevertReceipt, RevertRequest, SubmissionError, SubmissionLookup,
+    SubmissionState, TransactionReceipt, TransactionRequest,
 };
 use async_trait::async_trait;
 use fluree_db_api::{CommitReceipt, Fluree};
@@ -692,6 +692,62 @@ impl Committer for QueuedTransactor {
                 message: format!("cached failure: {:?}", record.reason),
             }),
         }
+    }
+}
+
+/// Status lookup backed by the replicated idempotency state.
+///
+/// The wrapping [`CachingCommitter`](crate::CachingCommitter) checks
+/// its in-process moka cache first — that has the full typed
+/// [`OperationReceipt`] the originating node produced and returns
+/// [`SubmissionState::Committed`] with `receipt: Some(...)`. Only on
+/// a cache miss does the call land here, and that's the path that
+/// closes the post-leader-transition gap: the new leader's moka
+/// won't carry entries the old leader served, but
+/// `state.idempotency` is replicated, so this lookup still returns
+/// `Committed` for any submission that completed before the
+/// transition.
+///
+/// `receipt` is `None` on this path — the per-op detail (conflict
+/// counts, merge target branch, etc.) isn't replicated. The
+/// canonical kit (`commit_id`, `t`, `kind`, `tally`) is enough for
+/// clients verifying "did my submission land?"; richer detail can
+/// be chased through the commit-log endpoint.
+#[async_trait]
+impl SubmissionLookup for QueuedTransactor {
+    async fn status(&self, ledger_id: &str, key: &IdempotencyKey) -> SubmissionState {
+        let cache_key = IdempotencyCacheKey::new(ledger_id, key.clone());
+        let state = self.shared_state.read().await;
+        match state.idempotency.get(&cache_key) {
+            Some(ApplyOutcome::Applied(record)) => committed_from_applied(key.clone(), record),
+            Some(ApplyOutcome::Failed(record)) => {
+                SubmissionState::Failed(failure_from_poison(record))
+            }
+            None => SubmissionState::Unknown,
+        }
+    }
+}
+
+fn committed_from_applied(key: IdempotencyKey, record: &ApplyRecord) -> SubmissionState {
+    SubmissionState::Committed {
+        idempotency_key: Some(key),
+        kind: record.body_kind,
+        commit_id: record.head.clone(),
+        t: record.t,
+        tally: record.tally.clone().map(Into::into),
+        receipt: None,
+    }
+}
+
+fn failure_from_poison(record: &PoisonRecord) -> SubmissionError {
+    // Failure shape — the replicated `PoisonRecord` only carries the
+    // poison reason (e.g. `BodyMalformed`, `StagingFailed`); surface
+    // it as an `Execution` error with the reason embedded. Clients
+    // that need richer typing can use the body via the commit log;
+    // the status route only promises pass/fail + identity.
+    SubmissionError::Execution {
+        status: 500,
+        message: format!("submission failed: {:?}", record.reason),
     }
 }
 
