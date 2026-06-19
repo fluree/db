@@ -1,16 +1,16 @@
 # Cypher (openCypher 9 subset)
 
-> **Status: v1 (preview).** This page describes the Cypher surface
-> exposed by Fluree DB as of the first delivery. Many of the features
-> users expect from Neo4j are explicitly out of scope for v1 and are
-> called out below. See `GQL_CYPHER_SUPPORT.md` at the repository root
-> for the design and roadmap.
+Fluree accepts a subset of [openCypher 9][opencypher] on top of the same query
+IR and transaction pipeline as JSON-LD and SPARQL — the planner, executor, and
+result formatter are shared across all three surfaces. A Cypher
+relationship-with-properties — `(a)-[:WORKS_FOR {role: "..."}]->(b)` — maps to
+Fluree's edge-annotation primitive ([concept](edge-annotations.md),
+[internals](../design/edge-annotations.md)), so property-graph edges and RDF
+quoted-triple annotations are the same data read from two angles.
 
-Fluree DB accepts a useful subset of [openCypher 9][opencypher] on top
-of the same query IR and transaction pipeline as JSON-LD and SPARQL.
-Cypher relationship-with-properties — `(a)-[:WORKS_FOR {role: "..."}]->(b)`
-— maps to Fluree's edge-annotation primitive
-([concept](edge-annotations.md), [internals](../design/edge-annotations.md)).
+It is a *subset*: the constructs Fluree does not yet accept are listed under
+[Not yet supported](#not-yet-supported), and each produces a clear error rather
+than silently misbehaving.
 
 [opencypher]: https://opencypher.org/resources/
 
@@ -32,9 +32,53 @@ MATCH (p:Person {name: "Alice"})-[:WORKS_FOR {role: "Engineer"}]->(o:Organizatio
 RETURN p, o
 ```
 
+## Running Cypher
+
+Cypher is read/write — reads go through the query path, writes through the
+transaction path. Both require a target ledger (Cypher has no `FROM`/dataset
+clause). Read and write are split into separate endpoints/methods for parity
+with SPARQL, but the *statement* determines what runs.
+
+**Rust API**
+
 ```rust
-let result = fluree.query_cypher(&db, cypher).await?;
+// read
+let result = fluree.query_cypher(&db, "MATCH (n:Person) RETURN n.name").await?;
+// write
+let committed = fluree.transact_cypher(ledger, "CREATE (n:Person {name: \"Alice\"})").await?;
 ```
+
+Parameterized forms (`$param`) are available via `query_cypher_with_params` /
+`transact_cypher_with_params`.
+
+**CLI** — Cypher is auto-detected from a `.cypher`/`.cyp`/`.cql` file extension
+or a leading `MATCH`/`CREATE`/`MERGE`/…; force it with `--cypher` (query) or
+`--format cypher` (update):
+
+```bash
+fluree query my/ledger -e 'MATCH (n:Person) RETURN n.name' --cypher
+fluree update my/ledger -f create.cypher
+```
+
+Cypher results default to **cypher-json** (a Neo4j-compatible tabular envelope
+with native scalars); pass `--format jsonld` for the RDF JSON-LD form.
+
+**HTTP** — send the statement with `Content-Type: application/cypher` to the
+ledger-scoped query/update endpoints:
+
+```bash
+curl -X POST http://localhost:8090/v1/fluree/query/my/ledger \
+  -H 'Content-Type: application/cypher' \
+  --data 'MATCH (n:Person) RETURN n.name'
+
+curl -X POST http://localhost:8090/v1/fluree/update/my/ledger \
+  -H 'Content-Type: application/cypher' \
+  --data 'CREATE (n:Person {name: "Alice"})'
+```
+
+The body may be raw Cypher, or a JSON envelope `{"cypher": "...", "params": {...}}`
+(the Neo4j-HTTP shape). Responses are cypher-json; request RDF JSON-LD with
+`Accept: application/ld+json`.
 
 ## How Cypher maps to RDF
 
@@ -101,7 +145,7 @@ semantics. The cardinality contract:
   row per occurrence — matches Cypher.
 - `RETURN DISTINCT` always falls back to set semantics.
 
-## v1 supported surface
+## Supported surface
 
 ### Reads
 
@@ -201,53 +245,73 @@ ORDER BY / SKIP / LIMIT
 
 ### Writes
 
-```text
-CREATE (a:Label {p:v})-[:T {q:w}]->(b:Label2)
-```
+- **`CREATE`** — nodes and relationships. Directed typed relationships emit a
+  base triple plus a reifier bundle (LPG-mode default for Cypher); multiple
+  parallel relationships in one `CREATE` mint distinct annotation subjects
+  automatically.
+  ```cypher
+  CREATE (a:Person {name: "Alice"})-[:WORKS_FOR {role: "Engineer"}]->(b:Org {name: "Acme"})
+  ```
+- **`SET`** — set/overwrite a property (`SET n.age = 30`), merge a map
+  (`SET n += {age: 30, city: "X"}`), or add a label (`SET n:Admin`). Full map
+  *replace* (`SET n = {...}`) is not yet supported.
+- **`REMOVE`** — remove a property (`REMOVE n.age`) or a label (`REMOVE n:Admin`).
+- **`DELETE` / `DETACH DELETE`** — delete nodes/relationships. `DETACH DELETE`
+  removes a node together with its relationships.
+- **`MERGE`** — find-or-create, with `ON CREATE SET` / `ON MATCH SET`. Resolved
+  by probing the current writer state, then staging either a create or an update.
+- **`MATCH … CREATE/SET`** — WHERE-driven write templates (find rows, then write
+  per match).
 
 ```rust
-let result = fluree.transact_cypher(ledger, cypher).await?;
+let committed = fluree.transact_cypher(ledger, cypher).await?;
 ```
 
-- Directed typed relationships emit base triple + reifier bundle
-  (LPG-mode default for Cypher).
-- Multiple parallel relationships in one `CREATE` mint distinct
-  annotation subjects automatically.
+Writes default to LPG mode, where every relationship reifies (carries an
+annotation identity). See [Edge annotations](edge-annotations.md) for the RDF
+vs. LPG modes and the retraction semantics that follow from them.
 
-## v1 deferred — what to expect later
+## Not yet supported
 
-These produce a clear error today and land in follow-on slices.
+These constructs are part of openCypher but Fluree does not yet accept them; each
+produces a clear error rather than a silent wrong answer.
 
-- `MATCH (n)` without label/property/relationship constraint.
+**Patterns and paths**
+
+- Bare `MATCH (n)` — a node must be constrained by a label, a property, or a
+  relationship.
 - Free path values `MATCH p = (...)` without a `shortestPath` /
-  `allShortestPaths` wrapper (the path binding needs general
-  list-valued path semantics).
-- Binding a relationship variable to a variable-length path
-  (`-[r:T*]->`) — needs list-valued bindings.
-- Expression-valued aggregate arguments (`sum(n + 1)`) — needs a
-  pre-aggregation `Bind`.
-- `relationships(p)` (edge identities), `labels(...)`, `keys(...)`,
-  `properties(...)`, `type(r)`, `id(...)`, and map functions generally.
-  (`nodes(p)`, `pathPairs(p)`, and list functions are supported — see
-  above.)
-- `SET / REMOVE / DELETE / DETACH DELETE`.
-- `MERGE` — Cypher's find-or-create needs a search-first phase that
-  the existing `TxnType` variants don't model. A v1.1 implementation
-  can layer it at the API level: snapshot-query for the identifying
-  pattern, then conditionally stage either a CREATE-shape transaction
-  or an ON MATCH SET update.
-- `MATCH ... CREATE ...` (WHERE-driven write templates).
-- `CALL` with side effects, stored procedures.
-- `LOAD CSV`, `FOREACH`, schema DDL.
-- Multi-statement scripts (one statement per request).
-- `%`, `^`, `XOR`.
+  `allShortestPaths` wrapper.
+- Binding a relationship variable to a variable-length path (`-[r:T*]->`).
+- Untyped variable-length paths (`-[*m..n]->` — name a type); zero-length bounded
+  paths (`*0..M` — use `*1..M`); property filters on a variable-length or
+  shortestPath relationship.
+
+**Functions**
+
+- `relationships(p)`, `labels(n)`, `type(r)`, `keys(x)`, `properties(x)`,
+  `id(x)`, and map functions generally; map/object parameters.
+  (`nodes(p)`, `pathPairs(p)`, and the list functions *are* supported — see above.)
+
+**Expressions**
+
+- `%` (modulus), `^` (exponent), `XOR`.
+- Chained property accessors (`n.a.b` — bind an intermediate via `WITH`).
+- `NULL` literals; expression-valued aggregate arguments (`sum(n + 1)`);
+  aggregates inside `CASE` / `EXISTS`.
+
+**Clauses and structure**
+
+- `WITH *`; non-literal `SKIP`/`LIMIT`; `ORDER BY` on a `collect()` list.
+- `SET n = {...}` full map replace (the `+=` merge form is supported).
+- `CALL` / stored procedures, `LOAD CSV`, `FOREACH`, schema DDL.
+- Multi-statement scripts — submit one statement per request.
 
 ## See also
 
-- [Edge annotations (concept)](edge-annotations.md) — the storage
-  primitive Cypher relationships sit on top of.
-- [Edge annotations (storage internals)](../design/edge-annotations.md)
-  — the `f:reifies*` durable encoding.
-- [SPARQL](../query/sparql.md) — the parallel surface for the same IR.
-- `GQL_CYPHER_SUPPORT.md` at the repo root — the design plan and v1
-  contract.
+- [Edge annotations (concept)](edge-annotations.md) — the storage primitive
+  Cypher relationships sit on top of.
+- [Edge annotations (storage internals)](../design/edge-annotations.md) — the
+  `f:reifies*` durable encoding.
+- [SPARQL](../query/sparql.md) and [JSON-LD Query](../query/jsonld-query.md) —
+  the parallel surfaces over the same IR.
