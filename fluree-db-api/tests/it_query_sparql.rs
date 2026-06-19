@@ -4889,7 +4889,10 @@ async fn sparql_order_by_exists_expression_sorts_by_correlated_existence() {
             {"@id": "ex:dave",  "@type": "ex:Person", "ex:knows": {"@id": "ex:carol"}}
         ]
     });
-    let ledger = fluree.insert(ledger0, &insert).await.expect("insert people");
+    let ledger = fluree
+        .insert(ledger0, &insert)
+        .await
+        .expect("insert people");
 
     // ORDER BY the EXISTS boolean (false sorts before true), then by ?s.
     // Expect the two friendless people first, then the two who know someone.
