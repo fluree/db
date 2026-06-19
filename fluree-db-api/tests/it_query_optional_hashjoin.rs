@@ -125,3 +125,108 @@ async fn correlated_multi_pattern_optional_counts_per_group_with_left_join() {
         "per-forum post counts (incl. the left-join zero for F3) must match"
     );
 }
+
+/// Regression: the batched OPTIONAL hash-join enforces correlation purely by
+/// `binding_to_group_key_normalized` partitioning (the per-row `unify_check`
+/// is a no-op because the optional batches carry no shared vars). That is only
+/// correct because `encoded_equivalent` normalizes a decoded `Iri`/`Sid` on the
+/// REQUIRED side to the same `EncodedSid` the INNER scan produces.
+///
+/// This test deliberately drives the correlation var `?person` from a top-level
+/// `VALUES` clause — so on the required side it is a *materialized* IRI binding,
+/// never touched by a scan — while inside the OPTIONAL `?person` is the object
+/// of `ex:HAS_CREATOR` and is therefore left UNBOUND and *scan-produced*
+/// (`EncodedSid`). If the two representations failed to normalize to the same
+/// group key, every `(person, forum)` bucket would miss and the counts would
+/// collapse to zero. `?forum` is `VALUES`-materialized too and seeded
+/// subject-first, so it is the cross-representation `?person` that is under test.
+#[tokio::test]
+async fn batched_optional_matches_materialized_values_against_scan_produced_corr() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/optional:hashjoin-values";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+    // Same shape as the IC5 test: members per forum, posts with creator+container.
+    //   F1 -> {bob, carol}, posts p1(bob), p2(carol)
+    //   F2 -> {bob},        post  p3(bob)
+    //   F3 -> {bob},        no posts
+    let txn = json!({
+        "@context": ctx(),
+        "@graph": [
+            {"@id": "ex:bob",   "@type": "ex:Person"},
+            {"@id": "ex:carol", "@type": "ex:Person"},
+            {
+                "@id": "ex:f1", "@type": "ex:Forum", "ex:name": "F1",
+                "ex:CONTAINER_OF": [{"@id": "ex:p1"}, {"@id": "ex:p2"}]
+            },
+            {
+                "@id": "ex:f2", "@type": "ex:Forum", "ex:name": "F2",
+                "ex:CONTAINER_OF": [{"@id": "ex:p3"}]
+            },
+            {"@id": "ex:f3", "@type": "ex:Forum", "ex:name": "F3"},
+            {"@id": "ex:p1", "@type": "ex:Post", "ex:HAS_CREATOR": {"@id": "ex:bob"}},
+            {"@id": "ex:p2", "@type": "ex:Post", "ex:HAS_CREATOR": {"@id": "ex:carol"}},
+            {"@id": "ex:p3", "@type": "ex:Post", "ex:HAS_CREATOR": {"@id": "ex:bob"}}
+        ]
+    });
+    let committed = fluree.insert(ledger0, &txn).await.expect("seed");
+    let db = graphdb_from_ledger(&committed.ledger);
+
+    // The (person, forum) membership pairs come straight from VALUES — the
+    // required side never scans them, so `?person`/`?forum` arrive materialized.
+    let id = |iri: &str| json!({"@value": iri, "@type": "@id"});
+    let q = json!({
+        "@context": ctx(),
+        "values": [
+            ["?person", "?forum"],
+            [
+                [id("ex:bob"),   id("ex:f1")],
+                [id("ex:carol"), id("ex:f1")],
+                [id("ex:bob"),   id("ex:f2")],
+                [id("ex:bob"),   id("ex:f3")]
+            ]
+        ],
+        "select": ["?forumName", "(as (count ?post) ?postCount)"],
+        "where": [
+            {"@id": "?forum", "ex:name": "?forumName"},
+            ["optional",
+                {"@id": "?post", "@type": "ex:Post", "ex:HAS_CREATOR": "?person"},
+                {"@id": "?forum", "ex:CONTAINER_OF": "?post"}
+            ]
+        ],
+        "groupBy": ["?forum", "?forumName"],
+        "orderBy": ["(desc ?postCount)", "?forumName"]
+    });
+
+    let result = fluree
+        .query(&db, &q)
+        .await
+        .expect("optional hash-join query");
+
+    let rows = result
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("format rows");
+
+    let arr = rows.as_array().expect("tabular array result");
+    let pairs: Vec<(String, i64)> = arr
+        .iter()
+        .map(|row| {
+            let r = row.as_array().expect("row is array");
+            let name = r[0].as_str().expect("forumName string").to_string();
+            let count = r[1].as_i64().expect("postCount int");
+            (name, count)
+        })
+        .collect();
+
+    assert_eq!(
+        pairs,
+        vec![
+            ("F1".to_string(), 2),
+            ("F2".to_string(), 1),
+            ("F3".to_string(), 0),
+        ],
+        "materialized (VALUES) vs scan-produced correlation must normalize to \
+         the same group key — counts must not collapse to zero"
+    );
+}

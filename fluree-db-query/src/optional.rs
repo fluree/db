@@ -1276,7 +1276,7 @@ impl OptionalBuilder for PlanTreeOptionalBuilder {
         // tuples; object-only correlation vars stay unbound so the inner
         // produces them subject-first.
         let seed_schema: Arc<[VarId]> = Arc::from(seed_vars.clone().into_boxed_slice());
-        let seed = MaterializedSeedOperator::new(seed_schema, seed_rows, ctx.batch_size);
+        let seed = MaterializedSeedOperator::new(seed_schema, seed_rows, ctx.batch_size)?;
         let mut inner = crate::execute::build_where_operators_seeded(
             Some(Box::new(seed)),
             &self.inner_patterns,
@@ -1447,7 +1447,12 @@ struct MaterializedSeedOperator {
 }
 
 impl MaterializedSeedOperator {
-    fn new(schema: Arc<[VarId]>, rows: Vec<Vec<Binding>>, chunk: usize) -> Self {
+    /// Build the seed from the distinct correlation tuples. Fallible: a
+    /// `Batch::new` failure here would otherwise silently drop a seed chunk,
+    /// running the inner with fewer correlations and undercounting the OPTIONAL
+    /// — a silent wrong answer. Propagate instead so `build_batch` falls back to
+    /// the per-row path rather than returning short results.
+    fn new(schema: Arc<[VarId]>, rows: Vec<Vec<Binding>>, chunk: usize) -> Result<Self> {
         let chunk = chunk.max(1);
         let ncols = schema.len();
         let mut batches = VecDeque::new();
@@ -1460,15 +1465,13 @@ impl MaterializedSeedOperator {
                     columns[c].push(b.clone());
                 }
             }
-            if let Ok(batch) = Batch::new(schema.clone(), columns) {
-                batches.push_back(batch);
-            }
+            batches.push_back(Batch::new(schema.clone(), columns)?);
         }
-        Self {
+        Ok(Self {
             schema,
             batches,
             state: OperatorState::Created,
-        }
+        })
     }
 }
 
