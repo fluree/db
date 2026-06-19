@@ -716,6 +716,7 @@ The array form uses the operator as the first element followed by its operands.
 | Inverse | `^ex:p` | `["^", "ex:p"]` | Traverse predicate in reverse direction |
 | Alternative | <code>ex:a&#124;ex:b</code> | <code>["&#124;", "ex:a", "ex:b"]</code> | Match any of several predicates |
 | Sequence | `ex:a/ex:b` | `["/", "ex:a", "ex:b"]` | Follow a chain of predicates (property chain) |
+| Alternation-transitive | <code>(ex:a&#124;ex:b)+</code> | <code>["+", ["&#124;", "ex:a", "ex:b"]]</code> | Transitive closure following an edge of **any** listed predicate per hop |
 
 Zero-or-more (`*`) includes the starting node itself in the results (zero hops).
 
@@ -803,6 +804,31 @@ Match entities connected by either `ex:knows` or `ex:likes`:
   ]
 }
 ```
+
+**Alternation-Transitive Example:**
+
+Apply a transitive modifier (`+` or `*`) to an alternative of predicates to follow an edge of *any* listed predicate at each hop. For example, `(ex:knows|ex:likes)+` reaches every node connected through a chain of `ex:knows` and/or `ex:likes` edges, in any combination:
+
+```json
+{
+  "@context": {
+    "ex": "http://example.org/",
+    "reaches": { "@path": "(ex:knows|ex:likes)+" }
+  },
+  "select": ["?who"],
+  "where": [
+    { "@id": "ex:alice", "reaches": "?who" }
+  ]
+}
+```
+
+Array form:
+
+```json
+{ "@path": ["+", ["|", "ex:knows", "ex:likes"]] }
+```
+
+This differs from running `ex:knows+` and `ex:likes+` separately: a single closure mixes both predicates within one path (e.g. `alice -knows-> bob -likes-> carol`). The branches under the transitive modifier must be **simple forward predicate IRIs** — inverse (`^ex:p`), sequence, or nested-transitive branches are not supported in this position. Like other arbitrary-length paths, the closure is duplicate-free and cycle-safe.
 
 Inverse can also be applied to complex paths (sequences and alternatives):
 

@@ -639,19 +639,25 @@ fn lower_path_to_patterns<E: IriEncoder>(
     };
 
     match effective_path {
-        // Transitive: keep existing PropertyPath operator
+        // Transitive: `p+` / `p*`, plus alternation-transitive `(a|b…)+` / `(a|b…)*`
+        // whose closure follows an edge of any listed predicate per hop.
         UnresolvedPathExpr::OneOrMore(inner) | UnresolvedPathExpr::ZeroOrMore(inner) => {
-            let iri = expect_simple_iri(inner)?;
-            let modifier = match path {
+            let iris = extract_transitive_predicate_iris(inner)?;
+            let modifier = match effective_path {
                 UnresolvedPathExpr::OneOrMore(_) => PathModifier::OneOrMore,
                 _ => PathModifier::ZeroOrMore,
             };
-            let predicate = encoder
-                .encode_iri(iri)
-                .ok_or_else(|| ParseError::UnknownNamespace(iri.to_string()))?;
-            Ok(vec![Pattern::PropertyPath(PropertyPathPattern::new(
-                s, predicate, modifier, o,
-            ))])
+            let mut predicates = Vec::with_capacity(iris.len());
+            for iri in iris {
+                predicates.push(
+                    encoder
+                        .encode_iri(iri)
+                        .ok_or_else(|| ParseError::UnknownNamespace(iri.to_string()))?,
+                );
+            }
+            Ok(vec![Pattern::PropertyPath(
+                PropertyPathPattern::new_alternatives(s, predicates, modifier, o),
+            )])
         }
 
         // Inverse: ^path
@@ -1177,6 +1183,20 @@ fn lower_select_expr_bind<E: IriEncoder>(
 }
 
 /// Expect a path expression to be a simple IRI. Returns the Arc'd IRI string.
+/// Collect the predicate IRI(s) directly under a transitive operator.
+///
+/// `p+`/`p*` yields one IRI; `(a|b|…)+`/`(a|b|…)*` yields one per branch and
+/// lowers to an alternation-transitive path whose closure follows an edge of
+/// any branch per hop. Branches must be simple forward predicate IRIs —
+/// inverse/compound branches are rejected. Mirrors the SPARQL lowering in
+/// `fluree-db-sparql/src/lower/path.rs::extract_transitive_predicate_iris`.
+fn extract_transitive_predicate_iris(path: &UnresolvedPathExpr) -> Result<Vec<&Arc<str>>> {
+    match path {
+        UnresolvedPathExpr::Alternative(alts) => alts.iter().map(expect_simple_iri).collect(),
+        _ => Ok(vec![expect_simple_iri(path)?]),
+    }
+}
+
 fn expect_simple_iri(path: &UnresolvedPathExpr) -> Result<&Arc<str>> {
     match path {
         UnresolvedPathExpr::Iri(iri) => Ok(iri),

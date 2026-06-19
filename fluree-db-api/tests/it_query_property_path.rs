@@ -631,23 +631,114 @@ async fn property_path_alternative_duplicate_semantics() {
     );
 }
 
+/// Mixed `knows`/`likes` chain so an alternation-transitive path reaches nodes
+/// that neither single-predicate closure could: a -knows-> b -likes-> c -knows-> d.
+async fn seed_knows_likes_chain(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
+    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let insert = json!({
+        "@context": {"ex":"http://example.org/"},
+        "@graph": [
+            {"@id":"ex:a","ex:knows":{"@id":"ex:b"}},
+            {"@id":"ex:b","ex:likes":{"@id":"ex:c"}},
+            {"@id":"ex:c","ex:knows":{"@id":"ex:d"}}
+        ]
+    });
+    fluree.insert(ledger0, &insert).await.unwrap().ledger
+}
+
 #[tokio::test]
-async fn property_path_nested_alternative_under_transitive_errors() {
-    // (ex:knows|ex:likes)+ — alternative under transitive modifier should error
-    // because transitive paths require a simple predicate IRI
+async fn property_path_alternation_transitive_one_or_more() {
+    // (ex:knows|ex:likes)+ from ex:a follows an edge of either predicate per hop,
+    // reaching b, c, d — which neither ex:knows+ nor ex:likes+ alone could.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_knows_likes_chain(&fluree, "property/path-alt-trans:main").await;
+
+    let q = json!({
+        "@context": {
+            "ex": "http://example.org/",
+            "reaches": {"@path": "(ex:knows|ex:likes)+"}
+        },
+        "where": [{"@id":"ex:a","reaches":"?who"}],
+        "select": ["?who"]
+    });
+    let result = support::query_jsonld(&fluree, &ledger, &q)
+        .await
+        .unwrap()
+        .to_jsonld(&ledger.snapshot)
+        .unwrap();
+    assert_eq!(
+        normalize_rows(&result),
+        normalize_rows(&json!([["ex:b"], ["ex:c"], ["ex:d"]]))
+    );
+}
+
+#[tokio::test]
+async fn property_path_alternation_transitive_zero_or_more() {
+    // (ex:knows|ex:likes)* additionally includes the start node ex:a (zero hops).
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_knows_likes_chain(&fluree, "property/path-alt-trans-star:main").await;
+
+    let q = json!({
+        "@context": {
+            "ex": "http://example.org/",
+            "reaches": {"@path": "(ex:knows|ex:likes)*"}
+        },
+        "where": [{"@id":"ex:a","reaches":"?who"}],
+        "select": ["?who"]
+    });
+    let result = support::query_jsonld(&fluree, &ledger, &q)
+        .await
+        .unwrap()
+        .to_jsonld(&ledger.snapshot)
+        .unwrap();
+    assert_eq!(
+        normalize_rows(&result),
+        normalize_rows(&json!([["ex:a"], ["ex:b"], ["ex:c"], ["ex:d"]]))
+    );
+}
+
+#[tokio::test]
+async fn property_path_alternation_transitive_array_form() {
+    // Array form: ["+", ["|", "ex:knows", "ex:likes"]] matches the string form.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_knows_likes_chain(&fluree, "property/path-alt-trans-arr:main").await;
+
+    let q = json!({
+        "@context": {
+            "ex": "http://example.org/",
+            "reaches": {"@path": ["+", ["|", "ex:knows", "ex:likes"]]}
+        },
+        "where": [{"@id":"ex:a","reaches":"?who"}],
+        "select": ["?who"]
+    });
+    let result = support::query_jsonld(&fluree, &ledger, &q)
+        .await
+        .unwrap()
+        .to_jsonld(&ledger.snapshot)
+        .unwrap();
+    assert_eq!(
+        normalize_rows(&result),
+        normalize_rows(&json!([["ex:b"], ["ex:c"], ["ex:d"]]))
+    );
+}
+
+#[tokio::test]
+async fn property_path_transitive_inverse_branch_errors() {
+    // (ex:knows|^ex:likes)+ — an inverse branch under a transitive modifier is
+    // not representable as a forward alternation-transitive path, so it errors.
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger = seed_knows_chain(&fluree, "property/path-alt-trans-err:main").await;
 
     let q = json!({
         "@context": {
             "ex": "http://example.org/",
-            "bad": {"@path": "(ex:knows|ex:likes)+"}
+            "bad": {"@path": "(ex:knows|^ex:likes)+"}
         },
         "where": [{"@id":"ex:a","bad":"?who"}],
         "select": ["?who"]
     });
     let err = support::query_jsonld(&fluree, &ledger, &q).await;
-    assert!(err.is_err(), "(a|b)+ should error");
+    assert!(err.is_err(), "(a|^b)+ should error");
     let msg = format!("{}", err.unwrap_err());
     assert!(
         msg.contains("simple predicate IRI"),
