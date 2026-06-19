@@ -829,9 +829,11 @@ fn subquery_body_has_constant_anchor(patterns: &[Pattern]) -> bool {
 ///   estimated at [`DISTINCT_SUBQUERY_PRODUCER_SELECTIVITY`].
 /// - Everything else keeps the body cardinality as an upper bound.
 ///
-/// Shared by [`estimate_pattern`] (join ordering) and
-/// `SubqueryOperator::estimated_rows` (seeding the downstream hash join), so the
-/// producer's estimate is consistent in both places.
+/// Used by [`estimate_pattern`] for join *ordering*, where a loose upper bound
+/// is acceptable. The operator cost model takes the narrower
+/// [`subquery_output_estimate_is_bounded`] gate before trusting this value (see
+/// `SubqueryOperator::estimated_rows`), so an arbitrary subquery's body-cardinality
+/// guess does not perturb downstream hash-join decisions.
 pub(crate) fn estimate_subquery_output(sq: &SubqueryPattern, stats: Option<&StatsView>) -> f64 {
     let rows = match &sq.grouping {
         Some(Grouping::Implicit { .. }) => HIGHLY_SELECTIVE,
@@ -847,6 +849,27 @@ pub(crate) fn estimate_subquery_output(sq: &SubqueryPattern, stats: Option<&Stat
     // A LIMIT caps the output regardless of grouping.
     let rows = sq.limit.map_or(rows, |l| rows.min(l as f64));
     rows.max(HIGHLY_SELECTIVE)
+}
+
+/// Is [`estimate_subquery_output`] reliable enough to feed the operator cost
+/// model (`SubqueryOperator::estimated_rows`, which seeds the downstream
+/// hash-join driving estimate)?
+///
+/// True only for shapes whose output is bounded INDEPENDENT of body
+/// cardinality:
+/// - a scalar aggregate (implicit `GROUP BY`) — exactly one row;
+/// - an anchored `DISTINCT` single-var producer — the intended hash-join seed;
+/// - any subquery with an explicit `LIMIT` — a hard cap.
+///
+/// For everything else (a plain row-per-solution subquery, or an explicit
+/// `GROUP BY` whose distinct-key count we cannot estimate) the value is just the
+/// body cardinality — a fine upper bound for join *ordering* but too unreliable
+/// to perturb hash-join cost decisions, so the operator keeps the conservative
+/// `None`.
+pub(crate) fn subquery_output_estimate_is_bounded(sq: &SubqueryPattern) -> bool {
+    matches!(&sq.grouping, Some(Grouping::Implicit { .. }))
+        || sq.limit.is_some()
+        || (sq.distinct && sq.select.len() == 1 && subquery_body_has_constant_anchor(&sq.patterns))
 }
 
 /// Estimate cardinality for any pattern type.
@@ -3440,5 +3463,87 @@ mod tests {
                 if matches!(&tp.p, Ref::Sid(s) if s.name.as_ref() == "HAS_CREATOR")),
             "consumer drains right after the producer: {ordered:?}"
         );
+    }
+
+    // --- which subquery shapes feed the operator cost model -------------------
+    //
+    // `subquery_output_estimate_is_bounded` gates `SubqueryOperator::estimated_rows`
+    // (which seeds the downstream hash-join driving estimate). Only reliably
+    // bounded shapes may return `Some`; an arbitrary subquery keeps the
+    // conservative `None` so its body-cardinality guess cannot perturb hash-join
+    // decisions for unrelated queries.
+
+    use crate::ir::{AggregateFn, AggregateSpec};
+
+    /// A `?s <p> <const>` triple — a constant-object anchor (not `rdf:type`).
+    fn value_anchor(subject: VarId) -> Pattern {
+        Pattern::Triple(TriplePattern::new(
+            Ref::Var(subject),
+            Ref::Sid(Sid::new(100, "id")),
+            Term::Sid(Sid::new(100, "x")),
+        ))
+    }
+
+    fn count_all_grouping(group_by: Vec<VarId>, out: VarId) -> Grouping {
+        Grouping::assemble(
+            group_by,
+            vec![AggregateSpec {
+                function: AggregateFn::CountAll,
+                output_var: out,
+            }],
+            vec![],
+            None,
+        )
+        .expect("aggregate present")
+    }
+
+    #[test]
+    fn scalar_aggregate_subquery_is_bounded() {
+        // Implicit GROUP BY → exactly one row.
+        let sq = SubqueryPattern::new(vec![VarId(0)], vec![value_anchor(VarId(1))])
+            .with_grouping(count_all_grouping(vec![], VarId(0)));
+        assert!(subquery_output_estimate_is_bounded(&sq));
+    }
+
+    #[test]
+    fn anchored_distinct_producer_is_bounded() {
+        // `WITH DISTINCT ?x` over an anchored body — the intended hash-join seed.
+        let sq = SubqueryPattern::new(vec![VarId(0)], vec![value_anchor(VarId(0))]).with_distinct();
+        assert!(subquery_output_estimate_is_bounded(&sq));
+    }
+
+    /// A plain `?x knows ?y` body — no anchor, multiplies rows.
+    fn unanchored_body() -> Vec<Pattern> {
+        vec![Pattern::Triple(make_pattern(VarId(0), "knows", VarId(1)))]
+    }
+
+    #[test]
+    fn limited_subquery_is_bounded() {
+        // An explicit LIMIT is a hard cap regardless of shape.
+        let sq = SubqueryPattern::new(vec![VarId(0)], unanchored_body()).with_limit(5);
+        assert!(subquery_output_estimate_is_bounded(&sq));
+    }
+
+    #[test]
+    fn plain_row_per_solution_subquery_is_unbounded() {
+        // Non-DISTINCT, no grouping, no limit: body cardinality only → keep None.
+        let sq = SubqueryPattern::new(vec![VarId(0)], unanchored_body());
+        assert!(!subquery_output_estimate_is_bounded(&sq));
+    }
+
+    #[test]
+    fn explicit_group_by_subquery_is_unbounded() {
+        // Distinct-key count is unknown → not safe to feed the cost model.
+        let sq = SubqueryPattern::new(vec![VarId(0)], unanchored_body())
+            .with_grouping(count_all_grouping(vec![VarId(0)], VarId(2)));
+        assert!(!subquery_output_estimate_is_bounded(&sq));
+    }
+
+    #[test]
+    fn distinct_without_anchor_is_unbounded() {
+        // DISTINCT single-var but no constant anchor in the body: the 500-row
+        // producer estimate does not apply, so it is not a trustworthy seed.
+        let sq = SubqueryPattern::new(vec![VarId(0)], unanchored_body()).with_distinct();
+        assert!(!subquery_output_estimate_is_bounded(&sq));
     }
 }

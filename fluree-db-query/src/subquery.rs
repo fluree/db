@@ -398,11 +398,17 @@ impl Operator for SubqueryOperator {
     }
 
     fn estimated_rows(&self) -> Option<usize> {
-        // The subquery's OWN output estimate (uncorrelated producers — the common
-        // `WITH DISTINCT friend` case — emit this many rows). Seeds the downstream
-        // object→subject hash join's driving estimate so a `(message HAS_CREATOR
-        // friend)` probe is costed against the ~producer size, not 1. Shared with
-        // the planner's join-ordering estimate for consistency.
+        // The subquery's OWN output estimate seeds the downstream object→subject
+        // hash join's driving estimate so a `(message HAS_CREATOR friend)` probe
+        // is costed against the ~producer size, not 1 — but ONLY for shapes whose
+        // output is reliably bounded (scalar aggregate, anchored `WITH DISTINCT`
+        // producer, or explicit LIMIT). For an arbitrary subquery the estimate is
+        // just body cardinality, which is fine for join ordering but too
+        // unreliable to perturb the hash-join cost model, so we keep the
+        // conservative `None` the operator returned before.
+        if !crate::planner::subquery_output_estimate_is_bounded(&self.subquery) {
+            return None;
+        }
         Some(
             crate::planner::estimate_subquery_output(&self.subquery, self.stats.as_deref()).round()
                 as usize,
