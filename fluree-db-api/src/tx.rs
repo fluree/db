@@ -1342,9 +1342,16 @@ fn convert_named_graphs_to_templates(
                 Some(DatatypeConstraint::LangTag(Arc::from(lang.as_str()))),
             )),
             RawObject::TypedLiteral { value, datatype } => {
+                // Parse the lexical with the shared coercion (exact decimals,
+                // integers, temporals, ...) — storing the raw String here
+                // would persist a string flake mislabeled with the datatype,
+                // diverging from the bulk-import path. Unknown datatypes keep
+                // the lexical as a string, matching import behavior.
                 let dt_sid = ns_registry.sid_for_iri(datatype);
+                let fv = fluree_db_core::coerce::coerce_string_value(value, datatype)
+                    .unwrap_or_else(|_| FlakeValue::String(value.clone()));
                 Ok((
-                    TemplateTerm::Value(FlakeValue::String(value.clone())),
+                    TemplateTerm::Value(fv),
                     Some(DatatypeConstraint::Explicit(dt_sid)),
                 ))
             }

@@ -82,7 +82,7 @@ async fn push_ledger_local(
         governance.policy_class = Some(headers.policy_class.clone());
     }
 
-    let idempotency_key = extract_idempotency_key(&headers.raw);
+    let idempotency_key = extract_idempotency_key(&headers.raw)?;
 
     let bytes = axum::body::to_bytes(request.into_body(), 50 * 1024 * 1024)
         .await

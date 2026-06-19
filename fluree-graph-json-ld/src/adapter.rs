@@ -391,16 +391,26 @@ fn process_literal<S: GraphSink>(
             }
         }
         Value::Number(n) => {
-            // When the declared @type decodes as F64 (float, double, decimal),
-            // always produce LiteralValue::Double even if the JSON number is an
+            // xsd:decimal must stay exact: route the number's lexical through
+            // the typed-string-literal path, whose shared parser produces a
+            // BigDecimal (same as a string @value). Going through f64 here
+            // both corrupts the value and loses the declared datatype, since
+            // term_literal_value re-infers xsd:double from the Double.
+            if datatype.as_iri() == fluree_vocab::xsd::DECIMAL {
+                return Ok(ProcessedValue::Single(sink.term_literal(
+                    &n.to_string(),
+                    datatype,
+                    None,
+                )));
+            }
+            // When the declared @type decodes as F64 (float, double), always
+            // produce LiteralValue::Double even if the JSON number is an
             // integer. Otherwise the integer bits get stored as NUM_INT but
             // decoded as F64, producing garbage subnormal values after indexing.
             // (fluree/db-r#142)
             let is_float_type = {
                 let iri = datatype.as_iri();
-                iri == fluree_vocab::xsd::DOUBLE
-                    || iri == fluree_vocab::xsd::FLOAT
-                    || iri == fluree_vocab::xsd::DECIMAL
+                iri == fluree_vocab::xsd::DOUBLE || iri == fluree_vocab::xsd::FLOAT
             };
             if is_float_type {
                 if let Some(f) = n.as_f64() {
@@ -1031,6 +1041,51 @@ mod tests {
         for (i, triple) in graph.iter().enumerate() {
             assert_eq!(triple.list_index(), Some(i as i32));
         }
+    }
+
+    /// JSON number @value with xsd:decimal @type must keep the declared
+    /// datatype and the exact lexical (string path), never f64 / xsd:double.
+    #[test]
+    fn test_decimal_typed_number_keeps_lexical_and_datatype() {
+        let expanded = json!([{
+            "@id": "http://example.org/item",
+            "http://example.org/ns#price": [{
+                "@value": 19.99,
+                "@type": "http://www.w3.org/2001/XMLSchema#decimal"
+            }],
+            "http://example.org/ns#count": [{
+                "@value": 42,
+                "@type": "http://www.w3.org/2001/XMLSchema#decimal"
+            }]
+        }]);
+
+        let mut sink = GraphCollectorSink::new();
+        to_graph_events(&expanded, &mut sink).unwrap();
+
+        let graph = sink.graph();
+        assert_eq!(graph.len(), 2);
+
+        let mut lexicals: Vec<String> = Vec::new();
+        for triple in graph.iter() {
+            match &triple.o {
+                Term::Literal {
+                    value, datatype, ..
+                } => {
+                    assert_eq!(
+                        datatype.as_iri(),
+                        "http://www.w3.org/2001/XMLSchema#decimal",
+                        "declared xsd:decimal must be preserved"
+                    );
+                    match value {
+                        LiteralValue::String(s) => lexicals.push(s.to_string()),
+                        other => panic!("Expected lexical string for decimal, got {other:?}"),
+                    }
+                }
+                other => panic!("Expected literal, got {other:?}"),
+            }
+        }
+        lexicals.sort();
+        assert_eq!(lexicals, vec!["19.99", "42"]);
     }
 
     /// Regression test for fluree/db-r#142: JSON integer @value with xsd:float

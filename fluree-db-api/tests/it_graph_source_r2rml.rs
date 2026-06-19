@@ -403,8 +403,7 @@ async fn e2e_r2rml_query_iceberg_table() {
     let mut ledger = genesis_ledger(&fluree, "e2e-iceberg:main");
 
     // Register example.org namespace
-    ledger
-        .snapshot
+    std::sync::Arc::make_mut(&mut ledger.snapshot)
         .insert_namespace_code(9_999, "http://example.org/".to_string())
         .unwrap();
 
@@ -575,8 +574,7 @@ async fn e2e_fluree_r2rml_provider_full_flow() {
 
     // Create a ledger for query execution
     let mut ledger = genesis_ledger(&fluree, "e2e-provider:main");
-    ledger
-        .snapshot
+    std::sync::Arc::make_mut(&mut ledger.snapshot)
         .insert_namespace_code(9_999, "http://example.org/".to_string())
         .unwrap();
 
@@ -1055,8 +1053,7 @@ async fn engine_e2e_graph_pattern_r2rml_scan() {
     // Register the example.org namespace prefix in this Db so the R2RML operator
     // can encode subject IRIs produced by rr:template. Without this, encode_iri()
     // returns None and the operator will skip all rows as "IRI not encodable".
-    ledger
-        .snapshot
+    std::sync::Arc::make_mut(&mut ledger.snapshot)
         .insert_namespace_code(9_999, "http://example.org/".to_string())
         .unwrap();
 
@@ -1812,8 +1809,7 @@ async fn engine_e2e_ref_object_map_join_execution() {
     let mut ledger = genesis_ledger(&fluree, "ref-join-test:main");
 
     // Register example.org namespace
-    ledger
-        .snapshot
+    std::sync::Arc::make_mut(&mut ledger.snapshot)
         .insert_namespace_code(9_999, "http://example.org/".to_string())
         .unwrap();
 

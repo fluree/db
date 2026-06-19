@@ -62,6 +62,11 @@ pub async fn run(action: MemoryAction, dirs: &FlureeDir) -> CliResult<()> {
 }
 
 fn build_store(dirs: &FlureeDir) -> CliResult<MemoryStore> {
+    // Short-lived CLI commands keep a persistent (file-backed) ledger so that
+    // `import` and the `init` legacy-ledger migration work and repeated
+    // invocations don't rebuild from scratch. The long-lived `mcp serve` path
+    // uses an ephemeral in-memory ledger instead (see `mcp_serve`), which is
+    // what makes many concurrent MCP processes safe.
     let fluree = context::build_fluree(dirs)?;
 
     // Determine memory_dir: use .fluree-memory/ at the project root.

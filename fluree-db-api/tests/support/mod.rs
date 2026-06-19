@@ -278,14 +278,9 @@ pub async fn trigger_index_and_wait_outcome(
 #[cfg(feature = "native")]
 pub fn start_background_indexer_local(
     backend: fluree_db_core::StorageBackend,
-    nameservice: Arc<dyn fluree_db_nameservice::ReadWriteNameService>,
+    nameservice: Arc<dyn fluree_db_nameservice::IndexingNameService>,
     config: fluree_db_indexer::IndexerConfig,
 ) -> (LocalSet, fluree_db_indexer::IndexerHandle) {
-    // Upcast the convenience-typed ReadWriteNameService into the
-    // combined `IndexingNameService` the worker now takes.
-    // ReadWriteNameService declares IndexingNameService as a
-    // supertrait, so the Arc upcasts directly.
-    let nameservice: Arc<dyn fluree_db_nameservice::IndexingNameService> = nameservice;
     let (worker, handle) =
         fluree_db_api::BackgroundIndexerWorker::new(backend, nameservice, config);
 

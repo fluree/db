@@ -26,6 +26,7 @@
 
 pub mod address;
 pub mod address_path;
+pub mod cancellation;
 pub mod coerce;
 pub mod commit;
 pub mod comparator;
@@ -66,6 +67,7 @@ pub mod stats_view;
 pub mod stats_wire;
 pub mod storage;
 pub mod subject_id;
+pub mod sysmem;
 pub mod temporal;
 pub mod tracking;
 pub mod value;
@@ -77,6 +79,7 @@ pub use address::{
     extract_identifier, extract_ledger_prefix, extract_path, parse_fluree_address,
     ParsedFlureeAddress,
 };
+pub use cancellation::{QueryCancellation, QueryCancellationReason};
 pub use coerce::{coerce_json_value, coerce_value, CoercionError, CoercionResult};
 pub use commit::{
     collect_dag_cids, collect_dag_cids_with_split_mode, commit_to_summary, find_common_ancestor,
@@ -184,7 +187,9 @@ pub use storage::{
 pub use storage::{FileStorage, STORAGE_METHOD_FILE};
 pub use subject_id::{SubjectId, SubjectIdColumn, SubjectIdEncoding};
 pub use temporal::{Date, DateTime, Time};
-pub use tracking::{FuelExceededError, PolicyStats, Tracker, TrackingOptions, TrackingTally};
+pub use tracking::{
+    FuelExceededError, PolicyStats, ReasoningTally, Tracker, TrackingOptions, TrackingTally,
+};
 pub use value::{
     parse_decimal, parse_decimal_string, parse_double, parse_integer, parse_integer_string,
     FlakeValue, GeoPointBits,

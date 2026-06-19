@@ -177,6 +177,11 @@ Build the server with the `otel` feature flag:
 cargo build -p fluree-db-server --features otel --release
 ```
 
+> **Building via the CLI crate?** Feature flags do not propagate across
+> binaries: `cargo build -p fluree-db-cli --features otel` enables OTEL only
+> for the CLI's import pipeline, not for the server the daemon launches. Use
+> `--features "otel,fluree-db-server/otel"` to enable both.
+
 Then set environment variables to configure the OTLP exporter:
 
 ```bash
@@ -238,7 +243,7 @@ Each HTTP request span is named dynamically via the `otel.name` field so that tr
 
 | Operation | otel.name examples |
 |-----------|-------------------|
-| Query | `query:json-ld`, `query:sparql`, `query:explain` |
+| Query | `query:json-ld`, `query:sparql`, `query:explain`, `query:multi-query` |
 | Transact | `transact:json-ld`, `transact:sparql-update`, `transact:turtle` |
 | Insert | `insert:json-ld`, `insert:turtle` |
 | Upsert | `upsert:json-ld`, `upsert:turtle`, `upsert:trig` |
@@ -274,6 +279,7 @@ Additional spans: `binary_cursor_next_leaf`, `property_join`, `group_by`, `aggre
 
 ```
 query_execute (debug)
+├── ledger_view_load (debug, ledger_id, cold_binary_store — view acquisition; the pre-prepare phase, multi-second on cold ledgers)
 ├── query_prepare (debug)
 │   ├── reasoning_prep (debug)
 │   ├── pattern_rewrite (debug, patterns_before, patterns_after)
@@ -282,6 +288,11 @@ query_execute (debug)
 │   ├── scan (debug)
 │   ├── join (debug)
 │   │   └── join_next_batch (debug, per iteration)
+│   ├── cyclic_scan_relation (debug, per cyclic edge: predicate, mode=full|probed, rows; cross-thread when scans parallelize)
+│   ├── cyclic_index_build (debug, per cyclic edge: predicate, rows; cross-thread when scans parallelize)
+│   ├── cyclic_prune (debug: rows_before, rows_after, passes)
+│   ├── cyclic_wedge_build (debug, squares only)
+│   ├── cyclic_enumerate (debug, per output batch: strategy, rows)
 │   ├── filter (debug)
 │   ├── project (debug)
 │   ├── sort (debug)
@@ -289,6 +300,29 @@ query_execute (debug)
 │   └── ...
 └── format (debug)
 ```
+
+#### Span Tree (Multi-query envelope)
+
+The `/multi-query` endpoint produces a single `request` span (otel.name = `query:multi-query`) with one `sub_query` child per envelope alias. Each `sub_query` carries the full single-query span tree shown above (`query_execute → query_prepare → query_run → ...`) under it, so per-alias execution remains drillable in trace tools.
+
+```
+request (info, otel.name=query:multi-query)
+├── sub_query (debug, alias, language, effective_timeout_ms, result_status)
+│   └── query_execute … (full single-query tree)
+└── sub_query (debug, alias, language, effective_timeout_ms, result_status)
+    └── query_execute … (full single-query tree)
+```
+
+`sub_query` attributes:
+
+| Attribute | Set when | Description |
+|-----------|----------|-------------|
+| `alias` | span open | The user-supplied alias key from the envelope's `queries` map. |
+| `language` | span open | `jsonld` or `sparql`. |
+| `effective_timeout_ms` | permit acquired | `min(opts.timeoutMs, envelope deadline remaining)` at semaphore-acquisition time. |
+| `result_status` | task end | `ok` \| `error` \| `timeout`. |
+
+Sub-query tasks run on the tokio scheduler under a shared `JoinSet`, so the `request` span context propagates through `.instrument(span).await` to each `sub_query`. When the envelope wall deadline fires, in-flight `sub_query` spans close with `result_status = timeout`.
 
 #### Span Tree (Transaction)
 

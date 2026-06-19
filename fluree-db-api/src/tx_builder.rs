@@ -16,7 +16,7 @@
 use serde_json::Value as JsonValue;
 
 use crate::error::{BuilderError, BuilderErrors};
-use crate::ledger_manager::{LedgerHandle, LedgerWriteGuard};
+use crate::ledger_manager::{LedgerHandle, LedgerWriteGuard, RefreshOpts};
 use crate::tx::{IndexingMode, IndexingStatus, StageResult, TransactResult, TransactResultRef};
 use crate::{
     ApiError, Fluree, PolicyContext, Result, TrackedErrorResponse, TrackedTransactionInput,
@@ -27,8 +27,36 @@ use fluree_db_ledger::{IndexConfig, LedgerState, StagedLedger};
 use fluree_db_nameservice::NsRecord;
 use fluree_db_transact::{
     lower_sparql_update_ast, parse_trig_phase1, CommitOpts, NamedGraphBlock, NamespaceRegistry,
-    RawTrigMeta, Txn, TxnOpts, TxnType,
+    RawTrigMeta, TransactError, Txn, TxnOpts, TxnType,
 };
+
+/// Conflicts that heal by reconciling the cached writer state to the durable
+/// nameservice head and re-staging.
+///
+/// Unreachable in a single-process embedded `Fluree` whose ledgers are only
+/// written through its own [`LedgerManager`] — the per-ledger write lock
+/// plus atomic cache replace inside [`Fluree::commit_and_finalize`] keep
+/// `verify_sequencing`'s `base.t()` equal to the durable head and the
+/// head-record CAS uncontended. The retry guards against the same
+/// out-of-this-process scenarios as the consensus layer:
+///
+/// * Another process / instance writes to the same nameservice + storage
+///   backend.
+/// * Storage is mutated out-of-band (manual restore, sidecar tooling)
+///   while this process's cache is live.
+///
+/// `NamespaceConflict` is deliberately not handled here — re-staging in
+/// `commit_with_handle` would consume the already-built `stage_result`.
+/// The consensus layer's retry, which preserves the request body across
+/// attempts, handles that case instead.
+fn is_retryable_commit_conflict(e: &ApiError) -> bool {
+    matches!(
+        e,
+        ApiError::Transact(
+            TransactError::CommitConflict { .. } | TransactError::PublishLostRace { .. }
+        )
+    )
+}
 
 // ============================================================================
 // TransactOperation (private)
@@ -1272,7 +1300,7 @@ impl Fluree {
                     store_raw_txn,
                 )
                 .await?;
-            return self
+            return match self
                 .commit_and_finalize(
                     write_guard,
                     stage_result,
@@ -1281,7 +1309,32 @@ impl Fluree {
                     &index_config,
                     tracker.tally(),
                 )
-                .await;
+                .await
+            {
+                Ok(r) => Ok(r),
+                Err(e) if is_retryable_commit_conflict(&e) => {
+                    // Fast-path inputs are already consumed and can't be
+                    // re-staged in place, so we propagate the error. But
+                    // `refresh` first so the cache stops trailing the
+                    // durable head — a subsequent request from this same
+                    // process will otherwise stay wedged on the same
+                    // conflict. Reaching this branch requires an
+                    // out-of-this-process writer or out-of-band storage
+                    // mutation (see [`is_retryable_commit_conflict`]).
+                    // The lock was released inside `commit_and_finalize`,
+                    // so `refresh` can re-acquire it without deadlock.
+                    if let Err(refresh_err) =
+                        self.refresh(ledger.id(), RefreshOpts::default()).await
+                    {
+                        tracing::warn!(
+                            error = %refresh_err,
+                            "refresh after fast-path commit conflict failed"
+                        );
+                    }
+                    Err(e)
+                }
+                Err(e) => Err(e),
+            };
         }
 
         // Optimistic path: stage outside the lock against a snapshot, then
@@ -1295,7 +1348,7 @@ impl Fluree {
         let tracker_ref = tracker.is_enabled().then_some(&tracker);
 
         const MAX_RETRIES: usize = 16;
-        for _ in 0..MAX_RETRIES {
+        for attempt in 0..MAX_RETRIES {
             let snap = ledger.snapshot().await;
             let base_t = snap.t;
             let base_head_id = snap.head_commit_id.clone();
@@ -1319,7 +1372,7 @@ impl Fluree {
                 continue;
             }
 
-            return self
+            match self
                 .commit_and_finalize(
                     write_guard,
                     stage_result,
@@ -1328,7 +1381,35 @@ impl Fluree {
                     &index_config,
                     tracker.tally(),
                 )
-                .await;
+                .await
+            {
+                Ok(r) => return Ok(r),
+                Err(e) if attempt + 1 < MAX_RETRIES && is_retryable_commit_conflict(&e) => {
+                    // The cached writer state agreed with our snapshot under
+                    // the lock yet `commit_staged` still failed — the cache
+                    // and durable head moved out of sync from outside this
+                    // committer (see [`is_retryable_commit_conflict`]).
+                    // Reconcile via `refresh` and retry against the healed
+                    // cache; `commit_and_finalize` has already dropped the
+                    // write guard, so `refresh` can re-acquire it.
+                    tracing::warn!(
+                        attempt,
+                        error = %e,
+                        "commit conflict under matching snapshot; reconciling and retrying"
+                    );
+                    if let Err(refresh_err) =
+                        self.refresh(ledger.id(), RefreshOpts::default()).await
+                    {
+                        tracing::warn!(
+                            attempt,
+                            error = %refresh_err,
+                            "refresh during commit-conflict retry failed; retrying anyway"
+                        );
+                    }
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
         }
 
         Err(ApiError::internal(format!(

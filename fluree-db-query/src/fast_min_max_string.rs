@@ -1,19 +1,27 @@
-//! Fast-path: scalar `MIN(?o)` / `MAX(?o)` / `AVG(?o)` for a single triple `?s <p> ?o`.
+//! Fast-path: scalar `MIN(?o)` / `MAX(?o)` for a single triple `?s <p> ?o`.
 //!
-//! QLever answers these kinds of aggregates by exploiting permutation order and metadata
-//! to avoid scanning all rows. For Fluree's V3 index, we can do something similar:
-//! - for homogeneous numeric predicates, use each POST leaflet's first/last key as the
-//!   MIN/MAX candidate and scan only `o_key` for AVG
-//! - for homogeneous string-dict predicates, use each leaflet's first/last key as the
-//!   MIN/MAX candidate and compare string dictionary values lexicographically
+//! These aggregates can be answered by exploiting permutation order and metadata
+//! to avoid scanning all rows. For Fluree's V3 index, we do this as follows:
+//! - for numeric predicates, use each POST leaflet's first/last key as the
+//!   MIN/MAX candidate (numeric `o_key` encodings are order-preserving)
+//! - for string-dict predicates on lex-sorted indexes (`lex_sorted_string_ids`,
+//!   i.e. bulk imports), reduce leaflet boundary keys across all datatype/language
+//!   groups by raw `(str_id, dt_id, lang_id)` — the same order the fallback
+//!   aggregate applies to `EncodedLit` bindings
 //!
-//! This reduces work from O(rows) decode/materialization to O(leaflets) for MIN/MAX and
-//! O(rows) over `o_key` only for AVG.
+//! Boundary keys are only a leaflet's extreme within its own `o_type` when the
+//! leaflet is `o_type`-homogeneous; the few leaflets containing an `o_type`
+//! region edge are column-scanned so an extreme hidden mid-leaflet is not missed.
+//!
+//! This reduces work from O(rows) decode/materialization to O(leaflets) — only leaflet
+//! directory keys are read. The row-scanning aggregates (`SUM`/`AVG`/`COUNT(DISTINCT)`)
+//! live in [`crate::fast_predicate_scalar_agg`]; routing MIN/MAX through that per-row
+//! cursor would regress them to O(rows).
 
 use crate::binding::{Batch, Binding};
 use crate::error::{QueryError, Result};
 use crate::fast_path_common::{
-    fast_path_store, leaf_entries_for_predicate, normalize_pred_sid, projection_okey_only,
+    fast_path_store, leaf_entries_for_predicate, normalize_pred_sid, projection_otype_okey,
     FastPathOperator,
 };
 use crate::ir::triple::Ref;
@@ -77,44 +85,12 @@ pub fn predicate_min_max_string_operator(
     )
 }
 
-/// Create a fused operator that outputs a single-row batch containing AVG(?o).
-pub fn predicate_avg_numeric_operator(
-    predicate: Ref,
-    out_var: VarId,
-    fallback: Option<BoxedOperator>,
-) -> FastPathOperator {
-    FastPathOperator::new(
-        out_var,
-        move |ctx| {
-            let Some(store) = fast_path_store(ctx) else {
-                return Ok(None);
-            };
-            let pred_sid = normalize_pred_sid(store, &predicate)?;
-            let Some(p_id) = store.sid_to_p_id(&pred_sid) else {
-                let batch = Batch::single_row(
-                    Arc::from(vec![out_var].into_boxed_slice()),
-                    vec![Binding::Unbound],
-                )
-                .map_err(|e| QueryError::execution(format!("avg batch build: {e}")))?;
-                return Ok(Some(batch));
-            };
-
-            if let Some(b) = avg_numeric_post(store, ctx.binary_g_id, p_id)? {
-                let batch = Batch::single_row(Arc::from(vec![out_var].into_boxed_slice()), vec![b])
-                    .map_err(|e| QueryError::execution(format!("avg batch build: {e}")))?;
-                return Ok(Some(batch));
-            }
-
-            Ok(None)
-        },
-        fallback,
-        "AVG numeric",
-    )
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Candidate identity, ordered to match the fallback aggregate's `EncodedLit`
+/// comparison: `(o_key, dt_id, lang_id)`. On lex-sorted indexes (the only place
+/// the string path runs) `str_id` order equals UTF-8 byte order of the values.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 struct EncodedStringIdentity {
-    /// String dictionary ID (NOT lexicographically ordered).
+    /// String dictionary ID.
     str_id: u32,
     /// Datatype identity for ordering/equality (xsd:string vs rdf:langString vs fulltext).
     dt_id: u16,
@@ -159,56 +135,75 @@ fn encoded_lit_from_otype(
     Some((ident, b))
 }
 
-/// Compute MIN/MAX candidate for a predicate by scanning POST leaflets and considering
-/// only directory keys (first/last key per leaflet).
+/// Compute MIN/MAX candidate for a string-dict predicate from POST leaflet metadata.
 ///
-/// Returns `None` when leaflets contain non-string objects (to avoid semantic surprises).
+/// Sound only when string dictionary IDs are lexicographically assigned
+/// (`lex_sorted_string_ids`): a homogeneous leaflet's boundary key is then its
+/// lexicographic extreme, and raw [`EncodedStringIdentity`] comparison across
+/// datatype/language groups matches the fallback aggregate's ordering. Without
+/// that property the true extreme can sit mid-leaflet where directory keys never
+/// surface it, so we decline.
+///
+/// `o_type`-heterogeneous leaflets (a datatype/language region edge falls inside —
+/// at most one leaflet per region) are column-scanned; every row is a valid
+/// candidate, so no per-region bookkeeping is needed.
+///
+/// Returns `None` when any object is not string-dict-backed.
 fn minmax_string_dict_post(
     store: &BinaryIndexStore,
     g_id: GraphId,
     p_id: u32,
     mode: MinMaxMode,
 ) -> Result<Option<Binding>> {
+    if !store.lex_sorted_string_ids() {
+        return Ok(None);
+    }
     let leaves = leaf_entries_for_predicate(store, g_id, RunSortOrder::Post, p_id);
 
     let mut best: Option<(EncodedStringIdentity, Binding)> = None;
 
     for leaf_entry in leaves {
-        let handle = store
-            .open_leaf_handle(&leaf_entry.leaf_cid, leaf_entry.sidecar_cid.as_ref(), false)
-            .map_err(|e| QueryError::Internal(format!("leaf open: {e}")))?;
-        let dir = handle.dir();
+        // Directory-only prefix read (cached); the full leaf blob is opened
+        // lazily and only for o_type-heterogeneous leaflets.
+        let dir = store
+            .open_leaf_dir(&leaf_entry.leaf_cid)
+            .map_err(|e| QueryError::Internal(format!("leaf dir open: {e}")))?;
+        let mut handle = None;
 
-        for entry in &dir.entries {
+        for (leaflet_idx, entry) in dir.entries.iter().enumerate() {
             if entry.row_count == 0 || entry.p_const != Some(p_id) {
                 continue;
             }
-            let rr = match mode {
-                MinMaxMode::Min => read_ordered_key_v2(RunSortOrder::Post, &entry.first_key),
-                MinMaxMode::Max => read_ordered_key_v2(RunSortOrder::Post, &entry.last_key),
-            };
-            let Some(candidate) = encoded_lit_from_otype(rr.o_type, rr.o_key, p_id) else {
-                return Ok(None);
-            };
-
-            match &best {
-                None => best = Some(candidate),
-                Some((best_id, _)) => {
-                    // We can compare lexicographically without materialization *only*
-                    // when both candidates share the same datatype+lang identity.
-                    if candidate.0.dt_id != best_id.dt_id || candidate.0.lang_id != best_id.lang_id
-                    {
+            if entry.o_type_const.is_some() {
+                let rr = match mode {
+                    MinMaxMode::Min => read_ordered_key_v2(RunSortOrder::Post, &entry.first_key),
+                    MinMaxMode::Max => read_ordered_key_v2(RunSortOrder::Post, &entry.last_key),
+                };
+                if !consider_string_candidate(&mut best, rr.o_type, rr.o_key, p_id, mode) {
+                    return Ok(None);
+                }
+            } else {
+                if handle.is_none() {
+                    handle = Some(
+                        store
+                            .open_leaf_handle(
+                                &leaf_entry.leaf_cid,
+                                leaf_entry.sidecar_cid.as_ref(),
+                                false,
+                            )
+                            .map_err(|e| QueryError::Internal(format!("leaf open: {e}")))?,
+                    );
+                }
+                let batch = handle
+                    .as_ref()
+                    .expect("handle opened above")
+                    .load_columns(leaflet_idx, &projection_otype_okey(), RunSortOrder::Post)
+                    .map_err(|e| QueryError::Internal(format!("load columns: {e}")))?;
+                for row in 0..batch.row_count {
+                    let o_type = batch.o_type.get_or(row, 0);
+                    let o_key = batch.o_key.get(row);
+                    if !consider_string_candidate(&mut best, o_type, o_key, p_id, mode) {
                         return Ok(None);
-                    }
-                    let ord = store
-                        .compare_string_lex(candidate.0.str_id, best_id.str_id)
-                        .map_err(|e| QueryError::Internal(format!("compare string lex: {e}")))?;
-                    let better = match mode {
-                        MinMaxMode::Min => ord.is_lt(),
-                        MinMaxMode::Max => ord.is_gt(),
-                    };
-                    if better {
-                        best = Some(candidate);
                     }
                 }
             }
@@ -216,6 +211,35 @@ fn minmax_string_dict_post(
     }
 
     Ok(best.map(|(_, b)| b))
+}
+
+/// Fold one `(o_type, o_key)` candidate into `best`.
+///
+/// Returns `false` for non-string-dict objects: the caller must decline the
+/// fast path and defer to the planned pipeline.
+fn consider_string_candidate(
+    best: &mut Option<(EncodedStringIdentity, Binding)>,
+    o_type: u16,
+    o_key: u64,
+    p_id: u32,
+    mode: MinMaxMode,
+) -> bool {
+    let Some(candidate) = encoded_lit_from_otype(o_type, o_key, p_id) else {
+        return false;
+    };
+    match best {
+        None => *best = Some(candidate),
+        Some((best_id, _)) => {
+            let better = match mode {
+                MinMaxMode::Min => candidate.0 < *best_id,
+                MinMaxMode::Max => candidate.0 > *best_id,
+            };
+            if better {
+                *best = Some(candidate);
+            }
+        }
+    }
+    true
 }
 
 fn minmax_numeric_post(
@@ -228,14 +252,20 @@ fn minmax_numeric_post(
     let mut best: Option<(u16, u64)> = None;
 
     for leaf_entry in leaves {
-        let handle = store
-            .open_leaf_handle(&leaf_entry.leaf_cid, leaf_entry.sidecar_cid.as_ref(), false)
-            .map_err(|e| QueryError::Internal(format!("leaf open: {e}")))?;
-        let dir = handle.dir();
+        // Directory-only prefix read (cached); this path never loads columns.
+        let dir = store
+            .open_leaf_dir(&leaf_entry.leaf_cid)
+            .map_err(|e| QueryError::Internal(format!("leaf dir open: {e}")))?;
 
         for entry in &dir.entries {
             if entry.row_count == 0 || entry.p_const != Some(p_id) {
                 continue;
+            }
+            // A heterogeneous leaflet can hide another o_type's extreme
+            // mid-leaflet where boundary keys never surface it; the numeric
+            // path only supports a single o_type anyway, so decline.
+            if entry.o_type_const.is_none() {
+                return Ok(None);
             }
             let rr = match mode {
                 MinMaxMode::Min => read_ordered_key_v2(RunSortOrder::Post, &entry.first_key),
@@ -267,71 +297,6 @@ fn minmax_numeric_post(
     Ok(best.map(|(o_type, o_key)| numeric_binding_from_otype_okey(store, o_type, o_key)))
 }
 
-/// Compute AVG(?o) over a numeric predicate by scanning POST leaflets.
-///
-/// # Precision
-///
-/// Uses Kahan compensated summation to reduce floating-point rounding error when
-/// accumulating many values. Naive `sum += x` can lose low-order bits as the
-/// accumulator grows large; Kahan summation maintains a separate compensation
-/// term `c` that captures the lost low-order bits each iteration, keeping
-/// relative error near machine epsilon rather than growing with row count.
-fn avg_numeric_post(store: &BinaryIndexStore, g_id: GraphId, p_id: u32) -> Result<Option<Binding>> {
-    let leaves = leaf_entries_for_predicate(store, g_id, RunSortOrder::Post, p_id);
-    let projection = projection_okey_only();
-    let mut required_otype: Option<u16> = None;
-    // Kahan compensated summation state
-    let mut sum = 0.0f64;
-    let mut compensation = 0.0f64;
-    let mut count: u64 = 0;
-
-    for leaf_entry in leaves {
-        let handle = store
-            .open_leaf_handle(&leaf_entry.leaf_cid, leaf_entry.sidecar_cid.as_ref(), false)
-            .map_err(|e| QueryError::Internal(format!("leaf open: {e}")))?;
-        let dir = handle.dir();
-
-        for (leaflet_idx, entry) in dir.entries.iter().enumerate() {
-            if entry.row_count == 0 || entry.p_const != Some(p_id) {
-                continue;
-            }
-            let Some(o_type) = entry.o_type_const else {
-                return Ok(None);
-            };
-            let ot = OType::from_u16(o_type);
-            if !ot.is_numeric() {
-                return Ok(None);
-            }
-            match required_otype {
-                None => required_otype = Some(o_type),
-                Some(existing) if existing != o_type => return Ok(None),
-                Some(_) => {}
-            }
-
-            let batch = handle
-                .load_columns(leaflet_idx, &projection, RunSortOrder::Post)
-                .map_err(|e| QueryError::Internal(format!("load columns: {e}")))?;
-            for row in 0..batch.row_count {
-                let val = decode_numeric_as_f64(o_type, batch.o_key.get(row))?;
-                // Kahan summation: compensate for lost low-order bits
-                let y = val - compensation;
-                let t = sum + y;
-                compensation = (t - sum) - y;
-                sum = t;
-            }
-            count = count.saturating_add(batch.row_count as u64);
-        }
-    }
-
-    if count == 0 {
-        return Ok(Some(Binding::Unbound));
-    }
-    Ok(Some(Binding::lit(
-        FlakeValue::Double(sum / count as f64),
-        Sid::xsd_double(),
-    )))
-}
-
 fn numeric_binding_from_otype_okey(store: &BinaryIndexStore, o_type: u16, o_key: u64) -> Binding {
     let ot = OType::from_u16(o_type);
     let dt = store
@@ -343,17 +308,5 @@ fn numeric_binding_from_otype_okey(store: &BinaryIndexStore, o_type: u16, o_key:
             Binding::lit(FlakeValue::Double(ObjKey::from_u64(o_key).decode_f64()), dt)
         }
         _ => Binding::Unbound,
-    }
-}
-
-fn decode_numeric_as_f64(o_type: u16, o_key: u64) -> Result<f64> {
-    let ot = OType::from_u16(o_type);
-    let key = ObjKey::from_u64(o_key);
-    match ot.decode_kind() {
-        DecodeKind::I64 => Ok(key.decode_i64() as f64),
-        DecodeKind::F64 => Ok(key.decode_f64()),
-        _ => Err(QueryError::execution(format!(
-            "unsupported numeric decode kind for AVG fast-path: {ot:?}"
-        ))),
     }
 }

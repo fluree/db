@@ -296,12 +296,12 @@ async fn rdfs_subpropertyof_expansion() {
     });
     let ledger = fluree.insert(ledger3, &insert4).await.unwrap().ledger;
 
-    // Querying one-level up in subproperty hierarchy.
+    // Querying one-level up in subproperty hierarchy (reasoning is opt-in).
     let q1 = json!({
         "@context": {"ex":"http://example.org/ns/"},
         "select": "?parent",
-        "where": {"@id":"ex:bob","ex:biologicalParent":"?parent"}
-        // relies on default auto-RDFS (hierarchy exists)
+        "where": {"@id":"ex:bob","ex:biologicalParent":"?parent"},
+        "reasoning": "rdfs"
     });
     let rows1 = support::query_jsonld(&fluree, &ledger, &q1)
         .await
@@ -337,7 +337,7 @@ async fn rdfs_subpropertyof_expansion() {
         ]))
     );
 
-    // Sanity: explicit "none" disables auto-RDFS (so parent expansion disappears).
+    // Sanity: with no reasoning (explicit "none" == the default), no expansion.
     let q3 = json!({
         "@context": {"ex":"http://example.org/ns/"},
         "select": "?parent",

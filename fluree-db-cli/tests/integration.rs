@@ -308,6 +308,216 @@ fn query_no_input_errors() {
     );
 }
 
+// ============================================================================
+// multi-query CLI
+// ============================================================================
+
+#[test]
+fn multi_query_help_shows_subcommand() {
+    cargo_bin_cmd!("fluree")
+        .args(["multi-query", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("multi-query"))
+        .stdout(predicate::str::contains("--remote"))
+        .stdout(predicate::str::contains("envelope"));
+}
+
+#[test]
+fn multi_query_invalid_json_rejected() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    // Inline malformed JSON — should fail at parse time before any
+    // transport resolution.
+    fluree_cmd(&tmp)
+        .args(["multi-query", "-e", "{ not json"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("not valid JSON"));
+}
+
+#[test]
+fn multi_query_local_no_ledger_errors_at_envelope_execution() {
+    // No --remote, no running local server, no `create` of the
+    // referenced ledger. The CLI should fall back to in-process local
+    // execution against the empty storage tree; envelope reaches the
+    // dispatcher which fails to resolve the missing ledger and surfaces
+    // a clear error (not a "no transport" complaint).
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    let envelope = r#"{"queries":{"a":{"language":"jsonld","query":{"from":"definitely-no-such-ledger","select":["?s"],"where":{"@id":"?s"}}}}}"#;
+    fluree_cmd(&tmp)
+        .args(["multi-query", "-e", envelope])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("definitely-no-such-ledger"));
+}
+
+#[test]
+fn multi_query_direct_flag_runs_in_process() {
+    // --direct now means "skip auto-route, execute in-process locally"
+    // — the same semantic as fluree query --direct. Without --remote
+    // the command runs against local storage; the envelope still needs
+    // to reference a ledger that exists, so this test confirms the
+    // transport path is local-in-process by checking that the error
+    // mentions the missing ledger (not a transport / remote error).
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    let envelope = r#"{"queries":{"a":{"language":"jsonld","query":{"from":"missing-ledger","select":["?s"],"where":{"@id":"?s"}}}}}"#;
+    fluree_cmd(&tmp)
+        .args(["--direct", "multi-query", "-e", envelope])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("missing-ledger"));
+}
+
+#[test]
+fn multi_query_unknown_remote_errors() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    let envelope = r#"{"queries":{"a":{"language":"jsonld","query":{"from":"x","select":["?s"],"where":{"@id":"?s"}}}}}"#;
+    fluree_cmd(&tmp)
+        .args(["multi-query", "--remote", "nonexistent", "-e", envelope])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("nonexistent"));
+}
+
+#[test]
+fn multi_query_missing_positional_file_errors_clearly() {
+    // Regression: a typoed positional file name must surface as a
+    // "failed to read <path>" error rather than silently routing to
+    // stdin and executing whatever happened to be piped in.
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    fluree_cmd(&tmp)
+        .args(["multi-query", "definitely-not-a-real-file.json"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("definitely-not-a-real-file.json"));
+}
+
+#[test]
+fn multi_query_local_in_process_against_seeded_ledger_succeeds() {
+    // End-to-end check that the relocated dispatcher works locally
+    // without any HTTP server. Create a ledger via the CLI, insert
+    // a fact, then run a multi-query envelope against it and confirm
+    // the inserted value appears in the response.
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    fluree_cmd(&tmp)
+        .args(["create", "lc:main"])
+        .assert()
+        .success();
+    fluree_cmd(&tmp)
+        .args([
+            "insert",
+            "lc:main",
+            r#"{"@context":{"ex":"http://example.org/"},"@id":"ex:alice","ex:name":"Alice"}"#,
+        ])
+        .assert()
+        .success();
+
+    let envelope = r#"{
+        "queries": {
+            "find": {
+                "language": "jsonld",
+                "query": {
+                    "@context": { "ex": "http://example.org/" },
+                    "from":     "lc:main",
+                    "select":   ["?name"],
+                    "where":    { "@id": "?s", "ex:name": "?name" }
+                }
+            }
+        }
+    }"#;
+    // `--output pretty` selects the envelope display; `--format` now
+    // controls per-alias result shape (`json` | `typed-json`) and
+    // defaults to `json` here, so the response uses the JSON-LD default
+    // for the single alias.
+    fluree_cmd(&tmp)
+        .args(["multi-query", "--output", "pretty", "-e", envelope])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"status\": \"ok\""))
+        .stdout(predicate::str::contains("Alice"));
+}
+
+#[test]
+fn multi_query_typed_json_format_emits_typed_literals() {
+    // `--format typed-json` makes every alias emit `@value`-wrapped
+    // literals — end-to-end coverage that the CLI threads the new
+    // alias-format flag through to the dispatcher.
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    fluree_cmd(&tmp)
+        .args(["create", "lct:main"])
+        .assert()
+        .success();
+    fluree_cmd(&tmp)
+        .args([
+            "insert",
+            "lct:main",
+            r#"{"@context":{"ex":"http://example.org/"},"@id":"ex:alice","ex:name":"Alice"}"#,
+        ])
+        .assert()
+        .success();
+
+    let envelope = r#"{
+        "queries": {
+            "find": {
+                "language": "jsonld",
+                "query": {
+                    "@context": { "ex": "http://example.org/" },
+                    "from":     "lct:main",
+                    "select":   ["?name"],
+                    "where":    { "@id": "?s", "ex:name": "?name" }
+                }
+            }
+        }
+    }"#;
+    fluree_cmd(&tmp)
+        .args([
+            "multi-query",
+            "--format",
+            "typed-json",
+            "--output",
+            "pretty",
+            "-e",
+            envelope,
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("@value"));
+}
+
+#[test]
+fn multi_query_unknown_alias_format_errors_before_network() {
+    // --format is validated up front so a typo can't burn the
+    // server-side multi-query before failing locally.
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    let envelope = r#"{"queries":{"a":{"language":"jsonld","query":{"from":"x","select":["?s"],"where":{"@id":"?s"}}}}}"#;
+    fluree_cmd(&tmp)
+        .args(["multi-query", "--format", "jzon", "-e", envelope])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("unknown --format value"));
+}
+
+#[test]
+fn multi_query_unknown_envelope_view_errors_before_network() {
+    // --output (envelope display) is validated up front too.
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    let envelope = r#"{"queries":{"a":{"language":"jsonld","query":{"from":"x","select":["?s"],"where":{"@id":"?s"}}}}}"#;
+    fluree_cmd(&tmp)
+        .args(["multi-query", "--output", "tabular", "-e", envelope])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("unknown --output value"));
+}
+
 #[test]
 fn query_positional_inline() {
     let tmp = TempDir::new().unwrap();
@@ -438,6 +648,122 @@ fn create_from_file() {
         .assert()
         .success()
         .stdout(predicate::str::contains("About ledger 'seeddb'"))
+        .stdout(predicate::str::contains("flakes"));
+}
+
+#[test]
+fn create_from_nt_file() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+
+    let nt_path = tmp.path().join("seed.nt");
+    std::fs::write(
+        &nt_path,
+        "<http://example.org/seed> <http://example.org/val> \"seeded\" .\n",
+    )
+    .unwrap();
+
+    fluree_cmd(&tmp)
+        .args(["create", "ntdb", "--from", nt_path.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("About ledger 'ntdb'"))
+        .stdout(predicate::str::contains("flakes"));
+}
+
+#[test]
+fn create_from_nquads_file() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+
+    let nq_path = tmp.path().join("seed.nq");
+    std::fs::write(
+        &nq_path,
+        "<http://example.org/seed> <http://example.org/val> \"seeded\" .\n",
+    )
+    .unwrap();
+
+    fluree_cmd(&tmp)
+        .args(["create", "nqdb", "--from", nq_path.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("About ledger 'nqdb'"))
+        .stdout(predicate::str::contains("flakes"));
+}
+
+/// Regression: `fluree create --from data.nt.gz` was failing with "stream did
+/// not contain valid UTF-8" because the CLI's `is_import_path` gate didn't
+/// recognize compressed RDF extensions and silently routed them through a
+/// fallback that did raw `fs::read_to_string`.
+#[test]
+fn create_from_gzipped_nt_file() {
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
+    use std::io::Write;
+
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+
+    let gz_path = tmp.path().join("seed.nt.gz");
+    let f = std::fs::File::create(&gz_path).unwrap();
+    let mut enc = GzEncoder::new(f, Compression::default());
+    enc.write_all(b"<http://example.org/seed> <http://example.org/val> \"seeded\" .\n")
+        .unwrap();
+    enc.finish().unwrap();
+
+    fluree_cmd(&tmp)
+        .args(["create", "ntgzdb", "--from", gz_path.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("About ledger 'ntgzdb'"))
+        .stdout(predicate::str::contains("flakes"));
+}
+
+#[test]
+fn create_from_gzipped_ttl_file() {
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
+    use std::io::Write;
+
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+
+    let gz_path = tmp.path().join("seed.ttl.gz");
+    let f = std::fs::File::create(&gz_path).unwrap();
+    let mut enc = GzEncoder::new(f, Compression::default());
+    enc.write_all(
+        b"@prefix ex: <http://example.org/> .\nex:seed a ex:Thing ; ex:val \"seeded\" .\n",
+    )
+    .unwrap();
+    enc.finish().unwrap();
+
+    fluree_cmd(&tmp)
+        .args(["create", "ttlgzdb", "--from", gz_path.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("About ledger 'ttlgzdb'"))
+        .stdout(predicate::str::contains("flakes"));
+}
+
+#[test]
+fn create_from_zstd_ttl_file() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+
+    let zst_path = tmp.path().join("seed.ttl.zst");
+    let mut f = std::fs::File::create(&zst_path).unwrap();
+    zstd::stream::copy_encode(
+        &b"@prefix ex: <http://example.org/> .\nex:seed a ex:Thing ; ex:val \"seeded\" .\n"[..],
+        &mut f,
+        3,
+    )
+    .unwrap();
+
+    fluree_cmd(&tmp)
+        .args(["create", "ttlzstdb", "--from", zst_path.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("About ledger 'ttlzstdb'"))
         .stdout(predicate::str::contains("flakes"));
 }
 

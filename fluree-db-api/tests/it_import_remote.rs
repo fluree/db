@@ -35,6 +35,19 @@ fn extract_sorted_strings(v: &serde_json::Value) -> Vec<String> {
     out
 }
 
+/// Extract column `n` (0-based) of each row, string values only, sorted.
+fn extract_nth_column(v: &serde_json::Value, n: usize) -> Vec<String> {
+    let mut out: Vec<String> = v
+        .as_array()
+        .expect("expected array")
+        .iter()
+        .filter_map(|row| row.as_array().and_then(|cols| cols.get(n)))
+        .filter_map(|c| c.as_str().map(str::to_string))
+        .collect();
+    out.sort();
+    out
+}
+
 const TTL_PREFIX: &str = "@prefix ex: <http://example.org/ns/> .\n\
 @prefix schema: <http://schema.org/> .\n\
 @prefix xsd: <http://www.w3.org/2001/XMLSchema#> .\n";
@@ -327,20 +340,25 @@ async fn import_from_storage_jsonld_then_query() {
 }
 
 // ============================================================================
-// .trig rejection — assert the explicit error so we don't silently start
-// importing TriG into a half-broken state if the resolver changes.
+// .trig remote import — including named GRAPH blocks — is fully supported.
+// Default-graph and named-graph data both index and become queryable.
 // ============================================================================
-//
-// The underlying TriG-via-import path has a documented upstream limitation
-// (see `import_trig_commit` in fluree-db-transact/src/import.rs). Until that
-// is fixed, import_from_storage rejects .trig with an actionable error message.
 
 #[tokio::test]
-async fn import_from_storage_rejects_trig_with_upstream_explanation() {
+async fn import_from_storage_trig_named_graph_then_query() {
     let db_dir = tempfile::tempdir().unwrap();
     let storage = Arc::new(MemoryStorage::new());
+    let trig = r#"@prefix ex: <http://example.org/> .
+@prefix schema: <http://schema.org/> .
+
+ex:alice schema:name "Alice" .
+
+GRAPH <http://example.org/graphs/audit> {
+    ex:event1 schema:description "User login" .
+}
+"#;
     storage
-        .write_bytes("trig/data.trig", b"# trig data")
+        .write_bytes("trig/data.trig", trig.as_bytes())
         .await
         .unwrap();
 
@@ -349,7 +367,7 @@ async fn import_from_storage_rejects_trig_with_upstream_explanation() {
         .unwrap();
 
     let storage_dyn: Arc<dyn StorageRead> = storage;
-    let err = fluree
+    let result = fluree
         .create("test/remote-trig:main")
         .import_from_storage(
             storage_dyn,
@@ -360,12 +378,44 @@ async fn import_from_storage_rejects_trig_with_upstream_explanation() {
         .cleanup(false)
         .execute()
         .await
-        .expect_err(".trig should be rejected with an upstream-limitation error");
+        .expect("remote .trig import should succeed");
+    assert!(result.flake_count >= 2, "default + named-graph flakes");
 
-    let msg = err.to_string();
+    let ledger = fluree
+        .ledger("test/remote-trig:main")
+        .await
+        .expect("load ledger");
+
+    // Default graph: broad scan must include Alice's name. (Uses a broad
+    // triple scan rather than a prefixed-name pattern to avoid an unrelated
+    // pre-existing prefix-resolution quirk on the TriG default-graph path.)
+    let q_default = json!({
+        "select": ["?s", "?p", "?o"],
+        "where": {"@id": "?s", "?p": "?o"}
+    });
+    let qr = support::query_jsonld(&fluree, &ledger, &q_default)
+        .await
+        .expect("default-graph query");
     assert!(
-        msg.contains(".trig") && msg.contains("not currently supported"),
-        "expected explicit not-supported message, got: {msg}"
+        extract_nth_column(&qr.to_jsonld(&ledger.snapshot).unwrap(), 2)
+            .contains(&"Alice".to_string()),
+        "default graph must contain Alice"
+    );
+
+    // Named graph: queryable via the #<iri> fragment — the behavior the fix enables.
+    let named_alias = "test/remote-trig:main#http://example.org/graphs/audit";
+    let q_named = json!({
+        "from": named_alias,
+        "select": ["?s", "?p", "?o"],
+        "where": {"@id": "?s", "?p": "?o"}
+    });
+    let qr = fluree
+        .query_connection(&q_named)
+        .await
+        .expect("named-graph query should resolve and return data");
+    assert_eq!(
+        extract_nth_column(&qr.to_jsonld(&ledger.snapshot).unwrap(), 2),
+        vec!["User login"]
     );
 }
 

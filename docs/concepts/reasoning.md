@@ -64,12 +64,16 @@ Before your query runs, the engine:
 
 1. **Loads the ontology** — extracts OWL/RDFS declarations (property types,
    class hierarchies, restrictions) from your data.
-2. **Applies rules in a fixpoint loop** — each iteration derives new facts from
-   the combination of asserted and previously-derived facts. The loop stops when
-   no new facts are produced (fixpoint) or a budget limit is reached.
-3. **Overlays derived facts** — the inferred triples are layered on top of your
+2. **Compiles the ontology into ground rules** — each axiom becomes a concrete
+   rule indexed by the facts that can fire it (its trigger predicate or
+   class), so the fixpoint only ever evaluates rules a new fact can actually
+   trigger.
+3. **Applies rules in a fixpoint loop** — each iteration dispatches the newly
+   derived facts to their triggered rules. The loop stops when no new facts
+   are produced (fixpoint) or a budget limit is reached.
+4. **Overlays derived facts** — the inferred triples are layered on top of your
    base data as a read-only overlay. Your original data is never modified.
-4. **Caches the result** — if the same database state is queried again with the
+5. **Caches the result** — if the same database state is queried again with the
    same reasoning modes, the cached materialization is reused instantly.
 
 ### Budget controls
@@ -82,9 +86,14 @@ To guarantee termination, materialization enforces configurable limits:
 | Derived facts | 1,000,000 | Materialization stops; partial results used |
 | Memory | 100 MB | Materialization stops; partial results used |
 
-When a budget is exceeded the query still runs — it simply uses whatever facts
-were derived before the limit was hit. Diagnostics are available via tracing
-spans to identify when capping occurs.
+When a budget is exceeded the query still runs — but over an **incomplete**
+closure, so results may be missing entailments. A capped materialization is
+surfaced in tracked query responses (the `reasoning` block /
+`x-fdb-reasoning` header) and logged as a server WARN. The fact and time
+limits are configurable per ledger (`f:reasoningMaxFacts` /
+`f:reasoningMaxSeconds`), per query (`"reasoningBudget"` or SPARQL budget
+pragmas), and server-wide via environment variables — see
+[Reasoning — materialization budget](../query/reasoning.md#materialization-budget).
 
 ## Enabling reasoning
 

@@ -260,7 +260,9 @@ pub fn lower_sparql_update(
 
 /// Lower INSERT DATA operation.
 ///
-/// INSERT DATA contains ground triples (no variables) that are directly inserted.
+/// INSERT DATA contains ground quads (no variables) that are directly inserted.
+/// `GRAPH <iri> { ... }` blocks route their triples into the named graph,
+/// registering it via `graph_delta` (same machinery as DELETE/INSERT ... WHERE).
 fn lower_insert_data(
     data: &QuadData,
     prologue: &Prologue,
@@ -269,7 +271,16 @@ fn lower_insert_data(
     bnodes: &mut BlankNodeCounter,
     opts: TxnOpts,
 ) -> Result<Txn, LowerError> {
-    let insert_templates = lower_triples_to_templates(&data.triples, prologue, ns, vars, bnodes)?;
+    let mut graph_ids = TemplateGraphIds::new();
+    let insert_templates = lower_quad_pattern_to_templates(
+        &data.quads,
+        prologue,
+        ns,
+        vars,
+        bnodes,
+        &mut graph_ids,
+        None,
+    )?;
 
     Ok(Txn {
         txn_type: TxnType::Insert,
@@ -283,14 +294,15 @@ fn lower_insert_data(
         opts,
         vars: mem::take(vars),
         txn_meta: Vec::new(),
-        graph_delta: FxHashMap::default(),
+        graph_delta: graph_ids.delta(),
         namespace_delta: std::collections::HashMap::new(),
     })
 }
 
 /// Lower DELETE DATA operation.
 ///
-/// DELETE DATA contains ground triples (no variables) that are retracted.
+/// DELETE DATA contains ground quads (no variables) that are retracted.
+/// `GRAPH <iri> { ... }` blocks scope the retraction to the named graph.
 /// Uses TxnType::Update because it's a retract-only transaction.
 fn lower_delete_data(
     data: &QuadData,
@@ -300,7 +312,16 @@ fn lower_delete_data(
     bnodes: &mut BlankNodeCounter,
     opts: TxnOpts,
 ) -> Result<Txn, LowerError> {
-    let delete_templates = lower_triples_to_templates(&data.triples, prologue, ns, vars, bnodes)?;
+    let mut graph_ids = TemplateGraphIds::new();
+    let delete_templates = lower_quad_pattern_to_templates(
+        &data.quads,
+        prologue,
+        ns,
+        vars,
+        bnodes,
+        &mut graph_ids,
+        None,
+    )?;
 
     Ok(Txn {
         txn_type: TxnType::Update,
@@ -314,7 +335,7 @@ fn lower_delete_data(
         opts,
         vars: mem::take(vars),
         txn_meta: Vec::new(),
-        graph_delta: FxHashMap::default(),
+        graph_delta: graph_ids.delta(),
         namespace_delta: std::collections::HashMap::new(),
     })
 }
@@ -456,7 +477,7 @@ fn lower_modify(
     // Lower DELETE templates (if present)
     let delete_templates = if let Some(delete_clause) = &modify.delete_clause {
         lower_quad_pattern_to_templates(
-            delete_clause,
+            &delete_clause.patterns,
             prologue,
             ns,
             vars,
@@ -471,7 +492,7 @@ fn lower_modify(
     // Lower INSERT templates (if present)
     let insert_templates = if let Some(insert_clause) = &modify.insert_clause {
         lower_quad_pattern_to_templates(
-            insert_clause,
+            &insert_clause.patterns,
             prologue,
             ns,
             vars,
@@ -501,7 +522,7 @@ fn lower_modify(
 }
 
 fn lower_quad_pattern_to_templates(
-    pattern: &QuadPattern,
+    elements: &[QuadPatternElement],
     prologue: &Prologue,
     ns: &mut NamespaceRegistry,
     vars: &mut VarRegistry,
@@ -510,7 +531,7 @@ fn lower_quad_pattern_to_templates(
     default_graph_id: Option<u16>,
 ) -> Result<Vec<TripleTemplate>, LowerError> {
     let mut out: Vec<TripleTemplate> = Vec::new();
-    for el in &pattern.patterns {
+    for el in elements {
         match el {
             QuadPatternElement::Triple(tp) => {
                 let mut t = lower_triple_to_template(tp, prologue, ns, vars, bnodes)?;
@@ -542,20 +563,6 @@ fn lower_quad_pattern_to_templates(
         }
     }
     Ok(out)
-}
-
-/// Lower triple patterns to TripleTemplate for DELETE/INSERT templates.
-fn lower_triples_to_templates(
-    triples: &[TriplePattern],
-    prologue: &Prologue,
-    ns: &mut NamespaceRegistry,
-    vars: &mut VarRegistry,
-    bnodes: &mut BlankNodeCounter,
-) -> Result<Vec<TripleTemplate>, LowerError> {
-    triples
-        .iter()
-        .map(|tp| lower_triple_to_template(tp, prologue, ns, vars, bnodes))
-        .collect()
 }
 
 /// Lower a single triple pattern to TripleTemplate.
@@ -736,6 +743,18 @@ fn literal_to_unresolved(
                 xsd::INTEGER,
             ))),
         }),
+        SparqlLiteralValue::BigInteger(s) => {
+            let term = match s.parse::<num_bigint::BigInt>() {
+                Ok(n) => UnresolvedTerm::Literal(LiteralValue::BigInt(Box::new(n))),
+                Err(_) => UnresolvedTerm::Literal(LiteralValue::String(Arc::from(s.as_ref()))),
+            };
+            Ok(UnresolvedTermWithMeta {
+                term,
+                dtc: Some(UnresolvedDatatypeConstraint::Explicit(Arc::from(
+                    xsd::INTEGER,
+                ))),
+            })
+        }
         SparqlLiteralValue::Double(d) => Ok(UnresolvedTermWithMeta {
             term: UnresolvedTerm::Literal(LiteralValue::Double(*d)),
             dtc: Some(UnresolvedDatatypeConstraint::Explicit(Arc::from(
@@ -743,9 +762,9 @@ fn literal_to_unresolved(
             ))),
         }),
         SparqlLiteralValue::Decimal(s) => {
-            // Try to parse as f64; on failure, keep as string with datatype
-            let term = match s.parse::<f64>() {
-                Ok(d) => UnresolvedTerm::Literal(LiteralValue::Double(d)),
+            // Parse exactly; on failure, keep as string with datatype
+            let term = match s.parse::<bigdecimal::BigDecimal>() {
+                Ok(d) => UnresolvedTerm::Literal(LiteralValue::Decimal(Box::new(d))),
                 Err(_) => UnresolvedTerm::Literal(LiteralValue::String(Arc::from(s.as_ref()))),
             };
             Ok(UnresolvedTermWithMeta {
@@ -878,14 +897,24 @@ fn literal_to_template(
             term: TemplateTerm::Value(FlakeValue::Long(*i)),
             dtc: Some(DatatypeConstraint::Explicit(ns.sid_for_iri(xsd::INTEGER))),
         }),
+        SparqlLiteralValue::BigInteger(s) => {
+            let term = match s.parse::<num_bigint::BigInt>() {
+                Ok(n) => TemplateTerm::Value(FlakeValue::BigInt(Box::new(n))),
+                Err(_) => TemplateTerm::Value(FlakeValue::String(s.to_string())),
+            };
+            Ok(LiteralResult {
+                term,
+                dtc: Some(DatatypeConstraint::Explicit(ns.sid_for_iri(xsd::INTEGER))),
+            })
+        }
         SparqlLiteralValue::Double(d) => Ok(LiteralResult {
             term: TemplateTerm::Value(FlakeValue::Double(*d)),
             dtc: Some(DatatypeConstraint::Explicit(ns.sid_for_iri(xsd::DOUBLE))),
         }),
         SparqlLiteralValue::Decimal(s) => {
-            // Try to parse as f64; on failure, keep as string with datatype
-            let term = match s.parse::<f64>() {
-                Ok(d) => TemplateTerm::Value(FlakeValue::Double(d)),
+            // Parse exactly; on failure, keep as string with datatype
+            let term = match s.parse::<bigdecimal::BigDecimal>() {
+                Ok(d) => TemplateTerm::Value(FlakeValue::Decimal(Box::new(d))),
                 Err(_) => TemplateTerm::Value(FlakeValue::String(s.to_string())),
             };
             Ok(LiteralResult {
@@ -933,13 +962,23 @@ fn coerce_typed_value(lexical: &str, datatype_iri: &str) -> UnresolvedTerm {
     // MVP: basic coercion for common types
     match datatype_iri {
         xsd::INTEGER => {
+            // xsd:integer is unbounded: promote past i64 instead of falling
+            // back to a string-valued literal.
             if let Ok(i) = lexical.parse::<i64>() {
                 return UnresolvedTerm::Literal(LiteralValue::Long(i));
             }
+            if let Ok(n) = lexical.parse::<num_bigint::BigInt>() {
+                return UnresolvedTerm::Literal(LiteralValue::BigInt(Box::new(n)));
+            }
         }
-        xsd::DOUBLE | xsd::DECIMAL => {
+        xsd::DOUBLE => {
             if let Ok(d) = lexical.parse::<f64>() {
                 return UnresolvedTerm::Literal(LiteralValue::Double(d));
+            }
+        }
+        xsd::DECIMAL => {
+            if let Ok(d) = lexical.parse::<bigdecimal::BigDecimal>() {
+                return UnresolvedTerm::Literal(LiteralValue::Decimal(Box::new(d)));
             }
         }
         xsd::BOOLEAN => {
@@ -971,13 +1010,23 @@ fn coerce_typed_flake_value(lexical: &str, datatype_iri: &str) -> FlakeValue {
     // MVP: basic coercion for common types
     match datatype_iri {
         xsd::INTEGER => {
+            // xsd:integer is unbounded: promote past i64 instead of falling
+            // back to a string-valued literal.
             if let Ok(i) = lexical.parse::<i64>() {
                 return FlakeValue::Long(i);
             }
+            if let Ok(n) = lexical.parse::<num_bigint::BigInt>() {
+                return FlakeValue::BigInt(Box::new(n));
+            }
         }
-        xsd::DOUBLE | xsd::DECIMAL => {
+        xsd::DOUBLE => {
             if let Ok(d) = lexical.parse::<f64>() {
                 return FlakeValue::Double(d);
+            }
+        }
+        xsd::DECIMAL => {
+            if let Ok(d) = lexical.parse::<bigdecimal::BigDecimal>() {
+                return FlakeValue::Decimal(Box::new(d));
             }
         }
         xsd::BOOLEAN => {
@@ -1106,6 +1155,58 @@ mod tests {
         assert_eq!(counter.next(), "_:b0");
         assert_eq!(counter.next(), "_:b1");
         assert_eq!(counter.next(), "_:b2");
+    }
+
+    #[test]
+    fn test_lower_insert_data_graph_block_registers_named_graph() {
+        // Issue #1288: INSERT DATA { GRAPH <g> { ... } } must lower into
+        // graph-tagged templates plus a graph_delta registering the named graph.
+        let parsed = fluree_db_sparql::parse_sparql(
+            "INSERT DATA { GRAPH <urn:g1> { <http://example.org/s> <http://example.org/p> \"v\" } }",
+        );
+        assert!(
+            !parsed.has_errors(),
+            "parse errors: {:?}",
+            parsed.diagnostics
+        );
+        let ast = parsed.ast.expect("AST");
+
+        let mut ns = NamespaceRegistry::new();
+        let txn = lower_sparql_update_ast(&ast, &mut ns, TxnOpts::default()).expect("lower");
+
+        assert_eq!(txn.txn_type, TxnType::Insert);
+        assert_eq!(txn.insert_templates.len(), 1);
+        assert!(
+            txn.insert_templates[0].graph_id.is_some(),
+            "template should carry a txn-local graph id"
+        );
+        // The named graph IRI must be registered in graph_delta.
+        assert!(
+            txn.graph_delta.values().any(|iri| iri == "urn:g1"),
+            "graph_delta must register <urn:g1>, got {:?}",
+            txn.graph_delta
+        );
+    }
+
+    #[test]
+    fn test_lower_insert_data_default_graph_has_no_graph_delta() {
+        // A plain INSERT DATA (no GRAPH block) lowers with no named-graph delta.
+        let parsed = fluree_db_sparql::parse_sparql(
+            "INSERT DATA { <http://example.org/s> <http://example.org/p> \"v\" }",
+        );
+        assert!(
+            !parsed.has_errors(),
+            "parse errors: {:?}",
+            parsed.diagnostics
+        );
+        let ast = parsed.ast.expect("AST");
+
+        let mut ns = NamespaceRegistry::new();
+        let txn = lower_sparql_update_ast(&ast, &mut ns, TxnOpts::default()).expect("lower");
+
+        assert_eq!(txn.insert_templates.len(), 1);
+        assert!(txn.insert_templates[0].graph_id.is_none());
+        assert!(txn.graph_delta.is_empty());
     }
 
     #[test]

@@ -2564,8 +2564,10 @@ async fn json_transaction_with_meta_reports_decimal_fuel() {
         .and_then(JsonValue::as_f64)
         .expect("tracked transaction response should include decimal fuel");
     assert_eq!(fuel, fuel_header);
+    // Transaction baseline is 10.000 fuel + 1 µfuel/flake; any small txn
+    // should land between the baseline and well under raw-micro-fuel scale.
     assert!(
-        (100.0..1000.0).contains(&fuel),
+        (10.0..1000.0).contains(&fuel),
         "fuel should be reported in fuel units, not raw micro-fuel: {fuel}"
     );
 }
@@ -2623,8 +2625,10 @@ async fn sparql_update_with_tracking_header_reports_decimal_fuel() {
         .and_then(JsonValue::as_f64)
         .expect("tracked SPARQL UPDATE response should include decimal fuel");
     assert_eq!(fuel, fuel_header);
+    // Transaction baseline is 10.000 fuel + 1 µfuel/flake; any small txn
+    // should land between the baseline and well under raw-micro-fuel scale.
     assert!(
-        (100.0..1000.0).contains(&fuel),
+        (10.0..1000.0).contains(&fuel),
         "fuel should be reported in fuel units, not raw micro-fuel: {fuel}"
     );
 }
@@ -3280,4 +3284,93 @@ async fn explain_connection_jsonld_with_time_travel_returns_plan() {
         .unwrap();
     let (status, json) = json_body(resp).await;
     assert_eq!(status, StatusCode::OK, "explain failed: {json}");
+}
+
+/// Issue #1279: on the ledger-scoped query endpoint, a `GRAPH <iri>` pattern
+/// over a user-registered named graph must return data WITHOUT an explicit
+/// `FROM NAMED`, and `GRAPH ?g` must discover the named graph. End-to-end
+/// reproducer over the real HTTP route.
+#[tokio::test]
+async fn sparql_graph_pattern_named_graph_without_from_named() {
+    let (_tmp, state) = test_state().await;
+    let app = build_router(state.clone());
+
+    // Create ledger
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/create")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "ledger": "ngquirk:main" }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    // Upsert one named graph via TriG (mirrors the issue reproducer)
+    let trig = "@prefix ex: <http://example.org/probe/> .\n\
+                GRAPH <urn:probegraph> {\n\
+                  ex:a ex:p ex:b .\n\
+                  ex:a ex:q \"hello\" .\n\
+                }\n";
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/upsert/ngquirk:main")
+                .header("content-type", "application/trig")
+                .body(Body::from(trig))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let (status, json) = json_body(resp).await;
+    assert_eq!(status, StatusCode::OK, "trig upsert failed: {json}");
+
+    // (1) Concrete GRAPH <iri> with NO FROM NAMED → finds the named graph data
+    let sparql = r"SELECT ?s ?p ?o WHERE { GRAPH <urn:probegraph> { ?s ?p ?o } }";
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/query/ngquirk:main")
+                .header("content-type", "application/sparql-query")
+                .body(Body::from(sparql))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let (status, json) = json_body(resp).await;
+    assert_eq!(status, StatusCode::OK, "graph query failed: {json}");
+    assert!(
+        json_contains_string(&json, "hello"),
+        "Expected GRAPH <urn:probegraph> (no FROM NAMED) to find 'hello', got: {json}"
+    );
+
+    // (2) GRAPH ?g discovery → binds ?g to the named graph
+    let sparql = r"SELECT DISTINCT ?g WHERE { GRAPH ?g { ?s ?p ?o } }";
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/query/ngquirk:main")
+                .header("content-type", "application/sparql-query")
+                .body(Body::from(sparql))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let (status, json) = json_body(resp).await;
+    assert_eq!(status, StatusCode::OK, "graph discovery failed: {json}");
+    assert!(
+        json_contains_string(&json, "urn:probegraph"),
+        "Expected GRAPH ?g discovery to surface 'urn:probegraph', got: {json}"
+    );
 }

@@ -237,7 +237,9 @@ async fn indexing_coalesces_multiple_commits_and_latest_root_is_queryable() {
             let c2 = handle.trigger(ledger_id, t2).await;
 
             let (index_t2, _root_id2) = match c2.wait().await {
-                fluree_db_api::IndexOutcome::Completed { index_t, root_id } => (index_t, root_id),
+                fluree_db_api::IndexOutcome::Completed {
+                    index_t, root_id, ..
+                } => (index_t, root_id),
                 fluree_db_api::IndexOutcome::Failed(e) => panic!("indexing failed: {e}"),
                 fluree_db_api::IndexOutcome::Cancelled => panic!("indexing cancelled"),
             };

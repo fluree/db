@@ -1,8 +1,11 @@
 use crate::binding::Binding;
 use crate::context::{ExecutionContext, WellKnownDatatypes};
 use crate::error::{QueryError, Result};
-use crate::fast_path_common::{fast_path_store, normalize_pred_sid};
-use crate::ir::triple::Term;
+use crate::fast_path_common::{
+    allow_cursor_fast_path, build_psot_cursor_for_predicate, fast_path_store, normalize_pred_sid,
+    subject_ref_to_s_id,
+};
+use crate::ir::triple::{Ref, Term};
 use crate::operator::BoxedOperator;
 use crate::operator::{Operator, OperatorState};
 use crate::var_registry::VarId;
@@ -18,15 +21,15 @@ use fluree_db_binary_index::read::column_loader::{
     load_leaflet_columns, load_leaflet_columns_cached,
 };
 use fluree_db_binary_index::{
-    BinaryCursor, BinaryFilter, BinaryGraphView, BinaryIndexStore, ColumnBatch, ColumnProjection,
-    ColumnSet, RunSortOrder,
+    BinaryCursor, BinaryGraphView, BinaryIndexStore, ColumnBatch, ColumnProjection, ColumnSet,
+    RunSortOrder,
 };
 use fluree_db_core::o_type::OType;
 use fluree_db_core::subject_id::SubjectId;
-use fluree_db_core::{FlakeValue, GraphId, Sid};
+use fluree_db_core::{FlakeValue, GraphId, LedgerSnapshot, QueryCancellation, Sid};
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::BinaryHeap;
 use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
@@ -39,13 +42,11 @@ fn should_fallback(ctx: &ExecutionContext<'_>) -> bool {
 }
 
 #[inline]
-fn allow_cursor_fast_path(ctx: &ExecutionContext<'_>) -> bool {
-    // History mode is filtered at the planner — see
-    // `execute::operator_tree::build_operator_tree_inner` — so this gate
-    // doesn't duplicate that check.
-    !ctx.is_multi_ledger()
-        && ctx.from_t.is_none()
-        && ctx.policy_enforcer.as_ref().is_none_or(|p| p.is_root())
+fn check_cancelled(cancellation: &QueryCancellation) -> Result<()> {
+    match cancellation.reason() {
+        Some(reason) => Err(QueryError::Cancelled { reason }),
+        None => Ok(()),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -165,6 +166,12 @@ impl PredicateGroupCountFirstsOperator {
 
 #[async_trait]
 impl Operator for PredicateGroupCountFirstsOperator {
+    fn plan_children(&self) -> Vec<crate::plan_node::PlanChild<'_>> {
+        self.fallback
+            .as_deref()
+            .map(|fb| vec![crate::plan_node::PlanChild::fallback(fb)])
+            .unwrap_or_default()
+    }
     fn schema(&self) -> &[VarId] {
         &self.schema
     }
@@ -197,6 +204,7 @@ impl Operator for PredicateGroupCountFirstsOperator {
                     ctx.binary_g_id,
                     &self.predicate,
                     self.limit,
+                    &ctx.cancellation,
                 ) {
                     Ok(v6_results) => {
                         self.results_v6 = Some(v6_results);
@@ -404,6 +412,12 @@ impl PredicateObjectCountFirstsOperator {
 
 #[async_trait]
 impl Operator for PredicateObjectCountFirstsOperator {
+    fn plan_children(&self) -> Vec<crate::plan_node::PlanChild<'_>> {
+        self.fallback
+            .as_deref()
+            .map(|fb| vec![crate::plan_node::PlanChild::fallback(fb)])
+            .unwrap_or_default()
+    }
     fn schema(&self) -> &[VarId] {
         &self.schema
     }
@@ -432,10 +446,12 @@ impl Operator for PredicateObjectCountFirstsOperator {
         {
             if let Some(binary_index_store) = ctx.binary_store.as_ref() {
                 match count_bound_object_v6(
+                    ctx.active_snapshot,
                     binary_index_store,
                     ctx.binary_g_id,
                     &self.predicate,
                     &self.object,
+                    &ctx.cancellation,
                 ) {
                     Ok(total) => {
                         self.count = total;
@@ -539,10 +555,13 @@ fn load_v6_batch(
             leaf_bytes,
             entry,
             payload_base,
-            order,
             c,
-            leaf_id,
-            leaflet_idx,
+            fluree_db_binary_index::read::column_loader::LeafletDecodeSpec {
+                leaf_id,
+                leaflet_idx,
+                order,
+                decode_set: ColumnSet::ALL,
+            },
         )
         .map_err(|e| QueryError::Internal(format!("load columns: {e}")))
     } else {
@@ -583,15 +602,24 @@ fn resolve_predicate_id_v6(
 /// `(o_type, o_key)` to skip whole leaflets, and decodes only `o_key` + `o_type`
 /// columns when needed.
 fn count_bound_object_v6(
+    snapshot: &LedgerSnapshot,
     store: &BinaryIndexStore,
     g_id: GraphId,
-    predicate: &crate::ir::triple::Ref,
+    predicate: &Ref,
     object: &Term,
+    cancellation: &QueryCancellation,
 ) -> Result<i64> {
     let p_id = resolve_predicate_id_v6(predicate, store)?;
 
-    // Translate the bound object term into V6 (o_type, o_key).
-    let (target_o_type, target_o_key) = translate_term_to_v6(object, store, p_id, g_id)?;
+    // Translate the bound object term into V6 (o_type, o_key). A `None` here is
+    // a *conclusive* base-dict miss (refs are resolved snapshot-aware); since
+    // this path runs only with no novelty overlay, the count is exactly 0 —
+    // return without a fallback full-predicate scan.
+    let Some((target_o_type, target_o_key)) =
+        translate_term_to_v6(object, snapshot, store, p_id, g_id)?
+    else {
+        return Ok(0);
+    };
 
     let branch = store
         .branch_for_order(g_id, RunSortOrder::Post)
@@ -623,6 +651,7 @@ fn count_bound_object_v6(
     let cache = store.leaflet_cache();
 
     for leaf_idx in leaf_range.clone() {
+        check_cancelled(cancellation)?;
         let leaf_entry = &branch.leaves[leaf_idx];
         let bytes = store
             .get_leaf_bytes_sync(&leaf_entry.leaf_cid)
@@ -746,11 +775,60 @@ fn count_bound_object_v6(
 /// V6 fast-path: GROUP BY ?o COUNT(?s) for a predicate.
 ///
 /// Returns `Vec<(o_type, o_key, count)>` sorted by count descending, truncated to `limit`.
+/// One `(o_type, o_key)` group's count, ordered so a `BinaryHeap` (max-heap)
+/// keeps the *worst* element on top for O(log K) eviction.
+///
+/// "Worse" = the element the final sort would place LATER: lower count, then
+/// higher `o_type`, then higher `o_key` (the reverse of the keep order, which is
+/// count DESC, `o_type` ASC, `o_key` ASC). `into_sorted_vec()` then yields the
+/// kept groups in keep order (best first) directly.
+#[derive(PartialEq, Eq)]
+struct GroupTopK {
+    count: i64,
+    o_type: u16,
+    o_key: u64,
+}
+
+impl Ord for GroupTopK {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // Larger == worse.
+        other
+            .count
+            .cmp(&self.count)
+            .then(self.o_type.cmp(&other.o_type))
+            .then(self.o_key.cmp(&other.o_key))
+    }
+}
+
+impl PartialOrd for GroupTopK {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// Offer a completed group's run to the bounded top-K heap, keeping only the
+/// `limit` best by (count DESC, o_type ASC, o_key ASC). No-op for empty runs.
+fn offer_topk(heap: &mut BinaryHeap<GroupTopK>, limit: usize, cand: GroupTopK) {
+    if limit == 0 || cand.count <= 0 {
+        return;
+    }
+    if heap.len() < limit {
+        heap.push(cand);
+    } else if let Some(worst) = heap.peek() {
+        // cand < worst means cand is better than the current worst kept element.
+        if cand.cmp(worst) == Ordering::Less {
+            heap.pop();
+            heap.push(cand);
+        }
+    }
+}
+
 fn group_count_v6(
     store: &BinaryIndexStore,
     g_id: GraphId,
     predicate: &crate::ir::triple::Ref,
     limit: usize,
+    cancellation: &QueryCancellation,
 ) -> Result<Vec<(u16, u64, i64)>> {
     let p_id = resolve_predicate_id_v6(predicate, store)?;
 
@@ -779,10 +857,18 @@ fn group_count_v6(
     };
     let leaf_range = branch.find_leaves_in_range(&min_key, &max_key, cmp);
 
-    let mut counts: HashMap<(u16, u64), i64> = HashMap::new();
+    // Streaming run-length: POST order (p_id, o_type, o_key, …) makes every
+    // object's rows physically contiguous, so COUNT(?subject) per object is the
+    // length of its run — a single counter that persists across leaflet/leaf
+    // boundaries, no per-row hashing. Completed runs feed a bounded top-K heap, so
+    // there is no full sort of all distinct objects either.
+    let mut heap: BinaryHeap<GroupTopK> = BinaryHeap::with_capacity(limit + 1);
+    let mut cur: Option<(u16, u64)> = None;
+    let mut run: i64 = 0;
     let cache = store.leaflet_cache();
 
     for leaf_idx in leaf_range.clone() {
+        check_cancelled(cancellation)?;
         let leaf_entry = &branch.leaves[leaf_idx];
         let bytes = store
             .get_leaf_bytes_sync(&leaf_entry.leaf_cid)
@@ -832,7 +918,23 @@ fn group_count_v6(
             // same `(o_type, o_key)` first row as the next leaflet but still
             // contain rows for *other* predicates that must be excluded.
             if next_prefix == Some(prefix) && entry.p_const == Some(p_id) {
-                *counts.entry(prefix).or_insert(0) += entry.row_count as i64;
+                // Whole leaflet is one object that continues into the next leaflet:
+                // extend the current run (or start one), no per-row decode.
+                if cur == Some(prefix) {
+                    run += entry.row_count as i64;
+                } else {
+                    offer_topk(
+                        &mut heap,
+                        limit,
+                        GroupTopK {
+                            count: run,
+                            o_type: cur.map_or(0, |c| c.0),
+                            o_key: cur.map_or(0, |c| c.1),
+                        },
+                    );
+                    cur = Some(prefix);
+                    run = entry.row_count as i64;
+                }
                 continue;
             }
 
@@ -863,53 +965,90 @@ fn group_count_v6(
                     .o_type_const
                     .unwrap_or_else(|| batch.o_type.get_or(row, 0));
                 let ok = batch.o_key.get(row);
-                *counts.entry((ot, ok)).or_insert(0) += 1;
+                // Contiguous run: extend if the object is unchanged, else flush the
+                // completed run and start a new one.
+                if cur == Some((ot, ok)) {
+                    run += 1;
+                } else {
+                    offer_topk(
+                        &mut heap,
+                        limit,
+                        GroupTopK {
+                            count: run,
+                            o_type: cur.map_or(0, |c| c.0),
+                            o_key: cur.map_or(0, |c| c.1),
+                        },
+                    );
+                    cur = Some((ot, ok));
+                    run = 1;
+                }
             }
         }
     }
 
-    // Sort by count desc, truncate.
-    let mut rows: Vec<(u16, u64, i64)> = counts
+    // Flush the final run, then emit the kept groups in keep order (best first):
+    // count DESC, o_type ASC, o_key ASC — identical to the prior sort+truncate.
+    offer_topk(
+        &mut heap,
+        limit,
+        GroupTopK {
+            count: run,
+            o_type: cur.map_or(0, |c| c.0),
+            o_key: cur.map_or(0, |c| c.1),
+        },
+    );
+    let rows: Vec<(u16, u64, i64)> = heap
+        .into_sorted_vec()
         .into_iter()
-        .map(|((ot, ok), c)| (ot, ok, c))
+        .map(|g| (g.o_type, g.o_key, g.count))
         .collect();
-    rows.sort_unstable_by(|a, b| b.2.cmp(&a.2).then(a.0.cmp(&b.0)).then(a.1.cmp(&b.1)));
-    rows.truncate(limit);
 
     Ok(rows)
 }
 
 /// Translate a bound object `Term` to V6 `(o_type, o_key)`.
+///
+/// Return values:
+/// - `Ok(Some(..))` — resolved to a persisted `(o_type, o_key)`.
+/// - `Ok(None)` — the object is **conclusively absent from the base dict**.
+///   Combined with the caller's no-novelty (`epoch == 0`) gate, "absent from
+///   base dict" implies "absent from the logical DB", so the caller reports a
+///   0 count.
+/// - `Err(..)` — genuine error or unbound object; routes to the generic
+///   fallback.
+///
+/// Refs (`Term::Iri` and `Term::Sid`) resolve through `subject_ref_to_s_id`,
+/// which is snapshot-aware: a `Sid` is decoded via `snapshot.decode_sid` (then
+/// `store.sid_to_iri`) and re-looked-up by full IRI. This makes a `None` a
+/// genuine base miss rather than a "store can't decode this snapshot namespace
+/// code" false negative — so returning a 0 count stays sound even for
+/// pre-encoded `Term::Sid` objects of unknown provenance.
 fn translate_term_to_v6(
     term: &Term,
+    snapshot: &LedgerSnapshot,
     store: &BinaryIndexStore,
     _p_id: u32,
     _g_id: GraphId,
-) -> Result<(u16, u64)> {
+) -> Result<Option<(u16, u64)>> {
     match term {
-        Term::Sid(sid) => {
-            let s_id = store
-                .find_subject_id_by_parts(sid.namespace_code, &sid.name)
-                .map_err(|e| QueryError::execution(format!("find_subject_id_by_parts: {e}")))?
-                .ok_or_else(|| {
-                    QueryError::execution("bound object SID not found in V6 dict".to_string())
-                })?;
-            Ok((OType::IRI_REF.as_u16(), s_id))
-        }
-        Term::Iri(iri) => {
-            let s_id = store
-                .find_subject_id(iri)
-                .map_err(|e| QueryError::execution(format!("find_subject_id: {e}")))?
-                .ok_or_else(|| {
-                    QueryError::execution("bound object IRI not found in V6 dict".to_string())
-                })?;
-            Ok((OType::IRI_REF.as_u16(), s_id))
-        }
+        Term::Iri(iri) => Ok(
+            subject_ref_to_s_id(snapshot, store, &Ref::Iri(iri.clone()))?
+                .map(|s_id| (OType::IRI_REF.as_u16(), s_id)),
+        ),
+        Term::Sid(sid) => Ok(
+            subject_ref_to_s_id(snapshot, store, &Ref::Sid(sid.clone()))?
+                .map(|s_id| (OType::IRI_REF.as_u16(), s_id)),
+        ),
         Term::Value(val) => {
-            // For literal values, we need the FlakeValue → (o_type, o_key) translation.
-            // Use the Sid-based dt info from the FlakeValue if available.
-            let (ot, ok) = crate::binary_scan::value_to_otype_okey_simple(val, store)?;
-            Ok((ot.as_u16(), ok))
+            // Literal values: the FlakeValue → (o_type, o_key) translation.
+            // A NotFound means the value isn't in the persisted dict — conclusive
+            // for literals (no namespace ambiguity). Other errors are genuine and
+            // propagate to the fallback. (Ref-valued objects arrive as Term::Iri.)
+            match crate::binary_scan::value_to_otype_okey_simple(val, store) {
+                Ok((ot, ok)) => Ok(Some((ot.as_u16(), ok))),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(e) => Err(QueryError::from_io("value_to_otype_okey_simple", e)),
+            }
         }
         Term::Var(_) => Err(QueryError::InvalidQuery(
             "fast-path requires a bound object".to_string(),
@@ -1016,6 +1155,12 @@ impl GroupByObjectStarTopKOperator {
 
 #[async_trait]
 impl Operator for GroupByObjectStarTopKOperator {
+    fn plan_children(&self) -> Vec<crate::plan_node::PlanChild<'_>> {
+        self.fallback
+            .as_deref()
+            .map(|fb| vec![crate::plan_node::PlanChild::fallback(fb)])
+            .unwrap_or_default()
+    }
     fn schema(&self) -> &[VarId] {
         &self.schema
     }
@@ -1105,123 +1250,6 @@ impl Operator for GroupByObjectStarTopKOperator {
     }
 }
 
-fn build_psot_cursor_for_predicate_group(
-    ctx: &ExecutionContext<'_>,
-    store: &Arc<BinaryIndexStore>,
-    g_id: GraphId,
-    pred_sid: Sid,
-    p_id: u32,
-    projection: ColumnProjection,
-) -> Result<Option<BinaryCursor>> {
-    let Some(branch) = store.branch_for_order(g_id, RunSortOrder::Psot) else {
-        return Ok(None);
-    };
-    let branch = Arc::clone(branch);
-
-    let min_key = RunRecordV2 {
-        s_id: SubjectId(0),
-        o_key: 0,
-        p_id,
-        t: 0,
-        o_i: 0,
-        o_type: 0,
-        g_id,
-    };
-    let max_key = RunRecordV2 {
-        s_id: SubjectId(u64::MAX),
-        o_key: u64::MAX,
-        p_id,
-        t: 0,
-        o_i: u32::MAX,
-        o_type: u16::MAX,
-        g_id,
-    };
-
-    let filter = BinaryFilter {
-        p_id: Some(p_id),
-        ..Default::default()
-    };
-
-    let mut cursor = BinaryCursor::new(
-        Arc::clone(store),
-        RunSortOrder::Psot,
-        branch,
-        &min_key,
-        &max_key,
-        filter,
-        projection,
-    );
-    cursor.set_to_t(ctx.to_t);
-
-    // Overlay merge — pre-filter by predicate.
-    if ctx.overlay.is_some() {
-        use std::collections::HashMap as StdHashMap;
-        let dn = ctx.dict_novelty.clone().unwrap_or_else(|| {
-            Arc::new(fluree_db_core::dict_novelty::DictNovelty::new_uninitialized())
-        });
-        let mut ephemeral_preds: StdHashMap<fluree_db_core::Sid, u32> = StdHashMap::new();
-        let mut next_ep = store.predicate_count();
-        let mut ops = Vec::new();
-        let mut translate_failed = false;
-        let mut translate_fail_count: u32 = 0;
-
-        ctx.overlay().for_each_overlay_flake(
-            g_id,
-            fluree_db_core::IndexType::Psot,
-            None,
-            None,
-            true,
-            ctx.to_t,
-            &mut |flake| {
-                if flake.p != pred_sid {
-                    return;
-                }
-                match crate::binary_scan::translate_one_flake_v3_pub(
-                    flake,
-                    store,
-                    Some(&dn),
-                    ctx.runtime_small_dicts,
-                    &mut ephemeral_preds,
-                    &mut next_ep,
-                    g_id,
-                ) {
-                    Ok(op) => ops.push(op),
-                    Err(e) => {
-                        translate_failed = true;
-                        translate_fail_count = translate_fail_count.saturating_add(1);
-                        if translate_fail_count == 1 {
-                            tracing::warn!(
-                                error = %e,
-                                s = %flake.s,
-                                p = %flake.p,
-                                t = flake.t,
-                                op = flake.op,
-                                "group-by-object star: overlay flake translation failed; disabling fast path for correctness"
-                            );
-                        }
-                    }
-                }
-            },
-        );
-        if translate_failed {
-            tracing::debug!(
-                failures = translate_fail_count,
-                "group-by-object star: falling back due to overlay translation failures"
-            );
-            return Ok(None);
-        }
-
-        if !ops.is_empty() {
-            fluree_db_binary_index::read::types::sort_overlay_ops(&mut ops, RunSortOrder::Psot);
-            fluree_db_binary_index::read::types::resolve_overlay_ops(&mut ops);
-            cursor.set_overlay_ops(ops);
-        }
-        cursor.set_epoch(ctx.overlay().epoch());
-    }
-
-    Ok(Some(cursor))
-}
-
 fn collect_subject_set_for_predicate_group(
     store: &Arc<BinaryIndexStore>,
     ctx: &ExecutionContext<'_>,
@@ -1249,7 +1277,7 @@ fn collect_subject_set_for_predicate_group(
         internal: ColumnSet::EMPTY,
     };
     let Some(mut cursor) =
-        build_psot_cursor_for_predicate_group(ctx, store, g_id, sid, p_id, projection)?
+        build_psot_cursor_for_predicate(ctx, store, g_id, sid, p_id, projection)?
     else {
         return Ok(None);
     };
@@ -1260,6 +1288,7 @@ fn collect_subject_set_for_predicate_group(
         .next_batch()
         .map_err(|e| QueryError::Internal(format!("cursor batch: {e}")))?
     {
+        ctx.check_cancelled()?;
         for i in 0..batch.row_count {
             let s = batch.s_id.get(i);
             if last_s == Some(s) {
@@ -1315,7 +1344,7 @@ fn compute_group_by_object_star_topk(
         internal: ColumnSet::EMPTY,
     };
     let Some(mut cursor) =
-        build_psot_cursor_for_predicate_group(ctx, store, g_id, sid, p_id, projection)?
+        build_psot_cursor_for_predicate(ctx, store, g_id, sid, p_id, projection)?
     else {
         return Ok(None);
     };
@@ -1344,7 +1373,7 @@ fn compute_group_by_object_star_topk(
             internal: ColumnSet::EMPTY,
         };
         let Some(mut fcur) =
-            build_psot_cursor_for_predicate_group(ctx, store, g_id, fp_sid, fp_id, fp_proj)?
+            build_psot_cursor_for_predicate(ctx, store, g_id, fp_sid, fp_id, fp_proj)?
         else {
             return Ok(None);
         };
@@ -1362,6 +1391,7 @@ fn compute_group_by_object_star_topk(
          -> Result<Option<u64>> {
             loop {
                 if f_batch.is_none() || *f_i >= f_batch.as_ref().unwrap().row_count {
+                    ctx.check_cancelled()?;
                     *f_batch = fcur
                         .next_batch()
                         .map_err(|e| QueryError::Internal(format!("cursor batch: {e}")))?;
@@ -1386,6 +1416,7 @@ fn compute_group_by_object_star_topk(
                                   g_i: &mut usize|
          -> Result<Option<u64>> {
             if g_batch.is_none() || *g_i >= g_batch.as_ref().unwrap().row_count {
+                ctx.check_cancelled()?;
                 *g_batch = cursor
                     .next_batch()
                     .map_err(|e| QueryError::Internal(format!("cursor batch: {e}")))?;
@@ -1474,6 +1505,7 @@ fn compute_group_by_object_star_topk(
             .next_batch()
             .map_err(|e| QueryError::Internal(format!("cursor batch: {e}")))?
         {
+            ctx.check_cancelled()?;
             for i in 0..batch.row_count {
                 let s = batch.s_id.get(i);
                 if !s_set.contains(&s) {
@@ -1589,4 +1621,66 @@ fn compute_group_by_object_star_topk(
     Ok(Some(crate::binding::Batch::new(schema, cols).map_err(
         |e| QueryError::execution(format!("batch build: {e}")),
     )?))
+}
+
+#[cfg(test)]
+mod topk_tests {
+    use super::{offer_topk, GroupTopK};
+    use std::collections::BinaryHeap;
+
+    /// Feed `(count, o_type, o_key)` groups through the bounded heap and return
+    /// the kept groups in emit order `(o_type, o_key, count)`.
+    fn topk(items: &[(i64, u16, u64)], limit: usize) -> Vec<(u16, u64, i64)> {
+        let mut heap: BinaryHeap<GroupTopK> = BinaryHeap::new();
+        for &(count, o_type, o_key) in items {
+            offer_topk(
+                &mut heap,
+                limit,
+                GroupTopK {
+                    count,
+                    o_type,
+                    o_key,
+                },
+            );
+        }
+        heap.into_sorted_vec()
+            .into_iter()
+            .map(|g| (g.o_type, g.o_key, g.count))
+            .collect()
+    }
+
+    #[test]
+    fn orders_by_count_desc() {
+        let r = topk(&[(2, 0, 0), (5, 0, 0), (3, 0, 0), (1, 0, 0)], 3);
+        assert_eq!(r, vec![(0, 0, 5), (0, 0, 3), (0, 0, 2)]);
+    }
+
+    #[test]
+    fn tie_break_is_otype_then_okey_ascending() {
+        // All count 3: keep order is lower o_type first, then lower o_key.
+        let r = topk(&[(3, 2, 9), (3, 1, 5), (3, 1, 2), (3, 0, 100)], 3);
+        assert_eq!(r, vec![(0, 100, 3), (1, 2, 3), (1, 5, 3)]);
+    }
+
+    #[test]
+    fn evicts_worst_and_respects_limit() {
+        assert_eq!(
+            topk(&[(1, 0, 0), (2, 0, 0), (3, 0, 0), (4, 0, 0), (5, 0, 0)], 2),
+            vec![(0, 0, 5), (0, 0, 4)]
+        );
+        assert!(topk(&[], 3).is_empty());
+        assert!(topk(&[(5, 0, 0)], 0).is_empty(), "limit 0 keeps nothing");
+        assert!(
+            topk(&[(0, 0, 0), (-1, 0, 0)], 3).is_empty(),
+            "non-positive runs are not emitted"
+        );
+    }
+
+    #[test]
+    fn count_dominates_tie_break() {
+        // A lower-count group must never outrank a higher-count one regardless of
+        // o_type/o_key.
+        let r = topk(&[(10, 9, 9), (3, 0, 0), (5, 1, 1)], 2);
+        assert_eq!(r, vec![(9, 9, 10), (1, 1, 5)]);
+    }
 }

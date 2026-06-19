@@ -32,7 +32,7 @@
 
 mod dependency;
 pub(crate) mod operator_tree;
-mod pushdown;
+pub(crate) mod pushdown;
 mod reasoning_prep;
 mod rewrite_glue;
 mod runner;
@@ -106,6 +106,7 @@ mod tests {
             reasoning: ReasoningConfig::default(),
             grouping: None,
             ordering: Vec::new(),
+            order_binds: Vec::new(),
             limit: None,
             offset: None,
             post_values: None,
@@ -122,7 +123,9 @@ mod tests {
     }
 
     #[test]
-    fn test_build_operator_tree_validates_select_vars() {
+    fn test_build_operator_tree_allows_unbound_select_var() {
+        // SPARQL 1.1 §18.5: selecting a variable not bound by the pattern is
+        // legal — it is reported unbound, not an error.
         let query = Query {
             context: ParsedContext::default(),
             orig_context: None,
@@ -131,6 +134,7 @@ mod tests {
             reasoning: ReasoningConfig::default(),
             grouping: None,
             ordering: Vec::new(),
+            order_binds: Vec::new(),
             limit: None,
             offset: None,
             post_values: None,
@@ -141,10 +145,10 @@ mod tests {
             None,
             &crate::temporal_mode::PlanningContext::current(),
         );
-        match result {
-            Err(e) => assert!(e.to_string().contains("not found")),
-            Ok(_) => panic!("Expected error for invalid select var"),
-        }
+        assert!(
+            result.is_ok(),
+            "selecting an unbound variable should succeed (reported unbound)"
+        );
     }
 
     #[test]
@@ -157,6 +161,7 @@ mod tests {
             reasoning: ReasoningConfig::default(),
             grouping: None,
             ordering: vec![SortSpec::asc(VarId(99))], // Invalid var
+            order_binds: Vec::new(),
             limit: None,
             offset: None,
             post_values: None,

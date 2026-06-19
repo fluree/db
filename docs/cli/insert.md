@@ -74,7 +74,7 @@ Commit ID: bafybeig...
 The format is auto-detected:
 - `@prefix` or `@base` at line start → Turtle
 - Starts with `{` or `[` → JSON-LD
-- `.ttl` file extension → Turtle
+- `.ttl` or `.nt` file extension → Turtle (N-Triples is parsed as Turtle)
 - `.json` or `.jsonld` extension → JSON-LD
 
 Override with `--format turtle` or `--format jsonld`.

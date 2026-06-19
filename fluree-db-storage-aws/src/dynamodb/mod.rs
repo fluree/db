@@ -118,21 +118,115 @@ impl DynamoDbNameService {
             .unwrap_or(0)
     }
 
-    /// Query all concern items for a given pk (consistent read).
-    async fn query_all_items(&self, pk: &str) -> std::result::Result<Vec<Item>, NameServiceError> {
-        let response = self
-            .client
-            .query()
-            .table_name(&self.table_name)
-            .key_condition_expression("#pk = :pk")
-            .expression_attribute_names("#pk", ATTR_PK)
-            .expression_attribute_values(":pk", AttributeValue::S(pk.to_string()))
-            .consistent_read(true)
-            .send()
-            .await
-            .map_err(|e| NameServiceError::storage(format!("DynamoDB Query failed: {e}")))?;
+    /// Current epoch time in seconds (for the commit-index TTL backstop).
+    fn now_epoch_secs() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    }
 
-        Ok(response.items().to_vec())
+    /// Sort key for a commit-index item: `commit#` + zero-padded `t` so lexical
+    /// SK order matches numeric `t` order. `t` is `i64 >= 0` on this path.
+    fn commit_index_sk(t: i64) -> String {
+        format!("{SK_COMMIT_PREFIX}{:0pad$}", t.max(0), pad = COMMIT_SK_PAD)
+    }
+
+    /// Mirror an advanced commit head into the per-commit index so incremental
+    /// indexing can discover the chain without a serial DAG walk. Best-effort:
+    /// the index is a discovery accelerator, never a source of truth, so a
+    /// failure here must not fail the commit (callers log debug + continue).
+    /// Idempotent — `PutItem` overwrites the same SK on retry/re-publish.
+    async fn put_commit_index_item(&self, pk: &str, t: i64, commit_id: &ContentId) {
+        let ttl = (Self::now_epoch_secs() + COMMIT_INDEX_TTL_SECS).to_string();
+        let result = self
+            .client
+            .put_item()
+            .table_name(&self.table_name)
+            .item(ATTR_PK, AttributeValue::S(pk.to_string()))
+            .item(ATTR_SK, AttributeValue::S(Self::commit_index_sk(t)))
+            .item(ATTR_COMMIT_CID, AttributeValue::S(commit_id.to_string()))
+            .item(ATTR_COMMIT_T, AttributeValue::N(t.to_string()))
+            .item(ATTR_TTL, AttributeValue::N(ttl))
+            .send()
+            .await;
+        if let Err(e) = result {
+            tracing::debug!(error = %e, pk, t, "commit-index PutItem failed (non-fatal)");
+        }
+    }
+
+    /// Query the metadata/ref/graph-source rows for a pk (consistent read).
+    ///
+    /// Bounds the sort key to `>= SK_CONFIG`, which excludes every `commit#…`
+    /// row (those sort lexically before `"config"`, the smallest pre-existing
+    /// SK). Without this bound a large commit-index backlog can push metadata
+    /// off the first Query page and make a ledger appear to not exist. Paginated
+    /// for safety even though the metadata footprint is tiny.
+    async fn query_metadata_items(
+        &self,
+        pk: &str,
+    ) -> std::result::Result<Vec<Item>, NameServiceError> {
+        let mut items = Vec::new();
+        let mut last_key: Option<Item> = None;
+        loop {
+            let mut request = self
+                .client
+                .query()
+                .table_name(&self.table_name)
+                .key_condition_expression("#pk = :pk AND #sk >= :min_sk")
+                .expression_attribute_names("#pk", ATTR_PK)
+                .expression_attribute_names("#sk", ATTR_SK)
+                .expression_attribute_values(":pk", AttributeValue::S(pk.to_string()))
+                .expression_attribute_values(":min_sk", AttributeValue::S(SK_CONFIG.to_string()))
+                .consistent_read(true);
+            if let Some(key) = last_key.take() {
+                request = request.set_exclusive_start_key(Some(key));
+            }
+            let response = request
+                .send()
+                .await
+                .map_err(|e| NameServiceError::storage(format!("DynamoDB Query failed: {e}")))?;
+            items.extend(response.items().iter().cloned());
+            match response.last_evaluated_key() {
+                Some(key) if !key.is_empty() => last_key = Some(key.clone()),
+                _ => break,
+            }
+        }
+        Ok(items)
+    }
+
+    /// Query every row under a pk including `commit#…` items (consistent read,
+    /// paginated). Used only by the delete/purge sweep, which must remove the
+    /// entire partition with no orphaned rows.
+    async fn query_all_items_paginated(
+        &self,
+        pk: &str,
+    ) -> std::result::Result<Vec<Item>, NameServiceError> {
+        let mut items = Vec::new();
+        let mut last_key: Option<Item> = None;
+        loop {
+            let mut request = self
+                .client
+                .query()
+                .table_name(&self.table_name)
+                .key_condition_expression("#pk = :pk")
+                .expression_attribute_names("#pk", ATTR_PK)
+                .expression_attribute_values(":pk", AttributeValue::S(pk.to_string()))
+                .consistent_read(true);
+            if let Some(key) = last_key.take() {
+                request = request.set_exclusive_start_key(Some(key));
+            }
+            let response = request
+                .send()
+                .await
+                .map_err(|e| NameServiceError::storage(format!("DynamoDB Query failed: {e}")))?;
+            items.extend(response.items().iter().cloned());
+            match response.last_evaluated_key() {
+                Some(key) if !key.is_empty() => last_key = Some(key.clone()),
+                _ => break,
+            }
+        }
+        Ok(items)
     }
 
     /// Find an item with a specific sort key value.
@@ -501,7 +595,7 @@ impl fluree_db_nameservice::NameServiceLookup for DynamoDbNameService {
         ledger_id: &str,
     ) -> std::result::Result<Option<NsRecord>, NameServiceError> {
         let pk = Self::normalize(ledger_id);
-        let items = self.query_all_items(&pk).await?;
+        let items = self.query_metadata_items(&pk).await?;
         Ok(Self::items_to_ns_record(&pk, &items))
     }
 
@@ -518,7 +612,7 @@ impl fluree_db_nameservice::NameServiceLookup for DynamoDbNameService {
         // 3. For each PK, query all concern items and assemble NsRecord
         let mut records = Vec::with_capacity(pks.len());
         for pk in &pks {
-            let items = self.query_all_items(pk).await?;
+            let items = self.query_metadata_items(pk).await?;
             if let Some(record) = Self::items_to_ns_record(pk, &items) {
                 records.push(record);
             }
@@ -692,9 +786,9 @@ impl BranchLifecycle for DynamoDbNameService {
     ) -> std::result::Result<Option<u32>, NameServiceError> {
         let pk = Self::normalize(ledger_id);
 
-        // Read all items for this branch to find the parent
-        let items = self.query_all_items(&pk).await?;
-        let meta = Self::find_item_by_sk(&items, SK_META)
+        // Read metadata rows for this branch to find the parent.
+        let meta_items = self.query_metadata_items(&pk).await?;
+        let meta = Self::find_item_by_sk(&meta_items, SK_META)
             .ok_or_else(|| NameServiceError::not_found(ledger_id))?;
 
         let parent_source = meta
@@ -709,10 +803,11 @@ impl BranchLifecycle for DynamoDbNameService {
             .unwrap_or_default();
 
         // Atomic linearization point: conditional delete of meta, then sweep
-        // every remaining row under this pk. If meta is already gone, another
-        // caller already won — surface as NotFound here so we don't decrement
-        // the parent's branch count twice.
-        if !self.delete_all_rows_for_pk(&pk, &items).await? {
+        // every remaining row under this pk (including commit# items). If meta
+        // is already gone, another caller already won — surface as NotFound here
+        // so we don't decrement the parent's branch count twice.
+        let all_items = self.query_all_items_paginated(&pk).await?;
+        if !self.delete_all_rows_for_pk(&pk, &all_items).await? {
             return Err(NameServiceError::not_found(ledger_id));
         }
 
@@ -813,6 +908,153 @@ impl BranchLifecycle for DynamoDbNameService {
         txn.send()
             .await
             .map_err(|e| NameServiceError::storage(format!("DynamoDB reset_head failed: {e}")))?;
+
+        Ok(())
+    }
+
+    async fn pending_commit_cids(
+        &self,
+        ledger_id: &str,
+        since_t: i64,
+    ) -> std::result::Result<Option<Vec<(i64, ContentId)>>, NameServiceError> {
+        let pk = Self::normalize(ledger_id);
+        // Half-open range `(since_t, +inf)` over the `commit#` SK namespace:
+        // BETWEEN the padded `since_t+1` and the all-9s upper bound.
+        let lo = Self::commit_index_sk(since_t.saturating_add(1));
+        let hi = format!("{SK_COMMIT_PREFIX}{}", "9".repeat(COMMIT_SK_PAD));
+
+        let mut out: Vec<(i64, ContentId)> = Vec::new();
+        let mut last_key: Option<Item> = None;
+        loop {
+            let mut req = self
+                .client
+                .query()
+                .table_name(&self.table_name)
+                .key_condition_expression("#pk = :pk AND #sk BETWEEN :lo AND :hi")
+                .expression_attribute_names("#pk", ATTR_PK)
+                .expression_attribute_names("#sk", ATTR_SK)
+                .expression_attribute_values(":pk", AttributeValue::S(pk.clone()))
+                .expression_attribute_values(":lo", AttributeValue::S(lo.clone()))
+                .expression_attribute_values(":hi", AttributeValue::S(hi.clone()))
+                .consistent_read(true);
+            if let Some(ref start) = last_key {
+                req = req.set_exclusive_start_key(Some(start.clone()));
+            }
+
+            let resp = req.send().await.map_err(|e| {
+                NameServiceError::storage(format!("DynamoDB commit-index Query failed: {e}"))
+            })?;
+
+            for item in resp.items() {
+                let t = item
+                    .get(ATTR_COMMIT_T)
+                    .and_then(|v| v.as_n().ok())
+                    .and_then(|n| n.parse::<i64>().ok());
+                let cid = item
+                    .get(ATTR_COMMIT_CID)
+                    .and_then(|v| v.as_s().ok())
+                    .and_then(|s| s.parse::<ContentId>().ok());
+                if let (Some(t), Some(cid)) = (t, cid) {
+                    out.push((t, cid));
+                }
+            }
+
+            match resp.last_evaluated_key() {
+                Some(k) if !k.is_empty() => last_key = Some(k.clone()),
+                _ => break,
+            }
+        }
+
+        // Zero rows in range = this ledger has no commit-index (old ledger, or
+        // none yet above `since_t`); signal fallback to the serial DAG walk.
+        // The indexer re-validates coverage before trusting a non-empty result.
+        if out.is_empty() {
+            return Ok(None);
+        }
+
+        // SK order already yields ascending `t`, but sort defensively.
+        out.sort_by_key(|(t, _)| *t);
+        Ok(Some(out))
+    }
+
+    async fn prune_commit_index(
+        &self,
+        ledger_id: &str,
+        up_to_t: i64,
+    ) -> std::result::Result<(), NameServiceError> {
+        let pk = Self::normalize(ledger_id);
+        // `commit#` items with t <= up_to_t: BETWEEN padded 0 and padded up_to_t.
+        let lo = Self::commit_index_sk(0);
+        let hi = Self::commit_index_sk(up_to_t);
+
+        let mut deletes: Vec<aws_sdk_dynamodb::types::WriteRequest> = Vec::new();
+        let mut last_key: Option<Item> = None;
+        loop {
+            let mut req = self
+                .client
+                .query()
+                .table_name(&self.table_name)
+                .key_condition_expression("#pk = :pk AND #sk BETWEEN :lo AND :hi")
+                .expression_attribute_names("#pk", ATTR_PK)
+                .expression_attribute_names("#sk", ATTR_SK)
+                .expression_attribute_values(":pk", AttributeValue::S(pk.clone()))
+                .expression_attribute_values(":lo", AttributeValue::S(lo.clone()))
+                .expression_attribute_values(":hi", AttributeValue::S(hi.clone()))
+                .projection_expression("#sk");
+            if let Some(ref start) = last_key {
+                req = req.set_exclusive_start_key(Some(start.clone()));
+            }
+
+            let resp = req.send().await.map_err(|e| {
+                NameServiceError::storage(format!("DynamoDB commit-index prune Query failed: {e}"))
+            })?;
+
+            for item in resp.items() {
+                if let Some(sk) = item.get(ATTR_SK).and_then(|v| v.as_s().ok()) {
+                    deletes.push(
+                        aws_sdk_dynamodb::types::WriteRequest::builder()
+                            .delete_request(
+                                aws_sdk_dynamodb::types::DeleteRequest::builder()
+                                    .key(ATTR_PK, AttributeValue::S(pk.clone()))
+                                    .key(ATTR_SK, AttributeValue::S(sk.clone()))
+                                    .build()
+                                    .expect("delete request keys set"),
+                            )
+                            .build(),
+                    );
+                }
+            }
+
+            match resp.last_evaluated_key() {
+                Some(k) if !k.is_empty() => last_key = Some(k.clone()),
+                _ => break,
+            }
+        }
+
+        // BatchWriteItem caps at 25 per call; chunk and retry unprocessed items.
+        while !deletes.is_empty() {
+            let chunk_size = deletes.len().min(25);
+            let chunk: Vec<_> = deletes.drain(..chunk_size).collect();
+
+            let mut remaining: HashMap<String, Vec<_>> = HashMap::new();
+            remaining.insert(self.table_name.clone(), chunk);
+
+            while !remaining.is_empty() {
+                let mut builder = self.client.batch_write_item();
+                for (table, batch) in &remaining {
+                    builder = builder.request_items(table, batch.clone());
+                }
+                let resp = builder.send().await.map_err(|e| {
+                    NameServiceError::storage(format!(
+                        "DynamoDB commit-index batch delete failed: {e}"
+                    ))
+                })?;
+                remaining = resp.unprocessed_items().cloned().unwrap_or_default();
+                if !remaining.is_empty() {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            }
+        }
 
         Ok(())
     }
@@ -948,7 +1190,7 @@ impl LedgerLifecycle for DynamoDbNameService {
         // config, plus any other ledger-level rows). Idempotent — if the
         // record is already gone we return Ok so repeated drops are safe.
         let pk = Self::normalize(ledger_id);
-        let items = self.query_all_items(&pk).await?;
+        let items = self.query_all_items_paginated(&pk).await?;
         let _ = self.delete_all_rows_for_pk(&pk, &items).await?;
         Ok(())
     }
@@ -984,7 +1226,11 @@ impl CommitPublisher for DynamoDbNameService {
             .await;
 
         match result {
-            Ok(_) => Ok(()),
+            Ok(_) => {
+                // Head advanced — mirror into the commit-CID index (best-effort).
+                self.put_commit_index_item(&pk, commit_t, commit_id).await;
+                Ok(())
+            }
             Err(e) if Self::is_conditional_check_failed(&e) => {
                 // Distinguish stale (item exists, t >= new) from missing (not initialized).
                 if !self.meta_exists(&pk).await? {
@@ -1342,7 +1588,12 @@ impl DynamoDbNameService {
             .await;
 
         match result {
-            Ok(_) => Ok(()),
+            Ok(_) => {
+                if let (RefKind::CommitHead, Some(id)) = (kind, new.id.as_ref()) {
+                    self.put_commit_index_item(pk, new.t, id).await;
+                }
+                Ok(())
+            }
             Err(e) if Self::is_transaction_canceled(&e) => {
                 // Race: someone else created the ledger between our get_ref and
                 // this transaction. Return a generic error; the caller's CAS
@@ -1498,7 +1749,12 @@ impl RefPublisher for DynamoDbNameService {
             let result = request.update_expression(update_expr).send().await;
 
             return match result {
-                Ok(_) => Ok(CasResult::Updated),
+                Ok(_) => {
+                    if let (RefKind::CommitHead, Some(id)) = (kind, new.id.as_ref()) {
+                        self.put_commit_index_item(&pk, new.t, id).await;
+                    }
+                    Ok(CasResult::Updated)
+                }
                 Err(e) if Self::is_conditional_check_failed(&e) => {
                     let actual = self.get_ref(ledger_id, kind).await?;
                     Ok(CasResult::Conflict { actual })
@@ -1541,7 +1797,12 @@ impl RefPublisher for DynamoDbNameService {
         let result = request.update_expression(update_expr).send().await;
 
         match result {
-            Ok(_) => Ok(CasResult::Updated),
+            Ok(_) => {
+                if let (RefKind::CommitHead, Some(id)) = (kind, new.id.as_ref()) {
+                    self.put_commit_index_item(&pk, new.t, id).await;
+                }
+                Ok(CasResult::Updated)
+            }
             Err(e) if Self::is_conditional_check_failed(&e) => {
                 let actual = self.get_ref(ledger_id, kind).await?;
                 Ok(CasResult::Conflict { actual })
@@ -1742,7 +2003,7 @@ impl GraphSourceLookup for DynamoDbNameService {
         graph_source_id: &str,
     ) -> std::result::Result<Option<GraphSourceRecord>, NameServiceError> {
         let pk = Self::normalize(graph_source_id);
-        let items = self.query_all_items(&pk).await?;
+        let items = self.query_metadata_items(&pk).await?;
         Ok(Self::items_to_gs_record(&pk, &items))
     }
 
@@ -1751,7 +2012,7 @@ impl GraphSourceLookup for DynamoDbNameService {
         resource_id: &str,
     ) -> std::result::Result<NsLookupResult, NameServiceError> {
         let pk = Self::normalize(resource_id);
-        let items = self.query_all_items(&pk).await?;
+        let items = self.query_metadata_items(&pk).await?;
 
         // Discriminate by meta.kind
         let meta = Self::find_item_by_sk(&items, SK_META);

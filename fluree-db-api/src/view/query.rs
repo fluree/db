@@ -4,12 +4,15 @@
 //! a GraphDb, respecting policy and reasoning wrappers.
 
 use crate::query::helpers::{
-    build_query_result, parse_and_validate_sparql, parse_jsonld_query, parse_sparql_to_ir,
-    prepare_for_execution, status_for_query_error, tracker_for_limits,
-    tracker_for_tracked_endpoint,
+    build_query_result, charge_query_floor, parse_and_validate_sparql, parse_jsonld_query,
+    parse_sparql_to_ir, prepare_for_execution, status_for_query_error, tracked_query_tracker,
+    tracker_for_limits,
 };
 use crate::view::{GraphDb, QueryInput};
-use crate::{ApiError, ExecutableQuery, Fluree, QueryResult, Result, Tracker, TrackingOptions};
+use crate::{
+    ApiError, ExecutableQuery, Fluree, QueryExecutionOptions, QueryResult, Result, Tracker,
+    TrackingOptions,
+};
 use fluree_db_query::execute::{
     execute_prepared, prepare_execution_with_config, ContextConfig, PrepareConfig,
 };
@@ -70,7 +73,27 @@ impl Fluree {
     /// `FROM` or `FROM NAMED` clauses will be rejected. Use
     /// `query_connection_sparql` for multi-ledger queries.
     pub async fn query(&self, db: &GraphDb, q: impl Into<QueryInput<'_>>) -> Result<QueryResult> {
+        self.query_with_options(db, q, QueryExecutionOptions::default())
+            .await
+    }
+
+    /// Execute a query against a GraphDb with explicit execution controls.
+    pub async fn query_with_options(
+        &self,
+        db: &GraphDb,
+        q: impl Into<QueryInput<'_>>,
+        options: QueryExecutionOptions,
+    ) -> Result<QueryResult> {
         let input = q.into();
+
+        // 0. Tracker for fuel limits only (no tracking overhead for non-tracked
+        // calls). Charge the floor up front so a sub-floor `max-fuel` is
+        // rejected before we spend parse/plan work; no-op when fuel isn't tracked.
+        let tracker = match &input {
+            QueryInput::JsonLd(json) => tracker_for_limits(json),
+            QueryInput::Sparql(_) => Tracker::disabled(),
+        };
+        charge_query_floor(&tracker).map_err(fluree_db_query::QueryError::from)?;
 
         // 1. Parse to common IR
         let parse_start = std::time::Instant::now();
@@ -94,16 +117,10 @@ impl Fluree {
         let executable = self.build_executable_for_view(db, &parsed).await?;
         let plan_ms = plan_start.elapsed().as_secs_f64() * 1000.0;
 
-        // 3. Get tracker for fuel limits only (no tracking overhead for non-tracked calls)
-        let tracker = match &input {
-            QueryInput::JsonLd(json) => tracker_for_limits(json),
-            QueryInput::Sparql(_) => Tracker::disabled(),
-        };
-
         // 4. Execute
         let exec_start = std::time::Instant::now();
         let batches = self
-            .execute_view_internal(db, &vars, &executable, &tracker)
+            .execute_view_internal(db, &vars, &executable, &tracker, &options)
             .await?;
         let exec_ms = exec_start.elapsed().as_secs_f64() * 1000.0;
 
@@ -130,14 +147,23 @@ impl Fluree {
     /// This is used by connection query paths (and builders) that need to resolve
     /// graph sources via R2RML/Iceberg while still running against a ledger-backed
     /// planning database.
-    pub(crate) async fn query_view_with_r2rml(
+    pub(crate) async fn query_view_with_r2rml_options(
         &self,
         db: &GraphDb,
         q: impl Into<QueryInput<'_>>,
         r2rml_provider: &dyn R2rmlProvider,
         r2rml_table_provider: &dyn R2rmlTableProvider,
+        options: QueryExecutionOptions,
     ) -> Result<QueryResult> {
         let input = q.into();
+
+        // 0. Tracker (fuel limits only). Charge the floor up front so a
+        // sub-floor `max-fuel` is rejected before parse/plan; no-op untracked.
+        let tracker = match &input {
+            QueryInput::JsonLd(json) => tracker_for_limits(json),
+            QueryInput::Sparql(_) => Tracker::disabled(),
+        };
+        charge_query_floor(&tracker).map_err(fluree_db_query::QueryError::from)?;
 
         // 1. Parse to common IR
         let (vars, mut parsed) = match &input {
@@ -157,12 +183,6 @@ impl Fluree {
         // 2. Build executable with optional reasoning override
         let executable = self.build_executable_for_view(db, &parsed).await?;
 
-        // 3. Tracker (fuel limits only)
-        let tracker = match &input {
-            QueryInput::JsonLd(json) => tracker_for_limits(json),
-            QueryInput::Sparql(_) => Tracker::disabled(),
-        };
-
         // 4. Execute
         let batches = self
             .execute_view_internal_with_r2rml(
@@ -170,8 +190,11 @@ impl Fluree {
                 &vars,
                 &executable,
                 &tracker,
-                r2rml_provider,
-                r2rml_table_provider,
+                crate::R2rmlProviders {
+                    provider: r2rml_provider,
+                    table_provider: r2rml_table_provider,
+                },
+                &options,
             )
             .await?;
 
@@ -213,26 +236,24 @@ impl Fluree {
     /// Returns a tracked response with fuel, time, and policy statistics.
     /// When `format_config` is `None`, defaults to JSON-LD for FlureeQL
     /// queries and SPARQL JSON for SPARQL queries.
-    pub(crate) async fn query_tracked(
+    pub(crate) async fn query_tracked_with_options(
         &self,
         db: &GraphDb,
         q: impl Into<QueryInput<'_>>,
         format_config: Option<crate::format::FormatterConfig>,
         tracking_override: Option<TrackingOptions>,
+        options: QueryExecutionOptions,
     ) -> std::result::Result<crate::query::TrackedQueryResponse, crate::query::TrackedErrorResponse>
     {
         let input = q.into();
 
-        // Get tracker: use caller-provided options if given, otherwise fall back
-        // to defaults (all-enabled for SPARQL, opts-derived for JSON-LD).
-        let tracker = if let Some(opts) = tracking_override {
-            Tracker::new(opts)
-        } else {
-            match &input {
-                QueryInput::JsonLd(json) => tracker_for_tracked_endpoint(json),
-                QueryInput::Sparql(_) => Tracker::new(TrackingOptions::all_enabled()),
-            }
-        };
+        // Tracker: caller-provided options if given, else per-input defaults.
+        let tracker = tracked_query_tracker(&input, &tracking_override);
+
+        // Charge the one-time query floor before parsing so a parse/plan error
+        // still reports it and a sub-floor max-fuel is rejected up front.
+        charge_query_floor(&tracker)
+            .map_err(|e| crate::query::TrackedErrorResponse::fuel_exceeded(&e, tracker.tally()))?;
 
         // Determine output format: caller override > input-type default
         let default_format = match &input {
@@ -275,7 +296,7 @@ impl Fluree {
 
         // Execute with tracking
         let batches = self
-            .execute_view_tracked(db, &vars, &executable, &tracker)
+            .execute_view_tracked(db, &vars, &executable, &tracker, &options)
             .await
             .map_err(|e| {
                 let status = query_error_to_status(&e);
@@ -326,26 +347,23 @@ impl Fluree {
         ))
     }
 
-    pub(crate) async fn query_tracked_with_r2rml(
+    pub(crate) async fn query_tracked_with_r2rml_options(
         &self,
         db: &GraphDb,
         q: impl Into<QueryInput<'_>>,
         format_config: Option<crate::format::FormatterConfig>,
         tracking_override: Option<TrackingOptions>,
-        r2rml_provider: &dyn R2rmlProvider,
-        r2rml_table_provider: &dyn R2rmlTableProvider,
+        r2rml: crate::R2rmlProviders<'_>,
+        options: QueryExecutionOptions,
     ) -> std::result::Result<crate::query::TrackedQueryResponse, crate::query::TrackedErrorResponse>
     {
         let input = q.into();
 
-        let tracker = if let Some(opts) = tracking_override {
-            Tracker::new(opts)
-        } else {
-            match &input {
-                QueryInput::JsonLd(json) => tracker_for_tracked_endpoint(json),
-                QueryInput::Sparql(_) => Tracker::new(TrackingOptions::all_enabled()),
-            }
-        };
+        let tracker = tracked_query_tracker(&input, &tracking_override);
+
+        // Charge the one-time query floor before parsing (see `query_tracked`).
+        charge_query_floor(&tracker)
+            .map_err(|e| crate::query::TrackedErrorResponse::fuel_exceeded(&e, tracker.tally()))?;
 
         let default_format = match &input {
             QueryInput::Sparql(_) => crate::format::FormatterConfig::sparql_json(),
@@ -384,14 +402,7 @@ impl Fluree {
             })?;
 
         let batches = self
-            .execute_view_tracked_with_r2rml(
-                db,
-                &vars,
-                &executable,
-                &tracker,
-                r2rml_provider,
-                r2rml_table_provider,
-            )
+            .execute_view_tracked_with_r2rml(db, &vars, &executable, &tracker, r2rml, &options)
             .await
             .map_err(|e| {
                 let status = query_error_to_status(&e);
@@ -491,10 +502,28 @@ impl Fluree {
             let query_has_reasoning = executable.reasoning.modes.has_any_enabled();
             let query_disabled = executable.reasoning.modes.is_disabled();
 
-            // Apply precedence rules
+            // Apply precedence rules. Mode replacement keeps the query's
+            // budget: wrapper modes come from config mode strings and never
+            // carry one, and whether the query budget survives is decided
+            // below by `ConfigReasoningBudget::apply` (override control),
+            // not by mode precedence.
             if let Some(effective) = db.effective_reasoning(query_has_reasoning, query_disabled) {
+                let (max_facts, max_seconds) = (
+                    executable.reasoning.modes.max_facts,
+                    executable.reasoning.modes.max_seconds,
+                );
                 executable.reasoning.modes = effective.clone();
+                executable.reasoning.modes.max_facts = max_facts;
+                executable.reasoning.modes.max_seconds = max_seconds;
             }
+        }
+
+        // Apply the ledger-config materialization budget. Runs after mode
+        // precedence on purpose: the budget governs whichever modes won
+        // (config defaults or a query override), and override control decides
+        // whether a query-supplied budget survives.
+        if let Some(budget) = db.config_reasoning_budget() {
+            budget.apply(&mut executable.reasoning.modes);
         }
 
         // Enforce config-graph datalog restrictions
@@ -748,24 +777,35 @@ impl Fluree {
         vars: &crate::VarRegistry,
         executable: &ExecutableQuery,
         tracker: &Tracker,
+        options: &QueryExecutionOptions,
     ) -> Result<Vec<crate::Batch>> {
         let noop = crate::NoOpR2rmlProvider::new();
-        self.execute_view_internal_with_r2rml(db, vars, executable, tracker, &noop, &noop)
-            .await
+        self.execute_view_internal_with_r2rml(
+            db,
+            vars,
+            executable,
+            tracker,
+            crate::R2rmlProviders {
+                provider: &noop,
+                table_provider: &noop,
+            },
+            options,
+        )
+        .await
     }
 
     /// Execute against a GraphDb with explicit R2RML provider.
     ///
     /// Used by callers that need R2RML/Iceberg graph source support
     /// (e.g., server query handlers with iceberg support).
-    pub(crate) async fn execute_view_internal_with_r2rml<'b>(
+    pub(crate) async fn execute_view_internal_with_r2rml(
         &self,
         db: &GraphDb,
         vars: &crate::VarRegistry,
         executable: &ExecutableQuery,
         tracker: &Tracker,
-        r2rml_provider: &'b dyn fluree_db_query::r2rml::R2rmlProvider,
-        r2rml_table_provider: &'b dyn fluree_db_query::r2rml::R2rmlTableProvider,
+        r2rml: crate::R2rmlProviders<'_>,
+        options: &QueryExecutionOptions,
     ) -> Result<Vec<crate::Batch>> {
         let db_ref = db.as_graph_db_ref();
         // Single-graph view: no dataset-level history detection — current state.
@@ -796,8 +836,9 @@ impl Fluree {
 
         let config = ContextConfig {
             tracker: Some(tracker),
+            cancellation: options.cancellation.clone(),
             policy_enforcer: db.policy_enforcer().cloned(),
-            r2rml: Some((r2rml_provider, r2rml_table_provider)),
+            r2rml: Some((r2rml.provider, r2rml.table_provider)),
             binary_store: db.binary_store.clone(),
             binary_g_id: db.graph_id,
             dict_novelty: db.dict_novelty.clone(),
@@ -823,10 +864,21 @@ impl Fluree {
         vars: &crate::VarRegistry,
         executable: &ExecutableQuery,
         tracker: &Tracker,
+        options: &QueryExecutionOptions,
     ) -> std::result::Result<Vec<crate::Batch>, fluree_db_query::QueryError> {
         let noop = crate::NoOpR2rmlProvider::new();
-        self.execute_view_tracked_with_r2rml(db, vars, executable, tracker, &noop, &noop)
-            .await
+        self.execute_view_tracked_with_r2rml(
+            db,
+            vars,
+            executable,
+            tracker,
+            crate::R2rmlProviders {
+                provider: &noop,
+                table_provider: &noop,
+            },
+            options,
+        )
+        .await
     }
 
     pub(crate) async fn execute_view_tracked_with_r2rml(
@@ -835,8 +887,8 @@ impl Fluree {
         vars: &crate::VarRegistry,
         executable: &ExecutableQuery,
         tracker: &Tracker,
-        r2rml_provider: &dyn R2rmlProvider,
-        r2rml_table_provider: &dyn R2rmlTableProvider,
+        r2rml: crate::R2rmlProviders<'_>,
+        options: &QueryExecutionOptions,
     ) -> std::result::Result<Vec<crate::Batch>, fluree_db_query::QueryError> {
         let db_ref = db.as_graph_db_ref();
         // Single-graph view: no dataset-level history detection — current state.
@@ -865,8 +917,9 @@ impl Fluree {
 
         let config = ContextConfig {
             tracker: Some(tracker),
+            cancellation: options.cancellation.clone(),
             policy_enforcer: db.policy_enforcer().cloned(),
-            r2rml: Some((r2rml_provider, r2rml_table_provider)),
+            r2rml: Some((r2rml.provider, r2rml.table_provider)),
             binary_store: db.binary_store.clone(),
             binary_g_id: db.graph_id,
             dict_novelty: db.dict_novelty.clone(),
@@ -887,7 +940,7 @@ impl Fluree {
 // ============================================================================
 
 fn query_error_to_api_error(err: fluree_db_query::QueryError) -> ApiError {
-    ApiError::query(err.to_string())
+    ApiError::Query(err)
 }
 
 /// Map QueryError to HTTP-ish status code.

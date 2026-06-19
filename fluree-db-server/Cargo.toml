@@ -153,7 +153,7 @@ rmcp = { workspace = true }
 schemars = { workspace = true }
 
 # Async cancellation token for graceful shutdown
-tokio-util = { version = "0.7", features = ["rt"] }
+tokio-util = { version = "0.7", features = ["rt", "io"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
@@ -161,6 +161,7 @@ http-body-util = { workspace = true }
 tower = { workspace = true, features = ["util"] }
 tempfile = "3"
 wiremock = { workspace = true }
+indexmap = { workspace = true }
 fluree-db-binary-index = { path = "../fluree-db-binary-index" }
 fluree-db-novelty = { path = "../fluree-db-novelty" }
 

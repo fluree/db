@@ -36,6 +36,57 @@ pub fn fuel_to_micro(fuel: f64) -> u64 {
     (fuel * MICRO_FUEL_PER_FUEL as f64).round().max(0.0) as u64
 }
 
+/// Fuel schedule — the central, named source for the engine's structural fuel
+/// charges: the query floor, I/O "touches", the per-row/per-flake rate, and the
+/// transaction baseline. All values are **micro-fuel** (1 fuel = 1000 micro-fuel).
+///
+/// Not (yet) centralized here: per-call expression/function micro-charges
+/// (1–5 µf for hashing, UUID, geo, vector, fulltext, etc.) and R2RML row
+/// charges, which are applied inline at their `eval`/r2rml sites. The public
+/// cost ladder in `docs/query/tracking-and-fuel.md` lists all of them.
+///
+/// To re-scale a charge defined here, change it once and every call site picks
+/// it up. History: I/O "touches" were rescaled from 1000 µf (1.000 fuel) to
+/// 10 µf (0.010 fuel) so scan-dominated queries report fuel proportionate to a
+/// transaction's flat baseline. The per-row/per-flake rate (1 µf) is the floor
+/// of the integer unit and was left unchanged.
+pub mod schedule {
+    /// One-time floor charged once at query entry (before parsing). Guarantees
+    /// a fuel-tracked query reports at least 1.000 fuel and that parse/plan
+    /// errors still reflect a non-zero cost.
+    pub const QUERY_FLOOR_MICRO_FUEL: u64 = 1000;
+
+    /// Per index-leaflet batch read during a binary cursor scan, charged once
+    /// per batch returned regardless of cache state.
+    pub const INDEX_TOUCH_MICRO_FUEL: u64 = 10;
+
+    /// Per persisted forward-dict decode (id → value) during result
+    /// materialization.
+    pub const DICT_TOUCH_MICRO_FUEL: u64 = 10;
+
+    /// Base charge per history-scan leaflet. Per-row costs (base rows +
+    /// in-range sidecar rows, at [`PER_ROW_MICRO_FUEL`] each) are added on top
+    /// at the call site.
+    pub const HISTORY_LEAF_TOUCH_MICRO_FUEL: u64 = 10;
+
+    /// Per row/flake materialized from in-memory state: `db.range` flakes,
+    /// overlay/novelty rows, and history rows. The same 1 µf-per-unit rate also
+    /// applies to staged flakes during transactions and bulk imports, where it
+    /// is charged as a raw count (`flakes.len()`) at those call sites.
+    pub const PER_ROW_MICRO_FUEL: u64 = 1;
+
+    /// Transaction/commit baseline, charged once per `stage` and once per
+    /// bulk-import commit chunk.
+    pub const TXN_BASELINE_MICRO_FUEL: u64 = 10_000;
+
+    /// Per successful indexer CAS write. Charged once per `put`, `put_with_id`,
+    /// or `content_write_bytes` call made by the indexer. For `IndexLeaf` writes
+    /// an additional charge of this same rate is applied per *re-encoded*
+    /// leaflet inside the leaf (passthrough leaflets are byte-copied and not
+    /// charged).
+    pub const INDEX_CAS_WRITE_MICRO_FUEL: u64 = 1000;
+}
+
 /// Tracking options parsed from query `opts`
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TrackingOptions {
@@ -144,6 +195,11 @@ struct TrackerInner {
     // Policy tracking
     policy_stats: RwLock<HashMap<String, PolicyStats>>,
 
+    // Reasoning materialization outcome (recorded by query prepare when a
+    // reasoning mode ran). Not gated by an option: a capped materialization
+    // is a correctness signal, so any enabled tracker reports it.
+    reasoning: RwLock<Option<ReasoningTally>>,
+
     options: TrackingOptions,
 }
 
@@ -165,6 +221,7 @@ impl Tracker {
             fuel_total: AtomicU64::new(0),
             fuel_limit: options.max_fuel.unwrap_or(0),
             policy_stats: RwLock::new(HashMap::new()),
+            reasoning: RwLock::new(None),
             options,
         })))
     }
@@ -249,6 +306,19 @@ impl Tracker {
         }
     }
 
+    /// Record the outcome of an OWL2-RL materialization for this request.
+    ///
+    /// Last write wins (a request runs at most one materialization per
+    /// prepared query; dataset queries record the primary graph's run).
+    pub fn record_reasoning(&self, tally: ReasoningTally) {
+        let Some(inner) = &self.0 else {
+            return;
+        };
+        if let Ok(mut slot) = inner.reasoning.write() {
+            *slot = Some(tally);
+        }
+    }
+
     /// Finalize tracking into a serializable tally.
     pub fn tally(&self) -> Option<TrackingTally> {
         let inner = self.0.as_ref()?;
@@ -264,6 +334,7 @@ impl Tracker {
             } else {
                 None
             },
+            reasoning: inner.reasoning.read().ok().and_then(|r| r.clone()),
         })
     }
 }
@@ -280,9 +351,93 @@ pub struct TrackingTally {
     /// Policy stats: `{policy-id -> {executed, allowed}}`
     #[serde(skip_serializing_if = "Option::is_none")]
     pub policy: Option<HashMap<String, PolicyStats>>,
+    /// Reasoning materialization outcome, when a reasoning mode ran.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<ReasoningTally>,
+}
+
+/// Outcome of an OWL2-RL materialization, reported per request.
+///
+/// `capped: true` means the closure hit its budget before reaching fixpoint —
+/// query results may be missing entailments. Clients should treat capped
+/// results as incomplete, not merely slow.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReasoningTally {
+    /// Whether materialization was capped before reaching fixpoint.
+    pub capped: bool,
+    /// Why materialization was capped (e.g. budget kind), if it was.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capped_reason: Option<String>,
+    /// Number of facts derived.
+    pub derived_facts: u64,
+    /// Fixpoint iterations performed.
+    pub iterations: u64,
+    /// Wall-clock materialization time in milliseconds. For a cached
+    /// materialization this reports the original computation, not this
+    /// request's (near-zero) cache hit.
+    pub duration_ms: u64,
 }
 
 fn format_time_ms(duration: Duration) -> String {
     let ms = duration.as_secs_f64() * 1000.0;
     format!("{ms:.2}ms")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::schedule::*;
+    use super::*;
+
+    fn fuel_tracker(max_fuel: Option<u64>) -> Tracker {
+        Tracker::new(TrackingOptions {
+            track_fuel: true,
+            max_fuel,
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn query_floor_reports_one_fuel() {
+        let t = fuel_tracker(None);
+        t.consume_fuel(QUERY_FLOOR_MICRO_FUEL).unwrap();
+        assert_eq!(t.tally().unwrap().fuel, Some(1.0));
+    }
+
+    #[test]
+    fn index_dict_history_touches_are_one_hundredth_fuel() {
+        for touch in [
+            INDEX_TOUCH_MICRO_FUEL,
+            DICT_TOUCH_MICRO_FUEL,
+            HISTORY_LEAF_TOUCH_MICRO_FUEL,
+        ] {
+            let t = fuel_tracker(None);
+            t.consume_fuel(touch).unwrap();
+            assert_eq!(t.tally().unwrap().fuel, Some(0.01), "touch={touch}");
+        }
+    }
+
+    #[test]
+    fn floor_plus_one_touch_reports_one_point_zero_one() {
+        let t = fuel_tracker(None);
+        t.consume_fuel(QUERY_FLOOR_MICRO_FUEL).unwrap();
+        t.consume_fuel(INDEX_TOUCH_MICRO_FUEL).unwrap();
+        assert_eq!(t.tally().unwrap().fuel, Some(1.01));
+    }
+
+    #[test]
+    fn floor_exceeds_max_fuel_below_one() {
+        // max-fuel: 0.5 leaves no room for the 1.000 floor.
+        let t = fuel_tracker(Some(fuel_to_micro(0.5)));
+        let err = t.consume_fuel(QUERY_FLOOR_MICRO_FUEL).unwrap_err();
+        assert_eq!(err.limit_fuel(), 0.5);
+        assert_eq!(err.used_fuel(), 1.0);
+    }
+
+    #[test]
+    fn max_fuel_one_admits_floor_but_not_a_touch() {
+        // max-fuel: 1 permits exactly the floor; the next persisted touch fails.
+        let t = fuel_tracker(Some(fuel_to_micro(1.0)));
+        t.consume_fuel(QUERY_FLOOR_MICRO_FUEL).unwrap();
+        assert!(t.consume_fuel(INDEX_TOUCH_MICRO_FUEL).is_err());
+    }
 }

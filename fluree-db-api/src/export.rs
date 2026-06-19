@@ -5,13 +5,14 @@
 
 use fluree_db_binary_index::read::types::sort_overlay_ops;
 use fluree_db_binary_index::{
-    BinaryCursor, BinaryFilter, BinaryIndexStore, ColumnBatch, ColumnProjection, ColumnSet,
-    RunSortOrder,
+    BinaryCursor, BinaryFilter, BinaryIndexStore, ColumnBatch, ColumnProjection, RunSortOrder,
 };
 use fluree_db_core::dict_novelty::DictNovelty;
 use fluree_db_core::value::FlakeValue;
-use fluree_db_core::{DecodeKind, GraphId, OType, OverlayProvider, Sid};
-use fluree_db_query::binary_scan::{translate_overlay_flakes, EphemeralPredicateMap};
+use fluree_db_core::{DecodeKind, Flake, GraphId, OType, OverlayProvider, Sid};
+use fluree_db_query::binary_scan::{
+    translate_overlay_flakes_with_untranslated, EphemeralPredicateMap,
+};
 use fluree_vocab::xsd;
 use std::collections::{BTreeMap, HashMap};
 use std::io::{self, Write};
@@ -68,15 +69,21 @@ pub fn is_system_graph(g_id: GraphId) -> bool {
 
 /// Configure a `BinaryCursor` with time-travel bounds and novelty overlay.
 ///
-/// Returns the ephemeral predicate map for novelty-only predicates.
+/// Returns the ephemeral predicate map for novelty-only predicates and any
+/// overlay flakes that could not be encoded into V3 overlay ops (e.g.
+/// language-tagged literals whose BCP-47 tag is not yet in the persisted
+/// language dictionary, or vector/bigint/decimal values). These "untranslated"
+/// flakes carry their fully-decoded `(s, p, o, dt, m)` and are emitted directly
+/// by the per-format writers so committed-but-not-yet-indexed novelty is never
+/// silently dropped from the export.
 fn apply_time_travel(
     cursor: &mut BinaryCursor,
     config: &ExportConfig,
     store: &Arc<BinaryIndexStore>,
-) -> EphemeralPredicateMap {
+) -> (EphemeralPredicateMap, Vec<Flake>) {
     cursor.set_to_t(config.to_t);
     if let Some(overlay) = config.overlay {
-        let (mut ops, ephemeral_preds) = translate_overlay_flakes(
+        let (mut ops, untranslated, ephemeral_preds) = translate_overlay_flakes_with_untranslated(
             overlay,
             store,
             config.dict_novelty,
@@ -86,13 +93,31 @@ fn apply_time_travel(
         );
         if !ops.is_empty() {
             sort_overlay_ops(&mut ops, RunSortOrder::Spot);
-            cursor.set_overlay_ops(ops);
-            cursor.set_epoch(overlay.epoch());
+            cursor.set_overlay_ops(ops.into());
         }
-        ephemeral_preds
+        (ephemeral_preds, surviving_untranslated(untranslated))
     } else {
-        HashMap::new()
+        (HashMap::new(), Vec::new())
     }
+}
+
+/// Resolve assert/retract set-semantics among the untranslated overlay flakes.
+///
+/// Untranslated flakes bypass the cursor's overlay merge, so we apply the same
+/// rule here: for each fact identity `(s, p, o, dt, m)` keep the highest-`t`
+/// flake and emit it only if it is an assertion. `Flake`'s `Eq`/`Hash` key on
+/// fact identity (ignoring `t`/`op`), so the map collapses each identity.
+fn surviving_untranslated(flakes: Vec<Flake>) -> Vec<Flake> {
+    let mut latest: HashMap<Flake, Flake> = HashMap::with_capacity(flakes.len());
+    for f in flakes {
+        match latest.get(&f) {
+            Some(existing) if existing.t >= f.t => {}
+            _ => {
+                latest.insert(f.clone(), f);
+            }
+        }
+    }
+    latest.into_values().filter(|f| f.op).collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -105,7 +130,7 @@ fn apply_time_travel(
 struct ExportResolver<'a> {
     store: &'a Arc<BinaryIndexStore>,
     dict_novelty: Option<&'a Arc<DictNovelty>>,
-    /// Reverse map: ephemeral p_id → Sid (inverted from translate_overlay_flakes).
+    /// Reverse map: ephemeral p_id → Sid (inverted from translate_overlay_flakes_with_untranslated).
     ephemeral_preds_reverse: HashMap<u32, Sid>,
 }
 
@@ -345,10 +370,11 @@ pub fn export_graph_turtle<W: Write>(
     let branch = Arc::clone(branch_ref);
 
     let filter = BinaryFilter::default();
-    let projection = ColumnProjection {
-        output: ColumnSet::CORE,
-        internal: ColumnSet::EMPTY,
-    };
+    // Full identity projection (incl. OI): when a novelty overlay is attached,
+    // the cursor merges base rows against overlay ops on the full V3 identity
+    // (s_id, p_id, o_type, o_key, o_i). A narrower projection makes the missing
+    // columns read as defaults and corrupts the merge.
+    let projection = ColumnProjection::all();
 
     let mut cursor = BinaryCursor::scan_all(
         Arc::clone(store),
@@ -357,7 +383,7 @@ pub fn export_graph_turtle<W: Write>(
         filter,
         projection,
     );
-    let ephemeral_preds = apply_time_travel(&mut cursor, config, store);
+    let (ephemeral_preds, untranslated) = apply_time_travel(&mut cursor, config, store);
     let resolver = ExportResolver::new(store, config.dict_novelty, &ephemeral_preds);
 
     let mut stats = ExportStats::default();
@@ -378,6 +404,11 @@ pub fn export_graph_turtle<W: Write>(
     // Close last subject if any
     if prev_subject.is_some() {
         writeln!(writer, " .")?;
+    }
+
+    // Emit untranslated overlay flakes as standalone Turtle statements.
+    for flake in &untranslated {
+        write_raw_flake_turtle(&resolver, flake, prefixes, &mut stats, writer)?;
     }
 
     Ok(stats)
@@ -522,10 +553,11 @@ pub fn export_graph_jsonld<W: Write>(
     let branch = Arc::clone(branch_ref);
 
     let filter = BinaryFilter::default();
-    let projection = ColumnProjection {
-        output: ColumnSet::CORE,
-        internal: ColumnSet::EMPTY,
-    };
+    // Full identity projection (incl. OI): when a novelty overlay is attached,
+    // the cursor merges base rows against overlay ops on the full V3 identity
+    // (s_id, p_id, o_type, o_key, o_i). A narrower projection makes the missing
+    // columns read as defaults and corrupts the merge.
+    let projection = ColumnProjection::all();
 
     let mut cursor = BinaryCursor::scan_all(
         Arc::clone(store),
@@ -534,7 +566,7 @@ pub fn export_graph_jsonld<W: Write>(
         filter,
         projection,
     );
-    let ephemeral_preds = apply_time_travel(&mut cursor, config, store);
+    let (ephemeral_preds, untranslated) = apply_time_travel(&mut cursor, config, store);
     let resolver = ExportResolver::new(store, config.dict_novelty, &ephemeral_preds);
 
     let mut stats = ExportStats::default();
@@ -596,9 +628,114 @@ pub fn export_graph_jsonld<W: Write>(
     // Flush last subject
     if let Some(ref subj_iri) = current_subject {
         write_jsonld_node(writer, subj_iri, &current_props, prefixes, first_node)?;
+        first_node = false;
+    }
+
+    // Emit untranslated overlay flakes as additional JSON-LD nodes, grouped by
+    // subject (a repeated @id node object is valid JSON-LD; it merges on parse).
+    // (subject IRI, [(predicate, [values])]) — mirrors the cursor accumulator.
+    type JsonLdNode = (String, Vec<(String, Vec<serde_json::Value>)>);
+    let mut raw_nodes: Vec<JsonLdNode> = Vec::new();
+    for flake in &untranslated {
+        let (Some(s_iri), Some(p_iri)) = (store.sid_to_iri(&flake.s), store.sid_to_iri(&flake.p))
+        else {
+            stats.rows_skipped += 1;
+            continue;
+        };
+        let Some(jval) = flake_to_jsonld_raw(flake, store, prefixes) else {
+            stats.rows_skipped += 1;
+            continue;
+        };
+        let compact_p = compact_iri(&p_iri, prefixes);
+        let node = match raw_nodes.iter_mut().find(|(s, _)| *s == s_iri) {
+            Some(n) => n,
+            None => {
+                raw_nodes.push((s_iri, Vec::new()));
+                raw_nodes.last_mut().unwrap()
+            }
+        };
+        if let Some(entry) = node.1.iter_mut().find(|(k, _)| *k == compact_p) {
+            entry.1.push(jval);
+        } else {
+            node.1.push((compact_p, vec![jval]));
+        }
+        stats.triples_written += 1;
+    }
+    for (subj_iri, props) in &raw_nodes {
+        write_jsonld_node(writer, subj_iri, props, prefixes, first_node)?;
+        first_node = false;
     }
 
     Ok(stats)
+}
+
+/// JSON-LD value for an untranslated overlay flake, deriving the language tag
+/// from `flake.m` and the datatype from `flake.dt`. Returns `None` for value
+/// variants that should never reach the untranslated set.
+fn flake_to_jsonld_raw(
+    flake: &Flake,
+    store: &BinaryIndexStore,
+    prefixes: &PrefixMap,
+) -> Option<serde_json::Value> {
+    let lang = flake.m.as_ref().and_then(|m| m.lang.as_deref());
+    let dt_iri = || store.sid_to_iri(&flake.dt);
+    let typed = |s: String, dt: String| serde_json::json!({ "@value": s, "@type": compact_iri(&dt, prefixes) });
+    match &flake.o {
+        FlakeValue::Ref(sid) => {
+            let iri = store
+                .sid_to_iri(sid)
+                .unwrap_or_else(|| format!("_:unknown_{sid}"));
+            Some(serde_json::json!({ "@id": compact_iri(&iri, prefixes) }))
+        }
+        FlakeValue::String(s) => {
+            if let Some(lang) = lang {
+                return Some(serde_json::json!({ "@value": s, "@language": lang }));
+            }
+            match dt_iri().as_deref() {
+                None | Some(xsd::STRING) => Some(serde_json::Value::String(s.clone())),
+                Some(dt) => {
+                    Some(serde_json::json!({ "@value": s, "@type": compact_iri(dt, prefixes) }))
+                }
+            }
+        }
+        FlakeValue::Boolean(b) => Some(serde_json::Value::Bool(*b)),
+        FlakeValue::Long(n) => Some(serde_json::json!({
+            "@value": n,
+            "@type": compact_iri(&dt_iri().unwrap_or_else(|| xsd::LONG.to_string()), prefixes)
+        })),
+        FlakeValue::BigInt(n) => Some(typed(
+            n.to_string(),
+            dt_iri().unwrap_or_else(|| xsd::INTEGER.to_string()),
+        )),
+        FlakeValue::Decimal(d) => Some(typed(
+            d.to_string(),
+            dt_iri().unwrap_or_else(|| xsd::DECIMAL.to_string()),
+        )),
+        FlakeValue::Double(f) => {
+            let dt = compact_iri(
+                &dt_iri().unwrap_or_else(|| xsd::DOUBLE.to_string()),
+                prefixes,
+            );
+            if f.is_finite() {
+                Some(serde_json::json!({ "@value": f, "@type": dt }))
+            } else {
+                let lexical = if f.is_nan() {
+                    "NaN"
+                } else if f.is_sign_positive() {
+                    "INF"
+                } else {
+                    "-INF"
+                };
+                Some(serde_json::json!({ "@value": lexical, "@type": dt }))
+            }
+        }
+        FlakeValue::Vector(v) => Some(serde_json::json!({
+            "@value": v,
+            "@type": compact_iri(&dt_iri().unwrap_or_else(|| "https://ns.flur.ee/db#vector".to_string()), prefixes)
+        })),
+        // Temporal / other types always encode into V3 ops.
+        _ => None,
+    }
 }
 
 /// Write the JSON-LD document header: `{"@context": {...}, "@graph": [`
@@ -926,10 +1063,11 @@ pub fn export_graph_ntriples<W: Write>(
     let branch = Arc::clone(branch_ref);
 
     let filter = BinaryFilter::default();
-    let projection = ColumnProjection {
-        output: ColumnSet::CORE,
-        internal: ColumnSet::EMPTY,
-    };
+    // Full identity projection (incl. OI): when a novelty overlay is attached,
+    // the cursor merges base rows against overlay ops on the full V3 identity
+    // (s_id, p_id, o_type, o_key, o_i). A narrower projection makes the missing
+    // columns read as defaults and corrupts the merge.
+    let projection = ColumnProjection::all();
 
     let mut cursor = BinaryCursor::scan_all(
         Arc::clone(store),
@@ -938,7 +1076,7 @@ pub fn export_graph_ntriples<W: Write>(
         filter,
         projection,
     );
-    let ephemeral_preds = apply_time_travel(&mut cursor, config, store);
+    let (ephemeral_preds, untranslated) = apply_time_travel(&mut cursor, config, store);
     let resolver = ExportResolver::new(store, config.dict_novelty, &ephemeral_preds);
 
     let mut stats = ExportStats::default();
@@ -959,6 +1097,12 @@ pub fn export_graph_ntriples<W: Write>(
             &mut stats,
             writer,
         )?;
+    }
+
+    // Emit overlay flakes that could not be encoded into V3 ops (e.g.
+    // novelty-only language tags) directly from their decoded form.
+    for flake in &untranslated {
+        write_raw_flake_ntriples(&resolver, flake, graph_term.as_deref(), &mut stats, writer)?;
     }
 
     Ok(stats)
@@ -1229,6 +1373,191 @@ fn write_object<W: Write>(
 
         FlakeValue::Null => Ok(()), // should have been filtered above
     }
+}
+
+// ---------------------------------------------------------------------------
+// Raw (untranslated) overlay flake emission
+// ---------------------------------------------------------------------------
+//
+// Overlay flakes that could not be encoded into V3 ops (novelty-only language
+// tags, vector/bigint/decimal values, novelty-only custom datatypes) carry
+// their fully-decoded `(s, p, o, dt, m)`. These writers emit them directly,
+// deriving the language tag from `flake.m` and the datatype IRI from
+// `flake.dt`, instead of from an `o_type` the cursor never produced.
+
+/// Resolve a raw flake's object term lexical form + datatype/lang, writing it
+/// in N-Triples literal syntax. `prefixes` enables Turtle prefixed-name
+/// compression for IRI refs (N-Triples passes `None`). Returns `false` if the
+/// value variant is not representable (the caller counts it as skipped).
+fn write_raw_object<W: Write>(
+    w: &mut W,
+    store: &BinaryIndexStore,
+    flake: &Flake,
+    prefixes: Option<&PrefixMap>,
+) -> io::Result<bool> {
+    let lang = flake.m.as_ref().and_then(|m| m.lang.as_deref());
+    let dt_iri = || store.sid_to_iri(&flake.dt);
+    match &flake.o {
+        FlakeValue::Ref(sid) => {
+            let iri = store
+                .sid_to_iri(sid)
+                .unwrap_or_else(|| format!("_:unknown_{sid}"));
+            match prefixes {
+                Some(p) => write_turtle_iri_or_bnode(w, &iri, p)?,
+                None => write_iri_or_bnode(w, &iri)?,
+            }
+            Ok(true)
+        }
+        FlakeValue::String(s) => {
+            if let Some(lang) = lang {
+                w.write_all(b"\"")?;
+                write_escaped_ntriples_string(w, s)?;
+                w.write_all(b"\"@")?;
+                w.write_all(lang.as_bytes())?;
+            } else {
+                w.write_all(b"\"")?;
+                write_escaped_ntriples_string(w, s)?;
+                w.write_all(b"\"")?;
+                if let Some(dt) = dt_iri() {
+                    if dt != xsd::STRING {
+                        w.write_all(b"^^<")?;
+                        write_escaped_iri(w, &dt)?;
+                        w.write_all(b">")?;
+                    }
+                }
+            }
+            Ok(true)
+        }
+        FlakeValue::Json(s) => {
+            let dt = dt_iri()
+                .unwrap_or_else(|| "http://www.w3.org/1999/02/22-rdf-syntax-ns#JSON".to_string());
+            write_typed_literal(w, s, &dt)?;
+            Ok(true)
+        }
+        FlakeValue::Boolean(b) => {
+            write_typed_literal(w, if *b { "true" } else { "false" }, xsd::BOOLEAN)?;
+            Ok(true)
+        }
+        FlakeValue::Long(n) => {
+            write_typed_literal(
+                w,
+                &n.to_string(),
+                &dt_iri().unwrap_or_else(|| xsd::LONG.to_string()),
+            )?;
+            Ok(true)
+        }
+        FlakeValue::BigInt(n) => {
+            write_typed_literal(
+                w,
+                &n.to_string(),
+                &dt_iri().unwrap_or_else(|| xsd::INTEGER.to_string()),
+            )?;
+            Ok(true)
+        }
+        FlakeValue::Decimal(d) => {
+            write_typed_literal(
+                w,
+                &d.to_string(),
+                &dt_iri().unwrap_or_else(|| "http://www.w3.org/2001/XMLSchema#decimal".to_string()),
+            )?;
+            Ok(true)
+        }
+        FlakeValue::Double(f) => {
+            let lexical = if f.is_infinite() {
+                if f.is_sign_positive() {
+                    "INF".to_string()
+                } else {
+                    "-INF".to_string()
+                }
+            } else if f.is_nan() {
+                "NaN".to_string()
+            } else {
+                format!("{f:E}")
+            };
+            write_typed_literal(w, &lexical, xsd::DOUBLE)?;
+            Ok(true)
+        }
+        FlakeValue::Vector(v) => {
+            let dt = dt_iri().unwrap_or_else(|| "https://ns.flur.ee/db#vector".to_string());
+            let json = serde_json::to_string(v).unwrap_or_else(|_| "[]".to_string());
+            write_typed_literal(w, &json, &dt)?;
+            Ok(true)
+        }
+        // Temporal and other types always encode into V3 ops, so they should
+        // never reach the untranslated set. Decline rather than emit a
+        // potentially non-canonical lexical form.
+        _ => Ok(false),
+    }
+}
+
+/// Emit a single untranslated overlay flake as an N-Triples / N-Quads statement.
+fn write_raw_flake_ntriples<W: Write>(
+    resolver: &ExportResolver,
+    flake: &Flake,
+    graph_term: Option<&str>,
+    stats: &mut ExportStats,
+    writer: &mut W,
+) -> io::Result<()> {
+    let (Some(s_iri), Some(p_iri)) = (
+        resolver.store.sid_to_iri(&flake.s),
+        resolver.store.sid_to_iri(&flake.p),
+    ) else {
+        stats.rows_skipped += 1;
+        return Ok(());
+    };
+
+    let mut body: Vec<u8> = Vec::new();
+    write_iri_or_bnode(&mut body, &s_iri)?;
+    body.write_all(b" <")?;
+    write_escaped_iri(&mut body, &p_iri)?;
+    body.write_all(b"> ")?;
+    if !write_raw_object(&mut body, resolver.store, flake, None)? {
+        stats.rows_skipped += 1;
+        return Ok(());
+    }
+    writer.write_all(&body)?;
+    if let Some(g) = graph_term {
+        writer.write_all(b" ")?;
+        writer.write_all(g.as_bytes())?;
+    }
+    writer.write_all(b" .\n")?;
+    stats.triples_written += 1;
+    Ok(())
+}
+
+/// Emit a single untranslated overlay flake as a standalone Turtle statement.
+fn write_raw_flake_turtle<W: Write>(
+    resolver: &ExportResolver,
+    flake: &Flake,
+    prefixes: &PrefixMap,
+    stats: &mut ExportStats,
+    writer: &mut W,
+) -> io::Result<()> {
+    let (Some(s_iri), Some(p_iri)) = (
+        resolver.store.sid_to_iri(&flake.s),
+        resolver.store.sid_to_iri(&flake.p),
+    ) else {
+        stats.rows_skipped += 1;
+        return Ok(());
+    };
+
+    let mut body: Vec<u8> = Vec::new();
+    write_turtle_iri_or_bnode(&mut body, &s_iri, prefixes)?;
+    body.write_all(b" ")?;
+    if p_iri == "http://www.w3.org/1999/02/22-rdf-syntax-ns#type" {
+        body.write_all(b"a")?;
+    } else {
+        write_turtle_iri(&mut body, &p_iri, prefixes)?;
+    }
+    body.write_all(b" ")?;
+    if !write_raw_object(&mut body, resolver.store, flake, Some(prefixes))? {
+        stats.rows_skipped += 1;
+        return Ok(());
+    }
+    writer.write_all(&body)?;
+    writer.write_all(b" .\n")?;
+    stats.triples_written += 1;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

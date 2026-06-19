@@ -109,6 +109,31 @@ impl AggregateFn {
     }
 }
 
+impl AggregateFn {
+    /// Rename the input variable from `old` to `new` (no-op for `CountAll`).
+    pub fn substitute_var(&mut self, old: VarId, new: VarId) {
+        let rename = |v: &mut VarId| {
+            if *v == old {
+                *v = new;
+            }
+        };
+        match self {
+            Self::CountAll => {}
+            Self::Count(v)
+            | Self::CountDistinct(v)
+            | Self::Sum(v, _)
+            | Self::Avg(v, _)
+            | Self::Min(v)
+            | Self::Max(v)
+            | Self::Median(v, _)
+            | Self::Variance(v, _)
+            | Self::Stddev(v, _)
+            | Self::Sample(v) => rename(v),
+            Self::GroupConcat { input, .. } => rename(input),
+        }
+    }
+}
+
 /// Specification for a single aggregate operation: the function applied to
 /// each group plus the variable the result is bound to.
 #[derive(Debug, Clone)]
@@ -254,5 +279,45 @@ impl Grouping {
         self.aggregation()
             .into_iter()
             .flat_map(|agg| agg.binds.iter())
+    }
+
+    /// Rename every occurrence of variable `old` to `new` across GROUP BY keys,
+    /// aggregate input/output vars, post-aggregation binds, and HAVING. Used by
+    /// the equijoin-filter fold to unify two provably-equal variables.
+    pub fn substitute_var(&mut self, old: VarId, new: VarId) {
+        let rename = |v: &mut VarId| {
+            if *v == old {
+                *v = new;
+            }
+        };
+        let (aggregation, having) = match self {
+            Self::Implicit {
+                aggregation,
+                having,
+            } => (Some(aggregation), having),
+            Self::Explicit {
+                group_by,
+                aggregation,
+                having,
+            } => {
+                for v in group_by.iter_mut() {
+                    rename(v);
+                }
+                (aggregation.as_mut(), having)
+            }
+        };
+        if let Some(agg) = aggregation {
+            for spec in agg.aggregates.iter_mut() {
+                spec.function.substitute_var(old, new);
+                rename(&mut spec.output_var);
+            }
+            for (var, expr) in &mut agg.binds {
+                rename(var);
+                expr.substitute_var(old, new);
+            }
+        }
+        if let Some(expr) = having {
+            expr.substitute_var(old, new);
+        }
     }
 }

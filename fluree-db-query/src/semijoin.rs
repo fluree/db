@@ -17,8 +17,9 @@ use crate::binding::{Batch, Binding};
 use crate::context::ExecutionContext;
 use crate::error::{QueryError, Result};
 use crate::execute::build_where_operators_seeded;
-use crate::group_aggregate::{binding_to_group_key_owned, CompositeGroupKey};
+use crate::group_aggregate::{binding_to_group_key_normalized, CompositeGroupKey};
 use crate::ir::Pattern;
+use crate::object_binding::{equality_norm, EqualityNorm};
 use crate::operator::{BoxedOperator, Operator, OperatorState};
 use crate::seed::{EmptyOperator, SeedOperator};
 use crate::temporal_mode::PlanningContext;
@@ -49,6 +50,10 @@ pub struct SemijoinOperator {
     stats: Option<Arc<StatsView>>,
     /// Planning context captured at planner-time for the inner subplan.
     planning: PlanningContext,
+    /// Store for normalizing decoded bindings to encoded form on both sides,
+    /// so mixed-representation rows key identically. `None` outside
+    /// single-ledger binary execution.
+    norm: Option<EqualityNorm>,
 }
 
 impl SemijoinOperator {
@@ -69,6 +74,7 @@ impl SemijoinOperator {
             schema,
             state: OperatorState::Created,
             key_set: FxHashSet::default(),
+            norm: None,
             key_col_indices: Vec::new(),
             stats,
             planning,
@@ -80,7 +86,10 @@ impl SemijoinOperator {
         let keys = self
             .key_col_indices
             .iter()
-            .map(|&ci| binding_to_group_key_owned(batch.get_by_col(row_idx, ci)))
+            .map(|&ci| {
+                let (store, gv) = EqualityNorm::parts(&self.norm);
+                binding_to_group_key_normalized(batch.get_by_col(row_idx, ci), store, gv)
+            })
             .collect();
         CompositeGroupKey(keys)
     }
@@ -127,6 +136,9 @@ impl SemijoinOperator {
 
 #[async_trait]
 impl Operator for SemijoinOperator {
+    fn plan_children(&self) -> Vec<crate::plan_node::PlanChild<'_>> {
+        vec![crate::plan_node::PlanChild::child(self.child.as_ref())]
+    }
     fn schema(&self) -> &[VarId] {
         &self.schema
     }
@@ -136,6 +148,9 @@ impl Operator for SemijoinOperator {
             return Err(QueryError::Internal(
                 "SemijoinOperator::open() called in invalid state".into(),
             ));
+        }
+        if self.norm.is_none() {
+            self.norm = equality_norm(ctx);
         }
 
         // Build phase: execute inner patterns once, collect distinct key tuples.
@@ -165,13 +180,18 @@ impl Operator for SemijoinOperator {
         inner_op.open(ctx).await?;
 
         while let Some(batch) = inner_op.next_batch(ctx).await? {
+            ctx.check_cancelled()?;
             for row_idx in 0..batch.len() {
                 let key = inner_key_col_indices
                     .iter()
-                    .map(|&ci| binding_to_group_key_owned(batch.get_by_col(row_idx, ci)))
+                    .map(|&ci| {
+                        let (store, gv) = EqualityNorm::parts(&self.norm);
+                        binding_to_group_key_normalized(batch.get_by_col(row_idx, ci), store, gv)
+                    })
                     .collect();
                 self.key_set.insert(CompositeGroupKey(key));
             }
+            ctx.check_cancelled()?;
         }
         inner_op.close();
 

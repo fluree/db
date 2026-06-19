@@ -20,6 +20,13 @@ pub enum ReasonerError {
     /// Invalid ontology configuration
     #[error("Invalid ontology: {0}")]
     InvalidOntology(String),
+
+    /// Unknown rule identifier in `ReasoningOptions::enabled_rules`
+    #[error(
+        "unknown reasoning rule {0:?}; valid rule identifiers: {}",
+        crate::KNOWN_RULE_NAMES.join(", ")
+    )]
+    UnknownRule(String),
 }
 
 /// Result type for reasoning operations

@@ -48,6 +48,9 @@ pub struct FlureeHeaders {
     /// Maximum fuel limit (decimal). Internally converted to micro-fuel.
     pub max_fuel: Option<f64>,
 
+    /// Minimum ledger `t` the request must observe before executing.
+    pub min_t: Option<i64>,
+
     /// Content-Type header value
     pub content_type: Option<String>,
 
@@ -69,6 +72,7 @@ impl Default for FlureeHeaders {
             track_fuel: false,
             track_time: false,
             max_fuel: None,
+            min_t: None,
             content_type: None,
             accept: None,
         }
@@ -87,6 +91,7 @@ impl FlureeHeaders {
     pub const TRACK_FUEL: &'static str = "fluree-track-fuel";
     pub const TRACK_TIME: &'static str = "fluree-track-time";
     pub const MAX_FUEL: &'static str = "fluree-max-fuel";
+    pub const MIN_T: &'static str = "fluree-min-t";
 
     /// Parse headers from a HeaderMap
     pub fn from_headers(headers: &HeaderMap) -> Result<Self> {
@@ -147,6 +152,19 @@ impl FlureeHeaders {
             fluree_headers.max_fuel = Some(val.parse().map_err(|_| {
                 ServerError::invalid_header(format!("{} must be a number", Self::MAX_FUEL))
             })?);
+        }
+
+        if let Some(val) = get_header_str(headers, Self::MIN_T) {
+            let min_t: i64 = val.parse().map_err(|_| {
+                ServerError::invalid_header(format!("{} must be an integer", Self::MIN_T))
+            })?;
+            if min_t < 0 {
+                return Err(ServerError::invalid_header(format!(
+                    "{} must be non-negative",
+                    Self::MIN_T
+                )));
+            }
+            fluree_headers.min_t = Some(min_t);
         }
 
         // Content-Type
@@ -268,6 +286,23 @@ impl FlureeHeaders {
         self.accept
             .as_ref()
             .map(|a| a.to_ascii_lowercase().contains("application/rdf+xml"))
+            .unwrap_or(false)
+    }
+
+    /// Check if the client explicitly requests JSON-LD output via Accept header.
+    ///
+    /// Matches `application/ld+json` (case-insensitive) only. Bare
+    /// `application/json` is intentionally NOT matched: it is the most common
+    /// default Accept value, and treating it as a JSON-LD request would silently
+    /// flip every existing SELECT client from SPARQL-results-JSON to JSON-LD.
+    /// SPARQL CONSTRUCT/DESCRIBE already render as JSON-LD regardless of Accept
+    /// (the formatter coerces graph results — see issue #1274); this helper lets
+    /// a SELECT query *opt in* to JSON-LD via the unambiguous media type.
+    /// Does NOT match `*/*` — JSON-LD must be explicitly requested.
+    pub fn wants_jsonld(&self) -> bool {
+        self.accept
+            .as_ref()
+            .map(|a| a.to_ascii_lowercase().contains("application/ld+json"))
             .unwrap_or(false)
     }
 
@@ -399,5 +434,31 @@ where
         _state: &S,
     ) -> std::result::Result<Self, Self::Rejection> {
         FlureeHeaders::from_headers(&parts.headers)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::FlureeHeaders;
+    use axum::http::HeaderMap;
+
+    #[test]
+    fn parses_min_t_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert(FlureeHeaders::MIN_T, "42".parse().unwrap());
+
+        let parsed = FlureeHeaders::from_headers(&headers).unwrap();
+
+        assert_eq!(parsed.min_t, Some(42));
+    }
+
+    #[test]
+    fn rejects_negative_min_t_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert(FlureeHeaders::MIN_T, "-1".parse().unwrap());
+
+        let err = FlureeHeaders::from_headers(&headers).unwrap_err();
+
+        assert!(err.to_string().contains("fluree-min-t"));
     }
 }

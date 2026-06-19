@@ -124,7 +124,7 @@ async fn transact_policy_denied_includes_policy_and_fuel_tracking() {
         0
     );
 
-    // Fuel should be tracked when opts.meta=true. Cost = 100 fuel transaction
-    // baseline + 1 micro-fuel per non-schema flake (3 here) = 100.003 fuel.
-    assert_eq!(err.fuel, Some(100.003));
+    // Fuel should be tracked when opts.meta=true. Cost = 10 fuel transaction
+    // baseline + 1 micro-fuel per non-schema flake (3 here) = 10.003 fuel.
+    assert_eq!(err.fuel, Some(10.003));
 }

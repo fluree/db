@@ -369,7 +369,7 @@ impl crate::Fluree {
             // Load the source's state under the branch's id so the
             // post-apply cache reflects the fast-forwarded branch.
             let mut final_state = self.ledger(&source_id).await?;
-            final_state.snapshot.ledger_id = branch_id.clone();
+            std::sync::Arc::make_mut(&mut final_state.snapshot).ledger_id = branch_id.clone();
 
             let write_guard = self.lock_ledger(&branch_id).await?;
 
@@ -448,7 +448,7 @@ impl crate::Fluree {
         // Start replay from the source's queryable state, relabeled
         // to the branch.
         let mut current_state = self.ledger(&source_id).await?;
-        current_state.snapshot.ledger_id = branch_id.clone();
+        std::sync::Arc::make_mut(&mut current_state.snapshot).ledger_id = branch_id.clone();
 
         let mut conflicts: Vec<RebaseConflict> = Vec::new();
         let mut skipped = 0;

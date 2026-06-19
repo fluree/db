@@ -10,11 +10,14 @@
 //! available on read-only storage.
 
 use crate::{error::ApiError, tx::IndexingMode, Result};
+use fluree_db_core::tracking::{Tracker, TrackingOptions};
 use fluree_db_core::{
     address_path::{ledger_id_to_path_prefix, shared_prefix_for_path},
     format_ledger_id, DEFAULT_BRANCH,
 };
-use fluree_db_indexer::{clean_garbage, rebuild_index_from_commits, CleanGarbageConfig};
+use fluree_db_indexer::{
+    clean_garbage, rebuild_index_from_commits_with_tracker, CleanGarbageConfig,
+};
 use fluree_db_nameservice::NsRecord;
 use std::time::Duration;
 use tracing::{debug, info, warn};
@@ -202,6 +205,12 @@ pub struct TriggerIndexResult {
     pub index_t: i64,
     /// Content identifier of the index root (when available)
     pub root_id: Option<fluree_db_core::ContentId>,
+    /// Total fuel charged for the build that satisfied this trigger. The
+    /// background orchestrator always measures with a per-build tracker, so
+    /// this is normally `Some(N)` (or `Some(0.0)` when the requested t was
+    /// already indexed and no work was needed). Coalesced trigger callers
+    /// all receive the fuel of the single build that satisfied them.
+    pub fuel: Option<f64>,
 }
 
 /// Result of reindex operation
@@ -215,6 +224,9 @@ pub struct ReindexResult {
     pub root_id: fluree_db_core::ContentId,
     /// Build statistics
     pub stats: fluree_db_indexer::IndexStats,
+    /// Total fuel charged for this reindex (decimal). `None` only if fuel
+    /// tracking was disabled at the caller; `/reindex` always populates it.
+    pub fuel: Option<f64>,
 }
 
 /// Result of index_status query
@@ -1415,6 +1427,7 @@ impl crate::Fluree {
                 ledger_id,
                 index_t: 0,
                 root_id: None,
+                fuel: Some(0.0),
             });
         }
 
@@ -1469,10 +1482,15 @@ impl crate::Fluree {
         macro_rules! finish_wait {
             ($outcome:expr) => {
                 match $outcome {
-                    IndexOutcome::Completed { index_t, root_id } => {
+                    IndexOutcome::Completed {
+                        index_t,
+                        root_id,
+                        fuel,
+                    } => {
                         info!(
                             ledger_id = %ledger_id,
                             index_t = index_t,
+                            fuel = ?fuel,
                             elapsed_ms = wait_started.elapsed().as_millis() as u64,
                             "Indexing completed"
                         );
@@ -1480,6 +1498,7 @@ impl crate::Fluree {
                             ledger_id: ledger_id.clone(),
                             index_t,
                             root_id,
+                            fuel,
                         });
                     }
                     IndexOutcome::Failed(msg) => {
@@ -1675,8 +1694,17 @@ impl crate::Fluree {
             }
         }
 
-        let index_result = rebuild_index_from_commits(
+        // Reindex is a user-triggered API call; create a fuel-enabled,
+        // no-limit tracker per request so the response can report total fuel.
+        // Indexing never enforces a fuel limit (measurement only) — a partial
+        // index is worse than a slow one.
+        let reindex_tracker = Tracker::new(TrackingOptions {
+            track_fuel: true,
+            ..Default::default()
+        });
+        let index_result = rebuild_index_from_commits_with_tracker(
             self.content_store(&ledger_id),
+            reindex_tracker,
             &ledger_id,
             &record,
             indexer_config,
@@ -1753,6 +1781,7 @@ impl crate::Fluree {
             index_t: index_result.index_t,
             root_id: index_result.root_id,
             stats: index_result.stats,
+            fuel: index_result.fuel,
         })
     }
 }

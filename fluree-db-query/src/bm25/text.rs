@@ -71,7 +71,7 @@ fn extract_text_recursive(value: &Value, result: &mut String) {
 /// Combines text extraction with the analyzer for indexing.
 pub fn extract_and_analyze(
     item: &Value,
-    analyzer: &super::analyzer::Analyzer,
+    analyzer: &fluree_db_binary_index::analyzer::Analyzer,
 ) -> std::collections::HashMap<String, u32> {
     let text = extract_text(item);
     analyzer.analyze_to_term_freqs(&text)

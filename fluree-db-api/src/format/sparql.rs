@@ -20,7 +20,8 @@
 use super::config::FormatterConfig;
 use super::datatype::is_inferable_datatype;
 use super::iri::IriCompactor;
-use super::{FormatError, Result};
+use super::json_write::{push_json_string, push_value};
+use super::{materialize, FormatError, Result};
 use crate::QueryResult;
 use fluree_db_core::FlakeValue;
 use fluree_db_query::binding::Binding;
@@ -33,44 +34,7 @@ pub fn format(
     compactor: &IriCompactor,
     _config: &FormatterConfig,
 ) -> Result<JsonValue> {
-    // Build head.vars from select list (without ? prefix).
-    // For wildcard, use the operator schema (all variables).
-    // Fall back to VarRegistry when batches are empty (W3C: exists-02 etc.).
-    let head_vars: Vec<fluree_db_query::VarId> = if result.output.is_wildcard() {
-        result
-            .batches
-            .first()
-            .map(|b| {
-                b.schema()
-                    .iter()
-                    .copied()
-                    // Skip internal variables (?__pp0, ?__s0, etc.) from wildcard output.
-                    .filter(|&vid| !result.vars.name(vid).starts_with("?__"))
-                    .collect()
-            })
-            .unwrap_or_else(|| {
-                // Empty result set: derive vars from the registry (all user-visible variables).
-                result
-                    .vars
-                    .iter()
-                    .filter(|(name, _)| !name.starts_with("?__"))
-                    .map(|(_, id)| id)
-                    .collect()
-            })
-    } else {
-        result.output.projected_vars_or_empty()
-    };
-
-    // Order head vars lexicographically by variable name (without '?').
-    // This also stabilizes output across planner reorderings.
-    let mut head_pairs: Vec<(String, fluree_db_query::VarId)> = head_vars
-        .iter()
-        .map(|&var_id| (strip_question_mark(result.vars.name(var_id)), var_id))
-        .collect();
-    head_pairs.sort_by(|(a, _), (b, _)| a.cmp(b));
-
-    let vars: Vec<String> = head_pairs.iter().map(|(name, _)| name.clone()).collect();
-    let head_vars: Vec<fluree_db_query::VarId> = head_pairs.into_iter().map(|(_, id)| id).collect();
+    let (vars, head_vars) = compute_head(result);
 
     let select_one = result.output.is_select_one();
     let mut bindings = Vec::new();
@@ -109,6 +73,289 @@ pub fn format(
     }))
 }
 
+/// Compute the `head.vars` names (without `?`) and the parallel `VarId` list,
+/// ordered lexicographically by name. Shared by the DOM and streaming paths so
+/// the head order can never drift between them.
+fn compute_head(result: &QueryResult) -> (Vec<String>, Vec<fluree_db_query::VarId>) {
+    // For wildcard, use the operator schema (all variables); fall back to the
+    // VarRegistry when batches are empty (W3C: exists-02 etc.).
+    let head_vars: Vec<fluree_db_query::VarId> = if result.output.is_wildcard() {
+        result
+            .batches
+            .first()
+            .map(|b| {
+                b.schema()
+                    .iter()
+                    .copied()
+                    // Skip internal variables (?__pp0, ?__s0, etc.) from wildcard output.
+                    .filter(|&vid| !result.vars.name(vid).starts_with("?__"))
+                    .collect()
+            })
+            .unwrap_or_else(|| {
+                result
+                    .vars
+                    .iter()
+                    .filter(|(name, _)| !name.starts_with("?__"))
+                    .map(|(_, id)| id)
+                    .collect()
+            })
+    } else {
+        result.output.projected_vars_or_empty()
+    };
+
+    // Order head vars lexicographically by name (stable across planner reorderings).
+    let mut head_pairs: Vec<(String, fluree_db_query::VarId)> = head_vars
+        .iter()
+        .map(|&var_id| (strip_question_mark(result.vars.name(var_id)), var_id))
+        .collect();
+    head_pairs.sort_by(|(a, _), (b, _)| a.cmp(b));
+
+    let vars: Vec<String> = head_pairs.iter().map(|(name, _)| name.clone()).collect();
+    let head_vars: Vec<fluree_db_query::VarId> = head_pairs.into_iter().map(|(_, id)| id).collect();
+    (vars, head_vars)
+}
+
+/// Stream SPARQL 1.1 JSON results directly into a `String`, byte-identical to
+/// `serde_json::to_string(&format(...))` for the non-`select_one` SELECT case.
+///
+/// The common (non-grouped) row streams cell-by-cell with no per-cell
+/// `serde_json::Value` allocation. Grouped rows (GROUP BY without aggregation)
+/// are rare and reuse the proven [`disaggregate_row`] cartesian expansion,
+/// serialized leaf-wise via [`push_value`]. `select_one`, ASK, CONSTRUCT, and
+/// `pretty` are handled by the caller on the DOM path and never reach here.
+pub fn format_string(
+    result: &QueryResult,
+    compactor: &IriCompactor,
+    _config: &FormatterConfig,
+) -> Result<String> {
+    debug_assert!(
+        !result.output.is_select_one(),
+        "format_string is only for the non-select_one path; select_one routes through the DOM"
+    );
+
+    let (vars, head_vars) = compute_head(result);
+
+    // Pre-size: rows × cols × an estimated per-cell width plus envelope slack.
+    let est = (result.row_count() + 1)
+        .saturating_mul(head_vars.len().max(1))
+        .saturating_mul(64)
+        .saturating_add(64);
+    let mut out = String::with_capacity(est);
+
+    out.push_str("{\"head\":{\"vars\":[");
+    for (i, name) in vars.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        push_json_string(&mut out, name);
+    }
+    out.push_str("]},\"results\":{\"bindings\":[");
+
+    let mut first_binding = true;
+    for batch in &result.batches {
+        let schema = batch.schema();
+        // Map each head var to its column index in this batch once per batch.
+        let cols: Vec<Option<usize>> = head_vars
+            .iter()
+            .map(|&v| schema.iter().position(|&sv| sv == v))
+            .collect();
+
+        for row_idx in 0..batch.len() {
+            let has_grouped = cols.iter().any(|&c| {
+                matches!(
+                    c.map(|c| batch.get_by_col(row_idx, c)),
+                    Some(Binding::Grouped(_))
+                )
+            });
+
+            if has_grouped {
+                // Rare: cartesian-expand via the DOM disaggregator, then splice
+                // each fully-built binding object in verbatim.
+                let row_bindings: Vec<(fluree_db_query::VarId, &Binding)> = head_vars
+                    .iter()
+                    .map(|&var_id| {
+                        (
+                            var_id,
+                            batch.get(row_idx, var_id).unwrap_or(&Binding::Unbound),
+                        )
+                    })
+                    .collect();
+                let objs = disaggregate_row(result, &row_bindings, &result.vars, compactor)?;
+                for obj in &objs {
+                    if !first_binding {
+                        out.push(',');
+                    }
+                    first_binding = false;
+                    push_value(&mut out, obj)?;
+                }
+            } else {
+                if !first_binding {
+                    out.push(',');
+                }
+                first_binding = false;
+                out.push('{');
+                let mut first_cell = true;
+                for (k, &col) in cols.iter().enumerate() {
+                    if let Some(col) = col {
+                        let binding = batch.get_by_col(row_idx, col);
+                        write_cell(
+                            &mut out,
+                            result,
+                            binding,
+                            &vars[k],
+                            compactor,
+                            &mut first_cell,
+                        )?;
+                    }
+                }
+                out.push('}');
+            }
+        }
+    }
+
+    out.push_str("]}}");
+    Ok(out)
+}
+
+/// Write one `"name":{term}` cell, or nothing for Unbound/Poisoned/null literals
+/// (omitted per the SPARQL Results spec, matching [`format_binding`]).
+fn write_cell(
+    out: &mut String,
+    result: &QueryResult,
+    binding: &Binding,
+    name: &str,
+    compactor: &IriCompactor,
+    first_cell: &mut bool,
+) -> Result<()> {
+    // Late materialization: resolve encoded bindings to a concrete binding (the
+    // same step the DOM path takes), then stream the result.
+    if binding.is_encoded() {
+        let materialized = materialize::materialize_binding(result, binding)?;
+        return write_cell(out, result, &materialized, name, compactor, first_cell);
+    }
+
+    // Omitted cells produce no key at all.
+    match binding {
+        Binding::Unbound | Binding::Poisoned => return Ok(()),
+        Binding::Lit {
+            val: FlakeValue::Null,
+            ..
+        } => return Ok(()),
+        _ => {}
+    }
+
+    if !*first_cell {
+        out.push(',');
+    }
+    *first_cell = false;
+    push_json_string(out, name);
+    out.push(':');
+    write_term(out, binding, compactor)
+}
+
+/// Write the `{"type":...,"value":...}` term object for a (non-omitted) binding.
+fn write_term(out: &mut String, binding: &Binding, compactor: &IriCompactor) -> Result<()> {
+    match binding {
+        Binding::Sid { sid, .. } => write_node(out, &compactor.compact_id_sid(sid)?),
+        Binding::IriMatch { iri, .. } => write_node(out, &compactor.compact_id_iri(iri)),
+        Binding::Iri(iri) => write_node(out, iri.as_ref()),
+        Binding::Lit { val, dtc, .. } => {
+            let dt_iri = compactor.decode_sid(dtc.datatype())?;
+            write_literal(out, val, dtc.lang_tag(), &dt_iri)?;
+        }
+        Binding::Grouped(_) => {
+            return Err(FormatError::InvalidBinding(
+                "Binding::Grouped should be disaggregated before formatting".to_string(),
+            ));
+        }
+        Binding::EncodedLit { .. } | Binding::EncodedSid { .. } | Binding::EncodedPid { .. } => {
+            unreachable!("encoded bindings are materialized before write_term")
+        }
+        Binding::Unbound | Binding::Poisoned => unreachable!("omitted before write_term"),
+    }
+    Ok(())
+}
+
+/// Write a node reference as `{"type":"uri"|"bnode","value":...}`.
+fn write_node(out: &mut String, iri: &str) {
+    if let Some(label) = iri.strip_prefix("_:") {
+        out.push_str(r#"{"type":"bnode","value":"#);
+        push_json_string(out, label);
+    } else {
+        out.push_str(r#"{"type":"uri","value":"#);
+        push_json_string(out, iri);
+    }
+    out.push('}');
+}
+
+/// Write a literal term. SPARQL JSON encodes every literal value as a JSON
+/// string and carries the datatype for non-inferable / non-string types.
+fn write_literal(
+    out: &mut String,
+    val: &FlakeValue,
+    lang: Option<&str>,
+    dt_iri: &str,
+) -> Result<()> {
+    match val {
+        FlakeValue::String(s) => {
+            out.push_str(r#"{"type":"literal","value":"#);
+            push_json_string(out, s);
+            if let Some(lang) = lang {
+                out.push_str(r#","xml:lang":"#);
+                push_json_string(out, lang);
+            } else if !is_inferable_datatype(dt_iri) {
+                out.push_str(r#","datatype":"#);
+                push_json_string(out, dt_iri);
+            }
+            out.push('}');
+        }
+        FlakeValue::Ref(_) => {
+            return Err(FormatError::InvalidBinding(
+                "Binding::Lit invariant violated: contains Ref".to_string(),
+            ));
+        }
+        FlakeValue::Null => unreachable!("null literals are omitted before write_literal"),
+        // Every other value type is rendered as its string lexical form with the
+        // datatype attached (matching the DOM `format_binding`).
+        other => {
+            let value = scalar_lexical(other);
+            out.push_str(r#"{"type":"literal","value":"#);
+            push_json_string(out, &value);
+            out.push_str(r#","datatype":"#);
+            push_json_string(out, dt_iri);
+            out.push('}');
+        }
+    }
+    Ok(())
+}
+
+/// The lexical string form of a non-string literal value, matching the DOM
+/// `format_binding` value strings exactly.
+fn scalar_lexical(val: &FlakeValue) -> String {
+    match val {
+        FlakeValue::Long(n) => n.to_string(),
+        FlakeValue::Double(d) => {
+            if d.is_nan() {
+                "NaN".to_string()
+            } else if d.is_infinite() {
+                if d.is_sign_positive() {
+                    "INF".to_string()
+                } else {
+                    "-INF".to_string()
+                }
+            } else {
+                d.to_string()
+            }
+        }
+        FlakeValue::Boolean(b) => b.to_string(),
+        FlakeValue::Vector(v) => serde_json::to_string(v).unwrap_or_else(|_| "[]".to_string()),
+        FlakeValue::Json(json_str) => json_str.clone(),
+        FlakeValue::BigInt(n) => n.to_string(),
+        FlakeValue::Decimal(d) => d.to_plain_string(),
+        other => other.to_string(),
+    }
+}
+
 /// Strip the leading '?' from a variable name
 fn strip_question_mark(var_name: &str) -> String {
     var_name.strip_prefix('?').unwrap_or(var_name).to_string()
@@ -135,7 +382,9 @@ fn format_binding(
         // Reference (IRI or blank node)
         Binding::Sid { sid, .. } => {
             // SPARQL JSON output uses compact IRIs where possible (not full IRIs).
-            let iri = compactor.compact_sid(sid)?;
+            // A `uri` value names a node, so it's an `@id`-position identifier:
+            // compact via `@base` + explicit prefixes, never `@vocab` (issue #1280).
+            let iri = compactor.compact_id_sid(sid)?;
             // Check if it's a blank node (starts with _:)
             if iri.starts_with("_:") {
                 Ok(Some(json!({
@@ -152,7 +401,7 @@ fn format_binding(
 
         // IriMatch: use canonical IRI, then compact (multi-ledger mode)
         Binding::IriMatch { iri, .. } => {
-            let compacted = compactor.compact_iri(iri)?;
+            let compacted = compactor.compact_id_iri(iri);
             if compacted.starts_with("_:") {
                 Ok(Some(json!({
                     "type": "bnode",
@@ -278,7 +527,7 @@ fn format_binding(
                 }))),
                 FlakeValue::Decimal(d) => Ok(Some(json!({
                     "type": "literal",
-                    "value": d.to_string(),
+                    "value": d.to_plain_string(),
                     "datatype": dt_iri
                 }))),
                 // Temporal types
@@ -451,7 +700,7 @@ mod tests {
         namespaces.insert(2, "http://www.w3.org/2001/XMLSchema#".to_string());
         namespaces.insert(3, "http://www.w3.org/1999/02/22-rdf-syntax-ns#".to_string());
         namespaces.insert(100, "http://example.org/".to_string());
-        IriCompactor::from_namespaces(&namespaces)
+        IriCompactor::from_namespaces(std::sync::Arc::new(namespaces))
     }
 
     /// Create a minimal QueryResult for tests that don't need binary_store.
@@ -576,6 +825,212 @@ mod tests {
         let binding = Binding::Unbound;
         let formatted = format_binding(&result, &binding, &compactor).unwrap();
         assert!(formatted.is_none());
+    }
+
+    // ------------------------------------------------------------------
+    // Streaming `format_string` parity with the DOM `format` + serde_json.
+    // ------------------------------------------------------------------
+
+    use fluree_db_query::var_registry::VarRegistry;
+    use std::sync::Arc;
+
+    fn make_result(var_names: &[&str], rows: Vec<Vec<Binding>>) -> QueryResult {
+        let mut vars = VarRegistry::new();
+        let var_ids: Vec<fluree_db_query::VarId> =
+            var_names.iter().map(|&n| vars.get_or_insert(n)).collect();
+        let mut columns: Vec<Vec<Binding>> = vec![Vec::new(); var_ids.len()];
+        for row in rows {
+            for (col, b) in row.into_iter().enumerate() {
+                columns[col].push(b);
+            }
+        }
+        let batch = fluree_db_query::binding::Batch::new(
+            Arc::from(var_ids.clone().into_boxed_slice()),
+            columns,
+        )
+        .unwrap();
+        QueryResult {
+            vars,
+            t: Some(0),
+            novelty: None,
+            context: crate::ParsedContext::default(),
+            orig_context: None,
+            output: crate::QueryOutput::select_all(var_ids),
+            batches: vec![batch],
+            binary_graph: None,
+        }
+    }
+
+    /// The streaming serializer must be byte-identical to compact-serializing the
+    /// DOM tree produced by `format`.
+    fn assert_parity(result: &QueryResult, compactor: &IriCompactor) {
+        let dom = format(result, compactor, &FormatterConfig::sparql_json()).unwrap();
+        let want = serde_json::to_string(&dom).unwrap();
+        let got = format_string(result, compactor, &FormatterConfig::sparql_json()).unwrap();
+        assert_eq!(got, want, "streaming SPARQL JSON diverged from DOM");
+    }
+
+    #[test]
+    fn parity_scalar_terms() {
+        let c = make_test_compactor();
+        let r = make_result(
+            &["?uri", "?str", "?long", "?bool", "?lang", "?date"],
+            vec![vec![
+                Binding::sid(Sid::new(100, "alice")),
+                Binding::lit(
+                    FlakeValue::String("Alice & <Bob>".to_string()),
+                    Sid::new(2, "string"),
+                ),
+                Binding::lit(FlakeValue::Long(42), Sid::new(2, "long")),
+                Binding::lit(FlakeValue::Boolean(true), Sid::new(2, "boolean")),
+                Binding::lit_lang(FlakeValue::String("Bonjour".to_string()), "fr"),
+                Binding::lit(
+                    FlakeValue::String("2024-01-15".to_string()),
+                    Sid::new(2, "date"),
+                ),
+            ]],
+        );
+        assert_parity(&r, &c);
+    }
+
+    #[test]
+    fn parity_double_special_and_normal() {
+        let c = make_test_compactor();
+        for d in [
+            3.13_f64,
+            1e30,
+            -0.0,
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+        ] {
+            let r = make_result(
+                &["?d"],
+                vec![vec![Binding::lit(
+                    FlakeValue::Double(d),
+                    Sid::new(2, "double"),
+                )]],
+            );
+            assert_parity(&r, &c);
+        }
+    }
+
+    #[test]
+    fn parity_blank_node_and_unbound() {
+        let c = make_test_compactor();
+        let r = make_result(
+            &["?a", "?b", "?c"],
+            vec![vec![
+                Binding::sid(Sid::new(0, "_:b1")),
+                Binding::Unbound,
+                Binding::sid(Sid::new(100, "x")),
+            ]],
+        );
+        assert_parity(&r, &c);
+    }
+
+    #[test]
+    fn parity_multi_row() {
+        let c = make_test_compactor();
+        let r = make_result(
+            &["?s", "?n"],
+            vec![
+                vec![
+                    Binding::sid(Sid::new(100, "a")),
+                    Binding::lit(FlakeValue::Long(1), Sid::new(2, "long")),
+                ],
+                vec![
+                    Binding::sid(Sid::new(100, "b")),
+                    Binding::lit(FlakeValue::String("two".to_string()), Sid::new(2, "string")),
+                ],
+                vec![Binding::Unbound, Binding::Unbound],
+            ],
+        );
+        assert_parity(&r, &c);
+    }
+
+    #[test]
+    fn parity_empty_results() {
+        let c = make_test_compactor();
+        let r = make_result(&["?s", "?p"], vec![]);
+        assert_parity(&r, &c);
+    }
+
+    #[test]
+    fn parity_wildcard() {
+        let c = make_test_compactor();
+        let mut r = make_result(
+            &["?s", "?p"],
+            vec![vec![
+                Binding::sid(Sid::new(100, "a")),
+                Binding::lit(FlakeValue::Long(7), Sid::new(2, "long")),
+            ]],
+        );
+        r.output = crate::QueryOutput::select_all(vec![]); // wildcard
+        assert_parity(&r, &c);
+    }
+
+    #[test]
+    fn parity_grouped_disaggregation() {
+        let c = make_test_compactor();
+        let r = make_result(
+            &["?a", "?b"],
+            vec![vec![
+                Binding::Grouped(vec![
+                    Binding::lit(FlakeValue::Long(10), Sid::new(2, "long")),
+                    Binding::lit(FlakeValue::Long(20), Sid::new(2, "long")),
+                ]),
+                Binding::Grouped(vec![
+                    Binding::lit(FlakeValue::Long(1), Sid::new(2, "long")),
+                    Binding::lit(FlakeValue::Long(2), Sid::new(2, "long")),
+                ]),
+            ]],
+        );
+        assert_parity(&r, &c);
+    }
+
+    #[test]
+    fn parity_json_and_vector_values() {
+        let c = make_test_compactor();
+        let r = make_result(
+            &["?j", "?v"],
+            vec![vec![
+                Binding::lit(
+                    FlakeValue::Json(r#"{"k":1}"#.to_string()),
+                    Sid::new(3, "JSON"),
+                ),
+                Binding::lit(
+                    FlakeValue::Vector(vec![1.0, 2.5, -3.0]),
+                    Sid::new(2, "double"),
+                ),
+            ]],
+        );
+        assert_parity(&r, &c);
+    }
+
+    #[test]
+    fn parity_extended_value_types() {
+        use fluree_db_core::coerce::coerce_string_value;
+        use fluree_vocab::xsd;
+        let c = make_test_compactor();
+        let r = make_result(
+            &["?big", "?dec", "?dt"],
+            vec![vec![
+                Binding::lit(
+                    coerce_string_value("99999999999999999999999999", xsd::INTEGER).unwrap(),
+                    Sid::new(2, "integer"),
+                ),
+                Binding::lit(
+                    coerce_string_value("3.14159265358979", xsd::DECIMAL).unwrap(),
+                    Sid::new(2, "decimal"),
+                ),
+                Binding::lit(
+                    coerce_string_value("2024-01-15T10:30:00Z", xsd::DATE_TIME).unwrap(),
+                    Sid::new(2, "dateTime"),
+                ),
+            ]],
+        );
+        assert_parity(&r, &c);
     }
 
     #[test]

@@ -5,9 +5,13 @@
 //! endpoint to discover the outcome of that submission — useful when the
 //! original response was lost (timeout, disconnect, process restart).
 
+use crate::config::DataAuthMode;
+use crate::error::{Result, ServerError};
+use crate::extract::MaybeDataBearer;
 use crate::state::AppState;
 use axum::{
     extract::{Path, State},
+    response::{IntoResponse, Response},
     Json,
 };
 use fluree_db_consensus::{
@@ -108,11 +112,35 @@ pub struct PushStatusResponse {
 
 pub async fn submission_status(
     State(state): State<Arc<AppState>>,
+    bearer: MaybeDataBearer,
     Path(params): Path<SubmissionStatusParams>,
-) -> Json<SubmissionStateResponse> {
-    let key = IdempotencyKey::new(params.key);
+) -> Result<Response> {
+    // Read-side data-auth gate mirroring `routes/ledger.rs::info`: the
+    // response carries commit metadata (commit ids, `t`, reverted commits,
+    // …) so it has to clear the same scope check the rest of the data API
+    // honors. Without this, anyone holding or guessing an idempotency key
+    // could probe submission outcomes on any ledger, and a cache-hit would
+    // confirm both the ledger's existence and the operation's effect.
+    let data_auth = state.config.data_auth();
+    if data_auth.mode == DataAuthMode::Required && bearer.0.is_none() {
+        return Err(ServerError::unauthorized("Bearer token required"));
+    }
+    if let Some(principal) = bearer.0.as_ref() {
+        if !principal.can_read(&params.ledger) {
+            // Match the existence-leak avoidance in `info`: out-of-scope and
+            // missing-ledger return the same 404 so a caller can't use the
+            // response to distinguish them.
+            return Err(ServerError::not_found("Ledger not found"));
+        }
+    }
+
+    // Validate the URL-borne key through the same constructor that gates
+    // header-borne keys, so an over-long path segment is rejected at the
+    // boundary before it can be hashed into a cache lookup.
+    let key = IdempotencyKey::new(params.key)
+        .map_err(|e| ServerError::BadRequest(format!("invalid idempotency key: {e}")))?;
     let lookup_state = state.committer.status(&params.ledger, &key).await;
-    Json(SubmissionStateResponse::from(lookup_state))
+    Ok(Json(SubmissionStateResponse::from(lookup_state)).into_response())
 }
 
 impl From<SubmissionState> for SubmissionStateResponse {

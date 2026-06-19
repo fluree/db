@@ -494,6 +494,9 @@ impl SortOperator {
 
 #[async_trait]
 impl Operator for SortOperator {
+    fn plan_children(&self) -> Vec<crate::plan_node::PlanChild<'_>> {
+        vec![crate::plan_node::PlanChild::child(self.child.as_ref())]
+    }
     fn schema(&self) -> &[VarId] {
         effective_schema(&self.out_schema, &self.in_schema)
     }
@@ -567,6 +570,7 @@ impl Operator for SortOperator {
                 let cached_gv = ctx.graph_view();
 
                 loop {
+                    ctx.check_cancelled()?;
                     let next_start = Instant::now();
                     let next = self
                         .child
@@ -577,6 +581,7 @@ impl Operator for SortOperator {
                     let Some(batch) = next else {
                         break;
                     };
+                    ctx.check_cancelled()?;
 
                     input_batches += 1;
                     let build_span =
@@ -618,6 +623,7 @@ impl Operator for SortOperator {
                         }
                     }
                     build_rows_ms += (build_start.elapsed().as_secs_f64() * 1000.0) as u64;
+                    ctx.check_cancelled()?;
                 }
                 let drain_ms = (drain_start.elapsed().as_secs_f64() * 1000.0) as u64;
 
@@ -638,6 +644,7 @@ impl Operator for SortOperator {
                     materialize = ctx.graph_view().is_some(),
                 );
                 let _sort_exec_guard = sort_execute_span.enter();
+                ctx.check_cancelled()?;
                 if !use_streaming_topk {
                     if let Some(ref gv) = cached_gv {
                         materialize_sort_keys_in_rows(
@@ -658,6 +665,7 @@ impl Operator for SortOperator {
                         }
                     }
                 }
+                ctx.check_cancelled()?;
                 let sort_start = Instant::now();
                 let out_rows: Vec<Vec<Binding>> = if use_streaming_topk {
                     let mut rows: Vec<Vec<Binding>> = heap

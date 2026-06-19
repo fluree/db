@@ -10,33 +10,31 @@ use crate::distinct::DistinctOperator;
 use crate::error::{QueryError, Result};
 use crate::eval::PreparedBoolExpression;
 use crate::fast_count::{
-    count_blank_node_subjects_operator, count_distinct_object_operator,
-    count_distinct_objects_operator, count_distinct_predicates_operator,
-    count_distinct_subjects_operator, count_literal_objects_operator,
-    count_rows_lang_filter_operator, count_rows_numeric_compare_operator, count_rows_operator,
-    count_triples_operator, NumericCompareOp,
+    count_blank_node_subjects_operator, count_distinct_position_operator,
+    count_literal_objects_operator, count_rows_lang_filter_operator,
+    count_rows_numeric_compare_operator, count_rows_operator, count_triples_operator,
+    sum_compare_as_count_operator, DistinctPosition, NumericCompareOp,
 };
 use crate::fast_exists_join_count_distinct_object::exists_join_count_distinct_object_operator;
-use crate::fast_fused_scan_sum::{
-    fused_scan_sum_i64_operator, DateComponentFn, NumericUnaryFn, SumExprI64,
-};
 use crate::fast_group_count_firsts::{
     GroupByObjectStarTopKOperator, PredicateGroupCountFirstsOperator,
     PredicateObjectCountFirstsOperator,
 };
 use crate::fast_label_regex_type::label_regex_type_operator;
-use crate::fast_min_max_string::{
-    predicate_avg_numeric_operator, predicate_min_max_string_operator, MinMaxMode,
+use crate::fast_min_max_string::{predicate_min_max_string_operator, MinMaxMode};
+use crate::fast_path_plus_count_all::{
+    property_path_plus_count_all_operator, transitive_path_plus_count_all_operator,
 };
-use crate::fast_multicolumn_join_count_all::multicolumn_join_count_all_operator;
-use crate::fast_optional_chain_head_count_all::predicate_optional_chain_head_count_all;
-use crate::fast_property_path_plus_count_all::property_path_plus_count_all_operator;
+use crate::fast_post_order_limit::post_order_desc_limit_operator;
+use crate::fast_predicate_scalar_agg::{
+    predicate_scalar_agg_operator, DateComponentFn, NumericUnaryFn, ScalarAggKind, SumExprI64,
+};
 use crate::fast_star_const_order_topk::star_const_ordered_limit_operator;
+use crate::fast_string_fold::{predicate_string_fold_operator, StringFoldAgg};
 use crate::fast_string_prefix_count_all::{
     string_prefix_count_all_operator, string_prefix_sum_strstarts_operator,
 };
 use crate::fast_sum_strlen_group_concat::sum_strlen_group_concat_operator;
-use crate::fast_transitive_path_plus_count_all::transitive_path_plus_count_all_operator;
 use crate::fast_union_star_count_all::{UnionCountMode, UnionStarCountAllOperator};
 use crate::group_aggregate::{GroupAggregateOperator, StreamingAggSpec};
 use crate::groupby::GroupByOperator;
@@ -53,6 +51,7 @@ use crate::operator::BoxedOperator;
 use crate::project::ProjectOperator;
 use crate::sort::SortDirection;
 use crate::sort::SortOperator;
+use crate::sort::SortSpec;
 use crate::stats_query::StatsCountByPredicateOperator;
 use crate::temporal_mode::PlanningContext;
 use crate::var_registry::VarId;
@@ -60,7 +59,7 @@ use fluree_db_core::StatsView;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use super::dependency::compute_variable_deps;
+use super::dependency::{compute_variable_deps, VariableDeps};
 use super::where_plan::build_where_operators_with_needed;
 use super::where_plan::collect_var_stats;
 
@@ -86,26 +85,6 @@ pub(crate) fn validate_simple_triple(tp: &TriplePattern) -> Option<(VarId, Ref, 
     Some((*sv, pred, *ov))
 }
 
-/// Find a 2-hop chain pattern `?a <p1> ?b . ?b <p2> ?c` in two triples (trying both orderings).
-///
-/// Returns `(a_var, pred1, b_var, pred2, c_var)` or `None` if neither ordering forms a chain.
-/// Both triples must be simple (var subject, bound pred, var object, no dtc).
-fn find_two_hop_chain(
-    t1: &TriplePattern,
-    t2: &TriplePattern,
-) -> Option<(VarId, Ref, VarId, Ref, VarId)> {
-    let try_order =
-        |x: &TriplePattern, y: &TriplePattern| -> Option<(VarId, Ref, VarId, Ref, VarId)> {
-            let (a, p1, b1) = validate_simple_triple(x)?;
-            let (b2, p2, c) = validate_simple_triple(y)?;
-            if b1 != b2 {
-                return None;
-            }
-            Some((a, p1, b1, p2, c))
-        };
-    try_order(t1, t2).or_else(|| try_order(t2, t1))
-}
-
 #[derive(Clone)]
 struct StarConstOrderTopKSpec {
     subject_var: VarId,
@@ -115,6 +94,183 @@ struct StarConstOrderTopKSpec {
     numeric_pred: Ref,
     numeric_threshold: crate::ir::triple::Term, // stored as Term::Value for convenience
     limit: usize,
+}
+
+/// Detected shape for the reverse-POST `ORDER BY DESC(?o) LIMIT k` fast path.
+struct PostOrderDescLimitSpec {
+    /// SELECT vars, in projection order (subset of `{subject_var, object_var}`).
+    projected: Vec<VarId>,
+    subject_var: VarId,
+    object_var: VarId,
+    /// Predicate whose object is the ORDER BY key.
+    anchor_pred: Ref,
+    /// Optional `?s rdf:type <Class>` constraint object.
+    class_term: Option<Term>,
+    distinct: bool,
+    limit: usize,
+    offset: usize,
+}
+
+/// Detect `SELECT ?s ?o WHERE { ?s <p> ?o [ ; ?s a <Class> ] } ORDER BY DESC(?o) LIMIT k`.
+///
+/// Shape-only (no stats): the object-datatype order-preservation proof and the
+/// profitability budget are enforced at runtime by
+/// [`post_order_desc_limit_operator`], which bails to the fallback tree on any
+/// uncertainty. v1 is DESC-only (the ASC complement is served today by
+/// [`detect_star_const_numeric_label_order_limit`] only for its narrow shape).
+fn detect_post_order_desc_limit(
+    query: &Query,
+    stats: Option<&StatsView>,
+) -> Option<PostOrderDescLimitSpec> {
+    if query.grouping.is_some() || query.post_values.is_some() {
+        return None;
+    }
+    let limit = query.limit?;
+    if limit == 0 {
+        return None;
+    }
+    let offset = query.offset.unwrap_or(0);
+    if query.ordering.len() != 1 {
+        return None;
+    }
+    let ob = &query.ordering[0];
+    if ob.direction != SortDirection::Descending {
+        return None;
+    }
+    let object_var = ob.var;
+
+    // WHERE must be only triple patterns: one anchor `?s <p> ?o`, optionally one
+    // `?s rdf:type <Class>`.
+    let mut anchor: Option<(VarId, Ref)> = None;
+    let mut class_term: Option<Term> = None;
+    let mut subject_var: Option<VarId> = None;
+    let mut triple_count = 0usize;
+    for p in &query.patterns {
+        let Pattern::Triple(tp) = p else {
+            return None;
+        };
+        triple_count += 1;
+        if triple_count > 2 {
+            return None;
+        }
+        let Ref::Var(sv) = &tp.s else {
+            return None;
+        };
+        match subject_var {
+            None => subject_var = Some(*sv),
+            Some(x) if x != *sv => return None,
+            _ => {}
+        }
+        if tp.dtc.is_some() {
+            return None;
+        }
+        if matches!(&tp.o, Term::Var(v) if *v == object_var) {
+            if anchor.is_some() || !tp.p_bound() {
+                return None;
+            }
+            anchor = Some((*sv, tp.p.clone()));
+        } else if tp.p.is_rdf_type() {
+            if class_term.is_some() {
+                return None;
+            }
+            match &tp.o {
+                Term::Sid(_) | Term::Iri(_) => class_term = Some(tp.o.clone()),
+                _ => return None,
+            }
+        } else {
+            return None;
+        }
+    }
+
+    let (anchor_subject, anchor_pred) = anchor?;
+    let subject_var = subject_var?;
+    if anchor_subject != subject_var || subject_var == object_var {
+        return None;
+    }
+
+    // Projection must be a non-empty subset of {subject_var, object_var}.
+    let projected = query.output.projected_vars()?;
+    if projected.is_empty()
+        || projected
+            .iter()
+            .any(|v| *v != subject_var && *v != object_var)
+    {
+        return None;
+    }
+
+    let distinct = query.output.is_distinct();
+    // DISTINCT with the order var projected away (`SELECT DISTINCT ?s ORDER BY
+    // DESC(?o)`) has subtle projection/distinct semantics — defer to fallback.
+    if distinct && !projected.contains(&object_var) {
+        return None;
+    }
+
+    // Profitability gate for the `?s a <Class>` shape. The reverse-tail scan
+    // walks the ordering predicate newest-first, testing each candidate's class,
+    // until it has `offset + limit` survivors — so a *selective* class makes it
+    // walk far more rows than the generic plan would by anchoring on the class
+    // directly. When stats say so, defer to the generic plan. The bare shape
+    // (no class) always wins, and missing stats fall back to the operator's
+    // runtime scan budget. (Patterns beyond `?s <p> ?o [; ?s a <Class>]` were
+    // already rejected above, so no other selective clause reaches here.)
+    if let (Some(class), Some(stats)) = (&class_term, stats) {
+        if !post_order_class_is_profitable(stats, &anchor_pred, class, offset + limit) {
+            return None;
+        }
+    }
+
+    Some(PostOrderDescLimitSpec {
+        projected,
+        subject_var,
+        object_var,
+        anchor_pred,
+        class_term,
+        distinct,
+        limit,
+        offset,
+    })
+}
+
+/// Heuristic: is the reverse-POST tail scan cheaper than the generic plan's
+/// option of anchoring on `<Class>`?
+///
+/// Estimates the rows the tail scan must inspect to collect `need` class
+/// members — `need / survivor_fraction`, where `survivor_fraction` ≈
+/// `class_count / ndv_subjects(anchor)` — and compares it to `class_count` (the
+/// generic class-anchor scan). Returns `true` (profitable) when the tail scan is
+/// no larger, or when stats are missing for either side (the operator's runtime
+/// budget is then the backstop). A class with no recorded members is not
+/// profitable (the tail scan would never fill `need`).
+fn post_order_class_is_profitable(
+    stats: &StatsView,
+    anchor_pred: &Ref,
+    class: &Term,
+    need: usize,
+) -> bool {
+    let prop = match anchor_pred {
+        Ref::Sid(s) => stats.get_property(s),
+        Ref::Iri(i) => stats.get_property_by_iri(i),
+        Ref::Var(_) => None,
+    };
+    let class_count = match class {
+        Term::Sid(s) => stats.get_class_count(s),
+        Term::Iri(i) => stats.get_class_count_by_iri(i),
+        _ => None,
+    };
+    // Missing stats on either side → can't judge; let it run (runtime budget guards).
+    let (Some(prop), Some(class_count)) = (prop, class_count) else {
+        return true;
+    };
+    if class_count == 0 {
+        return false; // no members ⇒ tail scan can never fill `need`
+    }
+    let ndv_subjects = prop.ndv_subjects.max(1) as f64;
+    let survivor_fraction = (class_count as f64 / ndv_subjects).clamp(f64::MIN_POSITIVE, 1.0);
+    let expected_inspect = need as f64 / survivor_fraction;
+    // Tail scan inspects ~expected_inspect rows; the generic plan can anchor on
+    // the class (~class_count rows). Prefer the tail scan only when it is the
+    // smaller scan.
+    expected_inspect <= class_count as f64
 }
 
 /// Detect a common benchmark shape:
@@ -770,6 +926,21 @@ fn detect_sum_strlen_group_concat_subquery(query: &Query) -> Option<(Ref, Arc<st
     let (Some(sq), Some((bind_var, bind_expr))) = (subq, bind) else {
         return None;
     };
+    // The fused operator sums STRLEN(GROUP_CONCAT(..)) over EVERY group directly
+    // and ignores the inner subquery's slice / distinct / ordering modifiers.
+    // Only fire for the exact unmodified inner shape; otherwise an inner
+    // DISTINCT (collapsing duplicate concatenations) or LIMIT/OFFSET (summing a
+    // subset of groups) would change the answer. Falling back to the generic
+    // pipeline keeps those modifiers honored. ORDER BY alone is sum-invariant,
+    // but is declined too so the matched shape stays exact.
+    if sq.distinct
+        || sq.limit.is_some()
+        || sq.offset.is_some()
+        || !sq.ordering.is_empty()
+        || !sq.order_binds.is_empty()
+    {
+        return None;
+    }
     if bind_var != strlen_var {
         return None;
     }
@@ -853,6 +1024,11 @@ fn detect_sum_strlen_group_concat_subquery(query: &Query) -> Option<(Ref, Arc<st
 fn detect_predicate_object_count(
     query: &Query,
 ) -> Option<(Ref, VarId, crate::ir::triple::Term, VarId)> {
+    // Expression ORDER BY needs the generic pipeline's order-bind stage; this
+    // fast path sorts on `query.ordering` directly, so decline it.
+    if !query.order_binds.is_empty() {
+        return None;
+    }
     let (input_var, out_var) = detect_count_aggregate(query)?;
 
     if query.patterns.len() != 1 {
@@ -903,6 +1079,56 @@ fn detect_predicate_count_rows(query: &Query) -> Option<(Ref, VarId)> {
     }
 
     Some((pred, out_var))
+}
+
+/// Detect `COUNT(*)` / `COUNT(?s|?o)` of `?s rdf:type <Class> . ?s P ?o` — one leg
+/// with a constant (class) object, the other a same-subject property with a variable
+/// object. Returns `(type_pred, class_obj, property, out_var)`; the operator verifies
+/// the constant-object leg is rdf:type and does the class-stat lookup. Exactly one
+/// constant-object leg and one variable-object leg are required, so the variable-class
+/// star (`?s rdf:type ?o1 . ?s P ?o2`) and pure-constant joins don't match.
+/// `COUNT(DISTINCT …)` is rejected by `detect_count_aggregate`.
+fn detect_class_property_count(query: &Query) -> Option<(Ref, Ref, Ref, VarId)> {
+    let (input_var, out_var) = detect_count_aggregate(query)?;
+    if query.patterns.len() != 2 {
+        return None;
+    }
+    let (Pattern::Triple(t0), Pattern::Triple(t1)) = (&query.patterns[0], &query.patterns[1])
+    else {
+        return None;
+    };
+    for (cls_tp, prop_tp) in [(t0, t1), (t1, t0)] {
+        // Class leg: ?s <type_pred> <ConstClass> (constant ref object).
+        let Ref::Var(cs) = &cls_tp.s else { continue };
+        if cls_tp.dtc.is_some() {
+            continue;
+        }
+        let Some(type_pred) = extract_bound_predicate(&cls_tp.p) else {
+            continue;
+        };
+        let class_obj = match &cls_tp.o {
+            Term::Iri(i) => Ref::Iri(i.clone()),
+            Term::Sid(s) => Ref::Sid(s.clone()),
+            _ => continue, // not a constant class object
+        };
+        // Property leg: same subject, bound predicate, variable object.
+        let Ref::Var(ps) = &prop_tp.s else { continue };
+        if cs != ps || prop_tp.dtc.is_some() {
+            continue;
+        }
+        let Some(property) = extract_bound_predicate(&prop_tp.p) else {
+            continue;
+        };
+        let Term::Var(po) = &prop_tp.o else { continue };
+        // COUNT(?v): v must be the subject or the property's object (both bound).
+        if let Some(v) = input_var {
+            if v != *cs && v != *po {
+                continue;
+            }
+        }
+        return Some((type_pred, class_obj, property, out_var));
+    }
+    None
 }
 
 fn detect_predicate_count_rows_lang_filter(query: &Query) -> Option<(Ref, String, VarId)> {
@@ -1239,6 +1465,136 @@ fn detect_string_prefix_sum_strstarts(query: &Query) -> Option<(Ref, Arc<str>, V
     Some((pred, Arc::from(prefix.as_str()), agg.output_var))
 }
 
+/// `COUNT(*)` / `COUNT(?s)` over one triple with a `REGEX(?o, const[, const])`
+/// or `CONTAINS(?o, const)` filter — the per-distinct-string fold shapes.
+fn detect_predicate_count_string_match(query: &Query) -> Option<(Ref, StringFoldAgg, VarId)> {
+    use crate::ir::{Expression, FlakeValue, Function};
+
+    let agg = implicit_single_aggregate(query)?;
+    if query.patterns.len() != 2 {
+        return None;
+    }
+    if !matches!(agg.function, AggregateFn::Count(_) | AggregateFn::CountAll) {
+        return None;
+    }
+
+    let (tp, filter) = match (&query.patterns[0], &query.patterns[1]) {
+        (Pattern::Triple(tp), Pattern::Filter(expr)) => (tp, expr),
+        (Pattern::Filter(expr), Pattern::Triple(tp)) => (tp, expr),
+        _ => return None,
+    };
+    let (s_var, pred, o_var) = validate_simple_triple(tp)?;
+    if matches!(agg.function, AggregateFn::Count(v) if v != s_var) {
+        return None;
+    }
+    let select_vars = query.output.projected_vars()?;
+    if select_vars.len() != 1 || select_vars[0] != agg.output_var {
+        return None;
+    }
+
+    let Expression::Call { func, args } = filter else {
+        return None;
+    };
+    if !matches!(&args[0], Expression::Var(v) if *v == o_var) {
+        return None;
+    }
+    let Some(Expression::Const(FlakeValue::String(needle))) = args.get(1) else {
+        return None;
+    };
+    let fold = match func {
+        Function::Regex => {
+            let flags: Arc<str> = match args.get(2) {
+                None => Arc::from(""),
+                Some(Expression::Const(FlakeValue::String(f))) => Arc::from(f.as_str()),
+                Some(_) => return None,
+            };
+            if args.len() > 3 {
+                return None;
+            }
+            StringFoldAgg::CountRegex {
+                pattern: Arc::from(needle.as_str()),
+                flags,
+            }
+        }
+        Function::Contains if args.len() == 2 => StringFoldAgg::CountContains {
+            needle: Arc::from(needle.as_str()),
+        },
+        _ => return None,
+    };
+    Some((pred, fold, agg.output_var))
+}
+
+/// `SUM(f(?o))` over one triple for the string functions the fold supports —
+/// lowered to a pre-aggregation BIND of the expression plus `SUM(?synthetic)`:
+/// `STRLEN(?o)`, `STRLEN(STRBEFORE/STRAFTER(?o, const))`, and
+/// `xsd:integer(STRENDS(?o, const))`.
+fn detect_predicate_sum_string_fn(query: &Query) -> Option<(Ref, StringFoldAgg, VarId)> {
+    use crate::ir::{Expression, FlakeValue, Function};
+
+    let agg = implicit_single_aggregate(query)?;
+    let AggregateFn::Sum(sum_input, InputSemantics::List) = agg.function else {
+        return None;
+    };
+    let select_vars = query.output.projected_vars()?;
+    if select_vars.len() != 1 || select_vars[0] != agg.output_var {
+        return None;
+    }
+
+    if query.patterns.len() != 2 {
+        return None;
+    }
+    let (tp, bind_var, bind_expr) = match (&query.patterns[0], &query.patterns[1]) {
+        (Pattern::Triple(tp), Pattern::Bind { var, expr }) => (tp, *var, expr),
+        _ => return None,
+    };
+    let (_s_var, pred, o_var) = validate_simple_triple(tp)?;
+    if sum_input != bind_var {
+        return None;
+    }
+
+    // Matches `f(Var(o), Const(needle))` for a given function.
+    let var_const_args = |func: Function, args: &[Expression]| -> Option<Arc<str>> {
+        let Expression::Call { func: f, args } = &args[0] else {
+            return None;
+        };
+        if *f != func || args.len() != 2 {
+            return None;
+        }
+        if !matches!(&args[0], Expression::Var(v) if *v == o_var) {
+            return None;
+        }
+        let Expression::Const(FlakeValue::String(needle)) = &args[1] else {
+            return None;
+        };
+        Some(Arc::from(needle.as_str()))
+    };
+
+    let Expression::Call { func, args } = bind_expr else {
+        return None;
+    };
+    let fold = match func {
+        Function::Strlen if args.len() == 1 => match &args[0] {
+            Expression::Var(v) if *v == o_var => StringFoldAgg::SumStrlen,
+            Expression::Call { .. } => {
+                if let Some(needle) = var_const_args(Function::StrBefore, args) {
+                    StringFoldAgg::SumStrlenBefore { needle }
+                } else if let Some(needle) = var_const_args(Function::StrAfter, args) {
+                    StringFoldAgg::SumStrlenAfter { needle }
+                } else {
+                    return None;
+                }
+            }
+            _ => return None,
+        },
+        Function::XsdInteger if args.len() == 1 => {
+            let needle = var_const_args(Function::StrEnds, args)?;
+            StringFoldAgg::SumStrEnds { needle }
+        }
+        _ => return None,
+    };
+    Some((pred, fold, agg.output_var))
+}
+
 fn extract_string_prefix_filter(
     expr: &crate::ir::Expression,
     object_var: VarId,
@@ -1316,6 +1672,12 @@ fn anchored_literal_regex_prefix(pattern: &str) -> Option<Arc<str>> {
 ///
 /// Returns `Some((predicate_var, count_output_var))` if the query matches the pattern.
 fn detect_stats_count_by_predicate(query: &Query) -> Option<(VarId, VarId)> {
+    // Expression ORDER BY needs the generic pipeline's order-bind stage; this
+    // fast path sorts on `query.ordering` directly (a synthetic, unbound sort
+    // var would be silently dropped), so decline it.
+    if !query.order_binds.is_empty() {
+        return None;
+    }
     // Must have stats available (checked by caller)
     // Must have exactly one triple pattern with all variables
     if query.patterns.len() != 1 {
@@ -1451,6 +1813,43 @@ fn detect_fused_scan_sum_i64(query: &Query) -> Option<(Ref, SumExprI64, VarId)> 
     }
 }
 
+/// Detect `SELECT (SUM(?o <cmp> K) AS ?sum) WHERE { ?s <p> ?o }`, lowered as
+/// `Triple + Bind(Gt/Ge/Lt/Le(?o, const)) + SUM(synthetic_var, List)`.
+///
+/// `SUM` of a boolean comparison is `COUNT` of the matching rows, which the
+/// directory-skipping numeric-compare count answers far faster than the general
+/// decode+eval+materialize aggregate pipeline. Restricted to `InputSemantics::List`
+/// (non-DISTINCT) because `SUM(DISTINCT ?o>0)` sums the distinct set {0,1}, not a
+/// row count. Empty-input (`SUM`=Unbound vs `COUNT`=0) is handled by the operator,
+/// which defers to the fallback when the predicate feeds no rows.
+fn detect_sum_numeric_compare_as_count(
+    query: &Query,
+) -> Option<(Ref, NumericCompareOp, fluree_db_core::FlakeValue, VarId)> {
+    let agg = implicit_single_aggregate(query)?;
+    let select_vars = query.output.projected_vars()?;
+    if select_vars.len() != 1 || select_vars[0] != agg.output_var {
+        return None;
+    }
+    let AggregateFn::Sum(sum_input, InputSemantics::List) = agg.function else {
+        return None;
+    };
+    let [Pattern::Triple(tp), Pattern::Bind { var, expr }] = query.patterns.as_slice() else {
+        return None;
+    };
+    if sum_input != *var {
+        return None;
+    }
+    let pred = extract_bound_predicate(&tp.p)?;
+    let Term::Var(o_var) = &tp.o else {
+        return None;
+    };
+    let (cmp_var, op, threshold) = extract_simple_numeric_compare_threshold(expr)?;
+    if cmp_var != *o_var {
+        return None;
+    }
+    Some((pred, op, threshold, agg.output_var))
+}
+
 fn detect_exists_join_count_distinct_object(query: &Query) -> Option<(Ref, Ref, VarId)> {
     let (in_var, out_var) = detect_count_distinct_aggregate(query)?;
 
@@ -1481,36 +1880,6 @@ fn detect_exists_join_count_distinct_object(query: &Query) -> Option<(Ref, Ref, 
     } else {
         None
     }
-}
-
-fn detect_multicolumn_join_count_all(query: &Query) -> Option<(Ref, Ref, VarId)> {
-    let out_var = detect_count_all_aggregate(query)?;
-
-    // WHERE must be exactly two triple patterns and nothing else.
-    if query.patterns.len() != 2 {
-        return None;
-    }
-    let Pattern::Triple(t1) = &query.patterns[0] else {
-        return None;
-    };
-    let Pattern::Triple(t2) = &query.patterns[1] else {
-        return None;
-    };
-
-    // Must be ?s p1 ?o . ?s p2 ?o (same subject var, same object var).
-    let (s1, p1, o1) = validate_simple_triple(t1)?;
-    let (s2, p2, o2) = validate_simple_triple(t2)?;
-    if s1 != s2 {
-        return None;
-    }
-    if o1 != o2 {
-        return None;
-    }
-    if o1 == s1 {
-        return None;
-    }
-
-    Some((p1, p2, out_var))
 }
 
 fn detect_count_blank_node_subjects(query: &Query) -> Option<VarId> {
@@ -1589,32 +1958,12 @@ fn detect_count_literal_objects(query: &Query) -> Option<VarId> {
     Some(out_var)
 }
 
-fn detect_count_distinct_objects(query: &Query) -> Option<VarId> {
-    let (in_var, out_var) = detect_count_distinct_aggregate(query)?;
-
-    // Pattern shape: exactly one triple with all vars.
-    if query.patterns.len() != 1 {
-        return None;
-    }
-    let Pattern::Triple(tp) = &query.patterns[0] else {
-        return None;
-    };
-    let Ref::Var(_sv) = &tp.s else { return None };
-    let Ref::Var(_pv) = &tp.p else { return None };
-    let Term::Var(ov) = &tp.o else { return None };
-    if tp.dtc.is_some() {
-        return None;
-    }
-
-    // COUNT(DISTINCT ?o) specifically.
-    if in_var != *ov {
-        return None;
-    }
-
-    Some(out_var)
-}
-
-fn detect_count_distinct_subjects(query: &Query) -> Option<VarId> {
+/// Detect `SELECT (COUNT(DISTINCT ?v) AS ?c) WHERE { ?s ?p ?o }` and resolve
+/// which triple position `?v` binds. All three positions must be variables (the
+/// fast paths read whole-permutation metadata), matching the prior three
+/// separate detectors exactly. Priority on positional ambiguity (e.g. `?x ?p ?x`)
+/// is subjects → predicates → objects, preserving the old dispatch order.
+fn detect_count_distinct_position(query: &Query) -> Option<(DistinctPosition, VarId)> {
     let (in_var, out_var) = detect_count_distinct_aggregate(query)?;
 
     // Pattern shape: exactly one triple with all vars.
@@ -1625,43 +1974,23 @@ fn detect_count_distinct_subjects(query: &Query) -> Option<VarId> {
         return None;
     };
     let Ref::Var(sv) = &tp.s else { return None };
-    let Ref::Var(_pv) = &tp.p else { return None };
-    let Term::Var(_ov) = &tp.o else { return None };
+    let Ref::Var(pv) = &tp.p else { return None };
+    let Term::Var(ov) = &tp.o else { return None };
     if tp.dtc.is_some() {
         return None;
     }
 
-    // COUNT(DISTINCT ?s) specifically.
-    if in_var != *sv {
-        return None;
-    }
-
-    Some(out_var)
-}
-
-fn detect_count_distinct_predicates(query: &Query) -> Option<VarId> {
-    let (in_var, out_var) = detect_count_distinct_aggregate(query)?;
-
-    // Pattern shape: exactly one triple with all vars.
-    if query.patterns.len() != 1 {
-        return None;
-    }
-    let Pattern::Triple(tp) = &query.patterns[0] else {
+    let position = if in_var == *sv {
+        DistinctPosition::Subjects
+    } else if in_var == *pv {
+        DistinctPosition::Predicates
+    } else if in_var == *ov {
+        DistinctPosition::Objects
+    } else {
         return None;
     };
-    let Ref::Var(_sv) = &tp.s else { return None };
-    let Ref::Var(pv) = &tp.p else { return None };
-    let Term::Var(_ov) = &tp.o else { return None };
-    if tp.dtc.is_some() {
-        return None;
-    }
 
-    // COUNT(DISTINCT ?p) specifically.
-    if in_var != *pv {
-        return None;
-    }
-
-    Some(out_var)
+    Some((position, out_var))
 }
 
 fn detect_count_triples(query: &Query) -> Option<VarId> {
@@ -1689,51 +2018,6 @@ fn detect_count_triples(query: &Query) -> Option<VarId> {
     }
 
     Some(out_var)
-}
-
-fn detect_optional_chain_head_join_count_all(query: &Query) -> Option<(Ref, Ref, Ref, VarId)> {
-    let out_var = detect_count_all_aggregate(query)?;
-
-    // Pattern shape: one required triple + OPTIONAL with two triples (order-independent).
-    if query.patterns.len() != 2 {
-        return None;
-    }
-
-    let mut req: Option<&crate::ir::triple::TriplePattern> = None;
-    let mut inner: Option<&[Pattern]> = None;
-    for p in &query.patterns {
-        match p {
-            Pattern::Triple(tp) => req = Some(tp),
-            Pattern::Optional(v) => inner = Some(v),
-            _ => return None,
-        }
-    }
-    let req = req?;
-    let inner = inner?;
-    if inner.len() != 2 {
-        return None;
-    }
-    let (t1, t2) = match (&inner[0], &inner[1]) {
-        (Pattern::Triple(a), Pattern::Triple(b)) => (a, b),
-        _ => return None,
-    };
-
-    // Required: ?a <p1> ?b
-    let (_a, p1, b_var) = validate_simple_triple(req)?;
-
-    // Optional must be a 2-hop chain starting at ?b: ?b <p2> ?c . ?c <p3> ?d (either order).
-    let (b1, p2, _c, p3, _d) = find_two_hop_chain(t1, t2)?;
-    if b1 != b_var {
-        return None;
-    }
-
-    tracing::debug!(
-        "detected optional chain-head COUNT(*) fast-path (p1={:?}, p2={:?}, p3={:?})",
-        p1,
-        p2,
-        p3
-    );
-    Some((p1, p2, p3, out_var))
 }
 
 fn detect_transitive_path_plus_count_all(query: &Query) -> Option<(Ref, Ref, VarId)> {
@@ -1897,6 +2181,23 @@ pub fn build_operator_tree(
     stats: Option<Arc<StatsView>>,
     planning: &PlanningContext,
 ) -> Result<BoxedOperator> {
+    // Fold `FILTER(?x = ?y)` equijoins into variable unification before planning,
+    // so the rewrite feeds the stats-driven reorder, count planner, and index
+    // fast paths (rather than running as a cross-product + filter). Only clone
+    // the IR when there is actually something to fold. Recurses into subqueries.
+    if stats.is_some() && crate::filter_fold::has_equijoin_filter(query) {
+        let mut folded = query.clone();
+        crate::filter_fold::fold_equijoin_filters(&mut folded, stats.as_deref());
+        return build_operator_tree_inner(&folded, stats, true, planning);
+    }
+    // Rewrite `avg` over an anti-join complement into a difference of aggregates
+    // (universe total minus the per-key WITH aggregate), eliminating the
+    // feature x product cross-product. Clone only when a candidate is present.
+    if crate::aggregate_complement_fold::has_aggregate_complement_candidate(query) {
+        let mut rewritten = query.clone();
+        crate::aggregate_complement_fold::fold_aggregate_complements(&mut rewritten);
+        return build_operator_tree_inner(&rewritten, stats, true, planning);
+    }
     build_operator_tree_inner(query, stats, true, planning)
 }
 
@@ -1914,12 +2215,42 @@ fn build_operator_tree_inner(
     // single planner-time decision.
     let enable_fused_fast_paths = enable_fused_fast_paths && !planning.is_history();
 
+    // Expression-based ORDER BY (`query.order_binds`) is materialized only by the
+    // generic pipeline's dedicated post-grouping bind stage. No fast path runs
+    // that stage, so any fast path that returns early would sort on a synthetic
+    // ORDER BY variable that was never bound (silently dropping the sort). Force
+    // the generic path whenever order binds are present. (The history-gated
+    // count fast paths below are guarded inside their detectors for the same
+    // reason.)
+    let enable_fused_fast_paths = enable_fused_fast_paths && query.order_binds.is_empty();
+
     if enable_fused_fast_paths {
         tracing::debug!(
             patterns = ?query.patterns,
             grouping = ?query.grouping,
             "operator_tree: considering fused fast paths"
         );
+    }
+
+    // Fast-path: `SELECT (SUM(?o <cmp> K) AS ?sum) WHERE { ?s <p> ?o }`.
+    //
+    // SUM of a boolean comparison == COUNT of matching rows, answered by the
+    // directory-skipping numeric-compare count instead of the general
+    // decode+eval+materialize aggregate pipeline. Placed before the generic
+    // SUM-i64 fast path (which declines the comparison shape).
+    if enable_fused_fast_paths {
+        if let Some((pred, compare, threshold, out_var)) =
+            detect_sum_numeric_compare_as_count(query)
+        {
+            let fallback = build_operator_tree_inner(query, stats.clone(), false, planning)?;
+            return Ok(Box::new(sum_compare_as_count_operator(
+                pred,
+                compare,
+                threshold,
+                out_var,
+                Some(fallback),
+            )));
+        }
     }
 
     // Fast-path: `SELECT (SUM(DAY(?o)) AS ?sum) WHERE { ?s <p> ?o }` and friends.
@@ -1931,9 +2262,9 @@ fn build_operator_tree_inner(
             // Build fallback operator tree without this fast path to preserve correctness in
             // pre-index / history / policy contexts.
             let fallback = build_operator_tree_inner(query, stats.clone(), false, planning)?;
-            return Ok(Box::new(fused_scan_sum_i64_operator(
+            return Ok(Box::new(predicate_scalar_agg_operator(
+                ScalarAggKind::Sum(scalar),
                 pred,
-                scalar,
                 out_var,
                 Some(fallback),
             )));
@@ -1945,7 +2276,8 @@ fn build_operator_tree_inner(
     if enable_fused_fast_paths {
         if let Some((pred, out_var)) = detect_predicate_avg_numeric(query) {
             let fallback = build_operator_tree_inner(query, stats.clone(), false, planning)?;
-            return Ok(Box::new(predicate_avg_numeric_operator(
+            return Ok(Box::new(predicate_scalar_agg_operator(
+                ScalarAggKind::AvgNumeric,
                 pred,
                 out_var,
                 Some(fallback),
@@ -1958,7 +2290,8 @@ fn build_operator_tree_inner(
     if enable_fused_fast_paths {
         if let Some((pred, out_var)) = detect_predicate_count_distinct_object(query) {
             let fallback = build_operator_tree_inner(query, stats.clone(), false, planning)?;
-            return Ok(Box::new(count_distinct_object_operator(
+            return Ok(Box::new(predicate_scalar_agg_operator(
+                ScalarAggKind::CountDistinctObject,
                 pred,
                 out_var,
                 Some(fallback),
@@ -2000,6 +2333,24 @@ fn build_operator_tree_inner(
             return Ok(Box::new(string_prefix_sum_strstarts_operator(
                 pred,
                 prefix,
+                out_var,
+                Some(fallback),
+            )));
+        }
+    }
+
+    // Fast-path: per-distinct-string folds over one triple — COUNT(*) with a
+    // REGEX/CONTAINS filter on ?o, and SUM of STRLEN / STRLEN∘STRBEFORE /
+    // STRLEN∘STRAFTER / xsd:integer∘STRENDS of ?o. Placed after the
+    // string-prefix paths so anchored-prefix patterns keep the range shortcut.
+    if enable_fused_fast_paths {
+        if let Some((pred, agg, out_var)) = detect_predicate_count_string_match(query)
+            .or_else(|| detect_predicate_sum_string_fn(query))
+        {
+            let fallback = build_operator_tree_inner(query, stats.clone(), false, planning)?;
+            return Ok(Box::new(predicate_string_fold_operator(
+                pred,
+                agg,
                 out_var,
                 Some(fallback),
             )));
@@ -2053,18 +2404,28 @@ fn build_operator_tree_inner(
                 o: false,
             };
             let scan: BoxedOperator = Box::new(crate::dataset_operator::DatasetOperator::scan(
-                tp,
+                tp.clone(),
                 None,
-                inline_ops,
+                inline_ops.clone(),
                 emit,
                 None,
                 planning.mode(),
             ));
-            return Ok(Box::new(CountRowsOperator::new(
-                scan,
-                out_var,
-                Some(fallback),
-            )));
+            // Serial scan-count → general aggregate pipeline (the correct path for
+            // overlay/time-travel/policy). This is the fast path's fallback.
+            let scan_count: BoxedOperator =
+                Box::new(CountRowsOperator::new(scan, out_var, Some(fallback)));
+            // At HEAD, count the rows passing the encoded pre-filters in parallel
+            // across leaf chunks (no per-row binding materialization); otherwise, or
+            // if a filter can't be pushed to encoded columns, fall back to the scan.
+            return Ok(Box::new(
+                crate::fast_count::count_rows_encoded_filters_operator(
+                    tp,
+                    inline_ops,
+                    out_var,
+                    Some(scan_count),
+                ),
+            ));
         }
     }
 
@@ -2074,6 +2435,23 @@ fn build_operator_tree_inner(
         if let Some((pred, out_var)) = detect_predicate_count_rows(query) {
             let fallback = build_operator_tree_inner(query, stats.clone(), false, planning)?;
             return Ok(Box::new(count_rows_operator(pred, out_var, Some(fallback))));
+        }
+    }
+
+    // Fast-path: `COUNT(*)` of `?s rdf:type <Class> . ?s P ?o` — the P-flake count on
+    // instances of one bound class, from per-(class,property) stats. Before the count
+    // planner, which would otherwise run it as a real class-instances ⋈ P join.
+    if enable_fused_fast_paths {
+        if let Some((type_pred, class_obj, property, out_var)) = detect_class_property_count(query)
+        {
+            let fallback = build_operator_tree_inner(query, stats.clone(), false, planning)?;
+            return Ok(Box::new(crate::fast_count::class_property_count_operator(
+                type_pred,
+                class_obj,
+                property,
+                out_var,
+                Some(fallback),
+            )));
         }
     }
 
@@ -2090,18 +2468,8 @@ fn build_operator_tree_inner(
         }
     }
 
-    // Fast-path: `COUNT(*)` for a 2-pattern multicolumn join `?s p1 ?o . ?s p2 ?o`.
-    if enable_fused_fast_paths {
-        if let Some((p1, p2, out_var)) = detect_multicolumn_join_count_all(query) {
-            let fallback = build_operator_tree_inner(query, stats.clone(), false, planning)?;
-            return Ok(Box::new(multicolumn_join_count_all_operator(
-                p1,
-                p2,
-                out_var,
-                Some(fallback),
-            )));
-        }
-    }
+    // (The 2-pattern multicolumn join `?s p1 ?o . ?s p2 ?o` COUNT(*) is now handled
+    // by the generic count planner above — see `count_plan::try_build_multicolumn_join`.)
 
     // Fast-path: `COUNT(DISTINCT ?o1)` with an existence-only same-subject join.
     if enable_fused_fast_paths {
@@ -2142,24 +2510,17 @@ fn build_operator_tree_inner(
         }
     }
 
-    // Fast-path: `SELECT (COUNT(DISTINCT ?s) AS ?c) WHERE { ?s ?p ?o }`
-    // answered metadata-only from SPOT leaflet `lead_group_count` + boundary correction.
+    // Fast-path: `SELECT (COUNT(DISTINCT ?s|?p|?o) AS ?c) WHERE { ?s ?p ?o }`
+    // answered metadata-only: subjects from SPOT `lead_group_count` + boundary
+    // correction, predicates from PSOT `p_const` transitions, objects from OPST
+    // `lead_group_count` + boundary correction. The object variant is mutually
+    // exclusive with every detector between here and its old position, so folding
+    // it into this block does not change which fast path fires.
     if enable_fused_fast_paths {
-        if let Some(out_var) = detect_count_distinct_subjects(query) {
+        if let Some((position, out_var)) = detect_count_distinct_position(query) {
             let fallback = build_operator_tree_inner(query, stats.clone(), false, planning)?;
-            return Ok(Box::new(count_distinct_subjects_operator(
-                out_var,
-                Some(fallback),
-            )));
-        }
-    }
-
-    // Fast-path: `SELECT (COUNT(DISTINCT ?p) AS ?c) WHERE { ?s ?p ?o }`
-    // answered metadata-only from PSOT leaflet `p_const` transitions.
-    if enable_fused_fast_paths {
-        if let Some(out_var) = detect_count_distinct_predicates(query) {
-            let fallback = build_operator_tree_inner(query, stats.clone(), false, planning)?;
-            return Ok(Box::new(count_distinct_predicates_operator(
+            return Ok(Box::new(count_distinct_position_operator(
+                position,
                 out_var,
                 Some(fallback),
             )));
@@ -2175,20 +2536,8 @@ fn build_operator_tree_inner(
         }
     }
 
-    // Fast-path: `SELECT (COUNT(*) AS ?c) WHERE { ?a <p1> ?b . OPTIONAL { ?b <p2> ?c . ?c <p3> ?d } }`
-    // answered by streaming group counts and an `n3(c)` map.
-    if enable_fused_fast_paths {
-        if let Some((p1, p2, p3, out_var)) = detect_optional_chain_head_join_count_all(query) {
-            let fallback = build_operator_tree_inner(query, stats.clone(), false, planning)?;
-            return Ok(Box::new(predicate_optional_chain_head_count_all(
-                p1,
-                p2,
-                p3,
-                out_var,
-                Some(fallback),
-            )));
-        }
-    }
+    // `?a <p1> ?b . OPTIONAL { ?b <p2> ?c . ?c <p3> ?d }` COUNT(*) is now handled
+    // by the generic count planner above (CountPlanRoot::OptionalChainHead).
 
     // Fast-path: `SELECT (COUNT(*) AS ?c) WHERE { <S> <p>+ ?o }`
     // Avoids repeated range scans by building adjacency once and traversing.
@@ -2235,18 +2584,6 @@ fn build_operator_tree_inner(
         }
     }
 
-    // Fast-path: `SELECT (COUNT(DISTINCT ?o) AS ?c) WHERE { ?s ?p ?o }`
-    // answered metadata-only from OPST leaflet `lead_group_count` + boundary correction.
-    if enable_fused_fast_paths {
-        if let Some(out_var) = detect_count_distinct_objects(query) {
-            let fallback = build_operator_tree_inner(query, stats.clone(), false, planning)?;
-            return Ok(Box::new(count_distinct_objects_operator(
-                out_var,
-                Some(fallback),
-            )));
-        }
-    }
-
     // Fast-path: constant-object star constraints + numeric existence filter + label ORDER BY + LIMIT.
     if enable_fused_fast_paths {
         if let Some(spec) = detect_star_const_numeric_label_order_limit(query) {
@@ -2263,6 +2600,26 @@ fn build_operator_tree_inner(
                 spec.numeric_pred,
                 threshold,
                 spec.limit,
+                Some(fallback),
+            ));
+        }
+    }
+
+    // Fast-path: `ORDER BY DESC(?o) LIMIT k` over a single bound predicate's
+    // object (optionally `?s a <Class>`), served by a bounded reverse scan of
+    // the POST index tail instead of a full-drain top-k sort.
+    if enable_fused_fast_paths {
+        if let Some(spec) = detect_post_order_desc_limit(query, stats.as_deref()) {
+            let fallback = build_operator_tree_inner(query, stats.clone(), false, planning)?;
+            return Ok(post_order_desc_limit_operator(
+                spec.projected,
+                spec.subject_var,
+                spec.object_var,
+                spec.anchor_pred,
+                spec.class_term,
+                spec.distinct,
+                spec.limit,
+                spec.offset,
                 Some(fallback),
             ));
         }
@@ -2464,27 +2821,14 @@ fn build_operator_tree_inner(
         needed_where_vars = vars;
     }
 
-    // Flatten the grouping phase's data for consumption below. The variant
-    // distinction has already done its structural work at the IR boundary;
-    // the operator-tree builder treats both variants uniformly. Cloning is
-    // cheap here — both vectors are short (typically a handful of items)
-    // and this is one-shot setup, not per-row work.
+    // The WHERE planner takes the GROUP BY keys as a hint (it can stream-group
+    // a sorted scan). The remainder of the grouping phase (aggregates, HAVING,
+    // post-binds) is consumed by the shared `apply_solution_modifiers` tail.
     let group_by_vec: Vec<VarId> = query
         .grouping
         .iter()
         .flat_map(Grouping::group_by_vars)
         .collect();
-    let aggregates_vec: Vec<AggregateSpec> = query
-        .grouping
-        .as_ref()
-        .map(|g| g.aggregates().cloned().collect())
-        .unwrap_or_default();
-    let post_binds_vec: Vec<(VarId, Expression)> = query
-        .grouping
-        .as_ref()
-        .map(|g| g.binds().cloned().collect())
-        .unwrap_or_default();
-    let having_expr: Option<&Expression> = query.grouping.as_ref().and_then(Grouping::having);
 
     let mut operator = build_where_operators_with_needed(
         &query.patterns,
@@ -2507,13 +2851,106 @@ fn build_operator_tree_inner(
         ));
     }
 
-    // Get the schema after WHERE (before grouping)
-    let where_schema: Arc<[VarId]> = Arc::from(operator.schema().to_vec().into_boxed_slice());
+    // The solution-modifier tail (grouping → HAVING → post-binds → order-binds
+    // → sort/validate → PROJECT → DISTINCT → OFFSET → LIMIT) is shared with the
+    // per-row correlated-subquery pipeline (`SubqueryOperator`) via
+    // `apply_solution_modifiers`, so both inherit identical modifier semantics.
+    // Only the WHERE build and outermost-only concerns (post-VALUES) stay here.
+    let projected = query.output.projected_vars();
+    apply_solution_modifiers(
+        operator,
+        query.grouping.as_ref(),
+        &query.order_binds,
+        &query.ordering,
+        projected.as_deref(),
+        query.output.is_distinct(),
+        query.offset,
+        query.limit,
+        detect_partitioned_group_by(query),
+        variable_deps.as_ref(),
+    )
+}
+
+/// Apply the SPARQL solution-modifier tail to an already-built WHERE operator.
+///
+/// Shared by the top-level query pipeline (`build_operator_tree_inner`) and the
+/// per-row correlated-subquery pipeline (`SubqueryOperator`). Runs, in order:
+/// GROUP BY + aggregation, HAVING, post-aggregation binds, expression/aggregate
+/// ORDER-BY binds, sort-var validation, ORDER BY (with safe top-k and the
+/// project-distinct-before-sort optimization), PROJECT, DISTINCT, OFFSET, LIMIT.
+///
+/// `operator` is the WHERE output (seeded or not). `select_vars` is the plain
+/// projected-variable list (`None` = no projection, e.g. wildcard). Outermost-
+/// only concerns (output formatting, CONSTRUCT/ASK, post-VALUES) stay in the
+/// caller. `variable_deps` drives projection trimming; pass `None` to skip it.
+/// `partitioned` is the streaming-GroupAggregate partition hint (callers that
+/// don't benefit pass `false`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn apply_solution_modifiers(
+    mut operator: BoxedOperator,
+    grouping: Option<&Grouping>,
+    order_binds: &[(VarId, Expression)],
+    ordering: &[SortSpec],
+    select_vars: Option<&[VarId]>,
+    distinct: bool,
+    offset: Option<usize>,
+    limit: Option<usize>,
+    partitioned: bool,
+    variable_deps: Option<&VariableDeps>,
+) -> Result<BoxedOperator> {
+    // Flatten the grouping phase's data for consumption below. The variant
+    // distinction has already done its structural work at the IR boundary; the
+    // tail treats both variants uniformly. Cloning is cheap — both vectors are
+    // short and this is one-shot setup, not per-row work.
+    let group_by_vec: Vec<VarId> = grouping
+        .into_iter()
+        .flat_map(Grouping::group_by_vars)
+        .collect();
+    let aggregates_vec: Vec<AggregateSpec> = grouping
+        .map(|g| g.aggregates().cloned().collect())
+        .unwrap_or_default();
+    let post_binds_vec: Vec<(VarId, Expression)> = grouping
+        .map(|g| g.binds().cloned().collect())
+        .unwrap_or_default();
+    let having_expr: Option<&Expression> = grouping.and_then(Grouping::having);
+
+    let needs_grouping = !group_by_vec.is_empty() || !aggregates_vec.is_empty();
+
+    // SPARQL 1.1 §11.4 (GROUP BY) / §18.5: a GROUP BY variable — or, in an
+    // ungrouped query, a SELECT variable — that the WHERE never binds is legal.
+    // It is simply unbound: every solution shares the same unbound value, so
+    // they collapse into one group on that key, and the variable is reported
+    // unbound. Materialize such variables as Unbound columns (an identity
+    // `BIND(?v AS ?v)` over the absent var evaluates to Unbound) so grouping and
+    // projection treat them as unbound instead of failing the schema lookup.
+    // Aggregate INPUT variables are intentionally NOT padded here — a missing
+    // aggregate input stays an error.
+    let mut where_schema_vec: Vec<VarId> = operator.schema().to_vec();
+    {
+        let mut want: Vec<VarId> = group_by_vec.clone();
+        if !needs_grouping {
+            if let Some(sv) = select_vars {
+                want.extend_from_slice(sv);
+            }
+        }
+        for v in want {
+            if !where_schema_vec.contains(&v) {
+                operator = Box::new(crate::bind::BindOperator::new(
+                    operator,
+                    v,
+                    Expression::Var(v),
+                    Vec::new(),
+                ));
+                where_schema_vec.push(v);
+            }
+        }
+    }
+    // Get the schema after WHERE (before grouping), including any unbound pads.
+    let where_schema: Arc<[VarId]> = Arc::from(where_schema_vec.into_boxed_slice());
 
     // GROUP BY + Aggregates
     // We use streaming GroupAggregateOperator when all aggregates are streamable
     // (COUNT, SUM, AVG, MIN, MAX). This is O(groups) memory instead of O(rows).
-    let needs_grouping = !group_by_vec.is_empty() || !aggregates_vec.is_empty();
     if needs_grouping {
         // Validate group vars exist in where schema
         for var in &group_by_vec {
@@ -2582,7 +3019,7 @@ fn build_operator_tree_inner(
         // If the SELECT projects any *grouped* variables (non-key, non-aggregate),
         // we must use the traditional GroupByOperator path so those vars become
         // `Binding::Grouped(Vec<Binding>)` and remain selectable.
-        let select_needs_grouped_vars = query.output.projected_vars().is_some_and(|vars| {
+        let select_needs_grouped_vars = select_vars.is_some_and(|vars| {
             vars.iter().any(|v| {
                 !group_by_vec.contains(v) && !aggregates_vec.iter().any(|a| a.output_var == *v)
             })
@@ -2594,7 +3031,6 @@ fn build_operator_tree_inner(
 
         if use_streaming {
             // Streaming path: O(groups) memory
-            let partitioned = detect_partitioned_group_by(query);
             tracing::debug!(
                 group_by_count = group_by_vec.len(),
                 agg_count = streaming_specs.len(),
@@ -2664,6 +3100,50 @@ fn build_operator_tree_inner(
         }
     }
 
+    // Expression-based ORDER BY binds (e.g. `ORDER BY DESC(?a / ?b)`).
+    //
+    // Evaluated once per solution as a dedicated stage AFTER
+    // grouping/aggregation/HAVING/post-binds and BEFORE the sort, so the sort
+    // keys can reference GROUP BY keys, aggregate outputs, and SELECT post-binds.
+    // For ungrouped queries this is simply a post-WHERE stage. This placement is
+    // what makes expression ORDER BY work uniformly across no-grouping,
+    // dedup-only GROUP BY (no aggregation stage), and aggregating queries.
+    if !order_binds.is_empty() {
+        // Under grouping, an order-key expression may only read GROUP BY keys,
+        // aggregate outputs, and post-aggregation bind outputs. Referencing any
+        // other variable means it is `Binding::Grouped` here — reject cleanly
+        // rather than evaluating the bind over a grouped binding (which panics
+        // in `eval`), matching how bare `ORDER BY ?groupedVar` is rejected.
+        if needs_grouping {
+            let mut allowed: HashSet<VarId> = group_by_vec.iter().copied().collect();
+            for spec in &aggregates_vec {
+                allowed.insert(spec.output_var);
+            }
+            for (var, _) in &post_binds_vec {
+                allowed.insert(*var);
+            }
+            for (out_var, expr) in order_binds {
+                for v in expr.referenced_vars() {
+                    if !allowed.contains(&v) {
+                        return Err(QueryError::InvalidQuery(format!(
+                            "ORDER BY expression references variable {v:?}, which is not a GROUP BY key or aggregate result"
+                        )));
+                    }
+                }
+                // A later order bind may legitimately reference an earlier one.
+                allowed.insert(*out_var);
+            }
+        }
+        for (var, expr) in order_binds {
+            operator = Box::new(crate::bind::BindOperator::new(
+                operator,
+                *var,
+                expr.clone(),
+                vec![],
+            ));
+        }
+    }
+
     // Get the schema after grouping/aggregation/binds (for validation)
     let post_group_schema: Arc<[VarId]> = Arc::from(operator.schema().to_vec().into_boxed_slice());
 
@@ -2677,15 +3157,13 @@ fn build_operator_tree_inner(
     // size (and allow top-k truncation) while preserving semantics:
     // duplicates eliminated by DISTINCT have identical sort keys, so removing
     // them before sorting does not change the ordered set of unique solutions.
-    let select_vars_opt: Option<Vec<VarId>> = query.output.projected_vars();
-    let can_project_distinct_before_sort = query.output.is_distinct()
-        && !query.ordering.is_empty()
-        && select_vars_opt.as_ref().is_some_and(|vars| {
-            !vars.is_empty() && query.ordering.iter().all(|s| vars.contains(&s.var))
-        });
+    let can_project_distinct_before_sort = distinct
+        && !ordering.is_empty()
+        && select_vars
+            .is_some_and(|vars| !vars.is_empty() && ordering.iter().all(|s| vars.contains(&s.var)));
 
     // Validate SELECT vars (when present) exist in the post-group schema.
-    if let Some(vars) = &select_vars_opt {
+    if let Some(vars) = select_vars {
         if !vars.is_empty() {
             for var in vars {
                 if !post_group_schema.contains(var) {
@@ -2698,7 +3176,7 @@ fn build_operator_tree_inner(
     }
 
     // Validate ORDER BY vars exist in the post-group schema and are allowed under grouping.
-    if !query.ordering.is_empty() {
+    if !ordering.is_empty() {
         // Disallow sorting on Grouped variables (non-key, non-aggregated) because comparison is undefined.
         let mut allowed_sort_vars: Option<HashSet<VarId>> = None;
         if needs_grouping {
@@ -2709,9 +3187,20 @@ fn build_operator_tree_inner(
             for spec in &aggregates_vec {
                 allowed.insert(spec.output_var);
             }
+            // Post-aggregation binds (SELECT expressions like `(CEIL(?avg) AS
+            // ?c)`) are per-group scalars computed after aggregation — they are
+            // valid sort keys.
+            for (var, _) in &post_binds_vec {
+                allowed.insert(*var);
+            }
+            // Desugared expression-ORDER-BY keys run as a post-grouping stage
+            // and are validated above to read only allowed vars.
+            for (var, _) in order_binds {
+                allowed.insert(*var);
+            }
             allowed_sort_vars = Some(allowed);
         }
-        for spec in &query.ordering {
+        for spec in ordering {
             if !post_group_schema.contains(&spec.var) {
                 return Err(QueryError::VariableNotFound(format!(
                     "Sort variable {:?} not found in query schema",
@@ -2731,23 +3220,23 @@ fn build_operator_tree_inner(
 
     if can_project_distinct_before_sort {
         // PROJECT
-        if let Some(vars) = select_vars_opt {
+        if let Some(vars) = select_vars {
             operator = Box::new(ProjectOperator::new(operator, vars.to_vec()));
         }
         // DISTINCT (pre-sort)
         operator = Box::new(DistinctOperator::new(operator));
 
         // ORDER BY (post-distinct, projected vars only)
-        let k = match (query.limit, query.offset) {
+        let k = match (limit, offset) {
             (Some(limit), Some(offset)) => limit.saturating_add(offset),
             (Some(limit), None) => limit,
             _ => 0,
         };
-        let can_topk = query.limit.is_some();
+        let can_topk = limit.is_some();
         let mut sort_op = if can_topk {
-            SortOperator::new_topk(operator, query.ordering.clone(), k)
+            SortOperator::new_topk(operator, ordering.to_vec(), k)
         } else {
-            SortOperator::new(operator, query.ordering.clone())
+            SortOperator::new(operator, ordering.to_vec())
         };
         sort_op = sort_op.with_out_schema(
             variable_deps
@@ -2757,20 +3246,20 @@ fn build_operator_tree_inner(
         operator = Box::new(sort_op);
     } else {
         // ORDER BY (before projection - may reference vars not in SELECT)
-        if !query.ordering.is_empty() {
+        if !ordering.is_empty() {
             // Safe top-k: ORDER BY + (OFFSET o) + LIMIT l can keep only (o + l) rows.
             //
             // This is safe when DISTINCT is not in play because slicing happens after sorting.
-            let can_topk = query.limit.is_some() && !query.output.is_distinct();
-            let k = match (query.limit, query.offset) {
+            let can_topk = limit.is_some() && !distinct;
+            let k = match (limit, offset) {
                 (Some(limit), Some(offset)) => limit.saturating_add(offset),
                 (Some(limit), None) => limit,
                 _ => 0,
             };
             let mut sort_op = if can_topk {
-                SortOperator::new_topk(operator, query.ordering.clone(), k)
+                SortOperator::new_topk(operator, ordering.to_vec(), k)
             } else {
-                SortOperator::new(operator, query.ordering.clone())
+                SortOperator::new(operator, ordering.to_vec())
             };
             sort_op = sort_op.with_out_schema(
                 variable_deps
@@ -2781,27 +3270,27 @@ fn build_operator_tree_inner(
         }
 
         // PROJECT
-        if let Some(vars) = select_vars_opt {
+        if let Some(vars) = select_vars {
             if !vars.is_empty() {
                 operator = Box::new(ProjectOperator::new(operator, vars.to_vec()));
             }
         }
 
         // DISTINCT (after projection)
-        if query.output.is_distinct() {
+        if distinct {
             operator = Box::new(DistinctOperator::new(operator));
         }
     }
 
     // OFFSET
-    if let Some(offset) = query.offset {
+    if let Some(offset) = offset {
         if offset > 0 {
             operator = Box::new(OffsetOperator::new(operator, offset));
         }
     }
 
     // LIMIT
-    if let Some(limit) = query.limit {
+    if let Some(limit) = limit {
         operator = Box::new(LimitOperator::new(operator, limit));
     }
 
@@ -2841,10 +3330,60 @@ mod tests {
             reasoning: ReasoningConfig::default(),
             grouping: None,
             ordering: Vec::new(),
+            order_binds: Vec::new(),
             limit: None,
             offset: None,
             post_values: None,
         }
+    }
+
+    #[test]
+    fn detect_stats_count_by_predicate_declines_expression_order_by() {
+        // The count-by-predicate fast path sorts on `query.ordering` directly,
+        // so it must decline when `order_binds` are present (the synthetic sort
+        // var is only bound by the generic pipeline's order-bind stage).
+        let s = VarId(0);
+        let p = VarId(1);
+        let o = VarId(2);
+        let c = VarId(3);
+        let order_key = VarId(4);
+
+        let make = |order_binds: Vec<(VarId, Expression)>, ordering: Vec<SortSpec>| Query {
+            context: ParsedContext::default(),
+            orig_context: None,
+            output: QueryOutput::select_all(vec![p, c]),
+            patterns: vec![Pattern::Triple(TriplePattern::new(
+                Ref::Var(s),
+                Ref::Var(p),
+                Term::Var(o),
+            ))],
+            reasoning: ReasoningConfig::default(),
+            grouping: Grouping::assemble(
+                vec![p],
+                vec![AggregateSpec {
+                    function: AggregateFn::Count(s),
+                    output_var: c,
+                }],
+                vec![],
+                None,
+            ),
+            ordering,
+            order_binds,
+            limit: None,
+            offset: None,
+            post_values: None,
+        };
+
+        // Bare-variable ORDER BY (no order binds): fast path applies.
+        let plain = make(Vec::new(), vec![SortSpec::asc(c)]);
+        assert_eq!(detect_stats_count_by_predicate(&plain), Some((p, c)));
+
+        // Expression ORDER BY (order binds present): must decline.
+        let with_expr = make(
+            vec![(order_key, Expression::Const(crate::ir::FlakeValue::Long(0)))],
+            vec![SortSpec::asc(order_key)],
+        );
+        assert!(detect_stats_count_by_predicate(&with_expr).is_none());
     }
 
     #[test]
@@ -2889,6 +3428,7 @@ mod tests {
             reasoning: ReasoningConfig::default(),
             grouping: None,
             ordering: vec![SortSpec::asc(label)],
+            order_binds: Vec::new(),
             limit: Some(10),
             offset: None,
             post_values: None,
@@ -2905,7 +3445,10 @@ mod tests {
     }
 
     #[test]
-    fn test_build_operator_tree_validates_select_vars() {
+    fn test_build_operator_tree_allows_unbound_select_var() {
+        // SPARQL 1.1 §18.5: selecting a variable not bound by the pattern is
+        // legal — it is reported unbound, not an error. The tree pads it as an
+        // Unbound column rather than failing the schema lookup.
         let query = Query {
             context: ParsedContext::default(),
             orig_context: None,
@@ -2914,6 +3457,7 @@ mod tests {
             reasoning: ReasoningConfig::default(),
             grouping: None,
             ordering: Vec::new(),
+            order_binds: Vec::new(),
             limit: None,
             offset: None,
             post_values: None,
@@ -2924,10 +3468,10 @@ mod tests {
             None,
             &crate::temporal_mode::PlanningContext::current(),
         );
-        match result {
-            Err(e) => assert!(e.to_string().contains("not found")),
-            Ok(_) => panic!("Expected error for invalid select var"),
-        }
+        assert!(
+            result.is_ok(),
+            "selecting an unbound variable should succeed (reported unbound)"
+        );
     }
 
     #[test]
@@ -2940,6 +3484,7 @@ mod tests {
             reasoning: ReasoningConfig::default(),
             grouping: None,
             ordering: vec![SortSpec::asc(VarId(99))], // Invalid var
+            order_binds: Vec::new(),
             limit: None,
             offset: None,
             post_values: None,
@@ -3014,6 +3559,7 @@ mod tests {
             reasoning: ReasoningConfig::default(),
             grouping: make_grouping(),
             ordering: Vec::new(),
+            order_binds: Vec::new(),
             limit: None,
             offset: None,
             post_values: None,
@@ -3037,6 +3583,7 @@ mod tests {
             reasoning: ReasoningConfig::default(),
             grouping: make_grouping(),
             ordering: Vec::new(),
+            order_binds: Vec::new(),
             limit: None,
             offset: None,
             post_values: None,
@@ -3049,5 +3596,246 @@ mod tests {
             detect_exists_join_count_distinct_object(&reversed),
             Some((count_pred, exists_pred, out))
         );
+    }
+
+    #[test]
+    fn test_detect_sum_numeric_compare_as_count() {
+        let s = VarId(0);
+        let o = VarId(1);
+        let synth = VarId(2);
+        let out = VarId(3);
+        let pred = Ref::Sid(Sid::new(100, "numberOfCreators"));
+
+        // SELECT (SUM(?synth) AS ?out) WHERE { ?s <pred> ?o . BIND(?o > 0 AS ?synth) }
+        let make_query = |function: AggregateFn| Query {
+            context: ParsedContext::default(),
+            orig_context: None,
+            output: QueryOutput::select_all(vec![out]),
+            patterns: vec![
+                Pattern::Triple(TriplePattern::new(Ref::Var(s), pred.clone(), Term::Var(o))),
+                Pattern::Bind {
+                    var: synth,
+                    expr: crate::ir::Expression::gt(
+                        crate::ir::Expression::Var(o),
+                        crate::ir::Expression::Const(crate::ir::FlakeValue::Long(0)),
+                    ),
+                },
+            ],
+            reasoning: ReasoningConfig::default(),
+            grouping: Some(Grouping::Implicit {
+                aggregation: Aggregation {
+                    aggregates: fluree_db_core::NonEmpty::try_from_vec(vec![
+                        crate::ir::AggregateSpec {
+                            function,
+                            output_var: out,
+                        },
+                    ])
+                    .unwrap(),
+                    binds: Vec::new(),
+                },
+                having: None,
+            }),
+            ordering: Vec::new(),
+            order_binds: Vec::new(),
+            limit: None,
+            offset: None,
+            post_values: None,
+        };
+
+        // SUM (List / non-DISTINCT) over the comparison synth var => detected as Gt/threshold 0.
+        let q = make_query(AggregateFn::Sum(synth, InputSemantics::List));
+        assert_eq!(
+            detect_sum_numeric_compare_as_count(&q),
+            Some((
+                pred.clone(),
+                NumericCompareOp::Gt,
+                fluree_db_core::FlakeValue::Long(0),
+                out
+            ))
+        );
+
+        // SUM(DISTINCT ...) must be rejected: SUM(DISTINCT bool) is not a row count.
+        let q_distinct = make_query(AggregateFn::Sum(synth, InputSemantics::Set));
+        assert_eq!(detect_sum_numeric_compare_as_count(&q_distinct), None);
+
+        // A non-SUM aggregate over the same shape must be rejected.
+        let q_count = make_query(AggregateFn::Count(synth));
+        assert_eq!(detect_sum_numeric_compare_as_count(&q_count), None);
+    }
+
+    #[test]
+    fn test_detect_post_order_desc_limit() {
+        let s = VarId(0);
+        let o = VarId(1);
+        let date_pred = Ref::Sid(Sid::new(100, "dateModified"));
+        let rdf_type = Ref::Iri(std::sync::Arc::from(fluree_vocab::rdf::TYPE));
+        let class = Term::Sid(Sid::new(13, "Conversation"));
+
+        let anchor = Pattern::Triple(TriplePattern::new(Ref::Var(s), date_pred, Term::Var(o)));
+        let type_tp = Pattern::Triple(TriplePattern::new(Ref::Var(s), rdf_type, class));
+
+        let mk = |patterns: Vec<Pattern>,
+                  output: QueryOutput,
+                  ordering: Vec<SortSpec>,
+                  limit: Option<usize>,
+                  offset: Option<usize>| Query {
+            context: ParsedContext::default(),
+            orig_context: None,
+            output,
+            patterns,
+            reasoning: ReasoningConfig::default(),
+            grouping: None,
+            ordering,
+            order_binds: Vec::new(),
+            limit,
+            offset,
+            post_values: None,
+        };
+
+        // Positive: `?s a <Class> ; <p> ?o` ORDER BY DESC(?o) LIMIT 5, SELECT ?s ?o.
+        let q = mk(
+            vec![type_tp.clone(), anchor.clone()],
+            QueryOutput::select_all(vec![s, o]),
+            vec![SortSpec::desc(o)],
+            Some(5),
+            None,
+        );
+        let spec = detect_post_order_desc_limit(&q, None).expect("class + anchor should detect");
+        assert_eq!(spec.subject_var, s);
+        assert_eq!(spec.object_var, o);
+        assert!(spec.class_term.is_some());
+        assert_eq!(spec.limit, 5);
+        assert_eq!(spec.offset, 0);
+        assert!(!spec.distinct);
+        assert_eq!(spec.projected, vec![s, o]);
+
+        // Positive: single anchor (no class), with OFFSET.
+        let q = mk(
+            vec![anchor.clone()],
+            QueryOutput::select_all(vec![s, o]),
+            vec![SortSpec::desc(o)],
+            Some(3),
+            Some(2),
+        );
+        let spec = detect_post_order_desc_limit(&q, None).expect("single triple should detect");
+        assert!(spec.class_term.is_none());
+        assert_eq!(spec.offset, 2);
+
+        // Positive: DISTINCT with the order var projected.
+        let q = mk(
+            vec![anchor.clone()],
+            QueryOutput::select_distinct(vec![s, o]),
+            vec![SortSpec::desc(o)],
+            Some(5),
+            None,
+        );
+        assert!(
+            detect_post_order_desc_limit(&q, None).is_some_and(|sp| sp.distinct),
+            "DISTINCT with ?o projected should detect"
+        );
+
+        // Negative cases.
+        let asc = mk(
+            vec![anchor.clone()],
+            QueryOutput::select_all(vec![s, o]),
+            vec![SortSpec::asc(o)],
+            Some(5),
+            None,
+        );
+        assert!(
+            detect_post_order_desc_limit(&asc, None).is_none(),
+            "ASC must not match"
+        );
+
+        let no_limit = mk(
+            vec![anchor.clone()],
+            QueryOutput::select_all(vec![s, o]),
+            vec![SortSpec::desc(o)],
+            None,
+            None,
+        );
+        assert!(
+            detect_post_order_desc_limit(&no_limit, None).is_none(),
+            "missing LIMIT must not match"
+        );
+
+        let order_by_subject = mk(
+            vec![anchor.clone()],
+            QueryOutput::select_all(vec![s, o]),
+            vec![SortSpec::desc(s)],
+            Some(5),
+            None,
+        );
+        assert!(
+            detect_post_order_desc_limit(&order_by_subject, None).is_none(),
+            "ordering by a non-object var must not match"
+        );
+
+        let with_filter = mk(
+            vec![
+                anchor.clone(),
+                Pattern::Filter(crate::ir::Expression::Var(o)),
+            ],
+            QueryOutput::select_all(vec![s, o]),
+            vec![SortSpec::desc(o)],
+            Some(5),
+            None,
+        );
+        assert!(
+            detect_post_order_desc_limit(&with_filter, None).is_none(),
+            "a FILTER pattern must not match in v1"
+        );
+
+        let distinct_no_o = mk(
+            vec![anchor],
+            QueryOutput::select_distinct(vec![s]),
+            vec![SortSpec::desc(o)],
+            Some(5),
+            None,
+        );
+        assert!(
+            detect_post_order_desc_limit(&distinct_no_o, None).is_none(),
+            "DISTINCT without ?o projected must not match"
+        );
+    }
+
+    #[test]
+    fn test_post_order_class_profitability_gate() {
+        let pred = Ref::Sid(Sid::new(100, "dateModified"));
+        let class_sid = Sid::new(13, "Conversation");
+        let class = Term::Sid(class_sid.clone());
+
+        let mk = |ndv_subjects: u64, class_count: u64| {
+            let mut s = fluree_db_core::StatsView::default();
+            s.properties.insert(
+                Sid::new(100, "dateModified"),
+                fluree_db_core::PropertyStatData {
+                    count: ndv_subjects,
+                    ndv_values: ndv_subjects,
+                    ndv_subjects,
+                },
+            );
+            s.classes.insert(class_sid.clone(), class_count);
+            s
+        };
+
+        // Common class (most dated subjects are Conversations) → tail scan wins.
+        let common = mk(1_000, 950);
+        assert!(post_order_class_is_profitable(&common, &pred, &class, 5));
+
+        // Selective class (5 Conversations among 1M dated subjects) → the tail
+        // scan would walk ~1M rows to find 5; the generic class anchor is cheaper.
+        let selective = mk(1_000_000, 5);
+        assert!(!post_order_class_is_profitable(
+            &selective, &pred, &class, 5
+        ));
+
+        // No recorded members → never fills `need`.
+        let empty = mk(1_000, 0);
+        assert!(!post_order_class_is_profitable(&empty, &pred, &class, 5));
+
+        // Missing stats → run it (the operator's runtime scan budget is the guard).
+        let none = fluree_db_core::StatsView::default();
+        assert!(post_order_class_is_profitable(&none, &pred, &class, 5));
     }
 }

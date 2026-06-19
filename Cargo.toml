@@ -43,7 +43,7 @@ members = [
 exclude = ["testsuite-sparql"]
 
 [workspace.package]
-version = "4.0.4"
+version = "4.0.7"
 edition = "2021"
 license = "BUSL-1.1"
 repository = "https://github.com/fluree/db"
@@ -56,7 +56,11 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", features = ["preserve_order"] }
 mimalloc = { version = "0.1", default-features = false }
 thiserror = "1.0"
+# Persistent/immutable data structures (structural sharing -> O(1) clone).
+# Used by fluree-db-novelty's current-state fact index.
+imbl = "3"
 winnow = "0.7"
+indexmap = { version = "2", features = ["serde"] }
 
 # For content addressing and hashing
 postcard = { version = "1.0", features = ["alloc", "use-std"] }
@@ -144,6 +148,7 @@ wiremock = "0.6"
 
 # Compression
 zstd = "0.13"
+flate2 = "1"
 
 # Iceberg format support (manifest Avro, data Parquet)
 apache-avro = "0.21.0"

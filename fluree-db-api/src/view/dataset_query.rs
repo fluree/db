@@ -3,12 +3,15 @@
 //! Provides `query_dataset` for multi-ledger queries.
 
 use crate::query::helpers::{
-    build_query_result, parse_and_validate_sparql, parse_jsonld_query, parse_sparql_to_ir,
-    prepare_for_execution, status_for_query_error, tracker_for_limits,
-    tracker_for_tracked_endpoint,
+    build_query_result, charge_query_floor, parse_and_validate_sparql, parse_jsonld_query,
+    parse_sparql_to_ir, prepare_for_execution, status_for_query_error, tracked_query_tracker,
+    tracker_for_limits,
 };
 use crate::view::{DataSetDb, QueryInput};
-use crate::{ApiError, ExecutableQuery, Fluree, QueryResult, Result, Tracker, TrackingOptions};
+use crate::{
+    ApiError, ExecutableQuery, Fluree, QueryExecutionOptions, QueryResult, Result, Tracker,
+    TrackingOptions,
+};
 use fluree_db_query::execute::{
     execute_prepared, prepare_execution_with_config, ContextConfig, PrepareConfig,
 };
@@ -41,13 +44,26 @@ impl Fluree {
         dataset: &DataSetDb,
         q: impl Into<QueryInput<'_>>,
     ) -> Result<QueryResult> {
+        self.query_dataset_with_options(dataset, q, QueryExecutionOptions::default())
+            .await
+    }
+
+    /// Execute a query against a dataset view with explicit execution controls.
+    pub async fn query_dataset_with_options(
+        &self,
+        dataset: &DataSetDb,
+        q: impl Into<QueryInput<'_>>,
+        options: QueryExecutionOptions,
+    ) -> Result<QueryResult> {
         let input = q.into();
 
         // Single-ledger fast path (only safe for JSON-LD or SPARQL without dataset clauses).
         if dataset.is_single_ledger() {
             if let Some(view) = dataset.primary() {
                 match &input {
-                    QueryInput::JsonLd(_) => return self.query(view, input).await,
+                    QueryInput::JsonLd(_) => {
+                        return self.query_with_options(view, input, options).await;
+                    }
                     QueryInput::Sparql(sparql) => {
                         let ast = parse_and_validate_sparql(sparql)?;
                         let has_dataset = match &ast.body {
@@ -58,7 +74,7 @@ impl Fluree {
                             fluree_db_sparql::ast::QueryBody::Update(_) => false,
                         };
                         if !has_dataset {
-                            return self.query(view, input).await;
+                            return self.query_with_options(view, input, options).await;
                         }
                     }
                 }
@@ -81,6 +97,17 @@ impl Fluree {
             .primary()
             .ok_or_else(|| ApiError::query("Dataset has no graphs for query execution"))?;
 
+        // 0. Tracker for fuel limits. Charge the floor up front so a sub-floor
+        // `max-fuel` is rejected before parse/plan; no-op when fuel isn't
+        // tracked. (The single-ledger fast path above delegates to `query`,
+        // which charges the floor itself — so we only reach here, and charge
+        // once, on the genuine multi-ledger/dataset path.)
+        let tracker = match &input {
+            QueryInput::JsonLd(json) => tracker_for_limits(json),
+            QueryInput::Sparql(_) => Tracker::disabled(),
+        };
+        charge_query_floor(&tracker).map_err(fluree_db_query::QueryError::from)?;
+
         // 1. Parse to common IR (using primary db for namespace resolution).
         let (vars, mut parsed) = match &input {
             QueryInput::JsonLd(json) => parse_jsonld_query(
@@ -102,15 +129,9 @@ impl Fluree {
         // 2. Build executable with optional reasoning override from primary view
         let executable = self.build_executable_for_dataset(dataset, &parsed).await?;
 
-        // 3. Get tracker for fuel limits
-        let tracker = match &input {
-            QueryInput::JsonLd(json) => tracker_for_limits(json),
-            QueryInput::Sparql(_) => Tracker::disabled(),
-        };
-
         // 4. Execute against merged dataset
         let batches = self
-            .execute_dataset_internal(dataset, &vars, &executable, &tracker)
+            .execute_dataset_internal(dataset, &vars, &executable, &tracker, &options)
             .await?;
 
         // 5. Build result with max_t across all views
@@ -124,12 +145,13 @@ impl Fluree {
         ))
     }
 
-    pub(crate) async fn query_dataset_with_r2rml(
+    pub(crate) async fn query_dataset_with_r2rml_options(
         &self,
         dataset: &DataSetDb,
         q: impl Into<QueryInput<'_>>,
         r2rml_provider: &dyn R2rmlProvider,
         r2rml_table_provider: &dyn R2rmlTableProvider,
+        options: QueryExecutionOptions,
     ) -> Result<QueryResult> {
         let input = q.into();
 
@@ -139,11 +161,12 @@ impl Fluree {
                 match &input {
                     QueryInput::JsonLd(_) => {
                         return self
-                            .query_view_with_r2rml(
+                            .query_view_with_r2rml_options(
                                 view,
                                 input,
                                 r2rml_provider,
                                 r2rml_table_provider,
+                                options,
                             )
                             .await;
                     }
@@ -158,11 +181,12 @@ impl Fluree {
                         };
                         if !has_dataset {
                             return self
-                                .query_view_with_r2rml(
+                                .query_view_with_r2rml_options(
                                     view,
                                     input,
                                     r2rml_provider,
                                     r2rml_table_provider,
+                                    options,
                                 )
                                 .await;
                         }
@@ -174,6 +198,16 @@ impl Fluree {
         let primary = dataset
             .primary()
             .ok_or_else(|| ApiError::query("Dataset has no graphs for query execution"))?;
+
+        // 0. Tracker for fuel limits. Charge the floor up front so a sub-floor
+        // `max-fuel` is rejected before parse/plan; no-op when fuel isn't
+        // tracked. (The single-ledger fast path above delegates to
+        // `query_view_with_r2rml`, which charges the floor — so we charge once.)
+        let tracker = match &input {
+            QueryInput::JsonLd(json) => tracker_for_limits(json),
+            QueryInput::Sparql(_) => Tracker::disabled(),
+        };
+        charge_query_floor(&tracker).map_err(fluree_db_query::QueryError::from)?;
 
         // 1. Parse to common IR (using primary db for namespace resolution).
         let (vars, mut parsed) = match &input {
@@ -194,12 +228,6 @@ impl Fluree {
         // 2. Build executable with optional reasoning override from primary view
         let executable = self.build_executable_for_dataset(dataset, &parsed).await?;
 
-        // 3. Get tracker for fuel limits
-        let tracker = match &input {
-            QueryInput::JsonLd(json) => tracker_for_limits(json),
-            QueryInput::Sparql(_) => Tracker::disabled(),
-        };
-
         // 4. Execute against merged dataset
         let batches = self
             .execute_dataset_internal_with_r2rml(
@@ -207,8 +235,11 @@ impl Fluree {
                 &vars,
                 &executable,
                 &tracker,
-                r2rml_provider,
-                r2rml_table_provider,
+                crate::R2rmlProviders {
+                    provider: r2rml_provider,
+                    table_provider: r2rml_table_provider,
+                },
+                &options,
             )
             .await?;
 
@@ -226,26 +257,23 @@ impl Fluree {
     ///
     /// When `format_config` is `None`, defaults to JSON-LD for FlureeQL
     /// queries and SPARQL JSON for SPARQL queries.
-    pub(crate) async fn query_dataset_tracked(
+    pub(crate) async fn query_dataset_tracked_with_options(
         &self,
         dataset: &DataSetDb,
         q: impl Into<QueryInput<'_>>,
         format_config: Option<crate::format::FormatterConfig>,
         tracking_override: Option<TrackingOptions>,
+        options: QueryExecutionOptions,
     ) -> std::result::Result<crate::query::TrackedQueryResponse, crate::query::TrackedErrorResponse>
     {
         let input = q.into();
 
-        // Get tracker: use caller-provided options if given, otherwise fall back
-        // to defaults (all-enabled for SPARQL, opts-derived for JSON-LD).
-        let tracker = if let Some(opts) = tracking_override {
-            Tracker::new(opts)
-        } else {
-            match &input {
-                QueryInput::JsonLd(json) => tracker_for_tracked_endpoint(json),
-                QueryInput::Sparql(_) => Tracker::new(TrackingOptions::all_enabled()),
-            }
-        };
+        // Tracker: caller-provided options if given, else per-input defaults.
+        let tracker = tracked_query_tracker(&input, &tracking_override);
+
+        // Charge the one-time query floor before parsing (see `query_tracked`).
+        charge_query_floor(&tracker)
+            .map_err(|e| crate::query::TrackedErrorResponse::fuel_exceeded(&e, tracker.tally()))?;
 
         // Determine output format: caller override > input-type default
         let default_format = match &input {
@@ -293,7 +321,7 @@ impl Fluree {
 
         // Execute with tracking
         let batches = self
-            .execute_dataset_tracked(dataset, &vars, &executable, &tracker)
+            .execute_dataset_tracked(dataset, &vars, &executable, &tracker, &options)
             .await
             .map_err(|e| {
                 let status = status_for_query_error(&e);
@@ -344,26 +372,23 @@ impl Fluree {
         ))
     }
 
-    pub(crate) async fn query_dataset_tracked_with_r2rml(
+    pub(crate) async fn query_dataset_tracked_with_r2rml_options(
         &self,
         dataset: &DataSetDb,
         q: impl Into<QueryInput<'_>>,
         format_config: Option<crate::format::FormatterConfig>,
         tracking_override: Option<TrackingOptions>,
-        r2rml_provider: &dyn R2rmlProvider,
-        r2rml_table_provider: &dyn R2rmlTableProvider,
+        r2rml: crate::R2rmlProviders<'_>,
+        options: QueryExecutionOptions,
     ) -> std::result::Result<crate::query::TrackedQueryResponse, crate::query::TrackedErrorResponse>
     {
         let input = q.into();
 
-        let tracker = if let Some(opts) = tracking_override {
-            Tracker::new(opts)
-        } else {
-            match &input {
-                QueryInput::JsonLd(json) => tracker_for_tracked_endpoint(json),
-                QueryInput::Sparql(_) => Tracker::new(TrackingOptions::all_enabled()),
-            }
-        };
+        let tracker = tracked_query_tracker(&input, &tracking_override);
+
+        // Charge the one-time query floor before parsing (see `query_tracked`).
+        charge_query_floor(&tracker)
+            .map_err(|e| crate::query::TrackedErrorResponse::fuel_exceeded(&e, tracker.tally()))?;
 
         let default_format = match &input {
             QueryInput::Sparql(_) => crate::format::FormatterConfig::sparql_json(),
@@ -411,8 +436,8 @@ impl Fluree {
                 &vars,
                 &executable,
                 &tracker,
-                r2rml_provider,
-                r2rml_table_provider,
+                r2rml,
+                &options,
             )
             .await
             .map_err(|e| {
@@ -483,11 +508,25 @@ impl Fluree {
                 let query_has_reasoning = executable.reasoning.modes.has_any_enabled();
                 let query_disabled = executable.reasoning.modes.is_disabled();
 
+                // Mode replacement keeps the query's budget — see
+                // `build_executable_for_view` for the rationale.
                 if let Some(effective) =
                     primary.effective_reasoning(query_has_reasoning, query_disabled)
                 {
+                    let (max_facts, max_seconds) = (
+                        executable.reasoning.modes.max_facts,
+                        executable.reasoning.modes.max_seconds,
+                    );
                     executable.reasoning.modes = effective.clone();
+                    executable.reasoning.modes.max_facts = max_facts;
+                    executable.reasoning.modes.max_seconds = max_seconds;
                 }
+            }
+
+            // Ledger-config materialization budget — after mode precedence,
+            // same rationale as `build_executable_for_view`.
+            if let Some(budget) = primary.config_reasoning_budget() {
+                budget.apply(&mut executable.reasoning.modes);
             }
 
             // Resolve schema bundle against the primary view's ledger
@@ -548,24 +587,35 @@ impl Fluree {
         vars: &crate::VarRegistry,
         executable: &ExecutableQuery,
         tracker: &Tracker,
+        options: &QueryExecutionOptions,
     ) -> Result<Vec<crate::Batch>> {
         let noop = crate::NoOpR2rmlProvider::new();
-        self.execute_dataset_internal_with_r2rml(dataset, vars, executable, tracker, &noop, &noop)
-            .await
+        self.execute_dataset_internal_with_r2rml(
+            dataset,
+            vars,
+            executable,
+            tracker,
+            crate::R2rmlProviders {
+                provider: &noop,
+                table_provider: &noop,
+            },
+            options,
+        )
+        .await
     }
 
     /// Execute against dataset with explicit R2RML provider.
     ///
     /// Used by callers that need R2RML/Iceberg graph source support
     /// (e.g., server query handlers with iceberg support).
-    pub(crate) async fn execute_dataset_internal_with_r2rml<'b>(
+    pub(crate) async fn execute_dataset_internal_with_r2rml(
         &self,
         dataset: &DataSetDb,
         vars: &crate::VarRegistry,
         executable: &ExecutableQuery,
         tracker: &Tracker,
-        r2rml_provider: &'b dyn fluree_db_query::r2rml::R2rmlProvider,
-        r2rml_table_provider: &'b dyn fluree_db_query::r2rml::R2rmlTableProvider,
+        r2rml: crate::R2rmlProviders<'_>,
+        options: &QueryExecutionOptions,
     ) -> Result<Vec<crate::Batch>> {
         let primary = dataset
             .primary()
@@ -649,9 +699,10 @@ impl Fluree {
             } else {
                 None
             },
+            cancellation: options.cancellation.clone(),
             dataset: Some(&runtime_dataset),
             policy_enforcer: primary.policy_enforcer().cloned(),
-            r2rml: Some((r2rml_provider, r2rml_table_provider)),
+            r2rml: Some((r2rml.provider, r2rml.table_provider)),
             binary_g_id: primary.graph_id,
             binary_store,
             dict_novelty,
@@ -679,10 +730,21 @@ impl Fluree {
         vars: &crate::VarRegistry,
         executable: &ExecutableQuery,
         tracker: &Tracker,
+        options: &QueryExecutionOptions,
     ) -> std::result::Result<Vec<crate::Batch>, fluree_db_query::QueryError> {
         let noop = crate::NoOpR2rmlProvider::new();
-        self.execute_dataset_tracked_with_r2rml(dataset, vars, executable, tracker, &noop, &noop)
-            .await
+        self.execute_dataset_tracked_with_r2rml(
+            dataset,
+            vars,
+            executable,
+            tracker,
+            crate::R2rmlProviders {
+                provider: &noop,
+                table_provider: &noop,
+            },
+            options,
+        )
+        .await
     }
 
     async fn execute_dataset_tracked_with_r2rml(
@@ -691,8 +753,8 @@ impl Fluree {
         vars: &crate::VarRegistry,
         executable: &ExecutableQuery,
         tracker: &Tracker,
-        r2rml_provider: &dyn R2rmlProvider,
-        r2rml_table_provider: &dyn R2rmlTableProvider,
+        r2rml: crate::R2rmlProviders<'_>,
+        options: &QueryExecutionOptions,
     ) -> std::result::Result<Vec<crate::Batch>, fluree_db_query::QueryError> {
         let primary = dataset.primary().ok_or_else(|| {
             fluree_db_query::QueryError::InvalidQuery("Dataset has no default graphs".into())
@@ -765,9 +827,10 @@ impl Fluree {
 
         let config = ContextConfig {
             tracker: Some(tracker),
+            cancellation: options.cancellation.clone(),
             dataset: Some(&runtime_dataset),
             policy_enforcer: primary.policy_enforcer().cloned(),
-            r2rml: Some((r2rml_provider, r2rml_table_provider)),
+            r2rml: Some((r2rml.provider, r2rml.table_provider)),
             binary_g_id: primary.graph_id,
             binary_store,
             dict_novelty,
@@ -786,7 +849,7 @@ impl Fluree {
 }
 
 fn query_error_to_api_error(err: fluree_db_query::QueryError) -> ApiError {
-    ApiError::query(err.to_string())
+    ApiError::Query(err)
 }
 
 #[cfg(test)]

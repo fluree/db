@@ -1374,7 +1374,7 @@ pub async fn rebase(State(state): State<Arc<AppState>>, request: Request) -> Res
 async fn rebase_local(state: Arc<AppState>, request: Request) -> Result<impl IntoResponse> {
     let (parts, body) = request.into_parts();
     let headers = FlureeHeaders::from_headers(&parts.headers)?;
-    let idempotency_key = extract_idempotency_key(&parts.headers);
+    let idempotency_key = extract_idempotency_key(&parts.headers)?;
 
     let body_bytes = axum::body::to_bytes(body, 50 * 1024 * 1024)
         .await
@@ -1510,7 +1510,7 @@ pub async fn merge(State(state): State<Arc<AppState>>, request: Request) -> Resp
 async fn merge_local(state: Arc<AppState>, request: Request) -> Result<impl IntoResponse> {
     let (parts, body) = request.into_parts();
     let headers = FlureeHeaders::from_headers(&parts.headers)?;
-    let idempotency_key = extract_idempotency_key(&parts.headers);
+    let idempotency_key = extract_idempotency_key(&parts.headers)?;
 
     let body_bytes = axum::body::to_bytes(body, 50 * 1024 * 1024)
         .await
@@ -1669,7 +1669,7 @@ pub async fn revert(State(state): State<Arc<AppState>>, request: Request) -> Res
 async fn revert_local(state: Arc<AppState>, request: Request) -> Result<impl IntoResponse> {
     let (parts, body) = request.into_parts();
     let headers = FlureeHeaders::from_headers(&parts.headers)?;
-    let idempotency_key = extract_idempotency_key(&parts.headers);
+    let idempotency_key = extract_idempotency_key(&parts.headers)?;
 
     let body_bytes = axum::body::to_bytes(body, 50 * 1024 * 1024)
         .await

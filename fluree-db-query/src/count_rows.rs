@@ -9,7 +9,7 @@
 use crate::binding::{Batch, Binding};
 use crate::context::ExecutionContext;
 use crate::error::{QueryError, Result};
-use crate::fast_path_common::fast_path_store;
+use crate::fast_path_common::allow_cursor_fast_path;
 use crate::operator::{BoxedOperator, Operator, OperatorState};
 use crate::var_registry::VarId;
 use async_trait::async_trait;
@@ -53,6 +53,13 @@ impl CountRowsOperator {
 
 #[async_trait]
 impl Operator for CountRowsOperator {
+    fn plan_children(&self) -> Vec<crate::plan_node::PlanChild<'_>> {
+        let mut v = vec![crate::plan_node::PlanChild::child(self.fast_child.as_ref())];
+        if let Some(fb) = self.fallback.as_deref() {
+            v.push(crate::plan_node::PlanChild::fallback(fb));
+        }
+        v
+    }
     fn schema(&self) -> &[VarId] {
         std::slice::from_ref(&self.out_var)
     }
@@ -65,7 +72,17 @@ impl Operator for CountRowsOperator {
             return Err(QueryError::OperatorAlreadyOpened);
         }
 
-        if fast_path_store(ctx).is_some() {
+        // Strategy (b): the `fast_child` is a `DatasetOperator::scan` whose
+        // `BinaryScanOperator` folds the novelty overlay into its cursor and
+        // honors `to_t`, so it stays correct under overlay and time-travel.
+        // Gate on `allow_cursor_fast_path` (single-ledger / no `from_t` / root
+        // policy) rather than `fast_path_store` — the latter additionally bailed
+        // on `overlay.epoch() != 0` and `to_t != max_t`, which forced the whole
+        // encoded-filters COUNT family onto the generic fallback whenever any
+        // novelty was present (~50% of real queries). A binary store is still
+        // required; without one the scan would take the range fallback, which
+        // the generic `fallback` tree already covers identically.
+        if allow_cursor_fast_path(ctx) && ctx.binary_store.is_some() {
             self.use_fallback = false;
             self.fast_child.open(ctx).await?;
         } else if let Some(fallback) = self.fallback.as_mut() {
@@ -101,8 +118,10 @@ impl Operator for CountRowsOperator {
         }
 
         while let Some(batch) = self.fast_child.next_batch(ctx).await? {
+            ctx.check_cancelled()?;
             self.count += batch.len() as i64;
         }
+        ctx.check_cancelled()?;
 
         self.done = true;
         Ok(Some(self.build_output_batch(self.count)?))

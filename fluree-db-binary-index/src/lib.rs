@@ -16,7 +16,9 @@ pub mod format;
 pub mod read;
 
 // ── Read-side types ─────────────────────────────────────────────────────────
-pub use read::batched_lookup::batched_lookup_predicate_refs;
+pub use read::batched_lookup::{
+    batched_lookup_inbound_refs, batched_lookup_predicate_refs, batched_lookup_subject_properties,
+};
 pub use read::binary_cursor::BinaryCursor;
 pub use read::binary_index_store::{BinaryGraphView, BinaryIndexStore};
 pub use read::column_types::{BinaryFilter, ColumnBatch, ColumnData, ColumnProjection, ColumnSet};
@@ -36,7 +38,9 @@ pub use format::wire_helpers::{
 pub use arena::fulltext::FulltextArena;
 
 // ── Types ───────────────────────────────────────────────────────────────────
-pub use read::types::{resolve_overlay_ops, sort_overlay_ops, DecodedRowV3, OverlayOp};
+pub use read::types::{
+    overlay_window_for_range, resolve_overlay_ops, sort_overlay_ops, DecodedRowV3, OverlayOp,
+};
 pub use types::NumericShape;
 
 // ── Dict ────────────────────────────────────────────────────────────────────

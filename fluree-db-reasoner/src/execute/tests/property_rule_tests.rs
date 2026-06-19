@@ -863,6 +863,7 @@ fn test_functional_property_rule() {
     let rdf_type_sid = Sid::new(RDF, RDF_TYPE);
     let mut diagnostics = ReasoningDiagnostics::default();
 
+    let mut state = IdentityRuleState::default();
     let mut ctx = IdentityRuleContext {
         delta: &delta,
         derived: &derived,
@@ -873,6 +874,7 @@ fn test_functional_property_rule() {
         t: 1,
         same_as_changed: false,
         diagnostics: &mut diagnostics,
+        state: &mut state,
     };
     apply_functional_property_rule(&ontology, &mut ctx);
 
@@ -918,22 +920,21 @@ fn test_functional_property_rule_with_derived() {
         1,
     );
 
-    // P(1, 2) is in derived (already computed)
-    let mut derived = DerivedSet::new();
-    derived.try_add(make_ref_flake(1, 10, 2, 1)); // P(1, 2)
-
-    // P(1, 3) is new in delta
-    let mut delta = DeltaSet::new();
-    delta.push(make_ref_flake(1, 10, 3, 1)); // P(1, 3)
-
-    let mut new_delta = DeltaSet::new();
+    // Simulate two fixpoint iterations: P(1, 2) arrives in iteration 1's
+    // delta (folding it into the persistent grouping state), is merged into
+    // derived, then P(1, 3) arrives in iteration 2's delta.
+    let mut state = IdentityRuleState::default();
     let same_as = SameAsTracker::new();
     let owl_same_as_sid = owl::same_as_sid();
     let rdf_type_sid = Sid::new(RDF, RDF_TYPE);
     let mut diagnostics = ReasoningDiagnostics::default();
 
+    let mut delta1 = DeltaSet::new();
+    delta1.push(make_ref_flake(1, 10, 2, 1)); // P(1, 2)
+    let derived = DerivedSet::new();
+    let mut new_delta = DeltaSet::new();
     let mut ctx = IdentityRuleContext {
-        delta: &delta,
+        delta: &delta1,
         derived: &derived,
         new_delta: &mut new_delta,
         same_as: &same_as,
@@ -942,6 +943,30 @@ fn test_functional_property_rule_with_derived() {
         t: 1,
         same_as_changed: false,
         diagnostics: &mut diagnostics,
+        state: &mut state,
+    };
+    apply_functional_property_rule(&ontology, &mut ctx);
+    assert_eq!(new_delta.len(), 0, "single object: no conflict yet");
+
+    let mut derived = DerivedSet::new();
+    derived.try_add(make_ref_flake(1, 10, 2, 1)); // P(1, 2) merged
+
+    // P(1, 3) is new in delta
+    let mut delta2 = DeltaSet::new();
+    delta2.push(make_ref_flake(1, 10, 3, 1)); // P(1, 3)
+
+    let mut new_delta = DeltaSet::new();
+    let mut ctx = IdentityRuleContext {
+        delta: &delta2,
+        derived: &derived,
+        new_delta: &mut new_delta,
+        same_as: &same_as,
+        owl_same_as_sid: &owl_same_as_sid,
+        rdf_type_sid: &rdf_type_sid,
+        t: 1,
+        same_as_changed: false,
+        diagnostics: &mut diagnostics,
+        state: &mut state,
     };
     apply_functional_property_rule(&ontology, &mut ctx);
 
@@ -986,6 +1011,7 @@ fn test_functional_property_rule_no_conflict() {
     let rdf_type_sid = Sid::new(RDF, RDF_TYPE);
     let mut diagnostics = ReasoningDiagnostics::default();
 
+    let mut state = IdentityRuleState::default();
     let mut ctx = IdentityRuleContext {
         delta: &delta,
         derived: &derived,
@@ -996,6 +1022,7 @@ fn test_functional_property_rule_no_conflict() {
         t: 1,
         same_as_changed: false,
         diagnostics: &mut diagnostics,
+        state: &mut state,
     };
     apply_functional_property_rule(&ontology, &mut ctx);
 
@@ -1038,6 +1065,7 @@ fn test_inverse_functional_property_rule() {
     let rdf_type_sid = Sid::new(RDF, RDF_TYPE);
     let mut diagnostics = ReasoningDiagnostics::default();
 
+    let mut state = IdentityRuleState::default();
     let mut ctx = IdentityRuleContext {
         delta: &delta,
         derived: &derived,
@@ -1048,6 +1076,7 @@ fn test_inverse_functional_property_rule() {
         t: 1,
         same_as_changed: false,
         diagnostics: &mut diagnostics,
+        state: &mut state,
     };
     apply_inverse_functional_property_rule(&ontology, &mut ctx);
 
@@ -1093,22 +1122,21 @@ fn test_inverse_functional_property_rule_with_derived() {
         1,
     );
 
-    // P(1, 3) is in derived (already computed)
-    let mut derived = DerivedSet::new();
-    derived.try_add(make_ref_flake(1, 10, 3, 1)); // P(1, 3)
-
-    // P(2, 3) is new in delta
-    let mut delta = DeltaSet::new();
-    delta.push(make_ref_flake(2, 10, 3, 1)); // P(2, 3)
-
-    let mut new_delta = DeltaSet::new();
+    // Simulate two fixpoint iterations: P(1, 3) arrives in iteration 1's
+    // delta (folding it into the persistent grouping state), is merged into
+    // derived, then P(2, 3) arrives in iteration 2's delta.
+    let mut state = IdentityRuleState::default();
     let same_as = SameAsTracker::new();
     let owl_same_as_sid = owl::same_as_sid();
     let rdf_type_sid = Sid::new(RDF, RDF_TYPE);
     let mut diagnostics = ReasoningDiagnostics::default();
 
+    let mut delta1 = DeltaSet::new();
+    delta1.push(make_ref_flake(1, 10, 3, 1)); // P(1, 3)
+    let derived = DerivedSet::new();
+    let mut new_delta = DeltaSet::new();
     let mut ctx = IdentityRuleContext {
-        delta: &delta,
+        delta: &delta1,
         derived: &derived,
         new_delta: &mut new_delta,
         same_as: &same_as,
@@ -1117,6 +1145,30 @@ fn test_inverse_functional_property_rule_with_derived() {
         t: 1,
         same_as_changed: false,
         diagnostics: &mut diagnostics,
+        state: &mut state,
+    };
+    apply_inverse_functional_property_rule(&ontology, &mut ctx);
+    assert_eq!(new_delta.len(), 0, "single subject: no conflict yet");
+
+    let mut derived = DerivedSet::new();
+    derived.try_add(make_ref_flake(1, 10, 3, 1)); // P(1, 3) merged
+
+    // P(2, 3) is new in delta
+    let mut delta2 = DeltaSet::new();
+    delta2.push(make_ref_flake(2, 10, 3, 1)); // P(2, 3)
+
+    let mut new_delta = DeltaSet::new();
+    let mut ctx = IdentityRuleContext {
+        delta: &delta2,
+        derived: &derived,
+        new_delta: &mut new_delta,
+        same_as: &same_as,
+        owl_same_as_sid: &owl_same_as_sid,
+        rdf_type_sid: &rdf_type_sid,
+        t: 1,
+        same_as_changed: false,
+        diagnostics: &mut diagnostics,
+        state: &mut state,
     };
     apply_inverse_functional_property_rule(&ontology, &mut ctx);
 
@@ -1174,6 +1226,7 @@ fn test_inverse_functional_property_triggered_by_sameas() {
     let mut diagnostics = ReasoningDiagnostics::default();
 
     // Call with same_as_changed = true
+    let mut state = IdentityRuleState::default();
     let mut ctx = IdentityRuleContext {
         delta: &delta,
         derived: &derived,
@@ -1184,6 +1237,7 @@ fn test_inverse_functional_property_triggered_by_sameas() {
         t: 1,
         same_as_changed: true,
         diagnostics: &mut diagnostics,
+        state: &mut state,
     };
     apply_inverse_functional_property_rule(&ontology, &mut ctx);
 
@@ -1254,6 +1308,7 @@ fn test_functional_property_triggered_by_sameas() {
     let mut diagnostics = ReasoningDiagnostics::default();
 
     // Call with same_as_changed = true
+    let mut state = IdentityRuleState::default();
     let mut ctx = IdentityRuleContext {
         delta: &delta,
         derived: &derived,
@@ -1264,6 +1319,7 @@ fn test_functional_property_triggered_by_sameas() {
         t: 1,
         same_as_changed: true,
         diagnostics: &mut diagnostics,
+        state: &mut state,
     };
     apply_functional_property_rule(&ontology, &mut ctx);
 
@@ -1353,6 +1409,7 @@ fn test_has_key_rule() {
     let owl_same_as_sid = owl::same_as_sid();
     let mut diagnostics = ReasoningDiagnostics::default();
 
+    let mut state = IdentityRuleState::default();
     let mut ctx = IdentityRuleContext {
         delta: &delta,
         derived: &derived,
@@ -1363,6 +1420,7 @@ fn test_has_key_rule() {
         t: 1,
         same_as_changed: false,
         diagnostics: &mut diagnostics,
+        state: &mut state,
     };
     apply_has_key_rule(&ontology, &mut ctx);
 
@@ -1442,6 +1500,7 @@ fn test_has_key_rule_no_match() {
     let owl_same_as_sid = owl::same_as_sid();
     let mut diagnostics = ReasoningDiagnostics::default();
 
+    let mut state = IdentityRuleState::default();
     let mut ctx = IdentityRuleContext {
         delta: &delta,
         derived: &derived,
@@ -1452,6 +1511,7 @@ fn test_has_key_rule_no_match() {
         t: 1,
         same_as_changed: false,
         diagnostics: &mut diagnostics,
+        state: &mut state,
     };
     apply_has_key_rule(&ontology, &mut ctx);
 
@@ -1521,6 +1581,7 @@ fn test_has_key_rule_missing_key_property() {
     let owl_same_as_sid = owl::same_as_sid();
     let mut diagnostics = ReasoningDiagnostics::default();
 
+    let mut state = IdentityRuleState::default();
     let mut ctx = IdentityRuleContext {
         delta: &delta,
         derived: &derived,
@@ -1531,6 +1592,7 @@ fn test_has_key_rule_missing_key_property() {
         t: 1,
         same_as_changed: false,
         diagnostics: &mut diagnostics,
+        state: &mut state,
     };
     apply_has_key_rule(&ontology, &mut ctx);
 
@@ -1602,6 +1664,7 @@ fn test_has_key_rule_multi_key() {
     let owl_same_as_sid = owl::same_as_sid();
     let mut diagnostics = ReasoningDiagnostics::default();
 
+    let mut state = IdentityRuleState::default();
     let mut ctx = IdentityRuleContext {
         delta: &delta,
         derived: &derived,
@@ -1612,6 +1675,7 @@ fn test_has_key_rule_multi_key() {
         t: 1,
         same_as_changed: false,
         diagnostics: &mut diagnostics,
+        state: &mut state,
     };
     apply_has_key_rule(&ontology, &mut ctx);
 
@@ -1692,6 +1756,7 @@ fn test_has_key_rule_multi_valued_key_skipped() {
     let owl_same_as_sid = owl::same_as_sid();
     let mut diagnostics = ReasoningDiagnostics::default();
 
+    let mut state = IdentityRuleState::default();
     let mut ctx = IdentityRuleContext {
         delta: &delta,
         derived: &derived,
@@ -1702,6 +1767,7 @@ fn test_has_key_rule_multi_valued_key_skipped() {
         t: 1,
         same_as_changed: false,
         diagnostics: &mut diagnostics,
+        state: &mut state,
     };
     apply_has_key_rule(&ontology, &mut ctx);
 

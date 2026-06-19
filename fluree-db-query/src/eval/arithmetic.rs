@@ -105,10 +105,15 @@ mod tests {
 
     #[test]
     fn test_div_three_args() {
+        // Per XPath op:numeric-divide, integer / integer yields xsd:decimal:
+        // 24 / 4 = 6, then 6 / 3 = 2, carried as a decimal throughout.
         let row = empty_row();
         let args = vec![long(24), long(4), long(3)];
         let result = ArithmeticOp::Div.eval(&args, &row, None).unwrap();
-        assert_eq!(result, Some(ComparableValue::Long(2)));
+        assert_eq!(
+            result,
+            Some(ComparableValue::Decimal(Box::new("2".parse().unwrap())))
+        );
     }
 
     #[test]

@@ -845,3 +845,104 @@ async fn all_spans_properly_closed() {
         unclosed.iter().map(|s| s.name).collect::<Vec<_>>()
     );
 }
+
+// =============================================================================
+// AC-9: Cyclic BGP operator spans — scan / index build / prune / wedge / enumerate
+// =============================================================================
+
+/// The CyclicBgpOperator fast path must surface its open() phases as DEBUG
+/// spans under `query_run` so traces can attribute time to edge scans,
+/// relation index builds, semi-join pruning, wedge builds, and enumeration.
+#[cfg(feature = "native")]
+#[tokio::test(flavor = "current_thread")]
+async fn ac9_cyclic_bgp_operator_spans() {
+    use fluree_db_api::{IndexConfig, LedgerManagerConfig, QueryInput};
+    use fluree_db_transact::{CommitOpts, TxnOpts};
+
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "ac9/cyclic-spans:main";
+
+    let (local, handle) = support::start_background_indexer_local(
+        fluree.backend().clone(),
+        fluree.nameservice_mode().as_arc_indexing_nameservice().expect("test fluree has writable nameservice"),
+        fluree_db_indexer::IndexerConfig::small(),
+    );
+
+    local
+        .run_until(async move {
+            let index_cfg = IndexConfig {
+                reindex_min_bytes: 0,
+                reindex_max_bytes: 10_000_000,
+            };
+            let ledger = support::genesis_ledger_for_fluree(&fluree, ledger_id);
+            let insert = json!({
+                "@context": {"ex": "http://example.org/ns/"},
+                "@graph": [
+                    // Directed triangle (RefOnly mode).
+                    {"@id": "ex:n1", "ex:p1": {"@id": "ex:n2"}},
+                    {"@id": "ex:n2", "ex:p2": {"@id": "ex:n3"}},
+                    {"@id": "ex:n3", "ex:p3": {"@id": "ex:n1"}},
+                    // Mixed square (EncodedObject mode, wedge-eligible).
+                    {"@id": "ex:n40", "ex:p4": {"@id": "ex:n3"}},
+                    {"@id": "ex:n1", "ex:p5": {"@id": "ex:n40"}}
+                ]
+            });
+            let result = fluree
+                .insert_with_opts(
+                    ledger,
+                    &insert,
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg,
+                )
+                .await
+                .expect("insert");
+            let ledger = result.ledger;
+            support::trigger_index_and_wait_outcome(&handle, ledger_id, ledger.t()).await;
+
+            let (store, _guard) = span_capture::init_test_tracing();
+            let view = fluree.db(ledger_id).await.expect("load view");
+            assert!(
+                store.has_span("ledger_view_load"),
+                "ledger_view_load span should wrap view acquisition. Captured: {:?}",
+                store.span_names()
+            );
+
+            let triangle = r"PREFIX ex: <http://example.org/ns/>
+                SELECT ?a ?b ?c
+                WHERE { ?a ex:p1 ?b . ?b ex:p2 ?c . ?c ex:p3 ?a }";
+            let result = fluree
+                .query(&view, QueryInput::Sparql(triangle))
+                .await
+                .expect("triangle query");
+            let _ = result.to_jsonld(&view.snapshot).expect("to_jsonld");
+
+            let square = r"PREFIX ex: <http://example.org/ns/>
+                SELECT ?a ?b ?c ?d
+                WHERE { ?a ex:p1 ?b . ?b ex:p2 ?c . ?d ex:p4 ?c . ?a ex:p5 ?d }";
+            let result = fluree
+                .query(&view, QueryInput::Sparql(square))
+                .await
+                .expect("square query");
+            let _ = result.to_jsonld(&view.snapshot).expect("to_jsonld");
+
+            for name in [
+                "cyclic_scan_relation",
+                "cyclic_index_build",
+                "cyclic_prune",
+                "cyclic_wedge_build",
+                "cyclic_enumerate",
+            ] {
+                assert!(
+                    store.has_span(name),
+                    "{name} span should exist. Captured spans: {:?}",
+                    store.span_names()
+                );
+                let span = store.find_span(name).unwrap();
+                assert_eq!(span.level, tracing::Level::DEBUG, "{name} should be DEBUG");
+            }
+        })
+        .await;
+}

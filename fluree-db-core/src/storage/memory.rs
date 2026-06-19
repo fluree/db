@@ -107,6 +107,10 @@ impl StorageRead for MemoryStorage {
         Ok(full[start..end].to_vec())
     }
 
+    fn supports_ranged_reads(&self) -> bool {
+        true
+    }
+
     async fn list_prefix_with_metadata(&self, prefix: &str) -> Result<Vec<crate::RemoteObject>> {
         let data = self.data.read();
         Ok(data

@@ -43,6 +43,12 @@ pub const INVALID_TRANSACTION: &str = "err:db/InvalidTransaction";
 /// Query execution error
 pub const QUERY_EXECUTION: &str = "err:db/QueryExecution";
 
+/// Query was cancelled by a timeout monitor, caller, or disconnected client.
+pub const QUERY_CANCELLED: &str = "err:db/QueryCancelled";
+
+/// Query read-after-write freshness wait timed out before requested t was visible.
+pub const READ_AFTER_WRITE_TIMEOUT: &str = "err:db/ReadAfterWriteTimeout";
+
 /// Transaction execution error
 pub const TRANSACTION_EXECUTION: &str = "err:db/TransactionExecution";
 

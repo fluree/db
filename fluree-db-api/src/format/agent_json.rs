@@ -12,6 +12,7 @@ use std::collections::{BTreeSet, HashMap};
 use serde_json::{json, Map, Value as JsonValue};
 
 use super::iri::IriCompactor;
+use super::json_write::{push_bool, push_i64, push_json_string, push_value};
 use super::Result;
 use crate::QueryResult;
 use fluree_db_query::binding::Binding;
@@ -115,50 +116,256 @@ pub fn format(
     if row_count == 0 {
         envelope.insert(
             "message".to_string(),
-            JsonValue::String(
-                "Query returned no results. The schema is empty because no rows were \
-                 available to infer types from. This does not necessarily indicate an \
-                 incorrect query — the data may not exist for the given constraints."
-                    .to_string(),
-            ),
+            JsonValue::String(NO_RESULTS_MESSAGE.to_string()),
         );
     }
 
     if has_more {
-        let budget_str = max_bytes.map(|b| b.to_string()).unwrap_or_default();
-        let mut msg = format!(
-            "Response truncated due to size limit of {budget_str} bytes. {row_count} of {total_row_hint} total rows included."
-        );
-
-        if let Some(ref ctx) = config.agent_json_context {
-            if ctx.from_count <= 1 {
-                if let (Some(ref sparql), Some(t)) = (&ctx.sparql_text, result.t) {
-                    if let Some(resume) =
-                        generate_resume_query(sparql, t, row_count, ctx.resume_limit)
-                    {
-                        msg = format!(
-                            "Response truncated due to size limit of {budget_str} bytes. \
-                             Use the query below to retrieve the next batch."
-                        );
-                        envelope.insert("resume".to_string(), JsonValue::String(resume));
-                    }
-                }
-            } else {
-                // Multi-ledger: advise using @iso: for time-pinning
-                if let Some(ref iso) = ctx.iso_timestamp {
-                    msg.push_str(&format!(
-                        " To retrieve the next batch, re-issue your query with \
-                         @iso:{} on each FROM clause and add OFFSET {} LIMIT {}.",
-                        iso, row_count, ctx.resume_limit
-                    ));
-                }
-            }
+        let (resume, msg) =
+            truncation_resume_and_message(config, result.t, row_count, total_row_hint, max_bytes);
+        if let Some(resume) = resume {
+            envelope.insert("resume".to_string(), JsonValue::String(resume));
         }
-
         envelope.insert("message".to_string(), JsonValue::String(msg));
     }
 
     Ok(JsonValue::Object(envelope))
+}
+
+/// Message used when a query returns zero rows.
+const NO_RESULTS_MESSAGE: &str =
+    "Query returned no results. The schema is empty because no rows were \
+     available to infer types from. This does not necessarily indicate an \
+     incorrect query — the data may not exist for the given constraints.";
+
+/// Build the `(resume, message)` pair for a size-truncated response.
+///
+/// Shared by the DOM and streaming envelopes so the wording and resume-query
+/// rules stay in lockstep. `resume` is `Some` only for the single-FROM,
+/// `@t:`-pinnable case.
+fn truncation_resume_and_message(
+    config: &super::config::FormatterConfig,
+    t: Option<i64>,
+    row_count: usize,
+    total_row_hint: usize,
+    max_bytes: Option<usize>,
+) -> (Option<String>, String) {
+    let budget_str = max_bytes.map(|b| b.to_string()).unwrap_or_default();
+    let mut msg = format!(
+        "Response truncated due to size limit of {budget_str} bytes. {row_count} of {total_row_hint} total rows included."
+    );
+    let mut resume = None;
+
+    if let Some(ref ctx) = config.agent_json_context {
+        if ctx.from_count <= 1 {
+            if let (Some(ref sparql), Some(t)) = (&ctx.sparql_text, t) {
+                if let Some(q) = generate_resume_query(sparql, t, row_count, ctx.resume_limit) {
+                    msg = format!(
+                        "Response truncated due to size limit of {budget_str} bytes. \
+                         Use the query below to retrieve the next batch."
+                    );
+                    resume = Some(q);
+                }
+            }
+        } else if let Some(ref iso) = ctx.iso_timestamp {
+            // Multi-ledger: advise using @iso: for time-pinning
+            msg.push_str(&format!(
+                " To retrieve the next batch, re-issue your query with \
+                 @iso:{} on each FROM clause and add OFFSET {} LIMIT {}.",
+                iso, row_count, ctx.resume_limit
+            ));
+        }
+    }
+
+    (resume, msg)
+}
+
+/// Stream the AgentJson envelope directly into a `String`, byte-identical to
+/// `serde_json::to_string(&format(...))`.
+///
+/// Rows stream into an inner buffer (no per-row `serde_json::Value`), the byte
+/// budget is measured from buffer-length deltas (no separate size-measuring
+/// serialization), and the schema / metadata envelope is assembled around the
+/// rows in serde's insertion order.
+pub fn format_string(
+    result: &QueryResult,
+    compactor: &IriCompactor,
+    config: &super::config::FormatterConfig,
+) -> Result<String> {
+    let select_vars = if result.output.is_wildcard() {
+        None
+    } else {
+        Some(result.output.projected_vars_or_empty())
+    };
+    let select_vars = select_vars.as_deref();
+
+    let max_bytes = config.max_bytes;
+    let total_row_hint = result
+        .batches
+        .iter()
+        .map(fluree_db_query::Batch::len)
+        .sum::<usize>();
+
+    let mut type_map: HashMap<VarId, BTreeSet<String>> = HashMap::new();
+    let mut cumulative_bytes: usize = 0;
+    let mut has_more = false;
+    let mut row_count: usize = 0;
+
+    // Stream the row objects (comma-separated) into their own buffer so the
+    // schema — computed from the same pass — can be written ahead of them.
+    //
+    // When a byte budget is set the buffer never exceeds `budget` (the running
+    // total is capped, and the one over-budget row is truncated away), so cap the
+    // preallocation at the budget rather than sizing for the full untruncated row
+    // count — otherwise a large result set with a small budget would still
+    // allocate megabytes up front, defeating the truncation path. Mirrors the DOM
+    // path's `total_row_hint.min(256)` guard.
+    let full_est = total_row_hint.saturating_mul(64).saturating_add(16);
+    let est_rows = match max_bytes {
+        Some(budget) => budget.saturating_add(64).min(full_est),
+        None => full_est,
+    };
+    let mut rows_buf = String::with_capacity(est_rows);
+
+    'outer: for batch in &result.batches {
+        let vars_to_scan = select_vars.unwrap_or_else(|| batch.schema());
+        for row_idx in 0..batch.len() {
+            let pre = rows_buf.len();
+            if row_count > 0 {
+                rows_buf.push(',');
+            }
+            let row_start = rows_buf.len();
+
+            // Formats the row AND records its types — done before the budget
+            // check, exactly as the DOM path does (so a budget-rejected row's
+            // types still contribute to the schema).
+            write_row_with_types(
+                &mut rows_buf,
+                result,
+                batch,
+                row_idx,
+                vars_to_scan,
+                &result.vars,
+                compactor,
+                &mut type_map,
+            )?;
+            let row_size = rows_buf.len() - row_start;
+
+            if let Some(budget) = max_bytes {
+                if cumulative_bytes + row_size > budget && row_count > 0 {
+                    has_more = true;
+                    rows_buf.truncate(pre); // drop the comma + rejected row
+                    break 'outer;
+                }
+                cumulative_bytes += row_size;
+            }
+
+            row_count += 1;
+        }
+    }
+
+    // Schema (built from the types collected above).
+    let schema = build_schema(&type_map, &result.vars);
+
+    let mut out = String::with_capacity(rows_buf.len() + 256);
+    out.push_str("{\"schema\":");
+    push_value(&mut out, &schema)?;
+    out.push_str(",\"rows\":[");
+    out.push_str(&rows_buf);
+    out.push_str("],\"rowCount\":");
+    push_i64(&mut out, row_count as i64);
+
+    if let Some(t) = result.t {
+        let include_t = match config.agent_json_context {
+            Some(ref ctx) => ctx.from_count <= 1,
+            None => true,
+        };
+        if include_t {
+            out.push_str(",\"t\":");
+            push_i64(&mut out, t);
+        }
+    }
+    if let Some(ref ctx) = config.agent_json_context {
+        if let Some(ref iso) = ctx.iso_timestamp {
+            out.push_str(",\"iso\":");
+            push_json_string(&mut out, iso);
+        }
+    }
+
+    out.push_str(",\"hasMore\":");
+    push_bool(&mut out, has_more);
+
+    if row_count == 0 {
+        out.push_str(",\"message\":");
+        push_json_string(&mut out, NO_RESULTS_MESSAGE);
+    }
+
+    if has_more {
+        let (resume, msg) =
+            truncation_resume_and_message(config, result.t, row_count, total_row_hint, max_bytes);
+        if let Some(resume) = resume {
+            out.push_str(",\"resume\":");
+            push_json_string(&mut out, &resume);
+        }
+        out.push_str(",\"message\":");
+        push_json_string(&mut out, &msg);
+    }
+
+    out.push('}');
+    Ok(out)
+}
+
+/// Stream one row object (`{"?v":value,...}`) into `out`, recording each cell's
+/// datatype label in `type_map`. Mirrors [`format_row_with_types`].
+#[allow(clippy::too_many_arguments)]
+fn write_row_with_types(
+    out: &mut String,
+    result: &QueryResult,
+    batch: &fluree_db_query::Batch,
+    row_idx: usize,
+    vars: &[VarId],
+    registry: &fluree_db_query::VarRegistry,
+    compactor: &IriCompactor,
+    type_map: &mut HashMap<VarId, BTreeSet<String>>,
+) -> Result<()> {
+    out.push('{');
+    let mut first = true;
+    for &var_id in vars {
+        let var_name = registry.name(var_id);
+        if var_name.starts_with("?__") {
+            continue;
+        }
+
+        // Resolve the cell to (value-source binding, type label). Encoded
+        // bindings are materialized once and reused for both, matching the DOM.
+        let binding = batch.get(row_idx, var_id);
+
+        if !first {
+            out.push(',');
+        }
+        first = false;
+        push_json_string(out, var_name);
+        out.push(':');
+
+        match binding {
+            None | Some(Binding::Unbound | Binding::Poisoned) => out.push_str("null"),
+            Some(b) if b.is_encoded() => {
+                let m = super::materialize::materialize_binding(result, b)?;
+                super::jsonld::write_value_with_result(out, result, &m, compactor)?;
+                if let Some(label) = binding_type_label(&m, compactor)? {
+                    type_map.entry(var_id).or_default().insert(label);
+                }
+            }
+            Some(b) => {
+                super::jsonld::write_value_with_result(out, result, b, compactor)?;
+                if let Some(label) = binding_type_label(b, compactor)? {
+                    type_map.entry(var_id).or_default().insert(label);
+                }
+            }
+        }
+    }
+    out.push('}');
+    Ok(())
 }
 
 /// Format a single row as a JSON object AND extract type info in one pass.
@@ -368,6 +575,190 @@ fn strip_clause(sparql: &str, keyword: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ------------------------------------------------------------------
+    // Streaming `format_string` parity with the DOM `format` + serde_json.
+    // ------------------------------------------------------------------
+
+    use crate::QueryResult;
+    use fluree_db_core::{FlakeValue, Sid};
+    use fluree_db_query::binding::Binding;
+    use fluree_db_query::var_registry::VarRegistry;
+    use std::collections::HashMap as StdHashMap;
+    use std::sync::Arc;
+
+    fn make_test_compactor() -> IriCompactor {
+        let mut namespaces = StdHashMap::new();
+        namespaces.insert(2, "http://www.w3.org/2001/XMLSchema#".to_string());
+        namespaces.insert(3, "http://www.w3.org/1999/02/22-rdf-syntax-ns#".to_string());
+        namespaces.insert(100, "http://example.org/".to_string());
+        IriCompactor::from_namespaces(Arc::new(namespaces))
+    }
+
+    fn make_result(var_names: &[&str], rows: Vec<Vec<Binding>>) -> QueryResult {
+        let mut vars = VarRegistry::new();
+        let var_ids: Vec<VarId> = var_names.iter().map(|&n| vars.get_or_insert(n)).collect();
+        let mut columns: Vec<Vec<Binding>> = vec![Vec::new(); var_ids.len()];
+        for row in rows {
+            for (col, b) in row.into_iter().enumerate() {
+                columns[col].push(b);
+            }
+        }
+        let batch = fluree_db_query::binding::Batch::new(
+            Arc::from(var_ids.clone().into_boxed_slice()),
+            columns,
+        )
+        .unwrap();
+        QueryResult {
+            vars,
+            t: Some(7),
+            novelty: None,
+            context: crate::ParsedContext::default(),
+            orig_context: None,
+            output: crate::QueryOutput::select_all(var_ids),
+            batches: vec![batch],
+            binary_graph: None,
+        }
+    }
+
+    fn assert_parity(result: &QueryResult, config: &super::super::config::FormatterConfig) {
+        let c = make_test_compactor();
+        let dom = format(result, &c, config).unwrap();
+        let want = serde_json::to_string(&dom).unwrap();
+        let got = format_string(result, &c, config).unwrap();
+        assert_eq!(got, want, "streaming AgentJson diverged from DOM");
+    }
+
+    #[test]
+    fn parity_basic_envelope() {
+        let r = make_result(
+            &["?s", "?n", "?d"],
+            vec![
+                vec![
+                    Binding::sid(Sid::new(100, "alice")),
+                    Binding::lit(
+                        FlakeValue::String("Alice & co".to_string()),
+                        Sid::new(2, "string"),
+                    ),
+                    Binding::lit(FlakeValue::Double(3.13), Sid::new(2, "double")),
+                ],
+                vec![
+                    Binding::sid(Sid::new(100, "bob")),
+                    Binding::lit(FlakeValue::Long(42), Sid::new(2, "long")),
+                    Binding::Unbound,
+                ],
+            ],
+        );
+        assert_parity(&r, &super::super::config::FormatterConfig::agent_json());
+    }
+
+    #[test]
+    fn parity_mixed_types_and_schema_array() {
+        // Same var carries two datatypes across rows -> schema becomes an array.
+        let r = make_result(
+            &["?v"],
+            vec![
+                vec![Binding::lit(FlakeValue::Long(1), Sid::new(2, "long"))],
+                vec![Binding::lit(
+                    FlakeValue::String("x".to_string()),
+                    Sid::new(2, "string"),
+                )],
+            ],
+        );
+        assert_parity(&r, &super::super::config::FormatterConfig::agent_json());
+    }
+
+    #[test]
+    fn parity_empty_results() {
+        let r = make_result(&["?s"], vec![]);
+        assert_parity(&r, &super::super::config::FormatterConfig::agent_json());
+    }
+
+    #[test]
+    fn parity_wildcard_and_grouped() {
+        let mut r = make_result(
+            &["?s", "?g"],
+            vec![vec![
+                Binding::sid(Sid::new(100, "a")),
+                Binding::Grouped(vec![
+                    Binding::lit(FlakeValue::Long(1), Sid::new(2, "long")),
+                    Binding::lit(FlakeValue::Long(2), Sid::new(2, "long")),
+                ]),
+            ]],
+        );
+        r.output = crate::QueryOutput::wildcard();
+        assert_parity(&r, &super::super::config::FormatterConfig::agent_json());
+    }
+
+    #[test]
+    fn parity_budget_truncation() {
+        // Small byte budget so the second/third rows are dropped (has_more).
+        let r = make_result(
+            &["?s", "?label"],
+            vec![
+                vec![
+                    Binding::sid(Sid::new(100, "a")),
+                    Binding::lit(
+                        FlakeValue::String("first row label".to_string()),
+                        Sid::new(2, "string"),
+                    ),
+                ],
+                vec![
+                    Binding::sid(Sid::new(100, "b")),
+                    Binding::lit(
+                        FlakeValue::String("second row label".to_string()),
+                        Sid::new(2, "string"),
+                    ),
+                ],
+                vec![
+                    Binding::sid(Sid::new(100, "c")),
+                    Binding::lit(
+                        FlakeValue::String("third row label".to_string()),
+                        Sid::new(2, "string"),
+                    ),
+                ],
+            ],
+        );
+        let mut config = super::super::config::FormatterConfig::agent_json();
+        config.max_bytes = Some(60);
+        assert_parity(&r, &config);
+    }
+
+    #[test]
+    fn parity_budget_truncation_with_resume() {
+        let r = make_result(
+            &["?s"],
+            vec![
+                vec![Binding::sid(Sid::new(100, "a"))],
+                vec![Binding::sid(Sid::new(100, "b"))],
+                vec![Binding::sid(Sid::new(100, "c"))],
+            ],
+        );
+        let mut config = super::super::config::FormatterConfig::agent_json();
+        config.max_bytes = Some(40);
+        config.agent_json_context = Some(super::super::config::AgentJsonContext {
+            sparql_text: Some("SELECT ?s FROM <mydb:main> WHERE { ?s ?p ?o }".to_string()),
+            from_count: 1,
+            iso_timestamp: Some("2026-03-26T14:30:00Z".to_string()),
+            resume_limit: 100,
+        });
+        assert_parity(&r, &config);
+    }
+
+    #[test]
+    fn parity_json_and_vector_cells() {
+        let r = make_result(
+            &["?j", "?v"],
+            vec![vec![
+                Binding::lit(
+                    FlakeValue::Json(r#"{"k":[1,2]}"#.to_string()),
+                    Sid::new(3, "JSON"),
+                ),
+                Binding::lit(FlakeValue::Vector(vec![1.0, -2.5]), Sid::new(2, "double")),
+            ]],
+        );
+        assert_parity(&r, &super::super::config::FormatterConfig::agent_json());
+    }
 
     #[test]
     fn test_generate_resume_basic() {

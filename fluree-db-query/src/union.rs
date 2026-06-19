@@ -130,6 +130,16 @@ impl UnionOperator {
 
     /// Normalize a batch to the effective schema (pad missing vars with Unbound).
     fn normalize_batch(&self, batch: Batch) -> Result<Batch> {
+        // Variable-free solutions (e.g. an all-bound existence branch like
+        // `<s> a <C>`) carry rows but no columns. `Batch::new` infers the row
+        // count from the first column and so reports len=0 for a zero-column
+        // batch, which would silently drop those existence rows. Preserve the
+        // count explicitly — mirrors join.rs / optional.rs / seed.rs, which use
+        // `empty_schema_with_len` for the same reason.
+        if self.effective_schema.is_empty() {
+            return Ok(Batch::empty_schema_with_len(batch.len()));
+        }
+
         if batch.is_empty() {
             return Ok(Batch::empty(self.effective_schema.clone())?);
         }
@@ -200,6 +210,9 @@ impl UnionOperator {
 
 #[async_trait]
 impl Operator for UnionOperator {
+    fn plan_children(&self) -> Vec<crate::plan_node::PlanChild<'_>> {
+        vec![crate::plan_node::PlanChild::child(self.child.as_ref())]
+    }
     fn schema(&self) -> &[VarId] {
         &self.effective_schema
     }
@@ -296,6 +309,7 @@ impl Operator for UnionOperator {
 
                 branch_op.open(ctx).await?;
                 while let Some(batch) = branch_op.next_batch(ctx).await? {
+                    ctx.check_cancelled()?;
                     if batch.is_empty() {
                         continue;
                     }
@@ -305,6 +319,7 @@ impl Operator for UnionOperator {
                     self.max_output_batch_len = self.max_output_batch_len.max(normalized.len());
                     self.pending_output_rows += normalized.len();
                     self.output_buffer.push_back(normalized);
+                    ctx.check_cancelled()?;
                 }
                 branch_op.close();
             }

@@ -47,9 +47,11 @@ pub struct ReasoningModes {
     ///
     /// Opt-in mode, not enabled by default.
     pub owl_datalog: bool,
-    /// Explicitly disable all reasoning (overrides auto-RDFS)
+    /// Explicitly disable all reasoning.
     ///
-    /// When true, no reasoning is applied even if hierarchy exists.
+    /// Reasoning is opt-in (no mode runs unless requested), so this flag is
+    /// mostly an affirmation — but it also overrides any view- or
+    /// ledger-config-level reasoning default for this query.
     /// This is set by `"reasoning": "none"` in JSON.
     pub explicit_none: bool,
     /// Query-time datalog rules (JSON-LD format)
@@ -74,6 +76,22 @@ pub struct ReasoningModes {
     /// materializer, and merges the resulting flakes into
     /// `ReasoningConfig.schema_bundle` before reasoning runs.
     pub ontology: Option<serde_json::Value>,
+
+    /// OWL2-RL materialization budget: max derived facts before the closure
+    /// is capped. A capped closure is incomplete — queries may silently miss
+    /// entailments — so the cap surfaces in response tracking metadata.
+    ///
+    /// Sources, in precedence order: query (`"reasoningBudget"` key / SPARQL
+    /// `# PRAGMA reasoning-max-facts:`), ledger config
+    /// (`f:reasoningMaxFacts`, subject to override control), server env
+    /// (`FLUREE_REASONING_MAX_FACTS`), built-in default.
+    pub max_facts: Option<u64>,
+
+    /// OWL2-RL materialization budget: max wall-clock seconds before the
+    /// closure is capped. Same sourcing/precedence as [`Self::max_facts`]
+    /// (query key `maxSeconds`, pragma `reasoning-max-seconds:`, config
+    /// `f:reasoningMaxSeconds`, env `FLUREE_REASONING_MAX_SECONDS`).
+    pub max_seconds: Option<u64>,
 }
 
 impl ReasoningModes {
@@ -245,15 +263,52 @@ impl ReasoningModes {
         // Parse query-time ontology (RDFS / OWL axioms supplied
         // inline). Layered on top of f:schemaSource at reasoning
         // prep; doesn't itself flip any mode flag — reasoning is
-        // a separate decision (auto-RDFS still applies if a
-        // schema hierarchy exists).
+        // a separate, explicit decision (the axioms only take
+        // effect when a reasoning mode is requested).
         if let Some(ontology) = query.get("ontology") {
             if !ontology.is_null() {
                 modes.ontology = Some(ontology.clone());
             }
         }
 
+        // Parse the per-query materialization budget. Doesn't flip any mode
+        // flag — it only takes effect when a reasoning mode is requested.
+        if let Some(budget) = query.get("reasoningBudget") {
+            let (max_facts, max_seconds) = Self::parse_budget_json(budget)?;
+            modes.max_facts = max_facts;
+            modes.max_seconds = max_seconds;
+        }
+
         Ok(modes)
+    }
+
+    /// Parse a `"reasoningBudget"` JSON object.
+    ///
+    /// Shape: `{"maxFacts": 20000000, "maxSeconds": 300}` (both optional;
+    /// `max-facts`/`max_facts` variants accepted).
+    fn parse_budget_json(value: &serde_json::Value) -> Result<(Option<u64>, Option<u64>), String> {
+        let serde_json::Value::Object(obj) = value else {
+            if value.is_null() {
+                return Ok((None, None));
+            }
+            return Err("reasoningBudget must be an object".to_string());
+        };
+
+        let field = |names: &[&str]| -> Result<Option<u64>, String> {
+            for name in names {
+                if let Some(v) = obj.get(*name) {
+                    let n = v.as_u64().ok_or_else(|| {
+                        format!("reasoningBudget.{name} must be a non-negative integer")
+                    })?;
+                    return Ok(Some(n));
+                }
+            }
+            Ok(None)
+        };
+
+        let max_facts = field(&["maxFacts", "max-facts", "max_facts"])?;
+        let max_seconds = field(&["maxSeconds", "max-seconds", "max_seconds"])?;
+        Ok((max_facts, max_seconds))
     }
 
     /// Parse a single mode string
@@ -299,6 +354,9 @@ impl ReasoningModes {
         // explicit_none is only set by "none" alone, not merged
         // rules are combined
         self.rules.extend(other.rules.iter().cloned());
+        // budgets: first explicit value wins
+        self.max_facts = self.max_facts.or(other.max_facts);
+        self.max_seconds = self.max_seconds.or(other.max_seconds);
         self
     }
 
@@ -341,28 +399,6 @@ impl ReasoningModes {
     pub fn has_rules(&self) -> bool {
         !self.rules.is_empty()
     }
-
-    /// Compute effective reasoning given available hierarchy
-    ///
-    /// Auto-enables RDFS if:
-    /// - RDFS is not already enabled
-    /// - User didn't explicitly disable reasoning with "none"
-    /// - A schema hierarchy is available
-    ///
-    /// This means other modes (datalog, owl2rl) can be enabled independently
-    /// and RDFS will still be auto-enabled unless explicitly disabled.
-    pub fn effective_with_hierarchy(self, hierarchy_available: bool) -> Self {
-        if self.explicit_none {
-            // User explicitly disabled - no auto-enable
-            return self;
-        }
-        // Auto-enable RDFS if not already enabled and hierarchy exists
-        if !self.rdfs && hierarchy_available {
-            Self { rdfs: true, ..self }
-        } else {
-            self
-        }
-    }
 }
 
 /// Reasoning configuration consumed by the rewriter. Solution modifiers
@@ -373,10 +409,9 @@ pub struct ReasoningConfig {
     /// Reasoning modes for RDFS/OWL reasoning
     ///
     /// Controls pattern expansion based on class/property hierarchies.
-    /// Default is to auto-enable RDFS when hierarchy exists.
-    ///
-    /// Use `modes.effective_with_hierarchy(has_hierarchy)` at execution
-    /// time to compute the actual modes to apply.
+    /// Reasoning is opt-in: no mode runs unless explicitly requested by the
+    /// query (`"reasoning"` key / SPARQL pragma), the view builder, or a
+    /// ledger-config reasoning default.
     pub modes: ReasoningModes,
     /// Pre-resolved schema bundle flakes projected to `g_id=0`.
     ///
@@ -637,43 +672,50 @@ mod tests {
     }
 
     #[test]
-    fn test_reasoning_modes_effective_with_hierarchy_auto_rdfs() {
-        // Default modes (no explicit setting) + hierarchy available = RDFS enabled
+    fn test_reasoning_budget_from_query_json() {
+        let query = serde_json::json!({
+            "reasoning": "owl2rl",
+            "reasoningBudget": {"maxFacts": 20_000_000, "maxSeconds": 300}
+        });
+        let modes = ReasoningModes::from_query_json(&query).unwrap();
+        assert!(modes.owl2rl);
+        assert_eq!(modes.max_facts, Some(20_000_000));
+        assert_eq!(modes.max_seconds, Some(300));
+    }
+
+    #[test]
+    fn test_reasoning_budget_partial_and_variant_keys() {
+        let query = serde_json::json!({"reasoningBudget": {"max-facts": 5}});
+        let modes = ReasoningModes::from_query_json(&query).unwrap();
+        assert_eq!(modes.max_facts, Some(5));
+        assert_eq!(modes.max_seconds, None);
+
+        let query = serde_json::json!({"reasoningBudget": {"max_seconds": 10}});
+        let modes = ReasoningModes::from_query_json(&query).unwrap();
+        assert_eq!(modes.max_facts, None);
+        assert_eq!(modes.max_seconds, Some(10));
+    }
+
+    #[test]
+    fn test_reasoning_budget_invalid_values_error() {
+        for bad in [
+            serde_json::json!({"reasoningBudget": {"maxFacts": -1}}),
+            serde_json::json!({"reasoningBudget": {"maxFacts": "lots"}}),
+            serde_json::json!({"reasoningBudget": [1, 2]}),
+        ] {
+            assert!(
+                ReasoningModes::from_query_json(&bad).is_err(),
+                "expected error for {bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_reasoning_is_opt_in_by_default() {
+        // Default modes request nothing — reasoning must be explicitly enabled
+        // (no auto-RDFS, regardless of whether a schema hierarchy exists).
         let modes = ReasoningModes::default();
-        let effective = modes.effective_with_hierarchy(true);
-        assert!(effective.rdfs);
-    }
-
-    #[test]
-    fn test_reasoning_modes_effective_with_hierarchy_no_auto_without_hierarchy() {
-        // Default modes + no hierarchy = RDFS not enabled
-        let modes = ReasoningModes::default();
-        let effective = modes.effective_with_hierarchy(false);
-        assert!(!effective.rdfs);
-    }
-
-    #[test]
-    fn test_reasoning_modes_effective_explicit_none_overrides_auto() {
-        // Explicit "none" + hierarchy available = RDFS NOT enabled
-        let modes = ReasoningModes::none();
-        let effective = modes.effective_with_hierarchy(true);
-        assert!(!effective.rdfs);
-    }
-
-    #[test]
-    fn test_reasoning_modes_effective_explicit_rdfs_without_hierarchy() {
-        // Explicit RDFS + no hierarchy = RDFS still requested (may warn at runtime)
-        let modes = ReasoningModes::rdfs();
-        let effective = modes.effective_with_hierarchy(false);
-        assert!(effective.rdfs);
-    }
-
-    #[test]
-    fn test_reasoning_modes_effective_preserves_other_modes() {
-        // Auto-RDFS shouldn't affect other modes
-        let modes = ReasoningModes::default().with_datalog();
-        let effective = modes.effective_with_hierarchy(true);
-        assert!(effective.rdfs);
-        assert!(effective.datalog);
+        assert!(!modes.has_any_enabled());
+        assert!(!modes.is_disabled());
     }
 }

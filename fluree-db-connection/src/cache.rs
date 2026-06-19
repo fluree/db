@@ -7,19 +7,30 @@
 //! Tiers (native):
 //! - `< 4 GB`    → 30% (fixed runtime/txn overhead dominates on small hosts)
 //! - `4 – 8 GB`  → 40%
-//! - `≥ 8 GB`    → 50%
+//! - `≥ 8 GB`    → 35%
 
 use tracing::info;
 
 /// Default cache size in MB when memory detection is unavailable (WASM/JS)
 pub const DEFAULT_CACHE_MB_FALLBACK: usize = 1000;
 
+#[cfg(feature = "native")]
+fn cache_fraction_for_total_mb(total_mb: usize) -> (usize, usize, usize) {
+    if total_mb < 4 * 1024 {
+        (3, 10, 30)
+    } else if total_mb < 8 * 1024 {
+        (2, 5, 40)
+    } else {
+        (7, 20, 35)
+    }
+}
+
 /// Calculate the default cache size in MB based on available system memory.
 ///
 /// Uses a tiered fraction of total system memory:
 /// - `< 4 GB`    → 30%
 /// - `4 – 8 GB`  → 40%
-/// - `≥ 8 GB`    → 50%
+/// - `≥ 8 GB`    → 35%
 ///
 /// On WASM, returns a conservative 1000 MB default. If memory detection fails
 /// (sandboxing, permissions), falls back to [`DEFAULT_CACHE_MB_FALLBACK`].
@@ -32,7 +43,10 @@ pub fn default_cache_max_mb() -> usize {
     let mut sys = System::new();
     sys.refresh_memory_specifics(MemoryRefreshKind::everything());
 
-    let total_memory_bytes = sys.total_memory();
+    // Clamp to the cgroup limit so a container sizes its cache to its real
+    // limit, not the host's RAM.
+    let total_memory_bytes =
+        fluree_db_core::sysmem::effective_memory_limit_bytes(sys.total_memory());
 
     if total_memory_bytes == 0 {
         info!(
@@ -43,13 +57,7 @@ pub fn default_cache_max_mb() -> usize {
     }
 
     let total_mb = (total_memory_bytes / (1024 * 1024)) as usize;
-    let (numerator, denominator, pct) = if total_mb < 4 * 1024 {
-        (3, 10, 30)
-    } else if total_mb < 8 * 1024 {
-        (2, 5, 40)
-    } else {
-        (1, 2, 50)
-    };
+    let (numerator, denominator, pct) = cache_fraction_for_total_mb(total_mb);
     let cache_mb = (total_mb * numerator / denominator).max(100);
 
     info!(
@@ -64,4 +72,16 @@ pub fn default_cache_max_mb() -> usize {
 #[cfg(not(feature = "native"))]
 pub fn default_cache_max_mb() -> usize {
     DEFAULT_CACHE_MB_FALLBACK
+}
+
+#[cfg(all(test, feature = "native"))]
+mod tests {
+    use super::cache_fraction_for_total_mb;
+
+    #[test]
+    fn cache_fraction_tiers_keep_large_hosts_at_35_percent() {
+        assert_eq!(cache_fraction_for_total_mb(3 * 1024), (3, 10, 30));
+        assert_eq!(cache_fraction_for_total_mb(6 * 1024), (2, 5, 40));
+        assert_eq!(cache_fraction_for_total_mb(256 * 1024), (7, 20, 35));
+    }
 }

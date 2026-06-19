@@ -18,9 +18,9 @@ use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use super::analyzer::Analyzer;
 use super::index::{Bm25Config, Bm25Index, DocKey, GraphSourceWatermark, PropertyDeps};
 use super::text::extract_text;
+use fluree_db_binary_index::analyzer::Analyzer;
 
 /// Error type for builder operations.
 #[derive(Debug, thiserror::Error)]

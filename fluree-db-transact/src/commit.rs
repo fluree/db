@@ -499,7 +499,7 @@ pub async fn build_commit(
 
     // Apply envelope deltas (namespace + graph) to the in-memory LedgerSnapshot.
     // This must happen before novelty apply so encode_iri() works for graph routing.
-    base.snapshot.apply_envelope_deltas(
+    Arc::make_mut(&mut base.snapshot).apply_envelope_deltas(
         &ns_delta,
         graph_delta.values().map(std::string::String::as_str),
     )?;
@@ -816,16 +816,26 @@ fn finalize_state_with_base(
     }
 
     let mut snapshot = base.snapshot;
-    if let Some(provider) = snapshot.range_provider.as_ref() {
-        if let Some(brp) = provider.as_any().downcast_ref::<BinaryRangeProvider>() {
-            let ns_fallback = Some(Arc::new(snapshot.namespaces().clone()));
-            snapshot.range_provider = Some(Arc::new(BinaryRangeProvider::new(
-                Arc::clone(brp.store()),
-                Arc::clone(&dict_novelty),
-                Arc::clone(&runtime_small_dicts),
-                ns_fallback,
-            )));
-        }
+    // Build the re-attached provider first so the read-borrow of `snapshot`
+    // ends before the `Arc::make_mut` (copy-on-write) assignment below.
+    let new_range_provider: Option<Arc<dyn fluree_db_core::range_provider::RangeProvider>> =
+        snapshot.range_provider.as_ref().and_then(|provider| {
+            provider
+                .as_any()
+                .downcast_ref::<BinaryRangeProvider>()
+                .map(|brp| {
+                    let ns_fallback = Some(snapshot.shared_namespaces());
+                    Arc::new(BinaryRangeProvider::new(
+                        Arc::clone(brp.store()),
+                        Arc::clone(&dict_novelty),
+                        Arc::clone(&runtime_small_dicts),
+                        ns_fallback,
+                    ))
+                        as Arc<dyn fluree_db_core::range_provider::RangeProvider>
+                })
+        });
+    if let Some(rp) = new_range_provider {
+        Arc::make_mut(&mut snapshot).range_provider = Some(rp);
     }
 
     let new_state = LedgerState {

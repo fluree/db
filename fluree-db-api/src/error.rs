@@ -391,6 +391,7 @@ impl ApiError {
             }
             // Builder validation errors
             ApiError::Builder(_) => 400,
+            ApiError::Query(fluree_db_query::QueryError::Cancelled { .. }) => 408,
             // Most errors are client errors (bad input)
             ApiError::Parse(_)
             | ApiError::Query(_)

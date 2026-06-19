@@ -62,16 +62,39 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
             // when the user has no project-local `.fluree/` directory — fall
             // back to global config for remote registration lookups.
             if let Some(remote_name) = remote {
-                if from.is_some() || memory.is_some() {
+                if memory.is_some() {
                     return Err(error::CliError::Usage(
-                        "--remote can only create empty ledgers; \
-                         use `fluree publish <remote> <ledger>` to push local commits to a remote, \
-                         or run `fluree create` locally first then publish."
+                        "--remote cannot import memory history; \
+                         run `fluree create <ledger> --memory ...` locally, then \
+                         `fluree publish <remote> <ledger>`."
                             .to_string(),
                     ));
                 }
                 let fluree_dir = config::require_fluree_dir_or_global(config_path)?;
-                return commands::create::run_remote(&ledger, &remote_name, &fluree_dir).await;
+                return match from.as_deref() {
+                    // `.flpack` archives restore wholesale via the remote's
+                    // import endpoint — the generic "push any local data to a
+                    // server" path (build locally in any format → export to
+                    // .flpack → import here).
+                    Some(path) if commands::create::is_flpack_path(path) => {
+                        commands::create::run_remote_flpack_import(
+                            &ledger,
+                            &remote_name,
+                            path,
+                            &fluree_dir,
+                        )
+                        .await
+                    }
+                    // Other formats can't be bulk-imported server-side yet.
+                    Some(_) => Err(error::CliError::Usage(
+                        "--remote --from supports only .flpack archives; \
+                         for other formats, export to .flpack first \
+                         (`fluree export <ledger> --format ledger -o out.flpack`), \
+                         or create locally then `fluree publish <remote> <ledger>`."
+                            .to_string(),
+                    )),
+                    None => commands::create::run_remote(&ledger, &remote_name, &fluree_dir).await,
+                };
             }
 
             // Local-create paths still require a project `.fluree/` so the
@@ -271,6 +294,32 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
                     track_policy,
                     max_fuel,
                 },
+                &policy,
+            )
+            .await
+        }
+
+        Commands::MultiQuery {
+            args,
+            expr,
+            file,
+            format,
+            normalize_arrays,
+            output,
+            remote,
+            policy,
+        } => {
+            let fluree_dir = config::require_fluree_dir_or_global(config_path)?;
+            commands::multi_query::run(
+                &args,
+                expr.as_deref(),
+                file.as_deref(),
+                &format,
+                normalize_arrays,
+                &output,
+                &fluree_dir,
+                remote.as_deref(),
+                direct,
                 &policy,
             )
             .await

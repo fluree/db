@@ -843,6 +843,43 @@ mod tests {
     }
 
     #[test]
+    fn data_frame_over_cap_decodes_when_cap_raised() {
+        // Mirrors the DBLP restore failure: a single CAS object (a ~256 MiB
+        // dictionary pack) lands just over the per-frame cap, so the producer
+        // emits a frame the reader rejects. The cap is the only gate — the same
+        // frame decodes once the reader's `max_payload` is raised above it.
+        let cid = sample_cid(ContentKind::Commit, b"dict-pack");
+        let payload = vec![0xABu8; 4096];
+        let mut buf = Vec::new();
+        encode_data_frame(&cid, &payload, &mut buf);
+
+        // Rejected when the cap is below the payload size.
+        let err = decode_frame(&buf, 2048).unwrap_err();
+        assert!(matches!(
+            err,
+            PackError::PayloadTooLarge {
+                size: 4096,
+                max: 2048
+            }
+        ));
+
+        // Decodes intact once the cap covers it — the restore path passes a
+        // generous cap (`RESTORE_MAX_FRAME_PAYLOAD`) for exactly this reason.
+        let (frame, consumed) = decode_frame(&buf, 8192).unwrap();
+        assert_eq!(consumed, buf.len());
+        match frame {
+            PackFrame::Data {
+                cid: got,
+                payload: got_payload,
+            } => {
+                assert_eq!(got, cid);
+                assert_eq!(got_payload, payload);
+            }
+            other => panic!("expected Data frame, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_cid_too_large() {
         let mut buf = vec![FRAME_DATA];
         buf.extend_from_slice(&200u16.to_le_bytes());
