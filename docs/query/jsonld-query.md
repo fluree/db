@@ -812,7 +812,7 @@ Edge annotations attach metadata to a specific `(subject, predicate, object)` ed
 - **Inline form** with `@annotation` — match an edge and pull metadata about it.
 - **Annotation-rooted form** with `@reifies` — match metadata first, find the edges it reifies.
 
-`@edge` is a Cypher-oriented alias for `@annotation`; the two are interchangeable. For how to *write* annotations (`@annotation` on insert), the storage model, the cardinality contract, and worked output, see the [Edge annotations](../concepts/edge-annotations.md) concept doc. Note `@reifies` is a **query-side** construct only — user-authored `@reifies` on an insert/update is rejected; write with `@annotation` instead.
+`@edge` is an alias for `@annotation`; the two are interchangeable. For how to *write* annotations (`@annotation` on insert), the storage model, the cardinality contract, and worked output, see the [Edge annotations](../concepts/edge-annotations.md) concept doc. Note `@reifies` is a **query-side** construct only — user-authored `@reifies` on an insert/update is rejected; write with `@annotation` instead.
 
 **Inline form (`@annotation`):**
 
@@ -832,7 +832,7 @@ The `@annotation` block sits inside the object node-map and binds the annotation
 }
 ```
 
-When two parallel annotations reify the same edge, the inline form returns two rows (Cypher fidelity). A bare triple pattern (`?person ex:worksFor ?org` with no `@annotation` block) returns one row regardless of how many annotations exist — annotations only multiply cardinality through the `@annotation` / `@reifies` keywords.
+When two parallel annotations reify the same edge, the inline form returns two rows (property-graph fidelity). A bare triple pattern (`?person ex:worksFor ?org` with no `@annotation` block) returns one row regardless of how many annotations exist — annotations only multiply cardinality through the `@annotation` / `@reifies` keywords.
 
 The annotation subject can be bound to a variable or filtered by an explicit IRI:
 

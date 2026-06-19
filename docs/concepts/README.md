@@ -17,7 +17,7 @@ These concepts build on each other. If you're new to Fluree, read them in this o
 4. [Time Travel](time-travel.md) — Query any point in history
 5. [Branching](ledgers-and-nameservice.md#branching) — Git-like branch, merge, and rebase for your data
 6. [Datasets and Named Graphs](datasets-and-named-graphs.md) — Partition and query across graphs
-7. [Edge Annotations](edge-annotations.md) — Properties on relationships, RDF-star, and LPG fidelity
+7. [Edge Annotations](edge-annotations.md) — Properties on relationships, RDF-star, and property-graph edges
 
 **Differentiating features** (read as needed):
 
@@ -52,7 +52,7 @@ Learn about SPARQL datasets, named graphs, and how Fluree supports multi-graph q
 
 ### [Edge Annotations](edge-annotations.md)
 
-Attach properties to a relationship — role, confidence, since-date — without modeling an intermediate node by hand. Edge annotations cover the property-graph shape, RDF-star / JSON-LD-star asserted-triple annotations, and Cypher relationship properties on a single ergonomic surface, while leaving plain RDF queries untouched.
+Attach properties to a relationship — role, confidence, since-date — without modeling an intermediate node by hand. Edge annotations cover the property-graph shape (relationship properties, parallel edges) and RDF-star / JSON-LD-star asserted-triple annotations on a single ergonomic surface, while leaving plain RDF queries untouched.
 
 ### [Graph Sources](graph-sources.md)
 

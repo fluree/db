@@ -25,3 +25,7 @@ Set up fine-grained access control: department isolation, role-based access, pro
 ### [SHACL Validation](cookbook-shacl.md)
 
 Define data quality constraints: required properties, datatype validation, value ranges, string patterns, cardinality, and allowed values.
+
+### [Edge Annotations](cookbook-edge-annotations.md)
+
+Attach properties to a relationship: model property-graph edges, record statement-level provenance, represent parallel relationships, query inline or annotation-rooted, and understand the retract cascade — in JSON-LD and SPARQL 1.2.

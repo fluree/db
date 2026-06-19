@@ -329,7 +329,7 @@ Attach metadata to a specific edge via an `@annotation` block on the object node
 }
 ```
 
-`@edge` is a Cypher-oriented alias for `@annotation`; the two are interchangeable.
+`@edge` is an alias for `@annotation`; the two are interchangeable.
 
 The annotation subject can be left anonymous (a blank node is minted) or pinned to an explicit IRI for stable identity:
 

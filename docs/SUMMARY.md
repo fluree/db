@@ -57,7 +57,6 @@
   - [Datatypes and typed values](concepts/datatypes.md)
   - [Datasets and named graphs](concepts/datasets-and-named-graphs.md)
   - [Edge annotations](concepts/edge-annotations.md)
-  - [Cypher (openCypher 9 subset)](concepts/cypher.md)
   - [Time travel](concepts/time-travel.md)
   - [Policy enforcement](concepts/policy-enforcement.md)
   - [Verifiable data](concepts/verifiable-data.md)
@@ -69,6 +68,7 @@
   - [Branching and merging](guides/cookbook-branching.md)
   - [Access control policies](guides/cookbook-policies.md)
   - [SHACL validation](guides/cookbook-shacl.md)
+  - [Edge annotations](guides/cookbook-edge-annotations.md)
   - [`owl:imports` across named graphs](guides/cookbook-owl-imports.md)
 
 - [Design](design/README.md)

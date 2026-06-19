@@ -17,7 +17,7 @@ Reach for `@annotation` when you need any of these:
 - **Property-graph-shaped edges.** A `worksFor` relationship needs `role` and `since`. Modeling that as a separate `Employment` node works but distorts the graph.
 - **Provenance / quality on a fact.** "This `ex:hasAuthor` claim has confidence 0.97 from source X." Classic RDF reification with quoted triples.
 - **Multiple parallel relationships** between the same two subjects — e.g. Alice was both an Engineer and later a Manager at Acme. Plain RDF can't distinguish two `ex:worksFor` triples; annotations can.
-- **Cypher / LPG imports.** Relationship properties round-trip without forcing every edge through an intermediate `:Relationship` node.
+- **Property-graph imports.** Relationship properties round-trip without forcing every edge through an intermediate `:Relationship` node.
 
 If a fact is naturally about a *node* (Alice's birthdate, Acme's industry), put it on the node — not on the edge. Annotations are for facts about the *relationship*.
 
@@ -28,7 +28,6 @@ If a fact is naturally about a *node* (Alice's birthdate, Acme's industry), put 
 | **JSON-LD insert / upsert / update** | `@annotation` (or alias `@edge`) on a value object | Most ergonomic. Covers literal-valued edges (with explicit `@type` / `@language`), parallel annotations, named reifiers, body cascades, and **named-graph edges** (an annotation on an edge inside a named graph is written into that same graph, carrying `f:reifiesGraph`). `@reifies` is a query-side construct, **not** an insert form (user-authored `@reifies` on a write is rejected). |
 | **SPARQL 1.2 UPDATE** | `INSERT DATA { :s :p :o {\| ... \|} }`, `~ <reifier>`, optional `INSERT { } WHERE { }` templates | Use this when integrating with SPARQL pipelines or when porting from RDF 1.2 / SPARQL-star. **Default graph only:** an annotation tail inside an explicit `GRAPH { }` block, or under a `WITH <g>` template, is rejected — use the JSON-LD surface for named-graph edge annotations. See [SPARQL 1.2 surface](#sparql-12--rdf-12-surface) below for the per-operation rules. |
 | **Turtle / TriG / N-Triples / N-Quads file ingest** | Not natively (today) | These ingest paths are RDF 1.1 + Fluree extensions; they do **not** parse RDF 1.2 annotation tails (`{\| ... \|}`), the `~` reifier, or `<<( ... )>>` triple terms — a file containing them **fails to parse** with a lexer error (e.g. `unexpected character '~'`). Two routes work: (a) convert your file to JSON-LD before ingesting, or (b) ingest the plain edges first and then add annotations with a follow-up SPARQL `INSERT DATA { :s :p :o {\| ... \|} }` transaction. Either route ends up with the same on-disk shape. |
-| **Cypher / LPG import** | Relationship-property syntax (`-[:T {p:v}]->`) | The storage primitive is in place; the full Cypher front-end (paths, `MERGE`, pattern comprehensions) is a separate workstream. Relationship properties round-trip today through the JSON-LD surface that imports emit. |
 
 The reserved-predicate firewall rejects user-authored `f:reifies*` predicates on normal write surfaces (JSON-LD and SPARQL UPDATE). The way to mint annotations through application writes is `@annotation` / `@edge` (JSON-LD) or the RDF 1.2 annotation tail (`~`, `{| |}`) in SPARQL — not direct `f:reifiesSubject` triples. Bulk import is an administrative bootstrap path: it may ingest already-lowered `f:reifies*` bundles, marks the ledger as annotation-bearing, and lets the indexer seal the annotation arena from those durable facts. Import does **not** validate that input — bundle well-formedness and the single-target invariant (below) are checked at arena-build time and surfaced as a `tracing::warn!` plus a count (`multi_target_annotations`, `observed_malformed_bundle_count`), **not** rejected. Feeding malformed `f:reifies*` data therefore yields a data-quality signal rather than an error, and a malformed bundle can still match a query. Application writes (JSON-LD / SPARQL UPDATE) are validated up front and cannot produce these.
 
@@ -65,7 +64,7 @@ Internally this commits four things atomically:
 3. An attachment row recording that the annotation belongs to that edge.
 4. The annotation properties (`ex:role`, `ex:since`, `ex:confidence`) as ordinary triples on the annotation subject.
 
-`@edge` is accepted as an alias for users coming from LPG; it normalizes to `@annotation`.
+`@edge` is accepted as an alias for `@annotation`; the two are interchangeable.
 
 ### Naming the annotation explicitly
 
@@ -219,7 +218,7 @@ Concretely:
 - `?s ex:worksFor ?o` returns the same rows whether the edge has zero, one, or twenty annotations attached. RDF set semantics are preserved; existing queries don't change behavior just because a ledger started using annotations.
 - `?s ex:worksFor ?o, @annotation { ?ann }` (or any `@annotation` body that binds a variable / matches a property) returns one row per annotation occurrence on each matching edge.
 
-This is what lets a Cypher `MATCH (a)-[r]->(b)` faithfully return parallel-edge rows while leaving plain RDF queries undisturbed.
+This is what lets a property-graph traversal faithfully return parallel-edge rows while leaving plain RDF queries undisturbed.
 
 `select: "*"` follows the same rule — it does not multiply by occurrence count unless the WHERE binds an annotation variable.
 
@@ -276,7 +275,7 @@ The two forms have deliberately different lifecycle behavior. The default is con
 
 The anonymous-hide rule means a user wildcard query against Alice doesn't suddenly start returning a sea of internal annotation SIDs once you adopt edge metadata. Annotations participate in queries that ask for them and stay out of the way otherwise.
 
-The explicit-ID-doesn't-cascade rule protects user-named resources from accidental deletion when an edge gets retracted. Opt out via *LPG mode* (below) when you actually want Cypher's "delete the relationship deletes its properties" semantics.
+The explicit-ID-doesn't-cascade rule protects user-named resources from accidental deletion when an edge gets retracted. Opt out via *LPG mode* (below) when you actually want property-graph "delete the relationship deletes its properties" semantics.
 
 ## Retraction semantics
 
@@ -301,7 +300,7 @@ History preserves both events — query at the pre-retract `t` and the annotatio
 
 ### LPG mode (opt-in per transaction)
 
-For Cypher fidelity — "deleting the relationship deletes the relationship's properties" — set `lpgEdgeLifecycle: true` in transaction options:
+For property-graph relationship lifecycle — "deleting the relationship deletes the relationship's properties" — set `lpgEdgeLifecycle: true` in transaction options:
 
 ```json
 {
@@ -313,7 +312,7 @@ For Cypher fidelity — "deleting the relationship deletes the relationship's pr
 }
 ```
 
-Now explicit-IRI annotations cascade their owned metadata too. Cypher imports default to this mode automatically.
+Now explicit-IRI annotations cascade their owned metadata too.
 
 ### Updating annotation properties
 
@@ -337,7 +336,7 @@ Updating metadata is normal RDF update against the annotation subject. Once you'
 
 In RDF mode, `"@annotation": {}` is a no-op: no annotation subject is minted, no attachment row is written. Inserts stay idempotent at the `(s, p, o)` level.
 
-In LPG mode, an empty block mints a fresh annotation subject — a property-less relationship still has identity, the way Cypher relationships do.
+In LPG mode, an empty block mints a fresh annotation subject — a property-less relationship still has identity, the way property-graph relationships do.
 
 ## SPARQL 1.2 / RDF 1.2 surface
 
@@ -509,26 +508,16 @@ The mandated SPARQL 1.2 `VERSION "1.2"` prologue declaration is **accepted** (le
 
 For the index format, sidecar layout, sort orders, and garbage-collection treatment, see the [Edge annotations design doc](../design/edge-annotations.md).
 
-## Cypher / LPG compatibility
+## Property-graph (LPG) model
 
-The storage primitive supports the property-graph shape directly:
+Edge annotations are the storage primitive for the labeled-property-graph shape: a relationship that carries its own properties, and parallel relationships between the same two nodes. A property-graph relationship with properties maps directly onto an annotated edge —
 
-```cypher
-CREATE
-  (:Person {id: "alice"})
-    -[:WORKS_FOR {role: "Engineer", confidence: 0.97}]->
-  (:Org {id: "acme"})
-```
+- the relationship's properties become the `@annotation` body,
+- the relationship's identity is the annotation subject (anonymous, or pinned with an explicit `@id`),
+- two relationships of the same type between the same endpoints become two parallel annotations (see *Parallel annotations* above),
+- *LPG mode* (`lpgEdgeLifecycle: true`) gives the "delete the relationship deletes its properties" lifecycle property graphs expect.
 
-lowers to the same shape as the JSON-LD insert above. Parallel relationships round-trip:
-
-```cypher
-MATCH (a)-[r:WORKS_FOR]->(b) RETURN a, b, r.role
-```
-
-returns one row per relationship occurrence. Relationship variable `r` corresponds to the annotation subject.
-
-A full Cypher front-end is its own workstream — path values, `MERGE`, pattern comprehensions, and so on still need language and runtime work — but the storage layer is in place and the JSON-LD `@annotation` surface is the same primitive Cypher imports use.
+A dedicated property-graph query/write language front-end is a separate surface and is not part of this release; the JSON-LD `@annotation` surface and the SPARQL 1.2 annotation tail are the supported ways to write and read this shape today.
 
 ## See also
 

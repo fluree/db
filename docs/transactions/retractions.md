@@ -203,7 +203,7 @@ When a transaction retracts a base edge that has annotations attached (see [Inse
 
 - The `f:reifies*` bundle for each currently-asserted annotation on the edge is retracted in the same transaction.
 - Anonymous (blank-node) annotation subjects also have their body metadata retracted, since the synthetic SID is unaddressable once the bundle is gone.
-- Explicit-IRI annotation subjects keep their body metadata as ordinary RDF on the named subject (default RDF mode). To extend cleanup to explicit-IRI annotations as well, set `opts.lpgEdgeLifecycle: true` on the transaction — this matches Cypher's relationship lifecycle.
+- Explicit-IRI annotation subjects keep their body metadata as ordinary RDF on the named subject (default RDF mode). To extend cleanup to explicit-IRI annotations as well, set `opts.lpgEdgeLifecycle: true` on the transaction — this matches the property-graph relationship lifecycle.
 
 **Metadata-only retract** — fires when the user retracts every body fact of an annotation subject without touching the base edge:
 
