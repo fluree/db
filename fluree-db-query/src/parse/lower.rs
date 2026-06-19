@@ -1588,6 +1588,13 @@ fn lower_function_name(name: &str) -> Function {
         // List values & generators (drive UNWIND; also usable in BIND/SELECT)
         "range" => Function::Range,
         "list" | "make-list" | "makelist" => Function::MakeList,
+        // List accessors / transforms
+        "size" => Function::Size,
+        "head" => Function::Head,
+        "last" => Function::Last,
+        "tail" => Function::Tail,
+        "reverse" => Function::Reverse,
+        "nth" => Function::ListIndex,
         // Other
         "bound" => Function::Bound,
         "if" => Function::If,

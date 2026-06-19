@@ -1014,10 +1014,23 @@ Arithmetic operators accept two or more arguments. With multiple arguments, they
 
 ### List Value Functions
 
-Produce list values, chiefly to drive [`unwind`](#unwind-patterns) (also usable in `bind`/`select`):
+Operate on list values — those produced by `range`, `list`, or [`collect`](#aggregation-functions). Usable anywhere expressions are (`bind`, `filter`, `select`), and the list-producing ones drive [`unwind`](#unwind-patterns).
+
+Producers:
 
 - `(range ?start ?end)` / `(range ?start ?end ?step)` - Inclusive integer sequence; `?start > ?end` yields an empty list
 - `(list ?a ?b ...)` - List literal from the given arguments
+
+Accessors / transforms:
+
+- `(size ?list)` - Element count (also the length of a string)
+- `(head ?list)` - First element (null if empty)
+- `(last ?list)` - Last element (null if empty)
+- `(nth ?list ?i)` - Element at 0-based index `?i`; negative indexes count from the end; out-of-range/non-integer/non-list → null
+- `(tail ?list)` - The list without its first element
+- `(reverse ?list)` - The list reversed (also reverses a string)
+
+`head`, `last`, and `nth` return a single element; `tail` and `reverse` return a list (compose them, e.g. `(head (reverse ?xs))`).
 
 ### Vector Similarity Functions
 
