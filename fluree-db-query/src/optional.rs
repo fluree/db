@@ -1162,6 +1162,22 @@ impl OptionalBuilder for PlanTreeOptionalBuilder {
     /// per-seed evaluation is a pure restriction by the correlation tuple
     /// (no internal LIMIT / independent correlation / row-multiplying subquery).
     /// Any unmet gate returns `Ok(None)`, deferring to the per-row `build` path.
+    ///
+    /// Trade-offs (deliberate, and why `FLUREE_OPTIONAL_HASH_JOIN=0` exists):
+    /// - The whole inner result is MATERIALIZED into `buckets`/`key_batches`
+    ///   before any row is emitted — peak memory is the inner output size, not
+    ///   the streaming O(1) of the per-row path. Bounded in practice by the gates
+    ///   plus single-ledger correlation, but unbounded inner outputs are why this
+    ///   is a kill-switchable fast path, not the default for every shape.
+    /// - The inner is rebuilt and re-executed once PER required BATCH (not once
+    ///   globally): there is no cross-batch seed dedup, so a correlation tuple
+    ///   spanning N required batches drives the inner N times. The win is still
+    ///   decisive vs. per-ROW rebuild; a global hash join would need a different
+    ///   operator boundary.
+    /// - Leaving an object-only correlation var unbound (see
+    ///   [`corr_var_only_triple_object`]) can make the seeded inner read MORE
+    ///   than the per-row path when that var is the selective one — the bet is
+    ///   that the scattered object-probe it replaces is the dominant cost.
     async fn build_batch(
         &self,
         required_batch: &Batch,

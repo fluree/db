@@ -1116,6 +1116,33 @@ mod tests {
     }
 
     #[test]
+    fn producer_seed_clears_scan_ratio_cap() {
+        // Coupling guard: `planner::DISTINCT_SUBQUERY_PRODUCER_SELECTIVITY` (the
+        // estimate handed to a downstream object→subject hash join when an
+        // anchored `WITH DISTINCT` producer drives it) is load-bearing precisely
+        // because it must clear this module's scan-ratio cap. Concretely the seed
+        // must keep a probe of `seed × HASH_JOIN_MAX_SCAN_RATIO` rows within
+        // budget — otherwise the hash join the producer ordering exists to unlock
+        // is re-rejected as scan-ratio-too-high.
+        let seed = crate::planner::DISTINCT_SUBQUERY_PRODUCER_SELECTIVITY;
+        // A probe sized between a too-small seed's budget (100 × cap = 102,400)
+        // and the tuned seed's budget (500 × cap = 512,000): accepted at the
+        // tuned seed, rejected if the seed shrinks to 100.
+        let probe = 300_000_u64;
+        assert!(
+            hash_join_cost_wins(Some(probe), Some(seed)),
+            "seed {seed} must keep a {probe}-row probe within the scan-ratio budget \
+             (seed × {HASH_JOIN_MAX_SCAN_RATIO}); lower either constant and this fails"
+        );
+        // Demonstrate the coupling is real: a seed of 100 (the value the planner
+        // doc warns against) re-rejects the same probe.
+        assert!(
+            !hash_join_cost_wins(Some(probe), Some(100.0)),
+            "a 100-row seed must re-reject the probe — proving the tuned seed is load-bearing"
+        );
+    }
+
+    #[test]
     fn cost_gate_fires_for_small_build_star_anchors() {
         // First object-star joins from slow deep-star plans (build -> probe rows):
         // 5,092 -> 7,100; 2,196 -> 35,246; 1,068 -> 7,684.

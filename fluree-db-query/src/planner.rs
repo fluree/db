@@ -70,7 +70,10 @@ const ANCHORED_PROPERTY_PATH_SELECTIVITY: f64 = 100.0;
 /// HAS_CREATOR friend)` probe), so it must stay realistic enough that
 /// `probe_count / driving_est` clears [`hash_join`'s scan-ratio cap](crate::hash_join)
 /// — too small (e.g. 100) re-rejects the very hash join this ordering unlocks.
-const DISTINCT_SUBQUERY_PRODUCER_SELECTIVITY: f64 = 500.0;
+/// That coupling is asserted by `hash_join::tests::producer_seed_clears_scan_ratio_cap`,
+/// which fails if either this value or `HASH_JOIN_MAX_SCAN_RATIO` drifts below
+/// the targeted probe size.
+pub(crate) const DISTINCT_SUBQUERY_PRODUCER_SELECTIVITY: f64 = 500.0;
 /// Full scan - all variables unbound
 const FULL_SCAN: f64 = 1e12;
 
