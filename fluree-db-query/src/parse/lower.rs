@@ -1746,6 +1746,8 @@ fn lower_aggregate_spec(spec: &UnresolvedAggregateSpec, vars: &mut VarRegistry) 
             separator: separator.clone(),
         },
         UnresolvedAggregateFn::Sample => AggregateFn::Sample(input),
+        UnresolvedAggregateFn::Collect => AggregateFn::Collect(input, list),
+        UnresolvedAggregateFn::CollectDistinct => AggregateFn::Collect(input, InputSemantics::Set),
     };
 
     AggregateSpec {

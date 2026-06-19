@@ -617,8 +617,14 @@ pub enum UnresolvedAggregateFn {
     Median,
     Variance,
     Stddev,
-    GroupConcat { separator: String },
+    GroupConcat {
+        separator: String,
+    },
     Sample,
+    /// `collect(?x)` — gather every non-unbound value in the group into a list.
+    Collect,
+    /// `collect-distinct(?x)` — gather distinct non-unbound values into a list.
+    CollectDistinct,
 }
 
 /// Aggregate specification (unresolved)

@@ -1127,8 +1127,14 @@ Filter grouped results:
 - `(variance ?var)` / `(stddev ?var)` — population variance / standard deviation
 - `(sample ?var)` — implementation-defined sample value
 - `(groupconcat ?var)` / `(groupconcat ?var ", ")` — concatenate string values, optional separator (defaults to a single space)
+- `(collect ?var)` — gather every non-null value in the group into a **list value** (a JSON array), keeping row-level duplicates
+- `(collect-distinct ?var)` — like `collect`, but deduplicates within the group
 
 Each aggregate auto-aliases to `?<fn-name>` (`?count`, `?sum`, …). Use `(as (<fn> ?var) ?alias)` to choose an explicit alias.
+
+`collect` is the inverse of [`unwind`](#unwind-patterns): it folds many rows into one list, and `unwind` fans a list back out into rows. A `collect` result is a first-class list value, so it can be re-expanded — e.g. a sub-select that `collect`s values, with an outer `unwind` over the result.
+
+> Note: in RDF a repeated *identical* value is a single triple, so `collect` and `collect-distinct` differ only when the same value reaches the aggregate on multiple solution rows (typically via a join).
 
 ## Time Travel Queries
 

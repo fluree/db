@@ -722,6 +722,9 @@ fn is_aggregate_name(name: &str) -> bool {
             | "sample"
             | "group-concat"
             | "groupconcat"
+            | "collect"
+            | "collect-distinct"
+            | "collectdistinct"
     )
 }
 
@@ -916,6 +919,10 @@ fn parse_aggregate_fn_and_input(
                 "variance" => ast::UnresolvedAggregateFn::Variance,
                 "stddev" => ast::UnresolvedAggregateFn::Stddev,
                 "sample" => ast::UnresolvedAggregateFn::Sample,
+                "collect" => ast::UnresolvedAggregateFn::Collect,
+                "collect-distinct" | "collectdistinct" => {
+                    ast::UnresolvedAggregateFn::CollectDistinct
+                }
                 other => return Err(ParseError::UnknownAggregate(other.to_string())),
             };
             if args.len() != 1 {
