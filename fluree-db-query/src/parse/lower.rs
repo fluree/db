@@ -24,7 +24,8 @@ use crate::ir::{
 };
 use crate::ir::{
     Expression, Function, IndexSearchPattern, IndexSearchTarget, PathModifier, Pattern,
-    PropertyPathPattern, SubqueryPattern, VectorSearchPattern, VectorSearchTarget,
+    PropertyPathPattern, ShortestPathPattern, SubqueryPattern, VectorSearchPattern,
+    VectorSearchTarget,
 };
 use crate::sort::{SortDirection, SortSpec};
 use crate::var_registry::{VarId, VarRegistry};
@@ -270,6 +271,49 @@ pub fn lower_unresolved_pattern<E: IriEncoder>(
                 var: var_id,
                 list: lowered_expr,
             }])
+        }
+        UnresolvedPattern::ShortestPath {
+            start,
+            end,
+            predicate,
+            direction,
+            mode,
+            path_var,
+            min_hops,
+            max_hops,
+        } => {
+            let start_ref = lower_ref_term(start, encoder, vars)?;
+            let end_ref = lower_ref_term(end, encoder, vars)?;
+            let path_var_id = vars.get_or_insert(path_var);
+            match encoder.encode_iri(predicate) {
+                Some(predicate) => Ok(vec![Pattern::ShortestPath(ShortestPathPattern {
+                    start: start_ref,
+                    end: end_ref,
+                    predicate,
+                    direction: *direction,
+                    mode: *mode,
+                    path_var: path_var_id,
+                    min_hops: *min_hops,
+                    max_hops: *max_hops,
+                })]),
+                // Predicate IRI not in the dictionary → no edges of that type
+                // exist → the search yields no rows.
+                None => {
+                    let mut bound = Vec::new();
+                    for r in [&start_ref, &end_ref] {
+                        if let Ref::Var(v) = r {
+                            if !bound.contains(v) {
+                                bound.push(*v);
+                            }
+                        }
+                    }
+                    bound.push(path_var_id);
+                    Ok(vec![Pattern::Values {
+                        vars: bound,
+                        rows: Vec::new(),
+                    }])
+                }
+            }
         }
         UnresolvedPattern::Values { vars: v, rows } => {
             let var_ids: Vec<VarId> = v.iter().map(|name| vars.get_or_insert(name)).collect();
@@ -1595,6 +1639,9 @@ fn lower_function_name(name: &str) -> Function {
         "tail" => Function::Tail,
         "reverse" => Function::Reverse,
         "nth" => Function::ListIndex,
+        // Path-value accessors (consume a shortestPath result)
+        "nodes" => Function::Nodes,
+        "path-pairs" | "pathpairs" => Function::PathPairs,
         // Other
         "bound" => Function::Bound,
         "if" => Function::If,

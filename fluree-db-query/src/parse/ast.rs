@@ -10,6 +10,7 @@
 //! - Bind expressions (computed values)
 //! - Values blocks (inline data)
 
+use crate::ir::path::{PathDirection, ShortestPathMode};
 use crate::parse::IriEncoder;
 use fluree_db_core::DatatypeConstraint;
 use fluree_graph_json_ld::ParsedContext;
@@ -985,6 +986,20 @@ pub enum UnresolvedPattern {
         var: Arc<str>,
         expr: UnresolvedExpression,
     },
+    /// Anchored shortest-path search (`shortestPath` / `allShortestPaths`):
+    /// bind `path_var` to the shortest path(s) between `start` and `end` over a
+    /// single predicate. `predicate` is an expanded IRI resolved to a Sid at
+    /// lowering (an unresolvable predicate yields no rows).
+    ShortestPath {
+        start: UnresolvedTerm,
+        end: UnresolvedTerm,
+        predicate: Arc<str>,
+        direction: PathDirection,
+        mode: ShortestPathMode,
+        path_var: Arc<str>,
+        min_hops: Option<u32>,
+        max_hops: Option<u32>,
+    },
     /// Inline VALUES block - constant rows to join with the current solution stream
     Values {
         /// Variables defined by VALUES (column order)
@@ -1263,6 +1278,7 @@ impl UnresolvedQuery {
                     UnresolvedPattern::Filter(_)
                     | UnresolvedPattern::Bind { .. }
                     | UnresolvedPattern::Unwind { .. }
+                    | UnresolvedPattern::ShortestPath { .. }
                     | UnresolvedPattern::Values { .. }
                     | UnresolvedPattern::Path { .. }
                     | UnresolvedPattern::Subquery(_)

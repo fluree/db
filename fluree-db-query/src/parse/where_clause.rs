@@ -35,10 +35,11 @@
 //! }
 //! ```
 
-use super::ast::UnresolvedPattern;
+use super::ast::{UnresolvedPattern, UnresolvedTerm};
 use super::error::{ParseError, Result};
 use super::policy::JsonLdParseCtx;
 use super::{node_map, parse_query_ast_internal, values, UnresolvedQuery};
+use crate::ir::path::{PathDirection, ShortestPathMode};
 use serde_json::Value as JsonValue;
 use std::sync::Arc;
 
@@ -53,6 +54,18 @@ fn validate_var_name(name: &str) -> Result<()> {
         return Err(ParseError::InvalidVariable(name.to_string()));
     }
     Ok(())
+}
+
+/// Parse a shortest-path endpoint: a variable (`?x`) or a constant IRI
+/// (expanded through the context's `@base`, like a subject `@id`).
+fn parse_path_endpoint(s: &str, ctx: &JsonLdParseCtx) -> Result<UnresolvedTerm> {
+    if s.starts_with('?') {
+        validate_var_name(s)?;
+        Ok(UnresolvedTerm::var(s))
+    } else {
+        let (expanded, _) = ctx.expand_id(s)?;
+        Ok(UnresolvedTerm::iri(expanded))
+    }
 }
 
 /// Parse WHERE clause with explicit counters for generating implicit variables
@@ -217,6 +230,75 @@ pub fn parse_where_array_element(
             query.patterns.push(UnresolvedPattern::Unwind {
                 var: Arc::from(var),
                 expr,
+            });
+            Ok(())
+        }
+        "shortestpath" | "allshortestpaths" => {
+            // ["shortestPath", {"from": ?a, "to": ?b, "via": "ex:knows",
+            //   "bind": ?path, "direction": out|in|both,
+            //   "minHops": n, "maxHops": n}]
+            let mode = if keyword_lower == "shortestpath" {
+                ShortestPathMode::Single
+            } else {
+                ShortestPathMode::All
+            };
+            if arr.len() != 2 {
+                return Err(ParseError::InvalidWhere(format!(
+                    "{keyword} requires exactly one config-object argument"
+                )));
+            }
+            let obj = arr[1].as_object().ok_or_else(|| {
+                ParseError::InvalidWhere(format!("{keyword} argument must be an object"))
+            })?;
+            let get_str = |key: &str| -> Result<&str> {
+                obj.get(key).and_then(|v| v.as_str()).ok_or_else(|| {
+                    ParseError::InvalidWhere(format!("{keyword} requires a string '{key}'"))
+                })
+            };
+
+            // Endpoints: a variable (`?x`) or a constant IRI (subject position).
+            let start = parse_path_endpoint(get_str("from")?, ctx)?;
+            let end = parse_path_endpoint(get_str("to")?, ctx)?;
+            // Predicate IRI is expanded through @vocab.
+            let (predicate, _) = ctx.expand_vocab(get_str("via")?)?;
+            let path_var = get_str("bind")?;
+            validate_var_name(path_var)?;
+
+            let direction = match obj.get("direction").and_then(|v| v.as_str()) {
+                None | Some("out" | "outgoing") => PathDirection::Outgoing,
+                Some("in" | "incoming") => PathDirection::Incoming,
+                Some("both" | "either" | "undirected") => PathDirection::Either,
+                Some(other) => {
+                    return Err(ParseError::InvalidWhere(format!(
+                        "shortestPath 'direction' must be out|in|both, got '{other}'"
+                    )))
+                }
+            };
+
+            let hops = |key: &str| -> Result<Option<u32>> {
+                match obj.get(key) {
+                    None => Ok(None),
+                    Some(v) => v
+                        .as_u64()
+                        .and_then(|n| u32::try_from(n).ok())
+                        .map(Some)
+                        .ok_or_else(|| {
+                            ParseError::InvalidWhere(format!(
+                                "shortestPath '{key}' must be a non-negative integer"
+                            ))
+                        }),
+                }
+            };
+
+            query.patterns.push(UnresolvedPattern::ShortestPath {
+                start,
+                end,
+                predicate: Arc::from(predicate.as_str()),
+                direction,
+                mode,
+                path_var: Arc::from(path_var),
+                min_hops: hops("minHops")?,
+                max_hops: hops("maxHops")?,
             });
             Ok(())
         }
