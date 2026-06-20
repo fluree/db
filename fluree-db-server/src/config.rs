@@ -1027,6 +1027,32 @@ impl ServerConfig {
                     "raft.enabled=true is incompatible with storage-access-mode=proxy".to_string(),
                 );
             }
+            // The raft log + snapshot tree (raft_storage_path) and
+            // the ledger content store (storage_path) both manage
+            // their own directory layouts; overlapping them lets
+            // either side blow away the other's files on
+            // compaction/eviction, and tends to surface only after a
+            // restart corrupts state. Catch the misconfiguration up
+            // front rather than mid-recovery. Comparison is lexical
+            // (the dirs may not exist yet at validation time, so
+            // `canonicalize` would fail); operators using symlink
+            // aliasing tricks bypass this knowingly.
+            if let (Some(raft_path), Some(storage_path)) =
+                (self.raft_storage_path.as_ref(), self.storage_path.as_ref())
+            {
+                if raft_path == storage_path
+                    || raft_path.starts_with(storage_path)
+                    || storage_path.starts_with(raft_path)
+                {
+                    return Err(format!(
+                        "raft.storage_path ({}) must not equal or be nested under \
+                         storage.path ({}) (or vice versa) — the raft log + state-machine \
+                         snapshots and ledger content store need disjoint filesystem subtrees",
+                        raft_path.display(),
+                        storage_path.display(),
+                    ));
+                }
+            }
         }
 
         // Peer mode validation
@@ -1170,4 +1196,71 @@ fn shellexpand(path: &str) -> String {
         }
     }
     path.to_string()
+}
+
+#[cfg(all(test, feature = "raft"))]
+mod raft_validation_tests {
+    use super::*;
+    use std::net::SocketAddr;
+    use std::path::PathBuf;
+
+    fn raft_enabled_base() -> ServerConfig {
+        let mut cfg = ServerConfig::default();
+        cfg.raft_enabled = true;
+        cfg.raft_node_id = Some(1);
+        cfg.raft_listen_addr = Some(SocketAddr::from(([127, 0, 0, 1], 9001)));
+        cfg
+    }
+
+    #[test]
+    fn rejects_equal_raft_and_storage_paths() {
+        let mut cfg = raft_enabled_base();
+        cfg.storage_path = Some(PathBuf::from("/var/lib/fluree"));
+        cfg.raft_storage_path = Some(PathBuf::from("/var/lib/fluree"));
+        let err = cfg.validate().expect_err("must reject identical paths");
+        assert!(
+            err.contains("raft.storage_path") && err.contains("storage.path"),
+            "unexpected error message: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_raft_nested_under_storage() {
+        let mut cfg = raft_enabled_base();
+        cfg.storage_path = Some(PathBuf::from("/var/lib/fluree"));
+        cfg.raft_storage_path = Some(PathBuf::from("/var/lib/fluree/raft"));
+        let err = cfg.validate().expect_err("must reject nested raft path");
+        assert!(err.contains("disjoint"), "unexpected error message: {err}");
+    }
+
+    #[test]
+    fn rejects_storage_nested_under_raft() {
+        let mut cfg = raft_enabled_base();
+        cfg.raft_storage_path = Some(PathBuf::from("/srv/raft"));
+        cfg.storage_path = Some(PathBuf::from("/srv/raft/data"));
+        let err = cfg
+            .validate()
+            .expect_err("must reject nested storage path");
+        assert!(err.contains("disjoint"), "unexpected error message: {err}");
+    }
+
+    #[test]
+    fn accepts_disjoint_paths() {
+        let mut cfg = raft_enabled_base();
+        cfg.storage_path = Some(PathBuf::from("/var/lib/fluree/data"));
+        cfg.raft_storage_path = Some(PathBuf::from("/var/lib/fluree/raft"));
+        cfg.validate()
+            .expect("sibling dirs should validate cleanly");
+    }
+
+    #[test]
+    fn accepts_raft_without_local_storage_path() {
+        // Connection-config-driven deployments don't set
+        // `storage_path` at all — the disjoint check should noop.
+        let mut cfg = raft_enabled_base();
+        cfg.raft_storage_path = Some(PathBuf::from("/var/lib/fluree/raft"));
+        cfg.storage_path = None;
+        cfg.validate()
+            .expect("missing storage_path should skip the disjoint check");
+    }
 }
