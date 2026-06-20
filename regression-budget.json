@@ -48,6 +48,16 @@
         "tiny": 10.0,
         "small": 5.0,
         "medium": 3.0
+      },
+      "annotation_hydration": {
+        "tiny": 10.0,
+        "small": 5.0,
+        "medium": 5.0
+      },
+      "annotation_planner": {
+        "tiny": 10.0,
+        "small": 5.0,
+        "medium": 5.0
       }
     },
     "fluree-db-query": {
