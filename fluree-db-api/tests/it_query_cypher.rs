@@ -1580,6 +1580,118 @@ async fn cypher_untyped_path_incoming_direction() {
 }
 
 #[tokio::test]
+async fn cypher_map_literal_projection_renders_native_object() {
+    // `RETURN {…}` builds a map value; cypher-json renders it as a native JSON
+    // object with bare scalars (not RDF value-objects).
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = genesis_ledger(&fluree, "it/cypher:map-literal");
+    let l = fluree
+        .transact_cypher(l, r#"CREATE (p:Person {name: "Alice", age: 30})"#)
+        .await
+        .expect("seed")
+        .ledger;
+    let db = graphdb_from_ledger(&l);
+    let cj = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (p:Person {name: "Alice"})
+               RETURN {name: p.name, age: p.age} AS person"#,
+        )
+        .await
+        .expect("query")
+        .to_cypher_json_async(db.as_graph_db_ref())
+        .await
+        .expect("cypher json");
+    assert_eq!(
+        cj["results"][0]["data"][0]["row"][0],
+        json!({"name": "Alice", "age": 30}),
+        "map literal → native object: {cj}"
+    );
+}
+
+#[tokio::test]
+async fn cypher_properties_and_keys() {
+    // properties(n) → a map of all data properties; keys(n) → their names. Both
+    // exclude the label (rdf:type) and any relationship edges.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = genesis_ledger(&fluree, "it/cypher:properties");
+    let l = fluree
+        .transact_cypher(
+            l,
+            r#"CREATE (a:Person {name: "Alice", age: 30})-[:KNOWS]->(b:Person {name: "Bob"})"#,
+        )
+        .await
+        .expect("seed")
+        .ledger;
+    let db = graphdb_from_ledger(&l);
+
+    // properties(a): name + age only — not the :Person label, not the KNOWS edge.
+    let props = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (a:Person {name: "Alice"}) RETURN properties(a) AS p"#,
+        )
+        .await
+        .expect("query")
+        .to_cypher_json_async(db.as_graph_db_ref())
+        .await
+        .expect("cypher json");
+    assert_eq!(
+        props["results"][0]["data"][0]["row"][0],
+        json!({"name": "Alice", "age": 30}),
+        "properties() is data-only: {props}"
+    );
+
+    // keys(a): the property names, sorted.
+    let keys = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (a:Person {name: "Alice"}) RETURN keys(a) AS k"#,
+        )
+        .await
+        .expect("query")
+        .to_cypher_json_async(db.as_graph_db_ref())
+        .await
+        .expect("cypher json");
+    assert_eq!(
+        keys["results"][0]["data"][0]["row"][0],
+        json!(["age", "name"]),
+        "keys() is the sorted property names: {keys}"
+    );
+}
+
+#[tokio::test]
+async fn cypher_object_param_used_as_map_value() {
+    // An object `$param` substitutes to a map value usable in a projection.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = genesis_ledger(&fluree, "it/cypher:map-param");
+    let l = fluree
+        .transact_cypher(l, r#"CREATE (p:Person {name: "Alice"})"#)
+        .await
+        .expect("seed")
+        .ledger;
+    let db = graphdb_from_ledger(&l);
+    let params: fluree_db_cypher::ParamMap =
+        serde_json::from_value(json!({"filter": {"city": "NYC", "zip": 10001}})).expect("params");
+    let cj = fluree
+        .query_cypher_with_params(
+            &db,
+            r#"MATCH (p:Person {name: "Alice"}) RETURN $filter AS f"#,
+            Some(&params),
+        )
+        .await
+        .expect("query")
+        .to_cypher_json_async(db.as_graph_db_ref())
+        .await
+        .expect("cypher json");
+    assert_eq!(
+        cj["results"][0]["data"][0]["row"][0],
+        json!({"city": "NYC", "zip": 10001}),
+        "object param → map value: {cj}"
+    );
+}
+
+#[tokio::test]
 async fn transact_cypher_merge_creates_then_is_a_noop() {
     // MERGE = find-or-create: the first run creates the node, the second run
     // finds the existing one and inserts nothing (single-Txn NOT EXISTS guard).

@@ -495,6 +495,24 @@ pub(crate) fn binding_to_group_key_owned(binding: &Binding) -> GroupKeyOwned {
         Binding::List(items) => {
             GroupKeyOwned::Seq(items.iter().map(binding_to_group_key_owned).collect())
         }
+        // A map groups per distinct {key→value} set: each entry contributes its
+        // key string (sentinel namespace) and its value key. Sorted by key so the
+        // group key is order-insensitive, matching map equality/hash.
+        Binding::Map(entries) => {
+            let mut sorted: Vec<_> = entries.iter().collect();
+            sorted.sort_by(|x, y| x.0.cmp(&y.0));
+            GroupKeyOwned::Seq(
+                sorted
+                    .into_iter()
+                    .map(|(k, v)| {
+                        GroupKeyOwned::Seq(vec![
+                            GroupKeyOwned::MaterializedSid(u16::MAX, k.clone()),
+                            binding_to_group_key_owned(v),
+                        ])
+                    })
+                    .collect(),
+            )
+        }
     }
 }
 

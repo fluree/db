@@ -226,6 +226,19 @@ fn write_value(
             }
             out.push(']');
         }
+        // A map renders as a JSON object of its (typed) values.
+        Binding::Map(entries) => {
+            out.push('{');
+            for (i, (k, v)) in entries.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                push_json_string(out, k);
+                out.push(':');
+                write_value(out, result, v, compactor)?;
+            }
+            out.push('}');
+        }
         Binding::EncodedLit { .. } | Binding::EncodedSid { .. } | Binding::EncodedPid { .. } => {
             unreachable!("encoded bindings are materialized before write_value")
         }
@@ -521,6 +534,14 @@ pub(crate) fn format_binding(
                 .map(|v| format_binding(result, v, compactor))
                 .collect();
             Ok(JsonValue::Array(arr?))
+        }
+        // A map - object of its (typed) values.
+        Binding::Map(entries) => {
+            let mut obj = serde_json::Map::with_capacity(entries.len());
+            for (k, v) in entries {
+                obj.insert(k.to_string(), format_binding(result, v, compactor)?);
+            }
+            Ok(JsonValue::Object(obj))
         }
     }
 }

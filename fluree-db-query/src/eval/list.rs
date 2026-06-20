@@ -180,6 +180,8 @@ pub fn eval_list_fn_to_binding<R: RowAccess>(
     match func {
         Function::ListIndex => Ok(Some(eval_list_index_to_binding(args, row, ctx)?)),
         Function::Labels => Ok(Some(metadata::eval_labels_to_binding(args, row, ctx)?)),
+        Function::Keys => Ok(Some(metadata::eval_keys_to_binding(args, row, ctx)?)),
+        Function::Properties => Ok(Some(metadata::eval_properties_to_binding(args, row, ctx)?)),
         Function::Nodes => {
             // The node sequence of a path value, as a list of node refs.
             let arg = arity1(args, "nodes")?;

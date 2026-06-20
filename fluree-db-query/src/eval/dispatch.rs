@@ -196,7 +196,9 @@ impl Function {
             | Function::Nodes
             | Function::Range
             | Function::PathPairs
-            | Function::Labels => Ok(None),
+            | Function::Labels
+            | Function::Keys
+            | Function::Properties => Ok(None),
 
             // Unknown function
             Function::Custom(name) => Err(QueryError::InvalidFilter(format!(

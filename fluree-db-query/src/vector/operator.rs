@@ -200,6 +200,7 @@ impl VectorSearchOperator {
                     | Binding::Grouped(_)
                     | Binding::Path(_)
                     | Binding::List(_)
+                    | Binding::Map(_)
                     | Binding::EncodedSid { .. }
                     | Binding::EncodedPid { .. },
                 ) => Ok(None),

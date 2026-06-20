@@ -743,6 +743,9 @@ impl<'a> CypherLowering<'a> {
                 };
                 Ok(unresolved_call(func, args))
             }
+            Expr::Map(_, _) => Err(LowerCypherError::unsupported(
+                "map literals in a write MATCH WHERE are not supported",
+            )),
             Expr::Case(_) | Expr::Exists(_, _, _) => Err(LowerCypherError::unsupported(
                 "CASE and EXISTS in write MATCH WHERE are deferred",
             )),

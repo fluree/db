@@ -238,6 +238,17 @@ ORDER BY / SKIP / LIMIT
   IC14-style weighted path scoring — `reduce` over per-edge interaction
   counts becomes unwind-pairs → OPTIONAL MATCH → `count` → `sum`, grouped
   by the carried path.
+- Map **values**: a map literal `{k: expr, …}` in expression position
+  (`RETURN {name: n.name, age: n.age} AS person`), `properties(n)` (all of a
+  node's data properties as a map — excluding labels, relationships, and the
+  reifier sidecar; a multi-valued property becomes a list), `keys(n)` (the
+  property names as a sorted list), and object `$params`
+  (`$filter = {city: "NYC"}`). A map carries in a `Binding::Map` and renders as
+  a JSON object — native (`{"name": "Alice"}`) in cypher-json. Map identity
+  (DISTINCT / grouping) is key-order-insensitive; display preserves insertion
+  order; duplicate literal keys resolve last-wins. Maps are projection/value
+  constructs only — not RDF terms, so they can't be matched, indexed, or stored
+  via `SET n.prop = {…}`.
 - Aggregates: `count(*)`, `count(x)`, `count(DISTINCT x)`,
   `sum(x)`, `avg(x)`, `min(x)`, `max(x)`. Arguments may be a bare
   variable (`count(n)`), a property accessor (`avg(n.age)`), a list
@@ -347,10 +358,10 @@ produces a clear error rather than a silent wrong answer.
 
 **Functions**
 
-- `relationships(p)`, `keys(x)`, `properties(x)`,
-  `id(x)`, and map functions generally; map/object parameters.
-  (`labels(n)`, `type(r)`, `nodes(p)`, `pathPairs(p)`, and the list functions
-  *are* supported — see above.)
+- `relationships(p)`, `id(x)`, `point`, `distance`.
+  (`labels(n)`, `type(r)`, `nodes(p)`, `pathPairs(p)`, `keys(n)`,
+  `properties(n)`, map literals (`{k: v}`), object `$params`, and the list
+  functions *are* supported — see above.)
 
 **Expressions**
 

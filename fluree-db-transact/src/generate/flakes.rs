@@ -260,7 +260,7 @@ impl<'a> FlakeGenerator<'a> {
                         Binding::Grouped(_) => Err(TransactError::InvalidTerm(
                             "Subject cannot be a grouped value (GROUP BY output)".to_string(),
                         )),
-                        Binding::Path(_) | Binding::List(_) => Err(TransactError::InvalidTerm(
+                        Binding::Path(_) | Binding::List(_) | Binding::Map(_) => Err(TransactError::InvalidTerm(
                             "Subject cannot be a path or list value".to_string(),
                         )),
                         Binding::Lit { .. } => Err(TransactError::InvalidTerm(
@@ -315,7 +315,7 @@ impl<'a> FlakeGenerator<'a> {
                         Binding::Grouped(_) => Err(TransactError::InvalidTerm(
                             "Predicate cannot be a grouped value (GROUP BY output)".to_string(),
                         )),
-                        Binding::Path(_) | Binding::List(_) => Err(TransactError::InvalidTerm(
+                        Binding::Path(_) | Binding::List(_) | Binding::Map(_) => Err(TransactError::InvalidTerm(
                             "Predicate cannot be a path or list value".to_string(),
                         )),
                         Binding::Lit { .. } => Err(TransactError::InvalidTerm(
@@ -392,7 +392,7 @@ impl<'a> FlakeGenerator<'a> {
                         Binding::Grouped(_) => Err(TransactError::InvalidTerm(
                             "Object cannot be a grouped value (GROUP BY output)".to_string(),
                         )),
-                        Binding::Path(_) | Binding::List(_) => Err(TransactError::InvalidTerm(
+                        Binding::Path(_) | Binding::List(_) | Binding::Map(_) => Err(TransactError::InvalidTerm(
                             "Object cannot be a path or list value".to_string(),
                         )),
                         Binding::Iri(_) => Err(TransactError::InvalidTerm(

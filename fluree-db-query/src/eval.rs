@@ -69,6 +69,9 @@ impl Expression {
 
             Expression::Call { func, args } => func.eval_to_bool(args, row, ctx),
 
+            // A map's effective boolean value: non-empty is truthy.
+            Expression::Map(_) => Ok((&self.try_eval_to_binding(row, ctx)?).into()),
+
             // EXISTS subexpressions in compound filters are pre-evaluated by the
             // FilterOperator and replaced with Const(Bool) before this is called.
             // If we reach here, it means the EXISTS was not pre-evaluated (bug).
@@ -181,7 +184,7 @@ impl Expression {
                 // A path or list is not a scalar — no comparable value. The
                 // relevant functions (`length`, `size`/`head`/…) read the
                 // binding directly via dispatch / the binding-producing path.
-                Some(Binding::Path(_) | Binding::List(_)) => Ok(None),
+                Some(Binding::Path(_) | Binding::List(_) | Binding::Map(_)) => Ok(None),
             },
 
             // FlakeValue::Null is the only variant TryFrom rejects (with
@@ -189,6 +192,10 @@ impl Expression {
             Expression::Const(val) => Ok(val.try_into().ok()),
 
             Expression::Call { func, args } => func.eval(args, row, ctx),
+
+            // A map is a structured value, not a scalar — no comparable form.
+            // Map-consuming contexts read the binding via `try_eval_to_binding`.
+            Expression::Map(_) => Ok(None),
 
             // EXISTS: pre-evaluated by FilterOperator; shouldn't reach here
             Expression::Exists { .. } => {
@@ -261,9 +268,24 @@ impl Expression {
         // preserve the list. Scalars fall through to the comparable path so
         // their normalization is unchanged.
         if let Expression::Var(v) = self {
-            if let Some(b @ Binding::List(_)) = row.get(*v) {
+            if let Some(b @ (Binding::List(_) | Binding::Map(_))) = row.get(*v) {
                 return Ok(b.clone());
             }
+        }
+
+        // A map literal builds a `Binding::Map` directly (values evaluated per
+        // row, insertion order preserved, duplicate keys resolved last-wins).
+        if let Expression::Map(entries) = self {
+            let mut out: Vec<(Arc<str>, Binding)> = Vec::with_capacity(entries.len());
+            for (key, value_expr) in entries {
+                let value = value_expr.try_eval_to_binding(row, ctx)?;
+                if let Some(slot) = out.iter_mut().find(|(k, _)| k == key) {
+                    slot.1 = value; // last-wins
+                } else {
+                    out.push((Arc::clone(key), value));
+                }
+            }
+            return Ok(Binding::Map(out));
         }
 
         // List-*returning* functions (tail, list-reverse) and list literals

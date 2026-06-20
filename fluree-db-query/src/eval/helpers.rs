@@ -253,6 +253,16 @@ fn bool_predicate_var_usage(expr: &Expression) -> VarUsage {
             }
             vars
         }
+        Expression::Map(entries) => {
+            let mut vars = VarUsage::None;
+            for (_, v) in entries {
+                vars = merge_var_usage(vars, bool_predicate_var_usage(v));
+                if matches!(vars, VarUsage::Multiple) {
+                    return VarUsage::Multiple;
+                }
+            }
+            vars
+        }
     }
 }
 
@@ -338,7 +348,7 @@ fn analyze_bool_cache_inner(expr: &Expression, state: &mut impl Hasher) -> BoolC
                 may_materialize: false,
             }
         }
-        Expression::Exists { .. } => BoolCacheAnalysis {
+        Expression::Exists { .. } | Expression::Map(_) => BoolCacheAnalysis {
             expr_hash: state.finish(),
             vars: VarUsage::None,
             supported: false,

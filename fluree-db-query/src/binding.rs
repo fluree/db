@@ -195,6 +195,16 @@ pub enum Binding {
     /// rejects `ORDER BY <list>` and `collect()` in `WITH`), so it is opaque in
     /// those hot paths.
     List(Vec<Binding>),
+
+    /// First-class map value (ordered key→value entries).
+    ///
+    /// The user-visible Cypher map: produced by a map literal (`{a: 1, b: x}`),
+    /// `properties(n)`, and object `$params`. Keys are insertion-ordered (Cypher
+    /// preserves map literal order; `properties(n)` orders by predicate). Like
+    /// [`Binding::List`] it is a real value rendered as a JSON object at
+    /// projection time and otherwise opaque to join/scan/sort/group hot paths
+    /// (the cypher lowering does not sort/join/group by a map value).
+    Map(Vec<(Arc<str>, Binding)>),
 }
 
 impl Binding {
@@ -755,6 +765,8 @@ impl From<&Binding> for bool {
             Binding::Path(_) => true,
             // Cypher: a non-empty list is truthy, an empty list falsy.
             Binding::List(items) => !items.is_empty(),
+            // Cypher: a non-empty map is truthy, an empty map falsy.
+            Binding::Map(entries) => !entries.is_empty(),
         }
     }
 }
@@ -887,6 +899,17 @@ impl PartialEq for Binding {
             (Binding::Grouped(a), Binding::Grouped(b)) => a == b,
             (Binding::Path(a), Binding::Path(b)) => a == b,
             (Binding::List(a), Binding::List(b)) => a == b,
+            // Map identity is key-order-insensitive (a map equals a map with the
+            // same entries in any order); display order is preserved separately.
+            (Binding::Map(a), Binding::Map(b)) => {
+                a.len() == b.len() && {
+                    let mut a: Vec<_> = a.iter().collect();
+                    let mut b: Vec<_> = b.iter().collect();
+                    a.sort_by(|x, y| x.0.cmp(&y.0));
+                    b.sort_by(|x, y| x.0.cmp(&y.0));
+                    a == b
+                }
+            }
             _ => false,
         }
     }
@@ -987,6 +1010,18 @@ impl std::hash::Hash for Binding {
                 10u8.hash(state);
                 values.len().hash(state);
                 for v in values {
+                    v.hash(state);
+                }
+            }
+            Binding::Map(entries) => {
+                // Hash in key order so the hash is order-insensitive, matching
+                // the order-insensitive `PartialEq` above.
+                11u8.hash(state);
+                entries.len().hash(state);
+                let mut sorted: Vec<_> = entries.iter().collect();
+                sorted.sort_by(|x, y| x.0.cmp(&y.0));
+                for (k, v) in sorted {
+                    k.hash(state);
                     v.hash(state);
                 }
             }

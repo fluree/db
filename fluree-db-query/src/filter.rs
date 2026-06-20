@@ -84,6 +84,7 @@ pub fn contains_exists(expr: &Expression) -> bool {
     match expr {
         Expression::Exists { .. } => true,
         Expression::Call { args, .. } => args.iter().any(contains_exists),
+        Expression::Map(entries) => entries.iter().any(|(_, v)| contains_exists(v)),
         Expression::Var(_) | Expression::Const(_) => false,
     }
 }
@@ -137,6 +138,11 @@ fn collect_simple_exists_keys(expr: &Expression, out: &mut Vec<(VarId, Ref)>) {
         Expression::Call { func: _, args } => {
             for a in args {
                 collect_simple_exists_keys(a, out);
+            }
+        }
+        Expression::Map(entries) => {
+            for (_, v) in entries {
+                collect_simple_exists_keys(v, out);
             }
         }
         Expression::Var(_) | Expression::Const(_) => {}

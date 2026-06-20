@@ -50,6 +50,23 @@ WHERE p.age > 30
 RETURN p.name, o.name
 ```
 
+## Shape rows as maps
+
+Build a structured row with a map literal, or dump a node's properties:
+
+```cypher
+MATCH (p:Person {name: "Alice"})
+RETURN {name: p.name, age: p.age} AS person
+
+MATCH (p:Person {name: "Alice"})
+RETURN properties(p) AS props, keys(p) AS fields
+```
+
+In the default cypher-json output a map is a native JSON object
+(`{"name": "Alice", "age": 30}`). `properties(n)` returns only data properties
+(not labels or relationships); `keys(n)` is their names. An object parameter is a
+map value too — `$filter = {city: "NYC"}` can be passed and returned as-is.
+
 ## Find-or-create with MERGE
 
 `MERGE` creates the pattern only if it doesn't already exist, with optional

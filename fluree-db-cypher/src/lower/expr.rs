@@ -143,6 +143,18 @@ pub fn lower_expr<E: IriEncoder>(
                 .collect::<Result<Vec<_>>>()?;
             Ok(Expression::call(Function::MakeList, args))
         }
+        Expr::Map(entries, _) => {
+            // A map literal `{k: v, …}` lowers to `Expression::Map`: keys are
+            // static (`Arc<str>`), values are sub-expressions evaluated per row.
+            let mut lowered = Vec::with_capacity(entries.len());
+            for (key, val) in entries {
+                lowered.push((
+                    std::sync::Arc::from(key.as_str()),
+                    lower_expr(ctx, val, aux)?,
+                ));
+            }
+            Ok(Expression::Map(lowered))
+        }
         Expr::Index(list, index, _) => {
             // `list[index]` — element access (e.g. `pair[0]`).
             let list = lower_expr(ctx, list, aux)?;
@@ -177,6 +189,8 @@ pub fn lower_expr<E: IriEncoder>(
                 "pathpairs" => Function::PathPairs,
                 "labels" => Function::Labels,
                 "type" => Function::RelType,
+                "keys" => Function::Keys,
+                "properties" => Function::Properties,
                 _ => {
                     return Err(LowerError::unsupported(format!(
                         "function `{}` is not in the v1 expression surface",

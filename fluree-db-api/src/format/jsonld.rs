@@ -250,6 +250,19 @@ fn write_value(out: &mut String, binding: &Binding, compactor: &IriCompactor) ->
             }
             out.push(']');
         }
+        // A map (map literal / `properties(n)`) renders as a JSON object.
+        Binding::Map(entries) => {
+            out.push('{');
+            for (i, (k, v)) in entries.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                push_json_string(out, k);
+                out.push(':');
+                write_value(out, v, compactor)?;
+            }
+            out.push('}');
+        }
     }
     Ok(())
 }
@@ -567,6 +580,14 @@ pub(crate) fn format_binding(binding: &Binding, compactor: &IriCompactor) -> Res
                 .map(|v| format_binding(v, compactor))
                 .collect();
             Ok(JsonValue::Array(arr?))
+        }
+        // A map renders as a JSON object (insertion order preserved).
+        Binding::Map(entries) => {
+            let mut obj = serde_json::Map::with_capacity(entries.len());
+            for (k, v) in entries {
+                obj.insert(k.to_string(), format_binding(v, compactor)?);
+            }
+            Ok(JsonValue::Object(obj))
         }
     }
 }

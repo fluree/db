@@ -44,6 +44,9 @@ pub enum Expr {
     Exists(Box<Pattern>, Option<Box<Expr>>, SourceSpan),
     /// Inline list literal `[expr, expr, ...]`.
     List(Vec<Expr>, SourceSpan),
+    /// Inline map literal `{key: expr, ...}` in expression position (e.g.
+    /// `RETURN {name: n.name}`). Keys are insertion-ordered.
+    Map(Vec<(String, Expr)>, SourceSpan),
     /// `expr[index]` — list element access.
     Index(Box<Expr>, Box<Expr>, SourceSpan),
 }
@@ -65,6 +68,7 @@ impl Expr {
             | Expr::Contains(_, _, s)
             | Expr::Exists(_, _, s)
             | Expr::List(_, s)
+            | Expr::Map(_, s)
             | Expr::Index(_, _, s) => *s,
             Expr::Call(c) => c.span,
             Expr::Case(c) => c.span,

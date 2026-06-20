@@ -390,6 +390,11 @@ fn collect_alias_in_expr(e: &Expr, alias: &str, fields: &mut Vec<String>, bare: 
                 collect_alias_in_expr(it, alias, fields, bare);
             }
         }
+        Expr::Map(entries, _) => {
+            for (_, v) in entries {
+                collect_alias_in_expr(v, alias, fields, bare);
+            }
+        }
         Expr::Lit(_) | Expr::Param(_) | Expr::Case(_) | Expr::Exists(_, _, _) => {}
     }
 }
@@ -526,6 +531,11 @@ fn rewrite_alias_in_expr_to_var<F: Fn(&str) -> String>(
                 rewrite_alias_in_expr_to_var(it, alias, col_var, bare_var);
             }
         }
+        Expr::Map(entries, _) => {
+            for (_, v) in entries.iter_mut() {
+                rewrite_alias_in_expr_to_var(v, alias, col_var, bare_var);
+            }
+        }
         Expr::Var(_) | Expr::Lit(_) | Expr::Param(_) | Expr::Case(_) | Expr::Exists(_, _, _) => {}
     }
 }
@@ -635,6 +645,12 @@ fn replace_alias_in_expr(
         Expr::List(items, _) => {
             for it in items {
                 replace_alias_in_expr(it, alias, elem, pname)?;
+            }
+            Ok(())
+        }
+        Expr::Map(entries, _) => {
+            for (_, v) in entries.iter_mut() {
+                replace_alias_in_expr(v, alias, elem, pname)?;
             }
             Ok(())
         }
@@ -872,6 +888,12 @@ fn subst_expr(e: &mut Expr, p: &ParamMap) -> Result<(), ParamError> {
             }
             Ok(())
         }
+        Expr::Map(entries, _) => {
+            for (_, v) in entries.iter_mut() {
+                subst_expr(v, p)?;
+            }
+            Ok(())
+        }
         Expr::Var(_) | Expr::Lit(_) => Ok(()),
     }
 }
@@ -923,8 +945,15 @@ fn json_to_expr(v: &JsonValue, name: &str, span: SourceSpan) -> Result<Expr, Par
             }
             Expr::List(out, span)
         }
-        JsonValue::Object(_) => {
-            return Err(unsupported("map/object parameters are not supported in v1"))
+        JsonValue::Object(map) => {
+            // Object params become a map value (`$filter = {city: "NYC"}`). Values
+            // recurse through `json_to_expr`, so scalar and list-valued entries
+            // work; a nested array still rejects nested arrays/objects per its arm.
+            let mut entries = Vec::with_capacity(map.len());
+            for (k, val) in map {
+                entries.push((k.clone(), json_to_expr(val, name, span)?));
+            }
+            Expr::Map(entries, span)
         }
     })
 }
@@ -999,13 +1028,20 @@ mod tests {
     }
 
     #[test]
-    fn object_param_is_rejected() {
-        let err = run(
-            "MATCH (n:Person {name: $p}) RETURN n",
-            &params(serde_json::json!({"p": {"nested": 1}})),
+    fn object_param_substitutes_to_a_map() {
+        // An object param becomes an `Expr::Map` value (used in RETURN position).
+        let ast = run(
+            "MATCH (n:Person) RETURN $p AS m",
+            &params(serde_json::json!({"p": {"city": "NYC", "zip": 10001}})),
         )
-        .unwrap_err();
-        assert!(matches!(err, ParamError::Unsupported { .. }), "{err:?}");
+        .expect("object param substitutes");
+        let Statement::Query(q) = &ast.statement else {
+            panic!("expected a query");
+        };
+        let Expr::Map(entries, _) = &q.return_clause.items[0].expr else {
+            panic!("expected the param to substitute to a map literal");
+        };
+        assert_eq!(entries.len(), 2, "two map entries: {entries:?}");
     }
 
     #[test]

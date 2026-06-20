@@ -21,6 +21,12 @@ pub enum Expression {
         func: Function,
         args: Vec<Expression>,
     },
+    /// Map literal `{k: v, …}` — builds an ordered map value from its entries.
+    /// Keys are static (resolved at lowering); values are sub-expressions
+    /// evaluated per row. Insertion order is preserved for display; identity
+    /// (equality / grouping) is key-order-insensitive. Duplicate keys resolve
+    /// last-wins at construction. Produces a [`crate::binding::Binding::Map`].
+    Map(Vec<(std::sync::Arc<str>, Expression)>),
     /// EXISTS / NOT EXISTS subquery inside a compound filter expression.
     ///
     /// Used when EXISTS/NOT EXISTS appears as part of a larger expression
@@ -52,6 +58,11 @@ impl Expression {
                     arg.substitute_var(old, new);
                 }
             }
+            Expression::Map(entries) => {
+                for (_, v) in entries {
+                    v.substitute_var(old, new);
+                }
+            }
             Expression::Exists { patterns, .. } => {
                 for p in patterns {
                     p.substitute_var(old, new);
@@ -72,6 +83,7 @@ impl Expression {
             Expression::Call { func, args } => {
                 func == target || args.iter().any(|a| a.contains_function(target))
             }
+            Expression::Map(entries) => entries.iter().any(|(_, v)| v.contains_function(target)),
             Expression::Exists { patterns, .. } => {
                 patterns.iter().any(|p| p.contains_function(target))
             }
@@ -89,6 +101,7 @@ impl PartialEq for Expression {
             (Expression::Call { func: f1, args: a1 }, Expression::Call { func: f2, args: a2 }) => {
                 f1 == f2 && a1 == a2
             }
+            (Expression::Map(a), Expression::Map(b)) => a == b,
             (Expression::Exists { .. }, Expression::Exists { .. }) => false,
             _ => false,
         }
@@ -243,6 +256,10 @@ impl Expression {
             Expression::Call { args, .. } => {
                 args.iter().flat_map(Expression::referenced_vars).collect()
             }
+            Expression::Map(entries) => entries
+                .iter()
+                .flat_map(|(_, v)| v.referenced_vars())
+                .collect(),
             Expression::Exists { patterns, .. } => {
                 patterns.iter().flat_map(Pattern::referenced_vars).collect()
             }
@@ -310,7 +327,10 @@ impl Expression {
                 _ => false,
             },
             // Var, Const, Exists are not range-safe on their own
-            Expression::Var(_) | Expression::Const(_) | Expression::Exists { .. } => false,
+            Expression::Var(_)
+            | Expression::Const(_)
+            | Expression::Map(_)
+            | Expression::Exists { .. } => false,
         }
     }
 }
@@ -621,6 +641,14 @@ pub enum Function {
     Labels,
     /// `type(rel)` — relationship type string from `f:reifiesPredicate`.
     RelType,
+    /// `keys(node)` — the list of a node's data-property keys (local names),
+    /// excluding `rdf:type`, the `f:reifies*` bundle, and relationship (ref)
+    /// edges. Produces a [`crate::binding::Binding::List`] of strings.
+    Keys,
+    /// `properties(node)` — a map of a node's data properties (`{key: value}`),
+    /// using the same exclusions as [`Function::Keys`]. Produces a
+    /// [`crate::binding::Binding::Map`].
+    Properties,
 
     // =========================================================================
     // Custom/unknown function

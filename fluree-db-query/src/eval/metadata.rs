@@ -326,6 +326,170 @@ pub fn eval_labels_to_binding<R: RowAccess>(
     Ok(Binding::List(labels))
 }
 
+/// All flakes for `subject` (SPOT subject-prefix), provider-merged with the
+/// novelty overlay (falling back to an overlay-only scan when no range provider
+/// is present). Used by `keys` / `properties` to enumerate a node's predicates.
+fn subject_all_flakes(ctx: &ExecutionContext<'_>, subject: &Sid) -> Result<Vec<Flake>> {
+    let overlay = ctx.overlay.unwrap_or(&NoOverlay);
+    let match_val = RangeMatch::subject(subject.clone());
+    let opts = RangeOptions::default().with_to_t(ctx.to_t);
+    if let Some(provider) = ctx.active_snapshot.range_provider.as_ref() {
+        let query = RangeQuery {
+            g_id: ctx.binary_g_id,
+            index: IndexType::Spot,
+            test: RangeTest::Eq,
+            match_val: &match_val,
+            opts: &opts,
+            overlay,
+            tracker: Some(&ctx.tracker),
+        };
+        return provider
+            .range(&query)
+            .map_err(|e| QueryError::Internal(format!("properties/keys range lookup: {e}")));
+    }
+    // Overlay-only fallback (no index provider).
+    let mut flakes = Vec::new();
+    overlay.for_each_overlay_flake(
+        ctx.binary_g_id,
+        IndexType::Spot,
+        None,
+        None,
+        true,
+        ctx.to_t,
+        &mut |flake| {
+            if flake.s == *subject {
+                flakes.push(flake.clone());
+            }
+        },
+    );
+    Ok(flakes)
+}
+
+/// One asserted data property: `(predicate, value, datatype, language)`.
+type DataProperty = (Sid, FlakeValue, Sid, Option<String>);
+
+/// Resolve a node's current **data** properties (literal-valued, non-reserved
+/// predicates) by replaying the subject's flakes in time order — assertions add,
+/// retractions remove. Preserves multiplicity (a multi-valued predicate yields
+/// several). Excludes `rdf:type`, the `f:reifies*` bundle, and relationship
+/// (ref) edges.
+fn subject_data_properties(
+    ctx: &ExecutionContext<'_>,
+    subject: &Sid,
+) -> Result<Vec<DataProperty>> {
+    let mut flakes = subject_all_flakes(ctx, subject)?;
+    flakes.sort_by_key(|f| f.t);
+    let mut live: Vec<DataProperty> = Vec::new();
+    for flake in flakes {
+        // Data properties only: skip references (relationships), rdf:type, and
+        // the reifier sidecar.
+        if matches!(flake.o, FlakeValue::Ref(_))
+            || fluree_db_core::is_rdf_type(&flake.p)
+            || fluree_db_core::is_reserved_reifies_predicate(&flake.p)
+        {
+            continue;
+        }
+        let lang = flake.m.as_ref().and_then(|m| m.lang.clone());
+        let key = (
+            flake.p.clone(),
+            flake.o.clone(),
+            flake.dt.clone(),
+            lang.clone(),
+        );
+        if flake.op {
+            if !live.contains(&key) {
+                live.push(key);
+            }
+        } else {
+            live.retain(|e| e != &key);
+        }
+    }
+    Ok(live)
+}
+
+/// `keys(node)` → list of a node's data-property keys (local names), sorted and
+/// de-duplicated.
+pub fn eval_keys_to_binding<R: RowAccess>(
+    args: &[Expression],
+    row: &R,
+    ctx: Option<&ExecutionContext<'_>>,
+) -> Result<Binding> {
+    let arg = arity1(args, "keys")?;
+    let Some(ctx) = ctx else {
+        return Ok(Binding::Unbound);
+    };
+    let Some(binding) = resolve_arg_binding(arg, row, Some(ctx))? else {
+        return Ok(Binding::Unbound);
+    };
+    let Some(subject) = binding_subject_sid(&binding, ctx)? else {
+        return Ok(Binding::Unbound);
+    };
+    ctx.tracker.consume_fuel(1)?;
+
+    let props = subject_data_properties(ctx, &subject)?;
+    let dt = xsd_string_sid(ctx);
+    let mut names: Vec<String> = Vec::new();
+    for (pred, _, _, _) in &props {
+        if let Some(name) = cypher_name_from_sid(pred, ctx)? {
+            if !names.contains(&name) {
+                names.push(name);
+            }
+        }
+    }
+    names.sort_unstable();
+    Ok(Binding::List(
+        names.into_iter().map(|n| string_binding(n, &dt)).collect(),
+    ))
+}
+
+/// `properties(node)` → a map of a node's data properties (`{key: value}`).
+/// A multi-valued predicate becomes a list value under its key.
+pub fn eval_properties_to_binding<R: RowAccess>(
+    args: &[Expression],
+    row: &R,
+    ctx: Option<&ExecutionContext<'_>>,
+) -> Result<Binding> {
+    let arg = arity1(args, "properties")?;
+    let Some(ctx) = ctx else {
+        return Ok(Binding::Unbound);
+    };
+    let Some(binding) = resolve_arg_binding(arg, row, Some(ctx))? else {
+        return Ok(Binding::Unbound);
+    };
+    let Some(subject) = binding_subject_sid(&binding, ctx)? else {
+        return Ok(Binding::Unbound);
+    };
+    ctx.tracker.consume_fuel(1)?;
+
+    let props = subject_data_properties(ctx, &subject)?;
+    // Group by key (local name), preserving first-seen order.
+    let mut order: Vec<String> = Vec::new();
+    let mut grouped: HashMap<String, Vec<Binding>> = HashMap::new();
+    for (pred, val, dt, _lang) in props {
+        let Some(name) = cypher_name_from_sid(&pred, ctx)? else {
+            continue;
+        };
+        let value = Binding::lit(val, dt);
+        grouped.entry(name.clone()).or_default().push(value);
+        if !order.contains(&name) {
+            order.push(name);
+        }
+    }
+    let entries = order
+        .into_iter()
+        .map(|name| {
+            let mut vals = grouped.remove(&name).unwrap_or_default();
+            let value = if vals.len() == 1 {
+                vals.pop().expect("len == 1")
+            } else {
+                Binding::List(vals)
+            };
+            (Arc::from(name.as_str()), value)
+        })
+        .collect();
+    Ok(Binding::Map(entries))
+}
+
 /// `type(rel)` → relationship type string from `f:reifiesPredicate`.
 pub fn eval_rel_type<R: RowAccess>(
     args: &[Expression],

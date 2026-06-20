@@ -233,6 +233,27 @@ pub fn compare_bindings(a: &Binding, b: &Binding) -> Ordering {
         (_, Binding::List(_)) => Ordering::Less,
         (Binding::List(_), _) => Ordering::Greater,
 
+        // Map sorts after List, key-then-value (cypher rejects ORDER BY <map>,
+        // so this is only a defensive total order).
+        (Binding::Map(x), Binding::Map(y)) => x
+            .iter()
+            .map(Some)
+            .chain(std::iter::repeat(None))
+            .zip(y.iter().map(Some).chain(std::iter::repeat(None)))
+            .take(x.len().max(y.len()))
+            .map(|(a, b)| match (a, b) {
+                (Some((ka, va)), Some((kb, vb))) => {
+                    ka.cmp(kb).then_with(|| compare_bindings(va, vb))
+                }
+                (Some(_), None) => Ordering::Greater,
+                (None, Some(_)) => Ordering::Less,
+                (None, None) => Ordering::Equal,
+            })
+            .find(|o| *o != Ordering::Equal)
+            .unwrap_or(Ordering::Equal),
+        (_, Binding::Map(_)) => Ordering::Less,
+        (Binding::Map(_), _) => Ordering::Greater,
+
         // IRI types vs Lit types: IRI sorts before Lit
         (
             Binding::Sid { .. }

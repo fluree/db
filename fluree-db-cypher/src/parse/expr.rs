@@ -256,6 +256,12 @@ fn parse_primary(s: &mut TokenStream) -> Result<Expr, Diagnostic> {
             let end = s.expect(&TokenKind::RBracket)?;
             Ok(Expr::List(items, start.union(end)))
         }
+        TokenKind::LBrace => {
+            // Map literal in expression position: `{key: expr, ...}`. Reuses the
+            // pattern-side map parser, then re-homes it as an `Expr::Map`.
+            let map = parse_map_lit(s)?;
+            Ok(Expr::Map(map.entries, map.span))
+        }
         TokenKind::Case => parse_case(s),
         TokenKind::Exists => {
             s.advance();
@@ -323,10 +329,7 @@ fn parse_var_or_call(s: &mut TokenStream) -> Result<Expr, Diagnostic> {
         let end = s.expect(&TokenKind::RParen)?;
         // Reject deferred functions early with specific error.
         let lower = name.to_ascii_lowercase();
-        if matches!(
-            lower.as_str(),
-            "keys" | "properties" | "id" | "point" | "distance"
-        ) {
+        if matches!(lower.as_str(), "id" | "point" | "distance") {
             return Err(Diagnostic {
                 code: DiagCode::DeferredFunction,
                 severity: crate::diag::Severity::Error,

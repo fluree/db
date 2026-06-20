@@ -505,6 +505,9 @@ fn expression_references_any(
         Expression::Var(v) => vars.contains(v),
         Expression::Const(_) => false,
         Expression::Call { args, .. } => args.iter().any(|a| expression_references_any(a, vars)),
+        Expression::Map(entries) => entries
+            .iter()
+            .any(|(_, v)| expression_references_any(v, vars)),
         Expression::Exists { .. } => false,
     }
 }
@@ -618,6 +621,7 @@ fn expr_has_aggregate(e: &Expr) -> bool {
         | Expr::IsNotNull(x, _)
         | Expr::Prop(x, _, _) => expr_has_aggregate(x),
         Expr::List(items, _) => items.iter().any(expr_has_aggregate),
+        Expr::Map(entries, _) => entries.iter().any(|(_, v)| expr_has_aggregate(v)),
         Expr::Var(_) | Expr::Lit(_) | Expr::Param(_) | Expr::Case(_) | Expr::Exists(_, _, _) => {
             false
         }
@@ -704,6 +708,12 @@ fn extract_aggregates_inner<E: IriEncoder>(
             }
             Ok(())
         }
+        Expr::Map(entries, _) => {
+            for (_, v) in entries {
+                extract_aggregates_inner(ctx, v, patterns, aggregates, counter, false)?;
+            }
+            Ok(())
+        }
         Expr::Case(_) | Expr::Exists(_, _, _) => Err(LowerError::unsupported(
             "aggregates inside CASE / EXISTS are not supported in v1",
         )),
@@ -740,6 +750,9 @@ fn composite_references_grouping_value(e: &Expr) -> bool {
         }
         Expr::Call(c) => c.args.iter().any(composite_references_grouping_value),
         Expr::List(items, _) => items.iter().any(composite_references_grouping_value),
+        Expr::Map(entries, _) => entries
+            .iter()
+            .any(|(_, v)| composite_references_grouping_value(v)),
         Expr::Lit(_) | Expr::Param(_) | Expr::Case(_) | Expr::Exists(_, _, _) => false,
     }
 }

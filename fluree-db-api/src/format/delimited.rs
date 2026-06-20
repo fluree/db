@@ -475,6 +475,17 @@ fn write_binding_cell(
                 write_binding_cell(cell, val, compactor, gv)?;
             }
         }
+        // A map: semicolon-separated `key=value` pairs (flat CSV can't nest).
+        Binding::Map(entries) => {
+            for (j, (k, val)) in entries.iter().enumerate() {
+                if j > 0 {
+                    cell.push(b';');
+                }
+                cell.extend_from_slice(k.as_bytes());
+                cell.push(b'=');
+                write_binding_cell(cell, val, compactor, gv)?;
+            }
+        }
     }
     Ok(())
 }

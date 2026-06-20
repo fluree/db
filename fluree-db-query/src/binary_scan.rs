@@ -138,6 +138,7 @@ fn expr_needs_t(expr: &Expression) -> bool {
         Expression::Call { func, args } => {
             matches!(func, Function::T) || args.iter().any(expr_needs_t)
         }
+        Expression::Map(entries) => entries.iter().any(|(_, v)| expr_needs_t(v)),
         Expression::Exists { .. } => false,
     }
 }

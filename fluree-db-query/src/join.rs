@@ -984,7 +984,7 @@ impl NestedLoopJoinOperator {
                         // boundary (e.g. `WITH collect(x) AS l ...`). It is never
                         // a valid triple term, so leave the slot as a variable
                         // (no match) rather than asserting.
-                        Binding::List(_) => {}
+                        Binding::List(_) | Binding::Map(_) => {}
                     }
                 }
             }

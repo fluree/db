@@ -93,8 +93,10 @@ fn cypherify(value: JsonValue) -> JsonValue {
             } else if let Some(id) = m.remove("@id") {
                 id
             } else {
-                // A non-literal/non-ref object (rare) — pass through unchanged.
-                JsonValue::Object(m)
+                // A plain object — a Cypher map value (`{a: n.name}`) or
+                // `properties(n)`. Recurse so each value is itself cypherified
+                // (RDF value-objects → native scalars).
+                JsonValue::Object(m.into_iter().map(|(k, v)| (k, cypherify(v))).collect())
             }
         }
         JsonValue::Array(items) => JsonValue::Array(items.into_iter().map(cypherify).collect()),
