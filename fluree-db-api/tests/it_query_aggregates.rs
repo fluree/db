@@ -590,3 +590,97 @@ async fn select_expr_if_branches_on_age() {
         ]))
     );
 }
+
+async fn seed_receipt_line_items_jsonld(
+    fluree: &MemoryFluree,
+    ledger_id: &str,
+) -> MemoryLedger {
+    let ledger0 = genesis_ledger(fluree, ledger_id);
+
+    let insert = json!({
+        "@context": {
+            "sup": "http://Magna/SupplyChain#",
+            "xsd": "http://www.w3.org/2001/XMLSchema#"
+        },
+        "@graph": [
+            {
+                "@id": "sup:r1",
+                "@type": "sup:ReceiptLineItem",
+                "sup:forEngcPart": {"@id": "sup:partA"},
+                "sup:receiptUnitPrice": 10
+            },
+            {
+                "@id": "sup:r2",
+                "@type": "sup:ReceiptLineItem",
+                "sup:forEngcPart": {"@id": "sup:partA"},
+                "sup:receiptUnitPrice": 14
+            },
+            {
+                "@id": "sup:r3",
+                "@type": "sup:ReceiptLineItem",
+                "sup:forEngcPart": {"@id": "sup:partA"},
+                "sup:receiptUnitPrice": 12
+            },
+            {
+                "@id": "sup:r4",
+                "@type": "sup:ReceiptLineItem",
+                "sup:forEngcPart": {"@id": "sup:partB"},
+                "sup:receiptUnitPrice": 5
+            },
+            {
+                "@id": "sup:r5",
+                "@type": "sup:ReceiptLineItem",
+                "sup:forEngcPart": {"@id": "sup:partB"},
+                "sup:receiptUnitPrice": 9
+            }
+        ]
+    });
+
+    fluree
+        .insert(ledger0, &insert)
+        .await
+        .expect("seed receipt line items")
+        .ledger
+}
+
+#[tokio::test]
+async fn aggregates_arithmetic_over_min_max_jsonld() {
+    // JSON-LD equivalent of the SPARQL
+    //   SELECT ?part ((MAX(?u) - MIN(?u)) AS ?spread) GROUP BY ?part
+    // which currently fails on the SPARQL side.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger =
+        seed_receipt_line_items_jsonld(&fluree, "query/agg-spread-jsonld:main").await;
+    let ctx = json!({
+        "sup": "http://Magna/SupplyChain#",
+        "xsd": "http://www.w3.org/2001/XMLSchema#"
+    });
+
+    let query = json!({
+        "@context": ctx,
+        "select": [
+            "?part",
+            "(as (- (max ?u) (min ?u)) ?spread)"
+        ],
+        "where": {
+            "@id": "?r",
+            "@type": "sup:ReceiptLineItem",
+            "sup:forEngcPart": "?part",
+            "sup:receiptUnitPrice": "?u"
+        },
+        "groupBy": ["?part"]
+    });
+
+    let result = support::query_jsonld(&fluree, &ledger, &query)
+        .await
+        .expect("query");
+    let json_rows = result.to_jsonld(&ledger.snapshot).expect("jsonld");
+
+    assert_eq!(
+        normalize_rows(&json_rows),
+        normalize_rows(&json!([
+            ["sup:partA", 4],
+            ["sup:partB", 4]
+        ]))
+    );
+}
