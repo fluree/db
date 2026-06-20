@@ -59,10 +59,11 @@ use async_trait::async_trait;
 use fluree_db_core::ledger_id::split_ledger_id;
 use fluree_db_core::ContentId;
 use fluree_db_nameservice::{
-    AdminPublisher, BranchLifecycle, CasResult, CommitPublisher, ConfigLookup, ConfigValue,
-    GraphSourceLookup, GraphSourceRecord, IndexPublisher, LedgerLifecycle, NameServiceError,
-    NameServiceLookup, NsLookupResult, NsRecord, NsRecordSnapshot, RefKind, RefLookup,
-    RefPublisher, RefValue, Result, StatusCasResult, StatusLookup, StatusPublisher, StatusValue,
+    AdminPublisher, BranchLifecycle, CasResult, CommitPublisher, ConfigCasResult, ConfigLookup,
+    ConfigPublisher, ConfigValue, GraphSourceLookup, GraphSourceRecord, IndexPublisher,
+    LedgerLifecycle, NameServiceError, NameServiceLookup, NsLookupResult, NsRecord,
+    NsRecordSnapshot, RefKind, RefLookup, RefPublisher, RefValue, Result, StatusCasResult,
+    StatusLookup, StatusPublisher, StatusValue,
 };
 use openraft::error::{ClientWriteError, RaftError};
 use openraft::Raft;
@@ -825,8 +826,46 @@ impl StatusPublisher for RaftNameService {
 
 #[async_trait]
 impl ConfigLookup for RaftNameService {
-    async fn get_config(&self, _ledger_id: &str) -> Result<Option<ConfigValue>> {
-        Ok(None)
+    async fn get_config(&self, ledger_id: &str) -> Result<Option<ConfigValue>> {
+        let (name, branch) = split_ledger_id(ledger_id)?;
+        let state = self.state.read().await;
+        let branch_registered = state
+            .ledgers
+            .get(&name)
+            .is_some_and(|l| l.branches.iter().any(|b| b == &branch));
+        if !branch_registered {
+            return Ok(None);
+        }
+        Ok(Some(
+            state
+                .config
+                .get(ledger_id)
+                .cloned()
+                .unwrap_or_else(ConfigValue::unborn),
+        ))
+    }
+}
+
+#[async_trait]
+impl ConfigPublisher for RaftNameService {
+    async fn push_config(
+        &self,
+        ledger_id: &str,
+        expected: Option<&ConfigValue>,
+        new: &ConfigValue,
+    ) -> Result<ConfigCasResult> {
+        let cmd = SmCommand::PushConfig {
+            ledger_id: ledger_id.to_string(),
+            expected: expected.cloned(),
+            new: new.clone(),
+        };
+        match self.submit_lifecycle(cmd).await? {
+            SmResponse::ConfigUpdated => Ok(ConfigCasResult::Updated),
+            SmResponse::ConfigConflict { actual } => Ok(ConfigCasResult::Conflict { actual }),
+            other => Err(NameServiceError::storage(format!(
+                "unexpected Response variant for PushConfig: {other:?}"
+            ))),
+        }
     }
 }
 

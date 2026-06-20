@@ -20,7 +20,7 @@
 use crate::IdempotencyCacheKey;
 use fluree_db_api::{ContentId, PolicyStats, TrackingTally};
 use fluree_db_core::ledger_id::{format_ledger_id, split_ledger_id};
-use fluree_db_nameservice::{RefKind, RefValue, StatusValue};
+use fluree_db_nameservice::{ConfigValue, RefKind, RefValue, StatusValue};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use thiserror::Error;
@@ -418,6 +418,12 @@ pub struct NameServiceState {
     /// branch is registered but no record lives here.
     #[serde(default)]
     pub status: HashMap<String, StatusValue>,
+    /// Per-`alias:branch` configuration pushed via
+    /// [`fluree_db_nameservice::ConfigPublisher::push_config`]. The
+    /// read path falls back to [`ConfigValue::unborn`] when the
+    /// branch is registered but no record lives here.
+    #[serde(default)]
+    pub config: HashMap<String, ConfigValue>,
 }
 
 /// Replicated commands the state machine accepts.
@@ -530,6 +536,18 @@ pub enum Command {
         ledger_id: String,
         expected: Option<StatusValue>,
         new: StatusValue,
+    },
+    /// CAS push for one branch's configuration. Mirrors the
+    /// [`fluree_db_nameservice::ConfigPublisher::push_config`]
+    /// contract: returns [`Response::ConfigConflict`] when `expected`
+    /// doesn't match the current value, and enforces
+    /// `new.v > current.v`. The current value is
+    /// [`ConfigValue::unborn`] when no record is present for a
+    /// registered branch.
+    PushConfig {
+        ledger_id: String,
+        expected: Option<ConfigValue>,
+        new: ConfigValue,
     },
     /// Append a transactor request to the per-branch queue. Apply
     /// checks idempotency, the in-flight queue, and the queue
@@ -724,6 +742,11 @@ pub enum Response {
     /// current value when the branch is known; `None` when the
     /// ledger or branch isn't registered.
     StatusConflict { actual: Option<StatusValue> },
+    /// [`Command::PushConfig`] succeeded.
+    ConfigUpdated,
+    /// [`Command::PushConfig`] refused — see [`Self::StatusConflict`]
+    /// for the analogous semantics.
+    ConfigConflict { actual: Option<ConfigValue> },
     /// [`Command::CreateLedger`] succeeded. `ledger_id` is the full
     /// `name:branch` form.
     Created { ledger_id: String },
@@ -959,6 +982,11 @@ pub fn apply(state: &mut NameServiceState, command: Command, log_index: u64) -> 
             expected,
             new,
         } => apply_push_status(state, ledger_id, expected, new),
+        Command::PushConfig {
+            ledger_id,
+            expected,
+            new,
+        } => apply_push_config(state, ledger_id, expected, new),
         // Queue-related commands. Apply paths land in subsequent
         // commits; see docs/design/raft-command-queue.md.
         Command::EnqueueCommand(args) => apply_enqueue_command(state, log_index, args),
@@ -1539,6 +1567,46 @@ fn apply_push_status(
     }
     state.status.insert(ledger_id, new);
     Response::StatusUpdated
+}
+
+fn apply_push_config(
+    state: &mut NameServiceState,
+    ledger_id: String,
+    expected: Option<ConfigValue>,
+    new: ConfigValue,
+) -> Response {
+    let Ok((name, branch)) = split_ledger_id(&ledger_id) else {
+        return Response::ConfigConflict { actual: None };
+    };
+    let branch_registered = state
+        .ledgers
+        .get(&name)
+        .is_some_and(|l| l.branches.iter().any(|b| b == &branch));
+    if !branch_registered {
+        return Response::ConfigConflict { actual: None };
+    }
+
+    // Absent record reads as `ConfigValue::unborn`; the apply uses
+    // the same fallback so an initial CAS push from
+    // `expected = unborn` lands on a fresh branch.
+    let current = state
+        .config
+        .get(&ledger_id)
+        .cloned()
+        .unwrap_or_else(ConfigValue::unborn);
+
+    if expected.as_ref() != Some(&current) {
+        return Response::ConfigConflict {
+            actual: Some(current),
+        };
+    }
+    if new.v <= current.v {
+        return Response::ConfigConflict {
+            actual: Some(current),
+        };
+    }
+    state.config.insert(ledger_id, new);
+    Response::ConfigUpdated
 }
 
 fn apply_enqueue_command(
@@ -3909,6 +3977,116 @@ mod tests {
         match resp {
             Response::StatusConflict { actual } => assert_eq!(actual, None),
             other => panic!("expected StatusConflict, got {other:?}"),
+        }
+    }
+
+    // ====================================================================
+    // PushConfig
+    // ====================================================================
+
+    fn config(v: i64, default_context: Option<ContentId>) -> ConfigValue {
+        let payload = default_context.map(|cid| fluree_db_nameservice::ConfigPayload {
+            default_context: Some(cid),
+            config_id: None,
+            extra: Default::default(),
+        });
+        ConfigValue::new(v, payload)
+    }
+
+    fn push_config_cmd(
+        ledger_id: &str,
+        expected: Option<ConfigValue>,
+        new: ConfigValue,
+    ) -> Command {
+        Command::PushConfig {
+            ledger_id: ledger_id.into(),
+            expected,
+            new,
+        }
+    }
+
+    #[test]
+    fn push_config_initial_creation_from_unborn_lands() {
+        let mut state = NameServiceState::new();
+        apply(&mut state, create_ledger("test/db"), 0);
+
+        let resp = apply(
+            &mut state,
+            push_config_cmd(
+                "test/db:main",
+                Some(ConfigValue::unborn()),
+                config(1, Some(cid(42))),
+            ),
+            1,
+        );
+        assert_eq!(resp, Response::ConfigUpdated);
+        assert_eq!(
+            state.config.get("test/db:main").cloned(),
+            Some(config(1, Some(cid(42))))
+        );
+    }
+
+    #[test]
+    fn push_config_conflict_when_expected_doesnt_match() {
+        let mut state = NameServiceState::new();
+        apply(&mut state, create_ledger("test/db"), 0);
+        apply(
+            &mut state,
+            push_config_cmd(
+                "test/db:main",
+                Some(ConfigValue::unborn()),
+                config(1, Some(cid(42))),
+            ),
+            1,
+        );
+
+        // Stale expected — caller hasn't observed the v=1 push.
+        let resp = apply(
+            &mut state,
+            push_config_cmd(
+                "test/db:main",
+                Some(ConfigValue::unborn()),
+                config(2, Some(cid(43))),
+            ),
+            2,
+        );
+        match resp {
+            Response::ConfigConflict { actual } => {
+                assert_eq!(actual, Some(config(1, Some(cid(42)))));
+            }
+            other => panic!("expected ConfigConflict, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn push_config_rejects_non_monotonic_v() {
+        let mut state = NameServiceState::new();
+        apply(&mut state, create_ledger("test/db"), 0);
+
+        // Unborn fallback is v=0; v=0 is not strictly greater.
+        let resp = apply(
+            &mut state,
+            push_config_cmd(
+                "test/db:main",
+                Some(ConfigValue::unborn()),
+                ConfigValue::unborn(),
+            ),
+            1,
+        );
+        assert!(matches!(resp, Response::ConfigConflict { actual: Some(_) }));
+    }
+
+    #[test]
+    fn push_config_rejects_when_branch_not_registered() {
+        let mut state = NameServiceState::new();
+        let resp = apply(
+            &mut state,
+            push_config_cmd("missing:main", None, config(1, None)),
+            1,
+        );
+        match resp {
+            Response::ConfigConflict { actual } => assert_eq!(actual, None),
+            other => panic!("expected ConfigConflict, got {other:?}"),
         }
     }
 
