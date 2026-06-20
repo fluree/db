@@ -208,6 +208,7 @@ impl Function {
             | Function::Nodes
             | Function::Range
             | Function::PathPairs
+            | Function::Relationships
             | Function::Split
             | Function::Labels
             | Function::Keys

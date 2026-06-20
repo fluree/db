@@ -192,6 +192,29 @@ pub fn eval_list_fn_to_binding<R: RowAccess>(
                 _ => Ok(Some(Binding::Unbound)),
             }
         }
+        Function::Relationships => {
+            // One relationship value per hop of a path: Rel(node[i], pred[i], node[i+1]).
+            // Path edges are plain triples, so `reifier` is None (properties(r) on
+            // a path relationship yields an empty map); type/startNode/endNode work
+            // off the intrinsic fields.
+            let arg = arity1(args, "relationships")?;
+            match resolve_arg_binding(arg, row, ctx)? {
+                Some(Binding::Path { nodes, preds }) => {
+                    let rels = nodes
+                        .windows(2)
+                        .zip(preds.iter())
+                        .map(|(w, pred)| Binding::Rel {
+                            start: w[0].clone(),
+                            predicate: pred.clone(),
+                            end: w[1].clone(),
+                            reifier: None,
+                        })
+                        .collect();
+                    Ok(Some(Binding::List(rels)))
+                }
+                _ => Ok(Some(Binding::Unbound)),
+            }
+        }
         Function::PathPairs => {
             // Consecutive node pairs of a path, each a two-element list. The
             // building block for per-edge aggregation (unwind pairs → match).

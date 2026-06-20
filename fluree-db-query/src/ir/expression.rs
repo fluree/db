@@ -946,6 +946,9 @@ pub enum Function {
     /// ref, from `f:reifiesSubject` / `f:reifiesObject` on the reifier.
     StartNode,
     EndNode,
+    /// `relationships(path)` — the list of relationship values along a path
+    /// (one per hop), built from the path's nodes and per-hop predicates.
+    Relationships,
     /// `keys(node)` — the list of a node's data-property keys (local names),
     /// excluding `rdf:type`, the `f:reifies*` bundle, and relationship (ref)
     /// edges. Produces a [`crate::binding::Binding::List`] of strings.

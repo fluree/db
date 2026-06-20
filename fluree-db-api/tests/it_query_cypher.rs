@@ -4129,6 +4129,37 @@ async fn cypher_shortest_path_length_directed() {
 }
 
 #[tokio::test]
+async fn cypher_relationships_of_path() {
+    // relationships(p) yields one relationship value per hop; type/startNode/
+    // endNode work off each. Alice -> Bob -> Carol -> Dave.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = seed_knows_chain(&fluree, "it/cypher:rels-of-path").await;
+    let db = graphdb_from_ledger(&l);
+
+    let cj = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (a:Person {name: "Alice"}), (c:Person {name: "Carol"})
+               MATCH p = shortestPath((a)-[:KNOWS*]->(c))
+               RETURN [r IN relationships(p) | type(r)] AS types,
+                      size(relationships(p)) AS n,
+                      startNode(relationships(p)[0]) AS first_start,
+                      endNode(relationships(p)[1]) AS last_end,
+                      a AS aa, c AS cc"#,
+        )
+        .await
+        .expect("relationships(p)")
+        .to_cypher_json_async(db.as_graph_db_ref())
+        .await
+        .expect("cypher json");
+    let row = &cj["results"][0]["data"][0]["row"];
+    assert_eq!(row[0], json!(["KNOWS", "KNOWS"]), "type per hop: {cj}");
+    assert_eq!(row[1], json!(2), "Alice→Carol is 2 hops: {cj}");
+    assert_eq!(row[2], row[4], "first hop start == Alice: {cj}");
+    assert_eq!(row[3], row[5], "last hop end == Carol: {cj}");
+}
+
+#[tokio::test]
 async fn cypher_shortest_path_length_undirected() {
     let fluree = FlureeBuilder::memory().build_memory();
     let l = seed_knows_chain(&fluree, "it/cypher:sp-undirected").await;

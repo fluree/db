@@ -62,6 +62,9 @@ fn binding_subject_sid(binding: &Binding, ctx: &ExecutionContext<'_>) -> Result<
             }
             Ok(ctx.active_snapshot.encode_iri(iri.as_ref()))
         }
+        // A relationship value's "node" for property lookup is its reifier (the
+        // edge-annotation node). A plain path edge has none → no properties.
+        Binding::Rel { reifier, .. } => Ok(reifier.clone()),
         Binding::Unbound | Binding::Poisoned => Ok(None),
         _ => Ok(None),
     }
@@ -556,23 +559,35 @@ pub fn eval_rel_type<R: RowAccess>(
     let Some(binding) = resolve_arg_binding(arg, row, Some(ctx))? else {
         return Ok(None);
     };
-    let Some(reifier) = binding_subject_sid(&binding, ctx)? else {
-        return Ok(None);
-    };
 
     ctx.tracker.consume_fuel(1)?;
 
-    let reifies_pred = ctx
-        .active_snapshot
-        .encode_iri(fluree_vocab::reifies_iris::PREDICATE)
-        .unwrap_or_else(|| Sid::new(fluree_vocab::namespaces::FLUREE_DB, "reifiesPredicate"));
-    let pred_sids = lookup_ref_objects(ctx, &reifier, &reifies_pred)?;
-
-    let Some(pred_sid) = pred_sids.first() else {
-        return Ok(None);
+    // A relationship value carries its predicate intrinsically (e.g. from
+    // `relationships(p)`); a reifier-node binding (bound `-[r:T]->`) needs the
+    // `f:reifiesPredicate` lookup.
+    let pred_sid = match &binding {
+        Binding::Rel { predicate, .. } => predicate.clone(),
+        _ => {
+            let Some(reifier) = binding_subject_sid(&binding, ctx)? else {
+                return Ok(None);
+            };
+            let reifies_pred = ctx
+                .active_snapshot
+                .encode_iri(fluree_vocab::reifies_iris::PREDICATE)
+                .unwrap_or_else(|| {
+                    Sid::new(fluree_vocab::namespaces::FLUREE_DB, "reifiesPredicate")
+                });
+            match lookup_ref_objects(ctx, &reifier, &reifies_pred)?
+                .into_iter()
+                .next()
+            {
+                Some(p) => p,
+                None => return Ok(None),
+            }
+        }
     };
 
-    let name = cypher_name_from_sid(pred_sid, ctx)?;
+    let name = cypher_name_from_sid(&pred_sid, ctx)?;
     Ok(name.map(|s| ComparableValue::String(Arc::from(s))))
 }
 
@@ -626,6 +641,19 @@ fn eval_rel_endpoint<R: RowAccess>(
     let Some(binding) = resolve_arg_binding(arg, row, Some(ctx))? else {
         return Ok(None);
     };
+
+    // A relationship value carries its endpoints intrinsically; a reifier-node
+    // binding needs the `f:reifiesSubject`/`f:reifiesObject` lookup. `is_start`
+    // selects the field for the Rel case.
+    if let Binding::Rel { start, end, .. } = &binding {
+        let node = if reifies_iri == fluree_vocab::reifies_iris::SUBJECT {
+            start
+        } else {
+            end
+        };
+        return Ok(Some(ComparableValue::Sid(node.clone())));
+    }
+
     let Some(reifier) = binding_subject_sid(&binding, ctx)? else {
         return Ok(None);
     };

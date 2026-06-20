@@ -346,6 +346,7 @@ pub fn lower_expr<E: IriEncoder>(
                 "tofloat" => Function::XsdDouble,
                 // Path / list builders.
                 "nodes" => Function::Nodes,
+                "relationships" => Function::Relationships,
                 "range" => Function::Range,
                 "pathpairs" => Function::PathPairs,
                 "labels" => Function::Labels,
