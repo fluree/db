@@ -173,10 +173,14 @@ ORDER BY / SKIP / LIMIT
   type): a *wildcard* transitive path that follows **any** node→node edge per
   hop — excluding `rdf:type` (its object is a class, not a node) and the
   `f:reifies*` reifier bundle, and ignoring data properties (only node-valued
-  edges are followed). Bounds become the path's `min_hops`/`max_hops`. These use
-  **reachability** semantics (each node reachable within the hop range, by
-  shortest path — not path enumeration or trail semantics). A direction is
-  required; undirected untyped (`-[*]-`) is deferred.
+  edges are followed). Bounds become the path's `min_hops`/`max_hops`; a
+  **bounded** range runs a layered (node, depth) BFS, so a node reachable in
+  range is found even when a shorter path to it also exists (`-[*2..2]->` finds
+  the length-2 path past a 1-hop edge), and the bound-bound and bound-unbound
+  forms agree. These use **reachability** semantics (each in-range node once, not
+  path enumeration or trail semantics). A direction is required; undirected
+  untyped (`-[*]-`) is deferred, as is an **unbounded** lower bound above 1
+  (`-[*2..]->` — give an upper bound or name a type).
 - Undirected relationships `-[:T]-` (forward ∪ reverse `Union`).
 - Path finding: `MATCH p = shortestPath((a)-[:T*]-(b))` and
   `allShortestPaths(...)`. Anchored (both endpoints bound by a
@@ -327,9 +331,11 @@ ORDER BY / SKIP / LIMIT
   (`WITH a, a.birthYear + 30 AS adultAt SET a.adultAt = adultAt`), and a
   post-projection `WHERE` that gates which rows are written
   (`WITH p, p.age AS age WHERE age >= 30 SET p.adult = true`). `WITH` applies
-  Cypher scoping — only projected names are visible to the write. Aggregation,
-  `DISTINCT`, and `ORDER BY` / `SKIP` / `LIMIT` on a write-side `WITH` are
-  deferred.
+  Cypher scoping — only projected names are visible to the write. Works before
+  `CREATE` / `SET` / `REMOVE`; `WITH` before `DELETE` is rejected (delete
+  resolution keys off the raw MATCH variables and can't honor a rename/horizon —
+  `DELETE` directly off the MATCH variables). Aggregation, `DISTINCT`, and
+  `ORDER BY` / `SKIP` / `LIMIT` on a write-side `WITH` are deferred.
 
 ```rust
 let committed = fluree.transact_cypher(ledger, cypher).await?;
@@ -352,9 +358,10 @@ produces a clear error rather than a silent wrong answer.
   `allShortestPaths` wrapper.
 - Binding a relationship variable to a variable-length path (`-[r:T*]->`).
 - Undirected untyped variable-length paths (`-[*m..n]-` — give a direction);
-  zero-length *typed* bounded paths (`-[:T*0..M]->` — use `*1..M`); bounded type
-  alternation (`-[:A|B*1..3]->` — use the unbounded form); property filters on a
-  variable-length or shortestPath relationship.
+  unbounded untyped paths with a lower bound above 1 (`-[*2..]->` — add an upper
+  bound or name a type); zero-length *typed* bounded paths (`-[:T*0..M]->` — use
+  `*1..M`); bounded type alternation (`-[:A|B*1..3]->` — use the unbounded form);
+  property filters on a variable-length or shortestPath relationship.
 
 **Functions**
 
@@ -373,9 +380,9 @@ produces a clear error rather than a silent wrong answer.
 
 - Non-literal `SKIP`/`LIMIT`; `ORDER BY` on a `collect()` list.
 - `CASE` / `EXISTS` inside a write-statement `MATCH ... WHERE`. Aggregation,
-  `DISTINCT`, and `ORDER BY` / `SKIP` / `LIMIT` on a `WITH` before a write clause
-  (the pass-through / rename / computed-alias / filter subset *is* supported —
-  see above).
+  `DISTINCT`, and `ORDER BY` / `SKIP` / `LIMIT` on a `WITH` before a write clause,
+  and `WITH` before `DELETE` (the pass-through / rename / computed-alias / filter
+  subset before `CREATE` / `SET` / `REMOVE` *is* supported — see above).
 - `MERGE` on a property-bearing relationship (`-[:KNOWS {since: 2020}]->`),
   multi-hop or multi-part (comma-separated) `MERGE`, multiple `MERGE` clauses,
   `ON MATCH SET` on a relationship `MERGE`, and `MERGE` combined with another

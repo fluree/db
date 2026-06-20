@@ -373,10 +373,7 @@ type DataProperty = (Sid, FlakeValue, Sid, Option<String>);
 /// retractions remove. Preserves multiplicity (a multi-valued predicate yields
 /// several). Excludes `rdf:type`, the `f:reifies*` bundle, and relationship
 /// (ref) edges.
-fn subject_data_properties(
-    ctx: &ExecutionContext<'_>,
-    subject: &Sid,
-) -> Result<Vec<DataProperty>> {
+fn subject_data_properties(ctx: &ExecutionContext<'_>, subject: &Sid) -> Result<Vec<DataProperty>> {
     let mut flakes = subject_all_flakes(ctx, subject)?;
     flakes.sort_by_key(|f| f.t);
     let mut live: Vec<DataProperty> = Vec::new();

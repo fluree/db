@@ -262,11 +262,13 @@ impl Expression {
         row: &R,
         ctx: Option<&ExecutionContext<'_>>,
     ) -> Result<Binding> {
-        // A bare variable may hold a `List` binding, which can't round-trip
-        // through `ComparableValue` (it would collapse to Unbound). Return it
-        // directly so `UNWIND ?listVar` and the collect→unwind round-trip
-        // preserve the list. Scalars fall through to the comparable path so
-        // their normalization is unchanged.
+        // A bare variable may hold a `List` or `Map` binding, which can't
+        // round-trip through `ComparableValue` (it would collapse to Unbound).
+        // Return it directly so reuse preserves the structured value — e.g.
+        // `UNWIND ?listVar`, the collect→unwind round-trip, and nesting a map
+        // var inside another value (`WITH properties(n) AS p RETURN {props: p}`).
+        // Scalars fall through to the comparable path so normalization is
+        // unchanged.
         if let Expression::Var(v) = self {
             if let Some(b @ (Binding::List(_) | Binding::Map(_))) = row.get(*v) {
                 return Ok(b.clone());

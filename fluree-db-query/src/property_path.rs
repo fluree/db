@@ -287,11 +287,74 @@ impl PropertyPathOperator {
             .await
     }
 
+    /// Layered BFS for a **bounded** path (`max_hops` set). Tracks visited per
+    /// `(node, depth)` rather than per node, so a node first reached below
+    /// `min_hops` can still be reached on a longer in-range path — the correct
+    /// `*2..3` semantics (a plain node-visited set would suppress it, and then
+    /// disagree with the bound-bound `path_exists` form). Output is de-duped.
+    /// Termination is guaranteed by the finite depth cap. Only untyped paths
+    /// reach the operator with bounds (typed bounded ranges lower to a UNION of
+    /// fixed-length chains), so this never runs for SPARQL/typed paths.
+    async fn traverse_bounded(
+        &self,
+        ctx: &ExecutionContext<'_>,
+        anchor: &Sid,
+        forward: bool,
+    ) -> Result<Vec<Sid>> {
+        let max = self
+            .pattern
+            .max_hops
+            .expect("bounded traversal needs max_hops");
+        let mut frontier: Vec<Sid> = vec![anchor.clone()];
+        let mut seen_at_depth: HashSet<(Sid, u32)> = HashSet::new();
+        seen_at_depth.insert((anchor.clone(), 0));
+        let mut emitted: Vec<Sid> = Vec::new();
+        let mut emitted_set: HashSet<Sid> = HashSet::new();
+        if self.emit_at_depth(0) {
+            emitted.push(anchor.clone());
+            emitted_set.insert(anchor.clone());
+        }
+
+        let mut depth = 0u32;
+        while depth < max && !frontier.is_empty() {
+            crate::fast_path_common::bail_if_cancelled(&ctx.cancellation)?;
+            if seen_at_depth.len() >= self.max_visited {
+                return Err(QueryError::ResourceLimit(format!(
+                    "Property path exceeded max visited nodes ({})",
+                    self.max_visited
+                )));
+            }
+            let next_depth = depth + 1;
+            let mut next_frontier: Vec<Sid> = Vec::new();
+            for node in &frontier {
+                let neighbors = if forward {
+                    self.forward_step(ctx, node).await?
+                } else {
+                    self.backward_step(ctx, node).await?
+                };
+                for nb in neighbors {
+                    if self.emit_at_depth(next_depth) && emitted_set.insert(nb.clone()) {
+                        emitted.push(nb.clone());
+                    }
+                    if seen_at_depth.insert((nb.clone(), next_depth)) {
+                        next_frontier.push(nb);
+                    }
+                }
+            }
+            frontier = next_frontier;
+            depth = next_depth;
+        }
+        Ok(emitted)
+    }
+
     /// Traverse forward from a starting node (subject bound)
     ///
     /// Uses SPOT index: (subject=start, predicate=path_pred)
     /// Returns all reachable nodes via the transitive predicate.
     async fn traverse_forward(&self, ctx: &ExecutionContext<'_>, start: &Sid) -> Result<Vec<Sid>> {
+        if self.pattern.max_hops.is_some() {
+            return self.traverse_bounded(ctx, start, true).await;
+        }
         let mut visited: HashSet<Sid> = HashSet::new();
         let mut queue: VecDeque<(Sid, u32)> = VecDeque::new();
         let mut results: Vec<Sid> = Vec::new();
@@ -356,6 +419,9 @@ impl PropertyPathOperator {
         ctx: &ExecutionContext<'_>,
         target: &Sid,
     ) -> Result<Vec<Sid>> {
+        if self.pattern.max_hops.is_some() {
+            return self.traverse_bounded(ctx, target, false).await;
+        }
         let mut visited: HashSet<Sid> = HashSet::new();
         let mut queue: VecDeque<(Sid, u32)> = VecDeque::new();
         let mut results: Vec<Sid> = Vec::new();
@@ -464,6 +530,46 @@ impl PropertyPathOperator {
 
         let mut out: Vec<(Sid, Sid)> = Vec::new();
         for start in &nodes {
+            // Bounded path: layered (node, depth) BFS over the adjacency map, so
+            // a node first reached below `min_hops` can still be reached on a
+            // longer in-range path (matches `traverse_bounded`).
+            if let Some(max) = self.pattern.max_hops {
+                let mut frontier: Vec<Sid> = vec![start.clone()];
+                let mut seen_at_depth: HashSet<(Sid, u32)> = HashSet::new();
+                seen_at_depth.insert((start.clone(), 0));
+                let mut emitted: HashSet<Sid> = HashSet::new();
+                if self.emit_at_depth(0) {
+                    out.push((start.clone(), start.clone()));
+                    emitted.insert(start.clone());
+                }
+                let mut depth = 0u32;
+                while depth < max && !frontier.is_empty() {
+                    if seen_at_depth.len() >= self.max_visited {
+                        return Err(QueryError::ResourceLimit(format!(
+                            "Property path exceeded max visited nodes ({})",
+                            self.max_visited
+                        )));
+                    }
+                    let next_depth = depth + 1;
+                    let mut next_frontier: Vec<Sid> = Vec::new();
+                    for node in &frontier {
+                        if let Some(nexts) = adj.get(node) {
+                            for n in nexts {
+                                if self.emit_at_depth(next_depth) && emitted.insert(n.clone()) {
+                                    out.push((start.clone(), n.clone()));
+                                }
+                                if seen_at_depth.insert((n.clone(), next_depth)) {
+                                    next_frontier.push(n.clone());
+                                }
+                            }
+                        }
+                    }
+                    frontier = next_frontier;
+                    depth = next_depth;
+                }
+                continue;
+            }
+
             // BFS from start using adjacency only (no DB calls).
             let mut visited: HashSet<Sid> = HashSet::new();
             let mut queue: VecDeque<(Sid, u32)> = VecDeque::new();

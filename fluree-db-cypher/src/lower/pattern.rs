@@ -467,18 +467,32 @@ fn lower_untyped_var_length_rel<E: IriEncoder>(
         .expect("caller checked length.is_some()");
     let lo = length.min.unwrap_or(1);
     let hi = length.max; // None = unbounded
-    if let Some(hi) = hi {
-        if hi < lo {
+    match hi {
+        Some(hi) => {
+            if hi < lo {
+                return Err(LowerError::unsupported(
+                    "variable-length path upper bound must be ≥ the lower bound",
+                ));
+            }
+            if hi > MAX_BOUNDED_HOPS {
+                return Err(LowerError::unsupported(
+                    "bounded variable-length paths above 16 hops are not supported; use an \
+                     unbounded `*` for deeper traversal",
+                ));
+            }
+        }
+        // An UNBOUNDED lower bound above 1 (`-[*2..]->`) can't be evaluated
+        // soundly with the transitive operator's node-reachability state (a node
+        // reached below the bound on its shortest path would be wrongly
+        // suppressed, with no finite depth cap to recover it). Bounded ranges
+        // (`-[*2..5]->`) are fine — give an upper bound, or name a type.
+        None if lo >= 2 => {
             return Err(LowerError::unsupported(
-                "variable-length path upper bound must be ≥ the lower bound",
+                "an untyped variable-length path with a lower bound above 1 needs an upper \
+                 bound (`-[*2..N]->`) or a named type (`-[:T*2..]->`)",
             ));
         }
-        if hi > MAX_BOUNDED_HOPS {
-            return Err(LowerError::unsupported(
-                "bounded variable-length paths above 16 hops are not supported; use an \
-                 unbounded `*` for deeper traversal",
-            ));
-        }
+        None => {}
     }
 
     let left_ref = lookup_node_ref(ctx, left);

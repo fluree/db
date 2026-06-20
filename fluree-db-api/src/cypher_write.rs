@@ -80,6 +80,18 @@ pub fn detect_conditional(ast: &CypherAst) -> Option<ConditionalCypherWrite> {
             if u.read_clauses.is_empty() {
                 return None;
             }
+            // A `WITH` between the MATCH and the DELETE re-scopes/renames
+            // variables (`WITH a AS p`, or dropping a rel var). The DELETE
+            // classifier and the rel-var lowering key off the *raw* MATCH
+            // variables, so they can't honor that horizon — route WITH+DELETE to
+            // the single-Txn lowering, which rejects it with a clear error rather
+            // than mis-classifying or deleting an out-of-scope variable.
+            if u.read_clauses
+                .iter()
+                .any(|c| matches!(c, ReadClause::With(_)))
+            {
+                return None;
+            }
             let rel_targets = d.targets.iter().filter(|t| is_rel_var(u, &t.name)).count();
             if rel_targets == d.targets.len() && rel_targets > 0 {
                 Some(ConditionalCypherWrite::DeleteRel(u.clone()))

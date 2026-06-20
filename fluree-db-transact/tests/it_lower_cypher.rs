@@ -430,6 +430,24 @@ fn with_distinct_or_slice_before_write_is_rejected() {
 }
 
 #[test]
+fn with_before_delete_is_rejected() {
+    // DELETE resolution keys off the raw MATCH variables, so a WITH rename or
+    // dropped target can't be honored — reject the combination outright (rather
+    // than mis-routing or deleting an out-of-scope variable).
+    for src in [
+        r#"MATCH (a:Person) WITH a AS p DELETE p"#,
+        r#"MATCH (a:Person)-[r:KNOWS]->(b:Person) WITH r AS edge DELETE edge"#,
+        r#"MATCH (a:Person)-[r:KNOWS]->(b:Person) WITH a DELETE r"#,
+    ] {
+        let msg = lower_err(src);
+        assert!(
+            msg.contains("WITH before DELETE"),
+            "expected a WITH-before-DELETE rejection for `{src}`, got: {msg}"
+        );
+    }
+}
+
+#[test]
 fn merge_single_node_emits_not_exists_guard_and_create_inserts() {
     use fluree_db_query::parse::UnresolvedPattern;
     let txn = lower(r#"MERGE (n:Person {name: "Alice"})"#);

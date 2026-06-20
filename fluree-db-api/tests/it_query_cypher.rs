@@ -1533,6 +1533,73 @@ async fn cypher_untyped_path_unbounded_reaches_whole_chain() {
 }
 
 #[tokio::test]
+async fn cypher_untyped_path_diamond_lower_bound_is_consistent() {
+    // Diamond: Alice -KNOWS-> Bob, and Alice -KNOWS-> Carol -KNOWS-> Bob.
+    // `*2..2` from Alice must include Bob via the length-2 path Alice->Carol->Bob
+    // even though Bob is ALSO reachable in 1 hop — the layered (node,depth) BFS
+    // doesn't suppress the longer in-range path. Bound-unbound (RETURN x) and
+    // bound-bound (RETURN exists) must agree.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = genesis_ledger(&fluree, "it/cypher:untyped-diamond");
+    let l = fluree
+        .transact_cypher(
+            l,
+            r#"CREATE (a:Person {name: "Alice"})-[:KNOWS]->(b:Person {name: "Bob"}),
+                      (a)-[:KNOWS]->(c:Person {name: "Carol"}),
+                      (c)-[:KNOWS]->(b)"#,
+        )
+        .await
+        .expect("seed")
+        .ledger;
+
+    // Bound-unbound: who is exactly 2 hops from Alice? Bob (via Carol).
+    let rows = cypher_names(
+        &fluree,
+        &l,
+        r#"MATCH (a:Person {name: "Alice"})-[*2..2]->(x) RETURN x.name AS n ORDER BY n"#,
+    )
+    .await;
+    assert_eq!(
+        rows,
+        json!([["Bob"]]),
+        "*2..2 reaches Bob via the length-2 path despite the 1-hop edge: {rows}"
+    );
+
+    // Bound-bound: the same query with Bob bound must also see the path.
+    let db = graphdb_from_ledger(&l);
+    let exists = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (a:Person {name: "Alice"})-[*2..2]->(b:Person {name: "Bob"}) RETURN b"#,
+        )
+        .await
+        .expect("bound-bound")
+        .row_count();
+    assert_eq!(exists, 1, "bound-bound agrees with bound-unbound");
+}
+
+#[tokio::test]
+async fn cypher_untyped_path_unbounded_lower_bound_above_one_is_rejected() {
+    // `-[*2..]->` (unbounded, lower bound > 1) can't be evaluated soundly — it
+    // must be rejected with a clear error.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = genesis_ledger(&fluree, "it/cypher:untyped-unbounded-lo");
+    let l = fluree
+        .transact_cypher(l, r#"CREATE (a:Person {name: "Alice"})"#)
+        .await
+        .expect("seed")
+        .ledger;
+    let db = graphdb_from_ledger(&l);
+    let err = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (a:Person {name: "Alice"})-[*2..]->(x) RETURN x"#,
+        )
+        .await;
+    assert!(err.is_err(), "unbounded *2.. should be rejected");
+}
+
+#[tokio::test]
 async fn cypher_untyped_path_lower_bound_excludes_near_nodes() {
     let fluree = FlureeBuilder::memory().build_memory();
     let l = untyped_path_chain(&fluree, "it/cypher:untyped-lo").await;
@@ -1657,6 +1724,58 @@ async fn cypher_properties_and_keys() {
         keys["results"][0]["data"][0]["row"][0],
         json!(["age", "name"]),
         "keys() is the sorted property names: {keys}"
+    );
+}
+
+#[tokio::test]
+async fn cypher_map_value_reused_and_nested() {
+    // A map-valued variable reused inside another value must survive the
+    // round-trip (the `try_eval_to_binding` Map passthrough), and maps nest
+    // maps/lists.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = genesis_ledger(&fluree, "it/cypher:map-nested");
+    let l = fluree
+        .transact_cypher(l, r#"CREATE (p:Person {name: "Alice", age: 30})"#)
+        .await
+        .expect("seed")
+        .ledger;
+    let db = graphdb_from_ledger(&l);
+
+    // Reuse a map var: `WITH properties(p) AS props RETURN {wrapped: props}`.
+    let reused = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (p:Person {name: "Alice"})
+               WITH p, properties(p) AS props
+               RETURN {name: p.name, props: props} AS row"#,
+        )
+        .await
+        .expect("query")
+        .to_cypher_json_async(db.as_graph_db_ref())
+        .await
+        .expect("cypher json");
+    assert_eq!(
+        reused["results"][0]["data"][0]["row"][0],
+        json!({"name": "Alice", "props": {"name": "Alice", "age": 30}}),
+        "map var reused inside a map literal: {reused}"
+    );
+
+    // Nested map + list literal in one shape.
+    let nested = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (p:Person {name: "Alice"})
+               RETURN {nums: [1, 2, 3], info: {city: "NYC"}} AS row"#,
+        )
+        .await
+        .expect("query")
+        .to_cypher_json_async(db.as_graph_db_ref())
+        .await
+        .expect("cypher json");
+    assert_eq!(
+        nested["results"][0]["data"][0]["row"][0],
+        json!({"nums": [1, 2, 3], "info": {"city": "NYC"}}),
+        "nested map + list: {nested}"
     );
 }
 
@@ -1809,6 +1928,42 @@ async fn transact_cypher_with_filter_gates_a_write() {
         rows,
         serde_json::json!([["Alice"]]),
         "only the over-30 person was flagged: {rows}"
+    );
+}
+
+#[tokio::test]
+async fn transact_cypher_with_before_delete_is_rejected_not_silent() {
+    // `WITH a DELETE r` (r dropped by WITH) must error through the real
+    // classifier→lowering path, not silently delete the out-of-scope edge.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = genesis_ledger(&fluree, "it/cypher:with-delete");
+    let l = fluree
+        .transact_cypher(
+            l,
+            r#"CREATE (a:Person {name: "Alice"})-[:KNOWS]->(b:Person {name: "Bob"})"#,
+        )
+        .await
+        .expect("seed")
+        .ledger;
+
+    let res = fluree
+        .transact_cypher(
+            l.clone(),
+            r#"MATCH (a:Person)-[r:KNOWS]->(b:Person) WITH a DELETE r"#,
+        )
+        .await;
+    assert!(res.is_err(), "WITH before DELETE must be rejected");
+
+    // The edge is untouched — the rejection happened before any staging.
+    let db = graphdb_from_ledger(&l);
+    assert_eq!(
+        fluree
+            .query_cypher(&db, "MATCH (a:Person)-[:KNOWS]->(b:Person) RETURN a, b")
+            .await
+            .unwrap()
+            .row_count(),
+        1,
+        "the KNOWS edge survives the rejected DELETE"
     );
 }
 

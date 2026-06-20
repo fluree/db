@@ -252,6 +252,26 @@ impl<'a> CypherLowering<'a> {
             ));
         }
 
+        // WITH before DELETE is rejected: DELETE resolution (the rel-var edge map
+        // and the API delete-classifier) keys off the raw MATCH variables, so it
+        // can't honor a WITH rename/horizon — a renamed or dropped target would
+        // be mis-handled. WITH before CREATE/SET/REMOVE is fine (those go through
+        // `require_bound`, which respects the narrowed scope).
+        let has_with = update
+            .read_clauses
+            .iter()
+            .any(|c| matches!(c, ReadClause::With(_)));
+        let has_delete = update
+            .write_clauses
+            .iter()
+            .any(|w| matches!(w, WriteClause::Delete(_)));
+        if has_with && has_delete {
+            return Err(LowerCypherError::unsupported(
+                "WITH before DELETE is not supported — re-scoping or renaming a DELETE target \
+                 through WITH is deferred; DELETE directly off the MATCH variables",
+            ));
+        }
+
         // Lower any leading MATCH / OPTIONAL MATCH into where_patterns.
         // Their presence flips the transaction into Update mode (DELETE /
         // INSERT templates reference the bound variables).
