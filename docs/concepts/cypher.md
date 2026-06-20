@@ -243,7 +243,9 @@ ORDER BY / SKIP / LIMIT
   node element scans the property at eval time. The list position may aggregate
   (`[x IN collect(p) | x.name]`). A null / non-list input yields null (not an
   empty list); empty-list identities are `all`/`none` = true, `any`/`single` =
-  false. (Write-side `MATCH … WHERE` doesn't yet accept these.)
+  false. (`EXISTS { … }` inside a list-iteration body is rejected — it would
+  need per-element async subquery evaluation; write-side `MATCH … WHERE` doesn't
+  accept these forms either.)
 - Metadata functions: `labels(n)` returns the node's Cypher label strings
   (from live `rdf:type` assertions, overlay-aware); `type(r)` returns the
   relationship type string for a named relationship variable (from

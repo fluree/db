@@ -199,12 +199,14 @@ pub fn lower_expr<E: IriEncoder>(
                 .transpose()?
                 .map(Box::new);
             ctx.exit_scope();
-            Ok(Expression::ListComprehension {
+            let built = Expression::ListComprehension {
                 var: loop_var,
                 list: list_expr,
                 filter: filter_expr,
                 map: map_expr,
-            })
+            };
+            reject_exists_in_iteration(&built)?;
+            Ok(built)
         }
         Expr::Reduce(r) => {
             let init_expr = Box::new(lower_expr(ctx, &r.init, aux)?);
@@ -214,13 +216,15 @@ pub fn lower_expr<E: IriEncoder>(
             let loop_var = ctx.bind_local(&r.var.name);
             let body_expr = Box::new(lower_expr(ctx, &r.body, aux)?);
             ctx.exit_scope();
-            Ok(Expression::Reduce {
+            let built = Expression::Reduce {
                 acc: acc_var,
                 init: init_expr,
                 var: loop_var,
                 list: list_expr,
                 body: body_expr,
-            })
+            };
+            reject_exists_in_iteration(&built)?;
+            Ok(built)
         }
         Expr::ListPredicate(pred) => {
             let list_expr = Box::new(lower_expr(ctx, &pred.list, aux)?);
@@ -228,12 +232,14 @@ pub fn lower_expr<E: IriEncoder>(
             let loop_var = ctx.bind_local(&pred.var.name);
             let pred_expr = Box::new(lower_expr(ctx, &pred.predicate, aux)?);
             ctx.exit_scope();
-            Ok(Expression::ListPredicate {
+            let built = Expression::ListPredicate {
                 kind: lower_list_predicate_kind(pred.kind),
                 var: loop_var,
                 list: list_expr,
                 predicate: pred_expr,
-            })
+            };
+            reject_exists_in_iteration(&built)?;
+            Ok(built)
         }
         Expr::Call(call) => {
             let name = call.name.to_ascii_lowercase();
@@ -285,6 +291,22 @@ pub fn lower_expr<E: IriEncoder>(
             Ok(Expression::call(func, args))
         }
     }
+}
+
+/// Reject an `EXISTS { … }` anywhere inside a list-iteration expression. An
+/// `EXISTS` there typically references the loop-local element and would need
+/// row-local **async** subquery evaluation per element — but list iteration runs
+/// in the synchronous per-element eval path, and the FilterOperator's EXISTS
+/// pre-resolver doesn't (and shouldn't) descend into these scoped bodies. Reject
+/// with a clear error rather than silently evaluating the `EXISTS` as false.
+fn reject_exists_in_iteration(built: &Expression) -> Result<()> {
+    if fluree_db_query::filter::contains_exists(built) {
+        return Err(LowerError::unsupported(
+            "EXISTS inside a list comprehension / reduce / list predicate is not supported — \
+             it would need per-element async subquery evaluation",
+        ));
+    }
+    Ok(())
 }
 
 /// Map the Cypher list-predicate kind to the query IR kind.

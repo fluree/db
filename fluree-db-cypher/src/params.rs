@@ -395,23 +395,31 @@ fn collect_alias_in_expr(e: &Expr, alias: &str, fields: &mut Vec<String>, bare: 
                 collect_alias_in_expr(v, alias, fields, bare);
             }
         }
+        // Always inspect the outer-scope list/init; only descend into a scoped
+        // body when the loop/acc var doesn't shadow the UNWIND alias.
         Expr::ListComprehension(c) => {
             collect_alias_in_expr(&c.list, alias, fields, bare);
-            if let Some(f) = &c.filter {
-                collect_alias_in_expr(f, alias, fields, bare);
-            }
-            if let Some(m) = &c.map {
-                collect_alias_in_expr(m, alias, fields, bare);
+            if c.var.name != alias {
+                if let Some(f) = &c.filter {
+                    collect_alias_in_expr(f, alias, fields, bare);
+                }
+                if let Some(m) = &c.map {
+                    collect_alias_in_expr(m, alias, fields, bare);
+                }
             }
         }
         Expr::Reduce(r) => {
             collect_alias_in_expr(&r.init, alias, fields, bare);
             collect_alias_in_expr(&r.list, alias, fields, bare);
-            collect_alias_in_expr(&r.body, alias, fields, bare);
+            if r.acc.name != alias && r.var.name != alias {
+                collect_alias_in_expr(&r.body, alias, fields, bare);
+            }
         }
         Expr::ListPredicate(p) => {
             collect_alias_in_expr(&p.list, alias, fields, bare);
-            collect_alias_in_expr(&p.predicate, alias, fields, bare);
+            if p.var.name != alias {
+                collect_alias_in_expr(&p.predicate, alias, fields, bare);
+            }
         }
         Expr::Lit(_) | Expr::Param(_) | Expr::Case(_) | Expr::Exists(_, _, _) => {}
     }
@@ -556,21 +564,27 @@ fn rewrite_alias_in_expr_to_var<F: Fn(&str) -> String>(
         }
         Expr::ListComprehension(c) => {
             rewrite_alias_in_expr_to_var(&mut c.list, alias, col_var, bare_var);
-            if let Some(f) = &mut c.filter {
-                rewrite_alias_in_expr_to_var(f, alias, col_var, bare_var);
-            }
-            if let Some(m) = &mut c.map {
-                rewrite_alias_in_expr_to_var(m, alias, col_var, bare_var);
+            if c.var.name != alias {
+                if let Some(f) = &mut c.filter {
+                    rewrite_alias_in_expr_to_var(f, alias, col_var, bare_var);
+                }
+                if let Some(m) = &mut c.map {
+                    rewrite_alias_in_expr_to_var(m, alias, col_var, bare_var);
+                }
             }
         }
         Expr::Reduce(r) => {
             rewrite_alias_in_expr_to_var(&mut r.init, alias, col_var, bare_var);
             rewrite_alias_in_expr_to_var(&mut r.list, alias, col_var, bare_var);
-            rewrite_alias_in_expr_to_var(&mut r.body, alias, col_var, bare_var);
+            if r.acc.name != alias && r.var.name != alias {
+                rewrite_alias_in_expr_to_var(&mut r.body, alias, col_var, bare_var);
+            }
         }
         Expr::ListPredicate(p) => {
             rewrite_alias_in_expr_to_var(&mut p.list, alias, col_var, bare_var);
-            rewrite_alias_in_expr_to_var(&mut p.predicate, alias, col_var, bare_var);
+            if p.var.name != alias {
+                rewrite_alias_in_expr_to_var(&mut p.predicate, alias, col_var, bare_var);
+            }
         }
         Expr::Var(_) | Expr::Lit(_) | Expr::Param(_) | Expr::Case(_) | Expr::Exists(_, _, _) => {}
     }
@@ -692,22 +706,30 @@ fn replace_alias_in_expr(
         }
         Expr::ListComprehension(c) => {
             replace_alias_in_expr(&mut c.list, alias, elem, pname)?;
-            if let Some(f) = &mut c.filter {
-                replace_alias_in_expr(f, alias, elem, pname)?;
-            }
-            if let Some(m) = &mut c.map {
-                replace_alias_in_expr(m, alias, elem, pname)?;
+            if c.var.name != alias {
+                if let Some(f) = &mut c.filter {
+                    replace_alias_in_expr(f, alias, elem, pname)?;
+                }
+                if let Some(m) = &mut c.map {
+                    replace_alias_in_expr(m, alias, elem, pname)?;
+                }
             }
             Ok(())
         }
         Expr::Reduce(r) => {
             replace_alias_in_expr(&mut r.init, alias, elem, pname)?;
             replace_alias_in_expr(&mut r.list, alias, elem, pname)?;
-            replace_alias_in_expr(&mut r.body, alias, elem, pname)
+            if r.acc.name != alias && r.var.name != alias {
+                replace_alias_in_expr(&mut r.body, alias, elem, pname)?;
+            }
+            Ok(())
         }
         Expr::ListPredicate(p) => {
             replace_alias_in_expr(&mut p.list, alias, elem, pname)?;
-            replace_alias_in_expr(&mut p.predicate, alias, elem, pname)
+            if p.var.name != alias {
+                replace_alias_in_expr(&mut p.predicate, alias, elem, pname)?;
+            }
+            Ok(())
         }
         Expr::Case(_) | Expr::Exists(_, _, _) | Expr::Var(_) | Expr::Lit(_) | Expr::Param(_) => {
             Ok(())
@@ -1037,6 +1059,51 @@ mod tests {
 
     fn params(json: serde_json::Value) -> ParamMap {
         json.as_object().unwrap().clone()
+    }
+
+    #[test]
+    fn unwind_alias_rewrite_respects_comprehension_binder() {
+        use crate::ast::{ListComprehensionExpr, Literal, Variable};
+        let span = SourceSpan::new(0, 0);
+        let var = |name: &str| Variable {
+            name: name.to_string(),
+            span,
+        };
+        let comp = |binder: &str| {
+            Expr::ListComprehension(Box::new(ListComprehensionExpr {
+                var: var(binder),
+                list: Box::new(Expr::List(vec![Expr::Lit(Literal::Integer(1, span))], span)),
+                filter: None,
+                // body references `row` — the UNWIND alias.
+                map: Some(Box::new(Expr::Var(var("row")))),
+                span,
+            }))
+        };
+        let col = |f: &str| format!("?col_{f}");
+
+        // Binder `row` shadows the alias → the body's `row` is the loop var and
+        // must be left untouched.
+        let mut shadowed = comp("row");
+        rewrite_alias_in_expr_to_var(&mut shadowed, "row", &col, Some("?bare_row"));
+        let Expr::ListComprehension(c) = &shadowed else {
+            unreachable!()
+        };
+        assert!(
+            matches!(c.map.as_deref(), Some(Expr::Var(v)) if v.name == "row"),
+            "shadowed loop var must not be rewritten: {shadowed:?}"
+        );
+
+        // Binder `x` does NOT shadow → the body's `row` is the outer alias and
+        // is rewritten to the bare column var.
+        let mut free = comp("x");
+        rewrite_alias_in_expr_to_var(&mut free, "row", &col, Some("?bare_row"));
+        let Expr::ListComprehension(c) = &free else {
+            unreachable!()
+        };
+        assert!(
+            matches!(c.map.as_deref(), Some(Expr::Var(v)) if v.name == "?bare_row"),
+            "non-shadowed alias must be rewritten: {free:?}"
+        );
     }
 
     /// Parse, substitute, and return the (possibly mutated) AST or the param

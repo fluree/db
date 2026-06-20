@@ -250,6 +250,28 @@ fn untyped_zero_or_more_bounded() {
 }
 
 #[test]
+fn exists_inside_list_iteration_is_rejected() {
+    // EXISTS inside a comprehension/reduce/predicate would need per-element
+    // async subquery evaluation — rejected with a clear error.
+    for src in [
+        r#"MATCH (p:Person)
+           RETURN [x IN [1] WHERE EXISTS { (p)-[:KNOWS]->(:Person) } | x] AS r"#,
+        r#"MATCH (p:Person)
+           RETURN any(x IN [1] WHERE EXISTS { (p)-[:KNOWS]->(:Person) }) AS r"#,
+    ] {
+        let out = parse_cypher(src);
+        assert!(!out.has_errors(), "parse should accept: {src}");
+        let ast = out.ast.unwrap();
+        let encoder = NoEncoder;
+        let mut vars = VarRegistry::new();
+        assert!(
+            lower_cypher(&ast, &encoder, &mut vars).is_err(),
+            "EXISTS inside list iteration should be rejected: {src}"
+        );
+    }
+}
+
+#[test]
 fn untyped_undirected_is_rejected() {
     let out = parse_cypher("MATCH (a:Person)-[*1..3]-(b) RETURN b");
     assert!(!out.has_errors(), "parse should accept it");
