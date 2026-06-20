@@ -56,6 +56,7 @@ pub fn lower_expr<E: IriEncoder>(
                 BinOp::Sub => Function::Sub,
                 BinOp::Mul => Function::Mul,
                 BinOp::Div => Function::Div,
+                BinOp::Mod => Function::Mod,
                 BinOp::And => Function::And,
                 BinOp::Or => Function::Or,
             };

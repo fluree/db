@@ -216,6 +216,146 @@ async fn transact_cypher_set_property_replaces_old_value() {
 }
 
 #[tokio::test]
+async fn transact_cypher_set_map_replace_preserves_labels_and_relationships() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/cypher:set-map-replace");
+
+    let committed = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": ctx(),
+                "@graph": [
+                    {
+                        "@id": "ex:alice",
+                        "@type": "ex:Person",
+                        "ex:name": "Alice",
+                        "ex:age": 25,
+                        "ex:KNOWS": {"@id": "ex:bob"}
+                    },
+                    {
+                        "@id": "ex:bob",
+                        "@type": "ex:Person",
+                        "ex:name": "Bob",
+                        "ex:age": 35
+                    }
+                ]
+            }),
+        )
+        .await
+        .expect("seed");
+
+    let updated = fluree
+        .transact_cypher(
+            committed.ledger,
+            r#"MATCH (n:Person {name: "Alice"}) SET n = {name: "Alicia", city: "Paris"}"#,
+        )
+        .await
+        .expect("set map replace");
+
+    let db = graphdb_from_ledger(&updated.ledger);
+    let replaced = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (n:Person {name: "Alicia", city: "Paris"}) RETURN n"#,
+        )
+        .await
+        .expect("query replacement props");
+    assert_eq!(replaced.row_count(), 1, "replacement properties inserted");
+
+    let old_props = fluree
+        .query_cypher(&db, r#"MATCH (n:Person {name: "Alice"}) RETURN n"#)
+        .await
+        .expect("query old name");
+    assert_eq!(old_props.row_count(), 0, "old scalar properties removed");
+
+    let old_age = fluree
+        .query_cypher(&db, "MATCH (n:Person {age: 25}) RETURN n")
+        .await
+        .expect("query old age");
+    assert_eq!(old_age.row_count(), 0, "omitted scalar properties removed");
+
+    let relationship = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (a:Person {name: "Alicia"})-[:KNOWS]->(b:Person {name: "Bob"}) RETURN a, b"#,
+        )
+        .await
+        .expect("query relationship");
+    assert_eq!(relationship.row_count(), 1, "relationships are preserved");
+}
+
+#[tokio::test]
+async fn transact_cypher_match_where_set_filters_target_rows() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/cypher:match-where-set");
+
+    let committed = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": ctx(),
+                "@graph": [
+                    {"@id": "ex:alice", "@type": "ex:Person", "ex:name": "Alice", "ex:age": 25},
+                    {"@id": "ex:bob",   "@type": "ex:Person", "ex:name": "Bob",   "ex:age": 35},
+                ]
+            }),
+        )
+        .await
+        .expect("seed");
+
+    let updated = fluree
+        .transact_cypher(
+            committed.ledger,
+            r#"MATCH (n:Person) WHERE n.age > 30 SET n.status = "senior""#,
+        )
+        .await
+        .expect("match where set");
+
+    let db = graphdb_from_ledger(&updated.ledger);
+    let rows = fluree
+        .query_cypher(&db, r#"MATCH (n:Person {status: "senior"}) RETURN n"#)
+        .await
+        .expect("query status");
+    assert_eq!(rows.row_count(), 1, "only Bob should be updated");
+}
+
+#[tokio::test]
+async fn transact_cypher_match_where_is_null_set() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/cypher:match-where-null");
+
+    let committed = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": ctx(),
+                "@graph": [
+                    {"@id": "ex:alice", "@type": "ex:Person", "ex:name": "Alice", "ex:age": 25},
+                    {"@id": "ex:bob",   "@type": "ex:Person", "ex:name": "Bob"},
+                ]
+            }),
+        )
+        .await
+        .expect("seed");
+
+    let updated = fluree
+        .transact_cypher(
+            committed.ledger,
+            r#"MATCH (n:Person) WHERE n.age IS NULL SET n.status = "missing-age""#,
+        )
+        .await
+        .expect("match where is null set");
+
+    let db = graphdb_from_ledger(&updated.ledger);
+    let rows = fluree
+        .query_cypher(&db, r#"MATCH (n:Person {status: "missing-age"}) RETURN n"#)
+        .await
+        .expect("query status");
+    assert_eq!(rows.row_count(), 1, "only Bob lacks age");
+}
+
+#[tokio::test]
 async fn transact_cypher_match_create_links_existing_nodes() {
     // MATCH binds Alice and Bob; CREATE links them with a new edge.
     let fluree = FlureeBuilder::memory().build_memory();
@@ -245,6 +385,44 @@ async fn transact_cypher_match_create_links_existing_nodes() {
         .await
         .expect("query edge");
     assert_eq!(rows.row_count(), 1, "Alice KNOWS Bob should exist");
+}
+
+#[tokio::test]
+async fn transact_cypher_match_where_create_links_existing_nodes() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/cypher:match-where-create");
+
+    let committed = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": ctx(),
+                "@graph": [
+                    {"@id": "ex:alice", "@type": "ex:Person", "ex:name": "Alice"},
+                    {"@id": "ex:bob",   "@type": "ex:Person", "ex:name": "Bob"},
+                    {"@id": "ex:eve",   "@type": "ex:Person", "ex:name": "Eve"},
+                ]
+            }),
+        )
+        .await
+        .expect("seed");
+
+    let linked = fluree
+        .transact_cypher(
+            committed.ledger,
+            r#"MATCH (a:Person), (b:Person)
+               WHERE a.name = "Alice" AND b.name STARTS WITH "B"
+               CREATE (a)-[:KNOWS]->(b)"#,
+        )
+        .await
+        .expect("match where create");
+
+    let db = graphdb_from_ledger(&linked.ledger);
+    let rows = fluree
+        .query_cypher(&db, "MATCH (a:Person)-[:KNOWS]->(b:Person) RETURN a, b")
+        .await
+        .expect("query edge");
+    assert_eq!(rows.row_count(), 1, "only Alice KNOWS Bob should exist");
 }
 
 #[tokio::test]
@@ -722,6 +900,83 @@ async fn cypher_aggregate_composed_into_expression() {
 }
 
 #[tokio::test]
+async fn cypher_aggregate_expression_argument() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = seed_nodes_with_ids(&fluree, "it/cypher:agg-expression-arg").await;
+    let db = graphdb_from_ledger(&l);
+
+    let result = fluree
+        .query_cypher(&db, "MATCH (n:Person) RETURN sum(n.id * 2) AS total")
+        .await
+        .expect("sum expression arg")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    assert_eq!(result[0][0], json!(12), "(1 + 2 + 3) * 2 = 12: {result}");
+}
+
+#[tokio::test]
+async fn cypher_xor_expression_filters_rows() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = seed_nodes_with_ids(&fluree, "it/cypher:xor").await;
+    let db = graphdb_from_ledger(&l);
+
+    let rows = fluree
+        .query_cypher(
+            &db,
+            "MATCH (n:Person) WHERE n.id = 1 XOR n.id = 2 RETURN n ORDER BY n.id",
+        )
+        .await
+        .expect("xor query");
+    assert_eq!(rows.row_count(), 2, "ids 1 and 2 satisfy exactly one side");
+}
+
+#[tokio::test]
+async fn cypher_modulus_expression_filters_rows() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = seed_nodes_with_ids(&fluree, "it/cypher:modulus").await;
+    let db = graphdb_from_ledger(&l);
+
+    let rows = fluree
+        .query_cypher(
+            &db,
+            "MATCH (n:Person) WHERE n.id % 2 = 1 RETURN n ORDER BY n.id",
+        )
+        .await
+        .expect("modulus query");
+    assert_eq!(rows.row_count(), 2, "ids 1 and 3 are odd");
+}
+
+#[tokio::test]
+async fn cypher_with_star_carries_visible_vars_only() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = seed_nodes_with_ids(&fluree, "it/cypher:with-star").await;
+    let db = graphdb_from_ledger(&l);
+
+    let result = fluree
+        .query_cypher(
+            &db,
+            "MATCH (n:Person) WHERE n.id > 1 WITH * RETURN * ORDER BY n.id",
+        )
+        .await
+        .expect("WITH * query")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    let rows = result.as_array().expect("rows");
+    assert_eq!(rows.len(), 2, "ids 2 and 3 survive the WITH boundary");
+    for row in rows {
+        let row = row.as_object().expect("wildcard row object");
+        assert_eq!(
+            row.len(),
+            1,
+            "WITH * should not expose synthetic property-accessor vars: {result}"
+        );
+        assert!(row.contains_key("n"), "WITH * should keep user variable n");
+    }
+}
+
+#[tokio::test]
 async fn cypher_order_by_property_accessor_grouping_key() {
     // ORDER BY a grouping key written as a property accessor (`f.id`, not its
     // alias) must work under aggregation — it should behave like ORDER BY the
@@ -966,12 +1221,6 @@ async fn transact_cypher_bare_delete_removes_relationship_free_node() {
     );
 }
 
-// Known gap: the bare-DELETE guard probes a node's relationships via an
-// untyped rel-var pattern `(n)-[r]->()`, which queries the `f:reifies*`
-// sidecar — now hidden by the tightened edge-annotation read-side firewall, so
-// the guard finds no relationship and allows the delete. Tracked for a focused
-// fix in the per-edge-annotation probe path.
-#[ignore = "bare-DELETE relationship guard vs edge-annotation firewall — tracked separately"]
 #[tokio::test]
 async fn transact_cypher_bare_delete_errors_when_node_has_relationships() {
     let fluree = FlureeBuilder::memory().build_memory();

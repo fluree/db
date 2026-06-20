@@ -441,6 +441,17 @@ impl ProjectionState {
         Ok(())
     }
 
+    fn expand_star<E: IriEncoder>(&mut self, ctx: &LoweringContext<'_, E>, patterns: &[Pattern]) {
+        for var in visible_vars_from_patterns(ctx, patterns) {
+            if !self.vars.contains(&var) {
+                self.vars.push(var);
+            }
+            if !self.group_keys.contains(&var) {
+                self.group_keys.push(var);
+            }
+        }
+    }
+
     /// Lower a projection item whose expression *contains* aggregates but isn't
     /// a bare aggregate call. Each aggregate sub-expression is lifted into a
     /// spec with a synthetic `?#__agg_N` output; the rewritten expression
@@ -774,10 +785,9 @@ fn build_aggregate_fn(name: &str, distinct: bool, input_var: Option<VarId>) -> R
 }
 
 /// Resolve the aggregate's input variable: `None` for `count(*)`,
-/// a bare-variable VarId for `count(n)` / `sum(n)` / etc., or a
-/// property-accessor's synthetic VarId for `sum(n.age)`. Other
-/// expression-valued arguments (`sum(n.age * 2)`) are deferred —
-/// they need a pre-aggregation `Bind`.
+/// a bare-variable VarId for `count(n)` / `sum(n)` / etc., a
+/// property-accessor's synthetic VarId for `sum(n.age)`, or a pre-aggregation
+/// `Bind` for expression-valued arguments (`sum(n.age * 2)`).
 fn aggregate_input_var<E: IriEncoder>(
     ctx: &mut LoweringContext<'_, E>,
     call: &FuncCall,
@@ -814,10 +824,18 @@ fn aggregate_input_var<E: IriEncoder>(
             aux.push(Pattern::Bind { var, expr });
             Ok(Some(var))
         }
-        _ => Err(LowerError::unsupported(format!(
-            "{}() argument must be a bare variable, property accessor, or list literal in v1 — other expressions are deferred",
-            call.name
-        ))),
+        other => {
+            if expr_has_aggregate(other) {
+                return Err(LowerError::unsupported(format!(
+                    "{}() argument cannot contain another aggregate",
+                    call.name
+                )));
+            }
+            let expr = crate::lower::expr::lower_expr(ctx, other, aux)?;
+            let var = ctx.fresh_synth();
+            aux.push(Pattern::Bind { var, expr });
+            Ok(Some(var))
+        }
     }
 }
 
@@ -940,9 +958,7 @@ fn lower_with<E: IriEncoder>(
         projection.add_item(ctx, &mut inner_patterns, item)?;
     }
     if projection.saw_star {
-        return Err(LowerError::unsupported(
-            "WITH * is deferred in v1 — list the variables explicitly",
-        ));
+        projection.expand_star(ctx, &inner_patterns);
     }
     if !projection.list_outputs.is_empty() {
         // A `collect()` projected by WITH flows out as a `Binding::List`. List
@@ -1040,6 +1056,27 @@ fn lower_with<E: IriEncoder>(
         sq = sq.with_grouping(g);
     }
     Ok(sq)
+}
+
+fn visible_vars_from_patterns<E: IriEncoder>(
+    ctx: &LoweringContext<'_, E>,
+    patterns: &[Pattern],
+) -> Vec<VarId> {
+    let mut out = Vec::new();
+    for var in patterns.iter().flat_map(Pattern::produced_vars) {
+        if out.contains(&var) {
+            continue;
+        }
+        if ctx
+            .vars
+            .try_name(var)
+            .is_some_and(|name| name.starts_with("?#__"))
+        {
+            continue;
+        }
+        out.push(var);
+    }
+    out
 }
 
 /// Lower `UNWIND <list> AS x` to a `Pattern::Values` with one row per

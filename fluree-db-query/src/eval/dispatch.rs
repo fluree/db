@@ -43,6 +43,7 @@ impl Function {
             Function::Sub => ArithmeticOp::Sub.eval(args, row, ctx),
             Function::Mul => ArithmeticOp::Mul.eval(args, row, ctx),
             Function::Div => ArithmeticOp::Div.eval(args, row, ctx),
+            Function::Mod => ArithmeticOp::Mod.eval(args, row, ctx),
             Function::Negate => arithmetic::eval_negate(args, row, ctx),
 
             // Logical operators

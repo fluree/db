@@ -1577,6 +1577,7 @@ fn lower_function_name(name: &str) -> Function {
         "-" => Function::Sub,
         "*" => Function::Mul,
         "/" => Function::Div,
+        "%" | "mod" => Function::Mod,
         "negate" => Function::Negate,
         // String functions
         "strlen" => Function::Strlen,

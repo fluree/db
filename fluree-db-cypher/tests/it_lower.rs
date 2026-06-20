@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 
 use fluree_db_cypher::{lower_cypher, lower_cypher_with_context, parse_cypher, LoweringContext};
-use fluree_db_query::ir::{Pattern, Ref, Term};
+use fluree_db_query::ir::{Function, Pattern, Ref, Term};
 use fluree_db_query::parse::encode::NoEncoder;
 use fluree_db_query::var_registry::VarRegistry;
 
@@ -47,6 +47,26 @@ fn match_node_with_property_filter() {
     let q = lower(r#"MATCH (n:Person {name: "Alice"}) RETURN n"#);
     // 1 triple for label, 1 triple for property.
     assert_eq!(q.patterns.len(), 2);
+}
+
+#[test]
+fn xor_expression_lowers_as_boolean_filter() {
+    let q = lower("MATCH (n:Person) WHERE n.age = 1 XOR n.age = 2 RETURN n");
+    assert!(
+        q.patterns.iter().any(|p| matches!(p, Pattern::Filter(_))),
+        "XOR should desugar into the existing boolean filter IR"
+    );
+}
+
+#[test]
+fn modulus_expression_lowers_to_mod_function() {
+    let q = lower("MATCH (n:Person) WHERE n.age % 2 = 0 RETURN n");
+    assert!(
+        q.patterns.iter().any(|p| {
+            matches!(p, Pattern::Filter(expr) if expr.contains_function(&Function::Mod))
+        }),
+        "modulus should lower to Function::Mod"
+    );
 }
 
 #[test]
@@ -616,18 +636,24 @@ fn sum_avg_min_max() {
 }
 
 #[test]
-fn aggregate_expression_arg_rejected_in_v1() {
-    // sum(n + 1) — expression-valued argument requires a pre-Bind that
-    // we defer. The lower step rejects clearly.
-    let out = parse_cypher("MATCH (n:Person) RETURN sum(n + 1) AS s");
-    if out.has_errors() {
-        return; // parser may reject; either way is acceptable
+fn aggregate_expression_arg_lowers_to_pre_bind() {
+    use fluree_db_query::ir::grouping::{AggregateFn, Grouping};
+
+    let q = lower("MATCH (n:Person) RETURN sum(n + 1) AS s");
+    assert!(
+        q.patterns.iter().any(|p| matches!(p, Pattern::Bind { .. })),
+        "expression aggregate argument should be bound before grouping"
+    );
+    let grouping = q.grouping.expect("grouping");
+    match grouping {
+        Grouping::Implicit { aggregation, .. } => {
+            assert!(matches!(
+                aggregation.aggregates.first().function,
+                AggregateFn::Sum(..)
+            ));
+        }
+        other => panic!("expected Implicit grouping, got {other:?}"),
     }
-    let ast = out.ast.unwrap();
-    let encoder = NoEncoder;
-    let mut vars = VarRegistry::new();
-    let r = lower_cypher(&ast, &encoder, &mut vars);
-    assert!(r.is_err(), "expression-arg aggregates deferred");
 }
 
 #[test]
@@ -635,6 +661,44 @@ fn with_boundary_lowers_to_subquery() {
     let q = lower("MATCH (n:Person) WITH n MATCH (n)-[:KNOWS]->(b:Person) RETURN n, b");
     let has_subquery = q.patterns.iter().any(|p| matches!(p, Pattern::Subquery(_)));
     assert!(has_subquery, "expected a Subquery from WITH");
+}
+
+#[test]
+fn with_star_expands_visible_variables() {
+    let q = lower("MATCH (n:Person)-[:KNOWS]->(b:Person) WITH * RETURN n, b");
+    let sq = q
+        .patterns
+        .iter()
+        .find_map(|p| match p {
+            Pattern::Subquery(sq) => Some(sq),
+            _ => None,
+        })
+        .expect("subquery");
+    assert_eq!(
+        sq.select.len(),
+        2,
+        "WITH * should carry the two user variables n and b: {:?}",
+        sq.select
+    );
+}
+
+#[test]
+fn with_star_hides_internal_property_accessor_vars() {
+    let q = lower("MATCH (n:Person) WHERE n.age > 30 WITH * RETURN n");
+    let sq = q
+        .patterns
+        .iter()
+        .find_map(|p| match p {
+            Pattern::Subquery(sq) => Some(sq),
+            _ => None,
+        })
+        .expect("subquery");
+    assert_eq!(
+        sq.select.len(),
+        1,
+        "WITH * should not expose synthetic property-accessor vars: {:?}",
+        sq.select
+    );
 }
 
 #[test]

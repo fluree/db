@@ -13,26 +13,26 @@
 //! - **CREATE** (nodes + directed typed relationships, with optional
 //!   relationship properties producing an `f:reifies*` bundle).
 //! - **MATCH … CREATE / SET / REMOVE** — node-anchored WHERE patterns
-//!   (labels + inline property filters + directed single-typed
-//!   relationships) lowered to `where_patterns`, with DELETE/INSERT
+//!   (labels + inline property filters + directed single-typed relationships
+//!   plus scalar `WHERE` filters) lowered to `where_patterns`, with DELETE/INSERT
 //!   templates that reference the bound variables (`TxnType::Update`).
 //!   Covers template-driven CREATE, `SET n.prop = lit`, `SET n.prop = null`
-//!   (removes the property), `SET n += {…}`, `SET n:Label`, `REMOVE n.prop`,
-//!   and `REMOVE n:Label`.
+//!   (removes the property), `SET n += {…}`, `SET n = {…}`, `SET n:Label`,
+//!   `REMOVE n.prop`, and `REMOVE n:Label`.
 //!
 //! Parameter (`$param`) substitution happens upstream in
 //! `fluree_db_cypher::substitute_params` before this lowering runs, so the
 //! AST reaching here carries only concrete literals.
 //!
-//! Still deferred (clear errors): DELETE / DETACH DELETE, MERGE,
-//! `SET n = {…}` (bounded replace), WHERE-clause filter expressions, and
+//! Still deferred (clear errors): CASE/EXISTS in write-side WHERE, and
 //! named/untyped/alternation relationships in a write MATCH.
 
 use std::sync::Arc;
 
 use fluree_db_core::{FlakeValue, Sid};
 use fluree_db_query::parse::{
-    LiteralValue, UnresolvedPattern, UnresolvedTerm, UnresolvedTriplePattern, UnresolvedValue,
+    LiteralValue, UnresolvedExpression, UnresolvedFilterValue, UnresolvedPattern, UnresolvedTerm,
+    UnresolvedTriplePattern, UnresolvedValue,
 };
 use fluree_db_query::VarRegistry;
 use fluree_vocab::{rdf, reifies_iris};
@@ -331,14 +331,24 @@ impl<'a> CypherLowering<'a> {
         m: &MatchClause,
         out: &mut Vec<UnresolvedPattern>,
     ) -> Result<(), LowerCypherError> {
-        if m.where_clause.is_some() {
-            return Err(LowerCypherError::unsupported(
-                "WHERE filter expressions in a write-statement MATCH are deferred — use inline property filters `(n:Label {key: val})`",
-            ));
-        }
         for part in &m.pattern.parts {
             self.lower_match_part(part, out)?;
         }
+        if let Some(where_expr) = &m.where_clause {
+            self.lower_match_where(where_expr, out)?;
+        }
+        Ok(())
+    }
+
+    fn lower_match_where(
+        &mut self,
+        where_expr: &Expr,
+        out: &mut Vec<UnresolvedPattern>,
+    ) -> Result<(), LowerCypherError> {
+        let mut aux = Vec::new();
+        let filter = self.lower_filter_expr(where_expr, &mut aux)?;
+        out.extend(aux);
+        out.push(UnresolvedPattern::Filter(filter));
         Ok(())
     }
 
@@ -496,6 +506,177 @@ impl<'a> CypherLowering<'a> {
         }
     }
 
+    fn lower_filter_expr(
+        &mut self,
+        e: &Expr,
+        aux: &mut Vec<UnresolvedPattern>,
+    ) -> Result<UnresolvedExpression, LowerCypherError> {
+        match e {
+            Expr::Var(v) => Ok(UnresolvedExpression::var(var_name(&v.name))),
+            Expr::Lit(lit) => lower_filter_literal(lit),
+            Expr::Param(_) => Err(LowerCypherError::unsupported(
+                "internal: Cypher params should be substituted before write MATCH WHERE lowering",
+            )),
+            Expr::Prop(target, key, _) => {
+                let prop_var = self.resolve_filter_property_accessor(target, key, aux)?;
+                Ok(UnresolvedExpression::var(prop_var))
+            }
+            Expr::BinOp(op, l, r, _) => {
+                let l = self.lower_filter_expr(l, aux)?;
+                let r = self.lower_filter_expr(r, aux)?;
+                let func = match op {
+                    fluree_db_cypher::ast::BinOp::Eq => "=",
+                    fluree_db_cypher::ast::BinOp::Ne => "!=",
+                    fluree_db_cypher::ast::BinOp::Lt => "<",
+                    fluree_db_cypher::ast::BinOp::Le => "<=",
+                    fluree_db_cypher::ast::BinOp::Gt => ">",
+                    fluree_db_cypher::ast::BinOp::Ge => ">=",
+                    fluree_db_cypher::ast::BinOp::Add => "+",
+                    fluree_db_cypher::ast::BinOp::Sub => "-",
+                    fluree_db_cypher::ast::BinOp::Mul => "*",
+                    fluree_db_cypher::ast::BinOp::Div => "/",
+                    fluree_db_cypher::ast::BinOp::Mod => "%",
+                    fluree_db_cypher::ast::BinOp::And => {
+                        return Ok(UnresolvedExpression::And(vec![l, r]));
+                    }
+                    fluree_db_cypher::ast::BinOp::Or => {
+                        return Ok(UnresolvedExpression::Or(vec![l, r]));
+                    }
+                };
+                Ok(unresolved_call(func, vec![l, r]))
+            }
+            Expr::UnaryOp(op, inner, _) => {
+                let inner = self.lower_filter_expr(inner, aux)?;
+                match op {
+                    fluree_db_cypher::ast::UnaryOp::Not => {
+                        Ok(UnresolvedExpression::Not(Box::new(inner)))
+                    }
+                    fluree_db_cypher::ast::UnaryOp::Neg => {
+                        Ok(unresolved_call("negate", vec![inner]))
+                    }
+                }
+            }
+            Expr::In(left, list, _) => {
+                let expr = self.lower_filter_expr(left, aux)?;
+                let Expr::List(items, _) = list.as_ref() else {
+                    return Err(LowerCypherError::unsupported(
+                        "`IN` right-hand side in write MATCH WHERE must be an inline list",
+                    ));
+                };
+                let values = items
+                    .iter()
+                    .map(|item| self.lower_filter_expr(item, aux))
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                Ok(UnresolvedExpression::In {
+                    expr: Box::new(expr),
+                    values,
+                    negated: false,
+                })
+            }
+            Expr::IsNull(inner, _) => {
+                let inner = self.lower_filter_expr(inner, aux)?;
+                Ok(UnresolvedExpression::Not(Box::new(unresolved_call(
+                    "bound",
+                    vec![inner],
+                ))))
+            }
+            Expr::IsNotNull(inner, _) => {
+                let inner = self.lower_filter_expr(inner, aux)?;
+                Ok(unresolved_call("bound", vec![inner]))
+            }
+            Expr::StartsWith(l, r, _) => {
+                let l = self.lower_filter_expr(l, aux)?;
+                let r = self.lower_filter_expr(r, aux)?;
+                Ok(unresolved_call("strstarts", vec![l, r]))
+            }
+            Expr::EndsWith(l, r, _) => {
+                let l = self.lower_filter_expr(l, aux)?;
+                let r = self.lower_filter_expr(r, aux)?;
+                Ok(unresolved_call("strends", vec![l, r]))
+            }
+            Expr::Contains(l, r, _) => {
+                let l = self.lower_filter_expr(l, aux)?;
+                let r = self.lower_filter_expr(r, aux)?;
+                Ok(unresolved_call("contains", vec![l, r]))
+            }
+            Expr::List(items, _) => {
+                let args = items
+                    .iter()
+                    .map(|item| self.lower_filter_expr(item, aux))
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                Ok(unresolved_call("list", args))
+            }
+            Expr::Index(list, index, _) => {
+                let list = self.lower_filter_expr(list, aux)?;
+                let index = self.lower_filter_expr(index, aux)?;
+                Ok(unresolved_call("nth", vec![list, index]))
+            }
+            Expr::Call(call) => {
+                let args = call
+                    .args
+                    .iter()
+                    .map(|arg| self.lower_filter_expr(arg, aux))
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                let func = match call.name.to_ascii_lowercase().as_str() {
+                    "coalesce" => "coalesce",
+                    "abs" => "abs",
+                    "size" => "size",
+                    "head" => "head",
+                    "last" => "last",
+                    "tail" => "tail",
+                    "reverse" => "reverse",
+                    "tostring" => "str",
+                    "tointeger" => "xsd:integer",
+                    "tofloat" => "xsd:double",
+                    "range" => "range",
+                    other => {
+                        return Err(LowerCypherError::unsupported(format!(
+                            "function `{other}` in write MATCH WHERE is not supported"
+                        )));
+                    }
+                };
+                Ok(unresolved_call(func, args))
+            }
+            Expr::Case(_) | Expr::Exists(_, _, _) => Err(LowerCypherError::unsupported(
+                "CASE and EXISTS in write MATCH WHERE are deferred",
+            )),
+        }
+    }
+
+    fn resolve_filter_property_accessor(
+        &mut self,
+        target: &Expr,
+        key: &str,
+        aux: &mut Vec<UnresolvedPattern>,
+    ) -> Result<String, LowerCypherError> {
+        let target = match target {
+            Expr::Var(v) => v,
+            Expr::Prop(_, _, _) => {
+                return Err(LowerCypherError::unsupported(
+                    "chained property accessors in write MATCH WHERE are deferred",
+                ));
+            }
+            _ => {
+                return Err(LowerCypherError::unsupported(
+                    "property accessors in write MATCH WHERE require a bare variable target",
+                ));
+            }
+        };
+        self.require_bound(target)?;
+
+        let pred_iri = self.resolve_predicate(key)?;
+        let prop_var = format!("?#__cy_where_prop_{}_{}", target.name, key);
+        aux.push(UnresolvedPattern::Optional(vec![
+            UnresolvedPattern::Triple(UnresolvedTriplePattern {
+                s: self.unresolved_named_var(&target.name),
+                p: UnresolvedTerm::Iri(Arc::from(pred_iri.as_str())),
+                o: UnresolvedTerm::Var(Arc::from(prop_var.as_str())),
+                dtc: None,
+            }),
+        ]));
+        Ok(prop_var)
+    }
+
     // ---- SET / REMOVE ---------------------------------------------------
 
     fn lower_set(&mut self, s: &SetClause) -> Result<(), LowerCypherError> {
@@ -515,10 +696,9 @@ impl<'a> CypherLowering<'a> {
                         self.set_property(&target.name, key, val_expr)?;
                     }
                 }
-                SetItem::MapReplace { .. } => {
-                    return Err(LowerCypherError::unsupported(
-                        "SET n = {…} (replace all data properties) is deferred — its bounded retract scope needs a predicate-variable scan; use `SET n += {…}` or explicit per-property SET",
-                    ));
+                SetItem::MapReplace { target, map } => {
+                    self.require_bound(target)?;
+                    self.replace_property_map(&target.name, map)?;
                 }
                 SetItem::Labels { target, labels } => {
                     self.require_bound(target)?;
@@ -565,6 +745,26 @@ impl<'a> CypherLowering<'a> {
                 TemplateTerm::Sid(pred_sid.clone()),
                 obj,
             ));
+        }
+        Ok(())
+    }
+
+    /// `SET n = { ... }` — replace all scalar node properties visible to Cypher.
+    /// Labels (`rdf:type`), relationship edges (ref-valued objects), and
+    /// `f:reifies*` sidecar facts are not node properties and are preserved.
+    fn replace_property_map(&mut self, target: &str, map: &MapLit) -> Result<(), LowerCypherError> {
+        self.push_optional_old_data_properties(target);
+        for (key, val_expr) in &map.entries {
+            let pred_iri = self.resolve_predicate(key)?;
+            let pred_sid = self.ns.sid_for_iri(&pred_iri);
+            let subj = self.var_term(target);
+            for obj in self.expr_to_object_terms(val_expr)? {
+                self.insert_templates.push(TripleTemplate::new(
+                    subj.clone(),
+                    TemplateTerm::Sid(pred_sid.clone()),
+                    obj,
+                ));
+            }
         }
         Ok(())
     }
@@ -884,6 +1084,57 @@ impl<'a> CypherLowering<'a> {
             TemplateTerm::Sid(pred_sid.clone()),
             TemplateTerm::Var(old_vid),
         ));
+    }
+
+    /// Emit `OPTIONAL { ?target ?p ?old }` plus filters for Cypher node
+    /// properties, then delete the matched old property triples.
+    fn push_optional_old_data_properties(&mut self, target: &str) {
+        let (p_unres, p_term) = self.fresh_scan_var();
+        let (old_unres, old_term) = self.fresh_scan_var();
+        let p_name = p_unres
+            .as_var()
+            .expect("fresh scan predicate is a variable")
+            .to_string();
+        let old_name = old_unres
+            .as_var()
+            .expect("fresh scan object is a variable")
+            .to_string();
+
+        let p_expr = UnresolvedExpression::var(&p_name);
+        let p_str = unresolved_call("str", vec![p_expr.clone()]);
+        let old_expr = UnresolvedExpression::var(&old_name);
+        let mut filters = Vec::with_capacity(2 + reifies_iris::ALL.len());
+        filters.push(unresolved_call(
+            "!=",
+            vec![p_str.clone(), UnresolvedExpression::string(rdf::TYPE)],
+        ));
+        for iri in reifies_iris::ALL {
+            filters.push(unresolved_call(
+                "!=",
+                vec![p_str.clone(), UnresolvedExpression::string(iri)],
+            ));
+        }
+        filters.push(UnresolvedExpression::Not(Box::new(
+            UnresolvedExpression::Or(vec![
+                unresolved_call("isiri", vec![old_expr.clone()]),
+                unresolved_call("isblank", vec![old_expr]),
+            ]),
+        )));
+        let data_property_filter = UnresolvedExpression::And(filters);
+
+        self.where_patterns.push(UnresolvedPattern::Optional(vec![
+            UnresolvedPattern::Triple(UnresolvedTriplePattern {
+                s: self.unresolved_named_var(target),
+                p: p_unres,
+                o: old_unres,
+                dtc: None,
+            }),
+            UnresolvedPattern::Filter(data_property_filter),
+        ]));
+
+        let subj = self.var_term(target);
+        self.delete_templates
+            .push(TripleTemplate::new(subj, p_term, old_term));
     }
 
     fn require_bound(&self, target: &Variable) -> Result<(), LowerCypherError> {
@@ -1209,6 +1460,27 @@ fn lower_literal_unresolved(lit: &Literal) -> Result<LiteralValue, LowerCypherEr
             ));
         }
     })
+}
+
+fn lower_filter_literal(lit: &Literal) -> Result<UnresolvedExpression, LowerCypherError> {
+    Ok(UnresolvedExpression::Const(match lit {
+        Literal::Integer(n, _) => UnresolvedFilterValue::Long(*n),
+        Literal::Float(f, _) => UnresolvedFilterValue::Double(*f),
+        Literal::String(s, _) => UnresolvedFilterValue::String(Arc::from(s.as_str())),
+        Literal::Bool(b, _) => UnresolvedFilterValue::Bool(*b),
+        Literal::Null(_) => {
+            return Err(LowerCypherError::unsupported(
+                "NULL literal in write MATCH WHERE is rejected — use IS NULL / IS NOT NULL",
+            ));
+        }
+    }))
+}
+
+fn unresolved_call(func: &str, args: Vec<UnresolvedExpression>) -> UnresolvedExpression {
+    UnresolvedExpression::Call {
+        func: Arc::from(func),
+        args,
+    }
 }
 
 fn lower_literal_value(lit: &Literal) -> Result<FlakeValue, LowerCypherError> {

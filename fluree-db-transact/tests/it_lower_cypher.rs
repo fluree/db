@@ -284,6 +284,29 @@ fn match_set_map_merge_emits_per_key_replace() {
 }
 
 #[test]
+fn match_set_map_replace_emits_bounded_property_scan() {
+    let txn = lower(r#"MATCH (n:Person {name: "Alice"}) SET n = {name: "Alicia", city: "Paris"}"#);
+    assert_eq!(txn.txn_type, TxnType::Update);
+    // WHERE: label triple + inline-name triple + OPTIONAL old-property scan.
+    assert_eq!(
+        txn.where_patterns.len(),
+        3,
+        "where: {:?}",
+        txn.where_patterns
+    );
+    assert_eq!(txn.delete_templates.len(), 1);
+    assert_eq!(txn.insert_templates.len(), 2);
+    assert!(matches!(
+        txn.delete_templates[0].predicate,
+        TemplateTerm::Var(_)
+    ));
+    assert!(matches!(
+        txn.delete_templates[0].object,
+        TemplateTerm::Var(_)
+    ));
+}
+
+#[test]
 fn match_remove_property_emits_delete_only() {
     let txn = lower(r#"MATCH (n:Person {name: "Alice"}) REMOVE n.age"#);
     assert_eq!(txn.txn_type, TxnType::Update);
@@ -463,21 +486,6 @@ fn match_remove_label_deletes_rdf_type_triple() {
         txn.delete_templates[0].object,
         TemplateTerm::Sid(_)
     ));
-}
-
-#[test]
-fn set_map_replace_is_deferred() {
-    let out = parse_cypher(r#"MATCH (n:Person {name: "A"}) SET n = {age: 1}"#);
-    assert!(!out.has_errors());
-    let ast = out.ast.unwrap();
-    let mut ns = NamespaceRegistry::new();
-    let r = lower_cypher_update(
-        &ast,
-        &mut ns,
-        TxnOpts::default(),
-        CypherLowerOpts::default(),
-    );
-    assert!(r.is_err(), "SET n = {{…}} should be deferred");
 }
 
 #[test]

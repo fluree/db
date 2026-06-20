@@ -353,6 +353,7 @@ pub enum ArithmeticOp {
     Sub,
     Mul,
     Div,
+    Mod,
 }
 
 impl std::fmt::Display for ArithmeticOp {
@@ -362,6 +363,7 @@ impl std::fmt::Display for ArithmeticOp {
             ArithmeticOp::Sub => write!(f, "-"),
             ArithmeticOp::Mul => write!(f, "*"),
             ArithmeticOp::Div => write!(f, "/"),
+            ArithmeticOp::Mod => write!(f, "%"),
         }
     }
 }
@@ -390,6 +392,7 @@ impl From<ArithmeticOp> for Function {
             ArithmeticOp::Sub => Function::Sub,
             ArithmeticOp::Mul => Function::Mul,
             ArithmeticOp::Div => Function::Div,
+            ArithmeticOp::Mod => Function::Mod,
         }
     }
 }
@@ -436,6 +439,8 @@ pub enum Function {
     Mul,
     /// Division (/)
     Div,
+    /// Modulus (%)
+    Mod,
     /// Unary negation (-)
     Negate,
 

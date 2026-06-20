@@ -227,12 +227,12 @@ ORDER BY / SKIP / LIMIT
   by the carried path.
 - Aggregates: `count(*)`, `count(x)`, `count(DISTINCT x)`,
   `sum(x)`, `avg(x)`, `min(x)`, `max(x)`. Arguments may be a bare
-  variable (`count(n)`) or a property accessor (`avg(n.age)`);
-  other expression-valued arguments (`sum(n.age * 2)`) are deferred
-  pending a pre-aggregation `Bind`. Mixed projections
+  variable (`count(n)`), a property accessor (`avg(n.age)`), a list
+  literal (`collect([n.id, n.name])`), or a scalar expression
+  (`sum(n.age * 2)`, lowered through a pre-aggregation `Bind`). Mixed projections
   (`RETURN n, count(*) AS c`) implicitly group by the non-aggregate
   projections.
-- `WITH ... [WHERE/ORDER BY/SKIP/LIMIT/DISTINCT]` — subquery
+- `WITH ... [WHERE/ORDER BY/SKIP/LIMIT/DISTINCT]` and `WITH *` — subquery
   boundary. WHERE that references aggregate aliases lowers to HAVING
   rather than a pre-aggregation Filter. Nested WITHs nest Subqueries.
 - `RETURN n`, `RETURN n, m`, `RETURN *`, `RETURN DISTINCT ...`,
@@ -253,15 +253,22 @@ ORDER BY / SKIP / LIMIT
   CREATE (a:Person {name: "Alice"})-[:WORKS_FOR {role: "Engineer"}]->(b:Org {name: "Acme"})
   ```
 - **`SET`** — set/overwrite a property (`SET n.age = 30`), merge a map
-  (`SET n += {age: 30, city: "X"}`), or add a label (`SET n:Admin`). Full map
-  *replace* (`SET n = {...}`) is not yet supported.
+  (`SET n += {age: 30, city: "X"}`), replace scalar node properties with a map
+  (`SET n = {name: "Alice"}`), or add a label (`SET n:Admin`). Map replace
+  removes prior scalar node properties while preserving labels, relationships,
+  and relationship sidecar metadata.
 - **`REMOVE`** — remove a property (`REMOVE n.age`) or a label (`REMOVE n:Admin`).
 - **`DELETE` / `DETACH DELETE`** — delete nodes/relationships. `DETACH DELETE`
   removes a node together with its relationships.
-- **`MERGE`** — find-or-create, with `ON CREATE SET` / `ON MATCH SET`. Resolved
-  by probing the current writer state, then staging either a create or an update.
-- **`MATCH … CREATE/SET`** — WHERE-driven write templates (find rows, then write
-  per match).
+- **`MERGE`** — single-node find-or-create, with `ON CREATE SET` /
+  `ON MATCH SET`. Resolved by probing the current writer state, then staging
+  either a create or an update.
+- **`MATCH … CREATE/SET/REMOVE/DELETE`** — pattern-driven write templates (find
+  rows, then write per match). Write-side `MATCH` supports labels, inline
+  property filters, directed single-typed relationships, and scalar `WHERE`
+  filters over the same comparison/boolean/string/property-accessor expression
+  surface used by reads. `CASE` / `EXISTS` inside write-side `WHERE` are still
+  deferred.
 
 ```rust
 let committed = fluree.transact_cypher(ledger, cypher).await?;
@@ -295,15 +302,17 @@ produces a clear error rather than a silent wrong answer.
 
 **Expressions**
 
-- `%` (modulus), `^` (exponent), `XOR`.
+- `^` (exponent).
 - Chained property accessors (`n.a.b` — bind an intermediate via `WITH`).
-- `NULL` literals; expression-valued aggregate arguments (`sum(n + 1)`);
-  aggregates inside `CASE` / `EXISTS`.
+- `NULL` literals; aggregates inside `CASE` / `EXISTS`.
 
 **Clauses and structure**
 
-- `WITH *`; non-literal `SKIP`/`LIMIT`; `ORDER BY` on a `collect()` list.
-- `SET n = {...}` full map replace (the `+=` merge form is supported).
+- Non-literal `SKIP`/`LIMIT`; `ORDER BY` on a `collect()` list.
+- `CASE` / `EXISTS` inside a write-statement `MATCH ... WHERE`; `WITH` before a
+  write clause.
+- Relationship / multi-part `MERGE`; multiple `MERGE` clauses; `MERGE` combined
+  with a leading `MATCH` or other writes.
 - `CALL` / stored procedures, `LOAD CSV`, `FOREACH`, schema DDL.
 - Multi-statement scripts — submit one statement per request.
 

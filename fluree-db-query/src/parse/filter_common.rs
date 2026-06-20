@@ -119,11 +119,11 @@ pub fn is_compare_op(op: &str) -> bool {
 
 /// Check if an operator name is an arithmetic operator
 ///
-/// Recognizes: `+`, `add`, `-`, `sub`, `*`, `mul`, `/`, `div`
+/// Recognizes: `+`, `add`, `-`, `sub`, `*`, `mul`, `/`, `div`, `%`, `mod`
 pub fn is_arithmetic_op(op: &str) -> bool {
     matches!(
         op.to_lowercase().as_str(),
-        "+" | "add" | "-" | "sub" | "*" | "mul" | "/" | "div"
+        "+" | "add" | "-" | "sub" | "*" | "mul" | "/" | "div" | "%" | "mod"
     )
 }
 
@@ -131,7 +131,7 @@ pub fn is_arithmetic_op(op: &str) -> bool {
 ///
 /// Maps word aliases to their symbol equivalents:
 /// - `eq` → `=`, `ne` → `!=`, `lt` → `<`, `le` → `<=`, `gt` → `>`, `ge` → `>=`
-/// - `add` → `+`, `sub` → `-`, `mul` → `*`, `div` → `/`
+/// - `add` → `+`, `sub` → `-`, `mul` → `*`, `div` → `/`, `mod` → `%`
 ///
 /// Returns the input unchanged if it's already in symbol form or unrecognized.
 pub fn normalize_op(op: &str) -> &str {
@@ -146,6 +146,7 @@ pub fn normalize_op(op: &str) -> &str {
         "sub" => "-",
         "mul" => "*",
         "div" => "/",
+        "mod" => "%",
         _ => op,
     }
 }

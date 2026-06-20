@@ -23,12 +23,19 @@ fn parse_or(s: &mut TokenStream) -> Result<Expr, Diagnostic> {
 }
 
 fn parse_xor(s: &mut TokenStream) -> Result<Expr, Diagnostic> {
-    let left = parse_and(s)?;
-    if matches!(s.peek_kind(), TokenKind::Xor) {
-        return Err(s.error(
-            DiagCode::DeferredFunction,
-            "XOR is deferred — rewrite as `(a OR b) AND NOT (a AND b)`",
-        ));
+    let mut left = parse_and(s)?;
+    while s.eat(&TokenKind::Xor).is_some() {
+        let right = parse_and(s)?;
+        let span = left.span().union(right.span());
+        let either = Expr::BinOp(
+            BinOp::Or,
+            Box::new(left.clone()),
+            Box::new(right.clone()),
+            span,
+        );
+        let both = Expr::BinOp(BinOp::And, Box::new(left), Box::new(right), span);
+        let not_both = Expr::UnaryOp(UnaryOp::Not, Box::new(both), span);
+        left = Expr::BinOp(BinOp::And, Box::new(either), Box::new(not_both), span);
     }
     Ok(left)
 }
@@ -145,12 +152,7 @@ fn parse_multiplicative(s: &mut TokenStream) -> Result<Expr, Diagnostic> {
         let op = match s.peek_kind() {
             TokenKind::Star => BinOp::Mul,
             TokenKind::Slash => BinOp::Div,
-            TokenKind::Percent => {
-                return Err(s.error(
-                    DiagCode::DeferredFunction,
-                    "`%` (modulus) is deferred — pending IR support",
-                ));
-            }
+            TokenKind::Percent => BinOp::Mod,
             TokenKind::Caret => {
                 return Err(s.error(
                     DiagCode::DeferredFunction,

@@ -20,8 +20,8 @@
 
 use fluree_db_cypher::ast::{
     BinOp, CypherAst, DeleteClause, Direction, Expr, FuncCall, Literal, MatchClause, MergeClause,
-    NodePattern, Pattern, PatternPart, ProjectionItem, Query, ReadClause, RelPattern, ReturnClause,
-    SetClause, Statement, Update, Variable, WithClause, WriteClause,
+    NodePattern, Pattern, PatternPart, ProjectionItem, Query, ReadClause, ReturnClause, SetClause,
+    Statement, Update, Variable, WithClause, WriteClause,
 };
 use fluree_db_transact::ir::Txn;
 
@@ -223,60 +223,18 @@ pub(crate) fn delete_clause(update: &Update) -> Option<&DeleteClause> {
     }
 }
 
-/// Build a probe that returns at most one row when a matched `target` node
-/// still participates in a (reified) relationship — `<original MATCH>` plus a
-/// `(target)-[__r]->(__o)` (outbound) or `(__s)-[__r]->(target)` (inbound)
-/// hop, returning `target LIMIT 1`. Named relationship ⇒ only reified edges
-/// match, which is exactly Cypher's notion of a relationship.
-pub(crate) fn build_relationship_probe_ast(
+/// Build a probe over the original MATCH clauses that returns candidate nodes
+/// for a bare `DELETE n` target. The API conditional-write path appends its
+/// own internal triple pattern after lowering so it can inspect predicate/object
+/// bindings without going through Cypher relationship-variable sidecar matching.
+pub(crate) fn build_delete_target_probe_ast(
     read_clauses: &[ReadClause],
     target: &Variable,
-    inbound: bool,
 ) -> CypherAst {
     let span = target.span;
-    let mk_var = |name: &str| Variable {
-        name: name.to_string(),
-        span,
-    };
-    let anon = |var: Variable| NodePattern {
-        var: Some(var),
-        labels: Vec::new(),
-        props: None,
-        span,
-    };
-    let rel = RelPattern {
-        var: Some(mk_var("__cydel_r")),
-        direction: Direction::Outgoing,
-        types: Vec::new(),
-        length: None,
-        props: None,
-        span,
-    };
-    let (head, tail_node) = if inbound {
-        (anon(mk_var("__cydel_s")), anon(target.clone()))
-    } else {
-        (anon(target.clone()), anon(mk_var("__cydel_o")))
-    };
-    let rel_part = PatternPart {
-        path_var: None,
-        path_search: None,
-        head,
-        tail: vec![(rel, tail_node)],
-        span,
-    };
-    let mut clauses: Vec<ReadClause> = read_clauses.to_vec();
-    clauses.push(ReadClause::Match(MatchClause {
-        pattern: Pattern {
-            parts: vec![rel_part],
-            span,
-        },
-        where_clause: None,
-        span,
-    }));
-
     CypherAst {
         statement: Statement::Query(Query {
-            clauses,
+            clauses: read_clauses.to_vec(),
             return_clause: ReturnClause {
                 items: vec![ProjectionItem {
                     expr: Expr::Var(target.clone()),
@@ -286,7 +244,7 @@ pub(crate) fn build_relationship_probe_ast(
                 distinct: false,
                 order_by: Vec::new(),
                 skip: None,
-                limit: Some(Expr::Lit(Literal::Integer(1, span))),
+                limit: None,
                 span,
             },
             union_tail: None,

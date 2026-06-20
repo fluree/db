@@ -3463,16 +3463,9 @@ impl Fluree {
                         ));
                     }
                     for inbound in [false, true] {
-                        let probe_ast = crate::cypher_write::build_relationship_probe_ast(
-                            &update.read_clauses,
-                            target,
-                            inbound,
-                        );
                         if self
-                            .query_cypher_ast(&probe_view, &probe_ast)
+                            .delete_target_has_relationship(&probe_view, update, target, inbound)
                             .await?
-                            .row_count()
-                            > 0
                         {
                             return Err(ApiError::cypher(
                                 format!(
@@ -3546,6 +3539,92 @@ impl Fluree {
                     .await
             }
         }
+    }
+
+    async fn delete_target_has_relationship(
+        &self,
+        probe_view: &GraphDb,
+        update: &fluree_db_cypher::ast::Update,
+        target: &fluree_db_cypher::ast::Variable,
+        inbound: bool,
+    ) -> Result<bool> {
+        use fluree_db_query::ir::{Pattern, QueryOutput, Ref, Term, TriplePattern};
+
+        let probe_ast =
+            crate::cypher_write::build_delete_target_probe_ast(&update.read_clauses, target);
+        let (mut vars, mut parsed) = crate::query::helpers::lower_cypher_ast_to_ir(
+            &probe_ast,
+            &probe_view.snapshot,
+            probe_view.default_context.as_ref(),
+        )?;
+
+        let target_var = vars.get(&target.name).ok_or_else(|| {
+            ApiError::cypher(
+                format!("DELETE probe could not resolve target `{}`", target.name),
+                Vec::new(),
+            )
+        })?;
+        let pred_var = vars.get_or_insert("?#__cydel_p");
+        let other_var = vars.get_or_insert(if inbound {
+            "?#__cydel_s"
+        } else {
+            "?#__cydel_o"
+        });
+
+        let triple = if inbound {
+            TriplePattern::new(
+                Ref::Var(other_var),
+                Ref::Var(pred_var),
+                Term::Var(target_var),
+            )
+        } else {
+            TriplePattern::new(
+                Ref::Var(target_var),
+                Ref::Var(pred_var),
+                Term::Var(other_var),
+            )
+        };
+        parsed.patterns.push(Pattern::Triple(triple));
+        parsed.output = if inbound {
+            QueryOutput::select_all(vec![pred_var])
+        } else {
+            QueryOutput::select_all(vec![pred_var, other_var])
+        };
+        parsed.limit = None;
+
+        let executable = self.build_executable_for_view(probe_view, &parsed).await?;
+        let batches = self
+            .execute_view_internal(
+                probe_view,
+                &vars,
+                &executable,
+                &fluree_db_core::Tracker::disabled(),
+                &QueryExecutionOptions::default(),
+            )
+            .await?;
+        let binary_graph = probe_view.binary_graph();
+
+        for batch in &batches {
+            for row in 0..batch.len() {
+                let Some(pred) = batch.get(row, pred_var) else {
+                    continue;
+                };
+                if !cypher_delete_predicate_is_relationship(pred, binary_graph.as_ref())? {
+                    continue;
+                }
+                if inbound {
+                    return Ok(true);
+                }
+                let Some(object) = batch.get(row, other_var) else {
+                    continue;
+                };
+                if binding_is_node_ref(object) {
+                    return Ok(true);
+                }
+            }
+        }
+
+        Ok(false)
     }
 
     /// Parse and lower a Cypher write statement to a `Txn`, resolving bare
@@ -3917,6 +3996,45 @@ impl Fluree {
             .as_ref()
             .map(ledger_manager::LedgerManager::spawn_maintenance)
     }
+}
+
+fn binding_is_node_ref(binding: &fluree_db_query::Binding) -> bool {
+    matches!(
+        binding,
+        fluree_db_query::Binding::Sid { .. }
+            | fluree_db_query::Binding::IriMatch { .. }
+            | fluree_db_query::Binding::Iri(_)
+            | fluree_db_query::Binding::EncodedSid { .. }
+    )
+}
+
+fn cypher_delete_predicate_is_relationship(
+    binding: &fluree_db_query::Binding,
+    binary_graph: Option<&fluree_db_binary_index::BinaryGraphView>,
+) -> Result<bool> {
+    let sid = match binding {
+        fluree_db_query::Binding::Sid { sid, .. } => sid.clone(),
+        fluree_db_query::Binding::IriMatch { primary_sid, .. } => primary_sid.clone(),
+        fluree_db_query::Binding::EncodedPid { p_id } => {
+            let gv = binary_graph.ok_or_else(|| {
+                ApiError::query(
+                    "DELETE relationship probe returned an encoded predicate without a binary graph",
+                )
+            })?;
+            let iri = gv.store().resolve_predicate_iri(*p_id).ok_or_else(|| {
+                ApiError::query(format!(
+                    "DELETE relationship probe could not resolve predicate id {p_id}"
+                ))
+            })?;
+            gv.store().encode_iri(iri)
+        }
+        fluree_db_query::Binding::Iri(iri) => {
+            return Ok(iri.as_ref() != fluree_vocab::rdf::TYPE);
+        }
+        _ => return Ok(false),
+    };
+
+    Ok(!fluree_db_core::is_rdf_type(&sid) && !fluree_db_core::is_reserved_reifies_predicate(&sid))
 }
 
 // ============================================================================
