@@ -26,6 +26,7 @@ use crate::error::{ApiError, Result};
 ///
 /// Commits have a canonical content-addressed id ([`CommitId`]), but there are
 /// several user-facing forms that resolve to the same id.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CommitRef {
     /// Fully resolved CID — no lookup needed.
     ///

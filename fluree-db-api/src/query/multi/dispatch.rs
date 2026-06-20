@@ -75,7 +75,7 @@ use crate::query::multi::{
     SparqlContextDirectives, SubqueryLanguage,
 };
 use crate::{
-    ApiError, Fluree, QueryConnectionOptions, QueryExecutionOptions, TrackingOptions, TrackingTally,
+    ApiError, Fluree, GovernanceOptions, QueryExecutionOptions, TrackingOptions, TrackingTally,
 };
 
 // =============================================================================
@@ -753,17 +753,15 @@ async fn execute_subquery(
             // Policy enforcement for SPARQL aliases. SPARQL bodies carry no
             // `opts` block, so identity / policy-class / inline policy can only
             // reach execution through the merged envelope/sub opts assembled
-            // above. Parse them into `QueryConnectionOptions` and thread them
+            // above. Parse them into `GovernanceOptions` and thread them
             // down; `run_sparql_subquery` only diverts to the policy path when
             // an actual policy input is present. The identity here is whatever
             // the caller (HTTP handler) resolved through its impersonation gate
             // — this layer stays authn/authz-agnostic, mirroring JSON-LD.
             let policy_opts = match &merged_opts_val {
-                Some(opts) => {
-                    QueryConnectionOptions::from_json(&serde_json::json!({ "opts": opts }))
-                        .map_err(|e| ApiError::query(format!("invalid sub-query opts: {e}")))?
-                }
-                None => QueryConnectionOptions::default(),
+                Some(opts) => GovernanceOptions::from_json(&serde_json::json!({ "opts": opts }))
+                    .map_err(|e| ApiError::query(format!("invalid sub-query opts: {e}")))?,
+                None => GovernanceOptions::default(),
             };
             run_sparql_subquery(
                 fluree,

@@ -12,7 +12,7 @@
 
 use crate::format::FormatterConfig;
 use crate::{
-    ApiError, Fluree, QueryConnectionOptions, QueryExecutionOptions, Result, TrackingOptions,
+    ApiError, Fluree, GovernanceOptions, QueryExecutionOptions, Result, TrackingOptions,
     TrackingTally,
 };
 use serde_json::Value as JsonValue;
@@ -112,15 +112,15 @@ pub async fn run_jsonld_subquery(
 pub async fn run_sparql_subquery(
     fluree: &Fluree,
     sparql: &str,
-    policy: Option<QueryConnectionOptions>,
+    policy: Option<GovernanceOptions>,
     tracking: Option<TrackingOptions>,
     format: Option<FormatterConfig>,
     execution: QueryExecutionOptions,
 ) -> Result<SubqueryOutput> {
     // Only attach the policy channel when there's an actual policy input —
-    // an empty `QueryConnectionOptions` would needlessly divert from the
+    // an empty `GovernanceOptions` would needlessly divert from the
     // plain path (and `connection_opts` takes precedence over it).
-    let policy = policy.filter(QueryConnectionOptions::has_any_policy_inputs);
+    let policy = policy.filter(GovernanceOptions::has_any_policy_inputs);
 
     if let Some(opts) = tracking {
         let mut builder = fluree.query_from().sparql(sparql).tracking(opts);

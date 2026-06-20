@@ -7,7 +7,7 @@ use crate::query::helpers::{
 };
 use crate::view::{DataSetDb, GraphDb, QueryInput};
 use crate::{
-    ApiError, DatasetSpec, Fluree, FormatterConfig, PolicyContext, QueryConnectionOptions,
+    ApiError, DatasetSpec, Fluree, FormatterConfig, GovernanceOptions, PolicyContext,
     QueryExecutionOptions, QueryResult, Result,
 };
 use fluree_db_core::TrackingOptions;
@@ -19,7 +19,7 @@ impl Fluree {
     async fn prepare_single_view_for_connection(
         &self,
         spec: &DatasetSpec,
-        qc_opts: &QueryConnectionOptions,
+        qc_opts: &GovernanceOptions,
     ) -> Result<Option<GraphDb>> {
         let Some(view) = self.try_single_view_from_spec(spec).await? else {
             return Ok(None);
@@ -36,7 +36,7 @@ impl Fluree {
     async fn build_dataset_for_connection(
         &self,
         spec: &DatasetSpec,
-        qc_opts: &QueryConnectionOptions,
+        qc_opts: &GovernanceOptions,
     ) -> Result<DataSetDb> {
         if qc_opts.has_any_policy_inputs() {
             self.build_dataset_view_with_policy(spec, qc_opts).await
@@ -48,7 +48,7 @@ impl Fluree {
     async fn prepare_single_view_for_connection_tracked(
         &self,
         spec: &DatasetSpec,
-        qc_opts: &QueryConnectionOptions,
+        qc_opts: &GovernanceOptions,
     ) -> TrackedResult<Option<GraphDb>> {
         let view = self
             .try_single_view_from_spec(spec)
@@ -71,7 +71,7 @@ impl Fluree {
     async fn build_dataset_for_connection_tracked(
         &self,
         spec: &DatasetSpec,
-        qc_opts: &QueryConnectionOptions,
+        qc_opts: &GovernanceOptions,
     ) -> TrackedResult<DataSetDb> {
         let dataset = if qc_opts.has_any_policy_inputs() {
             self.build_dataset_view_with_policy(spec, qc_opts).await
@@ -665,7 +665,7 @@ impl Fluree {
         }
 
         let Some(view) = self
-            .prepare_single_view_for_connection(&spec, &crate::QueryConnectionOptions::default())
+            .prepare_single_view_for_connection(&spec, &crate::GovernanceOptions::default())
             .await?
         else {
             return Err(ApiError::query(
@@ -727,7 +727,7 @@ impl Fluree {
     }
 
     /// Execute a SPARQL connection query applying policy derived from
-    /// [`QueryConnectionOptions`] (identity / policy-class / inline policy).
+    /// [`GovernanceOptions`] (identity / policy-class / inline policy).
     ///
     /// SPARQL bodies carry no `opts` block, so the multi-query dispatcher
     /// passes the merged envelope/sub opts here explicitly. This mirrors
@@ -737,7 +737,7 @@ impl Fluree {
     pub(crate) async fn query_connection_sparql_with_opts_options(
         &self,
         sparql: &str,
-        qc_opts: &QueryConnectionOptions,
+        qc_opts: &GovernanceOptions,
         options: QueryExecutionOptions,
     ) -> Result<QueryResult> {
         let ast = parse_and_validate_sparql(sparql)?;
@@ -962,13 +962,13 @@ impl Fluree {
     }
 
     /// Tracked SPARQL connection query applying policy derived from
-    /// [`QueryConnectionOptions`]. Opts→policy twin of
+    /// [`GovernanceOptions`]. Opts→policy twin of
     /// [`Self::query_connection_sparql_tracked`], used by the multi-query
     /// dispatcher for policy-enforced SPARQL aliases under tracking.
     pub(crate) async fn query_connection_sparql_tracked_with_opts_options(
         &self,
         sparql: &str,
-        qc_opts: &QueryConnectionOptions,
+        qc_opts: &GovernanceOptions,
         format_config: Option<FormatterConfig>,
         tracking_override: Option<TrackingOptions>,
         options: QueryExecutionOptions,
@@ -1063,7 +1063,7 @@ impl Fluree {
         &self,
         view: crate::view::GraphDb,
         source: &crate::dataset::GraphSource,
-        global_opts: &crate::QueryConnectionOptions,
+        global_opts: &crate::GovernanceOptions,
     ) -> Result<crate::view::GraphDb> {
         // Per-source policy takes precedence
         if let Some(policy_override) = &source.policy_override {

@@ -359,7 +359,7 @@ async fn extract_credential(req: Request<axum::body::Body>) -> Result<MaybeCrede
     // Read the body
     let body = axum::body::to_bytes(req.into_body(), usize::MAX)
         .await
-        .map_err(|e| ServerError::bad_request(format!("Failed to read body: {}", e)))?;
+        .map_err(|e| ServerError::bad_request(format!("Failed to read body: {e}")))?;
 
     // No credential verification - pass through as-is
     Ok(MaybeCredential {
@@ -367,9 +367,9 @@ async fn extract_credential(req: Request<axum::body::Body>) -> Result<MaybeCrede
         credential: None,
         body,
         is_sparql: is_sparql_query,
-        is_sparql_update: is_sparql_update,
-        is_turtle: is_turtle,
-        is_trig: is_trig,
+        is_sparql_update,
+        is_turtle,
+        is_trig,
     })
 }
 

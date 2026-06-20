@@ -18,7 +18,7 @@
 //! Pages walk backward via `parents` — O(limit) per page regardless of
 //! ledger size. Used by pull and clone operations.
 
-use crate::dataset::QueryConnectionOptions;
+use crate::dataset::GovernanceOptions;
 use crate::error::{ApiError, Result};
 use crate::policy_builder::build_policy_context_from_opts;
 use crate::tx::{IndexingMode, IndexingStatus};
@@ -217,16 +217,16 @@ pub struct PushedHead {
     pub commit_id: ContentId,
 }
 
-/// Push precomputed commits to a ledger handle (transaction server mode).
+/// Push precomputed commits to a ledger (transaction server mode).
 ///
 /// This acquires the ledger write mutex for the duration of validation + publish,
 /// so pushes are serialized with normal transactions.
 impl Fluree {
-    pub async fn push_commits_with_handle(
+    pub async fn push_commits(
         &self,
-        handle: &LedgerHandle,
+        ledger_id: &str,
         request: PushCommitsRequest,
-        opts: &QueryConnectionOptions,
+        opts: &GovernanceOptions,
         index_config: &IndexConfig,
     ) -> Result<PushCommitsResponse> {
         if request.commits.is_empty() {
@@ -234,7 +234,10 @@ impl Fluree {
         }
 
         // 0) Lock ledger state for write (serialize with transactions).
-        let mut guard = handle.lock_for_write().await;
+        let mut guard = self
+            .lock_ledger(ledger_id)
+            .await?
+            .ok_or_else(|| ApiError::internal("push requires a ledger manager"))?;
         let mut base_state = guard.clone_state();
 
         // 1) Read current head ref (CAS expected).
@@ -456,18 +459,7 @@ impl Fluree {
         .map_err(PushError::into_api_error)?;
 
         let mut new_state = new_state;
-        if crate::ns_helpers::binary_store_missing_snapshot_namespaces(&new_state) {
-            let cache_dir = self.binary_store_cache_dir();
-            // Result unused: load_and_attach mutates new_state in-place
-            let _store = crate::ledger_manager::load_and_attach_binary_store(
-                self.backend(),
-                self.nameservice(),
-                &mut new_state,
-                &cache_dir,
-                Some(std::sync::Arc::clone(self.leaflet_cache())),
-            )
-            .await?;
-        }
+        self.refresh_index(&mut new_state).await?;
 
         // 8) Compute indexing status from the updated state.
         let indexing_enabled = self.indexing_mode.is_enabled() && self.defaults_indexing_enabled();
@@ -483,18 +475,21 @@ impl Fluree {
 
         // Sync binary_store BEFORE replacing state so that concurrent readers
         // (via snapshot()) never see the new state with a stale binary_store.
-        handle.sync_binary_store_from_state(&new_state).await;
+        guard
+            .ledger()
+            .sync_binary_store_from_state(&new_state)
+            .await;
         guard.replace(new_state);
 
         // 9) Trigger background indexing if enabled and needed.
         if let IndexingMode::Background(idx_handle) = &self.indexing_mode {
             if indexing_enabled && indexing_needed {
-                idx_handle.trigger(handle.ledger_id(), final_head.t).await;
+                idx_handle.trigger(ledger_id, final_head.t).await;
             }
         }
 
         Ok(PushCommitsResponse {
-            ledger: handle.ledger_id().to_string(),
+            ledger: ledger_id.to_string(),
             accepted: decoded.len(),
             head: PushedHead {
                 t: final_head.t,
@@ -766,7 +761,7 @@ async fn build_policy_ctx_for_push(
     base: &LedgerState,
     evolving: &Novelty,
     current_t: i64,
-    opts: &QueryConnectionOptions,
+    opts: &GovernanceOptions,
 ) -> Result<PolicyContext> {
     // Build policy context from opts against current state (db + evolving novelty).
     build_policy_context_from_opts(
@@ -1153,7 +1148,7 @@ impl Fluree {
             .unwrap_or(EXPORT_DEFAULT_LIMIT)
             .min(EXPORT_MAX_LIMIT);
 
-        let ledger_id = handle.ledger_id();
+        let ledger_id = handle.id();
 
         // Read current head.
         let head_ref = self
@@ -1308,7 +1303,7 @@ impl Fluree {
         handle: &LedgerHandle,
         response: &ExportCommitsResponse,
     ) -> Result<BulkImportResult> {
-        let ledger_id = handle.ledger_id();
+        let ledger_id = handle.id();
         let storage = self.admin_storage().ok_or_else(|| {
             ApiError::config("import_commits_bulk requires a managed storage backend")
         })?;
@@ -1372,7 +1367,7 @@ impl Fluree {
         head_commit_id: &ContentId,
         head_t: i64,
     ) -> Result<()> {
-        let ledger_id = handle.ledger_id();
+        let ledger_id = handle.id();
         let new_ref = RefValue {
             id: Some(head_commit_id.clone()),
             t: head_t,
@@ -1415,7 +1410,7 @@ impl Fluree {
         index_id: &ContentId,
         index_t: i64,
     ) -> Result<()> {
-        let ledger_id = handle.ledger_id();
+        let ledger_id = handle.id();
         let new_ref = RefValue {
             id: Some(index_id.clone()),
             t: index_t,
@@ -1836,7 +1831,7 @@ impl Fluree {
     /// `commits` must be ordered oldest → newest.
     pub async fn import_commits_incremental(
         &self,
-        handle: &LedgerHandle,
+        ledger_id: &str,
         commits: Vec<Base64Bytes>,
         blobs: HashMap<String, Base64Bytes>,
     ) -> Result<CommitImportResult> {
@@ -1844,7 +1839,10 @@ impl Fluree {
             return Err(ApiError::http(400, "no commits to import"));
         }
 
-        let mut guard = handle.lock_for_write().await;
+        let mut guard = self
+            .lock_ledger(ledger_id)
+            .await?
+            .ok_or_else(|| ApiError::internal("import requires a ledger manager"))?;
         let base_state = guard.clone_state();
 
         // 1) Read current head ref.
@@ -1953,13 +1951,16 @@ impl Fluree {
 
         // Sync binary_store BEFORE replacing state so that concurrent readers
         // (via snapshot()) never see the new state with a stale binary_store.
-        handle.sync_binary_store_from_state(&new_state).await;
+        guard
+            .ledger()
+            .sync_binary_store_from_state(&new_state)
+            .await;
         guard.replace(new_state);
 
         // 10) Trigger background indexing if enabled and needed.
         if let IndexingMode::Background(idx_handle) = &self.indexing_mode {
             if indexing_enabled && indexing_needed {
-                idx_handle.trigger(handle.ledger_id(), final_head.t).await;
+                idx_handle.trigger(ledger_id, final_head.t).await;
             }
         }
 

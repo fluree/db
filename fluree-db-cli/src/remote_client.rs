@@ -105,7 +105,7 @@ pub(crate) fn policy_headers(policy: &PolicyArgs) -> Vec<(&'static str, String)>
 ///
 /// Does nothing when `policy` is unset or `body` is not a JSON object. Uses
 /// the standard `opts.identity` / `opts.policy-class` / `opts.default-allow`
-/// shape the server parses via `QueryConnectionOptions::from_json`.
+/// shape the server parses via `GovernanceOptions::from_json`.
 pub(crate) fn inject_policy_into_json_opts(body: &mut serde_json::Value, policy: &PolicyArgs) {
     if !policy.is_set() {
         return;

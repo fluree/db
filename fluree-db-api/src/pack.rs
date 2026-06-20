@@ -283,10 +283,7 @@ pub async fn full_ledger_pack_request(
 ) -> Result<PackRequest> {
     let snapshot = handle.snapshot().await;
     let head_commit_id = snapshot.head_commit_id.clone().ok_or_else(|| {
-        ApiError::internal(format!(
-            "ledger {} has no head commit to pack",
-            handle.ledger_id()
-        ))
+        ApiError::internal(format!("ledger {} has no head commit to pack", handle.id()))
     })?;
 
     let request = match (include_indexes, snapshot.head_index_id.clone()) {
@@ -386,7 +383,7 @@ pub async fn stream_archive(
                     .parse()
                     .map_err(|e| format!("invalid default_context_id in manifest: {e}"))?;
                 let store = fluree
-                    .branched_content_store(handle.ledger_id())
+                    .branched_content_store(handle.id())
                     .await
                     .map_err(|e| format!("failed to build store for default context: {e}"))?;
                 let bytes = store
@@ -436,7 +433,7 @@ async fn stream_pack_inner(
     // non-HTTP callers that bypass the route-layer check.
     validate_pack_request(request)?;
 
-    let ledger_id = handle.ledger_id();
+    let ledger_id = handle.id();
     // Branch-aware store: packing a branched ledger requires reading
     // pre-fork ancestor commits that live under the source branch's
     // namespace.

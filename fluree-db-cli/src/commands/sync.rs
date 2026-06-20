@@ -566,13 +566,8 @@ pub async fn run_pull(ledger: Option<&str>, no_indexes: bool, dirs: &FlureeDir) 
     let count = to_import.len();
 
     // Import incrementally (validates chain, ancestry, writes blobs, advances head, updates novelty).
-    let handle = fluree
-        .ledger_cached(&ledger_id)
-        .await
-        .map_err(|e| CliError::Config(format!("failed to load ledger: {e}")))?;
-
     let result = fluree
-        .import_commits_incremental(&handle, to_import, all_blobs)
+        .import_commits_incremental(&ledger_id, to_import, all_blobs)
         .await
         .map_err(|e| CliError::Config(format!("pull failed (import): {e}")))?;
 
