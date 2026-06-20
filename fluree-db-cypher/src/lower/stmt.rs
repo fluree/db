@@ -36,7 +36,7 @@ pub fn lower_query<E: IriEncoder>(
         limit,
         offset,
         grouping,
-    } = lower_single_branch(ctx, q)?;
+    } = lower_single_branch(ctx, q, &[])?;
 
     Ok(Query {
         context: ParsedContext::new(),
@@ -88,7 +88,7 @@ fn lower_union_query<E: IriEncoder>(
             ));
         }
 
-        let branch = lower_single_branch(ctx, cursor)?;
+        let branch = lower_single_branch(ctx, cursor, &[])?;
         let branch_vars = branch.projected_vars();
         if branch_vars.is_empty() {
             return Err(LowerError::unsupported(
@@ -226,8 +226,14 @@ impl SingleBranch {
 fn lower_single_branch<E: IriEncoder>(
     ctx: &mut LoweringContext<'_, E>,
     q: &crate::ast::Query,
+    outer_scope: &[VarId],
 ) -> Result<SingleBranch> {
     let mut patterns: Vec<Pattern> = Vec::new();
+    // Variables visible from an ENCLOSING scope (a CALL body sees its imports);
+    // empty at the top level. A `WITH` narrows scope to its projection, so once
+    // one is seen the enclosing-scope vars are no longer separately visible —
+    // whatever the `WITH` carried forward is already reflected in `patterns`.
+    let mut narrowed = false;
     for clause in &q.clauses {
         match clause {
             ReadClause::Match(m) => {
@@ -252,6 +258,7 @@ fn lower_single_branch<E: IriEncoder>(
             ReadClause::With(w) => {
                 let subq = lower_with(ctx, w, std::mem::take(&mut patterns))?;
                 patterns.push(Pattern::Subquery(subq));
+                narrowed = true;
             }
             ReadClause::Unwind(u) => {
                 patterns.push(lower_unwind(ctx, u)?);
@@ -260,9 +267,20 @@ fn lower_single_branch<E: IriEncoder>(
                 // Pipeline clause: outer rows flow INTO the subquery and its
                 // RETURN columns continue downstream. Unlike WITH, it does NOT
                 // consume the prior patterns — it appends alongside them. The
-                // outer scope (vars bound by preceding clauses) gates which
-                // imports are valid and which RETURN names would collide.
-                let outer_vars = visible_vars_from_patterns(ctx, &patterns);
+                // visible scope (which gates valid imports / RETURN collisions /
+                // shadowing) is the vars bound by preceding clauses here PLUS the
+                // enclosing scope's vars (e.g. a parent CALL's imports), until a
+                // WITH narrows them away.
+                let mut outer_vars: Vec<VarId> = if narrowed {
+                    Vec::new()
+                } else {
+                    outer_scope.to_vec()
+                };
+                for v in visible_vars_from_patterns(ctx, &patterns) {
+                    if !outer_vars.contains(&v) {
+                        outer_vars.push(v);
+                    }
+                }
                 let p = lower_call_subquery(ctx, call, &outer_vars)?;
                 patterns.push(p);
             }
@@ -1273,7 +1291,9 @@ fn lower_call_branch<E: IriEncoder>(
         ));
     }
 
-    let mut branch = lower_single_branch(ctx, branch_query)?;
+    // The branch body sees the CALL's imports as its enclosing scope, so a
+    // NESTED CALL inside it can correlate on them.
+    let mut branch = lower_single_branch(ctx, branch_query, import_vars)?;
     let return_vars = branch.projected_vars();
     if return_vars.is_empty() {
         return Err(LowerError::unsupported(

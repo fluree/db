@@ -2275,6 +2275,82 @@ async fn cypher_call_subquery_import_all() {
 }
 
 #[tokio::test]
+async fn cypher_call_subquery_nested() {
+    // A nested CALL sees the variables imported by its enclosing CALL.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = seed_call_graph(&fluree, "it/cypher:call-nested").await;
+    let db = graphdb_from_ledger(&l);
+
+    // Nested explicit import: the inner CALL (p) correlates on the outer CALL's
+    // imported `p`.
+    let nested = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (p:Person)
+               CALL (p) {
+                 CALL (p) { MATCH (p)-[:KNOWS]->(f:Person) RETURN count(f) AS c }
+                 RETURN c AS friends
+               }
+               RETURN p.name AS name, friends ORDER BY name"#,
+        )
+        .await
+        .expect("nested explicit import")
+        .to_cypher_json_async(db.as_graph_db_ref())
+        .await
+        .expect("cypher json");
+    let data = nested["results"][0]["data"].as_array().expect("rows");
+    assert_eq!(data.len(), 2, "Carol (zero matches) drops: {nested}");
+    assert_eq!(data[0]["row"], json!(["Alice", 2]), "{nested}");
+    assert_eq!(data[1]["row"], json!(["Bob", 1]), "{nested}");
+
+    // Nested CALL (*) must import the enclosing scope (incl. `p`), NOT silently
+    // uncorrelate to a global count (which would broadcast 3 to every person).
+    let star = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (p:Person)
+               CALL (p) {
+                 CALL (*) { MATCH (p)-[:KNOWS]->(f:Person) RETURN count(f) AS c }
+                 RETURN c AS friends
+               }
+               RETURN p.name AS name, friends ORDER BY name"#,
+        )
+        .await
+        .expect("nested import-all")
+        .to_cypher_json_async(db.as_graph_db_ref())
+        .await
+        .expect("cypher json");
+    let data = star["results"][0]["data"].as_array().expect("rows");
+    assert_eq!(
+        data.len(),
+        2,
+        "nested CALL (*) correlates on p (not a global broadcast): {star}"
+    );
+    assert_eq!(data[0]["row"], json!(["Alice", 2]), "{star}");
+    assert_eq!(data[1]["row"], json!(["Bob", 1]), "{star}");
+
+    // A WITH inside the body narrows scope: after `WITH f` (which drops `p`), a
+    // nested CALL (p) can no longer import `p`.
+    assert!(
+        fluree
+            .query_cypher(
+                &db,
+                r#"MATCH (p:Person)
+                   CALL (p) {
+                     MATCH (p)-[:KNOWS]->(f:Person)
+                     WITH f
+                     CALL (p) { MATCH (p)-[:KNOWS]->(g:Person) RETURN count(g) AS c }
+                     RETURN c AS cc
+                   }
+                   RETURN p.name, cc"#,
+            )
+            .await
+            .is_err(),
+        "a WITH that drops the import narrows it out of a nested CALL's scope"
+    );
+}
+
+#[tokio::test]
 async fn cypher_call_subquery_rejections() {
     let fluree = FlureeBuilder::memory().build_memory();
     let l = seed_call_graph(&fluree, "it/cypher:call-reject").await;
