@@ -26,7 +26,14 @@ use super::{LoweringContext, Result};
 pub(super) struct SelectBinds {
     /// BIND patterns to apply before grouping/aggregation
     pub pre: Vec<Pattern>,
-    /// Post-aggregation binds (var, expr) to apply after GROUP BY
+    /// Post-aggregation binds (var, expr) to apply after GROUP BY.
+    ///
+    /// Includes binds whose expression references an aggregate **alias**
+    /// (e.g. `(?count + 1 AS ?bumped)`); compound-aggregate SELECT items —
+    /// expressions like `((MAX(?u) - MIN(?u)) AS ?spread)` whose aggregates
+    /// must first be hoisted into the alias map — are produced later by
+    /// [`Self::lower_solution_modifiers`] and appended onto this list by the
+    /// caller.
     pub post: Vec<(VarId, Expression)>,
 }
 
@@ -71,6 +78,11 @@ pub(super) struct LoweredModifiers {
     /// Pre-GROUP-BY BIND patterns for expression-based GROUP BY conditions.
     /// These must be injected into the WHERE pattern list before query building.
     pub pre_group_binds: Vec<Pattern>,
+    /// Post-aggregation binds produced by compound-aggregate SELECT items
+    /// (e.g. `((MAX(?u) - MIN(?u)) AS ?spread)`). Each inner aggregate has
+    /// been hoisted into `aggregates`; the bind references those synthetic
+    /// output vars. The caller appends these onto `SelectBinds::post`.
+    pub select_post_binds: Vec<(VarId, Expression)>,
 }
 
 impl<E: IriEncoder> LoweringContext<'_, E> {
@@ -106,7 +118,12 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
         if let SelectVariables::Explicit(vars) = &clause.variables {
             for var in vars {
                 if let SelectVariable::Expr { expr, alias, .. } = var {
-                    if matches!(expr, AstExpression::Aggregate { .. }) {
+                    // Both bare aggregates (`MAX(?u) AS ?hi`) and compound
+                    // expressions that contain aggregates (`MAX(?u) - MIN(?u)
+                    // AS ?spread`) bind their alias only after the aggregation
+                    // stage. Anything depending on that alias must therefore
+                    // ride as a post-aggregation bind.
+                    if self.expr_contains_aggregate(expr) {
                         names.insert(alias.name.clone());
                     }
                 }
@@ -127,7 +144,16 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
         if let SelectVariables::Explicit(vars) = &clause.variables {
             for var in vars {
                 if let SelectVariable::Expr { expr, alias, .. } = var {
-                    if matches!(expr, AstExpression::Aggregate { .. }) {
+                    // Bare aggregates (`MAX(?u) AS ?hi`) become AggregateSpecs
+                    // in `extract_aggregates`. Compound expressions that contain
+                    // aggregates (`MAX(?u) - MIN(?u) AS ?spread`) need their
+                    // inner aggregates hoisted before they can be lowered, so
+                    // `lower_solution_modifiers` produces their post-bind once
+                    // the alias map exists. Both are skipped here.
+                    if self.expr_contains_aggregate(expr) {
+                        // Register the alias so projection / GROUP BY checks
+                        // can resolve it before the post-bind lands.
+                        self.register_var(alias);
                         continue;
                     }
                     let filter_expr = self.lower_expression(expr)?;
@@ -188,18 +214,51 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
             group_by = group_vars;
         }
 
-        // Aggregate-alias map shared by HAVING and aggregate-bearing ORDER BY
-        // hoisting. Seeded with SELECT aggregate aliases so both reuse them, and
-        // so the synthetic `?__inline_agg_N` names stay unique across both (the
-        // names are keyed off the shared map's length).
-        let needs_alias_map = modifiers.having.is_some() || !base.deferred_order_exprs.is_empty();
+        // Compound-aggregate SELECT items (`(MAX(?u) - MIN(?u) AS ?spread)`):
+        // these need the alias map too, so their inner aggregates can be
+        // hoisted and the outer expression lowered as a post-aggregation bind.
+        let compound_aggregate_select_items: Vec<(VarId, AstExpression)> =
+            self.collect_compound_aggregate_select_items(select);
+
+        // Aggregate-alias map shared by HAVING, aggregate-bearing ORDER BY, and
+        // compound-aggregate SELECT items. Seeded with bare-Aggregate SELECT
+        // aliases so all three reuse them, and so the synthetic
+        // `?__inline_agg_N` names stay unique across them (keyed off the shared
+        // map's length).
+        let needs_alias_map = modifiers.having.is_some()
+            || !base.deferred_order_exprs.is_empty()
+            || !compound_aggregate_select_items.is_empty();
         let mut aggregate_aliases: HashMap<String, VarId> = if needs_alias_map {
             self.build_aggregate_aliases(select)?
         } else {
             HashMap::new()
         };
-        // Aggregates hoisted out of HAVING and/or ORDER BY expressions.
+        // Aggregates hoisted out of compound SELECT items, HAVING, and/or
+        // ORDER BY expressions.
         let mut hoisted_aggregates: Vec<AggregateSpec> = Vec::new();
+
+        // Compound-aggregate SELECT items: hoist their inner aggregates, then
+        // lower each outer expression to a post-aggregation bind referencing
+        // the synthetic alias vars.
+        let mut select_post_binds: Vec<(VarId, Expression)> = Vec::new();
+        if !compound_aggregate_select_items.is_empty() {
+            let mut select_pre_binds: Vec<Pattern> = Vec::new();
+            for (_, ast_expr) in &compound_aggregate_select_items {
+                self.collect_inline_aggregates(
+                    ast_expr,
+                    &mut aggregate_aliases,
+                    &mut hoisted_aggregates,
+                    &mut select_pre_binds,
+                )?;
+            }
+            self.aggregate_aliases = Some(aggregate_aliases.clone());
+            for (var_id, ast_expr) in &compound_aggregate_select_items {
+                let lowered = self.lower_expression(ast_expr)?;
+                select_post_binds.push((*var_id, lowered));
+            }
+            self.aggregate_aliases = None;
+            pre_group_binds.extend(select_pre_binds);
+        }
 
         // HAVING (may reference aggregate expressions)
         if let Some(ref having_clause) = modifiers.having {
@@ -264,7 +323,34 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
             aggregates,
             having,
             pre_group_binds,
+            select_post_binds,
         })
+    }
+
+    /// Walk the SELECT clause for compound expressions that *contain*
+    /// aggregates (e.g. `(MAX(?u) - MIN(?u) AS ?spread)`) — bare aggregates
+    /// (`MAX(?u) AS ?hi`) are handled separately by `extract_aggregates`.
+    /// Returns each as `(alias VarId, AST expression)` for hoisting + post-bind
+    /// lowering in `lower_solution_modifiers`.
+    fn collect_compound_aggregate_select_items(
+        &mut self,
+        select: &SelectClause,
+    ) -> Vec<(VarId, AstExpression)> {
+        let mut items = Vec::new();
+        if let SelectVariables::Explicit(vars) = &select.variables {
+            for var in vars {
+                if let SelectVariable::Expr { expr, alias, .. } = var {
+                    if matches!(expr, AstExpression::Aggregate { .. }) {
+                        continue;
+                    }
+                    if self.expr_contains_aggregate(expr) {
+                        let var_id = self.register_var(alias);
+                        items.push((var_id, expr.clone()));
+                    }
+                }
+            }
+        }
+        items
     }
 
     /// Lower LIMIT, OFFSET, and ORDER BY modifiers (shared by SELECT and
@@ -572,11 +658,16 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
         // the grouping's aggregation stage; expression/aggregate ORDER BY binds
         // ride on `order_binds` (a dedicated post-grouping stage in the shared
         // modifier tail) so they evaluate uniformly with or without grouping.
+        // Compound-aggregate SELECT post-binds — produced by
+        // `lower_solution_modifiers` after aggregate hoisting — also ride in
+        // the aggregation stage.
+        let mut post_binds = select_binds.post;
+        post_binds.extend(lowered.select_post_binds);
         let mut sq = SubqueryPattern::new(select, patterns);
         if let Some(grouping) = Grouping::assemble(
             lowered.group_by,
             lowered.aggregates,
-            select_binds.post,
+            post_binds,
             lowered.having,
         ) {
             sq = sq.with_grouping(grouping);

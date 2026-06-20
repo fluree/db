@@ -311,16 +311,19 @@ impl<'a, E: IriEncoder> LoweringContext<'a, E> {
                 let distinct = lowered_modifiers.distinct;
 
                 // Assemble the grouping phase from the lowered components.
-                // SELECT post-binds (`select_binds.post`) ride inside the
-                // aggregation stage. Expression-based ORDER BY binds ride on
-                // `Query.order_binds` (a dedicated post-grouping stage in the
-                // operator tree) so they evaluate uniformly with or without
-                // grouping — including dedup-only GROUP BY, which has no
-                // aggregation stage to carry binds.
+                // SELECT post-binds (`select_binds.post`, plus any compound-
+                // aggregate post-binds produced by `lower_solution_modifiers`)
+                // ride inside the aggregation stage. Expression-based ORDER BY
+                // binds ride on `Query.order_binds` (a dedicated post-grouping
+                // stage in the operator tree) so they evaluate uniformly with
+                // or without grouping — including dedup-only GROUP BY, which
+                // has no aggregation stage to carry binds.
+                let mut post_binds = select_binds.post;
+                post_binds.extend(lowered_modifiers.select_post_binds);
                 let grouping = Grouping::assemble(
                     lowered_modifiers.group_by,
                     lowered_modifiers.aggregates,
-                    select_binds.post,
+                    post_binds,
                     lowered_modifiers.having,
                 );
 
