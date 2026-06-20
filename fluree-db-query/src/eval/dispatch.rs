@@ -209,6 +209,8 @@ impl Function {
             | Function::Range
             | Function::PathPairs
             | Function::Relationships
+            | Function::MakeRel
+            | Function::MakePath
             | Function::Split
             | Function::Labels
             | Function::Keys

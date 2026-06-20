@@ -43,7 +43,10 @@ fn resolve_arg_binding<R: RowAccess>(
     }
 }
 
-fn binding_subject_sid(binding: &Binding, ctx: &ExecutionContext<'_>) -> Result<Option<Sid>> {
+pub(crate) fn binding_subject_sid(
+    binding: &Binding,
+    ctx: &ExecutionContext<'_>,
+) -> Result<Option<Sid>> {
     match binding {
         Binding::Sid { sid, .. } => Ok(Some(sid.clone())),
         Binding::EncodedSid { s_id, .. } => {

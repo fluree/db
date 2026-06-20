@@ -59,21 +59,9 @@ fn parse_pattern_part(s: &mut TokenStream) -> Result<PatternPart, Diagnostic> {
         }
     }
 
-    // A bound path var without a shortestPath wrapper is a first-class path
-    // value — still deferred.
-    if path_var.is_some() && path_search.is_none() {
-        return Err(Diagnostic {
-            code: DiagCode::DeferredPathValue,
-            severity: crate::diag::Severity::Error,
-            message: "path values (`p = (...)`) are deferred — only \
-                      `p = shortestPath((a)-[:T*]->(b))` is supported"
-                .to_string(),
-            span: s.peek_span(),
-            help: Some(
-                "wrap the pattern in shortestPath(...) or drop the path binding".to_string(),
-            ),
-        });
-    }
+    // A bound path var without a shortestPath wrapper (`p = (a)-[:T*1..n]->(b)`)
+    // is now lowered for a single bounded variable-length relationship; lowering
+    // rejects the still-unsupported shapes with a specific message.
 
     let head = parse_node_pat(s)?;
     let mut tail = Vec::new();

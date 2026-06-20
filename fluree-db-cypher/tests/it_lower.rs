@@ -285,17 +285,25 @@ fn untyped_undirected_is_rejected() {
 }
 
 #[test]
-fn bound_variable_length_relationship_is_rejected() {
-    // Binding `r` to a variable-length relationship needs list values.
-    let out = parse_cypher("MATCH (a:Person)-[r:KNOWS*1..3]->(b) RETURN b");
-    assert!(!out.has_errors(), "parse should accept it");
-    let ast = out.ast.unwrap();
-    let encoder = NoEncoder;
-    let mut vars = VarRegistry::new();
-    let r = lower_cypher(&ast, &encoder, &mut vars);
+fn bounded_var_length_rel_binding_lowers_unbounded_rejected() {
+    // A BOUNDED `-[r:T*m..n]->` binds `r` to a rel list (lowers OK); the
+    // UNBOUNDED form needs path enumeration the transitive operator lacks
+    // (rejected at lowering).
+    let lower_res = |src: &str| {
+        let out = parse_cypher(src);
+        assert!(!out.has_errors(), "parse should accept it: {src}");
+        let ast = out.ast.unwrap();
+        let encoder = ConstEncoder;
+        let mut vars = VarRegistry::new();
+        lower_cypher(&ast, &encoder, &mut vars)
+    };
     assert!(
-        r.is_err(),
-        "bound var-length relationship should be rejected"
+        lower_res("MATCH (a:Person)-[r:KNOWS*1..3]->(b) RETURN b").is_ok(),
+        "bounded var-length rel binding lowers"
+    );
+    assert!(
+        lower_res("MATCH (a:Person)-[r:KNOWS*]->(b) RETURN b").is_err(),
+        "unbounded var-length rel binding is rejected"
     );
 }
 
@@ -354,11 +362,19 @@ impl fluree_db_query::parse::encode::IriEncoder for ConstEncoder {
 }
 
 #[test]
-fn plain_path_value_is_still_rejected() {
+fn plain_fixed_path_value_is_rejected_at_lowering() {
+    // A fixed-length `p = (a)-[:KNOWS]->(b)` now parses (the parser no longer
+    // blocks non-shortestPath path vars), but path binding is only supported for
+    // shortestPath and a single bounded variable-length relationship, so lowering
+    // rejects this shape.
     let out = parse_cypher("MATCH p = (a)-[:KNOWS]->(b) RETURN p");
+    assert!(!out.has_errors(), "fixed path value now parses");
+    let ast = out.ast.expect("ast");
+    let encoder = NoEncoder;
+    let mut vars = VarRegistry::new();
     assert!(
-        out.has_errors(),
-        "plain path values should be rejected at parse"
+        lower_cypher(&ast, &encoder, &mut vars).is_err(),
+        "a fixed-length path binding is rejected at lowering"
     );
 }
 

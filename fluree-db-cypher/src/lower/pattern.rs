@@ -57,10 +57,27 @@ fn lower_part<E: IriEncoder>(
     // Otherwise, the relationship anchors the node — it can be
     // unlabeled but it must participate in a relationship.
     lower_node(ctx, &part.head, out)?;
+
+    // A plain `p = …` path variable (not shortestPath) is supported only for a
+    // single bounded variable-length relationship in v1; that segment builds the
+    // path value. Reject it on other shapes rather than silently leaving p unbound.
+    let single_var_length = part.tail.len() == 1 && part.tail[0].0.length.is_some();
+    if part.path_var.is_some() && !single_var_length {
+        return Err(LowerError::unsupported(
+            "a path variable (`p = …`) is supported for shortestPath and a single \
+             bounded variable-length relationship in v1",
+        ));
+    }
+
     let mut prev = part.head.clone();
     for (rel, next) in &part.tail {
         lower_node(ctx, next, out)?;
-        lower_rel(ctx, &prev, rel, next, out)?;
+        let pv = if single_var_length {
+            part.path_var.as_ref()
+        } else {
+            None
+        };
+        lower_rel(ctx, &prev, rel, next, out, pv)?;
         prev = next.clone();
     }
     Ok(())
@@ -224,9 +241,10 @@ fn lower_rel<E: IriEncoder>(
     rel: &RelPattern,
     right: &NodePattern,
     out: &mut Vec<Pattern>,
+    path_var: Option<&Variable>,
 ) -> Result<()> {
     if rel.length.is_some() {
-        return lower_var_length_rel(ctx, left, rel, right, out);
+        return lower_var_length_rel(ctx, left, rel, right, out, path_var);
     }
 
     // Both nodes' refs were already minted in `lower_node`; re-resolve
@@ -316,19 +334,22 @@ fn lower_var_length_rel<E: IriEncoder>(
     rel: &RelPattern,
     right: &NodePattern,
     out: &mut Vec<Pattern>,
+    path_var: Option<&Variable>,
 ) -> Result<()> {
-    if rel.var.is_some() {
-        return Err(LowerError::unsupported(
-            "binding a variable to a variable-length relationship needs list-valued bindings \
-             (deferred); use an anonymous `-[:T*m..n]->`",
-        ));
-    }
     if rel.props.is_some() {
         return Err(LowerError::unsupported(
             "property filters on a variable-length relationship are deferred",
         ));
     }
     if rel.types.is_empty() {
+        // Untyped wildcard paths can't name a single predicate to build rel/path
+        // values from, so binding is deferred there.
+        if rel.var.is_some() || path_var.is_some() {
+            return Err(LowerError::unsupported(
+                "binding a relationship/path variable on an untyped variable-length path \
+                 (`-[r*]->` / `p = (a)-[*]->(b)`) is deferred; name a relationship type",
+            ));
+        }
         return lower_untyped_var_length_rel(ctx, left, rel, right, out);
     }
 
@@ -349,6 +370,15 @@ fn lower_var_length_rel<E: IriEncoder>(
         // whose closure follows an edge of any listed type per hop (LDBC IC12's
         // `[:HAS_TYPE|IS_SUBCLASS_OF*0..]`).
         None => {
+            // Unbounded paths use the transitive operator, which yields reachable
+            // endpoints but no enumerated hops to build a rel-list / path from.
+            if rel.var.is_some() || path_var.is_some() {
+                return Err(LowerError::unsupported(
+                    "binding a relationship/path variable on an UNBOUNDED variable-length path \
+                     (`-[r:T*]->` / `p = (a)-[:T*]->(b)`) is deferred; use a bounded range \
+                     like `-[r:T*1..3]->`",
+                ));
+            }
             let modifier = match lo {
                 0 => PathModifier::ZeroOrMore,
                 1 => PathModifier::OneOrMore,
@@ -417,16 +447,40 @@ fn lower_var_length_rel<E: IriEncoder>(
                      unbounded `*` for deeper traversal",
                 ));
             }
+            if matches!(rel.direction, Direction::Either)
+                && (rel.var.is_some() || path_var.is_some())
+            {
+                return Err(LowerError::unsupported(
+                    "binding a relationship/path variable on an undirected variable-length path \
+                     is deferred (a bound relationship needs a definite orientation)",
+                ));
+            }
+            // The predicate SID for constructing rel/path values per branch. If the
+            // type isn't in the dictionary there are no edges, so binding is moot;
+            // the chains below simply match nothing.
+            let pred_sid = ctx.encoder.encode_iri(&type_iri);
+            let rel_var_id = rel.var.as_ref().map(|v| ctx.intern_var(&v.name));
+            let path_var_id = path_var.map(|v| ctx.intern_var(&v.name));
+
             let mut chains: Vec<Vec<Pattern>> = Vec::with_capacity((hi - lo + 1) as usize);
             for k in lo..=hi {
-                chains.push(build_fixed_chain(
-                    ctx,
-                    &left_ref,
-                    &right_ref,
-                    k,
-                    &type_iri,
-                    rel.direction,
-                )?);
+                let (mut chain, nodes) =
+                    build_fixed_chain(ctx, &left_ref, &right_ref, k, &type_iri, rel.direction)?;
+                if let Some(pred) = &pred_sid {
+                    if let Some(rv) = rel_var_id {
+                        chain.push(Pattern::Bind {
+                            var: rv,
+                            expr: build_rel_list_expr(&nodes, pred, rel.direction)?,
+                        });
+                    }
+                    if let Some(pv) = path_var_id {
+                        chain.push(Pattern::Bind {
+                            var: pv,
+                            expr: build_path_expr(&nodes, pred)?,
+                        });
+                    }
+                }
+                chains.push(chain);
             }
             if chains.len() == 1 {
                 out.append(&mut chains.pop().expect("non-empty range yields ≥ 1 chain"));
@@ -538,7 +592,7 @@ fn build_fixed_chain<E: IriEncoder>(
     k: u32,
     type_iri: &str,
     direction: Direction,
-) -> Result<Vec<Pattern>> {
+) -> Result<(Vec<Pattern>, Vec<Ref>)> {
     let mut chain = Vec::new();
     let mut nodes: Vec<Ref> = vec![s.clone()];
     let mut prev = s.clone();
@@ -557,7 +611,54 @@ fn build_fixed_chain<E: IriEncoder>(
             chain.push(filter);
         }
     }
-    Ok(chain)
+    Ok((chain, nodes))
+}
+
+/// Build `MakeList([MakeRel(start, pred, end), …])` over a fixed chain's nodes,
+/// one relationship per hop. Directed orientation: `Outgoing` keeps the chain
+/// order (subject → object); `Incoming` flips each hop so the relationship's
+/// start/end match the stored edge.
+fn build_rel_list_expr(
+    nodes: &[Ref],
+    pred_sid: &fluree_db_core::Sid,
+    direction: Direction,
+) -> Result<Expression> {
+    let pred_const = Expression::Const(FlakeValue::Ref(pred_sid.clone()));
+    let mut rels = Vec::with_capacity(nodes.len().saturating_sub(1));
+    for w in nodes.windows(2) {
+        let (a, b) = match direction {
+            Direction::Incoming => (&w[1], &w[0]),
+            _ => (&w[0], &w[1]),
+        };
+        let (Some(sa), Some(sb)) = (ref_to_expr(a), ref_to_expr(b)) else {
+            return Err(LowerError::unsupported(
+                "binding a variable-length relationship over IRI-anchored endpoints is deferred",
+            ));
+        };
+        rels.push(Expression::call(
+            Function::MakeRel,
+            vec![sa, pred_const.clone(), sb],
+        ));
+    }
+    Ok(Expression::call(Function::MakeList, rels))
+}
+
+/// Build `MakePath(pred, node0, …, nodeN)` over a fixed chain's nodes (traversal
+/// order, every hop using `pred`).
+fn build_path_expr(nodes: &[Ref], pred_sid: &fluree_db_core::Sid) -> Result<Expression> {
+    let mut args = Vec::with_capacity(nodes.len() + 1);
+    args.push(Expression::Const(FlakeValue::Ref(pred_sid.clone())));
+    for n in nodes {
+        match ref_to_expr(n) {
+            Some(e) => args.push(e),
+            None => {
+                return Err(LowerError::unsupported(
+                    "binding a variable-length path over IRI-anchored endpoints is deferred",
+                ))
+            }
+        }
+    }
+    Ok(Expression::call(Function::MakePath, args))
 }
 
 /// A `Filter` enforcing Cypher relationship-uniqueness: every pair of hops on

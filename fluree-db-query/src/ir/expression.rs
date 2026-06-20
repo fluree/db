@@ -949,6 +949,14 @@ pub enum Function {
     /// `relationships(path)` — the list of relationship values along a path
     /// (one per hop), built from the path's nodes and per-hop predicates.
     Relationships,
+    /// Construct a relationship value: `MakeRel(start, Const(Ref(predicate)), end)`
+    /// → [`crate::binding::Binding::Rel`] (reifier = None). Internal; emitted by
+    /// the var-length relationship-variable binding.
+    MakeRel,
+    /// Construct a path value: `MakePath(Const(Ref(predicate)), node0, …, nodeN)`
+    /// → [`crate::binding::Binding::Path`] with every hop using `predicate`.
+    /// Internal; emitted by the var-length path-variable binding.
+    MakePath,
     /// `keys(node)` — the list of a node's data-property keys (local names),
     /// excluding `rdf:type`, the `f:reifies*` bundle, and relationship (ref)
     /// edges. Produces a [`crate::binding::Binding::List`] of strings.

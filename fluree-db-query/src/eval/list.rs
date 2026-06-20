@@ -35,6 +35,18 @@ fn resolve_arg_binding<R: RowAccess>(
     }
 }
 
+/// Resolve an argument to a node/ref `Sid` (for `MakeRel` / `MakePath`).
+fn arg_to_sid<R: RowAccess>(
+    arg: &Expression,
+    row: &R,
+    ctx: &ExecutionContext<'_>,
+) -> Result<Option<fluree_db_core::Sid>> {
+    let Some(b) = resolve_arg_binding(arg, row, Some(ctx))? else {
+        return Ok(None);
+    };
+    super::metadata::binding_subject_sid(&b, ctx)
+}
+
 /// Convert a list element binding to a comparable scalar (for `head`/`last`).
 /// Collect materializes elements, so they are decoded literals / refs; a
 /// non-scalar element (e.g. a nested list) yields `None`.
@@ -191,6 +203,55 @@ pub fn eval_list_fn_to_binding<R: RowAccess>(
                 ))),
                 _ => Ok(Some(Binding::Unbound)),
             }
+        }
+        Function::MakeRel => {
+            // MakeRel(start, Const(Ref(pred)), end) → Rel (reifier = None).
+            if args.len() != 3 {
+                return Err(QueryError::InvalidFilter(
+                    "MakeRel expects 3 arguments".to_string(),
+                ));
+            }
+            let Some(ctx) = ctx else {
+                return Ok(Some(Binding::Unbound));
+            };
+            let s = arg_to_sid(&args[0], row, ctx)?;
+            let p = arg_to_sid(&args[1], row, ctx)?;
+            let e = arg_to_sid(&args[2], row, ctx)?;
+            match (s, p, e) {
+                (Some(start), Some(predicate), Some(end)) => Ok(Some(Binding::Rel {
+                    start,
+                    predicate,
+                    end,
+                    reifier: None,
+                })),
+                _ => Ok(Some(Binding::Unbound)),
+            }
+        }
+        Function::MakePath => {
+            // MakePath(Const(Ref(pred)), node0, …, nodeN) → Path (every hop = pred).
+            if args.len() < 2 {
+                return Err(QueryError::InvalidFilter(
+                    "MakePath expects a predicate and at least one node".to_string(),
+                ));
+            }
+            let Some(ctx) = ctx else {
+                return Ok(Some(Binding::Unbound));
+            };
+            let Some(pred) = arg_to_sid(&args[0], row, ctx)? else {
+                return Ok(Some(Binding::Unbound));
+            };
+            let mut nodes = Vec::with_capacity(args.len() - 1);
+            for a in &args[1..] {
+                match arg_to_sid(a, row, ctx)? {
+                    Some(sid) => nodes.push(sid),
+                    None => return Ok(Some(Binding::Unbound)),
+                }
+            }
+            let hops = nodes.len().saturating_sub(1);
+            Ok(Some(Binding::Path {
+                nodes,
+                preds: vec![pred; hops],
+            }))
         }
         Function::Relationships => {
             // One relationship value per hop of a path: Rel(node[i], pred[i], node[i+1]).

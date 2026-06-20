@@ -151,17 +151,21 @@ async fn cypher_bare_node_pattern_rejected_at_lower() {
 }
 
 #[tokio::test]
-async fn cypher_var_length_bound_relationship_variable_rejected() {
-    // Binding a variable to a variable-length relationship yields a list of
-    // relationships, which needs list-valued bindings (deferred).
+async fn cypher_var_length_unbounded_bound_relationship_variable_rejected() {
+    // Binding a variable to an UNBOUNDED variable-length relationship needs path
+    // enumeration the transitive operator doesn't provide (deferred). The bounded
+    // form is supported — see `cypher_var_length_rel_and_path_binding`.
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger0 = genesis_ledger(&fluree, "it/cypher:varlen-bound");
     let db = graphdb_from_ledger(&ledger0);
 
     let r = fluree
-        .query_cypher(&db, "MATCH (a:Person)-[r:KNOWS*1..3]->(b) RETURN b")
+        .query_cypher(&db, "MATCH (a:Person)-[r:KNOWS*]->(b) RETURN b")
         .await;
-    assert!(r.is_err(), "bound var-length relationship must be rejected");
+    assert!(
+        r.is_err(),
+        "unbounded bound var-length relationship must be rejected"
+    );
 }
 
 #[tokio::test]
@@ -4157,6 +4161,67 @@ async fn cypher_relationships_of_path() {
     assert_eq!(row[1], json!(2), "Alice→Carol is 2 hops: {cj}");
     assert_eq!(row[2], row[4], "first hop start == Alice: {cj}");
     assert_eq!(row[3], row[5], "last hop end == Carol: {cj}");
+}
+
+#[tokio::test]
+async fn cypher_var_length_rel_and_path_binding() {
+    // Bounded var-length: bind a relationship variable as a rel list and a path
+    // variable. Alice -> Bob -> Carol -> Dave.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = seed_knows_chain(&fluree, "it/cypher:varlen-bind").await;
+    let db = graphdb_from_ledger(&l);
+
+    // `-[r:KNOWS*1..2]->` binds r to the list of relationships on each match.
+    let rels = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (a:Person {name: "Alice"})-[r:KNOWS*1..2]->(b:Person)
+               RETURN b.name AS name, size(r) AS hops, [x IN r | type(x)] AS types
+               ORDER BY name"#,
+        )
+        .await
+        .expect("var-length rel binding")
+        .to_cypher_json_async(db.as_graph_db_ref())
+        .await
+        .expect("cypher json");
+    let data = rels["results"][0]["data"].as_array().expect("rows");
+    assert_eq!(data.len(), 2, "Alice reaches Bob (1) and Carol (2): {rels}");
+    assert_eq!(data[0]["row"], json!(["Bob", 1, ["KNOWS"]]), "{rels}");
+    assert_eq!(
+        data[1]["row"],
+        json!(["Carol", 2, ["KNOWS", "KNOWS"]]),
+        "{rels}"
+    );
+
+    // `MATCH p = (a)-[:KNOWS*1..2]->(b)` binds p as a path; relationships(p)
+    // works over the bound path.
+    let path = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH p = (a:Person {name: "Alice"})-[:KNOWS*1..2]->(b:Person)
+               RETURN b.name AS name, length(p) AS len, size(relationships(p)) AS nrel
+               ORDER BY name"#,
+        )
+        .await
+        .expect("var-length path binding")
+        .to_cypher_json_async(db.as_graph_db_ref())
+        .await
+        .expect("cypher json");
+    let data = path["results"][0]["data"].as_array().expect("rows");
+    assert_eq!(data[0]["row"], json!(["Bob", 1, 1]), "{path}");
+    assert_eq!(data[1]["row"], json!(["Carol", 2, 2]), "{path}");
+
+    // Unbounded rel binding is deferred with a clear error.
+    assert!(
+        fluree
+            .query_cypher(
+                &db,
+                r#"MATCH (a:Person {name: "Alice"})-[r:KNOWS*]->(b:Person) RETURN size(r)"#,
+            )
+            .await
+            .is_err(),
+        "unbounded var-length rel binding is deferred"
+    );
 }
 
 #[tokio::test]
