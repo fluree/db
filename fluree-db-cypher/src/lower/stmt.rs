@@ -1074,18 +1074,9 @@ fn lower_with<E: IriEncoder>(
     if projection.saw_star {
         projection.expand_star(ctx, &inner_patterns);
     }
-    if !projection.list_outputs.is_empty() {
-        // A `collect()` projected by WITH flows out as a `Binding::List`. List
-        // functions over it work in the final RETURN (`RETURN size(collect(x))`),
-        // but projecting the raw list *through* the WITH subquery boundary
-        // currently nulls it (the subquery result projection drops the List —
-        // a separate fix). Rather than return a silent null, keep collect() in
-        // WITH deferred with a clear error.
-        return Err(LowerError::unsupported(
-            "collect() in WITH is deferred in v1 — wrap it in the final RETURN, \
-             e.g. `RETURN size(collect(x))`",
-        ));
-    }
+    // Captured before `projection` is partially moved below; used to reject an
+    // ORDER BY on a collect() list (sorting a list value is unsound in v1).
+    let list_outputs = projection.list_outputs.clone();
 
     // WITH WHERE routing:
     //
@@ -1144,6 +1135,7 @@ fn lower_with<E: IriEncoder>(
     // hand patterns to SubqueryPattern. Align accessor/var keys that match an
     // aliased projection item to that alias (so they survive grouping).
     let order_by = align_order_by_with_projection(&w.items, &w.order_by);
+    reject_order_by_on_list(ctx, &order_by, &list_outputs)?;
     let ordering = lower_order_by(ctx, &order_by, &mut inner_patterns)?;
 
     // SubqueryOperator runs Project BEFORE Sort. Sort keys not in

@@ -861,6 +861,94 @@ async fn cypher_collect_inside_expression_rejected() {
 }
 
 #[tokio::test]
+async fn cypher_collect_through_with() {
+    // `collect()` projected by a WITH must flow out as a real list to the next
+    // stage (it was previously deferred). Alice KNOWS Bob & Carol; Bob KNOWS Carol.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = seed_call_graph(&fluree, "it/cypher:collect-with").await;
+    let db = graphdb_from_ledger(&l);
+
+    // Raw list carried through the WITH boundary.
+    let cj = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (p:Person)-[:KNOWS]->(f:Person)
+               WITH p, collect(f.name) AS friends
+               RETURN p.name AS name, friends ORDER BY name"#,
+        )
+        .await
+        .expect("collect through WITH")
+        .to_cypher_json_async(db.as_graph_db_ref())
+        .await
+        .expect("cypher json");
+    let data = cj["results"][0]["data"].as_array().expect("rows");
+    assert_eq!(data.len(), 2, "Alice and Bob have outgoing KNOWS: {cj}");
+    assert_eq!(data[0]["row"][0], json!("Alice"), "{cj}");
+    let mut alice: Vec<String> = serde_json::from_value(data[0]["row"][1].clone()).expect("list");
+    alice.sort();
+    assert_eq!(
+        alice,
+        vec!["Bob", "Carol"],
+        "Alice's collected friends: {cj}"
+    );
+    assert_eq!(data[1]["row"], json!(["Bob", ["Carol"]]), "{cj}");
+
+    // The carried list feeds a downstream list function.
+    let sized = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (p:Person)-[:KNOWS]->(f:Person)
+               WITH p, collect(f.name) AS friends
+               RETURN p.name AS name, size(friends) AS n ORDER BY name"#,
+        )
+        .await
+        .expect("size over WITH-collected list")
+        .to_cypher_json_async(db.as_graph_db_ref())
+        .await
+        .expect("cypher json");
+    let data = sized["results"][0]["data"].as_array().expect("rows");
+    assert_eq!(data[0]["row"], json!(["Alice", 2]), "{sized}");
+    assert_eq!(data[1]["row"], json!(["Bob", 1]), "{sized}");
+
+    // The carried list feeds a downstream UNWIND (collect → unwind round-trip).
+    let unwound = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (p:Person {name: "Alice"})-[:KNOWS]->(f:Person)
+               WITH p, collect(f.name) AS friends
+               UNWIND friends AS fr
+               RETURN fr ORDER BY fr"#,
+        )
+        .await
+        .expect("unwind WITH-collected list")
+        .to_cypher_json_async(db.as_graph_db_ref())
+        .await
+        .expect("cypher json");
+    let rows: Vec<_> = unwound["results"][0]["data"]
+        .as_array()
+        .expect("rows")
+        .iter()
+        .map(|r| r["row"][0].clone())
+        .collect();
+    assert_eq!(rows, vec![json!("Bob"), json!("Carol")], "{unwound}");
+
+    // ORDER BY directly on a collect() list in the same WITH is still rejected
+    // (sorting a list value is unsound in v1).
+    assert!(
+        fluree
+            .query_cypher(
+                &db,
+                r#"MATCH (p:Person)-[:KNOWS]->(f:Person)
+                   WITH p, collect(f.name) AS friends ORDER BY friends
+                   RETURN p.name, friends"#,
+            )
+            .await
+            .is_err(),
+        "ORDER BY on a collect() list in WITH is rejected"
+    );
+}
+
+#[tokio::test]
 async fn cypher_aggregate_composed_into_expression() {
     // Aggregates nested in a larger expression (IC3 total, IC10 score, IC14):
     // `count(*) * 2`, `count(n) + 1`, `count(*) + count(*)`.
@@ -3731,19 +3819,27 @@ async fn cypher_order_by_collect_rejected() {
 }
 
 #[tokio::test]
-async fn cypher_with_collect_rejected() {
+async fn cypher_with_collect_carries_list() {
+    // collect() projected by WITH now flows out as a real list (was deferred).
     let fluree = FlureeBuilder::memory().build_memory();
     let l = seed_knows_chain(&fluree, "it/cypher:with-collect").await;
     let db = graphdb_from_ledger(&l);
 
-    let err = fluree
+    let cj = fluree
         .query_cypher(
             &db,
-            r"MATCH (a:Person)-[:KNOWS]->(b) WITH a, collect(b) AS bs RETURN a, bs",
+            r"MATCH (a:Person)-[:KNOWS]->(b) WITH a, collect(b.name) AS bs RETURN a.name AS name, bs ORDER BY name",
         )
         .await
-        .expect_err("collect() in WITH must be rejected");
-    assert!(format!("{err}").contains("collect() in WITH"), "{err}");
+        .expect("collect() in WITH carries a list")
+        .to_cypher_json_async(db.as_graph_db_ref())
+        .await
+        .expect("cypher json");
+    let data = cj["results"][0]["data"].as_array().expect("rows");
+    assert_eq!(data.len(), 3, "Alice, Bob, Carol each KNOW one: {cj}");
+    assert_eq!(data[0]["row"], json!(["Alice", ["Bob"]]), "{cj}");
+    assert_eq!(data[1]["row"], json!(["Bob", ["Carol"]]), "{cj}");
+    assert_eq!(data[2]["row"], json!(["Carol", ["Dave"]]), "{cj}");
 }
 
 #[tokio::test]

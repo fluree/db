@@ -299,7 +299,11 @@ ORDER BY / SKIP / LIMIT
   projections.
 - `WITH ... [WHERE/ORDER BY/SKIP/LIMIT/DISTINCT]` and `WITH *` — subquery
   boundary. WHERE that references aggregate aliases lowers to HAVING
-  rather than a pre-aggregation Filter. Nested WITHs nest Subqueries.
+  rather than a pre-aggregation Filter. Nested WITHs nest Subqueries. A
+  `collect()` projected by a `WITH` carries forward as a real list to the next
+  stage (`WITH p, collect(f) AS fs … RETURN size(fs)` / `UNWIND fs …`); only
+  `ORDER BY` directly on a collected list is rejected (sorting a list value is
+  unsupported in v1).
 - `CALL [(a, b) | (*)] { … }` — a read-only subquery clause in the pipeline.
   The scope clause `(a, b)` imports those outer variables (the subquery is
   correlated on them), `(*)` imports the whole visible outer scope, and
