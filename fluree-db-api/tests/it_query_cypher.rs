@@ -2079,6 +2079,132 @@ async fn cypher_call_subquery_correlated_aggregate_join_mode() {
 }
 
 #[tokio::test]
+async fn cypher_call_subquery_union() {
+    // `CALL { … UNION … }` — branches share a column shape; correlation flows
+    // into each branch. Alice KNOWS Bob & Carol; Bob KNOWS Carol.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = seed_call_graph(&fluree, "it/cypher:call-union").await;
+    let db = graphdb_from_ledger(&l);
+
+    // Correlated UNION: per person, union two filtered branches.
+    let cj = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (p:Person)
+               CALL (p) {
+                 MATCH (p)-[:KNOWS]->(f:Person) WHERE f.name STARTS WITH "B" RETURN f.name AS fn
+                 UNION
+                 MATCH (p)-[:KNOWS]->(f:Person) WHERE f.name STARTS WITH "C" RETURN f.name AS fn
+               }
+               RETURN p.name AS name, fn ORDER BY name, fn"#,
+        )
+        .await
+        .expect("correlated union call")
+        .to_cypher_json_async(db.as_graph_db_ref())
+        .await
+        .expect("cypher json");
+    let rows: Vec<_> = cj["results"][0]["data"]
+        .as_array()
+        .expect("rows")
+        .iter()
+        .map(|r| r["row"].clone())
+        .collect();
+    assert_eq!(
+        rows,
+        vec![
+            json!(["Alice", "Bob"]),
+            json!(["Alice", "Carol"]),
+            json!(["Bob", "Carol"]),
+        ],
+        "correlated union per person: {cj}"
+    );
+
+    // UNION dedups; UNION ALL keeps duplicates. Two identical branches over
+    // Alice's friends (Bob, Carol).
+    let dedup = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (p:Person {name: "Alice"})
+               CALL (p) {
+                 MATCH (p)-[:KNOWS]->(f:Person) RETURN f.name AS fn
+                 UNION
+                 MATCH (p)-[:KNOWS]->(f:Person) RETURN f.name AS fn
+               }
+               RETURN fn ORDER BY fn"#,
+        )
+        .await
+        .expect("union dedup")
+        .to_cypher_json_async(db.as_graph_db_ref())
+        .await
+        .expect("cypher json");
+    assert_eq!(
+        dedup["results"][0]["data"].as_array().expect("rows").len(),
+        2,
+        "UNION dedups identical branches: {dedup}"
+    );
+
+    let bag = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (p:Person {name: "Alice"})
+               CALL (p) {
+                 MATCH (p)-[:KNOWS]->(f:Person) RETURN f.name AS fn
+                 UNION ALL
+                 MATCH (p)-[:KNOWS]->(f:Person) RETURN f.name AS fn
+               }
+               RETURN fn ORDER BY fn"#,
+        )
+        .await
+        .expect("union all bag")
+        .to_cypher_json_async(db.as_graph_db_ref())
+        .await
+        .expect("cypher json");
+    assert_eq!(
+        bag["results"][0]["data"].as_array().expect("rows").len(),
+        4,
+        "UNION ALL keeps duplicates: {bag}"
+    );
+
+    // Mixing UNION and UNION ALL in one CALL body is rejected.
+    assert!(
+        fluree
+            .query_cypher(
+                &db,
+                r#"MATCH (p:Person {name: "Alice"})
+                   CALL (p) {
+                     MATCH (p)-[:KNOWS]->(f:Person) RETURN f.name AS fn
+                     UNION
+                     MATCH (p)-[:KNOWS]->(f:Person) RETURN f.name AS fn
+                     UNION ALL
+                     MATCH (p)-[:KNOWS]->(f:Person) RETURN f.name AS fn
+                   }
+                   RETURN fn"#,
+            )
+            .await
+            .is_err(),
+        "mixing UNION and UNION ALL in a CALL body is rejected"
+    );
+
+    // Branches must project the same columns.
+    assert!(
+        fluree
+            .query_cypher(
+                &db,
+                r#"MATCH (p:Person {name: "Alice"})
+                   CALL (p) {
+                     MATCH (p)-[:KNOWS]->(f:Person) RETURN f.name AS fn
+                     UNION
+                     MATCH (p)-[:KNOWS]->(f:Person) RETURN f.name AS other
+                   }
+                   RETURN fn"#,
+            )
+            .await
+            .is_err(),
+        "CALL UNION branches must project the same columns"
+    );
+}
+
+#[tokio::test]
 async fn cypher_call_subquery_rejections() {
     let fluree = FlureeBuilder::memory().build_memory();
     let l = seed_call_graph(&fluree, "it/cypher:call-reject").await;
@@ -2155,6 +2281,21 @@ async fn cypher_call_subquery_rejections() {
             .await
             .is_err(),
         "importing a variable not bound outside is rejected"
+    );
+
+    // Strict shadowing: the body reuses an outer name (`x`) internally without
+    // importing it — ambiguous, rejected until per-subquery scoping lands.
+    assert!(
+        fluree
+            .query_cypher(
+                &db,
+                r#"MATCH (p:Person), (x:Person)
+                   CALL (p) { MATCH (p)-[:KNOWS]->(x:Person) RETURN count(x) AS c }
+                   RETURN c"#,
+            )
+            .await
+            .is_err(),
+        "an un-imported outer name reused inside the body is rejected"
     );
 }
 

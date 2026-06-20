@@ -196,9 +196,23 @@ CALL (p) { OPTIONAL MATCH (p)-[:KNOWS]->(f:Person) RETURN count(f) AS friends }
 RETURN p.name, friends
 ```
 
-The body must end in `RETURN` with explicit columns, and a returned name can't
-re-bind an imported one. Writes inside `CALL`, `CALL (*)`, and inner `UNION` are
-not yet supported.
+The body may also be a `UNION` of branches sharing a column shape — handy for
+"try these alternatives, then continue":
+
+```cypher
+MATCH (p:Person)
+CALL (p) {
+  MATCH (p)-[:KNOWS]->(f:Person)   RETURN f.name AS contact
+  UNION
+  MATCH (p)-[:WORKS_FOR]->(o:Org)  RETURN o.name AS contact
+}
+RETURN p.name, contact
+```
+
+The body must end in `RETURN` with explicit columns. Scope is strict: a returned
+name can't re-bind an outer one, and the body can't reuse an outer variable's
+name without importing it. Writes inside `CALL` and `CALL (*)` aren't supported
+yet.
 
 ## Paths
 

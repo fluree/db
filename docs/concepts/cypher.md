@@ -298,12 +298,16 @@ ORDER BY / SKIP / LIMIT
   them); `CALL { … }` with no scope clause runs once and broadcasts its result.
   The body is `MATCH` / `OPTIONAL MATCH` / `WITH` / `UNWIND` / nested `CALL`
   ending in `RETURN` (explicit columns, not `*`); outer rows flow in and the
-  RETURN columns continue downstream. A correlated aggregating CALL
-  (`CALL (p) { … RETURN count(f) }`) is grouped per import, so an import with
-  **zero inner matches yields no row** — wrap the inner `MATCH` in `OPTIONAL
-  MATCH` to retain it as a `0`. A RETURN that re-binds an imported name is
-  rejected. Deferred: writes inside `CALL`, `CALL (*)` (import-all), and
-  `CALL { … UNION … }`.
+  RETURN columns continue downstream. The body may be a `UNION` / `UNION ALL`
+  of branches with a common column shape (`UNION` dedups per correlation group;
+  every branch references the same imports and projects the same columns).
+  A correlated aggregating CALL (`CALL (p) { … RETURN count(f) }`) is grouped
+  per import, so an import with **zero inner matches yields no row** — wrap the
+  inner `MATCH` in `OPTIONAL MATCH` to retain it as a `0`. **Scope is strict:**
+  every import must already be bound outside, a RETURN may not re-bind any
+  outer name, and the body may not reuse an outer variable's name internally
+  without importing it (rename it, or add it to the scope clause). Deferred:
+  writes inside `CALL` and `CALL (*)` (import-all).
 - `RETURN n`, `RETURN n, m`, `RETURN *`, `RETURN DISTINCT ...`,
   `RETURN expr AS alias` (lowered via `Bind`).
 - `UNION` and `UNION ALL` at the RETURN boundary. Every branch must

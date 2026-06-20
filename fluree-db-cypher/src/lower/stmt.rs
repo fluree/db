@@ -1166,17 +1166,6 @@ fn lower_call_subquery<E: IriEncoder>(
     call: &crate::ast::CallSubqueryClause,
     outer_vars: &[VarId],
 ) -> Result<Pattern> {
-    if call.query.union_tail.is_some() {
-        return Err(LowerError::unsupported(
-            "CALL { … UNION … } is deferred — split into separate CALL subqueries",
-        ));
-    }
-    if uses_wildcard_return(&call.query) {
-        return Err(LowerError::unsupported(
-            "CALL { … } must RETURN explicit columns, not `*` — the subquery's output schema must be statically known",
-        ));
-    }
-
     let outer_set: std::collections::HashSet<VarId> = outer_vars.iter().copied().collect();
 
     // Every imported variable must already be bound in the outer scope —
@@ -1196,7 +1185,88 @@ fn lower_call_subquery<E: IriEncoder>(
         }
     }
 
-    let mut branch = lower_single_branch(ctx, &call.query)?;
+    // Walk the (right-recursive) UNION chain, lowering + validating each branch.
+    let mut branch_subqueries: Vec<Pattern> = Vec::new();
+    let mut projected: Option<Vec<VarId>> = None;
+    let mut union_variant: Option<bool> = None; // Some(true) = UNION ALL
+    let mut cursor = &*call.query;
+    loop {
+        let (sq, return_vars) = lower_call_branch(ctx, cursor, &import_vars, &outer_set)?;
+        match &projected {
+            None => projected = Some(return_vars.clone()),
+            Some(existing) if existing != &return_vars => {
+                return Err(LowerError::unsupported(
+                    "CALL { … UNION … } branches must RETURN the same columns in the same order \
+                     (Cypher's column-name-match rule)",
+                ));
+            }
+            _ => {}
+        }
+        branch_subqueries.push(Pattern::Subquery(sq));
+
+        match &cursor.union_tail {
+            Some(tail) => {
+                match union_variant {
+                    None => union_variant = Some(tail.all),
+                    Some(prev) if prev != tail.all => {
+                        return Err(LowerError::unsupported(
+                            "mixing `UNION` and `UNION ALL` in one CALL body is not allowed — \
+                             every join in the chain must use the same variant",
+                        ));
+                    }
+                    _ => {}
+                }
+                cursor = &tail.right;
+            }
+            None => break,
+        }
+    }
+
+    let projected = projected.expect("at least one branch");
+    // select = imports (correlation) ++ return columns.
+    let mut select = import_vars;
+    for rv in projected {
+        if !select.contains(&rv) {
+            select.push(rv);
+        }
+    }
+
+    if branch_subqueries.len() == 1 {
+        // No UNION: the single branch subquery (its select already = imports ++
+        // returns) IS the CALL pattern.
+        return Ok(branch_subqueries.pop().expect("one branch"));
+    }
+
+    // UNION: the branches become a `Pattern::Union`, wrapped in the CALL
+    // subquery so the import seed flows CALL → Union → each branch and the
+    // parent-row merge happens once. Plain `UNION` dedups the combined result
+    // (DISTINCT on the CALL subquery, keyed per correlation group); `UNION ALL`
+    // keeps duplicates.
+    let union = Pattern::Union(branch_subqueries.into_iter().map(|p| vec![p]).collect());
+    let all = union_variant.unwrap_or(false);
+    let mut call_sq = SubqueryPattern::new(select, vec![union]);
+    if !all {
+        call_sq = call_sq.with_distinct();
+    }
+    Ok(Pattern::Subquery(call_sq))
+}
+
+/// Lower and validate one CALL body branch (one link in the UNION chain) into a
+/// `SubqueryPattern` whose select is `imports ++ return columns`, returning the
+/// branch's RETURN columns for cross-branch column-compatibility checking.
+fn lower_call_branch<E: IriEncoder>(
+    ctx: &mut LoweringContext<'_, E>,
+    branch_query: &crate::ast::Query,
+    import_vars: &[VarId],
+    outer_set: &std::collections::HashSet<VarId>,
+) -> Result<(SubqueryPattern, Vec<VarId>)> {
+    if uses_wildcard_return(branch_query) {
+        return Err(LowerError::unsupported(
+            "CALL { … } must RETURN explicit columns, not `*` — the subquery's output schema must be statically known",
+        ));
+    }
+
+    let mut branch = lower_single_branch(ctx, branch_query)?;
     let return_vars = branch.projected_vars();
     if return_vars.is_empty() {
         return Err(LowerError::unsupported(
@@ -1223,6 +1293,35 @@ fn lower_call_subquery<E: IriEncoder>(
         }
     }
 
+    let body_referenced: std::collections::HashSet<VarId> = branch
+        .patterns
+        .iter()
+        .flat_map(Pattern::referenced_vars)
+        .collect();
+
+    // Strict shadowing boundary: the subquery body may only see its imports. A
+    // body that references a NON-imported variable whose name also exists in the
+    // outer scope is ambiguous — under proper scoped-CALL semantics that inner
+    // name is a FRESH variable (the outer one is invisible), but our shared
+    // VarRegistry would silently treat it as the outer var (unbound here, since
+    // it isn't seeded), yielding wrong results. Reject until real per-subquery
+    // scoping lands: rename the inner variable, or import it to correlate.
+    let import_set: std::collections::HashSet<VarId> = import_vars.iter().copied().collect();
+    for v in &body_referenced {
+        if outer_set.contains(v) && !import_set.contains(v) {
+            let name = ctx
+                .vars
+                .try_name(*v)
+                .map(ToString::to_string)
+                .unwrap_or_else(|| format!("?v{}", v.0));
+            return Err(LowerError::unsupported(format!(
+                "CALL subquery uses `{name}`, which shares a name with an outer variable but \
+                 is not imported — rename the inner variable, or add it to the CALL scope \
+                 (`CALL ({name}, …) {{ … }}`) to correlate on it"
+            )));
+        }
+    }
+
     // Correlated aggregation: a `CALL (p) { … RETURN count(f) }` body lowers to
     // IMPLICIT grouping (no GROUP BY key). Evaluated once + hash-joined (the
     // materialize path SubqueryOperator picks for a large parent), that collapses
@@ -1232,15 +1331,10 @@ fn lower_call_subquery<E: IriEncoder>(
     // one row either way). Only imports actually bound inside the body qualify;
     // a pure pass-through import isn't available to group on.
     if branch.grouping.is_some() && !import_vars.is_empty() {
-        let body_refs: std::collections::HashSet<VarId> = branch
-            .patterns
-            .iter()
-            .flat_map(Pattern::referenced_vars)
-            .collect();
         let group_imports: Vec<VarId> = import_vars
             .iter()
             .copied()
-            .filter(|v| body_refs.contains(v))
+            .filter(|v| body_referenced.contains(v))
             .collect();
         if !group_imports.is_empty() {
             branch.grouping = branch
@@ -1251,14 +1345,17 @@ fn lower_call_subquery<E: IriEncoder>(
     }
 
     // select = imports (correlation) ++ return columns.
-    let mut select = import_vars;
-    for rv in return_vars {
-        if !select.contains(&rv) {
-            select.push(rv);
+    let mut select: Vec<VarId> = import_vars.to_vec();
+    for rv in &return_vars {
+        if !select.contains(rv) {
+            select.push(*rv);
         }
     }
 
-    Ok(branch.into_subquery_pattern(select))
+    match branch.into_subquery_pattern(select) {
+        Pattern::Subquery(sq) => Ok((sq, return_vars)),
+        _ => unreachable!("into_subquery_pattern always yields Pattern::Subquery"),
+    }
 }
 
 /// Rebuild a `Grouping` with `extra` prepended to its GROUP BY keys (dedup).

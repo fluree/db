@@ -277,18 +277,33 @@ fn parse_call_body(s: &mut TokenStream) -> Result<Query, Diagnostic> {
         }
     };
 
-    if matches!(s.peek_kind(), TokenKind::Union) {
-        return Err(s.error(
-            DiagCode::DeferredProcedure,
-            "CALL { … UNION … } is deferred — split into separate CALL subqueries",
-        ));
-    }
+    // `UNION [ALL]` inside the body: parse the next branch right-recursively,
+    // stopping at the closing `}` (unlike the top-level `parse_union_tail`,
+    // which recurses through `parse_statement` to EOF).
+    let union_tail = if matches!(s.peek_kind(), TokenKind::Union) {
+        Some(Box::new(parse_call_union_tail(s)?))
+    } else {
+        None
+    };
 
     let end = s.peek_span();
     Ok(Query {
         clauses: read_clauses,
         return_clause,
-        union_tail: None,
+        union_tail,
+        span: start.union(end),
+    })
+}
+
+/// Parse a `UNION [ALL] <call-body branch>` tail inside a `CALL { … }` body.
+fn parse_call_union_tail(s: &mut TokenStream) -> Result<UnionTail, Diagnostic> {
+    let start = s.expect(&TokenKind::Union)?;
+    let all = s.eat(&TokenKind::All).is_some();
+    let right = parse_call_body(s)?;
+    let end = s.peek_span();
+    Ok(UnionTail {
+        all,
+        right,
         span: start.union(end),
     })
 }
