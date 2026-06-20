@@ -67,8 +67,11 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     // Ledger names may contain `/`, so ledger-scoped routes use `*ledger`
     // (greedy tail) with the operation first (e.g. `/v1/fluree/query/<ledger...>`).
 
-    // Admin-protected routes (create, drop) - require admin token when configured
-    let v1_admin_protected_routes = Router::new()
+    // Admin-protected leader-coordinated writes — need to run on the
+    // current Raft leader so the state-machine proposal originates
+    // there. Followers transparently HTTP-forward via the layer
+    // applied below.
+    let v1_admin_protected_writes = Router::new()
         .route("/create", post(ledger::create))
         .route("/drop", post(ledger::drop))
         .route("/reindex", post(ledger::reindex))
@@ -78,31 +81,50 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/rebase", post(ledger::rebase))
         .route("/merge", post(ledger::merge))
         .route("/revert", post(ledger::revert))
-        // RDF export bypasses per-flake policy filtering today, so it lives in
-        // the admin-protected bracket alongside other root-level operations.
-        .route("/export/*ledger", post(export::export_ledger_tail))
         // Wholesale .flpack restore: creates a new ledger from a trusted
         // archive. Writes prebuilt index artifacts, so admin-gated.
         .route("/import/*ledger", post(import::import_ledger_tail))
-        // Negotiated upload flow for size-capped clients (mint/complete/status
-        // are admin-gated; the blob PUT below is token-authorized).
+        // Negotiated upload flow for size-capped clients (mint/complete
+        // are admin-gated; the blob PUT below is token-authorized;
+        // status is read-only and sits in the reads block).
         .route("/import-upload", post(import::mint_upload))
         .route(
             "/import-upload/:import_id/complete",
             post(import::complete_upload),
-        )
-        .route("/import-upload/:import_id", get(import::import_status));
+        );
 
     #[cfg(feature = "iceberg")]
-    let v1_admin_protected_routes =
-        v1_admin_protected_routes.route("/iceberg/map", post(iceberg::iceberg_map));
+    let v1_admin_protected_writes =
+        v1_admin_protected_writes.route("/iceberg/map", post(iceberg::iceberg_map));
 
     // Forward to the Raft leader (when running in Raft mode) before
     // admin-token auth: an out-of-date follower with stale credentials
     // shouldn't reject a request the leader would accept.
-    let v1_admin_protected_routes = apply_leader_forward(v1_admin_protected_routes, &state);
+    let v1_admin_protected_writes = apply_leader_forward(v1_admin_protected_writes, &state);
 
-    let v1_admin_protected_routes = v1_admin_protected_routes
+    let v1_admin_protected_writes = v1_admin_protected_writes
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            admin_auth::require_admin_token,
+        ))
+        .with_state(state.clone());
+
+    // Admin-protected reads — same admin-token bracket but no
+    // leader-forward. These either read ledger data (any node has it
+    // via replicated commit log + storage) or per-node ephemeral
+    // state. Leader-forwarding them would either burn an extra hop
+    // for no functional gain (export) or actively misroute the
+    // request away from the node that owns the state (import status,
+    // which lives in this node's `import_jobs` map).
+    let v1_admin_protected_reads = Router::new()
+        // RDF export — pure read; bypasses per-flake policy filtering
+        // today, hence admin-gated.
+        .route("/export/*ledger", post(export::export_ledger_tail))
+        // Status of a negotiated upload — reads this node's
+        // `state.import_jobs` map (each node owns the jobs it minted).
+        .route("/import-upload/:import_id", get(import::import_status));
+
+    let v1_admin_protected_reads = v1_admin_protected_reads
         .layer(middleware::from_fn_with_state(
             state.clone(),
             admin_auth::require_admin_token,
@@ -169,8 +191,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/branch/*ledger", get(ledger::list_branches))
         .route("/merge-preview/*ledger", get(ledger::merge_preview))
         .route("/revert-preview/*ledger", get(ledger::revert_preview))
-        // Merge admin-protected routes
-        .merge(v1_admin_protected_routes)
+        // Merge admin-protected leader-coordinated writes
+        .merge(v1_admin_protected_writes)
+        // Merge admin-protected local reads
+        .merge(v1_admin_protected_reads)
         // Merge leader-only routes (Raft-forwarded when applicable)
         .merge(v1_leader_only_routes)
         // Query endpoints
