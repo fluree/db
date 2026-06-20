@@ -44,7 +44,7 @@ use openraft::Raft;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use thiserror::Error;
-use tracing::warn;
+use tracing::{debug, warn};
 
 /// How often the drain loop polls [`NameServiceState::queues`] when
 /// no work was found on the previous tick.
@@ -54,6 +54,21 @@ const POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// trying again. Long enough that we don't tight-loop against a lost
 /// leader; short enough that recovery feels responsive.
 const RAFT_BACKOFF: Duration = Duration::from_millis(250);
+
+/// Max staging attempts before [`process_entry`] gives up and
+/// proposes a poison. Only `PoisonReason::StagingFailed` is
+/// retried — the other variants are deterministic and would just
+/// burn worker rounds. Three tries balances "recover from a
+/// transient CAS hiccup or lock contention" against "don't hold a
+/// branch's queue front hostage indefinitely."
+const MAX_STAGE_ATTEMPTS: u32 = 3;
+
+/// First-attempt backoff between staging retries; subsequent
+/// attempts double it. With three total attempts the worst-case
+/// wait before poisoning is `100 + 200 = 300ms` — short enough
+/// that downstream waiters don't time out, long enough to ride
+/// through a transient hiccup.
+const STAGE_RETRY_BASE_BACKOFF: Duration = Duration::from_millis(100);
 
 /// Per-leader worker that processes the per-branch command queue.
 ///
@@ -109,21 +124,62 @@ impl CommitWorker {
     ///
     /// Reads the [`QueuedRequest`] envelope from CAS, stages the
     /// commit, writes the commit blob, and publishes the head
-    /// advance through the [`CommitPublisher`]. On staging failure,
-    /// proposes [`Command::PoisonQueueEntry`] instead. Returns once
-    /// the entry has reached a terminal state in the queue (advanced
-    /// or poisoned).
+    /// advance through the [`CommitPublisher`]. Transient staging
+    /// failures (`PoisonReason::StagingFailed`) retry with
+    /// exponential backoff up to [`MAX_STAGE_ATTEMPTS`] times before
+    /// poisoning — the other `PoisonReason` variants are
+    /// deterministic (`BodyMalformed`, `PolicyViolation`, etc.) so
+    /// retrying them just burns a worker round. Returns once the
+    /// entry has reached a terminal state in the queue (advanced or
+    /// poisoned).
     pub async fn process_entry(
         &self,
         ref_key: &RefKey,
         entry: QueueEntry,
     ) -> Result<(), WorkerError> {
-        match self.try_advance_head(ref_key, &entry).await {
-            Ok(()) => Ok(()),
-            Err(WorkerError::Stage(reason)) => {
-                self.propose_poison(ref_key, entry.queue_id, reason).await
+        let mut attempt: u32 = 0;
+        loop {
+            attempt += 1;
+            match self.try_advance_head(ref_key, &entry).await {
+                Ok(()) => return Ok(()),
+                Err(WorkerError::Stage(reason)) => {
+                    let is_transient = matches!(reason, PoisonReason::StagingFailed { .. });
+                    if is_transient && attempt < MAX_STAGE_ATTEMPTS {
+                        let backoff = STAGE_RETRY_BASE_BACKOFF * (1u32 << (attempt - 1));
+                        debug!(
+                            queue_id = entry.queue_id,
+                            attempt,
+                            backoff_ms = backoff.as_millis() as u64,
+                            ?reason,
+                            "transient staging failure, retrying"
+                        );
+                        tokio::time::sleep(backoff).await;
+                        continue;
+                    }
+                    if is_transient {
+                        warn!(
+                            queue_id = entry.queue_id,
+                            attempts = attempt,
+                            ?reason,
+                            "exhausted staging retries, poisoning entry"
+                        );
+                    }
+                    // Stamp the final attempt count onto the
+                    // `StagingFailed` record so the poison reason
+                    // surfaces how many tries actually happened.
+                    let reason = match reason {
+                        PoisonReason::StagingFailed { error, .. } => {
+                            PoisonReason::StagingFailed {
+                                error,
+                                attempts: attempt,
+                            }
+                        }
+                        other => other,
+                    };
+                    return self.propose_poison(ref_key, entry.queue_id, reason).await;
+                }
+                Err(other) => return Err(other),
             }
-            Err(other) => Err(other),
         }
     }
 
