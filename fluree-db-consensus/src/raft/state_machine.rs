@@ -425,6 +425,13 @@ pub enum Command {
     /// build. Apply enforces strict monotonicity and rejects index
     /// claims for commits the state machine hasn't applied yet.
     AdvanceIndexHead(AdvanceIndexHeadArgs),
+    /// Rewrite the published index head for a branch with relaxed
+    /// monotonicity: accepts `new.t == existing.t` so an admin
+    /// reindex can land a fresh root at the same commit watermark.
+    /// `new.t < existing.t` is still rejected, and the
+    /// commits-not-yet-applied guard from
+    /// [`Self::AdvanceIndexHead`] still fires.
+    RewriteIndexHead(AdvanceIndexHeadArgs),
     /// Register a branch on a ledger. The branch starts unborn — no
     /// [`RefEntry`] is created until the first
     /// [`Command::ApplyHead`] for the branch.
@@ -880,6 +887,7 @@ impl NameServiceState {
 pub fn apply(state: &mut NameServiceState, command: Command, log_index: u64) -> Response {
     match command {
         Command::AdvanceIndexHead(args) => advance_index_head(state, args),
+        Command::RewriteIndexHead(args) => rewrite_index_head(state, args),
         Command::CreateLedger(args) => create_ledger(state, log_index, args),
         Command::CreateBranch(args) => create_branch(state, log_index, args),
         Command::DropBranch {
@@ -1264,6 +1272,22 @@ fn decrement_child_count(
 }
 
 fn advance_index_head(state: &mut NameServiceState, args: AdvanceIndexHeadArgs) -> Response {
+    set_index_head(state, args, |existing_t, new_t| new_t <= existing_t)
+}
+
+fn rewrite_index_head(state: &mut NameServiceState, args: AdvanceIndexHeadArgs) -> Response {
+    set_index_head(state, args, |existing_t, new_t| new_t < existing_t)
+}
+
+/// Install a new index head subject to `is_stale(existing_t, new_t)`
+/// — the differing rule between [`advance_index_head`] (strict `<=`)
+/// and [`rewrite_index_head`] (relaxed `<`). Shared body covers the
+/// ledger / ref-entry / ahead-of-commit-t checks and the write.
+fn set_index_head(
+    state: &mut NameServiceState,
+    args: AdvanceIndexHeadArgs,
+    is_stale: impl FnOnce(i64, i64) -> bool,
+) -> Response {
     let AdvanceIndexHeadArgs {
         ledger_id,
         branch,
@@ -1285,14 +1309,8 @@ fn advance_index_head(state: &mut NameServiceState, args: AdvanceIndexHeadArgs) 
         return Response::LedgerNotFound { ledger_id };
     };
 
-    // Strict monotonic — concurrent indexers racing to publish only
-    // the latest survive. Equal `t` is treated as stale on purpose:
-    // the existing entry already covers everything this proposal
-    // would, so re-writing risks rewriting a content-equivalent
-    // root with a different cid (e.g. different leaf ordering) for
-    // no benefit.
     if let Some(existing) = &entry.index {
-        if t <= existing.t {
+        if is_stale(existing.t, t) {
             return Response::IndexStale {
                 current_t: existing.t,
             };
@@ -2765,6 +2783,83 @@ mod tests {
                 t: 10
             })
         );
+    }
+
+    // -------------------------------------------------------------
+    // RewriteIndexHead — apply path
+    // -------------------------------------------------------------
+
+    fn rewrite_index(ledger_id: &str, branch: &str, head: ContentId, t: i64) -> Command {
+        Command::RewriteIndexHead(AdvanceIndexHeadArgs {
+            ledger_id: ledger_id.into(),
+            branch: branch.into(),
+            new_index_head: head,
+            t,
+            applied_at_millis: 3_000,
+        })
+    }
+
+    #[test]
+    fn rewrite_index_head_accepts_same_t_with_new_root() {
+        let mut state = ledger_with_commit_at_t10();
+        apply(&mut state, advance_index("test/db", "main", cid(42), 10), 3);
+
+        // Same t, different root — strict advance would reject, rewrite lands.
+        let resp = apply(&mut state, rewrite_index("test/db", "main", cid(43), 10), 4);
+        assert_eq!(
+            resp,
+            Response::IndexAdvanced {
+                index_t: 10,
+                index_head: cid(43),
+            }
+        );
+        let entry = ref_entry(&state, "test/db", "main");
+        assert_eq!(
+            entry.index,
+            Some(IndexState {
+                head: cid(43),
+                t: 10
+            })
+        );
+    }
+
+    #[test]
+    fn rewrite_index_head_still_rejects_lower_t() {
+        let mut state = ledger_with_commit_at_t10();
+        apply(&mut state, advance_index("test/db", "main", cid(42), 10), 3);
+
+        let resp = apply(&mut state, rewrite_index("test/db", "main", cid(44), 5), 4);
+        assert_eq!(resp, Response::IndexStale { current_t: 10 });
+        let entry = ref_entry(&state, "test/db", "main");
+        assert_eq!(
+            entry.index,
+            Some(IndexState {
+                head: cid(42),
+                t: 10
+            })
+        );
+    }
+
+    #[test]
+    fn rewrite_index_head_rejects_index_t_beyond_commit_t() {
+        let mut state = ledger_with_commit_at_t10();
+        let resp = apply(&mut state, rewrite_index("test/db", "main", cid(99), 15), 3);
+        assert_eq!(
+            resp,
+            Response::IndexAhead {
+                commit_t: 10,
+                proposed_t: 15,
+            }
+        );
+        let entry = ref_entry(&state, "test/db", "main");
+        assert_eq!(entry.index, None);
+    }
+
+    #[test]
+    fn rewrite_index_head_rejects_when_ledger_missing() {
+        let mut state = NameServiceState::new();
+        let resp = apply(&mut state, rewrite_index("missing", "main", cid(99), 1), 1);
+        assert!(matches!(resp, Response::LedgerNotFound { .. }));
     }
 
     // ====================================================================

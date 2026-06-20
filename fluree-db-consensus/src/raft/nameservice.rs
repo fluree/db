@@ -59,10 +59,10 @@ use async_trait::async_trait;
 use fluree_db_core::ledger_id::split_ledger_id;
 use fluree_db_core::ContentId;
 use fluree_db_nameservice::{
-    BranchLifecycle, CasResult, CommitPublisher, ConfigLookup, ConfigValue, GraphSourceLookup,
-    GraphSourceRecord, IndexPublisher, LedgerLifecycle, NameServiceError, NameServiceLookup,
-    NsLookupResult, NsRecord, NsRecordSnapshot, RefKind, RefLookup, RefPublisher, RefValue, Result,
-    StatusLookup, StatusValue,
+    AdminPublisher, BranchLifecycle, CasResult, CommitPublisher, ConfigLookup, ConfigValue,
+    GraphSourceLookup, GraphSourceRecord, IndexPublisher, LedgerLifecycle, NameServiceError,
+    NameServiceLookup, NsLookupResult, NsRecord, NsRecordSnapshot, RefKind, RefLookup,
+    RefPublisher, RefValue, Result, StatusLookup, StatusValue,
 };
 use openraft::error::{ClientWriteError, RaftError};
 use openraft::Raft;
@@ -123,18 +123,38 @@ fn build_advance_index_command(
     index_t: i64,
     index_id: &ContentId,
 ) -> std::result::Result<SmCommand, NameServiceError> {
+    let args = build_index_head_args(ledger_id, index_t, index_id)?;
+    Ok(SmCommand::AdvanceIndexHead(args))
+}
+
+/// Build the state-machine command an
+/// `AdminPublisher::publish_index_allow_equal` call translates into.
+fn build_rewrite_index_command(
+    ledger_id: &str,
+    index_t: i64,
+    index_id: &ContentId,
+) -> std::result::Result<SmCommand, NameServiceError> {
+    let args = build_index_head_args(ledger_id, index_t, index_id)?;
+    Ok(SmCommand::RewriteIndexHead(args))
+}
+
+fn build_index_head_args(
+    ledger_id: &str,
+    index_t: i64,
+    index_id: &ContentId,
+) -> std::result::Result<AdvanceIndexHeadArgs, NameServiceError> {
     let (ledger_name, branch) = split_ledger_id(ledger_id)?;
     let applied_at_millis = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
-    Ok(SmCommand::AdvanceIndexHead(AdvanceIndexHeadArgs {
+    Ok(AdvanceIndexHeadArgs {
         ledger_id: ledger_name,
         branch,
         new_index_head: index_id.clone(),
         t: index_t,
         applied_at_millis,
-    }))
+    })
 }
 
 /// Translate the apply outcome into the `IndexPublisher::publish_index`
@@ -238,7 +258,6 @@ impl IndexPublisher for RaftNameService {
         index_id: &ContentId,
     ) -> Result<()> {
         let cmd = build_advance_index_command(ledger_id, index_t, index_id)?;
-
         match self.raft.client_write(cmd).await {
             Ok(resp) => map_advance_index_response(resp.data),
             // A stepped-down leader's straggling publish call. The
@@ -255,6 +274,30 @@ impl IndexPublisher for RaftNameService {
             }
             Err(RaftError::Fatal(f)) => Err(NameServiceError::storage(format!(
                 "raft fatal during AdvanceIndexHead: {f}"
+            ))),
+        }
+    }
+}
+
+#[async_trait]
+impl AdminPublisher for RaftNameService {
+    async fn publish_index_allow_equal(
+        &self,
+        ledger_id: &str,
+        index_t: i64,
+        index_id: &ContentId,
+    ) -> Result<()> {
+        let cmd = build_rewrite_index_command(ledger_id, index_t, index_id)?;
+        match self.raft.client_write(cmd).await {
+            Ok(resp) => map_advance_index_response(resp.data),
+            Err(RaftError::APIError(ClientWriteError::ForwardToLeader(_))) => Ok(()),
+            Err(RaftError::APIError(ClientWriteError::ChangeMembershipError(e))) => {
+                Err(NameServiceError::storage(format!(
+                    "unexpected ChangeMembershipError on RewriteIndexHead: {e}"
+                )))
+            }
+            Err(RaftError::Fatal(f)) => Err(NameServiceError::storage(format!(
+                "raft fatal during RewriteIndexHead: {f}"
             ))),
         }
     }
