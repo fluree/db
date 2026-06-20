@@ -33,3 +33,7 @@ __pycache__/
 
 # Benchmark inputs/outputs — never tracked
 /benchmarks/
+
+# Internal analysis scratch — not part of the published docs
+BI_QUERY_ANALYSIS.md
+SEPARATION_PLAN.md

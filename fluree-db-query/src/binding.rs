@@ -169,14 +169,15 @@ pub enum Binding {
     /// - Consumed by aggregate functions (count, sum, avg, etc.)
     Grouped(Vec<Binding>),
 
-    /// Path value (node sequence) produced by a shortest-path search.
+    /// Path value (node sequence + per-hop edges) bound to a Cypher path var.
     ///
     /// Holds the ordered node SIDs of a single matched path, start to end
     /// inclusive. Hop count (`length(p)` in Cypher) is `nodes.len() - 1`.
     ///
     /// # Invariants
     ///
-    /// - Only produced by [`crate::shortest_path::ShortestPathOperator`].
+    /// - Produced by [`crate::shortest_path::ShortestPathOperator`] and by the
+    ///   `MakePath` constructor (var-length `MATCH p = (a)-[:T*m..n]->(b)`).
     /// - Opaque to join/scan/sort hot paths (treated as an atomic value);
     ///   consumed by path functions (`length`, `nodes`, `relationships`) and
     ///   rendered as a JSON array of node IRIs at projection time.

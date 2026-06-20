@@ -435,9 +435,10 @@ produces a clear error rather than a silent wrong answer.
 
 **Functions**
 
-- `relationships(p)`, `id(x)`, `point`, `distance`.
-  (`labels(n)`, `type(r)`, `nodes(p)`, `pathPairs(p)`, `keys(n)`,
-  `properties(n)`, map literals (`{k: v}`), object `$params`, and the list
+- `point`, `distance`.
+  (`labels(n)`, `type(r)`, `startNode(r)`, `endNode(r)`, `nodes(p)`,
+  `relationships(p)`, `pathPairs(p)`, `keys(n)`, `properties(n)`, `id(x)` /
+  `elementId(x)`, map literals (`{k: v}`), object `$params`, and the list
   functions *are* supported — see above.)
 
 **Expressions**
