@@ -387,10 +387,12 @@ struct ProjectionState {
     aggregates: Vec<AggregateSpec>,
     saw_star: bool,
     alias_counter: u32,
-    /// Output vars bound to `collect()` — list-valued. The list carrier
-    /// (`Binding::Grouped`) is an internal value the sort/join/group key paths
-    /// don't handle, so these vars must not reach ORDER BY (or flow out of a
-    /// WITH into a downstream join/sort/group). Tracked here to reject those.
+    /// Output vars bound to `collect()` — list-valued (a `Binding::List`).
+    /// These DO flow out of a `WITH` as a real list and may be projected, fed to
+    /// list functions, or `UNWIND`ed downstream. They are tracked only to reject
+    /// `ORDER BY` directly on the list: the sort comparator has no meaningful
+    /// order for a list value in v1 (see `reject_order_by_on_list`, used by both
+    /// the RETURN and WITH paths).
     list_outputs: std::collections::HashSet<VarId>,
     /// Post-aggregation binds: `output_var = <expr over aggregate outputs and
     /// literals>`, for aggregates composed into a larger expression
