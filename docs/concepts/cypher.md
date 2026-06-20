@@ -218,6 +218,11 @@ ORDER BY / SKIP / LIMIT
   counts from the end (`list[-1]` is the last element). Out-of-range,
   non-integer index, or non-list yields null. An indexed element that is
   itself a node ref correlates downstream (`WITH pair[0] AS x ... x.name`).
+- Metadata functions: `labels(n)` returns the node's Cypher label strings
+  (from live `rdf:type` assertions, overlay-aware); `type(r)` returns the
+  relationship type string for a named relationship variable (from
+  `f:reifiesPredicate` on the reifier). Unbound or non-node/non-rel
+  arguments yield null.
 - `pathPairs(p)` — the consecutive node pairs of a path value
   (`[[a,b],[b,c],…]`, each pair a two-element list). With `UNWIND`, this
   drives per-edge aggregation: `UNWIND pathPairs(p) AS pair` then
@@ -296,9 +301,10 @@ produces a clear error rather than a silent wrong answer.
 
 **Functions**
 
-- `relationships(p)`, `labels(n)`, `type(r)`, `keys(x)`, `properties(x)`,
+- `relationships(p)`, `keys(x)`, `properties(x)`,
   `id(x)`, and map functions generally; map/object parameters.
-  (`nodes(p)`, `pathPairs(p)`, and the list functions *are* supported — see above.)
+  (`labels(n)`, `type(r)`, `nodes(p)`, `pathPairs(p)`, and the list functions
+  *are* supported — see above.)
 
 **Expressions**
 

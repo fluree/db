@@ -70,6 +70,28 @@ fn modulus_expression_lowers_to_mod_function() {
 }
 
 #[test]
+fn labels_function_lowers_to_labels() {
+    let q = lower("MATCH (n:Person) RETURN labels(n) AS ls");
+    assert!(
+        q.patterns.iter().any(|p| {
+            matches!(p, Pattern::Bind { expr, .. } if expr.contains_function(&Function::Labels))
+        }),
+        "labels() should lower to Function::Labels"
+    );
+}
+
+#[test]
+fn type_function_lowers_to_rel_type() {
+    let q = lower("MATCH (a:Person)-[r:KNOWS]->(b:Person) RETURN type(r) AS t");
+    assert!(
+        q.patterns.iter().any(|p| {
+            matches!(p, Pattern::Bind { expr, .. } if expr.contains_function(&Function::RelType))
+        }),
+        "type() should lower to Function::RelType"
+    );
+}
+
+#[test]
 fn anonymous_relationship_lowers_to_plain_triple() {
     // Shape 1 — set semantics, sees plain RDF.
     let q = lower("MATCH (a:Person)-[:KNOWS]->(b:Person) RETURN a, b");

@@ -27,6 +27,7 @@ mod hash;
 mod helpers;
 mod list;
 mod logical;
+mod metadata;
 mod numeric;
 mod path;
 mod rdf;

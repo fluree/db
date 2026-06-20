@@ -175,6 +175,8 @@ pub fn lower_expr<E: IriEncoder>(
                 "nodes" => Function::Nodes,
                 "range" => Function::Range,
                 "pathpairs" => Function::PathPairs,
+                "labels" => Function::Labels,
+                "type" => Function::RelType,
                 _ => {
                     return Err(LowerError::unsupported(format!(
                         "function `{}` is not in the v1 expression surface",

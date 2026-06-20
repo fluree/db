@@ -977,6 +977,87 @@ async fn cypher_with_star_carries_visible_vars_only() {
 }
 
 #[tokio::test]
+async fn cypher_labels_returns_rdf_type_strings() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/cypher:labels-fn");
+    let committed = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": ctx(),
+                "@graph": [
+                    {"@id": "ex:alice", "@type": "ex:Person", "ex:name": "Alice"},
+                    {
+                        "@id": "ex:bob",
+                        "@type": ["ex:Person", "ex:Employee"],
+                        "ex:name": "Bob"
+                    },
+                ]
+            }),
+        )
+        .await
+        .expect("seed");
+    let db = graphdb_from_ledger(&committed.ledger);
+
+    let jsonld = fluree
+        .query_cypher(
+            &db,
+            "MATCH (n:Person) RETURN n.name AS name, labels(n) AS ls ORDER BY name",
+        )
+        .await
+        .expect("labels query")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+
+    assert_eq!(jsonld.as_array().expect("rows").len(), 2, "Alice and Bob");
+    let alice_labels: Vec<&str> = jsonld[0][1]
+        .as_array()
+        .expect("labels list")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert_eq!(alice_labels, ["Person"]);
+
+    let mut bob_labels: Vec<&str> = jsonld[1][1]
+        .as_array()
+        .expect("labels list")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    bob_labels.sort_unstable();
+    assert_eq!(bob_labels, ["Employee", "Person"]);
+}
+
+#[tokio::test]
+async fn cypher_type_returns_named_relationship_type() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let mut l = genesis_ledger(&fluree, "it/cypher:type-fn");
+    for stmt in [
+        r#"CREATE (a:Person {name: "Alice"})"#,
+        r#"CREATE (b:Person {name: "Bob"})"#,
+        r#"MATCH (a:Person {name: "Alice"}), (b:Person {name: "Bob"}) CREATE (a)-[:KNOWS]->(b)"#,
+    ] {
+        l = fluree.transact_cypher(l, stmt).await.expect(stmt).ledger;
+    }
+    let db = graphdb_from_ledger(&l);
+
+    let jsonld = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (a:Person {name: "Alice"})-[r:KNOWS]->(b:Person) RETURN type(r) AS t"#,
+        )
+        .await
+        .expect("type query")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+
+    assert_eq!(jsonld.as_array().expect("rows").len(), 1);
+    assert_eq!(jsonld[0][0].as_str(), Some("KNOWS"));
+}
+
+#[tokio::test]
 async fn cypher_order_by_property_accessor_grouping_key() {
     // ORDER BY a grouping key written as a property accessor (`f.id`, not its
     // alias) must work under aggregation — it should behave like ORDER BY the

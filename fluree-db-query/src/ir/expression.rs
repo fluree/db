@@ -615,6 +615,14 @@ pub enum Function {
     ListIndex,
 
     // =========================================================================
+    // Cypher metadata functions
+    // =========================================================================
+    /// `labels(node)` — Cypher label strings from `rdf:type` assertions.
+    Labels,
+    /// `type(rel)` — relationship type string from `f:reifiesPredicate`.
+    RelType,
+
+    // =========================================================================
     // Custom/unknown function
     // =========================================================================
     Custom(String),

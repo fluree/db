@@ -15,6 +15,7 @@ use crate::error::{QueryError, Result};
 use crate::ir::{Expression, Function};
 use std::sync::Arc;
 
+use super::metadata;
 use super::value::ComparableValue;
 
 /// Resolve a list-function argument to its input binding without losing a list.
@@ -178,6 +179,7 @@ pub fn eval_list_fn_to_binding<R: RowAccess>(
 ) -> Result<Option<Binding>> {
     match func {
         Function::ListIndex => Ok(Some(eval_list_index_to_binding(args, row, ctx)?)),
+        Function::Labels => Ok(Some(metadata::eval_labels_to_binding(args, row, ctx)?)),
         Function::Nodes => {
             // The node sequence of a path value, as a list of node refs.
             let arg = arity1(args, "nodes")?;

@@ -325,7 +325,7 @@ fn parse_var_or_call(s: &mut TokenStream) -> Result<Expr, Diagnostic> {
         let lower = name.to_ascii_lowercase();
         if matches!(
             lower.as_str(),
-            "labels" | "keys" | "properties" | "type" | "id" | "point" | "distance"
+            "keys" | "properties" | "id" | "point" | "distance"
         ) {
             return Err(Diagnostic {
                 code: DiagCode::DeferredFunction,
