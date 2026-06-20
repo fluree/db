@@ -649,6 +649,9 @@ fn expr_has_aggregate(e: &Expr) -> bool {
         Expr::ListComprehension(c) => expr_has_aggregate(&c.list),
         Expr::Reduce(r) => expr_has_aggregate(&r.init) || expr_has_aggregate(&r.list),
         Expr::ListPredicate(p) => expr_has_aggregate(&p.list),
+        Expr::MapProjection(mp) => mp.selectors.iter().any(|sel| {
+            matches!(sel, crate::ast::MapProjectionSelector::Literal(_, e) if expr_has_aggregate(e))
+        }),
         Expr::Var(_) | Expr::Lit(_) | Expr::Param(_) | Expr::Case(_) | Expr::Exists(_, _, _) => {
             false
         }
@@ -755,6 +758,14 @@ fn extract_aggregates_inner<E: IriEncoder>(
             extract_aggregates_inner(ctx, &mut r.init, patterns, aggregates, counter, false)?;
             extract_aggregates_inner(ctx, &mut r.list, patterns, aggregates, counter, true)
         }
+        Expr::MapProjection(mp) => {
+            for sel in &mut mp.selectors {
+                if let crate::ast::MapProjectionSelector::Literal(_, e) = sel {
+                    extract_aggregates_inner(ctx, e, patterns, aggregates, counter, false)?;
+                }
+            }
+            Ok(())
+        }
         Expr::Case(_) | Expr::Exists(_, _, _) => Err(LowerError::unsupported(
             "aggregates inside CASE / EXISTS are not supported in v1",
         )),
@@ -802,6 +813,9 @@ fn composite_references_grouping_value(e: &Expr) -> bool {
             composite_references_grouping_value(&r.init)
                 || composite_references_grouping_value(&r.list)
         }
+        // A map projection reads the node's properties — a grouping value (like a
+        // bare property accessor).
+        Expr::MapProjection(_) => true,
         Expr::Lit(_) | Expr::Param(_) | Expr::Case(_) | Expr::Exists(_, _, _) => false,
     }
 }

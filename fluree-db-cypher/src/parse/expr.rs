@@ -383,9 +383,53 @@ fn parse_var_or_call(s: &mut TokenStream) -> Result<Expr, Diagnostic> {
             distinct,
             span: start.union(end),
         }))
+    } else if matches!(s.peek_kind(), TokenKind::LBrace) {
+        // `var{ … }` — a map projection (distinct from the bare map literal
+        // `{ … }`, which has no leading variable).
+        parse_map_projection(s, Variable { name, span: start }, start)
     } else {
         Ok(Expr::Var(Variable { name, span: start }))
     }
+}
+
+/// `var{ .key, .*, key: expr }` — the leading `var` is already parsed.
+fn parse_map_projection(
+    s: &mut TokenStream,
+    var: Variable,
+    start: SourceSpan,
+) -> Result<Expr, Diagnostic> {
+    use crate::ast::{MapProjectionExpr, MapProjectionSelector};
+    s.expect(&TokenKind::LBrace)?;
+    let mut selectors = Vec::new();
+    if !matches!(s.peek_kind(), TokenKind::RBrace) {
+        loop {
+            if s.eat(&TokenKind::Dot).is_some() {
+                // `.key` property selector, or `.*` all-properties.
+                if s.eat(&TokenKind::Star).is_some() {
+                    selectors.push(MapProjectionSelector::AllProperties);
+                } else {
+                    selectors.push(MapProjectionSelector::Property(parse_ident_or_keyword(s)?));
+                }
+            } else {
+                // `key: expr` explicit entry.
+                let key = parse_ident_or_keyword(s)?;
+                s.expect(&TokenKind::Colon)?;
+                selectors.push(MapProjectionSelector::Literal(
+                    key,
+                    Box::new(parse_expr(s)?),
+                ));
+            }
+            if s.eat(&TokenKind::Comma).is_none() {
+                break;
+            }
+        }
+    }
+    let end = s.expect(&TokenKind::RBrace)?;
+    Ok(Expr::MapProjection(Box::new(MapProjectionExpr {
+        var,
+        selectors,
+        span: start.union(end),
+    })))
 }
 
 fn parse_case(s: &mut TokenStream) -> Result<Expr, Diagnostic> {

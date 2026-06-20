@@ -421,6 +421,13 @@ fn collect_alias_in_expr(e: &Expr, alias: &str, fields: &mut Vec<String>, bare: 
                 collect_alias_in_expr(&p.predicate, alias, fields, bare);
             }
         }
+        Expr::MapProjection(mp) => {
+            for sel in &mp.selectors {
+                if let crate::ast::MapProjectionSelector::Literal(_, e) = sel {
+                    collect_alias_in_expr(e, alias, fields, bare);
+                }
+            }
+        }
         Expr::Lit(_) | Expr::Param(_) | Expr::Case(_) | Expr::Exists(_, _, _) => {}
     }
 }
@@ -586,6 +593,13 @@ fn rewrite_alias_in_expr_to_var<F: Fn(&str) -> String>(
                 rewrite_alias_in_expr_to_var(&mut p.predicate, alias, col_var, bare_var);
             }
         }
+        Expr::MapProjection(mp) => {
+            for sel in &mut mp.selectors {
+                if let crate::ast::MapProjectionSelector::Literal(_, e) = sel {
+                    rewrite_alias_in_expr_to_var(e, alias, col_var, bare_var);
+                }
+            }
+        }
         Expr::Var(_) | Expr::Lit(_) | Expr::Param(_) | Expr::Case(_) | Expr::Exists(_, _, _) => {}
     }
 }
@@ -728,6 +742,14 @@ fn replace_alias_in_expr(
             replace_alias_in_expr(&mut p.list, alias, elem, pname)?;
             if p.var.name != alias {
                 replace_alias_in_expr(&mut p.predicate, alias, elem, pname)?;
+            }
+            Ok(())
+        }
+        Expr::MapProjection(mp) => {
+            for sel in &mut mp.selectors {
+                if let crate::ast::MapProjectionSelector::Literal(_, e) = sel {
+                    replace_alias_in_expr(e, alias, elem, pname)?;
+                }
             }
             Ok(())
         }
@@ -989,6 +1011,14 @@ fn subst_expr(e: &mut Expr, p: &ParamMap) -> Result<(), ParamError> {
         Expr::ListPredicate(pr) => {
             subst_expr(&mut pr.list, p)?;
             subst_expr(&mut pr.predicate, p)
+        }
+        Expr::MapProjection(mp) => {
+            for sel in &mut mp.selectors {
+                if let crate::ast::MapProjectionSelector::Literal(_, e) = sel {
+                    subst_expr(e, p)?;
+                }
+            }
+            Ok(())
         }
         Expr::Var(_) | Expr::Lit(_) => Ok(()),
     }

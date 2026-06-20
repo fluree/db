@@ -269,6 +269,11 @@ ORDER BY / SKIP / LIMIT
   order; duplicate literal keys resolve last-wins. Maps are projection/value
   constructs only — not RDF terms, so they can't be matched, indexed, or stored
   via `SET n.prop = {…}`.
+- **Map projection** `n{.name, .age, computed: n.age + 1}` — build a map from a
+  node variable: `.key` selectors desugar to `key: n.key`, `key: expr` adds an
+  explicit entry, and `n{.*}` projects every data property (equivalent to
+  `properties(n)`). Mixing `.*` with other selectors is deferred (use
+  `properties(n)` or list the keys).
 - Aggregates: `count(*)`, `count(x)`, `count(DISTINCT x)`,
   `sum(x)`, `avg(x)`, `min(x)`, `max(x)`. Arguments may be a bare
   variable (`count(n)`), a property accessor (`avg(n.age)`), a list

@@ -8,7 +8,9 @@ use fluree_db_query::ir::{Expression, Function, Pattern, Ref, Term, TriplePatter
 use fluree_db_query::parse::encode::IriEncoder;
 use fluree_db_query::var_registry::VarId;
 
-use crate::ast::{BinOp, CaseExpr, Expr, ListPredicateKind, Literal, ParamRef, UnaryOp};
+use crate::ast::{
+    BinOp, CaseExpr, Expr, ListPredicateKind, Literal, MapProjectionSelector, ParamRef, UnaryOp,
+};
 
 use super::context::LoweringContext;
 use super::pattern::lower_pattern;
@@ -240,6 +242,42 @@ pub fn lower_expr<E: IriEncoder>(
             };
             reject_exists_in_iteration(&built)?;
             Ok(built)
+        }
+        Expr::MapProjection(mp) => {
+            let has_all = mp
+                .selectors
+                .iter()
+                .any(|s| matches!(s, MapProjectionSelector::AllProperties));
+            if has_all {
+                // `var{.*}` is exactly `properties(var)`. Mixing `.*` with other
+                // selectors would need a runtime map merge — deferred.
+                if mp.selectors.len() != 1 {
+                    return Err(LowerError::unsupported(
+                        "map projection mixing `.*` with other selectors is deferred — use \
+                         `properties(n)` or list the keys explicitly",
+                    ));
+                }
+                let target = Expression::Var(ctx.intern_var(&mp.var.name));
+                return Ok(Expression::call(Function::Properties, vec![target]));
+            }
+            // `var{.a, k: e}` desugars to `{a: var.a, k: e}`. A `.key` selector
+            // reuses the property-accessor lowering (outer-var aux-pattern join,
+            // or eval-time member access when `var` is a loop-local).
+            let mut entries = Vec::with_capacity(mp.selectors.len());
+            for sel in &mp.selectors {
+                match sel {
+                    MapProjectionSelector::Property(key) => {
+                        let accessor =
+                            Expr::Prop(Box::new(Expr::Var(mp.var.clone())), key.clone(), mp.span);
+                        entries.push((Arc::from(key.as_str()), lower_expr(ctx, &accessor, aux)?));
+                    }
+                    MapProjectionSelector::Literal(key, expr) => {
+                        entries.push((Arc::from(key.as_str()), lower_expr(ctx, expr, aux)?));
+                    }
+                    MapProjectionSelector::AllProperties => unreachable!("handled above"),
+                }
+            }
+            Ok(Expression::Map(entries))
         }
         Expr::Call(call) => {
             let name = call.name.to_ascii_lowercase();

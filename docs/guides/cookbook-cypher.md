@@ -62,6 +62,17 @@ MATCH (p:Person {name: "Alice"})
 RETURN properties(p) AS props, keys(p) AS fields
 ```
 
+Map projection is shorthand for building a map from a node — `.key` selectors,
+a computed entry, or `.*` for every property:
+
+```cypher
+MATCH (p:Person {name: "Alice"})
+RETURN p{.name, .age, nextYear: p.age + 1} AS person
+
+MATCH (p:Person {name: "Alice"})
+RETURN p{.*} AS allProps
+```
+
 In the default cypher-json output a map is a native JSON object
 (`{"name": "Alice", "age": 30}`). `properties(n)` returns only data properties
 (not labels or relationships); `keys(n)` is their names. An object parameter is a

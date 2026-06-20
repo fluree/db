@@ -56,6 +56,28 @@ pub enum Expr {
     Reduce(Box<ReduceExpr>),
     /// List predicate `all/any/none/single(var IN list WHERE pred)`.
     ListPredicate(Box<ListPredicateExpr>),
+    /// Map projection `var{.key, .*, key: expr}` — build a map from a node/map
+    /// variable's properties (boxed to keep `Expr` small).
+    MapProjection(Box<MapProjectionExpr>),
+}
+
+/// `var{ selector, … }`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MapProjectionExpr {
+    pub var: Variable,
+    pub selectors: Vec<MapProjectionSelector>,
+    pub span: SourceSpan,
+}
+
+/// One entry of a map projection.
+#[derive(Clone, Debug, PartialEq)]
+pub enum MapProjectionSelector {
+    /// `.key` — include `var.key` under `key`.
+    Property(String),
+    /// `.*` — include every data property of `var`.
+    AllProperties,
+    /// `key: expr` — an explicit entry.
+    Literal(String, Box<Expr>),
 }
 
 /// `[var IN list WHERE filter | map]`.
@@ -120,6 +142,7 @@ impl Expr {
             Expr::ListComprehension(c) => c.span,
             Expr::Reduce(r) => r.span,
             Expr::ListPredicate(p) => p.span,
+            Expr::MapProjection(m) => m.span,
             Expr::Call(c) => c.span,
             Expr::Case(c) => c.span,
         }

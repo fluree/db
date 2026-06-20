@@ -1743,6 +1743,73 @@ async fn cypher_row(
 }
 
 #[tokio::test]
+async fn cypher_map_projection() {
+    // `n{.key}` selectors, a `key: expr` entry, and `n{.*}` (all properties).
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = genesis_ledger(&fluree, "it/cypher:map-projection");
+    let l = fluree
+        .transact_cypher(l, r#"CREATE (p:Person {name: "Alice", age: 30})"#)
+        .await
+        .expect("seed")
+        .ledger;
+    let db = graphdb_from_ledger(&l);
+
+    // Explicit selectors + a computed entry.
+    let cj = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (p:Person {name: "Alice"})
+               RETURN p{.name, .age, nextYear: p.age + 1} AS person"#,
+        )
+        .await
+        .expect("query")
+        .to_cypher_json_async(db.as_graph_db_ref())
+        .await
+        .expect("cypher json");
+    assert_eq!(
+        cj["results"][0]["data"][0]["row"][0],
+        json!({"name": "Alice", "age": 30, "nextYear": 31}),
+        "explicit selectors + computed entry: {cj}"
+    );
+
+    // `.*` projects all data properties (like properties(n)).
+    let star = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (p:Person {name: "Alice"}) RETURN p{.*} AS person"#,
+        )
+        .await
+        .expect("query")
+        .to_cypher_json_async(db.as_graph_db_ref())
+        .await
+        .expect("cypher json");
+    assert_eq!(
+        star["results"][0]["data"][0]["row"][0],
+        json!({"name": "Alice", "age": 30}),
+        "`.*` is all data properties: {star}"
+    );
+}
+
+#[tokio::test]
+async fn cypher_map_projection_mixed_star_is_rejected() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = genesis_ledger(&fluree, "it/cypher:map-projection-mixed");
+    let l = fluree
+        .transact_cypher(l, r#"CREATE (p:Person {name: "Alice"})"#)
+        .await
+        .expect("seed")
+        .ledger;
+    let db = graphdb_from_ledger(&l);
+    let res = fluree
+        .query_cypher(&db, r#"MATCH (p:Person) RETURN p{.*, extra: 1} AS person"#)
+        .await;
+    assert!(
+        res.is_err(),
+        "mixing .* with other selectors should be rejected"
+    );
+}
+
+#[tokio::test]
 async fn cypher_list_comprehension_arithmetic_and_filter() {
     let fluree = FlureeBuilder::memory().build_memory();
     let l = genesis_ledger(&fluree, "it/cypher:listcomp");
