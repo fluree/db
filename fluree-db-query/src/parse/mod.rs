@@ -860,22 +860,22 @@ fn hoist_inline_aggregates(
     tok: &mut sexpr_tokenize::SexprToken,
     aggregates: &mut Vec<ast::UnresolvedAggregateSpec>,
 ) -> Result<()> {
-    let mut seen: std::collections::HashMap<String, Arc<str>> =
-        std::collections::HashMap::new();
-    hoist_inline_aggregates_inner(tok, aggregates, &mut seen)
+    hoist_inline_aggregates_inner(tok, aggregates, &mut HashMap::new())
 }
 
 fn hoist_inline_aggregates_inner(
     tok: &mut sexpr_tokenize::SexprToken,
     aggregates: &mut Vec<ast::UnresolvedAggregateSpec>,
-    seen: &mut std::collections::HashMap<String, Arc<str>>,
+    seen: &mut HashMap<String, Arc<str>>,
 ) -> Result<()> {
-    let sexpr_tokenize::SexprToken::List(items) = tok else {
+    use sexpr_tokenize::SexprToken;
+
+    let SexprToken::List(items) = tok else {
         return Ok(());
     };
 
     // If this list is itself an aggregate call, hoist it whole.
-    if let Some(sexpr_tokenize::SexprToken::Atom(name)) = items.first() {
+    if let Some(SexprToken::Atom(name)) = items.first() {
         let head = name.to_lowercase();
         if is_aggregate_name(&head) {
             let (function, input_var) = parse_aggregate_fn_and_input(&head, &items[1..])?;
@@ -900,7 +900,7 @@ fn hoist_inline_aggregates_inner(
 
     // Otherwise recurse into children. A nested aggregate inside an arithmetic
     // or function call gets rewritten in place.
-    for child in items.iter_mut() {
+    for child in items {
         hoist_inline_aggregates_inner(child, aggregates, seen)?;
     }
     Ok(())

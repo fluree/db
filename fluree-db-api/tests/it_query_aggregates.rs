@@ -591,10 +591,7 @@ async fn select_expr_if_branches_on_age() {
     );
 }
 
-async fn seed_receipt_line_items_jsonld(
-    fluree: &MemoryFluree,
-    ledger_id: &str,
-) -> MemoryLedger {
+async fn seed_receipt_line_items_jsonld(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
     let ledger0 = genesis_ledger(fluree, ledger_id);
 
     let insert = json!({
@@ -649,8 +646,7 @@ async fn aggregates_arithmetic_over_min_max_jsonld() {
     //   SELECT ?part ((MAX(?u) - MIN(?u)) AS ?spread) GROUP BY ?part
     // which currently fails on the SPARQL side.
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger =
-        seed_receipt_line_items_jsonld(&fluree, "query/agg-spread-jsonld:main").await;
+    let ledger = seed_receipt_line_items_jsonld(&fluree, "query/agg-spread-jsonld:main").await;
     let ctx = json!({
         "sup": "http://Magna/SupplyChain#",
         "xsd": "http://www.w3.org/2001/XMLSchema#"
@@ -678,9 +674,6 @@ async fn aggregates_arithmetic_over_min_max_jsonld() {
 
     assert_eq!(
         normalize_rows(&json_rows),
-        normalize_rows(&json!([
-            ["sup:partA", 4],
-            ["sup:partB", 4]
-        ]))
+        normalize_rows(&json!([["sup:partA", 4], ["sup:partB", 4]]))
     );
 }
