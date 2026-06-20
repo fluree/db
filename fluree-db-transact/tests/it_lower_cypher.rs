@@ -215,6 +215,13 @@ fn deferred_write_shapes_are_rejected() {
         "MERGE (a:Person {name: \"A\"})-[:KNOWS]-(b:Person {name: \"B\"})",
         // Multi-hop MERGE pattern is deferred.
         "MERGE (a:Person {name: \"A\"})-[:KNOWS]->(b:Person)-[:KNOWS]->(c:Person)",
+        // A leading MATCH is allowed only before a *relationship* MERGE — a
+        // node MERGE must stand alone.
+        "MATCH (a:Person) MERGE (n:Person {name: \"A\"})",
+        // OPTIONAL MATCH before a relationship MERGE risks a partial reifier
+        // bundle (optionally-unbound endpoint), so it is rejected.
+        "MATCH (a:Person {name: \"A\"}) OPTIONAL MATCH (b:Person {name: \"B\"}) \
+         MERGE (a)-[:KNOWS]->(b)",
     ] {
         let out = parse_cypher(src);
         if out.has_errors() {

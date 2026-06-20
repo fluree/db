@@ -266,18 +266,36 @@ ORDER BY / SKIP / LIMIT
 - **`DELETE` / `DETACH DELETE`** — delete nodes/relationships. `DETACH DELETE`
   removes a node together with its relationships.
 - **`MERGE`** — find-or-create for a single node
-  (`MERGE (n:Person {name: "Alice"})`) or a single relationship path. The
-  relationship form works both standalone, where the whole pattern is the match
-  key and absent endpoints are created
-  (`MERGE (a:Person {name: "Alice"})-[:KNOWS]->(b:Person {name: "Bob"})`), and
-  with a leading `MATCH` binding the endpoints, where it is a **per-row
-  find-or-create** — the edge is created only for matched pairs that don't
-  already have it
-  (`MATCH (a:Person), (b:Person) WHERE a.name <> b.name MERGE (a)-[:KNOWS]->(b)`).
-  An endpoint introduced by the `MERGE` (not bound by the `MATCH`) is created
-  per row. `ON CREATE SET` / `ON MATCH SET` are supported, and `ON CREATE SET`
-  may target either endpoint node variable. Resolved by probing the current
-  writer state, then staging either a create or an update.
+  (`MERGE (n:Person {name: "Alice"})`) or a single relationship path, in two
+  forms:
+  - **Standalone** — the whole pattern is the match key, treated atomically:
+    `MERGE (a:Person {name: "Alice"})-[:KNOWS]->(b:Person {name: "Bob"})`. If
+    *no* matching path exists, the entire path is created with **fresh** nodes
+    for both endpoints — even if a node matching one endpoint already exists.
+    (To reuse existing endpoints, bind them with a leading `MATCH` — the
+    per-row form below.)
+  - **Per-row (leading `MATCH` binds the endpoints)** — find-or-create the edge
+    for each matched pair, reusing the bound nodes:
+    `MATCH (a:Person), (b:Person) WHERE a.name <> b.name MERGE (a)-[:KNOWS]->(b)`.
+    The edge is created only for pairs that don't already have it. An endpoint
+    *introduced* by the `MERGE` (not bound by the `MATCH`) is created per row —
+    e.g. `MATCH (a:Person) MERGE (a)-[:HAS_PET]->(p:Pet {name: "Rex"})` creates
+    one `Pet` per matched `a`.
+
+  > **Cartesian-product warning:** a per-row `MERGE` over an unfiltered
+  > multi-node `MATCH` (`MATCH (a:Person), (b:Person) MERGE (a)-[:KNOWS]->(b)`)
+  > considers every ordered pair — O(n²) candidate edges. Add a selective
+  > `WHERE` (as above) unless a full cross-product is intended.
+
+  `ON CREATE SET` is supported on both forms (and may target either endpoint
+  node variable). `ON MATCH SET` is supported on **single-node** `MERGE` only
+  (deferred on a relationship `MERGE`). Resolved by probing the current writer
+  state, then staging either a create or an update.
+
+  Style note: write bound endpoints **bare** in the `MERGE` pattern
+  (`MATCH (a:Person) MERGE (a)-[:T]->(b)`). Repeating a label on a bound
+  endpoint (`MERGE (a:Person)-[:T]->(b)`) re-asserts its `rdf:type` triple when
+  the edge is inserted — idempotent in RDF, but redundant.
 - **`MATCH … CREATE/SET/REMOVE/DELETE`** — pattern-driven write templates (find
   rows, then write per match). Write-side `MATCH` supports labels, inline
   property filters, directed single-typed relationships, and scalar `WHERE`

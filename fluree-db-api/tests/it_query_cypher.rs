@@ -1650,6 +1650,55 @@ async fn transact_cypher_merge_relationship_bound_endpoints_is_per_row_find_or_c
 }
 
 #[tokio::test]
+async fn transact_cypher_merge_relationship_on_create_set_bound_head() {
+    // ON CREATE SET targeting a MATCH-bound endpoint (the head) fires only when
+    // the edge is created, and writes onto the existing bound node.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = genesis_ledger(&fluree, "it/cypher:merge-rel-oncreate-head");
+    let l = fluree
+        .transact_cypher(
+            l,
+            r#"CREATE (a:Person {name: "Alice"}) CREATE (b:Person {name: "Bob"})"#,
+        )
+        .await
+        .expect("seed")
+        .ledger;
+
+    let stmt = r#"MATCH (a:Person {name: "Alice"}), (b:Person {name: "Bob"})
+                  MERGE (a)-[:KNOWS]->(b)
+                  ON CREATE SET a.linked = "yes""#;
+    let l = fluree.transact_cypher(l, stmt).await.expect("merge").ledger;
+    let db = graphdb_from_ledger(&l);
+    assert_eq!(
+        fluree
+            .query_cypher(&db, r#"MATCH (a:Person {linked: "yes"}) RETURN a.name"#)
+            .await
+            .unwrap()
+            .row_count(),
+        1,
+        "ON CREATE SET wrote onto the bound head node"
+    );
+
+    // Second run: the edge already exists → ON CREATE SET does not fire again
+    // (no second `linked` value — the property stays single-valued).
+    let l = fluree
+        .transact_cypher(l, stmt)
+        .await
+        .expect("merge#2")
+        .ledger;
+    let db = graphdb_from_ledger(&l);
+    assert_eq!(
+        fluree
+            .query_cypher(&db, r#"MATCH (a:Person {linked: "yes"}) RETURN a"#)
+            .await
+            .unwrap()
+            .row_count(),
+        1,
+        "still exactly one match — ON CREATE SET did not re-fire"
+    );
+}
+
+#[tokio::test]
 async fn transact_cypher_merge_relationship_bound_head_new_tail() {
     // Mixed: bound head + a new tail node introduced by the MERGE. Per matched
     // Person, find-or-create a Pet named Rex.
