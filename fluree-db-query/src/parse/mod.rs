@@ -879,21 +879,19 @@ fn hoist_inline_aggregates_inner(
         let head = name.to_lowercase();
         if is_aggregate_name(&head) {
             let (function, input_var) = parse_aggregate_fn_and_input(&head, &items[1..])?;
-            let dedup_key = format!("{head}|{input_var}");
-            let output_var = if let Some(existing) = seen.get(&dedup_key) {
-                existing.clone()
-            } else {
-                let next_idx = aggregates.len();
-                let name: Arc<str> = Arc::from(format!("?__inline_agg_{next_idx}"));
-                aggregates.push(ast::UnresolvedAggregateSpec {
-                    function,
-                    input_var: Arc::from(input_var),
-                    output_var: name.clone(),
-                });
-                seen.insert(dedup_key, name.clone());
-                name
-            };
-            *tok = sexpr_tokenize::SexprToken::Atom(output_var.to_string());
+            let output_var = seen
+                .entry(format!("{head}|{input_var}"))
+                .or_insert_with(|| {
+                    let name: Arc<str> = Arc::from(format!("?__inline_agg_{}", aggregates.len()));
+                    aggregates.push(ast::UnresolvedAggregateSpec {
+                        function,
+                        input_var: Arc::from(input_var),
+                        output_var: name.clone(),
+                    });
+                    name
+                })
+                .clone();
+            *tok = SexprToken::Atom(output_var.to_string());
             return Ok(());
         }
     }
