@@ -1,3 +1,5 @@
+#![allow(clippy::needless_raw_string_hashes)]
+
 //! Read-path lowering tests — exercise the Cypher → IR lowering rules.
 
 use std::collections::HashMap;

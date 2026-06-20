@@ -1,3 +1,5 @@
+#![allow(clippy::needless_raw_string_hashes)]
+
 //! Cypher write-path lowering tests.
 //!
 //! These exercise the Cypher write surface. The generated `Txn` shape is

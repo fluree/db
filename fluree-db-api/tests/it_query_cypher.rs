@@ -1,3 +1,7 @@
+// Cypher query strings are written as raw strings (`r#"..."#`) for consistency
+// even when a given query has no inner quotes.
+#![allow(clippy::needless_raw_string_hashes)]
+
 //! Cypher read-path end-to-end tests.
 //!
 //! Each test inserts data via JSON-LD `@annotation` (the canonical

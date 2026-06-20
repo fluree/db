@@ -1,3 +1,5 @@
+#![allow(clippy::needless_raw_string_hashes)]
+
 //! CSV bulk import (neo4j-admin header convention → JSON-LD front-end) — end to
 //! end. Proves a single CSV-loaded dataset is queryable from BOTH Cypher and
 //! SPARQL, including edge properties carried as `@annotation` (RDF 1.2 / LPG).
