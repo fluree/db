@@ -1725,6 +1725,39 @@ async fn cypher_map_literal_projection_renders_native_object() {
 }
 
 #[tokio::test]
+async fn cypher_scalar_string_and_math_functions() {
+    // The clean 1:1 scalar mappings: toUpper/toLower (string), round/floor/ceil
+    // (math). `rand()` is wired but non-deterministic, so it's exercised in
+    // a range check separately.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = genesis_ledger(&fluree, "it/cypher:scalar-fns");
+    let l = fluree
+        .transact_cypher(l, r#"CREATE (p:Person {name: "Alice", score: 2.4})"#)
+        .await
+        .expect("seed")
+        .ledger;
+    let db = graphdb_from_ledger(&l);
+    let cj = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (p:Person {name: "Alice"})
+               RETURN toUpper(p.name) AS up, toLower(p.name) AS down,
+                      floor(p.score) AS fl, ceil(p.score) AS ce, round(p.score) AS rd"#,
+        )
+        .await
+        .expect("query")
+        .to_cypher_json_async(db.as_graph_db_ref())
+        .await
+        .expect("cypher json");
+    let row = &cj["results"][0]["data"][0]["row"];
+    assert_eq!(row[0], json!("ALICE"), "toUpper: {cj}");
+    assert_eq!(row[1], json!("alice"), "toLower: {cj}");
+    assert_eq!(row[2].as_f64(), Some(2.0), "floor: {cj}");
+    assert_eq!(row[3].as_f64(), Some(3.0), "ceil: {cj}");
+    assert_eq!(row[4].as_f64(), Some(2.0), "round: {cj}");
+}
+
+#[tokio::test]
 async fn cypher_properties_and_keys() {
     // properties(n) → a map of all data properties; keys(n) → their names. Both
     // exclude the label (rdf:type) and any relationship edges.

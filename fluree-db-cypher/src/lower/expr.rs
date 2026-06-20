@@ -191,6 +191,16 @@ pub fn lower_expr<E: IriEncoder>(
                 "type" => Function::RelType,
                 "keys" => Function::Keys,
                 "properties" => Function::Properties,
+                // Scalar string/math functions with clean 1:1 engine semantics.
+                // (Deferred where semantics differ: `substring` is 0-indexed vs
+                // SPARQL SUBSTR's 1-based, `replace` is literal vs regex; and
+                // `sqrt`/`sign`/`split`/`trim`/`^` need new eval.)
+                "toupper" => Function::Ucase,
+                "tolower" => Function::Lcase,
+                "round" => Function::Round,
+                "ceil" | "ceiling" => Function::Ceil,
+                "floor" => Function::Floor,
+                "rand" => Function::Rand,
                 _ => {
                     return Err(LowerError::unsupported(format!(
                         "function `{}` is not in the v1 expression surface",
