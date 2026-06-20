@@ -87,9 +87,21 @@ pub struct FlureeServer {
     /// CAS release channel. Runs on every node (not just the leader)
     /// so admin-cleared queue entries and idempotency-evicted
     /// envelopes don't orphan their bodies in the content store.
-    /// Aborted on shutdown.
+    ///
+    /// Holds the task's `JoinHandle` and a `CancellationToken`.
+    /// Shutdown cancels the token, the task drains any messages
+    /// already buffered in the channel, then exits; the
+    /// `JoinHandle` is awaited so leftover releases land in the
+    /// content store before the process goes away. A naked
+    /// `task.abort()` here would drop in-flight releases and leak
+    /// the envelopes — the channel is `mpsc::unbounded`, so
+    /// whatever the adapter pushed between the last `recv` and the
+    /// abort is gone.
     #[cfg(feature = "raft")]
-    raft_release_task: Option<tokio::task::JoinHandle<()>>,
+    raft_release_task: Option<(
+        tokio::task::JoinHandle<()>,
+        tokio_util::sync::CancellationToken,
+    )>,
 }
 
 impl FlureeServer {
@@ -315,8 +327,15 @@ impl FlureeServer {
             handle.shutdown().await;
         }
         #[cfg(feature = "raft")]
-        if let Some(task) = self.raft_release_task {
-            task.abort();
+        if let Some((task, cancel)) = self.raft_release_task {
+            // Cooperative: cancel the recv loop, the task drains
+            // any messages still buffered in the unbounded channel,
+            // then exits. Awaiting the `JoinHandle` is what makes
+            // the drain actually happen before the process tears
+            // down — a bare `abort()` here would skip the drain
+            // and leak the envelopes.
+            cancel.cancel();
+            let _ = task.await;
         }
 
         result
@@ -526,18 +545,37 @@ impl FlureeServerBuilder {
                 let rx = integration.take_release_receiver().await;
                 rx.map(|mut rx| {
                     let fluree = Arc::clone(&state_inner.fluree);
-                    tokio::spawn(async move {
-                        while let Some((ledger_id, cid)) = rx.recv().await {
-                            if let Err(err) = fluree.content_store(&ledger_id).release(&cid).await {
-                                tracing::warn!(
-                                    %ledger_id,
-                                    %cid,
-                                    error = %err,
-                                    "failed to release envelope from content store"
-                                );
+                    let cancel = tokio_util::sync::CancellationToken::new();
+                    let cancel_for_task = cancel.clone();
+                    let join = tokio::spawn(async move {
+                        loop {
+                            tokio::select! {
+                                biased;
+                                _ = cancel_for_task.cancelled() => break,
+                                msg = rx.recv() => {
+                                    match msg {
+                                        Some((ledger_id, cid)) => {
+                                            release_one(&fluree, &ledger_id, &cid).await;
+                                        }
+                                        // Sender side closed (Raft adapter
+                                        // gone): no more releases possible.
+                                        None => return,
+                                    }
+                                }
                             }
                         }
-                    })
+                        // Shutdown drain: between the last `recv` and the
+                        // cancel signal the adapter may have buffered
+                        // releases for evictions / admin clears applied
+                        // moments before stop. Drop them and the
+                        // envelopes leak in the content store with no
+                        // path to GC; pull whatever's buffered and
+                        // release it before the task exits.
+                        while let Ok((ledger_id, cid)) = rx.try_recv() {
+                            release_one(&fluree, &ledger_id, &cid).await;
+                        }
+                    });
+                    (join, cancel)
                 })
             }
             None => None,
@@ -657,5 +695,20 @@ impl FlureeServerBuilder {
 impl Default for FlureeServerBuilder {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// One-shot release of a `(ledger_id, content_id)` pair from the
+/// content store. Pulled out so the steady-state release loop and
+/// the shutdown drain don't drift apart on error handling.
+#[cfg(feature = "raft")]
+async fn release_one(fluree: &fluree_db_api::Fluree, ledger_id: &str, cid: &fluree_db_core::ContentId) {
+    if let Err(err) = fluree.content_store(ledger_id).release(cid).await {
+        tracing::warn!(
+            %ledger_id,
+            %cid,
+            error = %err,
+            "failed to release envelope from content store"
+        );
     }
 }
