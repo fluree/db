@@ -483,21 +483,13 @@ impl FlureeServerBuilder {
         // uses whatever the storage backend implies.
         #[cfg(feature = "raft")]
         let (fluree, cache_stats_handle) = if let Some(raft_ns) = raft_nameservice.as_ref() {
-            // RaftNameService satisfies both LifecycleNameService
-            // (NameServiceLookup + LedgerLifecycle + BranchLifecycle)
-            // and IndexingNameService (NameServiceLookup +
-            // IndexPublisher), so both Lifecycle fields hold a
-            // clone of the same Arc. Method-form `.clone()`
-            // returns `Arc<RaftNameService>` which each let
-            // binding coerces to its target trait object.
-            let lifecycle: std::sync::Arc<dyn fluree_db_api::LifecycleNameService> =
+            // RaftNameService satisfies the full
+            // `NameServicePublisher` surface (refs, admin reindex,
+            // status / config push, graph-source publish / index /
+            // retract), so it slots directly into ReadWrite.
+            let publisher: std::sync::Arc<dyn fluree_db_nameservice::NameServicePublisher> =
                 raft_ns.clone();
-            let indexing: std::sync::Arc<dyn fluree_db_nameservice::IndexingNameService> =
-                raft_ns.clone();
-            let ns_mode = fluree_db_api::NameServiceMode::Lifecycle {
-                lifecycle,
-                indexing,
-            };
+            let ns_mode = fluree_db_api::NameServiceMode::ReadWrite(publisher);
             state::build_fluree_with_nameservice(&self.config, ns_mode).await?
         } else {
             state::build_default_fluree(&self.config).await?

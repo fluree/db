@@ -298,41 +298,22 @@ pub use fluree_graph_json_ld::FirstLineContextPolicy;
 // Re-export the combined read-write nameservice trait from the nameservice crate.
 pub use fluree_db_nameservice::NameServicePublisher;
 
-/// Nameservice surface for record-lifecycle mutations: reads,
-/// ledger-level lifecycle ([`LedgerLifecycle`]), and branch-level
-/// lifecycle ([`BranchLifecycle`]). Pairs with [`IndexingNameService`]
-/// (lookup + [`IndexPublisher`]) on
-/// [`NameServiceMode::Lifecycle`] — the two surfaces are kept
-/// separate because publishing an index head isn't part of a
-/// record's lifecycle, even though one implementation may back both.
-pub trait LifecycleNameService: NameServiceLookup + LedgerLifecycle + BranchLifecycle {}
-impl<T> LifecycleNameService for T where
-    T: NameServiceLookup + LedgerLifecycle + BranchLifecycle + ?Sized
-{
-}
-
 /// Runtime nameservice selection.
 ///
-/// Encodes whether this Fluree instance has full read-write nameservice access,
-/// a lifecycle + indexing surface (e.g. a Raft-replicated nameservice),
-/// or is a read-only proxy that forwards writes to a remote transaction server.
+/// Encodes whether this Fluree instance has full read-write
+/// nameservice access (file/memory/S3/DynamoDB *or* the
+/// Raft-replicated nameservice) or is a read-only proxy that
+/// forwards writes to a remote transaction server.
 ///
 /// Analogous to [`StorageBackend`] for storage.
 #[derive(Clone)]
 pub enum NameServiceMode {
-    /// Full read-write nameservice (File, Memory, S3, DynamoDB).
+    /// Full read-write nameservice. Every backend that satisfies
+    /// [`NameServicePublisher`] lives here — file, memory, S3,
+    /// DynamoDB, and the Raft-replicated nameservice.
     ReadWrite(Arc<dyn NameServicePublisher>),
-    /// Nameservice that supports record lifecycle and index
-    /// publishing but not the full [`NameServicePublisher`] surface
-    /// (no commit publishing, graph sources, status, config, refs).
-    /// The two arcs are independent in principle; one implementation
-    /// may satisfy both and hand the same `Arc` to each field.
-    Lifecycle {
-        lifecycle: Arc<dyn LifecycleNameService>,
-        indexing: Arc<dyn IndexingNameService>,
-    },
-    /// Read-only proxy nameservice.
-    /// Writes are forwarded to the remote transaction server via HTTP.
+    /// Read-only proxy nameservice. Writes are forwarded to the
+    /// remote transaction server via HTTP.
     ReadOnly(Arc<dyn NameServiceLookup>),
 }
 
@@ -340,14 +321,6 @@ impl std::fmt::Debug for NameServiceMode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::ReadWrite(ns) => f.debug_tuple("ReadWrite").field(ns).finish(),
-            Self::Lifecycle {
-                lifecycle,
-                indexing,
-            } => f
-                .debug_struct("Lifecycle")
-                .field("lifecycle", lifecycle)
-                .field("indexing", indexing)
-                .finish(),
             Self::ReadOnly(ns) => f.debug_tuple("ReadOnly").field(ns).finish(),
         }
     }
@@ -358,7 +331,6 @@ impl NameServiceMode {
     pub fn reader(&self) -> &dyn NameServiceLookup {
         match self {
             Self::ReadWrite(ns) => ns.as_ref(),
-            Self::Lifecycle { lifecycle, .. } => lifecycle.as_ref(),
             Self::ReadOnly(ns) => ns.as_ref(),
         }
     }
@@ -372,21 +344,16 @@ impl NameServiceMode {
                 let cloned: Arc<dyn NameServicePublisher> = Arc::clone(ns);
                 cloned
             }
-            Self::Lifecycle { lifecycle, .. } => {
-                let cloned: Arc<dyn LifecycleNameService> = Arc::clone(lifecycle);
-                cloned
-            }
             Self::ReadOnly(ns) => Arc::clone(ns),
         }
     }
 
-    /// Get the full read-write nameservice surface. Only available
-    /// for [`Self::ReadWrite`]; [`Self::Lifecycle`] satisfies a
-    /// narrower set of surfaces and returns `None` here.
+    /// Get the full read-write nameservice surface. `None` for
+    /// [`Self::ReadOnly`].
     pub fn publisher(&self) -> Option<&dyn NameServicePublisher> {
         match self {
             Self::ReadWrite(ns) => Some(ns.as_ref()),
-            Self::Lifecycle { .. } | Self::ReadOnly(_) => None,
+            Self::ReadOnly(_) => None,
         }
     }
 
@@ -397,55 +364,47 @@ impl NameServiceMode {
     pub fn publisher_arc(&self) -> Option<Arc<dyn NameServicePublisher>> {
         match self {
             Self::ReadWrite(ns) => Some(Arc::clone(ns)),
-            Self::Lifecycle { .. } | Self::ReadOnly(_) => None,
+            Self::ReadOnly(_) => None,
         }
     }
 
     /// Get the ledger-admin surface ([`LedgerLifecycle`] — init,
-    /// retract, purge). Available in [`Self::ReadWrite`] and
-    /// [`Self::Lifecycle`].
+    /// retract, purge). `None` for [`Self::ReadOnly`].
     pub fn ledger_admin(&self) -> Option<&dyn LedgerLifecycle> {
         match self {
             Self::ReadWrite(ns) => Some(ns.as_ref()),
-            Self::Lifecycle { lifecycle, .. } => Some(lifecycle.as_ref()),
             Self::ReadOnly(_) => None,
         }
     }
 
     /// Get the branch-admin surface ([`BranchLifecycle`] —
-    /// create_branch, drop_branch, reset_head). Available in
-    /// [`Self::ReadWrite`] and [`Self::Lifecycle`].
+    /// create_branch, drop_branch, reset_head). `None` for
+    /// [`Self::ReadOnly`].
     pub fn branch_admin(&self) -> Option<&dyn BranchLifecycle> {
         match self {
             Self::ReadWrite(ns) => Some(ns.as_ref()),
-            Self::Lifecycle { lifecycle, .. } => Some(lifecycle.as_ref()),
             Self::ReadOnly(_) => None,
         }
     }
 
     /// Get a cloned `Arc<dyn IndexingNameService>` covering this mode's
     /// indexing surface (`NameServiceLookup + IndexPublisher +
-    /// BranchLifecycle`). [`Self::ReadOnly`] returns `None` because a
-    /// proxy backend can't publish index heads.
+    /// BranchLifecycle`). `None` for [`Self::ReadOnly`].
     pub fn as_arc_indexing_nameservice(&self) -> Option<Arc<dyn IndexingNameService>> {
         match self {
             Self::ReadWrite(ns) => {
                 let cloned: Arc<dyn NameServicePublisher> = Arc::clone(ns);
                 Some(cloned)
             }
-            Self::Lifecycle { indexing, .. } => Some(Arc::clone(indexing)),
             Self::ReadOnly(_) => None,
         }
     }
 
-    /// Get the [`IndexPublisher`] surface. Available in
-    /// [`Self::ReadWrite`] and [`Self::Lifecycle`] (the latter via
-    /// its `indexing` field, which satisfies
-    /// [`IndexingNameService`]).
+    /// Get the [`IndexPublisher`] surface. `None` for
+    /// [`Self::ReadOnly`].
     pub fn index_publisher(&self) -> Option<&dyn IndexPublisher> {
         match self {
             Self::ReadWrite(ns) => Some(ns.as_ref()),
-            Self::Lifecycle { indexing, .. } => Some(indexing.as_ref()),
             Self::ReadOnly(_) => None,
         }
     }

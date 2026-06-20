@@ -2125,9 +2125,7 @@ mod tests {
         // Advance the nameservice past the cache: the helper now reports stale.
         let writable = match &ns_mode {
             crate::NameServiceMode::ReadWrite(arc) => arc,
-            crate::NameServiceMode::Lifecycle { .. } | crate::NameServiceMode::ReadOnly(_) => {
-                unreachable!()
-            }
+            crate::NameServiceMode::ReadOnly(_) => unreachable!(),
         };
         writable
             .publish_commit(
