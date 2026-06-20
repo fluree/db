@@ -199,6 +199,8 @@ impl Function {
             Function::Reverse => list::eval_reverse_string(args, row, ctx),
             Function::ListIndex => list::eval_list_index(args, row, ctx),
             Function::RelType => metadata::eval_rel_type(args, row, ctx),
+            Function::StartNode => metadata::eval_start_node(args, row, ctx),
+            Function::EndNode => metadata::eval_end_node(args, row, ctx),
             // List-returning only; no scalar value (handled by the
             // binding-producing path in `try_eval_to_binding`).
             Function::Tail

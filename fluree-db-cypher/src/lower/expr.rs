@@ -350,6 +350,8 @@ pub fn lower_expr<E: IriEncoder>(
                 "pathpairs" => Function::PathPairs,
                 "labels" => Function::Labels,
                 "type" => Function::RelType,
+                "startnode" => Function::StartNode,
+                "endnode" => Function::EndNode,
                 "keys" => Function::Keys,
                 "properties" => Function::Properties,
                 // Scalar string functions.

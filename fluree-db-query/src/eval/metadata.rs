@@ -575,3 +575,67 @@ pub fn eval_rel_type<R: RowAccess>(
     let name = cypher_name_from_sid(pred_sid, ctx)?;
     Ok(name.map(|s| ComparableValue::String(Arc::from(s))))
 }
+
+/// `startNode(rel)` → the relationship's start node ref (`f:reifiesSubject`).
+pub fn eval_start_node<R: RowAccess>(
+    args: &[Expression],
+    row: &R,
+    ctx: Option<&ExecutionContext<'_>>,
+) -> Result<Option<ComparableValue>> {
+    eval_rel_endpoint(
+        args,
+        row,
+        ctx,
+        fluree_vocab::reifies_iris::SUBJECT,
+        "reifiesSubject",
+        "startNode",
+    )
+}
+
+/// `endNode(rel)` → the relationship's end node ref (`f:reifiesObject`).
+pub fn eval_end_node<R: RowAccess>(
+    args: &[Expression],
+    row: &R,
+    ctx: Option<&ExecutionContext<'_>>,
+) -> Result<Option<ComparableValue>> {
+    eval_rel_endpoint(
+        args,
+        row,
+        ctx,
+        fluree_vocab::reifies_iris::OBJECT,
+        "reifiesObject",
+        "endNode",
+    )
+}
+
+/// Shared body for `startNode` / `endNode`: read the named `f:reifies*` ref off
+/// the reifier and return it as a node ref. Mirrors [`eval_rel_type`] but yields
+/// the node SID (a ref) rather than a type-name string.
+fn eval_rel_endpoint<R: RowAccess>(
+    args: &[Expression],
+    row: &R,
+    ctx: Option<&ExecutionContext<'_>>,
+    reifies_iri: &str,
+    reifies_local: &'static str,
+    fn_name: &str,
+) -> Result<Option<ComparableValue>> {
+    let arg = arity1(args, fn_name)?;
+    let Some(ctx) = ctx else {
+        return Ok(None);
+    };
+    let Some(binding) = resolve_arg_binding(arg, row, Some(ctx))? else {
+        return Ok(None);
+    };
+    let Some(reifier) = binding_subject_sid(&binding, ctx)? else {
+        return Ok(None);
+    };
+
+    ctx.tracker.consume_fuel(1)?;
+
+    let reifies = ctx
+        .active_snapshot
+        .encode_iri(reifies_iri)
+        .unwrap_or_else(|| Sid::new(fluree_vocab::namespaces::FLUREE_DB, reifies_local));
+    let refs = lookup_ref_objects(ctx, &reifier, &reifies)?;
+    Ok(refs.first().map(|s| ComparableValue::Sid(s.clone())))
+}

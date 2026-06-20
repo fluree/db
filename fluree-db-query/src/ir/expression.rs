@@ -942,6 +942,10 @@ pub enum Function {
     Labels,
     /// `type(rel)` — relationship type string from `f:reifiesPredicate`.
     RelType,
+    /// `startNode(rel)` / `endNode(rel)` — the relationship's start / end node
+    /// ref, from `f:reifiesSubject` / `f:reifiesObject` on the reifier.
+    StartNode,
+    EndNode,
     /// `keys(node)` — the list of a node's data-property keys (local names),
     /// excluding `rdf:type`, the `f:reifies*` bundle, and relationship (ref)
     /// edges. Produces a [`crate::binding::Binding::List`] of strings.

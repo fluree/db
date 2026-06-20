@@ -1150,6 +1150,43 @@ async fn cypher_type_returns_named_relationship_type() {
 }
 
 #[tokio::test]
+async fn cypher_relationship_value_semantics() {
+    // A bound relationship variable `r` (the reified edge) supports the full
+    // relationship-value surface: type(r), startNode(r)/endNode(r), r.prop, and
+    // properties(r).
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = genesis_ledger(&fluree, "it/cypher:rel-value");
+    let l = fluree
+        .transact_cypher(
+            l,
+            r#"CREATE (a:Person {name: "Alice"})-[:RATED {stars: 5}]->(m:Movie {title: "Inception"})"#,
+        )
+        .await
+        .expect("seed")
+        .ledger;
+    let db = graphdb_from_ledger(&l);
+
+    let cj = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (a:Person)-[r:RATED]->(m:Movie)
+               RETURN type(r) AS t, r.stars AS stars, properties(r) AS props,
+                      startNode(r) AS sn, endNode(r) AS en, a AS aa, m AS mm"#,
+        )
+        .await
+        .expect("relationship value query")
+        .to_cypher_json_async(db.as_graph_db_ref())
+        .await
+        .expect("cypher json");
+    let row = &cj["results"][0]["data"][0]["row"];
+    assert_eq!(row[0], json!("RATED"), "type(r): {cj}");
+    assert_eq!(row[1], json!(5), "r.stars: {cj}");
+    assert_eq!(row[2], json!({"stars": 5}), "properties(r): {cj}");
+    assert_eq!(row[3], row[5], "startNode(r) == a: {cj}");
+    assert_eq!(row[4], row[6], "endNode(r) == m: {cj}");
+}
+
+#[tokio::test]
 async fn cypher_order_by_property_accessor_grouping_key() {
     // ORDER BY a grouping key written as a property accessor (`f.id`, not its
     // alias) must work under aggregation — it should behave like ORDER BY the
