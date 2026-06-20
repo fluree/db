@@ -1634,6 +1634,37 @@ mod tests {
     }
 
     #[test]
+    fn rel_eq_hash_contract() {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let hash = |b: &Binding| {
+            let mut h = DefaultHasher::new();
+            b.hash(&mut h);
+            h.finish()
+        };
+        let (s, p, e) = (Sid::new(1, "a"), Sid::new(2, "knows"), Sid::new(1, "b"));
+        let rel = |reifier: Option<Sid>| Binding::Rel {
+            start: s.clone(),
+            predicate: p.clone(),
+            end: e.clone(),
+            reifier,
+        };
+        // Plain edges with the same SPO are equal and hash equal.
+        assert_eq!(rel(None), rel(None));
+        assert_eq!(hash(&rel(None)), hash(&rel(None)));
+        // Same reifier → equal + hash equal (regardless of SPO comparison path).
+        let r1 = Sid::new(9, "r1");
+        assert_eq!(rel(Some(r1.clone())), rel(Some(r1.clone())));
+        assert_eq!(hash(&rel(Some(r1.clone()))), hash(&rel(Some(r1.clone()))));
+        // Different reifiers (parallel relationships) → distinct; the Eq/Hash
+        // contract holds (unequal values may hash equal, but equal must not hash
+        // differently — checked above; here we assert the distinctness).
+        assert_ne!(rel(Some(r1.clone())), rel(Some(Sid::new(9, "r2"))));
+        // A reified rel is never equal to a plain rel with the same SPO.
+        assert_ne!(rel(Some(r1)), rel(None));
+    }
+
+    #[test]
     fn test_binding_from_object_ref() {
         let sid = test_sid();
         let binding = Binding::from_object(FlakeValue::Ref(sid.clone()), xsd_long());
