@@ -329,9 +329,7 @@ fn lower_var_length_rel<E: IriEncoder>(
         ));
     }
     if rel.types.is_empty() {
-        return Err(LowerError::unsupported(
-            "untyped variable-length paths (`-[*m..n]->`) are deferred; name a relationship type",
-        ));
+        return lower_untyped_var_length_rel(ctx, left, rel, right, out);
     }
 
     let length = rel
@@ -438,6 +436,73 @@ fn lower_var_length_rel<E: IriEncoder>(
             Ok(())
         }
     }
+}
+
+/// Lower an **untyped** variable-length relationship `-[*m..n]->` (no relationship
+/// type named). This maps to a *wildcard* transitive `PropertyPathPattern`: the
+/// operator follows any node→node edge per hop (skipping `rdf:type` and the
+/// `f:reifies*` reifier bundle, and ignoring data properties since only `Ref`
+/// objects are followed). Bounds `m..n` become the path's `min_hops`/`max_hops`.
+///
+/// Undirected (`-[*]-`) is rejected — the transitive operator traverses a single
+/// direction (the bound endpoint drives forward/backward). A type alternation
+/// cannot occur here (there are no types).
+fn lower_untyped_var_length_rel<E: IriEncoder>(
+    ctx: &mut LoweringContext<'_, E>,
+    left: &NodePattern,
+    rel: &RelPattern,
+    right: &NodePattern,
+    out: &mut Vec<Pattern>,
+) -> Result<()> {
+    if matches!(rel.direction, Direction::Either) {
+        return Err(LowerError::unsupported(
+            "undirected untyped variable-length paths (`-[*m..n]-`) are deferred; give a \
+             direction (`-[*m..n]->` or `<-[*m..n]-`)",
+        ));
+    }
+
+    let length = rel
+        .length
+        .as_ref()
+        .expect("caller checked length.is_some()");
+    let lo = length.min.unwrap_or(1);
+    let hi = length.max; // None = unbounded
+    if let Some(hi) = hi {
+        if hi < lo {
+            return Err(LowerError::unsupported(
+                "variable-length path upper bound must be ≥ the lower bound",
+            ));
+        }
+        if hi > MAX_BOUNDED_HOPS {
+            return Err(LowerError::unsupported(
+                "bounded variable-length paths above 16 hops are not supported; use an \
+                 unbounded `*` for deeper traversal",
+            ));
+        }
+    }
+
+    let left_ref = lookup_node_ref(ctx, left);
+    let right_ref = lookup_node_ref(ctx, right);
+    let (s, o) = match rel.direction {
+        Direction::Outgoing => (left_ref, right_ref),
+        Direction::Incoming => (right_ref, left_ref),
+        Direction::Either => unreachable!(),
+    };
+
+    // `*` / `*1..` are one-or-more (exclude the start); `*0..` is zero-or-more.
+    let modifier = if lo == 0 {
+        PathModifier::ZeroOrMore
+    } else {
+        PathModifier::OneOrMore
+    };
+    out.push(Pattern::PropertyPath(PropertyPathPattern::new_wildcard(
+        s,
+        modifier,
+        Some(lo),
+        hi,
+        o,
+    )));
+    Ok(())
 }
 
 /// Build a `k`-hop chain from `s` to `o` through `k - 1` fresh intermediate

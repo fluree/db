@@ -1467,6 +1467,118 @@ async fn transact_cypher_detach_delete_works_on_indexed_data() {
         .await;
 }
 
+/// A mixed-type relationship chain Alice -KNOWS-> Bob -FOLLOWS-> Carol -KNOWS->
+/// Dave, every node a `:Person` with a `name` data property. Returns the ledger.
+async fn untyped_path_chain(fluree: &support::MemoryFluree, name: &str) -> support::MemoryLedger {
+    let l = genesis_ledger(fluree, name);
+    fluree
+        .transact_cypher(
+            l,
+            r#"CREATE (a:Person {name: "Alice"})-[:KNOWS]->(b:Person {name: "Bob"}),
+                      (b)-[:FOLLOWS]->(c:Person {name: "Carol"}),
+                      (c)-[:KNOWS]->(d:Person {name: "Dave"})"#,
+        )
+        .await
+        .expect("build chain")
+        .ledger
+}
+
+async fn cypher_names(
+    fluree: &support::MemoryFluree,
+    l: &support::MemoryLedger,
+    q: &str,
+) -> JsonValue {
+    let db = graphdb_from_ledger(l);
+    fluree
+        .query_cypher(&db, q)
+        .await
+        .expect("query")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld")
+}
+
+#[tokio::test]
+async fn cypher_untyped_path_bounded_follows_mixed_edge_types() {
+    // `-[*1..2]->` from Alice follows KNOWS then FOLLOWS (mixed types), reaching
+    // Bob (1 hop) and Carol (2 hops) — NOT Dave (3 hops, over the cap). Data
+    // properties (`name`), `rdf:type` (the `:Person` class), and the reifier
+    // sidecar are not edges, so they are never traversed.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = untyped_path_chain(&fluree, "it/cypher:untyped-bounded").await;
+    let rows = cypher_names(
+        &fluree,
+        &l,
+        r#"MATCH (a:Person {name: "Alice"})-[*1..2]->(x) RETURN x.name AS n ORDER BY n"#,
+    )
+    .await;
+    assert_eq!(rows, json!([["Bob"], ["Carol"]]), "1..2 hops: {rows}");
+}
+
+#[tokio::test]
+async fn cypher_untyped_path_unbounded_reaches_whole_chain() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = untyped_path_chain(&fluree, "it/cypher:untyped-unbounded").await;
+    let rows = cypher_names(
+        &fluree,
+        &l,
+        r#"MATCH (a:Person {name: "Alice"})-[*]->(x) RETURN x.name AS n ORDER BY n"#,
+    )
+    .await;
+    assert_eq!(
+        rows,
+        json!([["Bob"], ["Carol"], ["Dave"]]),
+        "unbounded reaches the whole chain: {rows}"
+    );
+}
+
+#[tokio::test]
+async fn cypher_untyped_path_lower_bound_excludes_near_nodes() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = untyped_path_chain(&fluree, "it/cypher:untyped-lo").await;
+    // `*2..3` from Alice: Carol (2) and Dave (3), but NOT Bob (1 hop).
+    let rows = cypher_names(
+        &fluree,
+        &l,
+        r#"MATCH (a:Person {name: "Alice"})-[*2..3]->(x) RETURN x.name AS n ORDER BY n"#,
+    )
+    .await;
+    assert_eq!(rows, json!([["Carol"], ["Dave"]]), "2..3 hops: {rows}");
+}
+
+#[tokio::test]
+async fn cypher_untyped_path_single_hop_excludes_rdf_type_class() {
+    // Exactly one hop from Alice is just her relationship target (Bob). If the
+    // wildcard scan followed `rdf:type` (a Ref to the `Person` class) it would
+    // also surface the class node — proving the reserved-predicate exclusion.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = untyped_path_chain(&fluree, "it/cypher:untyped-1hop").await;
+    let db = graphdb_from_ledger(&l);
+    let count = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (a:Person {name: "Alice"})-[*1..1]->(x) RETURN x"#,
+        )
+        .await
+        .expect("query")
+        .row_count();
+    assert_eq!(count, 1, "exactly one 1-hop target (Bob), not the class");
+}
+
+#[tokio::test]
+async fn cypher_untyped_path_incoming_direction() {
+    // `<-[*1..2]-` into Dave: Carol (1 back) and Bob (2 back), not Alice (3).
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = untyped_path_chain(&fluree, "it/cypher:untyped-incoming").await;
+    let rows = cypher_names(
+        &fluree,
+        &l,
+        r#"MATCH (a:Person {name: "Dave"})<-[*1..2]-(x) RETURN x.name AS n ORDER BY n"#,
+    )
+    .await;
+    assert_eq!(rows, json!([["Bob"], ["Carol"]]), "incoming 1..2: {rows}");
+}
+
 #[tokio::test]
 async fn transact_cypher_merge_creates_then_is_a_noop() {
     // MERGE = find-or-create: the first run creates the node, the second run

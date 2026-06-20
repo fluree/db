@@ -117,6 +117,19 @@ MATCH (a:Person {name: "Alice"})-[:KNOWS*1..3]->(b:Person)
 RETURN DISTINCT b.name
 ```
 
+Untyped traversal — follow **any** relationship type per hop (handy for "who is
+reachable from Alice within 3 hops, over any edge"):
+
+```cypher
+MATCH (a:Person {name: "Alice"})-[*1..3]->(b:Person)
+RETURN DISTINCT b.name
+```
+
+Untyped paths follow only node→node relationships — they skip data properties,
+`:Label` membership, and the edge-annotation sidecar — and use reachability
+semantics (each node reachable within the hop range). Give the path a direction
+(`-[*]->` or `<-[*]-`); undirected untyped paths aren't supported.
+
 Shortest path between two people, and its length:
 
 ```cypher

@@ -169,6 +169,14 @@ ORDER BY / SKIP / LIMIT
   listed type per hop (LDBC IC12's
   `[:HAS_TYPE|IS_SUBCLASS_OF*0..]`). Bounded alternation
   (`-[:A|B*1..3]->`) is still deferred — use the unbounded form.
+- **Untyped** variable-length paths `-[*]->`, `-[*m..n]->` (no relationship
+  type): a *wildcard* transitive path that follows **any** node→node edge per
+  hop — excluding `rdf:type` (its object is a class, not a node) and the
+  `f:reifies*` reifier bundle, and ignoring data properties (only node-valued
+  edges are followed). Bounds become the path's `min_hops`/`max_hops`. These use
+  **reachability** semantics (each node reachable within the hop range, by
+  shortest path — not path enumeration or trail semantics). A direction is
+  required; undirected untyped (`-[*]-`) is deferred.
 - Undirected relationships `-[:T]-` (forward ∪ reverse `Union`).
 - Path finding: `MATCH p = shortestPath((a)-[:T*]-(b))` and
   `allShortestPaths(...)`. Anchored (both endpoints bound by a
@@ -332,9 +340,10 @@ produces a clear error rather than a silent wrong answer.
 - Free path values `MATCH p = (...)` without a `shortestPath` /
   `allShortestPaths` wrapper.
 - Binding a relationship variable to a variable-length path (`-[r:T*]->`).
-- Untyped variable-length paths (`-[*m..n]->` — name a type); zero-length bounded
-  paths (`*0..M` — use `*1..M`); property filters on a variable-length or
-  shortestPath relationship.
+- Undirected untyped variable-length paths (`-[*m..n]-` — give a direction);
+  zero-length *typed* bounded paths (`-[:T*0..M]->` — use `*1..M`); bounded type
+  alternation (`-[:A|B*1..3]->` — use the unbounded form); property filters on a
+  variable-length or shortestPath relationship.
 
 **Functions**
 

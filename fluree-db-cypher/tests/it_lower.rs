@@ -5,7 +5,8 @@
 use std::collections::HashMap;
 
 use fluree_db_cypher::{lower_cypher, lower_cypher_with_context, parse_cypher, LoweringContext};
-use fluree_db_query::ir::{Function, Pattern, Ref, Term};
+use fluree_db_query::ir::path::PathModifier;
+use fluree_db_query::ir::{Function, Pattern, PropertyPathPattern, Ref, Term};
 use fluree_db_query::parse::encode::NoEncoder;
 use fluree_db_query::var_registry::VarRegistry;
 
@@ -196,6 +197,68 @@ fn bounded_variable_length_lowers_to_union_of_chains() {
     assert_eq!(
         filters, 2,
         "the 2- and 3-hop chains carry a distinctness filter"
+    );
+}
+
+fn find_path(q: &fluree_db_query::ir::Query) -> &PropertyPathPattern {
+    q.patterns
+        .iter()
+        .find_map(|p| match p {
+            Pattern::PropertyPath(pp) => Some(pp),
+            _ => None,
+        })
+        .expect("expected a PropertyPath pattern")
+}
+
+#[test]
+fn untyped_unbounded_lowers_to_wildcard_path() {
+    // `-[*]->` (no type) → a wildcard transitive path, one-or-more.
+    let pp = {
+        let q = lower("MATCH (a:Person)-[*]->(b) RETURN b");
+        let pp = find_path(&q);
+        assert!(pp.wildcard, "wildcard predicate set");
+        assert!(pp.predicates.is_empty(), "no concrete predicates");
+        assert_eq!(pp.modifier, PathModifier::OneOrMore);
+        assert_eq!(pp.min_hops, Some(1));
+        assert_eq!(pp.max_hops, None);
+        pp.effective_min_hops()
+    };
+    assert_eq!(pp, 1);
+}
+
+#[test]
+fn untyped_bounded_lowers_to_wildcard_path_with_bounds() {
+    // `-[*1..3]->` → a wildcard path carrying the hop bounds (NOT a UNION of
+    // chains — the chain form can't exclude data properties / rdf:type).
+    let q = lower("MATCH (a:Person)-[*1..3]->(b) RETURN b");
+    let pp = find_path(&q);
+    assert!(pp.wildcard);
+    assert_eq!(pp.modifier, PathModifier::OneOrMore);
+    assert_eq!(pp.min_hops, Some(1));
+    assert_eq!(pp.max_hops, Some(3));
+}
+
+#[test]
+fn untyped_zero_or_more_bounded() {
+    // `*0..2` → zero-or-more (includes the start), capped at 2 hops.
+    let q = lower("MATCH (a:Person)-[*0..2]->(b) RETURN b");
+    let pp = find_path(&q);
+    assert!(pp.wildcard);
+    assert_eq!(pp.modifier, PathModifier::ZeroOrMore);
+    assert_eq!(pp.min_hops, Some(0));
+    assert_eq!(pp.max_hops, Some(2));
+}
+
+#[test]
+fn untyped_undirected_is_rejected() {
+    let out = parse_cypher("MATCH (a:Person)-[*1..3]-(b) RETURN b");
+    assert!(!out.has_errors(), "parse should accept it");
+    let ast = out.ast.unwrap();
+    let encoder = NoEncoder;
+    let mut vars = VarRegistry::new();
+    assert!(
+        lower_cypher(&ast, &encoder, &mut vars).is_err(),
+        "undirected untyped variable-length path should be rejected"
     );
 }
 

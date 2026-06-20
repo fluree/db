@@ -26,10 +26,24 @@ pub struct PropertyPathPattern {
     /// Predicate(s) to traverse, all resolved to Sids. A single entry is the
     /// ordinary `p*` / `p+`; multiple entries are an alternation-transitive
     /// path `(a|b|…)*` — the closure follows an edge of ANY listed predicate at
-    /// each hop (SPARQL `(a|b)*`, Cypher `[:A|B*]`). Never empty.
+    /// each hop (SPARQL `(a|b)*`, Cypher `[:A|B*]`). Empty **only** when
+    /// `wildcard` is set (an untyped Cypher path).
     pub predicates: Vec<Sid>,
+    /// Wildcard predicate (untyped Cypher variable-length path `-[*]->`): follow
+    /// **any** node→node edge at each hop instead of a fixed predicate set. The
+    /// traversal still only follows `Ref` objects (so data properties are
+    /// excluded) and additionally skips the reserved predicates `rdf:type` and
+    /// the `f:reifies*` reifier bundle, so it walks genuine relationships only.
+    /// When set, `predicates` is empty.
+    pub wildcard: bool,
     /// Path modifier (+ or *)
     pub modifier: PathModifier,
+    /// Minimum hop count (Cypher `*min..`). `None` falls back to the modifier
+    /// (`*` = 0, `+` = 1). Used by bounded untyped paths (`-[*1..3]->`).
+    pub min_hops: Option<u32>,
+    /// Maximum hop count (Cypher `*..max`). `None` = unbounded (subject to the
+    /// operator's safety cap).
+    pub max_hops: Option<u32>,
     /// Object ref (Var or Sid — literals not allowed)
     pub object: Ref,
 }
@@ -40,7 +54,10 @@ impl PropertyPathPattern {
         Self {
             subject,
             predicates: vec![predicate],
+            wildcard: false,
             modifier,
+            min_hops: None,
+            max_hops: None,
             object,
         }
     }
@@ -58,20 +75,57 @@ impl PropertyPathPattern {
         Self {
             subject,
             predicates,
+            wildcard: false,
             modifier,
+            min_hops: None,
+            max_hops: None,
+            object,
+        }
+    }
+
+    /// Create a wildcard (untyped) transitive path — follow any node→node edge
+    /// per hop, optionally bounded to `[min_hops, max_hops]`. `modifier` carries
+    /// the zero-vs-one lower bound when `min_hops` is `None` (`*` includes the
+    /// start node, `+` does not).
+    pub fn new_wildcard(
+        subject: Ref,
+        modifier: PathModifier,
+        min_hops: Option<u32>,
+        max_hops: Option<u32>,
+        object: Ref,
+    ) -> Self {
+        Self {
+            subject,
+            predicates: Vec::new(),
+            wildcard: true,
+            modifier,
+            min_hops,
+            max_hops,
             object,
         }
     }
 
     /// The single traversed predicate, if this path has exactly one — used by
     /// count/scan fast paths that only handle the single-predicate shape.
-    /// Returns `None` for an alternation path so callers fall back to the
-    /// general traversal operator.
+    /// Returns `None` for an alternation or wildcard path so callers fall back
+    /// to the general traversal operator.
     pub fn single_predicate(&self) -> Option<&Sid> {
+        if self.wildcard {
+            return None;
+        }
         match self.predicates.as_slice() {
             [p] => Some(p),
             _ => None,
         }
+    }
+
+    /// The effective minimum hop count: explicit `min_hops`, else the modifier
+    /// default (`*` = 0, `+` = 1).
+    pub fn effective_min_hops(&self) -> u32 {
+        self.min_hops.unwrap_or(match self.modifier {
+            PathModifier::ZeroOrMore => 0,
+            PathModifier::OneOrMore => 1,
+        })
     }
 
     fn positional_vars(&self) -> Vec<VarId> {
