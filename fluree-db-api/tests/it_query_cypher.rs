@@ -1600,6 +1600,54 @@ async fn cypher_untyped_path_unbounded_lower_bound_above_one_is_rejected() {
 }
 
 #[tokio::test]
+async fn cypher_untyped_path_revisit_intermediate_bound_bound() {
+    // A->B, A->C, C->B, B->D. `*3..3` from A reaches D only via A-C-B-D — which
+    // requires revisiting B at depth 2. The bound-bound form (path_exists) must
+    // agree with the bound-unbound form: both find D.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = genesis_ledger(&fluree, "it/cypher:untyped-revisit");
+    let l = fluree
+        .transact_cypher(
+            l,
+            r#"CREATE (a:Person {name: "A"})-[:R]->(b:Person {name: "B"}),
+                      (a)-[:R]->(c:Person {name: "C"}),
+                      (c)-[:R]->(b),
+                      (b)-[:R]->(d:Person {name: "D"})"#,
+        )
+        .await
+        .expect("seed")
+        .ledger;
+    let db = graphdb_from_ledger(&l);
+
+    // Bound-unbound: who is exactly 3 hops from A? D (via A-C-B-D).
+    let rows = cypher_names(
+        &fluree,
+        &l,
+        r#"MATCH (a:Person {name: "A"})-[*3..3]->(x) RETURN x.name AS n ORDER BY n"#,
+    )
+    .await;
+    assert_eq!(
+        rows,
+        json!([["D"]]),
+        "*3..3 reaches D via the revisited B: {rows}"
+    );
+
+    // Bound-bound: the same with D bound must also see the path.
+    let exists = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (a:Person {name: "A"})-[*3..3]->(d:Person {name: "D"}) RETURN d"#,
+        )
+        .await
+        .expect("bound-bound")
+        .row_count();
+    assert_eq!(
+        exists, 1,
+        "bound-bound agrees with bound-unbound on the revisit path"
+    );
+}
+
+#[tokio::test]
 async fn cypher_untyped_path_lower_bound_excludes_near_nodes() {
     let fluree = FlureeBuilder::memory().build_memory();
     let l = untyped_path_chain(&fluree, "it/cypher:untyped-lo").await;
@@ -1776,6 +1824,42 @@ async fn cypher_map_value_reused_and_nested() {
         nested["results"][0]["data"][0]["row"][0],
         json!({"nums": [1, 2, 3], "info": {"city": "NYC"}}),
         "nested map + list: {nested}"
+    );
+}
+
+#[tokio::test]
+async fn cypher_properties_preserves_language_and_list_order() {
+    // properties(n) must keep a `rdf:langString`'s @language (visible in JSON-LD
+    // output) and render an `@list` property in its stored order.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/cypher:props-lang");
+    let txn = json!({
+        "@context": ctx(),
+        "@id": "ex:alice",
+        "@type": "ex:Person",
+        "ex:greeting": {"@value": "Bonjour", "@language": "fr"},
+        "ex:tags": {"@list": ["x", "y", "z"]},
+    });
+    let committed = fluree.insert(ledger0, &txn).await.expect("seed");
+    let db = graphdb_from_ledger(&committed.ledger);
+
+    let jl = fluree
+        .query_cypher(&db, r#"MATCH (n:Person) RETURN properties(n) AS p"#)
+        .await
+        .expect("query")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    let props = &jl[0][0];
+    assert_eq!(
+        props["greeting"],
+        json!({"@value": "Bonjour", "@language": "fr"}),
+        "langString keeps @language: {jl}"
+    );
+    assert_eq!(
+        props["tags"],
+        json!(["x", "y", "z"]),
+        "@list property keeps its order: {jl}"
     );
 }
 

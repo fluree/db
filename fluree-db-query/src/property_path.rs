@@ -629,6 +629,18 @@ impl PropertyPathOperator {
         start: &Sid,
         target: &Sid,
     ) -> Result<bool> {
+        // Bounded path: reuse the exact layered (node, depth) traversal the
+        // bound-unbound form uses, so the two never disagree — a node-only
+        // visited set here would suppress an intermediate that must be revisited
+        // at a later depth (e.g. A→B, A→C→B, B→D; `A-[*3..3]->D` via A-C-B-D).
+        if self.pattern.max_hops.is_some() {
+            return Ok(self
+                .traverse_bounded(ctx, start, true)
+                .await?
+                .iter()
+                .any(|reached| reached == target));
+        }
+
         // Zero-length path — only when the bounds admit depth 0.
         if self.pattern.modifier == PathModifier::ZeroOrMore
             && start == target

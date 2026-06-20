@@ -365,8 +365,19 @@ fn subject_all_flakes(ctx: &ExecutionContext<'_>, subject: &Sid) -> Result<Vec<F
     Ok(flakes)
 }
 
-/// One asserted data property: `(predicate, value, datatype, language)`.
-type DataProperty = (Sid, FlakeValue, Sid, Option<String>);
+/// One asserted data property: `(predicate, value, datatype, language, list
+/// index)`. The list index (`FlakeMeta::i`) orders the elements of a
+/// list-valued (`@list`) property; `None` for a plain scalar.
+type DataProperty = (Sid, FlakeValue, Sid, Option<String>, Option<i32>);
+
+/// The `Binding` for a property value, carrying its language tag when present
+/// (a `rdf:langString`) so map output keeps `@language`.
+fn property_value_binding(val: FlakeValue, dt: Sid, lang: Option<String>) -> Binding {
+    match lang {
+        Some(l) => Binding::lit_lang(val, l),
+        None => Binding::lit(val, dt),
+    }
+}
 
 /// Resolve a node's current **data** properties (literal-valued, non-reserved
 /// predicates) by replaying the subject's flakes in time order — assertions add,
@@ -387,11 +398,13 @@ fn subject_data_properties(ctx: &ExecutionContext<'_>, subject: &Sid) -> Result<
             continue;
         }
         let lang = flake.m.as_ref().and_then(|m| m.lang.clone());
+        let list_index = flake.m.as_ref().and_then(|m| m.i);
         let key = (
             flake.p.clone(),
             flake.o.clone(),
             flake.dt.clone(),
             lang.clone(),
+            list_index,
         );
         if flake.op {
             if !live.contains(&key) {
@@ -426,7 +439,7 @@ pub fn eval_keys_to_binding<R: RowAccess>(
     let props = subject_data_properties(ctx, &subject)?;
     let dt = xsd_string_sid(ctx);
     let mut names: Vec<String> = Vec::new();
-    for (pred, _, _, _) in &props {
+    for (pred, ..) in &props {
         if let Some(name) = cypher_name_from_sid(pred, ctx)? {
             if !names.contains(&name) {
                 names.push(name);
@@ -459,15 +472,19 @@ pub fn eval_properties_to_binding<R: RowAccess>(
     ctx.tracker.consume_fuel(1)?;
 
     let props = subject_data_properties(ctx, &subject)?;
-    // Group by key (local name), preserving first-seen order.
+    // Group by key (local name), preserving first-seen order. Each value keeps
+    // its list index so a list-valued property renders in `@list` order.
     let mut order: Vec<String> = Vec::new();
-    let mut grouped: HashMap<String, Vec<Binding>> = HashMap::new();
-    for (pred, val, dt, _lang) in props {
+    let mut grouped: HashMap<String, Vec<(Binding, Option<i32>)>> = HashMap::new();
+    for (pred, val, dt, lang, list_index) in props {
         let Some(name) = cypher_name_from_sid(&pred, ctx)? else {
             continue;
         };
-        let value = Binding::lit(val, dt);
-        grouped.entry(name.clone()).or_default().push(value);
+        let value = property_value_binding(val, dt, lang);
+        grouped
+            .entry(name.clone())
+            .or_default()
+            .push((value, list_index));
         if !order.contains(&name) {
             order.push(name);
         }
@@ -477,9 +494,11 @@ pub fn eval_properties_to_binding<R: RowAccess>(
         .map(|name| {
             let mut vals = grouped.remove(&name).unwrap_or_default();
             let value = if vals.len() == 1 {
-                vals.pop().expect("len == 1")
+                vals.pop().expect("len == 1").0
             } else {
-                Binding::List(vals)
+                // Order list elements by their stored index (stable for absent).
+                vals.sort_by_key(|(_, i)| i.unwrap_or(i32::MAX));
+                Binding::List(vals.into_iter().map(|(b, _)| b).collect())
             };
             (Arc::from(name.as_str()), value)
         })
