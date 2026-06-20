@@ -255,6 +255,17 @@ fn parse_primary(s: &mut TokenStream) -> Result<Expr, Diagnostic> {
             {
                 return parse_list_comprehension(s, start);
             }
+            // `[(a)-[:T]->(b) … | proj]` is a pattern comprehension. It starts
+            // with a node pattern `(`, but so does a parenthesized list element
+            // (`[(1 + 2)]`); the two are only distinguishable by trying to parse
+            // a pattern + `|`, so speculatively parse and backtrack on failure.
+            if matches!(s.peek_kind(), TokenKind::LParen) {
+                let mark = s.mark();
+                if let Ok(pc) = parse_pattern_comprehension(s, start) {
+                    return Ok(pc);
+                }
+                s.reset(mark);
+            }
             let mut items = Vec::new();
             if !matches!(s.peek_kind(), TokenKind::RBracket) {
                 loop {
@@ -522,6 +533,32 @@ fn parse_list_predicate(
             var,
             list,
             predicate,
+            span: start.union(end),
+        },
+    )))
+}
+
+/// `[pattern (WHERE filter)? | projection]` — the leading `[` is already eaten,
+/// and the caller has confirmed the next token is `(`. Returns `Err` (for the
+/// caller to backtrack) if it doesn't parse as a pattern comprehension.
+fn parse_pattern_comprehension(s: &mut TokenStream, start: SourceSpan) -> Result<Expr, Diagnostic> {
+    use crate::ast::PatternComprehensionExpr;
+    let pattern = parse_pattern(s)?;
+    let filter = if s.eat(&TokenKind::Where).is_some() {
+        Some(Box::new(parse_expr(s)?))
+    } else {
+        None
+    };
+    // The `|` projection is mandatory — it's what distinguishes a pattern
+    // comprehension from a parenthesized list element.
+    s.expect(&TokenKind::Pipe)?;
+    let projection = Box::new(parse_expr(s)?);
+    let end = s.expect(&TokenKind::RBracket)?;
+    Ok(Expr::PatternComprehension(Box::new(
+        PatternComprehensionExpr {
+            pattern,
+            filter,
+            projection,
             span: start.union(end),
         },
     )))

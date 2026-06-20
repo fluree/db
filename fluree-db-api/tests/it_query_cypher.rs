@@ -1743,6 +1743,81 @@ async fn cypher_row(
 }
 
 #[tokio::test]
+async fn cypher_pattern_comprehension() {
+    // `[(a)-[:KNOWS]->(b) | b.name]` — a correlated subquery collecting a
+    // projection per match, returned as a list per outer row.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = genesis_ledger(&fluree, "it/cypher:pattern-comp");
+    let l = fluree
+        .transact_cypher(
+            l,
+            r#"CREATE (a:Person {name: "Alice"})-[:KNOWS]->(b:Person {name: "Bob", age: 40}),
+                      (a)-[:KNOWS]->(c:Person {name: "Carol", age: 20})"#,
+        )
+        .await
+        .expect("seed")
+        .ledger;
+    let db = graphdb_from_ledger(&l);
+
+    // All of Alice's friends' names.
+    let cj = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (a:Person {name: "Alice"})
+               RETURN [(a)-[:KNOWS]->(b:Person) | b.name] AS friends"#,
+        )
+        .await
+        .expect("query")
+        .to_cypher_json_async(db.as_graph_db_ref())
+        .await
+        .expect("cypher json");
+    let mut friends: Vec<String> =
+        serde_json::from_value(cj["results"][0]["data"][0]["row"][0].clone()).expect("list");
+    friends.sort();
+    assert_eq!(
+        friends,
+        vec!["Bob".to_string(), "Carol".to_string()],
+        "{cj}"
+    );
+
+    // With an inner WHERE filter — only friends over 30.
+    let filtered = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (a:Person {name: "Alice"})
+               RETURN [(a)-[:KNOWS]->(b:Person) WHERE b.age > 30 | b.name] AS older"#,
+        )
+        .await
+        .expect("query")
+        .to_cypher_json_async(db.as_graph_db_ref())
+        .await
+        .expect("cypher json");
+    assert_eq!(
+        filtered["results"][0]["data"][0]["row"][0],
+        json!(["Bob"]),
+        "inner WHERE filters the comprehension: {filtered}"
+    );
+
+    // Nested in another function: size of the comprehension.
+    let count = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (a:Person {name: "Alice"})
+               RETURN size([(a)-[:KNOWS]->(b:Person) | b.name]) AS friendCount"#,
+        )
+        .await
+        .expect("query")
+        .to_cypher_json_async(db.as_graph_db_ref())
+        .await
+        .expect("cypher json");
+    assert_eq!(
+        count["results"][0]["data"][0]["row"][0],
+        json!(2),
+        "pattern comprehension nested in size(): {count}"
+    );
+}
+
+#[tokio::test]
 async fn cypher_map_projection() {
     // `n{.key}` selectors, a `key: expr` entry, and `n{.*}` (all properties).
     let fluree = FlureeBuilder::memory().build_memory();

@@ -279,6 +279,27 @@ pub fn lower_expr<E: IriEncoder>(
             }
             Ok(Expression::Map(entries))
         }
+        Expr::PatternComprehension(pc) => {
+            // A correlated subquery (like EXISTS): the inner pattern's existing
+            // variables correlate via the shared registry, new ones bind inside.
+            let mut patterns = lower_pattern(ctx, &pc.pattern)?;
+            if let Some(cond) = &pc.filter {
+                let mut filter_aux = Vec::new();
+                let filter = lower_expr(ctx, cond, &mut filter_aux)?;
+                patterns.extend(filter_aux);
+                patterns.push(Pattern::Filter(filter));
+            }
+            // The projection's auxiliary patterns (e.g. `b.name` property
+            // accessors) must run INSIDE the subquery so they resolve per match;
+            // the projection expression then reads the resulting vars.
+            let mut proj_aux = Vec::new();
+            let projection = lower_expr(ctx, &pc.projection, &mut proj_aux)?;
+            patterns.extend(proj_aux);
+            Ok(Expression::PatternComprehension {
+                patterns,
+                projection: Box::new(projection),
+            })
+        }
         Expr::Call(call) => {
             let name = call.name.to_ascii_lowercase();
             let args: std::result::Result<Vec<_>, _> =

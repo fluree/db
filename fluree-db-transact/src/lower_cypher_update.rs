@@ -769,9 +769,10 @@ impl<'a> CypherLowering<'a> {
             Expr::ListComprehension(_)
             | Expr::Reduce(_)
             | Expr::ListPredicate(_)
-            | Expr::MapProjection(_) => Err(LowerCypherError::unsupported(
-                "list comprehensions / reduce / list predicates / map projections in a write \
-                 MATCH WHERE are deferred",
+            | Expr::MapProjection(_)
+            | Expr::PatternComprehension(_) => Err(LowerCypherError::unsupported(
+                "list / pattern comprehensions, reduce, list predicates, and map projections in a \
+                 write MATCH WHERE are deferred",
             )),
             Expr::Case(_) | Expr::Exists(_, _, _) => Err(LowerCypherError::unsupported(
                 "CASE and EXISTS in write MATCH WHERE are deferred",

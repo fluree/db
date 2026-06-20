@@ -268,7 +268,9 @@ fn bool_predicate_var_usage(expr: &Expression) -> VarUsage {
         Expression::ListComprehension { .. }
         | Expression::Reduce { .. }
         | Expression::ListPredicate { .. }
-        | Expression::Member { .. } => VarUsage::Multiple,
+        | Expression::Member { .. }
+        | Expression::PatternComprehension { .. }
+        | Expression::Resolved(_) => VarUsage::Multiple,
     }
 }
 
@@ -359,7 +361,9 @@ fn analyze_bool_cache_inner(expr: &Expression, state: &mut impl Hasher) -> BoolC
         | Expression::ListComprehension { .. }
         | Expression::Reduce { .. }
         | Expression::ListPredicate { .. }
-        | Expression::Member { .. } => BoolCacheAnalysis {
+        | Expression::Member { .. }
+        | Expression::PatternComprehension { .. }
+        | Expression::Resolved(_) => BoolCacheAnalysis {
             expr_hash: state.finish(),
             vars: VarUsage::None,
             supported: false,

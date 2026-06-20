@@ -18,6 +18,16 @@ impl TokenStream {
         &self.tokens[self.pos]
     }
 
+    /// Snapshot the current position for speculative parsing.
+    pub fn mark(&self) -> usize {
+        self.pos
+    }
+
+    /// Restore a position captured by [`Self::mark`] (backtracking).
+    pub fn reset(&mut self, mark: usize) {
+        self.pos = mark;
+    }
+
     pub fn peek_kind(&self) -> &TokenKind {
         &self.tokens[self.pos].kind
     }

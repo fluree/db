@@ -161,6 +161,14 @@ both node elements (`x.name` scans the graph) and map elements
 (`row.email` for `[row IN $people | row.email]`). A null or non-list input
 yields null.
 
+A **pattern comprehension** collects a projection over a correlated pattern —
+e.g. each person with the list of their friends' names:
+
+```cypher
+MATCH (p:Person)
+RETURN p.name, [(p)-[:KNOWS]->(f:Person) WHERE f.age > 30 | f.name] AS adultFriends
+```
+
 ## Paths
 
 Variable-length traversal (name the relationship type):

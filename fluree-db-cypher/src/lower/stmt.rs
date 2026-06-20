@@ -530,7 +530,10 @@ fn expression_references_any(
             list, predicate, ..
         } => expression_references_any(list, vars) || expression_references_any(predicate, vars),
         Expression::Member { target, .. } => expression_references_any(target, vars),
-        Expression::Exists { .. } => false,
+        Expression::PatternComprehension { projection, .. } => {
+            expression_references_any(projection, vars)
+        }
+        Expression::Exists { .. } | Expression::Resolved(_) => false,
     }
 }
 
@@ -652,6 +655,9 @@ fn expr_has_aggregate(e: &Expr) -> bool {
         Expr::MapProjection(mp) => mp.selectors.iter().any(|sel| {
             matches!(sel, crate::ast::MapProjectionSelector::Literal(_, e) if expr_has_aggregate(e))
         }),
+        // A pattern comprehension is its own subquery scope — aggregates inside
+        // it don't bubble to the outer projection.
+        Expr::PatternComprehension(_) => false,
         Expr::Var(_) | Expr::Lit(_) | Expr::Param(_) | Expr::Case(_) | Expr::Exists(_, _, _) => {
             false
         }
@@ -766,6 +772,9 @@ fn extract_aggregates_inner<E: IriEncoder>(
             }
             Ok(())
         }
+        // A pattern comprehension is a self-contained subquery — its inner
+        // expressions must not have aggregates hoisted to the outer scope.
+        Expr::PatternComprehension(_) => Ok(()),
         Expr::Case(_) | Expr::Exists(_, _, _) => Err(LowerError::unsupported(
             "aggregates inside CASE / EXISTS are not supported in v1",
         )),
@@ -814,8 +823,9 @@ fn composite_references_grouping_value(e: &Expr) -> bool {
                 || composite_references_grouping_value(&r.list)
         }
         // A map projection reads the node's properties — a grouping value (like a
-        // bare property accessor).
-        Expr::MapProjection(_) => true,
+        // bare property accessor). A pattern comprehension correlates on outer
+        // (grouping) variables, so treat it the same.
+        Expr::MapProjection(_) | Expr::PatternComprehension(_) => true,
         Expr::Lit(_) | Expr::Param(_) | Expr::Case(_) | Expr::Exists(_, _, _) => false,
     }
 }

@@ -428,6 +428,12 @@ fn collect_alias_in_expr(e: &Expr, alias: &str, fields: &mut Vec<String>, bare: 
                 }
             }
         }
+        Expr::PatternComprehension(pc) => {
+            if let Some(f) = &pc.filter {
+                collect_alias_in_expr(f, alias, fields, bare);
+            }
+            collect_alias_in_expr(&pc.projection, alias, fields, bare);
+        }
         Expr::Lit(_) | Expr::Param(_) | Expr::Case(_) | Expr::Exists(_, _, _) => {}
     }
 }
@@ -600,6 +606,12 @@ fn rewrite_alias_in_expr_to_var<F: Fn(&str) -> String>(
                 }
             }
         }
+        Expr::PatternComprehension(pc) => {
+            if let Some(f) = &mut pc.filter {
+                rewrite_alias_in_expr_to_var(f, alias, col_var, bare_var);
+            }
+            rewrite_alias_in_expr_to_var(&mut pc.projection, alias, col_var, bare_var);
+        }
         Expr::Var(_) | Expr::Lit(_) | Expr::Param(_) | Expr::Case(_) | Expr::Exists(_, _, _) => {}
     }
 }
@@ -752,6 +764,12 @@ fn replace_alias_in_expr(
                 }
             }
             Ok(())
+        }
+        Expr::PatternComprehension(pc) => {
+            if let Some(f) = &mut pc.filter {
+                replace_alias_in_expr(f, alias, elem, pname)?;
+            }
+            replace_alias_in_expr(&mut pc.projection, alias, elem, pname)
         }
         Expr::Case(_) | Expr::Exists(_, _, _) | Expr::Var(_) | Expr::Lit(_) | Expr::Param(_) => {
             Ok(())
@@ -1019,6 +1037,12 @@ fn subst_expr(e: &mut Expr, p: &ParamMap) -> Result<(), ParamError> {
                 }
             }
             Ok(())
+        }
+        Expr::PatternComprehension(pc) => {
+            if let Some(f) = &mut pc.filter {
+                subst_expr(f, p)?;
+            }
+            subst_expr(&mut pc.projection, p)
         }
         Expr::Var(_) | Expr::Lit(_) => Ok(()),
     }

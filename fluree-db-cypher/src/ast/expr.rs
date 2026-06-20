@@ -59,6 +59,18 @@ pub enum Expr {
     /// Map projection `var{.key, .*, key: expr}` — build a map from a node/map
     /// variable's properties (boxed to keep `Expr` small).
     MapProjection(Box<MapProjectionExpr>),
+    /// Pattern comprehension `[(a)-[:T]->(b) WHERE pred | proj]` — a correlated
+    /// subquery collecting `proj` over each match (boxed; the pattern is large).
+    PatternComprehension(Box<PatternComprehensionExpr>),
+}
+
+/// `[pattern WHERE filter | projection]`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PatternComprehensionExpr {
+    pub pattern: Pattern,
+    pub filter: Option<Box<Expr>>,
+    pub projection: Box<Expr>,
+    pub span: SourceSpan,
 }
 
 /// `var{ selector, … }`.
@@ -143,6 +155,7 @@ impl Expr {
             Expr::Reduce(r) => r.span,
             Expr::ListPredicate(p) => p.span,
             Expr::MapProjection(m) => m.span,
+            Expr::PatternComprehension(pc) => pc.span,
             Expr::Call(c) => c.span,
             Expr::Case(c) => c.span,
         }

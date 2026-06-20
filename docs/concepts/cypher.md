@@ -246,6 +246,13 @@ ORDER BY / SKIP / LIMIT
   false. (`EXISTS { … }` inside a list-iteration body is rejected — it would
   need per-element async subquery evaluation; write-side `MATCH … WHERE` doesn't
   accept these forms either.)
+- **Pattern comprehension** `[(a)-[:KNOWS]->(b) WHERE b.age > 30 | b.name]` — a
+  correlated subquery that collects a projection over each match into a list.
+  The inner pattern's existing variables (e.g. `a`) correlate with the outer
+  row; new ones (`b`) are introduced in the subquery. Resolved asynchronously
+  per outer row on the same machinery as `EXISTS`, so it can appear as a value
+  anywhere a projection expression can — including nested
+  (`size([(a)-->(b) | b])`). Write-side `MATCH … WHERE` doesn't accept it.
 - Metadata functions: `labels(n)` returns the node's Cypher label strings
   (from live `rdf:type` assertions, overlay-aware); `type(r)` returns the
   relationship type string for a named relationship variable (from

@@ -95,6 +95,20 @@ pub enum Expression {
         patterns: Vec<Pattern>,
         negated: bool,
     },
+    /// Pattern comprehension `[(a)-[:T]->(b) WHERE pred | proj]`: a correlated
+    /// subquery that projects `proj` over each match of `patterns` (the inner
+    /// `WHERE` is folded into `patterns` as a `Filter`) and collects the results
+    /// into a list. Like [`Expression::Exists`] it is resolved **asynchronously**
+    /// per outer row (seeded with that row's bindings) and replaced with a
+    /// [`Expression::Resolved`] list — it never reaches the synchronous evaluator.
+    PatternComprehension {
+        patterns: Vec<Pattern>,
+        projection: Box<Expression>,
+    },
+    /// A value pre-computed by async resolution (the list result of a
+    /// [`Expression::PatternComprehension`]). The synchronous evaluator returns
+    /// it directly. Never produced by lowering — only substituted in at runtime.
+    Resolved(Box<crate::binding::Binding>),
 }
 
 impl Expression {
@@ -166,6 +180,16 @@ impl Expression {
                     p.substitute_var(old, new);
                 }
             }
+            Expression::PatternComprehension {
+                patterns,
+                projection,
+            } => {
+                for p in patterns {
+                    p.substitute_var(old, new);
+                }
+                projection.substitute_var(old, new);
+            }
+            Expression::Resolved(_) => {}
         }
     }
 
@@ -203,6 +227,14 @@ impl Expression {
             Expression::Exists { patterns, .. } => {
                 patterns.iter().any(|p| p.contains_function(target))
             }
+            Expression::PatternComprehension {
+                patterns,
+                projection,
+            } => {
+                patterns.iter().any(|p| p.contains_function(target))
+                    || projection.contains_function(target)
+            }
+            Expression::Resolved(_) => false,
         }
     }
 }
@@ -275,6 +307,11 @@ impl PartialEq for Expression {
                 },
             ) => t1 == t2 && k1 == k2 && p1 == p2,
             (Expression::Exists { .. }, Expression::Exists { .. }) => false,
+            // Patterns aren't comparable (mirrors Exists); a resolved value is.
+            (Expression::PatternComprehension { .. }, Expression::PatternComprehension { .. }) => {
+                false
+            }
+            (Expression::Resolved(a), Expression::Resolved(b)) => a == b,
             _ => false,
         }
     }
@@ -479,9 +516,13 @@ impl Expression {
                 vars
             }
             Expression::Member { target, .. } => target.referenced_vars(),
-            Expression::Exists { patterns, .. } => {
+            // The outer (correlation) variables come from the patterns; the
+            // projection references subquery-internal vars (mirrors Exists).
+            Expression::Exists { patterns, .. }
+            | Expression::PatternComprehension { patterns, .. } => {
                 patterns.iter().flat_map(Pattern::referenced_vars).collect()
             }
+            Expression::Resolved(_) => Vec::new(),
         }
     }
 
@@ -553,7 +594,9 @@ impl Expression {
             | Expression::Reduce { .. }
             | Expression::ListPredicate { .. }
             | Expression::Member { .. }
-            | Expression::Exists { .. } => false,
+            | Expression::Exists { .. }
+            | Expression::PatternComprehension { .. }
+            | Expression::Resolved(_) => false,
         }
     }
 }

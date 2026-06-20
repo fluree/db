@@ -83,16 +83,21 @@ impl Expression {
                 iter::eval_list_predicate(*kind, *var, list, predicate, row, ctx)?.unwrap_or(false),
             ),
 
-            // Comprehension / reduce / member are values — use EBV of the value.
+            // Comprehension / reduce / member / a resolved value — EBV of it.
             Expression::ListComprehension { .. }
             | Expression::Reduce { .. }
-            | Expression::Member { .. } => Ok((&self.try_eval_to_binding(row, ctx)?).into()),
+            | Expression::Member { .. }
+            | Expression::Resolved(_) => Ok((&self.try_eval_to_binding(row, ctx)?).into()),
 
-            // EXISTS subexpressions in compound filters are pre-evaluated by the
-            // FilterOperator and replaced with Const(Bool) before this is called.
-            // If we reach here, it means the EXISTS was not pre-evaluated (bug).
+            // EXISTS / pattern comprehensions are pre-resolved per row by the
+            // Filter/Bind operators (replaced with Const(Bool) / Resolved). If we
+            // reach here, it means resolution didn't run (bug).
             Expression::Exists { .. } => {
                 tracing::warn!("EXISTS subexpression not pre-evaluated; treating as false");
+                Ok(false)
+            }
+            Expression::PatternComprehension { .. } => {
+                tracing::warn!("pattern comprehension not pre-resolved; treating as false");
                 Ok(false)
             }
         }
@@ -213,7 +218,11 @@ impl Expression {
             // form; consumers read the binding via `try_eval_to_binding`.
             Expression::Map(_)
             | Expression::ListComprehension { .. }
-            | Expression::Reduce { .. } => Ok(None),
+            | Expression::Reduce { .. }
+            | Expression::PatternComprehension { .. } => Ok(None),
+
+            // A resolved value (pattern-comprehension list) — its comparable form.
+            Expression::Resolved(b) => Ok(list::element_to_comparable(b)),
 
             // A list predicate is a boolean scalar.
             Expression::ListPredicate {
@@ -328,6 +337,11 @@ impl Expression {
                 }
             }
             return Ok(Binding::Map(out));
+        }
+
+        // A pre-resolved value (a pattern-comprehension list) is returned as-is.
+        if let Expression::Resolved(b) = self {
+            return Ok((**b).clone());
         }
 
         // Scoped list-iteration and eval-time member access produce structured

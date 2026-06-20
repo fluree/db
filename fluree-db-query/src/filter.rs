@@ -99,7 +99,10 @@ pub fn contains_exists(expr: &Expression) -> bool {
             list, predicate, ..
         } => contains_exists(list) || contains_exists(predicate),
         Expression::Member { target, .. } => contains_exists(target),
-        Expression::Var(_) | Expression::Const(_) => false,
+        // A pattern comprehension is an async subquery resolved on the same
+        // per-row path as EXISTS, so it must trip this gate too.
+        Expression::PatternComprehension { .. } => true,
+        Expression::Var(_) | Expression::Const(_) | Expression::Resolved(_) => false,
     }
 }
 
@@ -165,7 +168,9 @@ fn collect_simple_exists_keys(expr: &Expression, out: &mut Vec<(VarId, Ref)>) {
         Expression::ListComprehension { .. }
         | Expression::Reduce { .. }
         | Expression::ListPredicate { .. }
-        | Expression::Member { .. } => {}
+        | Expression::Member { .. }
+        | Expression::PatternComprehension { .. }
+        | Expression::Resolved(_) => {}
         Expression::Var(_) | Expression::Const(_) => {}
     }
 }
@@ -292,6 +297,38 @@ async fn eval_exists_for_row(
     Ok(if negated { !has_match } else { has_match })
 }
 
+/// Evaluate a pattern comprehension for a given row (always correlated): run the
+/// subquery seeded with the row's bindings, evaluate `projection` per match, and
+/// collect the non-null results into a `Binding::List`.
+async fn eval_pattern_comprehension_for_row(
+    patterns: &[Pattern],
+    projection: &Expression,
+    batch: &Batch,
+    row_idx: usize,
+    ctx: &ExecutionContext<'_>,
+    planning: &crate::temporal_mode::PlanningContext,
+) -> Result<Binding> {
+    let seed = SeedOperator::from_batch_row(batch, row_idx);
+    let mut op =
+        build_where_operators_seeded(Some(Box::new(seed)), patterns, None, None, planning)?;
+    op.open(ctx).await?;
+
+    let mut items = Vec::new();
+    while let Some(result) = op.next_batch(ctx).await? {
+        for r in 0..result.len() {
+            let Some(rv) = result.row_view(r) else {
+                continue;
+            };
+            let val = projection.try_eval_to_binding(&rv, Some(ctx))?;
+            if !matches!(val, Binding::Unbound | Binding::Poisoned) {
+                items.push(val);
+            }
+        }
+    }
+    op.close();
+    Ok(Binding::List(items))
+}
+
 /// Pre-evaluate all uncorrelated EXISTS nodes in an expression tree.
 ///
 /// Called once per batch (not per row). Uncorrelated EXISTS subexpressions
@@ -414,6 +451,16 @@ fn resolve_exists_for_row<'a>(
                     eval_exists_for_row(patterns, *negated, batch, row_idx, ctx, planning).await?;
                 Ok(Expression::Const(FlakeValue::Boolean(result)))
             }
+            Expression::PatternComprehension {
+                patterns,
+                projection,
+            } => {
+                let list = eval_pattern_comprehension_for_row(
+                    patterns, projection, batch, row_idx, ctx, planning,
+                )
+                .await?;
+                Ok(Expression::Resolved(Box::new(list)))
+            }
             Expression::Call { func, args } => {
                 let mut resolved_args = Vec::with_capacity(args.len());
                 for arg in args {
@@ -426,7 +473,19 @@ fn resolve_exists_for_row<'a>(
                     args: resolved_args,
                 })
             }
-            // Var and Const have no EXISTS nodes — already resolved or irrelevant
+            // Resolve nested async subqueries inside a map literal too.
+            Expression::Map(entries) => {
+                let mut out = Vec::with_capacity(entries.len());
+                for (k, v) in entries {
+                    out.push((
+                        k.clone(),
+                        resolve_exists_for_row(v, batch, row_idx, ctx, cache, planning).await?,
+                    ));
+                }
+                Ok(Expression::Map(out))
+            }
+            // Other variants carry no async subquery (or carry it only behind a
+            // loop-local scope, which is rejected at lowering) — clone as-is.
             _ => Ok(expr.clone()),
         }
     })

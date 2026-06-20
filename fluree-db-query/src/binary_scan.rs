@@ -153,7 +153,8 @@ fn expr_needs_t(expr: &Expression) -> bool {
             list, predicate, ..
         } => expr_needs_t(list) || expr_needs_t(predicate),
         Expression::Member { target, .. } => expr_needs_t(target),
-        Expression::Exists { .. } => false,
+        Expression::PatternComprehension { projection, .. } => expr_needs_t(projection),
+        Expression::Exists { .. } | Expression::Resolved(_) => false,
     }
 }
 
