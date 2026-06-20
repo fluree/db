@@ -35,7 +35,7 @@ use crate::{
 };
 use async_trait::async_trait;
 use fluree_db_api::{CommitReceipt, Fluree};
-use fluree_db_core::ledger_id::split_ledger_id;
+use fluree_db_core::ledger_id::{normalize_ledger_id, split_ledger_id};
 use fluree_db_core::ContentId;
 use fluree_db_core::ContentKind;
 use fluree_db_transact::CommitOptsRequest;
@@ -294,6 +294,19 @@ impl Committer for QueuedTransactor {
             governance,
         } = request;
 
+        // Canonical `name:branch` form drives both the
+        // [`IdempotencyCacheKey`] (so retries that elide the
+        // default branch dedup correctly against the replicated
+        // map) and the per-ledger `content_store` namespace (so
+        // CAS writes the worker reads back resolve from the same
+        // store). The wrapping [`CachingCommitter`] normalizes too,
+        // but doing it here keeps this layer self-correct
+        // independent of caller behavior.
+        let ledger_id =
+            normalize_ledger_id(&ledger_id).map_err(|e| SubmissionError::Execution {
+                status: 400,
+                message: format!("invalid ledger_id: {e}"),
+            })?;
         let (ledger_name, branch) =
             split_ledger_id(&ledger_id).map_err(|e| SubmissionError::Execution {
                 status: 400,
@@ -618,6 +631,14 @@ impl Committer for QueuedTransactor {
             governance,
         } = request;
 
+        // See the same comment in `transact` — normalize once so
+        // the idempotency map and the per-ledger content store
+        // both key off the canonical `name:branch` form.
+        let ledger_id =
+            normalize_ledger_id(&ledger_id).map_err(|e| SubmissionError::Execution {
+                status: 400,
+                message: format!("invalid ledger_id: {e}"),
+            })?;
         let (ledger_name, branch) =
             split_ledger_id(&ledger_id).map_err(|e| SubmissionError::Execution {
                 status: 400,
@@ -728,6 +749,12 @@ impl Committer for QueuedTransactor {
 #[async_trait]
 impl SubmissionLookup for QueuedTransactor {
     async fn status(&self, ledger_id: &str, key: &IdempotencyKey) -> SubmissionState {
+        // Same canonicalization as the write side — a bad
+        // ledger_id falls through to `Unknown` (the route boundary
+        // surfaces 400s).
+        let Ok(ledger_id) = normalize_ledger_id(ledger_id) else {
+            return SubmissionState::Unknown;
+        };
         let cache_key = IdempotencyCacheKey::new(ledger_id, key.clone());
         let state = self.shared_state.read().await;
         match state.idempotency.get(&cache_key) {

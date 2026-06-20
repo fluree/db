@@ -22,6 +22,7 @@ use crate::{
 };
 use async_trait::async_trait;
 use fluree_db_api::{CommitRef, Fluree};
+use fluree_db_core::ledger_id::normalize_ledger_id;
 use fluree_db_ledger::IndexConfig;
 use moka::future::Cache;
 use sha2::{Digest, Sha256};
@@ -316,6 +317,19 @@ impl<C: Committer> Committer for CachingCommitter<C> {
     ) -> Result<TransactionReceipt, SubmissionError> {
         let _permit = self.try_admit()?;
 
+        // Canonicalize the ledger id once at the top so the moka
+        // cache key (here), the downstream executor's idempotency
+        // map, and any CAS keying it drives all agree on the form.
+        // Without this, a retry that elides the default branch
+        // (`"my-db"` vs `"my-db:main"`) would miss the cached
+        // outcome and re-execute against the same canonical ledger.
+        let mut request = request;
+        request.ledger_id =
+            normalize_ledger_id(&request.ledger_id).map_err(|e| SubmissionError::Execution {
+                status: 400,
+                message: format!("invalid ledger_id: {e}"),
+            })?;
+
         // Anonymous submissions (no idempotency key) skip the cache
         // entirely — no retry-collapse and no later status lookup.
         let Some(idempotency_key) = request.idempotency_key.clone() else {
@@ -468,6 +482,16 @@ impl<C: Committer> Committer for CachingCommitter<C> {
     async fn push(&self, request: PushRequest) -> Result<PushReceipt, SubmissionError> {
         let _permit = self.try_admit()?;
 
+        // See the same comment in `transact` — canonicalize once at
+        // the cache boundary so the moka key, the downstream
+        // idempotency map, and the per-ledger CAS path all agree.
+        let mut request = request;
+        request.ledger_id =
+            normalize_ledger_id(&request.ledger_id).map_err(|e| SubmissionError::Execution {
+                status: 400,
+                message: format!("invalid ledger_id: {e}"),
+            })?;
+
         let Some(idempotency_key) = request.idempotency_key.clone() else {
             return self.executor.push(request).await;
         };
@@ -503,7 +527,15 @@ impl<C: Committer> Committer for CachingCommitter<C> {
 #[async_trait]
 impl<C: Committer + SubmissionLookup> SubmissionLookup for CachingCommitter<C> {
     async fn status(&self, ledger_id: &str, key: &IdempotencyKey) -> SubmissionState {
-        let cache_key = IdempotencyCacheKey::new(ledger_id, key.clone());
+        // Canonicalize so a status lookup with `"my-db"` finds an
+        // entry recorded under `"my-db:main"` (and vice versa) —
+        // same form as the write-side cache keys above. A bad
+        // ledger_id falls through to `Unknown`; the route boundary
+        // is where 400s get surfaced.
+        let Ok(normalized) = normalize_ledger_id(ledger_id) else {
+            return SubmissionState::Unknown;
+        };
+        let cache_key = IdempotencyCacheKey::new(&normalized, key.clone());
         if let Some(entry) = self.cache.get(&cache_key).await {
             return entry.state;
         }
@@ -511,11 +543,13 @@ impl<C: Committer + SubmissionLookup> SubmissionLookup for CachingCommitter<C> {
         // status. For [`LocalCommitter`] this is a noop (always
         // `Unknown`); for the Raft path the inner
         // [`QueuedTransactor`](crate::raft::queued_transactor::QueuedTransactor)
-        // consults the replicated idempotency state and surfaces a
-        // [`OperationReceipt::Minimal`] for entries any node committed
-        // through consensus, including ones a different leader served
-        // before this node took over.
-        self.executor.status(ledger_id, key).await
+        // consults the replicated idempotency state and returns a
+        // `Committed { receipt: None, ... }` for entries any node
+        // committed through consensus — including ones a different
+        // leader served before this node took over. Pass the
+        // normalized form so the downstream cache key matches the
+        // canonical envelope the worker stored.
+        self.executor.status(&normalized, key).await
     }
 }
 
@@ -619,6 +653,50 @@ mod tests {
             committer.status(&ledger_id, &key).await,
             SubmissionState::Unknown
         ));
+    }
+
+    #[tokio::test]
+    async fn idempotent_retry_collapses_across_default_branch_elision() {
+        // `"test/committer"` (no `:branch`) and `"test/committer:main"`
+        // address the same ledger. A retry that drops the default
+        // branch on the second attempt must hit the same cache
+        // entry, otherwise dedup is purely cosmetic and the same
+        // submission re-executes against the canonical ledger.
+        let (_fluree, committer, _) = setup().await;
+        let key = IdempotencyKey::new("01J5NORMRETRY").expect("test key fits cap");
+        let body = sample_insert("alice");
+
+        let first = committer
+            .transact(request(
+                "test/committer:main",
+                Some(key.as_str()),
+                body.clone(),
+            ))
+            .await
+            .expect("first submission to succeed");
+
+        let second = committer
+            .transact(request("test/committer", Some(key.as_str()), body))
+            .await
+            .expect("retry with elided default branch should return cached receipt");
+
+        assert_eq!(first.commit.t, second.commit.t);
+        assert_eq!(first.commit.commit_id, second.commit.commit_id);
+
+        // Status lookup should also be tolerant to default-branch
+        // elision — clients that query under the un-normalized
+        // form still find the entry.
+        let elided_status = committer.status("test/committer", &key).await;
+        assert!(
+            matches!(
+                elided_status,
+                SubmissionState::Committed {
+                    receipt: Some(OperationReceipt::Transaction(_)),
+                    ..
+                }
+            ),
+            "status via elided ledger_id should resolve, got {elided_status:?}"
+        );
     }
 
     #[tokio::test]
