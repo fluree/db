@@ -840,15 +840,23 @@ impl CommitWorker {
                         unreachable!("process_entry maps Stage failures to PoisonQueueEntry")
                     }
                     Err(WorkerError::Raft(error)) => {
+                        // Skip the failing branch but keep draining
+                        // the rest. A Raft propose can fail because
+                        // the leader stepped down (every subsequent
+                        // branch will fail too — backoff catches
+                        // that) or because something specific to
+                        // this branch's reconcile path went wrong
+                        // (other branches are still serviceable).
+                        // Breaking outright let one bad branch
+                        // starve every other branch on this tick.
                         warn!(
                             ledger_id = %ref_key.ledger_id,
                             branch = %ref_key.branch,
                             queue_id,
                             error = %error,
-                            "raft publish failed; backing off and re-polling"
+                            "raft publish failed; skipping this branch and continuing drain"
                         );
                         raft_blocked = true;
-                        break;
                     }
                 }
             }
