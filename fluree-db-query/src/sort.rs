@@ -210,9 +210,27 @@ pub fn compare_bindings(a: &Binding, b: &Binding) -> Ordering {
         (Binding::Grouped(_), _) => Ordering::Greater,
 
         // Path sorts last by node sequence (rarely sorted directly).
-        (Binding::Path(x), Binding::Path(y)) => x.cmp(y),
-        (_, Binding::Path(_)) => Ordering::Less,
-        (Binding::Path(_), _) => Ordering::Greater,
+        (Binding::Path { nodes: x, .. }, Binding::Path { nodes: y, .. }) => x.cmp(y),
+        (_, Binding::Path { .. }) => Ordering::Less,
+        (Binding::Path { .. }, _) => Ordering::Greater,
+
+        // Relationship: defensive total order by (start, predicate, end).
+        (
+            Binding::Rel {
+                start: a_s,
+                predicate: a_p,
+                end: a_e,
+                ..
+            },
+            Binding::Rel {
+                start: b_s,
+                predicate: b_p,
+                end: b_e,
+                ..
+            },
+        ) => (a_s, a_p, a_e).cmp(&(b_s, b_p, b_e)),
+        (_, Binding::Rel { .. }) => Ordering::Less,
+        (Binding::Rel { .. }, _) => Ordering::Greater,
 
         // List sorts last, element-wise (cypher rejects ORDER BY <list>, so
         // this is only a defensive total order).

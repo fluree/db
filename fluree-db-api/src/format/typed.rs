@@ -203,7 +203,7 @@ fn write_value(
             out.push(']');
         }
         // A path renders as an array of `{"@id": ...}` node references.
-        Binding::Path(nodes) => {
+        Binding::Path { nodes, .. } => {
             out.push('[');
             for (i, sid) in nodes.iter().enumerate() {
                 if i > 0 {
@@ -214,6 +214,27 @@ fn write_value(
                 out.push('}');
             }
             out.push(']');
+        }
+        // A relationship renders as `{start, type, end}` with `{"@id":...}` refs.
+        Binding::Rel {
+            start,
+            predicate,
+            end,
+            ..
+        } => {
+            let id_ref = |out: &mut String, sid: &fluree_db_core::Sid| -> Result<()> {
+                out.push_str(r#"{"@id":"#);
+                push_json_string(out, &compactor.compact_id_sid(sid)?);
+                out.push('}');
+                Ok(())
+            };
+            out.push_str(r#"{"start":"#);
+            id_ref(out, start)?;
+            out.push_str(r#","type":"#);
+            id_ref(out, predicate)?;
+            out.push_str(r#","end":"#);
+            id_ref(out, end)?;
+            out.push('}');
         }
         // A list renders as a JSON array of its (typed) elements.
         Binding::List(values) => {
@@ -519,13 +540,25 @@ pub(crate) fn format_binding(
         }
 
         // A path - array of `{"@id": ...}` node references.
-        Binding::Path(nodes) => {
+        Binding::Path { nodes, .. } => {
             let arr: Result<Vec<_>> = nodes
                 .iter()
                 .map(|sid| compactor.compact_id_sid(sid).map(|iri| json!({"@id": iri})))
                 .collect();
             Ok(JsonValue::Array(arr?))
         }
+
+        // A relationship - `{start, type, end}` with `{"@id":...}` refs.
+        Binding::Rel {
+            start,
+            predicate,
+            end,
+            ..
+        } => Ok(json!({
+            "start": {"@id": compactor.compact_id_sid(start)?},
+            "type": {"@id": compactor.compact_id_sid(predicate)?},
+            "end": {"@id": compactor.compact_id_sid(end)?},
+        })),
 
         // A list - array of its (typed) elements.
         Binding::List(values) => {

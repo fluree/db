@@ -205,7 +205,9 @@ impl Expression {
                 // A path or list is not a scalar — no comparable value. The
                 // relevant functions (`length`, `size`/`head`/…) read the
                 // binding directly via dispatch / the binding-producing path.
-                Some(Binding::Path(_) | Binding::List(_) | Binding::Map(_)) => Ok(None),
+                Some(
+                    Binding::Path { .. } | Binding::Rel { .. } | Binding::List(_) | Binding::Map(_),
+                ) => Ok(None),
             },
 
             // FlakeValue::Null is the only variant TryFrom rejects (with

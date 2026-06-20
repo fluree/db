@@ -591,7 +591,13 @@ impl ShortestPathOperator {
             let mut row: Vec<Binding> = Vec::with_capacity(self.in_schema.len());
             for var in self.in_schema.iter() {
                 if *var == self.pattern.path_var {
-                    row.push(Binding::Path(path.clone()));
+                    // Single-typed path: every hop uses the pattern's predicate.
+                    let hops = path.len().saturating_sub(1);
+                    let preds = vec![self.pattern.predicate.clone(); hops];
+                    row.push(Binding::Path {
+                        nodes: path.clone(),
+                        preds,
+                    });
                 } else if let Some(col) = child_batch.column(*var) {
                     row.push(col[row_idx].clone());
                 } else {

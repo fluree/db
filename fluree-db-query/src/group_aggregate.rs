@@ -486,8 +486,20 @@ pub(crate) fn binding_to_group_key_owned(binding: &Binding) -> GroupKeyOwned {
         Binding::Grouped(_) => GroupKeyOwned::Absent, // Shouldn't happen
         // A path / list groups per distinct element sequence — needed for
         // `WITH path, collect(...)` over allShortestPaths (IC14).
-        Binding::Path(nodes) => GroupKeyOwned::Seq(
+        Binding::Path { nodes, .. } => GroupKeyOwned::Seq(
             nodes
+                .iter()
+                .map(|sid| GroupKeyOwned::MaterializedSid(sid.namespace_code, sid.name.clone()))
+                .collect(),
+        ),
+        // A relationship groups per (start, predicate, end) identity.
+        Binding::Rel {
+            start,
+            predicate,
+            end,
+            ..
+        } => GroupKeyOwned::Seq(
+            [start, predicate, end]
                 .iter()
                 .map(|sid| GroupKeyOwned::MaterializedSid(sid.namespace_code, sid.name.clone()))
                 .collect(),

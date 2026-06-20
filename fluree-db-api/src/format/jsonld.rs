@@ -228,7 +228,7 @@ fn write_value(out: &mut String, binding: &Binding, compactor: &IriCompactor) ->
             out.push(']');
         }
         // A path renders as an array of its node IRIs (start → end).
-        Binding::Path(nodes) => {
+        Binding::Path { nodes, .. } => {
             out.push('[');
             for (i, sid) in nodes.iter().enumerate() {
                 if i > 0 {
@@ -237,6 +237,22 @@ fn write_value(out: &mut String, binding: &Binding, compactor: &IriCompactor) ->
                 push_json_string(out, &compactor.compact_id_sid(sid)?);
             }
             out.push(']');
+        }
+        // A relationship renders as a `{start, type, end}` object of compacted
+        // IRIs (its properties are reached via `properties(r)`).
+        Binding::Rel {
+            start,
+            predicate,
+            end,
+            ..
+        } => {
+            out.push_str("{\"start\":");
+            push_json_string(out, &compactor.compact_id_sid(start)?);
+            out.push_str(",\"type\":");
+            push_json_string(out, &compactor.compact_id_sid(predicate)?);
+            out.push_str(",\"end\":");
+            push_json_string(out, &compactor.compact_id_sid(end)?);
+            out.push('}');
         }
         // A list (collect / list literal / list function) renders as a JSON
         // array of its elements.
@@ -565,12 +581,35 @@ pub(crate) fn format_binding(binding: &Binding, compactor: &IriCompactor) -> Res
         }
 
         // A path renders as an array of its node IRIs (start → end).
-        Binding::Path(nodes) => {
+        Binding::Path { nodes, .. } => {
             let arr: Result<Vec<_>> = nodes
                 .iter()
                 .map(|sid| compactor.compact_id_sid(sid).map(JsonValue::String))
                 .collect();
             Ok(JsonValue::Array(arr?))
+        }
+
+        // A relationship renders as a `{start, type, end}` object of compacted IRIs.
+        Binding::Rel {
+            start,
+            predicate,
+            end,
+            ..
+        } => {
+            let mut obj = serde_json::Map::with_capacity(3);
+            obj.insert(
+                "start".to_string(),
+                JsonValue::String(compactor.compact_id_sid(start)?),
+            );
+            obj.insert(
+                "type".to_string(),
+                JsonValue::String(compactor.compact_id_sid(predicate)?),
+            );
+            obj.insert(
+                "end".to_string(),
+                JsonValue::String(compactor.compact_id_sid(end)?),
+            );
+            Ok(JsonValue::Object(obj))
         }
 
         // A list renders as a JSON array of its elements.

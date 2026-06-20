@@ -458,13 +458,26 @@ fn write_binding_cell(
             }
         }
         // A path: arrow-separated node IRIs for pragmatic consumption.
-        Binding::Path(nodes) => {
+        Binding::Path { nodes, .. } => {
             for (j, sid) in nodes.iter().enumerate() {
                 if j > 0 {
                     cell.extend_from_slice(b"->");
                 }
                 write_compacted_sid(cell, compactor, sid)?;
             }
+        }
+        // A relationship: `start-[type]->end` for pragmatic consumption.
+        Binding::Rel {
+            start,
+            predicate,
+            end,
+            ..
+        } => {
+            write_compacted_sid(cell, compactor, start)?;
+            cell.extend_from_slice(b"-[");
+            write_compacted_sid(cell, compactor, predicate)?;
+            cell.extend_from_slice(b"]->");
+            write_compacted_sid(cell, compactor, end)?;
         }
         // A list: semicolon-separated elements (mirrors Grouped).
         Binding::List(values) => {

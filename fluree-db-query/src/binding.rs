@@ -178,9 +178,31 @@ pub enum Binding {
     ///
     /// - Only produced by [`crate::shortest_path::ShortestPathOperator`].
     /// - Opaque to join/scan/sort hot paths (treated as an atomic value);
-    ///   consumed by path functions (`length`, `nodes`) and rendered as a
-    ///   JSON array of node IRIs at projection time.
-    Path(Vec<Sid>),
+    ///   consumed by path functions (`length`, `nodes`, `relationships`) and
+    ///   rendered as a JSON array of node IRIs at projection time.
+    ///
+    /// `preds` holds the predicate SID of each hop, so `relationships(p)` can
+    /// reconstruct relationship values; `preds.len() == nodes.len().saturating_sub(1)`.
+    /// For a single-typed path every entry is the same predicate.
+    Path { nodes: Vec<Sid>, preds: Vec<Sid> },
+
+    /// Relationship value (a directed edge with a type).
+    ///
+    /// Carries the edge's start node, predicate (type), and end node intrinsically
+    /// so a relationship from a plain (unreified) path edge is a first-class value.
+    /// `reifier` is `Some` when the edge has a reified annotation node (i.e. it was
+    /// written with `-[r:T {..}]->` / `@annotation`), which backs `properties(r)`
+    /// and `r.prop`; `None` for a plain edge (those yield an empty map / null).
+    ///
+    /// Produced by `relationships(p)` and by binding a variable-length relationship
+    /// variable (`-[r:T*]->`). Consumed by `type`/`startNode`/`endNode`/
+    /// `properties`/property-access. Opaque in join/scan/sort hot paths.
+    Rel {
+        start: Sid,
+        predicate: Sid,
+        end: Sid,
+        reifier: Option<Sid>,
+    },
 
     /// First-class list value (ordered sequence of element bindings).
     ///
@@ -762,7 +784,9 @@ impl From<&Binding> for bool {
             Binding::Unbound | Binding::Poisoned => false,
             Binding::Grouped(_) => false,
             // A bound path is truthy (it exists); an absent path is `Unbound`.
-            Binding::Path(_) => true,
+            Binding::Path { .. } => true,
+            // A bound relationship is truthy (it exists).
+            Binding::Rel { .. } => true,
             // Cypher: a non-empty list is truthy, an empty list falsy.
             Binding::List(items) => !items.is_empty(),
             // Cypher: a non-empty map is truthy, an empty map falsy.
@@ -897,7 +921,30 @@ impl PartialEq for Binding {
             (Binding::IriMatch { .. } | Binding::Iri(_), Binding::EncodedPid { .. }) => false,
 
             (Binding::Grouped(a), Binding::Grouped(b)) => a == b,
-            (Binding::Path(a), Binding::Path(b)) => a == b,
+            (
+                Binding::Path {
+                    nodes: an,
+                    preds: ap,
+                },
+                Binding::Path {
+                    nodes: bn,
+                    preds: bp,
+                },
+            ) => an == bn && ap == bp,
+            (
+                Binding::Rel {
+                    start: a_s,
+                    predicate: a_p,
+                    end: a_e,
+                    ..
+                },
+                Binding::Rel {
+                    start: b_s,
+                    predicate: b_p,
+                    end: b_e,
+                    ..
+                },
+            ) => a_s == b_s && a_p == b_p && a_e == b_e,
             (Binding::List(a), Binding::List(b)) => a == b,
             // Map identity is key-order-insensitive (a map equals a map with the
             // same entries in any order); display order is preserved separately.
@@ -999,12 +1046,27 @@ impl std::hash::Hash for Binding {
                     v.hash(state);
                 }
             }
-            Binding::Path(nodes) => {
+            Binding::Path { nodes, preds } => {
                 9u8.hash(state);
                 nodes.len().hash(state);
                 for n in nodes {
                     n.hash(state);
                 }
+                for p in preds {
+                    p.hash(state);
+                }
+            }
+            Binding::Rel {
+                start,
+                predicate,
+                end,
+                reifier,
+            } => {
+                12u8.hash(state);
+                start.hash(state);
+                predicate.hash(state);
+                end.hash(state);
+                reifier.hash(state);
             }
             Binding::List(values) => {
                 10u8.hash(state);

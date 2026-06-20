@@ -186,7 +186,7 @@ pub fn eval_list_fn_to_binding<R: RowAccess>(
             // The node sequence of a path value, as a list of node refs.
             let arg = arity1(args, "nodes")?;
             match resolve_arg_binding(arg, row, ctx)? {
-                Some(Binding::Path(nodes)) => Ok(Some(Binding::List(
+                Some(Binding::Path { nodes, .. }) => Ok(Some(Binding::List(
                     nodes.into_iter().map(Binding::sid).collect(),
                 ))),
                 _ => Ok(Some(Binding::Unbound)),
@@ -197,7 +197,7 @@ pub fn eval_list_fn_to_binding<R: RowAccess>(
             // building block for per-edge aggregation (unwind pairs → match).
             let arg = arity1(args, "pathPairs")?;
             match resolve_arg_binding(arg, row, ctx)? {
-                Some(Binding::Path(nodes)) => {
+                Some(Binding::Path { nodes, .. }) => {
                     let pairs = nodes
                         .windows(2)
                         .map(|w| {
