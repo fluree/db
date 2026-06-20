@@ -195,29 +195,46 @@ impl<'a> CypherLowering<'a> {
             ));
         }
 
-        // MERGE must stand alone. Each MERGE appends a top-level NOT EXISTS
-        // guard evaluated against the pre-transaction snapshot, so combining
-        // MERGE with other writes (or another MERGE) would make the guards
-        // conjunctive and blind to earlier writes in the same statement —
-        // both unsound. Sequential MERGE needs multi-statement staging the
-        // single-Txn model can't provide.
-        let merge_count = update
+        // A MERGE must be the only write. Each MERGE appends a top-level NOT
+        // EXISTS guard evaluated against the pre-transaction snapshot, so
+        // combining it with another write (or a second MERGE) would make the
+        // guards conjunctive and blind to earlier writes in the same statement.
+        // A *leading MATCH* is the one exception: a relationship MERGE whose
+        // endpoints are bound by the MATCH (`MATCH (a),(b) MERGE (a)-[:T]->(b)`)
+        // is a per-row find-or-create — the NOT EXISTS guard runs once per bound
+        // row against the pre-write snapshot, exactly like SPARQL
+        // `INSERT … WHERE { … FILTER NOT EXISTS { … } }`.
+        let merges: Vec<&MergeClause> = update
             .write_clauses
             .iter()
-            .filter(|w| matches!(w, WriteClause::Merge(_)))
-            .count();
-        if merge_count > 0 && (update.write_clauses.len() > 1 || !update.read_clauses.is_empty()) {
-            return Err(LowerCypherError::unsupported(
-                "MERGE must be the only clause in v1 — combining MERGE with other writes, \
-                 a leading MATCH, or another MERGE needs sequential snapshot evaluation that \
-                 single-Txn staging can't provide",
-            ));
+            .filter_map(|w| match w {
+                WriteClause::Merge(m) => Some(m),
+                _ => None,
+            })
+            .collect();
+        let is_relationship_merge =
+            |m: &MergeClause| m.pattern.parts.len() == 1 && m.pattern.parts[0].tail.len() == 1;
+        if !merges.is_empty() {
+            if update.write_clauses.len() > 1 {
+                return Err(LowerCypherError::unsupported(
+                    "MERGE must be the only write clause in v1 — combining MERGE with another \
+                     write or a second MERGE needs sequential snapshot evaluation that \
+                     single-Txn staging can't provide",
+                ));
+            }
+            if !update.read_clauses.is_empty() && !is_relationship_merge(merges[0]) {
+                return Err(LowerCypherError::unsupported(
+                    "a leading MATCH is only allowed before a relationship MERGE \
+                     (`MATCH (a),(b) MERGE (a)-[:T]->(b)`) in v1 — a node MERGE must stand alone",
+                ));
+            }
         }
 
-        // OPTIONAL MATCH before CREATE is unsafe: a CREATE emits a multi-triple
-        // reifier bundle, and a template referencing an optionally-unbound
-        // variable skips per-triple — which could assert only part of the
-        // bundle (a malformed reifier). Require mandatory binding for CREATE.
+        // OPTIONAL MATCH before a reifier-bundle write (CREATE, or a
+        // relationship MERGE) is unsafe: the bundle is multi-triple, and a
+        // template referencing an optionally-unbound variable skips per-triple —
+        // which could assert only part of the bundle (a malformed reifier).
+        // Require mandatory binding for these.
         let has_optional = update
             .read_clauses
             .iter()
@@ -226,11 +243,12 @@ impl<'a> CypherLowering<'a> {
             .write_clauses
             .iter()
             .any(|w| matches!(w, WriteClause::Create(_)));
-        if has_optional && has_create {
+        let has_relationship_merge = merges.iter().any(|m| is_relationship_merge(m));
+        if has_optional && (has_create || has_relationship_merge) {
             return Err(LowerCypherError::rejected(
-                "OPTIONAL MATCH before CREATE is not supported — a CREATE referencing an \
-                 optionally-unbound variable could assert a partial reifier bundle; bind its \
-                 variables with a mandatory MATCH",
+                "OPTIONAL MATCH before CREATE / a relationship MERGE is not supported — a \
+                 template referencing an optionally-unbound variable could assert a partial \
+                 reifier bundle; bind its variables with a mandatory MATCH",
             ));
         }
 
@@ -967,12 +985,16 @@ impl<'a> CypherLowering<'a> {
         Ok(())
     }
 
-    /// Standalone relationship MERGE `(a)-[r:T]->(b)` where the whole pattern is
-    /// the MERGE (endpoints introduced here, not bound by a preceding MATCH).
-    /// The entire path becomes one `NOT EXISTS` guard; when no matching path
-    /// exists the create branch mints both endpoints and the edge (with its
-    /// `f:reifies*` reifier bundle) exactly once. `ON CREATE SET` may target
-    /// either endpoint node variable.
+    /// Relationship MERGE `(a)-[r:T]->(b)`. The whole path becomes one
+    /// `NOT EXISTS` guard; when no matching path exists the create branch mints
+    /// the missing endpoints and the edge (with its `f:reifies*` reifier bundle)
+    /// exactly once. `ON CREATE SET` may target either endpoint node variable.
+    ///
+    /// Endpoints are bound-aware: a variable bound by a preceding MATCH
+    /// (`MATCH (a),(b) MERGE (a)-[:T]->(b)`) references the existing node, so the
+    /// guard runs per matched row (per-row find-or-create); an endpoint
+    /// introduced here (standalone MERGE) gets a fresh existential probe in the
+    /// guard and a fresh blank node in the create branch.
     ///
     /// Deferred (clear errors): relationship properties and `ON CREATE SET` on
     /// the relationship variable — matching a property-bearing edge needs an
@@ -1007,16 +1029,17 @@ impl<'a> CypherLowering<'a> {
             ));
         }
 
-        // NOT EXISTS guard over the whole path (fresh existential probes for
-        // both endpoints, joined by the directed type triple).
-        let head_probe = self.fresh_merge_probe();
-        let tail_probe = self.fresh_merge_probe();
-        let mut guard = self.build_merge_guard(head_node, &head_probe)?;
-        guard.extend(self.build_merge_guard(tail_node, &tail_probe)?);
+        // NOT EXISTS guard over the whole path: a bound endpoint contributes its
+        // MATCH variable (per-row check); an unbound one a fresh existential
+        // probe. Both are joined by the directed type triple.
+        let head_term = self.merge_endpoint_term(head_node);
+        let tail_term = self.merge_endpoint_term(tail_node);
+        let mut guard = self.build_merge_guard(head_node, &head_term)?;
+        guard.extend(self.build_merge_guard(tail_node, &tail_term)?);
         let type_iri = self.resolve_predicate(&rel.types[0].name)?;
         let (gs, go) = match rel.direction {
-            Direction::Outgoing => (head_probe, tail_probe),
-            Direction::Incoming => (tail_probe, head_probe),
+            Direction::Outgoing => (head_term, tail_term),
+            Direction::Incoming => (tail_term, head_term),
             Direction::Either => unreachable!(),
         };
         guard.push(UnresolvedPattern::Triple(UnresolvedTriplePattern {
@@ -1061,6 +1084,20 @@ impl<'a> CypherLowering<'a> {
         let name = format!("?#__cy_merge_{}", self.synth_counter);
         self.synth_counter += 1;
         UnresolvedTerm::Var(Arc::from(name.as_str()))
+    }
+
+    /// The guard term for a MERGE relationship endpoint: a MATCH-bound variable
+    /// references the existing node (per-row find-or-create against the
+    /// pre-write snapshot); an unbound endpoint gets a fresh existential probe
+    /// (whole-pattern standalone MERGE). The create branch makes the matching
+    /// choice independently via [`Self::node_subject`].
+    fn merge_endpoint_term(&mut self, node: &NodePattern) -> UnresolvedTerm {
+        if let Some(var) = &node.var {
+            if self.bound_vars.contains(&var.name) {
+                return UnresolvedTerm::Var(Arc::from(var_name(&var.name).as_str()));
+            }
+        }
+        self.fresh_merge_probe()
     }
 
     fn build_merge_guard(

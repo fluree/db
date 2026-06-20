@@ -1581,6 +1581,119 @@ async fn transact_cypher_merge_relationship_on_create_set_endpoint() {
 }
 
 #[tokio::test]
+async fn transact_cypher_merge_relationship_bound_endpoints_is_per_row_find_or_create() {
+    // Scope B: `MATCH (a),(b) MERGE (a)-[:KNOWS]->(b)` — the endpoints are bound
+    // by the MATCH, so the MERGE runs per matched (a,b) row. Seed Alice, Bob,
+    // and one existing Alice->Bob edge; then MERGE every Person→Person pair.
+    // Existing edges are left alone; only the missing ones are created.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = genesis_ledger(&fluree, "it/cypher:merge-rel-bound");
+    let l = fluree
+        .transact_cypher(
+            l,
+            r#"CREATE (a:Person {name: "Alice"})-[:KNOWS]->(b:Person {name: "Bob"})"#,
+        )
+        .await
+        .expect("seed")
+        .ledger;
+
+    // MERGE every ordered distinct pair of Persons. Alice->Bob exists (no-op);
+    // Bob->Alice is created. (Self-pairs are excluded by name inequality.)
+    let l = fluree
+        .transact_cypher(
+            l,
+            r#"MATCH (a:Person), (b:Person) WHERE a.name <> b.name
+               MERGE (a)-[:KNOWS]->(b)"#,
+        )
+        .await
+        .expect("merge pairs")
+        .ledger;
+    let db = graphdb_from_ledger(&l);
+
+    // Exactly two directed edges now: Alice->Bob (pre-existing) and Bob->Alice.
+    let edges = fluree
+        .query_cypher(
+            &db,
+            "MATCH (a:Person)-[:KNOWS]->(b:Person) RETURN a.name AS f, b.name AS t ORDER BY f",
+        )
+        .await
+        .expect("edges")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    assert_eq!(
+        edges,
+        serde_json::json!([["Alice", "Bob"], ["Bob", "Alice"]]),
+        "the pre-existing edge is untouched; only the missing reverse edge is created: {edges}"
+    );
+
+    // Re-running the same MERGE is a no-op — both edges now exist.
+    let l = fluree
+        .transact_cypher(
+            l,
+            r#"MATCH (a:Person), (b:Person) WHERE a.name <> b.name
+               MERGE (a)-[:KNOWS]->(b)"#,
+        )
+        .await
+        .expect("merge#2")
+        .ledger;
+    let db = graphdb_from_ledger(&l);
+    assert_eq!(
+        fluree
+            .query_cypher(&db, "MATCH (a:Person)-[:KNOWS]->(b:Person) RETURN a, b")
+            .await
+            .unwrap()
+            .row_count(),
+        2,
+        "still exactly two edges — no duplicates on the second MERGE"
+    );
+}
+
+#[tokio::test]
+async fn transact_cypher_merge_relationship_bound_head_new_tail() {
+    // Mixed: bound head + a new tail node introduced by the MERGE. Per matched
+    // Person, find-or-create a Pet named Rex.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = genesis_ledger(&fluree, "it/cypher:merge-rel-newtail");
+    let l = fluree
+        .transact_cypher(l, r#"CREATE (a:Person {name: "Alice"})"#)
+        .await
+        .expect("seed")
+        .ledger;
+
+    let stmt = r#"MATCH (a:Person {name: "Alice"})
+                  MERGE (a)-[:HAS_PET]->(p:Pet {name: "Rex"})"#;
+    let l = fluree.transact_cypher(l, stmt).await.expect("merge").ledger;
+    let db = graphdb_from_ledger(&l);
+    assert_eq!(
+        fluree
+            .query_cypher(&db, "MATCH (a:Person)-[:HAS_PET]->(p:Pet) RETURN p.name")
+            .await
+            .unwrap()
+            .row_count(),
+        1,
+        "first run creates the Pet + edge"
+    );
+
+    // Second run finds the existing Pet+edge → no new Pet.
+    let l = fluree
+        .transact_cypher(l, stmt)
+        .await
+        .expect("merge#2")
+        .ledger;
+    let db = graphdb_from_ledger(&l);
+    assert_eq!(
+        fluree
+            .query_cypher(&db, "MATCH (p:Pet) RETURN p")
+            .await
+            .unwrap()
+            .row_count(),
+        1,
+        "second run is a no-op — exactly one Pet"
+    );
+}
+
+#[tokio::test]
 async fn transact_cypher_merge_on_match_set_fires_only_on_match() {
     // Conditional write: ON CREATE SET on first (absent) run, ON MATCH SET on
     // the second (present) run.

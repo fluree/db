@@ -478,6 +478,91 @@ fn merge_relationship_incoming_direction_orients_edge() {
 }
 
 #[test]
+fn merge_relationship_with_bound_endpoints_uses_match_vars() {
+    use fluree_db_query::parse::UnresolvedPattern;
+    // Scope B: both endpoints bound by a leading MATCH → per-row find-or-create.
+    let txn = lower(
+        r#"MATCH (a:Person {name: "Alice"}), (b:Person {name: "Bob"})
+           MERGE (a)-[:KNOWS]->(b)"#,
+    );
+    assert_eq!(txn.txn_type, TxnType::Update);
+    // WHERE: 2 MATCH labels + 2 name filters + 1 NOT EXISTS guard = 5.
+    assert_eq!(
+        txn.where_patterns.len(),
+        5,
+        "where: {:?}",
+        txn.where_patterns
+    );
+    let guard = txn
+        .where_patterns
+        .iter()
+        .find_map(|p| match p {
+            UnresolvedPattern::NotExists(g) => Some(g),
+            _ => None,
+        })
+        .expect("a NOT EXISTS guard");
+    // Bound endpoints add no label/prop guard — just the rel triple.
+    assert_eq!(guard.len(), 1, "guard: {guard:?}");
+    // Create branch: only the base edge + 3 reifier triples (endpoints exist).
+    assert_eq!(
+        txn.insert_templates.len(),
+        4,
+        "inserts: {:?}",
+        txn.insert_templates
+    );
+    // The base edge references the MATCH-bound variables, not blank nodes.
+    let base = &txn.insert_templates[0];
+    assert!(matches!(base.subject, TemplateTerm::Var(_)));
+    assert!(matches!(base.object, TemplateTerm::Var(_)));
+}
+
+#[test]
+fn merge_relationship_mixed_bound_and_new_endpoint() {
+    use fluree_db_query::parse::UnresolvedPattern;
+    // Bound head + a new tail node introduced by the MERGE: per matched `a`,
+    // find-or-create a Pet named Rex.
+    let txn = lower(
+        r#"MATCH (a:Person {name: "Alice"})
+           MERGE (a)-[:HAS_PET]->(p:Pet {name: "Rex"})"#,
+    );
+    // WHERE: 1 MATCH label + 1 name filter + 1 NOT EXISTS guard = 3.
+    assert_eq!(
+        txn.where_patterns.len(),
+        3,
+        "where: {:?}",
+        txn.where_patterns
+    );
+    let guard = txn
+        .where_patterns
+        .iter()
+        .find_map(|p| match p {
+            UnresolvedPattern::NotExists(g) => Some(g),
+            _ => None,
+        })
+        .expect("a NOT EXISTS guard");
+    // Guard: the new tail's label + name (probe) + the rel triple = 3.
+    assert_eq!(guard.len(), 3, "guard: {guard:?}");
+    // Create: new Pet's label + name + base edge + 3 reifier triples = 6.
+    assert_eq!(
+        txn.insert_templates.len(),
+        6,
+        "inserts: {:?}",
+        txn.insert_templates
+    );
+    // The new endpoint is a blank node; the bound head stays a Var.
+    let base = txn
+        .insert_templates
+        .iter()
+        .find(|t| {
+            matches!(t.subject, TemplateTerm::Var(_))
+                && matches!(t.object, TemplateTerm::BlankNode(_))
+        })
+        .expect("base edge: bound head Var → new tail blank node");
+    assert!(matches!(base.subject, TemplateTerm::Var(_)));
+    assert!(matches!(base.object, TemplateTerm::BlankNode(_)));
+}
+
+#[test]
 fn match_create_relationship_references_bound_nodes() {
     let txn = lower(
         r#"MATCH (a:Person {name: "Alice"}), (b:Person {name: "Bob"})

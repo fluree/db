@@ -62,6 +62,22 @@ ON MATCH SET p.lastSeen = 2024
 RETURN p
 ```
 
+`MERGE` also works on a relationship. Standalone, the whole path is the match
+key and missing endpoints are created:
+
+```cypher
+MERGE (a:Person {name: "Alice"})-[:KNOWS]->(b:Person {name: "Bob"})
+```
+
+With a leading `MATCH` binding the endpoints it is a per-row find-or-create —
+the edge is added only for matched pairs that don't already have it (idempotent
+on re-run):
+
+```cypher
+MATCH (a:Person), (b:Person) WHERE a.name <> b.name
+MERGE (a)-[:KNOWS]->(b)
+```
+
 ## Update and delete
 
 ```cypher

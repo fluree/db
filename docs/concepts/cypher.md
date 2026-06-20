@@ -266,12 +266,18 @@ ORDER BY / SKIP / LIMIT
 - **`DELETE` / `DETACH DELETE`** — delete nodes/relationships. `DETACH DELETE`
   removes a node together with its relationships.
 - **`MERGE`** — find-or-create for a single node
-  (`MERGE (n:Person {name: "Alice"})`) or a single standalone relationship path
-  (`MERGE (a:Person {name: "Alice"})-[:KNOWS]->(b:Person {name: "Bob"})`), with
-  `ON CREATE SET` / `ON MATCH SET`. The whole pattern is the match key: when it
-  is absent the entire path (both endpoints and the edge) is created once.
-  `ON CREATE SET` may target either endpoint node variable. Resolved by probing
-  the current writer state, then staging either a create or an update.
+  (`MERGE (n:Person {name: "Alice"})`) or a single relationship path. The
+  relationship form works both standalone, where the whole pattern is the match
+  key and absent endpoints are created
+  (`MERGE (a:Person {name: "Alice"})-[:KNOWS]->(b:Person {name: "Bob"})`), and
+  with a leading `MATCH` binding the endpoints, where it is a **per-row
+  find-or-create** — the edge is created only for matched pairs that don't
+  already have it
+  (`MATCH (a:Person), (b:Person) WHERE a.name <> b.name MERGE (a)-[:KNOWS]->(b)`).
+  An endpoint introduced by the `MERGE` (not bound by the `MATCH`) is created
+  per row. `ON CREATE SET` / `ON MATCH SET` are supported, and `ON CREATE SET`
+  may target either endpoint node variable. Resolved by probing the current
+  writer state, then staging either a create or an update.
 - **`MATCH … CREATE/SET/REMOVE/DELETE`** — pattern-driven write templates (find
   rows, then write per match). Write-side `MATCH` supports labels, inline
   property filters, directed single-typed relationships, and scalar `WHERE`
@@ -323,9 +329,8 @@ produces a clear error rather than a silent wrong answer.
   write clause.
 - `MERGE` on a property-bearing relationship (`-[:KNOWS {since: 2020}]->`),
   multi-hop or multi-part (comma-separated) `MERGE`, multiple `MERGE` clauses,
-  `ON MATCH SET` on a relationship `MERGE`, and `MERGE` combined with a leading
-  `MATCH` or other writes (a bound-endpoint `MATCH … MERGE (a)-[:T]->(b)`
-  included).
+  `ON MATCH SET` on a relationship `MERGE`, and `MERGE` combined with another
+  write clause in the same statement.
 - `CALL` / stored procedures, `LOAD CSV`, `FOREACH`, schema DDL.
 - Multi-statement scripts — submit one statement per request.
 
