@@ -33,7 +33,7 @@
 //! ex:vendor-N    a bsbm:Vendor   ; bsbm:label ; bsbm:country .
 //! ex:product-N   a bsbm:Product  ; bsbm:label ; bsbm:vendor ;
 //!                                  bsbm:productType ; bsbm:price .
-//! ex:person-N    a bsbm:Person   ; bsbm:name .
+//! ex:person-N    a bsbm:Person   ; bsbm:name ; bsbm:country .
 //! ex:review-N    a bsbm:Review   ; bsbm:reviewFor ; bsbm:reviewer ;
 //!                                  bsbm:rating ; bsbm:text .
 //! ```
@@ -69,6 +69,10 @@ pub struct Product {
 pub struct Person {
     pub id: String,
     pub name: String,
+    /// Reviewer's country. Paired with `Vendor::country` this gives the
+    /// BSBM-BI "bowtie" shape: two equally-selective country anchors that
+    /// meet through the large review predicate (see `query_hot_bsbm_bi`).
+    pub country: &'static str,
 }
 
 #[derive(Debug, Clone)]
@@ -94,11 +98,11 @@ impl BsbmData {
     pub fn estimated_triples(&self) -> u64 {
         // Vendor: 3 (a, label, country)
         // Product: 5 (a, label, productType, vendor, price)
-        // Person: 2 (a, name)
+        // Person: 3 (a, name, country)
         // Review: 5 (a, reviewFor, reviewer, rating, text)
         (self.vendors.len() * 3
             + self.products.len() * 5
-            + self.persons.len() * 2
+            + self.persons.len() * 3
             + self.reviews.len() * 5) as u64
     }
 }
@@ -139,6 +143,11 @@ pub fn generate_dataset(n_products: usize) -> BsbmData {
         .map(|i| Person {
             id: format!("ex:person-{i:06}"),
             name: format!("Person {i:06}"),
+            // Stride differs from the vendor assignment (`i % len`) so the
+            // reviewer-country and vendor-country anchors are not trivially
+            // correlated — the BI-F2 bowtie wants two independent, equally
+            // selective (~1/5) filters meeting through the review predicate.
+            country: COUNTRIES[(i * 3 + 1) % COUNTRIES.len()],
         })
         .collect();
 
@@ -202,7 +211,8 @@ pub fn bsbm_data_to_turtle(data: &BsbmData) -> String {
     for p in &data.persons {
         buf.push_str(&p.id);
         buf.push_str(" a bsbm:Person ;\n");
-        buf.push_str(&format!("    bsbm:name \"{}\" .\n\n", p.name));
+        buf.push_str(&format!("    bsbm:name \"{}\" ;\n", p.name));
+        buf.push_str(&format!("    bsbm:country \"{}\" .\n\n", p.country));
     }
 
     for r in &data.reviews {
@@ -287,8 +297,17 @@ mod tests {
     #[test]
     fn estimated_triples_reasonable() {
         let d = generate_dataset(100);
-        // 100 * 5 (products) + 2 (vendors) * 3 + 10 (persons) * 2 + 300 (reviews) * 5
-        // = 500 + 6 + 20 + 1500 = 2026
-        assert_eq!(d.estimated_triples(), 2026);
+        // 100 * 5 (products) + 2 (vendors) * 3 + 10 (persons) * 3 + 300 (reviews) * 5
+        // = 500 + 6 + 30 + 1500 = 2036
+        assert_eq!(d.estimated_triples(), 2036);
+    }
+
+    #[test]
+    fn person_countries_distribute() {
+        let d = generate_dataset(500); // 50 persons
+        let countries: std::collections::HashSet<_> = d.persons.iter().map(|p| p.country).collect();
+        // 50 persons over 5 countries ⇒ every country appears, so the
+        // BI-F2 reviewer-country filter is genuinely ~1/5 selective.
+        assert_eq!(countries.len(), COUNTRIES.len());
     }
 }
