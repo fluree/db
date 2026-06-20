@@ -169,6 +169,37 @@ MATCH (p:Person)
 RETURN p.name, [(p)-[:KNOWS]->(f:Person) WHERE f.age > 30 | f.name] AS adultFriends
 ```
 
+## Subqueries with CALL
+
+`CALL { … }` runs a read-only subquery as a pipeline step. A scope clause
+imports outer variables (correlated execution); without one, the subquery runs
+once and its result is broadcast to every row:
+
+```cypher
+// Per-person friend count (grouped per imported `p`).
+MATCH (p:Person)
+CALL (p) { MATCH (p)-[:KNOWS]->(f:Person) RETURN count(f) AS friends }
+RETURN p.name, friends
+
+// Uncorrelated: one count, broadcast to every row.
+CALL { MATCH (x:Person) RETURN count(x) AS total }
+MATCH (p:Person)
+RETURN p.name, total
+```
+
+A correlated aggregating CALL is grouped per import, so a person with no matches
+drops out. Wrap the inner `MATCH` in `OPTIONAL MATCH` to keep them as `0`:
+
+```cypher
+MATCH (p:Person)
+CALL (p) { OPTIONAL MATCH (p)-[:KNOWS]->(f:Person) RETURN count(f) AS friends }
+RETURN p.name, friends
+```
+
+The body must end in `RETURN` with explicit columns, and a returned name can't
+re-bind an imported one. Writes inside `CALL`, `CALL (*)`, and inner `UNION` are
+not yet supported.
+
 ## Paths
 
 Variable-length traversal (name the relationship type):

@@ -256,6 +256,12 @@ fn lower_single_branch<E: IriEncoder>(
             ReadClause::Unwind(u) => {
                 patterns.push(lower_unwind(ctx, u)?);
             }
+            ReadClause::CallSubquery(call) => {
+                // Pipeline clause: outer rows flow INTO the subquery and its
+                // RETURN columns continue downstream. Unlike WITH, it does NOT
+                // consume the prior patterns — it appends alongside them.
+                patterns.push(lower_call_subquery(ctx, call)?);
+            }
             ReadClause::InlineRows { vars, rows } => {
                 patterns.push(lower_inline_rows(ctx, vars, rows)?);
             }
@@ -1142,6 +1148,114 @@ fn lower_with<E: IriEncoder>(
         sq = sq.with_grouping(g);
     }
     Ok(sq)
+}
+
+/// Lower a `CALL [(imports)] { … }` subquery clause to a `Pattern::Subquery`.
+///
+/// The imported variables become the subquery's correlation inputs: they are
+/// prepended to the SELECT list so `SubqueryOperator` (which derives
+/// correlation from `parent_schema ∩ select`) seeds/hash-joins on them, and so
+/// the outer columns survive into the output. The inner RETURN columns are
+/// appended as the subquery's new outputs.
+fn lower_call_subquery<E: IriEncoder>(
+    ctx: &mut LoweringContext<'_, E>,
+    call: &crate::ast::CallSubqueryClause,
+) -> Result<Pattern> {
+    if call.query.union_tail.is_some() {
+        return Err(LowerError::unsupported(
+            "CALL { … UNION … } is deferred — split into separate CALL subqueries",
+        ));
+    }
+    if uses_wildcard_return(&call.query) {
+        return Err(LowerError::unsupported(
+            "CALL { … } must RETURN explicit columns, not `*` — the subquery's output schema must be statically known",
+        ));
+    }
+
+    let import_vars: Vec<VarId> = call
+        .imports
+        .iter()
+        .map(|v| ctx.intern_var(&v.name))
+        .collect();
+
+    let mut branch = lower_single_branch(ctx, &call.query)?;
+    let return_vars = branch.projected_vars();
+    if return_vars.is_empty() {
+        return Err(LowerError::unsupported(
+            "CALL { … } subquery must RETURN at least one column",
+        ));
+    }
+
+    // Cypher forbids a subquery RETURN that re-introduces a name already bound
+    // in the outer scope (here: an imported variable). Reject the collision
+    // rather than silently shadow.
+    for rv in &return_vars {
+        if import_vars.contains(rv) {
+            let name = ctx
+                .vars
+                .try_name(*rv)
+                .map(ToString::to_string)
+                .unwrap_or_else(|| format!("?v{}", rv.0));
+            return Err(LowerError::unsupported(format!(
+                "CALL subquery RETURNs `{name}`, which is already bound in the outer scope — \
+                 a subquery cannot return a variable that already exists outside it"
+            )));
+        }
+    }
+
+    // Correlated aggregation: a `CALL (p) { … RETURN count(f) }` body lowers to
+    // IMPLICIT grouping (no GROUP BY key). Evaluated once + hash-joined (the
+    // materialize path SubqueryOperator picks for a large parent), that collapses
+    // to a single global aggregate. Cypher semantics group the subquery per
+    // import, so promote the body-referenced imports to GROUP BY keys — correct
+    // in both per-row and materialize-once modes (a single-valued seed groups to
+    // one row either way). Only imports actually bound inside the body qualify;
+    // a pure pass-through import isn't available to group on.
+    if branch.grouping.is_some() && !import_vars.is_empty() {
+        let body_refs: std::collections::HashSet<VarId> = branch
+            .patterns
+            .iter()
+            .flat_map(Pattern::referenced_vars)
+            .collect();
+        let group_imports: Vec<VarId> = import_vars
+            .iter()
+            .copied()
+            .filter(|v| body_refs.contains(v))
+            .collect();
+        if !group_imports.is_empty() {
+            branch.grouping = branch
+                .grouping
+                .take()
+                .map(|g| prepend_group_keys(g, &group_imports));
+        }
+    }
+
+    // select = imports (correlation) ++ return columns.
+    let mut select = import_vars;
+    for rv in return_vars {
+        if !select.contains(&rv) {
+            select.push(rv);
+        }
+    }
+
+    Ok(branch.into_subquery_pattern(select))
+}
+
+/// Rebuild a `Grouping` with `extra` prepended to its GROUP BY keys (dedup).
+/// Turns `Implicit` grouping into `Explicit` so a correlated aggregate is
+/// partitioned per imported variable.
+fn prepend_group_keys(grouping: Grouping, extra: &[VarId]) -> Grouping {
+    let mut group_by: Vec<VarId> = extra.to_vec();
+    for v in grouping.group_by_vars() {
+        if !group_by.contains(&v) {
+            group_by.push(v);
+        }
+    }
+    let aggregates: Vec<AggregateSpec> = grouping.aggregates().cloned().collect();
+    let binds: Vec<(VarId, fluree_db_query::ir::Expression)> = grouping.binds().cloned().collect();
+    let having = grouping.having().cloned();
+    Grouping::assemble(group_by, aggregates, binds, having)
+        .expect("non-empty group_by yields Explicit grouping")
 }
 
 fn visible_vars_from_patterns<E: IriEncoder>(

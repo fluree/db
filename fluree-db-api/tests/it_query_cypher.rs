@@ -1913,6 +1913,226 @@ async fn cypher_pattern_comprehension_outer_var_and_nested_async() {
     );
 }
 
+/// Seed Alice->Bob, Alice->Carol, Bob->Carol for the CALL subquery tests.
+async fn seed_call_graph(
+    fluree: &fluree_db_api::Fluree,
+    ledger_id: &str,
+) -> fluree_db_api::LedgerState {
+    let l = genesis_ledger(fluree, ledger_id);
+    fluree
+        .transact_cypher(
+            l,
+            r#"CREATE (a:Person {name: "Alice"})-[:KNOWS]->(b:Person {name: "Bob"}),
+                      (a)-[:KNOWS]->(c:Person {name: "Carol"}),
+                      (b)-[:KNOWS]->(c)"#,
+        )
+        .await
+        .expect("seed call graph")
+        .ledger
+}
+
+#[tokio::test]
+async fn cypher_call_subquery_uncorrelated_broadcasts() {
+    // `CALL { … }` with no scope clause runs once; its single value is broadcast
+    // to every outer row.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = seed_call_graph(&fluree, "it/cypher:call-uncorr").await;
+    let db = graphdb_from_ledger(&l);
+
+    let cj = fluree
+        .query_cypher(
+            &db,
+            r#"CALL { MATCH (x:Person) RETURN count(x) AS total }
+               MATCH (p:Person)
+               RETURN p.name AS name, total ORDER BY name"#,
+        )
+        .await
+        .expect("uncorrelated call")
+        .to_cypher_json_async(db.as_graph_db_ref())
+        .await
+        .expect("cypher json");
+    let data = cj["results"][0]["data"].as_array().expect("rows");
+    assert_eq!(data.len(), 3, "one row per person: {cj}");
+    assert_eq!(data[0]["row"], json!(["Alice", 3]), "{cj}");
+    assert_eq!(data[1]["row"], json!(["Bob", 3]), "{cj}");
+    assert_eq!(data[2]["row"], json!(["Carol", 3]), "total broadcast: {cj}");
+}
+
+#[tokio::test]
+async fn cypher_call_subquery_correlated_aggregate() {
+    // `CALL (p) { … RETURN count(f) }` is grouped per imported `p`. Plain MATCH
+    // inside drops a zero-match import (Carol has no outgoing KNOWS); OPTIONAL
+    // MATCH retains it as 0.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = seed_call_graph(&fluree, "it/cypher:call-corr-agg").await;
+    let db = graphdb_from_ledger(&l);
+
+    let cj = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (p:Person)
+               CALL (p) { MATCH (p)-[:KNOWS]->(f:Person) RETURN count(f) AS friends }
+               RETURN p.name AS name, friends ORDER BY name"#,
+        )
+        .await
+        .expect("correlated aggregate call")
+        .to_cypher_json_async(db.as_graph_db_ref())
+        .await
+        .expect("cypher json");
+    let data = cj["results"][0]["data"].as_array().expect("rows");
+    assert_eq!(data.len(), 2, "Carol (zero matches) drops out: {cj}");
+    assert_eq!(data[0]["row"], json!(["Alice", 2]), "{cj}");
+    assert_eq!(data[1]["row"], json!(["Bob", 1]), "{cj}");
+
+    // OPTIONAL MATCH inside the CALL keeps the zero-match import as 0.
+    let opt = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (p:Person)
+               CALL (p) { OPTIONAL MATCH (p)-[:KNOWS]->(f:Person) RETURN count(f) AS friends }
+               RETURN p.name AS name, friends ORDER BY name"#,
+        )
+        .await
+        .expect("correlated optional aggregate call")
+        .to_cypher_json_async(db.as_graph_db_ref())
+        .await
+        .expect("cypher json");
+    let data = opt["results"][0]["data"].as_array().expect("rows");
+    assert_eq!(data.len(), 3, "OPTIONAL retains Carol: {opt}");
+    assert_eq!(data[2]["row"], json!(["Carol", 0]), "{opt}");
+}
+
+#[tokio::test]
+async fn cypher_call_subquery_correlated_row_expanding() {
+    // A correlated CALL with no aggregate expands to one row per inner match.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = seed_call_graph(&fluree, "it/cypher:call-expand").await;
+    let db = graphdb_from_ledger(&l);
+
+    let cj = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (p:Person {name: "Alice"})
+               CALL (p) { MATCH (p)-[:KNOWS]->(f:Person) RETURN f.name AS friend }
+               RETURN p.name AS name, friend ORDER BY friend"#,
+        )
+        .await
+        .expect("row-expanding call")
+        .to_cypher_json_async(db.as_graph_db_ref())
+        .await
+        .expect("cypher json");
+    let data = cj["results"][0]["data"].as_array().expect("rows");
+    assert_eq!(data.len(), 2, "one row per friend: {cj}");
+    assert_eq!(data[0]["row"], json!(["Alice", "Bob"]), "{cj}");
+    assert_eq!(data[1]["row"], json!(["Alice", "Carol"]), "{cj}");
+}
+
+#[tokio::test]
+async fn cypher_call_subquery_correlated_aggregate_join_mode() {
+    // Soundness at scale: with >= 8 outer rows the SubqueryOperator picks
+    // evaluate-once + hash-join (join-mode). The imports-as-GROUP-BY promotion
+    // must still produce per-person counts, not a single global count broadcast
+    // to every row. 12 people, each knowing exactly the next two (mod 12).
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/cypher:call-joinmode");
+    let n = 12;
+    let people: Vec<JsonValue> = (0..n)
+        .map(|i| {
+            json!({
+                "@id": format!("ex:p{i}"),
+                "@type": "ex:Person",
+                "ex:name": format!("P{i:02}"),
+                "ex:KNOWS": [
+                    {"@id": format!("ex:p{}", (i + 1) % n)},
+                    {"@id": format!("ex:p{}", (i + 2) % n)},
+                ],
+            })
+        })
+        .collect();
+    let committed = fluree
+        .insert(ledger0, &json!({"@context": ctx(), "@graph": people}))
+        .await
+        .expect("seed 12 people");
+    let db = graphdb_from_ledger(&committed.ledger);
+
+    let cj = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (p:Person)
+               CALL (p) { MATCH (p)-[:KNOWS]->(f:Person) RETURN count(f) AS friends }
+               RETURN p.name AS name, friends ORDER BY name"#,
+        )
+        .await
+        .expect("join-mode correlated aggregate")
+        .to_cypher_json_async(db.as_graph_db_ref())
+        .await
+        .expect("cypher json");
+    let data = cj["results"][0]["data"].as_array().expect("rows");
+    assert_eq!(data.len(), n, "one row per person: {cj}");
+    for row in data {
+        assert_eq!(
+            row["row"][1],
+            json!(2),
+            "each person KNOWS exactly 2 — per-person count, not a global broadcast: {cj}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn cypher_call_subquery_rejections() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = seed_call_graph(&fluree, "it/cypher:call-reject").await;
+    let db = graphdb_from_ledger(&l);
+
+    // CALL (*) is deferred.
+    assert!(
+        fluree
+            .query_cypher(
+                &db,
+                r#"MATCH (p:Person) CALL (*) { MATCH (p)-[:KNOWS]->(f) RETURN f.name AS n } RETURN n"#,
+            )
+            .await
+            .is_err(),
+        "CALL (*) is deferred"
+    );
+
+    // A write inside CALL is deferred.
+    assert!(
+        fluree
+            .query_cypher(
+                &db,
+                r#"MATCH (p:Person) CALL (p) { CREATE (p)-[:SELF]->(p) RETURN p AS x } RETURN x"#,
+            )
+            .await
+            .is_err(),
+        "writes inside CALL are deferred"
+    );
+
+    // RETURN * inside CALL is rejected (opaque output schema).
+    assert!(
+        fluree
+            .query_cypher(
+                &db,
+                r#"MATCH (p:Person) CALL (p) { MATCH (p)-[:KNOWS]->(f) RETURN * } RETURN p.name"#,
+            )
+            .await
+            .is_err(),
+        "RETURN * inside CALL is rejected"
+    );
+
+    // A subquery RETURN that re-binds an imported name collides.
+    assert!(
+        fluree
+            .query_cypher(
+                &db,
+                r#"MATCH (p:Person) CALL (p) { MATCH (p)-[:KNOWS]->(f) RETURN f AS p } RETURN p.name"#,
+            )
+            .await
+            .is_err(),
+        "returning an imported name collides"
+    );
+}
+
 #[tokio::test]
 async fn cypher_map_projection() {
     // `n{.key}` selectors, a `key: expr` entry, and `n{.*}` (all properties).

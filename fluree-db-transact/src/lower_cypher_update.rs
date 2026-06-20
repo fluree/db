@@ -336,6 +336,12 @@ impl<'a> CypherLowering<'a> {
                          `$param` list of maps so they desugar to a VALUES join",
                     ));
                 }
+                ReadClause::CallSubquery(_) => {
+                    return Err(LowerCypherError::unsupported(
+                        "CALL { … } before a write clause is deferred — the read-side CALL \
+                         subquery is only supported in read queries in v1",
+                    ));
+                }
                 // Desugared constant rows (the `UNWIND $listOfMaps` → VALUES
                 // rewrite). Bind each column as a VALUES block; the MATCH and
                 // CREATE/SET templates then fire once per row.

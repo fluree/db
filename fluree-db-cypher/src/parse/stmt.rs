@@ -1,9 +1,9 @@
 //! Statement-level parser.
 
 use crate::ast::{
-    CreateClause, DeleteClause, MatchClause, MergeClause, OrderDirection, OrderItem,
-    ProjectionItem, Query, ReadClause, RemoveClause, RemoveItem, ReturnClause, SetClause, SetItem,
-    Statement, UnionTail, UnwindClause, Update, WithClause, WriteClause,
+    CallSubqueryClause, CreateClause, DeleteClause, MatchClause, MergeClause, OrderDirection,
+    OrderItem, ProjectionItem, Query, ReadClause, RemoveClause, RemoveItem, ReturnClause,
+    SetClause, SetItem, Statement, UnionTail, UnwindClause, Update, WithClause, WriteClause,
 };
 use crate::ast::{Expr, Variable};
 use crate::diag::{DiagCode, Diagnostic};
@@ -37,6 +37,9 @@ pub fn parse_statement(s: &mut TokenStream) -> Result<Statement, Diagnostic> {
             }
             TokenKind::Unwind => {
                 read_clauses.push(ReadClause::Unwind(parse_unwind(s)?));
+            }
+            TokenKind::Call => {
+                read_clauses.push(ReadClause::CallSubquery(parse_call_subquery(s)?));
             }
             TokenKind::Return => {
                 return_clause = Some(parse_return(s)?);
@@ -194,6 +197,98 @@ fn parse_unwind(s: &mut TokenStream) -> Result<UnwindClause, Diagnostic> {
     Ok(UnwindClause {
         expr,
         alias,
+        span: start.union(end),
+    })
+}
+
+/// Parse `CALL [(a, b)] { <read-query ending in RETURN> }`. The optional scope
+/// clause names imported variables; `CALL (*)` is deferred. The body reuses the
+/// read-clause grammar and must terminate in RETURN.
+fn parse_call_subquery(s: &mut TokenStream) -> Result<CallSubqueryClause, Diagnostic> {
+    let start = s.expect(&TokenKind::Call)?;
+
+    let imports = if matches!(s.peek_kind(), TokenKind::LParen) {
+        s.advance();
+        if matches!(s.peek_kind(), TokenKind::Star) {
+            return Err(s.error(
+                DiagCode::DeferredProcedure,
+                "CALL (*) { … } (import all variables) is deferred — list the imported variables explicitly, e.g. CALL (a, b) { … }",
+            ));
+        }
+        let mut vars = Vec::new();
+        if !matches!(s.peek_kind(), TokenKind::RParen) {
+            loop {
+                vars.push(parse_var(s)?);
+                if s.eat(&TokenKind::Comma).is_none() {
+                    break;
+                }
+            }
+        }
+        s.expect(&TokenKind::RParen)?;
+        vars
+    } else {
+        Vec::new()
+    };
+
+    s.expect(&TokenKind::LBrace)?;
+    let query = parse_call_body(s)?;
+    let end = s.expect(&TokenKind::RBrace)?;
+    Ok(CallSubqueryClause {
+        imports,
+        query: Box::new(query),
+        span: start.union(end),
+    })
+}
+
+/// Parse the body of a `CALL { … }` subquery: read clauses terminating in
+/// RETURN, stopping at the closing `}`. Writes inside CALL and inner UNION are
+/// deferred.
+fn parse_call_body(s: &mut TokenStream) -> Result<Query, Diagnostic> {
+    let start = s.peek_span();
+    let mut read_clauses = Vec::new();
+    let return_clause = loop {
+        match s.peek_kind() {
+            TokenKind::Match => read_clauses.push(ReadClause::Match(parse_match(s, false)?)),
+            TokenKind::Optional => {
+                s.advance();
+                read_clauses.push(ReadClause::OptionalMatch(parse_match(s, true)?));
+            }
+            TokenKind::With => read_clauses.push(ReadClause::With(parse_with(s)?)),
+            TokenKind::Unwind => read_clauses.push(ReadClause::Unwind(parse_unwind(s)?)),
+            TokenKind::Call => read_clauses.push(ReadClause::CallSubquery(parse_call_subquery(s)?)),
+            TokenKind::Return => break parse_return(s)?,
+            TokenKind::Create
+            | TokenKind::Merge
+            | TokenKind::Set
+            | TokenKind::Remove
+            | TokenKind::Delete
+            | TokenKind::Detach => {
+                return Err(s.error(
+                    DiagCode::DeferredProcedure,
+                    "writes inside CALL { … } are deferred — the subquery body must be read-only (MATCH / OPTIONAL MATCH / WITH / UNWIND / RETURN)",
+                ));
+            }
+            other => {
+                return Err(s.error(
+                    DiagCode::UnexpectedToken,
+                    format!("unexpected `{other}` in CALL subquery — expected MATCH / OPTIONAL MATCH / WITH / UNWIND / RETURN"),
+                ));
+            }
+        }
+    };
+
+    if matches!(s.peek_kind(), TokenKind::Union) {
+        return Err(s.error(
+            DiagCode::DeferredProcedure,
+            "CALL { … UNION … } is deferred — split into separate CALL subqueries",
+        ));
+    }
+
+    let end = s.peek_span();
+    Ok(Query {
+        clauses: read_clauses,
+        return_clause,
+        union_tail: None,
         span: start.union(end),
     })
 }

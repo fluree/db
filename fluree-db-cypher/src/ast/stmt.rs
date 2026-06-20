@@ -59,6 +59,11 @@ pub enum ReadClause {
     OptionalMatch(MatchClause),
     With(WithClause),
     Unwind(UnwindClause),
+    /// `CALL (a, b) { <subquery> }` — a correlated subquery clause. The scope
+    /// clause `(a, b)` lists the imported variables (empty for `CALL { … }`,
+    /// which runs uncorrelated). The body is a read-only query terminating in
+    /// RETURN. Lowers to a `Pattern::Subquery` appended to the pipeline.
+    CallSubquery(CallSubqueryClause),
     /// Internal-only: a constant multi-column row set, never produced by the
     /// parser. The parameter desugaring rewrites `UNWIND $listOfMaps AS row`
     /// (when the body has a MATCH) into this — one column per `row.field`
@@ -92,6 +97,16 @@ pub struct WithClause {
 pub struct UnwindClause {
     pub expr: Expr,
     pub alias: Variable,
+    pub span: SourceSpan,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct CallSubqueryClause {
+    /// Imported (correlated) variables from the explicit scope clause
+    /// `CALL (a, b) { … }`. Empty for `CALL { … }` (uncorrelated).
+    pub imports: Vec<Variable>,
+    /// The read-only subquery body (ends in RETURN).
+    pub query: Box<Query>,
     pub span: SourceSpan,
 }
 

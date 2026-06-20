@@ -293,6 +293,17 @@ ORDER BY / SKIP / LIMIT
 - `WITH ... [WHERE/ORDER BY/SKIP/LIMIT/DISTINCT]` and `WITH *` — subquery
   boundary. WHERE that references aggregate aliases lowers to HAVING
   rather than a pre-aggregation Filter. Nested WITHs nest Subqueries.
+- `CALL [(a, b)] { … }` — a read-only subquery clause in the pipeline. The
+  scope clause `(a, b)` imports outer variables (the subquery is correlated on
+  them); `CALL { … }` with no scope clause runs once and broadcasts its result.
+  The body is `MATCH` / `OPTIONAL MATCH` / `WITH` / `UNWIND` / nested `CALL`
+  ending in `RETURN` (explicit columns, not `*`); outer rows flow in and the
+  RETURN columns continue downstream. A correlated aggregating CALL
+  (`CALL (p) { … RETURN count(f) }`) is grouped per import, so an import with
+  **zero inner matches yields no row** — wrap the inner `MATCH` in `OPTIONAL
+  MATCH` to retain it as a `0`. A RETURN that re-binds an imported name is
+  rejected. Deferred: writes inside `CALL`, `CALL (*)` (import-all), and
+  `CALL { … UNION … }`.
 - `RETURN n`, `RETURN n, m`, `RETURN *`, `RETURN DISTINCT ...`,
   `RETURN expr AS alias` (lowered via `Bind`).
 - `UNION` and `UNION ALL` at the RETURN boundary. Every branch must
@@ -417,7 +428,8 @@ produces a clear error rather than a silent wrong answer.
   multi-hop or multi-part (comma-separated) `MERGE`, multiple `MERGE` clauses,
   `ON MATCH SET` on a relationship `MERGE`, and `MERGE` combined with another
   write clause in the same statement.
-- `CALL` / stored procedures, `LOAD CSV`, `FOREACH`, schema DDL.
+- `CALL proc(...)` stored/builtin procedures (the `CALL { … }` read subquery
+  *is* supported — see above), `LOAD CSV`, `FOREACH`, schema DDL.
 - Multi-statement scripts — submit one statement per request.
 
 ## See also

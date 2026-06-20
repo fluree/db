@@ -866,6 +866,7 @@ fn subst_read_clause(c: &mut ReadClause, p: &ParamMap) -> Result<(), ParamError>
             subst_opt(&mut w.limit, p)
         }
         ReadClause::Unwind(u) => subst_expr(&mut u.expr, p),
+        ReadClause::CallSubquery(call) => subst_query(&mut call.query, p),
         // Desugared constant rows: cells are already literals, but recurse for
         // robustness (a future producer might leave a `$param` cell).
         ReadClause::InlineRows { rows, .. } => {
