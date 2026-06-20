@@ -259,8 +259,12 @@ fn lower_single_branch<E: IriEncoder>(
             ReadClause::CallSubquery(call) => {
                 // Pipeline clause: outer rows flow INTO the subquery and its
                 // RETURN columns continue downstream. Unlike WITH, it does NOT
-                // consume the prior patterns — it appends alongside them.
-                patterns.push(lower_call_subquery(ctx, call)?);
+                // consume the prior patterns — it appends alongside them. The
+                // outer scope (vars bound by preceding clauses) gates which
+                // imports are valid and which RETURN names would collide.
+                let outer_vars = visible_vars_from_patterns(ctx, &patterns);
+                let p = lower_call_subquery(ctx, call, &outer_vars)?;
+                patterns.push(p);
             }
             ReadClause::InlineRows { vars, rows } => {
                 patterns.push(lower_inline_rows(ctx, vars, rows)?);
@@ -1160,6 +1164,7 @@ fn lower_with<E: IriEncoder>(
 fn lower_call_subquery<E: IriEncoder>(
     ctx: &mut LoweringContext<'_, E>,
     call: &crate::ast::CallSubqueryClause,
+    outer_vars: &[VarId],
 ) -> Result<Pattern> {
     if call.query.union_tail.is_some() {
         return Err(LowerError::unsupported(
@@ -1172,11 +1177,24 @@ fn lower_call_subquery<E: IriEncoder>(
         ));
     }
 
+    let outer_set: std::collections::HashSet<VarId> = outer_vars.iter().copied().collect();
+
+    // Every imported variable must already be bound in the outer scope —
+    // `CALL (x) { … }` where `x` was never declared outside is invalid Cypher.
     let import_vars: Vec<VarId> = call
         .imports
         .iter()
         .map(|v| ctx.intern_var(&v.name))
         .collect();
+    for (v, imp) in import_vars.iter().zip(&call.imports) {
+        if !outer_set.contains(v) {
+            return Err(LowerError::unsupported(format!(
+                "CALL imports `{}`, which is not bound in the outer scope — only variables \
+                 already bound by a preceding clause can be imported",
+                imp.name
+            )));
+        }
+    }
 
     let mut branch = lower_single_branch(ctx, &call.query)?;
     let return_vars = branch.projected_vars();
@@ -1186,11 +1204,13 @@ fn lower_call_subquery<E: IriEncoder>(
         ));
     }
 
-    // Cypher forbids a subquery RETURN that re-introduces a name already bound
-    // in the outer scope (here: an imported variable). Reject the collision
-    // rather than silently shadow.
+    // Cypher forbids a subquery RETURN that re-introduces ANY name already bound
+    // in the outer scope (not just an import) — the executor would treat the
+    // collision as an existing parent var and silently drop the subquery's
+    // value. Reject rather than shadow. Synthetic `?#__*` vars are excluded from
+    // `outer_set` already, so they can't false-trigger.
     for rv in &return_vars {
-        if import_vars.contains(rv) {
+        if outer_set.contains(rv) {
             let name = ctx
                 .vars
                 .try_name(*rv)

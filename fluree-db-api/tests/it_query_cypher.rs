@@ -2131,6 +2131,31 @@ async fn cypher_call_subquery_rejections() {
             .is_err(),
         "returning an imported name collides"
     );
+
+    // A subquery RETURN that re-binds a NON-import outer name also collides
+    // (the executor would silently drop the subquery's value otherwise).
+    assert!(
+        fluree
+            .query_cypher(
+                &db,
+                r#"MATCH (p:Person), (q:Person) CALL (p) { MATCH (p)-[:KNOWS]->(f:Person) RETURN f AS q } RETURN q.name"#,
+            )
+            .await
+            .is_err(),
+        "returning a name already bound elsewhere in the outer scope collides"
+    );
+
+    // An import that was never bound in the outer scope is rejected.
+    assert!(
+        fluree
+            .query_cypher(
+                &db,
+                r#"CALL (p) { MATCH (p:Person) RETURN p.name AS name } RETURN name"#,
+            )
+            .await
+            .is_err(),
+        "importing a variable not bound outside is rejected"
+    );
 }
 
 #[tokio::test]
