@@ -169,6 +169,12 @@ ORDER BY / SKIP / LIMIT
   listed type per hop (LDBC IC12's
   `[:HAS_TYPE|IS_SUBCLASS_OF*0..]`). Bounded alternation
   (`-[:A|B*1..3]->`) is still deferred — use the unbounded form.
+- **Variable-length relationship / path binding** — a **bounded** typed
+  var-length relationship may bind a variable: `-[r:T*1..n]->` binds `r` to the
+  list of relationship values on each match, and `MATCH p = (a)-[:T*1..n]->(b)`
+  binds `p` to a path. Each fixed-length chain branch constructs the value from
+  its nodes. Deferred: binding on an **unbounded** (`-[r:T*]->`), **undirected**,
+  **untyped**, or IRI-anchored var-length path (all reject with a clear error).
 - **Untyped** variable-length paths `-[*]->`, `-[*m..n]->` (no relationship
   type): a *wildcard* transitive path that follows **any** node→node edge per
   hop — excluding `rdf:type` (its object is a class, not a node) and the
@@ -190,9 +196,16 @@ ORDER BY / SKIP / LIMIT
   input row; `All` mode emits one row per minimal-length path. The
   path binds to a `Binding::Path` (node sequence); `length(p)` is its
   hop count and `p IS NULL` (under `OPTIONAL MATCH`) detects "no path"
-  — the IC13 shape. `nodes(p)` returns the node sequence and
-  `pathPairs(p)` the consecutive node pairs (both list-valued, for
-  `UNWIND`); `relationships(p)` (edge identities) is deferred.
+  — the IC13 shape. `nodes(p)` returns the node sequence,
+  `pathPairs(p)` the consecutive node pairs, and `relationships(p)` the
+  per-hop relationship values (all list-valued, for `UNWIND` / list functions).
+- **Relationship values.** A relationship is a value carrying its start node,
+  type, and end node (`Binding::Rel`); it comes from a bound `-[r:T]->` (the
+  reified edge), `relationships(p)`, or a bound var-length relationship.
+  `type(r)` is the relationship type string, `startNode(r)` / `endNode(r)` its
+  endpoints, `properties(r)` / `r.prop` its edge properties (present only for a
+  reified/annotated edge — a plain path edge has none). Rendered as a
+  `{start, type, end}` object.
 - Scalar functions:
   - **Casts / general:** `toString`, `toInteger`, `toFloat`, `coalesce`.
   - **String:** `toUpper`, `toLower`, `substring` (0-indexed; 2- and 3-arg),
