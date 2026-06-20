@@ -63,6 +63,22 @@ const HOP_BY_HOP_HEADERS: &[&str] = &[
 /// the leader directly.
 const MAX_FORWARDED_BODY_BYTES: usize = 64 * 1024 * 1024;
 
+/// Header carrying the count of follower → leader hops a request
+/// has already accumulated. Each forwarder increments it; the next
+/// forwarder bails if the count is already at [`MAX_FORWARD_HOPS`].
+/// Stops a misconfigured cluster (two nodes that each believe the
+/// other is leader, e.g. across a membership-update race) from
+/// looping a single client request through the whole ring.
+const FORWARD_HOPS_HEADER: &str = "x-fluree-raft-forward-hops";
+
+/// Maximum follower → leader hops a request may take. One hop
+/// covers the canonical case (client lands on a follower, follower
+/// forwards to the leader); the slack absorbs at-most-one stale
+/// membership snapshot on the path. Anything beyond that is almost
+/// certainly a converging cluster — we'd rather surface 503 + retry
+/// than amplify the load.
+const MAX_FORWARD_HOPS: u32 = 2;
+
 // ============================================================================
 // State
 // ============================================================================
@@ -101,12 +117,31 @@ impl LeaderForwarder {
             .find(|(id, _)| **id == leader_id)
             .map(|(_, node)| node.clone());
         match leader_node {
-            Some(node) if !node.client_addr.is_empty() => {
+            Some(node) if is_valid_leader_url(&node.client_addr) => {
                 ForwardDecision::Forward(node.client_addr)
             }
             _ => ForwardDecision::UnknownLeader(leader_id),
         }
     }
+}
+
+/// Sanity-check a candidate leader URL before opening an outbound
+/// connection to it. Replicated membership data is broadly trusted
+/// (it has to be — proposing a `ChangeMembership` requires Raft
+/// consent), but a buggy `add_learner` call or a hand-edited
+/// snapshot could leave a `client_addr` with an unexpected scheme.
+/// Without this, a malformed entry could redirect every follower's
+/// forwarded write at `file://`, `javascript:`, or any other URL
+/// scheme reqwest happens to accept. Permit only the two transport
+/// schemes the cluster actually uses.
+fn is_valid_leader_url(url: &str) -> bool {
+    if url.is_empty() {
+        return false;
+    }
+    let Ok(parsed) = reqwest::Url::parse(url) else {
+        return false;
+    };
+    matches!(parsed.scheme(), "http" | "https") && parsed.has_host()
 }
 
 enum ForwardDecision {
@@ -150,14 +185,25 @@ pub async fn forward_to_leader(
     match forwarder.decide().await {
         ForwardDecision::Local => next.run(request).await,
         ForwardDecision::Forward(leader_url) => {
-            forward_request(&forwarder.client, &leader_url, request)
+            let hops = incoming_hop_count(request.headers());
+            if hops >= MAX_FORWARD_HOPS {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!(
+                        "forward hop limit ({MAX_FORWARD_HOPS}) reached; \
+                         cluster likely converging on a new leader, retry shortly"
+                    ),
+                )
+                    .into_response();
+            }
+            forward_request(&forwarder.client, &leader_url, request, hops + 1)
                 .await
                 .unwrap_or_else(IntoResponse::into_response)
         }
         ForwardDecision::UnknownLeader(id) => (
             StatusCode::SERVICE_UNAVAILABLE,
             format!(
-                "leader node {id} has no client address in the current \
+                "leader node {id} has no usable client address in the current \
                  membership; cluster may be reconfiguring"
             ),
         )
@@ -168,6 +214,18 @@ pub async fn forward_to_leader(
         )
             .into_response(),
     }
+}
+
+/// Read the hop counter from a follower-forward header. Missing /
+/// malformed values mean "this is the first hop" — clients that
+/// don't set the header at all start at zero, so a fresh public
+/// request gets one full follower → leader hop.
+fn incoming_hop_count(headers: &HeaderMap) -> u32 {
+    headers
+        .get(FORWARD_HOPS_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(0)
 }
 
 // ============================================================================
@@ -212,6 +270,7 @@ async fn forward_request(
     client: &reqwest::Client,
     leader_base_url: &str,
     req: Request,
+    outgoing_hops: u32,
 ) -> Result<Response, ForwardError> {
     let (parts, body) = req.into_parts();
     let original_uri = parts.extensions.get::<OriginalUri>().map(|o| &o.0);
@@ -229,9 +288,19 @@ async fn forward_request(
         .await
         .map_err(ForwardError::ReadBody)?;
 
+    let mut headers = strip_hop_by_hop(parts.headers);
+    // Stamp the outgoing hop count so the next forwarder can bail
+    // if we're stuck in a loop. We always insert (rather than
+    // merging onto whatever the client sent) so a hostile client
+    // can't suppress the guard.
+    headers.insert(
+        HeaderName::from_static(FORWARD_HOPS_HEADER),
+        HeaderValue::from(outgoing_hops),
+    );
+
     let upstream = client
         .request(parts.method, &leader_url)
-        .headers(strip_hop_by_hop(parts.headers))
+        .headers(headers)
         .body(body_bytes)
         .send()
         .await
@@ -334,5 +403,51 @@ mod tests {
             status_from_reqwest(reqwest::StatusCode::INTERNAL_SERVER_ERROR),
             StatusCode::INTERNAL_SERVER_ERROR
         );
+    }
+
+    #[test]
+    fn leader_url_validation_accepts_http_and_https() {
+        assert!(is_valid_leader_url("http://node-1:8080"));
+        assert!(is_valid_leader_url("https://node-1.cluster.internal:8080"));
+        assert!(is_valid_leader_url("http://10.0.1.5:9090/"));
+    }
+
+    #[test]
+    fn leader_url_validation_rejects_other_schemes_and_garbage() {
+        // Schemes the forwarder must not honor even if a buggy
+        // membership update placed them there.
+        assert!(!is_valid_leader_url("file:///etc/passwd"));
+        assert!(!is_valid_leader_url("ftp://node-1:21"));
+        assert!(!is_valid_leader_url("javascript:alert(1)"));
+        assert!(!is_valid_leader_url("data:text/plain,hi"));
+        // Plain garbage.
+        assert!(!is_valid_leader_url(""));
+        assert!(!is_valid_leader_url("not a url"));
+    }
+
+    #[test]
+    fn incoming_hop_count_defaults_to_zero() {
+        let h = HeaderMap::new();
+        assert_eq!(incoming_hop_count(&h), 0);
+    }
+
+    #[test]
+    fn incoming_hop_count_parses_decimal() {
+        let mut h = HeaderMap::new();
+        h.insert(FORWARD_HOPS_HEADER, "1".parse().unwrap());
+        assert_eq!(incoming_hop_count(&h), 1);
+        h.insert(FORWARD_HOPS_HEADER, "42".parse().unwrap());
+        assert_eq!(incoming_hop_count(&h), 42);
+    }
+
+    #[test]
+    fn incoming_hop_count_malformed_falls_back_to_zero() {
+        // A hostile / buggy client can't bypass the guard by
+        // sending unparseable values — we treat them as "fresh."
+        let mut h = HeaderMap::new();
+        h.insert(FORWARD_HOPS_HEADER, "not-a-number".parse().unwrap());
+        assert_eq!(incoming_hop_count(&h), 0);
+        h.insert(FORWARD_HOPS_HEADER, "-1".parse().unwrap());
+        assert_eq!(incoming_hop_count(&h), 0);
     }
 }
