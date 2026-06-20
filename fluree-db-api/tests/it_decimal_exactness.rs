@@ -56,6 +56,20 @@ fn binding_values(sparql_json: &JsonValue, var: &str) -> Vec<String> {
         .collect()
 }
 
+fn binding_datatypes(sparql_json: &JsonValue, var: &str) -> Vec<String> {
+    sparql_json["results"]["bindings"]
+        .as_array()
+        .expect("bindings array")
+        .iter()
+        .map(|b| {
+            b[var]["datatype"]
+                .as_str()
+                .expect("binding datatype string")
+                .to_string()
+        })
+        .collect()
+}
+
 fn memory_fluree() -> MemoryFluree {
     assert_index_defaults();
     FlureeBuilder::memory().build_memory()
@@ -928,38 +942,67 @@ async fn integer_valued_double_over_indexed_predicate_is_not_corrupted() {
             trigger_index_and_wait(&handle, ledger_id, result.receipt.t).await;
             let ledger = fluree.ledger(ledger_id).await.expect("load ledger");
 
-            // Insert a NEW integer-valued double into the now-indexed predicate;
-            // it lands in novelty and is read back through the overlay merge.
+            // Insert NEW integer-valued doubles into the now-indexed predicate;
+            // they land in novelty and are read back through the overlay merge.
+            // Boundary companions exercise the encode_f64/decode_f64 sign-flip
+            // branch (-55000.0) and the i64-range edge (2^53, the largest
+            // exactly-representable integral double).
             let result = run_sparql_update(
                 &fluree,
                 ledger,
                 r#"
                 PREFIX ex: <http://example.org/>
                 PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
-                INSERT DATA { ex:a ex:amount "55000.0"^^xsd:double . }
+                INSERT DATA {
+                    ex:a ex:amount "55000.0"^^xsd:double .
+                    ex:b ex:amount "-55000.0"^^xsd:double .
+                    ex:c ex:amount "9.007199254740992e15"^^xsd:double .
+                }
                 "#,
             )
             .await;
             let ledger = result.ledger;
 
-            let query = r"
-                PREFIX ex: <http://example.org/>
-                SELECT ?amount WHERE { ex:a ex:amount ?amount . }
-            ";
-            let result = support::query_sparql(&fluree, &ledger, query)
-                .await
-                .expect("query");
-            let sparql_json = result
-                .to_sparql_json(&ledger.snapshot)
-                .expect("to_sparql_json");
-            let values = binding_values(&sparql_json, "amount");
-            assert_eq!(values.len(), 1, "expected exactly one row, got {values:?}");
-            let got: f64 = values[0].parse().expect("double result");
-            assert_eq!(
-                got, 55000.0,
-                "integer-valued double over an indexed predicate must round-trip \
-                 exactly (was corrupted to a subnormal), got {got:e}"
-            );
+            // (subject, expected exact f64) for each inserted integral double.
+            let cases = [
+                ("ex:a", 55000.0),
+                ("ex:b", -55000.0),
+                ("ex:c", 9.007_199_254_740_992e15),
+            ];
+            for (subject, expected) in cases {
+                let query = format!(
+                    "PREFIX ex: <http://example.org/>
+                     SELECT ?amount WHERE {{ {subject} ex:amount ?amount . }}"
+                );
+                let result = support::query_sparql(&fluree, &ledger, &query)
+                    .await
+                    .expect("query");
+                let sparql_json = result
+                    .to_sparql_json(&ledger.snapshot)
+                    .expect("to_sparql_json");
+
+                let values = binding_values(&sparql_json, "amount");
+                assert_eq!(
+                    values.len(),
+                    1,
+                    "{subject}: expected exactly one row, got {values:?}"
+                );
+                let got: f64 = values[0].parse().expect("double result");
+                assert_eq!(
+                    got, expected,
+                    "{subject}: integer-valued double over an indexed predicate must \
+                     round-trip exactly (was corrupted to a subnormal), got {got:e}"
+                );
+
+                // Lock in that the uniform-f64 encoding does not silently downgrade
+                // the reported datatype to xsd:integer/xsd:long.
+                let datatypes = binding_datatypes(&sparql_json, "amount");
+                assert_eq!(
+                    datatypes,
+                    vec!["http://www.w3.org/2001/XMLSchema#double".to_string()],
+                    "{subject}: datatype must stay xsd:double"
+                );
+            }
         })
         .await;
 }

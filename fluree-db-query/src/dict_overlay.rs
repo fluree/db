@@ -476,7 +476,14 @@ impl DictOverlay {
     ///
     /// Unlike `BinaryIndexStore::value_to_obj_pair()`, this never returns `None`
     /// for representable values.
-    pub fn value_to_obj_pair(&mut self, val: &FlakeValue) -> io::Result<(ObjKind, ObjKey)> {
+    ///
+    /// Kept for: parity with the live `value_to_otype_okey` encoder in
+    /// `binary_scan.rs` — both must apply the same integral-double guard so a
+    /// future overlay write path can reuse this twin without reintroducing the
+    /// subnormal corruption (fluree/db-r#142).
+    /// Use when: a `DictOverlay`-based write path needs (ObjKind, ObjKey) pairs.
+    #[expect(dead_code)]
+    pub(crate) fn value_to_obj_pair(&mut self, val: &FlakeValue) -> io::Result<(ObjKind, ObjKey)> {
         match val {
             FlakeValue::Null => Ok((ObjKind::NULL, ObjKey::from_u64(0))),
             FlakeValue::Boolean(b) => Ok((ObjKind::BOOL, ObjKey::encode_bool(*b))),
@@ -488,14 +495,10 @@ impl DictOverlay {
                 // decode_f64 over the i64-encoded bits, corrupting the value to a
                 // tiny subnormal. Mirrors value_to_otype_okey and the encode-side
                 // guards in resolver.rs / import_sink.rs. (fluree/db-r#142)
-                if d.is_finite() {
-                    match ObjKey::encode_f64(*d) {
-                        Ok(key) => Ok((ObjKind::NUM_F64, key)),
-                        Err(_) => Ok((ObjKind::NULL, ObjKey::from_u64(0))),
-                    }
-                } else {
-                    // NaN/Inf → NULL sentinel (can't represent in index)
-                    Ok((ObjKind::NULL, ObjKey::from_u64(0)))
+                match ObjKey::encode_f64(*d) {
+                    Ok(key) => Ok((ObjKind::NUM_F64, key)),
+                    // NaN/Inf can't be order-encoded → NULL sentinel.
+                    Err(_) => Ok((ObjKind::NULL, ObjKey::from_u64(0))),
                 }
             }
 

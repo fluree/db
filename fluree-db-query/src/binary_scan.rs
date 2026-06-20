@@ -2592,13 +2592,10 @@ fn value_to_otype_okey(
             // over integer bits, corrupting the value to a tiny subnormal
             // (55000.0 -> 2.71736e-319). Mirrors the encode-side guards in
             // resolver.rs / import_sink.rs. (fluree/db-r#142)
-            if d.is_finite() {
-                match ObjKey::encode_f64(*d) {
-                    Ok(key) => Ok((ot, key.as_u64())),
-                    Err(_) => Ok((OType::NULL, 0)),
-                }
-            } else {
-                Ok((OType::NULL, 0))
+            match ObjKey::encode_f64(*d) {
+                Ok(key) => Ok((ot, key.as_u64())),
+                // NaN/Inf can't be order-encoded → NULL sentinel.
+                Err(_) => Ok((OType::NULL, 0)),
             }
         }
         FlakeValue::Ref(sid) => {
