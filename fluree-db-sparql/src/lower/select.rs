@@ -149,11 +149,9 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                     // aggregates (`MAX(?u) - MIN(?u) AS ?spread`) need their
                     // inner aggregates hoisted before they can be lowered, so
                     // `lower_solution_modifiers` produces their post-bind once
-                    // the alias map exists. Both are skipped here.
+                    // the alias map exists. Both are skipped here; the alias
+                    // VarId itself was already registered by `lower_select_clause`.
                     if self.expr_contains_aggregate(expr) {
-                        // Register the alias so projection / GROUP BY checks
-                        // can resolve it before the post-bind lands.
-                        self.register_var(alias);
                         continue;
                     }
                     let filter_expr = self.lower_expression(expr)?;
@@ -331,7 +329,8 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
     /// aggregates (e.g. `(MAX(?u) - MIN(?u) AS ?spread)`) — bare aggregates
     /// (`MAX(?u) AS ?hi`) are handled separately by `extract_aggregates`.
     /// Returns each as `(alias VarId, AST expression)` for hoisting + post-bind
-    /// lowering in `lower_solution_modifiers`.
+    /// lowering in `lower_solution_modifiers`. Alias VarIds were registered
+    /// upstream by `lower_select_clause`.
     fn collect_compound_aggregate_select_items(
         &mut self,
         select: &SelectClause,
