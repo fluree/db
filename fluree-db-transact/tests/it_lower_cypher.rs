@@ -331,6 +331,104 @@ fn match_remove_property_emits_delete_only() {
     ));
 }
 
+/// Lower a write statement, expecting a rejection (returns the error message).
+fn lower_err(src: &str) -> String {
+    let out = parse_cypher(src);
+    assert!(!out.has_errors(), "parse errors: {:?}", out.diagnostics);
+    let ast = out.ast.unwrap();
+    let mut ns = NamespaceRegistry::new();
+    lower_cypher_update(
+        &ast,
+        &mut ns,
+        TxnOpts::default(),
+        CypherLowerOpts::default(),
+    )
+    .expect_err("expected lowering to reject")
+    .to_string()
+}
+
+#[test]
+fn with_passes_through_variables_into_a_write() {
+    // `WITH a, b` carries both forward → the SET target stays in scope.
+    let txn = lower(
+        r#"MATCH (a:Person {name: "Alice"})-[:KNOWS]->(b:Person)
+           WITH a, b
+           SET b.seen = true"#,
+    );
+    assert_eq!(txn.txn_type, TxnType::Update);
+    assert_eq!(txn.insert_templates.len(), 1, "one SET insert");
+}
+
+#[test]
+fn with_computed_alias_binds_and_carries_into_set() {
+    use fluree_db_query::parse::UnresolvedPattern;
+    // A computed projection becomes a Bind the SET can reference.
+    let txn = lower(
+        r#"MATCH (a:Person {name: "Alice"})
+           WITH a, a.age + 1 AS next
+           SET a.nextAge = next"#,
+    );
+    let has_next_bind = txn
+        .where_patterns
+        .iter()
+        .any(|p| matches!(p, UnresolvedPattern::Bind { var, .. } if var.as_ref() == "?next"));
+    assert!(has_next_bind, "where: {:?}", txn.where_patterns);
+    // SET nextAge: retract old + assert new = 1 insert, 1 delete.
+    assert_eq!(txn.insert_templates.len(), 1);
+    assert_eq!(txn.delete_templates.len(), 1);
+}
+
+#[test]
+fn with_renames_a_variable_for_a_write() {
+    // `WITH a AS p` — the alias is the only in-scope name afterward.
+    let txn = lower(
+        r#"MATCH (a:Person {name: "Alice"})
+           WITH a AS p
+           SET p.flag = true"#,
+    );
+    assert_eq!(txn.insert_templates.len(), 1);
+}
+
+#[test]
+fn with_narrows_scope_so_dropped_target_is_rejected() {
+    // `b` is dropped by `WITH a`, so a later SET on `b` is unbound.
+    let msg = lower_err(
+        r#"MATCH (a:Person {name: "Alice"})-[:KNOWS]->(b:Person)
+           WITH a
+           SET b.x = 1"#,
+    );
+    assert!(msg.contains("not bound"), "msg: {msg}");
+}
+
+#[test]
+fn with_aggregate_projection_is_rejected() {
+    // Aggregation in a write-side WITH is deferred (no grouping in single-Txn).
+    let msg = lower_err(
+        r#"MATCH (a:Person)-[:KNOWS]->(b:Person)
+           WITH a, count(b) AS friends
+           SET a.friends = friends"#,
+    );
+    assert!(
+        msg.contains("count") || msg.contains("aggregat"),
+        "msg: {msg}"
+    );
+}
+
+#[test]
+fn with_distinct_or_slice_before_write_is_rejected() {
+    for src in [
+        r#"MATCH (a:Person) WITH DISTINCT a SET a.x = 1"#,
+        r#"MATCH (a:Person) WITH a LIMIT 5 SET a.x = 1"#,
+        r#"MATCH (a:Person) WITH a ORDER BY a.name SET a.x = 1"#,
+    ] {
+        let msg = lower_err(src);
+        assert!(
+            msg.contains("deferred"),
+            "expected a deferred error for `{src}`, got: {msg}"
+        );
+    }
+}
+
 #[test]
 fn merge_single_node_emits_not_exists_guard_and_create_inserts() {
     use fluree_db_query::parse::UnresolvedPattern;

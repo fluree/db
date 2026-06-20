@@ -41,7 +41,7 @@ use thiserror::Error;
 use fluree_db_cypher::ast::{
     CreateClause, CypherAst, DeleteClause, Direction, Expr, Label, Literal, MapLit, MatchClause,
     MergeClause, NodePattern, Pattern, PatternPart, ReadClause, RelPattern, RemoveClause,
-    RemoveItem, SetClause, SetItem, Statement, Update, Variable, WriteClause,
+    RemoveItem, SetClause, SetItem, Statement, Update, Variable, WithClause, WriteClause,
 };
 
 use crate::ir::{TemplateTerm, TripleTemplate, Txn, TxnOpts, TxnType};
@@ -307,10 +307,8 @@ impl<'a> CypherLowering<'a> {
                     self.lower_match_pattern(m, &mut pats)?;
                     self.where_patterns.push(UnresolvedPattern::Optional(pats));
                 }
-                ReadClause::With(_) => {
-                    return Err(LowerCypherError::unsupported(
-                        "WITH before a write clause is deferred",
-                    ));
+                ReadClause::With(w) => {
+                    self.lower_with_clause(w)?;
                 }
                 ReadClause::Unwind(_) => {
                     return Err(LowerCypherError::unsupported(
@@ -340,6 +338,96 @@ impl<'a> CypherLowering<'a> {
                     });
                 }
             }
+        }
+        Ok(())
+    }
+
+    /// Lower a `WITH` projection that precedes a write clause. This is the
+    /// **horizon subset** that maps cleanly onto the where-pattern stream:
+    /// pass-through variables, renames, and computed (non-aggregate) aliases
+    /// (each a `Bind`), plus an optional `WHERE` filter. After the projection
+    /// the in-scope variables are narrowed to the WITH list — exactly Cypher's
+    /// scoping rule — so a later write can only reference projected names (a
+    /// dropped node referenced in a write `MATCH`-style position becomes a fresh
+    /// node, and a dropped target of SET/REMOVE/DELETE is rejected as unbound).
+    ///
+    /// Deferred (clear errors): aggregation (rejected via the computed-projection
+    /// path, since aggregate calls aren't in the filter-expression surface),
+    /// `DISTINCT`, and `ORDER BY` / `SKIP` / `LIMIT` — these need a query-level
+    /// grouping or slice the single-Txn write model doesn't carry.
+    fn lower_with_clause(&mut self, w: &WithClause) -> Result<(), LowerCypherError> {
+        if w.distinct {
+            return Err(LowerCypherError::unsupported(
+                "WITH DISTINCT before a write clause is deferred",
+            ));
+        }
+        if !w.order_by.is_empty() || w.skip.is_some() || w.limit.is_some() {
+            return Err(LowerCypherError::unsupported(
+                "ORDER BY / SKIP / LIMIT on a WITH before a write clause is deferred",
+            ));
+        }
+
+        // Build the new in-scope set (the WITH horizon) and emit a Bind for each
+        // rename / computed alias. Pass-through variables must already be bound.
+        let mut horizon: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut binds: Vec<UnresolvedPattern> = Vec::new();
+        for item in &w.items {
+            let alias = item.alias.as_ref().map(|a| a.name.clone());
+            match &item.expr {
+                Expr::Var(v) => {
+                    self.require_bound(v)?;
+                    match alias {
+                        // Pass-through (`WITH a` / `WITH a AS a`).
+                        None => {
+                            horizon.insert(v.name.clone());
+                        }
+                        Some(a) if a == v.name => {
+                            horizon.insert(v.name.clone());
+                        }
+                        // Rename (`WITH a AS b`).
+                        Some(a) => {
+                            binds.push(UnresolvedPattern::Bind {
+                                var: Arc::from(var_name(&a).as_str()),
+                                expr: UnresolvedExpression::var(var_name(&v.name)),
+                            });
+                            horizon.insert(a);
+                        }
+                    }
+                }
+                // Computed projection (`WITH a.age + 1 AS next`) — needs an alias
+                // and must not contain an aggregate (lower_filter_expr rejects
+                // aggregate calls). Property-accessor scans land in `aux`.
+                other => {
+                    let Some(a) = alias else {
+                        return Err(LowerCypherError::rejected(
+                            "a non-variable WITH expression before a write needs an alias \
+                             (`<expr> AS name`)",
+                        ));
+                    };
+                    let mut aux = Vec::new();
+                    let expr = self.lower_filter_expr(other, &mut aux)?;
+                    self.where_patterns.append(&mut aux);
+                    binds.push(UnresolvedPattern::Bind {
+                        var: Arc::from(var_name(&a).as_str()),
+                        expr,
+                    });
+                    horizon.insert(a);
+                }
+            }
+        }
+        self.where_patterns.append(&mut binds);
+
+        // Narrow lowering scope to the horizon. The execution stream keeps every
+        // matched binding (the Bind/Filter patterns still see them); this only
+        // gates which names a later write clause may reference.
+        self.bound_vars = horizon;
+
+        // Optional post-projection (HAVING-style) filter over the horizon.
+        if let Some(where_expr) = &w.where_clause {
+            let mut aux = Vec::new();
+            let filter = self.lower_filter_expr(where_expr, &mut aux)?;
+            self.where_patterns.append(&mut aux);
+            self.where_patterns.push(UnresolvedPattern::Filter(filter));
         }
         Ok(())
     }

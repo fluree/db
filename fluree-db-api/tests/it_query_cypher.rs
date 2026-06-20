@@ -1509,6 +1509,86 @@ async fn transact_cypher_merge_creates_then_is_a_noop() {
 }
 
 #[tokio::test]
+async fn transact_cypher_with_computed_alias_carries_into_set() {
+    // WITH before a write: a computed projection (`a.birthYear + 30 AS adultAt`)
+    // is carried into the SET and actually lands as a stored value.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = genesis_ledger(&fluree, "it/cypher:with-computed");
+    let l = fluree
+        .transact_cypher(l, r#"CREATE (a:Person {name: "Alice", birthYear: 1990})"#)
+        .await
+        .expect("seed")
+        .ledger;
+
+    let l = fluree
+        .transact_cypher(
+            l,
+            r#"MATCH (a:Person {name: "Alice"})
+               WITH a, a.birthYear + 30 AS adultAt
+               SET a.adultAt = adultAt"#,
+        )
+        .await
+        .expect("with+set")
+        .ledger;
+    let db = graphdb_from_ledger(&l);
+    let rows = fluree
+        .query_cypher(&db, r#"MATCH (a:Person {name: "Alice"}) RETURN a.adultAt"#)
+        .await
+        .expect("read back")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    assert_eq!(
+        rows,
+        serde_json::json!([[2020]]),
+        "computed value stored: {rows}"
+    );
+}
+
+#[tokio::test]
+async fn transact_cypher_with_filter_gates_a_write() {
+    // WITH ... WHERE filters which matched rows reach the write.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = genesis_ledger(&fluree, "it/cypher:with-filter");
+    let l = fluree
+        .transact_cypher(
+            l,
+            r#"CREATE (a:Person {name: "Alice", age: 40})
+               CREATE (b:Person {name: "Bob", age: 20})"#,
+        )
+        .await
+        .expect("seed")
+        .ledger;
+
+    let l = fluree
+        .transact_cypher(
+            l,
+            r#"MATCH (p:Person)
+               WITH p, p.age AS age WHERE age >= 30
+               SET p.adult = true"#,
+        )
+        .await
+        .expect("with+filter+set")
+        .ledger;
+    let db = graphdb_from_ledger(&l);
+    let rows = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (p:Person {adult: true}) RETURN p.name ORDER BY p.name"#,
+        )
+        .await
+        .expect("read back")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    assert_eq!(
+        rows,
+        serde_json::json!([["Alice"]]),
+        "only the over-30 person was flagged: {rows}"
+    );
+}
+
+#[tokio::test]
 async fn transact_cypher_merge_relationship_creates_then_is_a_noop() {
     // Relationship MERGE = find-or-create the whole path. The first run mints
     // both endpoints and the edge; the second finds the path and inserts

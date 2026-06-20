@@ -302,6 +302,15 @@ ORDER BY / SKIP / LIMIT
   filters over the same comparison/boolean/string/property-accessor expression
   surface used by reads. `CASE` / `EXISTS` inside write-side `WHERE` are still
   deferred.
+- **`MATCH … WITH … <write>`** — a `WITH` between the match and the write,
+  limited to the *horizon subset*: pass-through variables (`WITH a, b`), renames
+  (`WITH a AS p`), computed (non-aggregate) aliases carried into the write
+  (`WITH a, a.birthYear + 30 AS adultAt SET a.adultAt = adultAt`), and a
+  post-projection `WHERE` that gates which rows are written
+  (`WITH p, p.age AS age WHERE age >= 30 SET p.adult = true`). `WITH` applies
+  Cypher scoping — only projected names are visible to the write. Aggregation,
+  `DISTINCT`, and `ORDER BY` / `SKIP` / `LIMIT` on a write-side `WITH` are
+  deferred.
 
 ```rust
 let committed = fluree.transact_cypher(ledger, cypher).await?;
@@ -343,8 +352,10 @@ produces a clear error rather than a silent wrong answer.
 **Clauses and structure**
 
 - Non-literal `SKIP`/`LIMIT`; `ORDER BY` on a `collect()` list.
-- `CASE` / `EXISTS` inside a write-statement `MATCH ... WHERE`; `WITH` before a
-  write clause.
+- `CASE` / `EXISTS` inside a write-statement `MATCH ... WHERE`. Aggregation,
+  `DISTINCT`, and `ORDER BY` / `SKIP` / `LIMIT` on a `WITH` before a write clause
+  (the pass-through / rename / computed-alias / filter subset *is* supported —
+  see above).
 - `MERGE` on a property-bearing relationship (`-[:KNOWS {since: 2020}]->`),
   multi-hop or multi-part (comma-separated) `MERGE`, multiple `MERGE` clauses,
   `ON MATCH SET` on a relationship `MERGE`, and `MERGE` combined with another

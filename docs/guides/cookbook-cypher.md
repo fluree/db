@@ -89,6 +89,25 @@ MATCH (p:Person {name: "Bob"}) DETACH DELETE p
 `SET p += {a: 1, b: 2}` merges a map of properties; `SET p:Label` adds a label;
 `DETACH DELETE` removes a node together with its relationships.
 
+## Compute or filter before a write with WITH
+
+A `WITH` between the match and the write can carry a computed value into the
+write or gate which rows are written:
+
+```cypher
+MATCH (a:Person {name: "Alice"})
+WITH a, a.birthYear + 30 AS adultAt
+SET a.adultAt = adultAt
+
+MATCH (p:Person)
+WITH p, p.age AS age WHERE age >= 30
+SET p.adult = true
+```
+
+`WITH` narrows scope to its projection (Cypher semantics) — only the listed
+names are visible to the write. Aggregation, `DISTINCT`, and `ORDER BY` /
+`SKIP` / `LIMIT` on a write-side `WITH` are not yet supported.
+
 ## Paths
 
 Variable-length traversal (name the relationship type):
