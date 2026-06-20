@@ -335,17 +335,17 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
         &mut self,
         select: &SelectClause,
     ) -> Vec<(VarId, AstExpression)> {
+        let SelectVariables::Explicit(vars) = &select.variables else {
+            return Vec::new();
+        };
         let mut items = Vec::new();
-        if let SelectVariables::Explicit(vars) = &select.variables {
-            for var in vars {
-                if let SelectVariable::Expr { expr, alias, .. } = var {
-                    if matches!(expr, AstExpression::Aggregate { .. }) {
-                        continue;
-                    }
-                    if self.expr_contains_aggregate(expr) {
-                        let var_id = self.register_var(alias);
-                        items.push((var_id, expr.clone()));
-                    }
+        for var in vars {
+            if let SelectVariable::Expr { expr, alias, .. } = var {
+                if matches!(expr, AstExpression::Aggregate { .. }) {
+                    continue;
+                }
+                if self.expr_contains_aggregate(expr) {
+                    items.push((self.register_var(alias), expr.clone()));
                 }
             }
         }
