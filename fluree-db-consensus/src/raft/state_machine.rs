@@ -19,8 +19,8 @@
 
 use crate::IdempotencyCacheKey;
 use fluree_db_api::{ContentId, PolicyStats, TrackingTally};
-use fluree_db_core::ledger_id::format_ledger_id;
-use fluree_db_nameservice::{RefKind, RefValue};
+use fluree_db_core::ledger_id::{format_ledger_id, split_ledger_id};
+use fluree_db_nameservice::{RefKind, RefValue, StatusValue};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use thiserror::Error;
@@ -412,6 +412,12 @@ pub struct NameServiceState {
     /// in state so every node enforces the same caps.
     #[serde(default)]
     pub queue_config: QueueConfig,
+    /// Per-`alias:branch` operational status pushed via
+    /// [`fluree_db_nameservice::StatusPublisher::push_status`]. The
+    /// read path falls back to [`StatusValue::initial`] when the
+    /// branch is registered but no record lives here.
+    #[serde(default)]
+    pub status: HashMap<String, StatusValue>,
 }
 
 /// Replicated commands the state machine accepts.
@@ -512,6 +518,18 @@ pub enum Command {
         /// See [`Command::DropBranch::applied_at_millis`].
         #[serde(default)]
         applied_at_millis: u64,
+    },
+    /// CAS push for one branch's operational status. Mirrors the
+    /// [`fluree_db_nameservice::StatusPublisher::push_status`]
+    /// contract: returns [`Response::StatusConflict`] when `expected`
+    /// doesn't match the current value, and enforces
+    /// `new.v > current.v`. The current value is
+    /// [`StatusValue::initial`] when no record is present for a
+    /// registered branch.
+    PushStatus {
+        ledger_id: String,
+        expected: Option<StatusValue>,
+        new: StatusValue,
     },
     /// Append a transactor request to the per-branch queue. Apply
     /// checks idempotency, the in-flight queue, and the queue
@@ -699,6 +717,13 @@ pub enum Response {
     /// post-mismatch value the caller decides what to do with —
     /// retry, surface the conflict, or diverge.
     RefCasConflict { actual: Option<RefValue> },
+    /// [`Command::PushStatus`] succeeded.
+    StatusUpdated,
+    /// [`Command::PushStatus`] refused — `expected` didn't match or
+    /// `new.v` failed the monotonic guard. `actual` carries the
+    /// current value when the branch is known; `None` when the
+    /// ledger or branch isn't registered.
+    StatusConflict { actual: Option<StatusValue> },
     /// [`Command::CreateLedger`] succeeded. `ledger_id` is the full
     /// `name:branch` form.
     Created { ledger_id: String },
@@ -929,6 +954,11 @@ pub fn apply(state: &mut NameServiceState, command: Command, log_index: u64) -> 
             new,
             applied_at_millis,
         ),
+        Command::PushStatus {
+            ledger_id,
+            expected,
+            new,
+        } => apply_push_status(state, ledger_id, expected, new),
         // Queue-related commands. Apply paths land in subsequent
         // commits; see docs/design/raft-command-queue.md.
         Command::EnqueueCommand(args) => apply_enqueue_command(state, log_index, args),
@@ -1469,6 +1499,46 @@ fn apply_compare_and_set_ref(
     }
 
     Response::RefCasUpdated
+}
+
+fn apply_push_status(
+    state: &mut NameServiceState,
+    ledger_id: String,
+    expected: Option<StatusValue>,
+    new: StatusValue,
+) -> Response {
+    let Ok((name, branch)) = split_ledger_id(&ledger_id) else {
+        return Response::StatusConflict { actual: None };
+    };
+    let branch_registered = state
+        .ledgers
+        .get(&name)
+        .is_some_and(|l| l.branches.iter().any(|b| b == &branch));
+    if !branch_registered {
+        return Response::StatusConflict { actual: None };
+    }
+
+    // Absent record reads as `StatusValue::initial`; the apply uses
+    // the same fallback so an initial CAS push from
+    // `expected = initial` lands on a fresh branch.
+    let current = state
+        .status
+        .get(&ledger_id)
+        .cloned()
+        .unwrap_or_else(StatusValue::initial);
+
+    if expected.as_ref() != Some(&current) {
+        return Response::StatusConflict {
+            actual: Some(current),
+        };
+    }
+    if new.v <= current.v {
+        return Response::StatusConflict {
+            actual: Some(current),
+        };
+    }
+    state.status.insert(ledger_id, new);
+    Response::StatusUpdated
 }
 
 fn apply_enqueue_command(
@@ -3751,6 +3821,95 @@ mod tests {
             1,
         );
         assert!(matches!(resp, Response::LedgerNotFound { .. }));
+    }
+
+    // ====================================================================
+    // PushStatus
+    // ====================================================================
+
+    fn status(v: i64, state_str: &str) -> StatusValue {
+        StatusValue::new(v, fluree_db_nameservice::StatusPayload::new(state_str))
+    }
+
+    fn push_status_cmd(
+        ledger_id: &str,
+        expected: Option<StatusValue>,
+        new: StatusValue,
+    ) -> Command {
+        Command::PushStatus {
+            ledger_id: ledger_id.into(),
+            expected,
+            new,
+        }
+    }
+
+    #[test]
+    fn push_status_initial_creation_against_unborn_record_lands() {
+        let mut state = NameServiceState::new();
+        apply(&mut state, create_ledger("test/db"), 0);
+
+        let resp = apply(
+            &mut state,
+            push_status_cmd("test/db:main", Some(status(1, "ready")), status(2, "indexing")),
+            1,
+        );
+        assert_eq!(resp, Response::StatusUpdated);
+        assert_eq!(
+            state.status.get("test/db:main").cloned(),
+            Some(status(2, "indexing"))
+        );
+    }
+
+    #[test]
+    fn push_status_conflict_when_expected_doesnt_match() {
+        let mut state = NameServiceState::new();
+        apply(&mut state, create_ledger("test/db"), 0);
+        apply(
+            &mut state,
+            push_status_cmd("test/db:main", Some(status(1, "ready")), status(2, "indexing")),
+            1,
+        );
+
+        // Stale expected — caller hasn't observed the v=2 push.
+        let resp = apply(
+            &mut state,
+            push_status_cmd("test/db:main", Some(status(1, "ready")), status(3, "ready")),
+            2,
+        );
+        match resp {
+            Response::StatusConflict { actual } => {
+                assert_eq!(actual, Some(status(2, "indexing")));
+            }
+            other => panic!("expected StatusConflict, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn push_status_rejects_non_monotonic_v() {
+        let mut state = NameServiceState::new();
+        apply(&mut state, create_ledger("test/db"), 0);
+
+        // Initial fallback is v=1; v=1 is not strictly greater.
+        let resp = apply(
+            &mut state,
+            push_status_cmd("test/db:main", Some(status(1, "ready")), status(1, "ready")),
+            1,
+        );
+        assert!(matches!(resp, Response::StatusConflict { actual: Some(_) }));
+    }
+
+    #[test]
+    fn push_status_rejects_when_branch_not_registered() {
+        let mut state = NameServiceState::new();
+        let resp = apply(
+            &mut state,
+            push_status_cmd("missing:main", None, status(1, "ready")),
+            1,
+        );
+        match resp {
+            Response::StatusConflict { actual } => assert_eq!(actual, None),
+            other => panic!("expected StatusConflict, got {other:?}"),
+        }
     }
 
     // ====================================================================

@@ -62,7 +62,7 @@ use fluree_db_nameservice::{
     AdminPublisher, BranchLifecycle, CasResult, CommitPublisher, ConfigLookup, ConfigValue,
     GraphSourceLookup, GraphSourceRecord, IndexPublisher, LedgerLifecycle, NameServiceError,
     NameServiceLookup, NsLookupResult, NsRecord, NsRecordSnapshot, RefKind, RefLookup,
-    RefPublisher, RefValue, Result, StatusLookup, StatusValue,
+    RefPublisher, RefValue, Result, StatusCasResult, StatusLookup, StatusPublisher, StatusValue,
 };
 use openraft::error::{ClientWriteError, RaftError};
 use openraft::Raft;
@@ -781,12 +781,44 @@ impl GraphSourceLookup for RaftNameService {
 #[async_trait]
 impl StatusLookup for RaftNameService {
     async fn get_status(&self, ledger_id: &str) -> Result<Option<StatusValue>> {
-        let (name, _branch) = split_ledger_id(ledger_id)?;
+        let (name, branch) = split_ledger_id(ledger_id)?;
         let state = self.state.read().await;
-        if state.ledgers.contains_key(&name) {
-            Ok(Some(StatusValue::initial()))
-        } else {
-            Ok(None)
+        let branch_registered = state
+            .ledgers
+            .get(&name)
+            .is_some_and(|l| l.branches.iter().any(|b| b == &branch));
+        if !branch_registered {
+            return Ok(None);
+        }
+        Ok(Some(
+            state
+                .status
+                .get(ledger_id)
+                .cloned()
+                .unwrap_or_else(StatusValue::initial),
+        ))
+    }
+}
+
+#[async_trait]
+impl StatusPublisher for RaftNameService {
+    async fn push_status(
+        &self,
+        ledger_id: &str,
+        expected: Option<&StatusValue>,
+        new: &StatusValue,
+    ) -> Result<StatusCasResult> {
+        let cmd = SmCommand::PushStatus {
+            ledger_id: ledger_id.to_string(),
+            expected: expected.cloned(),
+            new: new.clone(),
+        };
+        match self.submit_lifecycle(cmd).await? {
+            SmResponse::StatusUpdated => Ok(StatusCasResult::Updated),
+            SmResponse::StatusConflict { actual } => Ok(StatusCasResult::Conflict { actual }),
+            other => Err(NameServiceError::storage(format!(
+                "unexpected Response variant for PushStatus: {other:?}"
+            ))),
         }
     }
 }
