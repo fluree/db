@@ -516,11 +516,26 @@ impl Expression {
                 vars
             }
             Expression::Member { target, .. } => target.referenced_vars(),
-            // The outer (correlation) variables come from the patterns; the
-            // projection references subquery-internal vars (mirrors Exists).
-            Expression::Exists { patterns, .. }
-            | Expression::PatternComprehension { patterns, .. } => {
+            // EXISTS has no projection — only the pattern's correlation vars.
+            Expression::Exists { patterns, .. } => {
                 patterns.iter().flat_map(Pattern::referenced_vars).collect()
+            }
+            // A pattern comprehension's projection can capture OUTER variables
+            // that never appear in the inner pattern (e.g. `[(a)-->(b) | c]`).
+            // Those are real dependencies — include them so dependency trimming
+            // can't drop them. Pattern-internal vars (`b`) are already covered.
+            Expression::PatternComprehension {
+                patterns,
+                projection,
+            } => {
+                let mut vars: Vec<VarId> =
+                    patterns.iter().flat_map(Pattern::referenced_vars).collect();
+                for v in projection.referenced_vars() {
+                    if !vars.contains(&v) {
+                        vars.push(v);
+                    }
+                }
+                vars
             }
             Expression::Resolved(_) => Vec::new(),
         }

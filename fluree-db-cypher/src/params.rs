@@ -429,6 +429,7 @@ fn collect_alias_in_expr(e: &Expr, alias: &str, fields: &mut Vec<String>, bare: 
             }
         }
         Expr::PatternComprehension(pc) => {
+            collect_alias_in_pattern(&pc.pattern, alias, fields, bare);
             if let Some(f) = &pc.filter {
                 collect_alias_in_expr(f, alias, fields, bare);
             }
@@ -607,6 +608,7 @@ fn rewrite_alias_in_expr_to_var<F: Fn(&str) -> String>(
             }
         }
         Expr::PatternComprehension(pc) => {
+            rewrite_alias_in_pattern(&mut pc.pattern, alias, col_var, bare_var);
             if let Some(f) = &mut pc.filter {
                 rewrite_alias_in_expr_to_var(f, alias, col_var, bare_var);
             }
@@ -766,6 +768,7 @@ fn replace_alias_in_expr(
             Ok(())
         }
         Expr::PatternComprehension(pc) => {
+            replace_alias_in_pattern(&mut pc.pattern, alias, elem, pname)?;
             if let Some(f) = &mut pc.filter {
                 replace_alias_in_expr(f, alias, elem, pname)?;
             }
@@ -1039,6 +1042,7 @@ fn subst_expr(e: &mut Expr, p: &ParamMap) -> Result<(), ParamError> {
             Ok(())
         }
         Expr::PatternComprehension(pc) => {
+            subst_pattern(&mut pc.pattern, p)?;
             if let Some(f) = &mut pc.filter {
                 subst_expr(f, p)?;
             }

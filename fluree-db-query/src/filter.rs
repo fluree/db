@@ -313,13 +313,23 @@ async fn eval_pattern_comprehension_for_row(
         build_where_operators_seeded(Some(Box::new(seed)), patterns, None, None, planning)?;
     op.open(ctx).await?;
 
+    // The projection may itself hold an async subquery (a nested EXISTS or
+    // pattern comprehension, e.g. `[(a)-->(b) | EXISTS { (b)-->(c) }]`). When it
+    // does, resolve those per inner match before the synchronous eval.
+    let projection_has_async = contains_exists(projection);
     let mut items = Vec::new();
     while let Some(result) = op.next_batch(ctx).await? {
         for r in 0..result.len() {
             let Some(rv) = result.row_view(r) else {
                 continue;
             };
-            let val = projection.try_eval_to_binding(&rv, Some(ctx))?;
+            let val = if projection_has_async {
+                let resolved =
+                    resolve_exists_for_row(projection, &result, r, ctx, None, planning).await?;
+                resolved.try_eval_to_binding(&rv, Some(ctx))?
+            } else {
+                projection.try_eval_to_binding(&rv, Some(ctx))?
+            };
             if !matches!(val, Binding::Unbound | Binding::Poisoned) {
                 items.push(val);
             }

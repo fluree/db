@@ -1818,6 +1818,102 @@ async fn cypher_pattern_comprehension() {
 }
 
 #[tokio::test]
+async fn cypher_pattern_comprehension_outer_var_and_nested_async() {
+    // A pattern-comprehension projection can capture an OUTER variable that
+    // never appears in the inner pattern, and can itself contain an async
+    // subquery (EXISTS / a nested pattern comprehension). A chain
+    // Alice->Bob->Carol plus a disconnected Zed.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = genesis_ledger(&fluree, "it/cypher:pattern-comp-outer");
+    let l = fluree
+        .transact_cypher(
+            l,
+            r#"CREATE (a:Person {name: "Alice"})-[:KNOWS]->(b:Person {name: "Bob"}),
+                      (b)-[:KNOWS]->(c:Person {name: "Carol"}),
+                      (z:Person {name: "Zed"})"#,
+        )
+        .await
+        .expect("seed")
+        .ledger;
+    let db = graphdb_from_ledger(&l);
+
+    // Finding 1: projection references outer `z`, absent from the inner pattern.
+    let outer = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (a:Person {name: "Alice"}), (z:Person {name: "Zed"})
+               RETURN [(a)-[:KNOWS]->(b:Person) | z.name] AS r"#,
+        )
+        .await
+        .expect("outer-var projection")
+        .to_cypher_json_async(db.as_graph_db_ref())
+        .await
+        .expect("cypher json");
+    assert_eq!(
+        outer["results"][0]["data"][0]["row"][0],
+        json!(["Zed"]),
+        "outer var in projection survives dependency trimming: {outer}"
+    );
+
+    // Finding 2a: a nested EXISTS in the projection. Alice KNOWS Bob; Bob KNOWS
+    // Carol, so the EXISTS holds for Bob.
+    let nested_exists = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (a:Person {name: "Alice"})
+               RETURN [(a)-[:KNOWS]->(b:Person) | EXISTS { (b)-[:KNOWS]->(x:Person) }] AS r"#,
+        )
+        .await
+        .expect("nested exists projection")
+        .to_cypher_json_async(db.as_graph_db_ref())
+        .await
+        .expect("cypher json");
+    assert_eq!(
+        nested_exists["results"][0]["data"][0]["row"][0],
+        json!([true]),
+        "nested EXISTS in projection is resolved per inner match: {nested_exists}"
+    );
+
+    // Finding 2b: a nested pattern comprehension in the projection.
+    let nested_pc = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (a:Person {name: "Alice"})
+               RETURN [(a)-[:KNOWS]->(b:Person) | [(b)-[:KNOWS]->(c:Person) | c.name]] AS r"#,
+        )
+        .await
+        .expect("nested pattern comprehension")
+        .to_cypher_json_async(db.as_graph_db_ref())
+        .await
+        .expect("cypher json");
+    assert_eq!(
+        nested_pc["results"][0]["data"][0]["row"][0],
+        json!([["Carol"]]),
+        "nested pattern comprehension is resolved per inner match: {nested_pc}"
+    );
+
+    // Finding 3: a parameter inside the inner pattern is substituted.
+    let params = json!({ "bname": "Bob" });
+    let with_param = fluree
+        .query_cypher_with_params(
+            &db,
+            r#"MATCH (a:Person {name: "Alice"})
+               RETURN [(a)-[:KNOWS]->(b:Person {name: $bname}) | b.name] AS r"#,
+            params.as_object(),
+        )
+        .await
+        .expect("param in inner pattern")
+        .to_cypher_json_async(db.as_graph_db_ref())
+        .await
+        .expect("cypher json");
+    assert_eq!(
+        with_param["results"][0]["data"][0]["row"][0],
+        json!(["Bob"]),
+        "param in the inner pattern is substituted: {with_param}"
+    );
+}
+
+#[tokio::test]
 async fn cypher_map_projection() {
     // `n{.key}` selectors, a `key: expr` entry, and `n{.*}` (all properties).
     let fluree = FlureeBuilder::memory().build_memory();
