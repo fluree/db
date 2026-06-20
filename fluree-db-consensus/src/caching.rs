@@ -21,7 +21,7 @@ use crate::{
     SubmissionState, TransactionReceipt, TransactionRequest,
 };
 use async_trait::async_trait;
-use fluree_db_api::{CommitRef, Fluree};
+use fluree_db_api::{CommitRef, Fluree, GovernanceOptions};
 use fluree_db_core::ledger_id::normalize_ledger_id;
 use fluree_db_ledger::IndexConfig;
 use moka::future::Cache;
@@ -124,7 +124,10 @@ impl<C: Committer> CachingCommitter<C> {
     }
 
     fn hash_request_body(request: &TransactionRequest) -> [u8; 32] {
-        request.body.body_hash()
+        let mut hasher = Sha256::new();
+        hasher.update(request.body.body_hash());
+        hash_governance(&mut hasher, &request.governance);
+        hasher.finalize().into()
     }
 
     /// Atomically claim an idempotency slot in the cache.
@@ -287,8 +290,87 @@ impl<C: Committer> CachingCommitter<C> {
             hasher.update((value.len() as u64).to_le_bytes());
             hasher.update(value);
         }
+        hash_governance(&mut hasher, &request.governance);
         hasher.finalize().into()
     }
+}
+
+/// Fold the request's [`GovernanceOptions`] into a per-op body
+/// hash so two submissions with identical bodies but different
+/// auth/policy contexts don't collapse onto the same cache entry.
+/// Without this, a retry that reused another caller's idempotency
+/// key + body — but a different `identity` or policy — would
+/// silently receive the original caller's receipt back. The
+/// state-machine layer covers this via the postcard-encoded
+/// envelope CID; this is the matching defense in the in-process
+/// moka cache.
+///
+/// Determinism notes:
+/// - Scalar fields (`identity`, `default_allow`) and the
+///   length-prefixed string list (`policy_class`) hash to stable
+///   bytes for a given input.
+/// - `policy_values` keys are sorted before iteration so HashMap
+///   iteration order doesn't perturb the digest.
+/// - `policy` and individual `policy_values` entries are
+///   `JsonValue`s and depend on `serde_json::to_string`, which is
+///   only deterministic across calls from the same client that
+///   produces the same insertion order (the crate enables
+///   `preserve_order`). Same caveat the body itself carries — the
+///   contract is "same client, same retry," not "any byte-for-byte
+///   reproducer."
+fn hash_governance(hasher: &mut Sha256, governance: &GovernanceOptions) {
+    hasher.update(b"gov");
+    match governance.identity.as_deref() {
+        Some(identity) => {
+            hasher.update([1u8]);
+            hasher.update((identity.len() as u64).to_le_bytes());
+            hasher.update(identity.as_bytes());
+        }
+        None => hasher.update([0u8]),
+    }
+    match governance.policy_class.as_ref() {
+        Some(classes) => {
+            hasher.update([1u8]);
+            // Sort so policy-class ordering (e.g. `["a", "b"]`
+            // vs `["b", "a"]`) doesn't perturb the digest — the
+            // set of classes is the dedup-relevant signal, not
+            // the order it was supplied in.
+            let mut sorted: Vec<&String> = classes.iter().collect();
+            sorted.sort();
+            hasher.update((sorted.len() as u64).to_le_bytes());
+            for class in sorted {
+                hasher.update((class.len() as u64).to_le_bytes());
+                hasher.update(class.as_bytes());
+            }
+        }
+        None => hasher.update([0u8]),
+    }
+    match governance.policy.as_ref() {
+        Some(policy) => {
+            hasher.update([1u8]);
+            let bytes = policy.to_string();
+            hasher.update((bytes.len() as u64).to_le_bytes());
+            hasher.update(bytes.as_bytes());
+        }
+        None => hasher.update([0u8]),
+    }
+    match governance.policy_values.as_ref() {
+        Some(values) => {
+            hasher.update([1u8]);
+            let mut sorted: Vec<&String> = values.keys().collect();
+            sorted.sort();
+            hasher.update((sorted.len() as u64).to_le_bytes());
+            for key in sorted {
+                hasher.update((key.len() as u64).to_le_bytes());
+                hasher.update(key.as_bytes());
+                let value_bytes = values[key].to_string();
+                hasher.update((value_bytes.len() as u64).to_le_bytes());
+                hasher.update(value_bytes.as_bytes());
+            }
+        }
+        None => hasher.update([0u8]),
+    }
+    hasher.update([u8::from(governance.default_allow)]);
 }
 
 fn hash_commit_ref(hasher: &mut Sha256, commit: &CommitRef) {
@@ -743,6 +825,35 @@ mod tests {
             ))
             .await
             .expect_err("second submission with different body should fail");
+
+        assert!(
+            matches!(err, SubmissionError::KeyCollision),
+            "expected KeyCollision, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn key_collision_with_different_governance_errors() {
+        // A retry that reuses the idempotency key + body but
+        // changes the auth context (different `identity`) must not
+        // silently receive the original caller's receipt back —
+        // governance is part of what makes the submission
+        // semantically unique.
+        let (_fluree, committer, ledger_id) = setup().await;
+        let key = IdempotencyKey::new("01J5COLLIDE002").expect("test key fits cap");
+        let body = sample_insert("alice");
+
+        committer
+            .transact(request(&ledger_id, Some(key.as_str()), body.clone()))
+            .await
+            .expect("first submission to succeed");
+
+        let mut req = request(&ledger_id, Some(key.as_str()), body);
+        req.governance.identity = Some("did:example:other".into());
+        let err = committer
+            .transact(req)
+            .await
+            .expect_err("retry with same body but different identity must collide");
 
         assert!(
             matches!(err, SubmissionError::KeyCollision),
