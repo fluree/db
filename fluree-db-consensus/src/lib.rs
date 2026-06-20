@@ -302,15 +302,22 @@ impl From<&TransactionBody> for BodyKind {
 /// replicate large opaque values through the Raft log.
 ///
 /// One variant per `Committer` method.
+///
+/// The two heavy variants (`Transact`, `Push`) are boxed so the
+/// enum's footprint isn't dominated by their inline payload. Every
+/// queue entry carries one of these via the worker pipeline and we
+/// pattern-match on the variant on every step — without the
+/// indirection a `Revert`/`Merge`/`Rebase` entry would still pay
+/// the size of a full transact body.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum QueuedRequest {
     /// `transact` — body, opts, tracking, governance to stage and
     /// commit through the worker.
-    Transact(QueuedTransact),
+    Transact(Box<QueuedTransact>),
     /// `push` — raw commit-chain bytes the client supplied. The
     /// worker decodes via `Fluree::prepare_push`, advances the head
     /// to the chain's final commit.
-    Push(QueuedPush),
+    Push(Box<QueuedPush>),
     /// `revert` — selection + conflict strategy. The worker
     /// re-runs `Fluree::prepare_revert` and advances the head to
     /// the resulting inverse commit (or NoOp short-circuits when
@@ -612,6 +619,42 @@ pub enum OperationReceipt {
     Push(PushReceipt),
 }
 
+/// Payload of [`SubmissionState::Committed`]. Extracted into its
+/// own struct so the enclosing enum's largest variant stays a
+/// single pointer wide — `CommittedSubmission` itself collects six
+/// fields and would otherwise inflate every `SubmissionState`
+/// value (including the lightweight `Unknown` / `InFlight`
+/// branches) to its footprint.
+///
+/// The canonical kit (`commit_id`, `t`, `kind`, `tally`,
+/// `idempotency_key`) is always populated — it's what a client
+/// asking "did my submission land?" actually needs, and it's
+/// recoverable from either the in-process idempotency cache or
+/// the Raft-replicated state.
+///
+/// `receipt` is `Some` when the originating node still has the
+/// typed [`OperationReceipt`] cached (the moka entry hasn't been
+/// evicted and the process hasn't restarted). It's `None` after
+/// a leader transition / restart / cache eviction — clients that
+/// want full per-op detail can chase it through the commit log
+/// endpoint, but the commit identity above is already
+/// authoritative.
+///
+/// The receipt is boxed because `OperationReceipt`'s heaviest
+/// variants (full `MergeReceipt` / `RebaseReceipt`) dwarf the
+/// rest of the canonical kit, and `SubmissionState` itself flows
+/// through hot paths (idempotency lookup, retry-collapse, HTTP
+/// response shaping).
+#[derive(Debug, Clone)]
+pub struct CommittedSubmission {
+    pub idempotency_key: Option<IdempotencyKey>,
+    pub kind: BodyKind,
+    pub commit_id: CommitId,
+    pub t: i64,
+    pub tally: Option<TrackingTally>,
+    pub receipt: Option<Box<OperationReceipt>>,
+}
+
 /// State of a previously-submitted operation, accessible by idempotency key.
 #[derive(Debug, Clone)]
 pub enum SubmissionState {
@@ -619,29 +662,9 @@ pub enum SubmissionState {
     Unknown,
     /// Submission accepted, durability not yet acknowledged.
     InFlight,
-    /// Submission durably accepted and committed.
-    ///
-    /// The canonical kit (`commit_id`, `t`, `kind`, `tally`,
-    /// `idempotency_key`) is always populated — it's what a client
-    /// asking "did my submission land?" actually needs, and it's
-    /// recoverable from either the in-process idempotency cache or
-    /// the Raft-replicated state.
-    ///
-    /// `receipt` is `Some` when the originating node still has the
-    /// typed [`OperationReceipt`] cached (the moka entry hasn't been
-    /// evicted and the process hasn't restarted). It's `None` after
-    /// a leader transition / restart / cache eviction — clients that
-    /// want full per-op detail can chase it through the commit log
-    /// endpoint, but the commit identity above is already
-    /// authoritative.
-    Committed {
-        idempotency_key: Option<IdempotencyKey>,
-        kind: BodyKind,
-        commit_id: CommitId,
-        t: i64,
-        tally: Option<TrackingTally>,
-        receipt: Option<OperationReceipt>,
-    },
+    /// Submission durably accepted and committed. See
+    /// [`CommittedSubmission`] for the payload shape.
+    Committed(Box<CommittedSubmission>),
     /// Submission attempted but failed.
     Failed(SubmissionError),
 }

@@ -290,13 +290,20 @@ mod tests {
         let map = WaiterMap::new();
         // Worker resolves before the proposer's register call lands.
         map.resolve_applied(9_999, minimal(1, 1));
-        assert_eq!(map.len(), 1, "buffered slot stays until register picks it up");
+        assert_eq!(
+            map.len(),
+            1,
+            "buffered slot stays until register picks it up"
+        );
 
         // Late-arriving register pulls the buffered outcome out and
         // delivers it on the new receiver.
         let rx = map.register(9_999, ref_key("main"));
         match rx.await.expect("buffered outcome delivered") {
-            WaiterOutcome::Applied(AppliedReceipt::Minimal { commit_id, commit_t }) => {
+            WaiterOutcome::Applied(AppliedReceipt::Minimal {
+                commit_id,
+                commit_t,
+            }) => {
                 assert_eq!(commit_id, cid(1));
                 assert_eq!(commit_t, 1);
             }

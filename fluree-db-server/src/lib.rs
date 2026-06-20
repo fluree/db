@@ -551,7 +551,7 @@ impl FlureeServerBuilder {
                         loop {
                             tokio::select! {
                                 biased;
-                                _ = cancel_for_task.cancelled() => break,
+                                () = cancel_for_task.cancelled() => break,
                                 msg = rx.recv() => {
                                     match msg {
                                         Some((ledger_id, cid)) => {
@@ -702,7 +702,11 @@ impl Default for FlureeServerBuilder {
 /// content store. Pulled out so the steady-state release loop and
 /// the shutdown drain don't drift apart on error handling.
 #[cfg(feature = "raft")]
-async fn release_one(fluree: &fluree_db_api::Fluree, ledger_id: &str, cid: &fluree_db_core::ContentId) {
+async fn release_one(
+    fluree: &fluree_db_api::Fluree,
+    ledger_id: &str,
+    cid: &fluree_db_core::ContentId,
+) {
     if let Err(err) = fluree.content_store(ledger_id).release(cid).await {
         tracing::warn!(
             %ledger_id,

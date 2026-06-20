@@ -143,6 +143,9 @@ impl CommitWorker {
             match self.try_advance_head(ref_key, &entry).await {
                 Ok(()) => return Ok(()),
                 Err(WorkerError::Stage(reason)) => {
+                    // Unbox once at the top so the rest of the arm
+                    // can work with a plain `PoisonReason`.
+                    let reason = *reason;
                     let is_transient = matches!(reason, PoisonReason::StagingFailed { .. });
                     if is_transient && attempt < MAX_STAGE_ATTEMPTS {
                         let backoff = STAGE_RETRY_BASE_BACKOFF * (1u32 << (attempt - 1));
@@ -168,12 +171,10 @@ impl CommitWorker {
                     // `StagingFailed` record so the poison reason
                     // surfaces how many tries actually happened.
                     let reason = match reason {
-                        PoisonReason::StagingFailed { error, .. } => {
-                            PoisonReason::StagingFailed {
-                                error,
-                                attempts: attempt,
-                            }
-                        }
+                        PoisonReason::StagingFailed { error, .. } => PoisonReason::StagingFailed {
+                            error,
+                            attempts: attempt,
+                        },
                         other => other,
                     };
                     return self.propose_poison(ref_key, entry.queue_id, reason).await;
@@ -196,8 +197,8 @@ impl CommitWorker {
         check_envelope_kind(entry.body_kind, &envelope)?;
 
         let StagedOutcome { receipt, install } = match envelope {
-            QueuedRequest::Transact(transact) => self.stage_and_persist(ref_key, transact).await?,
-            QueuedRequest::Push(push) => self.process_push(ref_key, push).await?,
+            QueuedRequest::Transact(transact) => self.stage_and_persist(ref_key, *transact).await?,
+            QueuedRequest::Push(push) => self.process_push(ref_key, *push).await?,
             QueuedRequest::Revert(revert) => self.process_revert(ref_key, revert).await?,
             QueuedRequest::Merge(merge) => self.process_merge(ref_key, merge).await?,
             QueuedRequest::Rebase(rebase) => self.process_rebase(ref_key, rebase).await?,
@@ -300,13 +301,13 @@ impl CommitWorker {
             .get(&entry.request_cid)
             .await
             .map_err(|e| {
-                WorkerError::Stage(PoisonReason::StagingFailed {
+                stage(PoisonReason::StagingFailed {
                     error: format!("CAS read of request_cid failed: {e}"),
                     attempts: 1,
                 })
             })?;
         QueuedRequest::from_bytes(&bytes).map_err(|e| {
-            WorkerError::Stage(PoisonReason::BodyMalformed {
+            stage(PoisonReason::BodyMalformed {
                 error: format!("QueuedRequest decode failed: {e}"),
             })
         })
@@ -542,7 +543,7 @@ impl CommitWorker {
         let mut commits = Vec::with_capacity(commit_cids.len());
         for cid in &commit_cids {
             let bytes = content_store.get(cid).await.map_err(|e| {
-                WorkerError::Stage(PoisonReason::BodyMalformed {
+                stage(PoisonReason::BodyMalformed {
                     error: format!("push commit {cid} missing from CAS: {e}"),
                 })
             })?;
@@ -629,7 +630,7 @@ impl CommitWorker {
         // disagree about which queue the entry belongs on. Poison
         // rather than advance the wrong branch.
         if target != ref_key.branch {
-            return Err(WorkerError::Stage(PoisonReason::BodyMalformed {
+            return Err(stage(PoisonReason::BodyMalformed {
                 error: format!(
                     "queue entry on branch {} but prepare_merge resolved target to {target}",
                     ref_key.branch
@@ -734,7 +735,7 @@ impl CommitWorker {
             (Some(head), _) => (head, new_head_t),
             (None, Some(head)) => (head, pre_rebase_head_t),
             (None, None) => {
-                return Err(WorkerError::Stage(PoisonReason::WorkerPanic {
+                return Err(stage(PoisonReason::WorkerPanic {
                     message: "rebase produced no advance and the branch had no pre-rebase head"
                         .into(),
                 }));
@@ -898,7 +899,7 @@ fn check_envelope_kind(body_kind: BodyKind, envelope: &QueuedRequest) -> Result<
     if expected == body_kind {
         Ok(())
     } else {
-        Err(WorkerError::Stage(PoisonReason::BodyMalformed {
+        Err(stage(PoisonReason::BodyMalformed {
             error: format!(
                 "queue entry body_kind {body_kind:?} does not match envelope variant {expected:?}"
             ),
@@ -914,24 +915,31 @@ fn current_millis() -> u64 {
 }
 
 fn stage_failure(message: &str) -> WorkerError {
-    WorkerError::Stage(PoisonReason::StagingFailed {
+    stage(PoisonReason::StagingFailed {
         error: message.into(),
         attempts: 1,
     })
 }
 
 fn submission_to_stage(err: SubmissionError) -> WorkerError {
-    WorkerError::Stage(PoisonReason::StagingFailed {
+    stage(PoisonReason::StagingFailed {
         error: err.to_string(),
         attempts: 1,
     })
 }
 
 fn api_error_to_stage(err: ApiError) -> WorkerError {
-    WorkerError::Stage(PoisonReason::StagingFailed {
+    stage(PoisonReason::StagingFailed {
         error: err.to_string(),
         attempts: 1,
     })
+}
+
+/// Wrap a [`PoisonReason`] into the boxed [`WorkerError::Stage`]
+/// variant. Centralizes the `Box::new` so the construction sites
+/// don't have to repeat it.
+fn stage(reason: PoisonReason) -> WorkerError {
+    WorkerError::Stage(Box::new(reason))
 }
 
 /// Internal classification for worker outcomes.
@@ -943,8 +951,12 @@ fn api_error_to_stage(err: ApiError) -> WorkerError {
 /// quorum lost) and the drain loop should yield.
 #[derive(Debug, Error)]
 pub enum WorkerError {
+    /// `PoisonReason` is boxed so this enum stays small even though
+    /// `PushCasFailed` carries two `Option<ContentId>`s — without
+    /// the indirection every `Result<(), WorkerError>` in the worker
+    /// pays that variant's footprint even on the happy path.
     #[error("staging poisoned: {0:?}")]
-    Stage(PoisonReason),
+    Stage(Box<PoisonReason>),
     #[error("raft propose: {0}")]
     Raft(String),
 }
@@ -987,21 +999,21 @@ mod tests {
     }
 
     fn sample_transact_envelope() -> QueuedRequest {
-        QueuedRequest::Transact(QueuedTransact {
+        QueuedRequest::Transact(Box::new(QueuedTransact {
             body: TransactionBody::JsonLdInsert(json!({"@id": "ex:s", "ex:p": "ex:o"})),
             txn_opts: TxnOpts::default(),
             commit_opts: CommitOptsRequest::default(),
             tracking: Some(TrackingOptions::default()),
             governance: GovernanceOptions::default(),
-        })
+        }))
     }
 
     fn sample_push_envelope() -> QueuedRequest {
-        QueuedRequest::Push(QueuedPush {
+        QueuedRequest::Push(Box::new(QueuedPush {
             commit_cids: vec![cid(5)],
             blobs: std::collections::HashMap::new(),
             governance: GovernanceOptions::default(),
-        })
+        }))
     }
 
     #[test]

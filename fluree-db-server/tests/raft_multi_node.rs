@@ -883,9 +883,10 @@ async fn submission_status_survives_leader_transition() {
                 break id;
             }
         }
-        if Instant::now() >= deadline {
-            panic!("no new leader elected within {DEFAULT_TIMEOUT:?}");
-        }
+        assert!(
+            Instant::now() < deadline,
+            "no new leader elected within {DEFAULT_TIMEOUT:?}"
+        );
         tokio::time::sleep(Duration::from_millis(100)).await;
     };
     assert_ne!(new_leader, original_leader);
@@ -931,10 +932,7 @@ async fn submission_status_survives_leader_transition() {
             kind, "transact",
             "expected kind=transact, got {kind:?} (full body: {json})"
         );
-        let commit_id = json
-            .get("commit_id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let commit_id = json.get("commit_id").and_then(|v| v.as_str()).unwrap_or("");
         assert!(
             !commit_id.is_empty(),
             "committed envelope should carry the commit_id; got {json}"

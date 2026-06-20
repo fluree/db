@@ -15,10 +15,10 @@
 //! adds no operation-pipeline work of its own.
 
 use crate::{
-    BodyKind, Committer, IdempotencyCacheKey, IdempotencyKey, LocalCommitter, MergeReceipt,
-    MergeRequest, OperationReceipt, PushReceipt, PushRequest, RebaseReceipt, RebaseRequest,
-    RevertReceipt, RevertRequest, RevertSelection, SubmissionError, SubmissionLookup,
-    SubmissionState, TransactionReceipt, TransactionRequest,
+    BodyKind, CommittedSubmission, Committer, IdempotencyCacheKey, IdempotencyKey, LocalCommitter,
+    MergeReceipt, MergeRequest, OperationReceipt, PushReceipt, PushRequest, RebaseReceipt,
+    RebaseRequest, RevertReceipt, RevertRequest, RevertSelection, SubmissionError,
+    SubmissionLookup, SubmissionState, TransactionReceipt, TransactionRequest,
 };
 use async_trait::async_trait;
 use fluree_db_api::{CommitRef, Fluree, GovernanceOptions};
@@ -178,9 +178,10 @@ impl<C: Committer> CachingCommitter<C> {
             // reserved for the replicated-state fallback in
             // `SubmissionLookup` (post-leader-transition reads), which
             // doesn't flow through this map.
-            SubmissionState::Committed {
-                receipt: Some(r), ..
-            } => Ok(Some(r)),
+            SubmissionState::Committed(committed) => match committed.receipt {
+                Some(r) => Ok(Some(*r)),
+                None => Err(SubmissionError::AlreadyInFlight),
+            },
             _ => Err(SubmissionError::AlreadyInFlight),
         }
     }
@@ -435,14 +436,14 @@ impl<C: Committer> Committer for CachingCommitter<C> {
         let body_kind = BodyKind::from(&request.body);
         let outcome = self.executor.transact(request).await;
         self.record_outcome(cache_key, body_hash, &outcome, |r: &TransactionReceipt| {
-            SubmissionState::Committed {
+            SubmissionState::Committed(Box::new(CommittedSubmission {
                 idempotency_key: r.idempotency_key.clone(),
                 kind: body_kind,
                 commit_id: r.commit.commit_id.clone(),
                 t: r.commit.t,
                 tally: r.tally.clone(),
-                receipt: Some(OperationReceipt::Transaction(r.clone())),
-            }
+                receipt: Some(Box::new(OperationReceipt::Transaction(r.clone()))),
+            }))
         })
         .await;
         outcome
@@ -470,14 +471,14 @@ impl<C: Committer> Committer for CachingCommitter<C> {
 
         let outcome = self.executor.revert(request).await;
         self.record_outcome(cache_key, body_hash, &outcome, |r: &RevertReceipt| {
-            SubmissionState::Committed {
+            SubmissionState::Committed(Box::new(CommittedSubmission {
                 idempotency_key: r.idempotency_key.clone(),
                 kind: BodyKind::Revert,
                 commit_id: r.new_head_id.clone(),
                 t: r.new_head_t,
                 tally: None,
-                receipt: Some(OperationReceipt::Revert(r.clone())),
-            }
+                receipt: Some(Box::new(OperationReceipt::Revert(r.clone()))),
+            }))
         })
         .await;
         outcome
@@ -507,14 +508,14 @@ impl<C: Committer> Committer for CachingCommitter<C> {
 
         let outcome = self.executor.merge(request).await;
         self.record_outcome(cache_key, body_hash, &outcome, |r: &MergeReceipt| {
-            SubmissionState::Committed {
+            SubmissionState::Committed(Box::new(CommittedSubmission {
                 idempotency_key: r.idempotency_key.clone(),
                 kind: BodyKind::Merge,
                 commit_id: r.new_head_id.clone(),
                 t: r.new_head_t,
                 tally: None,
-                receipt: Some(OperationReceipt::Merge(r.clone())),
-            }
+                receipt: Some(Box::new(OperationReceipt::Merge(r.clone()))),
+            }))
         })
         .await;
         outcome
@@ -548,14 +549,14 @@ impl<C: Committer> Committer for CachingCommitter<C> {
             // branch's own new head (replays on top) isn't recorded
             // in the receipt; clients that need it follow up via
             // commit-log.
-            SubmissionState::Committed {
+            SubmissionState::Committed(Box::new(CommittedSubmission {
                 idempotency_key: r.idempotency_key.clone(),
                 kind: BodyKind::Rebase,
                 commit_id: r.source_head_id.clone(),
                 t: r.source_head_t,
                 tally: None,
-                receipt: Some(OperationReceipt::Rebase(r.clone())),
-            }
+                receipt: Some(Box::new(OperationReceipt::Rebase(r.clone()))),
+            }))
         })
         .await;
         outcome
@@ -592,14 +593,14 @@ impl<C: Committer> Committer for CachingCommitter<C> {
 
         let outcome = self.executor.push(request).await;
         self.record_outcome(cache_key, body_hash, &outcome, |r: &PushReceipt| {
-            SubmissionState::Committed {
+            SubmissionState::Committed(Box::new(CommittedSubmission {
                 idempotency_key: r.idempotency_key.clone(),
                 kind: BodyKind::Pushed,
                 commit_id: r.head_id.clone(),
                 t: r.head_t,
                 tally: None,
-                receipt: Some(OperationReceipt::Push(r.clone())),
-            }
+                receipt: Some(Box::new(OperationReceipt::Push(r.clone()))),
+            }))
         })
         .await;
         outcome
@@ -715,14 +716,14 @@ mod tests {
         assert_eq!(receipt.idempotency_key.as_ref(), Some(&key));
 
         match committer.status(&ledger_id, &key).await {
-            SubmissionState::Committed {
-                receipt: Some(OperationReceipt::Transaction(stored)),
-                ..
-            } => {
-                assert_eq!(stored.commit.t, receipt.commit.t);
-                assert_eq!(stored.commit.commit_id, receipt.commit.commit_id);
-            }
-            other => panic!("expected Committed(Transaction), got {other:?}"),
+            SubmissionState::Committed(committed) => match committed.receipt.map(|b| *b) {
+                Some(OperationReceipt::Transaction(stored)) => {
+                    assert_eq!(stored.commit.t, receipt.commit.t);
+                    assert_eq!(stored.commit.commit_id, receipt.commit.commit_id);
+                }
+                other => panic!("expected Some(Transaction), got {other:?}"),
+            },
+            other => panic!("expected Committed, got {other:?}"),
         }
     }
 
@@ -769,14 +770,16 @@ mod tests {
         // elision — clients that query under the un-normalized
         // form still find the entry.
         let elided_status = committer.status("test/committer", &key).await;
+        let resolved = matches!(
+            &elided_status,
+            SubmissionState::Committed(committed)
+                if matches!(
+                    committed.receipt.as_deref(),
+                    Some(OperationReceipt::Transaction(_))
+                ),
+        );
         assert!(
-            matches!(
-                elided_status,
-                SubmissionState::Committed {
-                    receipt: Some(OperationReceipt::Transaction(_)),
-                    ..
-                }
-            ),
+            resolved,
             "status via elided ledger_id should resolve, got {elided_status:?}"
         );
     }
@@ -1174,14 +1177,14 @@ ex:alice ex:name "Alice" ."#;
             .expect("revert to succeed");
 
         match committer.status(&ledger_id, &key).await {
-            SubmissionState::Committed {
-                receipt: Some(OperationReceipt::Revert(stored)),
-                ..
-            } => {
-                assert_eq!(stored.new_head_t, receipt.new_head_t);
-                assert_eq!(stored.new_head_id, receipt.new_head_id);
-            }
-            other => panic!("expected Committed(Revert), got {other:?}"),
+            SubmissionState::Committed(committed) => match committed.receipt.map(|b| *b) {
+                Some(OperationReceipt::Revert(stored)) => {
+                    assert_eq!(stored.new_head_t, receipt.new_head_t);
+                    assert_eq!(stored.new_head_id, receipt.new_head_id);
+                }
+                other => panic!("expected Some(Revert), got {other:?}"),
+            },
+            other => panic!("expected Committed, got {other:?}"),
         }
     }
 
@@ -1299,15 +1302,15 @@ ex:alice ex:name "Alice" ."#;
         // Status namespacing for merge is `ledger:source_branch`.
         let cache_ledger_id = fluree_db_api::format_ledger_id("test/committer", "feature");
         match committer.status(&cache_ledger_id, &key).await {
-            SubmissionState::Committed {
-                receipt: Some(OperationReceipt::Merge(stored)),
-                ..
-            } => {
-                assert_eq!(stored.new_head_t, receipt.new_head_t);
-                assert_eq!(stored.new_head_id, receipt.new_head_id);
-                assert_eq!(stored.fast_forward, receipt.fast_forward);
-            }
-            other => panic!("expected Committed(Merge), got {other:?}"),
+            SubmissionState::Committed(committed) => match committed.receipt.map(|b| *b) {
+                Some(OperationReceipt::Merge(stored)) => {
+                    assert_eq!(stored.new_head_t, receipt.new_head_t);
+                    assert_eq!(stored.new_head_id, receipt.new_head_id);
+                    assert_eq!(stored.fast_forward, receipt.fast_forward);
+                }
+                other => panic!("expected Some(Merge), got {other:?}"),
+            },
+            other => panic!("expected Committed, got {other:?}"),
         }
     }
 
@@ -1391,15 +1394,15 @@ ex:alice ex:name "Alice" ."#;
         // Cache namespace for rebase is `ledger:branch` (the branch being rebased).
         let cache_ledger_id = fluree_db_api::format_ledger_id("test/committer", "feature");
         match committer.status(&cache_ledger_id, &key).await {
-            SubmissionState::Committed {
-                receipt: Some(OperationReceipt::Rebase(stored)),
-                ..
-            } => {
-                assert_eq!(stored.source_head_t, receipt.source_head_t);
-                assert_eq!(stored.source_head_id, receipt.source_head_id);
-                assert_eq!(stored.fast_forward, receipt.fast_forward);
-            }
-            other => panic!("expected Committed(Rebase), got {other:?}"),
+            SubmissionState::Committed(committed) => match committed.receipt.map(|b| *b) {
+                Some(OperationReceipt::Rebase(stored)) => {
+                    assert_eq!(stored.source_head_t, receipt.source_head_t);
+                    assert_eq!(stored.source_head_id, receipt.source_head_id);
+                    assert_eq!(stored.fast_forward, receipt.fast_forward);
+                }
+                other => panic!("expected Some(Rebase), got {other:?}"),
+            },
+            other => panic!("expected Committed, got {other:?}"),
         }
     }
 

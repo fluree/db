@@ -223,24 +223,7 @@ impl crate::Fluree {
             lm.disconnect(&ctx.branch_id).await;
         }
 
-        let RevertContext {
-            branch_id,
-            branch_record,
-            branch_store,
-            plan,
-            conflict_keys,
-        } = ctx;
-
-        self.build_revert_commit(
-            &branch_id,
-            branch,
-            branch_record,
-            &branch_store,
-            &plan,
-            &conflict_keys,
-            strategy,
-        )
-        .await
+        self.build_revert_commit(branch, ctx, strategy).await
     }
 
     async fn revert_selection(
@@ -416,16 +399,19 @@ impl crate::Fluree {
     /// [`StagedCommit::apply`]) and by the Raft revert path (which
     /// writes the commit blob to the shared content store and proposes
     /// `AdvanceRef` through consensus instead).
-    pub(crate) async fn build_revert_commit<C: ContentStore + Clone + 'static>(
+    pub(crate) async fn build_revert_commit(
         &self,
-        branch_id: &str,
         branch: &str,
-        branch_record: fluree_db_nameservice::NsRecord,
-        branch_store: &C,
-        plan: &RevertPlan,
-        conflict_keys: &[ConflictKey],
+        ctx: RevertContext,
         strategy: ConflictStrategy,
     ) -> Result<StagedRevert> {
+        let RevertContext {
+            branch_id,
+            branch_record,
+            branch_store,
+            plan,
+            conflict_keys,
+        } = ctx;
         let reverted_commits = plan.ordered_commits.clone().into_vec();
         let conflict_count = conflict_keys.len();
         let rollback_snapshot = NsRecordSnapshot::from_record(&branch_record);
@@ -435,7 +421,7 @@ impl crate::Fluree {
         // semantics, matching the merge path's `collect_commit_data`.
         let mut commits = Vec::with_capacity(plan.ordered_commits.len());
         for commit_id in plan.ordered_commits.iter().rev() {
-            commits.push(load_commit_by_id(branch_store, commit_id).await?);
+            commits.push(load_commit_by_id(&branch_store, commit_id).await?);
         }
         let CollectedCommitData {
             flakes: inverted,
@@ -448,11 +434,11 @@ impl crate::Fluree {
         // manager (embedded use with no shared cache), fall back to a
         // fresh storage load — there's nothing to protect against.
         let (write_guard, target_state) = self
-            .lock_or_load(branch_id, branch_store.clone(), branch_record)
+            .lock_or_load(&branch_id, branch_store.clone(), branch_record)
             .await?;
 
         let staged = self
-            .apply_two_way_strategy(inverted, conflict_keys, &strategy, &target_state)
+            .apply_two_way_strategy(inverted, &conflict_keys, &strategy, &target_state)
             .await?;
 
         let current_head_t = target_state.t();

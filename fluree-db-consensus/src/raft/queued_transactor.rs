@@ -28,10 +28,10 @@ use crate::raft::state_machine_adapter::SharedState;
 use crate::raft::waiter::{AbortReason, WaiterMap, WaiterOutcome};
 use crate::raft::TypeConfig;
 use crate::{
-    Committer, IdempotencyCacheKey, IdempotencyKey, MergeReceipt, MergeRequest, PushReceipt,
-    PushRequest, QueuedMerge, QueuedPush, QueuedRebase, QueuedRequest, QueuedRevert, QueuedTransact,
-    RebaseReceipt, RebaseRequest, RevertReceipt, RevertRequest, SubmissionError, SubmissionLookup,
-    SubmissionState, TransactionReceipt, TransactionRequest,
+    CommittedSubmission, Committer, IdempotencyCacheKey, IdempotencyKey, MergeReceipt,
+    MergeRequest, PushReceipt, PushRequest, QueuedMerge, QueuedPush, QueuedRebase, QueuedRequest,
+    QueuedRevert, QueuedTransact, RebaseReceipt, RebaseRequest, RevertReceipt, RevertRequest,
+    SubmissionError, SubmissionLookup, SubmissionState, TransactionReceipt, TransactionRequest,
 };
 use async_trait::async_trait;
 use fluree_db_api::{CommitReceipt, Fluree};
@@ -319,13 +319,13 @@ impl Committer for QueuedTransactor {
             .map(|k| IdempotencyCacheKey::new(ledger_id.clone(), k.clone()));
 
         let body_kind = BodyKind::from(&body);
-        let envelope = QueuedRequest::Transact(QueuedTransact {
+        let envelope = QueuedRequest::Transact(Box::new(QueuedTransact {
             body,
             txn_opts,
             commit_opts: CommitOptsRequest::from(&commit_opts),
             tracking,
             governance,
-        });
+        }));
         let bytes = envelope
             .to_bytes()
             .map_err(|e| SubmissionError::Execution {
@@ -666,11 +666,11 @@ impl Committer for QueuedTransactor {
             commit_cids.push(cid);
         }
 
-        let envelope = QueuedRequest::Push(QueuedPush {
+        let envelope = QueuedRequest::Push(Box::new(QueuedPush {
             commit_cids,
             blobs,
             governance,
-        });
+        }));
         let bytes = envelope
             .to_bytes()
             .map_err(|e| SubmissionError::Execution {
@@ -768,14 +768,14 @@ impl SubmissionLookup for QueuedTransactor {
 }
 
 fn committed_from_applied(key: IdempotencyKey, record: &ApplyRecord) -> SubmissionState {
-    SubmissionState::Committed {
+    SubmissionState::Committed(Box::new(CommittedSubmission {
         idempotency_key: Some(key),
         kind: record.body_kind,
         commit_id: record.head.clone(),
         t: record.t,
         tally: record.tally.clone().map(Into::into),
         receipt: None,
-    }
+    }))
 }
 
 fn failure_from_poison(record: &PoisonRecord) -> SubmissionError {

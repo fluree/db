@@ -323,13 +323,21 @@ pub fn router(raft: Arc<Raft<TypeConfig>>) -> Router {
 }
 
 /// Decode a postcard-encoded request body. Failure → 400.
-fn decode<T: DeserializeOwned>(body: &[u8]) -> Result<T, Response> {
+///
+/// The error variant boxes the response so the `Result` itself
+/// stays small even though `axum::http::Response<Body>` is
+/// ~128 bytes — the happy path of every Raft RPC handler ends up
+/// pattern-matching this Result, and the unboxed version pads the
+/// good case with the size of the bad case.
+fn decode<T: DeserializeOwned>(body: &[u8]) -> Result<T, Box<Response>> {
     postcard::from_bytes(body).map_err(|e| {
-        (
-            StatusCode::BAD_REQUEST,
-            format!("postcard decode error: {e}"),
+        Box::new(
+            (
+                StatusCode::BAD_REQUEST,
+                format!("postcard decode error: {e}"),
+            )
+                .into_response(),
         )
-            .into_response()
     })
 }
 
@@ -356,7 +364,7 @@ async fn handle_append_entries(
 ) -> Response {
     let rpc: AppendEntriesRequest<TypeConfig> = match decode(&body) {
         Ok(v) => v,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
     match raft.append_entries(rpc).await {
         Ok(resp) => encode(&resp),
@@ -374,7 +382,7 @@ async fn handle_vote(
 ) -> Response {
     let rpc: VoteRequest<NodeId> = match decode(&body) {
         Ok(v) => v,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
     match raft.vote(rpc).await {
         Ok(resp) => encode(&resp),
@@ -388,7 +396,7 @@ async fn handle_install_snapshot(
 ) -> Response {
     let rpc: InstallSnapshotRequest<TypeConfig> = match decode(&body) {
         Ok(v) => v,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
     match raft.install_snapshot(rpc).await {
         Ok(resp) => encode(&resp),

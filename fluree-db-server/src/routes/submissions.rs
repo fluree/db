@@ -15,8 +15,8 @@ use axum::{
     Json,
 };
 use fluree_db_consensus::{
-    BodyKind, IdempotencyKey, MergeReceipt, OperationReceipt, PushReceipt, RebaseReceipt,
-    RevertReceipt, SubmissionState, TransactionReceipt,
+    BodyKind, CommittedSubmission, IdempotencyKey, MergeReceipt, OperationReceipt, PushReceipt,
+    RebaseReceipt, RevertReceipt, SubmissionState, TransactionReceipt,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -46,25 +46,31 @@ pub struct SubmissionStatusParams {
 pub enum SubmissionStateResponse {
     Unknown,
     InFlight,
-    Committed {
-        idempotency_key: Option<String>,
-        /// Op kind — `"transact"`, `"push"`, `"revert"`, `"merge"`,
-        /// or `"rebase"`. The seven transact body shapes (JSON-LD
-        /// insert/upsert/update, Turtle insert/upsert, TriG upsert,
-        /// SPARQL) collapse to `"transact"` so clients don't have to
-        /// branch on body format.
-        kind: &'static str,
-        commit_id: String,
-        t: i64,
-        /// Full per-op detail when the originating node still has
-        /// the typed receipt cached. `null` after leader transition
-        /// / restart / cache eviction.
-        #[serde(skip_serializing_if = "Option::is_none")]
-        detail: Option<OperationDetailResponse>,
-    },
-    Failed {
-        error: String,
-    },
+    Committed(Box<CommittedSubmissionResponse>),
+    Failed { error: String },
+}
+
+/// Payload of [`SubmissionStateResponse::Committed`]. Lifted into a
+/// struct so the enclosing enum's variant footprint stays a single
+/// pointer wide — the wire shape (flat fields plus an optional
+/// `detail` block) is preserved via the enclosing enum's `#[serde]`
+/// tag attribute and this struct's flat layout.
+#[derive(Serialize)]
+pub struct CommittedSubmissionResponse {
+    pub idempotency_key: Option<String>,
+    /// Op kind — `"transact"`, `"push"`, `"revert"`, `"merge"`,
+    /// or `"rebase"`. The seven transact body shapes (JSON-LD
+    /// insert/upsert/update, Turtle insert/upsert, TriG upsert,
+    /// SPARQL) collapse to `"transact"` so clients don't have to
+    /// branch on body format.
+    pub kind: &'static str,
+    pub commit_id: String,
+    pub t: i64,
+    /// Full per-op detail when the originating node still has the
+    /// typed receipt cached. `null` after leader transition /
+    /// restart / cache eviction.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<OperationDetailResponse>,
 }
 
 /// Per-op detail block, present on `Committed` when the typed
@@ -176,20 +182,23 @@ impl From<SubmissionState> for SubmissionStateResponse {
         match state {
             SubmissionState::Unknown => Self::Unknown,
             SubmissionState::InFlight => Self::InFlight,
-            SubmissionState::Committed {
-                idempotency_key,
-                kind,
-                commit_id,
-                t,
-                tally: _,
-                receipt,
-            } => Self::Committed {
-                idempotency_key: idempotency_key.map(|k| k.as_str().to_string()),
-                kind: body_kind_tag(kind),
-                commit_id: commit_id.to_string(),
-                t,
-                detail: receipt.map(OperationDetailResponse::from),
-            },
+            SubmissionState::Committed(committed) => {
+                let CommittedSubmission {
+                    idempotency_key,
+                    kind,
+                    commit_id,
+                    t,
+                    tally: _,
+                    receipt,
+                } = *committed;
+                Self::Committed(Box::new(CommittedSubmissionResponse {
+                    idempotency_key: idempotency_key.map(|k| k.as_str().to_string()),
+                    kind: body_kind_tag(kind),
+                    commit_id: commit_id.to_string(),
+                    t,
+                    detail: receipt.map(|r| OperationDetailResponse::from(*r)),
+                }))
+            }
             SubmissionState::Failed(err) => Self::Failed {
                 error: err.to_string(),
             },

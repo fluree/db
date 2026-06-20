@@ -1205,11 +1205,12 @@ mod raft_validation_tests {
     use std::path::PathBuf;
 
     fn raft_enabled_base() -> ServerConfig {
-        let mut cfg = ServerConfig::default();
-        cfg.raft_enabled = true;
-        cfg.raft_node_id = Some(1);
-        cfg.raft_listen_addr = Some(SocketAddr::from(([127, 0, 0, 1], 9001)));
-        cfg
+        ServerConfig {
+            raft_enabled: true,
+            raft_node_id: Some(1),
+            raft_listen_addr: Some(SocketAddr::from(([127, 0, 0, 1], 9001))),
+            ..Default::default()
+        }
     }
 
     #[test]
@@ -1238,9 +1239,7 @@ mod raft_validation_tests {
         let mut cfg = raft_enabled_base();
         cfg.raft_storage_path = Some(PathBuf::from("/srv/raft"));
         cfg.storage_path = Some(PathBuf::from("/srv/raft/data"));
-        let err = cfg
-            .validate()
-            .expect_err("must reject nested storage path");
+        let err = cfg.validate().expect_err("must reject nested storage path");
         assert!(err.contains("disjoint"), "unexpected error message: {err}");
     }
 

@@ -145,9 +145,9 @@ pub struct LedgerRecord {
 /// duplicate submission, but no leader-side details. A different
 /// leader handling a retry can't reconstruct full typed receipts
 /// (per-op fields like Merge's `commits_copied` aren't replicated),
-/// so this layer carries a minimal kit — op kind + commit identity
-/// + tally — that's enough for status lookups to answer "yes it
-/// committed" after a leader transition.
+/// so this layer carries a minimal kit (op kind, commit identity,
+/// tally) — enough for status lookups to answer "yes it committed"
+/// after a leader transition.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ApplyRecord {
     /// CAS identifier of the [`crate::QueuedRequest`] envelope this
@@ -943,12 +943,8 @@ fn retract_ledger(
         // (the head check happens at apply time, not at propose
         // time). Aborting in-flight waiters with `BranchRetracted`
         // gives proposers a clear signal to give up the slot.
-        let released_envelopes = clear_queue_for_admin(
-            state,
-            &key,
-            ClearReason::BranchRetracted,
-            applied_at_millis,
-        );
+        let released_envelopes =
+            clear_queue_for_admin(state, &key, ClearReason::BranchRetracted, applied_at_millis);
         Response::Retracted {
             ledger_id: full,
             released_envelopes,
@@ -1850,7 +1846,7 @@ mod tests {
         assert!(state
             .queues
             .get(&RefKey::new("test/db", "main"))
-            .map_or(true, VecDeque::is_empty));
+            .is_none_or(VecDeque::is_empty));
     }
 
     #[test]

@@ -9,8 +9,8 @@
 
 use crate::{
     Committer, IdempotencyKey, MergeReceipt, MergeRequest, PushReceipt, PushRequest, RebaseReceipt,
-    RebaseRequest, RevertReceipt, RevertRequest, RevertSelection, SubmissionError, SubmissionLookup,
-    SubmissionState, TransactionBody, TransactionReceipt, TransactionRequest,
+    RebaseRequest, RevertReceipt, RevertRequest, RevertSelection, SubmissionError,
+    SubmissionLookup, SubmissionState, TransactionBody, TransactionReceipt, TransactionRequest,
 };
 use async_trait::async_trait;
 use fluree_db_api::{

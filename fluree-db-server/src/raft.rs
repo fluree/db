@@ -100,21 +100,37 @@ pub struct RaftIntegration {
     release_rx: Arc<Mutex<Option<ReleaseReceiver>>>,
 }
 
+/// Parts the [`RaftIntegration::new`] assembler stitches together.
+/// Grouped so the constructor stays a single positional struct
+/// argument instead of an eight-parameter call site — each field
+/// is independently produced upstream and they only meet here.
+pub struct RaftIntegrationParts {
+    pub raft: Arc<Raft<TypeConfig>>,
+    pub self_id: NodeId,
+    pub http_client: reqwest::Client,
+    pub shared_state: SharedState,
+    pub event_bus: Arc<LedgerEventBus>,
+    pub waiter_map: Arc<WaiterMap>,
+    pub staged_receipts: Arc<StagedReceiptMap>,
+    pub release_rx: ReleaseReceiver,
+}
+
 impl RaftIntegration {
     /// Build the integration from a fully-constructed Raft handle.
     /// The HTTP client is shared with the leader-forward middleware
     /// so a single connection pool serves both inter-node RPC and
     /// follower→leader request relays.
-    pub fn new(
-        raft: Arc<Raft<TypeConfig>>,
-        self_id: NodeId,
-        http_client: reqwest::Client,
-        shared_state: SharedState,
-        event_bus: Arc<LedgerEventBus>,
-        waiter_map: Arc<WaiterMap>,
-        staged_receipts: Arc<StagedReceiptMap>,
-        release_rx: ReleaseReceiver,
-    ) -> Self {
+    pub fn new(parts: RaftIntegrationParts) -> Self {
+        let RaftIntegrationParts {
+            raft,
+            self_id,
+            http_client,
+            shared_state,
+            event_bus,
+            waiter_map,
+            staged_receipts,
+            release_rx,
+        } = parts;
         let forwarder = Arc::new(LeaderForwarder::new(
             Arc::clone(&raft),
             self_id,
@@ -183,16 +199,16 @@ impl RaftIntegration {
 
         let raft = Raft::new(config.node_id, raft_cfg, factory, log, sm).await?;
 
-        Ok(Self::new(
-            Arc::new(raft),
-            config.node_id,
+        Ok(Self::new(RaftIntegrationParts {
+            raft: Arc::new(raft),
+            self_id: config.node_id,
             http_client,
             shared_state,
             event_bus,
             waiter_map,
             staged_receipts,
             release_rx,
-        ))
+        }))
     }
 
     /// Router for the private listener — exposes the inter-node Raft
@@ -638,18 +654,14 @@ mod tests {
             }
         }
 
-        let watcher = spawn_leader_watcher(
-            Arc::clone(&integration.raft),
-            1,
-            move || {
-                alive_for_closure.fetch_add(1, Ordering::SeqCst);
-                let guard = AliveGuard(Arc::clone(&alive_for_closure));
-                vec![tokio::spawn(async move {
-                    let _g = guard;
-                    futures::future::pending::<()>().await;
-                })]
-            },
-        );
+        let watcher = spawn_leader_watcher(Arc::clone(&integration.raft), 1, move || {
+            alive_for_closure.fetch_add(1, Ordering::SeqCst);
+            let guard = AliveGuard(Arc::clone(&alive_for_closure));
+            vec![tokio::spawn(async move {
+                let _g = guard;
+                futures::future::pending::<()>().await;
+            })]
+        });
 
         let mut members = std::collections::BTreeMap::new();
         members.insert(1u64, fluree_db_consensus::raft::ClusterNode::default());
