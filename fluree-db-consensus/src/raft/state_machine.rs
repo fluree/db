@@ -20,6 +20,7 @@
 use crate::IdempotencyCacheKey;
 use fluree_db_api::{ContentId, PolicyStats, TrackingTally};
 use fluree_db_core::ledger_id::format_ledger_id;
+use fluree_db_nameservice::{RefKind, RefValue};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use thiserror::Error;
@@ -489,6 +490,22 @@ pub enum Command {
     /// doesn't mutate state on this — the entry's role is to let
     /// every node's content store act in sync.
     ReleaseContent { id: ContentId },
+    /// Compare-and-set one branch's commit or index head. Mirrors
+    /// the [`fluree_db_nameservice::RefPublisher::compare_and_set_ref`]
+    /// contract: returns [`Response::RefCasConflict`] on mismatch
+    /// and enforces per-kind monotonicity on the update
+    /// (`new.t > current.t` for [`RefKind::CommitHead`],
+    /// `new.t >= current.t` for [`RefKind::IndexHead`]).
+    CompareAndSetRef {
+        ledger_id: String,
+        branch: String,
+        kind: RefKind,
+        expected: Option<RefValue>,
+        new: RefValue,
+        /// See [`Command::DropBranch::applied_at_millis`].
+        #[serde(default)]
+        applied_at_millis: u64,
+    },
     /// Append a transactor request to the per-branch queue. Apply
     /// checks idempotency, the in-flight queue, and the queue
     /// depth caps; on success appends a [`QueueEntry`] and returns
@@ -667,6 +684,14 @@ pub enum Response {
         /// The proposed (rejected) index t.
         proposed_t: i64,
     },
+    /// [`Command::CompareAndSetRef`] succeeded — the branch's
+    /// commit or index head matches `new`.
+    RefCasUpdated,
+    /// [`Command::CompareAndSetRef`] refused because `expected` didn't
+    /// match the branch's current ref. `actual` carries the
+    /// post-mismatch value the caller decides what to do with —
+    /// retry, surface the conflict, or diverge.
+    RefCasConflict { actual: Option<RefValue> },
     /// [`Command::CreateLedger`] succeeded. `ledger_id` is the full
     /// `name:branch` form.
     Created { ledger_id: String },
@@ -879,6 +904,23 @@ pub fn apply(state: &mut NameServiceState, command: Command, log_index: u64) -> 
             applied_at_millis,
         } => purge_ledger(state, ledger_id, branch, applied_at_millis),
         Command::ReleaseContent { id: _ } => Response::NoOp,
+        Command::CompareAndSetRef {
+            ledger_id,
+            branch,
+            kind,
+            expected,
+            new,
+            applied_at_millis,
+        } => apply_compare_and_set_ref(
+            state,
+            log_index,
+            ledger_id,
+            branch,
+            kind,
+            expected,
+            new,
+            applied_at_millis,
+        ),
         // Queue-related commands. Apply paths land in subsequent
         // commits; see docs/design/raft-command-queue.md.
         Command::EnqueueCommand(args) => apply_enqueue_command(state, log_index, args),
@@ -1280,6 +1322,135 @@ fn advance_index_head(state: &mut NameServiceState, args: AdvanceIndexHeadArgs) 
         index_t: t,
         index_head: new_index_head,
     }
+}
+
+/// Read the current commit or index ref value for `(ledger_id, branch)`
+/// as a [`RefValue`]. Returns `None` when the ledger or branch isn't
+/// registered. A registered branch with no `RefEntry` returns
+/// `Some(RefValue { id: None, t: 0 })`.
+fn current_ref_value(state: &NameServiceState, key: &RefKey, kind: RefKind) -> Option<RefValue> {
+    if !state
+        .ledgers
+        .get(&key.ledger_id)
+        .is_some_and(|l| l.branches.iter().any(|b| b == &key.branch))
+    {
+        return None;
+    }
+    let entry = state.refs.get(key);
+    Some(match kind {
+        RefKind::CommitHead => RefValue {
+            id: entry.map(|e| e.head.clone()),
+            t: entry.map(|e| e.t).unwrap_or(0),
+        },
+        RefKind::IndexHead => RefValue {
+            id: entry
+                .and_then(|e| e.index.as_ref())
+                .map(|i| i.head.clone()),
+            t: entry
+                .and_then(|e| e.index.as_ref())
+                .map(|i| i.t)
+                .unwrap_or(0),
+        },
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_compare_and_set_ref(
+    state: &mut NameServiceState,
+    log_index: u64,
+    ledger_id: String,
+    branch: String,
+    kind: RefKind,
+    expected: Option<RefValue>,
+    new: RefValue,
+    applied_at_millis: u64,
+) -> Response {
+    let key = RefKey::new(&ledger_id, &branch);
+    let full_ledger_id = format_ledger_id(&ledger_id, &branch);
+
+    let Some(current) = current_ref_value(state, &key, kind) else {
+        return Response::LedgerNotFound {
+            ledger_id: full_ledger_id,
+        };
+    };
+
+    // `expected = None` matches when the current ref has no `id`
+    // (no `RefEntry`, or an `IndexHead` with no `index` field).
+    let expected_matches = match expected.as_ref() {
+        None => current.id.is_none(),
+        Some(rv) => &current == rv,
+    };
+    if !expected_matches {
+        return Response::RefCasConflict {
+            actual: Some(current),
+        };
+    }
+
+    // Commit heads are strictly monotonic in `t`; index heads
+    // allow equal.
+    let monotonic = match kind {
+        RefKind::CommitHead => new.t > current.t,
+        RefKind::IndexHead => new.t >= current.t,
+    };
+    if !monotonic {
+        return Response::RefCasConflict {
+            actual: Some(current),
+        };
+    }
+
+    // Carry the existing entry's index / lineage / child-count
+    // fields forward when overwriting a born ref; defaults when no
+    // entry exists.
+    let (prior_index, prior_source, prior_branches) = state
+        .refs
+        .get(&key)
+        .map(|r| (r.index.clone(), r.source_branch.clone(), r.branches))
+        .unwrap_or_default();
+    match kind {
+        RefKind::CommitHead => {
+            // `new.id = None` on a commit head is rejected as a
+            // conflict; ref removal goes through
+            // `Command::ResetHead { snapshot: unborn }`.
+            let Some(head) = new.id.clone() else {
+                return Response::RefCasConflict {
+                    actual: Some(current),
+                };
+            };
+            state.refs.insert(
+                key,
+                RefEntry {
+                    head,
+                    t: new.t,
+                    last_advanced_at_millis: applied_at_millis,
+                    last_advanced_index: log_index,
+                    index: prior_index,
+                    source_branch: prior_source,
+                    branches: prior_branches,
+                },
+            );
+        }
+        RefKind::IndexHead => {
+            // An `IndexHead` CAS on a branch with no `RefEntry`, or
+            // proposing past the branch's commit `t`, surfaces as
+            // `IndexAhead` — same shape `AdvanceIndexHead` returns.
+            let Some(entry) = state.refs.get_mut(&key) else {
+                return Response::IndexAhead {
+                    commit_t: 0,
+                    proposed_t: new.t,
+                };
+            };
+            if new.t > entry.t {
+                return Response::IndexAhead {
+                    commit_t: entry.t,
+                    proposed_t: new.t,
+                };
+            }
+            entry.index = new.id.clone().map(|head| IndexState { head, t: new.t });
+            entry.last_advanced_at_millis = applied_at_millis;
+        }
+    }
+
+    Response::RefCasUpdated
 }
 
 fn apply_enqueue_command(
@@ -3318,6 +3489,173 @@ mod tests {
             other => panic!("expected EvictionApplied, got {other:?}"),
         }
         assert_eq!(state.evicted_idempotency_count, 0);
+    }
+
+    // ====================================================================
+    // CompareAndSetRef
+    // ====================================================================
+
+    fn cas_ref_cmd(
+        ledger_id: &str,
+        branch: &str,
+        kind: RefKind,
+        expected: Option<RefValue>,
+        new: RefValue,
+    ) -> Command {
+        Command::CompareAndSetRef {
+            ledger_id: ledger_id.into(),
+            branch: branch.into(),
+            kind,
+            expected,
+            new,
+            applied_at_millis: 0,
+        }
+    }
+
+    #[test]
+    fn cas_ref_commit_initial_creation_lands_on_unborn_branch() {
+        let mut state = NameServiceState::new();
+        apply(&mut state, create_ledger("test/db"), 0);
+        // Initial creation: `expected = None` against an unborn branch.
+        let resp = apply(
+            &mut state,
+            cas_ref_cmd(
+                "test/db",
+                "main",
+                RefKind::CommitHead,
+                None,
+                RefValue { id: Some(cid(1)), t: 1 },
+            ),
+            1,
+        );
+        assert_eq!(resp, Response::RefCasUpdated);
+        let entry = state.refs.get(&RefKey::new("test/db", "main")).unwrap();
+        assert_eq!(entry.head, cid(1));
+        assert_eq!(entry.t, 1);
+    }
+
+    #[test]
+    fn cas_ref_commit_conflict_when_expected_doesnt_match() {
+        let mut state = NameServiceState::new();
+        create_ledger_with_genesis(&mut state, "test/db");
+        let resp = apply(
+            &mut state,
+            cas_ref_cmd(
+                "test/db",
+                "main",
+                RefKind::CommitHead,
+                Some(RefValue { id: Some(cid(9)), t: 99 }),
+                RefValue { id: Some(cid(1)), t: 100 },
+            ),
+            2,
+        );
+        match resp {
+            Response::RefCasConflict { actual } => {
+                let actual = actual.expect("actual present");
+                assert_eq!(actual.id, Some(cid(0)));
+                assert_eq!(actual.t, 0);
+            }
+            other => panic!("expected RefCasConflict, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cas_ref_commit_rejects_non_monotonic_t() {
+        let mut state = NameServiceState::new();
+        create_ledger_with_genesis(&mut state, "test/db");
+        // Genesis sits at (cid(0), t=0). A CAS expecting the same with
+        // new.t = 0 (equal, not strictly greater) must conflict.
+        let resp = apply(
+            &mut state,
+            cas_ref_cmd(
+                "test/db",
+                "main",
+                RefKind::CommitHead,
+                Some(RefValue { id: Some(cid(0)), t: 0 }),
+                RefValue { id: Some(cid(1)), t: 0 },
+            ),
+            2,
+        );
+        assert!(matches!(resp, Response::RefCasConflict { .. }));
+    }
+
+    #[test]
+    fn cas_ref_index_allows_equal_t_for_admin_reindex() {
+        let mut state = NameServiceState::new();
+        create_ledger_with_genesis(&mut state, "test/db");
+        // Seed an index at t = 0 against the genesis commit.
+        apply(
+            &mut state,
+            Command::AdvanceIndexHead(AdvanceIndexHeadArgs {
+                ledger_id: "test/db".into(),
+                branch: "main".into(),
+                new_index_head: cid(10),
+                t: 0,
+                applied_at_millis: 0,
+            }),
+            2,
+        );
+        // CAS overwriting the index at the same t with a new root.
+        let resp = apply(
+            &mut state,
+            cas_ref_cmd(
+                "test/db",
+                "main",
+                RefKind::IndexHead,
+                Some(RefValue { id: Some(cid(10)), t: 0 }),
+                RefValue { id: Some(cid(11)), t: 0 },
+            ),
+            3,
+        );
+        assert_eq!(resp, Response::RefCasUpdated);
+        let entry = state.refs.get(&RefKey::new("test/db", "main")).unwrap();
+        let idx = entry.index.as_ref().unwrap();
+        assert_eq!(idx.head, cid(11));
+        assert_eq!(idx.t, 0);
+    }
+
+    #[test]
+    fn cas_ref_index_ahead_when_proposed_t_exceeds_commit_t() {
+        let mut state = NameServiceState::new();
+        create_ledger_with_genesis(&mut state, "test/db");
+        let resp = apply(
+            &mut state,
+            cas_ref_cmd(
+                "test/db",
+                "main",
+                RefKind::IndexHead,
+                Some(RefValue { id: None, t: 0 }),
+                RefValue { id: Some(cid(10)), t: 5 },
+            ),
+            2,
+        );
+        match resp {
+            Response::IndexAhead {
+                commit_t,
+                proposed_t,
+            } => {
+                assert_eq!(commit_t, 0);
+                assert_eq!(proposed_t, 5);
+            }
+            other => panic!("expected IndexAhead, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cas_ref_rejects_when_ledger_missing() {
+        let mut state = NameServiceState::new();
+        let resp = apply(
+            &mut state,
+            cas_ref_cmd(
+                "missing",
+                "main",
+                RefKind::CommitHead,
+                None,
+                RefValue { id: Some(cid(1)), t: 1 },
+            ),
+            1,
+        );
+        assert!(matches!(resp, Response::LedgerNotFound { .. }));
     }
 
     // ====================================================================

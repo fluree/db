@@ -59,10 +59,10 @@ use async_trait::async_trait;
 use fluree_db_core::ledger_id::split_ledger_id;
 use fluree_db_core::ContentId;
 use fluree_db_nameservice::{
-    BranchLifecycle, CommitPublisher, ConfigLookup, ConfigValue, GraphSourceLookup,
+    BranchLifecycle, CasResult, CommitPublisher, ConfigLookup, ConfigValue, GraphSourceLookup,
     GraphSourceRecord, IndexPublisher, LedgerLifecycle, NameServiceError, NameServiceLookup,
-    NsLookupResult, NsRecord, NsRecordSnapshot, RefKind, RefLookup, RefValue, Result, StatusLookup,
-    StatusValue,
+    NsLookupResult, NsRecord, NsRecordSnapshot, RefKind, RefLookup, RefPublisher, RefValue, Result,
+    StatusLookup, StatusValue,
 };
 use openraft::error::{ClientWriteError, RaftError};
 use openraft::Raft;
@@ -675,6 +675,41 @@ impl RefLookup for RaftNameService {
                     t: index.map(|i| i.t).unwrap_or(0),
                 }))
             }
+        }
+    }
+}
+
+#[async_trait]
+impl RefPublisher for RaftNameService {
+    async fn compare_and_set_ref(
+        &self,
+        ledger_id: &str,
+        kind: RefKind,
+        expected: Option<&RefValue>,
+        new: &RefValue,
+    ) -> Result<CasResult> {
+        let (ledger_name, branch) = split_ledger_id(ledger_id)?;
+        let cmd = SmCommand::CompareAndSetRef {
+            ledger_id: ledger_name,
+            branch,
+            kind,
+            expected: expected.cloned(),
+            new: new.clone(),
+            applied_at_millis: current_millis(),
+        };
+        match self.submit_lifecycle(cmd).await? {
+            SmResponse::RefCasUpdated => Ok(CasResult::Updated),
+            SmResponse::RefCasConflict { actual } => Ok(CasResult::Conflict { actual }),
+            SmResponse::LedgerNotFound { ledger_id } => {
+                Err(NameServiceError::not_found(ledger_id))
+            }
+            // `IndexAhead` from an `IndexHead` CAS proposing past
+            // the branch's commit watermark maps to a `Conflict`
+            // with no actual value.
+            SmResponse::IndexAhead { .. } => Ok(CasResult::Conflict { actual: None }),
+            other => Err(NameServiceError::storage(format!(
+                "unexpected Response variant for CompareAndSetRef: {other:?}"
+            ))),
         }
     }
 }
