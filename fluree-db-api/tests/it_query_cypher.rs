@@ -3632,6 +3632,58 @@ async fn cypher_not_exists_subquery_inner_where() {
 }
 
 #[tokio::test]
+async fn cypher_exists_in_map_projection_computed_entry() {
+    // EXISTS as a computed entry inside a map projection / map literal must be
+    // resolved per row (not fall through to a synchronous `false`). Person 1
+    // KNOWS others → true; persons 2/3/4 have no outgoing KNOWS → false.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = seed_exists_graph(&fluree, "it/cypher:exists-in-map").await;
+    let db = graphdb_from_ledger(&l);
+
+    // Map projection: `p{id: ..., hasFriends: EXISTS { ... }}`.
+    let proj = fluree
+        .query_cypher(
+            &db,
+            r"MATCH (p:Person)
+               RETURN p{id: p.id, hasFriends: EXISTS { (p)-[:KNOWS]->(x:Person) }} AS info
+               ORDER BY p.id",
+        )
+        .await
+        .expect("map projection with EXISTS")
+        .to_cypher_json_async(db.as_graph_db_ref())
+        .await
+        .expect("cypher json");
+    assert_eq!(
+        proj["results"][0]["data"][0]["row"][0],
+        json!({"id": 1, "hasFriends": true}),
+        "person 1 has outgoing KNOWS → EXISTS true: {proj}"
+    );
+    assert_eq!(
+        proj["results"][0]["data"][1]["row"][0],
+        json!({"id": 2, "hasFriends": false}),
+        "person 2 has no outgoing KNOWS → EXISTS false: {proj}"
+    );
+
+    // Bare map literal with a nested EXISTS must behave identically.
+    let lit = fluree
+        .query_cypher(
+            &db,
+            r"MATCH (p:Person {id: 1})
+               RETURN {ok: EXISTS { (p)-[:KNOWS]->(x:Person) }} AS info",
+        )
+        .await
+        .expect("map literal with EXISTS")
+        .to_cypher_json_async(db.as_graph_db_ref())
+        .await
+        .expect("cypher json");
+    assert_eq!(
+        lit["results"][0]["data"][0]["row"][0],
+        json!({"ok": true}),
+        "bare map literal resolves nested EXISTS: {lit}"
+    );
+}
+
+#[tokio::test]
 async fn cypher_create_list_valued_property_stores_each_element() {
     // IU1 (AddPerson) shape: a node with a list-valued literal property
     // (email[]) becomes a multi-valued RDF predicate — one flake per element.

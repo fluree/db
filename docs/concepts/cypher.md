@@ -275,7 +275,9 @@ ORDER BY / SKIP / LIMIT
   (DISTINCT / grouping) is key-order-insensitive; display preserves insertion
   order; duplicate literal keys resolve last-wins. Maps are projection/value
   constructs only — not RDF terms, so they can't be matched, indexed, or stored
-  via `SET n.prop = {…}`.
+  via `SET n.prop = {…}`. A computed entry may itself be an async subquery
+  (`{ok: EXISTS { (p)-[:KNOWS]->(:Person) }}`) — it is resolved per row on the
+  same machinery as a bare `EXISTS`.
 - **Map projection** `n{.name, .age, computed: n.age + 1}` — build a map from a
   node variable: `.key` selectors desugar to `key: n.key`, `key: expr` adds an
   explicit entry, and `n{.*}` projects every data property (equivalent to

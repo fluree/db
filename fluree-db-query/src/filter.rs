@@ -362,6 +362,19 @@ fn pre_resolve_uncorrelated<'a>(
                     args: resolved_args,
                 })
             }
+            // Recurse into map literals so an uncorrelated EXISTS in a computed
+            // entry (`{ok: EXISTS { ... }}`) is resolved once per batch too.
+            // Correlated ones are left in place for phase 2 (per-row).
+            Expression::Map(entries) => {
+                let mut out = Vec::with_capacity(entries.len());
+                for (k, v) in entries {
+                    out.push((
+                        k.clone(),
+                        pre_resolve_uncorrelated(v, batch_schema, ctx, planning).await?,
+                    ));
+                }
+                Ok(Expression::Map(out))
+            }
             _ => Ok(expr.clone()),
         }
     })
