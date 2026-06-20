@@ -1175,7 +1175,7 @@ pub fn reorder_patterns(
 
     let mut bound_vars = initial_bound_vars.clone();
 
-    // Outputs of UNCORRELATED sibling subqueries (Cypher WITH-pipeline
+    // PIPELINE outputs of UNCORRELATED sibling subqueries (Cypher WITH-pipeline
     // producers). A pattern consuming one of these must be placed AFTER the
     // producing subquery — otherwise the greedy source race can place the
     // consumer first (e.g. a cheap `?post a :Post` scan ahead of a var-length
@@ -1183,12 +1183,18 @@ pub fn reorder_patterns(
     // into a per-row correlated subquery over its own consumer and silently
     // collapses the consumer's bindings. Correlated subqueries are excluded:
     // their own outputs are handled by the correlation deferral below.
+    //
+    // CRITICAL: a subquery's shared GROUP BY key is a JOIN KEY, not a pipeline
+    // output — see [`subquery_pipeline_output_vars`]. Without that narrowing,
+    // BSBM BI-8's `avg(price) … GROUP BY ?product` made the preceding
+    // `?product`-establishing offer scan look like a consumer of the subquery,
+    // deferring it behind a lookup keyed by `?product` and blowing the plan up.
     let subquery_output_vars: HashSet<VarId> = patterns
         .iter()
         .enumerate()
         .filter_map(|(i, p)| match p {
             Pattern::Subquery(sq) if subquery_correlation_vars(sq, patterns, i).is_empty() => {
-                Some(subquery_produced_select_vars(sq))
+                Some(subquery_pipeline_output_vars(sq, patterns, i))
             }
             _ => None,
         })
@@ -1814,6 +1820,48 @@ fn subquery_produced_select_vars(sq: &SubqueryPattern) -> HashSet<VarId> {
         .flat_map(Pattern::produced_vars)
         .filter(|v| select.contains(v))
         .collect()
+}
+
+/// The vars an uncorrelated sub-SELECT contributes as WITH-pipeline OUTPUTS —
+/// the ones a *later* sibling genuinely has to wait for. This is
+/// [`subquery_produced_select_vars`] minus any **GROUP BY key that another
+/// sibling in the same block also produces**.
+///
+/// A shared GROUP BY key is a JOIN KEY, not a pipeline output: the subquery is
+/// an aggregate lookup table keyed by it, so a sibling that establishes that
+/// key must NOT be deferred behind the lookup. This is the BSBM BI-8 shape —
+/// `{ SELECT ?product (avg(?price) AS ?avgPrice) … GROUP BY ?product }` sitting
+/// after `?product a :PT . ?offer :product ?product …`: `?product` is already
+/// established by the offer scan, and only the aggregate `?avgPrice` is a new
+/// output (consumed by a later FILTER, which the normal filter deferral already
+/// orders). Treating `?product` as a pipeline output deferred the offer scan
+/// behind the per-`?product` average lookup and blew the plan up (>3000x).
+///
+/// Cypher `WITH [DISTINCT] ?friend` producers have no shared GROUP BY key
+/// (DISTINCT is not an explicit `GROUP BY`), so `?friend` stays an output and
+/// the consuming pattern still defers — the IC3/IC9 win is preserved.
+fn subquery_pipeline_output_vars(
+    sq: &SubqueryPattern,
+    siblings: &[Pattern],
+    self_idx: usize,
+) -> HashSet<VarId> {
+    let mut outputs = subquery_produced_select_vars(sq);
+    let group_keys: HashSet<VarId> = sq
+        .grouping
+        .as_ref()
+        .map(|g| g.group_by_vars().collect())
+        .unwrap_or_default();
+    if group_keys.is_empty() {
+        return outputs;
+    }
+    let sibling_produced: HashSet<VarId> = siblings
+        .iter()
+        .enumerate()
+        .filter(|(j, _)| *j != self_idx)
+        .flat_map(|(_, p)| p.produced_vars())
+        .collect();
+    outputs.retain(|v| !(group_keys.contains(v) && sibling_produced.contains(v)));
+    outputs
 }
 
 fn deferred_required_vars(pattern: &Pattern) -> Vec<VarId> {
@@ -3747,6 +3795,130 @@ mod tests {
                 if matches!(&tp.p, Ref::Sid(s) if s.name.as_ref() == "HAS_CREATOR")),
             "consumer drains right after the producer: {ordered:?}"
         );
+    }
+
+    // --- F3 narrowing: shared GROUP BY key is a join key, not a pipeline output ---
+
+    /// A grouped sub-SELECT: `SELECT <select> { <body> } GROUP BY <group_key>`.
+    fn grouped_sq(select: Vec<VarId>, group_key: VarId, body: Vec<Pattern>) -> Pattern {
+        Pattern::Subquery(crate::ir::SubqueryPattern::new(select, body).with_grouping(
+            crate::ir::Grouping::assemble(vec![group_key], vec![], vec![], None).unwrap(),
+        ))
+    }
+
+    #[test]
+    fn bi8_shared_group_key_excluded_from_pipeline_outputs() {
+        // BI-8 shape: preceding triples establish ?product, then a GROUP BY
+        // ?product sub-SELECT (avg-price lookup keyed by ?product) selects
+        // ?product + ?avgPrice. The shared group key ?product is a JOIN KEY, so
+        // it must NOT be a pipeline output (only the new ?avgPrice would be, and
+        // that is not body-produced here). Directly exercises the narrowing.
+        let (product, offer, avg) = (VarId(0), VarId(1), VarId(2));
+        let avg_sq = grouped_sq(
+            vec![product, avg],
+            product,
+            vec![Pattern::Triple(make_pattern(offer, "product", product))],
+        );
+        let siblings = vec![
+            type_anchor(product, "ProductType1"),
+            Pattern::Triple(make_pattern(offer, "product", product)),
+            avg_sq.clone(),
+        ];
+        let Pattern::Subquery(sq) = &avg_sq else {
+            unreachable!()
+        };
+        let outputs = subquery_pipeline_output_vars(sq, &siblings, 2);
+        assert!(
+            !outputs.contains(&product),
+            "shared GROUP BY key must not be a pipeline output: {outputs:?}"
+        );
+    }
+
+    #[test]
+    fn bi8_group_key_scan_not_deferred_behind_subquery() {
+        // End-to-end: the ?product-establishing scan must NOT be deferred behind
+        // the GROUP BY ?product subquery (the regression forced the subquery to
+        // seed and drove the offer scan as its per-?product consumer).
+        let (product, offer, avg) = (VarId(0), VarId(1), VarId(2));
+        let patterns = vec![
+            type_anchor(product, "ProductType1"),
+            Pattern::Triple(make_pattern(offer, "product", product)),
+            grouped_sq(
+                vec![product, avg],
+                product,
+                vec![Pattern::Triple(make_pattern(offer, "product", product))],
+            ),
+        ];
+        let ordered = reorder_patterns(&patterns, None, &HashSet::new());
+        let sub_pos = ordered
+            .iter()
+            .position(|p| matches!(p, Pattern::Subquery(_)))
+            .expect("subquery present");
+        let type_pos = ordered
+            .iter()
+            .position(|p| matches!(p, Pattern::Triple(tp) if tp.p.is_rdf_type()))
+            .expect("type anchor present");
+        assert!(
+            type_pos < sub_pos,
+            "the ?product scan must lead, not defer behind the lookup subquery: {ordered:?}"
+        );
+        assert!(
+            !matches!(&ordered[0], Pattern::Subquery(_)),
+            "the grouped lookup subquery must not be forced to seed: {ordered:?}"
+        );
+    }
+
+    #[test]
+    fn cypher_with_producer_output_still_defers_consumer() {
+        // Companion guard: a real Cypher WITH producer (no GROUP BY) keeps its
+        // output as a pipeline var, so the consumer still defers. Producer-first
+        // input order (as the lowered WITH yields).
+        let (friend, message) = (VarId(0), VarId(1));
+        let producer = with_producer(friend); // SELECT ?friend { ?friend knows 99 }
+        let siblings = vec![
+            producer.clone(),
+            Pattern::Triple(make_pattern(message, "HAS_CREATOR", friend)),
+        ];
+        let Pattern::Subquery(sq) = &producer else {
+            unreachable!()
+        };
+        assert!(
+            subquery_pipeline_output_vars(sq, &siblings, 0).contains(&friend),
+            "ungrouped WITH producer's output stays a pipeline output (IC3/IC9 win)"
+        );
+        let ordered = reorder_patterns(&siblings, None, &HashSet::new());
+        assert!(
+            matches!(&ordered[0], Pattern::Subquery(_)),
+            "producer still seeds before its consumer: {ordered:?}"
+        );
+    }
+
+    #[test]
+    fn sibling_group_by_subqueries_are_peer_sources() {
+        // BI-8 outer shape: two sub-SELECTs both GROUP BY ?vendor, joined on it.
+        // Neither produces ?vendor as a pipeline output for the other (it is the
+        // shared join key), so neither is deferred as the other's consumer.
+        let (vendor, a_out, b_out, offer) = (VarId(0), VarId(1), VarId(2), VarId(3));
+        let sub_a = grouped_sq(
+            vec![vendor, a_out],
+            vendor,
+            vec![Pattern::Triple(make_pattern(offer, "vendor", vendor))],
+        );
+        let sub_b = grouped_sq(
+            vec![vendor, b_out],
+            vendor,
+            vec![Pattern::Triple(make_pattern(offer, "vendor", vendor))],
+        );
+        let siblings = vec![sub_a.clone(), sub_b.clone()];
+        for (idx, sub) in [(0usize, &sub_a), (1usize, &sub_b)] {
+            let Pattern::Subquery(sq) = sub else {
+                unreachable!()
+            };
+            assert!(
+                !subquery_pipeline_output_vars(sq, &siblings, idx).contains(&vendor),
+                "shared GROUP BY ?vendor is a join key between peers, not a pipeline output"
+            );
+        }
     }
 
     /// Position of the first triple whose predicate name is `name`.
