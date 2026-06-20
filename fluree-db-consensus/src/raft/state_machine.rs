@@ -20,7 +20,9 @@
 use crate::IdempotencyCacheKey;
 use fluree_db_api::{ContentId, PolicyStats, TrackingTally};
 use fluree_db_core::ledger_id::{format_ledger_id, split_ledger_id};
-use fluree_db_nameservice::{ConfigValue, RefKind, RefValue, StatusValue};
+use fluree_db_nameservice::{
+    ConfigValue, GraphSourceRecord, GraphSourceType, RefKind, RefValue, StatusValue,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use thiserror::Error;
@@ -424,6 +426,16 @@ pub struct NameServiceState {
     /// branch is registered but no record lives here.
     #[serde(default)]
     pub config: HashMap<String, ConfigValue>,
+    /// Non-ledger graph source records (BM25, Vector, Geo, R2RML,
+    /// Iceberg) keyed by `name:branch`. Mutated through the three
+    /// [`fluree_db_nameservice::GraphSourcePublisher`] commands:
+    /// [`Command::PublishGraphSource`] upserts the config side
+    /// (preserving any existing index pointer and retraction flag),
+    /// [`Command::PublishGraphSourceIndex`] advances the index
+    /// pointer with strict monotonicity, and
+    /// [`Command::RetractGraphSource`] flips the retracted flag.
+    #[serde(default)]
+    pub graph_sources: HashMap<String, GraphSourceRecord>,
 }
 
 /// Replicated commands the state machine accepts.
@@ -549,6 +561,31 @@ pub enum Command {
         expected: Option<ConfigValue>,
         new: ConfigValue,
     },
+    /// Upsert a graph source's config-side fields (source type,
+    /// config blob, dependencies). On an existing record the index
+    /// pointer (`index_id`, `index_t`) and `retracted` flag are
+    /// preserved.
+    PublishGraphSource {
+        name: String,
+        branch: String,
+        source_type: GraphSourceType,
+        config: String,
+        dependencies: Vec<String>,
+    },
+    /// Advance a graph source's index pointer with strict
+    /// monotonicity (`new_index_t > existing_index_t`). The state
+    /// machine returns [`Response::GraphSourceNotFound`] when no
+    /// record exists — config must be published first.
+    PublishGraphSourceIndex {
+        name: String,
+        branch: String,
+        index_id: ContentId,
+        index_t: i64,
+    },
+    /// Mark a graph source as retracted. Idempotent — a no-op on a
+    /// missing or already-retracted record returns
+    /// [`Response::GraphSourceAlreadyRetracted`].
+    RetractGraphSource { name: String, branch: String },
     /// Append a transactor request to the per-branch queue. Apply
     /// checks idempotency, the in-flight queue, and the queue
     /// depth caps; on success appends a [`QueueEntry`] and returns
@@ -747,6 +784,23 @@ pub enum Response {
     /// [`Command::PushConfig`] refused — see [`Self::StatusConflict`]
     /// for the analogous semantics.
     ConfigConflict { actual: Option<ConfigValue> },
+    /// [`Command::PublishGraphSource`] upserted the record.
+    GraphSourcePublished,
+    /// [`Command::PublishGraphSourceIndex`] advanced the index
+    /// pointer on the named record.
+    GraphSourceIndexAdvanced { index_t: i64 },
+    /// [`Command::PublishGraphSourceIndex`] was rejected because the
+    /// proposed `index_t` is at or below the record's current value.
+    GraphSourceIndexStale { current_t: i64 },
+    /// [`Command::PublishGraphSourceIndex`] was rejected because no
+    /// graph source record exists at the named id.
+    GraphSourceNotFound { graph_source_id: String },
+    /// [`Command::RetractGraphSource`] flipped a record from active
+    /// to retracted.
+    GraphSourceRetracted { graph_source_id: String },
+    /// [`Command::RetractGraphSource`] was a no-op — the record was
+    /// already retracted or didn't exist. Idempotent.
+    GraphSourceAlreadyRetracted { graph_source_id: String },
     /// [`Command::CreateLedger`] succeeded. `ledger_id` is the full
     /// `name:branch` form.
     Created { ledger_id: String },
@@ -987,6 +1041,22 @@ pub fn apply(state: &mut NameServiceState, command: Command, log_index: u64) -> 
             expected,
             new,
         } => apply_push_config(state, ledger_id, expected, new),
+        Command::PublishGraphSource {
+            name,
+            branch,
+            source_type,
+            config,
+            dependencies,
+        } => apply_publish_graph_source(state, name, branch, source_type, config, dependencies),
+        Command::PublishGraphSourceIndex {
+            name,
+            branch,
+            index_id,
+            index_t,
+        } => apply_publish_graph_source_index(state, name, branch, index_id, index_t),
+        Command::RetractGraphSource { name, branch } => {
+            apply_retract_graph_source(state, name, branch)
+        }
         // Queue-related commands. Apply paths land in subsequent
         // commits; see docs/design/raft-command-queue.md.
         Command::EnqueueCommand(args) => apply_enqueue_command(state, log_index, args),
@@ -1607,6 +1677,71 @@ fn apply_push_config(
     }
     state.config.insert(ledger_id, new);
     Response::ConfigUpdated
+}
+
+fn apply_publish_graph_source(
+    state: &mut NameServiceState,
+    name: String,
+    branch: String,
+    source_type: GraphSourceType,
+    config: String,
+    dependencies: Vec<String>,
+) -> Response {
+    let graph_source_id = format_ledger_id(&name, &branch);
+    match state.graph_sources.get_mut(&graph_source_id) {
+        Some(record) => {
+            // Existing record: touch only config-side fields. The
+            // index pointer and retracted flag are owned by
+            // `Command::PublishGraphSourceIndex` and
+            // `Command::RetractGraphSource`.
+            record.source_type = source_type;
+            record.config = config;
+            record.dependencies = dependencies;
+        }
+        None => {
+            state.graph_sources.insert(
+                graph_source_id,
+                GraphSourceRecord::new(name, branch, source_type, config, dependencies),
+            );
+        }
+    }
+    Response::GraphSourcePublished
+}
+
+fn apply_publish_graph_source_index(
+    state: &mut NameServiceState,
+    name: String,
+    branch: String,
+    index_id: ContentId,
+    index_t: i64,
+) -> Response {
+    let graph_source_id = format_ledger_id(&name, &branch);
+    let Some(record) = state.graph_sources.get_mut(&graph_source_id) else {
+        return Response::GraphSourceNotFound { graph_source_id };
+    };
+    if index_t <= record.index_t {
+        return Response::GraphSourceIndexStale {
+            current_t: record.index_t,
+        };
+    }
+    record.index_id = Some(index_id);
+    record.index_t = index_t;
+    Response::GraphSourceIndexAdvanced { index_t }
+}
+
+fn apply_retract_graph_source(
+    state: &mut NameServiceState,
+    name: String,
+    branch: String,
+) -> Response {
+    let graph_source_id = format_ledger_id(&name, &branch);
+    match state.graph_sources.get_mut(&graph_source_id) {
+        Some(record) if !record.retracted => {
+            record.retracted = true;
+            Response::GraphSourceRetracted { graph_source_id }
+        }
+        _ => Response::GraphSourceAlreadyRetracted { graph_source_id },
+    }
 }
 
 fn apply_enqueue_command(
@@ -4088,6 +4223,231 @@ mod tests {
             Response::ConfigConflict { actual } => assert_eq!(actual, None),
             other => panic!("expected ConfigConflict, got {other:?}"),
         }
+    }
+
+    // ====================================================================
+    // GraphSource publishers
+    // ====================================================================
+
+    fn publish_graph_source_cmd(
+        name: &str,
+        branch: &str,
+        source_type: GraphSourceType,
+        config: &str,
+        dependencies: Vec<String>,
+    ) -> Command {
+        Command::PublishGraphSource {
+            name: name.into(),
+            branch: branch.into(),
+            source_type,
+            config: config.into(),
+            dependencies,
+        }
+    }
+
+    #[test]
+    fn publish_graph_source_creates_new_record() {
+        let mut state = NameServiceState::new();
+        let resp = apply(
+            &mut state,
+            publish_graph_source_cmd(
+                "my-search",
+                "main",
+                GraphSourceType::Bm25,
+                "{}",
+                vec!["test/db:main".into()],
+            ),
+            1,
+        );
+        assert_eq!(resp, Response::GraphSourcePublished);
+        let rec = state.graph_sources.get("my-search:main").unwrap();
+        assert_eq!(rec.source_type, GraphSourceType::Bm25);
+        assert_eq!(rec.config, "{}");
+        assert_eq!(rec.dependencies, vec!["test/db:main".to_string()]);
+        assert_eq!(rec.index_id, None);
+        assert_eq!(rec.index_t, 0);
+        assert!(!rec.retracted);
+    }
+
+    #[test]
+    fn publish_graph_source_preserves_index_and_retracted_on_update() {
+        let mut state = NameServiceState::new();
+        apply(
+            &mut state,
+            publish_graph_source_cmd(
+                "my-search",
+                "main",
+                GraphSourceType::Bm25,
+                "{}",
+                vec![],
+            ),
+            1,
+        );
+        apply(
+            &mut state,
+            Command::PublishGraphSourceIndex {
+                name: "my-search".into(),
+                branch: "main".into(),
+                index_id: cid(42),
+                index_t: 5,
+            },
+            2,
+        );
+        apply(
+            &mut state,
+            Command::RetractGraphSource {
+                name: "my-search".into(),
+                branch: "main".into(),
+            },
+            3,
+        );
+
+        // Re-publish with new config — index pointer + retracted preserved.
+        let resp = apply(
+            &mut state,
+            publish_graph_source_cmd(
+                "my-search",
+                "main",
+                GraphSourceType::Bm25,
+                r#"{"updated":true}"#,
+                vec!["new-dep:main".into()],
+            ),
+            4,
+        );
+        assert_eq!(resp, Response::GraphSourcePublished);
+        let rec = state.graph_sources.get("my-search:main").unwrap();
+        assert_eq!(rec.config, r#"{"updated":true}"#);
+        assert_eq!(rec.dependencies, vec!["new-dep:main".to_string()]);
+        assert_eq!(rec.index_id, Some(cid(42)));
+        assert_eq!(rec.index_t, 5);
+        assert!(rec.retracted);
+    }
+
+    #[test]
+    fn publish_graph_source_index_is_strictly_monotonic() {
+        let mut state = NameServiceState::new();
+        apply(
+            &mut state,
+            publish_graph_source_cmd(
+                "my-search",
+                "main",
+                GraphSourceType::Bm25,
+                "{}",
+                vec![],
+            ),
+            1,
+        );
+
+        let resp = apply(
+            &mut state,
+            Command::PublishGraphSourceIndex {
+                name: "my-search".into(),
+                branch: "main".into(),
+                index_id: cid(42),
+                index_t: 5,
+            },
+            2,
+        );
+        assert_eq!(resp, Response::GraphSourceIndexAdvanced { index_t: 5 });
+
+        // Equal t is stale.
+        let resp = apply(
+            &mut state,
+            Command::PublishGraphSourceIndex {
+                name: "my-search".into(),
+                branch: "main".into(),
+                index_id: cid(43),
+                index_t: 5,
+            },
+            3,
+        );
+        assert_eq!(resp, Response::GraphSourceIndexStale { current_t: 5 });
+
+        // Lower t is also stale.
+        let resp = apply(
+            &mut state,
+            Command::PublishGraphSourceIndex {
+                name: "my-search".into(),
+                branch: "main".into(),
+                index_id: cid(44),
+                index_t: 2,
+            },
+            4,
+        );
+        assert_eq!(resp, Response::GraphSourceIndexStale { current_t: 5 });
+
+        let rec = state.graph_sources.get("my-search:main").unwrap();
+        assert_eq!(rec.index_id, Some(cid(42)));
+        assert_eq!(rec.index_t, 5);
+    }
+
+    #[test]
+    fn publish_graph_source_index_rejects_when_record_missing() {
+        let mut state = NameServiceState::new();
+        let resp = apply(
+            &mut state,
+            Command::PublishGraphSourceIndex {
+                name: "ghost".into(),
+                branch: "main".into(),
+                index_id: cid(99),
+                index_t: 1,
+            },
+            1,
+        );
+        match resp {
+            Response::GraphSourceNotFound { graph_source_id } => {
+                assert_eq!(graph_source_id, "ghost:main");
+            }
+            other => panic!("expected GraphSourceNotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn retract_graph_source_is_idempotent() {
+        let mut state = NameServiceState::new();
+        apply(
+            &mut state,
+            publish_graph_source_cmd(
+                "my-search",
+                "main",
+                GraphSourceType::Bm25,
+                "{}",
+                vec![],
+            ),
+            1,
+        );
+
+        let resp = apply(
+            &mut state,
+            Command::RetractGraphSource {
+                name: "my-search".into(),
+                branch: "main".into(),
+            },
+            2,
+        );
+        assert!(matches!(resp, Response::GraphSourceRetracted { .. }));
+
+        // Second retract — already retracted.
+        let resp = apply(
+            &mut state,
+            Command::RetractGraphSource {
+                name: "my-search".into(),
+                branch: "main".into(),
+            },
+            3,
+        );
+        assert!(matches!(resp, Response::GraphSourceAlreadyRetracted { .. }));
+
+        // Retract on missing record — also AlreadyRetracted.
+        let resp = apply(
+            &mut state,
+            Command::RetractGraphSource {
+                name: "ghost".into(),
+                branch: "main".into(),
+            },
+            4,
+        );
+        assert!(matches!(resp, Response::GraphSourceAlreadyRetracted { .. }));
     }
 
     // ====================================================================

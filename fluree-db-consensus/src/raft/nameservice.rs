@@ -60,10 +60,10 @@ use fluree_db_core::ledger_id::split_ledger_id;
 use fluree_db_core::ContentId;
 use fluree_db_nameservice::{
     AdminPublisher, BranchLifecycle, CasResult, CommitPublisher, ConfigCasResult, ConfigLookup,
-    ConfigPublisher, ConfigValue, GraphSourceLookup, GraphSourceRecord, IndexPublisher,
-    LedgerLifecycle, NameServiceError, NameServiceLookup, NsLookupResult, NsRecord,
-    NsRecordSnapshot, RefKind, RefLookup, RefPublisher, RefValue, Result, StatusCasResult,
-    StatusLookup, StatusPublisher, StatusValue,
+    ConfigPublisher, ConfigValue, GraphSourceLookup, GraphSourcePublisher, GraphSourceRecord,
+    GraphSourceType, IndexPublisher, LedgerLifecycle, NameServiceError, NameServiceLookup,
+    NsLookupResult, NsRecord, NsRecordSnapshot, RefKind, RefLookup, RefPublisher, RefValue, Result,
+    StatusCasResult, StatusLookup, StatusPublisher, StatusValue,
 };
 use openraft::error::{ClientWriteError, RaftError};
 use openraft::Raft;
@@ -762,20 +762,92 @@ impl RefPublisher for RaftNameService {
 impl GraphSourceLookup for RaftNameService {
     async fn lookup_graph_source(
         &self,
-        _graph_source_id: &str,
+        graph_source_id: &str,
     ) -> Result<Option<GraphSourceRecord>> {
-        Ok(None)
+        let state = self.state.read().await;
+        Ok(state.graph_sources.get(graph_source_id).cloned())
     }
 
+    /// Resolve `resource_id` against the ledger map first, then the
+    /// graph-source map. Ledger ids and graph-source ids share the
+    /// `name:branch` namespace; the ledger record wins on collision.
     async fn lookup_any(&self, resource_id: &str) -> Result<NsLookupResult> {
-        match self.lookup(resource_id).await? {
-            Some(record) => Ok(NsLookupResult::Ledger(record)),
-            None => Ok(NsLookupResult::NotFound),
+        if let Some(record) = self.lookup(resource_id).await? {
+            return Ok(NsLookupResult::Ledger(record));
         }
+        let state = self.state.read().await;
+        if let Some(record) = state.graph_sources.get(resource_id).cloned() {
+            return Ok(NsLookupResult::GraphSource(record));
+        }
+        Ok(NsLookupResult::NotFound)
     }
 
     async fn all_graph_source_records(&self) -> Result<Vec<GraphSourceRecord>> {
-        Ok(Vec::new())
+        let state = self.state.read().await;
+        Ok(state.graph_sources.values().cloned().collect())
+    }
+}
+
+#[async_trait]
+impl GraphSourcePublisher for RaftNameService {
+    async fn publish_graph_source(
+        &self,
+        name: &str,
+        branch: &str,
+        source_type: GraphSourceType,
+        config: &str,
+        dependencies: &[String],
+    ) -> Result<()> {
+        let cmd = SmCommand::PublishGraphSource {
+            name: name.to_string(),
+            branch: branch.to_string(),
+            source_type,
+            config: config.to_string(),
+            dependencies: dependencies.to_vec(),
+        };
+        match self.submit_lifecycle(cmd).await? {
+            SmResponse::GraphSourcePublished => Ok(()),
+            other => Err(NameServiceError::storage(format!(
+                "unexpected Response variant for PublishGraphSource: {other:?}"
+            ))),
+        }
+    }
+
+    async fn publish_graph_source_index(
+        &self,
+        name: &str,
+        branch: &str,
+        index_id: &ContentId,
+        index_t: i64,
+    ) -> Result<()> {
+        let cmd = SmCommand::PublishGraphSourceIndex {
+            name: name.to_string(),
+            branch: branch.to_string(),
+            index_id: index_id.clone(),
+            index_t,
+        };
+        match self.submit_lifecycle(cmd).await? {
+            SmResponse::GraphSourceIndexAdvanced { .. }
+            | SmResponse::GraphSourceIndexStale { .. }
+            | SmResponse::GraphSourceNotFound { .. } => Ok(()),
+            other => Err(NameServiceError::storage(format!(
+                "unexpected Response variant for PublishGraphSourceIndex: {other:?}"
+            ))),
+        }
+    }
+
+    async fn retract_graph_source(&self, name: &str, branch: &str) -> Result<()> {
+        let cmd = SmCommand::RetractGraphSource {
+            name: name.to_string(),
+            branch: branch.to_string(),
+        };
+        match self.submit_lifecycle(cmd).await? {
+            SmResponse::GraphSourceRetracted { .. }
+            | SmResponse::GraphSourceAlreadyRetracted { .. } => Ok(()),
+            other => Err(NameServiceError::storage(format!(
+                "unexpected Response variant for RetractGraphSource: {other:?}"
+            ))),
+        }
     }
 }
 
