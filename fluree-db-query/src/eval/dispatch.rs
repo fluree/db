@@ -67,6 +67,12 @@ impl Function {
             Function::StrBefore => string::eval_str_before(args, row, ctx),
             Function::StrAfter => string::eval_str_after(args, row, ctx),
             Function::Replace => string::eval_replace(args, row, ctx),
+            Function::ReplaceAll => string::eval_replace_all(args, row, ctx),
+            Function::Trim => string::eval_trim(args, row, ctx, string::TrimSide::Both),
+            Function::LTrim => string::eval_trim(args, row, ctx, string::TrimSide::Left),
+            Function::RTrim => string::eval_trim(args, row, ctx, string::TrimSide::Right),
+            Function::Left => string::eval_left_right(args, row, ctx, true),
+            Function::Right => string::eval_left_right(args, row, ctx, false),
             Function::Substr => string::eval_substr(args, row, ctx),
             Function::EncodeForUri => string::eval_encode_for_uri(args, row, ctx),
             Function::StrDt => string::eval_str_dt(args, row, ctx),
@@ -78,6 +84,10 @@ impl Function {
             Function::Ceil => numeric::eval_ceil(args, row, ctx),
             Function::Floor => numeric::eval_floor(args, row, ctx),
             Function::Rand => numeric::eval_rand(args),
+            Function::Sqrt => numeric::eval_sqrt(args, row, ctx),
+            Function::Sign => numeric::eval_sign(args, row, ctx),
+            Function::Ln => numeric::eval_ln(args, row, ctx),
+            Function::Pow => numeric::eval_pow(args, row, ctx),
 
             // DateTime functions
             Function::Now => datetime::eval_now(args),
@@ -196,6 +206,7 @@ impl Function {
             | Function::Nodes
             | Function::Range
             | Function::PathPairs
+            | Function::Split
             | Function::Labels
             | Function::Keys
             | Function::Properties => Ok(None),

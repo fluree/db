@@ -2434,6 +2434,89 @@ async fn cypher_call_subquery_rejections() {
 }
 
 #[tokio::test]
+async fn cypher_scalar_functions_extended() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = genesis_ledger(&fluree, "it/cypher:scalar-ext");
+    let l = fluree
+        .transact_cypher(l, r#"CREATE (p:Person {id: 1})"#)
+        .await
+        .expect("seed")
+        .ledger;
+    let db = graphdb_from_ledger(&l);
+
+    let cj = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (p:Person {id: 1})
+               RETURN substring("hello", 1) AS sub1,
+                      substring("hello", 1, 3) AS sub2,
+                      left("hello", 3) AS lft,
+                      right("hello", 2) AS rgt,
+                      right("hi", 9) AS rgtclamp,
+                      trim("  hi  ") AS t,
+                      ltrim("  hi  ") AS lt,
+                      rtrim("  hi  ") AS rt,
+                      replace("a-b-a", "a", "X") AS rep,
+                      split("a,b,c", ",") AS sp,
+                      sqrt(16) AS sq,
+                      sign(-5) AS sg,
+                      sign(0) AS sg0,
+                      log(1) AS lg,
+                      2 ^ 10 AS pw,
+                      2 ^ 3 ^ 2 AS pwassoc"#,
+        )
+        .await
+        .expect("scalar functions")
+        .to_cypher_json_async(db.as_graph_db_ref())
+        .await
+        .expect("cypher json");
+    let row = &cj["results"][0]["data"][0]["row"];
+    assert_eq!(row[0], json!("ello"), "substring 2-arg: {cj}");
+    assert_eq!(row[1], json!("ell"), "substring 3-arg: {cj}");
+    assert_eq!(row[2], json!("hel"), "left: {cj}");
+    assert_eq!(row[3], json!("lo"), "right: {cj}");
+    assert_eq!(row[4], json!("hi"), "right clamps n>len: {cj}");
+    assert_eq!(row[5], json!("hi"), "trim: {cj}");
+    assert_eq!(row[6], json!("hi  "), "ltrim: {cj}");
+    assert_eq!(row[7], json!("  hi"), "rtrim: {cj}");
+    assert_eq!(row[8], json!("X-b-X"), "replace literal: {cj}");
+    assert_eq!(row[9], json!(["a", "b", "c"]), "split: {cj}");
+    assert_eq!(row[10], json!(4.0), "sqrt: {cj}");
+    assert_eq!(row[11], json!(-1), "sign neg: {cj}");
+    assert_eq!(row[12], json!(0), "sign zero: {cj}");
+    assert_eq!(row[13], json!(0.0), "log(1)=0: {cj}");
+    assert_eq!(row[14], json!(1024.0), "2^10: {cj}");
+    assert_eq!(row[15], json!(512.0), "2^3^2 right-assoc = 2^9: {cj}");
+}
+
+#[tokio::test]
+async fn cypher_id_function_returns_iri() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/cypher:id-fn");
+    let committed = fluree
+        .insert(
+            ledger0,
+            &json!({"@context": ctx(), "@id": "ex:zoe", "@type": "ex:Person", "ex:name": "Zoe"}),
+        )
+        .await
+        .expect("seed");
+    let db = graphdb_from_ledger(&committed.ledger);
+
+    let cj = fluree
+        .query_cypher(&db, r#"MATCH (p:Person {name: "Zoe"}) RETURN id(p) AS id"#)
+        .await
+        .expect("id function")
+        .to_cypher_json_async(db.as_graph_db_ref())
+        .await
+        .expect("cypher json");
+    assert_eq!(
+        cj["results"][0]["data"][0]["row"][0],
+        json!("http://example.org/zoe"),
+        "id(n) returns the node's IRI string: {cj}"
+    );
+}
+
+#[tokio::test]
 async fn cypher_map_projection() {
     // `n{.key}` selectors, a `key: expr` entry, and `n{.*}` (all properties).
     let fluree = FlureeBuilder::memory().build_memory();

@@ -778,6 +778,18 @@ pub enum Function {
     StrDt,
     StrLang,
     EncodeForUri,
+    /// Cypher `replace(s, search, replacement)` — LITERAL replace-all (vs the
+    /// regex [`Replace`]).
+    ReplaceAll,
+    /// Cypher `split(s, delim)` — split a string into a list (list-valued).
+    Split,
+    /// Cypher `trim` / `ltrim` / `rtrim` — strip leading/trailing whitespace.
+    Trim,
+    LTrim,
+    RTrim,
+    /// Cypher `left(s, n)` / `right(s, n)` — first / last `n` characters.
+    Left,
+    Right,
 
     // =========================================================================
     // Numeric functions
@@ -787,6 +799,14 @@ pub enum Function {
     Ceil,
     Floor,
     Rand,
+    /// Cypher `sqrt(x)`.
+    Sqrt,
+    /// Cypher `sign(x)` — -1 / 0 / 1.
+    Sign,
+    /// Cypher `log(x)` — natural logarithm.
+    Ln,
+    /// Exponentiation (`x ^ y`).
+    Pow,
 
     // =========================================================================
     // RDF term constructors

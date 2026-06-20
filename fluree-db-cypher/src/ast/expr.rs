@@ -220,6 +220,8 @@ pub enum BinOp {
     Mul,
     Div,
     Mod,
+    /// Exponentiation (`^`).
+    Pow,
     And,
     Or,
 }

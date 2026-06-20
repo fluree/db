@@ -97,3 +97,80 @@ pub fn eval_rand(args: &[Expression]) -> Result<Option<ComparableValue>> {
     check_arity(args, 0, "RAND")?;
     Ok(Some(ComparableValue::Double(random::<f64>())))
 }
+
+/// Coerce a numeric `ComparableValue` to `f64` for transcendental math.
+/// Decimal / BigInt go through their string form to avoid a `ToPrimitive`
+/// import; these calls are rare. Returns `None` for non-numeric values.
+fn numeric_f64(v: &ComparableValue) -> Option<f64> {
+    match v {
+        ComparableValue::Long(n) => Some(*n as f64),
+        ComparableValue::Double(d) => Some(*d),
+        ComparableValue::Decimal(d) => d.to_string().parse().ok(),
+        ComparableValue::BigInt(n) => n.to_string().parse().ok(),
+        _ => None,
+    }
+}
+
+pub fn eval_sqrt<R: RowAccess>(
+    args: &[Expression],
+    row: &R,
+    ctx: Option<&ExecutionContext<'_>>,
+) -> Result<Option<ComparableValue>> {
+    check_arity(args, 1, "sqrt")?;
+    match args[0].eval_to_comparable(row, ctx)? {
+        Some(v) => Ok(numeric_f64(&v).map(|x| ComparableValue::Double(x.sqrt()))),
+        None => Ok(None),
+    }
+}
+
+pub fn eval_sign<R: RowAccess>(
+    args: &[Expression],
+    row: &R,
+    ctx: Option<&ExecutionContext<'_>>,
+) -> Result<Option<ComparableValue>> {
+    check_arity(args, 1, "sign")?;
+    match args[0].eval_to_comparable(row, ctx)? {
+        // Integer in, integer out (Cypher returns -1/0/1).
+        Some(ComparableValue::Long(n)) => Ok(Some(ComparableValue::Long(n.signum()))),
+        Some(v) => Ok(numeric_f64(&v).map(|x| {
+            let s = if x > 0.0 {
+                1
+            } else if x < 0.0 {
+                -1
+            } else {
+                0
+            };
+            ComparableValue::Long(s)
+        })),
+        None => Ok(None),
+    }
+}
+
+pub fn eval_ln<R: RowAccess>(
+    args: &[Expression],
+    row: &R,
+    ctx: Option<&ExecutionContext<'_>>,
+) -> Result<Option<ComparableValue>> {
+    check_arity(args, 1, "log")?;
+    match args[0].eval_to_comparable(row, ctx)? {
+        Some(v) => Ok(numeric_f64(&v).map(|x| ComparableValue::Double(x.ln()))),
+        None => Ok(None),
+    }
+}
+
+pub fn eval_pow<R: RowAccess>(
+    args: &[Expression],
+    row: &R,
+    ctx: Option<&ExecutionContext<'_>>,
+) -> Result<Option<ComparableValue>> {
+    check_arity(args, 2, "^")?;
+    let base = args[0].eval_to_comparable(row, ctx)?;
+    let exp = args[1].eval_to_comparable(row, ctx)?;
+    match (base, exp) {
+        (Some(b), Some(e)) => match (numeric_f64(&b), numeric_f64(&e)) {
+            (Some(b), Some(e)) => Ok(Some(ComparableValue::Double(b.powf(e)))),
+            _ => Ok(None),
+        },
+        _ => Ok(None),
+    }
+}

@@ -470,6 +470,13 @@ fn function_may_materialize_encoded_value(func: &Function) -> bool {
             | Function::StrBefore
             | Function::StrAfter
             | Function::Replace
+            | Function::ReplaceAll
+            | Function::Split
+            | Function::Trim
+            | Function::LTrim
+            | Function::RTrim
+            | Function::Left
+            | Function::Right
             | Function::Substr
             | Function::EncodeForUri
             | Function::StrDt

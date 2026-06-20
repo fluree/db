@@ -193,11 +193,18 @@ ORDER BY / SKIP / LIMIT
   — the IC13 shape. `nodes(p)` returns the node sequence and
   `pathPairs(p)` the consecutive node pairs (both list-valued, for
   `UNWIND`); `relationships(p)` (edge identities) is deferred.
-- Scalar functions: `toString`, `toInteger`, `toFloat`, `coalesce`, `abs`,
-  `toUpper`, `toLower`, `round`, `floor`, `ceil`/`ceiling`, `rand`. (`substring`
-  and `replace` are deferred — they differ from the engine's 1-based `SUBSTR` /
-  regex `REPLACE`; `sqrt`/`sign`/`split`/`trim`/`^` need new evaluators.)
-- `WHERE` expressions: comparison, AND/OR/NOT, arithmetic +/-/*//,
+- Scalar functions:
+  - **Casts / general:** `toString`, `toInteger`, `toFloat`, `coalesce`.
+  - **String:** `toUpper`, `toLower`, `substring` (0-indexed; 2- and 3-arg),
+    `left`, `right`, `trim`, `ltrim`, `rtrim`, `replace` (literal replace-all),
+    `split` (→ list).
+  - **Math:** `abs`, `round`, `floor`, `ceil`/`ceiling`, `rand`, `sqrt`,
+    `sign`, `log` (natural logarithm), and the `^` exponent operator
+    (right-associative).
+  - **Identity:** `id(n)` / `elementId(n)` return the node/relationship's **IRI
+    string** — Fluree has no integer element id, so this is its stable string
+    identity (differs from Neo4j's integer `id`).
+- `WHERE` expressions: comparison, AND/OR/NOT, arithmetic +/-/*//, `^`,
   STARTS WITH / ENDS WITH / CONTAINS, IS NULL / IS NOT NULL,
   `expr IN [a, b, ...]`, `CASE WHEN ... THEN ... END` (simple and
   subject forms), `EXISTS { pattern }` and the subquery form

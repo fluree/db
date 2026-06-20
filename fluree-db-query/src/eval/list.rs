@@ -288,6 +288,41 @@ pub fn eval_list_fn_to_binding<R: RowAccess>(
                 _ => Ok(None),
             }
         }
+        Function::Split => {
+            // Cypher `split(s, delim)` → list of string parts.
+            if args.len() != 2 {
+                return Err(QueryError::InvalidFilter(
+                    "split() expects 2 arguments".to_string(),
+                ));
+            }
+            let s = args[0].eval_to_comparable(row, ctx)?;
+            let delim = args[1].eval_to_comparable(row, ctx)?;
+            match (
+                s.as_ref()
+                    .and_then(crate::eval::value::ComparableValue::as_str),
+                delim
+                    .as_ref()
+                    .and_then(crate::eval::value::ComparableValue::as_str),
+            ) {
+                (Some(s), Some(delim)) => {
+                    let str_lit = |part: &str| {
+                        Binding::lit(
+                            fluree_db_core::FlakeValue::String(part.to_string()),
+                            fluree_db_core::Sid::new(fluree_vocab::namespaces::XSD, "string"),
+                        )
+                    };
+                    // An empty delimiter splits into individual characters
+                    // (str::split on "" yields empty edges, so handle it directly).
+                    let items: Vec<Binding> = if delim.is_empty() {
+                        s.chars().map(|c| str_lit(&c.to_string())).collect()
+                    } else {
+                        s.split(delim).map(str_lit).collect()
+                    };
+                    Ok(Some(Binding::List(items)))
+                }
+                _ => Ok(Some(Binding::Unbound)),
+            }
+        }
         _ => Ok(None),
     }
 }

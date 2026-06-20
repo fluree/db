@@ -668,6 +668,11 @@ impl<'a> CypherLowering<'a> {
                     fluree_db_cypher::ast::BinOp::Mul => "*",
                     fluree_db_cypher::ast::BinOp::Div => "/",
                     fluree_db_cypher::ast::BinOp::Mod => "%",
+                    fluree_db_cypher::ast::BinOp::Pow => {
+                        return Err(LowerCypherError::unsupported(
+                            "`^` (exponentiation) is not supported in a write-side MATCH … WHERE",
+                        ));
+                    }
                     fluree_db_cypher::ast::BinOp::And => {
                         return Ok(UnresolvedExpression::And(vec![l, r]));
                     }

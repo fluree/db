@@ -77,6 +77,7 @@ pub fn lower_expr<E: IriEncoder>(
                 BinOp::Mul => Function::Mul,
                 BinOp::Div => Function::Div,
                 BinOp::Mod => Function::Mod,
+                BinOp::Pow => Function::Pow,
                 BinOp::And => Function::And,
                 BinOp::Or => Function::Or,
             };
@@ -305,6 +306,27 @@ pub fn lower_expr<E: IriEncoder>(
             let args: std::result::Result<Vec<_>, _> =
                 call.args.iter().map(|a| lower_expr(ctx, a, aux)).collect();
             let args = args?;
+
+            // Functions that remap onto an existing IR primitive with adjusted
+            // arguments rather than a straight name → Function mapping.
+            match name.as_str() {
+                // Cypher `substring` is 0-indexed; SPARQL SUBSTR is 1-based.
+                // Shift the start by +1 (works for the 2- and 3-arg forms).
+                "substring" => return lower_substring(args),
+                // A node/relationship's identity. Fluree has no integer id, so
+                // `id(x)` returns its IRI string (its stable identity). Differs
+                // from Neo4j's integer id; documented in docs/concepts/cypher.md.
+                "id" | "elementid" => {
+                    if args.len() != 1 {
+                        return Err(LowerError::unsupported(
+                            "id() takes exactly one argument",
+                        ));
+                    }
+                    return Ok(Expression::call(Function::Str, args));
+                }
+                _ => {}
+            }
+
             let func = match name.as_str() {
                 "coalesce" => Function::Coalesce,
                 "abs" => Function::Abs,
@@ -330,16 +352,24 @@ pub fn lower_expr<E: IriEncoder>(
                 "type" => Function::RelType,
                 "keys" => Function::Keys,
                 "properties" => Function::Properties,
-                // Scalar string/math functions with clean 1:1 engine semantics.
-                // (Deferred where semantics differ: `substring` is 0-indexed vs
-                // SPARQL SUBSTR's 1-based, `replace` is literal vs regex; and
-                // `sqrt`/`sign`/`split`/`trim`/`^` need new eval.)
+                // Scalar string functions.
                 "toupper" => Function::Ucase,
                 "tolower" => Function::Lcase,
+                "replace" => Function::ReplaceAll, // literal replace-all
+                "split" => Function::Split,
+                "trim" => Function::Trim,
+                "ltrim" => Function::LTrim,
+                "rtrim" => Function::RTrim,
+                "left" => Function::Left,
+                "right" => Function::Right,
+                // Scalar math functions.
                 "round" => Function::Round,
                 "ceil" | "ceiling" => Function::Ceil,
                 "floor" => Function::Floor,
                 "rand" => Function::Rand,
+                "sqrt" => Function::Sqrt,
+                "sign" => Function::Sign,
+                "log" => Function::Ln, // natural logarithm
                 _ => {
                     return Err(LowerError::unsupported(format!(
                         "function `{}` is not in the v1 expression surface",
@@ -350,6 +380,22 @@ pub fn lower_expr<E: IriEncoder>(
             Ok(Expression::call(func, args))
         }
     }
+}
+
+/// Lower Cypher `substring(s, start[, len])` (0-indexed) to the engine's
+/// `Substr` (1-based) by shifting the start position by `+1`.
+fn lower_substring(args: Vec<Expression>) -> Result<Expression> {
+    if args.len() != 2 && args.len() != 3 {
+        return Err(LowerError::unsupported(
+            "substring() takes 2 or 3 arguments: substring(string, start[, length])",
+        ));
+    }
+    let mut args = args;
+    let start = args.remove(1);
+    let one_based =
+        Expression::binary(Function::Add, start, Expression::Const(FlakeValue::Long(1)));
+    args.insert(1, one_based);
+    Ok(Expression::call(Function::Substr, args))
 }
 
 /// Reject an `EXISTS { … }` anywhere inside a list-iteration expression. An

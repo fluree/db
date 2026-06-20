@@ -151,26 +151,39 @@ fn parse_additive(s: &mut TokenStream) -> Result<Expr, Diagnostic> {
 }
 
 fn parse_multiplicative(s: &mut TokenStream) -> Result<Expr, Diagnostic> {
-    let mut left = parse_unary(s)?;
+    let mut left = parse_power(s)?;
     loop {
         let op = match s.peek_kind() {
             TokenKind::Star => BinOp::Mul,
             TokenKind::Slash => BinOp::Div,
             TokenKind::Percent => BinOp::Mod,
-            TokenKind::Caret => {
-                return Err(s.error(
-                    DiagCode::DeferredFunction,
-                    "`^` (exponent) is deferred — pending IR support",
-                ));
-            }
             _ => break,
         };
         s.advance();
-        let right = parse_unary(s)?;
+        let right = parse_power(s)?;
         let span = left.span().union(right.span());
         left = Expr::BinOp(op, Box::new(left), Box::new(right), span);
     }
     Ok(left)
+}
+
+/// Exponentiation `^` — binds tighter than `* / %` and is right-associative
+/// (`2 ^ 3 ^ 2` = `2 ^ (3 ^ 2)`), matching openCypher.
+fn parse_power(s: &mut TokenStream) -> Result<Expr, Diagnostic> {
+    let left = parse_unary(s)?;
+    if matches!(s.peek_kind(), TokenKind::Caret) {
+        s.advance();
+        let right = parse_power(s)?;
+        let span = left.span().union(right.span());
+        Ok(Expr::BinOp(
+            BinOp::Pow,
+            Box::new(left),
+            Box::new(right),
+            span,
+        ))
+    } else {
+        Ok(left)
+    }
 }
 
 fn parse_unary(s: &mut TokenStream) -> Result<Expr, Diagnostic> {
@@ -379,7 +392,7 @@ fn parse_var_or_call(s: &mut TokenStream) -> Result<Expr, Diagnostic> {
         let end = s.expect(&TokenKind::RParen)?;
         // Reject deferred functions early with specific error.
         let lower = name.to_ascii_lowercase();
-        if matches!(lower.as_str(), "id" | "point" | "distance") {
+        if matches!(lower.as_str(), "point" | "distance") {
             return Err(Diagnostic {
                 code: DiagCode::DeferredFunction,
                 severity: crate::diag::Severity::Error,
