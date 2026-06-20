@@ -50,6 +50,12 @@ pub enum AbortReason {
     BranchDropped,
     BranchPurged,
     BranchHeadReset,
+    /// The branch was soft-dropped via `RetractLedger`. The flag
+    /// flip drains the queue alongside it (see the comment on
+    /// [`ClearReason::BranchRetracted`](crate::raft::state_machine::ClearReason::BranchRetracted)),
+    /// so in-flight waiters from before the retract get this
+    /// reason instead of a head-mutating `BranchHeadReset`.
+    BranchRetracted,
     Poisoned(PoisonReason),
 }
 

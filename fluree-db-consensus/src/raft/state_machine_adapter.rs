@@ -301,6 +301,15 @@ fn waiter_resolution_for(cmd: &Command, response: &Response) -> Option<WaiterRes
             ref_key: RefKey::new(ledger_id, branch),
             reason: AbortReason::BranchHeadReset,
         }),
+        (
+            Command::RetractLedger {
+                ledger_id, branch, ..
+            },
+            Response::Retracted { .. },
+        ) => Some(WaiterResolution::AbortBranch {
+            ref_key: RefKey::new(ledger_id, branch),
+            reason: AbortReason::BranchRetracted,
+        }),
         _ => None,
     }
 }
@@ -333,7 +342,7 @@ fn event_for(cmd: &Command, response: &Response) -> Option<NameServiceEvent> {
             index_id: index_head.clone(),
             index_t: *index_t,
         }),
-        (Command::RetractLedger { .. }, Response::Retracted { ledger_id })
+        (Command::RetractLedger { .. }, Response::Retracted { ledger_id, .. })
         | (Command::PurgeLedger { .. }, Response::Purged { ledger_id, .. })
         | (Command::DropBranch { .. }, Response::BranchDropped { ledger_id, .. }) => {
             Some(NameServiceEvent::LedgerRetracted {
@@ -368,6 +377,9 @@ fn drain_releases(response: &mut Response) -> Vec<(String, ContentId)> {
             released_envelopes, ..
         }
         | Response::HeadReset {
+            released_envelopes, ..
+        }
+        | Response::Retracted {
             released_envelopes, ..
         } => std::mem::take(released_envelopes),
         _ => Vec::new(),
@@ -730,6 +742,7 @@ mod tests {
             payload: EntryPayload::Normal(RaftCommand::RetractLedger {
                 ledger_id: "test/db".into(),
                 branch: "main".into(),
+                applied_at_millis: 0,
             }),
         }])
         .await
@@ -756,6 +769,7 @@ mod tests {
             payload: EntryPayload::Normal(RaftCommand::RetractLedger {
                 ledger_id: "test/db".into(),
                 branch: "main".into(),
+                applied_at_millis: 0,
             }),
         }])
         .await
@@ -767,6 +781,7 @@ mod tests {
             payload: EntryPayload::Normal(RaftCommand::RetractLedger {
                 ledger_id: "test/db".into(),
                 branch: "main".into(),
+                applied_at_millis: 0,
             }),
         }])
         .await

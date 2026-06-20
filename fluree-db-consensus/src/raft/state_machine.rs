@@ -323,6 +323,11 @@ pub enum ClearReason {
     BranchDropped,
     BranchPurged,
     BranchHeadReset,
+    /// Branch was soft-dropped via `RetractLedger`. The queue is
+    /// drained alongside flipping the `retracted` flag so an
+    /// already-staged worker can't race a head-advance past the
+    /// retraction point.
+    BranchRetracted,
 }
 
 /// Short-lived marker a head-mutating admin command stamps when
@@ -458,8 +463,16 @@ pub enum Command {
     },
     /// Soft-drop a branch: mark it retracted but leave its
     /// [`LedgerRecord`] and [`RefEntry`] entries in place so the
-    /// alias can't be reused. Idempotent.
-    RetractLedger { ledger_id: String, branch: String },
+    /// alias can't be reused. Drains the per-branch queue alongside
+    /// the flag flip (head-mutating semantics — see
+    /// [`Response::Retracted`]). Idempotent.
+    RetractLedger {
+        ledger_id: String,
+        branch: String,
+        /// See [`Command::DropBranch::applied_at_millis`].
+        #[serde(default)]
+        applied_at_millis: u64,
+    },
     /// Hard-drop a branch: remove its [`RefEntry`], retraction mark,
     /// and entry from the parent [`LedgerRecord::branches`]. Removes
     /// the `LedgerRecord` itself when its branches list empties.
@@ -692,11 +705,23 @@ pub enum Response {
         released_envelopes: Vec<(String, ContentId)>,
     },
     /// [`Command::RetractLedger`] flipped a branch from active to
-    /// retracted.
-    Retracted { ledger_id: String },
+    /// retracted. Carries `released_envelopes` from the queue clear
+    /// that runs alongside the flag flip — same shape as the other
+    /// head-mutating admin commands.
+    Retracted {
+        ledger_id: String,
+        released_envelopes: Vec<(String, ContentId)>,
+    },
     /// [`Command::RetractLedger`] was a no-op — the branch was
     /// already retracted, or didn't exist. Idempotent.
     AlreadyRetracted { ledger_id: String },
+    /// A write command (`EnqueueCommand` / `ApplyHead` / `ResetHead`)
+    /// targeted a branch flagged retracted by `RetractLedger`. Writes
+    /// are rejected so the visible `retracted: true` status on
+    /// `lookup` can't be silently undone — a branch only becomes
+    /// writable again via `PurgeLedger` + a fresh `CreateLedger` /
+    /// `CreateBranch`.
+    LedgerRetracted { ledger_id: String },
     /// [`Command::PurgeLedger`] removed a registered branch (any
     /// retraction state). See [`Self::BranchDropped`] for
     /// `released_envelopes` semantics.
@@ -843,7 +868,11 @@ pub fn apply(state: &mut NameServiceState, command: Command, log_index: u64) -> 
             snapshot,
             applied_at_millis,
         } => reset_head(state, ledger_id, branch, snapshot, applied_at_millis),
-        Command::RetractLedger { ledger_id, branch } => retract_ledger(state, ledger_id, branch),
+        Command::RetractLedger {
+            ledger_id,
+            branch,
+            applied_at_millis,
+        } => retract_ledger(state, ledger_id, branch, applied_at_millis),
         Command::PurgeLedger {
             ledger_id,
             branch,
@@ -888,7 +917,12 @@ fn create_ledger(state: &mut NameServiceState, log_index: u64, args: CreateLedge
     }
 }
 
-fn retract_ledger(state: &mut NameServiceState, ledger_id: String, branch: String) -> Response {
+fn retract_ledger(
+    state: &mut NameServiceState,
+    ledger_id: String,
+    branch: String,
+    applied_at_millis: u64,
+) -> Response {
     let key = RefKey::new(&ledger_id, &branch);
     let full = format_ledger_id(&ledger_id, &branch);
     let is_known = state
@@ -901,8 +935,24 @@ fn retract_ledger(state: &mut NameServiceState, ledger_id: String, branch: Strin
         // emission) treat the result uniformly.
         return Response::AlreadyRetracted { ledger_id: full };
     }
-    if state.retracted.insert(key) {
-        Response::Retracted { ledger_id: full }
+    if state.retracted.insert(key.clone()) {
+        // Retraction is a head-mutating admin command: flip the
+        // flag *and* drain the per-branch queue. Without the drain
+        // an already-staged worker could land an `ApplyHead` past
+        // the retraction point and silently un-retract the branch
+        // (the head check happens at apply time, not at propose
+        // time). Aborting in-flight waiters with `BranchRetracted`
+        // gives proposers a clear signal to give up the slot.
+        let released_envelopes = clear_queue_for_admin(
+            state,
+            &key,
+            ClearReason::BranchRetracted,
+            applied_at_millis,
+        );
+        Response::Retracted {
+            ledger_id: full,
+            released_envelopes,
+        }
     } else {
         Response::AlreadyRetracted { ledger_id: full }
     }
@@ -1068,6 +1118,12 @@ fn reset_head(
         .is_some_and(|l| l.branches.iter().any(|b| b == &branch));
     if !ledger_known {
         return Response::LedgerNotFound { ledger_id: full };
+    }
+    // `reset_head` is a write — same semantics as `EnqueueCommand`
+    // and `ApplyHead`. The retracted flag is a tombstone, so refuse
+    // the reset until the branch is purged + re-created.
+    if state.retracted.contains(&key) {
+        return Response::LedgerRetracted { ledger_id: full };
     }
 
     let ResetHeadSnapshot {
@@ -1262,6 +1318,20 @@ fn apply_enqueue_command(
         };
     }
 
+    // 0b. Reject submissions targeting a retracted branch. The
+    //     `retracted` flag is a tombstone (the alias is held so it
+    //     can't be reused); writes through here would silently
+    //     resurrect the branch behind the operator's back. Retract
+    //     drains the queue when it applies, so this check only
+    //     triggers for enqueues that land after a retraction —
+    //     never for entries that were already in flight at retract
+    //     time (those get aborted with `BranchRetracted`).
+    if state.retracted.contains(&ref_key) {
+        return Response::LedgerRetracted {
+            ledger_id: full_ledger_id,
+        };
+    }
+
     // 1. Idempotency cache — one lookup, branch on outcome variant.
     //    The body CID must match; mismatched bodies under the same
     //    key are a client bug we surface rather than silently dedup.
@@ -1405,6 +1475,18 @@ fn apply_head(state: &mut NameServiceState, log_index: u64, args: ApplyHeadArgs)
     } = args;
     let full_ledger_id = format_ledger_id(&ledger_id, &branch);
     let ref_key = RefKey::new(&ledger_id, &branch);
+
+    // Defense-in-depth against a retracted branch surviving with a
+    // non-empty queue: `RetractLedger` drains the queue at flag-flip
+    // time, so a clean state graph never reaches `apply_head` for a
+    // retracted branch. The check here is so a future bug that
+    // skips the drain can't silently advance the head past
+    // retraction.
+    if state.retracted.contains(&ref_key) {
+        return Response::LedgerRetracted {
+            ledger_id: full_ledger_id,
+        };
+    }
 
     let entry = match pop_validated_front(state, &ref_key, &full_ledger_id, queue_id) {
         Ok(entry) => entry,
@@ -1692,6 +1774,7 @@ mod tests {
             Command::RetractLedger {
                 ledger_id: "test/db".into(),
                 branch: "main".into(),
+                applied_at_millis: 0,
             },
             2,
         );
@@ -1716,16 +1799,116 @@ mod tests {
             Command::RetractLedger {
                 ledger_id: "test/db".into(),
                 branch: "main".into(),
+                applied_at_millis: 0,
             },
             2,
         );
         assert_eq!(
             resp,
             Response::Retracted {
-                ledger_id: "test/db:main".into()
+                ledger_id: "test/db:main".into(),
+                released_envelopes: Vec::new(),
             }
         );
         assert!(state.retracted.contains(&RefKey::new("test/db", "main")));
+    }
+
+    #[test]
+    fn retract_drains_in_flight_queue_entries() {
+        let mut state = NameServiceState::new();
+        apply(&mut state, create_ledger("test/db"), 1);
+        let _ = apply(&mut state, enqueue("test/db", "main", 7, None), 2);
+        assert_eq!(
+            state
+                .queues
+                .get(&RefKey::new("test/db", "main"))
+                .map(VecDeque::len),
+            Some(1)
+        );
+
+        let resp = apply(
+            &mut state,
+            Command::RetractLedger {
+                ledger_id: "test/db".into(),
+                branch: "main".into(),
+                applied_at_millis: 5_000,
+            },
+            3,
+        );
+        match resp {
+            Response::Retracted {
+                ledger_id,
+                released_envelopes,
+            } => {
+                assert_eq!(ledger_id, "test/db:main");
+                assert_eq!(released_envelopes.len(), 1);
+            }
+            other => panic!("expected Retracted, got {other:?}"),
+        }
+        // Queue was drained: a stuck worker can no longer race a
+        // head-advance past the retraction.
+        assert!(state
+            .queues
+            .get(&RefKey::new("test/db", "main"))
+            .map_or(true, VecDeque::is_empty));
+    }
+
+    #[test]
+    fn enqueue_rejects_retracted_branch_with_ledger_retracted() {
+        let mut state = NameServiceState::new();
+        apply(&mut state, create_ledger("test/db"), 1);
+        apply(
+            &mut state,
+            Command::RetractLedger {
+                ledger_id: "test/db".into(),
+                branch: "main".into(),
+                applied_at_millis: 0,
+            },
+            2,
+        );
+        let resp = apply(&mut state, enqueue("test/db", "main", 9, None), 3);
+        assert_eq!(
+            resp,
+            Response::LedgerRetracted {
+                ledger_id: "test/db:main".into()
+            }
+        );
+    }
+
+    #[test]
+    fn reset_head_rejects_retracted_branch_with_ledger_retracted() {
+        let mut state = NameServiceState::new();
+        create_ledger_with_genesis(&mut state, "test/db");
+        apply(
+            &mut state,
+            Command::RetractLedger {
+                ledger_id: "test/db".into(),
+                branch: "main".into(),
+                applied_at_millis: 0,
+            },
+            2,
+        );
+        let resp = apply(
+            &mut state,
+            Command::ResetHead {
+                ledger_id: "test/db".into(),
+                branch: "main".into(),
+                snapshot: ResetHeadSnapshot {
+                    commit_head_id: Some(cid(42)),
+                    commit_t: 99,
+                    index_head_id: None,
+                    index_t: 0,
+                },
+                applied_at_millis: 0,
+            },
+            3,
+        );
+        assert_eq!(
+            resp,
+            Response::LedgerRetracted {
+                ledger_id: "test/db:main".into()
+            }
+        );
     }
 
     #[test]
@@ -1737,6 +1920,7 @@ mod tests {
             Command::RetractLedger {
                 ledger_id: "test/db".into(),
                 branch: "main".into(),
+                applied_at_millis: 0,
             },
             2,
         );
@@ -1745,6 +1929,7 @@ mod tests {
             Command::RetractLedger {
                 ledger_id: "test/db".into(),
                 branch: "main".into(),
+                applied_at_millis: 0,
             },
             3,
         );
@@ -1766,6 +1951,7 @@ mod tests {
             Command::RetractLedger {
                 ledger_id: "missing".into(),
                 branch: "main".into(),
+                applied_at_millis: 0,
             },
             1,
         );
@@ -1786,6 +1972,7 @@ mod tests {
             Command::RetractLedger {
                 ledger_id: "test/db".into(),
                 branch: "main".into(),
+                applied_at_millis: 0,
             },
             3,
         );
@@ -2256,6 +2443,7 @@ mod tests {
             Command::RetractLedger {
                 ledger_id: "test/db".into(),
                 branch: "feature".into(),
+                applied_at_millis: 0,
             },
             4,
         );

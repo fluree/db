@@ -192,6 +192,18 @@ impl QueuedTransactor {
                         message: format!("ledger not found: {ledger_id}"),
                     });
                 }
+                SmResponse::LedgerRetracted { ledger_id } => {
+                    // Retracted branches are tombstoned at the state
+                    // machine; the alias can't be reused without a
+                    // purge + re-create. 410 Gone matches the
+                    // semantics — the resource existed, the client
+                    // shouldn't retry with the same alias.
+                    self.release_envelope(&full_ledger_id, &request_cid).await;
+                    return Err(SubmissionError::Execution {
+                        status: 410,
+                        message: format!("ledger retracted: {ledger_id}"),
+                    });
+                }
                 other => {
                     self.release_envelope(&full_ledger_id, &request_cid).await;
                     return Err(SubmissionError::Execution {
@@ -998,6 +1010,10 @@ fn submission_error_from_abort(reason: AbortReason) -> SubmissionError {
         AbortReason::BranchHeadReset => SubmissionError::Execution {
             status: 409,
             message: "branch head reset while submission was queued; retry".into(),
+        },
+        AbortReason::BranchRetracted => SubmissionError::Execution {
+            status: 410,
+            message: "branch retracted while submission was queued".into(),
         },
         AbortReason::Poisoned(reason) => SubmissionError::Execution {
             status: 422,

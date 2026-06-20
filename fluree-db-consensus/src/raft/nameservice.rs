@@ -434,6 +434,7 @@ fn build_retract_command(ledger_id: &str) -> std::result::Result<SmCommand, Name
     Ok(SmCommand::RetractLedger {
         ledger_id: ledger_name,
         branch,
+        applied_at_millis: current_millis(),
     })
 }
 
@@ -649,19 +650,26 @@ impl RefLookup for RaftNameService {
         if !state.ledgers.contains_key(&name) {
             return Ok(None);
         }
+        // Retracted branches are tombstoned — the `lookup` surface
+        // returns the full `NsRecord` so tools can see the
+        // `retracted: true` flag, but the active-read surface
+        // (`get_ref`) reports the branch as gone. Without this
+        // pairing the data-plane query path would happily resolve
+        // a head ref for a branch the operator soft-deleted.
+        let ref_key = RefKey::new(&name, &branch);
+        if state.retracted.contains(&ref_key) {
+            return Ok(None);
+        }
         match kind {
             RefKind::CommitHead => {
-                let entry = state.refs.get(&RefKey::new(&name, &branch));
+                let entry = state.refs.get(&ref_key);
                 Ok(Some(RefValue {
                     id: entry.map(|e| e.head.clone()),
                     t: entry.map(|e| e.t).unwrap_or(0),
                 }))
             }
             RefKind::IndexHead => {
-                let index = state
-                    .refs
-                    .get(&RefKey::new(&name, &branch))
-                    .and_then(|e| e.index.as_ref());
+                let index = state.refs.get(&ref_key).and_then(|e| e.index.as_ref());
                 Ok(Some(RefValue {
                     id: index.map(|i| i.head.clone()),
                     t: index.map(|i| i.t).unwrap_or(0),
