@@ -1509,6 +1509,78 @@ async fn transact_cypher_merge_creates_then_is_a_noop() {
 }
 
 #[tokio::test]
+async fn transact_cypher_merge_relationship_creates_then_is_a_noop() {
+    // Relationship MERGE = find-or-create the whole path. The first run mints
+    // both endpoints and the edge; the second finds the path and inserts
+    // nothing (one NOT EXISTS guard over the whole pattern).
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = genesis_ledger(&fluree, "it/cypher:merge-rel");
+
+    let stmt = r#"MERGE (a:Person {name: "Alice"})-[:KNOWS]->(b:Person {name: "Bob"})"#;
+    let edge_q = "MATCH (a:Person)-[:KNOWS]->(b:Person) RETURN a.name, b.name";
+
+    let l = fluree.transact_cypher(l, stmt).await.expect("merge").ledger;
+    let db = graphdb_from_ledger(&l);
+    assert_eq!(
+        fluree.query_cypher(&db, edge_q).await.unwrap().row_count(),
+        1,
+        "first MERGE creates the Alice-KNOWS->Bob path"
+    );
+    assert_eq!(
+        fluree
+            .query_cypher(&db, "MATCH (n:Person) RETURN n")
+            .await
+            .unwrap()
+            .row_count(),
+        2,
+        "two endpoints created"
+    );
+
+    // Re-running the identical MERGE finds the path → no duplicate edge / nodes.
+    let l = fluree
+        .transact_cypher(l, stmt)
+        .await
+        .expect("merge#2")
+        .ledger;
+    let db = graphdb_from_ledger(&l);
+    assert_eq!(
+        fluree.query_cypher(&db, edge_q).await.unwrap().row_count(),
+        1,
+        "second MERGE is a no-op — the path already exists"
+    );
+    assert_eq!(
+        fluree
+            .query_cypher(&db, "MATCH (n:Person) RETURN n")
+            .await
+            .unwrap()
+            .row_count(),
+        2,
+        "still exactly two Person nodes"
+    );
+}
+
+#[tokio::test]
+async fn transact_cypher_merge_relationship_on_create_set_endpoint() {
+    // ON CREATE SET targeting an endpoint node var fires only on the create run.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = genesis_ledger(&fluree, "it/cypher:merge-rel-on-create");
+
+    let stmt = r#"MERGE (a:Person {name: "Alice"})-[:KNOWS]->(b:Person {name: "Bob"})
+                  ON CREATE SET b.note = "fresh""#;
+    let l = fluree.transact_cypher(l, stmt).await.expect("merge").ledger;
+    let db = graphdb_from_ledger(&l);
+    assert_eq!(
+        fluree
+            .query_cypher(&db, r#"MATCH (b:Person {note: "fresh"}) RETURN b"#)
+            .await
+            .unwrap()
+            .row_count(),
+        1,
+        "ON CREATE SET applied to the tail endpoint"
+    );
+}
+
+#[tokio::test]
 async fn transact_cypher_merge_on_match_set_fires_only_on_match() {
     // Conditional write: ON CREATE SET on first (absent) run, ON MATCH SET on
     // the second (present) run.

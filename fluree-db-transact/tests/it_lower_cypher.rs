@@ -209,8 +209,12 @@ fn deferred_write_shapes_are_rejected() {
         "MATCH (n:Person) DELETE n",
         // MERGE ON MATCH SET needs a complementary EXISTS branch.
         "MERGE (n:Person {name: \"A\"}) ON MATCH SET n.x = 1",
-        // Relationship MERGE is deferred.
-        "MERGE (a:Person {name: \"A\"})-[:KNOWS]->(b:Person {name: \"B\"})",
+        // A property-bearing MERGE relationship needs an annotation-sidecar guard.
+        "MERGE (a:Person {name: \"A\"})-[:KNOWS {since: 2020}]->(b:Person {name: \"B\"})",
+        // Undirected MERGE relationship is rejected.
+        "MERGE (a:Person {name: \"A\"})-[:KNOWS]-(b:Person {name: \"B\"})",
+        // Multi-hop MERGE pattern is deferred.
+        "MERGE (a:Person {name: \"A\"})-[:KNOWS]->(b:Person)-[:KNOWS]->(c:Person)",
     ] {
         let out = parse_cypher(src);
         if out.has_errors() {
@@ -407,6 +411,70 @@ fn merge_on_create_map_merge_skips_null_entries() {
         "inserts: {:?}",
         txn.insert_templates
     );
+}
+
+#[test]
+fn merge_relationship_emits_path_guard_and_create_branch() {
+    use fluree_db_query::parse::UnresolvedPattern;
+    let txn = lower(r#"MERGE (a:Person {name: "Alice"})-[:KNOWS]->(b:Person {name: "Bob"})"#);
+    assert_eq!(txn.txn_type, TxnType::Update);
+    // One NOT EXISTS guard spanning the whole path.
+    assert_eq!(
+        txn.where_patterns.len(),
+        1,
+        "where: {:?}",
+        txn.where_patterns
+    );
+    assert!(matches!(
+        txn.where_patterns[0],
+        UnresolvedPattern::NotExists(_)
+    ));
+    // Guard contents: 2 labels + 2 name filters + 1 rel triple = 5.
+    if let UnresolvedPattern::NotExists(guard) = &txn.where_patterns[0] {
+        assert_eq!(guard.len(), 5, "guard: {guard:?}");
+    }
+    // Create branch: 2 labels + 2 names + base edge + 3 reifier triples = 8.
+    assert_eq!(
+        txn.insert_templates.len(),
+        8,
+        "inserts: {:?}",
+        txn.insert_templates
+    );
+    assert_eq!(txn.delete_templates.len(), 0);
+    // Endpoints are fresh blank nodes (neither var was MATCH-bound).
+    let base = txn
+        .insert_templates
+        .iter()
+        .find(|t| {
+            matches!(t.subject, TemplateTerm::BlankNode(_))
+                && matches!(t.object, TemplateTerm::BlankNode(_))
+        })
+        .expect("a base edge between two blank-node endpoints");
+    assert!(matches!(base.subject, TemplateTerm::BlankNode(_)));
+    assert!(matches!(base.object, TemplateTerm::BlankNode(_)));
+}
+
+#[test]
+fn merge_relationship_on_create_set_routes_to_endpoint() {
+    // ON CREATE SET on the tail endpoint adds one insert on that node.
+    let txn = lower(
+        r#"MERGE (a:Person {name: "Alice"})-[:KNOWS]->(b:Person {name: "Bob"})
+           ON CREATE SET b.note = "new""#,
+    );
+    // 8 path inserts + 1 ON CREATE SET = 9.
+    assert_eq!(
+        txn.insert_templates.len(),
+        9,
+        "inserts: {:?}",
+        txn.insert_templates
+    );
+}
+
+#[test]
+fn merge_relationship_incoming_direction_orients_edge() {
+    // `<-[:KNOWS]-` puts the tail node on the subject side of the base edge.
+    let txn = lower(r#"MERGE (a:Person {name: "Alice"})<-[:KNOWS]-(b:Person {name: "Bob"})"#);
+    assert_eq!(txn.insert_templates.len(), 8);
 }
 
 #[test]

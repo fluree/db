@@ -265,9 +265,13 @@ ORDER BY / SKIP / LIMIT
 - **`REMOVE`** — remove a property (`REMOVE n.age`) or a label (`REMOVE n:Admin`).
 - **`DELETE` / `DETACH DELETE`** — delete nodes/relationships. `DETACH DELETE`
   removes a node together with its relationships.
-- **`MERGE`** — single-node find-or-create, with `ON CREATE SET` /
-  `ON MATCH SET`. Resolved by probing the current writer state, then staging
-  either a create or an update.
+- **`MERGE`** — find-or-create for a single node
+  (`MERGE (n:Person {name: "Alice"})`) or a single standalone relationship path
+  (`MERGE (a:Person {name: "Alice"})-[:KNOWS]->(b:Person {name: "Bob"})`), with
+  `ON CREATE SET` / `ON MATCH SET`. The whole pattern is the match key: when it
+  is absent the entire path (both endpoints and the edge) is created once.
+  `ON CREATE SET` may target either endpoint node variable. Resolved by probing
+  the current writer state, then staging either a create or an update.
 - **`MATCH … CREATE/SET/REMOVE/DELETE`** — pattern-driven write templates (find
   rows, then write per match). Write-side `MATCH` supports labels, inline
   property filters, directed single-typed relationships, and scalar `WHERE`
@@ -317,8 +321,11 @@ produces a clear error rather than a silent wrong answer.
 - Non-literal `SKIP`/`LIMIT`; `ORDER BY` on a `collect()` list.
 - `CASE` / `EXISTS` inside a write-statement `MATCH ... WHERE`; `WITH` before a
   write clause.
-- Relationship / multi-part `MERGE`; multiple `MERGE` clauses; `MERGE` combined
-  with a leading `MATCH` or other writes.
+- `MERGE` on a property-bearing relationship (`-[:KNOWS {since: 2020}]->`),
+  multi-hop or multi-part (comma-separated) `MERGE`, multiple `MERGE` clauses,
+  `ON MATCH SET` on a relationship `MERGE`, and `MERGE` combined with a leading
+  `MATCH` or other writes (a bound-endpoint `MATCH … MERGE (a)-[:T]->(b)`
+  included).
 - `CALL` / stored procedures, `LOAD CSV`, `FOREACH`, schema DDL.
 - Multi-statement scripts — submit one statement per request.
 

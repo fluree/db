@@ -903,9 +903,15 @@ impl<'a> CypherLowering<'a> {
     /// no-op behavior relies on the SPARQL-UPDATE staging fix (a present WHERE
     /// matching nothing no longer fires all-literal inserts).
     fn lower_merge(&mut self, m: &MergeClause) -> Result<(), LowerCypherError> {
-        if m.pattern.parts.len() != 1 || !m.pattern.parts[0].tail.is_empty() {
+        if m.pattern.parts.len() != 1 {
             return Err(LowerCypherError::unsupported(
-                "relationship / multi-part MERGE is deferred — v1 supports single-node MERGE",
+                "multi-part MERGE (comma-separated patterns) is deferred — v1 supports one pattern",
+            ));
+        }
+        let part = &m.pattern.parts[0];
+        if part.path_search.is_some() || part.path_var.is_some() {
+            return Err(LowerCypherError::unsupported(
+                "shortestPath / path-variable MERGE is not supported",
             ));
         }
         if !m.on_match.is_empty() {
@@ -915,19 +921,35 @@ impl<'a> CypherLowering<'a> {
                  branch). v1 supports MERGE [ON CREATE SET …].",
             ));
         }
-        let node = &m.pattern.parts[0].head;
+
+        self.txn_type = TxnType::Update;
+
+        match part.tail.len() {
+            0 => self.lower_merge_node(m, &part.head),
+            1 => self.lower_merge_relationship(m, part),
+            _ => Err(LowerCypherError::unsupported(
+                "multi-hop MERGE pattern is deferred — v1 supports a single relationship \
+                 `(a)-[r:T]->(b)`",
+            )),
+        }
+    }
+
+    /// Single-node MERGE (find-or-create). The identifying pattern (labels +
+    /// inline props) becomes the `NOT EXISTS` guard; the create branch fires a
+    /// fresh node carrying the same labels/props plus any `ON CREATE SET`.
+    fn lower_merge_node(
+        &mut self,
+        m: &MergeClause,
+        node: &NodePattern,
+    ) -> Result<(), LowerCypherError> {
         if node.labels.is_empty() && node.props.is_none() {
             return Err(LowerCypherError::rejected(
                 "bare MERGE `(n)` — a MERGE node needs a label or property to identify it",
             ));
         }
 
-        self.txn_type = TxnType::Update;
-
         // NOT EXISTS guard over a fresh probe var: the full identifying pattern.
-        let probe_name = format!("?#__cy_merge_{}", self.synth_counter);
-        self.synth_counter += 1;
-        let probe = UnresolvedTerm::Var(Arc::from(probe_name.as_str()));
+        let probe = self.fresh_merge_probe();
         let guard = self.build_merge_guard(node, &probe)?;
         self.where_patterns
             .push(UnresolvedPattern::NotExists(guard));
@@ -938,18 +960,107 @@ impl<'a> CypherLowering<'a> {
         let new_subj = self.node_subject(node);
         self.lower_node_create(node, new_subj.clone())?;
         let merge_var = node.var.as_ref().map(|v| v.name.clone());
-        // Keys already asserted by the identity map — ON CREATE SET on one of
-        // these would double-assert (Cypher SET overwrites; our identity insert
-        // can't be retracted in the same create branch), so reject it.
-        let identity_keys: std::collections::HashSet<&str> = node
-            .props
-            .as_ref()
-            .map(|p| p.entries.iter().map(|(k, _)| k.as_str()).collect())
-            .unwrap_or_default();
+        let identity_keys = node_identity_keys(node);
         for item in &m.on_create {
             self.emit_on_create_set(&new_subj, merge_var.as_deref(), &identity_keys, item)?;
         }
         Ok(())
+    }
+
+    /// Standalone relationship MERGE `(a)-[r:T]->(b)` where the whole pattern is
+    /// the MERGE (endpoints introduced here, not bound by a preceding MATCH).
+    /// The entire path becomes one `NOT EXISTS` guard; when no matching path
+    /// exists the create branch mints both endpoints and the edge (with its
+    /// `f:reifies*` reifier bundle) exactly once. `ON CREATE SET` may target
+    /// either endpoint node variable.
+    ///
+    /// Deferred (clear errors): relationship properties and `ON CREATE SET` on
+    /// the relationship variable — matching a property-bearing edge needs an
+    /// annotation-sidecar guard the single-Txn model doesn't build.
+    fn lower_merge_relationship(
+        &mut self,
+        m: &MergeClause,
+        part: &PatternPart,
+    ) -> Result<(), LowerCypherError> {
+        let head_node = &part.head;
+        let (rel, tail_node) = &part.tail[0];
+
+        if matches!(rel.direction, Direction::Either) {
+            return Err(LowerCypherError::rejected(
+                "undirected relationship `-[r]-` in MERGE — use `-[r]->` or `<-[r]-`",
+            ));
+        }
+        if rel.length.is_some() {
+            return Err(LowerCypherError::rejected(
+                "variable-length relationship in MERGE is not supported",
+            ));
+        }
+        if rel.types.len() != 1 {
+            return Err(LowerCypherError::rejected(
+                "MERGE relationship needs exactly one type — `-[:T]->`",
+            ));
+        }
+        if rel.props.is_some() {
+            return Err(LowerCypherError::unsupported(
+                "properties on a MERGE relationship are deferred — matching them needs an \
+                 annotation-sidecar guard; MERGE the bare edge, or use CREATE",
+            ));
+        }
+
+        // NOT EXISTS guard over the whole path (fresh existential probes for
+        // both endpoints, joined by the directed type triple).
+        let head_probe = self.fresh_merge_probe();
+        let tail_probe = self.fresh_merge_probe();
+        let mut guard = self.build_merge_guard(head_node, &head_probe)?;
+        guard.extend(self.build_merge_guard(tail_node, &tail_probe)?);
+        let type_iri = self.resolve_predicate(&rel.types[0].name)?;
+        let (gs, go) = match rel.direction {
+            Direction::Outgoing => (head_probe, tail_probe),
+            Direction::Incoming => (tail_probe, head_probe),
+            Direction::Either => unreachable!(),
+        };
+        guard.push(UnresolvedPattern::Triple(UnresolvedTriplePattern {
+            s: gs,
+            p: UnresolvedTerm::Iri(Arc::from(type_iri.as_str())),
+            o: go,
+            dtc: None,
+        }));
+        self.where_patterns
+            .push(UnresolvedPattern::NotExists(guard));
+
+        // Create branch: both endpoints + the directed edge with its bundle.
+        self.lower_create_part(part)?;
+
+        // ON CREATE SET — route each item to whichever endpoint var it targets.
+        if !m.on_create.is_empty() {
+            let head_subj = self.node_subject(head_node);
+            let tail_subj = self.node_subject(tail_node);
+            let head_var = head_node.var.as_ref().map(|v| v.name.as_str());
+            let tail_var = tail_node.var.as_ref().map(|v| v.name.as_str());
+            let head_keys = node_identity_keys(head_node);
+            let tail_keys = node_identity_keys(tail_node);
+            for item in &m.on_create {
+                let tgt = set_item_target(item).name.as_str();
+                if head_var == Some(tgt) {
+                    self.emit_on_create_set(&head_subj, head_var, &head_keys, item)?;
+                } else if tail_var == Some(tgt) {
+                    self.emit_on_create_set(&tail_subj, tail_var, &tail_keys, item)?;
+                } else {
+                    return Err(LowerCypherError::unsupported(
+                        "ON CREATE SET on a MERGE relationship targets only the endpoint node \
+                         variables in v1 (the relationship variable is deferred)",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Mint a fresh existential probe variable for a MERGE `NOT EXISTS` guard.
+    fn fresh_merge_probe(&mut self) -> UnresolvedTerm {
+        let name = format!("?#__cy_merge_{}", self.synth_counter);
+        self.synth_counter += 1;
+        UnresolvedTerm::Var(Arc::from(name.as_str()))
     }
 
     fn build_merge_guard(
@@ -1388,6 +1499,26 @@ impl<'a> CypherLowering<'a> {
             return Err(LowerCypherError::ReservedPredicate(iri));
         }
         Ok(iri)
+    }
+}
+
+/// Inline-property keys that a MERGE node asserts as its identity. `ON CREATE
+/// SET` on one of these would double-assert (the identity insert can't be
+/// retracted in the same create branch), so callers reject it.
+fn node_identity_keys(node: &NodePattern) -> std::collections::HashSet<&str> {
+    node.props
+        .as_ref()
+        .map(|p| p.entries.iter().map(|(k, _)| k.as_str()).collect())
+        .unwrap_or_default()
+}
+
+/// The variable a `SET` / `ON CREATE SET` item targets.
+fn set_item_target(item: &SetItem) -> &Variable {
+    match item {
+        SetItem::Property { target, .. }
+        | SetItem::MapMerge { target, .. }
+        | SetItem::MapReplace { target, .. }
+        | SetItem::Labels { target, .. } => target,
     }
 }
 

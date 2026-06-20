@@ -165,9 +165,7 @@ fn collect_subject_predicate_overlay_refs(
         true,
         ctx.to_t,
         &mut |flake| {
-            if flake.s == *subject
-                && flake.p == *predicate
-                && matches!(flake.o, FlakeValue::Ref(_))
+            if flake.s == *subject && flake.p == *predicate && matches!(flake.o, FlakeValue::Ref(_))
             {
                 flakes.push(flake.clone());
             }
