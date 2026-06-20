@@ -201,33 +201,32 @@ fn parse_unwind(s: &mut TokenStream) -> Result<UnwindClause, Diagnostic> {
     })
 }
 
-/// Parse `CALL [(a, b)] { <read-query ending in RETURN> }`. The optional scope
-/// clause names imported variables; `CALL (*)` is deferred. The body reuses the
-/// read-clause grammar and must terminate in RETURN.
+/// Parse `CALL [(a, b) | (*)] { <read-query ending in RETURN> }`. The optional
+/// scope clause names the imported variables, or `(*)` imports the whole outer
+/// scope. The body reuses the read-clause grammar and must terminate in RETURN.
 fn parse_call_subquery(s: &mut TokenStream) -> Result<CallSubqueryClause, Diagnostic> {
     let start = s.expect(&TokenKind::Call)?;
 
-    let imports = if matches!(s.peek_kind(), TokenKind::LParen) {
+    let (imports, import_all) = if matches!(s.peek_kind(), TokenKind::LParen) {
         s.advance();
-        if matches!(s.peek_kind(), TokenKind::Star) {
-            return Err(s.error(
-                DiagCode::DeferredProcedure,
-                "CALL (*) { … } (import all variables) is deferred — list the imported variables explicitly, e.g. CALL (a, b) { … }",
-            ));
-        }
-        let mut vars = Vec::new();
-        if !matches!(s.peek_kind(), TokenKind::RParen) {
-            loop {
-                vars.push(parse_var(s)?);
-                if s.eat(&TokenKind::Comma).is_none() {
-                    break;
+        if s.eat(&TokenKind::Star).is_some() {
+            s.expect(&TokenKind::RParen)?;
+            (Vec::new(), true)
+        } else {
+            let mut vars = Vec::new();
+            if !matches!(s.peek_kind(), TokenKind::RParen) {
+                loop {
+                    vars.push(parse_var(s)?);
+                    if s.eat(&TokenKind::Comma).is_none() {
+                        break;
+                    }
                 }
             }
+            s.expect(&TokenKind::RParen)?;
+            (vars, false)
         }
-        s.expect(&TokenKind::RParen)?;
-        vars
     } else {
-        Vec::new()
+        (Vec::new(), false)
     };
 
     s.expect(&TokenKind::LBrace)?;
@@ -235,6 +234,7 @@ fn parse_call_subquery(s: &mut TokenStream) -> Result<CallSubqueryClause, Diagno
     let end = s.expect(&TokenKind::RBrace)?;
     Ok(CallSubqueryClause {
         imports,
+        import_all,
         query: Box::new(query),
         span: start.union(end),
     })

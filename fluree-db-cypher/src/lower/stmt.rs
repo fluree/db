@@ -1168,22 +1168,29 @@ fn lower_call_subquery<E: IriEncoder>(
 ) -> Result<Pattern> {
     let outer_set: std::collections::HashSet<VarId> = outer_vars.iter().copied().collect();
 
-    // Every imported variable must already be bound in the outer scope —
-    // `CALL (x) { … }` where `x` was never declared outside is invalid Cypher.
-    let import_vars: Vec<VarId> = call
-        .imports
-        .iter()
-        .map(|v| ctx.intern_var(&v.name))
-        .collect();
-    for (v, imp) in import_vars.iter().zip(&call.imports) {
-        if !outer_set.contains(v) {
-            return Err(LowerError::unsupported(format!(
-                "CALL imports `{}`, which is not bound in the outer scope — only variables \
-                 already bound by a preceding clause can be imported",
-                imp.name
-            )));
+    // Resolve the import list. `CALL (*)` imports the entire visible outer scope
+    // (so the body may reference any outer variable, with no shadowing
+    // ambiguity); an explicit `CALL (a, b)` imports just those, each of which
+    // must already be bound outside (`CALL (x)` for an unbound `x` is invalid).
+    let import_vars: Vec<VarId> = if call.import_all {
+        outer_vars.to_vec()
+    } else {
+        let vars: Vec<VarId> = call
+            .imports
+            .iter()
+            .map(|v| ctx.intern_var(&v.name))
+            .collect();
+        for (v, imp) in vars.iter().zip(&call.imports) {
+            if !outer_set.contains(v) {
+                return Err(LowerError::unsupported(format!(
+                    "CALL imports `{}`, which is not bound in the outer scope — only variables \
+                     already bound by a preceding clause can be imported",
+                    imp.name
+                )));
+            }
         }
-    }
+        vars
+    };
 
     // Walk the (right-recursive) UNION chain, lowering + validating each branch.
     let mut branch_subqueries: Vec<Pattern> = Vec::new();

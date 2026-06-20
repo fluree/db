@@ -211,8 +211,8 @@ RETURN p.name, contact
 
 The body must end in `RETURN` with explicit columns. Scope is strict: a returned
 name can't re-bind an outer one, and the body can't reuse an outer variable's
-name without importing it. Writes inside `CALL` and `CALL (*)` aren't supported
-yet.
+name without importing it — or use `CALL (*) { … }` to import the whole outer
+scope. Writes inside `CALL` aren't supported yet.
 
 ## Paths
 

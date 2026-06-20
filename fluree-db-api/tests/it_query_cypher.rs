@@ -2205,22 +2205,80 @@ async fn cypher_call_subquery_union() {
 }
 
 #[tokio::test]
-async fn cypher_call_subquery_rejections() {
+async fn cypher_call_subquery_import_all() {
+    // `CALL (*)` imports the whole visible outer scope.
     let fluree = FlureeBuilder::memory().build_memory();
-    let l = seed_call_graph(&fluree, "it/cypher:call-reject").await;
+    let l = seed_call_graph(&fluree, "it/cypher:call-star").await;
     let db = graphdb_from_ledger(&l);
 
-    // CALL (*) is deferred.
+    // (*) behaves like an explicit import of the referenced outer var `p`.
+    let agg = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (p:Person)
+               CALL (*) { MATCH (p)-[:KNOWS]->(f:Person) RETURN count(f) AS friends }
+               RETURN p.name AS name, friends ORDER BY name"#,
+        )
+        .await
+        .expect("import-all aggregate")
+        .to_cypher_json_async(db.as_graph_db_ref())
+        .await
+        .expect("cypher json");
+    let data = agg["results"][0]["data"].as_array().expect("rows");
+    assert_eq!(data.len(), 2, "Carol (zero matches) drops: {agg}");
+    assert_eq!(data[0]["row"], json!(["Alice", 2]), "{agg}");
+    assert_eq!(data[1]["row"], json!(["Bob", 1]), "{agg}");
+
+    // (*) imports `x` too, so reusing its name inside is a correlated bound-bound
+    // match (not a shadow error) — keeps only outer pairs where p KNOWS x.
+    let pairs = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (p:Person), (x:Person)
+               CALL (*) { MATCH (p)-[:KNOWS]->(x:Person) RETURN p.name AS hit }
+               RETURN p.name AS pn, x.name AS xn ORDER BY pn, xn"#,
+        )
+        .await
+        .expect("import-all correlated pair")
+        .to_cypher_json_async(db.as_graph_db_ref())
+        .await
+        .expect("cypher json");
+    let rows: Vec<_> = pairs["results"][0]["data"]
+        .as_array()
+        .expect("rows")
+        .iter()
+        .map(|r| r["row"].clone())
+        .collect();
+    assert_eq!(
+        rows,
+        vec![
+            json!(["Alice", "Bob"]),
+            json!(["Alice", "Carol"]),
+            json!(["Bob", "Carol"]),
+        ],
+        "(*) imports x → bound-bound correlation keeps only KNOWS pairs: {pairs}"
+    );
+
+    // A RETURN re-binding an outer name is still rejected, even under (*).
     assert!(
         fluree
             .query_cypher(
                 &db,
-                r#"MATCH (p:Person) CALL (*) { MATCH (p)-[:KNOWS]->(f) RETURN f.name AS n } RETURN n"#,
+                r#"MATCH (p:Person), (q:Person)
+                   CALL (*) { MATCH (p)-[:KNOWS]->(f:Person) RETURN f AS q }
+                   RETURN q.name"#,
             )
             .await
             .is_err(),
-        "CALL (*) is deferred"
+        "RETURN re-binding an outer name is rejected even under (*)"
     );
+}
+
+#[tokio::test]
+async fn cypher_call_subquery_rejections() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = seed_call_graph(&fluree, "it/cypher:call-reject").await;
+    let db = graphdb_from_ledger(&l);
 
     // A write inside CALL is deferred.
     assert!(

@@ -103,8 +103,13 @@ pub struct UnwindClause {
 #[derive(Clone, Debug, PartialEq)]
 pub struct CallSubqueryClause {
     /// Imported (correlated) variables from the explicit scope clause
-    /// `CALL (a, b) { … }`. Empty for `CALL { … }` (uncorrelated).
+    /// `CALL (a, b) { … }`. Empty for `CALL { … }` (uncorrelated) and for
+    /// `CALL (*) { … }` (see `import_all`).
     pub imports: Vec<Variable>,
+    /// `CALL (*) { … }` — import every variable visible in the outer scope.
+    /// When set, `imports` is empty and the importer is resolved at lowering
+    /// from the outer scope.
+    pub import_all: bool,
     /// The read-only subquery body (ends in RETURN).
     pub query: Box<Query>,
     pub span: SourceSpan,

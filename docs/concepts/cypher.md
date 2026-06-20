@@ -293,9 +293,10 @@ ORDER BY / SKIP / LIMIT
 - `WITH ... [WHERE/ORDER BY/SKIP/LIMIT/DISTINCT]` and `WITH *` — subquery
   boundary. WHERE that references aggregate aliases lowers to HAVING
   rather than a pre-aggregation Filter. Nested WITHs nest Subqueries.
-- `CALL [(a, b)] { … }` — a read-only subquery clause in the pipeline. The
-  scope clause `(a, b)` imports outer variables (the subquery is correlated on
-  them); `CALL { … }` with no scope clause runs once and broadcasts its result.
+- `CALL [(a, b) | (*)] { … }` — a read-only subquery clause in the pipeline.
+  The scope clause `(a, b)` imports those outer variables (the subquery is
+  correlated on them), `(*)` imports the whole visible outer scope, and
+  `CALL { … }` with no scope clause runs once and broadcasts its result.
   The body is `MATCH` / `OPTIONAL MATCH` / `WITH` / `UNWIND` / nested `CALL`
   ending in `RETURN` (explicit columns, not `*`); outer rows flow in and the
   RETURN columns continue downstream. The body may be a `UNION` / `UNION ALL`
@@ -306,8 +307,8 @@ ORDER BY / SKIP / LIMIT
   inner `MATCH` in `OPTIONAL MATCH` to retain it as a `0`. **Scope is strict:**
   every import must already be bound outside, a RETURN may not re-bind any
   outer name, and the body may not reuse an outer variable's name internally
-  without importing it (rename it, or add it to the scope clause). Deferred:
-  writes inside `CALL` and `CALL (*)` (import-all).
+  without importing it (rename it, or add it to the scope clause, or use
+  `CALL (*)`). Deferred: writes inside `CALL`.
 - `RETURN n`, `RETURN n, m`, `RETURN *`, `RETURN DISTINCT ...`,
   `RETURN expr AS alias` (lowered via `Bind`).
 - `UNION` and `UNION ALL` at the RETURN boundary. Every branch must
