@@ -508,6 +508,28 @@ fn expression_references_any(
         Expression::Map(entries) => entries
             .iter()
             .any(|(_, v)| expression_references_any(v, vars)),
+        Expression::ListComprehension {
+            list, filter, map, ..
+        } => {
+            expression_references_any(list, vars)
+                || filter
+                    .as_deref()
+                    .is_some_and(|f| expression_references_any(f, vars))
+                || map
+                    .as_deref()
+                    .is_some_and(|m| expression_references_any(m, vars))
+        }
+        Expression::Reduce {
+            init, list, body, ..
+        } => {
+            expression_references_any(init, vars)
+                || expression_references_any(list, vars)
+                || expression_references_any(body, vars)
+        }
+        Expression::ListPredicate {
+            list, predicate, ..
+        } => expression_references_any(list, vars) || expression_references_any(predicate, vars),
+        Expression::Member { target, .. } => expression_references_any(target, vars),
         Expression::Exists { .. } => false,
     }
 }
@@ -622,6 +644,11 @@ fn expr_has_aggregate(e: &Expr) -> bool {
         | Expr::Prop(x, _, _) => expr_has_aggregate(x),
         Expr::List(items, _) => items.iter().any(expr_has_aggregate),
         Expr::Map(entries, _) => entries.iter().any(|(_, v)| expr_has_aggregate(v)),
+        // An aggregate can only legally appear in the list/init position
+        // (`[x IN collect(y) | x]`), never in a loop-local scoped body.
+        Expr::ListComprehension(c) => expr_has_aggregate(&c.list),
+        Expr::Reduce(r) => expr_has_aggregate(&r.init) || expr_has_aggregate(&r.list),
+        Expr::ListPredicate(p) => expr_has_aggregate(&p.list),
         Expr::Var(_) | Expr::Lit(_) | Expr::Param(_) | Expr::Case(_) | Expr::Exists(_, _, _) => {
             false
         }
@@ -714,6 +741,20 @@ fn extract_aggregates_inner<E: IriEncoder>(
             }
             Ok(())
         }
+        // Only the list/init position can carry an aggregate; loop-local scoped
+        // bodies can't (and must not have their aggregates hoisted out). The list
+        // position is list-consuming, so `collect()` is allowed there
+        // (`[x IN collect(p) | x.name]`).
+        Expr::ListComprehension(c) => {
+            extract_aggregates_inner(ctx, &mut c.list, patterns, aggregates, counter, true)
+        }
+        Expr::ListPredicate(p) => {
+            extract_aggregates_inner(ctx, &mut p.list, patterns, aggregates, counter, true)
+        }
+        Expr::Reduce(r) => {
+            extract_aggregates_inner(ctx, &mut r.init, patterns, aggregates, counter, false)?;
+            extract_aggregates_inner(ctx, &mut r.list, patterns, aggregates, counter, true)
+        }
         Expr::Case(_) | Expr::Exists(_, _, _) => Err(LowerError::unsupported(
             "aggregates inside CASE / EXISTS are not supported in v1",
         )),
@@ -753,6 +794,14 @@ fn composite_references_grouping_value(e: &Expr) -> bool {
         Expr::Map(entries, _) => entries
             .iter()
             .any(|(_, v)| composite_references_grouping_value(v)),
+        // Only the outer-scope list/init can carry a grouping value; loop-local
+        // scoped bodies reference internal vars, not grouping keys.
+        Expr::ListComprehension(c) => composite_references_grouping_value(&c.list),
+        Expr::ListPredicate(p) => composite_references_grouping_value(&p.list),
+        Expr::Reduce(r) => {
+            composite_references_grouping_value(&r.init)
+                || composite_references_grouping_value(&r.list)
+        }
         Expr::Lit(_) | Expr::Param(_) | Expr::Case(_) | Expr::Exists(_, _, _) => false,
     }
 }

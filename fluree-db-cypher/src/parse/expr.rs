@@ -1,8 +1,12 @@
 //! Expression parser — Pratt-style precedence climbing.
 
-use crate::ast::{BinOp, CaseExpr, Expr, FuncCall, Literal, MapLit, ParamRef, UnaryOp, Variable};
+use crate::ast::{
+    BinOp, CaseExpr, Expr, FuncCall, ListPredicateKind, Literal, MapLit, ParamRef, UnaryOp,
+    Variable,
+};
 use crate::diag::{DiagCode, Diagnostic};
 use crate::lex::TokenKind;
+use crate::span::SourceSpan;
 
 use super::pattern::parse_pattern;
 use super::stmt::parse_ident_or_keyword;
@@ -244,6 +248,13 @@ fn parse_primary(s: &mut TokenStream) -> Result<Expr, Diagnostic> {
         }
         TokenKind::LBracket => {
             s.advance();
+            // `[var IN list …]` is a list comprehension; `[a, b, …]` a literal.
+            // The distinguishing shape is an identifier immediately followed by
+            // `IN`.
+            if matches!(s.peek_kind(), TokenKind::Ident(_)) && matches!(s.peek_at(1), TokenKind::In)
+            {
+                return parse_list_comprehension(s, start);
+            }
             let mut items = Vec::new();
             if !matches!(s.peek_kind(), TokenKind::RBracket) {
                 loop {
@@ -255,6 +266,12 @@ fn parse_primary(s: &mut TokenStream) -> Result<Expr, Diagnostic> {
             }
             let end = s.expect(&TokenKind::RBracket)?;
             Ok(Expr::List(items, start.union(end)))
+        }
+        TokenKind::All => {
+            // `all(var IN list WHERE pred)` — the only keyword-tokenized list
+            // predicate (any/none/single are identifiers, handled in calls).
+            s.advance();
+            parse_list_predicate(s, ListPredicateKind::All, start)
         }
         TokenKind::LBrace => {
             // Map literal in expression position: `{key: expr, ...}`. Reuses the
@@ -313,6 +330,28 @@ fn parse_var_or_call(s: &mut TokenStream) -> Result<Expr, Diagnostic> {
     } else {
         return Err(s.error(DiagCode::UnexpectedToken, "expected identifier"));
     };
+    // List-iteration forms tokenized as identifiers (`all` is a keyword, handled
+    // in `parse_primary`). They take a `var IN list …` argument, not a normal
+    // call arg list — so intercept before generic call parsing.
+    match name.to_ascii_lowercase().as_str() {
+        "reduce" => {
+            s.advance();
+            return parse_reduce(s, start);
+        }
+        "any" => {
+            s.advance();
+            return parse_list_predicate(s, ListPredicateKind::Any, start);
+        }
+        "none" => {
+            s.advance();
+            return parse_list_predicate(s, ListPredicateKind::None, start);
+        }
+        "single" => {
+            s.advance();
+            return parse_list_predicate(s, ListPredicateKind::Single, start);
+        }
+        _ => {}
+    }
     s.advance();
     if matches!(s.peek_kind(), TokenKind::LParen) {
         s.advance();
@@ -374,6 +413,95 @@ fn parse_case(s: &mut TokenStream) -> Result<Expr, Diagnostic> {
         subject,
         branches,
         else_branch,
+        span: start.union(end),
+    })))
+}
+
+/// Parse a bare identifier as a (loop) variable.
+fn parse_variable(s: &mut TokenStream) -> Result<Variable, Diagnostic> {
+    let span = s.peek_span();
+    let TokenKind::Ident(name) = s.peek_kind().clone() else {
+        return Err(s.error(DiagCode::UnexpectedToken, "expected a variable name"));
+    };
+    s.advance();
+    Ok(Variable { name, span })
+}
+
+/// `[var IN list (WHERE filter)? (| map)?]` — the leading `[` is already eaten.
+fn parse_list_comprehension(s: &mut TokenStream, start: SourceSpan) -> Result<Expr, Diagnostic> {
+    let var = parse_variable(s)?;
+    s.expect(&TokenKind::In)?;
+    let list = Box::new(parse_expr(s)?);
+    let filter = if s.eat(&TokenKind::Where).is_some() {
+        Some(Box::new(parse_expr(s)?))
+    } else {
+        None
+    };
+    let map = if s.eat(&TokenKind::Pipe).is_some() {
+        Some(Box::new(parse_expr(s)?))
+    } else {
+        None
+    };
+    let end = s.expect(&TokenKind::RBracket)?;
+    Ok(Expr::ListComprehension(Box::new(
+        crate::ast::ListComprehensionExpr {
+            var,
+            list,
+            filter,
+            map,
+            span: start.union(end),
+        },
+    )))
+}
+
+/// `(var IN list (WHERE pred)?)` for a list predicate — the kind token is
+/// already eaten. A missing `WHERE` defaults the predicate to `true` (so
+/// `any(x IN xs)` is "xs is non-empty").
+fn parse_list_predicate(
+    s: &mut TokenStream,
+    kind: ListPredicateKind,
+    start: SourceSpan,
+) -> Result<Expr, Diagnostic> {
+    s.expect(&TokenKind::LParen)?;
+    let var = parse_variable(s)?;
+    s.expect(&TokenKind::In)?;
+    let list = Box::new(parse_expr(s)?);
+    let predicate = if s.eat(&TokenKind::Where).is_some() {
+        Box::new(parse_expr(s)?)
+    } else {
+        Box::new(Expr::Lit(Literal::Bool(true, start)))
+    };
+    let end = s.expect(&TokenKind::RParen)?;
+    Ok(Expr::ListPredicate(Box::new(
+        crate::ast::ListPredicateExpr {
+            kind,
+            var,
+            list,
+            predicate,
+            span: start.union(end),
+        },
+    )))
+}
+
+/// `(acc = init, var IN list | body)` for `reduce` — `reduce` already eaten.
+fn parse_reduce(s: &mut TokenStream, start: SourceSpan) -> Result<Expr, Diagnostic> {
+    s.expect(&TokenKind::LParen)?;
+    let acc = parse_variable(s)?;
+    s.expect(&TokenKind::Eq)?;
+    let init = Box::new(parse_expr(s)?);
+    s.expect(&TokenKind::Comma)?;
+    let var = parse_variable(s)?;
+    s.expect(&TokenKind::In)?;
+    let list = Box::new(parse_expr(s)?);
+    s.expect(&TokenKind::Pipe)?;
+    let body = Box::new(parse_expr(s)?);
+    let end = s.expect(&TokenKind::RParen)?;
+    Ok(Expr::Reduce(Box::new(crate::ast::ReduceExpr {
+        acc,
+        init,
+        var,
+        list,
+        body,
         span: start.union(end),
     })))
 }

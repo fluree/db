@@ -85,6 +85,20 @@ pub fn contains_exists(expr: &Expression) -> bool {
         Expression::Exists { .. } => true,
         Expression::Call { args, .. } => args.iter().any(contains_exists),
         Expression::Map(entries) => entries.iter().any(|(_, v)| contains_exists(v)),
+        Expression::ListComprehension {
+            list, filter, map, ..
+        } => {
+            contains_exists(list)
+                || filter.as_deref().is_some_and(contains_exists)
+                || map.as_deref().is_some_and(contains_exists)
+        }
+        Expression::Reduce {
+            init, list, body, ..
+        } => contains_exists(init) || contains_exists(list) || contains_exists(body),
+        Expression::ListPredicate {
+            list, predicate, ..
+        } => contains_exists(list) || contains_exists(predicate),
+        Expression::Member { target, .. } => contains_exists(target),
         Expression::Var(_) | Expression::Const(_) => false,
     }
 }
@@ -145,6 +159,13 @@ fn collect_simple_exists_keys(expr: &Expression, out: &mut Vec<(VarId, Ref)>) {
                 collect_simple_exists_keys(v, out);
             }
         }
+        // Scoped iteration / member access: an EXISTS buried in a comprehension
+        // body or behind eval-time member access is not a hoistable semijoin key
+        // (it references loop locals), so it is opaque to this optimizer.
+        Expression::ListComprehension { .. }
+        | Expression::Reduce { .. }
+        | Expression::ListPredicate { .. }
+        | Expression::Member { .. } => {}
         Expression::Var(_) | Expression::Const(_) => {}
     }
 }

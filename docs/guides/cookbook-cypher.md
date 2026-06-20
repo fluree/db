@@ -125,6 +125,31 @@ SET p.adult = true
 names are visible to the write. Aggregation, `DISTINCT`, and `ORDER BY` /
 `SKIP` / `LIMIT` on a write-side `WITH` are not yet supported.
 
+## Transform lists with comprehensions, reduce, and predicates
+
+```cypher
+// Project + filter a list inline.
+MATCH (p:Person)
+RETURN [x IN range(1, 10) WHERE x % 2 = 0 | x * x] AS evenSquares
+
+// Fold a list to a scalar.
+RETURN reduce(total = 0, x IN [3, 5, 7] | total + x) AS sum
+
+// Collect nodes, then map a property over them (loop-local property access).
+MATCH (p:Person)
+RETURN [x IN collect(p) | x.name] AS names
+
+// Quantify over a list.
+MATCH (p:Person)
+WHERE all(t IN p.tags WHERE t <> "banned")
+RETURN p.name
+```
+
+The loop variable is scoped to the body, and property access on it works for
+both node elements (`x.name` scans the graph) and map elements
+(`row.email` for `[row IN $people | row.email]`). A null or non-list input
+yields null.
+
 ## Paths
 
 Variable-length traversal (name the relationship type):

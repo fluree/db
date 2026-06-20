@@ -506,6 +506,43 @@ pub fn eval_properties_to_binding<R: RowAccess>(
     Ok(Binding::Map(entries))
 }
 
+/// Eval-time single data-property lookup for a node binding: `node.<predicate>`.
+/// Returns the scalar value (with language tag), a list for a multi-valued
+/// `@list` property (ordered by index), or `Unbound` when absent. Used by
+/// loop-local member access (`[x IN nodes(p) | x.name]`).
+pub fn eval_node_property(
+    node: &Binding,
+    predicate_iri: &str,
+    ctx: &ExecutionContext<'_>,
+) -> Result<Binding> {
+    let Some(subject) = binding_subject_sid(node, ctx)? else {
+        return Ok(Binding::Unbound);
+    };
+    let pred_sid = ctx
+        .binary_store
+        .as_ref()
+        .map(|s| s.encode_iri(predicate_iri))
+        .or_else(|| ctx.active_snapshot.encode_iri(predicate_iri));
+    let Some(pred_sid) = pred_sid else {
+        return Ok(Binding::Unbound);
+    };
+    ctx.tracker.consume_fuel(1)?;
+
+    let mut vals: Vec<(Binding, Option<i32>)> = subject_data_properties(ctx, &subject)?
+        .into_iter()
+        .filter(|(p, ..)| *p == pred_sid)
+        .map(|(_, val, dt, lang, i)| (property_value_binding(val, dt, lang), i))
+        .collect();
+    Ok(match vals.len() {
+        0 => Binding::Unbound,
+        1 => vals.pop().expect("len == 1").0,
+        _ => {
+            vals.sort_by_key(|(_, i)| i.unwrap_or(i32::MAX));
+            Binding::List(vals.into_iter().map(|(b, _)| b).collect())
+        }
+    })
+}
+
 /// `type(rel)` → relationship type string from `f:reifiesPredicate`.
 pub fn eval_rel_type<R: RowAccess>(
     args: &[Expression],

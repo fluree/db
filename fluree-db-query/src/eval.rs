@@ -25,6 +25,7 @@ mod fulltext;
 mod geo;
 mod hash;
 mod helpers;
+mod iter;
 mod list;
 mod logical;
 mod metadata;
@@ -71,6 +72,21 @@ impl Expression {
 
             // A map's effective boolean value: non-empty is truthy.
             Expression::Map(_) => Ok((&self.try_eval_to_binding(row, ctx)?).into()),
+
+            // A list predicate is already boolean (null → false in EBV).
+            Expression::ListPredicate {
+                kind,
+                var,
+                list,
+                predicate,
+            } => Ok(
+                iter::eval_list_predicate(*kind, *var, list, predicate, row, ctx)?.unwrap_or(false),
+            ),
+
+            // Comprehension / reduce / member are values — use EBV of the value.
+            Expression::ListComprehension { .. }
+            | Expression::Reduce { .. }
+            | Expression::Member { .. } => Ok((&self.try_eval_to_binding(row, ctx)?).into()),
 
             // EXISTS subexpressions in compound filters are pre-evaluated by the
             // FilterOperator and replaced with Const(Bool) before this is called.
@@ -193,9 +209,33 @@ impl Expression {
 
             Expression::Call { func, args } => func.eval(args, row, ctx),
 
-            // A map is a structured value, not a scalar — no comparable form.
-            // Map-consuming contexts read the binding via `try_eval_to_binding`.
-            Expression::Map(_) => Ok(None),
+            // A map / comprehension / reduce is a structured value — no scalar
+            // form; consumers read the binding via `try_eval_to_binding`.
+            Expression::Map(_)
+            | Expression::ListComprehension { .. }
+            | Expression::Reduce { .. } => Ok(None),
+
+            // A list predicate is a boolean scalar.
+            Expression::ListPredicate {
+                kind,
+                var,
+                list,
+                predicate,
+            } => Ok(
+                iter::eval_list_predicate(*kind, *var, list, predicate, row, ctx)?
+                    .map(ComparableValue::Bool),
+            ),
+
+            // Member access yields a value; expose its comparable form (a scalar
+            // property is comparable; a map/list value collapses to None).
+            Expression::Member {
+                target,
+                key,
+                predicate_iri,
+            } => {
+                let b = iter::eval_member(target, key, predicate_iri, row, ctx)?;
+                Ok(list::element_to_comparable(&b))
+            }
 
             // EXISTS: pre-evaluated by FilterOperator; shouldn't reach here
             Expression::Exists { .. } => {
@@ -288,6 +328,39 @@ impl Expression {
                 }
             }
             return Ok(Binding::Map(out));
+        }
+
+        // Scoped list-iteration and eval-time member access produce structured
+        // values directly (a List / the accumulator / a looked-up value).
+        match self {
+            Expression::ListComprehension {
+                var,
+                list,
+                filter,
+                map,
+            } => {
+                return iter::eval_list_comprehension(
+                    *var,
+                    list,
+                    filter.as_deref(),
+                    map.as_deref(),
+                    row,
+                    ctx,
+                );
+            }
+            Expression::Reduce {
+                acc,
+                init,
+                var,
+                list,
+                body,
+            } => return iter::eval_reduce(*acc, init, *var, list, body, row, ctx),
+            Expression::Member {
+                target,
+                key,
+                predicate_iri,
+            } => return iter::eval_member(target, key, predicate_iri, row, ctx),
+            _ => {}
         }
 
         // List-*returning* functions (tail, list-reverse) and list literals

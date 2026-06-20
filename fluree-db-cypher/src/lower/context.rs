@@ -28,6 +28,12 @@ pub struct LoweringContext<'a, E: IriEncoder> {
     /// either via request envelope or test fixture. Bare identifier →
     /// IRI string.
     pub overrides: HashMap<String, String>,
+    /// Lexical scopes for loop-local variables introduced by list
+    /// comprehensions / `reduce` / list predicates. A name in an active scope
+    /// resolves to its scoped synthetic `VarId` (innermost wins) instead of a
+    /// query variable, and property access on it lowers to eval-time member
+    /// access rather than an outer-pattern join.
+    scopes: Vec<HashMap<String, VarId>>,
 }
 
 impl<'a, E: IriEncoder> LoweringContext<'a, E> {
@@ -38,7 +44,35 @@ impl<'a, E: IriEncoder> LoweringContext<'a, E> {
             next_synth: 0,
             vocab: "http://example.org/".to_string(),
             overrides: HashMap::new(),
+            scopes: Vec::new(),
         }
+    }
+
+    /// Push a new loop-local scope. Pair with [`Self::exit_scope`].
+    pub fn enter_scope(&mut self) {
+        self.scopes.push(HashMap::new());
+    }
+
+    /// Pop the innermost loop-local scope.
+    pub fn exit_scope(&mut self) {
+        self.scopes.pop();
+    }
+
+    /// Bind a loop-local variable name to a fresh synthetic `VarId` in the
+    /// current (innermost) scope, returning its id. Fresh synthetics avoid
+    /// collisions with an outer variable of the same name and make the
+    /// `referenced_vars` subtraction meaningful.
+    pub fn bind_local(&mut self, name: &str) -> VarId {
+        let id = self.fresh_synth();
+        if let Some(top) = self.scopes.last_mut() {
+            top.insert(name.to_string(), id);
+        }
+        id
+    }
+
+    /// Whether `name` currently resolves to a loop-local (in any active scope).
+    pub fn is_local(&self, name: &str) -> bool {
+        self.scopes.iter().any(|s| s.contains_key(name))
     }
 
     pub fn with_vocab(mut self, vocab: impl Into<String>) -> Self {
@@ -59,8 +93,15 @@ impl<'a, E: IriEncoder> LoweringContext<'a, E> {
         self.vars.get_or_insert(&name)
     }
 
-    /// Resolve a Cypher variable identifier to a VarId.
+    /// Resolve a Cypher variable identifier to a VarId. A name bound by an
+    /// active loop-local scope (innermost first) resolves to its scoped id;
+    /// otherwise it interns as a query variable.
     pub fn intern_var(&mut self, name: &str) -> VarId {
+        for scope in self.scopes.iter().rev() {
+            if let Some(&id) = scope.get(name) {
+                return id;
+            }
+        }
         self.vars.get_or_insert(name)
     }
 

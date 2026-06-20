@@ -6,6 +6,19 @@ use super::pattern::Pattern;
 use crate::var_registry::VarId;
 use fluree_db_core::value::FlakeValue;
 
+/// Which quantifier a [`Expression::ListPredicate`] applies over a list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListPredicateKind {
+    /// `all` — true iff the predicate holds for every element.
+    All,
+    /// `any` — true iff the predicate holds for at least one element.
+    Any,
+    /// `none` — true iff the predicate holds for no element.
+    None,
+    /// `single` — true iff the predicate holds for exactly one element.
+    Single,
+}
+
 /// Filter expression AST
 ///
 /// Represents expressions that can be evaluated against solution bindings.
@@ -27,6 +40,48 @@ pub enum Expression {
     /// (equality / grouping) is key-order-insensitive. Duplicate keys resolve
     /// last-wins at construction. Produces a [`crate::binding::Binding::Map`].
     Map(Vec<(std::sync::Arc<str>, Expression)>),
+
+    /// List comprehension `[var IN list WHERE filter | map]`. Iterates `list`,
+    /// binding `var` to each element (a scoped local, excluded from
+    /// `referenced_vars`); keeps elements passing `filter` (if any) and projects
+    /// `map` (identity if absent). Produces a [`crate::binding::Binding::List`].
+    ListComprehension {
+        var: VarId,
+        list: Box<Expression>,
+        filter: Option<Box<Expression>>,
+        map: Option<Box<Expression>>,
+    },
+    /// `reduce(acc = init, var IN list | body)`. Folds `list` left-to-right:
+    /// `acc` starts at `init`, and each step re-binds `acc` and `var` (both
+    /// scoped locals) and evaluates `body` to the next accumulator.
+    Reduce {
+        acc: VarId,
+        init: Box<Expression>,
+        var: VarId,
+        list: Box<Expression>,
+        body: Box<Expression>,
+    },
+    /// List predicate `all/any/none/single(var IN list WHERE pred)` — tests
+    /// `pred` (with `var` a scoped local) across the elements of `list`,
+    /// short-circuiting. Produces a boolean.
+    ListPredicate {
+        kind: ListPredicateKind,
+        var: VarId,
+        list: Box<Expression>,
+        predicate: Box<Expression>,
+    },
+    /// Eval-time member access `target.key` — used when `target` can't be a
+    /// graph-join variable (a loop-local from a comprehension/reduce). At eval:
+    /// a [`crate::binding::Binding::Map`] target looks up `key`; a node (ref)
+    /// target scans `(node, predicate_iri, ?)` for the data property; anything
+    /// else is null. `predicate_iri` is resolved at lowering (it needs the
+    /// Cypher vocab, absent from the engine). Outer query-variable property
+    /// access still lowers to the efficient auxiliary-pattern join instead.
+    Member {
+        target: Box<Expression>,
+        key: std::sync::Arc<str>,
+        predicate_iri: std::sync::Arc<str>,
+    },
     /// EXISTS / NOT EXISTS subquery inside a compound filter expression.
     ///
     /// Used when EXISTS/NOT EXISTS appears as part of a larger expression
@@ -63,6 +118,49 @@ impl Expression {
                     v.substitute_var(old, new);
                 }
             }
+            // Scoped iteration: always rename in the list/init (outer scope), but
+            // not inside the body when the bound (loop/acc) variable shadows.
+            Expression::ListComprehension {
+                var,
+                list,
+                filter,
+                map,
+            } => {
+                list.substitute_var(old, new);
+                if *var != old {
+                    if let Some(f) = filter {
+                        f.substitute_var(old, new);
+                    }
+                    if let Some(m) = map {
+                        m.substitute_var(old, new);
+                    }
+                }
+            }
+            Expression::Reduce {
+                acc,
+                init,
+                var,
+                list,
+                body,
+            } => {
+                init.substitute_var(old, new);
+                list.substitute_var(old, new);
+                if *acc != old && *var != old {
+                    body.substitute_var(old, new);
+                }
+            }
+            Expression::ListPredicate {
+                var,
+                list,
+                predicate,
+                ..
+            } => {
+                list.substitute_var(old, new);
+                if *var != old {
+                    predicate.substitute_var(old, new);
+                }
+            }
+            Expression::Member { target, .. } => target.substitute_var(old, new),
             Expression::Exists { patterns, .. } => {
                 for p in patterns {
                     p.substitute_var(old, new);
@@ -84,6 +182,24 @@ impl Expression {
                 func == target || args.iter().any(|a| a.contains_function(target))
             }
             Expression::Map(entries) => entries.iter().any(|(_, v)| v.contains_function(target)),
+            Expression::ListComprehension {
+                list, filter, map, ..
+            } => {
+                list.contains_function(target)
+                    || filter.as_ref().is_some_and(|f| f.contains_function(target))
+                    || map.as_ref().is_some_and(|m| m.contains_function(target))
+            }
+            Expression::Reduce {
+                init, list, body, ..
+            } => {
+                init.contains_function(target)
+                    || list.contains_function(target)
+                    || body.contains_function(target)
+            }
+            Expression::ListPredicate {
+                list, predicate, ..
+            } => list.contains_function(target) || predicate.contains_function(target),
+            Expression::Member { target: t, .. } => t.contains_function(target),
             Expression::Exists { patterns, .. } => {
                 patterns.iter().any(|p| p.contains_function(target))
             }
@@ -102,6 +218,62 @@ impl PartialEq for Expression {
                 f1 == f2 && a1 == a2
             }
             (Expression::Map(a), Expression::Map(b)) => a == b,
+            (
+                Expression::ListComprehension {
+                    var: v1,
+                    list: l1,
+                    filter: f1,
+                    map: m1,
+                },
+                Expression::ListComprehension {
+                    var: v2,
+                    list: l2,
+                    filter: f2,
+                    map: m2,
+                },
+            ) => v1 == v2 && l1 == l2 && f1 == f2 && m1 == m2,
+            (
+                Expression::Reduce {
+                    acc: a1,
+                    init: i1,
+                    var: v1,
+                    list: l1,
+                    body: b1,
+                },
+                Expression::Reduce {
+                    acc: a2,
+                    init: i2,
+                    var: v2,
+                    list: l2,
+                    body: b2,
+                },
+            ) => a1 == a2 && i1 == i2 && v1 == v2 && l1 == l2 && b1 == b2,
+            (
+                Expression::ListPredicate {
+                    kind: k1,
+                    var: v1,
+                    list: l1,
+                    predicate: p1,
+                },
+                Expression::ListPredicate {
+                    kind: k2,
+                    var: v2,
+                    list: l2,
+                    predicate: p2,
+                },
+            ) => k1 == k2 && v1 == v2 && l1 == l2 && p1 == p2,
+            (
+                Expression::Member {
+                    target: t1,
+                    key: k1,
+                    predicate_iri: p1,
+                },
+                Expression::Member {
+                    target: t2,
+                    key: k2,
+                    predicate_iri: p2,
+                },
+            ) => t1 == t2 && k1 == k2 && p1 == p2,
             (Expression::Exists { .. }, Expression::Exists { .. }) => false,
             _ => false,
         }
@@ -260,6 +432,53 @@ impl Expression {
                 .iter()
                 .flat_map(|(_, v)| v.referenced_vars())
                 .collect(),
+            // The loop/acc variables are bound internally — exclude them, but
+            // keep the free vars referenced by the list and the scoped bodies.
+            Expression::ListComprehension {
+                var,
+                list,
+                filter,
+                map,
+            } => {
+                let mut vars = list.referenced_vars();
+                let mut inner = Vec::new();
+                if let Some(f) = filter {
+                    inner.extend(f.referenced_vars());
+                }
+                if let Some(m) = map {
+                    inner.extend(m.referenced_vars());
+                }
+                inner.retain(|x| x != var);
+                vars.extend(inner);
+                vars
+            }
+            Expression::Reduce {
+                acc,
+                init,
+                var,
+                list,
+                body,
+            } => {
+                let mut vars = init.referenced_vars();
+                vars.extend(list.referenced_vars());
+                let mut inner = body.referenced_vars();
+                inner.retain(|x| x != acc && x != var);
+                vars.extend(inner);
+                vars
+            }
+            Expression::ListPredicate {
+                var,
+                list,
+                predicate,
+                ..
+            } => {
+                let mut vars = list.referenced_vars();
+                let mut inner = predicate.referenced_vars();
+                inner.retain(|x| x != var);
+                vars.extend(inner);
+                vars
+            }
+            Expression::Member { target, .. } => target.referenced_vars(),
             Expression::Exists { patterns, .. } => {
                 patterns.iter().flat_map(Pattern::referenced_vars).collect()
             }
@@ -330,6 +549,10 @@ impl Expression {
             Expression::Var(_)
             | Expression::Const(_)
             | Expression::Map(_)
+            | Expression::ListComprehension { .. }
+            | Expression::Reduce { .. }
+            | Expression::ListPredicate { .. }
+            | Expression::Member { .. }
             | Expression::Exists { .. } => false,
         }
     }

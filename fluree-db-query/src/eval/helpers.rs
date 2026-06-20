@@ -263,6 +263,12 @@ fn bool_predicate_var_usage(expr: &Expression) -> VarUsage {
             }
             vars
         }
+        // Scoped iteration / member access aren't single-var bool predicates;
+        // mark Multiple so the single-var bool cache declines them (safe).
+        Expression::ListComprehension { .. }
+        | Expression::Reduce { .. }
+        | Expression::ListPredicate { .. }
+        | Expression::Member { .. } => VarUsage::Multiple,
     }
 }
 
@@ -348,7 +354,12 @@ fn analyze_bool_cache_inner(expr: &Expression, state: &mut impl Hasher) -> BoolC
                 may_materialize: false,
             }
         }
-        Expression::Exists { .. } | Expression::Map(_) => BoolCacheAnalysis {
+        Expression::Exists { .. }
+        | Expression::Map(_)
+        | Expression::ListComprehension { .. }
+        | Expression::Reduce { .. }
+        | Expression::ListPredicate { .. }
+        | Expression::Member { .. } => BoolCacheAnalysis {
             expr_hash: state.finish(),
             vars: VarUsage::None,
             supported: false,

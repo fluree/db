@@ -49,6 +49,53 @@ pub enum Expr {
     Map(Vec<(String, Expr)>, SourceSpan),
     /// `expr[index]` — list element access.
     Index(Box<Expr>, Box<Expr>, SourceSpan),
+    /// List comprehension `[var IN list WHERE filter | map]` (boxed — these
+    /// iteration variants are large and would otherwise bloat every `Expr`).
+    ListComprehension(Box<ListComprehensionExpr>),
+    /// `reduce(acc = init, var IN list | body)`.
+    Reduce(Box<ReduceExpr>),
+    /// List predicate `all/any/none/single(var IN list WHERE pred)`.
+    ListPredicate(Box<ListPredicateExpr>),
+}
+
+/// `[var IN list WHERE filter | map]`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ListComprehensionExpr {
+    pub var: Variable,
+    pub list: Box<Expr>,
+    pub filter: Option<Box<Expr>>,
+    pub map: Option<Box<Expr>>,
+    pub span: SourceSpan,
+}
+
+/// `reduce(acc = init, var IN list | body)`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ReduceExpr {
+    pub acc: Variable,
+    pub init: Box<Expr>,
+    pub var: Variable,
+    pub list: Box<Expr>,
+    pub body: Box<Expr>,
+    pub span: SourceSpan,
+}
+
+/// `all/any/none/single(var IN list WHERE pred)`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ListPredicateExpr {
+    pub kind: ListPredicateKind,
+    pub var: Variable,
+    pub list: Box<Expr>,
+    pub predicate: Box<Expr>,
+    pub span: SourceSpan,
+}
+
+/// Which quantifier a list-predicate expression applies.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ListPredicateKind {
+    All,
+    Any,
+    None,
+    Single,
 }
 
 impl Expr {
@@ -70,6 +117,9 @@ impl Expr {
             | Expr::List(_, s)
             | Expr::Map(_, s)
             | Expr::Index(_, _, s) => *s,
+            Expr::ListComprehension(c) => c.span,
+            Expr::Reduce(r) => r.span,
+            Expr::ListPredicate(p) => p.span,
             Expr::Call(c) => c.span,
             Expr::Case(c) => c.span,
         }

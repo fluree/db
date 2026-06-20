@@ -766,6 +766,12 @@ impl<'a> CypherLowering<'a> {
             Expr::Map(_, _) => Err(LowerCypherError::unsupported(
                 "map literals in a write MATCH WHERE are not supported",
             )),
+            Expr::ListComprehension(_) | Expr::Reduce(_) | Expr::ListPredicate(_) => {
+                Err(LowerCypherError::unsupported(
+                    "list comprehensions / reduce / list predicates in a write MATCH WHERE are \
+                     deferred",
+                ))
+            }
             Expr::Case(_) | Expr::Exists(_, _, _) => Err(LowerCypherError::unsupported(
                 "CASE and EXISTS in write MATCH WHERE are deferred",
             )),

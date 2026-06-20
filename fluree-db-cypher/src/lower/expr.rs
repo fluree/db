@@ -1,11 +1,14 @@
 //! Expression lowering — Cypher Expr → fluree-db-query Expression.
 
+use std::sync::Arc;
+
 use fluree_db_core::FlakeValue;
+use fluree_db_query::ir::expression::ListPredicateKind as IrListPredicateKind;
 use fluree_db_query::ir::{Expression, Function, Pattern, Ref, Term, TriplePattern};
 use fluree_db_query::parse::encode::IriEncoder;
 use fluree_db_query::var_registry::VarId;
 
-use crate::ast::{BinOp, CaseExpr, Expr, Literal, ParamRef, UnaryOp};
+use crate::ast::{BinOp, CaseExpr, Expr, ListPredicateKind, Literal, ParamRef, UnaryOp};
 
 use super::context::LoweringContext;
 use super::pattern::lower_pattern;
@@ -28,6 +31,21 @@ pub fn lower_expr<E: IriEncoder>(
             "parameter substitution is wired at the API layer, not the lowering layer; submit pre-substituted Cypher in v1",
         )),
         Expr::Prop(target, key, _) => {
+            // Property access on a loop-local (a comprehension / reduce variable)
+            // can't be a graph-join pattern — lower to eval-time member access.
+            // Carry both the bare key (map lookup) and the resolved predicate IRI
+            // (node-property scan); the IRI needs the vocab, known only here.
+            if let Expr::Var(v) = target.as_ref() {
+                if ctx.is_local(&v.name) {
+                    let target_expr = lower_expr(ctx, target, aux)?;
+                    let predicate_iri = ctx.resolve_predicate(key)?;
+                    return Ok(Expression::Member {
+                        target: Box::new(target_expr),
+                        key: Arc::from(key.as_str()),
+                        predicate_iri: Arc::from(predicate_iri.as_str()),
+                    });
+                }
+            }
             // Temporal accessor (`<date>.month`, `<datetime>.year`, …): when
             // the target is a *value* expression — e.g. another property
             // access `friend.birthday` — rather than a bare node variable,
@@ -161,6 +179,62 @@ pub fn lower_expr<E: IriEncoder>(
             let index = lower_expr(ctx, index, aux)?;
             Ok(Expression::call(Function::ListIndex, vec![list, index]))
         }
+        // List-iteration forms: lower the list (outer scope), then a fresh
+        // loop-local scope for the body so the body's `var` resolves to a
+        // synthetic id (and `var.prop` becomes member access).
+        Expr::ListComprehension(c) => {
+            let list_expr = Box::new(lower_expr(ctx, &c.list, aux)?);
+            ctx.enter_scope();
+            let loop_var = ctx.bind_local(&c.var.name);
+            let filter_expr = c
+                .filter
+                .as_ref()
+                .map(|f| lower_expr(ctx, f, aux))
+                .transpose()?
+                .map(Box::new);
+            let map_expr = c
+                .map
+                .as_ref()
+                .map(|m| lower_expr(ctx, m, aux))
+                .transpose()?
+                .map(Box::new);
+            ctx.exit_scope();
+            Ok(Expression::ListComprehension {
+                var: loop_var,
+                list: list_expr,
+                filter: filter_expr,
+                map: map_expr,
+            })
+        }
+        Expr::Reduce(r) => {
+            let init_expr = Box::new(lower_expr(ctx, &r.init, aux)?);
+            let list_expr = Box::new(lower_expr(ctx, &r.list, aux)?);
+            ctx.enter_scope();
+            let acc_var = ctx.bind_local(&r.acc.name);
+            let loop_var = ctx.bind_local(&r.var.name);
+            let body_expr = Box::new(lower_expr(ctx, &r.body, aux)?);
+            ctx.exit_scope();
+            Ok(Expression::Reduce {
+                acc: acc_var,
+                init: init_expr,
+                var: loop_var,
+                list: list_expr,
+                body: body_expr,
+            })
+        }
+        Expr::ListPredicate(pred) => {
+            let list_expr = Box::new(lower_expr(ctx, &pred.list, aux)?);
+            ctx.enter_scope();
+            let loop_var = ctx.bind_local(&pred.var.name);
+            let pred_expr = Box::new(lower_expr(ctx, &pred.predicate, aux)?);
+            ctx.exit_scope();
+            Ok(Expression::ListPredicate {
+                kind: lower_list_predicate_kind(pred.kind),
+                var: loop_var,
+                list: list_expr,
+                predicate: pred_expr,
+            })
+        }
         Expr::Call(call) => {
             let name = call.name.to_ascii_lowercase();
             let args: std::result::Result<Vec<_>, _> =
@@ -210,6 +284,16 @@ pub fn lower_expr<E: IriEncoder>(
             };
             Ok(Expression::call(func, args))
         }
+    }
+}
+
+/// Map the Cypher list-predicate kind to the query IR kind.
+fn lower_list_predicate_kind(kind: ListPredicateKind) -> IrListPredicateKind {
+    match kind {
+        ListPredicateKind::All => IrListPredicateKind::All,
+        ListPredicateKind::Any => IrListPredicateKind::Any,
+        ListPredicateKind::None => IrListPredicateKind::None,
+        ListPredicateKind::Single => IrListPredicateKind::Single,
     }
 }
 

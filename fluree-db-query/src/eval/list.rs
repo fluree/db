@@ -38,7 +38,7 @@ fn resolve_arg_binding<R: RowAccess>(
 /// Convert a list element binding to a comparable scalar (for `head`/`last`).
 /// Collect materializes elements, so they are decoded literals / refs; a
 /// non-scalar element (e.g. a nested list) yields `None`.
-fn element_to_comparable(b: &Binding) -> Option<ComparableValue> {
+pub(crate) fn element_to_comparable(b: &Binding) -> Option<ComparableValue> {
     match b {
         Binding::Lit { val, .. } => ComparableValue::try_from(val).ok(),
         Binding::Sid { sid, .. } => Some(ComparableValue::Sid(sid.clone())),

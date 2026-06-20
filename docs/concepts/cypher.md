@@ -234,6 +234,16 @@ ORDER BY / SKIP / LIMIT
   counts from the end (`list[-1]` is the last element). Out-of-range,
   non-integer index, or non-list yields null. An indexed element that is
   itself a node ref correlates downstream (`WITH pair[0] AS x ... x.name`).
+- **List iteration** — list comprehensions `[x IN list WHERE pred | expr]`,
+  `reduce(acc = init, x IN list | expr)`, and the list predicates
+  `all/any/none/single(x IN list WHERE pred)`. The loop variable is scoped to
+  the body and bound per element via a shared overlay; **property access on it
+  works** (`[x IN nodes(p) | x.name]`, `[row IN $people | row.email]`,
+  `reduce(s = 0, x IN xs | s + x.score)`) — a map element looks the key up, a
+  node element scans the property at eval time. The list position may aggregate
+  (`[x IN collect(p) | x.name]`). A null / non-list input yields null (not an
+  empty list); empty-list identities are `all`/`none` = true, `any`/`single` =
+  false. (Write-side `MATCH … WHERE` doesn't yet accept these.)
 - Metadata functions: `labels(n)` returns the node's Cypher label strings
   (from live `rdf:type` assertions, overlay-aware); `type(r)` returns the
   relationship type string for a named relationship variable (from

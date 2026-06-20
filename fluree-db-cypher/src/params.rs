@@ -395,6 +395,24 @@ fn collect_alias_in_expr(e: &Expr, alias: &str, fields: &mut Vec<String>, bare: 
                 collect_alias_in_expr(v, alias, fields, bare);
             }
         }
+        Expr::ListComprehension(c) => {
+            collect_alias_in_expr(&c.list, alias, fields, bare);
+            if let Some(f) = &c.filter {
+                collect_alias_in_expr(f, alias, fields, bare);
+            }
+            if let Some(m) = &c.map {
+                collect_alias_in_expr(m, alias, fields, bare);
+            }
+        }
+        Expr::Reduce(r) => {
+            collect_alias_in_expr(&r.init, alias, fields, bare);
+            collect_alias_in_expr(&r.list, alias, fields, bare);
+            collect_alias_in_expr(&r.body, alias, fields, bare);
+        }
+        Expr::ListPredicate(p) => {
+            collect_alias_in_expr(&p.list, alias, fields, bare);
+            collect_alias_in_expr(&p.predicate, alias, fields, bare);
+        }
         Expr::Lit(_) | Expr::Param(_) | Expr::Case(_) | Expr::Exists(_, _, _) => {}
     }
 }
@@ -536,6 +554,24 @@ fn rewrite_alias_in_expr_to_var<F: Fn(&str) -> String>(
                 rewrite_alias_in_expr_to_var(v, alias, col_var, bare_var);
             }
         }
+        Expr::ListComprehension(c) => {
+            rewrite_alias_in_expr_to_var(&mut c.list, alias, col_var, bare_var);
+            if let Some(f) = &mut c.filter {
+                rewrite_alias_in_expr_to_var(f, alias, col_var, bare_var);
+            }
+            if let Some(m) = &mut c.map {
+                rewrite_alias_in_expr_to_var(m, alias, col_var, bare_var);
+            }
+        }
+        Expr::Reduce(r) => {
+            rewrite_alias_in_expr_to_var(&mut r.init, alias, col_var, bare_var);
+            rewrite_alias_in_expr_to_var(&mut r.list, alias, col_var, bare_var);
+            rewrite_alias_in_expr_to_var(&mut r.body, alias, col_var, bare_var);
+        }
+        Expr::ListPredicate(p) => {
+            rewrite_alias_in_expr_to_var(&mut p.list, alias, col_var, bare_var);
+            rewrite_alias_in_expr_to_var(&mut p.predicate, alias, col_var, bare_var);
+        }
         Expr::Var(_) | Expr::Lit(_) | Expr::Param(_) | Expr::Case(_) | Expr::Exists(_, _, _) => {}
     }
 }
@@ -653,6 +689,25 @@ fn replace_alias_in_expr(
                 replace_alias_in_expr(v, alias, elem, pname)?;
             }
             Ok(())
+        }
+        Expr::ListComprehension(c) => {
+            replace_alias_in_expr(&mut c.list, alias, elem, pname)?;
+            if let Some(f) = &mut c.filter {
+                replace_alias_in_expr(f, alias, elem, pname)?;
+            }
+            if let Some(m) = &mut c.map {
+                replace_alias_in_expr(m, alias, elem, pname)?;
+            }
+            Ok(())
+        }
+        Expr::Reduce(r) => {
+            replace_alias_in_expr(&mut r.init, alias, elem, pname)?;
+            replace_alias_in_expr(&mut r.list, alias, elem, pname)?;
+            replace_alias_in_expr(&mut r.body, alias, elem, pname)
+        }
+        Expr::ListPredicate(p) => {
+            replace_alias_in_expr(&mut p.list, alias, elem, pname)?;
+            replace_alias_in_expr(&mut p.predicate, alias, elem, pname)
         }
         Expr::Case(_) | Expr::Exists(_, _, _) | Expr::Var(_) | Expr::Lit(_) | Expr::Param(_) => {
             Ok(())
@@ -894,6 +949,25 @@ fn subst_expr(e: &mut Expr, p: &ParamMap) -> Result<(), ParamError> {
             }
             Ok(())
         }
+        Expr::ListComprehension(c) => {
+            subst_expr(&mut c.list, p)?;
+            if let Some(f) = &mut c.filter {
+                subst_expr(f, p)?;
+            }
+            if let Some(m) = &mut c.map {
+                subst_expr(m, p)?;
+            }
+            Ok(())
+        }
+        Expr::Reduce(r) => {
+            subst_expr(&mut r.init, p)?;
+            subst_expr(&mut r.list, p)?;
+            subst_expr(&mut r.body, p)
+        }
+        Expr::ListPredicate(pr) => {
+            subst_expr(&mut pr.list, p)?;
+            subst_expr(&mut pr.predicate, p)
+        }
         Expr::Var(_) | Expr::Lit(_) => Ok(()),
     }
 }
@@ -934,13 +1008,11 @@ fn json_to_expr(v: &JsonValue, name: &str, span: SourceSpan) -> Result<Expr, Par
             }
         }
         JsonValue::Array(items) => {
+            // Elements recurse — a list of maps (`$people = [{…}, {…}]`, used by
+            // `[row IN $people | row.x]`) and nested lists are first-class now
+            // that map/list values exist.
             let mut out = Vec::with_capacity(items.len());
             for it in items {
-                if it.is_array() || it.is_object() {
-                    return Err(unsupported(
-                        "nested arrays/objects inside a list parameter are not supported in v1",
-                    ));
-                }
                 out.push(json_to_expr(it, name, span)?);
             }
             Expr::List(out, span)

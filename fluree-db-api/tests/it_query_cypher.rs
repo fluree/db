@@ -1724,6 +1724,188 @@ async fn cypher_map_literal_projection_renders_native_object() {
     );
 }
 
+/// Run a Cypher read against a single seeded Person and return the first row's
+/// columns as cypher-json native values.
+async fn cypher_row(
+    fluree: &support::MemoryFluree,
+    l: &support::MemoryLedger,
+    q: &str,
+) -> JsonValue {
+    let db = graphdb_from_ledger(l);
+    fluree
+        .query_cypher(&db, q)
+        .await
+        .expect("query")
+        .to_cypher_json_async(db.as_graph_db_ref())
+        .await
+        .expect("cypher json")["results"][0]["data"][0]["row"]
+        .clone()
+}
+
+#[tokio::test]
+async fn cypher_list_comprehension_arithmetic_and_filter() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = genesis_ledger(&fluree, "it/cypher:listcomp");
+    let l = fluree
+        .transact_cypher(l, r#"CREATE (p:Person {name: "Alice"})"#)
+        .await
+        .expect("seed")
+        .ledger;
+    // map projection, WHERE filter, and both together.
+    let row = cypher_row(
+        &fluree,
+        &l,
+        r#"MATCH (p:Person)
+           RETURN [x IN range(1, 4) | x * 2] AS doubled,
+                  [x IN range(1, 6) WHERE x % 2 = 0] AS evens,
+                  [x IN range(1, 5) WHERE x > 2 | x * 10] AS big"#,
+    )
+    .await;
+    assert_eq!(row[0], json!([2, 4, 6, 8]), "map: {row}");
+    assert_eq!(row[1], json!([2, 4, 6]), "filter: {row}");
+    assert_eq!(row[2], json!([30, 40, 50]), "filter+map: {row}");
+}
+
+#[tokio::test]
+async fn cypher_reduce_folds_a_list() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = genesis_ledger(&fluree, "it/cypher:reduce");
+    let l = fluree
+        .transact_cypher(l, r#"CREATE (p:Person {name: "Alice"})"#)
+        .await
+        .expect("seed")
+        .ledger;
+    let row = cypher_row(
+        &fluree,
+        &l,
+        r#"MATCH (p:Person)
+           RETURN reduce(s = 0, x IN range(1, 4) | s + x) AS total,
+                  reduce(s = 1, x IN [2, 3, 4] | s * x) AS product"#,
+    )
+    .await;
+    assert_eq!(row[0], json!(10), "sum 1..4: {row}");
+    assert_eq!(row[1], json!(24), "product: {row}");
+}
+
+#[tokio::test]
+async fn cypher_list_predicates() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = genesis_ledger(&fluree, "it/cypher:listpred");
+    let l = fluree
+        .transact_cypher(l, r#"CREATE (p:Person {name: "Alice"})"#)
+        .await
+        .expect("seed")
+        .ledger;
+    let row = cypher_row(
+        &fluree,
+        &l,
+        r#"MATCH (p:Person)
+           RETURN all(x IN [2, 4, 6] WHERE x % 2 = 0) AS allEven,
+                  any(x IN [1, 2, 3] WHERE x > 2) AS anyBig,
+                  none(x IN [1, 2, 3] WHERE x > 5) AS noneBig,
+                  single(x IN [1, 2, 3] WHERE x = 2) AS oneTwo,
+                  all(x IN [] WHERE x > 0) AS emptyAll,
+                  any(x IN [] WHERE x > 0) AS emptyAny"#,
+    )
+    .await;
+    assert_eq!(row[0], json!(true), "all even: {row}");
+    assert_eq!(row[1], json!(true), "any > 2: {row}");
+    assert_eq!(row[2], json!(true), "none > 5: {row}");
+    assert_eq!(row[3], json!(true), "single = 2: {row}");
+    assert_eq!(row[4], json!(true), "empty all = true: {row}");
+    assert_eq!(row[5], json!(false), "empty any = false: {row}");
+}
+
+#[tokio::test]
+async fn cypher_comprehension_member_access_map_param() {
+    // Loop-local member access on a map element ($people is a list of maps).
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = genesis_ledger(&fluree, "it/cypher:listcomp-map");
+    let l = fluree
+        .transact_cypher(l, r#"CREATE (p:Person {name: "Alice"})"#)
+        .await
+        .expect("seed")
+        .ledger;
+    let db = graphdb_from_ledger(&l);
+    let params: fluree_db_cypher::ParamMap = serde_json::from_value(json!({
+        "people": [{"name": "Bob", "age": 30}, {"name": "Carol", "age": 40}]
+    }))
+    .expect("params");
+    let cj = fluree
+        .query_cypher_with_params(
+            &db,
+            r#"MATCH (p:Person)
+               RETURN [row IN $people | row.name] AS names,
+                      [row IN $people WHERE row.age > 35 | row.name] AS older"#,
+            Some(&params),
+        )
+        .await
+        .expect("query")
+        .to_cypher_json_async(db.as_graph_db_ref())
+        .await
+        .expect("cypher json");
+    let row = &cj["results"][0]["data"][0]["row"];
+    assert_eq!(row[0], json!(["Bob", "Carol"]), "map member access: {cj}");
+    assert_eq!(row[1], json!(["Carol"]), "filter on map member: {cj}");
+}
+
+#[tokio::test]
+async fn cypher_comprehension_member_access_node() {
+    // Loop-local member access on a node element (collect → list of nodes).
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = genesis_ledger(&fluree, "it/cypher:listcomp-node");
+    let l = fluree
+        .transact_cypher(
+            l,
+            r#"CREATE (a:Person {name: "Alice", age: 30}),
+                      (b:Person {name: "Bob", age: 40})"#,
+        )
+        .await
+        .expect("seed")
+        .ledger;
+    let names = cypher_row(
+        &fluree,
+        &l,
+        r#"MATCH (p:Person)
+           RETURN [x IN collect(p) | x.name] AS names"#,
+    )
+    .await;
+    // Order follows collect(); compare as a set.
+    let mut got: Vec<String> = serde_json::from_value(names[0].clone()).expect("list of names");
+    got.sort();
+    assert_eq!(
+        got,
+        vec!["Alice".to_string(), "Bob".to_string()],
+        "node member: {names}"
+    );
+}
+
+#[tokio::test]
+async fn cypher_comprehension_null_and_nonlist_input() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = genesis_ledger(&fluree, "it/cypher:listcomp-null");
+    let l = fluree
+        .transact_cypher(l, r#"CREATE (p:Person {name: "Alice"})"#)
+        .await
+        .expect("seed")
+        .ledger;
+    // A non-existent property is null → comprehension over null is null (not []).
+    let row = cypher_row(
+        &fluree,
+        &l,
+        r#"MATCH (p:Person)
+           RETURN [x IN p.missingList | x] AS over_null,
+                  any(x IN p.missingList WHERE x > 0) AS any_null"#,
+    )
+    .await;
+    assert_eq!(
+        row[0],
+        json!(null),
+        "comprehension over null is null: {row}"
+    );
+    assert_eq!(row[1], json!(null), "predicate over null is null: {row}");
+}
+
 #[tokio::test]
 async fn cypher_scalar_string_and_math_functions() {
     // The clean 1:1 scalar mappings: toUpper/toLower (string), round/floor/ceil
