@@ -644,7 +644,8 @@ async fn seed_receipt_line_items_jsonld(fluree: &MemoryFluree, ledger_id: &str) 
 async fn aggregates_arithmetic_over_min_max_jsonld() {
     // JSON-LD equivalent of the SPARQL
     //   SELECT ?part ((MAX(?u) - MIN(?u)) AS ?spread) GROUP BY ?part
-    // which currently fails on the SPARQL side.
+    // The compound aggregate is computed directly: inner MAX/MIN are hoisted
+    // and the surrounding arithmetic runs as a post-aggregation bind.
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger = seed_receipt_line_items_jsonld(&fluree, "query/agg-spread-jsonld:main").await;
     let ctx = json!({
