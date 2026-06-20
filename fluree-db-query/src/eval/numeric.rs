@@ -99,12 +99,15 @@ pub fn eval_rand(args: &[Expression]) -> Result<Option<ComparableValue>> {
 }
 
 /// Coerce a numeric `ComparableValue` to `f64` for transcendental math.
-/// Decimal / BigInt go through their string form to avoid a `ToPrimitive`
-/// import; these calls are rare. Returns `None` for non-numeric values.
+/// Normalizes a string-backed `TypedLiteral` (e.g. `xsd:float(...)`) through
+/// the canonical numeric-coercion layer first, so those reach the math
+/// functions as real numbers instead of collapsing to null. Decimal / BigInt go
+/// through their string form to avoid a `ToPrimitive` import; these calls are
+/// rare. Returns `None` for non-numeric values.
 fn numeric_f64(v: &ComparableValue) -> Option<f64> {
-    match v {
-        ComparableValue::Long(n) => Some(*n as f64),
-        ComparableValue::Double(d) => Some(*d),
+    match v.clone().coerce_numeric_operand() {
+        ComparableValue::Long(n) => Some(n as f64),
+        ComparableValue::Double(d) => Some(d),
         ComparableValue::Decimal(d) => d.to_string().parse().ok(),
         ComparableValue::BigInt(n) => n.to_string().parse().ok(),
         _ => None,
@@ -172,5 +175,49 @@ pub fn eval_pow<R: RowAccess>(
             _ => Ok(None),
         },
         _ => Ok(None),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::binding::Batch;
+    use crate::ir::Function;
+    use fluree_db_core::FlakeValue;
+
+    fn empty_row_batch() -> Batch {
+        // A single row with an empty schema — enough to evaluate Const-only args.
+        Batch::empty_schema_with_len(1)
+    }
+
+    /// `xsd:float(...)` yields a string-backed `TypedLiteral`; the math functions
+    /// must coerce it numerically rather than return null. Regression for the
+    /// `numeric_f64` coercion fix.
+    #[test]
+    fn math_functions_coerce_xsd_float_typed_literal() {
+        let batch = empty_row_batch();
+        let row = batch.row_view(0).unwrap();
+        let xsd_float = |s: &str| {
+            Expression::call(
+                Function::XsdFloat,
+                vec![Expression::Const(FlakeValue::String(s.to_string()))],
+            )
+        };
+
+        let sq = eval_sqrt(&[xsd_float("16.0")], &row, None).unwrap();
+        assert_eq!(sq, Some(ComparableValue::Double(4.0)), "sqrt(xsd:float)");
+
+        let sg = eval_sign(&[xsd_float("-3.5")], &row, None).unwrap();
+        assert_eq!(sg, Some(ComparableValue::Long(-1)), "sign(xsd:float)");
+
+        let ln = eval_ln(&[xsd_float("1.0")], &row, None).unwrap();
+        assert_eq!(ln, Some(ComparableValue::Double(0.0)), "log(xsd:float)");
+
+        let pw = eval_pow(&[xsd_float("16.0"), xsd_float("0.5")], &row, None).unwrap();
+        assert_eq!(
+            pw,
+            Some(ComparableValue::Double(4.0)),
+            "xsd:float ^ xsd:float"
+        );
     }
 }
