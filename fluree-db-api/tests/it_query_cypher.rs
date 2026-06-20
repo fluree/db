@@ -4164,6 +4164,35 @@ async fn cypher_relationships_of_path() {
 }
 
 #[tokio::test]
+async fn cypher_relationships_incoming_direction() {
+    // relationships(p) must report the STORED edge direction, not traversal
+    // order. For an incoming path `(b)<-[:KNOWS]-(a)` the edge is a→b, so the
+    // relationship's startNode is `a` even though `b` is the path's first node.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = seed_knows_chain(&fluree, "it/cypher:rels-incoming").await;
+    let db = graphdb_from_ledger(&l);
+
+    let cj = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH p = (b:Person {name: "Bob"})<-[:KNOWS*1..1]-(a:Person)
+               RETURN startNode(relationships(p)[0]) AS s, endNode(relationships(p)[0]) AS e,
+                      a AS aa, b AS bb"#,
+        )
+        .await
+        .expect("incoming path relationships")
+        .to_cypher_json_async(db.as_graph_db_ref())
+        .await
+        .expect("cypher json");
+    let row = &cj["results"][0]["data"][0]["row"];
+    assert_eq!(
+        row[0], row[2],
+        "edge start is a (Alice), not the path's first node: {cj}"
+    );
+    assert_eq!(row[1], row[3], "edge end is b (Bob): {cj}");
+}
+
+#[tokio::test]
 async fn cypher_var_length_rel_and_path_binding() {
     // Bounded var-length: bind a relationship variable as a rel list and a path
     // variable. Alice -> Bob -> Carol -> Dave.

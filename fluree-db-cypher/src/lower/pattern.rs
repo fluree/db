@@ -476,7 +476,7 @@ fn lower_var_length_rel<E: IriEncoder>(
                     if let Some(pv) = path_var_id {
                         chain.push(Pattern::Bind {
                             var: pv,
-                            expr: build_path_expr(&nodes, pred)?,
+                            expr: build_path_expr(&nodes, pred, rel.direction)?,
                         });
                     }
                 }
@@ -643,10 +643,17 @@ fn build_rel_list_expr(
     Ok(Expression::call(Function::MakeList, rels))
 }
 
-/// Build `MakePath(pred, node0, …, nodeN)` over a fixed chain's nodes (traversal
-/// order, every hop using `pred`).
-fn build_path_expr(nodes: &[Ref], pred_sid: &fluree_db_core::Sid) -> Result<Expression> {
-    let mut args = Vec::with_capacity(nodes.len() + 1);
+/// Build `MakePath(Const(Bool(forward)), pred, node0, …, nodeN)` over a fixed
+/// chain's nodes (traversal order). `forward` orients each hop's edge: `Outgoing`
+/// keeps node[i]→node[i+1]; `Incoming` flips to the stored edge.
+fn build_path_expr(
+    nodes: &[Ref],
+    pred_sid: &fluree_db_core::Sid,
+    direction: Direction,
+) -> Result<Expression> {
+    let forward = !matches!(direction, Direction::Incoming);
+    let mut args = Vec::with_capacity(nodes.len() + 2);
+    args.push(Expression::Const(FlakeValue::Boolean(forward)));
     args.push(Expression::Const(FlakeValue::Ref(pred_sid.clone())));
     for n in nodes {
         match ref_to_expr(n) {

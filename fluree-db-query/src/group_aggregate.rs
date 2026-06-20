@@ -493,17 +493,25 @@ pub(crate) fn binding_to_group_key_owned(binding: &Binding) -> GroupKeyOwned {
                 .collect(),
         ),
         // A relationship groups per (start, predicate, end) identity.
+        // Relationship identity (matches PartialEq/Hash): the reifier when
+        // present, else (start, predicate, end). The single-vs-triple length
+        // keeps the two cases distinct.
         Binding::Rel {
             start,
             predicate,
             end,
-            ..
-        } => GroupKeyOwned::Seq(
-            [start, predicate, end]
-                .iter()
-                .map(|sid| GroupKeyOwned::MaterializedSid(sid.namespace_code, sid.name.clone()))
-                .collect(),
-        ),
+            reifier,
+        } => {
+            let sids: Vec<&Sid> = match reifier {
+                Some(r) => vec![r],
+                None => vec![start, predicate, end],
+            };
+            GroupKeyOwned::Seq(
+                sids.into_iter()
+                    .map(|sid| GroupKeyOwned::MaterializedSid(sid.namespace_code, sid.name.clone()))
+                    .collect(),
+            )
+        }
         Binding::List(items) => {
             GroupKeyOwned::Seq(items.iter().map(binding_to_group_key_owned).collect())
         }

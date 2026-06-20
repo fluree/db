@@ -181,10 +181,15 @@ pub enum Binding {
     ///   consumed by path functions (`length`, `nodes`, `relationships`) and
     ///   rendered as a JSON array of node IRIs at projection time.
     ///
-    /// `preds` holds the predicate SID of each hop, so `relationships(p)` can
-    /// reconstruct relationship values; `preds.len() == nodes.len().saturating_sub(1)`.
-    /// For a single-typed path every entry is the same predicate.
-    Path { nodes: Vec<Sid>, preds: Vec<Sid> },
+    /// `nodes` is the traversal order (what `nodes(p)` returns). `edges` holds
+    /// each hop's relationship as an oriented `(start, predicate, end)` — already
+    /// flipped to the STORED edge direction, so `relationships(p)` is correct for
+    /// incoming/undirected traversals (where the edge start is `nodes[i+1]`, not
+    /// `nodes[i]`). `edges.len() == nodes.len().saturating_sub(1)`.
+    Path {
+        nodes: Vec<Sid>,
+        edges: Vec<(Sid, Sid, Sid)>,
+    },
 
     /// Relationship value (a directed edge with a type).
     ///
@@ -924,27 +929,35 @@ impl PartialEq for Binding {
             (
                 Binding::Path {
                     nodes: an,
-                    preds: ap,
+                    edges: ae,
                 },
                 Binding::Path {
                     nodes: bn,
-                    preds: bp,
+                    edges: be,
                 },
-            ) => an == bn && ap == bp,
+            ) => an == bn && ae == be,
+            // Relationship identity: a reified edge is identified by its reifier
+            // (so parallel relationships are distinct occurrences); a plain edge
+            // (no reifier) by its (start, predicate, end). Eq and Hash MUST agree
+            // on this — see `hash_binding`'s Rel arm.
             (
                 Binding::Rel {
                     start: a_s,
                     predicate: a_p,
                     end: a_e,
-                    ..
+                    reifier: a_r,
                 },
                 Binding::Rel {
                     start: b_s,
                     predicate: b_p,
                     end: b_e,
-                    ..
+                    reifier: b_r,
                 },
-            ) => a_s == b_s && a_p == b_p && a_e == b_e,
+            ) => match (a_r, b_r) {
+                (Some(x), Some(y)) => x == y,
+                (None, None) => a_s == b_s && a_p == b_p && a_e == b_e,
+                _ => false,
+            },
             (Binding::List(a), Binding::List(b)) => a == b,
             // Map identity is key-order-insensitive (a map equals a map with the
             // same entries in any order); display order is preserved separately.
@@ -1046,14 +1059,16 @@ impl std::hash::Hash for Binding {
                     v.hash(state);
                 }
             }
-            Binding::Path { nodes, preds } => {
+            Binding::Path { nodes, edges } => {
                 9u8.hash(state);
                 nodes.len().hash(state);
                 for n in nodes {
                     n.hash(state);
                 }
-                for p in preds {
+                for (s, p, e) in edges {
+                    s.hash(state);
                     p.hash(state);
+                    e.hash(state);
                 }
             }
             Binding::Rel {
@@ -1063,10 +1078,22 @@ impl std::hash::Hash for Binding {
                 reifier,
             } => {
                 12u8.hash(state);
-                start.hash(state);
-                predicate.hash(state);
-                end.hash(state);
-                reifier.hash(state);
+                // Mirror PartialEq: hash the reifier when present, else the
+                // (start, predicate, end) triple. The 0/1 tag keeps the two
+                // cases from colliding (a Some-reifier rel is never == a plain
+                // rel, so it must not hash the same either).
+                match reifier {
+                    Some(r) => {
+                        1u8.hash(state);
+                        r.hash(state);
+                    }
+                    None => {
+                        0u8.hash(state);
+                        start.hash(state);
+                        predicate.hash(state);
+                        end.hash(state);
+                    }
+                }
             }
             Binding::List(values) => {
                 10u8.hash(state);

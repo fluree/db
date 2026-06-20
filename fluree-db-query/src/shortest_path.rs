@@ -591,12 +591,26 @@ impl ShortestPathOperator {
             let mut row: Vec<Binding> = Vec::with_capacity(self.in_schema.len());
             for var in self.in_schema.iter() {
                 if *var == self.pattern.path_var {
-                    // Single-typed path: every hop uses the pattern's predicate.
-                    let hops = path.len().saturating_sub(1);
-                    let preds = vec![self.pattern.predicate.clone(); hops];
+                    // Single-typed path. Orient each hop's edge by the traversal
+                    // direction: outgoing keeps node[i]→node[i+1]; incoming flips
+                    // to the stored edge node[i+1]→node[i]. For an undirected
+                    // (`Either`) search the per-hop orientation isn't recorded, so
+                    // we fall back to traversal order (best effort).
+                    let pred = self.pattern.predicate.clone();
+                    let incoming = matches!(self.pattern.direction, PathDirection::Incoming);
+                    let edges: Vec<(Sid, Sid, Sid)> = path
+                        .windows(2)
+                        .map(|w| {
+                            if incoming {
+                                (w[1].clone(), pred.clone(), w[0].clone())
+                            } else {
+                                (w[0].clone(), pred.clone(), w[1].clone())
+                            }
+                        })
+                        .collect();
                     row.push(Binding::Path {
                         nodes: path.clone(),
-                        preds,
+                        edges,
                     });
                 } else if let Some(col) = child_batch.column(*var) {
                     row.push(col[row_idx].clone());

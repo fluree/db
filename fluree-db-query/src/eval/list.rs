@@ -228,30 +228,42 @@ pub fn eval_list_fn_to_binding<R: RowAccess>(
             }
         }
         Function::MakePath => {
-            // MakePath(Const(Ref(pred)), node0, …, nodeN) → Path (every hop = pred).
-            if args.len() < 2 {
+            // MakePath(Const(Bool(forward)), Const(Ref(pred)), node0, …, nodeN)
+            // → Path. `forward` orients each hop's edge: true keeps node[i]→
+            // node[i+1]; false (incoming) flips to the stored edge.
+            if args.len() < 3 {
                 return Err(QueryError::InvalidFilter(
-                    "MakePath expects a predicate and at least one node".to_string(),
+                    "MakePath expects a direction flag, a predicate, and ≥1 node".to_string(),
                 ));
             }
             let Some(ctx) = ctx else {
                 return Ok(Some(Binding::Unbound));
             };
-            let Some(pred) = arg_to_sid(&args[0], row, ctx)? else {
+            let forward = matches!(
+                args[0].eval_to_comparable(row, Some(ctx))?,
+                Some(crate::eval::value::ComparableValue::Bool(true))
+            );
+            let Some(pred) = arg_to_sid(&args[1], row, ctx)? else {
                 return Ok(Some(Binding::Unbound));
             };
-            let mut nodes = Vec::with_capacity(args.len() - 1);
-            for a in &args[1..] {
+            let mut nodes = Vec::with_capacity(args.len() - 2);
+            for a in &args[2..] {
                 match arg_to_sid(a, row, ctx)? {
                     Some(sid) => nodes.push(sid),
                     None => return Ok(Some(Binding::Unbound)),
                 }
             }
-            let hops = nodes.len().saturating_sub(1);
-            Ok(Some(Binding::Path {
-                nodes,
-                preds: vec![pred; hops],
-            }))
+            let edges = nodes
+                .windows(2)
+                .map(|w| {
+                    if forward {
+                        (w[0].clone(), pred.clone(), w[1].clone())
+                    } else {
+                        (w[1].clone(), pred.clone(), w[0].clone())
+                    }
+                })
+                .collect();
+            Ok(Some(Binding::Path { nodes, edges }))
         }
         Function::Relationships => {
             // One relationship value per hop of a path: Rel(node[i], pred[i], node[i+1]).
@@ -260,14 +272,14 @@ pub fn eval_list_fn_to_binding<R: RowAccess>(
             // off the intrinsic fields.
             let arg = arity1(args, "relationships")?;
             match resolve_arg_binding(arg, row, ctx)? {
-                Some(Binding::Path { nodes, preds }) => {
-                    let rels = nodes
-                        .windows(2)
-                        .zip(preds.iter())
-                        .map(|(w, pred)| Binding::Rel {
-                            start: w[0].clone(),
-                            predicate: pred.clone(),
-                            end: w[1].clone(),
+                Some(Binding::Path { edges, .. }) => {
+                    // Edges are already oriented to the stored edge direction.
+                    let rels = edges
+                        .into_iter()
+                        .map(|(start, predicate, end)| Binding::Rel {
+                            start,
+                            predicate,
+                            end,
                             reifier: None,
                         })
                         .collect();
