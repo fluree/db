@@ -145,9 +145,7 @@ impl Drop for ClaimGuard {
                 .entry(key)
                 .and_compute_with(|maybe_entry| async move {
                     match maybe_entry {
-                        Some(entry)
-                            if matches!(entry.value().state, SubmissionState::InFlight) =>
-                        {
+                        Some(entry) if matches!(entry.value().state, SubmissionState::InFlight) => {
                             Op::Remove
                         }
                         _ => Op::Nop,

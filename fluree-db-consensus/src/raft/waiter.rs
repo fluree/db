@@ -69,6 +69,12 @@ pub enum AbortReason {
 /// here before the worker resolved) or a buffered outcome (the worker
 /// resolved before the proposer parked its waiter — the race the
 /// pre-buffer design fixes).
+///
+/// `Resolved` is boxed because [`WaiterOutcome`] (and the
+/// [`AppliedReceipt`] it carries) is several times larger than
+/// `Parked`; inlining it would force every entry in the slot map to
+/// occupy the worst-case variant size even when most slots are
+/// short-lived parked senders.
 enum WaiterSlot {
     /// Proposer parked first. The next `resolve_*` call sends through
     /// `sender` and removes the slot.
@@ -83,7 +89,7 @@ enum WaiterSlot {
     /// Buffered slots have no `ref_key` because the resolve already
     /// happened — there's no waiter for an admin clear to sweep, only
     /// a value to hand off to the eventual register.
-    Resolved(WaiterOutcome),
+    Resolved(Box<WaiterOutcome>),
 }
 
 /// Concurrent map from queue_id → parked waiter or buffered outcome.
@@ -138,7 +144,7 @@ impl WaiterMap {
                 if matches!(o.get(), WaiterSlot::Resolved(_)) {
                     // Pre-buffered outcome — deliver and remove.
                     if let WaiterSlot::Resolved(outcome) = o.remove() {
-                        let _ = sender.send(outcome);
+                        let _ = sender.send(*outcome);
                     }
                 } else {
                     // Duplicate register; the prior sender drops.
@@ -172,7 +178,7 @@ impl WaiterMap {
             Entry::Vacant(v) => {
                 // Race: resolve arrived before register. Buffer for
                 // late-arriving register.
-                v.insert(WaiterSlot::Resolved(outcome));
+                v.insert(WaiterSlot::Resolved(Box::new(outcome)));
             }
             Entry::Occupied(mut o) => {
                 if matches!(o.get(), WaiterSlot::Parked { .. }) {
@@ -185,7 +191,7 @@ impl WaiterMap {
                     // to one apply outcome) but is defended against
                     // here so a duplicate adapter call doesn't drop
                     // either outcome on the floor silently.
-                    *o.get_mut() = WaiterSlot::Resolved(outcome);
+                    *o.get_mut() = WaiterSlot::Resolved(Box::new(outcome));
                 }
             }
         }

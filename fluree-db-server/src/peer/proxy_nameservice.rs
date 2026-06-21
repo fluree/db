@@ -228,10 +228,7 @@ impl fluree_db_nameservice::GraphSourceLookup for ProxyNameService {
         Ok(None) // Proxy doesn't have local graph source records
     }
 
-    async fn lookup_any(
-        &self,
-        resource_id: &str,
-    ) -> Result<fluree_db_nameservice::NsLookupResult> {
+    async fn lookup_any(&self, resource_id: &str) -> Result<fluree_db_nameservice::NsLookupResult> {
         // Delegate to the ledger lookup endpoint. Graph-source
         // discovery isn't exposed through the storage proxy today,
         // so a non-ledger resource still reports NotFound — but a

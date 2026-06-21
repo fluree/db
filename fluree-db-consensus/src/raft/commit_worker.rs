@@ -322,9 +322,7 @@ impl CommitWorker {
             .content_store(&ledger_id)
             .get(&entry.request_cid)
             .await
-            .map_err(|e| {
-                WorkerError::Transient(format!("CAS read of request_cid failed: {e}"))
-            })?;
+            .map_err(|e| WorkerError::Transient(format!("CAS read of request_cid failed: {e}")))?;
         QueuedRequest::from_bytes(&bytes).map_err(|e| {
             stage(PoisonReason::BodyMalformed {
                 error: format!("QueuedRequest decode failed: {e}"),
