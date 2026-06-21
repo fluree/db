@@ -39,6 +39,7 @@ use axum::response::{IntoResponse, Response};
 use openraft::Raft;
 use std::net::IpAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 /// Hop-by-hop headers from RFC 7230 §6.1 plus a couple of modern
 /// additions. Stripped from both the outbound request and the
@@ -63,6 +64,17 @@ const HOP_BY_HOP_HEADERS: &[&str] = &[
 /// callers running larger imports should split the payload or address
 /// the leader directly.
 const MAX_FORWARDED_BODY_BYTES: usize = 64 * 1024 * 1024;
+
+/// Total per-request timeout for a forwarded call to the leader,
+/// from connect through response body read. Without this, a leader
+/// that accepts the connection but stalls (long GC pause, fsync
+/// stuck, network blackhole) pins the follower's forwarding task
+/// indefinitely with the buffered request body still resident —
+/// sustained client traffic against a frozen leader exhausts the
+/// follower's memory before any failover takes over. 60 s comfortably
+/// covers a 64 MiB body at modest throughput while bounding the
+/// resource footprint of a stuck leader.
+const FORWARD_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Header carrying the count of follower → leader hops a request
 /// has already accumulated. Each forwarder increments it; the next
@@ -289,15 +301,17 @@ fn incoming_hop_count(headers: &HeaderMap) -> u32 {
 // HTTP forwarding internals
 // ============================================================================
 
-/// Errors that can fall out of forwarding. All map to a 502 Bad
-/// Gateway when surfaced to the original client — the request was
-/// well-formed, the cluster just couldn't proxy it.
+/// Errors that can fall out of forwarding. Each maps to the HTTP
+/// status that best describes its failure mode for the original
+/// client.
 #[derive(Debug, thiserror::Error)]
 enum ForwardError {
     #[error("reading request body to forward: {0}")]
     ReadBody(axum::Error),
     #[error("sending forwarded request to leader: {0}")]
     Send(reqwest::Error),
+    #[error("forwarded request to leader timed out after {seconds}s", seconds = FORWARD_REQUEST_TIMEOUT.as_secs())]
+    Timeout,
     #[error("reading forwarded response from leader: {0}")]
     ReadResponse(reqwest::Error),
     #[error("building forwarded response: {0}")]
@@ -306,7 +320,16 @@ enum ForwardError {
 
 impl IntoResponse for ForwardError {
     fn into_response(self) -> Response {
-        (StatusCode::BAD_GATEWAY, self.to_string()).into_response()
+        let status = match self {
+            // `Timeout` matches HTTP's gateway-timeout semantics — the
+            // proxy gave up waiting for the upstream. `ReadResponse`
+            // covers the timeout that fires mid-body-read by way of
+            // reqwest's per-request deadline.
+            ForwardError::Timeout => StatusCode::GATEWAY_TIMEOUT,
+            ForwardError::ReadResponse(ref e) if e.is_timeout() => StatusCode::GATEWAY_TIMEOUT,
+            _ => StatusCode::BAD_GATEWAY,
+        };
+        (status, self.to_string()).into_response()
     }
 }
 
@@ -359,9 +382,16 @@ async fn forward_request(
         .request(parts.method, &leader_url)
         .headers(headers)
         .body(body_bytes)
+        .timeout(FORWARD_REQUEST_TIMEOUT)
         .send()
         .await
-        .map_err(ForwardError::Send)?;
+        .map_err(|e| {
+            if e.is_timeout() {
+                ForwardError::Timeout
+            } else {
+                ForwardError::Send(e)
+            }
+        })?;
 
     response_from_upstream(upstream).await
 }
@@ -447,6 +477,26 @@ mod tests {
         assert!(is_hop_by_hop("TRANSFER-ENCODING"));
         assert!(!is_hop_by_hop("Content-Type"));
         assert!(!is_hop_by_hop("Authorization"));
+    }
+
+    #[test]
+    fn timeout_error_maps_to_gateway_timeout() {
+        let resp = ForwardError::Timeout.into_response();
+        assert_eq!(resp.status(), StatusCode::GATEWAY_TIMEOUT);
+    }
+
+    #[test]
+    fn non_timeout_errors_map_to_bad_gateway() {
+        // `BuildResponse` is the easiest variant to construct in a
+        // test — it wraps `axum::http::Error`, which `Response::builder`
+        // produces for an out-of-range status. Stand-in for any
+        // non-timeout variant; the mapping treats them all the same.
+        let axum_err = Response::builder()
+            .status(9999_u16)
+            .body(Body::empty())
+            .unwrap_err();
+        let resp = ForwardError::BuildResponse(axum_err).into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
     }
 
     #[test]
