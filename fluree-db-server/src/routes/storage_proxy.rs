@@ -195,6 +195,21 @@ pub struct NsRecordResponse {
     pub retracted: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub config_id: Option<String>,
+    /// Parent branch this branch was forked from. `None` for the
+    /// initial branch. Peers need it to build the branched content
+    /// store that walks parent ancestry for commits inherited from
+    /// the source.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_branch: Option<String>,
+    /// Number of child branches forked from this one. Peers need it
+    /// to honor the "branch with children can't be fully purged"
+    /// invariant.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub branches: u32,
+}
+
+fn is_zero(v: &u32) -> bool {
+    *v == 0
 }
 
 /// Request body for block fetch endpoint.
@@ -270,6 +285,8 @@ pub async fn get_ns_record(
             .config_id
             .as_ref()
             .map(std::string::ToString::to_string),
+        source_branch: ns_record.source_branch.clone(),
+        branches: ns_record.branches,
     }))
 }
 
