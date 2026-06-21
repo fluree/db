@@ -135,10 +135,14 @@ impl QueuedTransactor {
     ///   release: a worker on the new leader may still need to read
     ///   the envelope. The idempotency-key eviction path sweeps it
     ///   later if the entry never actually committed.
-    /// - `Enqueued`/`InFlight`/`IdempotencyHit`/`IdempotencyFailed`:
-    ///   the envelope is owned by the queue or idempotency cache;
+    /// - `Enqueued`/`InFlight`: the envelope is owned by the queue;
     ///   eviction / admin clear releases it via the state-machine
     ///   adapter's release channel.
+    /// - `IdempotencyHit`/`IdempotencyFailed`: the cached record
+    ///   points at a *prior* submission's envelope (unique
+    ///   timestamps per attempt mean retries hash to distinct
+    ///   `request_cid`s). The freshly-written envelope for this
+    ///   retry is unreferenced and released here.
     async fn submit_and_await(
         &self,
         args: EnqueueCommandArgs,
@@ -213,9 +217,23 @@ impl QueuedTransactor {
                     }
                 }
                 SmResponse::IdempotencyHit { record } => {
+                    // The cached record points at the *original*
+                    // submission's request_cid; the envelope we just
+                    // wrote to CAS for this retry is unreferenced —
+                    // its timestamps differ from the cached one's,
+                    // so its content id won't dedup against the
+                    // existing blob. Release it before returning so
+                    // every idempotent retry doesn't leak one CAS
+                    // object per attempt.
+                    self.release_envelope(&full_ledger_id, &request_cid).await;
                     return Ok(SubmissionOutcome::Cached(record));
                 }
                 SmResponse::IdempotencyFailed { record } => {
+                    // Same as `IdempotencyHit`: the cached failure
+                    // record references the original envelope; the
+                    // retry's envelope is orphaned and must be
+                    // released.
+                    self.release_envelope(&full_ledger_id, &request_cid).await;
                     return Ok(SubmissionOutcome::CachedFailure(record));
                 }
                 SmResponse::BodyHashMismatch => {
