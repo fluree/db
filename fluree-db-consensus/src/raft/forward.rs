@@ -37,6 +37,7 @@ use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use openraft::Raft;
+use std::net::IpAddr;
 use std::sync::Arc;
 
 /// Hop-by-hop headers from RFC 7230 §6.1 plus a couple of modern
@@ -127,13 +128,31 @@ impl LeaderForwarder {
 
 /// Sanity-check a candidate leader URL before opening an outbound
 /// connection to it. Replicated membership data is broadly trusted
-/// (it has to be — proposing a `ChangeMembership` requires Raft
-/// consent), but a buggy `add_learner` call or a hand-edited
-/// snapshot could leave a `client_addr` with an unexpected scheme.
-/// Without this, a malformed entry could redirect every follower's
-/// forwarded write at `file://`, `javascript:`, or any other URL
-/// scheme reqwest happens to accept. Permit only the two transport
-/// schemes the cluster actually uses.
+/// (proposing a `ChangeMembership` requires Raft consent), but a
+/// buggy `add_learner` call or a hand-edited snapshot could leave a
+/// `client_addr` that redirects every follower's forwarded write —
+/// body, auth headers, and all — at the wrong destination.
+///
+/// Permit only the two transport schemes the cluster actually uses
+/// (http/https) and reject hosts that are obvious SSRF targets:
+///
+/// - **Loopback** (`127.0.0.0/8`, `::1`): a follower pointing
+///   `client_addr` at its own localhost would loop back the write
+///   into whatever local service answers that port (Postgres at
+///   5432, an admin endpoint, etc.).
+/// - **Link-local** (`169.254.0.0/16`, `fe80::/10`): notably AWS /
+///   GCP / Azure instance metadata services at `169.254.169.254`,
+///   which return cloud credentials.
+/// - **Unspecified** (`0.0.0.0`, `::`): kernel routes these to a
+///   local interface, same effective risk as loopback.
+/// - The literal hostname `"localhost"`.
+///
+/// Hostnames are not resolved here — a hostname that resolves to a
+/// denied IP at DNS time still passes, and the kernel handles the
+/// rest. The intent is to catch the straight-line mistake of putting
+/// a literal SSRF address into the membership record; an active
+/// adversary controlling DNS for cluster hostnames is out of scope
+/// of this check and needs to be addressed at a different layer.
 fn is_valid_leader_url(url: &str) -> bool {
     if url.is_empty() {
         return false;
@@ -141,7 +160,45 @@ fn is_valid_leader_url(url: &str) -> bool {
     let Ok(parsed) = reqwest::Url::parse(url) else {
         return false;
     };
-    matches!(parsed.scheme(), "http" | "https") && parsed.has_host()
+    if !matches!(parsed.scheme(), "http" | "https") || !parsed.has_host() {
+        return false;
+    }
+    let Some(host) = parsed.host_str() else {
+        return false;
+    };
+    // `Url::host_str` returns IPv6 addresses with the URL-syntax
+    // `[...]` brackets in place. Strip them so the IP parser sees
+    // a bare address; non-IPv6 hosts pass through unchanged.
+    let bare = host
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(host);
+    !is_ssrf_host(bare)
+}
+
+/// Returns true for hosts that should never be a legitimate cluster
+/// peer: loopback / link-local / unspecified IPs, or the literal
+/// hostname `"localhost"`. See [`is_valid_leader_url`] for the full
+/// rationale.
+fn is_ssrf_host(host: &str) -> bool {
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    let Ok(ip) = host.parse::<IpAddr>() else {
+        return false;
+    };
+    if ip.is_loopback() || ip.is_unspecified() {
+        return true;
+    }
+    match ip {
+        IpAddr::V4(v4) => v4.is_link_local(),
+        IpAddr::V6(v6) => {
+            // fe80::/10 — link-local unicast. `Ipv6Addr::is_unicast_link_local`
+            // exists but is still unstable; the segment check is the
+            // stable equivalent.
+            (v6.segments()[0] & 0xffc0) == 0xfe80
+        }
+    }
 }
 
 enum ForwardDecision {
@@ -423,6 +480,36 @@ mod tests {
         // Plain garbage.
         assert!(!is_valid_leader_url(""));
         assert!(!is_valid_leader_url("not a url"));
+    }
+
+    #[test]
+    fn leader_url_validation_rejects_ssrf_targets() {
+        // Loopback — IPv4 + IPv6 + hostname.
+        assert!(!is_valid_leader_url("http://127.0.0.1:8080"));
+        assert!(!is_valid_leader_url("http://127.0.0.5:8080"));
+        assert!(!is_valid_leader_url("http://[::1]:8080"));
+        assert!(!is_valid_leader_url("http://localhost:8080"));
+        assert!(!is_valid_leader_url("http://LOCALHOST:8080"));
+
+        // Link-local — AWS / GCP / Azure metadata services and any
+        // 169.254.x.y peer.
+        assert!(!is_valid_leader_url("http://169.254.169.254/"));
+        assert!(!is_valid_leader_url("http://169.254.0.1:8080"));
+        assert!(!is_valid_leader_url("http://[fe80::1]:8080"));
+
+        // Unspecified — kernel routes 0.0.0.0 / :: to a local
+        // interface, same effective risk as loopback.
+        assert!(!is_valid_leader_url("http://0.0.0.0:8080"));
+        assert!(!is_valid_leader_url("http://[::]:8080"));
+    }
+
+    #[test]
+    fn leader_url_validation_still_accepts_private_cluster_addresses() {
+        // Private RFC1918 ranges are standard for internal clusters;
+        // the SSRF deny-list doesn't include them.
+        assert!(is_valid_leader_url("http://10.0.1.5:9090/"));
+        assert!(is_valid_leader_url("http://192.168.1.10:8080"));
+        assert!(is_valid_leader_url("http://172.16.0.5:8080"));
     }
 
     #[test]
