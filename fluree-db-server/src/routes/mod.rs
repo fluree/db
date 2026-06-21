@@ -1,7 +1,7 @@
 //! HTTP route handlers and router configuration
 
 mod admin;
-mod admin_auth;
+pub(crate) mod admin_auth;
 mod commits;
 mod context;
 mod events;

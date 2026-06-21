@@ -207,14 +207,35 @@ impl RaftIntegration {
         }))
     }
 
-    /// Router for the private listener — exposes the inter-node Raft
-    /// RPC endpoints under `/raft` and the cluster admin endpoints
-    /// under `/cluster`. Mount on a VPC-internal listener; this
-    /// router carries no auth of its own.
+    /// Inter-node Raft RPC router. Mount under `/raft` on the private
+    /// listener. Carries no auth — peers authenticate to one another
+    /// via network trust (VPC ACL); a compromised peer is already
+    /// inside that boundary. [`Self::cluster_admin_router`] is the
+    /// layer that gates membership changes against operator
+    /// credentials.
+    pub fn raft_rpc_router(&self) -> Router {
+        raft_network::router(Arc::clone(&self.raft))
+    }
+
+    /// Cluster admin router — bootstrap and membership-change
+    /// endpoints. Mount under `/cluster` on the private listener and
+    /// wrap with operator-credential middleware before serving. The
+    /// router itself carries no auth; layering happens at the mount
+    /// site so callers can pick their own mechanism (the in-tree
+    /// server applies `routes::admin_auth::require_admin_token`).
+    pub fn cluster_admin_router(&self) -> Router {
+        raft_admin::router(Arc::clone(&self.raft))
+    }
+
+    /// Combined unauthenticated private-listener router — `/raft/*`
+    /// for inter-node RPC and `/cluster/*` for admin. Convenience for
+    /// VPC-trusted setups, embedders that supply their own auth, and
+    /// integration tests; the in-tree server bypasses this method to
+    /// layer admin auth on the `/cluster` subtree before serving.
     pub fn private_router(&self) -> Router {
         Router::new()
-            .nest("/raft", raft_network::router(Arc::clone(&self.raft)))
-            .nest("/cluster", raft_admin::router(Arc::clone(&self.raft)))
+            .nest("/raft", self.raft_rpc_router())
+            .nest("/cluster", self.cluster_admin_router())
     }
 }
 

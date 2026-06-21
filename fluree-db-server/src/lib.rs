@@ -61,7 +61,10 @@ use tracing::info;
 /// Raft handle via [`FlureeServer::new_with_raft`].
 #[cfg(feature = "raft")]
 struct RaftListener {
-    /// Routed under `/raft` (inter-node RPC) and `/cluster` (admin).
+    /// Routed under `/raft` (inter-node RPC, peer-trusted) and
+    /// `/cluster` (admin, gated by `routes::admin_auth::require_admin_token`
+    /// against the active `admin_auth` config; pass-through when the
+    /// mode is `None`).
     private_router: Router,
     /// Address for the VPC-internal listener. Distinct from the
     /// public client-facing listener at `config.listen_addr`.
@@ -503,7 +506,7 @@ impl FlureeServerBuilder {
                 .await?;
 
         #[cfg(feature = "raft")]
-        let raft_listener = self.raft.as_ref().map(|(integration, listen_addr)| {
+        let raft_listener_parts = self.raft.as_ref().map(|(integration, listen_addr)| {
             // Consensus-side committer stack: `QueuedTransactor`
             // routes all five `Committer` methods through
             // `EnqueueCommand` plus the per-process `WaiterMap` and
@@ -518,10 +521,10 @@ impl FlureeServerBuilder {
             state_inner.committer =
                 Arc::new(fluree_db_consensus::CachingCommitter::wrapping(queued));
             state_inner.raft = Some(Arc::clone(integration));
-            RaftListener {
-                private_router: integration.private_router(),
-                listen_addr: *listen_addr,
-            }
+            // The actual `RaftListener` is assembled after `state` is
+            // Arc-wrapped below so the admin-auth middleware can be
+            // layered onto the `/cluster` subtree with `Arc<AppState>`.
+            (Arc::clone(integration), *listen_addr)
         });
 
         // Per-node CAS release task. The state-machine adapter pushes
@@ -639,6 +642,28 @@ impl FlureeServerBuilder {
         drop(raft_nameservice);
 
         let state = Arc::new(state_inner);
+
+        // Assemble the private-listener router now that `state` is an
+        // `Arc<AppState>` — `require_admin_token` needs that shape. The
+        // `/cluster` admin subtree is gated against the configured
+        // `admin_auth` mode (pass-through when `None`); `/raft` peer
+        // RPC stays unauthenticated and relies on network trust.
+        #[cfg(feature = "raft")]
+        let raft_listener = raft_listener_parts.map(|(integration, listen_addr)| {
+            let cluster_admin = integration
+                .cluster_admin_router()
+                .layer(axum::middleware::from_fn_with_state(
+                    Arc::clone(&state),
+                    crate::routes::admin_auth::require_admin_token,
+                ));
+            let private_router = Router::new()
+                .nest("/raft", integration.raft_rpc_router())
+                .nest("/cluster", cluster_admin);
+            RaftListener {
+                private_router,
+                listen_addr,
+            }
+        });
 
         // Warm JWKS cache (async — fetch keys from configured endpoints).
         #[cfg(feature = "oidc")]
