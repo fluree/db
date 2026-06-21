@@ -823,20 +823,55 @@ impl<C: Committer + SubmissionLookup> SubmissionLookup for CachingCommitter<C> {
             return SubmissionState::Unknown;
         };
         let cache_key = IdempotencyCacheKey::new(&normalized, key.clone());
-        if let Some(entry) = self.cache.get(&cache_key).await {
-            return entry.state;
+        match self.cache.get(&cache_key).await {
+            // Terminal states in the cache are authoritative; return
+            // them without paying for an inner round-trip.
+            Some(entry) if !matches!(entry.state, SubmissionState::InFlight) => entry.state,
+            // Cached `InFlight` may be stale: the originating
+            // `try_claim_slot` writes `InFlight` before the executor
+            // returns, and a cancelled transact future (HTTP timeout,
+            // client disconnect) skips the `record_outcome` that
+            // would overwrite it. The executor's idempotency state
+            // is the canonical answer in that window — for the Raft
+            // path, [`QueuedTransactor::status`] consults the
+            // replicated map and returns `Committed` / `Failed` if
+            // the propose actually landed.
+            Some(entry) => {
+                let inner = self.executor.status(&normalized, key).await;
+                match &inner {
+                    SubmissionState::Committed(_) | SubmissionState::Failed(_) => {
+                        // Refresh the cache so subsequent polls hit
+                        // fast without another inner round-trip.
+                        self.cache
+                            .insert(
+                                cache_key,
+                                CachedSubmission {
+                                    state: inner.clone(),
+                                    body_hash: entry.body_hash,
+                                },
+                            )
+                            .await;
+                        inner
+                    }
+                    // Inner doesn't know either (LocalCommitter
+                    // always returns Unknown; QueuedTransactor's
+                    // replicated map may not yet reflect the
+                    // entry). Surface the cached `InFlight` rather
+                    // than `Unknown` so the client doesn't flip
+                    // from "in flight" to "never heard of it".
+                    _ => SubmissionState::InFlight,
+                }
+            }
+            // Cache miss — fall through to the inner committer. For
+            // [`LocalCommitter`] this is a noop (always `Unknown`);
+            // for the Raft path the inner
+            // [`QueuedTransactor`](crate::raft::queued_transactor::QueuedTransactor)
+            // surfaces a `Committed { receipt: None, ... }` for
+            // entries any node committed through consensus —
+            // including ones a different leader served before this
+            // node took over.
+            None => self.executor.status(&normalized, key).await,
         }
-        // Local moka miss — fall through to the inner committer's
-        // status. For [`LocalCommitter`] this is a noop (always
-        // `Unknown`); for the Raft path the inner
-        // [`QueuedTransactor`](crate::raft::queued_transactor::QueuedTransactor)
-        // consults the replicated idempotency state and returns a
-        // `Committed { receipt: None, ... }` for entries any node
-        // committed through consensus — including ones a different
-        // leader served before this node took over. Pass the
-        // normalized form so the downstream cache key matches the
-        // canonical envelope the worker stored.
-        self.executor.status(&normalized, key).await
     }
 }
 
@@ -959,6 +994,208 @@ mod tests {
             large > small,
             "weight must scale with policy map size; small={small}, large={large}"
         );
+    }
+
+    /// Minimal Committer + SubmissionLookup stub for status-fallthrough
+    /// tests. The committer methods are unreachable in these tests
+    /// (the caching layer's status path doesn't call them), and the
+    /// stub's `status` returns whatever the caller pre-installs.
+    ///
+    /// `Clone` so the test can hand one instance to the committer and
+    /// keep another for inspection (`calls()`); cloning is cheap because
+    /// state lives behind a single `Arc`.
+    #[derive(Clone)]
+    struct StubExecutor(Arc<StubExecutorInner>);
+
+    struct StubExecutorInner {
+        status_response: std::sync::Mutex<SubmissionState>,
+        status_calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl StubExecutor {
+        fn new(initial: SubmissionState) -> Self {
+            Self(Arc::new(StubExecutorInner {
+                status_response: std::sync::Mutex::new(initial),
+                status_calls: std::sync::atomic::AtomicUsize::new(0),
+            }))
+        }
+
+        fn calls(&self) -> usize {
+            self.0
+                .status_calls
+                .load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Committer for StubExecutor {
+        async fn transact(
+            &self,
+            _request: TransactionRequest,
+        ) -> Result<TransactionReceipt, SubmissionError> {
+            unreachable!("status-fallthrough tests never exercise transact")
+        }
+        async fn revert(
+            &self,
+            _request: RevertRequest,
+        ) -> Result<RevertReceipt, SubmissionError> {
+            unreachable!("status-fallthrough tests never exercise revert")
+        }
+        async fn merge(&self, _request: MergeRequest) -> Result<MergeReceipt, SubmissionError> {
+            unreachable!("status-fallthrough tests never exercise merge")
+        }
+        async fn rebase(
+            &self,
+            _request: RebaseRequest,
+        ) -> Result<RebaseReceipt, SubmissionError> {
+            unreachable!("status-fallthrough tests never exercise rebase")
+        }
+        async fn push(&self, _request: PushRequest) -> Result<PushReceipt, SubmissionError> {
+            unreachable!("status-fallthrough tests never exercise push")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl SubmissionLookup for StubExecutor {
+        async fn status(&self, _ledger_id: &str, _key: &IdempotencyKey) -> SubmissionState {
+            self.0
+                .status_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.0.status_response.lock().unwrap().clone()
+        }
+    }
+
+    fn committed_state(label: &str) -> SubmissionState {
+        SubmissionState::Committed(Box::new(CommittedSubmission {
+            idempotency_key: Some(IdempotencyKey::new(label).expect("fits cap")),
+            kind: BodyKind::JsonLdInsert,
+            commit_id: CommitId::new(fluree_db_api::ContentKind::Commit, &[0u8]),
+            t: 1,
+            tally: None,
+            receipt: None,
+        }))
+    }
+
+    #[tokio::test]
+    async fn status_falls_through_to_inner_when_cache_has_stale_in_flight() {
+        let stub = StubExecutor::new(committed_state("k1"));
+        // Manual construction so the test keeps a clone of `stub` for
+        // post-call assertions on `calls()`.
+        let cache = Cache::builder()
+            .time_to_live(DEFAULT_IDEMPOTENCY_TTL)
+            .max_capacity(DEFAULT_IDEMPOTENCY_CACHE_MAX_BYTES)
+            .weigher(weigh_cached_submission)
+            .build();
+        let committer: CachingCommitter<StubExecutor> = CachingCommitter {
+            executor: stub.clone(),
+            cache,
+            admission: Arc::new(Semaphore::new(DEFAULT_PENDING_LIMIT)),
+            per_ledger_admission: DashMap::new(),
+            per_ledger_limit: DEFAULT_PER_LEDGER_PENDING_LIMIT,
+        };
+
+        // Plant a stale InFlight cache entry like a dropped transact
+        // future would leave behind.
+        let key = IdempotencyKey::new("k1").expect("fits cap");
+        let cache_key = IdempotencyCacheKey::new("tenant-a:main", key.clone());
+        committer
+            .cache
+            .insert(
+                cache_key.clone(),
+                CachedSubmission {
+                    state: SubmissionState::InFlight,
+                    body_hash: [7u8; 32],
+                },
+            )
+            .await;
+
+        // Status must surface the inner committer's Committed even
+        // though the cache says InFlight.
+        let got = committer.status("tenant-a:main", &key).await;
+        assert!(matches!(got, SubmissionState::Committed(_)));
+        assert_eq!(stub.calls(), 1, "inner status must be consulted exactly once");
+
+        // The cache should now be refreshed so a second poll hits
+        // fast without a second inner round-trip.
+        let got2 = committer.status("tenant-a:main", &key).await;
+        assert!(matches!(got2, SubmissionState::Committed(_)));
+        assert_eq!(stub.calls(), 1, "cache refresh must short-circuit the second poll");
+
+        // Body hash must be preserved across the refresh — otherwise a
+        // later retry with the same key + same body would incorrectly
+        // hit KeyCollision.
+        let entry = committer.cache.get(&cache_key).await.expect("refreshed");
+        assert_eq!(entry.body_hash, [7u8; 32]);
+    }
+
+    #[tokio::test]
+    async fn status_keeps_in_flight_when_inner_does_not_know_either() {
+        let stub = StubExecutor::new(SubmissionState::Unknown);
+        let cache = Cache::builder()
+            .time_to_live(DEFAULT_IDEMPOTENCY_TTL)
+            .max_capacity(DEFAULT_IDEMPOTENCY_CACHE_MAX_BYTES)
+            .weigher(weigh_cached_submission)
+            .build();
+        let committer: CachingCommitter<StubExecutor> = CachingCommitter {
+            executor: stub.clone(),
+            cache,
+            admission: Arc::new(Semaphore::new(DEFAULT_PENDING_LIMIT)),
+            per_ledger_admission: DashMap::new(),
+            per_ledger_limit: DEFAULT_PER_LEDGER_PENDING_LIMIT,
+        };
+
+        let key = IdempotencyKey::new("k1").expect("fits cap");
+        let cache_key = IdempotencyCacheKey::new("tenant-a:main", key.clone());
+        committer
+            .cache
+            .insert(
+                cache_key,
+                CachedSubmission {
+                    state: SubmissionState::InFlight,
+                    body_hash: [7u8; 32],
+                },
+            )
+            .await;
+
+        // Inner returns Unknown — caller still sees InFlight, not
+        // Unknown, because the cache's InFlight is a stronger signal
+        // than the inner's "haven't heard of it".
+        let got = committer.status("tenant-a:main", &key).await;
+        assert!(matches!(got, SubmissionState::InFlight));
+    }
+
+    #[tokio::test]
+    async fn status_returns_cached_committed_without_inner_round_trip() {
+        let stub = StubExecutor::new(SubmissionState::Unknown);
+        let cache = Cache::builder()
+            .time_to_live(DEFAULT_IDEMPOTENCY_TTL)
+            .max_capacity(DEFAULT_IDEMPOTENCY_CACHE_MAX_BYTES)
+            .weigher(weigh_cached_submission)
+            .build();
+        let committer: CachingCommitter<StubExecutor> = CachingCommitter {
+            executor: stub.clone(),
+            cache,
+            admission: Arc::new(Semaphore::new(DEFAULT_PENDING_LIMIT)),
+            per_ledger_admission: DashMap::new(),
+            per_ledger_limit: DEFAULT_PER_LEDGER_PENDING_LIMIT,
+        };
+
+        let key = IdempotencyKey::new("k1").expect("fits cap");
+        let cache_key = IdempotencyCacheKey::new("tenant-a:main", key.clone());
+        committer
+            .cache
+            .insert(
+                cache_key,
+                CachedSubmission {
+                    state: committed_state("k1"),
+                    body_hash: [7u8; 32],
+                },
+            )
+            .await;
+
+        let got = committer.status("tenant-a:main", &key).await;
+        assert!(matches!(got, SubmissionState::Committed(_)));
+        assert_eq!(stub.calls(), 0, "terminal cache entry must not consult the inner");
     }
 
     #[tokio::test]
