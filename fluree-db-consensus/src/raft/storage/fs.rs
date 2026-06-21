@@ -216,8 +216,19 @@ impl RaftLogStore for FsRaftLogStore {
     }
 
     async fn truncate_from(&self, from_index: u64) -> Result<(), StorageError> {
+        // Delete in descending order so the surviving prefix stays
+        // contiguous after a crash mid-loop. The reverse order
+        // (ascending) can leave a hole — e.g. removing 5 and 6 but
+        // crashing before 7..N — and `log_state` would then report
+        // `last_log` from a stale-term entry above the missing
+        // window, which openraft cannot reconcile. With descending
+        // deletion the worst-case post-crash state is some
+        // stale-term entries still in [from_index, k]; openraft's
+        // append-entries conflict detection re-triggers
+        // `truncate_from` against the actual conflict point on
+        // recovery, so no missing-middle hole ever surfaces.
         let indices = self.list_entry_indices().await?;
-        for idx in indices.into_iter().filter(|&i| i >= from_index) {
+        for idx in indices.into_iter().filter(|&i| i >= from_index).rev() {
             remove_if_exists(&self.entry_path(idx)).await?;
         }
         Ok(())
@@ -476,6 +487,41 @@ mod tests {
         let got = store.read_range(0..100).await.unwrap();
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].log_id.index, 1);
+    }
+
+    /// Simulates a crash mid-`truncate_from`: the descending-order
+    /// loop completed deletions of the top few entries but stopped
+    /// before reaching the truncation point. The surviving log must
+    /// be a contiguous prefix — no missing-middle hole — so
+    /// `log_state` reports a coherent `last_log` and `read_range`
+    /// returns every index up to it.
+    #[tokio::test]
+    async fn partial_truncate_leaves_contiguous_prefix() {
+        let (_dir, store) = fresh_log_store().await;
+        store
+            .append(&[
+                entry(1, 1),
+                entry(1, 2),
+                entry(1, 3),
+                entry(1, 4),
+                entry(1, 5),
+            ])
+            .await
+            .unwrap();
+
+        // Hand-delete the top two entries to mimic the on-disk
+        // state after a `truncate_from(2)` that crashed after
+        // removing 5 and 4 but before 3 and 2. Ascending-order
+        // deletion would have left 5 in place with 2 and 3 gone — a
+        // hole at indices 2,3 with last_log=5.
+        remove_if_exists(&store.entry_path(5)).await.unwrap();
+        remove_if_exists(&store.entry_path(4)).await.unwrap();
+
+        let state = store.log_state().await.unwrap();
+        assert_eq!(state.last_log, Some(LogId::new(1, 3)));
+        let got = store.read_range(0..100).await.unwrap();
+        let indices: Vec<u64> = got.iter().map(|e| e.log_id.index).collect();
+        assert_eq!(indices, vec![1, 2, 3]);
     }
 
     #[tokio::test]
