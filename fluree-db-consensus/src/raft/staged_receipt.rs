@@ -186,6 +186,16 @@ impl StagedReceiptMap {
         }
     }
 
+    /// Drop every stashed receipt. Called by the state-machine
+    /// adapter on install_snapshot: the receipts here were stashed
+    /// against this node's prior-leader state, but the snapshot
+    /// installs a state machine the prior leader didn't produce, so
+    /// their queue_ids no longer correspond to anything the local
+    /// adapter will resolve.
+    pub fn clear_all(&self) {
+        self.receipts.clear();
+    }
+
     /// Number of stashed receipts. Test-only.
     #[cfg(test)]
     pub fn len(&self) -> usize {

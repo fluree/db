@@ -1042,6 +1042,12 @@ fn submission_error_from_abort(reason: AbortReason) -> SubmissionError {
             status: 410,
             message: "branch retracted while submission was queued".into(),
         },
+        AbortReason::SnapshotInstalled => SubmissionError::Execution {
+            status: 503,
+            message: "leader transitioned and the local state was rebuilt from a snapshot; \
+                      the submission's outcome is unknown, retry"
+                .into(),
+        },
         AbortReason::Poisoned(reason) => SubmissionError::Execution {
             status: 422,
             message: format!("submission poisoned: {reason:?}"),

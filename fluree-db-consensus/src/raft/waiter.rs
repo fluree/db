@@ -56,6 +56,12 @@ pub enum AbortReason {
     /// so in-flight waiters from before the retract get this
     /// reason instead of a head-mutating `BranchHeadReset`.
     BranchRetracted,
+    /// The state machine was rebuilt from an install_snapshot, so
+    /// every locally-tracked queue_id (parked or buffered) is
+    /// abandoned: the entry may or may not exist in the new state,
+    /// and the prior leader's local outcome is no longer
+    /// authoritative.
+    SnapshotInstalled,
     Poisoned(PoisonReason),
 }
 
@@ -207,6 +213,28 @@ impl WaiterMap {
             .collect();
         for queue_id in to_resolve {
             self.resolve_aborted(queue_id, reason.clone());
+        }
+    }
+
+    /// Resolve every parked slot with `reason` and drop every
+    /// buffered slot. Called by the state-machine adapter on
+    /// install_snapshot: the in-memory queue ids tracked here belong
+    /// to the pre-snapshot state, and neither parked proposers nor
+    /// buffered outcomes can be trusted once the local state has
+    /// been replaced by a snapshot the prior leader didn't produce.
+    ///
+    /// Distinct from [`Self::abort_all_for_branch`], which
+    /// intentionally preserves buffered resolutions because their
+    /// underlying entry actually applied — that invariant does not
+    /// hold across a snapshot install.
+    pub fn drain_all_with(&self, reason: AbortReason) {
+        let queue_ids: Vec<u64> = self.slots.iter().map(|entry| *entry.key()).collect();
+        for queue_id in queue_ids {
+            if let Some((_, slot)) = self.slots.remove(&queue_id) {
+                if let WaiterSlot::Parked { sender, .. } = slot {
+                    let _ = sender.send(WaiterOutcome::Aborted(reason.clone()));
+                }
+            }
         }
     }
 
@@ -366,6 +394,27 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn drain_all_resolves_parked_and_drops_buffered() {
+        let map = WaiterMap::new();
+        // Parked: a proposer waiting on queue_id 1.
+        let parked_rx = map.register(1, ref_key("main"));
+        // Buffered: worker resolved 2 before the proposer registered;
+        // unlike abort_all_for_branch this drain MUST drop the
+        // buffered slot too because the post-snapshot state can't
+        // honor it.
+        map.resolve_applied(2, minimal(42, 10));
+        assert_eq!(map.len(), 2);
+
+        map.drain_all_with(AbortReason::SnapshotInstalled);
+
+        assert!(matches!(
+            parked_rx.await.unwrap(),
+            WaiterOutcome::Aborted(AbortReason::SnapshotInstalled)
+        ));
+        assert!(map.is_empty(), "buffered slot must be dropped, not retained");
     }
 
     #[tokio::test]

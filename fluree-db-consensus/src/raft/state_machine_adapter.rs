@@ -536,6 +536,20 @@ where
         *self.state.write().await = new_state;
         self.last_applied = meta.last_log_id;
         self.last_membership = meta.last_membership.clone();
+
+        // The snapshot replaces the state machine wholesale. Any
+        // queue_id tracked by this node's waiter map or staged-
+        // receipt map belonged to the prior-leader state, and the
+        // new state may or may not contain it — neither parked
+        // proposers nor buffered receipts can be trusted across the
+        // install. Resolve waiters as aborted so callers stop
+        // waiting; drop the stash so memory doesn't leak.
+        if let Some(waiters) = self.waiter_map.as_ref() {
+            waiters.drain_all_with(AbortReason::SnapshotInstalled);
+        }
+        if let Some(stash) = self.staged_receipts.as_ref() {
+            stash.clear_all();
+        }
         Ok(())
     }
 
@@ -952,6 +966,67 @@ mod tests {
             .contains_key("test/db"));
         let (applied, _) = target.applied_state().await.unwrap();
         assert_eq!(applied, Some(log_id(1, 1)));
+    }
+
+    #[tokio::test]
+    async fn install_snapshot_drains_waiters_and_stash() {
+        use crate::raft::staged_receipt::{StagedReceiptMap, TransactApplied};
+
+        // Source adapter builds a snapshot from a fresh state.
+        let source_storage = Arc::new(MemoryRaftStorage::new());
+        let mut source = StateMachineAdapter::new(Arc::clone(&source_storage));
+        source
+            .apply([create_ledger_entry(1, "test/db")])
+            .await
+            .unwrap();
+        let mut builder = source.get_snapshot_builder().await;
+        let snap = builder.build_snapshot().await.unwrap();
+
+        // Target adapter has both maps wired and prior-leader work
+        // tracked in them: a parked waiter, a buffered Applied, and
+        // a stashed receipt — all keyed on queue_ids the snapshot
+        // does not (and cannot) recognize.
+        let target_storage = Arc::new(MemoryRaftStorage::new());
+        let waiter_map = Arc::new(WaiterMap::new());
+        let staged = Arc::new(StagedReceiptMap::new());
+        let mut target = StateMachineAdapter::new(target_storage)
+            .with_waiter_map(Arc::clone(&waiter_map))
+            .with_staged_receipts(Arc::clone(&staged));
+
+        let parked_rx = waiter_map.register(100, RefKey::new("test/db", "main"));
+        waiter_map.resolve_applied(
+            101,
+            AppliedReceipt::Minimal {
+                commit_id: cid(7),
+                commit_t: 5,
+            },
+        );
+        staged.stash(
+            100,
+            RefKey::new("test/db", "main"),
+            AppliedReceipt::Transact(TransactApplied {
+                commit_id: cid(42),
+                commit_t: 10,
+                tally: None,
+            }),
+        );
+        assert_eq!(waiter_map.len(), 2);
+        assert_eq!(staged.len(), 1);
+
+        target
+            .install_snapshot(&snap.meta, snap.snapshot)
+            .await
+            .unwrap();
+
+        // Parked waiter is aborted with SnapshotInstalled.
+        assert!(matches!(
+            parked_rx.await.unwrap(),
+            WaiterOutcome::Aborted(AbortReason::SnapshotInstalled)
+        ));
+        // Buffered Applied is dropped, not preserved.
+        assert!(waiter_map.is_empty());
+        // Stashed receipts cleared.
+        assert!(staged.is_empty());
     }
 
     // ====================================================================
