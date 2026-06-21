@@ -405,6 +405,27 @@ fn resolve_exists_for_row<'a>(
     })
 }
 
+/// Resolve every `Expression::Exists` in `expr` for one row, seeding the
+/// row's bindings, and return the expression with each EXISTS replaced by
+/// its `Const(Bool)` result.
+///
+/// This is the projection/BIND counterpart to the per-row resolution the
+/// `FilterOperator` does: it lets EXISTS appear as a *value* (e.g.
+/// `RETURN NOT EXISTS { ... } AS isNew`), not only as a row filter.
+/// Correlation is via `batch[row_idx]`, so any outer variable the inner
+/// pattern references is bound. No semijoin cache — each call resolves
+/// independently (correct; the common no-EXISTS case is gated out by the
+/// caller via [`contains_exists`]).
+pub(crate) async fn resolve_row_exists(
+    expr: &Expression,
+    batch: &Batch,
+    row_idx: usize,
+    ctx: &ExecutionContext<'_>,
+    planning: &crate::temporal_mode::PlanningContext,
+) -> Result<Expression> {
+    resolve_exists_for_row(expr, batch, row_idx, ctx, None, planning).await
+}
+
 /// Filter a batch using an expression that contains EXISTS subexpressions.
 ///
 /// Two-phase evaluation:
