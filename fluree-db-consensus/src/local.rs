@@ -15,10 +15,45 @@ use crate::{
 use async_trait::async_trait;
 use fluree_db_api::{
     ApiError, Base64Bytes, Fluree, GovernanceOptions, LedgerHandle, LedgerManager, PolicyContext,
-    PushCommitsRequest,
+    PushCommitsRequest, RefreshOpts, TransactError,
 };
 use fluree_db_ledger::IndexConfig;
 use std::sync::Arc;
+
+/// Upper bound on stage + commit attempts when a retryable
+/// inter-writer conflict surfaces. Mirrors the prior monolithic
+/// retry budget; sized high enough that a contended ledger with
+/// several concurrent writers still converges within one HTTP
+/// timeout, low enough to bound the worst-case latency added by a
+/// pathological writer.
+const MAX_TXN_RETRIES: usize = 16;
+
+/// Conflicts that heal by reconciling the cached writer state to
+/// the durable nameservice head and re-staging against the fresh
+/// state.
+///
+/// Unreachable for a single instance with no external writers — the
+/// per-ledger write lock plus atomic cache replace after publish
+/// keep `verify_sequencing` consistent, the head-record CAS
+/// uncontended, and namespace allocations process-serialized. They
+/// become reachable when something outside this committer's lock
+/// writes to the same durable backend (multiple processes sharing a
+/// nameservice + storage, out-of-band cache invalidation).
+///
+/// `tx_builder` deliberately excludes `NamespaceConflict` from its
+/// internal retry — re-staging would consume the already-built
+/// `stage_result`. The consensus layer (this loop) preserves the
+/// request body across attempts, so it's the right altitude.
+fn is_retryable_txn_conflict(e: &ApiError) -> bool {
+    matches!(
+        e,
+        ApiError::Transact(
+            TransactError::CommitConflict { .. }
+                | TransactError::PublishLostRace { .. }
+                | TransactError::NamespaceConflict(_)
+        )
+    )
+}
 
 /// Per-operation execution path against a local [`Fluree`] instance.
 ///
@@ -69,41 +104,77 @@ impl Committer for LocalCommitter {
             .await
             .map_err(execution_failure)?;
 
-        let policy_ctx = build_policy_context(&ledger_handle, &governance).await?;
+        // Bounded reconcile-and-retry around stage + commit. See
+        // [`is_retryable_txn_conflict`] for the conflict variants that
+        // heal via `refresh()` + re-stage. Each attempt rebuilds the
+        // policy context (against the post-refresh snapshot) and the
+        // builder from scratch — the body is borrowed, so the
+        // per-iteration cost is one extra clone of `TxnOpts` /
+        // `CommitOpts` / `TrackingOptions`.
+        let mut last_error: Option<ApiError> = None;
+        for attempt in 1..=MAX_TXN_RETRIES {
+            let policy_ctx = build_policy_context(&ledger_handle, &governance).await?;
 
-        // The builder API holds the ledger write lock and replaces the cached
-        // state internally for the duration of stage + commit — no manual
-        // lock/clone/replace dance is needed here. Each body variant fixes
-        // both the parser path and the insert/upsert/update semantics.
-        let staged = self.fluree.stage(&ledger_handle);
-        let staged = match &body {
-            TransactionBody::JsonLdInsert(json) => staged.insert(json),
-            TransactionBody::JsonLdUpsert(json) => staged.upsert(json),
-            TransactionBody::JsonLdUpdate(json) => staged.update(json),
-            TransactionBody::TurtleInsert(text) => staged.insert_turtle(text.as_str()),
-            TransactionBody::TurtleUpsert(text) | TransactionBody::TrigUpsert(text) => {
-                staged.upsert_turtle(text.as_str())
+            // The builder API holds the ledger write lock and replaces the cached
+            // state internally for the duration of stage + commit — no manual
+            // lock/clone/replace dance is needed here. Each body variant fixes
+            // both the parser path and the insert/upsert/update semantics.
+            let staged = self.fluree.stage(&ledger_handle);
+            let staged = match &body {
+                TransactionBody::JsonLdInsert(json) => staged.insert(json),
+                TransactionBody::JsonLdUpsert(json) => staged.upsert(json),
+                TransactionBody::JsonLdUpdate(json) => staged.update(json),
+                TransactionBody::TurtleInsert(text) => staged.insert_turtle(text.as_str()),
+                TransactionBody::TurtleUpsert(text) | TransactionBody::TrigUpsert(text) => {
+                    staged.upsert_turtle(text.as_str())
+                }
+                TransactionBody::Sparql(query) => staged.sparql_update(query.as_str()),
+            };
+            let mut builder = staged
+                .txn_opts(txn_opts.clone())
+                .commit_opts(commit_opts.clone())
+                .index_config(self.index_config.clone());
+            if let Some(tracking) = tracking.clone() {
+                builder = builder.tracking(tracking);
             }
-            TransactionBody::Sparql(query) => staged.sparql_update(query.as_str()),
-        };
-        let mut builder = staged
-            .txn_opts(txn_opts)
-            .commit_opts(commit_opts)
-            .index_config(self.index_config.clone());
-        if let Some(tracking) = tracking {
-            builder = builder.tracking(tracking);
-        }
-        if let Some(policy) = policy_ctx {
-            builder = builder.policy(policy);
+            if let Some(policy) = policy_ctx {
+                builder = builder.policy(policy);
+            }
+
+            match builder.execute().await {
+                Ok(result) => {
+                    return Ok(TransactionReceipt {
+                        idempotency_key,
+                        commit: result.receipt,
+                        tally: result.tally,
+                    });
+                }
+                Err(e) if attempt < MAX_TXN_RETRIES && is_retryable_txn_conflict(&e) => {
+                    tracing::warn!(
+                        attempt,
+                        max_attempts = MAX_TXN_RETRIES,
+                        error = %e,
+                        "transaction commit conflict; reconciling cached state and retrying"
+                    );
+                    if let Err(refresh_err) =
+                        self.fluree.refresh(&ledger_id, RefreshOpts::default()).await
+                    {
+                        tracing::warn!(
+                            attempt,
+                            error = %refresh_err,
+                            "refresh during commit-conflict retry failed; retrying anyway"
+                        );
+                    }
+                    last_error = Some(e);
+                    continue;
+                }
+                Err(e) => return Err(execution_failure(e)),
+            }
         }
 
-        let result = builder.execute().await.map_err(execution_failure)?;
-
-        Ok(TransactionReceipt {
-            idempotency_key,
-            commit: result.receipt,
-            tally: result.tally,
-        })
+        Err(execution_failure(last_error.unwrap_or_else(|| {
+            ApiError::internal("transaction failed after retries with no captured error")
+        })))
     }
 
     async fn revert(&self, request: RevertRequest) -> Result<RevertReceipt, SubmissionError> {
@@ -291,4 +362,49 @@ pub(crate) async fn build_policy_context(
     .await
     .map(Some)
     .map_err(execution_failure)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retryable_includes_the_three_inter_writer_conflicts() {
+        assert!(is_retryable_txn_conflict(&ApiError::Transact(
+            TransactError::CommitConflict {
+                expected_t: 5,
+                head_t: 6,
+            },
+        )));
+        assert!(is_retryable_txn_conflict(&ApiError::Transact(
+            TransactError::PublishLostRace {
+                ledger_id: "db:main".into(),
+                attempted_t: 5,
+                attempted_commit_id: "a".into(),
+                published_t: 5,
+                published_commit_id: "b".into(),
+            },
+        )));
+        assert!(is_retryable_txn_conflict(&ApiError::Transact(
+            TransactError::NamespaceConflict("ex".into()),
+        )));
+    }
+
+    #[test]
+    fn retryable_excludes_non_inter_writer_conflicts() {
+        // EmptyTransaction is a client-side error — retrying with the
+        // same body produces the same result. Must NOT loop.
+        assert!(!is_retryable_txn_conflict(&ApiError::Transact(
+            TransactError::EmptyTransaction,
+        )));
+        // CommitIdMismatch indicates the head was rewritten under us in
+        // a way refresh can't reconcile (snapshot taken at the wrong
+        // moment); a retry would hit the same mismatch.
+        assert!(!is_retryable_txn_conflict(&ApiError::Transact(
+            TransactError::CommitIdMismatch {
+                expected: "a".into(),
+                found: "b".into(),
+            },
+        )));
+    }
 }
