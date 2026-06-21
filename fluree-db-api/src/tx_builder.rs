@@ -1225,10 +1225,19 @@ impl Fluree {
             .with_txn_meta(txn_meta)
             .with_graph_delta(graph_delta.into_iter().collect());
 
-        // Finish the raw-txn upload before invoking the build phase
-        // (build_commit is now pure and does no I/O). The result CID
-        // ends up referenced by the commit record.
-        let txn_id = if let Some(pending) = commit_opts.raw_txn_upload.take() {
+        // Resolve the raw-txn CID before invoking the build phase
+        // (build_commit is now pure and does no I/O). A pre-resolved
+        // `raw_txn_id` (carried e.g. through the Raft queue envelope
+        // by a leader that already awaited the upload) wins over a
+        // local pending upload — both pointing to the same CID would
+        // be redundant work. The result CID ends up referenced by the
+        // commit record.
+        let txn_id = if let Some(cid) = commit_opts.raw_txn_id.take() {
+            // Drop any redundant pending upload — its blob (if it
+            // landed) shares the same CID and stays content-addressed.
+            commit_opts.raw_txn_upload.take();
+            Some(cid)
+        } else if let Some(pending) = commit_opts.raw_txn_upload.take() {
             Some(pending.finish().await.map_err(ApiError::from)?)
         } else {
             None

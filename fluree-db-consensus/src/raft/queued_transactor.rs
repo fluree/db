@@ -346,10 +346,31 @@ impl Committer for QueuedTransactor {
             ledger_id,
             body,
             txn_opts,
-            commit_opts,
+            mut commit_opts,
             tracking,
             governance,
         } = request;
+
+        // Resolve any pending raw-txn upload on the leader and carry
+        // the CID through the queue envelope. The worker only sees
+        // the parsed body, which is insufficient when the original
+        // payload is a signed credential envelope (the canonical
+        // body and the raw payload differ). Resolving here also
+        // means the upload happens once per submission rather than
+        // re-running on each worker retry.
+        let raw_txn_id = if let Some(pending) = commit_opts.raw_txn_upload.take() {
+            Some(
+                pending
+                    .finish()
+                    .await
+                    .map_err(|e| SubmissionError::Execution {
+                        status: 500,
+                        message: format!("raw_txn upload failed: {e}"),
+                    })?,
+            )
+        } else {
+            commit_opts.raw_txn_id.take()
+        };
 
         // Canonical `name:branch` form drives both the
         // [`IdempotencyCacheKey`] (so retries that elide the
@@ -376,10 +397,12 @@ impl Committer for QueuedTransactor {
             .map(|k| IdempotencyCacheKey::new(ledger_id.clone(), k.clone()));
 
         let body_kind = BodyKind::from(&body);
+        let mut commit_opts_request = CommitOptsRequest::from(&commit_opts);
+        commit_opts_request.raw_txn_id = raw_txn_id;
         let envelope = QueuedRequest::Transact(Box::new(QueuedTransact {
             body,
             txn_opts,
-            commit_opts: CommitOptsRequest::from(&commit_opts),
+            commit_opts: commit_opts_request,
             tracking,
             governance,
         }));

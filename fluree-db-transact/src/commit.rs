@@ -121,6 +121,12 @@ pub struct CommitOpts {
     /// caller of [`build_commit`] just before staging completes, so the
     /// upload overlaps staging CPU work on the caller's path.
     pub raw_txn_upload: Option<PendingRawTxnUpload>,
+    /// Pre-resolved raw-txn ContentId. Set when the upload was already
+    /// awaited upstream (e.g. on the Raft leader before enqueueing, so
+    /// the CID can travel through the queue envelope and be reattached
+    /// worker-side). When both this and `raw_txn_upload` are set,
+    /// [`build_commit`] prefers this CID and discards the upload.
+    pub raw_txn_id: Option<ContentId>,
     /// Ed25519 signing key for commit signatures (opt-in).
     /// When set, the commit blob includes a trailing signature block.
     pub signing_key: Option<Arc<SigningKey>>,
@@ -170,6 +176,7 @@ impl std::fmt::Debug for CommitOpts {
         f.debug_struct("CommitOpts")
             .field("identity", &self.identity)
             .field("raw_txn_upload", &self.raw_txn_upload.is_some())
+            .field("raw_txn_id", &self.raw_txn_id)
             .field("signing_key", &self.signing_key.is_some())
             .field(
                 "txn_signature",
@@ -200,6 +207,7 @@ impl Clone for CommitOpts {
         Self {
             identity: self.identity.clone(),
             raw_txn_upload: None,
+            raw_txn_id: self.raw_txn_id.clone(),
             signing_key: self.signing_key.clone(),
             txn_signature: self.txn_signature.clone(),
             txn_meta: self.txn_meta.clone(),
@@ -320,8 +328,9 @@ impl CommitOpts {
 /// Fields excluded by design:
 /// - `signing_key` — node-level credential resolved worker-side from
 ///   local config, never transmitted with the request.
-/// - `raw_txn_upload` — runtime task; the worker re-spawns it from the
-///   body bytes.
+/// - `raw_txn_upload` — runtime task; the leader awaits any pending
+///   upload before enqueueing and carries the resolved CID via
+///   `raw_txn_id`, so the worker doesn't re-do the upload.
 /// - `graph_delta` / `namespace_delta` / `skip_backpressure` /
 ///   `skip_sequencing` / `merge_parents` — populated during staging or
 ///   reserved for the rebase/merge paths, which carry their own
@@ -332,18 +341,28 @@ pub struct CommitOptsRequest {
     pub txn_signature: Option<TxnSignature>,
     pub txn_meta: Vec<TxnMetaEntry>,
     pub timestamp: Option<String>,
+    /// Pre-resolved raw-txn CID. Set when the upstream caller's
+    /// [`CommitOpts::raw_txn_upload`] was awaited before projection
+    /// (e.g. by the Raft leader so the worker can reference the same
+    /// raw payload the client submitted). When `None`, the worker's
+    /// staging path may re-derive the upload from the parsed body when
+    /// `txn_opts.store_raw_txn` is set.
+    #[serde(default)]
+    pub raw_txn_id: Option<ContentId>,
 }
 
 impl CommitOptsRequest {
     /// Lift the request-side projection into a runtime [`CommitOpts`].
     /// Node-side and staging-side fields stay at their defaults; the
     /// worker layers them in (e.g. attaching `signing_key` from local
-    /// config or spawning the `raw_txn_upload`) before passing the opts
-    /// to the staging path.
+    /// config) before passing the opts to the staging path. The
+    /// pre-resolved `raw_txn_id` is reattached so the build path
+    /// references the same raw payload the client uploaded.
     pub fn into_commit_opts(self) -> CommitOpts {
         CommitOpts {
             identity: self.identity,
             raw_txn_upload: None,
+            raw_txn_id: self.raw_txn_id,
             signing_key: None,
             txn_signature: self.txn_signature,
             txn_meta: self.txn_meta,
@@ -365,13 +384,17 @@ impl From<CommitOptsRequest> for CommitOpts {
 
 impl From<&CommitOpts> for CommitOptsRequest {
     /// Extract the serializable client-supplied subset. Node-side and
-    /// staging-side fields are dropped.
+    /// staging-side fields are dropped. `raw_txn_id` passes through
+    /// when already resolved; an unresolved `raw_txn_upload` is not
+    /// awaited here — callers that need it materialized (Raft leader)
+    /// must `finish()` it explicitly before projecting.
     fn from(opts: &CommitOpts) -> Self {
         Self {
             identity: opts.identity.clone(),
             txn_signature: opts.txn_signature.clone(),
             txn_meta: opts.txn_meta.clone(),
             timestamp: opts.timestamp.clone(),
+            raw_txn_id: opts.raw_txn_id.clone(),
         }
     }
 }
