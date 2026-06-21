@@ -8,7 +8,6 @@ mod support;
 
 use fluree_db_api::FlureeBuilder;
 use serde_json::Value as JsonValue;
-use std::sync::Arc;
 use support::{
     assert_index_defaults, genesis_ledger, start_background_indexer_local, trigger_index_and_wait,
     MemoryFluree,
@@ -935,7 +934,10 @@ async fn integer_valued_double_over_indexed_predicate_is_not_corrupted() {
 
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        Arc::new(fluree.nameservice_mode().clone()),
+        fluree
+            .nameservice_mode()
+            .as_arc_indexing_nameservice()
+            .expect("test fluree has indexing nameservice"),
         fluree_db_indexer::IndexerConfig::small(),
     );
 
