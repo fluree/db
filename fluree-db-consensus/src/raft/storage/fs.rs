@@ -229,23 +229,41 @@ impl RaftLogStore for FsRaftLogStore {
             return Ok(());
         }
 
+        // Persist the marker BEFORE deleting any entry files. A crash
+        // after the marker but before all deletions leaves orphans at
+        // indices <= log_id.index, which `log_state` / `read_range`
+        // filter out via the marker; openraft sees a consistent
+        // (last_purged, last_log] window. The reverse order would
+        // leave entries 1..k missing with `last_purged` still
+        // pointing at an older id — a hole openraft cannot reconcile.
+        let bytes = postcard::to_allocvec(&log_id).map_err(|e| ser_err("encode last_purged", e))?;
+        atomic_write(&self.last_purged_path(), &bytes).await?;
+
         let indices = self.list_entry_indices().await?;
         for idx in indices.into_iter().filter(|&i| i <= log_id.index) {
             remove_if_exists(&self.entry_path(idx)).await?;
         }
-
-        let bytes = postcard::to_allocvec(&log_id).map_err(|e| ser_err("encode last_purged", e))?;
-        atomic_write(&self.last_purged_path(), &bytes).await
+        Ok(())
     }
 
     async fn log_state(&self) -> Result<LogState, StorageError> {
-        let indices = self.list_entry_indices().await?;
-        let last_log = if let Some(&max_idx) = indices.last() {
-            self.read_entry(max_idx).await?.map(|e| e.log_id)
-        } else {
-            None
-        };
         let last_purged = self.read_last_purged().await?;
+        let purged_cutoff = last_purged.map(|p| p.index);
+        let indices = self.list_entry_indices().await?;
+        // `last_log` reflects only entries strictly above
+        // `last_purged`; orphans at indices <= cutoff (left behind by
+        // a crashed `purge_through` between marker write and
+        // deletion) must not bump `last_log` or openraft sees a
+        // last_log inside the purged range.
+        let last_log = match indices
+            .iter()
+            .rev()
+            .find(|&&idx| purged_cutoff.is_none_or(|c| idx > c))
+            .copied()
+        {
+            Some(idx) => self.read_entry(idx).await?.map(|e| e.log_id),
+            None => None,
+        };
         Ok(LogState {
             last_purged,
             last_log,
@@ -489,6 +507,66 @@ mod tests {
         store.purge_through(LogId::new(1, 1)).await.unwrap();
         let state = store.log_state().await.unwrap();
         assert_eq!(state.last_purged, Some(LogId::new(1, 2)));
+    }
+
+    /// Simulates a crash after `purge_through` wrote the marker but
+    /// before all entry files at or below it were deleted. The
+    /// orphans must be invisible to openraft: `log_state` reports
+    /// `last_log` from entries strictly above the marker, and
+    /// `read_range` returns only the live tail.
+    #[tokio::test]
+    async fn log_state_hides_orphans_below_last_purged() {
+        let (_dir, store) = fresh_log_store().await;
+        store
+            .append(&[entry(1, 1), entry(1, 2), entry(1, 3), entry(2, 4)])
+            .await
+            .unwrap();
+
+        // Hand-write the marker as if a purge through index 3 had
+        // gotten that far. Entries 1..3 are still on disk — those
+        // are the orphans the next-step deletion would have removed.
+        let marker =
+            postcard::to_allocvec(&LogId::new(1, 3)).expect("encode last_purged for fixture");
+        atomic_write(&store.last_purged_path(), &marker)
+            .await
+            .expect("write last_purged fixture");
+
+        let state = store.log_state().await.unwrap();
+        assert_eq!(state.last_purged, Some(LogId::new(1, 3)));
+        assert_eq!(
+            state.last_log,
+            Some(LogId::new(2, 4)),
+            "last_log must come from entries strictly above last_purged"
+        );
+
+        // A range covering everything above the marker must not be
+        // affected by the orphans.
+        let tail = store.read_range(4..100).await.unwrap();
+        assert_eq!(tail.len(), 1);
+        assert_eq!(tail[0].log_id, LogId::new(2, 4));
+    }
+
+    /// Edge case: a marker is in place and every entry at or below
+    /// it survives (none above). `log_state` must report `last_log =
+    /// None` so the openraft adapter falls back to the marker
+    /// instead of advertising an orphan as the live tail.
+    #[tokio::test]
+    async fn log_state_returns_none_when_only_orphans_remain() {
+        let (_dir, store) = fresh_log_store().await;
+        store.append(&[entry(1, 1), entry(1, 2)]).await.unwrap();
+
+        let marker =
+            postcard::to_allocvec(&LogId::new(1, 5)).expect("encode last_purged for fixture");
+        atomic_write(&store.last_purged_path(), &marker)
+            .await
+            .expect("write last_purged fixture");
+
+        let state = store.log_state().await.unwrap();
+        assert_eq!(state.last_purged, Some(LogId::new(1, 5)));
+        assert!(
+            state.last_log.is_none(),
+            "orphans below the marker must not surface as last_log"
+        );
     }
 
     #[tokio::test]
