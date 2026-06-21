@@ -478,7 +478,6 @@ pub enum Command {
         /// the [`recently_cleared`](NameServiceState::recently_cleared)
         /// marker so [`Command::EvictIdempotency`] can age out
         /// markers no worker ever consumed.
-        #[serde(default)]
         applied_at_millis: u64,
     },
     /// Non-monotonic head reset for rebase/merge rollback. Sets
@@ -490,7 +489,6 @@ pub enum Command {
         branch: String,
         snapshot: ResetHeadSnapshot,
         /// See [`Command::DropBranch::applied_at_millis`].
-        #[serde(default)]
         applied_at_millis: u64,
     },
     /// Soft-drop a branch: mark it retracted but leave its
@@ -502,7 +500,6 @@ pub enum Command {
         ledger_id: String,
         branch: String,
         /// See [`Command::DropBranch::applied_at_millis`].
-        #[serde(default)]
         applied_at_millis: u64,
     },
     /// Hard-drop a branch: remove its [`RefEntry`], retraction mark,
@@ -513,7 +510,6 @@ pub enum Command {
         ledger_id: String,
         branch: String,
         /// See [`Command::DropBranch::applied_at_millis`].
-        #[serde(default)]
         applied_at_millis: u64,
     },
     /// Signal that the named content blob is no longer referenced
@@ -534,7 +530,6 @@ pub enum Command {
         expected: Option<RefValue>,
         new: RefValue,
         /// See [`Command::DropBranch::applied_at_millis`].
-        #[serde(default)]
         applied_at_millis: u64,
     },
     /// CAS push for one branch's operational status. Mirrors the
@@ -614,7 +609,6 @@ pub enum Command {
     /// life than idempotency cache entries.
     EvictIdempotency {
         cutoff_millis: u64,
-        #[serde(default)]
         marker_cutoff_millis: u64,
     },
 }
