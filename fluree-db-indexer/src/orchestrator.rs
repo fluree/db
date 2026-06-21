@@ -451,15 +451,43 @@ impl IndexerOrchestrator {
 /// Per-ledger state map
 type LedgerStates = BTreeMap<String, LedgerIndexState>;
 
-/// Handle for triggering background indexing
-///
-/// Provides APIs for:
-/// - Triggering indexing with completion tracking
-/// - Cancelling pending work
-/// - Checking status
-/// - Waiting for idle state
+/// Fires its inner `oneshot::Sender<()>` on drop. Wrapped in an
+/// `Arc` and shared across every external `IndexerHandle` clone so
+/// the worker's `oneshot::Receiver<()>` wakes exactly when the *last*
+/// external handle is dropped — distinct from the watch::Sender count
+/// the trigger path also relies on (which the worker and subscriber
+/// must keep alive to do their job).
+struct ShutdownTrigger {
+    tx: std::sync::Mutex<Option<oneshot::Sender<()>>>,
+}
+
+impl ShutdownTrigger {
+    /// Returns the trigger (held by every `IndexerHandle` clone) and
+    /// the matching receiver (held by the worker).
+    fn pair() -> (Arc<Self>, oneshot::Receiver<()>) {
+        let (tx, rx) = oneshot::channel();
+        let trigger = Arc::new(Self {
+            tx: std::sync::Mutex::new(Some(tx)),
+        });
+        (trigger, rx)
+    }
+}
+
+impl Drop for ShutdownTrigger {
+    fn drop(&mut self) {
+        if let Some(tx) = self.tx.lock().expect("ShutdownTrigger mutex poisoned").take() {
+            let _ = tx.send(());
+        }
+    }
+}
+
+/// Bits the worker and event-subscriber need to wake the indexer and
+/// mutate per-ledger state. Carved off from [`IndexerHandle`] so the
+/// subscriber (and the worker itself) can hold what they need without
+/// holding the [`ShutdownTrigger`] that fires the worker's exit
+/// signal when the last external handle drops.
 #[derive(Clone)]
-pub struct IndexerHandle {
+pub struct TriggerHandle {
     /// Per-ledger state (shared with worker)
     states: Arc<Mutex<LedgerStates>>,
     /// Signal to wake the worker
@@ -468,16 +496,44 @@ pub struct IndexerHandle {
     idle_notify: Arc<Notify>,
 }
 
-impl std::fmt::Debug for IndexerHandle {
+impl std::fmt::Debug for TriggerHandle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("IndexerHandle")
+        f.debug_struct("TriggerHandle")
             .field("states", &"<Mutex<LedgerStates>>")
             .field("tick", &"<watch::Sender>")
             .finish()
     }
 }
 
-impl IndexerHandle {
+/// Handle for triggering background indexing
+///
+/// Provides APIs for:
+/// - Triggering indexing with completion tracking
+/// - Cancelling pending work
+/// - Checking status
+/// - Waiting for idle state
+///
+/// Cloneable and reference-counted. The worker watches for the drop
+/// of the *last* clone via a [`ShutdownTrigger`] — distinct from the
+/// internal wake path so the subscriber spawn can keep a
+/// [`TriggerHandle`] alive without preventing shutdown.
+#[derive(Clone)]
+pub struct IndexerHandle {
+    trigger: TriggerHandle,
+    /// Holding this Arc bumps the shutdown trigger's strong count;
+    /// dropping the last clone fires the worker's `shutdown_rx`.
+    _shutdown: Arc<ShutdownTrigger>,
+}
+
+impl std::fmt::Debug for IndexerHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IndexerHandle")
+            .field("trigger", &self.trigger)
+            .finish()
+    }
+}
+
+impl TriggerHandle {
     /// Trigger indexing for a ledger with completion tracking
     ///
     /// Returns a completion handle that resolves when `index_t >= min_t`.
@@ -654,6 +710,55 @@ impl IndexerHandle {
     }
 }
 
+impl IndexerHandle {
+    /// Trigger indexing for a ledger with completion tracking. See
+    /// [`TriggerHandle::trigger`].
+    pub async fn trigger(&self, ledger_id: impl Into<String>, min_t: i64) -> IndexCompletion {
+        self.trigger.trigger(ledger_id, min_t).await
+    }
+
+    /// Cancel pending/queued work for a ledger. See
+    /// [`TriggerHandle::cancel`].
+    pub async fn cancel(&self, ledger_id: &str) -> bool {
+        self.trigger.cancel(ledger_id).await
+    }
+
+    /// Cancel all pending work. See [`TriggerHandle::cancel_all`].
+    pub async fn cancel_all(&self) {
+        self.trigger.cancel_all().await
+    }
+
+    /// Snapshot the per-ledger indexing status. See
+    /// [`TriggerHandle::status`].
+    pub async fn status(&self, ledger_id: &str) -> Option<IndexStatusSnapshot> {
+        self.trigger.status(ledger_id).await
+    }
+
+    /// Check if a ledger has pending/in-progress work. See
+    /// [`TriggerHandle::is_pending`].
+    pub async fn is_pending(&self, ledger_id: &str) -> bool {
+        self.trigger.is_pending(ledger_id).await
+    }
+
+    /// List all ledgers with pending/in-progress work. See
+    /// [`TriggerHandle::pending_ledgers`].
+    pub async fn pending_ledgers(&self) -> Vec<String> {
+        self.trigger.pending_ledgers().await
+    }
+
+    /// Wait until a specific ledger has no pending work. See
+    /// [`TriggerHandle::wait_for_idle`].
+    pub async fn wait_for_idle(&self, ledger_id: &str) {
+        self.trigger.wait_for_idle(ledger_id).await
+    }
+
+    /// Wait until every ledger has no pending work. See
+    /// [`TriggerHandle::wait_all_idle`].
+    pub async fn wait_all_idle(&self) {
+        self.trigger.wait_all_idle().await
+    }
+}
+
 /// Background indexer worker with predicate-based completion
 ///
 /// This worker processes index requests one ledger at a time with:
@@ -666,13 +771,27 @@ pub struct BackgroundIndexerWorker {
     backend: StorageBackend,
     nameservice: Arc<dyn IndexingNameService>,
     config: IndexerConfig,
-    /// Shared with the handle returned from [`new`](Self::new) and
-    /// cloned for the internal event-bus subscriber.
-    handle: IndexerHandle,
+    /// Shared with the handle returned from [`new`](Self::new). The
+    /// worker reads/writes this directly; it intentionally does *not*
+    /// hold an `IndexerHandle` so dropping the last external handle
+    /// can fire the shutdown trigger.
+    states: Arc<Mutex<LedgerStates>>,
+    /// Shared with the handle; notified when work drains.
+    idle_notify: Arc<Notify>,
     tick_rx: watch::Receiver<u64>,
+    /// Fires when the last external `IndexerHandle` clone drops. The
+    /// run loop selects on this in addition to `tick_rx.changed()` so
+    /// shutdown doesn't depend on the watch::Sender count (the
+    /// subscriber spawn holds a [`TriggerHandle`] that keeps Senders
+    /// alive while the worker runs).
+    shutdown_rx: oneshot::Receiver<()>,
+    /// Trigger surface handed to the event subscriber when one is
+    /// attached. Holds a Sender but no `ShutdownTrigger`, so the
+    /// subscriber's lifetime doesn't block shutdown.
+    subscriber_trigger: TriggerHandle,
     /// When set, [`run`](Self::run) subscribes and translates
     /// [`NameServiceEvent::LedgerCommitPublished`] into
-    /// [`IndexerHandle::trigger`] calls.
+    /// [`TriggerHandle::trigger`] calls.
     event_bus: Option<Arc<LedgerEventBus>>,
     /// Bounds concurrent detached background-GC tasks. Each successful index
     /// spawns at most one GC pass; without a cap, a slow `clean_garbage`
@@ -700,19 +819,27 @@ impl BackgroundIndexerWorker {
         let states = Arc::new(Mutex::new(BTreeMap::new()));
         let (tick_tx, tick_rx) = watch::channel(0u64);
         let idle_notify = Arc::new(Notify::new());
+        let (shutdown, shutdown_rx) = ShutdownTrigger::pair();
 
-        let handle = IndexerHandle {
-            states,
+        let trigger = TriggerHandle {
+            states: Arc::clone(&states),
             tick: tick_tx,
-            idle_notify,
+            idle_notify: Arc::clone(&idle_notify),
+        };
+        let handle = IndexerHandle {
+            trigger: trigger.clone(),
+            _shutdown: shutdown,
         };
 
         let worker = Self {
             backend,
             nameservice,
             config,
-            handle: handle.clone(),
+            states,
+            idle_notify,
             tick_rx,
+            shutdown_rx,
+            subscriber_trigger: trigger,
             event_bus: None,
             gc_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_GC)),
         };
@@ -741,10 +868,16 @@ impl BackgroundIndexerWorker {
         // the subscriber — its broadcast receiver doesn't otherwise
         // observe cancellation.
         let _subscriber_guard = self.event_bus.clone().map(|bus| {
-            let handle = self.handle.clone();
+            // Hand the subscriber the trigger surface, not the full
+            // `IndexerHandle`. The subscriber keeps a `watch::Sender`
+            // alive (so trigger() can wake the worker), but it does
+            // *not* hold the `ShutdownTrigger` Arc — otherwise the
+            // subscriber's lifetime would block the worker's shutdown
+            // signal from firing.
+            let trigger = self.subscriber_trigger.clone();
             let nameservice = Arc::clone(&self.nameservice);
             AbortOnDrop(tokio::spawn(async move {
-                run_event_subscriber(bus, handle, nameservice).await;
+                run_event_subscriber(bus, trigger, nameservice).await;
             }))
         });
 
@@ -758,7 +891,7 @@ impl BackgroundIndexerWorker {
             // iteration, hot-spinning the worker. `is_processable()` keeps this
             // in lockstep with the processing scan below.
             let retry_deadline = {
-                let states = self.handle.states.lock().await;
+                let states = self.states.lock().await;
                 states
                     .values()
                     .filter(|s| s.is_processable())
@@ -766,29 +899,37 @@ impl BackgroundIndexerWorker {
                     .min()
             };
 
-            // Wait for tick OR retry deadline (whichever comes first)
+            // Wait for tick OR retry deadline (whichever comes first),
+            // with explicit shutdown observation. The shutdown signal
+            // is independent of `tick_rx.changed()` because the
+            // subscriber spawn keeps a `watch::Sender` alive — see
+            // `subscriber_trigger`.
             let wait_result = if let Some(deadline) = retry_deadline {
                 tokio::select! {
+                    _ = &mut self.shutdown_rx => { break; }
                     result = self.tick_rx.changed() => result,
                     () = tokio::time::sleep_until(deadline) => Ok(()),
                 }
             } else {
-                self.tick_rx.changed().await
+                tokio::select! {
+                    _ = &mut self.shutdown_rx => { break; }
+                    result = self.tick_rx.changed() => result,
+                }
             };
 
             if wait_result.is_err() {
-                // All senders dropped - resolve remaining waiters and shutdown
-                let mut states = self.handle.states.lock().await;
-                for state in states.values_mut() {
-                    state.resolve_waiters_below(i64::MAX, IndexOutcome::Cancelled);
-                }
+                // Defensive: the shutdown_rx path above is the
+                // primary exit, but if every Sender drops (e.g.
+                // someone disabled the subscriber path) the watch
+                // channel still signals shutdown the old way. Treat
+                // it identically — drain waiters and exit.
                 break;
             }
 
             // Collect ledgers that need processing
             let now = tokio::time::Instant::now();
             let ledgers_to_process: Vec<String> = {
-                let states = self.handle.states.lock().await;
+                let states = self.states.lock().await;
                 states
                     .iter()
                     .filter(|(_, state)| {
@@ -821,7 +962,7 @@ impl BackgroundIndexerWorker {
                         "Indexer process_ledger PANICKED; isolating so the worker survives, \
                          scheduling retry"
                     );
-                    let mut states = self.handle.states.lock().await;
+                    let mut states = self.states.lock().await;
                     if let Some(state) = states.get_mut(&ledger_id) {
                         state.last_error = Some("indexer task panicked".to_string());
                         if state.cancelled {
@@ -855,7 +996,7 @@ impl BackgroundIndexerWorker {
                     // catch a missed InProgress→terminal transition here rather
                     // than relying on every branch (see
                     // `normalize_orphaned_inprogress`).
-                    let mut states = self.handle.states.lock().await;
+                    let mut states = self.states.lock().await;
                     if let Some(state) = states.get_mut(&ledger_id) {
                         if let Some(demoted_to) = state.normalize_orphaned_inprogress() {
                             warn!(
@@ -874,7 +1015,7 @@ impl BackgroundIndexerWorker {
             // states map stays sized to the active working set (it otherwise
             // grows once per distinct ledger and never shrinks).
             {
-                let mut states = self.handle.states.lock().await;
+                let mut states = self.states.lock().await;
                 for state in states.values_mut() {
                     if !state.cancelled {
                         continue;
@@ -912,8 +1053,19 @@ impl BackgroundIndexerWorker {
             }
 
             // Notify idle waiters
-            self.handle.idle_notify.notify_waiters();
+            self.idle_notify.notify_waiters();
         }
+
+        // Loop exited (shutdown signal or all watch::Senders gone).
+        // Drain every pending waiter as Cancelled so callers parked
+        // on a `trigger()` future stop waiting; without this they'd
+        // sit on their oneshot until the sender is finally dropped
+        // when the state map is freed.
+        let mut states = self.states.lock().await;
+        for state in states.values_mut() {
+            state.resolve_waiters_below(i64::MAX, IndexOutcome::Cancelled);
+        }
+        self.idle_notify.notify_waiters();
     }
 
     /// Process a single ledger
@@ -922,7 +1074,7 @@ impl BackgroundIndexerWorker {
 
         let (pending_min_t, waiter_count, retry_count) = {
             let lock_started = Instant::now();
-            let states = self.handle.states.lock().await;
+            let states = self.states.lock().await;
             debug!(
                 ledger_id = %ledger_id,
                 lock_wait_ms = lock_started.elapsed().as_millis(),
@@ -942,7 +1094,7 @@ impl BackgroundIndexerWorker {
         // Mark as in-progress
         {
             let lock_started = Instant::now();
-            let mut states = self.handle.states.lock().await;
+            let mut states = self.states.lock().await;
             debug!(
                 ledger_id = %ledger_id,
                 lock_wait_ms = lock_started.elapsed().as_millis(),
@@ -986,7 +1138,7 @@ impl BackgroundIndexerWorker {
             Ok(Some(r)) => r,
             Ok(None) => {
                 // Ledger doesn't exist - resolve waiters as failed
-                let mut states = self.handle.states.lock().await;
+                let mut states = self.states.lock().await;
                 if let Some(state) = states.get_mut(ledger_id) {
                     state.resolve_waiters_below(
                         i64::MAX,
@@ -1030,7 +1182,7 @@ impl BackgroundIndexerWorker {
                 commit_t = record.commit_t,
                 "Waiting for state lock before queued indexing gate"
             );
-            let mut states = self.handle.states.lock().await;
+            let mut states = self.states.lock().await;
             debug!(
                 ledger_id = %ledger_id,
                 lock_wait_ms = lock_started.elapsed().as_millis(),
@@ -1171,7 +1323,7 @@ impl BackgroundIndexerWorker {
                 commit_t = record.commit_t,
                 "Queued indexing request already satisfied"
             );
-            let mut states = self.handle.states.lock().await;
+            let mut states = self.states.lock().await;
             if let Some(state) = states.get_mut(ledger_id) {
                 // Resolve waiters that can be satisfied
                 if let Some(root_id) = &record.index_head_id {
@@ -1234,7 +1386,7 @@ impl BackgroundIndexerWorker {
                     error = %e,
                     "Failed to build branched content store for indexing; aborting build"
                 );
-                let mut states = self.handle.states.lock().await;
+                let mut states = self.states.lock().await;
                 if let Some(state) = states.get_mut(ledger_id) {
                     state.last_error = Some(e.to_string());
                     state.phase = IndexPhase::Pending;
@@ -1384,7 +1536,7 @@ impl BackgroundIndexerWorker {
                     // Resolve waiters. Coalesced waiters all receive the same
                     // fuel value — the cost of the single build that
                     // satisfied them.
-                    let mut states = self.handle.states.lock().await;
+                    let mut states = self.states.lock().await;
                     if let Some(state) = states.get_mut(ledger_id) {
                         let outcome = IndexOutcome::Completed {
                             index_t: index_result.index_t,
@@ -1421,7 +1573,7 @@ impl BackgroundIndexerWorker {
 
     /// Schedule a retry with exponential backoff
     async fn schedule_retry(&self, ledger_id: &str, error: &str) {
-        let mut states = self.handle.states.lock().await;
+        let mut states = self.states.lock().await;
         if let Some(state) = states.get_mut(ledger_id) {
             // Check if cancelled - don't retry
             if state.cancelled {
@@ -1467,7 +1619,7 @@ impl Drop for AbortOnDrop {
 /// Trigger every ledger whose `commit_t > index_t`. Safe to call
 /// repeatedly — the handle coalesces redundant triggers.
 /// Nameservice errors are logged and swallowed.
-async fn catch_up_sweep(handle: &IndexerHandle, nameservice: &dyn IndexingNameService) {
+async fn catch_up_sweep(handle: &TriggerHandle, nameservice: &dyn IndexingNameService) {
     let records = match nameservice.all_records().await {
         Ok(records) => records,
         Err(e) => {
@@ -1494,7 +1646,7 @@ async fn catch_up_sweep(handle: &IndexerHandle, nameservice: &dyn IndexingNameSe
 /// startup and on `Lagged`. Returns when the bus closes.
 async fn run_event_subscriber(
     bus: Arc<LedgerEventBus>,
-    handle: IndexerHandle,
+    handle: TriggerHandle,
     nameservice: Arc<dyn IndexingNameService>,
 ) {
     // Subscribe before the catch-up sweep so events arriving during
@@ -2384,7 +2536,7 @@ mod tests {
         // Put it into backoff.
         worker.schedule_retry("test:main", "boom").await;
         {
-            let states = handle.states.lock().await;
+            let states = handle.trigger.states.lock().await;
             let state = states.get("test:main").expect("state exists");
             assert!(state.next_retry_at.is_some());
             assert!(state.retry_count > 0);
@@ -2393,7 +2545,7 @@ mod tests {
         // New trigger should clear backoff.
         let _c2 = handle.trigger("test:main", 2).await;
         {
-            let states = handle.states.lock().await;
+            let states = handle.trigger.states.lock().await;
             let state = states.get("test:main").expect("state exists");
             assert!(state.next_retry_at.is_none());
             assert_eq!(state.retry_count, 0);
@@ -2419,7 +2571,7 @@ mod tests {
         let _c1 = handle.trigger("test:main", 1).await;
         worker.schedule_retry("test:main", "boom").await;
         {
-            let states = handle.states.lock().await;
+            let states = handle.trigger.states.lock().await;
             assert!(states.get("test:main").unwrap().next_retry_at.is_some());
         }
 
@@ -2427,7 +2579,7 @@ mod tests {
         // un-processable (so it contributes no wake).
         assert!(handle.cancel("test:main").await);
         {
-            let states = handle.states.lock().await;
+            let states = handle.trigger.states.lock().await;
             let state = states.get("test:main").unwrap();
             assert!(state.next_retry_at.is_none());
             assert!(!state.is_processable());
@@ -2454,7 +2606,7 @@ mod tests {
         let future = now + Duration::from_secs(60);
 
         {
-            let mut states = handle.states.lock().await;
+            let mut states = handle.trigger.states.lock().await;
 
             // Cancelled with a stale (past) deadline — must be ignored.
             states.insert(
@@ -2603,7 +2755,7 @@ mod tests {
 
         // Seed a prunable idle entry directly.
         {
-            let mut states = handle.states.lock().await;
+            let mut states = handle.trigger.states.lock().await;
             states.insert("idle:ledger".to_string(), LedgerIndexState::default());
         }
 
@@ -2622,7 +2774,7 @@ mod tests {
         let mut pruned = false;
         for _ in 0..50 {
             {
-                let states = handle.states.lock().await;
+                let states = handle.trigger.states.lock().await;
                 if !states.contains_key("idle:ledger") {
                     pruned = true;
                     break;
@@ -2650,7 +2802,7 @@ mod tests {
         );
 
         {
-            let mut states = handle.states.lock().await;
+            let mut states = handle.trigger.states.lock().await;
             states.insert(
                 "cancelled:done".to_string(),
                 LedgerIndexState {
@@ -2670,7 +2822,7 @@ mod tests {
         let mut pruned = false;
         for _ in 0..50 {
             {
-                let states = handle.states.lock().await;
+                let states = handle.trigger.states.lock().await;
                 if !states.contains_key("cancelled:done") {
                     pruned = true;
                     break;
@@ -2787,7 +2939,7 @@ mod tests {
             let handle = handle.clone();
             let ns = Arc::clone(&ns);
             async move {
-                run_event_subscriber(bus, handle, ns).await;
+                run_event_subscriber(bus, handle.trigger.clone(), ns).await;
             }
         });
 
@@ -2832,7 +2984,7 @@ mod tests {
             .unwrap();
         ns.create_ledger("current:main").unwrap();
 
-        catch_up_sweep(&handle, ns_dyn.as_ref()).await;
+        catch_up_sweep(&handle.trigger, ns_dyn.as_ref()).await;
 
         assert!(
             handle.is_pending("behind:main").await,
@@ -2875,6 +3027,70 @@ mod tests {
             .await
             .expect("run task should resolve after abort");
         assert!(join.is_err() || join.is_ok(), "join returned");
+    }
+
+    /// Dropping the last external [`IndexerHandle`] must fire the
+    /// worker's shutdown signal; the run loop exits gracefully and
+    /// any registered waiters resolve. Before the fix, the worker
+    /// held a clone of `IndexerHandle` internally so the watch
+    /// `Sender` count never dropped to zero and the loop ran forever.
+    #[tokio::test]
+    async fn dropping_last_handle_shuts_down_worker() {
+        let backend = StorageBackend::Managed(Arc::new(MemoryStorage::new()));
+        let ns: Arc<dyn IndexingNameService> = Arc::new(MemoryNameService::new());
+        let (worker, handle) =
+            BackgroundIndexerWorker::new(backend, Arc::clone(&ns), IndexerConfig::default());
+
+        let run_task = tokio::spawn(worker.run());
+
+        // Give the worker a moment to subscribe + park on the select.
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+
+        // Drop the only external handle. The Arc<ShutdownTrigger>
+        // refcount falls to zero, ShutdownTrigger::drop fires the
+        // oneshot, the worker's select arm wakes and breaks out.
+        drop(handle);
+
+        let join = tokio::time::timeout(Duration::from_millis(500), run_task)
+            .await
+            .expect("worker did not shut down after the last handle was dropped");
+        join.expect("worker run() panicked");
+    }
+
+    /// A waiter registered on the handle just before shutdown must
+    /// resolve to [`IndexOutcome::Cancelled`] — not hang forever.
+    #[tokio::test]
+    async fn shutdown_resolves_pending_waiters() {
+        let backend = StorageBackend::Managed(Arc::new(MemoryStorage::new()));
+        // Empty nameservice: trigger creates a pending state but no
+        // commit ever lands, so the waiter would otherwise sit on its
+        // oneshot indefinitely.
+        let ns: Arc<dyn IndexingNameService> = Arc::new(MemoryNameService::new());
+        let (worker, handle) =
+            BackgroundIndexerWorker::new(backend, Arc::clone(&ns), IndexerConfig::default());
+
+        let run_task = tokio::spawn(worker.run());
+
+        // Register a waiter for a min_t that will never be reached.
+        let completion = handle.trigger("never-published:main", 10).await;
+
+        // Drop the last handle to signal shutdown.
+        drop(handle);
+
+        // Waiter must resolve (with Cancelled) within the shutdown
+        // window, not hang forever.
+        let outcome = tokio::time::timeout(Duration::from_millis(500), completion.wait())
+            .await
+            .expect("waiter did not resolve after shutdown");
+        assert!(matches!(outcome, IndexOutcome::Cancelled));
+
+        // And the run task itself should exit cleanly.
+        let join = tokio::time::timeout(Duration::from_millis(500), run_task)
+            .await
+            .expect("worker did not shut down");
+        join.expect("worker run() panicked");
     }
 }
 
