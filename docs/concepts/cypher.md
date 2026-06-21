@@ -10,7 +10,9 @@ quoted-triple annotations are the same data read from two angles.
 
 It is a *subset*: the constructs Fluree does not yet accept are listed under
 [Not yet supported](#not-yet-supported), and each produces a clear error rather
-than silently misbehaving.
+than silently misbehaving. For a feature-by-feature status view — supported,
+divergent-by-design, or deferred — see the
+[openCypher support matrix](../reference/cypher-support-matrix.md).
 
 [opencypher]: https://opencypher.org/resources/
 

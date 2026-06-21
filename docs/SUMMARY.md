@@ -214,6 +214,7 @@
   - [Standards and feature flags](reference/compatibility.md)
   - [Graph identities and naming](reference/graph-identities.md)
   - [OWL & RDFS support](reference/owl-rdfs-support.md)
+  - [openCypher support matrix](reference/cypher-support-matrix.md)
   - [Crate map](reference/crate-map.md)
 
 - [Contributing](contributing/README.md)
