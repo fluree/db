@@ -75,6 +75,74 @@ struct CachedSubmission {
     body_hash: [u8; 32],
 }
 
+/// Outcome of [`CachingCommitter::try_claim_slot`]: either an earlier
+/// submission's recorded receipt (the caller surfaces it), or a claim
+/// guard the caller must hold for the duration of its own execution.
+enum ClaimOutcome {
+    /// A previous submission with the same key and body already completed.
+    /// The caller returns this receipt without running the executor.
+    AlreadyDone(OperationReceipt),
+    /// This caller won the claim. The guard owns the `InFlight` slot in
+    /// the moka cache; dropping it before [`ClaimGuard::commit`] runs
+    /// schedules an asynchronous eviction so a cancelled transact future
+    /// doesn't leave the slot stuck for the cache TTL.
+    Claimed(ClaimGuard),
+}
+
+/// Guards the in-flight cache slot a winning [`try_claim_slot`] call
+/// wrote. Held by the caller across executor + [`record_outcome`].
+///
+/// `commit` is the success ack: it disarms the drop-time cleanup so the
+/// terminal state `record_outcome` just wrote isn't second-guessed.
+/// Without an explicit commit, the drop spawns a best-effort eviction
+/// of the slot iff it still shows `InFlight` — covering the
+/// cancelled-transact-future case the cache TTL alone would leave stale
+/// for an hour.
+struct ClaimGuard {
+    cache: Cache<IdempotencyCacheKey, CachedSubmission>,
+    cache_key: IdempotencyCacheKey,
+    committed: bool,
+}
+
+impl ClaimGuard {
+    /// Mark the claim as committed (terminal state written), disarming
+    /// the drop-time cleanup. Call once `record_outcome` has updated
+    /// the cache entry to a terminal `Committed` / `Failed` state.
+    fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for ClaimGuard {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        // The transact future was dropped between `try_claim_slot` and
+        // `commit` (HTTP timeout, client disconnect, panic in the
+        // executor). Spawn a cleanup that invalidates the cache entry
+        // iff it's still `InFlight`: any terminal state means a race
+        // with another writer that should be preserved.
+        //
+        // Best-effort: if no tokio runtime is in scope (a sync test
+        // dropping the guard, runtime shutdown) the cleanup is skipped
+        // and the slot expires via TTL — degrading to the prior
+        // behavior, not a correctness break.
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let cache = self.cache.clone();
+        let key = self.cache_key.clone();
+        handle.spawn(async move {
+            if let Some(entry) = cache.get(&key).await {
+                if matches!(entry.state, SubmissionState::InFlight) {
+                    cache.invalidate(&key).await;
+                }
+            }
+        });
+    }
+}
+
 /// Estimated bytes a cache entry holds, used by moka as the weight for
 /// capacity accounting.
 ///
@@ -336,16 +404,24 @@ impl<C: Committer> CachingCommitter<C> {
 
     /// Atomically claim an idempotency slot in the cache.
     ///
-    /// Returns `Ok(None)` when the caller wins the claim and must execute
-    /// the operation. Returns `Ok(Some(receipt))` when an earlier
-    /// submission with the same key and body already completed. Returns
-    /// `Err(KeyCollision)` for a mismatched body or `Err(AlreadyInFlight)`
-    /// when another caller's execution is still running.
+    /// Returns [`ClaimOutcome::Claimed`] with a guard when the caller
+    /// wins the claim and must execute the operation — the guard must
+    /// be held across the executor + `record_outcome` and then
+    /// [`commit`](ClaimGuard::commit)ed on success; dropping it
+    /// without committing schedules an asynchronous eviction of the
+    /// `InFlight` slot, so a cancelled transact future doesn't pin
+    /// the cache key for the full TTL.
+    ///
+    /// Returns [`ClaimOutcome::AlreadyDone`] when an earlier submission
+    /// with the same key and body already completed. Returns
+    /// `Err(KeyCollision)` for a mismatched body or
+    /// `Err(AlreadyInFlight)` when another caller's execution is still
+    /// running.
     async fn try_claim_slot(
         &self,
         cache_key: IdempotencyCacheKey,
         body_hash: [u8; 32],
-    ) -> Result<Option<OperationReceipt>, SubmissionError> {
+    ) -> Result<ClaimOutcome, SubmissionError> {
         // `or_insert_with_if` writes a fresh `InFlight` marker when the key
         // is absent, or replaces a prior failed attempt for the same body —
         // failures are re-attemptable. Concurrent submissions for the same
@@ -353,7 +429,7 @@ impl<C: Committer> CachingCommitter<C> {
         // submission; only the caller that wins the claim goes on to execute.
         let claim = self
             .cache
-            .entry(cache_key)
+            .entry(cache_key.clone())
             .or_insert_with_if(
                 std::future::ready(CachedSubmission {
                     state: SubmissionState::InFlight,
@@ -367,7 +443,11 @@ impl<C: Committer> CachingCommitter<C> {
             .await;
 
         if claim.is_fresh() {
-            return Ok(None);
+            return Ok(ClaimOutcome::Claimed(ClaimGuard {
+                cache: self.cache.clone(),
+                cache_key,
+                committed: false,
+            }));
         }
 
         let existing = claim.into_value();
@@ -383,7 +463,7 @@ impl<C: Committer> CachingCommitter<C> {
             // `SubmissionLookup` (post-leader-transition reads), which
             // doesn't flow through this map.
             SubmissionState::Committed(committed) => match committed.receipt {
-                Some(r) => Ok(Some(*r)),
+                Some(r) => Ok(ClaimOutcome::AlreadyDone(*r)),
                 None => Err(SubmissionError::AlreadyInFlight),
             },
             _ => Err(SubmissionError::AlreadyInFlight),
@@ -626,12 +706,11 @@ impl<C: Committer> Committer for CachingCommitter<C> {
         let cache_key = IdempotencyCacheKey::new(request.ledger_id.clone(), idempotency_key);
         let body_hash = Self::hash_request_body(&request);
 
-        if let Some(receipt) = self.try_claim_slot(cache_key.clone(), body_hash).await? {
-            return match receipt {
-                OperationReceipt::Transaction(r) => Ok(r),
-                _ => Err(SubmissionError::KeyCollision),
-            };
-        }
+        let guard = match self.try_claim_slot(cache_key.clone(), body_hash).await? {
+            ClaimOutcome::AlreadyDone(OperationReceipt::Transaction(r)) => return Ok(r),
+            ClaimOutcome::AlreadyDone(_) => return Err(SubmissionError::KeyCollision),
+            ClaimOutcome::Claimed(g) => g,
+        };
 
         // Capture the body discriminator before the move; the
         // canonical kit on the cached `Committed` state needs it
@@ -650,6 +729,7 @@ impl<C: Committer> Committer for CachingCommitter<C> {
             }))
         })
         .await;
+        guard.commit();
         outcome
     }
 
@@ -666,12 +746,11 @@ impl<C: Committer> Committer for CachingCommitter<C> {
         let cache_key = IdempotencyCacheKey::new(ledger_id, idempotency_key);
         let body_hash = Self::hash_revert_body(&request);
 
-        if let Some(receipt) = self.try_claim_slot(cache_key.clone(), body_hash).await? {
-            return match receipt {
-                OperationReceipt::Revert(r) => Ok(r),
-                _ => Err(SubmissionError::KeyCollision),
-            };
-        }
+        let guard = match self.try_claim_slot(cache_key.clone(), body_hash).await? {
+            ClaimOutcome::AlreadyDone(OperationReceipt::Revert(r)) => return Ok(r),
+            ClaimOutcome::AlreadyDone(_) => return Err(SubmissionError::KeyCollision),
+            ClaimOutcome::Claimed(g) => g,
+        };
 
         let outcome = self.executor.revert(request).await;
         self.record_outcome(cache_key, body_hash, &outcome, |r: &RevertReceipt| {
@@ -685,6 +764,7 @@ impl<C: Committer> Committer for CachingCommitter<C> {
             }))
         })
         .await;
+        guard.commit();
         outcome
     }
 
@@ -703,12 +783,11 @@ impl<C: Committer> Committer for CachingCommitter<C> {
         let cache_key = IdempotencyCacheKey::new(ledger_id, idempotency_key);
         let body_hash = Self::hash_merge_body(&request);
 
-        if let Some(receipt) = self.try_claim_slot(cache_key.clone(), body_hash).await? {
-            return match receipt {
-                OperationReceipt::Merge(r) => Ok(r),
-                _ => Err(SubmissionError::KeyCollision),
-            };
-        }
+        let guard = match self.try_claim_slot(cache_key.clone(), body_hash).await? {
+            ClaimOutcome::AlreadyDone(OperationReceipt::Merge(r)) => return Ok(r),
+            ClaimOutcome::AlreadyDone(_) => return Err(SubmissionError::KeyCollision),
+            ClaimOutcome::Claimed(g) => g,
+        };
 
         let outcome = self.executor.merge(request).await;
         self.record_outcome(cache_key, body_hash, &outcome, |r: &MergeReceipt| {
@@ -722,6 +801,7 @@ impl<C: Committer> Committer for CachingCommitter<C> {
             }))
         })
         .await;
+        guard.commit();
         outcome
     }
 
@@ -739,12 +819,11 @@ impl<C: Committer> Committer for CachingCommitter<C> {
         let cache_key = IdempotencyCacheKey::new(ledger_id, idempotency_key);
         let body_hash = Self::hash_rebase_body(&request);
 
-        if let Some(receipt) = self.try_claim_slot(cache_key.clone(), body_hash).await? {
-            return match receipt {
-                OperationReceipt::Rebase(r) => Ok(r),
-                _ => Err(SubmissionError::KeyCollision),
-            };
-        }
+        let guard = match self.try_claim_slot(cache_key.clone(), body_hash).await? {
+            ClaimOutcome::AlreadyDone(OperationReceipt::Rebase(r)) => return Ok(r),
+            ClaimOutcome::AlreadyDone(_) => return Err(SubmissionError::KeyCollision),
+            ClaimOutcome::Claimed(g) => g,
+        };
 
         let outcome = self.executor.rebase(request).await;
         self.record_outcome(cache_key, body_hash, &outcome, |r: &RebaseReceipt| {
@@ -763,6 +842,7 @@ impl<C: Committer> Committer for CachingCommitter<C> {
             }))
         })
         .await;
+        guard.commit();
         outcome
     }
 
@@ -788,12 +868,11 @@ impl<C: Committer> Committer for CachingCommitter<C> {
         let cache_key = IdempotencyCacheKey::new(request.ledger_id.clone(), idempotency_key);
         let body_hash = Self::hash_push_body(&request);
 
-        if let Some(receipt) = self.try_claim_slot(cache_key.clone(), body_hash).await? {
-            return match receipt {
-                OperationReceipt::Push(r) => Ok(r),
-                _ => Err(SubmissionError::KeyCollision),
-            };
-        }
+        let guard = match self.try_claim_slot(cache_key.clone(), body_hash).await? {
+            ClaimOutcome::AlreadyDone(OperationReceipt::Push(r)) => return Ok(r),
+            ClaimOutcome::AlreadyDone(_) => return Err(SubmissionError::KeyCollision),
+            ClaimOutcome::Claimed(g) => g,
+        };
 
         let outcome = self.executor.push(request).await;
         self.record_outcome(cache_key, body_hash, &outcome, |r: &PushReceipt| {
@@ -807,6 +886,7 @@ impl<C: Committer> Committer for CachingCommitter<C> {
             }))
         })
         .await;
+        guard.commit();
         outcome
     }
 }
@@ -1196,6 +1276,131 @@ mod tests {
         let got = committer.status("tenant-a:main", &key).await;
         assert!(matches!(got, SubmissionState::Committed(_)));
         assert_eq!(stub.calls(), 0, "terminal cache entry must not consult the inner");
+    }
+
+    #[tokio::test]
+    async fn dropped_claim_guard_evicts_in_flight_slot() {
+        let (_fluree, committer, _ledger_id) = setup().await;
+        let cache_key = IdempotencyCacheKey::new(
+            "tenant-a:main",
+            IdempotencyKey::new("k1").expect("fits cap"),
+        );
+        let body_hash = [9u8; 32];
+
+        let outcome = committer
+            .try_claim_slot(cache_key.clone(), body_hash)
+            .await
+            .expect("first claim");
+        let guard = match outcome {
+            ClaimOutcome::Claimed(g) => g,
+            _ => panic!("expected a fresh claim"),
+        };
+
+        // Sanity: the cache now holds an InFlight slot.
+        let entry = committer
+            .cache
+            .get(&cache_key)
+            .await
+            .expect("inflight just claimed");
+        assert!(matches!(entry.state, SubmissionState::InFlight));
+
+        // Cancellation: the guard is dropped without commit, mirroring
+        // an HTTP-timeout / client-disconnect on the transact future.
+        drop(guard);
+
+        // The cleanup runs on a spawned task; yield until it observes
+        // and invalidates the slot. The cache TTL alone is 1h, so this
+        // assertion fails fast (~100ms cap) if the guard's Drop didn't
+        // spawn the cleanup.
+        for _ in 0..20 {
+            if committer.cache.get(&cache_key).await.is_none() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("dropped claim guard never evicted the InFlight slot");
+    }
+
+    #[tokio::test]
+    async fn cancelled_claim_unblocks_subsequent_retry() {
+        let (_fluree, committer, _ledger_id) = setup().await;
+        let cache_key = IdempotencyCacheKey::new(
+            "tenant-a:main",
+            IdempotencyKey::new("k1").expect("fits cap"),
+        );
+        let body_hash = [9u8; 32];
+
+        // First attempt: claim, drop without commit — simulates a
+        // cancelled transact future leaving a stale InFlight slot.
+        let outcome1 = committer
+            .try_claim_slot(cache_key.clone(), body_hash)
+            .await
+            .expect("first claim");
+        drop(match outcome1 {
+            ClaimOutcome::Claimed(g) => g,
+            _ => panic!("expected fresh claim"),
+        });
+
+        // Wait for the cleanup task to evict the slot.
+        for _ in 0..20 {
+            if committer.cache.get(&cache_key).await.is_none() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        // Retry must win the claim fresh, NOT see AlreadyInFlight.
+        let outcome2 = committer
+            .try_claim_slot(cache_key, body_hash)
+            .await
+            .expect("retry after cancelled claim");
+        assert!(
+            matches!(outcome2, ClaimOutcome::Claimed(_)),
+            "retry after a cancelled claim must win the slot, not surface stale InFlight"
+        );
+    }
+
+    #[tokio::test]
+    async fn committed_claim_guard_skips_cleanup() {
+        let (_fluree, committer, _ledger_id) = setup().await;
+        let cache_key = IdempotencyCacheKey::new(
+            "tenant-a:main",
+            IdempotencyKey::new("k1").expect("fits cap"),
+        );
+        let body_hash = [9u8; 32];
+
+        let outcome = committer
+            .try_claim_slot(cache_key.clone(), body_hash)
+            .await
+            .expect("claim");
+        let guard = match outcome {
+            ClaimOutcome::Claimed(g) => g,
+            _ => panic!("expected fresh claim"),
+        };
+
+        // Simulate record_outcome having written terminal state.
+        committer
+            .cache
+            .insert(
+                cache_key.clone(),
+                CachedSubmission {
+                    state: committed_state("k1"),
+                    body_hash,
+                },
+            )
+            .await;
+        guard.commit();
+
+        // Give any (unwanted) cleanup time to fire — the guard's Drop
+        // must skip it because commit was called.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let entry = committer
+            .cache
+            .get(&cache_key)
+            .await
+            .expect("terminal state must survive");
+        assert!(matches!(entry.state, SubmissionState::Committed(_)));
     }
 
     #[tokio::test]
