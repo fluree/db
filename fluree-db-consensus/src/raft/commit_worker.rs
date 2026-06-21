@@ -148,18 +148,14 @@ impl CommitWorker {
             attempt += 1;
             match self.try_advance_head(ref_key, &entry).await {
                 Ok(()) => return Ok(()),
-                Err(WorkerError::Stage(reason)) => {
-                    // Unbox once at the top so the rest of the arm
-                    // can work with a plain `PoisonReason`.
-                    let reason = *reason;
-                    let is_transient = matches!(reason, PoisonReason::StagingFailed { .. });
-                    if is_transient && attempt < MAX_STAGE_ATTEMPTS {
+                Err(WorkerError::Transient(error)) => {
+                    if attempt < MAX_STAGE_ATTEMPTS {
                         let backoff = STAGE_RETRY_BASE_BACKOFF * (1u32 << (attempt - 1));
                         debug!(
                             queue_id = entry.queue_id,
                             attempt,
                             backoff_ms = backoff.as_millis() as u64,
-                            ?reason,
+                            %error,
                             "transient staging failure, retrying"
                         );
                         tokio::time::sleep(backoff).await;
@@ -185,25 +181,25 @@ impl CommitWorker {
                         }
                         continue;
                     }
-                    if is_transient {
-                        warn!(
-                            queue_id = entry.queue_id,
-                            attempts = attempt,
-                            ?reason,
-                            "exhausted staging retries, poisoning entry"
-                        );
-                    }
-                    // Stamp the final attempt count onto the
-                    // `StagingFailed` record so the poison reason
-                    // surfaces how many tries actually happened.
-                    let reason = match reason {
-                        PoisonReason::StagingFailed { error, .. } => PoisonReason::StagingFailed {
-                            error,
-                            attempts: attempt,
-                        },
-                        other => other,
-                    };
-                    return self.propose_poison(ref_key, entry.queue_id, reason).await;
+                    warn!(
+                        queue_id = entry.queue_id,
+                        attempts = attempt,
+                        %error,
+                        "exhausted staging retries, poisoning entry"
+                    );
+                    return self
+                        .propose_poison(
+                            ref_key,
+                            entry.queue_id,
+                            PoisonReason::StagingFailed {
+                                error,
+                                attempts: attempt,
+                            },
+                        )
+                        .await;
+                }
+                Err(WorkerError::Stage(reason)) => {
+                    return self.propose_poison(ref_key, entry.queue_id, *reason).await;
                 }
                 Err(other) => return Err(other),
             }
@@ -327,10 +323,7 @@ impl CommitWorker {
             .get(&entry.request_cid)
             .await
             .map_err(|e| {
-                stage(PoisonReason::StagingFailed {
-                    error: format!("CAS read of request_cid failed: {e}"),
-                    attempts: 1,
-                })
+                WorkerError::Transient(format!("CAS read of request_cid failed: {e}"))
             })?;
         QueuedRequest::from_bytes(&bytes).map_err(|e| {
             stage(PoisonReason::BodyMalformed {
@@ -567,10 +560,8 @@ impl CommitWorker {
         // `NotFound` means the blob has been GC'd (or never landed)
         // — retrying won't recover it, so poison immediately as a
         // malformed body. Any other error is a transport / backend
-        // hiccup; treat as transient so the retry/backoff loop in
-        // `process_entry` heals it. `attempts: 1` is a placeholder
-        // the loop overwrites with the actual final attempt count
-        // before proposing the poison.
+        // hiccup; raise as `Transient` so the retry/backoff loop in
+        // `process_entry` heals it.
         let mut commits = Vec::with_capacity(commit_cids.len());
         for cid in &commit_cids {
             let bytes = content_store.get(cid).await.map_err(|e| {
@@ -579,10 +570,7 @@ impl CommitWorker {
                         error: format!("push commit {cid} missing from CAS: {e}"),
                     })
                 } else {
-                    stage(PoisonReason::StagingFailed {
-                        error: format!("push commit {cid} CAS read failed: {e}"),
-                        attempts: 1,
-                    })
+                    WorkerError::Transient(format!("push commit {cid} CAS read failed: {e}"))
                 }
             })?;
             commits.push(Base64Bytes(bytes));
@@ -882,8 +870,10 @@ impl CommitWorker {
                     .await;
                 match outcome {
                     Ok(Ok(())) => {}
-                    Ok(Err(WorkerError::Stage(_))) => {
-                        unreachable!("process_entry maps Stage failures to PoisonQueueEntry")
+                    Ok(Err(WorkerError::Transient(_) | WorkerError::Stage(_))) => {
+                        unreachable!(
+                            "process_entry maps Transient/Stage failures to PoisonQueueEntry"
+                        )
                     }
                     Ok(Err(WorkerError::Raft(propose_error))) => {
                         // Skip the failing branch but keep draining
@@ -987,10 +977,7 @@ fn current_millis() -> u64 {
 }
 
 fn stage_failure(message: &str) -> WorkerError {
-    stage(PoisonReason::StagingFailed {
-        error: message.into(),
-        attempts: 1,
-    })
+    WorkerError::Transient(message.into())
 }
 
 /// Best-effort string extraction from a `catch_unwind` payload —
@@ -1007,17 +994,11 @@ fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
 }
 
 fn submission_to_stage(err: SubmissionError) -> WorkerError {
-    stage(PoisonReason::StagingFailed {
-        error: err.to_string(),
-        attempts: 1,
-    })
+    WorkerError::Transient(err.to_string())
 }
 
 fn api_error_to_stage(err: ApiError) -> WorkerError {
-    stage(PoisonReason::StagingFailed {
-        error: err.to_string(),
-        attempts: 1,
-    })
+    WorkerError::Transient(err.to_string())
 }
 
 /// Wrap a [`PoisonReason`] into the boxed [`WorkerError::Stage`]
@@ -1029,13 +1010,30 @@ fn stage(reason: PoisonReason) -> WorkerError {
 
 /// Internal classification for worker outcomes.
 ///
-/// `Stage` carries a [`PoisonReason`] the worker turns into a
-/// `PoisonQueueEntry` proposal. `Raft` is reserved for propose
-/// failures the caller propagates — those mean the cluster
-/// fundamentally can't accept commands right now (leader changed,
-/// quorum lost) and the drain loop should yield.
+/// `Transient` is a retryable hiccup — the per-entry loop in
+/// [`CommitWorker::process_entry`] retries with backoff up to
+/// [`MAX_STAGE_ATTEMPTS`] and then promotes the carried message
+/// into [`PoisonReason::StagingFailed`] stamped with the real
+/// final attempt count. Producers don't need to know how many
+/// attempts have run.
+///
+/// `Stage` carries a deterministic [`PoisonReason`] (e.g.
+/// `BodyMalformed`, `PolicyViolation`, `WorkerPanic`) the worker
+/// proposes verbatim via `PoisonQueueEntry` — retrying these would
+/// just burn a worker round.
+///
+/// `Raft` is reserved for propose failures the caller propagates —
+/// those mean the cluster fundamentally can't accept commands
+/// right now (leader changed, quorum lost) and the drain loop
+/// should yield.
 #[derive(Debug, Error)]
 pub enum WorkerError {
+    /// Retryable backend hiccup. Promoted to
+    /// [`PoisonReason::StagingFailed`] by the retry loop only after
+    /// the budget is exhausted, so the recorded `attempts` reflects
+    /// the actual count rather than a placeholder.
+    #[error("transient staging error: {0}")]
+    Transient(String),
     /// `PoisonReason` is boxed so this enum stays small even though
     /// `PushCasFailed` carries two `Option<ContentId>`s — without
     /// the indirection every `Result<(), WorkerError>` in the worker

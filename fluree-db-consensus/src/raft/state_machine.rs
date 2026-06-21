@@ -304,6 +304,7 @@ pub struct PoisonRecord {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PoisonReason {
     /// Worker exhausted its retry budget on transient errors.
+    /// `attempts` is the actual final retry count.
     StagingFailed { error: String, attempts: u32 },
     /// Body refused at staging time — invalid JSON-LD / Turtle /
     /// SPARQL, schema violation, etc.
