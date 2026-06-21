@@ -21,11 +21,13 @@ use crate::{
     SubmissionLookup, SubmissionState, TransactionReceipt, TransactionRequest,
 };
 use async_trait::async_trait;
-use fluree_db_api::{CommitRef, Fluree, GovernanceOptions};
+use fluree_db_api::{CommitId, CommitRef, Fluree, GovernanceOptions, PolicyStats, TrackingTally};
 use fluree_db_core::ledger_id::normalize_ledger_id;
 use fluree_db_ledger::IndexConfig;
 use moka::future::Cache;
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
+use std::mem;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -37,9 +39,16 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 /// body, and status lookups for the expired key return [`SubmissionState::Unknown`].
 pub const DEFAULT_IDEMPOTENCY_TTL: Duration = Duration::from_secs(3600);
 
-/// Upper bound on idempotency cache entries, so sustained keyed traffic
-/// can't grow the cache without limit between TTL evictions.
-const IDEMPOTENCY_CACHE_CAPACITY: u64 = 100_000;
+/// Total byte budget for the idempotency cache across all entries.
+///
+/// Bounded by bytes rather than entry count because [`CachedSubmission`]
+/// size is highly variable: a tracking-enabled `TransactionReceipt` carrying
+/// a `TrackingTally` (with its per-policy `HashMap<String, PolicyStats>`)
+/// is typically a few KB; a bare `RevertReceipt` is on the order of bytes.
+/// A fixed entry count would let resident memory drift far above what the
+/// count suggests under sustained tracked traffic. 256 MiB sized to absorb
+/// ~100k tracking-heavy entries before evictions start.
+pub const DEFAULT_IDEMPOTENCY_CACHE_MAX_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Default cap on in-flight submissions; calls beyond this count are
 /// refused with [`SubmissionError::Overloaded`]. Bounding the in-flight
@@ -54,6 +63,105 @@ pub const DEFAULT_PENDING_LIMIT: usize = 1024;
 struct CachedSubmission {
     state: SubmissionState,
     body_hash: [u8; 32],
+}
+
+/// Estimated bytes a cache entry holds, used by moka as the weight for
+/// capacity accounting.
+///
+/// Stack footprint of the key and `CachedSubmission` plus the heap the
+/// variant payloads own. The dominant variable cost —
+/// `TrackingTally::policy`, a `HashMap<String, PolicyStats>` — is walked
+/// explicitly so a heavy entry registers at its true memory cost rather
+/// than as a single slot. Fixed-size inline structs (e.g. `CommitId`)
+/// contribute through the base `size_of` term, which is exact for them.
+fn weigh_cached_submission(key: &IdempotencyCacheKey, value: &CachedSubmission) -> u32 {
+    let base = mem::size_of::<IdempotencyCacheKey>() + mem::size_of::<CachedSubmission>();
+    let key_heap = key.ledger_id.capacity() + key.key.as_str().len();
+    let state_heap = weigh_submission_state(&value.state);
+    base.saturating_add(key_heap)
+        .saturating_add(state_heap)
+        .min(u32::MAX as usize) as u32
+}
+
+fn weigh_submission_state(state: &SubmissionState) -> usize {
+    match state {
+        SubmissionState::Unknown | SubmissionState::InFlight => 0,
+        SubmissionState::Committed(committed) => weigh_committed_submission(committed),
+        SubmissionState::Failed(err) => weigh_submission_error(err),
+    }
+}
+
+fn weigh_committed_submission(committed: &CommittedSubmission) -> usize {
+    let base = mem::size_of::<CommittedSubmission>();
+    let key = weigh_idempotency_key(committed.idempotency_key.as_ref());
+    let tally = committed
+        .tally
+        .as_ref()
+        .map(weigh_tracking_tally)
+        .unwrap_or(0);
+    let receipt = committed
+        .receipt
+        .as_ref()
+        .map(|r| mem::size_of::<OperationReceipt>() + weigh_operation_receipt(r))
+        .unwrap_or(0);
+    base + key + tally + receipt
+}
+
+fn weigh_operation_receipt(receipt: &OperationReceipt) -> usize {
+    match receipt {
+        OperationReceipt::Transaction(tr) => {
+            weigh_idempotency_key(tr.idempotency_key.as_ref())
+                + tr.tally.as_ref().map(weigh_tracking_tally).unwrap_or(0)
+        }
+        OperationReceipt::Revert(rr) => {
+            weigh_idempotency_key(rr.idempotency_key.as_ref())
+                + rr.branch.capacity()
+                + rr.reverted_commits.capacity() * mem::size_of::<CommitId>()
+        }
+        OperationReceipt::Merge(mr) => {
+            weigh_idempotency_key(mr.idempotency_key.as_ref())
+                + mr.source.capacity()
+                + mr.target.capacity()
+        }
+        OperationReceipt::Rebase(rr) => {
+            weigh_idempotency_key(rr.idempotency_key.as_ref()) + rr.branch.capacity()
+        }
+        OperationReceipt::Push(pr) => {
+            weigh_idempotency_key(pr.idempotency_key.as_ref()) + pr.ledger.capacity()
+        }
+    }
+}
+
+fn weigh_idempotency_key(key: Option<&IdempotencyKey>) -> usize {
+    key.map(|k| k.as_str().len()).unwrap_or(0)
+}
+
+fn weigh_tracking_tally(tally: &TrackingTally) -> usize {
+    let time = tally.time.as_ref().map(String::capacity).unwrap_or(0);
+    let policy = tally.policy.as_ref().map(weigh_policy_map).unwrap_or(0);
+    let reasoning = tally
+        .reasoning
+        .as_ref()
+        .and_then(|r| r.capped_reason.as_ref())
+        .map(String::capacity)
+        .unwrap_or(0);
+    time + policy + reasoning
+}
+
+fn weigh_policy_map(map: &HashMap<String, PolicyStats>) -> usize {
+    // Hashbrown's open-addressing layout costs roughly one control byte plus
+    // one `(K, V)` slot per entry; capacity (not len) is what's allocated.
+    const SLOT: usize = mem::size_of::<(String, PolicyStats)>() + 1;
+    map.capacity().saturating_mul(SLOT) + map.keys().map(String::capacity).sum::<usize>()
+}
+
+fn weigh_submission_error(err: &SubmissionError) -> usize {
+    match err {
+        SubmissionError::Execution { message, .. } => message.capacity(),
+        SubmissionError::KeyCollision
+        | SubmissionError::AlreadyInFlight
+        | SubmissionError::Overloaded => 0,
+    }
 }
 
 /// Idempotency cache + admission control around an inner [`Committer`].
@@ -95,7 +203,8 @@ impl<C: Committer> CachingCommitter<C> {
     pub fn wrapping_with_ttl(executor: C, ttl: Duration) -> Self {
         let cache = Cache::builder()
             .time_to_live(ttl)
-            .max_capacity(IDEMPOTENCY_CACHE_CAPACITY)
+            .max_capacity(DEFAULT_IDEMPOTENCY_CACHE_MAX_BYTES)
+            .weigher(weigh_cached_submission)
             .build();
         Self {
             executor,
@@ -110,6 +219,28 @@ impl<C: Committer> CachingCommitter<C> {
     /// [`SubmissionError::Overloaded`] rather than queued.
     pub fn with_pending_limit(mut self, limit: usize) -> Self {
         self.admission = Arc::new(Semaphore::new(limit));
+        self
+    }
+
+    /// Override the idempotency cache's byte budget (defaults to
+    /// [`DEFAULT_IDEMPOTENCY_CACHE_MAX_BYTES`]). Entry weight is the
+    /// per-entry footprint reported by [`weigh_cached_submission`],
+    /// not a flat 1 — so a tracking-heavy entry counts against the
+    /// budget proportionally to its policy / tally heap, not as a
+    /// single slot.
+    ///
+    /// Rebuilds the cache, so call this before populating any keys.
+    pub fn with_cache_capacity_bytes(mut self, max_bytes: u64) -> Self {
+        let ttl = self
+            .cache
+            .policy()
+            .time_to_live()
+            .unwrap_or(DEFAULT_IDEMPOTENCY_TTL);
+        self.cache = Cache::builder()
+            .time_to_live(ttl)
+            .max_capacity(max_bytes)
+            .weigher(weigh_cached_submission)
+            .build();
         self
     }
 
@@ -685,6 +816,94 @@ mod tests {
             tracking: None,
             governance: GovernanceOptions::default(),
         }
+    }
+
+    fn cache_key(label: &str) -> IdempotencyCacheKey {
+        IdempotencyCacheKey::new("test/db:main", IdempotencyKey::new(label).expect("fits cap"))
+    }
+
+    fn lightweight_committed(label: &str) -> CachedSubmission {
+        CachedSubmission {
+            state: SubmissionState::Committed(Box::new(CommittedSubmission {
+                idempotency_key: Some(IdempotencyKey::new(label).expect("fits cap")),
+                kind: BodyKind::JsonLdInsert,
+                commit_id: CommitId::new(fluree_db_api::ContentKind::Commit, &[0u8]),
+                t: 1,
+                tally: None,
+                receipt: None,
+            })),
+            body_hash: [0u8; 32],
+        }
+    }
+
+    fn tracking_heavy_committed(label: &str, policy_entries: usize) -> CachedSubmission {
+        let mut policy = HashMap::with_capacity(policy_entries);
+        for i in 0..policy_entries {
+            policy.insert(
+                format!("urn:fluree:policy:{i:08}"),
+                PolicyStats {
+                    executed: i as u64,
+                    allowed: i as u64,
+                },
+            );
+        }
+        CachedSubmission {
+            state: SubmissionState::Committed(Box::new(CommittedSubmission {
+                idempotency_key: Some(IdempotencyKey::new(label).expect("fits cap")),
+                kind: BodyKind::JsonLdInsert,
+                commit_id: CommitId::new(fluree_db_api::ContentKind::Commit, &[0u8]),
+                t: 1,
+                tally: Some(TrackingTally {
+                    time: Some("12.34ms".into()),
+                    fuel: Some(0.0),
+                    policy: Some(policy),
+                    reasoning: None,
+                }),
+                receipt: None,
+            })),
+            body_hash: [0u8; 32],
+        }
+    }
+
+    #[test]
+    fn weigh_charges_more_for_tracking_heavy_entries() {
+        let key = cache_key("k1");
+        let light_w = weigh_cached_submission(&key, &lightweight_committed("k1"));
+        let heavy_w = weigh_cached_submission(&key, &tracking_heavy_committed("k1", 100));
+        assert!(
+            heavy_w as u64 > light_w as u64 * 4,
+            "tracking-heavy entry must register substantially more weight than a bare \
+             receipt; light={light_w}, heavy={heavy_w}"
+        );
+    }
+
+    #[test]
+    fn weigh_grows_with_policy_map_size() {
+        let key = cache_key("k1");
+        let small = weigh_cached_submission(&key, &tracking_heavy_committed("k1", 10));
+        let large = weigh_cached_submission(&key, &tracking_heavy_committed("k1", 1000));
+        assert!(
+            large > small,
+            "weight must scale with policy map size; small={small}, large={large}"
+        );
+    }
+
+    #[test]
+    fn weigh_unknown_and_inflight_have_no_state_heap() {
+        let key = cache_key("k1");
+        let unknown = CachedSubmission {
+            state: SubmissionState::Unknown,
+            body_hash: [0u8; 32],
+        };
+        let in_flight = CachedSubmission {
+            state: SubmissionState::InFlight,
+            body_hash: [0u8; 32],
+        };
+        let unknown_w = weigh_cached_submission(&key, &unknown);
+        let inflight_w = weigh_cached_submission(&key, &in_flight);
+        // Both variants contribute zero state-heap, so the weight is
+        // exactly the (key + value) base size plus the key heap.
+        assert_eq!(unknown_w, inflight_w);
     }
 
     #[tokio::test]
