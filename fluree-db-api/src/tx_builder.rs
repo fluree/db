@@ -1256,7 +1256,13 @@ impl Fluree {
                     t: view.base().t(),
                 });
 
-        let mut staged = fluree_db_transact::build_commit(
+        // `build_commit` consumes `txn_id`; its early-return paths
+        // (EmptyTransaction / NoveltyAtMax / NoveltyWouldExceed /
+        // envelope-delta / serialize) return before installing
+        // `txn_id_for_release` on the staged commit, so release here
+        // to avoid orphaning the raw-txn blob.
+        let txn_id_for_cleanup = txn_id.clone();
+        let mut staged = match fluree_db_transact::build_commit(
             view,
             ns_registry,
             expected_head_ref,
@@ -1264,7 +1270,19 @@ impl Fluree {
             &index_config,
             commit_opts,
         )
-        .await?;
+        .await
+        {
+            Ok(s) => s,
+            Err(e) => {
+                let content_store = self.content_store(ledger.id());
+                fluree_db_transact::release_raw_txn_after_build_err(
+                    content_store.as_ref(),
+                    txn_id_for_cleanup.as_ref(),
+                )
+                .await;
+                return Err(ApiError::from(e));
+            }
+        };
 
         if tracker.is_enabled() {
             staged.tally = tracker.tally();

@@ -908,17 +908,12 @@ where
     );
 
     async move {
-        let txn_id = if let Some(pending) = opts.raw_txn_upload.take() {
-            Some(
-                pending
-                    .finish()
-                    .instrument(tracing::debug_span!("commit_write_raw_txn"))
-                    .await?,
-            )
-        } else {
-            None
-        };
-
+        // Run the cheap pre-checks before awaiting the raw-txn upload.
+        // If lookup or sequencing fails, the still-pending upload is
+        // dropped here; `PendingRawTxnUpload`'s Drop guard releases any
+        // blob the upload already landed in CAS. Awaiting `finish()`
+        // first would have promoted the blob to a referenced CID with
+        // no caller obligated to release it.
         let current = if skip_sequencing {
             None
         } else {
@@ -934,7 +929,25 @@ where
         }
         let expected_head_ref = current.as_ref().map(commit_head_ref);
 
-        let staged = build_commit(
+        let txn_id = if let Some(pending) = opts.raw_txn_upload.take() {
+            Some(
+                pending
+                    .finish()
+                    .instrument(tracing::debug_span!("commit_write_raw_txn"))
+                    .await?,
+            )
+        } else {
+            opts.raw_txn_id.take()
+        };
+
+        // `build_commit` consumes `txn_id` but its early-return paths
+        // (EmptyTransaction, NoveltyAtMax/WouldExceed, envelope-delta
+        // failure, serialize failure) all return before installing
+        // `txn_id_for_release` on the staged commit's `BuildState`.
+        // Release here so an early build error doesn't orphan the
+        // blob we just resolved.
+        let txn_id_for_cleanup = txn_id.clone();
+        let staged = match build_commit(
             view,
             ns_registry,
             expected_head_ref,
@@ -942,13 +955,38 @@ where
             index_config,
             opts,
         )
-        .await?;
+        .await
+        {
+            Ok(s) => s,
+            Err(e) => {
+                release_raw_txn_after_build_err(content_store, txn_id_for_cleanup.as_ref()).await;
+                return Err(e);
+            }
+        };
         staged
             .apply(content_store, nameservice, skip_sequencing)
             .await
     }
     .instrument(commit_span)
     .await
+}
+
+/// Release a raw-txn blob whose CID was resolved before a failed
+/// [`build_commit`]. A failed release is logged but not propagated —
+/// the caller is already returning an error and shouldn't have its
+/// failure mode replaced.
+pub async fn release_raw_txn_after_build_err<C>(content_store: &C, txn_id: Option<&ContentId>)
+where
+    C: ContentStore + ?Sized,
+{
+    let Some(cid) = txn_id else { return };
+    if let Err(release_err) = content_store.release(cid).await {
+        tracing::warn!(
+            error = %release_err,
+            raw_txn_cid = %cid,
+            "failed to release raw txn after build_commit failure"
+        );
+    }
 }
 
 fn commit_head_ref(record: &fluree_db_nameservice::NsRecord) -> RefValue {
@@ -1486,5 +1524,51 @@ mod tests {
             }
             other => panic!("expected PublishLostRace, got {other:?}"),
         }
+    }
+
+    /// Regression: `build_commit`'s early-return paths
+    /// (`EmptyTransaction`, novelty caps, envelope-delta failure,
+    /// serialize failure) all return before installing the
+    /// `txn_id_for_release` machinery, so a leftover raw-txn upload
+    /// would orphan its blob in CAS. The fix moves the upload await
+    /// below the pre-checks AND releases on `build_commit` err.
+    #[tokio::test]
+    async fn empty_transaction_does_not_orphan_raw_txn() {
+        let storage = MemoryStorage::new();
+        let db = LedgerSnapshot::genesis("test:main");
+        let novelty = Novelty::new(0);
+        let ledger = LedgerState::new(db, novelty);
+
+        let nameservice = MemoryNameService::new();
+        let txn = Txn::insert();
+        let ns_registry = NamespaceRegistry::from_db(&ledger.snapshot);
+        let (view, ns_registry) = stage(ledger, txn, ns_registry, StageOptions::default())
+            .await
+            .unwrap();
+
+        let cs = content_store_for(storage.clone(), "test:main");
+        let upload_cs: Arc<dyn ContentStore> =
+            Arc::new(content_store_for(storage.clone(), "test:main"));
+        let raw_txn = serde_json::json!({ "raw": "payload" });
+        let raw_txn_bytes = serde_json::to_vec(&raw_txn).expect("serialize raw txn");
+        let expected_cid = ContentId::new(ContentKind::Txn, &raw_txn_bytes);
+        let opts = CommitOpts::default().with_raw_txn_spawned(upload_cs, raw_txn);
+
+        let config = IndexConfig {
+            reindex_min_bytes: 100_000,
+            reindex_max_bytes: 1_000_000_000,
+        };
+
+        let result = commit(view, ns_registry, &cs, &nameservice, &config, opts).await;
+        assert!(
+            matches!(result, Err(TransactError::EmptyTransaction)),
+            "expected EmptyTransaction, got {result:?}"
+        );
+
+        // The blob the upload landed in CAS must be released.
+        assert!(
+            cs.get(&expected_cid).await.is_err(),
+            "raw_txn blob must be released after EmptyTransaction error"
+        );
     }
 }

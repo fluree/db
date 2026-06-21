@@ -55,7 +55,8 @@ pub use fluree_graph_turtle::splitter as turtle_splitter;
 // Re-exports
 pub use address::parse_commit_id;
 pub use commit::{
-    build_commit, commit, CommitOpts, CommitOptsRequest, CommitReceipt, StagedCommit,
+    build_commit, commit, release_raw_txn_after_build_err, CommitOpts, CommitOptsRequest,
+    CommitReceipt, StagedCommit,
 };
 pub use commit_flakes::generate_commit_flakes;
 pub use error::{Result, TransactError};
