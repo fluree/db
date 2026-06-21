@@ -34,8 +34,8 @@ use crate::{
     SubmissionError, TransactionBody,
 };
 use fluree_db_api::{
-    ApiError, Base64Bytes, Fluree, PushCommitsRequest, StagedMerge, StagedPush, StagedRebase,
-    StagedRevert,
+    ApiError, Base64Bytes, Fluree, PushCommitsRequest, RefreshOpts, StagedMerge, StagedPush,
+    StagedRebase, StagedRevert,
 };
 use fluree_db_core::ContentId;
 use fluree_db_ledger::IndexConfig;
@@ -131,9 +131,13 @@ impl CommitWorker {
     /// exponential backoff up to [`MAX_STAGE_ATTEMPTS`] times before
     /// poisoning — the other `PoisonReason` variants are
     /// deterministic (`BodyMalformed`, `PolicyViolation`, etc.) so
-    /// retrying them just burns a worker round. Returns once the
-    /// entry has reached a terminal state in the queue (advanced or
-    /// poisoned).
+    /// retrying them just burns a worker round. Between retries
+    /// the local Fluree cache is `refresh()`ed against the durable
+    /// nameservice head so a conflict rooted in stale state (e.g.
+    /// a namespace allocation this node missed because it took
+    /// leadership mid-write) heals instead of producing the same
+    /// failure forever. Returns once the entry has reached a
+    /// terminal state in the queue (advanced or poisoned).
     pub async fn process_entry(
         &self,
         ref_key: &RefKey,
@@ -159,6 +163,26 @@ impl CommitWorker {
                             "transient staging failure, retrying"
                         );
                         tokio::time::sleep(backoff).await;
+                        // Reconcile cached ledger state with the
+                        // durable head before re-staging — without
+                        // this, conflicts rooted in stale local
+                        // state (`NamespaceConflict` after a
+                        // leader transition is the canonical case)
+                        // reproduce on every attempt and the entry
+                        // poisons.
+                        let ledger_id = format_full_ledger_id(ref_key);
+                        if let Err(refresh_err) = self
+                            .fluree
+                            .refresh(&ledger_id, RefreshOpts::default())
+                            .await
+                        {
+                            warn!(
+                                queue_id = entry.queue_id,
+                                attempt,
+                                error = %refresh_err,
+                                "refresh during staging retry failed; retrying anyway"
+                            );
+                        }
                         continue;
                     }
                     if is_transient {
