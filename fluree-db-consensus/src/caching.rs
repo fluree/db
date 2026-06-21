@@ -26,6 +26,7 @@ use fluree_db_api::{CommitId, CommitRef, Fluree, GovernanceOptions, PolicyStats,
 use fluree_db_core::ledger_id::normalize_ledger_id;
 use fluree_db_ledger::IndexConfig;
 use moka::future::Cache;
+use moka::ops::compute::Op;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::mem;
@@ -120,9 +121,15 @@ impl Drop for ClaimGuard {
         }
         // The transact future was dropped between `try_claim_slot` and
         // `commit` (HTTP timeout, client disconnect, panic in the
-        // executor). Spawn a cleanup that invalidates the cache entry
-        // iff it's still `InFlight`: any terminal state means a race
-        // with another writer that should be preserved.
+        // executor). Spawn a cleanup that removes the entry iff it is
+        // still `InFlight`: any terminal state means a concurrent
+        // writer landed a `record_outcome` and must be preserved.
+        //
+        // `and_compute_with` holds moka's per-key compute lock across
+        // the read-decide-write so a concurrent `record_outcome`
+        // (which goes through the same compute path) cannot interleave
+        // — without that lock the bare `get` + `invalidate` would
+        // race and erase the terminal state.
         //
         // Best-effort: if no tokio runtime is in scope (a sync test
         // dropping the guard, runtime shutdown) the cleanup is skipped
@@ -134,11 +141,19 @@ impl Drop for ClaimGuard {
         let cache = self.cache.clone();
         let key = self.cache_key.clone();
         handle.spawn(async move {
-            if let Some(entry) = cache.get(&key).await {
-                if matches!(entry.state, SubmissionState::InFlight) {
-                    cache.invalidate(&key).await;
-                }
-            }
+            cache
+                .entry(key)
+                .and_compute_with(|maybe_entry| async move {
+                    match maybe_entry {
+                        Some(entry)
+                            if matches!(entry.value().state, SubmissionState::InFlight) =>
+                        {
+                            Op::Remove
+                        }
+                        _ => Op::Nop,
+                    }
+                })
+                .await;
         });
     }
 }
@@ -491,14 +506,18 @@ impl<C: Committer> CachingCommitter<C> {
             Ok(receipt) => project_committed(receipt),
             Err(err) => SubmissionState::Failed(err.clone()),
         };
+        let value = CachedSubmission {
+            state: final_state,
+            body_hash,
+        };
+        // Go through `and_compute_with` rather than `cache.insert` so
+        // this terminal write serializes against `ClaimGuard::drop`'s
+        // cleanup on the same key (which uses the same compute path).
+        // Otherwise drop's `Op::Remove` decision could race against a
+        // bare insert and erase this state.
         self.cache
-            .insert(
-                cache_key,
-                CachedSubmission {
-                    state: final_state,
-                    body_hash,
-                },
-            )
+            .entry(cache_key)
+            .and_compute_with(|_| async move { Op::Put(value) })
             .await;
     }
 
@@ -1410,6 +1429,63 @@ mod tests {
             .await
             .expect("terminal state must survive");
         assert!(matches!(entry.state, SubmissionState::Committed(_)));
+    }
+
+    #[tokio::test]
+    async fn drop_cleanup_preserves_existing_terminal_state() {
+        // Regression for the `get` + `invalidate` TOCTOU in
+        // `ClaimGuard::drop`: when the cache holds a terminal
+        // `Committed` entry at the time the dropped guard's cleanup
+        // runs, the cleanup must `Op::Nop`, not erase it. Both the
+        // drop cleanup and `record_outcome` now go through moka's
+        // compute lock so a concurrent terminal write cannot
+        // interleave between the cleanup's read and the conditional
+        // remove.
+        let (_fluree, committer, _ledger_id) = setup().await;
+        let cache_key = IdempotencyCacheKey::new(
+            "tenant-a:main",
+            IdempotencyKey::new("k1").expect("fits cap"),
+        );
+        let body_hash = [9u8; 32];
+
+        let outcome = committer
+            .try_claim_slot(cache_key.clone(), body_hash)
+            .await
+            .expect("claim");
+        let guard = match outcome {
+            ClaimOutcome::Claimed(g) => g,
+            _ => panic!("expected fresh claim"),
+        };
+
+        // Simulate `record_outcome` landing a terminal Committed
+        // entry through the same compute path it now uses.
+        committer
+            .cache
+            .entry(cache_key.clone())
+            .and_compute_with(|_| async {
+                Op::Put(CachedSubmission {
+                    state: committed_state("k1"),
+                    body_hash,
+                })
+            })
+            .await;
+
+        // Drop without commit — fires the cleanup spawn against a
+        // cache that already holds the terminal state.
+        drop(guard);
+
+        // Give the cleanup task time to run.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let entry = committer
+            .cache
+            .get(&cache_key)
+            .await
+            .expect("Committed entry must survive drop cleanup");
+        assert!(
+            matches!(entry.state, SubmissionState::Committed(_)),
+            "drop cleanup must not erase a terminal Committed entry"
+        );
     }
 
     #[tokio::test]
