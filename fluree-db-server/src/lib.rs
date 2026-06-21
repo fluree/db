@@ -650,12 +650,13 @@ impl FlureeServerBuilder {
         // RPC stays unauthenticated and relies on network trust.
         #[cfg(feature = "raft")]
         let raft_listener = raft_listener_parts.map(|(integration, listen_addr)| {
-            let cluster_admin = integration
-                .cluster_admin_router()
-                .layer(axum::middleware::from_fn_with_state(
-                    Arc::clone(&state),
-                    crate::routes::admin_auth::require_admin_token,
-                ));
+            let cluster_admin =
+                integration
+                    .cluster_admin_router()
+                    .layer(axum::middleware::from_fn_with_state(
+                        Arc::clone(&state),
+                        crate::routes::admin_auth::require_admin_token,
+                    ));
             let private_router = Router::new()
                 .nest("/raft", integration.raft_rpc_router())
                 .nest("/cluster", cluster_admin);

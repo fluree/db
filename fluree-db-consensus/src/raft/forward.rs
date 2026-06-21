@@ -644,7 +644,9 @@ mod tests {
 
         // Real interface addresses → multi-host posture.
         assert!(!self_addr_is_loopback("http://10.0.1.5:8080"));
-        assert!(!self_addr_is_loopback("http://node-1.cluster.internal:8080"));
+        assert!(!self_addr_is_loopback(
+            "http://node-1.cluster.internal:8080"
+        ));
         assert!(!self_addr_is_loopback("http://192.168.1.10:8080"));
 
         // Garbage / non-http schemes → conservative false (no opt-in).
