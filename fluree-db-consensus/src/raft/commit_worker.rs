@@ -373,11 +373,11 @@ impl CommitWorker {
             .await
             .map_err(|e| stage_failure(&format!("build_commit failed: {e}")))?;
 
-        let commit_cid = staged_commit
-            .commit
-            .id
-            .clone()
-            .expect("build_commit guarantees commit.id is set");
+        let commit_cid = staged_commit.commit.id.clone().ok_or_else(|| {
+            stage(PoisonReason::WorkerPanic {
+                message: "build_commit produced staged commit without commit.id".into(),
+            })
+        })?;
         let commit_t = staged_commit.commit.t;
         // Pull tally out before `finalize_state` consumes the staged
         // commit. The receipt the worker hands back through the side
@@ -479,11 +479,11 @@ impl CommitWorker {
             });
         };
 
-        let commit_cid = staged_commit
-            .commit
-            .id
-            .clone()
-            .expect("prepare_revert guarantees commit.id is set");
+        let commit_cid = staged_commit.commit.id.clone().ok_or_else(|| {
+            stage(PoisonReason::WorkerPanic {
+                message: "prepare_revert produced staged commit without commit.id".into(),
+            })
+        })?;
         let commit_t = staged_commit.commit.t;
 
         let ledger_id = format_full_ledger_id(ref_key);
@@ -649,11 +649,11 @@ impl CommitWorker {
             staged,
         }) = commit
         {
-            let commit_cid = staged
-                .commit
-                .id
-                .clone()
-                .expect("build_merge_general guarantees commit.id is set");
+            let commit_cid = staged.commit.id.clone().ok_or_else(|| {
+                stage(PoisonReason::WorkerPanic {
+                    message: "build_merge_general produced staged commit without commit.id".into(),
+                })
+            })?;
             let content_store = self.fluree.content_store(&target_id);
             content_store
                 .put_with_id(&commit_cid, &staged.commit_bytes)
