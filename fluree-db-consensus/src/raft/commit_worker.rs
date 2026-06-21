@@ -563,16 +563,27 @@ impl CommitWorker {
         let ledger_id = format_full_ledger_id(ref_key);
         let content_store = self.fluree.content_store(&ledger_id);
         // Read each commit's bytes back from CAS by CID. The
-        // transactor wrote them before enqueueing so they're
-        // guaranteed present unless something has GC'd them out from
-        // under us — surface that as a malformed-body poison rather
-        // than silently re-fetch.
+        // transactor wrote them before enqueueing, so a definitive
+        // `NotFound` means the blob has been GC'd (or never landed)
+        // — retrying won't recover it, so poison immediately as a
+        // malformed body. Any other error is a transport / backend
+        // hiccup; treat as transient so the retry/backoff loop in
+        // `process_entry` heals it. `attempts: 1` is a placeholder
+        // the loop overwrites with the actual final attempt count
+        // before proposing the poison.
         let mut commits = Vec::with_capacity(commit_cids.len());
         for cid in &commit_cids {
             let bytes = content_store.get(cid).await.map_err(|e| {
-                stage(PoisonReason::BodyMalformed {
-                    error: format!("push commit {cid} missing from CAS: {e}"),
-                })
+                if matches!(e, fluree_db_core::Error::NotFound(_)) {
+                    stage(PoisonReason::BodyMalformed {
+                        error: format!("push commit {cid} missing from CAS: {e}"),
+                    })
+                } else {
+                    stage(PoisonReason::StagingFailed {
+                        error: format!("push commit {cid} CAS read failed: {e}"),
+                        attempts: 1,
+                    })
+                }
             })?;
             commits.push(Base64Bytes(bytes));
         }
