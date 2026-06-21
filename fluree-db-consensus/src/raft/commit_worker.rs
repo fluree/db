@@ -40,11 +40,13 @@ use fluree_db_api::{
 use fluree_db_core::ContentId;
 use fluree_db_ledger::IndexConfig;
 use fluree_db_nameservice::CommitPublisher;
+use futures::FutureExt;
 use openraft::Raft;
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use thiserror::Error;
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 
 /// How often the drain loop polls [`NameServiceState::queues`] when
 /// no work was found on the previous tick.
@@ -832,15 +834,22 @@ impl CommitWorker {
             let mut raft_blocked = false;
             for (ref_key, entry) in pending {
                 let queue_id = entry.queue_id;
+                // Wrap `process_entry` in `catch_unwind` so a panic
+                // (third-party crate, future-proofed invariant slip)
+                // poisons just this entry instead of killing the
+                // worker task and halting every other branch's drain.
                 // `process_entry` consumes `Stage` failures by
                 // proposing `PoisonQueueEntry`, so only `Raft`
-                // propagates here.
-                match self.process_entry(&ref_key, entry).await {
-                    Ok(()) => {}
-                    Err(WorkerError::Stage(_)) => {
+                // propagates from the `Ok` arm.
+                let outcome = AssertUnwindSafe(self.process_entry(&ref_key, entry))
+                    .catch_unwind()
+                    .await;
+                match outcome {
+                    Ok(Ok(())) => {}
+                    Ok(Err(WorkerError::Stage(_))) => {
                         unreachable!("process_entry maps Stage failures to PoisonQueueEntry")
                     }
-                    Err(WorkerError::Raft(error)) => {
+                    Ok(Err(WorkerError::Raft(propose_error))) => {
                         // Skip the failing branch but keep draining
                         // the rest. A Raft propose can fail because
                         // the leader stepped down (every subsequent
@@ -854,10 +863,37 @@ impl CommitWorker {
                             ledger_id = %ref_key.ledger_id,
                             branch = %ref_key.branch,
                             queue_id,
-                            error = %error,
+                            error = %propose_error,
                             "raft publish failed; skipping this branch and continuing drain"
                         );
                         raft_blocked = true;
+                    }
+                    Err(panic_payload) => {
+                        let message = panic_message(panic_payload);
+                        error!(
+                            ledger_id = %ref_key.ledger_id,
+                            branch = %ref_key.branch,
+                            queue_id,
+                            panic = %message,
+                            "commit worker panicked while processing entry; poisoning and continuing"
+                        );
+                        if let Err(propose_error) = self
+                            .propose_poison(
+                                &ref_key,
+                                queue_id,
+                                PoisonReason::WorkerPanic { message },
+                            )
+                            .await
+                        {
+                            warn!(
+                                ledger_id = %ref_key.ledger_id,
+                                branch = %ref_key.branch,
+                                queue_id,
+                                error = %propose_error,
+                                "failed to publish poison after worker panic; entry stays at queue head"
+                            );
+                            raft_blocked = true;
+                        }
                     }
                 }
             }
@@ -919,6 +955,19 @@ fn stage_failure(message: &str) -> WorkerError {
         error: message.into(),
         attempts: 1,
     })
+}
+
+/// Best-effort string extraction from a `catch_unwind` payload —
+/// covers the `panic!("literal")` and `panic!("{fmt}")` cases that
+/// produce `&'static str` and `String` payloads respectively.
+fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<&'static str>() {
+        return (*s).to_string();
+    }
+    if let Some(s) = payload.downcast_ref::<String>() {
+        return s.clone();
+    }
+    "non-string panic payload".to_string()
 }
 
 fn submission_to_stage(err: SubmissionError) -> WorkerError {
@@ -1136,5 +1185,23 @@ mod tests {
                 queue.front().map(|entry| (ref_key.clone(), entry.clone()))
             })
             .collect()
+    }
+
+    #[test]
+    fn panic_message_extracts_static_str() {
+        let payload: Box<dyn std::any::Any + Send> = Box::new("kaboom");
+        assert_eq!(panic_message(payload), "kaboom");
+    }
+
+    #[test]
+    fn panic_message_extracts_string() {
+        let payload: Box<dyn std::any::Any + Send> = Box::new(String::from("formatted: 42"));
+        assert_eq!(panic_message(payload), "formatted: 42");
+    }
+
+    #[test]
+    fn panic_message_falls_back_for_unknown_payload() {
+        let payload: Box<dyn std::any::Any + Send> = Box::new(42u32);
+        assert_eq!(panic_message(payload), "non-string panic payload");
     }
 }

@@ -2656,6 +2656,7 @@ dependencies = [
  "fluree-db-ledger",
  "fluree-db-nameservice",
  "fluree-db-transact",
+ "futures",
  "hex",
  "moka",
  "openraft",

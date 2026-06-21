@@ -11,7 +11,7 @@ default = []
 # Enables the Raft-replicated `Committer` implementation. Off by default
 # so that monolithic users don't compile (or link) openraft and its
 # transitive dependencies.
-raft = ["dep:openraft", "dep:postcard", "dep:reqwest", "dep:axum"]
+raft = ["dep:openraft", "dep:postcard", "dep:reqwest", "dep:axum", "dep:futures"]
 
 [dependencies]
 fluree-db-api = { path = "../fluree-db-api" }
@@ -52,6 +52,10 @@ reqwest = { workspace = true, optional = true }
 # returned `axum::Router` under whatever path they want. Gated behind
 # `raft` because only the network impl reaches for it.
 axum = { workspace = true, optional = true }
+
+# `FutureExt::catch_unwind` for the per-entry panic boundary in the
+# commit worker. Gated behind `raft` because only that path needs it.
+futures = { workspace = true, optional = true }
 
 # In-memory concurrent map for the per-process WaiterMap: queue_id →
 # oneshot::Sender. Gated behind `raft` because only the queue-mediated
