@@ -8,6 +8,7 @@ mod support;
 
 use fluree_db_api::FlureeBuilder;
 use serde_json::Value as JsonValue;
+use std::sync::Arc;
 use support::{
     assert_index_defaults, genesis_ledger, start_background_indexer_local, trigger_index_and_wait,
     MemoryFluree,
