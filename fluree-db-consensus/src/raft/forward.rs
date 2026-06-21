@@ -30,7 +30,7 @@
 //! via [`super::admin::RaftAdmin::add_learner`] is immediately
 //! reachable for forwarding on every other node — no restart.
 
-use crate::raft::{NodeId, TypeConfig};
+use crate::raft::{ClusterNode, NodeId, TypeConfig};
 use axum::body::Body;
 use axum::extract::{OriginalUri, Request, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
@@ -116,6 +116,14 @@ impl LeaderForwarder {
     /// Decide whether this node should serve the request locally or
     /// forward it, resolving the leader's client URL from the
     /// current membership snapshot.
+    ///
+    /// `allow_loopback` for the SSRF check is sourced from this
+    /// node's own `client_addr` in membership: if self is on
+    /// loopback / `localhost`, every peer is too (single-host test
+    /// or dev cluster), so loopback peer URLs are accepted. In a
+    /// real multi-host deployment self binds to a routable address,
+    /// `allow_loopback` is false, and a loopback peer URL is
+    /// rejected as SSRF.
     async fn decide(&self) -> ForwardDecision {
         let Some(leader_id) = self.raft.current_leader().await else {
             return ForwardDecision::NoLeader;
@@ -123,14 +131,25 @@ impl LeaderForwarder {
         if leader_id == self.self_id {
             return ForwardDecision::Local;
         }
-        let metrics = self.raft.metrics().borrow().clone();
-        let leader_node = metrics
+        let nodes: Vec<(NodeId, ClusterNode)> = self
+            .raft
+            .metrics()
+            .borrow()
             .membership_config
             .nodes()
-            .find(|(id, _)| **id == leader_id)
-            .map(|(_, node)| node.clone());
+            .map(|(id, node)| (*id, node.clone()))
+            .collect();
+        let allow_loopback = nodes
+            .iter()
+            .find(|(id, _)| *id == self.self_id)
+            .map(|(_, node)| self_addr_is_loopback(&node.client_addr))
+            .unwrap_or(false);
+        let leader_node = nodes
+            .into_iter()
+            .find(|(id, _)| *id == leader_id)
+            .map(|(_, node)| node);
         match leader_node {
-            Some(node) if is_valid_leader_url(&node.client_addr) => {
+            Some(node) if is_valid_leader_url(&node.client_addr, allow_loopback) => {
                 ForwardDecision::Forward(node.client_addr)
             }
             _ => ForwardDecision::UnknownLeader(leader_id),
@@ -148,16 +167,22 @@ impl LeaderForwarder {
 /// Permit only the two transport schemes the cluster actually uses
 /// (http/https) and reject hosts that are obvious SSRF targets:
 ///
-/// - **Loopback** (`127.0.0.0/8`, `::1`): a follower pointing
-///   `client_addr` at its own localhost would loop back the write
-///   into whatever local service answers that port (Postgres at
-///   5432, an admin endpoint, etc.).
+/// - **Loopback** (`127.0.0.0/8`, `::1`) and the literal hostname
+///   `"localhost"`: a follower pointing `client_addr` at its own
+///   localhost would loop back the write into whatever local service
+///   answers that port (Postgres at 5432, an admin endpoint, etc.).
+///   Permitted only when `allow_loopback` is true, which the caller
+///   sets when this node also reports itself on loopback —
+///   single-host test or dev clusters where every peer is on
+///   localhost legitimately. In a real multi-host deployment self
+///   binds to a routable interface, so `allow_loopback` stays false
+///   and loopback peer URLs are rejected.
 /// - **Link-local** (`169.254.0.0/16`, `fe80::/10`): notably AWS /
 ///   GCP / Azure instance metadata services at `169.254.169.254`,
-///   which return cloud credentials.
+///   which return cloud credentials. Always rejected.
 /// - **Unspecified** (`0.0.0.0`, `::`): kernel routes these to a
-///   local interface, same effective risk as loopback.
-/// - The literal hostname `"localhost"`.
+///   local interface, same effective risk as loopback, but never a
+///   valid client target. Always rejected.
 ///
 /// Hostnames are not resolved here — a hostname that resolves to a
 /// denied IP at DNS time still passes, and the kernel handles the
@@ -165,41 +190,64 @@ impl LeaderForwarder {
 /// a literal SSRF address into the membership record; an active
 /// adversary controlling DNS for cluster hostnames is out of scope
 /// of this check and needs to be addressed at a different layer.
-fn is_valid_leader_url(url: &str) -> bool {
+fn is_valid_leader_url(url: &str, allow_loopback: bool) -> bool {
+    match url_host(url) {
+        Some(host) => !is_ssrf_host(&host, allow_loopback),
+        None => false,
+    }
+}
+
+/// True iff this node's own reported `client_addr` is on loopback
+/// (or the literal `"localhost"`). The forwarder uses this to opt
+/// into accepting loopback peer URLs — see [`is_valid_leader_url`].
+fn self_addr_is_loopback(url: &str) -> bool {
+    url_host(url).is_some_and(|h| is_loopback_host(&h))
+}
+
+/// Parse an http(s) URL and return its bare host (IPv6 brackets
+/// stripped). `None` for empty input, unparseable URLs, non-http(s)
+/// schemes, and URLs with no host. `Url::host_str` returns IPv6
+/// addresses with the URL-syntax `[...]` brackets in place; the
+/// parsers we then feed expect bare addresses.
+fn url_host(url: &str) -> Option<String> {
     if url.is_empty() {
-        return false;
+        return None;
     }
-    let Ok(parsed) = reqwest::Url::parse(url) else {
-        return false;
-    };
+    let parsed = reqwest::Url::parse(url).ok()?;
     if !matches!(parsed.scheme(), "http" | "https") || !parsed.has_host() {
-        return false;
+        return None;
     }
-    let Some(host) = parsed.host_str() else {
-        return false;
-    };
-    // `Url::host_str` returns IPv6 addresses with the URL-syntax
-    // `[...]` brackets in place. Strip them so the IP parser sees
-    // a bare address; non-IPv6 hosts pass through unchanged.
+    let host = parsed.host_str()?;
     let bare = host
         .strip_prefix('[')
         .and_then(|s| s.strip_suffix(']'))
         .unwrap_or(host);
-    !is_ssrf_host(bare)
+    Some(bare.to_string())
+}
+
+/// True for loopback IPv4 (`127.0.0.0/8`), IPv6 (`::1`), and the
+/// literal hostname `"localhost"`. Used both for the SSRF check and
+/// for self-loopback detection.
+fn is_loopback_host(host: &str) -> bool {
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    host.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
 }
 
 /// Returns true for hosts that should never be a legitimate cluster
-/// peer: loopback / link-local / unspecified IPs, or the literal
-/// hostname `"localhost"`. See [`is_valid_leader_url`] for the full
-/// rationale.
-fn is_ssrf_host(host: &str) -> bool {
-    if host.eq_ignore_ascii_case("localhost") {
-        return true;
+/// peer in this deployment: link-local / unspecified IPs always; the
+/// literal `"localhost"` and loopback IPs unless `allow_loopback` is
+/// set (single-host test/dev clusters). See [`is_valid_leader_url`]
+/// for the full rationale.
+fn is_ssrf_host(host: &str, allow_loopback: bool) -> bool {
+    if is_loopback_host(host) {
+        return !allow_loopback;
     }
     let Ok(ip) = host.parse::<IpAddr>() else {
         return false;
     };
-    if ip.is_loopback() || ip.is_unspecified() {
+    if ip.is_unspecified() {
         return true;
     }
     match ip {
@@ -514,52 +562,95 @@ mod tests {
 
     #[test]
     fn leader_url_validation_accepts_http_and_https() {
-        assert!(is_valid_leader_url("http://node-1:8080"));
-        assert!(is_valid_leader_url("https://node-1.cluster.internal:8080"));
-        assert!(is_valid_leader_url("http://10.0.1.5:9090/"));
+        assert!(is_valid_leader_url("http://node-1:8080", false));
+        assert!(is_valid_leader_url(
+            "https://node-1.cluster.internal:8080",
+            false,
+        ));
+        assert!(is_valid_leader_url("http://10.0.1.5:9090/", false));
     }
 
     #[test]
     fn leader_url_validation_rejects_other_schemes_and_garbage() {
         // Schemes the forwarder must not honor even if a buggy
         // membership update placed them there.
-        assert!(!is_valid_leader_url("file:///etc/passwd"));
-        assert!(!is_valid_leader_url("ftp://node-1:21"));
-        assert!(!is_valid_leader_url("javascript:alert(1)"));
-        assert!(!is_valid_leader_url("data:text/plain,hi"));
+        assert!(!is_valid_leader_url("file:///etc/passwd", false));
+        assert!(!is_valid_leader_url("ftp://node-1:21", false));
+        assert!(!is_valid_leader_url("javascript:alert(1)", false));
+        assert!(!is_valid_leader_url("data:text/plain,hi", false));
         // Plain garbage.
-        assert!(!is_valid_leader_url(""));
-        assert!(!is_valid_leader_url("not a url"));
+        assert!(!is_valid_leader_url("", false));
+        assert!(!is_valid_leader_url("not a url", false));
     }
 
     #[test]
-    fn leader_url_validation_rejects_ssrf_targets() {
+    fn leader_url_validation_rejects_ssrf_targets_in_prod_posture() {
+        // `allow_loopback = false` — the multi-host posture.
         // Loopback — IPv4 + IPv6 + hostname.
-        assert!(!is_valid_leader_url("http://127.0.0.1:8080"));
-        assert!(!is_valid_leader_url("http://127.0.0.5:8080"));
-        assert!(!is_valid_leader_url("http://[::1]:8080"));
-        assert!(!is_valid_leader_url("http://localhost:8080"));
-        assert!(!is_valid_leader_url("http://LOCALHOST:8080"));
+        assert!(!is_valid_leader_url("http://127.0.0.1:8080", false));
+        assert!(!is_valid_leader_url("http://127.0.0.5:8080", false));
+        assert!(!is_valid_leader_url("http://[::1]:8080", false));
+        assert!(!is_valid_leader_url("http://localhost:8080", false));
+        assert!(!is_valid_leader_url("http://LOCALHOST:8080", false));
 
         // Link-local — AWS / GCP / Azure metadata services and any
         // 169.254.x.y peer.
-        assert!(!is_valid_leader_url("http://169.254.169.254/"));
-        assert!(!is_valid_leader_url("http://169.254.0.1:8080"));
-        assert!(!is_valid_leader_url("http://[fe80::1]:8080"));
+        assert!(!is_valid_leader_url("http://169.254.169.254/", false));
+        assert!(!is_valid_leader_url("http://169.254.0.1:8080", false));
+        assert!(!is_valid_leader_url("http://[fe80::1]:8080", false));
 
         // Unspecified — kernel routes 0.0.0.0 / :: to a local
         // interface, same effective risk as loopback.
-        assert!(!is_valid_leader_url("http://0.0.0.0:8080"));
-        assert!(!is_valid_leader_url("http://[::]:8080"));
+        assert!(!is_valid_leader_url("http://0.0.0.0:8080", false));
+        assert!(!is_valid_leader_url("http://[::]:8080", false));
+    }
+
+    #[test]
+    fn leader_url_validation_permits_loopback_on_single_host_clusters() {
+        // `allow_loopback = true` — the single-host posture the
+        // forwarder enters when self's own client_addr is loopback.
+        // Loopback variants pass.
+        assert!(is_valid_leader_url("http://127.0.0.1:8080", true));
+        assert!(is_valid_leader_url("http://127.0.0.5:8080", true));
+        assert!(is_valid_leader_url("http://[::1]:8080", true));
+        assert!(is_valid_leader_url("http://localhost:8080", true));
+        assert!(is_valid_leader_url("http://LOCALHOST:8080", true));
+
+        // Link-local and unspecified stay rejected — different
+        // threat (metadata services / kernel routing), not gated by
+        // single-host vs multi-host.
+        assert!(!is_valid_leader_url("http://169.254.169.254/", true));
+        assert!(!is_valid_leader_url("http://[fe80::1]:8080", true));
+        assert!(!is_valid_leader_url("http://0.0.0.0:8080", true));
+        assert!(!is_valid_leader_url("http://[::]:8080", true));
     }
 
     #[test]
     fn leader_url_validation_still_accepts_private_cluster_addresses() {
         // Private RFC1918 ranges are standard for internal clusters;
         // the SSRF deny-list doesn't include them.
-        assert!(is_valid_leader_url("http://10.0.1.5:9090/"));
-        assert!(is_valid_leader_url("http://192.168.1.10:8080"));
-        assert!(is_valid_leader_url("http://172.16.0.5:8080"));
+        assert!(is_valid_leader_url("http://10.0.1.5:9090/", false));
+        assert!(is_valid_leader_url("http://192.168.1.10:8080", false));
+        assert!(is_valid_leader_url("http://172.16.0.5:8080", false));
+    }
+
+    #[test]
+    fn self_addr_loopback_detection_recognizes_local_bindings() {
+        // Hosts that mark this node as single-host / dev.
+        assert!(self_addr_is_loopback("http://127.0.0.1:8080"));
+        assert!(self_addr_is_loopback("http://[::1]:8080"));
+        assert!(self_addr_is_loopback("http://localhost:8080"));
+        assert!(self_addr_is_loopback("http://LOCALHOST:8080"));
+
+        // Real interface addresses → multi-host posture.
+        assert!(!self_addr_is_loopback("http://10.0.1.5:8080"));
+        assert!(!self_addr_is_loopback("http://node-1.cluster.internal:8080"));
+        assert!(!self_addr_is_loopback("http://192.168.1.10:8080"));
+
+        // Garbage / non-http schemes → conservative false (no opt-in).
+        assert!(!self_addr_is_loopback(""));
+        assert!(!self_addr_is_loopback("not a url"));
+        assert!(!self_addr_is_loopback("file:///etc/passwd"));
     }
 
     #[test]

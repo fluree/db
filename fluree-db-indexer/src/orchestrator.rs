@@ -908,15 +908,21 @@ impl BackgroundIndexerWorker {
             // with explicit shutdown observation. The shutdown signal
             // is independent of `tick_rx.changed()` because the
             // subscriber spawn keeps a `watch::Sender` alive — see
-            // `subscriber_trigger`.
+            // `subscriber_trigger`. `biased` so a shutdown signal that
+            // landed concurrently with a tick (or retry deadline) wins
+            // the select and the worker stops processing new work
+            // instead of starting a fresh `process_ledger` that would
+            // resolve waiters as `Failed` rather than `Cancelled`.
             let wait_result = if let Some(deadline) = retry_deadline {
                 tokio::select! {
+                    biased;
                     _ = &mut self.shutdown_rx => { break; }
                     result = self.tick_rx.changed() => result,
                     () = tokio::time::sleep_until(deadline) => Ok(()),
                 }
             } else {
                 tokio::select! {
+                    biased;
                     _ = &mut self.shutdown_rx => { break; }
                     result = self.tick_rx.changed() => result,
                 }
