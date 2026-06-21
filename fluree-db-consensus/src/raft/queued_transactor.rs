@@ -39,6 +39,7 @@ use fluree_db_core::ledger_id::{normalize_ledger_id, split_ledger_id};
 use fluree_db_core::ContentId;
 use fluree_db_core::ContentKind;
 use fluree_db_transact::CommitOptsRequest;
+use openraft::error::{ClientWriteError, RaftError};
 use openraft::Raft;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -120,14 +121,24 @@ impl QueuedTransactor {
     /// an idempotency key: without one, re-proposing would create a
     /// duplicate queue entry rather than hitting the cache.
     ///
-    /// When the state machine rejects the propose (`BodyHashMismatch`,
-    /// `QueueFull`, `LedgerNotFound`, unexpected variants, or the raft
-    /// layer itself errors), the envelope at `request_cid` is orphaned
-    /// in CAS — nothing else references it. This function releases it
-    /// before returning. `Enqueued`/`InFlight`/`IdempotencyHit`/
-    /// `IdempotencyFailed` paths leave the envelope owned by the
-    /// queue or idempotency cache; eviction / admin clear releases it
-    /// via the state-machine adapter's release channel.
+    /// Envelope release rules:
+    ///
+    /// - State-machine rejections (`BodyHashMismatch`, `QueueFull`,
+    ///   `LedgerNotFound`, `LedgerRetracted`, unexpected variants):
+    ///   the propose was applied to a deterministic rejection, so
+    ///   the envelope is genuinely orphaned and released here.
+    /// - Raft-layer pre-commit errors (`ForwardToLeader`,
+    ///   `ChangeMembershipError`): the propose never entered the
+    ///   replicated log; release.
+    /// - Raft-layer `Fatal`: ambiguous — the entry may have committed
+    ///   to a majority before this node's loop crashed. Don't
+    ///   release: a worker on the new leader may still need to read
+    ///   the envelope. The idempotency-key eviction path sweeps it
+    ///   later if the entry never actually committed.
+    /// - `Enqueued`/`InFlight`/`IdempotencyHit`/`IdempotencyFailed`:
+    ///   the envelope is owned by the queue or idempotency cache;
+    ///   eviction / admin clear releases it via the state-machine
+    ///   adapter's release channel.
     async fn submit_and_await(
         &self,
         args: EnqueueCommandArgs,
@@ -141,11 +152,41 @@ impl QueuedTransactor {
         for attempt in 0..attempts_allowed {
             let response = match self.raft.client_write(cmd.clone()).await {
                 Ok(response) => response,
-                Err(e) => {
+                // `ForwardToLeader` and `ChangeMembershipError` reject
+                // the propose before it enters the replicated log, so
+                // the envelope is genuinely orphaned and safe to
+                // release. `Fatal` is ambiguous: the entry may have
+                // committed to a majority before this node's local
+                // raft loop crashed, in which case some other node's
+                // worker is going to read the envelope. Leaving it in
+                // CAS is correct — the idempotency-key eviction path
+                // sweeps it later if the entry never actually
+                // committed, but releasing here would race against a
+                // worker on the new leader trying to read it.
+                Err(RaftError::APIError(ClientWriteError::ForwardToLeader(_))) => {
+                    self.release_envelope(&full_ledger_id, &request_cid).await;
+                    return Err(SubmissionError::Execution {
+                        status: 503,
+                        message: "raft node is not the leader; retry against the current leader"
+                            .into(),
+                    });
+                }
+                Err(RaftError::APIError(ClientWriteError::ChangeMembershipError(e))) => {
                     self.release_envelope(&full_ledger_id, &request_cid).await;
                     return Err(SubmissionError::Execution {
                         status: 500,
-                        message: format!("raft client_write failed: {e}"),
+                        message: format!(
+                            "unexpected ChangeMembershipError on EnqueueCommand: {e}"
+                        ),
+                    });
+                }
+                Err(RaftError::Fatal(f)) => {
+                    return Err(SubmissionError::Execution {
+                        status: 503,
+                        message: format!(
+                            "raft fatal during EnqueueCommand: {f}; submission outcome \
+                             is unknown, retry with an idempotency key"
+                        ),
                     });
                 }
             };
@@ -1089,6 +1130,19 @@ mod tests {
             status(&submission_error_from_abort(AbortReason::BranchHeadReset)),
             409
         );
+    }
+
+    #[test]
+    fn snapshot_installed_maps_to_503_with_retry_hint() {
+        let err = submission_error_from_abort(AbortReason::SnapshotInstalled);
+        assert_eq!(status(&err), 503);
+        match err {
+            SubmissionError::Execution { message, .. } => {
+                assert!(message.contains("snapshot"), "got: {message}");
+                assert!(message.contains("retry"), "got: {message}");
+            }
+            _ => unreachable!(),
+        }
     }
 
     #[test]
