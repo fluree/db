@@ -52,9 +52,17 @@ pub enum SubmissionStateResponse {
 
 /// Payload of [`SubmissionStateResponse::Committed`]. Lifted into a
 /// struct so the enclosing enum's variant footprint stays a single
-/// pointer wide — the wire shape (flat fields plus an optional
-/// `detail` block) is preserved via the enclosing enum's `#[serde]`
-/// tag attribute and this struct's flat layout.
+/// pointer wide — the wire shape (flat fields plus optional
+/// `detail` / `status` blocks) is preserved via the enclosing enum's
+/// `#[serde]` tag attribute and this struct's flat layout.
+///
+/// `detail` and `status` carry the same payload; `status` is a
+/// back-compat alias for v1 clients that read the previous
+/// `{ "state": "committed", "status": {...} }` shape, before the
+/// canonical kit (`commit_id`, `t`, `kind`, `idempotency_key`) was
+/// hoisted to top-level fields. Both are omitted when the typed
+/// receipt is not recoverable (leader transition / restart / moka
+/// eviction). Plan to drop `status` in the next major version.
 #[derive(Serialize)]
 pub struct CommittedSubmissionResponse {
     pub idempotency_key: Option<String>,
@@ -71,13 +79,19 @@ pub struct CommittedSubmissionResponse {
     /// restart / cache eviction.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<OperationDetailResponse>,
+    /// **Deprecated** — back-compat alias of [`Self::detail`] for v1
+    /// clients written against the prior `{ status: {...} }` shape.
+    /// Carries the same payload. Will be removed in the next major
+    /// version; migrate readers to `detail`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<OperationDetailResponse>,
 }
 
 /// Per-op detail block, present on `Committed` when the typed
 /// receipt was recoverable from the in-process cache. Discriminated
 /// on `operation` matching the kit-level `kind`, but carrying the
 /// richer field set.
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 #[serde(tag = "operation", rename_all = "snake_case")]
 pub enum OperationDetailResponse {
     Transaction(TransactionStatusResponse),
@@ -87,7 +101,7 @@ pub enum OperationDetailResponse {
     Push(PushStatusResponse),
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 pub struct TransactionStatusResponse {
     pub idempotency_key: Option<String>,
     pub commit_id: String,
@@ -95,7 +109,7 @@ pub struct TransactionStatusResponse {
     pub flake_count: usize,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 pub struct RevertStatusResponse {
     pub idempotency_key: Option<String>,
     pub branch: String,
@@ -106,7 +120,7 @@ pub struct RevertStatusResponse {
     pub new_head_id: String,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 pub struct MergeStatusResponse {
     pub idempotency_key: Option<String>,
     pub source: String,
@@ -120,7 +134,7 @@ pub struct MergeStatusResponse {
     pub strategy: Option<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 pub struct RebaseStatusResponse {
     pub idempotency_key: Option<String>,
     pub branch: String,
@@ -135,7 +149,7 @@ pub struct RebaseStatusResponse {
     pub strategy: String,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 pub struct PushStatusResponse {
     pub idempotency_key: Option<String>,
     pub ledger: String,
@@ -191,12 +205,20 @@ impl From<SubmissionState> for SubmissionStateResponse {
                     tally: _,
                     receipt,
                 } = *committed;
+                // Emit `detail` and the back-compat `status` alias
+                // with identical payloads — both omitted when the
+                // typed receipt was not recoverable. The double-
+                // serialize cost is one `OperationDetailResponse`
+                // clone per cache hit; trivial vs the round-trip
+                // it serves.
+                let detail = receipt.map(|r| OperationDetailResponse::from(*r));
                 Self::Committed(Box::new(CommittedSubmissionResponse {
                     idempotency_key: idempotency_key.map(|k| k.as_str().to_string()),
                     kind: body_kind_tag(kind),
                     commit_id: commit_id.to_string(),
                     t,
-                    detail: receipt.map(|r| OperationDetailResponse::from(*r)),
+                    status: detail.clone(),
+                    detail,
                 }))
             }
             SubmissionState::Failed(err) => Self::Failed {
@@ -312,5 +334,101 @@ impl From<PushReceipt> for PushStatusResponse {
             head_t: receipt.head_t,
             head_id: receipt.head_id.to_string(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Wire-format pinning. The shape evolved past the original v1
+    //! contract (`{ state: "committed", status: {...} }`), so the
+    //! response now emits the new flat fields **and** the legacy
+    //! `status` alias side-by-side. These tests pin both shapes so a
+    //! refactor of the response struct can't silently re-break v1
+    //! clients.
+    use super::*;
+    use fluree_db_api::{CommitId, CommitReceipt, ContentKind};
+    use fluree_db_consensus::CommittedSubmission;
+
+    fn fake_commit_id() -> CommitId {
+        CommitId::new(ContentKind::Commit, &[7u8; 16])
+    }
+
+    fn cached_transact_state() -> SubmissionState {
+        let commit_id = fake_commit_id();
+        SubmissionState::Committed(Box::new(CommittedSubmission {
+            idempotency_key: Some(IdempotencyKey::new("client-key-42").expect("fits cap")),
+            kind: BodyKind::JsonLdInsert,
+            commit_id: commit_id.clone(),
+            t: 42,
+            tally: None,
+            receipt: Some(Box::new(OperationReceipt::Transaction(TransactionReceipt {
+                idempotency_key: Some(IdempotencyKey::new("client-key-42").expect("fits cap")),
+                commit: CommitReceipt {
+                    commit_id,
+                    t: 42,
+                    flake_count: 3,
+                },
+                tally: None,
+            }))),
+        }))
+    }
+
+    #[test]
+    fn cached_committed_emits_both_new_flat_fields_and_legacy_status() {
+        let response = SubmissionStateResponse::from(cached_transact_state());
+        let json = serde_json::to_value(&response).expect("serialize");
+
+        // New v2 surface: top-level canonical kit.
+        assert_eq!(json["state"], "committed");
+        assert_eq!(json["idempotency_key"], "client-key-42");
+        assert_eq!(json["kind"], "transact");
+        assert_eq!(json["t"], 42);
+        assert!(json["commit_id"].is_string());
+
+        // New v2 surface: `detail` block.
+        assert_eq!(json["detail"]["operation"], "transaction");
+        assert_eq!(json["detail"]["flake_count"], 3);
+
+        // v1 back-compat: `status` alias carries the same payload.
+        assert_eq!(json["status"]["operation"], "transaction");
+        assert_eq!(json["status"]["flake_count"], 3);
+        assert_eq!(json["status"], json["detail"]);
+    }
+
+    #[test]
+    fn degraded_committed_omits_both_status_and_detail() {
+        // Post-leader-transition / restart / TTL eviction: the typed
+        // receipt is gone but the canonical kit remains. Both
+        // `detail` and `status` must be absent (not `null`) so v1
+        // clients reading `response.status.operation` get a clean
+        // "key missing" rather than a null-deref.
+        let state = SubmissionState::Committed(Box::new(CommittedSubmission {
+            idempotency_key: Some(IdempotencyKey::new("client-key-42").expect("fits cap")),
+            kind: BodyKind::JsonLdInsert,
+            commit_id: fake_commit_id(),
+            t: 42,
+            tally: None,
+            receipt: None,
+        }));
+        let response = SubmissionStateResponse::from(state);
+        let json = serde_json::to_value(&response).expect("serialize");
+
+        assert_eq!(json["state"], "committed");
+        assert_eq!(json["t"], 42);
+        assert!(json.get("detail").is_none(), "detail must be omitted");
+        assert!(json.get("status").is_none(), "status must be omitted");
+    }
+
+    #[test]
+    fn unknown_and_in_flight_have_no_extra_fields() {
+        let unknown = serde_json::to_value(SubmissionStateResponse::from(SubmissionState::Unknown))
+            .expect("serialize");
+        assert_eq!(unknown, serde_json::json!({ "state": "unknown" }));
+
+        let in_flight = serde_json::to_value(SubmissionStateResponse::from(
+            SubmissionState::InFlight,
+        ))
+        .expect("serialize");
+        assert_eq!(in_flight, serde_json::json!({ "state": "in_flight" }));
     }
 }
