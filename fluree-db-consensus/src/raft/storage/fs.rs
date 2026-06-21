@@ -17,11 +17,11 @@
 //!     <id>.data      # raw snapshot bytes
 //! ```
 //!
-//! Every mutation is atomic-write-then-rename with `fsync` of the temp
-//! file, so a partial write never replaces a previously-good file.
-//! Parent-directory fsync is omitted — modern journaling filesystems
-//! make the rename durable, and the rare older filesystems that don't
-//! aren't a v1 concern.
+//! Every mutation is atomic-write-then-rename with `fsync` of both the
+//! temp file and the parent directory (so the rename's directory
+//! entry is durable across power loss, not just the file contents).
+//! Directory fsync is a no-op on non-Unix targets, which don't expose
+//! an equivalent operation.
 
 use super::{
     LogEntry, LogId, LogState, RaftLogStore, RaftSnapshotStore, RaftStorage, SnapshotId,
@@ -42,11 +42,41 @@ fn ser_err(action: &str, err: postcard::Error) -> StorageError {
     StorageError::serialization(format!("{action}: {err}"))
 }
 
-/// Atomic write: stage to `<path>.tmp`, fsync, rename onto `path`.
+/// fsync the directory at `path` so any rename/create/unlink whose
+/// effect on the directory entry should outlive a power loss is
+/// actually persisted.
+///
+/// On Unix this opens the directory read-only and calls `fsync` on
+/// the resulting fd. On non-Unix targets (Windows) the platform has
+/// no equivalent operation; the call is a no-op and we accept the
+/// weaker durability rather than failing.
+async fn fsync_dir(path: &Path) -> Result<(), StorageError> {
+    #[cfg(unix)]
+    {
+        let dir = fs::File::open(path)
+            .await
+            .map_err(|e| io_err("open parent dir", e))?;
+        dir.sync_all()
+            .await
+            .map_err(|e| io_err("sync parent dir", e))?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+    Ok(())
+}
+
+/// Atomic write: stage to `<path>.tmp`, fsync, rename onto `path`,
+/// fsync the parent directory.
 ///
 /// On any POSIX-y filesystem the rename is atomic, so readers either
 /// see the previous good file or the new good file — never a torn
-/// write.
+/// write. Fsyncing the parent directory after the rename is what
+/// keeps that guarantee across a power loss: without it the rename
+/// can revert on remount, silently rolling back a write whose `Ok`
+/// callers (Raft vote / log entry / snapshot pointer persistence)
+/// rely on for safety.
 async fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), StorageError> {
     let tmp = path.with_extension("tmp");
     {
@@ -61,6 +91,9 @@ async fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), StorageError> {
     fs::rename(&tmp, path)
         .await
         .map_err(|e| io_err("rename tmp", e))?;
+    if let Some(parent) = path.parent() {
+        fsync_dir(parent).await?;
+    }
     Ok(())
 }
 
