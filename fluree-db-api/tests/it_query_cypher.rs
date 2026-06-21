@@ -4111,6 +4111,60 @@ async fn cypher_var_length_unbounded_transitive() {
 }
 
 #[tokio::test]
+async fn cypher_path_enumeration_vs_reachability() {
+    // Diamond: A→B, A→C, B→D, C→D — two distinct 2-hop paths A→D.
+    // Bounded var-length ENUMERATES paths (2 rows); unbounded is REACHABILITY
+    // (D reached once → 1 row). Documents the current semantic boundary.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/cypher:path-enum");
+    let committed = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": ctx(),
+                "@graph": [
+                    {"@id": "ex:A", "@type": "ex:N", "ex:name": "A", "ex:R": [{"@id": "ex:B"}, {"@id": "ex:C"}]},
+                    {"@id": "ex:B", "@type": "ex:N", "ex:name": "B", "ex:R": {"@id": "ex:D"}},
+                    {"@id": "ex:C", "@type": "ex:N", "ex:name": "C", "ex:R": {"@id": "ex:D"}},
+                    {"@id": "ex:D", "@type": "ex:N", "ex:name": "D"},
+                ]
+            }),
+        )
+        .await
+        .expect("seed diamond");
+    let db = graphdb_from_ledger(&committed.ledger);
+
+    let count = |q: &'static str| {
+        let fluree = &fluree;
+        let db = &db;
+        async move {
+            let out = fluree
+                .query_cypher(db, q)
+                .await
+                .expect("query")
+                .to_jsonld_async(db.as_graph_db_ref())
+                .await
+                .expect("jsonld");
+            out[0][0].as_i64().expect("count")
+        }
+    };
+
+    // Bounded: one row per distinct 2-hop trail → 2.
+    assert_eq!(
+        count(r#"MATCH (a:N {name: "A"})-[:R*2..2]->(d:N {name: "D"}) RETURN count(*) AS c"#).await,
+        2,
+        "bounded var-length enumerates both A→B→D and A→C→D"
+    );
+
+    // Unbounded: reachability — D is reached, counted once → 1.
+    assert_eq!(
+        count(r#"MATCH (a:N {name: "A"})-[:R*]->(d:N {name: "D"}) RETURN count(*) AS c"#).await,
+        1,
+        "unbounded var-length is reachability (one row per reachable endpoint)"
+    );
+}
+
+#[tokio::test]
 async fn cypher_shortest_path_length_directed() {
     let fluree = FlureeBuilder::memory().build_memory();
     let l = seed_knows_chain(&fluree, "it/cypher:sp-directed").await;
