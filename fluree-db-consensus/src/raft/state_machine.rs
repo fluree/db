@@ -183,6 +183,12 @@ pub struct ApplyRecord {
     /// the original didn't request tracking; carried so idempotent
     /// retries return what the original asked for.
     pub tally: Option<RecordedTally>,
+    /// Flake count from the original submission. Carried so
+    /// idempotent retries (post-cache-eviction or post-leader-
+    /// transition) return the same flake count the original
+    /// observed instead of a degraded zero. Only meaningful for
+    /// [`BodyKind`] variants whose commits produce flakes.
+    pub flake_count: u64,
 }
 
 /// Cached outcome of a previously-processed request, keyed in
@@ -661,6 +667,11 @@ pub struct ApplyHeadArgs {
     /// `tally: None` even when the first call observed one.
     #[serde(default)]
     pub tally: Option<RecordedTally>,
+    /// Flake count from the staged commit. Recorded in
+    /// [`ApplyRecord::flake_count`] so a later [`IdempotencyHit`]
+    /// returns the same count the original produced instead of a
+    /// degraded zero.
+    pub flake_count: u64,
 }
 
 /// Payload for [`Command::PoisonQueueEntry`].
@@ -1924,6 +1935,7 @@ fn apply_head(state: &mut NameServiceState, log_index: u64, args: ApplyHeadArgs)
         commit_t,
         applied_at_millis,
         tally,
+        flake_count,
     } = args;
     let full_ledger_id = format_ledger_id(&ledger_id, &branch);
     let ref_key = RefKey::new(&ledger_id, &branch);
@@ -1987,6 +1999,7 @@ fn apply_head(state: &mut NameServiceState, log_index: u64, args: ApplyHeadArgs)
                 t: commit_t,
                 recorded_index: log_index,
                 tally,
+                flake_count,
             }),
         );
     }
@@ -2888,6 +2901,7 @@ mod tests {
                 t: 5,
                 recorded_index: 3,
                 tally: None,
+                flake_count: 0,
             }),
         );
         apply(
@@ -3197,6 +3211,7 @@ mod tests {
                 t: 5,
                 recorded_index: 9,
                 tally: None,
+                flake_count: 0,
             }),
         );
         let resp = apply(
@@ -3231,6 +3246,7 @@ mod tests {
                 t: 5,
                 recorded_index: 9,
                 tally: None,
+                flake_count: 0,
             }),
         );
         let resp = apply(
@@ -3338,6 +3354,7 @@ mod tests {
             commit_t: t,
             applied_at_millis: 2_000,
             tally: None,
+            flake_count: 0,
         })
     }
 
@@ -3705,6 +3722,7 @@ mod tests {
             t: 1,
             recorded_index,
             tally: None,
+            flake_count: 0,
         })
     }
 

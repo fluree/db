@@ -190,6 +190,7 @@ async fn single_node_raft_index_publisher_round_trip() {
         commit_t: 10,
         applied_at_millis: 2_000,
         tally: None,
+        flake_count: 0,
     }))
     .await
     .unwrap();
@@ -317,6 +318,7 @@ async fn single_node_apply_emits_commit_event_on_bus() {
         commit_t: 10,
         applied_at_millis: 2_000,
         tally: None,
+        flake_count: 0,
     }))
     .await
     .unwrap();
@@ -498,6 +500,7 @@ async fn single_node_branch_lifecycle_round_trip() {
         commit_t: 5,
         applied_at_millis: 1_000,
         tally: None,
+        flake_count: 0,
     }))
     .await
     .unwrap();

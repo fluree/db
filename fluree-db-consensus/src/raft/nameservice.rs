@@ -339,10 +339,12 @@ fn build_apply_head_command(
         .duration_since(SystemTime::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
-    let tally = staged_receipts
-        .and_then(|s| s.peek_transact_tally(queue_id))
+    let metadata = staged_receipts.and_then(|s| s.peek_transact_metadata(queue_id));
+    let tally = metadata
         .as_ref()
+        .and_then(|m| m.tally.as_ref())
         .map(RecordedTally::from);
+    let flake_count = metadata.map(|m| m.flake_count as u64).unwrap_or(0);
     Ok(SmCommand::ApplyHead(ApplyHeadArgs {
         ledger_id: ledger_name,
         branch,
@@ -351,6 +353,7 @@ fn build_apply_head_command(
         commit_t,
         applied_at_millis,
         tally,
+        flake_count,
     }))
 }
 

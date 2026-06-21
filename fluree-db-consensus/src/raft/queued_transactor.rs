@@ -446,15 +446,7 @@ impl Committer for QueuedTransactor {
                 commit: CommitReceipt {
                     commit_id: record.head,
                     t: record.t,
-                    // ApplyRecord doesn't carry flake_count, so the
-                    // post-eviction / leader-transition retry path
-                    // can't recover it. The in-process moka cache
-                    // wraps this layer and preserves the full receipt
-                    // for the common case; this hardcoded zero is the
-                    // degraded fallback. See review finding #9 — a
-                    // future schema extension to ApplyRecord would
-                    // close this gap.
-                    flake_count: 0,
+                    flake_count: record.flake_count as usize,
                 },
                 tally: record.tally.map(Into::into),
             }),

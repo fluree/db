@@ -1073,6 +1073,7 @@ mod tests {
                 commit_t,
                 applied_at_millis: 2_000,
                 tally: None,
+                flake_count: 0,
             })),
         }
     }

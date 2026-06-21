@@ -123,6 +123,17 @@ pub struct RebaseApplied {
     pub strategy: ConflictStrategy,
 }
 
+/// Subset of [`TransactApplied`] threaded through
+/// [`StagedReceiptMap::peek_transact_metadata`]: the fields the
+/// state-machine command needs to record in the replicated
+/// [`super::state_machine::ApplyRecord`] so idempotent retries
+/// recover them post cache eviction or leader transition.
+#[derive(Debug, Clone)]
+pub struct TransactStashMetadata {
+    pub flake_count: usize,
+    pub tally: Option<TrackingTally>,
+}
+
 /// Concurrent map from queue_id → stashed [`AppliedReceipt`].
 ///
 /// Held jointly by the state-machine adapter (consumer) and the
@@ -174,15 +185,19 @@ impl StagedReceiptMap {
             .collect()
     }
 
-    /// Non-destructively read the tally from a stashed
+    /// Non-destructively read the per-transact metadata from a stashed
     /// [`AppliedReceipt::Transact`]. Returns `None` for any other
     /// variant or when the slot is empty. Used by `publish_commit`
-    /// to thread the tally into [`ApplyHeadArgs`] without consuming
-    /// the receipt the adapter still needs for waiter resolution.
-    pub fn peek_transact_tally(&self, queue_id: u64) -> Option<TrackingTally> {
+    /// to thread the metadata into [`ApplyHeadArgs`] without
+    /// consuming the receipt the adapter still needs for waiter
+    /// resolution.
+    pub fn peek_transact_metadata(&self, queue_id: u64) -> Option<TransactStashMetadata> {
         let entry = self.receipts.get(&queue_id)?;
         match &entry.value().1 {
-            AppliedReceipt::Transact(r) => r.tally.clone(),
+            AppliedReceipt::Transact(r) => Some(TransactStashMetadata {
+                flake_count: r.flake_count,
+                tally: r.tally.clone(),
+            }),
             _ => None,
         }
     }
