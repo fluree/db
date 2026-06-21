@@ -555,12 +555,10 @@ pub enum Command {
     /// doesn't match the current value, and enforces
     /// `new.v > current.v`. The current value is
     /// [`ConfigValue::unborn`] when no record is present for a
-    /// registered branch.
-    PushConfig {
-        ledger_id: String,
-        expected: Option<ConfigValue>,
-        new: ConfigValue,
-    },
+    /// registered branch. The args are boxed because
+    /// [`ConfigValue`]'s `ConfigPayload` carries an `extra` map
+    /// whose size dominates the enum otherwise.
+    PushConfig(Box<PushConfigArgs>),
     /// Upsert a graph source's config-side fields (source type,
     /// config blob, dependencies). On an existing record the index
     /// pointer (`index_id`, `index_t`) and `retracted` flag are
@@ -619,6 +617,14 @@ pub enum Command {
         #[serde(default)]
         marker_cutoff_millis: u64,
     },
+}
+
+/// Payload for [`Command::PushConfig`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PushConfigArgs {
+    pub ledger_id: String,
+    pub expected: Option<ConfigValue>,
+    pub new: ConfigValue,
 }
 
 /// Payload for [`Command::EnqueueCommand`].
@@ -1036,11 +1042,7 @@ pub fn apply(state: &mut NameServiceState, command: Command, log_index: u64) -> 
             expected,
             new,
         } => apply_push_status(state, ledger_id, expected, new),
-        Command::PushConfig {
-            ledger_id,
-            expected,
-            new,
-        } => apply_push_config(state, ledger_id, expected, new),
+        Command::PushConfig(args) => apply_push_config(state, *args),
         Command::PublishGraphSource {
             name,
             branch,
@@ -1489,9 +1491,7 @@ fn current_ref_value(state: &NameServiceState, key: &RefKey, kind: RefKind) -> O
             t: entry.map(|e| e.t).unwrap_or(0),
         },
         RefKind::IndexHead => RefValue {
-            id: entry
-                .and_then(|e| e.index.as_ref())
-                .map(|i| i.head.clone()),
+            id: entry.and_then(|e| e.index.as_ref()).map(|i| i.head.clone()),
             t: entry
                 .and_then(|e| e.index.as_ref())
                 .map(|i| i.t)
@@ -1639,12 +1639,12 @@ fn apply_push_status(
     Response::StatusUpdated
 }
 
-fn apply_push_config(
-    state: &mut NameServiceState,
-    ledger_id: String,
-    expected: Option<ConfigValue>,
-    new: ConfigValue,
-) -> Response {
+fn apply_push_config(state: &mut NameServiceState, args: PushConfigArgs) -> Response {
+    let PushConfigArgs {
+        ledger_id,
+        expected,
+        new,
+    } = args;
     let Ok((name, branch)) = split_ledger_id(&ledger_id) else {
         return Response::ConfigConflict { actual: None };
     };
@@ -3892,7 +3892,10 @@ mod tests {
                 "main",
                 RefKind::CommitHead,
                 None,
-                RefValue { id: Some(cid(1)), t: 1 },
+                RefValue {
+                    id: Some(cid(1)),
+                    t: 1,
+                },
             ),
             1,
         );
@@ -3912,8 +3915,14 @@ mod tests {
                 "test/db",
                 "main",
                 RefKind::CommitHead,
-                Some(RefValue { id: Some(cid(9)), t: 99 }),
-                RefValue { id: Some(cid(1)), t: 100 },
+                Some(RefValue {
+                    id: Some(cid(9)),
+                    t: 99,
+                }),
+                RefValue {
+                    id: Some(cid(1)),
+                    t: 100,
+                },
             ),
             2,
         );
@@ -3939,8 +3948,14 @@ mod tests {
                 "test/db",
                 "main",
                 RefKind::CommitHead,
-                Some(RefValue { id: Some(cid(0)), t: 0 }),
-                RefValue { id: Some(cid(1)), t: 0 },
+                Some(RefValue {
+                    id: Some(cid(0)),
+                    t: 0,
+                }),
+                RefValue {
+                    id: Some(cid(1)),
+                    t: 0,
+                },
             ),
             2,
         );
@@ -3970,8 +3985,14 @@ mod tests {
                 "test/db",
                 "main",
                 RefKind::IndexHead,
-                Some(RefValue { id: Some(cid(10)), t: 0 }),
-                RefValue { id: Some(cid(11)), t: 0 },
+                Some(RefValue {
+                    id: Some(cid(10)),
+                    t: 0,
+                }),
+                RefValue {
+                    id: Some(cid(11)),
+                    t: 0,
+                },
             ),
             3,
         );
@@ -3993,7 +4014,10 @@ mod tests {
                 "main",
                 RefKind::IndexHead,
                 Some(RefValue { id: None, t: 0 }),
-                RefValue { id: Some(cid(10)), t: 5 },
+                RefValue {
+                    id: Some(cid(10)),
+                    t: 5,
+                },
             ),
             2,
         );
@@ -4019,7 +4043,10 @@ mod tests {
                 "main",
                 RefKind::CommitHead,
                 None,
-                RefValue { id: Some(cid(1)), t: 1 },
+                RefValue {
+                    id: Some(cid(1)),
+                    t: 1,
+                },
             ),
             1,
         );
@@ -4053,7 +4080,11 @@ mod tests {
 
         let resp = apply(
             &mut state,
-            push_status_cmd("test/db:main", Some(status(1, "ready")), status(2, "indexing")),
+            push_status_cmd(
+                "test/db:main",
+                Some(status(1, "ready")),
+                status(2, "indexing"),
+            ),
             1,
         );
         assert_eq!(resp, Response::StatusUpdated);
@@ -4069,7 +4100,11 @@ mod tests {
         apply(&mut state, create_ledger("test/db"), 0);
         apply(
             &mut state,
-            push_status_cmd("test/db:main", Some(status(1, "ready")), status(2, "indexing")),
+            push_status_cmd(
+                "test/db:main",
+                Some(status(1, "ready")),
+                status(2, "indexing"),
+            ),
             1,
         );
 
@@ -4133,11 +4168,11 @@ mod tests {
         expected: Option<ConfigValue>,
         new: ConfigValue,
     ) -> Command {
-        Command::PushConfig {
+        Command::PushConfig(Box::new(PushConfigArgs {
             ledger_id: ledger_id.into(),
             expected,
             new,
-        }
+        }))
     }
 
     #[test]
@@ -4274,13 +4309,7 @@ mod tests {
         let mut state = NameServiceState::new();
         apply(
             &mut state,
-            publish_graph_source_cmd(
-                "my-search",
-                "main",
-                GraphSourceType::Bm25,
-                "{}",
-                vec![],
-            ),
+            publish_graph_source_cmd("my-search", "main", GraphSourceType::Bm25, "{}", vec![]),
             1,
         );
         apply(
@@ -4328,13 +4357,7 @@ mod tests {
         let mut state = NameServiceState::new();
         apply(
             &mut state,
-            publish_graph_source_cmd(
-                "my-search",
-                "main",
-                GraphSourceType::Bm25,
-                "{}",
-                vec![],
-            ),
+            publish_graph_source_cmd("my-search", "main", GraphSourceType::Bm25, "{}", vec![]),
             1,
         );
 
@@ -4407,13 +4430,7 @@ mod tests {
         let mut state = NameServiceState::new();
         apply(
             &mut state,
-            publish_graph_source_cmd(
-                "my-search",
-                "main",
-                GraphSourceType::Bm25,
-                "{}",
-                vec![],
-            ),
+            publish_graph_source_cmd("my-search", "main", GraphSourceType::Bm25, "{}", vec![]),
             1,
         );
 

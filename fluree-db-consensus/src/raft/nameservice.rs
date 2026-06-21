@@ -50,7 +50,7 @@
 use crate::raft::staged_receipt::StagedReceiptMap;
 use crate::raft::state_machine::{
     AdvanceIndexHeadArgs, ApplyHeadArgs, Command as SmCommand, CreateBranchArgs, CreateLedgerArgs,
-    DesyncReason, NameServiceState, RecordedTally, RefKey, ResetHeadSnapshot,
+    DesyncReason, NameServiceState, PushConfigArgs, RecordedTally, RefKey, ResetHeadSnapshot,
     Response as SmResponse,
 };
 use crate::raft::state_machine_adapter::SharedState;
@@ -744,9 +744,7 @@ impl RefPublisher for RaftNameService {
         match self.submit_lifecycle(cmd).await? {
             SmResponse::RefCasUpdated => Ok(CasResult::Updated),
             SmResponse::RefCasConflict { actual } => Ok(CasResult::Conflict { actual }),
-            SmResponse::LedgerNotFound { ledger_id } => {
-                Err(NameServiceError::not_found(ledger_id))
-            }
+            SmResponse::LedgerNotFound { ledger_id } => Err(NameServiceError::not_found(ledger_id)),
             // `IndexAhead` from an `IndexHead` CAS proposing past
             // the branch's commit watermark maps to a `Conflict`
             // with no actual value.
@@ -926,11 +924,11 @@ impl ConfigPublisher for RaftNameService {
         expected: Option<&ConfigValue>,
         new: &ConfigValue,
     ) -> Result<ConfigCasResult> {
-        let cmd = SmCommand::PushConfig {
+        let cmd = SmCommand::PushConfig(Box::new(PushConfigArgs {
             ledger_id: ledger_id.to_string(),
             expected: expected.cloned(),
             new: new.clone(),
-        };
+        }));
         match self.submit_lifecycle(cmd).await? {
             SmResponse::ConfigUpdated => Ok(ConfigCasResult::Updated),
             SmResponse::ConfigConflict { actual } => Ok(ConfigCasResult::Conflict { actual }),
