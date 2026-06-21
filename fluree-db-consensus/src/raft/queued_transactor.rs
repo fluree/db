@@ -446,6 +446,14 @@ impl Committer for QueuedTransactor {
                 commit: CommitReceipt {
                     commit_id: record.head,
                     t: record.t,
+                    // ApplyRecord doesn't carry flake_count, so the
+                    // post-eviction / leader-transition retry path
+                    // can't recover it. The in-process moka cache
+                    // wraps this layer and preserves the full receipt
+                    // for the common case; this hardcoded zero is the
+                    // degraded fallback. See review finding #9 — a
+                    // future schema extension to ApplyRecord would
+                    // close this gap.
                     flake_count: 0,
                 },
                 tally: record.tally.map(Into::into),
@@ -907,16 +915,17 @@ fn transaction_receipt_from(
     receipt: AppliedReceipt,
 ) -> Result<TransactionReceipt, SubmissionError> {
     use crate::raft::staged_receipt::TransactApplied;
-    let (commit_id, commit_t, tally) = match receipt {
+    let (commit_id, commit_t, flake_count, tally) = match receipt {
         AppliedReceipt::Transact(TransactApplied {
             commit_id,
             commit_t,
+            flake_count,
             tally,
-        }) => (commit_id, commit_t, tally),
+        }) => (commit_id, commit_t, flake_count, tally),
         AppliedReceipt::Minimal {
             commit_id,
             commit_t,
-        } => (commit_id, commit_t, None),
+        } => (commit_id, commit_t, 0, None),
         other => return Err(variant_mismatch("Transact", &other)),
     };
     Ok(TransactionReceipt {
@@ -924,7 +933,7 @@ fn transaction_receipt_from(
         commit: CommitReceipt {
             commit_id,
             t: commit_t,
-            flake_count: 0,
+            flake_count,
         },
         tally,
     })

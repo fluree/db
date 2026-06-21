@@ -77,6 +77,7 @@ impl AppliedReceipt {
 pub struct TransactApplied {
     pub commit_id: ContentId,
     pub commit_t: i64,
+    pub flake_count: usize,
     pub tally: Option<TrackingTally>,
 }
 
@@ -229,6 +230,7 @@ mod tests {
             AppliedReceipt::Transact(TransactApplied {
                 commit_id: cid(1),
                 commit_t: 10,
+                flake_count: 0,
                 tally: None,
             }),
         );
@@ -253,6 +255,7 @@ mod tests {
             AppliedReceipt::Transact(TransactApplied {
                 commit_id: cid(1),
                 commit_t: 1,
+                flake_count: 0,
                 tally: None,
             }),
         );
@@ -262,6 +265,7 @@ mod tests {
             AppliedReceipt::Transact(TransactApplied {
                 commit_id: cid(2),
                 commit_t: 2,
+                flake_count: 0,
                 tally: None,
             }),
         );
@@ -271,6 +275,7 @@ mod tests {
             AppliedReceipt::Transact(TransactApplied {
                 commit_id: cid(3),
                 commit_t: 3,
+                flake_count: 0,
                 tally: None,
             }),
         );

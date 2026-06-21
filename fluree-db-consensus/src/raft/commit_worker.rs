@@ -429,7 +429,7 @@ impl CommitWorker {
         // head landed in the cluster. If publish fails, the
         // write_guard drops without `replace`, leaving the local
         // Fluree handle at its pre-stage head.
-        let (_receipt, new_state) = staged_commit
+        let (receipt, new_state) = staged_commit
             .finalize_state()
             .map_err(|e| stage_failure(&format!("finalize_state failed: {e}")))?;
 
@@ -437,6 +437,7 @@ impl CommitWorker {
             receipt: AppliedReceipt::Transact(TransactApplied {
                 commit_id: commit_cid,
                 commit_t,
+                flake_count: receipt.flake_count,
                 tally,
             }),
             install: Some(StagedStateInstall {

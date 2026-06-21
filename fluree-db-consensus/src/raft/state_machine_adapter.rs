@@ -1007,6 +1007,7 @@ mod tests {
             AppliedReceipt::Transact(TransactApplied {
                 commit_id: cid(42),
                 commit_t: 10,
+                flake_count: 0,
                 tally: None,
             }),
         );
@@ -1171,6 +1172,7 @@ mod tests {
             AppliedReceipt::Transact(TransactApplied {
                 commit_id: cid(42),
                 commit_t: 10,
+                flake_count: 0,
                 tally: None,
             }),
         );
