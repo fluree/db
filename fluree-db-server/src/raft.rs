@@ -41,7 +41,6 @@ use fluree_db_core::ContentId;
 use fluree_db_nameservice::LedgerEventBus;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
 use thiserror::Error;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::sync::Mutex;
@@ -190,10 +189,7 @@ impl RaftIntegration {
 
         let raft_cfg = Arc::new(config.raft_config.validate()?);
 
-        let http_client = reqwest::Client::builder()
-            .connect_timeout(config.network_config.connect_timeout)
-            .pool_idle_timeout(Some(Duration::from_secs(90)))
-            .build()?;
+        let http_client = HttpRaftNetworkFactory::build_client(&config.network_config)?;
         let factory =
             HttpRaftNetworkFactory::with_client(http_client.clone(), config.network_config);
 
@@ -491,6 +487,7 @@ mod tests {
 
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
     use tempfile::TempDir;
 
     #[tokio::test]

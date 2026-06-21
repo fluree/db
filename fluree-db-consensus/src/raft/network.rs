@@ -103,10 +103,7 @@ impl HttpRaftNetworkFactory {
     /// `config`'s timeouts. Errors only if the reqwest builder
     /// rejects the configuration (very rare).
     pub fn new(config: NetworkConfig) -> Result<Self, reqwest::Error> {
-        let client = reqwest::Client::builder()
-            .connect_timeout(config.connect_timeout)
-            .pool_idle_timeout(Some(Duration::from_secs(90)))
-            .build()?;
+        let client = Self::build_client(&config)?;
         Ok(Self { client, config })
     }
 
@@ -115,6 +112,18 @@ impl HttpRaftNetworkFactory {
     /// custom TLS roots across raft traffic and other HTTP traffic.
     pub fn with_client(client: reqwest::Client, config: NetworkConfig) -> Self {
         Self { client, config }
+    }
+
+    /// Build a `reqwest::Client` configured for raft HTTP transport:
+    /// `config`'s connect timeout, a 90 s pool idle timeout, and
+    /// redirects disabled (closes SSRF via 302 to internal addresses
+    /// such as the EC2 instance-metadata service).
+    pub fn build_client(config: &NetworkConfig) -> Result<reqwest::Client, reqwest::Error> {
+        reqwest::Client::builder()
+            .connect_timeout(config.connect_timeout)
+            .pool_idle_timeout(Some(Duration::from_secs(90)))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
     }
 }
 
