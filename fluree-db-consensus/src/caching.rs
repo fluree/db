@@ -21,6 +21,7 @@ use crate::{
     SubmissionLookup, SubmissionState, TransactionReceipt, TransactionRequest,
 };
 use async_trait::async_trait;
+use dashmap::DashMap;
 use fluree_db_api::{CommitId, CommitRef, Fluree, GovernanceOptions, PolicyStats, TrackingTally};
 use fluree_db_core::ledger_id::normalize_ledger_id;
 use fluree_db_ledger::IndexConfig;
@@ -55,6 +56,15 @@ pub const DEFAULT_IDEMPOTENCY_CACHE_MAX_BYTES: u64 = 256 * 1024 * 1024;
 /// count is what keeps the per-request body memory from growing without
 /// limit under sustained load.
 pub const DEFAULT_PENDING_LIMIT: usize = 1024;
+
+/// Default per-ledger in-flight cap layered under [`DEFAULT_PENDING_LIMIT`].
+///
+/// A burst of submissions against one ledger fills its own slice of permits
+/// before drawing from the global pool, so the global cap is always
+/// available to other ledgers. Sized at 1/8 of the global cap: eight
+/// equally-saturated ledgers can collectively reach the global limit, but
+/// no single ledger can exhaust it on its own.
+pub const DEFAULT_PER_LEDGER_PENDING_LIMIT: usize = DEFAULT_PENDING_LIMIT / 8;
 
 /// Cached state for a submission plus the hash of the body it carried.
 /// The hash enables detecting the misuse case where the same idempotency
@@ -173,6 +183,17 @@ pub struct CachingCommitter<C: Committer = LocalCommitter> {
     executor: C,
     cache: Cache<IdempotencyCacheKey, CachedSubmission>,
     admission: Arc<Semaphore>,
+    per_ledger_admission: DashMap<String, Arc<Semaphore>>,
+    per_ledger_limit: usize,
+}
+
+/// RAII guard holding both an admission permits — the per-ledger slot
+/// (acquired first) and the global slot. Dropping it releases both.
+/// Fields are private with `_` prefixes because callers only care about
+/// the lifetime effect, not direct permit access.
+struct AdmissionPermits {
+    _global: OwnedSemaphorePermit,
+    _per_ledger: OwnedSemaphorePermit,
 }
 
 impl CachingCommitter<LocalCommitter> {
@@ -210,15 +231,30 @@ impl<C: Committer> CachingCommitter<C> {
             executor,
             cache,
             admission: Arc::new(Semaphore::new(DEFAULT_PENDING_LIMIT)),
+            per_ledger_admission: DashMap::new(),
+            per_ledger_limit: DEFAULT_PER_LEDGER_PENDING_LIMIT,
         }
     }
 
-    /// Override the in-flight pending-operation cap (defaults to
+    /// Override the global in-flight pending-operation cap (defaults to
     /// [`DEFAULT_PENDING_LIMIT`]). Submissions arriving while `limit`
-    /// operations are already in flight are refused with
-    /// [`SubmissionError::Overloaded`] rather than queued.
+    /// operations are already in flight across all ledgers are refused
+    /// with [`SubmissionError::Overloaded`] rather than queued.
     pub fn with_pending_limit(mut self, limit: usize) -> Self {
         self.admission = Arc::new(Semaphore::new(limit));
+        self
+    }
+
+    /// Override the per-ledger in-flight cap (defaults to
+    /// [`DEFAULT_PER_LEDGER_PENDING_LIMIT`]). Each ledger draws from its
+    /// own slice of permits before reaching the global pool, so one
+    /// ledger's burst cannot starve other ledgers of admission slots.
+    ///
+    /// Applies only to per-ledger semaphores created *after* this call;
+    /// already-active ledgers keep the cap their semaphore was built with.
+    /// Set at construction time before any submissions land.
+    pub fn with_per_ledger_pending_limit(mut self, limit: usize) -> Self {
+        self.per_ledger_limit = limit;
         self
     }
 
@@ -244,14 +280,51 @@ impl<C: Committer> CachingCommitter<C> {
         self
     }
 
-    /// Try to claim one of the in-flight admission permits, refusing the
-    /// submission outright when the cap is reached. The returned permit
-    /// drops (and releases its slot) when the caller's submission future
-    /// completes.
-    fn try_admit(&self) -> Result<OwnedSemaphorePermit, SubmissionError> {
-        Arc::clone(&self.admission)
+    /// Resolve (or lazily create) the per-ledger admission semaphore
+    /// for `ledger_id`. The returned `Arc` is cloned from the map so
+    /// the permit acquired against it stays valid even if some future
+    /// cleanup pass evicts the map entry.
+    fn ledger_semaphore(&self, ledger_id: &str) -> Arc<Semaphore> {
+        // Fast path: entry already present. Avoids the `to_string`
+        // allocation that `entry(...)` would force on a borrowed key.
+        if let Some(slot) = self.per_ledger_admission.get(ledger_id) {
+            return Arc::clone(slot.value());
+        }
+        // Slow path: lazily create. `or_insert_with` is atomic under
+        // DashMap's per-bucket lock so concurrent first-touches converge
+        // on a single semaphore.
+        self.per_ledger_admission
+            .entry(ledger_id.to_string())
+            .or_insert_with(|| Arc::new(Semaphore::new(self.per_ledger_limit)))
+            .value()
+            .clone()
+    }
+
+    /// Try to claim one admission permit at each tier — first the
+    /// per-ledger semaphore for `ledger_id`, then the global pool.
+    /// Order matters: a flood against one ledger fills its own slice
+    /// and is rejected before drawing from the global pool, leaving
+    /// global slots available for other ledgers. Either tier hitting
+    /// its cap returns [`SubmissionError::Overloaded`]; the per-ledger
+    /// permit acquired first drops if the global one fails, releasing
+    /// its slot for the next caller.
+    ///
+    /// `ledger_id` must be the canonical (`name:branch`) form — pass
+    /// the result of [`normalize_ledger_id`] or [`format_ledger_id`]
+    /// so retries that elide the default branch resolve to the same
+    /// semaphore.
+    fn try_admit(&self, ledger_id: &str) -> Result<AdmissionPermits, SubmissionError> {
+        let per_ledger = self
+            .ledger_semaphore(ledger_id)
             .try_acquire_owned()
-            .map_err(|_| SubmissionError::Overloaded)
+            .map_err(|_| SubmissionError::Overloaded)?;
+        let global = Arc::clone(&self.admission)
+            .try_acquire_owned()
+            .map_err(|_| SubmissionError::Overloaded)?;
+        Ok(AdmissionPermits {
+            _global: global,
+            _per_ledger: per_ledger,
+        })
     }
 
     fn hash_request_body(request: &TransactionRequest) -> [u8; 32] {
@@ -529,20 +602,20 @@ impl<C: Committer> Committer for CachingCommitter<C> {
         &self,
         request: TransactionRequest,
     ) -> Result<TransactionReceipt, SubmissionError> {
-        let _permit = self.try_admit()?;
-
         // Canonicalize the ledger id once at the top so the moka
         // cache key (here), the downstream executor's idempotency
-        // map, and any CAS keying it drives all agree on the form.
-        // Without this, a retry that elides the default branch
-        // (`"my-db"` vs `"my-db:main"`) would miss the cached
-        // outcome and re-execute against the same canonical ledger.
+        // map, the per-ledger admission semaphore, and any CAS
+        // keying it drives all agree on the form. Without this, a
+        // retry that elides the default branch (`"my-db"` vs
+        // `"my-db:main"`) would miss the cached outcome and resolve
+        // to a different admission semaphore than the original.
         let mut request = request;
         request.ledger_id =
             normalize_ledger_id(&request.ledger_id).map_err(|e| SubmissionError::Execution {
                 status: 400,
                 message: format!("invalid ledger_id: {e}"),
             })?;
+        let _permit = self.try_admit(&request.ledger_id)?;
 
         // Anonymous submissions (no idempotency key) skip the cache
         // entirely — no retry-collapse and no later status lookup.
@@ -581,15 +654,15 @@ impl<C: Committer> Committer for CachingCommitter<C> {
     }
 
     async fn revert(&self, request: RevertRequest) -> Result<RevertReceipt, SubmissionError> {
-        let _permit = self.try_admit()?;
+        // Cache key uses the same `ledger:branch` form as `transact` so a
+        // single status-lookup endpoint works uniformly across op kinds.
+        let ledger_id = fluree_db_api::format_ledger_id(&request.ledger_name, &request.branch);
+        let _permit = self.try_admit(&ledger_id)?;
 
         let Some(idempotency_key) = request.idempotency_key.clone() else {
             return self.executor.revert(request).await;
         };
 
-        // Cache key uses the same `ledger:branch` form as `transact` so a
-        // single status-lookup endpoint works uniformly across op kinds.
-        let ledger_id = fluree_db_api::format_ledger_id(&request.ledger_name, &request.branch);
         let cache_key = IdempotencyCacheKey::new(ledger_id, idempotency_key);
         let body_hash = Self::hash_revert_body(&request);
 
@@ -616,17 +689,17 @@ impl<C: Committer> Committer for CachingCommitter<C> {
     }
 
     async fn merge(&self, request: MergeRequest) -> Result<MergeReceipt, SubmissionError> {
-        let _permit = self.try_admit()?;
-
-        let Some(idempotency_key) = request.idempotency_key.clone() else {
-            return self.executor.merge(request).await;
-        };
-
         // Namespace by `ledger:source_branch` — uniquely identifies the
         // merge from the client's perspective and is always known up
         // front, no need to pre-resolve the target.
         let ledger_id =
             fluree_db_api::format_ledger_id(&request.ledger_name, &request.source_branch);
+        let _permit = self.try_admit(&ledger_id)?;
+
+        let Some(idempotency_key) = request.idempotency_key.clone() else {
+            return self.executor.merge(request).await;
+        };
+
         let cache_key = IdempotencyCacheKey::new(ledger_id, idempotency_key);
         let body_hash = Self::hash_merge_body(&request);
 
@@ -653,16 +726,16 @@ impl<C: Committer> Committer for CachingCommitter<C> {
     }
 
     async fn rebase(&self, request: RebaseRequest) -> Result<RebaseReceipt, SubmissionError> {
-        let _permit = self.try_admit()?;
+        // Rebase rewrites `branch` itself, so cache by the branch being
+        // rebased — natural client identifier and matches the URL they'd
+        // use to check status.
+        let ledger_id = fluree_db_api::format_ledger_id(&request.ledger_name, &request.branch);
+        let _permit = self.try_admit(&ledger_id)?;
 
         let Some(idempotency_key) = request.idempotency_key.clone() else {
             return self.executor.rebase(request).await;
         };
 
-        // Rebase rewrites `branch` itself, so cache by the branch being
-        // rebased — natural client identifier and matches the URL they'd
-        // use to check status.
-        let ledger_id = fluree_db_api::format_ledger_id(&request.ledger_name, &request.branch);
         let cache_key = IdempotencyCacheKey::new(ledger_id, idempotency_key);
         let body_hash = Self::hash_rebase_body(&request);
 
@@ -694,17 +767,17 @@ impl<C: Committer> Committer for CachingCommitter<C> {
     }
 
     async fn push(&self, request: PushRequest) -> Result<PushReceipt, SubmissionError> {
-        let _permit = self.try_admit()?;
-
         // See the same comment in `transact` — canonicalize once at
         // the cache boundary so the moka key, the downstream
-        // idempotency map, and the per-ledger CAS path all agree.
+        // idempotency map, the per-ledger admission semaphore, and
+        // the per-ledger CAS path all agree.
         let mut request = request;
         request.ledger_id =
             normalize_ledger_id(&request.ledger_id).map_err(|e| SubmissionError::Execution {
                 status: 400,
                 message: format!("invalid ledger_id: {e}"),
             })?;
+        let _permit = self.try_admit(&request.ledger_id)?;
 
         let Some(idempotency_key) = request.idempotency_key.clone() else {
             return self.executor.push(request).await;
@@ -886,6 +959,42 @@ mod tests {
             large > small,
             "weight must scale with policy map size; small={small}, large={large}"
         );
+    }
+
+    #[tokio::test]
+    async fn per_ledger_admission_isolates_tenants_under_a_flood() {
+        // Global cap 4, per-ledger cap 2 — so ledger A can hold at
+        // most 2 in-flight slots, leaving the other 2 globally
+        // available for any other ledger.
+        let (_fluree, committer, _ledger_id) = setup().await;
+        let committer = committer
+            .with_pending_limit(4)
+            .with_per_ledger_pending_limit(2);
+
+        // Saturate ledger A's per-ledger semaphore.
+        let _a1 = committer.try_admit("tenant-a:main").expect("a slot 1");
+        let _a2 = committer.try_admit("tenant-a:main").expect("a slot 2");
+
+        // The next claim against ledger A is refused — its per-ledger
+        // pool is full even though 2 global slots remain free.
+        assert!(matches!(
+            committer.try_admit("tenant-a:main"),
+            Err(SubmissionError::Overloaded)
+        ));
+
+        // Ledger B is unaffected: it has its own per-ledger pool, and
+        // the global pool has room.
+        let _b1 = committer.try_admit("tenant-b:main").expect("b slot 1");
+
+        // Ledger C also fits (slots used: a1, a2, b1 = 3 of 4).
+        let _c1 = committer.try_admit("tenant-c:main").expect("c slot 1");
+
+        // Now ledger D hits the global cap (4 of 4) — refused even
+        // though D's per-ledger pool is empty.
+        assert!(matches!(
+            committer.try_admit("tenant-d:main"),
+            Err(SubmissionError::Overloaded)
+        ));
     }
 
     #[test]
