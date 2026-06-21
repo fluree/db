@@ -1007,7 +1007,10 @@ mod tests {
     }
 
     fn cache_key(label: &str) -> IdempotencyCacheKey {
-        IdempotencyCacheKey::new("test/db:main", IdempotencyKey::new(label).expect("fits cap"))
+        IdempotencyCacheKey::new(
+            "test/db:main",
+            IdempotencyKey::new(label).expect("fits cap"),
+        )
     }
 
     fn lightweight_committed(label: &str) -> CachedSubmission {
@@ -1115,19 +1118,13 @@ mod tests {
         ) -> Result<TransactionReceipt, SubmissionError> {
             unreachable!("status-fallthrough tests never exercise transact")
         }
-        async fn revert(
-            &self,
-            _request: RevertRequest,
-        ) -> Result<RevertReceipt, SubmissionError> {
+        async fn revert(&self, _request: RevertRequest) -> Result<RevertReceipt, SubmissionError> {
             unreachable!("status-fallthrough tests never exercise revert")
         }
         async fn merge(&self, _request: MergeRequest) -> Result<MergeReceipt, SubmissionError> {
             unreachable!("status-fallthrough tests never exercise merge")
         }
-        async fn rebase(
-            &self,
-            _request: RebaseRequest,
-        ) -> Result<RebaseReceipt, SubmissionError> {
+        async fn rebase(&self, _request: RebaseRequest) -> Result<RebaseReceipt, SubmissionError> {
             unreachable!("status-fallthrough tests never exercise rebase")
         }
         async fn push(&self, _request: PushRequest) -> Result<PushReceipt, SubmissionError> {
@@ -1193,13 +1190,21 @@ mod tests {
         // though the cache says InFlight.
         let got = committer.status("tenant-a:main", &key).await;
         assert!(matches!(got, SubmissionState::Committed(_)));
-        assert_eq!(stub.calls(), 1, "inner status must be consulted exactly once");
+        assert_eq!(
+            stub.calls(),
+            1,
+            "inner status must be consulted exactly once"
+        );
 
         // The cache should now be refreshed so a second poll hits
         // fast without a second inner round-trip.
         let got2 = committer.status("tenant-a:main", &key).await;
         assert!(matches!(got2, SubmissionState::Committed(_)));
-        assert_eq!(stub.calls(), 1, "cache refresh must short-circuit the second poll");
+        assert_eq!(
+            stub.calls(),
+            1,
+            "cache refresh must short-circuit the second poll"
+        );
 
         // Body hash must be preserved across the refresh — otherwise a
         // later retry with the same key + same body would incorrectly
@@ -1275,7 +1280,11 @@ mod tests {
 
         let got = committer.status("tenant-a:main", &key).await;
         assert!(matches!(got, SubmissionState::Committed(_)));
-        assert_eq!(stub.calls(), 0, "terminal cache entry must not consult the inner");
+        assert_eq!(
+            stub.calls(),
+            0,
+            "terminal cache entry must not consult the inner"
+        );
     }
 
     #[tokio::test]

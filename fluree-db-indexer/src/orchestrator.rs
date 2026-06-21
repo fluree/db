@@ -475,7 +475,12 @@ impl ShutdownTrigger {
 
 impl Drop for ShutdownTrigger {
     fn drop(&mut self) {
-        if let Some(tx) = self.tx.lock().expect("ShutdownTrigger mutex poisoned").take() {
+        if let Some(tx) = self
+            .tx
+            .lock()
+            .expect("ShutdownTrigger mutex poisoned")
+            .take()
+        {
             let _ = tx.send(());
         }
     }
@@ -725,7 +730,7 @@ impl IndexerHandle {
 
     /// Cancel all pending work. See [`TriggerHandle::cancel_all`].
     pub async fn cancel_all(&self) {
-        self.trigger.cancel_all().await
+        self.trigger.cancel_all().await;
     }
 
     /// Snapshot the per-ledger indexing status. See
@@ -749,13 +754,13 @@ impl IndexerHandle {
     /// Wait until a specific ledger has no pending work. See
     /// [`TriggerHandle::wait_for_idle`].
     pub async fn wait_for_idle(&self, ledger_id: &str) {
-        self.trigger.wait_for_idle(ledger_id).await
+        self.trigger.wait_for_idle(ledger_id).await;
     }
 
     /// Wait until every ledger has no pending work. See
     /// [`TriggerHandle::wait_all_idle`].
     pub async fn wait_all_idle(&self) {
-        self.trigger.wait_all_idle().await
+        self.trigger.wait_all_idle().await;
     }
 }
 

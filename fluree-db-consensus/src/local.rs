@@ -156,8 +156,10 @@ impl Committer for LocalCommitter {
                         error = %e,
                         "transaction commit conflict; reconciling cached state and retrying"
                     );
-                    if let Err(refresh_err) =
-                        self.fluree.refresh(&ledger_id, RefreshOpts::default()).await
+                    if let Err(refresh_err) = self
+                        .fluree
+                        .refresh(&ledger_id, RefreshOpts::default())
+                        .await
                     {
                         tracing::warn!(
                             attempt,

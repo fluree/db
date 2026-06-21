@@ -179,9 +179,7 @@ impl QueuedTransactor {
                     self.release_envelope(&full_ledger_id, &request_cid).await;
                     return Err(SubmissionError::Execution {
                         status: 500,
-                        message: format!(
-                            "unexpected ChangeMembershipError on EnqueueCommand: {e}"
-                        ),
+                        message: format!("unexpected ChangeMembershipError on EnqueueCommand: {e}"),
                     });
                 }
                 Err(RaftError::Fatal(f)) => {

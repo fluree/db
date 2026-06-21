@@ -361,15 +361,17 @@ mod tests {
             commit_id: commit_id.clone(),
             t: 42,
             tally: None,
-            receipt: Some(Box::new(OperationReceipt::Transaction(TransactionReceipt {
-                idempotency_key: Some(IdempotencyKey::new("client-key-42").expect("fits cap")),
-                commit: CommitReceipt {
-                    commit_id,
-                    t: 42,
-                    flake_count: 3,
+            receipt: Some(Box::new(OperationReceipt::Transaction(
+                TransactionReceipt {
+                    idempotency_key: Some(IdempotencyKey::new("client-key-42").expect("fits cap")),
+                    commit: CommitReceipt {
+                        commit_id,
+                        t: 42,
+                        flake_count: 3,
+                    },
+                    tally: None,
                 },
-                tally: None,
-            }))),
+            ))),
         }))
     }
 
@@ -425,10 +427,9 @@ mod tests {
             .expect("serialize");
         assert_eq!(unknown, serde_json::json!({ "state": "unknown" }));
 
-        let in_flight = serde_json::to_value(SubmissionStateResponse::from(
-            SubmissionState::InFlight,
-        ))
-        .expect("serialize");
+        let in_flight =
+            serde_json::to_value(SubmissionStateResponse::from(SubmissionState::InFlight))
+                .expect("serialize");
         assert_eq!(in_flight, serde_json::json!({ "state": "in_flight" }));
     }
 }

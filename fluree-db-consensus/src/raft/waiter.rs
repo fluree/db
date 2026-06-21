@@ -230,10 +230,8 @@ impl WaiterMap {
     pub fn drain_all_with(&self, reason: AbortReason) {
         let queue_ids: Vec<u64> = self.slots.iter().map(|entry| *entry.key()).collect();
         for queue_id in queue_ids {
-            if let Some((_, slot)) = self.slots.remove(&queue_id) {
-                if let WaiterSlot::Parked { sender, .. } = slot {
-                    let _ = sender.send(WaiterOutcome::Aborted(reason.clone()));
-                }
+            if let Some((_, WaiterSlot::Parked { sender, .. })) = self.slots.remove(&queue_id) {
+                let _ = sender.send(WaiterOutcome::Aborted(reason.clone()));
             }
         }
     }
@@ -414,7 +412,10 @@ mod tests {
             parked_rx.await.unwrap(),
             WaiterOutcome::Aborted(AbortReason::SnapshotInstalled)
         ));
-        assert!(map.is_empty(), "buffered slot must be dropped, not retained");
+        assert!(
+            map.is_empty(),
+            "buffered slot must be dropped, not retained"
+        );
     }
 
     #[tokio::test]
