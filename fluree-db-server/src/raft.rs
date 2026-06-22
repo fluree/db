@@ -89,6 +89,12 @@ pub struct RaftIntegration {
     /// them during waiter resolution so transactors see staged-time
     /// detail instead of falling back to `Minimal`.
     pub staged_receipts: Arc<StagedReceiptMap>,
+    /// Inter-node HTTP transport tuning. Held here so
+    /// [`Self::raft_rpc_router`] can apply the per-route body-byte
+    /// caps that match the outbound transport the factory was
+    /// built with — same `NetworkConfig` instance configures both
+    /// sides of every RPC.
+    network_config: NetworkConfig,
     /// One-shot slot holding the [`ReleaseReceiver`] half of the
     /// adapter's CAS release channel. Server startup
     /// [`take_release_receiver`](Self::take_release_receiver)s the
@@ -111,6 +117,7 @@ pub struct RaftIntegrationParts {
     pub event_bus: Arc<LedgerEventBus>,
     pub waiter_map: Arc<WaiterMap>,
     pub staged_receipts: Arc<StagedReceiptMap>,
+    pub network_config: NetworkConfig,
     pub release_rx: ReleaseReceiver,
 }
 
@@ -128,6 +135,7 @@ impl RaftIntegration {
             event_bus,
             waiter_map,
             staged_receipts,
+            network_config,
             release_rx,
         } = parts;
         let forwarder = Arc::new(LeaderForwarder::new(
@@ -143,6 +151,7 @@ impl RaftIntegration {
             event_bus,
             waiter_map,
             staged_receipts,
+            network_config,
             release_rx: Arc::new(Mutex::new(Some(release_rx))),
         }
     }
@@ -190,6 +199,7 @@ impl RaftIntegration {
         let raft_cfg = Arc::new(config.raft_config.validate()?);
 
         let http_client = HttpRaftNetworkFactory::build_client(&config.network_config)?;
+        let network_config = config.network_config.clone();
         let factory =
             HttpRaftNetworkFactory::with_client(http_client.clone(), config.network_config);
 
@@ -203,6 +213,7 @@ impl RaftIntegration {
             event_bus,
             waiter_map,
             staged_receipts,
+            network_config,
             release_rx,
         }))
     }
@@ -214,7 +225,7 @@ impl RaftIntegration {
     /// layer that gates membership changes against operator
     /// credentials.
     pub fn raft_rpc_router(&self) -> Router {
-        raft_network::router(Arc::clone(&self.raft))
+        raft_network::router(Arc::clone(&self.raft), &self.network_config)
     }
 
     /// Cluster admin router — bootstrap and membership-change

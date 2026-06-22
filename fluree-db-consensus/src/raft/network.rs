@@ -72,6 +72,25 @@ pub struct NetworkConfig {
     /// HTTP connect timeout. Independent of the request timeout so a
     /// dead peer fails fast rather than blocking the replication tick.
     pub connect_timeout: Duration,
+    /// Maximum buffered body size accepted on the `vote` route.
+    /// `VoteRequest` is a fixed-size record (a few dozen postcard-
+    /// encoded bytes); a tighter cap than the other two RPCs keeps a
+    /// compromised peer from flooding the vote endpoint with
+    /// max-sized blobs that get decoded as garbage.
+    pub vote_max_body_bytes: usize,
+    /// Maximum buffered body size accepted on the `append-entries`
+    /// route. Bounded by openraft's `max_payload_entries` ×
+    /// per-entry size; the default leaves comfortable headroom for
+    /// large catch-up batches without letting an oversized RPC OOM
+    /// the process.
+    pub append_entries_max_body_bytes: usize,
+    /// Maximum buffered body size accepted on the `install-snapshot`
+    /// route. The snapshot is the full replicated state-machine
+    /// image (or a chunk of it under chunked transport), and
+    /// realistically grows with cluster lifetime. The default
+    /// tolerates a sizable cluster; operators with larger state
+    /// raise this knob.
+    pub install_snapshot_max_body_bytes: usize,
 }
 
 impl Default for NetworkConfig {
@@ -80,6 +99,9 @@ impl Default for NetworkConfig {
             rpc_timeout: Duration::from_millis(500),
             snapshot_timeout: Duration::from_secs(30),
             connect_timeout: Duration::from_millis(250),
+            vote_max_body_bytes: 1024 * 1024,
+            append_entries_max_body_bytes: 64 * 1024 * 1024,
+            install_snapshot_max_body_bytes: 1024 * 1024 * 1024,
         }
     }
 }
@@ -307,27 +329,38 @@ where
 /// network layer (VPC-only port). Embedders can layer their own
 /// auth, TLS, metrics, etc. on top.
 ///
+/// Each route gets its own body-byte cap from `config` so a single
+/// oversized POST can't OOM the process: vote bodies are tiny so
+/// they get the tightest cap; append-entries scales with the batch
+/// size openraft replicates; install-snapshot tolerates the full
+/// state-machine image. Bodies past the cap return 413; the
+/// `Bytes` extractor never buffers more than the route allows.
+/// Defaults live on [`NetworkConfig`].
+///
 /// Example:
 /// ```ignore
 /// let raft = Arc::clone(&raft_handle);
+/// let config = NetworkConfig::default();
 /// let app = axum::Router::new()
-///     .nest("/raft", fluree_db_consensus::raft::network::router(raft));
+///     .nest("/raft", fluree_db_consensus::raft::network::router(raft, &config));
 /// ```
-pub fn router(raft: Arc<Raft<TypeConfig>>) -> Router {
-    // Axum's default body limit is 2 MiB — fine for `vote` (a few
-    // hundred bytes) but well below realistic catch-up traffic on
-    // `append-entries` (a batch of log entries replicating to a
-    // lagging follower) and `install-snapshot` (a full state-machine
-    // image). Disable at the router so all three RPC bodies are
-    // bounded by the per-call timeouts in `NetworkConfig` instead of
-    // a static byte cap. The Raft network listens on a private port
-    // we already trust to the same extent as the data we replicate
-    // through it.
+pub fn router(raft: Arc<Raft<TypeConfig>>, config: &NetworkConfig) -> Router {
     Router::new()
-        .route(PATH_APPEND_ENTRIES, post(handle_append_entries))
-        .route(PATH_VOTE, post(handle_vote))
-        .route(PATH_INSTALL_SNAPSHOT, post(handle_install_snapshot))
-        .layer(DefaultBodyLimit::disable())
+        .route(
+            PATH_APPEND_ENTRIES,
+            post(handle_append_entries)
+                .layer(DefaultBodyLimit::max(config.append_entries_max_body_bytes)),
+        )
+        .route(
+            PATH_VOTE,
+            post(handle_vote).layer(DefaultBodyLimit::max(config.vote_max_body_bytes)),
+        )
+        .route(
+            PATH_INSTALL_SNAPSHOT,
+            post(handle_install_snapshot).layer(DefaultBodyLimit::max(
+                config.install_snapshot_max_body_bytes,
+            )),
+        )
         .with_state(raft)
 }
 
@@ -518,5 +551,22 @@ mod tests {
     fn factory_builds_with_default_config() {
         let _ = HttpRaftNetworkFactory::new(NetworkConfig::default())
             .expect("reqwest client builds with default timeouts");
+    }
+
+    #[test]
+    fn default_body_caps_match_expected_route_profiles() {
+        // Pin the per-route caps so a refactor can't quietly widen
+        // them past the documented profiles: vote stays tight
+        // because the body is fixed-size; append-entries scales
+        // with batch size; install-snapshot tolerates the full
+        // state-machine image.
+        let cfg = NetworkConfig::default();
+        assert_eq!(cfg.vote_max_body_bytes, 1024 * 1024);
+        assert_eq!(cfg.append_entries_max_body_bytes, 64 * 1024 * 1024);
+        assert_eq!(cfg.install_snapshot_max_body_bytes, 1024 * 1024 * 1024);
+        // Ordering invariant — vote ≤ append-entries ≤ install-snapshot.
+        // A future change that flips this is almost certainly a bug.
+        assert!(cfg.vote_max_body_bytes <= cfg.append_entries_max_body_bytes);
+        assert!(cfg.append_entries_max_body_bytes <= cfg.install_snapshot_max_body_bytes);
     }
 }
