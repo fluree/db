@@ -347,12 +347,12 @@ impl FsRaftSnapshotStore {
         self.root.join("snapshots")
     }
 
-    fn meta_path(&self, id: &SnapshotId) -> PathBuf {
-        self.snapshot_dir().join(format!("{}.meta", id.as_str()))
+    fn meta_path(&self, id: &str) -> PathBuf {
+        self.snapshot_dir().join(format!("{id}.meta"))
     }
 
-    fn data_path(&self, id: &SnapshotId) -> PathBuf {
-        self.snapshot_dir().join(format!("{}.data", id.as_str()))
+    fn data_path(&self, id: &str) -> PathBuf {
+        self.snapshot_dir().join(format!("{id}.data"))
     }
 
     fn current_path(&self) -> PathBuf {
@@ -360,19 +360,67 @@ impl FsRaftSnapshotStore {
     }
 }
 
+/// Reject snapshot ids that would be unsafe to interpolate into a
+/// path component under the snapshots directory.
+///
+/// `install_snapshot` carries the snapshot id as a peer-supplied
+/// string. Without this gate, a peer could push a snapshot whose id
+/// is `../../../etc/whatever` and the meta/data writes would land
+/// outside the storage root with peer-controlled bytes — a
+/// single-peer compromise turns into cluster-wide arbitrary FS
+/// write bounded only by the raft-storage UID's permissions. The
+/// `current` pointer file also stores the id as raw bytes, so a
+/// one-time poison would re-fire on every restart until disinfected.
+///
+/// Allowlist: non-empty, `[A-Za-z0-9._-]+`, length ≤ 128, no `..`
+/// substring. The locally-generated `snap-{last_index}-{counter}`
+/// format always passes; on the read paths a previously poisoned id
+/// (from before this gate landed) is rejected before any path
+/// construction. Returns the validated string for the caller to
+/// thread into `meta_path` / `data_path`.
+fn validate_path_safe_id(id: &SnapshotId) -> Result<&str, StorageError> {
+    const MAX_LEN: usize = 128;
+    let s = id.as_str();
+    if s.is_empty() {
+        return Err(StorageError::corruption("snapshot id is empty"));
+    }
+    if s.len() > MAX_LEN {
+        return Err(StorageError::corruption(format!(
+            "snapshot id length {} exceeds cap {MAX_LEN}",
+            s.len()
+        )));
+    }
+    if s.contains("..") {
+        return Err(StorageError::corruption(format!(
+            "snapshot id contains path-traversal '..': {s:?}"
+        )));
+    }
+    if let Some(c) = s
+        .chars()
+        .find(|c| !matches!(c, 'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '_' | '.'))
+    {
+        return Err(StorageError::corruption(format!(
+            "snapshot id contains disallowed character {c:?}: {s:?}"
+        )));
+    }
+    Ok(s)
+}
+
 #[async_trait]
 impl RaftSnapshotStore for FsRaftSnapshotStore {
     async fn write(&self, meta: &SnapshotMeta, data: Vec<u8>) -> Result<(), StorageError> {
+        let safe_id = validate_path_safe_id(&meta.id)?;
         let meta_bytes =
             postcard::to_allocvec(meta).map_err(|e| ser_err("encode snapshot meta", e))?;
-        atomic_write(&self.meta_path(&meta.id), &meta_bytes).await?;
-        atomic_write(&self.data_path(&meta.id), &data).await?;
-        atomic_write(&self.current_path(), meta.id.as_str().as_bytes()).await?;
+        atomic_write(&self.meta_path(safe_id), &meta_bytes).await?;
+        atomic_write(&self.data_path(safe_id), &data).await?;
+        atomic_write(&self.current_path(), safe_id.as_bytes()).await?;
         Ok(())
     }
 
     async fn read(&self, id: &SnapshotId) -> Result<Option<Vec<u8>>, StorageError> {
-        read_if_exists(&self.data_path(id)).await
+        let safe_id = validate_path_safe_id(id)?;
+        read_if_exists(&self.data_path(safe_id)).await
     }
 
     async fn current(&self) -> Result<Option<(SnapshotMeta, Vec<u8>)>, StorageError> {
@@ -383,14 +431,15 @@ impl RaftSnapshotStore for FsRaftSnapshotStore {
             StorageError::corruption(format!("current snapshot id is not utf8: {e}"))
         })?;
         let id = SnapshotId::new(id_str);
+        let safe_id = validate_path_safe_id(&id)?;
 
-        let Some(meta_bytes) = read_if_exists(&self.meta_path(&id)).await? else {
+        let Some(meta_bytes) = read_if_exists(&self.meta_path(safe_id)).await? else {
             return Ok(None);
         };
         let meta =
             postcard::from_bytes(&meta_bytes).map_err(|e| ser_err("decode snapshot meta", e))?;
 
-        let Some(data) = read_if_exists(&self.data_path(&id)).await? else {
+        let Some(data) = read_if_exists(&self.data_path(safe_id)).await? else {
             return Ok(None);
         };
 
@@ -726,6 +775,97 @@ mod tests {
             store.read(&SnapshotId::new("snap-1")).await.unwrap(),
             Some(vec![1])
         );
+    }
+
+    #[test]
+    fn validate_path_safe_id_accepts_safe_inputs() {
+        // The shape the local builder emits — always passes.
+        assert!(validate_path_safe_id(&SnapshotId::new("snap-1-0")).is_ok());
+        assert!(validate_path_safe_id(&SnapshotId::new("snap-18446744073709551615-0")).is_ok());
+        // Allowlisted alphabet.
+        assert!(validate_path_safe_id(&SnapshotId::new("abc_DEF-123.tag")).is_ok());
+        assert!(validate_path_safe_id(&SnapshotId::new("a")).is_ok());
+    }
+
+    #[test]
+    fn validate_path_safe_id_rejects_path_traversal() {
+        // The headline exploit shape — peer-supplied id whose
+        // unmodified interpolation escapes <root>/snapshots.
+        let id = SnapshotId::new("../../../etc/passwd");
+        let err = validate_path_safe_id(&id).unwrap_err();
+        assert!(matches!(err, StorageError::Corruption(_)));
+        assert!(err.to_string().contains(".."));
+
+        // `..` anywhere triggers, even surrounded by allowlisted chars.
+        assert!(validate_path_safe_id(&SnapshotId::new("foo..bar")).is_err());
+        assert!(validate_path_safe_id(&SnapshotId::new("a..b")).is_err());
+        assert!(validate_path_safe_id(&SnapshotId::new("..")).is_err());
+        assert!(validate_path_safe_id(&SnapshotId::new("...")).is_err());
+    }
+
+    #[test]
+    fn validate_path_safe_id_rejects_path_separators_and_exotic_chars() {
+        // Path separators on both Unix and Windows.
+        assert!(validate_path_safe_id(&SnapshotId::new("dir/file")).is_err());
+        assert!(validate_path_safe_id(&SnapshotId::new("dir\\file")).is_err());
+        // Null byte — would terminate C strings early in some FS layers.
+        assert!(validate_path_safe_id(&SnapshotId::new("a\0b")).is_err());
+        // Whitespace + non-ASCII.
+        assert!(validate_path_safe_id(&SnapshotId::new("a b")).is_err());
+        assert!(validate_path_safe_id(&SnapshotId::new("café")).is_err());
+        // Empty.
+        assert!(validate_path_safe_id(&SnapshotId::new("")).is_err());
+    }
+
+    #[test]
+    fn validate_path_safe_id_caps_length() {
+        // Locally-generated ids are tens of chars; anything orders
+        // of magnitude larger is a peer trying to exhaust resources.
+        let oversized = "a".repeat(129);
+        assert!(validate_path_safe_id(&SnapshotId::new(oversized)).is_err());
+        let at_cap = "a".repeat(128);
+        assert!(validate_path_safe_id(&SnapshotId::new(at_cap)).is_ok());
+    }
+
+    #[tokio::test]
+    async fn snapshot_write_rejects_traversal_id_and_writes_nothing() {
+        // End-to-end check that the validator gates `write` before
+        // any FS touch — the snapshots dir should still be empty
+        // (only the directory itself, no files) after the rejection.
+        let dir = TempDir::new().unwrap();
+        let store = FsRaftSnapshotStore::open(dir.path().to_path_buf())
+            .await
+            .unwrap();
+        let meta = SnapshotMeta {
+            id: SnapshotId::new("../escape"),
+            last_applied: Some(LogId::new(1, 1)),
+            membership: vec![],
+        };
+        let err = store.write(&meta, vec![1, 2, 3]).await.unwrap_err();
+        assert!(matches!(err, StorageError::Corruption(_)));
+
+        let mut entries = fs::read_dir(store.snapshot_dir()).await.unwrap();
+        assert!(
+            entries.next_entry().await.unwrap().is_none(),
+            "no snapshot files should have been written after a rejected traversal id"
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshot_current_rejects_poisoned_id_on_disk() {
+        // A pre-existing poisoned `current` file (written by a
+        // vulnerable older build) is rejected at read time before
+        // any meta/data path is constructed.
+        let dir = TempDir::new().unwrap();
+        let store = FsRaftSnapshotStore::open(dir.path().to_path_buf())
+            .await
+            .unwrap();
+        atomic_write(&store.current_path(), b"../etc/escape")
+            .await
+            .unwrap();
+        let err = store.current().await.unwrap_err();
+        assert!(matches!(err, StorageError::Corruption(_)));
+        assert!(err.to_string().contains(".."));
     }
 
     #[tokio::test]
