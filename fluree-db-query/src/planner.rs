@@ -57,6 +57,23 @@ const DEFAULT_PROPERTY_SCAN_SELECTIVITY: f64 = 1_000_000.0;
 /// probes the joined predicate by the produced var) instead of letting a
 /// high-cardinality predicate scan run first. See issue #1287.
 const ANCHORED_PROPERTY_PATH_SELECTIVITY: f64 = 100.0;
+/// A `WITH DISTINCT <one var>` subquery anchored by a constant in its body
+/// (e.g. `MATCH (p {id: $x})-[:KNOWS*1..2]-(friend) WITH DISTINCT friend`) emits
+/// the projected distinct rows reachable from that anchor — NOT the body's join
+/// product. The product wildly overestimates (a 2-hop KNOWS reads ~792M) and
+/// pushes the producer behind unrelated sources in join ordering. Estimate such
+/// an anchored producer at this small bounded value so it is placed first and
+/// binds its output before consumers are ranked.
+///
+/// Tuned above the pure-ordering minimum: it ALSO seeds the object→subject
+/// hash-join driving estimate for a downstream consumer (a `(message
+/// HAS_CREATOR friend)` probe), so it must stay realistic enough that
+/// `probe_count / driving_est` clears [`hash_join`'s scan-ratio cap](crate::hash_join)
+/// — too small (e.g. 100) re-rejects the very hash join this ordering unlocks.
+/// That coupling is asserted by `hash_join::tests::producer_seed_clears_scan_ratio_cap`,
+/// which fails if either this value or `HASH_JOIN_MAX_SCAN_RATIO` drifts below
+/// the targeted probe size.
+pub(crate) const DISTINCT_SUBQUERY_PRODUCER_SELECTIVITY: f64 = 500.0;
 /// Full scan - all variables unbound
 const FULL_SCAN: f64 = 1e12;
 
@@ -778,6 +795,86 @@ impl PatternEstimate {
     }
 }
 
+/// Does this subquery body contain a constant anchor — a specific starting node
+/// (`<const> p ?x`) or a property-value lookup that pins a subject
+/// (`?x p <const>`, e.g. `?root id $personId`) — that bounds the traversal to a
+/// small reachable set? Used to recognize an anchored `DISTINCT` producer (see
+/// [`DISTINCT_SUBQUERY_PRODUCER_SELECTIVITY`]). A broad `?x rdf:type Class` is
+/// NOT an anchor: it constrains membership, not a starting point.
+fn subquery_body_has_constant_anchor(patterns: &[Pattern]) -> bool {
+    patterns.iter().any(|p| match p {
+        Pattern::Triple(tp) => {
+            let const_subject = !matches!(tp.s, Ref::Var(_));
+            let pins_subject = tp.o.as_var().is_none() && !tp.p.is_rdf_type();
+            const_subject || pins_subject
+        }
+        Pattern::PropertyPath(pp) => {
+            !matches!(pp.subject, Ref::Var(_)) || !matches!(pp.object, Ref::Var(_))
+        }
+        Pattern::Union(branches) => branches
+            .iter()
+            .any(|b| subquery_body_has_constant_anchor(b)),
+        Pattern::Optional(ps) | Pattern::Graph { patterns: ps, .. } => {
+            subquery_body_has_constant_anchor(ps)
+        }
+        Pattern::Subquery(inner) => subquery_body_has_constant_anchor(&inner.patterns),
+        _ => false,
+    })
+}
+
+/// Estimate a subquery's OUTPUT cardinality (what join ordering and the
+/// hash-join driving estimate care about) — NOT the size of its internal scan.
+///
+/// - A scalar aggregate (implicit `GROUP BY`) emits exactly one row.
+/// - A `DISTINCT` producer of a single var anchored by a constant in its body
+///   (`WITH DISTINCT friend` over an `{id: $x}`-anchored traversal) emits the
+///   projected distinct rows reachable from the anchor, not the body product —
+///   estimated at [`DISTINCT_SUBQUERY_PRODUCER_SELECTIVITY`].
+/// - Everything else keeps the body cardinality as an upper bound.
+///
+/// Used by [`estimate_pattern`] for join *ordering*, where a loose upper bound
+/// is acceptable. The operator cost model takes the narrower
+/// [`subquery_output_estimate_is_bounded`] gate before trusting this value (see
+/// `SubqueryOperator::estimated_rows`), so an arbitrary subquery's body-cardinality
+/// guess does not perturb downstream hash-join decisions.
+pub(crate) fn estimate_subquery_output(sq: &SubqueryPattern, stats: Option<&StatsView>) -> f64 {
+    let rows = match &sq.grouping {
+        Some(Grouping::Implicit { .. }) => HIGHLY_SELECTIVE,
+        _ if sq.distinct
+            && sq.select.len() == 1
+            && sq.limit.is_none()
+            && subquery_body_has_constant_anchor(&sq.patterns) =>
+        {
+            DISTINCT_SUBQUERY_PRODUCER_SELECTIVITY
+        }
+        _ => estimate_branch_cardinality(&sq.patterns, stats),
+    };
+    // A LIMIT caps the output regardless of grouping.
+    let rows = sq.limit.map_or(rows, |l| rows.min(l as f64));
+    rows.max(HIGHLY_SELECTIVE)
+}
+
+/// Is [`estimate_subquery_output`] reliable enough to feed the operator cost
+/// model (`SubqueryOperator::estimated_rows`, which seeds the downstream
+/// hash-join driving estimate)?
+///
+/// True only for shapes whose output is bounded INDEPENDENT of body
+/// cardinality:
+/// - a scalar aggregate (implicit `GROUP BY`) — exactly one row;
+/// - an anchored `DISTINCT` single-var producer — the intended hash-join seed;
+/// - any subquery with an explicit `LIMIT` — a hard cap.
+///
+/// For everything else (a plain row-per-solution subquery, or an explicit
+/// `GROUP BY` whose distinct-key count we cannot estimate) the value is just the
+/// body cardinality — a fine upper bound for join *ordering* but too unreliable
+/// to perturb hash-join cost decisions, so the operator keeps the conservative
+/// `None`.
+pub(crate) fn subquery_output_estimate_is_bounded(sq: &SubqueryPattern) -> bool {
+    matches!(&sq.grouping, Some(Grouping::Implicit { .. }))
+        || sq.limit.is_some()
+        || (sq.distinct && sq.select.len() == 1 && subquery_body_has_constant_anchor(&sq.patterns))
+}
+
 /// Estimate cardinality for any pattern type.
 ///
 /// The `bound_vars` parameter indicates which variables are already bound from
@@ -808,28 +905,9 @@ pub fn estimate_pattern(
             }
         }
 
-        Pattern::Subquery(sq) => {
-            // Join ordering cares about a subquery's OUTPUT cardinality, not the
-            // size of its internal scan. A scalar aggregate (no `GROUP BY`) emits
-            // exactly one row. Estimating it by the (large) body cardinality
-            // wrongly ranks the subquery as a huge source and pushes it to the
-            // END of the join order — precisely where, if it is uncorrelated, it
-            // gets re-executed once per parent row (see `SubqueryOperator`'s
-            // uncorrelated fast-path). Treat a scalar-aggregate subquery as a
-            // single row so the planner places it early.
-            let rows = match &sq.grouping {
-                Some(Grouping::Implicit { .. }) => HIGHLY_SELECTIVE,
-                // `Explicit` GROUP BY emits one row per distinct key combination
-                // and `None` emits one row per solution; absent per-key NDV we
-                // keep the body estimate (an upper bound) for these.
-                _ => estimate_branch_cardinality(&sq.patterns, stats),
-            };
-            // A LIMIT caps the output regardless of grouping.
-            let rows = sq.limit.map_or(rows, |l| rows.min(l as f64));
-            PatternEstimate::Source {
-                row_count: rows.max(HIGHLY_SELECTIVE),
-            }
-        }
+        Pattern::Subquery(sq) => PatternEstimate::Source {
+            row_count: estimate_subquery_output(sq, stats),
+        },
 
         Pattern::Optional(_) => PatternEstimate::Expander { multiplier: 1.0 },
 
@@ -1070,6 +1148,26 @@ pub fn reorder_patterns(
 
     let mut bound_vars = initial_bound_vars.clone();
 
+    // Outputs of UNCORRELATED sibling subqueries (Cypher WITH-pipeline
+    // producers). A pattern consuming one of these must be placed AFTER the
+    // producing subquery — otherwise the greedy source race can place the
+    // consumer first (e.g. a cheap `?post a :Post` scan ahead of a var-length
+    // WITH whose cost estimate is high), which turns the uncorrelated producer
+    // into a per-row correlated subquery over its own consumer and silently
+    // collapses the consumer's bindings. Correlated subqueries are excluded:
+    // their own outputs are handled by the correlation deferral below.
+    let subquery_output_vars: HashSet<VarId> = patterns
+        .iter()
+        .enumerate()
+        .filter_map(|(i, p)| match p {
+            Pattern::Subquery(sq) if subquery_correlation_vars(sq, patterns, i).is_empty() => {
+                Some(subquery_produced_select_vars(sq))
+            }
+            _ => None,
+        })
+        .flatten()
+        .collect();
+
     // Classify each pattern by its cardinality category.
     let mut sources: Vec<RankedPattern> = Vec::new();
     let mut reducers: Vec<RankedPattern> = Vec::new();
@@ -1124,6 +1222,22 @@ pub fn reorder_patterns(
                 });
                 continue;
             }
+        } else {
+            // Consumer of an uncorrelated WITH-subquery's output: defer it on
+            // those vars so the producing subquery is placed first.
+            let needs: HashSet<VarId> = pattern
+                .referenced_vars()
+                .into_iter()
+                .filter(|v| subquery_output_vars.contains(v))
+                .collect();
+            if !needs.is_empty() {
+                deferred.push(DeferredPattern {
+                    orig_index: i,
+                    required_vars: needs,
+                    pattern: pattern.clone(),
+                });
+                continue;
+            }
         }
 
         match estimate_pattern(pattern, &bound_vars, stats) {
@@ -1156,7 +1270,13 @@ pub fn reorder_patterns(
     // Greedy loop: place patterns by priority
     while !sources.is_empty() || !reducers.is_empty() || !expanders.is_empty() {
         let placed = try_place_reducer(&mut reducers, &mut bound_vars, stats, &mut result)
-            || try_place_source(&mut sources, &mut bound_vars, stats, &mut result)
+            || try_place_source(
+                &mut sources,
+                &mut bound_vars,
+                stats,
+                &mut result,
+                &subquery_output_vars,
+            )
             || try_place_expander(&mut expanders, &mut bound_vars, stats, &mut result);
 
         if !placed {
@@ -1268,69 +1388,168 @@ fn unlocked_object_hash_scan(
         .unwrap_or(0)
 }
 
+/// A disconnected `?x rdf:type <const>` class anchor: a `rdf:type` triple whose
+/// object is a constant class and whose subject variable is part of neither the
+/// bound set nor the producer component. Seeding/placing from such a triple
+/// drives the join backward off the (often broad) class extension — e.g. `home
+/// rdf:type Country` reverse-scanning `IS_PART_OF`/`IS_LOCATED_IN` for every
+/// city. Only class anchors are matched: a selective property-value anchor such
+/// as `?c name "X"` (cardinality 1) is a *good* disconnected seed and is left
+/// alone. See [`try_place_source`].
+fn is_disconnected_class_anchor(
+    pattern: &Pattern,
+    bound_vars: &HashSet<VarId>,
+    anchor_vars: &HashSet<VarId>,
+) -> bool {
+    let Pattern::Triple(tp) = pattern else {
+        return false;
+    };
+    if !tp.p.is_rdf_type() || !matches!(tp.o, Term::Iri(_) | Term::Sid(_)) {
+        return false;
+    }
+    match &tp.s {
+        Ref::Var(v) => !bound_vars.contains(v) && !anchor_vars.contains(v),
+        _ => false,
+    }
+}
+
+/// Seed-candidate pool, phase 1: sources joinable with the bound set, or — when
+/// none are (e.g. the only forward continuation is a not-yet-placed producer) —
+/// every source as a fallback. Returns indices into `remaining`.
+fn connected_or_fallback_pool(
+    remaining: &[RankedPattern],
+    bound_vars: &HashSet<VarId>,
+) -> Vec<usize> {
+    let has_bound = !bound_vars.is_empty();
+    let connected: Vec<usize> = remaining
+        .iter()
+        .enumerate()
+        .filter(|(_, rp)| !has_bound || pattern_shares_variables(&rp.pattern, bound_vars))
+        .map(|(idx, _)| idx)
+        .collect();
+    if connected.is_empty() {
+        (0..remaining.len()).collect()
+    } else {
+        connected
+    }
+}
+
+/// Seed-candidate pool, phase 2: drop disconnected `rdf:type <const>` class
+/// anchors so a broad class extension cannot win the seed and flip the chain
+/// into a scattered reverse object-drive (the IC3 `home:Country` case).
+///
+/// Applies ONLY when a pipeline is active (bound vars or a producer) AND a
+/// connected alternative exists — otherwise the class anchor IS the legitimate
+/// seed and is kept. Deliberately narrow: only class anchors are demoted (a
+/// selective property-value anchor such as `?c name "X"` is never an
+/// [`is_disconnected_class_anchor`] and stays), and demotion never empties the
+/// pool. Returns `base_pool` unchanged when nothing is demoted.
+fn demote_disconnected_class_anchors(
+    base_pool: Vec<usize>,
+    remaining: &[RankedPattern],
+    bound_vars: &HashSet<VarId>,
+    anchor_vars: &HashSet<VarId>,
+) -> Vec<usize> {
+    let pipeline_active = !bound_vars.is_empty() || !anchor_vars.is_empty();
+    let has_connected_alt = pipeline_active
+        && remaining.iter().any(|rp| {
+            pattern_shares_variables(&rp.pattern, bound_vars)
+                || pattern_shares_variables(&rp.pattern, anchor_vars)
+        });
+    if !has_connected_alt {
+        return base_pool;
+    }
+    let demoted: Vec<usize> = base_pool
+        .iter()
+        .copied()
+        .filter(|&i| !is_disconnected_class_anchor(&remaining[i].pattern, bound_vars, anchor_vars))
+        .collect();
+    if demoted.is_empty() {
+        base_pool
+    } else {
+        demoted
+    }
+}
+
+/// Rank two seed candidates `i`/`j` (lower = better). The whole tie-break chain
+/// lives here, one level per `then_with`, in strict priority order:
+///   1. **search-source priority** — only at seed time (no bound vars), so a
+///      search source emits its result IDs/IriMatch bindings before plain
+///      triples consume them;
+///   2. **estimated cardinality** — the primary signal;
+///   3. **unlocked object→subject hash scan** — among EQUAL-cardinality starts
+///      only, prefer the one that keeps the LARGER predicate hash-able rather
+///      than forward-joining over a big intermediate (the BSBM-BI bowtie: 46× on
+///      BI-1's F2);
+///   4. **original position** — stable final tie-break.
+fn rank_seed_candidates(
+    i: usize,
+    j: usize,
+    remaining: &[RankedPattern],
+    bound_vars: &HashSet<VarId>,
+    stats: Option<&StatsView>,
+    has_bound: bool,
+) -> std::cmp::Ordering {
+    let search_priority = |pattern: &Pattern| match pattern {
+        Pattern::IndexSearch(_)
+        | Pattern::VectorSearch(_)
+        | Pattern::GeoSearch(_)
+        | Pattern::S2Search(_) => 0_u8,
+        _ => 1_u8,
+    };
+    let ci = estimate_pattern(&remaining[i].pattern, bound_vars, stats);
+    let cj = estimate_pattern(&remaining[j].pattern, bound_vars, stats);
+
+    // 1. Search sources seed first — but only before anything is bound.
+    let by_search = if has_bound {
+        std::cmp::Ordering::Equal
+    } else {
+        search_priority(&remaining[i].pattern).cmp(&search_priority(&remaining[j].pattern))
+    };
+    by_search
+        // 2. Primary: estimated cardinality.
+        .then_with(|| {
+            ci.row_count()
+                .partial_cmp(&cj.row_count())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        // 3. Equal-cardinality only: keep the larger predicate hash-able.
+        .then_with(|| {
+            let bi = unlocked_object_hash_scan(i, remaining, bound_vars, stats);
+            let bj = unlocked_object_hash_scan(j, remaining, bound_vars, stats);
+            bj.cmp(&bi)
+        })
+        // 4. Stable: original position.
+        .then_with(|| remaining[i].orig_index.cmp(&remaining[j].orig_index))
+}
+
 /// Try to place the best source. Returns true if one was placed.
+///
+/// Three phases (each a named helper): build the connected/fallback candidate
+/// pool, demote disconnected `rdf:type <const>` class anchors when a connected
+/// alternative exists (the IC3 guard — see [`demote_disconnected_class_anchors`]),
+/// then pick the best by [`rank_seed_candidates`]. `anchor_vars` are the outputs
+/// of uncorrelated WITH-subquery producers (see `reorder_patterns`) — a
+/// pseudo-bound pipeline component for both the connectivity test and the
+/// demotion guard.
 fn try_place_source(
     remaining: &mut Vec<RankedPattern>,
     bound_vars: &mut HashSet<VarId>,
     stats: Option<&StatsView>,
     result: &mut Vec<Pattern>,
+    anchor_vars: &HashSet<VarId>,
 ) -> bool {
     if remaining.is_empty() {
         return false;
     }
 
     let has_bound = !bound_vars.is_empty();
+    let base_pool = connected_or_fallback_pool(remaining, bound_vars);
+    let pool = demote_disconnected_class_anchors(base_pool, remaining, bound_vars, anchor_vars);
 
-    // Prefer joinable sources (share variables with bound set)
-    let candidates: Vec<usize> = remaining
-        .iter()
-        .enumerate()
-        .filter(|(_, rp)| !has_bound || pattern_shares_variables(&rp.pattern, bound_vars))
-        .map(|(idx, _)| idx)
-        .collect();
-
-    // Fall back to all sources if none are joinable
-    let pool = if candidates.is_empty() {
-        (0..remaining.len()).collect::<Vec<_>>()
-    } else {
-        candidates
-    };
-
-    let best_idx = pool.into_iter().min_by(|&i, &j| {
-        let seed_priority = |pattern: &Pattern| match pattern {
-            // Search sources should seed the pipeline before plain triples so
-            // they can emit result IDs/IriMatch bindings that later joins consume.
-            Pattern::IndexSearch(_)
-            | Pattern::VectorSearch(_)
-            | Pattern::GeoSearch(_)
-            | Pattern::S2Search(_) => 0_u8,
-            _ => 1_u8,
-        };
-        let ci = estimate_pattern(&remaining[i].pattern, bound_vars, stats);
-        let cj = estimate_pattern(&remaining[j].pattern, bound_vars, stats);
-        if !has_bound {
-            seed_priority(&remaining[i].pattern).cmp(&seed_priority(&remaining[j].pattern))
-        } else {
-            std::cmp::Ordering::Equal
-        }
-        .then_with(|| {
-            ci.row_count()
-                .partial_cmp(&cj.row_count())
-                .unwrap_or(std::cmp::Ordering::Equal)
-        })
-        // Before falling back to original index: among equally-selective starts,
-        // prefer the one that turns the LARGER predicate into an object→subject
-        // hash join rather than a forward join over a big intermediate. This flips
-        // a BSBM-BI bowtie (two equally-selective country filters, written
-        // producer/DE-first) onto the side whose chain keeps the 2.85M-row
-        // predicate hash-able — 46x on BI-1's F2.
-        .then_with(|| {
-            let bi = unlocked_object_hash_scan(i, &remaining[..], bound_vars, stats);
-            let bj = unlocked_object_hash_scan(j, &remaining[..], bound_vars, stats);
-            bj.cmp(&bi)
-        })
-        .then_with(|| remaining[i].orig_index.cmp(&remaining[j].orig_index))
-    });
+    let best_idx = pool
+        .into_iter()
+        .min_by(|&i, &j| rank_seed_candidates(i, j, remaining, bound_vars, stats, has_bound));
 
     if let Some(idx) = best_idx {
         let rp = remaining.remove(idx);
@@ -1495,6 +1714,18 @@ fn subquery_correlation_vars(
         }
     }
     corr
+}
+
+/// Variables a subquery binds itself and exposes in its SELECT — its
+/// WITH-pipeline outputs. A sibling that consumes one of these must run after
+/// the subquery (see the call site in `reorder_patterns`).
+fn subquery_produced_select_vars(sq: &SubqueryPattern) -> HashSet<VarId> {
+    let select: HashSet<VarId> = sq.select.iter().copied().collect();
+    sq.patterns
+        .iter()
+        .flat_map(Pattern::produced_vars)
+        .filter(|v| select.contains(v))
+        .collect()
 }
 
 fn deferred_required_vars(pattern: &Pattern) -> Vec<VarId> {
@@ -3115,5 +3346,328 @@ mod tests {
         // Age filter is pushed into UNION branches.
         assert_eq!(count_patterns(&reordered, is_filter), 1);
         assert_union_branches_contain(&reordered, is_filter, "should contain pushed-in age filter");
+    }
+
+    // --- seed-time WITH-producer vs disconnected class anchor ------------------
+
+    fn type_anchor(subject: VarId, class: &str) -> Pattern {
+        Pattern::Triple(TriplePattern::new(
+            Ref::Var(subject),
+            Ref::Sid(Sid::new(
+                fluree_vocab::namespaces::RDF,
+                fluree_vocab::predicates::RDF_TYPE,
+            )),
+            Term::Sid(Sid::new(100, class)),
+        ))
+    }
+
+    fn with_producer(out: VarId) -> Pattern {
+        use crate::ir::SubqueryPattern;
+        Pattern::Subquery(SubqueryPattern::new(
+            vec![out],
+            vec![Pattern::Triple(make_pattern(out, "knows", VarId(99)))],
+        ))
+    }
+
+    #[test]
+    fn with_producer_seeds_before_disconnected_class_anchor() {
+        // IC3 Stage 2 shape: WITH-subquery produces `friend`; `home rdf:type
+        // Country` is a tiny (111) but disconnected class anchor. Without the
+        // guard, Country seeds #0 and drives the chain backward (50s plan).
+        let (friend, city, home) = (VarId(0), VarId(1), VarId(2));
+        let mut stats = StatsView::default();
+        stats.classes.insert(Sid::new(100, "Country"), 111);
+        // Realistic shape: the location predicates are broad scans, the producer
+        // body (`knows`) is comparatively small — so once the disconnected Country
+        // anchor is dropped from the seed pool, the producer wins the seed.
+        for (p, c) in [
+            ("IS_PART_OF", 10_000),
+            ("IS_LOCATED_IN", 10_000),
+            ("knows", 50),
+        ] {
+            stats.properties.insert(
+                Sid::new(100, p),
+                PropertyStatData {
+                    count: c,
+                    ndv_values: c,
+                    ndv_subjects: c,
+                },
+            );
+        }
+
+        let patterns = vec![
+            type_anchor(home, "Country"),
+            Pattern::Triple(make_pattern(city, "IS_PART_OF", home)),
+            Pattern::Triple(make_pattern(friend, "IS_LOCATED_IN", city)), // consumes friend
+            with_producer(friend),
+        ];
+        let ordered = reorder_patterns(&patterns, Some(&stats), &HashSet::new());
+
+        let sub_pos = ordered
+            .iter()
+            .position(|p| matches!(p, Pattern::Subquery(_)))
+            .expect("subquery present");
+        let anchor_pos = ordered
+            .iter()
+            .position(|p| matches!(p, Pattern::Triple(tp) if tp.p.is_rdf_type()))
+            .expect("rdf:type anchor present");
+        assert!(
+            sub_pos < anchor_pos,
+            "WITH producer must seed before the disconnected class anchor: {ordered:?}"
+        );
+        assert!(
+            !matches!(&ordered[0], Pattern::Triple(tp) if tp.p.is_rdf_type()),
+            "class anchor must not seed the block: {ordered:?}"
+        );
+    }
+
+    #[test]
+    fn pure_class_anchor_seeds_without_producer() {
+        // No WITH producer: `home rdf:type Country` is the genuine anchor and must
+        // still seed (the guard must not penalize class anchors in general).
+        let (home, city, p) = (VarId(0), VarId(1), VarId(2));
+        let mut stats = StatsView::default();
+        stats.classes.insert(Sid::new(100, "Country"), 111);
+
+        let patterns = vec![
+            type_anchor(home, "Country"),
+            Pattern::Triple(make_pattern(city, "IS_PART_OF", home)),
+            Pattern::Triple(make_pattern(p, "IS_LOCATED_IN", city)),
+        ];
+        let ordered = reorder_patterns(&patterns, Some(&stats), &HashSet::new());
+        assert!(
+            matches!(&ordered[0], Pattern::Triple(tp) if tp.p.is_rdf_type()),
+            "with no producer the class anchor still seeds first: {ordered:?}"
+        );
+    }
+
+    #[test]
+    fn class_anchor_demoted_in_fallback_when_producer_continues() {
+        // IC3 mid-block shape: a selective chain has already bound `cx`, so no
+        // remaining source shares the bound set — the only forward continuation
+        // is the WITH producer (connected via `friend`, an anchor var). A cheap
+        // disconnected `home rdf:type Country` is also available. The producer
+        // must win: the class anchor must not seed a reverse drive out of the
+        // fall-back-to-all pool. (The seed-only demotion failed this.)
+        let (friend, cx, mx, home) = (VarId(0), VarId(1), VarId(2), VarId(4));
+        let mut stats = StatsView::default();
+        stats.classes.insert(Sid::new(100, "Country"), 111);
+
+        let patterns = vec![
+            type_anchor(home, "Country"),
+            with_producer(friend),
+            Pattern::Triple(make_pattern(mx, "HAS_CREATOR", friend)), // consumer of friend
+        ];
+        let mut bound = HashSet::new();
+        bound.insert(cx); // pretend the selective chain already bound `cx`
+        let ordered = reorder_patterns(&patterns, Some(&stats), &bound);
+
+        let sub_pos = ordered
+            .iter()
+            .position(|p| matches!(p, Pattern::Subquery(_)))
+            .expect("subquery present");
+        let anchor_pos = ordered
+            .iter()
+            .position(|p| matches!(p, Pattern::Triple(tp) if tp.p.is_rdf_type()))
+            .expect("rdf:type anchor present");
+        assert!(
+            sub_pos < anchor_pos,
+            "producer must beat the class anchor in the fall-back pool: {ordered:?}"
+        );
+    }
+
+    #[test]
+    fn producer_then_consumer_order_not_regressed() {
+        // IC9 shape: the WITH producer seeds, then its consumer (`HAS_CREATOR`,
+        // which references `friend`) drains immediately after.
+        let (friend, message) = (VarId(0), VarId(1));
+        let patterns = vec![
+            Pattern::Triple(make_pattern(message, "HAS_CREATOR", friend)),
+            with_producer(friend),
+        ];
+        let ordered = reorder_patterns(&patterns, None, &HashSet::new());
+        assert!(
+            matches!(&ordered[0], Pattern::Subquery(_)),
+            "producer seeds first: {ordered:?}"
+        );
+        assert!(
+            matches!(&ordered[1], Pattern::Triple(tp)
+                if matches!(&tp.p, Ref::Sid(s) if s.name.as_ref() == "HAS_CREATOR")),
+            "consumer drains right after the producer: {ordered:?}"
+        );
+    }
+
+    /// Position of the first triple whose predicate name is `name`.
+    fn triple_pos(ordered: &[Pattern], name: &str) -> usize {
+        ordered
+            .iter()
+            .position(|p| {
+                matches!(p, Pattern::Triple(tp)
+                    if matches!(&tp.p, Ref::Sid(s) if s.name.as_ref() == name))
+            })
+            .unwrap_or_else(|| panic!("predicate {name} present in {ordered:?}"))
+    }
+
+    #[test]
+    fn demotion_is_class_anchor_specific_property_anchor_survives() {
+        // Companion to `class_anchor_demoted_in_fallback_when_producer_continues`:
+        // the SAME pipeline shape, but the disconnected anchor is a SELECTIVE
+        // property-value anchor (`?home id <x>`), not an rdf:type class anchor.
+        // Demotion targets only class anchors, so the property anchor stays in
+        // the pool and — being more selective than the producer — seeds first.
+        // (If demotion over-reached to property anchors, the producer would win,
+        // exactly as it does for a class anchor.)
+        let (friend, home, mx) = (VarId(0), VarId(2), VarId(3));
+        let patterns = vec![
+            value_anchor(home),
+            with_producer(friend),
+            Pattern::Triple(make_pattern(mx, "HAS_CREATOR", friend)), // consumer of friend
+        ];
+        let ordered = reorder_patterns(&patterns, None, &HashSet::new());
+        assert!(
+            matches!(&ordered[0], Pattern::Triple(tp) if !tp.p.is_rdf_type()),
+            "selective property-value anchor is not demoted and seeds first: {ordered:?}"
+        );
+        assert!(
+            ordered
+                .iter()
+                .position(|p| matches!(p, Pattern::Subquery(_)))
+                .expect("producer present")
+                > 0,
+            "producer does not seed ahead of the surviving property anchor: {ordered:?}"
+        );
+    }
+
+    #[test]
+    fn hash_scan_tiebreak_only_breaks_equal_cardinality_seeds() {
+        // Two seed candidates A (`?x pa ?y`) and B (`?z pb ?w`) plus a large
+        // downstream predicate `?m big ?y` whose object A binds. The hash-scan
+        // tie-break is subordinate to cardinality, so it must decide ONLY when A
+        // and B tie.
+        let (x, y, z, w, m) = (VarId(0), VarId(1), VarId(2), VarId(3), VarId(4));
+        let stat = |c: u64| PropertyStatData {
+            count: c,
+            ndv_values: c,
+            ndv_subjects: c,
+        };
+
+        // Equal cardinality (100 vs 100): the unlocked-object-hash-scan tie-break
+        // prefers A, which keeps the 1M-row `big` predicate hash-able.
+        let mut tied = StatsView::default();
+        tied.properties.insert(Sid::new(100, "pa"), stat(100));
+        tied.properties.insert(Sid::new(100, "pb"), stat(100));
+        tied.properties
+            .insert(Sid::new(100, "big"), stat(1_000_000));
+        let patterns = vec![
+            Pattern::Triple(make_pattern(x, "pa", y)),
+            Pattern::Triple(make_pattern(z, "pb", w)),
+            Pattern::Triple(make_pattern(m, "big", y)),
+        ];
+        let ordered = reorder_patterns(&patterns, Some(&tied), &HashSet::new());
+        assert!(
+            triple_pos(&ordered, "pa") < triple_pos(&ordered, "pb"),
+            "equal cardinality: A unlocks the big hash scan and seeds before B: {ordered:?}"
+        );
+
+        // Break the tie on cardinality (B = 50 < A = 100): cardinality is primary,
+        // so B wins and the hash-scan tie-break is never consulted.
+        let mut skewed = StatsView::default();
+        skewed.properties.insert(Sid::new(100, "pa"), stat(100));
+        skewed.properties.insert(Sid::new(100, "pb"), stat(50));
+        skewed
+            .properties
+            .insert(Sid::new(100, "big"), stat(1_000_000));
+        let patterns = vec![
+            Pattern::Triple(make_pattern(x, "pa", y)),
+            Pattern::Triple(make_pattern(z, "pb", w)),
+            Pattern::Triple(make_pattern(m, "big", y)),
+        ];
+        let ordered = reorder_patterns(&patterns, Some(&skewed), &HashSet::new());
+        assert!(
+            triple_pos(&ordered, "pb") < triple_pos(&ordered, "pa"),
+            "strictly-more-selective B wins; the unlock tie-break does not override cardinality: {ordered:?}"
+        );
+    }
+
+    // --- which subquery shapes feed the operator cost model -------------------
+    //
+    // `subquery_output_estimate_is_bounded` gates `SubqueryOperator::estimated_rows`
+    // (which seeds the downstream hash-join driving estimate). Only reliably
+    // bounded shapes may return `Some`; an arbitrary subquery keeps the
+    // conservative `None` so its body-cardinality guess cannot perturb hash-join
+    // decisions for unrelated queries.
+
+    use crate::ir::{AggregateFn, AggregateSpec};
+
+    /// A `?s <p> <const>` triple — a constant-object anchor (not `rdf:type`).
+    fn value_anchor(subject: VarId) -> Pattern {
+        Pattern::Triple(TriplePattern::new(
+            Ref::Var(subject),
+            Ref::Sid(Sid::new(100, "id")),
+            Term::Sid(Sid::new(100, "x")),
+        ))
+    }
+
+    fn count_all_grouping(group_by: Vec<VarId>, out: VarId) -> Grouping {
+        Grouping::assemble(
+            group_by,
+            vec![AggregateSpec {
+                function: AggregateFn::CountAll,
+                output_var: out,
+            }],
+            vec![],
+            None,
+        )
+        .expect("aggregate present")
+    }
+
+    #[test]
+    fn scalar_aggregate_subquery_is_bounded() {
+        // Implicit GROUP BY → exactly one row.
+        let sq = SubqueryPattern::new(vec![VarId(0)], vec![value_anchor(VarId(1))])
+            .with_grouping(count_all_grouping(vec![], VarId(0)));
+        assert!(subquery_output_estimate_is_bounded(&sq));
+    }
+
+    #[test]
+    fn anchored_distinct_producer_is_bounded() {
+        // `WITH DISTINCT ?x` over an anchored body — the intended hash-join seed.
+        let sq = SubqueryPattern::new(vec![VarId(0)], vec![value_anchor(VarId(0))]).with_distinct();
+        assert!(subquery_output_estimate_is_bounded(&sq));
+    }
+
+    /// A plain `?x knows ?y` body — no anchor, multiplies rows.
+    fn unanchored_body() -> Vec<Pattern> {
+        vec![Pattern::Triple(make_pattern(VarId(0), "knows", VarId(1)))]
+    }
+
+    #[test]
+    fn limited_subquery_is_bounded() {
+        // An explicit LIMIT is a hard cap regardless of shape.
+        let sq = SubqueryPattern::new(vec![VarId(0)], unanchored_body()).with_limit(5);
+        assert!(subquery_output_estimate_is_bounded(&sq));
+    }
+
+    #[test]
+    fn plain_row_per_solution_subquery_is_unbounded() {
+        // Non-DISTINCT, no grouping, no limit: body cardinality only → keep None.
+        let sq = SubqueryPattern::new(vec![VarId(0)], unanchored_body());
+        assert!(!subquery_output_estimate_is_bounded(&sq));
+    }
+
+    #[test]
+    fn explicit_group_by_subquery_is_unbounded() {
+        // Distinct-key count is unknown → not safe to feed the cost model.
+        let sq = SubqueryPattern::new(vec![VarId(0)], unanchored_body())
+            .with_grouping(count_all_grouping(vec![VarId(0)], VarId(2)));
+        assert!(!subquery_output_estimate_is_bounded(&sq));
+    }
+
+    #[test]
+    fn distinct_without_anchor_is_unbounded() {
+        // DISTINCT single-var but no constant anchor in the body: the 500-row
+        // producer estimate does not apply, so it is not a trustworthy seed.
+        let sq = SubqueryPattern::new(vec![VarId(0)], unanchored_body()).with_distinct();
+        assert!(!subquery_output_estimate_is_bounded(&sq));
     }
 }

@@ -4973,3 +4973,59 @@ async fn sparql_group_by_expression_via_bind_workaround() {
         normalize_rows(&json!([["usd", 5], ["cad", 3], ["eur", 2]]))
     );
 }
+
+/// `ORDER BY (EXISTS { ... })` routes the EXISTS through an order-expression
+/// BIND built in `apply_solution_modifiers` (the `order_binds` site). That
+/// `BindOperator` resolves EXISTS per row, so this exercises the projected/
+/// ORDER-BY EXISTS path — distinct from a WHERE-clause `FILTER EXISTS`. It also
+/// pins the `with_planning` wiring through `apply_solution_modifiers`: the BIND
+/// must carry the query's temporal context, not default to current-state.
+#[tokio::test]
+async fn sparql_order_by_exists_expression_sorts_by_correlated_existence() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "exists:order-by");
+
+    // alice and dave know someone; bob and carol know no one.
+    let insert = json!({
+        "@context": { "ex": "http://example.org/ns/" },
+        "@graph": [
+            {"@id": "ex:alice", "@type": "ex:Person", "ex:knows": {"@id": "ex:bob"}},
+            {"@id": "ex:bob",   "@type": "ex:Person"},
+            {"@id": "ex:carol", "@type": "ex:Person"},
+            {"@id": "ex:dave",  "@type": "ex:Person", "ex:knows": {"@id": "ex:carol"}}
+        ]
+    });
+    let ledger = fluree
+        .insert(ledger0, &insert)
+        .await
+        .expect("insert people");
+
+    // ORDER BY the EXISTS boolean (false sorts before true), then by ?s.
+    // Expect the two friendless people first, then the two who know someone.
+    let query = r"
+        PREFIX ex: <http://example.org/ns/>
+        SELECT ?s WHERE {
+            ?s a ex:Person .
+        }
+        ORDER BY (EXISTS { ?s ex:knows ?o }) ?s
+    ";
+
+    let result = support::query_sparql(&fluree, &ledger.ledger, query)
+        .await
+        .expect("ORDER BY EXISTS query should succeed");
+    let jsonld = result
+        .to_jsonld(&ledger.ledger.snapshot)
+        .expect("to_jsonld");
+
+    assert_eq!(
+        normalize_rows(&jsonld),
+        normalize_rows(&json!([
+            ["ex:bob"],
+            ["ex:carol"],
+            ["ex:alice"],
+            ["ex:dave"]
+        ])),
+        "friendless subjects (EXISTS=false) must sort before those who know someone"
+    );
+}
