@@ -876,16 +876,43 @@ async fn submission_status_survives_leader_transition() {
     // we just used — the replicated idempotency state is the only
     // source of truth post-transition.
     cluster.shutdown_node(original_leader).await;
+    // Wait until *every* surviving node agrees on the same new
+    // (non-original) leader. A bare `current_leader` poll would
+    // return as soon as one node sees the election outcome; the
+    // status loop below queries each alive node in turn, and any
+    // follower still holding `current_leader = None` would have its
+    // forwarder return 503 NoLeader. Full convergence here is what
+    // closes the race the CI run exposed.
+    let expected_voters: BTreeSet<NodeId> = (1..=CLUSTER_SIZE).collect();
     let deadline = Instant::now() + DEFAULT_TIMEOUT;
     let new_leader = loop {
-        if let Some(id) = cluster.current_leader().await {
+        let mut leaders = BTreeSet::new();
+        let mut all_aligned = true;
+        for node in cluster.nodes.iter().filter(|n| n.is_alive()) {
+            match cluster.cluster_status(node).await {
+                Ok(status) => {
+                    match status.current_leader {
+                        Some(id) => {
+                            leaders.insert(id);
+                        }
+                        None => all_aligned = false,
+                    }
+                    if status.voters != expected_voters {
+                        all_aligned = false;
+                    }
+                }
+                Err(_) => all_aligned = false,
+            }
+        }
+        if all_aligned && leaders.len() == 1 {
+            let id = *leaders.iter().next().expect("len checked above");
             if id != original_leader {
                 break id;
             }
         }
         assert!(
             Instant::now() < deadline,
-            "no new leader elected within {DEFAULT_TIMEOUT:?}"
+            "no new leader (≠ {original_leader}) converged within {DEFAULT_TIMEOUT:?}; leaders={leaders:?}"
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     };
