@@ -59,7 +59,8 @@ pub struct RaftIntegration {
     /// Raft handle. Cloned into the network, admin, and forward
     /// routers; also used by
     /// [`QueuedTransactor`](fluree_db_consensus::raft::queued_transactor::QueuedTransactor)
-    /// and the [`CommitWorker`](fluree_db_consensus::raft::commit_worker::CommitWorker).
+    /// and each per-branch
+    /// [`Stager`](fluree_db_consensus::raft::commit_worker::Stager).
     pub raft: Arc<Raft<TypeConfig>>,
     /// This node's id. Cached so callers (notably the leader-aware
     /// indexer watcher) don't have to dip into `raft.metrics()` just
@@ -82,8 +83,8 @@ pub struct RaftIntegration {
     /// [`QueuedTransactor`](fluree_db_consensus::raft::queued_transactor::QueuedTransactor)
     /// so submission-side registrations meet apply-side resolutions.
     pub waiter_map: Arc<WaiterMap>,
-    /// Per-process side channel the
-    /// [`CommitWorker`](fluree_db_consensus::raft::commit_worker::CommitWorker)
+    /// Per-process side channel each per-branch
+    /// [`Stager`](fluree_db_consensus::raft::commit_worker::Stager)
     /// stashes typed [`AppliedReceipt`](fluree_db_consensus::raft::staged_receipt::AppliedReceipt)
     /// values into before proposing `ApplyHead`; the adapter takes
     /// them during waiter resolution so transactors see staged-time

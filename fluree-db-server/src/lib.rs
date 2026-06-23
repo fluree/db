@@ -591,22 +591,23 @@ impl FlureeServerBuilder {
             let indexer_config = fluree_db_indexer::IndexerConfig::default();
             let event_bus = Arc::clone(&integration.event_bus);
             // Same `RaftNameService` doubles as the
-            // `CommitPublisher` so the worker's head advance
+            // `CommitPublisher` so each stager's head advance
             // goes through `publish_commit` → `ApplyHead`
             // under the queue front it sampled.
             let publisher: std::sync::Arc<dyn fluree_db_nameservice::CommitPublisher> =
                 std::sync::Arc::clone(&raft_ns) as _;
-            let commit_worker = fluree_db_consensus::raft::commit_worker::CommitWorker::new(
-                Arc::clone(&integration.raft),
-                publisher,
-                Arc::clone(&state_inner.fluree),
-                state_inner
-                    .index_config
-                    .clone()
-                    .expect("index_config set by AppState::new"),
-                integration.shared_state.clone(),
-                Arc::clone(&integration.staged_receipts),
-            );
+            let stager_supervisor =
+                fluree_db_consensus::raft::commit_worker::StagerSupervisor::new(
+                    Arc::clone(&integration.raft),
+                    publisher,
+                    Arc::clone(&state_inner.fluree),
+                    state_inner
+                        .index_config
+                        .clone()
+                        .expect("index_config set by AppState::new"),
+                    integration.shared_state.clone(),
+                    Arc::clone(&integration.staged_receipts),
+                );
             let eviction_scheduler =
                 fluree_db_consensus::raft::eviction_scheduler::EvictionScheduler::new(Arc::clone(
                     &integration.raft,
@@ -622,7 +623,7 @@ impl FlureeServerBuilder {
                 let worker = worker.with_event_bus(Arc::clone(&event_bus));
                 vec![
                     tokio::spawn(worker.run()),
-                    tokio::spawn(commit_worker.clone().run()),
+                    tokio::spawn(stager_supervisor.clone().run()),
                     tokio::spawn(eviction_scheduler.clone().run()),
                 ]
             };

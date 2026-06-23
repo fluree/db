@@ -10,11 +10,12 @@
 //! 2. The state machine appends a `QueueEntry` on the target branch's
 //!    FIFO queue and assigns a `queue_id`. The transactor registers a
 //!    waiter on the per-process [`waiter::WaiterMap`].
-//! 3. The leader-only [`commit_worker::CommitWorker`] (driven by the
-//!    `RaftIntegration` leader watcher) drains the queue, stages the
-//!    work locally, writes the commit blob, stashes the typed receipt
-//!    in [`staged_receipt::StagedReceiptMap`], and proposes
-//!    [`state_machine::Command::ApplyHead`] via the
+//! 3. The leader-only [`commit_worker::StagerSupervisor`] (driven by
+//!    the `RaftIntegration` leader watcher) spawns one
+//!    [`commit_worker::Stager`] per active branch. Each stager drains
+//!    its queue, stages the work locally, writes the commit blob,
+//!    stashes the typed receipt in [`staged_receipt::StagedReceiptMap`],
+//!    and proposes [`state_machine::Command::ApplyHead`] via the
 //!    [`fluree_db_nameservice::CommitPublisher`] impl on
 //!    [`nameservice::RaftNameService`].
 //! 4. The [`state_machine_adapter::StateMachineAdapter`] applies

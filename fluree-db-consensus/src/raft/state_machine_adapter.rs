@@ -200,9 +200,9 @@ where
 
     /// Set the [`StagedReceiptMap`] the adapter reads from when
     /// constructing an [`AppliedReceipt`] for a resolved waiter.
-    /// Pair it with the same handle the
-    /// [`CommitWorker`](super::commit_worker::CommitWorker) stashes
-    /// per-op staging detail into.
+    /// Pair it with the same handle the per-branch
+    /// [`Stager`](super::commit_worker::Stager) stashes per-op staging
+    /// detail into.
     pub fn with_staged_receipts(mut self, staged_receipts: Arc<StagedReceiptMap>) -> Self {
         self.staged_receipts = Some(staged_receipts);
         self

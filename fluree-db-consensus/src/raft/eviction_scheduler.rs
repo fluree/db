@@ -4,7 +4,7 @@
 //! queue-mediated submission and only shrinks via
 //! [`Command::EvictIdempotency`]. This scheduler runs on the current
 //! leader (spawned by the same leader watcher as the
-//! [`CommitWorker`](super::commit_worker::CommitWorker)), sleeps
+//! [`StagerSupervisor`](super::commit_worker::StagerSupervisor)), sleeps
 //! `eviction_interval`, and proposes the eviction command. The actual
 //! CAS releases happen on every node: the state-machine adapter
 //! drains `Response::EvictionApplied.released_envelopes` into a

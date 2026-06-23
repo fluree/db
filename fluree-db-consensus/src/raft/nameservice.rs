@@ -100,8 +100,7 @@ impl RaftNameService {
 
     /// Wire the [`StagedReceiptMap`] this nameservice peeks for
     /// per-queue tally values. Pair it with the same handle the
-    /// [`CommitWorker`](super::commit_worker::CommitWorker) stashes
-    /// into and the
+    /// [`Stager`](super::commit_worker::Stager) stashes into and the
     /// [`StateMachineAdapter`](super::state_machine_adapter::StateMachineAdapter)
     /// consumes from.
     pub fn with_staged_receipts(mut self, staged_receipts: Arc<StagedReceiptMap>) -> Self {
