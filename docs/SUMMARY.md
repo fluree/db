@@ -56,17 +56,20 @@
   - [IRIs, namespaces, and JSON-LD @context](concepts/iri-and-context.md)
   - [Datatypes and typed values](concepts/datatypes.md)
   - [Datasets and named graphs](concepts/datasets-and-named-graphs.md)
+  - [Edge annotations](concepts/edge-annotations.md)
   - [Time travel](concepts/time-travel.md)
   - [Policy enforcement](concepts/policy-enforcement.md)
   - [Verifiable data](concepts/verifiable-data.md)
   - [Reasoning and inference](concepts/reasoning.md)
 
 - [Guides (cookbooks)](guides/README.md)
+  - [Query patterns](guides/cookbook-query-patterns.md)
   - [Full-text and vector search](guides/cookbook-search.md)
   - [Time travel patterns](guides/cookbook-time-travel.md)
   - [Branching and merging](guides/cookbook-branching.md)
   - [Access control policies](guides/cookbook-policies.md)
   - [SHACL validation](guides/cookbook-shacl.md)
+  - [Edge annotations](guides/cookbook-edge-annotations.md)
   - [`owl:imports` across named graphs](guides/cookbook-owl-imports.md)
 
 - [Design](design/README.md)
@@ -76,11 +79,12 @@
   - [Storage-agnostic commits and sync](design/storage-agnostic-commits-and-sync.md)
   - [ContentId and ContentStore](design/content-id-and-contentstore.md)
   - [Index format](design/index-format.md)
+  - [Edge annotations (storage internals)](design/edge-annotations.md)
+  - [Spatial index (GeoPoint + S2)](design/spatial-index.md)
   - [Namespace allocation and fallback modes](design/namespace-allocation.md)
   - [Ontology imports (`f:schemaSource` + `owl:imports`)](design/ontology-imports.md)
   - [Cross-ledger model enforcement](design/cross-ledger-model-enforcement.md)
   - [Storage traits](design/storage-traits.md)
-  - [Reasoning roadmap (OWL2RL maintenance, reasoned index head)](design/reasoning-roadmap.md)
 
 - [HTTP API (fluree-db-server)](api/README.md)
   - [Overview](api/overview.md)
@@ -144,6 +148,8 @@
   - [Iceberg / Parquet](graph-sources/iceberg.md)
   - [R2RML](graph-sources/r2rml.md)
   - [BM25 graph source](graph-sources/bm25.md)
+
+- [Fluree for AI and agents](ai/README.md)
 
 - [Memory](memory/README.md)
   - [Getting started](memory/getting-started/README.md)

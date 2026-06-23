@@ -3,6 +3,7 @@
 //! This module provides parsers for converting JSON-LD transaction
 //! representations into the internal Transaction IR.
 
+pub mod edge_annotations;
 pub mod jsonld;
 pub mod nquads;
 pub mod trig_meta;

@@ -59,6 +59,17 @@ impl TemporalMode {
 pub struct PlanningContext {
     /// Temporal mode for this query.
     pub mode: TemporalMode,
+    /// Whether the prepare caller has vouched that *semantic* stats-based
+    /// rewrites (e.g. eliding a provably-redundant `rdf:type` filter) are sound
+    /// for this execution. It is **only** set when the caller knows the query is
+    /// current-state, against a single stats domain (one ledger — not a
+    /// multi-ledger dataset), and under root policy (no visibility layer that
+    /// could hide `rdf:type` differently than the predicate it is proven
+    /// redundant against). Defaults to `false`, so any path that does not
+    /// explicitly opt in is safe. Folded into `StatsView::class_coverage_trustworthy`
+    /// and the stats-cache key so a trusted view is never reused for a
+    /// non-vouched (policy / dataset) execution at the same overlay epoch.
+    pub allow_semantic_elision: bool,
 }
 
 impl PlanningContext {
@@ -67,6 +78,7 @@ impl PlanningContext {
     pub const fn current() -> Self {
         Self {
             mode: TemporalMode::Current,
+            allow_semantic_elision: false,
         }
     }
 
@@ -75,7 +87,17 @@ impl PlanningContext {
     pub const fn history() -> Self {
         Self {
             mode: TemporalMode::History,
+            allow_semantic_elision: false,
         }
+    }
+
+    /// Vouch (or not) that semantic stats-based rewrites are sound for this
+    /// execution. See [`Self::allow_semantic_elision`]. History plans never
+    /// allow it regardless, so this is a no-op in history mode.
+    #[inline]
+    pub const fn with_semantic_elision(mut self, allow: bool) -> Self {
+        self.allow_semantic_elision = allow && self.mode.is_current();
+        self
     }
 
     /// Returns the temporal mode.

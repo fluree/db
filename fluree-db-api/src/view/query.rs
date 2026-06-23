@@ -821,7 +821,14 @@ impl Fluree {
     ) -> Result<Vec<crate::Batch>> {
         let db_ref = db.as_graph_db_ref();
         // Single-graph view: no dataset-level history detection — current state.
-        let prepare_config = PrepareConfig::current(db.binary_store.as_ref());
+        // Single ledger + root policy ⇒ semantic stats rewrites (redundant
+        // `rdf:type` elision) are sound; a non-root enforcer hides rows and must
+        // not allow it.
+        let allow_semantic_elision = db.policy_enforcer().is_none_or(|p| p.is_root());
+        let prepare_config = PrepareConfig::current_with_semantic_elision(
+            db.binary_store.as_ref(),
+            allow_semantic_elision,
+        );
         let prepared = prepare_execution_with_config(db_ref, executable, &prepare_config)
             .await
             .map_err(query_error_to_api_error)?;
@@ -878,7 +885,12 @@ impl Fluree {
     ) -> std::result::Result<Vec<crate::Batch>, fluree_db_query::QueryError> {
         let db_ref = db.as_graph_db_ref();
         // Single-graph view: no dataset-level history detection — current state.
-        let prepare_config = PrepareConfig::current(db.binary_store.as_ref());
+        // Single ledger + root policy ⇒ semantic stats rewrites are sound.
+        let allow_semantic_elision = db.policy_enforcer().is_none_or(|p| p.is_root());
+        let prepare_config = PrepareConfig::current_with_semantic_elision(
+            db.binary_store.as_ref(),
+            allow_semantic_elision,
+        );
         let prepared = prepare_execution_with_config(db_ref, executable, &prepare_config).await?;
 
         view_context_config!(

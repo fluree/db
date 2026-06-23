@@ -324,6 +324,9 @@ impl LedgerHandle {
             subject_watermarks: root.subject_watermarks,
             string_watermark: root.string_watermark,
             graph_iris: root.graph_iris,
+            has_annotations: root.has_annotations,
+            annotation_index: root.annotation_index.clone(),
+            had_annotation_arena: root.had_annotation_arena,
         };
         let db = LedgerSnapshot::new_meta(meta)
             .map_err(|e| ApiError::internal(format!("graph registry from root: {e}")))?;
@@ -356,7 +359,14 @@ impl LedgerHandle {
                 Arc::clone(&state.runtime_small_dicts),
                 ns_fallback,
             );
-            Arc::make_mut(&mut state.snapshot).range_provider = Some(Arc::new(provider));
+            let snap = Arc::make_mut(&mut state.snapshot);
+            snap.range_provider = Some(Arc::new(provider));
+            // Plumb the CAS handle so arena-backed annotation reads can
+            // resolve `AnnotationIndexRoot.{forward,reverse}_branch_cid`.
+            // Without this, `LedgerSnapshot::has_arena_reader()` always
+            // returns false and the formatter / cascade falls back to
+            // the M2a scan path even on snapshots with on-disk arenas.
+            snap.content_store = Some(Arc::clone(&cs));
 
             let te_store: Arc<dyn std::any::Any + Send + Sync> = arc_store.clone();
             state.binary_store = Some(TypeErasedStore(te_store));
@@ -705,7 +715,15 @@ pub(crate) async fn load_and_attach_binary_store(
     );
     // Always rebuild the provider here so it is coherent with the freshly
     // loaded BinaryIndexStore, DictNovelty, and runtime dictionary state.
-    Arc::make_mut(&mut state.snapshot).range_provider = Some(Arc::new(provider));
+    let snap = Arc::make_mut(&mut state.snapshot);
+    snap.range_provider = Some(Arc::new(provider));
+    // Plumb the CAS handle so arena-backed annotation reads can resolve
+    // `AnnotationIndexRoot.{forward,reverse}_branch_cid`. Mirror of the
+    // identical line in `apply_index_v2` — fresh-load path needs the
+    // same wiring as the cache-update path or `has_arena_reader()`
+    // would always be false on snapshots loaded outside the
+    // LedgerManager handle path.
+    snap.content_store = Some(Arc::clone(&cs));
     // Also attach the type-erased store to the state so transaction staging
     // (which clones LedgerState under the write lock) can construct
     // graph-scoped BinaryRangeProviders (needed for named-graph upsert deletions).
@@ -723,6 +741,33 @@ pub(crate) async fn load_and_attach_binary_store(
 ///
 /// Provides single-flight loading (concurrent requests share one I/O operation)
 /// and idle eviction.
+/// Coverage envelope returned alongside the running ledger's
+/// attachment events.
+///
+/// Distinguishes "we walked every commit since genesis" (safe to
+/// publish as `Authoritative`) from "we only have the post-index
+/// tail" (must be merged with a base arena via `Augment`).
+#[derive(Debug, Clone, Copy)]
+pub enum RunningCoverage {
+    /// Snapshot.t == 0: no index has ever run, so the running
+    /// `AttachmentNovelty` was built by walking every commit since
+    /// genesis. Provider can return `Authoritative`.
+    Authoritative,
+    /// Snapshot.t > 0: an index has run. The running
+    /// `AttachmentNovelty` may be the full history (continuously-
+    /// running ledger) or only the post-index tail (after a
+    /// reload). We can't distinguish, so the provider must return
+    /// `Augment`.
+    Augment,
+}
+
+/// Result of `LedgerManager::try_running_attachment_events`.
+#[derive(Debug, Clone)]
+pub struct RunningAttachmentEvents {
+    pub coverage: RunningCoverage,
+    pub events: Vec<(fluree_db_core::EdgeKey, fluree_db_core::Sid, i64, bool)>,
+}
+
 pub struct LedgerManager {
     /// Cached ledger handles + loading state
     ///
@@ -769,6 +814,71 @@ impl LedgerManager {
     /// Get the manager configuration
     pub fn config(&self) -> &LedgerManagerConfig {
         &self.config
+    }
+
+    /// Snapshot the running ledger's attachment-event delta in the
+    /// shape the indexer's arena builder expects, plus the coverage
+    /// envelope describing what the events span.
+    ///
+    /// Returns `None` when:
+    /// - the ledger isn't currently loaded into this manager (no
+    ///   running overlay to snapshot — the indexer treats this as
+    ///   "delta unknown" and defensively drops any base arena),
+    /// - the ledger is loading (we don't block the indexer's job
+    ///   dispatch on a load).
+    ///
+    /// Returns `Some(vec)` (possibly empty) when the snapshot was
+    /// observed cleanly — the empty case explicitly asserts "no
+    /// events since the base arena," which the indexer treats as
+    /// "delta is empty" and seals an authoritative (unchanged)
+    /// arena.
+    pub async fn try_running_attachment_events(
+        &self,
+        ledger_id: &str,
+    ) -> Option<RunningAttachmentEvents> {
+        let canonical_alias =
+            normalize_ledger_id(ledger_id).unwrap_or_else(|_| ledger_id.to_string());
+        let entries = self.entries.read().await;
+        let entry = entries.get(&canonical_alias)?;
+        let LoadState::Ready(handle) = entry else {
+            return None;
+        };
+        let view = handle.snapshot().await;
+        // Coverage heuristic: when the snapshot's `t` is zero, no
+        // index has ever run on this ledger, so the running
+        // `AttachmentNovelty` was built by walking every commit
+        // since genesis — it carries the complete event history.
+        // Once `snapshot.t > 0`, we can't distinguish a continuously-
+        // running ledger (full history preserved across reindexes)
+        // from a reloaded one (only post-index tail in the overlay),
+        // so the safe call is `Augment`.
+        let coverage = if view.snapshot.t == 0 {
+            RunningCoverage::Authoritative
+        } else {
+            RunningCoverage::Augment
+        };
+        let events: Vec<_> = view.novelty.attachments.iter_event_pairs().collect();
+        Some(RunningAttachmentEvents { coverage, events })
+    }
+
+    /// Return a read-only `LedgerView` for a currently-loaded ledger
+    /// without forcing a load. Returns `None` when the ledger isn't
+    /// in the cache.
+    ///
+    /// Used by `ApiAttachmentEventsProvider`'s bulk-import seal path:
+    /// when the running overlay reports no events but the snapshot's
+    /// sticky bit says annotations exist (the post-import state),
+    /// the provider needs the snapshot + range_provider to scan the
+    /// base index for `f:reifies*` flakes itself.
+    pub async fn get_loaded_view(&self, ledger_id: &str) -> Option<LedgerView> {
+        let canonical_alias =
+            normalize_ledger_id(ledger_id).unwrap_or_else(|_| ledger_id.to_string());
+        let entries = self.entries.read().await;
+        let entry = entries.get(&canonical_alias)?;
+        let LoadState::Ready(handle) = entry else {
+            return None;
+        };
+        Some(handle.snapshot().await)
     }
 
     /// Get cached handle or load from nameservice

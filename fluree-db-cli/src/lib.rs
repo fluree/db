@@ -43,6 +43,8 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
         Commands::Create {
             ledger,
             from,
+            edge_properties,
+            base_iri,
             memory,
             no_user,
             chunk_size_mb,
@@ -127,6 +129,8 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
                 chunk_size_mb,
                 leaflet_rows,
                 leaflets_per_leaf,
+                edge_policy: edge_properties.into(),
+                base_iri,
             };
             commands::create::run(
                 &ledger,

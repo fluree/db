@@ -249,7 +249,7 @@ pub async fn run(
 
     // Parse output format
     let output_format = match format_str.to_lowercase().as_str() {
-        "json" => OutputFormatKind::Json,
+        "json" | "jsonld" | "json-ld" => OutputFormatKind::Json,
         "typed-json" | "typed_json" | "typedjson" => OutputFormatKind::TypedJson,
         "table" => OutputFormatKind::Table,
         "csv" => OutputFormatKind::Csv,
@@ -257,7 +257,8 @@ pub async fn run(
         "ndjson" | "nd-json" | "jsonl" => OutputFormatKind::Ndjson,
         other => {
             return Err(CliError::Usage(format!(
-                "unknown output format '{other}'; valid formats: json, typed-json, table, csv, tsv, ndjson"
+                "unknown output format '{other}'; valid formats: json, jsonld, typed-json, \
+                 table, csv, tsv, ndjson"
             )));
         }
     };

@@ -96,15 +96,20 @@ pub fn rewrite_patterns_for_r2rml(
             // Preserve other patterns as-is
             Pattern::Filter(_)
             | Pattern::Bind { .. }
+            | Pattern::Unwind { .. }
             | Pattern::Values { .. }
             | Pattern::Subquery(_)
             | Pattern::PropertyPath(_)
+            | Pattern::ShortestPath(_)
             | Pattern::IndexSearch(_)
             | Pattern::VectorSearch(_)
             | Pattern::R2rml(_)
             | Pattern::GeoSearch(_)
             | Pattern::S2Search(_)
-            | Pattern::Graph { .. } => {
+            | Pattern::Graph { .. }
+            | Pattern::EdgeAnnotation { .. }
+            | Pattern::AnnotationTarget { .. }
+            | Pattern::DefaultGraphSource { .. } => {
                 result_patterns.push(pattern.clone());
             }
         }

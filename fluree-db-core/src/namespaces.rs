@@ -11,12 +11,14 @@
 //! Rust should mirror that behavior: seed genesis `Db.namespace_codes` with this
 //! baseline so query/transaction code can reliably encode standard IRIs even
 //! before any index exists.
+use fluree_vocab::db as fluree_db_predicates;
 use fluree_vocab::namespaces::{
     BLANK_NODE, DID_KEY, EMPTY, FLUREE_COMMIT, FLUREE_DB, FLUREE_URN, JSON_LD, OGC_GEO, OWL, RDF,
     RDFS, SHACL, XSD,
 };
 use fluree_vocab::predicates::*;
 use std::collections::HashMap;
+use std::sync::OnceLock;
 
 use crate::sid::Sid;
 
@@ -187,6 +189,159 @@ pub fn is_schema_class(cls: &Sid) -> bool {
         || is_rdf_property_class(cls)
 }
 
+// ============================================================================
+// Edge-annotation system predicates (durable attachment encoding)
+// ============================================================================
+//
+// Helpers for the seven `https://ns.flur.ee/db#reifies*` predicates that
+// encode an annotation's reified edge. These are **system-controlled** —
+// user transactions must never assert or retract them directly. The
+// predicates are emitted only by the internal `@annotation` / `@reifies`
+// lowering path. See `docs/design/edge-annotations.md`.
+
+/// True for `f:reifiesGraph` — the named graph of the reified edge.
+#[inline]
+pub fn is_reifies_graph(sid: &Sid) -> bool {
+    sid.namespace_code == FLUREE_DB && sid.name.as_ref() == fluree_db_predicates::REIFIES_GRAPH
+}
+
+/// True for `f:reifiesSubject`.
+#[inline]
+pub fn is_reifies_subject(sid: &Sid) -> bool {
+    sid.namespace_code == FLUREE_DB && sid.name.as_ref() == fluree_db_predicates::REIFIES_SUBJECT
+}
+
+/// True for `f:reifiesPredicate`.
+#[inline]
+pub fn is_reifies_predicate(sid: &Sid) -> bool {
+    sid.namespace_code == FLUREE_DB && sid.name.as_ref() == fluree_db_predicates::REIFIES_PREDICATE
+}
+
+/// True for `f:reifiesObject`.
+#[inline]
+pub fn is_reifies_object(sid: &Sid) -> bool {
+    sid.namespace_code == FLUREE_DB && sid.name.as_ref() == fluree_db_predicates::REIFIES_OBJECT
+}
+
+/// True for `f:reifiesDatatype`.
+#[inline]
+pub fn is_reifies_datatype(sid: &Sid) -> bool {
+    sid.namespace_code == FLUREE_DB && sid.name.as_ref() == fluree_db_predicates::REIFIES_DATATYPE
+}
+
+/// True for `f:reifiesLang`.
+#[inline]
+pub fn is_reifies_lang(sid: &Sid) -> bool {
+    sid.namespace_code == FLUREE_DB && sid.name.as_ref() == fluree_db_predicates::REIFIES_LANG
+}
+
+/// True for `f:reifiesListIndex`.
+#[inline]
+pub fn is_reifies_list_index(sid: &Sid) -> bool {
+    sid.namespace_code == FLUREE_DB && sid.name.as_ref() == fluree_db_predicates::REIFIES_LIST_INDEX
+}
+
+/// True if `sid` is **any** of the seven `f:reifies*` predicates.
+///
+/// This is the canonical reserved-predicate firewall check used by every
+/// write surface (parse, lower_sparql_update, turtle ingest, import,
+/// raw_txn_upload, flake_sink) and by the read-side system-fact filter.
+/// Implemented as an integer compare on `namespace_code` followed by a
+/// `matches!` over seven short string literals (the predicate names are
+/// all under 24 bytes). LLVM compiles the `matches!` to a small jump
+/// table over byte-prefix-disambiguated arms; cost is dominated by the
+/// string-equality dispatch but stays bounded — the hot path on a
+/// non-`FLUREE_DB` SID returns after the integer compare alone.
+#[inline]
+pub fn is_reserved_reifies_predicate(sid: &Sid) -> bool {
+    if sid.namespace_code != FLUREE_DB {
+        return false;
+    }
+    matches!(
+        sid.name.as_ref(),
+        fluree_db_predicates::REIFIES_GRAPH
+            | fluree_db_predicates::REIFIES_SUBJECT
+            | fluree_db_predicates::REIFIES_PREDICATE
+            | fluree_db_predicates::REIFIES_OBJECT
+            | fluree_db_predicates::REIFIES_DATATYPE
+            | fluree_db_predicates::REIFIES_LANG
+            | fluree_db_predicates::REIFIES_LIST_INDEX
+    )
+}
+
+/// Process-wide cache of the seven canonical `f:reifies*` predicate
+/// SIDs. Each entry holds an `Arc<str>` for the predicate name; the
+/// cache is populated once on first access and never reallocates.
+///
+/// Indices match the `[Graph, Subject, Predicate, Object, Datatype,
+/// Lang, ListIndex]` order documented on
+/// [`reifies_predicate_sids`].
+fn cached_reifies_predicate_sids() -> &'static [Sid; 7] {
+    static SIDS: OnceLock<[Sid; 7]> = OnceLock::new();
+    SIDS.get_or_init(|| {
+        [
+            Sid::new(FLUREE_DB, fluree_db_predicates::REIFIES_GRAPH),
+            Sid::new(FLUREE_DB, fluree_db_predicates::REIFIES_SUBJECT),
+            Sid::new(FLUREE_DB, fluree_db_predicates::REIFIES_PREDICATE),
+            Sid::new(FLUREE_DB, fluree_db_predicates::REIFIES_OBJECT),
+            Sid::new(FLUREE_DB, fluree_db_predicates::REIFIES_DATATYPE),
+            Sid::new(FLUREE_DB, fluree_db_predicates::REIFIES_LANG),
+            Sid::new(FLUREE_DB, fluree_db_predicates::REIFIES_LIST_INDEX),
+        ]
+    })
+}
+
+/// Borrow a single cached `f:reifies*` predicate SID. Cheaper than
+/// `Sid::new(FLUREE_DB, …)` on the bundle-build hot path — callers
+/// clone the static reference via the `Arc<str>` refcount bump
+/// instead of allocating a fresh `Arc::from(&str)` per flake.
+#[inline]
+pub fn reifies_graph_sid() -> &'static Sid {
+    &cached_reifies_predicate_sids()[0]
+}
+/// See [`reifies_graph_sid`].
+#[inline]
+pub fn reifies_subject_sid() -> &'static Sid {
+    &cached_reifies_predicate_sids()[1]
+}
+/// See [`reifies_graph_sid`].
+#[inline]
+pub fn reifies_predicate_sid() -> &'static Sid {
+    &cached_reifies_predicate_sids()[2]
+}
+/// See [`reifies_graph_sid`].
+#[inline]
+pub fn reifies_object_sid() -> &'static Sid {
+    &cached_reifies_predicate_sids()[3]
+}
+/// See [`reifies_graph_sid`].
+#[inline]
+pub fn reifies_datatype_sid() -> &'static Sid {
+    &cached_reifies_predicate_sids()[4]
+}
+/// See [`reifies_graph_sid`].
+#[inline]
+pub fn reifies_lang_sid() -> &'static Sid {
+    &cached_reifies_predicate_sids()[5]
+}
+/// See [`reifies_graph_sid`].
+#[inline]
+pub fn reifies_list_index_sid() -> &'static Sid {
+    &cached_reifies_predicate_sids()[6]
+}
+
+/// Construct the seven canonical `f:reifies*` predicate SIDs.
+///
+/// Returned in the order `[Graph, Subject, Predicate, Object, Datatype,
+/// Lang, ListIndex]`. Each `Sid` is cloned from the process-wide
+/// cache, so the call is allocation-free (Arc refcount bumps only).
+/// Callers that only need a subset should use the typed
+/// `reifies_*_sid()` accessors above to avoid the seven-element
+/// clone.
+pub fn reifies_predicate_sids() -> [Sid; 7] {
+    cached_reifies_predicate_sids().clone()
+}
+
 /// Baseline namespace codes (code -> prefix) matching Fluree's reserved codepoints.
 pub fn default_namespace_codes() -> HashMap<u16, String> {
     let mut map = HashMap::new();
@@ -204,4 +359,61 @@ pub fn default_namespace_codes() -> HashMap<u16, String> {
     map.insert(OGC_GEO, fluree_vocab::geo::NS.to_string());
     map.insert(FLUREE_URN, fluree_vocab::fluree::URN.to_string());
     map
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reifies_predicate_set_is_complete_and_disjoint() {
+        let sids = reifies_predicate_sids();
+        // Every canonical SID must pass the firewall check.
+        for sid in &sids {
+            assert!(
+                is_reserved_reifies_predicate(sid),
+                "{sid:?} should be in the reserved set"
+            );
+        }
+        // The seven SIDs are pairwise distinct.
+        for i in 0..sids.len() {
+            for j in (i + 1)..sids.len() {
+                assert_ne!(sids[i], sids[j], "duplicate SID at indices {i}/{j}");
+            }
+        }
+        // Non-Fluree-DB SIDs and unrelated FLUREE_DB names are not reserved.
+        assert!(!is_reserved_reifies_predicate(&Sid::new(RDF, "type")));
+        assert!(!is_reserved_reifies_predicate(&Sid::new(
+            FLUREE_DB, "alias"
+        )));
+        assert!(!is_reserved_reifies_predicate(&Sid::new(FLUREE_DB, "t")));
+        // Defensive: a name that *prefix-matches* "reifies" but is not one
+        // of the seven must not slip through.
+        assert!(!is_reserved_reifies_predicate(&Sid::new(
+            FLUREE_DB, "reifies"
+        )));
+        assert!(!is_reserved_reifies_predicate(&Sid::new(
+            FLUREE_DB,
+            "reifiesSomethingElse"
+        )));
+    }
+
+    #[test]
+    fn per_predicate_helpers_dispatch_correctly() {
+        let g = Sid::new(FLUREE_DB, fluree_db_predicates::REIFIES_GRAPH);
+        let s = Sid::new(FLUREE_DB, fluree_db_predicates::REIFIES_SUBJECT);
+        let p = Sid::new(FLUREE_DB, fluree_db_predicates::REIFIES_PREDICATE);
+        let o = Sid::new(FLUREE_DB, fluree_db_predicates::REIFIES_OBJECT);
+        let dt = Sid::new(FLUREE_DB, fluree_db_predicates::REIFIES_DATATYPE);
+        let lang = Sid::new(FLUREE_DB, fluree_db_predicates::REIFIES_LANG);
+        let li = Sid::new(FLUREE_DB, fluree_db_predicates::REIFIES_LIST_INDEX);
+
+        assert!(is_reifies_graph(&g) && !is_reifies_graph(&s));
+        assert!(is_reifies_subject(&s) && !is_reifies_subject(&p));
+        assert!(is_reifies_predicate(&p) && !is_reifies_predicate(&o));
+        assert!(is_reifies_object(&o) && !is_reifies_object(&dt));
+        assert!(is_reifies_datatype(&dt) && !is_reifies_datatype(&lang));
+        assert!(is_reifies_lang(&lang) && !is_reifies_lang(&li));
+        assert!(is_reifies_list_index(&li) && !is_reifies_list_index(&g));
+    }
 }

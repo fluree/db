@@ -399,6 +399,9 @@ impl PatternOptionalBuilder {
                             );
                             // Leave as variable
                         }
+                        Binding::Path(_) | Binding::List(_) => {
+                            // A path/list value is never substituted into a triple slot.
+                        }
                     }
                 }
             }
@@ -593,7 +596,7 @@ impl OptionalBuilder for PatternOptionalBuilder {
                 Binding::EncodedPid { .. } | Binding::EncodedLit { .. } | Binding::Lit { .. } => {
                     Ok(None)
                 }
-                Binding::Grouped(_) => Ok(None),
+                Binding::Grouped(_) | Binding::Path(_) | Binding::List(_) => Ok(None),
             };
         }
 

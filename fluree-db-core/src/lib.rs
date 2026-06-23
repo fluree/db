@@ -26,6 +26,7 @@
 
 pub mod address;
 pub mod address_path;
+pub mod annotation_index;
 pub mod cancellation;
 pub mod coerce;
 pub mod commit;
@@ -37,6 +38,7 @@ pub mod datatype_constraint;
 pub mod datatypes;
 pub mod db;
 pub mod dict_novelty;
+pub mod edge;
 pub mod error;
 pub mod flake;
 pub mod geo;
@@ -79,6 +81,7 @@ pub use address::{
     extract_identifier, extract_ledger_prefix, extract_path, parse_fluree_address,
     ParsedFlureeAddress,
 };
+pub use annotation_index::{AnnotationIndexRoot, AnnotationStats};
 pub use cancellation::{QueryCancellation, QueryCancellationReason};
 pub use coerce::{coerce_json_value, coerce_value, CoercionError, CoercionResult};
 pub use commit::{
@@ -92,15 +95,18 @@ pub use comparator::IndexType;
 pub use conflict_key::ConflictKey;
 pub use content_id::{CommitId, ContentId, IndexRootId, TxnId};
 pub use content_kind::{
-    ContentKind, DictKind, CODEC_FLUREE_COMMIT, CODEC_FLUREE_DICT_BLOB, CODEC_FLUREE_GARBAGE,
-    CODEC_FLUREE_GRAPH_SOURCE_SNAPSHOT, CODEC_FLUREE_HISTORY_SIDECAR, CODEC_FLUREE_INDEX_BRANCH,
-    CODEC_FLUREE_INDEX_LEAF, CODEC_FLUREE_INDEX_ROOT, CODEC_FLUREE_LEDGER_CONFIG,
-    CODEC_FLUREE_STATS_SKETCH, CODEC_FLUREE_TXN,
+    ContentKind, DictKind, CODEC_FLUREE_ANNOTATION_FORWARD_BRANCH,
+    CODEC_FLUREE_ANNOTATION_FORWARD_LEAF, CODEC_FLUREE_ANNOTATION_REVERSE_BRANCH,
+    CODEC_FLUREE_ANNOTATION_REVERSE_LEAF, CODEC_FLUREE_COMMIT, CODEC_FLUREE_DICT_BLOB,
+    CODEC_FLUREE_GARBAGE, CODEC_FLUREE_GRAPH_SOURCE_SNAPSHOT, CODEC_FLUREE_HISTORY_SIDECAR,
+    CODEC_FLUREE_INDEX_BRANCH, CODEC_FLUREE_INDEX_LEAF, CODEC_FLUREE_INDEX_ROOT,
+    CODEC_FLUREE_LEDGER_CONFIG, CODEC_FLUREE_STATS_SKETCH, CODEC_FLUREE_TXN,
 };
 pub use datatype_constraint::DatatypeConstraint;
 pub use datatypes::dt_compatible;
 pub use db::{load_ledger_snapshot, LedgerSnapshot, LedgerSnapshotMetadata};
 pub use dict_novelty::DictNovelty;
+pub use edge::{id_datatype_sid, xsd_string_datatype_sid, EdgeKey, EdgeKeyDecodeError};
 pub use error::{Error, Result};
 pub use flake::{Flake, FlakeMeta};
 pub use graph_db_ref::GraphDbRef;
@@ -129,7 +135,9 @@ pub use namespaces::{
     is_owl_object_property_class, is_owl_ontology_class, is_owl_same_as, is_owl_symmetric_property,
     is_owl_transitive_property, is_rdf_first, is_rdf_nil, is_rdf_property_class, is_rdf_rest,
     is_rdf_type, is_rdfs_domain, is_rdfs_range, is_rdfs_subclass_of, is_rdfs_subproperty_of,
-    is_schema_class, is_schema_predicate,
+    is_reifies_datatype, is_reifies_graph, is_reifies_lang, is_reifies_list_index,
+    is_reifies_object, is_reifies_predicate, is_reifies_subject, is_reserved_reifies_predicate,
+    is_schema_class, is_schema_predicate, reifies_predicate_sids,
 };
 pub use nonempty::NonEmpty;
 pub use ns_encoding::{

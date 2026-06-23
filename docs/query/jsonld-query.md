@@ -578,6 +578,93 @@ Provide initial bindings:
 }
 ```
 
+### Unwind Patterns
+
+`unwind` expands a **list-valued expression** into one row per element, binding
+each element to a variable. It is the inverse of an aggregate like `collect`:
+where aggregation folds many rows into one list, `unwind` fans one list back out
+into many rows.
+
+```json
+["unwind", "?n", "(range 1 5)"]
+```
+
+The list source is any expression that evaluates to a list:
+
+- **`(range start end)`** / **`(range start end step)`** — an inclusive integer
+  sequence (`(range 1 5)` → `1,2,3,4,5`). `start > end` yields an empty list.
+- **`(list a b c …)`** — a list literal built from its arguments.
+- **a bound list variable** — e.g. a list produced earlier by `bind`, or the
+  result of an aggregate such as `collect`.
+
+Per Cypher/GQL semantics, an **empty list, an unbound value, or a non-list
+value produces zero rows** for that input (it does not error and does not emit a
+null row).
+
+```json
+{
+  "@context": { "ex": "http://example.org/" },
+  "select": ["?n"],
+  "where": [["unwind", "?n", "(range 1 3)"]]
+}
+// → ?n = 1, then 2, then 3
+```
+
+#### When to use `unwind` (and when not to)
+
+`unwind` earns its place in exactly one situation: **generating rows that do not
+exist in the stored data**, from a *computed* list.
+
+- **Do not** use it for a constant set of values — `values` is clearer and
+  cheaper (`["values", "?s", ["a", "b"]]`).
+- **Do not** use it to read a multi-valued predicate — in RDF that is already
+  multiple triples, so a plain pattern `{ "@id": "?s", "ex:tag": "?tag" }`
+  yields one row per value natively.
+- **Do** use it when the driving rows must come from a `range` (a numeric axis,
+  a calendar, buckets, a pagination window) or from a list you computed — none
+  of which `values` (constants only) or triple patterns (stored data only) can
+  produce.
+
+#### Canonical use case: a dense / gap-filled series
+
+A `groupBy` only ever produces keys that occur in the data. To report a value
+for **every** point on an axis — including the empty ones — generate the axis
+with `range` and `unwind`, then LEFT JOIN the data with `optional`:
+
+```json
+{
+  "@context": { "ex": "http://example.org/" },
+  "select": ["?year", "(as (count ?o) ?orders)"],
+  "where": [
+    ["unwind", "?year", "(range 2019 2023)"],
+    ["optional", { "@id": "?o", "@type": "ex:Order", "ex:orderYear": "?year" }]
+  ],
+  "groupBy": ["?year"],
+  "orderBy": ["?year"]
+}
+```
+
+Every year `2019`–`2023` appears in the result, with `0` for years that have no
+orders — because the driving rows came from the generated range and the
+`optional` contributes a count only where matching data exists. The same shape
+fills gaps for any axis the data does not itself contain. Where the bounds are
+themselves derived from the data (e.g. a sub-select computing the min/max year),
+this produces a dynamically-sized dense axis that `values` cannot express.
+
+#### Ordering and correlation
+
+`unwind` is placed after whatever produces the variables its list expression
+reads, so a list computed by an earlier `bind` is expanded correctly:
+
+```json
+{
+  "where": [
+    ["bind", "?nums", "(range 1 3)"],
+    ["unwind", "?n", "?nums"]
+  ]
+}
+```
+
 ### Property Paths
 
 Property paths enable transitive traversal of predicates, following chains of relationships across multiple hops. Define a path alias in `@context` using `@path`, then use the alias as a key in WHERE node-maps.
@@ -629,6 +716,7 @@ The array form uses the operator as the first element followed by its operands.
 | Inverse | `^ex:p` | `["^", "ex:p"]` | Traverse predicate in reverse direction |
 | Alternative | <code>ex:a&#124;ex:b</code> | <code>["&#124;", "ex:a", "ex:b"]</code> | Match any of several predicates |
 | Sequence | `ex:a/ex:b` | `["/", "ex:a", "ex:b"]` | Follow a chain of predicates (property chain) |
+| Alternation-transitive | <code>(ex:a&#124;ex:b)+</code> | <code>["+", ["&#124;", "ex:a", "ex:b"]]</code> | Transitive closure following an edge of **any** listed predicate per hop |
 
 Zero-or-more (`*`) includes the starting node itself in the results (zero hops).
 
@@ -716,6 +804,31 @@ Match entities connected by either `ex:knows` or `ex:likes`:
   ]
 }
 ```
+
+**Alternation-Transitive Example:**
+
+Apply a transitive modifier (`+` or `*`) to an alternative of predicates to follow an edge of *any* listed predicate at each hop. For example, `(ex:knows|ex:likes)+` reaches every node connected through a chain of `ex:knows` and/or `ex:likes` edges, in any combination:
+
+```json
+{
+  "@context": {
+    "ex": "http://example.org/",
+    "reaches": { "@path": "(ex:knows|ex:likes)+" }
+  },
+  "select": ["?who"],
+  "where": [
+    { "@id": "ex:alice", "reaches": "?who" }
+  ]
+}
+```
+
+Array form:
+
+```json
+{ "@path": ["+", ["|", "ex:knows", "ex:likes"]] }
+```
+
+This differs from running `ex:knows+` and `ex:likes+` separately: a single closure mixes both predicates within one path (e.g. `alice -knows-> bob -likes-> carol`). The branches under the transitive modifier must be **simple forward predicate IRIs** — inverse (`^ex:p`), sequence, or nested-transitive branches are not supported in this position. Like other arbitrary-length paths, the closure is duplicate-free and cycle-safe.
 
 Inverse can also be applied to complex paths (sequences and alternatives):
 
@@ -805,6 +918,126 @@ Each step must be a simple predicate (`ex:p`), inverse simple predicate (`^ex:p`
 - Cycle detection is built in: transitive traversal terminates when it encounters a node already visited.
 - Variable names starting with `?__` are reserved for internal use (e.g., intermediate join variables generated by sequence paths). These variables will not appear in wildcard (`select: "*"`) output.
 
+### Shortest Path
+
+`shortestPath` / `allShortestPaths` find the shortest path(s) between two nodes over a single predicate and **bind the path to a variable** (unlike a property path, which matches transitively but binds only the endpoint). It is a `where`-clause object form:
+
+```json
+["shortestPath", {
+  "from": "?a", "to": "?b",
+  "via": "ex:knows",
+  "direction": "out",
+  "minHops": 1, "maxHops": 6,
+  "bind": "?p"
+}]
+```
+
+| Key | Meaning |
+|-----|---------|
+| `from` / `to` | Endpoints — a variable (`?x`) or a constant IRI. Usually bound by prior patterns. |
+| `via` | The predicate IRI to traverse. A single predicate; unknown IRI → no rows. |
+| `bind` | Variable bound to the resulting **path value**. |
+| `direction` | `out` (default), `in`, or `both` (undirected). |
+| `minHops` / `maxHops` | Optional hop bounds. Omit `maxHops` for unbounded (subject to safety caps). |
+
+- `["shortestPath", …]` binds **one** shortest path (or no row if none exists); `["allShortestPaths", …]` binds **every** path of the minimal length (one row each).
+- The path value is consumed by the path functions below; it is not itself a list of bindings.
+
+```json
+{
+  "@context": { "ex": "http://example.org/" },
+  "select": ["?hops"],
+  "where": [
+    ["shortestPath", { "from": "ex:alice", "to": "ex:dan", "via": "ex:knows", "bind": "?p" }],
+    ["bind", "?hops", "(size (path-pairs ?p))"]
+  ]
+}
+```
+
+#### Path value functions
+
+Consume a path value bound by `shortestPath` / `allShortestPaths`:
+
+- `(nodes ?p)` — the list of nodes along the path (in order). A list value, so it can feed [`unwind`](#unwind-patterns) or the [list functions](#list-value-functions).
+- `(path-pairs ?p)` — the consecutive node pairs `[[a,b],[b,c],…]`; its `size` is the hop count.
+
+### Edge Annotations
+
+Edge annotations attach metadata to a specific `(subject, predicate, object)` edge. Two query forms are supported:
+
+- **Inline form** with `@annotation` — match an edge and pull metadata about it.
+- **Annotation-rooted form** with `@reifies` — match metadata first, find the edges it reifies.
+
+`@edge` is an alias for `@annotation`; the two are interchangeable. For how to *write* annotations (`@annotation` on insert), the storage model, the cardinality contract, and worked output, see the [Edge annotations](../concepts/edge-annotations.md) concept doc. Note `@reifies` is a **query-side** construct only — user-authored `@reifies` on an insert/update is rejected; write with `@annotation` instead.
+
+**Inline form (`@annotation`):**
+
+The `@annotation` block sits inside the object node-map and binds the annotation subject. Each annotation occurrence on the matched edge produces one row.
+
+```json
+{
+  "@context": { "ex": "http://example.org/" },
+  "select": ["?person", "?org", "?role"],
+  "where": {
+    "@id": "?person",
+    "ex:worksFor": {
+      "@id": "?org",
+      "@annotation": { "ex:role": "?role" }
+    }
+  }
+}
+```
+
+When two parallel annotations reify the same edge, the inline form returns two rows (property-graph fidelity). A bare triple pattern (`?person ex:worksFor ?org` with no `@annotation` block) returns one row regardless of how many annotations exist — annotations only multiply cardinality through the `@annotation` / `@reifies` keywords.
+
+The annotation subject can be bound to a variable or filtered by an explicit IRI:
+
+```json
+"@annotation": { "@id": "?ann", "ex:role": "?role" }
+```
+
+```json
+"@annotation": { "@id": "ex:emp/alice-acme" }
+```
+
+**Annotation-rooted form (`@reifies`):**
+
+Filter by annotation metadata first, then surface the reified edge.
+
+```json
+{
+  "@context": { "ex": "http://example.org/" },
+  "select": ["?person", "?org"],
+  "where": {
+    "ex:role": "Engineer",
+    "@reifies": {
+      "@id": "?person",
+      "ex:worksFor": { "@id": "?org" }
+    }
+  }
+}
+```
+
+The base edge identified by `@reifies` is also matched as an ordinary triple, so the visibility check is automatic — if the edge is currently retracted or hidden by policy, the row drops.
+
+**Subject expansion output:**
+
+Wildcard hydration (`select: {"?s": ["*"]}`) on an annotated subject's base edge surfaces each annotation under an `@annotation` key on the expanded value. Anonymous (blank-node) annotation subjects render their body without `@id`; explicit-IRI annotations keep theirs. Multiple parallel annotations render as an array under `@annotation`.
+
+```json
+{
+  "@id": "ex:alice",
+  "ex:worksFor": {
+    "@id": "ex:acme",
+    "@annotation": { "ex:role": "Engineer" }
+  }
+}
+```
+
+**Reserved predicates:**
+
+Annotations are backed by reserved system predicates you can't query directly — use `@annotation` / `@reifies` instead. Naming them in a query is rejected at parse time, and they're hidden from variable-predicate scans (`?p`) and wildcard hydration so they never surface as ordinary RDF. See the [vocabulary reference](../reference/vocabulary.md#edge-annotation-predicates-reserved) for the list.
+
 ## Filter Functions
 
 ### Comparison Functions
@@ -847,6 +1080,26 @@ Arithmetic operators accept two or more arguments. With multiple arguments, they
 - `(/ ?x ?y ...)` - Division
 - `(- ?x)` - Unary negation (single argument)
 - `(abs ?x)` - Absolute value
+
+### List Value Functions
+
+Operate on list values — those produced by `range`, `list`, or [`collect`](#aggregation-functions). Usable anywhere expressions are (`bind`, `filter`, `select`), and the list-producing ones drive [`unwind`](#unwind-patterns).
+
+Producers:
+
+- `(range ?start ?end)` / `(range ?start ?end ?step)` - Inclusive integer sequence; `?start > ?end` yields an empty list
+- `(list ?a ?b ...)` - List literal from the given arguments
+
+Accessors / transforms:
+
+- `(size ?list)` - Element count (also the length of a string)
+- `(head ?list)` - First element (null if empty)
+- `(last ?list)` - Last element (null if empty)
+- `(nth ?list ?i)` - Element at 0-based index `?i`; negative indexes count from the end; out-of-range/non-integer/non-list → null
+- `(tail ?list)` - The list without its first element
+- `(reverse ?list)` - The list reversed (also reverses a string)
+
+`head`, `last`, and `nth` return a single element; `tail` and `reverse` return a list (compose them, e.g. `(head (reverse ?xs))`).
 
 ### Vector Similarity Functions
 
@@ -956,8 +1209,14 @@ Filter grouped results:
 - `(variance ?var)` / `(stddev ?var)` — population variance / standard deviation
 - `(sample ?var)` — implementation-defined sample value
 - `(groupconcat ?var)` / `(groupconcat ?var ", ")` — concatenate string values, optional separator (defaults to a single space)
+- `(collect ?var)` — gather every non-null value in the group into a **list value** (a JSON array), keeping row-level duplicates
+- `(collect-distinct ?var)` — like `collect`, but deduplicates within the group
 
 Each aggregate auto-aliases to `?<fn-name>` (`?count`, `?sum`, …). Use `(as (<fn> ?var) ?alias)` to choose an explicit alias.
+
+`collect` is the inverse of [`unwind`](#unwind-patterns): it folds many rows into one list, and `unwind` fans a list back out into rows. A `collect` result is a first-class list value, so it can be re-expanded — e.g. a sub-select that `collect`s values, with an outer `unwind` over the result.
+
+> Note: in RDF a repeated *identical* value is a single triple, so `collect` and `collect-distinct` differ only when the same value reaches the aggregate on multiple solution rows (typically via a join).
 
 ## Time Travel Queries
 

@@ -55,6 +55,18 @@ pub const CODEC_FLUREE_INDEX_ROOT: u64 = FLUREE_CODEC_BASE + 15;
 /// Multicodec for graph source mapping blobs (R2RML Turtle).
 pub const CODEC_FLUREE_GRAPH_SOURCE_MAPPING: u64 = FLUREE_CODEC_BASE + 16;
 
+/// Multicodec for edge-annotation forward arena branch manifests (EAFB1).
+pub const CODEC_FLUREE_ANNOTATION_FORWARD_BRANCH: u64 = FLUREE_CODEC_BASE + 17;
+
+/// Multicodec for edge-annotation forward arena leaf blobs (EAFL1).
+pub const CODEC_FLUREE_ANNOTATION_FORWARD_LEAF: u64 = FLUREE_CODEC_BASE + 18;
+
+/// Multicodec for edge-annotation reverse arena branch manifests (EARB1).
+pub const CODEC_FLUREE_ANNOTATION_REVERSE_BRANCH: u64 = FLUREE_CODEC_BASE + 19;
+
+/// Multicodec for edge-annotation reverse arena leaf blobs (EARL1).
+pub const CODEC_FLUREE_ANNOTATION_REVERSE_LEAF: u64 = FLUREE_CODEC_BASE + 20;
+
 // Legacy codec constants (pre-V3 format). Kept for backward-compatible CID
 // resolution — existing ledgers may have index artifacts stored under these
 // codecs in the nameservice.
@@ -137,6 +149,14 @@ pub enum ContentKind {
     HistorySidecar,
     /// Graph source mapping blob (R2RML Turtle content, stored via CAS)
     GraphSourceMapping,
+    /// Edge-annotation forward arena branch manifest (EAFB1).
+    AnnotationForwardBranch,
+    /// Edge-annotation forward arena leaf blob (EAFL1).
+    AnnotationForwardLeaf,
+    /// Edge-annotation reverse arena branch manifest (EARB1).
+    AnnotationReverseBranch,
+    /// Edge-annotation reverse arena leaf blob (EARL1).
+    AnnotationReverseLeaf,
 }
 
 // ============================================================================
@@ -162,6 +182,10 @@ impl ContentKind {
             ContentKind::SpatialIndex => CODEC_FLUREE_SPATIAL_INDEX,
             ContentKind::HistorySidecar => CODEC_FLUREE_HISTORY_SIDECAR,
             ContentKind::GraphSourceMapping => CODEC_FLUREE_GRAPH_SOURCE_MAPPING,
+            ContentKind::AnnotationForwardBranch => CODEC_FLUREE_ANNOTATION_FORWARD_BRANCH,
+            ContentKind::AnnotationForwardLeaf => CODEC_FLUREE_ANNOTATION_FORWARD_LEAF,
+            ContentKind::AnnotationReverseBranch => CODEC_FLUREE_ANNOTATION_REVERSE_BRANCH,
+            ContentKind::AnnotationReverseLeaf => CODEC_FLUREE_ANNOTATION_REVERSE_LEAF,
         }
     }
 
@@ -187,6 +211,10 @@ impl ContentKind {
             CODEC_FLUREE_SPATIAL_INDEX => Some(ContentKind::SpatialIndex),
             CODEC_FLUREE_HISTORY_SIDECAR => Some(ContentKind::HistorySidecar),
             CODEC_FLUREE_GRAPH_SOURCE_MAPPING => Some(ContentKind::GraphSourceMapping),
+            CODEC_FLUREE_ANNOTATION_FORWARD_BRANCH => Some(ContentKind::AnnotationForwardBranch),
+            CODEC_FLUREE_ANNOTATION_FORWARD_LEAF => Some(ContentKind::AnnotationForwardLeaf),
+            CODEC_FLUREE_ANNOTATION_REVERSE_BRANCH => Some(ContentKind::AnnotationReverseBranch),
+            CODEC_FLUREE_ANNOTATION_REVERSE_LEAF => Some(ContentKind::AnnotationReverseLeaf),
             // Legacy codecs (pre-V3 format) — map to current content kinds so
             // CIDs stored by older builds can still be resolved.
             CODEC_LEGACY_INDEX_ROOT => Some(ContentKind::IndexRoot),
@@ -212,6 +240,10 @@ impl ContentKind {
             ContentKind::SpatialIndex => "spatial-index",
             ContentKind::HistorySidecar => "history-sidecar",
             ContentKind::GraphSourceMapping => "graph-source-mapping",
+            ContentKind::AnnotationForwardBranch => "annotation-forward-branch",
+            ContentKind::AnnotationForwardLeaf => "annotation-forward-leaf",
+            ContentKind::AnnotationReverseBranch => "annotation-reverse-branch",
+            ContentKind::AnnotationReverseLeaf => "annotation-reverse-leaf",
         }
     }
 }

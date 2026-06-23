@@ -70,16 +70,34 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
             limit,
             offset,
             post_values: None,
+            include_system_facts: false,
         })
     }
 
     /// Lower CONSTRUCT template triples to resolved TriplePatterns.
+    ///
+    /// CONSTRUCT projection of edge-annotation metadata is not
+    /// supported in v1. The Turtle-star vs RDF 1.2 reifier output
+    /// decision is tracked in `docs/concepts/edge-annotations.md`
+    /// "Current limits" — JSON-LD output via the JSON-LD formatter
+    /// is the only supported path. Annotation tails on template
+    /// triples are rejected here with a clear error.
     fn lower_construct_template(
         &mut self,
         triples: &[SparqlTriplePattern],
     ) -> Result<Vec<TriplePattern>> {
         let mut result = Vec::with_capacity(triples.len());
         for tp in triples {
+            if tp.annotation.is_some() {
+                return Err(super::LowerError::not_implemented(
+                    "SPARQL CONSTRUCT projection of edge-annotation metadata is not \
+                     supported in v1. The Turtle-star vs RDF 1.2 reifier output \
+                     decision is tracked in the Edge Annotations concept doc \
+                     (Current limits). Use JSON-LD output (which emits @annotation) \
+                     instead.",
+                    tp.span,
+                ));
+            }
             result.push(self.lower_triple_pattern(tp)?);
         }
         Ok(result)
@@ -108,11 +126,18 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                         self.collect_triples(branch, out);
                     }
                 }
+                Pattern::EdgeAnnotation { edge, body, .. }
+                | Pattern::AnnotationTarget { edge, body, .. } => {
+                    out.push(edge.clone());
+                    self.collect_triples(body, out);
+                }
                 // Filters, Binds, Values, PropertyPaths, Subqueries, IndexSearch, Service, and R2rml don't contribute template triples
                 Pattern::Filter(_)
                 | Pattern::Bind { .. }
+                | Pattern::Unwind { .. }
                 | Pattern::Values { .. }
                 | Pattern::PropertyPath(_)
+                | Pattern::ShortestPath(_)
                 | Pattern::Subquery(_)
                 | Pattern::IndexSearch(_)
                 | Pattern::VectorSearch(_)
@@ -120,7 +145,8 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                 | Pattern::Service(_)
                 | Pattern::R2rml(_)
                 | Pattern::GeoSearch(_)
-                | Pattern::S2Search(_) => {}
+                | Pattern::S2Search(_)
+                | Pattern::DefaultGraphSource { .. } => {}
             }
         }
     }

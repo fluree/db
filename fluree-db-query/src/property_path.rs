@@ -139,6 +139,62 @@ impl PropertyPathOperator {
         self
     }
 
+    /// One forward hop from `node`: the ref objects of `(node, p, ?)` for every
+    /// traversed predicate (their union, for an alternation path `(a|b)*`).
+    async fn forward_step(&self, ctx: &ExecutionContext<'_>, node: &Sid) -> Result<Vec<Sid>> {
+        let (db, overlay, to_t) = ctx.require_single_graph()?;
+        let mut out = Vec::new();
+        for pred in &self.pattern.predicates {
+            let range_match = RangeMatch::new()
+                .with_subject(node.clone())
+                .with_predicate(pred.clone());
+            let flakes = range_with_overlay(
+                db,
+                ctx.binary_g_id,
+                overlay,
+                IndexType::Spot,
+                RangeTest::Eq,
+                range_match,
+                RangeOptions::new().with_to_t(to_t),
+            )
+            .await?;
+            let flakes = self.filter_edges(ctx, flakes).await?;
+            for flake in flakes {
+                if let FlakeValue::Ref(o) = flake.o {
+                    out.push(o);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// One backward hop into `node`: the subjects of `(?, p, node)` for every
+    /// traversed predicate (their union).
+    async fn backward_step(&self, ctx: &ExecutionContext<'_>, node: &Sid) -> Result<Vec<Sid>> {
+        let (db, overlay, to_t) = ctx.require_single_graph()?;
+        let mut out = Vec::new();
+        for pred in &self.pattern.predicates {
+            let range_match = RangeMatch::new()
+                .with_predicate(pred.clone())
+                .with_object(FlakeValue::Ref(node.clone()));
+            let flakes = range_with_overlay(
+                db,
+                ctx.binary_g_id,
+                overlay,
+                IndexType::Post,
+                RangeTest::Eq,
+                range_match,
+                RangeOptions::new().with_to_t(to_t),
+            )
+            .await?;
+            let flakes = self.filter_edges(ctx, flakes).await?;
+            for flake in flakes {
+                out.push(flake.s);
+            }
+        }
+        Ok(out)
+    }
+
     /// Apply view-policy filtering to a batch of edge flakes read during path
     /// traversal.
     ///
@@ -190,46 +246,23 @@ impl PropertyPathOperator {
                 )));
             }
 
-            // SPOT index: (subject=current, predicate=path_pred)
-            let range_match = RangeMatch::new()
-                .with_subject(current.clone())
-                .with_predicate(self.pattern.predicate.clone());
-
-            // In dataset mode, property paths must run against a single active graph.
-            // There is no meaningful dataset-wide `to_t` for multi-ledger datasets.
-            let (db, overlay, to_t) = ctx.require_single_graph()?;
-
-            let opts = RangeOptions::new().with_to_t(to_t);
-
-            let flakes = range_with_overlay(
-                db,
-                ctx.binary_g_id,
-                overlay,
-                IndexType::Spot,
-                RangeTest::Eq,
-                range_match,
-                opts,
-            )
-            .await?;
-            let flakes = self.filter_edges(ctx, flakes).await?;
-
-            for flake in flakes {
-                // REF-ONLY: Only traverse Sid objects, skip literals
-                if let FlakeValue::Ref(obj_sid) = flake.o {
-                    // OneOrMore should still be able to emit `start` if a non-zero-length path
-                    // returns to it (cycle), even though `visited` contains `start`.
-                    if self.pattern.modifier == PathModifier::OneOrMore
-                        && !added_start_via_cycle
-                        && &obj_sid == start
-                    {
-                        results.push(obj_sid.clone());
-                        added_start_via_cycle = true;
-                        continue;
-                    }
-                    if visited.insert(obj_sid.clone()) {
-                        results.push(obj_sid.clone());
-                        queue.push_back(obj_sid);
-                    }
+            // Union of one forward hop over every traversed predicate. In
+            // dataset mode this runs against a single active graph (there is no
+            // meaningful dataset-wide `to_t` for multi-ledger datasets).
+            for obj_sid in self.forward_step(ctx, &current).await? {
+                // OneOrMore should still be able to emit `start` if a non-zero-length path
+                // returns to it (cycle), even though `visited` contains `start`.
+                if self.pattern.modifier == PathModifier::OneOrMore
+                    && !added_start_via_cycle
+                    && &obj_sid == start
+                {
+                    results.push(obj_sid.clone());
+                    added_start_via_cycle = true;
+                    continue;
+                }
+                if visited.insert(obj_sid.clone()) {
+                    results.push(obj_sid.clone());
+                    queue.push_back(obj_sid);
                 }
             }
         }
@@ -272,40 +305,19 @@ impl PropertyPathOperator {
                 )));
             }
 
-            // POST index: (predicate=path_pred, object=current)
-            let range_match = RangeMatch::new()
-                .with_predicate(self.pattern.predicate.clone())
-                .with_object(FlakeValue::Ref(current.clone()));
-
-            let (db, overlay, to_t) = ctx.require_single_graph()?;
-
-            let opts = RangeOptions::new().with_to_t(to_t);
-
-            let flakes = range_with_overlay(
-                db,
-                ctx.binary_g_id,
-                overlay,
-                IndexType::Post,
-                RangeTest::Eq,
-                range_match,
-                opts,
-            )
-            .await?;
-            let flakes = self.filter_edges(ctx, flakes).await?;
-
-            for flake in flakes {
-                // Subject is always a Sid
+            // Union of one backward hop over every traversed predicate.
+            for src_sid in self.backward_step(ctx, &current).await? {
                 if self.pattern.modifier == PathModifier::OneOrMore
                     && !added_target_via_cycle
-                    && &flake.s == target
+                    && &src_sid == target
                 {
-                    results.push(flake.s.clone());
+                    results.push(src_sid.clone());
                     added_target_via_cycle = true;
                     continue;
                 }
-                if visited.insert(flake.s.clone()) {
-                    results.push(flake.s.clone());
-                    queue.push_back(flake.s);
+                if visited.insert(src_sid.clone()) {
+                    results.push(src_sid.clone());
+                    queue.push_back(src_sid);
                 }
             }
         }
@@ -317,30 +329,31 @@ impl PropertyPathOperator {
     ///
     /// Returns pairs (start, reachable) consistent with modifier semantics.
     async fn compute_closure(&self, ctx: &ExecutionContext<'_>) -> Result<Vec<(Sid, Sid)>> {
-        // Pull all edges with this predicate using PSOT (predicate-indexed).
-        let range_match = RangeMatch::predicate(self.pattern.predicate.clone());
+        // Pull all edges for every traversed predicate using PSOT
+        // (predicate-indexed) and merge them into one adjacency map — for an
+        // alternation path `(a|b)*` the closure spans both predicates' edges.
         let (db, overlay, to_t) = ctx.require_single_graph()?;
-        let opts = RangeOptions::new().with_to_t(to_t);
-        let flakes = range_with_overlay(
-            db,
-            ctx.binary_g_id,
-            overlay,
-            IndexType::Psot,
-            RangeTest::Eq,
-            range_match,
-            opts,
-        )
-        .await?;
-        let flakes = self.filter_edges(ctx, flakes).await?;
-
-        // Build adjacency (Sid -> Vec<Sid>)
         let mut adj: std::collections::HashMap<Sid, Vec<Sid>> = std::collections::HashMap::new();
         let mut nodes: HashSet<Sid> = HashSet::new();
-        for flake in flakes {
-            if let FlakeValue::Ref(o) = flake.o {
-                nodes.insert(flake.s.clone());
-                nodes.insert(o.clone());
-                adj.entry(flake.s).or_default().push(o);
+        for pred in &self.pattern.predicates {
+            let range_match = RangeMatch::predicate(pred.clone());
+            let flakes = range_with_overlay(
+                db,
+                ctx.binary_g_id,
+                overlay,
+                IndexType::Psot,
+                RangeTest::Eq,
+                range_match,
+                RangeOptions::new().with_to_t(to_t),
+            )
+            .await?;
+            let flakes = self.filter_edges(ctx, flakes).await?;
+            for flake in flakes {
+                if let FlakeValue::Ref(o) = flake.o {
+                    nodes.insert(flake.s.clone());
+                    nodes.insert(o.clone());
+                    adj.entry(flake.s).or_default().push(o);
+                }
             }
         }
 
@@ -421,29 +434,7 @@ impl PropertyPathOperator {
                 )));
             }
 
-            let range_match = RangeMatch::new()
-                .with_subject(current.clone())
-                .with_predicate(self.pattern.predicate.clone());
-            let (db, overlay, to_t) = ctx.require_single_graph()?;
-            let opts = RangeOptions::new().with_to_t(to_t);
-
-            let flakes = range_with_overlay(
-                db,
-                ctx.binary_g_id,
-                overlay,
-                IndexType::Spot,
-                RangeTest::Eq,
-                range_match,
-                opts,
-            )
-            .await?;
-            let flakes = self.filter_edges(ctx, flakes).await?;
-
-            for flake in flakes {
-                let FlakeValue::Ref(obj_sid) = flake.o else {
-                    continue;
-                };
-
+            for obj_sid in self.forward_step(ctx, &current).await? {
                 // This is a non-zero-length path, so it satisfies OneOrMore
                 // even when the target is the start node reached via a cycle.
                 if &obj_sid == target {

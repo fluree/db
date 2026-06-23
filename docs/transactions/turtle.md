@@ -439,6 +439,37 @@ ex:dataset-import-2024-01-22 a ex:DatasetImport ;
   ex:recordCount 1234567 .
 ```
 
+## Edge annotations (RDF 1.2 / Turtle-star)
+
+The Turtle ingest path — and the related N-Triples (`.nt`), TriG, and N-Quads paths, which share the same lexer — is RDF 1.1 + Fluree extensions. It does **not** parse RDF 1.2 annotation tails (`{| ... |}`), the `~` reifier, or the parenthesized `<<( ... )>>` triple term. A file containing those productions **fails to parse** with a lexer error (e.g. `unexpected character '~'`; a `<<` triple term errors as a malformed IRI) — the data is rejected, not silently ingested without the annotations.
+
+If you want to ingest edge annotations on data that lives in Turtle today, two paths work:
+
+**Path 1: Convert to JSON-LD before ingest.** Re-emit the file as JSON-LD with `@annotation` on the value objects you want annotated. The on-disk shape after ingest is identical to what an RDF 1.2 Turtle ingest would produce.
+
+**Path 2: Ingest plain Turtle first, then add annotations with SPARQL UPDATE.** Useful when the base edges are already in your Turtle export and the annotations come from a separate process.
+
+```bash
+# 1. Ingest the plain edges
+curl -X POST "http://localhost:8090/v1/fluree/upsert?ledger=mydb:main" \
+  -H "Content-Type: text/turtle" \
+  --data-binary '@employments.ttl'
+
+# 2. Add annotations via SPARQL UPDATE
+curl -X POST "http://localhost:8090/v1/fluree/update?ledger=mydb:main" \
+  -H "Content-Type: application/sparql-update" \
+  --data-binary @- <<'SPARQL'
+PREFIX ex: <http://example.org/>
+INSERT DATA {
+  ex:alice ex:worksFor ex:acme {| ex:role "Engineer" ; ex:since "2024-01-01" |} .
+}
+SPARQL
+```
+
+See the [Edge annotations concept doc](../concepts/edge-annotations.md) for the full SPARQL 1.2 surface — `~` for named reifiers, `rdf:reifies` for annotation-rooted queries, the per-operation rules for INSERT DATA / DELETE DATA / INSERT WHERE / DELETE WHERE templates, and the deferred shapes that produce parse errors.
+
+A `.ttl`-native annotation ingest would land alongside a Turtle-star vs RDF 1.2 reifier output decision and is tracked as a future extension.
+
 ## Comparing Formats
 
 ### JSON-LD vs Turtle

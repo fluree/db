@@ -311,6 +311,9 @@ fn apply_aggregate(
     let needs_decoded_values = matches!(
         func,
         AggregateFn::GroupConcat { .. }
+            // collect() must store fully-decoded elements so the formatter can
+            // render each one (the Grouped-of-encoded path can't materialize).
+            | AggregateFn::Collect(..)
             | AggregateFn::Median { .. }
             | AggregateFn::Variance { .. }
             | AggregateFn::Stddev { .. }
@@ -406,6 +409,7 @@ impl AggregateFn {
             Self::Stddev { .. } => agg_stddev(values),
             Self::GroupConcat { separator, .. } => agg_group_concat(values, separator),
             Self::Sample(_) => agg_sample(values),
+            Self::Collect(..) => agg_collect(values),
         }
     }
 }
@@ -833,6 +837,23 @@ fn agg_sample(values: &[Binding]) -> Binding {
         .find(|b| !matches!(b, Binding::Unbound | Binding::Poisoned))
         .cloned()
         .unwrap_or(Binding::Unbound)
+}
+
+/// collect() - gather every non-null value into a list (Cypher semantics: nulls
+/// are dropped; an empty collection yields an empty list, not null). The list
+/// is carried as a `Grouped` binding, which the JSON-LD formatter renders as a
+/// JSON array. DISTINCT, when requested, is applied upstream by
+/// [`AggregateFn::apply`].
+fn agg_collect(values: &[Binding]) -> Binding {
+    let items: Vec<Binding> = values
+        .iter()
+        .filter(|b| !matches!(b, Binding::Unbound | Binding::Poisoned))
+        .cloned()
+        .collect();
+    // `collect()` yields a first-class list value (not a transient GROUP-BY
+    // `Grouped`), so list functions and the JSON-array formatter treat it as a
+    // real Cypher list.
+    Binding::List(items)
 }
 
 /// Extract numeric values as f64 from bindings.

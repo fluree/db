@@ -1,9 +1,10 @@
 //! Term parsing: subjects, predicates, objects, IRIs, literals, blank nodes.
 
+use crate::ast::annotation::{Annotation, AnnotationBlock, AnnotationEntry, ReifierId, TripleTerm};
 use crate::ast::path::PropertyPath;
 use crate::ast::{
-    BlankNode, GraphPattern, Iri, Literal, ObjectTerm, PredicateTerm, QuotedTriple, SubjectTerm,
-    Term, TriplePattern, Var, VarOrIri,
+    BlankNode, GraphPattern, Iri, IriValue, Literal, ObjectTerm, PredicateTerm, QuotedTriple,
+    SubjectTerm, Term, TriplePattern, Var, VarOrIri,
 };
 use crate::lex::TokenKind;
 use crate::span::SourceSpan;
@@ -71,6 +72,16 @@ impl super::Parser<'_> {
         // RDF-star quoted triple: << subject predicate object >>
         if self.stream.check(&TokenKind::TripleStart) {
             return self.parse_quoted_triple().map(SubjectTerm::QuotedTriple);
+        }
+
+        // RDF 1.2 triple term in subject position is a deferred shape
+        // (nested triple terms / arbitrary triple-term values). Reject
+        // here with a targeted message instead of falling through to
+        // generic "expected subject" errors.
+        if self.stream.check(&TokenKind::TripleTermStart) {
+            self.stream
+                .error_at_current("nested triple terms are not supported in v1");
+            return None;
         }
 
         // RDF collection (list) syntax: ( item1 item2 ... ) or ()
@@ -510,20 +521,25 @@ impl super::Parser<'_> {
 
             match verb {
                 Verb::Simple(predicate) => {
-                    // Parse object list for simple predicate
-                    self.parse_object_list(subject, &predicate, triples, bgp_start)?;
+                    // RDF 1.2 reifies form: when the predicate lexically
+                    // resolves to `rdf:reifies` and a triple-term is in
+                    // object position, emit a `GraphPattern::AnnotationTarget`
+                    // (after flushing any in-progress BGP). This is the only
+                    // context in which `<<( s p o )>>` may appear in object
+                    // position per the v1 contract.
+                    if predicate_is_rdf_reifies(&predicate)
+                        && self.stream.check(&TokenKind::TripleTermStart)
+                    {
+                        flush_bgp(subject, triples, patterns, bgp_start);
+                        self.parse_reifies_object_list(subject, &predicate, patterns)?;
+                    } else {
+                        // Parse object list for simple predicate
+                        self.parse_object_list(subject, &predicate, triples, bgp_start)?;
+                    }
                 }
                 Verb::Path(path) => {
                     // Flush any accumulated triples first
-                    if !triples.is_empty() {
-                        let span = bgp_start.unwrap_or(subject.span());
-                        let end_span = triples.last().map(|t| t.span).unwrap_or(span);
-                        patterns.push(GraphPattern::Bgp {
-                            patterns: std::mem::take(triples),
-                            span: span.union(end_span),
-                        });
-                        *bgp_start = None;
-                    }
+                    flush_bgp(subject, triples, patterns, bgp_start);
 
                     // Parse objects for path pattern
                     self.parse_path_object_list(subject, &path, patterns)?;
@@ -553,6 +569,18 @@ impl super::Parser<'_> {
         bgp_start: &mut Option<SourceSpan>,
     ) -> Option<()> {
         loop {
+            // A bare `<<(` here means the user wrote a triple-term object
+            // for a predicate other than `rdf:reifies`. v1 only accepts
+            // triple terms as the object of `rdf:reifies`; reject with
+            // the documented deferred-feature error.
+            if self.stream.check(&TokenKind::TripleTermStart) {
+                self.stream.error_at_current(
+                    "triple terms (<<( s p o )>>) are only allowed as the object of \
+                     rdf:reifies in v1; arbitrary triple-term values are deferred",
+                );
+                return None;
+            }
+
             // Parse object
             let object = self.parse_object()?;
 
@@ -561,14 +589,30 @@ impl super::Parser<'_> {
                 *bgp_start = Some(subject.span());
             }
 
-            // Create triple pattern (span covers subject, predicate, and object)
-            let span = subject.span().union(predicate.span()).union(object.span());
-            triples.push(TriplePattern::new(
-                subject.clone(),
-                predicate.clone(),
-                object,
-                span,
-            ));
+            // RDF 1.2 annotation tail: zero or more (reifier | annotationBlock).
+            // Per v1 contract, accept at most one reifier and one block in any
+            // order. Literal-valued objects are accepted — the lowering path
+            // pins their datatype/language constraint onto the synthesized
+            // `TriplePattern.dtc`.
+            let annotation = self.parse_annotation_tail()?;
+
+            // Create triple pattern (span covers subject, predicate, object,
+            // and annotation tail if present).
+            let mut span = subject.span().union(predicate.span()).union(object.span());
+            if let Some(ann) = &annotation {
+                span = span.union(ann.span);
+            }
+            let triple = match annotation {
+                Some(ann) => TriplePattern::with_annotation(
+                    subject.clone(),
+                    predicate.clone(),
+                    object,
+                    ann,
+                    span,
+                ),
+                None => TriplePattern::new(subject.clone(), predicate.clone(), object, span),
+            };
+            triples.push(triple);
 
             // Check for comma (more objects)
             if !self.stream.match_token(&TokenKind::Comma) {
@@ -577,6 +621,242 @@ impl super::Parser<'_> {
         }
 
         Some(())
+    }
+
+    /// Parse a single triple term `<<( s p o )>>` after the opening
+    /// `TripleTermStart` token has been verified by the caller.
+    ///
+    /// Strict v1 rules:
+    /// - Triple-term subject must be an IRI, blank node, or variable
+    ///   (no nested triple terms).
+    /// - Triple-term predicate must be a simple predicate (no paths).
+    /// - Triple-term object must be an ordinary term (no nested triple
+    ///   terms, no annotation tails).
+    fn parse_triple_term(&mut self) -> Option<TripleTerm> {
+        let start = self.stream.current_span();
+        if !self.stream.match_token(&TokenKind::TripleTermStart) {
+            self.stream
+                .error_at_current("expected '<<(' to begin triple term");
+            return None;
+        }
+
+        let subject = self.parse_subject()?;
+        if matches!(subject, SubjectTerm::QuotedTriple(_)) {
+            self.stream
+                .error_at_current("nested triple terms are not supported in v1");
+            return None;
+        }
+        let predicate = self.parse_simple_predicate()?;
+
+        // Reject nested triple terms in object position.
+        if self.stream.check(&TokenKind::TripleTermStart) {
+            self.stream
+                .error_at_current("nested triple terms are not supported in v1");
+            return None;
+        }
+        let object = self.parse_object()?;
+
+        if !self.stream.match_token(&TokenKind::TripleTermEnd) {
+            self.stream
+                .error_at_current("expected ')>>' to close triple term");
+            return None;
+        }
+
+        let span = start.union(self.stream.previous_span());
+        Some(TripleTerm {
+            subject,
+            predicate,
+            object,
+            span,
+        })
+    }
+
+    /// Parse the object position for an `rdf:reifies` predicate, emitting
+    /// a `GraphPattern::AnnotationTarget` for each parsed triple term.
+    ///
+    /// SPARQL allows comma-separated objects; v1 rejects multiple triple
+    /// terms per `rdf:reifies` because that would mean one reifier
+    /// reifying multiple base edges (the deferred multi-triple-reifier
+    /// case from the design doc).
+    fn parse_reifies_object_list(
+        &mut self,
+        subject: &SubjectTerm,
+        predicate: &PredicateTerm,
+        patterns: &mut Vec<GraphPattern>,
+    ) -> Option<()> {
+        let triple_term = self.parse_triple_term()?;
+
+        let span = subject.span().union(triple_term.span);
+        patterns.push(GraphPattern::AnnotationTarget {
+            reifier: subject.clone(),
+            predicate: predicate.clone(),
+            triple_term,
+            span,
+        });
+
+        if self.stream.match_token(&TokenKind::Comma) {
+            self.stream.error_at_current(
+                "v1 rejects an annotation subject reifying more than one triple term; \
+                 multi-triple reifiers are deferred",
+            );
+            return None;
+        }
+
+        Some(())
+    }
+
+    /// Parse the optional RDF 1.2 annotation tail after an object.
+    ///
+    /// Grammar: `annotation ::= ( reifier | annotationBlock )*`
+    /// v1 narrowing: at most one reifier and one block, any order.
+    /// Returns `Ok(None)` when no tail is present.
+    ///
+    /// Literal-valued objects are accepted: the constraint-preserving
+    /// lowering path (`lower_object_with_constraint`) pins the literal's
+    /// datatype / language tag onto the synthesized `TriplePattern.dtc`
+    /// so reified base-edge object positions match exactly. Without
+    /// `dtc`, same-lexical literals with different datatypes (or
+    /// languages) would cross-match annotations on each other.
+    fn parse_annotation_tail(&mut self) -> Option<Option<Annotation>> {
+        let starts_tail =
+            self.stream.check(&TokenKind::Tilde) || self.stream.check(&TokenKind::AnnotationOpen);
+        if !starts_tail {
+            return Some(None);
+        }
+
+        let start = self.stream.current_span();
+        let mut reifier: Option<ReifierId> = None;
+        let mut block: Option<AnnotationBlock> = None;
+        let mut last_span = start;
+
+        loop {
+            if self.stream.check(&TokenKind::Tilde) {
+                if reifier.is_some() {
+                    self.stream
+                        .error_at_current("at most one reifier (`~`) is allowed per triple in v1");
+                    return None;
+                }
+                let r_span = self.stream.current_span();
+                self.stream.advance(); // consume `~`
+                let r = self.parse_reifier_id_after_tilde();
+                last_span = r.as_ref().map(ReifierId::span).unwrap_or(r_span);
+                reifier = r;
+            } else if self.stream.check(&TokenKind::AnnotationOpen) {
+                if block.is_some() {
+                    self.stream.error_at_current(
+                        "at most one annotation block (`{| ... |}`) is allowed per triple in v1",
+                    );
+                    return None;
+                }
+                let b = self.parse_annotation_block()?;
+                last_span = b.span;
+                block = Some(b);
+            } else {
+                break;
+            }
+        }
+
+        let span = start.union(last_span);
+        Some(Some(Annotation {
+            reifier,
+            block,
+            span,
+        }))
+    }
+
+    /// Parse the optional id following `~`. The bare `~` form (no id)
+    /// returns `None`, matching the RDF 1.2 grammar `reifier ::= '~' (iri | BlankNode)?`.
+    /// We extend the grammar to accept variables for SPARQL queries; the
+    /// update-path lower rejects `~ ?var` in `INSERT DATA` / `DELETE DATA`.
+    fn parse_reifier_id_after_tilde(&mut self) -> Option<ReifierId> {
+        // Variable
+        if let Some((name, span)) = self.stream.consume_var() {
+            return Some(ReifierId::Var(Var::new(name.as_ref(), span)));
+        }
+        // Blank node (labeled `_:foo` or `[]`)
+        if let Some(bnode) = self.parse_blank_node() {
+            return Some(ReifierId::BlankNode(bnode));
+        }
+        // IRI
+        if let Some(iri) = self.parse_iri_term() {
+            return Some(ReifierId::Iri(iri));
+        }
+        // Bare `~` with no following id is valid (mints fresh on lower).
+        None
+    }
+
+    /// Parse a `{| predicateObjectList |}` annotation block.
+    ///
+    /// Each entry is a predicate-object pair applied to the enclosing
+    /// reifier. v1 rejects nested annotation tails on body entries
+    /// (annotations-on-annotations are deferred).
+    fn parse_annotation_block(&mut self) -> Option<AnnotationBlock> {
+        let start = self.stream.current_span();
+        if !self.stream.match_token(&TokenKind::AnnotationOpen) {
+            self.stream
+                .error_at_current("expected '{|' to begin annotation block");
+            return None;
+        }
+
+        let mut entries: Vec<AnnotationEntry> = Vec::new();
+        // Allow empty block: `{| |}` is a valid v1 surface (semantics
+        // depends on RDF/LPG mode — see plan).
+        if !self.stream.check(&TokenKind::AnnotationClose) {
+            loop {
+                let predicate = self.parse_simple_predicate()?;
+                loop {
+                    // Reject nested triple terms here too.
+                    if self.stream.check(&TokenKind::TripleTermStart) {
+                        self.stream.error_at_current(
+                            "triple terms (<<( s p o )>>) are not allowed inside an \
+                             annotation block; reify edges via `rdf:reifies` instead",
+                        );
+                        return None;
+                    }
+                    let object = self.parse_object()?;
+
+                    // Reject nested annotation tails: annotations-on-annotations
+                    // are deferred per the design doc. Surfacing a clear error
+                    // here is friendlier than letting it parse and lower-rejecting.
+                    if self.stream.check(&TokenKind::Tilde)
+                        || self.stream.check(&TokenKind::AnnotationOpen)
+                    {
+                        self.stream.error_at_current(
+                            "annotations on annotation-block entries are not supported \
+                             in v1 (annotations-on-annotations are deferred)",
+                        );
+                        return None;
+                    }
+
+                    let span = predicate.span().union(object.span());
+                    entries.push(AnnotationEntry {
+                        predicate: predicate.clone(),
+                        object,
+                        span,
+                    });
+
+                    if !self.stream.match_token(&TokenKind::Comma) {
+                        break;
+                    }
+                }
+                if !self.stream.match_token(&TokenKind::Semicolon) {
+                    break;
+                }
+                // After `;`, allow trailing semicolon before `|}`.
+                if self.stream.check(&TokenKind::AnnotationClose) {
+                    break;
+                }
+            }
+        }
+
+        if !self.stream.match_token(&TokenKind::AnnotationClose) {
+            self.stream
+                .error_at_current("expected '|}' to close annotation block");
+            return None;
+        }
+
+        let span = start.union(self.stream.previous_span());
+        Some(AnnotationBlock { entries, span })
     }
 
     /// Parse an object list for a property path, creating Path patterns.
@@ -688,6 +968,12 @@ impl super::Parser<'_> {
     }
 
     /// Parse predicate-object list for CONSTRUCT template (no property paths).
+    ///
+    /// Also used by SPARQL UPDATE `INSERT DATA` / `DELETE DATA` and
+    /// `INSERT { ... }` / `DELETE { ... }` template clauses, so it must
+    /// recognize the RDF 1.2 annotation tail. CONSTRUCT itself rejects
+    /// annotations in the template (M4.5) at the lower layer, not the
+    /// parse layer.
     pub(super) fn parse_construct_predicate_object_list(
         &mut self,
         subject: &SubjectTerm,
@@ -699,14 +985,36 @@ impl super::Parser<'_> {
 
             // Parse object list
             loop {
+                // Triple-term objects are NOT allowed in DATA / template
+                // contexts in v1 (the `~` annotation-tail form covers
+                // the same content). Reject with the same documented
+                // deferred-feature error used by the WHERE path.
+                if self.stream.check(&TokenKind::TripleTermStart) {
+                    self.stream.error_at_current(
+                        "triple terms (<<( s p o )>>) are only allowed as the object of \
+                         rdf:reifies in v1; use the `~ {| ... |}` annotation-tail form in \
+                         INSERT/DELETE DATA and templates",
+                    );
+                    return None;
+                }
+
                 let object = self.parse_object()?;
-                let span = subject.span().union(predicate.span()).union(object.span());
-                triples.push(TriplePattern::new(
-                    subject.clone(),
-                    predicate.clone(),
-                    object,
-                    span,
-                ));
+                let annotation = self.parse_annotation_tail()?;
+                let mut span = subject.span().union(predicate.span()).union(object.span());
+                if let Some(ann) = &annotation {
+                    span = span.union(ann.span);
+                }
+                let triple = match annotation {
+                    Some(ann) => TriplePattern::with_annotation(
+                        subject.clone(),
+                        predicate.clone(),
+                        object,
+                        ann,
+                        span,
+                    ),
+                    None => TriplePattern::new(subject.clone(), predicate.clone(), object, span),
+                };
+                triples.push(triple);
 
                 if !self.stream.match_token(&TokenKind::Comma) {
                     break;
@@ -729,3 +1037,44 @@ impl super::Parser<'_> {
 }
 
 use crate::ast::DatasetClause;
+
+/// Flush an in-progress BGP into `patterns`, clearing `triples` and
+/// `bgp_start`. No-op when `triples` is empty.
+fn flush_bgp(
+    subject: &SubjectTerm,
+    triples: &mut Vec<TriplePattern>,
+    patterns: &mut Vec<GraphPattern>,
+    bgp_start: &mut Option<SourceSpan>,
+) {
+    if triples.is_empty() {
+        return;
+    }
+    let span = bgp_start.unwrap_or(subject.span());
+    let end_span = triples.last().map(|t| t.span).unwrap_or(span);
+    patterns.push(GraphPattern::Bgp {
+        patterns: std::mem::take(triples),
+        span: span.union(end_span),
+    });
+    *bgp_start = None;
+}
+
+/// Lexical check: does this predicate term resolve to `rdf:reifies`?
+///
+/// We handle two surface forms: a full IRI matching the standard
+/// `http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies`, and the
+/// prefixed form `rdf:reifies` assuming the conventional `rdf:` prefix
+/// binding. Users with a non-standard `rdf:` binding can fall back to
+/// the full IRI; the prefix-resolution layer at lower time will reject
+/// any false positive that slips through (the actual IRI lookup will
+/// not match).
+fn predicate_is_rdf_reifies(predicate: &PredicateTerm) -> bool {
+    match predicate {
+        PredicateTerm::Iri(iri) => match &iri.value {
+            IriValue::Full(s) => s.as_ref() == fluree_vocab::rdf::REIFIES,
+            IriValue::Prefixed { prefix, local } => {
+                prefix.as_ref() == "rdf" && local.as_ref() == "reifies"
+            }
+        },
+        PredicateTerm::Var(_) => false,
+    }
+}
