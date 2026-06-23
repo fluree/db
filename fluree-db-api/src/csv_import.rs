@@ -33,8 +33,40 @@
 //! - [`EdgePolicy::Plain`] — edge properties are dropped; every edge is a plain
 //!   triple (pure RDF 1.1).
 
+use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
 use serde_json::{Map, Value};
+use std::borrow::Cow;
 use std::io::{Read, Write};
+
+/// Characters percent-encoded when turning a CSV cell value into an IRI
+/// segment. Covers whitespace/controls, the RFC 3987-forbidden ASCII, and the
+/// structural delimiters (`/ # ? [ ] @`) a value could use to break IRI syntax
+/// or climb out of `base_iri`'s namespace (an embedded `http://evil/p`,
+/// `../../x`). Unreserved chars and `:` are left intact so ordinary ids and
+/// compact-looking values round-trip unchanged.
+const IRI_SEGMENT: &AsciiSet = &CONTROLS
+    .add(b' ')
+    .add(b'"')
+    .add(b'<')
+    .add(b'>')
+    .add(b'\\')
+    .add(b'^')
+    .add(b'`')
+    .add(b'{')
+    .add(b'|')
+    .add(b'}')
+    .add(b'%')
+    .add(b'/')
+    .add(b'#')
+    .add(b'?')
+    .add(b'[')
+    .add(b']')
+    .add(b'@');
+
+/// Percent-encode a CSV cell value so it is safe to append after `base_iri`.
+fn iri_segment(s: &str) -> Cow<'_, str> {
+    utf8_percent_encode(s, IRI_SEGMENT).into()
+}
 
 /// XSD namespace for typed literals emitted as JSON-LD `@value`/`@type`.
 const XSD: &str = "http://www.w3.org/2001/XMLSchema#";
@@ -291,6 +323,7 @@ fn classify(cols: &[Column]) -> Result<Shape> {
 
 /// Mint an absolute IRI for an id value, namespaced by its id space.
 fn mint_iri(base: &str, space: Option<&str>, value: &str) -> String {
+    let value = iri_segment(value);
     match space {
         Some(s) if !s.is_empty() => format!("{base}{s}/{value}"),
         _ => format!("{base}{value}"),
@@ -425,7 +458,7 @@ fn node_object(
             }
             Column::Label => {
                 for label in raw.split(opts.array_delimiter).filter(|s| !s.is_empty()) {
-                    types.push(Value::String(pred(label.trim())));
+                    types.push(Value::String(pred(&iri_segment(label.trim()))));
                 }
             }
             Column::Property { name, ty, array } => {
@@ -520,7 +553,7 @@ fn rel_object(
 
     let mut subj = Map::new();
     subj.insert("@id".to_string(), Value::String(s_iri));
-    subj.insert(pred(&rel_type), Value::Object(object));
+    subj.insert(pred(&iri_segment(&rel_type)), Value::Object(object));
     Ok(Some(Value::Object(subj)))
 }
 
@@ -730,6 +763,23 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn id_value_is_percent_encoded_into_namespace() {
+        // A value that would otherwise climb out of the namespace (`/`, an
+        // embedded URL) stays a single segment under base_iri.
+        let csv = "id:ID\nhttp://evil/p\n";
+        let out = csv_to_jsonld(csv, &opts()).unwrap();
+        assert_eq!(out[0]["@id"], json!("http://ex/http:%2F%2Fevil%2Fp"));
+    }
+
+    #[test]
+    fn rel_type_with_unsafe_chars_is_encoded() {
+        let csv = ":START_ID(Person),:END_ID(Person),:TYPE\n10,20,a b/c\n";
+        let out = csv_to_jsonld(csv, &opts()).unwrap();
+        // Predicate stays inside base_iri; space and slash are encoded.
+        assert!(out[0].get("http://ex/a%20b%2Fc").is_some(), "{out:?}");
     }
 
     #[test]

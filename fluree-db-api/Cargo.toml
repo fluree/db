@@ -88,6 +88,8 @@ itoa.workspace = true
 ryu.workspace = true
 # CSV bulk import (neo4j-admin header convention → JSON-LD front-end)
 csv = "1.4"
+# Percent-encode CSV cell values into safe IRI segments
+percent-encoding = "2"
 
 # Opt-in AWS + LocalStack testing deps (feature-gated)
 testcontainers = { version = "0.23", optional = true }
