@@ -221,7 +221,7 @@ fn sparql_table_cell(
 
         // A path renders as arrow-joined node IRIs (Cypher-only; never reached
         // via the SPARQL surface).
-        Binding::Path(nodes) => nodes
+        Binding::Path { nodes, .. } => nodes
             .iter()
             .map(|sid| compact_bnode_strip(compactor.compact_sid_for_display(sid).ok()))
             .collect::<Vec<_>>()
@@ -236,6 +236,28 @@ fn sparql_table_cell(
             }
             parts.join(";")
         }
+
+        // A map (Cypher map value) — `key=value` pairs; never reached via SPARQL.
+        Binding::Map(entries) => {
+            let mut parts = Vec::with_capacity(entries.len());
+            for (k, v) in entries {
+                parts.push(format!("{k}={}", sparql_table_cell(v, compactor, gv)?));
+            }
+            parts.join(";")
+        }
+
+        // A relationship value — `start-[type]->end`; never reached via SPARQL.
+        Binding::Rel {
+            start,
+            predicate,
+            end,
+            ..
+        } => format!(
+            "{}-[{}]->{}",
+            compact_bnode_strip(compactor.compact_sid_for_display(start).ok()),
+            compact_bnode_strip(compactor.compact_sid_for_display(predicate).ok()),
+            compact_bnode_strip(compactor.compact_sid_for_display(end).ok()),
+        ),
     };
     Ok(s)
 }
