@@ -752,10 +752,26 @@ impl LazyVectorArena {
         let cs = Arc::clone(cas);
         let cid = cid.clone();
         let path = source.path.clone();
+        // Bound the fetch with the same `cas_sync_timeout()` the index-leaf and
+        // dict-pack bridges use, so a stalled remote (S3) GET fails fast instead
+        // of blocking the waiting thread indefinitely.
+        let timeout = crate::read::binary_index_store::cas_sync_timeout();
         let bytes = crate::read::binary_index_store::run_sync_on_runtime(async move {
-            cs.get(&cid)
-                .await
-                .map_err(|e| io::Error::other(e.to_string()))
+            let fut = cs.get(&cid);
+            if let Some(dur) = timeout {
+                tokio::time::timeout(dur, fut)
+                    .await
+                    .map_err(|_| {
+                        io::Error::other(format!(
+                            "vector shard CAS fetch timed out after {}ms (cid={})",
+                            dur.as_millis(),
+                            cid
+                        ))
+                    })?
+                    .map_err(|e| io::Error::other(e.to_string()))
+            } else {
+                fut.await.map_err(|e| io::Error::other(e.to_string()))
+            }
         })?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
