@@ -8,7 +8,7 @@ use serde_json::Value as JsonValue;
 use crate::error::BuilderErrors;
 use crate::graph::Graph;
 use crate::graph_query_builder::GraphSnapshotQueryBuilder;
-use crate::tx_builder::{commit_with_handle, Staged, TransactCore, TransactOperation};
+use crate::tx_builder::{Staged, TransactCore, TransactOperation};
 use crate::view::GraphDb;
 use crate::{
     ApiError, Fluree, PolicyContext, Result, TrackedErrorResponse, TrackedTransactionInput,
@@ -152,7 +152,10 @@ impl<'a, 'g> GraphTransactBuilder<'a, 'g> {
             .fluree
             .ledger_cached(&self.graph.ledger_id)
             .await?;
-        commit_with_handle(self.graph.fluree, &handle, self.core).await
+        self.graph
+            .fluree
+            .commit_with_handle(&handle, self.core)
+            .await
     }
 
     /// Stage the transaction without committing.

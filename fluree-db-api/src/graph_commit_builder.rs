@@ -19,7 +19,7 @@
 //! }
 //! ```
 
-use crate::dataset::QueryConnectionOptions;
+use crate::dataset::GovernanceOptions;
 use crate::format::iri::IriCompactor;
 use crate::graph::Graph;
 use crate::ledger_view::CommitRef;
@@ -276,7 +276,7 @@ impl<'a, 'g> CommitBuilder<'a, 'g> {
         //    variants (query vs internal) instead of losing them through
         //    BlockFetchError's stringified intermediary.
         if self.identity.is_some() || self.policy_class.is_some() {
-            let opts = QueryConnectionOptions {
+            let opts = GovernanceOptions {
                 identity: self.identity.clone(),
                 policy_class: self.policy_class.as_deref().map(|c| vec![c.to_string()]),
                 ..Default::default()
@@ -297,6 +297,18 @@ impl<'a, 'g> CommitBuilder<'a, 'g> {
             if !policy_ctx.wrapper().is_root() {
                 let enforcer = QueryPolicyEnforcer::new(Arc::new(policy_ctx));
                 let tracker = Tracker::disabled();
+
+                // Populate subject class membership before filtering — otherwise
+                // filter_flakes_for_graph reads an empty class cache and every
+                // f:onClass restriction silently drops to default_allow.
+                let mut subjects: Vec<_> = commit.flakes.iter().map(|f| f.s.clone()).collect();
+                subjects.sort();
+                subjects.dedup();
+                let db = fluree_db_core::GraphDbRef::new(&snapshot.snapshot, 0, overlay, commit.t);
+                enforcer
+                    .populate_class_cache_for_graph(db, &subjects)
+                    .await?;
+
                 commit.flakes = enforcer
                     .filter_flakes_for_graph(
                         &snapshot.snapshot,

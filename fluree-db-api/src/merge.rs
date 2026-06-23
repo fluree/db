@@ -320,9 +320,12 @@ impl crate::Fluree {
             )));
         }
 
-        // Load target state for staging the merge commit.
-        let target_state = self
-            .load_queryable_state_with_store(target_store, target_record.clone())
+        // Acquire target state under the write lock when a manager is
+        // available, serializing with regular transactions on the target
+        // branch. Without a manager (embedded use, no shared cache), fall
+        // back to a fresh storage load — there's nothing to protect.
+        let (write_guard, target_state) = self
+            .lock_or_load(target_id, target_store, target_record.clone())
             .await?;
 
         // Collect source flakes and metadata: walk source commits from HEAD
@@ -370,7 +373,7 @@ impl crate::Fluree {
         let content_store = self.content_store(target_id);
 
         let publisher = self.publisher()?;
-        let (receipt, _new_state) = fluree_db_transact::commit(
+        let (receipt, new_state) = fluree_db_transact::commit(
             view,
             ns_registry,
             &content_store,
@@ -379,6 +382,12 @@ impl crate::Fluree {
             commit_opts,
         )
         .await?;
+
+        if let Some(guard) = write_guard {
+            let needs_reindex = new_state.should_reindex(&self.index_config);
+            self.finalize_commit(guard, new_state, receipt.t, needs_reindex)
+                .await?;
+        }
 
         // Copy source's index to target (best-effort).
         if let Some(ref index_cid) = source_record.index_head_id {

@@ -342,7 +342,25 @@ impl PolicyContext {
             }
         }
 
-        // Second pass: check for Allow (no Deny found)
+        // Second pass: no explicit Deny — apply the per-subset combining rule.
+        if has_required {
+            // Required policies are AND gates: every required entry must grant.
+            // This sync evaluator cannot run f:query, so a required f:query gate
+            // cannot be confirmed and is treated as not-granting (fail closed).
+            // Use the async evaluator for full f:query support.
+            for entry in &filtered_entries {
+                let restriction = &policy_set.restrictions[entry.idx];
+                tracker.policy_executed(&restriction.id);
+                match &restriction.value {
+                    PolicyValue::Allow => tracker.policy_allowed(&restriction.id),
+                    PolicyValue::Deny => unreachable!(), // handled in the deny pass
+                    PolicyValue::Query(_) => return Ok(false),
+                }
+            }
+            return Ok(true);
+        }
+
+        // No required policies: allow-overrides — first allow wins (f:query skipped).
         for entry in filtered_entries {
             let restriction = &policy_set.restrictions[entry.idx];
             tracker.policy_executed(&restriction.id);
@@ -436,7 +454,37 @@ impl PolicyContext {
             }
         }
 
-        // Second pass: check for Allow/Query (no Deny found)
+        // Second pass: no explicit Deny — apply the per-subset combining rule.
+        if has_required {
+            // Required policies are AND gates: EVERY required entry must grant,
+            // and none can be overridden by another allow. A required f:query
+            // returning no rows is a gate that did not permit, so it denies.
+            for entry in &filtered_entries {
+                let restriction = &policy_set.restrictions[entry.idx];
+                tracker.policy_executed(&restriction.id);
+                match &restriction.value {
+                    PolicyValue::Allow => tracker.policy_allowed(&restriction.id),
+                    PolicyValue::Deny => unreachable!(), // handled in the deny pass
+                    PolicyValue::Query(q) => {
+                        let bindings = build_policy_values_clause(
+                            flake.subject,
+                            &self.identity,
+                            self.wrapper.policy_values(),
+                        );
+                        if executor.evaluate_policy_query(q, &bindings).await? {
+                            tracker.policy_allowed(&restriction.id);
+                        } else {
+                            return Ok(false);
+                        }
+                    }
+                }
+            }
+            // Every required gate granted.
+            return Ok(true);
+        }
+
+        // No required policies: allow-overrides — the first allow (or passing
+        // f:query) grants; a targeted f:query that fails denies for its target.
         for entry in filtered_entries {
             let restriction = &policy_set.restrictions[entry.idx];
             tracker.policy_executed(&restriction.id);
@@ -559,7 +607,40 @@ impl PolicyContext {
             }
         }
 
-        // Second pass: check for Allow/Query (no Deny found)
+        // Second pass: no explicit Deny — apply the per-subset combining rule.
+        if has_required {
+            // Required policies are AND gates: every required entry must grant.
+            // A required f:query returning no rows denies (a gate that did not
+            // permit) and cannot be overridden by another required allow.
+            for entry in &filtered_entries {
+                let restriction = &policy_set.restrictions[entry.idx];
+                tracker.policy_executed(&restriction.id);
+                if let PolicyValue::Query(q) = &restriction.value {
+                    let bindings = build_policy_values_clause(
+                        flake.subject,
+                        &self.identity,
+                        self.wrapper.policy_values(),
+                    );
+                    if executor.evaluate_policy_query(q, &bindings).await? {
+                        tracker.policy_allowed(&restriction.id);
+                    } else {
+                        return Ok(PolicyDecision::Denied {
+                            candidates: vec![restriction],
+                        });
+                    }
+                } else {
+                    // Allow (Deny already handled in the deny pass).
+                    tracker.policy_allowed(&restriction.id);
+                }
+            }
+            // Every required gate granted; report the first as the representative.
+            return Ok(PolicyDecision::Allowed {
+                restriction: candidate_restrictions.first().copied(),
+            });
+        }
+
+        // No required policies: allow-overrides — first allow (or passing
+        // f:query) grants; a targeted f:query that fails denies for its target.
         for entry in &filtered_entries {
             let restriction = &policy_set.restrictions[entry.idx];
             tracker.policy_executed(&restriction.id);
@@ -676,8 +757,24 @@ impl PolicyContext {
             }
         }
 
-        // Second pass: check for Allow (no Deny found)
-        // NOTE: f:query policies are skipped in this sync version.
+        // Second pass: no explicit Deny — apply the per-subset combining rule.
+        // NOTE: f:query policies cannot be evaluated in this sync version.
+        if has_required {
+            // Required policies are AND gates: every required entry must grant.
+            // A required f:query gate can't be confirmed here, so it fails closed
+            // (deny). Use the async detailed evaluator for full f:query support.
+            for entry in &filtered_entries {
+                let restriction = &policy_set.restrictions[entry.idx];
+                match &restriction.value {
+                    PolicyValue::Allow => {}
+                    PolicyValue::Deny => unreachable!(), // handled in the deny pass
+                    PolicyValue::Query(_) => return Ok((false, vec![restriction])),
+                }
+            }
+            return Ok((true, vec![]));
+        }
+
+        // No required policies: allow-overrides — first allow grants (f:query skipped).
         for entry in &filtered_entries {
             let restriction = &policy_set.restrictions[entry.idx];
             match &restriction.value {

@@ -847,6 +847,143 @@ async fn all_spans_properly_closed() {
 }
 
 // =============================================================================
+// Annotation read-path spans — inject_annotations + annotation_arena_lookup
+// =============================================================================
+
+#[tokio::test(flavor = "current_thread")]
+async fn annotation_hydration_emits_inject_annotations_span() {
+    // A subject-hydration query against an annotated edge should emit
+    // an `inject_annotations` span tagged with the chosen path
+    // (`scan` here — no arena reader on a memory ledger that hasn't
+    // been reindexed). On non-annotation ledgers the formatter's
+    // zero-cost gate skips the span entirely; that contract is
+    // covered by `ac5_zero_noise_at_info` above (any span at all
+    // would fail it on a non-annotation workload — the API layer is
+    // span-clean at INFO).
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = support::genesis_ledger(&fluree, "tracing-annotations:main");
+    let ledger = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": { "ex": "http://example.org/" },
+                "@id": "ex:alice",
+                "ex:worksFor": {
+                    "@id": "ex:acme",
+                    "@annotation": { "ex:role": "Engineer" }
+                }
+            }),
+        )
+        .await
+        .expect("annotated insert")
+        .ledger;
+
+    // Re-init capture so only the hydration query produces spans.
+    let (store, _guard) = span_capture::init_test_tracing();
+
+    let query = json!({
+        "@context": { "ex": "http://example.org/" },
+        "select": {"?person": ["*", {"ex:worksFor": ["*"]}]},
+        "where": {"@id": "?person", "ex:worksFor": {"@id": "?org"}}
+    });
+    let _ = support::query_jsonld_formatted(&fluree, &ledger, &query)
+        .await
+        .expect("hydration query");
+
+    assert!(
+        store.has_span("inject_annotations"),
+        "annotation hydration must emit inject_annotations. Captured: {:?}",
+        store.span_names()
+    );
+    let inject = store
+        .find_span("inject_annotations")
+        .expect("inject_annotations recorded");
+    assert_eq!(
+        inject.level,
+        tracing::Level::DEBUG,
+        "inject_annotations must be DEBUG (per CLAUDE.md tracing convention)"
+    );
+    let path = inject
+        .fields
+        .get("path")
+        .map(String::as_str)
+        .unwrap_or("<missing>");
+    assert_eq!(
+        path, "scan",
+        "memory ledger without a sealed arena takes the scan path; got {path:?}"
+    );
+    assert!(
+        inject.fields.contains_key("annotation_count"),
+        "inject_annotations must record annotation_count: fields = {:?}",
+        inject.fields
+    );
+
+    // Without an arena reader the inner span should not fire.
+    assert!(
+        !store.has_span("annotation_arena_lookup"),
+        "annotation_arena_lookup must not fire when no arena is sealed"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn annotation_cascade_emits_cascade_reifies_bundle_span() {
+    // Retracting a base edge that has annotations should emit a
+    // `cascade_reifies_bundle` span tagged with the cascade row
+    // count. On non-annotation ledgers the gate skips it.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = support::genesis_ledger(&fluree, "tracing-cascade:main");
+    let after_insert = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": { "ex": "http://example.org/" },
+                "@id": "ex:alice",
+                "ex:worksFor": {
+                    "@id": "ex:acme",
+                    "@annotation": {
+                        "@id": "ex:emp/A",
+                        "ex:role": "Engineer"
+                    }
+                }
+            }),
+        )
+        .await
+        .expect("annotated insert")
+        .ledger;
+
+    let (store, _guard) = span_capture::init_test_tracing();
+
+    let _ = fluree
+        .update(
+            after_insert,
+            &json!({
+                "@context": { "ex": "http://example.org/" },
+                "delete": {
+                    "@id": "ex:alice",
+                    "ex:worksFor": { "@id": "ex:acme" }
+                }
+            }),
+        )
+        .await
+        .expect("base-edge retract");
+
+    assert!(
+        store.has_span("cascade_reifies_bundle"),
+        "annotated base-edge retract must emit cascade_reifies_bundle. Captured: {:?}",
+        store.span_names()
+    );
+    let cascade = store
+        .find_span("cascade_reifies_bundle")
+        .expect("cascade_reifies_bundle recorded");
+    assert_eq!(cascade.level, tracing::Level::DEBUG);
+    assert!(
+        cascade.fields.contains_key("cascade_count"),
+        "cascade_reifies_bundle must record cascade_count: fields = {:?}",
+        cascade.fields
+    );
+}
+
+// =============================================================================
 // AC-9: Cyclic BGP operator spans — scan / index build / prune / wedge / enumerate
 // =============================================================================
 

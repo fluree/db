@@ -50,6 +50,7 @@ otel = [
 fluree-db-api = { path = "../fluree-db-api" }
 fluree-db-connection = { path = "../fluree-db-connection" }
 fluree-db-core = { path = "../fluree-db-core" }
+fluree-db-consensus = { path = "../fluree-db-consensus" }
 fluree-db-credential = { path = "../fluree-db-credential" }
 fluree-db-nameservice = { path = "../fluree-db-nameservice" }
 fluree-db-nameservice-sync = { path = "../fluree-db-nameservice-sync" }

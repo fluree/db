@@ -404,3 +404,155 @@ async fn policy_fquery_empty_where_allows() {
         "Empty f:query should allow all items"
     );
 }
+
+/// Property-path traversal must enforce view policy on the edges it reads:
+/// hidden edges are not traversed, so nodes reachable only through them are not
+/// emitted. Regression for the V1 leak (the property-path operator read raw
+/// edges via `range_with_overlay` with no policy filtering).
+#[tokio::test]
+async fn policy_property_path_filters_hidden_edges() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    let ledger = genesis_ledger(&fluree, "policy/fquery-path:main");
+    // Chain a -> b -> c -> d. Only ex:a can share, so only the a->b edge is
+    // viewable; the b->c and c->d edges are hidden.
+    let seed = json!({
+        "@context": { "ex": "http://example.org/ns/" },
+        "@graph": [
+            { "@id": "ex:a", "ex:canShare": true, "ex:knows": { "@id": "ex:b" } },
+            { "@id": "ex:b", "ex:knows": { "@id": "ex:c" } },
+            { "@id": "ex:c", "ex:knows": { "@id": "ex:d" } }
+        ]
+    });
+    let _ = fluree
+        .insert(ledger, &seed)
+        .await
+        .expect("seed should succeed");
+
+    let policy = json!([{
+        "@id": "ex:knowsPolicy",
+        "@type": "f:AccessPolicy",
+        "f:action": "f:view",
+        // Only governs ex:knows edges; an edge is viewable iff its subject can share.
+        "f:onProperty": [{ "@id": "http://example.org/ns/knows" }],
+        "f:query": {
+            "@type": "@json",
+            "@value": {
+                "@context": { "ex": "http://example.org/ns/" },
+                "where": [{ "@id": "?$this", "ex:canShare": true }]
+            }
+        }
+    }]);
+
+    let query = json!({
+        "@context": {
+            "ex": "http://example.org/ns/",
+            "knowsPlus": { "@path": "ex:knows+" }
+        },
+        "from": "policy/fquery-path:main",
+        "opts": { "policy": policy, "default-allow": false },
+        "where": [{ "@id": "ex:a", "knowsPlus": "?who" }],
+        "select": ["?who"]
+    });
+
+    let result = fluree
+        .query_connection(&query)
+        .await
+        .expect("query_connection");
+    let ledger = fluree
+        .ledger("policy/fquery-path:main")
+        .await
+        .expect("ledger");
+    let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+
+    // Only ex:b is reachable. Without edge filtering the traversal would walk
+    // the hidden b->c and c->d edges and leak ex:c and ex:d.
+    assert_eq!(
+        normalize_rows(&jsonld),
+        normalize_rows(&json!([["ex:b"]])),
+        "property path must not traverse hidden edges; got: {jsonld:#?}"
+    );
+}
+
+/// C1 regression: required policies are AND gates. When two REQUIRED view
+/// policies target the same flake — one `f:allow: true` and one `f:query` that
+/// returns no rows — access must be DENIED regardless of policy order. The old
+/// combining algorithm returned on the first Allow (OR semantics), so a required
+/// failing query could be bypassed by a co-located required allow that happened
+/// to be evaluated first (order-dependent fail-open).
+#[tokio::test]
+async fn required_policies_are_and_gated() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "policy/required-and:main";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let seed = json!({
+        "@context": {"ex": "http://example.org/ns/"},
+        "@graph": [{"@id": "ex:item1", "@type": "ex:Item", "ex:secret": "classified"}]
+    });
+    fluree.insert(ledger0, &seed).await.unwrap();
+
+    let req_allow = json!({
+        "@id": "ex:reqAllow",
+        "f:required": true,
+        "f:onProperty": [{"@id": "http://example.org/ns/secret"}],
+        "f:action": "f:view",
+        "f:allow": true
+    });
+    // A required gate whose f:query never matches → returns no rows → a gate
+    // that "applied but did not permit", so access must be denied.
+    let req_query_false = json!({
+        "@id": "ex:reqQueryFalse",
+        "f:required": true,
+        "f:onProperty": [{"@id": "http://example.org/ns/secret"}],
+        "f:action": "f:view",
+        "f:query": serde_json::to_string(&json!({
+            "where": {"@id": "?$this", "http://example.org/ns/nonexistent": "?x"}
+        })).unwrap()
+    });
+
+    // Order A: [allow, query-false] — the old code returned at the first allow.
+    let q_a = json!({
+        "@context": {"ex": "http://example.org/ns/"},
+        "from": ledger_id,
+        "opts": {"policy": [req_allow.clone(), req_query_false.clone()], "default-allow": false},
+        "select": "?secret",
+        "where": {"@id": "ex:item1", "http://example.org/ns/secret": "?secret"}
+    });
+    let rows_a = normalize_rows(
+        &fluree
+            .query_connection(&q_a)
+            .await
+            .expect("query A")
+            .to_jsonld(&fluree.ledger(ledger_id).await.unwrap().snapshot)
+            .unwrap(),
+    );
+    assert_eq!(
+        rows_a,
+        normalize_rows(&json!([])),
+        "a failing required f:query must deny even after a required allow, got {rows_a:?}"
+    );
+
+    // Order B: [query-false, allow] — must also deny (order-independent).
+    let q_b = json!({
+        "@context": {"ex": "http://example.org/ns/"},
+        "from": ledger_id,
+        "opts": {"policy": [req_query_false, req_allow], "default-allow": false},
+        "select": "?secret",
+        "where": {"@id": "ex:item1", "http://example.org/ns/secret": "?secret"}
+    });
+    let rows_b = normalize_rows(
+        &fluree
+            .query_connection(&q_b)
+            .await
+            .expect("query B")
+            .to_jsonld(&fluree.ledger(ledger_id).await.unwrap().snapshot)
+            .unwrap(),
+    );
+    assert_eq!(
+        rows_b,
+        normalize_rows(&json!([])),
+        "required AND gate must be order-independent, got {rows_b:?}"
+    );
+}

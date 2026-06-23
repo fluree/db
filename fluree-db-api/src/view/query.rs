@@ -458,7 +458,7 @@ impl Fluree {
     ///
     /// A GraphDb is single-ledger; dataset clauses would conflict with
     /// the db's ledger alias.
-    fn validate_sparql_for_view(&self, sparql: &str) -> Result<()> {
+    pub(crate) fn validate_sparql_for_view(&self, sparql: &str) -> Result<()> {
         let ast = parse_and_validate_sparql(sparql)?;
 
         // Check for dataset clauses
@@ -488,7 +488,7 @@ impl Fluree {
     /// `f:schemaSource` (with optional `owl:imports` closure), the resolved
     /// schema bundle is attached to `options.schema_bundle` so the runner
     /// can layer it as a `SchemaBundleOverlay` at prep time.
-    async fn build_executable_for_view(
+    pub(crate) async fn build_executable_for_view(
         &self,
         db: &GraphDb,
         parsed: &fluree_db_query::ir::Query,
@@ -535,6 +535,18 @@ impl Fluree {
             if !db.query_time_rules_allowed() {
                 executable.reasoning.modes.rules.clear();
             }
+        }
+
+        // Query-time datalog rule injection is admin-only: a restricted
+        // (non-root view policy) request may not supply inference rules. A rule
+        // with a viewable head can launder hidden data the policy author never
+        // anticipated — the derived flake is filtered only by its own (s,p,o),
+        // not its provenance, and a caller-invented predicate can't be
+        // pre-denied. DB-stored rules and OWL reasoning are admin-controlled and
+        // unaffected. See docs/security/policy-in-queries.md (Reasoning).
+        if !db.is_root() && !executable.reasoning.modes.rules.is_empty() {
+            tracing::debug!("stripping query-time datalog rules under non-root view policy");
+            executable.reasoning.modes.rules.clear();
         }
 
         // Carry the pre-resolved `f:rulesSource` graph id (if any)
@@ -809,46 +821,27 @@ impl Fluree {
     ) -> Result<Vec<crate::Batch>> {
         let db_ref = db.as_graph_db_ref();
         // Single-graph view: no dataset-level history detection — current state.
-        let prepare_config = PrepareConfig::current(db.binary_store.as_ref());
+        // Single ledger + root policy ⇒ semantic stats rewrites (redundant
+        // `rdf:type` elision) are sound; a non-root enforcer hides rows and must
+        // not allow it.
+        let allow_semantic_elision = db.policy_enforcer().is_none_or(|p| p.is_root());
+        let prepare_config = PrepareConfig::current_with_semantic_elision(
+            db.binary_store.as_ref(),
+            allow_semantic_elision,
+        );
         let prepared = prepare_execution_with_config(db_ref, executable, &prepare_config)
             .await
             .map_err(query_error_to_api_error)?;
 
-        let spatial_map = db.binary_store.as_ref().map(|s| s.spatial_provider_map());
-        // Perf guardrail: skip fulltext arena map + `"en"` lang_id resolution
-        // for queries that don't actually call `fulltext(...)`. The setup
-        // cost (HashMap clone over every (graph, predicate, language) arena
-        // plus one lang dict probe) is real on wide ledgers — an unrelated
-        // query shouldn't pay it.
-        let uses_fulltext = executable.uses_fulltext();
-        let fulltext_map = if uses_fulltext {
-            db.binary_store.as_ref().map(|s| s.fulltext_provider_map())
-        } else {
-            None
-        };
-        let english_lang_id = if uses_fulltext {
-            db.binary_store
-                .as_ref()
-                .and_then(|s| s.resolve_lang_id("en"))
-        } else {
-            None
-        };
-
-        let config = ContextConfig {
-            tracker: Some(tracker),
-            cancellation: options.cancellation.clone(),
-            policy_enforcer: db.policy_enforcer().cloned(),
-            r2rml: Some((r2rml.provider, r2rml.table_provider)),
-            binary_store: db.binary_store.clone(),
-            binary_g_id: db.graph_id,
-            dict_novelty: db.dict_novelty.clone(),
-            spatial_providers: spatial_map.as_ref(),
-            fulltext_providers: fulltext_map.as_ref(),
-            english_lang_id,
-            remote_service: self.remote_service_executor(),
-            strict_bind_errors: true,
-            ..Default::default()
-        };
+        view_context_config!(
+            config,
+            self,
+            db,
+            executable,
+            tracker,
+            options,
+            Some((r2rml.provider, r2rml.table_provider)),
+        );
 
         execute_prepared(db_ref, vars, prepared, config)
             .await
@@ -892,44 +885,23 @@ impl Fluree {
     ) -> std::result::Result<Vec<crate::Batch>, fluree_db_query::QueryError> {
         let db_ref = db.as_graph_db_ref();
         // Single-graph view: no dataset-level history detection — current state.
-        let prepare_config = PrepareConfig::current(db.binary_store.as_ref());
+        // Single ledger + root policy ⇒ semantic stats rewrites are sound.
+        let allow_semantic_elision = db.policy_enforcer().is_none_or(|p| p.is_root());
+        let prepare_config = PrepareConfig::current_with_semantic_elision(
+            db.binary_store.as_ref(),
+            allow_semantic_elision,
+        );
         let prepared = prepare_execution_with_config(db_ref, executable, &prepare_config).await?;
 
-        let spatial_map = db.binary_store.as_ref().map(|s| s.spatial_provider_map());
-        // Perf guardrail: skip fulltext arena map + `"en"` lang_id resolution
-        // for queries that don't actually call `fulltext(...)`. The setup
-        // cost (HashMap clone over every (graph, predicate, language) arena
-        // plus one lang dict probe) is real on wide ledgers — an unrelated
-        // query shouldn't pay it.
-        let uses_fulltext = executable.uses_fulltext();
-        let fulltext_map = if uses_fulltext {
-            db.binary_store.as_ref().map(|s| s.fulltext_provider_map())
-        } else {
-            None
-        };
-        let english_lang_id = if uses_fulltext {
-            db.binary_store
-                .as_ref()
-                .and_then(|s| s.resolve_lang_id("en"))
-        } else {
-            None
-        };
-
-        let config = ContextConfig {
-            tracker: Some(tracker),
-            cancellation: options.cancellation.clone(),
-            policy_enforcer: db.policy_enforcer().cloned(),
-            r2rml: Some((r2rml.provider, r2rml.table_provider)),
-            binary_store: db.binary_store.clone(),
-            binary_g_id: db.graph_id,
-            dict_novelty: db.dict_novelty.clone(),
-            spatial_providers: spatial_map.as_ref(),
-            fulltext_providers: fulltext_map.as_ref(),
-            english_lang_id,
-            remote_service: self.remote_service_executor(),
-            strict_bind_errors: true,
-            ..Default::default()
-        };
+        view_context_config!(
+            config,
+            self,
+            db,
+            executable,
+            tracker,
+            options,
+            Some((r2rml.provider, r2rml.table_provider)),
+        );
 
         execute_prepared(db_ref, vars, prepared, config).await
     }

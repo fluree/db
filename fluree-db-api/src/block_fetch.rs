@@ -26,7 +26,7 @@
 //! API. Internal metadata (GC records, stats sketches) and graph source
 //! snapshots are rejected before any storage I/O occurs.
 
-use crate::dataset::QueryConnectionOptions;
+use crate::dataset::GovernanceOptions;
 use crate::policy_builder;
 use fluree_db_binary_index::format::leaf::{decode_leaf_dir_v3_with_base, decode_leaf_header_v3};
 use fluree_db_binary_index::read::column_loader::load_leaflet_columns;
@@ -373,7 +373,7 @@ pub async fn apply_policy_filter(
         return Ok((flakes, false));
     }
 
-    let opts = QueryConnectionOptions {
+    let opts = GovernanceOptions {
         identity: identity.map(std::string::ToString::to_string),
         policy_class: policy_class.map(|c| vec![c.to_string()]),
         ..Default::default()
@@ -392,6 +392,18 @@ pub async fn apply_policy_filter(
 
     let enforcer = QueryPolicyEnforcer::new(Arc::new(policy_ctx));
     let tracker = Tracker::disabled();
+
+    // Populate subject class membership (at to_t) before filtering — otherwise
+    // filter_flakes_for_graph reads an empty class cache and every f:onClass
+    // restriction silently drops to default_allow.
+    let mut subjects: Vec<_> = flakes.iter().map(|f| f.s.clone()).collect();
+    subjects.sort();
+    subjects.dedup();
+    let db = fluree_db_core::GraphDbRef::new(snapshot, 0, overlay, to_t);
+    enforcer
+        .populate_class_cache_for_graph(db, &subjects)
+        .await
+        .map_err(|e| BlockFetchError::PolicyFilter(e.to_string()))?;
 
     let filtered = enforcer
         .filter_flakes_for_graph(snapshot, overlay, to_t, &tracker, flakes)

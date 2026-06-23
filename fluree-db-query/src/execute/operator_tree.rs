@@ -2055,7 +2055,8 @@ fn detect_transitive_path_plus_count_all(query: &Query) -> Option<(Ref, Ref, Var
         return None;
     };
 
-    Some((p1, Ref::Sid(pp.predicate.clone()), out_var))
+    // Single-predicate only — an alternation path falls back to the operator.
+    Some((p1, Ref::Sid(pp.single_predicate()?.clone()), out_var))
 }
 
 fn detect_property_path_plus_fixed_subject_count_all(
@@ -2077,7 +2078,7 @@ fn detect_property_path_plus_fixed_subject_count_all(
     let Ref::Var(_o) = &pp.object else {
         return None;
     };
-    Some((pp.predicate.clone(), pp.subject.clone(), out_var))
+    Some((pp.single_predicate()?.clone(), pp.subject.clone(), out_var))
 }
 
 fn detect_union_star_count_all(
@@ -2766,10 +2767,31 @@ fn build_operator_tree_inner(
     if !planning.is_history() {
         if let Some(ref stats_view) = stats {
             if let Some((pred_var, count_var)) = detect_stats_count_by_predicate(query) {
+                // Build the policy-enforced fallback: the same query as a generic
+                // GROUP BY, producing the operator's internal `[pred, count]`
+                // schema (output forced to those two vars; ORDER BY / LIMIT /
+                // OFFSET stripped, since those wrap the stats operator below).
+                // Recurse with stats disabled so this fast path isn't re-entered.
+                // The operator streams from this fallback when a view policy is
+                // active (the whole-index stats counts can't be trusted then).
+                let mut fallback_query = query.clone();
+                fallback_query.output = QueryOutput::select_all(vec![pred_var, count_var]);
+                fallback_query.ordering = Vec::new();
+                fallback_query.order_binds = Vec::new();
+                fallback_query.limit = None;
+                fallback_query.offset = None;
+                let fallback = build_operator_tree_inner(
+                    &fallback_query,
+                    None,
+                    enable_fused_fast_paths,
+                    planning,
+                )?;
+
                 let mut operator: BoxedOperator = Box::new(StatsCountByPredicateOperator::new(
                     Arc::clone(stats_view),
                     pred_var,
                     count_var,
+                    Some(fallback),
                 ));
 
                 // ORDER BY (on predicate or count)
@@ -2874,6 +2896,7 @@ fn build_operator_tree_inner(
         query.limit,
         detect_partitioned_group_by(query),
         variable_deps.as_ref(),
+        planning,
     )
 }
 
@@ -2903,6 +2926,7 @@ pub(crate) fn apply_solution_modifiers(
     limit: Option<usize>,
     partitioned: bool,
     variable_deps: Option<&VariableDeps>,
+    planning: &PlanningContext,
 ) -> Result<BoxedOperator> {
     // Flatten the grouping phase's data for consumption below. The variant
     // distinction has already done its structural work at the IR boundary; the
@@ -3024,10 +3048,16 @@ pub(crate) fn apply_solution_modifiers(
         // The streaming GroupAggregateOperator only outputs GROUP BY keys + aggregate outputs.
         // If the SELECT projects any *grouped* variables (non-key, non-aggregate),
         // we must use the traditional GroupByOperator path so those vars become
-        // `Binding::Grouped(Vec<Binding>)` and remain selectable.
+        // `Binding::Grouped(Vec<Binding>)` and remain selectable. Post-aggregation
+        // bind outputs (e.g. `(count(a)+count(b)) AS total`) are NOT grouped
+        // passthroughs — they are computed by a downstream BindOperator — so they
+        // must not force the traditional path (which would drop the row when the
+        // bind's aggregate inputs aren't themselves projected).
         let select_needs_grouped_vars = select_vars.is_some_and(|vars| {
             vars.iter().any(|v| {
-                !group_by_vec.contains(v) && !aggregates_vec.iter().any(|a| a.output_var == *v)
+                !group_by_vec.contains(v)
+                    && !aggregates_vec.iter().any(|a| a.output_var == *v)
+                    && !post_binds_vec.iter().any(|(out, _)| out == v)
             })
         });
 
@@ -3096,6 +3126,7 @@ pub(crate) fn apply_solution_modifiers(
         for (i, (var, expr)) in post_binds_vec.iter().enumerate() {
             operator = Box::new(
                 crate::bind::BindOperator::new(operator, *var, expr.clone(), vec![])
+                    .with_planning(*planning)
                     .with_out_schema(
                         variable_deps
                             .as_ref()
@@ -3141,12 +3172,10 @@ pub(crate) fn apply_solution_modifiers(
             }
         }
         for (var, expr) in order_binds {
-            operator = Box::new(crate::bind::BindOperator::new(
-                operator,
-                *var,
-                expr.clone(),
-                vec![],
-            ));
+            operator = Box::new(
+                crate::bind::BindOperator::new(operator, *var, expr.clone(), vec![])
+                    .with_planning(*planning),
+            );
         }
     }
 
@@ -3340,6 +3369,7 @@ mod tests {
             limit: None,
             offset: None,
             post_values: None,
+            include_system_facts: false,
         }
     }
 
@@ -3364,6 +3394,7 @@ mod tests {
                 Term::Var(o),
             ))],
             reasoning: ReasoningConfig::default(),
+            include_system_facts: false,
             grouping: Grouping::assemble(
                 vec![p],
                 vec![AggregateSpec {
@@ -3438,6 +3469,7 @@ mod tests {
             limit: Some(10),
             offset: None,
             post_values: None,
+            include_system_facts: false,
         };
 
         let spec =
@@ -3467,6 +3499,7 @@ mod tests {
             limit: None,
             offset: None,
             post_values: None,
+            include_system_facts: false,
         };
 
         let result = build_operator_tree(
@@ -3494,6 +3527,7 @@ mod tests {
             limit: None,
             offset: None,
             post_values: None,
+            include_system_facts: false,
         };
 
         let result = build_operator_tree(
@@ -3569,6 +3603,7 @@ mod tests {
             limit: None,
             offset: None,
             post_values: None,
+            include_system_facts: false,
         };
         let reversed = Query {
             context: ParsedContext::default(),
@@ -3593,6 +3628,7 @@ mod tests {
             limit: None,
             offset: None,
             post_values: None,
+            include_system_facts: false,
         };
         assert_eq!(
             detect_exists_join_count_distinct_object(&counted_first),
@@ -3628,6 +3664,7 @@ mod tests {
                 },
             ],
             reasoning: ReasoningConfig::default(),
+            include_system_facts: false,
             grouping: Some(Grouping::Implicit {
                 aggregation: Aggregation {
                     aggregates: fluree_db_core::NonEmpty::try_from_vec(vec![
@@ -3690,6 +3727,7 @@ mod tests {
             output,
             patterns,
             reasoning: ReasoningConfig::default(),
+            include_system_facts: false,
             grouping: None,
             ordering,
             order_binds: Vec::new(),

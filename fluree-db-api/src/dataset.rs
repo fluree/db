@@ -31,10 +31,7 @@
 //! let result = fluree.query_dataset(&dataset, &query).await?;
 //! ```
 
-use fluree_db_core::{
-    ledger_id::{split_time_travel_suffix, LedgerIdTimeSpec},
-    TrackingOptions,
-};
+use fluree_db_core::ledger_id::{split_time_travel_suffix, LedgerIdTimeSpec};
 use fluree_db_sparql::ast::{DatasetClause as SparqlDatasetClause, IriValue};
 
 /// Convert a SPARQL IriValue to a string for use as a ledger identifier.
@@ -287,9 +284,9 @@ pub struct GraphSource {
 
 /// Per-source policy override options
 ///
-/// A subset of `QueryConnectionOptions` that can be applied per-source.
+/// A subset of `GovernanceOptions` that can be applied per-source.
 /// When present on a `GraphSource`, this policy takes precedence over any
-/// global policy specified in `QueryConnectionOptions`.
+/// global policy specified in `GovernanceOptions`.
 #[derive(Debug, Clone, Default)]
 pub struct SourcePolicyOverride {
     pub identity: Option<String>,
@@ -311,18 +308,17 @@ impl SourcePolicyOverride {
             || self.default_allow.is_some()
     }
 
-    /// Convert to `QueryConnectionOptions` for policy wrapping.
+    /// Convert to `GovernanceOptions` for policy wrapping.
     ///
-    /// This creates a minimal `QueryConnectionOptions` with only the policy
+    /// This creates a minimal `GovernanceOptions` with only the policy
     /// fields from this override, suitable for passing to `wrap_policy()`.
-    pub fn to_query_connection_options(&self) -> QueryConnectionOptions {
-        QueryConnectionOptions {
+    pub fn to_query_connection_options(&self) -> GovernanceOptions {
+        GovernanceOptions {
             identity: self.identity.clone(),
             policy_class: self.policy_class.clone(),
             policy: self.policy.clone(),
             policy_values: self.policy_values.clone(),
             default_allow: self.default_allow.unwrap_or(false),
-            tracking: TrackingOptions::default(),
         }
     }
 }
@@ -659,10 +655,10 @@ impl DatasetSpec {
     /// - Both `fromNamed` (object) and `from-named` (array, legacy) are accepted.
     pub fn from_query_json(
         json: &JsonValue,
-    ) -> Result<(Self, QueryConnectionOptions), DatasetParseError> {
+    ) -> Result<(Self, GovernanceOptions), DatasetParseError> {
         let obj = match json.as_object() {
             Some(o) => o,
-            None => return Ok((Self::new(), QueryConnectionOptions::default())),
+            None => return Ok((Self::new(), GovernanceOptions::default())),
         };
 
         let opts_obj = obj.get("opts").and_then(|v| v.as_object());
@@ -740,7 +736,7 @@ impl DatasetSpec {
         // Validate alias uniqueness across all sources
         validate_alias_uniqueness(&spec)?;
 
-        let qc_opts = QueryConnectionOptions::from_json(json)?;
+        let qc_opts = GovernanceOptions::from_json(json)?;
         Ok((spec, qc_opts))
     }
 }
@@ -753,20 +749,20 @@ impl DatasetSpec {
 /// - `policy`
 /// - `policy-values`
 /// - `default-allow`
-/// - `meta` (tracking enablement: bool or object)
-/// - `max-fuel` (fuel limit, also enables fuel tracking)
+///
+/// Tracking-related opts keys (`meta`, `max-fuel`) live on a separate
+/// [`TrackingOptions`] path; they are parsed and propagated by the
+/// transaction route, not by this type.
 #[derive(Debug, Clone, Default)]
-pub struct QueryConnectionOptions {
+pub struct GovernanceOptions {
     pub identity: Option<String>,
     pub policy_class: Option<Vec<String>>,
     pub policy: Option<JsonValue>,
     pub policy_values: Option<HashMap<String, JsonValue>>,
     pub default_allow: bool,
-    /// Tracking options parsed from `meta` and `max-fuel` in opts
-    pub tracking: TrackingOptions,
 }
 
-impl QueryConnectionOptions {
+impl GovernanceOptions {
     pub fn from_json(query: &JsonValue) -> Result<Self, DatasetParseError> {
         let obj = match query.as_object() {
             Some(o) => o,
@@ -783,9 +779,6 @@ impl QueryConnectionOptions {
                 )))
             }
         };
-
-        // Parse tracking options from opts
-        let tracking = TrackingOptions::from_opts_value(opts_val);
 
         let identity = opts
             .get("identity")
@@ -852,7 +845,6 @@ impl QueryConnectionOptions {
             policy,
             policy_values,
             default_allow,
-            tracking,
         })
     }
 

@@ -81,6 +81,30 @@ SELECT ?name ?salary WHERE {
 
 Now Alice sees both names, with `?salary` unbound — exactly the behavior an application expects when a property is suppressed by policy.
 
+## Enforcement across query operations
+
+Filtering happens wherever the plan reads flakes, so every query operation enforces the same per-flake policy — not just basic triple patterns:
+
+- **Triple patterns / BGPs** — the common case shown above; each matched flake is checked.
+- **OPTIONAL, joins, aggregates, `COUNT`** — these operate over already-filtered flakes, so a hidden flake is absent from joins and excluded from counts. `SELECT (COUNT(?o) ...) WHERE { ?s ex:salary ?o }` counts only the salary flakes the identity may view.
+- **Property paths** (`?x :knows+ ?y`, `:reportsTo*`, sequence/alternation) — traversal only follows edges the identity can view. A hidden `:knows` flake is not walked, so nodes reachable *only* through hidden edges do not appear in the result. You traverse exactly the graph you can see.
+- **Full-text and vector search** (embedded indexes) — a search hit is returned only if the identity can view the indexed content that produced the match. If the policy hides the indexed property's flake for a subject, that subject is dropped from the search results — even when selecting only the hit id/score with no constraining pattern. (This applies to Fluree's embedded search indexes; an external/dedicated search service enforces its own access controls.)
+
+In every case the rule is the same: the engine never emits — or traverses, or counts, or returns as a search hit — a flake the identity is not allowed to see.
+
+## Reasoning (RDFS / OWL / datalog)
+
+Reasoning and view policy compose, but the contract is specific:
+
+- **OWL 2 QL** rewrites the query and runs it through the normal scan path under your identity, so it is filtered exactly like any other query.
+- **OWL 2 RL and datalog** materialize *derived* facts into the query's overlay. Those derived facts are filtered by the **same per-flake view policy as base data** — a derived flake you may not view is dropped just like a stored one.
+
+What the engine does **not** do is trace a derived fact's *provenance*: a derived flake is judged by its own `(subject, predicate, object)`, not by the base facts it was computed from. So if a rule or ontology axiom re-expresses hidden data under a different, viewable predicate — e.g. `ex:ssn rdfs:subPropertyOf ex:identifier`, or a rule that writes `ex:isHighEarner` from a hidden `ex:salary` — the derived value can surface even though the source is hidden.
+
+**So when you enable reasoning under a non-root policy, your policy must cover the derived properties and classes.** Either deny them explicitly, or run with `default-allow: false` so any predicate you did not explicitly allow — including reasoning-introduced ones — is hidden by default. Inline per-query ontologies (`f:schemaSource`) are subject to the same rule: any class/property they entail must be covered by your policy.
+
+Query-time rule injection (the query's `rules` field) is **admin-only**: under a non-root view policy, caller-supplied datalog rules are stripped before execution, because a rule with a viewable head could launder hidden data the policy author never anticipated. Database-stored rules (`f:rule`) and OWL/RDFS reasoning are administrator-controlled and continue to apply.
+
 ## Targeting patterns
 
 ### Property-level (`f:onProperty`)
@@ -201,7 +225,8 @@ Two phases: load the policy set once per request; apply it to each touched flake
 - **Target policies whenever possible.** A policy with `f:onProperty` only runs against flakes whose predicate matches. Default policies (no targeting) run against every flake.
 - **Keep `f:query` cheap.** It runs once per flake-target. Lean on identity-side properties already loaded (`@type`, `f:policyClass`, role flags) rather than deep traversals.
 - **Avoid deep recursion in `f:query`.** Each level of indirection multiplies the per-flake cost.
-- **Required policies short-circuit.** If a required policy denies, no further required policies are checked for that flake.
+- **Required policies short-circuit on the first failed gate.** Required policies are AND gates — every one must grant. As soon as any required gate fails (an explicit deny, or an `f:query` returning no rows), the flake is denied and the remaining required policies are skipped.
+- **Targeted policies keep fast paths fast.** Cardinality and scalar-aggregate fast paths (e.g. a bare `COUNT` over a single predicate) still answer directly from index metadata when the active policy provably cannot restrict the scanned predicate — a policy that only targets `ex:salary` does not slow a `COUNT` over `schema:name`. A policy that *could* apply to the scanned predicate (including any default/subject-targeted policy) forces the per-flake filtered scan instead. This is another reason to prefer targeted policies.
 
 For complex deployments, the [explain plan](../query/explain.md) shows whether a query is dominated by policy filtering and which policies contribute.
 

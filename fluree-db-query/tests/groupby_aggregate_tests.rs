@@ -90,6 +90,7 @@ fn make_query(select: Vec<VarId>, patterns: Vec<Pattern>) -> Query {
         offset: None,
         reasoning: ReasoningConfig::default(),
         post_values: None,
+        include_system_facts: false,
     }
 }
 

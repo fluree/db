@@ -208,7 +208,7 @@ future micro-bench wants to exercise `fluree-db-indexer`,
 | `import` | bulk Turtle / N-Quads / JSON-LD ingest | `fluree-db-api/benches/import_bulk.rs` |
 | `transact` | stage + commit | `fluree-db-api/benches/transact_commit.rs` |
 | `reindex` | full reindex; incremental | `fluree-db-api/benches/reindex_full.rs`, `fluree-db-api/benches/reindex_incremental.rs` |
-| `query_hot` | BSBM-shape SPARQL on warm cache | `fluree-db-api/benches/query_hot_bsbm.rs` |
+| `query_hot` | BSBM-shape SPARQL on warm cache | `fluree-db-api/benches/query_hot_bsbm.rs` (Explore Q3/Q5/Q9), `fluree-db-api/benches/query_hot_bsbm_bi.rs` (BI-F2 bowtie / seed tie-break) |
 | `query_cold` | reload + first-query latency | `fluree-db-api/benches/query_cold_reload.rs` |
 | `novelty` | replay, catch-up, bulk-apply | `fluree-db-api/benches/novelty_replay.rs` |
 | `vector_math` | SIMD vs scalar math micro-benches | `fluree-db-query/benches/vector_math.rs` |

@@ -227,6 +227,29 @@ fn write_value(out: &mut String, binding: &Binding, compactor: &IriCompactor) ->
             }
             out.push(']');
         }
+        // A path renders as an array of its node IRIs (start → end).
+        Binding::Path(nodes) => {
+            out.push('[');
+            for (i, sid) in nodes.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                push_json_string(out, &compactor.compact_id_sid(sid)?);
+            }
+            out.push(']');
+        }
+        // A list (collect / list literal / list function) renders as a JSON
+        // array of its elements.
+        Binding::List(values) => {
+            out.push('[');
+            for (i, v) in values.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                write_value(out, v, compactor)?;
+            }
+            out.push(']');
+        }
     }
     Ok(())
 }
@@ -527,6 +550,24 @@ pub(crate) fn format_binding(binding: &Binding, compactor: &IriCompactor) -> Res
                 .collect();
             Ok(JsonValue::Array(arr?))
         }
+
+        // A path renders as an array of its node IRIs (start → end).
+        Binding::Path(nodes) => {
+            let arr: Result<Vec<_>> = nodes
+                .iter()
+                .map(|sid| compactor.compact_id_sid(sid).map(JsonValue::String))
+                .collect();
+            Ok(JsonValue::Array(arr?))
+        }
+
+        // A list renders as a JSON array of its elements.
+        Binding::List(values) => {
+            let arr: Result<Vec<_>> = values
+                .iter()
+                .map(|v| format_binding(v, compactor))
+                .collect();
+            Ok(JsonValue::Array(arr?))
+        }
     }
 }
 
@@ -591,9 +632,10 @@ fn format_row_wildcard(
 
             let var_name = vars.name(var_id);
 
-            // Skip internal variables (e.g. ?__pp0, ?__s0, ?__n0) from wildcard output.
-            // The ?__ prefix is reserved for internal use.
-            if var_name.starts_with("?__") {
+            // Skip internal / non-distinguished variables (planner synthetics
+            // `?__*`, annotation-reifier synthetics `?#*`, SPARQL blank-node
+            // vars `_:*` per §4.1.4). See `format::is_internal_var_name`.
+            if super::is_internal_var_name(var_name) {
                 continue;
             }
 

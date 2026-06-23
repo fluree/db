@@ -3,6 +3,7 @@
 
 pub mod branch;
 pub mod column_block;
+pub mod expanded_cas;
 pub mod history_sidecar;
 pub mod index_root;
 pub mod leaf;

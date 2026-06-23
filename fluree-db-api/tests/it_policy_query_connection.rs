@@ -8,7 +8,7 @@ mod support;
 
 use fluree_db_api::FlureeBuilder;
 use serde_json::json;
-use support::{assert_index_defaults, normalize_rows, seed_people_with_ssn};
+use support::{assert_index_defaults, genesis_ledger, normalize_rows, seed_people_with_ssn};
 
 #[tokio::test]
 async fn policy_inline_denies_restricted_property_in_direct_select() {
@@ -252,4 +252,77 @@ async fn policy_per_source_override_denies_when_global_allows() {
 
     // Per-source policy denies schema:name, so query returns empty
     assert_eq!(jsonld, json!([]));
+}
+
+/// V3 regression (hydration): an `f:onClass` view policy must be honored when a
+/// subject is reached **only** through hydration (a direct-id select or
+/// nested-ref expansion), not a WHERE scan. Such subjects are never scanned, so
+/// the policy class cache is empty unless hydration populates it itself — before
+/// the fix the onClass restriction silently dropped to `default_allow` and the
+/// subject's data leaked.
+#[tokio::test]
+async fn policy_onclass_denies_hydration_only_subject() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "policy/onclass-hydration:main";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+    let seed = json!({
+        "@context": {"ex": "http://example.org/ns/", "schema": "http://schema.org/"},
+        "@graph": [
+            {"@id": "ex:alice", "@type": "ex:User",   "schema:name": "Alice"},
+            {"@id": "ex:drBob", "@type": "ex:Doctor", "schema:name": "Roberta", "ex:secret": "TOPSECRET"}
+        ]
+    });
+    fluree.insert(ledger0, &seed).await.unwrap();
+
+    // Hide every flake of Doctor instances. f:onClass needs the subject's class
+    // membership, which a hydration-only fetch must resolve itself.
+    let policy = json!([{
+        "@id": "ex:doctorHidden",
+        "f:required": true,
+        "f:onClass": [{"@id": "http://example.org/ns/Doctor"}],
+        "f:action": "f:view",
+        "f:allow": false
+    }]);
+
+    // Direct-id select of the Doctor — fetched purely via hydration, never scanned.
+    let attack = json!({
+        "@context": {"ex": "http://example.org/ns/", "schema": "http://schema.org/"},
+        "from": ledger_id,
+        "opts": {"policy": policy.clone(), "default-allow": true},
+        "select": {"ex:drBob": ["*"]}
+    });
+    let attack_result = fluree
+        .query_connection_tracked(&attack)
+        .await
+        .expect("attack query_connection_tracked");
+    let attack_json = attack_result.result.to_string();
+    assert!(
+        !attack_json.contains("TOPSECRET"),
+        "Doctor's ex:secret leaked through hydration-only fetch: {}",
+        attack_result.result
+    );
+    assert!(
+        !attack_json.contains("Roberta"),
+        "Doctor's name leaked through hydration-only fetch: {}",
+        attack_result.result
+    );
+
+    // Control: a non-Doctor subject stays fully visible via the same path.
+    let control = json!({
+        "@context": {"ex": "http://example.org/ns/", "schema": "http://schema.org/"},
+        "from": ledger_id,
+        "opts": {"policy": policy, "default-allow": true},
+        "select": {"ex:alice": ["*"]}
+    });
+    let control_result = fluree
+        .query_connection_tracked(&control)
+        .await
+        .expect("control query_connection_tracked");
+    assert!(
+        control_result.result.to_string().contains("Alice"),
+        "non-Doctor subject must remain visible: {}",
+        control_result.result
+    );
 }

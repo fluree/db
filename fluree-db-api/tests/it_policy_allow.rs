@@ -676,7 +676,7 @@ async fn policy_onclass_and_onproperty_combined() {
 #[cfg(feature = "native")]
 #[tokio::test]
 async fn policy_onclass_applies_to_novelty_properties_without_type_restated() {
-    use fluree_db_api::dataset::QueryConnectionOptions;
+    use fluree_db_api::dataset::GovernanceOptions;
     use fluree_db_api::{build_policy_context, CommitOpts, GraphDb, IndexConfig, TxnOpts};
     use std::sync::Arc;
 
@@ -784,7 +784,7 @@ async fn policy_onclass_applies_to_novelty_properties_without_type_restated() {
                 }
             ]);
 
-            let opts = QueryConnectionOptions {
+            let opts = GovernanceOptions {
                 policy: Some(policy),
                 default_allow: true,
                 ..Default::default()

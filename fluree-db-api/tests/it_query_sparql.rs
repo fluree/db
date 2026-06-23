@@ -2627,24 +2627,25 @@ async fn sparql_property_path_alternative_duplicate_semantics() {
 }
 
 #[tokio::test]
-async fn sparql_property_path_nested_alternative_under_transitive_errors() {
+async fn sparql_property_path_alternation_under_transitive() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger = sparql_seed_knows_chain(&fluree, "sparql/path-alt-trans-err:main").await;
+    let ledger = sparql_seed_knows_chain(&fluree, "sparql/path-alt-trans:main").await;
 
-    // (ex:knows|ex:likes)+ — alternative inside transitive is not supported
+    // `(ex:knows|ex:likes)+` — an alternation inside a transitive path follows
+    // an edge of either predicate per hop. Here only `knows` edges exist
+    // (a→b→{c,d}, d→e), so the closure from ex:a is {b, c, d, e}.
     let query = "\
         PREFIX ex: <http://example.org/>
         SELECT ?o WHERE { ex:a (ex:knows|ex:likes)+ ?o }";
 
-    let result = support::query_sparql(&fluree, &ledger, query).await;
-    assert!(
-        result.is_err(),
-        "Nested alternative under transitive should error"
-    );
-    let msg = format!("{}", result.unwrap_err());
-    assert!(
-        msg.contains("simple predicate IRI"),
-        "Error should mention 'simple predicate IRI', got: {msg}"
+    let result = support::query_sparql(&fluree, &ledger, query)
+        .await
+        .expect("alternation under transitive now supported");
+    let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    assert_eq!(
+        normalize_rows(&jsonld),
+        normalize_rows(&json!([["ex:b"], ["ex:c"], ["ex:d"], ["ex:e"]])),
+        "(knows|likes)+ closure over the knows chain: {jsonld}"
     );
 }
 
@@ -3831,6 +3832,113 @@ async fn sparql_sum_avg_over_xsd_decimal_repro() {
     );
 }
 
+async fn seed_receipt_line_items(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
+    let ledger0 = genesis_ledger(fluree, ledger_id);
+
+    let insert = json!({
+        "@context": {
+            "sup": "http://Magna/SupplyChain#",
+            "xsd": "http://www.w3.org/2001/XMLSchema#"
+        },
+        "@graph": [
+            {
+                "@id": "sup:r1",
+                "@type": "sup:ReceiptLineItem",
+                "sup:forEngcPart": {"@id": "sup:partA"},
+                "sup:receiptUnitPrice": 10
+            },
+            {
+                "@id": "sup:r2",
+                "@type": "sup:ReceiptLineItem",
+                "sup:forEngcPart": {"@id": "sup:partA"},
+                "sup:receiptUnitPrice": 14
+            },
+            {
+                "@id": "sup:r3",
+                "@type": "sup:ReceiptLineItem",
+                "sup:forEngcPart": {"@id": "sup:partA"},
+                "sup:receiptUnitPrice": 12
+            },
+            {
+                "@id": "sup:r4",
+                "@type": "sup:ReceiptLineItem",
+                "sup:forEngcPart": {"@id": "sup:partB"},
+                "sup:receiptUnitPrice": 5
+            },
+            {
+                "@id": "sup:r5",
+                "@type": "sup:ReceiptLineItem",
+                "sup:forEngcPart": {"@id": "sup:partB"},
+                "sup:receiptUnitPrice": 9
+            }
+        ]
+    });
+
+    fluree
+        .insert(ledger0, &insert)
+        .await
+        .expect("seed receipt line items")
+        .ledger
+}
+
+#[tokio::test]
+async fn sparql_arithmetic_over_min_max_in_select_repro() {
+    // Repro for reported bug: SELECT with arithmetic over MAX(?u) - MIN(?u)
+    // grouped by ?part fails or returns wrong rows.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_receipt_line_items(&fluree, "agg:spread").await;
+
+    let query = r"
+        PREFIX sup: <http://Magna/SupplyChain#>
+        SELECT ?part ((MAX(?u) - MIN(?u)) AS ?spread)
+        WHERE { ?r a sup:ReceiptLineItem ; sup:forEngcPart ?part ; sup:receiptUnitPrice ?u }
+        GROUP BY ?part
+        LIMIT 5
+    ";
+
+    let result = support::query_sparql(&fluree, &ledger, query)
+        .await
+        .expect("MAX - MIN over grouped values");
+    let sparql_json = result
+        .to_sparql_json(&ledger.snapshot)
+        .expect("to_sparql_json");
+    let bindings = normalize_sparql_bindings(&sparql_json);
+    assert_eq!(bindings.len(), 2, "expected one row per part");
+
+    // partA: values 10, 14, 12 → spread 4
+    // partB: values 5, 9       → spread 4
+    let mut spreads: Vec<&str> = bindings
+        .iter()
+        .map(|b| b["spread"]["value"].as_str().expect("spread bound"))
+        .collect();
+    spreads.sort();
+    assert_eq!(spreads, vec!["4", "4"]);
+}
+
+#[tokio::test]
+async fn sparql_bare_min_max_in_select_works() {
+    // Control for the arithmetic-over-aggregates repro: bare MAX/MIN columns
+    // should succeed.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_receipt_line_items(&fluree, "agg:bare-minmax").await;
+
+    let query = r"
+        PREFIX sup: <http://Magna/SupplyChain#>
+        SELECT ?part (MAX(?u) AS ?hi) (MIN(?u) AS ?lo)
+        WHERE { ?r a sup:ReceiptLineItem ; sup:forEngcPart ?part ; sup:receiptUnitPrice ?u }
+        GROUP BY ?part
+    ";
+
+    let result = support::query_sparql(&fluree, &ledger, query)
+        .await
+        .expect("bare MAX/MIN per group");
+    let sparql_json = result
+        .to_sparql_json(&ledger.snapshot)
+        .expect("to_sparql_json");
+    let bindings = normalize_sparql_bindings(&sparql_json);
+    assert_eq!(bindings.len(), 2);
+}
+
 #[tokio::test]
 async fn sparql_ucase_preserves_language_tag() {
     // W3C: UCASE must preserve language tags from the input.
@@ -4864,5 +4972,154 @@ async fn sparql_group_by_expression_via_bind_workaround() {
     assert_eq!(
         normalize_rows(&jsonld),
         normalize_rows(&json!([["usd", 5], ["cad", 3], ["eur", 2]]))
+    );
+}
+
+/// `ORDER BY (EXISTS { ... })` routes the EXISTS through an order-expression
+/// BIND built in `apply_solution_modifiers` (the `order_binds` site). That
+/// `BindOperator` resolves EXISTS per row, so this exercises the projected/
+/// ORDER-BY EXISTS path — distinct from a WHERE-clause `FILTER EXISTS`. It also
+/// pins the `with_planning` wiring through `apply_solution_modifiers`: the BIND
+/// must carry the query's temporal context, not default to current-state.
+#[tokio::test]
+async fn sparql_order_by_exists_expression_sorts_by_correlated_existence() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "exists:order-by");
+
+    // alice and dave know someone; bob and carol know no one.
+    let insert = json!({
+        "@context": { "ex": "http://example.org/ns/" },
+        "@graph": [
+            {"@id": "ex:alice", "@type": "ex:Person", "ex:knows": {"@id": "ex:bob"}},
+            {"@id": "ex:bob",   "@type": "ex:Person"},
+            {"@id": "ex:carol", "@type": "ex:Person"},
+            {"@id": "ex:dave",  "@type": "ex:Person", "ex:knows": {"@id": "ex:carol"}}
+        ]
+    });
+    let ledger = fluree
+        .insert(ledger0, &insert)
+        .await
+        .expect("insert people");
+
+    // ORDER BY the EXISTS boolean (false sorts before true), then by ?s.
+    // Expect the two friendless people first, then the two who know someone.
+    let query = r"
+        PREFIX ex: <http://example.org/ns/>
+        SELECT ?s WHERE {
+            ?s a ex:Person .
+        }
+        ORDER BY (EXISTS { ?s ex:knows ?o }) ?s
+    ";
+
+    let result = support::query_sparql(&fluree, &ledger.ledger, query)
+        .await
+        .expect("ORDER BY EXISTS query should succeed");
+    let jsonld = result
+        .to_jsonld(&ledger.ledger.snapshot)
+        .expect("to_jsonld");
+
+    assert_eq!(
+        normalize_rows(&jsonld),
+        normalize_rows(&json!([
+            ["ex:bob"],
+            ["ex:carol"],
+            ["ex:alice"],
+            ["ex:dave"]
+        ])),
+        "friendless subjects (EXISTS=false) must sort before those who know someone"
+    );
+}
+
+#[tokio::test]
+async fn sparql_alternation_transitive_path() {
+    // `(ex:a|ex:b)*` — an alternation inside a transitive path. The closure
+    // follows an edge of EITHER predicate per hop. Chain mixing both:
+    //   n0 -a-> n1 -b-> n2 -a-> n3
+    // From n0, `(a|b)*` reaches n0 (zero hops), n1, n2, n3. Neither `a*` nor
+    // `b*` alone reaches past the first heterogeneous hop.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/sparql:alt-transitive");
+    let insert = json!({
+        "@context": {"ex":"http://example.org/"},
+        "@graph": [
+            {"@id":"ex:n0","ex:a":{"@id":"ex:n1"}},
+            {"@id":"ex:n1","ex:b":{"@id":"ex:n2"}},
+            {"@id":"ex:n2","ex:a":{"@id":"ex:n3"}},
+        ]
+    });
+    let ledger = fluree.insert(ledger0, &insert).await.unwrap().ledger;
+
+    let query = r"
+        PREFIX ex: <http://example.org/>
+        SELECT ?x WHERE { ex:n0 (ex:a|ex:b)* ?x }
+    ";
+    let result = support::query_sparql(&fluree, &ledger, query)
+        .await
+        .expect("alternation-transitive sparql");
+    let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    assert_eq!(
+        normalize_rows(&jsonld),
+        normalize_rows(&json!([["ex:n0"], ["ex:n1"], ["ex:n2"], ["ex:n3"]])),
+        "closure follows either predicate per hop: {jsonld}"
+    );
+
+    // `ex:a*` alone stops at n1 (the n1->n2 hop is ex:b).
+    let single = r"
+        PREFIX ex: <http://example.org/>
+        SELECT ?x WHERE { ex:n0 ex:a* ?x }
+    ";
+    let r2 = support::query_sparql(&fluree, &ledger, single)
+        .await
+        .expect("single-predicate star");
+    let j2 = r2.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    assert_eq!(
+        normalize_rows(&j2),
+        normalize_rows(&json!([["ex:n0"], ["ex:n1"]])),
+        "single predicate stops at the heterogeneous hop: {j2}"
+    );
+}
+
+#[tokio::test]
+async fn sparql_both_bound_path_reachability() {
+    // `:a :p+ :c` with BOTH endpoints bound is a reachability test (W3C pp36
+    // shape). With a sibling variable it yields one row iff reachable, none if
+    // not. Chain a->b->c via ex:p.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/sparql:both-bound");
+    let insert = json!({
+        "@context": {"ex":"http://example.org/"},
+        "@graph": [
+            {"@id":"ex:a","ex:p":{"@id":"ex:b"},"ex:tag":"A"},
+            {"@id":"ex:b","ex:p":{"@id":"ex:c"}},
+            {"@id":"ex:z","ex:tag":"Z"},
+        ]
+    });
+    let ledger = fluree.insert(ledger0, &insert).await.unwrap().ledger;
+
+    // Reachable a -> c: one row (the sibling tag binds).
+    let q1 = r"PREFIX ex: <http://example.org/>
+        SELECT ?t WHERE { ex:a ex:p+ ex:c . ex:a ex:tag ?t }";
+    let r1 = support::query_sparql(&fluree, &ledger, q1)
+        .await
+        .expect("reachable");
+    let j1 = r1.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    assert_eq!(
+        normalize_rows(&j1),
+        normalize_rows(&json!([["A"]])),
+        "a reaches c: {j1}"
+    );
+
+    // Not reachable a -> z: zero rows.
+    let q2 = r"PREFIX ex: <http://example.org/>
+        SELECT ?t WHERE { ex:a ex:p+ ex:z . ex:a ex:tag ?t }";
+    let r2 = support::query_sparql(&fluree, &ledger, q2)
+        .await
+        .expect("unreachable");
+    let j2 = r2.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    assert_eq!(
+        normalize_rows(&j2),
+        normalize_rows(&json!([])),
+        "a cannot reach z: {j2}"
     );
 }

@@ -334,6 +334,19 @@ impl<'a> HashJoinPlanner<'a> {
         }
     }
 
+    /// Seed the running driving estimate from the block's incoming LEFT operator
+    /// (e.g. a `SubqueryOperator` producing `WITH DISTINCT friend`). Without this
+    /// the first probe in the block is costed against `driving_est = 1` — so a
+    /// large object predicate trips `scan-ratio-too-high` and the hash join is
+    /// wrongly rejected, even though the left side produces hundreds of rows.
+    /// `None` (left side has no estimate) leaves the default 1.0.
+    pub(crate) fn with_left_estimate(mut self, left_est: Option<usize>) -> Self {
+        if let Some(n) = left_est {
+            self.driving_est = (n as f64).max(1.0);
+        }
+        self
+    }
+
     /// Advance the running driving cardinality past one pattern. Call once per
     /// pattern, in chain order, BEFORE building its operator. Snapshots the product
     /// of the patterns to the LEFT of `tp` (this becomes `step_est`, the size the
@@ -1100,6 +1113,33 @@ mod tests {
         // scattered OPST object seeks. A single predicate scan is cheaper and allows
         // the outer LIMIT to stop after the first output batch.
         assert!(hash_join_cost_wins(Some(136_131), Some(69_885.0)));
+    }
+
+    #[test]
+    fn producer_seed_clears_scan_ratio_cap() {
+        // Coupling guard: `planner::DISTINCT_SUBQUERY_PRODUCER_SELECTIVITY` (the
+        // estimate handed to a downstream object→subject hash join when an
+        // anchored `WITH DISTINCT` producer drives it) is load-bearing precisely
+        // because it must clear this module's scan-ratio cap. Concretely the seed
+        // must keep a probe of `seed × HASH_JOIN_MAX_SCAN_RATIO` rows within
+        // budget — otherwise the hash join the producer ordering exists to unlock
+        // is re-rejected as scan-ratio-too-high.
+        let seed = crate::planner::DISTINCT_SUBQUERY_PRODUCER_SELECTIVITY;
+        // A probe sized between a too-small seed's budget (100 × cap = 102,400)
+        // and the tuned seed's budget (500 × cap = 512,000): accepted at the
+        // tuned seed, rejected if the seed shrinks to 100.
+        let probe = 300_000_u64;
+        assert!(
+            hash_join_cost_wins(Some(probe), Some(seed)),
+            "seed {seed} must keep a {probe}-row probe within the scan-ratio budget \
+             (seed × {HASH_JOIN_MAX_SCAN_RATIO}); lower either constant and this fails"
+        );
+        // Demonstrate the coupling is real: a seed of 100 (the value the planner
+        // doc warns against) re-rejects the same probe.
+        assert!(
+            !hash_join_cost_wins(Some(probe), Some(100.0)),
+            "a 100-row seed must re-reject the probe — proving the tuned seed is load-bearing"
+        );
     }
 
     #[test]

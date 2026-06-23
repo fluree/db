@@ -1,0 +1,1958 @@
+//! Monolithic consensus implementation.
+//!
+//! A single integrated unit handles receiving, ordering, and executing every
+//! transaction. No replication, no quorum — the local execution stream *is*
+//! the agreement. Suitable for development, testing, and deployments that
+//! do not need cross-node coordination.
+
+use crate::{
+    CommitId, Committer, IdempotencyKey, MergeReceipt, MergeRequest, OperationReceipt, PushReceipt,
+    PushRequest, RebaseReceipt, RebaseRequest, RevertReceipt, RevertRequest, RevertSelection,
+    SubmissionError, SubmissionLookup, SubmissionState, TransactionBody, TransactionReceipt,
+    TransactionRequest,
+};
+use async_trait::async_trait;
+use dashmap::DashMap;
+use fluree_db_api::{
+    ApiError, Base64Bytes, CommitOpts, CommitReceipt, CommitRef, Fluree, GovernanceOptions,
+    IndexingStatus, LedgerHandle, LedgerManager, PolicyContext, PolicyStats, PushCommitsRequest,
+    RefreshOpts, TrackingOptions, TrackingTally, TransactError, TxnOpts,
+};
+use fluree_db_ledger::IndexConfig;
+use moka::future::Cache;
+use sha2::{Digest, Sha256};
+use std::collections::HashMap;
+use std::mem;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, SemaphorePermit};
+
+/// Map a transaction-pipeline error into a [`SubmissionError`], preserving
+/// the HTTP status so the caller can render an accurate response.
+fn execution_failure(err: ApiError) -> SubmissionError {
+    SubmissionError::Execution {
+        status: err.status_code(),
+        message: err.to_string(),
+    }
+}
+
+/// Conflicts that heal by reconciling the cached writer state to the durable
+/// nameservice head and re-staging against the fresh state.
+///
+/// A single [`MonolithicCommitter`] with no external writers cannot produce
+/// any of these — the per-ledger write lock + atomic cache replace after
+/// publish keep `verify_sequencing`'s `base.t()` equal to the durable
+/// `head_t`, the head-record CAS uncontended, and namespace allocations
+/// process-serialized. They become reachable only when something outside
+/// this committer's lock writes to the same durable backend:
+///
+/// * **Multiple processes / instances sharing the same nameservice +
+///   storage.** Each instance has its own in-memory cache; their per-ledger
+///   locks don't see each other. `CommitConflict` fires when another
+///   instance advanced the head between this writer's snapshot and its
+///   verify-sequencing read; `PublishLostRace` fires when both reach the
+///   head CAS and one loses; `NamespaceConflict` fires when both allocate
+///   the same first-time namespace code against snapshots that didn't see
+///   the other's commit yet.
+/// * **Out-of-band cache invalidation.** Storage mutated outside this
+///   process (manual restore, point-in-time recovery, sidecar tooling)
+///   leaves the in-memory cache trailing the durable head.
+/// * **Future `Committer` implementations** (Raft, BFT) where concurrent
+///   writers are the design.
+///
+/// In all three, `refresh()` applies the missing commit(s) so the next
+/// attempt targets the real head, and the re-stage picks namespace codes
+/// against the updated registry.
+fn is_retryable_txn_conflict(e: &ApiError) -> bool {
+    matches!(
+        e,
+        ApiError::Transact(
+            TransactError::CommitConflict { .. }
+                | TransactError::PublishLostRace { .. }
+                | TransactError::NamespaceConflict(_)
+        )
+    )
+}
+
+/// Build a [`PolicyContext`] from the request's policy inputs.
+///
+/// Returns `Ok(None)` when there are no policy inputs — the transaction runs
+/// under root. The context is built from a snapshot of the ledger this node
+/// is about to stage against, so policy enforcement reflects the same state
+/// the transaction commits onto. Building it here, rather than having the
+/// caller pre-build and pass a context, keeps the policy context bound to
+/// the executing node's state — the shape a replicated implementation needs.
+async fn build_policy_context(
+    ledger_handle: &LedgerHandle,
+    governance: &GovernanceOptions,
+) -> Result<Option<PolicyContext>, SubmissionError> {
+    if !governance.has_any_policy_inputs() {
+        return Ok(None);
+    }
+
+    let snap = ledger_handle.snapshot().await;
+    fluree_db_api::build_policy_context(
+        &snap.snapshot,
+        snap.novelty.as_ref(),
+        Some(snap.novelty.as_ref()),
+        snap.t,
+        governance,
+    )
+    .await
+    .map(Some)
+    .map_err(execution_failure)
+}
+
+/// Default TTL for idempotency cache entries (1 hour).
+///
+/// After this duration, a previously-recorded submission state is forgotten;
+/// the same idempotency key may then be reused for a new submission with any
+/// body, and status lookups for the expired key return [`SubmissionState::Unknown`].
+pub const DEFAULT_IDEMPOTENCY_TTL: Duration = Duration::from_secs(3600);
+
+/// Total byte budget for the idempotency cache across all entries.
+///
+/// Bounded by bytes rather than entry count because `CachedSubmission` size
+/// is highly variable: a tracking-enabled `TransactionReceipt` carrying a
+/// `TrackingTally` (with its per-policy `HashMap<String, PolicyStats>`) is
+/// typically a few KB; a bare `RevertReceipt` is on the order of bytes. A
+/// fixed entry count would let resident memory drift far above what the
+/// count suggests under sustained tracked traffic. 256 MiB sized to absorb
+/// ~100k tracking-heavy entries before evictions start.
+pub const DEFAULT_IDEMPOTENCY_CACHE_MAX_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Default cap on in-flight submissions; calls beyond this count are
+/// refused with [`SubmissionError::Overloaded`]. Bounding the in-flight
+/// count is what keeps the per-request body memory from growing without
+/// limit under sustained load.
+pub const DEFAULT_PENDING_LIMIT: usize = 1024;
+
+/// Default per-ledger in-flight cap layered under [`DEFAULT_PENDING_LIMIT`].
+///
+/// A burst of submissions against one ledger fills its own slice of permits
+/// before drawing from the global pool, so the global cap is always
+/// available to other ledgers. Sized at 1/8 of the global cap: eight
+/// equally-saturated ledgers can collectively reach the global limit, but
+/// no single ledger can exhaust it on its own.
+pub const DEFAULT_PER_LEDGER_PENDING_LIMIT: usize = DEFAULT_PENDING_LIMIT / 8;
+
+/// Composite cache key: `(ledger_id, idempotency_key)`. Submissions on
+/// different ledgers with the same key are independent.
+type SubmissionCacheKey = (String, IdempotencyKey);
+
+/// Cached state for a submission plus the hash of the body it carried.
+/// The hash enables detecting the misuse case where the same idempotency
+/// key is reused with a different transaction body.
+#[derive(Clone)]
+struct CachedSubmission {
+    state: SubmissionState,
+    body_hash: [u8; 32],
+}
+
+/// Held for the duration of a submission body — dropping it releases both
+/// the per-ledger and the global admission slot in one step. The fields
+/// are private with `_` prefixes because callers only care about the RAII
+/// effect, not direct permit access.
+struct AdmissionPermits<'a> {
+    _global: SemaphorePermit<'a>,
+    _per_ledger: OwnedSemaphorePermit,
+}
+
+/// Bare per-push outcome returned by [`MonolithicCommitter::execute_push`] —
+/// the umbrella [`PushReceipt`] is assembled by the caller, who supplies the
+/// idempotency key to echo. Splitting the construction lets `execute_push`
+/// borrow `ledger_id` while the caller retains ownership for cache keying.
+struct PushOutcome {
+    ledger: String,
+    accepted: usize,
+    head_t: i64,
+    head_id: CommitId,
+    indexing: IndexingStatus,
+}
+
+fn push_receipt(idempotency_key: Option<IdempotencyKey>, outcome: PushOutcome) -> PushReceipt {
+    PushReceipt {
+        idempotency_key,
+        ledger: outcome.ledger,
+        accepted: outcome.accepted,
+        head_t: outcome.head_t,
+        head_id: outcome.head_id,
+        indexing: outcome.indexing,
+    }
+}
+
+/// Estimated bytes a cache entry holds, used by moka as the weight for
+/// capacity accounting.
+///
+/// Stack footprint of the key tuple and `CachedSubmission` plus the heap the
+/// variant payloads own. The dominant variable cost — `TrackingTally::policy`,
+/// a `HashMap<String, PolicyStats>` — is walked explicitly so a heavy entry
+/// registers at its true memory cost rather than as a single slot. Fixed-size
+/// inline structs (e.g. `CommitId`'s `Cid`) contribute through the base
+/// `size_of` term, which is exact for them.
+fn weigh_cached_submission(key: &SubmissionCacheKey, value: &CachedSubmission) -> u32 {
+    let base = mem::size_of::<SubmissionCacheKey>() + mem::size_of::<CachedSubmission>();
+    let key_heap = key.0.capacity() + key.1.as_str().len();
+    let state_heap = weigh_submission_state(&value.state);
+    base.saturating_add(key_heap)
+        .saturating_add(state_heap)
+        .min(u32::MAX as usize) as u32
+}
+
+fn weigh_submission_state(state: &SubmissionState) -> usize {
+    match state {
+        SubmissionState::Unknown | SubmissionState::InFlight => 0,
+        SubmissionState::Committed(receipt) => weigh_operation_receipt(receipt),
+        SubmissionState::Failed(err) => weigh_submission_error(err),
+    }
+}
+
+fn weigh_operation_receipt(receipt: &OperationReceipt) -> usize {
+    match receipt {
+        OperationReceipt::Transaction(tr) => {
+            weigh_idempotency_key(tr.idempotency_key.as_ref())
+                + tr.tally.as_ref().map(weigh_tracking_tally).unwrap_or(0)
+        }
+        OperationReceipt::Revert(rr) => {
+            weigh_idempotency_key(rr.idempotency_key.as_ref())
+                + rr.branch.capacity()
+                + rr.reverted_commits.capacity() * mem::size_of::<CommitId>()
+        }
+        OperationReceipt::Merge(mr) => {
+            weigh_idempotency_key(mr.idempotency_key.as_ref())
+                + mr.source.capacity()
+                + mr.target.capacity()
+        }
+        OperationReceipt::Rebase(rr) => {
+            weigh_idempotency_key(rr.idempotency_key.as_ref()) + rr.branch.capacity()
+        }
+        OperationReceipt::Push(pr) => {
+            weigh_idempotency_key(pr.idempotency_key.as_ref()) + pr.ledger.capacity()
+        }
+    }
+}
+
+fn weigh_idempotency_key(key: Option<&IdempotencyKey>) -> usize {
+    key.map(|k| k.as_str().len()).unwrap_or(0)
+}
+
+fn weigh_tracking_tally(tally: &TrackingTally) -> usize {
+    let time = tally.time.as_ref().map(String::capacity).unwrap_or(0);
+    let policy = tally.policy.as_ref().map(weigh_policy_map).unwrap_or(0);
+    let reasoning = tally
+        .reasoning
+        .as_ref()
+        .and_then(|r| r.capped_reason.as_ref())
+        .map(String::capacity)
+        .unwrap_or(0);
+    time + policy + reasoning
+}
+
+fn weigh_policy_map(map: &HashMap<String, PolicyStats>) -> usize {
+    // Hashbrown's open-addressing layout costs roughly one control byte plus
+    // one `(K, V)` slot per entry; capacity (not len) is what's allocated.
+    const SLOT: usize = mem::size_of::<(String, PolicyStats)>() + 1;
+    map.capacity().saturating_mul(SLOT) + map.keys().map(String::capacity).sum::<usize>()
+}
+
+fn weigh_submission_error(err: &SubmissionError) -> usize {
+    match err {
+        SubmissionError::Execution { message, .. } => message.capacity(),
+        SubmissionError::KeyCollision
+        | SubmissionError::AlreadyInFlight
+        | SubmissionError::Overloaded => 0,
+    }
+}
+
+/// Monolithic consensus over the local Fluree transaction infrastructure.
+///
+/// Resolves the target ledger via the [`LedgerManager`] on the supplied
+/// [`Fluree`] instance, takes the write lock, runs stage + commit through
+/// the existing transactor, and replaces the cached ledger state with the
+/// post-commit state.
+///
+/// Idempotency is tracked in an in-memory TTL cache. The cache is not
+/// persisted across restarts; that is acceptable here because a process
+/// restart loses any in-flight submissions anyway.
+pub struct MonolithicCommitter {
+    fluree: Arc<Fluree>,
+    index_config: IndexConfig,
+    cache: Cache<SubmissionCacheKey, CachedSubmission>,
+    /// Global in-flight cap. Acquired *after* the per-ledger permit so a
+    /// single ledger's burst is rejected at the per-ledger semaphore first
+    /// and never consumes more than its slice of global slots.
+    admission: Arc<Semaphore>,
+    /// Per-ledger in-flight semaphores. Lazily created on first submission
+    /// to a given ledger and kept thereafter — the set of distinct ledger
+    /// ids is bounded by what operators create, so unbounded growth is not
+    /// a concern in practice. Long-lived deployments with many transient
+    /// ledgers would benefit from periodic eviction of unused entries.
+    per_ledger_admission: DashMap<String, Arc<Semaphore>>,
+    /// Per-ledger cap applied to newly-created entries in
+    /// [`per_ledger_admission`]. Pre-existing semaphores keep the cap they
+    /// were built with — callers should set this at construction time
+    /// before any submissions land.
+    per_ledger_limit: usize,
+}
+
+impl MonolithicCommitter {
+    /// Construct with the default 1-hour idempotency TTL.
+    pub fn new(fluree: Arc<Fluree>, index_config: IndexConfig) -> Self {
+        Self::with_ttl(fluree, index_config, DEFAULT_IDEMPOTENCY_TTL)
+    }
+
+    /// Construct with a caller-specified idempotency TTL.
+    pub fn with_ttl(fluree: Arc<Fluree>, index_config: IndexConfig, ttl: Duration) -> Self {
+        let cache = Cache::builder()
+            .time_to_live(ttl)
+            .max_capacity(DEFAULT_IDEMPOTENCY_CACHE_MAX_BYTES)
+            .weigher(weigh_cached_submission)
+            .build();
+        Self {
+            fluree,
+            index_config,
+            cache,
+            admission: Arc::new(Semaphore::new(DEFAULT_PENDING_LIMIT)),
+            per_ledger_admission: DashMap::new(),
+            per_ledger_limit: DEFAULT_PER_LEDGER_PENDING_LIMIT,
+        }
+    }
+
+    /// Override the global in-flight pending-operation cap (defaults to
+    /// [`DEFAULT_PENDING_LIMIT`]). Submissions arriving while `limit`
+    /// operations are already in flight across all ledgers are refused
+    /// with [`SubmissionError::Overloaded`] rather than queued.
+    pub fn with_pending_limit(mut self, limit: usize) -> Self {
+        self.admission = Arc::new(Semaphore::new(limit));
+        self
+    }
+
+    /// Override the per-ledger in-flight cap (defaults to
+    /// [`DEFAULT_PER_LEDGER_PENDING_LIMIT`]). Each ledger draws from its
+    /// own slice of permits before reaching the global pool, so one
+    /// ledger's burst cannot starve other ledgers of admission slots.
+    ///
+    /// Applies only to per-ledger semaphores created *after* this call;
+    /// already-active ledgers keep the cap their semaphore was built with.
+    /// Set at construction time before any submissions land.
+    pub fn with_per_ledger_pending_limit(mut self, limit: usize) -> Self {
+        self.per_ledger_limit = limit;
+        self
+    }
+
+    /// Override the idempotency cache's byte budget (defaults to
+    /// [`DEFAULT_IDEMPOTENCY_CACHE_MAX_BYTES`]). Entry weight is the per-entry
+    /// memory footprint; moka evicts the least-recently-used entries once the
+    /// total exceeds the budget. Tune up to absorb more sustained keyed
+    /// traffic before evictions start, or down to fit a tighter memory
+    /// envelope.
+    ///
+    /// Rebuilds the cache; safe to call only at construction time, before
+    /// any submissions have been recorded — existing entries are discarded.
+    pub fn with_cache_capacity_bytes(mut self, max_bytes: u64) -> Self {
+        let ttl = self
+            .cache
+            .policy()
+            .time_to_live()
+            .unwrap_or(DEFAULT_IDEMPOTENCY_TTL);
+        self.cache = Cache::builder()
+            .time_to_live(ttl)
+            .max_capacity(max_bytes)
+            .weigher(weigh_cached_submission)
+            .build();
+        self
+    }
+
+    /// Resolve (or create) the per-ledger admission semaphore for
+    /// `ledger_id`. Returns a fresh `Arc` clone — the caller acquires its
+    /// permit from the clone, and the entry stays in the map for the next
+    /// submission against the same ledger.
+    fn ledger_semaphore(&self, ledger_id: &str) -> Arc<Semaphore> {
+        // Fast path: entry already present. Avoids the `to_string` allocation
+        // that `entry(...)` would force on a borrowed key.
+        if let Some(slot) = self.per_ledger_admission.get(ledger_id) {
+            return Arc::clone(slot.value());
+        }
+        // Slow path: lazily create. `or_insert_with` is atomic under
+        // DashMap's per-bucket lock so concurrent first-touches converge on
+        // a single semaphore.
+        self.per_ledger_admission
+            .entry(ledger_id.to_string())
+            .or_insert_with(|| Arc::new(Semaphore::new(self.per_ledger_limit)))
+            .value()
+            .clone()
+    }
+
+    /// Try to claim one in-flight admission permit at each tier — first the
+    /// per-ledger semaphore for `ledger_id`, then the global pool. Order
+    /// matters: a flood against one ledger fills its own slice and is
+    /// rejected before drawing from the global pool, leaving global slots
+    /// available for other ledgers. Either tier hitting its cap returns
+    /// [`SubmissionError::Overloaded`]; the per-ledger permit dropped here
+    /// if the global one fails releases its slot for the next caller.
+    ///
+    /// The global permit borrows from `self.admission`; the per-ledger
+    /// permit owns its `Arc` clone so it stays valid even if the map entry
+    /// is later evicted. Both permits drop (releasing their slots) when
+    /// the returned guard is dropped at the end of the submission body.
+    fn try_admit(&self, ledger_id: &str) -> Result<AdmissionPermits<'_>, SubmissionError> {
+        let per_ledger = self
+            .ledger_semaphore(ledger_id)
+            .try_acquire_owned()
+            .map_err(|_| SubmissionError::Overloaded)?;
+        let global = self
+            .admission
+            .try_acquire()
+            .map_err(|_| SubmissionError::Overloaded)?;
+        Ok(AdmissionPermits {
+            _global: global,
+            _per_ledger: per_ledger,
+        })
+    }
+
+    fn hash_request_body(request: &TransactionRequest) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        // Each variant tag distinguishes both format and insert/upsert/update
+        // semantics — same bytes under a different variant produce different
+        // hashes, so two retries that disagree on operation kind collide
+        // correctly.
+        match &request.body {
+            TransactionBody::JsonLdInsert(json) => {
+                hasher.update(b"jsonld-insert");
+                serde_json::to_writer(&mut hasher, json)
+                    .expect("Sha256 write is infallible; a parsed Value re-serializes");
+            }
+            TransactionBody::JsonLdUpsert(json) => {
+                hasher.update(b"jsonld-upsert");
+                serde_json::to_writer(&mut hasher, json)
+                    .expect("Sha256 write is infallible; a parsed Value re-serializes");
+            }
+            TransactionBody::JsonLdUpdate(json) => {
+                hasher.update(b"jsonld-update");
+                serde_json::to_writer(&mut hasher, json)
+                    .expect("Sha256 write is infallible; a parsed Value re-serializes");
+            }
+            TransactionBody::TurtleInsert(text) => {
+                hasher.update(b"turtle-insert");
+                hasher.update(text.as_bytes());
+            }
+            TransactionBody::TurtleUpsert(text) => {
+                hasher.update(b"turtle-upsert");
+                hasher.update(text.as_bytes());
+            }
+            TransactionBody::TrigUpsert(text) => {
+                hasher.update(b"trig-upsert");
+                hasher.update(text.as_bytes());
+            }
+            TransactionBody::Sparql(text) => {
+                hasher.update(b"sparql");
+                hasher.update(text.as_bytes());
+            }
+        }
+        hasher.finalize().into()
+    }
+
+    fn ledger_manager(&self) -> Result<&Arc<LedgerManager>, SubmissionError> {
+        self.fluree
+            .ledger_manager()
+            .ok_or_else(|| SubmissionError::Execution {
+                status: 500,
+                message: "LedgerManager is not configured on the Fluree instance".into(),
+            })
+    }
+
+    /// Execute the stage + commit pipeline, returning the bare commit and
+    /// tally — the caller assembles the [`TransactionReceipt`] with whatever
+    /// idempotency key it needs to echo. Borrowing `ledger_id` here lets the
+    /// caller keep ownership for cache key insertion.
+    async fn execute_transaction(
+        &self,
+        ledger_id: &str,
+        body: TransactionBody,
+        txn_opts: TxnOpts,
+        commit_opts: CommitOpts,
+        tracking: Option<TrackingOptions>,
+        governance: GovernanceOptions,
+    ) -> Result<(CommitReceipt, Option<TrackingTally>), SubmissionError> {
+        let ledger_handle = self
+            .ledger_manager()?
+            .get_or_load(ledger_id)
+            .await
+            .map_err(execution_failure)?;
+
+        // Bounded reconcile-and-retry around stage + commit.
+        //
+        // Unreachable for a single instance with no external writers — the
+        // per-ledger write lock plus atomic cache replace after publish keep
+        // `verify_sequencing` consistent. See [`is_retryable_txn_conflict`]
+        // for the scenarios this defends (multi-instance shared backends,
+        // out-of-band cache invalidation, future concurrent-writer
+        // `Committer` implementations); in those, `refresh()` applies the
+        // missing commit(s) so the next attempt targets the real head.
+        //
+        // Each attempt rebuilds the policy context (against the post-refresh
+        // snapshot) and the builder from scratch — the body itself is
+        // borrowed each pass, so the per-iteration cost is one extra
+        // `Clone` of `TxnOpts` / `CommitOpts` / `TrackingOptions`.
+        const MAX_TXN_RETRIES: usize = 16;
+        let mut last_error: Option<ApiError> = None;
+        for attempt in 1..=MAX_TXN_RETRIES {
+            let policy_ctx = build_policy_context(&ledger_handle, &governance).await?;
+
+            // The builder API holds the ledger write lock and replaces the cached
+            // state internally for the duration of stage + commit — no manual
+            // lock/clone/replace dance is needed here. Each body variant fixes
+            // both the parser path and the insert/upsert/update semantics.
+            let staged = self.fluree.stage(&ledger_handle);
+            let staged = match &body {
+                TransactionBody::JsonLdInsert(json) => staged.insert(json),
+                TransactionBody::JsonLdUpsert(json) => staged.upsert(json),
+                TransactionBody::JsonLdUpdate(json) => staged.update(json),
+                TransactionBody::TurtleInsert(text) => staged.insert_turtle(text.as_str()),
+                TransactionBody::TurtleUpsert(text) | TransactionBody::TrigUpsert(text) => {
+                    staged.upsert_turtle(text.as_str())
+                }
+                TransactionBody::Sparql(query) => staged.sparql_update(query.as_str()),
+            };
+            let mut builder = staged
+                .txn_opts(txn_opts.clone())
+                .commit_opts(commit_opts.clone())
+                .index_config(self.index_config.clone());
+            if let Some(tracking) = tracking.clone() {
+                builder = builder.tracking(tracking);
+            }
+            if let Some(policy) = policy_ctx {
+                builder = builder.policy(policy);
+            }
+
+            match builder.execute().await {
+                Ok(result) => return Ok((result.receipt, result.tally)),
+                Err(e) if attempt < MAX_TXN_RETRIES && is_retryable_txn_conflict(&e) => {
+                    tracing::warn!(
+                        attempt,
+                        max_attempts = MAX_TXN_RETRIES,
+                        error = %e,
+                        "transaction commit conflict; reconciling cached state and retrying"
+                    );
+                    if let Err(refresh_err) =
+                        self.fluree.refresh(ledger_id, RefreshOpts::default()).await
+                    {
+                        tracing::warn!(
+                            attempt,
+                            error = %refresh_err,
+                            "refresh during commit-conflict retry failed; retrying anyway"
+                        );
+                    }
+                    last_error = Some(e);
+                    continue;
+                }
+                Err(e) => return Err(execution_failure(e)),
+            }
+        }
+
+        Err(execution_failure(last_error.unwrap_or_else(|| {
+            ApiError::internal("transaction failed after retries with no captured error")
+        })))
+    }
+
+    /// Atomically claim an idempotency slot in the cache.
+    ///
+    /// Returns `Ok(None)` when the caller wins the claim and must execute
+    /// the operation. Returns `Ok(Some(receipt))` when an earlier
+    /// submission with the same key and body already completed. Returns
+    /// `Err(KeyCollision)` for a mismatched body or `Err(AlreadyInFlight)`
+    /// when another caller's execution is still running.
+    async fn try_claim_slot(
+        &self,
+        cache_key: &SubmissionCacheKey,
+        body_hash: [u8; 32],
+    ) -> Result<Option<OperationReceipt>, SubmissionError> {
+        // `or_insert_with_if` writes a fresh `InFlight` marker when the key
+        // is absent, or replaces a prior failed attempt for the same body —
+        // failures are re-attemptable. Concurrent submissions for the same
+        // key see `is_fresh() == false` and collapse onto the existing
+        // submission; only the caller that wins the claim goes on to execute.
+        //
+        // `entry_by_ref` borrows the key on the hot path and only clones it
+        // (via `ToOwned`) when an insert actually happens, so the steady-state
+        // claim-collapse case takes no allocations.
+        let claim = self
+            .cache
+            .entry_by_ref(cache_key)
+            .or_insert_with_if(
+                std::future::ready(CachedSubmission {
+                    state: SubmissionState::InFlight,
+                    body_hash,
+                }),
+                |existing| {
+                    matches!(existing.state, SubmissionState::Failed(_))
+                        && existing.body_hash == body_hash
+                },
+            )
+            .await;
+
+        if claim.is_fresh() {
+            return Ok(None);
+        }
+
+        let existing = claim.into_value();
+        if existing.body_hash != body_hash {
+            return Err(SubmissionError::KeyCollision);
+        }
+        match existing.state {
+            SubmissionState::Committed(receipt) => Ok(Some(receipt)),
+            _ => Err(SubmissionError::AlreadyInFlight),
+        }
+    }
+
+    /// Record the outcome of a freshly-executed claim back into the cache.
+    ///
+    /// `wrap` lifts the per-operation receipt into the umbrella
+    /// [`OperationReceipt`] so the cache stays uniform across operation
+    /// kinds.
+    async fn record_outcome<R, F>(
+        &self,
+        cache_key: SubmissionCacheKey,
+        body_hash: [u8; 32],
+        outcome: &Result<R, SubmissionError>,
+        wrap: F,
+    ) where
+        R: Clone,
+        F: FnOnce(R) -> OperationReceipt,
+    {
+        let final_state = match outcome {
+            Ok(receipt) => SubmissionState::Committed(wrap(receipt.clone())),
+            Err(err) => SubmissionState::Failed(err.clone()),
+        };
+        self.cache
+            .insert(
+                cache_key,
+                CachedSubmission {
+                    state: final_state,
+                    body_hash,
+                },
+            )
+            .await;
+    }
+
+    fn hash_revert_body(request: &RevertRequest) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(request.ledger_name.as_bytes());
+        hasher.update([0u8]);
+        hasher.update(request.branch.as_bytes());
+        hasher.update([0u8]);
+        match &request.selection {
+            RevertSelection::Commits(commits) => {
+                hasher.update([0u8]);
+                hasher.update((commits.len() as u64).to_le_bytes());
+                for commit in commits.iter() {
+                    hash_commit_ref(&mut hasher, commit);
+                }
+            }
+            RevertSelection::Range { from, to } => {
+                hasher.update([1u8]);
+                hash_commit_ref(&mut hasher, from);
+                hash_commit_ref(&mut hasher, to);
+            }
+        }
+        hasher.update([request.strategy as u8]);
+        hasher.finalize().into()
+    }
+
+    async fn execute_revert(
+        &self,
+        request: RevertRequest,
+    ) -> Result<RevertReceipt, SubmissionError> {
+        let RevertRequest {
+            idempotency_key,
+            ledger_name,
+            branch,
+            selection,
+            strategy,
+            ..
+        } = request;
+
+        let result = match selection {
+            RevertSelection::Commits(commits) => {
+                self.fluree
+                    .revert_commits(&ledger_name, &branch, commits.into_vec(), strategy)
+                    .await
+            }
+            RevertSelection::Range { from, to } => {
+                self.fluree
+                    .revert_range(&ledger_name, &branch, from, to, strategy)
+                    .await
+            }
+        };
+
+        let outcome = result.map_err(execution_failure)?;
+        Ok(RevertReceipt {
+            idempotency_key,
+            branch,
+            reverted_commits: outcome.reverted_commits,
+            conflict_count: outcome.conflict_count,
+            strategy,
+            new_head_t: outcome.new_head_t,
+            new_head_id: outcome.new_head_id,
+        })
+    }
+
+    fn hash_merge_body(request: &MergeRequest) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(request.ledger_name.as_bytes());
+        hasher.update([0u8]);
+        hasher.update(request.source_branch.as_bytes());
+        hasher.update([0u8]);
+        match &request.target_branch {
+            Some(target) => {
+                hasher.update([1u8]);
+                hasher.update(target.as_bytes());
+                hasher.update([0u8]);
+            }
+            None => hasher.update([0u8]),
+        }
+        hasher.update([request.strategy as u8]);
+        hasher.finalize().into()
+    }
+
+    async fn execute_merge(&self, request: MergeRequest) -> Result<MergeReceipt, SubmissionError> {
+        let MergeRequest {
+            idempotency_key,
+            ledger_name,
+            source_branch,
+            target_branch,
+            strategy,
+            ..
+        } = request;
+
+        let report = self
+            .fluree
+            .merge_branch(
+                &ledger_name,
+                &source_branch,
+                target_branch.as_deref(),
+                strategy,
+            )
+            .await
+            .map_err(execution_failure)?;
+
+        Ok(MergeReceipt {
+            idempotency_key,
+            source: report.source,
+            target: report.target,
+            fast_forward: report.fast_forward,
+            new_head_t: report.new_head_t,
+            new_head_id: report.new_head_id,
+            commits_copied: report.commits_copied,
+            conflict_count: report.conflict_count,
+            strategy,
+        })
+    }
+
+    fn hash_rebase_body(request: &RebaseRequest) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(request.ledger_name.as_bytes());
+        hasher.update([0u8]);
+        hasher.update(request.branch.as_bytes());
+        hasher.update([0u8]);
+        hasher.update([request.strategy as u8]);
+        hasher.finalize().into()
+    }
+
+    async fn execute_rebase(
+        &self,
+        request: RebaseRequest,
+    ) -> Result<RebaseReceipt, SubmissionError> {
+        let RebaseRequest {
+            idempotency_key,
+            ledger_name,
+            branch,
+            strategy,
+            ..
+        } = request;
+
+        let report = self
+            .fluree
+            .rebase_branch(&ledger_name, &branch, strategy)
+            .await
+            .map_err(execution_failure)?;
+
+        Ok(RebaseReceipt {
+            idempotency_key,
+            branch,
+            fast_forward: report.fast_forward,
+            replayed: report.replayed,
+            skipped: report.skipped,
+            conflicts: report.conflicts.len(),
+            failures: report.failures.len(),
+            total_commits: report.total_commits,
+            source_head_t: report.source_head_t,
+            source_head_id: report.source_head_id,
+            strategy,
+        })
+    }
+
+    fn hash_push_body(request: &PushRequest) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(request.ledger_id.as_bytes());
+        hasher.update([0u8]);
+        hasher.update((request.commits.len() as u64).to_le_bytes());
+        for commit in &request.commits {
+            hasher.update((commit.len() as u64).to_le_bytes());
+            hasher.update(commit);
+        }
+        // Sort auxiliary blob keys so the hash is order-independent across
+        // retries that serialize the map differently.
+        let mut blob_keys: Vec<&String> = request.blobs.keys().collect();
+        blob_keys.sort();
+        hasher.update((blob_keys.len() as u64).to_le_bytes());
+        for key in blob_keys {
+            hasher.update((key.len() as u64).to_le_bytes());
+            hasher.update(key.as_bytes());
+            let value = &request.blobs[key];
+            hasher.update((value.len() as u64).to_le_bytes());
+            hasher.update(value);
+        }
+        hasher.finalize().into()
+    }
+
+    /// Push the supplied commit blobs and return the bare per-push outcome —
+    /// the caller assembles the [`PushReceipt`] with whatever idempotency key
+    /// it needs to echo. Borrowing `ledger_id` here lets the caller keep
+    /// ownership for cache key insertion.
+    async fn execute_push(
+        &self,
+        ledger_id: &str,
+        commits: Vec<Vec<u8>>,
+        blobs: HashMap<String, Vec<u8>>,
+        governance: GovernanceOptions,
+    ) -> Result<PushOutcome, SubmissionError> {
+        let payload = PushCommitsRequest {
+            commits: commits.into_iter().map(Base64Bytes).collect(),
+            blobs: blobs
+                .into_iter()
+                .map(|(k, v)| (k, Base64Bytes(v)))
+                .collect(),
+        };
+
+        let response = self
+            .fluree
+            .push_commits(ledger_id, payload, &governance, &self.index_config)
+            .await
+            .map_err(execution_failure)?;
+
+        Ok(PushOutcome {
+            ledger: response.ledger,
+            accepted: response.accepted,
+            head_t: response.head.t,
+            head_id: response.head.commit_id,
+            indexing: response.indexing,
+        })
+    }
+}
+
+fn hash_commit_ref(hasher: &mut Sha256, commit: &CommitRef) {
+    match commit {
+        CommitRef::Exact(id) => {
+            hasher.update([0u8]);
+            hasher.update(id.to_bytes());
+        }
+        CommitRef::Prefix(prefix) => {
+            hasher.update([1u8]);
+            hasher.update(prefix.as_bytes());
+            hasher.update([0u8]);
+        }
+        CommitRef::T(t) => {
+            hasher.update([2u8]);
+            hasher.update(t.to_le_bytes());
+        }
+    }
+}
+
+#[async_trait]
+impl Committer for MonolithicCommitter {
+    async fn transact(
+        &self,
+        request: TransactionRequest,
+    ) -> Result<TransactionReceipt, SubmissionError> {
+        let _permits = self.try_admit(&request.ledger_id)?;
+
+        // `hash_request_body` borrows the body, so compute the digest before
+        // we destructure and move the body into the execution pipeline.
+        let body_hash = Self::hash_request_body(&request);
+        let TransactionRequest {
+            idempotency_key,
+            ledger_id,
+            body,
+            txn_opts,
+            commit_opts,
+            tracking,
+            governance,
+        } = request;
+
+        // Anonymous submissions (no idempotency key) skip the cache
+        // entirely — no retry-collapse and no later status lookup.
+        let Some(idempotency_key) = idempotency_key else {
+            let (commit, tally) = self
+                .execute_transaction(
+                    &ledger_id,
+                    body,
+                    txn_opts,
+                    commit_opts,
+                    tracking,
+                    governance,
+                )
+                .await?;
+            return Ok(TransactionReceipt {
+                idempotency_key: None,
+                commit,
+                tally,
+            });
+        };
+
+        // Move `ledger_id` and the key into the cache key — no `String`
+        // clones on the hot path. `cache_key.0` is then the only owned
+        // ledger_id, borrowed into `execute_transaction` and consumed by
+        // `record_outcome`.
+        let cache_key = (ledger_id, idempotency_key);
+
+        if let Some(receipt) = self.try_claim_slot(&cache_key, body_hash).await? {
+            return match receipt {
+                OperationReceipt::Transaction(r) => Ok(r),
+                _ => Err(SubmissionError::KeyCollision),
+            };
+        }
+
+        let outcome = self
+            .execute_transaction(
+                &cache_key.0,
+                body,
+                txn_opts,
+                commit_opts,
+                tracking,
+                governance,
+            )
+            .await
+            .map(|(commit, tally)| TransactionReceipt {
+                idempotency_key: Some(cache_key.1.clone()),
+                commit,
+                tally,
+            });
+        self.record_outcome(
+            cache_key,
+            body_hash,
+            &outcome,
+            OperationReceipt::Transaction,
+        )
+        .await;
+        outcome
+    }
+
+    async fn revert(&self, mut request: RevertRequest) -> Result<RevertReceipt, SubmissionError> {
+        // Build the `ledger:branch` admission key once and reuse it as the
+        // cache-key half on the keyed path. The borrow of `ledger_id` into
+        // `try_admit` ends when the call returns, so it's free to move into
+        // `cache_key` below.
+        let ledger_id = fluree_db_api::format_ledger_id(&request.ledger_name, &request.branch);
+        let _permits = self.try_admit(&ledger_id)?;
+
+        // `take()` moves the key out without allocating — `execute_revert`
+        // sees `None` and returns a receipt with `idempotency_key: None`,
+        // which is filled in below when the cache miss path produces a
+        // fresh outcome. Cache-hit / collision paths short-circuit before
+        // the fill, so the allocation only happens when we actually return
+        // a freshly-computed receipt.
+        let Some(idempotency_key) = request.idempotency_key.take() else {
+            return self.execute_revert(request).await;
+        };
+
+        let cache_key = (ledger_id, idempotency_key);
+        let body_hash = Self::hash_revert_body(&request);
+
+        if let Some(receipt) = self.try_claim_slot(&cache_key, body_hash).await? {
+            return match receipt {
+                OperationReceipt::Revert(r) => Ok(r),
+                _ => Err(SubmissionError::KeyCollision),
+            };
+        }
+
+        let outcome = self.execute_revert(request).await.map(|mut r| {
+            r.idempotency_key = Some(cache_key.1.clone());
+            r
+        });
+        self.record_outcome(cache_key, body_hash, &outcome, OperationReceipt::Revert)
+            .await;
+        outcome
+    }
+
+    async fn merge(&self, mut request: MergeRequest) -> Result<MergeReceipt, SubmissionError> {
+        // Namespace admission and the cache by `ledger:source_branch` —
+        // uniquely identifies the merge from the client's perspective and
+        // is always known up front, no need to pre-resolve the target.
+        let ledger_id =
+            fluree_db_api::format_ledger_id(&request.ledger_name, &request.source_branch);
+        let _permits = self.try_admit(&ledger_id)?;
+
+        let Some(idempotency_key) = request.idempotency_key.take() else {
+            return self.execute_merge(request).await;
+        };
+
+        let cache_key = (ledger_id, idempotency_key);
+        let body_hash = Self::hash_merge_body(&request);
+
+        if let Some(receipt) = self.try_claim_slot(&cache_key, body_hash).await? {
+            return match receipt {
+                OperationReceipt::Merge(r) => Ok(r),
+                _ => Err(SubmissionError::KeyCollision),
+            };
+        }
+
+        let outcome = self.execute_merge(request).await.map(|mut r| {
+            r.idempotency_key = Some(cache_key.1.clone());
+            r
+        });
+        self.record_outcome(cache_key, body_hash, &outcome, OperationReceipt::Merge)
+            .await;
+        outcome
+    }
+
+    async fn rebase(&self, mut request: RebaseRequest) -> Result<RebaseReceipt, SubmissionError> {
+        // Rebase rewrites `branch` itself, so admission and the cache are
+        // keyed by the branch being rebased — the natural client
+        // identifier and the one they'd use to check status.
+        let ledger_id = fluree_db_api::format_ledger_id(&request.ledger_name, &request.branch);
+        let _permits = self.try_admit(&ledger_id)?;
+
+        let Some(idempotency_key) = request.idempotency_key.take() else {
+            return self.execute_rebase(request).await;
+        };
+
+        let cache_key = (ledger_id, idempotency_key);
+        let body_hash = Self::hash_rebase_body(&request);
+
+        if let Some(receipt) = self.try_claim_slot(&cache_key, body_hash).await? {
+            return match receipt {
+                OperationReceipt::Rebase(r) => Ok(r),
+                _ => Err(SubmissionError::KeyCollision),
+            };
+        }
+
+        let outcome = self.execute_rebase(request).await.map(|mut r| {
+            r.idempotency_key = Some(cache_key.1.clone());
+            r
+        });
+        self.record_outcome(cache_key, body_hash, &outcome, OperationReceipt::Rebase)
+            .await;
+        outcome
+    }
+
+    async fn push(&self, request: PushRequest) -> Result<PushReceipt, SubmissionError> {
+        let _permits = self.try_admit(&request.ledger_id)?;
+
+        // `hash_push_body` borrows the request, so compute the digest before
+        // we destructure and move the commits/blobs into the execution
+        // pipeline.
+        let body_hash = Self::hash_push_body(&request);
+        let PushRequest {
+            idempotency_key,
+            ledger_id,
+            commits,
+            blobs,
+            governance,
+        } = request;
+
+        let Some(idempotency_key) = idempotency_key else {
+            let outcome = self
+                .execute_push(&ledger_id, commits, blobs, governance)
+                .await?;
+            return Ok(push_receipt(None, outcome));
+        };
+
+        // Push targets a fully-qualified `ledger:branch` directly, so the
+        // cache key matches `transact` namespacing. Move both halves in to
+        // avoid the per-submission `ledger_id` clone.
+        let cache_key = (ledger_id, idempotency_key);
+
+        if let Some(receipt) = self.try_claim_slot(&cache_key, body_hash).await? {
+            return match receipt {
+                OperationReceipt::Push(r) => Ok(r),
+                _ => Err(SubmissionError::KeyCollision),
+            };
+        }
+
+        let outcome = self
+            .execute_push(&cache_key.0, commits, blobs, governance)
+            .await
+            .map(|outcome| push_receipt(Some(cache_key.1.clone()), outcome));
+        self.record_outcome(cache_key, body_hash, &outcome, OperationReceipt::Push)
+            .await;
+        outcome
+    }
+}
+
+#[async_trait]
+impl SubmissionLookup for MonolithicCommitter {
+    async fn status(&self, ledger_id: &str, key: &IdempotencyKey) -> SubmissionState {
+        let cache_key = (ledger_id.to_string(), key.clone());
+        match self.cache.get(&cache_key).await {
+            Some(entry) => entry.state,
+            None => SubmissionState::Unknown,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fluree_db_api::{CommitId, CommitRef, ConflictStrategy, FlureeBuilder, TrackingOptions};
+    use fluree_db_transact::{CommitOpts, TxnOpts};
+    use serde_json::{json, Value as JsonValue};
+
+    /// Build a Fluree + `MonolithicCommitter` + initialized ledger.
+    ///
+    /// Each test gets its own in-memory Fluree, so tests don't share state
+    /// and the same `ledger_id` is safe to reuse across tests.
+    async fn setup() -> (Arc<fluree_db_api::Fluree>, MonolithicCommitter, String) {
+        let fluree = Arc::new(FlureeBuilder::memory().build_memory());
+        let ledger_id = "test/consensus:main".to_string();
+        fluree
+            .create_ledger(&ledger_id)
+            .await
+            .expect("create ledger");
+        let index_config = fluree_db_ledger::IndexConfig {
+            reindex_min_bytes: 1024 * 1024,
+            reindex_max_bytes: 1024 * 1024 * 100,
+        };
+        let consensus = MonolithicCommitter::new(Arc::clone(&fluree), index_config);
+        (fluree, consensus, ledger_id)
+    }
+
+    fn sample_insert(name: &str) -> JsonValue {
+        json!({
+            "@context": {"ex": "http://example.org/"},
+            "@graph": [{
+                "@id": format!("ex:{name}"),
+                "ex:name": name
+            }]
+        })
+    }
+
+    fn request(ledger_id: &str, key: Option<&str>, body: JsonValue) -> TransactionRequest {
+        TransactionRequest {
+            idempotency_key: key.map(|k| IdempotencyKey::new(k).expect("test key fits cap")),
+            ledger_id: ledger_id.to_string(),
+            body: TransactionBody::JsonLdInsert(body),
+            txn_opts: TxnOpts::default(),
+            commit_opts: CommitOpts::default(),
+            tracking: None,
+            governance: GovernanceOptions::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn anonymous_submission_returns_receipt() {
+        let (_fluree, consensus, ledger_id) = setup().await;
+
+        let receipt = consensus
+            .transact(request(&ledger_id, None, sample_insert("alice")))
+            .await
+            .expect("submission to succeed");
+
+        assert!(receipt.idempotency_key.is_none());
+        assert!(receipt.commit.flake_count > 0);
+    }
+
+    #[tokio::test]
+    async fn keyed_submission_is_visible_via_status_lookup() {
+        let (_fluree, consensus, ledger_id) = setup().await;
+        let key = IdempotencyKey::new("01J5XAMPLE001").expect("test key fits cap");
+
+        let receipt = consensus
+            .transact(request(
+                &ledger_id,
+                Some(key.as_str()),
+                sample_insert("alice"),
+            ))
+            .await
+            .expect("submission to succeed");
+        assert_eq!(receipt.idempotency_key.as_ref(), Some(&key));
+
+        match consensus.status(&ledger_id, &key).await {
+            SubmissionState::Committed(OperationReceipt::Transaction(stored)) => {
+                assert_eq!(stored.commit.t, receipt.commit.t);
+                assert_eq!(stored.commit.commit_id, receipt.commit.commit_id);
+            }
+            other => panic!("expected Committed(Transaction), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn status_returns_unknown_for_unseen_key() {
+        let (_fluree, consensus, ledger_id) = setup().await;
+        let key = IdempotencyKey::new("01J5UNKNOWN").expect("test key fits cap");
+
+        assert!(matches!(
+            consensus.status(&ledger_id, &key).await,
+            SubmissionState::Unknown
+        ));
+    }
+
+    #[tokio::test]
+    async fn idempotent_retry_returns_cached_receipt() {
+        let (_fluree, consensus, ledger_id) = setup().await;
+        let key = IdempotencyKey::new("01J5RETRY001").expect("test key fits cap");
+        let body = sample_insert("alice");
+
+        let first = consensus
+            .transact(request(&ledger_id, Some(key.as_str()), body.clone()))
+            .await
+            .expect("first submission to succeed");
+
+        let second = consensus
+            .transact(request(&ledger_id, Some(key.as_str()), body))
+            .await
+            .expect("retry with same body should return cached receipt");
+
+        // Same receipt — the second call should NOT have re-executed.
+        // If it had, the new transaction would advance `t` past the first.
+        assert_eq!(first.commit.t, second.commit.t);
+        assert_eq!(first.commit.commit_id, second.commit.commit_id);
+    }
+
+    #[tokio::test]
+    async fn key_collision_with_different_body_errors() {
+        let (_fluree, consensus, ledger_id) = setup().await;
+        let key = IdempotencyKey::new("01J5COLLIDE001").expect("test key fits cap");
+
+        consensus
+            .transact(request(
+                &ledger_id,
+                Some(key.as_str()),
+                sample_insert("alice"),
+            ))
+            .await
+            .expect("first submission to succeed");
+
+        let err = consensus
+            .transact(request(
+                &ledger_id,
+                Some(key.as_str()),
+                sample_insert("bob"),
+            ))
+            .await
+            .expect_err("second submission with different body should fail");
+
+        assert!(
+            matches!(err, SubmissionError::KeyCollision),
+            "expected KeyCollision, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn anonymous_submissions_do_not_populate_cache() {
+        let (_fluree, consensus, ledger_id) = setup().await;
+
+        consensus
+            .transact(request(&ledger_id, None, sample_insert("alice")))
+            .await
+            .expect("anonymous submission");
+
+        // A fresh keyed submission with any body should succeed — no anonymous
+        // entry should sit in the cache to clash with it.
+        let key = IdempotencyKey::new("01J5FRESH001").expect("test key fits cap");
+        consensus
+            .transact(request(
+                &ledger_id,
+                Some(key.as_str()),
+                sample_insert("bob"),
+            ))
+            .await
+            .expect("fresh keyed submission should succeed after anonymous");
+    }
+
+    #[tokio::test]
+    async fn upsert_routes_through_consensus() {
+        let (_fluree, consensus, ledger_id) = setup().await;
+
+        let mut req = request(&ledger_id, None, sample_insert("alice"));
+        req.body = TransactionBody::JsonLdUpsert(sample_insert("alice"));
+
+        let receipt = consensus.transact(req).await.expect("upsert to succeed");
+        assert!(receipt.commit.flake_count > 0);
+    }
+
+    #[tokio::test]
+    async fn tracking_enabled_submission_carries_tally() {
+        let (_fluree, consensus, ledger_id) = setup().await;
+
+        let mut req = request(&ledger_id, None, sample_insert("alice"));
+        req.tracking = Some(TrackingOptions {
+            track_time: true,
+            track_fuel: true,
+            track_policy: false,
+            max_fuel: None,
+        });
+
+        let receipt = consensus
+            .transact(req)
+            .await
+            .expect("tracked submission to succeed");
+        assert!(
+            receipt.tally.is_some(),
+            "a tracking-enabled submission should carry a tally"
+        );
+    }
+
+    #[tokio::test]
+    async fn policy_default_allow_permits_transaction() {
+        let (_fluree, consensus, ledger_id) = setup().await;
+
+        // `default-allow: true` is a policy input — it triggers policy-context
+        // construction inside the consensus layer — and it permits the write.
+        let mut req = request(&ledger_id, None, sample_insert("alice"));
+        req.governance = GovernanceOptions {
+            default_allow: true,
+            ..Default::default()
+        };
+
+        let receipt = consensus
+            .transact(req)
+            .await
+            .expect("policy-permitted transaction to succeed");
+        assert!(receipt.commit.flake_count > 0);
+    }
+
+    #[tokio::test]
+    async fn view_only_policy_blocks_transaction() {
+        let (_fluree, consensus, ledger_id) = setup().await;
+
+        // A view-only policy grants `f:view` but never `f:modify`; with
+        // `default-allow: false` the write has no grant, so the consensus
+        // layer's policy enforcement must reject it.
+        let body = json!({
+            "@context": {"ex": "http://example.org/"},
+            "insert": {"@id": "ex:john", "ex:name": "John"}
+        });
+        let mut req = request(&ledger_id, None, body.clone());
+        req.body = TransactionBody::JsonLdUpdate(body);
+        req.governance = GovernanceOptions {
+            policy: Some(json!([{
+                "@id": "ex:viewOnly",
+                "f:action": [{"@id": "f:view"}],
+                "f:allow": true
+            }])),
+            default_allow: false,
+            ..Default::default()
+        };
+
+        let err = consensus
+            .transact(req)
+            .await
+            .expect_err("view-only policy should block the write");
+        // A policy denial is a client error — it must carry a 4xx status.
+        match err {
+            SubmissionError::Execution { status, .. } => {
+                assert!((400..500).contains(&status), "expected 4xx, got {status}");
+            }
+            other => panic!("expected Execution, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_submission_is_recorded_as_failed() {
+        let (_fluree, consensus, _ledger_id) = setup().await;
+        let key = IdempotencyKey::new("01J5FAILED001").expect("test key fits cap");
+        let missing = "test/missing-ledger:main";
+
+        let err = consensus
+            .transact(request(missing, Some(key.as_str()), sample_insert("alice")))
+            .await
+            .expect_err("submission to a missing ledger should fail");
+        assert!(
+            matches!(err, SubmissionError::Execution { .. }),
+            "expected an execution failure, got {err:?}"
+        );
+
+        match consensus.status(missing, &key).await {
+            SubmissionState::Failed(_) => {}
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn turtle_insert_routes_through_consensus() {
+        let (_fluree, consensus, ledger_id) = setup().await;
+
+        let turtle = r#"@prefix ex: <http://example.org/> .
+ex:alice ex:name "Alice" ."#;
+        let req = TransactionRequest {
+            idempotency_key: None,
+            ledger_id: ledger_id.clone(),
+            body: TransactionBody::TurtleInsert(turtle.to_string()),
+            txn_opts: TxnOpts::default(),
+            commit_opts: CommitOpts::default(),
+            tracking: None,
+            governance: GovernanceOptions::default(),
+        };
+
+        let receipt = consensus
+            .transact(req)
+            .await
+            .expect("turtle insert to succeed");
+        assert!(receipt.commit.flake_count > 0);
+    }
+
+    #[tokio::test]
+    async fn sparql_update_routes_through_consensus() {
+        let (_fluree, consensus, ledger_id) = setup().await;
+
+        let req = TransactionRequest {
+            idempotency_key: None,
+            ledger_id: ledger_id.clone(),
+            body: TransactionBody::Sparql(
+                r#"INSERT DATA { <http://example.org/alice> <http://example.org/name> "Alice" . }"#
+                    .to_string(),
+            ),
+            txn_opts: TxnOpts::default(),
+            commit_opts: CommitOpts::default(),
+            tracking: None,
+            governance: GovernanceOptions::default(),
+        };
+
+        let receipt = consensus
+            .transact(req)
+            .await
+            .expect("SPARQL UPDATE to succeed");
+        assert!(receipt.commit.flake_count > 0);
+    }
+
+    #[tokio::test]
+    async fn sparql_parse_error_is_rejected() {
+        let (_fluree, consensus, ledger_id) = setup().await;
+
+        let req = TransactionRequest {
+            idempotency_key: None,
+            ledger_id: ledger_id.clone(),
+            body: TransactionBody::Sparql("INSERT DATA { this is not valid sparql".to_string()),
+            txn_opts: TxnOpts::default(),
+            commit_opts: CommitOpts::default(),
+            tracking: None,
+            governance: GovernanceOptions::default(),
+        };
+
+        let err = consensus
+            .transact(req)
+            .await
+            .expect_err("malformed SPARQL should be rejected");
+        match err {
+            SubmissionError::Execution { status, .. } => {
+                assert_eq!(status, 400, "SPARQL parse error should be 400");
+            }
+            other => panic!("expected Execution, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_submission_can_be_retried() {
+        let (fluree, consensus, _ledger_id) = setup().await;
+        let key = IdempotencyKey::new("01J5RETRYAFTERFAIL").expect("test key fits cap");
+        let ledger = "test/created-later:main";
+        let body = sample_insert("alice");
+
+        // First attempt fails — the ledger does not exist yet.
+        consensus
+            .transact(request(ledger, Some(key.as_str()), body.clone()))
+            .await
+            .expect_err("first attempt should fail before the ledger exists");
+
+        // Create the ledger, then retry with the same key + body. A cached
+        // `Failed` entry must not block the retry.
+        fluree.create_ledger(ledger).await.expect("create ledger");
+        let receipt = consensus
+            .transact(request(ledger, Some(key.as_str()), body))
+            .await
+            .expect("retry after the ledger exists should succeed");
+        assert!(receipt.commit.flake_count > 0);
+    }
+
+    /// Submit two inserts against the test ledger and return the second
+    /// commit's ID — the first call seeds the genesis commit (which cannot
+    /// be reverted) and the second produces the revertable commit every
+    /// revert test needs.
+    async fn seed_commit(consensus: &MonolithicCommitter, ledger_id: &str, name: &str) -> CommitId {
+        consensus
+            .transact(request(ledger_id, None, sample_insert("__genesis__")))
+            .await
+            .expect("genesis transaction to succeed");
+        let receipt = consensus
+            .transact(request(ledger_id, None, sample_insert(name)))
+            .await
+            .expect("seed transaction to succeed");
+        receipt.commit.commit_id
+    }
+
+    fn revert_request(
+        key: Option<&str>,
+        commit: CommitId,
+        strategy: ConflictStrategy,
+    ) -> RevertRequest {
+        RevertRequest {
+            idempotency_key: key.map(|k| IdempotencyKey::new(k).expect("test key fits cap")),
+            ledger_name: "test/consensus".to_string(),
+            branch: "main".to_string(),
+            selection: RevertSelection::single(CommitRef::Exact(commit)),
+            strategy,
+        }
+    }
+
+    #[tokio::test]
+    async fn anonymous_revert_returns_receipt() {
+        let (_fluree, consensus, ledger_id) = setup().await;
+        let commit = seed_commit(&consensus, &ledger_id, "alice").await;
+
+        let receipt = consensus
+            .revert(revert_request(None, commit, ConflictStrategy::Abort))
+            .await
+            .expect("revert to succeed");
+
+        assert!(receipt.idempotency_key.is_none());
+        assert_eq!(receipt.reverted_commits.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn idempotent_revert_returns_cached_receipt() {
+        let (_fluree, consensus, ledger_id) = setup().await;
+        let commit = seed_commit(&consensus, &ledger_id, "alice").await;
+        let key = "01J5REVERTRETRY";
+
+        let first = consensus
+            .revert(revert_request(
+                Some(key),
+                commit.clone(),
+                ConflictStrategy::Abort,
+            ))
+            .await
+            .expect("first revert to succeed");
+
+        let second = consensus
+            .revert(revert_request(Some(key), commit, ConflictStrategy::Abort))
+            .await
+            .expect("retry with same body should return cached receipt");
+
+        // Same receipt — the second call must not have re-executed.
+        // A second revert would advance `new_head_t` past the first.
+        assert_eq!(first.new_head_t, second.new_head_t);
+        assert_eq!(first.new_head_id, second.new_head_id);
+    }
+
+    #[tokio::test]
+    async fn keyed_revert_is_visible_via_status_lookup() {
+        let (_fluree, consensus, ledger_id) = setup().await;
+        let commit = seed_commit(&consensus, &ledger_id, "alice").await;
+        let key = IdempotencyKey::new("01J5REVERTSTATUS").expect("test key fits cap");
+
+        let receipt = consensus
+            .revert(revert_request(
+                Some(key.as_str()),
+                commit,
+                ConflictStrategy::Abort,
+            ))
+            .await
+            .expect("revert to succeed");
+
+        match consensus.status(&ledger_id, &key).await {
+            SubmissionState::Committed(OperationReceipt::Revert(stored)) => {
+                assert_eq!(stored.new_head_t, receipt.new_head_t);
+                assert_eq!(stored.new_head_id, receipt.new_head_id);
+            }
+            other => panic!("expected Committed(Revert), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn revert_key_collides_with_transaction_key() {
+        let (_fluree, consensus, ledger_id) = setup().await;
+        let key = "01J5MIXEDKEY";
+        // Seed a non-genesis commit so the revert target is valid.
+        let commit = seed_commit(&consensus, &ledger_id, "alice").await;
+
+        // A keyed transaction claims the key on this ledger:branch.
+        consensus
+            .transact(request(&ledger_id, Some(key), sample_insert("carol")))
+            .await
+            .expect("keyed transaction to succeed");
+
+        // A revert reusing the same key must collide — the cached entry is
+        // a `Transaction` receipt, not a `Revert` one, so the bodies cannot
+        // match.
+        let err = consensus
+            .revert(revert_request(Some(key), commit, ConflictStrategy::Abort))
+            .await
+            .expect_err("revert with a transaction's key should collide");
+        assert!(
+            matches!(err, SubmissionError::KeyCollision),
+            "expected KeyCollision, got {err:?}"
+        );
+    }
+
+    /// Build a Fluree + consensus + a parent branch with one commit + a child
+    /// `feature` branch with one additional commit — the minimum setup a
+    /// merge test needs.
+    async fn setup_with_feature_branch() -> (Arc<fluree_db_api::Fluree>, MonolithicCommitter) {
+        let (fluree, consensus, parent_id) = setup().await;
+        // Genesis commit on `main` so the branch has a head to fork from.
+        consensus
+            .transact(request(&parent_id, None, sample_insert("__genesis__")))
+            .await
+            .expect("seed commit to succeed");
+        fluree
+            .create_branch("test/consensus", "feature", Some("main"), None)
+            .await
+            .expect("create feature branch");
+        // One commit on `feature` so the merge has something to apply.
+        consensus
+            .transact(request(
+                "test/consensus:feature",
+                None,
+                sample_insert("alice"),
+            ))
+            .await
+            .expect("commit on feature to succeed");
+        (fluree, consensus)
+    }
+
+    fn merge_request(key: Option<&str>) -> MergeRequest {
+        MergeRequest {
+            idempotency_key: key.map(|k| IdempotencyKey::new(k).expect("test key fits cap")),
+            ledger_name: "test/consensus".to_string(),
+            source_branch: "feature".to_string(),
+            target_branch: Some("main".to_string()),
+            strategy: ConflictStrategy::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn anonymous_merge_returns_receipt() {
+        let (_fluree, consensus) = setup_with_feature_branch().await;
+
+        let receipt = consensus
+            .merge(merge_request(None))
+            .await
+            .expect("merge to succeed");
+
+        assert!(receipt.idempotency_key.is_none());
+        assert_eq!(receipt.source, "feature");
+        assert_eq!(receipt.target, "main");
+        // `main` hasn't advanced since `feature` branched, so the merge
+        // resolves to a fast-forward.
+        assert!(receipt.fast_forward);
+    }
+
+    #[tokio::test]
+    async fn idempotent_merge_returns_cached_receipt() {
+        let (_fluree, consensus) = setup_with_feature_branch().await;
+        let key = "01J5MERGERETRY";
+
+        let first = consensus
+            .merge(merge_request(Some(key)))
+            .await
+            .expect("first merge to succeed");
+
+        let second = consensus
+            .merge(merge_request(Some(key)))
+            .await
+            .expect("retry with same body should return cached receipt");
+
+        // Same receipt — the second call must not have re-executed.
+        // A second merge attempt against the already-merged target would
+        // change the head or fail; either way the t/id would differ.
+        assert_eq!(first.new_head_t, second.new_head_t);
+        assert_eq!(first.new_head_id, second.new_head_id);
+    }
+
+    #[tokio::test]
+    async fn keyed_merge_is_visible_via_status_lookup() {
+        let (_fluree, consensus) = setup_with_feature_branch().await;
+        let key = IdempotencyKey::new("01J5MERGESTATUS").expect("test key fits cap");
+
+        let receipt = consensus
+            .merge(merge_request(Some(key.as_str())))
+            .await
+            .expect("merge to succeed");
+
+        // Status namespacing for merge is `ledger:source_branch`.
+        let cache_ledger_id = fluree_db_api::format_ledger_id("test/consensus", "feature");
+        match consensus.status(&cache_ledger_id, &key).await {
+            SubmissionState::Committed(OperationReceipt::Merge(stored)) => {
+                assert_eq!(stored.new_head_t, receipt.new_head_t);
+                assert_eq!(stored.new_head_id, receipt.new_head_id);
+                assert_eq!(stored.fast_forward, receipt.fast_forward);
+            }
+            other => panic!("expected Committed(Merge), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn merge_key_collides_with_transaction_key() {
+        let (_fluree, consensus) = setup_with_feature_branch().await;
+        let key = "01J5MIXEDMERGEKEY";
+
+        // A keyed transaction on `ledger:feature` claims the cache slot.
+        consensus
+            .transact(request(
+                "test/consensus:feature",
+                Some(key),
+                sample_insert("dave"),
+            ))
+            .await
+            .expect("keyed transaction to succeed");
+
+        let err = consensus
+            .merge(merge_request(Some(key)))
+            .await
+            .expect_err("merge with a transaction's key should collide");
+        assert!(
+            matches!(err, SubmissionError::KeyCollision),
+            "expected KeyCollision, got {err:?}"
+        );
+    }
+
+    fn rebase_request(key: Option<&str>) -> RebaseRequest {
+        RebaseRequest {
+            idempotency_key: key.map(|k| IdempotencyKey::new(k).expect("test key fits cap")),
+            ledger_name: "test/consensus".to_string(),
+            branch: "feature".to_string(),
+            strategy: ConflictStrategy::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn anonymous_rebase_returns_receipt() {
+        let (_fluree, consensus) = setup_with_feature_branch().await;
+
+        let receipt = consensus
+            .rebase(rebase_request(None))
+            .await
+            .expect("rebase to succeed");
+
+        assert!(receipt.idempotency_key.is_none());
+        assert_eq!(receipt.branch, "feature");
+    }
+
+    #[tokio::test]
+    async fn idempotent_rebase_returns_cached_receipt() {
+        let (_fluree, consensus) = setup_with_feature_branch().await;
+        let key = "01J5REBASERETRY";
+
+        let first = consensus
+            .rebase(rebase_request(Some(key)))
+            .await
+            .expect("first rebase to succeed");
+
+        let second = consensus
+            .rebase(rebase_request(Some(key)))
+            .await
+            .expect("retry with same body should return cached receipt");
+
+        assert_eq!(first.source_head_t, second.source_head_t);
+        assert_eq!(first.source_head_id, second.source_head_id);
+        assert_eq!(first.replayed, second.replayed);
+    }
+
+    #[tokio::test]
+    async fn keyed_rebase_is_visible_via_status_lookup() {
+        let (_fluree, consensus) = setup_with_feature_branch().await;
+        let key = IdempotencyKey::new("01J5REBASESTATUS").expect("test key fits cap");
+
+        let receipt = consensus
+            .rebase(rebase_request(Some(key.as_str())))
+            .await
+            .expect("rebase to succeed");
+
+        // Cache namespace for rebase is `ledger:branch` (the branch being rebased).
+        let cache_ledger_id = fluree_db_api::format_ledger_id("test/consensus", "feature");
+        match consensus.status(&cache_ledger_id, &key).await {
+            SubmissionState::Committed(OperationReceipt::Rebase(stored)) => {
+                assert_eq!(stored.source_head_t, receipt.source_head_t);
+                assert_eq!(stored.source_head_id, receipt.source_head_id);
+                assert_eq!(stored.fast_forward, receipt.fast_forward);
+            }
+            other => panic!("expected Committed(Rebase), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn rebase_key_collides_with_transaction_key() {
+        let (_fluree, consensus) = setup_with_feature_branch().await;
+        let key = "01J5MIXEDREBASEKEY";
+
+        // A keyed transaction on `ledger:feature` claims the cache slot.
+        consensus
+            .transact(request(
+                "test/consensus:feature",
+                Some(key),
+                sample_insert("eve"),
+            ))
+            .await
+            .expect("keyed transaction to succeed");
+
+        let err = consensus
+            .rebase(rebase_request(Some(key)))
+            .await
+            .expect_err("rebase with a transaction's key should collide");
+        assert!(
+            matches!(err, SubmissionError::KeyCollision),
+            "expected KeyCollision, got {err:?}"
+        );
+    }
+
+    fn push_request(key: Option<&str>, commits: Vec<Vec<u8>>) -> PushRequest {
+        PushRequest {
+            idempotency_key: key.map(|k| IdempotencyKey::new(k).expect("test key fits cap")),
+            ledger_id: "test/consensus:main".to_string(),
+            commits,
+            blobs: std::collections::HashMap::new(),
+            governance: GovernanceOptions::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_push_returns_execution_error() {
+        let (_fluree, consensus, _ledger_id) = setup().await;
+
+        let err = consensus
+            .push(push_request(None, vec![]))
+            .await
+            .expect_err("push with no commits should be rejected");
+        match err {
+            SubmissionError::Execution { status, .. } => {
+                assert_eq!(status, 400, "empty push must report a 400");
+            }
+            other => panic!("expected Execution, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn submission_rejected_when_pending_cap_reached() {
+        // Override the cap to zero so no permit is ever available — every
+        // submission must hit `Overloaded` instead of executing.
+        let (_fluree, consensus, ledger_id) = setup().await;
+        let consensus = consensus.with_pending_limit(0);
+
+        let err = consensus
+            .transact(request(&ledger_id, None, sample_insert("alice")))
+            .await
+            .expect_err("limit=0 should refuse every submission");
+        assert!(
+            matches!(err, SubmissionError::Overloaded),
+            "expected Overloaded, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn per_ledger_cap_rejects_when_saturated() {
+        // Hold the single per-ledger permit ourselves so the next submission
+        // can't acquire one — drops directly to `Overloaded` at the
+        // per-ledger tier without consulting the global pool.
+        let (_fluree, consensus, ledger_id) = setup().await;
+        let consensus = consensus.with_per_ledger_pending_limit(1);
+        let sema = consensus.ledger_semaphore(&ledger_id);
+        let _hold = sema
+            .try_acquire()
+            .expect("first per-ledger permit should be available");
+
+        let err = consensus
+            .transact(request(&ledger_id, None, sample_insert("alice")))
+            .await
+            .expect_err("saturated per-ledger cap must refuse submissions");
+        assert!(
+            matches!(err, SubmissionError::Overloaded),
+            "expected Overloaded, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn per_ledger_cap_does_not_block_other_ledgers() {
+        // Saturating ledger A's per-ledger semaphore must leave ledger B's
+        // independent slot untouched — that's the whole point of layering
+        // a per-ledger cap under the global pool.
+        let (fluree, consensus, ledger_a) = setup().await;
+        let ledger_b = "test/consensus:other".to_string();
+        fluree
+            .create_ledger(&ledger_b)
+            .await
+            .expect("create second ledger");
+        let consensus = consensus.with_per_ledger_pending_limit(1);
+
+        let sema_a = consensus.ledger_semaphore(&ledger_a);
+        let _hold = sema_a
+            .try_acquire()
+            .expect("first per-ledger permit on A should be available");
+
+        let err_a = consensus
+            .transact(request(&ledger_a, None, sample_insert("a")))
+            .await
+            .expect_err("A is saturated");
+        assert!(
+            matches!(err_a, SubmissionError::Overloaded),
+            "expected Overloaded for A, got {err_a:?}"
+        );
+
+        let ok_b = consensus
+            .transact(request(&ledger_b, None, sample_insert("b")))
+            .await
+            .expect("B should admit; its per-ledger semaphore is independent of A's");
+        assert!(ok_b.commit.flake_count > 0);
+    }
+
+    #[tokio::test]
+    async fn cache_capacity_override_preserves_idempotency() {
+        // A custom byte budget swaps the underlying moka cache. Confirm a
+        // keyed submission still records into the rebuilt cache and is
+        // recoverable via `status` — i.e. the override doesn't sever the
+        // claim-then-record path.
+        let (_fluree, consensus, ledger_id) = setup().await;
+        let consensus = consensus.with_cache_capacity_bytes(64 * 1024);
+        let key = "01J5OVERRIDEKEY00000";
+
+        let receipt = consensus
+            .transact(request(&ledger_id, Some(key), sample_insert("octavia")))
+            .await
+            .expect("keyed submission to succeed under custom budget");
+        assert_eq!(
+            receipt.idempotency_key.as_ref().map(IdempotencyKey::as_str),
+            Some(key)
+        );
+
+        let key = IdempotencyKey::new(key).expect("test key fits cap");
+        match consensus.status(&ledger_id, &key).await {
+            SubmissionState::Committed(OperationReceipt::Transaction(_)) => {}
+            other => panic!("expected Committed transaction in cache, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn push_key_collides_with_transaction_key() {
+        let (_fluree, consensus, ledger_id) = setup().await;
+        let key = "01J5MIXEDPUSHKEY";
+
+        // A keyed transaction on `ledger:main` claims the cache slot.
+        consensus
+            .transact(request(&ledger_id, Some(key), sample_insert("frank")))
+            .await
+            .expect("keyed transaction to succeed");
+
+        // The push reuses the same key on the same ledger:main — the cached
+        // Transaction receipt body-hash will not match the push body-hash,
+        // so the slot-claim returns KeyCollision before any push validation
+        // runs. Commits payload is empty for that reason.
+        let err = consensus
+            .push(push_request(Some(key), vec![]))
+            .await
+            .expect_err("push with a transaction's key should collide");
+        assert!(
+            matches!(err, SubmissionError::KeyCollision),
+            "expected KeyCollision, got {err:?}"
+        );
+    }
+}

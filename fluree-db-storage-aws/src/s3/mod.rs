@@ -439,7 +439,9 @@ impl StorageRead for S3Storage {
                     key = key.as_str(),
                     address,
                     range = range_header.as_str(),
+                    send_elapsed_ms,
                     body_elapsed_ms,
+                    total_elapsed_ms = total_started.elapsed().as_millis() as u64,
                     timeout_ms = send_timeout.as_millis() as u64,
                     is_express = Self::is_express_bucket(&self.bucket),
                     "s3 read_byte_range: body collect timed out"
@@ -459,6 +461,7 @@ impl StorageRead for S3Storage {
                 address,
                 range = range_header.as_str(),
                 body_bytes = bytes.len(),
+                send_elapsed_ms,
                 body_elapsed_ms,
                 total_elapsed_ms = total_started.elapsed().as_millis() as u64,
                 is_express = Self::is_express_bucket(&self.bucket),

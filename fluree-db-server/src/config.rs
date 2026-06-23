@@ -438,6 +438,12 @@ pub struct ServerConfig {
     #[arg(long, env = "FLUREE_QUERY_MIN_T_TIMEOUT_MS", default_value_t = server_defaults::DEFAULT_QUERY_MIN_T_TIMEOUT_MS)]
     pub query_min_t_timeout_ms: u64,
 
+    /// Heartbeat interval (ms) for the streaming query endpoint. Keep-alive
+    /// records flush at this cadence during stalls; set below the fronting
+    /// proxy's idle timeout. 0 disables heartbeats.
+    #[arg(long, env = "FLUREE_STREAM_HEARTBEAT_MS", default_value_t = server_defaults::DEFAULT_STREAM_HEARTBEAT_MS)]
+    pub stream_heartbeat_ms: u64,
+
     /// Enable query-time nameservice refresh checks before current-head reads.
     #[arg(long, env = "FLUREE_QUERY_REFRESH_ENABLED", default_value_t = server_defaults::DEFAULT_QUERY_REFRESH_ENABLED)]
     pub query_refresh_enabled: bool,
@@ -737,6 +743,7 @@ impl Default for ServerConfig {
             body_limit: server_defaults::DEFAULT_BODY_LIMIT,
             query_timeout_ms: server_defaults::DEFAULT_QUERY_TIMEOUT_MS,
             query_min_t_timeout_ms: server_defaults::DEFAULT_QUERY_MIN_T_TIMEOUT_MS,
+            stream_heartbeat_ms: server_defaults::DEFAULT_STREAM_HEARTBEAT_MS,
             query_refresh_enabled: server_defaults::DEFAULT_QUERY_REFRESH_ENABLED,
             query_refresh_ttl_ms: server_defaults::DEFAULT_QUERY_REFRESH_TTL_MS,
             import_presign_enabled: false,

@@ -38,11 +38,12 @@ members = [
     "fluree-db-cli",
     "fluree-db-memory",
     "fluree-bench-support",
+    "fluree-db-consensus",
 ]
 exclude = ["testsuite-sparql"]
 
 [workspace.package]
-version = "4.0.7"
+version = "4.1.0"
 edition = "2021"
 license = "BUSL-1.1"
 repository = "https://github.com/fluree/db"

@@ -174,6 +174,12 @@ pub struct BinaryScanOperator {
     sid_cache: HashMap<u64, Sid>,
     /// Whether predicate is a variable (for internal predicate filtering).
     p_is_var: bool,
+    /// Snapshot of `ExecutionContext::include_system_facts` taken at
+    /// `open()` time. When `true`, both filter sites
+    /// (`is_internal_predicate` on the binary cursor path and the
+    /// `f:reifies*` skip in `flakes_to_bindings`) become no-ops so
+    /// debug/inspection callers can see Fluree-system facts directly.
+    include_system_facts: bool,
     inline_ops: Vec<InlineOperator>,
     /// Encoded pre-filters compiled from inline filter expressions.
     ///
@@ -644,6 +650,7 @@ impl BinaryScanOperator {
             p_sids: Vec::new(),
             sid_cache: HashMap::new(),
             p_is_var,
+            include_system_facts: false,
             inline_ops,
             encoded_pre_filters: Vec::new(),
             emit,
@@ -705,6 +712,27 @@ impl BinaryScanOperator {
             let Some(flake) = self.range_iter.as_mut().and_then(std::iter::Iterator::next) else {
                 break;
             };
+
+            // Hide `f:reifies*` system predicates from
+            // variable-predicate scans on the overlay/novelty
+            // side. Without this, a scan like `?s ?p ?o` against
+            // an annotated subject leaks `f:reifiesSubject` /
+            // `f:reifiesPredicate` / `f:reifiesObject` from the
+            // overlay. Applied in every graph context (default
+            // and named) — annotation bundles are emitted in
+            // their reified edge's graph, so a `GRAPH ?g` /
+            // per-graph variable-predicate scan would otherwise
+            // leak the bundle in that graph.
+            //
+            // `include_system_facts` (set from
+            // `opts.includeSystemFacts: true`) bypasses the filter
+            // for debug / inspection workflows.
+            if self.p_is_var
+                && !self.include_system_facts
+                && fluree_db_core::is_reserved_reifies_predicate(&flake.p)
+            {
+                continue;
+            }
 
             if let Some(target_iri) = self.unresolved_bound_subject_iri.as_ref() {
                 let subject_iri = ctx
@@ -873,6 +901,12 @@ impl BinaryScanOperator {
         }
         self.store = ctx.binary_store.clone();
         self.g_id = ctx.binary_g_id;
+        // History-range queries unconditionally surface `f:reifies*`
+        // events; mirrors the rule applied in `open()`. Without this,
+        // a variable-predicate history scan would still drop `f:reifies*`
+        // rows in `flakes_to_bindings` because `prime_history_flakes`
+        // bypasses `open()`.
+        self.include_system_facts = ctx.include_system_facts || self.mode.is_history();
         self.range_iter = Some(flakes.into_iter());
         self.cursor = None;
         self.state = OperatorState::Open;
@@ -1034,15 +1068,41 @@ impl BinaryScanOperator {
             .unwrap_or_else(|| Sid::new(0, ""))
     }
 
-    /// Filter: skip internal db: predicates when predicate is a variable.
+    /// Filter: skip Fluree-system predicates when predicate is a
+    /// variable.
+    ///
+    /// Two predicate sets are filtered:
+    ///
+    /// 1. **`f:reifies*`** (the seven edge-annotation bundle
+    ///    predicates) are hidden in **every** graph context. The
+    ///    annotation bundle is emitted in the reified edge's
+    ///    graph, so a per-graph `?p` scan would otherwise leak the
+    ///    bundle into the user's results.
+    /// 2. Other Fluree-namespace predicates (commit metadata,
+    ///    nameservice, etc.) are hidden only in the **default
+    ///    graph**, matching the prior behavior of this filter.
+    ///    Those predicates live in their own system graphs (e.g.
+    ///    txn-meta at `g_id == 1`) and the legacy default-graph
+    ///    filter is preserved to avoid behavior drift for queries
+    ///    that have grown to depend on it.
     #[inline]
     fn is_internal_predicate(&self, p_id: u32) -> bool {
-        if !self.p_is_var || self.g_id != 0 {
+        if !self.p_is_var {
             return false;
         }
-        self.p_sids
-            .get(p_id as usize)
-            .is_some_and(|s| s.namespace_code == fluree_vocab::namespaces::FLUREE_DB)
+        // Opt-in escape for debug / inspection workflows.
+        if self.include_system_facts {
+            return false;
+        }
+        let Some(sid) = self.p_sids.get(p_id as usize) else {
+            return false;
+        };
+        // Always hide `f:reifies*` regardless of graph.
+        if fluree_db_core::is_reserved_reifies_predicate(sid) {
+            return true;
+        }
+        // Default-graph: also hide the broader Fluree-namespace set.
+        self.g_id == 0 && sid.namespace_code == fluree_vocab::namespaces::FLUREE_DB
     }
 
     /// Enforce within-pattern repeated-variable constraints.
@@ -1598,6 +1658,11 @@ impl Operator for BinaryScanOperator {
         // Resolve store and g_id from context.
         self.store = ctx.binary_store.clone();
         self.g_id = ctx.binary_g_id;
+        // History-range queries unconditionally surface `f:reifies*`
+        // events: attachment lifecycle is part of ledger history and
+        // hiding it would defeat the point of inspecting a history
+        // window. Otherwise honor the per-query opt-in.
+        self.include_system_facts = ctx.include_system_facts || self.mode.is_history();
 
         // Multi-graph fanout is handled by DatasetOperator, which wraps
         // BinaryScanOperator at the scan construction sites (where_plan.rs,
@@ -1611,7 +1676,7 @@ impl Operator for BinaryScanOperator {
         // and class-cache population. The binary cursor path currently does not
         // apply policy filtering, so force the range fallback when a non-root
         // policy enforcer is present.
-        if ctx.policy_enforcer.as_ref().is_some_and(|p| !p.is_root()) {
+        if !ctx.allow_unfiltered() {
             return self.open_range_fallback(ctx).await;
         }
 
@@ -1692,6 +1757,8 @@ impl Operator for BinaryScanOperator {
                 )
                 .with_runtime_small_dicts_opt(ctx.runtime_small_dicts),
                 self.store.as_ref(),
+                // Scan-time datatype narrowing only — never semantic elision.
+                false,
             );
             let inferred_dt_sid = if dt_sid.is_none() && lang.is_none() {
                 filter.p_id.and_then(|p_id| {
@@ -2665,19 +2732,16 @@ fn value_to_otype_okey(
                     "datatype not resolvable to OType for Double value",
                 )
             })?;
-            if d.is_finite() && d.fract() == 0.0 {
-                let as_i64 = *d as i64;
-                if (as_i64 as f64) == *d {
-                    return Ok((ot, ObjKey::encode_i64(as_i64).as_u64()));
-                }
-            }
-            if d.is_finite() {
-                match ObjKey::encode_f64(*d) {
-                    Ok(key) => Ok((ot, key.as_u64())),
-                    Err(_) => Ok((OType::NULL, 0)),
-                }
-            } else {
-                Ok((OType::NULL, 0))
+            // Do NOT optimize integral doubles to encode_i64: `ot` is the
+            // datatype-derived OType (e.g. XSD_DOUBLE), whose decode kind is F64.
+            // Pairing it with an i64-encoded key makes the reader run decode_f64
+            // over integer bits, corrupting the value to a tiny subnormal
+            // (55000.0 -> 2.71736e-319). Mirrors the encode-side guards in
+            // resolver.rs / import_sink.rs. (fluree/db-r#142)
+            match ObjKey::encode_f64(*d) {
+                Ok(key) => Ok((ot, key.as_u64())),
+                // NaN/Inf can't be order-encoded → NULL sentinel.
+                Err(_) => Ok((OType::NULL, 0)),
             }
         }
         FlakeValue::Ref(sid) => {

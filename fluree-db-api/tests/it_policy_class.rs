@@ -8,7 +8,7 @@
 mod support;
 
 use fluree_db_api::policy_builder;
-use fluree_db_api::{FlureeBuilder, QueryConnectionOptions};
+use fluree_db_api::{FlureeBuilder, GovernanceOptions};
 use serde_json::json;
 use std::collections::HashMap;
 use support::{assert_index_defaults, genesis_ledger};
@@ -86,7 +86,7 @@ async fn policy_class_restricts_ssn_to_own_user() {
     let ledger = fluree.insert(ledger0, &setup).await.unwrap().ledger;
 
     // Build policy context using policy_class option with Alice's identity
-    let qc_opts = QueryConnectionOptions {
+    let qc_opts = GovernanceOptions {
         policy_class: Some(vec!["http://example.org/ns/EmployeePolicy".to_string()]),
         policy_values: Some(HashMap::from([(
             "?$identity".to_string(),
@@ -193,7 +193,7 @@ async fn policy_class_allows_non_restricted_properties() {
 
     let ledger = fluree.insert(ledger0, &setup).await.unwrap().ledger;
 
-    let qc_opts = QueryConnectionOptions {
+    let qc_opts = GovernanceOptions {
         policy_class: Some(vec!["http://example.org/ns/EmployeePolicy".to_string()]),
         policy_values: Some(HashMap::from([(
             "?$identity".to_string(),
@@ -292,7 +292,7 @@ async fn policy_class_blocks_other_user_ssn_in_where() {
 
     let ledger = fluree.insert(ledger0, &setup).await.unwrap().ledger;
 
-    let qc_opts = QueryConnectionOptions {
+    let qc_opts = GovernanceOptions {
         policy_class: Some(vec!["http://example.org/ns/EmployeePolicy".to_string()]),
         policy_values: Some(HashMap::from([(
             "?$identity".to_string(),

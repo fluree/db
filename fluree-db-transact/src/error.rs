@@ -37,6 +37,14 @@ pub enum TransactError {
     #[error("Parse error: {0}")]
     Parse(String),
 
+    /// A syntactically valid transaction feature is not yet implemented.
+    ///
+    /// Distinct from [`Self::Parse`] (which is user-error) and
+    /// [`fluree_db_query::QueryError::UnsupportedFeature`] (the read-side
+    /// counterpart). M0 surface for edge annotations on inserts/updates.
+    #[error("Unsupported feature: {0}")]
+    UnsupportedFeature(String),
+
     /// SPARQL lowering error (structured, includes source spans)
     #[error("SPARQL lowering error: {0}")]
     SparqlLower(#[from] fluree_db_sparql::LowerError),
@@ -132,6 +140,15 @@ pub enum TransactError {
     /// Raw transaction upload failed (parallel `store_raw_txn` path).
     #[error("Raw transaction upload failed: {0}")]
     RawTxnUpload(String),
+
+    /// Transaction violates a structural invariant of the staged
+    /// flake set — e.g. an annotation SID would be attached to more
+    /// than one edge in a single transaction without retracting the
+    /// prior attachment. Distinct from [`Self::Parse`] (input syntax)
+    /// and [`Self::UniqueConstraintViolation`] (schema-level
+    /// `f:enforceUnique`).
+    #[error("Transaction invariant violation: {0}")]
+    InvariantViolation(String),
 
     /// Unique constraint violation (`f:enforceUnique`).
     ///

@@ -6,6 +6,10 @@ If you're new to Fluree, start with the [Getting Started](../getting-started/REA
 
 ## Cookbooks
 
+### [Query Patterns](cookbook-query-patterns.md)
+
+Recipes for the list-value and path operators: dense / gap-filled series with `unwind` + `range`, collecting values into lists, the collect→unwind round-trip, working with list values, and shortest-path queries.
+
 ### [Full-Text and Vector Search](cookbook-search.md)
 
 Set up BM25 full-text search and vector similarity. Insert searchable data, write relevance-ranked queries, combine search with graph patterns, and build hybrid text+vector search.
@@ -25,3 +29,7 @@ Set up fine-grained access control: department isolation, role-based access, pro
 ### [SHACL Validation](cookbook-shacl.md)
 
 Define data quality constraints: required properties, datatype validation, value ranges, string patterns, cardinality, and allowed values.
+
+### [Edge Annotations](cookbook-edge-annotations.md)
+
+Attach properties to a relationship: model property-graph edges, record statement-level provenance, represent parallel relationships, query inline or annotation-rooted, and understand the retract cascade — in JSON-LD and SPARQL 1.2.

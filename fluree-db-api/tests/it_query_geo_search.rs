@@ -18,10 +18,13 @@
 use std::sync::Arc;
 mod support;
 
-use fluree_db_api::{FlureeBuilder, LedgerState, Novelty};
+use fluree_db_api::{
+    policy_builder, FlureeBuilder, GovernanceOptions, IndexConfig, LedgerState, Novelty,
+};
 use fluree_db_core::LedgerSnapshot;
+use fluree_db_transact::{CommitOpts, TxnOpts};
 use serde_json::{json, Value as JsonValue};
-use support::start_background_indexer_local;
+use support::{start_background_indexer_local, trigger_index_and_wait_outcome};
 
 fn geo_search_context() -> JsonValue {
     json!({
@@ -830,6 +833,128 @@ async fn sparql_geof_distance_uses_geo_index() {
                     eprintln!("SPARQL geof:distance query error: {e}");
                 }
             }
+        })
+        .await;
+}
+
+/// View policy must drop geo search hits whose location flake the identity
+/// cannot view. Regression for the geo leak: `GeoSearchOperator` reads location
+/// flakes directly from the index with no per-flake policy filtering.
+#[tokio::test]
+async fn geo_search_enforces_view_policy_on_location_flake() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let path = tmp.path().to_string_lossy().to_string();
+    let index_cfg = IndexConfig {
+        reindex_min_bytes: 0,
+        reindex_max_bytes: 1_000_000,
+    };
+    let mut fluree = FlureeBuilder::file(path).build().expect("build");
+    let alias = "it/geo-policy:main";
+
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        Arc::new(fluree.nameservice_mode().clone()),
+        fluree_db_indexer::IndexerConfig::small(),
+    );
+    fluree.set_indexing_mode(fluree_db_api::tx::IndexingMode::Background(handle.clone()));
+
+    local
+        .run_until(async move {
+            let ledger = fluree.create_ledger(alias).await.unwrap();
+
+            // Paris (shareable) + London, both within 500km of the search center.
+            let setup = json!({
+                "@context": {"ex": "http://example.org/", "geo": "http://www.opengis.net/ont/geosparql#"},
+                "@graph": [
+                    {"@id": "ex:paris", "@type": "ex:City", "ex:canSee": true,
+                     "ex:location": {"@value": "POINT(2.3522 48.8566)", "@type": "geo:wktLiteral"}},
+                    {"@id": "ex:london", "@type": "ex:City",
+                     "ex:location": {"@value": "POINT(-0.1278 51.5074)", "@type": "geo:wktLiteral"}}
+                ]
+            });
+            let r1 = fluree
+                .upsert_with_opts(ledger, &setup, TxnOpts::default(), CommitOpts::default(), &index_cfg)
+                .await
+                .unwrap();
+            trigger_index_and_wait_outcome(&handle, alias, r1.receipt.t).await;
+            let loaded = fluree.ledger(alias).await.expect("load ledger");
+            assert!(
+                loaded.snapshot.range_provider.is_some(),
+                "geo search needs the binary index"
+            );
+
+            let geo_where = json!([
+                {"@id": "?place", "ex:location": "?loc"},
+                ["bind", "?dist", "(geof:distance ?loc \"POINT(2.3522 48.8566)\")"],
+                ["filter", "(<= ?dist 500000)"]
+            ]);
+
+            // The loaded indexed ledger carries the binary store geo needs, so
+            // query through that GraphDb (query_connection's path doesn't wire it
+            // for geo). Same query body for control + policy.
+            let query = json!({
+                "@context": {"ex": "http://example.org/", "geo": "http://www.opengis.net/ont/geosparql#"},
+                "select": ["?place"],
+                "where": geo_where
+            });
+
+            // Control: no policy => both cities are within range.
+            let control_json = support::query_jsonld(&fluree, &loaded, &query)
+                .await
+                .expect("control query")
+                .to_jsonld(&loaded.snapshot)
+                .expect("jsonld")
+                .to_string();
+            assert!(
+                control_json.contains("paris") && control_json.contains("london"),
+                "control: both cities should be in range; got {control_json}"
+            );
+
+            // Policy: ex:location is viewable only for shareable cities (Paris).
+            let policy = json!([{
+                "@id": "ex:locPolicy",
+                "@type": "f:AccessPolicy",
+                "f:action": "f:view",
+                "f:onProperty": [{"@id": "http://example.org/location"}],
+                "f:query": {
+                    "@type": "@json",
+                    "@value": {
+                        "@context": {"ex": "http://example.org/"},
+                        "where": [{"@id": "?$this", "ex:canSee": true}]
+                    }
+                }
+            }]);
+            let opts = GovernanceOptions {
+                policy: Some(policy),
+                default_allow: false,
+                ..Default::default()
+            };
+            let policy_ctx = policy_builder::build_policy_context_from_opts(
+                &loaded.snapshot,
+                loaded.novelty.as_ref(),
+                None,
+                loaded.t(),
+                &opts,
+                &[0],
+            )
+            .await
+            .expect("build policy");
+
+            let jsonld =
+                support::query_jsonld_with_policy(&fluree, &loaded, &query, &policy_ctx)
+                    .await
+                    .expect("policy query")
+                    .to_jsonld(&loaded.snapshot)
+                    .expect("jsonld");
+            let rendered = jsonld.to_string();
+            assert!(
+                rendered.contains("paris"),
+                "Paris (viewable location) must remain; got {jsonld:#?}"
+            );
+            assert!(
+                !rendered.contains("london"),
+                "London (hidden location) must not leak through geo search; got {jsonld:#?}"
+            );
         })
         .await;
 }

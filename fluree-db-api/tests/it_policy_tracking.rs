@@ -6,8 +6,8 @@ mod support;
 
 use fluree_db_api::policy_builder;
 use fluree_db_api::{
-    CommitOpts, FlureeBuilder, IndexConfig, QueryConnectionOptions, TrackedTransactionInput,
-    TxnOpts, TxnType,
+    CommitOpts, FlureeBuilder, GovernanceOptions, IndexConfig, TrackedTransactionInput, TxnOpts,
+    TxnType,
 };
 use serde_json::json;
 use std::collections::HashMap;
@@ -46,7 +46,7 @@ async fn transact_policy_denied_includes_policy_and_fuel_tracking() {
         .expect("policy query json string")
     }]);
 
-    let qc_opts = QueryConnectionOptions {
+    let qc_opts = GovernanceOptions {
         policy: Some(policy),
         policy_values: Some(HashMap::from([(
             "?$identity".to_string(),

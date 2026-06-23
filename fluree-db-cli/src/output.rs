@@ -15,6 +15,10 @@ pub enum OutputFormatKind {
     Table,
     Csv,
     Tsv,
+    /// Newline-delimited JSON, produced incrementally by the streaming query
+    /// path. Emits one bare binding object per line (or the full record
+    /// protocol when `--envelope` is set). See `commands::query_stream`.
+    Ndjson,
 }
 
 impl std::fmt::Display for OutputFormatKind {
@@ -25,6 +29,7 @@ impl std::fmt::Display for OutputFormatKind {
             Self::Table => f.write_str("table"),
             Self::Csv => f.write_str("csv"),
             Self::Tsv => f.write_str("tsv"),
+            Self::Ndjson => f.write_str("ndjson"),
         }
     }
 }
@@ -209,6 +214,24 @@ fn sparql_table_cell(
 
         // Grouped values must be disaggregated into multiple rows for SPARQL semantics.
         Binding::Grouped(_) => return Err(SparqlTableFastPath::NeedsDisaggregation),
+
+        // A path renders as arrow-joined node IRIs (Cypher-only; never reached
+        // via the SPARQL surface).
+        Binding::Path(nodes) => nodes
+            .iter()
+            .map(|sid| compact_bnode_strip(compactor.compact_sid_for_display(sid).ok()))
+            .collect::<Vec<_>>()
+            .join("->"),
+
+        // A list (Cypher collect/list value) — semicolon-joined cells; never
+        // reached via the SPARQL surface.
+        Binding::List(values) => {
+            let mut parts = Vec::with_capacity(values.len());
+            for v in values {
+                parts.push(sparql_table_cell(v, compactor, gv)?);
+            }
+            parts.join(";")
+        }
     };
     Ok(s)
 }
@@ -255,6 +278,15 @@ pub fn format_result(
             Err(crate::error::CliError::Usage(format!(
                 "{format} format requires direct access to query results (not available for remote queries)",
             )))
+        }
+        OutputFormatKind::Ndjson => {
+            // NDJSON is streamed incrementally via the streaming query path
+            // (commands::query_stream) and never goes through this buffered
+            // formatter.
+            Err(crate::error::CliError::Usage(
+                "ndjson format is produced by the streaming query path, not the buffered formatter"
+                    .to_string(),
+            ))
         }
     }
 }

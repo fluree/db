@@ -14,7 +14,7 @@ use crate::context::ExecutionContext;
 use crate::error::{QueryError, Result};
 use crate::fast_path_common::{
     build_count_batch, build_i64_singleton_batch, build_range_cursor, contiguous_id_range,
-    fast_path_store, ref_to_p_id, FastPathOperator,
+    fast_path_store_for_predicate, ref_to_p_id, FastPathOperator,
 };
 use crate::ir::triple::Ref;
 use crate::operator::BoxedOperator;
@@ -73,7 +73,10 @@ pub fn string_prefix_sum_strstarts_operator(
 }
 
 fn prefix_match_count(ctx: &ExecutionContext<'_>, pred: &Ref, prefix: &str) -> Result<Option<u64>> {
-    let Some(store) = fast_path_store(ctx) else {
+    // O1: only proceed when the scanned predicate is provably uncovered by the
+    // view policy; otherwise defer to the fallback (which applies the policy and
+    // evaluates the prefix filter per visible row).
+    let Some(store) = fast_path_store_for_predicate(ctx, pred)? else {
         return Ok(None);
     };
 

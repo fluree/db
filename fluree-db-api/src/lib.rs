@@ -42,6 +42,7 @@ pub mod config_resolver;
 #[cfg(feature = "credential")]
 pub mod credential;
 pub mod cross_ledger;
+pub mod csv_import;
 pub mod dataset;
 mod error;
 pub mod explain;
@@ -55,6 +56,7 @@ pub mod graph_snapshot;
 pub mod graph_source;
 pub mod graph_transact_builder;
 pub mod import;
+mod indexer_attachment_provider;
 mod indexer_fulltext_provider;
 mod inline_ontology;
 #[cfg(feature = "shacl")]
@@ -112,19 +114,20 @@ pub use block_fetch::{
 };
 pub use commit_transfer::{
     Base64Bytes, BulkImportResult, CommitImportResult, ExportCommitsRequest, ExportCommitsResponse,
-    PushCommitsRequest, PushCommitsResponse, RestoreResult,
+    PushCommitsRequest, PushCommitsResponse, PushedHead, RestoreResult,
 };
 pub use dataset::{
-    sparql_dataset_ledger_ids, DatasetParseError, DatasetSpec, GraphSource, QueryConnectionOptions,
+    sparql_dataset_ledger_ids, DatasetParseError, DatasetSpec, GovernanceOptions, GraphSource,
     TimeSpec,
 };
 pub use error::{ApiError, BuilderError, BuilderErrors, Result};
-pub use fluree_db_core::ContentId;
+pub use fluree_db_core::ledger_id::format_ledger_id;
 pub use fluree_db_core::RemoteObject;
 pub use fluree_db_core::{
     commit_to_summary, find_common_ancestor, walk_commit_summaries, CommitSummary, CommonAncestor,
     ConflictKey, QueryCancellation, QueryCancellationReason,
 };
+pub use fluree_db_core::{CommitId, ContentId};
 pub use format::{AgentJsonContext, FormatError, FormatterConfig, OutputFormat, QueryOutput};
 pub use graph::Graph;
 pub use graph_commit_builder::{CommitBuilder, CommitDetail, ResolvedFlake, ResolvedValue};
@@ -167,14 +170,17 @@ pub use query::builder::{
 pub use query::nameservice_builder::NameserviceQueryBuilder;
 pub use query::{QueryExecutionOptions, QueryResult, TrackedErrorResponse, TrackedQueryResponse};
 pub use rebase::{ConflictStrategy, RebaseConflict, RebaseFailure, RebaseReport};
-pub use revert::RevertReport;
+pub use revert::{RevertReport, RevertSelection};
 pub use revert_preview::{RevertConflictSummary, RevertPreview, RevertPreviewOpts};
 pub use tx::{
     IndexingMode, IndexingStatus, StageResult, TrackedTransactionInput, TransactResult,
     TransactResultRef,
 };
 pub use tx_builder::{OwnedTransactBuilder, RefTransactBuilder, Staged};
-pub use view::{ConfigReasoningBudget, DataSetDb, GraphDb, QueryInput, ReasoningModePrecedence};
+pub use view::{
+    ConfigReasoningBudget, DataSetDb, GraphDb, OwnedStreamQuery, QueryInput,
+    ReasoningModePrecedence, StreamDatasetPlan, StreamQueryPlan,
+};
 
 #[cfg(feature = "iceberg")]
 pub use graph_source::{
@@ -1349,6 +1355,12 @@ struct RuntimeParts {
     event_bus: Arc<fluree_db_nameservice::LedgerEventBus>,
     indexing_mode: tx::IndexingMode,
     index_config: IndexConfig,
+    /// Late-binding cell for the api's `LedgerManager`, shared with
+    /// the background indexer's `AttachmentEventsProvider`. The cell
+    /// is filled in `finalize_with_backend` after `LedgerManager` is
+    /// constructed; until then, the provider returns `None` (the
+    /// indexer's "delta unknown" path).
+    attachment_provider_cell: indexer_attachment_provider::LedgerManagerCell,
 }
 
 fn spawn_local_cache_event_listener(
@@ -1871,7 +1883,9 @@ impl FlureeBuilder {
         let backend = StorageBackend::Managed(Arc::new(storage));
         let index_config = self.derive_indexing();
         let ns_mode = NameServiceMode::ReadWrite(Arc::new(notifying.clone()));
-        let indexing_mode = self.start_background_indexing(&backend, &notifying);
+        let attachment_provider_cell = Self::new_attachment_provider_cell();
+        let indexing_mode =
+            self.start_background_indexing(&backend, &notifying, &attachment_provider_cell);
         Ok(Self::finalize_with_backend(
             self.ledger_cache_config,
             self.config,
@@ -1881,6 +1895,7 @@ impl FlureeBuilder {
                 event_bus,
                 indexing_mode,
                 index_config,
+                attachment_provider_cell,
             },
             self.remote_connections,
         ))
@@ -1909,6 +1924,7 @@ impl FlureeBuilder {
                 event_bus,
                 indexing_mode: tx::IndexingMode::Disabled,
                 index_config,
+                attachment_provider_cell: Self::new_attachment_provider_cell(),
             },
             self.remote_connections,
         )
@@ -2002,7 +2018,9 @@ impl FlureeBuilder {
         let index_config = self.derive_indexing();
         let backend = StorageBackend::Managed(Arc::new(storage));
         let ns_mode = NameServiceMode::ReadWrite(Arc::new(notifying.clone()));
-        let indexing_mode = self.start_background_indexing(&backend, &notifying);
+        let attachment_provider_cell = Self::new_attachment_provider_cell();
+        let indexing_mode =
+            self.start_background_indexing(&backend, &notifying, &attachment_provider_cell);
         Ok(Self::finalize_with_backend(
             self.ledger_cache_config,
             self.config,
@@ -2012,6 +2030,7 @@ impl FlureeBuilder {
                 event_bus,
                 indexing_mode,
                 index_config,
+                attachment_provider_cell,
             },
             self.remote_connections,
         ))
@@ -2047,6 +2066,7 @@ impl FlureeBuilder {
                 event_bus,
                 indexing_mode: tx::IndexingMode::Disabled,
                 index_config,
+                attachment_provider_cell: Self::new_attachment_provider_cell(),
             },
             self.remote_connections,
         )
@@ -2079,6 +2099,7 @@ impl FlureeBuilder {
                 event_bus,
                 indexing_mode: tx::IndexingMode::Disabled,
                 index_config,
+                attachment_provider_cell: Self::new_attachment_provider_cell(),
             },
             self.remote_connections,
         )
@@ -2119,7 +2140,9 @@ impl FlureeBuilder {
             fluree_db_nameservice::NotifyingNameService::new(nameservice, event_bus.clone());
         let ns_mode = NameServiceMode::ReadWrite(Arc::new(notifying.clone()));
         let index_config = self.derive_indexing();
-        let indexing_mode = self.start_background_indexing(&backend, &notifying);
+        let attachment_provider_cell = Self::new_attachment_provider_cell();
+        let indexing_mode =
+            self.start_background_indexing(&backend, &notifying, &attachment_provider_cell);
         Self::finalize_with_backend(
             self.ledger_cache_config,
             self.config,
@@ -2129,6 +2152,7 @@ impl FlureeBuilder {
                 event_bus,
                 indexing_mode,
                 index_config,
+                attachment_provider_cell,
             },
             self.remote_connections,
         )
@@ -2193,7 +2217,9 @@ impl FlureeBuilder {
         let ns_mode = NameServiceMode::ReadWrite(Arc::new(notifying.clone()));
         let index_config = self.derive_indexing();
         let backend = StorageBackend::Managed(Arc::new(storage));
-        let indexing_mode = self.start_background_indexing(&backend, &notifying);
+        let attachment_provider_cell = Self::new_attachment_provider_cell();
+        let indexing_mode =
+            self.start_background_indexing(&backend, &notifying, &attachment_provider_cell);
         Ok(Self::finalize_with_backend(
             self.ledger_cache_config,
             self.config,
@@ -2203,6 +2229,7 @@ impl FlureeBuilder {
                 event_bus,
                 indexing_mode,
                 index_config,
+                attachment_provider_cell,
             },
             self.remote_connections,
         ))
@@ -2291,7 +2318,9 @@ impl FlureeBuilder {
         let ns_mode = NameServiceMode::ReadWrite(Arc::new(notifying.clone()));
         let index_config = self.derive_indexing();
         let backend = StorageBackend::Managed(Arc::new(storage));
-        let indexing_mode = self.start_background_indexing(&backend, &notifying);
+        let attachment_provider_cell = Self::new_attachment_provider_cell();
+        let indexing_mode =
+            self.start_background_indexing(&backend, &notifying, &attachment_provider_cell);
         Ok(Self::finalize_with_backend(
             self.ledger_cache_config,
             self.config,
@@ -2301,6 +2330,7 @@ impl FlureeBuilder {
                 event_bus,
                 indexing_mode,
                 index_config,
+                attachment_provider_cell,
             },
             self.remote_connections,
         ))
@@ -2373,7 +2403,9 @@ impl FlureeBuilder {
         let ns_mode = NameServiceMode::ReadWrite(Arc::new(notifying.clone()));
         let index_config = self.derive_indexing();
         let backend = StorageBackend::Managed(Arc::new(storage));
-        let indexing_mode = self.start_background_indexing(&backend, &notifying);
+        let attachment_provider_cell = Self::new_attachment_provider_cell();
+        let indexing_mode =
+            self.start_background_indexing(&backend, &notifying, &attachment_provider_cell);
         Ok(Self::finalize_with_backend(
             self.ledger_cache_config,
             self.config,
@@ -2383,6 +2415,7 @@ impl FlureeBuilder {
                 event_bus,
                 indexing_mode,
                 index_config,
+                attachment_provider_cell,
             },
             self.remote_connections,
         ))
@@ -2412,11 +2445,23 @@ impl FlureeBuilder {
         &self,
         backend: &StorageBackend,
         nameservice: &N,
+        attachment_provider_cell: &indexer_attachment_provider::LedgerManagerCell,
     ) -> tx::IndexingMode
     where
         N: NameService + fluree_db_nameservice::Publisher + Clone + 'static,
     {
-        self.start_background_indexing_dyn(backend, Arc::new(nameservice.clone()))
+        self.start_background_indexing_dyn(
+            backend,
+            Arc::new(nameservice.clone()),
+            attachment_provider_cell,
+        )
+    }
+
+    /// Construct an empty late-binding cell for the api-side
+    /// `AttachmentEventsProvider`. Filled in `finalize_with_backend`
+    /// after `LedgerManager` is built.
+    fn new_attachment_provider_cell() -> indexer_attachment_provider::LedgerManagerCell {
+        Arc::new(std::sync::OnceLock::new())
     }
 
     /// Spawn the background indexer with an already-`Arc`'d nameservice.
@@ -2427,6 +2472,7 @@ impl FlureeBuilder {
         &self,
         backend: &StorageBackend,
         nameservice: Arc<dyn fluree_db_nameservice::ReadWriteNameService>,
+        attachment_provider_cell: &indexer_attachment_provider::LedgerManagerCell,
     ) -> tx::IndexingMode {
         if let Some(ref idx_config) = self.indexing_config {
             // Attach an api-side full-text config provider so each index
@@ -2449,10 +2495,23 @@ impl FlureeBuilder {
                         .unwrap_or_else(|| LedgerManagerConfig::default().cache_dir),
                 },
             ) as Arc<dyn fluree_db_indexer::FulltextConfigProvider>;
+            // Attach an api-side attachment-events provider so the
+            // background indexer can seal authoritative arenas with
+            // the running ledger's overlay state. The cell is filled
+            // by `finalize_with_backend` after `LedgerManager` is
+            // built; until then the provider returns `None`
+            // (delta-unknown → defensive arena drop in the indexer).
+            let ann_provider = Arc::new(
+                crate::indexer_attachment_provider::ApiAttachmentEventsProvider {
+                    manager: Arc::clone(attachment_provider_cell),
+                },
+            )
+                as Arc<dyn fluree_db_indexer::AttachmentEventsProvider>;
             let indexer_config = idx_config
                 .indexer_config
                 .clone()
-                .with_fulltext_config_provider(provider);
+                .with_fulltext_config_provider(provider)
+                .with_attachment_events_provider(ann_provider);
             let (worker, handle) =
                 BackgroundIndexerWorker::new(backend.clone(), nameservice, indexer_config);
             tokio::spawn(worker.run());
@@ -2483,6 +2542,7 @@ impl FlureeBuilder {
             event_bus,
             indexing_mode,
             index_config,
+            attachment_provider_cell,
         } = parts;
         let leaflet_cache = make_leaflet_cache(&config);
         let governance_cache = std::sync::Arc::new(cross_ledger::GovernanceCache::new());
@@ -2497,6 +2557,14 @@ impl FlureeBuilder {
                 lm_config,
             ))
         });
+
+        // Fill the late-binding cell so the background indexer's
+        // attachment-events provider can resolve running ledgers.
+        // Failure to set is silent — happens if `finalize_with_backend`
+        // ran twice somehow; the first set wins.
+        if let Some(ref mgr) = ledger_manager {
+            let _ = attachment_provider_cell.set(Arc::clone(mgr));
+        }
 
         if indexing_mode.is_enabled() {
             if let Some(manager) = &ledger_manager {
@@ -2569,7 +2637,9 @@ impl FlureeBuilder {
 
         let index_config = self.derive_indexing();
         let backend = StorageBackend::Managed(storage);
-        let indexing_mode = self.start_background_indexing(&backend, &notifying);
+        let attachment_provider_cell = Self::new_attachment_provider_cell();
+        let indexing_mode =
+            self.start_background_indexing(&backend, &notifying, &attachment_provider_cell);
         Ok(Self::finalize_with_backend(
             self.ledger_cache_config,
             self.config,
@@ -2579,6 +2649,7 @@ impl FlureeBuilder {
                 event_bus,
                 indexing_mode,
                 index_config,
+                attachment_provider_cell,
             },
             self.remote_connections,
         ))
@@ -2622,7 +2693,9 @@ impl FlureeBuilder {
 
             let index_config = self.derive_indexing();
             let backend = StorageBackend::Managed(storage);
-            let indexing_mode = self.start_background_indexing(&backend, &notifying);
+            let attachment_provider_cell = Self::new_attachment_provider_cell();
+            let indexing_mode =
+                self.start_background_indexing(&backend, &notifying, &attachment_provider_cell);
             Ok(Self::finalize_with_backend(
                 self.ledger_cache_config,
                 self.config,
@@ -2632,6 +2705,7 @@ impl FlureeBuilder {
                     event_bus,
                     indexing_mode,
                     index_config,
+                    attachment_provider_cell,
                 },
                 self.remote_connections,
             ))
@@ -2674,7 +2748,9 @@ impl FlureeBuilder {
         let backend = StorageBackend::Managed(storage);
         let ns_rw: Arc<dyn fluree_db_nameservice::ReadWriteNameService> =
             Arc::new(notifying.clone());
-        let indexing_mode = self.start_background_indexing_dyn(&backend, ns_rw);
+        let attachment_provider_cell = Self::new_attachment_provider_cell();
+        let indexing_mode =
+            self.start_background_indexing_dyn(&backend, ns_rw, &attachment_provider_cell);
         Ok(Self::finalize_with_backend(
             self.ledger_cache_config,
             aws_handle.config().clone(),
@@ -2684,6 +2760,7 @@ impl FlureeBuilder {
                 event_bus,
                 indexing_mode,
                 index_config,
+                attachment_provider_cell,
             },
             self.remote_connections,
         ))
@@ -2993,6 +3070,40 @@ impl Fluree {
                 cache_dir: self.binary_store_cache_dir(),
             },
         )
+    }
+
+    /// Build a [`fluree_db_indexer::AttachmentEventsProvider`] backed by
+    /// this connection's running `LedgerManager`. Attach it to the
+    /// indexer's `IndexerConfig` (via
+    /// `with_attachment_events_provider`) so every index build —
+    /// including CLI-driven incremental runs and direct `reindex`
+    /// calls — picks up the live attachment overlay and seals an
+    /// authoritative annotation arena.
+    ///
+    /// Returns `None` when ledger caching is disabled — without a
+    /// `LedgerManager`, the provider has nowhere to read the running
+    /// attachment overlay from. The indexer routes that case through
+    /// the defensive arena drop, which is correct.
+    ///
+    /// The background indexer constructed at `FlureeBuilder::build()`
+    /// time already attaches one of these automatically. External
+    /// callers invoking `fluree_db_indexer::build_index_for_ledger`
+    /// directly (e.g. the CLI's `index` command) need to attach
+    /// theirs by calling this method.
+    pub fn attachment_events_provider(
+        &self,
+    ) -> Option<Arc<dyn fluree_db_indexer::AttachmentEventsProvider>> {
+        use std::sync::OnceLock;
+        let manager = Arc::clone(self.ledger_manager.as_ref()?);
+        // The provider's late-binding cell is overkill here (manager
+        // already exists), but reusing the same provider type keeps
+        // one source of truth for `RunningCoverage` →
+        // `AttachmentEventCoverage` translation.
+        let cell = Arc::new(OnceLock::new());
+        let _ = cell.set(manager);
+        Some(Arc::new(
+            crate::indexer_attachment_provider::ApiAttachmentEventsProvider { manager: cell },
+        ))
     }
 
     /// Per-instance cache for cross-ledger governance artifacts.
