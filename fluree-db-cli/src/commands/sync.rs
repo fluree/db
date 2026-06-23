@@ -92,9 +92,15 @@ fn confirm_large_transfer(estimated_bytes: u64) -> bool {
 /// Whether a remote error string indicates an auth/permission failure
 /// (expired or insufficient token). `fluree-db-nameservice-sync` reports
 /// remote failures as strings, so we match on the common server messages.
+///
+/// The HTTP status checks match the canonical reason phrase (e.g.
+/// `401 Unauthorized`) rather than the bare code: the sync client always
+/// renders statuses via reqwest's `StatusCode` Display, and the error
+/// strings interpolate the request URL and response body, so a bare `401`
+/// could false-match a port or ledger name that merely contains those digits.
 fn is_replication_auth_error(err: &str) -> bool {
-    err.contains("401")
-        || err.contains("403")
+    err.contains("401 Unauthorized")
+        || err.contains("403 Forbidden")
         || err.contains("Bearer token required")
         || err.contains("Untrusted issuer")
         || err.contains("Token lacks storage proxy permissions")
