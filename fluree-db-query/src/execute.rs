@@ -41,6 +41,8 @@ mod where_plan;
 // Re-export public types
 pub use runner::execute;
 pub use runner::execute_prepared;
+pub use runner::execute_prepared_streaming;
+pub use runner::BatchSink;
 pub use runner::ContextConfig;
 pub use runner::ExecutableQuery;
 
@@ -51,7 +53,7 @@ pub(crate) use where_plan::{analyze_property_join_plan, collect_inner_join_block
 
 // Re-export operator tree builder and runner for custom execution pipelines
 pub use operator_tree::build_operator_tree;
-pub use runner::run_operator;
+pub use runner::{run_operator, run_operator_streaming};
 
 // Re-export pushdown utilities for tests
 pub use pushdown::{

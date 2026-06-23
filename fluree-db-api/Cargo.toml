@@ -67,6 +67,7 @@ fluree-vocab = { path = "../fluree-vocab" }
 fluree-graph-json-ld = { path = "../fluree-graph-json-ld" }
 
 async-trait.workspace = true
+bytes = "1.4"
 chrono.workspace = true
 futures.workspace = true
 indexmap.workspace = true
@@ -182,6 +183,10 @@ harness = false
 
 [[bench]]
 name = "query_hot_bsbm"
+harness = false
+
+[[bench]]
+name = "query_hot_bsbm_bi"
 harness = false
 
 [lints]

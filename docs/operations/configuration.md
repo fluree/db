@@ -317,8 +317,11 @@ operators can stop at the next checkpoint.
 | -------------------- | -------------------------- | ------------------------ |
 | `--query-timeout-ms` | `FLUREE_QUERY_TIMEOUT_MS`  | `900000` (15 minutes)    |
 | `--query-min-t-timeout-ms` | `FLUREE_QUERY_MIN_T_TIMEOUT_MS` | `5000` (5 seconds) |
+| `--stream-heartbeat-ms` | `FLUREE_STREAM_HEARTBEAT_MS` | `15000` (15 seconds) |
 
 `query_min_t_timeout_ms` caps HTTP read-after-write waits from `Fluree-Min-T`, `opts.min-t`, and numeric `@t` snapshot pins. It remains enforced even when `query_timeout_ms = 0`.
+
+`stream_heartbeat_ms` is the keep-alive cadence for the [streaming query endpoint](../api/streaming-query.md) (`/stream/query`). Records flush at this interval during stalls so a long-running query survives a fronting proxy's idle timeout; set it below that timeout (e.g. under CloudFront/ALB's ~60s). `0` disables heartbeats.
 
 ### Query-Time Refresh
 
@@ -822,6 +825,7 @@ fluree server run \
 | `FLUREE_BODY_LIMIT`                     | Max request body bytes                          | `52428800`                                                              |
 | `FLUREE_QUERY_TIMEOUT_MS`               | Max query execution time in milliseconds (`0` disables) | `900000`                                                     |
 | `FLUREE_QUERY_MIN_T_TIMEOUT_MS`         | Max read-after-write min-t wait in milliseconds | `5000`                                                                  |
+| `FLUREE_STREAM_HEARTBEAT_MS`            | Streaming-query heartbeat interval in ms (`0` disables) | `15000`                                                         |
 | `FLUREE_QUERY_REFRESH_ENABLED`          | Enable TTL-gated nameservice refresh before current-head queries | `false`                                                       |
 | `FLUREE_QUERY_REFRESH_TTL_MS`           | Query-time refresh interval per ledger per process (`0` checks every request) | `1000`                                           |
 | `FLUREE_LOG_LEVEL`                      | Log level                                       | `info`                                                                  |

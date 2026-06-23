@@ -446,7 +446,7 @@ impl DictTreeReader {
             // the shared `run_sync_on_runtime` helper, which uses
             // `block_in_place(handle.block_on)` on a multi-thread runtime (so a
             // replacement worker keeps driving the reactor while this thread
-            // blocks) and a self-contained helper runtime on current-thread.
+            // blocks) and a process-wide helper runtime when needed.
             //
             // The previous hand-rolled `thread::spawn` + outer-`Handle::block_on`
             // + `rx.recv()` re-injected the fetch onto the OUTER runtime with no

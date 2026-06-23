@@ -1,14 +1,20 @@
 use crate::cli::PolicyArgs;
 use crate::commands::insert::resolve_positional_args;
+use crate::commands::query_stream::{self, NdjsonConsumer};
 use crate::context::{self, LedgerMode};
 use crate::detect;
 use crate::error::{CliError, CliResult};
 use crate::input;
 use crate::output::{self, OutputFormatKind};
 use fluree_db_api::server_defaults::FlureeDir;
-use fluree_db_api::{GraphSnapshotQueryBuilder, TrackingOptions};
+use fluree_db_api::{
+    GraphDb, GraphSnapshotQueryBuilder, OwnedStreamQuery, QueryExecutionOptions, Tracker,
+    TrackingOptions,
+};
+use std::io::BufWriter;
 use std::path::Path;
 use std::time::Instant;
+use tokio::sync::mpsc;
 
 /// CLI tracking flags (mirrors the granular `fluree-track-*` HTTP headers
 /// and the `fluree-max-fuel` cap). `--track` is shorthand for fuel + time +
@@ -210,6 +216,7 @@ pub async fn run(
     expr: Option<&str>,
     file_flag: Option<&Path>,
     format_str: &str,
+    envelope: bool,
     normalize_arrays: bool,
     bench: bool,
     explain: bool,
@@ -247,13 +254,27 @@ pub async fn run(
         "table" => OutputFormatKind::Table,
         "csv" => OutputFormatKind::Csv,
         "tsv" => OutputFormatKind::Tsv,
+        "ndjson" | "nd-json" | "jsonl" => OutputFormatKind::Ndjson,
         other => {
             return Err(CliError::Usage(format!(
                 "unknown output format '{other}'; valid formats: json, jsonld, typed-json, \
-                 table, csv, tsv"
+                 table, csv, tsv, ndjson"
             )));
         }
     };
+
+    // `--envelope` only changes NDJSON output shape; it is meaningless elsewhere.
+    if envelope && output_format != OutputFormatKind::Ndjson {
+        return Err(CliError::Usage(
+            "--envelope only applies to --format ndjson".to_string(),
+        ));
+    }
+    // NDJSON streams incrementally; the buffered preview/timing modes don't apply.
+    if output_format == OutputFormatKind::Ndjson && bench {
+        return Err(CliError::Usage(
+            "--bench is not compatible with --format ndjson".to_string(),
+        ));
+    }
 
     if explain {
         if bench {
@@ -331,6 +352,63 @@ pub async fn run(
             // Attach policy flags to the remote client so headers + body opts
             // ride through on every request (see RemoteLedgerClient::with_policy).
             let client = client.with_policy(policy.clone());
+
+            // NDJSON streaming fast path: stream records from the server's
+            // `/stream/query/<ledger>` endpoint straight to stdout. Time travel
+            // (`--at`) composes via FROM injection (SPARQL) or body `from`
+            // (JSON-LD), exactly like the buffered remote paths below; policy
+            // rides through `with_policy`. The server enforces the streamable
+            // query-shape constraints (rejecting ASK/CONSTRUCT/history/etc.).
+            if output_format == OutputFormatKind::Ndjson {
+                let timer = Instant::now();
+                let response = match (query_format, at) {
+                    (detect::QueryFormat::Sparql, at) => {
+                        let sparql = match at {
+                            Some(at_str) => {
+                                inject_remote_time_travel_sparql(&content, &remote_alias, at_str)?
+                            }
+                            None => content.clone(),
+                        };
+                        client
+                            .stream_query_sparql(&remote_alias, &sparql, &tracking_headers)
+                            .await?
+                    }
+                    (detect::QueryFormat::JsonLd, at) => {
+                        let mut json_query: serde_json::Value = serde_json::from_str(&content)?;
+                        if let Some(at_str) = at {
+                            let spec = parse_time_spec(at_str);
+                            let suffix = time_spec_to_suffix(&spec);
+                            let from_id =
+                                attach_time_suffix_preserving_fragment(&remote_alias, &suffix);
+                            match json_query.as_object_mut() {
+                                Some(obj) => {
+                                    obj.insert(
+                                        "from".to_string(),
+                                        serde_json::Value::String(from_id),
+                                    );
+                                }
+                                None => {
+                                    return Err(CliError::Input(
+                                        "JSON-LD query must be a JSON object".to_string(),
+                                    ));
+                                }
+                            }
+                        }
+                        client
+                            .stream_query_jsonld(&remote_alias, &json_query, &tracking_headers)
+                            .await?
+                    }
+                };
+
+                context::persist_refreshed_tokens(&client, &remote_name, dirs).await;
+
+                let mut consumer = NdjsonConsumer::new(BufWriter::new(std::io::stdout()), envelope);
+                query_stream::drive_response(response, &mut consumer).await?;
+                let outcome = consumer.finish()?;
+                print_stream_footer(&outcome, timer.elapsed());
+                return Ok(());
+            }
+
             // Delimited fast path: for SPARQL + TSV/CSV, request the format directly
             // from the server and stream the raw bytes to stdout (no JSON round-trip).
             if matches!(output_format, OutputFormatKind::Tsv | OutputFormatKind::Csv) {
@@ -620,6 +698,23 @@ pub async fn run(
             }
         }
         LedgerMode::Local { fluree, alias } => {
+            // NDJSON streaming: drive the in-process streaming producer to
+            // stdout. Handled before view loading since it loads its own owned
+            // LedgerState for the spawned-style producer.
+            if output_format == OutputFormatKind::Ndjson {
+                return run_local_ndjson_stream(
+                    &fluree,
+                    &alias,
+                    &content,
+                    query_format,
+                    at,
+                    policy,
+                    envelope,
+                    tracking,
+                )
+                .await;
+            }
+
             // Load a single view (optionally time-traveled) and execute against it.
             // This avoids the redundant `fluree.ledger()` load (and duplicate BinaryIndexStore load)
             // that previously occurred before the lazy graph query loaded its own view.
@@ -898,6 +993,122 @@ pub async fn run(
     }
 
     Ok(())
+}
+
+/// Backpressure depth of the local producer→consumer channel (mirrors the
+/// server's `STREAM_CHANNEL_DEPTH`). A full channel suspends the producer at
+/// its next `send`, pausing execution until the consumer drains a batch.
+const STREAM_CHANNEL_DEPTH: usize = 64;
+
+/// Inject a time-travel `FROM <ledger@...>` into a remote SPARQL query for
+/// `--at`, reusing the same single-FROM-before-WHERE strategy as the buffered
+/// remote paths. Errors if the query already declares its own FROM/FROM NAMED.
+fn inject_remote_time_travel_sparql(
+    sparql: &str,
+    remote_alias: &str,
+    at_str: &str,
+) -> CliResult<String> {
+    if fluree_db_api::sparql_dataset_ledger_ids(sparql)
+        .map(|v| !v.is_empty())
+        .unwrap_or(false)
+    {
+        return Err(CliError::Usage(
+            "SPARQL query already contains FROM/FROM NAMED; \
+             for remote time travel, encode time travel in the FROM IRI \
+             (e.g., FROM <ledger@t:1>) instead of using --at"
+                .to_string(),
+        ));
+    }
+    let spec = parse_time_spec(at_str);
+    let suffix = time_spec_to_suffix(&spec);
+    let from_iri = attach_time_suffix_preserving_fragment(remote_alias, &suffix);
+    inject_sparql_from_before_where(sparql, &from_iri).ok_or_else(|| {
+        CliError::Usage(
+            "unable to inject SPARQL FROM clause for remote time travel; \
+             please write the query as `SELECT ... WHERE { ... }` or include an explicit FROM"
+                .to_string(),
+        )
+    })
+}
+
+/// Stream a SELECT query against a local ledger as NDJSON.
+///
+/// Mirrors the server's single-ledger `/stream/query/<ledger>` shape: streams
+/// against the current head with no per-request policy or time travel (those
+/// route through the server's dataset path, which the in-process producer does
+/// not build here). The producer ([`Fluree::run_stream_query`]) and the stdout
+/// consumer run concurrently on this task via `join!`, with the bounded channel
+/// providing backpressure.
+#[allow(clippy::too_many_arguments)]
+async fn run_local_ndjson_stream(
+    fluree: &fluree_db_api::Fluree,
+    alias: &str,
+    content: &str,
+    query_format: detect::QueryFormat,
+    at: Option<&str>,
+    policy: &PolicyArgs,
+    envelope: bool,
+    tracking: TrackingFlags,
+) -> CliResult<()> {
+    if at.is_some() {
+        return Err(CliError::Usage(
+            "time travel (--at) is not supported with --format ndjson on local ledgers; \
+             use --remote or a buffered --format"
+                .to_string(),
+        ));
+    }
+    if policy.is_set() {
+        return Err(CliError::Usage(
+            "per-request policy (--policy*) is not supported with --format ndjson on local \
+             ledgers; use --remote or a buffered --format"
+                .to_string(),
+        ));
+    }
+
+    let input = match query_format {
+        detect::QueryFormat::Sparql => OwnedStreamQuery::Sparql(content.to_string()),
+        detect::QueryFormat::JsonLd => OwnedStreamQuery::JsonLd(serde_json::from_str(content)?),
+    };
+
+    // Owned ledger state for the producer; a planning view carrying the
+    // ledger's default context so PREFIX/@context-less queries still resolve
+    // prefixes (parity with the buffered local path's db_with_default_context).
+    let ledger_state = fluree.ledger(alias).await?;
+    let planning_view = GraphDb::from_ledger_state(&ledger_state)
+        .with_default_context(fluree.get_default_context(alias).await?);
+    let plan = fluree.plan_stream_query(&planning_view, &input).await?;
+
+    let tracker = Tracker::new(tracking.as_options().unwrap_or_default());
+    let exec_opts = QueryExecutionOptions::default();
+
+    let (tx, rx) = mpsc::channel::<bytes::Bytes>(STREAM_CHANNEL_DEPTH);
+    let mut consumer = NdjsonConsumer::new(BufWriter::new(std::io::stdout()), envelope);
+
+    let timer = Instant::now();
+    let producer = fluree.run_stream_query(ledger_state, plan, tracker, exec_opts, tx);
+    let driver = query_stream::drive_channel(rx, &mut consumer);
+    let ((), drive_res) = tokio::join!(producer, driver);
+    drive_res?;
+    let outcome = consumer.finish()?;
+    print_stream_footer(&outcome, timer.elapsed());
+    Ok(())
+}
+
+/// Print the NDJSON streaming footer to stderr: row count, wall-clock time, and
+/// (when fuel tracking is on) the final fuel total from the `end` record. A
+/// broken downstream pipe suppresses the footer.
+fn print_stream_footer(outcome: &query_stream::StreamOutcome, elapsed: std::time::Duration) {
+    if outcome.broken_pipe {
+        return;
+    }
+    let mut parts = vec![
+        format!("{} rows", format_count(outcome.rows as usize)),
+        format_duration(elapsed),
+    ];
+    if let Some(fuel) = outcome.fuel {
+        parts.push(format!("fuel {fuel}"));
+    }
+    eprintln!("({})", parts.join(", "));
 }
 
 /// Print the timing/row-count footer line to stderr.

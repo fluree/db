@@ -817,7 +817,15 @@ fn parse_select_string(
         }
 
         // Scalar expression with explicit alias — desugars to a BIND.
-        let expr = filter_sexpr::expr_from_sexpr_token(&list[1])?;
+        //
+        // Compound expressions can contain aggregate calls (e.g.
+        // `(as (- (max ?u) (min ?u)) ?spread)`). Each one is hoisted into
+        // `aggregates` with a synthetic output var and the call is rewritten
+        // to reference that var; the surrounding expression then lowers as a
+        // post-aggregation bind via `lower_select_expr_bind`.
+        let mut inner_tok = list[1].clone();
+        hoist_inline_aggregates(&mut inner_tok, aggregates)?;
+        let expr = filter_sexpr::expr_from_sexpr_token(&inner_tok)?;
         return Ok(UnresolvedColumn::Computation {
             expr,
             alias: Arc::from(alias),
@@ -943,6 +951,66 @@ fn parse_aggregate_fn_and_input(
     }
 
     Ok((function, input.to_string()))
+}
+
+/// Walk a SELECT-clause S-expression token tree, hoisting any nested
+/// aggregate call out into `aggregates` and rewriting the call to an atom
+/// that references the synthetic output variable.
+///
+/// Used by `parse_select_string` so a compound expression like
+/// `(- (max ?u) (min ?u))` becomes `(- ?__inline_agg_0 ?__inline_agg_1)`
+/// with two `UnresolvedAggregateSpec`s pushed onto `aggregates`. Lowering
+/// then routes the surrounding expression to `post_binds` because the
+/// synthetic vars appear in the aggregate-output set.
+///
+/// Identical aggregates (same function + same input) dedupe to one output
+/// var via the `seen` map keyed by `"fn|input"`.
+fn hoist_inline_aggregates(
+    tok: &mut sexpr_tokenize::SexprToken,
+    aggregates: &mut Vec<ast::UnresolvedAggregateSpec>,
+) -> Result<()> {
+    hoist_inline_aggregates_inner(tok, aggregates, &mut HashMap::new())
+}
+
+fn hoist_inline_aggregates_inner(
+    tok: &mut sexpr_tokenize::SexprToken,
+    aggregates: &mut Vec<ast::UnresolvedAggregateSpec>,
+    seen: &mut HashMap<String, Arc<str>>,
+) -> Result<()> {
+    use sexpr_tokenize::SexprToken;
+
+    let SexprToken::List(items) = tok else {
+        return Ok(());
+    };
+
+    // If this list is itself an aggregate call, hoist it whole.
+    if let Some(SexprToken::Atom(name)) = items.first() {
+        let head = name.to_lowercase();
+        if is_aggregate_name(&head) {
+            let (function, input_var) = parse_aggregate_fn_and_input(&head, &items[1..])?;
+            let output_var = seen
+                .entry(format!("{head}|{input_var}"))
+                .or_insert_with(|| {
+                    let name: Arc<str> = Arc::from(format!("?__inline_agg_{}", aggregates.len()));
+                    aggregates.push(ast::UnresolvedAggregateSpec {
+                        function,
+                        input_var: Arc::from(input_var),
+                        output_var: name.clone(),
+                    });
+                    name
+                })
+                .clone();
+            *tok = SexprToken::Atom(output_var.to_string());
+            return Ok(());
+        }
+    }
+
+    // Otherwise recurse into children. A nested aggregate inside an arithmetic
+    // or function call gets rewritten in place.
+    for child in items {
+        hoist_inline_aggregates_inner(child, aggregates, seen)?;
+    }
+    Ok(())
 }
 
 /// Parse a hydration object like `{"?person": ["*", {"ex:friend": ["*"]}]}`.

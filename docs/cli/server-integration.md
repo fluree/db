@@ -187,6 +187,7 @@ See [Ledger portability](#ledger-portability-flpack-files) below for the on-disk
 - `POST {api_base_url}/update/*ledger`
 - `GET {api_base_url}/info/*ledger`
 - `GET {api_base_url}/exists/*ledger`
+- `POST {api_base_url}/stream/query/*ledger` — **only** when `fluree query --format ndjson` runs against this server; see [Streaming Query Contract](#streaming-query-contract).
 
 When the CLI is invoked with policy flags (`--as`, `--policy-class`,
 `--policy`, `--policy-file`, `--policy-values`, `--policy-values-file`,
@@ -487,6 +488,89 @@ implementation, micro-fuel internals (1 fuel = 1000 micro-fuel), and the
 `TrackedQueryResponse` / `PolicyStats` shapes are defined in
 `fluree-db-core/src/tracking.rs`. The full fuel cost ladder for queries
 and transactions is in `docs/query/tracking-and-fuel.md`.
+
+## Streaming Query Contract
+
+`fluree query --format ndjson` (and `--format ndjson --envelope`) streams SELECT
+results incrementally instead of buffering a single JSON body. When the command
+runs against a server — explicitly with `--remote`, or via auto-route to a
+running local server — it issues:
+
+```
+POST {api_base_url}/stream/query/{ledger}
+Content-Type: application/sparql-query   (SPARQL)   |   application/json   (JSON-LD)
+Accept: application/x-ndjson
+?default-context=true
+```
+
+and reads the response body as a newline-delimited stream of self-describing
+records. **This endpoint is only required if you want `--format ndjson` to work
+against your server** — every other output format (`json`, `typed-json`,
+`table`, `csv`, `tsv`) uses the buffered `POST /query/*ledger` path above. If you
+do not implement it, the CLI surfaces the server's `404`/`405` as an error;
+there is **no client-side fallback** to the buffered endpoint.
+
+The wire protocol (request shapes, the `head`/`row`/`heartbeat`/`end`/`error`
+record types, heartbeats, error codes, auth/policy/dataset behavior, and the
+connection-scoped `POST /stream/query` variant) is specified in full in
+[Streaming query (NDJSON)](../api/streaming-query.md) — that document is the
+canonical contract for both the endpoint and its in-process equivalent. The
+points below are the CLI-specific obligations on top of it.
+
+### What the CLI sends and requires
+
+1. **Ledger-scoped endpoint only.** The CLI always targets
+   `POST /stream/query/{ledger}` (never the connection-scoped
+   `POST /stream/query`), so the path drives the bearer's `can_read` check
+   exactly like the buffered `/query/{ledger}` path.
+2. **Content type by language.** SPARQL bodies are sent as
+   `application/sparql-query`; JSON-LD bodies as `application/json`. The server
+   must detect the language the same way it does for `/query`.
+3. **`Accept: application/x-ndjson`** and a chunked / unbuffered response body.
+   The server must flush records as they are produced (the whole point is
+   incremental delivery); buffering the entire stream before the first byte
+   defeats it but is not *incorrect*.
+4. **Policy, tracking, and `--at` ride identically to `/query`.** Policy flags
+   travel as the [Policy Enforcement Contract](#policy-enforcement-contract)
+   headers (and JSON-LD body `opts`); `--max-fuel` travels as the
+   `fluree-max-fuel` header from the [Tracking Contract](#tracking-contract);
+   `--at` injects the time-travel suffix into `from` (JSON-LD) or a
+   `FROM <ledger@t:N>` clause (SPARQL), just like buffered remote time travel.
+   (On a **local** in-process ledger the CLI refuses `--at` / per-request
+   `--policy` with `--format ndjson`; over the wire they are supported because
+   the server routes them through its dataset path.)
+5. **Terminal record is mandatory.** The CLI treats the absence of a terminal
+   `end`/`error` record as a truncated stream and exits non-zero. A server MUST
+   emit exactly one terminal record, and never a `row` after it.
+6. **Unsupported shapes return `4xx` before the `200` stream commits.** ASK,
+   CONSTRUCT/DESCRIBE, `selectOne`, hydration, and history (`to` / SPARQL
+   `FROM … TO …`) must be rejected — the CLI relies on the server to enforce
+   this rather than pre-validating the query text.
+
+### How the CLI renders the stream
+
+- **Bare mode** (default): the CLI emits each `row` record's inner binding
+  object, one per line, and consumes `head`/`heartbeat`/terminal internally.
+  The `row` body must be the same SPARQL-JSON binding-object shape used in the
+  buffered `/query` SELECT response's `results.bindings` entries.
+- **Envelope mode** (`--envelope`): the CLI prints every record line verbatim,
+  so the bytes a custom server emits are surfaced directly to the user — keep
+  them byte-identical to the protocol in
+  [Streaming query (NDJSON)](../api/streaming-query.md).
+
+### Reference implementation
+
+| Concern | Canonical location |
+|---------|-------------------|
+| HTTP routes (`/stream/query`, `/stream/query/*ledger`) + heartbeat assembly | `fluree-db-server/src/routes/stream_query.rs` |
+| NDJSON producer (single-ledger + dataset) | `fluree-db-api/src/view/stream_query.rs` (`plan_stream_query` / `run_stream_query`) |
+| Record protocol | `fluree-db-api/src/format/ndjson_stream.rs` |
+| CLI client + consumer | `fluree-db-cli/src/remote_client.rs::stream_query_sparql` / `stream_query_jsonld`, `fluree-db-cli/src/commands/query_stream.rs` |
+
+Validate compatibility by running
+`fluree query --remote your-remote --format ndjson --envelope -e 'SELECT ?s WHERE { ?s ?p ?o } LIMIT 5'`
+against your server and confirming a `head` record, one `row` per result, and a
+terminal `end` record arrive in order.
 
 ## Merge Preview Contract
 

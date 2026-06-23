@@ -33,7 +33,7 @@ impl Fluree {
         Ok(Some(view))
     }
 
-    async fn build_dataset_for_connection(
+    pub(crate) async fn build_dataset_for_connection(
         &self,
         spec: &DatasetSpec,
         qc_opts: &GovernanceOptions,
