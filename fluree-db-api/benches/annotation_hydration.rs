@@ -144,12 +144,26 @@ mod support {
     }
 }
 
+/// Scale-driven attachment counts. Seeding N annotations costs N sequential
+/// commits and per-commit work scales with accumulated novelty, so seeding is
+/// O(N²); the 10k case runs for many minutes and must stay out of the per-PR
+/// `bench-gate` (which runs at `Tiny` via `--test`). Honors `FLUREE_BENCH_SCALE`
+/// the same way the other benches (e.g. `fulltext_query.rs`) do.
+fn scenario_sizes() -> &'static [usize] {
+    use fluree_bench_support::BenchScale;
+    const SIZES: &[usize] = &[1, 100, 10_000];
+    match fluree_bench_support::current_scale() {
+        BenchScale::Tiny => &SIZES[..2],
+        _ => SIZES,
+    }
+}
+
 fn bench_annotation_hydration(c: &mut Criterion) {
     let runtime = Runtime::new().expect("tokio runtime");
     let mut group = c.benchmark_group("annotation_hydration");
     group.sample_size(20);
 
-    for n in &[1usize, 100, 10_000] {
+    for n in scenario_sizes() {
         group.throughput(Throughput::Elements(*n as u64));
 
         // ---- Build two ledgers seeded with N attachments ----
