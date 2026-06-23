@@ -118,12 +118,14 @@ jobs:
     #     entry in `regression-budget.json` (or vice versa).
     #
     # Wall-clock budget: ~5–8 min on `ubuntu-latest` after rust-cache
-    # warms up, ~12–15 min cold. The smoke run uses the `tiny` scale
-    # (smallest input curve per bench) so the gate stays affordable.
-    # `timeout-minutes` caps the whole job so a hung bench fails fast
-    # instead of tying up the runner queue.
+    # warms up. A cold cache must compile the whole workspace's benches in
+    # release (now including the consensus / search-service / search-httpd
+    # crates and their heavy deps), which overran the previous 25 min cap
+    # while still in `cargo bench --no-run`. `timeout-minutes` still caps the
+    # job so a genuinely hung bench fails fast; it just needs headroom for a
+    # cold release build.
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 45
     env:
       FLUREE_BENCH_PROFILE: quick
       FLUREE_BENCH_SCALE: tiny
