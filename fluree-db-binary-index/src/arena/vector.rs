@@ -63,14 +63,13 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
         Some(dir) => dir.join(format!(".{file_name}.tmp.{pid}.{seq}")),
         None => PathBuf::from(format!(".{file_name}.tmp.{pid}.{seq}")),
     };
-    std::fs::write(&tmp, bytes)?;
-    match std::fs::rename(&tmp, path) {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            let _ = std::fs::remove_file(&tmp);
-            Err(e)
-        }
+    // Clean up the staging file on any failure (write or rename) so a mid-write
+    // error doesn't leave an orphaned temp file behind.
+    let staged = std::fs::write(&tmp, bytes).and_then(|()| std::fs::rename(&tmp, path));
+    if staged.is_err() {
+        let _ = std::fs::remove_file(&tmp);
     }
+    staged
 }
 
 /// Maximum vectors per shard. At 768-dim f32 each shard ≈ 9 MB.
