@@ -2,6 +2,8 @@
 
 Temporal, verifiable, standards-compliant, git-like branching and merging, and [optimized for AI agents](docs/ai/README.md). Integrated vector, text and geo search, and fine-grained access control with no external dependencies.
 
+RDF 1.1 / 1.2, [Open Cypher Preview](https://github.com/fluree/db/pull/1361), SPARQL and JSON-LD query (includes history query and other Fluree feature extensions).
+
 Billions of graph facts on commodity hardware. Over 2M facts/second bulk import. [Benchmark leader](https://labs.flur.ee), 10.4x faster than next  database. On the full 21.5-billion-triple Wikidata dump, all 850/850 WGPB graph-pattern queries complete with a 43 ms geometric mean.
 
 > [!NOTE]
