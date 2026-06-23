@@ -166,7 +166,7 @@ impl CommitWorker {
                         // leader transition is the canonical case)
                         // reproduce on every attempt and the entry
                         // poisons.
-                        let ledger_id = format_full_ledger_id(ref_key);
+                        let ledger_id = self.ref_key.ledger_id();
                         if let Err(refresh_err) = self
                             .fluree
                             .refresh(&ledger_id, RefreshOpts::default())
@@ -316,7 +316,7 @@ impl CommitWorker {
         ref_key: &RefKey,
         entry: &QueueEntry,
     ) -> Result<QueuedRequest, WorkerError> {
-        let ledger_id = format_full_ledger_id(ref_key);
+        let ledger_id = self.ref_key.ledger_id();
         let bytes = self
             .fluree
             .content_store(&ledger_id)
@@ -348,7 +348,7 @@ impl CommitWorker {
             governance,
         } = transact;
 
-        let ledger_id = format_full_ledger_id(ref_key);
+        let ledger_id = self.ref_key.ledger_id();
         let ledger_manager = self
             .fluree
             .ledger_manager()
@@ -460,8 +460,8 @@ impl CommitWorker {
             strategy,
         } = revert;
 
-        let ledger_name = ref_key.ledger_id.clone();
         let branch = ref_key.branch.clone();
+        let ledger_name = self.ref_key.ledger_name.clone();
         let StagedRevert {
             reverted_commits,
             conflict_count,
@@ -504,7 +504,7 @@ impl CommitWorker {
         })?;
         let commit_t = staged_commit.commit.t;
 
-        let ledger_id = format_full_ledger_id(ref_key);
+        let ledger_id = self.ref_key.ledger_id();
         let content_store = self.fluree.content_store(&ledger_id);
         content_store
             .put_with_id(&commit_cid, &staged_commit.commit_bytes)
@@ -551,7 +551,7 @@ impl CommitWorker {
             blobs,
             governance,
         } = push;
-        let ledger_id = format_full_ledger_id(ref_key);
+        let ledger_id = self.ref_key.ledger_id();
         let content_store = self.fluree.content_store(&ledger_id);
         // Read each commit's bytes back from CAS by CID. The
         // transactor wrote them before enqueueing, so a definitive
@@ -626,7 +626,7 @@ impl CommitWorker {
             target_branch,
             strategy,
         } = merge;
-        let ledger_name = ref_key.ledger_id.clone();
+        let ledger_name = self.ref_key.ledger_name.clone();
         let StagedMerge {
             target,
             target_id,
@@ -725,8 +725,8 @@ impl CommitWorker {
         rebase: QueuedRebase,
     ) -> Result<StagedOutcome, WorkerError> {
         let QueuedRebase { strategy } = rebase;
-        let ledger_name = ref_key.ledger_id.clone();
-        let branch = ref_key.branch.clone();
+        let ledger_name = self.ref_key.ledger_name.clone();
+        let branch = self.ref_key.branch.clone();
         let StagedRebase {
             branch_id,
             source_head_id,
@@ -802,7 +802,7 @@ impl CommitWorker {
         commit_id: ContentId,
         commit_t: i64,
     ) -> Result<(), WorkerError> {
-        let full_ledger_id = format_full_ledger_id(ref_key);
+        let full_ledger_id = self.ref_key.ledger_id();
         self.publisher
             .publish_commit(&full_ledger_id, commit_t, &commit_id)
             .await
@@ -816,8 +816,8 @@ impl CommitWorker {
         reason: PoisonReason,
     ) -> Result<(), WorkerError> {
         let cmd = SmCommand::PoisonQueueEntry(PoisonQueueEntryArgs {
-            ledger_id: ref_key.ledger_id.clone(),
-            branch: ref_key.branch.clone(),
+            ledger_id: self.ref_key.ledger_name.clone(),
+            branch: self.ref_key.branch.clone(),
             queue_id,
             reason,
             applied_at_millis: current_millis(),

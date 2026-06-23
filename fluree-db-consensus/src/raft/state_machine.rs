@@ -69,16 +69,23 @@ impl From<RecordedTally> for TrackingTally {
 /// Composite identity of a single branch within a ledger.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct RefKey {
-    pub ledger_id: String,
+    pub ledger_name: String,
     pub branch: String,
 }
 
 impl RefKey {
-    pub fn new(ledger_id: impl Into<String>, branch: impl Into<String>) -> Self {
+    pub fn new(ledger_name: impl Into<String>, branch: impl Into<String>) -> Self {
         Self {
-            ledger_id: ledger_id.into(),
+            ledger_name: ledger_name.into(),
             branch: branch.into(),
         }
+    }
+
+    /// Canonical `name:branch` ledger ID for this ref. Thin wrapper
+    /// over [`format_ledger_id`] so callers can spell the canonical
+    /// form directly from a [`RefKey`].
+    pub fn ledger_id(&self) -> String {
+        format_ledger_id(&self.ledger_name, &self.branch)
     }
 }
 
@@ -1385,7 +1392,7 @@ fn clear_queue_for_admin(
             applied_at_millis,
         },
     );
-    let ledger_id = format_ledger_id(&ref_key.ledger_id, &ref_key.branch);
+    let ledger_id = ref_key.ledger_id();
     queue
         .into_iter()
         .map(|entry| (ledger_id.clone(), entry.request_cid))
@@ -1485,7 +1492,7 @@ fn set_index_head(
 fn current_ref_value(state: &NameServiceState, key: &RefKey, kind: RefKind) -> Option<RefValue> {
     if !state
         .ledgers
-        .get(&key.ledger_id)
+        .get(&key.ledger_name)
         .is_some_and(|l| l.branches.iter().any(|b| b == &key.branch))
     {
         return None;
