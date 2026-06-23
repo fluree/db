@@ -4042,7 +4042,7 @@ async fn policy_hiding_base_edge_blocks_annotation_rooted_query() {
                 "f:query": serde_json::to_string(&json!({
                     "where": {
                         "@id": "?$identity",
-                        "@type": "ex:NeverMatches"
+                        "@type": "http://example.org/NeverMatches"
                     }
                 })).unwrap()
             }]
@@ -4086,7 +4086,7 @@ async fn policy_hiding_base_edge_blocks_annotation_rooted_query() {
                 "f:query": serde_json::to_string(&json!({
                     "where": {
                         "@id": "?$identity",
-                        "@type": "ex:NeverMatches"
+                        "@type": "http://example.org/NeverMatches"
                     }
                 })).unwrap()
             }]
