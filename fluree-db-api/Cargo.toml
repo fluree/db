@@ -182,5 +182,9 @@ harness = false
 name = "query_hot_bsbm"
 harness = false
 
+[[bench]]
+name = "query_hot_bsbm_bi"
+harness = false
+
 [lints]
 workspace = true
