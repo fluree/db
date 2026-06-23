@@ -7,6 +7,7 @@ Fluree DB is a single binary that stores your data as an RDF knowledge graph, qu
 ## What you get
 
 - **Semantic by default.** Your data is RDF. IRIs, JSON-LD `@context`, named graphs, and typed values are first-class. Queries are SPARQL 1.1 or the equivalent JSON-LD Query, both compiling to the same execution engine.
+- **Property graphs and statement-level metadata.** Attach properties to a *relationship*, not just a node — `role` and `since` on a `worksFor` edge, `source` and `confidence` on a claim — with RDF 1.2 / SPARQL 1.2 edge annotations. Labeled-property-graph edges, parallel relationships between the same two nodes, and RDF-star provenance all live on one surface, and plain triple queries are left undisturbed. See [Edge annotations](concepts/edge-annotations.md).
 - **Time travel.** Every transaction is a commit on an immutable chain. Query the state of the graph at any past moment with a single `t` parameter — no snapshots to restore, no separate audit log to consult.
 - **Branching and merging.** Create a branch off any commit, transact against it in isolation, then merge it back. Useful for staging changes, running what-if analyses, or maintaining environment-specific overlays.
 - **Verifiable data.** Transactions and commits can be signed (JWS / W3C Verifiable Credentials). The commit chain is content-addressed, so any tampering is detectable. Pair it with policy enforcement to prove *who* changed *what* and *when* they were allowed to.
@@ -28,8 +29,8 @@ Fluree DB is a single binary that stores your data as an RDF knowledge graph, qu
 
 ## Explore the docs
 
-- [Concepts](concepts/README.md) — ledgers, graph sources, IRIs, time travel, policy, verifiable data, reasoning
-- [Guides (cookbooks)](guides/README.md) — search, time travel, branching, policies, SHACL — task-oriented recipes
+- [Concepts](concepts/README.md) — ledgers, graph sources, IRIs, datatypes, edge annotations, time travel, policy, verifiable data, reasoning
+- [Guides (cookbooks)](guides/README.md) — query patterns, search, time travel, branching, policies, SHACL, edge annotations — task-oriented recipes
 - [CLI reference](cli/README.md) — every `fluree` command, flag by flag
 - [HTTP API](api/README.md) — endpoints, headers, signed requests, error model
 - [Query](query/README.md) — JSON-LD Query, SPARQL, output formats, CONSTRUCT, explain plans, reasoning
@@ -44,6 +45,10 @@ Fluree DB is a single binary that stores your data as an RDF knowledge graph, qu
 - [Contributing](contributing/README.md) — dev setup, tests, SPARQL compliance, releasing
 
 The full table of contents is in [`SUMMARY.md`](SUMMARY.md).
+
+## Building with AI and agents
+
+[Fluree for AI and agents](ai/README.md) features for the AI use case — it ties together Agent JSON (token-efficient query output), the MCP server (Fluree as an agent tool), Fluree Memory, vector and full-text search as a RAG substrate, and reasoning.
 
 ## Fluree Memory
 

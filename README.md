@@ -1,12 +1,8 @@
-# Fluree
+# Fluree DB - A graph database for data that matters.
 
-A graph database built for data that matters. Temporal, verifiable, standards-compliant.
+Temporal, verifiable, standards-compliant, git-like branching and merging, and [optimized for AI agents](docs/ai/README.md). Integrated vector, text and geo search, and fine-grained access control with no external dependencies.
 
-Fluree stores data as RDF triples with complete history, integrated search, and fine-grained access control — in a single binary with no external dependencies.
-
-Billions of triples on commodity hardware. Over 2M triples/second bulk import. [Benchmark leader](https://labs.flur.ee) across 105 W3C SPARQL queries.
-
-[![License: BSL 1.1](https://img.shields.io/badge/license-BSL%201.1-blue)](#license)
+Billions of graph facts on commodity hardware. Over 2M facts/second bulk import. [Benchmark leader](https://labs.flur.ee), 10.4x faster than next  database. On the full 21.5-billion-triple Wikidata dump, all 850/850 WGPB graph-pattern queries complete with a 43 ms geometric mean.
 
 > [!NOTE]
 > **Fluree Memory** — is part of the Fluree DB CLI.
@@ -14,6 +10,8 @@ Billions of triples on commodity hardware. Over 2M triples/second bulk import. [
 > [Fluree Memory docs →](https://labs.flur.ee/docs)
 
 ## Install
+
+**Cloud / Serverless** — Run in a dedicated serverless stack at no cost at [flur.ee](https://flur.ee/solo) (usage limited), spin up dedicated servers on demand as needed. Interact seamlessly with local fluree CLI (install instructions below).
 
 **Docker** — pre-configured HTTP server, ready to accept queries on port 8090. Best for trying out the API or running Fluree as a service.
 
@@ -136,6 +134,26 @@ fluree query --at 2024-06-15T00:00:00Z 'SELECT * WHERE { ?s ?p ?o }'
 
 Learn more: [Time travel concepts](docs/concepts/time-travel.md), [time-travel cookbook](docs/guides/cookbook-time-travel.md).
 
+### Property graphs & edge annotations
+
+Attach properties to a *relationship*, not just a node — a `role` and `since` date on a `worksFor` edge, a `source` and `confidence` on a claim. Fluree implements the RDF 1.2 / SPARQL 1.2 annotation syntax, so you get labeled-property-graph edges, parallel relationships between the same two nodes, and RDF-star statement-level provenance on a single surface. Plain triple queries are left untouched — annotations only change cardinality when you ask for them.
+
+```sparql
+# Attach metadata to the edge itself, not to Alice or Acme
+INSERT DATA {
+  ex:alice ex:worksFor ex:acme {| ex:role "Engineer" ; ex:since 2024 |} .
+}
+
+# Match the edge and its metadata together
+SELECT ?role ?since WHERE {
+  ex:alice ex:worksFor ex:acme {| ex:role ?role ; ex:since ?since |} .
+}
+```
+
+The same shape is available in JSON-LD via `@annotation`, including on edges inside named graphs.
+
+Learn more: [Edge annotations concept](docs/concepts/edge-annotations.md), [edge-annotations cookbook](docs/guides/cookbook-edge-annotations.md).
+
 ### Integrated search
 
 BM25 full-text search and HNSW vector similarity are built into the query engine — not bolted-on external services. Search results participate in joins, filters, and aggregations like any other graph pattern.
@@ -235,6 +253,7 @@ fluree mcp serve            # stdio transport for Claude Desktop, Cursor, etc.
 |---|---|
 | **Query languages** | [SPARQL 1.1](docs/query/sparql.md), [JSON-LD Query](docs/query/jsonld-query.md) |
 | **Data formats** | JSON-LD, [Turtle, TriG](docs/transactions/turtle.md), N-Triples, N-Quads |
+| **Edge annotations** | [Property-graph edges & statement-level metadata (RDF 1.2 / SPARQL 1.2)](docs/concepts/edge-annotations.md) |
 | **Time travel** | [Transaction number, ISO timestamp, commit ID](docs/concepts/time-travel.md) |
 | **Full-text search** | [Integrated BM25 with Block-Max WAND](docs/indexing-and-search/bm25.md) |
 | **Vector search** | [Embedded HNSW or remote service](docs/indexing-and-search/vector-search.md) |

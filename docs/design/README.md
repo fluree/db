@@ -28,6 +28,14 @@ The content-addressed identity layer: `ContentId` type, `ContentStore` trait, mu
 
 Binary columnar index format: branch/leaf/leaflet hierarchy, dictionary artifacts, SPOT/PSOT/POST/OPST/TSPO layout, and encoding details.
 
+### [Edge annotations (storage internals)](edge-annotations.md)
+
+On-disk representation of RDF 1.2 edge annotations: the durable `f:reifies*` flake bundle, the derived `EdgeKey ↔ subject` annotation arena, the indexer state machine, and garbage-collection reachability. (User-facing contract lives in [Edge annotations (concept doc)](../concepts/edge-annotations.md).)
+
+### [Spatial Index](spatial-index.md)
+
+Geospatial indexing internals: inline GeoPoint encoding (packed 60-bit lat/lng for POINT geometries with latitude-band scans) and the S2 cell-based index for complex geometries, plus the query pipeline and time-travel semantics.
+
 ### [Namespace allocation and fallback modes](namespace-allocation.md)
 
 How Fluree assigns `ns_code` values for IRIs (prefix trie matching, fallback split modes), including bulk-import preflight mitigation and how the “host-only” fallback persists for future transactions.
@@ -43,10 +51,6 @@ How a single **model ledger** can hold the ontology, SHACL shapes, policy rules,
 ### [Storage Traits](storage-traits.md)
 
 Storage trait architecture: `StorageRead`, `StorageWrite`, `ContentAddressedWrite`, `Storage`, and `NameService` trait design with guidance for implementing new backends.
-
-### [Reasoning Roadmap](reasoning-roadmap.md)
-
-Two-axis plan for OWL reasoning: (A) static OWL2RL materialization performance (rule compilation, parallel fixpoint, post-import pass) and incremental maintenance via FBF with derived facts persisted in a branch-plumbing-based "reasoned index head"; (B) practitioner UX/DX (explanations from a provenance sidecar, ROBOT-style workflows, `versionIRI ↔ t` mapping, virtual RDF-star lineage).
 
 ## Related Documentation
 

@@ -174,6 +174,8 @@ Beyond XSD, Fluree supports RDF-specific datatypes:
 
 **rdf:langString** represents strings with language tags. This is distinct from plain strings and enables language-aware queries.
 
+> **Annotating literal values.** Any literal — plain, typed, or language-tagged — can carry statement-level metadata (source, confidence, timestamp) via an edge annotation. Because a JSON scalar has no room for sibling keys, an annotated literal must be written in value-object form (`@value` plus `@annotation`); language-tagged annotations are language-pinned, so `"chat"@fr` and `"chat"@en` annotate independently. See [Edge annotations → Annotating literal-valued edges](edge-annotations.md#annotating-literal-valued-edges).
+
 ### JSON Data
 
 ```json

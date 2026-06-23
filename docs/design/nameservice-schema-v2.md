@@ -965,38 +965,6 @@ Each file contains JSON matching the concern's payload plus metadata:
 - Used by `all_records()` (kind=`ledger`) and `all_vg_records()` (kind=`graph_source`)
 - After GSI query returns meta items, `BatchGetItem` fetches remaining concern items (`config`, `index`) to assemble full records
 
-### Future GSIs
-
-| GSI Name | Partition Key | Sort Key | Use Case |
-|----------|---------------|----------|----------|
-| `source-type-index` | `source_type` | `pk` | List all graph sources of a given type |
-| `state-index` | `status_state` | `pk` | Find entities in specific state |
-
-**Note on `state-index`**: DynamoDB GSIs cannot use nested map attributes as keys. To enable this GSI:
-
-1. Add an **optional denormalized attribute** `status_state` (String) on the `status` item
-2. Update `status_state` whenever `status.state` changes
-3. Only add it if you need GSI-based queries by state
-
-**Alternative**: Use Scan with FilterExpression on `status.state` (less efficient but no schema extension needed)
-
-## Future Considerations
-
-### Streams and Events
-
-DynamoDB Streams can be enabled to:
-- Trigger Lambda on changes
-- Build event sourcing
-- Replicate to other regions
-
-### Multi-region
-
-For global deployments:
-- Use DynamoDB Global Tables
-- Or regional nameservices with cross-region sync
-
----
-
 ## Appendix: Attribute Reference
 
 All items share:

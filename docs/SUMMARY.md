@@ -80,11 +80,11 @@
   - [ContentId and ContentStore](design/content-id-and-contentstore.md)
   - [Index format](design/index-format.md)
   - [Edge annotations (storage internals)](design/edge-annotations.md)
+  - [Spatial index (GeoPoint + S2)](design/spatial-index.md)
   - [Namespace allocation and fallback modes](design/namespace-allocation.md)
   - [Ontology imports (`f:schemaSource` + `owl:imports`)](design/ontology-imports.md)
   - [Cross-ledger model enforcement](design/cross-ledger-model-enforcement.md)
   - [Storage traits](design/storage-traits.md)
-  - [Reasoning roadmap (OWL2RL maintenance, reasoned index head)](design/reasoning-roadmap.md)
 
 - [HTTP API (fluree-db-server)](api/README.md)
   - [Overview](api/overview.md)
@@ -148,6 +148,8 @@
   - [Iceberg / Parquet](graph-sources/iceberg.md)
   - [R2RML](graph-sources/r2rml.md)
   - [BM25 graph source](graph-sources/bm25.md)
+
+- [Fluree for AI and agents](ai/README.md)
 
 - [Memory](memory/README.md)
   - [Getting started](memory/getting-started/README.md)
