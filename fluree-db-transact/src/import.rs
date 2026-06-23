@@ -955,17 +955,28 @@ mod inner {
         // Edge annotations: rewrite `@annotation` / `@edge` into the seven-fact
         // `f:reifies*` encoding before expansion, exactly as the transact path
         // does — otherwise the JSON-LD expander silently drops them and a bulk
-        // import loses every edge property. Gated on a cheap presence check so
-        // the common (non-annotated) bulk import pays nothing. RDF mode
-        // (lpg_mode=false): a non-empty `@annotation` lowers to a reifier
-        // bundle; the CSV/LPG loader never emits an empty `@annotation: {}`.
-        if jsonld.contains("@annotation") || jsonld.contains("@edge") || jsonld.contains("@reifies")
-        {
+        // import loses every edge property. RDF mode (lpg_mode=false): a
+        // non-empty `@annotation` lowers to a reifier bundle; the CSV/LPG
+        // loader never emits an empty `@annotation: {}`.
+        //
+        // The lowering is gated on a cheap presence check so the common
+        // (non-annotated) bulk import pays nothing. The firewall gate is
+        // *broader* on purpose: it must also fire on the fully-expanded
+        // `…#reifies*` IRI form, which contains none of the `@`-keywords
+        // above. Gating it on the same check would let a bulk import inject
+        // system facts directly, bypassing the guard the transact path
+        // always enforces. The bare `reifies` token covers both forms.
+        let needs_lowering = jsonld.contains("@annotation")
+            || jsonld.contains("@edge")
+            || jsonld.contains("@reifies");
+        if needs_lowering || jsonld.contains("reifies") {
             let top_ctx = crate::parse::edge_annotations::top_level_context(&doc)?;
             crate::parse::edge_annotations::run_user_authored_reifies_firewall(&doc, &top_ctx)?;
-            crate::parse::edge_annotations::lower_edge_annotations_after_firewall(
-                &mut doc, &top_ctx, false,
-            )?;
+            if needs_lowering {
+                crate::parse::edge_annotations::lower_edge_annotations_after_firewall(
+                    &mut doc, &top_ctx, false,
+                )?;
+            }
         }
 
         // Register @context prefix→IRI mappings in the namespace trie BEFORE

@@ -1062,6 +1062,48 @@ ex:bob   ex:worksFor ex:acme .
     );
 }
 
+/// Firewall regression: a JSON-LD bulk import that hand-writes a
+/// fully-expanded `https://ns.flur.ee/db#reifies*` IRI must be rejected,
+/// exactly as the transact path rejects it. The expanded form carries none
+/// of the `@annotation` / `@edge` / `@reifies` keywords, so a presence gate
+/// scoped to those keywords would skip the firewall and let the import
+/// inject raw system facts. The firewall gate is deliberately broader.
+#[tokio::test]
+async fn import_jsonld_user_authored_expanded_reifies_iri_is_rejected() {
+    let db_dir = tempfile::tempdir().expect("db tmpdir");
+    let data_dir = tempfile::tempdir().expect("data tmpdir");
+
+    // No `@annotation`/`@edge`/`@reifies` anywhere — only the expanded IRI.
+    let file_path = data_dir.path().join("evil.jsonld");
+    std::fs::write(
+        &file_path,
+        r#"{
+            "@context": {"ex": "http://example.org/ns/"},
+            "@id": "ex:alice",
+            "https://ns.flur.ee/db#reifiesSubject": {"@id": "ex:alice"}
+        }"#,
+    )
+    .unwrap();
+
+    let fluree = FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build file-backed Fluree");
+
+    let err = fluree
+        .create("test/import-expanded-reifies:main")
+        .import(&file_path)
+        .cleanup(false)
+        .execute()
+        .await
+        .expect_err("import of a user-authored f:reifies* IRI must be rejected");
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("system-controlled") || msg.contains("reifies"),
+        "expected a firewall rejection, got: {msg}"
+    );
+}
+
 /// End-to-end: imported annotation-bearing ledger → follow-up
 /// `fluree.reindex(...)` (the same call the CLI's
 /// `fluree create --import` auto-seal step makes) seals the

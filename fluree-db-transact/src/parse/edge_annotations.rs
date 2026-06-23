@@ -514,6 +514,23 @@ pub fn run_user_authored_reifies_firewall(doc: &Value, top_ctx: &ParsedContext) 
     scan_user_authored_reifies_iris(doc, top_ctx)
 }
 
+/// Cheap read-only check for whether `doc` contains any `@annotation` /
+/// `@edge` / `@reifies` block that the lowering passes would rewrite.
+///
+/// Lets the transactor skip the payload clone and the mutating lowering
+/// walks for the common non-annotated transaction. The firewall is a
+/// separate concern and must still run unconditionally — it guards against
+/// user-authored `f:reifies*` IRIs, which this scan does not look for.
+pub fn document_has_annotation_keys(doc: &Value) -> bool {
+    match doc {
+        Value::Object(map) => map.iter().any(|(k, v)| {
+            is_annotation_key(k) || k == REIFIES_KEY || document_has_annotation_keys(v)
+        }),
+        Value::Array(items) => items.iter().any(document_has_annotation_keys),
+        _ => false,
+    }
+}
+
 /// Pre-pass for UPDATE transactions: rewrite `@annotation` blocks
 /// inside the `delete` clause into explicit `f:reifies*` retract
 /// templates **before** the main `lower_edge_annotations` walker runs.
