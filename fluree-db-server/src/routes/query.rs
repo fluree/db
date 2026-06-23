@@ -2169,16 +2169,16 @@ async fn execute_query_proxy(
     Ok((HeaderMap::new(), Json(result)).into_response())
 }
 
-/// Build `QueryConnectionOptions` for a ledger-scoped SPARQL request from the
+/// Build `GovernanceOptions` for a ledger-scoped SPARQL request from the
 /// resolved identity plus header-supplied policy fields. SPARQL has no body
 /// `opts` block, so headers are the only transport for `policy-class`,
 /// `policy`, `policy-values`, and `default-allow`.
 pub(crate) fn sparql_qc_opts(
     identity: Option<&str>,
     headers: &FlureeHeaders,
-) -> Result<fluree_db_api::QueryConnectionOptions> {
+) -> Result<fluree_db_api::GovernanceOptions> {
     let policy_values_map = headers.policy_values_map()?;
-    Ok(fluree_db_api::QueryConnectionOptions {
+    Ok(fluree_db_api::GovernanceOptions {
         identity: identity.map(String::from),
         policy_class: if headers.policy_class.is_empty() {
             None
@@ -2345,7 +2345,7 @@ async fn execute_sparql_ledger(
             .map(|d| !d.default_graphs.is_empty() || !d.named_graphs.is_empty() || d.to_graph.is_some())
             .unwrap_or(false);
 
-        // Build QueryConnectionOptions from the resolved identity plus header-supplied
+        // Build GovernanceOptions from the resolved identity plus header-supplied
         // policy fields. SPARQL has no body `opts` block, so headers are the only
         // transport for `policy-class`, `policy`, `policy-values`, and `default-allow`.
         let qc_opts = sparql_qc_opts(identity, headers).inspect_err(|e| {

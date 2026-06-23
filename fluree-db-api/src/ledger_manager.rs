@@ -65,11 +65,17 @@ fn monotonic_secs() -> u64 {
 ///
 /// Transactions hold this guard across stage+commit to serialize writes
 /// to the same ledger.
-pub struct LedgerWriteGuard<'a> {
-    guard: tokio::sync::RwLockWriteGuard<'a, LedgerState>,
+pub struct LedgerWriteGuard {
+    ledger: LedgerHandle,
+    guard: tokio::sync::OwnedRwLockWriteGuard<LedgerState>,
 }
 
-impl LedgerWriteGuard<'_> {
+impl LedgerWriteGuard {
+    /// Get the ledger whose write lock this guard holds.
+    pub fn ledger(&self) -> &LedgerHandle {
+        &self.ledger
+    }
+
     /// Get reference to current state
     pub fn state(&self) -> &LedgerState {
         &self.guard
@@ -121,7 +127,12 @@ struct LedgerHandleInner {
     /// (every query takes a brief shared `read()` to clone a cheap, Arc-backed
     /// snapshot) run in parallel instead of serializing; transactions take an
     /// exclusive `write()` for the stage+commit duration.
-    state: RwLock<LedgerState>,
+    ///
+    /// Wrapped in an `Arc` so a [`LedgerWriteGuard`] can hold an
+    /// `OwnedRwLockWriteGuard` and live independently of any handle reference —
+    /// callers don't have to keep a borrow of the handle alive to use the
+    /// guard.
+    state: Arc<RwLock<LedgerState>>,
     /// Ledger ID (e.g., "mydb:main")
     ledger_id: String,
     /// Last access time (monotonic secs since process start)
@@ -142,7 +153,7 @@ impl LedgerHandle {
     ) -> Self {
         Self {
             inner: Arc::new(LedgerHandleInner {
-                state: RwLock::new(state),
+                state: Arc::new(RwLock::new(state)),
                 ledger_id,
                 last_access: AtomicU64::new(monotonic_secs()),
                 binary_store: RwLock::new(binary_store),
@@ -177,10 +188,11 @@ impl LedgerHandle {
     }
 
     /// Acquire exclusive access for transaction (hold lock for stage+commit)
-    pub async fn lock_for_write(&self) -> LedgerWriteGuard<'_> {
+    pub async fn lock_for_write(&self) -> LedgerWriteGuard {
         self.touch();
         LedgerWriteGuard {
-            guard: self.inner.state.write().await,
+            ledger: self.clone(),
+            guard: Arc::clone(&self.inner.state).write_owned().await,
         }
     }
 
@@ -213,7 +225,7 @@ impl LedgerHandle {
     }
 
     /// Get ledger ID
-    pub fn ledger_id(&self) -> &str {
+    pub fn id(&self) -> &str {
         &self.inner.ledger_id
     }
 
@@ -1602,7 +1614,7 @@ impl LedgerManager {
                     "notify: catching up commits (incremental)"
                 );
 
-                let ledger_id_canonical = handle.ledger_id().to_string();
+                let ledger_id_canonical = handle.id().to_string();
                 let cs: Arc<dyn ContentStore> = cs_for_record().await?;
 
                 // Load commits outside any lock.

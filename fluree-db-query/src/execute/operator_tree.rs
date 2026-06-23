@@ -2868,6 +2868,7 @@ fn build_operator_tree_inner(
         query.limit,
         detect_partitioned_group_by(query),
         variable_deps.as_ref(),
+        planning,
     )
 }
 
@@ -2897,6 +2898,7 @@ pub(crate) fn apply_solution_modifiers(
     limit: Option<usize>,
     partitioned: bool,
     variable_deps: Option<&VariableDeps>,
+    planning: &PlanningContext,
 ) -> Result<BoxedOperator> {
     // Flatten the grouping phase's data for consumption below. The variant
     // distinction has already done its structural work at the IR boundary; the
@@ -3090,6 +3092,7 @@ pub(crate) fn apply_solution_modifiers(
         for (i, (var, expr)) in post_binds_vec.iter().enumerate() {
             operator = Box::new(
                 crate::bind::BindOperator::new(operator, *var, expr.clone(), vec![])
+                    .with_planning(*planning)
                     .with_out_schema(
                         variable_deps
                             .as_ref()
@@ -3135,12 +3138,10 @@ pub(crate) fn apply_solution_modifiers(
             }
         }
         for (var, expr) in order_binds {
-            operator = Box::new(crate::bind::BindOperator::new(
-                operator,
-                *var,
-                expr.clone(),
-                vec![],
-            ));
+            operator = Box::new(
+                crate::bind::BindOperator::new(operator, *var, expr.clone(), vec![])
+                    .with_planning(*planning),
+            );
         }
     }
 

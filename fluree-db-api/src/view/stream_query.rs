@@ -283,11 +283,11 @@ impl Fluree {
     /// Build a policy-wrapped `DataSetDb` from an explicit spec + connection
     /// options. Used by the ledger-scoped streaming SPARQL path, where the
     /// server builds the `DatasetSpec` from `FROM`/`FROM NAMED` clauses and the
-    /// `QueryConnectionOptions` from the resolved identity + policy headers.
+    /// `GovernanceOptions` from the resolved identity + policy headers.
     pub async fn build_stream_dataset_from_spec(
         &self,
         spec: &crate::DatasetSpec,
-        qc_opts: &crate::QueryConnectionOptions,
+        qc_opts: &crate::GovernanceOptions,
     ) -> Result<DataSetDb> {
         self.build_dataset_for_connection(spec, qc_opts).await
     }
@@ -298,7 +298,7 @@ impl Fluree {
     pub async fn build_stream_dataset_for_sparql(
         &self,
         sparql: &str,
-        qc_opts: &crate::QueryConnectionOptions,
+        qc_opts: &crate::GovernanceOptions,
     ) -> Result<DataSetDb> {
         let ast = crate::query::helpers::parse_and_validate_sparql(sparql)?;
         let spec = crate::query::helpers::extract_sparql_dataset_spec(&ast)?;

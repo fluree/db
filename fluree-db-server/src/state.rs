@@ -21,6 +21,7 @@ use crate::registry::LedgerRegistry;
 use crate::telemetry::TelemetryConfig;
 use dashmap::DashMap;
 use fluree_db_api::{Fluree, FlureeBuilder, IndexConfig, NameServiceMode};
+use fluree_db_consensus::MonolithicCommitter;
 use fluree_db_core::ledger_id::normalize_ledger_id;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
@@ -45,6 +46,11 @@ pub struct AppState {
 
     /// Optional index configuration
     pub index_config: Option<IndexConfig>,
+
+    /// Transaction submission interface (monolithic consensus over the local
+    /// transactor). Always present; only meaningful when this node accepts
+    /// writes (peer-mode nodes forward writes elsewhere).
+    pub consensus: Arc<MonolithicCommitter>,
 
     /// Ledger registry for tracking loaded ledgers and their watermarks
     pub registry: Arc<LedgerRegistry>,
@@ -177,19 +183,25 @@ impl AppState {
 
         // Build IndexConfig from server config (always set, even if indexing is disabled,
         // so that novelty backpressure thresholds are respected for external indexers).
-        let index_config = Some(IndexConfig {
+        let index_config = IndexConfig {
             reindex_min_bytes: config.reindex_min_bytes,
             reindex_max_bytes: config
                 .reindex_max_bytes
                 .unwrap_or_else(fluree_db_api::server_defaults::default_reindex_max_bytes),
-        });
+        };
+
+        let consensus = Arc::new(MonolithicCommitter::new(
+            Arc::clone(&fluree),
+            index_config.clone(),
+        ));
 
         Ok(Self {
             fluree,
             config,
             telemetry_config,
             start_time: Instant::now(),
-            index_config,
+            index_config: Some(index_config),
+            consensus,
             registry,
             #[cfg(feature = "oidc")]
             jwks_cache,

@@ -21,8 +21,8 @@ use crate::format::FormatterConfig;
 use crate::query::helpers::parse_dataset_spec;
 use crate::view::{DataSetDb, GraphDb, QueryInput};
 use crate::{
-    ApiError, Fluree, PolicyContext, QueryConnectionOptions, QueryExecutionOptions, QueryResult,
-    Result, TrackedErrorResponse, TrackedQueryResponse, TrackingOptions,
+    ApiError, Fluree, GovernanceOptions, PolicyContext, QueryExecutionOptions, QueryResult, Result,
+    TrackedErrorResponse, TrackedQueryResponse, TrackingOptions,
 };
 
 use fluree_db_query::r2rml::{R2rmlProvider, R2rmlTableProvider};
@@ -775,7 +775,7 @@ pub struct FromQueryBuilder<'a> {
     fluree: &'a Fluree,
     core: QueryCore<'a>,
     policy: Option<Arc<PolicyContext>>,
-    connection_opts: Option<QueryConnectionOptions>,
+    connection_opts: Option<GovernanceOptions>,
 }
 
 impl<'a> FromQueryBuilder<'a> {
@@ -872,7 +872,7 @@ impl<'a> FromQueryBuilder<'a> {
     /// `query_connection` opts→policy path). For JSON-LD input it is a no-op
     /// — JSON-LD carries its opts in the body. Takes precedence over
     /// [`Self::policy`] when both are set.
-    pub fn connection_opts(mut self, opts: QueryConnectionOptions) -> Self {
+    pub fn connection_opts(mut self, opts: GovernanceOptions) -> Self {
         self.connection_opts = Some(opts);
         self
     }

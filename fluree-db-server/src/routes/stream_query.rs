@@ -149,7 +149,7 @@ async fn stream_query_connection_inner(
         let dataset = fluree
             .build_stream_dataset_for_sparql(
                 &sparql,
-                &fluree_db_api::QueryConnectionOptions::default(),
+                &fluree_db_api::GovernanceOptions::default(),
             )
             .await
             .map_err(ServerError::Api)?;
