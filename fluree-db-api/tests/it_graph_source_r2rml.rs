@@ -1670,6 +1670,85 @@ async fn integration_query_graph_source_provider_wiring() {
     }
 }
 
+/// Streaming parity for `integration_query_graph_source_provider_wiring`: a
+/// streaming query over a mapped graph source must resolve through the real
+/// `FlureeR2rmlProvider`, not the no-op stand-in.
+///
+/// The no-op provider reports no mapping, so the GRAPH would read as an empty
+/// native graph and the stream would end cleanly with zero rows. The real
+/// provider instead rewrites to an R2RML scan and fails (there is no live
+/// Iceberg catalog) — so an `error` terminal proves the real provider was the
+/// one consulted on the streaming path.
+#[tokio::test]
+async fn streaming_graph_source_uses_real_r2rml_provider() {
+    use fluree_db_api::{OwnedStreamQuery, QueryExecutionOptions};
+    use support::graphdb_from_ledger;
+    use tokio::sync::mpsc;
+
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    let config = R2rmlCreateConfig::new(
+        "airlines-stream-test",
+        "https://polaris.example.com",
+        "openflights.airlines",
+        AIRLINE_MAPPING_TTL,
+    )
+    .with_mapping_media_type("text/turtle");
+    let graph_source_id = fluree
+        .create_r2rml_graph_source(config)
+        .await
+        .expect("graph source creation should succeed")
+        .graph_source_id;
+
+    let ledger = genesis_ledger(&fluree, "stream-gs-test:main");
+
+    let sparql = format!(
+        "SELECT ?s WHERE {{ GRAPH <{graph_source_id}> {{ ?s a <http://example.org/Airline> }} }}"
+    );
+
+    let graph = graphdb_from_ledger(&ledger);
+    let plan = fluree
+        .plan_stream_query(&graph, &OwnedStreamQuery::Sparql(sparql))
+        .await
+        .expect("plan should succeed");
+    drop(graph);
+
+    let (tx, mut rx) = mpsc::channel(1024);
+    fluree
+        .run_stream_query(
+            ledger,
+            plan,
+            Tracker::disabled(),
+            QueryExecutionOptions::default(),
+            tx,
+        )
+        .await;
+
+    let mut bytes = Vec::new();
+    while let Some(chunk) = rx.recv().await {
+        bytes.extend_from_slice(&chunk);
+    }
+    let records: Vec<serde_json::Value> = String::from_utf8(bytes)
+        .expect("ndjson is utf-8")
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(|l| serde_json::from_str(l).expect("each line is valid JSON"))
+        .collect();
+
+    let terminal = records.last().expect("a terminal record");
+    assert_eq!(
+        terminal["type"], "error",
+        "real provider attempts the R2RML scan and fails without a catalog; \
+         a clean `end` would mean the no-op provider was wired. Terminal: {terminal}"
+    );
+    assert!(
+        !terminal
+            .to_string()
+            .contains("does not support graph source operations"),
+        "must use FlureeR2rmlProvider, not the no-op. Terminal: {terminal}"
+    );
+}
+
 // =============================================================================
 // RefObjectMap Join Execution Tests
 // =============================================================================

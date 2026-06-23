@@ -230,7 +230,20 @@ impl Fluree {
         )
         .await?;
 
-        view_context_config!(config, self, db, executable, tracker, options, None);
+        // Wire R2RML so a graph-source query that routed through the
+        // single-ledger streaming path applies its mapping (parity with the
+        // buffered `execute_view_internal_with_r2rml`); no-op without `iceberg`
+        // and never consulted for plain queries.
+        let r2rml = crate::r2rml_provider!(self);
+        view_context_config!(
+            config,
+            self,
+            db,
+            executable,
+            tracker,
+            options,
+            Some((&r2rml, &r2rml)),
+        );
 
         execute_prepared_streaming(db_ref, vars, prepared, config, sink).await
     }
@@ -385,7 +398,11 @@ impl Fluree {
             buf: String::new(),
         };
 
-        let noop = crate::NoOpR2rmlProvider::new();
+        // Mirror the buffered dataset path's R2RML wiring: with `iceberg` on,
+        // a mapped graph source resolves through `FlureeR2rmlProvider` (the
+        // provider is only consulted for graph-source patterns, so plain
+        // queries pay nothing); otherwise the no-op provider stands in.
+        let r2rml = crate::r2rml_provider!(self);
         let exec = self
             .execute_dataset_into_with_r2rml(
                 &dataset,
@@ -393,8 +410,8 @@ impl Fluree {
                 &plan.executable,
                 &tracker,
                 crate::R2rmlProviders {
-                    provider: &noop,
-                    table_provider: &noop,
+                    provider: &r2rml,
+                    table_provider: &r2rml,
                 },
                 &options,
                 &mut sink,
