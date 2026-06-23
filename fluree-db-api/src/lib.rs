@@ -2497,11 +2497,8 @@ impl FlureeBuilder {
                 let ns = MemoryNameService::new();
                 let notifying =
                     fluree_db_nameservice::NotifyingNameService::new(ns, event_bus.clone());
-                let indexing_mode = self.start_background_indexing(
-                    &backend,
-                    &notifying,
-                    &attachment_provider_cell,
-                );
+                let indexing_mode =
+                    self.start_background_indexing(&backend, &notifying, &attachment_provider_cell);
                 (
                     NameServiceMode::ReadWrite(Arc::new(notifying)),
                     indexing_mode,
@@ -2633,11 +2630,8 @@ impl FlureeBuilder {
                 let ns_arc: Arc<dyn NameServicePublisher> = aws_handle.nameservice_arc().clone();
                 let ns_rw: Arc<dyn fluree_db_nameservice::ReadWriteNameService> =
                     aws_handle.nameservice_arc().clone();
-                let indexing_mode = self.start_background_indexing_dyn(
-                    &backend,
-                    ns_rw,
-                    &attachment_provider_cell,
-                );
+                let indexing_mode =
+                    self.start_background_indexing_dyn(&backend, ns_rw, &attachment_provider_cell);
                 (NameServiceMode::ReadWrite(ns_arc), indexing_mode)
             }
         };
