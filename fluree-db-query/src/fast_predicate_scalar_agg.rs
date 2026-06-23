@@ -19,8 +19,8 @@ use crate::binding::{Batch, Binding};
 use crate::error::{QueryError, Result};
 use crate::fast_path_common::{
     build_i64_singleton_batch, build_post_cursor_for_predicate, count_to_i64,
-    cursor_fast_path_for_predicate, cursor_projection_otype_okey, leaf_entries_for_predicate,
-    normalize_pred_sid, projection_okey_only, FastPathOperator, PredicateFastPath,
+    cursor_projection_otype_okey, leaf_entries_for_predicate, normalize_pred_sid,
+    predicate_fast_path_allowed, projection_okey_only, FastPathOperator,
 };
 use crate::ir::triple::Ref;
 use crate::operator::BoxedOperator;
@@ -161,12 +161,10 @@ pub fn predicate_scalar_agg_operator(
             // O1: keep the cursor fast path when the scanned predicate is provably
             // uncovered by the view policy. Anything else (covered, default-deny,
             // multi-ledger, historical) defers to the fallback, which computes the
-            // correct aggregate identity over the policy-filtered input.
-            let pred_sid = normalize_pred_sid(store, &predicate)?;
-            if !matches!(
-                cursor_fast_path_for_predicate(ctx, &pred_sid),
-                PredicateFastPath::Allow
-            ) {
+            // correct aggregate identity over the policy-filtered input. This path
+            // is overlay-aware, so it gates on the predicate only — not on the
+            // no-overlay `fast_path_store_policy_cleared` store.
+            if !predicate_fast_path_allowed(ctx, store, &predicate)? {
                 return Ok(None);
             }
             // No-overlay HEAD reads take the leaflet-metadata scan (with its

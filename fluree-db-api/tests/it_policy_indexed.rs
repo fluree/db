@@ -450,12 +450,12 @@ async fn policy_count_respects_predicate_coverage() {
                 "where": {"@id": "?s", "http://schema.org/ssn": "?o"}
             });
 
-            let opts_allow = QueryConnectionOptions {
+            let opts_allow = GovernanceOptions {
                 identity: Some("http://example.org/ns/aliceIdentity".to_string()),
                 default_allow: true,
                 ..Default::default()
             };
-            let opts_deny = QueryConnectionOptions {
+            let opts_deny = GovernanceOptions {
                 identity: Some("http://example.org/ns/aliceIdentity".to_string()),
                 default_allow: false,
                 ..Default::default()
@@ -603,7 +603,7 @@ async fn policy_stats_count_by_predicate_uses_filtered_fallback() {
 
             // Policy: alice can view only her own ssn => count 1 (filtered fallback),
             // not the raw index count of 2.
-            let alice_opts = QueryConnectionOptions {
+            let alice_opts = GovernanceOptions {
                 identity: Some("http://example.org/ns/aliceIdentity".to_string()),
                 default_allow: true,
                 ..Default::default()

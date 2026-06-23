@@ -532,7 +532,7 @@ async fn where_read_respects_view_policy() {
         "f:action": [{"@id": "f:view"}],
         "f:allow": false
     }]);
-    let qc_opts = QueryConnectionOptions {
+    let qc_opts = GovernanceOptions {
         policy: Some(policy),
         default_allow: true,
         ..Default::default()
@@ -640,7 +640,7 @@ async fn turtle_insert_enforces_modify_policy() {
         "f:action": "f:modify",
         "f:allow": false
     }]);
-    let qc_opts = QueryConnectionOptions {
+    let qc_opts = GovernanceOptions {
         policy: Some(policy),
         default_allow: true,
         ..Default::default()

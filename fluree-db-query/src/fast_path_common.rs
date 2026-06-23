@@ -3565,6 +3565,52 @@ pub fn cursor_fast_path_for_predicate(
     }
 }
 
+/// Shared single-predicate fast-path gate: normalize `predicate` against
+/// `store` and decide whether the cursor fast path may run.
+///
+/// `Ok(true)` when the predicate is provably safe to fast-path under the
+/// current view policy (no policy / root, or uncovered + default-allow);
+/// `Ok(false)` to decline (covered, default-deny, multi-ledger, or historical
+/// — take the filtered fallback).
+///
+/// This is the decision every single-predicate fast path repeats; callers that
+/// also need a no-overlay, at-HEAD store should pair it with
+/// [`fast_path_store_policy_cleared`] (or just call
+/// [`fast_path_store_for_predicate`], which combines the two).
+#[inline]
+pub fn predicate_fast_path_allowed(
+    ctx: &ExecutionContext<'_>,
+    store: &BinaryIndexStore,
+    predicate: &Ref,
+) -> Result<bool> {
+    let pred_sid = normalize_pred_sid(store, predicate)?;
+    Ok(matches!(
+        cursor_fast_path_for_predicate(ctx, &pred_sid),
+        PredicateFastPath::Allow
+    ))
+}
+
+/// Convenience preamble for fast paths that scan **persisted index rows only**:
+/// runs [`predicate_fast_path_allowed`] against the context's binary store, then
+/// returns the policy-cleared, at-HEAD store ([`fast_path_store_policy_cleared`])
+/// to scan — or `None` to decline.
+///
+/// Overlay-aware cursor fast paths (which tolerate novelty / `to_t < max_t`)
+/// must NOT use this; they call [`predicate_fast_path_allowed`] directly and
+/// keep their own store handling.
+#[inline]
+pub fn fast_path_store_for_predicate<'a>(
+    ctx: &'a ExecutionContext<'_>,
+    predicate: &Ref,
+) -> Result<Option<&'a Arc<BinaryIndexStore>>> {
+    if let Some(store) = ctx.binary_store.as_ref() {
+        if !predicate_fast_path_allowed(ctx, store, predicate)? {
+            return Ok(None);
+        }
+    }
+    Ok(fast_path_store_policy_cleared(ctx))
+}
+
 // ---------------------------------------------------------------------------
 // 11. Generic fast-path operator
 // ---------------------------------------------------------------------------

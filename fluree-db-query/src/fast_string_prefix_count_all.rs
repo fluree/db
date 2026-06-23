@@ -14,8 +14,7 @@ use crate::context::ExecutionContext;
 use crate::error::{QueryError, Result};
 use crate::fast_path_common::{
     build_count_batch, build_i64_singleton_batch, build_range_cursor, contiguous_id_range,
-    cursor_fast_path_for_predicate, fast_path_store_policy_cleared, normalize_pred_sid,
-    ref_to_p_id, FastPathOperator, PredicateFastPath,
+    fast_path_store_for_predicate, ref_to_p_id, FastPathOperator,
 };
 use crate::ir::triple::Ref;
 use crate::operator::BoxedOperator;
@@ -77,16 +76,7 @@ fn prefix_match_count(ctx: &ExecutionContext<'_>, pred: &Ref, prefix: &str) -> R
     // O1: only proceed when the scanned predicate is provably uncovered by the
     // view policy; otherwise defer to the fallback (which applies the policy and
     // evaluates the prefix filter per visible row).
-    if let Some(store) = ctx.binary_store.as_ref() {
-        let pred_sid = normalize_pred_sid(store, pred)?;
-        if !matches!(
-            cursor_fast_path_for_predicate(ctx, &pred_sid),
-            PredicateFastPath::Allow
-        ) {
-            return Ok(None);
-        }
-    }
-    let Some(store) = fast_path_store_policy_cleared(ctx) else {
+    let Some(store) = fast_path_store_for_predicate(ctx, pred)? else {
         return Ok(None);
     };
 

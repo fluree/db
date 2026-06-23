@@ -19,7 +19,7 @@ use std::sync::Arc;
 mod support;
 
 use fluree_db_api::{
-    policy_builder, FlureeBuilder, IndexConfig, LedgerState, Novelty, QueryConnectionOptions,
+    policy_builder, FlureeBuilder, GovernanceOptions, IndexConfig, LedgerState, Novelty,
 };
 use fluree_db_core::LedgerSnapshot;
 use fluree_db_transact::{CommitOpts, TxnOpts};
@@ -924,7 +924,7 @@ async fn geo_search_enforces_view_policy_on_location_flake() {
                     }
                 }
             }]);
-            let opts = QueryConnectionOptions {
+            let opts = GovernanceOptions {
                 policy: Some(policy),
                 default_allow: false,
                 ..Default::default()

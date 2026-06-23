@@ -25,9 +25,8 @@ use crate::binding::Batch;
 use crate::error::{QueryError, Result};
 use crate::fast_path_common::{
     bail_if_cancelled, build_count_batch, build_i64_singleton_batch, count_rows_for_predicate_psot,
-    count_to_i64, cursor_fast_path_for_predicate, fast_path_store_policy_cleared,
-    leaf_entries_for_predicate, normalize_pred_sid, parallel_leaf_chunk_count,
-    projection_okey_only, projection_otype_okey, FastPathOperator, PredicateFastPath,
+    count_to_i64, fast_path_store_for_predicate, leaf_entries_for_predicate, normalize_pred_sid,
+    parallel_leaf_chunk_count, projection_okey_only, projection_otype_okey, FastPathOperator,
 };
 use crate::ir::triple::Ref;
 use crate::operator::BoxedOperator;
@@ -212,16 +211,7 @@ pub fn predicate_string_fold_operator(
             // O1: keep the fast path only when the scanned predicate is provably
             // uncovered by the view policy; otherwise defer to the fallback, which
             // computes the correct aggregate over the policy-filtered input.
-            if let Some(store) = ctx.binary_store.as_ref() {
-                let pred_sid = normalize_pred_sid(store, &predicate)?;
-                if !matches!(
-                    cursor_fast_path_for_predicate(ctx, &pred_sid),
-                    PredicateFastPath::Allow
-                ) {
-                    return Ok(None);
-                }
-            }
-            let Some(store) = fast_path_store_policy_cleared(ctx) else {
+            let Some(store) = fast_path_store_for_predicate(ctx, &predicate)? else {
                 return Ok(None);
             };
             // Persisted index rows only — defer when novelty is present.
