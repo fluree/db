@@ -2014,7 +2014,12 @@ mod tests {
         let values = property_test_decimals();
         let keyed: Vec<_> = values
             .iter()
-            .map(|v| (v.clone(), ObjKey::encode_decimal(v).expect("inline-eligible").as_u64()))
+            .map(|v| {
+                (
+                    v.clone(),
+                    ObjKey::encode_decimal(v).expect("inline-eligible").as_u64(),
+                )
+            })
             .collect();
         for (a, ka) in &keyed {
             for (b, kb) in &keyed {
