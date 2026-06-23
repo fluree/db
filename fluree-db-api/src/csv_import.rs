@@ -167,8 +167,19 @@ impl CsvType {
                 "false" | "0" | "no" => false,
                 _ => return Err(bad("boolean")),
             }),
-            CsvType::Date => typed_literal(raw.trim(), "date"),
-            CsvType::DateTime => typed_literal(raw.trim(), "dateTime"),
+            // Validate against the same parsers the downstream pipeline uses,
+            // so a malformed cell is rejected here (like `:int`/`:double`)
+            // rather than silently stored as an invalid typed literal.
+            CsvType::Date => {
+                let v = raw.trim();
+                fluree_db_core::Date::parse(v).map_err(|_| bad("date"))?;
+                typed_literal(v, "date")
+            }
+            CsvType::DateTime => {
+                let v = raw.trim();
+                fluree_db_core::DateTime::parse(v).map_err(|_| bad("dateTime"))?;
+                typed_literal(v, "dateTime")
+            }
         })
     }
 }
@@ -698,5 +709,36 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn bad_date_value_errors() {
+        let csv = "id:ID,joined:date\n1,not-a-date\n";
+        assert!(matches!(
+            csv_to_jsonld(csv, &opts()),
+            Err(CsvImportError::BadValue { kind: "date", .. })
+        ));
+    }
+
+    #[test]
+    fn bad_datetime_value_errors() {
+        let csv = "id:ID,seen:datetime\n1,2020-13-99\n";
+        assert!(matches!(
+            csv_to_jsonld(csv, &opts()),
+            Err(CsvImportError::BadValue {
+                kind: "dateTime",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn well_formed_datetime_is_accepted() {
+        let csv = "id:ID,seen:datetime\n1,2020-01-02T03:04:05Z\n";
+        let out = csv_to_jsonld(csv, &opts()).unwrap();
+        assert_eq!(
+            out[0]["http://ex/seen"],
+            json!({"@value": "2020-01-02T03:04:05Z", "@type": "http://www.w3.org/2001/XMLSchema#dateTime"})
+        );
     }
 }
