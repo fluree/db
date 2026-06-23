@@ -47,6 +47,10 @@ jobs:
 
   test:
     runs-on: ubuntu-latest
+    # Backstop so a hung/deadlocked test can never hold a runner for the full
+    # 6h default again. Per-test kills are handled by `slow-timeout` in
+    # `.config/nextest.toml`; this is the job-level safety net.
+    timeout-minutes: 45
     steps:
       - name: Free disk space
         run: |

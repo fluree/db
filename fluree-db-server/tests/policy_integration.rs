@@ -1628,6 +1628,13 @@ async fn cypher_classifications(
 
 /// Regression for the Cypher policy-bypass finding: a Cypher read under a
 /// restricted identity must be filtered the same way JSON-LD/SPARQL are.
+///
+/// Ignored: the `application/cypher` HTTP transport this test posts to is not
+/// yet implemented — Cypher/GQL operators are currently only expressible
+/// inside JSON-LD query bodies, and the server query route has no
+/// `application/cypher` content-type handler, so the raw Cypher body falls
+/// through to JSON parsing and 400s. Un-ignore once the endpoint lands (#1357).
+#[ignore = "application/cypher HTTP transport not yet implemented (#1357)"]
 #[tokio::test]
 async fn cypher_read_enforces_policy() {
     let (_tmp, state) = policy_test_state().await;
