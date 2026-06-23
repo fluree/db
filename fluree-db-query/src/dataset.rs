@@ -219,6 +219,18 @@ impl<'a> DataSet<'a> {
         self.named_graphs.contains_key(iri)
     }
 
+    /// True when any constituent graph (default or named) enforces a non-root
+    /// view policy.
+    ///
+    /// In dataset mode the policy enforcer lives on each [`GraphRef`], not the
+    /// top-level [`ExecutionContext`](crate::context::ExecutionContext). This
+    /// lets `ExecutionContext::has_policy` report policy correctly for a dataset
+    /// query even when the top-level enforcer is absent.
+    pub fn has_any_policy(&self) -> bool {
+        self.default_graphs.iter().any(GraphRef::has_policy)
+            || self.named_graphs.values().any(GraphRef::has_policy)
+    }
+
     /// Check if the dataset is empty (no graphs)
     pub fn is_empty(&self) -> bool {
         self.default_graphs.is_empty() && self.named_graphs.is_empty()

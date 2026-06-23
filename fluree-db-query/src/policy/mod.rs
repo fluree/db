@@ -28,5 +28,5 @@
 mod enforcer;
 mod executor;
 
-pub use enforcer::QueryPolicyEnforcer;
+pub use enforcer::{PredicateCoverage, QueryPolicyEnforcer};
 pub use executor::QueryPolicyExecutor;

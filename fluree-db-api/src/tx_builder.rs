@@ -486,8 +486,10 @@ impl<'a> OwnedTransactBuilder<'a> {
             unreachable!("validate ensures operation exists when pre_built_txn is None")
         });
 
-        // Direct flake path for InsertTurtle (bypass JSON-LD / IR)
+        // Direct flake path for InsertTurtle (bypass JSON-LD / IR).
+        // Carry the caller's policy so f:modify enforcement still runs.
         if let TransactOperation::InsertTurtle(turtle) = op {
+            let policy = self.core.policy;
             return self
                 .fluree
                 .insert_turtle_with_opts(
@@ -496,6 +498,7 @@ impl<'a> OwnedTransactBuilder<'a> {
                     self.core.txn_opts,
                     self.core.commit_opts,
                     &index_config,
+                    policy.as_ref(),
                 )
                 .await;
         }
@@ -603,7 +606,13 @@ impl<'a> OwnedTransactBuilder<'a> {
             let tracker_ref = tracker.is_enabled().then_some(&tracker);
             let stage_result = self
                 .fluree
-                .stage_turtle_insert(self.ledger, turtle, Some(&index_config), tracker_ref)
+                .stage_turtle_insert(
+                    self.ledger,
+                    turtle,
+                    Some(&index_config),
+                    tracker_ref,
+                    self.core.policy.as_ref(),
+                )
                 .await?;
             return Ok(Staged {
                 view: stage_result.view,
@@ -998,7 +1007,13 @@ impl Fluree {
         // Direct flake path for InsertTurtle (bypass JSON-LD / IR).
         if let TransactOperation::InsertTurtle(turtle) = op {
             let stage_result = self
-                .stage_turtle_insert(ledger_state, turtle, Some(index_config), tracker_ref)
+                .stage_turtle_insert(
+                    ledger_state,
+                    turtle,
+                    Some(index_config),
+                    tracker_ref,
+                    core.policy.as_ref(),
+                )
                 .await?;
             let commit_opts = self.maybe_spawn_txn_upload(
                 core.commit_opts,
@@ -1061,7 +1076,13 @@ impl Fluree {
                     store_raw_txn,
                 );
                 let stage_result = self
-                    .stage_turtle_insert(ledger_state, turtle, Some(index_config), tracker_ref)
+                    .stage_turtle_insert(
+                        ledger_state,
+                        turtle,
+                        Some(index_config),
+                        tracker_ref,
+                        None,
+                    )
                     .await?;
                 Ok((stage_result, TxnType::Insert, commit_opts))
             }

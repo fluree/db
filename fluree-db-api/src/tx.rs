@@ -2191,6 +2191,7 @@ impl crate::Fluree {
             TxnOpts::default(),
             CommitOpts::default(),
             &index_config,
+            None,
         )
         .await
     }
@@ -2207,6 +2208,7 @@ impl crate::Fluree {
         txn_opts: TxnOpts,
         commit_opts: CommitOpts,
         index_config: &IndexConfig,
+        policy: Option<&crate::PolicyContext>,
     ) -> Result<TransactResult> {
         let store_raw_txn = txn_opts.store_raw_txn.unwrap_or(false);
 
@@ -2222,7 +2224,7 @@ impl crate::Fluree {
         };
 
         let stage_result = self
-            .stage_turtle_insert(ledger, turtle, Some(index_config), None)
+            .stage_turtle_insert(ledger, turtle, Some(index_config), None, policy)
             .await?;
 
         let StageResult {
@@ -2277,6 +2279,7 @@ impl crate::Fluree {
         turtle: &str,
         index_config: Option<&IndexConfig>,
         tracker: Option<&Tracker>,
+        policy: Option<&crate::PolicyContext>,
     ) -> Result<StageResult> {
         use fluree_db_transact::{generate_txn_id, stage_flakes, FlakeSink};
 
@@ -2312,6 +2315,12 @@ impl crate::Fluree {
             if tracker.is_enabled() {
                 options = options.with_tracker(tracker);
             }
+        }
+        // Enforce f:modify policy on the parsed flakes. Without this a Turtle
+        // write would skip transaction-time enforcement entirely (the JSON/IR
+        // path applies it via StageOptions; the direct flake path must too).
+        if let Some(policy) = policy {
+            options = options.with_policy(policy);
         }
         let view = stage_flakes(ledger, flakes, options).await?;
 

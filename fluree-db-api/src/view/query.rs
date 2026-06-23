@@ -537,6 +537,18 @@ impl Fluree {
             }
         }
 
+        // Query-time datalog rule injection is admin-only: a restricted
+        // (non-root view policy) request may not supply inference rules. A rule
+        // with a viewable head can launder hidden data the policy author never
+        // anticipated — the derived flake is filtered only by its own (s,p,o),
+        // not its provenance, and a caller-invented predicate can't be
+        // pre-denied. DB-stored rules and OWL reasoning are admin-controlled and
+        // unaffected. See docs/security/policy-in-queries.md (Reasoning).
+        if !db.is_root() && !executable.reasoning.modes.rules.is_empty() {
+            tracing::debug!("stripping query-time datalog rules under non-root view policy");
+            executable.reasoning.modes.rules.clear();
+        }
+
         // Carry the pre-resolved `f:rulesSource` graph id (if any)
         // into the executable so `compute_derived_facts` extracts
         // datalog rules from the configured graph instead of the
