@@ -209,11 +209,9 @@ impl Fluree {
     }
 
     /// Streaming sibling of `execute_view_internal_with_r2rml`: builds the same
-    /// single-ledger execution context, but drives `execute_prepared_streaming`
-    /// with `sink` instead of collecting batches.
-    ///
-    /// SYNC: keep the context wiring here in step with
-    /// `execute_view_internal_with_r2rml` in `view/query.rs`.
+    /// single-ledger execution context (via the shared `view_context_config!`
+    /// macro), but drives `execute_prepared_streaming` with `sink` instead of
+    /// collecting batches.
     async fn execute_view_streaming<S: BatchSink>(
         &self,
         db: &GraphDb,
@@ -232,35 +230,7 @@ impl Fluree {
         )
         .await?;
 
-        let spatial_map = db.binary_store.as_ref().map(|s| s.spatial_provider_map());
-        let uses_fulltext = executable.uses_fulltext();
-        let fulltext_map = if uses_fulltext {
-            db.binary_store.as_ref().map(|s| s.fulltext_provider_map())
-        } else {
-            None
-        };
-        let english_lang_id = if uses_fulltext {
-            db.binary_store
-                .as_ref()
-                .and_then(|s| s.resolve_lang_id("en"))
-        } else {
-            None
-        };
-
-        let config = ContextConfig {
-            tracker: Some(tracker),
-            cancellation: options.cancellation.clone(),
-            policy_enforcer: db.policy_enforcer().cloned(),
-            binary_store: db.binary_store.clone(),
-            binary_g_id: db.graph_id,
-            dict_novelty: db.dict_novelty.clone(),
-            spatial_providers: spatial_map.as_ref(),
-            fulltext_providers: fulltext_map.as_ref(),
-            english_lang_id,
-            remote_service: self.remote_service_executor(),
-            strict_bind_errors: true,
-            ..Default::default()
-        };
+        view_context_config!(config, self, db, executable, tracker, options, None);
 
         execute_prepared_streaming(db_ref, vars, prepared, config, sink).await
     }

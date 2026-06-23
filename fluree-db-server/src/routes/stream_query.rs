@@ -616,3 +616,101 @@ fn ndjson_response(
         .body(body)
         .expect("response builder cannot fail")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fluree_db_api::{QueryCancellation, QueryCancellationReason};
+    use http_body_util::BodyExt;
+    use tokio::time::timeout;
+
+    /// Pull the next NDJSON record (one `\n`-terminated line) from a streaming
+    /// response body, buffering across frame boundaries. `None` at body end.
+    async fn next_record(body: &mut Body, buf: &mut Vec<u8>) -> Option<JsonValue> {
+        loop {
+            if let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+                let line: Vec<u8> = buf.drain(..=pos).collect();
+                let line = &line[..line.len() - 1]; // drop the '\n'
+                if line.is_empty() {
+                    continue;
+                }
+                return Some(serde_json::from_slice(line).expect("each NDJSON line is valid JSON"));
+            }
+            let frame = body.frame().await?.expect("body frame");
+            if let Ok(data) = frame.into_data() {
+                buf.extend_from_slice(&data);
+            }
+        }
+    }
+
+    /// When the producer goes idle after the head, the transport injects a
+    /// `heartbeat` record on the configured interval to keep the connection
+    /// alive past proxy idle timeouts.
+    #[tokio::test]
+    async fn heartbeat_emitted_during_idle_gap() {
+        let (tx, rx) = mpsc::channel::<Bytes>(STREAM_CHANNEL_DEPTH);
+        // Flush the head, then keep `tx` open but idle (a slow query that has
+        // not produced its first row yet).
+        tx.send(Bytes::from(ndjson_stream::head_record(&[
+            "name".to_string()
+        ])))
+        .await
+        .unwrap();
+
+        let resp = ndjson_response(
+            rx,
+            Tracker::disabled(),
+            None,
+            Some(Duration::from_millis(20)),
+        );
+        let mut body = resp.into_body();
+        let mut buf = Vec::new();
+
+        let head = next_record(&mut body, &mut buf).await.expect("head record");
+        assert_eq!(head["type"], "head");
+
+        let hb = timeout(Duration::from_secs(2), next_record(&mut body, &mut buf))
+            .await
+            .expect("a heartbeat arrives within the timeout")
+            .expect("a heartbeat record");
+        assert_eq!(hb["type"], "heartbeat");
+
+        drop(tx); // producer "finishes" → stream ends cleanly
+    }
+
+    /// If the client drops the response body mid-stream, the armed disconnect
+    /// guard held in the stream state fires `ClientDisconnected` on the shared
+    /// cancellation handle so the spawned producer stops at its next checkpoint.
+    #[tokio::test]
+    async fn client_disconnect_cancels_producer() {
+        let (tx, rx) = mpsc::channel::<Bytes>(STREAM_CHANNEL_DEPTH);
+        tx.send(Bytes::from(ndjson_stream::head_record(&[
+            "name".to_string()
+        ])))
+        .await
+        .unwrap();
+
+        let cancellation = QueryCancellation::new();
+        let guard = QueryDisconnectGuard::new(cancellation.clone());
+
+        let resp = ndjson_response(rx, Tracker::disabled(), Some(guard), None);
+        let mut body = resp.into_body();
+        let mut buf = Vec::new();
+
+        // Consume the head; the stream (and its armed guard) stays alive because
+        // the producer has not finished — `tx` is still open.
+        let head = next_record(&mut body, &mut buf).await.expect("head record");
+        assert_eq!(head["type"], "head");
+        assert_eq!(cancellation.reason(), None, "armed, not yet cancelled");
+
+        // Client goes away mid-stream.
+        drop(body);
+
+        assert_eq!(
+            cancellation.reason(),
+            Some(QueryCancellationReason::ClientDisconnected),
+            "dropping the body mid-stream cancels the producer",
+        );
+        drop(tx);
+    }
+}
