@@ -147,10 +147,7 @@ async fn stream_query_connection_inner(
         await_query_min_t_requirements(state.as_ref(), min_t).await?;
 
         let dataset = fluree
-            .build_stream_dataset_for_sparql(
-                &sparql,
-                &fluree_db_api::GovernanceOptions::default(),
-            )
+            .build_stream_dataset_for_sparql(&sparql, &fluree_db_api::GovernanceOptions::default())
             .await
             .map_err(ServerError::Api)?;
         let input = OwnedStreamQuery::Sparql(sparql);
