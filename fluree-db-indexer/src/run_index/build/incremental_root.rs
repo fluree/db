@@ -120,7 +120,23 @@ impl IncrementalRootBuilder {
     }
 
     /// Update inline predicate SIDs.
+    ///
+    /// Also OR-updates `has_annotations` whenever any of the seven
+    /// reserved `f:reifies*` predicate SIDs appears in the new dict.
+    /// The full-rebuild path computes the same bit at root-assembly
+    /// time, but the incremental path clones the old root and would
+    /// otherwise carry forward `has_annotations: false` even when the
+    /// first annotation has just rolled into the indexed predicate
+    /// dictionary. Sticky semantics: once flipped, stays set across
+    /// reindexes (predicate dicts only accumulate).
     pub fn set_predicate_sids(&mut self, sids: Vec<(u16, String)>) {
+        let saw_reifies = sids.iter().any(|(ns, name)| {
+            fluree_db_core::is_reserved_reifies_predicate(&fluree_db_core::Sid::new(
+                *ns,
+                name.as_str(),
+            ))
+        });
+        self.root.has_annotations |= saw_reifies;
         self.root.predicate_sids = sids;
     }
 
@@ -184,6 +200,74 @@ impl IncrementalRootBuilder {
         self.root.sketch_ref = cid;
     }
 
+    /// Replace the on-disk annotation arena pointer.
+    ///
+    /// Pass `Some(_)` after building the new arena and writing its
+    /// branch + leaf blobs to CAS. The encoder enforces the truth-
+    /// table invariant that any populated `annotation_index` implies
+    /// `has_annotations = true` on the wire (see
+    /// `fluree_db_core::annotation_index`), so callers don't need to
+    /// flip the sticky bit separately.
+    ///
+    /// `previous_leaf_cids` must enumerate **every** leaf CID
+    /// referenced by the arena currently in `root.annotation_index`.
+    /// `new_leaf_cids` must enumerate every leaf CID referenced by
+    /// `new_index` (empty when `new_index` is `None`).
+    /// `ContentStore::release` deletes exact CIDs (not child graphs),
+    /// so without these lists the old leaves leak when the new root
+    /// supersedes the chain. The orchestrator computes these sets from
+    /// [`PersistedArenaResult`](crate::build::annotation_arena::PersistedArenaResult);
+    /// pass empty `Vec`s when there's no previous arena. Old branch
+    /// CIDs are reconciled automatically from `root.annotation_index`.
+    ///
+    /// Old CIDs (branches + leaves) that the **new** arena still
+    /// references are NOT recorded as garbage. Content-addressed
+    /// storage means a re-sealed unchanged arena (e.g. the `Augment`
+    /// path on a continuously-running ledger whose overlay still holds
+    /// pre-index events matching the base arena) produces identical
+    /// CIDs; recording them would let GC delete leaves/branches the
+    /// new live root still points at. Mirrors `set_dict_refs`.
+    pub fn set_annotation_index(
+        &mut self,
+        new_index: Option<fluree_db_core::AnnotationIndexRoot>,
+        previous_leaf_cids: Vec<ContentId>,
+        new_leaf_cids: Vec<ContentId>,
+    ) {
+        // CIDs the new arena references (branches + leaves).
+        let mut new_cids: HashSet<ContentId> = HashSet::new();
+        if let Some(new) = new_index.as_ref() {
+            new_cids.insert(new.forward_branch_cid.clone());
+            new_cids.insert(new.reverse_branch_cid.clone());
+        }
+        new_cids.extend(new_leaf_cids);
+
+        // CIDs the old arena referenced (branches + leaves).
+        let mut old_cids: HashSet<ContentId> = HashSet::new();
+        if let Some(prev) = self.root.annotation_index.as_ref() {
+            old_cids.insert(prev.forward_branch_cid.clone());
+            old_cids.insert(prev.reverse_branch_cid.clone());
+        }
+        old_cids.extend(previous_leaf_cids);
+
+        // Only old CIDs the new arena no longer references are garbage.
+        let mut replaced: Vec<ContentId> = old_cids.difference(&new_cids).cloned().collect();
+        // Keep ordering deterministic for garbage manifest stability.
+        replaced.sort_by_key(std::string::ToString::to_string);
+        self.replaced_cids.extend(replaced);
+        // Sticky bit: flip `had_annotation_arena` to `true` the
+        // moment any arena is sealed, and *never* clear it on
+        // subsequent calls — including when this call sets
+        // `new_index = None` (defensive drop). Without this, the
+        // post-drop root would look identical to a fresh import
+        // and the provider's bootstrap base-index scan-fallback
+        // could resurrect a live-only `Authoritative` arena,
+        // losing historical retract/reassert rows.
+        if new_index.is_some() {
+            self.root.had_annotation_arena = true;
+        }
+        self.root.annotation_index = new_index;
+    }
+
     /// Add to cumulative commit stats.
     pub fn add_commit_stats(&mut self, size: u64, asserts: u64, retracts: u64) {
         self.root.total_commit_size += size;
@@ -197,7 +281,19 @@ impl IncrementalRootBuilder {
     }
 
     /// Consume the builder, returning the final root and all replaced CIDs.
-    pub fn build(self) -> (IndexRoot, Vec<ContentId>) {
+    pub fn build(mut self) -> (IndexRoot, Vec<ContentId>) {
+        // Sticky-bit coercion: see the canonical contract on
+        // `IndexRoot.had_annotation_arena` in
+        // `fluree-db-binary-index/src/format/index_root.rs`. Every
+        // indexer-produced root with `has_annotations = true`
+        // sets the bit so the provider's base-index scan-fallback
+        // can't later resurrect a live-only `Authoritative` arena
+        // from a defensive-drop or no-seal pass. Bulk import is
+        // the only path that leaves the bit false (it bypasses
+        // this builder entirely; see `fluree-db-api/src/import.rs`).
+        if self.root.has_annotations {
+            self.root.had_annotation_arena = true;
+        }
         (self.root, self.replaced_cids)
     }
 }
@@ -222,4 +318,128 @@ fn collect_dict_cids(refs: &DictRefs) -> Vec<ContentId> {
     out.extend(refs.string_reverse.leaves.iter().cloned());
 
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fluree_db_binary_index::{DictPackRefs, DictTreeRefs};
+    use fluree_db_core::{
+        ns_encoding::NsSplitMode, AnnotationIndexRoot, AnnotationStats, ContentKind,
+        SubjectIdEncoding,
+    };
+
+    fn cid(label: &[u8]) -> ContentId {
+        ContentId::new(ContentKind::IndexLeaf, label)
+    }
+
+    fn minimal_root() -> IndexRoot {
+        let dummy = DictTreeRefs {
+            branch: cid(b"dummy"),
+            leaves: Vec::new(),
+        };
+        IndexRoot {
+            ledger_id: "test".to_string(),
+            index_t: 0,
+            base_t: 0,
+            subject_id_encoding: SubjectIdEncoding::Narrow,
+            namespace_codes: BTreeMap::new(),
+            predicate_sids: Vec::new(),
+            graph_iris: Vec::new(),
+            datatype_iris: Vec::new(),
+            language_tags: Vec::new(),
+            dict_refs: DictRefs {
+                forward_packs: DictPackRefs {
+                    string_fwd_packs: Vec::new(),
+                    subject_fwd_ns_packs: Vec::new(),
+                },
+                subject_reverse: dummy.clone(),
+                string_reverse: dummy,
+            },
+            subject_watermarks: Vec::new(),
+            string_watermark: 0,
+            lex_sorted_string_ids: false,
+            total_commit_size: 0,
+            total_asserts: 0,
+            total_retracts: 0,
+            graph_arenas: Vec::new(),
+            default_graph_orders: Vec::new(),
+            named_graphs: Vec::new(),
+            stats: None,
+            schema: None,
+            prev_index: None,
+            garbage: None,
+            sketch_ref: None,
+            has_annotations: false,
+            annotation_index: None,
+            had_annotation_arena: false,
+            o_type_table: IndexRoot::build_o_type_table(&[], &[]),
+            ns_split_mode: NsSplitMode::default(),
+        }
+    }
+
+    fn arena(fwd: ContentId, rev: ContentId) -> AnnotationIndexRoot {
+        AnnotationIndexRoot {
+            version: 1,
+            max_t: 5,
+            forward_branch_cid: fwd,
+            reverse_branch_cid: rev,
+            stats: AnnotationStats::default(),
+        }
+    }
+
+    #[test]
+    fn set_annotation_index_keeps_unchanged_reseal_cids_out_of_garbage() {
+        // STOR-1: re-sealing an unchanged arena produces identical
+        // content-addressed CIDs. The live CIDs must NOT enter the
+        // garbage manifest, or GC deletes data the new root references.
+        let fwd = cid(b"fwd-branch");
+        let rev = cid(b"rev-branch");
+        let leaf_a = cid(b"leaf-a");
+        let leaf_b = cid(b"leaf-b");
+
+        let mut root = minimal_root();
+        root.annotation_index = Some(arena(fwd.clone(), rev.clone()));
+        let mut b = IncrementalRootBuilder::from_old_root(root);
+        // Same branches + same leaves (byte-identical re-seal).
+        b.set_annotation_index(
+            Some(arena(fwd.clone(), rev.clone())),
+            vec![leaf_a.clone(), leaf_b.clone()],
+            vec![leaf_a.clone(), leaf_b.clone()],
+        );
+        let (_root, garbage) = b.build();
+        for c in [&fwd, &rev, &leaf_a, &leaf_b] {
+            assert!(
+                !garbage.contains(c),
+                "unchanged re-seal must not GC live arena CID {c}"
+            );
+        }
+    }
+
+    #[test]
+    fn set_annotation_index_retires_changed_arena_cids() {
+        // Control: when the arena genuinely changes, the old now-unused
+        // CIDs ARE retired to garbage, but CIDs the new arena still
+        // references (the shared reverse branch) are kept.
+        let old_fwd = cid(b"fwd-old");
+        let rev = cid(b"rev-shared");
+        let old_leaf = cid(b"leaf-old");
+
+        let mut root = minimal_root();
+        root.annotation_index = Some(arena(old_fwd.clone(), rev.clone()));
+        let mut b = IncrementalRootBuilder::from_old_root(root);
+        let new_fwd = cid(b"fwd-new");
+        b.set_annotation_index(
+            Some(arena(new_fwd.clone(), rev.clone())),
+            vec![old_leaf.clone()],
+            Vec::new(), // new arena references no leaves
+        );
+        let (_root, garbage) = b.build();
+        assert!(garbage.contains(&old_fwd), "changed forward branch retired");
+        assert!(garbage.contains(&old_leaf), "unused old leaf retired");
+        assert!(
+            !garbage.contains(&rev),
+            "reverse branch still referenced by new arena must be kept"
+        );
+    }
 }

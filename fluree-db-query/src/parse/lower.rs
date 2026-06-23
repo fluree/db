@@ -24,7 +24,8 @@ use crate::ir::{
 };
 use crate::ir::{
     Expression, Function, IndexSearchPattern, IndexSearchTarget, PathModifier, Pattern,
-    PropertyPathPattern, SubqueryPattern, VectorSearchPattern, VectorSearchTarget,
+    PropertyPathPattern, ShortestPathPattern, SubqueryPattern, VectorSearchPattern,
+    VectorSearchTarget,
 };
 use crate::sort::{SortDirection, SortSpec};
 use crate::var_registry::{VarId, VarRegistry};
@@ -109,8 +110,8 @@ pub(crate) fn lower_query<E: IriEncoder>(
     // accumulate post-bind aliases as we go so chained derivations
     // (`(as (+ ?cnt 1) ?adj) (as (+ ?adj 1) ?again)`) land in `post_binds`
     // in source order.
-    let mut post_binds: Vec<(VarId, Expression)> = Vec::new();
     let mut post_bind_aliases: std::collections::HashSet<VarId> = std::collections::HashSet::new();
+    let mut post_binds: Vec<(VarId, Expression)> = Vec::new();
     for column in ast.select.columns() {
         if let UnresolvedColumn::Computation { expr, alias } = column {
             let (placement, alias_var, lowered_expr) = lower_select_expr_bind(
@@ -181,6 +182,7 @@ pub(crate) fn lower_query<E: IriEncoder>(
         offset,
         reasoning,
         post_values: None,
+        include_system_facts: ast.options.include_system_facts,
     })
 }
 
@@ -261,6 +263,57 @@ pub fn lower_unresolved_pattern<E: IriEncoder>(
                 var: var_id,
                 expr: lowered_expr,
             }])
+        }
+        UnresolvedPattern::Unwind { var, expr } => {
+            let var_id = vars.get_or_insert(var);
+            let lowered_expr = lower_filter_expr_with_encoder(expr, vars, encoder, pp_counter)?;
+            Ok(vec![Pattern::Unwind {
+                var: var_id,
+                list: lowered_expr,
+            }])
+        }
+        UnresolvedPattern::ShortestPath {
+            start,
+            end,
+            predicate,
+            direction,
+            mode,
+            path_var,
+            min_hops,
+            max_hops,
+        } => {
+            let start_ref = lower_ref_term(start, encoder, vars)?;
+            let end_ref = lower_ref_term(end, encoder, vars)?;
+            let path_var_id = vars.get_or_insert(path_var);
+            match encoder.encode_iri(predicate) {
+                Some(predicate) => Ok(vec![Pattern::ShortestPath(ShortestPathPattern {
+                    start: start_ref,
+                    end: end_ref,
+                    predicate,
+                    direction: *direction,
+                    mode: *mode,
+                    path_var: path_var_id,
+                    min_hops: *min_hops,
+                    max_hops: *max_hops,
+                })]),
+                // Predicate IRI not in the dictionary → no edges of that type
+                // exist → the search yields no rows.
+                None => {
+                    let mut bound = Vec::new();
+                    for r in [&start_ref, &end_ref] {
+                        if let Ref::Var(v) = r {
+                            if !bound.contains(v) {
+                                bound.push(*v);
+                            }
+                        }
+                    }
+                    bound.push(path_var_id);
+                    Ok(vec![Pattern::Values {
+                        vars: bound,
+                        rows: Vec::new(),
+                    }])
+                }
+            }
         }
         UnresolvedPattern::Values { vars: v, rows } => {
             let var_ids: Vec<VarId> = v.iter().map(|name| vars.get_or_insert(name)).collect();
@@ -378,6 +431,34 @@ pub fn lower_unresolved_pattern<E: IriEncoder>(
             Ok(vec![Pattern::Graph {
                 name: ir_name,
                 patterns: lowered_patterns,
+            }])
+        }
+        UnresolvedPattern::EdgeAnnotation {
+            edge,
+            annotation,
+            body,
+        } => {
+            let lowered_edge = lower_triple_pattern(edge, encoder, vars)?;
+            let lowered_annotation = lower_ref_term(annotation, encoder, vars)?;
+            let lowered_body = lower_unresolved_patterns(body, encoder, vars, pp_counter)?;
+            Ok(vec![Pattern::EdgeAnnotation {
+                edge: lowered_edge,
+                annotation: lowered_annotation,
+                body: lowered_body,
+            }])
+        }
+        UnresolvedPattern::AnnotationTarget {
+            annotation,
+            edge,
+            body,
+        } => {
+            let lowered_annotation = lower_ref_term(annotation, encoder, vars)?;
+            let lowered_edge = lower_triple_pattern(edge, encoder, vars)?;
+            let lowered_body = lower_unresolved_patterns(body, encoder, vars, pp_counter)?;
+            Ok(vec![Pattern::AnnotationTarget {
+                annotation: lowered_annotation,
+                edge: lowered_edge,
+                body: lowered_body,
             }])
         }
     }
@@ -558,19 +639,25 @@ fn lower_path_to_patterns<E: IriEncoder>(
     };
 
     match effective_path {
-        // Transitive: keep existing PropertyPath operator
+        // Transitive: `p+` / `p*`, plus alternation-transitive `(a|b…)+` / `(a|b…)*`
+        // whose closure follows an edge of any listed predicate per hop.
         UnresolvedPathExpr::OneOrMore(inner) | UnresolvedPathExpr::ZeroOrMore(inner) => {
-            let iri = expect_simple_iri(inner)?;
-            let modifier = match path {
+            let iris = extract_transitive_predicate_iris(inner)?;
+            let modifier = match effective_path {
                 UnresolvedPathExpr::OneOrMore(_) => PathModifier::OneOrMore,
                 _ => PathModifier::ZeroOrMore,
             };
-            let predicate = encoder
-                .encode_iri(iri)
-                .ok_or_else(|| ParseError::UnknownNamespace(iri.to_string()))?;
-            Ok(vec![Pattern::PropertyPath(PropertyPathPattern::new(
-                s, predicate, modifier, o,
-            ))])
+            let mut predicates = Vec::with_capacity(iris.len());
+            for iri in iris {
+                predicates.push(
+                    encoder
+                        .encode_iri(iri)
+                        .ok_or_else(|| ParseError::UnknownNamespace(iri.to_string()))?,
+                );
+            }
+            Ok(vec![Pattern::PropertyPath(
+                PropertyPathPattern::new_alternatives(s, predicates, modifier, o),
+            )])
         }
 
         // Inverse: ^path
@@ -1096,6 +1183,20 @@ fn lower_select_expr_bind<E: IriEncoder>(
 }
 
 /// Expect a path expression to be a simple IRI. Returns the Arc'd IRI string.
+/// Collect the predicate IRI(s) directly under a transitive operator.
+///
+/// `p+`/`p*` yields one IRI; `(a|b|…)+`/`(a|b|…)*` yields one per branch and
+/// lowers to an alternation-transitive path whose closure follows an edge of
+/// any branch per hop. Branches must be simple forward predicate IRIs —
+/// inverse/compound branches are rejected. Mirrors the SPARQL lowering in
+/// `fluree-db-sparql/src/lower/path.rs::extract_transitive_predicate_iris`.
+fn extract_transitive_predicate_iris(path: &UnresolvedPathExpr) -> Result<Vec<&Arc<str>>> {
+    match path {
+        UnresolvedPathExpr::Alternative(alts) => alts.iter().map(expect_simple_iri).collect(),
+        _ => Ok(vec![expect_simple_iri(path)?]),
+    }
+}
+
 fn expect_simple_iri(path: &UnresolvedPathExpr) -> Result<&Arc<str>> {
     match path {
         UnresolvedPathExpr::Iri(iri) => Ok(iri),
@@ -1548,6 +1649,19 @@ fn lower_function_name(name: &str) -> Function {
         | "http://www.opengis.net/def/function/geosparql/distance" => Function::GeofDistance,
         // Fulltext scoring
         "fulltext" | "full_text" => Function::Fulltext,
+        // List values & generators (drive UNWIND; also usable in BIND/SELECT)
+        "range" => Function::Range,
+        "list" | "make-list" | "makelist" => Function::MakeList,
+        // List accessors / transforms
+        "size" => Function::Size,
+        "head" => Function::Head,
+        "last" => Function::Last,
+        "tail" => Function::Tail,
+        "reverse" => Function::Reverse,
+        "nth" => Function::ListIndex,
+        // Path-value accessors (consume a shortestPath result)
+        "nodes" => Function::Nodes,
+        "path-pairs" | "pathpairs" => Function::PathPairs,
         // Other
         "bound" => Function::Bound,
         "if" => Function::If,
@@ -1706,6 +1820,8 @@ fn lower_aggregate_spec(spec: &UnresolvedAggregateSpec, vars: &mut VarRegistry) 
             separator: separator.clone(),
         },
         UnresolvedAggregateFn::Sample => AggregateFn::Sample(input),
+        UnresolvedAggregateFn::Collect => AggregateFn::Collect(input, list),
+        UnresolvedAggregateFn::CollectDistinct => AggregateFn::Collect(input, InputSemantics::Set),
     };
 
     AggregateSpec {
@@ -2362,7 +2478,7 @@ mod tests {
             Pattern::PropertyPath(pp) => {
                 assert!(matches!(pp.modifier, PathModifier::OneOrMore));
                 assert_eq!(pp.subject.as_var().map(|v| vars.name(v)), Some("?s"));
-                assert_eq!(pp.predicate.name_str(), "a");
+                assert_eq!(pp.single_predicate().unwrap().name_str(), "a");
                 assert_eq!(pp.object.as_var().map(|v| vars.name(v)), Some("?__pp0"));
             }
             other => panic!("Expected PropertyPath, got {other:?}"),

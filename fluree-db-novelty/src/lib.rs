@@ -24,6 +24,7 @@
 //! let slice = novelty.slice_for_range(g_id, IndexType::Spot, Some(&first), Some(&rhs), false);
 //! ```
 
+pub mod attachments;
 mod commit;
 mod commit_flakes;
 pub mod delta;
@@ -32,6 +33,7 @@ mod fact_state;
 mod runtime_stats;
 mod stats;
 
+pub use attachments::{AttachmentNovelty, ForwardRow, ReverseRow};
 pub use commit::{
     collect_dag_cids, collect_dag_cids_with_split_mode, find_common_ancestor, load_commit_by_id,
     load_commit_envelope_by_id, trace_commit_envelopes_by_id, trace_commits_by_id, Commit,
@@ -212,6 +214,12 @@ pub struct Novelty {
     /// Epoch for cache invalidation - bumped once per commit
     pub epoch: u64,
 
+    /// Edge-annotation attachment overlay (M1 — derived from the
+    /// `f:reifies*` system flakes flowing through the same pipeline).
+    /// Updated automatically by [`Self::apply_commit`] /
+    /// [`Self::bulk_apply_commits`] from the post-dedup flake set.
+    pub attachments: AttachmentNovelty,
+
     /// Current-state fact index for RDF set-semantics dedup (latest op per
     /// identity, per graph, within this novelty window). Persistent map, so it
     /// clones in O(1). The dedup oracle behind the seam; see [`fact_state`].
@@ -227,6 +235,7 @@ impl Novelty {
             size: 0,
             t,
             epoch: 0,
+            attachments: AttachmentNovelty::new(),
             fact_state: NoveltyFactState::new(),
         }
     }
@@ -334,6 +343,12 @@ impl Novelty {
         // deduplicates at index-build time.
         let mut per_graph: HashMap<GraphId, Vec<FlakeId>> = HashMap::new();
         let mut deduped = 0u64;
+        // Capture post-dedup `f:reifies*` flakes so the attachment
+        // overlay observer sees exactly the flakes that landed in the
+        // arena. The reserved-predicate test is a single SID compare —
+        // running it per-flake adds negligible overhead even on
+        // ledgers that never use annotations.
+        let mut accepted_reifies: Vec<Flake> = Vec::new();
 
         for (flake, g_id) in routed {
             // Set semantics: skip assertions already current in this graph's
@@ -343,6 +358,10 @@ impl Novelty {
             if flake.op && self.fact_state.is_asserted(g_id, &flake) {
                 deduped += 1;
                 continue;
+            }
+
+            if fluree_db_core::namespaces::is_reserved_reifies_predicate(&flake.p) {
+                accepted_reifies.push(flake.clone());
             }
 
             let size = flake.size_bytes();
@@ -365,6 +384,13 @@ impl Novelty {
                 deduped,
                 "skipped duplicate assertion flakes (set semantics)"
             );
+        }
+
+        // Update the attachment overlay from the post-dedup set. The
+        // observer skips quietly when no `f:reifies*` flakes are
+        // present — most commits never touch annotations.
+        if !accepted_reifies.is_empty() {
+            self.attachments.observe_flakes(&accepted_reifies)?;
         }
 
         // Ensure all graph slots exist
@@ -594,11 +620,19 @@ impl Novelty {
                 group_start = group_end;
             }
 
-            // Maintain the current-state index so later apply_commit calls dedup
-            // against bulk-loaded facts. `kept` is in (s,p,o,dt,m,t,op) order, so
-            // the last record per identity is its highest-t (latest) op.
+            // Capture `f:reifies*` flakes from the kept set for the
+            // attachment overlay observer (cheap clone, rare relative to
+            // data flakes), and maintain the current-state fact index so
+            // later apply_commit calls dedup against bulk-loaded facts.
+            // `kept` is in (s,p,o,dt,m,t,op) order, so the last record per
+            // identity is its highest-t (latest) op.
+            let mut accepted_reifies: Vec<Flake> = Vec::new();
             for &id in &kept {
-                self.fact_state.record(g_id, store.get(id));
+                let f = store.get(id);
+                if fluree_db_core::namespaces::is_reserved_reifies_predicate(&f.p) {
+                    accepted_reifies.push(f.clone());
+                }
+                self.fact_state.record(g_id, f);
             }
 
             // Build the 4 sorted index vectors from the deduped set. Each
@@ -620,6 +654,16 @@ impl Novelty {
             graph_vecs.psot = psot;
             graph_vecs.post = post;
             graph_vecs.opst = opst;
+
+            // Update attachment overlay after the per-graph batch is
+            // committed. Malformed bundles are skipped + warned +
+            // counted on `attachments.observed_malformed_bundle_count`
+            // (see `AttachmentNovelty::observe_flakes`); the
+            // `Result` only fails on infrastructure-level errors,
+            // which `?` propagates here.
+            if !accepted_reifies.is_empty() {
+                self.attachments.observe_flakes(&accepted_reifies)?;
+            }
         }
 
         self.t = max_t;

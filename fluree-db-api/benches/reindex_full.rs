@@ -111,6 +111,7 @@ fn bench_reindex_full(c: &mut Criterion) {
                                 TxnOpts::default(),
                                 CommitOpts::default(),
                                 &index_config,
+                                None,
                             )
                             .await
                             .expect("populate insert");

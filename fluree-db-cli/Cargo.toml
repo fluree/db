@@ -35,6 +35,8 @@ otel = [
 
 [dependencies]
 fluree-db-api = { path = "../fluree-db-api" }
+# Temp dir for streaming CSV → .jsonl into the bulk import pipeline.
+tempfile = "3"
 fluree-db-novelty = { path = "../fluree-db-novelty" }
 fluree-db-nameservice = { path = "../fluree-db-nameservice" }
 fluree-db-core = { path = "../fluree-db-core" }

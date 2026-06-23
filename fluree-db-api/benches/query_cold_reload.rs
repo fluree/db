@@ -71,6 +71,7 @@ async fn populate(db_dir: &std::path::Path, alias: &str, base_nodes: usize) {
             TxnOpts::default(),
             CommitOpts::default(),
             &index_config,
+            None,
         )
         .await
         .expect("populate insert");

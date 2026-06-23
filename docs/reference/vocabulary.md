@@ -72,6 +72,24 @@ Commit subjects use the scheme `fluree:commit:<content-id>` (e.g. `fluree:commit
 
 ---
 
+## Edge-annotation predicates (reserved)
+
+These seven predicates encode the edge that an [edge annotation](../concepts/edge-annotations.md) reifies. They are the durable, system-controlled representation behind the `@annotation` / `@reifies` (JSON-LD) and `{| ... |}` / `~` / `rdf:reifies` (SPARQL 1.2) surfaces. Together they form a *reifies bundle* on the annotation subject.
+
+| Predicate | Full IRI | Datatype | Description |
+|-----------|----------|----------|-------------|
+| `f:reifiesGraph` | `https://ns.flur.ee/db#reifiesGraph` | `@id` (ref) | Named graph the reified edge lives in. **Optional** — omitted for default-graph edges. |
+| `f:reifiesSubject` | `https://ns.flur.ee/db#reifiesSubject` | `@id` (ref) | Subject of the reified edge. **Required.** |
+| `f:reifiesPredicate` | `https://ns.flur.ee/db#reifiesPredicate` | `@id` (ref) | Predicate of the reified edge. **Required.** |
+| `f:reifiesObject` | `https://ns.flur.ee/db#reifiesObject` | any | Object of the reified edge — ref, literal, or language-tagged string. **Required.** |
+| `f:reifiesDatatype` | `https://ns.flur.ee/db#reifiesDatatype` | `@id` (ref) | Datatype IRI of a literal object. **Optional** — the JSON-LD lowering omits it (recovered from the object flake's datatype); a hand-authored bundle may carry it. |
+| `f:reifiesLang` | `https://ns.flur.ee/db#reifiesLang` | `xsd:string` | BCP-47 language tag, present only when the object is a language-tagged string. **Optional.** |
+| `f:reifiesListIndex` | `https://ns.flur.ee/db#reifiesListIndex` | `xsd:int` | List-occurrence index. **Reserved/deferred** — always omitted in this release. |
+
+**These predicates are reserved.** User-authored mention of any `f:reifies*` IRI (compact or full form) is rejected at parse time on every write surface (JSON-LD insert/upsert/update, SPARQL UPDATE, Turtle/raw ingest), and they are filtered out of variable-predicate (`?p`) scans and wildcard (`select: "*"`) hydration so they never surface as ordinary RDF. Mint and manage annotations only through `@annotation` / `@edge` (JSON-LD) or the annotation tail (`{| ... |}` / `~` / `rdf:reifies`) in SPARQL 1.2. See [Edge annotations](../concepts/edge-annotations.md) for the full surface and the [storage-internals design doc](../design/edge-annotations.md) for the bundle encoding and invariants.
+
+---
+
 ## Vector datatype
 
 | Term | IRI | Description |

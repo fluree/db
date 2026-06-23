@@ -319,6 +319,32 @@ impl Tracker {
         }
     }
 
+    /// Read fuel consumed so far, in micro-fuel, without finalizing.
+    ///
+    /// Lock-free: a single relaxed load of the fuel counter. Safe to call
+    /// concurrently from another task (e.g. a streaming heartbeat) while the
+    /// query executes — it never contends the per-flake `fetch_add` on the hot
+    /// path. Unlike [`tally`](Self::tally) it takes no locks and allocates
+    /// nothing. Returns `None` when fuel tracking is disabled.
+    #[inline]
+    pub fn current_micro_fuel(&self) -> Option<u64> {
+        let inner = self.0.as_ref()?;
+        inner
+            .options
+            .track_fuel
+            .then(|| inner.fuel_total.load(Ordering::Relaxed))
+    }
+
+    /// Read fuel consumed so far as a user-facing decimal (rounded to 3 places).
+    ///
+    /// See [`current_micro_fuel`](Self::current_micro_fuel) for the
+    /// concurrency/cost guarantees. Returns `None` when fuel tracking is
+    /// disabled.
+    #[inline]
+    pub fn current_fuel(&self) -> Option<f64> {
+        self.current_micro_fuel().map(micro_to_fuel)
+    }
+
     /// Finalize tracking into a serializable tally.
     pub fn tally(&self) -> Option<TrackingTally> {
         let inner = self.0.as_ref()?;
@@ -439,5 +465,33 @@ mod tests {
         let t = fuel_tracker(Some(fuel_to_micro(1.0)));
         t.consume_fuel(QUERY_FLOOR_MICRO_FUEL).unwrap();
         assert!(t.consume_fuel(INDEX_TOUCH_MICRO_FUEL).is_err());
+    }
+
+    #[test]
+    fn current_fuel_reflects_running_total_without_finalizing() {
+        let t = fuel_tracker(None);
+        assert_eq!(t.current_micro_fuel(), Some(0));
+        t.consume_fuel(QUERY_FLOOR_MICRO_FUEL).unwrap();
+        assert_eq!(t.current_micro_fuel(), Some(QUERY_FLOOR_MICRO_FUEL));
+        assert_eq!(t.current_fuel(), Some(1.0));
+        // Reading does not finalize: the tally still sees the same total and
+        // further consumption keeps accumulating.
+        t.consume_fuel(INDEX_TOUCH_MICRO_FUEL).unwrap();
+        assert_eq!(t.current_fuel(), Some(1.01));
+        assert_eq!(t.tally().unwrap().fuel, Some(1.01));
+    }
+
+    #[test]
+    fn current_fuel_none_when_disabled_or_untracked() {
+        // Fully disabled tracker.
+        assert_eq!(Tracker::disabled().current_micro_fuel(), None);
+        assert_eq!(Tracker::disabled().current_fuel(), None);
+        // Enabled tracker, but fuel not among the tracked dimensions.
+        let time_only = Tracker::new(TrackingOptions {
+            track_time: true,
+            track_fuel: false,
+            ..Default::default()
+        });
+        assert_eq!(time_only.current_micro_fuel(), None);
     }
 }

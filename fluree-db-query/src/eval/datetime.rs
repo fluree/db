@@ -252,10 +252,21 @@ where
                 if let Some(v) = fast_datetime_component_from_binding(binding, ctx, component) {
                     return Ok(Some(ComparableValue::Long(v)));
                 }
-                match parse_datetime_from_binding(binding, ctx) {
-                    Some(dt) => Ok(Some(ComparableValue::Long(extract(&dt)))),
-                    None => Ok(None),
+                if let Some(dt) = parse_datetime_from_binding(binding, ctx) {
+                    return Ok(Some(ComparableValue::Long(extract(&dt))));
                 }
+                // Fallback: a plain integer is treated as Unix epoch
+                // milliseconds. LDBC-style datasets store dates/datetimes as
+                // epoch-ms longs rather than xsd:dateTime, so `<epochMs>.month`
+                // / `.day` must still resolve. Only reached when the value is
+                // NOT a recognized temporal type (handled above), so this does
+                // not change date/dateTime semantics.
+                if let Some(ms) = binding_epoch_millis(binding, ctx) {
+                    if let Some(v) = epoch_millis_component(ms, component) {
+                        return Ok(Some(ComparableValue::Long(v)));
+                    }
+                }
+                Ok(None)
             }
             None => Ok(None), // unbound variable
         }
@@ -264,6 +275,49 @@ where
             "{fn_name} requires a variable argument"
         )))
     }
+}
+
+/// Extract an integer value from a binding that holds a plain `Long`
+/// (eager or late-materialized), for epoch-millisecond interpretation.
+fn binding_epoch_millis(
+    binding: &crate::binding::Binding,
+    ctx: Option<&ExecutionContext<'_>>,
+) -> Option<i64> {
+    use crate::binding::Binding;
+    use fluree_db_core::FlakeValue;
+    match binding {
+        Binding::Lit {
+            val: FlakeValue::Long(n),
+            ..
+        } => Some(*n),
+        Binding::EncodedLit {
+            o_kind,
+            o_key,
+            p_id,
+            dt_id,
+            lang_id,
+            ..
+        } => match ctx?
+            .decode_encoded_value(*o_kind, *o_key, *p_id, *dt_id, *lang_id)?
+            .ok()?
+        {
+            FlakeValue::Long(n) => Some(n),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Component of a Unix epoch-millisecond instant, interpreted in UTC.
+fn epoch_millis_component(ms: i64, component: DateComponent) -> Option<i64> {
+    let dt = DateTime::<Utc>::from_timestamp_millis(ms)?;
+    Some(match component {
+        DateComponent::Year => i64::from(dt.year()),
+        DateComponent::Month => i64::from(dt.month()),
+        DateComponent::Day => i64::from(dt.day()),
+        DateComponent::Hour => i64::from(dt.hour()),
+        DateComponent::Minute => i64::from(dt.minute()),
+    })
 }
 
 /// Fast-path extraction for YEAR/MONTH/DAY/HOURS/MINUTES without constructing a chrono DateTime.

@@ -22,6 +22,7 @@ pub mod memory;
 pub mod multi_query;
 pub mod prefix;
 pub mod query;
+pub mod query_stream;
 pub mod remote;
 #[cfg(feature = "server")]
 pub mod server;

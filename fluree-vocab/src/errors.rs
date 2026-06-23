@@ -114,6 +114,12 @@ pub const SPARQL_PARSE: &str = "err:parse/SparqlParse";
 /// SPARQL lowering error
 pub const SPARQL_LOWER: &str = "err:parse/SparqlLower";
 
+/// Cypher parsing error
+pub const CYPHER_PARSE: &str = "err:parse/CypherParse";
+
+/// Cypher lowering error
+pub const CYPHER_LOWER: &str = "err:parse/CypherLower";
+
 /// Turtle parsing error
 pub const TURTLE_PARSE: &str = "err:parse/TurtleParse";
 

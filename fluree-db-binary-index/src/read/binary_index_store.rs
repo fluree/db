@@ -8,7 +8,7 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use fluree_db_core::ids::DatatypeDictId;
@@ -36,6 +36,7 @@ use super::artifact_cache::{fetch_cached_bytes, fetch_cached_bytes_cid};
 use super::leaflet_cache::LeafletCache;
 
 const HOT_REMOTE_LEAF_PROMOTION_TOUCHES: usize = 2;
+const CAS_HELPER_RUNTIME_THREADS: usize = 2;
 
 // ============================================================================
 // Shared dictionary / CAS utilities
@@ -79,6 +80,38 @@ pub(crate) fn cas_sync_timeout() -> Option<Duration> {
         .map(Duration::from_millis)
 }
 
+fn shared_cas_helper_runtime() -> io::Result<&'static tokio::runtime::Runtime> {
+    static RT: OnceLock<Result<tokio::runtime::Runtime, String>> = OnceLock::new();
+
+    RT.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(CAS_HELPER_RUNTIME_THREADS)
+            .thread_name("fluree-cas-helper")
+            .enable_all()
+            .build()
+            .map_err(|e| format!("failed to build shared CAS helper runtime: {e}"))
+    })
+    .as_ref()
+    .map_err(|e| io::Error::other(e.clone()))
+}
+
+fn run_on_shared_cas_helper_thread<T, Fut>(fut: Fut) -> io::Result<T>
+where
+    T: Send + 'static,
+    Fut: std::future::Future<Output = io::Result<T>> + Send + 'static,
+{
+    let (tx, rx) = std::sync::mpsc::sync_channel::<io::Result<T>>(1);
+    std::thread::Builder::new()
+        .name("fluree-cas-helper-bridge".into())
+        .spawn(move || {
+            let result = shared_cas_helper_runtime().and_then(|rt| rt.block_on(fut));
+            let _ = tx.send(result);
+        })
+        .map_err(|e| io::Error::other(format!("failed to spawn CAS helper bridge: {e}")))?;
+    rx.recv()
+        .map_err(|_| io::Error::other("CAS helper bridge thread panicked"))?
+}
+
 /// Drive an async future to completion from synchronous code, safely on any
 /// Tokio runtime flavor.
 ///
@@ -86,8 +119,10 @@ pub(crate) fn cas_sync_timeout() -> Option<Duration> {
 /// the calling worker is converted to a blocking thread and Tokio promotes a
 /// replacement that keeps driving the IO reactor / timer, so the awaited
 /// future (e.g. an S3 `get`) makes progress even while this thread blocks.
-/// On a **current-thread** (or unknown / absent) runtime it runs the future on
-/// a self-contained helper runtime so it never deadlocks the single thread.
+/// On a **current-thread** (or unknown) runtime it moves the blocking wait to a
+/// helper thread backed by the process-wide CAS helper runtime, so it never
+/// deadlocks the single thread. With no ambient runtime (e.g. Rayon workers),
+/// it drives the future directly on that same long-lived helper runtime.
 ///
 /// This is the canonical sync→async bridge for the index read path. All
 /// CAS-backed reads (leaf bytes, dict-tree leaves, forward packs) must go
@@ -111,47 +146,22 @@ where
             tokio::runtime::RuntimeFlavor::CurrentThread => {
                 // Avoid deadlock:
                 // - We're on the single runtime thread.
-                // - If we block here waiting for another thread that calls
-                //   `handle.block_on(...)`, the runtime can't make progress.
-                // Instead, run the future on a self-contained runtime in a helper thread.
-                let (tx, rx) = std::sync::mpsc::sync_channel::<io::Result<T>>(1);
-                std::thread::spawn(move || {
-                    let result = tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                        .map_err(|e| {
-                            io::Error::other(format!("failed to build helper runtime: {e}"))
-                        })
-                        .and_then(|rt| rt.block_on(fut));
-                    let _ = tx.send(result);
-                });
-                rx.recv()
-                    .map_err(|_| io::Error::other("helper runtime thread panicked"))?
+                // - Calling `Runtime::block_on` directly here can panic or stall.
+                // Move the wait to a plain thread, but keep the async work on the
+                // long-lived CAS helper runtime so SDK dispatch tasks outlive each
+                // individual fetch.
+                run_on_shared_cas_helper_thread(fut)
             }
             _ => {
                 // Future-proofing: treat unknown flavors conservatively.
-                let (tx, rx) = std::sync::mpsc::sync_channel::<io::Result<T>>(1);
-                std::thread::spawn(move || {
-                    let result = tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                        .map_err(|e| {
-                            io::Error::other(format!("failed to build helper runtime: {e}"))
-                        })
-                        .and_then(|rt| rt.block_on(fut));
-                    let _ = tx.send(result);
-                });
-                rx.recv()
-                    .map_err(|_| io::Error::other("helper runtime thread panicked"))?
+                run_on_shared_cas_helper_thread(fut)
             }
         },
         Err(_) => {
-            // No runtime context available. Create a local runtime to run the future.
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|e| io::Error::other(format!("failed to build helper runtime: {e}")))?
-                .block_on(fut)
+            // No runtime context available (for example a Rayon worker). Use the
+            // process-wide runtime so pooled async-client connections keep their
+            // dispatch tasks on a runtime that is not dropped after each fetch.
+            shared_cas_helper_runtime()?.block_on(fut)
         }
     }
 }
@@ -3294,6 +3304,50 @@ mod tests {
             ),
             Err(_) => {
                 panic!("run_sync_on_runtime wedged a 2-worker runtime under fan-out (regression)")
+            }
+        }
+    }
+
+    /// Regression guard for the Lambda/Solo remote leaf-fetch failure mode.
+    ///
+    /// Fast-path leaf scans can run on Rayon workers with no ambient Tokio
+    /// runtime. The bridge must use the long-lived process-wide helper runtime
+    /// in that case, not create and drop a fresh runtime per fetch.
+    #[test]
+    fn run_sync_on_runtime_no_runtime_fanout_uses_shared_runtime() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        assert!(tokio::runtime::Handle::try_current().is_err());
+
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut workers = Vec::new();
+            for _ in 0..32 {
+                workers.push(std::thread::spawn(|| {
+                    run_sync_on_runtime(async {
+                        tokio::time::sleep(Duration::from_millis(25)).await;
+                        Ok::<(), std::io::Error>(())
+                    })
+                }));
+            }
+
+            let mut ok = 0usize;
+            for worker in workers {
+                if matches!(worker.join(), Ok(Ok(()))) {
+                    ok += 1;
+                }
+            }
+            let _ = tx.send(ok);
+        });
+
+        match rx.recv_timeout(Duration::from_secs(8)) {
+            Ok(done) => assert_eq!(
+                done, 32,
+                "all no-runtime bridged fetches must complete on the shared helper runtime"
+            ),
+            Err(_) => {
+                panic!("run_sync_on_runtime wedged no-runtime fan-out on shared helper runtime")
             }
         }
     }

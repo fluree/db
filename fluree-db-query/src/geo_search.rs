@@ -486,8 +486,22 @@ impl Operator for GeoSearchOperator {
                 row_idx,
             )?;
 
-            // Add results to output columns
+            // View-policy enforcement: geo reads location flakes directly from
+            // the index, bypassing per-flake policy filtering. Drop any hit whose
+            // location flake the identity cannot view (no-op for root / no policy).
+            let subject_pos = *self.out_pos.get(&self.pattern.subject_var).unwrap();
             for result_row in result_rows {
+                if let Some(subject_sid) = result_row[subject_pos].as_sid() {
+                    if !crate::search_readability::search_hit_readable_sids(
+                        ctx,
+                        subject_sid,
+                        std::slice::from_ref(&self.pattern.predicate),
+                    )
+                    .await?
+                    {
+                        continue;
+                    }
+                }
                 for (col_idx, binding) in result_row.into_iter().enumerate() {
                     columns[col_idx].push(binding);
                 }

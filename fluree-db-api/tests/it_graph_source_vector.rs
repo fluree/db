@@ -734,3 +734,101 @@ async fn vector_idx_query_syntax_e2e() {
         "doc2 should be least similar (last), got: {last_doc}"
     );
 }
+
+/// A non-root view policy must hide inline vector search hits whose embedded
+/// content the identity cannot view. Regression: VectorSearchOperator emitted
+/// matched subjects from the index with no per-flake policy filtering.
+#[tokio::test]
+async fn vector_search_enforces_view_policy_on_embedding_flake() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "vector/policy:main";
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let tx = json!({
+        "@context": { "ex": "http://example.org/" },
+        "@graph": [
+            { "@id": "ex:doc1", "@type": "ex:Doc", "ex:author": "Alice",
+              "ex:embedding": { "@value": [0.9, 0.1, 0.05], "@type": "@vector" } },
+            { "@id": "ex:doc2", "@type": "ex:Doc", "ex:author": "Bob",
+              "ex:embedding": { "@value": [0.8, 0.2, 0.1], "@type": "@vector" } }
+        ]
+    });
+    let _ = fluree.insert(ledger0, &tx).await.expect("insert");
+
+    let indexing_query = json!({
+        "@context": { "ex": "http://example.org/" },
+        "where": [{ "@id": "?x", "@type": "ex:Doc" }],
+        "select": { "?x": ["@id", "ex:embedding"] }
+    });
+    let cfg = VectorCreateConfig::new(
+        "policy-vec-idx",
+        ledger_id,
+        indexing_query,
+        "ex:embedding",
+        3,
+    );
+    let created = fluree.create_vector_index(cfg).await.expect("create index");
+
+    let search_where = json!([{
+        "f:graphSource": &created.graph_source_id,
+        "f:queryVector": [0.85, 0.1, 0.05],
+        "f:distanceMetric": "cosine",
+        "f:searchLimit": 10,
+        "f:searchResult": { "f:resultId": "?doc" }
+    }]);
+
+    // Control: no policy => both docs match.
+    let control = json!({
+        "@context": { "ex": "http://example.org/", "f": "https://ns.flur.ee/db#" },
+        "from": ledger_id,
+        "where": search_where.clone(),
+        "select": ["?doc"]
+    });
+    let control_total: usize = fluree
+        .query_connection_with_bm25(&control)
+        .await
+        .expect("control query")
+        .batches
+        .iter()
+        .map(fluree_db_api::Batch::len)
+        .sum();
+    assert_eq!(control_total, 2, "control: both docs should match");
+
+    // Policy: ex:embedding viewable only for Alice-authored docs (doc1).
+    let policy = json!([{
+        "@id": "ex:embPolicy",
+        "@type": "f:AccessPolicy",
+        "f:action": "f:view",
+        "f:onProperty": [{ "@id": "http://example.org/embedding" }],
+        "f:query": {
+            "@type": "@json",
+            "@value": {
+                "@context": { "ex": "http://example.org/" },
+                "where": [{ "@id": "?$this", "ex:author": "Alice" }]
+            }
+        }
+    }]);
+    let policy_query = json!({
+        "@context": { "ex": "http://example.org/", "f": "https://ns.flur.ee/db#" },
+        "from": ledger_id,
+        "opts": { "policy": policy, "default-allow": false },
+        "where": search_where,
+        "select": ["?doc"]
+    });
+    let result = fluree
+        .query_connection_with_bm25(&policy_query)
+        .await
+        .expect("policy query");
+    let ledger = fluree.ledger(ledger_id).await.expect("ledger");
+    let rendered = result
+        .to_jsonld(&ledger.snapshot)
+        .expect("jsonld")
+        .to_string();
+    assert!(
+        rendered.contains("doc1"),
+        "doc1 (viewable embedding) must remain; got {rendered}"
+    );
+    assert!(
+        !rendered.contains("doc2"),
+        "doc2 (hidden embedding) must not leak through vector search; got {rendered}"
+    );
+}

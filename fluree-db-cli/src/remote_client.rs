@@ -43,6 +43,9 @@ const LEDGER_PATH: &AsciiSet = &CONTROLS
 // wildcard; `/` must be encoded or it would split the URL path.
 const LEDGER_SEGMENT: &AsciiSet = &LEDGER_PATH.add(b'/');
 
+/// `Accept` header for the NDJSON streaming query endpoint.
+const NDJSON_ACCEPT: &str = "application/x-ndjson";
+
 fn encode_ledger_path(s: &str) -> Cow<'_, str> {
     utf8_percent_encode(s, LEDGER_PATH).into()
 }
@@ -681,6 +684,42 @@ impl RemoteLedgerClient {
         Ok(resp)
     }
 
+    /// Like [`send_raw`](Self::send_raw) but attaches extra request headers
+    /// (e.g. `fluree-max-fuel`) before sending. On 401, refresh and retry once.
+    async fn send_raw_with_headers(
+        &self,
+        method: reqwest::Method,
+        url: &str,
+        content_type: &str,
+        accept: Option<&str>,
+        extra_headers: &[(&'static str, String)],
+        body: Option<RequestBody<'_>>,
+    ) -> Result<reqwest::Response, RemoteLedgerError> {
+        let build = |me: &Self| {
+            let mut req = me.build_request(method.clone(), url, content_type, &body);
+            if let Some(a) = accept {
+                req = req.header("Accept", a);
+            }
+            for (k, v) in extra_headers {
+                req = req.header(*k, v);
+            }
+            req
+        };
+
+        let resp = build(self).send().await.map_err(Self::map_network_error)?;
+        if resp.status() == StatusCode::UNAUTHORIZED {
+            if self.try_refresh().await {
+                let resp2 = build(self).send().await.map_err(Self::map_network_error)?;
+                if resp2.status() == StatusCode::UNAUTHORIZED {
+                    return Err(RemoteLedgerError::Unauthorized);
+                }
+                return Ok(resp2);
+            }
+            return Err(RemoteLedgerError::Unauthorized);
+        }
+        Ok(resp)
+    }
+
     fn build_request(
         &self,
         method: reqwest::Method,
@@ -822,6 +861,61 @@ impl RemoteLedgerClient {
             resp.bytes()
                 .await
                 .map_err(|e| RemoteLedgerError::InvalidResponse(e.to_string()))
+        } else {
+            Err(Self::map_error(resp).await)
+        }
+    }
+
+    /// Stream a ledger-scoped SPARQL query as NDJSON from
+    /// `POST /v1/fluree/stream/query/<ledger>`. Returns the raw streaming
+    /// response; the caller drives the body incrementally (see
+    /// [`crate::commands::query_stream`]). Policy flags ride through as headers
+    /// / body opts via [`Self::with_policy`].
+    pub async fn stream_query_sparql(
+        &self,
+        ledger: &str,
+        sparql: &str,
+        extra_headers: &[(&'static str, String)],
+    ) -> Result<reqwest::Response, RemoteLedgerError> {
+        let url = Self::with_default_context_param(self.op_url("stream/query", ledger));
+        let resp = self
+            .send_raw_with_headers(
+                reqwest::Method::POST,
+                &url,
+                "application/sparql-query",
+                Some(NDJSON_ACCEPT),
+                extra_headers,
+                Some(RequestBody::Text(sparql)),
+            )
+            .await?;
+        if resp.status().is_success() {
+            Ok(resp)
+        } else {
+            Err(Self::map_error(resp).await)
+        }
+    }
+
+    /// Stream a ledger-scoped JSON-LD query as NDJSON. See
+    /// [`Self::stream_query_sparql`].
+    pub async fn stream_query_jsonld(
+        &self,
+        ledger: &str,
+        body: &serde_json::Value,
+        extra_headers: &[(&'static str, String)],
+    ) -> Result<reqwest::Response, RemoteLedgerError> {
+        let url = Self::with_default_context_param(self.op_url("stream/query", ledger));
+        let resp = self
+            .send_raw_with_headers(
+                reqwest::Method::POST,
+                &url,
+                "application/json",
+                Some(NDJSON_ACCEPT),
+                extra_headers,
+                Some(RequestBody::Json(body)),
+            )
+            .await?;
+        if resp.status().is_success() {
+            Ok(resp)
         } else {
             Err(Self::map_error(resp).await)
         }
@@ -2577,6 +2671,87 @@ mod tests {
         assert!(
             !headers.contains("transfer-encoding: chunked"),
             "PUT must not use chunked encoding (S3 presigned PUT rejects it); headers were:\n{headers}"
+        );
+    }
+
+    /// `stream_query_sparql` must POST to `/v1/fluree/stream/query/<ledger>`
+    /// and return the streaming response so the NDJSON consumer can drive it
+    /// to completion (head → rows → end).
+    #[tokio::test]
+    async fn stream_query_sparql_posts_to_stream_endpoint_and_streams_rows() {
+        use crate::commands::query_stream::{drive_response, NdjsonConsumer};
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = Vec::new();
+            let mut tmp = [0u8; 1024];
+            let header_end = loop {
+                let n = sock.read(&mut tmp).await.unwrap();
+                if n == 0 {
+                    break buf.len();
+                }
+                buf.extend_from_slice(&tmp[..n]);
+                if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break pos + 4;
+                }
+            };
+            let header_text = String::from_utf8_lossy(&buf[..header_end]).to_string();
+            // Drain the request body so the client's write completes.
+            let content_length: usize = header_text
+                .to_lowercase()
+                .lines()
+                .find_map(|l| l.strip_prefix("content-length:"))
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(0);
+            while buf.len() < header_end + content_length {
+                let n = sock.read(&mut tmp).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&tmp[..n]);
+            }
+
+            let body = "{\"type\":\"head\",\"vars\":[\"name\"]}\n\
+                 {\"type\":\"row\",\"row\":{\"name\":{\"type\":\"literal\",\"value\":\"Alice\"}}}\n\
+                 {\"type\":\"end\",\"rows\":1}\n";
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            sock.write_all(resp.as_bytes()).await.unwrap();
+            sock.flush().await.unwrap();
+            header_text
+        });
+
+        let client = RemoteLedgerClient::new(&format!("http://{addr}/v1/fluree"), None);
+        let response = client
+            .stream_query_sparql("mydb:main", "SELECT ?name WHERE { ?s ?p ?name }", &[])
+            .await
+            .expect("stream request should succeed");
+
+        let mut out: Vec<u8> = Vec::new();
+        let outcome = {
+            let mut consumer = NdjsonConsumer::new(&mut out, false);
+            drive_response(response, &mut consumer).await.unwrap();
+            consumer.finish().unwrap()
+        };
+        assert_eq!(outcome.rows, 1);
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "{\"name\":{\"type\":\"literal\",\"value\":\"Alice\"}}\n"
+        );
+
+        let request_headers = server.await.unwrap();
+        let first_line = request_headers.lines().next().unwrap_or("");
+        assert!(
+            first_line.starts_with("POST /v1/fluree/stream/query/"),
+            "expected POST to the stream endpoint, got: {first_line}"
         );
     }
 

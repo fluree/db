@@ -919,6 +919,10 @@ pub fn estimate_pattern(
 
         Pattern::Filter(_) | Pattern::Bind { .. } => PatternEstimate::Deferred,
 
+        // UNWIND a runtime list — defer until the list expression's vars are
+        // bound (it reads them per row), like a correlated Bind.
+        Pattern::Unwind { .. } => PatternEstimate::Deferred,
+
         Pattern::IndexSearch(isp) => PatternEstimate::Source {
             row_count: isp.limit.map_or(DEFAULT_SEARCH_LIMIT, |l| l as f64),
         },
@@ -955,12 +959,35 @@ pub fn estimate_pattern(
             PatternEstimate::Source { row_count }
         }
 
+        // Anchored shortest-path must run after both endpoints are bound.
+        // Defer it on its referenced (endpoint) vars, like a correlated
+        // subquery, so reorder never hoists it ahead of its inputs.
+        Pattern::ShortestPath(_) => PatternEstimate::Deferred,
+
         Pattern::R2rml(_) => PatternEstimate::Source {
             row_count: DEFAULT_PROPERTY_SCAN_SELECTIVITY,
         },
 
         Pattern::Service(_) => PatternEstimate::Source {
             row_count: DEFAULT_SERVICE_ROW_COUNT,
+        },
+
+        // Edge-annotation patterns (M0): treated as a `Source` with the
+        // wrapped edge's cardinality as a first approximation. Real
+        // cost-based selection between edge-first and annotation-first
+        // scans arrives in M3 alongside `AnnotationStats`.
+        Pattern::EdgeAnnotation { edge, .. } | Pattern::AnnotationTarget { edge, .. } => {
+            PatternEstimate::Source {
+                row_count: estimate_triple_row_count(edge, bound_vars, stats),
+            }
+        }
+
+        // DefaultGraphSource wraps an inner subplan and runs it once
+        // per default-graph source. Cost is modeled like Graph — the
+        // inner branch's cardinality, scaled implicitly by the source
+        // count at runtime.
+        Pattern::DefaultGraphSource { patterns, .. } => PatternEstimate::Source {
+            row_count: estimate_branch_cardinality(patterns, stats),
         },
     }
 }
@@ -1148,7 +1175,7 @@ pub fn reorder_patterns(
 
     let mut bound_vars = initial_bound_vars.clone();
 
-    // Outputs of UNCORRELATED sibling subqueries (Cypher WITH-pipeline
+    // PIPELINE outputs of UNCORRELATED sibling subqueries (Cypher WITH-pipeline
     // producers). A pattern consuming one of these must be placed AFTER the
     // producing subquery — otherwise the greedy source race can place the
     // consumer first (e.g. a cheap `?post a :Post` scan ahead of a var-length
@@ -1156,12 +1183,18 @@ pub fn reorder_patterns(
     // into a per-row correlated subquery over its own consumer and silently
     // collapses the consumer's bindings. Correlated subqueries are excluded:
     // their own outputs are handled by the correlation deferral below.
+    //
+    // CRITICAL: a subquery's shared GROUP BY key is a JOIN KEY, not a pipeline
+    // output — see [`subquery_pipeline_output_vars`]. Without that narrowing,
+    // BSBM BI-8's `avg(price) … GROUP BY ?product` made the preceding
+    // `?product`-establishing offer scan look like a consumer of the subquery,
+    // deferring it behind a lookup keyed by `?product` and blowing the plan up.
     let subquery_output_vars: HashSet<VarId> = patterns
         .iter()
         .enumerate()
         .filter_map(|(i, p)| match p {
             Pattern::Subquery(sq) if subquery_correlation_vars(sq, patterns, i).is_empty() => {
-                Some(subquery_produced_select_vars(sq))
+                Some(subquery_pipeline_output_vars(sq, patterns, i))
             }
             _ => None,
         })
@@ -1434,16 +1467,20 @@ fn connected_or_fallback_pool(
     }
 }
 
-/// Seed-candidate pool, phase 2: drop disconnected `rdf:type <const>` class
-/// anchors so a broad class extension cannot win the seed and flip the chain
-/// into a scattered reverse object-drive (the IC3 `home:Country` case).
+/// Seed-candidate pool, phase 2: drop "broad index" sources so they cannot win
+/// the seed and flip the chain into a scattered reverse object-drive:
+///   * disconnected `rdf:type <const>` class anchors (the IC3 chain-A
+///     `home:Country` reverse-drive), and
+///   * RDF-star annotation sidecars `?ann f:reifiesSubject/Object ?x`, which
+///     index every annotated edge — seeding from one scans the whole sidecar
+///     instead of driving the concrete base edge / `f:reifiesPredicate`
+///     discriminator (the IC5 `HAS_MEMBER` reified-edge case).
 ///
 /// Applies ONLY when a pipeline is active (bound vars or a producer) AND a
-/// connected alternative exists — otherwise the class anchor IS the legitimate
-/// seed and is kept. Deliberately narrow: only class anchors are demoted (a
-/// selective property-value anchor such as `?c name "X"` is never an
-/// [`is_disconnected_class_anchor`] and stays), and demotion never empties the
-/// pool. Returns `base_pool` unchanged when nothing is demoted.
+/// connected alternative exists — otherwise the broad source IS the legitimate
+/// seed and is kept. Deliberately narrow: a selective property-value anchor such
+/// as `?c name "X"` is never demoted, and demotion never empties the pool.
+/// Returns `base_pool` unchanged when nothing is demoted.
 fn demote_disconnected_class_anchors(
     base_pool: Vec<usize>,
     remaining: &[RankedPattern],
@@ -1462,7 +1499,11 @@ fn demote_disconnected_class_anchors(
     let demoted: Vec<usize> = base_pool
         .iter()
         .copied()
-        .filter(|&i| !is_disconnected_class_anchor(&remaining[i].pattern, bound_vars, anchor_vars))
+        .filter(|&i| {
+            let p = &remaining[i].pattern;
+            !is_disconnected_class_anchor(p, bound_vars, anchor_vars)
+                && !is_broad_annotation_sidecar(p)
+        })
         .collect();
     if demoted.is_empty() {
         base_pool
@@ -1523,12 +1564,36 @@ fn rank_seed_candidates(
         .then_with(|| remaining[i].orig_index.cmp(&remaining[j].orig_index))
 }
 
+/// A broad RDF-star annotation *sidecar* triple: `?ann f:reifiesSubject ?s` or
+/// `?ann f:reifiesObject ?o`. These index every annotated edge in the ledger, so
+/// seeding from one (e.g. `?ann f:reifiesObject ?friend`) scans the whole
+/// annotation sidecar before the concrete base edge or the `f:reifiesPredicate`
+/// discriminator narrows it to one predicate — like scanning a global secondary
+/// index before choosing the table. `f:reifiesPredicate` is deliberately NOT
+/// matched: its object is the concrete base predicate, so it *is* the
+/// discriminator and a good driver. Demoted from the seed pool by
+/// [`try_place_source`] whenever a connected alternative (the base edge) exists.
+fn is_broad_annotation_sidecar(pattern: &Pattern) -> bool {
+    let Pattern::Triple(tp) = pattern else {
+        return false;
+    };
+    match &tp.p {
+        Ref::Sid(sid) => {
+            sid.namespace_code == fluree_vocab::namespaces::FLUREE_DB
+                && (sid.name.as_ref() == fluree_vocab::db::REIFIES_SUBJECT
+                    || sid.name.as_ref() == fluree_vocab::db::REIFIES_OBJECT)
+        }
+        _ => false,
+    }
+}
+
 /// Try to place the best source. Returns true if one was placed.
 ///
 /// Three phases (each a named helper): build the connected/fallback candidate
-/// pool, demote disconnected `rdf:type <const>` class anchors when a connected
-/// alternative exists (the IC3 guard — see [`demote_disconnected_class_anchors`]),
-/// then pick the best by [`rank_seed_candidates`]. `anchor_vars` are the outputs
+/// pool, demote broad-index sources — disconnected `rdf:type <const>` class
+/// anchors and RDF-star annotation sidecars — when a connected alternative
+/// exists (see [`demote_disconnected_class_anchors`]), then pick the best by
+/// [`rank_seed_candidates`]. `anchor_vars` are the outputs
 /// of uncorrelated WITH-subquery producers (see `reorder_patterns`) — a
 /// pseudo-bound pipeline component for both the connectivity test and the
 /// demotion guard.
@@ -1642,9 +1707,14 @@ fn drain_ready_deferred(
                 .last_mut()
                 .is_some_and(|last| try_nest_deferred(last, &dp));
 
-            // BIND produces a new variable; FILTER does not.
-            if let Pattern::Bind { var, .. } = &dp.pattern {
-                bound_vars.insert(*var);
+            // A deferred pattern's produced variables must enter the bound set
+            // so later patterns referencing them place after and correlate.
+            // This covers BIND/UNWIND (their target var) and a deferred
+            // ShortestPath (its path var) — without it, e.g. an UNWIND that
+            // reads a deferred shortestPath's path never becomes ready and
+            // lands after a property accessor on the unwound var, cross-joining.
+            for v in dp.pattern.produced_vars() {
+                bound_vars.insert(v);
             }
 
             if !nested {
@@ -1691,22 +1761,46 @@ fn subquery_correlation_vars(
     }
     // Variables the subquery binds in EVERY solution on its own — but only when
     // no inner slice makes per-row seeding result-sensitive. Restricted to
-    // top-level required producers (triples / property paths) so a var that is
-    // only conditionally bound (UNION branch, OPTIONAL) is NOT declassified.
+    // top-level UNCONDITIONAL producers so a var that is only conditionally
+    // bound (UNION branch, OPTIONAL) is NOT declassified. Besides triples /
+    // property paths this must include the WITH-pipeline binders — UNWIND, BIND,
+    // VALUES — otherwise a var the subquery produces via one of them is
+    // mistaken for an external correlation, the subquery is deferred on a var
+    // only it can bind (so it never becomes ready and is placed last), and a
+    // consuming OPTIONAL/Filter runs first uncorrelated, clobbering that var.
     let self_produced: HashSet<VarId> = if sq.limit.is_none() && sq.offset.is_none() {
         sq.patterns
             .iter()
-            .filter(|p| matches!(p, Pattern::Triple(_) | Pattern::PropertyPath(_)))
+            .filter(|p| {
+                matches!(
+                    p,
+                    Pattern::Triple(_)
+                        | Pattern::PropertyPath(_)
+                        | Pattern::Unwind { .. }
+                        | Pattern::Bind { .. }
+                        | Pattern::Values { .. }
+                )
+            })
             .flat_map(Pattern::produced_vars)
             .collect()
     } else {
         HashSet::new()
     };
+    // A correlation input must be bound BEFORE the subquery runs, so only a
+    // PRECEDING sibling can supply one. A following sibling that re-produces a
+    // select var is a downstream CONSUMER, not a correlation — e.g. the Cypher
+    // WITH pipeline `… WITH m [ORDER BY m.x] LIMIT n  MATCH (m)-…`: the WITH
+    // lowers to this subquery and the trailing MATCH (plus the deterministic
+    // `?#__prop_m_x` accessor a later `RETURN m.x` shares) re-produces `m`/`m.x`
+    // AFTER it. Without the position guard those looked like correlations on a
+    // sliced subquery (slice empties `self_produced`), so the WITH was deferred
+    // behind its own consumer and the consuming MATCH ran first as an unseeded
+    // scan — silently empty results or an ignored limit. Restricting to
+    // preceding siblings keeps a genuinely correlated sliced sub-SELECT (its
+    // producer precedes it) per-row while letting the WITH producer lead.
     let mut corr = HashSet::new();
-    for (j, p) in siblings.iter().enumerate() {
-        if j == self_idx {
-            continue;
-        }
+    for (j, p) in siblings.iter().enumerate().take(self_idx) {
+        debug_assert!(j < self_idx);
         for v in p.produced_vars() {
             if select.contains(&v) && !self_produced.contains(&v) {
                 corr.insert(v);
@@ -1728,10 +1822,53 @@ fn subquery_produced_select_vars(sq: &SubqueryPattern) -> HashSet<VarId> {
         .collect()
 }
 
+/// The vars an uncorrelated sub-SELECT contributes as WITH-pipeline OUTPUTS —
+/// the ones a *later* sibling genuinely has to wait for. This is
+/// [`subquery_produced_select_vars`] minus any **GROUP BY key that another
+/// sibling in the same block also produces**.
+///
+/// A shared GROUP BY key is a JOIN KEY, not a pipeline output: the subquery is
+/// an aggregate lookup table keyed by it, so a sibling that establishes that
+/// key must NOT be deferred behind the lookup. This is the BSBM BI-8 shape —
+/// `{ SELECT ?product (avg(?price) AS ?avgPrice) … GROUP BY ?product }` sitting
+/// after `?product a :PT . ?offer :product ?product …`: `?product` is already
+/// established by the offer scan, and only the aggregate `?avgPrice` is a new
+/// output (consumed by a later FILTER, which the normal filter deferral already
+/// orders). Treating `?product` as a pipeline output deferred the offer scan
+/// behind the per-`?product` average lookup and blew the plan up (>3000x).
+///
+/// Cypher `WITH [DISTINCT] ?friend` producers have no shared GROUP BY key
+/// (DISTINCT is not an explicit `GROUP BY`), so `?friend` stays an output and
+/// the consuming pattern still defers — the IC3/IC9 win is preserved.
+fn subquery_pipeline_output_vars(
+    sq: &SubqueryPattern,
+    siblings: &[Pattern],
+    self_idx: usize,
+) -> HashSet<VarId> {
+    let mut outputs = subquery_produced_select_vars(sq);
+    let group_keys: HashSet<VarId> = sq
+        .grouping
+        .as_ref()
+        .map(|g| g.group_by_vars().collect())
+        .unwrap_or_default();
+    if group_keys.is_empty() {
+        return outputs;
+    }
+    let sibling_produced: HashSet<VarId> = siblings
+        .iter()
+        .enumerate()
+        .filter(|(j, _)| *j != self_idx)
+        .flat_map(|(_, p)| p.produced_vars())
+        .collect();
+    outputs.retain(|v| !(group_keys.contains(v) && sibling_produced.contains(v)));
+    outputs
+}
+
 fn deferred_required_vars(pattern: &Pattern) -> Vec<VarId> {
     match pattern {
         Pattern::Filter(expr) => expr.referenced_vars(),
         Pattern::Bind { expr, .. } => expr.referenced_vars(),
+        Pattern::Unwind { list, .. } => list.referenced_vars(),
         // Other patterns should not be classified as Deferred, but handle
         // gracefully by returning all referenced variables.
         other => other.referenced_vars(),
@@ -2155,6 +2292,89 @@ mod tests {
             Some("http://example.org/z"),
             "expected stats-driven ordering to pick the most selective predicate first; got ordered[0]={:?}",
             ordered[0]
+        );
+    }
+
+    #[test]
+    fn estimate_uses_merged_annotation_stats_for_reifies_predicates() {
+        // After `StatsView::merge_annotation_stats` runs with per-slot
+        // NDVs, the planner's classifier should produce arena-aligned
+        // BoundObject estimates: `count / ndv_values` for the matching
+        // slot's NDV, not the conservative fallback.
+
+        use fluree_db_core::AnnotationStats;
+        use fluree_vocab::db as p;
+        use fluree_vocab::namespaces::FLUREE_DB;
+
+        let mut stats = StatsView::default();
+        let ann = AnnotationStats {
+            forward_rows: 1_000,
+            reverse_rows: 1_000,
+            distinct_edges: 200,
+            distinct_annotations: 800,
+            live_attachment_pairs: 800,
+            distinct_reified_subjects: 50,
+            distinct_reified_predicates: 4,
+            distinct_reified_objects: 200,
+            ..Default::default()
+        };
+        let mut ns = std::collections::HashMap::new();
+        ns.insert(FLUREE_DB, "https://ns.flur.ee/db#".to_string());
+        stats.merge_annotation_stats(&ann, &ns);
+
+        // PropertyScan: `?ann f:reifiesObject ?o` — total annotations.
+        let scan = TriplePattern::new(
+            Ref::Var(VarId(0)),
+            Ref::Sid(Sid::new(FLUREE_DB, p::REIFIES_OBJECT)),
+            Term::Var(VarId(1)),
+        );
+        let scan_est = estimate_triple_row_count(&scan, &HashSet::new(), Some(&stats));
+        assert_eq!(
+            scan_est, 800.0,
+            "PropertyScan should equal annotation count"
+        );
+
+        // BoundObject: `?ann f:reifiesObject <some_object>`. With per-
+        // slot NDV the estimate is `800 / 200 = 4` — annotations per
+        // pinned object.
+        let bound_o = TriplePattern::new(
+            Ref::Var(VarId(0)),
+            Ref::Sid(Sid::new(FLUREE_DB, p::REIFIES_OBJECT)),
+            Term::Sid(Sid::new(7, "obj1")),
+        );
+        let bound_o_est = estimate_triple_row_count(&bound_o, &HashSet::new(), Some(&stats));
+        assert_eq!(
+            bound_o_est, 4.0,
+            "BoundObject on reifiesObject should be distinct_annotations / distinct_reified_objects"
+        );
+
+        // BoundSubject: a known annotation subject probing its slot.
+        let mut bound_subj_ctx = HashSet::new();
+        bound_subj_ctx.insert(VarId(0));
+        let bound_s = TriplePattern::new(
+            Ref::Var(VarId(0)),
+            Ref::Sid(Sid::new(FLUREE_DB, p::REIFIES_SUBJECT)),
+            Term::Var(VarId(2)),
+        );
+        let bound_s_est = estimate_triple_row_count(&bound_s, &bound_subj_ctx, Some(&stats));
+        assert_eq!(
+            bound_s_est, 1.0,
+            "BoundSubject on reifiesSubject should be ~1 row per known annotation"
+        );
+
+        // BoundObject on reifiesPredicate: 800 / 4 = 200 annotations
+        // per pinned predicate. Larger than reifiesObject's
+        // selectivity here, which is realistic — predicates are
+        // typically a small set even at scale.
+        let bound_p = TriplePattern::new(
+            Ref::Var(VarId(0)),
+            Ref::Sid(Sid::new(FLUREE_DB, p::REIFIES_PREDICATE)),
+            Term::Sid(Sid::new(7, "worksFor")),
+        );
+        let bound_p_est = estimate_triple_row_count(&bound_p, &HashSet::new(), Some(&stats));
+        assert_eq!(
+            bound_p_est, 200.0,
+            "BoundObject on reifiesPredicate should be distinct_annotations / distinct_reified_predicates"
         );
     }
 
@@ -3477,6 +3697,86 @@ mod tests {
     }
 
     #[test]
+    fn annotation_sidecar_demoted_for_base_edge() {
+        // RDF-star reified edge (IC5 shape): `?ann f:reifiesObject ?friend` is a
+        // broad annotation sidecar; `?forum HAS_MEMBER ?friend` is the concrete
+        // base edge. Both are object-bound on `friend`. The base edge must seed —
+        // not the sidecar — even though the sidecar is written first (and would
+        // otherwise win the orig-index tie).
+        let (friend, forum, ann) = (VarId(0), VarId(1), VarId(2));
+        let reifies_object = Pattern::Triple(TriplePattern::new(
+            Ref::Var(ann),
+            Ref::Sid(Sid::new(
+                fluree_vocab::namespaces::FLUREE_DB,
+                fluree_vocab::db::REIFIES_OBJECT,
+            )),
+            Term::Var(friend),
+        ));
+        let base_edge = Pattern::Triple(make_pattern(forum, "HAS_MEMBER", friend));
+        let patterns = vec![reifies_object, base_edge];
+        let mut bound = HashSet::new();
+        bound.insert(friend);
+        let ordered = reorder_patterns(&patterns, None, &bound);
+        assert!(
+            matches!(&ordered[0], Pattern::Triple(tp)
+                if matches!(&tp.p, Ref::Sid(s) if s.name.as_ref() == "HAS_MEMBER")),
+            "concrete base edge must seed before the f:reifiesObject sidecar: {ordered:?}"
+        );
+    }
+
+    #[test]
+    fn full_reifies_chain_drives_base_edge_first() {
+        // The REAL delegate path: the expanded edge-annotation chain (base edge +
+        // three `f:reifies*` sidecars) reordered with the child's `friend` already
+        // bound — exactly what `DefaultGraphSourceOperator` feeds to
+        // `build_where_operators_seeded` -> `reorder_patterns`. The base
+        // `HAS_MEMBER` edge must be placed before `f:reifiesObject`, otherwise the
+        // plan scans the global annotation sidecar.
+        let (friend, forum, ann) = (VarId(0), VarId(1), VarId(2));
+        let sid = |name| Ref::Sid(Sid::new(fluree_vocab::namespaces::FLUREE_DB, name));
+        let base_edge = Pattern::Triple(make_pattern(forum, "HAS_MEMBER", friend));
+        let reifies_subject = Pattern::Triple(TriplePattern::new(
+            Ref::Var(ann),
+            sid(fluree_vocab::db::REIFIES_SUBJECT),
+            Term::Var(forum),
+        ));
+        let reifies_predicate = Pattern::Triple(TriplePattern::new(
+            Ref::Var(ann),
+            sid(fluree_vocab::db::REIFIES_PREDICATE),
+            Term::Sid(Sid::new(100, "HAS_MEMBER")),
+        ));
+        let reifies_object = Pattern::Triple(TriplePattern::new(
+            Ref::Var(ann),
+            sid(fluree_vocab::db::REIFIES_OBJECT),
+            Term::Var(friend),
+        ));
+        // Emission order as produced by `expand_edge_annotation_patterns`.
+        let patterns = vec![
+            base_edge,
+            reifies_subject,
+            reifies_predicate,
+            reifies_object,
+        ];
+        let mut bound = HashSet::new();
+        bound.insert(friend); // the delegate's seeded child binds `friend`
+        let ordered = reorder_patterns(&patterns, None, &bound);
+
+        let pos = |pred: &str| {
+            ordered
+                .iter()
+                .position(|p| {
+                    matches!(p, Pattern::Triple(tp)
+                    if matches!(&tp.p, Ref::Sid(s) if s.name.as_ref() == pred))
+                })
+                .unwrap_or(usize::MAX)
+        };
+        assert!(
+            pos("HAS_MEMBER") < pos(fluree_vocab::db::REIFIES_OBJECT),
+            "base edge must drive before the f:reifiesObject sidecar: {ordered:?}"
+        );
+    }
+
+    #[test]
     fn producer_then_consumer_order_not_regressed() {
         // IC9 shape: the WITH producer seeds, then its consumer (`HAS_CREATOR`,
         // which references `friend`) drains immediately after.
@@ -3495,6 +3795,130 @@ mod tests {
                 if matches!(&tp.p, Ref::Sid(s) if s.name.as_ref() == "HAS_CREATOR")),
             "consumer drains right after the producer: {ordered:?}"
         );
+    }
+
+    // --- F3 narrowing: shared GROUP BY key is a join key, not a pipeline output ---
+
+    /// A grouped sub-SELECT: `SELECT <select> { <body> } GROUP BY <group_key>`.
+    fn grouped_sq(select: Vec<VarId>, group_key: VarId, body: Vec<Pattern>) -> Pattern {
+        Pattern::Subquery(crate::ir::SubqueryPattern::new(select, body).with_grouping(
+            crate::ir::Grouping::assemble(vec![group_key], vec![], vec![], None).unwrap(),
+        ))
+    }
+
+    #[test]
+    fn bi8_shared_group_key_excluded_from_pipeline_outputs() {
+        // BI-8 shape: preceding triples establish ?product, then a GROUP BY
+        // ?product sub-SELECT (avg-price lookup keyed by ?product) selects
+        // ?product + ?avgPrice. The shared group key ?product is a JOIN KEY, so
+        // it must NOT be a pipeline output (only the new ?avgPrice would be, and
+        // that is not body-produced here). Directly exercises the narrowing.
+        let (product, offer, avg) = (VarId(0), VarId(1), VarId(2));
+        let avg_sq = grouped_sq(
+            vec![product, avg],
+            product,
+            vec![Pattern::Triple(make_pattern(offer, "product", product))],
+        );
+        let siblings = vec![
+            type_anchor(product, "ProductType1"),
+            Pattern::Triple(make_pattern(offer, "product", product)),
+            avg_sq.clone(),
+        ];
+        let Pattern::Subquery(sq) = &avg_sq else {
+            unreachable!()
+        };
+        let outputs = subquery_pipeline_output_vars(sq, &siblings, 2);
+        assert!(
+            !outputs.contains(&product),
+            "shared GROUP BY key must not be a pipeline output: {outputs:?}"
+        );
+    }
+
+    #[test]
+    fn bi8_group_key_scan_not_deferred_behind_subquery() {
+        // End-to-end: the ?product-establishing scan must NOT be deferred behind
+        // the GROUP BY ?product subquery (the regression forced the subquery to
+        // seed and drove the offer scan as its per-?product consumer).
+        let (product, offer, avg) = (VarId(0), VarId(1), VarId(2));
+        let patterns = vec![
+            type_anchor(product, "ProductType1"),
+            Pattern::Triple(make_pattern(offer, "product", product)),
+            grouped_sq(
+                vec![product, avg],
+                product,
+                vec![Pattern::Triple(make_pattern(offer, "product", product))],
+            ),
+        ];
+        let ordered = reorder_patterns(&patterns, None, &HashSet::new());
+        let sub_pos = ordered
+            .iter()
+            .position(|p| matches!(p, Pattern::Subquery(_)))
+            .expect("subquery present");
+        let type_pos = ordered
+            .iter()
+            .position(|p| matches!(p, Pattern::Triple(tp) if tp.p.is_rdf_type()))
+            .expect("type anchor present");
+        assert!(
+            type_pos < sub_pos,
+            "the ?product scan must lead, not defer behind the lookup subquery: {ordered:?}"
+        );
+        assert!(
+            !matches!(&ordered[0], Pattern::Subquery(_)),
+            "the grouped lookup subquery must not be forced to seed: {ordered:?}"
+        );
+    }
+
+    #[test]
+    fn cypher_with_producer_output_still_defers_consumer() {
+        // Companion guard: a real Cypher WITH producer (no GROUP BY) keeps its
+        // output as a pipeline var, so the consumer still defers. Producer-first
+        // input order (as the lowered WITH yields).
+        let (friend, message) = (VarId(0), VarId(1));
+        let producer = with_producer(friend); // SELECT ?friend { ?friend knows 99 }
+        let siblings = vec![
+            producer.clone(),
+            Pattern::Triple(make_pattern(message, "HAS_CREATOR", friend)),
+        ];
+        let Pattern::Subquery(sq) = &producer else {
+            unreachable!()
+        };
+        assert!(
+            subquery_pipeline_output_vars(sq, &siblings, 0).contains(&friend),
+            "ungrouped WITH producer's output stays a pipeline output (IC3/IC9 win)"
+        );
+        let ordered = reorder_patterns(&siblings, None, &HashSet::new());
+        assert!(
+            matches!(&ordered[0], Pattern::Subquery(_)),
+            "producer still seeds before its consumer: {ordered:?}"
+        );
+    }
+
+    #[test]
+    fn sibling_group_by_subqueries_are_peer_sources() {
+        // BI-8 outer shape: two sub-SELECTs both GROUP BY ?vendor, joined on it.
+        // Neither produces ?vendor as a pipeline output for the other (it is the
+        // shared join key), so neither is deferred as the other's consumer.
+        let (vendor, a_out, b_out, offer) = (VarId(0), VarId(1), VarId(2), VarId(3));
+        let sub_a = grouped_sq(
+            vec![vendor, a_out],
+            vendor,
+            vec![Pattern::Triple(make_pattern(offer, "vendor", vendor))],
+        );
+        let sub_b = grouped_sq(
+            vec![vendor, b_out],
+            vendor,
+            vec![Pattern::Triple(make_pattern(offer, "vendor", vendor))],
+        );
+        let siblings = vec![sub_a.clone(), sub_b.clone()];
+        for (idx, sub) in [(0usize, &sub_a), (1usize, &sub_b)] {
+            let Pattern::Subquery(sq) = sub else {
+                unreachable!()
+            };
+            assert!(
+                !subquery_pipeline_output_vars(sq, &siblings, idx).contains(&vendor),
+                "shared GROUP BY ?vendor is a join key between peers, not a pipeline output"
+            );
+        }
     }
 
     /// Position of the first triple whose predicate name is `name`.

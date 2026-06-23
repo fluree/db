@@ -182,6 +182,137 @@ fn golden_path() {
         .stdout(predicate::str::contains("No ledgers found"));
 }
 
+/// Seed a ledger with two `ex:name` triples for the streaming tests.
+fn seed_named_people(tmp: &TempDir, ledger: &str) {
+    fluree_cmd(tmp).arg("init").assert().success();
+    fluree_cmd(tmp).args(["create", ledger]).assert().success();
+    fluree_cmd(tmp)
+        .args([
+            "insert",
+            "-e",
+            r#"{"@context": {"ex": "http://example.org/"}, "@graph": [
+                {"@id": "ex:alice", "ex:name": "Alice"},
+                {"@id": "ex:bob", "ex:name": "Bob"}
+            ]}"#,
+        ])
+        .assert()
+        .success();
+}
+
+#[test]
+fn query_ndjson_bare_streams_row_objects() {
+    let tmp = TempDir::new().unwrap();
+    seed_named_people(&tmp, "streamdb");
+
+    // Bare NDJSON: one inner binding object per line, no envelope records.
+    fluree_cmd(&tmp)
+        .args([
+            "query",
+            "--sparql",
+            "--format",
+            "ndjson",
+            "-e",
+            "SELECT ?name WHERE { ?s <http://example.org/name> ?name }",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Alice"))
+        .stdout(predicate::str::contains("Bob"))
+        // SPARQL-JSON term shape is preserved in bare rows...
+        .stdout(predicate::str::contains("\"value\":\"Alice\""))
+        // ...but the envelope records are not emitted in bare mode.
+        .stdout(predicate::str::contains("\"type\":\"head\"").not())
+        .stdout(predicate::str::contains("\"type\":\"row\"").not());
+}
+
+#[test]
+fn query_ndjson_envelope_emits_protocol() {
+    let tmp = TempDir::new().unwrap();
+    seed_named_people(&tmp, "streamdb");
+
+    fluree_cmd(&tmp)
+        .args([
+            "query",
+            "--sparql",
+            "--format",
+            "ndjson",
+            "--envelope",
+            "-e",
+            "SELECT ?name WHERE { ?s <http://example.org/name> ?name }",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"type\":\"head\""))
+        .stdout(predicate::str::contains("\"type\":\"row\""))
+        .stdout(predicate::str::contains("\"type\":\"end\""))
+        .stdout(predicate::str::contains("Alice"));
+}
+
+#[test]
+fn query_envelope_without_ndjson_errors() {
+    let tmp = TempDir::new().unwrap();
+    seed_named_people(&tmp, "streamdb");
+
+    fluree_cmd(&tmp)
+        .args([
+            "query",
+            "--sparql",
+            "--envelope",
+            "-e",
+            "SELECT ?name WHERE { ?s <http://example.org/name> ?name }",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "--envelope only applies to --format ndjson",
+        ));
+}
+
+#[test]
+fn query_ndjson_rejects_bench() {
+    let tmp = TempDir::new().unwrap();
+    seed_named_people(&tmp, "streamdb");
+
+    fluree_cmd(&tmp)
+        .args([
+            "query",
+            "--sparql",
+            "--format",
+            "ndjson",
+            "--bench",
+            "-e",
+            "SELECT ?name WHERE { ?s <http://example.org/name> ?name }",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "not compatible with --format ndjson",
+        ));
+}
+
+#[test]
+fn query_ndjson_local_rejects_time_travel() {
+    let tmp = TempDir::new().unwrap();
+    seed_named_people(&tmp, "streamdb");
+
+    fluree_cmd(&tmp)
+        .args([
+            "query",
+            "--sparql",
+            "--format",
+            "ndjson",
+            "--at",
+            "1",
+            "-e",
+            "SELECT ?name WHERE { ?s <http://example.org/name> ?name }",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "time travel (--at) is not supported",
+        ));
+}
+
 #[test]
 fn use_command_switches_active_ledger() {
     let tmp = TempDir::new().unwrap();

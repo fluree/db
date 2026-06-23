@@ -1,0 +1,13 @@
+# Nextest configuration.
+#
+# `slow-timeout.period` controls when a still-running test is reported as SLOW.
+# `terminate-after` hard-kills a test once it has been SLOW for that many
+# periods and marks it as a TIMEOUT failure. Without this, nextest only prints
+# SLOW warnings and a deadlocked test runs until the CI job's wall-clock cap —
+# a single hang previously burned the full 6h GitHub job ceiling.
+#
+# 120s × 3 = 6 minutes: comfortably above the slowest legitimate integration
+# test (a few seconds locally) while still failing a true hang fast and
+# visibly, and letting the rest of the suite finish under `--no-fail-fast`.
+[profile.default]
+slow-timeout = { period = "120s", terminate-after = 3 }

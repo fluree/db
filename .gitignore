@@ -5,6 +5,9 @@
 # mdBook build output
 /docs/book/
 
+# llms.txt artifacts staged by docs/scripts/llms_preproc.py
+/docs/.llms-staging/
+
 # Cargo lock for libraries (keep for binaries)
 # Cargo.lock
 

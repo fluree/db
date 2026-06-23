@@ -5,8 +5,9 @@
 
 use crate::binding::{Batch, Binding};
 use crate::context::{ExecutionContext, WellKnownDatatypes};
+use crate::dataset::ActiveGraphs;
 use crate::error::{QueryError, Result};
-use crate::operator::{Operator, OperatorState};
+use crate::operator::{BoxedOperator, Operator, OperatorState};
 use crate::var_registry::VarId;
 use async_trait::async_trait;
 use fluree_db_core::{FlakeValue, StatsView};
@@ -16,16 +17,35 @@ use std::sync::Arc;
 ///
 /// Intended to fast-path queries like:
 /// `SELECT ?p (COUNT(?s) AS ?count) WHERE { ?s ?p ?o } GROUP BY ?p ORDER BY DESC(?count)`
+///
+/// The `StatsView` counts are whole-index totals with no per-flake policy
+/// filtering, so under a non-root view policy they would leak restricted
+/// predicates' existence and cardinality. When a policy is active this operator
+/// delegates to `fallback` — the equivalent generic GROUP BY pipeline, whose
+/// scan applies the per-flake filter — instead of emitting stats rows.
 pub struct StatsCountByPredicateOperator {
     stats: Arc<StatsView>,
     schema: Arc<[VarId]>,
     state: OperatorState,
     rows: Vec<(Binding, Binding)>,
     pos: usize,
+    /// Policy-enforced generic GROUP BY producing the same `[pred, count]`
+    /// schema. Used when a view policy is active (the stats counts can't be
+    /// trusted then). Built unconditionally so the operator tree stays
+    /// policy-agnostic (it is prepared once and reused across policies).
+    fallback: Option<BoxedOperator>,
+    /// Set in `open()` when a policy is active: subsequent `next_batch` calls
+    /// stream from `fallback` rather than the stats rows.
+    use_fallback: bool,
 }
 
 impl StatsCountByPredicateOperator {
-    pub fn new(stats: Arc<StatsView>, pred_var: VarId, count_var: VarId) -> Self {
+    pub fn new(
+        stats: Arc<StatsView>,
+        pred_var: VarId,
+        count_var: VarId,
+        fallback: Option<BoxedOperator>,
+    ) -> Self {
         let schema: Arc<[VarId]> = Arc::from(vec![pred_var, count_var].into_boxed_slice());
         Self {
             stats,
@@ -33,6 +53,18 @@ impl StatsCountByPredicateOperator {
             state: OperatorState::Created,
             rows: Vec::new(),
             pos: 0,
+            fallback,
+            use_fallback: false,
+        }
+    }
+
+    /// True when a non-root view policy is active on the scope this operator
+    /// runs against (single-ledger or any graph of a dataset). The stats counts
+    /// are only valid when no such policy can hide flakes.
+    fn policy_active(ctx: &ExecutionContext<'_>) -> bool {
+        match ctx.active_graphs() {
+            ActiveGraphs::Single => ctx.has_policy(),
+            ActiveGraphs::Many(graphs) => graphs.iter().any(|g| g.has_policy()),
         }
     }
 
@@ -93,8 +125,22 @@ impl Operator for StatsCountByPredicateOperator {
         if !self.state.can_open() {
             return Err(QueryError::OperatorAlreadyOpened);
         }
-        self.rows = self.build_rows(ctx)?;
-        self.pos = 0;
+        // Under a view policy the whole-index stats counts can't be trusted, so
+        // stream from the policy-enforced generic fallback instead. If a policy
+        // is active but no fallback was wired, fail closed rather than leak.
+        if Self::policy_active(ctx) {
+            let fallback = self.fallback.as_mut().ok_or_else(|| {
+                QueryError::Policy(
+                    "stats count-by-predicate fast path has no policy-enforced fallback"
+                        .to_string(),
+                )
+            })?;
+            fallback.open(ctx).await?;
+            self.use_fallback = true;
+        } else {
+            self.rows = self.build_rows(ctx)?;
+            self.pos = 0;
+        }
         self.state = OperatorState::Open;
         Ok(())
     }
@@ -102,6 +148,14 @@ impl Operator for StatsCountByPredicateOperator {
     async fn next_batch(&mut self, ctx: &ExecutionContext<'_>) -> Result<Option<Batch>> {
         if self.state != OperatorState::Open {
             return Ok(None);
+        }
+        if self.use_fallback {
+            return self
+                .fallback
+                .as_mut()
+                .expect("use_fallback implies fallback is Some")
+                .next_batch(ctx)
+                .await;
         }
         if self.pos >= self.rows.len() {
             self.state = OperatorState::Exhausted;
@@ -126,6 +180,10 @@ impl Operator for StatsCountByPredicateOperator {
     }
 
     fn close(&mut self) {
+        if let Some(fallback) = self.fallback.as_mut() {
+            fallback.close();
+        }
+        self.use_fallback = false;
         self.state = OperatorState::Closed;
         self.rows.clear();
         self.pos = 0;

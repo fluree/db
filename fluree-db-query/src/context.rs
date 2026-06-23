@@ -137,6 +137,15 @@ pub struct ExecutionContext<'a> {
     pub cancellation: QueryCancellation,
     /// When true, bind evaluation errors are treated as query errors.
     pub strict_bind_errors: bool,
+    /// When true, scan operators bypass the variable-predicate filter
+    /// that hides Fluree-system predicates (`f:reifies*` in every
+    /// graph; the broader `f:` namespace in the default graph) for
+    /// patterns whose predicate slot is a variable.
+    ///
+    /// Opt-in escape for debug / inspection workflows; defaults to
+    /// `false`. Surfaced through `opts.includeSystemFacts: true` on
+    /// JSON-LD queries.
+    pub include_system_facts: bool,
     /// Optional binary columnar index store for fast local-file scans.
     ///
     /// When present, scan operators use the binary cursor path for queries
@@ -255,6 +264,7 @@ impl<'a> ExecutionContext<'a> {
             tracker: Tracker::disabled(),
             cancellation: QueryCancellation::disabled(),
             strict_bind_errors: false,
+            include_system_facts: false,
             binary_store: None,
             binary_g_id: 0,
             dict_novelty: None,
@@ -306,6 +316,7 @@ impl<'a> ExecutionContext<'a> {
             tracker: Tracker::disabled(),
             cancellation: QueryCancellation::disabled(),
             strict_bind_errors: false,
+            include_system_facts: false,
             binary_store,
             binary_g_id: db.g_id,
             dict_novelty,
@@ -361,6 +372,7 @@ impl<'a> ExecutionContext<'a> {
             tracker: Tracker::disabled(),
             cancellation: QueryCancellation::disabled(),
             strict_bind_errors: false,
+            include_system_facts: false,
             binary_store,
             binary_g_id: db.g_id,
             dict_novelty,
@@ -405,6 +417,7 @@ impl<'a> ExecutionContext<'a> {
             tracker: Tracker::disabled(),
             cancellation: QueryCancellation::disabled(),
             strict_bind_errors: false,
+            include_system_facts: false,
             binary_store: None,
             binary_g_id: 0,
             dict_novelty: None,
@@ -448,6 +461,7 @@ impl<'a> ExecutionContext<'a> {
             tracker: Tracker::disabled(),
             cancellation: QueryCancellation::disabled(),
             strict_bind_errors: false,
+            include_system_facts: false,
             binary_store: None,
             binary_g_id: 0,
             dict_novelty: None,
@@ -493,6 +507,7 @@ impl<'a> ExecutionContext<'a> {
             tracker: Tracker::disabled(),
             cancellation: QueryCancellation::disabled(),
             strict_bind_errors: false,
+            include_system_facts: false,
             binary_store: None,
             binary_g_id: 0,
             dict_novelty: None,
@@ -609,12 +624,46 @@ impl<'a> ExecutionContext<'a> {
         self
     }
 
-    /// Check if this context has an active (non-root) policy
+    /// Bypass the variable-predicate filter that hides Fluree-system
+    /// predicates. Opt-in for debug / inspection — see
+    /// [`Self::include_system_facts`].
+    pub fn with_include_system_facts(mut self, include: bool) -> Self {
+        self.include_system_facts = include;
+        self
+    }
+
+    /// Check if this context has an active (non-root) policy.
+    ///
+    /// Accounts for dataset mode: the top-level context may carry no enforcer
+    /// while a constituent graph does (the enforcer lives on the `GraphRef`,
+    /// applied via [`with_graph_ref`](Self::with_graph_ref)). Reporting policy
+    /// here whenever *any* active graph is filtered keeps `allow_unfiltered`
+    /// sound as the single canonical view-policy gate, even for callers that do
+    /// not also fold to a per-graph context first.
     pub fn has_policy(&self) -> bool {
-        self.policy_enforcer
+        let top_level = self
+            .policy_enforcer
             .as_ref()
             .map(|e| !e.is_root())
-            .unwrap_or(false)
+            .unwrap_or(false);
+        top_level || self.dataset.map(DataSet::has_any_policy).unwrap_or(false)
+    }
+
+    /// True when no view-policy filtering is required for this context — the
+    /// enforcer is absent or is the root (unrestricted) policy. The exact
+    /// negation of [`has_policy`](Self::has_policy).
+    ///
+    /// This is the single canonical predicate that protects view-policy
+    /// enforcement. The only operator that actually removes policy-hidden rows
+    /// is the range-fallback scan ([`BinaryScanOperator::filter_flakes_by_policy`]);
+    /// every fast path and raw-leaflet reader that does *not* route emitted
+    /// flakes through that filter MUST gate on `allow_unfiltered()` and decline
+    /// (fall back to the filtered scan) when it returns false. Adding a new
+    /// data-emitting operator that reads the index directly without consulting
+    /// this — or applying its own filter — is a policy leak.
+    #[inline]
+    pub fn allow_unfiltered(&self) -> bool {
+        !self.has_policy()
     }
 
     /// Get the effective overlay (NoOverlay if none set)
@@ -954,6 +1003,7 @@ impl<'a> ExecutionContext<'a> {
             tracker: self.tracker.clone(),
             cancellation: self.cancellation.clone(),
             strict_bind_errors: self.strict_bind_errors,
+            include_system_facts: self.include_system_facts,
             binary_store: self.binary_store.clone(),
             binary_g_id,
             dict_novelty: self.dict_novelty.clone(),
@@ -1008,6 +1058,7 @@ impl<'a> ExecutionContext<'a> {
             tracker: self.tracker.clone(),
             cancellation: self.cancellation.clone(),
             strict_bind_errors: self.strict_bind_errors,
+            include_system_facts: self.include_system_facts,
             binary_store: self.binary_store.clone(),
             binary_g_id,
             dict_novelty: self.dict_novelty.clone(),
@@ -1058,6 +1109,7 @@ impl<'a> ExecutionContext<'a> {
             tracker: self.tracker.clone(),
             cancellation: self.cancellation.clone(),
             strict_bind_errors: self.strict_bind_errors,
+            include_system_facts: self.include_system_facts,
             binary_store: Self::extract_binary_store(graph.snapshot),
             binary_g_id: graph.g_id,
             dict_novelty: Self::extract_dict_novelty(graph.snapshot),

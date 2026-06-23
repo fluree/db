@@ -22,10 +22,14 @@
 //! 1. **Schema bypass**: Schema flakes (rdfs:subClassOf, etc.) always allowed
 //! 2. **Candidate collection**: Policies gathered in order (property → subject → default)
 //! 3. **Class filtering**: Class policies filtered by subject membership
-//! 4. **Required subset**: If any `f:required` policy applies, only evaluate required policies
-//! 5. **Ordered evaluation**: Return `true` on first `Allow` or successful `Query`
-//! 6. **No short-circuit on Deny**: `Deny` continues to next policy, doesn't fail immediately
-//! 7. **Default fallback**: If no policies match, use `default_allow` setting
+//! 4. **Required subset**: if any `f:required` policy applies, only required
+//!    policies are evaluated (non-required allows cannot override a gate)
+//! 5. **Deny overrides**: an explicit `f:allow: false` denies immediately
+//! 6. **Combining**: required policies are AND gates — *every* required policy
+//!    must grant, so a missing allow or an `f:query` returning no rows denies
+//!    regardless of order; non-required policies use allow-overrides, where the
+//!    first `Allow` (or passing `f:query`) grants
+//! 7. **Default fallback**: if no policies match, use `default_allow` setting
 //!
 //! # Usage
 //!
@@ -56,7 +60,7 @@ pub use evaluate::{
 };
 pub use index::{build_policy_set, compute_class_check_needed, get_all_classes_for_property};
 pub use query_eval::{NoOpQueryExecutor, PolicyQueryExecutor, PolicyQueryFut};
-pub use schema::is_schema_flake;
+pub use schema::{is_schema_flake, is_schema_predicate};
 pub use types::{
     FlakePolicyEntry, PolicyAction, PolicyDecision, PolicyQuery, PolicyRestriction, PolicySet,
     PolicyValue, PolicyWrapper, PropertyPolicyEntry, TargetMode,

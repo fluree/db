@@ -18,20 +18,24 @@ impl Drop for QueryTimeoutGuard {
     }
 }
 
-struct QueryDisconnectGuard {
+/// Fires `ClientDisconnected` on the shared cancellation handle when dropped
+/// while still armed. Used by `run_query_task` for buffered requests, and by
+/// the streaming endpoint hung off the response body stream so a client that
+/// disconnects mid-execution cancels the producer at the next checkpoint.
+pub(crate) struct QueryDisconnectGuard {
     cancellation: QueryCancellation,
     disarmed: bool,
 }
 
 impl QueryDisconnectGuard {
-    fn new(cancellation: QueryCancellation) -> Self {
+    pub(crate) fn new(cancellation: QueryCancellation) -> Self {
         Self {
             cancellation,
             disarmed: false,
         }
     }
 
-    fn disarm(&mut self) {
+    pub(crate) fn disarm(&mut self) {
         self.disarmed = true;
     }
 }

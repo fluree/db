@@ -187,6 +187,10 @@ fn format_history_result(json: &serde_json::Value, format: OutputFormatKind) -> 
             "--format tsv is not supported for history queries; use json, table, or csv instead"
                 .to_string(),
         )),
+        OutputFormatKind::Ndjson => Err(CliError::Usage(
+            "--format ndjson is not supported for history queries; use json, table, or csv instead"
+                .to_string(),
+        )),
     }
 }
 

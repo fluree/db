@@ -132,7 +132,7 @@ Policy evaluation has two phases — load (read the policies relevant to this re
 
 Two practical implications:
 
-- **Target policies.** A policy with `f:onProperty` or `f:onClass` only runs on flakes whose predicate or rdf:type matches. Default policies (no targeting) run on every flake. Prefer targeting wherever it makes sense.
+- **Target policies.** A policy with `f:onProperty` or `f:onClass` only runs on flakes whose predicate or rdf:type matches. Default policies (no targeting) run on every flake. Prefer targeting wherever it makes sense. Targeting also lets the engine keep its index-metadata fast paths: a bare `COUNT` over a predicate the policy provably can't restrict is still answered without a per-flake scan (see [Policy in queries](../security/policy-in-queries.md#performance-considerations)).
 - **Keep `f:query` cheap.** Lean on identity attributes already loaded (`@type`, `f:policyClass`, role flags) rather than deep traversals.
 
 For deeper architectural detail see [Policy model and inputs](../security/policy-model.md), [Policy in queries](../security/policy-in-queries.md), and [Policy in transactions](../security/policy-in-transactions.md).
