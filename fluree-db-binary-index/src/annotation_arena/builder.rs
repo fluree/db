@@ -724,6 +724,10 @@ mod tests {
         assert_eq!(branch.leaves[1].last_edge, edge(0));
     }
 
+    // debug_assert!-only invariant: not compiled in release/`bench` profile
+    // builds (where bench-gate runs the unit tests), so gate on debug_assertions
+    // — otherwise `#[should_panic]` fails because the assert is stripped.
+    #[cfg(debug_assertions)]
     #[test]
     #[should_panic(expected = "rows must be sorted")]
     fn forward_debug_assert_catches_unsorted() {
@@ -732,6 +736,7 @@ mod tests {
         let _ = build_forward_leaves(&rows, DEFAULT_TARGET_ROWS_PER_LEAF);
     }
 
+    #[cfg(debug_assertions)]
     #[test]
     #[should_panic(expected = "rows must be sorted")]
     fn reverse_debug_assert_catches_unsorted() {

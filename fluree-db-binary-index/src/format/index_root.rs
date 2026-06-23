@@ -1614,6 +1614,10 @@ mod tests {
         );
     }
 
+    // debug_assert!-only invariant: not compiled in release/`bench` profile
+    // builds (where bench-gate runs the unit tests), so gate on debug_assertions
+    // — otherwise `#[should_panic]` fails because the assert is stripped.
+    #[cfg(debug_assertions)]
     #[test]
     #[should_panic(expected = "had_annotation_arena=false with annotation_index=Some")]
     fn fir6_encoder_debug_asserts_sticky_bit_when_arena_present() {
