@@ -99,7 +99,16 @@ where
         .join(&ledger_id_path)
         .join("tmp_import")
         .join(&session_id);
-    let index_dir = data_dir.join(&ledger_id_path).join("index");
+    // Scope the staging index dir to this rebuild's session too. Both dirs hold
+    // ephemeral, content-addressed artifacts that are read back and uploaded to
+    // the ContentStore; the canonical data lives in the CAS afterward. Without
+    // the session_id, concurrent rebuilds of the same ledger share one on-disk
+    // staging tree and a non-atomic `std::fs::write` can be observed mid-write
+    // by the other rebuild's upload read-back, surfacing as a CID mismatch.
+    let index_dir = data_dir
+        .join(&ledger_id_path)
+        .join("index")
+        .join(&session_id);
 
     tracing::info!(
         %head_commit_id,
@@ -1133,9 +1142,12 @@ where
 
             drop(_span_v3);
 
-            // Clean up ephemeral tmp_import session directory.
+            // Clean up ephemeral session directories.
             if let Err(e) = std::fs::remove_dir_all(&run_dir) {
                 tracing::warn!(?run_dir, %e, "failed to clean up tmp_import session dir");
+            }
+            if let Err(e) = std::fs::remove_dir_all(&index_dir) {
+                tracing::warn!(?index_dir, %e, "failed to clean up index session dir");
             }
 
             Ok(result)
