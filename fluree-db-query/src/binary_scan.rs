@@ -2586,19 +2586,16 @@ fn value_to_otype_okey(
                     "datatype not resolvable to OType for Double value",
                 )
             })?;
-            if d.is_finite() && d.fract() == 0.0 {
-                let as_i64 = *d as i64;
-                if (as_i64 as f64) == *d {
-                    return Ok((ot, ObjKey::encode_i64(as_i64).as_u64()));
-                }
-            }
-            if d.is_finite() {
-                match ObjKey::encode_f64(*d) {
-                    Ok(key) => Ok((ot, key.as_u64())),
-                    Err(_) => Ok((OType::NULL, 0)),
-                }
-            } else {
-                Ok((OType::NULL, 0))
+            // Do NOT optimize integral doubles to encode_i64: `ot` is the
+            // datatype-derived OType (e.g. XSD_DOUBLE), whose decode kind is F64.
+            // Pairing it with an i64-encoded key makes the reader run decode_f64
+            // over integer bits, corrupting the value to a tiny subnormal
+            // (55000.0 -> 2.71736e-319). Mirrors the encode-side guards in
+            // resolver.rs / import_sink.rs. (fluree/db-r#142)
+            match ObjKey::encode_f64(*d) {
+                Ok(key) => Ok((ot, key.as_u64())),
+                // NaN/Inf can't be order-encoded → NULL sentinel.
+                Err(_) => Ok((OType::NULL, 0)),
             }
         }
         FlakeValue::Ref(sid) => {

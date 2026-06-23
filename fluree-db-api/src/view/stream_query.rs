@@ -209,11 +209,9 @@ impl Fluree {
     }
 
     /// Streaming sibling of `execute_view_internal_with_r2rml`: builds the same
-    /// single-ledger execution context, but drives `execute_prepared_streaming`
-    /// with `sink` instead of collecting batches.
-    ///
-    /// SYNC: keep the context wiring here in step with
-    /// `execute_view_internal_with_r2rml` in `view/query.rs`.
+    /// single-ledger execution context (via the shared `view_context_config!`
+    /// macro), but drives `execute_prepared_streaming` with `sink` instead of
+    /// collecting batches.
     async fn execute_view_streaming<S: BatchSink>(
         &self,
         db: &GraphDb,
@@ -232,35 +230,20 @@ impl Fluree {
         )
         .await?;
 
-        let spatial_map = db.binary_store.as_ref().map(|s| s.spatial_provider_map());
-        let uses_fulltext = executable.uses_fulltext();
-        let fulltext_map = if uses_fulltext {
-            db.binary_store.as_ref().map(|s| s.fulltext_provider_map())
-        } else {
-            None
-        };
-        let english_lang_id = if uses_fulltext {
-            db.binary_store
-                .as_ref()
-                .and_then(|s| s.resolve_lang_id("en"))
-        } else {
-            None
-        };
-
-        let config = ContextConfig {
-            tracker: Some(tracker),
-            cancellation: options.cancellation.clone(),
-            policy_enforcer: db.policy_enforcer().cloned(),
-            binary_store: db.binary_store.clone(),
-            binary_g_id: db.graph_id,
-            dict_novelty: db.dict_novelty.clone(),
-            spatial_providers: spatial_map.as_ref(),
-            fulltext_providers: fulltext_map.as_ref(),
-            english_lang_id,
-            remote_service: self.remote_service_executor(),
-            strict_bind_errors: true,
-            ..Default::default()
-        };
+        // Wire R2RML so a graph-source query that routed through the
+        // single-ledger streaming path applies its mapping (parity with the
+        // buffered `execute_view_internal_with_r2rml`); no-op without `iceberg`
+        // and never consulted for plain queries.
+        let r2rml = crate::r2rml_provider!(self);
+        view_context_config!(
+            config,
+            self,
+            db,
+            executable,
+            tracker,
+            options,
+            Some((&r2rml, &r2rml)),
+        );
 
         execute_prepared_streaming(db_ref, vars, prepared, config, sink).await
     }
@@ -283,11 +266,11 @@ impl Fluree {
     /// Build a policy-wrapped `DataSetDb` from an explicit spec + connection
     /// options. Used by the ledger-scoped streaming SPARQL path, where the
     /// server builds the `DatasetSpec` from `FROM`/`FROM NAMED` clauses and the
-    /// `QueryConnectionOptions` from the resolved identity + policy headers.
+    /// `GovernanceOptions` from the resolved identity + policy headers.
     pub async fn build_stream_dataset_from_spec(
         &self,
         spec: &crate::DatasetSpec,
-        qc_opts: &crate::QueryConnectionOptions,
+        qc_opts: &crate::GovernanceOptions,
     ) -> Result<DataSetDb> {
         self.build_dataset_for_connection(spec, qc_opts).await
     }
@@ -298,7 +281,7 @@ impl Fluree {
     pub async fn build_stream_dataset_for_sparql(
         &self,
         sparql: &str,
-        qc_opts: &crate::QueryConnectionOptions,
+        qc_opts: &crate::GovernanceOptions,
     ) -> Result<DataSetDb> {
         let ast = crate::query::helpers::parse_and_validate_sparql(sparql)?;
         let spec = crate::query::helpers::extract_sparql_dataset_spec(&ast)?;
@@ -415,7 +398,11 @@ impl Fluree {
             buf: String::new(),
         };
 
-        let noop = crate::NoOpR2rmlProvider::new();
+        // Mirror the buffered dataset path's R2RML wiring: with `iceberg` on,
+        // a mapped graph source resolves through `FlureeR2rmlProvider` (the
+        // provider is only consulted for graph-source patterns, so plain
+        // queries pay nothing); otherwise the no-op provider stands in.
+        let r2rml = crate::r2rml_provider!(self);
         let exec = self
             .execute_dataset_into_with_r2rml(
                 &dataset,
@@ -423,8 +410,8 @@ impl Fluree {
                 &plan.executable,
                 &tracker,
                 crate::R2rmlProviders {
-                    provider: &noop,
-                    table_provider: &noop,
+                    provider: &r2rml,
+                    table_provider: &r2rml,
                 },
                 &options,
                 &mut sink,

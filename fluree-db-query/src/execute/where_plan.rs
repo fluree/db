@@ -738,6 +738,7 @@ fn apply_eligible_binds(
     pending_binds: Vec<BindPattern>,
     mut pending_filters: Vec<FilterPattern>,
     filter_idxs_consumed: &[usize],
+    planning: &PlanningContext,
 ) -> (BoxedOperator, Vec<BindPattern>, Vec<FilterPattern>) {
     let mut remaining_binds = Vec::new();
 
@@ -749,12 +750,10 @@ fn apply_eligible_binds(
                 partition_eligible_filters(pending_filters, bound, filter_idxs_consumed);
             pending_filters = still_pending;
 
-            child = Box::new(BindOperator::new(
-                child,
-                pending.var,
-                pending.expr,
-                bind_filters,
-            ));
+            child = Box::new(
+                BindOperator::new(child, pending.var, pending.expr, bind_filters)
+                    .with_planning(*planning),
+            );
         } else {
             remaining_binds.push(pending);
         }
@@ -781,6 +780,7 @@ fn apply_deferred_patterns(
         pending_binds,
         pending_filters,
         filter_idxs_consumed,
+        planning,
     );
 
     let (ready, remaining_filters) =
@@ -812,6 +812,7 @@ fn apply_all_remaining(
         pending_binds,
         pending_filters,
         filter_idxs_consumed,
+        planning,
     );
     for pending in remaining_filters {
         if !filter_idxs_consumed.contains(&pending.original_idx) {
@@ -840,12 +841,9 @@ fn build_single_pattern(
     match pattern {
         Pattern::Bind { var, expr } => {
             let child = get_or_empty_seed(operator);
-            Some(Box::new(BindOperator::new(
-                child,
-                *var,
-                expr.clone(),
-                vec![],
-            )))
+            Some(Box::new(
+                BindOperator::new(child, *var, expr.clone(), vec![]).with_planning(*planning),
+            ))
         }
         Pattern::Values { vars, rows } => {
             let child = get_or_empty_seed(operator);
@@ -1091,7 +1089,11 @@ fn build_sequential_join_block(
 
     // Tracks the running driving-chain cardinality across steps for the hash-join
     // cost model; `before_step` snapshots it against the live `bound` set per pattern.
-    let mut hash_planner = HashJoinPlanner::new(ctx.stats);
+    // Seed it from the incoming LEFT operator's estimate (e.g. a subquery producing
+    // `WITH DISTINCT friend`) so the first probe is costed against the producer size,
+    // not 1 — otherwise a large object predicate falsely trips scan-ratio-too-high.
+    let mut hash_planner = HashJoinPlanner::new(ctx.stats)
+        .with_left_estimate(operator.as_ref().and_then(|o| o.estimated_rows()));
     for (k, tp) in triples.iter().enumerate() {
         hash_planner.before_step(tp, &bound);
         let mut vars_after: HashSet<VarId> = bound.clone();
@@ -2151,8 +2153,14 @@ fn build_sequential_triple_chain(
 
     // Drives the hash-join cost model; snapshots cardinality against `seen_vars`
     // (the chain bound so far) before each pattern — see build_sequential_join_block.
-    let mut seen_vars: HashSet<VarId> = HashSet::new();
-    let mut hash_planner = HashJoinPlanner::new(ctx.stats);
+    // Both seed from the incoming LEFT operator: `seen_vars` from its bound schema
+    // (so the first probe is correctly costed as object-bound, not a full scan)
+    // and the driving estimate from its row estimate (e.g. a `WITH DISTINCT
+    // friend` subquery's ~producer size) — otherwise the first probe is weighed
+    // against 1 and a large object predicate falsely trips scan-ratio-too-high.
+    let mut seen_vars: HashSet<VarId> = bound_vars_from_operator(&operator);
+    let mut hash_planner = HashJoinPlanner::new(ctx.stats)
+        .with_left_estimate(operator.as_ref().and_then(|o| o.estimated_rows()));
     for (k, pattern) in triples.iter().enumerate() {
         hash_planner.before_step(pattern, &seen_vars);
         seen_vars.extend(pattern.produced_vars());

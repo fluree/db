@@ -82,8 +82,13 @@ impl crate::Fluree {
             strategy = strategy.as_str()
         );
         async move {
-            self.revert_inner(ledger_name, branch, RevertSource::single(commit), strategy)
-                .await
+            self.revert_inner(
+                ledger_name,
+                branch,
+                RevertSelection::single(commit),
+                strategy,
+            )
+            .await
         }
         .instrument(span)
         .await
@@ -121,10 +126,10 @@ impl crate::Fluree {
             strategy = strategy.as_str()
         );
         async move {
-            let source = RevertSource::try_set(commits).ok_or_else(|| {
+            let selection = RevertSelection::try_set(commits).ok_or_else(|| {
                 ApiError::InvalidBranch("Revert requires at least one commit".to_string())
             })?;
-            self.revert_inner(ledger_name, branch, source, strategy)
+            self.revert_inner(ledger_name, branch, selection, strategy)
                 .await
         }
         .instrument(span)
@@ -154,8 +159,13 @@ impl crate::Fluree {
             strategy = strategy.as_str()
         );
         async move {
-            self.revert_inner(ledger_name, branch, RevertSource::range(from, to), strategy)
-                .await
+            self.revert_inner(
+                ledger_name,
+                branch,
+                RevertSelection::range(from, to),
+                strategy,
+            )
+            .await
         }
         .instrument(span)
         .await
@@ -165,7 +175,7 @@ impl crate::Fluree {
         &self,
         ledger_name: &str,
         branch: &str,
-        source: RevertSource,
+        selection: RevertSelection,
         strategy: ConflictStrategy,
     ) -> Result<RevertReport> {
         match strategy {
@@ -183,7 +193,7 @@ impl crate::Fluree {
         }
 
         let ctx = self
-            .build_revert_context(ledger_name, branch, source)
+            .build_revert_context(ledger_name, branch, selection)
             .await?;
 
         if strategy == ConflictStrategy::Abort && !ctx.conflict_keys.is_empty() {
@@ -252,15 +262,15 @@ impl crate::Fluree {
         }
     }
 
-    /// Resolve `source` against `branch`'s current state, walk the DAG, build
-    /// the revert plan, and compute conflict keys — every step that
+    /// Resolve `selection` against `branch`'s current state, walk the DAG,
+    /// build the revert plan, and compute conflict keys — every step that
     /// [`Self::revert_inner`] performs *before* mutating state. Shared with the
     /// preview path.
     pub(crate) async fn build_revert_context(
         &self,
         ledger_name: &str,
         branch: &str,
-        source: RevertSource,
+        selection: RevertSelection,
     ) -> Result<RevertContext> {
         let branch_id = format_ledger_id(ledger_name, branch);
         let branch_record = self
@@ -287,8 +297,8 @@ impl crate::Fluree {
         // view — same path used by `branch create --at`.
         let branch_state = self.ledger(&branch_id).await?;
         let view = LedgerView::from_state(&branch_state);
-        let resolved = match source {
-            RevertSource::Commits(NonEmpty { head, tail }) => {
+        let resolved = match selection {
+            RevertSelection::Commits(NonEmpty { head, tail }) => {
                 let head = view.resolve_commit(head).await?;
                 let mut resolved_tail = Vec::with_capacity(tail.len());
                 for r in tail {
@@ -299,7 +309,7 @@ impl crate::Fluree {
                     tail: resolved_tail,
                 })
             }
-            RevertSource::Range { from, to } => {
+            RevertSelection::Range { from, to } => {
                 let from = view.resolve_commit(from).await?;
                 let to = view.resolve_commit(to).await?;
                 ResolvedSource::Range { from, to }
@@ -347,8 +357,12 @@ impl crate::Fluree {
             graph_delta,
         } = collect_from_commits(commits, |f| f.invert_at(0));
 
-        let target_state = self
-            .load_queryable_state_with_store(branch_store.clone(), branch_record)
+        // Acquire state under the ledger write lock when a manager is
+        // available, serializing with regular transactions. Without a
+        // manager (embedded use with no shared cache), fall back to a
+        // fresh storage load — there's nothing to protect against.
+        let (write_guard, target_state) = self
+            .lock_or_load(branch_id, branch_store.clone(), branch_record)
             .await?;
 
         let staged = self
@@ -400,7 +414,7 @@ impl crate::Fluree {
 
         let content_store = self.content_store(branch_id);
         let publisher = self.publisher()?;
-        let (receipt, _new_state) = fluree_db_transact::commit(
+        let (receipt, new_state) = fluree_db_transact::commit(
             view,
             ns_registry,
             &content_store,
@@ -409,6 +423,12 @@ impl crate::Fluree {
             commit_opts,
         )
         .await?;
+
+        if let Some(guard) = write_guard {
+            let needs_reindex = new_state.should_reindex(&self.index_config);
+            self.finalize_commit(guard, new_state, receipt.t, needs_reindex)
+                .await?;
+        }
 
         Ok(RevertWriteOutcome::Wrote(receipt))
     }
@@ -420,25 +440,26 @@ impl crate::Fluree {
 
 /// Caller-supplied source of the commit list, with [`CommitRef`]s still
 /// unresolved.
-pub(crate) enum RevertSource {
+#[derive(Clone, Debug)]
+pub enum RevertSelection {
     Commits(NonEmpty<CommitRef>),
     Range { from: CommitRef, to: CommitRef },
 }
 
-impl RevertSource {
+impl RevertSelection {
     /// Wrap a single [`CommitRef`] as a one-element source.
-    pub(crate) fn single(commit: CommitRef) -> Self {
+    pub fn single(commit: CommitRef) -> Self {
         Self::Commits(NonEmpty::from(commit))
     }
 
     /// Wrap a non-empty list of [`CommitRef`]s; returns `None` if `commits`
     /// is empty so callers must validate at the boundary.
-    pub(crate) fn try_set(commits: Vec<CommitRef>) -> Option<Self> {
+    pub fn try_set(commits: Vec<CommitRef>) -> Option<Self> {
         NonEmpty::try_from_vec(commits).map(Self::Commits)
     }
 
     /// Build a git-style range source.
-    pub(crate) fn range(from: CommitRef, to: CommitRef) -> Self {
+    pub fn range(from: CommitRef, to: CommitRef) -> Self {
         Self::Range { from, to }
     }
 }

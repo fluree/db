@@ -26,7 +26,7 @@ use tracing::Instrument;
 
 /// Strategy for resolving conflicts when branch and source modifications
 /// overlap on the same (subject, predicate, graph) tuple.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub enum ConflictStrategy {
     /// Replay as-is, both values coexist (multi-cardinality). Default.
     #[default]
@@ -179,11 +179,6 @@ impl crate::Fluree {
         })?;
         let source_head_t = source_record.commit_t;
 
-        // Disconnect branch from ledger manager to prevent stale reads.
-        if let Some(ref lm) = self.ledger_manager {
-            lm.disconnect(&branch_id).await;
-        }
-
         // Build a BranchedContentStore for reading commits across namespaces.
         let branch_store = LedgerState::build_branched_store(
             &self.nameservice_mode,
@@ -279,12 +274,7 @@ impl crate::Fluree {
         let result = self.run_replay(&ctx).await;
 
         match result {
-            Ok(report) => {
-                if let Some(ref lm) = self.ledger_manager {
-                    lm.disconnect(&branch_id).await;
-                }
-                Ok(report)
-            }
+            Ok(report) => Ok(report),
             Err(e) => {
                 tracing::warn!(
                     branch = %branch_id,
@@ -313,6 +303,13 @@ impl crate::Fluree {
     /// The actual replay loop + finalization, extracted so the caller can
     /// wrap it in a snapshot/rollback guard.
     async fn run_replay(&self, ctx: &ReplayContext<'_>) -> Result<RebaseReport> {
+        // Acquire the target branch's write lock when a manager is
+        // available, serializing the entire replay against regular
+        // transactions on the same branch. Without a manager (embedded
+        // use, no shared cache), proceed lock-free — there's nothing to
+        // protect against.
+        let write_guard = self.lock_ledger(ctx.branch_id).await?;
+
         let mut current_state = self.ledger(ctx.source_id).await?;
 
         // Replay stages commits as writes to the branch. Start from the
@@ -378,6 +375,13 @@ impl crate::Fluree {
                     .flush_rebase_novelty(ctx.branch_id, ctx.branch_record)
                     .await?;
             }
+        }
+
+        if let Some(guard) = write_guard {
+            let needs_reindex = current_state.should_reindex(&self.index_config);
+            let commit_t = current_state.t();
+            self.finalize_commit(guard, current_state, commit_t, needs_reindex)
+                .await?;
         }
 
         Ok(report)

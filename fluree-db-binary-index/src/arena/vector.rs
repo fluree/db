@@ -46,8 +46,31 @@ use serde::{Deserialize, Serialize};
 use std::io;
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+
+/// Write `bytes` to `path` atomically: stage in a uniquely-named temp file in
+/// the same directory, then `rename` it onto `path`. A POSIX rename is atomic,
+/// so concurrent readers never observe a partially-written file. The temp name
+/// is unique per (pid, monotonic counter) so concurrent writers of the same
+/// shard never collide on the staging file.
+fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let pid = std::process::id();
+    let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("shard");
+    let tmp = match path.parent() {
+        Some(dir) => dir.join(format!(".{file_name}.tmp.{pid}.{seq}")),
+        None => PathBuf::from(format!(".{file_name}.tmp.{pid}.{seq}")),
+    };
+    // Clean up the staging file on any failure (write or rename) so a mid-write
+    // error doesn't leave an orphaned temp file behind.
+    let staged = std::fs::write(&tmp, bytes).and_then(|()| std::fs::rename(&tmp, path));
+    if staged.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    staged
+}
 
 /// Maximum vectors per shard. At 768-dim f32 each shard ≈ 9 MB.
 pub const SHARD_CAPACITY: u32 = 3072;
@@ -720,7 +743,7 @@ impl LazyVectorArena {
         // Sync→async bridge via the shared `run_sync_on_runtime` helper, which
         // uses `block_in_place(handle.block_on)` on a multi-thread runtime (a
         // replacement worker keeps driving the reactor while this thread
-        // blocks) and a self-contained helper runtime on current-thread. The
+        // blocks) and a process-wide helper runtime when needed. The
         // previous `std::thread::spawn` + outer-`Handle::block_on` + `rx.recv()`
         // had no `block_in_place`, so on a small runtime every worker could park
         // in `recv()` with no thread left to drive the reactor — the same wedge
@@ -729,15 +752,38 @@ impl LazyVectorArena {
         let cs = Arc::clone(cas);
         let cid = cid.clone();
         let path = source.path.clone();
+        // Bound the fetch with the same `cas_sync_timeout()` the index-leaf and
+        // dict-pack bridges use, so a stalled remote (S3) GET fails fast instead
+        // of blocking the waiting thread indefinitely.
+        let timeout = crate::read::binary_index_store::cas_sync_timeout();
         let bytes = crate::read::binary_index_store::run_sync_on_runtime(async move {
-            cs.get(&cid)
-                .await
-                .map_err(|e| io::Error::other(e.to_string()))
+            let fut = cs.get(&cid);
+            if let Some(dur) = timeout {
+                tokio::time::timeout(dur, fut)
+                    .await
+                    .map_err(|_| {
+                        io::Error::other(format!(
+                            "vector shard CAS fetch timed out after {}ms (cid={})",
+                            dur.as_millis(),
+                            cid
+                        ))
+                    })?
+                    .map_err(|e| io::Error::other(e.to_string()))
+            } else {
+                fut.await.map_err(|e| io::Error::other(e.to_string()))
+            }
         })?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(&path, &bytes)?;
+        // Publish atomically: write to a unique temp file in the same directory,
+        // then rename onto the final path. Without this, two concurrent
+        // `ensure_on_disk` calls for the same shard (e.g. a cached `lookup_vector`
+        // racing a transient streaming scan) both `fs::write` the same path, and a
+        // reader can observe a half-written file — surfacing as
+        // "vector shard too small for header". A POSIX rename is atomic, so a
+        // reader always sees a complete shard once this returns.
+        write_atomic(&path, &bytes)?;
         source.on_disk.store(true, Ordering::Release);
         Ok(())
     }

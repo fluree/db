@@ -2586,7 +2586,7 @@ impl crate::Fluree {
         let verified = crate::credential::verify_credential(credential)?;
 
         // Build policy context with verified identity
-        let opts = crate::QueryConnectionOptions {
+        let opts = crate::GovernanceOptions {
             identity: Some(verified.did.clone()),
             ..Default::default()
         };

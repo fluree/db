@@ -8,7 +8,7 @@
 mod support;
 
 use fluree_db_api::config_resolver;
-use fluree_db_api::{FlureeBuilder, QueryConnectionOptions};
+use fluree_db_api::{FlureeBuilder, GovernanceOptions};
 use serde_json::json;
 use support::genesis_ledger;
 
@@ -214,7 +214,7 @@ async fn policy_defaults_apply() {
     // 4. Verify config defaults actually flow through merge_policy_opts:
     //    empty opts → config's defaultAllow and policyClass should be applied
     let resolved = view.resolved_config().expect("resolved config");
-    let empty_opts = QueryConnectionOptions::default();
+    let empty_opts = GovernanceOptions::default();
     let merged = config_resolver::merge_policy_opts(resolved, &empty_opts, None);
     assert!(
         !merged.default_allow,
@@ -530,7 +530,7 @@ async fn override_control_none_blocks() {
 
     // 4. Check that merge_policy_opts respects OverrideNone:
     //    Even with opts specifying default_allow=true, the config should win
-    let opts_with_override = QueryConnectionOptions {
+    let opts_with_override = GovernanceOptions {
         default_allow: true,
         ..Default::default()
     };
@@ -591,7 +591,7 @@ async fn override_control_identity_restricted() {
     );
 
     // Test actual gating behavior via merge_policy_opts
-    let opts = QueryConnectionOptions {
+    let opts = GovernanceOptions {
         default_allow: true,
         ..Default::default()
     };
@@ -2714,7 +2714,7 @@ async fn policy_source_unknown_graph_fails_closed() {
         .expect("config write");
     let ledger = r2.ledger;
 
-    let opts = QueryConnectionOptions::default();
+    let opts = GovernanceOptions::default();
     let err = fluree_db_api::build_policy_context(
         &ledger.snapshot,
         ledger.novelty.as_ref(),
@@ -2777,7 +2777,7 @@ async fn policy_source_cross_ledger_fails_closed() {
         .expect("config write");
     let ledger = r2.ledger;
 
-    let opts = QueryConnectionOptions::default();
+    let opts = GovernanceOptions::default();
     let err = fluree_db_api::build_policy_context(
         &ledger.snapshot,
         ledger.novelty.as_ref(),

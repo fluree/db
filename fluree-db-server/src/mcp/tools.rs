@@ -195,7 +195,7 @@ impl FlureeToolService {
         let mut envelope = crate::query_control::run_query_task(timeout_ms, move || async move {
             let envelope = match identity.as_deref() {
                 Some(id) => {
-                    let opts = fluree_db_api::QueryConnectionOptions {
+                    let opts = fluree_db_api::GovernanceOptions {
                         identity: Some(id.to_string()),
                         ..Default::default()
                     };

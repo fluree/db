@@ -251,6 +251,12 @@ if (!sawTerminal) throw new Error("stream truncated before terminal record");
 
 ### Rust (reqwest)
 
+This is an HTTP *client* consuming the endpoint over the wire. To produce the
+same NDJSON stream **in-process** from the `fluree-db-api` library (without the
+HTTP server), use `Fluree::plan_stream_query` + `run_stream_query` — see
+[Streaming query results (NDJSON)](../getting-started/rust-api.md#streaming-query-results-ndjson)
+in the Rust library guide.
+
 ```rust
 let resp = client
     .post(format!("{base}/v1/fluree/stream/query/{ledger}"))
@@ -278,6 +284,29 @@ while let Some(line) = lines.next_line().await? {
 }
 anyhow::ensure!(saw_terminal, "stream truncated before terminal record");
 ```
+
+### CLI (`fluree query --format ndjson`)
+
+The [`fluree query`](../cli/query.md) command consumes this stream for you.
+`--format ndjson` prints one **bare** binding object per line (the inner `row`
+body, with `head`/`heartbeat`/terminal consumed internally); add `--envelope`
+to print the full record protocol verbatim. The CLI exits non-zero on an `error`
+terminal or a truncated stream, and exits cleanly on a closed downstream pipe.
+
+```bash
+# bare rows, jq-friendly
+fluree query --format ndjson 'SELECT ?name WHERE { ?s <http://example.org/name> ?name }'
+
+# verbatim protocol (head/row/heartbeat/end/error)
+fluree query --remote origin --format ndjson --envelope -f big-select.rq
+```
+
+For a **local** ledger the CLI drives the in-process producer
+(`run_stream_query`) directly; with `--remote` it POSTs to this endpoint and
+streams the response. Time travel (`--at`) and per-request policy on the
+streaming path are supported only via `--remote` (they route through the
+server's dataset path). See [`fluree query`](../cli/query.md#ndjson-streaming)
+for the full scope.
 
 ## Relationship to `/query`
 

@@ -89,16 +89,26 @@ fn confirm_large_transfer(estimated_bytes: u64) -> bool {
     trimmed.is_empty() || trimmed == "y" || trimmed == "yes"
 }
 
-fn map_sync_auth_error(remote: &str, err: &str) -> Option<CliError> {
-    // `fluree-db-nameservice-sync` reports remote failures as strings; match the common
-    // permission-related server errors and provide a clearer CLI message.
-    if err.contains("401")
-        || err.contains("403")
+/// Whether a remote error string indicates an auth/permission failure
+/// (expired or insufficient token). `fluree-db-nameservice-sync` reports
+/// remote failures as strings, so we match on the common server messages.
+///
+/// The HTTP status checks match the canonical reason phrase (e.g.
+/// `401 Unauthorized`) rather than the bare code: the sync client always
+/// renders statuses via reqwest's `StatusCode` Display, and the error
+/// strings interpolate the request URL and response body, so a bare `401`
+/// could false-match a port or ledger name that merely contains those digits.
+fn is_replication_auth_error(err: &str) -> bool {
+    err.contains("401 Unauthorized")
+        || err.contains("403 Forbidden")
         || err.contains("Bearer token required")
         || err.contains("Untrusted issuer")
         || err.contains("Token lacks storage proxy permissions")
         || err.contains("Storage proxy not enabled")
-    {
+}
+
+fn map_sync_auth_error(remote: &str, err: &str) -> Option<CliError> {
+    if is_replication_auth_error(err) {
         Some(replication_permission_error(remote))
     } else {
         None
@@ -472,6 +482,15 @@ pub async fn run_pull(ledger: Option<&str>, no_indexes: bool, dirs: &FlureeDir) 
                                         return Ok(());
                                     }
                                     Err(e) => {
+                                        let msg = e.to_string();
+                                        if is_replication_auth_error(&msg) {
+                                            // Token expired mid-transfer: falling back to a
+                                            // paginated export would just 401 again. Fail fast
+                                            // with the re-login guidance.
+                                            return Err(replication_permission_error(
+                                                upstream.remote.as_str(),
+                                            ));
+                                        }
                                         eprintln!(
                                             "  {} pack import failed: {e}, falling back to paginated export",
                                             "warning:".yellow().bold()
@@ -566,13 +585,8 @@ pub async fn run_pull(ledger: Option<&str>, no_indexes: bool, dirs: &FlureeDir) 
     let count = to_import.len();
 
     // Import incrementally (validates chain, ancestry, writes blobs, advances head, updates novelty).
-    let handle = fluree
-        .ledger_cached(&ledger_id)
-        .await
-        .map_err(|e| CliError::Config(format!("failed to load ledger: {e}")))?;
-
     let result = fluree
-        .import_commits_incremental(&handle, to_import, all_blobs)
+        .import_commits_incremental(&ledger_id, to_import, all_blobs)
         .await
         .map_err(|e| CliError::Config(format!("pull failed (import): {e}")))?;
 
@@ -1176,6 +1190,13 @@ pub async fn run_clone(
                                         eprint!("  fetched {objects} object(s) via pack\r");
                                     }
                                     Err(e) => {
+                                        let msg = e.to_string();
+                                        if is_replication_auth_error(&msg) {
+                                            // Token expired mid-transfer: falling back to a
+                                            // paginated export would just 401 again. Fail fast
+                                            // with the re-login guidance.
+                                            return Err(replication_permission_error(remote_name));
+                                        }
                                         eprintln!(
                                             "  {} pack import failed: {e}, falling back to paginated export",
                                             "warning:".yellow().bold()

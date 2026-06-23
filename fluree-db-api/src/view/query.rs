@@ -826,41 +826,15 @@ impl Fluree {
             .await
             .map_err(query_error_to_api_error)?;
 
-        let spatial_map = db.binary_store.as_ref().map(|s| s.spatial_provider_map());
-        // Perf guardrail: skip fulltext arena map + `"en"` lang_id resolution
-        // for queries that don't actually call `fulltext(...)`. The setup
-        // cost (HashMap clone over every (graph, predicate, language) arena
-        // plus one lang dict probe) is real on wide ledgers — an unrelated
-        // query shouldn't pay it.
-        let uses_fulltext = executable.uses_fulltext();
-        let fulltext_map = if uses_fulltext {
-            db.binary_store.as_ref().map(|s| s.fulltext_provider_map())
-        } else {
-            None
-        };
-        let english_lang_id = if uses_fulltext {
-            db.binary_store
-                .as_ref()
-                .and_then(|s| s.resolve_lang_id("en"))
-        } else {
-            None
-        };
-
-        let config = ContextConfig {
-            tracker: Some(tracker),
-            cancellation: options.cancellation.clone(),
-            policy_enforcer: db.policy_enforcer().cloned(),
-            r2rml: Some((r2rml.provider, r2rml.table_provider)),
-            binary_store: db.binary_store.clone(),
-            binary_g_id: db.graph_id,
-            dict_novelty: db.dict_novelty.clone(),
-            spatial_providers: spatial_map.as_ref(),
-            fulltext_providers: fulltext_map.as_ref(),
-            english_lang_id,
-            remote_service: self.remote_service_executor(),
-            strict_bind_errors: true,
-            ..Default::default()
-        };
+        view_context_config!(
+            config,
+            self,
+            db,
+            executable,
+            tracker,
+            options,
+            Some((r2rml.provider, r2rml.table_provider)),
+        );
 
         execute_prepared(db_ref, vars, prepared, config)
             .await
@@ -907,41 +881,15 @@ impl Fluree {
         let prepare_config = PrepareConfig::current(db.binary_store.as_ref());
         let prepared = prepare_execution_with_config(db_ref, executable, &prepare_config).await?;
 
-        let spatial_map = db.binary_store.as_ref().map(|s| s.spatial_provider_map());
-        // Perf guardrail: skip fulltext arena map + `"en"` lang_id resolution
-        // for queries that don't actually call `fulltext(...)`. The setup
-        // cost (HashMap clone over every (graph, predicate, language) arena
-        // plus one lang dict probe) is real on wide ledgers — an unrelated
-        // query shouldn't pay it.
-        let uses_fulltext = executable.uses_fulltext();
-        let fulltext_map = if uses_fulltext {
-            db.binary_store.as_ref().map(|s| s.fulltext_provider_map())
-        } else {
-            None
-        };
-        let english_lang_id = if uses_fulltext {
-            db.binary_store
-                .as_ref()
-                .and_then(|s| s.resolve_lang_id("en"))
-        } else {
-            None
-        };
-
-        let config = ContextConfig {
-            tracker: Some(tracker),
-            cancellation: options.cancellation.clone(),
-            policy_enforcer: db.policy_enforcer().cloned(),
-            r2rml: Some((r2rml.provider, r2rml.table_provider)),
-            binary_store: db.binary_store.clone(),
-            binary_g_id: db.graph_id,
-            dict_novelty: db.dict_novelty.clone(),
-            spatial_providers: spatial_map.as_ref(),
-            fulltext_providers: fulltext_map.as_ref(),
-            english_lang_id,
-            remote_service: self.remote_service_executor(),
-            strict_bind_errors: true,
-            ..Default::default()
-        };
+        view_context_config!(
+            config,
+            self,
+            db,
+            executable,
+            tracker,
+            options,
+            Some((r2rml.provider, r2rml.table_provider)),
+        );
 
         execute_prepared(db_ref, vars, prepared, config).await
     }

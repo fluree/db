@@ -67,6 +67,8 @@ Auth Status:
 
 Store a bearer token for a remote. The token is saved in `.fluree/config.toml` and will be sent as a `Authorization: Bearer` header on subsequent remote operations (`fetch`, `pull`, `push`, `query --remote`, etc.).
 
+> **Which path do I use?** If the remote is backed by an identity provider (`auth.type = "oidc_device"`, auto-discovered), `fluree auth login` runs an interactive browser/device login for you — see [OIDC login flow](#oidc-login-flow) below; you do **not** pass `--token`. The `--token` options documented here are for manually supplying a token you already have, such as a locally-created Ed25519 JWS (`fluree token create`) or a service-account token for automation.
+
 ### Usage
 
 ```bash
@@ -183,7 +185,7 @@ When `--remote` is omitted:
 
 ## Security Notes
 
-- Tokens are stored in plaintext in `.fluree/config.toml`. Protect this file with appropriate filesystem permissions.
+- Tokens are stored in plaintext in `.fluree/config.toml`. On Unix, the CLI restricts the config file to `0600` and the `.fluree` directory to `0700` (owner-only) whenever it writes token material, so the file is not group/world-readable. On other platforms, protect the file with appropriate filesystem permissions yourself.
 - The `status` command never displays the raw token value.
 - On 401 errors from remote operations, the CLI checks token expiry and suggests `fluree auth login` if the token appears expired.
 
@@ -197,6 +199,39 @@ When a remote is configured with `auth.type = "oidc_device"` (auto-discovered fr
    - Otherwise, if it includes `authorization_endpoint`: use OAuth authorization-code + PKCE (opens a browser and receives a localhost callback).
 3. Exchanges the IdP token for a Fluree-scoped Bearer token via the server's `exchange_url`
 4. Stores the token (and optional refresh token) in the remote config
+
+If the IdP grants fewer scopes than were requested, the CLI prints a warning at login (the downgraded token still works, but a missing scope would otherwise surface later as an unrelated authorization failure). If the exchange returns no refresh token, the CLI notes that you will need to re-run `fluree auth login` when the token expires.
+
+### End-to-end walkthrough
+
+```bash
+# 1. Add the remote (auth type is auto-discovered from /.well-known/fluree.json)
+fluree remote add origin https://db.example.com
+
+# 2. Log in — opens a browser (PKCE) or prints a device code, then exchanges for a Fluree token
+fluree auth login --remote origin
+#   Discovering OIDC endpoints...
+#   >> Open this URL and enter the code below:  (device flow)
+#   ...or a browser window opens automatically  (PKCE flow)
+#   IdP authentication successful
+#   Exchanging for Fluree token...
+#   Token stored for remote 'origin'
+
+# 3. Use the remote
+fluree pull --remote origin
+```
+
+When the stored token later expires, data-plane commands (`query`, `insert`, …) auto-refresh silently if a refresh token is present; otherwise, or for replication commands, re-run `fluree auth login --remote origin`.
+
+### Automation / headless environments
+
+The browser (PKCE) flow needs a loopback callback port and, for most IdPs, an interactive browser — neither is available in CI or containers. For automation, **do not use the browser flow**; instead provision a service-account token and supply it directly:
+
+```bash
+fluree token create --private-key @~/.fluree/key --all | fluree auth login --remote origin --token @-
+```
+
+If you must use PKCE non-interactively, note that the callback listener only binds ports `8400`–`8405` (override with `redirect_port` in `/.well-known/fluree.json` or the `FLUREE_AUTH_PORT` env var). The port cannot be OS-assigned because the callback URL must be pre-allowlisted at the IdP (see the Cognito note below).
 
 ### Cognito note (Authorization Code + PKCE)
 

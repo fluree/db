@@ -126,10 +126,10 @@ impl PolicyArgs {
         }
     }
 
-    /// Convert into a `QueryConnectionOptions` usable by the fluree-db-api.
+    /// Convert into a `GovernanceOptions` usable by the fluree-db-api.
     /// Returns an error if `--policy` or `--policy-values` failed to parse.
-    pub fn to_options(&self) -> Result<fluree_db_api::QueryConnectionOptions, String> {
-        Ok(fluree_db_api::QueryConnectionOptions {
+    pub fn to_options(&self) -> Result<fluree_db_api::GovernanceOptions, String> {
+        Ok(fluree_db_api::GovernanceOptions {
             identity: self.identity.clone(),
             policy_class: if self.policy_class.is_empty() {
                 None
@@ -139,7 +139,6 @@ impl PolicyArgs {
             policy: self.resolve_policy()?,
             policy_values: self.resolve_policy_values()?,
             default_allow: self.default_allow,
-            tracking: Default::default(),
         })
     }
 }
@@ -457,9 +456,19 @@ pub enum Commands {
         #[arg(short = 'f', long = "file")]
         file: Option<PathBuf>,
 
-        /// Output format (json, typed-json, table, csv, or tsv)
+        /// Output format (json, typed-json, table, csv, tsv, or ndjson)
+        ///
+        /// `ndjson` streams SELECT results incrementally as newline-delimited
+        /// JSON (one binding object per line) instead of buffering the whole
+        /// result set — use it for large result sets and unix pipelines.
         #[arg(long, default_value = "table")]
         format: String,
+
+        /// With `--format ndjson`, emit the full streaming record protocol
+        /// (head / row / heartbeat / end / error) verbatim instead of bare
+        /// binding objects. Useful for debugging and detecting truncation.
+        #[arg(long)]
+        envelope: bool,
 
         /// Normalize arrays: always wrap multi-value properties in arrays (expansion only)
         #[arg(long)]
