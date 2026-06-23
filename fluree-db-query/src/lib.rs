@@ -84,6 +84,7 @@ pub mod rewrite;
 pub mod rewrite_owl_ql;
 pub mod s2_search;
 pub mod schema_bundle;
+pub mod search_readability;
 pub mod seed;
 pub(crate) mod semijoin;
 pub mod service;

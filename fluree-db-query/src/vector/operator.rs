@@ -94,6 +94,17 @@ pub trait VectorIndexProvider: std::fmt::Debug + Send + Sync {
 
     /// Check if a collection exists for the given graph source alias
     async fn collection_exists(&self, graph_source_id: &str) -> Result<bool>;
+
+    /// The embedding property IRI this graph source indexes, if known.
+    ///
+    /// Used to enforce view policy on search hits: a hit is kept only if the
+    /// identity can view the subject's flake on this property (the embedded
+    /// content that produced the match). Providers that can't surface it (e.g.
+    /// dedicated/remote search services) return `None`, which disables the
+    /// per-hit readability check for them.
+    async fn embedding_property(&self, _graph_source_id: &str) -> Result<Option<String>> {
+        Ok(None)
+    }
 }
 
 /// Vector search operator for `Pattern::VectorSearch`.
@@ -112,6 +123,10 @@ pub struct VectorSearchOperator {
     state: OperatorState,
     /// Variables required by downstream operators; if set, output is trimmed.
     out_schema: Option<Arc<[VarId]>>,
+    /// Expanded embedding-property IRI for this graph source (resolved in
+    /// `open()`), used to enforce view policy on emitted hits. `None` when the
+    /// provider doesn't expose it (e.g. dedicated/remote search).
+    embedding_property: Option<String>,
 }
 
 impl VectorSearchOperator {
@@ -149,6 +164,7 @@ impl VectorSearchOperator {
             datatypes: WellKnownDatatypes::new(),
             state: OperatorState::Created,
             out_schema: None,
+            embedding_property: None,
         }
     }
 
@@ -210,12 +226,17 @@ impl Operator for VectorSearchOperator {
     async fn open(&mut self, ctx: &ExecutionContext<'_>) -> Result<()> {
         self.child.open(ctx).await?;
 
-        let _provider = ctx.vector_provider.ok_or_else(|| {
+        let provider = ctx.vector_provider.ok_or_else(|| {
             QueryError::InvalidQuery(
                 "VectorSearch requires ExecutionContext.vector_provider (not configured)"
                     .to_string(),
             )
         })?;
+
+        // Resolve the embedding property for view-policy enforcement on hits.
+        self.embedding_property = provider
+            .embedding_property(&self.pattern.graph_source_id)
+            .await?;
 
         // If target is a variable, ensure it's available from the child schema.
         if let VectorSearchTarget::Var(v) = &self.pattern.target {
@@ -297,6 +318,18 @@ impl Operator for VectorSearchOperator {
 
             // For each search result, merge with the child row.
             for hit in results {
+                // View-policy enforcement: drop hits whose embedded content the
+                // identity cannot view. With no known embedding property the
+                // searched content is ambiguous, so under a policy the hit is
+                // hidden conservatively (empty predicate list => allowed with no
+                // policy, hidden under one).
+                let preds: Vec<&str> = self.embedding_property.as_deref().into_iter().collect();
+                if !crate::search_readability::search_hit_readable(ctx, hit.iri.as_ref(), &preds)
+                    .await?
+                {
+                    continue;
+                }
+
                 // Create IriMatch binding for correct cross-ledger joins.
                 // The hit already contains the canonical IRI and ledger alias.
                 // IMPORTANT: Encode SID using the hit's source ledger (not primary db)

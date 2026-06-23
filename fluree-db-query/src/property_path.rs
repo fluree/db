@@ -27,6 +27,7 @@
 //! full-closure enumeration which can be extremely expensive. If full closure
 //! is needed, the query should explicitly bind one side first.
 
+use crate::binary_scan::BinaryScanOperator;
 use crate::binding::{Batch, Binding};
 use crate::context::ExecutionContext;
 use crate::error::{QueryError, Result};
@@ -38,7 +39,7 @@ use crate::operator::{
 use crate::var_registry::VarId;
 use async_trait::async_trait;
 use fluree_db_core::{
-    range_with_overlay, FlakeValue, IndexType, RangeMatch, RangeOptions, RangeTest, Sid,
+    range_with_overlay, Flake, FlakeValue, IndexType, RangeMatch, RangeOptions, RangeTest, Sid,
 };
 use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
@@ -157,6 +158,7 @@ impl PropertyPathOperator {
                 RangeOptions::new().with_to_t(to_t),
             )
             .await?;
+            let flakes = self.filter_edges(ctx, flakes).await?;
             for flake in flakes {
                 if let FlakeValue::Ref(o) = flake.o {
                     out.push(o);
@@ -185,11 +187,32 @@ impl PropertyPathOperator {
                 RangeOptions::new().with_to_t(to_t),
             )
             .await?;
+            let flakes = self.filter_edges(ctx, flakes).await?;
             for flake in flakes {
                 out.push(flake.s);
             }
         }
         Ok(out)
+    }
+
+    /// Apply view-policy filtering to a batch of edge flakes read during path
+    /// traversal.
+    ///
+    /// Property paths read edges directly via `range_with_overlay`, which (like
+    /// every raw-leaflet reader) bypasses the per-flake `filter_flakes` policy
+    /// filtering that scan operators apply. Without this, a non-root view policy
+    /// would let traversal visit and emit subjects/edges the policy hides. Hidden
+    /// edges are removed here so the path neither traverses them nor reaches the
+    /// nodes behind them, matching the per-flake semantics of the scan path.
+    /// No-op for root / no policy (the filter short-circuits).
+    async fn filter_edges(
+        &self,
+        ctx: &ExecutionContext<'_>,
+        flakes: Vec<Flake>,
+    ) -> Result<Vec<Flake>> {
+        let (db, overlay, to_t) = ctx.require_single_graph()?;
+        BinaryScanOperator::filter_flakes_by_policy(ctx, db, overlay, to_t, ctx.binary_g_id, flakes)
+            .await
     }
 
     /// Traverse forward from a starting node (subject bound)
@@ -324,6 +347,7 @@ impl PropertyPathOperator {
                 RangeOptions::new().with_to_t(to_t),
             )
             .await?;
+            let flakes = self.filter_edges(ctx, flakes).await?;
             for flake in flakes {
                 if let FlakeValue::Ref(o) = flake.o {
                     nodes.insert(flake.s.clone());

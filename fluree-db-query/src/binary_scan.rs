@@ -1676,7 +1676,7 @@ impl Operator for BinaryScanOperator {
         // and class-cache population. The binary cursor path currently does not
         // apply policy filtering, so force the range fallback when a non-root
         // policy enforcer is present.
-        if ctx.policy_enforcer.as_ref().is_some_and(|p| !p.is_root()) {
+        if !ctx.allow_unfiltered() {
             return self.open_range_fallback(ctx).await;
         }
 

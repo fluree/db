@@ -275,6 +275,34 @@ impl PolicySet {
 
         candidates
     }
+
+    /// True if any materialized restriction in this set *could* apply to a flake
+    /// whose predicate is `p`.
+    ///
+    /// When this returns `false`, every `evaluate_flake*` call for a `p`-flake is
+    /// guaranteed to collect no candidate entries (see
+    /// [`policy_entries_for_flake`](Self::policy_entries_for_flake)) and therefore
+    /// fall to the empty-candidates branch that returns the wrapper's
+    /// `default_allow` constant — independent of the flake's subject, object, or
+    /// subject classes. A fast path can use that to skip the per-flake filter
+    /// (keeping the fast path when `default_allow` is true, or short-circuiting to
+    /// an empty result when it is false).
+    ///
+    /// Soundness: this inspects the *built* index buckets that
+    /// `policy_entries_for_flake` itself reads — `by_property` (which `f:onClass`
+    /// policies are pre-expanded into at build time), plus the predicate-agnostic
+    /// `by_subject` and `defaults`. It never derives coverage from the raw
+    /// `restrictions`/`for_classes`, so a `false` verdict is a faithful
+    /// optimization of the per-flake evaluator and can never disagree with it
+    /// (even when class policies were expanded under absent stats). Schema
+    /// predicates always report `true` so the per-flake `is_schema_flake` bypass
+    /// keeps firing rather than being constant-folded away.
+    pub fn covers_predicate(&self, p: &Sid) -> bool {
+        crate::schema::is_schema_predicate(p)
+            || self.by_property.contains_key(p)
+            || !self.by_subject.is_empty()
+            || !self.defaults.is_empty()
+    }
 }
 
 /// Inner data for PolicyWrapper (Arc-wrapped for cheap cloning)
@@ -449,5 +477,46 @@ mod tests {
             set.restrictions_for_flake(&make_sid(100, "alice"), &make_sid(100, "age"));
         assert_eq!(other_candidates.len(), 1);
         assert_eq!(other_candidates[0].id, "default-1");
+    }
+
+    #[test]
+    fn test_covers_predicate() {
+        use fluree_vocab::namespaces::{RDF, RDFS};
+
+        // Empty set: a regular predicate is provably uncovered...
+        let empty = PolicySet::new();
+        assert!(!empty.covers_predicate(&make_sid(100, "name")));
+        // ...but schema predicates always report covered so the per-flake
+        // is_schema_flake bypass keeps firing.
+        assert!(empty.covers_predicate(&make_sid(RDFS, "subClassOf")));
+        assert!(empty.covers_predicate(&make_sid(RDF, "type")));
+
+        // A by_property entry (this is also where f:onClass policies are
+        // pre-expanded) covers exactly its predicate, nothing else.
+        let mut by_prop = PolicySet::new();
+        by_prop
+            .by_property
+            .entry(make_sid(100, "ssn"))
+            .or_default()
+            .push(PropertyPolicyEntry {
+                idx: 0,
+                class_check_needed: false,
+            });
+        assert!(by_prop.covers_predicate(&make_sid(100, "ssn")));
+        assert!(!by_prop.covers_predicate(&make_sid(100, "name")));
+
+        // Predicate-agnostic buckets force "covered" for every predicate, since
+        // any subject/default entry can match a flake of any predicate.
+        let mut by_subj = PolicySet::new();
+        by_subj
+            .by_subject
+            .entry(make_sid(100, "alice"))
+            .or_default()
+            .push(0);
+        assert!(by_subj.covers_predicate(&make_sid(100, "name")));
+
+        let mut with_default = PolicySet::new();
+        with_default.defaults.push(0);
+        assert!(with_default.covers_predicate(&make_sid(100, "name")));
     }
 }

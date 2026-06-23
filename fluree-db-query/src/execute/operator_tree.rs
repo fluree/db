@@ -2761,10 +2761,31 @@ fn build_operator_tree_inner(
     if !planning.is_history() {
         if let Some(ref stats_view) = stats {
             if let Some((pred_var, count_var)) = detect_stats_count_by_predicate(query) {
+                // Build the policy-enforced fallback: the same query as a generic
+                // GROUP BY, producing the operator's internal `[pred, count]`
+                // schema (output forced to those two vars; ORDER BY / LIMIT /
+                // OFFSET stripped, since those wrap the stats operator below).
+                // Recurse with stats disabled so this fast path isn't re-entered.
+                // The operator streams from this fallback when a view policy is
+                // active (the whole-index stats counts can't be trusted then).
+                let mut fallback_query = query.clone();
+                fallback_query.output = QueryOutput::select_all(vec![pred_var, count_var]);
+                fallback_query.ordering = Vec::new();
+                fallback_query.order_binds = Vec::new();
+                fallback_query.limit = None;
+                fallback_query.offset = None;
+                let fallback = build_operator_tree_inner(
+                    &fallback_query,
+                    None,
+                    enable_fused_fast_paths,
+                    planning,
+                )?;
+
                 let mut operator: BoxedOperator = Box::new(StatsCountByPredicateOperator::new(
                     Arc::clone(stats_view),
                     pred_var,
                     count_var,
+                    Some(fallback),
                 ));
 
                 // ORDER BY (on predicate or count)

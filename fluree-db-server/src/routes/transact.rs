@@ -1650,10 +1650,48 @@ async fn execute_turtle_transaction(
             }
         };
 
-        let commit_opts = build_commit_opts(author, credential, &state.fluree, &handle);
+        // Turtle/TriG bodies carry no `opts`, so all policy inputs come from
+        // the fluree-identity / fluree-policy / fluree-policy-class /
+        // fluree-policy-values / fluree-default-allow headers — the same
+        // header-only path the SPARQL UPDATE route uses. The consensus layer
+        // builds the PolicyContext from this governance against the staged
+        // ledger state and enforces f:modify on the write.
+        let effective_identity = crate::routes::policy_auth::resolve_sparql_identity(
+            state,
+            ledger_id,
+            author,
+            headers.identity.as_deref(),
+        )
+        .await;
 
-        // Turtle/TriG carries no body `opts`, so policy runs under root.
-        // Tracking, however, is header-driven and applies to every format.
+        let policy_values_map = match headers.policy_values_map() {
+            Ok(v) => v,
+            Err(e) => {
+                set_span_error_code(&span, "error:BadRequest");
+                tracing::warn!(error = %e, "invalid fluree-policy-values header");
+                return Err(e);
+            }
+        };
+        let governance = GovernanceOptions {
+            identity: effective_identity.clone(),
+            policy_class: if headers.policy_class.is_empty() {
+                None
+            } else {
+                Some(headers.policy_class.clone())
+            },
+            policy: headers.policy.clone(),
+            policy_values: policy_values_map,
+            default_allow: headers.default_allow,
+        };
+
+        let commit_opts = build_commit_opts(
+            effective_identity.as_deref(),
+            credential,
+            &state.fluree,
+            &handle,
+        );
+
+        // Tracking is header-driven and applies to every format.
         let tracking = tracking_from_headers(headers);
         // Only the three valid cases remain after the (TriG, Insert)
         // rejection above: Turtle+Insert, Turtle+Upsert, TriG+Upsert.
@@ -1671,7 +1709,7 @@ async fn execute_turtle_transaction(
             txn_opts: TxnOpts::default(),
             commit_opts,
             tracking,
-            governance: GovernanceOptions::default(),
+            governance,
         };
         transact_via_consensus(state, ledger_id, request, tx_id, &credential.headers).await
     }

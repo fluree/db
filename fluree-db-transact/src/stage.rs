@@ -24,7 +24,8 @@ use fluree_db_policy::{
 };
 use fluree_db_query::parse::{lower_unresolved_patterns, UnresolvedPattern};
 use fluree_db_query::{
-    Batch, Binding, Pattern, QueryPolicyExecutor, Ref, Term, TriplePattern, VarId, VarRegistry,
+    Batch, Binding, Pattern, QueryPolicyEnforcer, QueryPolicyExecutor, Ref, Term, TriplePattern,
+    VarId, VarRegistry,
 };
 use fluree_db_sparql::ast::{
     QueryBody as SparqlQueryBody, SelectClause, SelectQuery, SolutionModifiers, SparqlAst,
@@ -699,6 +700,7 @@ pub async fn stage(
                 pure_delete,
                 &reverse_graph,
                 &mut acc,
+                options.policy_ctx,
             )
             .await?;
             let span = tracing::Span::current();
@@ -1296,6 +1298,7 @@ struct WhereStreamStats {
 /// accumulator before hydrate had a chance to fill in the list-index — we'd
 /// end up retracting only one of N list entries. Hydrating per batch keeps
 /// `m` correct on every retraction before it reaches the dedup layer.
+#[allow(clippy::too_many_arguments)]
 async fn stream_where_into_accumulator(
     ledger: &LedgerState,
     txn: &mut Txn,
@@ -1304,6 +1307,7 @@ async fn stream_where_into_accumulator(
     pure_delete: bool,
     reverse_graph: &HashMap<Sid, GraphId>,
     acc: &mut FlakeAccumulator,
+    view_policy: Option<&PolicyContext>,
 ) -> Result<WhereStreamStats> {
     // Lower transaction WHERE clause to query patterns.
     //
@@ -1386,14 +1390,36 @@ async fn stream_where_into_accumulator(
         ledger.as_graph_db_ref(0)
     };
 
+    // View-policy enforcement for the WHERE read. The transaction WHERE is a
+    // read: it must see only the flakes the requesting identity may VIEW, so a
+    // conditional match cannot probe data the identity can't read (e.g.
+    // `INSERT { ?s :flag 1 } WHERE { ?s :secret ?v }` must bind nothing when
+    // `:secret` is hidden). Modify-policy enforcement is separate and runs later
+    // on the staged flakes; a modify-only/no-view-rules identity therefore reads
+    // exactly what a plain query would (same enforcer, same default_allow). Pure
+    // inserts have no WHERE and so are unaffected. Root policies skip filtering.
+    let view_enforcer: Option<Arc<QueryPolicyEnforcer>> = view_policy
+        .filter(|p| !p.wrapper().is_root())
+        .map(|p| Arc::new(QueryPolicyEnforcer::new(Arc::new(p.clone()))));
+
     let make_graph_ref = |g_id: GraphId| -> fluree_db_query::GraphRef {
-        fluree_db_query::GraphRef::new(
-            base_db.snapshot,
-            g_id,
-            base_db.overlay,
-            base_db.t,
-            base_db.snapshot.ledger_id.as_str(),
-        )
+        match &view_enforcer {
+            Some(enforcer) => fluree_db_query::GraphRef::with_policy(
+                base_db.snapshot,
+                g_id,
+                base_db.overlay,
+                base_db.t,
+                base_db.snapshot.ledger_id.as_str(),
+                Arc::clone(enforcer),
+            ),
+            None => fluree_db_query::GraphRef::new(
+                base_db.snapshot,
+                g_id,
+                base_db.overlay,
+                base_db.t,
+                base_db.snapshot.ledger_id.as_str(),
+            ),
+        }
     };
 
     let composite_graph_key =

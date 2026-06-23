@@ -161,8 +161,11 @@ pub struct Bm25SearchOperator {
     in_schema: Arc<[VarId]>,
     /// Mapping from variables to output column positions
     out_pos: HashMap<VarId, usize>,
-    /// Cached BM25 index (loaded once in open) - used in legacy index provider mode
-    index: Option<Arc<Bm25Index>>,
+    /// Cached BM25 index (loaded once in open) — populated only in legacy
+    /// index-provider mode. `Some` means we hold the subject's flakes locally
+    /// and can enforce view policy on hits; `None` means search-provider mode,
+    /// where the engine has no local flakes to check.
+    local_index: Option<Arc<Bm25Index>>,
     /// Cached search results for constant targets (search provider mode only)
     cached_search_result: Option<Bm25SearchResult>,
     /// Whether we're using search provider mode (true) or index provider mode (false)
@@ -209,7 +212,7 @@ impl Bm25SearchOperator {
             pattern,
             in_schema: schema,
             out_pos,
-            index: None,
+            local_index: None,
             cached_search_result: None,
             use_search_provider: false,
             analyzer: Analyzer::english_default(),
@@ -223,6 +226,43 @@ impl Bm25SearchOperator {
     pub fn with_out_schema(mut self, downstream_vars: Option<&[VarId]>) -> Self {
         self.out_schema = compute_trimmed_vars(&self.in_schema, downstream_vars);
         self
+    }
+
+    /// Indexed-flake readability check for a search hit under a view policy.
+    ///
+    /// A BM25 hit is a matched document subject, not a flake, so the search
+    /// operator bypasses the per-flake policy filtering that scans apply. Here a
+    /// hit is visible iff the identity can view at least one of the subject's
+    /// flakes on a BM25-indexed property — the text that could have produced the
+    /// match. If every indexed-property flake of the subject is hidden, the hit
+    /// is dropped. The indexed-flake read runs in the single active graph; under
+    /// a non-root policy in multi-graph mode the hit is conservatively hidden
+    /// (no leak). No-op for root / no policy.
+    ///
+    /// Local-index vs search-provider: per-flake enforcement requires the
+    /// subject's flakes, which exist only in legacy local-index mode
+    /// (`local_index.is_some()`). In search-provider mode the engine holds no
+    /// local flakes, so an active view policy cannot be enforced on the hit —
+    /// we fail **closed** (hide the hit) rather than leak unfiltered results.
+    async fn hit_readable(&self, ctx: &ExecutionContext<'_>, subject_iri: &str) -> Result<bool> {
+        let Some(local_index) = self.local_index.as_ref() else {
+            if ctx.has_policy() {
+                tracing::debug!(
+                    subject = %subject_iri,
+                    "BM25 hit hidden: view policy active but search-provider mode \
+                     has no local flakes to enforce it against"
+                );
+                return Ok(false);
+            }
+            return Ok(true);
+        };
+        let pred_iris: Vec<&str> = local_index
+            .property_deps
+            .property_iris
+            .iter()
+            .map(std::convert::AsRef::as_ref)
+            .collect();
+        crate::search_readability::search_hit_readable(ctx, subject_iri, &pred_iris).await
     }
 
     fn resolve_target_from_row(
@@ -391,7 +431,7 @@ impl Operator for Bm25SearchOperator {
                     self.pattern.timeout,
                 )
                 .await?;
-            self.index = Some(idx);
+            self.local_index = Some(idx);
         } else {
             return Err(QueryError::InvalidQuery(
                 "BM25 IndexSearch requires ExecutionContext.bm25_search_provider or bm25_provider (not configured)"
@@ -512,8 +552,8 @@ impl Operator for Bm25SearchOperator {
                 }
             } else {
                 // Legacy index provider mode - local scoring
-                let index = self
-                    .index
+                let local_index = self
+                    .local_index
                     .as_ref()
                     .ok_or_else(|| QueryError::InvalidQuery("BM25 index not loaded".to_string()))?;
 
@@ -530,7 +570,7 @@ impl Operator for Bm25SearchOperator {
                     continue;
                 }
                 let term_refs: Vec<&str> = terms.iter().map(std::string::String::as_str).collect();
-                let scorer = Bm25Scorer::new(index, &term_refs);
+                let scorer = Bm25Scorer::new(local_index, &term_refs);
                 let results = scorer.top_k(limit);
 
                 results
@@ -551,6 +591,11 @@ impl Operator for Bm25SearchOperator {
 
             // For each BM25 result row, merge with the child row.
             for (subject_iri, ledger_alias, score) in hits {
+                // View-policy enforcement: drop hits whose indexed text the
+                // identity cannot view (inline index path only).
+                if !self.hit_readable(ctx, subject_iri.as_ref()).await? {
+                    continue;
+                }
                 // Create IriMatch binding for correct cross-ledger joins.
                 // IMPORTANT: Encode SID using the hit's source ledger (not primary db)
                 // so that primary_sid is consistent with ledger_alias.

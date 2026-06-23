@@ -53,6 +53,7 @@ use fluree_db_core::{Flake, GraphDbRef, Sid, Tracker};
 use fluree_db_policy::{is_schema_flake, PolicyContext};
 use fluree_db_query::binding::Binding;
 use fluree_db_query::ir::{Column, ForwardItem, HydrationSpec, NestedSelectSpec, Root};
+use fluree_db_query::QueryPolicyEnforcer;
 use fluree_vocab::namespaces::{BLANK_NODE, FLUREE_DB, JSON_LD};
 use fluree_vocab::rdf::{self, TYPE as RDF_TYPE_IRI};
 use futures::future::BoxFuture;
@@ -2123,7 +2124,7 @@ impl<'a> HydrationFormatter<'a> {
         // Policy filtering: only when policy is Some and not root.
         if let Some(policy_ctx) = self.policy {
             if !policy_ctx.wrapper().is_root() {
-                return Ok(self.filter_flakes_by_policy(flakes, policy_ctx));
+                return self.filter_flakes_by_policy(flakes, policy_ctx).await;
             }
         }
 
@@ -2156,7 +2157,7 @@ impl<'a> HydrationFormatter<'a> {
 
         if let Some(policy_ctx) = self.policy {
             if !policy_ctx.wrapper().is_root() {
-                return Ok(self.filter_flakes_by_policy(flakes, policy_ctx));
+                return self.filter_flakes_by_policy(flakes, policy_ctx).await;
             }
         }
 
@@ -2186,55 +2187,56 @@ impl<'a> HydrationFormatter<'a> {
         // db.range via the GraphDbRef tracker — no extra charge needed here.
         if let Some(policy_ctx) = self.policy {
             if !policy_ctx.wrapper().is_root() {
-                return Ok(self.filter_flakes_by_policy(flakes, policy_ctx));
+                return self.filter_flakes_by_policy(flakes, policy_ctx).await;
             }
         }
 
         Ok(flakes)
     }
 
-    /// Filter flakes according to view policies
+    /// Filter flakes according to view policies.
     ///
-    /// Schema flakes are always allowed. Other flakes are checked against
-    /// the policy context.
-    fn filter_flakes_by_policy(
+    /// Schema flakes are always allowed. Other flakes are checked against the
+    /// policy context's view set via the **async** evaluator, so `f:query`
+    /// policies run (the sync evaluator silently skips them). The subject class
+    /// cache is populated first: hydration-only-fetched subjects (direct-id
+    /// selects, nested-ref expansion) are never scanned, so the cache would
+    /// otherwise be empty and every `f:onClass` restriction would silently drop
+    /// to `default_allow`. Class membership is resolved at this view's `t` via
+    /// the GraphDbRef.
+    async fn filter_flakes_by_policy(
         &self,
         flakes: Vec<Flake>,
         policy_ctx: &PolicyContext,
-    ) -> Vec<Flake> {
-        flakes
-            .into_iter()
-            .filter(|flake| {
-                // Schema flakes always allowed (needed for query planning/formatting)
-                if is_schema_flake(&flake.p, &flake.o) {
-                    return true;
-                }
+    ) -> Result<Vec<Flake>> {
+        // Share the existing class cache (Arc-backed) so populated lookups carry
+        // across fetches and the original policy context sees them too.
+        let enforcer = QueryPolicyEnforcer::new(Arc::new(policy_ctx.clone()));
 
-                // Get subject classes from cache (empty if not cached)
-                // Note: Hydration doesn't pre-populate class cache like BinaryScanOperator.
-                // For hydration with class policies, the cache will be empty and
-                // class policies may not work correctly. This is a known limitation
-                // that can be addressed by pre-populating in format_async if needed.
-                let subject_classes = policy_ctx
-                    .get_cached_subject_classes(&flake.s)
-                    .unwrap_or_default();
+        let mut subjects: Vec<Sid> = flakes
+            .iter()
+            .filter(|f| !is_schema_flake(&f.p, &f.o))
+            .map(|f| f.s.clone())
+            .collect();
+        subjects.sort();
+        subjects.dedup();
+        enforcer
+            .populate_class_cache_for_graph(self.db, &subjects)
+            .await
+            .map_err(|e| FormatError::InvalidBinding(format!("policy class lookup failed: {e}")))?;
 
-                let allowed = match self.tracker {
-                    Some(tracker) => policy_ctx.allow_view_flake_tracked(
-                        &flake.s,
-                        &flake.p,
-                        &flake.o,
-                        &subject_classes,
-                        tracker,
-                    ),
-                    None => {
-                        policy_ctx.allow_view_flake(&flake.s, &flake.p, &flake.o, &subject_classes)
-                    }
-                };
-
-                allowed.unwrap_or_default() // On error, conservatively deny
-            })
-            .collect()
+        let disabled = Tracker::disabled();
+        let tracker = self.tracker.unwrap_or(&disabled);
+        enforcer
+            .filter_flakes_for_graph(
+                self.db.snapshot,
+                self.db.overlay,
+                self.db.t,
+                tracker,
+                flakes,
+            )
+            .await
+            .map_err(|e| FormatError::InvalidBinding(format!("policy filtering failed: {e}")))
     }
 }
 

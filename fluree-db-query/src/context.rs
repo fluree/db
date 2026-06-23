@@ -632,12 +632,38 @@ impl<'a> ExecutionContext<'a> {
         self
     }
 
-    /// Check if this context has an active (non-root) policy
+    /// Check if this context has an active (non-root) policy.
+    ///
+    /// Accounts for dataset mode: the top-level context may carry no enforcer
+    /// while a constituent graph does (the enforcer lives on the `GraphRef`,
+    /// applied via [`with_graph_ref`](Self::with_graph_ref)). Reporting policy
+    /// here whenever *any* active graph is filtered keeps `allow_unfiltered`
+    /// sound as the single canonical view-policy gate, even for callers that do
+    /// not also fold to a per-graph context first.
     pub fn has_policy(&self) -> bool {
-        self.policy_enforcer
+        let top_level = self
+            .policy_enforcer
             .as_ref()
             .map(|e| !e.is_root())
-            .unwrap_or(false)
+            .unwrap_or(false);
+        top_level || self.dataset.map(DataSet::has_any_policy).unwrap_or(false)
+    }
+
+    /// True when no view-policy filtering is required for this context — the
+    /// enforcer is absent or is the root (unrestricted) policy. The exact
+    /// negation of [`has_policy`](Self::has_policy).
+    ///
+    /// This is the single canonical predicate that protects view-policy
+    /// enforcement. The only operator that actually removes policy-hidden rows
+    /// is the range-fallback scan ([`BinaryScanOperator::filter_flakes_by_policy`]);
+    /// every fast path and raw-leaflet reader that does *not* route emitted
+    /// flakes through that filter MUST gate on `allow_unfiltered()` and decline
+    /// (fall back to the filtered scan) when it returns false. Adding a new
+    /// data-emitting operator that reads the index directly without consulting
+    /// this — or applying its own filter — is a policy leak.
+    #[inline]
+    pub fn allow_unfiltered(&self) -> bool {
+        !self.has_policy()
     }
 
     /// Get the effective overlay (NoOverlay if none set)
