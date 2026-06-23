@@ -939,7 +939,6 @@ impl LedgerManager {
         Some(handle.snapshot().await)
     }
 
-
     /// Get cached handle or load from nameservice
     ///
     /// Uses single-flight pattern: concurrent requests for same ledger ID

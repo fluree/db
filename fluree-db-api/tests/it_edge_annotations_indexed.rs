@@ -221,7 +221,10 @@ async fn full_rebuild_without_authoritative_falls_back_to_scan() {
     // harness that intentionally exercises the scan-fallback path.
     let (local, handle) = support::start_background_indexer_local(
         fluree.backend().clone(),
-        fluree.nameservice_mode().publisher_arc().expect("test setup requires ReadWrite nameservice mode"),
+        fluree
+            .nameservice_mode()
+            .publisher_arc()
+            .expect("test setup requires ReadWrite nameservice mode"),
         IndexerConfig::small(),
     );
 
@@ -333,7 +336,10 @@ async fn post_defensive_drop_stays_in_scan_fallback() {
             // wiring between passes.
             let (local_b, handle_b) = support::start_background_indexer_local(
                 fluree.backend().clone(),
-                fluree.nameservice_mode().publisher_arc().expect("test setup requires ReadWrite nameservice mode"),
+                fluree
+                    .nameservice_mode()
+                    .publisher_arc()
+                    .expect("test setup requires ReadWrite nameservice mode"),
                 IndexerConfig::small(),
             );
             local_b
@@ -486,7 +492,10 @@ async fn had_annotation_arena_sticky_survives_defensive_drop() {
 
             let (local_b, handle_b) = support::start_background_indexer_local(
                 fluree.backend().clone(),
-                fluree.nameservice_mode().publisher_arc().expect("test setup requires ReadWrite nameservice mode"),
+                fluree
+                    .nameservice_mode()
+                    .publisher_arc()
+                    .expect("test setup requires ReadWrite nameservice mode"),
                 IndexerConfig::small(),
             );
             local_b
@@ -562,7 +571,10 @@ async fn indexer_pass_without_provider_marks_arena_history_owned() {
     // arena handling.
     let (local, handle) = support::start_background_indexer_local(
         fluree.backend().clone(),
-        fluree.nameservice_mode().publisher_arc().expect("test setup requires ReadWrite nameservice mode"),
+        fluree
+            .nameservice_mode()
+            .publisher_arc()
+            .expect("test setup requires ReadWrite nameservice mode"),
         IndexerConfig::small(),
     );
 

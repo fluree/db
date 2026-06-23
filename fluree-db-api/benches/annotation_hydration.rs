@@ -95,7 +95,10 @@ mod support {
 
         let (worker, handle) = fluree_db_api::BackgroundIndexerWorker::new(
             fluree.backend().clone(),
-            fluree.nameservice_mode().publisher_arc().expect("test setup requires ReadWrite nameservice mode"),
+            fluree
+                .nameservice_mode()
+                .publisher_arc()
+                .expect("test setup requires ReadWrite nameservice mode"),
             config,
         );
         let local = LocalSet::new();
@@ -358,7 +361,10 @@ async fn seed_ledger_and_optionally_seal(n: usize, seal: bool) -> (fluree_db_api
     } else {
         let (worker, handle) = fluree_db_api::BackgroundIndexerWorker::new(
             fluree.backend().clone(),
-            fluree.nameservice_mode().publisher_arc().expect("test setup requires ReadWrite nameservice mode"),
+            fluree
+                .nameservice_mode()
+                .publisher_arc()
+                .expect("test setup requires ReadWrite nameservice mode"),
             IndexerConfig::small(),
         );
         let local = tokio::task::LocalSet::new();
