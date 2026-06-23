@@ -240,11 +240,18 @@ When a data-plane command receives a 401 from the remote:
 
 ### Replication commands (`fetch`, `pull`, `push`)
 
-Replication commands use `HttpRemoteClient` (from `fluree-db-nameservice-sync`) which does **not** perform auto-refresh. This is intentional:
+A replication command uses **two** clients, and only one of them auto-refreshes:
+
+- **Metadata calls** (nameservice lookups, commit pagination) go through `RemoteLedgerClient`, which **does** auto-refresh on 401 exactly as described above. After a successful command the CLI persists any rotated token back to `.fluree/config.toml` (`context::persist_refreshed_tokens`).
+- **The bulk pack transfer** goes through `HttpRemoteClient` (from `fluree-db-nameservice-sync`), which holds a static token and does **not** auto-refresh.
+
+This split is intentional:
 
 - Replication requires `fluree.storage.*` scopes, which are reserved for operators and service accounts.
 - Operator tokens are typically long-lived or non-expiring. If an operator token expires, the user should run `fluree auth login` to obtain a new one.
 - Regular users who only have query-scoped tokens should use `fluree track` + `--remote` mode instead of `fetch`/`pull`/`push`.
+
+If the token expires **during** a pack transfer, the CLI does not resume it. It detects the resulting auth failure and fails fast with the `fluree auth login` guidance rather than silently retrying a doomed paginated fallback. Re-authenticate and re-run the transfer.
 
 ## Scope rules
 

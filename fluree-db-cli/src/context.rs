@@ -285,6 +285,13 @@ pub fn build_client_from_auth(base_url: &str, auth: &RemoteAuth) -> RemoteLedger
                 refresh_token: refresh_token.clone(),
             });
         }
+    } else if auth.refresh_token.is_some() {
+        // Auto-refresh only engages for `oidc_device`; a refresh_token under any
+        // other auth type is dead config that will never be used. Warn rather
+        // than silently ignore it.
+        eprintln!(
+            "warning: 'refresh_token' is set but auth type is not 'oidc_device'; it will be ignored"
+        );
     }
 
     client
