@@ -2789,8 +2789,10 @@ mod tests {
     // --- redundant rdf:type elision ---------------------------------------
 
     fn coverage_stats(pred: &str, class: &str, total: u64, covered: u64, trust: bool) -> StatsView {
-        let mut v = StatsView::default();
-        v.class_coverage_trustworthy = trust;
+        let mut v = StatsView {
+            class_coverage_trustworthy: trust,
+            ..Default::default()
+        };
         v.properties_by_iri.insert(
             Arc::from(pred),
             PropertyStatData {
