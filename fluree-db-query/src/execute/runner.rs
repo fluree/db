@@ -438,14 +438,75 @@ pub async fn prepare_execution_with_config(
     .await
 }
 
-/// Run an operator tree to completion and collect all result batches
+/// Destination for the batches an operator tree produces.
 ///
-/// This is the common execution loop used by all execution paths.
-/// Includes consistent tracing for debugging and monitoring.
+/// The buffered path collects into a `Vec` ([`VecSink`]); the streaming path
+/// formats and flushes each batch as it arrives. Both drive the exact same
+/// [`run_operator_into`] loop, so execution behaviour (tracing, cancellation,
+/// fuel) can never drift between them.
+///
+/// `push` is a native async-fn-in-trait returning `impl Future` (not
+/// `#[async_trait]`), so the buffered `Vec` path pays no per-batch boxing —
+/// the future is monomorphized and inlined.
+pub trait BatchSink: Send {
+    /// Accept one result batch. Returning `Err` aborts execution — the
+    /// streaming sink uses this to stop work when the client disconnects.
+    fn push(&mut self, batch: Batch) -> impl std::future::Future<Output = Result<()>> + Send;
+}
+
+/// Buffered sink: collects every batch into a `Vec` (the standard,
+/// benchmark-critical query path). The per-batch `push` is just the `Vec::push`
+/// the loop used to do inline.
+struct VecSink {
+    batches: Vec<Batch>,
+}
+
+impl BatchSink for VecSink {
+    async fn push(&mut self, batch: Batch) -> Result<()> {
+        self.batches.push(batch);
+        Ok(())
+    }
+}
+
+/// Run an operator tree to completion and collect all result batches.
+///
+/// This is the buffered entry point used by all non-streaming execution paths.
+/// It drives [`run_operator_into`] with a [`VecSink`].
 pub async fn run_operator(
-    mut operator: BoxedOperator,
+    operator: BoxedOperator,
     ctx: &ExecutionContext<'_>,
 ) -> Result<Vec<Batch>> {
+    let mut sink = VecSink {
+        batches: Vec::new(),
+    };
+    run_operator_into(operator, ctx, &mut sink).await?;
+    Ok(sink.batches)
+}
+
+/// Run an operator tree to completion, feeding each batch to `sink` as it is
+/// produced (no full-result buffering at this layer).
+///
+/// Used by the streaming query path: the sink formats each batch and flushes it
+/// to the wire, so rows reach the client incrementally and a long-running query
+/// can keep bytes flowing. Blocking operators (ORDER BY/GROUP BY/aggregates)
+/// still buffer internally and emit in a burst at the end — the stream simply
+/// produces nothing until they finish.
+pub async fn run_operator_streaming<S: BatchSink>(
+    operator: BoxedOperator,
+    ctx: &ExecutionContext<'_>,
+    sink: &mut S,
+) -> Result<()> {
+    run_operator_into(operator, ctx, sink).await
+}
+
+/// Shared execution loop behind both [`run_operator`] and
+/// [`run_operator_streaming`]. Tracing, cancellation, and the open/next/close
+/// lifecycle live here so every path behaves identically.
+async fn run_operator_into<S: BatchSink>(
+    mut operator: BoxedOperator,
+    ctx: &ExecutionContext<'_>,
+    sink: &mut S,
+) -> Result<()> {
     let op_type = std::any::type_name_of_val(operator.as_ref());
     // Temporal mode is captured at planner-time inside the operator tree, not on
     // ExecutionContext, so it is no longer surfaced as a span field here. The
@@ -484,12 +545,11 @@ pub async fn run_operator(
             (open_start.elapsed().as_secs_f64() * 1000.0) as u64,
         );
 
-        let mut results = Vec::new();
         let mut batch_count = 0;
         let mut total_rows: usize = 0;
         let mut max_batch_ms: u64 = 0;
         let run_start = Instant::now();
-        while {
+        loop {
             ctx.check_cancelled()?;
             let batch_start = Instant::now();
             let next = operator.next_batch(ctx).await?;
@@ -498,21 +558,17 @@ pub async fn run_operator(
             if batch_ms > max_batch_ms {
                 max_batch_ms = batch_ms;
             }
-            if let Some(batch) = next {
-                batch_count += 1;
-                total_rows += batch.len();
-                tracing::debug!(
-                    batch_num = batch_count,
-                    row_count = batch.len(),
-                    batch_ms,
-                    "received batch"
-                );
-                results.push(batch);
-                true
-            } else {
-                false
-            }
-        } {}
+            let Some(batch) = next else { break };
+            batch_count += 1;
+            total_rows += batch.len();
+            tracing::debug!(
+                batch_num = batch_count,
+                row_count = batch.len(),
+                batch_ms,
+                "received batch"
+            );
+            sink.push(batch).await?;
+        }
 
         operator.close();
 
@@ -529,7 +585,7 @@ pub async fn run_operator(
             "query execution completed"
         );
 
-        Ok(results)
+        Ok(())
     }
     .instrument(span)
     .await
@@ -617,12 +673,40 @@ impl Default for ContextConfig<'_, '_> {
 ///
 /// This is the unified internal execution path that handles all variants.
 /// The `config` parameter specifies which optional components to add to the context.
-pub async fn execute_prepared<'a, 'b>(
+pub async fn execute_prepared<'a>(
     db: GraphDbRef<'a>,
     vars: &VarRegistry,
     prepared: PreparedExecution,
-    config: ContextConfig<'a, 'b>,
+    config: ContextConfig<'a, '_>,
 ) -> Result<Vec<Batch>> {
+    let mut sink = VecSink {
+        batches: Vec::new(),
+    };
+    execute_prepared_into(db, vars, prepared, config, &mut sink).await?;
+    Ok(sink.batches)
+}
+
+/// Streaming counterpart to [`execute_prepared`]: builds the same execution
+/// context, but feeds batches to `sink` as they are produced instead of
+/// collecting them. The context wiring is shared via [`execute_prepared_into`]
+/// so the streaming and buffered paths can never diverge in setup.
+pub async fn execute_prepared_streaming<'a, S: BatchSink>(
+    db: GraphDbRef<'a>,
+    vars: &VarRegistry,
+    prepared: PreparedExecution,
+    config: ContextConfig<'a, '_>,
+    sink: &mut S,
+) -> Result<()> {
+    execute_prepared_into(db, vars, prepared, config, sink).await
+}
+
+async fn execute_prepared_into<'a, S: BatchSink>(
+    db: GraphDbRef<'a>,
+    vars: &VarRegistry,
+    prepared: PreparedExecution,
+    config: ContextConfig<'a, '_>,
+    sink: &mut S,
+) -> Result<()> {
     // Surface the OWL2-RL materialization outcome in request tracking so a
     // capped (incomplete) closure is visible to clients, not just in logs.
     if let (Some(diag), Some(tracker)) = (&prepared.reasoning_diagnostics, config.tracker) {
@@ -749,7 +833,7 @@ pub async fn execute_prepared<'a, 'b>(
         }
     }
 
-    run_operator(prepared.operator, &ctx).await
+    run_operator_streaming(prepared.operator, &ctx, sink).await
 }
 
 /// Prepare and execute a query in a single call.

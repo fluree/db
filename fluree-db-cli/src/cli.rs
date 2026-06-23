@@ -456,9 +456,19 @@ pub enum Commands {
         #[arg(short = 'f', long = "file")]
         file: Option<PathBuf>,
 
-        /// Output format (json, typed-json, table, csv, or tsv)
+        /// Output format (json, typed-json, table, csv, tsv, or ndjson)
+        ///
+        /// `ndjson` streams SELECT results incrementally as newline-delimited
+        /// JSON (one binding object per line) instead of buffering the whole
+        /// result set — use it for large result sets and unix pipelines.
         #[arg(long, default_value = "table")]
         format: String,
+
+        /// With `--format ndjson`, emit the full streaming record protocol
+        /// (head / row / heartbeat / end / error) verbatim instead of bare
+        /// binding objects. Useful for debugging and detecting truncation.
+        #[arg(long)]
+        envelope: bool,
 
         /// Normalize arrays: always wrap multi-value properties in arrays (expansion only)
         #[arg(long)]

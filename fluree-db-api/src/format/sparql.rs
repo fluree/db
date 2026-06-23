@@ -74,9 +74,10 @@ pub fn format(
 }
 
 /// Compute the `head.vars` names (without `?`) and the parallel `VarId` list,
-/// ordered lexicographically by name. Shared by the DOM and streaming paths so
-/// the head order can never drift between them.
-fn compute_head(result: &QueryResult) -> (Vec<String>, Vec<fluree_db_query::VarId>) {
+/// ordered lexicographically by name. Shared by the DOM, the buffered streaming
+/// String path, and the NDJSON streaming path so the head order can never drift
+/// between them.
+pub(crate) fn compute_head(result: &QueryResult) -> (Vec<String>, Vec<fluree_db_query::VarId>) {
     // For wildcard, use the operator schema (all variables); fall back to the
     // VarRegistry when batches are empty (W3C: exists-02 etc.).
     let head_vars: Vec<fluree_db_query::VarId> = if result.output.is_wildcard() {
@@ -215,6 +216,75 @@ pub fn format_string(
 
     out.push_str("]}}");
     Ok(out)
+}
+
+/// Append NDJSON `{"type":"row","row":{...}}` records — one per logical result
+/// row, each newline-terminated — for every row in `batch`. Returns the count
+/// of row records written (grouped rows expand to several).
+///
+/// The row body (`{...}`) is produced by the same [`write_cell`] /
+/// [`disaggregate_row`] path as the buffered [`format`]/[`format_string`]
+/// binding objects, so a streamed row is byte-identical to the corresponding
+/// SPARQL-JSON binding object — only the surrounding framing differs (an NDJSON
+/// record wrapper instead of an array element). `head_vars`/`vars` come from
+/// [`compute_head`] and are computed once by the driver, then reused per batch.
+pub(crate) fn stream_ndjson_rows(
+    out: &mut String,
+    result: &QueryResult,
+    batch: &crate::Batch,
+    head_vars: &[fluree_db_query::VarId],
+    vars: &[String],
+    compactor: &IriCompactor,
+) -> Result<usize> {
+    let schema = batch.schema();
+    // Map each head var to its column index in this batch once per batch.
+    let cols: Vec<Option<usize>> = head_vars
+        .iter()
+        .map(|&v| schema.iter().position(|&sv| sv == v))
+        .collect();
+
+    let mut emitted = 0usize;
+    for row_idx in 0..batch.len() {
+        let has_grouped = cols.iter().any(|&c| {
+            matches!(
+                c.map(|c| batch.get_by_col(row_idx, c)),
+                Some(Binding::Grouped(_))
+            )
+        });
+
+        if has_grouped {
+            // Rare: cartesian-expand via the DOM disaggregator, then emit one
+            // row record per fully-built binding object.
+            let row_bindings: Vec<(fluree_db_query::VarId, &Binding)> = head_vars
+                .iter()
+                .map(|&var_id| {
+                    (
+                        var_id,
+                        batch.get(row_idx, var_id).unwrap_or(&Binding::Unbound),
+                    )
+                })
+                .collect();
+            let objs = disaggregate_row(result, &row_bindings, &result.vars, compactor)?;
+            for obj in &objs {
+                out.push_str("{\"type\":\"row\",\"row\":");
+                push_value(out, obj)?;
+                out.push_str("}\n");
+                emitted += 1;
+            }
+        } else {
+            out.push_str("{\"type\":\"row\",\"row\":{");
+            let mut first_cell = true;
+            for (k, &col) in cols.iter().enumerate() {
+                if let Some(col) = col {
+                    let binding = batch.get_by_col(row_idx, col);
+                    write_cell(out, result, binding, &vars[k], compactor, &mut first_cell)?;
+                }
+            }
+            out.push_str("}}\n");
+            emitted += 1;
+        }
+    }
+    Ok(emitted)
 }
 
 /// Write one `"name":{term}` cell, or nothing for Unbound/Poisoned/null literals
