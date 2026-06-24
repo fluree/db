@@ -1,34 +1,22 @@
 //! Deterministic per-branch stager assignment.
 //!
 //! Every node independently maps a [`RefKey`] to the [`NodeId`] that
-//! should run its stager, using rendezvous hashing (a.k.a. Highest
-//! Random Weight). For each candidate node, score the pair
-//! `hash(ref_key, node)`; the highest-scoring node wins.
+//! should run its stager, using rendezvous hashing (Highest Random
+//! Weight): score each `(ref_key, node)` pair, highest score wins.
+//! Reassignment fraction on a membership change is `~1/(N+1)`.
 //!
-//! Rendezvous is preferred over plain `hash(ref_key) % N` because the
-//! latter reshuffles roughly `(N-1)/N` of branches whenever the
-//! cluster gains or loses a node, while rendezvous moves only
-//! `~1/(N+1)` (the genuinely-reassigned fraction). For a cluster
-//! that goes through rolling restarts or scale events, that's the
-//! difference between cluster-wide reshuffle churn and a localized
-//! handoff.
+//! [`xxh64`] is fixed-seeded so every node computes identical scores
+//! for the same `(ref_key, node)` pair. `std`'s `DefaultHasher` is
+//! randomly seeded per process and would not.
 //!
-//! The hash is [`xxh64`] so every node in the cluster produces
-//! identical scores for the same `(ref_key, node)` pair — `std`'s
-//! `DefaultHasher` uses random per-process seeds and would have each
-//! node compute a different "winner."
-//!
-//! The function is total: given a non-empty voter set, every
-//! [`RefKey`] resolves to exactly one [`NodeId`], so cluster-wide
-//! at-most-one ownership is structural rather than coordinated.
+//! Total: any non-empty voter set yields exactly one owner per
+//! [`RefKey`], so cluster-wide at-most-one ownership is structural.
 
 use crate::raft::state_machine::RefKey;
 use crate::raft::NodeId;
 use xxhash_rust::xxh64::xxh64;
 
-/// Seed for the rendezvous hash. Any constant works; pinning one
-/// keeps ownership stable across binary rebuilds.
-const RENDEZVOUS_SEED: u64 = 0x6661_6566_5246_4252; // "FFEE_RFBR" — arbitrary; just stable.
+const RENDEZVOUS_SEED: u64 = 0x6661_6566_5246_4252;
 
 /// Resolve the owner of `ref_key` from a non-empty voter set.
 ///

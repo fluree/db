@@ -81,9 +81,7 @@ impl RefKey {
         }
     }
 
-    /// Canonical `name:branch` ledger ID for this ref. Thin wrapper
-    /// over [`format_ledger_id`] so callers can spell the canonical
-    /// form directly from a [`RefKey`].
+    /// Canonical `name:branch` ledger ID.
     pub fn ledger_id(&self) -> String {
         format_ledger_id(&self.ledger_name, &self.branch)
     }

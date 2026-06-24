@@ -3,24 +3,28 @@
 //!
 //! The state machine appends `QueueEntry` rows to per-branch FIFOs as
 //! [`Command::EnqueueCommand`](crate::raft::state_machine::Command::EnqueueCommand)
-//! applies. The leader runs one [`Stager`] per active branch; each
-//! polls its branch's queue front, restages the commit locally,
-//! writes the commit blob to shared CAS, and publishes the head
-//! advance through [`CommitPublisher::publish_commit`] — which
-//! proposes [`Command::ApplyHead`](crate::raft::state_machine::Command::ApplyHead).
+//! applies. One [`Stager`] runs per active branch on whichever node
+//! the rendezvous-hash owner resolves to; each polls its branch's
+//! queue front, restages the commit locally, writes the commit blob
+//! to shared CAS, and publishes the head advance through
+//! [`CommitPublisher::publish_commit`] — which proposes
+//! [`Command::ApplyHead`](crate::raft::state_machine::Command::ApplyHead).
 //! The entry pops and the head advances on that apply.
 //!
-//! [`StagerSupervisor`] watches [`NameServiceState::queues`] and
-//! spawns a fresh `Stager` the first time it observes each `RefKey`.
-//! Stagers run for the lifetime of the supervisor; leadership loss
-//! aborts the supervisor task, dropping the inner `JoinSet` and
-//! aborting every stager.
+//! [`StagerSupervisor`] runs at node lifetime on every node. Each
+//! tick it computes the desired set (branches in
+//! [`NameServiceState::queues`] whose rendezvous owner is this node)
+//! and reconciles its running stagers to match — spawning new ones,
+//! aborting reassigned ones. A cancellation token drives graceful
+//! shutdown; the supervisor exits its loop, aborts every per-branch
+//! stager, then returns.
 //!
 //! Scope cuts for v1 (tracked in `docs/design/raft-command-queue.md`):
 //! - No retry budget. Any staging failure poisons the entry.
 //! - [`BodyKind::Pushed`] handling is deferred; the stager poisons
 //!   any pushed entry until that path lands.
-//! - Stagers run until aborted; idle branches are not reaped.
+//! - Idle branches are not reaped; stagers run until ownership
+//!   moves or the supervisor shuts down.
 //! - Token-bearing fields in [`crate::QueuedRequest::governance`]
 //!   travel verbatim; redaction is future work.
 
@@ -48,10 +52,13 @@ use fluree_db_ledger::IndexConfig;
 use fluree_db_nameservice::CommitPublisher;
 use futures::FutureExt;
 use openraft::Raft;
+use std::collections::{HashMap, HashSet};
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use thiserror::Error;
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, warn};
 
 /// How often a [`Stager`] polls its branch queue when the previous
@@ -91,14 +98,16 @@ const STAGE_RETRY_BASE_BACKOFF: Duration = Duration::from_millis(100);
 /// Drains a single branch's queue: peeks the front, stages the
 /// commit, writes the commit blob, publishes the head advance through
 /// [`CommitPublisher::publish_commit`], and retires the entry. One
-/// stager runs per active [`RefKey`] on the leader; cross-branch
-/// concurrency is the supervisor's responsibility.
+/// stager runs per active [`RefKey`] on whichever node the rendezvous
+/// owner resolves to; cross-branch concurrency is the supervisor's
+/// responsibility.
 ///
 /// Head advances flow through `publisher.publish_commit` — a Raft
 /// deployment supplies a [`RaftNameService`](crate::raft::nameservice::RaftNameService)
 /// here, which proposes `ApplyHead` against the current per-branch
-/// queue front. Poisoning still goes direct to Raft because there's
-/// no trait surface for "fail this queue entry."
+/// queue front (forwarding to the leader when this stager runs on a
+/// follower). Poisoning still goes direct to Raft because there's no
+/// trait surface for "fail this queue entry."
 #[derive(Clone)]
 pub struct Stager {
     ref_key: RefKey,
@@ -959,9 +968,8 @@ impl StagerSupervisor {
     /// On shutdown, every still-running stager is aborted before the
     /// loop returns so the caller's `JoinHandle::await` sees the
     /// supervisor stop only after its children have.
-    pub async fn run(self, cancel: tokio_util::sync::CancellationToken) {
-        let mut stagers: std::collections::HashMap<RefKey, tokio::task::JoinHandle<()>> =
-            std::collections::HashMap::new();
+    pub async fn run(self, cancel: CancellationToken) {
+        let mut stagers: HashMap<RefKey, JoinHandle<()>> = HashMap::new();
         let mut metrics_rx = self.raft.metrics();
 
         loop {
@@ -988,13 +996,13 @@ impl StagerSupervisor {
         }
     }
 
-    async fn compute_desired_owners(&self) -> std::collections::HashSet<RefKey> {
+    async fn compute_desired_owners(&self) -> HashSet<RefKey> {
         let voters = self.current_voters();
         // Empty voter set = cluster not yet bootstrapped (or every
         // voter dropped); no branch can resolve an owner, so claim
         // nothing this tick.
         if voters.is_empty() {
-            return std::collections::HashSet::new();
+            return HashSet::new();
         }
         let state = self.shared_state.read().await;
         state
@@ -1023,8 +1031,8 @@ impl StagerSupervisor {
     /// change, or stay dormant until the supervisor restarts.
     fn reconcile_stagers(
         &self,
-        stagers: &mut std::collections::HashMap<RefKey, tokio::task::JoinHandle<()>>,
-        desired: std::collections::HashSet<RefKey>,
+        stagers: &mut HashMap<RefKey, JoinHandle<()>>,
+        desired: HashSet<RefKey>,
     ) {
         for key in &desired {
             if !stagers.contains_key(key) {
@@ -1183,7 +1191,7 @@ mod tests {
     use fluree_db_core::ContentKind;
     use fluree_db_transact::TxnOpts;
     use serde_json::json;
-    use std::collections::VecDeque;
+    use std::collections::{HashMap, HashSet, VecDeque};
     use tokio::sync::RwLock;
 
     fn cid(seed: u8) -> ContentId {
@@ -1203,7 +1211,7 @@ mod tests {
     fn sample_push_envelope() -> QueuedRequest {
         QueuedRequest::Push(Box::new(QueuedPush {
             commit_cids: vec![cid(5)],
-            blobs: std::collections::HashMap::new(),
+            blobs: HashMap::new(),
             governance: GovernanceOptions::default(),
         }))
     }
@@ -1295,10 +1303,10 @@ mod tests {
         state: &SharedState,
         id: NodeId,
         voters: &[NodeId],
-    ) -> std::collections::HashSet<RefKey> {
+    ) -> HashSet<RefKey> {
         use crate::raft::ownership::owner;
         if voters.is_empty() {
-            return std::collections::HashSet::new();
+            return HashSet::new();
         }
         let state = state.read().await;
         state
@@ -1397,7 +1405,7 @@ mod tests {
         let shared = Arc::new(RwLock::new(state));
         let voters = vec![1u64, 2, 3, 4];
 
-        let mut union = std::collections::HashSet::new();
+        let mut union = HashSet::new();
         for id in &voters {
             let mine = compute_desired_owners_for_test(&shared, *id, &voters).await;
             // Every claimed branch must belong to exactly one node.

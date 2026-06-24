@@ -329,10 +329,11 @@ impl FlureeServer {
         }
         #[cfg(feature = "raft")]
         if let Some(handle) = self.raft_stager_supervisor {
-            // Shut the supervisor down before the leader watcher so
-            // any in-flight stager work has a chance to finish
-            // (forwarding through the leader, which is still alive
-            // for now). The supervisor aborts each per-branch stager
+            // Drain stagers before the leader-only background tasks
+            // (indexer, evictor) shut down — they touch the same
+            // shared state the stagers' final publishes go through,
+            // and ordering matters when this node is itself the
+            // leader. The supervisor aborts each per-branch stager
             // and returns only after they've stopped.
             handle.shutdown().await;
         }
