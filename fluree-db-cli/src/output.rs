@@ -247,16 +247,11 @@ fn sparql_table_cell(
         }
 
         // A relationship value — `start-[type]->end`; never reached via SPARQL.
-        Binding::Rel {
-            start,
-            predicate,
-            end,
-            ..
-        } => format!(
+        Binding::Rel(rel) => format!(
             "{}-[{}]->{}",
-            compact_bnode_strip(compactor.compact_sid_for_display(start).ok()),
-            compact_bnode_strip(compactor.compact_sid_for_display(predicate).ok()),
-            compact_bnode_strip(compactor.compact_sid_for_display(end).ok()),
+            compact_bnode_strip(compactor.compact_sid_for_display(&rel.start).ok()),
+            compact_bnode_strip(compactor.compact_sid_for_display(&rel.predicate).ok()),
+            compact_bnode_strip(compactor.compact_sid_for_display(&rel.end).ok()),
         ),
     };
     Ok(s)

@@ -289,7 +289,7 @@ fn resolve_root_sid_from_binding(
             Binding::Lit { .. }
             | Binding::Grouped(_)
             | Binding::Path { .. }
-            | Binding::Rel { .. }
+            | Binding::Rel(_)
             | Binding::List(_)
             | Binding::Map(_)
             | Binding::Iri(_)

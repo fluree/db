@@ -218,12 +218,14 @@ pub fn eval_list_fn_to_binding<R: RowAccess>(
             let p = arg_to_sid(&args[1], row, ctx)?;
             let e = arg_to_sid(&args[2], row, ctx)?;
             match (s, p, e) {
-                (Some(start), Some(predicate), Some(end)) => Ok(Some(Binding::Rel {
-                    start,
-                    predicate,
-                    end,
-                    reifier: None,
-                })),
+                (Some(start), Some(predicate), Some(end)) => {
+                    Ok(Some(Binding::Rel(Box::new(crate::RelValue {
+                        start,
+                        predicate,
+                        end,
+                        reifier: None,
+                    }))))
+                }
                 _ => Ok(Some(Binding::Unbound)),
             }
         }
@@ -276,11 +278,13 @@ pub fn eval_list_fn_to_binding<R: RowAccess>(
                     // Edges are already oriented to the stored edge direction.
                     let rels = edges
                         .into_iter()
-                        .map(|(start, predicate, end)| Binding::Rel {
-                            start,
-                            predicate,
-                            end,
-                            reifier: None,
+                        .map(|(start, predicate, end)| {
+                            Binding::Rel(Box::new(crate::RelValue {
+                                start,
+                                predicate,
+                                end,
+                                reifier: None,
+                            }))
                         })
                         .collect();
                     Ok(Some(Binding::List(rels)))

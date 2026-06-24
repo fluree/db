@@ -409,7 +409,7 @@ impl Materializer {
             }
 
             // Paths/lists are not hashed/joined/grouped (v1).
-            Binding::Path { .. } | Binding::Rel { .. } | Binding::List(_) | Binding::Map(_) => {
+            Binding::Path { .. } | Binding::Rel(_) | Binding::List(_) | Binding::Map(_) => {
                 JoinKey::Absent
             }
         }
@@ -464,7 +464,7 @@ impl Materializer {
             Binding::Grouped(_) => None,
 
             // A path/list is not a scalar comparable value.
-            Binding::Path { .. } | Binding::Rel { .. } | Binding::List(_) | Binding::Map(_) => None,
+            Binding::Path { .. } | Binding::Rel(_) | Binding::List(_) | Binding::Map(_) => None,
         }
     }
 
@@ -528,7 +528,7 @@ impl Materializer {
             Binding::Grouped(_) => None,
 
             // No canonical string form for a path/list value.
-            Binding::Path { .. } | Binding::Rel { .. } | Binding::List(_) | Binding::Map(_) => None,
+            Binding::Path { .. } | Binding::Rel(_) | Binding::List(_) | Binding::Map(_) => None,
         }
     }
 
@@ -554,7 +554,7 @@ impl Materializer {
             | Binding::Lit { .. }
             | Binding::Grouped(_)
             | Binding::Path { .. }
-            | Binding::Rel { .. }
+            | Binding::Rel(_)
             | Binding::List(_)
             | Binding::Map(_) => binding.clone(),
 

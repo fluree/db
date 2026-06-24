@@ -206,7 +206,7 @@ impl Expression {
                 // relevant functions (`length`, `size`/`head`/…) read the
                 // binding directly via dispatch / the binding-producing path.
                 Some(
-                    Binding::Path { .. } | Binding::Rel { .. } | Binding::List(_) | Binding::Map(_),
+                    Binding::Path { .. } | Binding::Rel(_) | Binding::List(_) | Binding::Map(_),
                 ) => Ok(None),
             },
 

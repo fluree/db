@@ -400,7 +400,7 @@ impl PatternOptionalBuilder {
                             // Leave as variable
                         }
                         Binding::Path { .. }
-                        | Binding::Rel { .. }
+                        | Binding::Rel(_)
                         | Binding::List(_)
                         | Binding::Map(_) => {
                             // A path/list value is never substituted into a triple slot.
@@ -601,7 +601,7 @@ impl OptionalBuilder for PatternOptionalBuilder {
                 }
                 Binding::Grouped(_)
                 | Binding::Path { .. }
-                | Binding::Rel { .. }
+                | Binding::Rel(_)
                 | Binding::List(_)
                 | Binding::Map(_) => Ok(None),
             };

@@ -240,18 +240,13 @@ fn write_value(out: &mut String, binding: &Binding, compactor: &IriCompactor) ->
         }
         // A relationship renders as a `{start, type, end}` object of compacted
         // IRIs (its properties are reached via `properties(r)`).
-        Binding::Rel {
-            start,
-            predicate,
-            end,
-            ..
-        } => {
+        Binding::Rel(rel) => {
             out.push_str("{\"start\":");
-            push_json_string(out, &compactor.compact_id_sid(start)?);
+            push_json_string(out, &compactor.compact_id_sid(&rel.start)?);
             out.push_str(",\"type\":");
-            push_json_string(out, &compactor.compact_id_sid(predicate)?);
+            push_json_string(out, &compactor.compact_id_sid(&rel.predicate)?);
             out.push_str(",\"end\":");
-            push_json_string(out, &compactor.compact_id_sid(end)?);
+            push_json_string(out, &compactor.compact_id_sid(&rel.end)?);
             out.push('}');
         }
         // A list (collect / list literal / list function) renders as a JSON
@@ -590,24 +585,19 @@ pub(crate) fn format_binding(binding: &Binding, compactor: &IriCompactor) -> Res
         }
 
         // A relationship renders as a `{start, type, end}` object of compacted IRIs.
-        Binding::Rel {
-            start,
-            predicate,
-            end,
-            ..
-        } => {
+        Binding::Rel(rel) => {
             let mut obj = serde_json::Map::with_capacity(3);
             obj.insert(
                 "start".to_string(),
-                JsonValue::String(compactor.compact_id_sid(start)?),
+                JsonValue::String(compactor.compact_id_sid(&rel.start)?),
             );
             obj.insert(
                 "type".to_string(),
-                JsonValue::String(compactor.compact_id_sid(predicate)?),
+                JsonValue::String(compactor.compact_id_sid(&rel.predicate)?),
             );
             obj.insert(
                 "end".to_string(),
-                JsonValue::String(compactor.compact_id_sid(end)?),
+                JsonValue::String(compactor.compact_id_sid(&rel.end)?),
             );
             Ok(JsonValue::Object(obj))
         }

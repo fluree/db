@@ -984,7 +984,7 @@ impl NestedLoopJoinOperator {
                         // through a subquery boundary (e.g. `WITH collect(x) AS l`,
                         // `relationships(p)`). None is a valid triple term, so leave
                         // the slot as a variable (no match) rather than asserting.
-                        Binding::Rel { .. } | Binding::List(_) | Binding::Map(_) => {}
+                        Binding::Rel(_) | Binding::List(_) | Binding::Map(_) => {}
                     }
                 }
             }

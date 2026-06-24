@@ -11,6 +11,21 @@ use fluree_db_core::DatatypeConstraint;
 use fluree_db_core::{FlakeMeta, FlakeValue, Sid};
 use std::sync::Arc;
 
+/// Payload of the [`Binding::Rel`] variant, boxed so the rare relationship
+/// value does not inflate `size_of::<Binding>()` (an unboxed 96-byte payload
+/// would push the enum from 88 to 104 bytes, taxing every clone through the
+/// join/sort/materializer hot paths).
+///
+/// `reifier` is `Some` when the edge has a reified annotation node; `None` for
+/// a plain edge. See [`Binding::Rel`] for the full semantics.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct RelValue {
+    pub start: Sid,
+    pub predicate: Sid,
+    pub end: Sid,
+    pub reifier: Option<Sid>,
+}
+
 /// A bound value in a solution - cheap to clone (Arc-backed strings)
 ///
 /// # Invariants
@@ -203,12 +218,10 @@ pub enum Binding {
     /// Produced by `relationships(p)` and by binding a variable-length relationship
     /// variable (`-[r:T*]->`). Consumed by `type`/`startNode`/`endNode`/
     /// `properties`/property-access. Opaque in join/scan/sort hot paths.
-    Rel {
-        start: Sid,
-        predicate: Sid,
-        end: Sid,
-        reifier: Option<Sid>,
-    },
+    ///
+    /// Boxed (see [`RelValue`]) so this rare variant does not inflate
+    /// `size_of::<Binding>()`.
+    Rel(Box<RelValue>),
 
     /// First-class list value (ordered sequence of element bindings).
     ///
@@ -792,7 +805,7 @@ impl From<&Binding> for bool {
             // A bound path is truthy (it exists); an absent path is `Unbound`.
             Binding::Path { .. } => true,
             // A bound relationship is truthy (it exists).
-            Binding::Rel { .. } => true,
+            Binding::Rel(_) => true,
             // Cypher: a non-empty list is truthy, an empty list falsy.
             Binding::List(items) => !items.is_empty(),
             // Cypher: a non-empty map is truthy, an empty map falsy.
@@ -941,22 +954,9 @@ impl PartialEq for Binding {
             // (so parallel relationships are distinct occurrences); a plain edge
             // (no reifier) by its (start, predicate, end). Eq and Hash MUST agree
             // on this — see `hash_binding`'s Rel arm.
-            (
-                Binding::Rel {
-                    start: a_s,
-                    predicate: a_p,
-                    end: a_e,
-                    reifier: a_r,
-                },
-                Binding::Rel {
-                    start: b_s,
-                    predicate: b_p,
-                    end: b_e,
-                    reifier: b_r,
-                },
-            ) => match (a_r, b_r) {
+            (Binding::Rel(a), Binding::Rel(b)) => match (&a.reifier, &b.reifier) {
                 (Some(x), Some(y)) => x == y,
-                (None, None) => a_s == b_s && a_p == b_p && a_e == b_e,
+                (None, None) => a.start == b.start && a.predicate == b.predicate && a.end == b.end,
                 _ => false,
             },
             (Binding::List(a), Binding::List(b)) => a == b,
@@ -1072,27 +1072,22 @@ impl std::hash::Hash for Binding {
                     e.hash(state);
                 }
             }
-            Binding::Rel {
-                start,
-                predicate,
-                end,
-                reifier,
-            } => {
+            Binding::Rel(rel) => {
                 12u8.hash(state);
                 // Mirror PartialEq: hash the reifier when present, else the
                 // (start, predicate, end) triple. The 0/1 tag keeps the two
                 // cases from colliding (a Some-reifier rel is never == a plain
                 // rel, so it must not hash the same either).
-                match reifier {
+                match &rel.reifier {
                     Some(r) => {
                         1u8.hash(state);
                         r.hash(state);
                     }
                     None => {
                         0u8.hash(state);
-                        start.hash(state);
-                        predicate.hash(state);
-                        end.hash(state);
+                        rel.start.hash(state);
+                        rel.predicate.hash(state);
+                        rel.end.hash(state);
                     }
                 }
             }
@@ -1643,11 +1638,13 @@ mod tests {
             h.finish()
         };
         let (s, p, e) = (Sid::new(1, "a"), Sid::new(2, "knows"), Sid::new(1, "b"));
-        let rel = |reifier: Option<Sid>| Binding::Rel {
-            start: s.clone(),
-            predicate: p.clone(),
-            end: e.clone(),
-            reifier,
+        let rel = |reifier: Option<Sid>| {
+            Binding::Rel(Box::new(RelValue {
+                start: s.clone(),
+                predicate: p.clone(),
+                end: e.clone(),
+                reifier,
+            }))
         };
         // Plain edges with the same SPO are equal and hash equal.
         assert_eq!(rel(None), rel(None));

@@ -467,17 +467,12 @@ fn write_binding_cell(
             }
         }
         // A relationship: `start-[type]->end` for pragmatic consumption.
-        Binding::Rel {
-            start,
-            predicate,
-            end,
-            ..
-        } => {
-            write_compacted_sid(cell, compactor, start)?;
+        Binding::Rel(rel) => {
+            write_compacted_sid(cell, compactor, &rel.start)?;
             cell.extend_from_slice(b"-[");
-            write_compacted_sid(cell, compactor, predicate)?;
+            write_compacted_sid(cell, compactor, &rel.predicate)?;
             cell.extend_from_slice(b"]->");
-            write_compacted_sid(cell, compactor, end)?;
+            write_compacted_sid(cell, compactor, &rel.end)?;
         }
         // A list: semicolon-separated elements (mirrors Grouped).
         Binding::List(values) => {

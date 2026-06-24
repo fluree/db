@@ -67,7 +67,7 @@ pub(crate) fn binding_subject_sid(
         }
         // A relationship value's "node" for property lookup is its reifier (the
         // edge-annotation node). A plain path edge has none → no properties.
-        Binding::Rel { reifier, .. } => Ok(reifier.clone()),
+        Binding::Rel(rel) => Ok(rel.reifier.clone()),
         Binding::Unbound | Binding::Poisoned => Ok(None),
         _ => Ok(None),
     }
@@ -569,7 +569,7 @@ pub fn eval_rel_type<R: RowAccess>(
     // `relationships(p)`); a reifier-node binding (bound `-[r:T]->`) needs the
     // `f:reifiesPredicate` lookup.
     let pred_sid = match &binding {
-        Binding::Rel { predicate, .. } => predicate.clone(),
+        Binding::Rel(rel) => rel.predicate.clone(),
         _ => {
             let Some(reifier) = binding_subject_sid(&binding, ctx)? else {
                 return Ok(None);
@@ -648,11 +648,11 @@ fn eval_rel_endpoint<R: RowAccess>(
     // A relationship value carries its endpoints intrinsically; a reifier-node
     // binding needs the `f:reifiesSubject`/`f:reifiesObject` lookup. `is_start`
     // selects the field for the Rel case.
-    if let Binding::Rel { start, end, .. } = &binding {
+    if let Binding::Rel(rel) = &binding {
         let node = if reifies_iri == fluree_vocab::reifies_iris::SUBJECT {
-            start
+            &rel.start
         } else {
-            end
+            &rel.end
         };
         return Ok(Some(ComparableValue::Sid(node.clone())));
     }

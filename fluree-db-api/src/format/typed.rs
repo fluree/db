@@ -216,12 +216,7 @@ fn write_value(
             out.push(']');
         }
         // A relationship renders as `{start, type, end}` with `{"@id":...}` refs.
-        Binding::Rel {
-            start,
-            predicate,
-            end,
-            ..
-        } => {
+        Binding::Rel(rel) => {
             let id_ref = |out: &mut String, sid: &fluree_db_core::Sid| -> Result<()> {
                 out.push_str(r#"{"@id":"#);
                 push_json_string(out, &compactor.compact_id_sid(sid)?);
@@ -229,11 +224,11 @@ fn write_value(
                 Ok(())
             };
             out.push_str(r#"{"start":"#);
-            id_ref(out, start)?;
+            id_ref(out, &rel.start)?;
             out.push_str(r#","type":"#);
-            id_ref(out, predicate)?;
+            id_ref(out, &rel.predicate)?;
             out.push_str(r#","end":"#);
-            id_ref(out, end)?;
+            id_ref(out, &rel.end)?;
             out.push('}');
         }
         // A list renders as a JSON array of its (typed) elements.
@@ -549,15 +544,10 @@ pub(crate) fn format_binding(
         }
 
         // A relationship - `{start, type, end}` with `{"@id":...}` refs.
-        Binding::Rel {
-            start,
-            predicate,
-            end,
-            ..
-        } => Ok(json!({
-            "start": {"@id": compactor.compact_id_sid(start)?},
-            "type": {"@id": compactor.compact_id_sid(predicate)?},
-            "end": {"@id": compactor.compact_id_sid(end)?},
+        Binding::Rel(rel) => Ok(json!({
+            "start": {"@id": compactor.compact_id_sid(&rel.start)?},
+            "type": {"@id": compactor.compact_id_sid(&rel.predicate)?},
+            "end": {"@id": compactor.compact_id_sid(&rel.end)?},
         })),
 
         // A list - array of its (typed) elements.

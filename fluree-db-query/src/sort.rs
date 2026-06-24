@@ -217,22 +217,14 @@ pub fn compare_bindings(a: &Binding, b: &Binding) -> Ordering {
         // Relationship: defensive total order. Includes `reifier` so the order
         // is consistent with PartialEq's reifier-or-(start,predicate,end)
         // identity (equal relationships compare Equal).
-        (
-            Binding::Rel {
-                start: a_s,
-                predicate: a_p,
-                end: a_e,
-                reifier: a_r,
-            },
-            Binding::Rel {
-                start: b_s,
-                predicate: b_p,
-                end: b_e,
-                reifier: b_r,
-            },
-        ) => (a_r, a_s, a_p, a_e).cmp(&(b_r, b_s, b_p, b_e)),
-        (_, Binding::Rel { .. }) => Ordering::Less,
-        (Binding::Rel { .. }, _) => Ordering::Greater,
+        (Binding::Rel(a), Binding::Rel(b)) => (&a.reifier, &a.start, &a.predicate, &a.end).cmp(&(
+            &b.reifier,
+            &b.start,
+            &b.predicate,
+            &b.end,
+        )),
+        (_, Binding::Rel(_)) => Ordering::Less,
+        (Binding::Rel(_), _) => Ordering::Greater,
 
         // List sorts last, element-wise (cypher rejects ORDER BY <list>, so
         // this is only a defensive total order).

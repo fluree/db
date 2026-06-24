@@ -327,7 +327,7 @@ impl Bm25SearchOperator {
                 Some(Binding::Grouped(_)) => Ok(None),
                 // A path or list value is not a search target.
                 Some(
-                    Binding::Path { .. } | Binding::Rel { .. } | Binding::List(_) | Binding::Map(_),
+                    Binding::Path { .. } | Binding::Rel(_) | Binding::List(_) | Binding::Map(_),
                 ) => Ok(None),
                 // EncodedSid/EncodedPid: decode to IRI string if store available
                 Some(Binding::EncodedSid { s_id, .. }) => {

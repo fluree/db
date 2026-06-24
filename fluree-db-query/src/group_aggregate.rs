@@ -496,15 +496,10 @@ pub(crate) fn binding_to_group_key_owned(binding: &Binding) -> GroupKeyOwned {
         // Relationship identity (matches PartialEq/Hash): the reifier when
         // present, else (start, predicate, end). The single-vs-triple length
         // keeps the two cases distinct.
-        Binding::Rel {
-            start,
-            predicate,
-            end,
-            reifier,
-        } => {
-            let sids: Vec<&Sid> = match reifier {
+        Binding::Rel(rel) => {
+            let sids: Vec<&Sid> = match &rel.reifier {
                 Some(r) => vec![r],
-                None => vec![start, predicate, end],
+                None => vec![&rel.start, &rel.predicate, &rel.end],
             };
             GroupKeyOwned::Seq(
                 sids.into_iter()
