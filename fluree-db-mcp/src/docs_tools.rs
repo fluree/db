@@ -1,15 +1,14 @@
-//! Standalone `fluree-docs` MCP service (feature `mcp`).
+//! The `docs` toolset: `docs_search` / `docs_get` / `docs_examples` / `docs_tree`
+//! over the embedded, version-pinned corpus in `fluree-db-docs`.
 //!
-//! Mirrors `fluree-db-memory`'s `MemoryToolService`: an rmcp tool service with
-//! its own service type, served on its own server (`fluree docs serve`). It is
-//! read-only over static, embedded content — safe to auto-allowlist in agents —
-//! and shares nothing with the memory service.
+//! Read-only over static content (safe to auto-allowlist). The tool bodies just
+//! delegate to [`fluree_db_docs::index`]; this module is the rmcp surface.
 
-use crate::index;
-use rmcp::handler::server::router::tool::ToolRouter;
+use crate::service::{json_result, FlureeMcpService};
+use fluree_db_docs::index;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::*;
-use rmcp::{tool, tool_handler, tool_router, RoleServer, ServerHandler};
+use rmcp::{tool, tool_router, RoleServer};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -56,21 +55,8 @@ pub struct DocsExamplesRequest {
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct DocsTreeRequest {}
 
-/// MCP tool service for embedded, version-pinned Fluree documentation.
-#[derive(Clone)]
-pub struct DocsToolService {
-    tool_router: ToolRouter<DocsToolService>,
-}
-
-#[tool_router]
-impl DocsToolService {
-    /// Create a new docs tool service.
-    pub fn new() -> Self {
-        Self {
-            tool_router: Self::tool_router(),
-        }
-    }
-
+#[tool_router(router = docs_router, vis = "pub(crate)")]
+impl FlureeMcpService {
     /// Ranked, section-level documentation search.
     #[tool(
         description = "Search the embedded, version-pinned Fluree documentation. Returns ranked section-level hits (path, heading anchor, title, snippet). Results are pinned to this binary's version, so they match the Fluree you're building against. Use specific topic words ('property paths', 'policy', 'vector index'). Follow up with docs_get for the full text."
@@ -128,44 +114,12 @@ impl DocsToolService {
     }
 }
 
-impl Default for DocsToolService {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// Serialize a result payload to pretty JSON as a successful tool result.
-fn json_result<T: Serialize>(value: &T) -> Result<CallToolResult, rmcp::ErrorData> {
-    let text = serde_json::to_string_pretty(value).unwrap_or_else(|_| "[]".to_string());
-    Ok(CallToolResult::success(vec![Content::text(text)]))
-}
-
-#[tool_handler]
-impl ServerHandler for DocsToolService {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo {
-            protocol_version: ProtocolVersion::LATEST,
-            capabilities: ServerCapabilities::builder().enable_tools().build(),
-            server_info: Implementation {
-                name: "fluree-docs".to_string(),
-                version: env!("CARGO_PKG_VERSION").to_string(),
-                title: Some("Fluree Documentation".to_string()),
-                icons: None,
-                website_url: Some("https://flur.ee".to_string()),
-            },
-            instructions: Some(
-                "Fluree Documentation — version-pinned, read-only docs for the Fluree you're \
-                 building against.\n\n\
-                 WHEN TO USE:\n\
-                 - Before writing or debugging any Fluree query, transaction, policy, or config: \
-                   call docs_search with specific topic words (e.g. 'property paths', \
-                   'optional patterns', 'time travel', 'policy enforcement').\n\
-                 - docs_get to read a full page or a single section once docs_search points you at it.\n\
-                 - docs_examples to pull ready-to-adapt code blocks for a feature.\n\n\
-                 These results are pinned to this binary's version — trust them over guessing or \
-                 training-data recall."
-                    .to_string(),
-            ),
-        }
-    }
-}
+/// Per-toolset guidance fragment, merged into the unified server's `get_info`
+/// instructions when the `docs` toolset is enabled.
+pub(crate) const DOCS_INSTRUCTIONS: &str = "DOCS (version-pinned, read-only):\n\
+     - Before writing or debugging any Fluree query, transaction, policy, or config, call \
+       docs_search with specific topic words (e.g. 'property paths', 'optional patterns', \
+       'time travel', 'policy enforcement').\n\
+     - docs_get reads a full page or a single section once docs_search points you at it.\n\
+     - docs_examples pulls ready-to-adapt code blocks.\n\
+     These results are pinned to this binary's version — trust them over training-data recall.";

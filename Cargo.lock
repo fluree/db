@@ -2474,6 +2474,7 @@ dependencies = [
  "fluree-db-credential",
  "fluree-db-docs",
  "fluree-db-indexer",
+ "fluree-db-mcp",
  "fluree-db-memory",
  "fluree-db-nameservice",
  "fluree-db-nameservice-sync",
@@ -2494,7 +2495,6 @@ dependencies = [
  "predicates",
  "rand 0.8.5",
  "reqwest",
- "rmcp",
  "serde",
  "serde_json",
  "sha2",
@@ -2622,13 +2622,11 @@ dependencies = [
 
 [[package]]
 name = "fluree-db-docs"
-version = "4.0.6"
+version = "4.1.0"
 dependencies = [
  "pulldown-cmark",
- "rmcp",
  "rust-embed",
  "rust-stemmers",
- "schemars 1.2.1",
  "serde",
  "serde_json",
 ]
@@ -2716,6 +2714,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "fluree-db-mcp"
+version = "4.1.0"
+dependencies = [
+ "fluree-db-docs",
+ "fluree-db-memory",
+ "rmcp",
+ "schemars 1.2.1",
+ "serde",
+ "serde_json",
+ "tracing",
+]
+
+[[package]]
 name = "fluree-db-memory"
 version = "4.1.0"
 dependencies = [
@@ -2726,8 +2737,6 @@ dependencies = [
  "fluree-graph-turtle",
  "fs2",
  "regex",
- "rmcp",
- "schemars 1.2.1",
  "serde",
  "serde_json",
  "sha2",

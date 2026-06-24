@@ -3,8 +3,6 @@ pub mod error;
 pub mod file_sync;
 pub mod format;
 pub mod id;
-#[cfg(feature = "mcp")]
-pub mod mcp;
 pub mod recall;
 pub mod schema;
 pub mod secrets;
@@ -20,8 +18,6 @@ pub use format::{
     format_related_memories, format_status_text, format_text,
 };
 pub use id::generate_memory_id;
-#[cfg(feature = "mcp")]
-pub use mcp::MemoryToolService;
 pub use recall::RecallEngine;
 pub use secrets::SecretDetector;
 pub use store::MemoryStore;

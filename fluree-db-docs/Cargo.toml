@@ -6,11 +6,6 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
-[features]
-default = []
-# Optional rmcp-backed `DocsToolService` for the standalone `fluree-docs` MCP server.
-mcp = ["dep:rmcp", "dep:schemars"]
-
 [dependencies]
 # `include-exclude` enables the #[exclude] attribute. NOTE: do not enable the
 # `compression` feature — Cargo unifies it onto every rust-embed user in the
@@ -22,10 +17,6 @@ pulldown-cmark = "0.12"
 rust-stemmers = "1"
 serde = { workspace = true }
 serde_json = { workspace = true }
-
-# MCP support (optional) — mirrors fluree-db-memory's `mcp` feature.
-rmcp = { workspace = true, optional = true }
-schemars = { workspace = true, optional = true }
 
 [lints]
 workspace = true

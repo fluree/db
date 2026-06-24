@@ -16,7 +16,7 @@ pub mod init;
 pub mod insert;
 pub mod list;
 pub mod log;
-pub mod mcp_serve;
+pub mod mcp;
 pub mod memory;
 pub mod multi_query;
 pub mod prefix;

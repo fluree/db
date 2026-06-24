@@ -1,15 +1,15 @@
-//! `fluree docs` — search, read, and extract examples from the embedded,
-//! version-pinned documentation, plus serve them over MCP (`fluree docs serve`).
+//! `fluree docs` — the human-facing CLI to search, read, and extract examples
+//! from the embedded, version-pinned documentation.
 //!
 //! The corpus is baked into the binary by `fluree-db-docs`, so every result is
-//! offline and version-exact for this build. The `serve` subcommand starts the
-//! standalone `fluree-docs` MCP server (separate from `fluree mcp serve`, which
-//! serves developer memory).
+//! offline and version-exact for this build. The same corpus is exposed to
+//! agents as the `docs` toolset of the unified MCP server (`fluree mcp serve
+//! --toolsets docs`); this module is only the human CLI.
 
 use crate::cli::DocsAction;
 use crate::error::{CliError, CliResult};
 
-pub async fn run(action: DocsAction) -> CliResult<()> {
+pub fn run(action: DocsAction) -> CliResult<()> {
     match action {
         DocsAction::Search { query, limit, json } => search(&query, limit, json),
         DocsAction::Get { path, anchor, json } => get(&path, anchor.as_deref(), json),
@@ -20,7 +20,6 @@ pub async fn run(action: DocsAction) -> CliResult<()> {
             json,
         } => examples(&query, lang.as_deref(), limit, json),
         DocsAction::Tree { json } => tree(json),
-        DocsAction::Serve { transport } => serve(&transport).await,
     }
 }
 
@@ -123,28 +122,6 @@ fn print_node(node: &fluree_db_docs::TreeNode, depth: usize) {
     for child in &node.children {
         print_node(child, depth + 1);
     }
-}
-
-/// Start the standalone `fluree-docs` MCP server. Reads JSON-RPC over stdio, so
-/// it must not write to stdout/stderr.
-async fn serve(transport: &str) -> CliResult<()> {
-    if transport != "stdio" {
-        return Err(CliError::Usage(format!(
-            "unsupported MCP transport '{transport}'; valid: stdio"
-        )));
-    }
-
-    use rmcp::ServiceExt;
-    let service = fluree_db_docs::mcp::DocsToolService::new();
-    let server = service
-        .serve(rmcp::transport::io::stdio())
-        .await
-        .map_err(|e| CliError::Config(format!("failed to start docs MCP server: {e}")))?;
-    server
-        .waiting()
-        .await
-        .map_err(|e| CliError::Config(format!("docs MCP server error: {e}")))?;
-    Ok(())
 }
 
 fn version() -> &'static str {

@@ -7,18 +7,14 @@
 //! exact Fluree database) the agent is working against.
 //!
 //! Two surfaces consume this crate identically:
-//! - the `fluree docs` CLI subcommand, and
-//! - the standalone `fluree-docs` MCP server ([`mcp::DocsToolService`], behind
-//!   the `mcp` feature).
+//! - the `fluree docs` human CLI subcommand, and
+//! - the `docs` toolset of the unified `fluree-db-mcp` service.
 
 mod embed;
 mod index;
 mod model;
 mod parse;
 mod search;
-
-#[cfg(feature = "mcp")]
-pub mod mcp;
 
 pub use index::DocsIndex;
 pub use model::{CodeBlock, DocsTree, Example, Page, SearchHit, Section, TreeNode, VERSION};

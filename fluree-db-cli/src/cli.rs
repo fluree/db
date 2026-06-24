@@ -1163,14 +1163,22 @@ pub enum BranchAction {
 /// Memory subcommands.
 #[derive(Subcommand)]
 pub enum MemoryAction {
-    /// Initialize the memory store and configure MCP for detected AI tools
+    /// Deprecated: use `fluree mcp init --toolsets memory`. Hidden back-compat
+    /// alias — registers the memory MCP server with detected/selected IDEs. The
+    /// store is now created lazily on first use, so there is nothing to
+    /// initialize up front.
+    #[command(hide = true)]
     Init {
-        /// Auto-confirm all detected tool installations (non-interactive)
-        #[arg(long, short = 'y')]
+        /// Target IDE (auto-detected if omitted)
+        #[arg(long)]
+        ide: Option<String>,
+
+        /// Accepted for back-compat; no longer affects behavior.
+        #[arg(long, short = 'y', hide = true)]
         yes: bool,
 
-        /// Skip MCP tool detection and installation
-        #[arg(long)]
+        /// Accepted for back-compat; no longer affects behavior.
+        #[arg(long, hide = true)]
         no_mcp: bool,
     },
 
@@ -1283,7 +1291,9 @@ pub enum MemoryAction {
         file: std::path::PathBuf,
     },
 
-    /// Install MCP configuration for an IDE
+    /// Deprecated: use `fluree mcp init --toolsets memory`. Hidden back-compat
+    /// alias.
+    #[command(hide = true)]
     McpInstall {
         /// Target: claude-code, vscode, cursor, windsurf, zed (auto-detected if omitted)
         #[arg(long)]
@@ -1291,25 +1301,48 @@ pub enum MemoryAction {
     },
 }
 
-/// MCP subcommands.
+/// MCP subcommands. One `fluree` MCP server exposes a selectable set of
+/// toolsets (`memory`, `docs`) over a single stdio transport.
 #[derive(Subcommand)]
 pub enum McpAction {
-    /// Start the developer-memory MCP server (stdio transport for IDE integration)
+    /// Register Fluree's MCP server with an IDE (writes the IDE's MCP config)
+    Init {
+        /// Target: claude-code, vscode, cursor, windsurf, zed (auto-detected if omitted)
+        #[arg(long)]
+        ide: Option<String>,
+
+        /// Which toolset(s) to enable: `memory`, `docs`, a comma-separated list,
+        /// or `all` (default).
+        #[arg(long, default_value = "all")]
+        toolsets: String,
+    },
+
+    /// Start the Fluree MCP server (stdio transport for IDE integration)
     Serve {
         /// Transport: stdio (default) — reads JSON-RPC from stdin, writes to stdout
         #[arg(long, default_value = "stdio")]
         transport: String,
+
+        /// Which toolset(s) to expose: `memory`, `docs`, a comma-separated list,
+        /// or `all`. Defaults to `memory` for back-compat when omitted; `init`
+        /// always writes an explicit `--toolsets` into the args it installs.
+        #[arg(long, default_value = "memory")]
+        toolsets: String,
     },
 
-    /// Register Fluree's MCP servers with an IDE (memory and/or docs)
+    /// Show which toolsets are installed for each detected IDE
+    Status,
+
+    /// Deprecated alias for `init`.
+    #[command(hide = true)]
     Install {
         /// Target: claude-code, vscode, cursor, windsurf, zed (auto-detected if omitted)
         #[arg(long)]
         ide: Option<String>,
 
-        /// Which server(s) to register: memory, docs, or all (default)
+        /// Which toolset(s) to enable (alias of `init`'s `--toolsets`).
         #[arg(long, default_value = "all")]
-        server: String,
+        toolsets: String,
     },
 }
 
@@ -1358,12 +1391,6 @@ pub enum DocsAction {
         /// Emit JSON instead of an indented tree
         #[arg(long)]
         json: bool,
-    },
-    /// Start the standalone `fluree-docs` MCP server (stdio transport)
-    Serve {
-        /// Transport: stdio (default) — reads JSON-RPC from stdin, writes to stdout
-        #[arg(long, default_value = "stdio")]
-        transport: String,
     },
 }
 

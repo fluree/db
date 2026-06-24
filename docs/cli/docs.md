@@ -1,9 +1,12 @@
 # fluree docs
 
-Search and read the Fluree documentation from the command line, and serve it to
-IDE agents over MCP. The docs are **embedded in the `fluree` binary**, so lookups
-work offline and are **version-exact for this build** — they match the Fluree
-you're developing against, with no "latest"-vs-installed drift.
+Search and read the Fluree documentation from the command line. The docs are
+**embedded in the `fluree` binary**, so lookups work offline and are
+**version-exact for this build** — they match the Fluree you're developing
+against, with no "latest"-vs-installed drift.
+
+This is the human-facing CLI. The same corpus is exposed to IDE agents as the
+`docs` toolset of the MCP server — see [`fluree mcp`](mcp.md).
 
 ## Usage
 
@@ -19,7 +22,6 @@ fluree docs <COMMAND>
 | `get` | Print a page, or one heading section, as markdown |
 | `examples` | Extract code examples for a topic |
 | `tree` | Print the documentation table of contents |
-| `serve` | Start the standalone `fluree-docs` MCP server |
 
 No `.fluree/` directory or running database is required — these work in any
 directory.
@@ -101,22 +103,11 @@ fluree docs tree
 Only pages listed in `SUMMARY.md` appear; a markdown file not in the TOC is still
 searchable and retrievable by path, but won't show in the tree.
 
-## fluree docs serve
+## Docs for IDE agents (MCP)
 
-Start the standalone **`fluree-docs`** MCP server, which exposes the same lookup
-to IDE agents. It is read-only over static, embedded content — safe to
-auto-allow with no permission friction — and is **separate** from the
-developer-memory server ([`fluree mcp serve`](mcp.md)).
-
-```bash
-fluree docs serve [--transport <TRANSPORT>]
-```
-
-| Option | Description |
-|--------|-------------|
-| `--transport <TRANSPORT>` | Transport protocol: `stdio` (default) |
-
-### Tools
+The same lookup is exposed to IDE agents as the **`docs` toolset** of the
+unified Fluree MCP server — there is no separate docs server. It is read-only
+over static, embedded content (safe to auto-allow), and surfaces four tools:
 
 | Tool | Description |
 |------|-------------|
@@ -128,47 +119,16 @@ fluree docs serve [--transport <TRANSPORT>]
 Every result carries a `version` field matching the binary, so the agent can
 trust it over training-data recall.
 
-### IDE configuration
-
-`fluree mcp install` registers **both** the memory and docs servers in one step
-(see [mcp install](mcp.md#fluree-mcp-install)). To add only the docs server —
-e.g. in a project that doesn't use Fluree Memory — scope it with `--server`:
+Register it with your IDE (docs only, no `.fluree/` directory needed):
 
 ```bash
-fluree mcp install --server docs
+fluree mcp init --toolsets docs
 ```
 
-Or register it manually with your agent:
-
-```bash
-claude mcp add -t stdio fluree-docs -- fluree docs serve --transport stdio
-```
-
-Or add it to your IDE's MCP config:
-
-```json
-{
-  "mcpServers": {
-    "fluree-docs": {
-      "type": "stdio",
-      "command": "/path/to/fluree",
-      "args": ["docs", "serve", "--transport", "stdio"]
-    }
-  }
-}
-```
-
-### Testing with JSON-RPC
-
-```bash
-printf '%s\n' \
-  '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"smoke","version":"0.0"}}}' \
-  '{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}' \
-  '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}' \
-  | fluree docs serve --transport stdio
-```
+See [`fluree mcp`](mcp.md) for the full command surface, manual config, and
+combining `docs` with the `memory` toolset.
 
 ## See Also
 
-- [mcp](mcp.md) — the developer-memory MCP server (`fluree mcp serve`) and `fluree mcp install`
+- [mcp](mcp.md) — the unified MCP server (`fluree mcp init` / `serve` / `status`) and its toolsets
 - [Memory: IDE support matrix](../memory/reference/ide-matrix.md) — per-IDE MCP config file paths and keys
