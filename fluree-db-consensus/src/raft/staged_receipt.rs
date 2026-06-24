@@ -22,6 +22,7 @@ use crate::raft::state_machine::RefKey;
 use dashmap::DashMap;
 use fluree_db_api::{ConflictStrategy, IndexingStatus, TrackingTally};
 use fluree_db_core::{CommitId, ContentId};
+use serde::{Deserialize, Serialize};
 
 /// Typed receipt the worker stashes after staging and before
 /// proposing [`ApplyHead`](super::state_machine::Command::ApplyHead).
@@ -29,7 +30,12 @@ use fluree_db_core::{CommitId, ContentId};
 /// One variant per queue-mediated `Committer` method, plus
 /// [`Minimal`](Self::Minimal) for the fallback case where the
 /// adapter resolves a waiter without finding a stashed receipt.
-#[derive(Debug)]
+///
+/// `Serialize`/`Deserialize` so a follower-staged receipt can ferry
+/// to the leader over the cross-node `apply_head_on_behalf` RPC —
+/// the leader's adapter then resolves the parked waiter with the
+/// typed payload instead of falling back to [`Minimal`](Self::Minimal).
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum AppliedReceipt {
     Transact(TransactApplied),
     Push(PushApplied),
@@ -73,7 +79,7 @@ impl AppliedReceipt {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TransactApplied {
     pub commit_id: ContentId,
     pub commit_t: i64,
@@ -81,7 +87,7 @@ pub struct TransactApplied {
     pub tally: Option<TrackingTally>,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PushApplied {
     pub commit_id: ContentId,
     pub commit_t: i64,
@@ -89,7 +95,7 @@ pub struct PushApplied {
     pub indexing: IndexingStatus,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RevertApplied {
     pub commit_id: ContentId,
     pub commit_t: i64,
@@ -98,7 +104,7 @@ pub struct RevertApplied {
     pub strategy: ConflictStrategy,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MergeApplied {
     pub commit_id: ContentId,
     pub commit_t: i64,
@@ -108,7 +114,7 @@ pub struct MergeApplied {
     pub strategy: ConflictStrategy,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RebaseApplied {
     pub commit_id: ContentId,
     pub commit_t: i64,
