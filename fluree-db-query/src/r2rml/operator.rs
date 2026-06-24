@@ -93,6 +93,13 @@ impl R2rmlScanOperator {
             }
         }
 
+        // Add same-subject star object variables if new
+        for (_, var) in &pattern.star_bindings {
+            if seen.insert(*var) {
+                schema_vars.push(*var);
+            }
+        }
+
         // Build output position map
         let out_pos: HashMap<VarId, usize> = schema_vars
             .iter()
@@ -111,6 +118,20 @@ impl R2rmlScanOperator {
             pending: VecDeque::new(),
             state: OperatorState::Created,
         }
+    }
+
+    /// All predicate IRIs this pattern materializes: the base `predicate_filter`
+    /// plus any same-subject star members. Used for projection and parent-lookup
+    /// building so a star scan reads every needed column in one pass.
+    fn pattern_predicates(&self) -> Vec<&str> {
+        let mut preds: Vec<&str> = Vec::new();
+        if let Some(p) = self.pattern.predicate_filter.as_deref() {
+            preds.push(p);
+        }
+        for (pred, _) in &self.pattern.star_bindings {
+            preds.push(pred.as_str());
+        }
+        preds
     }
 
     /// Convert an RdfTerm to a Binding.
@@ -163,6 +184,27 @@ impl R2rmlScanOperator {
                         .active_snapshot
                         .encode_iri(xsd::STRING)
                         .unwrap_or(xsd_string_fallback),
+                };
+
+                // Coerce numeric XSD literals from their string form to the typed
+                // FlakeValue. Arithmetic/aggregation read the value (not the
+                // datatype Sid), so a String-backed xsd:decimal/integer/double
+                // would otherwise fail with a type mismatch. Non-numeric
+                // datatypes (string, date, ...) keep the String form, which the
+                // compare/datetime paths already handle.
+                let val = match dtc {
+                    Some(UnresolvedDatatypeConstraint::Explicit(dt_iri)) => {
+                        match fluree_db_core::coerce_value(val.clone(), dt_iri.as_ref()) {
+                            Ok(
+                                c @ (FlakeValue::Long(_)
+                                | FlakeValue::Double(_)
+                                | FlakeValue::BigInt(_)
+                                | FlakeValue::Decimal(_)),
+                            ) => c,
+                            _ => val,
+                        }
+                    }
+                    _ => val,
                 };
                 Ok(Binding::lit(val, dt_sid))
             }
@@ -376,13 +418,29 @@ impl Operator for R2rmlScanOperator {
                     QueryError::InvalidQuery("TriplesMap has no logical table".to_string())
                 })?;
 
-                // Determine projection columns needed based on predicate filter
-                // When a predicate filter is present, only project columns needed for that predicate
-                let projection: Vec<String> = triples_map
-                    .columns_for_predicate(self.pattern.predicate_filter.as_deref())
-                    .into_iter()
-                    .map(std::string::ToString::to_string)
-                    .collect();
+                // Determine projection columns. For a same-subject star, project
+                // the union of columns needed for every star predicate so the
+                // whole star is satisfied by one scan.
+                let projection: Vec<String> = if self.pattern.star_bindings.is_empty() {
+                    triples_map
+                        .columns_for_predicate(self.pattern.predicate_filter.as_deref())
+                        .into_iter()
+                        .map(std::string::ToString::to_string)
+                        .collect()
+                } else {
+                    let mut cols: Vec<String> = Vec::new();
+                    for pred in self.pattern_predicates() {
+                        cols.extend(
+                            triples_map
+                                .columns_for_predicate(Some(pred))
+                                .into_iter()
+                                .map(std::string::ToString::to_string),
+                        );
+                    }
+                    cols.sort();
+                    cols.dedup();
+                    cols
+                };
 
                 // Scan the table
                 let as_of_t = if ctx.dataset.is_some() {
@@ -403,12 +461,19 @@ impl Operator for R2rmlScanOperator {
                 // Key: (parent_tm_iri, parent_join_cols) -> ParentLookup
                 let mut parent_lookups: HashMap<LookupCacheKey, ParentLookup> = HashMap::new();
 
-                // Only process POMs that pass the predicate filter
+                // Only process POMs that pass the predicate filter. For a star,
+                // include POMs for any of the star predicates so RefObjectMap
+                // lookups are available during the wide-row emit below.
+                let star_preds = self.pattern_predicates();
                 let filtered_poms: Vec<_> = triples_map
                     .predicate_object_maps
                     .iter()
                     .filter(|pom| {
-                        if let Some(ref pred_filter) = self.pattern.predicate_filter {
+                        if !self.pattern.star_bindings.is_empty() {
+                            pom.predicate_map
+                                .as_constant()
+                                .is_some_and(|p| star_preds.contains(&p))
+                        } else if let Some(ref pred_filter) = self.pattern.predicate_filter {
                             pom.predicate_map.as_constant() == Some(pred_filter.as_str())
                         } else {
                             true
@@ -599,6 +664,132 @@ impl Operator for R2rmlScanOperator {
                                         self.pending.push_back(out_row);
                                     }
                                 }};
+                            }
+
+                            // Same-subject star: materialize every star predicate
+                            // from THIS table row and emit the cross product in one
+                            // pass — no self-join. Each predicate is required (inner
+                            // join semantics), so a null in any drops the row.
+                            if !self.pattern.star_bindings.is_empty() {
+                                // (object_var, predicate) for base + star members.
+                                let mut members: Vec<(VarId, &str)> = Vec::new();
+                                if let (Some(ov), Some(pf)) = (
+                                    self.pattern.object_var,
+                                    self.pattern.predicate_filter.as_deref(),
+                                ) {
+                                    members.push((ov, pf));
+                                }
+                                for (pred, var) in &self.pattern.star_bindings {
+                                    members.push((*var, pred.as_str()));
+                                }
+
+                                let mut binding_lists: Vec<(VarId, Vec<Binding>)> =
+                                    Vec::with_capacity(members.len());
+                                let mut row_ok = true;
+                                for (var, pred) in &members {
+                                    let mut vals: Vec<Binding> = Vec::new();
+                                    for pom in triples_map
+                                        .predicate_object_maps
+                                        .iter()
+                                        .filter(|p| p.predicate_map.as_constant() == Some(*pred))
+                                    {
+                                        let object_term = if let ObjectMap::RefObjectMap(ref rom) =
+                                            pom.object_map
+                                        {
+                                            let child_columns: Vec<String> = rom
+                                                .child_columns()
+                                                .into_iter()
+                                                .map(std::string::ToString::to_string)
+                                                .collect();
+                                            let child_key = match get_join_key_from_batch(
+                                                &child_columns,
+                                                iceberg_batch,
+                                                table_row_idx,
+                                            ) {
+                                                Some(k) => k,
+                                                None => continue,
+                                            };
+                                            let mut parent_join_cols: Vec<String> = rom
+                                                .parent_columns()
+                                                .into_iter()
+                                                .map(std::string::ToString::to_string)
+                                                .collect();
+                                            parent_join_cols.sort();
+                                            let lookup_key =
+                                                (rom.parent_triples_map.clone(), parent_join_cols);
+                                            match parent_lookups
+                                                .get(&lookup_key)
+                                                .and_then(|l| l.get(&child_key))
+                                            {
+                                                Some(parent_subject) => {
+                                                    Some(parent_subject.clone())
+                                                }
+                                                None => continue,
+                                            }
+                                        } else {
+                                            materialize_object_from_batch(
+                                                &pom.object_map,
+                                                iceberg_batch,
+                                                table_row_idx,
+                                            )?
+                                        };
+                                        if let Some(t) = object_term {
+                                            vals.push(self.term_to_binding(&t, ctx)?);
+                                        }
+                                    }
+                                    if vals.is_empty() {
+                                        row_ok = false;
+                                        break;
+                                    }
+                                    binding_lists.push((*var, vals));
+                                }
+                                if !row_ok {
+                                    continue; // required predicate missing → drop row
+                                }
+
+                                // Build base row (child cols + subject), then expand
+                                // by the cross product of each predicate's values.
+                                let mut base_row: Vec<Binding> = vec![Binding::Unbound; num_cols];
+                                for (col_idx, &var) in child_schema.iter().enumerate() {
+                                    let out_idx = *self.out_pos.get(&var).unwrap();
+                                    base_row[out_idx] = child_batch.column_by_idx(col_idx).unwrap()
+                                        [row_idx]
+                                        .clone();
+                                }
+                                let subj_pos =
+                                    *self.out_pos.get(&self.pattern.subject_var).unwrap();
+                                base_row[subj_pos] = subject_binding.clone();
+
+                                let mut rows: Vec<Vec<Binding>> = vec![base_row];
+                                for (var, vals) in &binding_lists {
+                                    let pos = *self.out_pos.get(var).unwrap();
+                                    if vals.len() == 1 {
+                                        for r in &mut rows {
+                                            r[pos] = vals[0].clone();
+                                        }
+                                    } else {
+                                        let mut next = Vec::with_capacity(rows.len() * vals.len());
+                                        for r in &rows {
+                                            for v in vals {
+                                                let mut nr = r.clone();
+                                                nr[pos] = v.clone();
+                                                next.push(nr);
+                                            }
+                                        }
+                                        rows = next;
+                                    }
+                                }
+                                for out_row in rows {
+                                    ctx.tracker.consume_fuel(1)?;
+                                    if columns[0].len() < ctx.batch_size {
+                                        for (col_idx, binding) in out_row.into_iter().enumerate() {
+                                            columns[col_idx].push(binding);
+                                        }
+                                    } else {
+                                        self.pending.push_back(out_row);
+                                    }
+                                }
+                                continue; // Next table row
                             }
 
                             // Fast path: if object_var is None, this is a subject-only pattern

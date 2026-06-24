@@ -26,7 +26,9 @@
 
 use crate::ir::triple::{Ref, Term, TriplePattern};
 use crate::ir::{Pattern, R2rmlPattern};
+use crate::var_registry::VarId;
 use fluree_db_core::LedgerSnapshot;
+use std::collections::HashSet;
 
 /// Result of rewriting patterns for R2RML.
 #[derive(Debug)]
@@ -63,13 +65,30 @@ pub fn rewrite_patterns_for_r2rml(
     let mut converted = 0;
     let mut unconverted = 0;
 
+    // Same-subject star grouping: accumulate regular-predicate R2RML patterns
+    // (const predicate + fresh object var) by subject so they can be merged into
+    // a single scan, eliminating the O(N^2) self-join. First-seen order preserved.
+    let mut star_groups: Vec<(VarId, Vec<R2rmlPattern>)> = Vec::new();
+
     for pattern in patterns {
         match pattern {
             Pattern::Triple(tp) => {
                 if let Some(r2rml_pattern) = convert_triple_to_r2rml(tp, graph_source_id, snapshot)
                 {
-                    result_patterns.push(Pattern::R2rml(r2rml_pattern));
                     converted += 1;
+                    if is_star_eligible(&r2rml_pattern) {
+                        match star_groups
+                            .iter_mut()
+                            .find(|(s, _)| *s == r2rml_pattern.subject_var)
+                        {
+                            Some((_, members)) => members.push(r2rml_pattern),
+                            None => {
+                                star_groups.push((r2rml_pattern.subject_var, vec![r2rml_pattern]));
+                            }
+                        }
+                    } else {
+                        result_patterns.push(Pattern::R2rml(r2rml_pattern));
+                    }
                 } else {
                     // Keep original pattern if conversion fails
                     result_patterns.push(pattern.clone());
@@ -115,11 +134,56 @@ pub fn rewrite_patterns_for_r2rml(
         }
     }
 
+    // Emit star groups. Single-member groups stay on the normal single-object
+    // path; multi-member groups with distinct object vars merge into one scan.
+    for (_subject, mut members) in star_groups {
+        if members.len() == 1 {
+            result_patterns.push(Pattern::R2rml(members.pop().unwrap()));
+            continue;
+        }
+        let mut seen_obj = HashSet::new();
+        let distinct = members
+            .iter()
+            .all(|m| m.object_var.is_some_and(|v| seen_obj.insert(v)));
+        if !distinct {
+            // Shared object var implies a self-join constraint; keep separate.
+            for m in members {
+                result_patterns.push(Pattern::R2rml(m));
+            }
+            continue;
+        }
+        let mut base = members.remove(0);
+        base.star_bindings = members
+            .into_iter()
+            .map(|m| {
+                (
+                    m.predicate_filter.expect("star-eligible has predicate"),
+                    m.object_var.expect("star-eligible has object var"),
+                )
+            })
+            .collect();
+        result_patterns.push(Pattern::R2rml(base));
+    }
+
     R2rmlRewriteResult {
         patterns: result_patterns,
         converted_count: converted,
         unconverted_count: unconverted,
     }
+}
+
+/// A regular-predicate R2RML pattern that can join via the subject: constant
+/// predicate, a fresh object var distinct from the subject, no class/TM filter.
+/// These are the patterns that can be merged into a same-subject star scan.
+fn is_star_eligible(p: &R2rmlPattern) -> bool {
+    p.predicate_filter.is_some()
+        && p.class_filter.is_none()
+        && p.triples_map_iri.is_none()
+        && p.star_bindings.is_empty()
+        && match p.object_var {
+            Some(obj) => obj != p.subject_var,
+            None => false,
+        }
 }
 
 /// Convert a triple pattern to an R2RML pattern.
