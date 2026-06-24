@@ -103,12 +103,12 @@ pub struct RaftNameService {
 }
 
 /// Per-node forwarding configuration for [`RaftNameService`]. Held as
-/// a unit so callers can't partially configure (e.g. set `self_id`
-/// but forget `http_client`) — both are needed for any forwarding to
+/// a unit so callers can't partially configure (e.g. set `id` but
+/// forget `http_client`) — both are needed for any forwarding to
 /// happen.
 #[derive(Clone)]
 struct ForwardingConfig {
-    self_id: NodeId,
+    id: NodeId,
     http_client: reqwest::Client,
 }
 
@@ -137,11 +137,8 @@ impl RaftNameService {
     /// non-leader node POSTs to the current leader's
     /// `apply_staged_commit` endpoint instead of attempting a local
     /// propose; without it, the previous leader-only contract holds.
-    pub fn with_forwarding(mut self, self_id: NodeId, http_client: reqwest::Client) -> Self {
-        self.forwarding = Some(ForwardingConfig {
-            self_id,
-            http_client,
-        });
+    pub fn with_forwarding(mut self, id: NodeId, http_client: reqwest::Client) -> Self {
+        self.forwarding = Some(ForwardingConfig { id, http_client });
         self
     }
 }
@@ -711,7 +708,7 @@ impl CommitPublisher for RaftNameService {
         // just bounce back as ForwardToLeader). Without forwarding,
         // the legacy leader-only contract applies.
         if let Some(forwarding) = &self.forwarding {
-            if !self.is_local_leader(forwarding.self_id).await {
+            if !self.is_local_leader(forwarding.id).await {
                 return self
                     .publish_commit_via_leader(ledger_id, commit_t, commit_id, forwarding)
                     .await;
@@ -733,8 +730,8 @@ impl CommitPublisher for RaftNameService {
 }
 
 impl RaftNameService {
-    async fn is_local_leader(&self, self_id: NodeId) -> bool {
-        self.raft.current_leader().await == Some(self_id)
+    async fn is_local_leader(&self, id: NodeId) -> bool {
+        self.raft.current_leader().await == Some(id)
     }
 
     /// In-process propose path — used on the leader and as the

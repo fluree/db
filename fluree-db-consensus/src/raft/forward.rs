@@ -100,17 +100,13 @@ const MAX_FORWARD_HOPS: u32 = 2;
 #[derive(Clone)]
 pub struct LeaderForwarder {
     raft: Arc<Raft<TypeConfig>>,
-    self_id: NodeId,
+    id: NodeId,
     client: reqwest::Client,
 }
 
 impl LeaderForwarder {
-    pub fn new(raft: Arc<Raft<TypeConfig>>, self_id: NodeId, client: reqwest::Client) -> Self {
-        Self {
-            raft,
-            self_id,
-            client,
-        }
+    pub fn new(raft: Arc<Raft<TypeConfig>>, id: NodeId, client: reqwest::Client) -> Self {
+        Self { raft, id, client }
     }
 
     /// Decide whether this node should serve the request locally or
@@ -128,7 +124,7 @@ impl LeaderForwarder {
         let Some(leader_id) = self.raft.current_leader().await else {
             return ForwardDecision::NoLeader;
         };
-        if leader_id == self.self_id {
+        if leader_id == self.id {
             return ForwardDecision::Local;
         }
         let nodes: Vec<(NodeId, ClusterNode)> = self
@@ -141,7 +137,7 @@ impl LeaderForwarder {
             .collect();
         let allow_loopback = nodes
             .iter()
-            .find(|(id, _)| *id == self.self_id)
+            .find(|(id, _)| *id == self.id)
             .map(|(_, node)| self_addr_is_loopback(&node.client_addr))
             .unwrap_or(false);
         let leader_node = nodes
@@ -289,7 +285,7 @@ enum ForwardDecision {
 /// use axum::{middleware, Router};
 /// use std::sync::Arc;
 ///
-/// let forwarder = Arc::new(LeaderForwarder::new(raft, self_id, client));
+/// let forwarder = Arc::new(LeaderForwarder::new(raft, id, client));
 /// let app = Router::new()
 ///     .route("/api/transact", axum::routing::post(transact_handler))
 ///     .layer(middleware::from_fn_with_state(forwarder, forward_to_leader));

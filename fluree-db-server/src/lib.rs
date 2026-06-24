@@ -501,7 +501,7 @@ impl FlureeServerBuilder {
                     std::sync::Arc::clone(&integration.raft),
                 )
                 .with_staged_receipts(std::sync::Arc::clone(&integration.staged_receipts))
-                .with_forwarding(integration.self_id, raft_forwarding_client.clone()),
+                .with_forwarding(integration.id, raft_forwarding_client.clone()),
             )
         });
 
@@ -626,7 +626,7 @@ impl FlureeServerBuilder {
             let publisher: std::sync::Arc<dyn fluree_db_nameservice::CommitPublisher> =
                 std::sync::Arc::clone(&raft_ns) as _;
             let supervisor = fluree_db_consensus::raft::commit_worker::StagerSupervisor::new(
-                integration.self_id,
+                integration.id,
                 Arc::clone(&integration.raft),
                 publisher,
                 Arc::clone(&state_inner.fluree),
@@ -674,7 +674,7 @@ impl FlureeServerBuilder {
             };
             crate::raft::spawn_leader_watcher(
                 Arc::clone(&integration.raft),
-                integration.self_id,
+                integration.id,
                 spawn_leader_tasks,
             )
         });

@@ -65,7 +65,7 @@ pub struct RaftIntegration {
     /// This node's id. Cached so callers (notably the leader-aware
     /// indexer watcher) don't have to dip into `raft.metrics()` just
     /// to ask "is this me?"
-    pub self_id: NodeId,
+    pub id: NodeId,
     /// Follower-forward middleware state. Cloned into the
     /// client-facing router's middleware layer.
     pub forwarder: Arc<LeaderForwarder>,
@@ -112,7 +112,7 @@ pub struct RaftIntegration {
 /// is independently produced upstream and they only meet here.
 pub struct RaftIntegrationParts {
     pub raft: Arc<Raft<TypeConfig>>,
-    pub self_id: NodeId,
+    pub id: NodeId,
     pub http_client: reqwest::Client,
     pub shared_state: SharedState,
     pub event_bus: Arc<LedgerEventBus>,
@@ -130,7 +130,7 @@ impl RaftIntegration {
     pub fn new(parts: RaftIntegrationParts) -> Self {
         let RaftIntegrationParts {
             raft,
-            self_id,
+            id,
             http_client,
             shared_state,
             event_bus,
@@ -139,14 +139,10 @@ impl RaftIntegration {
             network_config,
             release_rx,
         } = parts;
-        let forwarder = Arc::new(LeaderForwarder::new(
-            Arc::clone(&raft),
-            self_id,
-            http_client,
-        ));
+        let forwarder = Arc::new(LeaderForwarder::new(Arc::clone(&raft), id, http_client));
         Self {
             raft,
-            self_id,
+            id,
             forwarder,
             shared_state,
             event_bus,
@@ -208,7 +204,7 @@ impl RaftIntegration {
 
         Ok(Self::new(RaftIntegrationParts {
             raft: Arc::new(raft),
-            self_id: config.node_id,
+            id: config.node_id,
             http_client,
             shared_state,
             event_bus,
@@ -438,7 +434,7 @@ impl LeaderWatcherHandle {
 /// with us back at the lead, no spawn/abort churn.
 pub fn spawn_leader_watcher<F>(
     raft: Arc<Raft<TypeConfig>>,
-    self_id: NodeId,
+    id: NodeId,
     spawn_leader_tasks: F,
 ) -> LeaderWatcherHandle
 where
@@ -452,7 +448,7 @@ where
         let mut current_tasks: Vec<JoinHandle<()>> = Vec::new();
 
         loop {
-            let is_leader = metrics.borrow().current_leader == Some(self_id);
+            let is_leader = metrics.borrow().current_leader == Some(id);
             match tracker.tick(is_leader) {
                 LeadershipTransition::Spawn => {
                     current_tasks = spawn_leader_tasks();
@@ -652,7 +648,7 @@ mod tests {
 
         let watcher = spawn_leader_watcher(
             Arc::clone(&integration.raft),
-            1, // self_id
+            1, // id
             move || {
                 count_for_closure.fetch_add(1, Ordering::SeqCst);
                 // Two parked tasks stand in for the indexer + commit
