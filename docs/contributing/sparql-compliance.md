@@ -438,9 +438,11 @@ SPARQL and JSON-LD queries in Fluree compile to the **same intermediate represen
 # SPARQL W3C tests (from testsuite-sparql/)
 make test-eval-cat CAT=<category>
 
-# JSON-LD query tests (from workspace root)
-cargo test -p fluree-db-api --test it_query
-cargo test -p fluree-db-api --test it_query_analytical
+# JSON-LD query tests (from workspace root) — integration tests are grouped
+# into grp_* binaries; run a whole group or filter to one file's module.
+cargo test -p fluree-db-api --test grp_query
+cargo test -p fluree-db-api --test grp_query_sparql
+# e.g. just one file's tests: cargo test -p fluree-db-api --test grp_query it_query_jsonld
 ```
 
 ## Architecture Overview

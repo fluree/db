@@ -221,6 +221,11 @@ name = "it_graph_source_vector"
 path = "tests/it_graph_source_vector.rs"
 required-features = ["vector"]
 
+[[test]]
+name = "it_vector_flatrank"
+path = "tests/it_vector_flatrank.rs"
+required-features = ["vector"]
+
 [[bench]]
 name = "vector_query"
 harness = false

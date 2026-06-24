@@ -14,7 +14,7 @@
 //! Decision inputs: compile% of total (is the cache worth it?) and
 //! compile-vs-raw_parse (does a cheap normalizer stay << the savings?).
 //!
-//!   cargo test -p fluree-db-api --test it_compile_breakdown --features native \
+//!   cargo test -p fluree-db-api --test grp_misc it_compile_breakdown --features native \
 //!       --profile dev-fast -- --ignored --nocapture compile_breakdown
 
 #![cfg(feature = "native")]

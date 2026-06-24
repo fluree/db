@@ -10,7 +10,7 @@
 //! for high-cardinality namespace datasets.
 //!
 //! Run with:
-//!   cargo test -p fluree-db-api --test it_host_plus_n_e2e --features native
+//!   cargo test -p fluree-db-api --test grp_misc it_host_plus_n_e2e --features native
 
 #![cfg(feature = "native")]
 

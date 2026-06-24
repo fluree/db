@@ -8,7 +8,7 @@
 //!   - Reverse: same prefix, different code
 //!
 //! Run with:
-//!   cargo test -p fluree-db-api --test it_ns_sync_conflict --features native
+//!   cargo test -p fluree-db-api --test grp_import it_ns_sync_conflict --features native
 
 #![cfg(feature = "native")]
 

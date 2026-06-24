@@ -63,5 +63,3 @@ mod it_tutorial_end_to_end;
 mod it_values_type_deleted_repro;
 #[path = "it_vector_corruption_repro.rs"]
 mod it_vector_corruption_repro;
-#[path = "it_vector_flatrank.rs"]
-mod it_vector_flatrank;

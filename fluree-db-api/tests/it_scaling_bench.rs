@@ -8,7 +8,7 @@
 //!
 //! Manual run (release-ish optimization matters for absolute numbers, but the
 //! SCALING ratio is the signal):
-//!   cargo test -p fluree-db-api --test it_scaling_bench --features native --release -- --ignored --nocapture
+//!   cargo test -p fluree-db-api --test grp_misc it_scaling_bench --features native --release -- --ignored --nocapture
 //!
 //! Interpreting output: look at QPS(C)/QPS(1). Linear-ish scaling => reads run
 //! concurrently. Flat after a few cores => a read-path serialization bottleneck.

@@ -5,7 +5,7 @@
 //! under a different name. Verifies that query results match.
 //!
 //! Run with:
-//!   cargo test -p fluree-db-api --test it_flpack_round_trip --features native
+//!   cargo test -p fluree-db-api --test grp_import it_flpack_round_trip --features native
 
 #![cfg(feature = "native")]
 
