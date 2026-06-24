@@ -115,7 +115,9 @@ mod tests {
     fn adding_a_voter_moves_only_a_small_fraction() {
         let before: Vec<NodeId> = (1..=4).collect();
         let after: Vec<NodeId> = (1..=5).collect();
-        let keys: Vec<RefKey> = (0..1000).map(|i| key("db", &format!("branch-{i}"))).collect();
+        let keys: Vec<RefKey> = (0..1000)
+            .map(|i| key("db", &format!("branch-{i}")))
+            .collect();
 
         let moved = keys
             .iter()
@@ -136,7 +138,9 @@ mod tests {
     fn removing_a_voter_only_reassigns_its_branches() {
         let before: Vec<NodeId> = (1..=4).collect();
         let after: Vec<NodeId> = vec![1, 2, 3]; // dropped node 4
-        let keys: Vec<RefKey> = (0..1000).map(|i| key("db", &format!("branch-{i}"))).collect();
+        let keys: Vec<RefKey> = (0..1000)
+            .map(|i| key("db", &format!("branch-{i}")))
+            .collect();
 
         // Branches that pointed to a surviving node before must still
         // point to the same surviving node after — only the dropped

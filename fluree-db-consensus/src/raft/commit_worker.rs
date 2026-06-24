@@ -454,10 +454,7 @@ impl Stager {
     /// surfaces via `QueueDesync::WrongFront` only if another
     /// transactor jumped ahead, which is exactly the race the queue
     /// already serializes against.
-    async fn process_revert(
-        &self,
-        revert: QueuedRevert,
-    ) -> Result<StagedOutcome, WorkerError> {
+    async fn process_revert(&self, revert: QueuedRevert) -> Result<StagedOutcome, WorkerError> {
         use fluree_db_api::GuardedStagedCommit;
 
         let QueuedRevert {
@@ -801,11 +798,7 @@ impl Stager {
             .map_err(|e| WorkerError::Raft(format!("publish_commit failed: {e}")))
     }
 
-    async fn propose_poison(
-        &self,
-        queue_id: u64,
-        reason: PoisonReason,
-    ) -> Result<(), WorkerError> {
+    async fn propose_poison(&self, queue_id: u64, reason: PoisonReason) -> Result<(), WorkerError> {
         let cmd = SmCommand::PoisonQueueEntry(PoisonQueueEntryArgs {
             ledger_id: self.ref_key.ledger_name.clone(),
             branch: self.ref_key.branch.clone(),
@@ -1410,10 +1403,17 @@ mod tests {
             let mine = compute_desired_owners_for_test(&shared, *id, &voters).await;
             // Every claimed branch must belong to exactly one node.
             for k in &mine {
-                assert!(union.insert(k.clone()), "branch {k:?} claimed by two voters");
+                assert!(
+                    union.insert(k.clone()),
+                    "branch {k:?} claimed by two voters"
+                );
             }
         }
-        assert_eq!(union.len(), 50, "every branch must be claimed by exactly one voter");
+        assert_eq!(
+            union.len(),
+            50,
+            "every branch must be claimed by exactly one voter"
+        );
     }
 
     /// Empty voter set (cluster not yet bootstrapped or all voters

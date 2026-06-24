@@ -63,7 +63,6 @@ use axum::routing::post;
 use axum::Router;
 use fluree_db_core::ledger_id::split_ledger_id;
 use fluree_db_core::ContentId;
-use serde::{Deserialize, Serialize};
 use fluree_db_nameservice::{
     AdminPublisher, BranchLifecycle, CasResult, CommitPublisher, ConfigCasResult, ConfigLookup,
     ConfigPublisher, ConfigValue, GraphSourceLookup, GraphSourcePublisher, GraphSourceRecord,
@@ -73,6 +72,7 @@ use fluree_db_nameservice::{
 };
 use openraft::error::{ClientWriteError, RaftError};
 use openraft::Raft;
+use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -869,10 +869,9 @@ impl RaftNameService {
             )));
         }
 
-        let body_bytes = resp
-            .bytes()
-            .await
-            .map_err(|e| NameServiceError::storage(format!("read apply_staged_commit body: {e}")))?;
+        let body_bytes = resp.bytes().await.map_err(|e| {
+            NameServiceError::storage(format!("read apply_staged_commit body: {e}"))
+        })?;
         let outcome: std::result::Result<ApplyStagedCommitResponse, ApplyStagedCommitError> =
             postcard::from_bytes(&body_bytes).map_err(|e| {
                 NameServiceError::storage(format!(

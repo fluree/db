@@ -600,10 +600,8 @@ impl FlureeServerBuilder {
         // event bus so commit / index applies reconcile cached state
         // on every node, not just the one that staged the commit.
         #[cfg(feature = "raft")]
-        if let Some(((integration, _), mgr)) = self
-            .raft
-            .as_ref()
-            .zip(state_inner.fluree.ledger_manager())
+        if let Some(((integration, _), mgr)) =
+            self.raft.as_ref().zip(state_inner.fluree.ledger_manager())
         {
             fluree_db_api::spawn_local_cache_event_listener(
                 Arc::clone(&integration.event_bus),
