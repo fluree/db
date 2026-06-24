@@ -1121,6 +1121,7 @@ impl LedgerManager {
 
         match publish {
             Ok(handle) => {
+                let mut absorb_missed_events = false;
                 if owns_slot {
                     if let Some(LoadState::Loading { waiters, .. }) =
                         entries.remove(&canonical_alias)
@@ -1131,7 +1132,31 @@ impl LedgerManager {
                     }
                     // Don't re-insert into cache if shutdown has been initiated
                     if !shutting_down {
-                        entries.insert(canonical_alias, LoadState::Ready(handle.clone()));
+                        entries.insert(canonical_alias.clone(), LoadState::Ready(handle.clone()));
+                        absorb_missed_events = true;
+                    }
+                }
+                drop(entries);
+                // Commit events that fired while the entry was Loading were
+                // dropped by `notify`'s NotLoaded short-circuit (the listener
+                // can't update a cache that isn't there yet). The
+                // nameservice record we loaded against was sampled at
+                // load-start, so any commit that landed during the load is
+                // now invisible. Re-read the record once now that we're
+                // Ready and let the incremental path catch the cache up.
+                if absorb_missed_events {
+                    if let Err(error) = self
+                        .notify(NsNotify {
+                            ledger_id: canonical_alias,
+                            record: None,
+                        })
+                        .await
+                    {
+                        tracing::warn!(
+                            alias = %handle.id(),
+                            error = %error,
+                            "post-load reconciliation failed; cache may be stale until next event"
+                        );
                     }
                 }
                 Ok(handle)
