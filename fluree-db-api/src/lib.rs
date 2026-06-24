@@ -1586,6 +1586,21 @@ impl FlureeBuilder {
         self
     }
 
+    /// Set the maximum **on-disk** cache budget in MB, shared globally across
+    /// Fluree's object storage and Iceberg data files.
+    ///
+    /// By default the disk budget auto-detects from available disk space. This
+    /// sets a process-global default for caches created afterwards; the
+    /// `FLUREE_DISK_CACHE_BUDGET_BYTES` env var still overrides it, and `0`
+    /// disables disk caching. No effect without the `native` feature.
+    pub fn disk_cache_max_mb(self, max_mb: usize) -> Self {
+        #[cfg(feature = "native")]
+        fluree_db_core::disk_cache::set_configured_budget_bytes((max_mb as u64) << 20);
+        #[cfg(not(feature = "native"))]
+        let _ = max_mb;
+        self
+    }
+
     /// Set the parallelism level
     pub fn parallelism(mut self, parallelism: usize) -> Self {
         self.config.parallelism = parallelism;

@@ -20,6 +20,32 @@ const DEFAULT_LAMBDA_TMP_WARN_SLACK_BYTES: u64 = 64 * 1024 * 1024;
 static CACHE_REGISTRY: Lazy<Mutex<HashMap<PathBuf, Weak<DiskArtifactCache>>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
+/// Sentinel for "no configured budget" — fall back to auto-detect.
+const BUDGET_UNSET: u64 = u64::MAX;
+
+/// Process-global default disk-cache budget in bytes, set from configuration
+/// (e.g. the server's `disk_cache_max_mb`). `BUDGET_UNSET` means auto-detect.
+static CONFIGURED_BUDGET_BYTES: AtomicU64 = AtomicU64::new(BUDGET_UNSET);
+
+/// Set the process-global default disk-cache budget (bytes), shared across every
+/// on-disk cache (Fluree object storage + Iceberg). Applies to caches created
+/// after this call whose `FLUREE_DISK_CACHE_BUDGET_BYTES` env override is unset;
+/// `0` disables disk caching. Call before the first cache is created (e.g. at
+/// server/builder startup). Mirrors the `disk_cache_max_mb` config knob.
+pub fn set_configured_budget_bytes(bytes: u64) {
+    CONFIGURED_BUDGET_BYTES.store(bytes, Ordering::Relaxed);
+}
+
+/// The configured budget if set, otherwise a fraction of available disk space.
+fn configured_or_auto(available: u64) -> u64 {
+    match CONFIGURED_BUDGET_BYTES.load(Ordering::Relaxed) {
+        BUDGET_UNSET => available
+            .saturating_mul(CACHE_BUDGET_NUMERATOR)
+            .saturating_div(CACHE_BUDGET_DENOMINATOR),
+        bytes => bytes,
+    }
+}
+
 /// Shared outcome of one in-flight remote fetch. Bytes are shared via `Arc` so
 /// coalesced waiters neither re-fetch nor re-allocate the payload; the per-caller
 /// `Vec` copy happens only at the API boundary. Errors are shared but never
@@ -209,16 +235,12 @@ impl DiskArtifactCache {
                         cache_dir = %root.display(),
                         value = %val,
                         error = %err,
-                        "invalid FLUREE_DISK_CACHE_BUDGET_BYTES; falling back to auto-detect"
+                        "invalid FLUREE_DISK_CACHE_BUDGET_BYTES; falling back to configured/auto"
                     );
-                    available
-                        .saturating_mul(CACHE_BUDGET_NUMERATOR)
-                        .saturating_div(CACHE_BUDGET_DENOMINATOR)
+                    configured_or_auto(available)
                 }
             },
-            Err(_) => available
-                .saturating_mul(CACHE_BUDGET_NUMERATOR)
-                .saturating_div(CACHE_BUDGET_DENOMINATOR),
+            Err(_) => configured_or_auto(available),
         };
 
         if available > 0
@@ -252,6 +274,12 @@ impl DiskArtifactCache {
             inflight: Mutex::new(HashMap::new()),
             next_flight_generation: AtomicU64::new(0),
         }
+    }
+
+    /// The disk byte budget. `0` means disk caching is disabled (writes are
+    /// skipped), so callers can avoid pointless remote fetches into a dead cache.
+    pub fn budget_bytes(&self) -> u64 {
+        self.budget_bytes
     }
 
     fn low_water_mark(&self) -> u64 {
