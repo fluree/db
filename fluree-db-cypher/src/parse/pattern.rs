@@ -177,13 +177,27 @@ fn parse_rel_pat(s: &mut TokenStream) -> Result<RelPattern, Diagnostic> {
             let mut min = None;
             let mut max = None;
             // *N or *N..M or *..M or *
-            if let TokenKind::Integer(n) = s.peek_kind() {
-                min = Some(*n as u32);
+            let peek_int = |s: &TokenStream| match s.peek_kind() {
+                TokenKind::Integer(n) => Some(*n),
+                _ => None,
+            };
+            if let Some(n) = peek_int(s) {
+                min = Some(u32::try_from(n).map_err(|_| {
+                    s.error(
+                        DiagCode::InvalidNumber,
+                        "variable-length path bound out of range",
+                    )
+                })?);
                 s.advance();
             }
             if s.eat(&TokenKind::DotDot).is_some() {
-                if let TokenKind::Integer(n) = s.peek_kind() {
-                    max = Some(*n as u32);
+                if let Some(n) = peek_int(s) {
+                    max = Some(u32::try_from(n).map_err(|_| {
+                        s.error(
+                            DiagCode::InvalidNumber,
+                            "variable-length path bound out of range",
+                        )
+                    })?);
                     s.advance();
                 }
             } else if min.is_some() {

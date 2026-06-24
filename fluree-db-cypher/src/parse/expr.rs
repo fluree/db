@@ -151,7 +151,7 @@ fn parse_additive(s: &mut TokenStream) -> Result<Expr, Diagnostic> {
 }
 
 fn parse_multiplicative(s: &mut TokenStream) -> Result<Expr, Diagnostic> {
-    let mut left = parse_power(s)?;
+    let mut left = parse_unary(s)?;
     loop {
         let op = match s.peek_kind() {
             TokenKind::Star => BinOp::Mul,
@@ -160,20 +160,35 @@ fn parse_multiplicative(s: &mut TokenStream) -> Result<Expr, Diagnostic> {
             _ => break,
         };
         s.advance();
-        let right = parse_power(s)?;
+        let right = parse_unary(s)?;
         let span = left.span().union(right.span());
         left = Expr::BinOp(op, Box::new(left), Box::new(right), span);
     }
     Ok(left)
 }
 
-/// Exponentiation `^` — binds tighter than `* / %` and is right-associative
-/// (`2 ^ 3 ^ 2` = `2 ^ (3 ^ 2)`), matching openCypher.
+/// Unary `-` — binds looser than `^` but tighter than `* / %`, so
+/// `-2 ^ 2` = `-(2 ^ 2)` = `-4`, matching openCypher / Neo4j precedence.
+fn parse_unary(s: &mut TokenStream) -> Result<Expr, Diagnostic> {
+    let start = s.peek_span();
+    if s.eat(&TokenKind::Minus).is_some() {
+        let e = parse_unary(s)?;
+        let span = start.union(e.span());
+        return Ok(Expr::UnaryOp(UnaryOp::Neg, Box::new(e), span));
+    }
+    parse_power(s)
+}
+
+/// Exponentiation `^` — binds tighter than unary `-` and `* / %`, and is
+/// right-associative (`2 ^ 3 ^ 2` = `2 ^ (3 ^ 2)`), matching openCypher. The
+/// left operand is a postfix expression (a leading sign belongs to the looser
+/// unary layer above), while the right operand is a full unary expression so a
+/// signed exponent (`2 ^ -3`) parses.
 fn parse_power(s: &mut TokenStream) -> Result<Expr, Diagnostic> {
-    let left = parse_unary(s)?;
+    let left = parse_postfix(s)?;
     if matches!(s.peek_kind(), TokenKind::Caret) {
         s.advance();
-        let right = parse_power(s)?;
+        let right = parse_unary(s)?;
         let span = left.span().union(right.span());
         Ok(Expr::BinOp(
             BinOp::Pow,
@@ -184,16 +199,6 @@ fn parse_power(s: &mut TokenStream) -> Result<Expr, Diagnostic> {
     } else {
         Ok(left)
     }
-}
-
-fn parse_unary(s: &mut TokenStream) -> Result<Expr, Diagnostic> {
-    let start = s.peek_span();
-    if s.eat(&TokenKind::Minus).is_some() {
-        let e = parse_unary(s)?;
-        let span = start.union(e.span());
-        return Ok(Expr::UnaryOp(UnaryOp::Neg, Box::new(e), span));
-    }
-    parse_postfix(s)
 }
 
 fn parse_postfix(s: &mut TokenStream) -> Result<Expr, Diagnostic> {

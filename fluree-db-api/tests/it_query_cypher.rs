@@ -6144,3 +6144,32 @@ async fn cypher_var_length_then_with_distinct_multivar_drives_downstream() {
         "var-length WITH output must drive the downstream count: {jsonld}"
     );
 }
+
+#[tokio::test]
+async fn cypher_power_binds_tighter_than_unary_minus() {
+    // Regression: openCypher/Neo4j precedence puts `^` ABOVE unary `-`, so
+    // `-2 ^ 2` = -(2^2) = -4, not (-2)^2 = 4. The right operand of `^` still
+    // accepts a sign (`2 ^ -3` = 0.125), and `^` is right-associative
+    // (`-2 ^ 2 ^ 2` = -(2^(2^2)) = -16).
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = seed_nodes_with_ids(&fluree, "it/cypher:power-precedence").await;
+    let db = graphdb_from_ledger(&l);
+
+    for (expr, want) in [("-2 ^ 2", -4.0), ("2 ^ -3", 0.125), ("-2 ^ 2 ^ 2", -16.0)] {
+        let q = format!("MATCH (n:Person) RETURN {expr} AS x ORDER BY x");
+        let out = fluree
+            .query_cypher(&db, &q)
+            .await
+            .unwrap_or_else(|e| panic!("query `{expr}`: {e:?}"))
+            .to_jsonld_async(db.as_graph_db_ref())
+            .await
+            .expect("jsonld");
+        let got = out[0][0]
+            .as_f64()
+            .unwrap_or_else(|| panic!("`{expr}` produced non-numeric {out}"));
+        assert!(
+            (got - want).abs() < 1e-9,
+            "`{expr}` evaluated to {got}, expected {want}"
+        );
+    }
+}
