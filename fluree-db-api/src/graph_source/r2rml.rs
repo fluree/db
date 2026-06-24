@@ -49,10 +49,15 @@ fn build_iceberg_filter(
         let value = match &f.value {
             ScanValue::Bool(b) => LiteralValue::Boolean(*b),
             ScanValue::Date(d) => LiteralValue::Date(*d),
-            // Iceberg `int` is 32-bit, `long` 64-bit; a type mismatch just fails
-            // to compare and prunes nothing (safe).
+            // Iceberg `int` is 32-bit, `long` 64-bit. For an `int` column a
+            // literal outside i32 range must NOT be truncated with `as` (it would
+            // wrap and could prune files the residual filter keeps); skip the
+            // pushdown for that predicate instead.
             ScanValue::Int(n) => match field.type_string() {
-                Some("int") => LiteralValue::Int32(*n as i32),
+                Some("int") => match i32::try_from(*n) {
+                    Ok(v) => LiteralValue::Int32(v),
+                    Err(_) => continue,
+                },
                 _ => LiteralValue::Int64(*n),
             },
         };

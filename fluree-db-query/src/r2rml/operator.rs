@@ -152,23 +152,31 @@ impl R2rmlScanOperator {
                     .map(|(p, _)| p.as_str())
             };
             let Some(pred_iri) = pred_iri else { continue };
-            let Some(pom) = triples_map
+
+            // The predicate's values come from EVERY matching object map, so a
+            // file-level prune is only sound when the predicate maps to exactly
+            // one scalar object map backed by exactly one column. Otherwise a row
+            // could match via a column we didn't prune on — skip the pushdown and
+            // let the in-engine FILTER handle it.
+            let mut matching = triples_map
                 .predicate_object_maps
                 .iter()
-                .find(|p| p.predicate_map.as_constant() == Some(pred_iri))
-            else {
+                .filter(|p| p.predicate_map.as_constant() == Some(pred_iri));
+            let (Some(pom), None) = (matching.next(), matching.next()) else {
                 continue;
             };
             if matches!(pom.object_map, ObjectMap::RefObjectMap(_)) {
                 continue;
             }
-            if let Some(col) = pom.object_map.referenced_columns().first() {
-                out.push(crate::r2rml::ScanFilter {
-                    column: (*col).to_string(),
-                    op: pd.op,
-                    value: pd.value.clone(),
-                });
-            }
+            let cols = pom.object_map.referenced_columns();
+            let [col] = cols.as_slice() else {
+                continue;
+            };
+            out.push(crate::r2rml::ScanFilter {
+                column: (*col).to_string(),
+                op: pd.op,
+                value: pd.value.clone(),
+            });
         }
         out
     }
