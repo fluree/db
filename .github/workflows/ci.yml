@@ -14,7 +14,10 @@ env:
   CARGO_INCREMENTAL: 0
   CARGO_PROFILE_DEV_DEBUG: 0
   CARGO_PROFILE_TEST_DEBUG: 0
-  RUSTFLAGS: "-C link-arg=-fuse-ld=bfd"
+  # Linker experiment: was `-fuse-ld=bfd` (slowest GNU linker, set at the v4
+  # baseline with no recorded rationale). `mold` links several times faster;
+  # every compiling job below installs it via `rui314/setup-mold`.
+  RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
 
 jobs:
   fmt:
@@ -38,6 +41,7 @@ jobs:
 
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - uses: rui314/setup-mold@v1
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
@@ -62,6 +66,7 @@ jobs:
 
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - uses: rui314/setup-mold@v1
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
@@ -88,6 +93,7 @@ jobs:
           submodules: true
 
       - uses: dtolnay/rust-toolchain@stable
+      - uses: rui314/setup-mold@v1
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
@@ -140,6 +146,7 @@ jobs:
 
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - uses: rui314/setup-mold@v1
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
