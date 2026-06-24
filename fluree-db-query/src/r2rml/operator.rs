@@ -181,9 +181,6 @@ impl R2rmlScanOperator {
         out
     }
 
-    /// Materialize the object term for one POM at a table row, resolving a
-    /// RefObjectMap through the pre-built parent lookup. Returns None when the
-    /// value is null or the foreign key is orphaned.
     /// Materialize all produced rows of a TriplesMap (independent of the child
     /// stream) so the result can be hash-joined against the child. Datatype Sids
     /// are resolved once into a `LiteralEncoder` (not per cell) and the data
@@ -845,38 +842,81 @@ impl Operator for R2rmlScanOperator {
                     let store = ctx.binary_store.as_deref();
                     let gv = ctx.graph_view();
                     let gv = gv.as_ref();
+
+                    // Per-join-var keys for each produced row, aligned with
+                    // `produced`. A produced row always binds every pattern var,
+                    // so a complete key has len == join_vars.len().
+                    let produced_keys: Vec<Vec<GroupKeyOwned>> = produced
+                        .iter()
+                        .map(|prod| {
+                            join_vars
+                                .iter()
+                                .filter_map(|jv| {
+                                    prod.iter()
+                                        .find(|(v, _)| v == jv)
+                                        .map(|(_, b)| binding_to_group_key_normalized(b, store, gv))
+                                })
+                                .collect()
+                        })
+                        .collect();
+
                     let mut index: HashMap<Vec<GroupKeyOwned>, Vec<usize>> = HashMap::new();
-                    for (pi, prod) in produced.iter().enumerate() {
-                        let key: Vec<GroupKeyOwned> = join_vars
-                            .iter()
-                            .filter_map(|jv| {
-                                prod.iter()
-                                    .find(|(v, _)| v == jv)
-                                    .map(|(_, b)| binding_to_group_key_normalized(b, store, gv))
-                            })
-                            .collect();
-                        if key.len() == join_vars.len() {
-                            index.entry(key).or_default().push(pi);
+                    for (pi, keys) in produced_keys.iter().enumerate() {
+                        if keys.len() == join_vars.len() {
+                            index.entry(keys.clone()).or_default().push(pi);
                         }
                     }
                     for row_idx in 0..child_batch.len() {
-                        let mut key = Vec::with_capacity(join_vars.len());
-                        let mut ok = true;
+                        // Build the child's join key. An unbound join var is a
+                        // wildcard (SPARQL compatibility: unbound is compatible
+                        // with any value, binding from the produced side), so we
+                        // keep `None` for it and match the bound positions only.
+                        // A poisoned binding can never match, so the row is
+                        // dropped.
+                        let mut child_key: Vec<Option<GroupKeyOwned>> =
+                            Vec::with_capacity(join_vars.len());
+                        let mut all_bound = true;
+                        let mut poisoned = false;
                         for &jv in &join_vars {
                             let pos = child_schema.iter().position(|&v| v == jv).unwrap();
                             let b = &child_batch.column_by_idx(pos).unwrap()[row_idx];
-                            if !b.is_bound() || b.is_poisoned() {
-                                ok = false;
+                            if b.is_poisoned() {
+                                poisoned = true;
                                 break;
                             }
-                            key.push(binding_to_group_key_normalized(b, store, gv));
+                            if b.is_bound() {
+                                child_key.push(Some(binding_to_group_key_normalized(b, store, gv)));
+                            } else {
+                                all_bound = false;
+                                child_key.push(None);
+                            }
                         }
-                        if !ok {
+                        if poisoned {
                             continue;
                         }
-                        if let Some(matches) = index.get(&key) {
-                            for &pi in matches {
-                                emit_combined!(row_idx, &produced[pi]);
+                        if all_bound {
+                            // Fast path: full key, hash probe.
+                            let full: Vec<GroupKeyOwned> =
+                                child_key.into_iter().map(Option::unwrap).collect();
+                            if let Some(matches) = index.get(&full) {
+                                for &pi in matches {
+                                    emit_combined!(row_idx, &produced[pi]);
+                                }
+                            }
+                        } else {
+                            // Partial key: match produced rows agreeing on every
+                            // bound join var (unbound positions are wildcards).
+                            for (pi, keys) in produced_keys.iter().enumerate() {
+                                if keys.len() != join_vars.len() {
+                                    continue;
+                                }
+                                let agrees = child_key
+                                    .iter()
+                                    .zip(keys.iter())
+                                    .all(|(c, p)| c.as_ref().is_none_or(|c| c == p));
+                                if agrees {
+                                    emit_combined!(row_idx, &produced[pi]);
+                                }
                             }
                         }
                     }
