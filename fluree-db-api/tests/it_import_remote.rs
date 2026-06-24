@@ -8,6 +8,8 @@
 #![cfg(feature = "native")]
 
 use crate::support;
+
+use async_trait::async_trait;
 use fluree_db_api::{FlureeBuilder, RemoteObject, RemoteSource};
 use fluree_db_core::{MemoryStorage, StorageRead, StorageWrite};
 use serde_json::json;
@@ -456,4 +458,106 @@ async fn import_from_storage_rejects_mixed_formats() {
         msg.contains("Turtle") && msg.contains("JSON-LD"),
         "expected MixedFormats error, got: {msg}"
     );
+}
+
+// ============================================================================
+// Regression: single-worker runtime must not deadlock when the remote producer
+// re-parks between chunks (in-flight backpressure == 1).
+// ============================================================================
+
+/// A `StorageRead` that yields to the runtime before serving each read,
+/// mimicking a real async backend (File/S3) that hands control to the IO
+/// driver mid-read. `MemoryStorage` resolves reads synchronously, so it cannot
+/// reproduce the producer re-park that the commit consumer depends on the
+/// runtime worker to drive.
+#[derive(Debug)]
+struct YieldingStorage {
+    inner: Arc<MemoryStorage>,
+}
+
+#[async_trait]
+impl StorageRead for YieldingStorage {
+    async fn read_bytes(&self, address: &str) -> fluree_db_core::error::Result<Vec<u8>> {
+        // Hand control back to the runtime so the producer task genuinely
+        // depends on the worker being free to make progress.
+        tokio::task::yield_now().await;
+        self.inner.read_bytes(address).await
+    }
+
+    async fn exists(&self, address: &str) -> fluree_db_core::error::Result<bool> {
+        self.inner.exists(address).await
+    }
+
+    async fn list_prefix(&self, prefix: &str) -> fluree_db_core::error::Result<Vec<String>> {
+        self.inner.list_prefix(prefix).await
+    }
+}
+
+/// Reproduces the channel-fed remote-import deadlock deterministically.
+///
+/// With `max_inflight_chunks == 1` the remote producer can hold only one chunk
+/// in flight, so it re-parks (waiting for channel capacity, and on each
+/// yielding read) and relies on the single current-thread runtime worker to be
+/// re-polled. If the in-order commit consumer blocks that worker on a plain
+/// `std::sync::mpsc::recv`, the producer can never advance and the import hangs
+/// forever — the load/low-RAM-dependent failure seen on CI. The consumer must
+/// receive off the worker (via `spawn_blocking`) for this to complete.
+///
+/// Pre-fix: this test hangs (caught by nextest's `terminate-after`).
+/// Post-fix: it completes in well under a second.
+#[tokio::test]
+async fn remote_import_single_inflight_yielding_storage_does_not_deadlock() {
+    const N: usize = 6;
+
+    let inner = Arc::new(MemoryStorage::new());
+    let mut objects = Vec::with_capacity(N);
+    for i in 0..N {
+        let addr = format!("imports/chunk_{i:04}.ttl");
+        let body = format!(
+            "{TTL_PREFIX}\n\
+            ex:user{i} a ex:User ;\n\
+                schema:name \"User{i}\" ;\n\
+                schema:age {age} .\n",
+            age = 20 + i
+        );
+        inner.write_bytes(&addr, body.as_bytes()).await.unwrap();
+        objects.push(RemoteObject {
+            address: addr,
+            size_bytes: body.len() as u64,
+        });
+    }
+
+    let db_dir = tempfile::tempdir().expect("db tmpdir");
+    let fluree = FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build file-backed Fluree");
+
+    let storage_dyn: Arc<dyn StorageRead> = Arc::new(YieldingStorage { inner });
+    let result = fluree
+        .create("test/remote-single-inflight:main")
+        .import_from_storage(storage_dyn, RemoteSource::OrderedObjects(objects))
+        .threads(2)
+        .max_inflight_chunks(1)
+        .cleanup(false)
+        .execute()
+        .await
+        .expect("remote import must not deadlock with single in-flight chunk");
+
+    assert_eq!(result.t, N as i64, "every chunk commits one transaction");
+    assert!(result.flake_count > 0);
+
+    let ledger = fluree
+        .ledger("test/remote-single-inflight:main")
+        .await
+        .expect("load ledger");
+    let q = json!({
+        "@context": { "ex": "http://example.org/ns/", "schema": "http://schema.org/" },
+        "select": ["?name"],
+        "where": { "schema:name": "?name" }
+    });
+    let qr = support::query_jsonld(&fluree, &ledger, &q)
+        .await
+        .expect("query names");
+    let names = extract_sorted_strings(&qr.to_jsonld(&ledger.snapshot).unwrap());
+    assert_eq!(names.len(), N, "all {N} subjects imported");
 }
