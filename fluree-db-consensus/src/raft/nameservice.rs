@@ -47,17 +47,23 @@
 //!
 //! [`LedgerState::load`]: fluree_db_ledger::LedgerState::load
 
-use crate::raft::staged_receipt::StagedReceiptMap;
+use crate::raft::staged_receipt::{AppliedReceipt, StagedReceiptMap};
 use crate::raft::state_machine::{
     AdvanceIndexHeadArgs, ApplyHeadArgs, Command as SmCommand, CreateBranchArgs, CreateLedgerArgs,
     DesyncReason, NameServiceState, PushConfigArgs, RecordedTally, RefKey, ResetHeadSnapshot,
     Response as SmResponse,
 };
 use crate::raft::state_machine_adapter::SharedState;
-use crate::raft::TypeConfig;
+use crate::raft::{ClusterNode, NodeId, TypeConfig};
 use async_trait::async_trait;
+use axum::extract::State;
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
+use axum::routing::post;
+use axum::Router;
 use fluree_db_core::ledger_id::split_ledger_id;
 use fluree_db_core::ContentId;
+use serde::{Deserialize, Serialize};
 use fluree_db_nameservice::{
     AdminPublisher, BranchLifecycle, CasResult, CommitPublisher, ConfigCasResult, ConfigLookup,
     ConfigPublisher, ConfigValue, GraphSourceLookup, GraphSourcePublisher, GraphSourceRecord,
@@ -87,6 +93,23 @@ pub struct RaftNameService {
     /// later retry would expect to see. Off → tally lands as `None`,
     /// which only affects metric reporting on idempotent retries.
     staged_receipts: Option<Arc<StagedReceiptMap>>,
+    /// Pair set by [`Self::with_forwarding`] to make `publish_commit`
+    /// role-aware: on a non-leader node it ferries the staged receipt
+    /// to the current leader's `apply_staged_commit` endpoint
+    /// instead of trying to propose locally (which would just return
+    /// `ForwardToLeader`). When unset, `publish_commit` behaves as it
+    /// did before distributed stagers — assumes leader-only callers.
+    forwarding: Option<ForwardingConfig>,
+}
+
+/// Per-node forwarding configuration for [`RaftNameService`]. Held as
+/// a unit so callers can't partially configure (e.g. set `self_id`
+/// but forget `http_client`) — both are needed for any forwarding to
+/// happen.
+#[derive(Clone)]
+struct ForwardingConfig {
+    self_id: NodeId,
+    http_client: reqwest::Client,
 }
 
 impl RaftNameService {
@@ -95,6 +118,7 @@ impl RaftNameService {
             state,
             raft,
             staged_receipts: None,
+            forwarding: None,
         }
     }
 
@@ -105,6 +129,19 @@ impl RaftNameService {
     /// consumes from.
     pub fn with_staged_receipts(mut self, staged_receipts: Arc<StagedReceiptMap>) -> Self {
         self.staged_receipts = Some(staged_receipts);
+        self
+    }
+
+    /// Enable cross-node `apply_staged_commit` forwarding from
+    /// follower nodes. With this set, [`Self::publish_commit`] on a
+    /// non-leader node POSTs to the current leader's
+    /// `apply_staged_commit` endpoint instead of attempting a local
+    /// propose; without it, the previous leader-only contract holds.
+    pub fn with_forwarding(mut self, self_id: NodeId, http_client: reqwest::Client) -> Self {
+        self.forwarding = Some(ForwardingConfig {
+            self_id,
+            http_client,
+        });
         self
     }
 }
@@ -401,6 +438,265 @@ fn describe_desync_reason(reason: &DesyncReason) -> String {
     }
 }
 
+// ===========================================================================
+// Cross-node ApplyHead: types + handler method
+// ===========================================================================
+
+/// RPC payload a follower's stager sends to the current leader after
+/// it finishes staging a queue entry. The leader stashes the typed
+/// receipt and proposes [`Command::ApplyHead`] on the follower's
+/// behalf; the apply resolves the parked waiter on the leader with
+/// the ferried receipt instead of falling back to
+/// [`AppliedReceipt::Minimal`].
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ApplyStagedCommitArgs {
+    /// Branch identity that owns the staged entry.
+    pub ref_key: RefKey,
+    /// Queue ID of the entry the follower staged. The state machine
+    /// re-validates that this matches the queue front at apply time;
+    /// a mismatch is reported back as [`ApplyStagedCommitResponse::Stale`].
+    pub queue_id: u64,
+    /// Content id of the commit blob the follower wrote to CAS.
+    pub commit_id: ContentId,
+    /// Logical time of the staged commit.
+    pub commit_t: i64,
+    /// Typed staging receipt to stash on the leader so the waiter
+    /// resolves with full per-op detail.
+    pub receipt: AppliedReceipt,
+}
+
+/// Outcome of a cross-node ApplyHead proposal.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum ApplyStagedCommitResponse {
+    /// The head was applied at `commit_t`. The follower's stager can
+    /// retire the queue entry locally.
+    Applied { commit_t: i64 },
+    /// The queue front no longer matches the proposed `queue_id`.
+    /// Typically a racing stager already advanced past this entry;
+    /// the caller should drop its local stash and re-poll its queue.
+    Stale {
+        /// Queue ID currently at the front, if any. `None` means the
+        /// queue is empty (likely admin-cleared between stage and propose).
+        current_front_queue_id: Option<u64>,
+    },
+}
+
+/// Errors returned by [`RaftNameService::apply_staged_commit`]. Sent
+/// to the follower over the wire — kept `Serialize`/`Deserialize` so
+/// the HTTP transport carries structured failures, not just opaque
+/// status codes.
+#[derive(Clone, Debug, Serialize, Deserialize, thiserror::Error)]
+pub enum ApplyStagedCommitError {
+    /// The replicated state has no `LedgerRecord` for the named
+    /// ledger — possibly purged between the follower's stage and
+    /// this propose attempt.
+    #[error("ledger {0} not found")]
+    LedgerNotFound(String),
+    /// The receiving node isn't the current leader. The caller
+    /// should look up the new leader (if known) and retry.
+    #[error("not the leader; current leader: {leader:?}")]
+    NotLeader { leader: Option<NodeId> },
+    /// Raft `client_write` reported a non-forwardable failure
+    /// (membership change error, fatal storage error). The message
+    /// is the underlying error's `Display`.
+    #[error("raft propose failed: {0}")]
+    RaftPropose(String),
+    /// The state machine returned a [`SmResponse`] variant that's
+    /// not reachable for an `ApplyHead` command — points to a
+    /// state-machine bug, not a caller mistake.
+    #[error("state machine invariant violated: {0}")]
+    InvariantViolated(String),
+}
+
+impl RaftNameService {
+    /// Handle the cross-node ApplyHead RPC: stash the ferried
+    /// receipt, propose `Command::ApplyHead`, return the outcome.
+    /// Called by the HTTP handler on the leader after a follower's
+    /// stager forwards its staged work.
+    ///
+    /// Receipt-stash lifecycle: stashed before propose so the
+    /// state-machine adapter has it when the apply fires; taken back
+    /// on the [`Stale`](ApplyStagedCommitResponse::Stale) path
+    /// (entry never applies, stash would leak), and on any error
+    /// before propose-returns (same reason).
+    pub async fn apply_staged_commit(
+        &self,
+        args: ApplyStagedCommitArgs,
+    ) -> std::result::Result<ApplyStagedCommitResponse, ApplyStagedCommitError> {
+        let ApplyStagedCommitArgs {
+            ref_key,
+            queue_id,
+            commit_id,
+            commit_t,
+            receipt,
+        } = args;
+
+        let (tally, flake_count) = match &receipt {
+            AppliedReceipt::Transact(t) => (
+                t.tally.as_ref().map(RecordedTally::from),
+                t.flake_count as u64,
+            ),
+            _ => (None, 0),
+        };
+        let cmd = SmCommand::ApplyHead(ApplyHeadArgs {
+            ledger_id: ref_key.ledger_name.clone(),
+            branch: ref_key.branch.clone(),
+            queue_id,
+            commit_id: commit_id.clone(),
+            commit_t,
+            applied_at_millis: current_millis(),
+            tally,
+            flake_count,
+        });
+
+        if let Some(stash) = &self.staged_receipts {
+            stash.stash(queue_id, ref_key.clone(), receipt);
+        }
+
+        let resp = match self.raft.client_write(cmd).await {
+            Ok(resp) => resp,
+            Err(err) => {
+                if let Some(stash) = &self.staged_receipts {
+                    stash.take(queue_id);
+                }
+                return Err(map_propose_error(err));
+            }
+        };
+
+        match resp.data {
+            SmResponse::HeadApplied { commit_t, .. } => {
+                Ok(ApplyStagedCommitResponse::Applied { commit_t })
+            }
+            SmResponse::QueueDesync { .. } => {
+                if let Some(stash) = &self.staged_receipts {
+                    stash.take(queue_id);
+                }
+                let current_front = self.current_front_queue_id(&ref_key).await;
+                Ok(ApplyStagedCommitResponse::Stale {
+                    current_front_queue_id: current_front,
+                })
+            }
+            SmResponse::LedgerNotFound { ledger_id } => {
+                if let Some(stash) = &self.staged_receipts {
+                    stash.take(queue_id);
+                }
+                Err(ApplyStagedCommitError::LedgerNotFound(ledger_id))
+            }
+            other => {
+                if let Some(stash) = &self.staged_receipts {
+                    stash.take(queue_id);
+                }
+                Err(ApplyStagedCommitError::InvariantViolated(format!(
+                    "unexpected Response variant for ApplyHead: {other:?}"
+                )))
+            }
+        }
+    }
+
+    /// Peek the current queue front's `queue_id`, or `None` if the
+    /// queue is empty / absent. Used to give followers a hint about
+    /// why their proposal raced.
+    async fn current_front_queue_id(&self, ref_key: &RefKey) -> Option<u64> {
+        let state = self.state.read().await;
+        state
+            .queues
+            .get(ref_key)
+            .and_then(|q| q.front())
+            .map(|entry| entry.queue_id)
+    }
+}
+
+/// Path under [`apply_staged_commit_router`]'s root for the cross-node
+/// ApplyHead RPC. Exposed so the client side (see
+/// [`Self::publish_commit`] on a follower) can build the outbound URL
+/// without hardcoding the route string twice.
+pub const APPLY_STAGED_COMMIT_PATH: &str = "/apply_staged_commit";
+
+const POSTCARD_MIME: &str = "application/octet-stream";
+
+/// Axum router exposing the cross-node ApplyHead RPC under
+/// [`APPLY_STAGED_COMMIT_PATH`]. Caller nests this under whatever
+/// base path the openraft RPC router (see
+/// [`crate::raft::network::router`]) is mounted at — typically `/raft`
+/// — so the full URL becomes `<base>/raft/apply_staged_commit`.
+///
+/// No auth layer is applied. The endpoint follows the same
+/// trust-the-VPC posture as the openraft RPCs: operators bind the
+/// raft port to peer addresses only.
+pub fn apply_staged_commit_router(ns: Arc<RaftNameService>) -> Router {
+    Router::new()
+        .route(APPLY_STAGED_COMMIT_PATH, post(handle_apply_staged_commit))
+        .with_state(ns)
+}
+
+/// HTTP handler for [`APPLY_STAGED_COMMIT_PATH`]. Decodes a postcard
+/// [`ApplyStagedCommitArgs`] body, dispatches to
+/// [`RaftNameService::apply_staged_commit`], and encodes the
+/// outcome (success **or** logical failure) as a postcard
+/// `Result<ApplyStagedCommitResponse, ApplyStagedCommitError>` body
+/// with HTTP 200. HTTP-level statuses are reserved for
+/// transport-level failures (decode error, encode error).
+async fn handle_apply_staged_commit(
+    State(ns): State<Arc<RaftNameService>>,
+    body: axum::body::Bytes,
+) -> Response {
+    let args: ApplyStagedCommitArgs = match postcard::from_bytes(&body) {
+        Ok(args) => args,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("postcard decode error on ApplyStagedCommitArgs: {e}"),
+            )
+                .into_response();
+        }
+    };
+
+    let outcome = ns.apply_staged_commit(args).await;
+    encode_apply_staged_commit_response(outcome)
+}
+
+/// Encode the application-level `Result` as a postcard body with HTTP
+/// 200. Both `Ok` and `Err` variants travel in the body so the client
+/// can pattern-match on structured outcomes; HTTP non-2xx is reserved
+/// for transport failures.
+fn encode_apply_staged_commit_response(
+    outcome: std::result::Result<ApplyStagedCommitResponse, ApplyStagedCommitError>,
+) -> Response {
+    match postcard::to_allocvec(&outcome) {
+        Ok(bytes) => (
+            StatusCode::OK,
+            [(reqwest::header::CONTENT_TYPE, POSTCARD_MIME)],
+            bytes,
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("postcard encode error on apply_staged_commit response: {e}"),
+        )
+            .into_response(),
+    }
+}
+
+fn map_propose_error(
+    err: RaftError<NodeId, ClientWriteError<NodeId, ClusterNode>>,
+) -> ApplyStagedCommitError {
+    match err {
+        RaftError::APIError(ClientWriteError::ForwardToLeader(forward)) => {
+            ApplyStagedCommitError::NotLeader {
+                leader: forward.leader_id,
+            }
+        }
+        RaftError::APIError(ClientWriteError::ChangeMembershipError(e)) => {
+            ApplyStagedCommitError::RaftPropose(format!(
+                "unexpected ChangeMembershipError on ApplyHead: {e}"
+            ))
+        }
+        RaftError::Fatal(f) => {
+            ApplyStagedCommitError::RaftPropose(format!("raft fatal during ApplyHead: {f}"))
+        }
+    }
+}
+
 #[async_trait]
 impl CommitPublisher for RaftNameService {
     async fn publish_commit(
@@ -409,10 +705,49 @@ impl CommitPublisher for RaftNameService {
         commit_t: i64,
         commit_id: &ContentId,
     ) -> Result<()> {
-        // Peek the queue front under the read lock; `client_write`
-        // happens after the lock drops so we don't hold it across an
-        // async wait. The lock-then-propose sequence is safe because
-        // the state machine validates the queue_id at apply time.
+        // With forwarding enabled, a non-leader node ferries the
+        // staged work to the current leader's `apply_staged_commit`
+        // endpoint instead of attempting a local propose (which would
+        // just bounce back as ForwardToLeader). Without forwarding,
+        // the legacy leader-only contract applies.
+        if let Some(forwarding) = &self.forwarding {
+            if !self.is_local_leader(forwarding.self_id).await {
+                return self
+                    .publish_commit_via_leader(ledger_id, commit_t, commit_id, forwarding)
+                    .await;
+            }
+        }
+
+        self.publish_commit_locally(ledger_id, commit_t, commit_id)
+            .await
+    }
+
+    /// The state-machine carries every published commit under its
+    /// `ledger_id:branch` alias, so the alias to write into the
+    /// commit's `ns` field is the same string the caller passed in.
+    /// Private publishing isn't a concept here — the cluster is the
+    /// only nameservice.
+    fn publishing_ledger_id(&self, ledger_id: &str) -> Option<String> {
+        Some(ledger_id.to_string())
+    }
+}
+
+impl RaftNameService {
+    async fn is_local_leader(&self, self_id: NodeId) -> bool {
+        self.raft.current_leader().await == Some(self_id)
+    }
+
+    /// In-process propose path — used on the leader and as the
+    /// legacy fallback when forwarding isn't configured. Peeks the
+    /// queue front under the read lock, drops the lock before
+    /// `client_write`, then maps the apply outcome onto the trait's
+    /// `Result<(), NameServiceError>` contract.
+    async fn publish_commit_locally(
+        &self,
+        ledger_id: &str,
+        commit_t: i64,
+        commit_id: &ContentId,
+    ) -> Result<()> {
         let cmd = {
             let state = self.state.read().await;
             build_apply_head_command(
@@ -451,13 +786,135 @@ impl CommitPublisher for RaftNameService {
         }
     }
 
-    /// The state-machine carries every published commit under its
-    /// `ledger_id:branch` alias, so the alias to write into the
-    /// commit's `ns` field is the same string the caller passed in.
-    /// Private publishing isn't a concept here — the cluster is the
-    /// only nameservice.
-    fn publishing_ledger_id(&self, ledger_id: &str) -> Option<String> {
-        Some(ledger_id.to_string())
+    /// Follower path — pulls the local queue_id and stashed receipt,
+    /// POSTs them to the current leader's `apply_staged_commit`
+    /// endpoint, maps the structured response onto the trait's
+    /// `Result<(), NameServiceError>` contract.
+    ///
+    /// Taking the receipt out of the local stash is deliberate: if
+    /// the RPC succeeds the leader's stash takes over, and if it
+    /// fails the stager's outer error path re-stages the same entry
+    /// (idempotent against the state machine's `queue_id` check).
+    /// Holding a duplicate on the follower would leak.
+    async fn publish_commit_via_leader(
+        &self,
+        ledger_id: &str,
+        commit_t: i64,
+        commit_id: &ContentId,
+        forwarding: &ForwardingConfig,
+    ) -> Result<()> {
+        let (ledger_name, branch) = split_ledger_id(ledger_id)?;
+        let ref_key = RefKey::new(&ledger_name, &branch);
+
+        let queue_id = {
+            let state = self.state.read().await;
+            state
+                .queues
+                .get(&ref_key)
+                .and_then(|q| q.front())
+                .map(|entry| entry.queue_id)
+                .ok_or_else(|| {
+                    NameServiceError::storage(format!(
+                        "publish_commit on {ledger_id}: per-branch queue is empty — \
+                         nothing staged for this branch"
+                    ))
+                })?
+        };
+
+        let receipt = self
+            .staged_receipts
+            .as_ref()
+            .and_then(|s| s.take(queue_id))
+            .unwrap_or_else(|| AppliedReceipt::Minimal {
+                commit_id: commit_id.clone(),
+                commit_t,
+            });
+
+        let args = ApplyStagedCommitArgs {
+            ref_key,
+            queue_id,
+            commit_id: commit_id.clone(),
+            commit_t,
+            receipt,
+        };
+
+        let leader_url = self.lookup_leader_raft_url().await.ok_or_else(|| {
+            NameServiceError::storage(
+                "no leader currently elected; cross-node ApplyHead deferred".to_string(),
+            )
+        })?;
+        let target = format!(
+            "{}{}",
+            leader_url.trim_end_matches('/'),
+            APPLY_STAGED_COMMIT_PATH
+        );
+
+        let body = postcard::to_allocvec(&args).map_err(|e| {
+            NameServiceError::storage(format!("postcard encode of ApplyStagedCommitArgs: {e}"))
+        })?;
+
+        let resp = forwarding
+            .http_client
+            .post(&target)
+            .header(reqwest::header::CONTENT_TYPE, POSTCARD_MIME)
+            .body(body)
+            .send()
+            .await
+            .map_err(|e| {
+                NameServiceError::storage(format!("apply_staged_commit POST to leader: {e}"))
+            })?;
+
+        if !resp.status().is_success() {
+            return Err(NameServiceError::storage(format!(
+                "apply_staged_commit returned HTTP {}",
+                resp.status()
+            )));
+        }
+
+        let body_bytes = resp
+            .bytes()
+            .await
+            .map_err(|e| NameServiceError::storage(format!("read apply_staged_commit body: {e}")))?;
+        let outcome: std::result::Result<ApplyStagedCommitResponse, ApplyStagedCommitError> =
+            postcard::from_bytes(&body_bytes).map_err(|e| {
+                NameServiceError::storage(format!(
+                    "postcard decode of apply_staged_commit response: {e}"
+                ))
+            })?;
+
+        match outcome {
+            Ok(ApplyStagedCommitResponse::Applied { .. }) => Ok(()),
+            Ok(ApplyStagedCommitResponse::Stale {
+                current_front_queue_id,
+            }) => Err(NameServiceError::storage(format!(
+                "apply_staged_commit stale: queue_id {queue_id} no longer at front \
+                 (current front: {current_front_queue_id:?})"
+            ))),
+            Err(e) => Err(NameServiceError::storage(format!(
+                "leader rejected apply_staged_commit: {e}"
+            ))),
+        }
+    }
+
+    /// Resolve the current leader's `raft_addr` from the replicated
+    /// membership snapshot. `None` if no leader is currently elected
+    /// or the membership entry for the leader is somehow missing.
+    async fn lookup_leader_raft_url(&self) -> Option<String> {
+        let leader_id = self.raft.current_leader().await?;
+        // Collect into a Vec so the watch::Ref guard drops at the end
+        // of the scope rather than living across the iterator chain.
+        let nodes: Vec<(NodeId, String)> = self
+            .raft
+            .metrics()
+            .borrow()
+            .membership_config
+            .nodes()
+            .map(|(id, node)| (*id, node.raft_addr.clone()))
+            .collect();
+        nodes
+            .into_iter()
+            .find(|(id, _)| *id == leader_id)
+            .map(|(_, addr)| addr)
     }
 }
 

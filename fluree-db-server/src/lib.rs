@@ -524,7 +524,16 @@ impl FlureeServerBuilder {
             // The actual `RaftListener` is assembled after `state` is
             // Arc-wrapped below so the admin-auth middleware can be
             // layered onto the `/cluster` subtree with `Arc<AppState>`.
-            (Arc::clone(integration), *listen_addr)
+            // Carrying the `RaftNameService` Arc through here too keeps
+            // it alive past the `drop(raft_nameservice)` below, so the
+            // `/raft/apply_staged_commit` route can mount with the
+            // same handle every other consumer holds.
+            let ns_for_router = std::sync::Arc::clone(
+                raft_nameservice
+                    .as_ref()
+                    .expect("raft_nameservice present whenever self.raft is Some"),
+            );
+            (Arc::clone(integration), *listen_addr, ns_for_router)
         });
 
         // Per-node CAS release task. The state-machine adapter pushes
@@ -650,7 +659,7 @@ impl FlureeServerBuilder {
         // `admin_auth` mode (pass-through when `None`); `/raft` peer
         // RPC stays unauthenticated and relies on network trust.
         #[cfg(feature = "raft")]
-        let raft_listener = raft_listener_parts.map(|(integration, listen_addr)| {
+        let raft_listener = raft_listener_parts.map(|(integration, listen_addr, ns)| {
             let cluster_admin =
                 integration
                     .cluster_admin_router()
@@ -658,8 +667,14 @@ impl FlureeServerBuilder {
                         Arc::clone(&state),
                         crate::routes::admin_auth::require_admin_token,
                     ));
+            // Cross-node `apply_staged_commit` lives under the same
+            // `/raft` mount as the openraft RPCs — intra-cluster
+            // trusted, no auth layer.
+            let raft_routes = integration.raft_rpc_router().merge(
+                fluree_db_consensus::raft::nameservice::apply_staged_commit_router(ns),
+            );
             let private_router = Router::new()
-                .nest("/raft", integration.raft_rpc_router())
+                .nest("/raft", raft_routes)
                 .nest("/cluster", cluster_admin);
             RaftListener {
                 private_router,
