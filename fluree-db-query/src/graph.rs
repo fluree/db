@@ -37,7 +37,7 @@ use crate::execute::build_where_operators_seeded;
 use crate::ir::{GraphName, Pattern};
 use crate::operator::{BoxedOperator, Operator, OperatorState};
 use crate::r2rml::rewrite_patterns_for_r2rml;
-use crate::seed::SeedOperator;
+use crate::seed::{BatchSeedOperator, SeedOperator};
 use crate::temporal_mode::PlanningContext;
 use crate::var_registry::VarId;
 use async_trait::async_trait;
@@ -316,6 +316,99 @@ impl GraphOperator {
         Ok(())
     }
 
+    /// R2RML fast path: run a concrete-IRI graph-source block once over the
+    /// WHOLE parent batch (uncorrelated), so the inner R2RML scan hash-joins all
+    /// parent rows in a single pass instead of re-scanning the table per parent
+    /// row (which is O(parent_rows × table_rows)).
+    ///
+    /// Sound because an R2RML block is a pure conjunction of scans + filters
+    /// (the caller has verified the source and the rewrite rejects unconvertible
+    /// patterns): running it once over the batch and hash-joining on the shared
+    /// variables yields exactly the per-row correlated result.
+    async fn execute_in_graph_batched(
+        &mut self,
+        ctx: &ExecutionContext<'_>,
+        parent_batch: &Batch,
+        graph_iri: Arc<str>,
+    ) -> Result<()> {
+        let mut graph_ctx = ctx.with_active_graph(graph_iri.clone());
+
+        let stamp_ledger_id: Option<Arc<str>> = match &ctx.dataset {
+            Some(ds) if ds.spans_multiple_ledgers() => ds
+                .named_graph(graph_iri.as_ref())
+                .map(|g| Arc::clone(&g.ledger_id)),
+            _ => None,
+        };
+        if stamp_ledger_id.is_some() {
+            graph_ctx.eager_materialization = true;
+        }
+
+        let rewrite_result =
+            rewrite_patterns_for_r2rml(&self.inner_patterns, &graph_iri, ctx.active_snapshot);
+        if rewrite_result.unconverted_count > 0 {
+            return Err(crate::error::QueryError::InvalidQuery(format!(
+                "R2RML graph source '{}' contains {} pattern(s) that cannot be converted \
+                 to R2RML scans.",
+                graph_iri, rewrite_result.unconverted_count
+            )));
+        }
+
+        let seed = BatchSeedOperator::from_batch(parent_batch.clone());
+        let mut inner = build_where_operators_seeded(
+            Some(Box::new(seed)),
+            &rewrite_result.patterns,
+            None,
+            None,
+            &self.planning,
+        )?;
+        inner.open(&graph_ctx).await?;
+
+        let numbig_exit_gv = if graph_ctx.binary_g_id != ctx.binary_g_id {
+            graph_ctx.graph_view()
+        } else {
+            None
+        };
+
+        while let Some(batch) = inner.next_batch(&graph_ctx).await? {
+            graph_ctx.check_cancelled()?;
+            let batch = match &stamp_ledger_id {
+                Some(ledger_id) => {
+                    crate::dataset_operator::stamp_provenance(batch, ledger_id, &graph_ctx)?
+                }
+                None => batch,
+            };
+
+            // The inner output already carries the parent columns (threaded
+            // through the multi-row seed) plus the new R2RML vars, so map each
+            // output variable of `self.schema` directly from it.
+            for inner_row_idx in 0..batch.len() {
+                let mut merged_row = Vec::with_capacity(self.schema.len());
+                for var in self.schema.iter() {
+                    let binding = batch
+                        .get(inner_row_idx, *var)
+                        .cloned()
+                        .unwrap_or(Binding::Unbound);
+                    let binding = if numbig_exit_gv.is_some()
+                        && crate::object_binding::is_numbig_encoded(&binding)
+                    {
+                        crate::group_aggregate::materialize_encoded(
+                            &binding,
+                            numbig_exit_gv.as_ref(),
+                        )
+                    } else {
+                        binding
+                    };
+                    merged_row.push(binding);
+                }
+                self.result_buffer.push(merged_row);
+            }
+            graph_ctx.check_cancelled()?;
+        }
+
+        inner.close();
+        Ok(())
+    }
+
     /// Drain buffered results into a batch
     fn drain_buffer(&mut self) -> Result<Option<Batch>> {
         if self.buffer_pos >= self.result_buffer.len() {
@@ -401,6 +494,34 @@ impl Operator for GraphOperator {
             // Clear buffer for new parent batch
             self.result_buffer.clear();
             self.buffer_pos = 0;
+
+            // Fast path: a concrete-IRI R2RML graph source in single-db mode.
+            // Run the whole parent batch through ONE uncorrelated scan so the
+            // inner R2RML hash join joins all parent rows at once, instead of
+            // re-scanning the table per parent row.
+            if ctx.dataset.is_none() {
+                if let GraphName::Iri(iri) = &graph_name {
+                    let is_user_graph = ctx.single_db_user_graph_id(iri).is_some();
+                    let is_alias = iri.as_ref() == ctx.active_snapshot.ledger_id;
+                    let is_r2rml_gs = !is_user_graph
+                        && !is_alias
+                        && if ctx.r2rml_graph_ids.contains(iri.as_ref()) {
+                            true
+                        } else if let Some(provider) = ctx.r2rml_provider {
+                            provider.has_r2rml_mapping(iri).await
+                        } else {
+                            false
+                        };
+                    if is_r2rml_gs {
+                        self.execute_in_graph_batched(ctx, &parent_batch, iri.clone())
+                            .await?;
+                        if self.result_buffer.is_empty() {
+                            continue;
+                        }
+                        return self.drain_buffer();
+                    }
+                }
+            }
 
             // Process each parent row
             for row_idx in 0..parent_batch.len() {

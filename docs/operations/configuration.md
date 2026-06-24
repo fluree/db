@@ -958,6 +958,36 @@ The HTTP transport for remote SERVICE requires the `search-remote-client` Cargo 
 
 See [SPARQL: Remote Fluree Federation](../query/sparql.md#remote-fluree-federation) for query syntax and examples.
 
+## Memory Allocator (mimalloc)
+
+`fluree-db-server` and `fluree-db-cli` expose an opt-in `mimalloc` Cargo feature
+that swaps the global allocator to [mimalloc](https://github.com/microsoft/mimalloc).
+It is **off by default** — enable it in your release build:
+
+```bash
+cargo build --release -p fluree-db-server --features mimalloc
+```
+
+**When it helps:** allocation-heavy, multicore query paths — most notably
+R2RML/Iceberg graph-source scans, which materialize many RDF terms in parallel.
+On those workloads the system allocator's lock contention caps the parallel
+speedup; mimalloc roughly doubles the realized gain (e.g. TPC-H Q1 over a 6M-row
+Iceberg table: ~62s with the system allocator vs ~31s with mimalloc).
+
+**Tradeoffs (operational, not semantic):**
+
+- Changes the allocator for *every* allocation in the process (HTTP, query,
+  import, caches, AWS/Iceberg clients, tracing buffers).
+- Usually better multicore throughput and lower fragmentation, but may retain
+  more RSS due to per-thread heaps — relevant for large scans that already peak
+  high. Track RSS, p95 query latency, and concurrent-query behavior during a
+  soak before making it the default.
+- New native dependency in the binary; verify it builds for your target
+  (e.g. musl/cross builds) and keep a system-allocator fallback build.
+
+Pair it with bounded query parallelism so a single large scan cannot monopolize
+cores and allocator pressure under concurrent load.
+
 ## Related Documentation
 
 - [Query Peers](query-peers.md) - Peer mode and replication

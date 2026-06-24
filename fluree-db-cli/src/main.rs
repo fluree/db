@@ -1,3 +1,9 @@
+// Opt-in global allocator (see the `mimalloc` feature). In the binary only, so
+// embedders of the cli library keep their own allocator.
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use clap::Parser;
 use fluree_db_cli::cli::{Cli, Commands};
 use fluree_db_cli::error::exit_with_error;

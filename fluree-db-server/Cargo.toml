@@ -35,6 +35,10 @@ shacl = ["fluree-db-api/shacl"]
 oidc = ["fluree-db-credential/oidc", "dep:jsonwebtoken"]
 # Iceberg / R2RML graph source support
 iceberg = ["fluree-db-api/iceberg"]
+# Use mimalloc as the global allocator. Better multicore allocation throughput
+# for the allocation-heavy query/materialization paths (e.g. R2RML/Iceberg
+# scans). Opt-in: enable in release packaging after a soak.
+mimalloc = ["dep:mimalloc"]
 # Enable Swagger UI endpoint (requires network during build to download assets)
 swagger-ui = ["dep:utoipa-swagger-ui"]
 # Enable OpenTelemetry tracing (optional)
@@ -50,6 +54,8 @@ otel = [
 raft = ["fluree-db-consensus/raft", "dep:fluree-db-indexer"]
 
 [dependencies]
+# Optional global allocator (see the `mimalloc` feature).
+mimalloc = { workspace = true, optional = true }
 # Fluree DB crates
 fluree-db-api = { path = "../fluree-db-api" }
 fluree-db-connection = { path = "../fluree-db-connection" }

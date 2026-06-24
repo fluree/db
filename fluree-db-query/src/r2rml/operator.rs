@@ -33,11 +33,12 @@
 use crate::binding::{Batch, Binding};
 use crate::context::ExecutionContext;
 use crate::error::{QueryError, Result};
+use crate::group_aggregate::{binding_to_group_key_normalized, GroupKeyOwned};
 use crate::ir::R2rmlPattern;
 use crate::operator::{BoxedOperator, Operator, OperatorState};
 use crate::var_registry::VarId;
 use async_trait::async_trait;
-use fluree_db_r2rml::mapping::{CompiledR2rmlMapping, ObjectMap, TriplesMap};
+use fluree_db_r2rml::mapping::{CompiledR2rmlMapping, ObjectMap, PredicateObjectMap, TriplesMap};
 use fluree_db_r2rml::materialize::{
     get_join_key_from_batch, materialize_object_from_batch, materialize_subject_from_batch, RdfTerm,
 };
@@ -93,6 +94,13 @@ impl R2rmlScanOperator {
             }
         }
 
+        // Add same-subject star object variables if new
+        for (_, var) in &pattern.star_bindings {
+            if seen.insert(*var) {
+                schema_vars.push(*var);
+            }
+        }
+
         // Build output position map
         let out_pos: HashMap<VarId, usize> = schema_vars
             .iter()
@@ -113,61 +121,312 @@ impl R2rmlScanOperator {
         }
     }
 
-    /// Convert an RdfTerm to a Binding.
-    ///
-    /// This is where we bridge R2RML materialized terms to the query engine's
-    /// binding representation.
-    ///
-    /// # Graph Source IRI Handling
-    ///
-    /// IRIs generated from R2RML templates are kept as raw strings (`Binding::Iri`)
-    /// rather than being encoded to SIDs. This is because:
-    ///
-    /// 1. Graph source IRIs are dynamically generated and may not exist in any Fluree ledger
-    /// 2. Cross-ledger SIDs don't match anyway (different namespace codes)
-    /// 3. Encoding would silently drop rows for IRIs not in namespace table
-    ///
-    /// This matches the legacy implementation which uses `match-iri` for graph source results.
-    fn term_to_binding(&self, term: &RdfTerm, ctx: &ExecutionContext<'_>) -> Result<Binding> {
+    /// All predicate IRIs this pattern materializes: the base `predicate_filter`
+    /// plus any same-subject star members. Used for projection and parent-lookup
+    /// building so a star scan reads every needed column in one pass.
+    fn pattern_predicates(&self) -> Vec<&str> {
+        let mut preds: Vec<&str> = Vec::new();
+        if let Some(p) = self.pattern.predicate_filter.as_deref() {
+            preds.push(p);
+        }
+        for (pred, _) in &self.pattern.star_bindings {
+            preds.push(pred.as_str());
+        }
+        preds
+    }
+
+    /// Resolve this pattern's pushdown predicates (keyed by query variable) to
+    /// table columns for the given TriplesMap, producing scan filters. A
+    /// variable maps to a column via its predicate IRI; predicates backed by a
+    /// RefObjectMap (an IRI join, not a scalar column) are skipped.
+    fn build_scan_filters(&self, triples_map: &TriplesMap) -> Vec<crate::r2rml::ScanFilter> {
+        let mut out = Vec::new();
+        for pd in &self.pattern.scan_filters {
+            let pred_iri = if Some(pd.var) == self.pattern.object_var {
+                self.pattern.predicate_filter.as_deref()
+            } else {
+                self.pattern
+                    .star_bindings
+                    .iter()
+                    .find(|(_, v)| *v == pd.var)
+                    .map(|(p, _)| p.as_str())
+            };
+            let Some(pred_iri) = pred_iri else { continue };
+
+            // The predicate's values come from EVERY matching object map, so a
+            // file-level prune is only sound when the predicate maps to exactly
+            // one scalar object map backed by exactly one column. Otherwise a row
+            // could match via a column we didn't prune on — skip the pushdown and
+            // let the in-engine FILTER handle it.
+            let mut matching = triples_map
+                .predicate_object_maps
+                .iter()
+                .filter(|p| p.predicate_map.as_constant() == Some(pred_iri));
+            let (Some(pom), None) = (matching.next(), matching.next()) else {
+                continue;
+            };
+            if matches!(pom.object_map, ObjectMap::RefObjectMap(_)) {
+                continue;
+            }
+            let cols = pom.object_map.referenced_columns();
+            let [col] = cols.as_slice() else {
+                continue;
+            };
+            out.push(crate::r2rml::ScanFilter {
+                column: (*col).to_string(),
+                op: pd.op,
+                value: pd.value.clone(),
+            });
+        }
+        out
+    }
+
+    /// Materialize all produced rows of a TriplesMap (independent of the child
+    /// stream) so the result can be hash-joined against the child. Datatype Sids
+    /// are resolved once into a `LiteralEncoder` (not per cell) and the data
+    /// files are materialized in parallel on the rayon pool.
+    fn materialize_produced_rows(
+        &self,
+        triples_map: &TriplesMap,
+        batches: &[ColumnBatch],
+        parent_lookups: &HashMap<(String, Vec<String>), ParentLookup>,
+        ctx: &ExecutionContext<'_>,
+    ) -> Result<Vec<Vec<(VarId, Binding)>>> {
+        use rayon::prelude::*;
+        let encoder = LiteralEncoder::build(triples_map, ctx.active_snapshot);
+        let pattern = &self.pattern;
+        let per_batch: Vec<Vec<Vec<(VarId, Binding)>>> = batches
+            .par_iter()
+            .map(|batch| materialize_batch(pattern, triples_map, batch, parent_lookups, &encoder))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(per_batch.into_iter().flatten().collect())
+    }
+}
+
+/// Datatype Sids resolved once per scan instead of per literal cell — the
+/// per-cell `encode_iri` was a large share of materialization cost.
+struct LiteralEncoder {
+    dt_sids: HashMap<String, fluree_db_core::Sid>,
+    xsd_string: fluree_db_core::Sid,
+}
+
+impl LiteralEncoder {
+    fn build(triples_map: &TriplesMap, snapshot: &fluree_db_core::LedgerSnapshot) -> Self {
+        let fallback = fluree_db_core::Sid::new(2, "string");
+        let mut dt_sids: HashMap<String, fluree_db_core::Sid> = HashMap::new();
+        for pom in &triples_map.predicate_object_maps {
+            if let Some(dt) = object_map_datatype(&pom.object_map) {
+                dt_sids
+                    .entry(dt.to_string())
+                    .or_insert_with(|| snapshot.encode_iri(dt).unwrap_or_else(|| fallback.clone()));
+            }
+        }
+        let xsd_string = snapshot.encode_iri(xsd::STRING).unwrap_or(fallback);
+        Self {
+            dt_sids,
+            xsd_string,
+        }
+    }
+
+    /// Convert an RdfTerm to a Binding without touching the snapshot (datatype
+    /// Sids are pre-resolved). IRIs are kept as raw strings — graph source IRIs
+    /// are independent of any Fluree namespace table.
+    fn encode(&self, term: &RdfTerm) -> Binding {
+        use fluree_db_core::FlakeValue;
+        use fluree_vocab::UnresolvedDatatypeConstraint as Udc;
         match term {
-            RdfTerm::Iri(iri) => {
-                // Keep IRI as raw string - don't try to encode to SID
-                // Graph source IRIs are independent of Fluree's namespace table
-                Ok(Binding::iri(iri.as_str()))
-            }
-            RdfTerm::BlankNode(id) => {
-                // Blank nodes use _: prefix convention
-                let blank_iri = format!("_:{id}");
-                Ok(Binding::iri(blank_iri))
-            }
-            RdfTerm::Literal { value, dtc } => {
-                use fluree_db_core::FlakeValue;
-                use fluree_vocab::UnresolvedDatatypeConstraint;
-
-                let val = FlakeValue::String(value.clone());
-
-                if let Some(UnresolvedDatatypeConstraint::LangTag(lang)) = dtc {
-                    return Ok(Binding::lit_lang(val, lang.as_ref()));
+            RdfTerm::Iri(iri) => Binding::iri(iri.as_str()),
+            RdfTerm::BlankNode(id) => Binding::iri(format!("_:{id}")),
+            RdfTerm::Literal { value, dtc } => match dtc {
+                Some(Udc::LangTag(lang)) => {
+                    Binding::lit_lang(FlakeValue::String(value.clone()), lang.as_ref())
                 }
+                Some(Udc::Explicit(dt_iri)) => {
+                    let dt_sid = self
+                        .dt_sids
+                        .get(dt_iri.as_ref())
+                        .cloned()
+                        .unwrap_or_else(|| self.xsd_string.clone());
+                    // Coerce numeric XSD literals from string to typed FlakeValue
+                    // (arithmetic reads the value, not the datatype Sid);
+                    // non-numeric datatypes keep their string form.
+                    let val = match fluree_db_core::coerce_value(
+                        FlakeValue::String(value.clone()),
+                        dt_iri.as_ref(),
+                    ) {
+                        Ok(
+                            c @ (FlakeValue::Long(_)
+                            | FlakeValue::Double(_)
+                            | FlakeValue::BigInt(_)
+                            | FlakeValue::Decimal(_)),
+                        ) => c,
+                        _ => FlakeValue::String(value.clone()),
+                    };
+                    Binding::lit(val, dt_sid)
+                }
+                _ => Binding::lit(FlakeValue::String(value.clone()), self.xsd_string.clone()),
+            },
+        }
+    }
+}
 
-                let xsd_string_fallback = fluree_db_core::Sid::new(2, "string");
-                let dt_sid = match dtc {
-                    Some(UnresolvedDatatypeConstraint::Explicit(dt_iri)) => {
-                        ctx.active_snapshot.encode_iri(dt_iri).unwrap_or_else(|| {
-                            ctx.active_snapshot
-                                .encode_iri(xsd::STRING)
-                                .unwrap_or(xsd_string_fallback)
-                        })
+/// Datatype IRI declared by an ObjectMap, if any (column/template/constant).
+fn object_map_datatype(om: &ObjectMap) -> Option<&str> {
+    use fluree_db_r2rml::mapping::ConstantValue;
+    match om {
+        ObjectMap::Column { datatype, .. } | ObjectMap::Template { datatype, .. } => {
+            datatype.as_deref()
+        }
+        ObjectMap::Constant {
+            value: ConstantValue::Literal { datatype, .. },
+        } => datatype.as_deref(),
+        _ => None,
+    }
+}
+
+/// Materialize the object term for one POM at a table row, resolving a
+/// RefObjectMap through the pre-built parent lookup. Free fn so it runs off the
+/// operator inside a rayon worker.
+fn materialize_pom_object(
+    pom: &PredicateObjectMap,
+    iceberg_batch: &ColumnBatch,
+    table_row_idx: usize,
+    parent_lookups: &HashMap<(String, Vec<String>), ParentLookup>,
+) -> Result<Option<RdfTerm>> {
+    if let ObjectMap::RefObjectMap(ref rom) = pom.object_map {
+        let child_columns: Vec<String> = rom
+            .child_columns()
+            .into_iter()
+            .map(std::string::ToString::to_string)
+            .collect();
+        let child_key = match get_join_key_from_batch(&child_columns, iceberg_batch, table_row_idx)
+        {
+            Some(k) => k,
+            None => return Ok(None),
+        };
+        let mut parent_join_cols: Vec<String> = rom
+            .parent_columns()
+            .into_iter()
+            .map(std::string::ToString::to_string)
+            .collect();
+        parent_join_cols.sort();
+        let lookup_key = (rom.parent_triples_map.clone(), parent_join_cols);
+        Ok(parent_lookups
+            .get(&lookup_key)
+            .and_then(|l| l.get(&child_key))
+            .cloned())
+    } else {
+        Ok(materialize_object_from_batch(
+            &pom.object_map,
+            iceberg_batch,
+            table_row_idx,
+        )?)
+    }
+}
+
+/// Materialize one column batch into produced variable assignments (subject +
+/// object vars) — the per-batch unit of the parallel scan. Mirrors the previous
+/// per-row logic (star cross product, subject-only, single-object).
+fn materialize_batch(
+    pattern: &R2rmlPattern,
+    triples_map: &TriplesMap,
+    iceberg_batch: &ColumnBatch,
+    parent_lookups: &HashMap<(String, Vec<String>), ParentLookup>,
+    encoder: &LiteralEncoder,
+) -> Result<Vec<Vec<(VarId, Binding)>>> {
+    let mut produced: Vec<Vec<(VarId, Binding)>> = Vec::new();
+    for table_row_idx in 0..iceberg_batch.num_rows {
+        let subject_term = match materialize_subject_from_batch(
+            &triples_map.subject_map,
+            iceberg_batch,
+            table_row_idx,
+        )? {
+            Some(t) => t,
+            None => continue,
+        };
+        let subject_binding = encoder.encode(&subject_term);
+
+        if !pattern.star_bindings.is_empty() {
+            let mut members: Vec<(VarId, &str)> = Vec::new();
+            if let (Some(ov), Some(pf)) = (pattern.object_var, pattern.predicate_filter.as_deref())
+            {
+                members.push((ov, pf));
+            }
+            for (pred, var) in &pattern.star_bindings {
+                members.push((*var, pred.as_str()));
+            }
+
+            let mut binding_lists: Vec<(VarId, Vec<Binding>)> = Vec::with_capacity(members.len());
+            let mut row_ok = true;
+            for (var, pred) in &members {
+                let mut vals: Vec<Binding> = Vec::new();
+                for pom in triples_map
+                    .predicate_object_maps
+                    .iter()
+                    .filter(|p| p.predicate_map.as_constant() == Some(*pred))
+                {
+                    if let Some(t) =
+                        materialize_pom_object(pom, iceberg_batch, table_row_idx, parent_lookups)?
+                    {
+                        vals.push(encoder.encode(&t));
                     }
-                    _ => ctx
-                        .active_snapshot
-                        .encode_iri(xsd::STRING)
-                        .unwrap_or(xsd_string_fallback),
-                };
-                Ok(Binding::lit(val, dt_sid))
+                }
+                if vals.is_empty() {
+                    row_ok = false;
+                    break;
+                }
+                binding_lists.push((*var, vals));
+            }
+            if !row_ok {
+                continue;
+            }
+
+            let mut rows: Vec<Vec<(VarId, Binding)>> =
+                vec![vec![(pattern.subject_var, subject_binding.clone())]];
+            for (var, vals) in &binding_lists {
+                if vals.len() == 1 {
+                    for r in &mut rows {
+                        r.push((*var, vals[0].clone()));
+                    }
+                } else {
+                    let mut next = Vec::with_capacity(rows.len() * vals.len());
+                    for r in &rows {
+                        for v in vals {
+                            let mut nr = r.clone();
+                            nr.push((*var, v.clone()));
+                            next.push(nr);
+                        }
+                    }
+                    rows = next;
+                }
+            }
+            produced.extend(rows);
+            continue;
+        }
+
+        let Some(obj_var) = pattern.object_var else {
+            produced.push(vec![(pattern.subject_var, subject_binding)]);
+            continue;
+        };
+
+        for pom in triples_map.predicate_object_maps.iter().filter(|pom| {
+            pattern
+                .predicate_filter
+                .as_deref()
+                .is_none_or(|pf| pom.predicate_map.as_constant() == Some(pf))
+        }) {
+            if let Some(t) =
+                materialize_pom_object(pom, iceberg_batch, table_row_idx, parent_lookups)?
+            {
+                let object_binding = encoder.encode(&t);
+                produced.push(vec![
+                    (pattern.subject_var, subject_binding.clone()),
+                    (obj_var, object_binding),
+                ]);
             }
         }
     }
+    Ok(produced)
 }
 
 /// Build a parent lookup table for RefObjectMap joins.
@@ -376,15 +635,33 @@ impl Operator for R2rmlScanOperator {
                     QueryError::InvalidQuery("TriplesMap has no logical table".to_string())
                 })?;
 
-                // Determine projection columns needed based on predicate filter
-                // When a predicate filter is present, only project columns needed for that predicate
-                let projection: Vec<String> = triples_map
-                    .columns_for_predicate(self.pattern.predicate_filter.as_deref())
-                    .into_iter()
-                    .map(std::string::ToString::to_string)
-                    .collect();
+                // Determine projection columns. For a same-subject star, project
+                // the union of columns needed for every star predicate so the
+                // whole star is satisfied by one scan.
+                let projection: Vec<String> = if self.pattern.star_bindings.is_empty() {
+                    triples_map
+                        .columns_for_predicate(self.pattern.predicate_filter.as_deref())
+                        .into_iter()
+                        .map(std::string::ToString::to_string)
+                        .collect()
+                } else {
+                    let mut cols: Vec<String> = Vec::new();
+                    for pred in self.pattern_predicates() {
+                        cols.extend(
+                            triples_map
+                                .columns_for_predicate(Some(pred))
+                                .into_iter()
+                                .map(std::string::ToString::to_string),
+                        );
+                    }
+                    cols.sort();
+                    cols.dedup();
+                    cols
+                };
 
-                // Scan the table
+                // Scan the table, pushing resolved FILTER predicates for file
+                // pruning (column resolution needs the mapping, so it happens here).
+                let scan_filters = self.build_scan_filters(triples_map);
                 let as_of_t = if ctx.dataset.is_some() {
                     None
                 } else {
@@ -395,6 +672,7 @@ impl Operator for R2rmlScanOperator {
                         &self.pattern.graph_source_id,
                         table_name,
                         &projection,
+                        &scan_filters,
                         as_of_t,
                     )
                     .await?;
@@ -403,12 +681,19 @@ impl Operator for R2rmlScanOperator {
                 // Key: (parent_tm_iri, parent_join_cols) -> ParentLookup
                 let mut parent_lookups: HashMap<LookupCacheKey, ParentLookup> = HashMap::new();
 
-                // Only process POMs that pass the predicate filter
+                // Only process POMs that pass the predicate filter. For a star,
+                // include POMs for any of the star predicates so RefObjectMap
+                // lookups are available during the wide-row emit below.
+                let star_preds = self.pattern_predicates();
                 let filtered_poms: Vec<_> = triples_map
                     .predicate_object_maps
                     .iter()
                     .filter(|pom| {
-                        if let Some(ref pred_filter) = self.pattern.predicate_filter {
+                        if !self.pattern.star_bindings.is_empty() {
+                            pom.predicate_map
+                                .as_constant()
+                                .is_some_and(|p| star_preds.contains(&p))
+                        } else if let Some(ref pred_filter) = self.pattern.predicate_filter {
                             pom.predicate_map.as_constant() == Some(pred_filter.as_str())
                         } else {
                             true
@@ -482,6 +767,7 @@ impl Operator for R2rmlScanOperator {
                                 &self.pattern.graph_source_id,
                                 parent_table,
                                 &parent_projection,
+                                &[],
                                 as_of_t,
                             )
                             .await?;
@@ -497,235 +783,144 @@ impl Operator for R2rmlScanOperator {
                 tm_scan_cache.insert(triples_map.iri.clone(), (batches, parent_lookups));
             }
 
-            // For each input row, process the pre-scanned table data
-            for row_idx in 0..child_batch.len() {
-                // Process each matching TriplesMap
-                for triples_map in &triples_maps {
-                    let (batches, parent_lookups) = match tm_scan_cache.get(&triples_map.iri) {
-                        Some(cached) => cached,
-                        None => continue,
-                    };
+            // Materialize each TriplesMap's produced rows ONCE, then hash-join
+            // them against the child on the shared variables, instead of
+            // re-scanning/re-materializing the table per child row (O(N*M)).
+            for triples_map in &triples_maps {
+                let (batches, parent_lookups) = match tm_scan_cache.get(&triples_map.iri) {
+                    Some(cached) => cached,
+                    None => continue,
+                };
 
-                    // Check if subject_var was already bound in the child
-                    let subject_was_bound = child_schema.contains(&self.pattern.subject_var);
-                    // Check if object_var was already bound in the child
-                    let object_was_bound = self
-                        .pattern
-                        .object_var
-                        .map(|v| child_schema.contains(&v))
-                        .unwrap_or(false);
+                let produced =
+                    self.materialize_produced_rows(triples_map, batches, parent_lookups, ctx)?;
+                if produced.is_empty() {
+                    continue;
+                }
 
-                    // Process each batch from the table scan
-                    for iceberg_batch in batches {
-                        for table_row_idx in 0..iceberg_batch.num_rows {
-                            // Materialize subject
-                            let subject_term = materialize_subject_from_batch(
-                                &triples_map.subject_map,
-                                iceberg_batch,
-                                table_row_idx,
-                            )?;
+                // Join vars = pattern-produced vars the child already binds.
+                let join_vars: Vec<VarId> = self
+                    .pattern
+                    .produced_vars()
+                    .into_iter()
+                    .filter(|v| child_schema.contains(v))
+                    .collect();
 
-                            let subject_term = match subject_term {
-                                Some(t) => t,
-                                None => continue, // Null subject - skip row
-                            };
-
-                            let subject_binding = self.term_to_binding(&subject_term, ctx)?;
-                            // Note: term_to_binding always returns Binding::Iri or Binding::Lit,
-                            // never Unbound (IRIs are kept as raw strings, not encoded to SIDs)
-
-                            // SPARQL join semantics: if subject_var was already bound,
-                            // check if the existing binding matches the new one
-                            if subject_was_bound {
-                                let subj_child_pos = child_schema
-                                    .iter()
-                                    .position(|&v| v == self.pattern.subject_var)
-                                    .unwrap();
-                                let existing_binding =
-                                    &child_batch.column_by_idx(subj_child_pos).unwrap()[row_idx];
-
-                                // Skip if existing is poisoned (can't join with poisoned)
-                                if existing_binding.is_poisoned() {
-                                    continue;
-                                }
-
-                                // Skip if existing is bound but doesn't match
-                                if existing_binding.is_bound()
-                                    && *existing_binding != subject_binding
-                                {
-                                    continue;
-                                }
+                // Emit child[row_idx] combined with a produced assignment.
+                macro_rules! emit_combined {
+                    ($row_idx:expr, $prod:expr) => {{
+                        ctx.tracker.consume_fuel(1)?;
+                        let mut out_row: Vec<Binding> = vec![Binding::Unbound; num_cols];
+                        for (col_idx, &var) in child_schema.iter().enumerate() {
+                            let out_idx = *self.out_pos.get(&var).unwrap();
+                            out_row[out_idx] =
+                                child_batch.column_by_idx(col_idx).unwrap()[$row_idx].clone();
+                        }
+                        for (var, binding) in $prod {
+                            out_row[*self.out_pos.get(var).unwrap()] = binding.clone();
+                        }
+                        if columns[0].len() < ctx.batch_size {
+                            for (col_idx, binding) in out_row.into_iter().enumerate() {
+                                columns[col_idx].push(binding);
                             }
+                        } else {
+                            self.pending.push_back(out_row);
+                        }
+                    }};
+                }
 
-                            // Helper function to emit an output row (inlined to avoid borrow issues)
-                            macro_rules! emit_row {
-                                ($object_binding:expr) => {{
-                                    // R2RML rows are tabular (Parquet/Arrow), not
-                                    // FLI3 leaflets — charge per row at 1 micro-fuel.
-                                    ctx.tracker.consume_fuel(1)?;
+                if join_vars.is_empty() {
+                    // No shared vars: cross product (child is usually the seed row).
+                    for row_idx in 0..child_batch.len() {
+                        for prod in &produced {
+                            emit_combined!(row_idx, prod);
+                        }
+                    }
+                } else {
+                    // Hash join: index produced rows by the join-var values, then
+                    // probe once per child row. O(N + M) instead of O(N * M).
+                    let store = ctx.binary_store.as_deref();
+                    let gv = ctx.graph_view();
+                    let gv = gv.as_ref();
 
-                                    // Build output row
-                                    let mut out_row: Vec<Binding> =
-                                        vec![Binding::Unbound; num_cols];
-
-                                    // Copy child columns
-                                    for (col_idx, &var) in child_schema.iter().enumerate() {
-                                        let out_idx = *self.out_pos.get(&var).unwrap();
-                                        out_row[out_idx] =
-                                            child_batch.column_by_idx(col_idx).unwrap()[row_idx]
-                                                .clone();
-                                    }
-
-                                    // Set subject binding (may overwrite if subject was in child,
-                                    // but we've already verified it matches above)
-                                    let subj_pos =
-                                        *self.out_pos.get(&self.pattern.subject_var).unwrap();
-                                    out_row[subj_pos] = subject_binding.clone();
-
-                                    // Set object binding if variable
-                                    if let Some(obj_var) = self.pattern.object_var {
-                                        if let Some(obj_bind) = $object_binding {
-                                            let obj_pos = *self.out_pos.get(&obj_var).unwrap();
-                                            out_row[obj_pos] = obj_bind;
-                                        }
-                                    }
-
-                                    // Add to output or pending
-                                    if columns[0].len() < ctx.batch_size {
-                                        for (col_idx, binding) in out_row.into_iter().enumerate() {
-                                            columns[col_idx].push(binding);
-                                        }
-                                    } else {
-                                        self.pending.push_back(out_row);
-                                    }
-                                }};
-                            }
-
-                            // Fast path: if object_var is None, this is a subject-only pattern
-                            // (e.g., rdf:type pattern). Emit one row per subject, don't iterate POMs.
-                            if self.pattern.object_var.is_none() {
-                                emit_row!(None::<Binding>);
-                                continue; // Next table row
-                            }
-
-                            // Normal path: iterate POMs and emit rows for each matching predicate-object
-                            // Filter predicate-object maps by predicate_filter if specified
-                            let poms_to_process: Vec<_> = triples_map
-                                .predicate_object_maps
+                    // Per-join-var keys for each produced row, aligned with
+                    // `produced`. A produced row always binds every pattern var,
+                    // so a complete key has len == join_vars.len().
+                    let produced_keys: Vec<Vec<GroupKeyOwned>> = produced
+                        .iter()
+                        .map(|prod| {
+                            join_vars
                                 .iter()
-                                .filter(|pom| {
-                                    if let Some(ref pred_filter) = self.pattern.predicate_filter {
-                                        // Only process POMs where predicate matches the filter
-                                        pom.predicate_map.as_constant()
-                                            == Some(pred_filter.as_str())
-                                    } else {
-                                        // No filter - process all POMs
-                                        true
-                                    }
+                                .filter_map(|jv| {
+                                    prod.iter()
+                                        .find(|(v, _)| v == jv)
+                                        .map(|(_, b)| binding_to_group_key_normalized(b, store, gv))
                                 })
-                                .collect();
+                                .collect()
+                        })
+                        .collect();
 
-                            // Handle predicate-object maps
-                            for pom in poms_to_process {
-                                // Materialize object - handle RefObjectMap specially
-                                let object_term = if let ObjectMap::RefObjectMap(ref rom) =
-                                    pom.object_map
-                                {
-                                    // RefObjectMap: look up parent subject via join
-                                    let child_columns: Vec<String> = rom
-                                        .child_columns()
-                                        .into_iter()
-                                        .map(std::string::ToString::to_string)
-                                        .collect();
-
-                                    // Extract child join key from current row
-                                    let child_key = match get_join_key_from_batch(
-                                        &child_columns,
-                                        iceberg_batch,
-                                        table_row_idx,
-                                    ) {
-                                        Some(k) => k,
-                                        None => continue, // Null in child join key - skip
-                                    };
-
-                                    // Build composite lookup key: (parent_tm_iri, sorted_parent_join_cols)
-                                    let mut parent_join_cols: Vec<String> = rom
-                                        .parent_columns()
-                                        .into_iter()
-                                        .map(std::string::ToString::to_string)
-                                        .collect();
-                                    parent_join_cols.sort(); // Must match the key used when building
-                                    let lookup_key =
-                                        (rom.parent_triples_map.clone(), parent_join_cols);
-
-                                    // Look up parent subject in the pre-built lookup
-                                    let lookup = match parent_lookups.get(&lookup_key) {
-                                        Some(l) => l,
-                                        None => {
-                                            tracing::debug!(
-                                                parent = %rom.parent_triples_map,
-                                                "No parent lookup found for RefObjectMap, skipping"
-                                            );
-                                            continue;
-                                        }
-                                    };
-
-                                    match lookup.get(&child_key) {
-                                        Some(parent_subject) => Some(parent_subject.clone()),
-                                        None => {
-                                            // No matching parent row - this is normal for
-                                            // orphaned foreign keys. Skip silently.
-                                            continue;
-                                        }
-                                    }
-                                } else {
-                                    // Regular object map - materialize from current row
-                                    materialize_object_from_batch(
-                                        &pom.object_map,
-                                        iceberg_batch,
-                                        table_row_idx,
-                                    )?
-                                };
-
-                                let object_term = match object_term {
-                                    Some(t) => t,
-                                    None => continue, // Null object - skip
-                                };
-
-                                let object_binding = self.term_to_binding(&object_term, ctx)?;
-                                // Note: term_to_binding always returns Binding::Iri or Binding::Lit
-
-                                // SPARQL join semantics: if object_var was already bound,
-                                // check if the existing binding matches the new one
-                                if object_was_bound {
-                                    if let Some(obj_var) = self.pattern.object_var {
-                                        let obj_child_pos = child_schema
-                                            .iter()
-                                            .position(|&v| v == obj_var)
-                                            .unwrap();
-                                        let existing_binding = &child_batch
-                                            .column_by_idx(obj_child_pos)
-                                            .unwrap()[row_idx];
-
-                                        // Skip if existing is poisoned
-                                        if existing_binding.is_poisoned() {
-                                            continue;
-                                        }
-
-                                        // Skip if existing is bound but doesn't match
-                                        if existing_binding.is_bound()
-                                            && *existing_binding != object_binding
-                                        {
-                                            continue;
-                                        }
-                                    }
+                    let mut index: HashMap<Vec<GroupKeyOwned>, Vec<usize>> = HashMap::new();
+                    for (pi, keys) in produced_keys.iter().enumerate() {
+                        if keys.len() == join_vars.len() {
+                            index.entry(keys.clone()).or_default().push(pi);
+                        }
+                    }
+                    for row_idx in 0..child_batch.len() {
+                        // Build the child's join key. An unbound join var is a
+                        // wildcard (SPARQL compatibility: unbound is compatible
+                        // with any value, binding from the produced side), so we
+                        // keep `None` for it and match the bound positions only.
+                        // A poisoned binding can never match, so the row is
+                        // dropped.
+                        let mut child_key: Vec<Option<GroupKeyOwned>> =
+                            Vec::with_capacity(join_vars.len());
+                        let mut all_bound = true;
+                        let mut poisoned = false;
+                        for &jv in &join_vars {
+                            let pos = child_schema.iter().position(|&v| v == jv).unwrap();
+                            let b = &child_batch.column_by_idx(pos).unwrap()[row_idx];
+                            if b.is_poisoned() {
+                                poisoned = true;
+                                break;
+                            }
+                            if b.is_bound() {
+                                child_key.push(Some(binding_to_group_key_normalized(b, store, gv)));
+                            } else {
+                                all_bound = false;
+                                child_key.push(None);
+                            }
+                        }
+                        if poisoned {
+                            continue;
+                        }
+                        if all_bound {
+                            // Fast path: full key, hash probe.
+                            let full: Vec<GroupKeyOwned> =
+                                child_key.into_iter().map(Option::unwrap).collect();
+                            if let Some(matches) = index.get(&full) {
+                                for &pi in matches {
+                                    emit_combined!(row_idx, &produced[pi]);
                                 }
-
-                                emit_row!(Some(object_binding));
+                            }
+                        } else {
+                            // Partial key: match produced rows agreeing on every
+                            // bound join var (unbound positions are wildcards).
+                            for (pi, keys) in produced_keys.iter().enumerate() {
+                                if keys.len() != join_vars.len() {
+                                    continue;
+                                }
+                                let agrees = child_key
+                                    .iter()
+                                    .zip(keys.iter())
+                                    .all(|(c, p)| c.as_ref().is_none_or(|c| c == p));
+                                if agrees {
+                                    emit_combined!(row_idx, &produced[pi]);
+                                }
                             }
                         }
                     }
-                } // End for triples_map in triples_maps
+                }
             }
         }
 
