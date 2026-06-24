@@ -11,7 +11,7 @@ default = []
 # Enables the Raft-replicated `Committer` implementation. Off by default
 # so that monolithic users don't compile (or link) openraft and its
 # transitive dependencies.
-raft = ["dep:openraft", "dep:postcard", "dep:reqwest", "dep:axum", "dep:futures", "dep:xxhash-rust"]
+raft = ["dep:openraft", "dep:postcard", "dep:reqwest", "dep:axum", "dep:futures", "dep:xxhash-rust", "dep:tokio-util"]
 
 [dependencies]
 fluree-db-api = { path = "../fluree-db-api" }
@@ -63,6 +63,11 @@ futures = { workspace = true, optional = true }
 # DefaultHasher. Gated behind `raft` because only the stager supervisor
 # reaches for it.
 xxhash-rust = { workspace = true, features = ["xxh64"], optional = true }
+
+# `CancellationToken` for graceful shutdown of the stager supervisor's
+# select loop. Gated behind `raft` because only that lifecycle path
+# uses it.
+tokio-util = { version = "0.7", optional = true }
 
 # In-memory concurrent map for the per-process WaiterMap: queue_id →
 # oneshot::Sender. Gated behind `raft` because only the queue-mediated

@@ -486,6 +486,55 @@ where
     LeaderWatcherHandle { join, cancel }
 }
 
+/// Handle returned by [`spawn_stager_supervisor`]. Same shape as
+/// [`LeaderWatcherHandle`]: a cancellation token to drive graceful
+/// shutdown and the supervisor task's `JoinHandle` to await. The
+/// supervisor itself drains every per-branch stager before its loop
+/// returns, so awaiting [`Self::shutdown`] is sufficient to confirm
+/// the whole stager fleet has stopped.
+pub struct StagerSupervisorHandle {
+    join: JoinHandle<()>,
+    cancel: tokio_util::sync::CancellationToken,
+}
+
+impl StagerSupervisorHandle {
+    /// Cooperatively shut the supervisor down. Cancels its token so
+    /// the `select!` loop exits, lets it abort every still-running
+    /// stager, then awaits the supervisor task itself. Returns only
+    /// after the whole stager fleet on this node has stopped.
+    pub async fn shutdown(self) {
+        self.cancel.cancel();
+        let _ = self.join.await;
+    }
+
+    /// Hard abort: signal cancellation *and* abort the supervisor's
+    /// JoinHandle without awaiting. Test-only escape hatch — leaves
+    /// the cleanup invariants to whoever's tearing the runtime down.
+    #[cfg(test)]
+    pub fn abort(self) {
+        self.cancel.cancel();
+        self.join.abort();
+    }
+}
+
+/// Spawn the per-node stager supervisor as a long-running background
+/// task. Unlike [`spawn_leader_watcher`], this is node-lifetime — the
+/// supervisor runs on every node (leader and followers alike) because
+/// distributed stagers can land anywhere under rendezvous assignment.
+///
+/// Returns a [`StagerSupervisorHandle`] the caller drives at server
+/// shutdown via [`StagerSupervisorHandle::shutdown`].
+pub fn spawn_stager_supervisor(
+    supervisor: fluree_db_consensus::raft::commit_worker::StagerSupervisor,
+) -> StagerSupervisorHandle {
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let cancel_inner = cancel.clone();
+    let join = tokio::spawn(async move {
+        supervisor.run(cancel_inner).await;
+    });
+    StagerSupervisorHandle { join, cancel }
+}
+
 /// Abort every handle and wait for the joins to resolve. `abort` is
 /// best-effort — the task only stops at the next `.await` point —
 /// and the `await` after it is what gives the caller a "they've all

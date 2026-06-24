@@ -81,11 +81,20 @@ pub struct FlureeServer {
     #[cfg(feature = "raft")]
     raft_listener: Option<RaftListener>,
     /// Leader-aware watcher driving every leader-only background
-    /// task (indexer, commit-queue worker). `Some` when raft mode is
+    /// task (indexer, idempotency evictor). `Some` when raft mode is
     /// on. Aborted on shutdown so the spawned tasks tear down with
     /// the rest of the server.
     #[cfg(feature = "raft")]
     raft_leader_watcher: Option<crate::raft::LeaderWatcherHandle>,
+    /// Per-node stager supervisor. Runs on every node (independent
+    /// of leadership) and drives per-branch [`Stager`] tasks for
+    /// branches this node owns under rendezvous assignment. Shut
+    /// down gracefully so in-flight stagers stop before the runtime
+    /// goes away.
+    ///
+    /// [`Stager`]: fluree_db_consensus::raft::commit_worker::Stager
+    #[cfg(feature = "raft")]
+    raft_stager_supervisor: Option<crate::raft::StagerSupervisorHandle>,
     /// Per-node release task that drains the state-machine adapter's
     /// CAS release channel. Runs on every node (not just the leader)
     /// so admin-cleared queue entries and idempotency-evicted
@@ -319,14 +328,23 @@ impl FlureeServer {
             task.abort();
         }
         #[cfg(feature = "raft")]
+        if let Some(handle) = self.raft_stager_supervisor {
+            // Shut the supervisor down before the leader watcher so
+            // any in-flight stager work has a chance to finish
+            // (forwarding through the leader, which is still alive
+            // for now). The supervisor aborts each per-branch stager
+            // and returns only after they've stopped.
+            handle.shutdown().await;
+        }
+        #[cfg(feature = "raft")]
         if let Some(handle) = self.raft_leader_watcher {
             // Cooperative shutdown: cancel the watcher's token, then
             // await its `JoinHandle`. The watcher exits its select
             // loop, abort-and-awaits every in-flight leader task,
             // and only then returns — so this `await` resolves with
             // a guarantee that every leader-only task (indexer,
-            // commit worker, eviction scheduler) has actually
-            // stopped, not just been signalled.
+            // eviction scheduler) has actually stopped, not just
+            // been signalled.
             handle.shutdown().await;
         }
         #[cfg(feature = "raft")]
@@ -469,6 +487,12 @@ impl FlureeServerBuilder {
         // `IndexingNameService`). Keeping a single Arc keeps reads
         // and the index publisher coherent — both observe the same
         // shared state and propose through the same Raft handle.
+        // Per-node HTTP client for `apply_staged_commit` forwarding —
+        // shared with the nameservice so all cross-node propose RPCs
+        // pool over the same connections.
+        #[cfg(feature = "raft")]
+        let raft_forwarding_client = reqwest::Client::new();
+
         #[cfg(feature = "raft")]
         let raft_nameservice = self.raft.as_ref().map(|(integration, _)| {
             std::sync::Arc::new(
@@ -476,7 +500,8 @@ impl FlureeServerBuilder {
                     integration.shared_state.clone(),
                     std::sync::Arc::clone(&integration.raft),
                 )
-                .with_staged_receipts(std::sync::Arc::clone(&integration.staged_receipts)),
+                .with_staged_receipts(std::sync::Arc::clone(&integration.staged_receipts))
+                .with_forwarding(integration.self_id, raft_forwarding_client.clone()),
             )
         });
 
@@ -585,10 +610,40 @@ impl FlureeServerBuilder {
             None => None,
         };
 
-        // Wire the leader-aware launcher. Bundles both the background
-        // indexer and the commit-queue worker so they share one
-        // metrics watcher and one spawn/abort lifecycle. See
-        // `raft::spawn_leader_watcher` for the contract.
+        // Per-node stager supervisor. Runs on every node (leader and
+        // followers alike) because distributed stagers can land
+        // anywhere under rendezvous assignment. Spawned here so its
+        // lifecycle is independent of the leader watcher's; followers'
+        // stagers ferry their apply through the leader via
+        // `RaftNameService::apply_staged_commit`.
+        #[cfg(feature = "raft")]
+        let raft_stager_supervisor = self.raft.as_ref().map(|(integration, _)| {
+            let raft_ns = std::sync::Arc::clone(
+                raft_nameservice
+                    .as_ref()
+                    .expect("raft_nameservice present whenever self.raft is Some"),
+            );
+            let publisher: std::sync::Arc<dyn fluree_db_nameservice::CommitPublisher> =
+                std::sync::Arc::clone(&raft_ns) as _;
+            let supervisor = fluree_db_consensus::raft::commit_worker::StagerSupervisor::new(
+                integration.self_id,
+                Arc::clone(&integration.raft),
+                publisher,
+                Arc::clone(&state_inner.fluree),
+                state_inner
+                    .index_config
+                    .clone()
+                    .expect("index_config set by AppState::new"),
+                integration.shared_state.clone(),
+                Arc::clone(&integration.staged_receipts),
+            );
+            crate::raft::spawn_stager_supervisor(supervisor)
+        });
+
+        // Wire the leader-aware launcher. Bundles the background
+        // indexer and the periodic idempotency evictor — both
+        // leader-only tasks. The stager supervisor lives at node
+        // scope (above) and is *not* in this set.
         #[cfg(feature = "raft")]
         let raft_leader_watcher = self.raft.as_ref().map(|(integration, _)| {
             let raft_ns = std::sync::Arc::clone(
@@ -599,24 +654,6 @@ impl FlureeServerBuilder {
             let backend = state_inner.fluree.backend().clone();
             let indexer_config = fluree_db_indexer::IndexerConfig::default();
             let event_bus = Arc::clone(&integration.event_bus);
-            // Same `RaftNameService` doubles as the
-            // `CommitPublisher` so each stager's head advance
-            // goes through `publish_commit` → `ApplyHead`
-            // under the queue front it sampled.
-            let publisher: std::sync::Arc<dyn fluree_db_nameservice::CommitPublisher> =
-                std::sync::Arc::clone(&raft_ns) as _;
-            let stager_supervisor =
-                fluree_db_consensus::raft::commit_worker::StagerSupervisor::new(
-                    Arc::clone(&integration.raft),
-                    publisher,
-                    Arc::clone(&state_inner.fluree),
-                    state_inner
-                        .index_config
-                        .clone()
-                        .expect("index_config set by AppState::new"),
-                    integration.shared_state.clone(),
-                    Arc::clone(&integration.staged_receipts),
-                );
             let eviction_scheduler =
                 fluree_db_consensus::raft::eviction_scheduler::EvictionScheduler::new(Arc::clone(
                     &integration.raft,
@@ -632,7 +669,6 @@ impl FlureeServerBuilder {
                 let worker = worker.with_event_bus(Arc::clone(&event_bus));
                 vec![
                     tokio::spawn(worker.run()),
-                    tokio::spawn(stager_supervisor.clone().run()),
                     tokio::spawn(eviction_scheduler.clone().run()),
                 ]
             };
@@ -720,6 +756,8 @@ impl FlureeServerBuilder {
             raft_listener,
             #[cfg(feature = "raft")]
             raft_leader_watcher,
+            #[cfg(feature = "raft")]
+            raft_stager_supervisor,
             #[cfg(feature = "raft")]
             raft_release_task,
         })

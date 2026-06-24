@@ -25,6 +25,7 @@
 //!   travel verbatim; redaction is future work.
 
 use crate::local::build_policy_context;
+use crate::raft::ownership::owner;
 use crate::raft::staged_receipt::{
     AppliedReceipt, MergeApplied, PushApplied, RebaseApplied, RevertApplied, StagedReceiptMap,
     TransactApplied,
@@ -33,7 +34,7 @@ use crate::raft::state_machine::{
     BodyKind, Command as SmCommand, PoisonQueueEntryArgs, PoisonReason, QueueEntry, RefKey,
 };
 use crate::raft::state_machine_adapter::SharedState;
-use crate::raft::TypeConfig;
+use crate::raft::{NodeId, TypeConfig};
 use crate::{
     QueuedMerge, QueuedPush, QueuedRebase, QueuedRequest, QueuedRevert, QueuedTransact,
     SubmissionError, TransactionBody,
@@ -895,20 +896,23 @@ impl Stager {
     }
 }
 
-/// Supervises per-branch [`Stager`]s on the leader. Watches
-/// [`NameServiceState::queues`] and spawns a fresh stager the first
-/// time it observes each [`RefKey`].
+/// Supervises per-branch [`Stager`]s on this node. Watches the
+/// replicated [`NameServiceState::queues`] and the cluster's voter
+/// set, computes which branches this node owns under rendezvous
+/// hashing, and reconciles the running stager set to match.
 ///
-/// Stagers are spawned into an internal [`tokio::task::JoinSet`]. The
-/// supervisor's `run` future owns that set, so aborting the
-/// supervisor task drops the set, which aborts every stager —
-/// matching the abort-on-leadership-loss contract the leader watcher
-/// relies on.
+/// Lifecycle: spawned at process start (not bound to leadership)
+/// since every node potentially hosts stagers under distributed
+/// assignment. Graceful shutdown is driven through a
+/// [`CancellationToken`]; the supervisor's `select!` loop catches
+/// the cancel, exits, and aborts every per-branch stager it owns.
 ///
-/// Cloning is cheap (`Arc` clones); the leader watcher's closure
-/// holds one supervisor and clones it on each leadership gain.
+/// Cloning is cheap (`Arc` clones plus a `NodeId`); the embedding
+/// server typically constructs once and never clones, but the type
+/// stays `Clone` to match the rest of the integration surface.
 #[derive(Clone)]
 pub struct StagerSupervisor {
+    id: NodeId,
     raft: Arc<Raft<TypeConfig>>,
     publisher: Arc<dyn CommitPublisher>,
     fluree: Arc<Fluree>,
@@ -919,6 +923,7 @@ pub struct StagerSupervisor {
 
 impl StagerSupervisor {
     pub fn new(
+        id: NodeId,
         raft: Arc<Raft<TypeConfig>>,
         publisher: Arc<dyn CommitPublisher>,
         fluree: Arc<Fluree>,
@@ -927,6 +932,7 @@ impl StagerSupervisor {
         staged_receipts: Arc<StagedReceiptMap>,
     ) -> Self {
         Self {
+            id,
             raft,
             publisher,
             fluree,
@@ -936,30 +942,104 @@ impl StagerSupervisor {
         }
     }
 
-    /// Reconcile the set of running stagers against the active
-    /// branch queues forever.
+    /// Reconcile the set of running stagers against the branches
+    /// this node owns. Runs until the cancellation token is signaled.
     ///
-    /// Each tick reads the current [`NameServiceState::queues`] key
-    /// set and spawns a stager for any newly-observed [`RefKey`].
-    /// Once spawned, stagers run until the supervisor is aborted —
-    /// idle branches are not reaped (a deliberate v1 scope cut).
-    pub async fn run(self) {
-        let mut stagers: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
-        let mut spawned: std::collections::HashSet<RefKey> = std::collections::HashSet::new();
+    /// Each tick:
+    /// 1. Compute the desired set: branches in
+    ///    [`NameServiceState::queues`] whose rendezvous owner under
+    ///    the current voter set is this node.
+    /// 2. Spawn a stager for any newly-desired branch; abort the
+    ///    stager for any branch this node no longer owns.
+    /// 3. Sleep until either the metrics watch fires (membership /
+    ///    leader changed → recompute ownership), the poll interval
+    ///    elapses (queues may have new branches), or the cancel
+    ///    token signals shutdown.
+    ///
+    /// On shutdown, every still-running stager is aborted before the
+    /// loop returns so the caller's `JoinHandle::await` sees the
+    /// supervisor stop only after its children have.
+    pub async fn run(self, cancel: tokio_util::sync::CancellationToken) {
+        let mut stagers: std::collections::HashMap<RefKey, tokio::task::JoinHandle<()>> =
+            std::collections::HashMap::new();
+        let mut metrics_rx = self.raft.metrics();
 
         loop {
-            for key in self.discover_active_keys().await {
-                if spawned.insert(key.clone()) {
-                    stagers.spawn(self.make_stager(key).run());
+            let desired = self.compute_desired_owners().await;
+            self.reconcile_stagers(&mut stagers, desired);
+
+            tokio::select! {
+                // Metrics changed (membership, leader, term, index, …).
+                // Recompute ownership on the next iteration. `Err`
+                // means the Raft handle has been dropped — nothing
+                // more to observe, exit.
+                changed = metrics_rx.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
                 }
+                () = tokio::time::sleep(SUPERVISOR_POLL_INTERVAL) => {}
+                () = cancel.cancelled() => break,
             }
-            tokio::time::sleep(SUPERVISOR_POLL_INTERVAL).await;
+        }
+
+        for (_, handle) in stagers.drain() {
+            handle.abort();
         }
     }
 
-    async fn discover_active_keys(&self) -> Vec<RefKey> {
+    async fn compute_desired_owners(&self) -> std::collections::HashSet<RefKey> {
+        let voters = self.current_voters();
+        // Empty voter set = cluster not yet bootstrapped (or every
+        // voter dropped); no branch can resolve an owner, so claim
+        // nothing this tick.
+        if voters.is_empty() {
+            return std::collections::HashSet::new();
+        }
         let state = self.shared_state.read().await;
-        state.queues.keys().cloned().collect()
+        state
+            .queues
+            .keys()
+            .filter(|ref_key| owner(ref_key, &voters) == Some(self.id))
+            .cloned()
+            .collect()
+    }
+
+    fn current_voters(&self) -> Vec<NodeId> {
+        self.raft
+            .metrics()
+            .borrow()
+            .membership_config
+            .membership()
+            .voter_ids()
+            .collect()
+    }
+
+    /// Spawn stagers for newly-desired branches; abort stagers for
+    /// branches no longer owned. Dead handles (a stager that exited
+    /// on its own — should not happen under normal operation since
+    /// `Stager::run` loops forever and panics are caught per-entry)
+    /// are left in place: they'll be removed on the next ownership
+    /// change, or stay dormant until the supervisor restarts.
+    fn reconcile_stagers(
+        &self,
+        stagers: &mut std::collections::HashMap<RefKey, tokio::task::JoinHandle<()>>,
+        desired: std::collections::HashSet<RefKey>,
+    ) {
+        for key in &desired {
+            if !stagers.contains_key(key) {
+                let handle = tokio::spawn(self.make_stager(key.clone()).run());
+                stagers.insert(key.clone(), handle);
+            }
+        }
+        stagers.retain(|key, handle| {
+            if desired.contains(key) {
+                true
+            } else {
+                handle.abort();
+                false
+            }
+        });
     }
 
     fn make_stager(&self, ref_key: RefKey) -> Stager {
@@ -1208,13 +1288,25 @@ mod tests {
             .and_then(|queue| queue.front().cloned())
     }
 
-    /// Replicates [`StagerSupervisor::discover_active_keys`] against a
-    /// bare `SharedState`. Exercises the supervisor's view of which
-    /// branches need a stager spawned without wiring up the leader
-    /// watcher.
-    async fn discover_active_keys_for_test(state: &SharedState) -> Vec<RefKey> {
+    /// Replicates [`StagerSupervisor::compute_desired_owners`] against
+    /// a bare `SharedState` plus an explicit voter list. Exercises
+    /// the supervisor's ownership filter without wiring up Raft.
+    async fn compute_desired_owners_for_test(
+        state: &SharedState,
+        id: NodeId,
+        voters: &[NodeId],
+    ) -> std::collections::HashSet<RefKey> {
+        use crate::raft::ownership::owner;
+        if voters.is_empty() {
+            return std::collections::HashSet::new();
+        }
         let state = state.read().await;
-        state.queues.keys().cloned().collect()
+        state
+            .queues
+            .keys()
+            .filter(|ref_key| owner(ref_key, voters) == Some(id))
+            .cloned()
+            .collect()
     }
 
     /// A stager only ever takes the front of its own branch — never
@@ -1272,11 +1364,10 @@ mod tests {
         );
     }
 
-    /// The supervisor discovers every branch present in
-    /// [`NameServiceState::queues`], including empty ones — the
-    /// stager itself decides when there's nothing to do.
+    /// On a single-voter cluster every branch is owned by the sole
+    /// voter — supervisor running on that node claims them all.
     #[tokio::test]
-    async fn supervisor_discovers_every_branch_in_state() {
+    async fn supervisor_owns_every_branch_when_alone() {
         let mut state = NameServiceState::default();
         install_queue(
             &mut state,
@@ -1284,20 +1375,55 @@ mod tests {
             "main",
             vec![enqueued_entry(7, cid(1), BodyKind::JsonLdInsert)],
         );
+        install_queue(&mut state, "test/db", "feature", vec![]);
+        let shared = Arc::new(RwLock::new(state));
+
+        let desired = compute_desired_owners_for_test(&shared, 1, &[1]).await;
+        assert_eq!(desired.len(), 2);
+        assert!(desired.contains(&RefKey::new("test/db", "main")));
+        assert!(desired.contains(&RefKey::new("test/db", "feature")));
+    }
+
+    /// On a multi-voter cluster ownership is partitioned: this node
+    /// claims only the subset of branches whose rendezvous owner
+    /// resolves to it. The complement is empty for branches owned by
+    /// peers.
+    #[tokio::test]
+    async fn supervisor_owns_only_its_partition_share() {
+        let mut state = NameServiceState::default();
+        for i in 0..50 {
+            install_queue(&mut state, "test/db", &format!("branch-{i}"), vec![]);
+        }
+        let shared = Arc::new(RwLock::new(state));
+        let voters = vec![1u64, 2, 3, 4];
+
+        let mut union = std::collections::HashSet::new();
+        for id in &voters {
+            let mine = compute_desired_owners_for_test(&shared, *id, &voters).await;
+            // Every claimed branch must belong to exactly one node.
+            for k in &mine {
+                assert!(union.insert(k.clone()), "branch {k:?} claimed by two voters");
+            }
+        }
+        assert_eq!(union.len(), 50, "every branch must be claimed by exactly one voter");
+    }
+
+    /// Empty voter set (cluster not yet bootstrapped or all voters
+    /// dropped) → no branch resolves an owner, so the supervisor
+    /// claims nothing rather than crashing on the empty hash input.
+    #[tokio::test]
+    async fn supervisor_claims_nothing_with_empty_voter_set() {
+        let mut state = NameServiceState::default();
         install_queue(
             &mut state,
             "test/db",
-            "feature",
-            vec![enqueued_entry(9, cid(3), BodyKind::Sparql)],
+            "main",
+            vec![enqueued_entry(7, cid(1), BodyKind::JsonLdInsert)],
         );
-        install_queue(&mut state, "test/db", "empty", vec![]);
         let shared = Arc::new(RwLock::new(state));
 
-        let keys = discover_active_keys_for_test(&shared).await;
-        assert_eq!(keys.len(), 3);
-        assert!(keys.contains(&RefKey::new("test/db", "main")));
-        assert!(keys.contains(&RefKey::new("test/db", "feature")));
-        assert!(keys.contains(&RefKey::new("test/db", "empty")));
+        let desired = compute_desired_owners_for_test(&shared, 1, &[]).await;
+        assert!(desired.is_empty());
     }
 
     #[test]

@@ -52,7 +52,7 @@ fn rendezvous_score(ref_key: &RefKey, node: NodeId) -> u64 {
     // sequentially via the seed parameter so the final hash depends
     // on every byte of input.
     let mut hash = xxh64(ref_key.ledger_name.as_bytes(), RENDEZVOUS_SEED);
-    hash = xxh64(&[b':'], hash);
+    hash = xxh64(b":", hash);
     hash = xxh64(ref_key.branch.as_bytes(), hash);
     hash = xxh64(&node.to_le_bytes(), hash);
     hash
