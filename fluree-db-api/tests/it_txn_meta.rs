@@ -7,12 +7,10 @@
 
 #![cfg(feature = "native")]
 
-mod support;
-
+use crate::support::{genesis_ledger, start_background_indexer_local, trigger_index_and_wait};
 use fluree_db_api::{FlureeBuilder, IndexConfig, LedgerManagerConfig};
 use serde_json::json;
 use std::sync::Arc;
-use support::{genesis_ledger, start_background_indexer_local, trigger_index_and_wait};
 
 /// Extract an i64 from a JSON value, handling both bare numbers and typed literals
 /// like `{"@value": 42, "@type": "xsd:long"}`.

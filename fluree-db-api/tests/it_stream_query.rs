@@ -5,8 +5,7 @@
 //! asserts the NDJSON record protocol: a `head` record, one `row` per result
 //! row, and a single `end` terminator. Also covers eligibility rejection.
 
-mod support;
-
+use crate::support;
 use fluree_db_api::{
     FlureeBuilder, OwnedStreamQuery, QueryExecutionOptions, Tracker, TrackingOptions,
 };

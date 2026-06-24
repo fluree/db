@@ -289,6 +289,13 @@ Full documentation also lives in [`docs/`](docs/README.md):
 - [Contributing](docs/contributing/README.md) — Build from source, run tests, PR workflow
 - [Benchmarking](BENCHMARKING.md) — Run, understand, and add performance benchmarks
 
+### For AI agents
+
+The published docs are available as LLM-readable text following the [`llms.txt`](https://llmstxt.org) convention:
+
+- Curated index: https://fluree.github.io/db/llms.txt
+- Full corpus: https://fluree.github.io/db/llms-full.txt
+
 ## License
 
 Licensed under the [Business Source License 1.1](LICENSE), with a Change Date

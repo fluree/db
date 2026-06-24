@@ -1,11 +1,10 @@
 //! JSON-LD compound query integration tests
 //!
 
-mod support;
-
+use crate::support;
+use crate::support::{normalize_rows, seed_people_compound_dataset};
 use fluree_db_api::FlureeBuilder;
 use serde_json::json;
-use support::{normalize_rows, seed_people_compound_dataset};
 
 #[tokio::test]
 async fn compound_two_tuple_select_with_crawl_and_values() {

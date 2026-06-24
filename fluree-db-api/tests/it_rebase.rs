@@ -3,8 +3,7 @@
 //! Tests the branch rebase lifecycle: fast-forward, clean replay,
 //! conflict detection with various resolution strategies, and edge cases.
 
-mod support;
-
+use crate::support;
 use fluree_db_api::{ConflictStrategy, FlureeBuilder};
 use serde_json::json;
 

@@ -17,11 +17,10 @@
 //! See `docs/concepts/edge-annotations.md` for the user-facing
 //! surface contract.
 
-mod support;
-
+use crate::support;
+use crate::support::genesis_ledger;
 use fluree_db_api::FlureeBuilder;
 use serde_json::json;
-use support::genesis_ledger;
 
 fn ctx() -> serde_json::Value {
     json!({

@@ -18,8 +18,7 @@
 //! syntax has a separate known flattening bug and would not exercise the
 //! same structure.
 
-mod support;
-
+use crate::support;
 use fluree_db_api::{FlureeBuilder, ReindexOptions};
 use serde_json::json;
 

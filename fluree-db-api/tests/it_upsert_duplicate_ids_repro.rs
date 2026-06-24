@@ -5,8 +5,9 @@
 
 #![cfg(feature = "native")]
 
-mod support;
-
+use crate::support::{
+    query_sparql, start_background_indexer_local, trigger_index_and_wait_outcome,
+};
 use fluree_db_api::{FlureeBuilder, IndexConfig};
 use fluree_db_binary_index::BinaryIndexStore;
 use fluree_db_core::Sid;
@@ -14,7 +15,6 @@ use fluree_db_query::binding::Binding;
 use fluree_db_transact::{CommitOpts, TxnOpts};
 use serde_json::json;
 use std::sync::Arc;
-use support::{query_sparql, start_background_indexer_local, trigger_index_and_wait_outcome};
 
 fn sid_to_iri(sid: &Sid, codes: &std::collections::HashMap<u16, String>) -> String {
     if sid.namespace_code == fluree_vocab::namespaces::OVERFLOW {

@@ -2,11 +2,10 @@
 //!
 //! All inserts and queries are explicit with `@context`.
 
-mod support;
-
+use crate::support;
+use crate::support::{genesis_ledger, normalize_rows, MemoryFluree, MemoryLedger};
 use fluree_db_api::FlureeBuilder;
 use serde_json::json;
-use support::{genesis_ledger, normalize_rows, MemoryFluree, MemoryLedger};
 
 fn ctx_ex() -> serde_json::Value {
     // Match the minimal {"ex" "http://example.com/"} context and include xsd/schema for safety.

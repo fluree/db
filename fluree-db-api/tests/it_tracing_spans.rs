@@ -9,11 +9,10 @@
 //! All tests use `current_thread` tokio flavor to ensure the thread-local
 //! `set_default()` subscriber captures spans from all async work.
 
-mod support;
-
+use crate::support;
+use crate::support::span_capture;
 use fluree_db_api::FlureeBuilder;
 use serde_json::json;
-use support::span_capture;
 
 /// Seed a small dataset and return the ledger state.
 async fn seed_people(fluree: &support::MemoryFluree, ledger_id: &str) -> support::MemoryLedger {

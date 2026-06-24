@@ -4,13 +4,11 @@
 //! explicit `@type` annotations in expansion results, and that `normalize_arrays`
 //! forces array wrapping for single-valued properties.
 
-mod support;
-
-use fluree_db_api::{FlureeBuilder, FormatterConfig};
-use serde_json::{json, Value as JsonValue};
-use support::{
+use crate::support::{
     genesis_ledger, query_jsonld_format, query_jsonld_formatted, MemoryFluree, MemoryLedger,
 };
+use fluree_db_api::{FlureeBuilder, FormatterConfig};
+use serde_json::{json, Value as JsonValue};
 
 fn ctx() -> JsonValue {
     json!({

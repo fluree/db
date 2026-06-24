@@ -7,11 +7,9 @@
 //! 2. Supports FILTER expressions
 //! 3. Properly injects ?$this and ?$identity
 
-mod support;
-
+use crate::support::{assert_index_defaults, genesis_ledger, normalize_rows, MemoryFluree};
 use fluree_db_api::FlureeBuilder;
 use serde_json::json;
-use support::{assert_index_defaults, genesis_ledger, normalize_rows, MemoryFluree};
 
 /// Diagnostic test: verify basic policy mechanism works with f:allow: true
 #[tokio::test]

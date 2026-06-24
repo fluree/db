@@ -10,15 +10,14 @@
 #![cfg(feature = "native")]
 
 use std::sync::Arc;
-mod support;
 
-use fluree_db_api::{FlureeBuilder, IndexConfig};
-use fluree_db_transact::{CommitOpts, TxnOpts};
-use serde_json::json;
-use support::{
+use crate::support::{
     query_jsonld_formatted, query_sparql, start_background_indexer_local,
     trigger_index_and_wait_outcome,
 };
+use fluree_db_api::{FlureeBuilder, IndexConfig};
+use fluree_db_transact::{CommitOpts, TxnOpts};
+use serde_json::json;
 
 /// Build the config-graph IRI for a ledger.
 fn config_graph_iri(ledger_id: &str) -> String {

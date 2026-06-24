@@ -10,18 +10,17 @@
 //! for high-cardinality namespace datasets.
 //!
 //! Run with:
-//!   cargo test -p fluree-db-api --test it_host_plus_n_e2e --features native
+//!   cargo test -p fluree-db-api --test grp_misc it_host_plus_n_e2e --features native
 
 #![cfg(feature = "native")]
 
-use std::sync::Arc;
-mod support;
-
+use crate::support;
+use crate::support::{start_background_indexer_local, trigger_index_and_wait_outcome};
 use fluree_db_api::{FlureeBuilder, IndexConfig};
 use fluree_db_core::NsSplitMode;
 use fluree_db_transact::{CommitOpts, TxnOpts};
 use serde_json::json;
-use support::{start_background_indexer_local, trigger_index_and_wait_outcome};
+use std::sync::Arc;
 
 /// Insert data under HostPlusN(1), index, rebuild from disk, and query.
 ///

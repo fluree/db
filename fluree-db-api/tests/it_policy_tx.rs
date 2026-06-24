@@ -7,8 +7,8 @@
 //! - View-only policies blocking all modifications
 //! - Custom error messages via f:exMessage
 
-mod support;
-
+use crate::support;
+use crate::support::{assert_index_defaults, genesis_ledger};
 use fluree_db_api::policy_builder;
 use fluree_db_api::{
     CommitOpts, FlureeBuilder, GovernanceOptions, IndexConfig, TrackedTransactionInput, TxnOpts,
@@ -16,7 +16,6 @@ use fluree_db_api::{
 };
 use serde_json::json;
 use std::collections::HashMap;
-use support::{assert_index_defaults, genesis_ledger};
 
 /// Helper to seed test data with users.
 async fn seed_users(fluree: &support::MemoryFluree, ledger_id: &str) -> fluree_db_api::LedgerState {

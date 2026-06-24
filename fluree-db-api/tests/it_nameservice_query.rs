@@ -1,12 +1,10 @@
 //! Nameservice query integration tests
 //!
 
-mod support;
-
+use crate::support::assert_index_defaults;
 use fluree_db_api::FlureeBuilder;
 use serde_json::json;
 use std::collections::HashSet;
-use support::assert_index_defaults;
 
 fn extract_first_string(v: &serde_json::Value) -> Option<String> {
     if let Some(s) = v.as_str() {

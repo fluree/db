@@ -9,11 +9,10 @@
 //! The `vector_search_post_indexing_*` tests exercise the binary index path:
 //! transact → index build → query from arena (not novelty).
 
-use std::sync::Arc;
 mod support;
-
 use fluree_db_api::FlureeBuilder;
 use serde_json::json;
+use std::sync::Arc;
 
 /// Integration test for basic vector search with dot product scoring
 #[tokio::test]

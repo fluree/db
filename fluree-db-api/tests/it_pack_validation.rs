@@ -1,7 +1,7 @@
 //! Validation tests for `stream_pack` — guard against silent empty packs.
 //!
 //! Run with:
-//!   cargo test -p fluree-db-api --test it_pack_validation --features native
+//!   cargo test -p fluree-db-api --test grp_import it_pack_validation --features native
 
 #![cfg(feature = "native")]
 

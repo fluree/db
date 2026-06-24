@@ -6,8 +6,6 @@
 //! writing the commit blob. On success, the commit record references the
 //! raw-txn ContentId and the bytes are retrievable from the content store.
 
-mod support;
-
 use fluree_db_api::{CommitOpts, FlureeBuilder, IndexConfig, LedgerState, Novelty};
 use fluree_db_core::{commit::codec::read_commit, ContentKind, LedgerSnapshot};
 use fluree_db_transact::{ir::TxnType, TxnOpts as IrTxnOpts};

@@ -8,11 +8,10 @@
 //! - Transaction @t bindings are supported.
 //! - Numeric datatype normalization (xsd:int family -> xsd:integer) is an intentional divergence.
 
-mod support;
-
+use crate::support;
+use crate::support::{genesis_ledger, normalize_rows, MemoryFluree, MemoryLedger};
 use fluree_db_api::{FlureeBuilder, QueryInput};
 use serde_json::{json, Value as JsonValue};
-use support::{genesis_ledger, normalize_rows, MemoryFluree, MemoryLedger};
 
 fn ctx_datatype() -> JsonValue {
     json!({

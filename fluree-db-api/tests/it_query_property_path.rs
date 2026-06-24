@@ -4,11 +4,10 @@
 //! and using them in WHERE node-maps. Both string form (SPARQL syntax) and
 //! array form (S-expression) are tested.
 
-mod support;
-
+use crate::support;
+use crate::support::{genesis_ledger, normalize_rows, MemoryFluree, MemoryLedger};
 use fluree_db_api::FlureeBuilder;
 use serde_json::json;
-use support::{genesis_ledger, normalize_rows, MemoryFluree, MemoryLedger};
 
 async fn seed_knows_chain(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
     let ledger0 = genesis_ledger(fluree, ledger_id);
