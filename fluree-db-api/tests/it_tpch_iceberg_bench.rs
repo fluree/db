@@ -8,6 +8,9 @@
 //!   TPCH_BENCH=1 cargo test -p fluree-db-api --features iceberg \
 //!     --test it_tpch_iceberg_bench -- --ignored --nocapture
 #![cfg(feature = "iceberg")]
+// Query constants use a uniform `r#"..."#` style; some don't strictly need the
+// hashes, but mixing raw-string forms across the suite hurts readability.
+#![allow(clippy::needless_raw_string_hashes)]
 
 // Materialization is allocation-heavy and parallel; the system allocator
 // contends badly across cores. mimalloc is what the deployed binary should use.
