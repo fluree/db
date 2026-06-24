@@ -114,8 +114,8 @@ If you're building a custom server that must support the CLI end-to-end (for exa
 | Command | Description |
 |---------|-------------|
 | [`memory`](memory.md) | Store and recall facts, decisions, constraints, preferences, and artifact references |
-| [`mcp`](mcp.md) | Developer-memory MCP server for IDE agent integration |
-| [`docs`](docs.md) | Search the embedded, version-pinned documentation (CLI + `fluree-docs` MCP server) |
+| [`mcp`](mcp.md) | Unified MCP server for IDE agents — selectable `memory` / `docs` toolsets |
+| [`docs`](docs.md) | Search the embedded, version-pinned documentation (also the MCP `docs` toolset) |
 
 For background, IDE setup, team workflows, and the `mem:` schema, see the [Memory section](../memory/README.md) of the docs.
 
