@@ -7,13 +7,12 @@
 
 #![cfg(feature = "native")]
 
-mod support;
-
+use crate::support;
+use crate::support::genesis_ledger_for_fluree;
 use fluree_db_api::ledger_manager::{NotifyResult, RefreshOpts, RefreshResult};
 use fluree_db_api::{ApiError, FlureeBuilder, IndexConfig};
 use fluree_db_transact::{CommitOpts, TxnOpts};
 use serde_json::json;
-use support::genesis_ledger_for_fluree;
 
 /// Helper: transact one insert and return the committed ledger state.
 async fn insert_data(

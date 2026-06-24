@@ -43,8 +43,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-mod support;
-
+use crate::support;
 /// Atomic counters tracking every read through a [`CountingContentStore`].
 #[derive(Default)]
 struct FetchCounters {

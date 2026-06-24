@@ -5,13 +5,12 @@
 //! Tests policy class lookup where policies are stored in the database
 //! and loaded via f:policyClass references.
 
-mod support;
-
+use crate::support;
+use crate::support::{assert_index_defaults, genesis_ledger};
 use fluree_db_api::policy_builder;
 use fluree_db_api::{FlureeBuilder, GovernanceOptions};
 use serde_json::json;
 use std::collections::HashMap;
-use support::{assert_index_defaults, genesis_ledger};
 
 /// Test: Policy class restricts SSN visibility to own user
 ///

@@ -2,8 +2,7 @@
 //!
 //! Note: The `transaction-functions` section (hash/datetime) is covered with bind support.
 
-mod support;
-
+use crate::support;
 use fluree_db_api::{FlureeBuilder, IndexConfig, LedgerState, Novelty};
 use fluree_db_core::{load_commit_by_id, FlakeValue, LedgerSnapshot};
 use fluree_db_transact::{CommitOpts, TxnOpts};
@@ -1898,7 +1897,7 @@ async fn update_values_wildcard_delete_across_two_transactions() {
 #[cfg(feature = "native")]
 #[tokio::test]
 async fn update_values_wildcard_delete_index_plus_novelty() {
-    use support::{start_background_indexer_local, trigger_index_and_wait};
+    use crate::support::{start_background_indexer_local, trigger_index_and_wait};
 
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/transact-update:wildcard-delete-indexed";
@@ -2032,7 +2031,7 @@ async fn update_values_wildcard_delete_index_plus_novelty() {
 #[cfg(feature = "native")]
 #[tokio::test]
 async fn update_wildcard_delete_duplicate_facts_across_index_and_novelty() {
-    use support::{start_background_indexer_local, trigger_index_and_wait};
+    use crate::support::{start_background_indexer_local, trigger_index_and_wait};
 
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/transact-update:wildcard-delete-dup-index-novelty";
@@ -2165,7 +2164,7 @@ async fn update_wildcard_delete_duplicate_facts_across_index_and_novelty() {
 #[cfg(feature = "native")]
 #[tokio::test]
 async fn update_values_wildcard_delete_after_updates_and_indexing() {
-    use support::{start_background_indexer_local, trigger_index_and_wait};
+    use crate::support::{start_background_indexer_local, trigger_index_and_wait};
 
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/transact-update:wildcard-delete-updates-indexed";

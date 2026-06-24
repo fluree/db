@@ -8,8 +8,8 @@
 use fluree_db_api::{FlureeBuilder, LedgerManagerConfig};
 use serde_json::json;
 
-mod support;
-use support::{assert_index_defaults, start_background_indexer_local};
+use crate::support;
+use crate::support::{assert_index_defaults, start_background_indexer_local};
 
 #[tokio::test]
 async fn policy_applies_to_named_graph_queries() {

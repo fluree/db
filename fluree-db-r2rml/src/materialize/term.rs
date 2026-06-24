@@ -413,7 +413,9 @@ fn base64_encode(bytes: &[u8]) -> String {
 fn format_date(days: i32) -> String {
     // Simple implementation: 1970-01-01 + days
     // For production, use chrono or similar
-    let epoch = 719_163i64; // Days from year 0 to 1970-01-01 (Julian day offset)
+    // Days from 0001-01-01 (day 0 in days_to_ymd) to 1970-01-01. days_to_ymd is
+    // 0-indexed, so this is 719162, not 719163 — otherwise every date is +1 day.
+    let epoch = 719_162i64;
     let total_days = epoch + days as i64;
 
     // Simplified Gregorian calendar calculation
@@ -434,7 +436,7 @@ fn format_timestamp(micros: i64) -> String {
     let minutes = (time_of_day % 3600) / 60;
     let secs = time_of_day % 60;
 
-    let epoch = 719_163i64;
+    let epoch = 719_162i64; // see format_date: 0-indexed days_to_ymd
     let total_days = epoch + days_since_epoch;
     let (year, month, day) = days_to_ymd(total_days);
 

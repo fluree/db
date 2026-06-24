@@ -13,13 +13,11 @@
 
 #![cfg(feature = "native")]
 
-mod support;
-
+use crate::support::start_background_indexer_local;
 use fluree_db_api::{FlureeBuilder, IndexConfig};
 use fluree_db_core::{load_ledger_snapshot, LedgerSnapshot};
 use fluree_db_transact::{CommitOpts, TxnOpts};
 use serde_json::json;
-use support::start_background_indexer_local;
 use tokio::time::{sleep, Duration};
 
 #[tokio::test]

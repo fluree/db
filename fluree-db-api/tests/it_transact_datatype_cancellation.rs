@@ -37,8 +37,7 @@
 //! Legacy datasets require an audit + manual re-insertion of affected
 //! flakes; see `docs/operations/` for the recovery runbook.
 
-mod support;
-
+use crate::support;
 use fluree_db_api::FlureeBuilder;
 use fluree_db_core::{load_commit_by_id, FlakeValue};
 use serde_json::json;

@@ -2,6 +2,12 @@
 //!
 //! Run with: `cargo run -p fluree-db-server -- --help`
 
+// Opt-in global allocator (see the `mimalloc` feature). Kept in the binary, not
+// the library, so embedders of `fluree_db_server` keep their own allocator.
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use clap::{CommandFactory, FromArgMatches};
 use fluree_db_server::{
     config_file::{config_error_is_fatal, load_and_merge_config},

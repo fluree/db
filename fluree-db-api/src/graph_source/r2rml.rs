@@ -15,15 +15,84 @@ use fluree_db_iceberg::{
     catalog::{RestCatalogClient, RestCatalogConfig, SendCatalogClient},
     io::{ColumnBatch, S3IcebergStorage, SendIcebergStorage, SendParquetReader},
     metadata::TableMetadata,
-    scan::{FileScanTask, ScanConfig, SendScanPlanner},
+    scan::{ComparisonOp, Expression, FileScanTask, LiteralValue, ScanConfig, SendScanPlanner},
     IcebergGsConfig,
 };
 use fluree_db_nameservice::GraphSourceType;
 use fluree_db_query::error::{QueryError, Result as QueryResult};
-use fluree_db_query::r2rml::{R2rmlProvider, R2rmlTableProvider};
+use fluree_db_query::r2rml::{R2rmlProvider, R2rmlTableProvider, ScanCmpOp, ScanFilter, ScanValue};
 use fluree_db_r2rml::mapping::CompiledR2rmlMapping;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
+
+/// How many data files to read concurrently. Defaults to
+/// `min(available_parallelism, files, 8)`; override with
+/// `FLUREE_ICEBERG_SCAN_CONCURRENCY` (a positive integer; not capped, so callers
+/// can raise it for high-latency remote object stores). Bounded to keep memory
+/// and S3 request fan-out in check.
+fn iceberg_scan_concurrency(num_files: usize) -> usize {
+    if let Some(n) = std::env::var("FLUREE_ICEBERG_SCAN_CONCURRENCY")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+    {
+        return n.min(num_files.max(1));
+    }
+    let cpus = std::thread::available_parallelism()
+        .map(std::num::NonZeroUsize::get)
+        .unwrap_or(4);
+    cpus.min(num_files.max(1)).clamp(1, 8)
+}
+
+/// Translate resolved scan filters into an Iceberg pushdown `Expression` for
+/// file pruning. Filters on unknown columns are skipped; an empty result is
+/// `None`. Conservative — pruning never drops matching rows because the
+/// in-engine FILTER still runs.
+fn build_iceberg_filter(
+    filters: &[ScanFilter],
+    schema: &fluree_db_iceberg::metadata::Schema,
+) -> Option<Expression> {
+    let mut comparisons = Vec::new();
+    for f in filters {
+        let Some(field) = schema.field_by_name(&f.column) else {
+            continue;
+        };
+        let op = match f.op {
+            ScanCmpOp::Eq => ComparisonOp::Eq,
+            ScanCmpOp::NotEq => ComparisonOp::NotEq,
+            ScanCmpOp::Lt => ComparisonOp::Lt,
+            ScanCmpOp::LtEq => ComparisonOp::LtEq,
+            ScanCmpOp::Gt => ComparisonOp::Gt,
+            ScanCmpOp::GtEq => ComparisonOp::GtEq,
+        };
+        let value = match &f.value {
+            ScanValue::Bool(b) => LiteralValue::Boolean(*b),
+            ScanValue::Date(d) => LiteralValue::Date(*d),
+            // Iceberg `int` is 32-bit, `long` 64-bit. For an `int` column a
+            // literal outside i32 range must NOT be truncated with `as` (it would
+            // wrap and could prune files the residual filter keeps); skip the
+            // pushdown for that predicate instead.
+            ScanValue::Int(n) => match field.type_string() {
+                Some("int") => match i32::try_from(*n) {
+                    Ok(v) => LiteralValue::Int32(v),
+                    Err(_) => continue,
+                },
+                _ => LiteralValue::Int64(*n),
+            },
+        };
+        comparisons.push(Expression::Comparison {
+            field_id: field.id,
+            column: f.column.clone(),
+            op,
+            value,
+        });
+    }
+    match comparisons.len() {
+        0 => None,
+        1 => comparisons.into_iter().next(),
+        _ => Some(Expression::And(comparisons)),
+    }
+}
 
 // =============================================================================
 // Iceberg/R2RML Graph Source Creation
@@ -492,6 +561,7 @@ impl R2rmlTableProvider for FlureeR2rmlProvider<'_> {
         graph_source_id: &str,
         table_name: &str,
         projection: &[String],
+        filters: &[ScanFilter],
         _as_of_t: Option<i64>,
     ) -> QueryResult<Vec<ColumnBatch>> {
         // Look up the graph source record to get Iceberg connection info
@@ -749,10 +819,32 @@ impl R2rmlTableProvider for FlureeR2rmlProvider<'_> {
 
         let schema_arc = Arc::new(schema.clone());
 
+        // Build an Iceberg pushdown predicate for file pruning. Filters resolve
+        // to fields by name; unknown fields are skipped (conservative).
+        let filter_expr = build_iceberg_filter(filters, schema);
+
         // Reuse manifest-derived file selections across repeated scans of the
         // same snapshot. Projection still varies per scan, so we rebuild tasks.
+        // The scan-files cache is keyed only by metadata location, so it is
+        // bypassed when a pushdown filter is present (different filter → a
+        // different pruned file set).
         let (tasks, files_selected, files_pruned, estimated_row_count) =
-            if let Some(cached) = cache.get_scan_files(metadata_location).await {
+            if let Some(filter) = &filter_expr {
+                let scan_config = ScanConfig::new()
+                    .with_projection(projected_field_ids.clone())
+                    .with_filter(filter.clone());
+                let planner = SendScanPlanner::new(storage.as_ref(), &metadata, scan_config);
+                let plan = planner
+                    .plan_scan()
+                    .await
+                    .map_err(|e| QueryError::Internal(format!("Failed to plan scan: {e}")))?;
+                (
+                    plan.tasks,
+                    plan.files_selected,
+                    plan.files_pruned,
+                    plan.estimated_row_count,
+                )
+            } else if let Some(cached) = cache.get_scan_files(metadata_location).await {
                 debug!(
                     metadata_location = %metadata_location,
                     cached_files = cached.data_files.len(),
@@ -825,26 +917,48 @@ impl R2rmlTableProvider for FlureeR2rmlProvider<'_> {
             return Ok(Vec::new());
         }
 
-        // Read data files
-        let reader = SendParquetReader::with_cache(storage.as_ref(), cache.parquet_footers());
-        let mut all_batches = Vec::new();
+        // Read data files with bounded parallelism. Each file is an independent
+        // "file -> batches" worker; concurrency is capped (see
+        // `iceberg_scan_concurrency`) to avoid spiking memory or hammering S3.
+        // This is the first slice of a streaming scan — the next step consumes
+        // batches as workers complete instead of collecting them all here.
+        let footers = cache.parquet_footers();
+        let concurrency = iceberg_scan_concurrency(tasks.len());
+        debug!(
+            files = tasks.len(),
+            concurrency, "reading Parquet files (bounded parallel)"
+        );
 
-        for task in &tasks {
-            info!(
-                file_path = %task.data_file.file_path,
-                record_count = task.data_file.record_count,
-                "Reading Parquet file"
-            );
-
-            let batches = reader.read_task(task).await.map_err(|e| {
-                QueryError::Internal(format!(
-                    "Failed to read Parquet file '{}': {}",
-                    task.data_file.file_path, e
-                ))
-            })?;
-
-            all_batches.extend(batches);
-        }
+        let all_batches: Vec<ColumnBatch> = {
+            use futures::stream::{StreamExt, TryStreamExt};
+            futures::stream::iter(tasks)
+                .map(|task| {
+                    let storage = Arc::clone(&storage);
+                    let footers = Arc::clone(&footers);
+                    async move {
+                        tokio::spawn(async move {
+                            let reader =
+                                SendParquetReader::with_cache(storage.as_ref(), footers.as_ref());
+                            reader.read_task(&task).await.map_err(|e| {
+                                QueryError::Internal(format!(
+                                    "Failed to read Parquet file '{}': {e}",
+                                    task.data_file.file_path
+                                ))
+                            })
+                        })
+                        .await
+                        .map_err(|e| {
+                            QueryError::Internal(format!("Parquet read worker failed: {e}"))
+                        })?
+                    }
+                })
+                .buffer_unordered(concurrency)
+                .try_collect::<Vec<Vec<ColumnBatch>>>()
+                .await?
+                .into_iter()
+                .flatten()
+                .collect()
+        };
 
         info!(
             total_batches = all_batches.len(),

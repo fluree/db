@@ -10,16 +10,14 @@
 
 #![cfg(feature = "native")]
 
-mod support;
-
+use crate::support::{
+    assert_index_defaults, genesis_ledger_for_fluree, start_background_indexer_local,
+    trigger_index_and_wait_outcome,
+};
 use fluree_db_api::{FlureeBuilder, IndexConfig, LedgerManagerConfig, LedgerState, Novelty};
 use fluree_db_core::LedgerSnapshot;
 use fluree_db_transact::{CommitOpts, TxnOpts};
 use serde_json::json;
-use support::{
-    assert_index_defaults, genesis_ledger_for_fluree, start_background_indexer_local,
-    trigger_index_and_wait_outcome,
-};
 
 type MemoryFluree = fluree_db_api::Fluree;
 type MemoryLedger = LedgerState;

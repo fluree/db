@@ -2,13 +2,16 @@
 //!
 //! Provides type aliases, helpers, and utilities used by integration tests.
 
-// Many helpers are used by *some* integration test crates but not others.
-// Keep them centralized here and silence dead_code warnings in crates that
-// don't reference every helper.
+// Many helpers are used by *some* integration test groups but not others.
+// Keep them centralized here and silence dead_code warnings in group binaries
+// that don't reference every helper.
 //
-// Kept as a shared utility module across many integration tests. Individual
-// test crates intentionally do not use every helper.
-#![expect(dead_code)]
+// `allow` (not the repo-preferred `expect`) is deliberate: this module is
+// compiled once into each `grp_*` test binary, and the subset of helpers used
+// differs per group. `#![expect(dead_code)]` would fire an "unfulfilled
+// expectation" warning in any group that happens to use *all* of them, so a
+// plain `allow` is the only annotation correct across every binary.
+#![allow(dead_code)]
 
 pub mod span_capture;
 

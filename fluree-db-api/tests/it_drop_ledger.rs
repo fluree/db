@@ -7,14 +7,12 @@
 
 #![cfg(feature = "native")]
 
-mod support;
-
+use crate::support::start_background_indexer_local;
 use fluree_db_api::{DropMode, DropStatus, FlureeBuilder, IndexConfig, LedgerState, Novelty};
 use fluree_db_core::address_path::ledger_id_to_path_prefix;
 use fluree_db_core::LedgerSnapshot;
 use fluree_db_transact::{CommitOpts, TxnOpts};
 use serde_json::json;
-use support::start_background_indexer_local;
 use tokio::time::{timeout, Duration};
 
 /// Test that soft drop only retracts from nameservice and leaves files intact.

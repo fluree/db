@@ -7,8 +7,7 @@
 
 #![cfg(feature = "native")]
 
-mod support;
-
+use crate::support;
 use fluree_db_api::{FlureeBuilder, LedgerState, ReindexOptions};
 use serde_json::json;
 

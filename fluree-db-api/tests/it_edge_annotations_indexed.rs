@@ -27,12 +27,11 @@
 
 #![cfg(feature = "native")]
 
-mod support;
-
+use crate::support;
+use crate::support::genesis_ledger;
 use fluree_db_api::FlureeBuilder;
 use fluree_db_indexer::IndexerConfig;
 use serde_json::{json, Value as JsonValue};
-use support::genesis_ledger;
 
 fn ctx() -> JsonValue {
     json!({
@@ -842,7 +841,7 @@ async fn explain_tags_annotation_role_and_uses_arena_stats() {
     // is observable, and (c) report stats as available when the
     // annotation arena is sealed even if no other property stats
     // exist yet.
-    use support::graphdb_from_ledger;
+    use crate::support::graphdb_from_ledger;
 
     let fluree = FlureeBuilder::memory()
         .with_ledger_cache_config(fluree_db_api::LedgerManagerConfig::default())

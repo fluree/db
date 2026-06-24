@@ -5,11 +5,9 @@
 //! under a different name. Verifies that query results match.
 //!
 //! Run with:
-//!   cargo test -p fluree-db-api --test it_flpack_round_trip --features native
+//!   cargo test -p fluree-db-api --test grp_import it_flpack_round_trip --features native
 
 #![cfg(feature = "native")]
-
-mod support;
 
 use fluree_db_api::pack::{compute_missing_commits, compute_missing_index_artifacts};
 use fluree_db_api::FlureeBuilder;
@@ -342,7 +340,7 @@ async fn flpack_export_import_round_trip() {
 /// Round-trip with binary indexing: transact → index → export (with index artifacts) → import → query.
 #[tokio::test]
 async fn flpack_export_import_round_trip_with_index() {
-    use support::{start_background_indexer_local, trigger_index_and_wait};
+    use crate::support::{start_background_indexer_local, trigger_index_and_wait};
 
     let src_dir = tempfile::TempDir::new().expect("src tempdir");
     let dst_dir = tempfile::TempDir::new().expect("dst tempdir");
@@ -721,7 +719,7 @@ async fn flpack_preserves_default_context() {
 /// every write loops as retryable, leaving the ledger silently read-only.
 #[tokio::test]
 async fn flpack_restore_restamps_index_root_ledger_id() {
-    use support::{start_background_indexer_local, trigger_index_and_wait};
+    use crate::support::{start_background_indexer_local, trigger_index_and_wait};
 
     let src_dir = tempfile::TempDir::new().expect("src tempdir");
     let dst_dir = tempfile::TempDir::new().expect("dst tempdir");

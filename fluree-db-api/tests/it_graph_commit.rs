@@ -1,7 +1,8 @@
 #![cfg(feature = "native")]
 
-mod support;
-
+use crate::support::{
+    genesis_ledger, start_background_indexer_local, trigger_index_and_wait, MemoryFluree,
+};
 use fluree_db_api::{ApiError, FlureeBuilder};
 use fluree_db_core::{
     range_with_overlay, ContentId, Flake, FlakeValue, IndexType, RangeMatch, RangeOptions,
@@ -11,9 +12,6 @@ use fluree_db_ledger::LedgerState;
 use fluree_db_novelty::Novelty;
 use fluree_vocab::namespaces::{FLUREE_COMMIT, FLUREE_DB};
 use serde_json::json;
-use support::{
-    genesis_ledger, start_background_indexer_local, trigger_index_and_wait, MemoryFluree,
-};
 
 async fn seed_two_commits(
     fluree: &MemoryFluree,

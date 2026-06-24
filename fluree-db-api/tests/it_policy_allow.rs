@@ -2,11 +2,10 @@
 //!
 //! Tests f:allow true/false, precedence over f:query, and targeting modes.
 
-mod support;
-
+use crate::support;
+use crate::support::{assert_index_defaults, genesis_ledger, normalize_rows};
 use fluree_db_api::FlureeBuilder;
 use serde_json::json;
-use support::{assert_index_defaults, genesis_ledger, normalize_rows};
 
 /// Helper to seed test data with users having sensitive SSN property.
 async fn seed_user_data(fluree: &support::MemoryFluree, ledger_id: &str) {

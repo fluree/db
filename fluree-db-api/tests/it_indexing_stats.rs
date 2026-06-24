@@ -9,8 +9,10 @@
 #![cfg(feature = "native")]
 
 use std::sync::Arc;
-mod support;
 
+use crate::support::{
+    genesis_ledger_for_fluree, start_background_indexer_local, trigger_index_and_wait_outcome,
+};
 use fluree_db_api::{FlureeBuilder, IndexConfig, LedgerState};
 use fluree_db_binary_index::BinaryIndexStore;
 use fluree_db_core::{
@@ -19,9 +21,6 @@ use fluree_db_core::{
 use fluree_db_query::BinaryRangeProvider;
 use fluree_db_transact::{CommitOpts, TxnOpts};
 use serde_json::{json, Value as JsonValue};
-use support::{
-    genesis_ledger_for_fluree, start_background_indexer_local, trigger_index_and_wait_outcome,
-};
 
 /// Apply a binary index root to a ledger, loading the full BinaryIndexStore
 /// and attaching a BinaryRangeProvider so subsequent queries work correctly.
