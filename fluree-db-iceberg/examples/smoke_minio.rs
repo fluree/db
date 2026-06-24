@@ -23,15 +23,14 @@ use fluree_db_iceberg::S3IcebergStorage;
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let endpoint = std::env::var("ICEBERG_ENDPOINT").unwrap_or("http://localhost:9000".into());
-    let table_loc = std::env::var("ICEBERG_TABLE_LOC")
-        .unwrap_or("s3://warehouse/iceberg/tpch/region".into());
+    let table_loc =
+        std::env::var("ICEBERG_TABLE_LOC").unwrap_or("s3://warehouse/iceberg/tpch/region".into());
     let region = std::env::var("AWS_REGION").unwrap_or("us-east-1".into());
 
     println!("endpoint={endpoint}  table={table_loc}");
 
-    let storage = Arc::new(
-        S3IcebergStorage::from_default_chain(Some(&region), Some(&endpoint), true).await?,
-    );
+    let storage =
+        Arc::new(S3IcebergStorage::from_default_chain(Some(&region), Some(&endpoint), true).await?);
 
     // Resolve current metadata via version-hint.text.
     let catalog = DirectCatalogClient::new(table_loc.clone(), Arc::clone(&storage));
