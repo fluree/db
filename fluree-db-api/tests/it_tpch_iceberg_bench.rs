@@ -86,6 +86,38 @@ GROUP BY ?rf ?ls
 ORDER BY ?rf ?ls
 "#;
 
+// --- Cross-source join probes (lineitem ⋈ orders on orderkey) ---
+
+// J1: pure join cardinality — COUNT of lineitem joined to its order.
+// Baseline isolates the cross-source join cost (no filter/agg).
+const J1: &str = r#"
+PREFIX v: <http://tpch/voc/>
+SELECT (COUNT(?l) AS ?c) WHERE {
+  GRAPH <tpch-lineitem:main> { ?l v:l_orderkey ?ok }
+  GRAPH <tpch-orders:main>   { ?o v:o_orderkey ?ok }
+}
+"#;
+
+// J3: TPC-H Q3-style (orders ⋈ lineitem, no customer) — filter both sides,
+// group revenue by order. Exercises join + filter + aggregate together.
+const J3: &str = r#"
+PREFIX v: <http://tpch/voc/>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+SELECT ?ok (SUM(?ep * (1 - ?disc)) AS ?revenue) WHERE {
+  GRAPH <tpch-orders:main> {
+    ?o v:o_orderkey ?ok ; v:o_orderdate ?od .
+    FILTER(?od < "1995-03-15"^^xsd:date)
+  }
+  GRAPH <tpch-lineitem:main> {
+    ?l v:l_orderkey ?ok ; v:l_extendedprice ?ep ; v:l_discount ?disc ; v:l_shipdate ?sd .
+    FILTER(?sd > "1995-03-15"^^xsd:date)
+  }
+}
+GROUP BY ?ok
+ORDER BY DESC(?revenue)
+LIMIT 10
+"#;
+
 fn print_result(label: &str, r: &fluree_db_api::QueryResult, elapsed_ms: u128) {
     let rows: usize = r.batches.iter().map(Batch::len).sum();
     eprintln!("\n=== {label}: {rows} rows in {elapsed_ms} ms ===");
@@ -131,29 +163,33 @@ async fn tpch_lineitem_q1_q6() {
             .unwrap();
         snap.insert_namespace_code(9991, "http://tpch/lineitem/".into())
             .unwrap();
+        snap.insert_namespace_code(9992, "http://tpch/orders/".into())
+            .unwrap();
     }
 
-    let mapping = std::fs::read_to_string(format!("{WORK}/mappings/lineitem.ttl"))
-        .expect("read lineitem.ttl");
+    // DATASET selects scale: "tpch" (SF1), "tpch_small" (SF0.01), "tpch_tiny" (SF0.001).
+    let dataset = std::env::var("DATASET").unwrap_or_else(|_| "tpch".into());
+    eprintln!("dataset = {dataset}");
 
-    // TABLE_LOC overrides the table (e.g. the small SF0.01 set for fast iteration).
-    let table_loc = std::env::var("TABLE_LOC")
-        .unwrap_or_else(|_| "s3://warehouse/iceberg/tpch/lineitem".into());
-    eprintln!("table_location = {table_loc}");
-    let config = R2rmlCreateConfig::new_direct("tpch-lineitem", table_loc, mapping)
-        .with_s3_endpoint(ENDPOINT)
-        .with_s3_region("us-east-1")
-        .with_s3_path_style(true)
-        .with_mapping_media_type("text/turtle");
-
-    let created = fluree
-        .create_r2rml_graph_source(config)
-        .await
-        .expect("create graph source");
-    eprintln!(
-        "graph source: {} | mapping_validated={} | triples_maps={}",
-        created.graph_source_id, created.mapping_validated, created.triples_map_count
-    );
+    // Register one Direct graph source per table.
+    for (name, table) in [("tpch-lineitem", "lineitem"), ("tpch-orders", "orders")] {
+        let mapping = std::fs::read_to_string(format!("{WORK}/mappings/{table}.ttl"))
+            .unwrap_or_else(|e| panic!("read {table}.ttl: {e}"));
+        let loc = format!("s3://warehouse/iceberg/{dataset}/{table}");
+        let config = R2rmlCreateConfig::new_direct(name, loc, mapping)
+            .with_s3_endpoint(ENDPOINT)
+            .with_s3_region("us-east-1")
+            .with_s3_path_style(true)
+            .with_mapping_media_type("text/turtle");
+        let created = fluree
+            .create_r2rml_graph_source(config)
+            .await
+            .unwrap_or_else(|e| panic!("create {name}: {e}"));
+        eprintln!(
+            "graph source: {} | validated={} | maps={}",
+            created.graph_source_id, created.mapping_validated, created.triples_map_count
+        );
+    }
 
     // Ad-hoc SPARQL via env (no rebuild needed for new probes).
     if let Ok(adhoc) = std::env::var("SPARQL") {
@@ -166,7 +202,15 @@ async fn tpch_lineitem_q1_q6() {
     }
 
     // Pick which queries to run via QUERY env (comma-separated names). Default: probes.
-    let registry = [("P1", P1), ("P2", P2), ("P3", P3), ("Q6", Q6), ("Q1", Q1)];
+    let registry = [
+        ("P1", P1),
+        ("P2", P2),
+        ("P3", P3),
+        ("Q6", Q6),
+        ("Q1", Q1),
+        ("J1", J1),
+        ("J3", J3),
+    ];
     let want = std::env::var("QUERY").unwrap_or_else(|_| "P1".into());
     let selected: Vec<&str> = want.split(',').map(str::trim).collect();
 
