@@ -1820,6 +1820,24 @@ async fn execute_cypher_transact(
             // snapshot is Arc-shared); `cached_state` stays borrowed below.
             let probe_state = handle.snapshot().await.to_ledger_state();
             let probe = fluree_db_api::GraphDb::from_ledger_state(&probe_state);
+            // Wrap the probe in the same view policy the commit uses, so a
+            // restricted writer's MERGE ON CREATE/ON MATCH and DELETE-guard
+            // branch selection sees only policy-visible data — otherwise the
+            // branch outcome is a one-bit existence oracle over hidden nodes.
+            // Mirrors the Cypher read path (execute_cypher_ledger) and SPARQL
+            // UPDATE, whose WHERE evaluates inside the policy-wrapped engine.
+            let probe = if qc_opts.has_any_policy_inputs() {
+                state
+                    .fluree
+                    .wrap_policy(probe, &qc_opts, None)
+                    .await
+                    .map_err(|e| {
+                        set_span_error_code(span, "error:PolicyBuildFailed");
+                        ServerError::Api(e)
+                    })?
+            } else {
+                probe
+            };
             state
                 .fluree
                 .resolve_conditional_cypher(&cw, probe, ledger_id, &cached_state.snapshot)

@@ -184,6 +184,7 @@ impl PropertyPathOperator {
                 RangeOptions::new().with_to_t(to_t),
             )
             .await?;
+            let flakes = self.filter_edges(ctx, flakes).await?;
             for flake in flakes {
                 if is_reserved_edge_predicate(&flake.p) {
                     continue;
@@ -237,6 +238,7 @@ impl PropertyPathOperator {
                 RangeOptions::new().with_to_t(to_t),
             )
             .await?;
+            let flakes = self.filter_edges(ctx, flakes).await?;
             for flake in flakes {
                 if is_reserved_edge_predicate(&flake.p) {
                     continue;
@@ -522,6 +524,7 @@ impl PropertyPathOperator {
                     RangeOptions::new().with_to_t(to_t),
                 )
                 .await?;
+                let flakes = self.filter_edges(ctx, flakes).await?;
                 for flake in flakes {
                     ingest(flake);
                 }
