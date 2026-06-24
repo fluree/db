@@ -550,17 +550,19 @@ async fn filter_batch_with_exists(
     ctx: &ExecutionContext<'_>,
     cache: Option<&ExistsSemijoinCache>,
     planning: &crate::temporal_mode::PlanningContext,
+    needs_metadata: bool,
 ) -> Result<Option<Batch>> {
     // Phase 1: resolve uncorrelated EXISTS once for the whole batch
     let partially_resolved = pre_resolve_uncorrelated(expr, batch.schema(), ctx, planning).await?;
 
-    // If no EXISTS nodes remain, we can use the fast synchronous path
-    if !contains_exists(&partially_resolved) {
+    // If no EXISTS nodes remain and there are no policy-filtered metadata reads
+    // to resolve, we can use the fast synchronous path.
+    if !needs_metadata && !contains_exists(&partially_resolved) {
         let prepared = PreparedBoolExpression::new(partially_resolved);
         return filter_batch(batch, &prepared, schema, ctx);
     }
 
-    // Phase 2: resolve remaining correlated EXISTS per-row
+    // Phase 2: resolve remaining correlated EXISTS (and metadata) per-row
     let mut keep_indices: Vec<usize> = Vec::new();
 
     for row_idx in 0..batch.len() {
@@ -569,6 +571,11 @@ async fn filter_batch_with_exists(
                 .await?;
         let Some(row) = batch.row_view(row_idx) else {
             continue;
+        };
+        let resolved_expr = if needs_metadata {
+            crate::eval::metadata_resolve::resolve_row_metadata(&resolved_expr, &row, ctx).await?
+        } else {
+            resolved_expr
         };
         let pass = resolved_expr.eval_to_bool_non_strict(&row, Some(ctx))?;
         if pass {
@@ -611,6 +618,9 @@ pub struct FilterOperator {
     state: OperatorState,
     /// Whether the expression contains EXISTS subexpressions (cached)
     has_exists: bool,
+    /// Whether the expression contains a Cypher metadata read that must be
+    /// policy-filtered asynchronously when a non-root view policy is active.
+    has_metadata: bool,
     /// Optional semijoin caches for simple correlated EXISTS patterns.
     exists_semijoin: Option<ExistsSemijoinCache>,
     /// Planning context captured at planner-time for FILTER EXISTS subplans.
@@ -640,6 +650,7 @@ impl FilterOperator {
     ) -> Self {
         let schema = Arc::from(child.schema().to_vec().into_boxed_slice());
         let has_exists = contains_exists(&expr);
+        let has_metadata = crate::eval::metadata_resolve::contains_metadata_read(&expr);
         let prepared_expr = PreparedBoolExpression::new(expr.clone());
         Self {
             child,
@@ -648,6 +659,7 @@ impl FilterOperator {
             schema,
             state: OperatorState::Created,
             has_exists,
+            has_metadata,
             exists_semijoin: None,
             planning,
         }
@@ -695,7 +707,11 @@ impl Operator for FilterOperator {
                 continue;
             }
 
-            let filtered = if self.has_exists {
+            // Cypher metadata reads in a WHERE expression must be resolved
+            // through the policy-filtered async path when a non-root view
+            // policy is active (the synchronous readers are fail-closed there).
+            let needs_metadata = self.has_metadata && !ctx.allow_unfiltered();
+            let filtered = if self.has_exists || needs_metadata {
                 filter_batch_with_exists(
                     &batch,
                     &self.expr,
@@ -703,6 +719,7 @@ impl Operator for FilterOperator {
                     ctx,
                     self.exists_semijoin.as_ref(),
                     &self.planning,
+                    needs_metadata,
                 )
                 .await?
             } else {

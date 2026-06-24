@@ -56,6 +56,11 @@ pub struct BindOperator {
     /// is computed — projection/BIND counterpart to the FilterOperator path.
     /// The common case (no EXISTS) keeps the fast synchronous eval.
     has_exists: bool,
+    /// True when `expr` contains a Cypher metadata read (`labels`/`properties`/
+    /// member access, …). Under an active non-root policy these are resolved
+    /// per-row through the policy-filtered async path before the value is
+    /// computed; without a policy the synchronous fast path is used unchanged.
+    has_metadata: bool,
     /// Temporal context for any per-row EXISTS resolution. Defaults to
     /// current-state; EXISTS inside a BIND of a history query is out of scope.
     planning: crate::temporal_mode::PlanningContext,
@@ -101,6 +106,7 @@ impl BindOperator {
         };
 
         let has_exists = crate::filter::contains_exists(&expr);
+        let has_metadata = crate::eval::metadata_resolve::contains_metadata_read(&expr);
 
         Self {
             child,
@@ -116,6 +122,7 @@ impl BindOperator {
             state: OperatorState::Created,
             out_schema: None,
             has_exists,
+            has_metadata,
             planning: crate::temporal_mode::PlanningContext::current(),
         }
     }
@@ -206,6 +213,21 @@ impl Operator for BindOperator {
                 };
 
                 let row_view = input_batch.row_view(row_idx).unwrap();
+
+                // Under an active non-root policy, resolve Cypher metadata reads
+                // through the policy-filtered async path before evaluating; the
+                // synchronous readers are fail-closed there.
+                let expr: std::borrow::Cow<'_, Expression> =
+                    if self.has_metadata && !ctx.allow_unfiltered() {
+                        std::borrow::Cow::Owned(
+                            crate::eval::metadata_resolve::resolve_row_metadata(
+                                &expr, &row_view, ctx,
+                            )
+                            .await?,
+                        )
+                    } else {
+                        expr
+                    };
 
                 // Evaluate expression. Non-strict mode still propagates fatal
                 // execution issues such as dictionary lookup failures.

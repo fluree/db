@@ -1538,7 +1538,10 @@ impl<'a> BatchView<'a> {
 ///
 /// Using this trait enables pre-batch filtering where we evaluate filters
 /// on bindings before constructing a full batch.
-pub trait RowAccess {
+/// `Send + Sync` so a row view can be held across `.await` in the async
+/// metadata resolver (which evaluates loop-local member access under policy).
+/// All implementors are zero-copy views over `Send + Sync` batch/binding data.
+pub trait RowAccess: Send + Sync {
     /// Get a binding by variable ID.
     fn get(&self, var: VarId) -> Option<&Binding>;
 }

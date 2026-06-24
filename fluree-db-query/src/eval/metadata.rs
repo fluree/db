@@ -7,6 +7,7 @@ use crate::binding::{Binding, RowAccess};
 use crate::context::ExecutionContext;
 use crate::error::{QueryError, Result};
 use crate::fast_path_common::{cached_overlay_ops, subject_ref_to_s_id};
+use crate::ir::expression::Function;
 use crate::ir::{Expression, Ref};
 use fluree_db_binary_index::batched_lookup_predicate_refs;
 use fluree_db_binary_index::format::run_record::RunSortOrder;
@@ -180,16 +181,19 @@ fn collect_subject_predicate_overlay_refs(
     Ok(flakes)
 }
 
-fn lookup_ref_objects_via_range(
+/// Raw PSOT read of a subject's `(subject, predicate, ?)` flakes (ref edges plus
+/// the overlay). No policy filtering — callers that surface results to a
+/// policy-bound view must route through [`lookup_ref_objects_filtered`].
+fn read_subject_predicate_flakes(
     ctx: &ExecutionContext<'_>,
     subject: &Sid,
     predicate: &Sid,
-) -> Result<Vec<Sid>> {
+) -> Result<Vec<Flake>> {
     let overlay = ctx.overlay.unwrap_or(&NoOverlay);
     let match_val = RangeMatch::subject_predicate(subject.clone(), predicate.clone());
     let opts = RangeOptions::default().with_to_t(ctx.to_t);
 
-    let flakes = if let Some(provider) = ctx.active_snapshot.range_provider.as_ref() {
+    if let Some(provider) = ctx.active_snapshot.range_provider.as_ref() {
         let query = RangeQuery {
             g_id: ctx.binary_g_id,
             index: IndexType::Psot,
@@ -201,11 +205,46 @@ fn lookup_ref_objects_via_range(
         };
         provider
             .range(&query)
-            .map_err(|e| QueryError::Internal(format!("metadata range lookup: {e}")))?
+            .map_err(|e| QueryError::Internal(format!("metadata range lookup: {e}")))
     } else {
-        collect_subject_predicate_overlay_refs(ctx, subject, predicate)?
-    };
+        collect_subject_predicate_overlay_refs(ctx, subject, predicate)
+    }
+}
 
+fn lookup_ref_objects_via_range(
+    ctx: &ExecutionContext<'_>,
+    subject: &Sid,
+    predicate: &Sid,
+) -> Result<Vec<Sid>> {
+    Ok(merge_latest_ref_objects(read_subject_predicate_flakes(
+        ctx, subject, predicate,
+    )?))
+}
+
+/// View-policy-filtered counterpart of [`lookup_ref_objects`]. Reads the raw
+/// `(subject, predicate)` ref flakes, runs them through the same async enforcer
+/// the scan path uses, then extracts the surviving ref objects. Under a
+/// non-root policy this is the only correct ref reader — the batched fast path
+/// in [`lookup_ref_objects`] bypasses per-flake filtering.
+async fn lookup_ref_objects_filtered(
+    ctx: &ExecutionContext<'_>,
+    subject: &Sid,
+    predicate: &Sid,
+) -> Result<Vec<Sid>> {
+    if ctx.allow_unfiltered() {
+        return lookup_ref_objects(ctx, subject, predicate);
+    }
+    let flakes = read_subject_predicate_flakes(ctx, subject, predicate)?;
+    let overlay = ctx.overlay.unwrap_or(&NoOverlay);
+    let flakes = crate::binary_scan::BinaryScanOperator::filter_flakes_by_policy(
+        ctx,
+        ctx.active_snapshot,
+        overlay,
+        ctx.to_t,
+        ctx.binary_g_id,
+        flakes,
+    )
+    .await?;
     Ok(merge_latest_ref_objects(flakes))
 }
 
@@ -248,6 +287,16 @@ fn lookup_ref_objects(
     subject: &Sid,
     predicate: &Sid,
 ) -> Result<Vec<Sid>> {
+    if !ctx.allow_unfiltered() {
+        // Fail-closed safety net: under a non-root policy the async resolver
+        // (lookup_ref_objects_filtered) is the correct path. Reaching the sync
+        // raw reader here would leak policy-hidden edges, so return nothing.
+        tracing::warn!(
+            "Cypher metadata ref lookup reached the sync path under an active view policy; \
+             returning empty to avoid leaking unfiltered edges"
+        );
+        return Ok(Vec::new());
+    }
     if let Some(store) = ctx.binary_store.as_ref() {
         if let Some(subject_s_id) = binding_subject_s_id(
             &Binding::Sid {
@@ -316,12 +365,19 @@ pub fn eval_labels_to_binding<R: RowAccess>(
 
     ctx.tracker.consume_fuel(1)?;
 
-    let rdf_type = ctx
-        .active_snapshot
-        .encode_iri(rdf::TYPE)
-        .unwrap_or_else(|| Sid::new(3, "type"));
+    let rdf_type = rdf_type_sid(ctx);
     let class_sids = lookup_ref_objects(ctx, &subject, &rdf_type)?;
+    labels_binding(class_sids, ctx)
+}
 
+fn rdf_type_sid(ctx: &ExecutionContext<'_>) -> Sid {
+    ctx.active_snapshot
+        .encode_iri(rdf::TYPE)
+        .unwrap_or_else(|| Sid::new(3, "type"))
+}
+
+/// Build the `labels(node)` list binding from resolved class SIDs.
+fn labels_binding(class_sids: Vec<Sid>, ctx: &ExecutionContext<'_>) -> Result<Binding> {
     let dt = xsd_string_sid(ctx);
     let mut labels = Vec::with_capacity(class_sids.len());
     for class_sid in class_sids {
@@ -332,10 +388,49 @@ pub fn eval_labels_to_binding<R: RowAccess>(
     Ok(Binding::List(labels))
 }
 
+/// Sync entry for a subject's flakes. Fail-closed under a non-root policy: the
+/// async resolver ([`subject_all_flakes_filtered`]) is the correct path there,
+/// so reaching this raw reader returns nothing rather than leaking unfiltered
+/// flakes.
+fn subject_all_flakes(ctx: &ExecutionContext<'_>, subject: &Sid) -> Result<Vec<Flake>> {
+    if !ctx.allow_unfiltered() {
+        tracing::warn!(
+            "Cypher metadata subject read reached the sync path under an active view policy; \
+             returning empty to avoid leaking unfiltered flakes"
+        );
+        return Ok(Vec::new());
+    }
+    subject_all_flakes_raw(ctx, subject)
+}
+
+/// View-policy-filtered subject flakes: raw SPOT read run through the same async
+/// enforcer the scan path uses. No-op (returns the raw read) for root / no
+/// policy, where the enforcer short-circuits.
+async fn subject_all_flakes_filtered(
+    ctx: &ExecutionContext<'_>,
+    subject: &Sid,
+) -> Result<Vec<Flake>> {
+    let flakes = subject_all_flakes_raw(ctx, subject)?;
+    if ctx.allow_unfiltered() {
+        return Ok(flakes);
+    }
+    let overlay = ctx.overlay.unwrap_or(&NoOverlay);
+    crate::binary_scan::BinaryScanOperator::filter_flakes_by_policy(
+        ctx,
+        ctx.active_snapshot,
+        overlay,
+        ctx.to_t,
+        ctx.binary_g_id,
+        flakes,
+    )
+    .await
+}
+
 /// All flakes for `subject` (SPOT subject-prefix), provider-merged with the
 /// novelty overlay (falling back to an overlay-only scan when no range provider
-/// is present). Used by `keys` / `properties` to enumerate a node's predicates.
-fn subject_all_flakes(ctx: &ExecutionContext<'_>, subject: &Sid) -> Result<Vec<Flake>> {
+/// is present). Raw — no policy filtering. Used by `keys` / `properties` to
+/// enumerate a node's predicates.
+fn subject_all_flakes_raw(ctx: &ExecutionContext<'_>, subject: &Sid) -> Result<Vec<Flake>> {
     let overlay = ctx.overlay.unwrap_or(&NoOverlay);
     let match_val = RangeMatch::subject(subject.clone());
     let opts = RangeOptions::default().with_to_t(ctx.to_t);
@@ -391,7 +486,22 @@ fn property_value_binding(val: FlakeValue, dt: Sid, lang: Option<String>) -> Bin
 /// several). Excludes `rdf:type`, the `f:reifies*` bundle, and relationship
 /// (ref) edges.
 fn subject_data_properties(ctx: &ExecutionContext<'_>, subject: &Sid) -> Result<Vec<DataProperty>> {
-    let mut flakes = subject_all_flakes(ctx, subject)?;
+    Ok(data_properties_from_flakes(subject_all_flakes(ctx, subject)?))
+}
+
+/// Policy-filtered counterpart of [`subject_data_properties`].
+async fn subject_data_properties_filtered(
+    ctx: &ExecutionContext<'_>,
+    subject: &Sid,
+) -> Result<Vec<DataProperty>> {
+    Ok(data_properties_from_flakes(
+        subject_all_flakes_filtered(ctx, subject).await?,
+    ))
+}
+
+/// Pure flake→data-property reduction (time-ordered replay); shared by the sync
+/// and policy-filtered readers so only the *read* differs between them.
+fn data_properties_from_flakes(mut flakes: Vec<Flake>) -> Vec<DataProperty> {
     flakes.sort_by_key(|f| f.t);
     let mut live: Vec<DataProperty> = Vec::new();
     for flake in flakes {
@@ -420,7 +530,7 @@ fn subject_data_properties(ctx: &ExecutionContext<'_>, subject: &Sid) -> Result<
             live.retain(|e| e != &key);
         }
     }
-    Ok(live)
+    live
 }
 
 /// `keys(node)` → list of a node's data-property keys (local names), sorted and
@@ -443,6 +553,11 @@ pub fn eval_keys_to_binding<R: RowAccess>(
     ctx.tracker.consume_fuel(1)?;
 
     let props = subject_data_properties(ctx, &subject)?;
+    keys_binding(props, ctx)
+}
+
+/// Build the `keys(node)` list binding from resolved data properties.
+fn keys_binding(props: Vec<DataProperty>, ctx: &ExecutionContext<'_>) -> Result<Binding> {
     let dt = xsd_string_sid(ctx);
     let mut names: Vec<String> = Vec::new();
     for (pred, ..) in &props {
@@ -478,6 +593,11 @@ pub fn eval_properties_to_binding<R: RowAccess>(
     ctx.tracker.consume_fuel(1)?;
 
     let props = subject_data_properties(ctx, &subject)?;
+    properties_binding(props, ctx)
+}
+
+/// Build the `properties(node)` map binding from resolved data properties.
+fn properties_binding(props: Vec<DataProperty>, ctx: &ExecutionContext<'_>) -> Result<Binding> {
     // Group by key (local name), preserving first-seen order. Each value keeps
     // its list index so a list-valued property renders in `@list` order.
     let mut order: Vec<String> = Vec::new();
@@ -521,8 +641,22 @@ pub fn eval_node_property(
     predicate_iri: &str,
     ctx: &ExecutionContext<'_>,
 ) -> Result<Binding> {
-    let Some(subject) = binding_subject_sid(node, ctx)? else {
+    let Some((subject, pred_sid)) = node_property_subject(node, predicate_iri, ctx)? else {
         return Ok(Binding::Unbound);
+    };
+    let props = subject_data_properties(ctx, &subject)?;
+    Ok(node_property_binding(props, &pred_sid))
+}
+
+/// Resolve a member-access node binding to `(subject, predicate)` SIDs and
+/// charge fuel, or `None` when the node / predicate can't be resolved.
+fn node_property_subject(
+    node: &Binding,
+    predicate_iri: &str,
+    ctx: &ExecutionContext<'_>,
+) -> Result<Option<(Sid, Sid)>> {
+    let Some(subject) = binding_subject_sid(node, ctx)? else {
+        return Ok(None);
     };
     let pred_sid = ctx
         .binary_store
@@ -530,23 +664,27 @@ pub fn eval_node_property(
         .map(|s| s.encode_iri(predicate_iri))
         .or_else(|| ctx.active_snapshot.encode_iri(predicate_iri));
     let Some(pred_sid) = pred_sid else {
-        return Ok(Binding::Unbound);
+        return Ok(None);
     };
     ctx.tracker.consume_fuel(1)?;
+    Ok(Some((subject, pred_sid)))
+}
 
-    let mut vals: Vec<(Binding, Option<i32>)> = subject_data_properties(ctx, &subject)?
+/// Select the value(s) of one predicate out of a subject's data properties.
+fn node_property_binding(props: Vec<DataProperty>, pred_sid: &Sid) -> Binding {
+    let mut vals: Vec<(Binding, Option<i32>)> = props
         .into_iter()
-        .filter(|(p, ..)| *p == pred_sid)
+        .filter(|(p, ..)| p == pred_sid)
         .map(|(_, val, dt, lang, i)| (property_value_binding(val, dt, lang), i))
         .collect();
-    Ok(match vals.len() {
+    match vals.len() {
         0 => Binding::Unbound,
         1 => vals.pop().expect("len == 1").0,
         _ => {
             vals.sort_by_key(|(_, i)| i.unwrap_or(i32::MAX));
             Binding::List(vals.into_iter().map(|(b, _)| b).collect())
         }
-    })
+    }
 }
 
 /// `type(rel)` → relationship type string from `f:reifiesPredicate`.
@@ -669,4 +807,234 @@ fn eval_rel_endpoint<R: RowAccess>(
         .unwrap_or_else(|| Sid::new(fluree_vocab::namespaces::FLUREE_DB, reifies_local));
     let refs = lookup_ref_objects(ctx, &reifier, &reifies)?;
     Ok(refs.first().map(|s| ComparableValue::Sid(s.clone())))
+}
+
+// ===========================================================================
+// View-policy-filtered async variants
+//
+// Under a non-root view policy the sync readers above are fail-closed (they
+// return empty to avoid leaking unfiltered flakes). These async variants are
+// the correct path: they run the same raw reads through the engine's async
+// enforcer (`filter_flakes_by_policy`) before processing, mirroring how scan
+// operators feed already-filtered flakes downstream. They are driven by the
+// per-row metadata resolver (`super::metadata_resolve`) from the Filter/Bind
+// operators, which await before the synchronous evaluator runs.
+// ===========================================================================
+
+/// `labels(node)` against policy-filtered `rdf:type` edges.
+pub(crate) async fn eval_labels_async<R: RowAccess>(
+    args: &[Expression],
+    row: &R,
+    ctx: &ExecutionContext<'_>,
+) -> Result<Binding> {
+    let arg = arity1(args, "labels")?;
+    let Some(binding) = resolve_arg_binding(arg, row, Some(ctx))? else {
+        return Ok(Binding::Unbound);
+    };
+    let Some(subject) = binding_subject_sid(&binding, ctx)? else {
+        return Ok(Binding::Unbound);
+    };
+    ctx.tracker.consume_fuel(1)?;
+    let rdf_type = rdf_type_sid(ctx);
+    let class_sids = lookup_ref_objects_filtered(ctx, &subject, &rdf_type).await?;
+    labels_binding(class_sids, ctx)
+}
+
+/// `keys(node)` against policy-filtered data properties.
+pub(crate) async fn eval_keys_async<R: RowAccess>(
+    args: &[Expression],
+    row: &R,
+    ctx: &ExecutionContext<'_>,
+) -> Result<Binding> {
+    let arg = arity1(args, "keys")?;
+    let Some(binding) = resolve_arg_binding(arg, row, Some(ctx))? else {
+        return Ok(Binding::Unbound);
+    };
+    let Some(subject) = binding_subject_sid(&binding, ctx)? else {
+        return Ok(Binding::Unbound);
+    };
+    ctx.tracker.consume_fuel(1)?;
+    let props = subject_data_properties_filtered(ctx, &subject).await?;
+    keys_binding(props, ctx)
+}
+
+/// `properties(node)` against policy-filtered data properties.
+pub(crate) async fn eval_properties_async<R: RowAccess>(
+    args: &[Expression],
+    row: &R,
+    ctx: &ExecutionContext<'_>,
+) -> Result<Binding> {
+    let arg = arity1(args, "properties")?;
+    let Some(binding) = resolve_arg_binding(arg, row, Some(ctx))? else {
+        return Ok(Binding::Unbound);
+    };
+    let Some(subject) = binding_subject_sid(&binding, ctx)? else {
+        return Ok(Binding::Unbound);
+    };
+    ctx.tracker.consume_fuel(1)?;
+    let props = subject_data_properties_filtered(ctx, &subject).await?;
+    properties_binding(props, ctx)
+}
+
+/// Loop-local `node.<predicate>` against policy-filtered data properties.
+pub(crate) async fn eval_node_property_async(
+    node: &Binding,
+    predicate_iri: &str,
+    ctx: &ExecutionContext<'_>,
+) -> Result<Binding> {
+    let Some((subject, pred_sid)) = node_property_subject(node, predicate_iri, ctx)? else {
+        return Ok(Binding::Unbound);
+    };
+    let props = subject_data_properties_filtered(ctx, &subject).await?;
+    Ok(node_property_binding(props, &pred_sid))
+}
+
+/// `type(rel)` — the `Rel` value carries its predicate intrinsically (no read);
+/// a reifier-node binding reads `f:reifiesPredicate` through the policy filter.
+pub(crate) async fn eval_rel_type_async<R: RowAccess>(
+    args: &[Expression],
+    row: &R,
+    ctx: &ExecutionContext<'_>,
+) -> Result<Option<ComparableValue>> {
+    let arg = arity1(args, "type")?;
+    let Some(binding) = resolve_arg_binding(arg, row, Some(ctx))? else {
+        return Ok(None);
+    };
+    ctx.tracker.consume_fuel(1)?;
+    let pred_sid = match &binding {
+        Binding::Rel(rel) => rel.predicate.clone(),
+        _ => {
+            let Some(reifier) = binding_subject_sid(&binding, ctx)? else {
+                return Ok(None);
+            };
+            let reifies_pred = ctx
+                .active_snapshot
+                .encode_iri(fluree_vocab::reifies_iris::PREDICATE)
+                .unwrap_or_else(|| {
+                    Sid::new(fluree_vocab::namespaces::FLUREE_DB, "reifiesPredicate")
+                });
+            match lookup_ref_objects_filtered(ctx, &reifier, &reifies_pred)
+                .await?
+                .into_iter()
+                .next()
+            {
+                Some(p) => p,
+                None => return Ok(None),
+            }
+        }
+    };
+    let name = cypher_name_from_sid(&pred_sid, ctx)?;
+    Ok(name.map(|s| ComparableValue::String(Arc::from(s))))
+}
+
+/// `startNode(rel)` against the policy filter (or the intrinsic `Rel` field).
+pub(crate) async fn eval_start_node_async<R: RowAccess>(
+    args: &[Expression],
+    row: &R,
+    ctx: &ExecutionContext<'_>,
+) -> Result<Option<ComparableValue>> {
+    eval_rel_endpoint_async(
+        args,
+        row,
+        ctx,
+        fluree_vocab::reifies_iris::SUBJECT,
+        "reifiesSubject",
+        "startNode",
+    )
+    .await
+}
+
+/// `endNode(rel)` against the policy filter (or the intrinsic `Rel` field).
+pub(crate) async fn eval_end_node_async<R: RowAccess>(
+    args: &[Expression],
+    row: &R,
+    ctx: &ExecutionContext<'_>,
+) -> Result<Option<ComparableValue>> {
+    eval_rel_endpoint_async(
+        args,
+        row,
+        ctx,
+        fluree_vocab::reifies_iris::OBJECT,
+        "reifiesObject",
+        "endNode",
+    )
+    .await
+}
+
+/// Policy-filtered counterpart of [`eval_rel_endpoint`].
+async fn eval_rel_endpoint_async<R: RowAccess>(
+    args: &[Expression],
+    row: &R,
+    ctx: &ExecutionContext<'_>,
+    reifies_iri: &str,
+    reifies_local: &'static str,
+    fn_name: &str,
+) -> Result<Option<ComparableValue>> {
+    let arg = arity1(args, fn_name)?;
+    let Some(binding) = resolve_arg_binding(arg, row, Some(ctx))? else {
+        return Ok(None);
+    };
+    if let Binding::Rel(rel) = &binding {
+        let node = if reifies_iri == fluree_vocab::reifies_iris::SUBJECT {
+            &rel.start
+        } else {
+            &rel.end
+        };
+        return Ok(Some(ComparableValue::Sid(node.clone())));
+    }
+    let Some(reifier) = binding_subject_sid(&binding, ctx)? else {
+        return Ok(None);
+    };
+    ctx.tracker.consume_fuel(1)?;
+    let reifies = ctx
+        .active_snapshot
+        .encode_iri(reifies_iri)
+        .unwrap_or_else(|| Sid::new(fluree_vocab::namespaces::FLUREE_DB, reifies_local));
+    let refs = lookup_ref_objects_filtered(ctx, &reifier, &reifies).await?;
+    Ok(refs.first().map(|s| ComparableValue::Sid(s.clone())))
+}
+
+/// Evaluate a metadata `Call` for one row through the policy-filtered async
+/// path and return its `Binding`. The `ComparableValue`-returning functions
+/// (`type`/`startNode`/`endNode`) are converted the same way the synchronous
+/// scalar dispatch does. Returns `None` for a non-metadata function.
+pub(crate) async fn eval_metadata_call_async<R: RowAccess>(
+    func: &Function,
+    args: &[Expression],
+    row: &R,
+    ctx: &ExecutionContext<'_>,
+) -> Result<Option<Binding>> {
+    let binding = match func {
+        Function::Labels => eval_labels_async(args, row, ctx).await?,
+        Function::Keys => eval_keys_async(args, row, ctx).await?,
+        Function::Properties => eval_properties_async(args, row, ctx).await?,
+        Function::RelType => comparable_opt_to_binding(eval_rel_type_async(args, row, ctx).await?)?,
+        Function::StartNode => {
+            comparable_opt_to_binding(eval_start_node_async(args, row, ctx).await?)?
+        }
+        Function::EndNode => comparable_opt_to_binding(eval_end_node_async(args, row, ctx).await?)?,
+        _ => return Ok(None),
+    };
+    Ok(Some(binding))
+}
+
+/// True for the metadata functions that read graph flakes and so must be
+/// policy-filtered (`labels`/`keys`/`properties`/`type`/`startNode`/`endNode`).
+pub(crate) fn is_metadata_function(func: &Function) -> bool {
+    matches!(
+        func,
+        Function::Labels
+            | Function::Keys
+            | Function::Properties
+            | Function::RelType
+            | Function::StartNode
+            | Function::EndNode
+    )
+}
+
+fn comparable_opt_to_binding(v: Option<ComparableValue>) -> Result<Binding> {
+    match v {
+        Some(cv) => cv.to_binding(None),
+        None => Ok(Binding::Unbound),
+    }
 }

@@ -29,6 +29,7 @@ mod iter;
 mod list;
 mod logical;
 mod metadata;
+pub(crate) mod metadata_resolve;
 mod numeric;
 mod path;
 mod rdf;

@@ -24,9 +24,18 @@ use crate::var_registry::VarId;
 /// generic base would be an unbounded recursive type (`RowWithLocals<RowWith…>`)
 /// and blow the monomorphization recursion limit. Dynamic dispatch keeps the
 /// type flat at any nesting depth.
-struct RowWithLocals<'a> {
+pub(crate) struct RowWithLocals<'a> {
     base: &'a dyn RowAccess,
     locals: &'a [(VarId, Binding)],
+}
+
+impl<'a> RowWithLocals<'a> {
+    /// Overlay `locals` (later ones shadow earlier ones and the base) on `base`.
+    /// Shared with the async metadata resolver so loop-local scoping matches the
+    /// synchronous comprehension/reduce evaluators exactly.
+    pub(crate) fn new(base: &'a dyn RowAccess, locals: &'a [(VarId, Binding)]) -> Self {
+        RowWithLocals { base, locals }
+    }
 }
 
 impl RowAccess for RowWithLocals<'_> {
