@@ -23,11 +23,10 @@
 //! - cls-uni: owl:unionOf
 //! - cls-oo: owl:oneOf
 
-mod support;
-
+use crate::support;
+use crate::support::{genesis_ledger, normalize_rows};
 use fluree_db_api::FlureeBuilder;
 use serde_json::json;
-use support::{genesis_ledger, normalize_rows};
 
 // =============================================================================
 // Equality Tests (eq-sym, eq-trans)

@@ -4,11 +4,10 @@
 //! during `@type` matching. Reasoning is opt-in, so each expanding query sets
 //! `"reasoning": "rdfs"` explicitly; one test pins the plain-semantics default.
 
-mod support;
-
+use crate::support;
+use crate::support::{genesis_ledger, normalize_rows, MemoryFluree, MemoryLedger};
 use fluree_db_api::FlureeBuilder;
 use serde_json::json;
-use support::{genesis_ledger, normalize_rows, MemoryFluree, MemoryLedger};
 use tempfile::TempDir;
 
 async fn seed_schema_creative_work(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {

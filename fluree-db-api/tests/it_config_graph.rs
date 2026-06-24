@@ -5,12 +5,11 @@
 //! overrides work, override control blocks/permits query-time overrides,
 //! and config is time-travel consistent.
 
-mod support;
-
+use crate::support;
+use crate::support::genesis_ledger;
 use fluree_db_api::config_resolver;
 use fluree_db_api::{FlureeBuilder, GovernanceOptions};
 use serde_json::json;
-use support::genesis_ledger;
 
 /// Build the config graph IRI for a canonical ledger id.
 fn config_graph_iri(ledger_id: &str) -> String {

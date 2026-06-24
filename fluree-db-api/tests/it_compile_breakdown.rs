@@ -14,19 +14,17 @@
 //! Decision inputs: compile% of total (is the cache worth it?) and
 //! compile-vs-raw_parse (does a cheap normalizer stay << the savings?).
 //!
-//!   cargo test -p fluree-db-api --test it_compile_breakdown --features native \
+//!   cargo test -p fluree-db-api --test grp_misc it_compile_breakdown --features native \
 //!       --profile dev-fast -- --ignored --nocapture compile_breakdown
 
 #![cfg(feature = "native")]
 
-mod support;
-
 use std::hint::black_box;
 use std::time::Instant;
 
+use crate::support::graphdb_from_ledger;
 use fluree_db_api::{parse_sparql, FlureeBuilder, ReindexOptions};
 use serde_json::json;
-use support::graphdb_from_ledger;
 
 const SEED: usize = 8000;
 const ITERS: usize = 2000;

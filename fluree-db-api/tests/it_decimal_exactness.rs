@@ -4,15 +4,14 @@
 //! ingestion and output: query constants, SPARQL UPDATE templates, and
 //! stored values all carry exact BigDecimal representations.
 
-mod support;
-
-use fluree_db_api::FlureeBuilder;
-use serde_json::Value as JsonValue;
-use std::sync::Arc;
-use support::{
+use crate::support;
+use crate::support::{
     assert_index_defaults, genesis_ledger, start_background_indexer_local, trigger_index_and_wait,
     MemoryFluree,
 };
+use fluree_db_api::FlureeBuilder;
+use serde_json::Value as JsonValue;
+use std::sync::Arc;
 
 async fn run_sparql_update(
     fluree: &fluree_db_api::Fluree,

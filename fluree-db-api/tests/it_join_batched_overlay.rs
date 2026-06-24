@@ -18,11 +18,9 @@
 
 #![cfg(feature = "native")]
 
-mod support;
-
+use crate::support::{genesis_ledger_for_fluree, normalize_rows, span_capture};
 use fluree_db_api::{FlureeBuilder, QueryInput, ReindexOptions};
 use serde_json::json;
-use support::{genesis_ledger_for_fluree, normalize_rows, span_capture};
 
 fn ctx() -> serde_json::Value {
     json!({"ex": "http://example.org/ns/"})

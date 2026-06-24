@@ -5,8 +5,7 @@
 //! conflict-resolution strategies (`Abort`/`TakeSource`/`TakeBranch`), and
 //! validation errors (merge commits, unreachable commit IDs, unsupported strategies).
 
-mod support;
-
+use crate::support;
 use fluree_db_api::{CommitRef, ConflictStrategy, FlureeBuilder};
 use serde_json::json;
 

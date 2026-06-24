@@ -9,14 +9,13 @@
 
 #![cfg(feature = "native")]
 
-use std::sync::Arc;
-mod support;
-
+use crate::support;
+use crate::support::{start_background_indexer_local, trigger_index_and_wait_outcome};
 use fluree_db_api::policy_builder;
 use fluree_db_api::{FlureeBuilder, GovernanceOptions, IndexConfig};
 use fluree_db_transact::{CommitOpts, TxnOpts};
 use serde_json::json;
-use support::{start_background_indexer_local, trigger_index_and_wait_outcome};
+use std::sync::Arc;
 
 /// Identity-based `f:policyClass` enforcement must survive binary indexing.
 ///

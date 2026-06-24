@@ -9,8 +9,7 @@
 
 #![cfg(feature = "native")]
 
-mod support;
-
+use crate::support;
 use std::io::Write;
 
 use fluree_db_api::{Fluree, FlureeBuilder, ReindexOptions};

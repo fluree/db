@@ -3,8 +3,7 @@
 //! Tests that FlureeBuilder::build_memory_encrypted() works correctly
 //! with the full Fluree API.
 
-mod support;
-
+use crate::support;
 use fluree_db_api::FlureeBuilder;
 use fluree_db_core::prelude::*; // For storage traits
 use serde_json::json;

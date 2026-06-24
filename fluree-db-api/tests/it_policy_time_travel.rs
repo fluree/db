@@ -3,11 +3,9 @@
 //! Ensures view policy enforcement works when `from` includes a `t` time spec
 //! (time-travel path in query-connection).
 
-mod support;
-
+use crate::support::{assert_index_defaults, genesis_ledger};
 use fluree_db_api::FlureeBuilder;
 use serde_json::json;
-use support::{assert_index_defaults, genesis_ledger};
 
 #[tokio::test]
 async fn policy_applies_to_time_travel_queries() {

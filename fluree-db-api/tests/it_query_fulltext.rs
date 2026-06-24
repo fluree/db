@@ -15,13 +15,12 @@
 
 #![cfg(feature = "native")]
 
-use std::sync::Arc;
-mod support;
-
+use crate::support;
+use crate::support::start_background_indexer_local;
 use fluree_db_api::{FlureeBuilder, LedgerState, Novelty};
 use fluree_db_core::LedgerSnapshot;
 use serde_json::{json, Value as JsonValue};
-use support::start_background_indexer_local;
+use std::sync::Arc;
 
 fn fulltext_context() -> JsonValue {
     json!({

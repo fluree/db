@@ -9,11 +9,10 @@
 //! (e.g. `"summer"` for `http://example.org/lists/summer`), which a compliant
 //! JSON-LD processor would re-resolve against `@base`, not `@vocab`.
 
-mod support;
-
+use crate::support;
+use crate::support::{genesis_ledger, query_jsonld_formatted, MemoryFluree, MemoryLedger};
 use fluree_db_api::FlureeBuilder;
 use serde_json::{json, Value as JsonValue};
-use support::{genesis_ledger, query_jsonld_formatted, MemoryFluree, MemoryLedger};
 
 /// Seed two subjects in distinct namespaces:
 /// - `http://example.org/lists/summer` (a List, will sit under the query `@vocab`)

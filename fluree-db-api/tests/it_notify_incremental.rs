@@ -5,16 +5,17 @@
 
 #![cfg(feature = "native")]
 
-use std::sync::Arc;
-mod support;
-
+use crate::support;
+use crate::support::{
+    genesis_ledger_for_fluree, start_background_indexer_local, trigger_index_and_wait,
+};
 use fluree_db_api::{
     ledger_manager::{LedgerManagerConfig, NotifyResult, NsNotify},
     FlureeBuilder, IndexConfig,
 };
 use fluree_db_transact::{CommitOpts, TxnOpts};
 use serde_json::json;
-use support::{genesis_ledger_for_fluree, start_background_indexer_local, trigger_index_and_wait};
+use std::sync::Arc;
 
 /// Helper: transact one insert and return the committed ledger state.
 async fn insert_data(

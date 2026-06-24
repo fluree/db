@@ -23,13 +23,12 @@
 //! envelope of the IR-level expansion in
 //! `fluree-db-query/src/execute/where_plan.rs::expand_edge_annotation_patterns`.
 
-mod support;
-
+use crate::support;
 use std::sync::Arc;
 
+use crate::support::{genesis_ledger, genesis_ledger_for_fluree, MemoryFluree, MemoryLedger};
 use fluree_db_api::FlureeBuilder;
 use serde_json::{json, Value as JsonValue};
-use support::{genesis_ledger, genesis_ledger_for_fluree, MemoryFluree, MemoryLedger};
 
 fn ctx() -> JsonValue {
     json!({

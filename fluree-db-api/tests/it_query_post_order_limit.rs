@@ -9,11 +9,9 @@
 
 #![cfg(feature = "native")]
 
-mod support;
-
+use crate::support::{genesis_ledger_for_fluree, rebuild_and_publish_index};
 use fluree_db_api::{FlureeBuilder, LedgerManagerConfig, QueryInput};
 use serde_json::{json, Value as JsonValue};
-use support::{genesis_ledger_for_fluree, rebuild_and_publish_index};
 
 type MemoryFluree = fluree_db_api::Fluree;
 

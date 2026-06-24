@@ -5,11 +5,10 @@
 //! - `owl:equivalentProperty` expansion
 //! - explicit `"reasoning": "none"` disabling auto-RDFS
 
-mod support;
-
+use crate::support;
+use crate::support::genesis_ledger;
 use fluree_db_api::FlureeBuilder;
 use serde_json::json;
-use support::genesis_ledger;
 
 #[tokio::test]
 async fn owl2ql_equivalent_property_expands_across_properties() {

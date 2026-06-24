@@ -4,8 +4,7 @@
 //! (diverged target, missing source, self-merge), and post-merge
 //! verification of data, nameservice state, and continued branch use.
 
-mod support;
-
+use crate::support;
 use fluree_db_api::{ConflictStrategy, FlureeBuilder};
 use serde_json::json;
 

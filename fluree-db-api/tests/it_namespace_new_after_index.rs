@@ -9,12 +9,11 @@
 //! the binary scan path normalizes bound SIDs through the store's namespace table.
 //!
 //! Run with:
-//!   cargo test -p fluree-db-api --test it_namespace_new_after_index --features native
+//!   cargo test -p fluree-db-api --test grp_import it_namespace_new_after_index --features native
 
 #![cfg(feature = "native")]
 
-mod support;
-
+use crate::support;
 use fluree_db_api::{FlureeBuilder, ReindexOptions};
 use fluree_db_ledger::TypeErasedStore;
 use serde_json::json;

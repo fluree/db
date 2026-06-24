@@ -3,9 +3,8 @@
 
 #![cfg(feature = "native")]
 
-use std::sync::Arc;
-mod support;
-
+use crate::support;
+use crate::support::{assert_index_defaults, normalize_rows, start_background_indexer_local};
 use fluree_db_api::{
     Fluree, FlureeBuilder, IndexConfig, IndexingMode, LedgerState, Novelty, ReindexOptions,
     TriggerIndexOptions,
@@ -13,7 +12,7 @@ use fluree_db_api::{
 use fluree_db_core::LedgerSnapshot;
 use fluree_db_transact::{CommitOpts, TxnOpts};
 use serde_json::json;
-use support::{assert_index_defaults, normalize_rows, start_background_indexer_local};
+use std::sync::Arc;
 
 #[tokio::test]
 async fn indexing_disabled_transaction_exposes_indexing_status_hints() {

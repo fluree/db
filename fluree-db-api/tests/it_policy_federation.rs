@@ -6,8 +6,8 @@
 use fluree_db_api::FlureeBuilder;
 use serde_json::json;
 
-mod support;
-use support::assert_index_defaults;
+use crate::support;
+use crate::support::assert_index_defaults;
 
 #[tokio::test]
 async fn policy_applies_in_multi_ledger_query_connection() {

@@ -2,13 +2,12 @@
 //!
 //! Tests upsert functionality where existing data gets replaced rather than merged.
 
-mod support;
-
+use crate::support;
+use crate::support::normalize_rows;
 use fluree_db_api::FlureeBuilder;
 use fluree_db_core::comparator::IndexType;
 use fluree_db_core::{load_commit_by_id, FlakeValue};
 use serde_json::json;
-use support::normalize_rows;
 
 // Helper function to create a standard context
 fn ctx() -> serde_json::Value {

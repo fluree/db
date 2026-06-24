@@ -2,14 +2,13 @@
 //!
 //! Focus: query semantics (filters / optionals / union) using JSON inputs only.
 
-mod support;
-
-use fluree_db_api::FlureeBuilder;
-use serde_json::json;
-use support::{
+use crate::support;
+use crate::support::{
     context_ex_schema, genesis_ledger, normalize_rows, seed_people_filter_dataset, MemoryFluree,
     MemoryLedger,
 };
+use fluree_db_api::FlureeBuilder;
+use serde_json::json;
 
 async fn assert_query_bind_error(
     fluree: &MemoryFluree,
