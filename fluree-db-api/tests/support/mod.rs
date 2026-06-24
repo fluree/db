@@ -281,7 +281,7 @@ pub async fn trigger_index_and_wait_outcome(
 #[cfg(feature = "native")]
 pub fn start_background_indexer_local(
     backend: fluree_db_core::StorageBackend,
-    nameservice: Arc<dyn fluree_db_nameservice::ReadWriteNameService>,
+    nameservice: Arc<dyn fluree_db_nameservice::IndexingNameService>,
     config: fluree_db_indexer::IndexerConfig,
 ) -> (LocalSet, fluree_db_indexer::IndexerHandle) {
     let (worker, handle) =
@@ -344,7 +344,10 @@ pub fn start_background_indexer_with_attachments(
 
     start_background_indexer_local(
         fluree.backend().clone(),
-        Arc::new(fluree.nameservice_mode().clone()),
+        fluree
+            .nameservice_mode()
+            .publisher_arc()
+            .expect("test setup requires ReadWrite nameservice mode"),
         config,
     )
 }

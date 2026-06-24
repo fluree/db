@@ -11,7 +11,6 @@ use crate::support::{
 };
 use fluree_db_api::FlureeBuilder;
 use serde_json::Value as JsonValue;
-use std::sync::Arc;
 
 async fn run_sparql_update(
     fluree: &fluree_db_api::Fluree,
@@ -473,7 +472,10 @@ async fn sum_avg_over_indexed_decimals_is_exact() {
 
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        Arc::new(fluree.nameservice_mode().clone()),
+        fluree
+            .nameservice_mode()
+            .as_arc_indexing_nameservice()
+            .expect("test fluree has writable nameservice"),
         fluree_db_indexer::IndexerConfig::small(),
     );
 
@@ -545,7 +547,10 @@ async fn count_with_numeric_filter_over_decimal_rows_is_correct() {
 
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        Arc::new(fluree.nameservice_mode().clone()),
+        fluree
+            .nameservice_mode()
+            .as_arc_indexing_nameservice()
+            .expect("test fluree has writable nameservice"),
         fluree_db_indexer::IndexerConfig::small(),
     );
 
@@ -636,7 +641,10 @@ async fn scale_variant_decimal_retracts_indexed_fact() {
 
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        Arc::new(fluree.nameservice_mode().clone()),
+        fluree
+            .nameservice_mode()
+            .as_arc_indexing_nameservice()
+            .expect("test fluree has writable nameservice"),
         fluree_db_indexer::IndexerConfig::small(),
     );
 
@@ -717,7 +725,10 @@ async fn group_by_and_distinct_unify_decimals_across_index_and_novelty() {
 
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        Arc::new(fluree.nameservice_mode().clone()),
+        fluree
+            .nameservice_mode()
+            .as_arc_indexing_nameservice()
+            .expect("test fluree has writable nameservice"),
         fluree_db_indexer::IndexerConfig::small(),
     );
 
@@ -813,7 +824,10 @@ async fn named_graph_decimal_decodes_against_its_own_arena() {
 
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        Arc::new(fluree.nameservice_mode().clone()),
+        fluree
+            .nameservice_mode()
+            .as_arc_indexing_nameservice()
+            .expect("test fluree has writable nameservice"),
         fluree_db_indexer::IndexerConfig::small(),
     );
 
@@ -919,7 +933,10 @@ async fn integer_valued_double_over_indexed_predicate_is_not_corrupted() {
 
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        Arc::new(fluree.nameservice_mode().clone()),
+        fluree
+            .nameservice_mode()
+            .as_arc_indexing_nameservice()
+            .expect("test fluree has indexing nameservice"),
         fluree_db_indexer::IndexerConfig::small(),
     );
 

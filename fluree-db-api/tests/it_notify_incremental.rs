@@ -15,7 +15,6 @@ use fluree_db_api::{
 };
 use fluree_db_transact::{CommitOpts, TxnOpts};
 use serde_json::json;
-use std::sync::Arc;
 
 /// Helper: transact one insert and return the committed ledger state.
 async fn insert_data(
@@ -196,7 +195,10 @@ async fn notify_index_only_trims_novelty() {
     // Start a background indexer
     let (local, indexer_handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        Arc::new(fluree.nameservice_mode().clone()),
+        fluree
+            .nameservice_mode()
+            .publisher_arc()
+            .expect("test setup requires ReadWrite nameservice mode"),
         fluree_db_indexer::IndexerConfig::small(),
     );
 

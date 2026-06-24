@@ -157,12 +157,14 @@ async fn trigger_index_reports_positive_fuel() {
     use crate::support::start_background_indexer_local;
     use fluree_db_api::tx::IndexingMode;
     use fluree_db_api::TriggerIndexOptions;
-    use std::sync::Arc;
 
     let mut fluree = FlureeBuilder::memory().build_memory();
     let (local, indexer_handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        Arc::new(fluree.nameservice_mode().clone()),
+        fluree
+            .nameservice_mode()
+            .as_arc_indexing_nameservice()
+            .expect("test fluree has writable nameservice"),
         fluree_db_indexer::IndexerConfig::default(),
     );
     fluree.set_indexing_mode(IndexingMode::Background(indexer_handle));

@@ -5,11 +5,11 @@
 //! async runtimes.
 
 use crate::{
-    check_cas_expectation, ref_values_match, AdminPublisher, CasResult, ConfigCasResult,
-    ConfigLookup, ConfigPublisher, ConfigValue, GraphSourceLookup, GraphSourcePublisher,
-    GraphSourceRecord, GraphSourceType, NameService, NsLookupResult, NsRecord, Publisher, RefKind,
-    RefLookup, RefPublisher, RefValue, Result, StatusCasResult, StatusLookup, StatusPayload,
-    StatusPublisher, StatusValue,
+    check_cas_expectation, ref_values_match, AdminPublisher, CasResult, CommitPublisher,
+    ConfigCasResult, ConfigLookup, ConfigPublisher, ConfigValue, GraphSourceLookup,
+    GraphSourcePublisher, GraphSourceRecord, GraphSourceType, IndexPublisher, LedgerLifecycle,
+    NsLookupResult, NsRecord, RefKind, RefLookup, RefPublisher, RefValue, Result, StatusCasResult,
+    StatusLookup, StatusPayload, StatusPublisher, StatusValue,
 };
 use async_trait::async_trait;
 use fluree_db_core::format_ledger_id;
@@ -102,7 +102,7 @@ impl MemoryNameService {
 }
 
 #[async_trait]
-impl NameService for MemoryNameService {
+impl crate::NameServiceLookup for MemoryNameService {
     async fn lookup(&self, ledger_id: &str) -> Result<Option<NsRecord>> {
         Ok(self.get_record(ledger_id))
     }
@@ -120,7 +120,10 @@ impl NameService for MemoryNameService {
             .cloned()
             .collect())
     }
+}
 
+#[async_trait]
+impl crate::BranchLifecycle for MemoryNameService {
     async fn create_branch(
         &self,
         ledger_name: &str,
@@ -199,8 +202,8 @@ impl NameService for MemoryNameService {
 }
 
 #[async_trait]
-impl Publisher for MemoryNameService {
-    async fn publish_ledger_init(&self, ledger_id: &str) -> Result<()> {
+impl LedgerLifecycle for MemoryNameService {
+    async fn init(&self, ledger_id: &str) -> Result<()> {
         let key = self.normalize_ledger_id(ledger_id);
 
         // Check if record already exists — reject even if retracted (soft-dropped).
@@ -213,62 +216,6 @@ impl Publisher for MemoryNameService {
         let (ledger_name, branch) = core_ledger_id::split_ledger_id(ledger_id)?;
         let record = NsRecord::new(ledger_name, branch);
         self.records.write().insert(key, record);
-
-        Ok(())
-    }
-
-    async fn publish_commit(
-        &self,
-        ledger_id: &str,
-        commit_t: i64,
-        commit_id: &ContentId,
-    ) -> Result<()> {
-        let key = self.normalize_ledger_id(ledger_id);
-        let mut records = self.records.write();
-
-        if let Some(record) = records.get_mut(&key) {
-            // Only update if new_t > existing_t (strictly monotonic)
-            if commit_t > record.commit_t {
-                record.commit_head_id = Some(commit_id.clone());
-                record.commit_t = commit_t;
-            }
-            // If commit_t <= existing, silently ignore (monotonic guarantee)
-        } else {
-            // Create new record
-            let (ledger_name, branch) = core_ledger_id::split_ledger_id(ledger_id)?;
-            let mut record = NsRecord::new(ledger_name, branch);
-            record.commit_head_id = Some(commit_id.clone());
-            record.commit_t = commit_t;
-            records.insert(key, record);
-        }
-
-        Ok(())
-    }
-
-    async fn publish_index(
-        &self,
-        ledger_id: &str,
-        index_t: i64,
-        index_id: &ContentId,
-    ) -> Result<()> {
-        let key = self.normalize_ledger_id(ledger_id);
-        let mut records = self.records.write();
-
-        if let Some(record) = records.get_mut(&key) {
-            // Only update if new_t > existing_t (strictly monotonic)
-            if index_t > record.index_t {
-                record.index_head_id = Some(index_id.clone());
-                record.index_t = index_t;
-            }
-            // If index_t <= existing, silently ignore (monotonic guarantee)
-        } else {
-            // Create new record
-            let (ledger_name, branch) = core_ledger_id::split_ledger_id(ledger_id)?;
-            let mut record = NsRecord::new(ledger_name, branch);
-            record.index_head_id = Some(index_id.clone());
-            record.index_t = index_t;
-            records.insert(key, record);
-        }
 
         Ok(())
     }
@@ -304,10 +251,72 @@ impl Publisher for MemoryNameService {
         self.config_values.write().remove(&key);
         Ok(())
     }
+}
+
+#[async_trait]
+impl CommitPublisher for MemoryNameService {
+    async fn publish_commit(
+        &self,
+        ledger_id: &str,
+        commit_t: i64,
+        commit_id: &ContentId,
+    ) -> Result<()> {
+        let key = self.normalize_ledger_id(ledger_id);
+        let mut records = self.records.write();
+
+        if let Some(record) = records.get_mut(&key) {
+            // Only update if new_t > existing_t (strictly monotonic)
+            if commit_t > record.commit_t {
+                record.commit_head_id = Some(commit_id.clone());
+                record.commit_t = commit_t;
+            }
+            // If commit_t <= existing, silently ignore (monotonic guarantee)
+        } else {
+            // Create new record
+            let (ledger_name, branch) = core_ledger_id::split_ledger_id(ledger_id)?;
+            let mut record = NsRecord::new(ledger_name, branch);
+            record.commit_head_id = Some(commit_id.clone());
+            record.commit_t = commit_t;
+            records.insert(key, record);
+        }
+
+        Ok(())
+    }
 
     fn publishing_ledger_id(&self, ledger_id: &str) -> Option<String> {
         // Memory nameservice always returns the normalized ledger ID for publishing
         Some(self.normalize_ledger_id(ledger_id))
+    }
+}
+
+#[async_trait]
+impl IndexPublisher for MemoryNameService {
+    async fn publish_index(
+        &self,
+        ledger_id: &str,
+        index_t: i64,
+        index_id: &ContentId,
+    ) -> Result<()> {
+        let key = self.normalize_ledger_id(ledger_id);
+        let mut records = self.records.write();
+
+        if let Some(record) = records.get_mut(&key) {
+            // Only update if new_t > existing_t (strictly monotonic)
+            if index_t > record.index_t {
+                record.index_head_id = Some(index_id.clone());
+                record.index_t = index_t;
+            }
+            // If index_t <= existing, silently ignore (monotonic guarantee)
+        } else {
+            // Create new record
+            let (ledger_name, branch) = core_ledger_id::split_ledger_id(ledger_id)?;
+            let mut record = NsRecord::new(ledger_name, branch);
+            record.index_head_id = Some(index_id.clone());
+            record.index_t = index_t;
+            records.insert(key, record);
+        }
+
+        Ok(())
     }
 }
 
@@ -704,7 +713,7 @@ impl ConfigPublisher for MemoryNameService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ConfigPayload, StatusPayload};
+    use crate::{BranchLifecycle, ConfigPayload, NameServiceLookup, StatusPayload};
     use fluree_db_core::ContentKind;
 
     fn test_commit_id(label: &str) -> ContentId {
@@ -1232,7 +1241,7 @@ mod tests {
     #[tokio::test]
     async fn test_status_get_initial() {
         let ns = MemoryNameService::new();
-        ns.publish_ledger_init("mydb:main").await.unwrap();
+        ns.init("mydb:main").await.unwrap();
 
         let status = ns.get_status("mydb:main").await.unwrap().unwrap();
         assert_eq!(status.v, 1);
@@ -1242,7 +1251,7 @@ mod tests {
     #[tokio::test]
     async fn test_status_push_update() {
         let ns = MemoryNameService::new();
-        ns.publish_ledger_init("mydb:main").await.unwrap();
+        ns.init("mydb:main").await.unwrap();
 
         // Get initial status
         let initial = ns.get_status("mydb:main").await.unwrap().unwrap();
@@ -1265,7 +1274,7 @@ mod tests {
     #[tokio::test]
     async fn test_status_push_conflict_wrong_expected() {
         let ns = MemoryNameService::new();
-        ns.publish_ledger_init("mydb:main").await.unwrap();
+        ns.init("mydb:main").await.unwrap();
 
         // Try to push with wrong expected value
         let wrong_expected = StatusValue::new(5, StatusPayload::new("wrong"));
@@ -1288,7 +1297,7 @@ mod tests {
     #[tokio::test]
     async fn test_status_push_conflict_non_monotonic() {
         let ns = MemoryNameService::new();
-        ns.publish_ledger_init("mydb:main").await.unwrap();
+        ns.init("mydb:main").await.unwrap();
 
         let initial = ns.get_status("mydb:main").await.unwrap().unwrap();
 
@@ -1316,7 +1325,7 @@ mod tests {
     #[tokio::test]
     async fn test_status_push_with_extra_metadata() {
         let ns = MemoryNameService::new();
-        ns.publish_ledger_init("mydb:main").await.unwrap();
+        ns.init("mydb:main").await.unwrap();
 
         let initial = ns.get_status("mydb:main").await.unwrap().unwrap();
 
@@ -1352,7 +1361,7 @@ mod tests {
     #[tokio::test]
     async fn test_config_get_unborn() {
         let ns = MemoryNameService::new();
-        ns.publish_ledger_init("mydb:main").await.unwrap();
+        ns.init("mydb:main").await.unwrap();
 
         let config = ns.get_config("mydb:main").await.unwrap().unwrap();
         assert!(config.is_unborn());
@@ -1363,7 +1372,7 @@ mod tests {
     #[tokio::test]
     async fn test_config_push_from_unborn() {
         let ns = MemoryNameService::new();
-        ns.publish_ledger_init("mydb:main").await.unwrap();
+        ns.init("mydb:main").await.unwrap();
 
         let unborn = ns.get_config("mydb:main").await.unwrap().unwrap();
         assert!(unborn.is_unborn());
@@ -1393,7 +1402,7 @@ mod tests {
     #[tokio::test]
     async fn test_config_push_update() {
         let ns = MemoryNameService::new();
-        ns.publish_ledger_init("mydb:main").await.unwrap();
+        ns.init("mydb:main").await.unwrap();
 
         let unborn = ns.get_config("mydb:main").await.unwrap().unwrap();
 
@@ -1430,7 +1439,7 @@ mod tests {
     #[tokio::test]
     async fn test_config_push_conflict_wrong_expected() {
         let ns = MemoryNameService::new();
-        ns.publish_ledger_init("mydb:main").await.unwrap();
+        ns.init("mydb:main").await.unwrap();
 
         // Try to push with wrong expected value
         let wrong_expected = ConfigValue::new(5, Some(ConfigPayload::new()));
@@ -1452,7 +1461,7 @@ mod tests {
     #[tokio::test]
     async fn test_config_push_conflict_non_monotonic() {
         let ns = MemoryNameService::new();
-        ns.publish_ledger_init("mydb:main").await.unwrap();
+        ns.init("mydb:main").await.unwrap();
 
         let unborn = ns.get_config("mydb:main").await.unwrap().unwrap();
 
@@ -1509,7 +1518,7 @@ mod tests {
     #[tokio::test]
     async fn test_create_branch_from_main() {
         let ns = MemoryNameService::new();
-        ns.publish_ledger_init("mydb:main").await.unwrap();
+        ns.init("mydb:main").await.unwrap();
         let cid = test_commit_id("commit-5");
         ns.publish_commit("mydb:main", 5, &cid).await.unwrap();
 
@@ -1528,7 +1537,7 @@ mod tests {
     #[tokio::test]
     async fn test_create_branch_duplicate_fails() {
         let ns = MemoryNameService::new();
-        ns.publish_ledger_init("mydb:main").await.unwrap();
+        ns.init("mydb:main").await.unwrap();
         let cid = test_commit_id("commit-1");
         ns.publish_commit("mydb:main", 1, &cid).await.unwrap();
 
@@ -1541,7 +1550,7 @@ mod tests {
     #[tokio::test]
     async fn test_list_branches() {
         let ns = MemoryNameService::new();
-        ns.publish_ledger_init("mydb:main").await.unwrap();
+        ns.init("mydb:main").await.unwrap();
         let cid = test_commit_id("commit-3");
         ns.publish_commit("mydb:main", 3, &cid).await.unwrap();
 
@@ -1551,7 +1560,7 @@ mod tests {
             .unwrap();
 
         // Also create a different ledger to ensure filtering works
-        ns.publish_ledger_init("other:main").await.unwrap();
+        ns.init("other:main").await.unwrap();
 
         let branches = ns.list_branches("mydb").await.unwrap();
         assert_eq!(branches.len(), 3);
@@ -1570,7 +1579,7 @@ mod tests {
     #[tokio::test]
     async fn test_list_branches_excludes_retracted() {
         let ns = MemoryNameService::new();
-        ns.publish_ledger_init("mydb:main").await.unwrap();
+        ns.init("mydb:main").await.unwrap();
         let cid = test_commit_id("commit-1");
         ns.publish_commit("mydb:main", 1, &cid).await.unwrap();
 

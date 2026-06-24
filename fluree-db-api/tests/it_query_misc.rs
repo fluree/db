@@ -10,7 +10,6 @@ use crate::support::{
 use crate::support::{start_background_indexer_local, trigger_index_and_wait};
 use fluree_db_api::FlureeBuilder;
 use serde_json::json;
-use std::sync::Arc;
 
 async fn seed_three_people(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
     let ledger0 = genesis_ledger(fluree, ledger_id);
@@ -916,7 +915,10 @@ async fn indexed_untyped_value_matching_parity() {
 
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        Arc::new(fluree.nameservice_mode().clone()),
+        fluree
+            .nameservice_mode()
+            .publisher_arc()
+            .expect("test setup requires ReadWrite nameservice mode"),
         fluree_db_indexer::IndexerConfig::small(),
     );
 

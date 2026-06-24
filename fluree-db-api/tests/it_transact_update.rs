@@ -7,7 +7,6 @@ use fluree_db_api::{FlureeBuilder, IndexConfig, LedgerState, Novelty};
 use fluree_db_core::{load_commit_by_id, FlakeValue, LedgerSnapshot};
 use fluree_db_transact::{CommitOpts, TxnOpts};
 use serde_json::{json, Value as JsonValue};
-use std::sync::Arc;
 
 fn ctx_ex_schema() -> JsonValue {
     json!({
@@ -1911,7 +1910,10 @@ async fn update_values_wildcard_delete_index_plus_novelty() {
 
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        Arc::new(fluree.nameservice_mode().clone()),
+        fluree
+            .nameservice_mode()
+            .publisher_arc()
+            .expect("test setup requires ReadWrite nameservice mode"),
         Default::default(),
     );
 
@@ -2042,7 +2044,10 @@ async fn update_wildcard_delete_duplicate_facts_across_index_and_novelty() {
 
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        Arc::new(fluree.nameservice_mode().clone()),
+        fluree
+            .nameservice_mode()
+            .publisher_arc()
+            .expect("test setup requires ReadWrite nameservice mode"),
         Default::default(),
     );
 
@@ -2172,7 +2177,10 @@ async fn update_values_wildcard_delete_after_updates_and_indexing() {
 
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        Arc::new(fluree.nameservice_mode().clone()),
+        fluree
+            .nameservice_mode()
+            .publisher_arc()
+            .expect("test setup requires ReadWrite nameservice mode"),
         Default::default(),
     );
 

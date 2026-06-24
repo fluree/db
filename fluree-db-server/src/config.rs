@@ -725,6 +725,40 @@ pub struct ServerConfig {
     /// DANGEROUS: Accept any valid admin signature regardless of issuer (dev only)
     #[arg(long, env = "FLUREE_ADMIN_AUTH_INSECURE", hide = true)]
     pub admin_auth_insecure_accept_any_issuer: bool,
+
+    // === Raft cluster options (replicated writes) ===
+    //
+    // When `raft_enabled` is `true`, the server bootstraps an
+    // openraft node, mounts the follower-forward middleware over
+    // leader-only routes, and exposes the inter-node RPC + cluster
+    // admin routers on `raft_listen_addr` (a separate private
+    // listener). All four fields below are required when raft is
+    // on; validation rejects partial configs.
+    /// Replicate writes through a Raft cluster.
+    #[cfg(feature = "raft")]
+    #[arg(long, env = "FLUREE_RAFT_ENABLED")]
+    pub raft_enabled: bool,
+
+    /// This node's id in the Raft cluster. Must be unique and
+    /// stable across restarts — the openraft log + snapshots are
+    /// keyed by it.
+    #[cfg(feature = "raft")]
+    #[arg(long, env = "FLUREE_RAFT_NODE_ID")]
+    pub raft_node_id: Option<u64>,
+
+    /// Root directory for the Raft log and snapshots. Distinct
+    /// from `--storage-path` — losing this directory loses commits.
+    #[cfg(feature = "raft")]
+    #[arg(long, env = "FLUREE_RAFT_STORAGE_PATH")]
+    pub raft_storage_path: Option<PathBuf>,
+
+    /// VPC-internal address for the inter-node Raft RPC + cluster
+    /// admin listener. Distinct from `--listen-addr` (the
+    /// client-facing port). No auth — operators enforce trust at
+    /// the network layer.
+    #[cfg(feature = "raft")]
+    #[arg(long, env = "FLUREE_RAFT_LISTEN_ADDR")]
+    pub raft_listen_addr: Option<SocketAddr>,
 }
 
 impl Default for ServerConfig {
@@ -799,6 +833,15 @@ impl Default for ServerConfig {
             admin_auth_mode: AdminAuthMode::None,
             admin_auth_trusted_issuers: Vec::new(),
             admin_auth_insecure_accept_any_issuer: false,
+            // Raft defaults
+            #[cfg(feature = "raft")]
+            raft_enabled: false,
+            #[cfg(feature = "raft")]
+            raft_node_id: None,
+            #[cfg(feature = "raft")]
+            raft_storage_path: None,
+            #[cfg(feature = "raft")]
+            raft_listen_addr: None,
         }
     }
 }
@@ -971,6 +1014,54 @@ impl ServerConfig {
             );
         }
 
+        // Raft validation: when enabled, node_id + storage_path +
+        // listen_addr must all be set, and proxy storage is
+        // incompatible with raft (raft replicates writes via the
+        // log; proxy mode forwards to a remote tx server).
+        #[cfg(feature = "raft")]
+        if self.raft_enabled {
+            if self.raft_node_id.is_none() {
+                return Err("raft.enabled=true requires --raft-node-id".to_string());
+            }
+            if self.raft_storage_path.is_none() {
+                return Err("raft.enabled=true requires --raft-storage-path".to_string());
+            }
+            if self.raft_listen_addr.is_none() {
+                return Err("raft.enabled=true requires --raft-listen-addr".to_string());
+            }
+            if self.is_proxy_storage_mode() {
+                return Err(
+                    "raft.enabled=true is incompatible with storage-access-mode=proxy".to_string(),
+                );
+            }
+            // The raft log + snapshot tree (raft_storage_path) and
+            // the ledger content store (storage_path) both manage
+            // their own directory layouts; overlapping them lets
+            // either side blow away the other's files on
+            // compaction/eviction, and tends to surface only after a
+            // restart corrupts state. Catch the misconfiguration up
+            // front rather than mid-recovery. Comparison is lexical
+            // (the dirs may not exist yet at validation time, so
+            // `canonicalize` would fail); operators using symlink
+            // aliasing tricks bypass this knowingly.
+            if let (Some(raft_path), Some(storage_path)) =
+                (self.raft_storage_path.as_ref(), self.storage_path.as_ref())
+            {
+                if raft_path == storage_path
+                    || raft_path.starts_with(storage_path)
+                    || storage_path.starts_with(raft_path)
+                {
+                    return Err(format!(
+                        "raft.storage_path ({}) must not equal or be nested under \
+                         storage.path ({}) (or vice versa) — the raft log + state-machine \
+                         snapshots and ledger content store need disjoint filesystem subtrees",
+                        raft_path.display(),
+                        storage_path.display(),
+                    ));
+                }
+            }
+        }
+
         // Peer mode validation
         if self.server_role == ServerRole::Peer {
             // Require transaction server URL
@@ -1112,4 +1203,70 @@ fn shellexpand(path: &str) -> String {
         }
     }
     path.to_string()
+}
+
+#[cfg(all(test, feature = "raft"))]
+mod raft_validation_tests {
+    use super::*;
+    use std::net::SocketAddr;
+    use std::path::PathBuf;
+
+    fn raft_enabled_base() -> ServerConfig {
+        ServerConfig {
+            raft_enabled: true,
+            raft_node_id: Some(1),
+            raft_listen_addr: Some(SocketAddr::from(([127, 0, 0, 1], 9001))),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn rejects_equal_raft_and_storage_paths() {
+        let mut cfg = raft_enabled_base();
+        cfg.storage_path = Some(PathBuf::from("/var/lib/fluree"));
+        cfg.raft_storage_path = Some(PathBuf::from("/var/lib/fluree"));
+        let err = cfg.validate().expect_err("must reject identical paths");
+        assert!(
+            err.contains("raft.storage_path") && err.contains("storage.path"),
+            "unexpected error message: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_raft_nested_under_storage() {
+        let mut cfg = raft_enabled_base();
+        cfg.storage_path = Some(PathBuf::from("/var/lib/fluree"));
+        cfg.raft_storage_path = Some(PathBuf::from("/var/lib/fluree/raft"));
+        let err = cfg.validate().expect_err("must reject nested raft path");
+        assert!(err.contains("disjoint"), "unexpected error message: {err}");
+    }
+
+    #[test]
+    fn rejects_storage_nested_under_raft() {
+        let mut cfg = raft_enabled_base();
+        cfg.raft_storage_path = Some(PathBuf::from("/srv/raft"));
+        cfg.storage_path = Some(PathBuf::from("/srv/raft/data"));
+        let err = cfg.validate().expect_err("must reject nested storage path");
+        assert!(err.contains("disjoint"), "unexpected error message: {err}");
+    }
+
+    #[test]
+    fn accepts_disjoint_paths() {
+        let mut cfg = raft_enabled_base();
+        cfg.storage_path = Some(PathBuf::from("/var/lib/fluree/data"));
+        cfg.raft_storage_path = Some(PathBuf::from("/var/lib/fluree/raft"));
+        cfg.validate()
+            .expect("sibling dirs should validate cleanly");
+    }
+
+    #[test]
+    fn accepts_raft_without_local_storage_path() {
+        // Connection-config-driven deployments don't set
+        // `storage_path` at all — the disjoint check should noop.
+        let mut cfg = raft_enabled_base();
+        cfg.raft_storage_path = Some(PathBuf::from("/var/lib/fluree/raft"));
+        cfg.storage_path = None;
+        cfg.validate()
+            .expect("missing storage_path should skip the disjoint check");
+    }
 }

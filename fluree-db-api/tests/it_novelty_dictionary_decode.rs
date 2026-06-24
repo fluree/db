@@ -15,7 +15,6 @@ use fluree_db_query::{
 };
 use fluree_db_transact::{CommitOpts, TxnOpts};
 use serde_json::json;
-use std::sync::Arc;
 
 #[tokio::test]
 async fn novelty_only_strings_subjects_predicates_and_json_decode_with_existing_index() {
@@ -28,7 +27,10 @@ async fn novelty_only_strings_subjects_predicates_and_json_decode_with_existing_
 
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        Arc::new(fluree.nameservice_mode().clone()),
+        fluree
+            .nameservice_mode()
+            .publisher_arc()
+            .expect("test setup requires ReadWrite nameservice mode"),
         fluree_db_indexer::IndexerConfig::small(),
     );
     fluree.set_indexing_mode(fluree_db_api::tx::IndexingMode::Background(handle.clone()));

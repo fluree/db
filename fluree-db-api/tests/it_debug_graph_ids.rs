@@ -4,8 +4,6 @@ use fluree_db_api::FlureeBuilder;
 use fluree_db_core::ContentStore;
 use serde_json::json;
 
-use std::sync::Arc;
-
 use crate::support::{genesis_ledger, start_background_indexer_local, trigger_index_and_wait};
 
 #[tokio::test]
@@ -16,7 +14,10 @@ async fn debug_graph_ids_after_named_graph_index() {
 
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        Arc::new(fluree.nameservice_mode().clone()),
+        fluree
+            .nameservice_mode()
+            .publisher_arc()
+            .expect("test setup requires ReadWrite nameservice mode"),
         fluree_db_indexer::IndexerConfig::small(),
     );
 

@@ -681,7 +681,7 @@ Understanding how records evolve:
 
 ```text
 1. Initialization
-   - publish_ledger_init("mydb:main")
+   - init("mydb:main")
    - Creates record with commit_t=0, index_t=0
 
 2. First Transaction

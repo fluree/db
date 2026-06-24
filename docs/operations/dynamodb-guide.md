@@ -273,7 +273,7 @@ Only `meta` items carry the `kind` attribute and project into the GSI.
 
 **All concern items are created atomically at initialization time.** This is a key structural decision:
 
-- `publish_ledger_init` creates all 5 items (`meta`, `head`, `index`, `config`, `status`) via `TransactWriteItems`
+- `init` creates all 5 items (`meta`, `head`, `index`, `config`, `status`) via `TransactWriteItems`
 - `publish_graph_source` creates all 4 items (`meta`, `config`, `index`, `status`) via `TransactWriteItems`
 
 Subsequent writes usually use `UpdateItem` operations (`compare_and_set_ref`, `publish_index`, `push_status`, `push_config`). The one exception is commit-head CAS on an unknown ledger ID with `expected=None`, where the backend bootstraps the ledger atomically via `TransactWriteItems`.
@@ -666,7 +666,7 @@ aws dynamodb create-backup \
 
 **Symptoms**: Publish operations fail with "not found" or storage errors
 
-**Cause**: Attempting to `publish_index` or other non-bootstrap writes on a ledger ID that was never initialized with `publish_ledger_init`.
+**Cause**: Attempting to `publish_index` or other non-bootstrap writes on a ledger ID that was never initialized with `init`.
 
 **Solution**: Ensure ledger initialization happens before index/status/config writes. Normal Fluree transaction commit-head publication uses `RefPublisher` CAS and can bootstrap an unknown ledger ID when `expected=None`.
 

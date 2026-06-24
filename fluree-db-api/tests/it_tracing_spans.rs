@@ -994,7 +994,6 @@ async fn annotation_cascade_emits_cascade_reifies_bundle_span() {
 async fn ac9_cyclic_bgp_operator_spans() {
     use fluree_db_api::{IndexConfig, LedgerManagerConfig, QueryInput};
     use fluree_db_transact::{CommitOpts, TxnOpts};
-    use std::sync::Arc;
 
     let fluree = FlureeBuilder::memory()
         .with_ledger_cache_config(LedgerManagerConfig::default())
@@ -1003,7 +1002,10 @@ async fn ac9_cyclic_bgp_operator_spans() {
 
     let (local, handle) = support::start_background_indexer_local(
         fluree.backend().clone(),
-        Arc::new(fluree.nameservice_mode().clone()),
+        fluree
+            .nameservice_mode()
+            .as_arc_indexing_nameservice()
+            .expect("test fluree has writable nameservice"),
         fluree_db_indexer::IndexerConfig::small(),
     );
 

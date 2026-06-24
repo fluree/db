@@ -20,7 +20,7 @@ use async_trait::async_trait;
 use fluree_db_core::{config_graph_iri, first_t_where_graph_registered, GraphRegistrationProbe};
 use fluree_db_indexer::{ConfiguredFulltextProperty, FulltextConfigProvider};
 use fluree_db_ledger::LedgerState;
-use fluree_db_nameservice::NameService;
+use fluree_db_nameservice::NameServiceLookup;
 
 use crate::StorageBackend;
 
@@ -30,7 +30,7 @@ use crate::StorageBackend;
 /// should never block indexing.
 pub(crate) struct ApiFulltextConfigProvider {
     pub(crate) backend: StorageBackend,
-    pub(crate) nameservice: Arc<dyn NameService>,
+    pub(crate) nameservice: Arc<dyn NameServiceLookup>,
     pub(crate) leaflet_cache: Arc<fluree_db_binary_index::LeafletCache>,
     pub(crate) cache_dir: std::path::PathBuf,
 }

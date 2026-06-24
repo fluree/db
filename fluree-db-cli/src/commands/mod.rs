@@ -1,5 +1,7 @@
 pub mod auth;
 pub mod branch;
+#[cfg(feature = "server")]
+pub mod cluster;
 pub mod completions;
 pub mod config_cmd;
 pub mod context_cmd;

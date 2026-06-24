@@ -7,8 +7,6 @@
 
 #![cfg(feature = "native")]
 
-use std::sync::Arc;
-
 use crate::support::start_background_indexer_local;
 use fluree_db_api::{DropMode, DropStatus, FlureeBuilder, IndexConfig, LedgerState, Novelty};
 use fluree_db_core::address_path::ledger_id_to_path_prefix;
@@ -397,7 +395,10 @@ async fn drop_ledger_cancels_pending_indexing() {
 
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        Arc::new(fluree.nameservice_mode().clone()),
+        fluree
+            .nameservice_mode()
+            .publisher_arc()
+            .expect("test setup requires ReadWrite nameservice mode"),
         fluree_db_indexer::IndexerConfig::small(),
     );
     fluree.set_indexing_mode(fluree_db_api::tx::IndexingMode::Background(handle.clone()));

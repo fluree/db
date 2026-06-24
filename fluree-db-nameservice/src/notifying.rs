@@ -10,11 +10,12 @@ use async_trait::async_trait;
 use fluree_db_core::ContentId;
 
 use crate::{
-    event_bus::LedgerEventBus, AdminPublisher, CasResult, ConfigCasResult, ConfigLookup,
-    ConfigPublisher, ConfigValue, GraphSourceLookup, GraphSourcePublisher, GraphSourceRecord,
-    GraphSourceType, NameService, NameServiceEvent, NsLookupResult, NsRecord, NsRecordSnapshot,
-    Publisher, RefKind, RefLookup, RefPublisher, RefValue, Result, StatusCasResult, StatusLookup,
-    StatusPublisher, StatusValue, Subscription, SubscriptionScope,
+    event_bus::LedgerEventBus, AdminPublisher, BranchLifecycle, CasResult, CommitPublisher,
+    ConfigCasResult, ConfigLookup, ConfigPublisher, ConfigValue, GraphSourceLookup,
+    GraphSourcePublisher, GraphSourceRecord, GraphSourceType, IndexPublisher, LedgerLifecycle,
+    NameServiceEvent, NameServiceLookup, NsLookupResult, NsRecord, NsRecordSnapshot, RefKind,
+    RefLookup, RefPublisher, RefValue, Result, StatusCasResult, StatusLookup, StatusPublisher,
+    StatusValue, Subscription, SubscriptionScope,
 };
 
 /// Decorator that wraps a nameservice and emits events on a [`LedgerEventBus`]
@@ -61,13 +62,13 @@ impl<N: Clone> Clone for NotifyingNameService<N> {
 }
 
 // ---------------------------------------------------------------------------
-// NameService (read + branch management) — pure delegation
+// Read + branch lifecycle — pure delegation
 // ---------------------------------------------------------------------------
 
 #[async_trait]
-impl<N> NameService for NotifyingNameService<N>
+impl<N> NameServiceLookup for NotifyingNameService<N>
 where
-    N: NameService,
+    N: NameServiceLookup,
 {
     async fn lookup(&self, ledger_id: &str) -> Result<Option<NsRecord>> {
         self.inner.lookup(ledger_id).await
@@ -80,7 +81,13 @@ where
     async fn list_branches(&self, ledger_name: &str) -> Result<Vec<NsRecord>> {
         self.inner.list_branches(ledger_name).await
     }
+}
 
+#[async_trait]
+impl<N> BranchLifecycle for NotifyingNameService<N>
+where
+    N: BranchLifecycle,
+{
     async fn create_branch(
         &self,
         ledger_name: &str,
@@ -131,14 +138,36 @@ where
 // ---------------------------------------------------------------------------
 
 #[async_trait]
-impl<N> Publisher for NotifyingNameService<N>
+impl<N> LedgerLifecycle for NotifyingNameService<N>
 where
-    N: Publisher,
+    N: LedgerLifecycle,
 {
-    async fn publish_ledger_init(&self, ledger_id: &str) -> Result<()> {
-        self.inner.publish_ledger_init(ledger_id).await
+    async fn init(&self, ledger_id: &str) -> Result<()> {
+        self.inner.init(ledger_id).await
     }
 
+    async fn retract(&self, ledger_id: &str) -> Result<()> {
+        self.inner.retract(ledger_id).await?;
+        self.event_bus.notify(NameServiceEvent::LedgerRetracted {
+            ledger_id: ledger_id.to_string(),
+        });
+        Ok(())
+    }
+
+    async fn purge(&self, ledger_id: &str) -> Result<()> {
+        self.inner.purge(ledger_id).await?;
+        self.event_bus.notify(NameServiceEvent::LedgerRetracted {
+            ledger_id: ledger_id.to_string(),
+        });
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl<N> CommitPublisher for NotifyingNameService<N>
+where
+    N: CommitPublisher,
+{
     async fn publish_commit(
         &self,
         ledger_id: &str,
@@ -157,6 +186,16 @@ where
         Ok(())
     }
 
+    fn publishing_ledger_id(&self, ledger_id: &str) -> Option<String> {
+        self.inner.publishing_ledger_id(ledger_id)
+    }
+}
+
+#[async_trait]
+impl<N> IndexPublisher for NotifyingNameService<N>
+where
+    N: IndexPublisher,
+{
     async fn publish_index(
         &self,
         ledger_id: &str,
@@ -173,26 +212,6 @@ where
                 index_t,
             });
         Ok(())
-    }
-
-    async fn retract(&self, ledger_id: &str) -> Result<()> {
-        self.inner.retract(ledger_id).await?;
-        self.event_bus.notify(NameServiceEvent::LedgerRetracted {
-            ledger_id: ledger_id.to_string(),
-        });
-        Ok(())
-    }
-
-    async fn purge(&self, ledger_id: &str) -> Result<()> {
-        self.inner.purge(ledger_id).await?;
-        self.event_bus.notify(NameServiceEvent::LedgerRetracted {
-            ledger_id: ledger_id.to_string(),
-        });
-        Ok(())
-    }
-
-    fn publishing_ledger_id(&self, ledger_id: &str) -> Option<String> {
-        self.inner.publishing_ledger_id(ledger_id)
     }
 }
 

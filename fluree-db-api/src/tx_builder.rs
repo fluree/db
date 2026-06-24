@@ -514,10 +514,7 @@ impl<'a> OwnedTransactBuilder<'a> {
         // pipeline when explicitly opted-in, or let downstream attach it if
         // a signed credential envelope has already been pre-set.
         let store_raw_txn = self.core.txn_opts.store_raw_txn.unwrap_or(false);
-        let commit_opts = if self.core.commit_opts.raw_txn.is_none()
-            && self.core.commit_opts.raw_txn_upload.is_none()
-            && store_raw_txn
-        {
+        let commit_opts = if self.core.commit_opts.raw_txn_upload.is_none() && store_raw_txn {
             let content_store = self.fluree.content_store(self.ledger.ledger_id());
             self.core
                 .commit_opts
@@ -811,6 +808,24 @@ impl<'a> RefTransactBuilder<'a> {
     pub async fn execute(self) -> Result<TransactResultRef> {
         self.fluree.commit_with_handle(self.handle, self.core).await
     }
+
+    /// Dry-run terminal: stage the transaction and produce a
+    /// [`StagedCommit`] without writing the commit blob or publishing
+    /// to the nameservice.
+    ///
+    /// Returns the ledger's write guard alongside the staged commit —
+    /// the caller holds the guard for the rest of the
+    /// build-write-propose cycle and drops it when finished. This is
+    /// what consensus-coordinated committers
+    /// (e.g. `fluree-db-consensus::RaftCommitter`) use to produce a
+    /// commit they then carry through Raft consensus themselves.
+    pub async fn build_commit(
+        self,
+    ) -> Result<(LedgerWriteGuard, fluree_db_transact::StagedCommit)> {
+        self.fluree
+            .build_commit_with_handle(self.handle, self.core)
+            .await
+    }
 }
 
 // ============================================================================
@@ -900,7 +915,7 @@ impl Fluree {
     /// when needed. Consumes the write guard, releasing the lock before the
     /// (potentially slow) reindex trigger so other writers aren't blocked
     /// behind it.
-    pub(crate) async fn finalize_commit(
+    pub async fn finalize_commit(
         &self,
         mut write_guard: LedgerWriteGuard,
         mut new_state: LedgerState,
@@ -935,7 +950,7 @@ impl Fluree {
         txn_payload: JsonValue,
         store_raw_txn: bool,
     ) -> CommitOpts {
-        if commit_opts.raw_txn.is_none() && commit_opts.raw_txn_upload.is_none() && store_raw_txn {
+        if commit_opts.raw_txn_upload.is_none() && store_raw_txn {
             let content_store = self.content_store(ledger_id);
             commit_opts.with_raw_txn_spawned(content_store, txn_payload)
         } else {
@@ -1179,6 +1194,122 @@ impl Fluree {
             indexing: indexing_status,
             tally,
         })
+    }
+
+    /// Stage a transaction against a cached ledger handle and return
+    /// the staged commit without writing the commit blob or
+    /// publishing. The returned `LedgerWriteGuard` is held by the
+    /// caller for the duration of the build → write → propose cycle
+    /// (and dropped when finished).
+    ///
+    /// Always takes the fast path (write lock held throughout). The
+    /// optimistic retry loop used by `commit_with_handle` doesn't fit
+    /// the consensus-mediated flow — a successful build has to remain
+    /// valid until the caller's `AdvanceRef` proposal applies, which
+    /// requires holding the lock.
+    pub(crate) async fn build_commit_with_handle(
+        &self,
+        ledger: &LedgerHandle,
+        mut core: TransactCore<'_>,
+    ) -> Result<(LedgerWriteGuard, fluree_db_transact::StagedCommit)> {
+        core.validate().map_err(ApiError::Builder)?;
+
+        let index_config = core
+            .index_config
+            .clone()
+            .unwrap_or_else(crate::server_defaults::default_index_config);
+        let store_raw_txn = core.txn_opts.store_raw_txn.unwrap_or(false);
+        let tracker = core
+            .tracking
+            .take()
+            .map(Tracker::new)
+            .unwrap_or_else(Tracker::disabled);
+
+        let write_guard = ledger.lock_for_write().await;
+        let (stage_result, _txn_type, commit_opts) = self
+            .stage_under_lock(
+                write_guard.clone_state(),
+                core,
+                &tracker,
+                &index_config,
+                store_raw_txn,
+            )
+            .await?;
+
+        let StageResult {
+            view,
+            ns_registry,
+            txn_meta,
+            graph_delta,
+        } = stage_result;
+        let mut commit_opts = commit_opts
+            .with_txn_meta(txn_meta)
+            .with_graph_delta(graph_delta.into_iter().collect());
+
+        // Resolve the raw-txn CID before invoking the build phase
+        // (build_commit is now pure and does no I/O). A pre-resolved
+        // `raw_txn_id` (carried e.g. through the Raft queue envelope
+        // by a leader that already awaited the upload) wins over a
+        // local pending upload — both pointing to the same CID would
+        // be redundant work. The result CID ends up referenced by the
+        // commit record.
+        let txn_id = if let Some(cid) = commit_opts.raw_txn_id.take() {
+            // Drop any redundant pending upload — its blob (if it
+            // landed) shares the same CID and stays content-addressed.
+            commit_opts.raw_txn_upload.take();
+            Some(cid)
+        } else if let Some(pending) = commit_opts.raw_txn_upload.take() {
+            Some(pending.finish().await.map_err(ApiError::from)?)
+        } else {
+            None
+        };
+
+        // We hold the write guard for the entire build → propose →
+        // apply window, so the staged base IS authoritative. There is
+        // no nameservice race to verify against — derive the expected
+        // head ref directly from the snapshot we staged on.
+        let expected_head_ref =
+            view.base()
+                .head_commit_id
+                .as_ref()
+                .map(|cid| fluree_db_nameservice::RefValue {
+                    id: Some(cid.clone()),
+                    t: view.base().t(),
+                });
+
+        // `build_commit` consumes `txn_id`; its early-return paths
+        // (EmptyTransaction / NoveltyAtMax / NoveltyWouldExceed /
+        // envelope-delta / serialize) return before installing
+        // `txn_id_for_release` on the staged commit, so release here
+        // to avoid orphaning the raw-txn blob.
+        let txn_id_for_cleanup = txn_id.clone();
+        let mut staged = match fluree_db_transact::build_commit(
+            view,
+            ns_registry,
+            expected_head_ref,
+            txn_id,
+            &index_config,
+            commit_opts,
+        )
+        .await
+        {
+            Ok(s) => s,
+            Err(e) => {
+                let content_store = self.content_store(ledger.id());
+                fluree_db_transact::release_raw_txn_after_build_err(
+                    content_store.as_ref(),
+                    txn_id_for_cleanup.as_ref(),
+                )
+                .await;
+                return Err(ApiError::from(e));
+            }
+        };
+
+        if tracker.is_enabled() {
+            staged.tally = tracker.tally();
+        }
+
+        Ok((write_guard, staged))
     }
 
     /// Stage and commit a transaction against a cached ledger handle.

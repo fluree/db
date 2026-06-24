@@ -4,13 +4,17 @@
 //! and accepted into a ledger. Each implementation has its own trust model
 //! and durability mechanism:
 //!
-//! - [`MonolithicCommitter`] — a single integrated unit handles every
-//!   transaction; the local execution stream is the agreement. Used for
-//!   development, testing, and deployments that do not need cross-node
-//!   coordination.
+//! - [`LocalCommitter`] — runs the parse → stage → policy → commit
+//!   pipeline against a local [`Fluree`](fluree_db_api::Fluree) instance.
+//!   The base over which other committers compose.
+//! - [`CachingCommitter`] — wraps an inner committer with an
+//!   in-memory idempotency cache (TTL-bounded retry collapse + status
+//!   lookup via [`SubmissionLookup`]) and an admission-control
+//!   semaphore that bounds in-flight submissions.
 //!
-//! Future implementations (Raft for crash-fault tolerance, BFT for byzantine
-//! tolerance) will live alongside, behind the same [`Committer`] trait.
+//! Future implementations (Raft for crash-fault tolerance, BFT for
+//! byzantine tolerance) will live alongside, behind the same
+//! [`Committer`] trait, and compose the same way.
 //!
 //! Submission identity and status lookup are driven by optional
 //! [`IdempotencyKey`]s. Callers who want idempotent retry or after-the-fact
@@ -18,17 +22,39 @@
 //! [`TransactionRequest`]; submissions sharing a key collapse to a single
 //! outcome. Callers who don't need those guarantees may omit the key.
 
-pub mod monolithic;
+pub mod caching;
+pub mod local;
+#[cfg(feature = "raft")]
+pub mod raft;
 
-pub use monolithic::{MonolithicCommitter, DEFAULT_IDEMPOTENCY_TTL};
+pub use caching::{CachingCommitter, DEFAULT_IDEMPOTENCY_TTL};
+pub use local::LocalCommitter;
+
+// Trait re-exports for embedders that hold a type-erased committer.
+// `SubmittingCommitter` is the combined surface AppState typically
+// holds; `Committer` and `SubmissionLookup` are the constituents.
+#[cfg(feature = "raft")]
+pub use raft::{ClusterNode, Command, NodeId, Response, TypeConfig};
+
+/// Re-exports from openraft so embedders can construct a
+/// [`Raft<TypeConfig>`] handle without taking a direct openraft
+/// dependency.
+#[cfg(feature = "raft")]
+pub use openraft::error::Fatal as RaftFatal;
+#[cfg(feature = "raft")]
+pub use openraft::StorageError as RaftStorageError;
+#[cfg(feature = "raft")]
+pub use openraft::{
+    Config as RaftConfig, ConfigError as RaftConfigError, Raft, ServerState as RaftServerState,
+};
 
 use async_trait::async_trait;
 use fluree_db_api::{
     CommitId, ConflictStrategy, GovernanceOptions, IndexingStatus, RevertSelection,
     TrackingOptions, TrackingTally,
 };
-use fluree_db_transact::{CommitOpts, CommitReceipt, TxnOpts};
-use serde::Serialize;
+use fluree_db_transact::{CommitOpts, CommitOptsRequest, CommitReceipt, TxnOpts};
+use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
 use std::fmt;
@@ -55,11 +81,12 @@ pub enum InvalidIdempotencyKey {
     TooLong { len: usize },
 }
 
-/// Caller-provided identifier for a transaction submission.
+/// Caller-provided identifier for a write submission.
 ///
-/// Used both for idempotent retry (retries with the same key collapse to one
-/// outcome) and for status lookup via [`SubmissionLookup`]. Callers typically
-/// generate a ULID before submission so they can recover after a disconnect.
+/// Used for idempotent retry (retries with the same key collapse to one
+/// outcome) and for after-the-fact status lookup. Callers typically
+/// generate a ULID before submission so they can recover after a
+/// disconnect.
 ///
 /// `IdempotencyKey` has no public field and no infallible constructor: all
 /// instances flow through [`IdempotencyKey::new`], which enforces a non-empty,
@@ -94,12 +121,45 @@ impl fmt::Display for IdempotencyKey {
     }
 }
 
+impl<'de> serde::Deserialize<'de> for IdempotencyKey {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        Self::new(raw).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Composite lookup key for idempotency caches: an [`IdempotencyKey`]
+/// scoped to a particular ledger. Submissions on different ledgers
+/// with the same key are independent.
+///
+/// Used by both the in-process [`CachingCommitter`] and the
+/// replicated Raft state machine so the two layers agree on cache
+/// identity without owning parallel definitions.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct IdempotencyCacheKey {
+    pub ledger_id: String,
+    pub key: IdempotencyKey,
+}
+
+impl IdempotencyCacheKey {
+    pub fn new(ledger_id: impl Into<String>, key: IdempotencyKey) -> Self {
+        Self {
+            ledger_id: ledger_id.into(),
+            key,
+        }
+    }
+}
+
 /// The transaction payload in its submitted form.
 ///
 /// Each variant fixes both the parser path *and* the insert/upsert/update
 /// semantics, so invalid combinations (e.g. Turtle-Update, TriG-Insert)
 /// are unrepresentable at the type level. SPARQL UPDATE encodes its own
 /// semantics in the query and so has no per-op variants.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum TransactionBody {
     /// JSON-LD document staged as pure insert (no retractions).
     JsonLdInsert(JsonValue),
@@ -132,13 +192,270 @@ impl TransactionBody {
             Self::Sparql(_) => "sparql-update",
         }
     }
+
+    /// SHA-256 of this body's canonical bytes.
+    ///
+    /// Each variant tag is mixed into the digest so the same JSON
+    /// bytes under different semantics (insert vs upsert vs update)
+    /// hash to different values — two retries that disagree on
+    /// operation kind collide correctly.
+    ///
+    /// Used both by the in-process caching layer (to detect
+    /// "same key, different body" misuse) and by consensus-coordinated
+    /// nameservices (to populate the [`IdempotencyContext`]'s
+    /// `body_hash` field).
+    pub fn body_hash(&self) -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        match self {
+            Self::JsonLdInsert(json) => {
+                hasher.update(b"jsonld-insert");
+                hasher.update(json.to_string().as_bytes());
+            }
+            Self::JsonLdUpsert(json) => {
+                hasher.update(b"jsonld-upsert");
+                hasher.update(json.to_string().as_bytes());
+            }
+            Self::JsonLdUpdate(json) => {
+                hasher.update(b"jsonld-update");
+                hasher.update(json.to_string().as_bytes());
+            }
+            Self::TurtleInsert(text) => {
+                hasher.update(b"turtle-insert");
+                hasher.update(text.as_bytes());
+            }
+            Self::TurtleUpsert(text) => {
+                hasher.update(b"turtle-upsert");
+                hasher.update(text.as_bytes());
+            }
+            Self::TrigUpsert(text) => {
+                hasher.update(b"trig-upsert");
+                hasher.update(text.as_bytes());
+            }
+            Self::Sparql(text) => {
+                hasher.update(b"sparql");
+                hasher.update(text.as_bytes());
+            }
+        }
+        hasher.finalize().into()
+    }
+}
+
+/// Discriminator for [`Committer`] submission kinds. The Raft path
+/// stores it alongside each `EnqueueCommandArgs` so the worker can
+/// route without first parsing the body from CAS; status responses
+/// surface it on [`SubmissionState::Committed`] so clients can tell
+/// what kind of submission they're confirming.
+///
+/// The seven transact variants mirror [`TransactionBody`]'s
+/// discriminators (and convert via [`From<&TransactionBody>`]).
+/// The remaining four match the non-transact `Committer` methods.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BodyKind {
+    JsonLdInsert,
+    JsonLdUpsert,
+    JsonLdUpdate,
+    TurtleInsert,
+    TurtleUpsert,
+    TrigUpsert,
+    Sparql,
+    /// Body decodes as `Vec<ContentId>` — a pushed commit chain
+    /// already present in CAS. Worker verifies the chain rather
+    /// than restaging.
+    Pushed,
+    /// Body decodes as a `QueuedRevert` carrying selection +
+    /// conflict strategy. Worker re-runs `prepare_revert` and
+    /// advances the head to the inverse commit.
+    Revert,
+    /// Body decodes as a `QueuedMerge` carrying source / target
+    /// branches + conflict strategy. Worker re-runs `prepare_merge`
+    /// and advances the target's head.
+    Merge,
+    /// Body decodes as a `QueuedRebase` carrying the branch +
+    /// conflict strategy. Worker re-runs `prepare_rebase` and
+    /// advances the branch's head.
+    Rebase,
+}
+
+impl From<&TransactionBody> for BodyKind {
+    fn from(body: &TransactionBody) -> Self {
+        match body {
+            TransactionBody::JsonLdInsert(_) => BodyKind::JsonLdInsert,
+            TransactionBody::JsonLdUpsert(_) => BodyKind::JsonLdUpsert,
+            TransactionBody::JsonLdUpdate(_) => BodyKind::JsonLdUpdate,
+            TransactionBody::TurtleInsert(_) => BodyKind::TurtleInsert,
+            TransactionBody::TurtleUpsert(_) => BodyKind::TurtleUpsert,
+            TransactionBody::TrigUpsert(_) => BodyKind::TrigUpsert,
+            TransactionBody::Sparql(_) => BodyKind::Sparql,
+        }
+    }
+}
+
+/// Serializable envelope a consensus-coordinated committer writes to
+/// shared content-addressed storage before enqueueing work.
+///
+/// The CID of this blob is what travels through the Raft command queue
+/// (as `EnqueueCommandArgs::request_cid`); the worker reads the blob
+/// back to recover everything it needs to advance the head. Bundling
+/// the per-request context here means the queue itself stays thin
+/// (one CID + a body-kind discriminator) and we don't have to
+/// replicate large opaque values through the Raft log.
+///
+/// One variant per `Committer` method.
+///
+/// The two heavy variants (`Transact`, `Push`) are boxed so the
+/// enum's footprint isn't dominated by their inline payload. Every
+/// queue entry carries one of these via the worker pipeline and we
+/// pattern-match on the variant on every step — without the
+/// indirection a `Revert`/`Merge`/`Rebase` entry would still pay
+/// the size of a full transact body.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum QueuedRequest {
+    /// `transact` — body, opts, tracking, governance to stage and
+    /// commit through the worker.
+    Transact(Box<QueuedTransact>),
+    /// `push` — raw commit-chain bytes the client supplied. The
+    /// worker decodes via `Fluree::prepare_push`, advances the head
+    /// to the chain's final commit.
+    Push(Box<QueuedPush>),
+    /// `revert` — selection + conflict strategy. The worker
+    /// re-runs `Fluree::prepare_revert` and advances the head to
+    /// the resulting inverse commit (or NoOp short-circuits when
+    /// the conflict strategy drops every reverted flake).
+    Revert(QueuedRevert),
+    /// `merge` — source / target branches + conflict strategy.
+    /// The worker re-runs `Fluree::prepare_merge` and advances the
+    /// target branch's head.
+    Merge(QueuedMerge),
+    /// `rebase` — branch + conflict strategy. The worker re-runs
+    /// `Fluree::prepare_rebase` and advances the branch's head.
+    Rebase(QueuedRebase),
+}
+
+impl QueuedRequest {
+    /// Encode the envelope for content-addressed storage. The leader
+    /// writes these bytes to CAS; the resulting `ContentId` becomes
+    /// the `request_cid` in `EnqueueCommandArgs`.
+    ///
+    /// JSON is used here (not postcard like state-machine snapshots)
+    /// because the body and several option fields carry
+    /// `serde_json::Value`, which postcard refuses to round-trip —
+    /// its arbitrary-precision `Number` shape needs a self-describing
+    /// format. The envelope is one-shot (one write, one read) so the
+    /// size overhead is negligible compared to the body itself.
+    pub fn to_bytes(&self) -> Result<Vec<u8>, QueuedRequestCodecError> {
+        Ok(serde_json::to_vec(self)?)
+    }
+
+    /// Decode the envelope retrieved from CAS by `request_cid`. Used
+    /// worker-side to recover the request context.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, QueuedRequestCodecError> {
+        Ok(serde_json::from_slice(bytes)?)
+    }
+
+    /// Canonical bytes used to derive the idempotency body CID. Skips
+    /// per-request transient context (commit-opts timestamp, tracking
+    /// flags, governance metadata) so a retry of the same logical
+    /// request produces the same body CID even when the client recomputes
+    /// those fields between attempts. The full envelope still carries
+    /// them — only the idempotency comparison is normalized.
+    pub fn canonical_body_bytes(&self) -> Result<Vec<u8>, QueuedRequestCodecError> {
+        match self {
+            // Transact: the transaction body is the only semantically
+            // identifying field. txn_opts / commit_opts / tracking /
+            // governance can drift between retries (timestamps, request
+            // IDs, observability toggles) without changing what the
+            // commit means.
+            QueuedRequest::Transact(t) => Ok(serde_json::to_vec(&t.body)?),
+            // Push / Revert / Merge / Rebase envelopes already contain
+            // only stable fields (content-addressed commit ids, selection
+            // / strategy descriptors, branch names). Hashing the full
+            // envelope is equivalent to hashing the canonical body.
+            QueuedRequest::Push(p) => Ok(serde_json::to_vec(p)?),
+            QueuedRequest::Revert(r) => Ok(serde_json::to_vec(r)?),
+            QueuedRequest::Merge(m) => Ok(serde_json::to_vec(m)?),
+            QueuedRequest::Rebase(r) => Ok(serde_json::to_vec(r)?),
+        }
+    }
+}
+
+/// Transact-side envelope payload. Fields mirror the request-side
+/// projection of [`TransactionRequest`]. Node-side concerns (signing
+/// keys, in-flight upload handles) live on the runtime [`CommitOpts`]
+/// and are rehydrated worker-side — they do not travel through CAS.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueuedTransact {
+    pub body: TransactionBody,
+    pub txn_opts: TxnOpts,
+    pub commit_opts: CommitOptsRequest,
+    pub tracking: Option<TrackingOptions>,
+    pub governance: GovernanceOptions,
+}
+
+/// Push-side envelope payload.
+///
+/// Commits are content-addressed: the [`QueuedTransactor`] writes
+/// each commit's bytes to the per-ledger content store before
+/// enqueueing and records only the resulting [`ContentId`]s here.
+/// That keeps the envelope small (no commit bytes inline) and lines
+/// up with the design's "commits already in CAS when the worker
+/// picks up the entry" assumption — the worker reads them back by
+/// CID and reconstructs the [`fluree_db_api::PushCommitsRequest`]
+/// the existing `prepare_push` pipeline expects.
+///
+/// Auxiliary `blobs` stay keyed by their client-supplied address
+/// (which may be a CID or a legacy hex address) and travel as raw
+/// bytes — the keys are reference targets the commits rely on, so
+/// the server can't recompute them via `ContentId::new(...)`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueuedPush {
+    pub commit_cids: Vec<CommitId>,
+    pub blobs: HashMap<String, Vec<u8>>,
+    pub governance: GovernanceOptions,
+}
+
+/// Revert-side envelope payload. Mirrors the fields of
+/// [`RevertRequest`] the worker needs to re-run `prepare_revert`. The
+/// branch + ledger come from the `EnqueueCommandArgs` shell so we
+/// don't duplicate them in the envelope.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueuedRevert {
+    pub selection: RevertSelection,
+    pub strategy: ConflictStrategy,
+}
+
+/// Merge-side envelope payload. The queue entry rides on the target
+/// branch (the one whose head the merge mutates); the source branch
+/// is named here. When `target_branch` is `None`, the worker resolves
+/// it the same way the legacy committer does — falling back to the
+/// source's parent branch.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueuedMerge {
+    pub source_branch: String,
+    pub target_branch: Option<String>,
+    pub strategy: ConflictStrategy,
+}
+
+/// Rebase-side envelope payload. The queue entry rides on the branch
+/// being rebased (the one whose head shifts to the source's HEAD plus
+/// replayed commits).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueuedRebase {
+    pub strategy: ConflictStrategy,
+}
+
+/// Error encoding or decoding a [`QueuedRequest`].
+#[derive(Debug, Error)]
+pub enum QueuedRequestCodecError {
+    #[error("json codec: {0}")]
+    Json(#[from] serde_json::Error),
 }
 
 /// Transaction submission payload.
 ///
 /// Carries the transaction itself plus everything an implementation needs to
 /// process it. Implementation-specific knobs (e.g., Raft propose timeout,
-/// monolithic backpressure overrides) live on the implementation, not here.
+/// per-committer admission overrides) live on the implementation, not here.
 ///
 /// `idempotency_key` is optional: callers who want idempotent retry or
 /// after-the-fact status lookup provide one; callers who don't care can
@@ -282,10 +599,17 @@ pub struct PushReceipt {
 
 /// Receipt for any operation submitted through consensus.
 ///
-/// Variants correspond one-to-one with [`Committer`] trait methods. The
-/// umbrella type lets [`SubmissionState`] and the idempotency cache stay
-/// uniform across operation kinds without erasing per-op typing at the
-/// trait methods themselves.
+/// Variants correspond one-to-one with [`Committer`] trait methods.
+/// The umbrella type lets [`SubmissionState::Committed`] and the
+/// in-process idempotency cache carry the full typed receipt
+/// uniformly across operation kinds.
+///
+/// Status lookups that can't recover the typed receipt (after a
+/// leader transition or process restart cleared the cache) surface
+/// [`SubmissionState::Committed`] with `receipt: None` and the
+/// canonical kit (commit identity + body kind + tally) on the
+/// struct variant — [`OperationReceipt`] itself stays aligned with
+/// the [`Committer`] surface.
 #[derive(Debug, Clone)]
 pub enum OperationReceipt {
     Transaction(TransactionReceipt),
@@ -295,6 +619,42 @@ pub enum OperationReceipt {
     Push(PushReceipt),
 }
 
+/// Payload of [`SubmissionState::Committed`]. Extracted into its
+/// own struct so the enclosing enum's largest variant stays a
+/// single pointer wide — `CommittedSubmission` itself collects six
+/// fields and would otherwise inflate every `SubmissionState`
+/// value (including the lightweight `Unknown` / `InFlight`
+/// branches) to its footprint.
+///
+/// The canonical kit (`commit_id`, `t`, `kind`, `tally`,
+/// `idempotency_key`) is always populated — it's what a client
+/// asking "did my submission land?" actually needs, and it's
+/// recoverable from either the in-process idempotency cache or
+/// the Raft-replicated state.
+///
+/// `receipt` is `Some` when the originating node still has the
+/// typed [`OperationReceipt`] cached (the moka entry hasn't been
+/// evicted and the process hasn't restarted). It's `None` after
+/// a leader transition / restart / cache eviction — clients that
+/// want full per-op detail can chase it through the commit log
+/// endpoint, but the commit identity above is already
+/// authoritative.
+///
+/// The receipt is boxed because `OperationReceipt`'s heaviest
+/// variants (full `MergeReceipt` / `RebaseReceipt`) dwarf the
+/// rest of the canonical kit, and `SubmissionState` itself flows
+/// through hot paths (idempotency lookup, retry-collapse, HTTP
+/// response shaping).
+#[derive(Debug, Clone)]
+pub struct CommittedSubmission {
+    pub idempotency_key: Option<IdempotencyKey>,
+    pub kind: BodyKind,
+    pub commit_id: CommitId,
+    pub t: i64,
+    pub tally: Option<TrackingTally>,
+    pub receipt: Option<Box<OperationReceipt>>,
+}
+
 /// State of a previously-submitted operation, accessible by idempotency key.
 #[derive(Debug, Clone)]
 pub enum SubmissionState {
@@ -302,8 +662,9 @@ pub enum SubmissionState {
     Unknown,
     /// Submission accepted, durability not yet acknowledged.
     InFlight,
-    /// Submission durably accepted and committed.
-    Committed(OperationReceipt),
+    /// Submission durably accepted and committed. See
+    /// [`CommittedSubmission`] for the payload shape.
+    Committed(Box<CommittedSubmission>),
     /// Submission attempted but failed.
     Failed(SubmissionError),
 }
@@ -343,13 +704,12 @@ pub enum SubmissionError {
 
 /// Submit operations for processing.
 ///
-/// Each method represents an operation kind — transactions, reverts, and
-/// (later) merges and rebases — that requires durable acceptance through
-/// the same consensus path. Implementations choose how acceptance is
-/// achieved (local execution for monolithic, leader replication for Raft,
-/// quorum voting for BFT) but the caller's contract is identical per
-/// method: pass a request, await the future, get the per-op receipt when
-/// durably accepted.
+/// Each method represents an operation kind — transactions, reverts,
+/// merges, rebases, pushes — that requires durable acceptance.
+/// Implementations choose how acceptance is achieved (direct local
+/// execution, leader replication for Raft, quorum voting for BFT) but
+/// the caller's contract is identical per method: pass a request, await
+/// the future, get the per-op receipt when durably accepted.
 ///
 /// "Durably accepted" means the operation is persisted and visible to
 /// subsequent reads on this same consensus instance. Cross-instance read
@@ -399,6 +759,19 @@ pub trait Committer: Send + Sync {
 pub trait SubmissionLookup: Send + Sync {
     async fn status(&self, ledger_id: &str, key: &IdempotencyKey) -> SubmissionState;
 }
+
+/// Combined committer + lookup trait. Lets callers (notably
+/// `fluree-db-server::AppState`) hold a single
+/// `Arc<dyn SubmittingCommitter>` whose concrete type can swap
+/// between [`LocalCommitter`] and the Raft-side
+/// [`QueuedTransactor`](crate::raft::queued_transactor::QueuedTransactor)
+/// at server-construction time.
+///
+/// Blanket-implemented for every type that already implements both
+/// parent traits, so no manual impl is needed on
+/// [`CachingCommitter`] / [`LocalCommitter`] / `QueuedTransactor`.
+pub trait SubmittingCommitter: Committer + SubmissionLookup {}
+impl<T> SubmittingCommitter for T where T: Committer + SubmissionLookup + ?Sized {}
 
 #[cfg(test)]
 mod tests {

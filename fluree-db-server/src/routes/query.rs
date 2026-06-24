@@ -2188,7 +2188,6 @@ pub(crate) fn sparql_qc_opts(
         policy: headers.policy.clone(),
         policy_values: policy_values_map,
         default_allow: headers.default_allow,
-        ..Default::default()
     })
 }
 

@@ -352,7 +352,7 @@ pub async fn run_set_origins(ledger: &str, file: &Path, dirs: &FlureeDir) -> Cli
     use fluree_db_core::ContentKind;
     use fluree_db_core::ContentStore;
     use fluree_db_nameservice::{
-        ConfigCasResult, ConfigLookup, ConfigPayload, ConfigPublisher, ConfigValue, LedgerConfig,
+        ConfigCasResult, ConfigLookup, ConfigPayload, ConfigValue, LedgerConfig,
     };
 
     let config_json = std::fs::read(file)
@@ -390,7 +390,8 @@ pub async fn run_set_origins(ledger: &str, file: &Path, dirs: &FlureeDir) -> Cli
         }),
     );
     match fluree
-        .nameservice_mode()
+        .publisher()
+        .map_err(|e| CliError::Config(e.to_string()))?
         .push_config(&ledger_id, current.as_ref(), &new_config)
         .await
         .map_err(|e| CliError::Config(format!("failed to set config: {e}")))?

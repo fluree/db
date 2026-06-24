@@ -20,7 +20,6 @@ use fluree_db_api::{FlureeBuilder, IndexConfig};
 use fluree_db_core::NsSplitMode;
 use fluree_db_transact::{CommitOpts, TxnOpts};
 use serde_json::json;
-use std::sync::Arc;
 
 /// Insert data under HostPlusN(1), index, rebuild from disk, and query.
 ///
@@ -47,7 +46,10 @@ async fn host_plus_n_insert_index_reload_query() {
 
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        Arc::new(fluree.nameservice_mode().clone()),
+        fluree
+            .nameservice_mode()
+            .publisher_arc()
+            .expect("test setup requires ReadWrite nameservice mode"),
         fluree_db_indexer::IndexerConfig::small(),
     );
     fluree.set_indexing_mode(fluree_db_api::tx::IndexingMode::Background(handle.clone()));

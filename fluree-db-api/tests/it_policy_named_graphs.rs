@@ -10,7 +10,6 @@ use serde_json::json;
 
 use crate::support;
 use crate::support::{assert_index_defaults, start_background_indexer_local};
-use std::sync::Arc;
 
 #[tokio::test]
 async fn policy_applies_to_named_graph_queries() {
@@ -22,7 +21,10 @@ async fn policy_applies_to_named_graph_queries() {
 
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        Arc::new(fluree.nameservice_mode().clone()),
+        fluree
+            .nameservice_mode()
+            .publisher_arc()
+            .expect("test setup requires ReadWrite nameservice mode"),
         fluree_db_indexer::IndexerConfig::small(),
     );
 

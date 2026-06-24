@@ -493,6 +493,7 @@ impl HistoryTimeRange {
 // JSON-LD Query Parsing
 // =============================================================================
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
 
@@ -753,7 +754,7 @@ impl DatasetSpec {
 /// Tracking-related opts keys (`meta`, `max-fuel`) live on a separate
 /// [`TrackingOptions`] path; they are parsed and propagated by the
 /// transaction route, not by this type.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct GovernanceOptions {
     pub identity: Option<String>,
     pub policy_class: Option<Vec<String>>,

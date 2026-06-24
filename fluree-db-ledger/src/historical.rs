@@ -31,7 +31,7 @@ use fluree_db_core::{
     ContentId, ContentStore, Flake, FlakeMeta, FlakeValue, GraphDbRef, GraphId, IndexType,
     LedgerSnapshot, OverlayProvider, RuntimeSmallDicts, Sid, StorageBackend, TXN_META_GRAPH_ID,
 };
-use fluree_db_nameservice::NameService;
+use fluree_db_nameservice::NameServiceLookup;
 
 use fluree_db_novelty::{
     generate_commit_flakes, stamp_graph_on_commit_flakes, trace_commits_by_id, Novelty,
@@ -85,7 +85,7 @@ impl HistoricalLedgerView {
     /// - `NotFound` if the ledger doesn't exist
     /// - `FutureTime` if `target_t` is beyond the current head
     pub async fn load_at(
-        ns: &dyn NameService,
+        ns: &dyn NameServiceLookup,
         alias: &str,
         backend: &StorageBackend,
         target_t: i64,
