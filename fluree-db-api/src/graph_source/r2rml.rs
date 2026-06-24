@@ -25,6 +25,25 @@ use fluree_db_r2rml::mapping::CompiledR2rmlMapping;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
+/// How many data files to read concurrently. Defaults to
+/// `min(available_parallelism, files, 8)`; override with
+/// `FLUREE_ICEBERG_SCAN_CONCURRENCY` (a positive integer; not capped, so callers
+/// can raise it for high-latency remote object stores). Bounded to keep memory
+/// and S3 request fan-out in check.
+fn iceberg_scan_concurrency(num_files: usize) -> usize {
+    if let Some(n) = std::env::var("FLUREE_ICEBERG_SCAN_CONCURRENCY")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+    {
+        return n.min(num_files.max(1));
+    }
+    let cpus = std::thread::available_parallelism()
+        .map(std::num::NonZeroUsize::get)
+        .unwrap_or(4);
+    cpus.min(num_files.max(1)).clamp(1, 8)
+}
+
 /// Translate resolved scan filters into an Iceberg pushdown `Expression` for
 /// file pruning. Filters on unknown columns are skipped; an empty result is
 /// `None`. Conservative — pruning never drops matching rows because the
@@ -898,26 +917,48 @@ impl R2rmlTableProvider for FlureeR2rmlProvider<'_> {
             return Ok(Vec::new());
         }
 
-        // Read data files
-        let reader = SendParquetReader::with_cache(storage.as_ref(), cache.parquet_footers());
-        let mut all_batches = Vec::new();
+        // Read data files with bounded parallelism. Each file is an independent
+        // "file -> batches" worker; concurrency is capped (see
+        // `iceberg_scan_concurrency`) to avoid spiking memory or hammering S3.
+        // This is the first slice of a streaming scan — the next step consumes
+        // batches as workers complete instead of collecting them all here.
+        let footers = cache.parquet_footers();
+        let concurrency = iceberg_scan_concurrency(tasks.len());
+        debug!(
+            files = tasks.len(),
+            concurrency, "reading Parquet files (bounded parallel)"
+        );
 
-        for task in &tasks {
-            info!(
-                file_path = %task.data_file.file_path,
-                record_count = task.data_file.record_count,
-                "Reading Parquet file"
-            );
-
-            let batches = reader.read_task(task).await.map_err(|e| {
-                QueryError::Internal(format!(
-                    "Failed to read Parquet file '{}': {}",
-                    task.data_file.file_path, e
-                ))
-            })?;
-
-            all_batches.extend(batches);
-        }
+        let all_batches: Vec<ColumnBatch> = {
+            use futures::stream::{StreamExt, TryStreamExt};
+            futures::stream::iter(tasks)
+                .map(|task| {
+                    let storage = Arc::clone(&storage);
+                    let footers = Arc::clone(&footers);
+                    async move {
+                        tokio::spawn(async move {
+                            let reader =
+                                SendParquetReader::with_cache(storage.as_ref(), footers.as_ref());
+                            reader.read_task(&task).await.map_err(|e| {
+                                QueryError::Internal(format!(
+                                    "Failed to read Parquet file '{}': {e}",
+                                    task.data_file.file_path
+                                ))
+                            })
+                        })
+                        .await
+                        .map_err(|e| {
+                            QueryError::Internal(format!("Parquet read worker failed: {e}"))
+                        })?
+                    }
+                })
+                .buffer_unordered(concurrency)
+                .try_collect::<Vec<Vec<ColumnBatch>>>()
+                .await?
+                .into_iter()
+                .flatten()
+                .collect()
+        };
 
         info!(
             total_batches = all_batches.len(),

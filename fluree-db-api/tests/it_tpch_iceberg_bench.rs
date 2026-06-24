@@ -143,7 +143,7 @@ fn print_result(label: &str, r: &fluree_db_api::QueryResult, elapsed_ms: u128) {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 #[ignore = "Requires local MinIO + TPC-H dataset. Set TPCH_BENCH=1 to run."]
 async fn tpch_lineitem_q1_q6() {
     if std::env::var("TPCH_BENCH").is_err() {
