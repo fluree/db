@@ -565,6 +565,15 @@ impl S2SearchPattern {
 // R2RML Pattern
 // ============================================================================
 
+/// A FILTER comparison on an R2RML object variable, ready to push to the scan.
+/// `var` is resolved to a table column by the operator (var → predicate → column).
+#[derive(Debug, Clone)]
+pub struct ScanPushdown {
+    pub var: VarId,
+    pub op: crate::r2rml::ScanCmpOp,
+    pub value: crate::r2rml::ScanValue,
+}
+
 /// R2RML scan pattern for querying Iceberg graph sources via R2RML mappings.
 ///
 /// This pattern scans an Iceberg table through R2RML term maps and produces
@@ -580,15 +589,6 @@ impl S2SearchPattern {
 /// With an R2RML mapping, this could be lowered to:
 /// - R2rmlPattern with subject_var=?person, triples_map for ex:Person class
 /// - R2rmlPattern with subject_var=?person, object_var=?name, predicate ex:name
-/// A FILTER comparison on an R2RML object variable, ready to push to the scan.
-/// `var` is resolved to a table column by the operator (var → predicate → column).
-#[derive(Debug, Clone)]
-pub struct ScanPushdown {
-    pub var: VarId,
-    pub op: crate::r2rml::ScanCmpOp,
-    pub value: crate::r2rml::ScanValue,
-}
-
 #[derive(Debug, Clone)]
 pub struct R2rmlPattern {
     /// Graph source alias (e.g., "airlines-r2rml:main")

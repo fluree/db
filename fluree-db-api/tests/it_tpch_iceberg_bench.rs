@@ -9,6 +9,11 @@
 //!     --test it_tpch_iceberg_bench -- --ignored --nocapture
 #![cfg(feature = "iceberg")]
 
+// Materialization is allocation-heavy and parallel; the system allocator
+// contends badly across cores. mimalloc is what the deployed binary should use.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 mod support;
 
 use std::time::Instant;
