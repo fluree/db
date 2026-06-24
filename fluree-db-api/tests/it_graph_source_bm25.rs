@@ -1,5 +1,4 @@
-mod support;
-
+use crate::support;
 use fluree_db_api::{Bm25CreateConfig, FlureeBuilder, FlureeIndexProvider};
 use fluree_db_nameservice::STORAGE_SEGMENT_GRAPH_SOURCES;
 use fluree_db_query::bm25::{Analyzer, Bm25IndexProvider, Bm25Scorer};

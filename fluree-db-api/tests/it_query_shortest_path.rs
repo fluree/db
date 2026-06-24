@@ -4,10 +4,8 @@
 //! Graph (ex:knows): a→b→d, a→c→d (two 2-hop paths), a→e→f→d (a 3-hop path).
 //! So the shortest a→d distance is 2 hops, reachable two ways.
 
-mod support;
-
+use crate::support::{genesis_ledger, graphdb_from_ledger, MemoryFluree};
 use serde_json::{json, Value as JsonValue};
-use support::{genesis_ledger, graphdb_from_ledger, MemoryFluree};
 
 fn ctx() -> JsonValue {
     json!({"ex": "http://example.org/", "xsd": "http://www.w3.org/2001/XMLSchema#"})

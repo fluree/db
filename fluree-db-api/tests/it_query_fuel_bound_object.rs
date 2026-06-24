@@ -21,11 +21,9 @@
 
 #![cfg(feature = "native")]
 
-mod support;
-
+use crate::support::{assert_index_defaults, genesis_ledger, rebuild_and_publish_index};
 use fluree_db_api::FlureeBuilder;
 use serde_json::{json, Value as JsonValue};
-use support::{assert_index_defaults, genesis_ledger, rebuild_and_publish_index};
 
 const LEDGER_ID: &str = "fuel-bound-object:main";
 

@@ -19,14 +19,12 @@
 
 #![cfg(feature = "native")]
 
-mod support;
-
 use std::hint::black_box;
 use std::time::Instant;
 
+use crate::support::graphdb_from_ledger;
 use fluree_db_api::{parse_sparql, FlureeBuilder, ReindexOptions};
 use serde_json::json;
-use support::graphdb_from_ledger;
 
 const SEED: usize = 8000;
 const ITERS: usize = 2000;

@@ -2,11 +2,10 @@
 //!
 //! Tests identity-based access control and policy restrictions.
 
-mod support;
-
+use crate::support;
+use crate::support::{assert_index_defaults, genesis_ledger};
 use fluree_db_api::{wrap_identity_policy_view, FlureeBuilder};
 use serde_json::json;
-use support::{assert_index_defaults, genesis_ledger};
 
 /// Test inline policy with ?$identity binding.
 ///

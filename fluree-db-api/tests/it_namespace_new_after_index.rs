@@ -13,8 +13,7 @@
 
 #![cfg(feature = "native")]
 
-mod support;
-
+use crate::support;
 use fluree_db_api::{FlureeBuilder, ReindexOptions};
 use fluree_db_ledger::TypeErasedStore;
 use serde_json::json;

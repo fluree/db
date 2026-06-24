@@ -2,12 +2,10 @@
 
 #![cfg(feature = "native")]
 
-mod support;
-
+use crate::support::genesis_ledger_for_fluree;
 use fluree_db_api::{FlureeBuilder, ReindexOptions};
 use fluree_db_transact::{CommitOpts, TxnOpts};
 use serde_json::json;
-use support::genesis_ledger_for_fluree;
 
 #[tokio::test]
 async fn reindex_populates_index_schema_from_subclass_and_subproperty_ops() {

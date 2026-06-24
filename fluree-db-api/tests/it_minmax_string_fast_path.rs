@@ -11,8 +11,7 @@
 //! value-ordered results.
 #![cfg(feature = "native")]
 
-mod support;
-
+use crate::support;
 use fluree_db_api::FlureeBuilder;
 use std::io::Write;
 use tempfile::TempDir;

@@ -6,11 +6,10 @@
 //! - Negative tests (partial conditions shouldn't trigger inference)
 //!
 
-mod support;
-
+use crate::support;
+use crate::support::{genesis_ledger, normalize_rows};
 use fluree_db_api::FlureeBuilder;
 use serde_json::json;
-use support::{genesis_ledger, normalize_rows};
 
 // =============================================================================
 // Restriction Edge Cases

@@ -8,7 +8,7 @@
 //
 // Kept as a shared utility module across many integration tests. Individual
 // test crates intentionally do not use every helper.
-#![expect(dead_code)]
+#![allow(dead_code)]
 
 pub mod span_capture;
 

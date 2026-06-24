@@ -7,8 +7,7 @@
 //! push parts of query execution onto threads the subscriber can't see.
 #![cfg(feature = "native")]
 
-mod support;
-
+use crate::support;
 use fluree_db_api::FlureeBuilder;
 use std::io::Write;
 use tempfile::TempDir;

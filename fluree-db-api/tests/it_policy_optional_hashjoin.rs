@@ -10,11 +10,9 @@
 //! a forbidden optional-side row must not leak into the count, and a row whose
 //! only matches are all policy-hidden must collapse to the left-join zero.
 
-mod support;
-
+use crate::support::{assert_index_defaults, genesis_ledger, normalize_rows};
 use fluree_db_api::FlureeBuilder;
 use serde_json::{json, Value as JsonValue};
-use support::{assert_index_defaults, genesis_ledger, normalize_rows};
 
 fn ctx() -> JsonValue {
     json!({ "ex": "http://example.org/ns/" })

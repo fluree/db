@@ -8,8 +8,6 @@
 
 #![cfg(feature = "native")]
 
-mod support;
-
 use fluree_db_api::{Fluree, FlureeBuilder, LedgerState, Novelty};
 use fluree_db_core::tracking::{Tracker, TrackingOptions};
 use fluree_db_core::LedgerSnapshot;
@@ -156,10 +154,10 @@ async fn build_index_for_record_already_current_reports_zero_fuel() {
 
 #[tokio::test]
 async fn trigger_index_reports_positive_fuel() {
+    use crate::support::start_background_indexer_local;
     use fluree_db_api::tx::IndexingMode;
     use fluree_db_api::TriggerIndexOptions;
     use std::sync::Arc;
-    use support::start_background_indexer_local;
 
     let mut fluree = FlureeBuilder::memory().build_memory();
     let (local, indexer_handle) = start_background_indexer_local(

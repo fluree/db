@@ -2,15 +2,14 @@
 //!
 //! Covers query + update semantics (DELETE/INSERT/WHERE) using JSON-LD Update transactions.
 
-mod support;
-
-use fluree_db_api::FlureeBuilder;
-use serde_json::{json, Value as JsonValue};
-use std::sync::Arc;
-use support::{
+use crate::support;
+use crate::support::{
     assert_index_defaults, genesis_ledger, normalize_rows, normalize_sparql_bindings, MemoryFluree,
     MemoryLedger,
 };
+use fluree_db_api::FlureeBuilder;
+use serde_json::{json, Value as JsonValue};
+use std::sync::Arc;
 
 fn normalize_object_rows(value: &JsonValue) -> Vec<String> {
     let Some(array) = value.as_array() else {

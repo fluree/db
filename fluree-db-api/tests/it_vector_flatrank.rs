@@ -9,11 +9,10 @@
 //! The `vector_search_post_indexing_*` tests exercise the binary index path:
 //! transact → index build → query from arena (not novelty).
 
-use std::sync::Arc;
-mod support;
-
+use crate::support;
 use fluree_db_api::FlureeBuilder;
 use serde_json::json;
+use std::sync::Arc;
 
 /// Integration test for basic vector search with dot product scoring
 #[tokio::test]
@@ -482,10 +481,10 @@ async fn vector_search_mixed_datatypes() {
 #[cfg(feature = "native")]
 #[tokio::test]
 async fn vector_search_post_indexing() {
+    use crate::support::start_background_indexer_local;
     use fluree_db_api::{IndexConfig, LedgerState, Novelty};
     use fluree_db_core::LedgerSnapshot;
     use fluree_db_transact::{CommitOpts, TxnOpts};
-    use support::start_background_indexer_local;
 
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/vector-post-index:main";
@@ -603,10 +602,10 @@ async fn vector_search_post_indexing() {
 #[cfg(feature = "native")]
 #[tokio::test]
 async fn vector_search_novelty_plus_indexed() {
+    use crate::support::start_background_indexer_local;
     use fluree_db_api::{IndexConfig, LedgerState, Novelty};
     use fluree_db_core::LedgerSnapshot;
     use fluree_db_transact::{CommitOpts, TxnOpts};
-    use support::start_background_indexer_local;
 
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/vector-novelty-plus-index:main";
@@ -790,10 +789,10 @@ async fn vector_at_type_shorthand() {
 #[cfg(feature = "native")]
 #[tokio::test]
 async fn vector_cosine_normalized_optimization() {
+    use crate::support::start_background_indexer_local;
     use fluree_db_api::{IndexConfig, LedgerState, Novelty};
     use fluree_db_core::LedgerSnapshot;
     use fluree_db_transact::{CommitOpts, TxnOpts};
-    use support::start_background_indexer_local;
 
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/vector-cosine-norm:main";

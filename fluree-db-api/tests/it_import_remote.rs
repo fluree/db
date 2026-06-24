@@ -7,8 +7,7 @@
 
 #![cfg(feature = "native")]
 
-mod support;
-
+use crate::support;
 use fluree_db_api::{FlureeBuilder, RemoteObject, RemoteSource};
 use fluree_db_core::{MemoryStorage, StorageRead, StorageWrite};
 use serde_json::json;

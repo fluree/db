@@ -20,8 +20,6 @@
 
 #![cfg(feature = "native")]
 
-mod support;
-
 use fluree_db_api::FlureeBuilder;
 use serde_json::json;
 

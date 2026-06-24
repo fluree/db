@@ -1,8 +1,7 @@
 //! Integration tests for `Fluree::merge_preview` — the read-only branch
 //! diff. Mirrors the structure of `it_merge.rs`.
 
-mod support;
-
+use crate::support;
 use fluree_db_api::{ConflictStrategy, FlureeBuilder, MergePreviewOpts};
 use serde_json::json;
 

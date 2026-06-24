@@ -3,8 +3,7 @@
 //! Tests the branch lifecycle: creating branches, transacting on branches
 //! independently, and verifying data isolation between branches.
 
-mod support;
-
+use crate::support;
 use fluree_db_api::{CommitRef, FlureeBuilder};
 use serde_json::json;
 

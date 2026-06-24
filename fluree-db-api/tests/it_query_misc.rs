@@ -2,14 +2,15 @@
 //!
 //! We prioritize query semantics; some scenarios are intentionally out of scope here.
 
-use std::sync::Arc;
-mod support;
-
+use crate::support;
+use crate::support::{
+    context_ex_schema, genesis_ledger, normalize_rows, MemoryFluree, MemoryLedger,
+};
+#[cfg(feature = "native")]
+use crate::support::{start_background_indexer_local, trigger_index_and_wait};
 use fluree_db_api::FlureeBuilder;
 use serde_json::json;
-use support::{context_ex_schema, genesis_ledger, normalize_rows, MemoryFluree, MemoryLedger};
-#[cfg(feature = "native")]
-use support::{start_background_indexer_local, trigger_index_and_wait};
+use std::sync::Arc;
 
 async fn seed_three_people(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
     let ledger0 = genesis_ledger(fluree, ledger_id);

@@ -10,8 +10,7 @@ use fluree_db_api::{CommitOpts, FlureeBuilder, IndexConfig};
 use fluree_db_transact::ir::TxnOpts;
 use serde_json::json;
 
-mod support;
-use support::genesis_ledger;
+use crate::support::genesis_ledger;
 
 fn test_index_cfg() -> IndexConfig {
     IndexConfig {
