@@ -13,9 +13,12 @@
 //! This enables processing of large Parquet files in memory-constrained
 //! environments like AWS Lambda.
 
+use std::io::{Read, Seek, SeekFrom};
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use bytes::Bytes;
 use fluree_db_core::disk_cache::DiskArtifactCache;
 use tokio::runtime::Handle;
@@ -29,6 +32,7 @@ use crate::io::parquet::{
     parse_parquet_metadata_from_bytes, ColumnValue, ParquetFooterCache, NULL_COLUMN_SENTINEL,
 };
 use crate::io::SendIcebergStorage;
+use crate::metadata::Schema;
 use crate::scan::FileScanTask;
 
 use parquet::file::metadata::ParquetMetaData;
@@ -57,6 +61,11 @@ const WHOLE_FILE_MIN_SHARE_PCT: u64 = 50;
 /// buffer can omit chunks the row iterator dereferences). Applies even without a
 /// disk cache.
 const MIN_SPARSE_FILE_BYTES: u64 = 1024 * 1024;
+
+/// Ceiling on large-file broad admission. Filling caches the whole file, which
+/// transiently holds it in memory once; this bounds that spike (and the per-file
+/// cache footprint). Larger broad files keep range-reading from source uncached.
+const LARGE_FILE_ADMIT_MAX_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Borrowed handle to the shared on-disk cache plus its directory, used to map an
 /// immutable source path to a stable local cache file.
@@ -105,6 +114,59 @@ async fn read_whole_local(path: &Path, expected_size: u64) -> Option<Bytes> {
         Ok(Ok(bytes)) if bytes.len() as u64 == expected_size => Some(Bytes::from(bytes)),
         _ => None,
     }
+}
+
+/// A [`SendIcebergStorage`] backed by a single local cache file, so a large
+/// file's byte ranges are served from local disk instead of the remote store.
+/// Reads run synchronously; the chunk reader only drives this from a blocking
+/// context. The `path` argument is ignored — every read targets the cache file.
+#[derive(Debug)]
+struct LocalFileStorage {
+    path: PathBuf,
+    size: u64,
+}
+
+#[async_trait]
+impl SendIcebergStorage for LocalFileStorage {
+    async fn read(&self, _path: &str) -> Result<Bytes> {
+        std::fs::read(&self.path)
+            .map(Bytes::from)
+            .map_err(|e| IcebergError::Storage(format!("local cache read: {e}")))
+    }
+
+    async fn read_range(&self, _path: &str, range: Range<u64>) -> Result<Bytes> {
+        let mut f = std::fs::File::open(&self.path)
+            .map_err(|e| IcebergError::Storage(format!("local cache open: {e}")))?;
+        f.seek(SeekFrom::Start(range.start))
+            .map_err(|e| IcebergError::Storage(format!("local cache seek: {e}")))?;
+        let len = range.end.saturating_sub(range.start) as usize;
+        let mut buf = vec![0u8; len];
+        f.read_exact(&mut buf)
+            .map_err(|e| IcebergError::Storage(format!("local cache read_exact: {e}")))?;
+        Ok(Bytes::from(buf))
+    }
+
+    async fn file_size(&self, _path: &str) -> Result<u64> {
+        Ok(self.size)
+    }
+}
+
+/// Total bytes the projection reads (sum of projected column chunk ranges),
+/// used to decide broad-read admission for large files.
+fn projected_chunk_bytes(task: &FileScanTask, metadata: &Arc<ParquetMetaData>) -> Result<u64> {
+    let (_, column_indices) = if let Some(ref iceberg_schema) = task.iceberg_schema {
+        build_batch_schema_with_iceberg(metadata, iceberg_schema, &task.projected_field_ids)?
+    } else {
+        build_batch_schema(metadata, &task.projected_field_ids)?
+    };
+    let real: Vec<usize> = column_indices
+        .into_iter()
+        .filter(|&idx| idx != NULL_COLUMN_SENTINEL)
+        .collect();
+    Ok(calculate_column_chunk_ranges(metadata, &real)
+        .iter()
+        .map(|(s, e)| e - s)
+        .sum())
 }
 
 /// Send-safe Parquet reader with range-read support.
@@ -231,16 +293,9 @@ impl<'a, S: SendIcebergStorage> SendParquetReader<'a, S> {
     {
         let file_size = task.data_file.file_size_in_bytes as u64;
 
-        // A validly cached whole file is parsed directly regardless of size, so a
-        // large-file cache hit isn't skipped. Only uncached large files take the
-        // on-demand range-read path.
-        let cached_whole = self
-            .disk_cache
-            .filter(|dc| dc.cache.budget_bytes() > 0)
-            .and_then(|dc| dc.valid_local(&task.data_file.file_path, file_size))
-            .is_some();
-
-        if file_size > MAX_SPARSE_BUFFER_SIZE && !cached_whole {
+        // Large files take the on-demand range-read path, which itself serves
+        // from / fills the disk cache (rule 1/2) before falling back to source.
+        if file_size > MAX_SPARSE_BUFFER_SIZE {
             return self.read_task_large_file(task).await;
         }
 
@@ -359,37 +414,107 @@ impl<'a, S: SendIcebergStorage> SendParquetReader<'a, S> {
         Ok(batches)
     }
 
-    /// Read a large file using range-backed chunk reader.
-    ///
-    /// This method uses `RangeBackedChunkReader` to fetch byte ranges on-demand
-    /// instead of loading the entire file into memory. The decoding runs in a
-    /// blocking context via `spawn_blocking`.
+    /// Read a large file, applying the disk-cache policy before falling back to
+    /// on-demand range reads from source:
+    ///   1. a validly cached whole file → range-read lazily from local disk;
+    ///   2. a broad read of a large file within the fill ceiling → fill once
+    ///      (coalesced), then range-read from local;
+    ///   3. otherwise → range-read from source on demand, uncached.
     async fn read_task_large_file(&self, task: &FileScanTask) -> Result<Vec<ColumnBatch>>
     where
         S: Clone + 'static,
     {
-        use parquet::record::reader::RowIter;
-
         let path = task.data_file.file_path.clone();
         let file_size = task.data_file.file_size_in_bytes as u64;
         let projected_field_ids = task.projected_field_ids.clone();
         let iceberg_schema = task.iceberg_schema.clone();
-
-        // Clone storage for use in blocking task
-        let storage = Arc::new(self.storage.clone());
         let runtime = Handle::current();
 
-        tracing::info!(
+        if let Some(dc) = self.disk_cache.filter(|dc| dc.cache.budget_bytes() > 0) {
+            // Rule 1: serve a validly cached whole file as lazy local ranges.
+            if let Some(local) = dc.valid_local(&path, file_size) {
+                tracing::debug!(path = %path, file_size, "Iceberg disk-cache hit (large)");
+                let storage = Arc::new(LocalFileStorage {
+                    path: local,
+                    size: file_size,
+                });
+                return Self::decode_large_file(
+                    storage,
+                    path,
+                    file_size,
+                    projected_field_ids,
+                    iceberg_schema,
+                    runtime,
+                )
+                .await;
+            }
+            // Rule 2: admit a broad read of a large file within the fill ceiling.
+            // Fill once (coalesced) then serve from local; narrow large reads
+            // skip this and range-read from source.
+            if file_size <= LARGE_FILE_ADMIT_MAX_BYTES {
+                let metadata = self.read_metadata(&path).await?;
+                let projected_bytes = projected_chunk_bytes(task, &metadata)?;
+                if admit_whole_file(file_size, projected_bytes) {
+                    let local = dc.local_path(&path, file_size);
+                    dc.cache
+                        .coalesced_fetch(local.clone(), || async {
+                            self.storage
+                                .read(&path)
+                                .await
+                                .map(|b| b.to_vec())
+                                .map_err(|e| std::io::Error::other(e.to_string()))
+                        })
+                        .await
+                        .map_err(|e| IcebergError::Storage(format!("disk-cache fill: {e}")))?;
+                    tracing::debug!(path = %path, file_size, "Iceberg disk-cache fill (large, broad)");
+                    let storage = Arc::new(LocalFileStorage {
+                        path: local,
+                        size: file_size,
+                    });
+                    return Self::decode_large_file(
+                        storage,
+                        path,
+                        file_size,
+                        projected_field_ids,
+                        iceberg_schema,
+                        runtime,
+                    )
+                    .await;
+                }
+            }
+        }
+
+        tracing::info!(file_size, path = %path, "Using range-backed chunk reader (source)");
+        let storage = Arc::new(self.storage.clone());
+        Self::decode_large_file(
+            storage,
+            path,
             file_size,
-            path = %path,
-            "Using range-backed chunk reader for large file"
-        );
+            projected_field_ids,
+            iceberg_schema,
+            runtime,
+        )
+        .await
+    }
+
+    /// Decode a large Parquet file by streaming byte ranges from `storage` (the
+    /// source store or a local cache file) via `RangeBackedChunkReader`,
+    /// projecting only the requested columns. Runs the sync decode on a blocking
+    /// thread.
+    async fn decode_large_file<St: SendIcebergStorage + 'static>(
+        storage: Arc<St>,
+        path: String,
+        file_size: u64,
+        projected_field_ids: Vec<i32>,
+        iceberg_schema: Option<Arc<Schema>>,
+        runtime: Handle,
+    ) -> Result<Vec<ColumnBatch>> {
+        use parquet::record::reader::RowIter;
 
         // Run the sync parquet decoding in a blocking context
         let result = tokio::task::spawn_blocking(move || {
             // Create range-backed chunk reader
-            let chunk_reader =
-                RangeBackedChunkReader::new(storage, path.clone(), file_size, runtime);
+            let chunk_reader = RangeBackedChunkReader::new(storage, path, file_size, runtime);
 
             // Parse using parquet-rs with our chunk reader
             let reader = SerializedFileReader::new(chunk_reader)
@@ -709,5 +834,24 @@ mod tests {
         assert!(read_whole_local(&path, 4).await.is_some());
         assert!(read_whole_local(&path, 5).await.is_none());
         assert!(read_whole_local(&dir.join("missing"), 4).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn local_file_storage_serves_positioned_ranges() {
+        let dir = fresh_cache_dir("localfs");
+        let path = dir.join("blob");
+        std::fs::write(&path, b"0123456789").unwrap();
+        let storage = LocalFileStorage { path, size: 10 };
+        // The path argument is ignored; reads target the backing cache file.
+        assert_eq!(storage.file_size("ignored").await.unwrap(), 10);
+        assert_eq!(
+            &storage.read_range("ignored", 2..5).await.unwrap()[..],
+            b"234"
+        );
+        assert_eq!(
+            &storage.read_range("ignored", 7..10).await.unwrap()[..],
+            b"789"
+        );
+        assert_eq!(&storage.read("ignored").await.unwrap()[..], b"0123456789");
     }
 }
