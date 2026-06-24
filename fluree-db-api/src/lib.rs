@@ -1184,7 +1184,17 @@ struct RuntimeParts {
     attachment_provider_cell: indexer_attachment_provider::LedgerManagerCell,
 }
 
-fn spawn_local_cache_event_listener(
+/// Spawn a background task that subscribes to `event_bus` and refreshes
+/// `ledger_manager` on every commit / index publish; drops loaded
+/// ledgers on retract.
+///
+/// `FlureeBuilder::build` calls this with Fluree's internal bus when
+/// indexing is enabled. Deployments that publish commit events on a
+/// separate bus (e.g. raft's `LedgerEventBus`) should call this again
+/// with that bus so cache reconciliation also fires on those events —
+/// otherwise follower nodes only refresh on initial load, and writes
+/// that land between the initial load and the next reload are invisible.
+pub fn spawn_local_cache_event_listener(
     event_bus: Arc<fluree_db_nameservice::LedgerEventBus>,
     ledger_manager: Arc<LedgerManager>,
 ) {
