@@ -2,11 +2,10 @@
 //!
 //! Tests geo:wktLiteral POINT storage and geof:distance function.
 
-mod support;
-
+use crate::support;
+use crate::support::{genesis_ledger, MemoryFluree, MemoryLedger};
 use fluree_db_api::FlureeBuilder;
 use serde_json::{json, Value as JsonValue};
-use support::{genesis_ledger, MemoryFluree, MemoryLedger};
 
 fn geo_context() -> JsonValue {
     json!({

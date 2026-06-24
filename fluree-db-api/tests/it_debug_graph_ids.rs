@@ -4,9 +4,8 @@ use fluree_db_api::FlureeBuilder;
 use fluree_db_core::ContentStore;
 use serde_json::json;
 
-mod support;
 
-use support::{genesis_ledger, start_background_indexer_local, trigger_index_and_wait};
+use crate::support::{genesis_ledger, start_background_indexer_local, trigger_index_and_wait};
 
 #[tokio::test]
 #[ignore]

@@ -6,10 +6,8 @@
 //! patterns (stored data only) cannot do. The canonical case is a dense /
 //! gap-filled series: generate the axis with `range`, LEFT JOIN the data.
 
-mod support;
-
+use crate::support::{genesis_ledger, graphdb_from_ledger, MemoryFluree};
 use serde_json::{json, Value as JsonValue};
-use support::{genesis_ledger, graphdb_from_ledger, MemoryFluree};
 
 fn ctx() -> JsonValue {
     json!({"ex": "http://example.org/", "xsd": "http://www.w3.org/2001/XMLSchema#"})

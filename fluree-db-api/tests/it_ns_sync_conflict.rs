@@ -8,16 +8,15 @@
 //!   - Reverse: same prefix, different code
 //!
 //! Run with:
-//!   cargo test -p fluree-db-api --test it_ns_sync_conflict --features native
+//!   cargo test -p fluree-db-api --test grp_import it_ns_sync_conflict --features native
 
 #![cfg(feature = "native")]
 
-mod support;
-
+use crate::support;
+use crate::support::start_background_indexer_local;
 use fluree_db_api::{FlureeBuilder, IndexConfig};
 use fluree_db_transact::{CommitOpts, TxnOpts};
 use serde_json::json;
-use support::start_background_indexer_local;
 
 /// Helper: create a ledger, insert data with a custom namespace, and index it.
 /// Returns the Fluree instance, the ledger ID, and the temp dir (kept alive).

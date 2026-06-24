@@ -8,11 +8,10 @@
 //! surface" for the user-facing surface contract and the
 //! per-operation blank-node / variable rules.
 
-mod support;
-
+use crate::support;
+use crate::support::{genesis_ledger, MemoryFluree, MemoryLedger};
 use fluree_db_api::FlureeBuilder;
 use serde_json::{json, Value as JsonValue};
-use support::{genesis_ledger, MemoryFluree, MemoryLedger};
 
 fn ctx() -> JsonValue {
     json!({

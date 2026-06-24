@@ -5,8 +5,7 @@
 //!
 //! Merged from: it_api_create.rs, it_db.rs
 
-mod support;
-
+use crate::support;
 use fluree_db_api::FlureeBuilder;
 use serde_json::json;
 

@@ -1,8 +1,7 @@
 //! CONSTRUCT integration tests
 //!
 
-mod support;
-
+use crate::support;
 use fluree_db_api::{FlureeBuilder, LedgerState, Novelty};
 use fluree_db_core::LedgerSnapshot;
 use serde_json::{json, Map, Value as JsonValue};

@@ -7,11 +7,9 @@
 
 #![cfg(feature = "native")]
 
-mod support;
-
+use crate::support::genesis_ledger;
 use fluree_db_api::FlureeBuilder;
 use serde_json::json;
-use support::genesis_ledger;
 
 const ALPHA_IRI: &str = "http://example.org/graphs/alpha";
 const BETA_IRI: &str = "http://example.org/graphs/beta";

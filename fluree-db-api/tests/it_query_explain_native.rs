@@ -3,15 +3,14 @@
 
 #![cfg(feature = "native")]
 
-mod support;
 
+use crate::support::{graphdb_from_ledger, start_background_indexer_local};
 use fluree_db_api::{
     tx::IndexingMode, CommitOpts, FlureeBuilder, IndexConfig, LedgerState, Novelty,
 };
 use fluree_db_core::{load_ledger_snapshot, LedgerSnapshot};
 use fluree_db_transact::TxnOpts;
 use serde_json::json;
-use support::{graphdb_from_ledger, start_background_indexer_local};
 
 async fn index_and_load_db(
     fluree: &fluree_db_api::Fluree,

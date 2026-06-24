@@ -8,11 +8,12 @@
 //! - `(count *)` - count all rows in group
 //! - `(groupconcat ?x ", ")` - separator as second argument
 
-mod support;
-
+use crate::support;
+use crate::support::{
+    context_ex_schema, genesis_ledger, normalize_rows, MemoryFluree, MemoryLedger,
+};
 use fluree_db_api::FlureeBuilder;
 use serde_json::{json, Value as JsonValue};
-use support::{context_ex_schema, genesis_ledger, normalize_rows, MemoryFluree, MemoryLedger};
 
 async fn seed_people(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
     let ledger0 = genesis_ledger(fluree, ledger_id);

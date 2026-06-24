@@ -14,14 +14,13 @@
 
 #![cfg(feature = "native")]
 
-mod support;
 
+use crate::support::{genesis_ledger, start_background_indexer_local, trigger_index_and_wait};
 use fluree_db_api::{
     ExportCommitsRequest, FlureeBuilder, GovernanceOptions, IndexConfig, LedgerManagerConfig,
     PushCommitsRequest,
 };
 use serde_json::json;
-use support::{genesis_ledger, start_background_indexer_local, trigger_index_and_wait};
 
 /// Regression: rdf:type in graph A is invisible when querying graph B.
 ///

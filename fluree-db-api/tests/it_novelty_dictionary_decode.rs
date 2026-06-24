@@ -6,8 +6,8 @@
 
 #![cfg(feature = "native")]
 
-mod support;
-
+use crate::support;
+use crate::support::{genesis_ledger_for_fluree, query_sparql, start_background_indexer_local};
 use fluree_db_api::{FlureeBuilder, IndexConfig};
 use fluree_db_core::FlakeValue;
 use fluree_db_query::{
@@ -15,7 +15,6 @@ use fluree_db_query::{
 };
 use fluree_db_transact::{CommitOpts, TxnOpts};
 use serde_json::json;
-use support::{genesis_ledger_for_fluree, query_sparql, start_background_indexer_local};
 
 #[tokio::test]
 async fn novelty_only_strings_subjects_predicates_and_json_decode_with_existing_index() {

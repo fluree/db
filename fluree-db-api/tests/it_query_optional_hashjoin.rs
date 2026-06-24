@@ -16,11 +16,9 @@
 //! batched hash-join. The dataset includes a forum (`F3`) whose member has no
 //! qualifying post, validating the left-join no-match (count = 0) path.
 
-mod support;
-
+use crate::support::{genesis_ledger, graphdb_from_ledger};
 use fluree_db_api::FlureeBuilder;
 use serde_json::{json, Value as JsonValue};
-use support::{genesis_ledger, graphdb_from_ledger};
 
 fn ctx() -> JsonValue {
     json!({
