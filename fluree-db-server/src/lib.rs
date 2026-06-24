@@ -487,23 +487,17 @@ impl FlureeServerBuilder {
         // `IndexingNameService`). Keeping a single Arc keeps reads
         // and the index publisher coherent — both observe the same
         // shared state and propose through the same Raft handle.
-        // Per-node HTTP client for `apply_staged_commit` forwarding —
-        // shared with the nameservice so all cross-node propose RPCs
-        // pool over the same connections.
+        // `RaftIntegration` owns the per-node `RaftNameService` (built
+        // in its constructor with the same shared state, staged
+        // receipts, and HTTP client that drive the rest of the
+        // integration). We borrow the same handle here so reads,
+        // publishes, and the inbound `apply_staged_commit` route all
+        // see one consistent picture.
         #[cfg(feature = "raft")]
-        let raft_forwarding_client = reqwest::Client::new();
-
-        #[cfg(feature = "raft")]
-        let raft_nameservice = self.raft.as_ref().map(|(integration, _)| {
-            std::sync::Arc::new(
-                fluree_db_consensus::raft::nameservice::RaftNameService::new(
-                    integration.shared_state.clone(),
-                    std::sync::Arc::clone(&integration.raft),
-                )
-                .with_staged_receipts(std::sync::Arc::clone(&integration.staged_receipts))
-                .with_forwarding(integration.id, raft_forwarding_client.clone()),
-            )
-        });
+        let raft_nameservice = self
+            .raft
+            .as_ref()
+            .map(|(integration, _)| integration.nameservice());
 
         // Build `Fluree` with the right nameservice for the
         // deployment mode. Raft mode wires `RaftNameService` so
@@ -549,16 +543,7 @@ impl FlureeServerBuilder {
             // The actual `RaftListener` is assembled after `state` is
             // Arc-wrapped below so the admin-auth middleware can be
             // layered onto the `/cluster` subtree with `Arc<AppState>`.
-            // Carrying the `RaftNameService` Arc through here too keeps
-            // it alive past the `drop(raft_nameservice)` below, so the
-            // `/raft/apply_staged_commit` route can mount with the
-            // same handle every other consumer holds.
-            let ns_for_router = std::sync::Arc::clone(
-                raft_nameservice
-                    .as_ref()
-                    .expect("raft_nameservice present whenever self.raft is Some"),
-            );
-            (Arc::clone(integration), *listen_addr, ns_for_router)
+            (Arc::clone(integration), *listen_addr)
         });
 
         // Per-node CAS release task. The state-machine adapter pushes
@@ -609,6 +594,24 @@ impl FlureeServerBuilder {
             }
             None => None,
         };
+
+        // Wire the integration's commit/index event bus into Fluree's
+        // ledger cache. Without this, commit events published by the
+        // state-machine adapter (when a follower stages and the
+        // leader applies) never reach Fluree's `LedgerManager`, and
+        // stale cached state persists. Fluree spawns its own internal
+        // listener on its own bus during `build`; that bus stays
+        // dormant in raft mode, so this second listener is what
+        // actually fires.
+        #[cfg(feature = "raft")]
+        if let Some((integration, _)) = self.raft.as_ref() {
+            if let Some(mgr) = state_inner.fluree.ledger_manager() {
+                fluree_db_api::spawn_local_cache_event_listener(
+                    Arc::clone(&integration.event_bus),
+                    Arc::clone(mgr),
+                );
+            }
+        }
 
         // Per-node stager supervisor. Runs on every node (leader and
         // followers alike) because distributed stagers can land
@@ -695,7 +698,7 @@ impl FlureeServerBuilder {
         // `admin_auth` mode (pass-through when `None`); `/raft` peer
         // RPC stays unauthenticated and relies on network trust.
         #[cfg(feature = "raft")]
-        let raft_listener = raft_listener_parts.map(|(integration, listen_addr, ns)| {
+        let raft_listener = raft_listener_parts.map(|(integration, listen_addr)| {
             let cluster_admin =
                 integration
                     .cluster_admin_router()
@@ -703,14 +706,11 @@ impl FlureeServerBuilder {
                         Arc::clone(&state),
                         crate::routes::admin_auth::require_admin_token,
                     ));
-            // Cross-node `apply_staged_commit` lives under the same
-            // `/raft` mount as the openraft RPCs — intra-cluster
+            // `raft_rpc_router` includes the openraft RPCs plus the
+            // cross-node `apply_staged_commit` endpoint — intra-cluster
             // trusted, no auth layer.
-            let raft_routes = integration.raft_rpc_router().merge(
-                fluree_db_consensus::raft::nameservice::apply_staged_commit_router(ns),
-            );
             let private_router = Router::new()
-                .nest("/raft", raft_routes)
+                .nest("/raft", integration.raft_rpc_router())
                 .nest("/cluster", cluster_admin);
             RaftListener {
                 private_router,

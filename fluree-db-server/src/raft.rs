@@ -28,6 +28,7 @@ use fluree_db_consensus::raft::{
     admin as raft_admin,
     forward::LeaderForwarder,
     log_adapter::LogAdapter,
+    nameservice::{apply_staged_commit_router, RaftNameService},
     network::{self as raft_network, HttpRaftNetworkFactory, NetworkConfig},
     staged_receipt::StagedReceiptMap,
     state_machine_adapter::{SharedState, StateMachineAdapter},
@@ -96,6 +97,13 @@ pub struct RaftIntegration {
     /// built with — same `NetworkConfig` instance configures both
     /// sides of every RPC.
     network_config: NetworkConfig,
+    /// `NameService` adapter over the replicated state machine. Owns
+    /// reads of the shared state, all publish-paths (refs, indexes,
+    /// commits), and the cross-node `apply_staged_commit` forwarding
+    /// for follower stagers. Held here so the same handle threads
+    /// through `Fluree`, the stager supervisor, and the inbound
+    /// `apply_staged_commit` HTTP route on `raft_rpc_router`.
+    nameservice: Arc<RaftNameService>,
     /// One-shot slot holding the [`ReleaseReceiver`] half of the
     /// adapter's CAS release channel. Server startup
     /// [`take_release_receiver`](Self::take_release_receiver)s the
@@ -139,7 +147,16 @@ impl RaftIntegration {
             network_config,
             release_rx,
         } = parts;
-        let forwarder = Arc::new(LeaderForwarder::new(Arc::clone(&raft), id, http_client));
+        let forwarder = Arc::new(LeaderForwarder::new(
+            Arc::clone(&raft),
+            id,
+            http_client.clone(),
+        ));
+        let nameservice = Arc::new(
+            RaftNameService::new(shared_state.clone(), Arc::clone(&raft))
+                .with_staged_receipts(Arc::clone(&staged_receipts))
+                .with_forwarding(id, http_client),
+        );
         Self {
             raft,
             id,
@@ -149,6 +166,7 @@ impl RaftIntegration {
             waiter_map,
             staged_receipts,
             network_config,
+            nameservice,
             release_rx: Arc::new(Mutex::new(Some(release_rx))),
         }
     }
@@ -221,8 +239,22 @@ impl RaftIntegration {
     /// inside that boundary. [`Self::cluster_admin_router`] is the
     /// layer that gates membership changes against operator
     /// credentials.
+    ///
+    /// Includes both the openraft RPCs (append-entries, vote,
+    /// install-snapshot) and the cross-node `apply_staged_commit`
+    /// endpoint follower stagers POST to.
     pub fn raft_rpc_router(&self) -> Router {
         raft_network::router(Arc::clone(&self.raft), &self.network_config)
+            .merge(apply_staged_commit_router(Arc::clone(&self.nameservice)))
+    }
+
+    /// Borrow the shared [`RaftNameService`] handle. The integration
+    /// builds one in `new` and threads the same handle through the
+    /// HTTP routes, `Fluree`, and the stager supervisor so reads,
+    /// publishes, and the cross-node propose all observe one map of
+    /// staged receipts.
+    pub fn nameservice(&self) -> Arc<RaftNameService> {
+        Arc::clone(&self.nameservice)
     }
 
     /// Cluster admin router — bootstrap and membership-change
