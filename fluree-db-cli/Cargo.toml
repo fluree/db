@@ -26,6 +26,9 @@ iceberg = ["fluree-db-api/iceberg"]
 aws = ["fluree-db-server/aws"]
 # SHACL constraint validation at transaction time
 shacl = ["fluree-db-api/shacl"]
+# Use mimalloc as the global allocator (better multicore allocation throughput
+# for query/import/materialization paths). Opt-in; enable in release packaging.
+mimalloc = ["dep:mimalloc"]
 otel = [
     "dep:tracing-opentelemetry",
     "dep:opentelemetry",
@@ -34,6 +37,8 @@ otel = [
 ]
 
 [dependencies]
+# Optional global allocator (see the `mimalloc` feature).
+mimalloc = { workspace = true, optional = true }
 fluree-db-api = { path = "../fluree-db-api" }
 # Temp dir for streaming CSV → .jsonl into the bulk import pipeline.
 tempfile = "3"
