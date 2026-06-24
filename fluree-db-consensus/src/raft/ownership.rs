@@ -26,24 +26,23 @@ const RENDEZVOUS_SEED: u64 = 0x6661_6566_5246_4252;
 /// collision across two `NodeId`s and the same `ref_key`) break by
 /// the higher `NodeId` so the result is fully deterministic.
 pub fn owner(ref_key: &RefKey, voters: &[NodeId]) -> Option<NodeId> {
+    let key_digest = key_digest(ref_key);
     voters
         .iter()
         .copied()
-        .map(|node| (rendezvous_score(ref_key, node), node))
+        .map(|node| (rendezvous_score(node, key_digest), node))
         .max_by_key(|&(score, node)| (score, node))
         .map(|(_, node)| node)
 }
 
-fn rendezvous_score(ref_key: &RefKey, node: NodeId) -> u64 {
-    // Compose a stable byte payload from the (ref_key, node) pair
-    // without allocating a Vec — feed each piece into xxh64
-    // sequentially via the seed parameter so the final hash depends
-    // on every byte of input.
-    let mut hash = xxh64(ref_key.ledger_name.as_bytes(), RENDEZVOUS_SEED);
-    hash = xxh64(b":", hash);
-    hash = xxh64(ref_key.branch.as_bytes(), hash);
-    hash = xxh64(&node.to_le_bytes(), hash);
-    hash
+fn key_digest(ref_key: &RefKey) -> u64 {
+    let hash = xxh64(ref_key.ledger_name.as_bytes(), RENDEZVOUS_SEED);
+    let hash = xxh64(b":", hash);
+    xxh64(ref_key.branch.as_bytes(), hash)
+}
+
+fn rendezvous_score(node: NodeId, key_digest: u64) -> u64 {
+    xxh64(&node.to_le_bytes(), key_digest)
 }
 
 #[cfg(test)]

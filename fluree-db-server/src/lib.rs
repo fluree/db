@@ -596,22 +596,19 @@ impl FlureeServerBuilder {
             None => None,
         };
 
-        // Wire the integration's commit/index event bus into Fluree's
-        // ledger cache. Without this, commit events published by the
-        // state-machine adapter (when a follower stages and the
-        // leader applies) never reach Fluree's `LedgerManager`, and
-        // stale cached state persists. Fluree spawns its own internal
-        // listener on its own bus during `build`; that bus stays
-        // dormant in raft mode, so this second listener is what
-        // actually fires.
+        // Subscribe Fluree's `LedgerManager` to the raft integration's
+        // event bus so commit / index applies reconcile cached state
+        // on every node, not just the one that staged the commit.
         #[cfg(feature = "raft")]
-        if let Some((integration, _)) = self.raft.as_ref() {
-            if let Some(mgr) = state_inner.fluree.ledger_manager() {
-                fluree_db_api::spawn_local_cache_event_listener(
-                    Arc::clone(&integration.event_bus),
-                    Arc::clone(mgr),
-                );
-            }
+        if let Some(((integration, _), mgr)) = self
+            .raft
+            .as_ref()
+            .zip(state_inner.fluree.ledger_manager())
+        {
+            fluree_db_api::spawn_local_cache_event_listener(
+                Arc::clone(&integration.event_bus),
+                Arc::clone(mgr),
+            );
         }
 
         // Per-node stager supervisor. Runs on every node (leader and

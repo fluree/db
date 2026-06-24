@@ -337,6 +337,26 @@ impl AdminPublisher for RaftNameService {
     }
 }
 
+/// Peek the queue_id at the front of `ref_key`'s queue; surface an
+/// empty queue as a `publish_commit` error so callers stash-cleanup.
+fn peek_queue_front_id(
+    state: &NameServiceState,
+    ref_key: &RefKey,
+) -> std::result::Result<u64, NameServiceError> {
+    state
+        .queues
+        .get(ref_key)
+        .and_then(|q| q.front())
+        .map(|entry| entry.queue_id)
+        .ok_or_else(|| {
+            NameServiceError::storage(format!(
+                "publish_commit on {}: per-branch queue is empty — \
+                 nothing staged for this branch",
+                ref_key.ledger_id()
+            ))
+        })
+}
+
 /// Build the state-machine command a [`CommitPublisher::publish_commit`]
 /// call translates into.
 ///
@@ -357,17 +377,7 @@ fn build_apply_head_command(
 ) -> std::result::Result<SmCommand, NameServiceError> {
     let (ledger_name, branch) = split_ledger_id(ledger_id)?;
     let ref_key = RefKey::new(&ledger_name, &branch);
-    let queue_id = state
-        .queues
-        .get(&ref_key)
-        .and_then(|q| q.front())
-        .map(|entry| entry.queue_id)
-        .ok_or_else(|| {
-            NameServiceError::storage(format!(
-                "publish_commit on {ledger_id}: per-branch queue is empty — \
-                 nothing staged for this branch"
-            ))
-        })?;
+    let queue_id = peek_queue_front_id(state, &ref_key)?;
     let applied_at_millis = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
@@ -553,9 +563,7 @@ impl RaftNameService {
         let resp = match self.raft.client_write(cmd).await {
             Ok(resp) => resp,
             Err(err) => {
-                if let Some(stash) = &self.staged_receipts {
-                    stash.take(queue_id);
-                }
+                self.drop_staged_receipt(queue_id);
                 return Err(map_propose_error(err));
             }
         };
@@ -565,28 +573,31 @@ impl RaftNameService {
                 Ok(ApplyStagedCommitResponse::Applied { commit_t })
             }
             SmResponse::QueueDesync { .. } => {
-                if let Some(stash) = &self.staged_receipts {
-                    stash.take(queue_id);
-                }
-                let current_front = self.current_front_queue_id(&ref_key).await;
+                self.drop_staged_receipt(queue_id);
                 Ok(ApplyStagedCommitResponse::Stale {
-                    current_front_queue_id: current_front,
+                    current_front_queue_id: self.current_front_queue_id(&ref_key).await,
                 })
             }
             SmResponse::LedgerNotFound { ledger_id } => {
-                if let Some(stash) = &self.staged_receipts {
-                    stash.take(queue_id);
-                }
+                self.drop_staged_receipt(queue_id);
                 Err(ApplyStagedCommitError::LedgerNotFound(ledger_id))
             }
             other => {
-                if let Some(stash) = &self.staged_receipts {
-                    stash.take(queue_id);
-                }
+                self.drop_staged_receipt(queue_id);
                 Err(ApplyStagedCommitError::InvariantViolated(format!(
                     "unexpected Response variant for ApplyHead: {other:?}"
                 )))
             }
+        }
+    }
+
+    /// Discard a stashed receipt when the propose path won't apply
+    /// it — `Stale`, `LedgerNotFound`, propose error, or an
+    /// unreachable response variant. The state-machine adapter
+    /// `take`s on the success path, so this is a no-op there.
+    fn drop_staged_receipt(&self, queue_id: u64) {
+        if let Some(stash) = &self.staged_receipts {
+            stash.take(queue_id);
         }
     }
 
@@ -805,17 +816,7 @@ impl RaftNameService {
 
         let queue_id = {
             let state = self.state.read().await;
-            state
-                .queues
-                .get(&ref_key)
-                .and_then(|q| q.front())
-                .map(|entry| entry.queue_id)
-                .ok_or_else(|| {
-                    NameServiceError::storage(format!(
-                        "publish_commit on {ledger_id}: per-branch queue is empty — \
-                         nothing staged for this branch"
-                    ))
-                })?
+            peek_queue_front_id(&state, &ref_key)?
         };
 
         let receipt = self
@@ -898,20 +899,13 @@ impl RaftNameService {
     /// or the membership entry for the leader is somehow missing.
     async fn lookup_leader_raft_url(&self) -> Option<String> {
         let leader_id = self.raft.current_leader().await?;
-        // Collect into a Vec so the watch::Ref guard drops at the end
-        // of the scope rather than living across the iterator chain.
-        let nodes: Vec<(NodeId, String)> = self
-            .raft
+        self.raft
             .metrics()
             .borrow()
             .membership_config
             .nodes()
-            .map(|(id, node)| (*id, node.raft_addr.clone()))
-            .collect();
-        nodes
-            .into_iter()
-            .find(|(id, _)| *id == leader_id)
-            .map(|(_, addr)| addr)
+            .find(|(id, _)| **id == leader_id)
+            .map(|(_, node)| node.raft_addr.clone())
     }
 }
 
