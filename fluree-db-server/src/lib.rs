@@ -85,7 +85,7 @@ pub struct FlureeServer {
     /// on. Aborted on shutdown so the spawned tasks tear down with
     /// the rest of the server.
     #[cfg(feature = "raft")]
-    raft_leader_watcher: Option<crate::raft::LeaderWatcherHandle>,
+    raft_leader_watcher: Option<crate::raft::CancellableTaskHandle>,
     /// Per-node stager supervisor. Runs on every node (independent
     /// of leadership) and drives per-branch [`Stager`] tasks for
     /// branches this node owns under rendezvous assignment. Shut
@@ -94,7 +94,7 @@ pub struct FlureeServer {
     ///
     /// [`Stager`]: fluree_db_consensus::raft::commit_worker::Stager
     #[cfg(feature = "raft")]
-    raft_stager_supervisor: Option<crate::raft::StagerSupervisorHandle>,
+    raft_stager_supervisor: Option<crate::raft::CancellableTaskHandle>,
     /// Per-node release task that drains the state-machine adapter's
     /// CAS release channel. Runs on every node (not just the leader)
     /// so admin-cleared queue entries and idempotency-evicted

@@ -396,41 +396,37 @@ impl LeaderTracker {
     }
 }
 
-/// Handle returned by [`spawn_leader_watcher`]. Holds the watcher's
-/// `JoinHandle` plus a `CancellationToken` the caller uses to signal
-/// shutdown. Callers should use [`Self::shutdown`] (graceful) on the
-/// normal server-shutdown path so the watcher reaches its leader-
-/// task cleanup; [`Self::abort`] is a defensive last resort that
-/// drops the watcher mid-await and leaks any still-running leader
-/// tasks.
-pub struct LeaderWatcherHandle {
+/// Handle to a cancellable background task: the spawned future
+/// receives a [`CancellationToken`] and is expected to drain its
+/// own work before returning when the token fires. Callers drive
+/// graceful shutdown via [`Self::shutdown`] — cancels the token,
+/// awaits the task. [`Self::abort`] is a test-only escape hatch.
+///
+/// Returned by both [`spawn_leader_watcher`] and
+/// [`spawn_stager_supervisor`]; the handle's contract is the same
+/// for both — only the task body differs.
+pub struct CancellableTaskHandle {
     join: JoinHandle<()>,
     cancel: tokio_util::sync::CancellationToken,
 }
 
-impl LeaderWatcherHandle {
-    /// Cooperatively shut the watcher down. Cancels the watcher's
-    /// internal token so its `select!` loop exits naturally, runs the
-    /// trailing `abort_and_await` over any in-flight leader tasks,
-    /// and awaits the watcher's own `JoinHandle` so the function
-    /// returns only after every leader task this node spawned has
-    /// stopped.
+impl CancellableTaskHandle {
+    /// Cooperatively shut the task down. Cancels the token so the
+    /// task's loop exits naturally and runs whatever drain code its
+    /// body owns, then awaits the `JoinHandle` so the function
+    /// returns only after the task has actually stopped.
     ///
-    /// This is the path the server's shutdown sequence uses. Without
-    /// it (e.g. `JoinHandle::abort` straight on the watcher) the
-    /// watcher's Future is dropped mid-await and its cleanup code
-    /// never runs — leader tasks keep ticking on a runtime that's
-    /// about to disappear.
+    /// Without it (e.g. `JoinHandle::abort` straight on the task)
+    /// the task's Future is dropped mid-await and its cleanup code
+    /// never runs.
     pub async fn shutdown(self) {
         self.cancel.cancel();
-        // The watcher catches the cancel, drains its leader tasks,
-        // and returns. `JoinError` here would mean the watcher
-        // panicked — log via `_` since shutdown has no caller to
-        // surface it to.
+        // `JoinError` here would mean the task panicked — log via
+        // `_` since shutdown has no caller to surface it to.
         let _ = self.join.await;
     }
 
-    /// Hard abort: signal cancellation *and* abort the watcher's
+    /// Hard abort: signal cancellation *and* abort the task's
     /// JoinHandle without awaiting. Test-only escape hatch — leaves
     /// the cleanup invariants to whoever's tearing the runtime down.
     #[cfg(test)]
@@ -438,6 +434,21 @@ impl LeaderWatcherHandle {
         self.cancel.cancel();
         self.join.abort();
     }
+}
+
+/// Spawn a task whose body receives the matching
+/// [`CancellationToken`] for graceful shutdown, returning a handle
+/// that owns the join + cancel pair. Private — public spawn
+/// functions (e.g. [`spawn_leader_watcher`],
+/// [`spawn_stager_supervisor`]) delegate.
+fn spawn_cancellable<F, Fut>(future_fn: F) -> CancellableTaskHandle
+where
+    F: FnOnce(tokio_util::sync::CancellationToken) -> Fut,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let join = tokio::spawn(future_fn(cancel.clone()));
+    CancellableTaskHandle { join, cancel }
 }
 
 /// Spawn a background task that watches `raft.metrics()` and drives
@@ -453,10 +464,8 @@ impl LeaderWatcherHandle {
 /// leader (indexer, commit-queue worker, periodic idempotency
 /// evictor, …) into the returned `Vec`.
 ///
-/// The returned [`LeaderWatcherHandle`] is the watcher itself.
-/// Shutdown should call [`LeaderWatcherHandle::shutdown`] — cancels
-/// the token, lets the watcher reach its cleanup code, and awaits
-/// completion.
+/// Shutdown via [`CancellableTaskHandle::shutdown`] — cancels the
+/// token, lets the watcher reach its cleanup code, awaits.
 ///
 /// `tokio::sync::watch` is a "latest value" channel, so transient
 /// flips that don't cross the leader/not-leader boundary from this
@@ -468,13 +477,11 @@ pub fn spawn_leader_watcher<F>(
     raft: Arc<Raft<TypeConfig>>,
     id: NodeId,
     spawn_leader_tasks: F,
-) -> LeaderWatcherHandle
+) -> CancellableTaskHandle
 where
     F: Fn() -> Vec<JoinHandle<()>> + Send + 'static,
 {
-    let cancel = tokio_util::sync::CancellationToken::new();
-    let cancel_inner = cancel.clone();
-    let join = tokio::spawn(async move {
+    spawn_cancellable(move |cancel| async move {
         let mut metrics = raft.metrics();
         let mut tracker = LeaderTracker::default();
         let mut current_tasks: Vec<JoinHandle<()>> = Vec::new();
@@ -500,7 +507,7 @@ where
                         break;
                     }
                 }
-                () = cancel_inner.cancelled() => {
+                () = cancel.cancelled() => {
                     break;
                 }
             }
@@ -510,39 +517,7 @@ where
         // Awaiting here is what guarantees `shutdown()` returns only
         // after every leader task has actually stopped.
         abort_and_await(std::mem::take(&mut current_tasks)).await;
-    });
-    LeaderWatcherHandle { join, cancel }
-}
-
-/// Handle returned by [`spawn_stager_supervisor`]. Same shape as
-/// [`LeaderWatcherHandle`]: a cancellation token to drive graceful
-/// shutdown and the supervisor task's `JoinHandle` to await. The
-/// supervisor itself drains every per-branch stager before its loop
-/// returns, so awaiting [`Self::shutdown`] is sufficient to confirm
-/// the whole stager fleet has stopped.
-pub struct StagerSupervisorHandle {
-    join: JoinHandle<()>,
-    cancel: tokio_util::sync::CancellationToken,
-}
-
-impl StagerSupervisorHandle {
-    /// Cooperatively shut the supervisor down. Cancels its token so
-    /// the `select!` loop exits, lets it abort every still-running
-    /// stager, then awaits the supervisor task itself. Returns only
-    /// after the whole stager fleet on this node has stopped.
-    pub async fn shutdown(self) {
-        self.cancel.cancel();
-        let _ = self.join.await;
-    }
-
-    /// Hard abort: signal cancellation *and* abort the supervisor's
-    /// JoinHandle without awaiting. Test-only escape hatch — leaves
-    /// the cleanup invariants to whoever's tearing the runtime down.
-    #[cfg(test)]
-    pub fn abort(self) {
-        self.cancel.cancel();
-        self.join.abort();
-    }
+    })
 }
 
 /// Spawn the per-node stager supervisor as a long-running background
@@ -550,17 +525,11 @@ impl StagerSupervisorHandle {
 /// supervisor runs on every node (leader and followers alike) because
 /// distributed stagers can land anywhere under rendezvous assignment.
 ///
-/// Returns a [`StagerSupervisorHandle`] the caller drives at server
-/// shutdown via [`StagerSupervisorHandle::shutdown`].
+/// Shutdown via [`CancellableTaskHandle::shutdown`].
 pub fn spawn_stager_supervisor(
     supervisor: fluree_db_consensus::raft::commit_worker::StagerSupervisor,
-) -> StagerSupervisorHandle {
-    let cancel = tokio_util::sync::CancellationToken::new();
-    let cancel_inner = cancel.clone();
-    let join = tokio::spawn(async move {
-        supervisor.run(cancel_inner).await;
-    });
-    StagerSupervisorHandle { join, cancel }
+) -> CancellableTaskHandle {
+    spawn_cancellable(|cancel| async move { supervisor.run(cancel).await })
 }
 
 /// Abort every handle and wait for the joins to resolve. `abort` is
