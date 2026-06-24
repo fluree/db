@@ -24,10 +24,12 @@
 //! - Subject-bound patterns (`ex:subject ex:name ?o`) are not optimized
 //! - Filter patterns are preserved and applied post-R2RML scan
 
+use crate::ir::adapters::ScanPushdown;
 use crate::ir::triple::{Ref, Term, TriplePattern};
-use crate::ir::{Pattern, R2rmlPattern};
+use crate::ir::{Expression, Function, Pattern, R2rmlPattern};
+use crate::r2rml::{ScanCmpOp, ScanValue};
 use crate::var_registry::VarId;
-use fluree_db_core::LedgerSnapshot;
+use fluree_db_core::{FlakeValue, LedgerSnapshot};
 use std::collections::HashSet;
 
 /// Result of rewriting patterns for R2RML.
@@ -165,10 +167,105 @@ pub fn rewrite_patterns_for_r2rml(
         result_patterns.push(Pattern::R2rml(base));
     }
 
+    // Attach pushable FILTER comparisons to the R2RML pattern that produces
+    // each compared variable, for Iceberg file pruning. The FILTER pattern is
+    // left in place (residual), so this only ever skips data files.
+    let mut pushdowns: Vec<(VarId, ScanCmpOp, ScanValue)> = Vec::new();
+    for p in &result_patterns {
+        if let Pattern::Filter(expr) = p {
+            collect_pushdowns(expr, &mut pushdowns);
+        }
+    }
+    if !pushdowns.is_empty() {
+        for p in &mut result_patterns {
+            if let Pattern::R2rml(rp) = p {
+                let produced = rp.produced_vars();
+                for (var, op, value) in &pushdowns {
+                    // Only object-position vars map to columns (the subject is an
+                    // IRI template, not a scannable column).
+                    if *var != rp.subject_var && produced.contains(var) {
+                        rp.scan_filters.push(ScanPushdown {
+                            var: *var,
+                            op: *op,
+                            value: value.clone(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
     R2rmlRewriteResult {
         patterns: result_patterns,
         converted_count: converted,
         unconverted_count: unconverted,
+    }
+}
+
+/// Collect conjunctive `?var <op> const` comparisons that prune safely against
+/// Iceberg column min/max bounds (date/int/bool only). `!=` and non-prunable
+/// literal types are skipped — they stay with the in-engine FILTER.
+fn collect_pushdowns(expr: &Expression, out: &mut Vec<(VarId, ScanCmpOp, ScanValue)>) {
+    let Expression::Call { func, args } = expr else {
+        return;
+    };
+    if matches!(func, Function::And) {
+        for a in args {
+            collect_pushdowns(a, out);
+        }
+        return;
+    }
+    if args.len() != 2 {
+        return;
+    }
+    // Normalize to (var, op, const), reversing the operator if the constant is
+    // on the left.
+    let (var, value, reversed) = match (&args[0], &args[1]) {
+        (Expression::Var(v), Expression::Const(c)) => (*v, c, false),
+        (Expression::Const(c), Expression::Var(v)) => (*v, c, true),
+        _ => return,
+    };
+    let Some(op) = cmp_op(func, reversed) else {
+        return;
+    };
+    if let Some(sv) = to_scan_value(value) {
+        out.push((var, op, sv));
+    }
+}
+
+/// Map a comparison `Function` to a pushable `ScanCmpOp`, reversing operand
+/// order when the constant was on the left. Returns None for non-prunable ops.
+fn cmp_op(func: &Function, reversed: bool) -> Option<ScanCmpOp> {
+    let op = match func {
+        Function::Eq => ScanCmpOp::Eq,
+        Function::Lt => ScanCmpOp::Lt,
+        Function::Le => ScanCmpOp::LtEq,
+        Function::Gt => ScanCmpOp::Gt,
+        Function::Ge => ScanCmpOp::GtEq,
+        // `!=` cannot prune via min/max bounds; leave it to the FILTER.
+        _ => return None,
+    };
+    Some(if reversed {
+        match op {
+            ScanCmpOp::Lt => ScanCmpOp::Gt,
+            ScanCmpOp::LtEq => ScanCmpOp::GtEq,
+            ScanCmpOp::Gt => ScanCmpOp::Lt,
+            ScanCmpOp::GtEq => ScanCmpOp::LtEq,
+            other => other, // Eq is symmetric
+        }
+    } else {
+        op
+    })
+}
+
+/// Convert a constant literal to a prunable `ScanValue`. Only date, integer and
+/// boolean are pushed; everything else stays with the in-engine FILTER.
+fn to_scan_value(value: &FlakeValue) -> Option<ScanValue> {
+    match value {
+        FlakeValue::Long(n) => Some(ScanValue::Int(*n)),
+        FlakeValue::Boolean(b) => Some(ScanValue::Bool(*b)),
+        FlakeValue::Date(d) => Some(ScanValue::Date(d.days_since_epoch())),
+        _ => None,
     }
 }
 

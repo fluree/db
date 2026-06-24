@@ -12,6 +12,43 @@ use std::sync::Arc;
 // Re-export from fluree-db-r2rml for convenience
 pub use fluree_db_r2rml::mapping::CompiledR2rmlMapping;
 
+/// Comparison operator for a pushed-down scan filter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScanCmpOp {
+    Eq,
+    NotEq,
+    Lt,
+    LtEq,
+    Gt,
+    GtEq,
+}
+
+/// A literal value for a pushed-down scan filter.
+///
+/// Intentionally limited to the types that prune safely against Iceberg column
+/// min/max bounds in the MVP (date partition pruning is the target). Decimal /
+/// float / string predicates are left to the in-engine FILTER.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ScanValue {
+    Bool(bool),
+    Int(i64),
+    /// Days since 1970-01-01 (matches Iceberg date storage).
+    Date(i32),
+}
+
+/// A predicate pushed down to the Iceberg scan for file pruning.
+///
+/// Resolved to a concrete table column (the R2RML operator maps the query
+/// variable → predicate IRI → column). The provider turns this into an Iceberg
+/// `Expression` for conservative file-level min/max pruning; the in-engine
+/// FILTER still runs, so a missed push is only a perf loss, never wrong results.
+#[derive(Debug, Clone)]
+pub struct ScanFilter {
+    pub column: String,
+    pub op: ScanCmpOp,
+    pub value: ScanValue,
+}
+
 /// Provider for compiled R2RML mappings.
 ///
 /// This trait is used by the R2RML operator to load mappings at query time.
@@ -88,11 +125,15 @@ pub trait R2rmlTableProvider: Debug + Send + Sync {
     ///
     /// An iterator/stream of column batches. The exact streaming mechanism
     /// depends on the implementation.
+    /// `filters` are conservative pushdown predicates (resolved to columns) for
+    /// Iceberg file pruning. Implementations may ignore them (correctness is
+    /// preserved by the in-engine FILTER) but honoring them skips data files.
     async fn scan_table(
         &self,
         graph_source_id: &str,
         table_name: &str,
         projection: &[String],
+        filters: &[ScanFilter],
         as_of_t: Option<i64>,
     ) -> Result<Vec<ColumnBatch>>;
 }
@@ -142,6 +183,7 @@ impl R2rmlTableProvider for NoOpR2rmlProvider {
         graph_source_id: &str,
         _table_name: &str,
         _projection: &[String],
+        _filters: &[ScanFilter],
         _as_of_t: Option<i64>,
     ) -> Result<Vec<ColumnBatch>> {
         Err(crate::error::QueryError::Internal(format!(

@@ -15,15 +15,60 @@ use fluree_db_iceberg::{
     catalog::{RestCatalogClient, RestCatalogConfig, SendCatalogClient},
     io::{ColumnBatch, S3IcebergStorage, SendIcebergStorage, SendParquetReader},
     metadata::TableMetadata,
-    scan::{FileScanTask, ScanConfig, SendScanPlanner},
+    scan::{ComparisonOp, Expression, FileScanTask, LiteralValue, ScanConfig, SendScanPlanner},
     IcebergGsConfig,
 };
 use fluree_db_nameservice::GraphSourceType;
 use fluree_db_query::error::{QueryError, Result as QueryResult};
-use fluree_db_query::r2rml::{R2rmlProvider, R2rmlTableProvider};
+use fluree_db_query::r2rml::{R2rmlProvider, R2rmlTableProvider, ScanCmpOp, ScanFilter, ScanValue};
 use fluree_db_r2rml::mapping::CompiledR2rmlMapping;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
+
+/// Translate resolved scan filters into an Iceberg pushdown `Expression` for
+/// file pruning. Filters on unknown columns are skipped; an empty result is
+/// `None`. Conservative — pruning never drops matching rows because the
+/// in-engine FILTER still runs.
+fn build_iceberg_filter(
+    filters: &[ScanFilter],
+    schema: &fluree_db_iceberg::metadata::Schema,
+) -> Option<Expression> {
+    let mut comparisons = Vec::new();
+    for f in filters {
+        let Some(field) = schema.field_by_name(&f.column) else {
+            continue;
+        };
+        let op = match f.op {
+            ScanCmpOp::Eq => ComparisonOp::Eq,
+            ScanCmpOp::NotEq => ComparisonOp::NotEq,
+            ScanCmpOp::Lt => ComparisonOp::Lt,
+            ScanCmpOp::LtEq => ComparisonOp::LtEq,
+            ScanCmpOp::Gt => ComparisonOp::Gt,
+            ScanCmpOp::GtEq => ComparisonOp::GtEq,
+        };
+        let value = match &f.value {
+            ScanValue::Bool(b) => LiteralValue::Boolean(*b),
+            ScanValue::Date(d) => LiteralValue::Date(*d),
+            // Iceberg `int` is 32-bit, `long` 64-bit; a type mismatch just fails
+            // to compare and prunes nothing (safe).
+            ScanValue::Int(n) => match field.type_string() {
+                Some("int") => LiteralValue::Int32(*n as i32),
+                _ => LiteralValue::Int64(*n),
+            },
+        };
+        comparisons.push(Expression::Comparison {
+            field_id: field.id,
+            column: f.column.clone(),
+            op,
+            value,
+        });
+    }
+    match comparisons.len() {
+        0 => None,
+        1 => comparisons.into_iter().next(),
+        _ => Some(Expression::And(comparisons)),
+    }
+}
 
 // =============================================================================
 // Iceberg/R2RML Graph Source Creation
@@ -492,6 +537,7 @@ impl R2rmlTableProvider for FlureeR2rmlProvider<'_> {
         graph_source_id: &str,
         table_name: &str,
         projection: &[String],
+        filters: &[ScanFilter],
         _as_of_t: Option<i64>,
     ) -> QueryResult<Vec<ColumnBatch>> {
         // Look up the graph source record to get Iceberg connection info
@@ -749,10 +795,32 @@ impl R2rmlTableProvider for FlureeR2rmlProvider<'_> {
 
         let schema_arc = Arc::new(schema.clone());
 
+        // Build an Iceberg pushdown predicate for file pruning. Filters resolve
+        // to fields by name; unknown fields are skipped (conservative).
+        let filter_expr = build_iceberg_filter(filters, schema);
+
         // Reuse manifest-derived file selections across repeated scans of the
         // same snapshot. Projection still varies per scan, so we rebuild tasks.
+        // The scan-files cache is keyed only by metadata location, so it is
+        // bypassed when a pushdown filter is present (different filter → a
+        // different pruned file set).
         let (tasks, files_selected, files_pruned, estimated_row_count) =
-            if let Some(cached) = cache.get_scan_files(metadata_location).await {
+            if let Some(filter) = &filter_expr {
+                let scan_config = ScanConfig::new()
+                    .with_projection(projected_field_ids.clone())
+                    .with_filter(filter.clone());
+                let planner = SendScanPlanner::new(storage.as_ref(), &metadata, scan_config);
+                let plan = planner
+                    .plan_scan()
+                    .await
+                    .map_err(|e| QueryError::Internal(format!("Failed to plan scan: {e}")))?;
+                (
+                    plan.tasks,
+                    plan.files_selected,
+                    plan.files_pruned,
+                    plan.estimated_row_count,
+                )
+            } else if let Some(cached) = cache.get_scan_files(metadata_location).await {
                 debug!(
                     metadata_location = %metadata_location,
                     cached_files = cached.data_files.len(),

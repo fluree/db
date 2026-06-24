@@ -135,6 +135,44 @@ impl R2rmlScanOperator {
         preds
     }
 
+    /// Resolve this pattern's pushdown predicates (keyed by query variable) to
+    /// table columns for the given TriplesMap, producing scan filters. A
+    /// variable maps to a column via its predicate IRI; predicates backed by a
+    /// RefObjectMap (an IRI join, not a scalar column) are skipped.
+    fn build_scan_filters(&self, triples_map: &TriplesMap) -> Vec<crate::r2rml::ScanFilter> {
+        let mut out = Vec::new();
+        for pd in &self.pattern.scan_filters {
+            let pred_iri = if Some(pd.var) == self.pattern.object_var {
+                self.pattern.predicate_filter.as_deref()
+            } else {
+                self.pattern
+                    .star_bindings
+                    .iter()
+                    .find(|(_, v)| *v == pd.var)
+                    .map(|(p, _)| p.as_str())
+            };
+            let Some(pred_iri) = pred_iri else { continue };
+            let Some(pom) = triples_map
+                .predicate_object_maps
+                .iter()
+                .find(|p| p.predicate_map.as_constant() == Some(pred_iri))
+            else {
+                continue;
+            };
+            if matches!(pom.object_map, ObjectMap::RefObjectMap(_)) {
+                continue;
+            }
+            if let Some(col) = pom.object_map.referenced_columns().first() {
+                out.push(crate::r2rml::ScanFilter {
+                    column: (*col).to_string(),
+                    op: pd.op,
+                    value: pd.value.clone(),
+                });
+            }
+        }
+        out
+    }
+
     /// Materialize the object term for one POM at a table row, resolving a
     /// RefObjectMap through the pre-built parent lookup. Returns None when the
     /// value is null or the foreign key is orphaned.
@@ -609,7 +647,9 @@ impl Operator for R2rmlScanOperator {
                     cols
                 };
 
-                // Scan the table
+                // Scan the table, pushing resolved FILTER predicates for file
+                // pruning (column resolution needs the mapping, so it happens here).
+                let scan_filters = self.build_scan_filters(triples_map);
                 let as_of_t = if ctx.dataset.is_some() {
                     None
                 } else {
@@ -620,6 +660,7 @@ impl Operator for R2rmlScanOperator {
                         &self.pattern.graph_source_id,
                         table_name,
                         &projection,
+                        &scan_filters,
                         as_of_t,
                     )
                     .await?;
@@ -714,6 +755,7 @@ impl Operator for R2rmlScanOperator {
                                 &self.pattern.graph_source_id,
                                 parent_table,
                                 &parent_projection,
+                                &[],
                                 as_of_t,
                             )
                             .await?;

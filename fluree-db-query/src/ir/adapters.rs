@@ -580,6 +580,15 @@ impl S2SearchPattern {
 /// With an R2RML mapping, this could be lowered to:
 /// - R2rmlPattern with subject_var=?person, triples_map for ex:Person class
 /// - R2rmlPattern with subject_var=?person, object_var=?name, predicate ex:name
+/// A FILTER comparison on an R2RML object variable, ready to push to the scan.
+/// `var` is resolved to a table column by the operator (var → predicate → column).
+#[derive(Debug, Clone)]
+pub struct ScanPushdown {
+    pub var: VarId,
+    pub op: crate::r2rml::ScanCmpOp,
+    pub value: crate::r2rml::ScanValue,
+}
+
 #[derive(Debug, Clone)]
 pub struct R2rmlPattern {
     /// Graph source alias (e.g., "airlines-r2rml:main")
@@ -609,6 +618,11 @@ pub struct R2rmlPattern {
     /// Limits scan to TriplesMap(s) that produce this rdf:type.
     pub class_filter: Option<String>,
 
+    /// Pushed-down scan filters for Iceberg file pruning, resolved at execution
+    /// from FILTER comparisons on this pattern's object variables. Conservative:
+    /// the in-engine FILTER still runs, so these only skip data files.
+    pub scan_filters: Vec<ScanPushdown>,
+
     /// Same-subject star: additional `(predicate IRI, object var)` bindings to
     /// materialize in the SAME table scan, avoiding a self-join on the subject.
     ///
@@ -636,6 +650,7 @@ impl R2rmlPattern {
             predicate_filter: None,
             class_filter: None,
             star_bindings: Vec::new(),
+            scan_filters: Vec::new(),
         }
     }
 
