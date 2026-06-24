@@ -1,6 +1,5 @@
 #![cfg(feature = "native")]
 
-
 use crate::support::{
     genesis_ledger, start_background_indexer_local, trigger_index_and_wait, MemoryFluree,
 };

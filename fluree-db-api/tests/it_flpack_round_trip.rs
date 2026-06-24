@@ -9,7 +9,6 @@
 
 #![cfg(feature = "native")]
 
-
 use fluree_db_api::pack::{compute_missing_commits, compute_missing_index_artifacts};
 use fluree_db_api::FlureeBuilder;
 use fluree_db_core::commit::codec::envelope::decode_envelope;

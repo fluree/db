@@ -7,7 +7,6 @@
 
 #![cfg(feature = "native")]
 
-
 use crate::support::start_background_indexer_local;
 use fluree_db_api::{DropMode, DropStatus, FlureeBuilder, IndexConfig, LedgerState, Novelty};
 use fluree_db_core::address_path::ledger_id_to_path_prefix;

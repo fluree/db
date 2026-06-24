@@ -14,7 +14,6 @@
 
 #![cfg(feature = "native")]
 
-
 use crate::support::{genesis_ledger, start_background_indexer_local, trigger_index_and_wait};
 use fluree_db_api::{
     ExportCommitsRequest, FlureeBuilder, GovernanceOptions, IndexConfig, LedgerManagerConfig,

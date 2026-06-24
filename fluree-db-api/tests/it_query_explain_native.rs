@@ -3,7 +3,6 @@
 
 #![cfg(feature = "native")]
 
-
 use crate::support::{graphdb_from_ledger, start_background_indexer_local};
 use fluree_db_api::{
     tx::IndexingMode, CommitOpts, FlureeBuilder, IndexConfig, LedgerState, Novelty,

@@ -10,7 +10,6 @@
 
 #![cfg(feature = "native")]
 
-
 use crate::support::{
     assert_index_defaults, genesis_ledger_for_fluree, start_background_indexer_local,
     trigger_index_and_wait_outcome,

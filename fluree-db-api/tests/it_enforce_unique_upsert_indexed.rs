@@ -9,7 +9,6 @@
 
 #![cfg(feature = "native")]
 
-
 use crate::support::{
     query_jsonld_formatted, query_sparql, start_background_indexer_local,
     trigger_index_and_wait_outcome,

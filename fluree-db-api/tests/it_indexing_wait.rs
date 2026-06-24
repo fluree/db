@@ -13,7 +13,6 @@
 
 #![cfg(feature = "native")]
 
-
 use crate::support::start_background_indexer_local;
 use fluree_db_api::{FlureeBuilder, IndexConfig};
 use fluree_db_core::{load_ledger_snapshot, LedgerSnapshot};
