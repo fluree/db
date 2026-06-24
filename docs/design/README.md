@@ -52,6 +52,10 @@ How a single **model ledger** can hold the ontology, SHACL shapes, policy rules,
 
 Storage trait architecture: `StorageRead`, `StorageWrite`, `ContentAddressedWrite`, `Storage`, and `NameService` trait design with guidance for implementing new backends.
 
+### [Raft command queue and replicated state machine](raft-command-queue.md)
+
+How `fluree-db-consensus` replicates writes across a cluster: the queue → stage → apply flow, log entry types, snapshot model, and the rationale behind splitting "decisions" (in the Raft log) from "bytes" (in the shared content-addressed store). Operator-facing recipe lives in [Raft clusters (replicated writes)](../operations/raft-clusters.md).
+
 ## Related Documentation
 
 - [Crate Map](../reference/crate-map.md) - Workspace architecture
