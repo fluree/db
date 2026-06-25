@@ -1222,28 +1222,7 @@ pub fn spawn_local_cache_event_listener(
                         ..
                     },
                 ) => {
-                    match ledger_manager
-                        .notify(NsNotify {
-                            ledger_id: ledger_id.clone(),
-                            record: None,
-                        })
-                        .await
-                    {
-                        Ok(result) => {
-                            tracing::debug!(
-                                alias = %ledger_id,
-                                ?result,
-                                "local cache event listener reconciled ledger"
-                            );
-                        }
-                        Err(error) => {
-                            tracing::warn!(
-                                alias = %ledger_id,
-                                error = %error,
-                                "local cache event listener failed to reconcile ledger"
-                            );
-                        }
-                    }
+                    reconcile_cached_ledger(&ledger_manager, &ledger_id).await;
                 }
                 Ok(fluree_db_nameservice::NameServiceEvent::LedgerRetracted { ledger_id }) => {
                     ledger_manager.disconnect(&ledger_id).await;
@@ -1254,10 +1233,22 @@ pub fn spawn_local_cache_event_listener(
                 }
                 Ok(_) => {}
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                    // The channel overflowed and dropped events. With
+                    // commit publishes on the bus this is the only
+                    // notice some ledger gets, so a bare log would leave
+                    // its cache stale until the next event happens to
+                    // land. Fall back to a catch-up sweep: re-reconcile
+                    // every currently-loaded ledger against the
+                    // nameservice head (a no-op for any already current).
+                    let aliases = ledger_manager.cached_aliases().await;
                     tracing::warn!(
                         skipped,
-                        "local cache event listener lagged behind nameservice events"
+                        ledgers = aliases.len(),
+                        "local cache event listener lagged; sweeping loaded ledgers"
                     );
+                    for alias in aliases {
+                        reconcile_cached_ledger(&ledger_manager, &alias).await;
+                    }
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                     tracing::debug!("local cache event listener stopped");
@@ -1266,6 +1257,34 @@ pub fn spawn_local_cache_event_listener(
             }
         }
     });
+}
+
+/// Reconcile one cached ledger against the current nameservice head.
+/// A no-op when the cache is already current or the ledger isn't
+/// loaded. Shared by the per-event path and the lag catch-up sweep.
+async fn reconcile_cached_ledger(ledger_manager: &LedgerManager, ledger_id: &str) {
+    match ledger_manager
+        .notify(NsNotify {
+            ledger_id: ledger_id.to_string(),
+            record: None,
+        })
+        .await
+    {
+        Ok(result) => {
+            tracing::debug!(
+                alias = %ledger_id,
+                ?result,
+                "local cache event listener reconciled ledger"
+            );
+        }
+        Err(error) => {
+            tracing::warn!(
+                alias = %ledger_id,
+                error = %error,
+                "local cache event listener failed to reconcile ledger"
+            );
+        }
+    }
 }
 
 impl FlureeBuilder {
