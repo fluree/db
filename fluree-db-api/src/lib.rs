@@ -1210,8 +1210,7 @@ pub fn spawn_local_cache_event_listener(
                         ..
                     }
                     | fluree_db_nameservice::NameServiceEvent::LedgerIndexPublished {
-                        ledger_id,
-                        ..
+                        ledger_id, ..
                     },
                 ) => {
                     match ledger_manager
