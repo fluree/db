@@ -105,12 +105,21 @@ pub struct RaftNameService {
 
 /// Per-node forwarding configuration for [`RaftNameService`]. Held as
 /// a unit so callers can't partially configure (e.g. set `id` but
-/// forget `http_client`) — both are needed for any forwarding to
-/// happen.
+/// forget `http_client`) — all three are needed for any forwarding
+/// to happen.
 #[derive(Clone)]
 struct ForwardingConfig {
     id: NodeId,
     http_client: reqwest::Client,
+    /// Per-request timeout for the `apply_staged_commit` /
+    /// `apply_queue_poison` POSTs. The shared `http_client` carries
+    /// a `connect_timeout` for dead-peer detection but no request
+    /// timeout — without an explicit cap here, a connected-but-
+    /// stalled leader hangs the stager on `send().await`
+    /// indefinitely instead of falling through to the outer
+    /// backoff/retry path. Sourced from
+    /// [`NetworkConfig::cross_node_propose_timeout`] at construction.
+    request_timeout: std::time::Duration,
 }
 
 impl RaftNameService {
@@ -133,13 +142,28 @@ impl RaftNameService {
         self
     }
 
-    /// Enable cross-node `apply_staged_commit` forwarding from
-    /// follower nodes. With this set, [`Self::publish_commit`] on a
-    /// non-leader node POSTs to the current leader's
-    /// `apply_staged_commit` endpoint instead of attempting a local
-    /// propose; without it, the previous leader-only contract holds.
-    pub fn with_forwarding(mut self, id: NodeId, http_client: reqwest::Client) -> Self {
-        self.forwarding = Some(ForwardingConfig { id, http_client });
+    /// Enable cross-node `apply_staged_commit` / `apply_queue_poison`
+    /// forwarding from follower nodes. With this set,
+    /// [`Self::publish_commit`] and
+    /// [`Self::poison_queue_entry`](QueuePoisonPublisher::poison_queue_entry)
+    /// on a non-leader node POST to the current leader's matching
+    /// endpoint instead of attempting a local propose; without it,
+    /// the previous leader-only contract holds.
+    ///
+    /// `request_timeout` is the per-request cap on those POSTs —
+    /// typically threaded through from
+    /// [`NetworkConfig::cross_node_propose_timeout`](crate::raft::network::NetworkConfig::cross_node_propose_timeout).
+    pub fn with_forwarding(
+        mut self,
+        id: NodeId,
+        http_client: reqwest::Client,
+        request_timeout: std::time::Duration,
+    ) -> Self {
+        self.forwarding = Some(ForwardingConfig {
+            id,
+            http_client,
+            request_timeout,
+        });
         self
     }
 }
@@ -994,6 +1018,7 @@ impl RaftNameService {
             .post(&target)
             .header(reqwest::header::CONTENT_TYPE, POSTCARD_MIME)
             .body(body)
+            .timeout(forwarding.request_timeout)
             .send()
             .await
             .map_err(|e| {
@@ -1081,6 +1106,7 @@ impl RaftNameService {
             .post(&target)
             .header(reqwest::header::CONTENT_TYPE, POSTCARD_MIME)
             .body(body)
+            .timeout(forwarding.request_timeout)
             .send()
             .await
             .map_err(|e| QueuePoisonError::Transport(e.to_string()))?;

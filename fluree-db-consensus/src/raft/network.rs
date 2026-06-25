@@ -69,6 +69,14 @@ pub struct NetworkConfig {
     /// Per-request timeout for install-snapshot. Snapshots can be
     /// large; size this larger than `rpc_timeout`.
     pub snapshot_timeout: Duration,
+    /// Per-request timeout for the stager-initiated cross-node
+    /// `apply_staged_commit` / `apply_queue_poison` forwards.
+    /// Larger than [`Self::rpc_timeout`] because the leader has to
+    /// commit + apply the proposed entry before responding (openraft's
+    /// own RPCs return as soon as the entry is durably accepted),
+    /// but bounded so a fully-stalled leader is detected before the
+    /// stager loop times out a user's submission.
+    pub cross_node_propose_timeout: Duration,
     /// HTTP connect timeout. Independent of the request timeout so a
     /// dead peer fails fast rather than blocking the replication tick.
     pub connect_timeout: Duration,
@@ -98,6 +106,7 @@ impl Default for NetworkConfig {
         Self {
             rpc_timeout: Duration::from_millis(500),
             snapshot_timeout: Duration::from_secs(30),
+            cross_node_propose_timeout: Duration::from_secs(10),
             connect_timeout: Duration::from_millis(250),
             vote_max_body_bytes: 1024 * 1024,
             append_entries_max_body_bytes: 64 * 1024 * 1024,

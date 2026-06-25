@@ -155,7 +155,7 @@ impl RaftIntegration {
         let nameservice = Arc::new(
             RaftNameService::new(shared_state.clone(), Arc::clone(&raft))
                 .with_staged_receipts(Arc::clone(&staged_receipts))
-                .with_forwarding(id, http_client),
+                .with_forwarding(id, http_client, network_config.cross_node_propose_timeout),
         );
         Self {
             raft,
