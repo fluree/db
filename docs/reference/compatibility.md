@@ -83,6 +83,8 @@ Supported SPARQL features:
 
 **Aggregate result types:** COUNT and SUM of integers return `xsd:integer` (per W3C spec), not `xsd:long`. SUM of mixed types and AVG return `xsd:double`.
 
+**Empty-group aggregates:** Over an implicit single group (no `GROUP BY`) whose pattern matches nothing, `COUNT`, `SUM`, and `AVG` return their identity `"0"^^xsd:integer` (SPARQL 1.1 §18.5.1); `MIN`, `MAX`, and `SAMPLE` have no identity element and return unbound. A query *with* `GROUP BY` over an empty pattern returns zero rows.
+
 **W3C Compliance Testing:** Fluree runs the official W3C SPARQL test suite via the `testsuite-sparql` crate. The suite automatically discovers and runs 700+ test cases from W3C manifest files. See the [compliance test guide](../contributing/sparql-compliance.md) for details.
 
 **Specification:** https://www.w3.org/TR/sparql11-query/

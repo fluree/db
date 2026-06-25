@@ -1255,6 +1255,46 @@ async fn sparql_subquery_limit_scopes_outer_join() {
 }
 
 #[tokio::test]
+async fn sparql_empty_group_sum_avg_return_zero() {
+    // SPARQL 1.1 §18.5.1.3 / §18.5.1.4 (W3C agg-avg-03, agg-empty-group-count-2):
+    // over an implicit single group (no GROUP BY) whose pattern matches nothing,
+    // COUNT/SUM/AVG return their identity `"0"^^xsd:integer` in one row. (MIN/MAX/
+    // SAMPLE have no identity and stay unbound — not asserted here.)
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = genesis_ledger(&fluree, "emptyagg:main");
+
+    for (agg, var) in [("COUNT", "count"), ("SUM", "sum"), ("AVG", "avg")] {
+        let query = format!(
+            "PREFIX ex: <http://example.org/> \
+             SELECT ({agg}(?o) AS ?{var}) WHERE {{ ?s ex:nonexistent ?o }}"
+        );
+        let result = support::query_sparql(&fluree, &ledger, &query)
+            .await
+            .unwrap();
+        let sparql_json = result
+            .to_sparql_json(&ledger.snapshot)
+            .expect("to_sparql_json");
+        let bindings = sparql_json["results"]["bindings"]
+            .as_array()
+            .expect("bindings array");
+        assert_eq!(
+            bindings.len(),
+            1,
+            "{agg}: expected one row, got {sparql_json}"
+        );
+        assert_eq!(
+            bindings[0][var]["value"], "0",
+            "{agg} over an empty group must be 0, got {sparql_json}"
+        );
+        assert_eq!(
+            bindings[0][var]["datatype"], "http://www.w3.org/2001/XMLSchema#integer",
+            "{agg} empty-group identity must be xsd:integer, got {sparql_json}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn sparql_subquery_limit_w3c_sq11_blank_node_form() {
     // W3C subquery/sq11 verbatim: a blank-node property-list object
     // (`?O :hasItem [ rdfs:label ?L ]`) joined to a `SELECT DISTINCT ?O … LIMIT 2`
@@ -1589,9 +1629,10 @@ async fn sparql_subquery_group_concat_sum_respects_inner_offset() {
         .to_jsonld(&ledger.snapshot)
         .expect("to_jsonld");
     // With the guard, the fast path declines and the generic pipeline honors the
-    // OFFSET: the subquery is empty, so SUM has nothing to add (unbound). Without
-    // the guard this would wrongly equal the all-groups sum (15).
-    assert_eq!(offset_rows, json!([[null]]));
+    // OFFSET: the subquery is empty, so SUM is its empty-multiset identity 0
+    // (SPARQL 1.1 §18.5.1.3). Without the guard this would wrongly equal the
+    // all-groups sum (15).
+    assert_eq!(offset_rows, json!([[0]]));
 }
 
 #[tokio::test]
