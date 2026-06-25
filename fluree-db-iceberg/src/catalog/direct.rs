@@ -217,14 +217,23 @@ impl<S: SendIcebergStorage + 'static> SendCatalogClient for SendDirectCatalogCli
 
 /// Resolve a version-hint.text value to a full metadata path.
 ///
-/// Accepts two formats:
+/// Accepts three formats:
+/// - **Full path** (e.g., `"s3://bucket/.../00001-abc.metadata.json"`) →
+///   returned as-is.
 /// - **Filename** (e.g., `"00001-abc-def.metadata.json"`) →
 ///   `{table_location}/metadata/00001-abc-def.metadata.json`
-/// - **Full path** (e.g., `"s3://bucket/.../00001-abc.metadata.json"`) →
-///   returned as-is
+///   (Spark / iceberg-rust / AWS Glue style).
+/// - **Bare integer version** (e.g., `"1782390319"`) →
+///   `{table_location}/metadata/v1782390319.metadata.json`. This is the Iceberg
+///   Hadoop file-based catalog convention — `version-hint.text` holds the
+///   version number `N` and the metadata file is `vN.metadata.json`.
 fn resolve_hint_to_metadata_path(hint: &str, table_location: &str) -> String {
     if hint.contains("://") {
         hint.to_string()
+    } else if hint.ends_with(".metadata.json") {
+        format!("{table_location}/metadata/{hint}")
+    } else if !hint.is_empty() && hint.bytes().all(|b| b.is_ascii_digit()) {
+        format!("{table_location}/metadata/v{hint}.metadata.json")
     } else {
         format!("{table_location}/metadata/{hint}")
     }
@@ -340,6 +349,27 @@ mod tests {
         assert_eq!(
             response.metadata_location,
             "s3://bucket/table/metadata/00042-efgh-5678.metadata.json"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_direct_catalog_hadoop_integer_version_hint() {
+        // Iceberg Hadoop file-based catalog convention: version-hint.text holds
+        // a bare integer N; the metadata file is vN.metadata.json.
+        let mut storage = MemoryStorage::new();
+        storage.add_file("s3://bucket/table/metadata/version-hint.text", "1782390319");
+
+        let client = DirectCatalogClient::new("s3://bucket/table".to_string(), Arc::new(storage));
+
+        let table_id = TableIdentifier {
+            namespace: "ns".to_string(),
+            table: "table".to_string(),
+        };
+
+        let response = client.load_table(&table_id, false).await.unwrap();
+        assert_eq!(
+            response.metadata_location,
+            "s3://bucket/table/metadata/v1782390319.metadata.json"
         );
     }
 

@@ -189,17 +189,26 @@ impl S3IcebergStorage {
         }
     }
 
-    /// Parse S3 URI into (bucket, key).
+    /// Parse an object-store URI into (bucket, key).
     ///
     /// Supports formats:
     /// - `s3://bucket/key/path`
     /// - `s3a://bucket/key/path` (Hadoop style)
+    /// - `gs://bucket/key/path` (Google Cloud Storage, read via the GCS
+    ///   S3-interoperability endpoint). Iceberg metadata/manifests for GCS-backed
+    ///   tables reference `gs://` paths; when the storage endpoint is
+    ///   set to `storage.googleapis.com`, `gs://bucket/key` and `s3://bucket/key`
+    ///   address the same object, so the scheme is accepted and resolved against
+    ///   the configured endpoint.
     pub fn parse_s3_uri(path: &str) -> Result<(&str, &str)> {
         let path = path
             .strip_prefix("s3://")
             .or_else(|| path.strip_prefix("s3a://"))
+            .or_else(|| path.strip_prefix("gs://"))
             .ok_or_else(|| {
-                IcebergError::storage(format!("Invalid S3 URI (must start with s3://): {path}"))
+                IcebergError::storage(format!(
+                    "Invalid object-store URI (must start with s3://, s3a://, or gs://): {path}"
+                ))
             })?;
 
         let (bucket, key) = path.split_once('/').ok_or_else(|| {
@@ -494,6 +503,14 @@ mod tests {
         let (bucket, key) = S3IcebergStorage::parse_s3_uri("s3a://bucket/key").unwrap();
         assert_eq!(bucket, "bucket");
         assert_eq!(key, "key");
+
+        // GCS scheme (read via the S3-interop endpoint) — Iceberg metadata for
+        // GCS-backed tables references gs:// paths.
+        let (bucket, key) =
+            S3IcebergStorage::parse_s3_uri("gs://my-bucket/iceberg/t/metadata/v1.metadata.json")
+                .unwrap();
+        assert_eq!(bucket, "my-bucket");
+        assert_eq!(key, "iceberg/t/metadata/v1.metadata.json");
 
         // Invalid URIs
         assert!(S3IcebergStorage::parse_s3_uri("http://bucket/key").is_err());
