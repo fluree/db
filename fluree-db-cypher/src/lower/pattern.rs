@@ -158,6 +158,9 @@ fn lower_shortest_path<E: IriEncoder>(
             path_var: path_var_id,
             min_hops,
             max_hops,
+            // Conservatively build edges: Cypher's `relationships(p)` may read
+            // them, and that usage isn't visible at pattern-lowering time.
+            needs_relationships: true,
         })),
         // Unknown relationship type ⇒ no edges ⇒ no path. An empty result over
         // the endpoints yields no rows (mandatory MATCH drops; an OPTIONAL

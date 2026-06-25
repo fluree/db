@@ -295,6 +295,8 @@ pub fn lower_unresolved_pattern<E: IriEncoder>(
                     path_var: path_var_id,
                     min_hops: *min_hops,
                     max_hops: *max_hops,
+                    // JSON-LD/FQL has no `relationships()`; never build edges.
+                    needs_relationships: false,
                 })]),
                 // Predicate IRI not in the dictionary → no edges of that type
                 // exist → the search yields no rows.

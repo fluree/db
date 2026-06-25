@@ -195,6 +195,12 @@ pub struct ShortestPathPattern {
     pub min_hops: Option<u32>,
     /// Maximum hop count (`*..max`), `None` = unbounded (subject to safety caps).
     pub max_hops: Option<u32>,
+    /// Whether the emitted path value's per-hop `edges` are consumed (only
+    /// Cypher's `relationships(p)` reads them). When `false` the operator skips
+    /// building the per-hop edge tuples — a pure allocation/clone savings on the
+    /// JSON-LD/FQL surface, which has no `relationships()` function. Edges are
+    /// derivable from `nodes` + this pattern's single `predicate`/`direction`.
+    pub needs_relationships: bool,
 }
 
 impl ShortestPathPattern {

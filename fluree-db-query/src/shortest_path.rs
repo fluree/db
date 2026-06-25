@@ -596,18 +596,25 @@ impl ShortestPathOperator {
                     // to the stored edge node[i+1]→node[i]. For an undirected
                     // (`Either`) search the per-hop orientation isn't recorded, so
                     // we fall back to traversal order (best effort).
-                    let pred = self.pattern.predicate.clone();
-                    let incoming = matches!(self.pattern.direction, PathDirection::Incoming);
-                    let edges: Vec<(Sid, Sid, Sid)> = path
-                        .windows(2)
-                        .map(|w| {
-                            if incoming {
-                                (w[1].clone(), pred.clone(), w[0].clone())
-                            } else {
-                                (w[0].clone(), pred.clone(), w[1].clone())
-                            }
-                        })
-                        .collect();
+                    //
+                    // Only Cypher's `relationships(p)` reads `edges`; skip the
+                    // per-hop allocation/clone entirely on surfaces that don't
+                    // (JSON-LD/FQL), where `needs_relationships` is false.
+                    let edges: Vec<(Sid, Sid, Sid)> = if self.pattern.needs_relationships {
+                        let pred = self.pattern.predicate.clone();
+                        let incoming = matches!(self.pattern.direction, PathDirection::Incoming);
+                        path.windows(2)
+                            .map(|w| {
+                                if incoming {
+                                    (w[1].clone(), pred.clone(), w[0].clone())
+                                } else {
+                                    (w[0].clone(), pred.clone(), w[1].clone())
+                                }
+                            })
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
                     row.push(Binding::Path {
                         nodes: path.clone(),
                         edges,
