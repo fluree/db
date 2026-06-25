@@ -416,14 +416,34 @@ impl PropertyPathOperator {
     async fn compute_closure(&self, ctx: &ExecutionContext<'_>) -> Result<Vec<(Sid, Sid)>> {
         // Composite hops aren't a single readable edge, so the in-memory
         // adjacency shortcut below doesn't apply. Seed from every node that can
-        // begin a hop (a subject of any first-step predicate) and run the
-        // composite-aware forward traversal from each.
+        // begin a hop and run the composite-aware forward traversal from each.
+        //
+        // NOTE: this both-unbound composite closure is not optimized — it runs a
+        // separate per-frontier BFS for each start rather than building a
+        // reusable adjacency map, so `?s (a/b)+ ?o` over a large graph can be
+        // expensive. The bound-endpoint cases (one side fixed) stay cheap.
         if self.pattern.is_composite() {
             let starts = self.composite_start_candidates(ctx).await?;
+            let start_set: HashSet<Sid> = starts.iter().cloned().collect();
             let mut out = Vec::new();
-            for start in starts {
-                for reachable in self.traverse_forward(ctx, &start).await? {
+            for start in &starts {
+                for reachable in self.traverse_forward(ctx, start).await? {
                     out.push((start.clone(), reachable));
+                }
+            }
+            // For `*`/`?` the zero-length path pairs every node in the path's
+            // domain with itself. `traverse_forward` already emits `(n, n)` for
+            // start nodes; add the self-pair for domain nodes that are only
+            // composite *endpoints* (never a hop start), matching the
+            // simple-path closure which tracks both subjects and objects.
+            if matches!(
+                self.pattern.modifier,
+                PathModifier::ZeroOrMore | PathModifier::ZeroOrOne
+            ) {
+                for node in self.composite_domain_nodes(ctx).await? {
+                    if !start_set.contains(&node) {
+                        out.push((node.clone(), node));
+                    }
                 }
             }
             return Ok(out);
@@ -561,6 +581,42 @@ impl PropertyPathOperator {
             }
         }
         Ok(out)
+    }
+
+    /// Every node touched by any step of a composite path — the subjects and ref
+    /// objects of all step predicates. This is the domain over which a `*`/`?`
+    /// zero-length match pairs each node with itself (mirrors how the simple-path
+    /// closure tracks both subjects and objects).
+    async fn composite_domain_nodes(&self, ctx: &ExecutionContext<'_>) -> Result<HashSet<Sid>> {
+        let (db, overlay, to_t) = ctx.require_single_graph()?;
+        let mut nodes: HashSet<Sid> = HashSet::new();
+        let all_preds = self.pattern.predicates.iter().chain(
+            self.pattern
+                .sequence_steps
+                .iter()
+                .flat_map(|s| s.predicates.iter()),
+        );
+        for pred in all_preds {
+            let range_match = RangeMatch::predicate(pred.clone());
+            let flakes = range_with_overlay(
+                db,
+                ctx.binary_g_id,
+                overlay,
+                IndexType::Psot,
+                RangeTest::Eq,
+                range_match,
+                RangeOptions::new().with_to_t(to_t),
+            )
+            .await?;
+            let flakes = self.filter_edges(ctx, flakes).await?;
+            for flake in flakes {
+                nodes.insert(flake.s);
+                if let FlakeValue::Ref(o) = flake.o {
+                    nodes.insert(o);
+                }
+            }
+        }
+        Ok(nodes)
     }
 
     /// Check if a path exists between two nodes

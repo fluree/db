@@ -736,8 +736,9 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
             SparqlPropertyPath::Inverse { path: inner, .. } => {
                 match inner.as_ref() {
                     SparqlPropertyPath::OneOrMore { path: tp_inner, .. }
-                    | SparqlPropertyPath::ZeroOrMore { path: tp_inner, .. } => {
-                        // Inverse-transitive: ^p+ or ^p*
+                    | SparqlPropertyPath::ZeroOrMore { path: tp_inner, .. }
+                    | SparqlPropertyPath::ZeroOrOne { path: tp_inner, .. } => {
+                        // Inverse-transitive step: ^p+ / ^p* / ^p?
                         if prev.is_bound() && next.is_bound() {
                             return Err(LowerError::invalid_property_path(
                                 "Property path requires at least one variable (cannot have both subject and object as constants)",
@@ -747,6 +748,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                         let iri = self.extract_simple_predicate_iri(tp_inner, span)?;
                         let modifier = match inner.as_ref() {
                             SparqlPropertyPath::OneOrMore { .. } => PathModifier::OneOrMore,
+                            SparqlPropertyPath::ZeroOrOne { .. } => PathModifier::ZeroOrOne,
                             _ => PathModifier::ZeroOrMore,
                         };
                         let predicate_sid = self
@@ -773,7 +775,8 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                 }
             }
             SparqlPropertyPath::OneOrMore { path: inner, .. }
-            | SparqlPropertyPath::ZeroOrMore { path: inner, .. } => {
+            | SparqlPropertyPath::ZeroOrMore { path: inner, .. }
+            | SparqlPropertyPath::ZeroOrOne { path: inner, .. } => {
                 if prev.is_bound() && next.is_bound() {
                     return Err(LowerError::invalid_property_path(
                         "Property path requires at least one variable (cannot have both subject and object as constants)",
@@ -783,6 +786,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                 let iri = self.extract_simple_predicate_iri(inner, span)?;
                 let modifier = match step {
                     SparqlPropertyPath::OneOrMore { .. } => PathModifier::OneOrMore,
+                    SparqlPropertyPath::ZeroOrOne { .. } => PathModifier::ZeroOrOne,
                     _ => PathModifier::ZeroOrMore,
                 };
                 let predicate_sid = self

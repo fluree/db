@@ -264,8 +264,8 @@ Multiple alternative steps are supported: `(ex:a|ex:b)/(ex:c|ex:d)` expands to 4
 
 **Rules:**
 
-- Transitive paths (`+`, `*`) require at least one variable (both subject and object cannot be constants).
-- Sequence (`/`) steps must be simple predicates (`ex:p`), inverse simple predicates (`^ex:p`), or alternatives of simple predicates (`(ex:a|ex:b)`). Transitive (`+`/`*`) and nested sequence modifiers are not allowed inside sequence steps.
+- A transitive path with both endpoints constant — e.g. `:a :p+ :b` — is evaluated as a reachability test: it yields one solution if a path exists between them, none otherwise.
+- Sequence (`/`) steps may be simple predicates (`ex:p`), inverse simple predicates (`^ex:p`), alternatives of simple predicates (`(ex:a|ex:b)`), or a modifier applied to a simple predicate (`ex:p+`, `ex:p*`, `ex:p?`, and their inverses such as `^ex:p+`). A modifier applied to a parenthesized composite (e.g. `(ex:a/ex:b)+`) is the composite-transitive form described above, not a sequence step.
 - Variable names starting with `?__` are reserved for internal use and will not appear in `SELECT *` (wildcard) output.
 
 #### Not Yet Supported

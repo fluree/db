@@ -488,6 +488,40 @@ async fn property_path_unsupported_operator_error() {
 }
 
 #[tokio::test]
+async fn property_path_zero_or_one_inside_sequence() {
+    // JSON-LD parity for SPARQL `ex:p?/ex:q`. From a: zero p → a q x; one p → b q y.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "property/path-zoo-seq:main");
+    let insert = json!({
+        "@context": {"ex": "http://example.org/"},
+        "@graph": [
+            {"@id": "ex:a", "ex:p": {"@id": "ex:b"}, "ex:q": {"@id": "ex:x"}},
+            {"@id": "ex:b", "ex:q": {"@id": "ex:y"}}
+        ]
+    });
+    let ledger1 = fluree.insert(ledger0, &insert).await.unwrap().ledger;
+
+    let q = json!({
+        "@context": {
+            "ex": "http://example.org/",
+            "optThenQ": {"@path": "ex:p?/ex:q"}
+        },
+        "where": [{"@id":"ex:a","optThenQ":"?o"}],
+        "select": ["?o"]
+    });
+    let rows = support::query_jsonld(&fluree, &ledger1, &q)
+        .await
+        .unwrap()
+        .to_jsonld(&ledger1.snapshot)
+        .unwrap();
+    assert_eq!(
+        normalize_rows(&rows),
+        normalize_rows(&json!([["ex:x"], ["ex:y"]])),
+        "p?/q from a = {{x, y}}: {rows}"
+    );
+}
+
+#[tokio::test]
 async fn property_path_composite_transitive_inverse_step() {
     // JSON-LD parity for SPARQL `(^ex:p/ex:q)+`. hub0/hub1 each link a pair of
     // nodes (hub p x0, hub q x1), making `^p/q` the co-parent relation:

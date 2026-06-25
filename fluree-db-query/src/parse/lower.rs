@@ -1031,7 +1031,9 @@ fn lower_sequence_step_pattern<E: IriEncoder>(
                 next.clone().into(),
             )))
         }
-        UnresolvedPathExpr::OneOrMore(inner) | UnresolvedPathExpr::ZeroOrMore(inner) => {
+        UnresolvedPathExpr::OneOrMore(inner)
+        | UnresolvedPathExpr::ZeroOrMore(inner)
+        | UnresolvedPathExpr::ZeroOrOne(inner) => {
             if prev.is_bound() && next.is_bound() {
                 return Err(ParseError::InvalidWhere(
                     "Property path requires at least one variable (cannot have both subject and object as constants)"
@@ -1041,6 +1043,7 @@ fn lower_sequence_step_pattern<E: IriEncoder>(
             let iri = expect_simple_iri(inner)?;
             let modifier = match step {
                 UnresolvedPathExpr::OneOrMore(_) => PathModifier::OneOrMore,
+                UnresolvedPathExpr::ZeroOrOne(_) => PathModifier::ZeroOrOne,
                 _ => PathModifier::ZeroOrMore,
             };
             let predicate = encoder
@@ -1062,7 +1065,9 @@ fn lower_sequence_step_pattern<E: IriEncoder>(
                     prev.clone().into(),
                 )))
             }
-            UnresolvedPathExpr::OneOrMore(tp_inner) | UnresolvedPathExpr::ZeroOrMore(tp_inner) => {
+            UnresolvedPathExpr::OneOrMore(tp_inner)
+            | UnresolvedPathExpr::ZeroOrMore(tp_inner)
+            | UnresolvedPathExpr::ZeroOrOne(tp_inner) => {
                 if prev.is_bound() && next.is_bound() {
                     return Err(ParseError::InvalidWhere(
                         "Property path requires at least one variable (cannot have both subject and object as constants)"
@@ -1072,6 +1077,7 @@ fn lower_sequence_step_pattern<E: IriEncoder>(
                 let iri = expect_simple_iri(tp_inner)?;
                 let modifier = match inner.as_ref() {
                     UnresolvedPathExpr::OneOrMore(_) => PathModifier::OneOrMore,
+                    UnresolvedPathExpr::ZeroOrOne(_) => PathModifier::ZeroOrOne,
                     _ => PathModifier::ZeroOrMore,
                 };
                 let predicate = encoder

@@ -5153,6 +5153,69 @@ async fn seed_composite_chain(fluree: &MemoryFluree, ledger_id: &str) -> MemoryL
 }
 
 #[tokio::test]
+async fn sparql_composite_star_both_unbound_includes_all_self_pairs() {
+    // Both-unbound `?s (ex:p/ex:q)* ?o`. Data a -p-> m -q-> b. The zero-length
+    // path pairs EVERY node in the path's domain {a, m, b} with itself — not just
+    // hop-start subjects — plus the one composite hop a→b.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/sparql:composite-star-closure");
+    let insert = json!({
+        "@context": {"ex": "http://example.org/"},
+        "@graph": [
+            {"@id": "ex:a", "ex:p": {"@id": "ex:m"}},
+            {"@id": "ex:m", "ex:q": {"@id": "ex:b"}}
+        ]
+    });
+    let ledger = fluree.insert(ledger0, &insert).await.unwrap().ledger;
+
+    let q = r"PREFIX ex: <http://example.org/>
+        SELECT ?s ?o WHERE { ?s (ex:p/ex:q)* ?o }";
+    let r = support::query_sparql(&fluree, &ledger, q)
+        .await
+        .expect("composite star both-unbound");
+    let j = r.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    assert_eq!(
+        normalize_rows(&j),
+        normalize_rows(&json!([
+            ["ex:a", "ex:a"],
+            ["ex:m", "ex:m"],
+            ["ex:b", "ex:b"],
+            ["ex:a", "ex:b"]
+        ])),
+        "(p/q)* closure: self-pair for every domain node incl. mid m and sink b, plus a→b: {j}"
+    );
+}
+
+#[tokio::test]
+async fn sparql_zero_or_one_inside_sequence() {
+    // `?` as a sequence step: `ex:a ex:p?/ex:q ?o`. The optional `ex:p` step
+    // yields a itself (zero hops) and its p-neighbor b, then `ex:q` from each:
+    // a→q→x (zero p) and b→q→y (one p) → {x, y}.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/sparql:zoo-in-seq");
+    let insert = json!({
+        "@context": {"ex": "http://example.org/"},
+        "@graph": [
+            {"@id": "ex:a", "ex:p": {"@id": "ex:b"}, "ex:q": {"@id": "ex:x"}},
+            {"@id": "ex:b", "ex:q": {"@id": "ex:y"}}
+        ]
+    });
+    let ledger = fluree.insert(ledger0, &insert).await.unwrap().ledger;
+
+    let q = r"PREFIX ex: <http://example.org/>
+        SELECT ?o WHERE { ex:a ex:p?/ex:q ?o }";
+    let r = support::query_sparql(&fluree, &ledger, q)
+        .await
+        .expect("zero-or-one inside sequence");
+    let j = r.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    assert_eq!(
+        normalize_rows(&j),
+        normalize_rows(&json!([["ex:x"], ["ex:y"]])),
+        "p?/q from a = {{x (zero p), y (one p)}}: {j}"
+    );
+}
+
+#[tokio::test]
 async fn sparql_composite_transitive_sequence() {
     // W3C `pp02` shape: transitive over a sequence. `(ex:p/ex:q)+` from a walks
     // one composite hop to b, two to c → {b, c}. The intermediate m, n nodes are
