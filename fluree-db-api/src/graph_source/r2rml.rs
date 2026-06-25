@@ -23,8 +23,8 @@ use fluree_db_query::error::{QueryError, Result as QueryResult};
 use fluree_db_query::r2rml::{
     ColumnBatchStream, R2rmlProvider, R2rmlTableProvider, ScanCmpOp, ScanFilter, ScanValue,
 };
-use futures::StreamExt;
 use fluree_db_r2rml::mapping::CompiledR2rmlMapping;
+use futures::StreamExt;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 

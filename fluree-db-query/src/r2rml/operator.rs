@@ -39,13 +39,13 @@ use crate::operator::{BoxedOperator, Operator, OperatorState};
 use crate::r2rml::ColumnBatchStream;
 use crate::var_registry::VarId;
 use async_trait::async_trait;
-use futures::StreamExt;
 use fluree_db_r2rml::mapping::{CompiledR2rmlMapping, ObjectMap, PredicateObjectMap, TriplesMap};
 use fluree_db_r2rml::materialize::{
     get_join_key_from_batch, materialize_object_from_batch, materialize_subject_from_batch, RdfTerm,
 };
 use fluree_db_tabular::ColumnBatch;
 use fluree_vocab::xsd;
+use futures::StreamExt;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
@@ -348,9 +348,12 @@ impl R2rmlScanOperator {
         let child_schema = self.child.schema().to_vec();
 
         // Resolve the TriplesMap(s) for this pattern (same for every child row).
-        let triples_maps: Vec<&TriplesMap> = if let Some(ref tm_iri) = self.pattern.triples_map_iri {
+        let triples_maps: Vec<&TriplesMap> = if let Some(ref tm_iri) = self.pattern.triples_map_iri
+        {
             let tm = mapping.get(tm_iri).ok_or_else(|| {
-                QueryError::InvalidQuery(format!("TriplesMap '{tm_iri}' not found in R2RML mapping"))
+                QueryError::InvalidQuery(format!(
+                    "TriplesMap '{tm_iri}' not found in R2RML mapping"
+                ))
             })?;
             vec![tm]
         } else {
@@ -510,7 +513,8 @@ impl R2rmlScanOperator {
                     // Columns needed from the parent: join columns + subject
                     // template columns (+ rr:column if the subject uses one).
                     let mut parent_projection: Vec<String> = parent_join_cols.clone();
-                    parent_projection.extend(parent_tm.subject_map.template_columns.iter().cloned());
+                    parent_projection
+                        .extend(parent_tm.subject_map.template_columns.iter().cloned());
                     if let Some(ref col) = parent_tm.subject_map.column {
                         parent_projection.push(col.clone());
                     }
@@ -797,7 +801,10 @@ pub(crate) struct LiteralEncoder {
 }
 
 impl LiteralEncoder {
-    pub(crate) fn build(triples_map: &TriplesMap, snapshot: &fluree_db_core::LedgerSnapshot) -> Self {
+    pub(crate) fn build(
+        triples_map: &TriplesMap,
+        snapshot: &fluree_db_core::LedgerSnapshot,
+    ) -> Self {
         let fallback = fluree_db_core::Sid::new(2, "string");
         let mut dt_sids: HashMap<String, fluree_db_core::Sid> = HashMap::new();
         for pom in &triples_map.predicate_object_maps {
