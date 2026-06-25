@@ -435,7 +435,25 @@ fn collect_alias_in_expr(e: &Expr, alias: &str, fields: &mut Vec<String>, bare: 
             }
             collect_alias_in_expr(&pc.projection, alias, fields, bare);
         }
-        Expr::Lit(_) | Expr::Param(_) | Expr::Case(_) | Expr::Exists(_, _, _) => {}
+        Expr::Case(c) => {
+            if let Some(s) = &c.subject {
+                collect_alias_in_expr(s, alias, fields, bare);
+            }
+            for (cond, res) in &c.branches {
+                collect_alias_in_expr(cond, alias, fields, bare);
+                collect_alias_in_expr(res, alias, fields, bare);
+            }
+            if let Some(e) = &c.else_branch {
+                collect_alias_in_expr(e, alias, fields, bare);
+            }
+        }
+        Expr::Exists(pat, inner_where, _) => {
+            collect_alias_in_pattern(pat, alias, fields, bare);
+            if let Some(w) = inner_where {
+                collect_alias_in_expr(w, alias, fields, bare);
+            }
+        }
+        Expr::Lit(_) | Expr::Param(_) => {}
     }
 }
 
@@ -614,7 +632,25 @@ fn rewrite_alias_in_expr_to_var<F: Fn(&str) -> String>(
             }
             rewrite_alias_in_expr_to_var(&mut pc.projection, alias, col_var, bare_var);
         }
-        Expr::Var(_) | Expr::Lit(_) | Expr::Param(_) | Expr::Case(_) | Expr::Exists(_, _, _) => {}
+        Expr::Case(c) => {
+            if let Some(s) = &mut c.subject {
+                rewrite_alias_in_expr_to_var(s, alias, col_var, bare_var);
+            }
+            for (cond, res) in &mut c.branches {
+                rewrite_alias_in_expr_to_var(cond, alias, col_var, bare_var);
+                rewrite_alias_in_expr_to_var(res, alias, col_var, bare_var);
+            }
+            if let Some(e) = &mut c.else_branch {
+                rewrite_alias_in_expr_to_var(e, alias, col_var, bare_var);
+            }
+        }
+        Expr::Exists(pat, inner_where, _) => {
+            rewrite_alias_in_pattern(pat, alias, col_var, bare_var);
+            if let Some(w) = inner_where {
+                rewrite_alias_in_expr_to_var(w, alias, col_var, bare_var);
+            }
+        }
+        Expr::Var(_) | Expr::Lit(_) | Expr::Param(_) => {}
     }
 }
 
@@ -774,9 +810,27 @@ fn replace_alias_in_expr(
             }
             replace_alias_in_expr(&mut pc.projection, alias, elem, pname)
         }
-        Expr::Case(_) | Expr::Exists(_, _, _) | Expr::Var(_) | Expr::Lit(_) | Expr::Param(_) => {
+        Expr::Case(c) => {
+            if let Some(s) = &mut c.subject {
+                replace_alias_in_expr(s, alias, elem, pname)?;
+            }
+            for (cond, res) in &mut c.branches {
+                replace_alias_in_expr(cond, alias, elem, pname)?;
+                replace_alias_in_expr(res, alias, elem, pname)?;
+            }
+            if let Some(e) = &mut c.else_branch {
+                replace_alias_in_expr(e, alias, elem, pname)?;
+            }
             Ok(())
         }
+        Expr::Exists(pat, inner_where, _) => {
+            replace_alias_in_pattern(pat, alias, elem, pname)?;
+            if let Some(w) = inner_where {
+                replace_alias_in_expr(w, alias, elem, pname)?;
+            }
+            Ok(())
+        }
+        Expr::Var(_) | Expr::Lit(_) | Expr::Param(_) => Ok(()),
     }
 }
 

@@ -657,7 +657,53 @@ fn expr_touches_list<E: IriEncoder>(
         | Expr::IsNull(a, _)
         | Expr::IsNotNull(a, _)
         | Expr::Prop(a, _, _) => expr_touches_list(ctx, a, list_outputs),
-        _ => false,
+        Expr::Index(a, b, _) => {
+            expr_touches_list(ctx, a, list_outputs) || expr_touches_list(ctx, b, list_outputs)
+        }
+        Expr::List(items, _) => items.iter().any(|e| expr_touches_list(ctx, e, list_outputs)),
+        Expr::Map(entries, _) => entries
+            .iter()
+            .any(|(_, v)| expr_touches_list(ctx, v, list_outputs)),
+        Expr::Case(c) => {
+            c.subject
+                .as_ref()
+                .is_some_and(|s| expr_touches_list(ctx, s, list_outputs))
+                || c.branches.iter().any(|(cond, res)| {
+                    expr_touches_list(ctx, cond, list_outputs)
+                        || expr_touches_list(ctx, res, list_outputs)
+                })
+                || c.else_branch
+                    .as_ref()
+                    .is_some_and(|e| expr_touches_list(ctx, e, list_outputs))
+        }
+        Expr::ListComprehension(c) => {
+            expr_touches_list(ctx, &c.list, list_outputs)
+                || c.filter
+                    .as_ref()
+                    .is_some_and(|f| expr_touches_list(ctx, f, list_outputs))
+                || c.map
+                    .as_ref()
+                    .is_some_and(|m| expr_touches_list(ctx, m, list_outputs))
+        }
+        Expr::Reduce(r) => {
+            expr_touches_list(ctx, &r.init, list_outputs)
+                || expr_touches_list(ctx, &r.list, list_outputs)
+                || expr_touches_list(ctx, &r.body, list_outputs)
+        }
+        Expr::ListPredicate(p) => {
+            expr_touches_list(ctx, &p.list, list_outputs)
+                || expr_touches_list(ctx, &p.predicate, list_outputs)
+        }
+        Expr::MapProjection(mp) => mp.selectors.iter().any(|sel| {
+            matches!(sel, crate::ast::MapProjectionSelector::Literal(_, e)
+                if expr_touches_list(ctx, e, list_outputs))
+        }),
+        // A pattern comprehension is its own subquery scope; its body does not
+        // reference outer collect outputs by variable in a way the sort sees.
+        Expr::PatternComprehension(_)
+        | Expr::Lit(_)
+        | Expr::Param(_)
+        | Expr::Exists(_, _, _) => false,
     }
 }
 

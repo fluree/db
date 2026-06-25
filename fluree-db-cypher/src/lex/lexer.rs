@@ -15,6 +15,8 @@ pub enum LexError {
     UnterminatedString(usize),
     #[error("unterminated backtick identifier at offset {0}")]
     UnterminatedBacktick(usize),
+    #[error("unterminated block comment at offset {0}")]
+    UnterminatedComment(usize),
     #[error("invalid escape sequence at offset {0}")]
     InvalidEscape(usize),
     #[error("invalid number at offset {0}")]
@@ -28,6 +30,7 @@ impl LexError {
         let off = match self {
             LexError::UnterminatedString(o)
             | LexError::UnterminatedBacktick(o)
+            | LexError::UnterminatedComment(o)
             | LexError::InvalidEscape(o)
             | LexError::InvalidNumber(o) => *o,
             LexError::UnexpectedChar { offset, .. } => *offset,
@@ -60,11 +63,15 @@ pub fn tokenize(src: &str) -> Result<Vec<Token>, LexError> {
             }
             b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'*' => {
                 i += 2;
-                while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                loop {
+                    if i + 1 >= bytes.len() {
+                        return Err(LexError::UnterminatedComment(start));
+                    }
+                    if bytes[i] == b'*' && bytes[i + 1] == b'/' {
+                        i += 2;
+                        break;
+                    }
                     i += 1;
-                }
-                if i + 1 < bytes.len() {
-                    i += 2;
                 }
                 continue;
             }
@@ -566,6 +573,20 @@ mod tests {
             toks,
             vec![TokenKind::Match, TokenKind::Ident("n".to_string())]
         );
+    }
+
+    #[test]
+    fn unterminated_block_comment_errors() {
+        // An unterminated `/* …` must be a clean lex error, not leak its final
+        // byte as a stray token.
+        assert!(matches!(
+            tokenize("MATCH n /* trailing"),
+            Err(LexError::UnterminatedComment(_))
+        ));
+        assert!(matches!(
+            tokenize("/*"),
+            Err(LexError::UnterminatedComment(_))
+        ));
     }
 
     #[test]
