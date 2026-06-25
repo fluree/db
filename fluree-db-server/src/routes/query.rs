@@ -1977,8 +1977,17 @@ async fn execute_query(
         return execute_query_proxy(state, ledger_id, query_json, &span).await;
     }
 
-    // Shared storage mode: use load_ledger_for_query with freshness checking
-    let ledger = load_ledger_for_query(state, ledger_id, &span).await?;
+    // Shared storage mode: use load_ledger_for_query with freshness checking.
+    // The alias may name a graph source (Iceberg/R2RML, BM25, …) rather than a
+    // ledger; those resolve through the connection/dataset path, which queries
+    // them via their source engine instead of loading a ledger (#1369).
+    let ledger = match load_ledger_for_query(state, ledger_id, &span).await {
+        Ok(l) => l,
+        Err(ServerError::Api(ref e)) if e.is_not_found() && delimited.is_none() => {
+            return execute_dataset_query(state, ledger_id, query_json, &span).await;
+        }
+        Err(e) => return Err(e),
+    };
     let graph = GraphDb::from_ledger_state(&ledger);
     let fluree = &state.fluree;
 
