@@ -1444,6 +1444,18 @@ fn history_shows_changes() {
         .args(["history", "ex:alice", "--format", "json"])
         .assert()
         .success();
+
+    // Default (table) output must render the records, not blank `?` cells.
+    fluree_cmd(&tmp)
+        .args(["history", "ex:alice"])
+        .assert()
+        .success()
+        // Header + populated value cells.
+        .stdout(predicate::str::contains("predicate"))
+        .stdout(predicate::str::contains("Alice Smith"))
+        .stdout(predicate::str::contains("ex:name"))
+        // The pre-fix bug produced a `?` op column and blank t/value cells.
+        .stdout(predicate::str::contains("| ? |").not());
 }
 
 #[test]
