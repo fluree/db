@@ -547,21 +547,6 @@ impl FlureeServerBuilder {
             (Arc::clone(integration), *listen_addr)
         });
 
-        // Subscribe Fluree's `LedgerManager` to the raft integration's
-        // event bus so commit / index applies reconcile cached state
-        // on every node, not just the one that staged the commit.
-        // Without this, follower caches only catch up on cold loads
-        // and silently miss any writes that land between two loads.
-        #[cfg(feature = "raft")]
-        if let Some(((integration, _), mgr)) =
-            self.raft.as_ref().zip(state_inner.fluree.ledger_manager())
-        {
-            fluree_db_api::spawn_local_cache_event_listener(
-                Arc::clone(&integration.event_bus),
-                Arc::clone(mgr),
-            );
-        }
-
         // Per-node CAS release task. The state-machine adapter pushes
         // `(ledger_id, request_cid)` pairs through the integration's
         // release channel whenever an apply surfaces evictable
