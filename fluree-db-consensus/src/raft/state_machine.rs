@@ -36,12 +36,55 @@ use thiserror::Error;
 /// at the consensus boundary. Carried on [`AdvanceRefArgs`] and
 /// cached in [`ApplyRecord`] so idempotent retries return the
 /// original submission's tally.
+///
+/// The nested `reasoning` field uses [`RecordedReasoningTally`] for
+/// the same reason — `fluree_db_core::tracking::ReasoningTally` has
+/// its own skip-on-None field (`capped_reason`) that would silently
+/// drop on the wire.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct RecordedTally {
     pub time: Option<String>,
     pub fuel: Option<f64>,
     pub policy: Option<HashMap<String, PolicyStats>>,
-    pub reasoning: Option<fluree_db_core::tracking::ReasoningTally>,
+    pub reasoning: Option<RecordedReasoningTally>,
+}
+
+/// Postcard-friendly mirror of
+/// [`fluree_db_core::tracking::ReasoningTally`]. See
+/// [`RecordedTally`] for why a mirror is needed; this type strips the
+/// `skip_serializing_if` on `capped_reason` so the field always rides
+/// at the same byte offset.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecordedReasoningTally {
+    pub capped: bool,
+    pub capped_reason: Option<String>,
+    pub derived_facts: u64,
+    pub iterations: u64,
+    pub duration_ms: u64,
+}
+
+impl From<&fluree_db_core::tracking::ReasoningTally> for RecordedReasoningTally {
+    fn from(r: &fluree_db_core::tracking::ReasoningTally) -> Self {
+        Self {
+            capped: r.capped,
+            capped_reason: r.capped_reason.clone(),
+            derived_facts: r.derived_facts,
+            iterations: r.iterations,
+            duration_ms: r.duration_ms,
+        }
+    }
+}
+
+impl From<RecordedReasoningTally> for fluree_db_core::tracking::ReasoningTally {
+    fn from(r: RecordedReasoningTally) -> Self {
+        fluree_db_core::tracking::ReasoningTally {
+            capped: r.capped,
+            capped_reason: r.capped_reason,
+            derived_facts: r.derived_facts,
+            iterations: r.iterations,
+            duration_ms: r.duration_ms,
+        }
+    }
 }
 
 impl From<&TrackingTally> for RecordedTally {
@@ -50,7 +93,7 @@ impl From<&TrackingTally> for RecordedTally {
             time: t.time.clone(),
             fuel: t.fuel,
             policy: t.policy.clone(),
-            reasoning: t.reasoning.clone(),
+            reasoning: t.reasoning.as_ref().map(RecordedReasoningTally::from),
         }
     }
 }
@@ -61,7 +104,7 @@ impl From<RecordedTally> for TrackingTally {
             time: r.time,
             fuel: r.fuel,
             policy: r.policy,
-            reasoning: r.reasoning,
+            reasoning: r.reasoning.map(Into::into),
         }
     }
 }

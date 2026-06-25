@@ -472,6 +472,8 @@ pub struct ApplyStagedCommitArgs {
     pub receipt: AppliedReceipt,
 }
 
+mod wire;
+
 /// Outcome of a cross-node ApplyHead proposal.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum ApplyStagedCommitResponse {
@@ -648,16 +650,17 @@ async fn handle_apply_staged_commit(
     State(ns): State<Arc<RaftNameService>>,
     body: axum::body::Bytes,
 ) -> Response {
-    let args: ApplyStagedCommitArgs = match postcard::from_bytes(&body) {
-        Ok(args) => args,
-        Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                format!("postcard decode error on ApplyStagedCommitArgs: {e}"),
-            )
-                .into_response();
-        }
-    };
+    let args: ApplyStagedCommitArgs =
+        match postcard::from_bytes::<wire::ApplyStagedCommitArgs>(&body) {
+            Ok(args) => args.into(),
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    format!("postcard decode error on ApplyStagedCommitArgs: {e}"),
+                )
+                    .into_response();
+            }
+        };
 
     let outcome = ns.apply_staged_commit(args).await;
     encode_apply_staged_commit_response(outcome)
@@ -847,9 +850,10 @@ impl RaftNameService {
             APPLY_STAGED_COMMIT_PATH
         );
 
-        let body = postcard::to_allocvec(&args).map_err(|e| {
-            NameServiceError::storage(format!("postcard encode of ApplyStagedCommitArgs: {e}"))
-        })?;
+        let body =
+            postcard::to_allocvec(&wire::ApplyStagedCommitArgs::from(args)).map_err(|e| {
+                NameServiceError::storage(format!("postcard encode of ApplyStagedCommitArgs: {e}"))
+            })?;
 
         let resp = forwarding
             .http_client
@@ -1714,6 +1718,246 @@ mod tests {
     #[test]
     fn map_apply_head_response_unexpected_variant_is_err() {
         assert!(map_apply_head_response(SmResponse::NoOp).is_err());
+    }
+
+    // ----------------------------------------------------------------
+    // ApplyStagedCommitArgs postcard round-trip
+    // ----------------------------------------------------------------
+
+    use crate::raft::staged_receipt::{AppliedReceipt, TransactApplied};
+    use fluree_db_api::{PolicyStats, TrackingTally};
+
+    /// Build a [`TrackingTally`] populated with values in every field
+    /// of every nested struct. Any `skip_serializing_if` field that
+    /// leaks into the wire format will surface as a decode mismatch.
+    fn fully_populated_tracking_tally() -> TrackingTally {
+        use fluree_db_core::tracking::ReasoningTally;
+        use std::collections::HashMap;
+        let mut policy = HashMap::new();
+        policy.insert(
+            "policy:a".to_string(),
+            PolicyStats {
+                executed: 7,
+                allowed: 5,
+            },
+        );
+        TrackingTally {
+            time: Some("12.34ms".to_string()),
+            fuel: Some(1.5),
+            policy: Some(policy),
+            reasoning: Some(ReasoningTally {
+                capped: true,
+                capped_reason: Some("budget".to_string()),
+                derived_facts: 42,
+                iterations: 3,
+                duration_ms: 17,
+            }),
+        }
+    }
+
+    fn args_for_round_trip(receipt: AppliedReceipt) -> ApplyStagedCommitArgs {
+        ApplyStagedCommitArgs {
+            ref_key: RefKey::new("test/db", "main"),
+            queue_id: 9,
+            commit_id: cid(1),
+            commit_t: 17,
+            receipt,
+        }
+    }
+
+    fn assert_args_round_trip(args: ApplyStagedCommitArgs) {
+        let encoded = wire::ApplyStagedCommitArgs::from(args.clone());
+        let bytes = postcard::to_allocvec(&encoded).expect("encode");
+        let decoded: wire::ApplyStagedCommitArgs = postcard::from_bytes(&bytes).expect("decode");
+        let round_tripped: ApplyStagedCommitArgs = decoded.into();
+        assert_eq!(round_tripped.ref_key, args.ref_key);
+        assert_eq!(round_tripped.queue_id, args.queue_id);
+        assert_eq!(round_tripped.commit_id, args.commit_id);
+        assert_eq!(round_tripped.commit_t, args.commit_t);
+        // `AppliedReceipt` doesn't derive `PartialEq`, so compare via
+        // the wire form (which has all the same fields, by construction).
+        let want = wire::AppliedReceipt::from(args.receipt);
+        let got = wire::AppliedReceipt::from(round_tripped.receipt);
+        // The wire enum doesn't impl `PartialEq` either; round-trip
+        // through postcard a second time and compare the bytes.
+        let want_bytes = postcard::to_allocvec(&want).expect("encode want");
+        let got_bytes = postcard::to_allocvec(&got).expect("encode got");
+        assert_eq!(want_bytes, got_bytes);
+    }
+
+    #[test]
+    fn apply_staged_commit_args_round_trips_transact_with_fully_populated_tally() {
+        let receipt = AppliedReceipt::Transact(TransactApplied {
+            commit_id: cid(2),
+            commit_t: 17,
+            flake_count: 99,
+            tally: Some(fully_populated_tracking_tally()),
+        });
+        assert_args_round_trip(args_for_round_trip(receipt));
+    }
+
+    #[test]
+    fn apply_staged_commit_args_round_trips_transact_with_none_tally() {
+        // The previous case proves all-fields-populated survives.
+        // This one proves the None-everywhere case survives too — i.e.
+        // the wire codec also handles the all-skips-fire branch that
+        // exposes the bug most directly.
+        let receipt = AppliedReceipt::Transact(TransactApplied {
+            commit_id: cid(2),
+            commit_t: 17,
+            flake_count: 99,
+            tally: None,
+        });
+        assert_args_round_trip(args_for_round_trip(receipt));
+    }
+
+    #[test]
+    fn apply_staged_commit_args_round_trips_transact_with_partial_tally() {
+        // Mixed-presence ReasoningTally is the canonical
+        // `skip_serializing_if` shape — every other field present,
+        // `capped_reason` None — that quietly corrupted the wire on
+        // the old codec.
+        use fluree_db_core::tracking::ReasoningTally;
+        let tally = TrackingTally {
+            time: None,
+            fuel: Some(1.0),
+            policy: None,
+            reasoning: Some(ReasoningTally {
+                capped: false,
+                capped_reason: None,
+                derived_facts: 10,
+                iterations: 1,
+                duration_ms: 5,
+            }),
+        };
+        let receipt = AppliedReceipt::Transact(TransactApplied {
+            commit_id: cid(2),
+            commit_t: 17,
+            flake_count: 1,
+            tally: Some(tally),
+        });
+        assert_args_round_trip(args_for_round_trip(receipt));
+    }
+
+    #[test]
+    fn apply_staged_commit_args_round_trips_minimal_receipt() {
+        // The fallback variant the adapter resolves with when no
+        // typed receipt is stashed. Plain `commit_id` + `commit_t`,
+        // no nested skip-fielded types — establishes the baseline.
+        let receipt = AppliedReceipt::Minimal {
+            commit_id: cid(2),
+            commit_t: 17,
+        };
+        assert_args_round_trip(args_for_round_trip(receipt));
+    }
+
+    #[test]
+    fn wire_mirror_stays_in_lockstep_with_in_memory_receipt_graph() {
+        // Structural drift sentinel: pins the wire mirror's field set
+        // against the in-memory receipt graph and surfaces any silent
+        // skew the next time someone touches either side.
+        //
+        // The construction below uses struct literals with no `..`
+        // rest pattern at every level: `TransactApplied`,
+        // `TrackingTally`, and `ReasoningTally`. Adding a field to
+        // any of these types stops the test from compiling here
+        // until the contributor either threads the new field through
+        // the wire form or explicitly opts out — and the
+        // destructures after the round-trip have the same property
+        // for the decoded side, so a field added to the wire mirror
+        // alone (e.g. through a `..Default::default()` refactor of
+        // the `From` impls that silently drops fields) surfaces as a
+        // missing-field destructure error.
+        //
+        // We also assert each destructured field round-trips by
+        // value, so a refactor that compiles but loses data on the
+        // wire fails the assertion rather than silently passing.
+        use fluree_db_core::tracking::ReasoningTally;
+        let original_reasoning = ReasoningTally {
+            capped: true,
+            capped_reason: Some("budget".to_string()),
+            derived_facts: 42,
+            iterations: 3,
+            duration_ms: 17,
+        };
+        let original_tally = TrackingTally {
+            time: Some("12.34ms".to_string()),
+            fuel: Some(1.5),
+            policy: Some({
+                let mut m = std::collections::HashMap::new();
+                m.insert(
+                    "policy:a".to_string(),
+                    PolicyStats {
+                        executed: 7,
+                        allowed: 5,
+                    },
+                );
+                m
+            }),
+            reasoning: Some(original_reasoning),
+        };
+        let original_transact = TransactApplied {
+            commit_id: cid(2),
+            commit_t: 17,
+            flake_count: 99,
+            tally: Some(original_tally.clone()),
+        };
+        let args = args_for_round_trip(AppliedReceipt::Transact(original_transact.clone()));
+
+        let encoded = wire::ApplyStagedCommitArgs::from(args.clone());
+        let bytes = postcard::to_allocvec(&encoded).expect("encode");
+        let decoded: wire::ApplyStagedCommitArgs = postcard::from_bytes(&bytes).expect("decode");
+        let round_tripped: ApplyStagedCommitArgs = decoded.into();
+
+        let ApplyStagedCommitArgs {
+            ref_key,
+            queue_id,
+            commit_id,
+            commit_t,
+            receipt,
+        } = round_tripped;
+        assert_eq!(ref_key, args.ref_key);
+        assert_eq!(queue_id, args.queue_id);
+        assert_eq!(commit_id, args.commit_id);
+        assert_eq!(commit_t, args.commit_t);
+
+        let rt_transact = match receipt {
+            AppliedReceipt::Transact(t) => t,
+            other => panic!("expected Transact, got {other:?}"),
+        };
+        let TransactApplied {
+            commit_id: rt_commit_id,
+            commit_t: rt_commit_t,
+            flake_count: rt_flake_count,
+            tally: rt_tally,
+        } = rt_transact;
+        assert_eq!(rt_commit_id, original_transact.commit_id);
+        assert_eq!(rt_commit_t, original_transact.commit_t);
+        assert_eq!(rt_flake_count, original_transact.flake_count);
+
+        let TrackingTally {
+            time: rt_time,
+            fuel: rt_fuel,
+            policy: rt_policy,
+            reasoning: rt_reasoning,
+        } = rt_tally.expect("tally Some on round-trip");
+        assert_eq!(rt_time, original_tally.time);
+        assert_eq!(rt_fuel, original_tally.fuel);
+        assert_eq!(rt_policy, original_tally.policy);
+
+        let ReasoningTally {
+            capped: rt_capped,
+            capped_reason: rt_capped_reason,
+            derived_facts: rt_derived_facts,
+            iterations: rt_iterations,
+            duration_ms: rt_duration_ms,
+        } = rt_reasoning.expect("reasoning Some on round-trip");
+        let original_reasoning = original_tally.reasoning.expect("reasoning populated above");
+        assert_eq!(rt_capped, original_reasoning.capped);
+        assert_eq!(rt_capped_reason, original_reasoning.capped_reason);
+        assert_eq!(rt_derived_facts, original_reasoning.derived_facts);
+        assert_eq!(rt_iterations, original_reasoning.iterations);
+        assert_eq!(rt_duration_ms, original_reasoning.duration_ms);
     }
 
     // ----------------------------------------------------------------
