@@ -1795,140 +1795,38 @@ async fn execute_cypher_transact(
         default_allow: headers.default_allow,
     };
 
+    // Submit through consensus, exactly like SPARQL UPDATE: the Cypher statement
+    // is lowered to a `Txn` inside the consensus layer under the ledger write
+    // lock — including conditional `MERGE … ON MATCH/ON CREATE` branch
+    // resolution against a policy-wrapped probe — so a retried submission is
+    // deduplicated by `Idempotency-Key` and there is no pre-lock TOCTOU on the
+    // branch choice. `build_commit_opts` is built from the cached handle for
+    // raw-txn provenance / identity, identical to the SPARQL path.
     let handle = state
         .fluree
         .ledger_cached(ledger_id)
         .await
         .map_err(ServerError::Api)?;
-    let cached_state = handle.snapshot().await;
-
-    // Most writes lower to a single Txn; a conditional write (e.g. MERGE … ON
-    // MATCH SET) resolves its branch by probing the cached writer state, then
-    // stages the resulting Txn through the cached-handle builder below.
-    let plan = state
-        .fluree
-        .cypher_write_plan(&cypher, params.as_ref(), ledger_id, &cached_state.snapshot)
-        .await
-        .map_err(|e| {
-            set_span_error_code(span, "error:InvalidTransaction");
-            ServerError::Api(e)
-        })?;
-    let txn = match plan {
-        fluree_db_api::cypher_write::WritePlan::Single(txn) => *txn,
-        fluree_db_api::cypher_write::WritePlan::Conditional(cw) => {
-            // Fresh owned state for the branch-choosing probe (cheap — the
-            // snapshot is Arc-shared); `cached_state` stays borrowed below.
-            let probe_state = handle.snapshot().await.to_ledger_state();
-            let probe = fluree_db_api::GraphDb::from_ledger_state(&probe_state);
-            // Wrap the probe in the same view policy the commit uses, so a
-            // restricted writer's MERGE ON CREATE/ON MATCH and DELETE-guard
-            // branch selection sees only policy-visible data — otherwise the
-            // branch outcome is a one-bit existence oracle over hidden nodes.
-            // Mirrors the Cypher read path (execute_cypher_ledger) and SPARQL
-            // UPDATE, whose WHERE evaluates inside the policy-wrapped engine.
-            let probe = if qc_opts.has_any_policy_inputs() {
-                state
-                    .fluree
-                    .wrap_policy(probe, &qc_opts, None)
-                    .await
-                    .map_err(|e| {
-                        set_span_error_code(span, "error:PolicyBuildFailed");
-                        ServerError::Api(e)
-                    })?
-            } else {
-                probe
-            };
-            state
-                .fluree
-                .resolve_conditional_cypher(&cw, probe, ledger_id, &cached_state.snapshot)
-                .await
-                .map_err(|e| {
-                    set_span_error_code(span, "error:InvalidTransaction");
-                    ServerError::Api(e)
-                })?
-        }
-    };
-
-    // Build a PolicyContext when any policy input is present, so writes are
-    // filtered the same way SPARQL UPDATE / JSON-LD writes are. Built from the
-    // pre-lock `cached_state` — identical to the SPARQL/JSON-LD path above —
-    // since policy rules change far more slowly than the write lock turns over
-    // and writes are serialized per ledger. (The branch-choosing probe of a
-    // conditional plan, which *is* order-sensitive, resolves under the lock via
-    // the staged `WritePlan` resolver.)
-    let policy_ctx = if qc_opts.has_any_policy_inputs() {
-        Some(
-            fluree_db_api::build_policy_context(
-                &cached_state.snapshot,
-                cached_state.novelty.as_ref(),
-                Some(cached_state.novelty.as_ref()),
-                cached_state.t,
-                &qc_opts,
-            )
-            .await
-            .map_err(|e| {
-                set_span_error_code(span, "error:PolicyBuildFailed");
-                ServerError::Api(e)
-            })?,
-        )
-    } else {
-        None
-    };
-
-    let mut commit_opts = CommitOpts::default();
-    if let Some(d) = &effective_identity {
-        commit_opts = commit_opts.identity(d.clone());
-    }
-    // Persist the original signed envelope for provenance when present.
-    if let Some(raw_txn) = raw_txn_from_credential(credential) {
-        let content_store = state.fluree.content_store(handle.id());
-        commit_opts = commit_opts.with_raw_txn_spawned(content_store, raw_txn);
-    }
-
-    let mut builder = state
-        .fluree
-        .stage(&handle)
-        .txn(txn)
-        .commit_opts(commit_opts);
-    if let Some(config) = &state.index_config {
-        builder = builder.index_config(config.clone());
-    }
-    if headers.has_tracking() {
-        builder = builder.tracking(headers.to_tracking_options());
-    }
-    if let Some(ctx) = policy_ctx {
-        builder = builder.policy(ctx);
-    }
-    let result = builder.execute().await.map_err(|e| {
-        set_span_error_code(span, "error:InvalidTransaction");
-        ServerError::Api(e)
-    })?;
-
-    tracing::info!(
-        status = "success",
-        format = "cypher",
-        commit_t = result.receipt.t,
-        commit_id = %result.receipt.commit_id,
-        "Cypher write committed"
+    let commit_opts = build_commit_opts(
+        effective_identity.as_deref(),
+        credential,
+        &state.fluree,
+        &handle,
     );
-
-    if let Some(tally) = &result.tally {
-        record_tracking_on_span(span, tally);
-    }
-    let response = transact_response(
-        ledger_id.to_string(),
-        result.receipt.t,
-        tx_id,
-        result.receipt.commit_id.to_string(),
-        result.tally.as_ref(),
-    );
-    match &result.tally {
-        Some(tally) => {
-            let hdrs = tracking_headers(tally);
-            Ok((hdrs, Json(response)).into_response())
-        }
-        None => Ok(Json(response).into_response()),
-    }
+    let tracking = tracking_from_headers(headers);
+    let request = TransactionRequest {
+        idempotency_key: extract_idempotency_key(&credential.headers)?,
+        ledger_id: ledger_id.to_string(),
+        body: TransactionBody::Cypher {
+            query: cypher,
+            params,
+        },
+        txn_opts: TxnOpts::default(),
+        commit_opts,
+        tracking,
+        governance: qc_opts,
+    };
+    transact_via_consensus(state, ledger_id, request, tx_id, &credential.headers).await
 }
 
 /// Execute a SPARQL UPDATE request

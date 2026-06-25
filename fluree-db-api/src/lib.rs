@@ -243,7 +243,7 @@ pub use fluree_db_query::ir::Query;
 pub use fluree_db_query::parse::ParseError;
 pub use fluree_db_transact::{
     lower_sparql_update, lower_sparql_update_ast, CommitOpts, CommitReceipt,
-    LowerError as SparqlUpdateLowerError, NamespaceRegistry, TransactError, TxnOpts, TxnType,
+    LowerError as SparqlUpdateLowerError, NamespaceRegistry, TransactError, Txn, TxnOpts, TxnType,
 };
 
 // Re-export SPARQL types (product feature; always enabled)

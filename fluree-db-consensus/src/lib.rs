@@ -118,6 +118,18 @@ pub enum TransactionBody {
     /// SPARQL UPDATE query text; the lowered `Txn` carries its own
     /// insert/update semantics.
     Sparql(String),
+    /// openCypher write statement (`CREATE`/`MERGE`/`SET`/`REMOVE`/`DELETE`)
+    /// with an optional bound-parameter object. Like `Sparql`, the text is
+    /// lowered to a `Txn` inside the consensus layer under the ledger write
+    /// lock — so a conditional `MERGE … ON MATCH/ON CREATE` chooses its branch
+    /// against the same state the commit's head-check guards (no pre-lock
+    /// TOCTOU), and a retried submission is deduplicated by `idempotency_key`.
+    Cypher {
+        query: String,
+        /// Bound parameters (`{ "cypher": "...", "params": { … } }`). A JSON
+        /// object map, matching `fluree_db_cypher::ParamMap`.
+        params: Option<serde_json::Map<String, JsonValue>>,
+    },
 }
 
 impl TransactionBody {
@@ -130,6 +142,7 @@ impl TransactionBody {
             Self::JsonLdUpsert(_) | Self::TurtleUpsert(_) | Self::TrigUpsert(_) => "upsert",
             Self::JsonLdUpdate(_) => "update",
             Self::Sparql(_) => "sparql-update",
+            Self::Cypher { .. } => "cypher",
         }
     }
 }

@@ -74,6 +74,30 @@ async fn post_cypher(state: &Arc<AppState>, uri: &str, cypher: &str) -> (StatusC
     (status, String::from_utf8_lossy(&bytes).to_string())
 }
 
+/// POST a Cypher write carrying an `Idempotency-Key` header.
+async fn post_cypher_with_key(
+    state: &Arc<AppState>,
+    uri: &str,
+    cypher: &str,
+    idempotency_key: &str,
+) -> (StatusCode, String) {
+    let resp = build_router(Arc::clone(state))
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("content-type", "application/cypher")
+                .header("Idempotency-Key", idempotency_key)
+                .body(Body::from(cypher.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    (status, String::from_utf8_lossy(&bytes).to_string())
+}
+
 #[tokio::test]
 async fn cypher_http_read_write_round_trip() {
     let (_tmp, state) = server_state().await;
@@ -137,6 +161,61 @@ async fn cypher_http_read_write_round_trip() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert!(body.contains("Carol"), "after-create read body: {body}");
+}
+
+/// Regression (M2): Cypher writes go through consensus, so a retried submission
+/// carrying the same `Idempotency-Key` is deduplicated — it commits once, not
+/// twice. Before this routing the Cypher path staged directly and ignored the
+/// key, so a client retry double-committed (here: two `Dave` nodes).
+#[tokio::test]
+async fn cypher_http_write_is_idempotent() {
+    let (_tmp, state) = server_state().await;
+    create_ledger(&state, "cypheridem").await;
+
+    let create = r#"CREATE (n:Person {name: "Dave"})"#;
+    let (s1, b1) = post_cypher_with_key(
+        &state,
+        "/v1/fluree/update/cypheridem",
+        create,
+        "fixed-key-123",
+    )
+    .await;
+    let (s2, b2) = post_cypher_with_key(
+        &state,
+        "/v1/fluree/update/cypheridem",
+        create,
+        "fixed-key-123",
+    )
+    .await;
+    assert!(s1.is_success() && s2.is_success(), "{b1}\n{b2}");
+
+    // The idempotent replay echoes the original commit (same `t`), rather than
+    // advancing the ledger with a second commit.
+    let commit_t = |b: &str| {
+        serde_json::from_str::<serde_json::Value>(b)
+            .ok()
+            .and_then(|v| v.get("t").and_then(|t| t.as_i64()))
+    };
+    assert_eq!(
+        commit_t(&b1),
+        commit_t(&b2),
+        "retry must echo the original commit t:\n{b1}\n{b2}"
+    );
+
+    // And the node was created exactly once (a non-idempotent retry would make a
+    // second, distinct `Dave` node since CREATE always inserts).
+    let (status, body) = post_cypher(
+        &state,
+        "/v1/fluree/query/cypheridem",
+        "MATCH (n:Person) RETURN n.name",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body.matches("Dave").count(),
+        1,
+        "exactly one Dave node expected; body={body}"
+    );
 }
 
 #[tokio::test]

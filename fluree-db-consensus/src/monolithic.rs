@@ -16,7 +16,7 @@ use dashmap::DashMap;
 use fluree_db_api::{
     ApiError, Base64Bytes, CommitOpts, CommitReceipt, CommitRef, Fluree, GovernanceOptions,
     IndexingStatus, LedgerHandle, LedgerManager, PolicyContext, PolicyStats, PushCommitsRequest,
-    RefreshOpts, TrackingOptions, TrackingTally, TransactError, TxnOpts,
+    RefreshOpts, TrackingOptions, TrackingTally, TransactError, Txn, TxnOpts,
 };
 use fluree_db_ledger::IndexConfig;
 use moka::future::Cache;
@@ -448,6 +448,15 @@ impl MonolithicCommitter {
                 hasher.update(b"sparql");
                 hasher.update(text.as_bytes());
             }
+            TransactionBody::Cypher { query, params } => {
+                hasher.update(b"cypher");
+                hasher.update(query.as_bytes());
+                if let Some(params) = params {
+                    hasher.update(b"params");
+                    serde_json::to_writer(&mut hasher, params)
+                        .expect("Sha256 write is infallible; a parsed Value re-serializes");
+                }
+            }
         }
         hasher.finalize().into()
     }
@@ -459,6 +468,44 @@ impl MonolithicCommitter {
                 status: 500,
                 message: "LedgerManager is not configured on the Fluree instance".into(),
             })
+    }
+
+    /// Lower a Cypher write statement to a `Txn` against the ledger's current
+    /// (locked) state, resolving a conditional `MERGE` plan with a policy-wrapped
+    /// probe. Called inside the stage+commit retry loop so the branch choice and
+    /// the committed head stay consistent — see the call site for the TOCTOU
+    /// reasoning. The policy wrap mirrors the Cypher read / SPARQL surfaces so a
+    /// restricted writer's branch selection sees only policy-visible data.
+    async fn resolve_cypher_under_lock(
+        &self,
+        ledger_handle: &LedgerHandle,
+        ledger_id: &str,
+        query: &str,
+        params: Option<&serde_json::Map<String, serde_json::Value>>,
+        governance: &GovernanceOptions,
+    ) -> std::result::Result<Txn, ApiError> {
+        let snap = ledger_handle.snapshot().await;
+        let plan = self
+            .fluree
+            .cypher_write_plan(query, params, ledger_id, &snap.snapshot)
+            .await?;
+        match plan {
+            fluree_db_api::cypher_write::WritePlan::Single(txn) => Ok(*txn),
+            fluree_db_api::cypher_write::WritePlan::Conditional(cw) => {
+                // Fresh owned state for the branch-choosing probe (cheap — the
+                // snapshot is Arc-shared); `snap` stays borrowed for the resolve.
+                let probe_state = ledger_handle.snapshot().await.to_ledger_state();
+                let probe = fluree_db_api::GraphDb::from_ledger_state(&probe_state);
+                let probe = if governance.has_any_policy_inputs() {
+                    self.fluree.wrap_policy(probe, governance, None).await?
+                } else {
+                    probe
+                };
+                self.fluree
+                    .resolve_conditional_cypher(&cw, probe, ledger_id, &snap.snapshot)
+                    .await
+            }
+        }
     }
 
     /// Execute the stage + commit pipeline, returning the bare commit and
@@ -499,6 +546,28 @@ impl MonolithicCommitter {
         for attempt in 1..=MAX_TXN_RETRIES {
             let policy_ctx = build_policy_context(&ledger_handle, &governance).await?;
 
+            // Cypher lowers to a `Txn` here — under the write lock and re-resolved
+            // each retry attempt — rather than pre-lock in the route. A conditional
+            // `MERGE … ON MATCH/ON CREATE` therefore chooses its branch against the
+            // same state the commit's head-check guards: if a concurrent writer
+            // commits first, the head-check fails, `refresh()` reconciles, and the
+            // branch is re-chosen on the next attempt. (Other bodies lower inside
+            // `stage`, so only Cypher needs this explicit pre-stage resolution.)
+            let cypher_txn = match &body {
+                TransactionBody::Cypher { query, params } => Some(
+                    self.resolve_cypher_under_lock(
+                        &ledger_handle,
+                        ledger_id,
+                        query,
+                        params.as_ref(),
+                        &governance,
+                    )
+                    .await
+                    .map_err(execution_failure)?,
+                ),
+                _ => None,
+            };
+
             // The builder API holds the ledger write lock and replaces the cached
             // state internally for the duration of stage + commit — no manual
             // lock/clone/replace dance is needed here. Each body variant fixes
@@ -513,6 +582,9 @@ impl MonolithicCommitter {
                     staged.upsert_turtle(text.as_str())
                 }
                 TransactionBody::Sparql(query) => staged.sparql_update(query.as_str()),
+                TransactionBody::Cypher { .. } => {
+                    staged.txn(cypher_txn.expect("cypher_txn is Some for a Cypher body"))
+                }
             };
             let mut builder = staged
                 .txn_opts(txn_opts.clone())
