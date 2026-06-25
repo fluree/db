@@ -145,6 +145,14 @@ pub fn detect_fused_r2rml_aggregate(query: &Query) -> Option<FusedAggregatePlan>
         _ => return None,
     };
 
+    // Cost guard: a FILTER is only fused alongside a GROUP BY. There the fused
+    // path's win (skipping the subject + the many grouped/aggregated columns)
+    // dwarfs the per-row filter eval. For a filtered single aggregate the normal
+    // pipeline's file pruning + vectorized filter is faster, so decline.
+    if filter.is_some() && group_by.is_empty() {
+        return None;
+    }
+
     // Every aggregate must be a column fold this operator supports.
     let mut aggregates = Vec::with_capacity(aggregation.aggregates.len());
     for spec in aggregation.aggregates.iter() {
