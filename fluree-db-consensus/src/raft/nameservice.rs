@@ -47,11 +47,12 @@
 //!
 //! [`LedgerState::load`]: fluree_db_ledger::LedgerState::load
 
+use crate::raft::commit_worker::{QueuePoisonError, QueuePoisonPublisher};
 use crate::raft::staged_receipt::{AppliedReceipt, StagedReceiptMap};
 use crate::raft::state_machine::{
     AdvanceIndexHeadArgs, ApplyHeadArgs, Command as SmCommand, CreateBranchArgs, CreateLedgerArgs,
-    DesyncReason, NameServiceState, PushConfigArgs, RecordedTally, RefKey, ResetHeadSnapshot,
-    Response as SmResponse,
+    DesyncReason, NameServiceState, PoisonQueueEntryArgs, PoisonReason, PushConfigArgs,
+    RecordedTally, RefKey, ResetHeadSnapshot, Response as SmResponse,
 };
 use crate::raft::state_machine_adapter::SharedState;
 use crate::raft::{ClusterNode, NodeId, TypeConfig};
@@ -517,6 +518,34 @@ pub enum ApplyStagedCommitError {
     InvariantViolated(String),
 }
 
+/// RPC payload a follower's stager sends to the current leader when
+/// it wants to poison a queue entry it can't successfully stage.
+/// The leader proposes [`Command::PoisonQueueEntry`] on the
+/// follower's behalf.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ApplyQueuePoisonArgs {
+    pub ref_key: RefKey,
+    pub queue_id: u64,
+    pub reason: PoisonReason,
+}
+
+/// Errors returned by [`RaftNameService::apply_queue_poison`]. Sent
+/// to the follower over the wire — kept `Serialize`/`Deserialize` so
+/// the HTTP transport carries structured failures, not just opaque
+/// status codes.
+#[derive(Clone, Debug, Serialize, Deserialize, thiserror::Error)]
+pub enum ApplyQueuePoisonError {
+    /// The receiving node isn't the current leader. The caller
+    /// should look up the new leader (if known) and retry.
+    #[error("not the leader; current leader: {leader:?}")]
+    NotLeader { leader: Option<NodeId> },
+    /// Raft `client_write` reported a non-forwardable failure
+    /// (membership change error, fatal storage error). The message
+    /// is the underlying error's `Display`.
+    #[error("raft propose failed: {0}")]
+    RaftPropose(String),
+}
+
 impl RaftNameService {
     /// Handle the cross-node ApplyHead RPC: stash the ferried
     /// receipt, propose `Command::ApplyHead`, return the outcome.
@@ -614,6 +643,38 @@ impl RaftNameService {
             .and_then(|q| q.front())
             .map(|entry| entry.queue_id)
     }
+
+    /// Handle the cross-node `PoisonQueueEntry` RPC: propose the
+    /// poison from the leader and return the outcome. Called by the
+    /// HTTP handler on the leader after a follower-owned stager
+    /// forwards a deterministic staging failure.
+    ///
+    /// The state-machine response (`Poisoned` vs `QueueDesync`) is
+    /// informational once the poison is durably proposed — either
+    /// way the entry is done from the stager's perspective — so
+    /// success collapses to `Ok(())`. Only Raft-side failures
+    /// surface as `Err`.
+    pub async fn apply_queue_poison(
+        &self,
+        args: ApplyQueuePoisonArgs,
+    ) -> std::result::Result<(), ApplyQueuePoisonError> {
+        let ApplyQueuePoisonArgs {
+            ref_key,
+            queue_id,
+            reason,
+        } = args;
+        let cmd = SmCommand::PoisonQueueEntry(PoisonQueueEntryArgs {
+            ledger_id: ref_key.ledger_name.clone(),
+            branch: ref_key.branch.clone(),
+            queue_id,
+            reason,
+            applied_at_millis: current_millis(),
+        });
+        match self.raft.client_write(cmd).await {
+            Ok(_) => Ok(()),
+            Err(err) => Err(map_queue_poison_propose_error(err)),
+        }
+    }
 }
 
 /// Path under [`apply_staged_commit_router`]'s root for the cross-node
@@ -688,6 +749,59 @@ fn encode_apply_staged_commit_response(
     }
 }
 
+/// Path under [`apply_queue_poison_router`]'s root for the cross-node
+/// `PoisonQueueEntry` RPC. Exposed so the client side (see
+/// `RaftNameService`'s [`QueuePoisonPublisher`] impl) can build the
+/// outbound URL without hardcoding the route string twice.
+pub const APPLY_QUEUE_POISON_PATH: &str = "/apply_queue_poison";
+
+/// Axum router exposing the cross-node `PoisonQueueEntry` RPC under
+/// [`APPLY_QUEUE_POISON_PATH`]. Caller nests this under the same
+/// `/raft` mount the openraft RPCs and `apply_staged_commit` use —
+/// same intra-cluster trust posture, no auth layer.
+pub fn apply_queue_poison_router(ns: Arc<RaftNameService>) -> Router {
+    Router::new()
+        .route(APPLY_QUEUE_POISON_PATH, post(handle_apply_queue_poison))
+        .with_state(ns)
+}
+
+/// HTTP handler for [`APPLY_QUEUE_POISON_PATH`]. Decodes a postcard
+/// [`ApplyQueuePoisonArgs`] body, dispatches to
+/// [`RaftNameService::apply_queue_poison`], and encodes the
+/// outcome (success **or** logical failure) as a postcard
+/// `Result<(), ApplyQueuePoisonError>` body with HTTP 200.
+/// HTTP-level statuses are reserved for transport-level failures.
+async fn handle_apply_queue_poison(
+    State(ns): State<Arc<RaftNameService>>,
+    body: axum::body::Bytes,
+) -> Response {
+    let args: ApplyQueuePoisonArgs = match postcard::from_bytes(&body) {
+        Ok(args) => args,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("postcard decode error on ApplyQueuePoisonArgs: {e}"),
+            )
+                .into_response();
+        }
+    };
+
+    let outcome = ns.apply_queue_poison(args).await;
+    match postcard::to_allocvec(&outcome) {
+        Ok(bytes) => (
+            StatusCode::OK,
+            [(reqwest::header::CONTENT_TYPE, POSTCARD_MIME)],
+            bytes,
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("postcard encode error on apply_queue_poison response: {e}"),
+        )
+            .into_response(),
+    }
+}
+
 fn map_propose_error(
     err: RaftError<NodeId, ClientWriteError<NodeId, ClusterNode>>,
 ) -> ApplyStagedCommitError {
@@ -704,6 +818,26 @@ fn map_propose_error(
         }
         RaftError::Fatal(f) => {
             ApplyStagedCommitError::RaftPropose(format!("raft fatal during ApplyHead: {f}"))
+        }
+    }
+}
+
+fn map_queue_poison_propose_error(
+    err: RaftError<NodeId, ClientWriteError<NodeId, ClusterNode>>,
+) -> ApplyQueuePoisonError {
+    match err {
+        RaftError::APIError(ClientWriteError::ForwardToLeader(forward)) => {
+            ApplyQueuePoisonError::NotLeader {
+                leader: forward.leader_id,
+            }
+        }
+        RaftError::APIError(ClientWriteError::ChangeMembershipError(e)) => {
+            ApplyQueuePoisonError::RaftPropose(format!(
+                "unexpected ChangeMembershipError on PoisonQueueEntry: {e}"
+            ))
+        }
+        RaftError::Fatal(f) => {
+            ApplyQueuePoisonError::RaftPropose(format!("raft fatal during PoisonQueueEntry: {f}"))
         }
     }
 }
@@ -909,6 +1043,104 @@ impl RaftNameService {
             .nodes()
             .find(|(id, _)| **id == leader_id)
             .map(|(_, node)| node.raft_addr.clone())
+    }
+
+    /// Forward [`SmCommand::PoisonQueueEntry`] to the current leader's
+    /// `apply_queue_poison` endpoint. Parallel to
+    /// [`Self::publish_commit_via_leader`] — same `ForwardingConfig`
+    /// for leader lookup + outbound HTTP, same wire transport
+    /// (postcard body, structured result), same trust posture.
+    async fn poison_queue_entry_via_leader(
+        &self,
+        ref_key: &RefKey,
+        queue_id: u64,
+        reason: PoisonReason,
+        forwarding: &ForwardingConfig,
+    ) -> std::result::Result<(), QueuePoisonError> {
+        let args = ApplyQueuePoisonArgs {
+            ref_key: ref_key.clone(),
+            queue_id,
+            reason,
+        };
+
+        let leader_url = self
+            .lookup_leader_raft_url()
+            .await
+            .ok_or(QueuePoisonError::NoLeader)?;
+        let target = format!(
+            "{}{}",
+            leader_url.trim_end_matches('/'),
+            APPLY_QUEUE_POISON_PATH
+        );
+
+        let body = postcard::to_allocvec(&args)
+            .map_err(|e| QueuePoisonError::Codec(format!("encode ApplyQueuePoisonArgs: {e}")))?;
+
+        let resp = forwarding
+            .http_client
+            .post(&target)
+            .header(reqwest::header::CONTENT_TYPE, POSTCARD_MIME)
+            .body(body)
+            .send()
+            .await
+            .map_err(|e| QueuePoisonError::Transport(e.to_string()))?;
+
+        if !resp.status().is_success() {
+            return Err(QueuePoisonError::HttpStatus(resp.status().to_string()));
+        }
+
+        let body_bytes = resp
+            .bytes()
+            .await
+            .map_err(|e| QueuePoisonError::Transport(format!("read response body: {e}")))?;
+        let outcome: std::result::Result<(), ApplyQueuePoisonError> =
+            postcard::from_bytes(&body_bytes).map_err(|e| {
+                QueuePoisonError::Codec(format!("decode apply_queue_poison response: {e}"))
+            })?;
+        outcome.map_err(|e| QueuePoisonError::RaftPropose(e.to_string()))
+    }
+
+    /// Leader-side fast path: propose `PoisonQueueEntry` via local
+    /// `client_write`. Used when forwarding isn't configured or this
+    /// node currently is the leader. Mirrors
+    /// [`Self::publish_commit_locally`].
+    async fn poison_queue_entry_locally(
+        &self,
+        ref_key: &RefKey,
+        queue_id: u64,
+        reason: PoisonReason,
+    ) -> std::result::Result<(), QueuePoisonError> {
+        self.apply_queue_poison(ApplyQueuePoisonArgs {
+            ref_key: ref_key.clone(),
+            queue_id,
+            reason,
+        })
+        .await
+        .map_err(|e| QueuePoisonError::RaftPropose(e.to_string()))
+    }
+}
+
+#[async_trait]
+impl QueuePoisonPublisher for RaftNameService {
+    async fn poison_queue_entry(
+        &self,
+        ref_key: &RefKey,
+        queue_id: u64,
+        reason: PoisonReason,
+    ) -> std::result::Result<(), QueuePoisonError> {
+        // Dispatch by local-leader status, the same shape
+        // `publish_commit` uses for ApplyHead. Without forwarding,
+        // assume the legacy leader-only contract — caller knows it's
+        // the leader.
+        if let Some(forwarding) = &self.forwarding {
+            if !self.is_local_leader(forwarding.id).await {
+                return self
+                    .poison_queue_entry_via_leader(ref_key, queue_id, reason, forwarding)
+                    .await;
+            }
+        }
+        self.poison_queue_entry_locally(ref_key, queue_id, reason)
+            .await
     }
 }
 
@@ -1958,6 +2190,80 @@ mod tests {
         assert_eq!(rt_derived_facts, original_reasoning.derived_facts);
         assert_eq!(rt_iterations, original_reasoning.iterations);
         assert_eq!(rt_duration_ms, original_reasoning.duration_ms);
+    }
+
+    // ----------------------------------------------------------------
+    // ApplyQueuePoisonArgs postcard round-trip
+    // ----------------------------------------------------------------
+
+    fn assert_queue_poison_args_round_trip(args: ApplyQueuePoisonArgs) {
+        let bytes = postcard::to_allocvec(&args).expect("encode");
+        let decoded: ApplyQueuePoisonArgs = postcard::from_bytes(&bytes).expect("decode");
+        assert_eq!(decoded.ref_key, args.ref_key);
+        assert_eq!(decoded.queue_id, args.queue_id);
+        assert_eq!(decoded.reason, args.reason);
+    }
+
+    #[test]
+    fn apply_queue_poison_args_round_trips_staging_failed_variant() {
+        // `StagingFailed` is the variant emitted when the stager
+        // exhausts its retry budget on a transient hiccup. Carries
+        // a payload (error message + final attempt count) that has
+        // to survive the wire.
+        assert_queue_poison_args_round_trip(ApplyQueuePoisonArgs {
+            ref_key: RefKey::new("test/db", "main"),
+            queue_id: 17,
+            reason: PoisonReason::StagingFailed {
+                error: "CAS read timeout".to_string(),
+                attempts: 3,
+            },
+        });
+    }
+
+    #[test]
+    fn apply_queue_poison_args_round_trips_body_malformed_variant() {
+        // Canonical deterministic poison — the one the original
+        // local-`client_write` path would have bounced forever on a
+        // follower, the very symptom the leader-forward exists to
+        // close.
+        assert_queue_poison_args_round_trip(ApplyQueuePoisonArgs {
+            ref_key: RefKey::new("test/db", "main"),
+            queue_id: 0,
+            reason: PoisonReason::BodyMalformed {
+                error: "invalid JSON-LD".to_string(),
+            },
+        });
+    }
+
+    #[test]
+    fn apply_queue_poison_args_round_trips_push_cas_failed_variant() {
+        // The widest variant payload-wise — two `Option<ContentId>`s
+        // wrapped in the struct. Postcard handles `Option<ContentId>`
+        // positionally and these fields aren't skip-attribute'd, so
+        // the round-trip should preserve all four (Some, Some) /
+        // (Some, None) / (None, Some) / (None, None) combinations
+        // unchanged. We pick the most representative.
+        assert_queue_poison_args_round_trip(ApplyQueuePoisonArgs {
+            ref_key: RefKey::new("test/db", "feature"),
+            queue_id: 42,
+            reason: PoisonReason::PushCasFailed {
+                head_at_worker: Some(cid(2)),
+                expected_by_chain: Some(cid(3)),
+            },
+        });
+    }
+
+    #[test]
+    fn apply_queue_poison_args_round_trips_worker_panic_variant() {
+        // The last-resort variant. Carries an arbitrary string
+        // payload; round-trip preserves it byte-for-byte.
+        assert_queue_poison_args_round_trip(ApplyQueuePoisonArgs {
+            ref_key: RefKey::new("test/db", "main"),
+            queue_id: 5,
+            reason: PoisonReason::WorkerPanic {
+                message: "future-proofed invariant slip in third-party crate".to_string(),
+            },
+        });
     }
 
     // ----------------------------------------------------------------

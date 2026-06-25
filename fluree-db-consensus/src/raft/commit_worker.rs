@@ -28,15 +28,15 @@
 //! - Token-bearing fields in [`crate::QueuedRequest::governance`]
 //!   travel verbatim; redaction is future work.
 
+use async_trait::async_trait;
+
 use crate::local::build_policy_context;
 use crate::raft::ownership::owner;
 use crate::raft::staged_receipt::{
     AppliedReceipt, MergeApplied, PushApplied, RebaseApplied, RevertApplied, StagedReceiptMap,
     TransactApplied,
 };
-use crate::raft::state_machine::{
-    BodyKind, Command as SmCommand, PoisonQueueEntryArgs, PoisonReason, QueueEntry, RefKey,
-};
+use crate::raft::state_machine::{BodyKind, PoisonReason, QueueEntry, RefKey};
 use crate::raft::state_machine_adapter::SharedState;
 use crate::raft::{NodeId, TypeConfig};
 use crate::{
@@ -55,7 +55,7 @@ use openraft::Raft;
 use std::collections::{HashMap, HashSet};
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 use thiserror::Error;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -93,6 +93,61 @@ const MAX_STAGE_ATTEMPTS: u32 = 3;
 /// through a transient hiccup.
 const STAGE_RETRY_BASE_BACKOFF: Duration = Duration::from_millis(100);
 
+/// Cross-node propose path for [`SmCommand::PoisonQueueEntry`].
+///
+/// `Stager`s running on a follower can't propose to raft directly —
+/// `client_write` returns `ForwardToLeader` for non-leader proposes
+/// — so a deterministic poison (e.g. [`PoisonReason::BodyMalformed`])
+/// would otherwise bounce forever and head-of-line-block the
+/// branch. Implementations dispatch by local-leader status, mirroring
+/// how [`CommitPublisher::publish_commit`] routes `ApplyHead` via
+/// `RaftNameService::publish_commit_via_leader` on a follower.
+#[async_trait]
+pub trait QueuePoisonPublisher: Send + Sync {
+    /// Propose `PoisonQueueEntry` for the given queue entry. On a
+    /// follower, ferries the args to the current leader's
+    /// `apply_queue_poison` endpoint; on the leader, calls
+    /// `client_write` directly. Either way returns `Ok(())` once
+    /// the poison is durably proposed.
+    async fn poison_queue_entry(
+        &self,
+        ref_key: &RefKey,
+        queue_id: u64,
+        reason: PoisonReason,
+    ) -> Result<(), QueuePoisonError>;
+}
+
+/// Failure modes for [`QueuePoisonPublisher::poison_queue_entry`].
+///
+/// All variants are surfaced to the stager's outer `WorkerError::Raft`
+/// path, which logs and backs off. Distinguishing them at this layer
+/// keeps the cause explicit in logs without forcing the stager to
+/// switch on opaque strings.
+#[derive(Debug, Error)]
+pub enum QueuePoisonError {
+    /// Local `client_write` rejected the propose (leader-side path),
+    /// or the leader's `client_write` rejected it after the
+    /// follower forwarded.
+    #[error("raft propose failed: {0}")]
+    RaftPropose(String),
+    /// HTTP-level failure ferrying the poison to the leader: connect
+    /// refused, timeout, leader address missing from membership, etc.
+    #[error("apply_queue_poison transport: {0}")]
+    Transport(String),
+    /// Leader returned a non-success HTTP status (transport-layer
+    /// failure on the leader side — distinct from a structured
+    /// `Result::Err` body returned with 200).
+    #[error("apply_queue_poison returned HTTP {0}")]
+    HttpStatus(String),
+    /// Postcard encode/decode of the request or response failed.
+    #[error("apply_queue_poison codec: {0}")]
+    Codec(String),
+    /// No leader currently elected — `current_leader()` returned
+    /// `None`. The stager backs off and retries on the next loop tick.
+    #[error("no leader currently elected; poison deferred")]
+    NoLeader,
+}
+
 /// Per-branch staging task.
 ///
 /// Drains a single branch's queue: peeks the front, stages the
@@ -111,8 +166,12 @@ const STAGE_RETRY_BASE_BACKOFF: Duration = Duration::from_millis(100);
 #[derive(Clone)]
 pub struct Stager {
     ref_key: RefKey,
-    raft: Arc<Raft<TypeConfig>>,
     publisher: Arc<dyn CommitPublisher>,
+    /// Leader-aware sink for `PoisonQueueEntry`. On a follower this
+    /// ferries the propose to the current leader rather than
+    /// looping forever on `client_write` returning
+    /// `ForwardToLeader`.
+    poison_publisher: Arc<dyn QueuePoisonPublisher>,
     fluree: Arc<Fluree>,
     index_config: IndexConfig,
     shared_state: SharedState,
@@ -127,8 +186,8 @@ pub struct Stager {
 impl Stager {
     fn new(
         ref_key: RefKey,
-        raft: Arc<Raft<TypeConfig>>,
         publisher: Arc<dyn CommitPublisher>,
+        poison_publisher: Arc<dyn QueuePoisonPublisher>,
         fluree: Arc<Fluree>,
         index_config: IndexConfig,
         shared_state: SharedState,
@@ -136,8 +195,8 @@ impl Stager {
     ) -> Self {
         Self {
             ref_key,
-            raft,
             publisher,
+            poison_publisher,
             fluree,
             index_config,
             shared_state,
@@ -831,21 +890,15 @@ impl Stager {
     }
 
     async fn propose_poison(&self, queue_id: u64, reason: PoisonReason) -> Result<(), WorkerError> {
-        let cmd = SmCommand::PoisonQueueEntry(PoisonQueueEntryArgs {
-            ledger_id: self.ref_key.ledger_name.clone(),
-            branch: self.ref_key.branch.clone(),
-            queue_id,
-            reason,
-            applied_at_millis: current_millis(),
-        });
-        // The state-machine response (`Poisoned` vs `QueueDesync`) is
-        // informational once the poison is durably proposed — either
-        // way the entry is done from the stager's perspective. Only
-        // surface Raft-side failures.
-        self.raft
-            .client_write(cmd)
+        // Route through the publisher's leader-aware path: on a
+        // follower this ferries to the leader's `apply_queue_poison`
+        // endpoint, on the leader it calls `client_write` directly.
+        // Without the indirection a follower-owned stager would
+        // bounce `ForwardToLeader` indefinitely and the branch's
+        // queue front would stall on a deterministic poison.
+        self.poison_publisher
+            .poison_queue_entry(&self.ref_key, queue_id, reason)
             .await
-            .map(|_| ())
             .map_err(|e| WorkerError::Raft(format!("PoisonQueueEntry propose failed: {e}")))
     }
 
@@ -1003,26 +1056,45 @@ pub struct StagerSupervisor {
     id: NodeId,
     raft: Arc<Raft<TypeConfig>>,
     publisher: Arc<dyn CommitPublisher>,
+    poison_publisher: Arc<dyn QueuePoisonPublisher>,
     fluree: Arc<Fluree>,
     index_config: IndexConfig,
     shared_state: SharedState,
     staged_receipts: Arc<StagedReceiptMap>,
 }
 
+/// Components the [`StagerSupervisor`] assembles into a single
+/// long-running task. Bundled so the constructor stays one
+/// positional struct argument as the dependency set grows — same
+/// pattern as `RaftIntegrationParts` in fluree-db-server.
+pub struct StagerSupervisorParts {
+    pub id: NodeId,
+    pub raft: Arc<Raft<TypeConfig>>,
+    pub publisher: Arc<dyn CommitPublisher>,
+    pub poison_publisher: Arc<dyn QueuePoisonPublisher>,
+    pub fluree: Arc<Fluree>,
+    pub index_config: IndexConfig,
+    pub shared_state: SharedState,
+    pub staged_receipts: Arc<StagedReceiptMap>,
+}
+
 impl StagerSupervisor {
-    pub fn new(
-        id: NodeId,
-        raft: Arc<Raft<TypeConfig>>,
-        publisher: Arc<dyn CommitPublisher>,
-        fluree: Arc<Fluree>,
-        index_config: IndexConfig,
-        shared_state: SharedState,
-        staged_receipts: Arc<StagedReceiptMap>,
-    ) -> Self {
+    pub fn new(parts: StagerSupervisorParts) -> Self {
+        let StagerSupervisorParts {
+            id,
+            raft,
+            publisher,
+            poison_publisher,
+            fluree,
+            index_config,
+            shared_state,
+            staged_receipts,
+        } = parts;
         Self {
             id,
             raft,
             publisher,
+            poison_publisher,
             fluree,
             index_config,
             shared_state,
@@ -1148,8 +1220,8 @@ impl StagerSupervisor {
     fn make_stager(&self, ref_key: RefKey) -> Stager {
         Stager::new(
             ref_key,
-            Arc::clone(&self.raft),
             Arc::clone(&self.publisher),
+            Arc::clone(&self.poison_publisher),
             Arc::clone(&self.fluree),
             self.index_config.clone(),
             self.shared_state.clone(),
@@ -1179,13 +1251,6 @@ fn check_envelope_kind(body_kind: BodyKind, envelope: &QueuedRequest) -> Result<
             ),
         }))
     }
-}
-
-fn current_millis() -> u64 {
-    SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
 }
 
 fn stage_failure(message: &str) -> WorkerError {

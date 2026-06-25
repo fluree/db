@@ -56,6 +56,11 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 use tracing::info;
 
+#[cfg(feature = "raft")]
+use fluree_db_consensus::raft::commit_worker::{
+    QueuePoisonPublisher, StagerSupervisor, StagerSupervisorParts,
+};
+
 /// Private listener config for the Raft inter-node RPC + admin
 /// routers. Only populated when the server is constructed with a
 /// Raft handle via [`FlureeServer::new_with_raft`].
@@ -624,18 +629,25 @@ impl FlureeServerBuilder {
             );
             let publisher: std::sync::Arc<dyn fluree_db_nameservice::CommitPublisher> =
                 std::sync::Arc::clone(&raft_ns) as _;
-            let supervisor = fluree_db_consensus::raft::commit_worker::StagerSupervisor::new(
-                integration.id,
-                Arc::clone(&integration.raft),
+            // Same `RaftNameService` Arc upcast a second time, this
+            // time to the queue-poison publisher trait so a follower-
+            // owned stager can ferry deterministic poisons to the
+            // leader instead of looping forever on `client_write`
+            // returning `ForwardToLeader`.
+            let poison_publisher: Arc<dyn QueuePoisonPublisher> = Arc::clone(&raft_ns) as _;
+            let supervisor = StagerSupervisor::new(StagerSupervisorParts {
+                id: integration.id,
+                raft: Arc::clone(&integration.raft),
                 publisher,
-                Arc::clone(&state_inner.fluree),
-                state_inner
+                poison_publisher,
+                fluree: Arc::clone(&state_inner.fluree),
+                index_config: state_inner
                     .index_config
                     .clone()
                     .expect("index_config set by AppState::new"),
-                integration.shared_state.clone(),
-                Arc::clone(&integration.staged_receipts),
-            );
+                shared_state: integration.shared_state.clone(),
+                staged_receipts: Arc::clone(&integration.staged_receipts),
+            });
             crate::raft::spawn_stager_supervisor(supervisor)
         });
 

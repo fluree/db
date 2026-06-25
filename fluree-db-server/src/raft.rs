@@ -28,7 +28,7 @@ use fluree_db_consensus::raft::{
     admin as raft_admin,
     forward::LeaderForwarder,
     log_adapter::LogAdapter,
-    nameservice::{apply_staged_commit_router, RaftNameService},
+    nameservice::{apply_queue_poison_router, apply_staged_commit_router, RaftNameService},
     network::{self as raft_network, HttpRaftNetworkFactory, NetworkConfig},
     staged_receipt::StagedReceiptMap,
     state_machine_adapter::{SharedState, StateMachineAdapter},
@@ -242,10 +242,12 @@ impl RaftIntegration {
     ///
     /// Includes both the openraft RPCs (append-entries, vote,
     /// install-snapshot) and the cross-node `apply_staged_commit`
-    /// endpoint follower stagers POST to.
+    /// and `apply_queue_poison` endpoints follower-owned stagers
+    /// POST to.
     pub fn raft_rpc_router(&self) -> Router {
         raft_network::router(Arc::clone(&self.raft), &self.network_config)
             .merge(apply_staged_commit_router(Arc::clone(&self.nameservice)))
+            .merge(apply_queue_poison_router(Arc::clone(&self.nameservice)))
     }
 
     /// Borrow the shared [`RaftNameService`] handle. The integration
