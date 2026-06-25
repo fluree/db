@@ -957,6 +957,33 @@ impl Stager {
     }
 }
 
+/// Abort every handle, then await each one. The two-phase
+/// shape — signal all first, await all second — has two
+/// properties the supervisor needs:
+///
+/// - Cancellation fans out concurrently: every task receives the
+///   abort signal before we start waiting on the first one.
+/// - The caller is blocked until every aborted task has reached
+///   its `Drop`. Without that, a follow-up spawn for the same
+///   `RefKey` (a fast ownership flap) could race the to-be-dropped
+///   task on shared state like [`StagedReceiptMap`].
+///
+/// `JoinError::Cancelled` is the expected outcome after `abort`;
+/// a panic surfaces here too. Both are discarded — the caller is
+/// already past the point where the task could affect correctness.
+async fn abort_and_await<I>(handles: I)
+where
+    I: IntoIterator<Item = JoinHandle<()>>,
+{
+    let handles: Vec<_> = handles.into_iter().collect();
+    for handle in &handles {
+        handle.abort();
+    }
+    for handle in handles {
+        let _ = handle.await;
+    }
+}
+
 /// Supervises per-branch [`Stager`]s on this node. Watches the
 /// replicated [`NameServiceState::queues`] and the cluster's voter
 /// set, computes which branches this node owns under rendezvous
@@ -1026,7 +1053,7 @@ impl StagerSupervisor {
 
         loop {
             let desired = self.compute_desired_owners().await;
-            self.reconcile_stagers(&mut stagers, desired);
+            self.reconcile_stagers(&mut stagers, desired).await;
 
             tokio::select! {
                 // Metrics changed (membership, leader, term, index, …).
@@ -1043,9 +1070,12 @@ impl StagerSupervisor {
             }
         }
 
-        for (_, handle) in stagers.drain() {
-            handle.abort();
-        }
+        // Shutdown drain: same await-on-abort discipline reconcile
+        // uses. The caller wraps `run` in `CancellableTaskHandle::shutdown`,
+        // which awaits the supervisor's JoinHandle — without the
+        // inner await here, that outer await returns while stagers
+        // are still racing on shutdown.
+        abort_and_await(stagers.drain().map(|(_, h)| h)).await;
     }
 
     async fn compute_desired_owners(&self) -> HashSet<RefKey> {
@@ -1075,13 +1105,22 @@ impl StagerSupervisor {
             .collect()
     }
 
-    /// Spawn stagers for newly-desired branches; abort stagers for
-    /// branches no longer owned. Dead handles (a stager that exited
-    /// on its own — should not happen under normal operation since
-    /// `Stager::run` loops forever and panics are caught per-entry)
-    /// are left in place: they'll be removed on the next ownership
-    /// change, or stay dormant until the supervisor restarts.
-    fn reconcile_stagers(
+    /// Spawn stagers for newly-desired branches; tear down stagers
+    /// for branches no longer owned. Dead handles (a stager that
+    /// exited on its own — should not happen under normal operation
+    /// since `Stager::run` loops forever and panics are caught
+    /// per-entry) are left in place: they'll be removed on the next
+    /// ownership change, or stay dormant until the supervisor
+    /// restarts.
+    ///
+    /// Teardown uses [`abort_and_await`] — every aborted handle is
+    /// awaited before this method returns. That serialization is
+    /// what guarantees a fast ownership flap (the same `RefKey`
+    /// moves away and back inside one supervisor tick) can't
+    /// respawn a stager before the previous task has fully yielded;
+    /// the two would otherwise race on the shared
+    /// [`StagedReceiptMap`] under that `RefKey`.
+    async fn reconcile_stagers(
         &self,
         stagers: &mut HashMap<RefKey, JoinHandle<()>>,
         desired: HashSet<RefKey>,
@@ -1092,14 +1131,18 @@ impl StagerSupervisor {
                 stagers.insert(key.clone(), handle);
             }
         }
-        stagers.retain(|key, handle| {
-            if desired.contains(key) {
-                true
-            } else {
-                handle.abort();
-                false
-            }
-        });
+        // Two-step removal: HashMap::extract_if is unstable, so
+        // collect the keys we no longer want first, then pull each
+        // handle out by key. The intermediate Vec is bounded by the
+        // number of branches whose ownership just moved off this
+        // node — small under any realistic deployment.
+        let to_drop: Vec<RefKey> = stagers
+            .keys()
+            .filter(|key| !desired.contains(*key))
+            .cloned()
+            .collect();
+        let dropped = to_drop.into_iter().filter_map(|key| stagers.remove(&key));
+        abort_and_await(dropped).await;
     }
 
     fn make_stager(&self, ref_key: RefKey) -> Stager {
@@ -1509,5 +1552,51 @@ mod tests {
     fn panic_message_falls_back_for_unknown_payload() {
         let payload: Box<dyn std::any::Any + Send> = Box::new(42u32);
         assert_eq!(panic_message(payload), "non-string panic payload");
+    }
+
+    /// `abort_and_await` must return only after every aborted task
+    /// has reached its `Drop`. Without that property, the
+    /// supervisor's `reconcile_stagers` could respawn a stager for
+    /// a `RefKey` while the previous task is still in-flight on
+    /// the shared `StagedReceiptMap`. The test stands in for the
+    /// supervisor's contract: park a fleet of tasks on a never-
+    /// resolving future, have each one decrement an `AliveGuard`
+    /// in Drop, abort+await them as a batch, and assert the
+    /// counter is back to zero by the time the await returns.
+    #[tokio::test]
+    async fn abort_and_await_waits_for_every_task_to_drop() {
+        use std::future::pending;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct AliveGuard(Arc<AtomicUsize>);
+        impl Drop for AliveGuard {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+
+        let alive = Arc::new(AtomicUsize::new(0));
+        let handles: Vec<JoinHandle<()>> = (0..4)
+            .map(|_| {
+                alive.fetch_add(1, Ordering::SeqCst);
+                let guard = AliveGuard(Arc::clone(&alive));
+                tokio::spawn(async move {
+                    let _g = guard;
+                    pending::<()>().await;
+                })
+            })
+            .collect();
+        // Sanity check: every spawned task is alive before we
+        // touch them. If this fails, the test setup is broken
+        // and the assertion below would be misleading.
+        assert_eq!(alive.load(Ordering::SeqCst), 4);
+
+        super::abort_and_await(handles).await;
+
+        assert_eq!(
+            alive.load(Ordering::SeqCst),
+            0,
+            "every aborted task's Drop must run before abort_and_await returns"
+        );
     }
 }
