@@ -466,15 +466,16 @@ async fn property_path_array_form() {
 
 #[tokio::test]
 async fn property_path_unsupported_operator_error() {
-    // Composite-transitive supports forward sequence steps, but an INVERSE step
-    // inside the repeated unit — `(^ex:knows/ex:knows)+` — is not yet supported.
+    // Composite-transitive steps may be simple, alternations, or inverse, but a
+    // NESTED transitive step inside the repeated unit — `(ex:knows+/ex:knows)+` —
+    // is still rejected.
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger1 = seed_knows_chain(&fluree, "property/path-unsupported:main").await;
 
     let q = json!({
         "@context": {
             "ex": "http://example.org/",
-            "weird": {"@path": "(^ex:knows/ex:knows)+"}
+            "weird": {"@path": "(ex:knows+/ex:knows)+"}
         },
         "where": [{"@id":"ex:a","weird":"?who"}],
         "select": ["?who"]
@@ -482,7 +483,44 @@ async fn property_path_unsupported_operator_error() {
     let err = support::query_jsonld(&fluree, &ledger1, &q).await;
     assert!(
         err.is_err(),
-        "An inverse step inside a composite repeated unit should be rejected"
+        "A nested transitive step inside a composite repeated unit should be rejected"
+    );
+}
+
+#[tokio::test]
+async fn property_path_composite_transitive_inverse_step() {
+    // JSON-LD parity for SPARQL `(^ex:p/ex:q)+`. hub0/hub1 each link a pair of
+    // nodes (hub p x0, hub q x1), making `^p/q` the co-parent relation:
+    // x0 (^p/q) x1 via hub0, x1 (^p/q) x2 via hub1. Transitively from x0:
+    // {x1, x2}.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "property/path-composite-inv:main");
+    let insert = json!({
+        "@context": {"ex": "http://example.org/"},
+        "@graph": [
+            {"@id": "ex:hub0", "ex:p": {"@id": "ex:x0"}, "ex:q": {"@id": "ex:x1"}},
+            {"@id": "ex:hub1", "ex:p": {"@id": "ex:x1"}, "ex:q": {"@id": "ex:x2"}}
+        ]
+    });
+    let ledger1 = fluree.insert(ledger0, &insert).await.unwrap().ledger;
+
+    let q = json!({
+        "@context": {
+            "ex": "http://example.org/",
+            "coParent": {"@path": "(^ex:p/ex:q)+"}
+        },
+        "where": [{"@id":"ex:x0","coParent":"?who"}],
+        "select": ["?who"]
+    });
+    let rows = support::query_jsonld(&fluree, &ledger1, &q)
+        .await
+        .unwrap()
+        .to_jsonld(&ledger1.snapshot)
+        .unwrap();
+    assert_eq!(
+        normalize_rows(&rows),
+        normalize_rows(&json!([["ex:x1"], ["ex:x2"]])),
+        "(^p/q)+ from x0 = {{x1, x2}}: {rows}"
     );
 }
 

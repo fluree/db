@@ -730,12 +730,13 @@ intermediate variables. Each step must be a simple predicate or an inverse simpl
 predicate (`^ex:p`). For example, `"ex:friend/ex:name"` matches paths where
 subject has a `ex:friend` whose `ex:name` is the result.
 
+Composite steps may be simple predicates, alternations of simple predicates, or
+either of those inverted (`(^ex:a/ex:b)+`, where a step runs backward).
+
 **Not Yet Supported:**
 
-A transitive/optional modifier over a composite sub-path supports **forward**
-steps only (`(ex:a/ex:b)+`, or alternations of forward predicates like
-`(ex:a/(ex:b|ex:c))+`). An **inverse** step inside the repeated unit — e.g.
-`(^ex:a/ex:b)+` — is rejected.
+A **nested transitive** step inside a composite repeated unit is rejected — e.g.
+`(ex:a+/ex:b)+`, where a step of the repeated sub-path is itself quantified.
 
 **Subject and Object Variables:**
 

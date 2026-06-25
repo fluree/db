@@ -23,7 +23,7 @@ use crate::ir::{
     Query, QueryOutput, Restriction, Root,
 };
 use crate::ir::{
-    Expression, Function, IndexSearchPattern, IndexSearchTarget, PathModifier, Pattern,
+    Expression, Function, IndexSearchPattern, IndexSearchTarget, PathModifier, PathStep, Pattern,
     PropertyPathPattern, ShortestPathPattern, SubqueryPattern, VectorSearchPattern,
     VectorSearchTarget,
 };
@@ -1243,16 +1243,21 @@ fn expect_simple_iri(path: &UnresolvedPathExpr) -> Result<&Arc<str>> {
     }
 }
 
-/// Resolve the per-step predicate Sid sets of a composite-transitive path
-/// `(p1/p2/…)+`. Each step must be a simple predicate or an alternation of
-/// simple predicates (forward only); other step shapes are rejected.
+/// Resolve the per-step [`PathStep`]s of a composite-transitive path
+/// `(p1/p2/…)+`. Each step must be a simple predicate, an alternation of simple
+/// predicates, or either of those inverted (`^p`, `^(a|b)`); other step shapes
+/// are rejected.
 fn extract_composite_path_steps<E: IriEncoder>(
     steps: &[UnresolvedPathExpr],
     encoder: &E,
-) -> Result<Vec<Vec<fluree_db_core::Sid>>> {
+) -> Result<Vec<PathStep>> {
     let mut out = Vec::with_capacity(steps.len());
     for step in steps {
-        let iris = extract_transitive_predicate_iris(step)?;
+        let (inner, inverse) = match step {
+            UnresolvedPathExpr::Inverse(inner) => (inner.as_ref(), true),
+            other => (other, false),
+        };
+        let iris = extract_transitive_predicate_iris(inner)?;
         let mut sids = Vec::with_capacity(iris.len());
         for iri in iris {
             sids.push(
@@ -1261,7 +1266,10 @@ fn extract_composite_path_steps<E: IriEncoder>(
                     .ok_or_else(|| ParseError::UnknownNamespace(iri.to_string()))?,
             );
         }
-        out.push(sids);
+        out.push(PathStep {
+            predicates: sids,
+            inverse,
+        });
     }
     Ok(out)
 }

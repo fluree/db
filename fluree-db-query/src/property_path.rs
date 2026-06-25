@@ -141,58 +141,93 @@ impl PropertyPathOperator {
 
     /// One forward hop from `node`. For a simple/alternation path this is the
     /// ref objects of `(node, p, ?)` over every traversed predicate. For a
-    /// composite path `(p1/p2/…)+` it follows the whole sub-path — step 1
-    /// (`predicates`) then each `sequence_steps` entry — and returns the set of
-    /// nodes reachable by exactly one composite hop.
+    /// composite path `(p1/p2/…)+` it follows the whole sub-path — the first
+    /// step (`predicates`, `first_inverse`) then each `sequence_steps` entry,
+    /// each honoring its own direction — and returns the set of nodes reachable
+    /// by exactly one composite hop.
     async fn forward_step(&self, ctx: &ExecutionContext<'_>, node: &Sid) -> Result<Vec<Sid>> {
+        // Traversing a step forward reads SPOT for a forward step and POST for
+        // an inverse step (`^p` follows object→subject).
         let mut frontier = self
-            .step_forward(ctx, std::slice::from_ref(node), &self.pattern.predicates)
+            .read_step(
+                ctx,
+                std::slice::from_ref(node),
+                &self.pattern.predicates,
+                self.pattern.first_inverse,
+            )
             .await?;
         for step in &self.pattern.sequence_steps {
             if frontier.is_empty() {
                 break;
             }
-            frontier = self.step_forward(ctx, &frontier, step).await?;
+            frontier = self
+                .read_step(ctx, &frontier, &step.predicates, step.inverse)
+                .await?;
         }
         Ok(frontier)
     }
 
     /// One backward hop into `node`: the sources from which a single (composite)
-    /// hop reaches `node`. Walks a composite unit in reverse — last sequence
-    /// step first, `predicates` last.
+    /// hop reaches `node`. Walks the unit in reverse, and each step is retreated
+    /// the opposite way it is advanced (a forward step retreats via POST, an
+    /// inverse step via SPOT).
     async fn backward_step(&self, ctx: &ExecutionContext<'_>, node: &Sid) -> Result<Vec<Sid>> {
         let mut frontier = vec![node.clone()];
         for step in self.pattern.sequence_steps.iter().rev() {
-            frontier = self.step_backward(ctx, &frontier, step).await?;
+            frontier = self
+                .read_step(ctx, &frontier, &step.predicates, !step.inverse)
+                .await?;
             if frontier.is_empty() {
                 return Ok(frontier);
             }
         }
-        self.step_backward(ctx, &frontier, &self.pattern.predicates)
-            .await
+        self.read_step(
+            ctx,
+            &frontier,
+            &self.pattern.predicates,
+            !self.pattern.first_inverse,
+        )
+        .await
     }
 
-    /// Advance a frontier one forward step: the deduped union of ref objects of
-    /// `(n, p, ?)` for every `n` in `nodes` and every predicate in `preds`.
-    async fn step_forward(
+    /// Advance a frontier across one step in a chosen index direction: the
+    /// deduped union over every `n` in `nodes` and every predicate in `preds`.
+    /// `use_post = false` reads SPOT (subject `n` → ref objects); `use_post =
+    /// true` reads POST (object `n` ← subjects). Forward traversal of a forward
+    /// step (and backward traversal of an inverse step) uses SPOT; the opposite
+    /// pairings use POST.
+    async fn read_step(
         &self,
         ctx: &ExecutionContext<'_>,
         nodes: &[Sid],
         preds: &[Sid],
+        use_post: bool,
     ) -> Result<Vec<Sid>> {
         let (db, overlay, to_t) = ctx.require_single_graph()?;
         let mut out = Vec::new();
         let mut seen: HashSet<Sid> = HashSet::new();
         for node in nodes {
             for pred in preds {
-                let range_match = RangeMatch::new()
-                    .with_subject(node.clone())
-                    .with_predicate(pred.clone());
+                let (index, range_match) = if use_post {
+                    (
+                        IndexType::Post,
+                        RangeMatch::new()
+                            .with_predicate(pred.clone())
+                            .with_object(FlakeValue::Ref(node.clone())),
+                    )
+                } else {
+                    (
+                        IndexType::Spot,
+                        RangeMatch::new()
+                            .with_subject(node.clone())
+                            .with_predicate(pred.clone()),
+                    )
+                };
                 let flakes = range_with_overlay(
                     db,
                     ctx.binary_g_id,
                     overlay,
-                    IndexType::Spot,
+                    index,
                     RangeTest::Eq,
                     range_match,
                     RangeOptions::new().with_to_t(to_t),
@@ -200,47 +235,18 @@ impl PropertyPathOperator {
                 .await?;
                 let flakes = self.filter_edges(ctx, flakes).await?;
                 for flake in flakes {
-                    if let FlakeValue::Ref(o) = flake.o {
-                        if seen.insert(o.clone()) {
-                            out.push(o);
+                    // POST yields the subject side; SPOT yields the ref object.
+                    let next = if use_post {
+                        Some(flake.s)
+                    } else if let FlakeValue::Ref(o) = flake.o {
+                        Some(o)
+                    } else {
+                        None
+                    };
+                    if let Some(n) = next {
+                        if seen.insert(n.clone()) {
+                            out.push(n);
                         }
-                    }
-                }
-            }
-        }
-        Ok(out)
-    }
-
-    /// Retreat a frontier one backward step: the deduped union of subjects of
-    /// `(?, p, n)` for every `n` in `nodes` and every predicate in `preds`.
-    async fn step_backward(
-        &self,
-        ctx: &ExecutionContext<'_>,
-        nodes: &[Sid],
-        preds: &[Sid],
-    ) -> Result<Vec<Sid>> {
-        let (db, overlay, to_t) = ctx.require_single_graph()?;
-        let mut out = Vec::new();
-        let mut seen: HashSet<Sid> = HashSet::new();
-        for node in nodes {
-            for pred in preds {
-                let range_match = RangeMatch::new()
-                    .with_predicate(pred.clone())
-                    .with_object(FlakeValue::Ref(node.clone()));
-                let flakes = range_with_overlay(
-                    db,
-                    ctx.binary_g_id,
-                    overlay,
-                    IndexType::Post,
-                    RangeTest::Eq,
-                    range_match,
-                    RangeOptions::new().with_to_t(to_t),
-                )
-                .await?;
-                let flakes = self.filter_edges(ctx, flakes).await?;
-                for flake in flakes {
-                    if seen.insert(flake.s.clone()) {
-                        out.push(flake.s);
                     }
                 }
             }
@@ -517,8 +523,10 @@ impl PropertyPathOperator {
         Ok(out)
     }
 
-    /// Distinct subjects of any first-step predicate — the nodes from which a
-    /// composite hop can begin. Used to seed the both-unbound closure.
+    /// The nodes from which a composite hop can begin — the endpoints touched by
+    /// the first step: its edges' subjects for a forward leading step, or their
+    /// ref objects when the leading step is inverse. Used to seed the
+    /// both-unbound closure.
     async fn composite_start_candidates(&self, ctx: &ExecutionContext<'_>) -> Result<Vec<Sid>> {
         let (db, overlay, to_t) = ctx.require_single_graph()?;
         let mut seen: HashSet<Sid> = HashSet::new();
@@ -537,8 +545,18 @@ impl PropertyPathOperator {
             .await?;
             let flakes = self.filter_edges(ctx, flakes).await?;
             for flake in flakes {
-                if seen.insert(flake.s.clone()) {
-                    out.push(flake.s);
+                let candidate = if self.pattern.first_inverse {
+                    match flake.o {
+                        FlakeValue::Ref(o) => Some(o),
+                        _ => None,
+                    }
+                } else {
+                    Some(flake.s)
+                };
+                if let Some(c) = candidate {
+                    if seen.insert(c.clone()) {
+                        out.push(c);
+                    }
                 }
             }
         }

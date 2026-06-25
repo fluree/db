@@ -186,7 +186,7 @@ A negated set matches any predicate **not** listed. Forward members (`ex:a`) con
 ?person (ex:parent/ex:knows)+ ?reached .
 ```
 
-A `+`, `*`, or `?` modifier can be applied to a forward sequence: each hop follows the entire sub-path. `(ex:p/ex:q)+` repeatedly follows `ex:p` then `ex:q`; `*` adds the zero-length start, `?` is the start plus exactly one composite hop. Sequence steps may themselves be alternations of simple predicates (`(ex:a/(ex:b|ex:c))+`).
+A `+`, `*`, or `?` modifier can be applied to a sequence: each hop follows the entire sub-path. `(ex:p/ex:q)+` repeatedly follows `ex:p` then `ex:q`; `*` adds the zero-length start, `?` is the start plus exactly one composite hop. Sequence steps may be alternations of simple predicates (`(ex:a/(ex:b|ex:c))+`) and may be inverted (`(^ex:p/ex:q)+`, where the first step runs backward).
 
 **Inverse (`^`):**
 
@@ -270,7 +270,7 @@ Multiple alternative steps are supported: `(ex:a|ex:b)/(ex:c|ex:d)` expands to 4
 
 #### Not Yet Supported
 
-An **inverse** step inside a composite repeated unit is not yet supported — for example `(^ex:a/ex:b)+`, where one step of the repeated sub-path runs backward. Composite-transitive paths currently require all steps to be forward (`(ex:a/ex:b)+`) or alternations of forward predicates (`(ex:a/(ex:b|ex:c))+`). Workaround: rewrite the unit so each repeated step is forward, or expand a known-depth path into a `UNION` of fixed-length joins.
+A **nested transitive** step inside a composite repeated unit is not yet supported — for example `(ex:a+/ex:b)+`, where a step of the repeated sub-path is itself transitive. Composite steps may be simple predicates, alternations of simple predicates, or either of those inverted (`(^ex:a/ex:b)+`), but not themselves quantified. Workaround: lift the inner closure out, or expand a known-depth path into a `UNION` of fixed-length joins.
 
 ## Query Modifiers
 

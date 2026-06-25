@@ -17,6 +17,35 @@ pub enum PathModifier {
     ZeroOrOne,
 }
 
+/// One step of a composite-path repeated unit: a non-empty set of predicate
+/// alternatives plus a traversal direction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PathStep {
+    /// Predicate alternatives for this step (the step follows an edge of any).
+    /// Never empty.
+    pub predicates: Vec<Sid>,
+    /// When `true` the step runs against the object→subject direction (`^p`).
+    pub inverse: bool,
+}
+
+impl PathStep {
+    /// A forward step over `predicates`.
+    pub fn forward(predicates: Vec<Sid>) -> Self {
+        Self {
+            predicates,
+            inverse: false,
+        }
+    }
+
+    /// An inverse step over `predicates`.
+    pub fn inverse(predicates: Vec<Sid>) -> Self {
+        Self {
+            predicates,
+            inverse: true,
+        }
+    }
+}
+
 /// Resolved property path pattern for transitive traversal.
 ///
 /// Produced by `@path` aliases with `+` or `*` modifiers, e.g.:
@@ -30,12 +59,15 @@ pub struct PropertyPathPattern {
     /// alternation-transitive path `(a|b|…)*` — the step follows an edge of ANY
     /// listed predicate (SPARQL `(a|b)*`, Cypher `[:A|B*]`). Never empty.
     pub predicates: Vec<Sid>,
-    /// Additional forward steps making each hop a composite sub-path
-    /// `(p1/p2/…)+`. Empty for the simple/alternation case. When non-empty, one
-    /// hop follows `predicates` (step 1) then each entry here in order; each
-    /// inner `Vec` is that step's alternation set (so `(a/(b|c))+` is
-    /// `predicates=[a]`, `sequence_steps=[[b, c]]`). All steps are forward.
-    pub sequence_steps: Vec<Vec<Sid>>,
+    /// Direction of the first step (`predicates`). Only ever `true` for a
+    /// composite path whose leading step is inverse (`(^a/b)+`); a plain inverse
+    /// path (`^p+`) is lowered by swapping subject/object, so it stays `false`.
+    pub first_inverse: bool,
+    /// Additional steps making each hop a composite sub-path `(p1/p2/…)+`. Empty
+    /// for the simple/alternation case. When non-empty, one hop follows
+    /// `(predicates, first_inverse)` then each step here in order (so `(a/^b)+`
+    /// is `predicates=[a]`, `first_inverse=false`, `sequence_steps=[^[b]]`).
+    pub sequence_steps: Vec<PathStep>,
     /// Path modifier (+, *, or ?)
     pub modifier: PathModifier,
     /// Object ref (Var or Sid — literals not allowed)
@@ -48,6 +80,7 @@ impl PropertyPathPattern {
         Self {
             subject,
             predicates: vec![predicate],
+            first_inverse: false,
             sequence_steps: Vec::new(),
             modifier,
             object,
@@ -67,30 +100,32 @@ impl PropertyPathPattern {
         Self {
             subject,
             predicates,
+            first_inverse: false,
             sequence_steps: Vec::new(),
             modifier,
             object,
         }
     }
 
-    /// Create a composite-transitive path `(p1/p2/…)+` from per-step alternation
-    /// sets (`steps[0]` is the first step, etc.). Requires ≥2 steps, each
-    /// non-empty; for a single step use [`Self::new_alternatives`].
+    /// Create a composite-transitive path `(p1/p2/…)+` from per-step
+    /// [`PathStep`]s (`steps[0]` is the first step, etc.). Requires ≥2 steps,
+    /// each with ≥1 predicate; for a single step use [`Self::new_alternatives`].
     pub fn new_composite(
         subject: Ref,
-        mut steps: Vec<Vec<Sid>>,
+        mut steps: Vec<PathStep>,
         modifier: PathModifier,
         object: Ref,
     ) -> Self {
         debug_assert!(steps.len() >= 2, "composite path needs ≥2 steps");
         debug_assert!(
-            steps.iter().all(|s| !s.is_empty()),
+            steps.iter().all(|s| !s.predicates.is_empty()),
             "each composite step needs ≥1 predicate"
         );
-        let predicates = steps.remove(0);
+        let first = steps.remove(0);
         Self {
             subject,
-            predicates,
+            predicates: first.predicates,
+            first_inverse: first.inverse,
             sequence_steps: steps,
             modifier,
             object,

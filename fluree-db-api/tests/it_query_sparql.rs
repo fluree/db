@@ -5200,6 +5200,49 @@ async fn sparql_composite_transitive_sequence() {
 }
 
 #[tokio::test]
+async fn sparql_composite_transitive_inverse_step() {
+    // A composite hop with an INVERSE leading step: `(^ex:p/ex:q)+`. The unit
+    // `^p/q` is the "co-parent" relation — x0 and x1 share hub0 (hub0 p x0,
+    // hub0 q x1), so x0 (^p/q) x1; likewise x1 (^p/q) x2 via hub1. Transitively
+    // from x0: {x1, x2}.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/sparql:composite-inv");
+    let insert = json!({
+        "@context": {"ex": "http://example.org/"},
+        "@graph": [
+            {"@id": "ex:hub0", "ex:p": {"@id": "ex:x0"}, "ex:q": {"@id": "ex:x1"}},
+            {"@id": "ex:hub1", "ex:p": {"@id": "ex:x1"}, "ex:q": {"@id": "ex:x2"}}
+        ]
+    });
+    let ledger = fluree.insert(ledger0, &insert).await.unwrap().ledger;
+
+    let plus = r"PREFIX ex: <http://example.org/>
+        SELECT ?y WHERE { ex:x0 (^ex:p/ex:q)+ ?y }";
+    let r = support::query_sparql(&fluree, &ledger, plus)
+        .await
+        .expect("composite inverse-step +");
+    let j = r.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    assert_eq!(
+        normalize_rows(&j),
+        normalize_rows(&json!([["ex:x1"], ["ex:x2"]])),
+        "(^p/q)+ from x0 = {{x1, x2}}: {j}"
+    );
+
+    // Backward: who reaches x2 via `(^ex:p/ex:q)+`? x1 (1 hop) and x0 (2 hops).
+    let bwd = r"PREFIX ex: <http://example.org/>
+        SELECT ?s WHERE { ?s (^ex:p/ex:q)+ ex:x2 }";
+    let rb = support::query_sparql(&fluree, &ledger, bwd)
+        .await
+        .expect("composite inverse-step backward");
+    let jb = rb.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    assert_eq!(
+        normalize_rows(&jb),
+        normalize_rows(&json!([["ex:x0"], ["ex:x1"]])),
+        "?s (^p/q)+ x2 = {{x0, x1}}: {jb}"
+    );
+}
+
+#[tokio::test]
 async fn sparql_composite_transitive_backward_and_both_bound() {
     // Subject-var (backward) and both-bound (reachability) modes over a composite
     // hop.
