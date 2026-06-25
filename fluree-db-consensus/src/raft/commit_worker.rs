@@ -257,7 +257,8 @@ impl Stager {
         match self.publish_head_advance(commit_id.clone(), commit_t).await {
             Ok(()) => {
                 if let Some(install) = install {
-                    self.finalize_local_state(install).await?;
+                    self.finalize_after_publish(entry.queue_id, commit_t, install)
+                        .await;
                 }
                 Ok(())
             }
@@ -270,7 +271,8 @@ impl Stager {
                     // replicated head.
                     self.staged_receipts.take(entry.queue_id);
                     if let Some(install) = install {
-                        self.finalize_local_state(install).await?;
+                        self.finalize_after_publish(entry.queue_id, commit_t, install)
+                            .await;
                     }
                     Ok(())
                 } else {
@@ -283,6 +285,36 @@ impl Stager {
                     Err(err)
                 }
             }
+        }
+    }
+
+    /// Finalize the local cache after a confirmed publish, treating
+    /// any failure as non-fatal. The commit is already replicated in
+    /// the state machine — the replicated head advance is the source
+    /// of truth — so a transient failure to install the staged state
+    /// locally just leaves the cache momentarily stale; the per-node
+    /// commit-event listener reconciles it on the next apply. Crucially,
+    /// we do NOT return the error: re-running the staging loop after
+    /// a successful publish would call `publish_commit` a second time,
+    /// and the publisher samples the queue front at that moment — which
+    /// has already advanced past our entry, so the second `ApplyHead`
+    /// would consume the NEXT queue entry while carrying our commit
+    /// body. That race produces a duplicate of our commit and silently
+    /// drops the next entry.
+    async fn finalize_after_publish(
+        &self,
+        queue_id: u64,
+        commit_t: i64,
+        install: StagedStateInstall,
+    ) {
+        if let Err(err) = self.finalize_local_state(install).await {
+            warn!(
+                queue_id,
+                commit_t,
+                error = %err,
+                "finalize_local_state failed after publish; commit is replicated, \
+                 local cache will catch up via event listener"
+            );
         }
     }
 
@@ -825,11 +857,33 @@ impl Stager {
     /// front is sampled. Cross-branch concurrency is the supervisor's
     /// responsibility — each branch runs in its own stager task.
     pub async fn run(self) {
+        // Track the most recently committed queue_id so we don't re-stage
+        // an entry our locally-replicated state hasn't yet observed the
+        // pop for. After a successful publish, the leader's state machine
+        // pops the entry, but the follower's local apply lags behind the
+        // round-trip HTTP response — `snapshot_front` would still return
+        // the same `queue_id` until the follower applies. Re-staging it
+        // would cause a duplicate commit, because the publisher's
+        // `build_apply_head_command` samples the leader's current queue
+        // front at propose time (which has already advanced to the
+        // *next* entry), so the second ApplyHead carries our body but
+        // pops the next entry — silently dropping that entry's work.
+        let mut last_committed: Option<u64> = None;
         loop {
             let Some(entry) = self.snapshot_front().await else {
                 tokio::time::sleep(POLL_INTERVAL).await;
                 continue;
             };
+            if let Some(last) = last_committed {
+                if entry.queue_id <= last {
+                    // Local state hasn't yet observed the pop for the
+                    // entry we just published. Wait briefly for raft
+                    // replication to catch up rather than spin or
+                    // re-stage the same body against a stale front.
+                    tokio::time::sleep(POLL_INTERVAL).await;
+                    continue;
+                }
+            }
             let queue_id = entry.queue_id;
             // Wrap `process_entry` in `catch_unwind` so a panic
             // (third-party crate, future-proofed invariant slip)
@@ -842,7 +896,9 @@ impl Stager {
                 .catch_unwind()
                 .await;
             match outcome {
-                Ok(Ok(())) => {}
+                Ok(Ok(())) => {
+                    last_committed = Some(queue_id);
+                }
                 Ok(Err(WorkerError::Transient(_) | WorkerError::Stage(_))) => {
                     unreachable!("process_entry maps Transient/Stage failures to PoisonQueueEntry")
                 }
@@ -871,18 +927,21 @@ impl Stager {
                         panic = %message,
                         "stager panicked while processing entry; poisoning and continuing"
                     );
-                    if let Err(propose_error) = self
+                    match self
                         .propose_poison(queue_id, PoisonReason::WorkerPanic { message })
                         .await
                     {
-                        warn!(
-                            ledger_id = %self.ref_key.ledger_name,
-                            branch = %self.ref_key.branch,
-                            queue_id,
-                            error = %propose_error,
-                            "failed to publish poison after stager panic; entry stays at queue head"
-                        );
-                        tokio::time::sleep(RAFT_BACKOFF).await;
+                        Ok(()) => last_committed = Some(queue_id),
+                        Err(propose_error) => {
+                            warn!(
+                                ledger_id = %self.ref_key.ledger_name,
+                                branch = %self.ref_key.branch,
+                                queue_id,
+                                error = %propose_error,
+                                "failed to publish poison after stager panic; entry stays at queue head"
+                            );
+                            tokio::time::sleep(RAFT_BACKOFF).await;
+                        }
                     }
                 }
             }
