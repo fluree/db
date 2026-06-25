@@ -8,10 +8,12 @@
 //! typed `ColumnBatch` values**, never building a subject IRI or a per-row
 //! `Binding`, and materializes only the final result row.
 //!
-//! # Scope (slice 1)
+//! # Scope
 //!
-//! `COUNT(?col)` / `COUNT(*)` over one TriplesMap, no GROUP BY, no FILTER, no
-//! joins. `SUM`/`AVG`, FILTER pushdown, and GROUP BY keys extend this later.
+//! `COUNT` / `SUM` / `AVG` (multiset only — DISTINCT falls back) over one
+//! TriplesMap, optionally with GROUP BY keys, a FILTER, and exact decimal
+//! arithmetic in the aggregate (`SUM(?a * (1 - ?b))`). Joins, DISTINCT
+//! aggregates, and all-integer expression results fall back.
 //!
 //! # Soundness
 //!
@@ -28,7 +30,7 @@ use crate::binding::{Batch, Binding, BindingRow};
 use crate::context::ExecutionContext;
 use crate::error::{QueryError, Result};
 use crate::eval::PreparedBoolExpression;
-use crate::ir::grouping::{AggregateFn, Grouping};
+use crate::ir::grouping::{AggregateFn, Grouping, InputSemantics};
 use crate::ir::{Expression, Function, GraphName, Pattern, Query, R2rmlPattern};
 use crate::operator::{BoxedOperator, Operator, OperatorState};
 use crate::r2rml::operator::LiteralEncoder;
@@ -152,6 +154,16 @@ fn expr_native_foldable(expr: &Expression) -> bool {
     }
 }
 
+/// True if the foldable expression contains a decimal constant, so its result is
+/// `xsd:decimal` even when every referenced column is integer.
+fn expr_has_decimal_const(expr: &Expression) -> bool {
+    match expr {
+        Expression::Const(fv) => matches!(fv, FlakeValue::Decimal(_)),
+        Expression::Call { args, .. } => args.iter().any(expr_has_decimal_const),
+        _ => false,
+    }
+}
+
 /// Evaluate a native decimal arithmetic expression for one row. `vars` gives the
 /// already-read value of each referenced variable (`None` = null → the whole
 /// expression is `None`, and the row is skipped, matching SUM's null handling).
@@ -180,21 +192,22 @@ fn eval_dec(expr: &Expression, vars: &[(VarId, Option<Dec>)]) -> Option<Dec> {
 fn read_dec(col: Option<&Column>, kind: DecKind, row: usize) -> Option<Dec> {
     let col = col?;
     match (kind, col) {
-        (DecKind::Decimal, Column::Decimal { values, scale, .. }) => values
-            .get(row)
-            .copied()
-            .flatten()
-            .map(|v| Dec { val: v, scale: *scale as i64 }),
-        (_, Column::Int64(values)) => values
-            .get(row)
-            .copied()
-            .flatten()
-            .map(|v| Dec { val: v as i128, scale: 0 }),
-        (_, Column::Int32(values) | Column::Date(values)) => values
-            .get(row)
-            .copied()
-            .flatten()
-            .map(|v| Dec { val: v as i128, scale: 0 }),
+        (DecKind::Decimal, Column::Decimal { values, scale, .. }) => {
+            values.get(row).copied().flatten().map(|v| Dec {
+                val: v,
+                scale: *scale as i64,
+            })
+        }
+        (_, Column::Int64(values)) => values.get(row).copied().flatten().map(|v| Dec {
+            val: v as i128,
+            scale: 0,
+        }),
+        (_, Column::Int32(values) | Column::Date(values)) => {
+            values.get(row).copied().flatten().map(|v| Dec {
+                val: v as i128,
+                scale: 0,
+            })
+        }
         _ => None,
     }
 }
@@ -238,7 +251,10 @@ pub fn detect_fused_r2rml_aggregate(query: &Query) -> Option<FusedAggregatePlan>
     // Implicit aggregation, or GROUP BY with aggregates. No HAVING, no
     // post-aggregate binds.
     let (group_by, aggregation, having): (Vec<VarId>, _, _) = match query.grouping.as_ref()? {
-        Grouping::Implicit { aggregation, having } => (Vec::new(), aggregation, having),
+        Grouping::Implicit {
+            aggregation,
+            having,
+        } => (Vec::new(), aggregation, having),
         Grouping::Explicit {
             group_by,
             aggregation: Some(aggregation),
@@ -292,13 +308,17 @@ pub fn detect_fused_r2rml_aggregate(query: &Query) -> Option<FusedAggregatePlan>
     // Every aggregate must be a column fold this operator supports.
     let mut aggregates = Vec::with_capacity(aggregation.aggregates.len());
     for spec in aggregation.aggregates.iter() {
-        if !matches!(
-            spec.function,
-            AggregateFn::CountAll
-                | AggregateFn::Count(_)
-                | AggregateFn::Sum(_, _)
-                | AggregateFn::Avg(_, _)
-        ) {
+        // Only multiset (non-DISTINCT) COUNT/SUM/AVG fold from columns; the fused
+        // path has no dedup, so DISTINCT (Set) must fall back to the normal
+        // pipeline. `CountDistinct` is already a separate, unmatched variant.
+        let foldable = match &spec.function {
+            AggregateFn::CountAll | AggregateFn::Count(_) => true,
+            AggregateFn::Sum(_, sem) | AggregateFn::Avg(_, sem) => {
+                matches!(sem, InputSemantics::List)
+            }
+            _ => false,
+        };
+        if !foldable {
             return None;
         }
         aggregates.push((spec.output_var, spec.function.clone()));
@@ -361,7 +381,11 @@ enum Acc {
         is_avg: bool,
     },
     /// Floating sum.
-    Double { sum: f64, count: u64, is_avg: bool },
+    Double {
+        sum: f64,
+        count: u64,
+        is_avg: bool,
+    },
     /// Native decimal expression sum: unscaled i128 total + the (constant) result
     /// scale + non-null count.
     Expr {
@@ -401,59 +425,37 @@ impl Acc {
         }
     }
 
-    /// Fold one batch's column into this accumulator.
-    fn update(&mut self, fold: &Fold, batch: &fluree_db_tabular::ColumnBatch) {
+    /// Fold a single row's value into this accumulator. `col` is the fold's
+    /// pre-resolved column for this batch (`None` for `COUNT(*)`). Returns
+    /// `false` if an exact i128 sum would overflow (the caller re-runs on the
+    /// BigDecimal pipeline); all other folds always return `true`.
+    fn update_row(&mut self, fold: &Fold, col: Option<&Column>, row: usize) -> bool {
         match (self, fold) {
-            (Acc::Count(n), Fold::CountRows) => *n += batch.num_rows as u64,
-            (Acc::Count(n), Fold::CountColumn(col)) => {
-                if let Some(c) = batch.column_by_name(col) {
-                    *n += non_null_count(c) as u64;
-                }
+            (Acc::Count(n), Fold::CountRows) => {
+                *n += 1;
+                true
             }
-            (
-                Acc::Exact {
-                    sum, scale, count, ..
-                },
-                Fold::Numeric { column, .. },
-            ) => {
-                if let Some(c) = batch.column_by_name(column) {
-                    accumulate_exact(c, sum, scale, count);
-                }
-            }
-            (Acc::Double { sum, count, .. }, Fold::Numeric { column, .. }) => {
-                if let Some(c) = batch.column_by_name(column) {
-                    accumulate_double(c, sum, count);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    /// Fold a single row's value into this accumulator (grouped path). `col` is
-    /// the fold's pre-resolved column for this batch (`None` for `COUNT(*)`).
-    fn update_row(&mut self, fold: &Fold, col: Option<&Column>, row: usize) {
-        match (self, fold) {
-            (Acc::Count(n), Fold::CountRows) => *n += 1,
             (Acc::Count(n), Fold::CountColumn(_)) if col.is_some_and(|c| !c.is_null(row)) => {
                 *n += 1;
+                true
             }
-            (Acc::Count(_), Fold::CountColumn(_)) => {}
+            (Acc::Count(_), Fold::CountColumn(_)) => true,
             (
                 Acc::Exact {
                     sum, scale, count, ..
                 },
                 Fold::Numeric { .. },
-            ) => {
-                if let Some(c) = col {
-                    accumulate_exact_row(c, row, sum, scale, count);
-                }
-            }
+            ) => match col {
+                Some(c) => accumulate_exact_row(c, row, sum, scale, count),
+                None => true,
+            },
             (Acc::Double { sum, count, .. }, Fold::Numeric { .. }) => {
                 if let Some(c) = col {
                     accumulate_double_row(c, row, sum, count);
                 }
+                true
             }
-            _ => {}
+            _ => true,
         }
     }
 
@@ -476,11 +478,7 @@ impl Acc {
                     acc.finalize_sum()
                 }
             }
-            Acc::Double {
-                sum,
-                count,
-                is_avg,
-            } => {
+            Acc::Double { sum, count, is_avg } => {
                 let acc = NumericAcc::from_double_total(sum, count);
                 if is_avg {
                     acc.finalize_avg()
@@ -506,76 +504,42 @@ impl Acc {
     }
 }
 
-/// Sum a numeric column's values into an exact i128 accumulator, capturing the
-/// decimal scale. Decimal columns carry their scale; integer/date columns are
-/// scale 0.
-fn accumulate_exact(col: &Column, sum: &mut i128, scale: &mut i64, count: &mut u64) {
+/// Add one row's exact (decimal/integer) value to the accumulator. Returns
+/// `false` if the i128 sum would overflow (the caller falls back to BigDecimal).
+fn accumulate_exact_row(
+    col: &Column,
+    row: usize,
+    sum: &mut i128,
+    scale: &mut i64,
+    count: &mut u64,
+) -> bool {
+    let add = |sum: &mut i128, count: &mut u64, v: i128| match sum.checked_add(v) {
+        Some(s) => {
+            *sum = s;
+            *count += 1;
+            true
+        }
+        None => false,
+    };
     match col {
-        Column::Decimal { values, scale: s, .. } => {
+        Column::Decimal {
+            values, scale: s, ..
+        } => {
             *scale = *s as i64;
-            for v in values.iter().flatten() {
-                *sum += *v;
-                *count += 1;
+            match values.get(row) {
+                Some(Some(v)) => add(sum, count, *v),
+                _ => true,
             }
         }
-        Column::Int64(values) => {
-            for v in values.iter().flatten() {
-                *sum += *v as i128;
-                *count += 1;
-            }
-        }
-        Column::Int32(values) | Column::Date(values) => {
-            for v in values.iter().flatten() {
-                *sum += *v as i128;
-                *count += 1;
-            }
-        }
-        _ => {}
-    }
-}
-
-/// Sum a numeric column's values into an f64 accumulator (xsd:double/float).
-fn accumulate_double(col: &Column, sum: &mut f64, count: &mut u64) {
-    match col {
-        Column::Float64(values) => {
-            for v in values.iter().flatten() {
-                *sum += *v;
-                *count += 1;
-            }
-        }
-        Column::Float32(values) => {
-            for v in values.iter().flatten() {
-                *sum += *v as f64;
-                *count += 1;
-            }
-        }
-        _ => {}
-    }
-}
-
-/// Add one row's exact (decimal/integer) value to the accumulator.
-fn accumulate_exact_row(col: &Column, row: usize, sum: &mut i128, scale: &mut i64, count: &mut u64) {
-    match col {
-        Column::Decimal { values, scale: s, .. } => {
-            *scale = *s as i64;
-            if let Some(Some(v)) = values.get(row) {
-                *sum += *v;
-                *count += 1;
-            }
-        }
-        Column::Int64(values) => {
-            if let Some(Some(v)) = values.get(row) {
-                *sum += *v as i128;
-                *count += 1;
-            }
-        }
-        Column::Int32(values) | Column::Date(values) => {
-            if let Some(Some(v)) = values.get(row) {
-                *sum += *v as i128;
-                *count += 1;
-            }
-        }
-        _ => {}
+        Column::Int64(values) => match values.get(row) {
+            Some(Some(v)) => add(sum, count, *v as i128),
+            _ => true,
+        },
+        Column::Int32(values) | Column::Date(values) => match values.get(row) {
+            Some(Some(v)) => add(sum, count, *v as i128),
+            _ => true,
+        },
+        _ => true,
     }
 }
 
@@ -640,16 +604,18 @@ impl GroupCol {
         let Some(c) = col else { return GKey::Null };
         match self.kind {
             GKind::String => match c {
-                Column::String(v) => v
-                    .get(row)
-                    .cloned()
-                    .flatten()
-                    .map_or(GKey::Null, GKey::Str),
+                Column::String(v) => v.get(row).cloned().flatten().map_or(GKey::Null, GKey::Str),
                 _ => GKey::Null,
             },
             GKind::Integer => match c {
-                Column::Int64(v) => v.get(row).and_then(|o| *o).map_or(GKey::Null, |i| GKey::Int(i as i128)),
-                Column::Int32(v) => v.get(row).and_then(|o| *o).map_or(GKey::Null, |i| GKey::Int(i as i128)),
+                Column::Int64(v) => v
+                    .get(row)
+                    .and_then(|o| *o)
+                    .map_or(GKey::Null, |i| GKey::Int(i as i128)),
+                Column::Int32(v) => v
+                    .get(row)
+                    .and_then(|o| *o)
+                    .map_or(GKey::Null, |i| GKey::Int(i as i128)),
                 _ => GKey::Null,
             },
         }
@@ -679,7 +645,7 @@ struct Resolved {
     expr_folds: Vec<ExprFold>,
     /// Columns that must all be non-null for a row to participate, mirroring the
     /// R2RML star's row-drop: the subject template columns plus every predicate's
-    /// object column. Empty in the vectorized single-predicate fast path.
+    /// object column.
     validity_cols: Vec<String>,
 }
 
@@ -790,7 +756,11 @@ impl FusedR2rmlAggregateOperator {
 
     /// Resolve the (single, scalar-column) object map a variable's predicate maps
     /// to, for materializing the variable's value during FILTER evaluation.
-    fn object_map_for_var(pattern: &R2rmlPattern, tm: &TriplesMap, var: VarId) -> Option<ObjectMap> {
+    fn object_map_for_var(
+        pattern: &R2rmlPattern,
+        tm: &TriplesMap,
+        var: VarId,
+    ) -> Option<ObjectMap> {
         let pred = Self::predicate_for_var(pattern, var)?;
         let mut poms = tm
             .predicate_object_maps
@@ -835,23 +805,6 @@ impl FusedR2rmlAggregateOperator {
             (Some(tm), None) => Some(tm),
             _ => None,
         }
-    }
-}
-
-/// Count non-null values in a column without per-row branching on the enum.
-fn non_null_count(col: &Column) -> usize {
-    match col {
-        Column::Boolean(v) => v.iter().filter(|x| x.is_some()).count(),
-        Column::Int32(v) => v.iter().filter(|x| x.is_some()).count(),
-        Column::Int64(v) => v.iter().filter(|x| x.is_some()).count(),
-        Column::Float32(v) => v.iter().filter(|x| x.is_some()).count(),
-        Column::Float64(v) => v.iter().filter(|x| x.is_some()).count(),
-        Column::String(v) => v.iter().filter(|x| x.is_some()).count(),
-        Column::Bytes(v) => v.iter().filter(|x| x.is_some()).count(),
-        Column::Date(v) => v.iter().filter(|x| x.is_some()).count(),
-        Column::Timestamp(v) => v.iter().filter(|x| x.is_some()).count(),
-        Column::TimestampTz(v) => v.iter().filter(|x| x.is_some()).count(),
-        Column::Decimal { values, .. } => values.iter().filter(|x| x.is_some()).count(),
     }
 }
 
@@ -914,120 +867,139 @@ impl Operator for FusedR2rmlAggregateOperator {
 
         let folds = &resolved.folds;
         let gcols = &resolved.group_cols;
-        let columns = if gcols.is_empty()
-            && resolved.filter.is_none()
-            && resolved.expr_folds.is_empty()
-            && resolved.validity_cols.is_empty()
-        {
-            // Fast path: implicit aggregation, single predicate, no filter — fully
-            // vectorized per-batch.
-            let mut accs: Vec<Acc> = folds.iter().map(Acc::for_fold).collect();
-            while let Some(batch) = stream.next().await {
-                let batch = batch?;
-                for (acc, fold) in accs.iter_mut().zip(folds.iter()) {
-                    acc.update(fold, &batch);
+
+        // Each row is gated by the R2RML star's row-validity (subject + object
+        // columns non-null) and the optional FILTER, then folded. Implicit
+        // aggregation uses a single flat accumulator set (no per-row hashing);
+        // GROUP BY keys one set per group. An exact i128 sum that would overflow
+        // sets `overflowed` and the whole query re-runs on the exact pipeline.
+        let mut implicit: Vec<Acc> = folds.iter().map(Acc::for_fold).collect();
+        let mut groups: std::collections::HashMap<Vec<GKey>, Vec<Acc>> =
+            std::collections::HashMap::new();
+        let mut overflowed = false;
+        'scan: while let Some(batch) = stream.next().await {
+            let batch = batch?;
+            let fold_cols: Vec<Option<&Column>> = folds
+                .iter()
+                .map(|f| match f {
+                    Fold::CountRows | Fold::NumericExpr { .. } => None,
+                    Fold::CountColumn(c) | Fold::Numeric { column: c, .. } => {
+                        batch.column_by_name(c)
+                    }
+                })
+                .collect();
+            let key_cols: Vec<Option<&Column>> = gcols
+                .iter()
+                .map(|g| batch.column_by_name(&g.column))
+                .collect();
+            let validity: Vec<Option<&Column>> = resolved
+                .validity_cols
+                .iter()
+                .map(|c| batch.column_by_name(c))
+                .collect();
+            // Pre-resolve each expression aggregate's variable columns once.
+            let expr_cols: Vec<Vec<Option<&Column>>> = resolved
+                .expr_folds
+                .iter()
+                .map(|ef| {
+                    ef.var_cols
+                        .iter()
+                        .map(|(_, c, _)| batch.column_by_name(c))
+                        .collect()
+                })
+                .collect();
+            for row in 0..batch.num_rows {
+                // Row-validity (R2RML star row-drop): the subject and every
+                // predicate's object column must be non-null.
+                if validity
+                    .iter()
+                    .any(|c| c.is_none_or(|col| col.is_null(row)))
+                {
+                    continue;
                 }
-                ctx.tracker.consume_fuel(1)?;
-            }
-            accs.into_iter().map(|acc| vec![acc.finalize()]).collect()
-        } else {
-            // Per-row path: GROUP BY and/or FILTER. Each row is filtered, then
-            // folded into its group's accumulators.
-            let mut groups: std::collections::HashMap<Vec<GKey>, Vec<Acc>> =
-                std::collections::HashMap::new();
-            // Implicit aggregation always yields exactly one (possibly all-zero)
-            // group, even when the filter matches nothing.
-            if gcols.is_empty() {
-                groups.insert(Vec::new(), folds.iter().map(Acc::for_fold).collect());
-            }
-            while let Some(batch) = stream.next().await {
-                let batch = batch?;
-                let fold_cols: Vec<Option<&Column>> = folds
-                    .iter()
-                    .map(|f| match f {
-                        Fold::CountRows | Fold::NumericExpr { .. } => None,
-                        Fold::CountColumn(c) | Fold::Numeric { column: c, .. } => {
-                            batch.column_by_name(c)
-                        }
-                    })
-                    .collect();
-                let key_cols: Vec<Option<&Column>> =
-                    gcols.iter().map(|g| batch.column_by_name(&g.column)).collect();
-                let validity: Vec<Option<&Column>> = resolved
-                    .validity_cols
-                    .iter()
-                    .map(|c| batch.column_by_name(c))
-                    .collect();
-                // Pre-resolve each expression aggregate's variable columns once.
-                let expr_cols: Vec<Vec<Option<&Column>>> = resolved
-                    .expr_folds
-                    .iter()
-                    .map(|ef| {
-                        ef.var_cols
-                            .iter()
-                            .map(|(_, c, _)| batch.column_by_name(c))
-                            .collect()
-                    })
-                    .collect();
-                for row in 0..batch.num_rows {
-                    // Row-validity (R2RML star row-drop): the subject and every
-                    // predicate's object column must be non-null.
-                    if validity.iter().any(|c| c.is_none_or(|col| col.is_null(row))) {
+                if let Some(fp) = &resolved.filter {
+                    // Materialize only the referenced object columns into a
+                    // binding row and evaluate through the engine evaluator.
+                    let binds: Vec<Binding> = fp
+                        .eval_objmaps
+                        .iter()
+                        .map(|om| match materialize_object_from_batch(om, &batch, row) {
+                            Ok(Some(term)) => fp.encoder.encode(&term),
+                            _ => Binding::Unbound,
+                        })
+                        .collect();
+                    let rv = BindingRow::new(&fp.eval_vars, &binds);
+                    if !fp.prepared.eval_to_bool_non_strict(&rv, Some(ctx))? {
                         continue;
                     }
-                    if let Some(fp) = &resolved.filter {
-                        // Materialize only the referenced object columns into a
-                        // binding row and evaluate through the engine evaluator.
-                        let binds: Vec<Binding> = fp
-                            .eval_objmaps
-                            .iter()
-                            .map(|om| match materialize_object_from_batch(om, &batch, row) {
-                                Ok(Some(term)) => fp.encoder.encode(&term),
-                                _ => Binding::Unbound,
-                            })
-                            .collect();
-                        let rv = BindingRow::new(&fp.eval_vars, &binds);
-                        if !fp.prepared.eval_to_bool_non_strict(&rv, Some(ctx))? {
-                            continue;
-                        }
-                    }
+                }
+                let accs: &mut Vec<Acc> = if gcols.is_empty() {
+                    &mut implicit
+                } else {
                     let key: Vec<GKey> = gcols
                         .iter()
                         .zip(&key_cols)
                         .map(|(g, c)| g.key_at(*c, row))
                         .collect();
-                    let accs = groups
+                    groups
                         .entry(key)
-                        .or_insert_with(|| folds.iter().map(Acc::for_fold).collect());
-                    for (i, fold) in folds.iter().enumerate() {
-                        match fold {
-                            Fold::NumericExpr { index, .. } => {
-                                let ef = &resolved.expr_folds[*index];
-                                // Read each referenced variable's value, then
-                                // evaluate the arithmetic natively (no allocation).
-                                let vars: Vec<(VarId, Option<Dec>)> = ef
-                                    .var_cols
-                                    .iter()
-                                    .enumerate()
-                                    .map(|(k, (v, _, kind))| {
-                                        (*v, read_dec(expr_cols[*index][k], *kind, row))
-                                    })
-                                    .collect();
-                                if let (Acc::Expr { sum, scale, count, .. }, Some(d)) =
-                                    (&mut accs[i], eval_dec(&ef.expr, &vars))
-                                {
-                                    *sum = sum.wrapping_add(d.val);
-                                    *scale = d.scale;
-                                    *count += 1;
-                                }
+                        .or_insert_with(|| folds.iter().map(Acc::for_fold).collect())
+                };
+                for (i, fold) in folds.iter().enumerate() {
+                    let ok = match fold {
+                        Fold::NumericExpr { index, .. } => {
+                            let ef = &resolved.expr_folds[*index];
+                            // Read each referenced variable's value, then evaluate
+                            // the arithmetic natively (no allocation).
+                            let vars: Vec<(VarId, Option<Dec>)> = ef
+                                .var_cols
+                                .iter()
+                                .enumerate()
+                                .map(|(k, (v, _, kind))| {
+                                    (*v, read_dec(expr_cols[*index][k], *kind, row))
+                                })
+                                .collect();
+                            match (&mut accs[i], eval_dec(&ef.expr, &vars)) {
+                                (
+                                    Acc::Expr {
+                                        sum, scale, count, ..
+                                    },
+                                    Some(d),
+                                ) => match sum.checked_add(d.val) {
+                                    Some(s) => {
+                                        *sum = s;
+                                        *scale = d.scale;
+                                        *count += 1;
+                                        true
+                                    }
+                                    None => false,
+                                },
+                                _ => true,
                             }
-                            _ => accs[i].update_row(fold, fold_cols[i], row),
                         }
+                        _ => accs[i].update_row(fold, fold_cols[i], row),
+                    };
+                    if !ok {
+                        overflowed = true;
+                        break 'scan;
                     }
                 }
-                ctx.tracker.consume_fuel(1)?;
             }
+            ctx.tracker.consume_fuel(1)?;
+        }
 
+        // An i128 accumulator overflowed: the exact answer needs BigDecimal, so
+        // run the whole query on the normal pipeline instead (nothing has been
+        // emitted yet, so this is a clean handoff).
+        if overflowed {
+            self.use_fallback = true;
+            self.fallback.open(ctx).await?;
+            return self.fallback.next_batch(ctx).await;
+        }
+
+        let columns: Vec<Vec<Binding>> = if gcols.is_empty() {
+            implicit.into_iter().map(|a| vec![a.finalize()]).collect()
+        } else {
             // One output row per group: key bindings then aggregate bindings.
             let num_cols = gcols.len() + folds.len();
             let mut out: Vec<Vec<Binding>> = (0..num_cols).map(|_| Vec::new()).collect();
@@ -1060,7 +1032,8 @@ impl FusedR2rmlAggregateOperator {
         // Rewrite the inner triples for this graph using the active snapshot.
         // A non-R2RML graph (or an unconvertible pattern) leaves triples
         // unconverted → fall back.
-        let rr = rewrite_patterns_for_r2rml(&self.inner_patterns, &self.graph_iri, ctx.active_snapshot);
+        let rr =
+            rewrite_patterns_for_r2rml(&self.inner_patterns, &self.graph_iri, ctx.active_snapshot);
         if rr.unconverted_count > 0 {
             return Ok(None);
         }
@@ -1121,14 +1094,12 @@ impl FusedR2rmlAggregateOperator {
 
         let mut folds = Vec::with_capacity(self.aggregates.len());
         let mut expr_folds: Vec<ExprFold> = Vec::new();
-        let mut counts_subject = false;
         for (_, func) in &self.aggregates {
             match func {
                 AggregateFn::CountAll => folds.push(Fold::CountRows),
                 AggregateFn::Count(v) if *v == pattern.subject_var => {
                     // COUNT of the subject counts the rows that produce a row,
                     // which the row-validity gate already enforces.
-                    counts_subject = true;
                     folds.push(Fold::CountRows);
                 }
                 AggregateFn::Count(v) => {
@@ -1161,6 +1132,17 @@ impl FusedR2rmlAggregateOperator {
                             projection.push(col.clone());
                             var_cols.push((ev, col, deck));
                         }
+                        // The native expr fold always finalizes as xsd:decimal.
+                        // An all-integer expression (no decimal column or
+                        // constant) would be xsd:integer in the normal pipeline,
+                        // so fall back to keep the result datatype exact.
+                        let any_decimal = var_cols
+                            .iter()
+                            .any(|(_, _, k)| matches!(k, DecKind::Decimal))
+                            || expr_has_decimal_const(expr);
+                        if !any_decimal {
+                            return Ok(None);
+                        }
                         let index = expr_folds.len();
                         expr_folds.push(ExprFold {
                             expr: (*expr).clone(),
@@ -1188,32 +1170,32 @@ impl FusedR2rmlAggregateOperator {
             }
         }
 
-        // Row-validity columns. For a same-subject star (or a COUNT of the
-        // subject), a row participates only if the subject and every predicate's
-        // object column are non-null — mirroring the R2RML star's row-drop. A
-        // single-predicate scan needs no gate (the column's own null check plus
-        // the assumption that the subject materializes covers it), keeping the
-        // vectorized fast path.
-        let mut validity_cols: Vec<String> = Vec::new();
-        if !pattern.star_bindings.is_empty() || counts_subject {
-            validity_cols.extend(tm.subject_map.template_columns.iter().cloned());
-            if let Some(c) = &tm.subject_map.column {
-                validity_cols.push(c.clone());
-            }
-            let mut obj_vars: Vec<VarId> = pattern.object_var.into_iter().collect();
-            obj_vars.extend(pattern.star_bindings.iter().map(|(_, v)| *v));
-            for v in obj_vars {
-                let Some((col, _)) = Self::scalar_column_for_var(&pattern, tm, v) else {
-                    return Ok(None);
-                };
-                validity_cols.push(col);
-            }
-            for c in &validity_cols {
-                projection.push(c.clone());
-            }
-            validity_cols.sort();
-            validity_cols.dedup();
+        // Row-validity columns. A row participates only if the subject template
+        // columns and every predicate's object column are non-null — mirroring
+        // the R2RML star's row-drop (and a null subject template never
+        // materializes a subject). This always applies: even a single-predicate
+        // COUNT(*) over a nullable column, or a SUM over a row whose subject key
+        // is null, must match the normal pipeline. Because this is always
+        // non-empty, the vectorized fast path is gated off and the per-row path
+        // (which enforces it) runs — the win is still skipping RDF
+        // materialization, not skipping null checks.
+        let mut validity_cols: Vec<String> = tm.subject_map.template_columns.clone();
+        if let Some(c) = &tm.subject_map.column {
+            validity_cols.push(c.clone());
         }
+        let mut obj_vars: Vec<VarId> = pattern.object_var.into_iter().collect();
+        obj_vars.extend(pattern.star_bindings.iter().map(|(_, v)| *v));
+        for v in obj_vars {
+            let Some((col, _)) = Self::scalar_column_for_var(&pattern, tm, v) else {
+                return Ok(None);
+            };
+            validity_cols.push(col);
+        }
+        for c in &validity_cols {
+            projection.push(c.clone());
+        }
+        validity_cols.sort();
+        validity_cols.dedup();
 
         // FILTER: resolve each referenced variable to its object map (for per-row
         // materialization) and prepare the expression for the engine evaluator.
@@ -1274,7 +1256,12 @@ mod tests {
         }
     }
 
-    fn count_query(group_by: Vec<VarId>, patterns: Vec<Pattern>, out: VarId, counted: VarId) -> Query {
+    fn count_query(
+        group_by: Vec<VarId>,
+        patterns: Vec<Pattern>,
+        out: VarId,
+        counted: VarId,
+    ) -> Query {
         let agg = AggregateSpec {
             function: AggregateFn::Count(counted),
             output_var: out,
