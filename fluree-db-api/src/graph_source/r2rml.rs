@@ -13,7 +13,10 @@ use async_trait::async_trait;
 use fluree_db_core::ContentStore;
 use fluree_db_iceberg::{
     catalog::{RestCatalogClient, RestCatalogConfig, SendCatalogClient},
-    io::{ColumnBatch, S3IcebergStorage, SendIcebergStorage, SendParquetReader},
+    io::{
+        is_gcs_endpoint, ColumnBatch, GcsXmlStorage, IcebergBackend, S3IcebergStorage,
+        SendIcebergStorage, SendParquetReader,
+    },
     metadata::TableMetadata,
     scan::{ComparisonOp, Expression, FileScanTask, LiteralValue, ScanConfig, SendScanPlanner},
     IcebergGsConfig,
@@ -662,28 +665,54 @@ impl R2rmlTableProvider for FlureeR2rmlProvider<'_> {
                     "Loaded table metadata location"
                 );
 
-                let storage = if let Some(ref credentials) = load_response.credentials {
+                let storage = if is_gcs_endpoint(iceberg_config.io.s3_endpoint.as_deref()) {
+                    info!("Using native GCS reader (gs:// over reqwest, SigV4-signed) for storage reads");
+                    // Honor catalog-vended credentials for GCS-backed tables when
+                    // present; otherwise resolve HMAC keys from the AWS credential
+                    // chain, the same as the S3 path.
+                    let gcs = match load_response.credentials {
+                        Some(ref credentials) => GcsXmlStorage::from_vended_credentials(
+                            credentials,
+                            iceberg_config.io.s3_endpoint.as_deref(),
+                        ),
+                        None => {
+                            GcsXmlStorage::from_default_chain(
+                                iceberg_config.io.s3_region.as_deref(),
+                                iceberg_config.io.s3_endpoint.as_deref(),
+                            )
+                            .await
+                        }
+                    }
+                    .map_err(|e| {
+                        QueryError::Internal(format!("Failed to create GCS storage: {e}"))
+                    })?;
+                    IcebergBackend::Gcs(gcs)
+                } else if let Some(ref credentials) = load_response.credentials {
                     info!("Using vended credentials from catalog");
-                    S3IcebergStorage::from_vended_credentials(credentials)
-                        .await
-                        .map_err(|e| {
-                            QueryError::Internal(format!("Failed to create S3 storage: {e}"))
-                        })?
+                    IcebergBackend::S3(
+                        S3IcebergStorage::from_vended_credentials(credentials)
+                            .await
+                            .map_err(|e| {
+                                QueryError::Internal(format!("Failed to create S3 storage: {e}"))
+                            })?,
+                    )
                 } else {
                     info!(
                         region = ?iceberg_config.io.s3_region,
                         endpoint = ?iceberg_config.io.s3_endpoint,
                         "Using ambient AWS credentials"
                     );
-                    S3IcebergStorage::from_default_chain(
-                        iceberg_config.io.s3_region.as_deref(),
-                        iceberg_config.io.s3_endpoint.as_deref(),
-                        iceberg_config.io.s3_path_style,
+                    IcebergBackend::S3(
+                        S3IcebergStorage::from_default_chain(
+                            iceberg_config.io.s3_region.as_deref(),
+                            iceberg_config.io.s3_endpoint.as_deref(),
+                            iceberg_config.io.s3_path_style,
+                        )
+                        .await
+                        .map_err(|e| {
+                            QueryError::Internal(format!("Failed to create S3 storage: {e}"))
+                        })?,
                     )
-                    .await
-                    .map_err(|e| {
-                        QueryError::Internal(format!("Failed to create S3 storage: {e}"))
-                    })?
                 };
 
                 (load_response, Arc::new(storage))
@@ -694,17 +723,35 @@ impl R2rmlTableProvider for FlureeR2rmlProvider<'_> {
                     "Loading table via direct S3 access"
                 );
 
-                // Direct mode: create storage once, share via Arc
-                let storage = Arc::new(
-                    S3IcebergStorage::from_default_chain(
-                        iceberg_config.io.s3_region.as_deref(),
-                        iceberg_config.io.s3_endpoint.as_deref(),
-                        iceberg_config.io.s3_path_style,
-                    )
-                    .await
-                    .map_err(|e| {
-                        QueryError::Internal(format!("Failed to create S3 storage: {e}"))
-                    })?,
+                // Direct mode: create storage once, share via Arc. gs://-backed
+                // tables (GCS endpoint) use the native reqwest reader to avoid the
+                // AWS-SDK HTTP/2 range-read bug; everything else uses the S3 SDK.
+                let storage: Arc<IcebergBackend> = Arc::new(
+                    if is_gcs_endpoint(iceberg_config.io.s3_endpoint.as_deref()) {
+                        info!("Using native GCS reader (gs:// over reqwest, SigV4-signed) for storage reads");
+                        IcebergBackend::Gcs(
+                            GcsXmlStorage::from_default_chain(
+                                iceberg_config.io.s3_region.as_deref(),
+                                iceberg_config.io.s3_endpoint.as_deref(),
+                            )
+                            .await
+                            .map_err(|e| {
+                                QueryError::Internal(format!("Failed to create GCS storage: {e}"))
+                            })?,
+                        )
+                    } else {
+                        IcebergBackend::S3(
+                            S3IcebergStorage::from_default_chain(
+                                iceberg_config.io.s3_region.as_deref(),
+                                iceberg_config.io.s3_endpoint.as_deref(),
+                                iceberg_config.io.s3_path_style,
+                            )
+                            .await
+                            .map_err(|e| {
+                                QueryError::Internal(format!("Failed to create S3 storage: {e}"))
+                            })?,
+                        )
+                    },
                 );
 
                 let cache = self.fluree.r2rml_cache();

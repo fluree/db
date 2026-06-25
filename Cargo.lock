@@ -2787,12 +2787,14 @@ dependencies = [
  "aws-config",
  "aws-credential-types",
  "aws-sdk-s3",
+ "aws-sigv4",
  "bytes",
  "chrono",
  "dashmap",
  "fluree-db-core",
  "fluree-db-tabular",
  "futures",
+ "http 1.4.0",
  "lru 0.12.5",
  "parquet",
  "rand 0.8.5",
@@ -5123,6 +5125,7 @@ dependencies = [
  "num-bigint",
  "paste",
  "seq-macro",
+ "snap",
  "thrift",
  "twox-hash",
  "zstd",
@@ -6497,6 +6500,12 @@ name = "smallvec"
 version = "1.15.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
+
+[[package]]
+name = "snap"
+version = "1.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1b6b67fb9a61334225b5b790716f609cd58395f895b3fe8b328786812a40bc3b"
 
 [[package]]
 name = "socket2"

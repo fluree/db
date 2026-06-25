@@ -8,12 +8,13 @@ description = "Iceberg REST catalog support for Fluree DB graph sources"
 
 [features]
 default = []
-# AWS SDK integration (credential provider + S3 storage). Enables the shared
-# native disk cache (read-through for S3 data files).
+# AWS SDK integration (credential provider + S3 storage; SigV4 for the GCS
+# reader). Enables the shared native disk cache (read-through for S3 data files).
 aws = [
     "dep:aws-credential-types",
     "dep:aws-sdk-s3",
     "dep:aws-config",
+    "dep:aws-sigv4",
     "fluree-db-core/native",
 ]
 # Arrow columnar output (OFF by default for Lambda size)
@@ -34,6 +35,10 @@ futures.workspace = true
 
 # HTTP client for REST catalog
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+
+# HTTP request type (used to apply SigV4 signing headers before handing the
+# request to reqwest in the native GCS reader).
+http.workspace = true
 
 # Serialization
 serde = { workspace = true, features = ["derive"] }
@@ -73,6 +78,7 @@ dashmap.workspace = true
 aws-credential-types = { workspace = true, optional = true }
 aws-sdk-s3 = { workspace = true, optional = true }
 aws-config = { workspace = true, optional = true }
+aws-sigv4 = { workspace = true, optional = true }
 
 # Optional: Arrow columnar output
 arrow = { version = "54", optional = true }
