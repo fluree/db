@@ -713,25 +713,29 @@ The array form uses the operator as the first element followed by its operands.
 |----------|--------------|--------------|-------------|
 | One or more | `ex:p+` | `["+", "ex:p"]` | Transitive closure (1+ hops) |
 | Zero or more | `ex:p*` | `["*", "ex:p"]` | Reflexive transitive closure (0+ hops) |
+| Zero or one | `ex:p?` | `["?", "ex:p"]` | The node itself plus a single `ex:p` hop |
 | Inverse | `^ex:p` | `["^", "ex:p"]` | Traverse predicate in reverse direction |
 | Alternative | <code>ex:a&#124;ex:b</code> | <code>["&#124;", "ex:a", "ex:b"]</code> | Match any of several predicates |
 | Sequence | `ex:a/ex:b` | `["/", "ex:a", "ex:b"]` | Follow a chain of predicates (property chain) |
 | Alternation-transitive | <code>(ex:a&#124;ex:b)+</code> | <code>["+", ["&#124;", "ex:a", "ex:b"]]</code> | Transitive closure following an edge of **any** listed predicate per hop |
+| Composite-transitive | `(ex:a/ex:b)+` | `["+", ["/", "ex:a", "ex:b"]]` | Transitive closure where each hop follows the whole forward sub-path |
 
 Zero-or-more (`*`) includes the starting node itself in the results (zero hops).
+Zero-or-one (`?`) is the start node plus exactly one hop. Nested modifiers
+collapse algebraically (`((ex:p)*)*` ≡ `ex:p*`, `(ex:p+)?` ≡ `ex:p*`, `(ex:p?)?`
+≡ `ex:p?`).
 
 Sequence (`/`) compiles into a chain of triple patterns joined by internal
 intermediate variables. Each step must be a simple predicate or an inverse simple
 predicate (`^ex:p`). For example, `"ex:friend/ex:name"` matches paths where
 subject has a `ex:friend` whose `ex:name` is the result.
 
-**Parsed but Not Yet Supported:**
+**Not Yet Supported:**
 
-The following operators are recognized by the parser but currently rejected (not yet supported for execution):
-
-| Operator | String syntax | Array syntax |
-|----------|--------------|--------------|
-| Zero or one | `ex:p?` | `["?", "ex:p"]` |
+A transitive/optional modifier over a composite sub-path supports **forward**
+steps only (`(ex:a/ex:b)+`, or alternations of forward predicates like
+`(ex:a/(ex:b|ex:c))+`). An **inverse** step inside the repeated unit — e.g.
+`(^ex:a/ex:b)+` — is rejected.
 
 **Subject and Object Variables:**
 
