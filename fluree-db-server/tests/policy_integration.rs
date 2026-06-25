@@ -1660,3 +1660,54 @@ async fn cypher_read_enforces_policy() {
         "policy must hide confidential from public user: {body}"
     );
 }
+
+/// Modify-policy parity for the Cypher write route: a restricted employee
+/// identity issuing a Cypher `SET` on a policy-protected predicate must be
+/// denied exactly as the SPARQL UPDATE path is
+/// (`sparql_update_under_employee_bearer_denied`). The Cypher write goes
+/// through consensus with the same `PolicyContext`, so `f:modify` is enforced.
+#[tokio::test]
+async fn cypher_write_under_employee_bearer_denied() {
+    let (_tmp, state) = policy_test_state().await;
+    let app = setup_policy_ledger(build_router(state), "cypherwpol:main").await;
+    add_modify_policies(&app, "cypherwpol:main").await;
+
+    let signing_key = SigningKey::from_bytes(&[34u8; 32]);
+    let token = identity_token_rw(
+        &signing_key,
+        "http://example.org/employee-user",
+        "cypherwpol:main",
+    );
+
+    // SET rewrites `ex:content` on the public document — the employee deny
+    // policy blocks all `ex:content` modifications for that class.
+    let cypher = r#"MATCH (d:Document {classification: "public"}) SET d.content = "rewritten""#;
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/update/cypherwpol:main")
+                .header("content-type", "application/cypher")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::from(cypher))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let (status, json) = json_body(resp).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "employee Cypher SET must be rejected; got body: {json}"
+    );
+    let err_msg = json
+        .get("error")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    assert!(
+        err_msg.contains("Employees may not modify document content."),
+        "expected exMessage in error; got: {err_msg}"
+    );
+}
