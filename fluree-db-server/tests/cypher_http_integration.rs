@@ -194,7 +194,7 @@ async fn cypher_http_write_is_idempotent() {
     let commit_t = |b: &str| {
         serde_json::from_str::<serde_json::Value>(b)
             .ok()
-            .and_then(|v| v.get("t").and_then(|t| t.as_i64()))
+            .and_then(|v| v.get("t").and_then(serde_json::Value::as_i64))
     };
     assert_eq!(
         commit_t(&b1),
