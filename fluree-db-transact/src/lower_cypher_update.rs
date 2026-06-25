@@ -828,6 +828,12 @@ impl<'a> CypherLowering<'a> {
     // ---- SET / REMOVE ---------------------------------------------------
 
     fn lower_set(&mut self, s: &SetClause) -> Result<(), LowerCypherError> {
+        // Collect every property SET item's old-value lookup so they can be
+        // emitted as ONE OPTIONAL over a UNION of the per-predicate branches.
+        // Pushing a separate OPTIONAL per item (as before) makes the WHERE
+        // solver cross-join them — `SET n.a=…, n.b=…, n.c=…` over multi-valued
+        // predicates yields kₐ×k_b×k_c transient rows; the UNION yields kₐ+k_b+k_c.
+        let mut old_values: Vec<(String, String, Sid)> = Vec::new();
         for item in &s.items {
             match item {
                 SetItem::Property {
@@ -836,12 +842,12 @@ impl<'a> CypherLowering<'a> {
                     value,
                 } => {
                     self.require_bound(target)?;
-                    self.set_property(&target.name, property, value)?;
+                    self.set_property(&target.name, property, value, &mut old_values)?;
                 }
                 SetItem::MapMerge { target, map } => {
                     self.require_bound(target)?;
                     for (key, val_expr) in &map.entries {
-                        self.set_property(&target.name, key, val_expr)?;
+                        self.set_property(&target.name, key, val_expr, &mut old_values)?;
                     }
                 }
                 SetItem::MapReplace { target, map } => {
@@ -864,6 +870,7 @@ impl<'a> CypherLowering<'a> {
                 }
             }
         }
+        self.push_unioned_old_values(old_values);
         Ok(())
     }
 
@@ -874,19 +881,23 @@ impl<'a> CypherLowering<'a> {
         target: &str,
         property: &str,
         value: &Expr,
+        old_values: &mut Vec<(String, String, Sid)>,
     ) -> Result<(), LowerCypherError> {
         let pred_iri = self.resolve_predicate(property)?;
         let pred_sid = self.ns.sid_for_iri(&pred_iri);
 
         // SET replaces: always retract the existing value(s). A multi-valued
-        // predicate produces one OPTIONAL solution per old value, so the delete
+        // predicate produces one UNION solution per old value, so the delete
         // template clears all of them. `SET n.prop = null` (and `= []`) then
         // asserts nothing — the property is removed. A list value asserts one
         // triple per element (the new multi-valued set); re-asserting a kept
         // value across the per-solution firings is idempotent.
+        //
+        // The old-value lookup is collected (not pushed) so `lower_set` can emit
+        // all items' lookups as one UNION instead of cross-joining OPTIONALs.
         let objs = self.expr_to_object_terms(value)?;
         let subj = self.var_term(target);
-        self.push_optional_old_value(target, &pred_iri, &pred_sid);
+        old_values.push((target.to_string(), pred_iri, pred_sid.clone()));
         for obj in objs {
             self.insert_templates.push(TripleTemplate::new(
                 subj.clone(),
@@ -895,6 +906,41 @@ impl<'a> CypherLowering<'a> {
             ));
         }
         Ok(())
+    }
+
+    /// Emit the old-value lookups gathered across a SET clause as a single
+    /// `OPTIONAL { {?n p₁ ?old₁} UNION {?n p₂ ?old₂} … }` plus one delete
+    /// template per branch. Each UNION row binds exactly one branch's `?oldᵢ`,
+    /// so only that predicate's delete template fires on it — yielding Σkᵢ rows,
+    /// not Πkᵢ. A single lookup needs no UNION; an empty SET clause emits nothing.
+    fn push_unioned_old_values(&mut self, old_values: Vec<(String, String, Sid)>) {
+        if old_values.is_empty() {
+            return;
+        }
+        let mut branches: Vec<Vec<UnresolvedPattern>> = Vec::with_capacity(old_values.len());
+        for (target, pred_iri, pred_sid) in old_values {
+            let old_name = format!("?#__cy_old_{}", self.synth_counter);
+            self.synth_counter += 1;
+            let old_vid = self.vars.get_or_insert(&old_name);
+            branches.push(vec![UnresolvedPattern::Triple(UnresolvedTriplePattern {
+                s: UnresolvedTerm::Var(Arc::from(var_name(&target).as_str())),
+                p: UnresolvedTerm::Iri(Arc::from(pred_iri.as_str())),
+                o: UnresolvedTerm::Var(Arc::from(old_name.as_str())),
+                dtc: None,
+            })]);
+            let subj = self.var_term(&target);
+            self.delete_templates.push(TripleTemplate::new(
+                subj,
+                TemplateTerm::Sid(pred_sid),
+                TemplateTerm::Var(old_vid),
+            ));
+        }
+        let inner = if branches.len() == 1 {
+            branches.pop().expect("len == 1")
+        } else {
+            vec![UnresolvedPattern::Union(branches)]
+        };
+        self.where_patterns.push(UnresolvedPattern::Optional(inner));
     }
 
     /// `SET n = { ... }` — replace all scalar node properties visible to Cypher.
@@ -994,31 +1040,38 @@ impl<'a> CypherLowering<'a> {
         let n_unres = self.unresolved_named_var(target);
         let n_term = self.var_term(target);
 
-        // Outbound: OPTIONAL { ?n ?p ?o } → delete (?n, ?p, ?o).
         let (p_unres, p_term) = self.fresh_scan_var();
         let (o_unres, o_term) = self.fresh_scan_var();
-        self.where_patterns.push(UnresolvedPattern::Optional(vec![
-            UnresolvedPattern::Triple(UnresolvedTriplePattern {
-                s: n_unres.clone(),
-                p: p_unres,
-                o: o_unres,
-                dtc: None,
-            }),
-        ]));
-        self.delete_templates
-            .push(TripleTemplate::new(n_term.clone(), p_term, o_term));
-
-        // Inbound: OPTIONAL { ?s ?p2 ?n } → delete (?s, ?p2, ?n).
         let (s_unres, s_term) = self.fresh_scan_var();
         let (p2_unres, p2_term) = self.fresh_scan_var();
-        self.where_patterns.push(UnresolvedPattern::Optional(vec![
-            UnresolvedPattern::Triple(UnresolvedTriplePattern {
-                s: s_unres,
-                p: p2_unres,
-                o: n_unres,
-                dtc: None,
-            }),
-        ]));
+
+        // One OPTIONAL over the UNION of both edge directions, NOT two
+        // independent OPTIONALs. Two OPTIONALs share only the bound `?n`, so the
+        // WHERE solver cross-joins them: a hub with O outbound and I inbound
+        // edges produces O×I transient rows. The UNION instead yields O+I rows —
+        // each binds exactly one direction's vars; the other delete template's
+        // vars stay unbound on that row and skip per-triple. The OPTIONAL keeps
+        // the node-only row when `?n` has no edges, so a detached node with no
+        // relationships is still deleted.
+        let outbound = vec![UnresolvedPattern::Triple(UnresolvedTriplePattern {
+            s: n_unres.clone(),
+            p: p_unres,
+            o: o_unres,
+            dtc: None,
+        })];
+        let inbound = vec![UnresolvedPattern::Triple(UnresolvedTriplePattern {
+            s: s_unres,
+            p: p2_unres,
+            o: n_unres,
+            dtc: None,
+        })];
+        self.where_patterns
+            .push(UnresolvedPattern::Optional(vec![UnresolvedPattern::Union(
+                vec![outbound, inbound],
+            )]));
+
+        self.delete_templates
+            .push(TripleTemplate::new(n_term.clone(), p_term, o_term));
         self.delete_templates
             .push(TripleTemplate::new(s_term, p2_term, n_term));
     }

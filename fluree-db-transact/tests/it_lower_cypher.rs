@@ -188,10 +188,12 @@ fn read_query_via_update_entry_is_rejected() {
 fn detach_delete_emits_inbound_and_outbound_scans() {
     let txn = lower("MATCH (n:Person {name: \"Alice\"}) DETACH DELETE n");
     assert_eq!(txn.txn_type, TxnType::Update);
-    // WHERE: label + inline-name filter + OPTIONAL outbound + OPTIONAL inbound.
+    // WHERE: label + inline-name filter + one OPTIONAL over a UNION of the
+    // outbound and inbound edge scans (not two independent OPTIONALs, which
+    // would cross-join into O×I rows).
     assert_eq!(
         txn.where_patterns.len(),
-        4,
+        3,
         "where: {:?}",
         txn.where_patterns
     );

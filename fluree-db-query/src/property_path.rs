@@ -302,6 +302,7 @@ impl PropertyPathOperator {
         ctx: &ExecutionContext<'_>,
         anchor: &Sid,
         forward: bool,
+        stop_at: Option<&Sid>,
     ) -> Result<Vec<Sid>> {
         let max = self
             .pattern
@@ -315,6 +316,11 @@ impl PropertyPathOperator {
         if self.emit_at_depth(0) {
             emitted.push(anchor.clone());
             emitted_set.insert(anchor.clone());
+            // Existence probe: stop as soon as the target is reached in range,
+            // instead of enumerating the whole bounded frontier.
+            if stop_at == Some(anchor) {
+                return Ok(emitted);
+            }
         }
 
         let mut depth = 0u32;
@@ -337,6 +343,9 @@ impl PropertyPathOperator {
                 for nb in neighbors {
                     if self.emit_at_depth(next_depth) && emitted_set.insert(nb.clone()) {
                         emitted.push(nb.clone());
+                        if stop_at == Some(&nb) {
+                            return Ok(emitted);
+                        }
                     }
                     if seen_at_depth.insert((nb.clone(), next_depth)) {
                         next_frontier.push(nb);
@@ -355,7 +364,7 @@ impl PropertyPathOperator {
     /// Returns all reachable nodes via the transitive predicate.
     async fn traverse_forward(&self, ctx: &ExecutionContext<'_>, start: &Sid) -> Result<Vec<Sid>> {
         if self.pattern.max_hops.is_some() {
-            return self.traverse_bounded(ctx, start, true).await;
+            return self.traverse_bounded(ctx, start, true, None).await;
         }
         let mut visited: HashSet<Sid> = HashSet::new();
         let mut queue: VecDeque<(Sid, u32)> = VecDeque::new();
@@ -422,7 +431,7 @@ impl PropertyPathOperator {
         target: &Sid,
     ) -> Result<Vec<Sid>> {
         if self.pattern.max_hops.is_some() {
-            return self.traverse_bounded(ctx, target, false).await;
+            return self.traverse_bounded(ctx, target, false, None).await;
         }
         let mut visited: HashSet<Sid> = HashSet::new();
         let mut queue: VecDeque<(Sid, u32)> = VecDeque::new();
@@ -638,7 +647,7 @@ impl PropertyPathOperator {
         // at a later depth (e.g. A→B, A→C→B, B→D; `A-[*3..3]->D` via A-C-B-D).
         if self.pattern.max_hops.is_some() {
             return Ok(self
-                .traverse_bounded(ctx, start, true)
+                .traverse_bounded(ctx, start, true, Some(target))
                 .await?
                 .iter()
                 .any(|reached| reached == target));
