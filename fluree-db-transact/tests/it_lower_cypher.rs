@@ -333,6 +333,36 @@ fn match_remove_property_emits_delete_only() {
     ));
 }
 
+#[test]
+fn match_remove_multi_property_emits_single_union_optional() {
+    use fluree_db_query::parse::UnresolvedPattern;
+    // Two property removes must share one `OPTIONAL { … UNION … }` rather than
+    // two independent OPTIONALs (which cross-join to Πkᵢ rows on multi-valued
+    // predicates), mirroring the SET multi-property fix.
+    let txn = lower(r#"MATCH (n:Person {name: "Alice"}) REMOVE n.age, n.email"#);
+    assert_eq!(txn.txn_type, TxnType::Update);
+    assert_eq!(txn.delete_templates.len(), 2, "one delete per property");
+
+    let optionals: Vec<&UnresolvedPattern> = txn
+        .where_patterns
+        .iter()
+        .filter(|p| matches!(p, UnresolvedPattern::Optional(_)))
+        .collect();
+    assert_eq!(
+        optionals.len(),
+        1,
+        "exactly one OPTIONAL (not one per property): {:?}",
+        txn.where_patterns
+    );
+    let UnresolvedPattern::Optional(inner) = optionals[0] else {
+        unreachable!()
+    };
+    assert!(
+        matches!(inner.as_slice(), [UnresolvedPattern::Union(branches)] if branches.len() == 2),
+        "OPTIONAL wraps a 2-branch UNION: {inner:?}"
+    );
+}
+
 /// Lower a write statement, expecting a rejection (returns the error message).
 fn lower_err(src: &str) -> String {
     let out = parse_cypher(src);

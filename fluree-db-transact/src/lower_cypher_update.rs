@@ -969,13 +969,17 @@ impl<'a> CypherLowering<'a> {
     }
 
     fn lower_remove(&mut self, r: &RemoveClause) -> Result<(), LowerCypherError> {
+        // Collect property removes so their old-value lookups emit as one
+        // `OPTIONAL { … UNION … }` (Σkᵢ rows) instead of one independent
+        // OPTIONAL per property cross-joining to Πkᵢ — the same fix SET uses.
+        let mut old_values: Vec<(String, String, Sid)> = Vec::new();
         for item in &r.items {
             match item {
                 RemoveItem::Property { target, property } => {
                     self.require_bound(target)?;
                     let pred_iri = self.resolve_predicate(property)?;
                     let pred_sid = self.ns.sid_for_iri(&pred_iri);
-                    self.push_optional_old_value(&target.name, &pred_iri, &pred_sid);
+                    old_values.push((target.name.clone(), pred_iri, pred_sid));
                 }
                 RemoveItem::Labels { target, labels } => {
                     self.require_bound(target)?;
@@ -993,6 +997,7 @@ impl<'a> CypherLowering<'a> {
                 }
             }
         }
+        self.push_unioned_old_values(old_values);
         Ok(())
     }
 
@@ -1396,30 +1401,6 @@ impl<'a> CypherLowering<'a> {
             }
         }
         Ok(())
-    }
-
-    /// Emit `OPTIONAL { ?target <pred> ?old }` plus a delete template for
-    /// `(?target, <pred>, ?old)`. Shared by SET (replace) and REMOVE.
-    fn push_optional_old_value(&mut self, target: &str, pred_iri: &str, pred_sid: &Sid) {
-        let old_name = format!("?#__cy_old_{}", self.synth_counter);
-        self.synth_counter += 1;
-        let old_vid = self.vars.get_or_insert(&old_name);
-
-        self.where_patterns.push(UnresolvedPattern::Optional(vec![
-            UnresolvedPattern::Triple(UnresolvedTriplePattern {
-                s: UnresolvedTerm::Var(Arc::from(var_name(target).as_str())),
-                p: UnresolvedTerm::Iri(Arc::from(pred_iri)),
-                o: UnresolvedTerm::Var(Arc::from(old_name.as_str())),
-                dtc: None,
-            }),
-        ]));
-
-        let subj = self.var_term(target);
-        self.delete_templates.push(TripleTemplate::new(
-            subj,
-            TemplateTerm::Sid(pred_sid.clone()),
-            TemplateTerm::Var(old_vid),
-        ));
     }
 
     /// Emit `OPTIONAL { ?target ?p ?old }` plus filters for Cypher node
