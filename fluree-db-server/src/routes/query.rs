@@ -556,6 +556,8 @@ pub async fn query(
     // Detect input format before span creation so otel.name is set at open time
     let input_format = if is_sparql_request(&headers, &credential, &params) {
         "sparql"
+    } else if headers.is_cypher_query() {
+        "cypher"
     } else {
         "json-ld"
     };
