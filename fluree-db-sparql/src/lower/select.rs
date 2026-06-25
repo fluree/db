@@ -680,7 +680,9 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
         // the aggregation stage.
         let mut post_binds = select_binds.post;
         post_binds.extend(lowered.select_post_binds);
-        let mut sq = SubqueryPattern::new(select, patterns);
+        // SPARQL sub-SELECTs are uncorrelated (§18.2): evaluated independently
+        // of the enclosing pattern, then joined.
+        let mut sq = SubqueryPattern::new(select, patterns).with_uncorrelated();
         if let Some(grouping) = Grouping::assemble(
             lowered.group_by,
             lowered.aggregates,

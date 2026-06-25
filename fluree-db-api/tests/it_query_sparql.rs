@@ -634,6 +634,126 @@ async fn sparql_order_by_expression_dedup_only_group_by() {
 }
 
 #[tokio::test]
+async fn sparql_group_by_datatype_expression_collapses() {
+    // Issue #1362: `GROUP BY DATATYPE(?v)` directly on an expression must collapse
+    // to one row per distinct datatype (here all favNums are xsd:integer, so a
+    // single group), matching the behavior of `GROUP BY (LCASE(?x))` and of
+    // `BIND(DATATYPE(?v) AS ?dt) ... GROUP BY ?dt`. Previously it returned one row
+    // per binding (group key not collapsed) and LIMIT did not cap the output.
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_people(&fluree, "people:main").await;
+
+    let query = r"
+        PREFIX person: <http://example.org/Person#>
+        SELECT (DATATYPE(?favNum) AS ?dt) (COUNT(?favNum) AS ?n)
+        WHERE { ?person person:favNums ?favNum }
+        GROUP BY DATATYPE(?favNum)
+        LIMIT 10
+    ";
+
+    let result = support::query_sparql(&fluree, &ledger, query)
+        .await
+        .unwrap();
+    let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    let rows = jsonld.as_array().expect("array result");
+    assert_eq!(
+        rows.len(),
+        1,
+        "GROUP BY DATATYPE(?v) should collapse to one group, got: {jsonld}"
+    );
+}
+
+#[tokio::test]
+async fn sparql_group_by_datatype_expression_collapses_decimal() {
+    // Issue #1362 (as reported): three xsd:decimal values must collapse to a single
+    // `GROUP BY DATATYPE(?v)` group. Decimals exercise the NumBig/arena value path,
+    // distinct from the integer fast path above.
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "gbdt:main");
+
+    let insert = json!({
+        "@context": {
+            "ex": "http://example.org/",
+            "xsd": "http://www.w3.org/2001/XMLSchema#"
+        },
+        "@graph": [
+            {"@id": "ex:a", "ex:amount": {"@value": "1.5", "@type": "xsd:decimal"}},
+            {"@id": "ex:b", "ex:amount": {"@value": "2.5", "@type": "xsd:decimal"}},
+            {"@id": "ex:c", "ex:amount": {"@value": "3.0", "@type": "xsd:decimal"}}
+        ]
+    });
+    let ledger = fluree
+        .insert(ledger0, &insert)
+        .await
+        .expect("insert+commit should succeed")
+        .ledger;
+
+    let query = r"
+        PREFIX ex: <http://example.org/>
+        SELECT (DATATYPE(?v) AS ?dt) (COUNT(?v) AS ?n)
+        WHERE { ?s ex:amount ?v }
+        GROUP BY DATATYPE(?v)
+        LIMIT 10
+    ";
+
+    let result = support::query_sparql(&fluree, &ledger, query)
+        .await
+        .unwrap();
+    let sparql_json = result
+        .to_sparql_json(&ledger.snapshot)
+        .expect("to_sparql_json");
+    let bindings = sparql_json["results"]["bindings"]
+        .as_array()
+        .expect("bindings array");
+    assert_eq!(
+        bindings.len(),
+        1,
+        "GROUP BY DATATYPE(?v) over decimals should collapse to one group, got: {sparql_json}"
+    );
+    // The single group is xsd:decimal with a count of 3.
+    assert_eq!(
+        bindings[0]["dt"]["value"],
+        json!("http://www.w3.org/2001/XMLSchema#decimal")
+    );
+    assert_eq!(bindings[0]["n"]["value"], json!("3"));
+}
+
+#[tokio::test]
+async fn sparql_group_by_bare_builtin_not_projected() {
+    // Issue #1362: a bare-builtin GROUP BY whose expression is NOT projected as a
+    // SELECT alias must still collapse. This exercises the synthetic group-var
+    // lowering branch (no `(expr AS ?k)` to match against), distinct from the
+    // alias-matching path the other tests cover.
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_people(&fluree, "people:main").await;
+
+    let query = r"
+        PREFIX person: <http://example.org/Person#>
+        SELECT (COUNT(?favNum) AS ?n)
+        WHERE { ?person person:favNums ?favNum }
+        GROUP BY DATATYPE(?favNum)
+    ";
+
+    let result = support::query_sparql(&fluree, &ledger, query)
+        .await
+        .unwrap();
+    let sparql_json = result
+        .to_sparql_json(&ledger.snapshot)
+        .expect("to_sparql_json");
+    let bindings = sparql_json["results"]["bindings"]
+        .as_array()
+        .expect("bindings array");
+    assert_eq!(
+        bindings.len(),
+        1,
+        "bare-builtin GROUP BY should collapse to one group, got: {sparql_json}"
+    );
+}
+
+#[tokio::test]
 async fn sparql_order_by_inline_aggregate_shared_with_select_alias() {
     // `ORDER BY DESC(COUNT(?x))` with an explicit GROUP BY. The inline aggregate
     // is hoisted and deduped against the SELECT alias `?c`, so it sorts by the
@@ -1047,6 +1167,223 @@ async fn sparql_subquery_order_by_select_alias_expression() {
 }
 
 #[tokio::test]
+async fn sparql_subquery_limit_scopes_outer_join() {
+    // Issue (W3C subquery/sq11): a sub-SELECT with ORDER BY ... LIMIT n must be
+    // evaluated to its complete (limited, ordered) solution sequence BEFORE it
+    // joins the enclosing pattern. A "top-N then decorate" query must therefore
+    // only decorate the N selected resources, not the whole dataset.
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "sqlimit:main");
+
+    let insert = json!({
+        "@context": {
+            "ex": "http://www.example.org/",
+            "rdfs": "http://www.w3.org/2000/01/rdf-schema#"
+        },
+        "@graph": [
+            {"@id": "ex:order1", "@type": "ex:Order",
+             "ex:hasItem": [{"rdfs:label": "Ice Cream"}, {"rdfs:label": "Pizza"}, {"rdfs:label": "Wine"}]},
+            {"@id": "ex:order2", "@type": "ex:Order",
+             "ex:hasItem": [{"rdfs:label": "Ice Cream"}, {"rdfs:label": "Pasta"}, {"rdfs:label": "Soft Drink"}]},
+            {"@id": "ex:order3", "@type": "ex:Order",
+             "ex:hasItem": [{"rdfs:label": "Sandwich"}, {"rdfs:label": "Soft Drink"}]},
+            {"@id": "ex:order4", "@type": "ex:Order",
+             "ex:hasItem": [{"rdfs:label": "Bagel"}, {"rdfs:label": "Soft Drink"}]}
+        ]
+    });
+    let ledger = fluree
+        .insert(ledger0, &insert)
+        .await
+        .expect("insert+commit should succeed")
+        .ledger;
+
+    let query = r"
+        PREFIX ex: <http://www.example.org/>
+        PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+        SELECT ?O ?item ?L
+        WHERE {
+          ?O ex:hasItem ?item .
+          OPTIONAL { ?item rdfs:label ?L }
+          {
+            SELECT DISTINCT ?O
+            WHERE { ?O a ex:Order }
+            ORDER BY ?O
+            LIMIT 2
+          }
+        } ORDER BY ?O ?item
+    ";
+
+    let result = support::query_sparql(&fluree, &ledger, query)
+        .await
+        .unwrap();
+    let sparql_json = result
+        .to_sparql_json(&ledger.snapshot)
+        .expect("to_sparql_json");
+    let bindings = sparql_json["results"]["bindings"]
+        .as_array()
+        .expect("bindings array");
+
+    // The inner LIMIT 2 (ORDER BY ?O) selects only order1 and order2, which have
+    // 3 items each → 6 outer rows. order3/order4 must not appear. (Match on the
+    // IRI suffix to stay robust to compact-vs-full IRI rendering.)
+    let orders: std::collections::BTreeSet<String> = bindings
+        .iter()
+        .filter_map(|b| b["O"]["value"].as_str())
+        .map(|s| {
+            s.rsplit('/')
+                .next()
+                .unwrap_or(s)
+                .rsplit(':')
+                .next()
+                .unwrap_or(s)
+                .to_string()
+        })
+        .collect();
+    assert_eq!(
+        orders,
+        ["order1".to_string(), "order2".to_string()]
+            .into_iter()
+            .collect(),
+        "sub-SELECT LIMIT must scope the outer join, got: {sparql_json}"
+    );
+    assert_eq!(
+        bindings.len(),
+        6,
+        "expected 6 item rows (3 each for order1/order2), got: {sparql_json}"
+    );
+}
+
+#[tokio::test]
+async fn sparql_subquery_limit_w3c_sq11_blank_node_form() {
+    // W3C subquery/sq11 verbatim: a blank-node property-list object
+    // (`?O :hasItem [ rdfs:label ?L ]`) joined to a `SELECT DISTINCT ?O … LIMIT 2`
+    // sub-SELECT, loaded via Turtle (as the W3C runner does). Exercises three
+    // fixes together: (1) blank-node property lists must bind `?L`; (2) the inner
+    // LIMIT must scope the outer join; (3) a parent batch that matches no
+    // subquery row must not terminate the SubqueryOperator early. Turtle batching
+    // surfaces (3) — a non-matching parent batch (order3/order4) arrives first.
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "sq11ttl:main");
+
+    let ttl = r#"@prefix : <http://www.example.org> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+:order1 a :Order; :hasItem
+    [ :amount 2 ; rdfs:label "Ice Cream" ; :price 4 ],
+    [ :amount 2 ; rdfs:label "Pizza" ; :price 10 ],
+    [ :amount 1 ; rdfs:label "Wine" ; :price 8 ].
+:order2 a :Order; :hasItem
+    [ :amount 3 ; rdfs:label "Ice Cream" ; :price 4 ],
+    [ :amount 2 ; rdfs:label "Pasta" ; :price 8 ],
+    [ :amount 3 ; rdfs:label "Soft Drink" ; :price 6 ].
+:order3 a :Order; :hasItem
+    [ :amount 1 ; rdfs:label "Sandwich" ; :price 3 ],
+    [ :amount 1 ; rdfs:label "Soft Drink" ; :price 2 ].
+:order4 a :Order; :hasItem
+    [ :amount 1 ; rdfs:label "Bagel" ; :price 3.5 ],
+    [ :amount 1 ; rdfs:label "Soft Drink" ; :price 2 ].
+"#;
+    let ledger = fluree
+        .insert_turtle(ledger0, ttl)
+        .await
+        .expect("insert turtle")
+        .ledger;
+
+    let query = r"
+        PREFIX : <http://www.example.org>
+        PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+        SELECT ?L
+        WHERE {
+          ?O :hasItem [ rdfs:label ?L ] .
+          { SELECT DISTINCT ?O WHERE { ?O a :Order } ORDER BY ?O LIMIT 2 }
+        } ORDER BY ?L
+    ";
+
+    let result = support::query_sparql(&fluree, &ledger, query)
+        .await
+        .unwrap();
+    let sparql_json = result
+        .to_sparql_json(&ledger.snapshot)
+        .expect("to_sparql_json");
+    let labels: Vec<&str> = sparql_json["results"]["bindings"]
+        .as_array()
+        .expect("bindings")
+        .iter()
+        .map(|b| b["L"]["value"].as_str().expect("L bound"))
+        .collect();
+    // sq11 expected: the labels of order1 + order2 items, ordered.
+    assert_eq!(
+        labels,
+        [
+            "Ice Cream",
+            "Ice Cream",
+            "Pasta",
+            "Pizza",
+            "Soft Drink",
+            "Wine"
+        ],
+        "got: {sparql_json}"
+    );
+}
+
+#[tokio::test]
+async fn sparql_blank_node_property_list_binds_vars() {
+    // A variable inside an inline blank-node property list
+    // (`?s :p [ :q ?x ]`) must be bound and projectable — the list desugars to a
+    // fresh blank node plus its nested triples (SPARQL 1.1 §4.1.4). Covers object
+    // position, the multi-predicate `;` form, and nesting.
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "bnpl:main");
+    let ttl = r#"@prefix ex: <http://example.org/> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+ex:cart ex:has [ rdfs:label "Apple" ; ex:qty 3 ] , [ rdfs:label "Pear" ; ex:qty 1 ] .
+"#;
+    let ledger = fluree
+        .insert_turtle(ledger0, ttl)
+        .await
+        .expect("insert turtle")
+        .ledger;
+
+    // Object position, multi-predicate `;` list: both ?label and ?qty bind.
+    let q = r"
+        PREFIX ex: <http://example.org/>
+        PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+        SELECT ?label ?qty
+        WHERE { ex:cart ex:has [ rdfs:label ?label ; ex:qty ?qty ] . }
+        ORDER BY ?label
+    ";
+    let jsonld = support::query_sparql(&fluree, &ledger, q)
+        .await
+        .unwrap()
+        .to_jsonld(&ledger.snapshot)
+        .expect("to_jsonld");
+    assert_eq!(
+        normalize_rows(&jsonld),
+        normalize_rows(&json!([["Apple", 3], ["Pear", 1]])),
+        "blank-node property list must bind both nested vars"
+    );
+
+    // Bare blank-node-property-list subject form: `[ rdfs:label ?label ] ...`.
+    let q2 = r"
+        PREFIX ex: <http://example.org/>
+        PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+        SELECT ?label WHERE { [ rdfs:label ?label ] ex:qty 3 . }
+    ";
+    let jsonld2 = support::query_sparql(&fluree, &ledger, q2)
+        .await
+        .unwrap()
+        .to_jsonld(&ledger.snapshot)
+        .expect("to_jsonld");
+    assert_eq!(
+        normalize_rows(&jsonld2),
+        normalize_rows(&json!([["Apple"]])),
+        "subject-position blank-node property list must bind and join"
+    );
+}
+
+#[tokio::test]
 async fn sparql_subquery_full_modifier_stack() {
     // Pattern 8: GROUP BY + HAVING + aggregate ORDER BY + LIMIT in one subquery.
     assert_index_defaults();
@@ -1168,11 +1505,15 @@ async fn sparql_subquery_having_eliminates_all_groups() {
 }
 
 #[tokio::test]
-async fn sparql_correlated_subquery_order_by_limit_per_row() {
-    // Correlated subquery where the inner ORDER BY + LIMIT genuinely matter:
-    // for each outer ?person, pick that person's MAX favNum via
-    // `ORDER BY DESC(?top) LIMIT 1`. Proves per-row correlation seeding is
-    // preserved AND the inner sort/limit run before the merge-back.
+async fn sparql_subquery_order_by_limit_is_uncorrelated() {
+    // SPARQL 1.1 §18.2: a sub-SELECT is evaluated to its complete (ordered,
+    // sliced) solution sequence INDEPENDENTLY of the enclosing pattern, then
+    // joined. There are no correlated (LATERAL) sub-SELECTs in SPARQL 1.1, so
+    // `{ SELECT ?person ?top WHERE { ?person person:favNums ?top }
+    //    ORDER BY DESC(?top) LIMIT 1 }` yields the single GLOBAL max-favNum row
+    // (jdoe, 99) — NOT one row per outer ?person — and the outer join on ?person
+    // then keeps only jdoe. (Issue: inner LIMIT must scope the subquery, not the
+    // outer join; W3C subquery/sq11.)
     assert_index_defaults();
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger = seed_people(&fluree, "people:main").await;
@@ -1193,10 +1534,11 @@ async fn sparql_correlated_subquery_order_by_limit_per_row() {
         .await
         .unwrap();
     let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
-    // Per-person max favNum: jdoe 99, bbob 23, jbob 9; dankeshön (no favNums) drops.
+    // Global max favNum is 99 (jdoe); the inner LIMIT 1 keeps only that row,
+    // which joins to exactly one handle.
     assert_eq!(
         normalize_rows(&jsonld),
-        normalize_rows(&json!([["jdoe", 99], ["bbob", 23], ["jbob", 9]]))
+        normalize_rows(&json!([["jdoe", 99]]))
     );
 }
 

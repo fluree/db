@@ -44,6 +44,13 @@ pub struct SubqueryPattern {
     pub order_binds: Vec<(VarId, Expression)>,
     /// Optional aggregation phase (GROUP BY / aggregates / HAVING).
     pub grouping: Option<Grouping>,
+    /// Whether this subquery must be evaluated INDEPENDENTLY of the enclosing
+    /// pattern (its complete, ordered, sliced solution sequence computed, then
+    /// joined). SPARQL 1.1 §18.2 sub-`SELECT`s are always uncorrelated and set
+    /// this; the executor then never seeds the inner query per parent row (which
+    /// would correlate it / let an inner LIMIT apply per row). JSON-LD subqueries
+    /// default to `false`, preserving their per-row-seeding (LATERAL) behavior.
+    pub uncorrelated: bool,
 }
 
 impl SubqueryPattern {
@@ -58,7 +65,15 @@ impl SubqueryPattern {
             ordering: Vec::new(),
             order_binds: Vec::new(),
             grouping: None,
+            uncorrelated: false,
         }
+    }
+
+    /// Mark this subquery as uncorrelated (SPARQL 1.1 §18.2 — evaluated
+    /// independently, then joined). See [`Self::uncorrelated`].
+    pub fn with_uncorrelated(mut self) -> Self {
+        self.uncorrelated = true;
+        self
     }
 
     /// Set limit

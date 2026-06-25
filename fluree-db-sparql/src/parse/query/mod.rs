@@ -170,11 +170,23 @@ pub fn parse_group_graph_pattern(
 /// The SPARQL parser.
 struct Parser<'a> {
     stream: &'a mut super::stream::TokenStream,
+    /// Monotonic counter minting unique labels for blank-node property lists
+    /// (`[ :p ?o ]`). Each list desugars to a fresh labeled blank node so the
+    /// node and its nested triples share one join variable.
+    bnode_counter: usize,
+    /// Triples produced by a blank-node property list while parsing an
+    /// object/subject term. The enclosing object-list / triples-block parser
+    /// drains these into its BGP once the term that produced them is placed.
+    pending_bnpl_triples: Vec<TriplePattern>,
 }
 
 impl<'a> Parser<'a> {
     fn new(stream: &'a mut super::stream::TokenStream) -> Self {
-        Self { stream }
+        Self {
+            stream,
+            bnode_counter: 0,
+            pending_bnpl_triples: Vec::new(),
+        }
     }
 
     /// Parse a complete SPARQL query.

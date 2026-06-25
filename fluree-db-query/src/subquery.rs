@@ -154,28 +154,36 @@ impl SubqueryOperator {
             .filter(|v| produced.contains(v))
             .collect();
 
-        // Eligible for evaluate-once + hash-join when there is no inner slice and
-        // every NON-key correlation var is an unreferenced pass-through (it
-        // appears only in the SELECT, never constraining the body). Omitting such
-        // a var from the join key matches SPARQL join semantics. A correlation
-        // var that is referenced but not produced is a genuine per-row input.
-        let body_referenced = referenced_vars_set(&subquery.patterns);
-        let pass_through_ok = correlation_vars
-            .iter()
-            .all(|v| produced.contains(v) || !body_referenced.contains(v));
-        let eligible = subquery.limit.is_none() && subquery.offset.is_none() && pass_through_ok;
-
-        // Cardinality guard: evaluating once + hash-join removes the per-row
-        // operator-rebuild overhead, which pays off when the parent drives many
-        // rows; for a small parent, per-row seeding (with its pruning seed) can
-        // be cheaper, so fall back to it (the pre-existing behavior — this guard
-        // never regresses below it). An uncorrelated subquery has no shared key
-        // and MUST be evaluated once regardless (per-row recomputes identically).
-        let join_mode = eligible
-            && (correlation_vars.is_empty()
-                || child
-                    .estimated_rows()
-                    .is_none_or(|n| n >= SUBQUERY_MATERIALIZE_MIN_PARENT_ROWS));
+        let join_mode = if subquery.uncorrelated {
+            // SPARQL 1.1 §18.2: a sub-SELECT is evaluated INDEPENDENTLY (its
+            // complete, ordered, sliced solution sequence) and then joined — it
+            // is never seeded per parent row, which would correlate it (and let
+            // an inner LIMIT/OFFSET apply per row, leaking rows past the slice;
+            // W3C subquery/sq11). Materialize once + hash-join on `join_keys`.
+            // A non-produced correlation var is unbound in every inner row, so
+            // omitting it from the key is the correct natural join (unbound is
+            // compatible with any parent value), and the merge fills it from the
+            // parent. So this is correct regardless of `pass_through_ok`.
+            true
+        } else {
+            // JSON-LD subqueries keep their legacy per-row-seeding (LATERAL)
+            // behavior: evaluate-once + hash-join only when there is no inner
+            // slice and every NON-key correlation var is an unreferenced
+            // pass-through; otherwise per-row seed. The cardinality guard prefers
+            // per-row seeding for a small parent (its pruning seed can be
+            // cheaper); an uncorrelated (no shared key) subquery is always
+            // evaluated once (per-row recomputes identically).
+            let body_referenced = referenced_vars_set(&subquery.patterns);
+            let pass_through_ok = correlation_vars
+                .iter()
+                .all(|v| produced.contains(v) || !body_referenced.contains(v));
+            let eligible = subquery.limit.is_none() && subquery.offset.is_none() && pass_through_ok;
+            eligible
+                && (correlation_vars.is_empty()
+                    || child
+                        .estimated_rows()
+                        .is_none_or(|n| n >= SUBQUERY_MATERIALIZE_MIN_PARENT_ROWS))
+        };
 
         Self {
             child,
@@ -296,16 +304,64 @@ impl Operator for SubqueryOperator {
             return self.drain_buffer().await;
         }
 
-        // Get next batch from child
-        let Some(parent_batch) = self.child.next_batch(ctx).await? else {
-            self.state = OperatorState::Exhausted;
-            return Ok(None);
-        };
+        // Pull parent batches until one yields at least one merged row. A parent
+        // batch can legitimately produce no rows — in join mode, when none of its
+        // join keys are present in the (sliced) subquery result; in per-row mode,
+        // when the seeded subquery is empty. An empty result buffer must NOT be
+        // reported to the consumer as `None`, because `None` means "operator
+        // exhausted" and would drop every later parent batch. Only a `None` from
+        // the child ends iteration.
+        loop {
+            let Some(parent_batch) = self.child.next_batch(ctx).await? else {
+                self.state = OperatorState::Exhausted;
+                return Ok(None);
+            };
 
-        // Process each parent row
+            // Process each parent row
+            self.result_buffer.clear();
+            self.buffer_pos = 0;
+
+            self.process_parent_batch(ctx, &parent_batch).await?;
+
+            if !self.result_buffer.is_empty() {
+                return self.drain_buffer().await;
+            }
+            // No matches in this batch — pull the next one.
+        }
+    }
+
+    fn close(&mut self) {
+        self.child.close();
         self.result_buffer.clear();
-        self.buffer_pos = 0;
+        self.state = OperatorState::Closed;
+    }
 
+    fn estimated_rows(&self) -> Option<usize> {
+        // The subquery's OWN output estimate seeds the downstream object→subject
+        // hash join's driving estimate so a `(message HAS_CREATOR friend)` probe
+        // is costed against the ~producer size, not 1 — but ONLY for shapes whose
+        // output is reliably bounded (scalar aggregate, anchored `WITH DISTINCT`
+        // producer, or explicit LIMIT). For an arbitrary subquery the estimate is
+        // just body cardinality, which is fine for join ordering but too
+        // unreliable to perturb the hash-join cost model, so we keep the
+        // conservative `None` the operator returned before.
+        if !crate::planner::subquery_output_estimate_is_bounded(&self.subquery) {
+            return None;
+        }
+        Some(
+            crate::planner::estimate_subquery_output(&self.subquery, self.stats.as_deref()).round()
+                as usize,
+        )
+    }
+}
+
+impl SubqueryOperator {
+    /// Merge one parent batch against the subquery result into `result_buffer`.
+    async fn process_parent_batch(
+        &mut self,
+        ctx: &ExecutionContext<'_>,
+        parent_batch: &Batch,
+    ) -> Result<()> {
         for row_idx in 0..parent_batch.len() {
             // Produce this parent row's matching subquery rows.
             //
@@ -342,7 +398,7 @@ impl Operator for SubqueryOperator {
                     None => Vec::new(),
                 }
             } else {
-                self.execute_subquery_for_row(ctx, &parent_batch, row_idx)
+                self.execute_subquery_for_row(ctx, parent_batch, row_idx)
                     .await?
             };
 
@@ -388,35 +444,9 @@ impl Operator for SubqueryOperator {
             }
         }
 
-        self.drain_buffer().await
+        Ok(())
     }
 
-    fn close(&mut self) {
-        self.child.close();
-        self.result_buffer.clear();
-        self.state = OperatorState::Closed;
-    }
-
-    fn estimated_rows(&self) -> Option<usize> {
-        // The subquery's OWN output estimate seeds the downstream object→subject
-        // hash join's driving estimate so a `(message HAS_CREATOR friend)` probe
-        // is costed against the ~producer size, not 1 — but ONLY for shapes whose
-        // output is reliably bounded (scalar aggregate, anchored `WITH DISTINCT`
-        // producer, or explicit LIMIT). For an arbitrary subquery the estimate is
-        // just body cardinality, which is fine for join ordering but too
-        // unreliable to perturb the hash-join cost model, so we keep the
-        // conservative `None` the operator returned before.
-        if !crate::planner::subquery_output_estimate_is_bounded(&self.subquery) {
-            return None;
-        }
-        Some(
-            crate::planner::estimate_subquery_output(&self.subquery, self.stats.as_deref()).round()
-                as usize,
-        )
-    }
-}
-
-impl SubqueryOperator {
     /// Drain buffered results into a batch
     async fn drain_buffer(&mut self) -> Result<Option<Batch>> {
         if self.buffer_pos >= self.result_buffer.len() {
