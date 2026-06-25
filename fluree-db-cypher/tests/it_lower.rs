@@ -448,6 +448,25 @@ fn limit_and_skip() {
 }
 
 #[test]
+fn negative_limit_or_skip_is_rejected() {
+    // openCypher errors on a negative SKIP/LIMIT; reject rather than silently
+    // clamping to 0 (which a driver would not expect).
+    for src in [
+        "MATCH (n:Person) RETURN n LIMIT -1",
+        "MATCH (n:Person) RETURN n SKIP -5",
+    ] {
+        let out = parse_cypher(src);
+        assert!(!out.has_errors(), "parse should accept: {src}");
+        let ast = out.ast.expect("ast");
+        let mut vars = VarRegistry::new();
+        assert!(
+            lower_cypher(&ast, &NoEncoder, &mut vars).is_err(),
+            "expected lowering to reject: {src}"
+        );
+    }
+}
+
+#[test]
 fn where_clause_emits_filter() {
     let q = lower("MATCH (n:Person) WHERE n = n RETURN n");
     // 1 label + 1 filter = 2

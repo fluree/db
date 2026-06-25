@@ -1099,7 +1099,16 @@ fn lower_order_by<E: IriEncoder>(
 fn const_usize(e: &Option<Expr>) -> Result<Option<usize>> {
     match e {
         None => Ok(None),
-        Some(Expr::Lit(crate::ast::Literal::Integer(n, _))) => Ok(Some((*n).max(0) as usize)),
+        // openCypher errors on a negative SKIP/LIMIT; reject rather than
+        // silently clamping to 0 (which a driver would not expect).
+        Some(Expr::Lit(crate::ast::Literal::Integer(n, _))) => {
+            if *n < 0 {
+                return Err(LowerError::unsupported(
+                    "SKIP/LIMIT must be a non-negative integer",
+                ));
+            }
+            Ok(Some(*n as usize))
+        }
         Some(_) => Err(LowerError::unsupported(
             "non-literal SKIP/LIMIT is deferred — write a literal integer",
         )),
