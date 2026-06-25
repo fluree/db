@@ -2430,6 +2430,19 @@ fn build_operator_tree_inner(
         }
     }
 
+    // Fast-path: a single R2RML graph-source scan feeding a simple COUNT
+    // aggregate — fold straight from column batches instead of materializing an
+    // RDF binding per table row. Falls back to the normal pipeline at open if
+    // its column-resolution gates fail.
+    if enable_fused_fast_paths {
+        if let Some(plan) = crate::r2rml::detect_fused_r2rml_aggregate(query) {
+            let fallback = build_operator_tree_inner(query, stats.clone(), false, planning)?;
+            return Ok(Box::new(crate::r2rml::FusedR2rmlAggregateOperator::new(
+                plan, fallback,
+            )));
+        }
+    }
+
     // Fast-path: `SELECT (COUNT(?x) AS ?c) WHERE { ?s <p> ?o }` (and COUNT(*))
     // answered from PSOT leaflet directory row counts (no scan / no decoding).
     if enable_fused_fast_paths {
