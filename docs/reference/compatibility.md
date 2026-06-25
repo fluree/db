@@ -85,6 +85,8 @@ Supported SPARQL features:
 
 **Empty-group aggregates:** Over an implicit single group (no `GROUP BY`) whose pattern matches nothing, `COUNT`, `SUM`, and `AVG` return their identity `"0"^^xsd:integer` (SPARQL 1.1 §18.5.1); `MIN`, `MAX`, and `SAMPLE` have no identity element and return unbound. A query *with* `GROUP BY` over an empty pattern returns zero rows.
 
+**Expression error semantics:** A *dynamic value* error in a `SELECT`/`BIND`/`ORDER BY` expression (e.g. arithmetic on incompatible operand types) leaves that variable unbound for the solution and the query still returns the remaining rows (SPARQL 1.1 §18.5 `Extend`); the same error in a `FILTER` eliminates the solution (§17.2). *Structural* errors — a built-in called with the wrong arity, an unknown datatype IRI — describe a malformed query and are reported as a query error. (Transactions evaluate their `WHERE` clause in strict mode, so a computed value error fails the transaction rather than silently writing an unbound value.)
+
 **W3C Compliance Testing:** Fluree runs the official W3C SPARQL test suite via the `testsuite-sparql` crate. The suite automatically discovers and runs 700+ test cases from W3C manifest files. See the [compliance test guide](../contributing/sparql-compliance.md) for details.
 
 **Specification:** https://www.w3.org/TR/sparql11-query/

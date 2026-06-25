@@ -1255,6 +1255,106 @@ async fn sparql_subquery_limit_scopes_outer_join() {
 }
 
 #[tokio::test]
+async fn sparql_projection_expression_error_leaves_var_unbound() {
+    // SPARQL 1.1 §18.5 (Extend): when a SELECT/BIND expression raises an
+    // evaluation error for a solution, that variable is left UNBOUND for that
+    // solution and the remaining solutions are still returned — the query must
+    // NOT fail. (W3C functions/plus-1-corrected, project-expression/projexp02.)
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "exprerr:main");
+    let insert = json!({
+        "@context": {"ex": "http://example.org/", "xsd": "http://www.w3.org/2001/XMLSchema#"},
+        "@graph": [
+            {"@id": "ex:s1", "ex:p": "abc"},
+            {"@id": "ex:s2", "ex:p": {"@value": "2", "@type": "xsd:integer"}}
+        ]
+    });
+    let ledger = fluree.insert(ledger0, &insert).await.unwrap().ledger;
+
+    let query = r"
+        PREFIX ex: <http://example.org/>
+        SELECT ?s ?v (?v + 1 AS ?plus)
+        WHERE { ?s ex:p ?v }
+        ORDER BY ?s
+    ";
+    let result = support::query_sparql(&fluree, &ledger, query)
+        .await
+        .expect("expression error must not fail the whole query");
+    let sparql_json = result
+        .to_sparql_json(&ledger.snapshot)
+        .expect("to_sparql_json");
+    let bindings = sparql_json["results"]["bindings"]
+        .as_array()
+        .expect("bindings array");
+    assert_eq!(
+        bindings.len(),
+        2,
+        "both rows must be returned: {sparql_json}"
+    );
+    // s1: "abc" + 1 errors → ?plus unbound (absent from the binding map).
+    assert_eq!(bindings[0]["v"]["value"], "abc");
+    assert!(
+        bindings[0].get("plus").is_none(),
+        "?plus must be unbound where the addition errors: {sparql_json}"
+    );
+    // s2: 2 + 1 = 3.
+    assert_eq!(bindings[1]["v"]["value"], "2");
+    assert_eq!(bindings[1]["plus"]["value"], "3");
+}
+
+#[tokio::test]
+async fn sparql_bind_and_order_by_expression_errors_do_not_fail_query() {
+    // §18.5 Extend applies to WHERE-clause BIND and ORDER BY expressions too: a
+    // value error leaves the variable unbound (BIND) or sorts as unbound (ORDER
+    // BY) rather than failing the query. Structural errors (arity etc.) still
+    // surface — covered by the JSON-LD bind-error tests.
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "exprerr2:main");
+    let insert = json!({
+        "@context": {"ex": "http://example.org/", "xsd": "http://www.w3.org/2001/XMLSchema#"},
+        "@graph": [
+            {"@id": "ex:s1", "ex:p": "abc"},
+            {"@id": "ex:s2", "ex:p": {"@value": "2", "@type": "xsd:integer"}}
+        ]
+    });
+    let ledger = fluree.insert(ledger0, &insert).await.unwrap().ledger;
+
+    // WHERE-clause BIND that errors on the string row, plus an ORDER BY whose
+    // key also errors on that row — both must demote, not 400.
+    let query = r"
+        PREFIX ex: <http://example.org/>
+        SELECT ?v ?plus
+        WHERE { ?s ex:p ?v . BIND(?v + 1 AS ?plus) }
+        ORDER BY (?v + 1)
+    ";
+    let result = support::query_sparql(&fluree, &ledger, query)
+        .await
+        .expect("BIND/ORDER BY expression error must not fail the query");
+    let sparql_json = result
+        .to_sparql_json(&ledger.snapshot)
+        .expect("to_sparql_json");
+    let bindings = sparql_json["results"]["bindings"]
+        .as_array()
+        .expect("bindings array");
+    assert_eq!(
+        bindings.len(),
+        2,
+        "both rows must be returned: {sparql_json}"
+    );
+    // Exactly one row binds ?plus (the integer row → 3); the string row is unbound.
+    let plus: Vec<Option<&str>> = bindings
+        .iter()
+        .map(|b| b["plus"]["value"].as_str())
+        .collect();
+    assert!(
+        plus.contains(&Some("3")) && plus.contains(&None),
+        "one ?plus bound to 3, one unbound: {sparql_json}"
+    );
+}
+
+#[tokio::test]
 async fn sparql_empty_group_sum_avg_return_zero() {
     // SPARQL 1.1 §18.5.1.3 / §18.5.1.4 (W3C agg-avg-03, agg-empty-group-count-2):
     // over an implicit single group (no GROUP BY) whose pattern matches nothing,
