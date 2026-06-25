@@ -80,6 +80,7 @@ pub fn lower_expr<E: IriEncoder>(
                 BinOp::Pow => Function::Pow,
                 BinOp::And => Function::And,
                 BinOp::Or => Function::Or,
+                BinOp::Xor => Function::Xor,
             };
             Ok(Expression::binary(f, l, r))
         }

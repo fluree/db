@@ -28,3 +28,64 @@ fn parse_modulus_expression() {
     assert!(!out.has_errors(), "diagnostics: {:?}", out.diagnostics);
     assert!(out.ast.is_some());
 }
+
+/// Regression: a long `XOR` chain must stay linear. The old structural
+/// desugaring cloned the left operand twice per operator, so this 2000-term
+/// chain expanded to a ~2^2000-node AST and never finished parsing. With a
+/// first-class `BinOp::Xor` node it parses in microseconds.
+#[test]
+fn parse_long_xor_chain_is_linear() {
+    let terms: Vec<&str> = vec!["true"; 2000];
+    let query = format!("RETURN {}", terms.join(" XOR "));
+    let out = parse_cypher(&query);
+    assert!(!out.has_errors(), "diagnostics: {:?}", out.diagnostics);
+    assert!(out.ast.is_some());
+}
+
+/// Regression: deeply-nested input must return a diagnostic, not overflow the
+/// stack (a Rust stack overflow aborts the whole process — an unauthenticated
+/// DoS, since `parse_cypher` runs on the request handler thread). The depth
+/// guard trips long before the stack is exhausted. Each shape exercises a
+/// distinct recursion path: parens re-enter `parse_or`, the unary layers
+/// self-recurse, and `CALL { … }` re-enters `parse_statement`.
+#[test]
+fn deep_paren_nesting_errors() {
+    let parens = format!("RETURN {}1{}", "(".repeat(50_000), ")".repeat(50_000));
+    let out = parse_cypher(&parens);
+    assert!(out.has_errors(), "deep parens should error");
+    assert!(out.ast.is_none());
+}
+
+#[test]
+fn deep_not_nesting_errors() {
+    let nots = format!("RETURN {}true", "NOT ".repeat(50_000));
+    assert!(parse_cypher(&nots).has_errors(), "deep NOT should error");
+}
+
+#[test]
+fn deep_unary_minus_nesting_errors() {
+    let negs = format!("RETURN {}1", "-".repeat(50_000));
+    assert!(
+        parse_cypher(&negs).has_errors(),
+        "deep unary minus should error"
+    );
+}
+
+#[test]
+fn deep_call_nesting_errors() {
+    let calls = format!(
+        "{}RETURN 1{}",
+        "CALL { ".repeat(50_000),
+        " }".repeat(50_000)
+    );
+    assert!(parse_cypher(&calls).has_errors(), "deep CALL should error");
+}
+
+/// The depth guard must not reject ordinary, modestly-nested queries.
+#[test]
+fn moderate_nesting_is_accepted() {
+    let parens = format!("RETURN {}1{}", "(".repeat(32), ")".repeat(32));
+    let out = parse_cypher(&parens);
+    assert!(!out.has_errors(), "diagnostics: {:?}", out.diagnostics);
+    assert!(out.ast.is_some());
+}

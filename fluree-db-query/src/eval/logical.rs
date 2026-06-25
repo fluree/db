@@ -57,6 +57,23 @@ pub fn eval_not<R: RowAccess>(
     Ok(Some(ComparableValue::Bool(!result)))
 }
 
+/// Evaluate logical XOR (Cypher `XOR`).
+///
+/// Two-valued: `bool(a) ^ bool(b)`, folded left-to-right over all arguments.
+/// This reproduces exactly the `(a OR b) AND NOT(a AND b)` truthiness form it
+/// replaces — without the exponential AST blow-up of structural desugaring.
+pub fn eval_xor<R: RowAccess>(
+    args: &[Expression],
+    row: &R,
+    ctx: Option<&ExecutionContext<'_>>,
+) -> Result<Option<ComparableValue>> {
+    let mut acc = false;
+    for arg in args {
+        acc ^= arg.eval_to_bool(row, ctx)?;
+    }
+    Ok(Some(ComparableValue::Bool(acc)))
+}
+
 /// Evaluate IN expression
 ///
 /// First argument is the test value, remaining arguments are the set values.

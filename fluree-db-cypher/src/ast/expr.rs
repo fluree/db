@@ -224,6 +224,11 @@ pub enum BinOp {
     Pow,
     And,
     Or,
+    /// Logical XOR (`XOR`). A first-class node (not desugared at parse time) so a
+    /// chain `a XOR b XOR c …` stays linear in the AST; lowered to the engine's
+    /// `Function::Xor`. Desugaring to `(a OR b) AND NOT(a AND b)` here would
+    /// duplicate the left operand each step → O(2ⁿ) AST blow-up.
+    Xor,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

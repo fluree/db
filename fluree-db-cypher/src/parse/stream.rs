@@ -4,14 +4,50 @@ use crate::diag::{DiagCode, Diagnostic, Severity};
 use crate::lex::{Token, TokenKind};
 use crate::span::SourceSpan;
 
+/// Maximum parser recursion depth. The recursive-descent parser (and the
+/// AST walkers that later recurse over its output) descend one frame per level
+/// of expression/statement nesting; without a bound, hostile input such as
+/// `RETURN ((((…50k…))))` overflows the thread stack, which aborts the whole
+/// process (a Rust stack overflow is not catchable). Capping the AST depth here
+/// also bounds the depth of every downstream walker (lowering, param
+/// substitution). 256 is far beyond any real query yet leaves ample stack
+/// headroom even with the ~12-frame precedence chain per level.
+const MAX_PARSE_DEPTH: u32 = 256;
+
 pub struct TokenStream {
     tokens: Vec<Token>,
     pos: usize,
+    depth: u32,
 }
 
 impl TokenStream {
     pub fn new(tokens: Vec<Token>) -> Self {
-        Self { tokens, pos: 0 }
+        Self {
+            tokens,
+            pos: 0,
+            depth: 0,
+        }
+    }
+
+    /// Enter one level of recursion, erroring (rather than overflowing the
+    /// stack) past [`MAX_PARSE_DEPTH`]. Every successful `enter_recursion` MUST
+    /// be paired with a [`Self::leave_recursion`] on the success path; the
+    /// counter is incremented only when the limit is not exceeded, so an error
+    /// return (which aborts the whole parse) need not unwind it.
+    pub fn enter_recursion(&mut self) -> Result<(), Diagnostic> {
+        if self.depth >= MAX_PARSE_DEPTH {
+            return Err(self.error(
+                DiagCode::NestingTooDeep,
+                format!("query nesting exceeds the maximum depth of {MAX_PARSE_DEPTH}"),
+            ));
+        }
+        self.depth += 1;
+        Ok(())
+    }
+
+    /// Leave one level of recursion. Pairs with [`Self::enter_recursion`].
+    pub fn leave_recursion(&mut self) {
+        self.depth = self.depth.saturating_sub(1);
     }
 
     pub fn peek(&self) -> &Token {

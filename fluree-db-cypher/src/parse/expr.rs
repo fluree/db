@@ -17,12 +17,19 @@ pub fn parse_expr(s: &mut TokenStream) -> Result<Expr, Diagnostic> {
 }
 
 fn parse_or(s: &mut TokenStream) -> Result<Expr, Diagnostic> {
+    // Depth-guard the expression re-entry point: every nested expression
+    // (parens, list/map elements, function args, CASE arms, comprehensions)
+    // routes back through `parse_expr` → `parse_or`, so one guard here bounds
+    // all expression nesting. The self-recursive unary layers (`parse_not`,
+    // `parse_unary`) guard themselves since they bypass this entry.
+    s.enter_recursion()?;
     let mut left = parse_xor(s)?;
     while s.eat(&TokenKind::Or).is_some() {
         let right = parse_xor(s)?;
         let span = left.span().union(right.span());
         left = Expr::BinOp(BinOp::Or, Box::new(left), Box::new(right), span);
     }
+    s.leave_recursion();
     Ok(left)
 }
 
@@ -31,15 +38,11 @@ fn parse_xor(s: &mut TokenStream) -> Result<Expr, Diagnostic> {
     while s.eat(&TokenKind::Xor).is_some() {
         let right = parse_and(s)?;
         let span = left.span().union(right.span());
-        let either = Expr::BinOp(
-            BinOp::Or,
-            Box::new(left.clone()),
-            Box::new(right.clone()),
-            span,
-        );
-        let both = Expr::BinOp(BinOp::And, Box::new(left), Box::new(right), span);
-        let not_both = Expr::UnaryOp(UnaryOp::Not, Box::new(both), span);
-        left = Expr::BinOp(BinOp::And, Box::new(either), Box::new(not_both), span);
+        // Keep XOR a single node — desugaring to `(l OR r) AND NOT(l AND r)`
+        // here clones `left` twice per operator, exploding a chain of n XORs
+        // into an O(2ⁿ) AST. The engine evaluates `Function::Xor` directly with
+        // identical two-valued truthiness semantics.
+        left = Expr::BinOp(BinOp::Xor, Box::new(left), Box::new(right), span);
     }
     Ok(left)
 }
@@ -55,13 +58,19 @@ fn parse_and(s: &mut TokenStream) -> Result<Expr, Diagnostic> {
 }
 
 fn parse_not(s: &mut TokenStream) -> Result<Expr, Diagnostic> {
+    // Self-recursive: `NOT NOT NOT …` bypasses `parse_or`, so guard here too.
+    s.enter_recursion()?;
     let start = s.peek_span();
-    if s.eat(&TokenKind::Not).is_some() {
-        let e = parse_not(s)?;
-        let span = start.union(e.span());
-        return Ok(Expr::UnaryOp(UnaryOp::Not, Box::new(e), span));
-    }
-    parse_comparison(s)
+    let result = if s.eat(&TokenKind::Not).is_some() {
+        parse_not(s).map(|e| {
+            let span = start.union(e.span());
+            Expr::UnaryOp(UnaryOp::Not, Box::new(e), span)
+        })
+    } else {
+        parse_comparison(s)
+    };
+    s.leave_recursion();
+    result
 }
 
 fn parse_comparison(s: &mut TokenStream) -> Result<Expr, Diagnostic> {
@@ -170,13 +179,19 @@ fn parse_multiplicative(s: &mut TokenStream) -> Result<Expr, Diagnostic> {
 /// Unary `-` — binds looser than `^` but tighter than `* / %`, so
 /// `-2 ^ 2` = `-(2 ^ 2)` = `-4`, matching openCypher / Neo4j precedence.
 fn parse_unary(s: &mut TokenStream) -> Result<Expr, Diagnostic> {
+    // Self-recursive: `- - - …` bypasses `parse_or`, so guard here too.
+    s.enter_recursion()?;
     let start = s.peek_span();
-    if s.eat(&TokenKind::Minus).is_some() {
-        let e = parse_unary(s)?;
-        let span = start.union(e.span());
-        return Ok(Expr::UnaryOp(UnaryOp::Neg, Box::new(e), span));
-    }
-    parse_power(s)
+    let result = if s.eat(&TokenKind::Minus).is_some() {
+        parse_unary(s).map(|e| {
+            let span = start.union(e.span());
+            Expr::UnaryOp(UnaryOp::Neg, Box::new(e), span)
+        })
+    } else {
+        parse_power(s)
+    };
+    s.leave_recursion();
+    result
 }
 
 /// Exponentiation `^` — binds tighter than unary `-` and `* / %`, and is

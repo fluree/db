@@ -441,7 +441,7 @@ fn function_returns_bool(func: &Function, all_children_return_bool: bool) -> boo
         | Function::Regex
         | Function::LangMatches
         | Function::SameTerm => true,
-        Function::And | Function::Or | Function::Not => all_children_return_bool,
+        Function::And | Function::Or | Function::Not | Function::Xor => all_children_return_bool,
         _ => false,
     }
 }

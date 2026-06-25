@@ -679,6 +679,11 @@ impl<'a> CypherLowering<'a> {
                     fluree_db_cypher::ast::BinOp::Or => {
                         return Ok(UnresolvedExpression::Or(vec![l, r]));
                     }
+                    // XOR resolves to the engine's `Function::Xor` by name (see
+                    // the lowering name table) — a single call node, so a write
+                    // WHERE `a XOR b XOR c` stays linear instead of desugaring
+                    // into a duplicated And/Or/Not tree.
+                    fluree_db_cypher::ast::BinOp::Xor => "xor",
                 };
                 Ok(unresolved_call(func, vec![l, r]))
             }

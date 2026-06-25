@@ -42,6 +42,9 @@ pub enum DiagCode {
     InvalidNumber,
     InvalidIdentifier,
     UnexpectedEof,
+    /// Expression/statement nesting exceeded the parser's depth limit. Guards
+    /// against stack overflow (a process abort) from hostile deeply-nested input.
+    NestingTooDeep,
 
     // Deferred features
     UnsupportedFeature,
@@ -79,6 +82,7 @@ impl DiagCode {
             DiagCode::InvalidNumber => "C004",
             DiagCode::InvalidIdentifier => "C005",
             DiagCode::UnexpectedEof => "C006",
+            DiagCode::NestingTooDeep => "C007",
 
             DiagCode::UnsupportedFeature => "C100",
             DiagCode::DeferredVariableLengthPath => "C101",

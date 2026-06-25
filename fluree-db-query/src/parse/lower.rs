@@ -1580,6 +1580,7 @@ fn lower_function_name(name: &str) -> Function {
         "*" => Function::Mul,
         "/" => Function::Div,
         "%" | "mod" => Function::Mod,
+        "xor" => Function::Xor,
         "negate" => Function::Negate,
         // String functions
         "strlen" => Function::Strlen,

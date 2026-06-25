@@ -53,11 +53,13 @@ fn match_node_with_property_filter() {
 }
 
 #[test]
-fn xor_expression_lowers_as_boolean_filter() {
+fn xor_expression_lowers_to_xor_function() {
     let q = lower("MATCH (n:Person) WHERE n.age = 1 XOR n.age = 2 RETURN n");
     assert!(
-        q.patterns.iter().any(|p| matches!(p, Pattern::Filter(_))),
-        "XOR should desugar into the existing boolean filter IR"
+        q.patterns.iter().any(|p| {
+            matches!(p, Pattern::Filter(expr) if expr.contains_function(&Function::Xor))
+        }),
+        "XOR should lower to the single-node Function::Xor (not an O(2ⁿ) And/Or/Not desugar)"
     );
 }
 

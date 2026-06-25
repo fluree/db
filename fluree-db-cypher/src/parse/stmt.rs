@@ -14,6 +14,17 @@ use super::pattern::parse_pattern;
 use super::stream::TokenStream;
 
 pub fn parse_statement(s: &mut TokenStream) -> Result<Statement, Diagnostic> {
+    // Depth-guard statement nesting: UNION tails and `CALL { … }` subqueries
+    // both recurse back through this entry, so a bound here (shared with the
+    // expression guard via the same counter) caps total recursion — and hence
+    // AST depth, which bounds every downstream walker — against stack overflow.
+    s.enter_recursion()?;
+    let result = parse_statement_inner(s);
+    s.leave_recursion();
+    result
+}
+
+fn parse_statement_inner(s: &mut TokenStream) -> Result<Statement, Diagnostic> {
     let start = s.peek_span();
 
     // Categorize by first token. Queries start with MATCH / OPTIONAL /
@@ -205,6 +216,9 @@ fn parse_unwind(s: &mut TokenStream) -> Result<UnwindClause, Diagnostic> {
 /// scope clause names the imported variables, or `(*)` imports the whole outer
 /// scope. The body reuses the read-clause grammar and must terminate in RETURN.
 fn parse_call_subquery(s: &mut TokenStream) -> Result<CallSubqueryClause, Diagnostic> {
+    // Nested `CALL { … CALL { … } }` recurses through here (via `parse_call_body`),
+    // a cycle that bypasses `parse_statement` — so it needs its own depth guard.
+    s.enter_recursion()?;
     let start = s.expect(&TokenKind::Call)?;
 
     let (imports, import_all) = if matches!(s.peek_kind(), TokenKind::LParen) {
@@ -232,6 +246,7 @@ fn parse_call_subquery(s: &mut TokenStream) -> Result<CallSubqueryClause, Diagno
     s.expect(&TokenKind::LBrace)?;
     let query = parse_call_body(s)?;
     let end = s.expect(&TokenKind::RBrace)?;
+    s.leave_recursion();
     Ok(CallSubqueryClause {
         imports,
         import_all,

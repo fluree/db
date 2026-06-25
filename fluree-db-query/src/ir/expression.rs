@@ -754,6 +754,10 @@ pub enum Function {
     Or,
     /// Logical NOT
     Not,
+    /// Logical XOR (Cypher `XOR`). Two-valued: `bool(a) ^ bool(b)`, matching the
+    /// truthiness semantics of the `(a OR b) AND NOT(a AND b)` form it replaces.
+    /// Cypher-only; never produced by SPARQL/JSON-LD lowering.
+    Xor,
     /// IN expression (?x IN (1, 2, 3))
     In,
     /// NOT IN expression (?x NOT IN (1, 2, 3))

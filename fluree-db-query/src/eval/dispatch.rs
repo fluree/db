@@ -50,6 +50,7 @@ impl Function {
             Function::And => logical::eval_and(args, row, ctx),
             Function::Or => logical::eval_or(args, row, ctx),
             Function::Not => logical::eval_not(args, row, ctx),
+            Function::Xor => logical::eval_xor(args, row, ctx),
             Function::In => logical::eval_in(args, row, ctx),
             Function::NotIn => logical::eval_not_in(args, row, ctx),
 
