@@ -542,6 +542,11 @@ impl PropertyPathOperator {
 
         let mut out: Vec<(Sid, Sid)> = Vec::new();
         for start in &nodes {
+            // Poll cancellation per start node: a both-vars-unbound closure over a
+            // dense graph runs `nodes × edges × depth` work, and the bounded
+            // branch below would otherwise be uninterruptible (only the unbounded
+            // branch polls per dequeue).
+            crate::fast_path_common::bail_if_cancelled(&ctx.cancellation)?;
             // Bounded path: layered (node, depth) BFS over the adjacency map, so
             // a node first reached below `min_hops` can still be reached on a
             // longer in-range path (matches `traverse_bounded`).
@@ -556,6 +561,7 @@ impl PropertyPathOperator {
                 }
                 let mut depth = 0u32;
                 while depth < max && !frontier.is_empty() {
+                    crate::fast_path_common::bail_if_cancelled(&ctx.cancellation)?;
                     if seen_at_depth.len() >= self.max_visited {
                         return Err(QueryError::ResourceLimit(format!(
                             "Property path exceeded max visited nodes ({})",
