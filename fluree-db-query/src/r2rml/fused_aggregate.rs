@@ -68,18 +68,20 @@ fn numeric_kind(datatype: Option<&str>) -> Option<NumKind> {
 }
 
 /// A detected fused-aggregate plan: the enclosing graph IRI, the inner triple
-/// patterns (rewritten to R2RML at `open`), and the per-output aggregate
-/// functions in projected-output order.
+/// patterns (rewritten to R2RML at `open`), the GROUP BY variables, and the
+/// per-output aggregate functions.
 pub struct FusedAggregatePlan {
     graph_iri: Arc<str>,
     inner_patterns: Vec<Pattern>,
+    group_by: Vec<VarId>,
     aggregates: Vec<(VarId, AggregateFn)>,
 }
 
-/// Detect the slice-1 fused shape: a single `GRAPH { triples }` block feeding an
-/// implicit (no GROUP BY) aggregation of only `COUNT(?col)` / `COUNT(*)`, with no
-/// HAVING, post-binds, ordering, or slicing. Whether the graph is actually R2RML
-/// (and whether the triples collapse to one scan) is checked at `open`.
+/// Detect the fused shape: a single `GRAPH { triples }` block feeding an
+/// aggregation (implicit, or GROUP BY) of only `COUNT` / `SUM` / `AVG`, with no
+/// HAVING, post-binds, FILTER, ordering, or slicing. Whether the graph is
+/// actually R2RML (and whether the triples collapse to one scan, and the vars
+/// map to columns) is checked at `open`.
 pub fn detect_fused_r2rml_aggregate(query: &Query) -> Option<FusedAggregatePlan> {
     // Kill switch (A/B and incident response): force the normal pipeline.
     if matches!(
@@ -96,9 +98,17 @@ pub fn detect_fused_r2rml_aggregate(query: &Query) -> Option<FusedAggregatePlan>
         return None;
     }
 
-    // Implicit aggregation only (no GROUP BY), no HAVING, no post-aggregate binds.
-    let Some(Grouping::Implicit { aggregation, having }) = query.grouping.as_ref() else {
-        return None;
+    // Implicit aggregation, or GROUP BY with aggregates. No HAVING, no
+    // post-aggregate binds.
+    let (group_by, aggregation, having): (Vec<VarId>, _, _) = match query.grouping.as_ref()? {
+        Grouping::Implicit { aggregation, having } => (Vec::new(), aggregation, having),
+        Grouping::Explicit {
+            group_by,
+            aggregation: Some(aggregation),
+            having,
+        } => (group_by.iter().copied().collect(), aggregation, having),
+        // GROUP BY with no aggregates (DISTINCT-style) is not a fold here.
+        Grouping::Explicit { .. } => return None,
     };
     if having.is_some() || !aggregation.binds.is_empty() {
         return None;
@@ -132,10 +142,12 @@ pub fn detect_fused_r2rml_aggregate(query: &Query) -> Option<FusedAggregatePlan>
         aggregates.push((spec.output_var, spec.function.clone()));
     }
 
-    // The projection must be exactly the aggregate outputs, so the fused output
-    // row is the final result.
+    // The projection must be exactly the GROUP BY keys + aggregate outputs, so
+    // the fused output rows are the final result.
     if let Some(projected) = query.output.projected_vars() {
-        let outs: std::collections::HashSet<VarId> = aggregates.iter().map(|(v, _)| *v).collect();
+        let mut outs: std::collections::HashSet<VarId> =
+            aggregates.iter().map(|(v, _)| *v).collect();
+        outs.extend(group_by.iter().copied());
         if projected.len() != outs.len() || projected.iter().any(|v| !outs.contains(v)) {
             return None;
         }
@@ -144,6 +156,7 @@ pub fn detect_fused_r2rml_aggregate(query: &Query) -> Option<FusedAggregatePlan>
     Some(FusedAggregatePlan {
         graph_iri,
         inner_patterns: inner,
+        group_by,
         aggregates,
     })
 }
@@ -224,6 +237,34 @@ impl Acc {
             (Acc::Double { sum, count, .. }, Fold::Numeric { column, .. }) => {
                 if let Some(c) = batch.column_by_name(column) {
                     accumulate_double(c, sum, count);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Fold a single row's value into this accumulator (grouped path). `col` is
+    /// the fold's pre-resolved column for this batch (`None` for `COUNT(*)`).
+    fn update_row(&mut self, fold: &Fold, col: Option<&Column>, row: usize) {
+        match (self, fold) {
+            (Acc::Count(n), Fold::CountRows) => *n += 1,
+            (Acc::Count(n), Fold::CountColumn(_)) if col.is_some_and(|c| !c.is_null(row)) => {
+                *n += 1;
+            }
+            (Acc::Count(_), Fold::CountColumn(_)) => {}
+            (
+                Acc::Exact {
+                    sum, scale, count, ..
+                },
+                Fold::Numeric { .. },
+            ) => {
+                if let Some(c) = col {
+                    accumulate_exact_row(c, row, sum, scale, count);
+                }
+            }
+            (Acc::Double { sum, count, .. }, Fold::Numeric { .. }) => {
+                if let Some(c) = col {
+                    accumulate_double_row(c, row, sum, count);
                 }
             }
             _ => {}
@@ -312,21 +353,138 @@ fn accumulate_double(col: &Column, sum: &mut f64, count: &mut u64) {
     }
 }
 
+/// Add one row's exact (decimal/integer) value to the accumulator.
+fn accumulate_exact_row(col: &Column, row: usize, sum: &mut i128, scale: &mut i64, count: &mut u64) {
+    match col {
+        Column::Decimal { values, scale: s, .. } => {
+            *scale = *s as i64;
+            if let Some(Some(v)) = values.get(row) {
+                *sum += *v;
+                *count += 1;
+            }
+        }
+        Column::Int64(values) => {
+            if let Some(Some(v)) = values.get(row) {
+                *sum += *v as i128;
+                *count += 1;
+            }
+        }
+        Column::Int32(values) | Column::Date(values) => {
+            if let Some(Some(v)) = values.get(row) {
+                *sum += *v as i128;
+                *count += 1;
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Add one row's floating value to the accumulator.
+fn accumulate_double_row(col: &Column, row: usize, sum: &mut f64, count: &mut u64) {
+    match col {
+        Column::Float64(values) => {
+            if let Some(Some(v)) = values.get(row) {
+                *sum += *v;
+                *count += 1;
+            }
+        }
+        Column::Float32(values) => {
+            if let Some(Some(v)) = values.get(row) {
+                *sum += *v as f64;
+                *count += 1;
+            }
+        }
+        _ => {}
+    }
+}
+
+/// A GROUP BY key column: which table column, how to read it, and the encoded
+/// datatype Sid for the output key binding.
+struct GroupCol {
+    column: String,
+    kind: GKind,
+    dt_sid: Sid,
+}
+
+/// Supported GROUP BY key column kinds (slice 3).
+#[derive(Clone, Copy)]
+enum GKind {
+    String,
+    Integer,
+}
+
+/// Classify a declared datatype into a group-key kind, or `None` (fall back).
+fn group_kind(datatype: Option<&str>) -> Option<GKind> {
+    use fluree_vocab::xsd;
+    let dt = datatype?;
+    if dt == xsd::STRING {
+        Some(GKind::String)
+    } else if dt == xsd::INTEGER || dt == xsd::LONG || dt == xsd::INT {
+        Some(GKind::Integer)
+    } else {
+        None
+    }
+}
+
+/// One component of a composite group key (hashable / comparable).
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum GKey {
+    Str(String),
+    Int(i128),
+    Null,
+}
+
+impl GroupCol {
+    /// Read this column's group-key value at a row.
+    fn key_at(&self, col: Option<&Column>, row: usize) -> GKey {
+        let Some(c) = col else { return GKey::Null };
+        match self.kind {
+            GKind::String => match c {
+                Column::String(v) => v
+                    .get(row)
+                    .cloned()
+                    .flatten()
+                    .map_or(GKey::Null, GKey::Str),
+                _ => GKey::Null,
+            },
+            GKind::Integer => match c {
+                Column::Int64(v) => v.get(row).and_then(|o| *o).map_or(GKey::Null, |i| GKey::Int(i as i128)),
+                Column::Int32(v) => v.get(row).and_then(|o| *o).map_or(GKey::Null, |i| GKey::Int(i as i128)),
+                _ => GKey::Null,
+            },
+        }
+    }
+
+    /// Materialize the output binding for a group key component.
+    fn binding(&self, key: &GKey) -> Binding {
+        match key {
+            GKey::Str(s) => Binding::lit(FlakeValue::String(s.clone()), self.dt_sid.clone()),
+            GKey::Int(i) => Binding::lit(FlakeValue::Long(*i as i64), self.dt_sid.clone()),
+            GKey::Null => Binding::Unbound,
+        }
+    }
+}
+
 /// Resolved fused plan (post-`open`): the rewritten scan pattern, the table to
-/// scan, the columns to project, and the per-output fold.
+/// scan, the columns to project, the GROUP BY key columns, and the per-output
+/// fold.
 struct Resolved {
     pattern: R2rmlPattern,
     table_name: String,
     projection: Vec<String>,
+    group_cols: Vec<GroupCol>,
     folds: Vec<Fold>,
 }
 
-/// Fused R2RML aggregate operator. Folds COUNT aggregates straight from column
-/// batches; falls back to the normal pipeline when its soundness gates fail.
+/// Fused R2RML aggregate operator. Folds COUNT/SUM/AVG aggregates straight from
+/// column batches; falls back to the normal pipeline when its soundness gates
+/// fail.
 pub struct FusedR2rmlAggregateOperator {
     graph_iri: Arc<str>,
     inner_patterns: Vec<Pattern>,
+    group_by: Vec<VarId>,
     aggregates: Vec<(VarId, AggregateFn)>,
+    /// Output schema: GROUP BY key vars followed by aggregate output vars.
     schema: Arc<[VarId]>,
     fallback: BoxedOperator,
     resolved: Option<Resolved>,
@@ -339,10 +497,18 @@ impl FusedR2rmlAggregateOperator {
     /// Build the operator from a detected plan and the normal-pipeline fallback
     /// (built with fast paths disabled).
     pub fn new(plan: FusedAggregatePlan, fallback: BoxedOperator) -> Self {
-        let schema: Arc<[VarId]> = plan.aggregates.iter().map(|(v, _)| *v).collect();
+        // Output schema: GROUP BY keys first, then aggregate outputs. Downstream
+        // result formatting resolves columns by variable, so this order is safe.
+        let schema: Arc<[VarId]> = plan
+            .group_by
+            .iter()
+            .copied()
+            .chain(plan.aggregates.iter().map(|(v, _)| *v))
+            .collect();
         Self {
             graph_iri: plan.graph_iri,
             inner_patterns: plan.inner_patterns,
+            group_by: plan.group_by,
             aggregates: plan.aggregates,
             schema,
             fallback,
@@ -487,7 +653,6 @@ impl Operator for FusedR2rmlAggregateOperator {
             Some(ctx.to_t)
         };
 
-        let mut accs: Vec<Acc> = resolved.folds.iter().map(Acc::for_fold).collect();
         let mut stream = table_provider
             .scan_table(
                 &resolved.pattern.graph_source_id,
@@ -497,17 +662,69 @@ impl Operator for FusedR2rmlAggregateOperator {
                 as_of_t,
             )
             .await?;
-        while let Some(batch) = stream.next().await {
-            let batch = batch?;
-            for (acc, fold) in accs.iter_mut().zip(resolved.folds.iter()) {
-                acc.update(fold, &batch);
-            }
-            ctx.tracker.consume_fuel(1)?;
-        }
 
-        // Materialize the single result row (the only bindings this op creates).
-        let columns: Vec<Vec<Binding>> =
-            accs.into_iter().map(|acc| vec![acc.finalize()]).collect();
+        let columns = if resolved.group_cols.is_empty() {
+            // Implicit aggregation: one group, vectorized per-batch fold.
+            let mut accs: Vec<Acc> = resolved.folds.iter().map(Acc::for_fold).collect();
+            while let Some(batch) = stream.next().await {
+                let batch = batch?;
+                for (acc, fold) in accs.iter_mut().zip(resolved.folds.iter()) {
+                    acc.update(fold, &batch);
+                }
+                ctx.tracker.consume_fuel(1)?;
+            }
+            // One result row: each accumulator's final binding, in schema order.
+            accs.into_iter().map(|acc| vec![acc.finalize()]).collect()
+        } else {
+            // GROUP BY: per-row grouping into per-key accumulators.
+            let folds = &resolved.folds;
+            let gcols = &resolved.group_cols;
+            let mut groups: std::collections::HashMap<Vec<GKey>, Vec<Acc>> =
+                std::collections::HashMap::new();
+            while let Some(batch) = stream.next().await {
+                let batch = batch?;
+                // Resolve each fold's / group column's column once per batch.
+                let fold_cols: Vec<Option<&Column>> = folds
+                    .iter()
+                    .map(|f| match f {
+                        Fold::CountRows => None,
+                        Fold::CountColumn(c) | Fold::Numeric { column: c, .. } => {
+                            batch.column_by_name(c)
+                        }
+                    })
+                    .collect();
+                let key_cols: Vec<Option<&Column>> =
+                    gcols.iter().map(|g| batch.column_by_name(&g.column)).collect();
+                for row in 0..batch.num_rows {
+                    let key: Vec<GKey> = gcols
+                        .iter()
+                        .zip(&key_cols)
+                        .map(|(g, c)| g.key_at(*c, row))
+                        .collect();
+                    let accs = groups
+                        .entry(key)
+                        .or_insert_with(|| folds.iter().map(Acc::for_fold).collect());
+                    for (i, fold) in folds.iter().enumerate() {
+                        accs[i].update_row(fold, fold_cols[i], row);
+                    }
+                }
+                ctx.tracker.consume_fuel(1)?;
+            }
+
+            // One output row per group: key bindings then aggregate bindings.
+            let num_cols = gcols.len() + folds.len();
+            let mut out: Vec<Vec<Binding>> = (0..num_cols).map(|_| Vec::new()).collect();
+            for (key, accs) in groups {
+                for (i, g) in gcols.iter().enumerate() {
+                    out[i].push(g.binding(&key[i]));
+                }
+                for (j, acc) in accs.into_iter().enumerate() {
+                    out[gcols.len() + j].push(acc.finalize());
+                }
+            }
+            out
+        };
+
         self.done = true;
         self.state = OperatorState::Exhausted;
         Ok(Some(Batch::new(Arc::clone(&self.schema), columns)?))
@@ -554,8 +771,34 @@ impl FusedR2rmlAggregateOperator {
             return Ok(None);
         };
 
-        let mut folds = Vec::with_capacity(self.aggregates.len());
         let mut projection: Vec<String> = Vec::new();
+
+        // Resolve GROUP BY key columns (string / integer in slice 3). The output
+        // key binding's datatype Sid is encoded from the snapshot so it matches
+        // what the normal materialization path produces.
+        let mut group_cols = Vec::with_capacity(self.group_by.len());
+        for gv in &self.group_by {
+            let Some((col, datatype)) = Self::scalar_column_for_var(&pattern, tm, *gv) else {
+                return Ok(None);
+            };
+            let Some(kind) = group_kind(datatype.as_deref()) else {
+                return Ok(None);
+            };
+            let Some(dt_iri) = datatype.as_deref() else {
+                return Ok(None);
+            };
+            let Some(dt_sid) = ctx.active_snapshot.encode_iri(dt_iri) else {
+                return Ok(None);
+            };
+            projection.push(col.clone());
+            group_cols.push(GroupCol {
+                column: col,
+                kind,
+                dt_sid,
+            });
+        }
+
+        let mut folds = Vec::with_capacity(self.aggregates.len());
         for (_, func) in &self.aggregates {
             match func {
                 AggregateFn::CountAll => folds.push(Fold::CountRows),
@@ -591,6 +834,7 @@ impl FusedR2rmlAggregateOperator {
             pattern,
             table_name,
             projection,
+            group_cols,
             folds,
         }))
     }
@@ -671,6 +915,31 @@ mod tests {
         let mut q = count_query(vec![], vec![graph_triple(s, o)], c, o);
         q.limit = Some(1);
         assert!(detect_fused_r2rml_aggregate(&q).is_none());
+    }
+
+    #[test]
+    fn detects_group_by_shape() {
+        // GROUP BY ?g over a graph block with a COUNT aggregate.
+        let (s, o, g, c) = (VarId(0), VarId(1), VarId(2), VarId(3));
+        let agg = AggregateSpec {
+            function: AggregateFn::Count(o),
+            output_var: c,
+        };
+        let q = Query {
+            context: ParsedContext::default(),
+            orig_context: None,
+            output: QueryOutput::select_all(vec![g, c]),
+            patterns: vec![graph_triple(s, o)],
+            reasoning: ReasoningConfig::default(),
+            grouping: Grouping::assemble(vec![g], vec![agg], vec![], None),
+            ordering: Vec::new(),
+            order_binds: Vec::new(),
+            limit: None,
+            offset: None,
+            post_values: None,
+            include_system_facts: false,
+        };
+        assert!(detect_fused_r2rml_aggregate(&q).is_some());
     }
 
     #[test]
