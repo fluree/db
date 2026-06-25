@@ -38,6 +38,14 @@ fluree iceberg map execution-log \
   --mode direct \
   --table-location s3://bucket/warehouse/logs/execution_log \
   --r2rml mappings/execution_log.ttl
+
+# Google Cloud Storage — see "Google Cloud Storage (GCS)" below
+fluree iceberg map orders \
+  --mode direct \
+  --table-location s3://my-bucket/warehouse/sales/orders \
+  --r2rml mappings/orders.ttl \
+  --s3-endpoint https://storage.googleapis.com \
+  --s3-region europe-west1 --s3-path-style
 ```
 
 Once mapped, graph sources appear in `fluree list`, can be inspected with `fluree info`, and removed with `fluree drop`. See [CLI iceberg reference](../cli/iceberg.md) for all options.
@@ -173,7 +181,7 @@ Note the nesting: the graph source is “Iceberg” (this page), and `catalog.ty
 
 - `catalog.table_location` must be an S3 URI (`s3://` or `s3a://`) pointing to the table root directory.
 - The table must contain a `metadata/` subdirectory with:
-  - `version-hint.text` (containing the current metadata filename, e.g., `00001-abc-def.metadata.json`)
+  - `version-hint.text` — the current metadata filename (e.g., `00001-abc-def.metadata.json`), a full `s3://`/`gs://` path, or a bare integer version `N` (resolving to `vN.metadata.json`)
   - The referenced `.metadata.json` file
 - Direct mode uses ambient AWS credentials (IAM roles, env vars, `~/.aws/credentials`). It does **not** support vended credentials.
 
@@ -182,7 +190,7 @@ Note the nesting: the graph source is “Iceberg” (this page), and `catalog.ty
 - Fluree does **not** require you to provide a path to `version-hint.text` in the config. You provide the **table root** (`table_location`), and Fluree reads:
   - `"{table_location}/metadata/version-hint.text"` to get the current metadata filename
   - `"{table_location}/metadata/{filename}"` as the table’s current metadata
-- `version-hint.text` may contain a bare filename (e.g., `00001-abc.metadata.json`) or a full absolute path (`s3://...`).
+- `version-hint.text` may contain a bare filename (e.g., `00001-abc.metadata.json`), a full absolute path (`s3://...` / `gs://...`), or a bare integer version `N` — the Iceberg Hadoop file-based catalog convention — which resolves to `vN.metadata.json`.
 - If `version-hint.text` is missing or empty, Direct mode fails with an error mentioning `version-hint.text`.
 
 **Iceberg table setup must already exist:**
@@ -197,6 +205,37 @@ Direct mode assumes `table_location` points at a **valid Iceberg table layout** 
 | `iceberg-rust` / Spark appending to known S3 path | Direct |
 | Need catalog-managed credentials (vended) | REST |
 | Minimizing infrastructure (no catalog server) | Direct |
+
+### Google Cloud Storage (GCS)
+
+Fluree can read Iceberg tables stored in Google Cloud Storage. Set `s3_endpoint` to the GCS S3-interoperability endpoint and Fluree automatically uses a **native GCS reader** for object reads:
+
+```json
+{
+  "name": "orders",
+  "mode": "direct",
+  "table_location": "s3://my-bucket/warehouse/sales/orders",
+  "r2rml": "...",
+  "r2rml_type": "text/turtle",
+  "s3_endpoint": "https://storage.googleapis.com",
+  "s3_region": "europe-west1",
+  "s3_path_style": true
+}
+```
+
+**Why a native reader:** reading byte-range requests from GCS through the AWS S3 SDK over HTTP/2 fails (the SDK rejects the partial-content response body). The Parquet reader is range-based, so data reads would otherwise fail even though metadata reads succeed. When the endpoint is `storage.googleapis.com`, Fluree reads objects with a native HTTP client pinned to HTTP/1.1, which handles GCS range responses correctly. (Range/partial reads are an HTTP/1.1 feature, so only the Parquet footer and the column chunks a query needs are fetched — never the whole object.) Non-GCS endpoints use the AWS S3 SDK exactly as before.
+
+**Authentication.** The native GCS reader signs each request with **AWS SigV4** using GCS **HMAC interoperability keys** — the same credentials the S3-interop path already uses, resolved from the standard AWS credential chain. Set them as you would for any S3 access:
+
+```bash
+export AWS_ACCESS_KEY_ID=<gcs-hmac-access-key>
+export AWS_SECRET_ACCESS_KEY=<gcs-hmac-secret>
+# s3_region in the config is the SigV4 signing region (the bucket location).
+```
+
+HMAC keys do not expire, so no token-refresh handling is needed. In `rest` mode, if the catalog vends credentials for a GCS-backed table those are used instead.
+
+GCS-backed Iceberg tables are typically read via `direct` mode — point `table_location` at the table root. The reader handles GCS-native conventions automatically: `gs://` paths in metadata/manifests, a Hadoop-style integer `version-hint.text` (resolved to `vN.metadata.json`), and Snappy-compressed Parquet. As with any direct-mode table, the Iceberg layout (the `metadata/` directory and a current `version-hint.text`) must already exist in the bucket.
 
 ## RDF Mapping (R2RML)
 
@@ -425,6 +464,8 @@ export AWS_REGION=us-east-1
 ```
 
 REST catalog mode also supports vended credentials (credentials issued by the catalog). Direct mode uses only ambient AWS credentials (env vars, IAM roles, `~/.aws/credentials`).
+
+**Google Cloud Storage:** when the endpoint is `storage.googleapis.com`, reads use the native GCS reader, which signs requests with AWS SigV4 using GCS HMAC interop keys — the same `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` shown above (set them to your HMAC keys). See [Google Cloud Storage (GCS)](#google-cloud-storage-gcs).
 
 ## Use Cases
 
