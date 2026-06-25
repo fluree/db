@@ -1204,10 +1204,24 @@ pub fn spawn_local_cache_event_listener(
 
         loop {
             match subscription.receiver.recv().await {
-                Ok(fluree_db_nameservice::NameServiceEvent::LedgerIndexPublished {
-                    ledger_id,
-                    ..
-                }) => {
+                // A new commit OR a new index head both move the ledger
+                // forward relative to a cached follower view. Reconcile
+                // on either: without the commit arm, a follower's cache
+                // only advances when an index publish happens to follow,
+                // leaving committed-but-unindexed writes invisible to
+                // reads served by that node (the exact failure exercised
+                // by raft failover — a write lands, replicates, applies
+                // on every node, yet only the staging node's cache shows
+                // it).
+                Ok(
+                    fluree_db_nameservice::NameServiceEvent::LedgerIndexPublished {
+                        ledger_id, ..
+                    }
+                    | fluree_db_nameservice::NameServiceEvent::LedgerCommitPublished {
+                        ledger_id,
+                        ..
+                    },
+                ) => {
                     match ledger_manager
                         .notify(NsNotify {
                             ledger_id: ledger_id.clone(),

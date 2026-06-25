@@ -289,10 +289,38 @@ impl RaftBootstrapConfig {
         Self {
             node_id,
             storage_path: storage_path.into(),
-            raft_config: RaftConfig::default(),
+            raft_config: default_raft_config(),
             network_config: NetworkConfig::default(),
             event_bus_capacity: 1024,
         }
+    }
+}
+
+/// Election timeouts tuned to compose with [`NetworkConfig`]'s RPC
+/// timeouts, rather than openraft's stock 150–300 ms.
+///
+/// openraft's defaults assume sub-millisecond, always-reachable peers.
+/// Ours don't hold: `rpc_timeout` is 500 ms and a *dead but not yet
+/// evicted* voter costs `connect_timeout` (250 ms) on every vote round.
+/// With the stock 150–300 ms election window, a candidate re-elects —
+/// bumping its term — before its own vote RPCs from the previous round
+/// resolve, so every vote lands on a now-stale term and no quorum ever
+/// forms. On a leader failover the survivors then livelock: all climb
+/// to the same term with no leader and never converge.
+///
+/// Raising `election_timeout_min` safely above `rpc_timeout` (and
+/// keeping a wide min→max spread so timers desynchronize) lets a
+/// candidate collect votes from the live quorum — which answer in
+/// well under a millisecond on a LAN — before it gives up on the term.
+/// Cost is a slightly slower failover (~0.75–1.5 s vs the unreachable
+/// sub-second the stock window only nominally delivered); correctness
+/// of failover is worth it. Operators on faster or slower links can
+/// still override `raft_config` wholesale.
+fn default_raft_config() -> RaftConfig {
+    RaftConfig {
+        election_timeout_min: 750,
+        election_timeout_max: 1500,
+        ..RaftConfig::default()
     }
 }
 
