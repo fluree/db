@@ -488,6 +488,37 @@ async fn property_path_unsupported_operator_error() {
 }
 
 #[tokio::test]
+async fn property_path_parenthesized_inverse_transitive() {
+    // `(^ex:knows)+` (string) and `["+", ["^", "ex:knows"]]` (array) both mean
+    // `^ex:knows+`. Over the seed chain a→b→{c,d}→e, from e walk knows backwards:
+    // {d, b, a}.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger1 = seed_knows_chain(&fluree, "property/path-paren-inv:main").await;
+    let expected = json!([["ex:d"], ["ex:b"], ["ex:a"]]);
+
+    for path in [json!("(^ex:knows)+"), json!(["+", ["^", "ex:knows"]])] {
+        let q = json!({
+            "@context": {
+                "ex": "http://example.org/",
+                "rev": {"@path": path}
+            },
+            "where": [{"@id":"ex:e","rev":"?who"}],
+            "select": ["?who"]
+        });
+        let rows = support::query_jsonld(&fluree, &ledger1, &q)
+            .await
+            .unwrap()
+            .to_jsonld(&ledger1.snapshot)
+            .unwrap();
+        assert_eq!(
+            normalize_rows(&rows),
+            normalize_rows(&expected),
+            "(^knows)+ from e = {{d, b, a}} for path {path}: {rows}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn property_path_zero_or_one_inside_sequence() {
     // JSON-LD parity for SPARQL `ex:p?/ex:q`. From a: zero p → a q x; one p → b q y.
     let fluree = FlureeBuilder::memory().build_memory();

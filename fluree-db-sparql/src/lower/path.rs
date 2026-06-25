@@ -91,18 +91,34 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                     (false, _) => PathModifier::ZeroOrOne,
                 };
 
+                // `(^X)+ ≡ ^(X+)`: an inverse wrapper around the repeated unit is
+                // equivalent to swapping endpoints and traversing X forward. Peel
+                // each inverse layer, toggling the swap, so `(^p)+`, `(^(a|b))+`,
+                // and `(^(a/b))+` all reduce to a forward path with swapped ends.
+                let mut swapped = false;
+                let mut core = innermost;
+                while let SparqlPropertyPath::Inverse { path: inner, .. } = core {
+                    swapped = !swapped;
+                    core = Self::unwrap_group(inner);
+                }
+                let (pp_subject, pp_object) = if swapped { (o, s) } else { (s, o) };
+
                 // Composite (sequence) inner — `(p1/p2/…)+` — becomes a
                 // composite-transitive path whose every hop follows the whole
-                // forward sub-path. A single-step or alternation inner takes the
-                // simpler alternation-transitive form below.
-                if matches!(innermost, SparqlPropertyPath::Sequence { .. }) {
-                    let steps = self.extract_composite_steps(innermost, span)?;
-                    let pp =
-                        PropertyPathPattern::new_composite(s.clone(), steps, modifier, o.clone());
+                // sub-path. A single-step or alternation inner takes the simpler
+                // alternation-transitive form below.
+                if matches!(core, SparqlPropertyPath::Sequence { .. }) {
+                    let steps = self.extract_composite_steps(core, span)?;
+                    let pp = PropertyPathPattern::new_composite(
+                        pp_subject.clone(),
+                        steps,
+                        modifier,
+                        pp_object.clone(),
+                    );
                     return Ok(vec![Pattern::PropertyPath(pp)]);
                 }
 
-                let iris = self.extract_transitive_predicate_iris(innermost, span)?;
+                let iris = self.extract_transitive_predicate_iris(core, span)?;
                 let mut predicate_sids = Vec::with_capacity(iris.len());
                 for iri in &iris {
                     predicate_sids.push(
@@ -112,10 +128,10 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                     );
                 }
                 let pp = PropertyPathPattern::new_alternatives(
-                    s.clone(),
+                    pp_subject.clone(),
                     predicate_sids,
                     modifier,
-                    o.clone(),
+                    pp_object.clone(),
                 );
                 Ok(vec![Pattern::PropertyPath(pp)])
             }

@@ -5306,6 +5306,151 @@ async fn sparql_composite_transitive_inverse_step() {
 }
 
 #[tokio::test]
+async fn sparql_parenthesized_inverse_transitive() {
+    // `(^ex:p)+` is the parenthesized form of `^ex:p+` — `(^X)+ ≡ ^(X+)`. Over a
+    // p-chain x -p-> y -p-> z, from z it walks p backwards: `+` → {y, x},
+    // `*` → {z, y, x}, `?` → {z, y}.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/sparql:paren-inv");
+    let insert = json!({
+        "@context": {"ex": "http://example.org/"},
+        "@graph": [
+            {"@id": "ex:x", "ex:p": {"@id": "ex:y"}},
+            {"@id": "ex:y", "ex:p": {"@id": "ex:z"}}
+        ]
+    });
+    let ledger = fluree.insert(ledger0, &insert).await.unwrap().ledger;
+
+    for (op, expect) in [
+        ("+", json!([["ex:y"], ["ex:x"]])),
+        ("*", json!([["ex:z"], ["ex:y"], ["ex:x"]])),
+        ("?", json!([["ex:z"], ["ex:y"]])),
+    ] {
+        let q = format!(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?o WHERE {{ ex:z (^ex:p){op} ?o }}"
+        );
+        let r = support::query_sparql(&fluree, &ledger, &q)
+            .await
+            .unwrap_or_else(|e| panic!("(^p){op} failed: {e}"));
+        let j = r.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+        assert_eq!(
+            normalize_rows(&j),
+            normalize_rows(&expect),
+            "(^p){op} from z: {j}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn sparql_composite_inverse_step_both_unbound() {
+    // Both-unbound `?s (^ex:p/ex:q)+ ?o` — exercises the inverse-leading seed
+    // (start candidates come from the OBJECT side of the first step). hub0/hub1
+    // make `^p/q` the co-parent relation x0~x1~x2, so the transitive closure is
+    // {(x0,x1), (x0,x2), (x1,x2)}.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/sparql:composite-inv-unbound");
+    let insert = json!({
+        "@context": {"ex": "http://example.org/"},
+        "@graph": [
+            {"@id": "ex:hub0", "ex:p": {"@id": "ex:x0"}, "ex:q": {"@id": "ex:x1"}},
+            {"@id": "ex:hub1", "ex:p": {"@id": "ex:x1"}, "ex:q": {"@id": "ex:x2"}}
+        ]
+    });
+    let ledger = fluree.insert(ledger0, &insert).await.unwrap().ledger;
+
+    let q = r"PREFIX ex: <http://example.org/>
+        SELECT ?s ?o WHERE { ?s (^ex:p/ex:q)+ ?o }";
+    let r = support::query_sparql(&fluree, &ledger, q)
+        .await
+        .expect("composite inverse both-unbound");
+    let j = r.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    assert_eq!(
+        normalize_rows(&j),
+        normalize_rows(&json!([
+            ["ex:x0", "ex:x1"],
+            ["ex:x0", "ex:x2"],
+            ["ex:x1", "ex:x2"]
+        ])),
+        "(^p/q)+ closure seeds from object side of first step: {j}"
+    );
+}
+
+#[tokio::test]
+async fn sparql_composite_inverse_second_step() {
+    // Inverse step in a NON-leading position: `(ex:p/^ex:q)+`. The unit `p/^q`
+    // links x and y that share a target via different predicates: x p m, y q m.
+    // x0 p m0, x1 q m0 → x0 (p/^q) x1; x1 p m1, x2 q m1 → x1 (p/^q) x2.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/sparql:composite-inv2");
+    let insert = json!({
+        "@context": {"ex": "http://example.org/"},
+        "@graph": [
+            {"@id": "ex:x0", "ex:p": {"@id": "ex:m0"}},
+            {"@id": "ex:x1", "ex:q": {"@id": "ex:m0"}, "ex:p": {"@id": "ex:m1"}},
+            {"@id": "ex:x2", "ex:q": {"@id": "ex:m1"}}
+        ]
+    });
+    let ledger = fluree.insert(ledger0, &insert).await.unwrap().ledger;
+
+    // Forward from x0 → {x1, x2}.
+    let fwd = r"PREFIX ex: <http://example.org/>
+        SELECT ?o WHERE { ex:x0 (ex:p/^ex:q)+ ?o }";
+    let r = support::query_sparql(&fluree, &ledger, fwd)
+        .await
+        .expect("composite inverse 2nd step forward");
+    let j = r.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    assert_eq!(
+        normalize_rows(&j),
+        normalize_rows(&json!([["ex:x1"], ["ex:x2"]])),
+        "(p/^q)+ from x0 = {{x1, x2}}: {j}"
+    );
+
+    // Backward into x2 → {x0, x1} — exercises the per-step `!inverse` retreat.
+    let bwd = r"PREFIX ex: <http://example.org/>
+        SELECT ?s WHERE { ?s (ex:p/^ex:q)+ ex:x2 }";
+    let rb = support::query_sparql(&fluree, &ledger, bwd)
+        .await
+        .expect("composite inverse 2nd step backward");
+    let jb = rb.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    assert_eq!(
+        normalize_rows(&jb),
+        normalize_rows(&json!([["ex:x0"], ["ex:x1"]])),
+        "?s (p/^q)+ x2 = {{x0, x1}}: {jb}"
+    );
+}
+
+#[tokio::test]
+async fn sparql_composite_inverse_alternation_step() {
+    // An inverse ALTERNATION step inside a composite: `(^(ex:p|ex:q)/ex:r)+`.
+    // hub reaches a via p and b via q; both a and b have an r-edge to the next
+    // hub. One hop: a (^(p|q)/r) ? — from a, `^(p|q)` finds hub (hub p a), then
+    // `r` from hub → c.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/sparql:composite-inv-alt");
+    let insert = json!({
+        "@context": {"ex": "http://example.org/"},
+        "@graph": [
+            {"@id": "ex:hub", "ex:p": {"@id": "ex:a"}, "ex:r": {"@id": "ex:c"}}
+        ]
+    });
+    let ledger = fluree.insert(ledger0, &insert).await.unwrap().ledger;
+
+    // a `^(p|q)` hub (hub p a), then `r` → c. So a (^(p|q)/r)+ ?o = {c}.
+    let q = r"PREFIX ex: <http://example.org/>
+        SELECT ?o WHERE { ex:a (^(ex:p|ex:q)/ex:r)+ ?o }";
+    let r = support::query_sparql(&fluree, &ledger, q)
+        .await
+        .expect("composite inverse-alternation step");
+    let j = r.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    assert_eq!(
+        normalize_rows(&j),
+        normalize_rows(&json!([["ex:c"]])),
+        "(^(p|q)/r)+ from a = {{c}}: {j}"
+    );
+}
+
+#[tokio::test]
 async fn sparql_composite_transitive_backward_and_both_bound() {
     // Subject-var (backward) and both-bound (reachability) modes over a composite
     // hop.

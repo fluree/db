@@ -653,16 +653,27 @@ fn lower_path_to_patterns<E: IriEncoder>(
                 (false, _) => PathModifier::ZeroOrOne,
             };
 
+            // `(^X)+ ≡ ^(X+)`: peel inverse wrappers around the repeated unit,
+            // swapping endpoints each time, then traverse the core forward. This
+            // reduces `(^p)+`, `(^(a|b))+`, and `(^(a/b))+` to forward paths.
+            let mut swapped = false;
+            let mut core = innermost;
+            while let UnresolvedPathExpr::Inverse(inner) = core {
+                swapped = !swapped;
+                core = inner.as_ref();
+            }
+            let (pp_subject, pp_object) = if swapped { (o, s) } else { (s, o) };
+
             // Composite (sequence) inner — `(p1/p2/…)+` — each hop follows the
-            // whole forward sub-path.
-            if let UnresolvedPathExpr::Sequence(steps) = innermost {
+            // whole sub-path.
+            if let UnresolvedPathExpr::Sequence(steps) = core {
                 let composite = extract_composite_path_steps(steps, encoder)?;
                 return Ok(vec![Pattern::PropertyPath(
-                    PropertyPathPattern::new_composite(s, composite, modifier, o),
+                    PropertyPathPattern::new_composite(pp_subject, composite, modifier, pp_object),
                 )]);
             }
 
-            let iris = extract_transitive_predicate_iris(innermost)?;
+            let iris = extract_transitive_predicate_iris(core)?;
             let mut predicates = Vec::with_capacity(iris.len());
             for iri in iris {
                 predicates.push(
@@ -672,7 +683,7 @@ fn lower_path_to_patterns<E: IriEncoder>(
                 );
             }
             Ok(vec![Pattern::PropertyPath(
-                PropertyPathPattern::new_alternatives(s, predicates, modifier, o),
+                PropertyPathPattern::new_alternatives(pp_subject, predicates, modifier, pp_object),
             )])
         }
 

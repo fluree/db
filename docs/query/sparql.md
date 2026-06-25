@@ -206,6 +206,7 @@ Inverse can also be applied to complex paths (sequences and alternatives):
 - `^(ex:friend/ex:name)` reverses the step order and inverts each step: `(^ex:name)/(^ex:friend)`
 - `^(ex:name|ex:nick)` distributes inverse into each branch: `(^ex:name)|(^ex:nick)`
 - Double inverse cancels: `^(^ex:p)` simplifies to `ex:p`
+- An inverse can also carry a modifier: `(^ex:p)+` is equivalent to `^ex:p+` (and `(^(ex:a/ex:b))+` to the reversed composite walk)
 
 **Alternative (`|`):**
 

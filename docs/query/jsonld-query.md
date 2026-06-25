@@ -718,7 +718,7 @@ The array form uses the operator as the first element followed by its operands.
 | Alternative | <code>ex:a&#124;ex:b</code> | <code>["&#124;", "ex:a", "ex:b"]</code> | Match any of several predicates |
 | Sequence | `ex:a/ex:b` | `["/", "ex:a", "ex:b"]` | Follow a chain of predicates (property chain) |
 | Alternation-transitive | <code>(ex:a&#124;ex:b)+</code> | <code>["+", ["&#124;", "ex:a", "ex:b"]]</code> | Transitive closure following an edge of **any** listed predicate per hop |
-| Composite-transitive | `(ex:a/ex:b)+` | `["+", ["/", "ex:a", "ex:b"]]` | Transitive closure where each hop follows the whole forward sub-path |
+| Composite-transitive | `(ex:a/ex:b)+` | `["+", ["/", "ex:a", "ex:b"]]` | Transitive closure where each hop follows the whole sub-path (steps may be inverse, e.g. `(^ex:a/ex:b)+`) |
 
 Zero-or-more (`*`) includes the starting node itself in the results (zero hops).
 Zero-or-one (`?`) is the start node plus exactly one hop. Nested modifiers
