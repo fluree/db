@@ -130,6 +130,12 @@ pub fn detect_is_cypher(path: Option<&Path>, content: &str, cypher_flag: bool) -
 }
 
 fn sniff_is_cypher(content: &str) -> bool {
+    // A JSON `{"cypher": "...", "params": {...}}` envelope is Cypher even though
+    // it leads with `{` (which would otherwise sniff as JSON-LD). The server
+    // accepts the same envelope under `Content-Type: application/cypher`.
+    if looks_like_cypher_envelope(content) {
+        return true;
+    }
     let upper = content.trim_start().to_uppercase();
     const CYPHER_LEAD: [&str; 6] = [
         "MATCH ",
@@ -140,6 +146,20 @@ fn sniff_is_cypher(content: &str) -> bool {
         "CREATE ",
     ];
     CYPHER_LEAD.iter().any(|kw| upper.starts_with(kw))
+}
+
+/// Whether `content` is a JSON `{"cypher": "...", ...}` envelope — the bundled
+/// statement-plus-params form the server accepts as `application/cypher`. Used
+/// so envelope bodies are not mis-sniffed as JSON-LD before the Cypher path.
+pub fn looks_like_cypher_envelope(content: &str) -> bool {
+    let trimmed = content.trim_start();
+    if !trimmed.starts_with('{') {
+        return false;
+    }
+    serde_json::from_str::<serde_json::Value>(trimmed)
+        .ok()
+        .and_then(|v| v.get("cypher").and_then(|c| c.as_str()).map(|_| ()))
+        .is_some()
 }
 
 fn sniff_query_format(content: &str) -> CliResult<QueryFormat> {
@@ -163,4 +183,31 @@ fn sniff_query_format(content: &str) -> CliResult<QueryFormat> {
         "could not detect query format\n  {} use --sparql or --jsonld to specify",
         colored::Colorize::bold(colored::Colorize::cyan("help:"))
     )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn json_cypher_envelope_detected_as_cypher() {
+        // A `{"cypher": ..., "params": ...}` envelope is Cypher, even though it
+        // is valid JSON that would otherwise sniff as JSON-LD.
+        let body = r#"{"cypher": "MATCH (n) RETURN n", "params": {}}"#;
+        assert!(looks_like_cypher_envelope(body));
+        assert!(detect_is_cypher(None, body, false));
+
+        // A plain JSON-LD query object is not a Cypher envelope.
+        let jsonld = r#"{"select": ["?s"], "where": {"@id": "?s"}}"#;
+        assert!(!looks_like_cypher_envelope(jsonld));
+        assert!(!detect_is_cypher(None, jsonld, false));
+
+        // Leading-keyword Cypher still detected; SPARQL/JSON-LD still not.
+        assert!(detect_is_cypher(None, "MATCH (n) RETURN n", false));
+        assert!(!detect_is_cypher(
+            None,
+            "SELECT * WHERE { ?s ?p ?o }",
+            false
+        ));
+    }
 }

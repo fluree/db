@@ -57,6 +57,13 @@ fn detect_update_format(
 }
 
 fn sniff_update_format(content: &str) -> CliResult<UpdateFormat> {
+    // A `{"cypher": "...", "params": {...}}` envelope is Cypher even though it
+    // is valid JSON — check it before the generic JSON → JSON-LD fallthrough,
+    // which would otherwise route it to the JSON-LD pipeline and fail.
+    if crate::detect::looks_like_cypher_envelope(content) {
+        return Ok(UpdateFormat::Cypher);
+    }
+
     // Try JSON parse first
     if serde_json::from_str::<serde_json::Value>(content).is_ok() {
         return Ok(UpdateFormat::JsonLd);
@@ -243,6 +250,23 @@ mod tests {
     fn detect_explicit_unknown_errors() {
         let result = detect_update_format(None, "", Some("turtle"));
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn detect_json_cypher_envelope_as_cypher() {
+        // A `{"cypher": ..., "params": ...}` envelope must sniff as Cypher, not
+        // JSON-LD (it is valid JSON but is the Cypher transport form).
+        let body = r#"{"cypher": "CREATE (n:Person {name: $n})", "params": {"n": "A"}}"#;
+        assert_eq!(
+            detect_update_format(None, body, None).unwrap(),
+            UpdateFormat::Cypher
+        );
+        // A plain JSON-LD update object still sniffs as JSON-LD.
+        let jsonld = r#"{"insert": {"@id": "ex:a", "ex:p": 1}}"#;
+        assert_eq!(
+            detect_update_format(None, jsonld, None).unwrap(),
+            UpdateFormat::JsonLd
+        );
     }
 
     #[test]
