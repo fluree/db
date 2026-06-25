@@ -778,24 +778,16 @@ fn push_hop(a: &Ref, b: &Ref, type_iri: &str, direction: Direction, out: &mut Ve
     }
 }
 
-/// Determine the IR ref for an already-lowered node. Re-uses the
-/// variable interning so the same Cypher variable name resolves to
-/// the same VarId. Anonymous nodes — those without a `var` — get a
-/// fresh synthetic in `lower_node` and another fresh synthetic here;
-/// to share, we look up by deterministic naming.
+/// Determine the IR ref for an already-lowered node, re-using variable
+/// interning so the node's label/property triples and its relationship triples
+/// resolve to the same `VarId`.
 ///
-/// **Important:** anonymous nodes are tricky — `lower_node` mints a
-/// fresh synthetic each call. To share the SID between the node's
-/// label/prop triples and its relationship triple, we instead key the
-/// synthetic on the node's *position*. v1 simplifies this by re-doing
-/// `node_ref`: when the node has a `var`, that name resolves to the
-/// same VarId via the registry; when it doesn't, we call `fresh_synth`
-/// once per appearance, which is **buggy** — anonymous nodes break.
-/// For v1, we reject patterns that have an anonymous node *with* a
-/// participating relationship until we can rework this to assign
-/// stable per-pattern-part synthetic IDs.
-///
-/// This is a known v1 gap; tracked in the open-questions section.
+/// A named node resolves through the variable registry by name. An anonymous
+/// node (no `var`) is keyed on its source span — `?#__anon_{start}_{end}` via
+/// `VarRegistry::get_or_insert` — so every appearance of the same node within a
+/// pattern derives the identical synthetic name and thus the same `VarId`. This
+/// makes anonymous nodes participating in relationships work correctly
+/// (`it_lower.rs::anonymous_relationship_lowers_to_plain_triple`).
 fn lookup_node_ref<E: IriEncoder>(ctx: &mut LoweringContext<'_, E>, n: &NodePattern) -> Ref {
     match &n.var {
         Some(v) => Ref::Var(ctx.intern_var(&v.name)),
