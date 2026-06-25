@@ -24,12 +24,14 @@
 //! general graph-source semantics are unchanged.
 
 use crate::aggregate::NumericAcc;
-use crate::binding::{Batch, Binding};
+use crate::binding::{Batch, Binding, BindingRow};
 use crate::context::ExecutionContext;
 use crate::error::{QueryError, Result};
+use crate::eval::PreparedBoolExpression;
 use crate::ir::grouping::{AggregateFn, Grouping};
-use crate::ir::{GraphName, Pattern, Query, R2rmlPattern};
+use crate::ir::{Expression, GraphName, Pattern, Query, R2rmlPattern};
 use crate::operator::{BoxedOperator, Operator, OperatorState};
+use crate::r2rml::operator::LiteralEncoder;
 use crate::r2rml::rewrite_patterns_for_r2rml;
 use crate::var_registry::VarId;
 use async_trait::async_trait;
@@ -37,6 +39,7 @@ use bigdecimal::num_bigint::BigInt;
 use bigdecimal::BigDecimal;
 use fluree_db_core::{FlakeValue, Sid};
 use fluree_db_r2rml::mapping::{CompiledR2rmlMapping, ObjectMap, TriplesMap};
+use fluree_db_r2rml::materialize::materialize_object_from_batch;
 use fluree_db_tabular::Column;
 use futures::StreamExt;
 use std::sync::Arc;
@@ -72,7 +75,10 @@ fn numeric_kind(datatype: Option<&str>) -> Option<NumKind> {
 /// per-output aggregate functions.
 pub struct FusedAggregatePlan {
     graph_iri: Arc<str>,
+    /// The triple patterns (rewritten to R2RML at open); the FILTER, if any, is
+    /// held separately and applied per row during the fold.
     inner_patterns: Vec<Pattern>,
+    filter: Option<Expression>,
     group_by: Vec<VarId>,
     aggregates: Vec<(VarId, AggregateFn)>,
 }
@@ -114,15 +120,27 @@ pub fn detect_fused_r2rml_aggregate(query: &Query) -> Option<FusedAggregatePlan>
         return None;
     }
 
-    // Sole pattern is `GRAPH <iri> { triples... }` with only triple patterns.
-    let (graph_iri, inner) = match query.patterns.as_slice() {
+    // Sole pattern is `GRAPH <iri> { triples... [FILTER] }`: any number of triple
+    // patterns plus at most one FILTER. Anything else (OPTIONAL, nested groups, a
+    // second FILTER) declines.
+    let (graph_iri, inner, filter) = match query.patterns.as_slice() {
         [Pattern::Graph {
             name: GraphName::Iri(iri),
             patterns,
-        }] if !patterns.is_empty()
-            && patterns.iter().all(|p| matches!(p, Pattern::Triple(_))) =>
-        {
-            (Arc::clone(iri), patterns.clone())
+        }] => {
+            let mut triples = Vec::with_capacity(patterns.len());
+            let mut filter: Option<Expression> = None;
+            for p in patterns {
+                match p {
+                    Pattern::Triple(_) => triples.push(p.clone()),
+                    Pattern::Filter(e) if filter.is_none() => filter = Some(e.clone()),
+                    _ => return None,
+                }
+            }
+            if triples.is_empty() {
+                return None;
+            }
+            (Arc::clone(iri), triples, filter)
         }
         _ => return None,
     };
@@ -156,6 +174,7 @@ pub fn detect_fused_r2rml_aggregate(query: &Query) -> Option<FusedAggregatePlan>
     Some(FusedAggregatePlan {
         graph_iri,
         inner_patterns: inner,
+        filter,
         group_by,
         aggregates,
     })
@@ -474,6 +493,21 @@ struct Resolved {
     projection: Vec<String>,
     group_cols: Vec<GroupCol>,
     folds: Vec<Fold>,
+    filter: Option<FilterPlan>,
+}
+
+/// Per-row FILTER evaluation plan. The filter expression is evaluated through the
+/// engine's own evaluator (`PreparedBoolExpression`) against a `BindingRow` built
+/// from the referenced object columns, so semantics are identical to the normal
+/// FILTER operator — only the subject and unreferenced columns are skipped.
+struct FilterPlan {
+    prepared: PreparedBoolExpression,
+    /// Object maps for the referenced variables, aligned with `eval_vars`.
+    eval_objmaps: Vec<ObjectMap>,
+    /// The referenced variables (the `BindingRow` schema), aligned with the
+    /// object maps.
+    eval_vars: Arc<[VarId]>,
+    encoder: LiteralEncoder,
 }
 
 /// Fused R2RML aggregate operator. Folds COUNT/SUM/AVG aggregates straight from
@@ -482,6 +516,7 @@ struct Resolved {
 pub struct FusedR2rmlAggregateOperator {
     graph_iri: Arc<str>,
     inner_patterns: Vec<Pattern>,
+    filter: Option<Expression>,
     group_by: Vec<VarId>,
     aggregates: Vec<(VarId, AggregateFn)>,
     /// Output schema: GROUP BY key vars followed by aggregate output vars.
@@ -508,6 +543,7 @@ impl FusedR2rmlAggregateOperator {
         Self {
             graph_iri: plan.graph_iri,
             inner_patterns: plan.inner_patterns,
+            filter: plan.filter,
             group_by: plan.group_by,
             aggregates: plan.aggregates,
             schema,
@@ -553,6 +589,23 @@ impl FusedR2rmlAggregateOperator {
                 column, datatype, ..
             } => Some((column.clone(), datatype.clone())),
             _ => None, // RefObjectMap / Template / Constant
+        }
+    }
+
+    /// Resolve the (single, scalar-column) object map a variable's predicate maps
+    /// to, for materializing the variable's value during FILTER evaluation.
+    fn object_map_for_var(pattern: &R2rmlPattern, tm: &TriplesMap, var: VarId) -> Option<ObjectMap> {
+        let pred = Self::predicate_for_var(pattern, var)?;
+        let mut poms = tm
+            .predicate_object_maps
+            .iter()
+            .filter(|pom| pom.predicate_map.as_constant() == Some(pred));
+        let (Some(pom), None) = (poms.next(), poms.next()) else {
+            return None;
+        };
+        match &pom.object_map {
+            ObjectMap::Column { .. } => Some(pom.object_map.clone()),
+            _ => None,
         }
     }
 
@@ -663,27 +716,31 @@ impl Operator for FusedR2rmlAggregateOperator {
             )
             .await?;
 
-        let columns = if resolved.group_cols.is_empty() {
-            // Implicit aggregation: one group, vectorized per-batch fold.
-            let mut accs: Vec<Acc> = resolved.folds.iter().map(Acc::for_fold).collect();
+        let folds = &resolved.folds;
+        let gcols = &resolved.group_cols;
+        let columns = if gcols.is_empty() && resolved.filter.is_none() {
+            // Fast path: implicit aggregation, no filter — vectorized per-batch.
+            let mut accs: Vec<Acc> = folds.iter().map(Acc::for_fold).collect();
             while let Some(batch) = stream.next().await {
                 let batch = batch?;
-                for (acc, fold) in accs.iter_mut().zip(resolved.folds.iter()) {
+                for (acc, fold) in accs.iter_mut().zip(folds.iter()) {
                     acc.update(fold, &batch);
                 }
                 ctx.tracker.consume_fuel(1)?;
             }
-            // One result row: each accumulator's final binding, in schema order.
             accs.into_iter().map(|acc| vec![acc.finalize()]).collect()
         } else {
-            // GROUP BY: per-row grouping into per-key accumulators.
-            let folds = &resolved.folds;
-            let gcols = &resolved.group_cols;
+            // Per-row path: GROUP BY and/or FILTER. Each row is filtered, then
+            // folded into its group's accumulators.
             let mut groups: std::collections::HashMap<Vec<GKey>, Vec<Acc>> =
                 std::collections::HashMap::new();
+            // Implicit aggregation always yields exactly one (possibly all-zero)
+            // group, even when the filter matches nothing.
+            if gcols.is_empty() {
+                groups.insert(Vec::new(), folds.iter().map(Acc::for_fold).collect());
+            }
             while let Some(batch) = stream.next().await {
                 let batch = batch?;
-                // Resolve each fold's / group column's column once per batch.
                 let fold_cols: Vec<Option<&Column>> = folds
                     .iter()
                     .map(|f| match f {
@@ -696,6 +753,22 @@ impl Operator for FusedR2rmlAggregateOperator {
                 let key_cols: Vec<Option<&Column>> =
                     gcols.iter().map(|g| batch.column_by_name(&g.column)).collect();
                 for row in 0..batch.num_rows {
+                    if let Some(fp) = &resolved.filter {
+                        // Materialize only the referenced object columns into a
+                        // binding row and evaluate through the engine evaluator.
+                        let binds: Vec<Binding> = fp
+                            .eval_objmaps
+                            .iter()
+                            .map(|om| match materialize_object_from_batch(om, &batch, row) {
+                                Ok(Some(term)) => fp.encoder.encode(&term),
+                                _ => Binding::Unbound,
+                            })
+                            .collect();
+                        let rv = BindingRow::new(&fp.eval_vars, &binds);
+                        if !fp.prepared.eval_to_bool_non_strict(&rv, Some(ctx))? {
+                            continue;
+                        }
+                    }
                     let key: Vec<GKey> = gcols
                         .iter()
                         .zip(&key_cols)
@@ -828,6 +901,30 @@ impl FusedR2rmlAggregateOperator {
                 _ => return Ok(None),
             }
         }
+        // FILTER: resolve each referenced variable to its object map (for per-row
+        // materialization) and prepare the expression for the engine evaluator.
+        let filter = if let Some(expr) = &self.filter {
+            let eval_vars = expr.referenced_vars();
+            let mut eval_objmaps = Vec::with_capacity(eval_vars.len());
+            for v in &eval_vars {
+                let Some(om) = Self::object_map_for_var(&pattern, tm, *v) else {
+                    return Ok(None); // filter references a non-column var → fall back
+                };
+                for col in om.referenced_columns() {
+                    projection.push(col.to_string());
+                }
+                eval_objmaps.push(om);
+            }
+            Some(FilterPlan {
+                prepared: PreparedBoolExpression::new(expr.clone()),
+                eval_objmaps,
+                eval_vars: Arc::from(eval_vars),
+                encoder: LiteralEncoder::build(tm, ctx.active_snapshot),
+            })
+        } else {
+            None
+        };
+
         projection.sort();
         projection.dedup();
         Ok(Some(Resolved {
@@ -836,6 +933,7 @@ impl FusedR2rmlAggregateOperator {
             projection,
             group_cols,
             folds,
+            filter,
         }))
     }
 }

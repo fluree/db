@@ -788,14 +788,16 @@ fn emit_produced_window(
 }
 
 /// Datatype Sids resolved once per scan instead of per literal cell — the
-/// per-cell `encode_iri` was a large share of materialization cost.
-struct LiteralEncoder {
+/// per-cell `encode_iri` was a large share of materialization cost. Shared with
+/// the fused-aggregate operator so its filter/expression eval-var bindings are
+/// encoded identically to the normal materialization path.
+pub(crate) struct LiteralEncoder {
     dt_sids: HashMap<String, fluree_db_core::Sid>,
     xsd_string: fluree_db_core::Sid,
 }
 
 impl LiteralEncoder {
-    fn build(triples_map: &TriplesMap, snapshot: &fluree_db_core::LedgerSnapshot) -> Self {
+    pub(crate) fn build(triples_map: &TriplesMap, snapshot: &fluree_db_core::LedgerSnapshot) -> Self {
         let fallback = fluree_db_core::Sid::new(2, "string");
         let mut dt_sids: HashMap<String, fluree_db_core::Sid> = HashMap::new();
         for pom in &triples_map.predicate_object_maps {
@@ -815,7 +817,7 @@ impl LiteralEncoder {
     /// Convert an RdfTerm to a Binding without touching the snapshot (datatype
     /// Sids are pre-resolved). IRIs are kept as raw strings — graph source IRIs
     /// are independent of any Fluree namespace table.
-    fn encode(&self, term: &RdfTerm) -> Binding {
+    pub(crate) fn encode(&self, term: &RdfTerm) -> Binding {
         use fluree_db_core::FlakeValue;
         use fluree_vocab::UnresolvedDatatypeConstraint as Udc;
         match term {
