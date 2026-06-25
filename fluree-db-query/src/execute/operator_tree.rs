@@ -2437,9 +2437,21 @@ fn build_operator_tree_inner(
     if enable_fused_fast_paths {
         if let Some(plan) = crate::r2rml::detect_fused_r2rml_aggregate(query) {
             let fallback = build_operator_tree_inner(query, stats.clone(), false, planning)?;
-            return Ok(Box::new(crate::r2rml::FusedR2rmlAggregateOperator::new(
-                plan, fallback,
-            )));
+            let mut op: BoxedOperator =
+                Box::new(crate::r2rml::FusedR2rmlAggregateOperator::new(plan, fallback));
+            // The fused operator emits the final grouped result; apply ORDER BY /
+            // OFFSET / LIMIT on top with the engine's own operators (exact
+            // semantics on the small grouped output).
+            if !query.ordering.is_empty() {
+                op = Box::new(crate::sort::SortOperator::new(op, query.ordering.clone()));
+            }
+            if let Some(offset) = query.offset {
+                op = Box::new(OffsetOperator::new(op, offset));
+            }
+            if let Some(limit) = query.limit {
+                op = Box::new(LimitOperator::new(op, limit));
+            }
+            return Ok(op);
         }
     }
 

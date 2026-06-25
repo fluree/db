@@ -29,14 +29,14 @@ use crate::context::ExecutionContext;
 use crate::error::{QueryError, Result};
 use crate::eval::PreparedBoolExpression;
 use crate::ir::grouping::{AggregateFn, Grouping};
-use crate::ir::{Expression, GraphName, Pattern, Query, R2rmlPattern};
+use crate::ir::{Expression, Function, GraphName, Pattern, Query, R2rmlPattern};
 use crate::operator::{BoxedOperator, Operator, OperatorState};
 use crate::r2rml::operator::LiteralEncoder;
 use crate::r2rml::rewrite_patterns_for_r2rml;
 use crate::var_registry::VarId;
 use async_trait::async_trait;
 use bigdecimal::num_bigint::BigInt;
-use bigdecimal::BigDecimal;
+use bigdecimal::{BigDecimal, ToPrimitive};
 use fluree_db_core::{FlakeValue, Sid};
 use fluree_db_r2rml::mapping::{CompiledR2rmlMapping, ObjectMap, TriplesMap};
 use fluree_db_r2rml::materialize::materialize_object_from_batch;
@@ -70,6 +70,135 @@ fn numeric_kind(datatype: Option<&str>) -> Option<NumKind> {
     }
 }
 
+/// How to read a numeric column value as an exact decimal during native
+/// expression evaluation.
+#[derive(Clone, Copy)]
+enum DecKind {
+    Decimal,
+    Integer,
+}
+
+/// An exact fixed-point decimal `val * 10^-scale`, mirroring BigDecimal's
+/// (unscaled, scale) form so native `+`/`-`/`*` reproduce the engine's exact
+/// (no-rounding) decimal arithmetic. `i128` carries ~38 digits — ample for
+/// analytical decimal aggregates; an intermediate beyond that yields `None`
+/// (the row is skipped) rather than a wrong wraparound.
+#[derive(Clone, Copy)]
+struct Dec {
+    val: i128,
+    scale: i64,
+}
+
+impl Dec {
+    fn mul(self, o: Dec) -> Option<Dec> {
+        Some(Dec {
+            val: self.val.checked_mul(o.val)?,
+            scale: self.scale + o.scale,
+        })
+    }
+
+    /// Add (or subtract) after aligning to the larger scale, exactly as
+    /// BigDecimal does.
+    fn add_sub(self, o: Dec, sub: bool) -> Option<Dec> {
+        let scale = self.scale.max(o.scale);
+        let a = self.val.checked_mul(pow10(scale - self.scale)?)?;
+        let b = o.val.checked_mul(pow10(scale - o.scale)?)?;
+        let val = if sub {
+            a.checked_sub(b)?
+        } else {
+            a.checked_add(b)?
+        };
+        Some(Dec { val, scale })
+    }
+}
+
+fn pow10(n: i64) -> Option<i128> {
+    10i128.checked_pow(u32::try_from(n).ok()?)
+}
+
+/// Convert a numeric constant to an exact decimal (integers / i128-fitting
+/// decimals only).
+fn const_to_dec(fv: &FlakeValue) -> Option<Dec> {
+    match fv {
+        FlakeValue::Long(n) => Some(Dec {
+            val: *n as i128,
+            scale: 0,
+        }),
+        FlakeValue::Decimal(bd) => {
+            let (bigint, exp) = bd.as_bigint_and_exponent();
+            Some(Dec {
+                val: bigint.to_i128()?,
+                scale: exp,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Whether an expression is a native-foldable decimal arithmetic tree
+/// (`Var` / numeric `Const` / `+` `-` `*` `negate`). Division is excluded — it
+/// rounds, so it stays on the engine path.
+fn expr_native_foldable(expr: &Expression) -> bool {
+    match expr {
+        Expression::Var(_) => true,
+        Expression::Const(fv) => const_to_dec(fv).is_some(),
+        Expression::Call { func, args } => {
+            matches!(
+                func,
+                Function::Add | Function::Sub | Function::Mul | Function::Negate
+            ) && args.iter().all(expr_native_foldable)
+        }
+        _ => false,
+    }
+}
+
+/// Evaluate a native decimal arithmetic expression for one row. `vars` gives the
+/// already-read value of each referenced variable (`None` = null → the whole
+/// expression is `None`, and the row is skipped, matching SUM's null handling).
+fn eval_dec(expr: &Expression, vars: &[(VarId, Option<Dec>)]) -> Option<Dec> {
+    match expr {
+        Expression::Var(v) => vars.iter().find(|(x, _)| x == v).and_then(|(_, d)| *d),
+        Expression::Const(fv) => const_to_dec(fv),
+        Expression::Call { func, args } => match (func, args.as_slice()) {
+            (Function::Add, [a, b]) => eval_dec(a, vars)?.add_sub(eval_dec(b, vars)?, false),
+            (Function::Sub, [a, b]) => eval_dec(a, vars)?.add_sub(eval_dec(b, vars)?, true),
+            (Function::Mul, [a, b]) => eval_dec(a, vars)?.mul(eval_dec(b, vars)?),
+            (Function::Negate, [a]) => {
+                let d = eval_dec(a, vars)?;
+                Some(Dec {
+                    val: d.val.checked_neg()?,
+                    scale: d.scale,
+                })
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Read a numeric column's value at a row as an exact decimal.
+fn read_dec(col: Option<&Column>, kind: DecKind, row: usize) -> Option<Dec> {
+    let col = col?;
+    match (kind, col) {
+        (DecKind::Decimal, Column::Decimal { values, scale, .. }) => values
+            .get(row)
+            .copied()
+            .flatten()
+            .map(|v| Dec { val: v, scale: *scale as i64 }),
+        (_, Column::Int64(values)) => values
+            .get(row)
+            .copied()
+            .flatten()
+            .map(|v| Dec { val: v as i128, scale: 0 }),
+        (_, Column::Int32(values) | Column::Date(values)) => values
+            .get(row)
+            .copied()
+            .flatten()
+            .map(|v| Dec { val: v as i128, scale: 0 }),
+        _ => None,
+    }
+}
+
 /// A detected fused-aggregate plan: the enclosing graph IRI, the inner triple
 /// patterns (rewritten to R2RML at `open`), the GROUP BY variables, and the
 /// per-output aggregate functions.
@@ -79,6 +208,9 @@ pub struct FusedAggregatePlan {
     /// held separately and applied per row during the fold.
     inner_patterns: Vec<Pattern>,
     filter: Option<Expression>,
+    /// Synthetic aggregate-input variables defined by top-level BINDs (the
+    /// desugared `SUM(expr)` / `AVG(expr)` arguments), folded natively per row.
+    agg_binds: Vec<(VarId, Expression)>,
     group_by: Vec<VarId>,
     aggregates: Vec<(VarId, AggregateFn)>,
 }
@@ -96,11 +228,10 @@ pub fn detect_fused_r2rml_aggregate(query: &Query) -> Option<FusedAggregatePlan>
     ) {
         return None;
     }
-    if !query.ordering.is_empty()
-        || !query.order_binds.is_empty()
-        || query.limit.is_some()
-        || query.offset.is_some()
-    {
+    // ORDER BY / LIMIT / OFFSET are applied by wrapping the fused operator in the
+    // engine's own sort/offset/limit operators (see the operator-tree hook), so
+    // they're allowed here. Expression ORDER BY (a synthetic sort var) is not.
+    if !query.order_binds.is_empty() {
         return None;
     }
 
@@ -120,30 +251,35 @@ pub fn detect_fused_r2rml_aggregate(query: &Query) -> Option<FusedAggregatePlan>
         return None;
     }
 
-    // Sole pattern is `GRAPH <iri> { triples... [FILTER] }`: any number of triple
-    // patterns plus at most one FILTER. Anything else (OPTIONAL, nested groups, a
-    // second FILTER) declines.
-    let (graph_iri, inner, filter) = match query.patterns.as_slice() {
-        [Pattern::Graph {
+    // `GRAPH <iri> { triples... [FILTER] }` optionally followed by top-level
+    // `BIND`s (the desugared aggregate-input expressions, e.g. SUM(?a*?b)).
+    let (graph_pat, rest) = query.patterns.split_first()?;
+    let (graph_iri, graph_inner) = match graph_pat {
+        Pattern::Graph {
             name: GraphName::Iri(iri),
             patterns,
-        }] => {
-            let mut triples = Vec::with_capacity(patterns.len());
-            let mut filter: Option<Expression> = None;
-            for p in patterns {
-                match p {
-                    Pattern::Triple(_) => triples.push(p.clone()),
-                    Pattern::Filter(e) if filter.is_none() => filter = Some(e.clone()),
-                    _ => return None,
-                }
-            }
-            if triples.is_empty() {
-                return None;
-            }
-            (Arc::clone(iri), triples, filter)
-        }
+        } => (Arc::clone(iri), patterns),
         _ => return None,
     };
+    let mut inner = Vec::with_capacity(graph_inner.len());
+    let mut filter: Option<Expression> = None;
+    for p in graph_inner {
+        match p {
+            Pattern::Triple(_) => inner.push(p.clone()),
+            Pattern::Filter(e) if filter.is_none() => filter = Some(e.clone()),
+            _ => return None,
+        }
+    }
+    if inner.is_empty() {
+        return None;
+    }
+    let mut agg_binds: Vec<(VarId, Expression)> = Vec::new();
+    for p in rest {
+        match p {
+            Pattern::Bind { var, expr } => agg_binds.push((*var, expr.clone())),
+            _ => return None,
+        }
+    }
 
     // Cost guard: a FILTER is only fused alongside a GROUP BY. There the fused
     // path's win (skipping the subject + the many grouped/aggregated columns)
@@ -168,21 +304,27 @@ pub fn detect_fused_r2rml_aggregate(query: &Query) -> Option<FusedAggregatePlan>
         aggregates.push((spec.output_var, spec.function.clone()));
     }
 
-    // The projection must be exactly the GROUP BY keys + aggregate outputs, so
-    // the fused output rows are the final result.
+    // Output variables = GROUP BY keys + aggregate outputs.
+    let mut outs: std::collections::HashSet<VarId> = aggregates.iter().map(|(v, _)| *v).collect();
+    outs.extend(group_by.iter().copied());
+
+    // The projection must be exactly those, so the fused output rows are the
+    // final result; and any ORDER BY must sort by them (the wrapping
+    // SortOperator only sees the fused output schema).
     if let Some(projected) = query.output.projected_vars() {
-        let mut outs: std::collections::HashSet<VarId> =
-            aggregates.iter().map(|(v, _)| *v).collect();
-        outs.extend(group_by.iter().copied());
         if projected.len() != outs.len() || projected.iter().any(|v| !outs.contains(v)) {
             return None;
         }
+    }
+    if query.ordering.iter().any(|s| !outs.contains(&s.var)) {
+        return None;
     }
 
     Some(FusedAggregatePlan {
         graph_iri,
         inner_patterns: inner,
         filter,
+        agg_binds,
         group_by,
         aggregates,
     })
@@ -201,6 +343,9 @@ enum Fold {
         kind: NumKind,
         is_avg: bool,
     },
+    /// `SUM(expr)` / `AVG(expr)` over a native decimal arithmetic expression;
+    /// `index` points into `Resolved::expr_folds`.
+    NumericExpr { index: usize, is_avg: bool },
 }
 
 /// Running accumulator for one [`Fold`], mutated per batch in `next_batch`.
@@ -217,12 +362,26 @@ enum Acc {
     },
     /// Floating sum.
     Double { sum: f64, count: u64, is_avg: bool },
+    /// Native decimal expression sum: unscaled i128 total + the (constant) result
+    /// scale + non-null count.
+    Expr {
+        sum: i128,
+        scale: i64,
+        count: u64,
+        is_avg: bool,
+    },
 }
 
 impl Acc {
     fn for_fold(fold: &Fold) -> Self {
         match fold {
             Fold::CountRows | Fold::CountColumn(_) => Acc::Count(0),
+            Fold::NumericExpr { is_avg, .. } => Acc::Expr {
+                sum: 0,
+                scale: 0,
+                count: 0,
+                is_avg: *is_avg,
+            },
             Fold::Numeric {
                 kind: NumKind::Double,
                 is_avg,
@@ -323,6 +482,20 @@ impl Acc {
                 is_avg,
             } => {
                 let acc = NumericAcc::from_double_total(sum, count);
+                if is_avg {
+                    acc.finalize_avg()
+                } else {
+                    acc.finalize_sum()
+                }
+            }
+            Acc::Expr {
+                sum,
+                scale,
+                count,
+                is_avg,
+            } => {
+                let big = BigDecimal::new(BigInt::from(sum), scale);
+                let acc = NumericAcc::from_exact_total(big, count, true);
                 if is_avg {
                     acc.finalize_avg()
                 } else {
@@ -502,6 +675,19 @@ struct Resolved {
     group_cols: Vec<GroupCol>,
     folds: Vec<Fold>,
     filter: Option<FilterPlan>,
+    /// Native decimal expression aggregate plans, indexed by `Fold::NumericExpr`.
+    expr_folds: Vec<ExprFold>,
+    /// Columns that must all be non-null for a row to participate, mirroring the
+    /// R2RML star's row-drop: the subject template columns plus every predicate's
+    /// object column. Empty in the vectorized single-predicate fast path.
+    validity_cols: Vec<String>,
+}
+
+/// A native `SUM(expr)` / `AVG(expr)` plan: the arithmetic expression and the
+/// (variable, column, read-kind) of each referenced variable.
+struct ExprFold {
+    expr: Expression,
+    var_cols: Vec<(VarId, String, DecKind)>,
 }
 
 /// Per-row FILTER evaluation plan. The filter expression is evaluated through the
@@ -525,6 +711,7 @@ pub struct FusedR2rmlAggregateOperator {
     graph_iri: Arc<str>,
     inner_patterns: Vec<Pattern>,
     filter: Option<Expression>,
+    agg_binds: Vec<(VarId, Expression)>,
     group_by: Vec<VarId>,
     aggregates: Vec<(VarId, AggregateFn)>,
     /// Output schema: GROUP BY key vars followed by aggregate output vars.
@@ -552,6 +739,7 @@ impl FusedR2rmlAggregateOperator {
             graph_iri: plan.graph_iri,
             inner_patterns: plan.inner_patterns,
             filter: plan.filter,
+            agg_binds: plan.agg_binds,
             group_by: plan.group_by,
             aggregates: plan.aggregates,
             schema,
@@ -726,8 +914,13 @@ impl Operator for FusedR2rmlAggregateOperator {
 
         let folds = &resolved.folds;
         let gcols = &resolved.group_cols;
-        let columns = if gcols.is_empty() && resolved.filter.is_none() {
-            // Fast path: implicit aggregation, no filter — vectorized per-batch.
+        let columns = if gcols.is_empty()
+            && resolved.filter.is_none()
+            && resolved.expr_folds.is_empty()
+            && resolved.validity_cols.is_empty()
+        {
+            // Fast path: implicit aggregation, single predicate, no filter — fully
+            // vectorized per-batch.
             let mut accs: Vec<Acc> = folds.iter().map(Acc::for_fold).collect();
             while let Some(batch) = stream.next().await {
                 let batch = batch?;
@@ -752,7 +945,7 @@ impl Operator for FusedR2rmlAggregateOperator {
                 let fold_cols: Vec<Option<&Column>> = folds
                     .iter()
                     .map(|f| match f {
-                        Fold::CountRows => None,
+                        Fold::CountRows | Fold::NumericExpr { .. } => None,
                         Fold::CountColumn(c) | Fold::Numeric { column: c, .. } => {
                             batch.column_by_name(c)
                         }
@@ -760,7 +953,28 @@ impl Operator for FusedR2rmlAggregateOperator {
                     .collect();
                 let key_cols: Vec<Option<&Column>> =
                     gcols.iter().map(|g| batch.column_by_name(&g.column)).collect();
+                let validity: Vec<Option<&Column>> = resolved
+                    .validity_cols
+                    .iter()
+                    .map(|c| batch.column_by_name(c))
+                    .collect();
+                // Pre-resolve each expression aggregate's variable columns once.
+                let expr_cols: Vec<Vec<Option<&Column>>> = resolved
+                    .expr_folds
+                    .iter()
+                    .map(|ef| {
+                        ef.var_cols
+                            .iter()
+                            .map(|(_, c, _)| batch.column_by_name(c))
+                            .collect()
+                    })
+                    .collect();
                 for row in 0..batch.num_rows {
+                    // Row-validity (R2RML star row-drop): the subject and every
+                    // predicate's object column must be non-null.
+                    if validity.iter().any(|c| c.is_none_or(|col| col.is_null(row))) {
+                        continue;
+                    }
                     if let Some(fp) = &resolved.filter {
                         // Materialize only the referenced object columns into a
                         // binding row and evaluate through the engine evaluator.
@@ -786,7 +1000,29 @@ impl Operator for FusedR2rmlAggregateOperator {
                         .entry(key)
                         .or_insert_with(|| folds.iter().map(Acc::for_fold).collect());
                     for (i, fold) in folds.iter().enumerate() {
-                        accs[i].update_row(fold, fold_cols[i], row);
+                        match fold {
+                            Fold::NumericExpr { index, .. } => {
+                                let ef = &resolved.expr_folds[*index];
+                                // Read each referenced variable's value, then
+                                // evaluate the arithmetic natively (no allocation).
+                                let vars: Vec<(VarId, Option<Dec>)> = ef
+                                    .var_cols
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(k, (v, _, kind))| {
+                                        (*v, read_dec(expr_cols[*index][k], *kind, row))
+                                    })
+                                    .collect();
+                                if let (Acc::Expr { sum, scale, count, .. }, Some(d)) =
+                                    (&mut accs[i], eval_dec(&ef.expr, &vars))
+                                {
+                                    *sum = sum.wrapping_add(d.val);
+                                    *scale = d.scale;
+                                    *count += 1;
+                                }
+                            }
+                            _ => accs[i].update_row(fold, fold_cols[i], row),
+                        }
                     }
                 }
                 ctx.tracker.consume_fuel(1)?;
@@ -879,10 +1115,22 @@ impl FusedR2rmlAggregateOperator {
             });
         }
 
+        // Synthetic aggregate-input expressions (the desugared `SUM(expr)` args).
+        let bind_lookup: std::collections::HashMap<VarId, &Expression> =
+            self.agg_binds.iter().map(|(v, e)| (*v, e)).collect();
+
         let mut folds = Vec::with_capacity(self.aggregates.len());
+        let mut expr_folds: Vec<ExprFold> = Vec::new();
+        let mut counts_subject = false;
         for (_, func) in &self.aggregates {
             match func {
                 AggregateFn::CountAll => folds.push(Fold::CountRows),
+                AggregateFn::Count(v) if *v == pattern.subject_var => {
+                    // COUNT of the subject counts the rows that produce a row,
+                    // which the row-validity gate already enforces.
+                    counts_subject = true;
+                    folds.push(Fold::CountRows);
+                }
                 AggregateFn::Count(v) => {
                     let Some((col, _)) = Self::scalar_column_for_var(&pattern, tm, *v) else {
                         return Ok(None);
@@ -891,24 +1139,82 @@ impl FusedR2rmlAggregateOperator {
                     folds.push(Fold::CountColumn(col));
                 }
                 AggregateFn::Sum(v, _) | AggregateFn::Avg(v, _) => {
-                    let Some((col, datatype)) = Self::scalar_column_for_var(&pattern, tm, *v) else {
-                        return Ok(None);
-                    };
-                    // Only numeric declared datatypes fold; anything else (string,
-                    // date, untyped) goes to the fallback.
-                    let Some(kind) = numeric_kind(datatype.as_deref()) else {
-                        return Ok(None);
-                    };
-                    projection.push(col.clone());
-                    folds.push(Fold::Numeric {
-                        column: col,
-                        kind,
-                        is_avg: matches!(func, AggregateFn::Avg(_, _)),
-                    });
+                    let is_avg = matches!(func, AggregateFn::Avg(_, _));
+                    if let Some(expr) = bind_lookup.get(v) {
+                        // Aggregate over a desugared expression: native decimal fold.
+                        if !expr_native_foldable(expr) {
+                            return Ok(None);
+                        }
+                        let mut var_cols = Vec::new();
+                        for ev in expr.referenced_vars() {
+                            let Some((col, datatype)) =
+                                Self::scalar_column_for_var(&pattern, tm, ev)
+                            else {
+                                return Ok(None);
+                            };
+                            let deck = match numeric_kind(datatype.as_deref()) {
+                                Some(NumKind::Decimal) => DecKind::Decimal,
+                                Some(NumKind::Integer) => DecKind::Integer,
+                                // floats aren't exact decimals → engine path.
+                                _ => return Ok(None),
+                            };
+                            projection.push(col.clone());
+                            var_cols.push((ev, col, deck));
+                        }
+                        let index = expr_folds.len();
+                        expr_folds.push(ExprFold {
+                            expr: (*expr).clone(),
+                            var_cols,
+                        });
+                        folds.push(Fold::NumericExpr { index, is_avg });
+                    } else {
+                        // Aggregate over a bare numeric column: native fold.
+                        let Some((col, datatype)) = Self::scalar_column_for_var(&pattern, tm, *v)
+                        else {
+                            return Ok(None);
+                        };
+                        let Some(kind) = numeric_kind(datatype.as_deref()) else {
+                            return Ok(None);
+                        };
+                        projection.push(col.clone());
+                        folds.push(Fold::Numeric {
+                            column: col,
+                            kind,
+                            is_avg,
+                        });
+                    }
                 }
                 _ => return Ok(None),
             }
         }
+
+        // Row-validity columns. For a same-subject star (or a COUNT of the
+        // subject), a row participates only if the subject and every predicate's
+        // object column are non-null — mirroring the R2RML star's row-drop. A
+        // single-predicate scan needs no gate (the column's own null check plus
+        // the assumption that the subject materializes covers it), keeping the
+        // vectorized fast path.
+        let mut validity_cols: Vec<String> = Vec::new();
+        if !pattern.star_bindings.is_empty() || counts_subject {
+            validity_cols.extend(tm.subject_map.template_columns.iter().cloned());
+            if let Some(c) = &tm.subject_map.column {
+                validity_cols.push(c.clone());
+            }
+            let mut obj_vars: Vec<VarId> = pattern.object_var.into_iter().collect();
+            obj_vars.extend(pattern.star_bindings.iter().map(|(_, v)| *v));
+            for v in obj_vars {
+                let Some((col, _)) = Self::scalar_column_for_var(&pattern, tm, v) else {
+                    return Ok(None);
+                };
+                validity_cols.push(col);
+            }
+            for c in &validity_cols {
+                projection.push(c.clone());
+            }
+            validity_cols.sort();
+            validity_cols.dedup();
+        }
+
         // FILTER: resolve each referenced variable to its object map (for per-row
         // materialization) and prepare the expression for the engine evaluator.
         let filter = if let Some(expr) = &self.filter {
@@ -942,6 +1248,8 @@ impl FusedR2rmlAggregateOperator {
             group_cols,
             folds,
             filter,
+            expr_folds,
+            validity_cols,
         }))
     }
 }
@@ -1016,11 +1324,13 @@ mod tests {
     }
 
     #[test]
-    fn declines_with_limit() {
+    fn allows_limit() {
+        // LIMIT is applied by wrapping the fused operator, so detection still
+        // fires.
         let (s, o, c) = (VarId(0), VarId(1), VarId(2));
         let mut q = count_query(vec![], vec![graph_triple(s, o)], c, o);
         q.limit = Some(1);
-        assert!(detect_fused_r2rml_aggregate(&q).is_none());
+        assert!(detect_fused_r2rml_aggregate(&q).is_some());
     }
 
     #[test]
