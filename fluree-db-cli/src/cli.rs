@@ -356,6 +356,12 @@ pub enum Commands {
         #[arg(num_args = 0..=2)]
         args: Vec<String>,
 
+        /// Ledger name (defaults to active ledger). Explicit alternative to
+        /// the positional ledger argument; when given, positional args carry
+        /// only the inline data or a file path.
+        #[arg(short = 'l', long)]
+        ledger: Option<String>,
+
         /// Inline data expression (Turtle or JSON-LD).
         #[arg(short = 'e', long = "expr")]
         expr: Option<String>,
@@ -394,6 +400,12 @@ pub enum Commands {
         #[arg(num_args = 0..=2)]
         args: Vec<String>,
 
+        /// Ledger name (defaults to active ledger). Explicit alternative to
+        /// the positional ledger argument; when given, positional args carry
+        /// only the inline data or a file path.
+        #[arg(short = 'l', long)]
+        ledger: Option<String>,
+
         /// Inline data expression (JSON-LD or SPARQL UPDATE).
         #[arg(short = 'e', long = "expr")]
         expr: Option<String>,
@@ -430,6 +442,12 @@ pub enum Commands {
         /// With 2 args: first is ledger name, second is inline data.
         #[arg(num_args = 0..=2)]
         args: Vec<String>,
+
+        /// Ledger name (defaults to active ledger). Explicit alternative to
+        /// the positional ledger argument; when given, positional args carry
+        /// only the inline data or a file path.
+        #[arg(short = 'l', long)]
+        ledger: Option<String>,
 
         /// Inline data expression (Turtle or JSON-LD).
         #[arg(short = 'e', long = "expr")]
@@ -468,6 +486,12 @@ pub enum Commands {
         /// With 2 args: first is ledger name, second is inline query.
         #[arg(num_args = 0..=2)]
         args: Vec<String>,
+
+        /// Ledger name (defaults to active ledger). Explicit alternative to
+        /// the positional ledger argument; when given, positional args carry
+        /// only the inline query or a file path.
+        #[arg(short = 'l', long)]
+        ledger: Option<String>,
 
         /// Inline query expression (SPARQL or JSON-LD query).
         #[arg(short = 'e', long = "expr")]

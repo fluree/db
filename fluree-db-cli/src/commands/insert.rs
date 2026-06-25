@@ -41,6 +41,43 @@ pub fn resolve_positional_args(
     }
 }
 
+/// Resolve the ledger plus input source for insert/query/upsert/update,
+/// honoring an explicit `--ledger`/`-l` flag.
+///
+/// When `--ledger` is given it takes precedence and removes all ambiguity:
+/// the positional args carry only inline data/query or a file path — never a
+/// ledger name — so the `looks_like_query` heuristic is bypassed for ledger
+/// disambiguation. When `--ledger` is absent, falls back to the positional
+/// heuristic in [`resolve_positional_args`].
+///
+/// Returns `(ledger_name, inline_input, file_path)`.
+pub fn resolve_inputs<'a>(
+    ledger_flag: Option<&'a str>,
+    args: &'a [String],
+) -> CliResult<(Option<&'a str>, Option<&'a str>, Option<PathBuf>)> {
+    let Some(ledger) = ledger_flag else {
+        return resolve_positional_args(args);
+    };
+
+    match args.len() {
+        0 => Ok((Some(ledger), None, None)),
+        1 => {
+            let p = Path::new(&args[0]);
+            if !looks_like_query(&args[0]) && p.is_file() {
+                Ok((Some(ledger), None, Some(p.to_path_buf())))
+            } else {
+                // Inline data/query (or a path the input reader will reject).
+                Ok((Some(ledger), Some(&args[0]), None))
+            }
+        }
+        _ => Err(CliError::Usage(
+            "--ledger was given, so provide at most one positional argument \
+             (the inline query/data); the ledger comes from --ledger"
+                .into(),
+        )),
+    }
+}
+
 /// Heuristic: does this string look like a query or data literal rather than a
 /// ledger name or file path?
 fn looks_like_query(s: &str) -> bool {
@@ -68,6 +105,7 @@ fn looks_like_query(s: &str) -> bool {
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
     args: &[String],
+    ledger_flag: Option<&str>,
     expr: Option<&str>,
     file_flag: Option<&Path>,
     format_flag: Option<&str>,
@@ -76,7 +114,7 @@ pub async fn run(
     direct: bool,
     policy: &PolicyArgs,
 ) -> CliResult<()> {
-    let (explicit_ledger, positional_inline, positional_file) = resolve_positional_args(args)?;
+    let (explicit_ledger, positional_inline, positional_file) = resolve_inputs(ledger_flag, args)?;
 
     // Resolve input: -e > positional inline > -f > positional file > stdin
     let source = input::resolve_input(

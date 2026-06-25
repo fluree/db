@@ -200,6 +200,88 @@ fn seed_named_people(tmp: &TempDir, ledger: &str) {
 }
 
 #[test]
+fn query_and_insert_accept_ledger_flag() {
+    let tmp = TempDir::new().unwrap();
+    // Seed `streamdb`, then create `otherdb` so it becomes the active ledger.
+    seed_named_people(&tmp, "streamdb");
+    fluree_cmd(&tmp)
+        .args(["create", "otherdb"])
+        .assert()
+        .success();
+
+    // `query --ledger` targets a non-active ledger; the positional arg is the
+    // inline query (heuristic bypassed because the ledger is explicit).
+    fluree_cmd(&tmp)
+        .args([
+            "query",
+            "--ledger",
+            "streamdb",
+            "--sparql",
+            "SELECT ?name WHERE { ?s <http://example.org/name> ?name }",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Alice"))
+        .stdout(predicate::str::contains("Bob"));
+
+    // Short form `-l` plus `-e` behaves identically.
+    fluree_cmd(&tmp)
+        .args([
+            "query",
+            "-l",
+            "streamdb",
+            "--sparql",
+            "-e",
+            "SELECT ?name WHERE { ?s <http://example.org/name> ?name }",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Alice"));
+
+    // `insert --ledger` writes to the named ledger regardless of the active one.
+    fluree_cmd(&tmp)
+        .args([
+            "insert",
+            "--ledger",
+            "streamdb",
+            "-e",
+            r#"{"@context": {"ex": "http://example.org/"}, "@id": "ex:carol", "ex:name": "Carol"}"#,
+        ])
+        .assert()
+        .success();
+    fluree_cmd(&tmp)
+        .args([
+            "query",
+            "--ledger",
+            "streamdb",
+            "--sparql",
+            "SELECT ?name WHERE { ?s <http://example.org/name> ?name }",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Carol"));
+}
+
+#[test]
+fn query_ledger_flag_rejects_extra_positional() {
+    let tmp = TempDir::new().unwrap();
+    seed_named_people(&tmp, "streamdb");
+
+    // With --ledger, a second positional (a stray ledger name) is ambiguous.
+    fluree_cmd(&tmp)
+        .args([
+            "query",
+            "--ledger",
+            "streamdb",
+            "streamdb",
+            "SELECT ?name WHERE { ?s <http://example.org/name> ?name }",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--ledger"));
+}
+
+#[test]
 fn query_ndjson_bare_streams_row_objects() {
     let tmp = TempDir::new().unwrap();
     seed_named_people(&tmp, "streamdb");
