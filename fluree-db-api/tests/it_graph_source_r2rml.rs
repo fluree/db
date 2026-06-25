@@ -13,7 +13,7 @@ mod support;
 use async_trait::async_trait;
 use fluree_db_iceberg::io::batch::{BatchSchema, Column, ColumnBatch, FieldInfo, FieldType};
 use fluree_db_query::error::{QueryError, Result as QueryResult};
-use fluree_db_query::r2rml::{R2rmlProvider, R2rmlTableProvider, ScanFilter};
+use fluree_db_query::r2rml::{ColumnBatchStream, R2rmlProvider, R2rmlTableProvider, ScanFilter};
 use fluree_db_r2rml::loader::R2rmlLoader;
 use fluree_db_r2rml::mapping::CompiledR2rmlMapping;
 use std::sync::Arc;
@@ -88,9 +88,15 @@ impl R2rmlTableProvider for MockR2rmlProvider {
         _projection: &[String],
         _filters: &[ScanFilter],
         _as_of_t: Option<i64>,
-    ) -> QueryResult<Vec<ColumnBatch>> {
-        Ok(self.batches.clone())
+    ) -> QueryResult<ColumnBatchStream> {
+        Ok(vec_batch_stream(self.batches.clone()))
     }
+}
+
+/// Wrap pre-built batches as a `ColumnBatchStream` for the mock providers.
+fn vec_batch_stream(batches: Vec<ColumnBatch>) -> ColumnBatchStream {
+    use futures::StreamExt;
+    Box::pin(futures::stream::iter(batches).map(Ok))
 }
 
 // =============================================================================
@@ -220,10 +226,14 @@ async fn test_mock_r2rml_provider() {
     assert_eq!(loaded.triples_maps.len(), 1);
 
     // Test scan_table
-    let batches = provider
+    use futures::StreamExt;
+    let batches: Vec<ColumnBatch> = provider
         .scan_table("test-gs:main", "openflights.airlines", &[], &[], Some(0))
         .await
-        .unwrap();
+        .unwrap()
+        .map(|b| b.unwrap())
+        .collect()
+        .await;
     assert_eq!(batches.len(), 1);
     assert_eq!(batches[0].num_rows, 3);
 }
@@ -749,7 +759,7 @@ impl R2rmlTableProvider for IcebergDirectProvider {
         projection: &[String],
         _filters: &[ScanFilter],
         _as_of_t: Option<i64>,
-    ) -> QueryResult<Vec<ColumnBatch>> {
+    ) -> QueryResult<ColumnBatchStream> {
         use fluree_db_iceberg::{
             auth::AuthConfig,
             catalog::{
@@ -908,7 +918,7 @@ impl R2rmlTableProvider for IcebergDirectProvider {
         );
 
         if plan.is_empty() {
-            return Ok(Vec::new());
+            return Ok(vec_batch_stream(Vec::new()));
         }
 
         // Read Parquet files
@@ -931,7 +941,7 @@ impl R2rmlTableProvider for IcebergDirectProvider {
             total_rows
         );
 
-        Ok(all_batches)
+        Ok(vec_batch_stream(all_batches))
     }
 }
 
@@ -1169,12 +1179,12 @@ async fn engine_e2e_provider_method_calls() {
             projection: &[String],
             _filters: &[ScanFilter],
             _as_of_t: Option<i64>,
-        ) -> QueryResult<Vec<ColumnBatch>> {
+        ) -> QueryResult<ColumnBatchStream> {
             eprintln!(
                 "scan_table called: gs={graph_source_id}, table={table_name}, projection={projection:?}"
             );
             self.scan_table_called.fetch_add(1, Ordering::SeqCst);
-            Ok(self.batches.clone())
+            Ok(vec_batch_stream(self.batches.clone()))
         }
     }
 
@@ -1850,16 +1860,16 @@ impl R2rmlTableProvider for MultiTableMockProvider {
         _projection: &[String],
         _filters: &[ScanFilter],
         _as_of_t: Option<i64>,
-    ) -> QueryResult<Vec<ColumnBatch>> {
+    ) -> QueryResult<ColumnBatchStream> {
         eprintln!("MultiTableMockProvider.scan_table: {table_name}");
         // Return appropriate batch based on table name
         // Table names are normalized to dot notation
         match table_name {
-            "openflights.airlines" => Ok(vec![self.airlines_batch.clone()]),
-            "openflights.routes" => Ok(vec![self.routes_batch.clone()]),
+            "openflights.airlines" => Ok(vec_batch_stream(vec![self.airlines_batch.clone()])),
+            "openflights.routes" => Ok(vec_batch_stream(vec![self.routes_batch.clone()])),
             _ => {
                 eprintln!("Unknown table: {table_name}");
-                Ok(vec![])
+                Ok(vec_batch_stream(vec![]))
             }
         }
     }
