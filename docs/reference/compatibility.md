@@ -54,7 +54,7 @@ Supported SPARQL features:
 - ORDER BY
 - LIMIT and OFFSET
 - Subqueries
-- Property paths (partial: `+`, `*`, `^`, `|`, `/`; see [SPARQL docs](../query/sparql.md#property-paths))
+- Property paths (`+`, `*`, `?`, `^`, `|`, `/`, `!` negated sets; only transitive-over-composite like `(a/b)+` is unsupported — see [SPARQL docs](../query/sparql.md#property-paths))
 
 **Aggregate result types:** COUNT and SUM of integers return `xsd:integer` (per W3C spec), not `xsd:long`. SUM of mixed types and AVG return `xsd:double`.
 
@@ -348,7 +348,7 @@ Export Fluree data to:
 ### Planned Features
 
 **Query:**
-- SPARQL property paths: remaining operators (`?` zero-or-one, `!` negated set)
+- SPARQL property paths: transitive over a composite sub-path (`(a/b)+`, `(a/b)*`, `(a/b)?`)
 - GeoSPARQL
 - SPARQL 1.1 Federation
 - Full SPARQL UPDATE

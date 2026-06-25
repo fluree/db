@@ -141,9 +141,11 @@ SPARQL property paths allow complex traversal patterns in the predicate position
 |--------|------|-------------|
 | `p+` | One or more | Transitive closure (follows `p` one or more hops) |
 | `p*` | Zero or more | Reflexive transitive closure (includes self) |
+| `p?` | Zero or one | Optional step — the node itself plus a single `p` hop |
 | `^p` | Inverse | Traverses `p` in reverse direction |
 | `p\|q` | Alternative | Matches either `p` or `q` (UNION semantics) |
 | `p/q` | Sequence | Follows `p` then `q` (property chain) |
+| `!p`, `!(p\|q)`, `!(^p)` | Negated property set | Matches any predicate **not** in the set |
 
 **One or More (`+`):**
 
@@ -156,6 +158,27 @@ SPARQL property paths allow complex traversal patterns in the predicate position
 ```sparql
 ?person ex:parent* ?ancestorOrSelf .
 ```
+
+**Zero or One (`?`):**
+
+```sparql
+?person ex:parent? ?parentOrSelf .
+```
+
+Matches `?person` itself (zero-length) plus its direct `ex:parent` neighbors — no transitive closure beyond one hop. Works with an alternation of simple predicates (`(ex:a|ex:b)?`) and inverse (`^ex:p?`).
+
+**Negated Property Sets (`!`):**
+
+```sparql
+?s !ex:knows ?o .          -- any predicate except ex:knows
+?s !(ex:a|ex:b) ?o .       -- any predicate not in {ex:a, ex:b}
+?s !(^ex:parent) ?o .      -- any inverse edge except ex:parent
+?s !(ex:a|^ex:b) ?o .      -- forward not-a OR inverse not-b
+```
+
+A negated set matches any predicate **not** listed. Forward members (`ex:a`) constrain forward edges; inverse members (`^ex:b`) constrain reverse edges. A set with members in both directions is the union of a forward branch and a reverse branch; a single-direction set matches only that direction. Internally this lowers to a triple over a fresh predicate variable plus a `FILTER` excluding the listed predicates.
+
+**Nested modifiers** collapse algebraically: `((ex:p)*)*` ≡ `ex:p*`, `(ex:p+)?` ≡ `ex:p*`, and `(ex:p?)?` ≡ `ex:p?`.
 
 **Inverse (`^`):**
 
@@ -239,12 +262,7 @@ Multiple alternative steps are supported: `(ex:a|ex:b)/(ex:c|ex:d)` expands to 4
 
 #### Not Yet Supported
 
-The following operators are parsed but not yet supported for execution:
-
-| Syntax | Name |
-|--------|------|
-| `p?` | Zero or one (optional step) |
-| `!p` or `!(p\|q)` | Negated property set |
+A transitive or optional modifier applied to a **composite** sub-path (a sequence or nested non-simple expression) is not yet supported — for example `(ex:a/ex:b)+`, `(ex:a/ex:b)*`, or `(ex:a/ex:b)?`. The transitive operators require a simple predicate or an alternation of simple predicates (`(ex:a|ex:b)+`, which **is** supported). Workaround: materialize the composite edge into a single predicate, or expand a known-depth path into a `UNION` of fixed-length joins.
 
 ## Query Modifiers
 

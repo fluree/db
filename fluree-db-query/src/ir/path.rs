@@ -13,6 +13,8 @@ pub enum PathModifier {
     OneOrMore,
     /// * : zero or more (includes starting node)
     ZeroOrMore,
+    /// ? : zero or one (the starting node plus its direct neighbors; no closure)
+    ZeroOrOne,
 }
 
 /// Resolved property path pattern for transitive traversal.

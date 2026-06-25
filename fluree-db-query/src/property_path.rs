@@ -220,6 +220,19 @@ impl PropertyPathOperator {
     /// Uses SPOT index: (subject=start, predicate=path_pred)
     /// Returns all reachable nodes via the transitive predicate.
     async fn traverse_forward(&self, ctx: &ExecutionContext<'_>, start: &Sid) -> Result<Vec<Sid>> {
+        // ZeroOrOne (`p?`): the start node itself (zero-length) plus its direct
+        // neighbors (one hop) — no transitive closure.
+        if self.pattern.modifier == PathModifier::ZeroOrOne {
+            let mut results: Vec<Sid> = vec![start.clone()];
+            let mut seen: HashSet<Sid> = HashSet::from([start.clone()]);
+            for obj in self.forward_step(ctx, start).await? {
+                if seen.insert(obj.clone()) {
+                    results.push(obj);
+                }
+            }
+            return Ok(results);
+        }
+
         let mut visited: HashSet<Sid> = HashSet::new();
         let mut queue: VecDeque<Sid> = VecDeque::new();
         let mut results: Vec<Sid> = Vec::new();
@@ -279,6 +292,19 @@ impl PropertyPathOperator {
         ctx: &ExecutionContext<'_>,
         target: &Sid,
     ) -> Result<Vec<Sid>> {
+        // ZeroOrOne (`p?`): the target node itself (zero-length) plus its direct
+        // predecessors (one backward hop) — no transitive closure.
+        if self.pattern.modifier == PathModifier::ZeroOrOne {
+            let mut results: Vec<Sid> = vec![target.clone()];
+            let mut seen: HashSet<Sid> = HashSet::from([target.clone()]);
+            for src in self.backward_step(ctx, target).await? {
+                if seen.insert(src.clone()) {
+                    results.push(src);
+                }
+            }
+            return Ok(results);
+        }
+
         let mut visited: HashSet<Sid> = HashSet::new();
         let mut queue: VecDeque<Sid> = VecDeque::new();
         let mut results: Vec<Sid> = Vec::new();
@@ -358,6 +384,24 @@ impl PropertyPathOperator {
         }
 
         let mut out: Vec<(Sid, Sid)> = Vec::new();
+
+        // ZeroOrOne (`p?`): each node maps to itself (zero-length) and to its
+        // direct neighbors (one hop) — no closure.
+        if self.pattern.modifier == PathModifier::ZeroOrOne {
+            for n in &nodes {
+                let mut seen: HashSet<Sid> = HashSet::from([n.clone()]);
+                out.push((n.clone(), n.clone()));
+                if let Some(nexts) = adj.get(n) {
+                    for m in nexts {
+                        if seen.insert(m.clone()) {
+                            out.push((n.clone(), m.clone()));
+                        }
+                    }
+                }
+            }
+            return Ok(out);
+        }
+
         for start in &nodes {
             // BFS from start using adjacency only (no DB calls).
             let mut visited: HashSet<Sid> = HashSet::new();
@@ -417,6 +461,18 @@ impl PropertyPathOperator {
         // ZeroOrMore includes the zero-length path.
         if self.pattern.modifier == PathModifier::ZeroOrMore && start == target {
             return Ok(true);
+        }
+
+        // ZeroOrOne (`p?`): zero-length (start == target) or a single direct hop.
+        if self.pattern.modifier == PathModifier::ZeroOrOne {
+            if start == target {
+                return Ok(true);
+            }
+            return Ok(self
+                .forward_step(ctx, start)
+                .await?
+                .iter()
+                .any(|o| o == target));
         }
 
         let mut visited: HashSet<Sid> = HashSet::new();

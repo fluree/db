@@ -131,6 +131,60 @@ async fn property_path_one_or_more_no_vars_matches_transitively() {
 }
 
 #[tokio::test]
+async fn property_path_zero_or_one_object_var() {
+    // `@path: "ex:knows?"` — JSON-LD parity for SPARQL `ex:knows?`. From `ex:a`,
+    // ZeroOrOne yields a itself (zero-length) plus its direct neighbor b only.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger1 = seed_knows_chain(&fluree, "property/path-zoo-o:main").await;
+
+    let q = json!({
+        "@context": {
+            "ex": "http://example.org/",
+            "knowsOpt": {"@path": "ex:knows?"}
+        },
+        "where": [{"@id":"ex:a","knowsOpt":"?who"}],
+        "select": ["?who"]
+    });
+    let rows = support::query_jsonld(&fluree, &ledger1, &q)
+        .await
+        .unwrap()
+        .to_jsonld(&ledger1.snapshot)
+        .unwrap();
+    assert_eq!(
+        normalize_rows(&rows),
+        normalize_rows(&json!([["ex:a"], ["ex:b"]])),
+        "knows? from a = {{a, b}}, not the transitive closure: {rows}"
+    );
+}
+
+#[tokio::test]
+async fn property_path_nested_modifier_collapses() {
+    // `@path: "((ex:knows)*)*"` collapses to `ex:knows*` — JSON-LD parity for the
+    // SPARQL nested-modifier simplification. From `ex:a` over a->b->{c,d}->e.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger1 = seed_knows_chain(&fluree, "property/path-nested-mod:main").await;
+
+    let q = json!({
+        "@context": {
+            "ex": "http://example.org/",
+            "reach": {"@path": "((ex:knows)*)*"}
+        },
+        "where": [{"@id":"ex:a","reach":"?who"}],
+        "select": ["?who"]
+    });
+    let rows = support::query_jsonld(&fluree, &ledger1, &q)
+        .await
+        .unwrap()
+        .to_jsonld(&ledger1.snapshot)
+        .unwrap();
+    assert_eq!(
+        normalize_rows(&rows),
+        normalize_rows(&json!([["ex:a"], ["ex:b"], ["ex:c"], ["ex:d"], ["ex:e"]])),
+        "((knows)*)* = knows* = full closure incl. start: {rows}"
+    );
+}
+
+#[tokio::test]
 async fn property_path_one_or_more_object_var_with_and_without_cycle() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger1 = seed_knows_chain(&fluree, "property/path-oneplus-o:main").await;
@@ -412,24 +466,24 @@ async fn property_path_array_form() {
 
 #[tokio::test]
 async fn property_path_unsupported_operator_error() {
-    // Zero-or-one (?) is parsed but not yet supported for execution
+    // Transitive over a composite (sequence) sub-path — `(ex:knows/ex:knows)+` —
+    // is not yet supported: the transitive operators require a simple predicate
+    // (or an alternation of simple predicates). This is the remaining gap.
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger1 = seed_knows_chain(&fluree, "property/path-unsupported:main").await;
 
     let q = json!({
         "@context": {
             "ex": "http://example.org/",
-            "maybeFriend": {"@path": "ex:knows?"}
+            "twoHopPlus": {"@path": "(ex:knows/ex:knows)+"}
         },
-        "where": [{"@id":"ex:a","maybeFriend":"?who"}],
+        "where": [{"@id":"ex:a","twoHopPlus":"?who"}],
         "select": ["?who"]
     });
     let err = support::query_jsonld(&fluree, &ledger1, &q).await;
-    assert!(err.is_err(), "Zero-or-one paths should fail at execution");
-    let msg = format!("{}", err.unwrap_err());
     assert!(
-        msg.contains("not yet supported"),
-        "Error should mention 'not yet supported', got: {msg}"
+        err.is_err(),
+        "Transitive over a composite sub-path should be rejected (not yet supported)"
     );
 }
 

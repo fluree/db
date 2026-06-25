@@ -9,13 +9,15 @@
 
 use std::sync::Arc;
 
-use crate::ast::path::PropertyPath as SparqlPropertyPath;
+use crate::ast::path::{NegatedPredicate, PropertyPath as SparqlPropertyPath};
 use crate::ast::term::{ObjectTerm, SubjectTerm};
 use crate::span::SourceSpan;
 
+use fluree_db_core::FlakeValue;
 use fluree_db_query::ir::triple::{Ref, TriplePattern};
-use fluree_db_query::ir::{PathModifier, Pattern, PropertyPathPattern};
+use fluree_db_query::ir::{Expression, Function, PathModifier, Pattern, PropertyPathPattern};
 use fluree_db_query::parse::encode::IriEncoder;
+use fluree_db_query::var_registry::VarId;
 use fluree_vocab::rdf::TYPE;
 
 use super::{LowerError, LoweringContext, Result};
@@ -66,9 +68,10 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
         };
 
         match effective_path {
-            // Transitive: one-or-more / zero-or-more → PropertyPathPattern
+            // Transitive: one-or-more / zero-or-more / zero-or-one → PropertyPathPattern
             SparqlPropertyPath::OneOrMore { path: inner, .. }
-            | SparqlPropertyPath::ZeroOrMore { path: inner, .. } => {
+            | SparqlPropertyPath::ZeroOrMore { path: inner, .. }
+            | SparqlPropertyPath::ZeroOrOne { path: inner, .. } => {
                 // Both endpoints constant (`:a (:p)* :b`) is a reachability test:
                 // the operator's both-Sid arm emits one empty solution iff a
                 // path exists, none otherwise — no variable required.
@@ -76,10 +79,16 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                 // A transitive over an alternation of simple predicates —
                 // `(a|b)*` / `(a|b)+` — becomes an alternation-transitive path
                 // whose closure follows an edge of any branch per hop.
-                let iris = self.extract_transitive_predicate_iris(inner, span)?;
-                let modifier = match effective_path {
-                    SparqlPropertyPath::OneOrMore { .. } => PathModifier::OneOrMore,
-                    _ => PathModifier::ZeroOrMore,
+                // Collapse directly-nested modifiers (`((:p)*)*`, `(:p+)?`, …) to a
+                // single modifier over the innermost path before extracting
+                // predicates. `inner` is consumed via `innermost` below.
+                let _ = inner;
+                let ((zero, unbounded), innermost) = Self::collapse_modifiers(effective_path);
+                let iris = self.extract_transitive_predicate_iris(innermost, span)?;
+                let modifier = match (unbounded, zero) {
+                    (true, true) => PathModifier::ZeroOrMore,
+                    (true, false) => PathModifier::OneOrMore,
+                    (false, _) => PathModifier::ZeroOrOne,
                 };
                 let mut predicate_sids = Vec::with_capacity(iris.len());
                 for iri in &iris {
@@ -100,14 +109,16 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
 
             // Inverse: ^path
             SparqlPropertyPath::Inverse { path: inner, .. } => match inner.as_ref() {
-                // Inverse-transitive: ^p+ or ^p* → PropertyPathPattern with swapped s/o
+                // Inverse-transitive: ^p+ or ^p* or ^p? → PropertyPathPattern with swapped s/o
                 SparqlPropertyPath::OneOrMore { path: tp_inner, .. }
-                | SparqlPropertyPath::ZeroOrMore { path: tp_inner, .. } => {
+                | SparqlPropertyPath::ZeroOrMore { path: tp_inner, .. }
+                | SparqlPropertyPath::ZeroOrOne { path: tp_inner, .. } => {
                     // Both-constants is a reachability test (handled by the
                     // operator's both-Sid arm), not an error.
                     let iri = self.extract_simple_predicate_iri(tp_inner, span)?;
                     let modifier = match inner.as_ref() {
                         SparqlPropertyPath::OneOrMore { .. } => PathModifier::OneOrMore,
+                        SparqlPropertyPath::ZeroOrOne { .. } => PathModifier::ZeroOrOne,
                         _ => PathModifier::ZeroOrMore,
                     };
                     let predicate_sid = self
@@ -153,30 +164,119 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                 *a_span,
             )),
 
-            // Parsed but not yet supported
-            SparqlPropertyPath::ZeroOrOne { span: op_span, .. } => {
-                Err(LowerError::not_implemented(
-                    "Optional (?) property paths",
-                    *op_span,
-                ))
-            }
             // Sequence: path/path → chain of triple patterns joined by ?__pp{n} variables
             SparqlPropertyPath::Sequence { .. } => {
                 let mut steps = Vec::new();
                 Self::flatten_sequence(effective_path, &mut steps);
                 self.lower_sequence_chain(s, &steps, o, span)
             }
-            SparqlPropertyPath::NegatedSet { span: op_span, .. } => {
-                Err(LowerError::not_implemented(
-                    "Negated property sets (!)",
-                    *op_span,
-                ))
+            // Negated property set: `!iri`, `!(a|b)`, `!(^p)`, `!(a|^p)`.
+            SparqlPropertyPath::NegatedSet { iris, .. } => {
+                self.lower_negated_set(s, iris, o, span)
             }
 
             // Grouped path - unwrap and recurse
             SparqlPropertyPath::Group { path: inner, .. } => {
                 self.lower_path_dispatch(s, inner, o, span)
             }
+        }
+    }
+
+    /// Lower a negated property set `!(...)` to triple-pattern(s) over a fresh
+    /// predicate variable, filtered to exclude the listed predicates.
+    ///
+    /// Per SPARQL 1.1 §18.2, members partition by direction: forward members
+    /// produce a forward branch `s ?p o` filtered to exclude them; inverse
+    /// members produce a reversed branch `o ?p s` filtered likewise. A set with
+    /// members in both directions yields a `Union` of the two branches; a
+    /// single-direction set yields just that branch (no spurious opposite-side
+    /// matches — see W3C `nps_a` / `nps_inverse`).
+    fn lower_negated_set(
+        &mut self,
+        s: &Ref,
+        members: &[NegatedPredicate],
+        o: &Ref,
+        span: SourceSpan,
+    ) -> Result<Vec<Pattern>> {
+        let mut forward_iris: Vec<String> = Vec::new();
+        let mut inverse_iris: Vec<String> = Vec::new();
+        for member in members {
+            match member {
+                NegatedPredicate::Forward(iri) => forward_iris.push(self.expand_iri(iri)?),
+                NegatedPredicate::ForwardA { .. } => forward_iris.push(TYPE.to_string()),
+                NegatedPredicate::Inverse(iri) => inverse_iris.push(self.expand_iri(iri)?),
+                NegatedPredicate::InverseA { .. } => inverse_iris.push(TYPE.to_string()),
+            }
+        }
+
+        if forward_iris.is_empty() && inverse_iris.is_empty() {
+            return Err(LowerError::invalid_property_path(
+                "Negated property set must list at least one predicate",
+                span,
+            ));
+        }
+
+        // Forward branch: `s ?p o` excluding the forward predicates.
+        let forward =
+            (!forward_iris.is_empty()).then(|| self.negated_branch(s, &forward_iris, o, false));
+        // Inverse branch: `o ?p s` excluding the inverse predicates.
+        let inverse =
+            (!inverse_iris.is_empty()).then(|| self.negated_branch(s, &inverse_iris, o, true));
+
+        match (forward, inverse) {
+            (Some(f), None) => Ok(f),
+            (None, Some(i)) => Ok(i),
+            (Some(f), Some(i)) => Ok(vec![Pattern::Union(vec![f, i])]),
+            (None, None) => unreachable!("checked non-empty above"),
+        }
+    }
+
+    /// Build one direction of a negated property set: a triple over a fresh
+    /// predicate variable plus a `FILTER` excluding `excluded`. When `inverse`
+    /// is set the triple is reversed (`o ?p s`).
+    fn negated_branch(
+        &mut self,
+        s: &Ref,
+        excluded: &[String],
+        o: &Ref,
+        inverse: bool,
+    ) -> Vec<Pattern> {
+        let pvar = self
+            .vars
+            .get_or_insert(&format!("?__np{}", self.pp_counter));
+        self.pp_counter += 1;
+
+        let (subj, obj) = if inverse { (o, s) } else { (s, o) };
+        let triple = Pattern::Triple(TriplePattern::new(
+            subj.clone(),
+            Ref::Var(pvar),
+            obj.clone().into(),
+        ));
+        let filter = Pattern::Filter(Self::predicate_exclusion_filter(pvar, excluded));
+        vec![triple, filter]
+    }
+
+    /// `FILTER(?p != iri1 && ?p != iri2 && …)` over a predicate variable. Each
+    /// IRI is wrapped in `IRI()` so it compares as a resolved term (Sid), not a
+    /// plain string — matching how a hand-written `FILTER(?p != :iri)` lowers.
+    fn predicate_exclusion_filter(pvar: VarId, excluded: &[String]) -> Expression {
+        let conds: Vec<Expression> = excluded
+            .iter()
+            .map(|iri| Expression::Call {
+                func: Function::Ne,
+                args: vec![
+                    Expression::Var(pvar),
+                    Expression::Call {
+                        func: Function::Iri,
+                        args: vec![Expression::Const(FlakeValue::String(iri.clone()))],
+                    },
+                ],
+            })
+            .collect();
+        if conds.len() == 1 {
+            conds.into_iter().next().unwrap()
+        } else {
+            Expression::and(conds)
         }
     }
 
@@ -305,6 +405,30 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
             SparqlPropertyPath::Group { path: inner, .. } => Self::unwrap_group(inner),
             other => other,
         }
+    }
+
+    /// Collapse a chain of directly-nested transitive/optional modifiers (through
+    /// any `Group` layers) into a single modifier over the innermost path.
+    ///
+    /// Returns `((allows_zero, unbounded), innermost)`. Each layer contributes:
+    /// `+` → (no-zero, unbounded), `*` → (zero, unbounded), `?` → (zero, bounded);
+    /// the chain allows a zero-length match if ANY layer does, and is unbounded if
+    /// ANY layer repeats (`+`/`*`). So `(:p*)*`→`*`, `(:p+)?`→`*`, `(:p?)?`→`?`.
+    fn collapse_modifiers(path: &SparqlPropertyPath) -> ((bool, bool), &SparqlPropertyPath) {
+        let mut cur = Self::unwrap_group(path);
+        let (mut zero, mut unbounded) = (false, false);
+        loop {
+            let (layer_zero, layer_unbounded, inner) = match cur {
+                SparqlPropertyPath::OneOrMore { path: inner, .. } => (false, true, inner),
+                SparqlPropertyPath::ZeroOrMore { path: inner, .. } => (true, true, inner),
+                SparqlPropertyPath::ZeroOrOne { path: inner, .. } => (true, false, inner),
+                _ => break,
+            };
+            zero |= layer_zero;
+            unbounded |= layer_unbounded;
+            cur = Self::unwrap_group(inner);
+        }
+        ((zero, unbounded), cur)
     }
 
     /// Recursively rewrite `Inverse(Sequence/Alternative)` so that `Inverse`

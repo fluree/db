@@ -641,11 +641,17 @@ fn lower_path_to_patterns<E: IriEncoder>(
     match effective_path {
         // Transitive: `p+` / `p*`, plus alternation-transitive `(a|b…)+` / `(a|b…)*`
         // whose closure follows an edge of any listed predicate per hop.
-        UnresolvedPathExpr::OneOrMore(inner) | UnresolvedPathExpr::ZeroOrMore(inner) => {
-            let iris = extract_transitive_predicate_iris(inner)?;
-            let modifier = match effective_path {
-                UnresolvedPathExpr::OneOrMore(_) => PathModifier::OneOrMore,
-                _ => PathModifier::ZeroOrMore,
+        UnresolvedPathExpr::OneOrMore(_)
+        | UnresolvedPathExpr::ZeroOrMore(_)
+        | UnresolvedPathExpr::ZeroOrOne(_) => {
+            // Collapse directly-nested modifiers (`((p)*)*`, `(p+)?`, …) to one
+            // modifier over the innermost path. See `collapse_path_modifiers`.
+            let ((zero, unbounded), innermost) = collapse_path_modifiers(effective_path);
+            let iris = extract_transitive_predicate_iris(innermost)?;
+            let modifier = match (unbounded, zero) {
+                (true, true) => PathModifier::ZeroOrMore,
+                (true, false) => PathModifier::OneOrMore,
+                (false, _) => PathModifier::ZeroOrOne,
             };
             let mut predicates = Vec::with_capacity(iris.len());
             for iri in iris {
@@ -662,11 +668,14 @@ fn lower_path_to_patterns<E: IriEncoder>(
 
         // Inverse: ^path
         UnresolvedPathExpr::Inverse(inner) => match inner.as_ref() {
-            // Inverse-transitive: ^p+ or ^p* → PropertyPathPattern with swapped s/o
-            UnresolvedPathExpr::OneOrMore(tp_inner) | UnresolvedPathExpr::ZeroOrMore(tp_inner) => {
+            // Inverse-transitive: ^p+ or ^p* or ^p? → PropertyPathPattern with swapped s/o
+            UnresolvedPathExpr::OneOrMore(tp_inner)
+            | UnresolvedPathExpr::ZeroOrMore(tp_inner)
+            | UnresolvedPathExpr::ZeroOrOne(tp_inner) => {
                 let iri = expect_simple_iri(tp_inner)?;
                 let modifier = match inner.as_ref() {
                     UnresolvedPathExpr::OneOrMore(_) => PathModifier::OneOrMore,
+                    UnresolvedPathExpr::ZeroOrOne(_) => PathModifier::ZeroOrOne,
                     _ => PathModifier::ZeroOrMore,
                 };
                 let predicate = encoder
@@ -708,10 +717,6 @@ fn lower_path_to_patterns<E: IriEncoder>(
              use a regular predicate or add + or *"
                 .to_string(),
         )),
-        UnresolvedPathExpr::ZeroOrOne(_) => Err(ParseError::InvalidWhere(
-            "Optional (?) property paths are parsed but not yet supported for execution"
-                .to_string(),
-        )),
     }
 }
 
@@ -725,6 +730,28 @@ fn lower_path_to_patterns<E: IriEncoder>(
 ///
 /// Returns `Some(rewritten)` if the input was a complex inverse that was
 /// transformed, `None` if no rewrite was needed (simple/transitive inverse).
+/// Collapse a chain of directly-nested transitive/optional modifiers into a
+/// single modifier over the innermost path, returning `((allows_zero,
+/// unbounded), innermost)`. Mirrors the SPARQL-side collapse: the chain allows a
+/// zero-length match if ANY layer is `*`/`?`, and is unbounded if ANY layer is
+/// `+`/`*`. So `(p*)*`→`*`, `(p+)?`→`*`, `(p?)?`→`?`.
+fn collapse_path_modifiers(path: &UnresolvedPathExpr) -> ((bool, bool), &UnresolvedPathExpr) {
+    let mut cur = path;
+    let (mut zero, mut unbounded) = (false, false);
+    loop {
+        let (layer_zero, layer_unbounded, inner) = match cur {
+            UnresolvedPathExpr::OneOrMore(inner) => (false, true, inner),
+            UnresolvedPathExpr::ZeroOrMore(inner) => (true, true, inner),
+            UnresolvedPathExpr::ZeroOrOne(inner) => (true, false, inner),
+            _ => break,
+        };
+        zero |= layer_zero;
+        unbounded |= layer_unbounded;
+        cur = inner;
+    }
+    ((zero, unbounded), cur)
+}
+
 fn rewrite_inverse_of_complex(path: &UnresolvedPathExpr) -> Option<UnresolvedPathExpr> {
     match path {
         UnresolvedPathExpr::Inverse(inner) => match inner.as_ref() {

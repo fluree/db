@@ -5122,3 +5122,213 @@ async fn sparql_both_bound_path_reachability() {
         "a cannot reach z: {j2}"
     );
 }
+
+/// Seed a simple `a -> b -> c` chain over `ex:p` for ZeroOrOne path tests.
+async fn seed_pp_chain(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
+    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let insert = json!({
+        "@context": {"ex": "http://example.org/"},
+        "@graph": [
+            {"@id": "ex:a", "ex:p": {"@id": "ex:b"}},
+            {"@id": "ex:b", "ex:p": {"@id": "ex:c"}}
+        ]
+    });
+    fluree.insert(ledger0, &insert).await.unwrap().ledger
+}
+
+#[tokio::test]
+async fn sparql_nested_modifier_star_of_star() {
+    // W3C `pp37` shape: `((:p)*)*` collapses to `:p*`. From a (a→b→c chain),
+    // zero-or-more yields {a, b, c}.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_pp_chain(&fluree, "it/sparql:nested-mod").await;
+
+    // `((ex:p)*)*` ≡ `ex:p*` ≡ {a, b, c}.
+    let star2 = r"PREFIX ex: <http://example.org/>
+        SELECT ?x WHERE { ex:a ((ex:p)*)* ?x }";
+    let r = support::query_sparql(&fluree, &ledger, star2)
+        .await
+        .expect("nested star-of-star");
+    let j = r.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    assert_eq!(
+        normalize_rows(&j),
+        normalize_rows(&json!([["ex:a"], ["ex:b"], ["ex:c"]])),
+        "((p)*)* = p* = full closure incl. start: {j}"
+    );
+
+    // `(ex:p+)?` ≡ `ex:p*` (zero-or-one of one-or-more) — also {a, b, c}.
+    let plus_opt = r"PREFIX ex: <http://example.org/>
+        SELECT ?x WHERE { ex:a (ex:p+)? ?x }";
+    let r2 = support::query_sparql(&fluree, &ledger, plus_opt)
+        .await
+        .expect("plus-then-optional");
+    let j2 = r2.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    assert_eq!(
+        normalize_rows(&j2),
+        normalize_rows(&json!([["ex:a"], ["ex:b"], ["ex:c"]])),
+        "(p+)? = p* : {j2}"
+    );
+
+    // `(ex:p?)?` ≡ `ex:p?` (bounded) — {a, b} only, NOT c.
+    let opt2 = r"PREFIX ex: <http://example.org/>
+        SELECT ?x WHERE { ex:a (ex:p?)? ?x }";
+    let r3 = support::query_sparql(&fluree, &ledger, opt2)
+        .await
+        .expect("optional-of-optional");
+    let j3 = r3.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    assert_eq!(
+        normalize_rows(&j3),
+        normalize_rows(&json!([["ex:a"], ["ex:b"]])),
+        "(p?)? stays bounded at one hop: {j3}"
+    );
+}
+
+#[tokio::test]
+async fn sparql_negated_set_forward_excludes_type() {
+    // W3C `nps_a`: `?s !a ?o`. Data has a type edge (sa→oa) and a plain edge
+    // (sp→op). The negated set excludes rdf:type, so only (sp, op) matches.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/sparql:nps-fwd");
+    let insert = json!({
+        "@context": {"ex": "http://example.org/"},
+        "@graph": [
+            {"@id": "ex:sa", "@type": "ex:oa"},
+            {"@id": "ex:sp", "ex:p": {"@id": "ex:op"}}
+        ]
+    });
+    let ledger = fluree.insert(ledger0, &insert).await.unwrap().ledger;
+
+    let q = r"PREFIX ex: <http://example.org/>
+        SELECT ?s ?o WHERE { ?s !a ?o }";
+    let r = support::query_sparql(&fluree, &ledger, q)
+        .await
+        .expect("negated set forward");
+    let j = r.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    assert_eq!(
+        normalize_rows(&j),
+        normalize_rows(&json!([["ex:sp", "ex:op"]])),
+        "!a excludes the rdf:type edge: {j}"
+    );
+}
+
+/// Seed the W3C nps data: `sd pd od . sr pr or .`
+async fn seed_nps(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
+    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let insert = json!({
+        "@context": {"ex": "http://example.org/"},
+        "@graph": [
+            {"@id": "ex:sd", "ex:pd": {"@id": "ex:od"}},
+            {"@id": "ex:sr", "ex:pr": {"@id": "ex:or"}}
+        ]
+    });
+    fluree.insert(ledger0, &insert).await.unwrap().ledger
+}
+
+#[tokio::test]
+async fn sparql_negated_set_inverse_only() {
+    // W3C `nps_inverse`: `?s !^ex:pr ?o`. Inverse-only set → reversed edges whose
+    // predicate ≠ pr. Only sd-pd-od qualifies → reversed (od, sd). No forward
+    // branch (the sr-pr-or forward edge must NOT appear).
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_nps(&fluree, "it/sparql:nps-inv").await;
+
+    let q = r"PREFIX ex: <http://example.org/>
+        SELECT ?s ?o WHERE { ?s !^ex:pr ?o }";
+    let r = support::query_sparql(&fluree, &ledger, q)
+        .await
+        .expect("negated set inverse");
+    let j = r.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    assert_eq!(
+        normalize_rows(&j),
+        normalize_rows(&json!([["ex:od", "ex:sd"]])),
+        "!^pr = reversed non-pr edges: {j}"
+    );
+}
+
+#[tokio::test]
+async fn sparql_negated_set_direct_and_inverse() {
+    // W3C `nps_direct_and_inverse`: `?s !(ex:pd|^ex:pr) ?o` = UNION of the forward
+    // branch (edges with pred ≠ pd → sr,or) and the inverse branch (reversed
+    // edges with pred ≠ pr → od,sd).
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_nps(&fluree, "it/sparql:nps-mixed").await;
+
+    let q = r"PREFIX ex: <http://example.org/>
+        SELECT ?s ?o WHERE { ?s !(ex:pd|^ex:pr) ?o }";
+    let r = support::query_sparql(&fluree, &ledger, q)
+        .await
+        .expect("negated set mixed");
+    let j = r.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    assert_eq!(
+        normalize_rows(&j),
+        normalize_rows(&json!([["ex:od", "ex:sd"], ["ex:sr", "ex:or"]])),
+        "mixed negated set unions both directions: {j}"
+    );
+}
+
+#[tokio::test]
+async fn sparql_zero_or_one_object_var() {
+    // `:a :p? ?o` — zero-length (a itself) plus one direct hop (b). NOT c.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_pp_chain(&fluree, "it/sparql:zoo-obj").await;
+
+    let q = r"PREFIX ex: <http://example.org/>
+        SELECT ?o WHERE { ex:a ex:p? ?o }";
+    let r = support::query_sparql(&fluree, &ledger, q)
+        .await
+        .expect("zero-or-one object var");
+    let j = r.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    assert_eq!(
+        normalize_rows(&j),
+        normalize_rows(&json!([["ex:a"], ["ex:b"]])),
+        "a p? ?o = {{a, b}}, not the transitive c: {j}"
+    );
+}
+
+#[tokio::test]
+async fn sparql_zero_or_one_subject_var() {
+    // `?s :p? :b` — zero-length (b itself) plus one direct predecessor (a).
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_pp_chain(&fluree, "it/sparql:zoo-subj").await;
+
+    let q = r"PREFIX ex: <http://example.org/>
+        SELECT ?s WHERE { ?s ex:p? ex:b }";
+    let r = support::query_sparql(&fluree, &ledger, q)
+        .await
+        .expect("zero-or-one subject var");
+    let j = r.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    assert_eq!(
+        normalize_rows(&j),
+        normalize_rows(&json!([["ex:a"], ["ex:b"]])),
+        "?s p? b = {{a, b}}: {j}"
+    );
+}
+
+#[tokio::test]
+async fn sparql_zero_or_one_both_bound() {
+    // `:a :p? :b` is true (one hop); `:a :p? :c` is false (needs two hops);
+    // `:a :p? :a` is true (zero-length).
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_pp_chain(&fluree, "it/sparql:zoo-both").await;
+
+    for (s, o, expect) in [
+        ("ex:a", "ex:b", true),
+        ("ex:a", "ex:c", false),
+        ("ex:a", "ex:a", true),
+    ] {
+        let q = format!(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?x WHERE {{ {s} ex:p? {o} . BIND(1 AS ?x) }}"
+        );
+        let r = support::query_sparql(&fluree, &ledger, &q)
+            .await
+            .expect("zero-or-one both bound");
+        let j = r.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+        let rows = normalize_rows(&j).len();
+        assert_eq!(
+            rows == 1,
+            expect,
+            "{s} p? {o} expected reachable={expect}, got {rows} rows: {j}"
+        );
+    }
+}
