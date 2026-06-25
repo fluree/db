@@ -486,7 +486,9 @@ fn property_value_binding(val: FlakeValue, dt: Sid, lang: Option<String>) -> Bin
 /// several). Excludes `rdf:type`, the `f:reifies*` bundle, and relationship
 /// (ref) edges.
 fn subject_data_properties(ctx: &ExecutionContext<'_>, subject: &Sid) -> Result<Vec<DataProperty>> {
-    Ok(data_properties_from_flakes(subject_all_flakes(ctx, subject)?))
+    Ok(data_properties_from_flakes(subject_all_flakes(
+        ctx, subject,
+    )?))
 }
 
 /// Policy-filtered counterpart of [`subject_data_properties`].

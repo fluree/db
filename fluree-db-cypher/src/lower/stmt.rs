@@ -660,7 +660,9 @@ fn expr_touches_list<E: IriEncoder>(
         Expr::Index(a, b, _) => {
             expr_touches_list(ctx, a, list_outputs) || expr_touches_list(ctx, b, list_outputs)
         }
-        Expr::List(items, _) => items.iter().any(|e| expr_touches_list(ctx, e, list_outputs)),
+        Expr::List(items, _) => items
+            .iter()
+            .any(|e| expr_touches_list(ctx, e, list_outputs)),
         Expr::Map(entries, _) => entries
             .iter()
             .any(|(_, v)| expr_touches_list(ctx, v, list_outputs)),
@@ -700,10 +702,9 @@ fn expr_touches_list<E: IriEncoder>(
         }),
         // A pattern comprehension is its own subquery scope; its body does not
         // reference outer collect outputs by variable in a way the sort sees.
-        Expr::PatternComprehension(_)
-        | Expr::Lit(_)
-        | Expr::Param(_)
-        | Expr::Exists(_, _, _) => false,
+        Expr::PatternComprehension(_) | Expr::Lit(_) | Expr::Param(_) | Expr::Exists(_, _, _) => {
+            false
+        }
     }
 }
 

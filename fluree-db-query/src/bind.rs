@@ -217,17 +217,16 @@ impl Operator for BindOperator {
                 // Under an active non-root policy, resolve Cypher metadata reads
                 // through the policy-filtered async path before evaluating; the
                 // synchronous readers are fail-closed there.
-                let expr: std::borrow::Cow<'_, Expression> =
-                    if self.has_metadata && !ctx.allow_unfiltered() {
-                        std::borrow::Cow::Owned(
-                            crate::eval::metadata_resolve::resolve_row_metadata(
-                                &expr, &row_view, ctx,
-                            )
+                let expr: std::borrow::Cow<'_, Expression> = if self.has_metadata
+                    && !ctx.allow_unfiltered()
+                {
+                    std::borrow::Cow::Owned(
+                        crate::eval::metadata_resolve::resolve_row_metadata(&expr, &row_view, ctx)
                             .await?,
-                        )
-                    } else {
-                        expr
-                    };
+                    )
+                } else {
+                    expr
+                };
 
                 // Evaluate expression. Non-strict mode still propagates fatal
                 // execution issues such as dictionary lookup failures.

@@ -22,7 +22,9 @@ use crate::binding::{Binding, RowAccess};
 use crate::context::ExecutionContext;
 use crate::error::Result;
 use crate::eval::iter::RowWithLocals;
-use crate::eval::metadata::{eval_metadata_call_async, eval_node_property_async, is_metadata_function};
+use crate::eval::metadata::{
+    eval_metadata_call_async, eval_node_property_async, is_metadata_function,
+};
 use crate::ir::expression::ListPredicateKind;
 use crate::ir::{Expression, FlakeValue};
 use std::future::Future;
