@@ -23,6 +23,7 @@
 //! multi-valued — the operator falls back to the exact normal pipeline, so
 //! general graph-source semantics are unchanged.
 
+use crate::aggregate::NumericAcc;
 use crate::binding::{Batch, Binding};
 use crate::context::ExecutionContext;
 use crate::error::{QueryError, Result};
@@ -32,11 +33,39 @@ use crate::operator::{BoxedOperator, Operator, OperatorState};
 use crate::r2rml::rewrite_patterns_for_r2rml;
 use crate::var_registry::VarId;
 use async_trait::async_trait;
+use bigdecimal::num_bigint::BigInt;
+use bigdecimal::BigDecimal;
 use fluree_db_core::{FlakeValue, Sid};
 use fluree_db_r2rml::mapping::{CompiledR2rmlMapping, ObjectMap, TriplesMap};
 use fluree_db_tabular::Column;
 use futures::StreamExt;
 use std::sync::Arc;
+
+/// Result numeric kind for a SUM/AVG fold, from the object map's declared
+/// datatype (the binding path types the result by datatype, not by the parquet
+/// physical type).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NumKind {
+    Decimal,
+    Integer,
+    Double,
+}
+
+/// Classify an object map's declared datatype IRI into a fold kind, or `None`
+/// (not a foldable numeric → fall back).
+fn numeric_kind(datatype: Option<&str>) -> Option<NumKind> {
+    use fluree_vocab::xsd;
+    let dt = datatype?;
+    if dt == xsd::DECIMAL {
+        Some(NumKind::Decimal)
+    } else if dt == xsd::INTEGER || dt == xsd::LONG || dt == xsd::INT {
+        Some(NumKind::Integer)
+    } else if dt == xsd::DOUBLE || dt == xsd::FLOAT {
+        Some(NumKind::Double)
+    } else {
+        None
+    }
+}
 
 /// A detected fused-aggregate plan: the enclosing graph IRI, the inner triple
 /// patterns (rewritten to R2RML at `open`), and the per-output aggregate
@@ -52,6 +81,13 @@ pub struct FusedAggregatePlan {
 /// HAVING, post-binds, ordering, or slicing. Whether the graph is actually R2RML
 /// (and whether the triples collapse to one scan) is checked at `open`.
 pub fn detect_fused_r2rml_aggregate(query: &Query) -> Option<FusedAggregatePlan> {
+    // Kill switch (A/B and incident response): force the normal pipeline.
+    if matches!(
+        std::env::var("FLUREE_FUSED_R2RML_AGG").as_deref(),
+        Ok("0" | "false")
+    ) {
+        return None;
+    }
     if !query.ordering.is_empty()
         || !query.order_binds.is_empty()
         || query.limit.is_some()
@@ -81,10 +117,16 @@ pub fn detect_fused_r2rml_aggregate(query: &Query) -> Option<FusedAggregatePlan>
         _ => return None,
     };
 
-    // Every aggregate must be a COUNT this operator can fold from a column.
+    // Every aggregate must be a column fold this operator supports.
     let mut aggregates = Vec::with_capacity(aggregation.aggregates.len());
     for spec in aggregation.aggregates.iter() {
-        if !matches!(spec.function, AggregateFn::CountAll | AggregateFn::Count(_)) {
+        if !matches!(
+            spec.function,
+            AggregateFn::CountAll
+                | AggregateFn::Count(_)
+                | AggregateFn::Sum(_, _)
+                | AggregateFn::Avg(_, _)
+        ) {
             return None;
         }
         aggregates.push((spec.output_var, spec.function.clone()));
@@ -112,6 +154,162 @@ enum Fold {
     CountRows,
     /// `COUNT(?col)` — count non-null values of this table column.
     CountColumn(String),
+    /// `SUM(?col)` / `AVG(?col)` — reduce the numeric column natively (result
+    /// typed by the column's declared datatype, not its physical type).
+    Numeric {
+        column: String,
+        kind: NumKind,
+        is_avg: bool,
+    },
+}
+
+/// Running accumulator for one [`Fold`], mutated per batch in `next_batch`.
+enum Acc {
+    Count(u64),
+    /// Exact (decimal/integer) sum: unscaled i128 total + the decimal scale seen
+    /// (0 for integers) + non-null count.
+    Exact {
+        sum: i128,
+        scale: i64,
+        decimal: bool,
+        count: u64,
+        is_avg: bool,
+    },
+    /// Floating sum.
+    Double { sum: f64, count: u64, is_avg: bool },
+}
+
+impl Acc {
+    fn for_fold(fold: &Fold) -> Self {
+        match fold {
+            Fold::CountRows | Fold::CountColumn(_) => Acc::Count(0),
+            Fold::Numeric {
+                kind: NumKind::Double,
+                is_avg,
+                ..
+            } => Acc::Double {
+                sum: 0.0,
+                count: 0,
+                is_avg: *is_avg,
+            },
+            Fold::Numeric { kind, is_avg, .. } => Acc::Exact {
+                sum: 0,
+                scale: 0,
+                decimal: matches!(kind, NumKind::Decimal),
+                count: 0,
+                is_avg: *is_avg,
+            },
+        }
+    }
+
+    /// Fold one batch's column into this accumulator.
+    fn update(&mut self, fold: &Fold, batch: &fluree_db_tabular::ColumnBatch) {
+        match (self, fold) {
+            (Acc::Count(n), Fold::CountRows) => *n += batch.num_rows as u64,
+            (Acc::Count(n), Fold::CountColumn(col)) => {
+                if let Some(c) = batch.column_by_name(col) {
+                    *n += non_null_count(c) as u64;
+                }
+            }
+            (
+                Acc::Exact {
+                    sum, scale, count, ..
+                },
+                Fold::Numeric { column, .. },
+            ) => {
+                if let Some(c) = batch.column_by_name(column) {
+                    accumulate_exact(c, sum, scale, count);
+                }
+            }
+            (Acc::Double { sum, count, .. }, Fold::Numeric { column, .. }) => {
+                if let Some(c) = batch.column_by_name(column) {
+                    accumulate_double(c, sum, count);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Materialize the final result binding for this accumulator.
+    fn finalize(self) -> Binding {
+        match self {
+            Acc::Count(n) => Binding::lit(FlakeValue::Long(n as i64), Sid::xsd_integer()),
+            Acc::Exact {
+                sum,
+                scale,
+                decimal,
+                count,
+                is_avg,
+            } => {
+                let big = BigDecimal::new(BigInt::from(sum), scale);
+                let acc = NumericAcc::from_exact_total(big, count, decimal);
+                if is_avg {
+                    acc.finalize_avg()
+                } else {
+                    acc.finalize_sum()
+                }
+            }
+            Acc::Double {
+                sum,
+                count,
+                is_avg,
+            } => {
+                let acc = NumericAcc::from_double_total(sum, count);
+                if is_avg {
+                    acc.finalize_avg()
+                } else {
+                    acc.finalize_sum()
+                }
+            }
+        }
+    }
+}
+
+/// Sum a numeric column's values into an exact i128 accumulator, capturing the
+/// decimal scale. Decimal columns carry their scale; integer/date columns are
+/// scale 0.
+fn accumulate_exact(col: &Column, sum: &mut i128, scale: &mut i64, count: &mut u64) {
+    match col {
+        Column::Decimal { values, scale: s, .. } => {
+            *scale = *s as i64;
+            for v in values.iter().flatten() {
+                *sum += *v;
+                *count += 1;
+            }
+        }
+        Column::Int64(values) => {
+            for v in values.iter().flatten() {
+                *sum += *v as i128;
+                *count += 1;
+            }
+        }
+        Column::Int32(values) | Column::Date(values) => {
+            for v in values.iter().flatten() {
+                *sum += *v as i128;
+                *count += 1;
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Sum a numeric column's values into an f64 accumulator (xsd:double/float).
+fn accumulate_double(col: &Column, sum: &mut f64, count: &mut u64) {
+    match col {
+        Column::Float64(values) => {
+            for v in values.iter().flatten() {
+                *sum += *v;
+                *count += 1;
+            }
+        }
+        Column::Float32(values) => {
+            for v in values.iter().flatten() {
+                *sum += *v as f64;
+                *count += 1;
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Resolved fused plan (post-`open`): the rewritten scan pattern, the table to
@@ -168,10 +366,14 @@ impl FusedR2rmlAggregateOperator {
         }
     }
 
-    /// Resolve the single scalar column a variable's predicate maps to, or `None`
-    /// (gate fail) for a RefObjectMap join, a multi-valued predicate, or a
-    /// non-column object map.
-    fn scalar_column_for_var(pattern: &R2rmlPattern, tm: &TriplesMap, var: VarId) -> Option<String> {
+    /// Resolve the single scalar column (and its declared datatype) a variable's
+    /// predicate maps to, or `None` (gate fail) for a RefObjectMap join, a
+    /// multi-valued predicate, or a non-column object map.
+    fn scalar_column_for_var(
+        pattern: &R2rmlPattern,
+        tm: &TriplesMap,
+        var: VarId,
+    ) -> Option<(String, Option<String>)> {
         let pred = Self::predicate_for_var(pattern, var)?;
         let mut poms = tm
             .predicate_object_maps
@@ -181,7 +383,9 @@ impl FusedR2rmlAggregateOperator {
             return None; // missing or multi-valued predicate
         };
         match &pom.object_map {
-            ObjectMap::Column { column, .. } => Some(column.clone()),
+            ObjectMap::Column {
+                column, datatype, ..
+            } => Some((column.clone(), datatype.clone())),
             _ => None, // RefObjectMap / Template / Constant
         }
     }
@@ -255,7 +459,7 @@ impl Operator for FusedR2rmlAggregateOperator {
         } else {
             tracing::debug!(
                 aggs = self.aggregates.len(),
-                "fused R2RML aggregate: folding COUNT from column batches"
+                "fused R2RML aggregate: folding from column batches"
             );
         }
         self.state = OperatorState::Open;
@@ -283,7 +487,7 @@ impl Operator for FusedR2rmlAggregateOperator {
             Some(ctx.to_t)
         };
 
-        let mut counts = vec![0u64; resolved.folds.len()];
+        let mut accs: Vec<Acc> = resolved.folds.iter().map(Acc::for_fold).collect();
         let mut stream = table_provider
             .scan_table(
                 &resolved.pattern.graph_source_id,
@@ -295,23 +499,15 @@ impl Operator for FusedR2rmlAggregateOperator {
             .await?;
         while let Some(batch) = stream.next().await {
             let batch = batch?;
-            for (i, fold) in resolved.folds.iter().enumerate() {
-                match fold {
-                    Fold::CountRows => counts[i] += batch.num_rows as u64,
-                    Fold::CountColumn(col) => {
-                        if let Some(c) = batch.column_by_name(col) {
-                            counts[i] += non_null_count(c) as u64;
-                        }
-                    }
-                }
+            for (acc, fold) in accs.iter_mut().zip(resolved.folds.iter()) {
+                acc.update(fold, &batch);
             }
             ctx.tracker.consume_fuel(1)?;
         }
 
-        let columns: Vec<Vec<Binding>> = counts
-            .iter()
-            .map(|&n| vec![Binding::lit(FlakeValue::Long(n as i64), Sid::xsd_integer())])
-            .collect();
+        // Materialize the single result row (the only bindings this op creates).
+        let columns: Vec<Vec<Binding>> =
+            accs.into_iter().map(|acc| vec![acc.finalize()]).collect();
         self.done = true;
         self.state = OperatorState::Exhausted;
         Ok(Some(Batch::new(Arc::clone(&self.schema), columns)?))
@@ -364,11 +560,27 @@ impl FusedR2rmlAggregateOperator {
             match func {
                 AggregateFn::CountAll => folds.push(Fold::CountRows),
                 AggregateFn::Count(v) => {
-                    let Some(col) = Self::scalar_column_for_var(&pattern, tm, *v) else {
+                    let Some((col, _)) = Self::scalar_column_for_var(&pattern, tm, *v) else {
                         return Ok(None);
                     };
                     projection.push(col.clone());
                     folds.push(Fold::CountColumn(col));
+                }
+                AggregateFn::Sum(v, _) | AggregateFn::Avg(v, _) => {
+                    let Some((col, datatype)) = Self::scalar_column_for_var(&pattern, tm, *v) else {
+                        return Ok(None);
+                    };
+                    // Only numeric declared datatypes fold; anything else (string,
+                    // date, untyped) goes to the fallback.
+                    let Some(kind) = numeric_kind(datatype.as_deref()) else {
+                        return Ok(None);
+                    };
+                    projection.push(col.clone());
+                    folds.push(Fold::Numeric {
+                        column: col,
+                        kind,
+                        is_avg: matches!(func, AggregateFn::Avg(_, _)),
+                    });
                 }
                 _ => return Ok(None),
             }
@@ -459,5 +671,35 @@ mod tests {
         let mut q = count_query(vec![], vec![graph_triple(s, o)], c, o);
         q.limit = Some(1);
         assert!(detect_fused_r2rml_aggregate(&q).is_none());
+    }
+
+    #[test]
+    fn detects_sum_and_avg_shapes() {
+        use crate::ir::grouping::InputSemantics;
+        let (s, o, out) = (VarId(0), VarId(1), VarId(2));
+        for func in [
+            AggregateFn::Sum(o, InputSemantics::List),
+            AggregateFn::Avg(o, InputSemantics::List),
+        ] {
+            let agg = AggregateSpec {
+                function: func,
+                output_var: out,
+            };
+            let q = Query {
+                context: ParsedContext::default(),
+                orig_context: None,
+                output: QueryOutput::select_all(vec![out]),
+                patterns: vec![graph_triple(s, o)],
+                reasoning: ReasoningConfig::default(),
+                grouping: Grouping::assemble(vec![], vec![agg], vec![], None),
+                ordering: Vec::new(),
+                order_binds: Vec::new(),
+                limit: None,
+                offset: None,
+                post_values: None,
+                include_system_facts: false,
+            };
+            assert!(detect_fused_r2rml_aggregate(&q).is_some());
+        }
     }
 }
