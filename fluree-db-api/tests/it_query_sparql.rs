@@ -5136,6 +5136,107 @@ async fn seed_pp_chain(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
     fluree.insert(ledger0, &insert).await.unwrap().ledger
 }
 
+/// Seed `a -p-> m -q-> b -p-> n -q-> c`: an alternating two-predicate chain so
+/// each `(ex:p/ex:q)` hop advances a→b→c.
+async fn seed_composite_chain(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
+    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let insert = json!({
+        "@context": {"ex": "http://example.org/"},
+        "@graph": [
+            {"@id": "ex:a", "ex:p": {"@id": "ex:m"}},
+            {"@id": "ex:m", "ex:q": {"@id": "ex:b"}},
+            {"@id": "ex:b", "ex:p": {"@id": "ex:n"}},
+            {"@id": "ex:n", "ex:q": {"@id": "ex:c"}}
+        ]
+    });
+    fluree.insert(ledger0, &insert).await.unwrap().ledger
+}
+
+#[tokio::test]
+async fn sparql_composite_transitive_sequence() {
+    // W3C `pp02` shape: transitive over a sequence. `(ex:p/ex:q)+` from a walks
+    // one composite hop to b, two to c → {b, c}. The intermediate m, n nodes are
+    // not endpoints.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_composite_chain(&fluree, "it/sparql:composite").await;
+
+    let plus = r"PREFIX ex: <http://example.org/>
+        SELECT ?x WHERE { ex:a (ex:p/ex:q)+ ?x }";
+    let r = support::query_sparql(&fluree, &ledger, plus)
+        .await
+        .expect("composite +");
+    let j = r.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    assert_eq!(
+        normalize_rows(&j),
+        normalize_rows(&json!([["ex:b"], ["ex:c"]])),
+        "(p/q)+ from a = {{b, c}}: {j}"
+    );
+
+    // `*` includes the zero-length start.
+    let star = r"PREFIX ex: <http://example.org/>
+        SELECT ?x WHERE { ex:a (ex:p/ex:q)* ?x }";
+    let r2 = support::query_sparql(&fluree, &ledger, star)
+        .await
+        .expect("composite *");
+    let j2 = r2.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    assert_eq!(
+        normalize_rows(&j2),
+        normalize_rows(&json!([["ex:a"], ["ex:b"], ["ex:c"]])),
+        "(p/q)* from a includes start: {j2}"
+    );
+
+    // `?` is the start plus exactly one composite hop.
+    let opt = r"PREFIX ex: <http://example.org/>
+        SELECT ?x WHERE { ex:a (ex:p/ex:q)? ?x }";
+    let r3 = support::query_sparql(&fluree, &ledger, opt)
+        .await
+        .expect("composite ?");
+    let j3 = r3.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    assert_eq!(
+        normalize_rows(&j3),
+        normalize_rows(&json!([["ex:a"], ["ex:b"]])),
+        "(p/q)? = start + one hop: {j3}"
+    );
+}
+
+#[tokio::test]
+async fn sparql_composite_transitive_backward_and_both_bound() {
+    // Subject-var (backward) and both-bound (reachability) modes over a composite
+    // hop.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_composite_chain(&fluree, "it/sparql:composite-bwd").await;
+
+    // `?s (ex:p/ex:q)+ ex:c` — who reaches c? a (2 hops) and b (1 hop).
+    let bwd = r"PREFIX ex: <http://example.org/>
+        SELECT ?s WHERE { ?s (ex:p/ex:q)+ ex:c }";
+    let r = support::query_sparql(&fluree, &ledger, bwd)
+        .await
+        .expect("composite backward");
+    let j = r.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    assert_eq!(
+        normalize_rows(&j),
+        normalize_rows(&json!([["ex:a"], ["ex:b"]])),
+        "?s (p/q)+ c = {{a, b}}: {j}"
+    );
+
+    // Both bound: a reaches c (true), a reaches n (false — n is mid-hop).
+    for (o, expect) in [("ex:c", true), ("ex:n", false)] {
+        let q = format!(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?x WHERE {{ ex:a (ex:p/ex:q)+ {o} . BIND(1 AS ?x) }}"
+        );
+        let rr = support::query_sparql(&fluree, &ledger, &q)
+            .await
+            .expect("composite both-bound");
+        let jj = rr.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+        assert_eq!(
+            normalize_rows(&jj).len() == 1,
+            expect,
+            "a (p/q)+ {o} expected reachable={expect}: {jj}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn sparql_nested_modifier_star_of_star() {
     // W3C `pp37` shape: `((:p)*)*` collapses to `:p*`. From a (a→b→c chain),

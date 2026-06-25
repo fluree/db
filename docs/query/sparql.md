@@ -180,6 +180,14 @@ A negated set matches any predicate **not** listed. Forward members (`ex:a`) con
 
 **Nested modifiers** collapse algebraically: `((ex:p)*)*` ≡ `ex:p*`, `(ex:p+)?` ≡ `ex:p*`, and `(ex:p?)?` ≡ `ex:p?`.
 
+**Transitive over a sequence (`(p1/p2/…)+`):**
+
+```sparql
+?person (ex:parent/ex:knows)+ ?reached .
+```
+
+A `+`, `*`, or `?` modifier can be applied to a forward sequence: each hop follows the entire sub-path. `(ex:p/ex:q)+` repeatedly follows `ex:p` then `ex:q`; `*` adds the zero-length start, `?` is the start plus exactly one composite hop. Sequence steps may themselves be alternations of simple predicates (`(ex:a/(ex:b|ex:c))+`).
+
 **Inverse (`^`):**
 
 ```sparql
@@ -262,7 +270,7 @@ Multiple alternative steps are supported: `(ex:a|ex:b)/(ex:c|ex:d)` expands to 4
 
 #### Not Yet Supported
 
-A transitive or optional modifier applied to a **composite** sub-path (a sequence or nested non-simple expression) is not yet supported — for example `(ex:a/ex:b)+`, `(ex:a/ex:b)*`, or `(ex:a/ex:b)?`. The transitive operators require a simple predicate or an alternation of simple predicates (`(ex:a|ex:b)+`, which **is** supported). Workaround: materialize the composite edge into a single predicate, or expand a known-depth path into a `UNION` of fixed-length joins.
+An **inverse** step inside a composite repeated unit is not yet supported — for example `(^ex:a/ex:b)+`, where one step of the repeated sub-path runs backward. Composite-transitive paths currently require all steps to be forward (`(ex:a/ex:b)+`) or alternations of forward predicates (`(ex:a/(ex:b|ex:c))+`). Workaround: rewrite the unit so each repeated step is forward, or expand a known-depth path into a `UNION` of fixed-length joins.
 
 ## Query Modifiers
 

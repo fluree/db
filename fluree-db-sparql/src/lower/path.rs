@@ -84,12 +84,24 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                 // predicates. `inner` is consumed via `innermost` below.
                 let _ = inner;
                 let ((zero, unbounded), innermost) = Self::collapse_modifiers(effective_path);
-                let iris = self.extract_transitive_predicate_iris(innermost, span)?;
                 let modifier = match (unbounded, zero) {
                     (true, true) => PathModifier::ZeroOrMore,
                     (true, false) => PathModifier::OneOrMore,
                     (false, _) => PathModifier::ZeroOrOne,
                 };
+
+                // Composite (sequence) inner — `(p1/p2/…)+` — becomes a
+                // composite-transitive path whose every hop follows the whole
+                // forward sub-path. A single-step or alternation inner takes the
+                // simpler alternation-transitive form below.
+                if matches!(innermost, SparqlPropertyPath::Sequence { .. }) {
+                    let steps = self.extract_composite_steps(innermost, span)?;
+                    let pp =
+                        PropertyPathPattern::new_composite(s.clone(), steps, modifier, o.clone());
+                    return Ok(vec![Pattern::PropertyPath(pp)]);
+                }
+
+                let iris = self.extract_transitive_predicate_iris(innermost, span)?;
                 let mut predicate_sids = Vec::with_capacity(iris.len());
                 for iri in &iris {
                     predicate_sids.push(
@@ -885,6 +897,36 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
             }
             _ => Ok(vec![self.extract_simple_predicate_iri(unwrapped, span)?]),
         }
+    }
+
+    /// Extract the per-step predicate Sid sets for a composite-transitive path
+    /// `(p1/p2/…)+`. Each sequence step must be a simple predicate or an
+    /// alternation of simple predicates (forward only); inverse steps, nested
+    /// transitives, or further sequences are rejected (not yet supported).
+    fn extract_composite_steps(
+        &mut self,
+        path: &SparqlPropertyPath,
+        span: SourceSpan,
+    ) -> Result<Vec<Vec<fluree_db_core::Sid>>> {
+        let mut step_paths = Vec::new();
+        Self::flatten_sequence(path, &mut step_paths);
+        let mut steps = Vec::with_capacity(step_paths.len());
+        for step in step_paths {
+            // Reuse the transitive extractor: it accepts a simple predicate or
+            // an alternation of simple predicates and rejects everything else
+            // (inverse, sequence, nested modifier) with a clear error.
+            let iris = self.extract_transitive_predicate_iris(step, span)?;
+            let mut sids = Vec::with_capacity(iris.len());
+            for iri in &iris {
+                sids.push(
+                    self.encoder
+                        .encode_iri(iri)
+                        .ok_or_else(|| LowerError::unknown_namespace(iri, span))?,
+                );
+            }
+            steps.push(sids);
+        }
+        Ok(steps)
     }
 
     fn extract_simple_predicate_iri(

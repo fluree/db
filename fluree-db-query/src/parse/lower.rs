@@ -647,12 +647,22 @@ fn lower_path_to_patterns<E: IriEncoder>(
             // Collapse directly-nested modifiers (`((p)*)*`, `(p+)?`, …) to one
             // modifier over the innermost path. See `collapse_path_modifiers`.
             let ((zero, unbounded), innermost) = collapse_path_modifiers(effective_path);
-            let iris = extract_transitive_predicate_iris(innermost)?;
             let modifier = match (unbounded, zero) {
                 (true, true) => PathModifier::ZeroOrMore,
                 (true, false) => PathModifier::OneOrMore,
                 (false, _) => PathModifier::ZeroOrOne,
             };
+
+            // Composite (sequence) inner — `(p1/p2/…)+` — each hop follows the
+            // whole forward sub-path.
+            if let UnresolvedPathExpr::Sequence(steps) = innermost {
+                let composite = extract_composite_path_steps(steps, encoder)?;
+                return Ok(vec![Pattern::PropertyPath(
+                    PropertyPathPattern::new_composite(s, composite, modifier, o),
+                )]);
+            }
+
+            let iris = extract_transitive_predicate_iris(innermost)?;
             let mut predicates = Vec::with_capacity(iris.len());
             for iri in iris {
                 predicates.push(
@@ -1231,6 +1241,29 @@ fn expect_simple_iri(path: &UnresolvedPathExpr) -> Result<&Arc<str>> {
             "Transitive paths (+ or *) currently require a simple predicate IRI".to_string(),
         )),
     }
+}
+
+/// Resolve the per-step predicate Sid sets of a composite-transitive path
+/// `(p1/p2/…)+`. Each step must be a simple predicate or an alternation of
+/// simple predicates (forward only); other step shapes are rejected.
+fn extract_composite_path_steps<E: IriEncoder>(
+    steps: &[UnresolvedPathExpr],
+    encoder: &E,
+) -> Result<Vec<Vec<fluree_db_core::Sid>>> {
+    let mut out = Vec::with_capacity(steps.len());
+    for step in steps {
+        let iris = extract_transitive_predicate_iris(step)?;
+        let mut sids = Vec::with_capacity(iris.len());
+        for iri in iris {
+            sids.push(
+                encoder
+                    .encode_iri(iri)
+                    .ok_or_else(|| ParseError::UnknownNamespace(iri.to_string()))?,
+            );
+        }
+        out.push(sids);
+    }
+    Ok(out)
 }
 
 /// Lower an unresolved subquery to a resolved SubqueryPattern

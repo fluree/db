@@ -139,57 +139,110 @@ impl PropertyPathOperator {
         self
     }
 
-    /// One forward hop from `node`: the ref objects of `(node, p, ?)` for every
-    /// traversed predicate (their union, for an alternation path `(a|b)*`).
+    /// One forward hop from `node`. For a simple/alternation path this is the
+    /// ref objects of `(node, p, ?)` over every traversed predicate. For a
+    /// composite path `(p1/p2/…)+` it follows the whole sub-path — step 1
+    /// (`predicates`) then each `sequence_steps` entry — and returns the set of
+    /// nodes reachable by exactly one composite hop.
     async fn forward_step(&self, ctx: &ExecutionContext<'_>, node: &Sid) -> Result<Vec<Sid>> {
+        let mut frontier = self
+            .step_forward(ctx, std::slice::from_ref(node), &self.pattern.predicates)
+            .await?;
+        for step in &self.pattern.sequence_steps {
+            if frontier.is_empty() {
+                break;
+            }
+            frontier = self.step_forward(ctx, &frontier, step).await?;
+        }
+        Ok(frontier)
+    }
+
+    /// One backward hop into `node`: the sources from which a single (composite)
+    /// hop reaches `node`. Walks a composite unit in reverse — last sequence
+    /// step first, `predicates` last.
+    async fn backward_step(&self, ctx: &ExecutionContext<'_>, node: &Sid) -> Result<Vec<Sid>> {
+        let mut frontier = vec![node.clone()];
+        for step in self.pattern.sequence_steps.iter().rev() {
+            frontier = self.step_backward(ctx, &frontier, step).await?;
+            if frontier.is_empty() {
+                return Ok(frontier);
+            }
+        }
+        self.step_backward(ctx, &frontier, &self.pattern.predicates)
+            .await
+    }
+
+    /// Advance a frontier one forward step: the deduped union of ref objects of
+    /// `(n, p, ?)` for every `n` in `nodes` and every predicate in `preds`.
+    async fn step_forward(
+        &self,
+        ctx: &ExecutionContext<'_>,
+        nodes: &[Sid],
+        preds: &[Sid],
+    ) -> Result<Vec<Sid>> {
         let (db, overlay, to_t) = ctx.require_single_graph()?;
         let mut out = Vec::new();
-        for pred in &self.pattern.predicates {
-            let range_match = RangeMatch::new()
-                .with_subject(node.clone())
-                .with_predicate(pred.clone());
-            let flakes = range_with_overlay(
-                db,
-                ctx.binary_g_id,
-                overlay,
-                IndexType::Spot,
-                RangeTest::Eq,
-                range_match,
-                RangeOptions::new().with_to_t(to_t),
-            )
-            .await?;
-            let flakes = self.filter_edges(ctx, flakes).await?;
-            for flake in flakes {
-                if let FlakeValue::Ref(o) = flake.o {
-                    out.push(o);
+        let mut seen: HashSet<Sid> = HashSet::new();
+        for node in nodes {
+            for pred in preds {
+                let range_match = RangeMatch::new()
+                    .with_subject(node.clone())
+                    .with_predicate(pred.clone());
+                let flakes = range_with_overlay(
+                    db,
+                    ctx.binary_g_id,
+                    overlay,
+                    IndexType::Spot,
+                    RangeTest::Eq,
+                    range_match,
+                    RangeOptions::new().with_to_t(to_t),
+                )
+                .await?;
+                let flakes = self.filter_edges(ctx, flakes).await?;
+                for flake in flakes {
+                    if let FlakeValue::Ref(o) = flake.o {
+                        if seen.insert(o.clone()) {
+                            out.push(o);
+                        }
+                    }
                 }
             }
         }
         Ok(out)
     }
 
-    /// One backward hop into `node`: the subjects of `(?, p, node)` for every
-    /// traversed predicate (their union).
-    async fn backward_step(&self, ctx: &ExecutionContext<'_>, node: &Sid) -> Result<Vec<Sid>> {
+    /// Retreat a frontier one backward step: the deduped union of subjects of
+    /// `(?, p, n)` for every `n` in `nodes` and every predicate in `preds`.
+    async fn step_backward(
+        &self,
+        ctx: &ExecutionContext<'_>,
+        nodes: &[Sid],
+        preds: &[Sid],
+    ) -> Result<Vec<Sid>> {
         let (db, overlay, to_t) = ctx.require_single_graph()?;
         let mut out = Vec::new();
-        for pred in &self.pattern.predicates {
-            let range_match = RangeMatch::new()
-                .with_predicate(pred.clone())
-                .with_object(FlakeValue::Ref(node.clone()));
-            let flakes = range_with_overlay(
-                db,
-                ctx.binary_g_id,
-                overlay,
-                IndexType::Post,
-                RangeTest::Eq,
-                range_match,
-                RangeOptions::new().with_to_t(to_t),
-            )
-            .await?;
-            let flakes = self.filter_edges(ctx, flakes).await?;
-            for flake in flakes {
-                out.push(flake.s);
+        let mut seen: HashSet<Sid> = HashSet::new();
+        for node in nodes {
+            for pred in preds {
+                let range_match = RangeMatch::new()
+                    .with_predicate(pred.clone())
+                    .with_object(FlakeValue::Ref(node.clone()));
+                let flakes = range_with_overlay(
+                    db,
+                    ctx.binary_g_id,
+                    overlay,
+                    IndexType::Post,
+                    RangeTest::Eq,
+                    range_match,
+                    RangeOptions::new().with_to_t(to_t),
+                )
+                .await?;
+                let flakes = self.filter_edges(ctx, flakes).await?;
+                for flake in flakes {
+                    if seen.insert(flake.s.clone()) {
+                        out.push(flake.s);
+                    }
+                }
             }
         }
         Ok(out)
@@ -355,6 +408,21 @@ impl PropertyPathOperator {
     ///
     /// Returns pairs (start, reachable) consistent with modifier semantics.
     async fn compute_closure(&self, ctx: &ExecutionContext<'_>) -> Result<Vec<(Sid, Sid)>> {
+        // Composite hops aren't a single readable edge, so the in-memory
+        // adjacency shortcut below doesn't apply. Seed from every node that can
+        // begin a hop (a subject of any first-step predicate) and run the
+        // composite-aware forward traversal from each.
+        if self.pattern.is_composite() {
+            let starts = self.composite_start_candidates(ctx).await?;
+            let mut out = Vec::new();
+            for start in starts {
+                for reachable in self.traverse_forward(ctx, &start).await? {
+                    out.push((start.clone(), reachable));
+                }
+            }
+            return Ok(out);
+        }
+
         // Pull all edges for every traversed predicate using PSOT
         // (predicate-indexed) and merge them into one adjacency map — for an
         // alternation path `(a|b)*` the closure spans both predicates' edges.
@@ -446,6 +514,34 @@ impl PropertyPathOperator {
             }
         }
 
+        Ok(out)
+    }
+
+    /// Distinct subjects of any first-step predicate — the nodes from which a
+    /// composite hop can begin. Used to seed the both-unbound closure.
+    async fn composite_start_candidates(&self, ctx: &ExecutionContext<'_>) -> Result<Vec<Sid>> {
+        let (db, overlay, to_t) = ctx.require_single_graph()?;
+        let mut seen: HashSet<Sid> = HashSet::new();
+        let mut out = Vec::new();
+        for pred in &self.pattern.predicates {
+            let range_match = RangeMatch::predicate(pred.clone());
+            let flakes = range_with_overlay(
+                db,
+                ctx.binary_g_id,
+                overlay,
+                IndexType::Psot,
+                RangeTest::Eq,
+                range_match,
+                RangeOptions::new().with_to_t(to_t),
+            )
+            .await?;
+            let flakes = self.filter_edges(ctx, flakes).await?;
+            for flake in flakes {
+                if seen.insert(flake.s.clone()) {
+                    out.push(flake.s);
+                }
+            }
+        }
         Ok(out)
     }
 

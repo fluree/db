@@ -25,12 +25,18 @@ pub enum PathModifier {
 pub struct PropertyPathPattern {
     /// Subject ref (Var or Sid — literals not allowed)
     pub subject: Ref,
-    /// Predicate(s) to traverse, all resolved to Sids. A single entry is the
-    /// ordinary `p*` / `p+`; multiple entries are an alternation-transitive
-    /// path `(a|b|…)*` — the closure follows an edge of ANY listed predicate at
-    /// each hop (SPARQL `(a|b)*`, Cypher `[:A|B*]`). Never empty.
+    /// Predicate(s) for the first step of each hop, all resolved to Sids. A
+    /// single entry is the ordinary `p*` / `p+`; multiple entries are an
+    /// alternation-transitive path `(a|b|…)*` — the step follows an edge of ANY
+    /// listed predicate (SPARQL `(a|b)*`, Cypher `[:A|B*]`). Never empty.
     pub predicates: Vec<Sid>,
-    /// Path modifier (+ or *)
+    /// Additional forward steps making each hop a composite sub-path
+    /// `(p1/p2/…)+`. Empty for the simple/alternation case. When non-empty, one
+    /// hop follows `predicates` (step 1) then each entry here in order; each
+    /// inner `Vec` is that step's alternation set (so `(a/(b|c))+` is
+    /// `predicates=[a]`, `sequence_steps=[[b, c]]`). All steps are forward.
+    pub sequence_steps: Vec<Vec<Sid>>,
+    /// Path modifier (+, *, or ?)
     pub modifier: PathModifier,
     /// Object ref (Var or Sid — literals not allowed)
     pub object: Ref,
@@ -42,6 +48,7 @@ impl PropertyPathPattern {
         Self {
             subject,
             predicates: vec![predicate],
+            sequence_steps: Vec::new(),
             modifier,
             object,
         }
@@ -60,18 +67,49 @@ impl PropertyPathPattern {
         Self {
             subject,
             predicates,
+            sequence_steps: Vec::new(),
             modifier,
             object,
         }
     }
 
+    /// Create a composite-transitive path `(p1/p2/…)+` from per-step alternation
+    /// sets (`steps[0]` is the first step, etc.). Requires ≥2 steps, each
+    /// non-empty; for a single step use [`Self::new_alternatives`].
+    pub fn new_composite(
+        subject: Ref,
+        mut steps: Vec<Vec<Sid>>,
+        modifier: PathModifier,
+        object: Ref,
+    ) -> Self {
+        debug_assert!(steps.len() >= 2, "composite path needs ≥2 steps");
+        debug_assert!(
+            steps.iter().all(|s| !s.is_empty()),
+            "each composite step needs ≥1 predicate"
+        );
+        let predicates = steps.remove(0);
+        Self {
+            subject,
+            predicates,
+            sequence_steps: steps,
+            modifier,
+            object,
+        }
+    }
+
+    /// True if each hop traverses a composite sub-path (`(a/b)+`) rather than a
+    /// single (possibly alternated) predicate.
+    pub fn is_composite(&self) -> bool {
+        !self.sequence_steps.is_empty()
+    }
+
     /// The single traversed predicate, if this path has exactly one — used by
     /// count/scan fast paths that only handle the single-predicate shape.
-    /// Returns `None` for an alternation path so callers fall back to the
-    /// general traversal operator.
+    /// Returns `None` for an alternation or composite path so callers fall back
+    /// to the general traversal operator.
     pub fn single_predicate(&self) -> Option<&Sid> {
         match self.predicates.as_slice() {
-            [p] => Some(p),
+            [p] if self.sequence_steps.is_empty() => Some(p),
             _ => None,
         }
     }
