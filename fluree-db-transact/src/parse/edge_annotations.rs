@@ -1667,7 +1667,16 @@ fn lower_object_with_subject(
     if is_transaction_wrapper(map) {
         for clause in ["insert", "delete", "upsert"] {
             if let Some(clause_val) = map.get_mut(clause) {
+                // Siblings synthesized while lowering a clause belong to THAT
+                // clause's payload, not the top-level wrapper. Scope the
+                // accumulator to the clause: take it empty, recurse, then
+                // attach whatever this clause produced back onto its own
+                // value. `next_anon_id` stays shared so blank-node ids don't
+                // collide across clauses.
+                let outer = std::mem::take(&mut ctx.siblings);
                 lower_value_with_subject(clause_val, None, walk, ctx)?;
+                let clause_siblings = std::mem::replace(&mut ctx.siblings, outer);
+                attach_siblings(clause_val, clause_siblings);
             }
         }
         return Ok(());
