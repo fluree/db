@@ -666,6 +666,288 @@ impl<'a> FlureeR2rmlProvider<'a> {
             session: std::sync::Arc::new(super::catalog_session::IcebergCatalogSession::default()),
         }
     }
+
+    /// Resolve a graph source's storage backend, parsed table metadata, and
+    /// metadata-location — the shared setup behind both full and incremental
+    /// scans (REST/Direct × GCS/S3 × credentials × caching).
+    ///
+    /// TODO(dedup): `scan_table` still inlines this same setup + the
+    /// `read_scan_tasks` read loop; once the incremental path is verified,
+    /// refactor `scan_table` to call these helpers and drop the duplication.
+    async fn prepare_iceberg_scan(
+        &self,
+        graph_source_id: &str,
+        table_name: &str,
+    ) -> QueryResult<(Arc<S3IcebergStorage>, Arc<TableMetadata>, String)> {
+        // Look up the graph source record to get Iceberg connection info
+        let record = self
+            .fluree
+            .nameservice()
+            .lookup_graph_source(graph_source_id)
+            .await
+            .map_err(|e| QueryError::Internal(format!("Nameservice error: {e}")))?
+            .ok_or_else(|| {
+                QueryError::InvalidQuery(format!("Graph source '{graph_source_id}' not found"))
+            })?;
+
+        let iceberg_config = IcebergGsConfig::from_json(&record.config).map_err(|e| {
+            QueryError::Internal(format!(
+                "Failed to parse Iceberg graph source config for '{graph_source_id}': {e}"
+            ))
+        })?;
+        iceberg_config.validate().map_err(|e| {
+            QueryError::InvalidQuery(format!(
+                "Invalid Iceberg graph source config for '{graph_source_id}': {e}"
+            ))
+        })?;
+
+        use fluree_db_iceberg::catalog::parse_table_identifier;
+        use fluree_db_iceberg::config::CatalogConfig;
+        use fluree_db_iceberg::SendDirectCatalogClient;
+
+        let table_id = if !table_name.is_empty() {
+            parse_table_identifier(table_name).map_err(|e| {
+                QueryError::Internal(format!(
+                    "Failed to parse table identifier '{table_name}': {e}"
+                ))
+            })?
+        } else {
+            iceberg_config.table_identifier().map_err(|e| {
+                QueryError::Internal(format!("Failed to parse table identifier: {e}"))
+            })?
+        };
+
+        let (load_response, storage) = match &iceberg_config.catalog {
+            CatalogConfig::Rest {
+                uri,
+                warehouse,
+                auth,
+                ..
+            } => {
+                let auth_provider = auth.create_provider_arc().map_err(|e| {
+                    QueryError::Internal(format!("Failed to create auth provider: {e}"))
+                })?;
+                let catalog_config = RestCatalogConfig {
+                    uri: uri.clone(),
+                    warehouse: warehouse.clone(),
+                    ..Default::default()
+                };
+                let catalog =
+                    RestCatalogClient::new(catalog_config, auth_provider).map_err(|e| {
+                        QueryError::Internal(format!("Failed to create catalog client: {e}"))
+                    })?;
+                let load_response = catalog
+                    .load_table(&table_id, iceberg_config.io.vended_credentials)
+                    .await
+                    .map_err(|e| {
+                        QueryError::Internal(format!("Failed to load table from catalog: {e}"))
+                    })?;
+                // GCS-backed tables read through this same S3 SDK path; the
+                // client is pinned to HTTP/1.1 (see `S3IcebergStorage`). Vended
+                // creds win, with the io config as fallback for region/endpoint/
+                // path-style.
+                let storage = if let Some(ref credentials) = load_response.credentials {
+                    S3IcebergStorage::from_vended_credentials(
+                        credentials,
+                        iceberg_config.io.s3_region.as_deref(),
+                        iceberg_config.io.s3_endpoint.as_deref(),
+                        iceberg_config.io.s3_path_style,
+                    )
+                    .await
+                    .map_err(|e| {
+                        QueryError::Internal(format!("Failed to create S3 storage: {e}"))
+                    })?
+                } else {
+                    S3IcebergStorage::from_default_chain(
+                        iceberg_config.io.s3_region.as_deref(),
+                        iceberg_config.io.s3_endpoint.as_deref(),
+                        iceberg_config.io.s3_path_style,
+                    )
+                    .await
+                    .map_err(|e| {
+                        QueryError::Internal(format!("Failed to create S3 storage: {e}"))
+                    })?
+                };
+                (load_response, Arc::new(storage))
+            }
+            CatalogConfig::Direct { table_location } => {
+                let storage: Arc<S3IcebergStorage> = Arc::new(
+                    S3IcebergStorage::from_default_chain(
+                        iceberg_config.io.s3_region.as_deref(),
+                        iceberg_config.io.s3_endpoint.as_deref(),
+                        iceberg_config.io.s3_path_style,
+                    )
+                    .await
+                    .map_err(|e| {
+                        QueryError::Internal(format!("Failed to create S3 storage: {e}"))
+                    })?,
+                );
+                let cache = self.fluree.r2rml_cache();
+                let load_response = if let Some(metadata_location) =
+                    cache.get_direct_metadata_location(table_location).await
+                {
+                    fluree_db_iceberg::catalog::LoadTableResponse {
+                        metadata_location,
+                        config: std::collections::HashMap::default(),
+                        credentials: None,
+                    }
+                } else {
+                    let direct_catalog =
+                        SendDirectCatalogClient::new(table_location.clone(), Arc::clone(&storage));
+                    let load_response =
+                        direct_catalog
+                            .load_table(&table_id, false)
+                            .await
+                            .map_err(|e| {
+                                QueryError::Internal(format!(
+                                    "Failed to resolve table metadata from {table_location}: {e}"
+                                ))
+                            })?;
+                    cache
+                        .put_direct_metadata_location(
+                            table_location.clone(),
+                            load_response.metadata_location.clone(),
+                        )
+                        .await;
+                    load_response
+                };
+                (load_response, storage)
+            }
+        };
+
+        let cache = self.fluree.r2rml_cache();
+        let metadata_location = load_response.metadata_location.clone();
+        let metadata = if let Some(cached) = cache.get_metadata(&metadata_location).await {
+            cached
+        } else {
+            let metadata_bytes = storage
+                .as_ref()
+                .read(&metadata_location)
+                .await
+                .map_err(|e| QueryError::Internal(format!("Failed to read table metadata: {e}")))?;
+            let parsed = TableMetadata::from_json(&metadata_bytes).map_err(|e| {
+                QueryError::Internal(format!("Failed to parse table metadata: {e}"))
+            })?;
+            let metadata = Arc::new(parsed);
+            cache
+                .put_metadata(metadata_location.clone(), Arc::clone(&metadata))
+                .await;
+            metadata
+        };
+
+        Ok((storage, metadata, metadata_location))
+    }
+
+    /// Read a set of scan tasks into column batches with bounded parallelism.
+    async fn read_scan_tasks(
+        &self,
+        storage: &Arc<S3IcebergStorage>,
+        tasks: Vec<FileScanTask>,
+    ) -> QueryResult<Vec<ColumnBatch>> {
+        if tasks.is_empty() {
+            return Ok(Vec::new());
+        }
+        let footers = self.fluree.r2rml_cache().parquet_footers();
+        let concurrency = iceberg_scan_concurrency(tasks.len());
+        debug!(
+            files = tasks.len(),
+            concurrency, "reading Parquet files (bounded parallel)"
+        );
+        use futures::stream::{StreamExt, TryStreamExt};
+        let all_batches: Vec<ColumnBatch> = futures::stream::iter(tasks)
+            .map(|task| {
+                let storage = Arc::clone(storage);
+                let footers = Arc::clone(&footers);
+                async move {
+                    tokio::spawn(async move {
+                        let reader =
+                            SendParquetReader::with_cache(storage.as_ref(), footers.as_ref());
+                        reader.read_task(&task).await.map_err(|e| {
+                            QueryError::Internal(format!(
+                                "Failed to read Parquet file '{}': {e}",
+                                task.data_file.file_path
+                            ))
+                        })
+                    })
+                    .await
+                    .map_err(|e| QueryError::Internal(format!("Parquet read worker failed: {e}")))?
+                }
+            })
+            .buffer_unordered(concurrency)
+            .try_collect::<Vec<Vec<ColumnBatch>>>()
+            .await?
+            .into_iter()
+            .flatten()
+            .collect();
+        Ok(all_batches)
+    }
+
+    /// The source table's current snapshot id (the materialization "to" point),
+    /// or `None` if the table has no snapshots yet.
+    pub async fn current_snapshot_id(
+        &self,
+        graph_source_id: &str,
+        table_name: &str,
+    ) -> QueryResult<Option<i64>> {
+        let (_storage, metadata, _loc) = self
+            .prepare_iceberg_scan(graph_source_id, table_name)
+            .await?;
+        Ok(metadata.current_snapshot().map(|s| s.snapshot_id))
+    }
+
+    /// Scan only the data files ADDED in the snapshot window
+    /// `(from_snapshot_id, to_snapshot_id]` (append-only incremental).
+    ///
+    /// `from_snapshot_id = None` reads the full live state of `to_snapshot_id`
+    /// (initial materialization). The caller must verify the window is
+    /// incremental-safe (`TableMetadata::window_is_append_only`, allowing
+    /// compaction) and fall back to a full scan otherwise.
+    pub async fn scan_table_incremental(
+        &self,
+        graph_source_id: &str,
+        table_name: &str,
+        projection: &[String],
+        from_snapshot_id: Option<i64>,
+        to_snapshot_id: i64,
+    ) -> QueryResult<Vec<ColumnBatch>> {
+        let (storage, metadata, _loc) = self
+            .prepare_iceberg_scan(graph_source_id, table_name)
+            .await?;
+
+        let schema = metadata
+            .current_schema()
+            .ok_or_else(|| QueryError::Internal("Table has no current schema".to_string()))?;
+        let projected_field_ids: Vec<i32> = if projection.is_empty() {
+            schema
+                .fields
+                .iter()
+                .filter(|f| !f.is_nested())
+                .map(|f| f.id)
+                .collect()
+        } else {
+            projection
+                .iter()
+                .filter_map(|col| schema.field_by_name(col).map(|f| f.id))
+                .collect()
+        };
+
+        let scan_config = ScanConfig::new().with_projection(projected_field_ids);
+        let planner = SendScanPlanner::new(storage.as_ref(), &metadata, scan_config);
+        let plan = planner
+            .plan_incremental(from_snapshot_id, to_snapshot_id)
+            .await
+            .map_err(|e| QueryError::Internal(format!("Failed to plan incremental scan: {e}")))?;
+
+        info!(
+            from_snapshot_id = ?from_snapshot_id,
+            to_snapshot_id,
+            files = plan.files_selected,
+            estimated_rows = plan.estimated_row_count,
+            "Iceberg incremental scan plan created"
+        );
+
+        self.read_scan_tasks(&storage, plan.added_tasks).await
+    }
 }
 
 impl std::fmt::Debug for FlureeR2rmlProvider<'_> {
