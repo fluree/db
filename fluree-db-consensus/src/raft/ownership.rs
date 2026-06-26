@@ -1,7 +1,7 @@
-//! Deterministic per-branch stager assignment.
+//! Deterministic per-branch worker assignment.
 //!
 //! Every node independently maps a [`RefKey`] to the [`NodeId`] that
-//! should run its stager, using rendezvous hashing (Highest Random
+//! should run its worker, using rendezvous hashing (Highest Random
 //! Weight): score each `(ref_key, node)` pair, highest score wins.
 //! Reassignment fraction on a membership change is `~1/(N+1)`.
 //!

@@ -3,7 +3,7 @@
 //!
 //! The state machine appends `QueueEntry` rows to per-branch FIFOs as
 //! [`Command::EnqueueCommand`](crate::raft::state_machine::Command::EnqueueCommand)
-//! applies. One [`Stager`] runs per active branch on whichever node
+//! applies. One [`Worker`] runs per active branch on whichever node
 //! the rendezvous-hash owner resolves to; each polls its branch's
 //! queue front, restages the commit locally, writes the commit blob
 //! to shared CAS, and publishes the head advance through
@@ -11,19 +11,19 @@
 //! [`Command::ApplyHead`](crate::raft::state_machine::Command::ApplyHead).
 //! The entry pops and the head advances on that apply.
 //!
-//! [`StagerSupervisor`] runs at node lifetime on every node. Each
+//! [`WorkerSupervisor`] runs at node lifetime on every node. Each
 //! tick it computes the desired set (branches in
 //! [`NameServiceState::queues`] whose rendezvous owner is this node)
-//! and reconciles its running stagers to match — spawning new ones,
+//! and reconciles its running workers to match — spawning new ones,
 //! aborting reassigned ones. A cancellation token drives graceful
 //! shutdown; the supervisor exits its loop, aborts every per-branch
-//! stager, then returns.
+//! worker, then returns.
 //!
 //! Scope cuts for v1 (tracked in `docs/design/raft-command-queue.md`):
 //! - No retry budget. Any staging failure poisons the entry.
-//! - [`BodyKind::Pushed`] handling is deferred; the stager poisons
+//! - [`BodyKind::Pushed`] handling is deferred; the worker poisons
 //!   any pushed entry until that path lands.
-//! - Idle branches are not reaped; stagers run until ownership
+//! - Idle branches are not reaped; workers run until ownership
 //!   moves or the supervisor shuts down.
 //! - Token-bearing fields in [`crate::QueuedRequest::governance`]
 //!   travel verbatim; redaction is future work.
@@ -61,19 +61,19 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, warn};
 
-/// How often a [`Stager`] polls its branch queue when the previous
+/// How often a [`Worker`] polls its branch queue when the previous
 /// tick found nothing.
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
-/// How often [`StagerSupervisor`] scans [`NameServiceState::queues`]
-/// for branches it hasn't yet spawned a stager for. Longer than
+/// How often [`WorkerSupervisor`] scans [`NameServiceState::queues`]
+/// for branches it hasn't yet spawned a worker for. Longer than
 /// [`POLL_INTERVAL`] because per-branch work latency is bounded by
-/// the stager's own poll, not by how fast the supervisor notices new
+/// the worker's own poll, not by how fast the supervisor notices new
 /// keys — this just bounds the time-to-spawn for a freshly-seen
 /// branch.
 const SUPERVISOR_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
-/// How long a [`Stager`] waits after a Raft propose failure before
+/// How long a [`Worker`] waits after a Raft propose failure before
 /// trying again. Long enough that we don't tight-loop against a lost
 /// leader; short enough that recovery feels responsive.
 const RAFT_BACKOFF: Duration = Duration::from_millis(250);
@@ -95,7 +95,7 @@ const STAGE_RETRY_BASE_BACKOFF: Duration = Duration::from_millis(100);
 
 /// Cross-node propose path for [`SmCommand::PoisonQueueEntry`].
 ///
-/// `Stager`s running on a follower can't propose to raft directly —
+/// `Worker`s running on a follower can't propose to raft directly —
 /// `client_write` returns `ForwardToLeader` for non-leader proposes
 /// — so a deterministic poison (e.g. [`PoisonReason::BodyMalformed`])
 /// would otherwise bounce forever and head-of-line-block the
@@ -119,9 +119,9 @@ pub trait QueuePoisonPublisher: Send + Sync {
 
 /// Failure modes for [`QueuePoisonPublisher::poison_queue_entry`].
 ///
-/// All variants are surfaced to the stager's outer `WorkerError::Raft`
+/// All variants are surfaced to the worker's outer `WorkerError::Raft`
 /// path, which logs and backs off. Distinguishing them at this layer
-/// keeps the cause explicit in logs without forcing the stager to
+/// keeps the cause explicit in logs without forcing the worker to
 /// switch on opaque strings.
 #[derive(Debug, Error)]
 pub enum QueuePoisonError {
@@ -143,7 +143,7 @@ pub enum QueuePoisonError {
     #[error("apply_queue_poison codec: {0}")]
     Codec(String),
     /// No leader currently elected — `current_leader()` returned
-    /// `None`. The stager backs off and retries on the next loop tick.
+    /// `None`. The worker backs off and retries on the next loop tick.
     #[error("no leader currently elected; poison deferred")]
     NoLeader,
 }
@@ -153,18 +153,18 @@ pub enum QueuePoisonError {
 /// Drains a single branch's queue: peeks the front, stages the
 /// commit, writes the commit blob, publishes the head advance through
 /// [`CommitPublisher::publish_commit`], and retires the entry. One
-/// stager runs per active [`RefKey`] on whichever node the rendezvous
+/// worker runs per active [`RefKey`] on whichever node the rendezvous
 /// owner resolves to; cross-branch concurrency is the supervisor's
 /// responsibility.
 ///
 /// Head advances flow through `publisher.publish_commit` — a Raft
 /// deployment supplies a [`RaftNameService`](crate::raft::nameservice::RaftNameService)
 /// here, which proposes `ApplyHead` against the current per-branch
-/// queue front (forwarding to the leader when this stager runs on a
+/// queue front (forwarding to the leader when this worker runs on a
 /// follower). Poisoning still goes direct to Raft because there's no
 /// trait surface for "fail this queue entry."
 #[derive(Clone)]
-pub struct Stager {
+pub struct Worker {
     ref_key: RefKey,
     publisher: Arc<dyn CommitPublisher>,
     /// Leader-aware sink for `PoisonQueueEntry`. On a follower this
@@ -176,14 +176,14 @@ pub struct Stager {
     index_config: IndexConfig,
     shared_state: SharedState,
     /// Side channel paired with the state-machine adapter's
-    /// `StagedReceiptMap`. The stager stashes a typed
+    /// `StagedReceiptMap`. The worker stashes a typed
     /// [`AppliedReceipt`] here before proposing `ApplyHead`; the
     /// adapter takes it during waiter resolution. Cleanup on
     /// propose failure prevents stale receipts from accumulating.
     staged_receipts: Arc<StagedReceiptMap>,
 }
 
-impl Stager {
+impl Worker {
     fn new(
         ref_key: RefKey,
         publisher: Arc<dyn CommitPublisher>,
@@ -213,7 +213,7 @@ impl Stager {
     /// exponential backoff up to [`MAX_STAGE_ATTEMPTS`] times before
     /// poisoning — the other `PoisonReason` variants are
     /// deterministic (`BodyMalformed`, `PolicyViolation`, etc.) so
-    /// retrying them just burns a stager round. Between retries
+    /// retrying them just burns a worker round. Between retries
     /// the local Fluree cache is `refresh()`ed against the durable
     /// nameservice head so a conflict rooted in stale state (e.g.
     /// a namespace allocation this node missed because it took
@@ -378,7 +378,7 @@ impl Stager {
     }
 
     /// Read the replicated state to see whether `commit_id` is the
-    /// current head for this stager's [`RefKey`]. Used by
+    /// current head for this worker's [`RefKey`]. Used by
     /// [`Self::try_advance_head`] to disambiguate a publish error
     /// that may have committed anyway (lost response, post-apply
     /// step-down) from one that genuinely failed.
@@ -735,7 +735,7 @@ impl Stager {
             .map_err(|e| stage_failure(&format!("prepare_merge failed: {e}")))?;
 
         // Defensive: if prepare_merge resolves a different target
-        // than the queue entry's branch, the transactor and stager
+        // than the queue entry's branch, the transactor and worker
         // disagree about which queue the entry belongs on. Poison
         // rather than advance the wrong branch.
         if target != self.ref_key.branch {
@@ -891,7 +891,7 @@ impl Stager {
             Ok(()) => Ok(()),
             // Terminal classifications from the publisher (notably
             // the leader-forwarded apply_staged_commit) route into
-            // the poison path so the stager doesn't loop a known-
+            // the poison path so the worker doesn't loop a known-
             // unfixable error forever and head-of-line-block the
             // branch's queue. Everything else stays on the Raft path
             // (transient — outer loop retries with backoff).
@@ -909,7 +909,7 @@ impl Stager {
         // Route through the publisher's leader-aware path: on a
         // follower this ferries to the leader's `apply_queue_poison`
         // endpoint, on the leader it calls `client_write` directly.
-        // Without the indirection a follower-owned stager would
+        // Without the indirection a follower-owned worker would
         // bounce `ForwardToLeader` indefinitely and the branch's
         // queue front would stall on a deterministic poison.
         self.poison_publisher
@@ -924,7 +924,7 @@ impl Stager {
     /// runs it through [`Self::process_entry`]. The per-branch FIFO
     /// ordering the design promises is preserved because only the
     /// front is sampled. Cross-branch concurrency is the supervisor's
-    /// responsibility — each branch runs in its own stager task.
+    /// responsibility — each branch runs in its own worker task.
     pub async fn run(self) {
         // Track the most recently committed queue_id so we don't re-stage
         // an entry our locally-replicated state hasn't yet observed the
@@ -956,7 +956,7 @@ impl Stager {
             let queue_id = entry.queue_id;
             // Wrap `process_entry` in `catch_unwind` so a panic
             // (third-party crate, future-proofed invariant slip)
-            // poisons this entry rather than killing the stager task
+            // poisons this entry rather than killing the worker task
             // and halting drain for this branch. `process_entry`
             // consumes `Stage` failures by proposing
             // `PoisonQueueEntry`, so only `Raft` propagates from the
@@ -976,7 +976,7 @@ impl Stager {
                     // unreachable, branch-specific reconcile bug).
                     // Back off so we don't tight-loop, then retry the
                     // same front on the next tick. Other branches'
-                    // stagers are independent — they progress or fail
+                    // workers are independent — they progress or fail
                     // on their own.
                     warn!(
                         ledger_id = %self.ref_key.ledger_name,
@@ -994,7 +994,7 @@ impl Stager {
                         branch = %self.ref_key.branch,
                         queue_id,
                         panic = %message,
-                        "stager panicked while processing entry; poisoning and continuing"
+                        "worker panicked while processing entry; poisoning and continuing"
                     );
                     match self
                         .propose_poison(queue_id, PoisonReason::WorkerPanic { message })
@@ -1007,7 +1007,7 @@ impl Stager {
                                 branch = %self.ref_key.branch,
                                 queue_id,
                                 error = %propose_error,
-                                "failed to publish poison after stager panic; entry stays at queue head"
+                                "failed to publish poison after worker panic; entry stays at queue head"
                             );
                             tokio::time::sleep(RAFT_BACKOFF).await;
                         }
@@ -1053,22 +1053,22 @@ where
     }
 }
 
-/// Supervises per-branch [`Stager`]s on this node. Watches the
+/// Supervises per-branch [`Worker`]s on this node. Watches the
 /// replicated [`NameServiceState::queues`] and the cluster's voter
 /// set, computes which branches this node owns under rendezvous
-/// hashing, and reconciles the running stager set to match.
+/// hashing, and reconciles the running worker set to match.
 ///
 /// Lifecycle: spawned at process start (not bound to leadership)
-/// since every node potentially hosts stagers under distributed
+/// since every node potentially hosts workers under distributed
 /// assignment. Graceful shutdown is driven through a
 /// [`CancellationToken`]; the supervisor's `select!` loop catches
-/// the cancel, exits, and aborts every per-branch stager it owns.
+/// the cancel, exits, and aborts every per-branch worker it owns.
 ///
 /// Cloning is cheap (`Arc` clones plus a `NodeId`); the embedding
 /// server typically constructs once and never clones, but the type
 /// stays `Clone` to match the rest of the integration surface.
 #[derive(Clone)]
-pub struct StagerSupervisor {
+pub struct WorkerSupervisor {
     id: NodeId,
     raft: Arc<Raft<TypeConfig>>,
     publisher: Arc<dyn CommitPublisher>,
@@ -1079,11 +1079,11 @@ pub struct StagerSupervisor {
     staged_receipts: Arc<StagedReceiptMap>,
 }
 
-/// Components the [`StagerSupervisor`] assembles into a single
+/// Components the [`WorkerSupervisor`] assembles into a single
 /// long-running task. Bundled so the constructor stays one
 /// positional struct argument as the dependency set grows — same
 /// pattern as `RaftIntegrationParts` in fluree-db-server.
-pub struct StagerSupervisorParts {
+pub struct WorkerSupervisorParts {
     pub id: NodeId,
     pub raft: Arc<Raft<TypeConfig>>,
     pub publisher: Arc<dyn CommitPublisher>,
@@ -1094,9 +1094,9 @@ pub struct StagerSupervisorParts {
     pub staged_receipts: Arc<StagedReceiptMap>,
 }
 
-impl StagerSupervisor {
-    pub fn new(parts: StagerSupervisorParts) -> Self {
-        let StagerSupervisorParts {
+impl WorkerSupervisor {
+    pub fn new(parts: WorkerSupervisorParts) -> Self {
+        let WorkerSupervisorParts {
             id,
             raft,
             publisher,
@@ -1118,30 +1118,30 @@ impl StagerSupervisor {
         }
     }
 
-    /// Reconcile the set of running stagers against the branches
+    /// Reconcile the set of running workers against the branches
     /// this node owns. Runs until the cancellation token is signaled.
     ///
     /// Each tick:
     /// 1. Compute the desired set: branches in
     ///    [`NameServiceState::queues`] whose rendezvous owner under
     ///    the current voter set is this node.
-    /// 2. Spawn a stager for any newly-desired branch; abort the
-    ///    stager for any branch this node no longer owns.
+    /// 2. Spawn a worker for any newly-desired branch; abort the
+    ///    worker for any branch this node no longer owns.
     /// 3. Sleep until either the metrics watch fires (membership /
     ///    leader changed → recompute ownership), the poll interval
     ///    elapses (queues may have new branches), or the cancel
     ///    token signals shutdown.
     ///
-    /// On shutdown, every still-running stager is aborted before the
+    /// On shutdown, every still-running worker is aborted before the
     /// loop returns so the caller's `JoinHandle::await` sees the
     /// supervisor stop only after its children have.
     pub async fn run(self, cancel: CancellationToken) {
-        let mut stagers: HashMap<RefKey, JoinHandle<()>> = HashMap::new();
+        let mut workers: HashMap<RefKey, JoinHandle<()>> = HashMap::new();
         let mut metrics_rx = self.raft.metrics();
 
         loop {
             let desired = self.compute_desired_owners().await;
-            self.reconcile_stagers(&mut stagers, desired).await;
+            self.reconcile_workers(&mut workers, desired).await;
 
             tokio::select! {
                 // Metrics changed (membership, leader, term, index, …).
@@ -1161,9 +1161,9 @@ impl StagerSupervisor {
         // Shutdown drain: same await-on-abort discipline reconcile
         // uses. The caller wraps `run` in `CancellableTaskHandle::shutdown`,
         // which awaits the supervisor's JoinHandle — without the
-        // inner await here, that outer await returns while stagers
+        // inner await here, that outer await returns while workers
         // are still racing on shutdown.
-        abort_and_await(stagers.drain().map(|(_, h)| h)).await;
+        abort_and_await(workers.drain().map(|(_, h)| h)).await;
     }
 
     async fn compute_desired_owners(&self) -> HashSet<RefKey> {
@@ -1193,10 +1193,10 @@ impl StagerSupervisor {
             .collect()
     }
 
-    /// Spawn stagers for newly-desired branches; tear down stagers
-    /// for branches no longer owned. Dead handles (a stager that
+    /// Spawn workers for newly-desired branches; tear down workers
+    /// for branches no longer owned. Dead handles (a worker that
     /// exited on its own — should not happen under normal operation
-    /// since `Stager::run` loops forever and panics are caught
+    /// since `Worker::run` loops forever and panics are caught
     /// per-entry) are left in place: they'll be removed on the next
     /// ownership change, or stay dormant until the supervisor
     /// restarts.
@@ -1205,18 +1205,18 @@ impl StagerSupervisor {
     /// awaited before this method returns. That serialization is
     /// what guarantees a fast ownership flap (the same `RefKey`
     /// moves away and back inside one supervisor tick) can't
-    /// respawn a stager before the previous task has fully yielded;
+    /// respawn a worker before the previous task has fully yielded;
     /// the two would otherwise race on the shared
     /// [`StagedReceiptMap`] under that `RefKey`.
-    async fn reconcile_stagers(
+    async fn reconcile_workers(
         &self,
-        stagers: &mut HashMap<RefKey, JoinHandle<()>>,
+        workers: &mut HashMap<RefKey, JoinHandle<()>>,
         desired: HashSet<RefKey>,
     ) {
         for key in &desired {
-            if !stagers.contains_key(key) {
-                let handle = tokio::spawn(self.make_stager(key.clone()).run());
-                stagers.insert(key.clone(), handle);
+            if !workers.contains_key(key) {
+                let handle = tokio::spawn(self.make_worker(key.clone()).run());
+                workers.insert(key.clone(), handle);
             }
         }
         // Two-step removal: HashMap::extract_if is unstable, so
@@ -1224,17 +1224,17 @@ impl StagerSupervisor {
         // handle out by key. The intermediate Vec is bounded by the
         // number of branches whose ownership just moved off this
         // node — small under any realistic deployment.
-        let to_drop: Vec<RefKey> = stagers
+        let to_drop: Vec<RefKey> = workers
             .keys()
             .filter(|key| !desired.contains(*key))
             .cloned()
             .collect();
-        let dropped = to_drop.into_iter().filter_map(|key| stagers.remove(&key));
+        let dropped = to_drop.into_iter().filter_map(|key| workers.remove(&key));
         abort_and_await(dropped).await;
     }
 
-    fn make_stager(&self, ref_key: RefKey) -> Stager {
-        Stager::new(
+    fn make_worker(&self, ref_key: RefKey) -> Worker {
+        Worker::new(
             ref_key,
             Arc::clone(&self.publisher),
             Arc::clone(&self.poison_publisher),
@@ -1304,16 +1304,16 @@ fn stage(reason: PoisonReason) -> WorkerError {
 /// Internal classification for staging outcomes.
 ///
 /// `Transient` is a retryable hiccup — the per-entry loop in
-/// [`Stager::process_entry`] retries with backoff up to
+/// [`Worker::process_entry`] retries with backoff up to
 /// [`MAX_STAGE_ATTEMPTS`] and then promotes the carried message
 /// into [`PoisonReason::StagingFailed`] stamped with the real
 /// final attempt count. Producers don't need to know how many
 /// attempts have run.
 ///
 /// `Stage` carries a deterministic [`PoisonReason`] (e.g.
-/// `BodyMalformed`, `PolicyViolation`, `WorkerPanic`) the stager
+/// `BodyMalformed`, `PolicyViolation`, `WorkerPanic`) the worker
 /// proposes verbatim via `PoisonQueueEntry` — retrying these would
-/// just burn a stager round.
+/// just burn a worker round.
 ///
 /// `Raft` is reserved for propose failures the caller propagates —
 /// those mean the cluster fundamentally can't accept commands
@@ -1329,7 +1329,7 @@ pub enum WorkerError {
     Transient(String),
     /// `PoisonReason` is boxed so this enum stays small even though
     /// `PushCasFailed` carries two `Option<ContentId>`s — without
-    /// the indirection every `Result<(), WorkerError>` in the stager
+    /// the indirection every `Result<(), WorkerError>` in the worker
     /// pays that variant's footprint even on the happy path.
     #[error("staging poisoned: {0:?}")]
     Stage(Box<PoisonReason>),
@@ -1339,7 +1339,7 @@ pub enum WorkerError {
 
 /// Output of a per-op staging path before consensus has confirmed
 /// the head advance. Carries the typed receipt the adapter delivers
-/// through the waiter map plus any local state install the stager
+/// through the waiter map plus any local state install the worker
 /// should run *after* the publish succeeds — never before, so a
 /// failed publish leaves this node's Fluree cache at its pre-stage
 /// head.
@@ -1461,7 +1461,7 @@ mod tests {
             .insert(RefKey::new(ledger_id, branch), VecDeque::from(entries));
     }
 
-    /// Replicates the per-branch peek logic in [`Stager::snapshot_front`]
+    /// Replicates the per-branch peek logic in [`Worker::snapshot_front`]
     /// against a bare `SharedState`. Lets us exercise the queue-front
     /// invariants without wiring up Raft + Fluree.
     async fn snapshot_front_for_test(state: &SharedState, ref_key: &RefKey) -> Option<QueueEntry> {
@@ -1472,7 +1472,7 @@ mod tests {
             .and_then(|queue| queue.front().cloned())
     }
 
-    /// Replicates [`StagerSupervisor::compute_desired_owners`] against
+    /// Replicates [`WorkerSupervisor::compute_desired_owners`] against
     /// a bare `SharedState` plus an explicit voter list. Exercises
     /// the supervisor's ownership filter without wiring up Raft.
     async fn compute_desired_owners_for_test(
@@ -1493,7 +1493,7 @@ mod tests {
             .collect()
     }
 
-    /// A stager only ever takes the front of its own branch — never
+    /// A worker only ever takes the front of its own branch — never
     /// the second entry, never another branch's entry.
     #[tokio::test]
     async fn snapshot_front_returns_only_this_branches_front() {
@@ -1527,7 +1527,7 @@ mod tests {
     }
 
     /// Empty queues and unknown branches both yield `None` — the
-    /// stager treats them identically (sleep and re-poll).
+    /// worker treats them identically (sleep and re-poll).
     #[tokio::test]
     async fn snapshot_front_is_none_when_empty_or_missing() {
         let mut state = NameServiceState::default();
@@ -1637,7 +1637,7 @@ mod tests {
 
     /// `abort_and_await` must return only after every aborted task
     /// has reached its `Drop`. Without that property, the
-    /// supervisor's `reconcile_stagers` could respawn a stager for
+    /// supervisor's `reconcile_workers` could respawn a worker for
     /// a `RefKey` while the previous task is still in-flight on
     /// the shared `StagedReceiptMap`. The test stands in for the
     /// supervisor's contract: park a fleet of tasks on a never-

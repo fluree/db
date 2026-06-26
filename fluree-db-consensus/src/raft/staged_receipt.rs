@@ -1,5 +1,5 @@
 //! Per-leader side channel carrying staged-time receipt details from
-//! the per-branch [`Stager`](super::commit_worker::Stager) to the
+//! the per-branch [`Worker`](super::commit_worker::Worker) to the
 //! [`QueuedTransactor`](super::queued_transactor::QueuedTransactor)
 //! that registered the waiter.
 //!

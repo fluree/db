@@ -58,7 +58,7 @@ use tracing::info;
 
 #[cfg(feature = "raft")]
 use fluree_db_consensus::raft::commit_worker::{
-    QueuePoisonPublisher, StagerSupervisor, StagerSupervisorParts,
+    QueuePoisonPublisher, WorkerSupervisor, WorkerSupervisorParts,
 };
 
 /// Private listener config for the Raft inter-node RPC + admin
@@ -91,15 +91,15 @@ pub struct FlureeServer {
     /// the rest of the server.
     #[cfg(feature = "raft")]
     raft_leader_watcher: Option<crate::raft::CancellableTaskHandle>,
-    /// Per-node stager supervisor. Runs on every node (independent
-    /// of leadership) and drives per-branch [`Stager`] tasks for
+    /// Per-node worker supervisor. Runs on every node (independent
+    /// of leadership) and drives per-branch [`Worker`] tasks for
     /// branches this node owns under rendezvous assignment. Shut
-    /// down gracefully so in-flight stagers stop before the runtime
+    /// down gracefully so in-flight workers stop before the runtime
     /// goes away.
     ///
-    /// [`Stager`]: fluree_db_consensus::raft::commit_worker::Stager
+    /// [`Worker`]: fluree_db_consensus::raft::commit_worker::Worker
     #[cfg(feature = "raft")]
-    raft_stager_supervisor: Option<crate::raft::CancellableTaskHandle>,
+    raft_worker_supervisor: Option<crate::raft::CancellableTaskHandle>,
     /// Per-node release task that drains the state-machine adapter's
     /// CAS release channel. Runs on every node (not just the leader)
     /// so admin-cleared queue entries and idempotency-evicted
@@ -333,12 +333,12 @@ impl FlureeServer {
             task.abort();
         }
         #[cfg(feature = "raft")]
-        if let Some(handle) = self.raft_stager_supervisor {
-            // Drain stagers before the leader-only background tasks
+        if let Some(handle) = self.raft_worker_supervisor {
+            // Drain workers before the leader-only background tasks
             // (indexer, evictor) shut down — they touch the same
-            // shared state the stagers' final publishes go through,
+            // shared state the workers' final publishes go through,
             // and ordering matters when this node is itself the
-            // leader. The supervisor aborts each per-branch stager
+            // leader. The supervisor aborts each per-branch worker
             // and returns only after they've stopped.
             handle.shutdown().await;
         }
@@ -614,14 +614,14 @@ impl FlureeServerBuilder {
             );
         }
 
-        // Per-node stager supervisor. Runs on every node (leader and
-        // followers alike) because distributed stagers can land
+        // Per-node worker supervisor. Runs on every node (leader and
+        // followers alike) because distributed workers can land
         // anywhere under rendezvous assignment. Spawned here so its
         // lifecycle is independent of the leader watcher's; followers'
-        // stagers ferry their apply through the leader via
+        // workers ferry their apply through the leader via
         // `RaftNameService::apply_staged_commit`.
         #[cfg(feature = "raft")]
-        let raft_stager_supervisor = self.raft.as_ref().map(|(integration, _)| {
+        let raft_worker_supervisor = self.raft.as_ref().map(|(integration, _)| {
             let raft_ns = std::sync::Arc::clone(
                 raft_nameservice
                     .as_ref()
@@ -631,11 +631,11 @@ impl FlureeServerBuilder {
                 std::sync::Arc::clone(&raft_ns) as _;
             // Same `RaftNameService` Arc upcast a second time, this
             // time to the queue-poison publisher trait so a follower-
-            // owned stager can ferry deterministic poisons to the
+            // owned worker can ferry deterministic poisons to the
             // leader instead of looping forever on `client_write`
             // returning `ForwardToLeader`.
             let poison_publisher: Arc<dyn QueuePoisonPublisher> = Arc::clone(&raft_ns) as _;
-            let supervisor = StagerSupervisor::new(StagerSupervisorParts {
+            let supervisor = WorkerSupervisor::new(WorkerSupervisorParts {
                 id: integration.id,
                 raft: Arc::clone(&integration.raft),
                 publisher,
@@ -648,12 +648,12 @@ impl FlureeServerBuilder {
                 shared_state: integration.shared_state.clone(),
                 staged_receipts: Arc::clone(&integration.staged_receipts),
             });
-            crate::raft::spawn_stager_supervisor(supervisor)
+            crate::raft::spawn_worker_supervisor(supervisor)
         });
 
         // Wire the leader-aware launcher. Bundles the background
         // indexer and the periodic idempotency evictor — both
-        // leader-only tasks. The stager supervisor lives at node
+        // leader-only tasks. The worker supervisor lives at node
         // scope (above) and is *not* in this set.
         #[cfg(feature = "raft")]
         let raft_leader_watcher = self.raft.as_ref().map(|(integration, _)| {
@@ -765,7 +765,7 @@ impl FlureeServerBuilder {
             #[cfg(feature = "raft")]
             raft_leader_watcher,
             #[cfg(feature = "raft")]
-            raft_stager_supervisor,
+            raft_worker_supervisor,
             #[cfg(feature = "raft")]
             raft_release_task,
         })

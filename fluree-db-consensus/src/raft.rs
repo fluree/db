@@ -15,12 +15,12 @@
 //!    FIFO queue and assigns a `queue_id`. Every node sees the
 //!    enqueue when it applies. The transactor registers a waiter on
 //!    the per-process [`waiter::WaiterMap`].
-//! 3. The node-lifetime [`commit_worker::StagerSupervisor`] runs on
+//! 3. The node-lifetime [`commit_worker::WorkerSupervisor`] runs on
 //!    every cluster member (leader and followers alike). Each tick
 //!    it computes the desired set — branches whose rendezvous-hash
 //!    owner over the current voter set resolves to this node — and
-//!    reconciles its running [`commit_worker::Stager`]s against it.
-//!    A stager drains its branch's queue, stages the work locally,
+//!    reconciles its running [`commit_worker::Worker`]s against it.
+//!    A worker drains its branch's queue, stages the work locally,
 //!    writes the commit blob, stashes the typed receipt in
 //!    [`staged_receipt::StagedReceiptMap`], and publishes the head
 //!    advance through the [`fluree_db_nameservice::CommitPublisher`]
@@ -30,7 +30,7 @@
 //!    the leader's `apply_staged_commit` HTTP endpoint, which
 //!    proposes the same command from the leader's side. The same
 //!    forwarding shape covers [`state_machine::Command::PoisonQueueEntry`]
-//!    when a stager hits a deterministic failure.
+//!    when a worker hits a deterministic failure.
 //! 4. The [`state_machine_adapter::StateMachineAdapter`] applies
 //!    `ApplyHead`, takes the stashed receipt, and resolves the
 //!    waiter. The transactor's `await` returns the typed receipt.

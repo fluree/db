@@ -69,13 +69,13 @@ pub struct NetworkConfig {
     /// Per-request timeout for install-snapshot. Snapshots can be
     /// large; size this larger than `rpc_timeout`.
     pub snapshot_timeout: Duration,
-    /// Per-request timeout for the stager-initiated cross-node
+    /// Per-request timeout for the worker-initiated cross-node
     /// `apply_staged_commit` / `apply_queue_poison` forwards.
     /// Larger than [`Self::rpc_timeout`] because the leader has to
     /// commit + apply the proposed entry before responding (openraft's
     /// own RPCs return as soon as the entry is durably accepted),
     /// but bounded so a fully-stalled leader is detected before the
-    /// stager loop times out a user's submission.
+    /// worker loop times out a user's submission.
     pub cross_node_propose_timeout: Duration,
     /// HTTP connect timeout. Independent of the request timeout so a
     /// dead peer fails fast rather than blocking the replication tick.
@@ -106,7 +106,7 @@ pub struct NetworkConfig {
     /// covers any realistic single-commit receipt with headroom;
     /// without an explicit cap the route falls back to axum's
     /// 2 MiB default and an oversize receipt 413s into the
-    /// follower stager's retry-forever path.
+    /// follower worker's retry-forever path.
     pub apply_staged_commit_max_body_bytes: usize,
     /// Maximum buffered body size accepted on the cross-node
     /// `apply_queue_poison` route. Body shape: a `ref_key`, a
@@ -585,7 +585,7 @@ mod tests {
         // them past the documented profiles: vote stays tight
         // because the body is fixed-size; append-entries scales
         // with batch size; install-snapshot tolerates the full
-        // state-machine image; the cross-node stager RPCs sit
+        // state-machine image; the cross-node worker RPCs sit
         // between vote and append-entries — the receipt path
         // higher (it carries the staged commit's tally), the
         // poison path lower (a queue_id + structured reason).
@@ -599,7 +599,7 @@ mod tests {
         // A future change that flips this is almost certainly a bug.
         assert!(cfg.vote_max_body_bytes <= cfg.append_entries_max_body_bytes);
         assert!(cfg.append_entries_max_body_bytes <= cfg.install_snapshot_max_body_bytes);
-        // Cross-node stager-RPC caps stay within the
+        // Cross-node worker-RPC caps stay within the
         // append-entries envelope so an operator who's already
         // tuned that knob upward doesn't get blindsided by a
         // narrower route silently 413-ing under the same workload.

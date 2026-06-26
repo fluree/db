@@ -61,7 +61,7 @@ pub struct RaftIntegration {
     /// routers; also used by
     /// [`QueuedTransactor`](fluree_db_consensus::raft::queued_transactor::QueuedTransactor)
     /// and each per-branch
-    /// [`Stager`](fluree_db_consensus::raft::commit_worker::Stager).
+    /// [`Worker`](fluree_db_consensus::raft::commit_worker::Worker).
     pub raft: Arc<Raft<TypeConfig>>,
     /// This node's id. Cached so callers (notably the leader-aware
     /// indexer watcher) don't have to dip into `raft.metrics()` just
@@ -85,7 +85,7 @@ pub struct RaftIntegration {
     /// so submission-side registrations meet apply-side resolutions.
     pub waiter_map: Arc<WaiterMap>,
     /// Per-process side channel each per-branch
-    /// [`Stager`](fluree_db_consensus::raft::commit_worker::Stager)
+    /// [`Worker`](fluree_db_consensus::raft::commit_worker::Worker)
     /// stashes typed [`AppliedReceipt`](fluree_db_consensus::raft::staged_receipt::AppliedReceipt)
     /// values into before proposing `ApplyHead`; the adapter takes
     /// them during waiter resolution so transactors see staged-time
@@ -100,8 +100,8 @@ pub struct RaftIntegration {
     /// `NameService` adapter over the replicated state machine. Owns
     /// reads of the shared state, all publish-paths (refs, indexes,
     /// commits), and the cross-node `apply_staged_commit` forwarding
-    /// for follower stagers. Held here so the same handle threads
-    /// through `Fluree`, the stager supervisor, and the inbound
+    /// for follower workers. Held here so the same handle threads
+    /// through `Fluree`, the worker supervisor, and the inbound
     /// `apply_staged_commit` HTTP route on `raft_rpc_router`.
     nameservice: Arc<RaftNameService>,
     /// One-shot slot holding the [`ReleaseReceiver`] half of the
@@ -242,7 +242,7 @@ impl RaftIntegration {
     ///
     /// Includes both the openraft RPCs (append-entries, vote,
     /// install-snapshot) and the cross-node `apply_staged_commit`
-    /// and `apply_queue_poison` endpoints follower-owned stagers
+    /// and `apply_queue_poison` endpoints follower-owned workers
     /// POST to.
     pub fn raft_rpc_router(&self) -> Router {
         raft_network::router(Arc::clone(&self.raft), &self.network_config)
@@ -258,7 +258,7 @@ impl RaftIntegration {
 
     /// Borrow the shared [`RaftNameService`] handle. The integration
     /// builds one in `new` and threads the same handle through the
-    /// HTTP routes, `Fluree`, and the stager supervisor so reads,
+    /// HTTP routes, `Fluree`, and the worker supervisor so reads,
     /// publishes, and the cross-node propose all observe one map of
     /// staged receipts.
     pub fn nameservice(&self) -> Arc<RaftNameService> {
@@ -411,7 +411,7 @@ impl LeaderTracker {
 /// awaits the task. [`Self::abort`] is a test-only escape hatch.
 ///
 /// Returned by both [`spawn_leader_watcher`] and
-/// [`spawn_stager_supervisor`]; the handle's contract is the same
+/// [`spawn_worker_supervisor`]; the handle's contract is the same
 /// for both — only the task body differs.
 pub struct CancellableTaskHandle {
     join: JoinHandle<()>,
@@ -448,7 +448,7 @@ impl CancellableTaskHandle {
 /// [`CancellationToken`] for graceful shutdown, returning a handle
 /// that owns the join + cancel pair. Private — public spawn
 /// functions (e.g. [`spawn_leader_watcher`],
-/// [`spawn_stager_supervisor`]) delegate.
+/// [`spawn_worker_supervisor`]) delegate.
 fn spawn_cancellable<F, Fut>(future_fn: F) -> CancellableTaskHandle
 where
     F: FnOnce(tokio_util::sync::CancellationToken) -> Fut,
@@ -528,14 +528,14 @@ where
     })
 }
 
-/// Spawn the per-node stager supervisor as a long-running background
+/// Spawn the per-node worker supervisor as a long-running background
 /// task. Unlike [`spawn_leader_watcher`], this is node-lifetime — the
 /// supervisor runs on every node (leader and followers alike) because
-/// distributed stagers can land anywhere under rendezvous assignment.
+/// distributed workers can land anywhere under rendezvous assignment.
 ///
 /// Shutdown via [`CancellableTaskHandle::shutdown`].
-pub fn spawn_stager_supervisor(
-    supervisor: fluree_db_consensus::raft::commit_worker::StagerSupervisor,
+pub fn spawn_worker_supervisor(
+    supervisor: fluree_db_consensus::raft::commit_worker::WorkerSupervisor,
 ) -> CancellableTaskHandle {
     spawn_cancellable(|cancel| async move { supervisor.run(cancel).await })
 }

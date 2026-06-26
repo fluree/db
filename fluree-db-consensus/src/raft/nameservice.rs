@@ -99,7 +99,7 @@ pub struct RaftNameService {
     /// to the current leader's `apply_staged_commit` endpoint
     /// instead of trying to propose locally (which would just return
     /// `ForwardToLeader`). When unset, `publish_commit` behaves as it
-    /// did before distributed stagers — assumes leader-only callers.
+    /// did before distributed workers — assumes leader-only callers.
     forwarding: Option<ForwardingConfig>,
 }
 
@@ -115,7 +115,7 @@ struct ForwardingConfig {
     /// `apply_queue_poison` POSTs. The shared `http_client` carries
     /// a `connect_timeout` for dead-peer detection but no request
     /// timeout — without an explicit cap here, a connected-but-
-    /// stalled leader hangs the stager on `send().await`
+    /// stalled leader hangs the worker on `send().await`
     /// indefinitely instead of falling through to the outer
     /// backoff/retry path. Sourced from
     /// [`NetworkConfig::cross_node_propose_timeout`] at construction.
@@ -134,7 +134,7 @@ impl RaftNameService {
 
     /// Wire the [`StagedReceiptMap`] this nameservice peeks for
     /// per-queue tally values. Pair it with the same handle the
-    /// [`Stager`](super::commit_worker::Stager) stashes into and the
+    /// [`Worker`](super::commit_worker::Worker) stashes into and the
     /// [`StateMachineAdapter`](super::state_machine_adapter::StateMachineAdapter)
     /// consumes from.
     pub fn with_staged_receipts(mut self, staged_receipts: Arc<StagedReceiptMap>) -> Self {
@@ -474,7 +474,7 @@ fn describe_desync_reason(reason: &DesyncReason) -> String {
 // Cross-node ApplyHead: types + handler method
 // ===========================================================================
 
-/// RPC payload a follower's stager sends to the current leader after
+/// RPC payload a follower's worker sends to the current leader after
 /// it finishes staging a queue entry. The leader stashes the typed
 /// receipt and proposes [`Command::ApplyHead`] on the follower's
 /// behalf; the apply resolves the parked waiter on the leader with
@@ -502,11 +502,11 @@ mod wire;
 /// Outcome of a cross-node ApplyHead proposal.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum ApplyStagedCommitResponse {
-    /// The head was applied at `commit_t`. The follower's stager can
+    /// The head was applied at `commit_t`. The follower's worker can
     /// retire the queue entry locally.
     Applied { commit_t: i64 },
     /// The queue front no longer matches the proposed `queue_id`.
-    /// Typically a racing stager already advanced past this entry;
+    /// Typically a racing worker already advanced past this entry;
     /// the caller should drop its local stash and re-poll its queue.
     Stale {
         /// Queue ID currently at the front, if any. `None` means the
@@ -542,7 +542,7 @@ pub enum ApplyStagedCommitError {
     InvariantViolated(String),
 }
 
-/// RPC payload a follower's stager sends to the current leader when
+/// RPC payload a follower's worker sends to the current leader when
 /// it wants to poison a queue entry it can't successfully stage.
 /// The leader proposes [`Command::PoisonQueueEntry`] on the
 /// follower's behalf.
@@ -574,7 +574,7 @@ impl RaftNameService {
     /// Handle the cross-node ApplyHead RPC: stash the ferried
     /// receipt, propose `Command::ApplyHead`, return the outcome.
     /// Called by the HTTP handler on the leader after a follower's
-    /// stager forwards its staged work.
+    /// worker forwards its staged work.
     ///
     /// Receipt-stash lifecycle: stashed before propose so the
     /// state-machine adapter has it when the apply fires; taken back
@@ -670,12 +670,12 @@ impl RaftNameService {
 
     /// Handle the cross-node `PoisonQueueEntry` RPC: propose the
     /// poison from the leader and return the outcome. Called by the
-    /// HTTP handler on the leader after a follower-owned stager
+    /// HTTP handler on the leader after a follower-owned worker
     /// forwards a deterministic staging failure.
     ///
     /// The state-machine response (`Poisoned` vs `QueueDesync`) is
     /// informational once the poison is durably proposed — either
-    /// way the entry is done from the stager's perspective — so
+    /// way the entry is done from the worker's perspective — so
     /// success collapses to `Ok(())`. Only Raft-side failures
     /// surface as `Err`.
     pub async fn apply_queue_poison(
@@ -718,7 +718,7 @@ const POSTCARD_MIME: &str = "application/octet-stream";
 /// `network_config` supplies the per-route body-size cap. Without an
 /// explicit cap the route falls back to axum's 2 MiB default —
 /// the sibling openraft RPCs all set their own cap, and an
-/// oversize receipt 413s into the follower stager's retry-forever
+/// oversize receipt 413s into the follower worker's retry-forever
 /// path.
 ///
 /// No auth layer is applied. The endpoint follows the same
@@ -878,7 +878,7 @@ fn map_propose_error(
 /// trait-surface [`NameServiceError`] the caller's outer retry vs
 /// poison logic switches on.
 ///
-/// Terminal failures route to variants the stager's
+/// Terminal failures route to variants the worker's
 /// `publish_head_advance` recognizes as poison-worthy
 /// ([`NameServiceError::NotFound`] for missing ledgers,
 /// [`NameServiceError::ApplyRejected`] for state-machine invariant
@@ -1030,7 +1030,7 @@ impl RaftNameService {
     ///
     /// Taking the receipt out of the local stash is deliberate: if
     /// the RPC succeeds the leader's stash takes over, and if it
-    /// fails the stager's outer error path re-stages the same entry
+    /// fails the worker's outer error path re-stages the same entry
     /// (idempotent against the state machine's `queue_id` check).
     /// Holding a duplicate on the follower would leak.
     async fn publish_commit_via_leader(
@@ -2172,11 +2172,11 @@ mod tests {
     //
     // The leader-forwarded apply_staged_commit response used to
     // flatten every error variant into `NameServiceError::Storage`,
-    // which the stager's outer loop treats as transient. Terminal
+    // which the worker's outer loop treats as transient. Terminal
     // failures (a vanished ledger, a state-machine invariant
     // violation) would then loop forever, head-of-line-blocking the
     // branch's queue. Each test below pins one variant to the
-    // specific `NameServiceError` shape the stager pattern-matches
+    // specific `NameServiceError` shape the worker pattern-matches
     // on to decide retry vs poison.
 
     #[test]
@@ -2190,7 +2190,7 @@ mod tests {
 
     #[test]
     fn classify_outcome_stale_is_transient_storage() {
-        // The `Stale` shape is transient: a racing stager already
+        // The `Stale` shape is transient: a racing worker already
         // popped the front while ours was in flight; the next round
         // of the supervisor will reconcile. `Storage` is the
         // intended retry signal.
@@ -2212,7 +2212,7 @@ mod tests {
     #[test]
     fn classify_outcome_ledger_not_found_is_terminal_not_found() {
         // `LedgerNotFound` is terminal — the named ledger is gone
-        // and no amount of retrying will bring it back. The stager
+        // and no amount of retrying will bring it back. The worker
         // recognizes `NotFound` and routes to a
         // `PoisonReason::LedgerNotFound` instead of looping.
         let r = classify_apply_staged_commit_outcome(
@@ -2233,7 +2233,7 @@ mod tests {
         // The crux of this comment's fix: an `InvariantViolated`
         // surfacing from the leader's state machine is a deeper
         // bug, not a hiccup. Map it to `ApplyRejected` so the
-        // stager poisons the entry instead of spinning forever on
+        // worker poisons the entry instead of spinning forever on
         // a propose that can never succeed.
         let r = classify_apply_staged_commit_outcome(
             Err(ApplyStagedCommitError::InvariantViolated(
@@ -2268,7 +2268,7 @@ mod tests {
     fn classify_outcome_raft_propose_is_transient_storage() {
         // Raft fatal (membership-change error, log fsync stuck,
         // etc.). Transient at this layer — openraft's own retry
-        // machinery and the stager's backoff handle recovery.
+        // machinery and the worker's backoff handle recovery.
         let r = classify_apply_staged_commit_outcome(
             Err(ApplyStagedCommitError::RaftPropose(
                 "log fsync failed".into(),
@@ -2405,7 +2405,7 @@ mod tests {
 
     #[test]
     fn apply_queue_poison_args_round_trips_staging_failed_variant() {
-        // `StagingFailed` is the variant emitted when the stager
+        // `StagingFailed` is the variant emitted when the worker
         // exhausts its retry budget on a transient hiccup. Carries
         // a payload (error message + final attempt count) that has
         // to survive the wire.

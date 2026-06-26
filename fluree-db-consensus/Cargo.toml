@@ -57,14 +57,14 @@ axum = { workspace = true, optional = true }
 # commit worker. Gated behind `raft` because only that path needs it.
 futures = { workspace = true, optional = true }
 
-# Deterministic, fast hash for the stager-ownership rendezvous function.
+# Deterministic, fast hash for the worker-ownership rendezvous function.
 # Every node must agree on hash values for cluster-wide consistency, so
 # we use xxh64 (stable across versions) rather than std's randomly-seeded
-# DefaultHasher. Gated behind `raft` because only the stager supervisor
+# DefaultHasher. Gated behind `raft` because only the worker supervisor
 # reaches for it.
 xxhash-rust = { workspace = true, features = ["xxh64"], optional = true }
 
-# `CancellationToken` for graceful shutdown of the stager supervisor's
+# `CancellationToken` for graceful shutdown of the worker supervisor's
 # select loop. Gated behind `raft` because only that lifecycle path
 # uses it.
 tokio-util = { version = "0.7", optional = true }
