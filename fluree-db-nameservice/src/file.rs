@@ -1785,7 +1785,7 @@ mod tests {
         // graph-source record as a ledger `NsFileV2` (which lacks `f:ledger`).
         // Before the fix this returned a "missing field f:ledger" error.
         let (_temp, ns) = setup().await;
-        ns.publish_graph_source("actor", "main", GraphSourceType::Bm25, r#"{}"#, &[])
+        ns.publish_graph_source("actor", "main", GraphSourceType::Bm25, r"{}", &[])
             .await
             .unwrap();
         let record = ns
