@@ -145,6 +145,136 @@ async fn parallel_annotations_on_one_edge_return_one_row_per_occurrence() {
 }
 
 #[tokio::test]
+async fn annotation_lowers_with_top_level_ledger_key_in_body() {
+    // Regression: when the target ledger is supplied in the request *body*
+    // (HTTP body-ledger form: `{"ledger": "...", "@context": ..., "@graph": [...]}`)
+    // rather than the URL path, the stray top-level `ledger` key must not
+    // disturb `@annotation` lowering. Previously `is_envelope` rejected any
+    // document carrying a `ledger` key, so the envelope was misclassified as
+    // a node-map, `@graph` was skipped, and `@annotation` survived raw —
+    // expanding into a dangling literal predicate with no reification bundle
+    // and zero queryable annotations.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/edge-annotations:body-ledger";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+    let txn = json!({
+        "ledger": ledger_id,
+        "@context": ctx(),
+        "@graph": [
+            {
+                "@id": "ex:alice",
+                "ex:worksFor": {
+                    "@id": "ex:acme",
+                    "@annotation": { "ex:role": "Engineer" }
+                }
+            }
+        ]
+    });
+    let committed = fluree
+        .upsert(ledger0, &txn)
+        .await
+        .expect("upsert with body-ledger key");
+
+    let query = json!({
+        "@context": ctx(),
+        "select": ["?role"],
+        "where": {
+            "@id": "?person",
+            "ex:worksFor": {
+                "@id": "?org",
+                "@annotation": { "ex:role": "?role" }
+            }
+        }
+    });
+
+    let rows = support::query_jsonld_formatted(&fluree, &committed.ledger, &query)
+        .await
+        .expect("body-ledger annotation query");
+    let arr = rows.as_array().expect("Select array");
+    assert_eq!(
+        arr.len(),
+        1,
+        "body-ledger annotation must reify and be queryable, got: {arr:#?}"
+    );
+    assert_eq!(
+        arr[0]
+            .as_array()
+            .and_then(|cols| cols.first())
+            .and_then(|v| v.as_str()),
+        Some("Engineer")
+    );
+}
+
+#[tokio::test]
+async fn single_object_body_ledger_insert_lowers_annotation_and_drops_routing_key() {
+    // Single-object form (no `@graph`) with the ledger in the body. Two
+    // guarantees: (1) the `@annotation` reifies even though the stray
+    // `ledger` key trips the envelope/wrapper detectors, and (2) the
+    // `ledger` routing key is stripped before expansion so it never leaks
+    // as a `<ex:alice> ledger "..."` predicate — including the rewrap path
+    // where annotation lowering buries the original node inside `@graph`.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/edge-annotations:single-object-body-ledger";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+    let txn = json!({
+        "ledger": ledger_id,
+        "@context": ctx(),
+        "@id": "ex:alice",
+        "ex:worksFor": {
+            "@id": "ex:acme",
+            "@annotation": { "ex:role": "Engineer" }
+        }
+    });
+    let committed = fluree
+        .upsert(ledger0, &txn)
+        .await
+        .expect("single-object body-ledger upsert");
+
+    let ann_query = json!({
+        "@context": ctx(),
+        "select": ["?role"],
+        "where": {
+            "@id": "?person",
+            "ex:worksFor": { "@id": "?org", "@annotation": { "ex:role": "?role" } }
+        }
+    });
+    let rows = support::query_jsonld_formatted(&fluree, &committed.ledger, &ann_query)
+        .await
+        .expect("annotation query");
+    assert_eq!(
+        rows.as_array().map(Vec::len),
+        Some(1),
+        "single-object body-ledger annotation must reify, got: {rows:#?}"
+    );
+
+    // No stray routing-key predicate leaked onto the subject.
+    let pred_query = json!({
+        "@context": ctx(),
+        "select": ["?p", "?o"],
+        "where": { "@id": "ex:alice", "?p": "?o" }
+    });
+    let preds = support::query_jsonld_formatted(&fluree, &committed.ledger, &pred_query)
+        .await
+        .expect("predicate query");
+    let leaked = preds
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(JsonValue::as_array)
+        .any(|cols| {
+            let pred = cols.first().and_then(JsonValue::as_str).unwrap_or_default();
+            let obj = cols.get(1).and_then(JsonValue::as_str).unwrap_or_default();
+            pred.contains("ledger") || obj == ledger_id
+        });
+    assert!(
+        !leaked,
+        "routing `ledger` key must not leak as a predicate, got: {preds:#?}"
+    );
+}
+
+#[tokio::test]
 async fn bare_triple_pattern_returns_one_row_per_edge_regardless_of_annotations() {
     // Multiplicity contract: the `Pattern::Triple(?s, ex:worksFor, ?o)`
     // surface returns one row per *edge*, even when multiple

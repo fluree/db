@@ -685,8 +685,8 @@ const SYNTH_VAR_PREFIX: &str = "?_fluree_del_ann_";
 /// selector retract against the user's variable.
 fn next_synth_var_index(obj: &Map<String, Value>) -> u32 {
     let mut max_seen: Option<u32> = None;
-    for clause in ["where", "delete", "insert", "upsert", "values"] {
-        if let Some(v) = obj.get(clause) {
+    for clause in super::CLAUSE_KEYS {
+        if let Some(v) = obj.get(*clause) {
             scan_synth_var_usage(v, &mut max_seen);
         }
     }
@@ -1483,6 +1483,16 @@ fn attach_siblings(doc: &mut Value, siblings: Vec<Value>) {
             if let Some(ctx) = original_node.remove("@context") {
                 envelope.insert("@context".to_string(), ctx);
             }
+            // Lift transactor-reserved keys (routing / control, e.g. a body-form
+            // `ledger`) out of the data node up to the envelope, where
+            // `strip_opts_for_expansion` removes them before expansion.
+            // Without this, rewrapping buries them inside `@graph` and they
+            // leak as stray predicates on the subject (e.g. `<s> ledger "...").
+            for key in super::RESERVED_TXN_KEYS {
+                if let Some(v) = original_node.remove(*key) {
+                    envelope.insert((*key).to_string(), v);
+                }
+            }
             let mut graph_items = Vec::with_capacity(1 + siblings.len());
             graph_items.push(Value::Object(original_node));
             graph_items.extend(siblings);
@@ -1541,49 +1551,47 @@ pub(crate) fn lower_value_with_subject(
 /// keeps documents like `{"@context": ..., "opts": ..., "@graph": [...]}`
 /// classified as envelopes so we don't mint a synthetic subject for the
 /// outer wrapper.
+///
+/// The transactor-reserved routing / dataset keys ([`super::RESERVED_TXN_KEYS`],
+/// e.g. body-ledger `ledger`, `from`) ride along in the JSON body and must be
+/// tolerated here too — without this, a body-ledger `{"ledger": "...",
+/// "@context": ..., "@graph": [...]}` document is misclassified as a node-map,
+/// the `@graph` array is skipped during `@annotation` lowering, and
+/// annotations silently survive raw into JSON-LD expansion as dangling literal
+/// predicates (no reification bundle).
 fn is_envelope(map: &Map<String, Value>) -> bool {
-    if !map.contains_key("@graph") {
+    if !matches!(map.get("@graph"), Some(Value::Array(_))) {
         return false;
     }
-    let graph_is_array = matches!(map.get("@graph"), Some(Value::Array(_)));
-    if !graph_is_array {
-        return false;
-    }
-    map.keys()
-        .all(|k| matches!(k.as_str(), "@context" | "@graph" | "opts"))
+    map.keys().all(|k| {
+        matches!(k.as_str(), "@context" | "@graph")
+            || super::RESERVED_TXN_KEYS.contains(&k.as_str())
+    })
 }
 
 /// True when `map` is a transaction wrapper (UPDATE / explicit
 /// Insert+opts shape) rather than a node-map. The wrapper carries
-/// clause keys (`where`, `delete`, `insert`, `upsert`, `values`,
-/// `opts`, `ledger`) plus the optional `@context`, but no predicates
-/// of its own — so we must not mint an `@id` for it. Each clause's
-/// value is itself a fresh top-level payload that we recurse into.
+/// clause keys ([`super::CLAUSE_KEYS`]) plus the optional `@context` and
+/// any transactor-reserved keys ([`super::RESERVED_TXN_KEYS`] — `opts`,
+/// `ledger`, `txn-meta`, `from`, `fromNamed`, `from-named`, `graph`), but
+/// no predicates of its own — so we must not mint an `@id` for it. Each
+/// clause's value is itself a fresh top-level payload that we recurse into.
 ///
-/// The check fires when at least one clause key is present and
-/// every key is either a clause key, `@context`, or `@id`/`@type`
-/// (rare in transaction docs but tolerated). The `@id`/`@type`
-/// tolerance lets through documents that have already been minted
-/// by an earlier pass.
+/// The check fires when at least one clause key is present and every key is
+/// either a clause key, `@context`, or a reserved key. Sourcing the reserved
+/// set from the shared const keeps this in lock-step with the strip / envelope
+/// stages: a drift there is what dropped `@annotation` reification on UPDATE
+/// wrappers carrying `txn-meta` / `from-named` / `graph`.
 fn is_transaction_wrapper(map: &Map<String, Value>) -> bool {
-    const CLAUSE_KEYS: &[&str] = &["where", "delete", "insert", "upsert", "values"];
-    const WRAPPER_KEYS: &[&str] = &[
-        "where",
-        "delete",
-        "insert",
-        "upsert",
-        "values",
-        "opts",
-        "ledger",
-        "@context",
-        "from",
-        "fromNamed",
-    ];
-    let has_clause = CLAUSE_KEYS.iter().any(|k| map.contains_key(*k));
+    let has_clause = super::CLAUSE_KEYS.iter().any(|k| map.contains_key(*k));
     if !has_clause {
         return false;
     }
-    map.keys().all(|k| WRAPPER_KEYS.contains(&k.as_str()))
+    map.keys().all(|k| {
+        k == "@context"
+            || super::CLAUSE_KEYS.contains(&k.as_str())
+            || super::RESERVED_TXN_KEYS.contains(&k.as_str())
+    })
 }
 
 /// True when `map` is a JSON-LD value/list/variable wrapper rather
@@ -1925,6 +1933,35 @@ mod tests {
     fn lower(mut doc: Value) -> Result<Value> {
         lower_edge_annotations(&mut doc)?;
         Ok(doc)
+    }
+
+    // ---- Reserved-key sync guard ----------------------------------------
+
+    #[test]
+    fn every_reserved_key_tolerated_by_envelope_and_wrapper() {
+        // Pins the invariant that the structural detectors stay in lock-step
+        // with the canonical reserved-key set. A reserved key riding alongside
+        // `@graph` (envelope) or a clause (wrapper) must NOT demote the doc to
+        // a node-map, or annotation lowering would skip the data and silently
+        // drop reifications.
+        for key in super::super::RESERVED_TXN_KEYS {
+            let mut envelope = obj_map(json!({ "@graph": [] }));
+            envelope.insert((*key).to_string(), json!("x"));
+            assert!(
+                is_envelope(&envelope),
+                "is_envelope must tolerate reserved key {key:?}"
+            );
+
+            // Use a clause key the reserved key never collides with.
+            let mut wrapper = obj_map(json!({ "insert": {"@id": "ex:a", "ex:p": "v"} }));
+            if *key != "insert" {
+                wrapper.insert((*key).to_string(), json!("x"));
+            }
+            assert!(
+                is_transaction_wrapper(&wrapper),
+                "is_transaction_wrapper must tolerate reserved key {key:?}"
+            );
+        }
     }
 
     // ---- ReifiedObjectShape classifier ----------------------------------
