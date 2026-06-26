@@ -114,20 +114,30 @@ pub struct RaftIntegration {
     release_rx: Arc<Mutex<Option<ReleaseReceiver>>>,
 }
 
-/// Parts the [`RaftIntegration::new`] assembler stitches together.
-/// Grouped so the constructor stays a single positional struct
-/// argument instead of an eight-parameter call site — each field
-/// is independently produced upstream and they only meet here.
-pub struct RaftIntegrationParts {
-    pub raft: Arc<Raft<TypeConfig>>,
-    pub id: NodeId,
-    pub http_client: reqwest::Client,
-    pub shared_state: SharedState,
+/// HTTP transport surface the integration ferries across the
+/// construction boundary. [`client`](Self::client) is built from
+/// [`config`](Self::config) and routes to the leader-forward
+/// middleware and the cross-node propose forwards in `RaftNameService`;
+/// [`config`](Self::config) lives on past construction in the
+/// integration's storage, where `raft_rpc_router` reads the per-route
+/// body-byte caps from it.
+pub struct HttpTransport {
+    pub client: reqwest::Client,
+    pub config: NetworkConfig,
+}
+
+/// In-process channels the state-machine adapter writes to on apply.
+/// `bootstrap` creates the three together and threads them into the
+/// adapter via [`StateMachineAdapter::with_event_bus`],
+/// [`with_waiter_map`](StateMachineAdapter::with_waiter_map),
+/// [`with_staged_receipts`](StateMachineAdapter::with_staged_receipts);
+/// the integration ferries them across the construction boundary so
+/// every downstream consumer (event listener, transactor, worker
+/// supervisor, name service) reads from the same set.
+pub struct AdapterChannels {
     pub event_bus: Arc<LedgerEventBus>,
     pub waiter_map: Arc<WaiterMap>,
     pub staged_receipts: Arc<StagedReceiptMap>,
-    pub network_config: NetworkConfig,
-    pub release_rx: ReleaseReceiver,
 }
 
 impl RaftIntegration {
@@ -135,18 +145,23 @@ impl RaftIntegration {
     /// The HTTP client is shared with the leader-forward middleware
     /// so a single connection pool serves both inter-node RPC and
     /// follower→leader request relays.
-    pub fn new(parts: RaftIntegrationParts) -> Self {
-        let RaftIntegrationParts {
-            raft,
-            id,
-            http_client,
-            shared_state,
+    pub fn new(
+        raft: Arc<Raft<TypeConfig>>,
+        id: NodeId,
+        shared_state: SharedState,
+        channels: AdapterChannels,
+        transport: HttpTransport,
+        release_rx: ReleaseReceiver,
+    ) -> Self {
+        let AdapterChannels {
             event_bus,
             waiter_map,
             staged_receipts,
-            network_config,
-            release_rx,
-        } = parts;
+        } = channels;
+        let HttpTransport {
+            client: http_client,
+            config: network_config,
+        } = transport;
         let forwarder = Arc::new(LeaderForwarder::new(
             Arc::clone(&raft),
             id,
@@ -220,17 +235,21 @@ impl RaftIntegration {
 
         let raft = Raft::new(config.node_id, raft_cfg, factory, log, sm).await?;
 
-        Ok(Self::new(RaftIntegrationParts {
-            raft: Arc::new(raft),
-            id: config.node_id,
-            http_client,
+        Ok(Self::new(
+            Arc::new(raft),
+            config.node_id,
             shared_state,
-            event_bus,
-            waiter_map,
-            staged_receipts,
-            network_config,
+            AdapterChannels {
+                event_bus,
+                waiter_map,
+                staged_receipts,
+            },
+            HttpTransport {
+                client: http_client,
+                config: network_config,
+            },
             release_rx,
-        }))
+        ))
     }
 
     /// Inter-node Raft RPC router. Mount under `/raft` on the private
