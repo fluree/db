@@ -17,6 +17,7 @@
 //! a [`Command`], and the log index the command was committed at;
 //! returns a [`Response`] describing the outcome.
 
+use crate::raft::NodeId;
 use crate::IdempotencyCacheKey;
 use fluree_db_api::{ContentId, PolicyStats, TrackingTally};
 use fluree_db_core::ledger_id::{format_ledger_id, split_ledger_id};
@@ -24,7 +25,7 @@ use fluree_db_nameservice::{
     ConfigValue, GraphSourceRecord, GraphSourceType, RefKind, RefValue, StatusValue,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use thiserror::Error;
 
 /// Postcard-friendly mirror of [`TrackingTally`].
@@ -491,6 +492,16 @@ pub struct NameServiceState {
     /// [`Command::RetractGraphSource`] flips the retracted flag.
     #[serde(default)]
     pub graph_sources: HashMap<String, GraphSourceRecord>,
+    /// Subset of the configured voter set the cluster considers
+    /// eligible to host commit workers. Read by the per-node worker
+    /// supervisor's `compute_desired_owners` as the rendezvous-hash
+    /// input; mutated by [`Command::SetWorkerEligibility`] proposed
+    /// from the current leader's liveness monitor. Empty when the
+    /// state machine hasn't observed an explicit eligibility yet —
+    /// the supervisor falls back to the raft membership in that
+    /// case so a fresh cluster works without explicit init.
+    #[serde(default)]
+    pub worker_eligible_voters: BTreeSet<NodeId>,
 }
 
 /// Replicated commands the state machine accepts.
@@ -666,6 +677,13 @@ pub enum Command {
         cutoff_millis: u64,
         marker_cutoff_millis: u64,
     },
+    /// Flip a voter's entry in
+    /// [`NameServiceState::worker_eligible_voters`]. Proposed by the
+    /// current leader's liveness monitor based on observed openraft
+    /// replication state: a sustained outage flips the voter to
+    /// ineligible (no new worker assignments rendezvous to it);
+    /// restored contact flips it back to eligible.
+    SetWorkerEligibility(SetWorkerEligibilityArgs),
 }
 
 /// Payload for [`Command::PushConfig`].
@@ -730,6 +748,22 @@ pub struct PoisonQueueEntryArgs {
     pub branch: String,
     pub queue_id: u64,
     pub reason: PoisonReason,
+    pub applied_at_millis: u64,
+}
+
+/// Payload for [`Command::SetWorkerEligibility`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SetWorkerEligibilityArgs {
+    /// Voter whose entry in
+    /// [`NameServiceState::worker_eligible_voters`] is being toggled.
+    pub voter: NodeId,
+    /// Desired post-apply membership of `voter` in the set:
+    /// `true` inserts (idempotent), `false` removes (idempotent).
+    pub eligible: bool,
+    /// Leader's wall-clock at propose, milliseconds since epoch.
+    /// Metadata only — the apply doesn't use it for any ordering or
+    /// eviction decision; carried for parity with the other state-
+    /// mutating commands and as an audit hook.
     pub applied_at_millis: u64,
 }
 
@@ -986,6 +1020,18 @@ pub enum Response {
         removed: usize,
         released_envelopes: Vec<(String, ContentId)>,
     },
+    /// [`Command::SetWorkerEligibility`] applied. `changed` is
+    /// `true` when the apply actually mutated
+    /// [`NameServiceState::worker_eligible_voters`], `false` when
+    /// the voter's membership in the set already matched the
+    /// requested `eligible` flag — distinguishing the two lets the
+    /// leader's monitor log a state flip without confusing it with
+    /// an idempotent re-propose.
+    WorkerEligibilitySet {
+        voter: NodeId,
+        eligible: bool,
+        changed: bool,
+    },
     /// Command was understood but no state change resulted (e.g.,
     /// [`Command::ReleaseContent`]).
     NoOp,
@@ -1122,6 +1168,35 @@ pub fn apply(state: &mut NameServiceState, command: Command, log_index: u64) -> 
             cutoff_millis,
             marker_cutoff_millis,
         } => apply_evict_idempotency(state, cutoff_millis, marker_cutoff_millis),
+        Command::SetWorkerEligibility(args) => apply_set_worker_eligibility(state, args),
+    }
+}
+
+/// Apply [`Command::SetWorkerEligibility`]. Insert or remove
+/// `voter` from [`NameServiceState::worker_eligible_voters`] per
+/// the `eligible` flag. Idempotent: a no-op apply returns
+/// `changed: false`. No quorum check yet — the leader's monitor
+/// (and the membership-tracking field the adapter populates) come
+/// in a later piece; this apply is the wire format and storage
+/// shape only.
+fn apply_set_worker_eligibility(
+    state: &mut NameServiceState,
+    args: SetWorkerEligibilityArgs,
+) -> Response {
+    let SetWorkerEligibilityArgs {
+        voter,
+        eligible,
+        applied_at_millis: _,
+    } = args;
+    let changed = if eligible {
+        state.worker_eligible_voters.insert(voter)
+    } else {
+        state.worker_eligible_voters.remove(&voter)
+    };
+    Response::WorkerEligibilitySet {
+        voter,
+        eligible,
+        changed,
     }
 }
 
@@ -4792,5 +4867,133 @@ mod tests {
         // Marker is one-shot.
         let ref_key = RefKey::new("test/db", "feature");
         assert!(!state.recently_cleared.contains_key(&ref_key));
+    }
+
+    // ----------------------------------------------------------------
+    // Command::SetWorkerEligibility
+    // ----------------------------------------------------------------
+
+    fn set_eligibility(voter: NodeId, eligible: bool) -> Command {
+        Command::SetWorkerEligibility(SetWorkerEligibilityArgs {
+            voter,
+            eligible,
+            applied_at_millis: 1_000,
+        })
+    }
+
+    #[test]
+    fn set_eligibility_inserts_voter_into_empty_set() {
+        let mut state = NameServiceState::new();
+        assert!(state.worker_eligible_voters.is_empty());
+
+        let resp = apply(&mut state, set_eligibility(7, true), 1);
+
+        match resp {
+            Response::WorkerEligibilitySet {
+                voter,
+                eligible,
+                changed,
+            } => {
+                assert_eq!(voter, 7);
+                assert!(eligible);
+                assert!(changed);
+            }
+            other => panic!("expected WorkerEligibilitySet, got {other:?}"),
+        }
+        assert!(state.worker_eligible_voters.contains(&7));
+        assert_eq!(state.worker_eligible_voters.len(), 1);
+    }
+
+    #[test]
+    fn set_eligibility_inserting_already_present_voter_is_unchanged_noop() {
+        let mut state = NameServiceState::new();
+        state.worker_eligible_voters.insert(3);
+
+        let resp = apply(&mut state, set_eligibility(3, true), 1);
+
+        match resp {
+            Response::WorkerEligibilitySet { changed, .. } => assert!(!changed),
+            other => panic!("expected WorkerEligibilitySet, got {other:?}"),
+        }
+        assert_eq!(state.worker_eligible_voters.len(), 1);
+    }
+
+    #[test]
+    fn set_eligibility_removes_voter_from_set() {
+        let mut state = NameServiceState::new();
+        state.worker_eligible_voters.insert(5);
+        state.worker_eligible_voters.insert(6);
+
+        let resp = apply(&mut state, set_eligibility(5, false), 1);
+
+        match resp {
+            Response::WorkerEligibilitySet {
+                voter,
+                eligible,
+                changed,
+            } => {
+                assert_eq!(voter, 5);
+                assert!(!eligible);
+                assert!(changed);
+            }
+            other => panic!("expected WorkerEligibilitySet, got {other:?}"),
+        }
+        assert!(!state.worker_eligible_voters.contains(&5));
+        assert!(state.worker_eligible_voters.contains(&6));
+    }
+
+    #[test]
+    fn set_eligibility_removing_absent_voter_is_unchanged_noop() {
+        let mut state = NameServiceState::new();
+        state.worker_eligible_voters.insert(2);
+
+        let resp = apply(&mut state, set_eligibility(99, false), 1);
+
+        match resp {
+            Response::WorkerEligibilitySet { changed, .. } => assert!(!changed),
+            other => panic!("expected WorkerEligibilitySet, got {other:?}"),
+        }
+        // Original entry untouched.
+        assert!(state.worker_eligible_voters.contains(&2));
+        assert_eq!(state.worker_eligible_voters.len(), 1);
+    }
+
+    #[test]
+    fn set_eligibility_apply_is_deterministic_for_back_to_back_flips() {
+        // Same voter, opposite eligibility — exercises that the
+        // apply is order-sensitive on the flag and that each flip
+        // observes the prior apply's mutation rather than the
+        // pre-state.
+        let mut state = NameServiceState::new();
+
+        let r1 = apply(&mut state, set_eligibility(11, true), 1);
+        let r2 = apply(&mut state, set_eligibility(11, false), 2);
+        let r3 = apply(&mut state, set_eligibility(11, true), 3);
+
+        assert!(matches!(
+            r1,
+            Response::WorkerEligibilitySet {
+                changed: true,
+                eligible: true,
+                ..
+            }
+        ));
+        assert!(matches!(
+            r2,
+            Response::WorkerEligibilitySet {
+                changed: true,
+                eligible: false,
+                ..
+            }
+        ));
+        assert!(matches!(
+            r3,
+            Response::WorkerEligibilitySet {
+                changed: true,
+                eligible: true,
+                ..
+            }
+        ));
+        assert!(state.worker_eligible_voters.contains(&11));
     }
 }
