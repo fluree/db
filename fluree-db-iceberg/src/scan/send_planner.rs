@@ -9,7 +9,9 @@ use crate::error::{IcebergError, Result};
 use crate::io::SendIcebergStorage;
 use crate::manifest::{parse_manifest, parse_manifest_list_with_deletes};
 use crate::metadata::{Schema, Snapshot, TableMetadata};
-use crate::scan::planner::{FileScanTask, ScanConfig, ScanPlan};
+use crate::scan::planner::{
+    effective_sequence_number, FileScanTask, IncrementalScanPlan, ScanConfig, ScanPlan,
+};
 use crate::scan::pruning::can_contain_file;
 use tracing::Instrument;
 
@@ -173,6 +175,133 @@ impl<'a, S: SendIcebergStorage> SendScanPlanner<'a, S> {
             files_selected,
             files_pruned,
             has_delete_manifests,
+        })
+    }
+
+    /// Plan a full scan for a snapshot chosen by `selection` (current / by id /
+    /// as-of-time) rather than always the current snapshot.
+    pub async fn plan_scan_with_selection(
+        &self,
+        selection: &crate::metadata::SnapshotSelection,
+    ) -> Result<ScanPlan> {
+        let snapshot =
+            crate::metadata::select_snapshot(self.metadata, selection).ok_or_else(|| {
+                IcebergError::SnapshotNotFound("No snapshot matches selection".to_string())
+            })?;
+        self.plan_scan_for_snapshot(snapshot).await
+    }
+
+    /// Plan an **incremental (append-only)** scan: the data files ADDED in the
+    /// window `(from_snapshot_id, to_snapshot_id]`.
+    ///
+    /// A file is "added in the window" when its *effective data sequence number*
+    /// (see [`effective_sequence_number`]) is strictly greater than the `from`
+    /// snapshot's sequence number. `from_snapshot_id = None` means "since genesis"
+    /// (the full live state of `to`) — used for the initial materialization.
+    ///
+    /// This captures **additions only**. The caller MUST first verify the window
+    /// is append-only via [`TableMetadata::window_is_append_only`](crate::metadata::TableMetadata::window_is_append_only)
+    /// and fall back to a full re-read otherwise — overwrite/delete/replace
+    /// snapshots carry updates/deletions this scan cannot see.
+    pub async fn plan_incremental(
+        &self,
+        from_snapshot_id: Option<i64>,
+        to_snapshot_id: i64,
+    ) -> Result<IncrementalScanPlan> {
+        let to_snapshot = self.metadata.snapshot(to_snapshot_id).ok_or_else(|| {
+            IcebergError::SnapshotNotFound(format!("to snapshot {to_snapshot_id} not found"))
+        })?;
+        let from_seq = match from_snapshot_id {
+            Some(id) => {
+                self.metadata
+                    .snapshot(id)
+                    .ok_or_else(|| {
+                        IcebergError::SnapshotNotFound(format!("from snapshot {id} not found"))
+                    })?
+                    .sequence_number
+            }
+            None => 0,
+        };
+        let to_seq = to_snapshot.sequence_number;
+
+        let schema = self
+            .metadata
+            .current_schema()
+            .ok_or_else(|| IcebergError::Metadata("No current schema".to_string()))?;
+        let schema_arc = Arc::new(schema.clone());
+        let (projected_field_ids, projected_columns) = self.resolve_projection(schema)?;
+
+        let manifest_list_path = to_snapshot.manifest_list.as_ref().ok_or_else(|| {
+            IcebergError::Manifest(
+                "Snapshot has no manifest list (v1 format not supported)".to_string(),
+            )
+        })?;
+        let manifest_list_data = self.storage.read(manifest_list_path).await?;
+        let manifest_entries = parse_manifest_list(&manifest_list_data)?;
+
+        let mut added_tasks = Vec::new();
+        let mut files_selected = 0;
+        let mut estimated_row_count = 0i64;
+
+        for manifest_entry in &manifest_entries {
+            if manifest_entry.is_deletes() {
+                continue; // append-only: data manifests only
+            }
+            // A manifest written at or before `from` cannot hold files newer than
+            // `from` (every file it lists has data-seq <= the manifest's seq).
+            if manifest_entry.sequence_number <= from_seq {
+                continue;
+            }
+
+            let manifest_data = self.storage.read(&manifest_entry.manifest_path).await?;
+            let data_file_entries = parse_manifest(&manifest_data)?;
+
+            for entry in data_file_entries {
+                let eff_seq = effective_sequence_number(
+                    entry.sequence_number,
+                    manifest_entry.sequence_number,
+                );
+                if eff_seq <= from_seq {
+                    continue; // present at/before `from`
+                }
+
+                let data_file = entry.data_file;
+                if let Some(filter) = &self.config.filter {
+                    if !can_contain_file(filter, &data_file, schema) {
+                        continue;
+                    }
+                }
+
+                files_selected += 1;
+                estimated_row_count += data_file.record_count;
+                added_tasks.push(FileScanTask::for_whole_file_with_schema(
+                    data_file,
+                    projected_field_ids.clone(),
+                    self.config.filter.clone(),
+                    Arc::clone(&schema_arc),
+                ));
+            }
+        }
+
+        tracing::info!(
+            ?from_snapshot_id,
+            to_snapshot_id,
+            from_seq,
+            to_seq,
+            files_selected,
+            estimated_row_count,
+            "Incremental scan planning complete (append-only)"
+        );
+
+        Ok(IncrementalScanPlan {
+            added_tasks,
+            projected_columns,
+            projected_field_ids,
+            from_sequence_number: from_seq,
+            to_snapshot_id,
+            to_sequence_number: to_seq,
+            files_selected,
+            estimated_row_count,
         })
     }
 

@@ -166,6 +166,51 @@ impl ScanPlan {
     }
 }
 
+/// An incremental (append-only) scan plan: the data-file tasks ADDED in a
+/// `(from_sequence_number, to]` window, used to materialize only the rows that
+/// appeared since the last sync.
+///
+/// This captures the **added** half of a changelog only; callers must ensure the
+/// window contains no `overwrite`/`delete`/`replace` snapshots (see
+/// [`TableMetadata::window_is_append_only`](crate::metadata::TableMetadata::window_is_append_only))
+/// and otherwise fall back to a full re-materialization.
+#[derive(Debug)]
+pub struct IncrementalScanPlan {
+    /// Tasks for data files added in the window.
+    pub added_tasks: Vec<FileScanTask>,
+    /// Projected column names (for reference).
+    pub projected_columns: Vec<String>,
+    /// Projected field IDs.
+    pub projected_field_ids: Vec<i32>,
+    /// Exclusive lower bound: only files with effective data sequence number
+    /// strictly greater than this are included (`0` => from genesis).
+    pub from_sequence_number: i64,
+    /// The snapshot the window ends at (inclusive).
+    pub to_snapshot_id: i64,
+    /// Sequence number of `to_snapshot_id`.
+    pub to_sequence_number: i64,
+    /// Number of added files selected.
+    pub files_selected: usize,
+    /// Estimated added row count.
+    pub estimated_row_count: i64,
+}
+
+/// Effective data sequence number of a manifest entry, applying Iceberg's
+/// inheritance rule: an entry whose own sequence number is null/`0` inherits the
+/// sequence number of the manifest (i.e. the manifest-list entry) that holds it.
+///
+/// This is what makes `ADDED` entries (often written with a null sequence number)
+/// resolve to the sequence number of the snapshot that added them.
+pub fn effective_sequence_number(
+    entry_sequence_number: Option<i64>,
+    manifest_sequence_number: i64,
+) -> i64 {
+    match entry_sequence_number {
+        Some(s) if s != 0 => s,
+        _ => manifest_sequence_number,
+    }
+}
+
 /// Scan planner for Iceberg tables.
 pub struct ScanPlanner<'a, S: IcebergStorage> {
     storage: &'a S,
@@ -390,6 +435,17 @@ mod tests {
         assert!(task.residual_filter.is_none());
         assert_eq!(task.start, 0);
         assert_eq!(task.length, 10240);
+    }
+
+    #[test]
+    fn test_effective_sequence_number_inheritance() {
+        // An explicit, non-zero entry sequence number is used as-is.
+        assert_eq!(effective_sequence_number(Some(7), 3), 7);
+        // A null sequence number inherits the manifest's (ADDED entries are
+        // commonly written with a null sequence number).
+        assert_eq!(effective_sequence_number(None, 5), 5);
+        // Zero is treated as null and also inherits.
+        assert_eq!(effective_sequence_number(Some(0), 5), 5);
     }
 }
 

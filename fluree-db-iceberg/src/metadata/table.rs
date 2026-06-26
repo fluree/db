@@ -107,6 +107,65 @@ impl TableMetadata {
     pub fn default_partition_spec(&self) -> Option<&PartitionSpec> {
         self.partition_spec(self.default_spec_id)
     }
+
+    /// The snapshots in the window `(from_id, to_id]`, newest first, walking the
+    /// `parent_snapshot_id` chain from `to_id` back toward `from_id`.
+    ///
+    /// `from_id = None` walks to the root (the full history up to `to_id`).
+    /// Returns an error if `to_id` is unknown, an ancestor is missing (e.g. an
+    /// expired snapshot), or `from_id` is not an ancestor of `to_id` (a branch or
+    /// rollback) — in all of which the caller should fall back to a full re-read.
+    pub fn snapshot_window(
+        &self,
+        from_id: Option<i64>,
+        to_id: i64,
+    ) -> crate::error::Result<Vec<&super::Snapshot>> {
+        if from_id == Some(to_id) {
+            return Ok(Vec::new());
+        }
+        let mut window = Vec::new();
+        let mut cur = self.snapshot(to_id).ok_or_else(|| {
+            crate::error::IcebergError::SnapshotNotFound(format!("snapshot {to_id} not found"))
+        })?;
+        loop {
+            window.push(cur);
+            match cur.parent_snapshot_id {
+                Some(pid) if Some(pid) == from_id => return Ok(window),
+                Some(pid) => {
+                    cur = self.snapshot(pid).ok_or_else(|| {
+                        crate::error::IcebergError::SnapshotNotFound(format!(
+                            "ancestor snapshot {pid} not found (history may be expired)"
+                        ))
+                    })?;
+                }
+                None => {
+                    // Reached the root snapshot.
+                    if from_id.is_none() {
+                        return Ok(window);
+                    }
+                    return Err(crate::error::IcebergError::Metadata(format!(
+                        "snapshot {} is not an ancestor of {to_id}",
+                        from_id.unwrap()
+                    )));
+                }
+            }
+        }
+    }
+
+    /// Whether every snapshot in `(from_id, to_id]` was created by an `append`
+    /// operation. Only then does an added-files incremental scan capture all
+    /// changes (no `overwrite`/`delete`/`replace` => no updates or deletions to
+    /// miss). A snapshot with no recorded operation is treated as not-append-only
+    /// (fail safe: caller should full-refresh). Propagates `snapshot_window`
+    /// errors (unknown/expired/non-ancestor).
+    pub fn window_is_append_only(
+        &self,
+        from_id: Option<i64>,
+        to_id: i64,
+    ) -> crate::error::Result<bool> {
+        let window = self.snapshot_window(from_id, to_id)?;
+        Ok(window.iter().all(|s| s.operation() == Some("append")))
+    }
 }
 
 /// Schema definition.
@@ -330,5 +389,107 @@ mod tests {
     fn test_properties() {
         let metadata = TableMetadata::from_json_str(SAMPLE_METADATA).unwrap();
         assert_eq!(metadata.properties.get("owner"), Some(&"test".to_string()));
+    }
+
+    // ---- incremental window helpers ----
+
+    fn snap(id: i64, parent: Option<i64>, seq: i64, op: Option<&str>) -> crate::metadata::Snapshot {
+        let mut summary = HashMap::new();
+        if let Some(o) = op {
+            summary.insert("operation".to_string(), o.to_string());
+        }
+        crate::metadata::Snapshot {
+            snapshot_id: id,
+            parent_snapshot_id: parent,
+            sequence_number: seq,
+            timestamp_ms: seq * 1000,
+            manifest_list: Some(format!("snap-{id}.avro")),
+            manifests: None,
+            summary,
+            schema_id: Some(0),
+        }
+    }
+
+    fn meta_with(snapshots: Vec<crate::metadata::Snapshot>) -> TableMetadata {
+        let current = snapshots.last().map(|s| s.snapshot_id);
+        let last_seq = snapshots
+            .iter()
+            .map(|s| s.sequence_number)
+            .max()
+            .unwrap_or(0);
+        TableMetadata {
+            format_version: 2,
+            table_uuid: None,
+            location: "s3://b/t".to_string(),
+            last_sequence_number: last_seq,
+            last_updated_ms: 0,
+            last_column_id: 1,
+            current_schema_id: 0,
+            schemas: vec![],
+            current_snapshot_id: current,
+            snapshots,
+            snapshot_log: vec![],
+            default_spec_id: 0,
+            partition_specs: vec![],
+            last_partition_id: 0,
+            sort_orders: vec![],
+            default_sort_order_id: 0,
+            properties: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn snapshot_window_walks_parent_chain() {
+        let m = meta_with(vec![
+            snap(1, None, 1, Some("append")),
+            snap(2, Some(1), 2, Some("append")),
+            snap(3, Some(2), 3, Some("append")),
+        ]);
+        // (1, 3] -> snapshots 3 then 2 (newest first), excluding the `from` (1)
+        let ids: Vec<i64> = m
+            .snapshot_window(Some(1), 3)
+            .unwrap()
+            .iter()
+            .map(|s| s.snapshot_id)
+            .collect();
+        assert_eq!(ids, vec![3, 2]);
+        // from == to -> empty
+        assert!(m.snapshot_window(Some(3), 3).unwrap().is_empty());
+        // from = None -> full history
+        let full: Vec<i64> = m
+            .snapshot_window(None, 3)
+            .unwrap()
+            .iter()
+            .map(|s| s.snapshot_id)
+            .collect();
+        assert_eq!(full, vec![3, 2, 1]);
+        // `from` not an ancestor of `to` (branch/rollback) -> error
+        assert!(m.snapshot_window(Some(99), 3).is_err());
+        // unknown `to` -> error
+        assert!(m.snapshot_window(Some(1), 42).is_err());
+    }
+
+    #[test]
+    fn window_is_append_only_detects_non_append() {
+        let all_append = meta_with(vec![
+            snap(1, None, 1, Some("append")),
+            snap(2, Some(1), 2, Some("append")),
+        ]);
+        assert!(all_append.window_is_append_only(Some(1), 2).unwrap());
+        // from == to -> empty window -> vacuously append-only (nothing to apply)
+        assert!(all_append.window_is_append_only(Some(2), 2).unwrap());
+
+        let with_overwrite = meta_with(vec![
+            snap(1, None, 1, Some("append")),
+            snap(2, Some(1), 2, Some("overwrite")),
+        ]);
+        assert!(!with_overwrite.window_is_append_only(Some(1), 2).unwrap());
+
+        // A snapshot with no recorded operation is not provably append-only.
+        let no_op = meta_with(vec![
+            snap(1, None, 1, Some("append")),
+            snap(2, Some(1), 2, None),
+        ]);
+        assert!(!no_op.window_is_append_only(Some(1), 2).unwrap());
     }
 }
