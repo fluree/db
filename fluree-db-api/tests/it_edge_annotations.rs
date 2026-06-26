@@ -274,6 +274,219 @@ async fn single_object_body_ledger_insert_lowers_annotation_and_drops_routing_ke
     );
 }
 
+/// Collect the `?role` column of an inline-annotation query into a sorted set.
+async fn annotation_roles(
+    fluree: &MemoryFluree,
+    ledger: &MemoryLedger,
+) -> std::collections::BTreeSet<String> {
+    let query = json!({
+        "@context": ctx(),
+        "select": ["?role"],
+        "where": {
+            "@id": "?person",
+            "ex:worksFor": { "@id": "?org", "@annotation": { "ex:role": "?role" } }
+        }
+    });
+    let rows = support::query_jsonld_formatted(fluree, ledger, &query)
+        .await
+        .expect("annotation role query");
+    rows.as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(JsonValue::as_array)
+        .filter_map(|cols| cols.first().and_then(JsonValue::as_str))
+        .map(String::from)
+        .collect()
+}
+
+#[tokio::test]
+async fn update_insert_clause_mints_annotation_constant() {
+    // Minting a brand-new annotated edge through an UPDATE `insert` clause
+    // (constant template, gated by a matching WHERE). Both the base edge and
+    // its reified annotation must persist — previously the inline `@annotation`
+    // caused the whole insert clause to silently no-op.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/edge-annotations:update-insert-const";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+    let seed = json!({ "@context": ctx(), "@id": "ex:anchor", "ex:tag": "x" });
+    let seeded = fluree.insert(ledger0, &seed).await.expect("seed");
+
+    let update = json!({
+        "@context": ctx(),
+        "where": { "@id": "ex:anchor", "ex:tag": "?t" },
+        "insert": {
+            "@id": "ex:alice",
+            "ex:worksFor": { "@id": "ex:acme", "@annotation": { "ex:role": "Engineer" } }
+        }
+    });
+    let committed = fluree
+        .update(seeded.ledger, &update)
+        .await
+        .expect("update insert with inline annotation");
+
+    // Base edge landed.
+    let base_q = json!({
+        "@context": ctx(),
+        "select": ["?o"],
+        "where": { "@id": "ex:alice", "ex:worksFor": "?o" }
+    });
+    let base = support::query_jsonld_formatted(&fluree, &committed.ledger, &base_q)
+        .await
+        .expect("base edge query");
+    assert_eq!(
+        base.as_array().map(Vec::len),
+        Some(1),
+        "base edge must land, got: {base:#?}"
+    );
+
+    // Annotation reified.
+    assert_eq!(
+        annotation_roles(&fluree, &committed.ledger).await,
+        ["Engineer"].iter().map(ToString::to_string).collect()
+    );
+}
+
+#[tokio::test]
+async fn update_insert_clause_mints_annotation_for_where_bound_edges() {
+    // Annotate every edge matched by WHERE: the reification bundle references
+    // the WHERE-bound subject/object per solution, and each binding mints a
+    // distinct annotation (no blank-node collision across solutions).
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/edge-annotations:update-insert-where-bound";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+    let seed = json!({
+        "@context": ctx(),
+        "@graph": [
+            { "@id": "ex:alice", "ex:worksFor": { "@id": "ex:acme" } },
+            { "@id": "ex:bob", "ex:worksFor": { "@id": "ex:globex" } }
+        ]
+    });
+    let seeded = fluree.insert(ledger0, &seed).await.expect("seed two edges");
+
+    // Re-assert each matched edge with an annotation tying it to its object.
+    let update = json!({
+        "@context": ctx(),
+        "where": { "@id": "?p", "ex:worksFor": "?o" },
+        "insert": {
+            "@id": "?p",
+            "ex:worksFor": { "@id": "?o", "@annotation": { "ex:role": "Staff" } }
+        }
+    });
+    let committed = fluree
+        .update(seeded.ledger, &update)
+        .await
+        .expect("where-bound annotated update");
+
+    // Both edges carry a "Staff" annotation → one row per annotated edge.
+    let query = json!({
+        "@context": ctx(),
+        "select": ["?person", "?org"],
+        "where": {
+            "@id": "?person",
+            "ex:worksFor": { "@id": "?org", "@annotation": { "ex:role": "Staff" } }
+        }
+    });
+    let rows = support::query_jsonld_formatted(&fluree, &committed.ledger, &query)
+        .await
+        .expect("annotated-edge query");
+    let pairs: std::collections::BTreeSet<(String, String)> = rows
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(JsonValue::as_array)
+        .filter_map(|cols| {
+            Some((
+                cols.first()?.as_str()?.to_string(),
+                cols.get(1)?.as_str()?.to_string(),
+            ))
+        })
+        .collect();
+    assert_eq!(
+        pairs,
+        [
+            ("ex:alice".to_string(), "ex:acme".to_string()),
+            ("ex:bob".to_string(), "ex:globex".to_string()),
+        ]
+        .into_iter()
+        .collect(),
+        "each WHERE-bound edge must mint its own annotation, got: {rows:#?}"
+    );
+}
+
+#[tokio::test]
+async fn update_insert_clause_anonymous_annotation_reifies() {
+    // Anonymous (blank-node) annotation minted through an update insert clause.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/edge-annotations:update-insert-anon";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+    let seed = json!({ "@context": ctx(), "@id": "ex:anchor", "ex:tag": "x" });
+    let seeded = fluree.insert(ledger0, &seed).await.expect("seed");
+
+    let update = json!({
+        "@context": ctx(),
+        "where": { "@id": "ex:anchor", "ex:tag": "?t" },
+        "insert": {
+            "@id": "ex:alice",
+            "ex:worksFor": { "@id": "ex:acme", "@annotation": { "ex:role": "Engineer" } }
+        }
+    });
+    let committed = fluree
+        .update(seeded.ledger, &update)
+        .await
+        .expect("anonymous annotated update");
+
+    assert_eq!(
+        annotation_roles(&fluree, &committed.ledger).await,
+        ["Engineer"].iter().map(ToString::to_string).collect()
+    );
+}
+
+#[tokio::test]
+async fn update_delete_and_insert_annotation_in_one_txn() {
+    // Interaction: the delete-clause annotation pre-pass and the insert-clause
+    // lowering must coexist in one update. Retract the old annotation metadata
+    // (by the annotation's @id) while minting a fresh annotated edge.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/edge-annotations:update-delete-and-insert";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+    let seed = json!({
+        "@context": ctx(),
+        "@id": "ex:alice",
+        "ex:worksFor": {
+            "@id": "ex:acme",
+            "@annotation": { "@id": "ex:emp/alice-acme", "ex:role": "Engineer" }
+        }
+    });
+    let seeded = fluree
+        .insert(ledger0, &seed)
+        .await
+        .expect("seed annotated edge");
+
+    let update = json!({
+        "@context": ctx(),
+        "where": { "@id": "ex:emp/alice-acme", "ex:role": "?r" },
+        "delete": { "@id": "ex:emp/alice-acme", "ex:role": "Engineer" },
+        "insert": {
+            "@id": "ex:bob",
+            "ex:worksFor": { "@id": "ex:globex", "@annotation": { "ex:role": "Manager" } }
+        }
+    });
+    let committed = fluree
+        .update(seeded.ledger, &update)
+        .await
+        .expect("combined delete + insert annotation update");
+
+    // Old "Engineer" metadata gone, new "Manager" annotation minted.
+    assert_eq!(
+        annotation_roles(&fluree, &committed.ledger).await,
+        ["Manager"].iter().map(ToString::to_string).collect()
+    );
+}
+
 #[tokio::test]
 async fn bare_triple_pattern_returns_one_row_per_edge_regardless_of_annotations() {
     // Multiplicity contract: the `Pattern::Triple(?s, ex:worksFor, ?o)`
