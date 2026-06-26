@@ -116,34 +116,57 @@ async fn read_whole_local(path: &Path, expected_size: u64) -> Option<Bytes> {
     }
 }
 
-/// A [`SendIcebergStorage`] backed by a single local cache file, so a large
-/// file's byte ranges are served from local disk instead of the remote store.
-/// Reads run synchronously; the chunk reader only drives this from a blocking
-/// context. The `path` argument is ignored — every read targets the cache file.
+/// A [`SendIcebergStorage`] backed by a single local cache file, serving a large
+/// file's byte ranges from local disk instead of the remote store. Reads run
+/// synchronously; the chunk reader only drives this from a blocking context.
+///
+/// Because the shared disk cache can evict this file concurrently (eviction is
+/// mtime-ordered with no in-use pinning), a local read can fail *after* the file
+/// was validated. Rather than failing the query, a failed local read falls back
+/// to the `source` store using the original source `path` — turning a mid-read
+/// eviction into a (rare) slow read instead of an `IcebergError`.
 #[derive(Debug)]
-struct LocalFileStorage {
+struct LocalFileStorage<S: SendIcebergStorage> {
     path: PathBuf,
     size: u64,
+    source: Arc<S>,
+}
+
+impl<S: SendIcebergStorage> LocalFileStorage<S> {
+    fn read_local(&self) -> std::io::Result<Bytes> {
+        std::fs::read(&self.path).map(Bytes::from)
+    }
+
+    fn read_range_local(&self, range: &Range<u64>) -> std::io::Result<Bytes> {
+        let mut f = std::fs::File::open(&self.path)?;
+        f.seek(SeekFrom::Start(range.start))?;
+        let len = range.end.saturating_sub(range.start) as usize;
+        let mut buf = vec![0u8; len];
+        f.read_exact(&mut buf)?;
+        Ok(Bytes::from(buf))
+    }
 }
 
 #[async_trait]
-impl SendIcebergStorage for LocalFileStorage {
-    async fn read(&self, _path: &str) -> Result<Bytes> {
-        std::fs::read(&self.path)
-            .map(Bytes::from)
-            .map_err(|e| IcebergError::Storage(format!("local cache read: {e}")))
+impl<S: SendIcebergStorage + 'static> SendIcebergStorage for LocalFileStorage<S> {
+    async fn read(&self, path: &str) -> Result<Bytes> {
+        match self.read_local() {
+            Ok(bytes) => Ok(bytes),
+            Err(e) => {
+                tracing::debug!(path, error = %e, "local cache read failed; falling back to source");
+                self.source.read(path).await
+            }
+        }
     }
 
-    async fn read_range(&self, _path: &str, range: Range<u64>) -> Result<Bytes> {
-        let mut f = std::fs::File::open(&self.path)
-            .map_err(|e| IcebergError::Storage(format!("local cache open: {e}")))?;
-        f.seek(SeekFrom::Start(range.start))
-            .map_err(|e| IcebergError::Storage(format!("local cache seek: {e}")))?;
-        let len = range.end.saturating_sub(range.start) as usize;
-        let mut buf = vec![0u8; len];
-        f.read_exact(&mut buf)
-            .map_err(|e| IcebergError::Storage(format!("local cache read_exact: {e}")))?;
-        Ok(Bytes::from(buf))
+    async fn read_range(&self, path: &str, range: Range<u64>) -> Result<Bytes> {
+        match self.read_range_local(&range) {
+            Ok(bytes) => Ok(bytes),
+            Err(e) => {
+                tracing::debug!(path, error = %e, "local cache range read failed; falling back to source");
+                self.source.read_range(path, range).await
+            }
+        }
     }
 
     async fn file_size(&self, _path: &str) -> Result<u64> {
@@ -437,6 +460,7 @@ impl<'a, S: SendIcebergStorage> SendParquetReader<'a, S> {
                 let storage = Arc::new(LocalFileStorage {
                     path: local,
                     size: file_size,
+                    source: Arc::new(self.storage.clone()),
                 });
                 return Self::decode_large_file(
                     storage,
@@ -470,6 +494,7 @@ impl<'a, S: SendIcebergStorage> SendParquetReader<'a, S> {
                     let storage = Arc::new(LocalFileStorage {
                         path: local,
                         size: file_size,
+                        source: Arc::new(self.storage.clone()),
                     });
                     return Self::decode_large_file(
                         storage,
@@ -760,6 +785,30 @@ mod tests {
 
     const MIB: u64 = 1024 * 1024;
 
+    /// In-memory source store standing in for S3, used to prove the local-cache
+    /// fallback reads from source when the cache file is gone.
+    #[derive(Debug)]
+    struct InMemorySource {
+        bytes: Bytes,
+    }
+
+    #[async_trait]
+    impl SendIcebergStorage for InMemorySource {
+        async fn read(&self, _path: &str) -> Result<Bytes> {
+            Ok(self.bytes.clone())
+        }
+
+        async fn read_range(&self, _path: &str, range: Range<u64>) -> Result<Bytes> {
+            let start = (range.start as usize).min(self.bytes.len());
+            let end = (range.end as usize).min(self.bytes.len());
+            Ok(self.bytes.slice(start..end))
+        }
+
+        async fn file_size(&self, _path: &str) -> Result<u64> {
+            Ok(self.bytes.len() as u64)
+        }
+    }
+
     #[test]
     fn admit_caches_cheap_small_files_for_any_projection() {
         // Rule 2a: a small file is cached whole even for a 1-byte projection.
@@ -841,8 +890,15 @@ mod tests {
         let dir = fresh_cache_dir("localfs");
         let path = dir.join("blob");
         std::fs::write(&path, b"0123456789").unwrap();
-        let storage = LocalFileStorage { path, size: 10 };
-        // The path argument is ignored; reads target the backing cache file.
+        let source = Arc::new(InMemorySource {
+            bytes: Bytes::from_static(b"SOURCE----"),
+        });
+        let storage = LocalFileStorage {
+            path,
+            size: 10,
+            source,
+        };
+        // While the cache file exists, reads target it (never the source).
         assert_eq!(storage.file_size("ignored").await.unwrap(), 10);
         assert_eq!(
             &storage.read_range("ignored", 2..5).await.unwrap()[..],
@@ -853,5 +909,31 @@ mod tests {
             b"789"
         );
         assert_eq!(&storage.read("ignored").await.unwrap()[..], b"0123456789");
+    }
+
+    #[tokio::test]
+    async fn local_file_storage_falls_back_to_source_when_evicted() {
+        // Simulate a concurrent cache eviction: the local file is removed after
+        // validation but before the deferred range reads run. Reads must fall
+        // back to the source store rather than failing the query.
+        let dir = fresh_cache_dir("localfs_evict");
+        let path = dir.join("blob");
+        std::fs::write(&path, b"0123456789").unwrap();
+        let source = Arc::new(InMemorySource {
+            bytes: Bytes::from_static(b"SOURCEDATA"),
+        });
+        let storage = LocalFileStorage {
+            path: path.clone(),
+            size: 10,
+            source,
+        };
+        // Evict the cache file mid-read.
+        std::fs::remove_file(&path).unwrap();
+        // Range and whole-file reads now resolve from source, not an error.
+        assert_eq!(
+            &storage.read_range("ignored", 2..5).await.unwrap()[..],
+            b"URC"
+        );
+        assert_eq!(&storage.read("ignored").await.unwrap()[..], b"SOURCEDATA");
     }
 }

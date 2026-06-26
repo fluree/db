@@ -1,0 +1,22 @@
+[package]
+name = "fluree-db-docs"
+description = "Embedded, version-pinned Fluree documentation lookup (search/get/examples) for the CLI and MCP surfaces"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# `include-exclude` enables the #[exclude] attribute. NOTE: do not enable the
+# `compression` feature — Cargo unifies it onto every rust-embed user in the
+# workspace (e.g. utoipa-swagger-ui via fluree-db-server), and it rejects the
+# absolute OUT_DIR folder paths those crates use, breaking their build.
+rust-embed = { version = "8", features = ["include-exclude"] }
+pulldown-cmark = "0.12"
+# Snowball stemming so "property path" matches the "Property Paths" heading, etc.
+rust-stemmers = "1"
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

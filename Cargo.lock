@@ -2589,7 +2589,9 @@ dependencies = [
  "fluree-db-binary-index",
  "fluree-db-core",
  "fluree-db-credential",
+ "fluree-db-docs",
  "fluree-db-indexer",
+ "fluree-db-mcp",
  "fluree-db-memory",
  "fluree-db-nameservice",
  "fluree-db-nameservice-sync",
@@ -2611,7 +2613,6 @@ dependencies = [
  "predicates",
  "rand 0.8.5",
  "reqwest",
- "rmcp",
  "serde",
  "serde_json",
  "sha2",
@@ -2747,6 +2748,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "fluree-db-docs"
+version = "4.1.0"
+dependencies = [
+ "pulldown-cmark",
+ "rust-embed",
+ "rust-stemmers",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "fluree-db-iceberg"
 version = "4.1.0"
 dependencies = [
@@ -2830,6 +2842,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "fluree-db-mcp"
+version = "4.1.0"
+dependencies = [
+ "fluree-db-docs",
+ "fluree-db-memory",
+ "rmcp",
+ "schemars 1.2.1",
+ "serde",
+ "serde_json",
+ "tracing",
+]
+
+[[package]]
 name = "fluree-db-memory"
 version = "4.1.0"
 dependencies = [
@@ -2840,8 +2865,6 @@ dependencies = [
  "fluree-graph-turtle",
  "fs2",
  "regex",
- "rmcp",
- "schemars 1.2.1",
  "serde",
  "serde_json",
  "sha2",
@@ -3553,6 +3576,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "getopts"
+version = "0.2.24"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cfe4fbac503b8d1f88e6676011885f34b7174f46e59956bba534ba83abded4df"
+dependencies = [
+ "unicode-width",
+]
+
+[[package]]
 name = "getrandom"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3600,6 +3632,19 @@ checksum = "f0d8a4362ccb29cb0b265253fb0a2728f592895ee6854fd9bc13f2ffda266ff1"
 dependencies = [
  "opaque-debug",
  "polyval",
+]
+
+[[package]]
+name = "globset"
+version = "0.4.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "52dfc19153a48bde0cbd630453615c8151bce3a5adfac7a0aebfbf0a1e1f57e3"
+dependencies = [
+ "aho-corasick",
+ "bstr",
+ "log",
+ "regex-automata",
+ "regex-syntax",
 ]
 
 [[package]]
@@ -5392,6 +5437,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "pulldown-cmark"
+version = "0.12.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f86ba2052aebccc42cbbb3ed234b8b13ce76f75c3551a303cb2bcffcff12bb14"
+dependencies = [
+ "bitflags 2.10.0",
+ "getopts",
+ "memchr",
+ "pulldown-cmark-escape",
+ "unicase",
+]
+
+[[package]]
+name = "pulldown-cmark-escape"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "007d8adb5ddab6f8e3f491ac63566a7d5002cc7ed73901f72057943fa71ae1ae"
+
+[[package]]
 name = "quad-rand"
 version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5859,6 +5923,7 @@ version = "8.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5bcdef0be6fe7f6fa333b1073c949729274b05f123a0ad7efcb8efd878e5c3b1"
 dependencies = [
+ "globset",
  "sha2",
  "walkdir",
 ]
