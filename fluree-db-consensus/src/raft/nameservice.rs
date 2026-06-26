@@ -846,6 +846,46 @@ fn map_propose_error(
     }
 }
 
+/// Classify the structured `apply_staged_commit` response into the
+/// trait-surface [`NameServiceError`] the caller's outer retry vs
+/// poison logic switches on.
+///
+/// Terminal failures route to variants the stager's
+/// `publish_head_advance` recognizes as poison-worthy
+/// ([`NameServiceError::NotFound`] for missing ledgers,
+/// [`NameServiceError::ApplyRejected`] for state-machine invariant
+/// violations); transient failures (leader transition, raft
+/// `Fatal`, stale queue front) collapse to [`NameServiceError::Storage`]
+/// so the outer loop continues to retry. Without this classification
+/// every cross-node failure flattened to `Storage` and a terminal
+/// `InvariantViolated` would spin forever, head-of-line-blocking the
+/// branch's queue.
+fn classify_apply_staged_commit_outcome(
+    outcome: std::result::Result<ApplyStagedCommitResponse, ApplyStagedCommitError>,
+    queue_id: u64,
+) -> std::result::Result<(), NameServiceError> {
+    match outcome {
+        Ok(ApplyStagedCommitResponse::Applied { .. }) => Ok(()),
+        Ok(ApplyStagedCommitResponse::Stale {
+            current_front_queue_id,
+        }) => Err(NameServiceError::storage(format!(
+            "apply_staged_commit stale: queue_id {queue_id} no longer at front \
+             (current front: {current_front_queue_id:?})"
+        ))),
+        Err(ApplyStagedCommitError::LedgerNotFound(id)) => Err(NameServiceError::not_found(id)),
+        Err(ApplyStagedCommitError::InvariantViolated(msg)) => {
+            Err(NameServiceError::apply_rejected(format!(
+                "apply_staged_commit invariant violated: {msg}"
+            )))
+        }
+        Err(
+            e @ (ApplyStagedCommitError::NotLeader { .. } | ApplyStagedCommitError::RaftPropose(_)),
+        ) => Err(NameServiceError::storage(format!(
+            "leader rejected apply_staged_commit: {e}"
+        ))),
+    }
+}
+
 fn map_queue_poison_propose_error(
     err: RaftError<NodeId, ClientWriteError<NodeId, ClusterNode>>,
 ) -> ApplyQueuePoisonError {
@@ -1042,18 +1082,7 @@ impl RaftNameService {
                 ))
             })?;
 
-        match outcome {
-            Ok(ApplyStagedCommitResponse::Applied { .. }) => Ok(()),
-            Ok(ApplyStagedCommitResponse::Stale {
-                current_front_queue_id,
-            }) => Err(NameServiceError::storage(format!(
-                "apply_staged_commit stale: queue_id {queue_id} no longer at front \
-                 (current front: {current_front_queue_id:?})"
-            ))),
-            Err(e) => Err(NameServiceError::storage(format!(
-                "leader rejected apply_staged_commit: {e}"
-            ))),
-        }
+        classify_apply_staged_commit_outcome(outcome, queue_id)
     }
 
     /// Resolve the current leader's `raft_addr` from the replicated
@@ -2107,6 +2136,122 @@ mod tests {
             commit_t: 17,
         };
         assert_args_round_trip(args_for_round_trip(receipt));
+    }
+
+    // ----------------------------------------------------------------
+    // classify_apply_staged_commit_outcome
+    // ----------------------------------------------------------------
+    //
+    // The leader-forwarded apply_staged_commit response used to
+    // flatten every error variant into `NameServiceError::Storage`,
+    // which the stager's outer loop treats as transient. Terminal
+    // failures (a vanished ledger, a state-machine invariant
+    // violation) would then loop forever, head-of-line-blocking the
+    // branch's queue. Each test below pins one variant to the
+    // specific `NameServiceError` shape the stager pattern-matches
+    // on to decide retry vs poison.
+
+    #[test]
+    fn classify_outcome_applied_is_ok() {
+        let r = classify_apply_staged_commit_outcome(
+            Ok(ApplyStagedCommitResponse::Applied { commit_t: 9 }),
+            7,
+        );
+        assert!(r.is_ok());
+    }
+
+    #[test]
+    fn classify_outcome_stale_is_transient_storage() {
+        // The `Stale` shape is transient: a racing stager already
+        // popped the front while ours was in flight; the next round
+        // of the supervisor will reconcile. `Storage` is the
+        // intended retry signal.
+        let r = classify_apply_staged_commit_outcome(
+            Ok(ApplyStagedCommitResponse::Stale {
+                current_front_queue_id: Some(8),
+            }),
+            7,
+        );
+        let err = r.expect_err("stale must be Err");
+        assert!(
+            matches!(err, NameServiceError::Storage(_)),
+            "expected Storage, got {err:?}"
+        );
+        assert!(err.to_string().contains("queue_id 7"));
+        assert!(err.to_string().contains("Some(8)"));
+    }
+
+    #[test]
+    fn classify_outcome_ledger_not_found_is_terminal_not_found() {
+        // `LedgerNotFound` is terminal — the named ledger is gone
+        // and no amount of retrying will bring it back. The stager
+        // recognizes `NotFound` and routes to a
+        // `PoisonReason::LedgerNotFound` instead of looping.
+        let r = classify_apply_staged_commit_outcome(
+            Err(ApplyStagedCommitError::LedgerNotFound(
+                "test/db:main".into(),
+            )),
+            7,
+        );
+        let err = r.expect_err("ledger_not_found must be Err");
+        match err {
+            NameServiceError::NotFound(id) => assert_eq!(id, "test/db:main"),
+            other => panic!("expected NotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_outcome_invariant_violated_is_terminal_apply_rejected() {
+        // The crux of this comment's fix: an `InvariantViolated`
+        // surfacing from the leader's state machine is a deeper
+        // bug, not a hiccup. Map it to `ApplyRejected` so the
+        // stager poisons the entry instead of spinning forever on
+        // a propose that can never succeed.
+        let r = classify_apply_staged_commit_outcome(
+            Err(ApplyStagedCommitError::InvariantViolated(
+                "unexpected Response variant for ApplyHead: NoOp".into(),
+            )),
+            7,
+        );
+        let err = r.expect_err("invariant_violated must be Err");
+        assert!(
+            matches!(err, NameServiceError::ApplyRejected(_)),
+            "expected ApplyRejected, got {err:?}"
+        );
+        assert!(err.to_string().contains("unexpected Response variant"));
+    }
+
+    #[test]
+    fn classify_outcome_not_leader_is_transient_storage() {
+        // Mid-flight leader change. Transient: the next round
+        // discovers the new leader and retries against it.
+        let r = classify_apply_staged_commit_outcome(
+            Err(ApplyStagedCommitError::NotLeader { leader: Some(2) }),
+            7,
+        );
+        let err = r.expect_err("not_leader must be Err");
+        assert!(
+            matches!(err, NameServiceError::Storage(_)),
+            "expected Storage, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn classify_outcome_raft_propose_is_transient_storage() {
+        // Raft fatal (membership-change error, log fsync stuck,
+        // etc.). Transient at this layer — openraft's own retry
+        // machinery and the stager's backoff handle recovery.
+        let r = classify_apply_staged_commit_outcome(
+            Err(ApplyStagedCommitError::RaftPropose(
+                "log fsync failed".into(),
+            )),
+            7,
+        );
+        let err = r.expect_err("raft_propose must be Err");
+        assert!(
+            matches!(err, NameServiceError::Storage(_)),
+            "expected Storage, got {err:?}"
+        );
     }
 
     #[test]

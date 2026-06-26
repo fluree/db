@@ -36,6 +36,16 @@ pub enum NameServiceError {
     /// Ledger already exists (cannot create)
     #[error("Ledger already exists: {0}")]
     LedgerAlreadyExists(String),
+
+    /// The underlying state machine rejected the propose with a
+    /// terminal failure that retrying won't fix — typically a
+    /// state-machine invariant the apply path surfaced, or a
+    /// replicated apply path returning an unreachable response
+    /// variant. Distinguished from [`Self::Storage`] so callers can
+    /// route to a deterministic terminal handler (e.g. queue
+    /// poisoning) instead of looping on the same propose forever.
+    #[error("State machine rejected propose: {0}")]
+    ApplyRejected(String),
 }
 
 impl From<LedgerIdParseError> for NameServiceError {
@@ -75,5 +85,13 @@ impl NameServiceError {
     /// Create a ledger already exists error
     pub fn ledger_already_exists(id: impl Into<String>) -> Self {
         Self::LedgerAlreadyExists(id.into())
+    }
+
+    /// Create an [`Self::ApplyRejected`] error signaling a terminal
+    /// state-machine apply failure. Use for variants the caller
+    /// should treat as "give up, don't retry" rather than the
+    /// generic transient [`Self::storage`] phrasing.
+    pub fn apply_rejected(msg: impl Into<String>) -> Self {
+        Self::ApplyRejected(msg.into())
     }
 }

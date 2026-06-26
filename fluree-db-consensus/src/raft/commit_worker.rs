@@ -49,7 +49,7 @@ use fluree_db_api::{
 };
 use fluree_db_core::ContentId;
 use fluree_db_ledger::IndexConfig;
-use fluree_db_nameservice::CommitPublisher;
+use fluree_db_nameservice::{CommitPublisher, NameServiceError};
 use futures::FutureExt;
 use openraft::Raft;
 use std::collections::{HashMap, HashSet};
@@ -883,10 +883,26 @@ impl Stager {
         commit_t: i64,
     ) -> Result<(), WorkerError> {
         let full_ledger_id = self.ref_key.ledger_id();
-        self.publisher
+        match self
+            .publisher
             .publish_commit(&full_ledger_id, commit_t, &commit_id)
             .await
-            .map_err(|e| WorkerError::Raft(format!("publish_commit failed: {e}")))
+        {
+            Ok(()) => Ok(()),
+            // Terminal classifications from the publisher (notably
+            // the leader-forwarded apply_staged_commit) route into
+            // the poison path so the stager doesn't loop a known-
+            // unfixable error forever and head-of-line-block the
+            // branch's queue. Everything else stays on the Raft path
+            // (transient — outer loop retries with backoff).
+            Err(NameServiceError::NotFound(id)) => {
+                Err(stage(PoisonReason::LedgerNotFound { ledger_id: id }))
+            }
+            Err(NameServiceError::ApplyRejected(msg)) => Err(stage(PoisonReason::WorkerPanic {
+                message: format!("state machine rejected ApplyHead: {msg}"),
+            })),
+            Err(e) => Err(WorkerError::Raft(format!("publish_commit failed: {e}"))),
+        }
     }
 
     async fn propose_poison(&self, queue_id: u64, reason: PoisonReason) -> Result<(), WorkerError> {
