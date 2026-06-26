@@ -407,6 +407,11 @@ pub struct FlureeServerBuilder {
     /// [`Self::with_raft`].
     #[cfg(feature = "raft")]
     raft: Option<(Arc<crate::raft::RaftIntegration>, std::net::SocketAddr)>,
+    /// Threshold tuning for the leader-only liveness monitor. Defaults
+    /// to [`LivenessConfig::default`]; tests override with sub-second
+    /// thresholds to keep runtimes short.
+    #[cfg(feature = "raft")]
+    liveness_config: fluree_db_consensus::raft::liveness_monitor::LivenessConfig,
 }
 
 impl FlureeServerBuilder {
@@ -422,6 +427,8 @@ impl FlureeServerBuilder {
             config,
             #[cfg(feature = "raft")]
             raft: None,
+            #[cfg(feature = "raft")]
+            liveness_config: fluree_db_consensus::raft::liveness_monitor::LivenessConfig::default(),
         }
     }
 
@@ -475,6 +482,19 @@ impl FlureeServerBuilder {
         listen_addr: std::net::SocketAddr,
     ) -> Self {
         self.raft = Some((integration, listen_addr));
+        self
+    }
+
+    /// Override the leader-only liveness monitor's threshold tuning.
+    /// Defaults are sane for production; tests use this hook to
+    /// shrink the unreachable / live windows so the demotion path
+    /// fires within a couple of seconds.
+    #[cfg(feature = "raft")]
+    pub fn with_liveness_config(
+        mut self,
+        config: fluree_db_consensus::raft::liveness_monitor::LivenessConfig,
+    ) -> Self {
+        self.liveness_config = config;
         self
     }
 
@@ -676,7 +696,8 @@ impl FlureeServerBuilder {
             let liveness_monitor =
                 fluree_db_consensus::raft::liveness_monitor::LivenessMonitor::new(Arc::clone(
                     &integration.raft,
-                ));
+                ))
+                .with_config(self.liveness_config.clone());
             let spawn_leader_tasks = move || {
                 let nameservice: std::sync::Arc<dyn fluree_db_nameservice::IndexingNameService> =
                     raft_ns.clone();

@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 use fluree_db_consensus::raft::admin::{
     AddLearnerRequest, ChangeMembershipRequest, ClusterStatus, InitializeRequest, NodeAddrs,
 };
+use fluree_db_consensus::raft::liveness_monitor::LivenessConfig;
 use fluree_db_consensus::NodeId;
 use fluree_db_server::raft::{RaftBootstrapConfig, RaftIntegration};
 use fluree_db_server::{AppState, FlureeServerBuilder};
@@ -107,9 +108,18 @@ struct TestCluster {
 }
 
 impl TestCluster {
-    /// Spawn `count` raft nodes on ephemeral ports. The cluster is
-    /// not yet bootstrapped — call [`Self::bootstrap`] next.
+    /// Spawn `count` raft nodes on ephemeral ports with the default
+    /// liveness monitor tuning. The cluster is not yet bootstrapped
+    /// — call [`Self::bootstrap`] next.
     async fn spawn(count: u64) -> Self {
+        Self::spawn_with_liveness(count, LivenessConfig::default()).await
+    }
+
+    /// Spawn `count` raft nodes wired up with the supplied
+    /// [`LivenessConfig`]. Tests that exercise the
+    /// monitor-driven demotion path pass sub-second thresholds so
+    /// the demote / promote windows close inside the test budget.
+    async fn spawn_with_liveness(count: u64, liveness_config: LivenessConfig) -> Self {
         assert!(count >= 1, "cluster must have at least one node");
 
         // Single shared data directory across all nodes — the
@@ -144,6 +154,7 @@ impl TestCluster {
                     public_listener,
                     raft_listener,
                     shared_data_tmp.path(),
+                    liveness_config.clone(),
                 )
                 .await,
             );
@@ -523,6 +534,7 @@ async fn spawn_node(
     public_listener: TcpListener,
     raft_listener: TcpListener,
     shared_data_path: &std::path::Path,
+    liveness_config: LivenessConfig,
 ) -> TestNode {
     let public_addr = public_listener.local_addr().expect("public local_addr");
     let raft_addr = raft_listener.local_addr().expect("raft local_addr");
@@ -548,6 +560,7 @@ async fn spawn_node(
         .listen_addr(public_addr)
         .cors_enabled(false)
         .with_raft(Arc::clone(&integration), raft_addr)
+        .with_liveness_config(liveness_config)
         .build()
         .await
         .expect("server build");
@@ -990,4 +1003,186 @@ async fn submission_status_survives_leader_transition() {
             "committed envelope should carry the commit_id; got {json}"
         );
     }
+}
+
+/// End-to-end liveness flow: when a follower goes silent for longer
+/// than the monitor's `unreachable_after`, the leader-side liveness
+/// monitor proposes `SetWorkerEligibility(eligible: false)`; the
+/// state-machine apply removes the voter from
+/// `worker_eligible_voters`; surviving voters' supervisors take
+/// over ownership on their next reconcile tick. Verifies all three
+/// stages end-to-end.
+///
+/// Uses fast monitor thresholds so the demote window closes inside
+/// a tight test budget — production defaults are 15 s.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn liveness_monitor_demotes_killed_follower() {
+    init_test_tracing();
+    // Sub-second thresholds: a sample every 50 ms, demote after
+    // 500 ms of unanswered replication, promote after 200 ms of
+    // resumed advancement.
+    let liveness_config = LivenessConfig {
+        sample_interval: Duration::from_millis(50),
+        unreachable_after: Duration::from_millis(500),
+        live_after: Duration::from_millis(200),
+    };
+    let mut cluster = TestCluster::spawn_with_liveness(CLUSTER_SIZE, liveness_config).await;
+    cluster.bootstrap().await;
+
+    let leader_id = cluster.current_leader().await.expect("leader present");
+    let initial_eligible = read_eligible_voters(&cluster, leader_id).await;
+    let expected_voters: BTreeSet<NodeId> = (1..=CLUSTER_SIZE).collect();
+    assert_eq!(
+        initial_eligible, expected_voters,
+        "post-bootstrap eligible set must be the full voter set; got {initial_eligible:?}"
+    );
+
+    // Pick a follower (any of the four non-leaders) and shut it down.
+    let target = cluster
+        .nodes
+        .iter()
+        .find(|n| n.node_id != leader_id)
+        .map(|n| n.node_id)
+        .expect("at least one follower");
+    cluster.shutdown_node(target).await;
+
+    // Drive raft log advancement so the monitor has fresh
+    // replication metrics to evaluate — without ongoing log
+    // activity the leader's `last_log_index` stays put and the
+    // "stuck while leader is ahead" signal never fires.
+    let ledger = "raft:liveness";
+    let alive_voter = pick_alive_voter(&cluster, leader_id, target);
+    cluster.create_ledger(alive_voter, ledger).await;
+    let progress_handle = spawn_log_progress(
+        cluster.client.clone(),
+        cluster.public_url(alive_voter).to_string(),
+        ledger.to_string(),
+    );
+
+    // Poll the leader's `worker_eligible_voters` until the killed
+    // follower drops out. With the 500 ms threshold + the 50 ms
+    // sample loop this lands inside ~1 s under normal load.
+    let mut expected_after_demote = expected_voters.clone();
+    expected_after_demote.remove(&target);
+    wait_for_eligible_voters(
+        &cluster,
+        leader_id,
+        &expected_after_demote,
+        Duration::from_secs(5),
+    )
+    .await;
+
+    progress_handle.abort();
+
+    // Every other live node should observe the same demotion via
+    // raft replication — the state is replicated, not leader-local.
+    for node in cluster.nodes.iter().filter(|n| n.is_alive()) {
+        let eligible = read_eligible_voters(&cluster, node.node_id).await;
+        assert_eq!(
+            eligible, expected_after_demote,
+            "node {} should observe the same demoted set; got {eligible:?}",
+            node.node_id
+        );
+    }
+
+    // Quorum invariant guard: with 5 configured voters the floor is
+    // 3, so we should still be at exactly 4 eligible voters. A
+    // further demote would be refused by the apply.
+    let final_eligible = read_eligible_voters(&cluster, leader_id).await;
+    assert_eq!(
+        final_eligible.len(),
+        4,
+        "exactly one demotion should land; got {final_eligible:?}"
+    );
+}
+
+/// Pick any live voter that's not the leader and not `excluded`.
+/// Used as the target for ongoing log activity in the liveness
+/// test so the leader's `last_log_index` advances even with one
+/// follower offline.
+fn pick_alive_voter(cluster: &TestCluster, leader_id: NodeId, excluded: NodeId) -> NodeId {
+    cluster
+        .nodes
+        .iter()
+        .find(|n| n.is_alive() && n.node_id != excluded && n.node_id != leader_id)
+        .or_else(|| {
+            cluster
+                .nodes
+                .iter()
+                .find(|n| n.is_alive() && n.node_id != excluded)
+        })
+        .map(|n| n.node_id)
+        .expect("at least one alive voter that isn't the excluded target")
+}
+
+/// Read the `worker_eligible_voters` set from a specific node's
+/// shared state. Direct in-process read — bypasses the HTTP layer
+/// because the field isn't part of the public status API.
+async fn read_eligible_voters(cluster: &TestCluster, node_id: NodeId) -> BTreeSet<NodeId> {
+    let node = cluster
+        .nodes
+        .iter()
+        .find(|n| n.node_id == node_id)
+        .expect("node exists");
+    let integration = node
+        ._state
+        .raft
+        .as_ref()
+        .expect("test node always has raft integration");
+    let state = integration.shared_state.read().await;
+    state.worker_eligible_voters.clone()
+}
+
+/// Poll `worker_eligible_voters` on `via_node` until it equals
+/// `expected` or `timeout` elapses.
+async fn wait_for_eligible_voters(
+    cluster: &TestCluster,
+    via_node: NodeId,
+    expected: &BTreeSet<NodeId>,
+    timeout: Duration,
+) {
+    let deadline = Instant::now() + timeout;
+    let mut last = BTreeSet::new();
+    while Instant::now() < deadline {
+        last = read_eligible_voters(cluster, via_node).await;
+        if &last == expected {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!(
+        "timed out waiting for worker_eligible_voters to converge to {expected:?}; last={last:?}"
+    );
+}
+
+/// Drive log advancement on the leader. Submits a new insert every
+/// 100 ms via the chosen alive node until aborted. The monitor's
+/// "stuck while leader is ahead" signal depends on the leader's
+/// last_log_index advancing past the dead follower's match log —
+/// without ongoing activity, log indexes stand still and the
+/// monitor has no demotion signal.
+fn spawn_log_progress(
+    client: reqwest::Client,
+    public_url: String,
+    ledger: String,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut counter: usize = 0;
+        loop {
+            let body = json!({
+                "@context": { "ex": "http://example.org/" },
+                "@id": format!("ex:progress-{counter}"),
+                "ex:name": format!("p{counter}"),
+            });
+            let _ = client
+                .post(format!("{public_url}/v1/fluree/insert"))
+                .header("content-type", "application/json")
+                .header("fluree-ledger", ledger.as_str())
+                .body(body.to_string())
+                .send()
+                .await;
+            counter += 1;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
 }
