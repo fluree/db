@@ -194,7 +194,7 @@ impl StagedReceiptMap {
     /// Non-destructively read the per-transact metadata from a stashed
     /// [`AppliedReceipt::Transact`]. Returns `None` for any other
     /// variant or when the slot is empty. Used by `publish_commit`
-    /// to thread the metadata into [`ApplyHeadArgs`] without
+    /// to thread the metadata into [`StagedHead`] without
     /// consuming the receipt the adapter still needs for waiter
     /// resolution.
     pub fn peek_transact_metadata(&self, queue_id: u64) -> Option<TransactStashMetadata> {

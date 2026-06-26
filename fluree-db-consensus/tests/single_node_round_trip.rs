@@ -25,7 +25,7 @@ use openraft::{Config, Raft, ServerState};
 use fluree_db_consensus::raft::log_adapter::LogAdapter;
 use fluree_db_consensus::raft::nameservice::RaftNameService;
 use fluree_db_consensus::raft::state_machine::{
-    ApplyHeadArgs, BodyKind, Command as SmCommand, NewLedger, QueueSubmission, RefKey, Response,
+    BodyKind, Command as SmCommand, NewLedger, QueueSubmission, RefKey, Response, StagedHead,
 };
 use fluree_db_consensus::raft::state_machine_adapter::StateMachineAdapter;
 use fluree_db_consensus::raft::storage::memory::MemoryRaftStorage;
@@ -181,7 +181,7 @@ async fn single_node_raft_index_publisher_round_trip() {
         Response::Enqueued { queue_id, .. } => queue_id,
         other => panic!("expected Enqueued, got {other:?}"),
     };
-    raft.client_write(SmCommand::ApplyHead(ApplyHeadArgs {
+    raft.client_write(SmCommand::ApplyHead(StagedHead {
         ledger_id: "test/db".into(),
         branch: "main".into(),
         queue_id,
@@ -309,7 +309,7 @@ async fn single_node_apply_emits_commit_event_on_bus() {
         Response::Enqueued { queue_id, .. } => queue_id,
         other => panic!("expected Enqueued, got {other:?}"),
     };
-    raft.client_write(SmCommand::ApplyHead(ApplyHeadArgs {
+    raft.client_write(SmCommand::ApplyHead(StagedHead {
         ledger_id: "test/db".into(),
         branch: "main".into(),
         queue_id,
@@ -491,7 +491,7 @@ async fn single_node_branch_lifecycle_round_trip() {
         Response::Enqueued { queue_id, .. } => queue_id,
         other => panic!("expected Enqueued, got {other:?}"),
     };
-    raft.client_write(SmCommand::ApplyHead(ApplyHeadArgs {
+    raft.client_write(SmCommand::ApplyHead(StagedHead {
         ledger_id: "test/db".into(),
         branch: "main".into(),
         queue_id,

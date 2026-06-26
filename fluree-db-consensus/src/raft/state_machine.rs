@@ -525,14 +525,14 @@ pub enum Command {
     /// indexer running on the current leader after it finishes a
     /// build. Apply enforces strict monotonicity and rejects index
     /// claims for commits the state machine hasn't applied yet.
-    AdvanceIndexHead(AdvanceIndexHeadArgs),
+    AdvanceIndexHead(NewIndexHead),
     /// Rewrite the published index head for a branch with relaxed
     /// monotonicity: accepts `new.t == existing.t` so an admin
     /// reindex can land a fresh root at the same commit watermark.
     /// `new.t < existing.t` is still rejected, and the
     /// commits-not-yet-applied guard from
     /// [`Self::AdvanceIndexHead`] still fires.
-    RewriteIndexHead(AdvanceIndexHeadArgs),
+    RewriteIndexHead(NewIndexHead),
     /// Register a branch on a ledger. The branch starts unborn — no
     /// [`RefEntry`] is created until the first
     /// [`Command::ApplyHead`] for the branch.
@@ -630,7 +630,7 @@ pub enum Command {
     /// registered branch. The args are boxed because
     /// [`ConfigValue`]'s `ConfigPayload` carries an `extra` map
     /// whose size dominates the enum otherwise.
-    PushConfig(Box<PushConfigArgs>),
+    PushConfig(Box<ConfigUpdate>),
     /// Upsert a graph source's config-side fields (source type,
     /// config blob, dependencies). On an existing record the index
     /// pointer (`index_id`, `index_t`) and `retracted` flag are
@@ -666,12 +666,12 @@ pub enum Command {
     /// idempotency outcome from the entry, and signals waiters.
     /// Replaces the role of `Command::AdvanceRef` in the queue
     /// migration path.
-    ApplyHead(ApplyHeadArgs),
+    ApplyHead(StagedHead),
     /// Worker gave up on a queue entry. Pops the front, records
     /// the failure in the poisoned-idempotency map keyed by the
     /// entry's idempotency key, and signals the waiter with an
     /// abort outcome.
-    PoisonQueueEntry(PoisonQueueEntryArgs),
+    PoisonQueueEntry(EntryPoisoning),
     /// Periodic leader-proposed eviction of stale idempotency
     /// records. Removes entries whose `recorded_at_millis` is
     /// older than `cutoff_millis`, bounded per apply by an
@@ -699,7 +699,7 @@ pub enum Command {
 
 /// Payload for [`Command::PushConfig`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PushConfigArgs {
+pub struct ConfigUpdate {
     pub ledger_id: String,
     pub expected: Option<ConfigValue>,
     pub new: ConfigValue,
@@ -728,7 +728,7 @@ pub struct QueueSubmission {
 
 /// Payload for [`Command::ApplyHead`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ApplyHeadArgs {
+pub struct StagedHead {
     pub ledger_id: String,
     pub branch: String,
     /// Queue entry this commit was staged from. Apply rejects
@@ -754,7 +754,7 @@ pub struct ApplyHeadArgs {
 
 /// Payload for [`Command::PoisonQueueEntry`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PoisonQueueEntryArgs {
+pub struct EntryPoisoning {
     pub ledger_id: String,
     pub branch: String,
     pub queue_id: u64,
@@ -785,7 +785,7 @@ pub struct WorkerEligibility {
 /// current commit `t` (we never publish an index that claims to
 /// cover commits the state machine hasn't applied).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AdvanceIndexHeadArgs {
+pub struct NewIndexHead {
     pub ledger_id: String,
     pub branch: String,
     /// Content id of the new index root blob.
@@ -1605,11 +1605,11 @@ fn decrement_child_count(
     }
 }
 
-fn advance_index_head(state: &mut NameServiceState, args: AdvanceIndexHeadArgs) -> Response {
+fn advance_index_head(state: &mut NameServiceState, args: NewIndexHead) -> Response {
     set_index_head(state, args, |existing_t, new_t| new_t <= existing_t)
 }
 
-fn rewrite_index_head(state: &mut NameServiceState, args: AdvanceIndexHeadArgs) -> Response {
+fn rewrite_index_head(state: &mut NameServiceState, args: NewIndexHead) -> Response {
     set_index_head(state, args, |existing_t, new_t| new_t < existing_t)
 }
 
@@ -1619,10 +1619,10 @@ fn rewrite_index_head(state: &mut NameServiceState, args: AdvanceIndexHeadArgs) 
 /// ledger / ref-entry / ahead-of-commit-t checks and the write.
 fn set_index_head(
     state: &mut NameServiceState,
-    args: AdvanceIndexHeadArgs,
+    args: NewIndexHead,
     is_stale: impl FnOnce(i64, i64) -> bool,
 ) -> Response {
-    let AdvanceIndexHeadArgs {
+    let NewIndexHead {
         ledger_id,
         branch,
         new_index_head,
@@ -1843,8 +1843,8 @@ fn apply_push_status(
     Response::StatusUpdated
 }
 
-fn apply_push_config(state: &mut NameServiceState, args: PushConfigArgs) -> Response {
-    let PushConfigArgs {
+fn apply_push_config(state: &mut NameServiceState, args: ConfigUpdate) -> Response {
+    let ConfigUpdate {
         ledger_id,
         expected,
         new,
@@ -2125,8 +2125,8 @@ fn pop_validated_front(
     Ok(queue.pop_front().expect("non-empty checked above"))
 }
 
-fn apply_head(state: &mut NameServiceState, log_index: u64, args: ApplyHeadArgs) -> Response {
-    let ApplyHeadArgs {
+fn apply_head(state: &mut NameServiceState, log_index: u64, args: StagedHead) -> Response {
+    let StagedHead {
         ledger_id,
         branch,
         queue_id,
@@ -2213,9 +2213,9 @@ fn apply_head(state: &mut NameServiceState, log_index: u64, args: ApplyHeadArgs)
 fn apply_poison_queue_entry(
     state: &mut NameServiceState,
     log_index: u64,
-    args: PoisonQueueEntryArgs,
+    args: EntryPoisoning,
 ) -> Response {
-    let PoisonQueueEntryArgs {
+    let EntryPoisoning {
         ledger_id,
         branch,
         queue_id,
@@ -3123,7 +3123,7 @@ mod tests {
     // -------------------------------------------------------------
 
     fn advance_index(ledger_id: &str, branch: &str, head: ContentId, t: i64) -> Command {
-        Command::AdvanceIndexHead(AdvanceIndexHeadArgs {
+        Command::AdvanceIndexHead(NewIndexHead {
             ledger_id: ledger_id.into(),
             branch: branch.into(),
             new_index_head: head,
@@ -3270,7 +3270,7 @@ mod tests {
     // -------------------------------------------------------------
 
     fn rewrite_index(ledger_id: &str, branch: &str, head: ContentId, t: i64) -> Command {
-        Command::RewriteIndexHead(AdvanceIndexHeadArgs {
+        Command::RewriteIndexHead(NewIndexHead {
             ledger_id: ledger_id.into(),
             branch: branch.into(),
             new_index_head: head,
@@ -3545,7 +3545,7 @@ mod tests {
         commit: ContentId,
         t: i64,
     ) -> Command {
-        Command::ApplyHead(ApplyHeadArgs {
+        Command::ApplyHead(StagedHead {
             ledger_id: ledger_id.into(),
             branch: branch.into(),
             queue_id,
@@ -3738,7 +3738,7 @@ mod tests {
     // ====================================================================
 
     fn poison_cmd(ledger_id: &str, branch: &str, queue_id: u64, reason: PoisonReason) -> Command {
-        Command::PoisonQueueEntry(PoisonQueueEntryArgs {
+        Command::PoisonQueueEntry(EntryPoisoning {
             ledger_id: ledger_id.into(),
             branch: branch.into(),
             queue_id,
@@ -4180,7 +4180,7 @@ mod tests {
         // Seed an index at t = 0 against the genesis commit.
         apply(
             &mut state,
-            Command::AdvanceIndexHead(AdvanceIndexHeadArgs {
+            Command::AdvanceIndexHead(NewIndexHead {
                 ledger_id: "test/db".into(),
                 branch: "main".into(),
                 new_index_head: cid(10),
@@ -4379,7 +4379,7 @@ mod tests {
         expected: Option<ConfigValue>,
         new: ConfigValue,
     ) -> Command {
-        Command::PushConfig(Box::new(PushConfigArgs {
+        Command::PushConfig(Box::new(ConfigUpdate {
             ledger_id: ledger_id.into(),
             expected,
             new,

@@ -50,9 +50,9 @@
 use crate::raft::commit_worker::{QueuePoisonError, QueuePoisonPublisher};
 use crate::raft::staged_receipt::{AppliedReceipt, StagedReceiptMap};
 use crate::raft::state_machine::{
-    AdvanceIndexHeadArgs, ApplyHeadArgs, Command as SmCommand, DesyncReason, NameServiceState,
-    NewBranch, NewLedger, PoisonQueueEntryArgs, PoisonReason, PushConfigArgs, RecordedTally,
-    RefKey, ResetHeadSnapshot, Response as SmResponse,
+    Command as SmCommand, DesyncReason, EntryPoisoning, NameServiceState, NewBranch, NewIndexHead,
+    NewLedger, PoisonReason, ConfigUpdate, RecordedTally, RefKey, ResetHeadSnapshot,
+    Response as SmResponse, StagedHead,
 };
 use crate::raft::state_machine_adapter::SharedState;
 use crate::raft::{ClusterNode, NodeId, TypeConfig};
@@ -89,7 +89,7 @@ pub struct RaftNameService {
     state: SharedState,
     raft: Arc<Raft<TypeConfig>>,
     /// When set, `publish_commit` peeks the staged receipt for the
-    /// queue front and threads its tally into [`ApplyHeadArgs::tally`]
+    /// queue front and threads its tally into [`StagedHead::tally`]
     /// so the cached idempotency record carries the same tally a
     /// later retry would expect to see. Off → tally lands as `None`,
     /// which only affects metric reporting on idempotent retries.
@@ -201,13 +201,13 @@ fn build_index_head_args(
     ledger_id: &str,
     index_t: i64,
     index_id: &ContentId,
-) -> std::result::Result<AdvanceIndexHeadArgs, NameServiceError> {
+) -> std::result::Result<NewIndexHead, NameServiceError> {
     let (ledger_name, branch) = split_ledger_id(ledger_id)?;
     let applied_at_millis = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
-    Ok(AdvanceIndexHeadArgs {
+    Ok(NewIndexHead {
         ledger_id: ledger_name,
         branch,
         new_index_head: index_id.clone(),
@@ -413,7 +413,7 @@ fn build_apply_head_command(
         .and_then(|m| m.tally.as_ref())
         .map(RecordedTally::from);
     let flake_count = metadata.map(|m| m.flake_count as u64).unwrap_or(0);
-    Ok(SmCommand::ApplyHead(ApplyHeadArgs {
+    Ok(SmCommand::ApplyHead(StagedHead {
         ledger_id: ledger_name,
         branch,
         queue_id,
@@ -481,7 +481,7 @@ fn describe_desync_reason(reason: &DesyncReason) -> String {
 /// the ferried receipt instead of falling back to
 /// [`AppliedReceipt::Minimal`].
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ApplyStagedCommitArgs {
+pub struct StagedCommit {
     /// Branch identity that owns the staged entry.
     pub ref_key: RefKey,
     /// Queue ID of the entry the follower staged. The state machine
@@ -547,7 +547,7 @@ pub enum ApplyStagedCommitError {
 /// The leader proposes [`Command::PoisonQueueEntry`] on the
 /// follower's behalf.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ApplyQueuePoisonArgs {
+pub struct QueuePoison {
     pub ref_key: RefKey,
     pub queue_id: u64,
     pub reason: PoisonReason,
@@ -583,9 +583,9 @@ impl RaftNameService {
     /// before propose-returns (same reason).
     pub async fn apply_staged_commit(
         &self,
-        args: ApplyStagedCommitArgs,
+        args: StagedCommit,
     ) -> std::result::Result<ApplyStagedCommitResponse, ApplyStagedCommitError> {
-        let ApplyStagedCommitArgs {
+        let StagedCommit {
             ref_key,
             queue_id,
             commit_id,
@@ -600,7 +600,7 @@ impl RaftNameService {
             ),
             _ => (None, 0),
         };
-        let cmd = SmCommand::ApplyHead(ApplyHeadArgs {
+        let cmd = SmCommand::ApplyHead(StagedHead {
             ledger_id: ref_key.ledger_name.clone(),
             branch: ref_key.branch.clone(),
             queue_id,
@@ -680,14 +680,14 @@ impl RaftNameService {
     /// surface as `Err`.
     pub async fn apply_queue_poison(
         &self,
-        args: ApplyQueuePoisonArgs,
+        args: QueuePoison,
     ) -> std::result::Result<(), ApplyQueuePoisonError> {
-        let ApplyQueuePoisonArgs {
+        let QueuePoison {
             ref_key,
             queue_id,
             reason,
         } = args;
-        let cmd = SmCommand::PoisonQueueEntry(PoisonQueueEntryArgs {
+        let cmd = SmCommand::PoisonQueueEntry(EntryPoisoning {
             ledger_id: ref_key.ledger_name.clone(),
             branch: ref_key.branch.clone(),
             queue_id,
@@ -739,7 +739,7 @@ pub fn apply_staged_commit_router(
 }
 
 /// HTTP handler for [`APPLY_STAGED_COMMIT_PATH`]. Decodes a postcard
-/// [`ApplyStagedCommitArgs`] body, dispatches to
+/// [`StagedCommit`] body, dispatches to
 /// [`RaftNameService::apply_staged_commit`], and encodes the
 /// outcome (success **or** logical failure) as a postcard
 /// `Result<ApplyStagedCommitResponse, ApplyStagedCommitError>` body
@@ -749,17 +749,16 @@ async fn handle_apply_staged_commit(
     State(ns): State<Arc<RaftNameService>>,
     body: axum::body::Bytes,
 ) -> Response {
-    let args: ApplyStagedCommitArgs =
-        match postcard::from_bytes::<wire::ApplyStagedCommitArgs>(&body) {
-            Ok(args) => args.into(),
-            Err(e) => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    format!("postcard decode error on ApplyStagedCommitArgs: {e}"),
-                )
-                    .into_response();
-            }
-        };
+    let args: StagedCommit = match postcard::from_bytes::<wire::StagedCommit>(&body) {
+        Ok(args) => args.into(),
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("postcard decode error on StagedCommit: {e}"),
+            )
+                .into_response();
+        }
+    };
 
     let outcome = ns.apply_staged_commit(args).await;
     encode_apply_staged_commit_response(outcome)
@@ -818,7 +817,7 @@ pub fn apply_queue_poison_router(
 }
 
 /// HTTP handler for [`APPLY_QUEUE_POISON_PATH`]. Decodes a postcard
-/// [`ApplyQueuePoisonArgs`] body, dispatches to
+/// [`QueuePoison`] body, dispatches to
 /// [`RaftNameService::apply_queue_poison`], and encodes the
 /// outcome (success **or** logical failure) as a postcard
 /// `Result<(), ApplyQueuePoisonError>` body with HTTP 200.
@@ -827,12 +826,12 @@ async fn handle_apply_queue_poison(
     State(ns): State<Arc<RaftNameService>>,
     body: axum::body::Bytes,
 ) -> Response {
-    let args: ApplyQueuePoisonArgs = match postcard::from_bytes(&body) {
+    let args: QueuePoison = match postcard::from_bytes(&body) {
         Ok(args) => args,
         Err(e) => {
             return (
                 StatusCode::BAD_REQUEST,
-                format!("postcard decode error on ApplyQueuePoisonArgs: {e}"),
+                format!("postcard decode error on QueuePoison: {e}"),
             )
                 .into_response();
         }
@@ -1057,7 +1056,7 @@ impl RaftNameService {
                 commit_t,
             });
 
-        let args = ApplyStagedCommitArgs {
+        let args = StagedCommit {
             ref_key,
             queue_id,
             commit_id: commit_id.clone(),
@@ -1076,10 +1075,9 @@ impl RaftNameService {
             APPLY_STAGED_COMMIT_PATH
         );
 
-        let body =
-            postcard::to_allocvec(&wire::ApplyStagedCommitArgs::from(args)).map_err(|e| {
-                NameServiceError::storage(format!("postcard encode of ApplyStagedCommitArgs: {e}"))
-            })?;
+        let body = postcard::to_allocvec(&wire::StagedCommit::from(args)).map_err(|e| {
+            NameServiceError::storage(format!("postcard encode of StagedCommit: {e}"))
+        })?;
 
         let resp = forwarding
             .http_client
@@ -1139,7 +1137,7 @@ impl RaftNameService {
         reason: PoisonReason,
         forwarding: &ForwardingConfig,
     ) -> std::result::Result<(), QueuePoisonError> {
-        let args = ApplyQueuePoisonArgs {
+        let args = QueuePoison {
             ref_key: ref_key.clone(),
             queue_id,
             reason,
@@ -1156,7 +1154,7 @@ impl RaftNameService {
         );
 
         let body = postcard::to_allocvec(&args)
-            .map_err(|e| QueuePoisonError::Codec(format!("encode ApplyQueuePoisonArgs: {e}")))?;
+            .map_err(|e| QueuePoisonError::Codec(format!("encode QueuePoison: {e}")))?;
 
         let resp = forwarding
             .http_client
@@ -1193,7 +1191,7 @@ impl RaftNameService {
         queue_id: u64,
         reason: PoisonReason,
     ) -> std::result::Result<(), QueuePoisonError> {
-        self.apply_queue_poison(ApplyQueuePoisonArgs {
+        self.apply_queue_poison(QueuePoison {
             ref_key: ref_key.clone(),
             queue_id,
             reason,
@@ -1692,7 +1690,7 @@ impl ConfigPublisher for RaftNameService {
         expected: Option<&ConfigValue>,
         new: &ConfigValue,
     ) -> Result<ConfigCasResult> {
-        let cmd = SmCommand::PushConfig(Box::new(PushConfigArgs {
+        let cmd = SmCommand::PushConfig(Box::new(ConfigUpdate {
             ledger_id: ledger_id.to_string(),
             expected: expected.cloned(),
             new: new.clone(),
@@ -1726,7 +1724,7 @@ mod tests {
 
     use super::*;
     use crate::raft::state_machine::{
-        AdvanceIndexHeadArgs, Command, NameServiceState, NewLedger, RefEntry, Response,
+        Command, NameServiceState, NewIndexHead, NewLedger, RefEntry, Response,
     };
     use crate::raft::{ClusterNode, NodeId};
     use fluree_db_api::{ContentId, ContentKind};
@@ -2036,7 +2034,7 @@ mod tests {
     }
 
     // ----------------------------------------------------------------
-    // ApplyStagedCommitArgs postcard round-trip
+    // StagedCommit postcard round-trip
     // ----------------------------------------------------------------
 
     use crate::raft::staged_receipt::{AppliedReceipt, TransactApplied};
@@ -2070,8 +2068,8 @@ mod tests {
         }
     }
 
-    fn args_for_round_trip(receipt: AppliedReceipt) -> ApplyStagedCommitArgs {
-        ApplyStagedCommitArgs {
+    fn args_for_round_trip(receipt: AppliedReceipt) -> StagedCommit {
+        StagedCommit {
             ref_key: RefKey::new("test/db", "main"),
             queue_id: 9,
             commit_id: cid(1),
@@ -2080,11 +2078,11 @@ mod tests {
         }
     }
 
-    fn assert_args_round_trip(args: ApplyStagedCommitArgs) {
-        let encoded = wire::ApplyStagedCommitArgs::from(args.clone());
+    fn assert_args_round_trip(args: StagedCommit) {
+        let encoded = wire::StagedCommit::from(args.clone());
         let bytes = postcard::to_allocvec(&encoded).expect("encode");
-        let decoded: wire::ApplyStagedCommitArgs = postcard::from_bytes(&bytes).expect("decode");
-        let round_tripped: ApplyStagedCommitArgs = decoded.into();
+        let decoded: wire::StagedCommit = postcard::from_bytes(&bytes).expect("decode");
+        let round_tripped: StagedCommit = decoded.into();
         assert_eq!(round_tripped.ref_key, args.ref_key);
         assert_eq!(round_tripped.queue_id, args.queue_id);
         assert_eq!(round_tripped.commit_id, args.commit_id);
@@ -2335,12 +2333,12 @@ mod tests {
         };
         let args = args_for_round_trip(AppliedReceipt::Transact(original_transact.clone()));
 
-        let encoded = wire::ApplyStagedCommitArgs::from(args.clone());
+        let encoded = wire::StagedCommit::from(args.clone());
         let bytes = postcard::to_allocvec(&encoded).expect("encode");
-        let decoded: wire::ApplyStagedCommitArgs = postcard::from_bytes(&bytes).expect("decode");
-        let round_tripped: ApplyStagedCommitArgs = decoded.into();
+        let decoded: wire::StagedCommit = postcard::from_bytes(&bytes).expect("decode");
+        let round_tripped: StagedCommit = decoded.into();
 
-        let ApplyStagedCommitArgs {
+        let StagedCommit {
             ref_key,
             queue_id,
             commit_id,
@@ -2392,12 +2390,12 @@ mod tests {
     }
 
     // ----------------------------------------------------------------
-    // ApplyQueuePoisonArgs postcard round-trip
+    // QueuePoison postcard round-trip
     // ----------------------------------------------------------------
 
-    fn assert_queue_poison_args_round_trip(args: ApplyQueuePoisonArgs) {
+    fn assert_queue_poison_args_round_trip(args: QueuePoison) {
         let bytes = postcard::to_allocvec(&args).expect("encode");
-        let decoded: ApplyQueuePoisonArgs = postcard::from_bytes(&bytes).expect("decode");
+        let decoded: QueuePoison = postcard::from_bytes(&bytes).expect("decode");
         assert_eq!(decoded.ref_key, args.ref_key);
         assert_eq!(decoded.queue_id, args.queue_id);
         assert_eq!(decoded.reason, args.reason);
@@ -2409,7 +2407,7 @@ mod tests {
         // exhausts its retry budget on a transient hiccup. Carries
         // a payload (error message + final attempt count) that has
         // to survive the wire.
-        assert_queue_poison_args_round_trip(ApplyQueuePoisonArgs {
+        assert_queue_poison_args_round_trip(QueuePoison {
             ref_key: RefKey::new("test/db", "main"),
             queue_id: 17,
             reason: PoisonReason::StagingFailed {
@@ -2425,7 +2423,7 @@ mod tests {
         // local-`client_write` path would have bounced forever on a
         // follower, the very symptom the leader-forward exists to
         // close.
-        assert_queue_poison_args_round_trip(ApplyQueuePoisonArgs {
+        assert_queue_poison_args_round_trip(QueuePoison {
             ref_key: RefKey::new("test/db", "main"),
             queue_id: 0,
             reason: PoisonReason::BodyMalformed {
@@ -2442,7 +2440,7 @@ mod tests {
         // the round-trip should preserve all four (Some, Some) /
         // (Some, None) / (None, Some) / (None, None) combinations
         // unchanged. We pick the most representative.
-        assert_queue_poison_args_round_trip(ApplyQueuePoisonArgs {
+        assert_queue_poison_args_round_trip(QueuePoison {
             ref_key: RefKey::new("test/db", "feature"),
             queue_id: 42,
             reason: PoisonReason::PushCasFailed {
@@ -2456,7 +2454,7 @@ mod tests {
     fn apply_queue_poison_args_round_trips_worker_panic_variant() {
         // The last-resort variant. Carries an arbitrary string
         // payload; round-trip preserves it byte-for-byte.
-        assert_queue_poison_args_round_trip(ApplyQueuePoisonArgs {
+        assert_queue_poison_args_round_trip(QueuePoison {
             ref_key: RefKey::new("test/db", "main"),
             queue_id: 5,
             reason: PoisonReason::WorkerPanic {
@@ -2576,7 +2574,7 @@ mod tests {
         let state = ledger_at_commit(7, 10).await;
         let _ = apply_cmd(
             &state,
-            Command::AdvanceIndexHead(AdvanceIndexHeadArgs {
+            Command::AdvanceIndexHead(NewIndexHead {
                 ledger_id: "test/db".into(),
                 branch: "main".into(),
                 new_index_head: cid(42),
@@ -2600,7 +2598,7 @@ mod tests {
         let state = ledger_at_commit(7, 10).await;
         let _ = apply_cmd(
             &state,
-            Command::AdvanceIndexHead(AdvanceIndexHeadArgs {
+            Command::AdvanceIndexHead(NewIndexHead {
                 ledger_id: "test/db".into(),
                 branch: "main".into(),
                 new_index_head: cid(42),
@@ -2630,7 +2628,7 @@ mod tests {
         let state = ledger_at_commit(7, 10).await;
         let _ = apply_cmd(
             &state,
-            Command::AdvanceIndexHead(AdvanceIndexHeadArgs {
+            Command::AdvanceIndexHead(NewIndexHead {
                 ledger_id: "test/db".into(),
                 branch: "main".into(),
                 new_index_head: cid(42),

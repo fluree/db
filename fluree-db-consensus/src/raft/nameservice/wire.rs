@@ -21,11 +21,11 @@
 //!
 //! These types intentionally share the unqualified names of their
 //! in-memory counterparts so external readers see the clean
-//! `wire::ApplyStagedCommitArgs` form. To avoid `From<X> for X`
+//! `wire::StagedCommit` form. To avoid `From<X> for X`
 //! ambiguity inside this file the in-memory types are imported
 //! under `InMemory*` aliases below.
 
-use super::ApplyStagedCommitArgs as InMemoryArgs;
+use super::StagedCommit as InMemoryArgs;
 use crate::raft::staged_receipt::{
     AppliedReceipt as InMemoryReceipt, MergeApplied, PushApplied, RebaseApplied, RevertApplied,
     TransactApplied as InMemoryTransactApplied,
@@ -35,9 +35,9 @@ use fluree_db_core::ContentId;
 use serde::{Deserialize, Serialize};
 
 /// Postcard wire shape for
-/// [`ApplyStagedCommitArgs`](super::ApplyStagedCommitArgs).
+/// [`StagedCommit`](super::StagedCommit).
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub(super) struct ApplyStagedCommitArgs {
+pub(super) struct StagedCommit {
     pub ref_key: RefKey,
     pub queue_id: u64,
     pub commit_id: ContentId,
@@ -69,7 +69,7 @@ pub(super) struct TransactApplied {
     pub tally: Option<RecordedTally>,
 }
 
-impl From<InMemoryArgs> for ApplyStagedCommitArgs {
+impl From<InMemoryArgs> for StagedCommit {
     fn from(args: InMemoryArgs) -> Self {
         Self {
             ref_key: args.ref_key,
@@ -81,8 +81,8 @@ impl From<InMemoryArgs> for ApplyStagedCommitArgs {
     }
 }
 
-impl From<ApplyStagedCommitArgs> for InMemoryArgs {
-    fn from(args: ApplyStagedCommitArgs) -> Self {
+impl From<StagedCommit> for InMemoryArgs {
+    fn from(args: StagedCommit) -> Self {
         Self {
             ref_key: args.ref_key,
             queue_id: args.queue_id,

@@ -1109,8 +1109,7 @@ mod tests {
     // ====================================================================
 
     use crate::raft::state_machine::{
-        ApplyHeadArgs, BodyKind, PoisonQueueEntryArgs, PoisonReason, QueueSubmission,
-        ResetHeadSnapshot,
+        BodyKind, EntryPoisoning, PoisonReason, QueueSubmission, ResetHeadSnapshot, StagedHead,
     };
     use crate::raft::waiter::{AbortReason, WaiterMap, WaiterOutcome};
 
@@ -1139,7 +1138,7 @@ mod tests {
     ) -> Entry<TypeConfig> {
         Entry {
             log_id: log_id(1, index),
-            payload: EntryPayload::Normal(RaftCommand::ApplyHead(ApplyHeadArgs {
+            payload: EntryPayload::Normal(RaftCommand::ApplyHead(StagedHead {
                 ledger_id: ledger_id.into(),
                 branch: branch.into(),
                 queue_id,
@@ -1161,7 +1160,7 @@ mod tests {
     ) -> Entry<TypeConfig> {
         Entry {
             log_id: log_id(1, index),
-            payload: EntryPayload::Normal(RaftCommand::PoisonQueueEntry(PoisonQueueEntryArgs {
+            payload: EntryPayload::Normal(RaftCommand::PoisonQueueEntry(EntryPoisoning {
                 ledger_id: ledger_id.into(),
                 branch: branch.into(),
                 queue_id,
