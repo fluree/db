@@ -46,7 +46,7 @@ The TTL file is the **canonical** store for a given scope. The `__memory` ledger
 
 When you `memory add`, the CLI / MCP server:
 
-1. Rewrites the TTL file with the new memory inserted in sorted position (authoritative).
+1. Splices the new memory's block into its sorted `(branch, id)` position in the TTL file (authoritative). It reads and rewrites the file text directly — it does **not** re-derive the file from the ledger — so an add stays fast as the store grows. (`update` and `forget` rewrite the whole file, since they change or remove an existing block.)
 2. Transacts the new triples into the `__memory` ledger (so recall is fast).
 3. Writes a content-hash watermark to `.fluree-memory/.local/build-hash`.
 
@@ -56,7 +56,7 @@ If the ledger write fails, the hash is left stale and the next `ensure_synced` c
 
 It's normal for several processes to touch one project's memory at once — Cursor and Claude Code together, or several Claude sessions, each running its own `fluree mcp serve`. Two guarantees keep that safe:
 
-- **The TTL file is the only shared mutable state, and writes are serialized.** Every mutation takes a cross-process file lock (`.fluree-memory/.local/rebuild.lock`) before rewriting the file, and re-reads the file under that lock, so two writers can't lose each other's memories.
+- **The TTL file is the only shared mutable state, and writes are serialized.** Every mutation takes a cross-process file lock (`.fluree-memory/.local/rebuild.lock`) before touching the file, and re-reads the file under that lock, so two writers can't lose each other's memories. The lock wait is bounded (30s default, override with `FLUREE_MEMORY_LOCK_TIMEOUT_SECS`): if another process is wedged holding it, the operation fails with a clear error instead of hanging.
 - **Each process keeps its ledger cache private.** The `mcp serve` ledger is held **in-memory** and rebuilt from the TTL files on startup, so one process refreshing its cache can never disturb another's. Each process also tracks, in memory, the file content its own ledger reflects — the shared on-disk `build-hash` alone can't tell a long-running process that *another* process changed the files, so the per-process watermark is what triggers its rebuild. (Short-lived `fluree memory` CLI commands keep a file-backed ledger for `import` and legacy migration; they're not long-lived enough to drift.)
 
 ## Editing by hand
