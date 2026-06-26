@@ -58,7 +58,7 @@ use tracing::info;
 
 #[cfg(feature = "raft")]
 use fluree_db_consensus::raft::commit_worker::{
-    QueuePoisonPublisher, WorkerSupervisor, WorkerSupervisorParts,
+    PublishingChannel, QueuePoisonPublisher, StagingContext, WorkerSupervisor,
 };
 
 /// Private listener config for the Raft inter-node RPC + admin
@@ -627,27 +627,31 @@ impl FlureeServerBuilder {
                     .as_ref()
                     .expect("raft_nameservice present whenever self.raft is Some"),
             );
-            let publisher: std::sync::Arc<dyn fluree_db_nameservice::CommitPublisher> =
+            let commits: std::sync::Arc<dyn fluree_db_nameservice::CommitPublisher> =
                 std::sync::Arc::clone(&raft_ns) as _;
             // Same `RaftNameService` Arc upcast a second time, this
             // time to the queue-poison publisher trait so a follower-
             // owned worker can ferry deterministic poisons to the
             // leader instead of looping forever on `client_write`
             // returning `ForwardToLeader`.
-            let poison_publisher: Arc<dyn QueuePoisonPublisher> = Arc::clone(&raft_ns) as _;
-            let supervisor = WorkerSupervisor::new(WorkerSupervisorParts {
-                id: integration.id,
-                raft: Arc::clone(&integration.raft),
-                publisher,
-                poison_publisher,
-                fluree: Arc::clone(&state_inner.fluree),
-                index_config: state_inner
-                    .index_config
-                    .clone()
-                    .expect("index_config set by AppState::new"),
-                shared_state: integration.shared_state.clone(),
-                staged_receipts: Arc::clone(&integration.staged_receipts),
-            });
+            let poison: Arc<dyn QueuePoisonPublisher> = Arc::clone(&raft_ns) as _;
+            let supervisor = WorkerSupervisor::new(
+                integration.id,
+                Arc::clone(&integration.raft),
+                integration.shared_state.clone(),
+                PublishingChannel {
+                    commits,
+                    poison,
+                    staged_receipts: Arc::clone(&integration.staged_receipts),
+                },
+                StagingContext {
+                    fluree: Arc::clone(&state_inner.fluree),
+                    index_config: state_inner
+                        .index_config
+                        .clone()
+                        .expect("index_config set by AppState::new"),
+                },
+            );
             crate::raft::spawn_worker_supervisor(supervisor)
         });
 

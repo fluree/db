@@ -148,6 +148,40 @@ pub enum QueuePoisonError {
     NoLeader,
 }
 
+/// Handles a [`Worker`] uses to commit its staged work.
+///
+/// - [`commits`](Self::commits) proposes `ApplyHead` after a
+///   successful stage. Dispatches via `client_write` on the leader
+///   and via the `apply_staged_commit` HTTP endpoint on a follower.
+/// - [`poison`](Self::poison) proposes `PoisonQueueEntry` for
+///   deterministic failures, with the same dispatch via the
+///   `apply_queue_poison` endpoint.
+/// - [`staged_receipts`](Self::staged_receipts) is the per-leader
+///   stash the `apply_staged_commit` path reads typed receipt detail
+///   from. The worker writes to it before proposing through
+///   [`commits`](Self::commits); on propose failure the worker takes
+///   the entry back out; on success the state-machine adapter takes
+///   during waiter resolution.
+#[derive(Clone)]
+pub struct PublishingChannel {
+    pub commits: Arc<dyn CommitPublisher>,
+    pub poison: Arc<dyn QueuePoisonPublisher>,
+    pub staged_receipts: Arc<StagedReceiptMap>,
+}
+
+/// Handles a [`Worker`] uses to stage a commit locally.
+///
+/// - [`fluree`](Self::fluree) owns content storage, the per-branch
+///   write guards, and the staging machinery (`stage`, `prepare_*`,
+///   `content_store`).
+/// - [`index_config`](Self::index_config) shapes what staging
+///   produces. Consumed by `fluree`'s commit path.
+#[derive(Clone)]
+pub struct StagingContext {
+    pub fluree: Arc<Fluree>,
+    pub index_config: IndexConfig,
+}
+
 /// Per-branch staging task.
 ///
 /// Drains a single branch's queue: peeks the front, stages the
@@ -157,50 +191,33 @@ pub enum QueuePoisonError {
 /// owner resolves to; cross-branch concurrency is the supervisor's
 /// responsibility.
 ///
-/// Head advances flow through `publisher.publish_commit` — a Raft
-/// deployment supplies a [`RaftNameService`](crate::raft::nameservice::RaftNameService)
+/// Head advances flow through [`PublishingChannel::commits`] — a
+/// Raft deployment supplies a
+/// [`RaftNameService`](crate::raft::nameservice::RaftNameService)
 /// here, which proposes `ApplyHead` against the current per-branch
 /// queue front (forwarding to the leader when this worker runs on a
-/// follower). Poisoning still goes direct to Raft because there's no
-/// trait surface for "fail this queue entry."
+/// follower). Deterministic failures route through
+/// [`PublishingChannel::poison`] with the same dispatch.
 #[derive(Clone)]
 pub struct Worker {
     ref_key: RefKey,
-    publisher: Arc<dyn CommitPublisher>,
-    /// Leader-aware sink for `PoisonQueueEntry`. On a follower this
-    /// ferries the propose to the current leader rather than
-    /// looping forever on `client_write` returning
-    /// `ForwardToLeader`.
-    poison_publisher: Arc<dyn QueuePoisonPublisher>,
-    fluree: Arc<Fluree>,
-    index_config: IndexConfig,
     shared_state: SharedState,
-    /// Side channel paired with the state-machine adapter's
-    /// `StagedReceiptMap`. The worker stashes a typed
-    /// [`AppliedReceipt`] here before proposing `ApplyHead`; the
-    /// adapter takes it during waiter resolution. Cleanup on
-    /// propose failure prevents stale receipts from accumulating.
-    staged_receipts: Arc<StagedReceiptMap>,
+    publishing: PublishingChannel,
+    staging: StagingContext,
 }
 
 impl Worker {
     fn new(
         ref_key: RefKey,
-        publisher: Arc<dyn CommitPublisher>,
-        poison_publisher: Arc<dyn QueuePoisonPublisher>,
-        fluree: Arc<Fluree>,
-        index_config: IndexConfig,
         shared_state: SharedState,
-        staged_receipts: Arc<StagedReceiptMap>,
+        publishing: PublishingChannel,
+        staging: StagingContext,
     ) -> Self {
         Self {
             ref_key,
-            publisher,
-            poison_publisher,
-            fluree,
-            index_config,
             shared_state,
-            staged_receipts,
+            publishing,
+            staging,
         }
     }
 
@@ -246,6 +263,7 @@ impl Worker {
                         // poisons.
                         let ledger_id = self.ref_key.ledger_id();
                         if let Err(refresh_err) = self
+                            .staging
                             .fluree
                             .refresh(&ledger_id, RefreshOpts::default())
                             .await
@@ -311,7 +329,8 @@ impl Worker {
         // pre-stage head → silent stale reads. So on error we
         // reconcile against the replicated head and finalize the
         // install only if our commit landed.
-        self.staged_receipts
+        self.publishing
+            .staged_receipts
             .stash(entry.queue_id, self.ref_key.clone(), receipt);
         match self.publish_head_advance(commit_id.clone(), commit_t).await {
             Ok(()) => {
@@ -328,7 +347,7 @@ impl Worker {
                     // `take` here is a defensive no-op. Finalize the
                     // local cache so this node catches up with the
                     // replicated head.
-                    self.staged_receipts.take(entry.queue_id);
+                    self.publishing.staged_receipts.take(entry.queue_id);
                     if let Some(install) = install {
                         self.finalize_after_publish(entry.queue_id, commit_t, install)
                             .await;
@@ -340,7 +359,7 @@ impl Worker {
                     // without calling `replace`, so this node's
                     // Fluree handle stays at its pre-stage head —
                     // same as every other node.
-                    self.staged_receipts.take(entry.queue_id);
+                    self.publishing.staged_receipts.take(entry.queue_id);
                     Err(err)
                 }
             }
@@ -406,8 +425,9 @@ impl Worker {
             new_state,
             commit_t,
         } = install;
-        let needs_reindex = new_state.should_reindex(&self.index_config);
-        self.fluree
+        let needs_reindex = new_state.should_reindex(&self.staging.index_config);
+        self.staging
+            .fluree
             .finalize_commit(write_guard, new_state, commit_t, needs_reindex)
             .await
             .map_err(api_error_to_stage)
@@ -416,6 +436,7 @@ impl Worker {
     async fn load_envelope(&self, entry: &QueueEntry) -> Result<QueuedRequest, WorkerError> {
         let ledger_id = self.ref_key.ledger_id();
         let bytes = self
+            .staging
             .fluree
             .content_store(&ledger_id)
             .get(&entry.request_cid)
@@ -447,6 +468,7 @@ impl Worker {
 
         let ledger_id = self.ref_key.ledger_id();
         let ledger_manager = self
+            .staging
             .fluree
             .ledger_manager()
             .ok_or_else(|| stage_failure("LedgerManager is not configured on Fluree"))?;
@@ -459,7 +481,7 @@ impl Worker {
             .await
             .map_err(submission_to_stage)?;
 
-        let staged = self.fluree.stage(&ledger_handle);
+        let staged = self.staging.fluree.stage(&ledger_handle);
         let staged = match &body {
             TransactionBody::JsonLdInsert(json) => staged.insert(json),
             TransactionBody::JsonLdUpsert(json) => staged.upsert(json),
@@ -474,7 +496,7 @@ impl Worker {
         let mut builder = staged
             .txn_opts(txn_opts)
             .commit_opts(commit_opts.into_commit_opts())
-            .index_config(self.index_config.clone());
+            .index_config(self.staging.index_config.clone());
         if let Some(tracking) = tracking {
             builder = builder.tracking(tracking);
         }
@@ -500,7 +522,7 @@ impl Worker {
         // produced.
         let tally = staged_commit.tally.clone();
 
-        let content_store = self.fluree.content_store(&ledger_id);
+        let content_store = self.staging.fluree.content_store(&ledger_id);
         content_store
             .put_with_id(&commit_cid, &staged_commit.commit_bytes)
             .await
@@ -565,6 +587,7 @@ impl Worker {
             commit,
             ..
         } = self
+            .staging
             .fluree
             .prepare_revert(&ledger_name, &branch, selection, strategy)
             .await
@@ -598,7 +621,7 @@ impl Worker {
         let commit_t = staged_commit.commit.t;
 
         let ledger_id = self.ref_key.ledger_id();
-        let content_store = self.fluree.content_store(&ledger_id);
+        let content_store = self.staging.fluree.content_store(&ledger_id);
         content_store
             .put_with_id(&commit_cid, &staged_commit.commit_bytes)
             .await
@@ -641,7 +664,7 @@ impl Worker {
             governance,
         } = push;
         let ledger_id = self.ref_key.ledger_id();
-        let content_store = self.fluree.content_store(&ledger_id);
+        let content_store = self.staging.fluree.content_store(&ledger_id);
         // Read each commit's bytes back from CAS by CID. The
         // transactor wrote them before enqueueing, so a definitive
         // `NotFound` means the blob has been GC'd (or never landed)
@@ -678,8 +701,9 @@ impl Worker {
             indexing_status,
             ..
         } = self
+            .staging
             .fluree
-            .prepare_push(&ledger_id, payload, &governance, &self.index_config)
+            .prepare_push(&ledger_id, payload, &governance, &self.staging.index_config)
             .await
             .map_err(|e| stage_failure(&format!("prepare_push failed: {e}")))?;
 
@@ -724,6 +748,7 @@ impl Worker {
             commit,
             ..
         } = self
+            .staging
             .fluree
             .prepare_merge(
                 &ledger_name,
@@ -763,7 +788,7 @@ impl Worker {
                     message: "build_merge_general produced staged commit without commit.id".into(),
                 })
             })?;
-            let content_store = self.fluree.content_store(&target_id);
+            let content_store = self.staging.fluree.content_store(&target_id);
             content_store
                 .put_with_id(&commit_cid, &staged.commit_bytes)
                 .await
@@ -826,6 +851,7 @@ impl Worker {
             pending_replays,
             ..
         } = self
+            .staging
             .fluree
             .prepare_rebase(&ledger_name, &branch, strategy)
             .await
@@ -847,7 +873,7 @@ impl Worker {
             }
         };
 
-        let content_store = self.fluree.content_store(&branch_id);
+        let content_store = self.staging.fluree.content_store(&branch_id);
         for replay in &pending_replays {
             content_store
                 .put_with_id(&replay.commit_id, &replay.commit_bytes)
@@ -884,7 +910,8 @@ impl Worker {
     ) -> Result<(), WorkerError> {
         let full_ledger_id = self.ref_key.ledger_id();
         match self
-            .publisher
+            .publishing
+            .commits
             .publish_commit(&full_ledger_id, commit_t, &commit_id)
             .await
         {
@@ -912,7 +939,8 @@ impl Worker {
         // Without the indirection a follower-owned worker would
         // bounce `ForwardToLeader` indefinitely and the branch's
         // queue front would stall on a deterministic poison.
-        self.poison_publisher
+        self.publishing
+            .poison
             .poison_queue_entry(&self.ref_key, queue_id, reason)
             .await
             .map_err(|e| WorkerError::Raft(format!("PoisonQueueEntry propose failed: {e}")))
@@ -1071,50 +1099,25 @@ where
 pub struct WorkerSupervisor {
     id: NodeId,
     raft: Arc<Raft<TypeConfig>>,
-    publisher: Arc<dyn CommitPublisher>,
-    poison_publisher: Arc<dyn QueuePoisonPublisher>,
-    fluree: Arc<Fluree>,
-    index_config: IndexConfig,
     shared_state: SharedState,
-    staged_receipts: Arc<StagedReceiptMap>,
-}
-
-/// Components the [`WorkerSupervisor`] assembles into a single
-/// long-running task. Bundled so the constructor stays one
-/// positional struct argument as the dependency set grows — same
-/// pattern as `RaftIntegrationParts` in fluree-db-server.
-pub struct WorkerSupervisorParts {
-    pub id: NodeId,
-    pub raft: Arc<Raft<TypeConfig>>,
-    pub publisher: Arc<dyn CommitPublisher>,
-    pub poison_publisher: Arc<dyn QueuePoisonPublisher>,
-    pub fluree: Arc<Fluree>,
-    pub index_config: IndexConfig,
-    pub shared_state: SharedState,
-    pub staged_receipts: Arc<StagedReceiptMap>,
+    publishing: PublishingChannel,
+    staging: StagingContext,
 }
 
 impl WorkerSupervisor {
-    pub fn new(parts: WorkerSupervisorParts) -> Self {
-        let WorkerSupervisorParts {
-            id,
-            raft,
-            publisher,
-            poison_publisher,
-            fluree,
-            index_config,
-            shared_state,
-            staged_receipts,
-        } = parts;
+    pub fn new(
+        id: NodeId,
+        raft: Arc<Raft<TypeConfig>>,
+        shared_state: SharedState,
+        publishing: PublishingChannel,
+        staging: StagingContext,
+    ) -> Self {
         Self {
             id,
             raft,
-            publisher,
-            poison_publisher,
-            fluree,
-            index_config,
             shared_state,
-            staged_receipts,
+            publishing,
+            staging,
         }
     }
 
@@ -1236,12 +1239,9 @@ impl WorkerSupervisor {
     fn make_worker(&self, ref_key: RefKey) -> Worker {
         Worker::new(
             ref_key,
-            Arc::clone(&self.publisher),
-            Arc::clone(&self.poison_publisher),
-            Arc::clone(&self.fluree),
-            self.index_config.clone(),
             self.shared_state.clone(),
-            Arc::clone(&self.staged_receipts),
+            self.publishing.clone(),
+            self.staging.clone(),
         )
     }
 }
