@@ -749,6 +749,12 @@ impl R2rmlTableProvider for FlureeR2rmlProvider<'_> {
             }
         };
 
+        // Shared on-disk cache for data files (one global byte budget, deduped
+        // per directory). Threaded into the Parquet readers, which apply a
+        // whole-file-vs-range policy per file based on how much each query reads.
+        let cache_dir = self.fluree.binary_store_cache_dir();
+        let disk_cache = fluree_db_iceberg::DiskArtifactCache::for_dir(&cache_dir);
+
         // Check cache for table metadata
         let cache = self.fluree.r2rml_cache();
         let metadata_location = &load_response.metadata_location;
@@ -935,10 +941,16 @@ impl R2rmlTableProvider for FlureeR2rmlProvider<'_> {
                 .map(|task| {
                     let storage = Arc::clone(&storage);
                     let footers = Arc::clone(&footers);
+                    let disk_cache = Arc::clone(&disk_cache);
+                    let cache_dir = cache_dir.clone();
                     async move {
                         tokio::spawn(async move {
-                            let reader =
-                                SendParquetReader::with_cache(storage.as_ref(), footers.as_ref());
+                            let reader = SendParquetReader::with_caches(
+                                storage.as_ref(),
+                                footers.as_ref(),
+                                &disk_cache,
+                                &cache_dir,
+                            );
                             reader.read_task(&task).await.map_err(|e| {
                                 QueryError::Internal(format!(
                                     "Failed to read Parquet file '{}': {e}",

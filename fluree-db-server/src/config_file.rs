@@ -64,6 +64,7 @@ pub struct ServerFileConfig {
     pub query_timeout_ms: Option<u64>,
     pub query_min_t_timeout_ms: Option<u64>,
     pub cache_max_mb: Option<usize>,
+    pub disk_cache_max_mb: Option<usize>,
 
     /// `[server.query_refresh]`
     #[serde(default)]
@@ -409,6 +410,7 @@ pub const CONFIG_FILE_ARG_IDS: &[&str] = &[
     "query_refresh_enabled",
     "query_refresh_ttl_ms",
     "cache_max_mb",
+    "disk_cache_max_mb",
     "indexing_enabled",
     "reindex_min_bytes",
     "reindex_max_bytes",
@@ -525,6 +527,11 @@ pub fn apply_to_server_config(
     if is_default("cache_max_mb") {
         if let Some(v) = file.cache_max_mb {
             config.cache_max_mb = Some(v);
+        }
+    }
+    if is_default("disk_cache_max_mb") {
+        if let Some(v) = file.disk_cache_max_mb {
+            config.disk_cache_max_mb = Some(v);
         }
     }
 

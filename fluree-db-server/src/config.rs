@@ -426,6 +426,12 @@ pub struct ServerConfig {
     #[arg(long, env = "FLUREE_CACHE_MAX_MB")]
     pub cache_max_mb: Option<usize>,
 
+    /// On-disk cache budget in MB, shared globally across Fluree object storage
+    /// and Iceberg data files (default: auto-detect from available disk; `0`
+    /// disables). `FLUREE_DISK_CACHE_BUDGET_BYTES` (bytes) still overrides this.
+    #[arg(long, env = "FLUREE_DISK_CACHE_MAX_MB")]
+    pub disk_cache_max_mb: Option<usize>,
+
     /// Request body size limit in bytes (default 50MB)
     #[arg(long, env = "FLUREE_BODY_LIMIT", default_value_t = server_defaults::DEFAULT_BODY_LIMIT)]
     pub body_limit: usize,
@@ -774,6 +780,7 @@ impl Default for ServerConfig {
             reindex_min_bytes: server_defaults::DEFAULT_REINDEX_MIN_BYTES,
             reindex_max_bytes: None,
             cache_max_mb: None,
+            disk_cache_max_mb: None,
             body_limit: server_defaults::DEFAULT_BODY_LIMIT,
             query_timeout_ms: server_defaults::DEFAULT_QUERY_TIMEOUT_MS,
             query_min_t_timeout_ms: server_defaults::DEFAULT_QUERY_MIN_T_TIMEOUT_MS,

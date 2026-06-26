@@ -2785,6 +2785,7 @@ dependencies = [
  "tracing",
  "urlencoding",
  "wiremock",
+ "xxhash-rust",
 ]
 
 [[package]]
