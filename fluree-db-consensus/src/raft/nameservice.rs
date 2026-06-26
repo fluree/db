@@ -50,8 +50,8 @@
 use crate::raft::commit_worker::{QueuePoisonError, QueuePoisonPublisher};
 use crate::raft::staged_receipt::{AppliedReceipt, StagedReceiptMap};
 use crate::raft::state_machine::{
-    Command as SmCommand, DesyncReason, EntryPoisoning, NameServiceState, NewBranch, NewIndexHead,
-    NewLedger, PoisonReason, ConfigUpdate, RecordedTally, RefKey, ResetHeadSnapshot,
+    Command as SmCommand, ConfigUpdate, DesyncReason, EntryPoisoning, NameServiceState, NewBranch,
+    NewIndexHead, NewLedger, PoisonReason, RecordedTally, RefKey, ResetHeadSnapshot,
     Response as SmResponse, StagedHead,
 };
 use crate::raft::state_machine_adapter::SharedState;
