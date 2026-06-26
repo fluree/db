@@ -50,9 +50,9 @@
 use crate::raft::commit_worker::{QueuePoisonError, QueuePoisonPublisher};
 use crate::raft::staged_receipt::{AppliedReceipt, StagedReceiptMap};
 use crate::raft::state_machine::{
-    AdvanceIndexHeadArgs, ApplyHeadArgs, Command as SmCommand, CreateBranchArgs, CreateLedgerArgs,
-    DesyncReason, NameServiceState, PoisonQueueEntryArgs, PoisonReason, PushConfigArgs,
-    RecordedTally, RefKey, ResetHeadSnapshot, Response as SmResponse,
+    AdvanceIndexHeadArgs, ApplyHeadArgs, Command as SmCommand, DesyncReason, NameServiceState,
+    NewBranch, NewLedger, PoisonQueueEntryArgs, PoisonReason, PushConfigArgs, RecordedTally,
+    RefKey, ResetHeadSnapshot, Response as SmResponse,
 };
 use crate::raft::state_machine_adapter::SharedState;
 use crate::raft::{ClusterNode, NodeId, TypeConfig};
@@ -1234,7 +1234,7 @@ fn build_create_command(ledger_id: &str) -> std::result::Result<SmCommand, NameS
         .duration_since(SystemTime::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
-    Ok(SmCommand::CreateLedger(CreateLedgerArgs {
+    Ok(SmCommand::CreateLedger(NewLedger {
         ledger_id: ledger_name,
         branch,
         created_at_millis: applied_at_millis,
@@ -1343,7 +1343,7 @@ fn build_create_branch_command(
         .duration_since(SystemTime::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
-    Ok(SmCommand::CreateBranch(CreateBranchArgs {
+    Ok(SmCommand::CreateBranch(NewBranch {
         ledger_id: ledger_name.into(),
         branch: new_branch.into(),
         source_branch: source_branch.into(),
@@ -1726,7 +1726,7 @@ mod tests {
 
     use super::*;
     use crate::raft::state_machine::{
-        AdvanceIndexHeadArgs, Command, CreateLedgerArgs, NameServiceState, RefEntry, Response,
+        AdvanceIndexHeadArgs, Command, NameServiceState, NewLedger, RefEntry, Response,
     };
     use crate::raft::{ClusterNode, NodeId};
     use fluree_db_api::{ContentId, ContentKind};
@@ -1757,7 +1757,7 @@ mod tests {
     /// state machine. Leaves the branch unborn — the caller follows
     /// with `AdvanceRef(expected_prev=None, …)` to seed the head.
     fn init_cmd(ledger_id: &str, branch: &str) -> Command {
-        Command::CreateLedger(CreateLedgerArgs {
+        Command::CreateLedger(NewLedger {
             ledger_id: ledger_id.into(),
             branch: branch.into(),
             created_at_millis: 1_000,

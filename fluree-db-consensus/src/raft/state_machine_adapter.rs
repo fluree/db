@@ -645,7 +645,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::raft::state_machine::CreateLedgerArgs;
+    use crate::raft::state_machine::NewLedger;
     use crate::raft::storage::memory::MemoryRaftStorage;
     use crate::raft::Command as RaftCommand;
     use fluree_db_api::{ContentId, ContentKind};
@@ -665,7 +665,7 @@ mod tests {
     fn create_ledger_entry(index: u64, ledger_id: &str) -> Entry<TypeConfig> {
         Entry {
             log_id: log_id(1, index),
-            payload: EntryPayload::Normal(RaftCommand::CreateLedger(CreateLedgerArgs {
+            payload: EntryPayload::Normal(RaftCommand::CreateLedger(NewLedger {
                 ledger_id: ledger_id.into(),
                 branch: "main".into(),
                 created_at_millis: 1_000,
@@ -943,7 +943,7 @@ mod tests {
         sm.apply([Entry {
             log_id: log_id(1, 3),
             payload: EntryPayload::Normal(RaftCommand::CreateBranch(
-                crate::raft::state_machine::CreateBranchArgs {
+                crate::raft::state_machine::NewBranch {
                     ledger_id: "test/db".into(),
                     branch: "feature".into(),
                     source_branch: "main".into(),
@@ -981,7 +981,7 @@ mod tests {
         sm.apply([Entry {
             log_id: log_id(1, 3),
             payload: EntryPayload::Normal(RaftCommand::CreateBranch(
-                crate::raft::state_machine::CreateBranchArgs {
+                crate::raft::state_machine::NewBranch {
                     ledger_id: "test/db".into(),
                     branch: "feature".into(),
                     source_branch: "main".into(),

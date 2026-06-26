@@ -536,12 +536,12 @@ pub enum Command {
     /// Register a branch on a ledger. The branch starts unborn — no
     /// [`RefEntry`] is created until the first
     /// [`Command::ApplyHead`] for the branch.
-    CreateLedger(CreateLedgerArgs),
+    CreateLedger(NewLedger),
     /// Fork a new branch from an existing one. Increments the
     /// source branch's child counter and records parentage on the
     /// new [`RefEntry`]. The new branch is born with the source's
     /// current head (or `at_commit` if supplied).
-    CreateBranch(CreateBranchArgs),
+    CreateBranch(NewBranch),
     /// Drop a branch created via [`Command::CreateBranch`] (or
     /// implicit branch creation through [`Command::ApplyHead`]),
     /// decrementing the parent's child counter when applicable.
@@ -804,7 +804,7 @@ pub struct AdvanceIndexHeadArgs {
 /// adapter at `RaftNameService::init` splits it before building this
 /// command.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CreateLedgerArgs {
+pub struct NewLedger {
     pub ledger_id: String,
     pub branch: String,
     pub created_at_millis: u64,
@@ -812,7 +812,7 @@ pub struct CreateLedgerArgs {
 
 /// Payload for [`Command::CreateBranch`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CreateBranchArgs {
+pub struct NewBranch {
     pub ledger_id: String,
     /// New branch name to create.
     pub branch: String,
@@ -1275,8 +1275,8 @@ fn quorum_floor(configured: usize) -> usize {
     configured / 2 + 1
 }
 
-fn create_ledger(state: &mut NameServiceState, log_index: u64, args: CreateLedgerArgs) -> Response {
-    let CreateLedgerArgs {
+fn create_ledger(state: &mut NameServiceState, log_index: u64, args: NewLedger) -> Response {
+    let NewLedger {
         ledger_id,
         branch,
         created_at_millis,
@@ -1377,8 +1377,8 @@ fn purge_ledger(
     }
 }
 
-fn create_branch(state: &mut NameServiceState, log_index: u64, args: CreateBranchArgs) -> Response {
-    let CreateBranchArgs {
+fn create_branch(state: &mut NameServiceState, log_index: u64, args: NewBranch) -> Response {
+    let NewBranch {
         ledger_id,
         branch,
         source_branch,
@@ -2324,7 +2324,7 @@ mod tests {
     }
 
     fn create_branch_cmd(ledger_id: &str, branch: &str) -> Command {
-        Command::CreateLedger(CreateLedgerArgs {
+        Command::CreateLedger(NewLedger {
             ledger_id: ledger_id.into(),
             branch: branch.into(),
             created_at_millis: 1_000,
@@ -2737,7 +2737,7 @@ mod tests {
         source_branch: &str,
         at_commit: Option<(ContentId, i64)>,
     ) -> Command {
-        Command::CreateBranch(CreateBranchArgs {
+        Command::CreateBranch(NewBranch {
             ledger_id: ledger_id.into(),
             branch: new_branch.into(),
             source_branch: source_branch.into(),

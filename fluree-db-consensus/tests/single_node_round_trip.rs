@@ -25,8 +25,7 @@ use openraft::{Config, Raft, ServerState};
 use fluree_db_consensus::raft::log_adapter::LogAdapter;
 use fluree_db_consensus::raft::nameservice::RaftNameService;
 use fluree_db_consensus::raft::state_machine::{
-    ApplyHeadArgs, BodyKind, Command as SmCommand, CreateLedgerArgs, EnqueueCommandArgs, RefKey,
-    Response,
+    ApplyHeadArgs, BodyKind, Command as SmCommand, EnqueueCommandArgs, NewLedger, RefKey, Response,
 };
 use fluree_db_consensus::raft::state_machine_adapter::StateMachineAdapter;
 use fluree_db_consensus::raft::storage::memory::MemoryRaftStorage;
@@ -111,7 +110,7 @@ async fn single_node_create_ledger_round_trip() {
         .await
         .unwrap();
 
-    let cmd = SmCommand::CreateLedger(CreateLedgerArgs {
+    let cmd = SmCommand::CreateLedger(NewLedger {
         ledger_id: "test/db".into(),
         branch: "main".into(),
         created_at_millis: 1_000,
@@ -154,7 +153,7 @@ async fn single_node_raft_index_publisher_round_trip() {
 
     // Bootstrap the ledger + a commit so the index publish has
     // something to attach to.
-    raft.client_write(SmCommand::CreateLedger(CreateLedgerArgs {
+    raft.client_write(SmCommand::CreateLedger(NewLedger {
         ledger_id: "test/db".into(),
         branch: "main".into(),
         created_at_millis: 1_000,
@@ -276,7 +275,7 @@ async fn single_node_apply_emits_commit_event_on_bus() {
     // the receiver's buffer when apply emits it.
     let mut sub = event_bus.subscribe(SubscriptionScope::All);
 
-    raft.client_write(SmCommand::CreateLedger(CreateLedgerArgs {
+    raft.client_write(SmCommand::CreateLedger(NewLedger {
         ledger_id: "test/db".into(),
         branch: "main".into(),
         created_at_millis: 1_000,
