@@ -694,7 +694,7 @@ pub enum Command {
     /// replication state: a sustained outage flips the voter to
     /// ineligible (no new worker assignments rendezvous to it);
     /// restored contact flips it back to eligible.
-    SetWorkerEligibility(SetWorkerEligibilityArgs),
+    SetWorkerEligibility(WorkerEligibility),
 }
 
 /// Payload for [`Command::PushConfig`].
@@ -764,7 +764,7 @@ pub struct PoisonQueueEntryArgs {
 
 /// Payload for [`Command::SetWorkerEligibility`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SetWorkerEligibilityArgs {
+pub struct WorkerEligibility {
     /// Voter whose entry in
     /// [`NameServiceState::worker_eligible_voters`] is being toggled.
     pub voter: NodeId,
@@ -1221,11 +1221,8 @@ pub fn apply(state: &mut NameServiceState, command: Command, log_index: u64) -> 
 /// or remove `voter` from
 /// [`NameServiceState::worker_eligible_voters`] per the `eligible`
 /// flag. Idempotent: a no-op apply returns `changed: false`.
-fn apply_set_worker_eligibility(
-    state: &mut NameServiceState,
-    args: SetWorkerEligibilityArgs,
-) -> Response {
-    let SetWorkerEligibilityArgs {
+fn apply_set_worker_eligibility(state: &mut NameServiceState, args: WorkerEligibility) -> Response {
+    let WorkerEligibility {
         voter,
         eligible,
         applied_at_millis: _,
@@ -4952,7 +4949,7 @@ mod tests {
     // ----------------------------------------------------------------
 
     fn set_eligibility(voter: NodeId, eligible: bool) -> Command {
-        Command::SetWorkerEligibility(SetWorkerEligibilityArgs {
+        Command::SetWorkerEligibility(WorkerEligibility {
             voter,
             eligible,
             applied_at_millis: 1_000,

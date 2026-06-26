@@ -673,6 +673,10 @@ impl FlureeServerBuilder {
                 fluree_db_consensus::raft::eviction_scheduler::EvictionScheduler::new(Arc::clone(
                     &integration.raft,
                 ));
+            let liveness_monitor =
+                fluree_db_consensus::raft::liveness_monitor::LivenessMonitor::new(Arc::clone(
+                    &integration.raft,
+                ));
             let spawn_leader_tasks = move || {
                 let nameservice: std::sync::Arc<dyn fluree_db_nameservice::IndexingNameService> =
                     raft_ns.clone();
@@ -685,6 +689,7 @@ impl FlureeServerBuilder {
                 vec![
                     tokio::spawn(worker.run()),
                     tokio::spawn(eviction_scheduler.clone().run()),
+                    tokio::spawn(liveness_monitor.clone().run()),
                 ]
             };
             crate::raft::spawn_leader_watcher(

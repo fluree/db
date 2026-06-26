@@ -41,6 +41,7 @@ pub mod admin;
 pub mod commit_worker;
 pub mod eviction_scheduler;
 pub mod forward;
+pub mod liveness_monitor;
 pub mod log_adapter;
 pub mod nameservice;
 pub mod network;
