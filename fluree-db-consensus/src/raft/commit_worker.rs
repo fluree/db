@@ -1170,14 +1170,25 @@ impl WorkerSupervisor {
     }
 
     async fn compute_desired_owners(&self) -> HashSet<RefKey> {
-        let voters = self.current_voters();
+        let state = self.shared_state.read().await;
+        // The replicated `worker_eligible_voters` is the
+        // authoritative input once observed; the leader's monitor
+        // demotes unreachable voters in it so they stop hosting
+        // workers. Fall back to raft membership during the initial
+        // window before any membership-apply has populated the
+        // set on this node (fresh cluster bootstrap, or a snapshot
+        // restored from a build that predates the field).
+        let voters: Vec<NodeId> = if state.worker_eligible_voters.is_empty() {
+            self.current_voters()
+        } else {
+            state.worker_eligible_voters.iter().copied().collect()
+        };
         // Empty voter set = cluster not yet bootstrapped (or every
         // voter dropped); no branch can resolve an owner, so claim
         // nothing this tick.
         if voters.is_empty() {
             return HashSet::new();
         }
-        let state = self.shared_state.read().await;
         state
             .queues
             .keys()
@@ -1473,22 +1484,29 @@ mod tests {
     }
 
     /// Replicates [`WorkerSupervisor::compute_desired_owners`] against
-    /// a bare `SharedState` plus an explicit voter list. Exercises
-    /// the supervisor's ownership filter without wiring up Raft.
+    /// a bare `SharedState` plus a fallback voter list. Mirrors the
+    /// real implementation: reads `state.worker_eligible_voters` when
+    /// non-empty, otherwise uses `fallback_voters` (the test stand-in
+    /// for raft membership).
     async fn compute_desired_owners_for_test(
         state: &SharedState,
         id: NodeId,
-        voters: &[NodeId],
+        fallback_voters: &[NodeId],
     ) -> HashSet<RefKey> {
         use crate::raft::ownership::owner;
+        let state = state.read().await;
+        let voters: Vec<NodeId> = if state.worker_eligible_voters.is_empty() {
+            fallback_voters.to_vec()
+        } else {
+            state.worker_eligible_voters.iter().copied().collect()
+        };
         if voters.is_empty() {
             return HashSet::new();
         }
-        let state = state.read().await;
         state
             .queues
             .keys()
-            .filter(|ref_key| owner(ref_key, voters) == Some(id))
+            .filter(|ref_key| owner(ref_key, &voters) == Some(id))
             .cloned()
             .collect()
     }
@@ -1614,6 +1632,97 @@ mod tests {
         let shared = Arc::new(RwLock::new(state));
 
         let desired = compute_desired_owners_for_test(&shared, 1, &[]).await;
+        assert!(desired.is_empty());
+    }
+
+    /// When `worker_eligible_voters` is populated, ownership ranks
+    /// against that set — the fallback raft membership is ignored.
+    /// Verifies the supervisor honors the leader's monitor demoting
+    /// voter 3, even though raft still configures it as a voter.
+    #[tokio::test]
+    async fn supervisor_ranks_against_worker_eligible_voters_when_populated() {
+        let mut state = NameServiceState::default();
+        for i in 0..50 {
+            install_queue(&mut state, "test/db", &format!("branch-{i}"), vec![]);
+        }
+        // Configured = {1, 2, 3}, but the monitor demoted 3 — so
+        // only {1, 2} should host workers, and 3 must own nothing.
+        state.configured_voters = [1, 2, 3].into_iter().collect();
+        state.worker_eligible_voters = [1, 2].into_iter().collect();
+        let shared = Arc::new(RwLock::new(state));
+        let fallback = vec![1u64, 2, 3];
+
+        // The demoted voter claims nothing despite still being in
+        // the fallback list.
+        let demoted_share = compute_desired_owners_for_test(&shared, 3, &fallback).await;
+        assert!(
+            demoted_share.is_empty(),
+            "demoted voter must not own any branches"
+        );
+
+        // The remaining eligible voters partition every branch
+        // between them — nothing strands on the demoted voter.
+        let voter_1 = compute_desired_owners_for_test(&shared, 1, &fallback).await;
+        let voter_2 = compute_desired_owners_for_test(&shared, 2, &fallback).await;
+        let union: HashSet<RefKey> = voter_1.union(&voter_2).cloned().collect();
+        assert_eq!(
+            union.len(),
+            50,
+            "every branch must be claimed by exactly one eligible voter"
+        );
+        assert!(
+            voter_1.is_disjoint(&voter_2),
+            "no branch is double-claimed by two eligible voters"
+        );
+    }
+
+    /// When `worker_eligible_voters` is empty (fresh boot, snapshot
+    /// predating the field), the supervisor falls back to the raft
+    /// membership input. Demonstrates the supervisor stays
+    /// functional during the initial window before any
+    /// membership-apply has populated the replicated set.
+    #[tokio::test]
+    async fn supervisor_falls_back_to_membership_when_eligible_set_empty() {
+        let mut state = NameServiceState::default();
+        for i in 0..20 {
+            install_queue(&mut state, "test/db", &format!("branch-{i}"), vec![]);
+        }
+        // `worker_eligible_voters` deliberately left empty.
+        let shared = Arc::new(RwLock::new(state));
+        let fallback = vec![1u64, 2, 3];
+
+        // Each of the three fallback voters covers a share of the
+        // 20 branches, and they partition the full set.
+        let mut union = HashSet::new();
+        for id in &fallback {
+            let mine = compute_desired_owners_for_test(&shared, *id, &fallback).await;
+            for k in &mine {
+                assert!(
+                    union.insert(k.clone()),
+                    "branch {k:?} claimed twice during fallback"
+                );
+            }
+        }
+        assert_eq!(union.len(), 20);
+    }
+
+    /// When `worker_eligible_voters` is populated but a voter not
+    /// in the configured-voter input asks for its share, it gets
+    /// nothing — the eligible set is authoritative regardless of
+    /// what the caller passes as fallback.
+    #[tokio::test]
+    async fn supervisor_demoted_voter_claims_nothing_even_in_fallback() {
+        let mut state = NameServiceState::default();
+        install_queue(
+            &mut state,
+            "test/db",
+            "main",
+            vec![enqueued_entry(7, cid(1), BodyKind::JsonLdInsert)],
+        );
+        state.worker_eligible_voters = [1, 2].into_iter().collect();
+        let shared = Arc::new(RwLock::new(state));
+        // Voter 3 is in the fallback, but not in the eligible set.
+        let desired = compute_desired_owners_for_test(&shared, 3, &[1, 2, 3]).await;
         assert!(desired.is_empty());
     }
 
