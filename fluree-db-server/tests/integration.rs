@@ -29,10 +29,15 @@ async fn test_state() -> (TempDir, Arc<AppState>) {
 }
 
 // Regression for #1369: querying a registered Iceberg/R2RML graph source by
-// alias must route to the graph-source engine, not load it as a ledger (which
-// deserialized the graph-source nameservice record as `NsFileV2` and failed on
-// the missing `f:ledger` field with a 500). The bogus catalog means the query
-// itself can't succeed, but it must NOT fail with that deserialization error.
+// alias (SPARQL `POST /query/<alias>`, the `execute_sparql_ledger` path) must
+// route to the graph-source engine, not load it as a ledger (which deserialized
+// the graph-source nameservice record as `NsFileV2` and failed on the missing
+// `f:ledger` field with a 500) nor 404 as a missing ledger. The bogus catalog
+// (`s3://nonexistent`) means execution can't return rows, but the response must
+// prove the alias resolved AND reached the source engine: the error is the
+// engine's own "Iceberg graph source config" failure, never `f:ledger` and
+// never a not-found. (A readable in-tree source — which needs Iceberg test
+// infra — would additionally assert returned rows.)
 #[cfg(feature = "iceberg")]
 #[tokio::test]
 async fn graph_source_alias_query_does_not_deserialize_as_ledger() {
@@ -81,9 +86,22 @@ async fn graph_source_alias_query_does_not_deserialize_as_ledger() {
         .and_then(|e| e.as_str())
         .unwrap_or("")
         .to_lowercase();
+    // Must NOT be the ledger-deserialization failure...
     assert!(
         !err.contains("f:ledger") && !err.contains("missing field"),
         "alias query must route to the graph source, not deserialize the record as a ledger; status={status} body={body}"
+    );
+    // ...and must NOT be a not-found: the alias resolved and routed to the
+    // R2RML/Iceberg engine, which then fails on the bogus catalog config. This
+    // is the assertion the prior "not f:ledger" check missed (a 404 passed it).
+    assert_ne!(
+        status,
+        StatusCode::NOT_FOUND,
+        "graph-source alias should resolve and route to the engine, not 404; body={body}"
+    );
+    assert!(
+        err.contains("graph source") || err.contains("iceberg"),
+        "alias query should reach the graph-source engine (expected an Iceberg/graph-source config error); status={status} body={body}"
     );
 }
 
