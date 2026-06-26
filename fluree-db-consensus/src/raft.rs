@@ -1,23 +1,36 @@
 //! Raft-replicated consensus. Compiled only under the `raft` feature
 //! so non-replicated builds don't take the openraft dependency.
 //!
-//! Submission flow on the leader:
+//! Submission flow across the cluster:
 //!
 //! 1. [`queued_transactor::QueuedTransactor`] builds a
 //!    [`crate::QueuedRequest`] envelope from a `Committer` call,
 //!    writes it to shared content-addressed storage, and proposes
 //!    [`state_machine::Command::EnqueueCommand`] through Raft.
+//!    The propose itself is leader-only — a transactor running on a
+//!    follower receives `ForwardToLeader` from openraft and the
+//!    server-level forward middleware retargets the HTTP request at
+//!    the current leader.
 //! 2. The state machine appends a `QueueEntry` on the target branch's
-//!    FIFO queue and assigns a `queue_id`. The transactor registers a
-//!    waiter on the per-process [`waiter::WaiterMap`].
-//! 3. The leader-only [`commit_worker::StagerSupervisor`] (driven by
-//!    the `RaftIntegration` leader watcher) spawns one
-//!    [`commit_worker::Stager`] per active branch. Each stager drains
-//!    its queue, stages the work locally, writes the commit blob,
-//!    stashes the typed receipt in [`staged_receipt::StagedReceiptMap`],
-//!    and proposes [`state_machine::Command::ApplyHead`] via the
-//!    [`fluree_db_nameservice::CommitPublisher`] impl on
-//!    [`nameservice::RaftNameService`].
+//!    FIFO queue and assigns a `queue_id`. Every node sees the
+//!    enqueue when it applies. The transactor registers a waiter on
+//!    the per-process [`waiter::WaiterMap`].
+//! 3. The node-lifetime [`commit_worker::StagerSupervisor`] runs on
+//!    every cluster member (leader and followers alike). Each tick
+//!    it computes the desired set — branches whose rendezvous-hash
+//!    owner over the current voter set resolves to this node — and
+//!    reconciles its running [`commit_worker::Stager`]s against it.
+//!    A stager drains its branch's queue, stages the work locally,
+//!    writes the commit blob, stashes the typed receipt in
+//!    [`staged_receipt::StagedReceiptMap`], and publishes the head
+//!    advance through the [`fluree_db_nameservice::CommitPublisher`]
+//!    impl on [`nameservice::RaftNameService`]. On the leader that
+//!    proposes [`state_machine::Command::ApplyHead`] via
+//!    `client_write`; on a follower it ferries the staged receipt to
+//!    the leader's `apply_staged_commit` HTTP endpoint, which
+//!    proposes the same command from the leader's side. The same
+//!    forwarding shape covers [`state_machine::Command::PoisonQueueEntry`]
+//!    when a stager hits a deterministic failure.
 //! 4. The [`state_machine_adapter::StateMachineAdapter`] applies
 //!    `ApplyHead`, takes the stashed receipt, and resolves the
 //!    waiter. The transactor's `await` returns the typed receipt.
