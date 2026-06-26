@@ -246,8 +246,14 @@ impl RaftIntegration {
     /// POST to.
     pub fn raft_rpc_router(&self) -> Router {
         raft_network::router(Arc::clone(&self.raft), &self.network_config)
-            .merge(apply_staged_commit_router(Arc::clone(&self.nameservice)))
-            .merge(apply_queue_poison_router(Arc::clone(&self.nameservice)))
+            .merge(apply_staged_commit_router(
+                Arc::clone(&self.nameservice),
+                &self.network_config,
+            ))
+            .merge(apply_queue_poison_router(
+                Arc::clone(&self.nameservice),
+                &self.network_config,
+            ))
     }
 
     /// Borrow the shared [`RaftNameService`] handle. The integration

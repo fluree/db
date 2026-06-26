@@ -57,7 +57,7 @@ use crate::raft::state_machine::{
 use crate::raft::state_machine_adapter::SharedState;
 use crate::raft::{ClusterNode, NodeId, TypeConfig};
 use async_trait::async_trait;
-use axum::extract::State;
+use axum::extract::{DefaultBodyLimit, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
@@ -715,12 +715,26 @@ const POSTCARD_MIME: &str = "application/octet-stream";
 /// [`crate::raft::network::router`]) is mounted at — typically `/raft`
 /// — so the full URL becomes `<base>/raft/apply_staged_commit`.
 ///
+/// `network_config` supplies the per-route body-size cap. Without an
+/// explicit cap the route falls back to axum's 2 MiB default —
+/// the sibling openraft RPCs all set their own cap, and an
+/// oversize receipt 413s into the follower stager's retry-forever
+/// path.
+///
 /// No auth layer is applied. The endpoint follows the same
 /// trust-the-VPC posture as the openraft RPCs: operators bind the
 /// raft port to peer addresses only.
-pub fn apply_staged_commit_router(ns: Arc<RaftNameService>) -> Router {
+pub fn apply_staged_commit_router(
+    ns: Arc<RaftNameService>,
+    network_config: &crate::raft::network::NetworkConfig,
+) -> Router {
     Router::new()
-        .route(APPLY_STAGED_COMMIT_PATH, post(handle_apply_staged_commit))
+        .route(
+            APPLY_STAGED_COMMIT_PATH,
+            post(handle_apply_staged_commit).layer(DefaultBodyLimit::max(
+                network_config.apply_staged_commit_max_body_bytes,
+            )),
+        )
         .with_state(ns)
 }
 
@@ -783,9 +797,23 @@ pub const APPLY_QUEUE_POISON_PATH: &str = "/apply_queue_poison";
 /// [`APPLY_QUEUE_POISON_PATH`]. Caller nests this under the same
 /// `/raft` mount the openraft RPCs and `apply_staged_commit` use —
 /// same intra-cluster trust posture, no auth layer.
-pub fn apply_queue_poison_router(ns: Arc<RaftNameService>) -> Router {
+///
+/// `network_config` supplies the per-route body-size cap. The body
+/// is tiny (`ref_key` + `queue_id` + structured `PoisonReason`),
+/// but the cap is pinned to a deliberate value for parity with the
+/// sibling RPCs and so the route can't silently inherit the axum
+/// default if someone ever changes how the router is mounted.
+pub fn apply_queue_poison_router(
+    ns: Arc<RaftNameService>,
+    network_config: &crate::raft::network::NetworkConfig,
+) -> Router {
     Router::new()
-        .route(APPLY_QUEUE_POISON_PATH, post(handle_apply_queue_poison))
+        .route(
+            APPLY_QUEUE_POISON_PATH,
+            post(handle_apply_queue_poison).layer(DefaultBodyLimit::max(
+                network_config.apply_queue_poison_max_body_bytes,
+            )),
+        )
         .with_state(ns)
 }
 
