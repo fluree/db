@@ -1109,7 +1109,7 @@ mod tests {
     // ====================================================================
 
     use crate::raft::state_machine::{
-        ApplyHeadArgs, BodyKind, EnqueueCommandArgs, PoisonQueueEntryArgs, PoisonReason,
+        ApplyHeadArgs, BodyKind, PoisonQueueEntryArgs, PoisonReason, QueueSubmission,
         ResetHeadSnapshot,
     };
     use crate::raft::waiter::{AbortReason, WaiterMap, WaiterOutcome};
@@ -1117,7 +1117,7 @@ mod tests {
     fn enqueue_entry(index: u64, ledger_id: &str, branch: &str) -> Entry<TypeConfig> {
         Entry {
             log_id: log_id(1, index),
-            payload: EntryPayload::Normal(RaftCommand::EnqueueCommand(EnqueueCommandArgs {
+            payload: EntryPayload::Normal(RaftCommand::EnqueueCommand(QueueSubmission {
                 ledger_id: ledger_id.into(),
                 branch: branch.into(),
                 idempotency: None,

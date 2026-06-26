@@ -21,7 +21,7 @@
 
 use crate::raft::staged_receipt::AppliedReceipt;
 use crate::raft::state_machine::{
-    ApplyOutcome, ApplyRecord, BodyKind, Command as SmCommand, EnqueueCommandArgs, PoisonRecord,
+    ApplyOutcome, ApplyRecord, BodyKind, Command as SmCommand, PoisonRecord, QueueSubmission,
     RefKey, Response as SmResponse,
 };
 use crate::raft::state_machine_adapter::SharedState;
@@ -145,7 +145,7 @@ impl QueuedTransactor {
     ///   retry is unreferenced and released here.
     async fn submit_and_await(
         &self,
-        args: EnqueueCommandArgs,
+        args: QueueSubmission,
         ref_key: RefKey,
         retry_eligible: bool,
     ) -> Result<SubmissionOutcome, SubmissionError> {
@@ -424,7 +424,7 @@ impl Committer for QueuedTransactor {
 
         let body_cid = Self::canonical_body_cid(&envelope)?;
         let retry_eligible = idempotency_cache_key.is_some();
-        let args = EnqueueCommandArgs {
+        let args = QueueSubmission {
             ledger_id: ledger_name,
             branch,
             idempotency: idempotency_cache_key,
@@ -495,7 +495,7 @@ impl Committer for QueuedTransactor {
 
         let body_cid = Self::canonical_body_cid(&envelope)?;
         let retry_eligible = idempotency_cache_key.is_some();
-        let args = EnqueueCommandArgs {
+        let args = QueueSubmission {
             ledger_id: ledger_name,
             branch: branch.clone(),
             idempotency: idempotency_cache_key,
@@ -592,7 +592,7 @@ impl Committer for QueuedTransactor {
 
         let body_cid = Self::canonical_body_cid(&envelope)?;
         let retry_eligible = idempotency_cache_key.is_some();
-        let args = EnqueueCommandArgs {
+        let args = QueueSubmission {
             ledger_id: ledger_name,
             branch: target_for_queue.clone(),
             idempotency: idempotency_cache_key,
@@ -665,7 +665,7 @@ impl Committer for QueuedTransactor {
 
         let body_cid = Self::canonical_body_cid(&envelope)?;
         let retry_eligible = idempotency_cache_key.is_some();
-        let args = EnqueueCommandArgs {
+        let args = QueueSubmission {
             ledger_id: ledger_name,
             branch: branch.clone(),
             idempotency: idempotency_cache_key,
@@ -767,7 +767,7 @@ impl Committer for QueuedTransactor {
 
         let body_cid = Self::canonical_body_cid(&envelope)?;
         let retry_eligible = idempotency_cache_key.is_some();
-        let args = EnqueueCommandArgs {
+        let args = QueueSubmission {
             ledger_id: ledger_name,
             branch,
             idempotency: idempotency_cache_key,

@@ -25,7 +25,7 @@ use openraft::{Config, Raft, ServerState};
 use fluree_db_consensus::raft::log_adapter::LogAdapter;
 use fluree_db_consensus::raft::nameservice::RaftNameService;
 use fluree_db_consensus::raft::state_machine::{
-    ApplyHeadArgs, BodyKind, Command as SmCommand, EnqueueCommandArgs, NewLedger, RefKey, Response,
+    ApplyHeadArgs, BodyKind, Command as SmCommand, NewLedger, QueueSubmission, RefKey, Response,
 };
 use fluree_db_consensus::raft::state_machine_adapter::StateMachineAdapter;
 use fluree_db_consensus::raft::storage::memory::MemoryRaftStorage;
@@ -166,7 +166,7 @@ async fn single_node_raft_index_publisher_round_trip() {
     // previously-used `AdvanceRef` but exercising the real
     // post-migration code path.
     let enqueue_resp = raft
-        .client_write(SmCommand::EnqueueCommand(EnqueueCommandArgs {
+        .client_write(SmCommand::EnqueueCommand(QueueSubmission {
             ledger_id: "test/db".into(),
             branch: "main".into(),
             idempotency: None,
@@ -294,7 +294,7 @@ async fn single_node_apply_emits_commit_event_on_bus() {
     // previously-used `AdvanceRef` but exercising the real
     // post-migration code path.
     let enqueue_resp = raft
-        .client_write(SmCommand::EnqueueCommand(EnqueueCommandArgs {
+        .client_write(SmCommand::EnqueueCommand(QueueSubmission {
             ledger_id: "test/db".into(),
             branch: "main".into(),
             idempotency: None,
@@ -476,7 +476,7 @@ async fn single_node_branch_lifecycle_round_trip() {
     // has something to fork from. Drive the queue path end-to-end.
     ns.init("test/db:main").await.expect("init main");
     let enqueue_resp = raft
-        .client_write(SmCommand::EnqueueCommand(EnqueueCommandArgs {
+        .client_write(SmCommand::EnqueueCommand(QueueSubmission {
             ledger_id: "test/db".into(),
             branch: "main".into(),
             idempotency: None,

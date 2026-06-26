@@ -660,7 +660,7 @@ pub enum Command {
     /// checks idempotency, the in-flight queue, and the queue
     /// depth caps; on success appends a [`QueueEntry`] and returns
     /// [`Response::Enqueued`]. See `docs/design/raft-command-queue.md`.
-    EnqueueCommand(EnqueueCommandArgs),
+    EnqueueCommand(QueueSubmission),
     /// Advance a branch head from a worker-staged commit. Pops the
     /// per-branch queue front (must match `queue_id`), records the
     /// idempotency outcome from the entry, and signals waiters.
@@ -707,7 +707,7 @@ pub struct PushConfigArgs {
 
 /// Payload for [`Command::EnqueueCommand`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EnqueueCommandArgs {
+pub struct QueueSubmission {
     pub ledger_id: String,
     pub branch: String,
     pub idempotency: Option<IdempotencyCacheKey>,
@@ -1951,9 +1951,9 @@ fn apply_retract_graph_source(
 fn apply_enqueue_command(
     state: &mut NameServiceState,
     log_index: u64,
-    args: EnqueueCommandArgs,
+    args: QueueSubmission,
 ) -> Response {
-    let EnqueueCommandArgs {
+    let QueueSubmission {
         ledger_id,
         branch,
         idempotency,
@@ -3352,7 +3352,7 @@ mod tests {
         body_seed: u8,
         idempotency: Option<IdempotencyCacheKey>,
     ) -> Command {
-        Command::EnqueueCommand(EnqueueCommandArgs {
+        Command::EnqueueCommand(QueueSubmission {
             ledger_id: ledger_id.into(),
             branch: branch.into(),
             idempotency,
