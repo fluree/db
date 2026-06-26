@@ -21,12 +21,15 @@
 //! uses `rewrite_patterns_for_r2rml` to convert contained triple patterns
 //! to R2RML patterns before building the operator tree.
 
+mod fused_aggregate;
 mod operator;
 mod provider;
 mod rewrite;
 
+pub use fused_aggregate::{detect_fused_r2rml_aggregate, FusedR2rmlAggregateOperator};
 pub use operator::R2rmlScanOperator;
 pub use provider::{
-    NoOpR2rmlProvider, R2rmlProvider, R2rmlTableProvider, ScanCmpOp, ScanFilter, ScanValue,
+    ColumnBatchStream, NoOpR2rmlProvider, R2rmlProvider, R2rmlTableProvider, ScanCmpOp, ScanFilter,
+    ScanValue,
 };
 pub use rewrite::{convert_triple_to_r2rml, rewrite_patterns_for_r2rml, R2rmlRewriteResult};
