@@ -26,6 +26,7 @@ use openraft::{
     AnyError, Entry, EntryPayload, ErrorSubject, ErrorVerb, LogId, Snapshot, SnapshotMeta,
     StorageError, StorageIOError, StoredMembership,
 };
+use std::collections::BTreeSet;
 use std::io::Cursor;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -428,6 +429,17 @@ where
                         responses.push(response);
                     }
                     EntryPayload::Membership(m) => {
+                        // Mirror the new voter set into the replicated
+                        // state machine so `apply_set_worker_eligibility`
+                        // can validate against it without threading
+                        // membership through the apply signature, and
+                        // reset `worker_eligible_voters` so newly-
+                        // configured voters start eligible. Removed
+                        // voters disappear from both sets in the
+                        // same step.
+                        let new_voter_set: BTreeSet<NodeId> = m.voter_ids().collect();
+                        state.configured_voters = new_voter_set.clone();
+                        state.worker_eligible_voters = new_voter_set;
                         self.last_membership = StoredMembership::new(Some(log_id), m);
                         responses.push(Response::NoOp);
                     }
@@ -690,6 +702,68 @@ mod tests {
         assert_eq!(responses, vec![Response::NoOp]);
         let (applied, _) = sm.applied_state().await.unwrap();
         assert_eq!(applied, Some(log_id(1, 5)));
+    }
+
+    fn cluster_node(id: NodeId) -> ClusterNode {
+        ClusterNode::new(
+            format!("http://node-{id}:9090/raft"),
+            format!("http://node-{id}:8080"),
+        )
+    }
+
+    fn membership_entry(index: u64, voters: &[NodeId]) -> Entry<TypeConfig> {
+        let voter_set: BTreeSet<NodeId> = voters.iter().copied().collect();
+        let nodes: std::collections::BTreeMap<NodeId, ClusterNode> =
+            voters.iter().map(|&id| (id, cluster_node(id))).collect();
+        Entry {
+            log_id: log_id(1, index),
+            payload: EntryPayload::Membership(openraft::Membership::new(vec![voter_set], nodes)),
+        }
+    }
+
+    #[tokio::test]
+    async fn membership_apply_mirrors_voter_set_into_state() {
+        // First membership-apply sets `configured_voters` from
+        // empty and seeds every voter as eligible — the shape the
+        // worker supervisor's rendezvous expects at cluster boot.
+        let storage = Arc::new(MemoryRaftStorage::new());
+        let mut sm = StateMachineAdapter::new(storage);
+
+        sm.apply([membership_entry(1, &[1, 2, 3])]).await.unwrap();
+
+        let shared = sm.shared_state();
+        let state = shared.read().await;
+        let expected: BTreeSet<NodeId> = [1, 2, 3].into_iter().collect();
+        assert_eq!(state.configured_voters, expected);
+        assert_eq!(state.worker_eligible_voters, expected);
+    }
+
+    #[tokio::test]
+    async fn membership_change_resets_worker_eligible_voters_to_new_set() {
+        // A prior membership-apply seeded {1,2,3}; the leader's
+        // monitor then demoted 2. The next membership-apply that
+        // adds 4 and removes 2 should snap both sets to {1,3,4}
+        // — newly-configured voters start eligible, demoted-then-
+        // removed voters disappear from both sets.
+        let storage = Arc::new(MemoryRaftStorage::new());
+        let mut sm = StateMachineAdapter::new(storage);
+
+        sm.apply([membership_entry(1, &[1, 2, 3])]).await.unwrap();
+        let shared = sm.shared_state();
+        // Mid-life demotion of 2.
+        {
+            let mut state = shared.write().await;
+            state.worker_eligible_voters.remove(&2);
+        }
+
+        // Membership change: drop 2, add 4.
+        sm.apply([membership_entry(2, &[1, 3, 4])]).await.unwrap();
+
+        let state = shared.read().await;
+        let expected: BTreeSet<NodeId> = [1, 3, 4].into_iter().collect();
+        assert_eq!(state.configured_voters, expected);
+        // 4 starts eligible alongside the survivors, 2 is gone.
+        assert_eq!(state.worker_eligible_voters, expected);
     }
 
     /// Direct head seed used by event-bus tests that need a populated
