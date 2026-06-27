@@ -1240,6 +1240,14 @@ pub fn spawn_local_cache_event_listener(
                     // land. Fall back to a catch-up sweep: re-reconcile
                     // every currently-loaded ledger against the
                     // nameservice head (a no-op for any already current).
+                    //
+                    // The sweep runs inline in this receive loop, so it
+                    // does not drain the channel while it executes. If a
+                    // future workload makes reconciles slow enough that
+                    // the sweep itself keeps the receiver from draining,
+                    // this could re-trigger Lagged. Not observed in
+                    // practice; revisit with a bound or a provably-behind
+                    // scope only if it proves to arise.
                     let aliases = ledger_manager.cached_aliases().await;
                     tracing::warn!(
                         skipped,
