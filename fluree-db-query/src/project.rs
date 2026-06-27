@@ -53,6 +53,12 @@ impl Operator for ProjectOperator {
         Ok(())
     }
 
+    /// Projection produces one output row per input row, so the budget passes
+    /// straight through unchanged.
+    fn set_row_budget(&mut self, budget: usize) {
+        self.child.set_row_budget(budget);
+    }
+
     async fn next_batch(&mut self, ctx: &ExecutionContext<'_>) -> Result<Option<Batch>> {
         if !self.state.can_next() {
             if self.state == OperatorState::Created {

@@ -35,6 +35,15 @@ use tracing::Instrument;
 const BATCHED_EXISTS_DEBUG_MIN_ACCUM: usize = 8;
 const BATCHED_EXISTS_DEBUG_MIN_MS: u64 = 10;
 
+/// Floor for the adaptive first-flush threshold under a row budget: never flush
+/// an absurdly small batch (per-flush setup cost), even for `LIMIT 1`.
+const MIN_ADAPTIVE_FLUSH: usize = 1024;
+/// Geometric growth of the flush threshold after each budgeted flush, so a
+/// selective join (many left rows → few output rows, LIMIT not yet satisfied)
+/// converges back to the full `BATCHED_JOIN_SIZE` and stops paying per-flush
+/// overhead. The cap is therefore effectively first-flush-only.
+const ADAPTIVE_FLUSH_GROWTH: usize = 8;
+
 /// Prepared per-leaf inputs shared by every batched-probe path
 /// (`scan_matches`, `flush_batched_object_accumulator_binary`,
 /// `batched_subject_probe_binary`, `batched_subject_star_spot`). Owns the
@@ -451,6 +460,15 @@ pub struct NestedLoopJoinOperator {
     /// Accumulated entries for batched processing: (stored_batch_idx, row_idx, subject_s_id)
     /// Stores the raw s_id directly to avoid dictionary round-trips with EncodedSid.
     batched_accumulator: Vec<(usize, usize, u64)>,
+    /// Advisory row budget from a top-of-tree `LIMIT` (see
+    /// `Operator::set_row_budget`). When set, the first accumulator flush is
+    /// capped near this size instead of `BATCHED_JOIN_SIZE`, so a small `LIMIT`
+    /// doesn't buffer ~100k left rows before producing anything. Advisory only —
+    /// a fully-drained join yields the identical multiset and order.
+    row_budget: Option<usize>,
+    /// Current accumulator-full flush threshold. `BATCHED_JOIN_SIZE` by default;
+    /// lowered by `set_row_budget` and grown geometrically per flush.
+    batched_flush_threshold: usize,
     /// Left batches retained for the batched flush
     stored_left_batches: Vec<Batch>,
     /// Pre-built output batches from the batched path, ready to emit
@@ -733,6 +751,8 @@ impl NestedLoopJoinOperator {
             batched_predicate,
             batched_overlay_mode: ProbeLanePlan::Clean,
             batched_accumulator: Vec::new(),
+            row_budget: None,
+            batched_flush_threshold: BATCHED_JOIN_SIZE,
             stored_left_batches: Vec::new(),
             batched_output: VecDeque::new(),
             current_left_batch_stored_idx: None,
@@ -1091,6 +1111,21 @@ impl Operator for NestedLoopJoinOperator {
         effective_schema(&self.out_schema, &self.combined_schema)
     }
 
+    /// Absorb the budget (do NOT forward to `self.left`): a join's output
+    /// cardinality is not its left input's — a left row may match zero or many
+    /// right rows — so no fixed count can be pushed down soundly. We use it only
+    /// to cap the batched accumulator's first flush, which lets backpressure
+    /// stop the left scan once the top-level `LIMIT` is satisfied.
+    fn set_row_budget(&mut self, budget: usize) {
+        self.row_budget = Some(budget);
+        self.batched_flush_threshold = budget.clamp(MIN_ADAPTIVE_FLUSH, BATCHED_JOIN_SIZE);
+        tracing::debug!(
+            budget,
+            flush_threshold = self.batched_flush_threshold,
+            "nested-loop join: row budget set"
+        );
+    }
+
     async fn open(&mut self, ctx: &ExecutionContext<'_>) -> Result<()> {
         if !self.state.can_open() {
             if self.state.is_closed() {
@@ -1354,10 +1389,21 @@ impl Operator for NestedLoopJoinOperator {
                 if let Some(key) = resolved {
                     let batch_idx = self.ensure_current_batch_stored();
                     self.batched_accumulator.push((batch_idx, left_row, key));
-                    if self.batched_accumulator.len() >= BATCHED_JOIN_SIZE {
+                    if self.batched_accumulator.len() >= self.batched_flush_threshold {
                         ctx.check_cancelled()?;
                         self.flush_batched_accumulator_for_ctx(ctx).await?;
                         ctx.check_cancelled()?;
+                        // Under a budget the first flush is capped near the
+                        // budget; grow geometrically toward the full batch size
+                        // so a selective join stops paying per-flush overhead.
+                        if self.row_budget.is_some()
+                            && self.batched_flush_threshold < BATCHED_JOIN_SIZE
+                        {
+                            self.batched_flush_threshold = self
+                                .batched_flush_threshold
+                                .saturating_mul(ADAPTIVE_FLUSH_GROWTH)
+                                .min(BATCHED_JOIN_SIZE);
+                        }
                     }
                 } else {
                     // Fall back to per-row scan for unsupported binding types.
