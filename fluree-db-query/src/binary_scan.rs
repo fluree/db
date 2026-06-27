@@ -2430,7 +2430,6 @@ pub fn translate_overlay_flakes_with_untranslated(
 // merged-product cache, so same-epoch repeats stay free). Scoped to raw
 // `Novelty` overlays: a non-segmented overlay reports a single synthetic
 // segment (`seg_id == u64::MAX`), which routes to the whole-graph path.
-// See docs/design/segment-aware-overlay-translation.md.
 // ============================================================================
 
 /// Translate (and cache) one segment's flakes into sorted, unresolved overlay
