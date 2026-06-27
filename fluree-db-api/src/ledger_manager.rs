@@ -939,6 +939,22 @@ impl LedgerManager {
         Some(handle.snapshot().await)
     }
 
+    /// Return the already-cached handle for `ledger_id`, or `None` when it is
+    /// not loaded — never forces a load from the nameservice.
+    ///
+    /// Used by the owned-state commit path to write a freshly-committed state
+    /// back into the cache (read-your-writes) without resurrecting a ledger the
+    /// caller hasn't otherwise accessed.
+    pub async fn get_loaded_handle(&self, ledger_id: &str) -> Option<LedgerHandle> {
+        let canonical_alias =
+            normalize_ledger_id(ledger_id).unwrap_or_else(|_| ledger_id.to_string());
+        let entries = self.entries.read().await;
+        match entries.get(&canonical_alias)? {
+            LoadState::Ready(handle) | LoadState::Reloading { handle, .. } => Some(handle.clone()),
+            LoadState::Loading { .. } => None,
+        }
+    }
+
     /// Get cached handle or load from nameservice
     ///
     /// Uses single-flight pattern: concurrent requests for same ledger ID
