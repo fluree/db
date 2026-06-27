@@ -2490,7 +2490,7 @@ fn translate_segment_cached(
         ) {
             Ok(op) => ops.push(op),
             Err(e) if e.kind() == std::io::ErrorKind::Unsupported => {
-                untranslated.push(flake.clone())
+                untranslated.push(flake.clone());
             }
             Err(_) => hard_error = true,
         }
