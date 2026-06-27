@@ -1408,11 +1408,8 @@ impl BinaryIndexStore {
     ///
     /// [`resolve_datatype_sid`]: Self::resolve_datatype_sid
     pub fn resolve_datatype_sid_for_value(&self, o_type: u16, val: &FlakeValue) -> Option<Sid> {
-        self.resolve_datatype_sid(o_type).or_else(|| match val {
-            FlakeValue::Decimal(_) => Some(Sid::new(namespaces::XSD, xsd_names::DECIMAL)),
-            FlakeValue::BigInt(_) => Some(Sid::new(namespaces::XSD, xsd_names::INTEGER)),
-            _ => None,
-        })
+        self.resolve_datatype_sid(o_type)
+            .or_else(|| val.overflow_numeric_datatype_sid())
     }
 
     /// Look up an o_type table entry by o_type value. O(1).

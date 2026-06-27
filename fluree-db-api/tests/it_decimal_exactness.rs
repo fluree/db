@@ -461,6 +461,66 @@ async fn integer_beyond_i64_round_trips_exactly() {
 }
 
 #[tokio::test]
+async fn indexed_overflow_integer_reports_xsd_integer_not_decimal() {
+    // BigInt (overflow xsd:integer) and BigDecimal share the NUM_BIG arena and
+    // the same late-materialized EncodedLit, whose dt_id is hardcoded to
+    // decimal. Materialization must recover the datatype from the decoded value,
+    // else an indexed > i64 integer is mislabeled xsd:decimal (#1329 sibling).
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(fluree_db_api::LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "decimal/bigint-indexed:main";
+
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        fluree
+            .nameservice_mode()
+            .as_arc_indexing_nameservice()
+            .expect("test fluree has writable nameservice"),
+        fluree_db_indexer::IndexerConfig::small(),
+    );
+
+    local
+        .run_until(async move {
+            let ledger = genesis_ledger(&fluree, ledger_id);
+            let big = "123456789012345678901234567890";
+            let result = run_sparql_update(
+                &fluree,
+                ledger,
+                &format!(
+                    r#"
+                    PREFIX ex: <http://example.org/>
+                    PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+                    INSERT DATA {{ ex:item ex:serial "{big}"^^xsd:integer . }}
+                    "#
+                ),
+            )
+            .await;
+            trigger_index_and_wait(&handle, ledger_id, result.receipt.t).await;
+            let ledger = fluree.ledger(ledger_id).await.expect("load ledger");
+
+            let result = support::query_sparql(
+                &fluree,
+                &ledger,
+                "PREFIX ex: <http://example.org/>
+                 SELECT ?serial WHERE { ex:item ex:serial ?serial . }",
+            )
+            .await
+            .expect("query indexed bigint");
+            let sparql_json = result
+                .to_sparql_json(&ledger.snapshot)
+                .expect("to_sparql_json");
+            assert_eq!(binding_values(&sparql_json, "serial"), vec![big]);
+            assert_eq!(
+                binding_datatypes(&sparql_json, "serial"),
+                vec!["http://www.w3.org/2001/XMLSchema#integer".to_string()],
+                "indexed overflow integer must report xsd:integer, not xsd:decimal"
+            );
+        })
+        .await;
+}
+
+#[tokio::test]
 async fn sum_avg_over_indexed_decimals_is_exact() {
     // Indexed decimals are arena-backed (NUM_BIG encoded). SUM/AVG must
     // decode and accumulate them exactly — they previously contributed
