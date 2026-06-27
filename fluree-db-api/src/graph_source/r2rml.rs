@@ -20,8 +20,11 @@ use fluree_db_iceberg::{
 };
 use fluree_db_nameservice::GraphSourceType;
 use fluree_db_query::error::{QueryError, Result as QueryResult};
-use fluree_db_query::r2rml::{R2rmlProvider, R2rmlTableProvider, ScanCmpOp, ScanFilter, ScanValue};
+use fluree_db_query::r2rml::{
+    ColumnBatchStream, R2rmlProvider, R2rmlTableProvider, ScanCmpOp, ScanFilter, ScanValue,
+};
 use fluree_db_r2rml::mapping::CompiledR2rmlMapping;
+use futures::StreamExt;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
@@ -552,10 +555,12 @@ impl R2rmlProvider for FlureeR2rmlProvider<'_> {
 
 #[async_trait]
 impl R2rmlTableProvider for FlureeR2rmlProvider<'_> {
-    /// Scan an Iceberg table and return column batches.
+    /// Scan an Iceberg table, streaming column batches as data files are read.
     ///
-    /// This method connects to the Iceberg catalog, executes a scan with
-    /// the specified projection, and returns the results as column batches.
+    /// This method connects to the Iceberg catalog, plans the scan with the
+    /// specified projection/filters, and returns a [`ColumnBatchStream`] that
+    /// yields one file's batches at a time (bounded-parallel reads) so a
+    /// streaming consumer never holds the whole table in memory.
     async fn scan_table(
         &self,
         graph_source_id: &str,
@@ -563,7 +568,7 @@ impl R2rmlTableProvider for FlureeR2rmlProvider<'_> {
         projection: &[String],
         filters: &[ScanFilter],
         _as_of_t: Option<i64>,
-    ) -> QueryResult<Vec<ColumnBatch>> {
+    ) -> QueryResult<ColumnBatchStream> {
         // Look up the graph source record to get Iceberg connection info
         let record = self
             .fluree
@@ -920,64 +925,61 @@ impl R2rmlTableProvider for FlureeR2rmlProvider<'_> {
 
         if tasks.is_empty() {
             info!("Scan plan has no files - returning empty result");
-            return Ok(Vec::new());
+            return Ok(empty_batch_stream());
         }
 
-        // Read data files with bounded parallelism. Each file is an independent
-        // "file -> batches" worker; concurrency is capped (see
-        // `iceberg_scan_concurrency`) to avoid spiking memory or hammering S3.
-        // This is the first slice of a streaming scan — the next step consumes
-        // batches as workers complete instead of collecting them all here.
+        // Read data files with bounded parallelism, streaming each file's batches
+        // to the consumer as the worker completes. Concurrency is capped (see
+        // `iceberg_scan_concurrency`) so only O(concurrency) file decodes are
+        // resident — the consumer (R2rmlScanOperator) materializes and aggregates
+        // incrementally instead of the whole table being collected here.
         let footers = cache.parquet_footers();
         let concurrency = iceberg_scan_concurrency(tasks.len());
         debug!(
             files = tasks.len(),
-            concurrency, "reading Parquet files (bounded parallel)"
+            concurrency, "streaming Parquet files (bounded parallel)"
         );
 
-        let all_batches: Vec<ColumnBatch> = {
-            use futures::stream::{StreamExt, TryStreamExt};
-            futures::stream::iter(tasks)
-                .map(|task| {
-                    let storage = Arc::clone(&storage);
-                    let footers = Arc::clone(&footers);
-                    let disk_cache = Arc::clone(&disk_cache);
-                    let cache_dir = cache_dir.clone();
-                    async move {
-                        tokio::spawn(async move {
-                            let reader = SendParquetReader::with_caches(
-                                storage.as_ref(),
-                                footers.as_ref(),
-                                &disk_cache,
-                                &cache_dir,
-                            );
-                            reader.read_task(&task).await.map_err(|e| {
-                                QueryError::Internal(format!(
-                                    "Failed to read Parquet file '{}': {e}",
-                                    task.data_file.file_path
-                                ))
-                            })
+        let stream = futures::stream::iter(tasks)
+            .map(move |task| {
+                let storage = Arc::clone(&storage);
+                let footers = Arc::clone(&footers);
+                let disk_cache = Arc::clone(&disk_cache);
+                let cache_dir = cache_dir.clone();
+                async move {
+                    tokio::spawn(async move {
+                        let reader = SendParquetReader::with_caches(
+                            storage.as_ref(),
+                            footers.as_ref(),
+                            &disk_cache,
+                            &cache_dir,
+                        );
+                        reader.read_task(&task).await.map_err(|e| {
+                            QueryError::Internal(format!(
+                                "Failed to read Parquet file '{}': {e}",
+                                task.data_file.file_path
+                            ))
                         })
-                        .await
-                        .map_err(|e| {
-                            QueryError::Internal(format!("Parquet read worker failed: {e}"))
-                        })?
-                    }
-                })
-                .buffer_unordered(concurrency)
-                .try_collect::<Vec<Vec<ColumnBatch>>>()
-                .await?
-                .into_iter()
-                .flatten()
-                .collect()
-        };
+                    })
+                    .await
+                    .map_err(|e| QueryError::Internal(format!("Parquet read worker failed: {e}")))?
+                }
+            })
+            .buffer_unordered(concurrency)
+            // Flatten each file's `Result<Vec<ColumnBatch>>` into individual
+            // `Result<ColumnBatch>` items; a read error becomes one error item.
+            .flat_map(|res: QueryResult<Vec<ColumnBatch>>| match res {
+                Ok(batches) => {
+                    futures::stream::iter(batches.into_iter().map(Ok).collect::<Vec<_>>())
+                }
+                Err(e) => futures::stream::iter(vec![Err(e)]),
+            });
 
-        info!(
-            total_batches = all_batches.len(),
-            total_rows = all_batches.iter().map(|b| b.num_rows).sum::<usize>(),
-            "Iceberg scan complete"
-        );
-
-        Ok(all_batches)
+        Ok(Box::pin(stream))
     }
+}
+
+/// An empty [`ColumnBatchStream`], used when a scan plan selects no files.
+fn empty_batch_stream() -> ColumnBatchStream {
+    Box::pin(futures::stream::empty())
 }
