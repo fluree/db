@@ -182,8 +182,8 @@ async fn run() {
     }
 
     println!(
-        "  {:>6}{:>7}{:>8}{:>9}{:>12}{:>12}{:>12}",
-        "step", "t", "segs", "nov_flk", "scan_us", "join_us", "point_us"
+        "  {:>6}{:>7}{:>8}{:>9}{:>12}{:>12}{:>11}{:>10}",
+        "step", "t", "segs", "nov_flk", "scan_cold", "scan_warm", "join_us", "point_us"
     );
     let lookup_pid = n_products / 2;
     let n_vendors = (n_products / 50).max(1);
@@ -216,9 +216,17 @@ async fn run() {
         let nov = state.novelty().len();
         let db = GraphDb::from_ledger_state(&state);
 
+        // scan_cold = first query in this epoch (pays the per-epoch overlay
+        // assembly); scan_warm = immediate repeat in the SAME epoch (global
+        // translation cache hit → assembly avoided). The gap is the assembly
+        // cost a real server amortizes over many queries/commit; scan_warm is
+        // the per-query residual the LIMIT pushdown would target.
         let t = Instant::now();
-        fluree.query(&db, &scan_q).await.expect("scan");
-        let scan_us = t.elapsed().as_micros();
+        fluree.query(&db, &scan_q).await.expect("scan cold");
+        let scan_cold = t.elapsed().as_micros();
+        let t = Instant::now();
+        fluree.query(&db, &scan_q).await.expect("scan warm");
+        let scan_warm = t.elapsed().as_micros();
 
         let t = Instant::now();
         fluree.query(&db, &join_q).await.expect("join");
@@ -230,7 +238,7 @@ async fn run() {
 
         if step % sample_every == 0 || step == steps - 1 {
             println!(
-                "  {step:>6}{t_now:>7}{segs:>8}{nov:>9}{scan_us:>12}{join_us:>12}{point_us:>12}"
+                "  {step:>6}{t_now:>7}{segs:>8}{nov:>9}{scan_cold:>12}{scan_warm:>12}{join_us:>11}{point_us:>10}"
             );
         }
     }
