@@ -11,6 +11,21 @@ use fluree_db_core::DatatypeConstraint;
 use fluree_db_core::{FlakeMeta, FlakeValue, Sid};
 use std::sync::Arc;
 
+/// Payload of the [`Binding::Rel`] variant, boxed so the rare relationship
+/// value does not inflate `size_of::<Binding>()` (an unboxed 96-byte payload
+/// would push the enum from 88 to 104 bytes, taxing every clone through the
+/// join/sort/materializer hot paths).
+///
+/// `reifier` is `Some` when the edge has a reified annotation node; `None` for
+/// a plain edge. See [`Binding::Rel`] for the full semantics.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct RelValue {
+    pub start: Sid,
+    pub predicate: Sid,
+    pub end: Sid,
+    pub reifier: Option<Sid>,
+}
+
 /// A bound value in a solution - cheap to clone (Arc-backed strings)
 ///
 /// # Invariants
@@ -169,18 +184,44 @@ pub enum Binding {
     /// - Consumed by aggregate functions (count, sum, avg, etc.)
     Grouped(Vec<Binding>),
 
-    /// Path value (node sequence) produced by a shortest-path search.
+    /// Path value (node sequence + per-hop edges) bound to a Cypher path var.
     ///
     /// Holds the ordered node SIDs of a single matched path, start to end
     /// inclusive. Hop count (`length(p)` in Cypher) is `nodes.len() - 1`.
     ///
     /// # Invariants
     ///
-    /// - Only produced by [`crate::shortest_path::ShortestPathOperator`].
+    /// - Produced by [`crate::shortest_path::ShortestPathOperator`] and by the
+    ///   `MakePath` constructor (var-length `MATCH p = (a)-[:T*m..n]->(b)`).
     /// - Opaque to join/scan/sort hot paths (treated as an atomic value);
-    ///   consumed by path functions (`length`, `nodes`) and rendered as a
-    ///   JSON array of node IRIs at projection time.
-    Path(Vec<Sid>),
+    ///   consumed by path functions (`length`, `nodes`, `relationships`) and
+    ///   rendered as a JSON array of node IRIs at projection time.
+    ///
+    /// `nodes` is the traversal order (what `nodes(p)` returns). `edges` holds
+    /// each hop's relationship as an oriented `(start, predicate, end)` — already
+    /// flipped to the STORED edge direction, so `relationships(p)` is correct for
+    /// incoming/undirected traversals (where the edge start is `nodes[i+1]`, not
+    /// `nodes[i]`). `edges.len() == nodes.len().saturating_sub(1)`.
+    Path {
+        nodes: Vec<Sid>,
+        edges: Vec<(Sid, Sid, Sid)>,
+    },
+
+    /// Relationship value (a directed edge with a type).
+    ///
+    /// Carries the edge's start node, predicate (type), and end node intrinsically
+    /// so a relationship from a plain (unreified) path edge is a first-class value.
+    /// `reifier` is `Some` when the edge has a reified annotation node (i.e. it was
+    /// written with `-[r:T {..}]->` / `@annotation`), which backs `properties(r)`
+    /// and `r.prop`; `None` for a plain edge (those yield an empty map / null).
+    ///
+    /// Produced by `relationships(p)` and by binding a variable-length relationship
+    /// variable (`-[r:T*]->`). Consumed by `type`/`startNode`/`endNode`/
+    /// `properties`/property-access. Opaque in join/scan/sort hot paths.
+    ///
+    /// Boxed (see [`RelValue`]) so this rare variant does not inflate
+    /// `size_of::<Binding>()`.
+    Rel(Box<RelValue>),
 
     /// First-class list value (ordered sequence of element bindings).
     ///
@@ -195,6 +236,16 @@ pub enum Binding {
     /// rejects `ORDER BY <list>` and `collect()` in `WITH`), so it is opaque in
     /// those hot paths.
     List(Vec<Binding>),
+
+    /// First-class map value (ordered key→value entries).
+    ///
+    /// The user-visible Cypher map: produced by a map literal (`{a: 1, b: x}`),
+    /// `properties(n)`, and object `$params`. Keys are insertion-ordered (Cypher
+    /// preserves map literal order; `properties(n)` orders by predicate). Like
+    /// [`Binding::List`] it is a real value rendered as a JSON object at
+    /// projection time and otherwise opaque to join/scan/sort/group hot paths
+    /// (the cypher lowering does not sort/join/group by a map value).
+    Map(Vec<(Arc<str>, Binding)>),
 }
 
 impl Binding {
@@ -752,9 +803,13 @@ impl From<&Binding> for bool {
             Binding::Unbound | Binding::Poisoned => false,
             Binding::Grouped(_) => false,
             // A bound path is truthy (it exists); an absent path is `Unbound`.
-            Binding::Path(_) => true,
+            Binding::Path { .. } => true,
+            // A bound relationship is truthy (it exists).
+            Binding::Rel(_) => true,
             // Cypher: a non-empty list is truthy, an empty list falsy.
             Binding::List(items) => !items.is_empty(),
+            // Cypher: a non-empty map is truthy, an empty map falsy.
+            Binding::Map(entries) => !entries.is_empty(),
         }
     }
 }
@@ -885,8 +940,37 @@ impl PartialEq for Binding {
             (Binding::IriMatch { .. } | Binding::Iri(_), Binding::EncodedPid { .. }) => false,
 
             (Binding::Grouped(a), Binding::Grouped(b)) => a == b,
-            (Binding::Path(a), Binding::Path(b)) => a == b,
+            (
+                Binding::Path {
+                    nodes: an,
+                    edges: ae,
+                },
+                Binding::Path {
+                    nodes: bn,
+                    edges: be,
+                },
+            ) => an == bn && ae == be,
+            // Relationship identity: a reified edge is identified by its reifier
+            // (so parallel relationships are distinct occurrences); a plain edge
+            // (no reifier) by its (start, predicate, end). Eq and Hash MUST agree
+            // on this — see `hash_binding`'s Rel arm.
+            (Binding::Rel(a), Binding::Rel(b)) => match (&a.reifier, &b.reifier) {
+                (Some(x), Some(y)) => x == y,
+                (None, None) => a.start == b.start && a.predicate == b.predicate && a.end == b.end,
+                _ => false,
+            },
             (Binding::List(a), Binding::List(b)) => a == b,
+            // Map identity is key-order-insensitive (a map equals a map with the
+            // same entries in any order); display order is preserved separately.
+            (Binding::Map(a), Binding::Map(b)) => {
+                a.len() == b.len() && {
+                    let mut a: Vec<_> = a.iter().collect();
+                    let mut b: Vec<_> = b.iter().collect();
+                    a.sort_by(|x, y| x.0.cmp(&y.0));
+                    b.sort_by(|x, y| x.0.cmp(&y.0));
+                    a == b
+                }
+            }
             _ => false,
         }
     }
@@ -976,17 +1060,53 @@ impl std::hash::Hash for Binding {
                     v.hash(state);
                 }
             }
-            Binding::Path(nodes) => {
+            Binding::Path { nodes, edges } => {
                 9u8.hash(state);
                 nodes.len().hash(state);
                 for n in nodes {
                     n.hash(state);
+                }
+                for (s, p, e) in edges {
+                    s.hash(state);
+                    p.hash(state);
+                    e.hash(state);
+                }
+            }
+            Binding::Rel(rel) => {
+                12u8.hash(state);
+                // Mirror PartialEq: hash the reifier when present, else the
+                // (start, predicate, end) triple. The 0/1 tag keeps the two
+                // cases from colliding (a Some-reifier rel is never == a plain
+                // rel, so it must not hash the same either).
+                match &rel.reifier {
+                    Some(r) => {
+                        1u8.hash(state);
+                        r.hash(state);
+                    }
+                    None => {
+                        0u8.hash(state);
+                        rel.start.hash(state);
+                        rel.predicate.hash(state);
+                        rel.end.hash(state);
+                    }
                 }
             }
             Binding::List(values) => {
                 10u8.hash(state);
                 values.len().hash(state);
                 for v in values {
+                    v.hash(state);
+                }
+            }
+            Binding::Map(entries) => {
+                // Hash in key order so the hash is order-insensitive, matching
+                // the order-insensitive `PartialEq` above.
+                11u8.hash(state);
+                entries.len().hash(state);
+                let mut sorted: Vec<_> = entries.iter().collect();
+                sorted.sort_by(|x, y| x.0.cmp(&y.0));
+                for (k, v) in sorted {
+                    k.hash(state);
                     v.hash(state);
                 }
             }
@@ -1418,7 +1538,10 @@ impl<'a> BatchView<'a> {
 ///
 /// Using this trait enables pre-batch filtering where we evaluate filters
 /// on bindings before constructing a full batch.
-pub trait RowAccess {
+/// `Send + Sync` so a row view can be held across `.await` in the async
+/// metadata resolver (which evaluates loop-local member access under policy).
+/// All implementors are zero-copy views over `Send + Sync` batch/binding data.
+pub trait RowAccess: Send + Sync {
     /// Get a binding by variable ID.
     fn get(&self, var: VarId) -> Option<&Binding>;
 }
@@ -1506,6 +1629,39 @@ mod tests {
 
     fn xsd_string() -> Sid {
         Sid::new(2, "string")
+    }
+
+    #[test]
+    fn rel_eq_hash_contract() {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let hash = |b: &Binding| {
+            let mut h = DefaultHasher::new();
+            b.hash(&mut h);
+            h.finish()
+        };
+        let (s, p, e) = (Sid::new(1, "a"), Sid::new(2, "knows"), Sid::new(1, "b"));
+        let rel = |reifier: Option<Sid>| {
+            Binding::Rel(Box::new(RelValue {
+                start: s.clone(),
+                predicate: p.clone(),
+                end: e.clone(),
+                reifier,
+            }))
+        };
+        // Plain edges with the same SPO are equal and hash equal.
+        assert_eq!(rel(None), rel(None));
+        assert_eq!(hash(&rel(None)), hash(&rel(None)));
+        // Same reifier → equal + hash equal (regardless of SPO comparison path).
+        let r1 = Sid::new(9, "r1");
+        assert_eq!(rel(Some(r1.clone())), rel(Some(r1.clone())));
+        assert_eq!(hash(&rel(Some(r1.clone()))), hash(&rel(Some(r1.clone()))));
+        // Different reifiers (parallel relationships) → distinct; the Eq/Hash
+        // contract holds (unequal values may hash equal, but equal must not hash
+        // differently — checked above; here we assert the distinctness).
+        assert_ne!(rel(Some(r1.clone())), rel(Some(Sid::new(9, "r2"))));
+        // A reified rel is never equal to a plain rel with the same SPO.
+        assert_ne!(rel(Some(r1)), rel(None));
     }
 
     #[test]

@@ -178,6 +178,18 @@ pub enum TransactionBody {
     /// SPARQL UPDATE query text; the lowered `Txn` carries its own
     /// insert/update semantics.
     Sparql(String),
+    /// openCypher write statement (`CREATE`/`MERGE`/`SET`/`REMOVE`/`DELETE`)
+    /// with an optional bound-parameter object. Like `Sparql`, the text is
+    /// lowered to a `Txn` inside the consensus layer under the ledger write
+    /// lock — so a conditional `MERGE … ON MATCH/ON CREATE` chooses its branch
+    /// against the same state the commit's head-check guards (no pre-lock
+    /// TOCTOU), and a retried submission is deduplicated by `idempotency_key`.
+    Cypher {
+        query: String,
+        /// Bound parameters (`{ "cypher": "...", "params": { … } }`). A JSON
+        /// object map, matching `fluree_db_cypher::ParamMap`.
+        params: Option<serde_json::Map<String, JsonValue>>,
+    },
 }
 
 impl TransactionBody {
@@ -190,6 +202,7 @@ impl TransactionBody {
             Self::JsonLdUpsert(_) | Self::TurtleUpsert(_) | Self::TrigUpsert(_) => "upsert",
             Self::JsonLdUpdate(_) => "update",
             Self::Sparql(_) => "sparql-update",
+            Self::Cypher { .. } => "cypher",
         }
     }
 
@@ -236,6 +249,15 @@ impl TransactionBody {
                 hasher.update(b"sparql");
                 hasher.update(text.as_bytes());
             }
+            Self::Cypher { query, params } => {
+                hasher.update(b"cypher");
+                hasher.update(query.as_bytes());
+                if let Some(params) = params {
+                    hasher.update(b"params");
+                    serde_json::to_writer(&mut hasher, params)
+                        .expect("Sha256 write is infallible; a parsed Value re-serializes");
+                }
+            }
         }
         hasher.finalize().into()
     }
@@ -247,7 +269,7 @@ impl TransactionBody {
 /// surface it on [`SubmissionState::Committed`] so clients can tell
 /// what kind of submission they're confirming.
 ///
-/// The seven transact variants mirror [`TransactionBody`]'s
+/// The eight transact variants mirror [`TransactionBody`]'s
 /// discriminators (and convert via [`From<&TransactionBody>`]).
 /// The remaining four match the non-transact `Committer` methods.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -259,6 +281,9 @@ pub enum BodyKind {
     TurtleUpsert,
     TrigUpsert,
     Sparql,
+    /// openCypher write statement; the lowered `Txn` carries its own
+    /// insert/update semantics (resolved under the write lock).
+    Cypher,
     /// Body decodes as `Vec<ContentId>` — a pushed commit chain
     /// already present in CAS. Worker verifies the chain rather
     /// than restaging.
@@ -287,6 +312,7 @@ impl From<&TransactionBody> for BodyKind {
             TransactionBody::TurtleUpsert(_) => BodyKind::TurtleUpsert,
             TransactionBody::TrigUpsert(_) => BodyKind::TrigUpsert,
             TransactionBody::Sparql(_) => BodyKind::Sparql,
+            TransactionBody::Cypher { .. } => BodyKind::Cypher,
         }
     }
 }

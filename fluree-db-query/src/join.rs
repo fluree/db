@@ -996,15 +996,15 @@ impl NestedLoopJoinOperator {
                             debug_assert!(false, "Grouped binding in join bind");
                             // Leave as variable
                         }
-                        Binding::Path(_) => {
+                        Binding::Path { .. } => {
                             // A path value is never a join key — leave as variable.
                             debug_assert!(false, "Path binding in join bind");
                         }
-                        // A list value can legitimately flow through a subquery
-                        // boundary (e.g. `WITH collect(x) AS l ...`). It is never
-                        // a valid triple term, so leave the slot as a variable
-                        // (no match) rather than asserting.
-                        Binding::List(_) => {}
+                        // A list/map/relationship value can legitimately flow
+                        // through a subquery boundary (e.g. `WITH collect(x) AS l`,
+                        // `relationships(p)`). None is a valid triple term, so leave
+                        // the slot as a variable (no match) rather than asserting.
+                        Binding::Rel(_) | Binding::List(_) | Binding::Map(_) => {}
                     }
                 }
             }

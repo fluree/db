@@ -591,7 +591,34 @@ impl ShortestPathOperator {
             let mut row: Vec<Binding> = Vec::with_capacity(self.in_schema.len());
             for var in self.in_schema.iter() {
                 if *var == self.pattern.path_var {
-                    row.push(Binding::Path(path.clone()));
+                    // Single-typed path. Orient each hop's edge by the traversal
+                    // direction: outgoing keeps node[i]→node[i+1]; incoming flips
+                    // to the stored edge node[i+1]→node[i]. For an undirected
+                    // (`Either`) search the per-hop orientation isn't recorded, so
+                    // we fall back to traversal order (best effort).
+                    //
+                    // Only Cypher's `relationships(p)` reads `edges`; skip the
+                    // per-hop allocation/clone entirely on surfaces that don't
+                    // (JSON-LD/FQL), where `needs_relationships` is false.
+                    let edges: Vec<(Sid, Sid, Sid)> = if self.pattern.needs_relationships {
+                        let pred = self.pattern.predicate.clone();
+                        let incoming = matches!(self.pattern.direction, PathDirection::Incoming);
+                        path.windows(2)
+                            .map(|w| {
+                                if incoming {
+                                    (w[1].clone(), pred.clone(), w[0].clone())
+                                } else {
+                                    (w[0].clone(), pred.clone(), w[1].clone())
+                                }
+                            })
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
+                    row.push(Binding::Path {
+                        nodes: path.clone(),
+                        edges,
+                    });
                 } else if let Some(col) = child_batch.column(*var) {
                     row.push(col[row_idx].clone());
                 } else {

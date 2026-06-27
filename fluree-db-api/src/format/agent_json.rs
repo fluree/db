@@ -445,8 +445,10 @@ fn binding_type_label(binding: &Binding, compactor: &IriCompactor) -> Result<Opt
         }
         Binding::EncodedLit { .. } => Ok(None), // shouldn't reach here after materialization
         Binding::Grouped(_) => Ok(Some("grouped".to_string())),
-        Binding::Path(_) => Ok(Some("path".to_string())),
+        Binding::Path { .. } => Ok(Some("path".to_string())),
+        Binding::Rel(_) => Ok(Some("relationship".to_string())),
         Binding::List(_) => Ok(Some("list".to_string())),
+        Binding::Map(_) => Ok(Some("map".to_string())),
     }
 }
 

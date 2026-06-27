@@ -178,7 +178,8 @@ fn format_time_spec(alias: &str, spec: &str) -> String {
 /// Format history results for display.
 fn format_history_result(json: &serde_json::Value, format: OutputFormatKind) -> CliResult<String> {
     match format {
-        OutputFormatKind::Json | OutputFormatKind::TypedJson => {
+        // cypher-json isn't meaningful for history; render as plain JSON.
+        OutputFormatKind::Json | OutputFormatKind::TypedJson | OutputFormatKind::CypherJson => {
             Ok(serde_json::to_string_pretty(json).unwrap_or_else(|_| json.to_string()))
         }
         OutputFormatKind::Table => format_history_table(json),

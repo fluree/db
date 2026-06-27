@@ -59,6 +59,7 @@
   - [Datatypes and typed values](concepts/datatypes.md)
   - [Datasets and named graphs](concepts/datasets-and-named-graphs.md)
   - [Edge annotations](concepts/edge-annotations.md)
+  - [Cypher (openCypher subset)](concepts/cypher.md)
   - [Time travel](concepts/time-travel.md)
   - [Policy enforcement](concepts/policy-enforcement.md)
   - [Verifiable data](concepts/verifiable-data.md)
@@ -66,6 +67,7 @@
 
 - [Guides (cookbooks)](guides/README.md)
   - [Query patterns](guides/cookbook-query-patterns.md)
+  - [Cypher](guides/cookbook-cypher.md)
   - [Full-text and vector search](guides/cookbook-search.md)
   - [Time travel patterns](guides/cookbook-time-travel.md)
   - [Branching and merging](guides/cookbook-branching.md)
@@ -216,6 +218,7 @@
   - [Standards and feature flags](reference/compatibility.md)
   - [Graph identities and naming](reference/graph-identities.md)
   - [OWL & RDFS support](reference/owl-rdfs-support.md)
+  - [openCypher support matrix](reference/cypher-support-matrix.md)
   - [Crate map](reference/crate-map.md)
 
 - [Contributing](contributing/README.md)
