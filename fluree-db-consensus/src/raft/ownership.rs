@@ -25,10 +25,18 @@ const RENDEZVOUS_SEED: u64 = 0x6661_6566_5246_4252;
 /// yield exactly one owner; ties (which would require a hash
 /// collision across two `NodeId`s and the same `ref_key`) break by
 /// the higher `NodeId` so the result is fully deterministic.
-pub fn owner(ref_key: &RefKey, voters: &[NodeId]) -> Option<NodeId> {
+///
+/// Accepts any borrow that yields `&NodeId` — `&[NodeId]`,
+/// `&Vec<NodeId>`, `&BTreeSet<NodeId>`, etc. — so the per-supervisor
+/// tick can iterate `state.worker_eligible_voters` directly without
+/// allocating a `Vec` per call.
+pub fn owner<'a, I>(ref_key: &RefKey, voters: I) -> Option<NodeId>
+where
+    I: IntoIterator<Item = &'a NodeId>,
+{
     let key_digest = key_digest(ref_key);
     voters
-        .iter()
+        .into_iter()
         .copied()
         .map(|node| (rendezvous_score(node, key_digest), node))
         .max_by_key(|&(score, node)| (score, node))

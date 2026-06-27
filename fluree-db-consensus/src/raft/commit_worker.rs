@@ -1196,14 +1196,22 @@ impl WorkerSupervisor {
         // window before any membership-apply has populated the
         // set on this node (fresh cluster bootstrap, or a snapshot
         // restored from a build that predates the field).
-        let voters: Vec<NodeId> = if state.worker_eligible_voters.is_empty() {
-            self.current_voters()
-        } else {
-            state.worker_eligible_voters.iter().copied().collect()
-        };
-        // Empty voter set = cluster not yet bootstrapped (or every
-        // voter dropped); no branch can resolve an owner, so claim
-        // nothing this tick.
+        if !state.worker_eligible_voters.is_empty() {
+            // Steady-state path: iterate the BTreeSet directly so
+            // we don't allocate a fresh `Vec<NodeId>` every
+            // supervisor tick.
+            return state
+                .queues
+                .keys()
+                .filter(|ref_key| owner(ref_key, &state.worker_eligible_voters) == Some(self.id))
+                .cloned()
+                .collect();
+        }
+        // Boot-window fallback: read membership from raft metrics.
+        // The allocation here only happens once per tick until the
+        // first membership-apply populates `worker_eligible_voters`,
+        // then this branch goes dormant.
+        let voters = self.current_voters();
         if voters.is_empty() {
             return HashSet::new();
         }
@@ -1520,18 +1528,21 @@ mod tests {
     ) -> HashSet<RefKey> {
         use crate::raft::ownership::owner;
         let state = state.read().await;
-        let voters: Vec<NodeId> = if state.worker_eligible_voters.is_empty() {
-            fallback_voters.to_vec()
-        } else {
-            state.worker_eligible_voters.iter().copied().collect()
-        };
-        if voters.is_empty() {
+        if !state.worker_eligible_voters.is_empty() {
+            return state
+                .queues
+                .keys()
+                .filter(|ref_key| owner(ref_key, &state.worker_eligible_voters) == Some(id))
+                .cloned()
+                .collect();
+        }
+        if fallback_voters.is_empty() {
             return HashSet::new();
         }
         state
             .queues
             .keys()
-            .filter(|ref_key| owner(ref_key, &voters) == Some(id))
+            .filter(|ref_key| owner(ref_key, fallback_voters) == Some(id))
             .cloned()
             .collect()
     }
