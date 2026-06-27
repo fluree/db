@@ -61,36 +61,27 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, warn};
 
-/// How often a [`Worker`] polls its branch queue when the previous
-/// tick found nothing.
+/// [`Worker`] poll interval when the previous tick found nothing on
+/// its branch queue.
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
-/// How often [`WorkerSupervisor`] scans [`NameServiceState::queues`]
-/// for branches it hasn't yet spawned a worker for. Longer than
-/// [`POLL_INTERVAL`] because per-branch work latency is bounded by
-/// the worker's own poll, not by how fast the supervisor notices new
-/// keys — this just bounds the time-to-spawn for a freshly-seen
-/// branch.
+/// [`WorkerSupervisor`] scan interval for branches in
+/// [`NameServiceState::queues`] without a running worker. Bounds
+/// the time-to-spawn for a freshly-seen branch.
 const SUPERVISOR_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
-/// How long a [`Worker`] waits after a Raft propose failure before
-/// trying again. Long enough that we don't tight-loop against a lost
-/// leader; short enough that recovery feels responsive.
+/// [`Worker`] backoff after a Raft propose failure before the next
+/// retry.
 const RAFT_BACKOFF: Duration = Duration::from_millis(250);
 
 /// Max staging attempts before [`process_entry`] gives up and
-/// proposes a poison. Only `PoisonReason::StagingFailed` is
-/// retried — the other variants are deterministic and would just
-/// burn worker rounds. Three tries balances "recover from a
-/// transient CAS hiccup or lock contention" against "don't hold a
-/// branch's queue front hostage indefinitely."
+/// proposes a poison. Only [`PoisonReason::StagingFailed`] is
+/// retried; the other variants are deterministic.
 const MAX_STAGE_ATTEMPTS: u32 = 3;
 
-/// First-attempt backoff between staging retries; subsequent
-/// attempts double it. With three total attempts the worst-case
-/// wait before poisoning is `100 + 200 = 300ms` — short enough
-/// that downstream waiters don't time out, long enough to ride
-/// through a transient hiccup.
+/// First-attempt backoff between staging retries; doubles per
+/// subsequent attempt. With [`MAX_STAGE_ATTEMPTS`] = 3, the worst-
+/// case wait before poisoning is `100 + 200 = 300ms`.
 const STAGE_RETRY_BASE_BACKOFF: Duration = Duration::from_millis(100);
 
 /// Cross-node propose path for [`SmCommand::PoisonQueueEntry`].
@@ -1072,20 +1063,11 @@ impl Worker {
     }
 }
 
-/// Abort every handle, then await each one. The two-phase
-/// shape — signal all first, await all second — has two
-/// properties the supervisor needs:
-///
-/// - Cancellation fans out concurrently: every task receives the
-///   abort signal before we start waiting on the first one.
-/// - The caller is blocked until every aborted task has reached
-///   its `Drop`. Without that, a follow-up spawn for the same
-///   `RefKey` (a fast ownership flap) could race the to-be-dropped
-///   task on shared state like [`StagedReceiptMap`].
-///
-/// `JoinError::Cancelled` is the expected outcome after `abort`;
-/// a panic surfaces here too. Both are discarded — the caller is
-/// already past the point where the task could affect correctness.
+/// Signal `abort` on every handle, then `await` each one. Returns
+/// after every task has reached its `Drop`, so a follow-up spawn
+/// for the same `RefKey` can't race the aborting task on shared
+/// state like [`StagedReceiptMap`]. `JoinError::Cancelled` and
+/// task panics surfaced through the join are discarded.
 async fn abort_and_await<I>(handles: I)
 where
     I: IntoIterator<Item = JoinHandle<()>>,
@@ -1104,15 +1086,11 @@ where
 /// set, computes which branches this node owns under rendezvous
 /// hashing, and reconciles the running worker set to match.
 ///
-/// Lifecycle: spawned at process start (not bound to leadership)
-/// since every node potentially hosts workers under distributed
-/// assignment. Graceful shutdown is driven through a
-/// [`CancellationToken`]; the supervisor's `select!` loop catches
-/// the cancel, exits, and aborts every per-branch worker it owns.
-///
-/// Cloning is cheap (`Arc` clones plus a `NodeId`); the embedding
-/// server typically constructs once and never clones, but the type
-/// stays `Clone` to match the rest of the integration surface.
+/// Spawned at process start (not bound to leadership) so every node
+/// can host workers under distributed assignment. Shutdown is
+/// driven through a [`CancellationToken`]; the supervisor's
+/// `select!` loop catches the cancel, exits, and aborts every
+/// per-branch worker it owns.
 #[derive(Clone)]
 pub struct WorkerSupervisor {
     id: NodeId,

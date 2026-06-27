@@ -114,26 +114,16 @@ pub struct RaftIntegration {
     release_rx: Arc<Mutex<Option<ReleaseReceiver>>>,
 }
 
-/// HTTP transport surface the integration ferries across the
-/// construction boundary. [`client`](Self::client) is built from
-/// [`config`](Self::config) and routes to the leader-forward
-/// middleware and the cross-node propose forwards in `RaftNameService`;
-/// [`config`](Self::config) lives on past construction in the
-/// integration's storage, where `raft_rpc_router` reads the per-route
-/// body-byte caps from it.
+/// Shared HTTP transport: a `reqwest::Client` paired with the
+/// `NetworkConfig` it was built from.
 pub struct HttpTransport {
     pub client: reqwest::Client,
     pub config: NetworkConfig,
 }
 
-/// In-process channels the state-machine adapter writes to on apply.
-/// `bootstrap` creates the three together and threads them into the
-/// adapter via [`StateMachineAdapter::with_event_bus`],
-/// [`with_waiter_map`](StateMachineAdapter::with_waiter_map),
-/// [`with_staged_receipts`](StateMachineAdapter::with_staged_receipts);
-/// the integration ferries them across the construction boundary so
-/// every downstream consumer (event listener, transactor, worker
-/// supervisor, name service) reads from the same set.
+/// The in-process channels the state-machine adapter writes to on
+/// apply: a `NameServiceEvent` broadcast bus, a per-`queue_id`
+/// waiter map, and the per-leader staged-receipt stash.
 pub struct AdapterChannels {
     pub event_bus: Arc<LedgerEventBus>,
     pub waiter_map: Arc<WaiterMap>,
