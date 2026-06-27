@@ -768,6 +768,16 @@ impl Novelty {
                     keep.push(seg);
                 }
             }
+            // Chunk the merged flakes at MAX_SEGMENT_FLAKES (matching
+            // set_graph_segments / compact_graph) so a tier merge whose sum
+            // exceeds the local-index width can't silently truncate FlakeIds in
+            // release. (A single class-(K+1) result above the cap becomes a few
+            // segments instead; the cascade handles them on later calls.)
+            while flakes.len() > MAX_SEGMENT_FLAKES {
+                let tail = flakes.split_off(MAX_SEGMENT_FLAKES);
+                keep.push(Arc::new(Segment::build(flakes, true)));
+                flakes = tail;
+            }
             keep.push(Arc::new(Segment::build(flakes, true)));
             *segs = keep;
             merges += 1;
