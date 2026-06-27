@@ -2457,34 +2457,31 @@ struct CachedSegmentOps {
     ephemeral_preds: Arc<EphemeralPredicateMap>,
 }
 
-/// Cross-query LRU of per-segment translations. Entry-count bounded for now
-/// (byte-bounding is a follow-up, see the design doc §2.6).
-struct SegmentOpsCache {
-    inner: std::sync::Mutex<lru::LruCache<SegmentOpsKey, Arc<CachedSegmentOps>>>,
-}
-
-impl SegmentOpsCache {
-    fn get(&self, key: &SegmentOpsKey) -> Option<Arc<CachedSegmentOps>> {
-        self.inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(key)
-            .cloned()
-    }
-    fn insert(&self, key: SegmentOpsKey, value: Arc<CachedSegmentOps>) {
-        self.inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .put(key, value);
+impl CachedSegmentOps {
+    /// Approximate heap size, for the byte-weighted cache budget.
+    fn byte_size(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + self.ops.len() * std::mem::size_of::<OverlayOp>()
+            + self.untranslated.iter().map(Flake::size_bytes).sum::<usize>()
+            + self.ephemeral_preds.len() * (std::mem::size_of::<Sid>() + std::mem::size_of::<u32>())
     }
 }
 
-fn global_segment_ops_cache() -> &'static SegmentOpsCache {
+/// Byte budget for the cross-query per-segment translation cache. Uses the same
+/// byte-weighted moka / TinyLFU mechanism as the index `LeafletCache`, as a
+/// DEDICATED budget for now; folding it into the LeafletCache shared pool
+/// ("one pool, one budget") is a follow-up — see the design doc §2.6.
+const SEGMENT_OPS_CACHE_BYTES: u64 = 128 * 1024 * 1024;
+
+fn global_segment_ops_cache() -> &'static moka::sync::Cache<SegmentOpsKey, Arc<CachedSegmentOps>> {
     use once_cell::sync::Lazy;
-    static CACHE: Lazy<SegmentOpsCache> = Lazy::new(|| SegmentOpsCache {
-        inner: std::sync::Mutex::new(lru::LruCache::new(
-            std::num::NonZeroUsize::new(8192).expect("capacity > 0"),
-        )),
+    static CACHE: Lazy<moka::sync::Cache<SegmentOpsKey, Arc<CachedSegmentOps>>> = Lazy::new(|| {
+        moka::sync::Cache::builder()
+            .weigher(|_k: &SegmentOpsKey, v: &Arc<CachedSegmentOps>| {
+                v.byte_size().min(u32::MAX as usize) as u32
+            })
+            .max_capacity(SEGMENT_OPS_CACHE_BYTES)
+            .build()
     });
     &CACHE
 }

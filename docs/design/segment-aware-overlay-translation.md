@@ -156,14 +156,26 @@ the headline reasoning/burst win is **not** delivered by Phase 1.
   this is where the reasoning burst win actually lands. Likely keyed off the existing
   `global_reasoning_cache` generation rather than novelty seg_ids.
 
-### 2.6 Memory bounds (Finding 6)
+### 2.6 Cache layering & memory (Finding 6) — revised
 
-The per-segment cache is a **byte-bounded LRU** (configurable cap), sized at design time —
-not an open question. When the segment path is active for an overlay, the whole-graph
-`global_translation_cache` and per-execution `translated_overlay_cache` are **bypassed**
-for it (not co-resident) so we never hold both products. Compaction orphans old
-seg entries; the LRU evicts them by byte pressure (a compacted segment's new entry may be
-large — the byte cap, not an entry count, governs).
+The segment cache does **not** bypass the whole-graph caches; it **accelerates their MISS
+path**. The per-execution `translated_overlay_cache` and the cross-query
+`global_translation_cache` (keyed per overlay **epoch**) stay as the merged-product layer,
+so a same-epoch repeated query is a free cache hit exactly as today — **no warm-repeat
+regression**. Only on a global-cache MISS (the post-commit cold query) does `open()`
+assemble the merged product from the per-segment cache, translating only newly-appended
+segments. (This revises the v1 "bypass" wording, which would have regressed warm-repeat.)
+
+So for one hot epoch two bounded caches coexist: the per-segment translations (keyed by
+seg id) and the single merged epoch product (the LRU(4) global cache). The overlap is
+bounded — merged product ≈ Σ segment ops — and is the deliberate cost of keeping
+warm-repeat free.
+
+**Memory bound:** the per-segment cache must be **byte-bounded** and should share the
+engine's in-memory budget — route it through the moka byte-weighted `LeafletCache`
+("one pool, one budget", TinyLFU), **not** a fixed entry-count LRU (the current code's
+`lru::LruCache(8192)` is a temporary placeholder to be replaced). Compaction orphans old
+seg entries; byte pressure (not an entry count) evicts them.
 
 ---
 
