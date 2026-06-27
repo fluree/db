@@ -2036,16 +2036,35 @@ impl Operator for BinaryScanOperator {
                     let entry = if let Some(hit) = global_translation_cache().get(&global_key) {
                         hit
                     } else {
+                        // Segment-aware path (raw Novelty): assemble from
+                        // per-segment caches so a write burst re-translates only
+                        // new segments. Falls back to the whole-graph translate
+                        // for non-segment-native overlays or an uncacheable
+                        // segment. Both paths return ops sorted by `order`; the
+                        // merged product is then resolved + cached per epoch.
                         let (mut ops, mut untranslated, ephemeral_preds) =
-                            translate_overlay_flakes_with_untranslated(
-                                ctx.overlay(),
+                            match collect_segment_merged_ops(
+                                ctx,
                                 &store_arc,
-                                ctx.dict_novelty.as_ref(),
-                                ctx.runtime_small_dicts,
-                                ctx.to_t,
                                 self.g_id,
-                            );
-                        sort_overlay_ops(&mut ops, order);
+                                self.index,
+                                ctx.to_t,
+                            ) {
+                                Some(triple) => triple,
+                                None => {
+                                    let (mut ops, untrans, eph) =
+                                        translate_overlay_flakes_with_untranslated(
+                                            ctx.overlay(),
+                                            &store_arc,
+                                            ctx.dict_novelty.as_ref(),
+                                            ctx.runtime_small_dicts,
+                                            ctx.to_t,
+                                            self.g_id,
+                                        );
+                                    sort_overlay_ops(&mut ops, order);
+                                    (ops, untrans, eph)
+                                }
+                            };
                         resolve_overlay_ops(&mut ops);
                         if !untranslated.is_empty() {
                             untranslated.sort_by(self.index.comparator());
@@ -2397,6 +2416,218 @@ pub fn translate_overlay_flakes_with_untranslated(
     );
 
     (ops, untranslated, ephemeral_preds)
+}
+
+// ============================================================================
+// Per-segment overlay translation (Tier-2)
+//
+// Caches each immutable novelty segment's dict-translation so a write burst
+// re-translates only newly-appended segments. The cached product accelerates
+// the global-cache MISS path in `open()` (it does NOT replace the per-epoch
+// merged-product cache, so same-epoch repeats stay free). Scoped to raw
+// `Novelty` overlays: a non-segmented overlay reports a single synthetic
+// segment (`seg_id == u64::MAX`), which routes to the whole-graph path.
+// See docs/design/segment-aware-overlay-translation.md.
+// ============================================================================
+
+/// Identity of one segment's translation: stable across commits (the segment is
+/// immutable and `seg_id` is process-unique) but invalidated by reindex
+/// (`store_max_t`) and dictionary identity. Deliberately excludes the overlay
+/// epoch + `to_t` so the entry survives commits (the cross-commit reuse is the
+/// point); `to_t` is applied after the merge.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct SegmentOpsKey {
+    ledger_id: Arc<str>,
+    store_max_t: i64,
+    seg_id: u64,
+    index: IndexType,
+}
+
+/// A segment's cached translation: ops sorted by the index order but **not**
+/// lifecycle-resolved and **not** `to_t`-filtered, the `@vector`/unsupported
+/// flakes, and the stable novelty-predicate id map (only entries backed by the
+/// shared dictionaries — a segment needing an ad-hoc ephemeral id is never
+/// cached, so all ids here are mergeable across segments).
+struct CachedSegmentOps {
+    ops: Arc<[OverlayOp]>,
+    untranslated: Arc<[Flake]>,
+    ephemeral_preds: Arc<EphemeralPredicateMap>,
+}
+
+/// Cross-query LRU of per-segment translations. Entry-count bounded for now
+/// (byte-bounding is a follow-up, see the design doc §2.6).
+struct SegmentOpsCache {
+    inner: std::sync::Mutex<lru::LruCache<SegmentOpsKey, Arc<CachedSegmentOps>>>,
+}
+
+impl SegmentOpsCache {
+    fn get(&self, key: &SegmentOpsKey) -> Option<Arc<CachedSegmentOps>> {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(key)
+            .cloned()
+    }
+    fn insert(&self, key: SegmentOpsKey, value: Arc<CachedSegmentOps>) {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .put(key, value);
+    }
+}
+
+fn global_segment_ops_cache() -> &'static SegmentOpsCache {
+    use once_cell::sync::Lazy;
+    static CACHE: Lazy<SegmentOpsCache> = Lazy::new(|| SegmentOpsCache {
+        inner: std::sync::Mutex::new(lru::LruCache::new(
+            std::num::NonZeroUsize::new(8192).expect("capacity > 0"),
+        )),
+    });
+    &CACHE
+}
+
+/// Translate (and cache) one segment's flakes into sorted, unresolved overlay
+/// ops. Returns `None` when the segment cannot be cached/merged — a translation
+/// failure or an ad-hoc ephemeral predicate id (detected by the
+/// `next_ephemeral_p_id` counter moving) — so the caller falls back to the
+/// whole-graph path for the whole assembly.
+#[allow(clippy::too_many_arguments)]
+fn translate_segment_cached(
+    overlay: &dyn OverlayProvider,
+    store: &Arc<BinaryIndexStore>,
+    dict_novelty: Option<&Arc<fluree_db_core::dict_novelty::DictNovelty>>,
+    runtime_small_dicts: Option<&RuntimeSmallDicts>,
+    g_id: GraphId,
+    index: IndexType,
+    order: RunSortOrder,
+    seg_id: u64,
+    ledger_id: &Arc<str>,
+) -> Option<Arc<CachedSegmentOps>> {
+    let key = SegmentOpsKey {
+        ledger_id: Arc::clone(ledger_id),
+        store_max_t: store.max_t(),
+        seg_id,
+        index,
+    };
+    if let Some(hit) = global_segment_ops_cache().get(&key) {
+        return Some(hit);
+    }
+
+    let base_p_id = runtime_small_dicts
+        .map(|d| d.predicate_count().max(store.predicate_count()))
+        .unwrap_or_else(|| store.predicate_count());
+
+    let mut ops: Vec<OverlayOp> = Vec::new();
+    let mut untranslated: Vec<Flake> = Vec::new();
+    let mut ephemeral_preds: EphemeralPredicateMap = HashMap::new();
+    let mut next_ephemeral_p_id = base_p_id;
+    let mut hard_error = false;
+
+    overlay.for_each_overlay_segment_flake(g_id, seg_id, index, &mut |flake| {
+        if hard_error {
+            return;
+        }
+        match translate_one_flake_v3_pub(
+            flake,
+            store,
+            dict_novelty,
+            runtime_small_dicts,
+            &mut ephemeral_preds,
+            &mut next_ephemeral_p_id,
+            g_id,
+        ) {
+            Ok(op) => ops.push(op),
+            Err(e) if e.kind() == std::io::ErrorKind::Unsupported => untranslated.push(flake.clone()),
+            Err(_) => hard_error = true,
+        }
+    });
+
+    // Ad-hoc ephemeral id (counter moved) or a hard translation failure makes
+    // this segment's ops non-mergeable / non-reproducible → don't cache.
+    if hard_error || next_ephemeral_p_id != base_p_id {
+        return None;
+    }
+
+    sort_overlay_ops(&mut ops, order);
+
+    let entry = Arc::new(CachedSegmentOps {
+        ops: ops.into(),
+        untranslated: untranslated.into(),
+        ephemeral_preds: Arc::new(ephemeral_preds),
+    });
+    global_segment_ops_cache().insert(key, Arc::clone(&entry));
+    Some(entry)
+}
+
+/// Assemble the overlay's merged ops from per-segment caches, mirroring the
+/// product of `translate_overlay_flakes_with_untranslated` + `sort_overlay_ops`
+/// for a raw `Novelty` overlay. Returns `None` to signal the caller to use the
+/// whole-graph path: the overlay is not segment-native (one synthetic segment),
+/// or a contributing segment is uncacheable. `to_t` is applied here (after
+/// translation); lifecycle resolution is left to the caller.
+fn collect_segment_merged_ops(
+    ctx: &ExecutionContext<'_>,
+    store: &Arc<BinaryIndexStore>,
+    g_id: GraphId,
+    index: IndexType,
+    to_t: i64,
+) -> Option<(Vec<OverlayOp>, Vec<Flake>, EphemeralPredicateMap)> {
+    let overlay = ctx.overlay();
+    let segs = overlay.overlay_segments(g_id);
+    // Non-segment-native overlays report one synthetic segment; route them to
+    // the whole-graph path (preserves reasoning-overlay behaviour exactly).
+    if segs.len() == 1 && segs[0].seg_id == u64::MAX {
+        return None;
+    }
+
+    let order = index_type_to_sort_order(index);
+    let ledger_id: Arc<str> = ctx.active_snapshot.ledger_id.as_str().into();
+
+    let mut merged_ops: Vec<OverlayOp> = Vec::new();
+    let mut merged_untranslated: Vec<Flake> = Vec::new();
+    let mut merged_eph: EphemeralPredicateMap = HashMap::new();
+
+    for seg in &segs {
+        // Zone-map: a segment entirely after `to_t` contributes nothing.
+        if seg.min_t > to_t {
+            continue;
+        }
+        let cached = translate_segment_cached(
+            overlay,
+            store,
+            ctx.dict_novelty.as_ref(),
+            ctx.runtime_small_dicts,
+            g_id,
+            index,
+            order,
+            seg.seg_id,
+            &ledger_id,
+        )?;
+
+        // Whole segments below `to_t` need no per-op filter; only a straddling
+        // (compacted) segment does — but filtering every op is always correct.
+        let needs_t_filter = seg.max_t > to_t;
+        for op in cached.ops.iter() {
+            if !needs_t_filter || op.t <= to_t {
+                merged_ops.push(*op);
+            }
+        }
+        for f in cached.untranslated.iter() {
+            if f.t <= to_t {
+                merged_untranslated.push(f.clone());
+            }
+        }
+        // Stable (dictionary-backed) ids: identical Sid → identical id across
+        // segments, so the merge is consistent.
+        for (sid, id) in cached.ephemeral_preds.iter() {
+            merged_eph.insert(sid.clone(), *id);
+        }
+    }
+
+    // Per-segment runs are each sorted; the concatenation is not. Sort once
+    // (resolve is applied by the caller). A k-way merge is a later optimization.
+    sort_overlay_ops(&mut merged_ops, order);
+    Some((merged_ops, merged_untranslated, merged_eph))
 }
 
 /// Translate a single Flake to an OverlayOp.
