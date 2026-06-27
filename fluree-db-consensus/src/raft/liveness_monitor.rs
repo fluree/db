@@ -143,13 +143,24 @@ impl LivenessMonitor {
     /// them on abort.
     pub async fn run(self) {
         let mut trackers: HashMap<NodeId, PeerTracker> = HashMap::new();
+        // Cache the log id of the most recently observed membership
+        // change. When it doesn't advance between ticks, the voter
+        // set is unchanged and the tracker-pruning collect+retain
+        // pair can be skipped.
+        let mut last_membership_log_id: Option<LogId<NodeId>> = None;
         loop {
             tokio::time::sleep(self.config.sample_interval).await;
-            self.tick(&mut trackers, Instant::now()).await;
+            self.tick(&mut trackers, &mut last_membership_log_id, Instant::now())
+                .await;
         }
     }
 
-    async fn tick(&self, trackers: &mut HashMap<NodeId, PeerTracker>, now: Instant) {
+    async fn tick(
+        &self,
+        trackers: &mut HashMap<NodeId, PeerTracker>,
+        last_membership_log_id: &mut Option<LogId<NodeId>>,
+        now: Instant,
+    ) {
         // Read what we need from the metrics ref and drop it
         // before any await. Cloning the whole `RaftMetrics` (the
         // earlier shape) deep-copied the per-peer replication
@@ -157,7 +168,7 @@ impl LivenessMonitor {
         // need, leaving the watch ref free for openraft's writer.
         // Holding the ref across `propose_*` awaits would also
         // block metrics updates for the entire tick.
-        let (leader_last_log, peers, configured) = {
+        let (leader_last_log, peers, configured_voters) = {
             let metrics_rx = self.raft.metrics();
             let metrics = metrics_rx.borrow();
             // No replication metrics = not the leader. The leader
@@ -173,9 +184,25 @@ impl LivenessMonitor {
                 .filter(|(id, _)| **id != leader_id)
                 .map(|(id, log)| (*id, *log))
                 .collect();
-            let configured: std::collections::HashSet<NodeId> =
-                metrics.membership_config.membership().voter_ids().collect();
-            (leader_last_log, peers, configured)
+            // Skip the voter-set collect when membership hasn't
+            // changed since the previous tick — `log_id` advances
+            // only on a membership-apply, so equality means the
+            // voter set is identical and the retain below would
+            // be a no-op.
+            let current_log_id = *metrics.membership_config.log_id();
+            let configured_voters = if current_log_id != *last_membership_log_id {
+                *last_membership_log_id = current_log_id;
+                Some(
+                    metrics
+                        .membership_config
+                        .membership()
+                        .voter_ids()
+                        .collect::<std::collections::HashSet<NodeId>>(),
+                )
+            } else {
+                None
+            };
+            (leader_last_log, peers, configured_voters)
         };
 
         for (peer_id, peer_log) in peers {
@@ -193,9 +220,13 @@ impl LivenessMonitor {
             }
         }
         // Drop trackers for peers that left the voter set on a
-        // membership change. Keeps memory bounded across cluster
-        // lifetime.
-        trackers.retain(|id, _| configured.contains(id));
+        // membership change. Only run when membership actually
+        // changed — the cached `last_membership_log_id` lets us
+        // skip the retain (and the prior collect) on steady-state
+        // ticks where the voter set is unchanged.
+        if let Some(configured) = configured_voters {
+            trackers.retain(|id, _| configured.contains(id));
+        }
     }
 
     /// Propose `eligible: true` for `voter`. Returns `true` when the
