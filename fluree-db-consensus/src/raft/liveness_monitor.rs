@@ -150,28 +150,43 @@ impl LivenessMonitor {
     }
 
     async fn tick(&self, trackers: &mut HashMap<NodeId, PeerTracker>, now: Instant) {
-        let metrics = self.raft.metrics().borrow().clone();
-        // No replication metrics = not the leader. The leader watcher
-        // ordinarily aborts the task before this fires; the guard
-        // protects the gap.
-        let Some(replication) = metrics.replication.as_ref() else {
-            return;
+        // Read what we need from the metrics ref and drop it
+        // before any await. Cloning the whole `RaftMetrics` (the
+        // earlier shape) deep-copied the per-peer replication
+        // BTreeMap; here we just copy out the small fields we
+        // need, leaving the watch ref free for openraft's writer.
+        // Holding the ref across `propose_*` awaits would also
+        // block metrics updates for the entire tick.
+        let (leader_last_log, peers, configured) = {
+            let metrics_rx = self.raft.metrics();
+            let metrics = metrics_rx.borrow();
+            // No replication metrics = not the leader. The leader
+            // watcher ordinarily aborts the task before this fires;
+            // the guard protects the gap.
+            let Some(replication) = metrics.replication.as_ref() else {
+                return;
+            };
+            let leader_id = metrics.id;
+            let leader_last_log = metrics.last_log_index;
+            let peers: Vec<(NodeId, Option<LogId<NodeId>>)> = replication
+                .iter()
+                .filter(|(id, _)| **id != leader_id)
+                .map(|(id, log)| (*id, *log))
+                .collect();
+            let configured: std::collections::HashSet<NodeId> =
+                metrics.membership_config.membership().voter_ids().collect();
+            (leader_last_log, peers, configured)
         };
-        let leader_id = metrics.id;
-        let leader_last_log = metrics.last_log_index;
 
-        for (peer_id, peer_log) in replication {
-            if *peer_id == leader_id {
-                continue;
-            }
-            let tracker = trackers.entry(*peer_id).or_insert_with(PeerTracker::new);
-            record_replication_progress(tracker, *peer_log, leader_last_log, now);
+        for (peer_id, peer_log) in peers {
+            let tracker = trackers.entry(peer_id).or_insert_with(PeerTracker::new);
+            record_replication_progress(tracker, peer_log, leader_last_log, now);
             match next_eligibility_proposal(tracker, now, &self.config) {
-                Some(EligibilityProposal::Promote) if self.propose_eligible(*peer_id).await => {
+                Some(EligibilityProposal::Promote) if self.propose_eligible(peer_id).await => {
                     tracker.last_proposed = Some(EligibilityProposal::Promote);
                     tracker.recovering_since = None;
                 }
-                Some(EligibilityProposal::Demote) if self.propose_ineligible(*peer_id).await => {
+                Some(EligibilityProposal::Demote) if self.propose_ineligible(peer_id).await => {
                     tracker.last_proposed = Some(EligibilityProposal::Demote);
                 }
                 Some(_) | None => {}
@@ -180,8 +195,6 @@ impl LivenessMonitor {
         // Drop trackers for peers that left the voter set on a
         // membership change. Keeps memory bounded across cluster
         // lifetime.
-        let configured: std::collections::HashSet<NodeId> =
-            metrics.membership_config.membership().voter_ids().collect();
         trackers.retain(|id, _| configured.contains(id));
     }
 
