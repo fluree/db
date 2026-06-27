@@ -173,6 +173,36 @@ pub struct StagingContext {
     pub index_config: IndexConfig,
 }
 
+/// RAII wrapper around a [`StagedReceiptMap`] stash slot. Stashes a
+/// typed [`AppliedReceipt`] on construction; removes it on `Drop`.
+/// Ensures a worker aborted mid-publish doesn't strand its receipt
+/// in the shared map — every exit path (normal return, error, task
+/// cancellation, panic) runs `Drop`. Removal is idempotent: paths
+/// where the state-machine adapter or the cross-node forward
+/// already consumed the receipt see `Drop` perform a no-op `take`.
+struct StashGuard<'a> {
+    receipts: &'a StagedReceiptMap,
+    queue_id: u64,
+}
+
+impl<'a> StashGuard<'a> {
+    fn stash(
+        receipts: &'a StagedReceiptMap,
+        queue_id: u64,
+        ref_key: RefKey,
+        receipt: AppliedReceipt,
+    ) -> Self {
+        receipts.stash(queue_id, ref_key, receipt);
+        Self { receipts, queue_id }
+    }
+}
+
+impl Drop for StashGuard<'_> {
+    fn drop(&mut self) {
+        self.receipts.take(self.queue_id);
+    }
+}
+
 /// Per-branch staging task.
 ///
 /// Drains a single branch's queue: peeks the front, stages the
@@ -310,19 +340,24 @@ impl Worker {
         let commit_id = receipt.commit_id().clone();
         let commit_t = receipt.commit_t();
 
-        // Stash the typed receipt, then propose. The error path
-        // can't blindly drop `install` — `publish_head_advance` may
-        // return `Err` (lost response, stepped-down leader after
-        // local apply, post-apply fatal) for an `ApplyHead` that
-        // actually committed and was applied on this node. In that
-        // case the replicated `state.refs` reflects our advance but
-        // dropping the install leaves the local Fluree cache at the
+        // Stash the typed receipt through `StashGuard` so an abort
+        // mid-publish (ownership flap during the propose await)
+        // doesn't strand the receipt. The error path can't blindly
+        // drop `install` — `publish_head_advance` may return `Err`
+        // (lost response, stepped-down leader after local apply,
+        // post-apply fatal) for an `ApplyHead` that actually
+        // committed and was applied on this node. In that case the
+        // replicated `state.refs` reflects our advance but dropping
+        // the install leaves the local Fluree cache at the
         // pre-stage head → silent stale reads. So on error we
         // reconcile against the replicated head and finalize the
         // install only if our commit landed.
-        self.publishing
-            .staged_receipts
-            .stash(entry.queue_id, self.ref_key.clone(), receipt);
+        let _stash = StashGuard::stash(
+            &self.publishing.staged_receipts,
+            entry.queue_id,
+            self.ref_key.clone(),
+            receipt,
+        );
         match self.publish_head_advance(commit_id.clone(), commit_t).await {
             Ok(()) => {
                 if let Some(install) = install {
@@ -333,14 +368,11 @@ impl Worker {
             }
             Err(err) => {
                 let landed = self.commit_replicated(&commit_id).await;
-                self.publishing.staged_receipts.take(entry.queue_id);
                 if landed {
                     // Apply landed via another path (idempotency hit
-                    // or a sibling worker's race). The adapter
-                    // already took the stash during waiter
-                    // resolution; the `take` above is defensive.
-                    // Finalize the local cache so this node catches
-                    // up with the replicated head.
+                    // or a sibling worker's race). Finalize the local
+                    // cache so this node catches up with the
+                    // replicated head.
                     if let Some(install) = install {
                         self.finalize_after_publish(entry.queue_id, commit_t, install)
                             .await;
@@ -365,6 +397,9 @@ impl Worker {
                 }
             }
         }
+        // `_stash`'s Drop fires on function return (or on abort
+        // mid-await) — idempotent `take` cleans the slot regardless
+        // of which path won.
     }
 
     /// Finalize the local cache after a confirmed publish, treating
@@ -1808,5 +1843,67 @@ mod tests {
             0,
             "every aborted task's Drop must run before abort_and_await returns"
         );
+    }
+
+    /// `StashGuard` removes the receipt when the guard goes out of
+    /// scope. This is the load-bearing property for the abort case:
+    /// if a worker is aborted between the stash and the propose
+    /// completing, the future is dropped, all locals drop, the
+    /// guard's `Drop` fires, and the receipt is cleaned up.
+    #[tokio::test]
+    async fn stash_guard_removes_receipt_on_drop() {
+        use crate::raft::staged_receipt::{AppliedReceipt, StagedReceiptMap, TransactApplied};
+        use crate::raft::state_machine::RefKey;
+        use fluree_db_api::{ContentId, ContentKind};
+
+        let map = StagedReceiptMap::new();
+        let receipt = AppliedReceipt::Transact(TransactApplied {
+            commit_id: ContentId::new(ContentKind::Commit, &[1]),
+            commit_t: 10,
+            flake_count: 0,
+            tally: None,
+        });
+
+        {
+            let _guard =
+                super::StashGuard::stash(&map, 42, RefKey::new("test/db", "main"), receipt);
+            assert_eq!(map.len(), 1, "stash should populate the map");
+        }
+        assert_eq!(
+            map.len(),
+            0,
+            "scope exit must drop the guard and clean the stash"
+        );
+    }
+
+    /// Even when an unrelated path has already consumed the
+    /// receipt (the state-machine adapter on apply, or the
+    /// cross-node forward's pre-post take), the guard's `Drop` must
+    /// be a safe no-op rather than panic or corrupt the map.
+    #[tokio::test]
+    async fn stash_guard_drop_is_idempotent_after_external_take() {
+        use crate::raft::staged_receipt::{AppliedReceipt, StagedReceiptMap, TransactApplied};
+        use crate::raft::state_machine::RefKey;
+        use fluree_db_api::{ContentId, ContentKind};
+
+        let map = StagedReceiptMap::new();
+        let receipt = AppliedReceipt::Transact(TransactApplied {
+            commit_id: ContentId::new(ContentKind::Commit, &[1]),
+            commit_t: 10,
+            flake_count: 0,
+            tally: None,
+        });
+
+        {
+            let _guard =
+                super::StashGuard::stash(&map, 42, RefKey::new("test/db", "main"), receipt);
+            // Simulate the adapter / via-leader path taking the
+            // receipt before the guard drops.
+            assert!(map.take(42).is_some());
+            assert_eq!(map.len(), 0);
+        }
+        // Guard's Drop ran on the empty slot — still empty, no
+        // panic, no side effects.
+        assert_eq!(map.len(), 0);
     }
 }
