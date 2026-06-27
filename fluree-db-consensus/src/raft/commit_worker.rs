@@ -1166,15 +1166,26 @@ impl WorkerSupervisor {
     }
 
     async fn compute_desired_owners(&self) -> HashSet<RefKey> {
+        // Steady-state path: one lock acquisition, no allocation.
+        // `desired_owners` iterates `worker_eligible_voters`
+        // (a `BTreeSet`) through `owner`'s borrowed-iter input, so
+        // passing an empty fallback slice costs nothing — it's never
+        // consulted when the eligible set is non-empty.
+        {
+            let state = self.shared_state.read().await;
+            if !state.worker_eligible_voters.is_empty() {
+                return desired_owners(&state, self.id, &[]);
+            }
+        }
+        // Boot-window fallback: the lock is released before the
+        // `watch::Ref` borrow so the apply path's writer isn't
+        // contended on the membership read. Re-acquire to iterate
+        // queues. The eligible set being empty is monotonic — once
+        // the first membership-apply populates it the quorum-floor
+        // invariant keeps it non-empty — so racing back to empty
+        // between these two acquisitions can't happen in practice.
+        let fallback = self.current_voters();
         let state = self.shared_state.read().await;
-        // Read raft membership only when the eligible set is empty
-        // — that branch only fires during the boot window before
-        // any membership-apply has populated the replicated set.
-        let fallback = if state.worker_eligible_voters.is_empty() {
-            self.current_voters()
-        } else {
-            Vec::new()
-        };
         desired_owners(&state, self.id, &fallback)
     }
 
