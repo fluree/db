@@ -36,6 +36,55 @@
 //!    waiter. The transactor's `await` returns the typed receipt.
 //!
 //! See `docs/design/raft-command-queue.md` for the full design.
+//!
+//! # Threat model
+//!
+//! Every inter-node RPC in this crate — the openraft replication
+//! protocol ([`network`]), the cross-node propose forwards
+//! ([`nameservice`]'s `apply_staged_commit` / `apply_queue_poison`),
+//! and the client-facing leader-forward middleware ([`forward`]) —
+//! assumes a **peer-trusted** deployment posture:
+//!
+//! - All cluster nodes are reachable to one another over a private
+//!   network (VPC / dedicated subnet / equivalent firewall
+//!   boundary). External access reaches the cluster only through an
+//!   explicit load balancer with a curated port allowlist.
+//! - Peers are equally trusted. Compromise of any single node is
+//!   assumed to compromise the entire cluster — there is no honest-
+//!   party-among-malicious-peers guarantee, because a compromised
+//!   follower can already win elections, refuse to replicate, vote
+//!   against quorum, and propose arbitrary `client_write` commands
+//!   through normal raft.
+//! - The cluster-admin endpoints ([`admin`]) are gated by an
+//!   operator-credential layer (`require_admin_token`) at the
+//!   server level; the consensus RPCs themselves carry no
+//!   authentication of their own.
+//!
+//! Consequences of this posture, and what it leaves the code
+//! responsible for:
+//!
+//! - **No per-RPC caller-identity verification** on
+//!   `apply_staged_commit` / `apply_queue_poison`. A peer that can
+//!   reach these endpoints is, by assumption, already inside the
+//!   trust boundary. Adding owner-of-`ref_key` checks would not
+//!   buy anything against a malicious peer (who can simply skip the
+//!   forward and use openraft directly).
+//! - **Operator-error guards do still apply.** [`forward`]'s SSRF
+//!   filter rejects loopback / link-local / unspecified peer URLs
+//!   when this node isn't on loopback itself, catching the case
+//!   where a hand-edited or fat-fingered `client_addr` /
+//!   `raft_addr` would redirect every follower's forward at the
+//!   wrong target.
+//! - **Postcard decode and `DefaultBodyLimit::max` per-route caps**
+//!   protect against malformed or oversized bodies regardless of
+//!   source. They guard against bugs and crash conditions, not
+//!   adversarial peers.
+//!
+//! If a future deployment shape (multi-cluster federation, public
+//! peer joins, etc.) loosens the peer-trust assumption, every RPC
+//! handler in this crate needs an authentication layer above it —
+//! the load-bearing assumption is intentionally not duplicated
+//! per-endpoint.
 
 pub mod admin;
 pub mod commit_worker;
