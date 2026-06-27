@@ -20,9 +20,11 @@ Property paths are the foundation of graph crawl. They let you follow relationsh
 |---|---|---|---|
 | One or more (`+`) | `ex:knows+` | Follow 1+ times (transitive closure) | Friends of friends |
 | Zero or more (`*`) | `ex:knows*` | Follow 0+ times (includes self) | Self and all reachable |
+| Zero or one (`?`) | `ex:knows?` | Self plus a single hop | Direct connections or none |
 | Inverse (`^`) | `^ex:reportsTo` | Follow in reverse direction | Who reports to me? |
 | Alternative (`\|`) | `ex:knows\|ex:colleague` | Match any of several predicates | Social or professional connections |
 | Sequence (`/`) | `ex:knows/ex:name` | Chain of predicates | Names of friends |
+| Composite-transitive | `(ex:parent/ex:knows)+` | Repeat a whole forward sub-path | Walk parent-then-acquaintance chains |
 
 ### JSON-LD Query syntax
 

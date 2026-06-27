@@ -79,7 +79,7 @@ Supported SPARQL features:
 - LIMIT and OFFSET
 - Subqueries (evaluated independently — an inner `ORDER BY`/`LIMIT`/`OFFSET` scopes the sub-SELECT before it joins the enclosing pattern, per SPARQL 1.1 §18.2; there are no correlated/LATERAL sub-SELECTs)
 - Blank-node property lists (`[ :p ?o ]`) in subject and object position
-- Property paths (partial: `+`, `*`, `?`, `^`, `|`, `/`; negated property sets `!` and `{n,m}` depth ranges are not supported; see [SPARQL docs](../query/sparql.md#property-paths))
+- Property paths (partial: `+`, `*`, `?`, `^`, `|`, `/`, `!` negated property sets, and transitive over a sequence including inverse steps `(^a/b)+`; `{n,m}` depth ranges are not supported; see [SPARQL docs](../query/sparql.md#property-paths))
 
 **Aggregate result types:** COUNT and SUM of integers return `xsd:integer` (per W3C spec), not `xsd:long`. SUM of mixed types and AVG return `xsd:double`.
 
@@ -406,7 +406,7 @@ Export Fluree data to:
 ### Planned Features
 
 **Query:**
-- SPARQL property paths: remaining operators (`!` negated property set, `{n,m}` depth ranges)
+- SPARQL property paths: remaining operators (`{n,m}` depth ranges) and nested transitive steps inside a composite repeated unit (`(a+/b)+`)
 - SPARQL 1.1 Federation (`SERVICE`)
 - Full SPARQL UPDATE (LOAD, CLEAR, DROP, CREATE, COPY, MOVE, ADD; variable graph names)
 - GeoSPARQL: remaining OGC functions (only `geof:distance` is implemented today)

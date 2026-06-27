@@ -1447,6 +1447,23 @@ mem:fact-01kj8k5nzpe59p5vp7zrehbrr9 a mem:Fact ;
     mem:branch "feature/memory" ;
     mem:createdAt "2026-02-24T19:49:14.358637+00:00"^^xsd:dateTime .
 
+mem:fact-01kvzn4mmmcvc7zz6bcswtw47c a mem:Fact ;
+    mem:content "SPARQL property paths, branch feature/sparql-property-paths: closed ALL reported gaps PLUS inverse-in-composite (wired in BOTH sparql lower/path.rs AND query parse/lower.rs for JSON-LD parity). (1) ZeroOrOne p?: PathModifier::ZeroOrOne; BFS self+1hop. (2) Negated sets !: fresh ?__np{n} pred-var triple + FILTER(?p != IRI(...)); fwd/inv/mixed=UNION. (3) Nested modifiers (p*)*: collapse_modifiers (zero=any */?, unbounded=any +/*). (4) Composite-transitive (a/b)+ incl inverse steps (^a/b)+: PropertyPathPattern has predicates+first_inverse+sequence_steps:Vec<PathStep{predicates,inverse}>; operator's read_step reads SPOT/POST by direction (opposite index when retreating); single_predicate() bails on composite. ONLY UNSUPPORTED (niche): nested transitive step in a composite unit (a+/b)+ — not exercised by any W3C test." ;
+    mem:tag "negated-set" ;
+    mem:tag "property-path" ;
+    mem:tag "query" ;
+    mem:tag "sparql" ;
+    mem:tag "zero-or-one" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-query/src/ir/path.rs" ;
+    mem:artifactRef "fluree-db-query/src/parse/lower.rs" ;
+    mem:artifactRef "fluree-db-query/src/property_path.rs" ;
+    mem:artifactRef "fluree-db-sparql/src/lower/path.rs" ;
+    mem:artifactRef "fluree-db-sparql/src/validate/mod.rs" ;
+    mem:branch "feature/sparql-property-paths" ;
+    mem:createdAt "2026-06-25T15:07:25.716857+00:00"^^xsd:dateTime ;
+    mem:rationale "Predicate-var + IRI() filter is the proven approach for negated sets — the cypher 'var-predicate IN fails' warning was string-literal-specific, not IRI." .
+
 mem:decision-01kv5jegwe2h3fmsrbygh9j644 a mem:Decision ;
     mem:content "DATATYPE(?v) now returns the datatype IRI as ComparableValue::Sid (SPARQL 1.1 §17.4.2.3), not the old compact string (\"xsd:decimal\"). eval_datatype maps Lit→dtc.datatype() Sid, EncodedLit→reserved_datatype_sid() fast path or store.dt_sids(), IRI bindings→id_type Sid. Removed format_datatype_sid/format_reserved_datatype. Comparison works because filter-side xsd:decimal lowers via IRI()→encode_iri_strict→same Sid. Serialization: SPARQL results = full IRI; JSON-LD compacts via @context (so xsd prefix → \"xsd:decimal\"). JSON-LD s-expr filters can't express IRIs as bare prefixed names — must use (iri \"<full-iri>\"); STR(DATATYPE()) now yields the FULL IRI, breaking old \"xsd:decimal\" string workarounds." ;
     mem:tag "datatype" ;

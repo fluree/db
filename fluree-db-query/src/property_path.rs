@@ -164,15 +164,17 @@ impl PropertyPathOperator {
         self.pattern.max_hops.is_none_or(|hi| depth < hi)
     }
 
-    /// One forward hop from `node`: the ref objects of `(node, p, ?)`. For a
-    /// fixed path this is the union over the traversed predicate(s) (alternation
-    /// `(a|b)*`); for a wildcard (untyped) path it follows **any** node→node
-    /// edge — a subject-prefix scan keeping only `Ref` objects and skipping the
-    /// reserved predicates (`rdf:type`, `f:reifies*`).
+    /// One forward hop from `node`. For a simple/alternation path this is the
+    /// ref objects of `(node, p, ?)` over every traversed predicate. For a
+    /// composite path `(p1/p2/…)+` it follows the whole sub-path — the first
+    /// step (`predicates`, `first_inverse`) then each `sequence_steps` entry,
+    /// each honoring its own direction. For a wildcard (untyped Cypher) path it
+    /// follows **any** node→node edge — a subject-prefix scan keeping only `Ref`
+    /// objects and skipping the reserved predicates (`rdf:type`, `f:reifies*`).
     async fn forward_step(&self, ctx: &ExecutionContext<'_>, node: &Sid) -> Result<Vec<Sid>> {
-        let (db, overlay, to_t) = ctx.require_single_graph()?;
-        let mut out = Vec::new();
         if self.pattern.wildcard {
+            let (db, overlay, to_t) = ctx.require_single_graph()?;
+            let mut out = Vec::new();
             let range_match = RangeMatch::new().with_subject(node.clone());
             let flakes = range_with_overlay(
                 db,
@@ -195,38 +197,37 @@ impl PropertyPathOperator {
             }
             return Ok(out);
         }
-        for pred in &self.pattern.predicates {
-            let range_match = RangeMatch::new()
-                .with_subject(node.clone())
-                .with_predicate(pred.clone());
-            let flakes = range_with_overlay(
-                db,
-                ctx.binary_g_id,
-                overlay,
-                IndexType::Spot,
-                RangeTest::Eq,
-                range_match,
-                RangeOptions::new().with_to_t(to_t),
+        // Simple/alternation/composite (SPARQL): a forward step reads SPOT, an
+        // inverse step reads POST (`^p` follows object→subject).
+        let mut frontier = self
+            .read_step(
+                ctx,
+                std::slice::from_ref(node),
+                &self.pattern.predicates,
+                self.pattern.first_inverse,
             )
             .await?;
-            let flakes = self.filter_edges(ctx, flakes).await?;
-            for flake in flakes {
-                if let FlakeValue::Ref(o) = flake.o {
-                    out.push(o);
-                }
+        for step in &self.pattern.sequence_steps {
+            if frontier.is_empty() {
+                break;
             }
+            frontier = self
+                .read_step(ctx, &frontier, &step.predicates, step.inverse)
+                .await?;
         }
-        Ok(out)
+        Ok(frontier)
     }
 
-    /// One backward hop into `node`: the subjects of `(?, p, node)`. Fixed paths
-    /// union over the traversed predicate(s); a wildcard path follows any
-    /// node→node edge backward — an object-prefix scan (OPST) skipping the
-    /// reserved predicates.
+    /// One backward hop into `node`: the sources from which a single hop reaches
+    /// `node`. For a composite path it walks the unit in reverse, each step
+    /// retreated the opposite way it is advanced (a forward step retreats via
+    /// POST, an inverse step via SPOT). For a wildcard (untyped Cypher) path it
+    /// follows any node→node edge backward — an object-prefix scan (OPST)
+    /// skipping the reserved predicates.
     async fn backward_step(&self, ctx: &ExecutionContext<'_>, node: &Sid) -> Result<Vec<Sid>> {
-        let (db, overlay, to_t) = ctx.require_single_graph()?;
-        let mut out = Vec::new();
         if self.pattern.wildcard {
+            let (db, overlay, to_t) = ctx.require_single_graph()?;
+            let mut out = Vec::new();
             let range_match = RangeMatch::new().with_object(FlakeValue::Ref(node.clone()));
             let flakes = range_with_overlay(
                 db,
@@ -247,23 +248,83 @@ impl PropertyPathOperator {
             }
             return Ok(out);
         }
-        for pred in &self.pattern.predicates {
-            let range_match = RangeMatch::new()
-                .with_predicate(pred.clone())
-                .with_object(FlakeValue::Ref(node.clone()));
-            let flakes = range_with_overlay(
-                db,
-                ctx.binary_g_id,
-                overlay,
-                IndexType::Post,
-                RangeTest::Eq,
-                range_match,
-                RangeOptions::new().with_to_t(to_t),
-            )
-            .await?;
-            let flakes = self.filter_edges(ctx, flakes).await?;
-            for flake in flakes {
-                out.push(flake.s);
+        let mut frontier = vec![node.clone()];
+        for step in self.pattern.sequence_steps.iter().rev() {
+            frontier = self
+                .read_step(ctx, &frontier, &step.predicates, !step.inverse)
+                .await?;
+            if frontier.is_empty() {
+                return Ok(frontier);
+            }
+        }
+        self.read_step(
+            ctx,
+            &frontier,
+            &self.pattern.predicates,
+            !self.pattern.first_inverse,
+        )
+        .await
+    }
+
+    /// Advance a frontier across one step in a chosen index direction: the
+    /// deduped union over every `n` in `nodes` and every predicate in `preds`.
+    /// `use_post = false` reads SPOT (subject `n` → ref objects); `use_post =
+    /// true` reads POST (object `n` ← subjects). Forward traversal of a forward
+    /// step (and backward traversal of an inverse step) uses SPOT; the opposite
+    /// pairings use POST.
+    async fn read_step(
+        &self,
+        ctx: &ExecutionContext<'_>,
+        nodes: &[Sid],
+        preds: &[Sid],
+        use_post: bool,
+    ) -> Result<Vec<Sid>> {
+        let (db, overlay, to_t) = ctx.require_single_graph()?;
+        let mut out = Vec::new();
+        let mut seen: HashSet<Sid> = HashSet::new();
+        for node in nodes {
+            for pred in preds {
+                let (index, range_match) = if use_post {
+                    (
+                        IndexType::Post,
+                        RangeMatch::new()
+                            .with_predicate(pred.clone())
+                            .with_object(FlakeValue::Ref(node.clone())),
+                    )
+                } else {
+                    (
+                        IndexType::Spot,
+                        RangeMatch::new()
+                            .with_subject(node.clone())
+                            .with_predicate(pred.clone()),
+                    )
+                };
+                let flakes = range_with_overlay(
+                    db,
+                    ctx.binary_g_id,
+                    overlay,
+                    index,
+                    RangeTest::Eq,
+                    range_match,
+                    RangeOptions::new().with_to_t(to_t),
+                )
+                .await?;
+                let flakes = self.filter_edges(ctx, flakes).await?;
+                for flake in flakes {
+                    // POST yields the subject side; SPOT yields the ref object.
+                    let next = if use_post {
+                        Some(flake.s)
+                    } else if let FlakeValue::Ref(o) = flake.o {
+                        Some(o)
+                    } else {
+                        None
+                    };
+                    if let Some(n) = next {
+                        if seen.insert(n.clone()) {
+                            out.push(n);
+                        }
+                    }
+                }
             }
         }
         Ok(out)
@@ -366,6 +427,19 @@ impl PropertyPathOperator {
         if self.pattern.max_hops.is_some() {
             return self.traverse_bounded(ctx, start, true, None).await;
         }
+        // ZeroOrOne (`p?`): the start node itself (zero-length) plus its direct
+        // neighbors (one hop) — no transitive closure.
+        if self.pattern.modifier == PathModifier::ZeroOrOne {
+            let mut results: Vec<Sid> = vec![start.clone()];
+            let mut seen: HashSet<Sid> = HashSet::from([start.clone()]);
+            for obj in self.forward_step(ctx, start).await? {
+                if seen.insert(obj.clone()) {
+                    results.push(obj);
+                }
+            }
+            return Ok(results);
+        }
+
         let mut visited: HashSet<Sid> = HashSet::new();
         let mut queue: VecDeque<(Sid, u32)> = VecDeque::new();
         let mut results: Vec<Sid> = Vec::new();
@@ -433,6 +507,19 @@ impl PropertyPathOperator {
         if self.pattern.max_hops.is_some() {
             return self.traverse_bounded(ctx, target, false, None).await;
         }
+        // ZeroOrOne (`p?`): the target node itself (zero-length) plus its direct
+        // predecessors (one backward hop) — no transitive closure.
+        if self.pattern.modifier == PathModifier::ZeroOrOne {
+            let mut results: Vec<Sid> = vec![target.clone()];
+            let mut seen: HashSet<Sid> = HashSet::from([target.clone()]);
+            for src in self.backward_step(ctx, target).await? {
+                if seen.insert(src.clone()) {
+                    results.push(src);
+                }
+            }
+            return Ok(results);
+        }
+
         let mut visited: HashSet<Sid> = HashSet::new();
         let mut queue: VecDeque<(Sid, u32)> = VecDeque::new();
         let mut results: Vec<Sid> = Vec::new();
@@ -488,6 +575,41 @@ impl PropertyPathOperator {
     ///
     /// Returns pairs (start, reachable) consistent with modifier semantics.
     async fn compute_closure(&self, ctx: &ExecutionContext<'_>) -> Result<Vec<(Sid, Sid)>> {
+        // Composite hops aren't a single readable edge, so the in-memory
+        // adjacency shortcut below doesn't apply. Seed from every node that can
+        // begin a hop and run the composite-aware forward traversal from each.
+        //
+        // NOTE: this both-unbound composite closure is not optimized — it runs a
+        // separate per-frontier BFS for each start rather than building a
+        // reusable adjacency map, so `?s (a/b)+ ?o` over a large graph can be
+        // expensive. The bound-endpoint cases (one side fixed) stay cheap.
+        if self.pattern.is_composite() {
+            let starts = self.composite_start_candidates(ctx).await?;
+            let start_set: HashSet<Sid> = starts.iter().cloned().collect();
+            let mut out = Vec::new();
+            for start in &starts {
+                for reachable in self.traverse_forward(ctx, start).await? {
+                    out.push((start.clone(), reachable));
+                }
+            }
+            // For `*`/`?` the zero-length path pairs every node in the path's
+            // domain with itself. `traverse_forward` already emits `(n, n)` for
+            // start nodes; add the self-pair for domain nodes that are only
+            // composite *endpoints* (never a hop start), matching the
+            // simple-path closure which tracks both subjects and objects.
+            if matches!(
+                self.pattern.modifier,
+                PathModifier::ZeroOrMore | PathModifier::ZeroOrOne
+            ) {
+                for node in self.composite_domain_nodes(ctx).await? {
+                    if !start_set.contains(&node) {
+                        out.push((node.clone(), node));
+                    }
+                }
+            }
+            return Ok(out);
+        }
+
         // Pull all edges for every traversed predicate using PSOT
         // (predicate-indexed) and merge them into one adjacency map — for an
         // alternation path `(a|b)*` the closure spans both predicates' edges.
@@ -541,6 +663,24 @@ impl PropertyPathOperator {
         }
 
         let mut out: Vec<(Sid, Sid)> = Vec::new();
+
+        // ZeroOrOne (`p?`): each node maps to itself (zero-length) and to its
+        // direct neighbors (one hop) — no closure.
+        if self.pattern.modifier == PathModifier::ZeroOrOne {
+            for n in &nodes {
+                let mut seen: HashSet<Sid> = HashSet::from([n.clone()]);
+                out.push((n.clone(), n.clone()));
+                if let Some(nexts) = adj.get(n) {
+                    for m in nexts {
+                        if seen.insert(m.clone()) {
+                            out.push((n.clone(), m.clone()));
+                        }
+                    }
+                }
+            }
+            return Ok(out);
+        }
+
         for start in &nodes {
             // Poll cancellation per start node: a both-vars-unbound closure over a
             // dense graph runs `nodes × edges × depth` work, and the bounded
@@ -638,6 +778,82 @@ impl PropertyPathOperator {
         Ok(out)
     }
 
+    /// The nodes from which a composite hop can begin — the endpoints touched by
+    /// the first step: its edges' subjects for a forward leading step, or their
+    /// ref objects when the leading step is inverse. Used to seed the
+    /// both-unbound closure.
+    async fn composite_start_candidates(&self, ctx: &ExecutionContext<'_>) -> Result<Vec<Sid>> {
+        let (db, overlay, to_t) = ctx.require_single_graph()?;
+        let mut seen: HashSet<Sid> = HashSet::new();
+        let mut out = Vec::new();
+        for pred in &self.pattern.predicates {
+            let range_match = RangeMatch::predicate(pred.clone());
+            let flakes = range_with_overlay(
+                db,
+                ctx.binary_g_id,
+                overlay,
+                IndexType::Psot,
+                RangeTest::Eq,
+                range_match,
+                RangeOptions::new().with_to_t(to_t),
+            )
+            .await?;
+            let flakes = self.filter_edges(ctx, flakes).await?;
+            for flake in flakes {
+                let candidate = if self.pattern.first_inverse {
+                    match flake.o {
+                        FlakeValue::Ref(o) => Some(o),
+                        _ => None,
+                    }
+                } else {
+                    Some(flake.s)
+                };
+                if let Some(c) = candidate {
+                    if seen.insert(c.clone()) {
+                        out.push(c);
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Every node touched by any step of a composite path — the subjects and ref
+    /// objects of all step predicates. This is the domain over which a `*`/`?`
+    /// zero-length match pairs each node with itself (mirrors how the simple-path
+    /// closure tracks both subjects and objects).
+    async fn composite_domain_nodes(&self, ctx: &ExecutionContext<'_>) -> Result<HashSet<Sid>> {
+        let (db, overlay, to_t) = ctx.require_single_graph()?;
+        let mut nodes: HashSet<Sid> = HashSet::new();
+        let all_preds = self.pattern.predicates.iter().chain(
+            self.pattern
+                .sequence_steps
+                .iter()
+                .flat_map(|s| s.predicates.iter()),
+        );
+        for pred in all_preds {
+            let range_match = RangeMatch::predicate(pred.clone());
+            let flakes = range_with_overlay(
+                db,
+                ctx.binary_g_id,
+                overlay,
+                IndexType::Psot,
+                RangeTest::Eq,
+                range_match,
+                RangeOptions::new().with_to_t(to_t),
+            )
+            .await?;
+            let flakes = self.filter_edges(ctx, flakes).await?;
+            for flake in flakes {
+                nodes.insert(flake.s);
+                if let FlakeValue::Ref(o) = flake.o {
+                    nodes.insert(o);
+                }
+            }
+        }
+        Ok(nodes)
+    }
+
     /// Check if a path exists between two nodes
     ///
     /// Used for reachability filter when both subject and object are bound.
@@ -665,6 +881,18 @@ impl PropertyPathOperator {
             && self.emit_at_depth(0)
         {
             return Ok(true);
+        }
+
+        // ZeroOrOne (`p?`): zero-length (start == target) or a single direct hop.
+        if self.pattern.modifier == PathModifier::ZeroOrOne {
+            if start == target {
+                return Ok(true);
+            }
+            return Ok(self
+                .forward_step(ctx, start)
+                .await?
+                .iter()
+                .any(|o| o == target));
         }
 
         let mut visited: HashSet<Sid> = HashSet::new();
