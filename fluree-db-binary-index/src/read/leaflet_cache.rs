@@ -305,12 +305,22 @@ pub struct CachedOverlaySegment {
 }
 
 impl CachedOverlaySegment {
-    /// Approximate heap size, for the moka byte weigher.
+    /// Approximate heap size, for the moka byte weigher. Counts the `Arc<[T]>`
+    /// payloads, the flake heaps, and — the part a naive `len * size_of` misses
+    /// — the `HashMap` table capacity plus each predicate `Sid`'s `Arc<str>`
+    /// name heap, which dominates for novelty-only-predicate-heavy overlays.
     pub fn byte_size(&self) -> usize {
-        std::mem::size_of::<Self>()
-            + self.ops.len() * std::mem::size_of::<OverlayOp>()
-            + self.untranslated.iter().map(Flake::size_bytes).sum::<usize>()
-            + self.ephemeral_preds.len() * (std::mem::size_of::<Sid>() + std::mem::size_of::<u32>())
+        // Arc<[T]> control block (strong+weak counts + slice len), x3 fields.
+        const ARC_SLICE_OVERHEAD: usize = 3 * 2 * std::mem::size_of::<usize>();
+        let ops = self.ops.len() * std::mem::size_of::<OverlayOp>();
+        let untranslated: usize = self.untranslated.iter().map(Flake::size_bytes).sum();
+        let eph = self.ephemeral_preds.capacity() * std::mem::size_of::<(Sid, u32)>()
+            + self
+                .ephemeral_preds
+                .keys()
+                .map(|s| s.name_str().len())
+                .sum::<usize>();
+        std::mem::size_of::<Self>() + ARC_SLICE_OVERHEAD + ops + untranslated + eph
     }
 }
 

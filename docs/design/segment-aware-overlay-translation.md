@@ -97,12 +97,24 @@ ephemeral predicate id is not cached** (§2.3.2).
 **(d) Scan-time assembly — Task #4.** Replace the whole-graph translate in `open()` with:
 gather the graph's current segments via the trait; per segment apply the **t zone-map**
 (skip if `min_t > to_t`; no per-flake filter if `max_t <= to_t`; per-flake only on a
-straddling compacted segment) and the cursor **key window** (`overlay_window_for_range`
-on the cached integer ops — cheap); **k-way merge** the per-segment op runs in `order`;
-**then** `resolve_overlay_ops` over the merged stream. Feed `set_overlay_ops_window`.
-Stream each contributing segment's `untranslated` flakes after the cursor (per-segment,
-so no global fallback). If any contributing segment is uncacheable (ad-hoc ephemeral),
-fall back to the whole-graph path for the whole assembly.
+straddling compacted segment); **k-way merge** the per-segment op runs in `order` (a
+run-adaptive stable sort of the concatenated runs); **then** `resolve_overlay_ops` over
+the merged stream. Stream each contributing segment's `untranslated` flakes after the
+cursor (per-segment, so no global fallback). If any contributing segment is uncacheable
+(ad-hoc ephemeral), fall back to the whole-graph path for the whole assembly.
+
+**As-built note — the cursor key window is applied AFTER the merge, not during
+assembly (revising v1's "per-segment window").** The assembled **full** (un-windowed)
+merged product is what gets cached in `global_translation_cache` per epoch, so it must be
+complete to be reusable across queries with *different* key windows — windowing
+per-segment before the merge would make the cached product window-specific and defeat
+warm-repeat reuse. So `open()` caches the full merged product and applies the cursor
+window (`overlay_window_for_range` → `set_overlay_ops_window`) to it at cursor attach.
+Consequence (a known cost): a **selective** cold query still copies `O(total translated
+ops)` on a global-cache miss, even though it only needs its key window. Eliminating that
+without losing warm-repeat reuse means **per-predicate-scoped** assembly (compose with the
+deferred gap-#1 work) — translate/merge only the bound predicate's slice — rather than
+window-during-assembly; deferred.
 
 ### 2.3 Correctness invariants (non-negotiable)
 
