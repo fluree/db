@@ -169,7 +169,15 @@ pub fn resolve_overlay_ops(ops: &mut Vec<OverlayOp>) {
         let key = ops[read].fact_key();
         read += 1;
         while read < ops.len() && ops[read].fact_key() == key {
-            if ops[read].t > ops[best].t {
+            // Keep the highest-t op; on a same-t tie prefer the retract, so an
+            // assert+retract of the same fact in one commit resolves to absent
+            // (consistent with the per-commit apply path). The accumulator dedups
+            // within a txn so the tie is currently unreachable, but the
+            // segment-aware assembly merges runs across segments — keep it
+            // deterministic rather than dependent on sort position.
+            let better = ops[read].t > ops[best].t
+                || (ops[read].t == ops[best].t && !ops[read].op && ops[best].op);
+            if better {
                 best = read;
             }
             read += 1;
