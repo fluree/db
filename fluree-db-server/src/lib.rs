@@ -694,9 +694,10 @@ impl FlureeServerBuilder {
                     &integration.raft,
                 ));
             let liveness_monitor =
-                fluree_db_consensus::raft::liveness_monitor::LivenessMonitor::new(Arc::clone(
-                    &integration.raft,
-                ))
+                fluree_db_consensus::raft::liveness_monitor::LivenessMonitor::new(
+                    Arc::clone(&integration.raft),
+                    integration.shared_state.clone(),
+                )
                 .with_config(self.liveness_config.clone());
             let spawn_leader_tasks = move || {
                 let nameservice: std::sync::Arc<dyn fluree_db_nameservice::IndexingNameService> =

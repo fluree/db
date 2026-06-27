@@ -15,10 +15,14 @@
 //!
 //! Per-process scope: trackers live in the [`run`](LivenessMonitor::run)
 //! loop and disappear when the leader watcher aborts the task on
-//! leader transition. The next leader's monitor starts fresh; the
-//! replicated `worker_eligible_voters` survives the gap.
+//! leader transition. The next leader's monitor seeds each tracker's
+//! hysteresis from the replicated `worker_eligible_voters` set on
+//! first observation, so demotions a prior leader landed survive the
+//! gap and the Promote path can still fire when the demoted peer
+//! demonstrates recovery on the new leader.
 
 use crate::raft::state_machine::{Command as SmCommand, Response as SmResponse, WorkerEligibility};
+use crate::raft::state_machine_adapter::SharedState;
 use crate::raft::{NodeId, TypeConfig};
 use openraft::{LogId, Raft};
 use std::collections::HashMap;
@@ -96,20 +100,44 @@ struct PeerTracker {
     /// check measures elapsed time since the *first* post-demotion
     /// advance, not the most recent one.
     recovering_since: Option<Instant>,
-    /// The last [`EligibilityProposal`] this monitor landed for the
-    /// peer, or `None` if it's never proposed. Read as hysteresis:
-    /// re-propose only when the desired proposal differs from the
-    /// last one we landed.
+    /// The last [`EligibilityProposal`] this monitor expects the
+    /// replicated state to reflect for this peer. Seeded from
+    /// [`NameServiceState::worker_eligible_voters`](crate::raft::state_machine::NameServiceState::worker_eligible_voters)
+    /// when the tracker is first created — so a peer the prior
+    /// leader's monitor demoted carries `Some(Demote)` into the new
+    /// leader's tracker — and updated whenever this monitor's own
+    /// propose lands. Read as hysteresis: re-propose only when the
+    /// desired proposal differs from this.
     last_proposed: Option<EligibilityProposal>,
 }
 
 impl PeerTracker {
-    fn new() -> Self {
+    /// Tracker for a peer the replicated state shows as eligible.
+    /// Used both for monitor startup against a peer that has never
+    /// been demoted, and for newly-added voters whose first appearance
+    /// in the eligible set is part of the membership change that
+    /// added them.
+    fn for_eligible_peer() -> Self {
         Self {
             last_observed_log: None,
             unreachable_since: None,
             recovering_since: None,
             last_proposed: None,
+        }
+    }
+
+    /// Tracker for a peer the replicated state shows as ineligible.
+    /// Seeds `last_proposed` as if this monitor itself had landed
+    /// the Demote, so the Promote path fires when the peer
+    /// demonstrates recovery — covering the case where a prior
+    /// leader's monitor proposed the demotion and this leader's
+    /// fresh trackers wouldn't otherwise carry that history.
+    fn for_ineligible_peer() -> Self {
+        Self {
+            last_observed_log: None,
+            unreachable_since: None,
+            recovering_since: None,
+            last_proposed: Some(EligibilityProposal::Demote),
         }
     }
 }
@@ -121,13 +149,15 @@ impl PeerTracker {
 #[derive(Clone)]
 pub struct LivenessMonitor {
     raft: Arc<Raft<TypeConfig>>,
+    shared_state: SharedState,
     config: LivenessConfig,
 }
 
 impl LivenessMonitor {
-    pub fn new(raft: Arc<Raft<TypeConfig>>) -> Self {
+    pub fn new(raft: Arc<Raft<TypeConfig>>, shared_state: SharedState) -> Self {
         Self {
             raft,
+            shared_state,
             config: LivenessConfig::default(),
         }
     }
@@ -205,8 +235,24 @@ impl LivenessMonitor {
             (leader_last_log, peers, configured_voters)
         };
 
+        // Snapshot the replicated eligible set so every per-peer
+        // tracker created in this tick reads a consistent view, and
+        // so the per-peer awaits below don't hold the state lock
+        // against writers. Cloning a `BTreeSet<NodeId>` is cheap at
+        // realistic cluster sizes.
+        let eligible_voters = {
+            let state = self.shared_state.read().await;
+            state.worker_eligible_voters.clone()
+        };
+
         for (peer_id, peer_log) in peers {
-            let tracker = trackers.entry(peer_id).or_insert_with(PeerTracker::new);
+            let tracker = trackers.entry(peer_id).or_insert_with(|| {
+                if eligible_voters.contains(&peer_id) {
+                    PeerTracker::for_eligible_peer()
+                } else {
+                    PeerTracker::for_ineligible_peer()
+                }
+            });
             record_replication_progress(tracker, peer_log, leader_last_log, now);
             match next_eligibility_proposal(tracker, now, &self.config) {
                 Some(EligibilityProposal::Promote) if self.propose_eligible(peer_id).await => {
@@ -450,7 +496,7 @@ mod tests {
         // some log id. No prior proposal to override, no lag to
         // record — the monitor stays silent.
         let now = Instant::now();
-        let mut tracker = PeerTracker::new();
+        let mut tracker = PeerTracker::for_eligible_peer();
         let decision = tick(
             &mut tracker,
             Some(log_id(1, 5)),
@@ -470,7 +516,7 @@ mod tests {
         // 5. After `unreachable_after` elapses, demote.
         let cfg = fast_config();
         let t0 = Instant::now();
-        let mut tracker = PeerTracker::new();
+        let mut tracker = PeerTracker::for_eligible_peer();
         let _ = tick(&mut tracker, Some(log_id(1, 5)), Some(5), t0, &cfg);
         // Leader runs ahead, peer doesn't follow.
         let t1 = t0 + cfg.sample_interval;
@@ -494,7 +540,7 @@ mod tests {
         // `last_proposed == Some(Demote)` and bails.
         let cfg = fast_config();
         let t0 = Instant::now();
-        let mut tracker = PeerTracker::new();
+        let mut tracker = PeerTracker::for_eligible_peer();
         let _ = tick(&mut tracker, Some(log_id(1, 5)), Some(5), t0, &cfg);
         let t1 = t0 + cfg.unreachable_after;
         let _ = tick(&mut tracker, Some(log_id(1, 5)), Some(10), t1, &cfg);
@@ -511,9 +557,8 @@ mod tests {
         // the recovery window; once `live_after` elapses, promote.
         let cfg = fast_config();
         let t0 = Instant::now();
-        let mut tracker = PeerTracker::new();
+        let mut tracker = PeerTracker::for_ineligible_peer();
         tracker.last_observed_log = Some(log_id(1, 5));
-        tracker.last_proposed = Some(EligibilityProposal::Demote);
         // First advance after demotion starts recovering_since.
         let t1 = t0 + cfg.sample_interval;
         let d1 = tick(&mut tracker, Some(log_id(1, 6)), Some(10), t1, &cfg);
@@ -550,9 +595,8 @@ mod tests {
         // ever firing a promote.
         let cfg = fast_config();
         let t0 = Instant::now();
-        let mut tracker = PeerTracker::new();
+        let mut tracker = PeerTracker::for_ineligible_peer();
         tracker.last_observed_log = Some(log_id(1, 5));
-        tracker.last_proposed = Some(EligibilityProposal::Demote);
         // Brief advance.
         let t1 = t0 + cfg.sample_interval;
         let _ = tick(&mut tracker, Some(log_id(1, 6)), Some(10), t1, &cfg);
@@ -574,7 +618,7 @@ mod tests {
         // unreachable.
         let cfg = fast_config();
         let t0 = Instant::now();
-        let mut tracker = PeerTracker::new();
+        let mut tracker = PeerTracker::for_eligible_peer();
         tracker.last_observed_log = Some(log_id(1, 5));
         // Many ticks pass; nothing advances.
         for i in 1..50 {
@@ -592,7 +636,7 @@ mod tests {
         // resets — no demote.
         let cfg = fast_config();
         let t0 = Instant::now();
-        let mut tracker = PeerTracker::new();
+        let mut tracker = PeerTracker::for_eligible_peer();
         let _ = tick(&mut tracker, Some(log_id(1, 5)), Some(5), t0, &cfg);
         let t1 = t0 + cfg.sample_interval;
         let _ = tick(&mut tracker, Some(log_id(1, 5)), Some(10), t1, &cfg);
@@ -612,7 +656,7 @@ mod tests {
         // monitor itself put in place.
         let cfg = fast_config();
         let t0 = Instant::now();
-        let mut tracker = PeerTracker::new();
+        let mut tracker = PeerTracker::for_eligible_peer();
         let _ = tick(&mut tracker, Some(log_id(1, 5)), Some(5), t0, &cfg);
         let t1 = t0 + cfg.live_after * 10;
         let d = tick(&mut tracker, Some(log_id(1, 10)), Some(10), t1, &cfg);
@@ -629,7 +673,7 @@ mod tests {
         // headroom, and the monitor needs to retry then.
         let cfg = fast_config();
         let t0 = Instant::now();
-        let mut tracker = PeerTracker::new();
+        let mut tracker = PeerTracker::for_eligible_peer();
         // Build up to a Demote decision: healthy sample, then a
         // stuck sample, then enough time for `unreachable_after`.
         let _ = tick_with_outcome(&mut tracker, Some(log_id(1, 5)), Some(5), t0, &cfg, true);
@@ -672,9 +716,8 @@ mod tests {
         // so the next tick re-proposes Promote.
         let cfg = fast_config();
         let t0 = Instant::now();
-        let mut tracker = PeerTracker::new();
+        let mut tracker = PeerTracker::for_ineligible_peer();
         tracker.last_observed_log = Some(log_id(1, 5));
-        tracker.last_proposed = Some(EligibilityProposal::Demote);
         // First advance after demotion starts recovering_since.
         let t1 = t0 + cfg.sample_interval;
         let _ = tick_with_outcome(&mut tracker, Some(log_id(1, 6)), Some(10), t1, &cfg, true);
@@ -696,6 +739,46 @@ mod tests {
             second,
             Some(EligibilityProposal::Promote),
             "next tick must re-propose Promote because the prior apply didn't land"
+        );
+    }
+
+    #[test]
+    fn fresh_tracker_for_replicated_ineligible_peer_promotes_on_recovery() {
+        // Leader transition: the prior leader's monitor demoted the
+        // peer (replicated `worker_eligible_voters` no longer
+        // contains it). The new leader's monitor builds a fresh
+        // tracker on first observation. Without the seed from
+        // replicated state, `last_proposed` would be `None` and
+        // the Promote arm (which fires only against a
+        // `Some(Demote)` hysteresis) would never propose — the
+        // demotion would stick across every leader transition even
+        // after the peer recovers.
+        let cfg = fast_config();
+        let t0 = Instant::now();
+        // The replicated state shows this peer as ineligible.
+        let mut tracker = PeerTracker::for_ineligible_peer();
+        assert_eq!(
+            tracker.last_proposed,
+            Some(EligibilityProposal::Demote),
+            "tracker for an ineligible peer seeds as if this monitor demoted it"
+        );
+        // First sample on the new leader: peer advances. Starts
+        // recovering_since.
+        let t1 = t0 + cfg.sample_interval;
+        let d1 = tick(&mut tracker, Some(log_id(1, 6)), Some(10), t1, &cfg);
+        assert_eq!(
+            d1, None,
+            "recovery anchor just started; live_after not elapsed"
+        );
+        assert_eq!(tracker.recovering_since, Some(t1));
+        // Past live_after.
+        let t2 = t1 + cfg.live_after;
+        let d2 = tick(&mut tracker, Some(log_id(1, 7)), Some(10), t2, &cfg);
+        assert_eq!(
+            d2,
+            Some(EligibilityProposal::Promote),
+            "monitor promotes the peer the prior leader demoted, restoring \
+             eligibility once it demonstrates recovery"
         );
     }
 }
