@@ -215,9 +215,7 @@ fn eval_dec(expr: &Expression, vars: &[(VarId, Option<Dec>)]) -> DecEval {
             (Function::Sub, [a, b]) => combine_dec(eval_dec(a, vars), eval_dec(b, vars), |x, y| {
                 x.add_sub(y, true)
             }),
-            (Function::Mul, [a, b]) => {
-                combine_dec(eval_dec(a, vars), eval_dec(b, vars), Dec::mul)
-            }
+            (Function::Mul, [a, b]) => combine_dec(eval_dec(a, vars), eval_dec(b, vars), Dec::mul),
             (Function::Negate, [a]) => match eval_dec(a, vars) {
                 DecEval::Val(d) => match d.val.checked_neg() {
                     Some(val) => DecEval::Val(Dec {
