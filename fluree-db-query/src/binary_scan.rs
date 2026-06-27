@@ -15,7 +15,8 @@ use fluree_db_binary_index::format::column_block::ColumnId;
 use fluree_db_binary_index::read::column_types::ColumnSet;
 use fluree_db_binary_index::{
     resolve_overlay_ops, sort_overlay_ops, sort_overlay_ops_stable, BinaryCursor, BinaryFilter,
-    BinaryGraphView, BinaryIndexStore, ColumnBatch, ColumnProjection, OverlayOp,
+    BinaryGraphView, BinaryIndexStore, CachedOverlaySegment, ColumnBatch, ColumnProjection,
+    LeafletCache, OverlayOp,
 };
 use fluree_db_core::o_type::{DecodeKind, OType};
 use fluree_db_core::subject_id::SubjectId;
@@ -2436,67 +2437,19 @@ pub fn translate_overlay_flakes_with_untranslated(
 // See docs/design/segment-aware-overlay-translation.md.
 // ============================================================================
 
-/// Identity of one segment's translation. `store_id` (process-unique per store
-/// instance) identifies the FROZEN dictionary id-assignment the translation
-/// reads; `seg_id` identifies the immutable segment's content. Ordinary commits
-/// reuse the same store, so the key survives them (cross-commit reuse is the
-/// point); any from-scratch dict rebuild constructs a new store → new `store_id`
-/// → cache bypass. `store_id` is used instead of `store_max_t` because a
-/// same-`index_t` rebuild (refresh-on-new-namespace) re-ranks dict ids at an
-/// unchanged `store_max_t` — see SOUNDNESS note in `docs/design/`. The overlay
-/// epoch + `to_t` are deliberately excluded; `to_t` is applied after the merge.
-#[derive(Clone, PartialEq, Eq, Hash)]
-struct SegmentOpsKey {
-    store_id: u64,
-    seg_id: u64,
-    index: IndexType,
-}
-
-/// A segment's cached translation: ops sorted by the index order but **not**
-/// lifecycle-resolved and **not** `to_t`-filtered, the `@vector`/unsupported
-/// flakes, and the stable novelty-predicate id map (only entries backed by the
-/// shared dictionaries — a segment needing an ad-hoc ephemeral id is never
-/// cached, so all ids here are mergeable across segments).
-struct CachedSegmentOps {
-    ops: Arc<[OverlayOp]>,
-    untranslated: Arc<[Flake]>,
-    ephemeral_preds: Arc<EphemeralPredicateMap>,
-}
-
-impl CachedSegmentOps {
-    /// Approximate heap size, for the byte-weighted cache budget.
-    fn byte_size(&self) -> usize {
-        std::mem::size_of::<Self>()
-            + self.ops.len() * std::mem::size_of::<OverlayOp>()
-            + self.untranslated.iter().map(Flake::size_bytes).sum::<usize>()
-            + self.ephemeral_preds.len() * (std::mem::size_of::<Sid>() + std::mem::size_of::<u32>())
-    }
-}
-
-/// Byte budget for the cross-query per-segment translation cache. Uses the same
-/// byte-weighted moka / TinyLFU mechanism as the index `LeafletCache`, as a
-/// DEDICATED budget for now; folding it into the LeafletCache shared pool
-/// ("one pool, one budget") is a follow-up — see the design doc §2.6.
-const SEGMENT_OPS_CACHE_BYTES: u64 = 128 * 1024 * 1024;
-
-fn global_segment_ops_cache() -> &'static moka::sync::Cache<SegmentOpsKey, Arc<CachedSegmentOps>> {
-    use once_cell::sync::Lazy;
-    static CACHE: Lazy<moka::sync::Cache<SegmentOpsKey, Arc<CachedSegmentOps>>> = Lazy::new(|| {
-        moka::sync::Cache::builder()
-            .weigher(|_k: &SegmentOpsKey, v: &Arc<CachedSegmentOps>| {
-                v.byte_size().min(u32::MAX as usize) as u32
-            })
-            .max_capacity(SEGMENT_OPS_CACHE_BYTES)
-            .build()
-    });
-    &CACHE
-}
-
 /// Translate (and cache) one segment's flakes into sorted, unresolved overlay
 /// ops. Returns `None` when the segment cannot be cached/merged — a translation
 /// failure or an ad-hoc ephemeral predicate id (detected by the
 /// `next_ephemeral_p_id` counter moving) — so the caller falls back to the
 /// whole-graph path for the whole assembly.
+///
+/// Caching uses the shared `LeafletCache` byte budget ("one pool, one budget"),
+/// keyed by `segment_ops_key(store_id, seg_id, index)`. `store_id`
+/// (process-unique per store instance) is what makes the key sound: a dictionary
+/// rebuild constructs a fresh store (new id → no stale reuse), while ordinary
+/// commits reuse the same store (cross-commit reuse preserved). With no leaflet
+/// cache attached, the segment is translated fresh (no cross-query reuse) but
+/// still correct.
 #[allow(clippy::too_many_arguments)]
 fn translate_segment_cached(
     overlay: &dyn OverlayProvider,
@@ -2507,14 +2460,13 @@ fn translate_segment_cached(
     index: IndexType,
     order: RunSortOrder,
     seg_id: u64,
-) -> Option<Arc<CachedSegmentOps>> {
-    let key = SegmentOpsKey {
-        store_id: store.store_id(),
-        seg_id,
-        index,
-    };
-    if let Some(hit) = global_segment_ops_cache().get(&key) {
-        return Some(hit);
+) -> Option<Arc<CachedOverlaySegment>> {
+    let cache = store.leaflet_cache();
+    let cache_key = LeafletCache::segment_ops_key(store.store_id(), seg_id, index);
+    if let Some(c) = cache {
+        if let Some(hit) = c.get_segment_ops(cache_key) {
+            return Some(hit);
+        }
     }
 
     let base_p_id = runtime_small_dicts
@@ -2554,12 +2506,14 @@ fn translate_segment_cached(
 
     sort_overlay_ops(&mut ops, order);
 
-    let entry = Arc::new(CachedSegmentOps {
+    let entry = Arc::new(CachedOverlaySegment {
         ops: ops.into(),
         untranslated: untranslated.into(),
         ephemeral_preds: Arc::new(ephemeral_preds),
     });
-    global_segment_ops_cache().insert(key, Arc::clone(&entry));
+    if let Some(c) = cache {
+        c.insert_segment_ops(cache_key, Arc::clone(&entry));
+    }
     Some(entry)
 }
 

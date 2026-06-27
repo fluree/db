@@ -18,8 +18,9 @@
 //!   immutable — no epoch/time dimension needed.
 
 use crate::format::leaf::DecodedLeafDirV3;
+use crate::read::types::OverlayOp;
 use fluree_db_core::subject_id::SubjectIdColumn;
-use fluree_db_core::{ListIndex, StatsView};
+use fluree_db_core::{Flake, ListIndex, Sid, StatsView};
 use moka::sync::Cache;
 use std::io;
 use std::sync::Arc;
@@ -193,6 +194,12 @@ enum CacheKey {
     /// (derived from leaf CID) — immutable, self-invalidating on rewrite.
     /// `leaflet_idx` selects which leaflet within the leaf.
     V3Batch(V3BatchCacheKey),
+    /// Translated overlay ops for ONE immutable novelty segment.
+    /// Key = `xxh3_128(store_id, seg_id, index)` — see
+    /// [`LeafletCache::segment_ops_key`]. The store-instance id makes the key
+    /// sound (a dict rebuild builds a new store → new id); see the segment-aware
+    /// overlay design doc.
+    SegmentOps(u128),
 }
 
 /// Cache key for a V3 decoded `ColumnBatch`.
@@ -285,6 +292,28 @@ impl CachedRegion2 {
     }
 }
 
+/// Translated overlay ops for one immutable novelty segment, cached in the
+/// shared pool. `ops` are sorted by the index order but **not** lifecycle-
+/// resolved or `to_t`-filtered; `untranslated` are the `@vector`/unsupported
+/// flakes; `ephemeral_preds` maps novelty-only predicate Sids to their stable
+/// (dictionary-backed) ids. Produced by the segment-aware overlay path.
+#[derive(Clone)]
+pub struct CachedOverlaySegment {
+    pub ops: Arc<[OverlayOp]>,
+    pub untranslated: Arc<[Flake]>,
+    pub ephemeral_preds: Arc<std::collections::HashMap<Sid, u32>>,
+}
+
+impl CachedOverlaySegment {
+    /// Approximate heap size, for the moka byte weigher.
+    pub fn byte_size(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + self.ops.len() * std::mem::size_of::<OverlayOp>()
+            + self.untranslated.iter().map(Flake::size_bytes).sum::<usize>()
+            + self.ephemeral_preds.len() * (std::mem::size_of::<Sid>() + std::mem::size_of::<u32>())
+    }
+}
+
 // ============================================================================
 // Unified cached value
 // ============================================================================
@@ -302,6 +331,8 @@ enum CachedEntry {
     StatsView(Arc<StatsView>),
     /// V3 decoded column batch (base columns, no overlay/replay applied).
     V3Batch(super::column_types::ColumnBatch),
+    /// Translated overlay ops for one novelty segment.
+    SegmentOps(Arc<CachedOverlaySegment>),
 }
 
 impl CachedEntry {
@@ -322,6 +353,7 @@ impl CachedEntry {
             CachedEntry::LedgerInfo(bytes) => bytes.len(),
             CachedEntry::StatsView(view) => view.byte_size(),
             CachedEntry::V3Batch(batch) => batch.byte_size(),
+            CachedEntry::SegmentOps(seg) => seg.byte_size(),
         }
     }
 }
@@ -565,6 +597,36 @@ impl LeafletCache {
     pub fn insert_bm25_leaflet(&self, key: u128, bytes: Arc<[u8]>) {
         self.inner
             .insert(CacheKey::Bm25Leaflet(key), CachedEntry::Bm25Leaflet(bytes));
+    }
+
+    // ========================================================================
+    // Per-segment translated overlay ops (segment-aware overlay path)
+    // ========================================================================
+
+    /// Content-addressed key for one segment's translated overlay ops, from the
+    /// store-instance id, the segment id, and the index order. `store_id` makes
+    /// this sound: a dictionary rebuild constructs a fresh store (new id), so a
+    /// stale translation is never reused (see the segment-aware overlay design).
+    pub fn segment_ops_key(store_id: u64, seg_id: u64, index: fluree_db_core::IndexType) -> u128 {
+        let mut bytes = [0u8; 17];
+        bytes[0..8].copy_from_slice(&store_id.to_le_bytes());
+        bytes[8..16].copy_from_slice(&seg_id.to_le_bytes());
+        bytes[16] = index as u8;
+        xxhash_rust::xxh3::xxh3_128(&bytes)
+    }
+
+    /// Get a segment's cached translated ops (read-only, no insertion).
+    pub fn get_segment_ops(&self, key: u128) -> Option<Arc<CachedOverlaySegment>> {
+        match self.inner.get(&CacheKey::SegmentOps(key)) {
+            Some(CachedEntry::SegmentOps(v)) => Some(v),
+            _ => None,
+        }
+    }
+
+    /// Insert a segment's translated ops into the shared pool.
+    pub fn insert_segment_ops(&self, key: u128, value: Arc<CachedOverlaySegment>) {
+        self.inner
+            .insert(CacheKey::SegmentOps(key), CachedEntry::SegmentOps(value));
     }
 
     // ========================================================================
