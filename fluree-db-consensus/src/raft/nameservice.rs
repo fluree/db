@@ -696,7 +696,7 @@ impl RaftNameService {
         });
         match self.raft.client_write(cmd).await {
             Ok(_) => Ok(()),
-            Err(err) => Err(map_queue_poison_propose_error(err)),
+            Err(err) => Err(map_propose_error(err)),
         }
     }
 }
@@ -853,23 +853,50 @@ async fn handle_apply_queue_poison(
     }
 }
 
-fn map_propose_error(
+/// Translate openraft's structured `client_write` failure into one
+/// of the cross-node RPC error enums. Both
+/// [`ApplyStagedCommitError`] and [`ApplyQueuePoisonError`] carry
+/// the same two variants the leader can surface from
+/// `raft.client_write` — `NotLeader` for `ForwardToLeader`,
+/// `RaftPropose` for everything else — so the mapping is parametric
+/// in the target type and shared via this trait. The variant type
+/// already encodes which RPC failed; the `RaftPropose` message
+/// carries only the underlying error's `Display` without a
+/// per-RPC decoration.
+trait FromRaftWriteError {
+    fn not_leader(leader: Option<NodeId>) -> Self;
+    fn raft_propose(msg: String) -> Self;
+}
+
+impl FromRaftWriteError for ApplyStagedCommitError {
+    fn not_leader(leader: Option<NodeId>) -> Self {
+        Self::NotLeader { leader }
+    }
+    fn raft_propose(msg: String) -> Self {
+        Self::RaftPropose(msg)
+    }
+}
+
+impl FromRaftWriteError for ApplyQueuePoisonError {
+    fn not_leader(leader: Option<NodeId>) -> Self {
+        Self::NotLeader { leader }
+    }
+    fn raft_propose(msg: String) -> Self {
+        Self::RaftPropose(msg)
+    }
+}
+
+fn map_propose_error<E: FromRaftWriteError>(
     err: RaftError<NodeId, ClientWriteError<NodeId, ClusterNode>>,
-) -> ApplyStagedCommitError {
+) -> E {
     match err {
         RaftError::APIError(ClientWriteError::ForwardToLeader(forward)) => {
-            ApplyStagedCommitError::NotLeader {
-                leader: forward.leader_id,
-            }
+            E::not_leader(forward.leader_id)
         }
         RaftError::APIError(ClientWriteError::ChangeMembershipError(e)) => {
-            ApplyStagedCommitError::RaftPropose(format!(
-                "unexpected ChangeMembershipError on ApplyHead: {e}"
-            ))
+            E::raft_propose(format!("unexpected ChangeMembershipError: {e}"))
         }
-        RaftError::Fatal(f) => {
-            ApplyStagedCommitError::RaftPropose(format!("raft fatal during ApplyHead: {f}"))
-        }
+        RaftError::Fatal(f) => E::raft_propose(format!("raft fatal: {f}")),
     }
 }
 
@@ -914,26 +941,6 @@ fn classify_apply_staged_commit_outcome(
         ) => Err(NameServiceError::storage(format!(
             "leader rejected apply_staged_commit: {e}"
         ))),
-    }
-}
-
-fn map_queue_poison_propose_error(
-    err: RaftError<NodeId, ClientWriteError<NodeId, ClusterNode>>,
-) -> ApplyQueuePoisonError {
-    match err {
-        RaftError::APIError(ClientWriteError::ForwardToLeader(forward)) => {
-            ApplyQueuePoisonError::NotLeader {
-                leader: forward.leader_id,
-            }
-        }
-        RaftError::APIError(ClientWriteError::ChangeMembershipError(e)) => {
-            ApplyQueuePoisonError::RaftPropose(format!(
-                "unexpected ChangeMembershipError on PoisonQueueEntry: {e}"
-            ))
-        }
-        RaftError::Fatal(f) => {
-            ApplyQueuePoisonError::RaftPropose(format!("raft fatal during PoisonQueueEntry: {f}"))
-        }
     }
 }
 
