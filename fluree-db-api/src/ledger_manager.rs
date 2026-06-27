@@ -1943,18 +1943,28 @@ impl LedgerManager {
                         Arc::make_mut(&mut write_guard.state_mut().snapshot).range_provider = None;
                     }
 
+                    // Apply commits, capturing the first error instead of `?`-ing
+                    // straight out: the provider MUST be reattached even on a
+                    // mid-loop failure, or the live cached state is stranded with
+                    // `range_provider == None` and silently loses overlay
+                    // translation for this ledger until a reload.
+                    let mut apply_err = None;
                     for commit in commits {
-                        write_guard
+                        if let Err(e) = write_guard
                             .state_mut()
                             .apply_single_commit(commit, &ledger_id_canonical)
-                            .map_err(|e| ApiError::internal(format!("apply commit: {e}")))?;
+                        {
+                            apply_err = Some(ApiError::internal(format!("apply commit: {e}")));
+                            break;
+                        }
                     }
 
                     // Rebuild + reattach the provider pointing at the updated
                     // DictNovelty / runtime dicts so overlay translation resolves
                     // novelty-only strings/subjects introduced by these commits.
                     // (`apply_single_commit` mutates the dicts in place now that the
-                    // provider no longer pins them.)
+                    // provider no longer pins them.) Runs unconditionally — even
+                    // after an apply error — so the provider is never left detached.
                     if let Some(store) = provider_store {
                         let dn = Arc::clone(&write_guard.state().dict_novelty);
                         let runtime_small_dicts =
@@ -1967,6 +1977,10 @@ impl LedgerManager {
                                 runtime_small_dicts,
                                 ns_fallback,
                             )));
+                    }
+
+                    if let Some(e) = apply_err {
+                        return Err(e);
                     }
                 }
 
