@@ -273,7 +273,7 @@ impl Operator for PredicateGroupCountFirstsOperator {
                     .decode_value(o_type, o_key, p_id)
                     .map_err(|e| QueryError::Internal(format!("V6 decode_value: {e}")))?;
                 let dt = binary_index_store
-                    .resolve_datatype_sid(o_type)
+                    .resolve_datatype_sid_for_value(o_type, &val)
                     .unwrap_or_else(|| fluree_db_core::Sid::new(0, ""));
                 let lang: Option<Arc<str>> =
                     binary_index_store.resolve_lang_tag(o_type).map(Arc::from);
@@ -1570,7 +1570,7 @@ fn compute_group_by_object_star_topk(
                 .decode_value(k.o_type, k.o_key, p_id)
                 .map_err(|e| QueryError::Internal(format!("decode_value: {e}")))?;
             let dt = store
-                .resolve_datatype_sid(k.o_type)
+                .resolve_datatype_sid_for_value(k.o_type, &val)
                 .unwrap_or_else(|| Sid::new(0, ""));
             let lang = store.resolve_lang_tag(k.o_type).map(Arc::from);
             col_o1.push(Binding::Lit {
