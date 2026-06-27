@@ -432,14 +432,31 @@ where
                         // Mirror the new voter set into the replicated
                         // state machine so `apply_set_worker_eligibility`
                         // can validate against it without threading
-                        // membership through the apply signature, and
-                        // reset `worker_eligible_voters` so newly-
-                        // configured voters start eligible. Removed
-                        // voters disappear from both sets in the
-                        // same step.
-                        let new_voter_set: BTreeSet<NodeId> = m.voter_ids().collect();
-                        state.configured_voters = new_voter_set.clone();
-                        state.worker_eligible_voters = new_voter_set;
+                        // membership through the apply signature.
+                        //
+                        // Voters demoted before the change keep their
+                        // demotion if they remain in the new voter
+                        // set; newly-added voters start eligible;
+                        // removed voters disappear from both sets in
+                        // the same step. Without preserving surviving
+                        // demotions, a membership change that doesn't
+                        // drop the demoted voter (e.g. adding a new
+                        // voter to grow the cluster) re-promotes the
+                        // demoted voter, opening an
+                        // `unreachable_after`-long window where work
+                        // rendezvouses to the unreachable node.
+                        let new_voters: BTreeSet<NodeId> = m.voter_ids().collect();
+                        let surviving_demotions: BTreeSet<NodeId> = state
+                            .configured_voters
+                            .difference(&state.worker_eligible_voters)
+                            .copied()
+                            .filter(|id| new_voters.contains(id))
+                            .collect();
+                        state.worker_eligible_voters = new_voters
+                            .difference(&surviving_demotions)
+                            .copied()
+                            .collect();
+                        state.configured_voters = new_voters;
                         self.last_membership = StoredMembership::new(Some(log_id), m);
                         responses.push(Response::NoOp);
                     }
@@ -739,7 +756,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn membership_change_resets_worker_eligible_voters_to_new_set() {
+    async fn membership_change_removing_demoted_voter_drops_it_from_both_sets() {
         // A prior membership-apply seeded {1,2,3}; the leader's
         // monitor then demoted 2. The next membership-apply that
         // adds 4 and removes 2 should snap both sets to {1,3,4}
@@ -763,6 +780,62 @@ mod tests {
         let expected: BTreeSet<NodeId> = [1, 3, 4].into_iter().collect();
         assert_eq!(state.configured_voters, expected);
         // 4 starts eligible alongside the survivors, 2 is gone.
+        assert_eq!(state.worker_eligible_voters, expected);
+    }
+
+    #[tokio::test]
+    async fn membership_change_preserves_demotion_for_voter_that_survives() {
+        // A prior membership-apply seeded {1,2,3}; the leader's
+        // monitor demoted 2 (still unreachable). The next
+        // membership-apply *adds* 4 without dropping 2 — common
+        // case when growing the cluster while a node is down.
+        // 2's demotion must survive the membership change:
+        // worker_eligible_voters should be {1,3,4}, not {1,2,3,4}.
+        // Without this guard, work would rendezvous to the
+        // unreachable 2 until the monitor re-demoted it
+        // ~`unreachable_after` later.
+        let storage = Arc::new(MemoryRaftStorage::new());
+        let mut sm = StateMachineAdapter::new(storage);
+
+        sm.apply([membership_entry(1, &[1, 2, 3])]).await.unwrap();
+        let shared = sm.shared_state();
+        // Mid-life demotion of 2.
+        {
+            let mut state = shared.write().await;
+            state.worker_eligible_voters.remove(&2);
+        }
+
+        // Membership change: add 4, keep 2 in the voter set.
+        sm.apply([membership_entry(2, &[1, 2, 3, 4])])
+            .await
+            .unwrap();
+
+        let state = shared.read().await;
+        let expected_configured: BTreeSet<NodeId> = [1, 2, 3, 4].into_iter().collect();
+        let expected_eligible: BTreeSet<NodeId> = [1, 3, 4].into_iter().collect();
+        assert_eq!(state.configured_voters, expected_configured);
+        assert_eq!(
+            state.worker_eligible_voters, expected_eligible,
+            "demotion of 2 must survive the membership change; 4 starts eligible"
+        );
+    }
+
+    #[tokio::test]
+    async fn membership_change_starts_newly_added_voters_eligible() {
+        // No prior demotions, just a cluster-growth scenario:
+        // {1,2,3} → {1,2,3,4,5}. Both new voters start eligible.
+        let storage = Arc::new(MemoryRaftStorage::new());
+        let mut sm = StateMachineAdapter::new(storage);
+
+        sm.apply([membership_entry(1, &[1, 2, 3])]).await.unwrap();
+        sm.apply([membership_entry(2, &[1, 2, 3, 4, 5])])
+            .await
+            .unwrap();
+
+        let shared = sm.shared_state();
+        let state = shared.read().await;
+        let expected: BTreeSet<NodeId> = [1, 2, 3, 4, 5].into_iter().collect();
+        assert_eq!(state.configured_voters, expected);
         assert_eq!(state.worker_eligible_voters, expected);
     }
 
