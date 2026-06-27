@@ -592,10 +592,55 @@ fn main() {
         println!("     bounded by reindex_max_bytes, and amortized over every read until the next burst.");
     }
 
+    // ---------------------------------------------------------------
+    // PART G — PRUNE cost: clearing novelty after an index publishes (clear_up_to).
+    // Zero-compaction novelty = single-t segments => clear_up_to DROPS whole
+    // segments (O(#segments) pointer ops). A compacted K=1 segment spans all t,
+    // so a mid-window cutoff must REBUILD it (filter by t + re-sort 4 order
+    // vectors) = O(surviving flakes). This is the tax compaction puts on the drain.
+    // ---------------------------------------------------------------
+    println!("\n---- PART G: prune cost — clear_up_to mid-window (the post-index drain) ----");
+    {
+        let cutoff = (peak_commits as i64) / 2; // drop ~half, keep ~half
+
+        // Zero-compaction: K=peak single-t segments -> wholesale drop.
+        let mut zc = peak.clone();
+        let t0 = Instant::now();
+        zc.clear_up_to(cutoff);
+        let zc_ns = t0.elapsed().as_nanos();
+
+        // Compacted: one K=1 multi-t segment -> straddling rebuild.
+        let mut cc = peak.clone();
+        cc.compact_all();
+        let t0 = Instant::now();
+        cc.clear_up_to(cutoff);
+        let cc_ns = t0.elapsed().as_nanos();
+
+        println!(
+            "  zero-compaction (K={peak_k} single-t): clear_up_to = {:.1}us -> K={} after",
+            zc_ns as f64 / 1000.0,
+            zc.max_segment_count()
+        );
+        println!(
+            "  compacted (K=1 multi-t):         clear_up_to = {:.2}ms -> K={} after",
+            cc_ns as f64 / 1_000_000.0,
+            cc.max_segment_count()
+        );
+        let ratio = if zc_ns > 0 {
+            cc_ns as f64 / zc_ns as f64
+        } else {
+            0.0
+        };
+        println!(
+            "  => pruning a compacted overlay costs {ratio:.0}x pruning a single-t append log."
+        );
+        println!("     Compaction speeds broad reads modestly but TAXES the drain we rely on.");
+    }
+
     println!("\n======================================================================");
     println!("  Budget {budget:.1}x. Point/join ride the zone-map prune; narrow/full are");
     println!("  the deciders. Part C: tiered can't save broad reads. Part D: first read");
     println!("  after a silent burst spikes. Part E: a large base index dilutes it.");
-    println!("  Part F: cost to bridge back to K=1 reads.");
+    println!("  Part F: cost to bridge to K=1 reads. Part G: prune cost (drain tax).");
     println!("======================================================================");
 }
