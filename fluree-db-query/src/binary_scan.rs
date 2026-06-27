@@ -2430,15 +2430,18 @@ pub fn translate_overlay_flakes_with_untranslated(
 // See docs/design/segment-aware-overlay-translation.md.
 // ============================================================================
 
-/// Identity of one segment's translation: stable across commits (the segment is
-/// immutable and `seg_id` is process-unique) but invalidated by reindex
-/// (`store_max_t`) and dictionary identity. Deliberately excludes the overlay
-/// epoch + `to_t` so the entry survives commits (the cross-commit reuse is the
-/// point); `to_t` is applied after the merge.
+/// Identity of one segment's translation. `store_id` (process-unique per store
+/// instance) identifies the FROZEN dictionary id-assignment the translation
+/// reads; `seg_id` identifies the immutable segment's content. Ordinary commits
+/// reuse the same store, so the key survives them (cross-commit reuse is the
+/// point); any from-scratch dict rebuild constructs a new store → new `store_id`
+/// → cache bypass. `store_id` is used instead of `store_max_t` because a
+/// same-`index_t` rebuild (refresh-on-new-namespace) re-ranks dict ids at an
+/// unchanged `store_max_t` — see SOUNDNESS note in `docs/design/`. The overlay
+/// epoch + `to_t` are deliberately excluded; `to_t` is applied after the merge.
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct SegmentOpsKey {
-    ledger_id: Arc<str>,
-    store_max_t: i64,
+    store_id: u64,
     seg_id: u64,
     index: IndexType,
 }
@@ -2501,11 +2504,9 @@ fn translate_segment_cached(
     index: IndexType,
     order: RunSortOrder,
     seg_id: u64,
-    ledger_id: &Arc<str>,
 ) -> Option<Arc<CachedSegmentOps>> {
     let key = SegmentOpsKey {
-        ledger_id: Arc::clone(ledger_id),
-        store_max_t: store.max_t(),
+        store_id: store.store_id(),
         seg_id,
         index,
     };
@@ -2581,7 +2582,6 @@ fn collect_segment_merged_ops(
     }
 
     let order = index_type_to_sort_order(index);
-    let ledger_id: Arc<str> = ctx.active_snapshot.ledger_id.as_str().into();
 
     let mut merged_ops: Vec<OverlayOp> = Vec::new();
     let mut merged_untranslated: Vec<Flake> = Vec::new();
@@ -2601,7 +2601,6 @@ fn collect_segment_merged_ops(
             index,
             order,
             seg.seg_id,
-            &ledger_id,
         )?;
 
         // Whole segments below `to_t` need no per-op filter; only a straddling
