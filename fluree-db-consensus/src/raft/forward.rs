@@ -186,7 +186,7 @@ impl LeaderForwarder {
 /// a literal SSRF address into the membership record; an active
 /// adversary controlling DNS for cluster hostnames is out of scope
 /// of this check and needs to be addressed at a different layer.
-fn is_valid_leader_url(url: &str, allow_loopback: bool) -> bool {
+pub(crate) fn is_valid_leader_url(url: &str, allow_loopback: bool) -> bool {
     match url_host(url) {
         Some(host) => !is_ssrf_host(&host, allow_loopback),
         None => false,
@@ -196,7 +196,7 @@ fn is_valid_leader_url(url: &str, allow_loopback: bool) -> bool {
 /// True iff this node's own reported `client_addr` is on loopback
 /// (or the literal `"localhost"`). The forwarder uses this to opt
 /// into accepting loopback peer URLs — see [`is_valid_leader_url`].
-fn self_addr_is_loopback(url: &str) -> bool {
+pub(crate) fn self_addr_is_loopback(url: &str) -> bool {
     url_host(url).is_some_and(|h| is_loopback_host(&h))
 }
 

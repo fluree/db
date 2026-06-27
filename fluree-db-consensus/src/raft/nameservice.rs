@@ -1116,17 +1116,34 @@ impl RaftNameService {
     }
 
     /// Resolve the current leader's `raft_addr` from the replicated
-    /// membership snapshot. `None` if no leader is currently elected
-    /// or the membership entry for the leader is somehow missing.
+    /// membership snapshot. `None` if no leader is currently elected,
+    /// the membership entry for the leader is somehow missing, or
+    /// the leader's reported `raft_addr` fails the SSRF guard
+    /// (loopback / link-local / unspecified — see
+    /// [`crate::raft::forward::is_valid_leader_url`]). Loopback is
+    /// permitted when this node's own `raft_addr` is also on
+    /// loopback (single-host test/dev cluster).
     async fn lookup_leader_raft_url(&self) -> Option<String> {
         let leader_id = self.raft.current_leader().await?;
-        self.raft
+        let forwarding = self.forwarding.as_ref()?;
+        let nodes: Vec<(NodeId, ClusterNode)> = self
+            .raft
             .metrics()
             .borrow()
             .membership_config
             .nodes()
-            .find(|(id, _)| **id == leader_id)
-            .map(|(_, node)| node.raft_addr.clone())
+            .map(|(id, node)| (*id, node.clone()))
+            .collect();
+        let allow_loopback = nodes
+            .iter()
+            .find(|(id, _)| *id == forwarding.id)
+            .is_some_and(|(_, node)| crate::raft::forward::self_addr_is_loopback(&node.raft_addr));
+        let leader_addr = nodes
+            .into_iter()
+            .find(|(id, _)| *id == leader_id)
+            .map(|(_, node)| node.raft_addr)?;
+        crate::raft::forward::is_valid_leader_url(&leader_addr, allow_loopback)
+            .then_some(leader_addr)
     }
 
     /// Forward [`SmCommand::PoisonQueueEntry`] to the current leader's
