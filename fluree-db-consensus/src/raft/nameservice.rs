@@ -76,7 +76,6 @@ use openraft::Raft;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::sync::Arc;
-use std::time::SystemTime;
 
 /// `NameService` adapter over the replicated state machine — reads
 /// the shared state directly, writes the index head through Raft.
@@ -203,10 +202,7 @@ fn build_index_head_args(
     index_id: &ContentId,
 ) -> std::result::Result<NewIndexHead, NameServiceError> {
     let (ledger_name, branch) = split_ledger_id(ledger_id)?;
-    let applied_at_millis = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
+    let applied_at_millis = crate::raft::current_millis();
     Ok(NewIndexHead {
         ledger_id: ledger_name,
         branch,
@@ -403,10 +399,7 @@ fn build_apply_head_command(
     let (ledger_name, branch) = split_ledger_id(ledger_id)?;
     let ref_key = RefKey::new(&ledger_name, &branch);
     let queue_id = peek_queue_front_id(state, &ref_key)?;
-    let applied_at_millis = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
+    let applied_at_millis = crate::raft::current_millis();
     let metadata = staged_receipts.and_then(|s| s.peek_transact_metadata(queue_id));
     let tally = metadata
         .as_ref()
@@ -606,7 +599,7 @@ impl RaftNameService {
             queue_id,
             commit_id: commit_id.clone(),
             commit_t,
-            applied_at_millis: current_millis(),
+            applied_at_millis: crate::raft::current_millis(),
             tally,
             flake_count,
         });
@@ -692,7 +685,7 @@ impl RaftNameService {
             branch: ref_key.branch.clone(),
             queue_id,
             reason,
-            applied_at_millis: current_millis(),
+            applied_at_millis: crate::raft::current_millis(),
         });
         match self.raft.client_write(cmd).await {
             Ok(_) => Ok(()),
@@ -1256,10 +1249,7 @@ impl QueuePoisonPublisher for RaftNameService {
 /// Build the state-machine command for [`LedgerLifecycle::init`].
 fn build_create_command(ledger_id: &str) -> std::result::Result<SmCommand, NameServiceError> {
     let (ledger_name, branch) = split_ledger_id(ledger_id)?;
-    let applied_at_millis = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
+    let applied_at_millis = crate::raft::current_millis();
     Ok(SmCommand::CreateLedger(NewLedger {
         ledger_id: ledger_name,
         branch,
@@ -1272,7 +1262,7 @@ fn build_retract_command(ledger_id: &str) -> std::result::Result<SmCommand, Name
     Ok(SmCommand::RetractLedger {
         ledger_id: ledger_name,
         branch,
-        applied_at_millis: current_millis(),
+        applied_at_millis: crate::raft::current_millis(),
     })
 }
 
@@ -1281,7 +1271,7 @@ fn build_purge_command(ledger_id: &str) -> std::result::Result<SmCommand, NameSe
     Ok(SmCommand::PurgeLedger {
         ledger_id: ledger_name,
         branch,
-        applied_at_millis: current_millis(),
+        applied_at_millis: crate::raft::current_millis(),
     })
 }
 
@@ -1365,10 +1355,7 @@ fn build_create_branch_command(
     source_branch: &str,
     at_commit: Option<(ContentId, i64)>,
 ) -> std::result::Result<SmCommand, NameServiceError> {
-    let applied_at_millis = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
+    let applied_at_millis = crate::raft::current_millis();
     Ok(SmCommand::CreateBranch(NewBranch {
         ledger_id: ledger_name.into(),
         branch: new_branch.into(),
@@ -1383,7 +1370,7 @@ fn build_drop_branch_command(ledger_id: &str) -> std::result::Result<SmCommand, 
     Ok(SmCommand::DropBranch {
         ledger_id: ledger_name,
         branch,
-        applied_at_millis: current_millis(),
+        applied_at_millis: crate::raft::current_millis(),
     })
 }
 
@@ -1401,15 +1388,8 @@ fn build_reset_head_command(
             index_head_id: snapshot.index_head_id,
             index_t: snapshot.index_t,
         },
-        applied_at_millis: current_millis(),
+        applied_at_millis: crate::raft::current_millis(),
     })
-}
-
-fn current_millis() -> u64 {
-    SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
 }
 
 fn map_create_branch_response(resp: SmResponse) -> Result<()> {
@@ -1533,7 +1513,7 @@ impl RefPublisher for RaftNameService {
             kind,
             expected: expected.cloned(),
             new: new.clone(),
-            applied_at_millis: current_millis(),
+            applied_at_millis: crate::raft::current_millis(),
         };
         match self.submit_lifecycle(cmd).await? {
             SmResponse::RefCasUpdated => Ok(CasResult::Updated),

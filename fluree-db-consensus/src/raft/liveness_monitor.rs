@@ -23,7 +23,7 @@ use crate::raft::{NodeId, TypeConfig};
 use openraft::{LogId, Raft};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 use tracing::{debug, warn};
 
 /// Default interval between metric samples.
@@ -195,7 +195,7 @@ impl LivenessMonitor {
         self.propose_eligibility(WorkerEligibility {
             voter,
             eligible: true,
-            applied_at_millis: now_millis(),
+            applied_at_millis: crate::raft::current_millis(),
         })
         .await
     }
@@ -206,7 +206,7 @@ impl LivenessMonitor {
         self.propose_eligibility(WorkerEligibility {
             voter,
             eligible: false,
-            applied_at_millis: now_millis(),
+            applied_at_millis: crate::raft::current_millis(),
         })
         .await
     }
@@ -330,13 +330,6 @@ fn leader_is_ahead_of_peer(leader_last_log: Option<u64>, peer_log: &Option<LogId
         (Some(_), None) => true,
         _ => false,
     }
-}
-
-fn now_millis() -> u64 {
-    SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
 }
 
 #[cfg(test)]

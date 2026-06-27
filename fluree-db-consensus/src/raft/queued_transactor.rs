@@ -42,7 +42,7 @@ use fluree_db_transact::CommitOptsRequest;
 use openraft::error::{ClientWriteError, RaftError};
 use openraft::Raft;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 /// How long a single waiter `await` blocks before the transactor
 /// considers the call stranded by a leader transition and either
@@ -431,7 +431,7 @@ impl Committer for QueuedTransactor {
             request_cid,
             body_cid,
             body_kind,
-            applied_at_millis: current_millis(),
+            applied_at_millis: crate::raft::current_millis(),
         };
 
         match self.submit_and_await(args, ref_key, retry_eligible).await? {
@@ -502,7 +502,7 @@ impl Committer for QueuedTransactor {
             request_cid,
             body_cid,
             body_kind: BodyKind::Revert,
-            applied_at_millis: current_millis(),
+            applied_at_millis: crate::raft::current_millis(),
         };
 
         match self.submit_and_await(args, ref_key, retry_eligible).await? {
@@ -599,7 +599,7 @@ impl Committer for QueuedTransactor {
             request_cid,
             body_cid,
             body_kind: BodyKind::Merge,
-            applied_at_millis: current_millis(),
+            applied_at_millis: crate::raft::current_millis(),
         };
 
         match self.submit_and_await(args, ref_key, retry_eligible).await? {
@@ -672,7 +672,7 @@ impl Committer for QueuedTransactor {
             request_cid,
             body_cid,
             body_kind: BodyKind::Rebase,
-            applied_at_millis: current_millis(),
+            applied_at_millis: crate::raft::current_millis(),
         };
 
         match self.submit_and_await(args, ref_key, retry_eligible).await? {
@@ -774,7 +774,7 @@ impl Committer for QueuedTransactor {
             request_cid,
             body_cid,
             body_kind: BodyKind::Pushed,
-            applied_at_millis: current_millis(),
+            applied_at_millis: crate::raft::current_millis(),
         };
 
         match self.submit_and_await(args, ref_key, retry_eligible).await? {
@@ -868,13 +868,6 @@ fn failure_from_poison(record: &PoisonRecord) -> SubmissionError {
         status: 500,
         message: format!("submission failed: {:?}", record.reason),
     }
-}
-
-fn current_millis() -> u64 {
-    SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
 }
 
 /// Conservative `IndexingStatus` for paths that don't observe the

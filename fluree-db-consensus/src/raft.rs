@@ -115,3 +115,17 @@ openraft::declare_raft_types!(
         SnapshotData = std::io::Cursor<Vec<u8>>,
         AsyncRuntime = openraft::TokioRuntime,
 );
+
+/// Wall-clock `now` as milliseconds since the Unix epoch.
+///
+/// Saturates to `0` if the system clock is set before the epoch —
+/// preserves the `u64` return type without panicking. Used to stamp
+/// `applied_at_millis` on the state-machine command payloads
+/// (`HeadAdvance`, `EntryPoisoning`, `NewLedger`, ...) and as the
+/// `applied_at_millis` on the eligibility / eviction proposes.
+pub(crate) fn current_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
