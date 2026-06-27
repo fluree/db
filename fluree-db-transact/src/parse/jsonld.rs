@@ -864,23 +864,29 @@ fn extract_context(json: &Value) -> Result<ParsedContext> {
     }
 }
 
-/// Strip top-level keys that must not be interpreted as data by the JSON-LD
-/// expander.
+/// Strip top-level transactor-reserved keys so the JSON-LD expander never
+/// treats them as data predicates.
 ///
-/// - `opts`: reserved for parse-time options (e.g. `opts.strictCompactIri`).
-/// - `txn-meta`: the txn-meta sidecar; entries are extracted separately by
-///   [`extract_txn_meta`] and must not appear as transaction data.
+/// The reserved set is [`super::RESERVED_TXN_KEYS`] — control keys (`opts`,
+/// `txn-meta`), HTTP routing (`ledger`), and dataset selectors (`from`,
+/// `fromNamed`, `graph`, …). On the INSERT / UPSERT paths this strip runs on,
+/// the routing / dataset keys are pure noise: `opts` / `txn-meta` are
+/// extracted upstream by [`extract_txn_meta`], and `ledger` / `from*` are
+/// resolved by the HTTP layer for routing only. (UPDATE consumes `from*` /
+/// `graph` semantically and never calls this strip.)
 ///
 /// In envelope form (with `@graph`), the expander already ignores extra
-/// top-level keys — only the single-object form leaks these as properties.
+/// top-level keys — but the single-object form would otherwise leak each as
+/// a stray literal predicate (e.g. a dangling `<subject> ledger "x:main"`
+/// triple), so the strip is what keeps body-ledger writes clean.
 ///
 /// Returns `Cow::Borrowed` when no stripping is needed, `Cow::Owned` otherwise.
 fn strip_opts_for_expansion(json: &Value) -> std::borrow::Cow<'_, Value> {
-    const STRIP_KEYS: &[&str] = &["opts", "txn-meta"];
+    use super::RESERVED_TXN_KEYS;
     match json.as_object() {
-        Some(obj) if STRIP_KEYS.iter().any(|k| obj.contains_key(*k)) => {
+        Some(obj) if RESERVED_TXN_KEYS.iter().any(|k| obj.contains_key(*k)) => {
             let mut cloned = obj.clone();
-            for k in STRIP_KEYS {
+            for k in RESERVED_TXN_KEYS {
                 cloned.remove(*k);
             }
             std::borrow::Cow::Owned(Value::Object(cloned))
@@ -1891,6 +1897,29 @@ mod tests {
 
     fn test_registry() -> NamespaceRegistry {
         NamespaceRegistry::new()
+    }
+
+    #[test]
+    fn strip_removes_every_reserved_key_but_keeps_data() {
+        // Single-object form: every reserved key must be stripped before
+        // expansion (else it leaks as a stray literal predicate, e.g. a
+        // dangling `<subject> ledger "x:main"` triple), while genuine data
+        // predicates survive untouched.
+        for key in super::super::RESERVED_TXN_KEYS {
+            let mut obj = serde_json::Map::new();
+            obj.insert("ex:name".to_string(), json!("Alice"));
+            obj.insert((*key).to_string(), json!("x:main"));
+            let doc = Value::Object(obj);
+            let stripped = strip_opts_for_expansion(&doc);
+            assert!(
+                stripped.get(key).is_none(),
+                "reserved key {key:?} must be stripped before expansion"
+            );
+            assert!(
+                stripped.get("ex:name").is_some(),
+                "data predicate must survive stripping of {key:?}"
+            );
+        }
     }
 
     #[test]
