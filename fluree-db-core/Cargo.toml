@@ -28,7 +28,7 @@ sha2 = { workspace = true }
 hex = { workspace = true }
 cid = { workspace = true }
 multihash = { workspace = true }
-tokio = { workspace = true, features = ["fs"], optional = true }
+tokio = { workspace = true, features = ["fs", "sync"], optional = true }
 fs2 = { version = "0.4", optional = true }
 xxhash-rust = { workspace = true }
 moka = { workspace = true, optional = true }

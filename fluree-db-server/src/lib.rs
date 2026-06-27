@@ -438,6 +438,12 @@ impl FlureeServerBuilder {
         self
     }
 
+    /// Set the global on-disk cache budget in MB (Fluree object storage + Iceberg)
+    pub fn disk_cache_max_mb(mut self, max_mb: usize) -> Self {
+        self.config.disk_cache_max_mb = Some(max_mb);
+        self
+    }
+
     /// Attach a [`RaftIntegration`](crate::raft::RaftIntegration) and
     /// the private listener address. The resulting server mounts the
     /// leader-forward middleware over write routes and serves the

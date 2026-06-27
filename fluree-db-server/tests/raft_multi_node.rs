@@ -307,6 +307,43 @@ impl TestCluster {
         }
     }
 
+    /// Poll until *every* live node agrees on a single leader that is
+    /// not `excluding`, then return it. Used after a failover: a write
+    /// forwarded through a surviving follower only reaches the new
+    /// leader once that follower's own raft metrics have caught up, so
+    /// requiring cluster-wide agreement (not just the first node's
+    /// possibly-stale view) is what makes a follower-forwarded write
+    /// race-free. Panics on timeout.
+    async fn wait_for_new_leader(&self, excluding: NodeId, timeout: Duration) -> NodeId {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let mut leaders = BTreeSet::new();
+            let mut all_reported = true;
+            for node in self.nodes.iter().filter(|n| n.is_alive()) {
+                match self.cluster_status(node).await {
+                    Ok(status) => match status.current_leader {
+                        Some(id) => {
+                            leaders.insert(id);
+                        }
+                        None => all_reported = false,
+                    },
+                    Err(_) => all_reported = false,
+                }
+            }
+            if all_reported && leaders.len() == 1 {
+                let leader = *leaders.iter().next().expect("one leader");
+                if leader != excluding {
+                    return leader;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "no agreed new leader (excluding {excluding}) within {timeout:?}; saw {leaders:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
     async fn cluster_status(&self, node: &TestNode) -> reqwest::Result<ClusterStatus> {
         self.client
             .get(format!("{}/cluster/status", node.raft_url))
@@ -715,28 +752,13 @@ async fn leader_failover_resumes_writes() {
     cluster.shutdown_node(old_leader).await;
 
     // Quorum survives losing one of five nodes; a new leader should
-    // emerge within a few election timeouts. The bound here is
-    // generous so a slow CI tick doesn't flake the test — the
-    // raft default election timeout is on the order of hundreds of
-    // milliseconds.
-    let new_leader = {
-        let deadline = Instant::now() + DEFAULT_TIMEOUT;
-        let mut current = old_leader;
-        while Instant::now() < deadline {
-            if let Some(id) = cluster.current_leader().await {
-                if id != old_leader {
-                    current = id;
-                    break;
-                }
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-        assert_ne!(
-            current, old_leader,
-            "no new leader elected within {DEFAULT_TIMEOUT:?}"
-        );
-        current
-    };
+    // emerge within a few election timeouts. Wait until every survivor
+    // *agrees* on the new leader — not just until one node reports one —
+    // so the follower we resume writes through can actually forward to
+    // it. The bound is generous so a slow CI tick doesn't flake.
+    let new_leader = cluster
+        .wait_for_new_leader(old_leader, DEFAULT_TIMEOUT)
+        .await;
     assert_ne!(new_leader, old_leader);
 
     // Resume writes through a surviving non-leader to also exercise

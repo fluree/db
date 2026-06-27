@@ -7,6 +7,33 @@
 //!   source /Users/bplatz/fluree/iceberg-tpch/scripts/minio.env
 //!   TPCH_BENCH=1 cargo test -p fluree-db-api --features iceberg \
 //!     --test it_tpch_iceberg_bench -- --ignored --nocapture
+//!
+//! # Peak-RSS investigation (2026-06) — read before chasing memory again
+//!
+//! Q1 holds ~15 GB RSS at SF1 even though the dataset is only ~177 MB compressed
+//! (~1-2 GB decompressed). A long bisection ruled the following OUT as the cause,
+//! each by experiment, not reasoning — do not re-litigate them:
+//!   * the aggregate: Q1 already uses the streaming `GroupAggregateOperator`
+//!     (`use_streaming=true`; SUM/AVG/COUNT are List-streamable), O(groups) memory.
+//!   * `scan_table` batch accumulation: streaming it (per-file `ColumnBatchStream`)
+//!     moved RSS 0%.
+//!   * the Parquet row decoder: A/B-ing `RowIter` vs the columnar
+//!     `decode_row_group_columns` moved P2 RSS ~4% (5.06 -> 4.87 GB). The reader is
+//!     NOT the wall. (Side note: that columnar decoder is buggy — returns Unbound
+//!     for decimals — so it is left unwired.)
+//!   * mimalloc retention: the system allocator gives ~13 GB vs ~15 GB (genuine
+//!     live, not allocator hoarding).
+//!   * per-thread churn: `RAYON_NUM_THREADS=1` gives ~15 GB (down ~11%, 1.6x slower).
+//!
+//! What IS true: a symbolicated `dhat` heap profile (small scale; full scale OOMs
+//! dhat) shows the peak heap dominated by PER-ROW RDF materialization in
+//! `r2rml::operator` — `emit_combined_row`, `materialize_batch`'s per-row
+//! `Vec<(VarId,Binding)>`, and `FlakeValue`/`Binding` clones (subject-IRI Strings).
+//! RSS also scales ~linearly with files processed (~375 MB/file). The lever is to
+//! cut the per-row allocation COUNT: a fused analytical path that aggregates
+//! straight from `ColumnBatch` values and only materializes the final result
+//! bindings, crucially skipping subject-IRI Binding creation unless the subject is
+//! selected / grouped / joined / counted-distinctly (pure churn for P2/Q6/Q1).
 #![cfg(feature = "iceberg")]
 // Query constants use a uniform `r#"..."#` style; some don't strictly need the
 // hashes, but mixing raw-string forms across the suite hurts readability.

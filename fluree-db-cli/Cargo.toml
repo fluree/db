@@ -50,11 +50,14 @@ fluree-vocab = { path = "../fluree-vocab" }
 fluree-db-query = { path = "../fluree-db-query" }
 fluree-db-binary-index = { path = "../fluree-db-binary-index" }
 
-# Developer memory layer
-fluree-db-memory = { path = "../fluree-db-memory", features = ["mcp"] }
+# Developer memory layer (store + CLI subcommands)
+fluree-db-memory = { path = "../fluree-db-memory" }
 
-# MCP stdio server
-rmcp = { workspace = true }
+# Embedded docs lookup (human `fluree docs` CLI subcommand)
+fluree-db-docs = { path = "../fluree-db-docs" }
+
+# Unified MCP service (stdio) — selectable memory/docs toolsets
+fluree-db-mcp = { path = "../fluree-db-mcp" }
 
 # Server embedding (optional — enables `fluree server` subcommands)
 fluree-db-server = { path = "../fluree-db-server", optional = true }

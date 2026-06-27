@@ -472,6 +472,33 @@ impl NumericAcc {
         }
     }
 
+    /// Build an accumulator from a pre-reduced exact (integer/decimal) total —
+    /// for fused fast paths that sum column values natively, then reuse this
+    /// accumulator's finalize semantics. `decimal` selects an xsd:decimal vs
+    /// xsd:integer result type (matching the column's declared datatype).
+    pub(crate) fn from_exact_total(big_sum: BigDecimal, count: u64, decimal: bool) -> Self {
+        Self {
+            kind: if decimal {
+                NumKind::Decimal
+            } else {
+                NumKind::Integer
+            },
+            big_sum,
+            dbl_sum: 0.0,
+            count,
+        }
+    }
+
+    /// Build an accumulator from a pre-reduced floating (xsd:double) total.
+    pub(crate) fn from_double_total(dbl_sum: f64, count: u64) -> Self {
+        Self {
+            kind: NumKind::Double,
+            big_sum: BigDecimal::zero(),
+            dbl_sum,
+            count,
+        }
+    }
+
     pub(crate) fn add(&mut self, v: NumericValue) {
         self.count += 1;
         match v {
