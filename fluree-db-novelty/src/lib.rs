@@ -1860,9 +1860,12 @@ mod tests {
         // Drain everything, as an index swap does (apply_index/apply_loaded_db)
         novelty.clear_up_to(1);
 
-        // The arena retains dead flakes, so `is_empty()` stays false — pin that
-        // `is_effectively_empty()` sees through it via `size`.
-        assert!(!novelty.is_empty());
+        // Segmented novelty drops whole segments on clear (no dead-flake arena),
+        // so a full drain genuinely empties it: `is_empty()` and
+        // `is_effectively_empty()` agree. The point being pinned is that the
+        // drained state reads as effectively-empty *despite the bumped epoch* —
+        // that is the gate the post-indexing fast path relies on.
+        assert!(novelty.is_empty());
         assert!(novelty.epoch > 0);
         assert!(novelty.is_effectively_empty());
     }
