@@ -216,6 +216,21 @@ impl<O: OverlayProvider + ?Sized> OverlayProvider for SizedOverlayRef<'_, O> {
         self.0
             .for_each_overlay_flake(g_id, index, first, rhs, leftmost, to_t, callback);
     }
+
+    fn overlay_segments(&self, g_id: GraphId) -> Vec<crate::overlay::OverlaySegmentMeta> {
+        self.0.overlay_segments(g_id)
+    }
+
+    fn for_each_overlay_segment_flake(
+        &self,
+        g_id: GraphId,
+        seg_id: u64,
+        index: IndexType,
+        callback: &mut dyn FnMut(&Flake),
+    ) {
+        self.0
+            .for_each_overlay_segment_flake(g_id, seg_id, index, callback);
+    }
 }
 
 // ============================================================================

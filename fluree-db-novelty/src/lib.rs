@@ -148,12 +148,24 @@ pub const DEFAULT_COMPACTION_THRESHOLD: usize = 128;
 /// novelty size with only bounded per-merge work (no full-novelty rewrite).
 pub const DEFAULT_TIER_WIDTH: usize = 16;
 
+/// Process-global monotonic source of [`Segment`] ids.
+///
+/// Every distinct segment built in this process gets a unique id, so a
+/// per-segment overlay-translation cache keyed on it never collides across
+/// ledgers, reloads, cloned/diverged `Novelty` values, or derived overlays.
+/// `Arc`-clones share the id; compaction builds new segments with new ids
+/// (orphaning stale cache entries). Internal identity only — not persisted and
+/// not part of the observable novelty contract.
+static NEXT_SEG_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// An immutable, append-only batch of novelty flakes for one graph.
 ///
 /// Owns its flakes and four locally-sorted index orders (vectors of local
 /// indices into `flakes`). Segments are `Arc`-wrapped inside [`Novelty`], so
 /// cloning a `Novelty` copies only pointers — never the flakes.
 struct Segment {
+    /// Process-global unique id; stable cache identity (see [`NEXT_SEG_ID`]).
+    seg_id: u64,
     flakes: Vec<Flake>,
     spot: Vec<u32>,
     psot: Vec<u32>,
@@ -202,6 +214,7 @@ impl Segment {
         }
 
         Segment {
+            seg_id: NEXT_SEG_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             flakes,
             spot,
             psot,
@@ -1381,6 +1394,40 @@ impl OverlayProvider for Novelty {
                 }
             }
             _ => {}
+        }
+    }
+
+    fn overlay_segments(&self, g_id: GraphId) -> Vec<fluree_db_core::OverlaySegmentMeta> {
+        match self.graphs.get(g_id as usize).and_then(Option::as_ref) {
+            Some(segs) => segs
+                .iter()
+                .map(|s| fluree_db_core::OverlaySegmentMeta {
+                    seg_id: s.seg_id,
+                    min_t: s.min_t,
+                    max_t: s.max_t,
+                })
+                .collect(),
+            None => Vec::new(),
+        }
+    }
+
+    fn for_each_overlay_segment_flake(
+        &self,
+        g_id: GraphId,
+        seg_id: u64,
+        index: IndexType,
+        callback: &mut dyn FnMut(&Flake),
+    ) {
+        // Whole segment in `index` order, NO `to_t` filter: the query layer
+        // caches the segment's full translation and applies `to_t` + the cursor
+        // key window after the k-way merge.
+        if let Some(Some(segs)) = self.graphs.get(g_id as usize) {
+            if let Some(seg) = segs.iter().find(|s| s.seg_id == seg_id) {
+                let flakes = &seg.flakes;
+                for &local in seg.order(index) {
+                    callback(&flakes[local as usize]);
+                }
+            }
         }
     }
 }

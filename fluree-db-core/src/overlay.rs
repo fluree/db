@@ -39,6 +39,23 @@ use crate::flake::Flake;
 use crate::ids::GraphId;
 use std::any::Any;
 
+/// Identity + transaction-time span of one overlay segment.
+///
+/// Lets the query layer cache translated overlay ops per **immutable** segment
+/// so a write burst re-translates only newly-appended segments. `seg_id` is a
+/// stable, process-unique cache key (see `fluree-db-novelty`'s segment id).
+/// A non-segmented overlay reports a single synthetic segment.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OverlaySegmentMeta {
+    /// Stable, process-unique segment id. `u64::MAX` for a non-segmented
+    /// overlay's single synthetic segment.
+    pub seg_id: u64,
+    /// Lowest transaction time in the segment (`== max_t` for a single commit).
+    pub min_t: i64,
+    /// Highest transaction time in the segment.
+    pub max_t: i64,
+}
+
 /// Overlay provider trait for external flake sources
 ///
 /// Allows external crates to inject extra flakes at leaf resolution time
@@ -101,6 +118,36 @@ pub trait OverlayProvider: Send + Sync {
         to_t: i64,
         callback: &mut dyn FnMut(&Flake),
     );
+
+    /// Segment metadata for `g_id`, in segment (commit) order.
+    ///
+    /// Enables a per-segment translation cache (only newly-appended segments
+    /// re-translate on a write burst; older immutable segments are cache hits).
+    /// **Default:** one synthetic segment spanning the whole overlay — correct
+    /// but with no per-segment reuse, for non-segmented overlays (reasoner,
+    /// schema bundle, …).
+    fn overlay_segments(&self, _g_id: GraphId) -> Vec<OverlaySegmentMeta> {
+        vec![OverlaySegmentMeta {
+            seg_id: u64::MAX,
+            min_t: i64::MIN,
+            max_t: i64::MAX,
+        }]
+    }
+
+    /// Push the flakes of segment `seg_id` for `(g_id, index)` in comparator
+    /// order, **without** a `to_t` filter (the query layer caches the whole
+    /// segment's translation and applies `to_t` + the cursor key window after
+    /// the k-way merge). **Default:** the whole overlay (the single synthetic
+    /// segment), so non-segmented overlays stay correct.
+    fn for_each_overlay_segment_flake(
+        &self,
+        g_id: GraphId,
+        _seg_id: u64,
+        index: IndexType,
+        callback: &mut dyn FnMut(&Flake),
+    ) {
+        self.for_each_overlay_flake(g_id, index, None, None, true, i64::MAX, callback);
+    }
 }
 
 /// Null overlay - no extra flakes
@@ -133,6 +180,11 @@ impl OverlayProvider for NoOverlay {
         _callback: &mut dyn FnMut(&Flake),
     ) {
         // No-op: no overlay flakes
+    }
+
+    fn overlay_segments(&self, _g_id: GraphId) -> Vec<OverlaySegmentMeta> {
+        // Empty overlay → no segments (not the default synthetic one).
+        Vec::new()
     }
 }
 
