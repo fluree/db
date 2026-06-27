@@ -28,6 +28,83 @@ async fn test_state() -> (TempDir, Arc<AppState>) {
     (tmp, state)
 }
 
+// Regression for #1369: querying a registered Iceberg/R2RML graph source by
+// alias (SPARQL `POST /query/<alias>`, the `execute_sparql_ledger` path) must
+// route to the graph-source engine, not load it as a ledger (which deserialized
+// the graph-source nameservice record as `NsFileV2` and failed on the missing
+// `f:ledger` field with a 500) nor 404 as a missing ledger. The bogus catalog
+// (`s3://nonexistent`) means execution can't return rows, but the response must
+// prove the alias resolved AND reached the source engine: the error is the
+// engine's own "Iceberg graph source config" failure, never `f:ledger` and
+// never a not-found. (A readable in-tree source — which needs Iceberg test
+// infra — would additionally assert returned rows.)
+#[cfg(feature = "iceberg")]
+#[tokio::test]
+async fn graph_source_alias_query_does_not_deserialize_as_ledger() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let cfg = ServerConfig {
+        cors_enabled: false,
+        indexing_enabled: false,
+        storage_path: Some(tmp.path().to_path_buf()),
+        query_timeout_ms: 3000,
+        ..Default::default()
+    };
+    let telemetry = TelemetryConfig::with_server_config(&cfg);
+    let state = Arc::new(AppState::new(cfg, telemetry).await.expect("AppState::new"));
+
+    let mapping = concat!(
+        "@base <https://ex/r2rml/> .\n",
+        "@prefix rr: <http://www.w3.org/ns/r2rml#> .\n",
+        "@prefix ex: <http://example.org/> .\n",
+        "<#M> a rr:TriplesMap ; rr:logicalTable [ rr:tableName \"actor\" ] ; ",
+        "rr:subjectMap [ rr:template \"https://ex/{id}\" ] ; ",
+        "rr:predicateObjectMap [ rr:predicate ex:name ; rr:objectMap [ rr:column \"as_name\" ] ] ."
+    );
+    let create =
+        fluree_db_api::R2rmlCreateConfig::new_direct("actor", "s3://nonexistent/actor", mapping)
+            .with_mapping_media_type("text/turtle");
+    state
+        .fluree
+        .create_r2rml_graph_source(create)
+        .await
+        .expect("register graph source");
+
+    let resp = build_router(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/query/actor:main")
+                .header("content-type", "application/sparql-query")
+                .body(Body::from("SELECT ?s ?p ?o WHERE { ?s ?p ?o } LIMIT 1"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let (status, body) = json_body(resp).await;
+    let err = body
+        .get("error")
+        .and_then(|e| e.as_str())
+        .unwrap_or("")
+        .to_lowercase();
+    // Must NOT be the ledger-deserialization failure...
+    assert!(
+        !err.contains("f:ledger") && !err.contains("missing field"),
+        "alias query must route to the graph source, not deserialize the record as a ledger; status={status} body={body}"
+    );
+    // ...and must NOT be a not-found: the alias resolved and routed to the
+    // R2RML/Iceberg engine, which then fails on the bogus catalog config. This
+    // is the assertion the prior "not f:ledger" check missed (a 404 passed it).
+    assert_ne!(
+        status,
+        StatusCode::NOT_FOUND,
+        "graph-source alias should resolve and route to the engine, not 404; body={body}"
+    );
+    assert!(
+        err.contains("graph source") || err.contains("iceberg"),
+        "alias query should reach the graph-source engine (expected an Iceberg/graph-source config error); status={status} body={body}"
+    );
+}
+
 async fn json_body(resp: http::Response<Body>) -> (StatusCode, JsonValue) {
     let status = resp.status();
     let bytes = resp

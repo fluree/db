@@ -2022,8 +2022,17 @@ async fn execute_query(
         return execute_query_proxy(state, ledger_id, query_json, &span).await;
     }
 
-    // Shared storage mode: use load_ledger_for_query with freshness checking
-    let ledger = load_ledger_for_query(state, ledger_id, &span).await?;
+    // Shared storage mode: use load_ledger_for_query with freshness checking.
+    // The alias may name a graph source (Iceberg/R2RML, BM25, …) rather than a
+    // ledger; those resolve through the connection/dataset path, which queries
+    // them via their source engine instead of loading a ledger (#1369).
+    let ledger = match load_ledger_for_query(state, ledger_id, &span).await {
+        Ok(l) => l,
+        Err(ServerError::Api(ref e)) if e.is_not_found() && delimited.is_none() => {
+            return execute_dataset_query(state, ledger_id, query_json, &span).await;
+        }
+        Err(e) => return Err(e),
+    };
     let graph = GraphDb::from_ledger_state(&ledger);
     let fluree = &state.fluree;
 
@@ -2797,12 +2806,51 @@ async fn execute_sparql_ledger(
                 .into_response());
         }
 
-        // Shared storage mode: use load_ledger_for_query with freshness checking
-        let ledger = load_ledger_for_query(state, ledger_id, &span)
-            .await
-            .inspect_err(|_| {
+        // Shared storage mode: use load_ledger_for_query with freshness checking.
+        // The alias may name a graph source (Iceberg/R2RML) rather than a ledger;
+        // on a clean not-found, resolve it through the graph-source-aware single
+        // target path (`graph().query()` auto-enables R2RML), which queries it via
+        // its source engine (#1369). Mirrors the JSON-LD `execute_query` ->
+        // `execute_dataset_query` fallback. Graph sources support JSON output only.
+        let ledger = match load_ledger_for_query(state, ledger_id, &span).await {
+            Ok(ledger) => ledger,
+            Err(ServerError::Api(ref e)) if e.is_not_found() => {
+                if wants_sparql_xml || wants_rdf_xml {
+                    return Err(ServerError::not_acceptable(
+                        "Only JSON output is supported for graph source queries".to_string(),
+                    ));
+                }
+                if let Some(fmt) = delimited {
+                    return Err(ServerError::not_acceptable(format!(
+                        "{} format not supported for graph source queries",
+                        fmt.name().to_uppercase()
+                    )));
+                }
+                let result = state
+                    .fluree
+                    .graph(ledger_id)
+                    .query()
+                    .sparql(sparql)
+                    .format(json_fmt_config.clone())
+                    .execution_options(query_execution_options(state))
+                    .execute_formatted()
+                    .await
+                    .map_err(|e| {
+                        set_span_error_code(&span, "error:QueryFailed");
+                        ServerError::Api(e)
+                    })?;
+                tracing::info!(status = "success", graph_source = true);
+                return Ok((
+                    [(axum::http::header::CONTENT_TYPE, json_content_type)],
+                    Json(result),
+                )
+                    .into_response());
+            }
+            Err(e) => {
                 set_span_error_code(&span, "error:LedgerLoad");
-            })?;
+                return Err(e);
+            }
+        };
         let graph = attach_default_context_to_graph(
             state,
             ledger_id,

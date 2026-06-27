@@ -436,6 +436,12 @@ impl FileNameService {
 impl crate::NameServiceLookup for FileNameService {
     async fn lookup(&self, ledger_id: &str) -> Result<Option<NsRecord>> {
         let (ledger_name, branch) = split_ledger_id(ledger_id)?;
+        // A graph-source record is not a ledger; deserializing it as `NsFileV2`
+        // fails on the missing `f:ledger` field (#1369). Treat it as "no ledger
+        // here" so the caller can fall back to the graph-source path.
+        if self.is_graph_source_record(&ledger_name, &branch).await? {
+            return Ok(None);
+        }
         self.load_record(&ledger_name, &branch).await
     }
 
@@ -1772,6 +1778,22 @@ mod tests {
     }
 
     // ========== Graph Source Tests ==========
+
+    #[tokio::test]
+    async fn lookup_skips_graph_source_records() {
+        // Regression for #1369: the ledger `lookup` must not deserialize a
+        // graph-source record as a ledger `NsFileV2` (which lacks `f:ledger`).
+        // Before the fix this returned a "missing field f:ledger" error.
+        let (_temp, ns) = setup().await;
+        ns.publish_graph_source("actor", "main", GraphSourceType::Bm25, r"{}", &[])
+            .await
+            .unwrap();
+        let record = ns
+            .lookup("actor:main")
+            .await
+            .expect("lookup of a graph-source alias must not error");
+        assert!(record.is_none(), "a graph source is not a ledger record");
+    }
 
     #[tokio::test]
     async fn test_graph_source_publish_and_lookup() {
