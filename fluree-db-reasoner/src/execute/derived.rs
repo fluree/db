@@ -22,6 +22,14 @@ pub struct DerivedSet {
     by_ps: HashMap<(Sid, Sid), Vec<usize>>,
     /// Index by (predicate, object) for join lookups (Ref objects only)
     by_po: HashMap<(Sid, Sid), Vec<usize>>,
+    /// Content keys of base (seed) facts. Facts matching a base key are
+    /// kept for joins/dedup but excluded from the emitted overlay — they
+    /// already exist in the database.
+    base_keys: HashSet<(Sid, Sid, u64)>,
+    /// Aligned with `flakes`: true when the flake matched a base key at insert.
+    is_base: Vec<bool>,
+    /// Number of entries in `flakes` flagged as base facts.
+    base_count: usize,
 }
 
 impl DerivedSet {
@@ -128,6 +136,19 @@ impl DerivedSet {
         hasher.finish()
     }
 
+    /// Register a base (seed) fact's content key.
+    ///
+    /// Any fact later added with the same (s, p, o) content is retained for
+    /// rule joins but treated as pre-existing: it does not count toward
+    /// derived totals and is excluded from [`Self::into_derived_flakes`].
+    pub fn register_base(&mut self, flake: &Flake) {
+        self.base_keys.insert((
+            flake.s.clone(),
+            flake.p.clone(),
+            Self::object_hash(&flake.o),
+        ));
+    }
+
     /// Try to add a flake, returns true if it was new
     pub fn try_add(&mut self, flake: Flake) -> bool {
         let key = (
@@ -139,6 +160,12 @@ impl DerivedSet {
         if self.seen.contains(&key) {
             return false;
         }
+
+        let is_base = self.base_keys.contains(&key);
+        if is_base {
+            self.base_count += 1;
+        }
+        self.is_base.push(is_base);
 
         self.seen.insert(key);
         let idx = self.flakes.len();
@@ -199,6 +226,11 @@ impl DerivedSet {
         self.flakes.len()
     }
 
+    /// Number of genuinely derived facts (total minus re-added base facts).
+    pub fn derived_len(&self) -> usize {
+        self.flakes.len() - self.base_count
+    }
+
     /// Check if empty
     pub fn is_empty(&self) -> bool {
         self.flakes.is_empty()
@@ -207,5 +239,16 @@ impl DerivedSet {
     /// Consume and return all flakes
     pub fn into_flakes(self) -> Vec<Flake> {
         self.flakes
+    }
+
+    /// Consume and return only genuinely derived flakes, excluding facts
+    /// whose content matches a registered base (seed) fact.
+    pub fn into_derived_flakes(self) -> Vec<Flake> {
+        let is_base = self.is_base;
+        self.flakes
+            .into_iter()
+            .zip(is_base)
+            .filter_map(|(flake, base)| (!base).then_some(flake))
+            .collect()
     }
 }

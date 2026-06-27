@@ -24,8 +24,9 @@ use crate::binding::{Batch, Binding};
 use crate::context::ExecutionContext;
 use crate::error::{QueryError, Result};
 use crate::execute::build_where_operators_seeded;
-use crate::group_aggregate::{binding_to_group_key_owned, GroupKeyOwned};
+use crate::group_aggregate::{binding_to_group_key_normalized, GroupKeyOwned};
 use crate::ir::{Pattern, SubqueryPattern};
+use crate::object_binding::{equality_norm, EqualityNorm};
 use crate::operator::{
     compute_trimmed_vars, effective_schema, trim_batch, BoxedOperator, Operator, OperatorState,
 };
@@ -85,6 +86,10 @@ pub struct SubqueryOperator {
     /// result rows plus a hash index from the correlation-variable values to the
     /// rows carrying them. Reused across every parent row and batch.
     materialized: Option<MaterializedSubquery>,
+    /// Store for normalizing decoded bindings to encoded form on both join
+    /// sides, so mixed-representation rows key identically. `None` outside
+    /// single-ledger binary execution.
+    norm: Option<EqualityNorm>,
 }
 
 /// A once-evaluated subquery result, indexed for hash-join probing.
@@ -188,6 +193,7 @@ impl SubqueryOperator {
             join_keys,
             join_mode,
             materialized: None,
+            norm: None,
         }
     }
 
@@ -271,6 +277,9 @@ impl Operator for SubqueryOperator {
         self.child.open(ctx).await?;
         self.state = OperatorState::Open;
         self.materialized = None;
+        if self.norm.is_none() {
+            self.norm = equality_norm(ctx);
+        }
         Ok(())
     }
 
@@ -321,7 +330,10 @@ impl Operator for SubqueryOperator {
                     .map(|v| {
                         parent_batch
                             .get(row_idx, *v)
-                            .map(binding_to_group_key_owned)
+                            .map(|b| {
+                                let (store, gv) = EqualityNorm::parts(&self.norm);
+                                binding_to_group_key_normalized(b, store, gv)
+                            })
                             .unwrap_or(GroupKeyOwned::Absent)
                     })
                     .collect();
@@ -386,8 +398,21 @@ impl Operator for SubqueryOperator {
     }
 
     fn estimated_rows(&self) -> Option<usize> {
-        // Subqueries can multiply rows; hard to estimate
-        None
+        // The subquery's OWN output estimate seeds the downstream object→subject
+        // hash join's driving estimate so a `(message HAS_CREATOR friend)` probe
+        // is costed against the ~producer size, not 1 — but ONLY for shapes whose
+        // output is reliably bounded (scalar aggregate, anchored `WITH DISTINCT`
+        // producer, or explicit LIMIT). For an arbitrary subquery the estimate is
+        // just body cardinality, which is fine for join ordering but too
+        // unreliable to perturb the hash-join cost model, so we keep the
+        // conservative `None` the operator returned before.
+        if !crate::planner::subquery_output_estimate_is_bounded(&self.subquery) {
+            return None;
+        }
+        Some(
+            crate::planner::estimate_subquery_output(&self.subquery, self.stats.as_deref()).round()
+                as usize,
+        )
     }
 }
 
@@ -397,6 +422,10 @@ impl SubqueryOperator {
         if self.buffer_pos >= self.result_buffer.len() {
             return Ok(None);
         }
+
+        // Number of rows about to be drained — needed to size an empty-schema
+        // batch, where there are no columns to infer the row count from.
+        let drained = self.result_buffer.len() - self.buffer_pos;
 
         // Build batch from buffer
         let num_cols = self.in_schema.len();
@@ -412,7 +441,16 @@ impl SubqueryOperator {
 
         self.buffer_pos = self.result_buffer.len();
 
-        if columns.is_empty() || columns[0].is_empty() {
+        // A variable-free subquery (e.g. `{ SELECT * WHERE { :a :p "1" } }`)
+        // produces an empty schema; a match is still one empty-binding solution
+        // per row. Emit an empty-schema batch with the row count rather than
+        // collapsing to zero rows (out_schema is also empty here, so there is
+        // nothing to trim).
+        if num_cols == 0 {
+            return Ok(Some(Batch::empty_schema_with_len(drained)));
+        }
+
+        if columns[0].is_empty() {
             Ok(None)
         } else {
             let batch = Batch::new(self.in_schema.clone(), columns)?;
@@ -467,7 +505,10 @@ impl SubqueryOperator {
                     self.select_index
                         .get(v)
                         .and_then(|&si| row.get(si))
-                        .map(binding_to_group_key_owned)
+                        .map(|b| {
+                            let (store, gv) = EqualityNorm::parts(&self.norm);
+                            binding_to_group_key_normalized(b, store, gv)
+                        })
                         .unwrap_or(GroupKeyOwned::Absent)
                 })
                 .collect();
@@ -517,6 +558,7 @@ impl SubqueryOperator {
             self.subquery.limit,
             false,
             None,
+            &self.planning,
         )
     }
 
@@ -559,6 +601,7 @@ impl SubqueryOperator {
             self.subquery.limit,
             false,
             None,
+            &self.planning,
         )?;
 
         // Execute and collect results
@@ -566,6 +609,7 @@ impl SubqueryOperator {
         let mut results = Vec::new();
 
         while let Some(batch) = operator.next_batch(ctx).await? {
+            ctx.check_cancelled()?;
             for sub_row_idx in 0..batch.len() {
                 // Extract bindings for subquery SELECT variables (in order)
                 let row: Vec<Binding> = self
@@ -581,6 +625,7 @@ impl SubqueryOperator {
                     .collect();
                 results.push(row);
             }
+            ctx.check_cancelled()?;
         }
 
         operator.close();

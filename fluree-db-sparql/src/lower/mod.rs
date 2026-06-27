@@ -45,6 +45,7 @@
 //! - [`select`] — SELECT clause, solution modifiers, subqueries
 
 mod aggregate;
+mod annotation;
 mod ask;
 mod construct;
 mod describe;
@@ -125,7 +126,158 @@ pub fn lower_sparql_with_source<E: IriEncoder>(
         }
     }
 
+    // Mirror the JSON-LD read-side firewall
+    // (`fluree_db_query::parse::reject_user_authored_reifies_in_query`):
+    // user queries naming `f:reifies*` IRIs directly are rejected
+    // so system facts can't be enumerated through the user surface.
+    // The opt-in `opts.includeSystemFacts: true` only relaxes the
+    // variable-predicate scan filter — direct mention is the
+    // contract-level boundary, identical for SPARQL and JSON-LD.
+    if let Ok(query) = &result {
+        reject_direct_reifies_in_patterns(&query.patterns)?;
+    }
+
     result
+}
+
+/// Walk every triple pattern reachable from `patterns` (recursing
+/// through container patterns) and reject any whose predicate slot is
+/// a system-controlled `f:reifies*` IRI/SID. Called by
+/// `lower_sparql_with_source` after lowering succeeds.
+///
+/// Patterns built via the IR-level `expand_edge_annotation_patterns`
+/// pass also produce `f:reifies*` triples, but that pass runs at
+/// execution time on top of `Pattern::EdgeAnnotation` /
+/// `Pattern::AnnotationTarget`, *after* this firewall. SPARQL has no
+/// surface that produces those container variants today, so any
+/// `f:reifies*` triple visible here came from user input.
+fn reject_direct_reifies_in_patterns(patterns: &[Pattern]) -> Result<()> {
+    use fluree_db_query::ir::triple::Ref;
+    use fluree_vocab::reifies_iris;
+
+    fn is_reifies_ref(p: &Ref) -> bool {
+        match p {
+            Ref::Sid(sid) => fluree_db_core::is_reserved_reifies_predicate(sid),
+            Ref::Iri(iri) => reifies_iris::ALL.iter().any(|known| *known == iri.as_ref()),
+            _ => false,
+        }
+    }
+
+    fn reject_predicate_string(predicate: String) -> LowerError {
+        LowerError::not_implemented(
+            format!(
+                "predicate '{predicate}' is system-controlled; \
+                 read edge annotations through SPARQL-star \
+                 quoted-triple annotation syntax rather than \
+                 naming f:reifies* directly"
+            ),
+            (0..0).into(),
+        )
+    }
+
+    // A VALUES row binding that resolves to an `f:reifies*` IRI: the
+    // user is trying to smuggle a system-controlled predicate in as
+    // data (e.g. `VALUES ?p { f:reifiesSubject } . ?s ?p ?o`) so a
+    // later variable-predicate scan binds it to a constant and leaks
+    // the internal bundle. Returns the offending IRI for the message.
+    fn reifies_values_binding(b: &fluree_db_query::Binding) -> Option<String> {
+        use fluree_db_query::Binding;
+        match b {
+            Binding::Sid { sid, .. } if fluree_db_core::is_reserved_reifies_predicate(sid) => {
+                Some(format!("{sid}"))
+            }
+            Binding::IriMatch {
+                primary_sid, iri, ..
+            } if fluree_db_core::is_reserved_reifies_predicate(primary_sid)
+                || reifies_iris::ALL.iter().any(|known| *known == iri.as_ref()) =>
+            {
+                Some(iri.to_string())
+            }
+            _ => None,
+        }
+    }
+
+    // Exhaustive over `Pattern` so adding a new variant forces a
+    // firewall decision rather than silently slipping through. The
+    // previous wildcard arm let `PropertyPath` (which carries a
+    // predicate Sid) bypass the check — e.g.
+    // `?s f:reifiesSubject+ ?o` was accepted, exposing the
+    // system-controlled chain through transitive paths.
+    fn walk(patterns: &[Pattern]) -> Result<()> {
+        for pattern in patterns {
+            match pattern {
+                Pattern::Triple(tp) => {
+                    if is_reifies_ref(&tp.p) {
+                        let predicate = match &tp.p {
+                            Ref::Iri(iri) => iri.as_ref().to_string(),
+                            Ref::Sid(sid) => format!("{sid}"),
+                            _ => "<f:reifies*>".to_string(),
+                        };
+                        return Err(reject_predicate_string(predicate));
+                    }
+                }
+                Pattern::PropertyPath(pp) => {
+                    if let Some(reserved) = pp
+                        .predicates
+                        .iter()
+                        .find(|p| fluree_db_core::is_reserved_reifies_predicate(p))
+                    {
+                        return Err(reject_predicate_string(format!("{reserved}")));
+                    }
+                }
+                // ShortestPath also carries a predicate Sid; apply the same
+                // firewall (no SPARQL surface produces it today, but stay safe).
+                Pattern::ShortestPath(sp) => {
+                    if fluree_db_core::is_reserved_reifies_predicate(&sp.predicate) {
+                        return Err(reject_predicate_string(format!("{}", sp.predicate)));
+                    }
+                }
+                Pattern::Optional(inner)
+                | Pattern::Minus(inner)
+                | Pattern::Exists(inner)
+                | Pattern::NotExists(inner) => walk(inner)?,
+                Pattern::Union(branches) => {
+                    for branch in branches {
+                        walk(branch)?;
+                    }
+                }
+                Pattern::Graph { patterns, .. } => walk(patterns)?,
+                Pattern::Service(sp) => walk(&sp.patterns)?,
+                Pattern::Subquery(sq) => walk(&sq.patterns)?,
+                Pattern::EdgeAnnotation { body, .. } | Pattern::AnnotationTarget { body, .. } => {
+                    walk(body)?;
+                }
+                Pattern::DefaultGraphSource { patterns } => walk(patterns)?,
+                // VALUES carries no predicate slot, but its row DATA can
+                // bind a variable to an `f:reifies*` IRI which a later
+                // `?s ?p ?o` scan then resolves to a constant predicate,
+                // leaking the internal bundle. Reject the IRI here.
+                Pattern::Values { rows, .. } => {
+                    for row in rows {
+                        for binding in row {
+                            if let Some(iri) = reifies_values_binding(binding) {
+                                return Err(reject_predicate_string(iri));
+                            }
+                        }
+                    }
+                }
+                // Pattern types that don't carry an arbitrary triple
+                // predicate — adapters / search calls / leaf nodes.
+                // f:reifies* predicates can't appear inside them.
+                Pattern::Filter(_)
+                | Pattern::Bind { .. }
+                | Pattern::Unwind { .. }
+                | Pattern::IndexSearch(_)
+                | Pattern::VectorSearch(_)
+                | Pattern::R2rml(_)
+                | Pattern::GeoSearch(_)
+                | Pattern::S2Search(_) => {}
+            }
+        }
+        Ok(())
+    }
+
+    walk(patterns)
 }
 
 /// Context for lowering operations.
@@ -188,6 +340,76 @@ impl<'a, E: IriEncoder> LoweringContext<'a, E> {
         }
     }
 
+    /// Build the query's `ReasoningConfig` from the `# PRAGMA reasoning: ...`
+    /// directive, if present.
+    ///
+    /// Mirrors the JSON-LD `"reasoning"` option: no pragma means
+    /// `ReasoningConfig::default()` (ledger/config defaults apply); an
+    /// explicit pragma sets the query-level modes, which take precedence
+    /// under `DefaultUnlessQueryOverrides`. Unknown mode names error.
+    fn reasoning_config(&self) -> Result<ReasoningConfig> {
+        use fluree_db_query::ir::ReasoningModes;
+
+        let mut modes = match &self.ast.pragmas.reasoning {
+            None => ReasoningModes::default(),
+            Some(mode_strs) => {
+                if mode_strs.is_empty() {
+                    return Err(LowerError::invalid_pragma(
+                        "reasoning",
+                        "expected at least one mode: none, rdfs, owl2ql, owl2rl, datalog, owl-datalog",
+                        self.ast.span,
+                    ));
+                }
+                if mode_strs.len() > 1 && mode_strs.iter().any(|m| m.eq_ignore_ascii_case("none")) {
+                    return Err(LowerError::invalid_pragma(
+                        "reasoning",
+                        "'none' cannot be combined with other modes",
+                        self.ast.span,
+                    ));
+                }
+
+                let value = if mode_strs.len() == 1 {
+                    serde_json::Value::String(mode_strs[0].clone())
+                } else {
+                    serde_json::Value::Array(
+                        mode_strs
+                            .iter()
+                            .map(|m| serde_json::Value::String(m.clone()))
+                            .collect(),
+                    )
+                };
+                ReasoningModes::from_json(&value)
+                    .map_err(|e| LowerError::invalid_pragma("reasoning", e, self.ast.span))?
+            }
+        };
+
+        // Budget pragmas don't flip any mode flag — they only take effect
+        // when a reasoning mode runs (from this query or a ledger default).
+        modes.max_facts = self.budget_pragma_value(
+            "reasoning-max-facts",
+            self.ast.pragmas.reasoning_max_facts.as_deref(),
+        )?;
+        modes.max_seconds = self.budget_pragma_value(
+            "reasoning-max-seconds",
+            self.ast.pragmas.reasoning_max_seconds.as_deref(),
+        )?;
+
+        if modes == ReasoningModes::default() {
+            return Ok(ReasoningConfig::default());
+        }
+        Ok(ReasoningConfig::new().with_modes(modes))
+    }
+
+    /// Validate a `# PRAGMA reasoning-max-*: <n>` value as a non-negative integer.
+    fn budget_pragma_value(&self, name: &'static str, raw: Option<&str>) -> Result<Option<u64>> {
+        let Some(raw) = raw else {
+            return Ok(None);
+        };
+        raw.parse::<u64>().map(Some).map_err(|_| {
+            LowerError::invalid_pragma(name, "expected a non-negative integer", self.ast.span)
+        })
+    }
+
     /// Main entry point for lowering.
     fn lower(&mut self) -> Result<Query> {
         match &self.ast.body {
@@ -241,16 +463,19 @@ impl<'a, E: IriEncoder> LoweringContext<'a, E> {
                 let distinct = lowered_modifiers.distinct;
 
                 // Assemble the grouping phase from the lowered components.
-                // SELECT post-binds (`select_binds.post`) ride inside the
-                // aggregation stage. Expression-based ORDER BY binds ride on
-                // `Query.order_binds` (a dedicated post-grouping stage in the
-                // operator tree) so they evaluate uniformly with or without
-                // grouping — including dedup-only GROUP BY, which has no
-                // aggregation stage to carry binds.
+                // SELECT post-binds (`select_binds.post`, plus any compound-
+                // aggregate post-binds produced by `lower_solution_modifiers`)
+                // ride inside the aggregation stage. Expression-based ORDER BY
+                // binds ride on `Query.order_binds` (a dedicated post-grouping
+                // stage in the operator tree) so they evaluate uniformly with
+                // or without grouping — including dedup-only GROUP BY, which
+                // has no aggregation stage to carry binds.
+                let mut post_binds = select_binds.post;
+                post_binds.extend(lowered_modifiers.select_post_binds);
                 let grouping = Grouping::assemble(
                     lowered_modifiers.group_by,
                     lowered_modifiers.aggregates,
-                    select_binds.post,
+                    post_binds,
                     lowered_modifiers.having,
                 );
 
@@ -281,8 +506,9 @@ impl<'a, E: IriEncoder> LoweringContext<'a, E> {
                     order_binds,
                     limit,
                     offset,
-                    reasoning: ReasoningConfig::default(),
+                    reasoning: self.reasoning_config()?,
                     post_values,
+                    include_system_facts: false,
                 })
             }
             QueryBody::Construct(construct_query) => self.lower_construct(construct_query),
@@ -398,8 +624,214 @@ mod tests {
     }
 
     // =========================================================================
+    // Numeric literal lowering
+    // =========================================================================
+
+    fn object_of(query: &Query, idx: usize) -> &Term {
+        let Pattern::Triple(t) = &query.patterns[idx] else {
+            panic!("expected triple pattern, got {:?}", query.patterns[idx]);
+        };
+        &t.o
+    }
+
+    #[test]
+    fn test_overflowing_integer_literal_promotes_to_bigint() {
+        // xsd:integer is unbounded; beyond i64 must promote, not corrupt.
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?s WHERE { ?s ex:serial 123456789012345678901234567890 }",
+        )
+        .unwrap();
+
+        let Term::Value(fluree_db_core::FlakeValue::BigInt(n)) = object_of(&query, 0) else {
+            panic!(
+                "expected BigInt object for overflowing integer, got {:?}",
+                object_of(&query, 0)
+            );
+        };
+        assert_eq!(n.to_string(), "123456789012345678901234567890");
+    }
+
+    #[test]
+    fn test_negative_overflowing_integer_literal_promotes_to_bigint() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?s WHERE { ?s ex:serial -123456789012345678901234567890 }",
+        )
+        .unwrap();
+
+        let Term::Value(fluree_db_core::FlakeValue::BigInt(n)) = object_of(&query, 0) else {
+            panic!(
+                "expected BigInt object for overflowing integer, got {:?}",
+                object_of(&query, 0)
+            );
+        };
+        assert_eq!(n.to_string(), "-123456789012345678901234567890");
+    }
+
+    #[test]
+    fn test_typed_overflowing_integer_literal_promotes_to_bigint() {
+        // Typed lexical form: xsd:integer is unbounded, so this must promote,
+        // not error.
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+             SELECT ?s WHERE { ?s ex:serial \"123456789012345678901234567890\"^^xsd:integer }",
+        )
+        .unwrap();
+
+        let Term::Value(fluree_db_core::FlakeValue::BigInt(n)) = object_of(&query, 0) else {
+            panic!(
+                "expected BigInt object for typed overflowing integer, got {:?}",
+                object_of(&query, 0)
+            );
+        };
+        assert_eq!(n.to_string(), "123456789012345678901234567890");
+    }
+
+    #[test]
+    fn test_bare_decimal_literal_is_exact() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?s WHERE { ?s ex:price 19.99 }",
+        )
+        .unwrap();
+
+        let Term::Value(fluree_db_core::FlakeValue::Decimal(d)) = object_of(&query, 0) else {
+            panic!(
+                "expected exact decimal object, got {:?}",
+                object_of(&query, 0)
+            );
+        };
+        assert_eq!(d.to_string(), "19.99");
+    }
+
+    #[test]
+    fn test_negative_decimal_literal_is_exact() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?s WHERE { ?s ex:delta -0.5 }",
+        )
+        .unwrap();
+
+        let Term::Value(fluree_db_core::FlakeValue::Decimal(d)) = object_of(&query, 0) else {
+            panic!(
+                "expected exact decimal object, got {:?}",
+                object_of(&query, 0)
+            );
+        };
+        assert_eq!(d.to_string(), "-0.5");
+    }
+
+    #[test]
+    fn test_typed_decimal_literal_is_exact() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+             SELECT ?s WHERE { ?s ex:price \"1234567890123456789.0123456789\"^^xsd:decimal }",
+        )
+        .unwrap();
+
+        let Term::Value(fluree_db_core::FlakeValue::Decimal(d)) = object_of(&query, 0) else {
+            panic!(
+                "expected exact decimal object, got {:?}",
+                object_of(&query, 0)
+            );
+        };
+        // Round-tripping through f64 would lose these digits
+        assert_eq!(d.to_string(), "1234567890123456789.0123456789");
+    }
+
+    #[test]
+    fn test_double_literal_stays_double() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?s WHERE { ?s ex:price 1.5e2 }",
+        )
+        .unwrap();
+
+        assert!(
+            matches!(
+                object_of(&query, 0),
+                Term::Value(fluree_db_core::FlakeValue::Double(_))
+            ),
+            "exponent-form literal is xsd:double, got {:?}",
+            object_of(&query, 0)
+        );
+    }
+
+    #[test]
+    fn test_filter_decimal_constant_is_exact() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?s WHERE { ?s ex:price ?p . FILTER(?p > 10.25) }",
+        )
+        .unwrap();
+
+        let rendered = format!("{:?}", query.patterns);
+        assert!(
+            rendered.contains("Decimal"),
+            "FILTER constant should be an exact decimal: {rendered}"
+        );
+        assert!(
+            !rendered.contains("Double(10.25)"),
+            "FILTER constant must not round-trip through f64: {rendered}"
+        );
+    }
+
+    #[test]
+    fn test_values_decimal_constant_is_exact() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?p WHERE { VALUES ?p { 19.99 } ?s ex:price ?p }",
+        )
+        .unwrap();
+
+        let rendered = format!("{:?}", query.patterns);
+        assert!(
+            rendered.contains("Decimal"),
+            "VALUES constant should be an exact decimal: {rendered}"
+        );
+    }
+
+    // =========================================================================
     // Basic SELECT tests
     // =========================================================================
+
+    #[test]
+    fn test_rejects_user_authored_reifies_iri() {
+        // Mirrors the JSON-LD read-side firewall: SPARQL queries that
+        // mention `f:reifies*` IRIs directly are rejected at lower
+        // time so users can't enumerate system facts through the
+        // query surface. The opt-in `opts.includeSystemFacts: true`
+        // (JSON-LD only) does not relax this — it only relaxes the
+        // variable-predicate scan filter.
+        let err = lower_query(
+            "PREFIX f: <https://ns.flur.ee/db#>\n\
+             SELECT ?ann ?s WHERE { ?ann f:reifiesSubject ?s }",
+        )
+        .expect_err("direct f:reifiesSubject mention must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("system-controlled") && msg.contains("reifies"),
+            "expected system-controlled rejection; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_rejects_user_authored_reifies_iri_inside_optional() {
+        // Recurse-into-container check: nested mentions inside
+        // OPTIONAL (and by extension UNION/MINUS/etc.) must also be
+        // caught by the post-lower walk.
+        let err = lower_query(
+            "PREFIX ex: <http://example.org/>\n\
+             PREFIX f: <https://ns.flur.ee/db#>\n\
+             SELECT ?ann WHERE { ?ann ex:role \"Engineer\" \
+              OPTIONAL { ?ann f:reifiesObject ?o } }",
+        )
+        .expect_err("nested f:reifies* mention must be rejected");
+        assert!(err.to_string().contains("system-controlled"));
+    }
 
     #[test]
     fn test_simple_select() {
@@ -1581,6 +2013,43 @@ mod tests {
     }
 
     #[test]
+    fn test_group_by_expression_reuses_matching_select_alias() {
+        // Field P0: `SELECT (LCASE(?cur) AS ?k) ... GROUP BY (LCASE(?cur))` must
+        // group on ?k (the SELECT alias), NOT on a fresh synthetic var. Grouping
+        // on a synthetic var left ?k as an ungrouped per-row variable, which the
+        // formatter then exploded into one row per input binding (LIMIT ignored).
+        let (query, vars) = lower_query_with_vars(
+            "PREFIX ex: <http://example.org/>
+             SELECT (LCASE(?cur) AS ?k) (COUNT(?s) AS ?n)
+             WHERE { ?s ex:currency ?cur } GROUP BY (LCASE(?cur))",
+        )
+        .unwrap();
+
+        assert_eq!(group_by_of(&query).len(), 1);
+        let group_var = group_by_of(&query)[0];
+
+        // The group key is the SELECT alias ?k, not a synthetic ?__group_expr_N.
+        assert_eq!(vars.name(group_var), "?k");
+
+        // Exactly one BIND targets ?k (the SELECT pre-bind); GROUP BY adds none.
+        let binds_to_k = query
+            .patterns
+            .iter()
+            .filter(|p| matches!(p, Pattern::Bind { var, .. } if *var == group_var))
+            .count();
+        assert_eq!(
+            binds_to_k, 1,
+            "expected exactly one BIND to the shared group/alias var"
+        );
+
+        // No synthetic group-expression var should have been created.
+        let has_synthetic = query.patterns.iter().any(
+            |p| matches!(p, Pattern::Bind { var, .. } if vars.name(*var).starts_with("?__group_expr_")),
+        );
+        assert!(!has_synthetic, "no synthetic group var should be generated");
+    }
+
+    #[test]
     fn test_group_by_bracketed_var_produces_no_bind() {
         // GROUP BY (?var) should NOT produce a BIND pattern — just unwrap the parens
         let query = lower_query(
@@ -1993,16 +2462,22 @@ mod tests {
     }
 
     #[test]
-    fn test_property_path_both_constants_error() {
-        let result = lower_query(
+    fn test_property_path_both_constants_is_reachability() {
+        // Both endpoints constant is a reachability test, not an error: it
+        // lowers to a PropertyPath whose both-Sid arm emits one empty solution
+        // iff a path exists (W3C `:a :p+ :b`).
+        let query = lower_query(
             "PREFIX ex: <http://example.org/>
              SELECT * WHERE { ex:alice ex:parent+ ex:bob }",
-        );
-
-        // Should error because both subject and object are bound
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(matches!(err, LowerError::InvalidPropertyPath { .. }));
+        )
+        .unwrap();
+        assert_eq!(query.patterns.len(), 1);
+        match &query.patterns[0] {
+            Pattern::PropertyPath(pp) => {
+                assert!(pp.subject.is_bound() && pp.object.is_bound());
+            }
+            other => panic!("expected PropertyPath, got {other:?}"),
+        }
     }
 
     #[test]
@@ -2074,17 +2549,16 @@ mod tests {
     }
 
     #[test]
-    fn test_property_path_inverse_transitive_both_constants_error() {
-        let result = lower_query(
+    fn test_property_path_inverse_transitive_both_constants_is_reachability() {
+        // `:a ^:p+ :b` both-constant inverse transitive is also a reachability
+        // test (lowers to a PropertyPath with swapped, both-bound endpoints).
+        let query = lower_query(
             "PREFIX ex: <http://example.org/>
              SELECT * WHERE { ex:alice ^ex:knows+ ex:bob }",
-        );
-
-        assert!(result.is_err());
-        assert!(matches!(
-            result.unwrap_err(),
-            LowerError::InvalidPropertyPath { .. }
-        ));
+        )
+        .unwrap();
+        assert_eq!(query.patterns.len(), 1);
+        assert!(matches!(&query.patterns[0], Pattern::PropertyPath(_)));
     }
 
     #[test]
@@ -2188,16 +2662,24 @@ mod tests {
     }
 
     #[test]
-    fn test_property_path_nested_alternative_under_transitive_errors() {
-        let result = lower_query(
+    fn test_property_path_alternation_transitive_lowers_to_multi_predicate() {
+        // `(a|b)+` is an alternation-transitive path: the closure follows an
+        // edge of either predicate per hop. Lowers to one PropertyPath carrying
+        // both predicates.
+        let query = lower_query(
             "PREFIX ex: <http://example.org/>
              SELECT ?x WHERE { ?s (ex:a|ex:b)+ ?x }",
-        );
+        )
+        .unwrap();
 
-        // Transitive requires simple predicate, not complex expression
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(matches!(err, LowerError::InvalidPropertyPath { .. }));
+        assert_eq!(query.patterns.len(), 1);
+        match &query.patterns[0] {
+            Pattern::PropertyPath(pp) => {
+                assert_eq!(pp.predicates.len(), 2, "both branches traversed: {pp:?}");
+                assert!(pp.single_predicate().is_none());
+            }
+            other => panic!("expected PropertyPath, got {other:?}"),
+        }
     }
 
     #[test]
@@ -3273,5 +3755,448 @@ mod tests {
             "Expected PropertyPath, got {:?}",
             query.patterns[0]
         );
+    }
+
+    // =========================================================================
+    // M4.3 — RDF 1.2 annotation lowering
+    // =========================================================================
+
+    #[test]
+    fn m43_annotation_block_lowers_to_edge_annotation_with_body() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT * WHERE { ex:alice ex:worksFor ex:acme {| ex:role \"Engineer\" |} . }",
+        )
+        .expect("lower should succeed");
+        assert_eq!(query.patterns.len(), 1);
+        match &query.patterns[0] {
+            Pattern::EdgeAnnotation {
+                body, annotation, ..
+            } => {
+                assert_eq!(body.len(), 1, "one annotation entry → one body triple");
+                assert!(
+                    matches!(annotation, Ref::Var(_)),
+                    "anonymous reifier mints var"
+                );
+                match &body[0] {
+                    Pattern::Triple(tp) => {
+                        // Body triple's subject is the annotation reifier var.
+                        match (&tp.s, annotation) {
+                            (Ref::Var(a), Ref::Var(b)) => assert_eq!(a, b),
+                            _ => panic!("body subject should match annotation ref"),
+                        }
+                    }
+                    other => panic!("body[0] should be Pattern::Triple, got {other:?}"),
+                }
+            }
+            other => panic!("expected Pattern::EdgeAnnotation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn m43_annotated_plain_string_literal_object_carries_xsd_string_dtc() {
+        // Plain string literal on the base edge of an annotated triple.
+        // `edge.dtc` must be Some(Explicit(xsd:string)) so the scan
+        // matches only xsd:string flakes — not, say, a custom-typed
+        // string with the same lexical value.
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT * WHERE { ex:alice ex:name \"Alice\" {| ex:source \"hr\" |} . }",
+        )
+        .unwrap();
+        match &query.patterns[0] {
+            Pattern::EdgeAnnotation { edge, body, .. } => {
+                match &edge.dtc {
+                    Some(fluree_db_core::DatatypeConstraint::Explicit(_)) => {}
+                    other => panic!("plain string base edge must have Explicit dtc, got {other:?}"),
+                }
+                // Annotation body entry should also carry dtc for its
+                // string literal value.
+                match &body[0] {
+                    Pattern::Triple(tp) => match &tp.dtc {
+                        Some(fluree_db_core::DatatypeConstraint::Explicit(_)) => {}
+                        other => {
+                            panic!("body string literal must have Explicit dtc, got {other:?}")
+                        }
+                    },
+                    other => panic!("body[0] should be Pattern::Triple, got {other:?}"),
+                }
+            }
+            other => panic!("expected Pattern::EdgeAnnotation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn m43_annotated_lang_tagged_literal_object_carries_lang_dtc() {
+        // Language-tagged literal on the base edge. `edge.dtc` must be
+        // Some(LangTag("fr")) so same-lexical literals in different
+        // languages do not cross-match.
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT * WHERE { ex:alice ex:label \"chat\"@fr {| ex:source \"lex\" |} . }",
+        )
+        .unwrap();
+        match &query.patterns[0] {
+            Pattern::EdgeAnnotation { edge, .. } => match &edge.dtc {
+                Some(fluree_db_core::DatatypeConstraint::LangTag(tag)) => {
+                    assert_eq!(tag.as_ref(), "fr");
+                }
+                other => panic!("lang-tagged base edge must have LangTag dtc, got {other:?}"),
+            },
+            other => panic!("expected EdgeAnnotation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn m43_annotated_typed_literal_object_carries_typed_dtc() {
+        // Typed literal — integer in this case. The constraint must be
+        // Some(Explicit(<xsd:integer sid>)) so scans don't cross
+        // datatypes.
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT * WHERE { ex:alice ex:age 30 {| ex:source \"hr\" |} . }",
+        )
+        .unwrap();
+        match &query.patterns[0] {
+            Pattern::EdgeAnnotation { edge, .. } => match &edge.dtc {
+                Some(fluree_db_core::DatatypeConstraint::Explicit(_)) => {}
+                other => panic!("typed literal base edge must have Explicit dtc, got {other:?}"),
+            },
+            other => panic!("expected EdgeAnnotation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn m43_named_iri_reifier_resolves_to_iri_ref() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT * WHERE { ex:alice ex:worksFor ex:acme ~ ex:rel {| ex:role \"x\" |} . }",
+        )
+        .unwrap();
+        match &query.patterns[0] {
+            Pattern::EdgeAnnotation { annotation, .. } => {
+                assert!(
+                    matches!(annotation, Ref::Iri(_) | Ref::Sid(_)),
+                    "explicit IRI reifier resolves to a constant ref, got {annotation:?}"
+                );
+            }
+            other => panic!("expected EdgeAnnotation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn m43_named_var_reifier_resolves_to_var() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT * WHERE { ex:alice ex:worksFor ex:acme ~ ?ann {| ex:role \"x\" |} . }",
+        )
+        .unwrap();
+        match &query.patterns[0] {
+            Pattern::EdgeAnnotation { annotation, .. } => {
+                assert!(matches!(annotation, Ref::Var(_)));
+            }
+            other => panic!("expected EdgeAnnotation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn m43_empty_block_emits_empty_body() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT * WHERE { ex:alice ex:worksFor ex:acme {| |} . }",
+        )
+        .unwrap();
+        match &query.patterns[0] {
+            Pattern::EdgeAnnotation { body, .. } => assert!(body.is_empty()),
+            other => panic!("expected EdgeAnnotation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn m43_bare_tilde_reifier_emits_empty_body() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT * WHERE { ex:alice ex:worksFor ex:acme ~ ?ann . }",
+        )
+        .unwrap();
+        match &query.patterns[0] {
+            Pattern::EdgeAnnotation {
+                body, annotation, ..
+            } => {
+                assert!(body.is_empty());
+                assert!(matches!(annotation, Ref::Var(_)));
+            }
+            other => panic!("expected EdgeAnnotation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn m43_rdf_reifies_lowers_to_annotation_target_with_empty_body() {
+        let query = lower_query(
+            "PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+             PREFIX ex: <http://example.org/>
+             SELECT * WHERE { ?ann rdf:reifies <<( ex:alice ex:worksFor ex:acme )>> . }",
+        )
+        .unwrap();
+        // The pattern list contains exactly one AnnotationTarget. Sibling
+        // triples about ?ann (none in this query) would join via the
+        // standard executor — the AnnotationTarget itself carries no body.
+        let n = query
+            .patterns
+            .iter()
+            .filter(|p| matches!(p, Pattern::AnnotationTarget { .. }))
+            .count();
+        assert_eq!(n, 1, "expected exactly one AnnotationTarget IR pattern");
+        for p in &query.patterns {
+            if let Pattern::AnnotationTarget { body, .. } = p {
+                assert!(body.is_empty(), "M4.3 emits empty body");
+            }
+        }
+    }
+
+    #[test]
+    fn m43_sibling_triples_about_reifier_stay_in_outer_scope() {
+        // ?ann ex:role "Engineer" must remain a regular Pattern::Triple
+        // alongside the AnnotationTarget — NOT folded into body.
+        let query = lower_query(
+            "PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+             PREFIX ex: <http://example.org/>
+             SELECT * WHERE {
+               ?ann rdf:reifies <<( ex:alice ex:worksFor ex:acme )>> .
+               ?ann ex:role \"Engineer\" .
+             }",
+        )
+        .unwrap();
+        let n_target = query
+            .patterns
+            .iter()
+            .filter(|p| matches!(p, Pattern::AnnotationTarget { .. }))
+            .count();
+        let n_triple = query
+            .patterns
+            .iter()
+            .filter(|p| matches!(p, Pattern::Triple(_)))
+            .count();
+        assert_eq!(n_target, 1);
+        assert_eq!(n_triple, 1, "sibling stays as outer Pattern::Triple");
+        // And the body of AnnotationTarget is empty.
+        for p in &query.patterns {
+            if let Pattern::AnnotationTarget { body, .. } = p {
+                assert!(body.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn m43_rebound_rdf_prefix_with_reifies_is_rejected_at_lower_time() {
+        // The parser recognizes `rdf:reifies` lexically. If the user
+        // rebinds `rdf:` to a non-standard namespace, the resulting
+        // IRI is NOT the standard rdf:reifies and must be rejected by
+        // the lower step. Mirrors the JSON-LD path's strict-IRI rule.
+        let err = lower_query(
+            "PREFIX rdf: <http://example.org/fake-rdf#>
+             PREFIX ex:  <http://example.org/>
+             SELECT * WHERE {
+               ?ann rdf:reifies <<( ex:a ex:b ex:c )>> .
+             }",
+        )
+        .expect_err("rebound rdf:reifies must be rejected at lower time");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("does not resolve to rdf:reifies"),
+            "expected prefix-rejection diagnostic, got: {msg}"
+        );
+    }
+
+    // =========================================================================
+    // M4.5 — CONSTRUCT boundary
+    // =========================================================================
+
+    #[test]
+    fn m45_construct_with_annotation_in_template_is_rejected() {
+        let err = lower_query(
+            "PREFIX ex: <http://example.org/>
+             CONSTRUCT { ex:alice ex:worksFor ex:acme {| ex:role \"Engineer\" |} }
+             WHERE { ex:alice ex:worksFor ex:acme }",
+        )
+        .expect_err("annotation in CONSTRUCT template must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("CONSTRUCT projection of edge-annotation"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn m45_construct_without_annotation_in_template_works_with_annotation_where() {
+        // Annotation in WHERE filters the matches; template projects only
+        // ordinary triples. This must succeed.
+        lower_query(
+            "PREFIX ex: <http://example.org/>
+             CONSTRUCT { ?p ex:knows ex:acme }
+             WHERE { ?p ex:worksFor ex:acme {| ex:role \"Engineer\" |} . }",
+        )
+        .expect("CONSTRUCT-without-annotation-in-template + annotation-in-WHERE should lower");
+    }
+
+    #[test]
+    fn m43_does_not_trip_user_authored_reifies_firewall() {
+        // An @annotation lowering legitimately produces internal
+        // f:reifies* fan-out at execute time via
+        // expand_edge_annotation_patterns. The firewall must NOT
+        // reject it at lower time, because the f:reifies* triples
+        // don't appear in the IR yet.
+        let result = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT * WHERE { ex:alice ex:worksFor ex:acme {| ex:role \"x\" |} . }",
+        );
+        assert!(
+            result.is_ok(),
+            "lower should not be rejected by the firewall"
+        );
+    }
+}
+
+#[cfg(test)]
+mod pragma_tests {
+    use super::*;
+    use crate::parse::parse_sparql;
+    use fluree_db_query::parse::encode::MemoryEncoder;
+
+    fn lower_query(sparql: &str) -> Result<Query> {
+        let output = parse_sparql(sparql);
+        assert!(
+            output.ast.is_some(),
+            "Parse failed: {:?}",
+            output.diagnostics
+        );
+        let mut encoder = MemoryEncoder::with_common_namespaces();
+        encoder.add_namespace("http://example.org/", 100);
+        let mut vars = VarRegistry::new();
+        lower_sparql(&output.ast.unwrap(), &encoder, &mut vars)
+    }
+
+    #[test]
+    fn pragma_reasoning_owl2rl_sets_query_modes() {
+        let query = lower_query(
+            "# PRAGMA reasoning: owl2rl
+             PREFIX ex: <http://example.org/>
+             SELECT ?s WHERE { ?s a ex:Student }",
+        )
+        .unwrap();
+        assert!(query.reasoning.modes.owl2rl);
+        assert!(query.reasoning.has_reasoning());
+    }
+
+    #[test]
+    fn pragma_reasoning_none_disables() {
+        let query = lower_query(
+            "# PRAGMA reasoning: none
+             SELECT * WHERE { ?s ?p ?o }",
+        )
+        .unwrap();
+        assert!(query.reasoning.is_reasoning_disabled());
+    }
+
+    #[test]
+    fn pragma_reasoning_multi_mode_merges() {
+        let query = lower_query(
+            "# PRAGMA reasoning: rdfs, datalog
+             SELECT * WHERE { ?s ?p ?o }",
+        )
+        .unwrap();
+        assert!(query.reasoning.modes.rdfs);
+        assert!(query.reasoning.modes.datalog);
+        assert!(!query.reasoning.modes.owl2rl);
+    }
+
+    #[test]
+    fn no_pragma_leaves_default_config() {
+        let query = lower_query("SELECT * WHERE { ?s ?p ?o }").unwrap();
+        assert!(!query.reasoning.has_reasoning());
+    }
+
+    #[test]
+    fn pragma_reasoning_applies_to_ask() {
+        let query = lower_query(
+            "# PRAGMA reasoning: owl2rl
+             ASK { ?s ?p ?o }",
+        )
+        .unwrap();
+        assert!(query.reasoning.modes.owl2rl);
+    }
+
+    #[test]
+    fn pragma_reasoning_unknown_mode_errors() {
+        let err = lower_query(
+            "# PRAGMA reasoning: owl3xl
+             SELECT * WHERE { ?s ?p ?o }",
+        )
+        .unwrap_err();
+        assert!(matches!(err, LowerError::InvalidPragma { .. }), "{err}");
+    }
+
+    #[test]
+    fn pragma_reasoning_empty_errors() {
+        let err = lower_query(
+            "# PRAGMA reasoning:
+             SELECT * WHERE { ?s ?p ?o }",
+        )
+        .unwrap_err();
+        assert!(matches!(err, LowerError::InvalidPragma { .. }), "{err}");
+    }
+
+    #[test]
+    fn pragma_reasoning_none_combined_errors() {
+        let err = lower_query(
+            "# PRAGMA reasoning: none, rdfs
+             SELECT * WHERE { ?s ?p ?o }",
+        )
+        .unwrap_err();
+        assert!(matches!(err, LowerError::InvalidPragma { .. }), "{err}");
+    }
+
+    #[test]
+    fn pragma_reasoning_budget_sets_modes() {
+        let query = lower_query(
+            "# PRAGMA reasoning: owl2rl
+             # PRAGMA reasoning-max-facts: 20000000
+             # PRAGMA reasoning-max-seconds: 300
+             SELECT * WHERE { ?s ?p ?o }",
+        )
+        .unwrap();
+        assert!(query.reasoning.modes.owl2rl);
+        assert_eq!(query.reasoning.modes.max_facts, Some(20_000_000));
+        assert_eq!(query.reasoning.modes.max_seconds, Some(300));
+    }
+
+    #[test]
+    fn pragma_reasoning_budget_without_mode_is_carried() {
+        // A budget pragma alone doesn't enable reasoning, but it must survive
+        // lowering so a ledger-config default mode runs under it.
+        let query = lower_query(
+            "# PRAGMA reasoning-max-facts: 5
+             SELECT * WHERE { ?s ?p ?o }",
+        )
+        .unwrap();
+        assert!(!query.reasoning.modes.has_any_enabled());
+        assert_eq!(query.reasoning.modes.max_facts, Some(5));
+    }
+
+    #[test]
+    fn pragma_reasoning_budget_invalid_number_errors() {
+        let err = lower_query(
+            "# PRAGMA reasoning-max-facts: lots
+             SELECT * WHERE { ?s ?p ?o }",
+        )
+        .unwrap_err();
+        assert!(matches!(err, LowerError::InvalidPragma { .. }), "{err}");
+
+        let err = lower_query(
+            "# PRAGMA reasoning-max-seconds:
+             SELECT * WHERE { ?s ?p ?o }",
+        )
+        .unwrap_err();
+        assert!(matches!(err, LowerError::InvalidPragma { .. }), "{err}");
     }
 }

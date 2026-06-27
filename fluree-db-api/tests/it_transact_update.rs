@@ -2,9 +2,7 @@
 //!
 //! Note: The `transaction-functions` section (hash/datetime) is covered with bind support.
 
-use std::sync::Arc;
-mod support;
-
+use crate::support;
 use fluree_db_api::{FlureeBuilder, IndexConfig, LedgerState, Novelty};
 use fluree_db_core::{load_commit_by_id, FlakeValue, LedgerSnapshot};
 use fluree_db_transact::{CommitOpts, TxnOpts};
@@ -927,7 +925,12 @@ async fn update_where_bind_rdf_term_functions() {
     assert_eq!(result.get("ex:isIRI"), Some(&json!(true)));
     assert_eq!(result.get("ex:isLiteral"), Some(&json!(true)));
     assert_eq!(result.get("ex:lang"), Some(&json!("es")));
-    assert_eq!(result.get("ex:datatype"), Some(&json!("rdf:langString")));
+    // DATATYPE returns the datatype IRI (SPARQL 1.1 §17.4.2.3), so binding it
+    // and inserting stores an IRI reference, not a plain string.
+    assert_eq!(
+        result.get("ex:datatype"),
+        Some(&json!({"@id": "rdf:langString"}))
+    );
     assert_eq!(
         result.get("ex:strdt"),
         Some(&json!({"@value": "Abcdefg", "@type": "ex:mystring"}))
@@ -1894,7 +1897,7 @@ async fn update_values_wildcard_delete_across_two_transactions() {
 #[cfg(feature = "native")]
 #[tokio::test]
 async fn update_values_wildcard_delete_index_plus_novelty() {
-    use support::{start_background_indexer_local, trigger_index_and_wait};
+    use crate::support::{start_background_indexer_local, trigger_index_and_wait};
 
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/transact-update:wildcard-delete-indexed";
@@ -1907,7 +1910,10 @@ async fn update_values_wildcard_delete_index_plus_novelty() {
 
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        Arc::new(fluree.nameservice_mode().clone()),
+        fluree
+            .nameservice_mode()
+            .publisher_arc()
+            .expect("test setup requires ReadWrite nameservice mode"),
         Default::default(),
     );
 
@@ -2025,7 +2031,7 @@ async fn update_values_wildcard_delete_index_plus_novelty() {
 #[cfg(feature = "native")]
 #[tokio::test]
 async fn update_wildcard_delete_duplicate_facts_across_index_and_novelty() {
-    use support::{start_background_indexer_local, trigger_index_and_wait};
+    use crate::support::{start_background_indexer_local, trigger_index_and_wait};
 
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/transact-update:wildcard-delete-dup-index-novelty";
@@ -2038,7 +2044,10 @@ async fn update_wildcard_delete_duplicate_facts_across_index_and_novelty() {
 
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        Arc::new(fluree.nameservice_mode().clone()),
+        fluree
+            .nameservice_mode()
+            .publisher_arc()
+            .expect("test setup requires ReadWrite nameservice mode"),
         Default::default(),
     );
 
@@ -2155,7 +2164,7 @@ async fn update_wildcard_delete_duplicate_facts_across_index_and_novelty() {
 #[cfg(feature = "native")]
 #[tokio::test]
 async fn update_values_wildcard_delete_after_updates_and_indexing() {
-    use support::{start_background_indexer_local, trigger_index_and_wait};
+    use crate::support::{start_background_indexer_local, trigger_index_and_wait};
 
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/transact-update:wildcard-delete-updates-indexed";
@@ -2168,7 +2177,10 @@ async fn update_values_wildcard_delete_after_updates_and_indexing() {
 
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        Arc::new(fluree.nameservice_mode().clone()),
+        fluree
+            .nameservice_mode()
+            .publisher_arc()
+            .expect("test setup requires ReadWrite nameservice mode"),
         Default::default(),
     );
 

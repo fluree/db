@@ -389,3 +389,110 @@ async fn owl2rl_domain_range_and_chain_visible_via_execute_with_overlay() {
     got_o.dedup();
     assert_eq!(got_o, vec![charlie]);
 }
+
+#[tokio::test]
+async fn owl2rl_enabled_rules_filters_rule_families() {
+    // Same shape as the test above: domain/range axioms + a property chain,
+    // but reasoning runs with only `prp-spo2` enabled, so chain facts must
+    // derive while domain/range rdf:type facts must not.
+    let mut snapshot = LedgerSnapshot::genesis("test/enabled-rules");
+    snapshot
+        .insert_namespace_code(3, "http://www.w3.org/1999/02/22-rdf-syntax-ns#".to_string())
+        .unwrap();
+    snapshot
+        .insert_namespace_code(4, "http://www.w3.org/2000/01/rdf-schema#".to_string())
+        .unwrap();
+    snapshot
+        .insert_namespace_code(6, "http://www.w3.org/2002/07/owl#".to_string())
+        .unwrap();
+    snapshot
+        .insert_namespace_code(100, "http://example.org/".to_string())
+        .unwrap();
+
+    let person = sid_ex("Person");
+    let parent_of = sid_ex("parentOf");
+    let grandparent_of = sid_ex("grandparentOf");
+
+    let alice = sid_ex("alice");
+    let bob = sid_ex("bob");
+    let charlie = sid_ex("charlie");
+
+    let rdf_type = sid_rdf("type");
+    let rdf_first = sid_rdf("first");
+    let rdf_rest = sid_rdf("rest");
+    let rdf_nil = sid_rdf("nil");
+    let rdfs_domain = sid_rdfs("domain");
+    let rdfs_range = sid_rdfs("range");
+    let owl_chain = sid_owl("propertyChainAxiom");
+
+    let list1 = sid_ex("list1");
+    let list2 = sid_ex("list2");
+
+    let flakes: Vec<Flake> = vec![
+        flake_ref(parent_of.clone(), rdfs_domain, person.clone(), 1),
+        flake_ref(parent_of.clone(), rdfs_range, person, 1),
+        flake_ref(grandparent_of.clone(), owl_chain, list1.clone(), 1),
+        flake_ref(list1.clone(), rdf_first.clone(), parent_of.clone(), 1),
+        flake_ref(list1, rdf_rest.clone(), list2.clone(), 1),
+        flake_ref(list2.clone(), rdf_first, parent_of.clone(), 1),
+        flake_ref(list2, rdf_rest, rdf_nil, 1),
+        flake_ref(alice.clone(), parent_of.clone(), bob.clone(), 1),
+        flake_ref(bob, parent_of, charlie.clone(), 1),
+    ];
+
+    let overlay_epoch = overlay_epoch_from_flakes(&flakes);
+    let overlay = SortedOverlay::new(overlay_epoch, flakes);
+
+    let opts = ReasoningOptions {
+        enabled_rules: vec!["prp-spo2".to_string()],
+        ..Default::default()
+    };
+    let cache = ReasoningCache::with_default_capacity();
+    let db = GraphDbRef::new(&snapshot, 0, &overlay, 10);
+    let result = reason_owl2rl(db, &opts, &cache).await.unwrap();
+
+    let mut derived: Vec<Flake> = Vec::new();
+    result.overlay.for_each_overlay_flake(
+        0,
+        IndexType::Spot,
+        None,
+        None,
+        true,
+        i64::MAX,
+        &mut |f| derived.push(f.clone()),
+    );
+
+    assert!(
+        derived
+            .iter()
+            .any(|f| f.s == alice && f.p == grandparent_of),
+        "prp-spo2 enabled: expected alice grandparentOf charlie to be derived"
+    );
+    assert!(
+        !derived.iter().any(|f| f.p == rdf_type),
+        "prp-dom/prp-rng disabled: expected no derived rdf:type facts, got {:?}",
+        derived
+            .iter()
+            .filter(|f| f.p == rdf_type)
+            .collect::<Vec<_>>()
+    );
+
+    // Empty enabled_rules = all rules: domain/range types derive too.
+    let all_opts = ReasoningOptions::default();
+    let db = GraphDbRef::new(&snapshot, 0, &overlay, 10);
+    let all_result = reason_owl2rl(db, &all_opts, &cache).await.unwrap();
+    let mut all_derived: Vec<Flake> = Vec::new();
+    all_result.overlay.for_each_overlay_flake(
+        0,
+        IndexType::Spot,
+        None,
+        None,
+        true,
+        i64::MAX,
+        &mut |f| all_derived.push(f.clone()),
+    );
+    assert!(
+        all_derived.iter().any(|f| f.p == rdf_type),
+        "all rules enabled: expected derived rdf:type facts"
+    );
+}

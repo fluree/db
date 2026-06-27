@@ -24,6 +24,19 @@ pub fn rewrite_query_patterns(
     reasoning: &ReasoningModes,
     ontology: Option<&Ontology>,
 ) -> (Vec<Pattern>, Diagnostics) {
+    // When OWL2-RL materialization is active, every entailment the pattern
+    // rewriter would expand — subclass / subproperty UNIONs, owl:inverseOf,
+    // rdfs:domain/range type inference — has already been forward-chained into
+    // the derived-facts overlay. Re-applying the query rewrite on top would
+    // match the same entailment twice (once via a materialized superclass/
+    // superproperty fact, once via a base subclass/subproperty UNION branch),
+    // yielding duplicate solution rows under bag semantics (COUNT, aggregation,
+    // non-DISTINCT SELECT). Materialization is a superset of what the rewrite
+    // produces, so rely on it alone and skip the rewrite entirely.
+    if reasoning.owl2rl {
+        return (patterns.to_vec(), Diagnostics::default());
+    }
+
     // Check if any pattern rewriting is needed
     let needs_rdfs = reasoning.rdfs;
     let needs_owl2ql = reasoning.owl2ql;
@@ -96,16 +109,7 @@ mod tests {
     #[test]
     fn test_no_rewriting_when_disabled() {
         let patterns = vec![];
-        let modes = ReasoningModes {
-            rdfs: false,
-            owl2ql: false,
-            owl2rl: false,
-            datalog: false,
-            owl_datalog: false,
-            explicit_none: false,
-            rules: vec![],
-            ontology: None,
-        };
+        let modes = ReasoningModes::default();
 
         let (rewritten, diag) = rewrite_query_patterns(&patterns, None, &modes, None);
         assert_eq!(rewritten.len(), 0);

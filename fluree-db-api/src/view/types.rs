@@ -15,6 +15,37 @@ use fluree_db_policy::PolicyContext;
 use fluree_db_query::ir::ReasoningModes;
 use fluree_db_query::policy::QueryPolicyEnforcer;
 
+/// OWL2-RL materialization budget resolved from ledger config
+/// (`f:reasoningMaxFacts` / `f:reasoningMaxSeconds` in `f:reasoningDefaults`).
+///
+/// `force: true` means the reasoning setting group's override control denies
+/// this request, so a query-supplied budget is replaced by these values
+/// (including `None` values — the operator's "use system defaults" stands).
+/// `force: false` means the config values fill in whatever the query left
+/// unspecified.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConfigReasoningBudget {
+    /// `f:reasoningMaxFacts` — max derived facts before capping.
+    pub max_facts: Option<u64>,
+    /// `f:reasoningMaxSeconds` — max materialization wall-clock seconds.
+    pub max_seconds: Option<u64>,
+    /// Whether these values override a query-supplied budget.
+    pub force: bool,
+}
+
+impl ConfigReasoningBudget {
+    /// Merge this config budget into a query's reasoning modes.
+    pub fn apply(&self, modes: &mut ReasoningModes) {
+        if self.force {
+            modes.max_facts = self.max_facts;
+            modes.max_seconds = self.max_seconds;
+        } else {
+            modes.max_facts = modes.max_facts.or(self.max_facts);
+            modes.max_seconds = modes.max_seconds.or(self.max_seconds);
+        }
+    }
+}
+
 /// How wrapper-provided reasoning interacts with query-specified reasoning.
 ///
 /// Controls the precedence when both the view wrapper and the query itself
@@ -124,6 +155,15 @@ pub struct GraphDb {
 
     /// Precedence for reasoning mode resolution.
     reasoning_precedence: ReasoningModePrecedence,
+
+    /// OWL2-RL materialization budget from ledger config
+    /// (`f:reasoningMaxFacts` / `f:reasoningMaxSeconds`).
+    ///
+    /// Kept separate from `reasoning` because the budget applies whether the
+    /// reasoning *modes* come from config or from the query: a query that
+    /// overrides modes still runs under the configured budget unless override
+    /// control permits it to bring its own.
+    config_reasoning_budget: Option<ConfigReasoningBudget>,
 
     // ========================================================================
     // Binary index store (optional)
@@ -248,6 +288,7 @@ impl GraphDb {
             policy_enforcer: None,
             reasoning: None,
             reasoning_precedence: ReasoningModePrecedence::default(),
+            config_reasoning_budget: None,
             binary_store: None,
             dict_novelty: None,
             runtime_small_dicts: None,
@@ -511,13 +552,16 @@ impl GraphDb {
 
     /// Build a `BinaryGraphView` combining the binary store with the view's graph ID.
     ///
-    /// Returns `None` if no binary store is attached.
+    /// Returns `None` if no binary store is attached. The view carries
+    /// `dict_novelty` so encoded IDs allocated after the index snapshot
+    /// (novelty-only subjects/strings) resolve via watermark routing instead
+    /// of failing against the persisted forward packs.
     pub fn binary_graph(&self) -> Option<BinaryGraphView> {
         self.binary_store.as_ref().map(|store| {
             // `shared_namespaces()` is a refcount bump on the snapshot's already-Arc
             // namespace table; `namespaces().clone()` would deep-copy the whole map
             // on every query (a dominant per-query cost on large ledgers).
-            BinaryGraphView::new(store.clone(), self.graph_id)
+            BinaryGraphView::with_novelty(store.clone(), self.graph_id, self.dict_novelty.clone())
                 .with_namespace_codes_fallback(Some(self.snapshot.shared_namespaces()))
         })
     }
@@ -759,10 +803,24 @@ impl GraphDb {
 
     /// Remove reasoning defaults from the view.
     ///
-    /// Queries will use their own reasoning modes (or auto-RDFS).
+    /// Queries will use their own reasoning modes (default: none).
     pub fn without_reasoning(mut self) -> Self {
         self.reasoning = None;
         self
+    }
+
+    /// Attach the ledger-config OWL2-RL materialization budget.
+    ///
+    /// Applied to the effective query modes by the executable builders
+    /// (independent of mode precedence — see [`ConfigReasoningBudget`]).
+    pub fn with_config_reasoning_budget(mut self, budget: ConfigReasoningBudget) -> Self {
+        self.config_reasoning_budget = Some(budget);
+        self
+    }
+
+    /// Get the ledger-config materialization budget (if configured).
+    pub fn config_reasoning_budget(&self) -> Option<&ConfigReasoningBudget> {
+        self.config_reasoning_budget.as_ref()
     }
 
     /// Get the wrapper's reasoning modes (if any).
@@ -783,8 +841,8 @@ impl GraphDb {
     ///   reasoning enabled or explicitly disabled
     /// - `Force`: Wrapper modes always win
     ///
-    /// Returns `None` if no reasoning should be applied (let query engine
-    /// use its auto-RDFS behavior).
+    /// Returns `None` if this view contributes no reasoning default (the
+    /// query's own modes apply; reasoning stays off unless they request it).
     pub fn effective_reasoning(
         &self,
         query_has_reasoning: bool,

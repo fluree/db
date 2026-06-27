@@ -16,12 +16,19 @@ name = "fluree_db_cli"
 path = "src/lib.rs"
 
 [features]
-default = ["server", "iceberg", "shacl"]
+# `aws` is on by default so the shipped CLI (incl. the Docker image, which
+# reuses the dist binary) can use S3 storage + DynamoDB nameservice via
+# connection config. Dormant unless configured; ~+2 MB over the AWS SDK that
+# `iceberg` already pulls in.
+default = ["server", "iceberg", "shacl", "aws"]
 server = ["dep:fluree-db-server"]
 iceberg = ["fluree-db-api/iceberg"]
 aws = ["fluree-db-server/aws"]
 # SHACL constraint validation at transaction time
 shacl = ["fluree-db-api/shacl"]
+# Use mimalloc as the global allocator (better multicore allocation throughput
+# for query/import/materialization paths). Opt-in; enable in release packaging.
+mimalloc = ["dep:mimalloc"]
 otel = [
     "dep:tracing-opentelemetry",
     "dep:opentelemetry",
@@ -30,7 +37,11 @@ otel = [
 ]
 
 [dependencies]
+# Optional global allocator (see the `mimalloc` feature).
+mimalloc = { workspace = true, optional = true }
 fluree-db-api = { path = "../fluree-db-api" }
+# Temp dir for streaming CSV → .jsonl into the bulk import pipeline.
+tempfile = "3"
 fluree-db-novelty = { path = "../fluree-db-novelty" }
 fluree-db-nameservice = { path = "../fluree-db-nameservice" }
 fluree-db-core = { path = "../fluree-db-core" }
@@ -39,11 +50,14 @@ fluree-vocab = { path = "../fluree-vocab" }
 fluree-db-query = { path = "../fluree-db-query" }
 fluree-db-binary-index = { path = "../fluree-db-binary-index" }
 
-# Developer memory layer
-fluree-db-memory = { path = "../fluree-db-memory", features = ["mcp"] }
+# Developer memory layer (store + CLI subcommands)
+fluree-db-memory = { path = "../fluree-db-memory" }
 
-# MCP stdio server
-rmcp = { workspace = true }
+# Embedded docs lookup (human `fluree docs` CLI subcommand)
+fluree-db-docs = { path = "../fluree-db-docs" }
+
+# Unified MCP service (stdio) — selectable memory/docs toolsets
+fluree-db-mcp = { path = "../fluree-db-mcp" }
 
 # Server embedding (optional — enables `fluree server` subcommands)
 fluree-db-server = { path = "../fluree-db-server", optional = true }
@@ -89,14 +103,14 @@ rand.workspace = true
 sha2.workspace = true
 
 # Remote ledger client (track mode) + OIDC discovery/exchange
-reqwest = { workspace = true }
+# `stream` enables streaming a .flpack file body to POST /import without
+# buffering the whole archive; `tokio-util` io gives ReaderStream for it.
+reqwest = { workspace = true, features = ["stream"] }
+tokio-util = { version = "0.7", features = ["io"] }
 bytes.workspace = true
 urlencoding = { workspace = true }
 percent-encoding = "2"
 open = "5"
-
-# Memory-mapped file I/O (flpack import)
-memmap2 = "0.9"
 
 # Sync command dependencies
 fluree-db-nameservice-sync = { path = "../fluree-db-nameservice-sync" }

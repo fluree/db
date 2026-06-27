@@ -1,9 +1,12 @@
 pub mod auth;
 pub mod branch;
+#[cfg(feature = "server")]
+pub mod cluster;
 pub mod completions;
 pub mod config_cmd;
 pub mod context_cmd;
 pub mod create;
+pub mod docs;
 pub mod drop;
 pub mod export;
 pub mod graph;
@@ -15,11 +18,12 @@ pub mod init;
 pub mod insert;
 pub mod list;
 pub mod log;
-pub mod mcp_serve;
+pub mod mcp;
 pub mod memory;
 pub mod multi_query;
 pub mod prefix;
 pub mod query;
+pub mod query_stream;
 pub mod remote;
 #[cfg(feature = "server")]
 pub mod server;

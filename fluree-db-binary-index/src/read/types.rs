@@ -251,6 +251,26 @@ pub fn cmp_overlay_vs_record(
     }
 }
 
+/// Binary-search the window of `ops` (sorted by `order`) that intersects the
+/// inclusive key range `[min_key, max_key]`.
+///
+/// Ops outside the window can never match a cursor bounded by those keys, so
+/// a range-bounded cursor should be given only this window — otherwise every
+/// probe pays an O(overlay) merge walk and loses leaflet pre-skips (the
+/// first-leaf overlay window deliberately includes all preceding ops).
+pub fn overlay_window_for_range(
+    ops: &[OverlayOp],
+    min_key: &crate::format::run_record_v2::RunRecordV2,
+    max_key: &crate::format::run_record_v2::RunRecordV2,
+    order: RunSortOrder,
+) -> (usize, usize) {
+    let start =
+        ops.partition_point(|ov| cmp_overlay_vs_record(ov, min_key, order) == Ordering::Less);
+    let end =
+        ops.partition_point(|ov| cmp_overlay_vs_record(ov, max_key, order) != Ordering::Greater);
+    (start, end.max(start))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

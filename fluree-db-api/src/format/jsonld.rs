@@ -227,6 +227,29 @@ fn write_value(out: &mut String, binding: &Binding, compactor: &IriCompactor) ->
             }
             out.push(']');
         }
+        // A path renders as an array of its node IRIs (start → end).
+        Binding::Path(nodes) => {
+            out.push('[');
+            for (i, sid) in nodes.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                push_json_string(out, &compactor.compact_id_sid(sid)?);
+            }
+            out.push(']');
+        }
+        // A list (collect / list literal / list function) renders as a JSON
+        // array of its elements.
+        Binding::List(values) => {
+            out.push('[');
+            for (i, v) in values.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                write_value(out, v, compactor)?;
+            }
+            out.push(']');
+        }
     }
     Ok(())
 }
@@ -334,7 +357,7 @@ fn write_scalar(out: &mut String, val: &FlakeValue, json_as_string: bool) -> Res
             ));
         }
         FlakeValue::BigInt(n) => push_json_string(out, &n.to_string()),
-        FlakeValue::Decimal(d) => push_json_string(out, &d.to_string()),
+        FlakeValue::Decimal(d) => push_json_string(out, &d.to_plain_string()),
         // Temporal types + GeoPoint: original lexical string (FlakeValue Display
         // delegates to the inner value's Display for these variants).
         other => push_json_string(out, &other.to_string()),
@@ -434,7 +457,7 @@ pub(crate) fn format_binding(binding: &Binding, compactor: &IriCompactor) -> Res
                     )),
                     // Extended numeric types - serialize as string
                     FlakeValue::BigInt(n) => Ok(JsonValue::String(n.to_string())),
-                    FlakeValue::Decimal(d) => Ok(JsonValue::String(d.to_string())),
+                    FlakeValue::Decimal(d) => Ok(JsonValue::String(d.to_plain_string())),
                     // Temporal types - serialize as original string
                     FlakeValue::DateTime(dt) => Ok(JsonValue::String(dt.to_string())),
                     FlakeValue::Date(d) => Ok(JsonValue::String(d.to_string())),
@@ -483,7 +506,7 @@ pub(crate) fn format_binding(binding: &Binding, compactor: &IriCompactor) -> Res
                 }
                 // Extended numeric types - serialize as string with @type
                 FlakeValue::BigInt(n) => JsonValue::String(n.to_string()),
-                FlakeValue::Decimal(d) => JsonValue::String(d.to_string()),
+                FlakeValue::Decimal(d) => JsonValue::String(d.to_plain_string()),
                 // Temporal types - serialize as original string with @type
                 FlakeValue::DateTime(dt) => JsonValue::String(dt.to_string()),
                 FlakeValue::Date(d) => JsonValue::String(d.to_string()),
@@ -521,6 +544,24 @@ pub(crate) fn format_binding(binding: &Binding, compactor: &IriCompactor) -> Res
 
         // Grouped values (from GROUP BY without aggregation)
         Binding::Grouped(values) => {
+            let arr: Result<Vec<_>> = values
+                .iter()
+                .map(|v| format_binding(v, compactor))
+                .collect();
+            Ok(JsonValue::Array(arr?))
+        }
+
+        // A path renders as an array of its node IRIs (start → end).
+        Binding::Path(nodes) => {
+            let arr: Result<Vec<_>> = nodes
+                .iter()
+                .map(|sid| compactor.compact_id_sid(sid).map(JsonValue::String))
+                .collect();
+            Ok(JsonValue::Array(arr?))
+        }
+
+        // A list renders as a JSON array of its elements.
+        Binding::List(values) => {
             let arr: Result<Vec<_>> = values
                 .iter()
                 .map(|v| format_binding(v, compactor))
@@ -591,9 +632,10 @@ fn format_row_wildcard(
 
             let var_name = vars.name(var_id);
 
-            // Skip internal variables (e.g. ?__pp0, ?__s0, ?__n0) from wildcard output.
-            // The ?__ prefix is reserved for internal use.
-            if var_name.starts_with("?__") {
+            // Skip internal / non-distinguished variables (planner synthetics
+            // `?__*`, annotation-reifier synthetics `?#*`, SPARQL blank-node
+            // vars `_:*` per §4.1.4). See `format::is_internal_var_name`.
+            if super::is_internal_var_name(var_name) {
                 continue;
             }
 

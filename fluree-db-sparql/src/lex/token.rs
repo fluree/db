@@ -77,6 +77,9 @@ pub enum TokenKind {
     /// Integer literal
     Integer(i64),
 
+    /// Integer literal beyond i64 (stored as string; xsd:integer is unbounded)
+    BigInteger(Arc<str>),
+
     /// Decimal literal (stored as string to preserve precision)
     Decimal(Arc<str>),
 
@@ -238,6 +241,8 @@ pub enum TokenKind {
     // Prologue
     KwBase,
     KwPrefix,
+    /// SPARQL 1.2 `VERSION "1.2"` declaration keyword.
+    KwVersion,
 
     // Update
     KwInsert,
@@ -291,6 +296,18 @@ pub enum TokenKind {
     TripleStart,
     /// `>>` (quoted triple end)
     TripleEnd,
+
+    // RDF 1.2 reifier / annotation delimiters
+    /// `<<(` (triple term start)
+    TripleTermStart,
+    /// `)>>` (triple term end)
+    TripleTermEnd,
+    /// `{|` (annotation block start)
+    AnnotationOpen,
+    /// `|}` (annotation block end)
+    AnnotationClose,
+    /// `~` (reifier marker)
+    Tilde,
 
     /// `.`
     Dot,
@@ -581,6 +598,7 @@ impl TokenKind {
             TokenKind::KwStrUuid => Some("STRUUID"),
             TokenKind::KwBase => Some("BASE"),
             TokenKind::KwPrefix => Some("PREFIX"),
+            TokenKind::KwVersion => Some("VERSION"),
             TokenKind::KwInsert => Some("INSERT"),
             TokenKind::KwDelete => Some("DELETE"),
             TokenKind::KwData => Some("DATA"),
@@ -619,6 +637,7 @@ impl std::fmt::Display for TokenKind {
             TokenKind::Var(s) => write!(f, "?{s}"),
             TokenKind::String(s) => write!(f, "\"{s}\""),
             TokenKind::Integer(n) => write!(f, "{n}"),
+            TokenKind::BigInteger(s) => write!(f, "{s}"),
             TokenKind::Decimal(s) => write!(f, "{s}"),
             TokenKind::Double(n) => write!(f, "{n:e}"),
             TokenKind::LangTag(s) => write!(f, "@{s}"),
@@ -633,6 +652,11 @@ impl std::fmt::Display for TokenKind {
             TokenKind::RBracket => write!(f, "]"),
             TokenKind::TripleStart => write!(f, "<<"),
             TokenKind::TripleEnd => write!(f, ">>"),
+            TokenKind::TripleTermStart => write!(f, "<<("),
+            TokenKind::TripleTermEnd => write!(f, ")>>"),
+            TokenKind::AnnotationOpen => write!(f, "{{|"),
+            TokenKind::AnnotationClose => write!(f, "|}}"),
+            TokenKind::Tilde => write!(f, "~"),
             TokenKind::Dot => write!(f, "."),
             TokenKind::Comma => write!(f, ","),
             TokenKind::Semicolon => write!(f, ";"),
@@ -763,6 +787,7 @@ pub fn keyword_from_str(s: &str) -> Option<TokenKind> {
         }
         "BASE" => Some(TokenKind::KwBase),
         "PREFIX" => Some(TokenKind::KwPrefix),
+        "VERSION" => Some(TokenKind::KwVersion),
         "INSERT" => Some(TokenKind::KwInsert),
         "DELETE" => Some(TokenKind::KwDelete),
         "DATA" => Some(TokenKind::KwData),

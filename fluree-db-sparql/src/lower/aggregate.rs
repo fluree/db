@@ -30,7 +30,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
     ///
     /// This is used to de-duplicate aggregate-input BINDs and to build stable
     /// aggregate alias keys (HAVING → SELECT aggregate lookup).
-    fn expr_key_no_span(expr: &Expression) -> String {
+    pub(super) fn expr_key_no_span(expr: &Expression) -> String {
         use crate::ast::term::LiteralValue;
 
         match expr.unwrap_bracketed() {
@@ -42,6 +42,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                     format!("\"{}\"^^{}", value, Self::iri_key(datatype))
                 }
                 LiteralValue::Integer(i) => format!("{i}"),
+                LiteralValue::BigInteger(s) => format!("{s}"),
                 LiteralValue::Decimal(d) => format!("{d}"),
                 LiteralValue::Double(d) => format!("{d}"),
                 LiteralValue::Boolean(b) => format!("{b}"),

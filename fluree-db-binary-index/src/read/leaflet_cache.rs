@@ -17,6 +17,7 @@
 //! - `DictLeaf`: keyed by `xxh3_128(cas_address)`. Content-addressed and
 //!   immutable — no epoch/time dimension needed.
 
+use crate::format::leaf::DecodedLeafDirV3;
 use fluree_db_core::subject_id::SubjectIdColumn;
 use fluree_db_core::{ListIndex, StatsView};
 use moka::sync::Cache;
@@ -169,6 +170,10 @@ enum CacheKey {
     R2(LeafletCacheKey),
     /// Key = xxh3_128(CAS address). Content-addressed → immutable.
     DictLeaf(u128),
+    /// Decoded leaf directory (header+dir only, no payload). Key =
+    /// xxh3_128(leaf CID bytes) — content-addressed → immutable,
+    /// no epoch/time dimension needed.
+    LeafDir(u128),
     /// BM25 posting leaflet. Key = xxh3_128(CAS CID bytes).
     /// Content-addressed → immutable, no epoch/time dimension needed.
     Bm25Leaflet(u128),
@@ -290,6 +295,7 @@ enum CachedEntry {
     R1(CachedRegion1),
     R2(CachedRegion2),
     DictLeaf(Arc<[u8]>),
+    LeafDir(Arc<DecodedLeafDirV3>),
     Bm25Leaflet(Arc<[u8]>),
     VectorShard(Arc<crate::arena::vector::VectorShard>),
     LedgerInfo(Arc<[u8]>),
@@ -305,6 +311,7 @@ impl CachedEntry {
             CachedEntry::R1(r1) => r1.byte_size(),
             CachedEntry::R2(r2) => r2.byte_size(),
             CachedEntry::DictLeaf(bytes) => bytes.len(),
+            CachedEntry::LeafDir(dir) => dir.byte_size(),
             CachedEntry::Bm25Leaflet(bytes) => bytes.len(),
             CachedEntry::VectorShard(shard) => {
                 // Use capacity() for conservative accounting — correct even if
@@ -484,6 +491,47 @@ impl LeafletCache {
         match result {
             Ok(CachedEntry::DictLeaf(bytes)) => Ok(bytes),
             Ok(_) => unreachable!("DictLeaf key always maps to DictLeaf entry"),
+            Err(arc_err) => Err(io::Error::new(arc_err.kind(), arc_err.to_string())),
+        }
+    }
+
+    // ========================================================================
+    // Decoded leaf directory cache
+    // ========================================================================
+
+    /// Check if a decoded leaf directory is cached (read-only, no insertion).
+    pub fn get_leaf_dir(&self, key: u128) -> Option<Arc<DecodedLeafDirV3>> {
+        match self.inner.get(&CacheKey::LeafDir(key)) {
+            Some(CachedEntry::LeafDir(dir)) => Some(dir),
+            _ => None,
+        }
+    }
+
+    /// Get or load a decoded leaf directory with single-flight and error
+    /// propagation.
+    ///
+    /// Key should be `xxh3_128(leaf_cid.to_bytes())` — content-addressed, so
+    /// entries are immutable and self-invalidating on leaf rewrite.
+    pub fn try_get_or_load_leaf_dir<F>(
+        &self,
+        key: u128,
+        load_fn: F,
+    ) -> io::Result<Arc<DecodedLeafDirV3>>
+    where
+        F: FnOnce() -> io::Result<Arc<DecodedLeafDirV3>>,
+    {
+        // Fast path: a plain hit must not pay the block_in_place cost.
+        if let Some(dir) = self.get_leaf_dir(key) {
+            return Ok(dir);
+        }
+        let result = in_blocking_region(|| {
+            self.inner.try_get_with(CacheKey::LeafDir(key), || {
+                load_fn().map(CachedEntry::LeafDir)
+            })
+        });
+        match result {
+            Ok(CachedEntry::LeafDir(dir)) => Ok(dir),
+            Ok(_) => unreachable!("LeafDir key always maps to LeafDir entry"),
             Err(arc_err) => Err(io::Error::new(arc_err.kind(), arc_err.to_string())),
         }
     }

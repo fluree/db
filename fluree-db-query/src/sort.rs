@@ -209,6 +209,30 @@ pub fn compare_bindings(a: &Binding, b: &Binding) -> Ordering {
         (_, Binding::Grouped(_)) => Ordering::Less,
         (Binding::Grouped(_), _) => Ordering::Greater,
 
+        // Path sorts last by node sequence (rarely sorted directly).
+        (Binding::Path(x), Binding::Path(y)) => x.cmp(y),
+        (_, Binding::Path(_)) => Ordering::Less,
+        (Binding::Path(_), _) => Ordering::Greater,
+
+        // List sorts last, element-wise (cypher rejects ORDER BY <list>, so
+        // this is only a defensive total order).
+        (Binding::List(x), Binding::List(y)) => x
+            .iter()
+            .map(Some)
+            .chain(std::iter::repeat(None))
+            .zip(y.iter().map(Some).chain(std::iter::repeat(None)))
+            .take(x.len().max(y.len()))
+            .map(|(a, b)| match (a, b) {
+                (Some(a), Some(b)) => compare_bindings(a, b),
+                (Some(_), None) => Ordering::Greater,
+                (None, Some(_)) => Ordering::Less,
+                (None, None) => Ordering::Equal,
+            })
+            .find(|o| *o != Ordering::Equal)
+            .unwrap_or(Ordering::Equal),
+        (_, Binding::List(_)) => Ordering::Less,
+        (Binding::List(_), _) => Ordering::Greater,
+
         // IRI types vs Lit types: IRI sorts before Lit
         (
             Binding::Sid { .. }
@@ -570,6 +594,7 @@ impl Operator for SortOperator {
                 let cached_gv = ctx.graph_view();
 
                 loop {
+                    ctx.check_cancelled()?;
                     let next_start = Instant::now();
                     let next = self
                         .child
@@ -580,6 +605,7 @@ impl Operator for SortOperator {
                     let Some(batch) = next else {
                         break;
                     };
+                    ctx.check_cancelled()?;
 
                     input_batches += 1;
                     let build_span =
@@ -621,6 +647,7 @@ impl Operator for SortOperator {
                         }
                     }
                     build_rows_ms += (build_start.elapsed().as_secs_f64() * 1000.0) as u64;
+                    ctx.check_cancelled()?;
                 }
                 let drain_ms = (drain_start.elapsed().as_secs_f64() * 1000.0) as u64;
 
@@ -641,6 +668,7 @@ impl Operator for SortOperator {
                     materialize = ctx.graph_view().is_some(),
                 );
                 let _sort_exec_guard = sort_execute_span.enter();
+                ctx.check_cancelled()?;
                 if !use_streaming_topk {
                     if let Some(ref gv) = cached_gv {
                         materialize_sort_keys_in_rows(
@@ -661,6 +689,7 @@ impl Operator for SortOperator {
                         }
                     }
                 }
+                ctx.check_cancelled()?;
                 let sort_start = Instant::now();
                 let out_rows: Vec<Vec<Binding>> = if use_streaming_topk {
                     let mut rows: Vec<Vec<Binding>> = heap

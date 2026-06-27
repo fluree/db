@@ -16,11 +16,9 @@
 //! advances the shared head, then B writes through its now-stale cached handle.
 //!
 //! Run with:
-//!   cargo test -p fluree-db-api --test it_concurrent_update_reconcile --features native
+//!   cargo test -p fluree-db-api --test grp_transact it_concurrent_update_reconcile --features native
 
 #![cfg(feature = "native")]
-
-mod support;
 
 use fluree_db_api::FlureeBuilder;
 use serde_json::json;

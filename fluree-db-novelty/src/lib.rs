@@ -33,6 +33,7 @@
 //! let slice = novelty.slice_for_range(g_id, IndexType::Spot, Some(&first), Some(&rhs), false);
 //! ```
 
+pub mod attachments;
 mod commit;
 mod commit_flakes;
 pub mod delta;
@@ -41,6 +42,7 @@ mod fact_state;
 mod runtime_stats;
 mod stats;
 
+pub use attachments::{AttachmentNovelty, ForwardRow, ReverseRow};
 pub use commit::{
     collect_dag_cids, collect_dag_cids_with_split_mode, find_common_ancestor, load_commit_by_id,
     load_commit_envelope_by_id, trace_commit_envelopes_by_id, trace_commits_by_id, Commit,
@@ -467,6 +469,12 @@ pub struct Novelty {
     /// Epoch for cache invalidation - bumped once per commit
     pub epoch: u64,
 
+    /// Edge-annotation attachment overlay (M1 — derived from the
+    /// `f:reifies*` system flakes flowing through the same pipeline).
+    /// Updated automatically by [`Self::apply_commit`] /
+    /// [`Self::bulk_apply_commits`] from the post-dedup flake set.
+    pub attachments: AttachmentNovelty,
+
     /// Current-state fact index for RDF set-semantics dedup (latest op per
     /// identity, per graph, within this novelty window). Persistent map, so it
     /// clones in O(1). The dedup oracle behind the seam; see [`fact_state`].
@@ -482,6 +490,7 @@ impl Novelty {
             flake_count: 0,
             t,
             epoch: 0,
+            attachments: AttachmentNovelty::new(),
             fact_state: NoveltyFactState::new(),
         }
     }
@@ -847,10 +856,18 @@ impl Novelty {
         // is updated only after this loop).
         let mut per_graph: HashMap<GraphId, Vec<Flake>> = HashMap::new();
         let mut deduped = 0u64;
+        // Capture post-dedup `f:reifies*` flakes so the attachment overlay
+        // observer sees exactly the flakes that landed in novelty. The
+        // reserved-predicate test is a single SID compare — negligible even on
+        // ledgers that never use annotations.
+        let mut accepted_reifies: Vec<Flake> = Vec::new();
         for (flake, g_id) in routed {
             if flake.op && self.fact_state.is_asserted(g_id, &flake) {
                 deduped += 1;
                 continue;
+            }
+            if fluree_db_core::namespaces::is_reserved_reifies_predicate(&flake.p) {
+                accepted_reifies.push(flake.clone());
             }
             per_graph.entry(g_id).or_default().push(flake);
         }
@@ -869,6 +886,13 @@ impl Novelty {
                 deduped,
                 "skipped duplicate assertion flakes (set semantics)"
             );
+        }
+
+        // Update the attachment overlay from the post-dedup set. The observer
+        // skips quietly when no `f:reifies*` flakes are present — most commits
+        // never touch annotations.
+        if !accepted_reifies.is_empty() {
+            self.attachments.observe_flakes(&accepted_reifies)?;
         }
 
         // Build + append one immutable segment per touched graph. No merge into
@@ -1012,15 +1036,30 @@ impl Novelty {
             }
 
             // Maintain the current-state index so later apply_commit calls dedup
-            // against bulk-loaded facts. `kept` is in (s,p,o,dt,m,t,op) order, so
-            // the last record per identity is its highest-t (latest) op.
+            // against bulk-loaded facts, and capture `f:reifies*` flakes for the
+            // attachment overlay observer (cheap clone, rare relative to data
+            // flakes). `kept` is in (s,p,o,dt,m,t,op) order, so the last record
+            // per identity is its highest-t (latest) op.
+            let mut accepted_reifies: Vec<Flake> = Vec::new();
             for flake in &kept {
+                if fluree_db_core::namespaces::is_reserved_reifies_predicate(&flake.p) {
+                    accepted_reifies.push(flake.clone());
+                }
                 self.fact_state.record(g_id, flake);
             }
 
             // Replace the graph with one consolidated segment (chunked only if it
             // somehow exceeds the local-index width).
             self.set_graph_segments(g_id, kept, true);
+
+            // Update attachment overlay after the per-graph batch is committed.
+            // Malformed bundles are skipped + warned + counted on
+            // `attachments.observed_malformed_bundle_count` (see
+            // `AttachmentNovelty::observe_flakes`); `?` only propagates
+            // infrastructure-level errors.
+            if !accepted_reifies.is_empty() {
+                self.attachments.observe_flakes(&accepted_reifies)?;
+            }
         }
 
         self.t = max_t;
@@ -1300,6 +1339,12 @@ impl OverlayProvider for Novelty {
 
     fn epoch(&self) -> u64 {
         self.epoch
+    }
+
+    fn is_effectively_empty(&self) -> bool {
+        // Not `store.is_empty()`: after `clear_up_to` the arena retains dead
+        // flakes, while `size` tracks only alive bytes.
+        self.size == 0
     }
 
     fn for_each_overlay_flake(
@@ -1798,6 +1843,28 @@ mod tests {
 
         // Epoch should be bumped
         assert_eq!(novelty.epoch, initial_epoch + 1);
+    }
+
+    #[test]
+    fn test_is_effectively_empty_after_full_clear() {
+        let mut novelty = Novelty::new(0);
+        let rg = no_graphs();
+
+        assert!(novelty.is_effectively_empty());
+
+        novelty
+            .apply_commit(vec![make_flake(1, 1, 100, 1, true)], 1, &rg)
+            .unwrap();
+        assert!(!novelty.is_effectively_empty());
+
+        // Drain everything, as an index swap does (apply_index/apply_loaded_db)
+        novelty.clear_up_to(1);
+
+        // The arena retains dead flakes, so `is_empty()` stays false — pin that
+        // `is_effectively_empty()` sees through it via `size`.
+        assert!(!novelty.is_empty());
+        assert!(novelty.epoch > 0);
+        assert!(novelty.is_effectively_empty());
     }
 
     #[test]

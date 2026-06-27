@@ -9,7 +9,10 @@ use crate::query::helpers::{
     tracker_for_limits,
 };
 use crate::view::{GraphDb, QueryInput};
-use crate::{ApiError, ExecutableQuery, Fluree, QueryResult, Result, Tracker, TrackingOptions};
+use crate::{
+    ApiError, ExecutableQuery, Fluree, QueryExecutionOptions, QueryResult, Result, Tracker,
+    TrackingOptions,
+};
 use fluree_db_query::execute::{
     execute_prepared, prepare_execution_with_config, ContextConfig, PrepareConfig,
 };
@@ -70,6 +73,17 @@ impl Fluree {
     /// `FROM` or `FROM NAMED` clauses will be rejected. Use
     /// `query_connection_sparql` for multi-ledger queries.
     pub async fn query(&self, db: &GraphDb, q: impl Into<QueryInput<'_>>) -> Result<QueryResult> {
+        self.query_with_options(db, q, QueryExecutionOptions::default())
+            .await
+    }
+
+    /// Execute a query against a GraphDb with explicit execution controls.
+    pub async fn query_with_options(
+        &self,
+        db: &GraphDb,
+        q: impl Into<QueryInput<'_>>,
+        options: QueryExecutionOptions,
+    ) -> Result<QueryResult> {
         let input = q.into();
 
         // 0. Tracker for fuel limits only (no tracking overhead for non-tracked
@@ -106,7 +120,7 @@ impl Fluree {
         // 4. Execute
         let exec_start = std::time::Instant::now();
         let batches = self
-            .execute_view_internal(db, &vars, &executable, &tracker)
+            .execute_view_internal(db, &vars, &executable, &tracker, &options)
             .await?;
         let exec_ms = exec_start.elapsed().as_secs_f64() * 1000.0;
 
@@ -133,12 +147,13 @@ impl Fluree {
     /// This is used by connection query paths (and builders) that need to resolve
     /// graph sources via R2RML/Iceberg while still running against a ledger-backed
     /// planning database.
-    pub(crate) async fn query_view_with_r2rml(
+    pub(crate) async fn query_view_with_r2rml_options(
         &self,
         db: &GraphDb,
         q: impl Into<QueryInput<'_>>,
         r2rml_provider: &dyn R2rmlProvider,
         r2rml_table_provider: &dyn R2rmlTableProvider,
+        options: QueryExecutionOptions,
     ) -> Result<QueryResult> {
         let input = q.into();
 
@@ -175,8 +190,11 @@ impl Fluree {
                 &vars,
                 &executable,
                 &tracker,
-                r2rml_provider,
-                r2rml_table_provider,
+                crate::R2rmlProviders {
+                    provider: r2rml_provider,
+                    table_provider: r2rml_table_provider,
+                },
+                &options,
             )
             .await?;
 
@@ -218,12 +236,13 @@ impl Fluree {
     /// Returns a tracked response with fuel, time, and policy statistics.
     /// When `format_config` is `None`, defaults to JSON-LD for FlureeQL
     /// queries and SPARQL JSON for SPARQL queries.
-    pub(crate) async fn query_tracked(
+    pub(crate) async fn query_tracked_with_options(
         &self,
         db: &GraphDb,
         q: impl Into<QueryInput<'_>>,
         format_config: Option<crate::format::FormatterConfig>,
         tracking_override: Option<TrackingOptions>,
+        options: QueryExecutionOptions,
     ) -> std::result::Result<crate::query::TrackedQueryResponse, crate::query::TrackedErrorResponse>
     {
         let input = q.into();
@@ -277,7 +296,7 @@ impl Fluree {
 
         // Execute with tracking
         let batches = self
-            .execute_view_tracked(db, &vars, &executable, &tracker)
+            .execute_view_tracked(db, &vars, &executable, &tracker, &options)
             .await
             .map_err(|e| {
                 let status = query_error_to_status(&e);
@@ -328,14 +347,14 @@ impl Fluree {
         ))
     }
 
-    pub(crate) async fn query_tracked_with_r2rml(
+    pub(crate) async fn query_tracked_with_r2rml_options(
         &self,
         db: &GraphDb,
         q: impl Into<QueryInput<'_>>,
         format_config: Option<crate::format::FormatterConfig>,
         tracking_override: Option<TrackingOptions>,
-        r2rml_provider: &dyn R2rmlProvider,
-        r2rml_table_provider: &dyn R2rmlTableProvider,
+        r2rml: crate::R2rmlProviders<'_>,
+        options: QueryExecutionOptions,
     ) -> std::result::Result<crate::query::TrackedQueryResponse, crate::query::TrackedErrorResponse>
     {
         let input = q.into();
@@ -383,14 +402,7 @@ impl Fluree {
             })?;
 
         let batches = self
-            .execute_view_tracked_with_r2rml(
-                db,
-                &vars,
-                &executable,
-                &tracker,
-                r2rml_provider,
-                r2rml_table_provider,
-            )
+            .execute_view_tracked_with_r2rml(db, &vars, &executable, &tracker, r2rml, &options)
             .await
             .map_err(|e| {
                 let status = query_error_to_status(&e);
@@ -446,7 +458,7 @@ impl Fluree {
     ///
     /// A GraphDb is single-ledger; dataset clauses would conflict with
     /// the db's ledger alias.
-    fn validate_sparql_for_view(&self, sparql: &str) -> Result<()> {
+    pub(crate) fn validate_sparql_for_view(&self, sparql: &str) -> Result<()> {
         let ast = parse_and_validate_sparql(sparql)?;
 
         // Check for dataset clauses
@@ -476,7 +488,7 @@ impl Fluree {
     /// `f:schemaSource` (with optional `owl:imports` closure), the resolved
     /// schema bundle is attached to `options.schema_bundle` so the runner
     /// can layer it as a `SchemaBundleOverlay` at prep time.
-    async fn build_executable_for_view(
+    pub(crate) async fn build_executable_for_view(
         &self,
         db: &GraphDb,
         parsed: &fluree_db_query::ir::Query,
@@ -490,10 +502,28 @@ impl Fluree {
             let query_has_reasoning = executable.reasoning.modes.has_any_enabled();
             let query_disabled = executable.reasoning.modes.is_disabled();
 
-            // Apply precedence rules
+            // Apply precedence rules. Mode replacement keeps the query's
+            // budget: wrapper modes come from config mode strings and never
+            // carry one, and whether the query budget survives is decided
+            // below by `ConfigReasoningBudget::apply` (override control),
+            // not by mode precedence.
             if let Some(effective) = db.effective_reasoning(query_has_reasoning, query_disabled) {
+                let (max_facts, max_seconds) = (
+                    executable.reasoning.modes.max_facts,
+                    executable.reasoning.modes.max_seconds,
+                );
                 executable.reasoning.modes = effective.clone();
+                executable.reasoning.modes.max_facts = max_facts;
+                executable.reasoning.modes.max_seconds = max_seconds;
             }
+        }
+
+        // Apply the ledger-config materialization budget. Runs after mode
+        // precedence on purpose: the budget governs whichever modes won
+        // (config defaults or a query override), and override control decides
+        // whether a query-supplied budget survives.
+        if let Some(budget) = db.config_reasoning_budget() {
+            budget.apply(&mut executable.reasoning.modes);
         }
 
         // Enforce config-graph datalog restrictions
@@ -505,6 +535,18 @@ impl Fluree {
             if !db.query_time_rules_allowed() {
                 executable.reasoning.modes.rules.clear();
             }
+        }
+
+        // Query-time datalog rule injection is admin-only: a restricted
+        // (non-root view policy) request may not supply inference rules. A rule
+        // with a viewable head can launder hidden data the policy author never
+        // anticipated — the derived flake is filtered only by its own (s,p,o),
+        // not its provenance, and a caller-invented predicate can't be
+        // pre-denied. DB-stored rules and OWL reasoning are admin-controlled and
+        // unaffected. See docs/security/policy-in-queries.md (Reasoning).
+        if !db.is_root() && !executable.reasoning.modes.rules.is_empty() {
+            tracing::debug!("stripping query-time datalog rules under non-root view policy");
+            executable.reasoning.modes.rules.clear();
         }
 
         // Carry the pre-resolved `f:rulesSource` graph id (if any)
@@ -747,66 +789,59 @@ impl Fluree {
         vars: &crate::VarRegistry,
         executable: &ExecutableQuery,
         tracker: &Tracker,
+        options: &QueryExecutionOptions,
     ) -> Result<Vec<crate::Batch>> {
         let noop = crate::NoOpR2rmlProvider::new();
-        self.execute_view_internal_with_r2rml(db, vars, executable, tracker, &noop, &noop)
-            .await
+        self.execute_view_internal_with_r2rml(
+            db,
+            vars,
+            executable,
+            tracker,
+            crate::R2rmlProviders {
+                provider: &noop,
+                table_provider: &noop,
+            },
+            options,
+        )
+        .await
     }
 
     /// Execute against a GraphDb with explicit R2RML provider.
     ///
     /// Used by callers that need R2RML/Iceberg graph source support
     /// (e.g., server query handlers with iceberg support).
-    pub(crate) async fn execute_view_internal_with_r2rml<'b>(
+    pub(crate) async fn execute_view_internal_with_r2rml(
         &self,
         db: &GraphDb,
         vars: &crate::VarRegistry,
         executable: &ExecutableQuery,
         tracker: &Tracker,
-        r2rml_provider: &'b dyn fluree_db_query::r2rml::R2rmlProvider,
-        r2rml_table_provider: &'b dyn fluree_db_query::r2rml::R2rmlTableProvider,
+        r2rml: crate::R2rmlProviders<'_>,
+        options: &QueryExecutionOptions,
     ) -> Result<Vec<crate::Batch>> {
         let db_ref = db.as_graph_db_ref();
         // Single-graph view: no dataset-level history detection — current state.
-        let prepare_config = PrepareConfig::current(db.binary_store.as_ref());
+        // Single ledger + root policy ⇒ semantic stats rewrites (redundant
+        // `rdf:type` elision) are sound; a non-root enforcer hides rows and must
+        // not allow it.
+        let allow_semantic_elision = db.policy_enforcer().is_none_or(|p| p.is_root());
+        let prepare_config = PrepareConfig::current_with_semantic_elision(
+            db.binary_store.as_ref(),
+            allow_semantic_elision,
+        );
         let prepared = prepare_execution_with_config(db_ref, executable, &prepare_config)
             .await
             .map_err(query_error_to_api_error)?;
 
-        let spatial_map = db.binary_store.as_ref().map(|s| s.spatial_provider_map());
-        // Perf guardrail: skip fulltext arena map + `"en"` lang_id resolution
-        // for queries that don't actually call `fulltext(...)`. The setup
-        // cost (HashMap clone over every (graph, predicate, language) arena
-        // plus one lang dict probe) is real on wide ledgers — an unrelated
-        // query shouldn't pay it.
-        let uses_fulltext = executable.uses_fulltext();
-        let fulltext_map = if uses_fulltext {
-            db.binary_store.as_ref().map(|s| s.fulltext_provider_map())
-        } else {
-            None
-        };
-        let english_lang_id = if uses_fulltext {
-            db.binary_store
-                .as_ref()
-                .and_then(|s| s.resolve_lang_id("en"))
-        } else {
-            None
-        };
-
-        let config = ContextConfig {
-            tracker: Some(tracker),
-            policy_enforcer: db.policy_enforcer().cloned(),
-            r2rml: Some((r2rml_provider, r2rml_table_provider)),
-            binary_store: db.binary_store.clone(),
-            binary_g_id: db.graph_id,
-            dict_novelty: db.dict_novelty.clone(),
-            spatial_providers: spatial_map.as_ref(),
-            fulltext_providers: fulltext_map.as_ref(),
-            english_lang_id,
-            remote_service: self.remote_service_executor(),
-            strict_bind_errors: true,
-            ..Default::default()
-        };
+        view_context_config!(
+            config,
+            self,
+            db,
+            executable,
+            tracker,
+            options,
+            Some((r2rml.provider, r2rml.table_provider)),
+        );
 
         execute_prepared(db_ref, vars, prepared, config)
             .await
@@ -822,10 +857,21 @@ impl Fluree {
         vars: &crate::VarRegistry,
         executable: &ExecutableQuery,
         tracker: &Tracker,
+        options: &QueryExecutionOptions,
     ) -> std::result::Result<Vec<crate::Batch>, fluree_db_query::QueryError> {
         let noop = crate::NoOpR2rmlProvider::new();
-        self.execute_view_tracked_with_r2rml(db, vars, executable, tracker, &noop, &noop)
-            .await
+        self.execute_view_tracked_with_r2rml(
+            db,
+            vars,
+            executable,
+            tracker,
+            crate::R2rmlProviders {
+                provider: &noop,
+                table_provider: &noop,
+            },
+            options,
+        )
+        .await
     }
 
     pub(crate) async fn execute_view_tracked_with_r2rml(
@@ -834,48 +880,28 @@ impl Fluree {
         vars: &crate::VarRegistry,
         executable: &ExecutableQuery,
         tracker: &Tracker,
-        r2rml_provider: &dyn R2rmlProvider,
-        r2rml_table_provider: &dyn R2rmlTableProvider,
+        r2rml: crate::R2rmlProviders<'_>,
+        options: &QueryExecutionOptions,
     ) -> std::result::Result<Vec<crate::Batch>, fluree_db_query::QueryError> {
         let db_ref = db.as_graph_db_ref();
         // Single-graph view: no dataset-level history detection — current state.
-        let prepare_config = PrepareConfig::current(db.binary_store.as_ref());
+        // Single ledger + root policy ⇒ semantic stats rewrites are sound.
+        let allow_semantic_elision = db.policy_enforcer().is_none_or(|p| p.is_root());
+        let prepare_config = PrepareConfig::current_with_semantic_elision(
+            db.binary_store.as_ref(),
+            allow_semantic_elision,
+        );
         let prepared = prepare_execution_with_config(db_ref, executable, &prepare_config).await?;
 
-        let spatial_map = db.binary_store.as_ref().map(|s| s.spatial_provider_map());
-        // Perf guardrail: skip fulltext arena map + `"en"` lang_id resolution
-        // for queries that don't actually call `fulltext(...)`. The setup
-        // cost (HashMap clone over every (graph, predicate, language) arena
-        // plus one lang dict probe) is real on wide ledgers — an unrelated
-        // query shouldn't pay it.
-        let uses_fulltext = executable.uses_fulltext();
-        let fulltext_map = if uses_fulltext {
-            db.binary_store.as_ref().map(|s| s.fulltext_provider_map())
-        } else {
-            None
-        };
-        let english_lang_id = if uses_fulltext {
-            db.binary_store
-                .as_ref()
-                .and_then(|s| s.resolve_lang_id("en"))
-        } else {
-            None
-        };
-
-        let config = ContextConfig {
-            tracker: Some(tracker),
-            policy_enforcer: db.policy_enforcer().cloned(),
-            r2rml: Some((r2rml_provider, r2rml_table_provider)),
-            binary_store: db.binary_store.clone(),
-            binary_g_id: db.graph_id,
-            dict_novelty: db.dict_novelty.clone(),
-            spatial_providers: spatial_map.as_ref(),
-            fulltext_providers: fulltext_map.as_ref(),
-            english_lang_id,
-            remote_service: self.remote_service_executor(),
-            strict_bind_errors: true,
-            ..Default::default()
-        };
+        view_context_config!(
+            config,
+            self,
+            db,
+            executable,
+            tracker,
+            options,
+            Some((r2rml.provider, r2rml.table_provider)),
+        );
 
         execute_prepared(db_ref, vars, prepared, config).await
     }
@@ -886,7 +912,7 @@ impl Fluree {
 // ============================================================================
 
 fn query_error_to_api_error(err: fluree_db_query::QueryError) -> ApiError {
-    ApiError::query(err.to_string())
+    ApiError::Query(err)
 }
 
 /// Map QueryError to HTTP-ish status code.

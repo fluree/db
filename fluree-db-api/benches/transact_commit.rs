@@ -134,6 +134,7 @@ fn bench_transact_commit(c: &mut Criterion) {
                                 TxnOpts::default(),
                                 CommitOpts::default(),
                                 &index_config,
+                                None,
                             )
                             .await
                             .unwrap();
@@ -167,6 +168,7 @@ fn bench_transact_commit(c: &mut Criterion) {
                                         TxnOpts::default(),
                                         CommitOpts::default(),
                                         &index_config,
+                                        None,
                                     )
                                     .await
                                     .unwrap();
@@ -185,6 +187,7 @@ fn bench_transact_commit(c: &mut Criterion) {
                                     TxnOpts::default(),
                                     CommitOpts::default(),
                                     &index_config,
+                                    None,
                                 )
                                 .await
                                 .unwrap();

@@ -167,15 +167,14 @@ pub fn validate_less_than_or_equals(
 
 /// Compare two FlakeValues, returning None if they are incomparable
 fn compare_values(a: &FlakeValue, b: &FlakeValue) -> Option<Ordering> {
+    // Numeric pairs (Long/Double/BigInt/Decimal in any combination) compare
+    // via core's exact cross-type ordering — same-variant-only matching
+    // rejected mixed pairs like integer-vs-decimal as "incompatible types",
+    // which sh:lessThan reports as a violation.
+    if a.is_numeric() && b.is_numeric() {
+        return a.numeric_cmp(b);
+    }
     match (a, b) {
-        // Numeric comparisons
-        (FlakeValue::Long(x), FlakeValue::Long(y)) => Some(x.cmp(y)),
-        (FlakeValue::Double(x), FlakeValue::Double(y)) => x.partial_cmp(y),
-        (FlakeValue::Long(x), FlakeValue::Double(y)) => (*x as f64).partial_cmp(y),
-        (FlakeValue::Double(x), FlakeValue::Long(y)) => x.partial_cmp(&(*y as f64)),
-        (FlakeValue::BigInt(x), FlakeValue::BigInt(y)) => Some(x.cmp(y)),
-        (FlakeValue::Decimal(x), FlakeValue::Decimal(y)) => x.partial_cmp(y),
-
         // String comparisons
         (FlakeValue::String(x), FlakeValue::String(y)) => Some(x.cmp(y)),
 

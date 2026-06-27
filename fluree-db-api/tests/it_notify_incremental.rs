@@ -5,16 +5,16 @@
 
 #![cfg(feature = "native")]
 
-use std::sync::Arc;
-mod support;
-
+use crate::support;
+use crate::support::{
+    genesis_ledger_for_fluree, start_background_indexer_local, trigger_index_and_wait,
+};
 use fluree_db_api::{
     ledger_manager::{LedgerManagerConfig, NotifyResult, NsNotify},
     FlureeBuilder, IndexConfig,
 };
 use fluree_db_transact::{CommitOpts, TxnOpts};
 use serde_json::json;
-use support::{genesis_ledger_for_fluree, start_background_indexer_local, trigger_index_and_wait};
 
 /// Helper: transact one insert and return the committed ledger state.
 async fn insert_data(
@@ -195,7 +195,10 @@ async fn notify_index_only_trims_novelty() {
     // Start a background indexer
     let (local, indexer_handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        Arc::new(fluree.nameservice_mode().clone()),
+        fluree
+            .nameservice_mode()
+            .publisher_arc()
+            .expect("test setup requires ReadWrite nameservice mode"),
         fluree_db_indexer::IndexerConfig::small(),
     );
 

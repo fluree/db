@@ -88,7 +88,7 @@ pub mod schedule {
 }
 
 /// Tracking options parsed from query `opts`
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TrackingOptions {
     pub track_time: bool,
     pub track_fuel: bool,
@@ -157,7 +157,7 @@ impl TrackingOptions {
 }
 
 /// Policy execution statistics: `{:executed N :allowed M}`
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PolicyStats {
     pub executed: u64,
     pub allowed: u64,
@@ -195,6 +195,11 @@ struct TrackerInner {
     // Policy tracking
     policy_stats: RwLock<HashMap<String, PolicyStats>>,
 
+    // Reasoning materialization outcome (recorded by query prepare when a
+    // reasoning mode ran). Not gated by an option: a capped materialization
+    // is a correctness signal, so any enabled tracker reports it.
+    reasoning: RwLock<Option<ReasoningTally>>,
+
     options: TrackingOptions,
 }
 
@@ -216,6 +221,7 @@ impl Tracker {
             fuel_total: AtomicU64::new(0),
             fuel_limit: options.max_fuel.unwrap_or(0),
             policy_stats: RwLock::new(HashMap::new()),
+            reasoning: RwLock::new(None),
             options,
         })))
     }
@@ -300,6 +306,45 @@ impl Tracker {
         }
     }
 
+    /// Record the outcome of an OWL2-RL materialization for this request.
+    ///
+    /// Last write wins (a request runs at most one materialization per
+    /// prepared query; dataset queries record the primary graph's run).
+    pub fn record_reasoning(&self, tally: ReasoningTally) {
+        let Some(inner) = &self.0 else {
+            return;
+        };
+        if let Ok(mut slot) = inner.reasoning.write() {
+            *slot = Some(tally);
+        }
+    }
+
+    /// Read fuel consumed so far, in micro-fuel, without finalizing.
+    ///
+    /// Lock-free: a single relaxed load of the fuel counter. Safe to call
+    /// concurrently from another task (e.g. a streaming heartbeat) while the
+    /// query executes — it never contends the per-flake `fetch_add` on the hot
+    /// path. Unlike [`tally`](Self::tally) it takes no locks and allocates
+    /// nothing. Returns `None` when fuel tracking is disabled.
+    #[inline]
+    pub fn current_micro_fuel(&self) -> Option<u64> {
+        let inner = self.0.as_ref()?;
+        inner
+            .options
+            .track_fuel
+            .then(|| inner.fuel_total.load(Ordering::Relaxed))
+    }
+
+    /// Read fuel consumed so far as a user-facing decimal (rounded to 3 places).
+    ///
+    /// See [`current_micro_fuel`](Self::current_micro_fuel) for the
+    /// concurrency/cost guarantees. Returns `None` when fuel tracking is
+    /// disabled.
+    #[inline]
+    pub fn current_fuel(&self) -> Option<f64> {
+        self.current_micro_fuel().map(micro_to_fuel)
+    }
+
     /// Finalize tracking into a serializable tally.
     pub fn tally(&self) -> Option<TrackingTally> {
         let inner = self.0.as_ref()?;
@@ -315,12 +360,13 @@ impl Tracker {
             } else {
                 None
             },
+            reasoning: inner.reasoning.read().ok().and_then(|r| r.clone()),
         })
     }
 }
 
 /// Tracking tally returned on completion.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrackingTally {
     /// Formatted time string like `"12.34ms"`
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -331,6 +377,31 @@ pub struct TrackingTally {
     /// Policy stats: `{policy-id -> {executed, allowed}}`
     #[serde(skip_serializing_if = "Option::is_none")]
     pub policy: Option<HashMap<String, PolicyStats>>,
+    /// Reasoning materialization outcome, when a reasoning mode ran.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<ReasoningTally>,
+}
+
+/// Outcome of an OWL2-RL materialization, reported per request.
+///
+/// `capped: true` means the closure hit its budget before reaching fixpoint —
+/// query results may be missing entailments. Clients should treat capped
+/// results as incomplete, not merely slow.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReasoningTally {
+    /// Whether materialization was capped before reaching fixpoint.
+    pub capped: bool,
+    /// Why materialization was capped (e.g. budget kind), if it was.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capped_reason: Option<String>,
+    /// Number of facts derived.
+    pub derived_facts: u64,
+    /// Fixpoint iterations performed.
+    pub iterations: u64,
+    /// Wall-clock materialization time in milliseconds. For a cached
+    /// materialization this reports the original computation, not this
+    /// request's (near-zero) cache hit.
+    pub duration_ms: u64,
 }
 
 fn format_time_ms(duration: Duration) -> String {
@@ -394,5 +465,33 @@ mod tests {
         let t = fuel_tracker(Some(fuel_to_micro(1.0)));
         t.consume_fuel(QUERY_FLOOR_MICRO_FUEL).unwrap();
         assert!(t.consume_fuel(INDEX_TOUCH_MICRO_FUEL).is_err());
+    }
+
+    #[test]
+    fn current_fuel_reflects_running_total_without_finalizing() {
+        let t = fuel_tracker(None);
+        assert_eq!(t.current_micro_fuel(), Some(0));
+        t.consume_fuel(QUERY_FLOOR_MICRO_FUEL).unwrap();
+        assert_eq!(t.current_micro_fuel(), Some(QUERY_FLOOR_MICRO_FUEL));
+        assert_eq!(t.current_fuel(), Some(1.0));
+        // Reading does not finalize: the tally still sees the same total and
+        // further consumption keeps accumulating.
+        t.consume_fuel(INDEX_TOUCH_MICRO_FUEL).unwrap();
+        assert_eq!(t.current_fuel(), Some(1.01));
+        assert_eq!(t.tally().unwrap().fuel, Some(1.01));
+    }
+
+    #[test]
+    fn current_fuel_none_when_disabled_or_untracked() {
+        // Fully disabled tracker.
+        assert_eq!(Tracker::disabled().current_micro_fuel(), None);
+        assert_eq!(Tracker::disabled().current_fuel(), None);
+        // Enabled tracker, but fuel not among the tracked dimensions.
+        let time_only = Tracker::new(TrackingOptions {
+            track_time: true,
+            track_fuel: false,
+            ..Default::default()
+        });
+        assert_eq!(time_only.current_micro_fuel(), None);
     }
 }

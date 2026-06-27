@@ -461,7 +461,7 @@ fn rewrite_having_aggregates(
 /// - `"reasoning": "owl2ql"` - OWL2-QL (implies RDFS)
 /// - `"reasoning": ["rdfs", "owl2ql"]` - multiple modes
 /// - `"rules": [...]` - query-time datalog rules (enables datalog automatically)
-/// - No key present - use defaults (auto-RDFS when hierarchy exists)
+/// - No key present - no reasoning (reasoning is opt-in)
 ///
 /// # Example
 ///
@@ -477,12 +477,15 @@ fn rewrite_having_aggregates(
 pub fn parse_reasoning(
     obj: &serde_json::Map<String, JsonValue>,
 ) -> Result<Option<crate::ir::ReasoningModes>> {
-    // Check if reasoning, rules, or ontology is present.
+    // Check if reasoning, rules, ontology, or a budget is present. A budget
+    // alone enables no mode, but it must be carried so a ledger-config
+    // default mode runs under it.
     let has_reasoning = obj.contains_key("reasoning");
     let has_rules = obj.contains_key("rules");
     let has_ontology = obj.contains_key("ontology");
+    let has_budget = obj.contains_key("reasoningBudget");
 
-    if !has_reasoning && !has_rules && !has_ontology {
+    if !has_reasoning && !has_rules && !has_ontology && !has_budget {
         return Ok(None);
     }
 
@@ -524,6 +527,7 @@ pub fn parse_options(
         having,
         reasoning: parse_reasoning(obj)?,
         object_var_parsing: parse_object_var_parsing(obj),
+        include_system_facts: parse_include_system_facts(obj),
     })
 }
 
@@ -536,6 +540,36 @@ pub fn parse_object_var_parsing(obj: &serde_json::Map<String, JsonValue>) -> boo
     obj.get("objectVarParsing")
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(true)
+}
+
+/// Parse `opts.includeSystemFacts: true` from the top-level query
+/// object. Defaults to `false`.
+///
+/// **Scope:** the flag only relaxes the **variable-predicate** scan
+/// filter — i.e. patterns like `{"@id": "?ann", "?p": "?o"}`. Direct
+/// user mention of `f:reifies*` IRIs is rejected at parse time
+/// regardless of the flag (see
+/// `parse::reject_user_authored_reifies_in_query`); the rejection is
+/// the contract-level boundary because the only legitimate way for a
+/// triple naming `f:reifies*` to enter the pattern stream is via the
+/// `expand_edge_annotation_patterns` IR rewrite. Allowing direct
+/// mention even under the flag would let `BinaryScanOperator`'s
+/// bound-predicate fast path scan the system arenas without the
+/// JSON-LD/SPARQL syntactic envelope.
+///
+/// History-range queries surface `f:reifies*` events through a
+/// separate operator path (`BinaryHistoryScanOperator` → inner scan
+/// with `mode == TemporalMode::History`) and don't need the flag.
+pub fn parse_include_system_facts(obj: &serde_json::Map<String, JsonValue>) -> bool {
+    let opts = match obj.get("opts").and_then(|v| v.as_object()) {
+        Some(o) => o,
+        None => return false,
+    };
+    opts.get("includeSystemFacts")
+        .or_else(|| opts.get("include_system_facts"))
+        .or_else(|| opts.get("include-system-facts"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
 }
 
 #[cfg(test)]

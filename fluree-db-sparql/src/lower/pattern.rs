@@ -117,6 +117,47 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                 object,
                 span,
             } => self.lower_property_path(subject, path, object, *span),
+
+            // RDF 1.2 reifier-rooted annotation pattern.
+            // `?ann rdf:reifies <<( s p o )>>` →
+            // `Pattern::AnnotationTarget` IR with empty body. Sibling
+            // triples about the reifier in surrounding scope join on
+            // the bound annotation var via the standard executor.
+            //
+            // The parser recognized `rdf:reifies` lexically (either the
+            // full IRI or the `rdf:` prefixed form). Verify the
+            // predicate actually expands to the standard rdf:reifies
+            // IRI under the active prologue — rejecting any rebound
+            // `rdf:` false positive that the lexical pass let through.
+            SparqlGraphPattern::AnnotationTarget {
+                reifier,
+                predicate,
+                triple_term,
+                span,
+            } => {
+                use crate::ast::term::PredicateTerm;
+                let resolved = match predicate {
+                    PredicateTerm::Iri(iri) => self.expand_iri(iri)?,
+                    PredicateTerm::Var(v) => {
+                        return Err(super::LowerError::not_implemented(
+                            "rdf:reifies cannot be a variable predicate in v1",
+                            v.span,
+                        ));
+                    }
+                };
+                if resolved != fluree_vocab::rdf::REIFIES {
+                    return Err(super::LowerError::not_implemented(
+                        format!(
+                            "predicate '{resolved}' does not resolve to rdf:reifies — \
+                             only the standard rdf:reifies IRI is recognized as a \
+                             triple-term reifier in v1"
+                        ),
+                        *span,
+                    ));
+                }
+                let pat = self.lower_annotation_target_pattern(reifier, triple_term)?;
+                Ok(vec![pat])
+            }
         }
     }
 

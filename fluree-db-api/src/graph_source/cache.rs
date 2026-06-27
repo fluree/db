@@ -57,8 +57,9 @@ pub struct R2rmlCache {
     scan_files: moka::sync::Cache<String, Arc<CachedScanFiles>>,
 
     /// Shared Parquet footer cache for repeated scans of the same files.
+    /// `Arc` so it can be shared into per-file read workers.
     #[cfg(feature = "iceberg")]
-    parquet_footers: ParquetFooterCache,
+    parquet_footers: Arc<ParquetFooterCache>,
 
     /// Short-lived cache for direct-catalog `version-hint.text` resolution.
     ///
@@ -96,7 +97,9 @@ impl R2rmlCache {
                 compiled_mappings: moka::sync::Cache::new(mapping_cap),
                 table_metadata: moka::sync::Cache::new(metadata_cap),
                 scan_files: moka::sync::Cache::new(metadata_cap),
-                parquet_footers: ParquetFooterCache::new((metadata_capacity.max(1) / 2).max(32)),
+                parquet_footers: Arc::new(ParquetFooterCache::new(
+                    (metadata_capacity.max(1) / 2).max(32),
+                )),
                 direct_metadata_locations: moka::sync::Cache::builder()
                     .max_capacity(metadata_cap)
                     .time_to_live(DIRECT_METADATA_LOCATION_TTL)
@@ -159,10 +162,11 @@ impl R2rmlCache {
         self.scan_files.insert(metadata_location, scan_files);
     }
 
-    /// Get the shared Parquet footer cache.
+    /// Get the shared Parquet footer cache (clone the `Arc` to share into
+    /// per-file read workers).
     #[cfg(feature = "iceberg")]
-    pub fn parquet_footers(&self) -> &ParquetFooterCache {
-        &self.parquet_footers
+    pub fn parquet_footers(&self) -> Arc<ParquetFooterCache> {
+        Arc::clone(&self.parquet_footers)
     }
 
     /// Get a recently resolved direct-catalog metadata location.

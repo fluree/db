@@ -1,5 +1,4 @@
-mod support;
-
+use crate::support;
 use fluree_db_api::{Bm25CreateConfig, Bm25DropResult, FlureeBuilder};
 use serde_json::json;
 

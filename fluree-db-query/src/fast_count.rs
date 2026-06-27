@@ -9,11 +9,12 @@ use crate::binary_scan::{compile_encoded_pre_filters_and_prune_inline_ops, Encod
 use crate::context::ExecutionContext;
 use crate::error::{QueryError, Result};
 use crate::fast_path_common::{
-    allow_cursor_fast_path, build_count_batch, count_predicate_overlay_delta,
-    count_rows_for_predicate_psot, count_to_i64, fast_path_store, leaf_entries_for_predicate,
-    normalize_pred_sid, parallel_leaf_chunk_count, parallel_overlay_psot_filter_count,
-    projection_okey_only, projection_otype_only, projection_sid_only, projection_sid_otype_okey,
-    FastPathOperator,
+    build_count_batch, count_predicate_overlay_delta, count_rows_for_predicate_psot, count_to_i64,
+    cursor_fast_path_for_predicate, fast_path_store, fast_path_store_policy_cleared,
+    leaf_entries_for_predicate, normalize_pred_sid, parallel_leaf_chunk_count,
+    parallel_leaf_chunk_reduce, parallel_overlay_psot_filter_count, projection_okey_only,
+    projection_otype_only, projection_sid_only, projection_sid_otype_okey, FastPathOperator,
+    PredicateFastPath,
 };
 use crate::ir::triple::{Ref, TriplePattern};
 use crate::operator::inline::InlineOperator;
@@ -27,8 +28,8 @@ use fluree_db_binary_index::format::run_record_v2::{
 use fluree_db_binary_index::BinaryIndexStore;
 use fluree_db_core::o_type::OType;
 use fluree_db_core::subject_id::SubjectId;
-use fluree_db_core::value_id::ObjKey;
-use fluree_db_core::{FlakeValue, GraphId};
+use fluree_db_core::value_id::{ObjKey, ValueTypeTag};
+use fluree_db_core::{FlakeValue, GraphId, OverlayProvider};
 use fluree_vocab::namespaces;
 use std::sync::Arc;
 
@@ -45,43 +46,49 @@ pub fn count_rows_operator(
     FastPathOperator::new(
         out_var,
         move |ctx| {
-            // HEAD: metadata-only predicate row count (instant).
-            if let Some(store) = fast_path_store(ctx) {
-                let pred_sid = normalize_pred_sid(store, &predicate)?;
-                let Some(p_id) = store.sid_to_p_id(&pred_sid) else {
-                    return Ok(Some(build_count_batch(out_var, 0)?));
-                };
+            let Some(store) = ctx.binary_store.as_ref() else {
+                return Ok(None); // no binary store => general/filtered fallback
+            };
+            let pred_sid = normalize_pred_sid(store, &predicate)?;
+
+            // O1: under a non-root view policy, a single-predicate count can keep
+            // the fast path when the scanned predicate is provably uncovered by
+            // the policy. `Decline` (covered, multi-ledger, or historical) falls
+            // back to the filtered scan; an uncovered default-deny predicate is
+            // wholly hidden, so its count is 0. With no policy / root this is
+            // always `Allow`, preserving the original behavior.
+            match cursor_fast_path_for_predicate(ctx, &pred_sid) {
+                PredicateFastPath::Decline => return Ok(None),
+                PredicateFastPath::Empty => return Ok(Some(build_count_batch(out_var, 0)?)),
+                PredicateFastPath::Allow => {}
+            }
+
+            let Some(p_id) = store.sid_to_p_id(&pred_sid) else {
+                return Ok(Some(build_count_batch(out_var, 0)?)); // predicate absent => 0
+            };
+
+            // Lane 1 — metadata-only predicate row count (instant) when there is
+            // no novelty overlay and the target is the indexed head.
+            let overlay_free = ctx.overlay.map(OverlayProvider::epoch).unwrap_or(0) == 0;
+            if overlay_free && ctx.to_t == store.max_t() {
                 let count = count_rows_for_predicate_psot(store, ctx.binary_g_id, p_id)?;
                 return Ok(Some(build_count_batch(
                     out_var,
                     count_to_i64(count, "COUNT rows")?,
                 )?));
             }
-            // Novelty at HEAD (no time-travel): metadata base count + a novelty delta
-            // that rescans only the leaves novelty touches, instead of the whole
-            // predicate. Time-travel (to_t < max_t) needs base replay — defer.
-            if allow_cursor_fast_path(ctx) {
-                if let Some(store) = ctx.binary_store.as_ref() {
-                    // to_t >= max_t: at-or-above the indexed head (novelty folds on
-                    // top). Time-travel BELOW max_t needs base replay — defer.
-                    if ctx.to_t >= store.max_t() {
-                        let pred_sid = normalize_pred_sid(store, &predicate)?;
-                        let Some(p_id) = store.sid_to_p_id(&pred_sid) else {
-                            return Ok(None); // novelty-only predicate => defer
-                        };
-                        if let Some(count) = count_predicate_overlay_delta(
-                            ctx,
-                            store,
-                            ctx.binary_g_id,
-                            pred_sid,
-                            p_id,
-                        )? {
-                            return Ok(Some(build_count_batch(
-                                out_var,
-                                count_to_i64(count, "COUNT rows")?,
-                            )?));
-                        }
-                    }
+
+            // Lane 2 — base metadata count + a novelty delta that rescans only the
+            // leaves novelty touches, when the target is at or above the indexed
+            // head. Time-travel below the head needs base replay — defer.
+            if ctx.to_t >= store.max_t() {
+                if let Some(count) =
+                    count_predicate_overlay_delta(ctx, store, ctx.binary_g_id, pred_sid, p_id)?
+                {
+                    return Ok(Some(build_count_batch(
+                        out_var,
+                        count_to_i64(count, "COUNT rows")?,
+                    )?));
                 }
             }
             Ok(None)
@@ -177,8 +184,19 @@ pub fn count_rows_numeric_compare_operator(
     FastPathOperator::new(
         out_var,
         move |ctx| {
+            // O1: under a non-root view policy, keep the fast path when the scanned
+            // predicate is provably uncovered. An uncovered default-deny predicate
+            // is wholly hidden, so the count is 0.
+            if let Some(store) = ctx.binary_store.as_ref() {
+                let pred_sid = normalize_pred_sid(store, &predicate)?;
+                match cursor_fast_path_for_predicate(ctx, &pred_sid) {
+                    PredicateFastPath::Decline => return Ok(None),
+                    PredicateFastPath::Empty => return Ok(Some(build_count_batch(out_var, 0)?)),
+                    PredicateFastPath::Allow => {}
+                }
+            }
             // HEAD lane: directory shortcut + binary-search over base POST leaflets.
-            if let Some(store) = fast_path_store(ctx) {
+            if let Some(store) = fast_path_store_policy_cleared(ctx) {
                 let pred_sid = normalize_pred_sid(store, &predicate)?;
                 let Some(p_id) = store.sid_to_p_id(&pred_sid) else {
                     return Ok(Some(build_count_batch(out_var, 0)?));
@@ -199,28 +217,27 @@ pub fn count_rows_numeric_compare_operator(
                 };
             }
             // Overlay / time-travel lane: per-row compare over the merged cursor.
-            if allow_cursor_fast_path(ctx) {
-                if let Some(store) = ctx.binary_store.as_ref() {
-                    let pred_sid = normalize_pred_sid(store, &predicate)?;
-                    // Absent in base => COUNT is 0 only if also absent in novelty; a
-                    // novelty-only predicate has no base id, so defer to the fallback.
-                    let Some(p_id) = store.sid_to_p_id(&pred_sid) else {
-                        return Ok(None);
-                    };
-                    if let Some(matches) = count_numeric_compare_overlay_parallel(
-                        ctx,
-                        store,
-                        ctx.binary_g_id,
-                        pred_sid,
-                        p_id,
-                        compare,
-                        &threshold,
-                    )? {
-                        return Ok(Some(build_count_batch(
-                            out_var,
-                            count_to_i64(matches, "COUNT rows numeric compare")?,
-                        )?));
-                    }
+            // The O1 gate above already cleared single-ledger / no-from_t / policy.
+            if let Some(store) = ctx.binary_store.as_ref() {
+                let pred_sid = normalize_pred_sid(store, &predicate)?;
+                // Absent in base => COUNT is 0 only if also absent in novelty; a
+                // novelty-only predicate has no base id, so defer to the fallback.
+                let Some(p_id) = store.sid_to_p_id(&pred_sid) else {
+                    return Ok(None);
+                };
+                if let Some(matches) = count_numeric_compare_overlay_parallel(
+                    ctx,
+                    store,
+                    ctx.binary_g_id,
+                    pred_sid,
+                    p_id,
+                    compare,
+                    &threshold,
+                )? {
+                    return Ok(Some(build_count_batch(
+                        out_var,
+                        count_to_i64(matches, "COUNT rows numeric compare")?,
+                    )?));
                 }
             }
             Ok(None)
@@ -253,8 +270,19 @@ pub fn sum_compare_as_count_operator(
     FastPathOperator::new(
         out_var,
         move |ctx| {
+            // O1: keep the fast path when the scanned predicate is provably
+            // uncovered. An uncovered default-deny predicate feeds the aggregate
+            // *no rows*, so SUM is Unbound (not 0) — defer to the fallback, which
+            // emits Unbound; this matches the absent/empty-input handling below.
+            if let Some(store) = ctx.binary_store.as_ref() {
+                let pred_sid = normalize_pred_sid(store, &predicate)?;
+                match cursor_fast_path_for_predicate(ctx, &pred_sid) {
+                    PredicateFastPath::Decline | PredicateFastPath::Empty => return Ok(None),
+                    PredicateFastPath::Allow => {}
+                }
+            }
             // HEAD lane.
-            if let Some(store) = fast_path_store(ctx) {
+            if let Some(store) = fast_path_store_policy_cleared(ctx) {
                 let pred_sid = normalize_pred_sid(store, &predicate)?;
                 let Some(p_id) = store.sid_to_p_id(&pred_sid) else {
                     // Absent predicate => empty input => SUM is Unbound (not 0).
@@ -282,32 +310,31 @@ pub fn sum_compare_as_count_operator(
             }
             // Overlay / time-travel lane: the merged cursor count gives both the
             // matches and the total rows; an empty (base+novelty) input is SUM
-            // Unbound, so defer to the fallback which emits Unbound.
-            if allow_cursor_fast_path(ctx) {
-                if let Some(store) = ctx.binary_store.as_ref() {
-                    let pred_sid = normalize_pred_sid(store, &predicate)?;
-                    let Some(p_id) = store.sid_to_p_id(&pred_sid) else {
-                        return Ok(None);
-                    };
-                    if let Some(matches) = count_numeric_compare_overlay_parallel(
-                        ctx,
-                        store,
-                        ctx.binary_g_id,
-                        pred_sid,
-                        p_id,
-                        compare,
-                        &threshold,
-                    )? {
-                        // matches > 0 ⇒ the input is non-empty ⇒ SUM is the bound
-                        // count. matches == 0 can't distinguish empty (Unbound) from
-                        // non-empty-with-no-matches (bound 0), so defer to the
-                        // fallback, which resolves the SPARQL semantics correctly.
-                        if matches > 0 {
-                            return Ok(Some(build_count_batch(
-                                out_var,
-                                count_to_i64(matches, "SUM(compare) as count")?,
-                            )?));
-                        }
+            // Unbound, so defer to the fallback which emits Unbound. The O1 gate
+            // above already cleared single-ledger / no-from_t / policy.
+            if let Some(store) = ctx.binary_store.as_ref() {
+                let pred_sid = normalize_pred_sid(store, &predicate)?;
+                let Some(p_id) = store.sid_to_p_id(&pred_sid) else {
+                    return Ok(None);
+                };
+                if let Some(matches) = count_numeric_compare_overlay_parallel(
+                    ctx,
+                    store,
+                    ctx.binary_g_id,
+                    pred_sid,
+                    p_id,
+                    compare,
+                    &threshold,
+                )? {
+                    // matches > 0 ⇒ the input is non-empty ⇒ SUM is the bound
+                    // count. matches == 0 can't distinguish empty (Unbound) from
+                    // non-empty-with-no-matches (bound 0), so defer to the
+                    // fallback, which resolves the SPARQL semantics correctly.
+                    if matches > 0 {
+                        return Ok(Some(build_count_batch(
+                            out_var,
+                            count_to_i64(matches, "SUM(compare) as count")?,
+                        )?));
                     }
                 }
             }
@@ -340,16 +367,31 @@ fn count_rows_for_predicate_numeric_compare_post(
         // Same o_type at both ends ⇒ uniform o_type (POST sorts o_type before o_key).
         if min_ot == max_ot {
             let otype = OType::from_u16(min_ot);
-            if matches!(otype, OType::XSD_INTEGER | OType::XSD_DOUBLE) {
-                if let Some(threshold_key) = encode_numeric_threshold_for_otype(otype, threshold)? {
-                    if leaflet_fully_excluded(compare, min_ok, max_ok, threshold_key) {
-                        return Ok(Some(0));
-                    }
-                    if leaflet_fully_matches(compare, min_ok, max_ok, threshold_key) {
-                        return Ok(Some(count_rows_for_predicate_psot(store, g_id, p_id)?));
-                    }
-                }
+            if !matches!(otype, OType::XSD_INTEGER | OType::XSD_DOUBLE) {
+                // Uniformly unsupported (e.g. all-decimal predicate): the leaf
+                // scan below would bail on its first leaflet anyway — defer
+                // now without opening any leaves.
+                return Ok(None);
             }
+            let Some(threshold_key) = encode_numeric_threshold_for_otype(otype, threshold)? else {
+                // Threshold not encodable for the uniform o_type (e.g. a
+                // decimal constant over integer rows): same doomed scan.
+                return Ok(None);
+            };
+            if leaflet_fully_excluded(compare, min_ok, max_ok, threshold_key) {
+                return Ok(Some(0));
+            }
+            if leaflet_fully_matches(compare, min_ok, max_ok, threshold_key) {
+                return Ok(Some(count_rows_for_predicate_psot(store, g_id, p_id)?));
+            }
+        } else if otype_unsupported_numeric(min_ot) || otype_unsupported_numeric(max_ot) {
+            // Mixed-type predicate whose extent BOUNDARY is an unsupported
+            // numeric (e.g. integer rows + decimals: NUM_BIG sorts last among
+            // the numerics, so it lands on the max boundary): those rows are
+            // guaranteed present and the scan below is doomed — defer now.
+            // An unsupported numeric strictly interior to the extent still
+            // falls through and is caught by the per-leaflet bail.
+            return Ok(None);
         }
     }
 
@@ -370,6 +412,15 @@ fn count_rows_for_predicate_numeric_compare_post(
 /// per-leaflet directory must be consulted for this predicate's first/last key).
 /// Returns `None` if there are no leaves (an empty predicate — the caller's total is
 /// 0) or, defensively, if a boundary leaf yields no matching leaflet.
+/// True if this o_type is numeric but cannot be compared by encoded o_key in
+/// the numeric-COUNT lanes (non-canonical integer widths, floats, decimals,
+/// arena-keyed NUM_BIG): rows of these kinds force the count to defer.
+fn otype_unsupported_numeric(raw: u16) -> bool {
+    let ot = OType::from_u16(raw);
+    (ot.is_numeric() || ot == OType::NUM_BIG_OVERFLOW)
+        && !matches!(ot, OType::XSD_INTEGER | OType::XSD_DOUBLE)
+}
+
 fn predicate_post_global_extent(
     store: &BinaryIndexStore,
     p_id: u32,
@@ -610,7 +661,9 @@ fn okey_matches(compare: NumericCompareOp, o_key: u64, threshold: u64) -> bool {
 /// would error and so contributes nothing, which equals what the general aggregate
 /// pipeline counts (and avoids the base path's whole-query bail on mixed types).
 /// Returns the match count, or `Ok(None)` to defer (overlay flake failed to
-/// translate). BASE+novelty: caller gates on [`allow_cursor_fast_path`].
+/// translate). BASE+novelty: caller gates on the O1
+/// [`cursor_fast_path_for_predicate`] verdict (single-ledger, no `from_t`, and
+/// the view policy does not cover the scanned predicate).
 fn count_numeric_compare_overlay_parallel(
     ctx: &crate::context::ExecutionContext<'_>,
     store: &Arc<BinaryIndexStore>,
@@ -622,24 +675,71 @@ fn count_numeric_compare_overlay_parallel(
 ) -> Result<Option<u64>> {
     let tk_int = encode_numeric_threshold_for_otype(OType::XSD_INTEGER, threshold)?;
     let tk_dbl = encode_numeric_threshold_for_otype(OType::XSD_DOUBLE, threshold)?;
-    parallel_overlay_psot_filter_count(
+
+    // Pre-check the base predicate's POST extent: if the base rows are
+    // uniformly an unsupported o_type (e.g. all-decimal), or the threshold
+    // can't encode for the uniform supported type, the full scan below is
+    // doomed — defer immediately instead of scanning every partition first.
+    // (Unsupported values arriving only via novelty are still caught by the
+    // per-row flag; novelty is small, so that residual pass is bounded.)
+    let post_leaves = leaf_entries_for_predicate(store, g_id, RunSortOrder::Post, p_id);
+    if let Some((min_ot, _, max_ot, _)) = predicate_post_global_extent(store, p_id, post_leaves)? {
+        if min_ot == max_ot {
+            match OType::from_u16(min_ot) {
+                OType::XSD_INTEGER if tk_int.is_none() => return Ok(None),
+                OType::XSD_DOUBLE if tk_dbl.is_none() => return Ok(None),
+                OType::XSD_INTEGER | OType::XSD_DOUBLE => {}
+                ot if ot.is_numeric() || ot == OType::NUM_BIG_OVERFLOW => return Ok(None),
+                _ => {}
+            }
+        } else if otype_unsupported_numeric(min_ot) || otype_unsupported_numeric(max_ot) {
+            // Mixed base with an unsupported-numeric boundary (e.g. integer
+            // rows + decimals): doomed regardless of novelty — defer before
+            // scanning any partition.
+            return Ok(None);
+        }
+    }
+
+    // Numeric o_types this lane can't compare by o_key (other integer-family
+    // widths, floats, decimals — arena-keyed NUM_BIG has no value order at
+    // all) must defer the whole count: treating them as non-matches would
+    // silently undercount. Mirrors the base lane's per-leaflet Ok(None) bail.
+    let saw_unsupported_numeric = std::sync::atomic::AtomicBool::new(false);
+    let count = parallel_overlay_psot_filter_count(
         ctx,
         store,
         g_id,
         pred_sid,
         p_id,
-        move |_s, o_type, o_key| {
-            let tk = match OType::from_u16(o_type) {
+        |_s, o_type, o_key| {
+            let ot = OType::from_u16(o_type);
+            let tk = match ot {
                 OType::XSD_INTEGER => tk_int,
                 OType::XSD_DOUBLE => tk_dbl,
-                _ => return false, // non-numeric object: comparison errors => not a match
+                _ if ot.is_numeric() || ot == OType::NUM_BIG_OVERFLOW => {
+                    saw_unsupported_numeric.store(true, std::sync::atomic::Ordering::Relaxed);
+                    return false;
+                }
+                // Genuinely non-numeric object: comparison errors => not a match
+                _ => return false,
             };
             match tk {
                 Some(tk) => okey_matches(compare, o_key, tk),
-                None => false,
+                None => {
+                    // Threshold not encodable for this row's o_type (e.g. a
+                    // decimal threshold against integer rows): the comparison
+                    // is still numerically valid, so defer rather than
+                    // undercount — mirrors the base lane.
+                    saw_unsupported_numeric.store(true, std::sync::atomic::Ordering::Relaxed);
+                    false
+                }
             }
         },
-    )
+    )?;
+    if saw_unsupported_numeric.load(std::sync::atomic::Ordering::Relaxed) {
+        return Ok(None);
+    }
+    Ok(count)
 }
 
 /// Fast-path: parallel `COUNT(?s)` / `COUNT(*)` for a single predicate `?s <p> ?o`
@@ -664,8 +764,19 @@ pub fn count_rows_encoded_filters_operator(
         out_var,
         move |ctx| {
             let g_id = ctx.binary_g_id;
+            // O1: keep the fast path when the scanned predicate is provably
+            // uncovered; an uncovered default-deny predicate has all rows hidden
+            // => COUNT is 0.
+            if let Some(store) = ctx.binary_store.as_ref() {
+                let pred_sid = normalize_pred_sid(store, &pattern.p)?;
+                match cursor_fast_path_for_predicate(ctx, &pred_sid) {
+                    PredicateFastPath::Decline => return Ok(None),
+                    PredicateFastPath::Empty => return Ok(Some(build_count_batch(out_var, 0)?)),
+                    PredicateFastPath::Allow => {}
+                }
+            }
             // HEAD lane: parallel base-leaflet scan applying the encoded filters.
-            if let Some(store) = fast_path_store(ctx) {
+            if let Some(store) = fast_path_store_policy_cleared(ctx) {
                 let pred_sid = normalize_pred_sid(store, &pattern.p)?;
                 let Some(p_id) = store.sid_to_p_id(&pred_sid) else {
                     // Absent predicate => no rows => COUNT is 0.
@@ -697,36 +808,35 @@ pub fn count_rows_encoded_filters_operator(
             }
             // Overlay / time-travel lane: apply the same encoded filters per row over
             // the merged cursor. A novelty-only predicate has no base id => defer.
-            if allow_cursor_fast_path(ctx) {
-                if let Some(store) = ctx.binary_store.as_ref() {
-                    let pred_sid = normalize_pred_sid(store, &pattern.p)?;
-                    let Some(p_id) = store.sid_to_p_id(&pred_sid) else {
-                        return Ok(None);
-                    };
-                    let (encoded, pruned) = compile_encoded_pre_filters_and_prune_inline_ops(
-                        &inline_ops,
-                        &pattern,
-                        store,
-                        true,
-                    );
-                    if !pruned.is_empty() || encoded.is_empty() {
-                        return Ok(None);
-                    }
-                    if let Some(count) = parallel_overlay_psot_filter_count(
-                        ctx,
-                        store,
-                        g_id,
-                        pred_sid,
-                        p_id,
-                        move |s_id, o_type, o_key| {
-                            encoded.iter().all(|f| f.eval_row(s_id, o_type, o_key))
-                        },
-                    )? {
-                        return Ok(Some(build_count_batch(
-                            out_var,
-                            count_to_i64(count, "COUNT rows encoded filters")?,
-                        )?));
-                    }
+            // The O1 gate above already cleared single-ledger / no-from_t / policy.
+            if let Some(store) = ctx.binary_store.as_ref() {
+                let pred_sid = normalize_pred_sid(store, &pattern.p)?;
+                let Some(p_id) = store.sid_to_p_id(&pred_sid) else {
+                    return Ok(None);
+                };
+                let (encoded, pruned) = compile_encoded_pre_filters_and_prune_inline_ops(
+                    &inline_ops,
+                    &pattern,
+                    store,
+                    true,
+                );
+                if !pruned.is_empty() || encoded.is_empty() {
+                    return Ok(None);
+                }
+                if let Some(count) = parallel_overlay_psot_filter_count(
+                    ctx,
+                    store,
+                    g_id,
+                    pred_sid,
+                    p_id,
+                    move |s_id, o_type, o_key| {
+                        encoded.iter().all(|f| f.eval_row(s_id, o_type, o_key))
+                    },
+                )? {
+                    return Ok(Some(build_count_batch(
+                        out_var,
+                        count_to_i64(count, "COUNT rows encoded filters")?,
+                    )?));
                 }
             }
             Ok(None)
@@ -784,8 +894,19 @@ pub fn count_rows_lang_filter_operator(
     FastPathOperator::new(
         out_var,
         move |ctx| {
+            // O1: keep the fast path when the scanned predicate is provably
+            // uncovered; an uncovered default-deny predicate has all rows hidden
+            // => COUNT is 0.
+            if let Some(store) = ctx.binary_store.as_ref() {
+                let pred_sid = normalize_pred_sid(store, &predicate)?;
+                match cursor_fast_path_for_predicate(ctx, &pred_sid) {
+                    PredicateFastPath::Decline => return Ok(None),
+                    PredicateFastPath::Empty => return Ok(Some(build_count_batch(out_var, 0)?)),
+                    PredicateFastPath::Allow => {}
+                }
+            }
             // HEAD lane: base-leaflet scan with the per-leaflet o_type_const shortcut.
-            if let Some(store) = fast_path_store(ctx) {
+            if let Some(store) = fast_path_store_policy_cleared(ctx) {
                 let pred_sid = normalize_pred_sid(store, &predicate)?;
                 let Some(p_id) = store.sid_to_p_id(&pred_sid) else {
                     return Ok(Some(build_count_batch(out_var, 0)?));
@@ -808,29 +929,28 @@ pub fn count_rows_lang_filter_operator(
             // Overlay / time-travel lane: count merged rows whose o_type is the
             // lang-string type. A predicate or lang present only in novelty has no
             // base id, so defer to the fallback (it handles novelty-only terms).
-            if allow_cursor_fast_path(ctx) {
-                if let Some(store) = ctx.binary_store.as_ref() {
-                    let pred_sid = normalize_pred_sid(store, &predicate)?;
-                    let (Some(p_id), Some(lang_id)) = (
-                        store.sid_to_p_id(&pred_sid),
-                        store.resolve_lang_id(&lang_tag),
-                    ) else {
-                        return Ok(None);
-                    };
-                    let required_otype = OType::lang_string(lang_id).as_u16();
-                    if let Some(count) = parallel_overlay_psot_filter_count(
-                        ctx,
-                        store,
-                        ctx.binary_g_id,
-                        pred_sid,
-                        p_id,
-                        move |_s, o_type, _o_key| o_type == required_otype,
-                    )? {
-                        return Ok(Some(build_count_batch(
-                            out_var,
-                            count_to_i64(count, "COUNT rows lang filter")?,
-                        )?));
-                    }
+            // The O1 gate above already cleared single-ledger / no-from_t / policy.
+            if let Some(store) = ctx.binary_store.as_ref() {
+                let pred_sid = normalize_pred_sid(store, &predicate)?;
+                let (Some(p_id), Some(lang_id)) = (
+                    store.sid_to_p_id(&pred_sid),
+                    store.resolve_lang_id(&lang_tag),
+                ) else {
+                    return Ok(None);
+                };
+                let required_otype = OType::lang_string(lang_id).as_u16();
+                if let Some(count) = parallel_overlay_psot_filter_count(
+                    ctx,
+                    store,
+                    ctx.binary_g_id,
+                    pred_sid,
+                    p_id,
+                    move |_s, o_type, _o_key| o_type == required_otype,
+                )? {
+                    return Ok(Some(build_count_batch(
+                        out_var,
+                        count_to_i64(count, "COUNT rows lang filter")?,
+                    )?));
                 }
             }
             Ok(None)
@@ -1001,10 +1121,24 @@ fn distinct_predicates_from_graph_stats(ctx: &ExecutionContext<'_>) -> Option<u6
     Some(g.properties.iter().filter(|p| p.count > 0).count() as u64)
 }
 
+/// Per-chunk partial for the distinct-lead count: groups counted within the
+/// chunk (internal leaflet seams already deduplicated) plus the lead key
+/// prefixes of the chunk's first and last non-empty leaflets, so adjacent
+/// chunks can dedup a lead group spanning their seam. Empty leads ⇔ the chunk
+/// had no non-empty leaflets (identity for the combine).
+struct LeadGroupPartial {
+    count: u64,
+    first_lead: Vec<u8>,
+    last_lead: Vec<u8>,
+}
+
 /// Count distinct lead groups across all leaflets in a given sort order.
 ///
 /// Uses `lead_group_count` from leaflet directory entries, deduplicating groups
-/// that span leaflet boundaries by comparing lead key prefixes.
+/// that span leaflet boundaries by comparing lead key prefixes. Reads only leaf
+/// directories (no column payload) and parallelizes over contiguous leaf chunks
+/// via [`parallel_leaf_chunk_reduce`], stitching chunk seams exactly like the
+/// internal leaflet seams.
 ///
 /// `lead_len` is the number of leading key bytes that define the grouping:
 /// - SPOT distinct subjects: 8 bytes (s_id)
@@ -1019,37 +1153,198 @@ fn count_distinct_lead_groups(
         return Ok(0);
     };
 
-    let mut prev_lead_last: Vec<u8> = Vec::new();
-    let mut total: u64 = 0;
+    let map = |chunk: &[LeafEntry]| -> Result<Option<LeadGroupPartial>> {
+        let mut partial = LeadGroupPartial {
+            count: 0,
+            first_lead: Vec::new(),
+            last_lead: Vec::new(),
+        };
+        for leaf_entry in chunk {
+            let dir = store
+                .open_leaf_dir(&leaf_entry.leaf_cid)
+                .map_err(|e| QueryError::Internal(format!("leaf dir open: {e}")))?;
 
-    for leaf_entry in &branch.leaves {
-        let handle = store
-            .open_leaf_handle(&leaf_entry.leaf_cid, leaf_entry.sidecar_cid.as_ref(), false)
-            .map_err(|e| QueryError::Internal(format!("leaf open: {e}")))?;
-        let dir = handle.dir();
+            for entry in &dir.entries {
+                if entry.row_count == 0 || entry.lead_group_count == 0 {
+                    continue;
+                }
 
-        for entry in &dir.entries {
-            if entry.row_count == 0 || entry.lead_group_count == 0 {
-                continue;
+                let lead_first = entry.first_key.get(..lead_len).ok_or_else(|| {
+                    QueryError::execution("leaflet key shorter than expected lead_len")
+                })?;
+                let lead_last = entry.last_key.get(..lead_len).ok_or_else(|| {
+                    QueryError::execution("leaflet key shorter than expected lead_len")
+                })?;
+
+                partial.count += u64::from(entry.lead_group_count);
+                if !partial.last_lead.is_empty() && partial.last_lead == lead_first {
+                    partial.count = partial.count.saturating_sub(1);
+                }
+                if partial.first_lead.is_empty() {
+                    partial.first_lead.extend_from_slice(lead_first);
+                }
+                partial.last_lead.clear();
+                partial.last_lead.extend_from_slice(lead_last);
             }
-
-            let lead_first = entry.first_key.get(..lead_len).ok_or_else(|| {
-                QueryError::execution("leaflet key shorter than expected lead_len")
-            })?;
-            let lead_last = entry.last_key.get(..lead_len).ok_or_else(|| {
-                QueryError::execution("leaflet key shorter than expected lead_len")
-            })?;
-
-            total += u64::from(entry.lead_group_count);
-            if !prev_lead_last.is_empty() && prev_lead_last == lead_first {
-                total = total.saturating_sub(1);
-            }
-            prev_lead_last.clear();
-            prev_lead_last.extend_from_slice(lead_last);
         }
+        Ok(Some(partial))
+    };
+
+    let combine = |left: LeadGroupPartial, right: LeadGroupPartial| -> LeadGroupPartial {
+        if right.first_lead.is_empty() {
+            return left;
+        }
+        if left.first_lead.is_empty() {
+            return right;
+        }
+        let seam_dedup = u64::from(left.last_lead == right.first_lead);
+        LeadGroupPartial {
+            count: left
+                .count
+                .saturating_add(right.count)
+                .saturating_sub(seam_dedup),
+            first_lead: left.first_lead,
+            last_lead: right.last_lead,
+        }
+    };
+
+    let parallel = branch.leaves.len() >= crate::fast_path_common::parallel_dir_walk_min_leaves();
+    let result = parallel_leaf_chunk_reduce(&branch.leaves, parallel, map, combine)?;
+    Ok(result.map_or(0, |p| p.count))
+}
+
+/// Per-chunk partial for the per-predicate distinct-object count: the same
+/// seam stitching as [`LeadGroupPartial`], plus an `unsupported` flag for
+/// non-empty leaflets that predate `lead_group_count`.
+struct PredicateLeadPartial {
+    count: u64,
+    first_lead: Vec<u8>,
+    last_lead: Vec<u8>,
+    unsupported: bool,
+}
+
+/// Count distinct objects `(o_type, o_key)` for one predicate from POST
+/// leaflet directories only.
+///
+/// POST keys are `p_id(4) + o_type(2) + o_key(8) + o_i(4) + s_id(8)` and POST
+/// `lead_group_count` counts distinct `(o_type, o_key)` per leaflet (`o_i`
+/// excluded), so the 14-byte `p+o` prefix defines a group.
+pub(crate) fn count_distinct_objects_for_predicate(
+    store: &BinaryIndexStore,
+    g_id: GraphId,
+    p_id: u32,
+) -> Result<Option<u64>> {
+    count_lead_groups_for_predicate(store, g_id, p_id, RunSortOrder::Post, 14)
+}
+
+/// Count distinct subjects for one predicate from PSOT leaflet directories
+/// only.
+///
+/// PSOT keys are `p_id(4) + s_id(8) + …` and PSOT `lead_group_count` counts
+/// distinct `s_id` per leaflet, so the 12-byte `p+s` prefix defines a group.
+pub(crate) fn count_distinct_subjects_for_predicate(
+    store: &BinaryIndexStore,
+    g_id: GraphId,
+    p_id: u32,
+) -> Result<Option<u64>> {
+    count_lead_groups_for_predicate(store, g_id, p_id, RunSortOrder::Psot, 12)
+}
+
+/// Count distinct lead groups for one predicate's leaf range (cached
+/// header+directory prefix reads — no payload, columns, or dictionary access).
+///
+/// Sums `lead_group_count` over the predicate's leaflets and deduplicates
+/// groups that span leaflet/chunk seams by the `lead_len`-byte key prefix.
+/// Distinctness is order-independent, so no `lex_sorted_string_ids` gate is
+/// needed and every object type is supported.
+///
+/// Returns `Ok(None)` when a non-empty leaflet has no `lead_group_count`
+/// (pre-§3.2 leaves) — the caller must fall back to a row scan.
+fn count_lead_groups_for_predicate(
+    store: &BinaryIndexStore,
+    g_id: GraphId,
+    p_id: u32,
+    order: RunSortOrder,
+    lead_len: usize,
+) -> Result<Option<u64>> {
+    let leaves = leaf_entries_for_predicate(store, g_id, order, p_id);
+    if leaves.is_empty() {
+        return Ok(Some(0));
     }
 
-    Ok(total)
+    let map = |chunk: &[LeafEntry]| -> Result<Option<PredicateLeadPartial>> {
+        let mut partial = PredicateLeadPartial {
+            count: 0,
+            first_lead: Vec::new(),
+            last_lead: Vec::new(),
+            unsupported: false,
+        };
+        for leaf_entry in chunk {
+            let dir = store
+                .open_leaf_dir(&leaf_entry.leaf_cid)
+                .map_err(|e| QueryError::Internal(format!("leaf dir open: {e}")))?;
+
+            for entry in &dir.entries {
+                if entry.row_count == 0 || entry.p_const != Some(p_id) {
+                    continue;
+                }
+                if entry.lead_group_count == 0 {
+                    partial.unsupported = true;
+                    return Ok(Some(partial));
+                }
+
+                let lead_first = &entry.first_key[..lead_len];
+                let lead_last = &entry.last_key[..lead_len];
+
+                partial.count += u64::from(entry.lead_group_count);
+                if !partial.last_lead.is_empty() && partial.last_lead == lead_first {
+                    partial.count = partial.count.saturating_sub(1);
+                }
+                if partial.first_lead.is_empty() {
+                    partial.first_lead.extend_from_slice(lead_first);
+                }
+                partial.last_lead.clear();
+                partial.last_lead.extend_from_slice(lead_last);
+            }
+        }
+        Ok(Some(partial))
+    };
+
+    let combine =
+        |left: PredicateLeadPartial, right: PredicateLeadPartial| -> PredicateLeadPartial {
+            if left.unsupported || right.unsupported {
+                return PredicateLeadPartial {
+                    count: 0,
+                    first_lead: Vec::new(),
+                    last_lead: Vec::new(),
+                    unsupported: true,
+                };
+            }
+            if right.first_lead.is_empty() {
+                return left;
+            }
+            if left.first_lead.is_empty() {
+                return right;
+            }
+            let seam_dedup = u64::from(left.last_lead == right.first_lead);
+            PredicateLeadPartial {
+                count: left
+                    .count
+                    .saturating_add(right.count)
+                    .saturating_sub(seam_dedup),
+                first_lead: left.first_lead,
+                last_lead: right.last_lead,
+                unsupported: false,
+            }
+        };
+
+    let parallel = leaves.len() >= crate::fast_path_common::parallel_dir_walk_min_leaves();
+    let result = parallel_leaf_chunk_reduce(leaves, parallel, map, combine)?;
+    Ok(match result {
+        Some(p) if p.unsupported => None,
+        Some(p) => Some(p.count),
+        None => Some(0),
+    })
 }
 
 /// Distinct predicates uses p_const metadata rather than lead_group_count,
@@ -1063,10 +1358,9 @@ fn count_distinct_predicates_psot(store: &BinaryIndexStore, g_id: GraphId) -> Re
     let mut total: u64 = 0;
 
     for leaf_entry in &branch.leaves {
-        let handle = store
-            .open_leaf_handle(&leaf_entry.leaf_cid, leaf_entry.sidecar_cid.as_ref(), false)
-            .map_err(|e| QueryError::Internal(format!("leaf open: {e}")))?;
-        let dir = handle.dir();
+        let dir = store
+            .open_leaf_dir(&leaf_entry.leaf_cid)
+            .map_err(|e| QueryError::Internal(format!("leaf dir open: {e}")))?;
 
         for entry in &dir.entries {
             if entry.row_count == 0 {
@@ -1102,6 +1396,10 @@ fn count_distinct_predicates_psot(store: &BinaryIndexStore, g_id: GraphId) -> Re
 // ---------------------------------------------------------------------------
 
 /// Fast-path: count triples with literal objects.
+///
+/// First tries a metadata-only fold over the per-graph property datatype stats
+/// (zero leaf I/O); when the stats can't attribute every row exactly it falls
+/// back to the PSOT leaflet walk.
 pub fn count_literal_objects_operator(
     out_var: VarId,
     fallback: Option<BoxedOperator>,
@@ -1112,13 +1410,66 @@ pub fn count_literal_objects_operator(
             let Some(store) = fast_path_store(ctx) else {
                 return Ok(None);
             };
-            let count = count_literal_rows_psot(store, ctx.binary_g_id)?;
+            let stats_fold = ctx
+                .active_snapshot
+                .stats
+                .as_ref()
+                .and_then(|stats| count_literal_rows_from_stats(stats, ctx.binary_g_id));
+            let count = match stats_fold {
+                Some(count) => {
+                    tracing::debug!(count, "literal COUNT answered from datatype stats");
+                    count
+                }
+                None => count_literal_rows_psot(store, ctx.binary_g_id)?,
+            };
             let count_i64 = count_to_i64(count, "COUNT literals")?;
             Ok(Some(build_count_batch(out_var, count_i64)?))
         },
         fallback,
         "literal COUNT",
     )
+}
+
+/// Metadata-only literal-row count from per-graph property datatype stats:
+/// literal rows = Σ over properties of every non-`JSON_LD_ID` datatype count
+/// (IRI and blank-node refs both carry `JSON_LD_ID`; every other tag is a
+/// literal).
+///
+/// Returns `None` (caller falls back to the leaflet walk) unless the stats
+/// provably attribute every row in the graph:
+/// - an `UNKNOWN` bucket means unattributable rows — the index-build mapping
+///   sends both blank-node objects (not literals) and NumBig overflow values
+///   (literals) to `UNKNOWN`;
+/// - each property's datatype counts must sum to its row count, and property
+///   counts must sum to the graph's flake total (guards stale/partial stats);
+/// - a zero result defers so the leaflet walk (cheap when empty) confirms it.
+fn count_literal_rows_from_stats(stats: &fluree_db_core::IndexStats, g_id: GraphId) -> Option<u64> {
+    let graph = stats.graphs.as_ref()?.iter().find(|g| g.g_id == g_id)?;
+
+    let ref_tag = ValueTypeTag::JSON_LD_ID.as_u8();
+    let unknown_tag = ValueTypeTag::UNKNOWN.as_u8();
+    let mut literals: u64 = 0;
+    let mut attributed: u64 = 0;
+    for prop in &graph.properties {
+        let mut prop_total: u64 = 0;
+        for &(tag, count) in &prop.datatypes {
+            if tag == unknown_tag && count > 0 {
+                return None;
+            }
+            prop_total = prop_total.checked_add(count)?;
+            if tag != ref_tag {
+                literals = literals.checked_add(count)?;
+            }
+        }
+        if prop_total != prop.count {
+            return None;
+        }
+        attributed = attributed.checked_add(prop_total)?;
+    }
+    if attributed != graph.flakes {
+        return None;
+    }
+    (literals > 0).then_some(literals)
 }
 
 fn is_literal_otype(ot_u16: u16) -> bool {
@@ -1266,3 +1617,97 @@ fn count_blank_subject_rows_spot(store: &BinaryIndexStore, g_id: GraphId) -> Res
 // `#[expect(dead_code)]` and not wired. If we revisit this, we should implement
 // a correctness-first detector + a plan that doesn't require enumerating large
 // string-id sets for common prefixes.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fluree_db_core::index_stats::{GraphPropertyStatEntry, GraphStatsEntry};
+    use fluree_db_core::IndexStats;
+
+    fn prop(p_id: u32, datatypes: Vec<(u8, u64)>) -> GraphPropertyStatEntry {
+        let count = datatypes.iter().map(|&(_, c)| c).sum();
+        GraphPropertyStatEntry {
+            p_id,
+            count,
+            ndv_values: 0,
+            ndv_subjects: 0,
+            last_modified_t: 1,
+            datatypes,
+        }
+    }
+
+    fn stats_with_graph(g_id: GraphId, properties: Vec<GraphPropertyStatEntry>) -> IndexStats {
+        let flakes = properties.iter().map(|p| p.count).sum();
+        IndexStats {
+            flakes,
+            size: 0,
+            properties: None,
+            classes: None,
+            graphs: Some(vec![GraphStatsEntry {
+                g_id,
+                flakes,
+                size: 0,
+                properties,
+                classes: None,
+            }]),
+        }
+    }
+
+    const REF: u8 = 16; // ValueTypeTag::JSON_LD_ID
+    const STRING: u8 = 1;
+    const INTEGER: u8 = 2;
+    const UNKNOWN: u8 = 255;
+
+    #[test]
+    fn literal_fold_sums_non_ref_tags() {
+        let stats = stats_with_graph(
+            0,
+            vec![
+                prop(1, vec![(STRING, 100), (REF, 40)]),
+                prop(2, vec![(INTEGER, 7)]),
+                prop(3, vec![(REF, 9)]),
+            ],
+        );
+        assert_eq!(count_literal_rows_from_stats(&stats, 0), Some(107));
+    }
+
+    #[test]
+    fn literal_fold_declines_on_unknown_bucket() {
+        // UNKNOWN holds both blank-node refs and NumBig literals — unattributable.
+        let stats = stats_with_graph(0, vec![prop(1, vec![(STRING, 5), (UNKNOWN, 1)])]);
+        assert_eq!(count_literal_rows_from_stats(&stats, 0), None);
+    }
+
+    #[test]
+    fn literal_fold_declines_on_datatype_count_mismatch() {
+        let mut stats = stats_with_graph(0, vec![prop(1, vec![(STRING, 5)])]);
+        stats.graphs.as_mut().unwrap()[0].properties[0].count = 6;
+        stats.graphs.as_mut().unwrap()[0].flakes = 6;
+        assert_eq!(count_literal_rows_from_stats(&stats, 0), None);
+    }
+
+    #[test]
+    fn literal_fold_declines_on_graph_total_mismatch() {
+        let mut stats = stats_with_graph(0, vec![prop(1, vec![(STRING, 5)])]);
+        stats.graphs.as_mut().unwrap()[0].flakes = 7;
+        assert_eq!(count_literal_rows_from_stats(&stats, 0), None);
+    }
+
+    #[test]
+    fn literal_fold_defers_on_zero_and_missing() {
+        let all_refs = stats_with_graph(0, vec![prop(1, vec![(REF, 9)])]);
+        assert_eq!(count_literal_rows_from_stats(&all_refs, 0), None);
+
+        let stats = stats_with_graph(0, vec![prop(1, vec![(STRING, 5)])]);
+        assert_eq!(count_literal_rows_from_stats(&stats, 2), None);
+
+        let no_graphs = IndexStats {
+            flakes: 5,
+            size: 0,
+            properties: None,
+            classes: None,
+            graphs: None,
+        };
+        assert_eq!(count_literal_rows_from_stats(&no_graphs, 0), None);
+    }
+}

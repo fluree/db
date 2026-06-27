@@ -161,6 +161,28 @@ When tracking is enabled, the response includes tracking information as top-leve
 
 The `fuel` value is decimal with up to 3 places of precision. The HTTP `x-fdb-fuel` response header carries the same value.
 
+When a reasoning mode ran (e.g. `"reasoning": "owl2rl"`), tracked responses
+also include a top-level `reasoning` block describing the OWL2-RL
+materialization — most importantly whether it was **capped** (hit its budget
+before reaching fixpoint, meaning results may be missing entailments):
+
+```json
+{
+  "status": 200,
+  "result": [...],
+  "reasoning": {
+    "capped": false,
+    "derived_facts": 47213,
+    "iterations": 4,
+    "duration_ms": 380
+  }
+}
+```
+
+The same JSON rides the `x-fdb-reasoning` response header. See
+[Reasoning — materialization budget](reasoning.md#materialization-budget)
+for budget configuration.
+
 Tracked transaction responses (`/insert`, `/upsert`, `/update`, including Turtle/TriG and SPARQL UPDATE when tracking headers are used) expose the same top-level `time`, `fuel`, and `policy` fields when present, alongside the transaction receipt fields.
 
 ## Best Practices

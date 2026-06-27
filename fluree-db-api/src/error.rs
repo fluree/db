@@ -376,6 +376,7 @@ impl ApiError {
             ApiError::InvalidBranch(_) => 400,
             ApiError::BranchConflict(_) => 409,
             ApiError::NotFound(_) => 404,
+            ApiError::Ledger(fluree_db_ledger::LedgerError::NotFound(_)) => 404,
             ApiError::LedgerExists(_) => 409,
             ApiError::ReindexConflict { .. } => 409,
             ApiError::IndexTimeout(_) => 504,  // Gateway Timeout
@@ -390,6 +391,7 @@ impl ApiError {
             }
             // Builder validation errors
             ApiError::Builder(_) => 400,
+            ApiError::Query(fluree_db_query::QueryError::Cancelled { .. }) => 408,
             // Most errors are client errors (bad input)
             ApiError::Parse(_)
             | ApiError::Query(_)

@@ -1,13 +1,13 @@
 //! Subclass query integration tests
 //!
-//! These tests depend on subclass reasoning (`rdfs:subClassOf` hierarchy) being applied
-//! during `@type` matching.
+//! These tests exercise subclass reasoning (`rdfs:subClassOf` hierarchy) applied
+//! during `@type` matching. Reasoning is opt-in, so each expanding query sets
+//! `"reasoning": "rdfs"` explicitly; one test pins the plain-semantics default.
 
-mod support;
-
+use crate::support;
+use crate::support::{genesis_ledger, normalize_rows, MemoryFluree, MemoryLedger};
 use fluree_db_api::FlureeBuilder;
 use serde_json::json;
-use support::{genesis_ledger, normalize_rows, MemoryFluree, MemoryLedger};
 use tempfile::TempDir;
 
 async fn seed_schema_creative_work(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
@@ -128,7 +128,8 @@ async fn subclass_creative_work_returns_book_and_movie_instances() {
 
     let q = json!({
         "select": {"?s": ["*"]},
-        "where": {"@id":"?s","@type":"https://schema.org/CreativeWork"}
+        "where": {"@id":"?s","@type":"https://schema.org/CreativeWork"},
+        "reasoning": "rdfs"
     });
 
     let rows = support::query_jsonld(&fluree, &ledger, &q)
@@ -157,6 +158,43 @@ async fn subclass_creative_work_returns_book_and_movie_instances() {
             }
         ]))
     );
+}
+
+#[tokio::test]
+async fn subclass_expansion_requires_explicit_reasoning() {
+    // Reasoning is opt-in: without a `reasoning` key, `@type` matches only
+    // asserted types — no subclass expansion even though the ledger holds a
+    // subClassOf hierarchy.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_schema_creative_work(&fluree, "query/subclass:plain").await;
+
+    let q = json!({
+        "select": "?s",
+        "where": {"@id":"?s","@type":"https://schema.org/CreativeWork"}
+    });
+    let rows = support::query_jsonld(&fluree, &ledger, &q)
+        .await
+        .unwrap()
+        .to_jsonld(&ledger.snapshot)
+        .unwrap();
+    assert_eq!(
+        rows,
+        json!([]),
+        "plain query must not apply subclass expansion"
+    );
+
+    // `"reasoning": "none"` behaves the same as the default.
+    let q_none = json!({
+        "select": "?s",
+        "where": {"@id":"?s","@type":"https://schema.org/CreativeWork"},
+        "reasoning": "none"
+    });
+    let rows = support::query_jsonld(&fluree, &ledger, &q_none)
+        .await
+        .unwrap()
+        .to_jsonld(&ledger.snapshot)
+        .unwrap();
+    assert_eq!(rows, json!([]));
 }
 
 async fn seed_humanoid(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
@@ -209,7 +247,8 @@ async fn subclass_inferencing_issue_core_48() {
             "schema":"http://schema.org/"
         },
         "where": {"@id":"?s","@type":"ex:Humanoid"},
-        "select": {"?s":["*"]}
+        "select": {"?s":["*"]},
+        "reasoning": "rdfs"
     });
     let rows = support::query_jsonld(&fluree, &ledger, &q)
         .await
@@ -277,7 +316,8 @@ async fn subclass_inferencing_after_load_issue_core_48() {
     let q = json!({
         "@context": ctx,
         "where": {"@id":"?s","@type":"ex:Humanoid"},
-        "select": {"?s":["*"]}
+        "select": {"?s":["*"]},
+        "reasoning": "rdfs"
     });
     let rows = support::query_jsonld(&fluree2, &loaded, &q)
         .await
@@ -345,7 +385,8 @@ async fn subclass_nested_stages() {
     let q = json!({
         "@context": {"ex":"http://example.org/"},
         "select": "?s",
-        "where": {"@id":"?s","@type":"ex:Human"}
+        "where": {"@id":"?s","@type":"ex:Human"},
+        "reasoning": "rdfs"
     });
     let rows = support::query_jsonld(&fluree, &db3, &q)
         .await

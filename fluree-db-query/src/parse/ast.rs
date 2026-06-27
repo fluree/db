@@ -10,6 +10,7 @@
 //! - Bind expressions (computed values)
 //! - Values blocks (inline data)
 
+use crate::ir::path::{PathDirection, ShortestPathMode};
 use crate::parse::IriEncoder;
 use fluree_db_core::DatatypeConstraint;
 use fluree_graph_json_ld::ParsedContext;
@@ -25,6 +26,10 @@ pub enum LiteralValue {
     Long(i64),
     /// Float literal (parsed from JSON number)
     Double(f64),
+    /// Exact decimal literal (xsd:decimal — must not round-trip through f64)
+    Decimal(Box<bigdecimal::BigDecimal>),
+    /// Integer literal beyond i64 (xsd:integer is unbounded)
+    BigInt(Box<num_bigint::BigInt>),
     /// Boolean literal
     Boolean(bool),
     /// Vector literal (fluree:vector)
@@ -613,8 +618,14 @@ pub enum UnresolvedAggregateFn {
     Median,
     Variance,
     Stddev,
-    GroupConcat { separator: String },
+    GroupConcat {
+        separator: String,
+    },
     Sample,
+    /// `collect(?x)` — gather every non-unbound value in the group into a list.
+    Collect,
+    /// `collect-distinct(?x)` — gather distinct non-unbound values into a list.
+    CollectDistinct,
 }
 
 /// Aggregate specification (unresolved)
@@ -672,6 +683,11 @@ pub struct UnresolvedOptions {
     /// When false, bare "?x" object values are literals unless
     /// explicitly wrapped as {"@variable": "?x"}.
     pub object_var_parsing: bool,
+    /// When true, scan operators bypass the variable-predicate filter
+    /// for Fluree-system predicates. Parsed from
+    /// `opts.includeSystemFacts: true`. See
+    /// [`crate::ir::Query::include_system_facts`].
+    pub include_system_facts: bool,
 }
 
 impl UnresolvedOptions {
@@ -693,6 +709,7 @@ impl Default for UnresolvedOptions {
             having: None,
             reasoning: None,
             object_var_parsing: true,
+            include_system_facts: false,
         }
     }
 }
@@ -961,6 +978,28 @@ pub enum UnresolvedPattern {
         var: Arc<str>,
         expr: UnresolvedExpression,
     },
+    /// Expand a list-valued expression into one row per element, binding each
+    /// element to `var`. The list source is any expression that evaluates to a
+    /// list value (e.g. `range(1, 5)`, `list(…)`, or a bound list). An empty
+    /// list produces zero rows; a non-list / unbound value produces zero rows.
+    Unwind {
+        var: Arc<str>,
+        expr: UnresolvedExpression,
+    },
+    /// Anchored shortest-path search (`shortestPath` / `allShortestPaths`):
+    /// bind `path_var` to the shortest path(s) between `start` and `end` over a
+    /// single predicate. `predicate` is an expanded IRI resolved to a Sid at
+    /// lowering (an unresolvable predicate yields no rows).
+    ShortestPath {
+        start: UnresolvedTerm,
+        end: UnresolvedTerm,
+        predicate: Arc<str>,
+        direction: PathDirection,
+        mode: ShortestPathMode,
+        path_var: Arc<str>,
+        min_hops: Option<u32>,
+        max_hops: Option<u32>,
+    },
     /// Inline VALUES block - constant rows to join with the current solution stream
     Values {
         /// Variables defined by VALUES (column order)
@@ -1030,6 +1069,52 @@ pub enum UnresolvedPattern {
         name: Arc<str>,
         /// Patterns to execute within the graph
         patterns: Vec<UnresolvedPattern>,
+    },
+
+    /// Edge-rooted annotation pattern.
+    ///
+    /// Lowered from JSON-LD where an object position carries an
+    /// `@annotation` (or its `@edge` alias) block. Syntax:
+    /// ```json
+    /// { "@id": "?s", "ex:worksFor": {
+    ///     "@id": "?o",
+    ///     "@annotation": { "ex:role": "Engineer" }
+    /// }}
+    /// ```
+    /// The annotation is a node-map describing the annotation subject —
+    /// `@id` (if present) names the subject; the rest of the body
+    /// produces patterns about that subject.
+    EdgeAnnotation {
+        /// The annotated edge (subject, predicate, object).
+        edge: UnresolvedTriplePattern,
+        /// The annotation subject — variable, anonymous (synthetic var),
+        /// or named IRI.
+        annotation: UnresolvedTerm,
+        /// Patterns about the annotation subject (lowered from the
+        /// non-`@`-keyword properties of the `@annotation` node-map).
+        body: Vec<UnresolvedPattern>,
+    },
+
+    /// Annotation-rooted pattern (reverse direction).
+    ///
+    /// Lowered from a node-map containing `@reifies`. The enclosing node
+    /// is the annotation subject; `@reifies` names the edge it reifies;
+    /// the rest of the node's properties become facts about the
+    /// annotation subject. Syntax:
+    /// ```json
+    /// { "@id": "?ann", "ex:role": "Engineer",
+    ///   "@reifies": { "@id": "?s", "ex:worksFor": { "@id": "?o" } }
+    /// }
+    /// ```
+    AnnotationTarget {
+        /// The annotation subject (variable, anonymous synthetic var,
+        /// or named IRI).
+        annotation: UnresolvedTerm,
+        /// The base edge being reified (subject, predicate, object).
+        edge: UnresolvedTriplePattern,
+        /// Patterns about the annotation subject (lowered from the
+        /// non-`@`-keyword properties of the enclosing node).
+        body: Vec<UnresolvedPattern>,
     },
 }
 
@@ -1185,8 +1270,15 @@ impl UnresolvedQuery {
                     UnresolvedPattern::Graph {
                         patterns: inner, ..
                     } => collect(inner, out),
+                    UnresolvedPattern::EdgeAnnotation { edge, body, .. }
+                    | UnresolvedPattern::AnnotationTarget { edge, body, .. } => {
+                        out.push(edge);
+                        collect(body, out);
+                    }
                     UnresolvedPattern::Filter(_)
                     | UnresolvedPattern::Bind { .. }
+                    | UnresolvedPattern::Unwind { .. }
+                    | UnresolvedPattern::ShortestPath { .. }
                     | UnresolvedPattern::Values { .. }
                     | UnresolvedPattern::Path { .. }
                     | UnresolvedPattern::Subquery(_)

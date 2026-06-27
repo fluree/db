@@ -165,6 +165,9 @@ fn resolve_subject_term(
                         "CONSTRUCT does not support GROUP BY (Binding::Grouped encountered)"
                             .to_string(),
                     )),
+                    Binding::Path(_) | Binding::List(_) => Err(FormatError::InvalidBinding(
+                        "CONSTRUCT does not support path/list values".to_string(),
+                    )),
                 }
             }
             None => Ok(None),
@@ -237,6 +240,9 @@ fn resolve_predicate_term(
                     Binding::Grouped(_) => Err(FormatError::InvalidBinding(
                         "CONSTRUCT does not support GROUP BY (Binding::Grouped encountered)"
                             .to_string(),
+                    )),
+                    Binding::Path(_) | Binding::List(_) => Err(FormatError::InvalidBinding(
+                        "CONSTRUCT does not support path/list values".to_string(),
                     )),
                 }
             }
@@ -389,7 +395,7 @@ fn binding_to_ir_term(
                     language: None,
                 })),
                 FlakeValue::Decimal(d) => Ok(Some(IrTerm::Literal {
-                    value: LiteralValue::String(Arc::from(d.to_string())),
+                    value: LiteralValue::String(Arc::from(d.to_plain_string())),
                     datatype: Datatype::from_iri(&dt_iri),
                     language: None,
                 })),
@@ -468,6 +474,9 @@ fn binding_to_ir_term(
         Binding::Grouped(_) => Err(FormatError::InvalidBinding(
             "CONSTRUCT does not support GROUP BY (Binding::Grouped encountered)".to_string(),
         )),
+        Binding::Path(_) | Binding::List(_) => Err(FormatError::InvalidBinding(
+            "CONSTRUCT does not support path/list values".to_string(),
+        )),
     }
 }
 
@@ -519,7 +528,7 @@ fn flake_value_to_ir_term(val: &FlakeValue) -> Result<Option<IrTerm>> {
             language: None,
         }),
         FlakeValue::Decimal(d) => Some(IrTerm::Literal {
-            value: LiteralValue::String(Arc::from(d.to_string())),
+            value: LiteralValue::String(Arc::from(d.to_plain_string())),
             datatype: Datatype::xsd_decimal(),
             language: None,
         }),

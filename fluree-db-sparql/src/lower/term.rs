@@ -13,7 +13,7 @@ use crate::ast::TriplePattern as SparqlTriplePattern;
 use fluree_db_core::temporal::{
     DayTimeDuration, Duration, GDay, GMonth, GMonthDay, GYear, GYearMonth, YearMonthDuration,
 };
-use fluree_db_core::{FlakeValue, Sid};
+use fluree_db_core::{DatatypeConstraint, FlakeValue, Sid};
 use fluree_db_query::binding::Binding;
 use fluree_db_query::ir::triple::{Ref, Term, TriplePattern};
 use fluree_db_query::parse::encode::IriEncoder;
@@ -23,6 +23,33 @@ use fluree_vocab::{fluree, xsd, xsd_names};
 use std::sync::Arc;
 
 use super::{LowerError, LoweringContext, Result};
+
+/// Parse an `xsd:decimal` lexical form into an exact `FlakeValue::Decimal`.
+///
+/// Decimals must never round-trip through `f64`: values like `19.99` have no
+/// exact binary representation, and the storage layer keys decimals on the
+/// exact `BigDecimal` value.
+pub(super) fn parse_decimal_value(
+    value: &str,
+    span: crate::span::SourceSpan,
+) -> Result<FlakeValue> {
+    value
+        .parse::<bigdecimal::BigDecimal>()
+        .map(|d| FlakeValue::Decimal(Box::new(d)))
+        .map_err(|_| LowerError::invalid_decimal(value, span))
+}
+
+/// Parse an integer lexical beyond i64 into an exact `FlakeValue::BigInt`
+/// (xsd:integer is unbounded).
+pub(super) fn parse_big_integer_value(
+    value: &str,
+    span: crate::span::SourceSpan,
+) -> Result<FlakeValue> {
+    value
+        .parse::<num_bigint::BigInt>()
+        .map(|n| FlakeValue::BigInt(Box::new(n)))
+        .map_err(|_| LowerError::invalid_integer(value, span))
+}
 
 impl<E: IriEncoder> LoweringContext<'_, E> {
     /// Register a SPARQL variable with the variable registry.
@@ -100,6 +127,90 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
         }
     }
 
+    /// Constraint-preserving sibling to [`Self::lower_object`].
+    ///
+    /// Returns `(Term, Option<DatatypeConstraint>)` so callers that
+    /// build `TriplePattern { dtc, .. }` can attach a precise scan
+    /// filter for literal-typed objects. The constraint is `Some` only
+    /// for literal terms — variable, IRI, and blank-node objects
+    /// return `None` (their identity is fully captured by `Term`).
+    ///
+    /// Used by edge-annotation lowering paths (annotation block body
+    /// and triple-term) so that:
+    /// - plain strings match only `xsd:string` flakes,
+    /// - typed literals match only their exact datatype,
+    /// - language-tagged strings match only the same language tag.
+    ///
+    /// `lower_object`'s existing behavior (no constraint) is preserved
+    /// for non-annotated triples to avoid changing scan semantics on
+    /// the broader query surface.
+    pub(super) fn lower_object_with_constraint(
+        &mut self,
+        term: &ObjectTerm,
+    ) -> Result<(Term, Option<DatatypeConstraint>)> {
+        match term {
+            SparqlTerm::Var(v) => Ok((self.lower_var(v), None)),
+            SparqlTerm::Iri(iri) => Ok((self.lower_iri(iri)?, None)),
+            SparqlTerm::Literal(lit) => self.lower_literal_with_constraint(lit),
+            SparqlTerm::BlankNode(_) => Ok((self.lower_object(term)?, None)),
+        }
+    }
+
+    /// Like [`Self::lower_literal`] but also returns the
+    /// datatype/language constraint that pins the lexical value to a
+    /// specific RDF datatype or language tag.
+    fn lower_literal_with_constraint(
+        &mut self,
+        lit: &Literal,
+    ) -> Result<(Term, Option<DatatypeConstraint>)> {
+        let (value, dtc) = match &lit.value {
+            LiteralValue::Simple(s) => (
+                FlakeValue::String(s.to_string()),
+                DatatypeConstraint::Explicit(Sid::new(XSD, xsd_names::STRING)),
+            ),
+            LiteralValue::LangTagged { value, lang } => (
+                FlakeValue::String(value.to_string()),
+                DatatypeConstraint::LangTag(lang.clone()),
+            ),
+            LiteralValue::Typed { value, datatype } => {
+                let fv = self.lower_typed_literal(value, datatype)?;
+                // Resolve the datatype IRI to its canonical SID via the
+                // encoder. For custom (unencoded) datatypes the encoder
+                // returns None — fall back to `xsd:string`, matching
+                // the storage-side fallback in `term_to_binding`.
+                let dt_iri = self.expand_iri(datatype)?;
+                let dt_sid = self
+                    .encoder
+                    .encode_iri_strict(&dt_iri)
+                    .unwrap_or_else(|| Sid::new(XSD, xsd_names::STRING));
+                (fv, DatatypeConstraint::Explicit(dt_sid))
+            }
+            LiteralValue::Integer(i) => (
+                FlakeValue::Long(*i),
+                DatatypeConstraint::Explicit(Sid::new(XSD, xsd_names::INTEGER)),
+            ),
+            LiteralValue::BigInteger(s) => (
+                parse_big_integer_value(s, lit.span)?,
+                DatatypeConstraint::Explicit(Sid::new(XSD, xsd_names::INTEGER)),
+            ),
+            LiteralValue::Decimal(d) => (
+                // Exact: never round-trip xsd:decimal through f64 (see
+                // `parse_decimal_value`). Matches the sibling `lower_literal`.
+                parse_decimal_value(d, lit.span)?,
+                DatatypeConstraint::Explicit(Sid::new(XSD, xsd_names::DECIMAL)),
+            ),
+            LiteralValue::Double(d) => (
+                FlakeValue::Double(*d),
+                DatatypeConstraint::Explicit(Sid::new(XSD, xsd_names::DOUBLE)),
+            ),
+            LiteralValue::Boolean(b) => (
+                FlakeValue::Boolean(*b),
+                DatatypeConstraint::Explicit(Sid::new(XSD, xsd_names::BOOLEAN)),
+            ),
+        };
+        Ok((Term::Value(value), Some(dtc)))
+    }
+
     pub(super) fn lower_var(&mut self, var: &Var) -> Term {
         Term::Var(self.register_var(var))
     }
@@ -135,12 +246,8 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
             }
             LiteralValue::Typed { value, datatype } => self.lower_typed_literal(value, datatype)?,
             LiteralValue::Integer(i) => FlakeValue::Long(*i),
-            LiteralValue::Decimal(d) => {
-                let val: f64 = d
-                    .parse()
-                    .map_err(|_| LowerError::invalid_decimal(d.as_ref(), lit.span))?;
-                FlakeValue::Double(val)
-            }
+            LiteralValue::BigInteger(s) => parse_big_integer_value(s, lit.span)?,
+            LiteralValue::Decimal(d) => parse_decimal_value(d, lit.span)?,
             LiteralValue::Double(d) => FlakeValue::Double(*d),
             LiteralValue::Boolean(b) => FlakeValue::Boolean(*b),
         };
@@ -152,13 +259,20 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
 
         match dt_iri.as_str() {
             xsd::STRING => Ok(FlakeValue::String(value.to_string())),
-            xsd::INTEGER | xsd::INT | xsd::LONG => {
+            // xsd:integer is unbounded: promote past i64 instead of erroring.
+            xsd::INTEGER => match value.parse::<i64>() {
+                Ok(i) => Ok(FlakeValue::Long(i)),
+                Err(_) => parse_big_integer_value(value, datatype.span),
+            },
+            // xsd:int / xsd:long are bounded; out-of-range is a lexical error.
+            xsd::INT | xsd::LONG => {
                 let i: i64 = value
                     .parse()
                     .map_err(|_| LowerError::invalid_integer(value, datatype.span))?;
                 Ok(FlakeValue::Long(i))
             }
-            xsd::DECIMAL | xsd::DOUBLE | xsd::FLOAT => {
+            xsd::DECIMAL => parse_decimal_value(value, datatype.span),
+            xsd::DOUBLE | xsd::FLOAT => {
                 let d: f64 = value
                     .parse()
                     .map_err(|_| LowerError::invalid_decimal(value, datatype.span))?;
@@ -328,20 +442,25 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                     FlakeValue::Boolean(*b),
                     Sid::new(XSD, xsd_names::BOOLEAN),
                 )),
-                LiteralValue::Decimal(d) => {
-                    let val: f64 = d
-                        .parse()
-                        .map_err(|_| LowerError::invalid_decimal(d.as_ref(), lit.span))?;
-                    Ok(Binding::lit(
-                        FlakeValue::Double(val),
-                        Sid::new(XSD, xsd_names::DECIMAL),
-                    ))
-                }
+                LiteralValue::BigInteger(s) => Ok(Binding::lit(
+                    parse_big_integer_value(s, lit.span)?,
+                    Sid::new(XSD, xsd_names::INTEGER),
+                )),
+                LiteralValue::Decimal(d) => Ok(Binding::lit(
+                    parse_decimal_value(d, lit.span)?,
+                    Sid::new(XSD, xsd_names::DECIMAL),
+                )),
                 LiteralValue::Typed { value, datatype } => {
                     let fv = self.lower_typed_literal(value, datatype)?;
                     let dt_iri = self.expand_iri(datatype)?;
+                    // Bind the DECLARED datatype: Binding::Lit equality
+                    // includes the datatype, so labeling every typed literal
+                    // xsd:string made VALUES constants like
+                    // "…"^^xsd:integer unable to match stored values.
                     let dt_sid = if dt_iri == fluree::EMBEDDING_VECTOR {
                         Sid::new(FLUREE_DB, "vector")
+                    } else if let Some(sid) = self.encoder.encode_iri_strict(&dt_iri) {
+                        sid
                     } else {
                         Sid::new(XSD, xsd_names::STRING)
                     };

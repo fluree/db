@@ -2,13 +2,16 @@
 //!
 //! Provides type aliases, helpers, and utilities used by integration tests.
 
-// Many helpers are used by *some* integration test crates but not others.
-// Keep them centralized here and silence dead_code warnings in crates that
-// don't reference every helper.
+// Many helpers are used by *some* integration test groups but not others.
+// Keep them centralized here and silence dead_code warnings in group binaries
+// that don't reference every helper.
 //
-// Kept as a shared utility module across many integration tests. Individual
-// test crates intentionally do not use every helper.
-#![expect(dead_code)]
+// `allow` (not the repo-preferred `expect`) is deliberate: this module is
+// compiled once into each `grp_*` test binary, and the subset of helpers used
+// differs per group. `#![expect(dead_code)]` would fire an "unfulfilled
+// expectation" warning in any group that happens to use *all* of them, so a
+// plain `allow` is the only annotation correct across every binary.
+#![allow(dead_code)]
 
 pub mod span_capture;
 
@@ -278,7 +281,7 @@ pub async fn trigger_index_and_wait_outcome(
 #[cfg(feature = "native")]
 pub fn start_background_indexer_local(
     backend: fluree_db_core::StorageBackend,
-    nameservice: Arc<dyn fluree_db_nameservice::ReadWriteNameService>,
+    nameservice: Arc<dyn fluree_db_nameservice::IndexingNameService>,
     config: fluree_db_indexer::IndexerConfig,
 ) -> (LocalSet, fluree_db_indexer::IndexerHandle) {
     let (worker, handle) =
@@ -288,6 +291,125 @@ pub fn start_background_indexer_local(
     local.spawn_local(worker.run());
 
     (local, handle)
+}
+
+/// Variant that wires an `AttachmentEventsProvider` against a
+/// running `Fluree`'s `LedgerManager`. Tests that exercise the M2b
+/// arena-seal path use this so the worker resolves per-job
+/// attachment events from the live overlay.
+///
+/// The provider returns `Augment(events)` — the safe default
+/// matching the api's production behavior.
+#[cfg(feature = "native")]
+pub fn start_background_indexer_with_attachments(
+    fluree: &fluree_db_api::Fluree,
+    config: fluree_db_indexer::IndexerConfig,
+) -> (LocalSet, fluree_db_indexer::IndexerHandle) {
+    use async_trait::async_trait;
+    use fluree_db_indexer::{AttachmentEventCoverage, AttachmentEventsProvider};
+
+    struct TestProvider {
+        manager: Arc<fluree_db_api::LedgerManager>,
+    }
+
+    impl std::fmt::Debug for TestProvider {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("TestProvider").finish()
+        }
+    }
+
+    #[async_trait]
+    impl AttachmentEventsProvider for TestProvider {
+        async fn attachment_events(&self, ledger_id: &str) -> Option<AttachmentEventCoverage> {
+            use fluree_db_api::ledger_manager::RunningCoverage;
+            let result = self
+                .manager
+                .try_running_attachment_events(ledger_id)
+                .await?;
+            Some(match result.coverage {
+                RunningCoverage::Authoritative => {
+                    AttachmentEventCoverage::Authoritative(result.events)
+                }
+                RunningCoverage::Augment => AttachmentEventCoverage::Augment(result.events),
+            })
+        }
+    }
+
+    let manager = fluree
+        .ledger_manager()
+        .expect("test must be built with with_ledger_cache_config")
+        .clone();
+    let provider: Arc<dyn AttachmentEventsProvider> = Arc::new(TestProvider { manager });
+    let config = config.with_attachment_events_provider(provider);
+
+    start_background_indexer_local(
+        fluree.backend().clone(),
+        fluree
+            .nameservice_mode()
+            .publisher_arc()
+            .expect("test setup requires ReadWrite nameservice mode"),
+        config,
+    )
+}
+
+/// Force the LedgerManager to apply the just-published index onto
+/// the cached ledger handle, then poll until `snapshot.t` (the
+/// **indexed** t) catches up.
+///
+/// `trigger_index_and_wait` only waits on the worker's completion;
+/// `apply_index_v2` runs via `notify`. We can't use
+/// `Fluree::refresh` directly here — its fast path keys on the
+/// commit-t, which already equals `target_index_t` post-insert,
+/// short-circuiting before `notify` runs. Instead we call
+/// `LedgerManager::notify` directly with the latest ns_record so
+/// the IndexOnly branch fires.
+#[cfg(feature = "native")]
+pub async fn wait_for_index_application(
+    fluree: &fluree_db_api::Fluree,
+    ledger_id: &str,
+    target_index_t: i64,
+) {
+    use fluree_db_api::NsNotify;
+    use std::time::{Duration, Instant};
+
+    let ns_record = fluree
+        .nameservice()
+        .lookup(ledger_id)
+        .await
+        .expect("ns lookup")
+        .expect("ns record present");
+    let canonical = ns_record.ledger_id.clone();
+
+    // Fire notify so the cache applies the new index.
+    let mgr = fluree
+        .ledger_manager()
+        .expect("ledger caching must be enabled");
+    let _ = mgr
+        .notify(NsNotify {
+            ledger_id: canonical.clone(),
+            record: Some(ns_record),
+        })
+        .await
+        .expect("notify after reindex");
+
+    // Poll the cached handle's snapshot.t (the *indexed* t).
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let handle = fluree
+            .ledger_cached(&canonical)
+            .await
+            .expect("ledger_cached during wait");
+        let view = handle.snapshot().await;
+        if view.snapshot.t >= target_index_t {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for cached handle's snapshot.t to reach {target_index_t}; current={}",
+            view.snapshot.t
+        );
+        tokio::task::yield_now().await;
+    }
 }
 
 // =============================================================================

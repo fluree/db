@@ -118,7 +118,8 @@ Opts come from three layers, merged shallowly with **the most specific layer win
 
 This precedence is security-relevant. The HTTP server's bearer/identity gate runs against the **pre-merged** opts and writes its decision into the body layer (layer 3), where the dispatcher's merge then makes it the final word. Inverting the order would let an envelope-level or sub-query-level `opts.identity` clobber the gate's decision.
 
-- Per-sub-query overrides recognised at any layer: `meta`, `policy`, `policy-class`, `policy-values`, `identity`, `default-allow`, `timeoutMs`, `max-fuel`.
+- Per-sub-query overrides recognised at any layer: `meta`, `policy`, `policy-class`, `policy-values`, `identity`, `default-allow`, `timeoutMs`, `max-fuel`, `min-t` / `minT`.
+- `opts.min-t` / `opts.minT` requests read-after-write freshness before the envelope snapshot is resolved. Envelope-level values apply to every referenced ledger; sub-query values apply to that sub-query's ledger(s). The `Fluree-Min-T` header provides the same guarantee as an envelope default.
 - `opts.t` is **rejected at every layer** inside a multi-query envelope (envelope opts, sub-query opts, AND body opts). Pin time via `from` (per sub-query) or envelope `asOf`.
 - Envelope-level `opts.max-fuel` is rejected up-front (see [Limitations](#limitations)); per-sub-query `opts.max-fuel` (in either layer 2 or layer 3) is honoured.
 

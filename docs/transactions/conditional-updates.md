@@ -21,10 +21,15 @@ This guide covers common patterns for state-dependent updates with both **JSON-L
 
 The WHERE clause runs against the **current** database state. If it matches, the bound variables flow into DELETE (to retract old values) and INSERT (to assert new ones). If WHERE returns zero rows — because a FILTER eliminated them or a pattern didn't match — DELETE is skipped entirely (nothing to retract) and INSERT templates with unbound variables produce zero flakes.
 
-### Two INSERT behaviors
+### How INSERT interacts with WHERE solutions
 
-- **INSERT with variables from WHERE** (e.g., `"@id": "?s"`) — conditional. When WHERE returns zero rows, the variable is unbound and the INSERT produces nothing. Use this for CAS, state machines, and guards.
-- **All-literal INSERT** (e.g., `"@id": "ex:alice"`) — unconditional. Fires even when WHERE returns zero rows. Use this for "delete-if-exists, always insert" patterns.
+INSERT templates are instantiated **once per WHERE solution row**, following SPARQL 1.1 Update §3.1.3:
+
+- **WHERE returns one or more rows** — each INSERT template fires once per row. A template term bound to a WHERE variable takes that row's value; a term whose variable is unbound for that row (e.g., from an unmatched OPTIONAL) is skipped, while all-literal terms still assert.
+- **WHERE returns zero rows** — nothing is inserted, *even for all-literal INSERT templates*. A guard (required pattern or `FILTER`) that matches nothing is a true no-op. This applies identically to JSON-LD and SPARQL UPDATE.
+- **No WHERE clause at all** — the INSERT fires once (the plain insert path).
+
+This means an "always insert, delete-if-exists" idiom must be written so WHERE still yields a row when the entity is absent — use `OPTIONAL`, which produces one row with the probe variable unbound, alongside the literal INSERT (see [Insert-If-Not-Exists](#6-insert-if-not-exists-conditional-create)). A bare *required* pattern that fails to match yields zero rows and therefore inserts nothing.
 
 ---
 

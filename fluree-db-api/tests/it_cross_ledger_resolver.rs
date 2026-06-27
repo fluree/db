@@ -6,8 +6,7 @@
 //! step (slice 5) and enforcement against a real query (slice 9) are
 //! covered separately; this file's job is the wire-artifact contract.
 
-mod support;
-
+use crate::support::genesis_ledger;
 use fluree_db_api::cross_ledger::{
     resolve_graph_ref, ArtifactKind, GovernanceArtifact, ResolveCtx,
 };
@@ -15,7 +14,6 @@ use fluree_db_api::FlureeBuilder;
 use fluree_db_core::ledger_config::GraphSourceRef;
 use fluree_db_policy::TargetMode;
 use serde_json::json;
-use support::genesis_ledger;
 
 /// Build a cross-ledger GraphSourceRef.
 fn cross_ref(ledger: &str, graph: &str) -> GraphSourceRef {
@@ -638,7 +636,7 @@ async fn distinct_namespace_codes_canary_term_translation_still_works() {
     // into D's evaluation), the deny would miss and alice would be
     // visible.
     let wrapped = fluree
-        .db_with_policy(data_id, &fluree_db_api::QueryConnectionOptions::default())
+        .db_with_policy(data_id, &fluree_db_api::GovernanceOptions::default())
         .await
         .expect("db_with_policy under cross-ledger");
 

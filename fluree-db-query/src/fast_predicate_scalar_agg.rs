@@ -18,9 +18,9 @@
 use crate::binding::{Batch, Binding};
 use crate::error::{QueryError, Result};
 use crate::fast_path_common::{
-    allow_cursor_fast_path, build_i64_singleton_batch, build_post_cursor_for_predicate,
-    count_to_i64, cursor_projection_otype_okey, leaf_entries_for_predicate, normalize_pred_sid,
-    projection_okey_only, FastPathOperator,
+    build_i64_singleton_batch, build_post_cursor_for_predicate, count_to_i64,
+    cursor_projection_otype_okey, leaf_entries_for_predicate, normalize_pred_sid,
+    predicate_fast_path_allowed, projection_okey_only, FastPathOperator,
 };
 use crate::ir::triple::Ref;
 use crate::operator::BoxedOperator;
@@ -155,12 +155,18 @@ pub fn predicate_scalar_agg_operator(
     FastPathOperator::new(
         out_var,
         move |ctx| {
-            if !allow_cursor_fast_path(ctx) {
-                return Ok(None);
-            }
             let Some(store) = ctx.binary_store.as_ref() else {
                 return Ok(None);
             };
+            // O1: keep the cursor fast path when the scanned predicate is provably
+            // uncovered by the view policy. Anything else (covered, default-deny,
+            // multi-ledger, historical) defers to the fallback, which computes the
+            // correct aggregate identity over the policy-filtered input. This path
+            // is overlay-aware, so it gates on the predicate only — not on the
+            // no-overlay `fast_path_store_policy_cleared` store.
+            if !predicate_fast_path_allowed(ctx, store, &predicate)? {
+                return Ok(None);
+            }
             // No-overlay HEAD reads take the leaflet-metadata scan (with its
             // constant-folding / directory shortcuts). An uncommitted overlay or
             // `to_t < max_t` would make that scan stale, so fold the same
@@ -350,6 +356,20 @@ fn scan_predicate_scalar_agg(
     let Some(p_id) = store.sid_to_p_id(&pred_sid) else {
         return Ok(Some(empty_result(kind)));
     };
+
+    // COUNT(DISTINCT ?o): metadata-only POST lead-group walk (directory
+    // reads, every object type). The per-row scan below remains the fallback
+    // for leaves that predate `lead_group_count` and handles IRI refs only.
+    if matches!(kind, ScalarAggKind::CountDistinctObject) {
+        if let Some(distinct) =
+            crate::fast_count::count_distinct_objects_for_predicate(store, g_id, p_id)?
+        {
+            return Ok(Some(AggOutput::Integer(count_to_i64(
+                distinct,
+                "COUNT(DISTINCT)",
+            )?)));
+        }
+    }
 
     let leaves = leaf_entries_for_predicate(store, g_id, RunSortOrder::Post, p_id);
     let mut state = AggState::new(kind);

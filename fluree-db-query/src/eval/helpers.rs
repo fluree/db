@@ -16,7 +16,6 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
-use super::value::ComparableValue;
 use crate::var_registry::VarId;
 
 // =============================================================================
@@ -727,24 +726,6 @@ fn flake_value_to_datetime(
             )
         }
         _ => None,
-    }
-}
-
-/// Format a datatype Sid as a ComparableValue
-///
-/// Returns compact string representations for well-known datatypes.
-pub fn format_datatype_sid(dt: &fluree_db_core::Sid) -> ComparableValue {
-    let datatypes = &*WELL_KNOWN_DATATYPES;
-    if *dt == datatypes.rdf_json {
-        ComparableValue::String(Arc::from("@json"))
-    } else if *dt == datatypes.id_type {
-        ComparableValue::String(Arc::from("@id"))
-    } else if dt.namespace_code == datatypes.xsd_string.namespace_code {
-        ComparableValue::String(Arc::from(format!("xsd:{}", dt.name_str())))
-    } else if dt.namespace_code == datatypes.rdf_json.namespace_code {
-        ComparableValue::String(Arc::from(format!("rdf:{}", dt.name_str())))
-    } else {
-        ComparableValue::Sid(dt.clone())
     }
 }
 

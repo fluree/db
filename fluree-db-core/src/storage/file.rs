@@ -179,6 +179,10 @@ impl StorageRead for FileStorage {
         .map_err(|e| crate::error::Error::io(format!("spawn_blocking failed: {e}")))?
     }
 
+    fn supports_ranged_reads(&self) -> bool {
+        true
+    }
+
     async fn exists(&self, address: &str) -> Result<bool> {
         let path = self.resolve_path(address)?;
         match tokio::fs::metadata(&path).await {

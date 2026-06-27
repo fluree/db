@@ -129,113 +129,57 @@ pub async fn compute_missing_commits<C: ContentStore>(
 // Missing index artifact computation
 // ============================================================================
 
-/// Decode an index root blob (FIR6) and return all CAS artifact CIDs.
-fn decode_root_cas_ids(bytes: &[u8]) -> std::result::Result<Vec<ContentId>, String> {
-    let root = IndexRoot::decode(bytes).map_err(|e| e.to_string())?;
-    Ok(root.all_cas_ids())
-}
-
-/// Extract named-graph branch CIDs from a decoded root.
-///
-/// These branch manifests must be loaded from CAS to discover the
-/// leaf/sidecar CIDs they contain.
-fn extract_branch_cids(bytes: &[u8]) -> Vec<ContentId> {
-    if let Ok(root) = IndexRoot::decode(bytes) {
-        return root
-            .named_graphs
-            .iter()
-            .flat_map(|ng| ng.orders.iter().map(|(_, cid)| cid.clone()))
-            .collect();
-    }
-    Vec::new()
-}
-
-/// Load branch manifests and collect their leaf + sidecar CIDs.
-///
-/// Named-graph branches (FBR3) are separate CAS objects whose leaf/sidecar
-/// CIDs are not inline in the root. This function expands them so that
-/// pack/sync transfers a self-contained index snapshot.
-async fn expand_branch_leaf_cids<C: ContentStore>(
-    store: &C,
-    branch_cids: &[ContentId],
-) -> Vec<ContentId> {
-    let mut ids = Vec::new();
-    for branch_cid in branch_cids {
-        let bytes = match store.get(branch_cid).await {
-            Ok(b) => b,
-            Err(e) => {
-                tracing::debug!(
-                    %branch_cid,
-                    error = %e,
-                    "skipping branch manifest (not loadable)"
-                );
-                continue;
-            }
-        };
-        let manifest = match fluree_db_binary_index::format::branch::read_branch_from_bytes(&bytes)
-        {
-            Ok(m) => m,
-            Err(e) => {
-                tracing::debug!(
-                    %branch_cid,
-                    error = %e,
-                    "skipping branch manifest (decode failed)"
-                );
-                continue;
-            }
-        };
-        for leaf in &manifest.leaves {
-            ids.push(leaf.leaf_cid.clone());
-            if let Some(ref sc) = leaf.sidecar_cid {
-                ids.push(sc.clone());
-            }
-        }
-    }
-    ids
-}
-
 /// Compute the set of index artifact CIDs that the client is missing.
 ///
-/// Loads the `want` index root, collects all its CAS artifact CIDs via
-/// `all_cas_ids()`, then subtracts the `have` root's artifact set (if provided).
-/// The root blob itself is included in the result so the client gets a complete
-/// index snapshot.
+/// Loads the `want` index root, collects all CAS artifact CIDs reachable
+/// from it (including leaves behind named-graph and annotation branch
+/// manifests), then subtracts the `have` root's reachable set if provided.
+/// The root blob itself is included in the result so the client gets a
+/// complete, self-contained index snapshot.
 ///
-/// Returns artifact CIDs in sorted order (dict/branch/leaf CIDs), deduplicated.
+/// Returns artifact CIDs in sorted order (dict / branch / leaf CIDs),
+/// deduplicated.
 pub async fn compute_missing_index_artifacts<C: ContentStore>(
     store: &C,
     want_root_id: &ContentId,
     have_root_id: Option<&ContentId>,
 ) -> Result<Vec<ContentId>> {
-    // Load and parse the want root (FIR6).
     let want_bytes = store.get(want_root_id).await.map_err(|e| {
         ApiError::internal(format!("failed to read index root {want_root_id}: {e}"))
     })?;
-    let want_cas_ids = decode_root_cas_ids(&want_bytes).map_err(|e| {
+    let want_root = IndexRoot::decode(&want_bytes).map_err(|e| {
         ApiError::internal(format!("failed to parse index root {want_root_id}: {e}"))
     })?;
 
-    // Expand named-graph branch manifests to include their leaf/sidecar CIDs.
-    let want_branch_cids = extract_branch_cids(&want_bytes);
-    let want_branch_leaf_ids = expand_branch_leaf_cids(store, &want_branch_cids).await;
-
-    let mut want_set: HashSet<ContentId> = want_cas_ids.into_iter().collect();
-    want_set.extend(want_branch_leaf_ids);
+    // Strict expansion: pack must transfer a self-contained snapshot,
+    // so a missing branch manifest has to surface as an error rather
+    // than silently shipping a partial set.
+    let mut want_set = fluree_db_binary_index::collect_root_cas_ids_expanded(store, &want_root)
+        .await
+        .map_err(|e| {
+            ApiError::internal(format!(
+                "failed to expand index root {want_root_id} CAS set: {e}"
+            ))
+        })?;
     // Include the root blob itself.
     want_set.insert(want_root_id.clone());
 
     // If the client has an existing index root, subtract its artifacts.
     if let Some(have_id) = have_root_id {
         if let Ok(have_bytes) = store.get(have_id).await {
-            if let Ok(have_ids) = decode_root_cas_ids(&have_bytes) {
-                for cid in have_ids {
-                    want_set.remove(&cid);
-                }
-                // Expand the have root's branches too, so shared leaves are subtracted.
-                let have_branch_cids = extract_branch_cids(&have_bytes);
-                let have_branch_leaf_ids = expand_branch_leaf_cids(store, &have_branch_cids).await;
-                for cid in have_branch_leaf_ids {
-                    want_set.remove(&cid);
+            if let Ok(have_root) = IndexRoot::decode(&have_bytes) {
+                // Strict here too: under-counting the have-set would
+                // leave the client missing leaves it actually needs.
+                let have_set =
+                    fluree_db_binary_index::collect_root_cas_ids_expanded(store, &have_root)
+                        .await
+                        .map_err(|e| {
+                            ApiError::internal(format!(
+                                "failed to expand have-side index root {have_id} CAS set: {e}"
+                            ))
+                        })?;
+                for cid in &have_set {
+                    want_set.remove(cid);
                 }
                 // Don't remove have_root_id itself — client already has it.
             }
@@ -283,10 +227,7 @@ pub async fn full_ledger_pack_request(
 ) -> Result<PackRequest> {
     let snapshot = handle.snapshot().await;
     let head_commit_id = snapshot.head_commit_id.clone().ok_or_else(|| {
-        ApiError::internal(format!(
-            "ledger {} has no head commit to pack",
-            handle.ledger_id()
-        ))
+        ApiError::internal(format!("ledger {} has no head commit to pack", handle.id()))
     })?;
 
     let request = match (include_indexes, snapshot.head_index_id.clone()) {
@@ -373,6 +314,34 @@ pub async fn stream_archive(
 
     match result {
         Ok(stats) => {
+            // Ship the default-context blob (if the archive carries one) as a
+            // data frame before the nameservice manifest, so the importer can
+            // restore the ledger's stored default JSON-LD context. The blob is
+            // a `LedgerConfig` CAS object, not reachable via commits or the
+            // index root, so it must be sent explicitly.
+            if let Some(cid_str) = nameservice_manifest
+                .get("default_context_id")
+                .and_then(|v| v.as_str())
+            {
+                let cid: ContentId = cid_str
+                    .parse()
+                    .map_err(|e| format!("invalid default_context_id in manifest: {e}"))?;
+                let store = fluree
+                    .branched_content_store(handle.id())
+                    .await
+                    .map_err(|e| format!("failed to build store for default context: {e}"))?;
+                let bytes = store
+                    .get(&cid)
+                    .await
+                    .map_err(|e| format!("failed to read default context blob {cid}: {e}"))?;
+                let mut buf = Vec::with_capacity(bytes.len() + 64);
+                encode_data_frame(&cid, &bytes, &mut buf);
+                frame_tx
+                    .send(Ok(buf))
+                    .await
+                    .map_err(|_| "client disconnected before default context".to_string())?;
+            }
+
             let mut manifest_buf = Vec::with_capacity(512);
             encode_manifest_frame(&nameservice_manifest, &mut manifest_buf);
             frame_tx
@@ -408,7 +377,7 @@ async fn stream_pack_inner(
     // non-HTTP callers that bypass the route-layer check.
     validate_pack_request(request)?;
 
-    let ledger_id = handle.ledger_id();
+    let ledger_id = handle.id();
     // Branch-aware store: packing a branched ledger requires reading
     // pre-fork ancestor commits that live under the source branch's
     // namespace.

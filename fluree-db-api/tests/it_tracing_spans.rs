@@ -9,11 +9,10 @@
 //! All tests use `current_thread` tokio flavor to ensure the thread-local
 //! `set_default()` subscriber captures spans from all async work.
 
-mod support;
-
+use crate::support;
+use crate::support::span_capture;
 use fluree_db_api::FlureeBuilder;
 use serde_json::json;
-use support::span_capture;
 
 /// Seed a small dataset and return the ledger state.
 async fn seed_people(fluree: &support::MemoryFluree, ledger_id: &str) -> support::MemoryLedger {
@@ -844,4 +843,245 @@ async fn all_spans_properly_closed() {
         "All spans should be closed after operation completes. Unclosed: {:?}",
         unclosed.iter().map(|s| s.name).collect::<Vec<_>>()
     );
+}
+
+// =============================================================================
+// Annotation read-path spans — inject_annotations + annotation_arena_lookup
+// =============================================================================
+
+#[tokio::test(flavor = "current_thread")]
+async fn annotation_hydration_emits_inject_annotations_span() {
+    // A subject-hydration query against an annotated edge should emit
+    // an `inject_annotations` span tagged with the chosen path
+    // (`scan` here — no arena reader on a memory ledger that hasn't
+    // been reindexed). On non-annotation ledgers the formatter's
+    // zero-cost gate skips the span entirely; that contract is
+    // covered by `ac5_zero_noise_at_info` above (any span at all
+    // would fail it on a non-annotation workload — the API layer is
+    // span-clean at INFO).
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = support::genesis_ledger(&fluree, "tracing-annotations:main");
+    let ledger = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": { "ex": "http://example.org/" },
+                "@id": "ex:alice",
+                "ex:worksFor": {
+                    "@id": "ex:acme",
+                    "@annotation": { "ex:role": "Engineer" }
+                }
+            }),
+        )
+        .await
+        .expect("annotated insert")
+        .ledger;
+
+    // Re-init capture so only the hydration query produces spans.
+    let (store, _guard) = span_capture::init_test_tracing();
+
+    let query = json!({
+        "@context": { "ex": "http://example.org/" },
+        "select": {"?person": ["*", {"ex:worksFor": ["*"]}]},
+        "where": {"@id": "?person", "ex:worksFor": {"@id": "?org"}}
+    });
+    let _ = support::query_jsonld_formatted(&fluree, &ledger, &query)
+        .await
+        .expect("hydration query");
+
+    assert!(
+        store.has_span("inject_annotations"),
+        "annotation hydration must emit inject_annotations. Captured: {:?}",
+        store.span_names()
+    );
+    let inject = store
+        .find_span("inject_annotations")
+        .expect("inject_annotations recorded");
+    assert_eq!(
+        inject.level,
+        tracing::Level::DEBUG,
+        "inject_annotations must be DEBUG (per CLAUDE.md tracing convention)"
+    );
+    let path = inject
+        .fields
+        .get("path")
+        .map(String::as_str)
+        .unwrap_or("<missing>");
+    assert_eq!(
+        path, "scan",
+        "memory ledger without a sealed arena takes the scan path; got {path:?}"
+    );
+    assert!(
+        inject.fields.contains_key("annotation_count"),
+        "inject_annotations must record annotation_count: fields = {:?}",
+        inject.fields
+    );
+
+    // Without an arena reader the inner span should not fire.
+    assert!(
+        !store.has_span("annotation_arena_lookup"),
+        "annotation_arena_lookup must not fire when no arena is sealed"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn annotation_cascade_emits_cascade_reifies_bundle_span() {
+    // Retracting a base edge that has annotations should emit a
+    // `cascade_reifies_bundle` span tagged with the cascade row
+    // count. On non-annotation ledgers the gate skips it.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = support::genesis_ledger(&fluree, "tracing-cascade:main");
+    let after_insert = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": { "ex": "http://example.org/" },
+                "@id": "ex:alice",
+                "ex:worksFor": {
+                    "@id": "ex:acme",
+                    "@annotation": {
+                        "@id": "ex:emp/A",
+                        "ex:role": "Engineer"
+                    }
+                }
+            }),
+        )
+        .await
+        .expect("annotated insert")
+        .ledger;
+
+    let (store, _guard) = span_capture::init_test_tracing();
+
+    let _ = fluree
+        .update(
+            after_insert,
+            &json!({
+                "@context": { "ex": "http://example.org/" },
+                "delete": {
+                    "@id": "ex:alice",
+                    "ex:worksFor": { "@id": "ex:acme" }
+                }
+            }),
+        )
+        .await
+        .expect("base-edge retract");
+
+    assert!(
+        store.has_span("cascade_reifies_bundle"),
+        "annotated base-edge retract must emit cascade_reifies_bundle. Captured: {:?}",
+        store.span_names()
+    );
+    let cascade = store
+        .find_span("cascade_reifies_bundle")
+        .expect("cascade_reifies_bundle recorded");
+    assert_eq!(cascade.level, tracing::Level::DEBUG);
+    assert!(
+        cascade.fields.contains_key("cascade_count"),
+        "cascade_reifies_bundle must record cascade_count: fields = {:?}",
+        cascade.fields
+    );
+}
+
+// =============================================================================
+// AC-9: Cyclic BGP operator spans — scan / index build / prune / wedge / enumerate
+// =============================================================================
+
+/// The CyclicBgpOperator fast path must surface its open() phases as DEBUG
+/// spans under `query_run` so traces can attribute time to edge scans,
+/// relation index builds, semi-join pruning, wedge builds, and enumeration.
+#[cfg(feature = "native")]
+#[tokio::test(flavor = "current_thread")]
+async fn ac9_cyclic_bgp_operator_spans() {
+    use fluree_db_api::{IndexConfig, LedgerManagerConfig, QueryInput};
+    use fluree_db_transact::{CommitOpts, TxnOpts};
+
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "ac9/cyclic-spans:main";
+
+    let (local, handle) = support::start_background_indexer_local(
+        fluree.backend().clone(),
+        fluree
+            .nameservice_mode()
+            .as_arc_indexing_nameservice()
+            .expect("test fluree has writable nameservice"),
+        fluree_db_indexer::IndexerConfig::small(),
+    );
+
+    local
+        .run_until(async move {
+            let index_cfg = IndexConfig {
+                reindex_min_bytes: 0,
+                reindex_max_bytes: 10_000_000,
+            };
+            let ledger = support::genesis_ledger_for_fluree(&fluree, ledger_id);
+            let insert = json!({
+                "@context": {"ex": "http://example.org/ns/"},
+                "@graph": [
+                    // Directed triangle (RefOnly mode).
+                    {"@id": "ex:n1", "ex:p1": {"@id": "ex:n2"}},
+                    {"@id": "ex:n2", "ex:p2": {"@id": "ex:n3"}},
+                    {"@id": "ex:n3", "ex:p3": {"@id": "ex:n1"}},
+                    // Mixed square (EncodedObject mode, wedge-eligible).
+                    {"@id": "ex:n40", "ex:p4": {"@id": "ex:n3"}},
+                    {"@id": "ex:n1", "ex:p5": {"@id": "ex:n40"}}
+                ]
+            });
+            let result = fluree
+                .insert_with_opts(
+                    ledger,
+                    &insert,
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg,
+                )
+                .await
+                .expect("insert");
+            let ledger = result.ledger;
+            support::trigger_index_and_wait_outcome(&handle, ledger_id, ledger.t()).await;
+
+            let (store, _guard) = span_capture::init_test_tracing();
+            let view = fluree.db(ledger_id).await.expect("load view");
+            assert!(
+                store.has_span("ledger_view_load"),
+                "ledger_view_load span should wrap view acquisition. Captured: {:?}",
+                store.span_names()
+            );
+
+            let triangle = r"PREFIX ex: <http://example.org/ns/>
+                SELECT ?a ?b ?c
+                WHERE { ?a ex:p1 ?b . ?b ex:p2 ?c . ?c ex:p3 ?a }";
+            let result = fluree
+                .query(&view, QueryInput::Sparql(triangle))
+                .await
+                .expect("triangle query");
+            let _ = result.to_jsonld(&view.snapshot).expect("to_jsonld");
+
+            let square = r"PREFIX ex: <http://example.org/ns/>
+                SELECT ?a ?b ?c ?d
+                WHERE { ?a ex:p1 ?b . ?b ex:p2 ?c . ?d ex:p4 ?c . ?a ex:p5 ?d }";
+            let result = fluree
+                .query(&view, QueryInput::Sparql(square))
+                .await
+                .expect("square query");
+            let _ = result.to_jsonld(&view.snapshot).expect("to_jsonld");
+
+            for name in [
+                "cyclic_scan_relation",
+                "cyclic_index_build",
+                "cyclic_prune",
+                "cyclic_wedge_build",
+                "cyclic_enumerate",
+            ] {
+                assert!(
+                    store.has_span(name),
+                    "{name} span should exist. Captured spans: {:?}",
+                    store.span_names()
+                );
+                let span = store.find_span(name).unwrap();
+                assert_eq!(span.level, tracing::Level::DEBUG, "{name} should be DEBUG");
+            }
+        })
+        .await;
 }

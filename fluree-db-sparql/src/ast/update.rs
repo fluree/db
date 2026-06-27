@@ -156,21 +156,24 @@ impl Modify {
 
 /// Ground quad data (for INSERT DATA / DELETE DATA).
 ///
-/// Contains triples that must be ground (no variables).
-/// In the current implementation, we reuse `TriplePattern` but
-/// validation will ensure no variables are present.
+/// Per SPARQL 1.1 Update §3.1.1, `QuadData` is `'{' Quads '}'`, where each
+/// `Quads` may be a plain `TriplesTemplate` (default-graph triples) or a
+/// `QuadsNotTriples` of the form `GRAPH VarOrIri '{' TriplesTemplate? '}'`.
+/// We reuse [`QuadPatternElement`] to carry both, with the constraint that the
+/// data must be *ground* (no variables, including no variable graph names) —
+/// enforced by the validator, not the grammar.
 #[derive(Clone, Debug, PartialEq)]
 pub struct QuadData {
-    /// The ground triples
-    pub triples: Vec<TriplePattern>,
+    /// The ground quads (default-graph triples and/or `GRAPH <iri> { ... }` blocks).
+    pub quads: Vec<QuadPatternElement>,
     /// Source span
     pub span: SourceSpan,
 }
 
 impl QuadData {
     /// Create new quad data.
-    pub fn new(triples: Vec<TriplePattern>, span: SourceSpan) -> Self {
-        Self { triples, span }
+    pub fn new(quads: Vec<QuadPatternElement>, span: SourceSpan) -> Self {
+        Self { quads, span }
     }
 }
 
@@ -196,7 +199,12 @@ impl QuadPattern {
 #[derive(Clone, Debug, PartialEq)]
 pub enum QuadPatternElement {
     /// A triple in the default graph.
-    Triple(TriplePattern),
+    ///
+    /// Boxed because `TriplePattern` is ~328 bytes, dominating the
+    /// enum size; the `Graph` variant is ~96 bytes. Boxing keeps the
+    /// stack-resident discriminant + payload small and stops
+    /// `clippy::large_enum_variant` from firing.
+    Triple(Box<TriplePattern>),
     /// A GRAPH block: `GRAPH <iri>|?g { ... }`
     ///
     /// Note: Fluree currently supports only IRI graph names in UPDATE templates.
@@ -265,14 +273,14 @@ mod tests {
     fn test_insert_data_creation() {
         let data = QuadData::new(vec![], test_span());
         let insert = InsertData::new(data, test_span());
-        assert!(insert.data.triples.is_empty());
+        assert!(insert.data.quads.is_empty());
     }
 
     #[test]
     fn test_delete_data_creation() {
         let data = QuadData::new(vec![], test_span());
         let delete = DeleteData::new(data, test_span());
-        assert!(delete.data.triples.is_empty());
+        assert!(delete.data.quads.is_empty());
     }
 
     #[test]

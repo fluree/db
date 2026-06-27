@@ -7,9 +7,9 @@ use fluree_db_core::{collect_dag_cids, load_commit_envelope_by_id, CommitId};
 use fluree_db_nameservice::{NameServiceError, NsRecord};
 
 impl Fluree {
-    /// Attach a binary index store and range provider to an already-loaded
+    /// Attach the binary index store and range provider to an already-loaded
     /// ledger state when its nameservice record points at a binary index root.
-    pub(crate) async fn attach_binary_index_store(&self, state: &mut LedgerState) -> Result<()> {
+    pub(crate) async fn attach_index(&self, state: &mut LedgerState) -> Result<()> {
         crate::ledger_manager::load_and_attach_binary_store(
             self.backend(),
             self.nameservice(),
@@ -18,6 +18,17 @@ impl Fluree {
             Some(Arc::clone(self.leaflet_cache())),
         )
         .await?;
+        Ok(())
+    }
+
+    /// Reattach the binary index store when the snapshot has namespaces the
+    /// store wasn't built with. Intended for use after a commit that may
+    /// have introduced new namespaces; a no-op when the store already
+    /// covers every namespace in the snapshot.
+    pub(crate) async fn refresh_index(&self, state: &mut LedgerState) -> Result<()> {
+        if crate::ns_helpers::binary_store_missing_snapshot_namespaces(state) {
+            self.attach_index(state).await?;
+        }
         Ok(())
     }
 
@@ -33,7 +44,7 @@ impl Fluree {
         C: ContentStore + Clone + 'static,
     {
         let mut state = LedgerState::load_with_store(store, record).await?;
-        self.attach_binary_index_store(&mut state).await?;
+        self.attach_index(&mut state).await?;
         Ok(state)
     }
 
@@ -44,7 +55,7 @@ impl Fluree {
     pub async fn ledger(&self, ledger_id: &str) -> Result<LedgerState> {
         let mut state =
             LedgerState::load(&self.nameservice_mode, ledger_id, self.backend()).await?;
-        self.attach_binary_index_store(&mut state).await?;
+        self.attach_index(&mut state).await?;
         // Default context is not loaded here. Opt-in callers route through
         // `Fluree::db_with_default_context` / `db_at_with_default_context`,
         // which fetch and attach the context onto the returned `GraphDb`.
@@ -110,8 +121,10 @@ impl Fluree {
         let ledger_id = normalize_ledger_id(ledger_id).unwrap_or_else(|_| ledger_id.to_string());
         info!(ledger_id = %ledger_id, "Creating ledger");
 
-        // 2. Register in nameservice via Publisher (fails if already exists)
-        match self.publisher()?.publish_ledger_init(&ledger_id).await {
+        // 2. Register in nameservice via the ledger-admin surface
+        //    (fails if already exists). Works for both ReadWrite and
+        //    Replicated nameservices; the latter goes through Raft.
+        match self.ledger_admin()?.init(&ledger_id).await {
             Ok(()) => {}
             Err(NameServiceError::LedgerAlreadyExists(a)) => {
                 return Err(ApiError::ledger_exists(a));
@@ -210,7 +223,7 @@ impl Fluree {
 
         let is_historical = at_commit.is_some();
 
-        self.nameservice()
+        self.branch_admin()?
             .create_branch(ledger_name, new_branch, source, at_commit)
             .await
             .map_err(|e| match e {
@@ -233,7 +246,7 @@ impl Fluree {
                         "failed to copy index to branch; branch will replay from genesis"
                     );
                 } else {
-                    self.publisher()?
+                    self.index_publisher()?
                         .publish_index(&new_id, source_record.index_t, index_cid)
                         .await?;
                 }
@@ -266,9 +279,8 @@ impl Fluree {
         target_id: &str,
         index_cid: &fluree_db_core::ContentId,
     ) -> Result<()> {
-        use fluree_db_binary_index::format::branch::read_branch_from_bytes;
+        use fluree_db_binary_index::collect_root_cas_ids_expanded;
         use fluree_db_binary_index::format::index_root::IndexRoot;
-        use fluree_db_core::content_kind::ContentKind;
         use fluree_db_core::storage::content_address;
         use fluree_db_core::CODEC_FLUREE_DICT_BLOB;
 
@@ -294,28 +306,20 @@ impl Fluree {
             ApiError::internal(format!("failed to decode index root {index_cid}: {e}"))
         })?;
 
-        // Collect all CIDs referenced by the index root
-        let mut all_cids = root.all_cas_ids();
-
-        // Expand named graph branch manifests → leaf CIDs
-        // (all_cas_ids includes branch CIDs but not the leaves within)
-        for ng in &root.named_graphs {
-            for (_, branch_cid) in &ng.orders {
-                let branch_addr = content_address(
-                    method,
-                    ContentKind::IndexBranch,
-                    source_id,
-                    &branch_cid.digest_hex(),
-                );
-                if let Ok(branch_bytes) = storage.read_bytes(&branch_addr).await {
-                    if let Ok(manifest) = read_branch_from_bytes(&branch_bytes) {
-                        for leaf in &manifest.leaves {
-                            all_cids.push(leaf.leaf_cid.clone());
-                        }
-                    }
-                }
-            }
-        }
+        // Collect every CAS CID reachable from the root, including leaves
+        // behind named-graph and annotation branch manifests. Strict:
+        // an undecodable branch must abort the copy rather than yield a
+        // branch namespace missing leaves the new branch will need.
+        let mut all_cids: Vec<fluree_db_core::ContentId> =
+            collect_root_cas_ids_expanded(&source_store, &root)
+                .await
+                .map_err(|e| {
+                    ApiError::internal(format!(
+                        "failed to expand index root {index_cid} CAS set for branch copy: {e}"
+                    ))
+                })?
+                .into_iter()
+                .collect();
 
         // Add the root CID itself
         all_cids.push(index_cid.clone());
@@ -330,7 +334,10 @@ impl Fluree {
         all_cids.sort();
         all_cids.dedup();
 
-        // Copy artifacts concurrently from source to target namespace
+        // Copy artifacts concurrently from source to target namespace.
+        // Reads go through the branch-aware `source_store` so artifacts
+        // inherited from an ancestor branch are resolved correctly;
+        // writes go straight to the target's per-CID address.
         use futures::stream::{self, StreamExt, TryStreamExt};
 
         const COPY_CONCURRENCY: usize = 32;
@@ -338,16 +345,18 @@ impl Fluree {
         let source_label = source_id.to_string();
         let artifact_count = all_cids.len();
 
+        let source_store = std::sync::Arc::new(source_store);
+
         stream::iter(all_cids.into_iter().map(|cid| {
             let kind = cid.content_kind().expect("filtered above");
             let hex = cid.digest_hex();
-            let src_addr = content_address(method, kind, source_id, &hex);
             let dst_addr = content_address(method, kind, target_id, &hex);
             let storage = storage.clone();
+            let source_store = source_store.clone();
             let cid_display = cid.to_string();
             let source_label = source_label.clone();
             async move {
-                let bytes = storage.read_bytes(&src_addr).await.map_err(|e| {
+                let bytes = source_store.get(&cid).await.map_err(|e| {
                     ApiError::internal(format!(
                         "failed to read index artifact {cid_display} from {source_label}: {e}"
                     ))

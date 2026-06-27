@@ -36,6 +36,10 @@ impl OverlayProvider for CompositeOverlay {
         self.epoch
     }
 
+    fn is_effectively_empty(&self) -> bool {
+        self.overlays.iter().all(|o| o.is_effectively_empty())
+    }
+
     fn for_each_overlay_flake(
         &self,
         g_id: GraphId,

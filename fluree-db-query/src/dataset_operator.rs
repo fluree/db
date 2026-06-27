@@ -326,10 +326,12 @@ async fn count_member(op: &mut BoxedOperator, ctx: &ExecutionContext<'_>) -> Res
     }
     let mut n: u64 = 0;
     while let Some(batch) = op.next_batch(ctx).await? {
+        ctx.check_cancelled()?;
         n = n
             .checked_add(batch.len() as u64)
             .ok_or_else(|| QueryError::execution("COUNT(*) overflow in dataset drain_count"))?;
     }
+    ctx.check_cancelled()?;
     Ok(n)
 }
 

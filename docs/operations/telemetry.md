@@ -177,6 +177,11 @@ Build the server with the `otel` feature flag:
 cargo build -p fluree-db-server --features otel --release
 ```
 
+> **Building via the CLI crate?** Feature flags do not propagate across
+> binaries: `cargo build -p fluree-db-cli --features otel` enables OTEL only
+> for the CLI's import pipeline, not for the server the daemon launches. Use
+> `--features "otel,fluree-db-server/otel"` to enable both.
+
 Then set environment variables to configure the OTLP exporter:
 
 ```bash
@@ -274,6 +279,7 @@ Additional spans: `binary_cursor_next_leaf`, `property_join`, `group_by`, `aggre
 
 ```
 query_execute (debug)
+├── ledger_view_load (debug, ledger_id, cold_binary_store — view acquisition; the pre-prepare phase, multi-second on cold ledgers)
 ├── query_prepare (debug)
 │   ├── reasoning_prep (debug)
 │   ├── pattern_rewrite (debug, patterns_before, patterns_after)
@@ -282,13 +288,26 @@ query_execute (debug)
 │   ├── scan (debug)
 │   ├── join (debug)
 │   │   └── join_next_batch (debug, per iteration)
+│   ├── cyclic_scan_relation (debug, per cyclic edge: predicate, mode=full|probed, rows; cross-thread when scans parallelize)
+│   ├── cyclic_index_build (debug, per cyclic edge: predicate, rows; cross-thread when scans parallelize)
+│   ├── cyclic_prune (debug: rows_before, rows_after, passes)
+│   ├── cyclic_wedge_build (debug, squares only)
+│   ├── cyclic_enumerate (debug, per output batch: strategy, rows)
 │   ├── filter (debug)
 │   ├── project (debug)
 │   ├── sort (debug)
 │   ├── sort_blocking (debug, cross-thread via spawn_blocking)
 │   └── ...
 └── format (debug)
+    └── inject_annotations (debug, edge_in_named_graph, path, annotation_count)
+        └── annotation_arena_lookup (debug, live_count)  ← path = "arena" only
 ```
+
+`inject_annotations` and `annotation_arena_lookup` fire only on
+hydration responses that surface annotation bodies; both are skipped
+on non-annotation ledgers via the formatter's zero-cost gate.
+`path` is `"arena"` when the cached `AnnotationArenaReader` resolved
+the lookup, `"scan"` when the M2a POST-scan fallback ran.
 
 #### Span Tree (Multi-query envelope)
 
@@ -321,6 +340,9 @@ transact_execute (debug)
 │   ├── where_exec (debug, pattern_count, binding_rows, retraction_count, assertion_count)
 │   │   ├── delete_gen (debug, template_count, retraction_count)  ← per streaming-WHERE batch
 │   │   └── insert_gen (debug, template_count, assertion_count)   ← per batch (mixed DELETE+INSERT only)
+│   ├── cascade_reifies_bundle (debug, retract_input_count, lpg_edge_lifecycle, cascade_count)
+│   │     ← only on annotation ledgers (gated by snapshot.has_annotations
+│   │       || novelty.attachments.has_annotations())
 │   ├── cancellation (debug)        ← mixed DELETE+INSERT path
 │   ├── dedup_retractions (debug)   ← pure-DELETE path (no INSERT templates, not Upsert)
 │   └── policy_enforce (debug)

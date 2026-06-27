@@ -110,6 +110,15 @@ pub struct ReasoningDefaults {
     /// IRIs to local `GraphSourceRef`s. Consulted when an import IRI does not
     /// match a named graph in the current ledger.
     pub ontology_import_map: Vec<OntologyImportBinding>,
+    /// `f:reasoningMaxFacts` — materialization budget: max derived facts
+    /// before the OWL2-RL closure is capped. A capped closure is incomplete
+    /// (queries may miss entailments), so this is a correctness control, not
+    /// a tuning knob. `None` means use the system default.
+    pub max_facts: Option<u64>,
+    /// `f:reasoningMaxSeconds` — materialization budget: max wall-clock
+    /// seconds before the OWL2-RL closure is capped. `None` means use the
+    /// system default.
+    pub max_seconds: Option<u64>,
     /// Override control for this setting group.
     pub override_control: OverrideControl,
 }

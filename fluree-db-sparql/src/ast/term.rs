@@ -192,6 +192,14 @@ impl Literal {
         }
     }
 
+    /// Create a big-integer literal (beyond i64).
+    pub fn big_integer(value: impl AsRef<str>, span: SourceSpan) -> Self {
+        Self {
+            value: LiteralValue::BigInteger(Arc::from(value.as_ref())),
+            span,
+        }
+    }
+
     /// Create a decimal literal.
     pub fn decimal(value: impl AsRef<str>, span: SourceSpan) -> Self {
         Self {
@@ -238,6 +246,10 @@ pub enum LiteralValue {
     },
     /// Integer literal (syntactic shorthand, implicitly xsd:integer)
     Integer(i64),
+    /// Integer literal beyond i64 (implicitly xsd:integer; unbounded)
+    ///
+    /// Stored as string to preserve exact representation.
+    BigInteger(Arc<str>),
     /// Decimal literal (syntactic shorthand, implicitly xsd:decimal)
     ///
     /// Stored as string to preserve exact representation.

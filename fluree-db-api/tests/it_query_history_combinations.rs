@@ -27,8 +27,6 @@
 
 #![cfg(feature = "native")]
 
-mod support;
-
 use fluree_db_api::{FlureeBuilder, FormatterConfig, ReindexOptions};
 use serde_json::json;
 

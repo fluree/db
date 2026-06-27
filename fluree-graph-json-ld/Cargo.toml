@@ -10,6 +10,7 @@ description = "Minimal JSON-LD processing library"
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+tracing = { workspace = true }
 fluree-graph-ir = { path = "../fluree-graph-ir" }
 fluree-vocab = { path = "../fluree-vocab" }
 

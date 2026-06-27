@@ -14,10 +14,35 @@ use fluree_vocab::jsonld_names::ID as JSONLD_ID;
 use fluree_vocab::namespaces::{JSON_LD, RDF};
 use fluree_vocab::predicates::RDF_TYPE;
 
+use hashbrown::HashMap;
+
 use super::delta::DeltaSet;
 use super::derived::DerivedSet;
 use crate::same_as::SameAsTracker;
 use crate::ReasoningDiagnostics;
+
+/// Persistent grouping state for identity rules, carried across fixpoint
+/// iterations.
+///
+/// prp-fp/prp-ifp need "have we seen another object/subject for this key"
+/// lookups over everything derived so far. Rebuilding those groupings from
+/// delta ∪ derived every iteration is quadratic in practice; instead the
+/// groupings persist here and each iteration folds in only its delta.
+///
+/// Keys and values are stored in canonical (sameAs-resolved) form. When the
+/// equivalence classes change, canonical forms may shift, so the owning rule
+/// rebuilds its grouping from scratch for that iteration (gated on
+/// `same_as_changed`).
+#[derive(Debug, Default)]
+pub struct IdentityRuleState {
+    /// prp-fp: functional property → canonical subject → representative
+    /// canonical object. A second distinct object for the same subject
+    /// triggers `sameAs(rep, other)`.
+    pub fp_rep: HashMap<Sid, HashMap<Sid, Sid>>,
+    /// prp-ifp: inverse-functional property → canonical object →
+    /// representative canonical subject.
+    pub ifp_rep: HashMap<Sid, HashMap<Sid, Sid>>,
+}
 
 /// Shared context for rule execution.
 ///
@@ -58,6 +83,8 @@ pub struct IdentityRuleContext<'a> {
     pub t: i64,
     pub same_as_changed: bool,
     pub diagnostics: &'a mut ReasoningDiagnostics,
+    /// Cross-iteration grouping state for prp-fp/prp-ifp.
+    pub state: &'a mut IdentityRuleState,
 }
 
 /// Default datatype SID for derived Ref values.

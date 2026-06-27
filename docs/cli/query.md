@@ -22,7 +22,8 @@ fluree query [LEDGER] [QUERY] [OPTIONS]
 |--------|-------------|
 | `-e, --expr <EXPR>` | Inline query expression (alternative to positional) |
 | `-f, --file <FILE>` | Read query from a file |
-| `--format <FORMAT>` | Output format: `json`, `typed-json`, `table`, `csv`, or `tsv` (default: `table`) |
+| `--format <FORMAT>` | Output format: `json`, `typed-json`, `table`, `csv`, `tsv`, or `ndjson` (default: `table`) |
+| `--envelope` | With `--format ndjson`, emit the full streaming record protocol verbatim instead of bare binding objects |
 | `--sparql` | Force SPARQL query format |
 | `--jsonld` | Force JSON-LD query format |
 | `--at <TIME>` | Query at a specific point in time |
@@ -93,6 +94,52 @@ Bob
 ```
 
 Note: `--format csv` (and `--format tsv`) are only supported for **local** ledgers. Tracked/remote ledgers support `json` and `table` output.
+
+### NDJSON (streaming)
+
+`--format ndjson` streams SELECT results **incrementally** as newline-delimited
+JSON instead of buffering the whole result set — use it for large result sets
+and unix pipelines (`| jq`, `| while read`, etc.). Rows are flushed as the query
+produces them, so the CLI never holds the full result in memory.
+
+By default each line is a bare SPARQL-JSON binding object (the same term shapes
+as the `json` format's `results.bindings` entries), one per result row:
+
+```bash
+fluree query --format ndjson 'SELECT ?name WHERE { ?s <http://example.org/name> ?name }'
+```
+```
+{"name":{"type":"literal","value":"Alice"}}
+{"name":{"type":"literal","value":"Bob"}}
+```
+
+Add `--envelope` to emit the full streaming record protocol verbatim — the same
+bytes the server's [streaming query endpoint](../api/streaming-query.md) produces
+(`head` / `row` / `heartbeat` / `end` / `error`). This is useful for debugging
+and for detecting truncation (a stream that ends without a terminal record):
+
+```bash
+fluree query --format ndjson --envelope 'SELECT ?name WHERE { ?s <http://example.org/name> ?name }'
+```
+```
+{"type":"head","vars":["name"]}
+{"type":"row","row":{"name":{"type":"literal","value":"Alice"}}}
+{"type":"row","row":{"name":{"type":"literal","value":"Bob"}}}
+{"type":"end","rows":2}
+```
+
+In bare mode the CLI consumes the terminal record internally and exits **non-zero**
+if the stream carried an `error` or ended without a terminal (truncated /
+dropped connection). A closed downstream pipe (e.g. `| head`) ends the stream
+cleanly with exit 0.
+
+Scope (mirrors the server [streaming endpoint](../api/streaming-query.md)):
+NDJSON streaming applies to **SELECT** queries only. `ASK`, `CONSTRUCT`/`DESCRIBE`,
+`selectOne`, hydration, and history-range queries are rejected — use a buffered
+`--format`. On **local** ledgers, `--at` (time travel) and per-request `--policy`
+are not supported with `--format ndjson`; use `--remote` (where they route
+through the server's dataset path) or a buffered format instead. `--bench` and
+`--explain` are not compatible with `--format ndjson`.
 
 ## Time Travel
 

@@ -1502,7 +1502,7 @@ fn test_insert_data_simple() {
         assert_parses("INSERT DATA { <http://example.org/s> <http://example.org/p> \"value\" }");
     match &ast.body {
         QueryBody::Update(UpdateOperation::InsertData(insert)) => {
-            assert_eq!(insert.data.triples.len(), 1);
+            assert_eq!(insert.data.quads.len(), 1);
         }
         _ => panic!("Expected INSERT DATA"),
     }
@@ -1515,7 +1515,7 @@ fn test_insert_data_multiple_triples() {
     );
     match &ast.body {
         QueryBody::Update(UpdateOperation::InsertData(insert)) => {
-            assert_eq!(insert.data.triples.len(), 2);
+            assert_eq!(insert.data.quads.len(), 2);
         }
         _ => panic!("Expected INSERT DATA"),
     }
@@ -1526,7 +1526,7 @@ fn test_insert_data_prefixed() {
     let ast = assert_parses("PREFIX ex: <http://example.org/> INSERT DATA { ex:s ex:p \"value\" }");
     match &ast.body {
         QueryBody::Update(UpdateOperation::InsertData(insert)) => {
-            assert_eq!(insert.data.triples.len(), 1);
+            assert_eq!(insert.data.quads.len(), 1);
         }
         _ => panic!("Expected INSERT DATA"),
     }
@@ -1538,7 +1538,70 @@ fn test_delete_data_simple() {
         assert_parses("DELETE DATA { <http://example.org/s> <http://example.org/p> \"value\" }");
     match &ast.body {
         QueryBody::Update(UpdateOperation::DeleteData(delete)) => {
-            assert_eq!(delete.data.triples.len(), 1);
+            assert_eq!(delete.data.quads.len(), 1);
+        }
+        _ => panic!("Expected DELETE DATA"),
+    }
+}
+
+#[test]
+fn test_insert_data_graph_block() {
+    // Issue #1288: INSERT DATA { GRAPH <g> { ... } } (QuadsNotTriples).
+    use crate::ast::pattern::GraphName;
+    use crate::ast::QuadPatternElement;
+    let ast = assert_parses(
+        "INSERT DATA { GRAPH <https://example.org/g/1> { <https://example.org/s/1> <https://example.org/p> \"v\" } }"
+    );
+    match &ast.body {
+        QueryBody::Update(UpdateOperation::InsertData(insert)) => {
+            assert_eq!(insert.data.quads.len(), 1);
+            match &insert.data.quads[0] {
+                QuadPatternElement::Graph { name, triples, .. } => {
+                    assert!(matches!(name, GraphName::Iri(_)));
+                    assert_eq!(triples.len(), 1);
+                }
+                _ => panic!("Expected a GRAPH block in INSERT DATA"),
+            }
+        }
+        _ => panic!("Expected INSERT DATA"),
+    }
+}
+
+#[test]
+fn test_insert_data_mixed_default_and_graph() {
+    use crate::ast::QuadPatternElement;
+    let ast = assert_parses(
+        "PREFIX ex: <http://example.org/> INSERT DATA { ex:a ex:p \"d\" . GRAPH <urn:g> { ex:b ex:p \"n\" } }"
+    );
+    match &ast.body {
+        QueryBody::Update(UpdateOperation::InsertData(insert)) => {
+            assert_eq!(insert.data.quads.len(), 2);
+            assert!(matches!(
+                insert.data.quads[0],
+                QuadPatternElement::Triple(_)
+            ));
+            assert!(matches!(
+                insert.data.quads[1],
+                QuadPatternElement::Graph { .. }
+            ));
+        }
+        _ => panic!("Expected INSERT DATA"),
+    }
+}
+
+#[test]
+fn test_delete_data_graph_block() {
+    use crate::ast::QuadPatternElement;
+    let ast = assert_parses(
+        "DELETE DATA { GRAPH <urn:g> { <http://example.org/s> <http://example.org/p> \"v\" } }",
+    );
+    match &ast.body {
+        QueryBody::Update(UpdateOperation::DeleteData(delete)) => {
+            assert_eq!(delete.data.quads.len(), 1);
+            assert!(matches!(
+                delete.data.quads[0],
+                QuadPatternElement::Graph { .. }
+            ));
         }
         _ => panic!("Expected DELETE DATA"),
     }
@@ -1889,4 +1952,388 @@ fn test_service_fluree_ledger_endpoint() {
             other => panic!("expected Service, got {other:?}"),
         }
     }
+}
+
+// =============================================================================
+// M4.2 — RDF 1.2 annotation syntax: parser tests
+// =============================================================================
+
+const RDF_PREFIX: &str = "PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> ";
+const EX_PREFIX: &str = "PREFIX ex: <http://example.org/> ";
+
+fn first_bgp(ast: &SparqlAst) -> &Vec<crate::ast::TriplePattern> {
+    if let QueryBody::Select(q) = &ast.body {
+        if let GraphPattern::Bgp { patterns, .. } = &q.where_clause.pattern {
+            return patterns;
+        }
+        if let GraphPattern::Group { patterns, .. } = &q.where_clause.pattern {
+            for p in patterns {
+                if let GraphPattern::Bgp { patterns: tps, .. } = p {
+                    return tps;
+                }
+            }
+        }
+    }
+    panic!("Expected a BGP at the top of the WHERE clause");
+}
+
+fn first_pattern_kinds(ast: &SparqlAst) -> Vec<&'static str> {
+    let collect = |p: &GraphPattern| -> &'static str {
+        match p {
+            GraphPattern::Bgp { .. } => "Bgp",
+            GraphPattern::Group { .. } => "Group",
+            GraphPattern::Optional { .. } => "Optional",
+            GraphPattern::Union { .. } => "Union",
+            GraphPattern::Minus { .. } => "Minus",
+            GraphPattern::Filter { .. } => "Filter",
+            GraphPattern::Bind { .. } => "Bind",
+            GraphPattern::Values { .. } => "Values",
+            GraphPattern::Graph { .. } => "Graph",
+            GraphPattern::Service { .. } => "Service",
+            GraphPattern::SubSelect { .. } => "SubSelect",
+            GraphPattern::Path { .. } => "Path",
+            GraphPattern::AnnotationTarget { .. } => "AnnotationTarget",
+        }
+    };
+    if let QueryBody::Select(q) = &ast.body {
+        match &q.where_clause.pattern {
+            GraphPattern::Group { patterns, .. } => patterns.iter().map(collect).collect(),
+            other => vec![collect(other)],
+        }
+    } else {
+        panic!("Expected SELECT");
+    }
+}
+
+#[test]
+fn annotation_block_anonymous_parses_and_attaches_to_triple() {
+    let ast = assert_parses(&format!(
+        "{EX_PREFIX}SELECT * WHERE {{ ex:alice ex:worksFor ex:acme {{| ex:role \"Engineer\" |}} . }}"
+    ));
+    let bgp = first_bgp(&ast);
+    assert_eq!(bgp.len(), 1);
+    let ann = bgp[0]
+        .annotation
+        .as_ref()
+        .expect("annotation tail should be attached to the triple");
+    assert!(ann.reifier.is_none(), "anonymous form has no reifier id");
+    let block = ann.block.as_ref().expect("block should be present");
+    assert_eq!(block.entries.len(), 1);
+}
+
+#[test]
+fn annotation_block_with_named_blank_reifier() {
+    let ast = assert_parses(&format!(
+        "{EX_PREFIX}SELECT * WHERE {{ ex:alice ex:worksFor ex:acme ~ _:ann {{| ex:role \"Engineer\" |}} . }}"
+    ));
+    let bgp = first_bgp(&ast);
+    let ann = bgp[0].annotation.as_ref().expect("annotation tail");
+    match ann.reifier.as_ref().expect("reifier id") {
+        crate::ast::ReifierId::BlankNode(b) => {
+            assert!(matches!(b.value, BlankNodeValue::Labeled(ref l) if l.as_ref() == "ann"));
+        }
+        other => panic!("expected blank-node reifier, got {other:?}"),
+    }
+    assert!(ann.block.is_some());
+}
+
+#[test]
+fn annotation_block_with_named_iri_reifier() {
+    let ast = assert_parses(&format!(
+        "{EX_PREFIX}SELECT * WHERE {{ ex:alice ex:worksFor ex:acme ~ ex:rel {{| ex:role \"Engineer\" |}} . }}"
+    ));
+    let bgp = first_bgp(&ast);
+    let ann = bgp[0].annotation.as_ref().expect("annotation tail");
+    matches!(ann.reifier.as_ref(), Some(crate::ast::ReifierId::Iri(_)));
+}
+
+#[test]
+fn annotation_block_with_var_reifier() {
+    let ast = assert_parses(&format!(
+        "{EX_PREFIX}SELECT * WHERE {{ ex:alice ex:worksFor ex:acme ~ ?ann {{| ex:role \"Engineer\" |}} . }}"
+    ));
+    let bgp = first_bgp(&ast);
+    let ann = bgp[0].annotation.as_ref().expect("annotation tail");
+    matches!(ann.reifier.as_ref(), Some(crate::ast::ReifierId::Var(_)));
+}
+
+#[test]
+fn bare_tilde_reifier_no_block_parses() {
+    let ast = assert_parses(&format!(
+        "{EX_PREFIX}SELECT * WHERE {{ ex:alice ex:worksFor ex:acme ~ ?ann . }}"
+    ));
+    let bgp = first_bgp(&ast);
+    let ann = bgp[0].annotation.as_ref().expect("annotation tail");
+    assert!(ann.reifier.is_some());
+    assert!(ann.block.is_none(), "bare reifier carries no block");
+}
+
+#[test]
+fn empty_annotation_block_parses() {
+    let ast = assert_parses(&format!(
+        "{EX_PREFIX}SELECT * WHERE {{ ex:alice ex:worksFor ex:acme {{| |}} . }}"
+    ));
+    let bgp = first_bgp(&ast);
+    let ann = bgp[0].annotation.as_ref().expect("annotation tail");
+    let block = ann.block.as_ref().expect("block");
+    assert_eq!(block.entries.len(), 0);
+}
+
+#[test]
+fn annotation_block_with_multiple_predicate_object_pairs() {
+    let ast = assert_parses(&format!(
+        "{EX_PREFIX}SELECT * WHERE {{ ex:alice ex:worksFor ex:acme {{| ex:role \"Engineer\" ; ex:since \"2024\" |}} . }}"
+    ));
+    let bgp = first_bgp(&ast);
+    let block = bgp[0].annotation.as_ref().unwrap().block.as_ref().unwrap();
+    assert_eq!(block.entries.len(), 2);
+}
+
+#[test]
+fn rdf_reifies_with_triple_term_lowers_to_annotation_target_pattern() {
+    let ast = assert_parses(&format!(
+        "{RDF_PREFIX}{EX_PREFIX}SELECT * WHERE {{ ?ann rdf:reifies <<( ex:alice ex:worksFor ex:acme )>> . }}"
+    ));
+    let kinds = first_pattern_kinds(&ast);
+    assert!(
+        kinds.contains(&"AnnotationTarget"),
+        "expected an AnnotationTarget pattern in {kinds:?}"
+    );
+}
+
+#[test]
+fn test_pragma_reasoning_single_mode() {
+    let ast = assert_parses("# PRAGMA reasoning: owl2rl\nSELECT * WHERE { }");
+    assert_eq!(ast.pragmas.reasoning, Some(vec!["owl2rl".to_string()]));
+}
+
+#[test]
+fn test_pragma_reasoning_case_insensitive_and_no_colon() {
+    let ast = assert_parses("#pragma Reasoning owl2rl\nSELECT * WHERE { }");
+    assert_eq!(ast.pragmas.reasoning, Some(vec!["owl2rl".to_string()]));
+}
+
+#[test]
+fn test_pragma_reasoning_multiple_modes() {
+    let ast = assert_parses("# PRAGMA reasoning: rdfs, datalog\nSELECT * WHERE { }");
+    assert_eq!(
+        ast.pragmas.reasoning,
+        Some(vec!["rdfs".to_string(), "datalog".to_string()])
+    );
+}
+
+#[test]
+fn rdf_reifies_with_full_iri_form_recognized() {
+    let ast = assert_parses(
+        "SELECT * WHERE { ?ann <http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies> \
+         <<( <http://example.org/a> <http://example.org/b> <http://example.org/c> )>> . }",
+    );
+    let kinds = first_pattern_kinds(&ast);
+    assert!(kinds.contains(&"AnnotationTarget"));
+}
+
+#[test]
+fn rdf_reifies_followed_by_sibling_triples_keeps_them_in_bgp() {
+    // The `?ann ex:role "Engineer"` triple is a sibling that should NOT
+    // be folded into AnnotationTarget at parse time; it stays as a
+    // sibling in the surrounding scope.
+    let ast = assert_parses(&format!(
+        "{RDF_PREFIX}{EX_PREFIX}SELECT * WHERE {{ ?ann rdf:reifies <<( ex:alice ex:worksFor ex:acme )>> ; ex:role \"Engineer\" . }}"
+    ));
+    let kinds = first_pattern_kinds(&ast);
+    let n_target = kinds.iter().filter(|k| **k == "AnnotationTarget").count();
+    let n_bgp = kinds.iter().filter(|k| **k == "Bgp").count();
+    assert_eq!(n_target, 1, "exactly one AnnotationTarget; got {kinds:?}");
+    assert!(n_bgp >= 1, "sibling triple stays in a BGP; got {kinds:?}");
+}
+
+// ----- Deferred / rejected shapes ------------------------------------------
+
+fn assert_parse_error(input: &str, needle: &str) {
+    let result = parse(input);
+    assert!(
+        result.has_errors(),
+        "expected parse errors for input: {input}"
+    );
+    let any_match = result
+        .diagnostics
+        .iter()
+        .any(|d| d.message.contains(needle));
+    if !any_match {
+        for d in &result.diagnostics {
+            eprintln!("diag: {} {}", d.code, d.message);
+        }
+        panic!("expected diagnostic containing {needle:?}");
+    }
+}
+
+#[test]
+fn annotation_on_literal_object_parses_cleanly() {
+    // RDF 1.2 allows annotations on literal-valued triples. The
+    // lowering path attaches a `DatatypeConstraint` to the synthesized
+    // `TriplePattern.dtc` so the scan matches literal objects by exact
+    // datatype / language tag.
+    assert_parses(&format!(
+        "{EX_PREFIX}SELECT * WHERE {{ ex:alice ex:age 30 {{| ex:source \"x\" |}} . }}"
+    ));
+    assert_parses(&format!(
+        "{EX_PREFIX}SELECT * WHERE {{ ex:alice ex:name \"Alice\" {{| ex:source \"hr\" |}} . }}"
+    ));
+    assert_parses(&format!(
+        "{EX_PREFIX}SELECT * WHERE {{ ex:alice ex:label \"chat\"@fr {{| ex:source \"lex\" |}} . }}"
+    ));
+}
+
+#[test]
+fn triple_term_outside_rdf_reifies_is_rejected() {
+    assert_parse_error(
+        &format!("{EX_PREFIX}SELECT * WHERE {{ ?ann ex:foo <<( ex:a ex:b ex:c )>> . }}"),
+        "object of rdf:reifies",
+    );
+}
+
+#[test]
+fn multiple_triple_terms_per_rdf_reifies_is_rejected() {
+    assert_parse_error(
+        &format!(
+            "{RDF_PREFIX}{EX_PREFIX}SELECT * WHERE {{ ?ann rdf:reifies <<( ex:a ex:b ex:c )>>, <<( ex:d ex:e ex:f )>> . }}"
+        ),
+        "multi-triple",
+    );
+}
+
+#[test]
+fn nested_triple_term_in_subject_is_rejected() {
+    // `<<( <<( ... )>> ex:p ex:o )>>` uses a triple term as the inner subject.
+    assert_parse_error(
+        &format!(
+            "{RDF_PREFIX}{EX_PREFIX}SELECT * WHERE {{ ?ann rdf:reifies <<( <<( ex:a ex:b ex:c )>> ex:p ex:o )>> . }}"
+        ),
+        "nested triple terms",
+    );
+}
+
+#[test]
+fn nested_annotation_in_block_is_rejected() {
+    // Annotation on an annotation-block entry is deferred.
+    assert_parse_error(
+        &format!(
+            "{EX_PREFIX}SELECT * WHERE {{ ex:alice ex:worksFor ex:acme {{| ex:role ex:Eng ~ ?ann2 |}} . }}"
+        ),
+        "annotations-on-annotations",
+    );
+}
+
+#[test]
+fn duplicate_reifier_in_tail_is_rejected() {
+    assert_parse_error(
+        &format!(
+            "{EX_PREFIX}SELECT * WHERE {{ ex:alice ex:worksFor ex:acme ~ ?a ~ ?b {{| ex:role \"x\" |}} . }}"
+        ),
+        "at most one reifier",
+    );
+}
+
+#[test]
+fn duplicate_block_in_tail_is_rejected() {
+    assert_parse_error(
+        &format!(
+            "{EX_PREFIX}SELECT * WHERE {{ ex:alice ex:worksFor ex:acme {{| ex:role \"x\" |}} {{| ex:since \"y\" |}} . }}"
+        ),
+        "at most one annotation block",
+    );
+}
+
+// ----- Existing legacy `<< s p ?o >> f:t ?t` form regression check ---------
+
+#[test]
+fn rdf_reifies_in_insert_data_is_rejected_with_clear_error() {
+    // The rdf:reifies + triple-term form is WHERE-only in v1.
+    // SPARQL UPDATE uses the `~ {| |}` form instead.
+    assert_parse_error(
+        &format!(
+            "{RDF_PREFIX}{EX_PREFIX}INSERT DATA {{ _:ann rdf:reifies <<( ex:a ex:b ex:c )>> }}"
+        ),
+        "object of rdf:reifies",
+    );
+}
+
+#[test]
+fn rdf_reifies_in_insert_template_is_rejected_with_clear_error() {
+    assert_parse_error(
+        &format!(
+            "{RDF_PREFIX}{EX_PREFIX}\
+             INSERT {{ _:ann rdf:reifies <<( ex:a ex:b ex:c )>> }} WHERE {{ ?s ?p ?o }}"
+        ),
+        "object of rdf:reifies",
+    );
+}
+
+#[test]
+fn legacy_quoted_triple_in_subject_position_still_parses() {
+    // The bare `<<` form (no parens) is the Fluree-specific f:t / f:op
+    // metadata-extraction shape from `lower/rdf_star.rs`. Adding RDF 1.2
+    // tokens must not break it. Lex side already covered; this check
+    // confirms parse acceptance of the surrounding triple.
+    let ast = assert_parses(
+        "PREFIX f: <https://ns.flur.ee/db#> \
+         PREFIX ex: <http://example.org/> \
+         SELECT * WHERE { << ex:alice ex:age ?age >> f:t ?t . }",
+    );
+    let bgp = first_bgp(&ast);
+    assert_eq!(bgp.len(), 1);
+    // The subject should be a QuotedTriple, NOT confused with a triple term.
+    assert!(matches!(&bgp[0].subject, SubjectTerm::QuotedTriple(_)));
+}
+
+#[test]
+fn test_pragma_reasoning_last_wins() {
+    let ast =
+        assert_parses("# PRAGMA reasoning: rdfs\n# PRAGMA reasoning: owl2rl\nSELECT * WHERE { }");
+    assert_eq!(ast.pragmas.reasoning, Some(vec!["owl2rl".to_string()]));
+}
+
+#[test]
+fn test_pragma_reasoning_empty_value_preserved() {
+    let ast = assert_parses("# PRAGMA reasoning:\nSELECT * WHERE { }");
+    assert_eq!(ast.pragmas.reasoning, Some(Vec::new()));
+}
+
+#[test]
+fn test_ordinary_comments_are_not_pragmas() {
+    let ast =
+        assert_parses("# just a comment about reasoning\n# PRAGMATIC note\nSELECT * WHERE { }");
+    assert_eq!(ast.pragmas.reasoning, None);
+}
+
+#[test]
+fn test_unknown_pragma_ignored() {
+    let ast = assert_parses("# PRAGMA timeout: 30\nSELECT * WHERE { }");
+    assert_eq!(ast.pragmas.reasoning, None);
+}
+
+#[test]
+fn test_pragma_after_query_body_line() {
+    // Pragmas are honored anywhere as full-line comments.
+    let ast = assert_parses("SELECT * WHERE { }\n# PRAGMA reasoning: rdfs");
+    assert_eq!(ast.pragmas.reasoning, Some(vec!["rdfs".to_string()]));
+}
+
+#[test]
+fn test_pragma_inside_string_literal_ignored() {
+    // A '#' line inside a long string literal is data, not a comment —
+    // it must never be interpreted as a pragma.
+    let ast = assert_parses("SELECT * WHERE { ?s ?p \"\"\"\n# PRAGMA reasoning: owl2rl\n\"\"\" }");
+    assert_eq!(ast.pragmas.reasoning, None);
+
+    // Same for single-line strings containing a '#'.
+    let ast = assert_parses("SELECT * WHERE { ?s ?p \"# PRAGMA reasoning: owl2rl\" }");
+    assert_eq!(ast.pragmas.reasoning, None);
+}
+
+#[test]
+fn test_pragma_in_trailing_comment_honored() {
+    // A genuine trailing comment is a comment; the lexer identifies it.
+    let ast = assert_parses("SELECT * WHERE { } # PRAGMA reasoning: rdfs");
+    assert_eq!(ast.pragmas.reasoning, Some(vec!["rdfs".to_string()]));
 }

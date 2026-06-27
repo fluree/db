@@ -24,7 +24,7 @@ pub mod util;
 // Re-export main types
 pub use delta::DeltaSet;
 pub use derived::DerivedSet;
-pub use util::{IdentityRuleContext, RuleContext};
+pub use util::{IdentityRuleContext, IdentityRuleState, RuleContext};
 
 // Re-export property rules (prp-*)
 pub use property_rules::{
@@ -32,9 +32,14 @@ pub use property_rules::{
     apply_inverse_functional_property_rule, apply_inverse_rule, apply_property_chain_rule,
     apply_range_rule, apply_sub_property_rule, apply_symmetric_rule, apply_transitive_rule,
 };
+pub(crate) use property_rules::{
+    apply_single_property_chain, fire_domain, fire_inverse, fire_range, fire_sub_property,
+    fire_symmetric, fire_transitive,
+};
 
 // Re-export class rules (cax-*)
 pub use class_rules::{apply_equivalent_class_rule, apply_subclass_rule};
+pub(crate) use class_rules::{fire_equivalent_class, fire_subclass};
 
 // Re-export restriction rules (cls-*)
 pub use restriction_rules::{
@@ -42,6 +47,12 @@ pub use restriction_rules::{
     apply_intersection_backward_rule, apply_intersection_forward_rule, apply_max_cardinality_rule,
     apply_max_qualified_cardinality_rule, apply_one_of_rule, apply_some_values_from_rule,
     apply_union_rule,
+};
+pub(crate) use restriction_rules::{
+    fire_all_values_from_prop, fire_all_values_from_prop_inverse, fire_all_values_from_type,
+    fire_has_value_backward, fire_has_value_forward, fire_has_value_forward_inverse,
+    fire_intersection_backward, fire_intersection_member, fire_some_values_from,
+    fire_some_values_from_filler, fire_some_values_from_inverse, fire_union_member,
 };
 
 // Re-export equality rules (eq-*)

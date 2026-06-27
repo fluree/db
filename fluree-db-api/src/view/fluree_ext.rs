@@ -7,14 +7,13 @@ use std::sync::Arc;
 use chrono::DateTime;
 
 use crate::view::{GraphDb, ReasoningModePrecedence};
-use crate::{
-    config_resolver, time_resolve, ApiError, Fluree, QueryConnectionOptions, Result, TimeSpec,
-};
+use crate::{config_resolver, time_resolve, ApiError, Fluree, GovernanceOptions, Result, TimeSpec};
 use fluree_db_binary_index::BinaryIndexStore;
 use fluree_db_core::ids::GraphId;
 use fluree_db_core::{ContentStore, DictNovelty, IndexType, DEFAULT_GRAPH_ID, TXN_META_GRAPH_ID};
 use fluree_db_query::ir::ReasoningModes;
 use fluree_db_query::BinaryRangeProvider;
+use tracing::Instrument;
 
 // ============================================================================
 // View Loading
@@ -177,6 +176,29 @@ impl Fluree {
         ledger_id: &str,
         include_default_context: bool,
     ) -> Result<GraphDb> {
+        // This is the multi-second phase between a request span and
+        // query_prepare on cold ledgers (commit/novelty load + binary index
+        // attach) — span it so traces can attribute that gap.
+        let span = tracing::debug_span!(
+            "ledger_view_load",
+            ledger_id = ledger_id,
+            cold_binary_store = tracing::field::Empty,
+        );
+        async move {
+            let span = tracing::Span::current();
+            self.load_graph_db_inner(ledger_id, include_default_context, &span)
+                .await
+        }
+        .instrument(span)
+        .await
+    }
+
+    async fn load_graph_db_inner(
+        &self,
+        ledger_id: &str,
+        include_default_context: bool,
+        span: &tracing::Span,
+    ) -> Result<GraphDb> {
         let handle = self.ledger_cached(ledger_id).await?;
         let mut snapshot = handle.snapshot().await;
 
@@ -190,6 +212,7 @@ impl Fluree {
                 .and_then(|r| r.index_head_id.as_ref())
                 .cloned()
             {
+                span.record("cold_binary_store", true);
                 // Branch-aware store so leaf/branch/history blobs inherited
                 // from the source branch namespace resolve on a fresh branch.
                 let cs = self
@@ -611,7 +634,7 @@ impl Fluree {
     ///
     /// ```ignore
     /// let view = fluree.db("mydb:main").await?;
-    /// let opts = QueryConnectionOptions {
+    /// let opts = GovernanceOptions {
     ///     identity: Some("did:example:user".into()),
     ///     ..Default::default()
     /// };
@@ -620,7 +643,7 @@ impl Fluree {
     pub async fn wrap_policy(
         &self,
         view: GraphDb,
-        opts: &QueryConnectionOptions,
+        opts: &GovernanceOptions,
         server_identity: Option<&str>,
     ) -> Result<GraphDb> {
         let effective_opts = if let Some(ref resolved) = view.resolved_config {
@@ -772,7 +795,7 @@ impl Fluree {
     pub async fn db_with_policy(
         &self,
         ledger_id: &str,
-        opts: &QueryConnectionOptions,
+        opts: &GovernanceOptions,
     ) -> Result<GraphDb> {
         let view = self.db(ledger_id).await?;
         self.wrap_policy(view, opts, None).await
@@ -785,7 +808,7 @@ impl Fluree {
         &self,
         ledger_id: &str,
         target_t: i64,
-        opts: &QueryConnectionOptions,
+        opts: &GovernanceOptions,
     ) -> Result<GraphDb> {
         let view = self.db_at_t(ledger_id, target_t).await?;
         self.wrap_policy(view, opts, None).await
@@ -828,7 +851,13 @@ impl Fluree {
             None => return view,
         };
 
-        match config_resolver::merge_reasoning(resolved, server_identity) {
+        // The materialization budget applies independently of mode defaults:
+        // a ledger can cap (or extend) the OWL2-RL budget without forcing
+        // reasoning on, and the cap must hold even when the query brings its
+        // own modes.
+        let budget = config_resolver::config_reasoning_budget(resolved, server_identity);
+
+        let view = match config_resolver::merge_reasoning(resolved, server_identity) {
             Some((mode_strings, precedence)) => {
                 let modes = ReasoningModes::from_mode_strings(&mode_strings);
                 // Always wrap if modes has enabled flags or explicit_none=true
@@ -840,6 +869,11 @@ impl Fluree {
                     view
                 }
             }
+            None => view,
+        };
+
+        match budget {
+            Some(budget) => view.with_config_reasoning_budget(budget),
             None => view,
         }
     }

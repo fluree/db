@@ -418,8 +418,8 @@ fn fetch_and_load(
     // Remote fetch: bridge the sync lookup to the async CAS get via the shared
     // `run_sync_on_runtime` helper. It uses `block_in_place(handle.block_on)`
     // on a multi-thread runtime (a replacement worker keeps driving the
-    // reactor while this thread blocks) and a self-contained helper runtime on
-    // current-thread. The previous `thread::spawn` + outer-`Handle::block_on`
+    // reactor while this thread blocks) and a process-wide helper runtime when
+    // needed. The previous `thread::spawn` + outer-`Handle::block_on`
     // + `.join()` re-injected the fetch onto the OUTER runtime with no
     // `block_in_place`, which can wedge a small (e.g. 2-worker) runtime under
     // query fan-out (every worker parked with no thread driving the reactor).

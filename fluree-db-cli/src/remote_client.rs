@@ -43,6 +43,9 @@ const LEDGER_PATH: &AsciiSet = &CONTROLS
 // wildcard; `/` must be encoded or it would split the URL path.
 const LEDGER_SEGMENT: &AsciiSet = &LEDGER_PATH.add(b'/');
 
+/// `Accept` header for the NDJSON streaming query endpoint.
+const NDJSON_ACCEPT: &str = "application/x-ndjson";
+
 fn encode_ledger_path(s: &str) -> Cow<'_, str> {
     utf8_percent_encode(s, LEDGER_PATH).into()
 }
@@ -105,7 +108,7 @@ pub(crate) fn policy_headers(policy: &PolicyArgs) -> Vec<(&'static str, String)>
 ///
 /// Does nothing when `policy` is unset or `body` is not a JSON object. Uses
 /// the standard `opts.identity` / `opts.policy-class` / `opts.default-allow`
-/// shape the server parses via `QueryConnectionOptions::from_json`.
+/// shape the server parses via `GovernanceOptions::from_json`.
 pub(crate) fn inject_policy_into_json_opts(body: &mut serde_json::Value, policy: &PolicyArgs) {
     if !policy.is_set() {
         return;
@@ -191,6 +194,70 @@ pub struct RemoteLedgerClient {
     /// on every request and (when the body is JSON-LD) as body-level `opts`
     /// fields. Set via [`RemoteLedgerClient::with_policy`].
     policy: PolicyArgs,
+}
+
+/// `.flpack` import capabilities advertised by the server's discovery doc
+/// (`/.well-known/fluree.json` → `import`).
+#[derive(Debug, Clone)]
+pub struct ImportCapability {
+    /// Supported upload modes, e.g. `["direct", "presigned-put", "multipart-put"]`.
+    pub modes: Vec<String>,
+    /// Max body size accepted on the direct `POST /import` path, when advertised.
+    pub direct_max_bytes: Option<u64>,
+}
+
+impl ImportCapability {
+    /// Back-compatible default for servers that don't advertise import
+    /// capabilities: direct streaming only.
+    fn direct_only() -> Self {
+        Self {
+            modes: vec!["direct".to_string()],
+            direct_max_bytes: None,
+        }
+    }
+
+    /// Whether any out-of-band upload mode is offered. The server decides
+    /// single-PUT vs multipart per-archive at mint time, so the client only
+    /// needs to know that *some* negotiated mode exists.
+    fn supports_negotiated(&self) -> bool {
+        self.modes
+            .iter()
+            .any(|m| m == "presigned-put" || m == "multipart-put")
+    }
+
+    /// Whether an archive of `size` bytes should take the negotiated upload
+    /// path: a negotiated mode must be offered, and either direct isn't offered
+    /// at all or the archive exceeds the advertised direct cap.
+    pub fn needs_negotiated_upload(&self, size: u64) -> bool {
+        if !self.supports_negotiated() {
+            return false;
+        }
+        let direct_offered = self.modes.iter().any(|m| m == "direct");
+        if !direct_offered {
+            return true;
+        }
+        match self.direct_max_bytes {
+            Some(max) => size > max,
+            None => false,
+        }
+    }
+}
+
+/// One part of a minted multipart upload: where to PUT it and the headers to
+/// send. The byte range is derived from the part number and the server's
+/// `part_size` (all parts but the last are `part_size` bytes).
+#[derive(Debug, Clone)]
+pub struct MintedPart {
+    pub part_number: u32,
+    pub url: String,
+    pub headers: std::collections::HashMap<String, String>,
+}
+
+/// A part the client finished uploading, reported back on `complete`.
+#[derive(Debug, Clone)]
+pub struct CompletedPart {
+    pub part_number: u32,
+    pub etag: String,
 }
 
 impl fmt::Debug for RemoteLedgerClient {
@@ -617,6 +684,42 @@ impl RemoteLedgerClient {
         Ok(resp)
     }
 
+    /// Like [`send_raw`](Self::send_raw) but attaches extra request headers
+    /// (e.g. `fluree-max-fuel`) before sending. On 401, refresh and retry once.
+    async fn send_raw_with_headers(
+        &self,
+        method: reqwest::Method,
+        url: &str,
+        content_type: &str,
+        accept: Option<&str>,
+        extra_headers: &[(&'static str, String)],
+        body: Option<RequestBody<'_>>,
+    ) -> Result<reqwest::Response, RemoteLedgerError> {
+        let build = |me: &Self| {
+            let mut req = me.build_request(method.clone(), url, content_type, &body);
+            if let Some(a) = accept {
+                req = req.header("Accept", a);
+            }
+            for (k, v) in extra_headers {
+                req = req.header(*k, v);
+            }
+            req
+        };
+
+        let resp = build(self).send().await.map_err(Self::map_network_error)?;
+        if resp.status() == StatusCode::UNAUTHORIZED {
+            if self.try_refresh().await {
+                let resp2 = build(self).send().await.map_err(Self::map_network_error)?;
+                if resp2.status() == StatusCode::UNAUTHORIZED {
+                    return Err(RemoteLedgerError::Unauthorized);
+                }
+                return Ok(resp2);
+            }
+            return Err(RemoteLedgerError::Unauthorized);
+        }
+        Ok(resp)
+    }
+
     fn build_request(
         &self,
         method: reqwest::Method,
@@ -758,6 +861,61 @@ impl RemoteLedgerClient {
             resp.bytes()
                 .await
                 .map_err(|e| RemoteLedgerError::InvalidResponse(e.to_string()))
+        } else {
+            Err(Self::map_error(resp).await)
+        }
+    }
+
+    /// Stream a ledger-scoped SPARQL query as NDJSON from
+    /// `POST /v1/fluree/stream/query/<ledger>`. Returns the raw streaming
+    /// response; the caller drives the body incrementally (see
+    /// [`crate::commands::query_stream`]). Policy flags ride through as headers
+    /// / body opts via [`Self::with_policy`].
+    pub async fn stream_query_sparql(
+        &self,
+        ledger: &str,
+        sparql: &str,
+        extra_headers: &[(&'static str, String)],
+    ) -> Result<reqwest::Response, RemoteLedgerError> {
+        let url = Self::with_default_context_param(self.op_url("stream/query", ledger));
+        let resp = self
+            .send_raw_with_headers(
+                reqwest::Method::POST,
+                &url,
+                "application/sparql-query",
+                Some(NDJSON_ACCEPT),
+                extra_headers,
+                Some(RequestBody::Text(sparql)),
+            )
+            .await?;
+        if resp.status().is_success() {
+            Ok(resp)
+        } else {
+            Err(Self::map_error(resp).await)
+        }
+    }
+
+    /// Stream a ledger-scoped JSON-LD query as NDJSON. See
+    /// [`Self::stream_query_sparql`].
+    pub async fn stream_query_jsonld(
+        &self,
+        ledger: &str,
+        body: &serde_json::Value,
+        extra_headers: &[(&'static str, String)],
+    ) -> Result<reqwest::Response, RemoteLedgerError> {
+        let url = Self::with_default_context_param(self.op_url("stream/query", ledger));
+        let resp = self
+            .send_raw_with_headers(
+                reqwest::Method::POST,
+                &url,
+                "application/json",
+                Some(NDJSON_ACCEPT),
+                extra_headers,
+                Some(RequestBody::Json(body)),
+            )
+            .await?;
+        if resp.status().is_success() {
+            Ok(resp)
         } else {
             Err(Self::map_error(resp).await)
         }
@@ -1192,6 +1350,340 @@ impl RemoteLedgerClient {
             Some(RequestBody::Json(&body)),
         )
         .await
+    }
+
+    /// Restore a ledger on the remote from a local `.flpack` archive file.
+    ///
+    /// Streams the file to `POST {base_url}/import/<ledger>` (admin-gated), so
+    /// the server creates a NEW ledger named `ledger` from the archive without
+    /// a local staging instance. The file body is streamed, never buffered
+    /// whole, so multi-gigabyte archives upload without exhausting memory.
+    pub async fn import_ledger(
+        &self,
+        ledger: &str,
+        file_path: &std::path::Path,
+    ) -> Result<serde_json::Value, RemoteLedgerError> {
+        let url = self.op_url("import", ledger);
+
+        let resp = self.send_flpack_file(&url, file_path).await?;
+        if resp.status().is_success() {
+            return resp
+                .json()
+                .await
+                .map_err(|e| RemoteLedgerError::InvalidResponse(e.to_string()));
+        }
+        // A streamed body is consumed on send, so the 401-refresh retry
+        // re-opens the file rather than replaying the request.
+        if resp.status() == StatusCode::UNAUTHORIZED && self.try_refresh().await {
+            let resp2 = self.send_flpack_file(&url, file_path).await?;
+            if resp2.status().is_success() {
+                return resp2
+                    .json()
+                    .await
+                    .map_err(|e| RemoteLedgerError::InvalidResponse(e.to_string()));
+            }
+            return Err(Self::map_error(resp2).await);
+        }
+        Err(Self::map_error(resp).await)
+    }
+
+    /// Open `file_path` and POST it as a streaming `.flpack` body.
+    async fn send_flpack_file(
+        &self,
+        url: &str,
+        file_path: &std::path::Path,
+    ) -> Result<reqwest::Response, RemoteLedgerError> {
+        let file = tokio::fs::File::open(file_path).await.map_err(|e| {
+            RemoteLedgerError::InvalidRequest(format!(
+                "failed to open {}: {e}",
+                file_path.display()
+            ))
+        })?;
+        let stream = tokio_util::io::ReaderStream::new(file);
+        let body = reqwest::Body::wrap_stream(stream);
+        self.add_auth(self.client.post(url))
+            .header("Content-Type", "application/x-fluree-pack")
+            .body(body)
+            .send()
+            .await
+            .map_err(Self::map_network_error)
+    }
+
+    // ========================================================================
+    // Negotiated upload import (for size-capped servers)
+    // ========================================================================
+
+    /// Read the server's `.flpack` import capabilities from discovery.
+    ///
+    /// Best-effort: any failure (old server, no discovery, parse error) yields
+    /// the back-compatible default — direct streaming only.
+    pub async fn fetch_import_capability(&self) -> ImportCapability {
+        let Ok(disco_url) =
+            reqwest::Url::parse(&self.base_url).and_then(|u| u.join("/.well-known/fluree.json"))
+        else {
+            return ImportCapability::direct_only();
+        };
+        let resp = match self.add_auth(self.client.get(disco_url)).send().await {
+            Ok(r) if r.status().is_success() => r,
+            _ => return ImportCapability::direct_only(),
+        };
+        let Ok(doc) = resp.json::<serde_json::Value>().await else {
+            return ImportCapability::direct_only();
+        };
+        let import = &doc["import"];
+        if !import.is_object() {
+            return ImportCapability::direct_only();
+        }
+        let modes = import["modes"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_else(|| vec!["direct".to_string()]);
+        let direct_max_bytes = import["direct_max_bytes"].as_u64();
+        ImportCapability {
+            modes,
+            direct_max_bytes,
+        }
+    }
+
+    /// Mint an upload slot: `POST {base_url}/import-upload`.
+    ///
+    /// Returns the raw JSON response (`import_id` + `upload` descriptor).
+    pub async fn mint_import_upload(
+        &self,
+        ledger: &str,
+        size: Option<u64>,
+    ) -> Result<serde_json::Value, RemoteLedgerError> {
+        let url = self.op_url_root("import-upload");
+        let mut body = serde_json::json!({ "ledger": ledger });
+        if let Some(size) = size {
+            body["size"] = serde_json::Value::from(size);
+        }
+        self.send_json(
+            reqwest::Method::POST,
+            &url,
+            "application/json",
+            Some(RequestBody::Json(&body)),
+        )
+        .await
+    }
+
+    /// PUT a `.flpack` file to a minted upload URL.
+    ///
+    /// `url` may be absolute (a real presigned object-store URL) or relative
+    /// (the reference backend's own blob endpoint) — relative URLs resolve
+    /// against the server origin. The minted URL is the capability, so **no
+    /// bearer auth** is attached (it would break a presigned signature); only
+    /// the server-specified `headers` are sent.
+    pub async fn put_upload_file(
+        &self,
+        url: &str,
+        headers: &std::collections::HashMap<String, String>,
+        file_path: &std::path::Path,
+    ) -> Result<(), RemoteLedgerError> {
+        let resolved = self.resolve_upload_url(url)?;
+
+        // Set Content-Length explicitly so the streamed body is sent
+        // length-delimited. Without it, `wrap_stream` produces an
+        // unknown-length body and reqwest falls back to
+        // `Transfer-Encoding: chunked`, which real S3 presigned PUTs reject
+        // (`NotImplemented: ... Transfer-Encoding`). This keeps the file
+        // streaming (no buffering) while satisfying S3's fixed-length
+        // requirement.
+        let len = tokio::fs::metadata(file_path).await.map_err(|e| {
+            RemoteLedgerError::InvalidRequest(format!(
+                "failed to stat {}: {e}",
+                file_path.display()
+            ))
+        })?;
+        let file = tokio::fs::File::open(file_path).await.map_err(|e| {
+            RemoteLedgerError::InvalidRequest(format!(
+                "failed to open {}: {e}",
+                file_path.display()
+            ))
+        })?;
+        let body = reqwest::Body::wrap_stream(tokio_util::io::ReaderStream::new(file));
+
+        let mut req = self
+            .client
+            .put(&resolved)
+            .header(reqwest::header::CONTENT_LENGTH, len.len())
+            .body(body);
+        for (k, v) in headers {
+            req = req.header(k, v);
+        }
+        let resp = req.send().await.map_err(Self::map_network_error)?;
+        if resp.status().is_success() {
+            Ok(())
+        } else {
+            Err(Self::map_error(resp).await)
+        }
+    }
+
+    /// Resolve a minted upload URL: absolute URLs (real presigned object-store
+    /// links) pass through; relative ones (the reference backend's own endpoint)
+    /// resolve against the server origin.
+    fn resolve_upload_url(&self, url: &str) -> Result<String, RemoteLedgerError> {
+        if url.starts_with("http://") || url.starts_with("https://") {
+            Ok(url.to_string())
+        } else {
+            reqwest::Url::parse(&self.base_url)
+                .and_then(|u| u.join(url))
+                .map_err(|e| {
+                    RemoteLedgerError::InvalidResponse(format!("invalid upload url '{url}': {e}"))
+                })
+                .map(|u| u.to_string())
+        }
+    }
+
+    /// Upload `file_path` to a minted multipart plan, one PUT per part, with
+    /// bounded concurrency. Each part's byte range is `[(n-1)*part_size, …)`,
+    /// the last part being the remainder. Returns the `(part_number, etag)`
+    /// list the caller reports on `complete`.
+    ///
+    /// Like [`Self::put_upload_file`], each part PUT sets `Content-Length`
+    /// (length-delimited, no chunked encoding) and carries **no bearer auth** —
+    /// the minted URL is the capability. The body is a streamed file slice, so
+    /// no part is ever buffered whole in memory.
+    pub async fn put_upload_parts(
+        &self,
+        parts: &[MintedPart],
+        part_size: u64,
+        file_path: &std::path::Path,
+    ) -> Result<Vec<CompletedPart>, RemoteLedgerError> {
+        use futures::stream::{StreamExt, TryStreamExt};
+
+        let total = tokio::fs::metadata(file_path)
+            .await
+            .map_err(|e| {
+                RemoteLedgerError::InvalidRequest(format!(
+                    "failed to stat {}: {e}",
+                    file_path.display()
+                ))
+            })?
+            .len();
+
+        // Up to 4 parts in flight — the point of multipart is throughput on a
+        // large transfer, but unbounded concurrency would open one socket and
+        // file handle per part.
+        const MAX_INFLIGHT: usize = 4;
+
+        let completed: Vec<CompletedPart> = futures::stream::iter(parts.iter().map(|part| {
+            let offset = u64::from(part.part_number - 1) * part_size;
+            let len = part_size.min(total.saturating_sub(offset));
+            async move {
+                let etag = self
+                    .put_one_part(&part.url, &part.headers, file_path, offset, len)
+                    .await?;
+                Ok::<CompletedPart, RemoteLedgerError>(CompletedPart {
+                    part_number: part.part_number,
+                    etag,
+                })
+            }
+        }))
+        .buffer_unordered(MAX_INFLIGHT)
+        .try_collect()
+        .await?;
+
+        Ok(completed)
+    }
+
+    /// PUT a single byte range `[offset, offset+len)` of `file_path` to a part
+    /// URL; returns the part's ETag from the response (quotes stripped).
+    async fn put_one_part(
+        &self,
+        url: &str,
+        headers: &std::collections::HashMap<String, String>,
+        file_path: &std::path::Path,
+        offset: u64,
+        len: u64,
+    ) -> Result<String, RemoteLedgerError> {
+        use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _};
+
+        let resolved = self.resolve_upload_url(url)?;
+
+        let mut file = tokio::fs::File::open(file_path).await.map_err(|e| {
+            RemoteLedgerError::InvalidRequest(format!(
+                "failed to open {}: {e}",
+                file_path.display()
+            ))
+        })?;
+        file.seek(std::io::SeekFrom::Start(offset))
+            .await
+            .map_err(|e| {
+                RemoteLedgerError::InvalidRequest(format!(
+                    "failed to seek {} to {offset}: {e}",
+                    file_path.display()
+                ))
+            })?;
+        // `take(len)` bounds the streamed body to exactly this part's bytes.
+        let body = reqwest::Body::wrap_stream(tokio_util::io::ReaderStream::new(file.take(len)));
+
+        let mut req = self
+            .client
+            .put(&resolved)
+            .header(reqwest::header::CONTENT_LENGTH, len)
+            .body(body);
+        for (k, v) in headers {
+            req = req.header(k, v);
+        }
+        let resp = req.send().await.map_err(Self::map_network_error)?;
+        if !resp.status().is_success() {
+            return Err(Self::map_error(resp).await);
+        }
+        // S3 returns the part ETag in the `ETag` header (quoted). Fall back to
+        // an empty string for backends that omit it — the server tolerates that.
+        let etag = resp
+            .headers()
+            .get(reqwest::header::ETAG)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.trim_matches('"').to_string())
+            .unwrap_or_default();
+        Ok(etag)
+    }
+
+    /// Notify the server that the upload is complete and the restore may begin:
+    /// `POST {base_url}/import-upload/{import_id}/complete`.
+    ///
+    /// For a multipart upload, pass the `(part_number, etag)` list from
+    /// [`Self::put_upload_parts`]; for a single-PUT upload pass an empty slice.
+    pub async fn complete_import_upload(
+        &self,
+        import_id: &str,
+        parts: &[CompletedPart],
+    ) -> Result<serde_json::Value, RemoteLedgerError> {
+        let url = format!("{}/import-upload/{}/complete", self.base_url, import_id);
+        if parts.is_empty() {
+            return self
+                .send_json(reqwest::Method::POST, &url, "application/json", None)
+                .await;
+        }
+        let body = serde_json::json!({
+            "parts": parts
+                .iter()
+                .map(|p| serde_json::json!({ "part_number": p.part_number, "etag": p.etag }))
+                .collect::<Vec<_>>(),
+        });
+        self.send_json(
+            reqwest::Method::POST,
+            &url,
+            "application/json",
+            Some(RequestBody::Json(&body)),
+        )
+        .await
+    }
+
+    /// Poll import status: `GET {base_url}/import-upload/{import_id}`.
+    pub async fn import_upload_status(
+        &self,
+        import_id: &str,
+    ) -> Result<serde_json::Value, RemoteLedgerError> {
+        let url = format!("{}/import-upload/{}", self.base_url, import_id);
+        self.send_json(reqwest::Method::GET, &url, "application/json", None)
+            .await
     }
 
     /// Drop a ledger or graph source on the remote server.
@@ -2103,6 +2595,272 @@ mod tests {
     fn test_client_strips_trailing_slash() {
         let client = RemoteLedgerClient::new("http://localhost:8090/fluree/", None);
         assert_eq!(client.base_url, "http://localhost:8090/fluree");
+    }
+
+    /// `put_upload_file` must send a fixed `Content-Length` and NOT
+    /// `Transfer-Encoding: chunked` — real S3 presigned PUTs reject chunked
+    /// encoding (`NotImplemented: ... Transfer-Encoding`). The reference dev
+    /// backend tolerates chunked, so this asserts the wire shape directly
+    /// against a raw socket that records the request headers.
+    #[tokio::test]
+    async fn put_upload_file_sends_content_length_not_chunked() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = Vec::new();
+            let mut tmp = [0u8; 1024];
+            // Read until the end of the header block.
+            let header_end = loop {
+                let n = sock.read(&mut tmp).await.unwrap();
+                if n == 0 {
+                    break buf.len();
+                }
+                buf.extend_from_slice(&tmp[..n]);
+                if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break pos + 4;
+                }
+            };
+            let header_text = String::from_utf8_lossy(&buf[..header_end]).to_lowercase();
+
+            // Drain the body so the client's write completes cleanly.
+            let content_length: usize = header_text
+                .lines()
+                .find_map(|l| l.strip_prefix("content-length:"))
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(0);
+            while buf.len() < header_end + content_length {
+                let n = sock.read(&mut tmp).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&tmp[..n]);
+            }
+
+            sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .unwrap();
+            sock.flush().await.unwrap();
+            header_text
+        });
+
+        let path = std::env::temp_dir().join(format!("flpack-put-test-{}.bin", std::process::id()));
+        let payload = b"hello flpack archive bytes";
+        std::fs::write(&path, payload).unwrap();
+
+        let client = RemoteLedgerClient::new(&format!("http://{addr}/v1/fluree"), None);
+        let result = client
+            .put_upload_file(
+                &format!("http://{addr}/upload"),
+                &std::collections::HashMap::new(),
+                &path,
+            )
+            .await;
+        let _ = std::fs::remove_file(&path);
+        result.expect("put_upload_file should succeed");
+
+        let headers = server.await.unwrap();
+        assert!(
+            headers.contains(&format!("content-length: {}", payload.len())),
+            "PUT must send a fixed Content-Length; headers were:\n{headers}"
+        );
+        assert!(
+            !headers.contains("transfer-encoding: chunked"),
+            "PUT must not use chunked encoding (S3 presigned PUT rejects it); headers were:\n{headers}"
+        );
+    }
+
+    /// `stream_query_sparql` must POST to `/v1/fluree/stream/query/<ledger>`
+    /// and return the streaming response so the NDJSON consumer can drive it
+    /// to completion (head → rows → end).
+    #[tokio::test]
+    async fn stream_query_sparql_posts_to_stream_endpoint_and_streams_rows() {
+        use crate::commands::query_stream::{drive_response, NdjsonConsumer};
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = Vec::new();
+            let mut tmp = [0u8; 1024];
+            let header_end = loop {
+                let n = sock.read(&mut tmp).await.unwrap();
+                if n == 0 {
+                    break buf.len();
+                }
+                buf.extend_from_slice(&tmp[..n]);
+                if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break pos + 4;
+                }
+            };
+            let header_text = String::from_utf8_lossy(&buf[..header_end]).to_string();
+            // Drain the request body so the client's write completes.
+            let content_length: usize = header_text
+                .to_lowercase()
+                .lines()
+                .find_map(|l| l.strip_prefix("content-length:"))
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(0);
+            while buf.len() < header_end + content_length {
+                let n = sock.read(&mut tmp).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&tmp[..n]);
+            }
+
+            let body = "{\"type\":\"head\",\"vars\":[\"name\"]}\n\
+                 {\"type\":\"row\",\"row\":{\"name\":{\"type\":\"literal\",\"value\":\"Alice\"}}}\n\
+                 {\"type\":\"end\",\"rows\":1}\n";
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            sock.write_all(resp.as_bytes()).await.unwrap();
+            sock.flush().await.unwrap();
+            header_text
+        });
+
+        let client = RemoteLedgerClient::new(&format!("http://{addr}/v1/fluree"), None);
+        let response = client
+            .stream_query_sparql("mydb:main", "SELECT ?name WHERE { ?s ?p ?name }", &[])
+            .await
+            .expect("stream request should succeed");
+
+        let mut out: Vec<u8> = Vec::new();
+        let outcome = {
+            let mut consumer = NdjsonConsumer::new(&mut out, false);
+            drive_response(response, &mut consumer).await.unwrap();
+            consumer.finish().unwrap()
+        };
+        assert_eq!(outcome.rows, 1);
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "{\"name\":{\"type\":\"literal\",\"value\":\"Alice\"}}\n"
+        );
+
+        let request_headers = server.await.unwrap();
+        let first_line = request_headers.lines().next().unwrap_or("");
+        assert!(
+            first_line.starts_with("POST /v1/fluree/stream/query/"),
+            "expected POST to the stream endpoint, got: {first_line}"
+        );
+    }
+
+    /// `put_upload_parts` must split the file into the server-specified part
+    /// size, PUT each byte range to its own URL with a fixed `Content-Length`
+    /// (never chunked), and return the per-part ETags from the responses.
+    #[tokio::test]
+    async fn put_upload_parts_splits_byte_ranges_and_captures_etags() {
+        use std::collections::HashMap;
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // 25-byte file, 10-byte parts → parts of 10, 10, 5.
+        let payload: Vec<u8> = (0u8..25).collect();
+        let part_size = 10u64;
+        let num_parts = 3u32;
+
+        // Handle exactly `num_parts` PUTs; record (part_number, body, chunked?).
+        let server = tokio::spawn(async move {
+            let mut recorded: Vec<(u32, Vec<u8>, bool)> = Vec::new();
+            for _ in 0..num_parts {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let mut buf = Vec::new();
+                let mut tmp = [0u8; 1024];
+                let header_end = loop {
+                    let n = sock.read(&mut tmp).await.unwrap();
+                    if n == 0 {
+                        break buf.len();
+                    }
+                    buf.extend_from_slice(&tmp[..n]);
+                    if let Some(p) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break p + 4;
+                    }
+                };
+                let header_text = String::from_utf8_lossy(&buf[..header_end]).to_string();
+                let lower = header_text.to_lowercase();
+                let chunked = lower.contains("transfer-encoding: chunked");
+                // `PUT /part/2 HTTP/1.1`
+                let part_number: u32 = header_text
+                    .lines()
+                    .next()
+                    .and_then(|l| l.split('/').nth(2))
+                    .and_then(|seg| seg.split_whitespace().next())
+                    .and_then(|n| n.parse().ok())
+                    .unwrap();
+                let content_length: usize = lower
+                    .lines()
+                    .find_map(|l| l.strip_prefix("content-length:"))
+                    .and_then(|v| v.trim().parse().ok())
+                    .unwrap_or(0);
+                while buf.len() < header_end + content_length {
+                    let n = sock.read(&mut tmp).await.unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&tmp[..n]);
+                }
+                let body = buf[header_end..header_end + content_length].to_vec();
+                recorded.push((part_number, body, chunked));
+
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nETag: \"etag-{part_number}\"\r\nContent-Length: 0\r\n\r\n"
+                );
+                sock.write_all(resp.as_bytes()).await.unwrap();
+                sock.flush().await.unwrap();
+            }
+            recorded
+        });
+
+        let path =
+            std::env::temp_dir().join(format!("flpack-parts-test-{}.bin", std::process::id()));
+        std::fs::write(&path, &payload).unwrap();
+
+        let parts: Vec<MintedPart> = (1..=num_parts)
+            .map(|n| MintedPart {
+                part_number: n,
+                url: format!("http://{addr}/part/{n}"),
+                headers: HashMap::new(),
+            })
+            .collect();
+
+        let client = RemoteLedgerClient::new(&format!("http://{addr}/v1/fluree"), None);
+        let mut completed = client
+            .put_upload_parts(&parts, part_size, &path)
+            .await
+            .expect("put_upload_parts should succeed");
+        let _ = std::fs::remove_file(&path);
+
+        completed.sort_by_key(|p| p.part_number);
+        assert_eq!(completed.len(), 3);
+        assert_eq!(completed[0].etag, "etag-1");
+        assert_eq!(completed[2].etag, "etag-3");
+
+        let mut recorded = server.await.unwrap();
+        recorded.sort_by_key(|(n, _, _)| *n);
+        // Reassembling the recorded part bodies in order yields the original.
+        let reassembled: Vec<u8> = recorded.iter().flat_map(|(_, b, _)| b.clone()).collect();
+        assert_eq!(reassembled, payload, "parts must cover the file exactly");
+        // Part sizes: 10, 10, 5 — and none chunked.
+        assert_eq!(recorded[0].1.len(), 10);
+        assert_eq!(recorded[1].1.len(), 10);
+        assert_eq!(recorded[2].1.len(), 5);
+        assert!(
+            recorded.iter().all(|(_, _, chunked)| !chunked),
+            "no part may use chunked encoding (S3 presigned PUT rejects it)"
+        );
     }
 
     #[test]

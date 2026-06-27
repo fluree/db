@@ -112,6 +112,14 @@ impl DeltaSet {
         self.flakes.iter()
     }
 
+    /// Iterate over the distinct predicates present in this delta.
+    ///
+    /// Used by the compiled-rule dispatch to gate trigger-indexed rules
+    /// (e.g. property chains) without scanning the flakes.
+    pub fn predicates(&self) -> impl Iterator<Item = &Sid> {
+        self.by_p.keys()
+    }
+
     /// Clear the delta set
     pub fn clear(&mut self) {
         self.flakes.clear();

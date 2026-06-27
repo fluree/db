@@ -54,7 +54,7 @@ use crate::binding::{Batch, Binding};
 use crate::context::ExecutionContext;
 use crate::error::{QueryError, Result};
 use crate::fast_path_common::{
-    allow_cursor_fast_path, collect_resolved_overlay_ops, empty_batch, is_post_desc_orderable,
+    allow_cursor_fast_path, cached_overlay_ops, empty_batch, is_post_desc_orderable,
     leaf_entries_for_predicate, normalize_pred_sid, projection_sid_okey, projection_sid_okey_oi,
     term_to_ref_s_id,
 };
@@ -506,7 +506,7 @@ fn collect_post_desc_topk(
 /// - a value change (retract old + assert new, distinct fact keys) → old base
 ///   row skipped, new value emitted.
 ///
-/// `resolve_overlay_ops` (inside [`collect_resolved_overlay_ops`]) guarantees at
+/// `resolve_overlay_ops` (inside [`cached_overlay_ops`]) guarantees at
 /// most one op per fact key, so asserts and retracts are disjoint fact sets.
 #[allow(clippy::too_many_arguments)]
 fn collect_post_desc_topk_overlay(
@@ -522,8 +522,7 @@ fn collect_post_desc_topk_overlay(
 ) -> Result<Option<Vec<TopKRow>>> {
     // Resolved novelty ops for the anchor predicate (POST order). `Ok(None)`
     // means a flake failed to translate ⇒ defer to the generic pipeline.
-    let Some(ops) = collect_resolved_overlay_ops(ctx, store, g_id, RunSortOrder::Post, anchor_sid)?
-    else {
+    let Some(ops) = cached_overlay_ops(ctx, store, g_id, RunSortOrder::Post, anchor_sid)? else {
         return Ok(None);
     };
 
@@ -539,7 +538,7 @@ fn collect_post_desc_topk_overlay(
     // (All ops share `o_type` by the proof above.)
     let mut asserts: Vec<OvRow> = Vec::new();
     let mut retracts: FxHashSet<OvRow> = FxHashSet::default();
-    for op in &ops {
+    for op in ops.iter() {
         let row = OvRow {
             o_key: op.o_key,
             s_id: op.s_id,
@@ -818,15 +817,13 @@ fn build_overlay_class_filter(
     class_s_id: u64,
 ) -> Result<Option<OverlayClassFilter>> {
     let rdf_type_sid = store.encode_iri(fluree_vocab::rdf::TYPE);
-    let Some(ops) =
-        collect_resolved_overlay_ops(ctx, store, g_id, RunSortOrder::Psot, &rdf_type_sid)?
-    else {
+    let Some(ops) = cached_overlay_ops(ctx, store, g_id, RunSortOrder::Psot, &rdf_type_sid)? else {
         return Ok(None);
     };
     let iri_ref = OType::IRI_REF.as_u16();
     let mut asserts: FxHashSet<u64> = FxHashSet::default();
     let mut retracts: FxHashSet<u64> = FxHashSet::default();
-    for op in &ops {
+    for op in ops.iter() {
         if op.o_type == iri_ref && op.o_key == class_s_id {
             if op.op {
                 asserts.insert(op.s_id);

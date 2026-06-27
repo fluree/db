@@ -447,6 +447,7 @@ fn test_max_cardinality_rule() {
     let same_as = SameAsTracker::new();
     let mut diagnostics = ReasoningDiagnostics::default();
 
+    let mut state = IdentityRuleState::default();
     let mut ctx = IdentityRuleContext {
         delta: &delta,
         derived: &derived,
@@ -457,6 +458,7 @@ fn test_max_cardinality_rule() {
         t: 1,
         same_as_changed: false,
         diagnostics: &mut diagnostics,
+        state: &mut state,
     };
 
     apply_max_cardinality_rule(&index, &mut ctx);

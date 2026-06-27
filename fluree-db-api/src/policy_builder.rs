@@ -12,7 +12,7 @@
 //! - Load policies of given classes
 //! - Parse inline policy JSON-LD
 
-use crate::dataset::QueryConnectionOptions;
+use crate::dataset::GovernanceOptions;
 use crate::error::{ApiError, Result};
 use async_trait::async_trait;
 use fluree_db_core::IndexStats;
@@ -92,7 +92,7 @@ pub fn resolve_policy_source_g_ids(
     }
 }
 
-/// Build a `PolicyContext` from `QueryConnectionOptions`.
+/// Build a `PolicyContext` from `GovernanceOptions`.
 ///
 /// Handles the three policy modes:
 /// 1. **identity**: Query for policies via the identity's `f:policyClass` property
@@ -114,7 +114,7 @@ pub async fn build_policy_context_from_opts(
     overlay: &dyn fluree_db_core::OverlayProvider,
     novelty_for_stats: Option<&Novelty>,
     to_t: i64,
-    opts: &QueryConnectionOptions,
+    opts: &GovernanceOptions,
     policy_graphs: &[fluree_db_core::GraphId],
 ) -> Result<PolicyContext> {
     build_policy_context_from_opts_inner(
@@ -151,7 +151,7 @@ pub async fn build_policy_context_from_opts_with_cross_ledger(
     overlay: &dyn fluree_db_core::OverlayProvider,
     novelty_for_stats: Option<&Novelty>,
     to_t: i64,
-    opts: &QueryConnectionOptions,
+    opts: &GovernanceOptions,
     policy_graphs: &[fluree_db_core::GraphId],
     cross_ledger_restrictions: Vec<PolicyRestriction>,
 ) -> Result<PolicyContext> {
@@ -172,7 +172,7 @@ async fn build_policy_context_from_opts_inner(
     overlay: &dyn fluree_db_core::OverlayProvider,
     novelty_for_stats: Option<&Novelty>,
     to_t: i64,
-    opts: &QueryConnectionOptions,
+    opts: &GovernanceOptions,
     policy_graphs: &[fluree_db_core::GraphId],
     cross_ledger_restrictions: Option<Vec<PolicyRestriction>>,
 ) -> Result<PolicyContext> {

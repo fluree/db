@@ -3,11 +3,9 @@
 //! Verifies envelope structure, schema extraction, byte-budget truncation,
 //! and resume query generation against real query results.
 
-mod support;
-
+use crate::support::{genesis_ledger, query_sparql, MemoryFluree, MemoryLedger};
 use fluree_db_api::{AgentJsonContext, FlureeBuilder, FormatterConfig};
 use serde_json::{json, Value as JsonValue};
-use support::{genesis_ledger, query_sparql, MemoryFluree, MemoryLedger};
 
 fn ctx() -> JsonValue {
     json!({

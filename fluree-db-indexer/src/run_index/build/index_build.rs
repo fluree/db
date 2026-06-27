@@ -26,6 +26,40 @@ use std::time::{Duration, Instant};
 
 const PROGRESS_BATCH_SIZE: u64 = 4096;
 
+#[derive(Debug, Clone, Copy)]
+struct ProcessMemorySnapshot {
+    vm_rss_mb: u64,
+    rss_anon_mb: u64,
+    rss_file_mb: u64,
+    vm_swap_mb: u64,
+}
+
+#[cfg(target_os = "linux")]
+fn process_memory_snapshot() -> Option<ProcessMemorySnapshot> {
+    fn kb_for(status: &str, key: &str) -> u64 {
+        status
+            .lines()
+            .find_map(|line| {
+                let rest = line.strip_prefix(key)?;
+                rest.split_whitespace().next()?.parse::<u64>().ok()
+            })
+            .unwrap_or(0)
+    }
+
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    Some(ProcessMemorySnapshot {
+        vm_rss_mb: kb_for(&status, "VmRSS:") / 1024,
+        rss_anon_mb: kb_for(&status, "RssAnon:") / 1024,
+        rss_file_mb: kb_for(&status, "RssFile:") / 1024,
+        vm_swap_mb: kb_for(&status, "VmSwap:") / 1024,
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn process_memory_snapshot() -> Option<ProcessMemorySnapshot> {
+    None
+}
+
 // ============================================================================
 // Configuration
 // ============================================================================
@@ -524,12 +558,25 @@ pub fn build_all_indexes(
         let run_dir = config.base_run_dir.join(order.dir_name());
         let order_start = Instant::now();
         let run_count = discover_run_files_v2(&run_dir)?.len();
-        tracing::info!(
-            order = order.dir_name(),
-            run_count,
-            run_dir = %run_dir.display(),
-            "starting order index build"
-        );
+        if let Some(mem) = process_memory_snapshot() {
+            tracing::info!(
+                order = order.dir_name(),
+                run_count,
+                run_dir = %run_dir.display(),
+                vm_rss_mb = mem.vm_rss_mb,
+                rss_anon_mb = mem.rss_anon_mb,
+                rss_file_mb = mem.rss_file_mb,
+                vm_swap_mb = mem.vm_swap_mb,
+                "starting order index build"
+            );
+        } else {
+            tracing::info!(
+                order = order.dir_name(),
+                run_count,
+                run_dir = %run_dir.display(),
+                "starting order index build"
+            );
+        }
 
         let order_config = IndexBuildConfig {
             run_dir,
@@ -547,17 +594,36 @@ pub fn build_all_indexes(
         };
 
         let result = build_index(&order_config)?;
-        tracing::info!(
-            order = order.dir_name(),
-            total_rows = result.total_rows,
-            graphs = result.graphs.len(),
-            elapsed_ms = order_start.elapsed().as_millis(),
-            "completed order index build"
-        );
+        if let Some(mem) = process_memory_snapshot() {
+            tracing::info!(
+                order = order.dir_name(),
+                total_rows = result.total_rows,
+                graphs = result.graphs.len(),
+                elapsed_ms = order_start.elapsed().as_millis(),
+                vm_rss_mb = mem.vm_rss_mb,
+                rss_anon_mb = mem.rss_anon_mb,
+                rss_file_mb = mem.rss_file_mb,
+                vm_swap_mb = mem.vm_swap_mb,
+                "completed order index build"
+            );
+        } else {
+            tracing::info!(
+                order = order.dir_name(),
+                total_rows = result.total_rows,
+                graphs = result.graphs.len(),
+                elapsed_ms = order_start.elapsed().as_millis(),
+                "completed order index build"
+            );
+        }
         Ok(result)
     };
 
     let concurrency = config.max_concurrency.max(1).min(buildable.len());
+    tracing::info!(
+        buildable_orders = ?buildable.iter().map(|o| o.dir_name()).collect::<Vec<_>>(),
+        concurrency,
+        "building secondary orders"
+    );
 
     // Serial fast path (single order, or concurrency disabled): no thread spawn.
     if concurrency == 1 {

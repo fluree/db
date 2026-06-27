@@ -1342,9 +1342,16 @@ fn convert_named_graphs_to_templates(
                 Some(DatatypeConstraint::LangTag(Arc::from(lang.as_str()))),
             )),
             RawObject::TypedLiteral { value, datatype } => {
+                // Parse the lexical with the shared coercion (exact decimals,
+                // integers, temporals, ...) — storing the raw String here
+                // would persist a string flake mislabeled with the datatype,
+                // diverging from the bulk-import path. Unknown datatypes keep
+                // the lexical as a string, matching import behavior.
                 let dt_sid = ns_registry.sid_for_iri(datatype);
+                let fv = fluree_db_core::coerce::coerce_string_value(value, datatype)
+                    .unwrap_or_else(|_| FlakeValue::String(value.clone()));
                 Ok((
-                    TemplateTerm::Value(FlakeValue::String(value.clone())),
+                    TemplateTerm::Value(fv),
                     Some(DatatypeConstraint::Explicit(dt_sid)),
                 ))
             }
@@ -1755,10 +1762,7 @@ impl crate::Fluree {
         // Upload overlaps with parse/policy/flake-generation CPU work; commit()
         // awaits the handle just before writing the commit blob, so durability
         // is preserved but serial latency is eliminated on fast paths.
-        let commit_opts = if commit_opts.raw_txn.is_none()
-            && commit_opts.raw_txn_upload.is_none()
-            && store_raw_txn
-        {
+        let commit_opts = if commit_opts.raw_txn_upload.is_none() && store_raw_txn {
             let content_store = self.content_store(ledger.ledger_id());
             commit_opts.with_raw_txn_spawned(content_store, txn_json_for_commit)
         } else {
@@ -1851,10 +1855,7 @@ impl crate::Fluree {
         let store_raw_txn = txn_opts.store_raw_txn.unwrap_or(false);
 
         // Spawn raw_txn upload in parallel with staging when opted in.
-        let commit_opts = if commit_opts.raw_txn.is_none()
-            && commit_opts.raw_txn_upload.is_none()
-            && store_raw_txn
-        {
+        let commit_opts = if commit_opts.raw_txn_upload.is_none() && store_raw_txn {
             let content_store = self.content_store(ledger.ledger_id());
             commit_opts.with_raw_txn_spawned(content_store, txn_json.clone())
         } else {
@@ -1944,10 +1945,7 @@ impl crate::Fluree {
         let store_raw_txn = txn_opts.store_raw_txn.unwrap_or(false);
 
         // Spawn raw_txn upload in parallel with staging when opted in.
-        let commit_opts = if commit_opts.raw_txn.is_none()
-            && commit_opts.raw_txn_upload.is_none()
-            && store_raw_txn
-        {
+        let commit_opts = if commit_opts.raw_txn_upload.is_none() && store_raw_txn {
             let content_store = self.content_store(ledger.ledger_id());
             commit_opts.with_raw_txn_spawned(content_store, txn_json.clone())
         } else {
@@ -2044,10 +2042,7 @@ impl crate::Fluree {
         let store_raw_txn = txn_opts.store_raw_txn.unwrap_or(false);
 
         // Spawn raw_txn upload in parallel with staging when opted in.
-        let commit_opts = if commit_opts.raw_txn.is_none()
-            && commit_opts.raw_txn_upload.is_none()
-            && store_raw_txn
-        {
+        let commit_opts = if commit_opts.raw_txn_upload.is_none() && store_raw_txn {
             let content_store = self.content_store(ledger.ledger_id());
             commit_opts.with_raw_txn_spawned(content_store, txn_json.clone())
         } else {
@@ -2184,6 +2179,7 @@ impl crate::Fluree {
             TxnOpts::default(),
             CommitOpts::default(),
             &index_config,
+            None,
         )
         .await
     }
@@ -2200,14 +2196,12 @@ impl crate::Fluree {
         txn_opts: TxnOpts,
         commit_opts: CommitOpts,
         index_config: &IndexConfig,
+        policy: Option<&crate::PolicyContext>,
     ) -> Result<TransactResult> {
         let store_raw_txn = txn_opts.store_raw_txn.unwrap_or(false);
 
         // Spawn raw Turtle upload in parallel with staging when opted in.
-        let commit_opts = if commit_opts.raw_txn.is_none()
-            && commit_opts.raw_txn_upload.is_none()
-            && store_raw_txn
-        {
+        let commit_opts = if commit_opts.raw_txn_upload.is_none() && store_raw_txn {
             let content_store = self.content_store(ledger.ledger_id());
             commit_opts.with_raw_txn_spawned(content_store, JsonValue::String(turtle.to_string()))
         } else {
@@ -2215,7 +2209,7 @@ impl crate::Fluree {
         };
 
         let stage_result = self
-            .stage_turtle_insert(ledger, turtle, Some(index_config), None)
+            .stage_turtle_insert(ledger, turtle, Some(index_config), None, policy)
             .await?;
 
         let StageResult {
@@ -2270,6 +2264,7 @@ impl crate::Fluree {
         turtle: &str,
         index_config: Option<&IndexConfig>,
         tracker: Option<&Tracker>,
+        policy: Option<&crate::PolicyContext>,
     ) -> Result<StageResult> {
         use fluree_db_transact::{generate_txn_id, stage_flakes, FlakeSink};
 
@@ -2305,6 +2300,12 @@ impl crate::Fluree {
             if tracker.is_enabled() {
                 options = options.with_tracker(tracker);
             }
+        }
+        // Enforce f:modify policy on the parsed flakes. Without this a Turtle
+        // write would skip transaction-time enforcement entirely (the JSON/IR
+        // path applies it via StageOptions; the direct flake path must too).
+        if let Some(policy) = policy {
+            options = options.with_policy(policy);
         }
         let view = stage_flakes(ledger, flakes, options).await?;
 
@@ -2570,7 +2571,7 @@ impl crate::Fluree {
         let verified = crate::credential::verify_credential(credential)?;
 
         // Build policy context with verified identity
-        let opts = crate::QueryConnectionOptions {
+        let opts = crate::GovernanceOptions {
             identity: Some(verified.did.clone()),
             ..Default::default()
         };

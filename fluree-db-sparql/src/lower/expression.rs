@@ -178,13 +178,9 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
             LiteralValue::Simple(s) => Ok(FlakeValue::String(s.to_string())),
             LiteralValue::LangTagged { value, .. } => Ok(FlakeValue::String(value.to_string())),
             LiteralValue::Integer(i) => Ok(FlakeValue::Long(*i)),
+            LiteralValue::BigInteger(s) => super::term::parse_big_integer_value(s, lit.span),
             LiteralValue::Double(d) => Ok(FlakeValue::Double(*d)),
-            LiteralValue::Decimal(d) => {
-                let val: f64 = d
-                    .parse()
-                    .map_err(|_| LowerError::invalid_decimal(d.as_ref(), lit.span))?;
-                Ok(FlakeValue::Double(val))
-            }
+            LiteralValue::Decimal(d) => super::term::parse_decimal_value(d, lit.span),
             LiteralValue::Boolean(b) => Ok(FlakeValue::Boolean(*b)),
             LiteralValue::Typed { value, datatype } => {
                 let fv = self.lower_typed_literal(value, datatype)?;
@@ -195,6 +191,8 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                     fv,
                     FlakeValue::Long(_)
                         | FlakeValue::Double(_)
+                        | FlakeValue::Decimal(_)
+                        | FlakeValue::BigInt(_)
                         | FlakeValue::Boolean(_)
                         | FlakeValue::String(_),
                 ) || fv.is_temporal()

@@ -12,6 +12,7 @@
 use crate::binary_scan::EmitMask;
 use crate::bind::BindOperator;
 use crate::bm25::Bm25SearchOperator;
+use crate::cyclic_bgp::{analyze_cyclic_bgp, CyclicBgpOperator};
 use crate::distinct::DistinctOperator;
 use crate::error::{QueryError, Result};
 use crate::eval::PreparedBoolExpression;
@@ -40,6 +41,239 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use super::pushdown::extract_bounds_from_filters;
+
+// ============================================================================
+// Edge-annotation IR expansion (M1b)
+// ============================================================================
+//
+// `Pattern::EdgeAnnotation { edge, annotation, body }` and
+// `Pattern::AnnotationTarget { annotation, edge, body }` are flattened
+// at planner time into the equivalent triple chain over the
+// `f:reifies*` system predicates. The standard scan / join machinery
+// handles the rest. This avoids a custom operator and exercises the
+// existing visibility / policy / dedup paths automatically — the
+// base edge triple's standard scan provides the visibility check for
+// the reverse direction "for free".
+
+/// Expand every `Pattern::EdgeAnnotation` / `Pattern::AnnotationTarget`
+/// in `patterns` into its triple-chain equivalent, recursing through
+/// every container pattern (`Optional`, `Union`, `Minus`, `Exists`,
+/// `NotExists`, `Graph`, `Service`, `Subquery`).
+///
+/// Each expanded triple chain is wrapped in
+/// [`Pattern::DefaultGraphSource`] so the f:reifies* lookups
+/// correlate per source under multi-source default-graph queries
+/// (`from: [g1, g2]`). The wrapper is suppressed when the expansion
+/// runs inside an explicit `Pattern::Graph` — that wrapper already
+/// scopes execution to a single graph per iteration, so the extra
+/// per-source layer would be redundant.
+///
+/// Exposed at crate scope so `/explain` can run the same expansion
+/// the executor does — otherwise edge-annotation queries would
+/// surface as empty in the explain output.
+pub fn expand_edge_annotation_patterns(patterns: &[Pattern]) -> Vec<Pattern> {
+    let mut out = Vec::with_capacity(patterns.len());
+    for p in patterns {
+        expand_one_into(p.clone(), &mut out, false);
+    }
+    out
+}
+
+/// Cheap, allocation-free check for any `Pattern::EdgeAnnotation` /
+/// `Pattern::AnnotationTarget` anywhere in the tree. Lets the WHERE
+/// planner skip the `expand_edge_annotation_patterns` clone+rebuild on
+/// the common non-RDF-1.2 path. Exhaustive over `Pattern` so a new
+/// container variant forces a decision here rather than silently hiding
+/// an annotation from expansion.
+pub(crate) fn pattern_tree_has_edge_annotation(patterns: &[Pattern]) -> bool {
+    patterns.iter().any(|p| match p {
+        Pattern::EdgeAnnotation { .. } | Pattern::AnnotationTarget { .. } => true,
+        Pattern::Optional(inner)
+        | Pattern::Minus(inner)
+        | Pattern::Exists(inner)
+        | Pattern::NotExists(inner) => pattern_tree_has_edge_annotation(inner),
+        Pattern::Union(branches) => branches.iter().any(|b| pattern_tree_has_edge_annotation(b)),
+        Pattern::Graph { patterns, .. } => pattern_tree_has_edge_annotation(patterns),
+        Pattern::Service(sp) => pattern_tree_has_edge_annotation(&sp.patterns),
+        Pattern::Subquery(sq) => pattern_tree_has_edge_annotation(&sq.patterns),
+        Pattern::DefaultGraphSource { patterns } => pattern_tree_has_edge_annotation(patterns),
+        Pattern::Triple(_)
+        | Pattern::PropertyPath(_)
+        | Pattern::ShortestPath(_)
+        | Pattern::Filter(_)
+        | Pattern::Bind { .. }
+        | Pattern::Unwind { .. }
+        | Pattern::Values { .. }
+        | Pattern::IndexSearch(_)
+        | Pattern::VectorSearch(_)
+        | Pattern::R2rml(_)
+        | Pattern::GeoSearch(_)
+        | Pattern::S2Search(_) => false,
+    })
+}
+
+fn expand_one_into(pattern: Pattern, out: &mut Vec<Pattern>, inside_graph: bool) {
+    match pattern {
+        Pattern::EdgeAnnotation {
+            edge,
+            annotation,
+            body,
+        }
+        | Pattern::AnnotationTarget {
+            annotation,
+            edge,
+            body,
+        } => {
+            // Build the triple chain (base edge + three f:reifies*
+            // triples + recursively expanded body) into a local
+            // vector. The whole chain then gets wrapped in
+            // `Pattern::DefaultGraphSource` so the per-source
+            // iteration correlates them; the wrapper is skipped when
+            // we're already inside an explicit `Pattern::Graph`,
+            // which provides graph correlation by construction.
+            let mut chain: Vec<Pattern> = Vec::new();
+
+            // 1. Base edge triple: provides visibility for both
+            //    directions. The standard scan applies snapshot rules
+            //    + policy filters here, so an `AnnotationTarget`
+            //    operator-style visibility check is redundant.
+            chain.push(Pattern::Triple(edge.clone()));
+
+            // 2. Three required `f:reifies*` lookup triples that bind
+            //    the annotation to the edge.
+            let ann_ref = annotation.clone();
+            let id_dt = fluree_db_core::edge::id_datatype_sid();
+            chain.push(Pattern::Triple(TriplePattern {
+                s: ann_ref.clone(),
+                p: reifies_subject_ref(),
+                o: edge.s.clone().into(),
+                dtc: Some(fluree_db_core::DatatypeConstraint::Explicit(id_dt.clone())),
+            }));
+            chain.push(Pattern::Triple(TriplePattern {
+                s: ann_ref.clone(),
+                p: reifies_predicate_ref(),
+                o: edge.p.clone().into(),
+                dtc: Some(fluree_db_core::DatatypeConstraint::Explicit(id_dt)),
+            }));
+            // f:reifiesObject — preserves the original object's
+            // datatype constraint via `dtc` so typed-equality matches
+            // round-trip. For language-tagged literals
+            // (`DatatypeConstraint::LangTag`) this same clone is the
+            // intended per-language disambiguator: the writer DOES
+            // store the language tag on the f:reifiesObject flake's
+            // `m.lang` (verified by `it_edge_annotations::
+            // cross_language_annotation_does_not_cross_match` —
+            // both flakes carry `dt=rdf:langString,
+            // m.lang=Some(<tag>)`), so the LangTag dtc filter in
+            // `binary_scan` should pick exactly one annotation per
+            // language. This per-language disambiguation is exercised
+            // and green via `it_edge_annotations::
+            // cross_language_annotation_does_not_cross_match` (the
+            // executor honors the `dtc` LangTag filter; the earlier
+            // `#[ignore]`d gap was fixed in commit c3117574e).
+            chain.push(Pattern::Triple(TriplePattern {
+                s: ann_ref,
+                p: reifies_object_ref(),
+                o: edge.o.clone(),
+                dtc: edge.dtc.clone(),
+            }));
+
+            // 3. Body patterns (recursively expanded so nested
+            //    annotations — though M0 rejects them — flatten too).
+            //    The body inherits this expansion's wrapper context
+            //    (already inside the chain we'll wrap below).
+            for inner in body {
+                expand_one_into(inner, &mut chain, true);
+            }
+
+            // f:reifiesGraph is NOT emitted as a separate constraint
+            // triple — the `DefaultGraphSource` wrapper handles
+            // per-source correlation by switching execution context to
+            // one source at a time, so all f:reifies* triples scope to
+            // the same graph per iteration. The cross-graph misjoin
+            // (N×M cross-product under `from: [g1, g2]`) that
+            // motivated this wrapper is resolved by the per-source
+            // iteration.
+
+            if inside_graph {
+                // Already inside a `Pattern::Graph` wrapper — the
+                // existing wrapper scopes the inner subplan to one
+                // graph per iteration, so no extra correlation
+                // layer is needed.
+                out.extend(chain);
+            } else {
+                out.push(Pattern::DefaultGraphSource { patterns: chain });
+            }
+        }
+
+        // Recurse into compound containers so nested EdgeAnnotation
+        // patterns inside Optional/Union/Minus/Exists/NotExists/
+        // Graph/Service/Subquery get expanded too. The `map_subpatterns`
+        // helper rebuilds the surrounding container around the result.
+        Pattern::Graph { .. } => {
+            // Inside an explicit Pattern::Graph, expansion must
+            // suppress the DefaultGraphSource wrapper — propagate
+            // `inside_graph = true`.
+            let expanded = pattern
+                .map_subpatterns(&mut |inner| expand_edge_annotation_patterns_inside_graph(&inner));
+            out.push(expanded);
+        }
+        Pattern::Optional(_)
+        | Pattern::Minus(_)
+        | Pattern::Exists(_)
+        | Pattern::NotExists(_)
+        | Pattern::Union(_)
+        | Pattern::Service(_)
+        | Pattern::Subquery(_)
+        | Pattern::DefaultGraphSource { .. } => {
+            // Container patterns inherit the current `inside_graph`
+            // context.
+            let was_inside = inside_graph;
+            let expanded = pattern.map_subpatterns(&mut |inner| {
+                let mut out = Vec::with_capacity(inner.len());
+                for p in inner {
+                    expand_one_into(p, &mut out, was_inside);
+                }
+                out
+            });
+            out.push(expanded);
+        }
+
+        other => out.push(other),
+    }
+}
+
+/// Recursive entry that propagates `inside_graph = true`. Used by the
+/// `Pattern::Graph` arm above so its inner subtree doesn't synthesize
+/// a redundant `DefaultGraphSource`.
+fn expand_edge_annotation_patterns_inside_graph(patterns: &[Pattern]) -> Vec<Pattern> {
+    let mut out = Vec::with_capacity(patterns.len());
+    for p in patterns {
+        expand_one_into(p.clone(), &mut out, true);
+    }
+    out
+}
+
+fn reifies_subject_ref() -> Ref {
+    Ref::Sid(fluree_db_core::Sid::new(
+        fluree_vocab::namespaces::FLUREE_DB,
+        fluree_vocab::db::REIFIES_SUBJECT,
+    ))
+}
+
+fn reifies_predicate_ref() -> Ref {
+    Ref::Sid(fluree_db_core::Sid::new(
+        fluree_vocab::namespaces::FLUREE_DB,
+        fluree_vocab::db::REIFIES_PREDICATE,
+    ))
+}
+
+fn reifies_object_ref() -> Ref {
+    Ref::Sid(fluree_db_core::Sid::new(
+        fluree_vocab::namespaces::FLUREE_DB,
+        fluree_vocab::db::REIFIES_OBJECT,
+    ))
+}
 
 #[inline]
 fn filter_not_bound_var(expr: &Expression) -> Option<VarId> {
@@ -274,6 +508,14 @@ pub fn collect_var_stats(
                         vars.insert(v);
                     }
                 }
+                Pattern::Unwind { var, list } => {
+                    bump_count(counts, *var);
+                    vars.insert(*var);
+                    for v in list.referenced_vars() {
+                        bump_count(counts, v);
+                        vars.insert(v);
+                    }
+                }
                 Pattern::Filter(expr) => {
                     for v in expr.referenced_vars() {
                         bump_count(counts, v);
@@ -308,6 +550,33 @@ pub fn collect_var_stats(
                         bump_count(counts, v);
                         vars.insert(v);
                     }
+                }
+                Pattern::ShortestPath(sp) => {
+                    for v in sp.referenced_vars() {
+                        bump_count(counts, v);
+                        vars.insert(v);
+                    }
+                    bump_count(counts, sp.path_var);
+                    vars.insert(sp.path_var);
+                }
+                // The DefaultGraphSource wrapper is structurally
+                // transparent — its inner patterns are part of the
+                // surrounding WHERE clause for join / var-counting
+                // purposes. Walking into it is required so vars that
+                // bridge the wrapper (e.g. `?ann` used both inside
+                // the wrapped f:reifies* chain AND in a sibling
+                // triple outside) are counted as join vars and not
+                // pruned from sibling scan outputs.
+                //
+                // Without this, the per-language pinning test
+                // `cross_language_annotation_does_not_cross_match`
+                // mis-joins: the sibling `?ann ex:source ?src` scan
+                // sees `?ann.count == 1` and emits only `?src`,
+                // the wrapper's inner subplan binds `?ann`
+                // independently, and the merge yields a cartesian
+                // product over `?src`.
+                Pattern::DefaultGraphSource { patterns } => {
+                    walk(patterns, counts, vars);
                 }
                 _ => {}
             }
@@ -493,6 +762,7 @@ pub(crate) struct PropertyJoinPlanDecision {
     pub optional_bonus: f32,
     pub meets_width_threshold: bool,
     pub has_upstream_seed: bool,
+    pub has_selective_anchor: bool,
     pub can_property_join: bool,
     pub tail_optional_triples: usize,
     pub tail_filters: usize,
@@ -620,13 +890,20 @@ pub(crate) fn analyze_property_join_plan(
     patterns: &[Pattern],
     block_end_index: usize,
     triples_for_exec: &[TriplePattern],
+    object_bounds: &HashMap<VarId, ObjectBounds>,
     has_upstream_seed: bool,
 ) -> (PropertyJoinPlanDecision, PropertyJoinTail) {
     let analysis = analyze_property_join(triples_for_exec);
     let (width_score, optional_bonus) =
         property_join_width_score(triples_for_exec, &patterns[block_end_index..]);
     let meets_width_threshold = width_score >= PROPERTY_JOIN_MIN_WIDTH_SCORE;
-    let can_property_join = !has_upstream_seed && analysis.eligible() && meets_width_threshold;
+    // PropertyJoinOperator eagerly builds per-subject value vectors in open().
+    // Keep it for anchored stars, where the first scan can shrink the subject set;
+    // route pure high-cardinality variable stars through the sequential chain so
+    // subject-bound probes and outer LIMIT can stream results.
+    let has_selective_anchor = analysis.has_bound_objects || !object_bounds.is_empty();
+    let can_property_join =
+        !has_upstream_seed && analysis.eligible() && meets_width_threshold && has_selective_anchor;
     let tail = if can_property_join {
         collect_property_join_tail(patterns, block_end_index, triples_for_exec)
     } else {
@@ -641,6 +918,7 @@ pub(crate) fn analyze_property_join_plan(
         optional_bonus,
         meets_width_threshold,
         has_upstream_seed,
+        has_selective_anchor,
         can_property_join,
         tail_optional_triples: tail.optional_triples.len(),
         tail_filters: tail.filters.len(),
@@ -728,6 +1006,7 @@ fn apply_eligible_binds(
     pending_binds: Vec<BindPattern>,
     mut pending_filters: Vec<FilterPattern>,
     filter_idxs_consumed: &[usize],
+    planning: &PlanningContext,
 ) -> (BoxedOperator, Vec<BindPattern>, Vec<FilterPattern>) {
     let mut remaining_binds = Vec::new();
 
@@ -739,12 +1018,10 @@ fn apply_eligible_binds(
                 partition_eligible_filters(pending_filters, bound, filter_idxs_consumed);
             pending_filters = still_pending;
 
-            child = Box::new(BindOperator::new(
-                child,
-                pending.var,
-                pending.expr,
-                bind_filters,
-            ));
+            child = Box::new(
+                BindOperator::new(child, pending.var, pending.expr, bind_filters)
+                    .with_planning(*planning),
+            );
         } else {
             remaining_binds.push(pending);
         }
@@ -771,6 +1048,7 @@ fn apply_deferred_patterns(
         pending_binds,
         pending_filters,
         filter_idxs_consumed,
+        planning,
     );
 
     let (ready, remaining_filters) =
@@ -802,6 +1080,7 @@ fn apply_all_remaining(
         pending_binds,
         pending_filters,
         filter_idxs_consumed,
+        planning,
     );
     for pending in remaining_filters {
         if !filter_idxs_consumed.contains(&pending.original_idx) {
@@ -830,12 +1109,9 @@ fn build_single_pattern(
     match pattern {
         Pattern::Bind { var, expr } => {
             let child = get_or_empty_seed(operator);
-            Some(Box::new(BindOperator::new(
-                child,
-                *var,
-                expr.clone(),
-                vec![],
-            )))
+            Some(Box::new(
+                BindOperator::new(child, *var, expr.clone(), vec![]).with_planning(*planning),
+            ))
         }
         Pattern::Values { vars, rows } => {
             let child = get_or_empty_seed(operator);
@@ -1033,12 +1309,27 @@ fn inline_chain(
     (remaining_binds, remaining_filters)
 }
 
+/// Query-level planning metadata shared across triple-building functions.
+///
+/// Groups the parameters derived from the outer WHERE-planning pass that remain
+/// constant across all triple blocks and inner calls. Constructing this once at
+/// each logical call site and borrowing it is cheaper than threading seven
+/// individual references through every helper.
+pub(crate) struct TriplePlanContext<'a> {
+    required_where_vars: Option<&'a [VarId]>,
+    var_counts: &'a HashMap<VarId, usize>,
+    protected_vars: &'a HashSet<VarId>,
+    group_by: &'a [VarId],
+    distinct_query: bool,
+    planning: &'a PlanningContext,
+    stats: Option<&'a StatsView>,
+}
+
 /// Build an operator tree for a sequential scan/join block of triples.
 ///
 /// Applies VALUES first (if any), then iterates triples building scan/join
 /// operators, inlining eligible filters and binds into each step and applying
 /// deferred BINDs/FILTERs as their dependencies become bound.
-#[allow(clippy::too_many_arguments)]
 fn build_sequential_join_block(
     operator: Option<BoxedOperator>,
     triples: &[TriplePattern],
@@ -1046,13 +1337,7 @@ fn build_sequential_join_block(
     pending_binds: Vec<BindPattern>,
     pending_filters: Vec<FilterPattern>,
     pushdown: &FilterPushdown,
-    required_where_vars: Option<&[VarId]>,
-    var_counts: &HashMap<VarId, usize>,
-    protected_vars: &HashSet<VarId>,
-    group_by: &[VarId],
-    distinct_query: bool,
-    planning: &PlanningContext,
-    stats: Option<&StatsView>,
+    ctx: &TriplePlanContext<'_>,
 ) -> Result<Option<BoxedOperator>> {
     let mut operator = operator;
 
@@ -1066,12 +1351,17 @@ fn build_sequential_join_block(
 
     // Base required vars from the post-WHERE pipeline (SELECT, ORDER BY, etc.).
     // Computed once; filter/bind vars are added per-step using only remaining items.
-    let base_vars: Option<HashSet<VarId>> =
-        required_where_vars.map(|rwv| rwv.iter().copied().collect());
+    let base_vars: Option<HashSet<VarId>> = ctx
+        .required_where_vars
+        .map(|rwv| rwv.iter().copied().collect());
 
     // Tracks the running driving-chain cardinality across steps for the hash-join
     // cost model; `before_step` snapshots it against the live `bound` set per pattern.
-    let mut hash_planner = HashJoinPlanner::new(stats);
+    // Seed it from the incoming LEFT operator's estimate (e.g. a subquery producing
+    // `WITH DISTINCT friend`) so the first probe is costed against the producer size,
+    // not 1 — otherwise a large object predicate falsely trips scan-ratio-too-high.
+    let mut hash_planner = HashJoinPlanner::new(ctx.stats)
+        .with_left_estimate(operator.as_ref().and_then(|o| o.estimated_rows()));
     for (k, tp) in triples.iter().enumerate() {
         hash_planner.before_step(tp, &bound);
         let mut vars_after: HashSet<VarId> = bound.clone();
@@ -1110,7 +1400,7 @@ fn build_sequential_join_block(
             live.into_iter().collect::<Vec<VarId>>()
         });
 
-        let pruned_vars: Option<HashSet<VarId>> = if distinct_query {
+        let pruned_vars: Option<HashSet<VarId>> = if ctx.distinct_query {
             live_vars.as_ref().map(|live| {
                 let live_set: HashSet<VarId> = live.iter().copied().collect();
                 vars_after
@@ -1123,7 +1413,7 @@ fn build_sequential_join_block(
             None
         };
 
-        let emit = emit_mask_for_triple(tp, var_counts, protected_vars);
+        let emit = emit_mask_for_triple(tp, ctx.var_counts, ctx.protected_vars);
         let op = build_scan_or_join(
             operator,
             tp,
@@ -1131,8 +1421,8 @@ fn build_sequential_join_block(
             inline_ops,
             live_vars.as_deref(),
             emit,
-            group_by,
-            planning,
+            ctx.group_by,
+            ctx.planning,
             &hash_planner,
         );
         bound.extend(op.schema().iter().copied());
@@ -1145,11 +1435,12 @@ fn build_sequential_join_block(
                 pending_binds,
                 pending_filters,
                 &pushdown.consumed_indices,
-                planning,
+                ctx.planning,
             );
             pending_binds = new_binds;
             pending_filters = new_filters;
-            operator = if distinct_query && pruned_vars.as_ref().is_some_and(|s| !s.is_empty()) {
+            operator = if ctx.distinct_query && pruned_vars.as_ref().is_some_and(|s| !s.is_empty())
+            {
                 Some(Box::new(DistinctOperator::new(child)))
             } else {
                 Some(child)
@@ -1164,7 +1455,7 @@ fn build_sequential_join_block(
             pending_binds,
             pending_filters,
             &pushdown.consumed_indices,
-            planning,
+            ctx.planning,
         ));
     }
 
@@ -1319,6 +1610,83 @@ pub fn build_where_operators_seeded(
     )
 }
 
+/// Drop provably-redundant `?s rdf:type <C>` filters from a conjunctive block.
+///
+/// When `?s` is the subject of a concrete predicate `P` elsewhere in the block
+/// and stats prove every subject of `P` is an instance of `C`
+/// (`predicate_subjects_all_in_class_by_iri` — the count of `P`-flakes from
+/// `C`-typed subjects equals `P`'s total flake count), the `rdf:type` triple
+/// matches every row and binds nothing new (constant class object; `?s` stays
+/// bound by `P`), so it is sound to remove. The stats method is itself gated to
+/// trustworthy current-state coverage; this adds the current-state plan gate and
+/// the structural "`?s` is otherwise bound by `P`" requirement.
+///
+/// Operates only on the supplied top-level conjunctive list — nested
+/// GRAPH/OPTIONAL/UNION/subquery scopes are left untouched. Returns `None` when
+/// nothing is elided so callers can keep borrowing the original slice.
+fn elide_redundant_type_filters(
+    patterns: &[Pattern],
+    stats: Option<&StatsView>,
+    planning: &PlanningContext,
+) -> Option<Vec<Pattern>> {
+    if planning.is_history() {
+        return None;
+    }
+    let stats = stats?;
+    if !stats.class_coverage_trustworthy {
+        return None;
+    }
+
+    // Concrete (IRI) predicates each variable is the SUBJECT of, excluding rdf:type.
+    let mut subject_preds: HashMap<VarId, Vec<Arc<str>>> = HashMap::new();
+    for p in patterns {
+        if let Pattern::Triple(tp) = p {
+            if let (Ref::Var(s), Ref::Iri(pred)) = (&tp.s, &tp.p) {
+                if !tp.p.is_rdf_type() {
+                    subject_preds.entry(*s).or_default().push(pred.clone());
+                }
+            }
+        }
+    }
+    if subject_preds.is_empty() {
+        return None;
+    }
+
+    let mut remove = vec![false; patterns.len()];
+    let mut any = false;
+    for (i, p) in patterns.iter().enumerate() {
+        let Pattern::Triple(tp) = p else { continue };
+        if !tp.p.is_rdf_type() {
+            continue;
+        }
+        let Ref::Var(s) = &tp.s else { continue };
+        let Term::Iri(class_iri) = &tp.o else {
+            continue;
+        };
+        let Some(preds) = subject_preds.get(s) else {
+            continue;
+        };
+        if preds
+            .iter()
+            .any(|pred| stats.predicate_subjects_all_in_class_by_iri(pred, class_iri))
+        {
+            remove[i] = true;
+            any = true;
+        }
+    }
+    if !any {
+        return None;
+    }
+    Some(
+        patterns
+            .iter()
+            .zip(remove)
+            .filter(|(_, drop)| !drop)
+            .map(|(p, _)| p.clone())
+            .collect(),
+    )
+}
+
 /// Build WHERE operators with an optional initial seed operator and explicit needed-vars + GROUP BY keys.
 ///
 /// Handles all pattern types: Triple, VALUES, BIND, FILTER, OPTIONAL, UNION,
@@ -1355,6 +1723,34 @@ pub fn build_where_operators_seeded_with_needed(
         // Empty patterns = one row with empty schema
         return Ok(seed.unwrap_or_else(|| Box::new(EmptyOperator::new())));
     }
+
+    // Edge-annotation expansion (M1b): Pattern::EdgeAnnotation /
+    // Pattern::AnnotationTarget are flattened into the equivalent base
+    // edge plus four `f:reifies*` triple lookups plus the body. The
+    // standard scan/join machinery handles the rest. The base-edge
+    // triple is always emitted, which gives the
+    // `Pattern::AnnotationTarget` reverse direction its required
+    // visibility check for free: the base edge must be currently
+    // asserted under the snapshot's normal policy/visibility rules,
+    // or no row survives the join.
+    // Skip the clone+rebuild entirely when the block has no edge-annotation
+    // patterns (the overwhelmingly common, non-RDF-1.2 case): borrow the
+    // original slice instead of allocating an expanded copy. The presence
+    // check is allocation-free and exhaustive, so behavior is identical
+    // whenever annotations are actually present.
+    let expanded_storage: std::borrow::Cow<'_, [Pattern]> =
+        if pattern_tree_has_edge_annotation(patterns) {
+            std::borrow::Cow::Owned(expand_edge_annotation_patterns(patterns))
+        } else {
+            std::borrow::Cow::Borrowed(patterns)
+        };
+    let patterns: &[Pattern] = &expanded_storage;
+
+    // Drop provably-redundant `?s rdf:type <C>` filters before planning. The
+    // membership check costs a per-row index seek over the whole block but
+    // removes no rows when stats prove the predicate's subjects are all `C`.
+    let elided_storage = elide_redundant_type_filters(patterns, stats.as_deref(), planning);
+    let patterns: &[Pattern] = elided_storage.as_deref().unwrap_or(patterns);
 
     // Apply generalized pattern reordering upfront for all pattern lists.
     //
@@ -1434,8 +1830,7 @@ pub fn build_where_operators_seeded_with_needed(
                 // Hot path: triples only (no BIND/FILTER).
                 // Skip dependency bookkeeping entirely.
                 if block.binds.is_empty() && block.filters.is_empty() {
-                    let augmented_rwv = augmented_at(end);
-                    let augmented_ref = augmented_rwv.as_deref();
+                    let mut augmented_rwv = augmented_at(end);
 
                     // Preserve property-join eligibility when a top-level VALUES precedes
                     // a pure star block. Wrapping VALUES first seeds the schema/operator and
@@ -1445,6 +1840,31 @@ pub fn build_where_operators_seeded_with_needed(
                         && block.triples.len() >= 2
                         && is_property_join(&block.triples);
 
+                    // The deferred VALUES wrapper joins on its vars AFTER the triple
+                    // operators run, so those vars must survive schema pruning even
+                    // when the SELECT list doesn't mention them.
+                    if values_after_triples {
+                        if let Some(rwv) = augmented_rwv.as_mut() {
+                            for vp in &block.values {
+                                for v in &vp.vars {
+                                    if !rwv.contains(v) {
+                                        rwv.push(*v);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    let augmented_ref = augmented_rwv.as_deref();
+
+                    let ctx = TriplePlanContext {
+                        required_where_vars: augmented_ref,
+                        var_counts: &var_counts,
+                        protected_vars: &protected_vars,
+                        group_by,
+                        distinct_query,
+                        planning,
+                        stats: stats.as_deref(),
+                    };
                     let mut built = build_triple_operators(
                         if values_after_triples {
                             operator.take()
@@ -1453,13 +1873,7 @@ pub fn build_where_operators_seeded_with_needed(
                         },
                         &block.triples,
                         &HashMap::new(),
-                        augmented_ref,
-                        &var_counts,
-                        &protected_vars,
-                        group_by,
-                        distinct_query,
-                        planning,
-                        stats.as_deref(),
+                        &ctx,
                     )?;
                     if values_after_triples {
                         built = apply_values(Some(built), block.values)
@@ -1551,8 +1965,13 @@ pub fn build_where_operators_seeded_with_needed(
                 }
 
                 let has_upstream_seed = operator.is_some();
-                let (property_join_plan, property_join_tail) =
-                    analyze_property_join_plan(patterns, end, &triples_for_exec, has_upstream_seed);
+                let (property_join_plan, property_join_tail) = analyze_property_join_plan(
+                    patterns,
+                    end,
+                    &triples_for_exec,
+                    &pushdown.object_bounds,
+                    has_upstream_seed,
+                );
                 let property_join_end = property_join_tail.end_index;
                 let augmented_rwv = augmented_at(property_join_end);
                 let augmented_ref = augmented_rwv.as_deref();
@@ -1584,6 +2003,8 @@ pub fn build_where_operators_seeded_with_needed(
                         property_join_optional_bonus = property_join_plan.optional_bonus,
                         property_join_meets_width_threshold =
                             property_join_plan.meets_width_threshold,
+                        property_join_has_selective_anchor =
+                            property_join_plan.has_selective_anchor,
                         property_join_optional_triples = property_join_plan.tail_optional_triples,
                         property_join_tail_filters = property_join_plan.tail_filters,
                         property_join_tail_binds = property_join_plan.tail_binds,
@@ -1615,6 +2036,15 @@ pub fn build_where_operators_seeded_with_needed(
                         planning,
                     )?;
                 } else {
+                    let ctx = TriplePlanContext {
+                        required_where_vars: augmented_ref,
+                        var_counts: &var_counts,
+                        protected_vars: &protected_vars,
+                        group_by,
+                        distinct_query,
+                        planning,
+                        stats: stats.as_deref(),
+                    };
                     operator = build_sequential_join_block(
                         operator,
                         &triples_for_exec,
@@ -1622,13 +2052,7 @@ pub fn build_where_operators_seeded_with_needed(
                         pending_binds,
                         pending_filters,
                         &pushdown,
-                        augmented_ref,
-                        &var_counts,
-                        &protected_vars,
-                        group_by,
-                        distinct_query,
-                        planning,
-                        stats.as_deref(),
+                        &ctx,
                     )?;
                 }
             }
@@ -1799,6 +2223,36 @@ pub fn build_where_operators_seeded_with_needed(
                 i += 1;
             }
 
+            Pattern::ShortestPath(sp) => {
+                // Anchored shortest-path search. Endpoints come from a preceding
+                // pattern; seed an empty child if this somehow lands at pos 0
+                // (constant endpoints) so the operator always has an input row.
+                let child = get_or_empty_seed(operator.take());
+                let augmented_rwv = augmented_at(i + 1);
+                let augmented_ref = augmented_rwv.as_deref();
+
+                operator = Some(Box::new(
+                    crate::shortest_path::ShortestPathOperator::with_defaults(child, sp.clone())
+                        .with_out_schema(augmented_ref),
+                ));
+                i += 1;
+            }
+
+            Pattern::Unwind { var, list } => {
+                // UNWIND a runtime list expression — fan each input row out over
+                // the list elements. Correlated: the list expr reads bound vars
+                // from the child (seed an empty row if at position 0).
+                let child = get_or_empty_seed(operator.take());
+                let augmented_rwv = augmented_at(i + 1);
+                let augmented_ref = augmented_rwv.as_deref();
+
+                operator = Some(Box::new(
+                    crate::unwind::UnwindOperator::new(child, *var, list.clone())
+                        .with_out_schema(augmented_ref),
+                ));
+                i += 1;
+            }
+
             Pattern::Subquery(sq) => {
                 // Subquery - execute nested query and merge results
                 let child = require_child(operator, "SUBQUERY pattern")?;
@@ -1890,6 +2344,24 @@ pub fn build_where_operators_seeded_with_needed(
                 i += 1;
             }
 
+            Pattern::DefaultGraphSource {
+                patterns: inner_patterns,
+            } => {
+                // Internal — synthesized by `expand_edge_annotation_patterns`
+                // to correlate the f:reifies* triple chain with a single
+                // default-graph source under multi-source default queries.
+                let child = require_child(operator, "DEFAULT-GRAPH-SOURCE pattern")?;
+                operator = Some(Box::new(
+                    crate::default_graph_source::DefaultGraphSourceOperator::new(
+                        child,
+                        inner_patterns.clone(),
+                        *planning,
+                        stats.clone(),
+                    ),
+                ));
+                i += 1;
+            }
+
             Pattern::Service(service_pattern) => {
                 // SERVICE pattern - execute patterns against another ledger
                 let child = require_child(operator, "SERVICE pattern")?;
@@ -1899,6 +2371,20 @@ pub fn build_where_operators_seeded_with_needed(
                     *planning,
                 )));
                 i += 1;
+            }
+
+            // Edge-annotation patterns are flattened by
+            // `expand_edge_annotation_patterns` at the top of
+            // `build_where_operators_seeded_with_needed`, so this
+            // dispatch arm is unreachable from any standard entry
+            // point. Keep the guard for safety in case a future
+            // caller bypasses the expansion pass.
+            Pattern::EdgeAnnotation { .. } | Pattern::AnnotationTarget { .. } => {
+                return Err(QueryError::Internal(
+                    "edge-annotation pattern reached the operator dispatch \
+                     without being flattened by expand_edge_annotation_patterns"
+                        .to_string(),
+                ));
             }
         }
     }
@@ -2090,82 +2576,39 @@ fn scan_index_hint_for_triple(
     }
 }
 
-/// Build operators for a sequence of triple patterns
-///
-/// Uses property join optimization when applicable.
-/// When `object_bounds` is provided, range constraints are pushed down to the scan operator
-/// for the first pattern, enabling index-level filtering.
-#[allow(clippy::too_many_arguments)]
-pub fn build_triple_operators(
+fn build_sequential_triple_chain(
     existing: Option<BoxedOperator>,
     triples: &[TriplePattern],
     object_bounds: &HashMap<VarId, ObjectBounds>,
-    required_where_vars: Option<&[VarId]>,
-    var_counts: &HashMap<VarId, usize>,
-    protected_vars: &HashSet<VarId>,
-    group_by: &[VarId],
-    distinct_query: bool,
-    planning: &PlanningContext,
-    stats: Option<&StatsView>,
+    ctx: &TriplePlanContext<'_>,
 ) -> Result<BoxedOperator> {
-    if triples.is_empty() {
-        return existing
-            .ok_or_else(|| QueryError::InvalidQuery("No triple patterns to process".to_string()));
-    }
-
     let mut operator = existing;
-    let triples_for_exec: Vec<TriplePattern> = triples.to_vec();
-
-    // Check for property join optimization
-    //
-    // PropertyJoinOperator scans each predicate independently and applies per-predicate
-    // object bounds during its scan phase, then intersects subjects. This is far cheaper
-    // than falling back to NestedLoopJoin which does correlated novelty traversals.
-    if operator.is_none() && triples_for_exec.len() >= 2 && is_property_join(&triples_for_exec) {
-        // Use PropertyJoinOperator for multi-property patterns.
-        //
-        // If an object var is not needed downstream (not in required_where_vars and not
-        // otherwise protected), treat that predicate as existence-only (semijoin) to avoid
-        // cartesian-product blowups.
-        let mut needed: HashSet<VarId> = HashSet::new();
-        if let Some(rwv) = required_where_vars {
-            needed.extend(rwv.iter().copied());
-        }
-        for (v, c) in var_counts {
-            if *c > 1 || protected_vars.contains(v) {
-                needed.insert(*v);
-            }
-        }
-
-        let pj = PropertyJoinOperator::new_with_needed_vars(
-            &triples_for_exec,
-            object_bounds.clone(),
-            Some(&needed),
-            planning.mode(),
-        )?;
-        return Ok(Box::new(pj));
-    }
-
-    // Build chain of scan/join operators using the shared helper
-    let rwv_set: Option<HashSet<VarId>> = required_where_vars.map(|v| v.iter().copied().collect());
+    let rwv_set: Option<HashSet<VarId>> =
+        ctx.required_where_vars.map(|v| v.iter().copied().collect());
 
     // Drives the hash-join cost model; snapshots cardinality against `seen_vars`
     // (the chain bound so far) before each pattern — see build_sequential_join_block.
-    let mut seen_vars: HashSet<VarId> = HashSet::new();
-    let mut hash_planner = HashJoinPlanner::new(stats);
-    for (k, pattern) in triples_for_exec.iter().enumerate() {
+    // Both seed from the incoming LEFT operator: `seen_vars` from its bound schema
+    // (so the first probe is correctly costed as object-bound, not a full scan)
+    // and the driving estimate from its row estimate (e.g. a `WITH DISTINCT
+    // friend` subquery's ~producer size) — otherwise the first probe is weighed
+    // against 1 and a large object predicate falsely trips scan-ratio-too-high.
+    let mut seen_vars: HashSet<VarId> = bound_vars_from_operator(&operator);
+    let mut hash_planner = HashJoinPlanner::new(ctx.stats)
+        .with_left_estimate(operator.as_ref().and_then(|o| o.estimated_rows()));
+    for (k, pattern) in triples.iter().enumerate() {
         hash_planner.before_step(pattern, &seen_vars);
         seen_vars.extend(pattern.produced_vars());
         // Compute live vars: required_where_vars ∪ vars from subsequent triples
         let live_vars = rwv_set.as_ref().map(|base| {
-            let suffix_vars: HashSet<VarId> = triples_for_exec[k + 1..]
+            let suffix_vars: HashSet<VarId> = triples[k + 1..]
                 .iter()
                 .flat_map(crate::ir::triple::TriplePattern::referenced_vars)
                 .collect();
             base.union(&suffix_vars).copied().collect::<Vec<VarId>>()
         });
 
-        let emit = emit_mask_for_triple(pattern, var_counts, protected_vars);
+        let emit = emit_mask_for_triple(pattern, ctx.var_counts, ctx.protected_vars);
         operator = Some(build_scan_or_join(
             operator,
             pattern,
@@ -2173,14 +2616,14 @@ pub fn build_triple_operators(
             Vec::new(),
             live_vars.as_deref(),
             emit,
-            group_by,
-            planning,
+            ctx.group_by,
+            ctx.planning,
             &hash_planner,
         ));
 
         // DISTINCT query optimization: if any variables seen so far are no longer live,
         // collapse duplicates early to avoid downstream join blowups.
-        if distinct_query {
+        if ctx.distinct_query {
             if let Some(live) = live_vars.as_ref() {
                 let live_set: HashSet<VarId> = live.iter().copied().collect();
                 let dead = seen_vars
@@ -2198,6 +2641,79 @@ pub fn build_triple_operators(
     }
 
     Ok(operator.unwrap())
+}
+
+/// Build operators for a sequence of triple patterns
+///
+/// Uses property join optimization when applicable.
+/// When `object_bounds` is provided, range constraints are pushed down to the scan operator
+/// for the first pattern, enabling index-level filtering.
+pub fn build_triple_operators(
+    existing: Option<BoxedOperator>,
+    triples: &[TriplePattern],
+    object_bounds: &HashMap<VarId, ObjectBounds>,
+    ctx: &TriplePlanContext<'_>,
+) -> Result<BoxedOperator> {
+    if triples.is_empty() {
+        return existing
+            .ok_or_else(|| QueryError::InvalidQuery("No triple patterns to process".to_string()));
+    }
+
+    let triples_for_exec: Vec<TriplePattern> = triples.to_vec();
+
+    // Check for anchored property join optimization
+    //
+    // PropertyJoinOperator scans each predicate independently and applies per-predicate
+    // object bounds during its scan phase, then intersects subjects. This is far cheaper
+    // than falling back to NestedLoopJoin when a bound object or object bounds shrink
+    // the subject domain. Pure variable-object stars stay on the sequential chain so
+    // LIMIT can stop before every predicate has been fully drained.
+    let property_join_analysis = analyze_property_join(&triples_for_exec);
+    let has_property_join_anchor =
+        property_join_analysis.has_bound_objects || !object_bounds.is_empty();
+    if existing.is_none()
+        && triples_for_exec.len() >= 2
+        && property_join_analysis.eligible()
+        && has_property_join_anchor
+    {
+        // Use PropertyJoinOperator for multi-property patterns.
+        //
+        // If an object var is not needed downstream (not in required_where_vars and not
+        // otherwise protected), treat that predicate as existence-only (semijoin) to avoid
+        // cartesian-product blowups.
+        let mut needed: HashSet<VarId> = HashSet::new();
+        if let Some(rwv) = ctx.required_where_vars {
+            needed.extend(rwv.iter().copied());
+        }
+        for (v, c) in ctx.var_counts {
+            if *c > 1 || ctx.protected_vars.contains(v) {
+                needed.insert(*v);
+            }
+        }
+
+        let pj = PropertyJoinOperator::new_with_needed_vars(
+            &triples_for_exec,
+            object_bounds.clone(),
+            Some(&needed),
+            ctx.planning.mode(),
+        )?;
+        return Ok(Box::new(pj));
+    }
+
+    if existing.is_none() && object_bounds.is_empty() {
+        if let Some(cyclic_plan) = analyze_cyclic_bgp(&triples_for_exec, ctx.stats) {
+            let fallback =
+                build_sequential_triple_chain(None, &triples_for_exec, object_bounds, ctx)?;
+            return Ok(Box::new(CyclicBgpOperator::new(
+                cyclic_plan,
+                ctx.required_where_vars,
+                ctx.planning.mode(),
+                fallback,
+            )));
+        }
+    }
+
+    build_sequential_triple_chain(existing, &triples_for_exec, object_bounds, ctx)
 }
 
 #[cfg(test)]
@@ -2250,18 +2766,16 @@ mod tests {
                 .collect::<Vec<_>>(),
             &needed,
         );
-        super::build_triple_operators(
-            existing,
-            triples,
-            object_bounds,
-            None,
-            &counts,
-            &protected,
-            &[],
-            false,
-            &crate::temporal_mode::PlanningContext::current(),
-            None,
-        )
+        let ctx = super::TriplePlanContext {
+            required_where_vars: None,
+            var_counts: &counts,
+            protected_vars: &protected,
+            group_by: &[],
+            distinct_query: false,
+            planning: &crate::temporal_mode::PlanningContext::current(),
+            stats: None,
+        };
+        super::build_triple_operators(existing, triples, object_bounds, &ctx)
     }
 
     fn make_pattern(s_var: VarId, p_name: &str, o_var: VarId) -> TriplePattern {
@@ -2270,6 +2784,147 @@ mod tests {
             Ref::Sid(Sid::new(100, p_name)),
             Term::Var(o_var),
         )
+    }
+
+    // --- redundant rdf:type elision ---------------------------------------
+
+    fn coverage_stats(pred: &str, class: &str, total: u64, covered: u64, trust: bool) -> StatsView {
+        let mut v = StatsView {
+            class_coverage_trustworthy: trust,
+            ..Default::default()
+        };
+        v.properties_by_iri.insert(
+            Arc::from(pred),
+            PropertyStatData {
+                count: total,
+                ndv_values: 0,
+                ndv_subjects: 0,
+            },
+        );
+        let mut by_class = HashMap::new();
+        by_class.insert(Arc::from(class), covered);
+        v.predicate_class_subject_counts_by_iri
+            .insert(Arc::from(pred), by_class);
+        v
+    }
+
+    /// `?0 P ?1 . ?0 rdf:type <C>` — `?0` is the subject of `P` and bound by it.
+    fn pred_then_type(pred: &str, class: &str) -> Vec<Pattern> {
+        vec![
+            Pattern::Triple(TriplePattern::new(
+                Ref::Var(VarId(0)),
+                Ref::Iri(Arc::from(pred)),
+                Term::Var(VarId(1)),
+            )),
+            Pattern::Triple(TriplePattern::new(
+                Ref::Var(VarId(0)),
+                Ref::Iri(Arc::from(fluree_vocab::rdf::TYPE)),
+                Term::Iri(Arc::from(class)),
+            )),
+        ]
+    }
+
+    #[test]
+    fn elides_redundant_type_when_predicate_subjects_all_in_class() {
+        let stats = coverage_stats("ex:p", "ex:C", 10, 10, true);
+        let patterns = pred_then_type("ex:p", "ex:C");
+        let out =
+            elide_redundant_type_filters(&patterns, Some(&stats), &PlanningContext::current())
+                .expect("redundant rdf:type should be elided");
+        assert_eq!(out.len(), 1, "the rdf:type triple should be dropped");
+        assert!(
+            matches!(&out[0], Pattern::Triple(tp) if !tp.p.is_rdf_type()),
+            "the surviving triple is the binding predicate, not rdf:type"
+        );
+    }
+
+    #[test]
+    fn keeps_selective_type_filter() {
+        // Predicate has 10 flakes but only 5 from class C -> not covering -> keep.
+        let stats = coverage_stats("ex:p", "ex:C", 10, 5, true);
+        let patterns = pred_then_type("ex:p", "ex:C");
+        assert!(
+            elide_redundant_type_filters(&patterns, Some(&stats), &PlanningContext::current())
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn no_elision_when_coverage_untrustworthy() {
+        let stats = coverage_stats("ex:p", "ex:C", 10, 10, false);
+        let patterns = pred_then_type("ex:p", "ex:C");
+        assert!(
+            elide_redundant_type_filters(&patterns, Some(&stats), &PlanningContext::current())
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn no_elision_in_history_mode() {
+        let stats = coverage_stats("ex:p", "ex:C", 10, 10, true);
+        let patterns = pred_then_type("ex:p", "ex:C");
+        assert!(
+            elide_redundant_type_filters(&patterns, Some(&stats), &PlanningContext::history())
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn no_elision_when_type_is_sole_binder() {
+        // `?0 rdf:type <C>` with no other predicate on ?0: the type triple is the
+        // only thing binding ?0, so dropping it would change semantics.
+        let stats = coverage_stats("ex:p", "ex:C", 10, 10, true);
+        let patterns = vec![Pattern::Triple(TriplePattern::new(
+            Ref::Var(VarId(0)),
+            Ref::Iri(Arc::from(fluree_vocab::rdf::TYPE)),
+            Term::Iri(Arc::from("ex:C")),
+        ))];
+        assert!(
+            elide_redundant_type_filters(&patterns, Some(&stats), &PlanningContext::current())
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn cyclic_square_uses_cyclic_bgp_operator() {
+        // 4-cycle square:
+        // ?x1 p1 ?x2 . ?x1 p2 ?x3 . ?x4 p3 ?x2 . ?x4 p4 ?x3
+        let triples = vec![
+            make_pattern(VarId(0), "p1", VarId(1)),
+            make_pattern(VarId(0), "p2", VarId(2)),
+            make_pattern(VarId(3), "p3", VarId(1)),
+            make_pattern(VarId(3), "p4", VarId(2)),
+        ];
+
+        let op = build_triple_operators(None, &triples, &HashMap::new()).unwrap();
+        let plan = op.describe();
+        assert_eq!(plan.op, "CyclicBgpOperator");
+        assert_eq!(
+            plan.details.get("strategy").and_then(|v| v.as_str()),
+            Some("cyclic_bgp_join")
+        );
+        assert_eq!(
+            plan.details.get("shape").and_then(|v| v.as_str()),
+            Some("square")
+        );
+        assert!(
+            plan.children
+                .iter()
+                .any(|child| child.rel == crate::plan_node::PlanEdgeRel::Fallback),
+            "cyclic operator should expose the sequential fallback in EXPLAIN"
+        );
+    }
+
+    #[test]
+    fn acyclic_chain_stays_on_sequential_join() {
+        let triples = vec![
+            make_pattern(VarId(0), "p1", VarId(1)),
+            make_pattern(VarId(1), "p2", VarId(2)),
+            make_pattern(VarId(2), "p3", VarId(3)),
+        ];
+
+        let op = build_triple_operators(None, &triples, &HashMap::new()).unwrap();
+        assert_ne!(op.describe().op, "CyclicBgpOperator");
     }
 
     #[test]
@@ -2297,12 +2952,11 @@ mod tests {
         assert!(result.is_ok());
     }
 
-    /// Regression: top-level VALUES must not block PropertyJoinOperator selection.
+    /// Regression: top-level VALUES must not force VALUES to become the first plan node.
     ///
     /// Previously, we eagerly inserted an EmptyOperator seed whenever the first pattern
     /// was non-triple. With VALUES at position 0, that made `operator.is_none()` false
-    /// and disabled PropertyJoinOperator, causing a catastrophic fallback to nested-loop
-    /// joins on multi-property patterns (e.g. vector score + date filter).
+    /// and prevented the triple block from choosing its best plan shape.
     #[test]
     fn test_values_does_not_block_property_join_schema_order() {
         use crate::binding::Binding;
@@ -2315,7 +2969,7 @@ mod tests {
         //
         // We assert schema order to distinguish the plan shape:
         // - Bad (VALUES first): schema starts with ?queryVec
-        // - Good (PropertyJoin first, then VALUES wrap): schema starts with ?article
+        // - Good (triple block first, then VALUES wrap): schema starts with ?article
         let patterns = vec![
             Pattern::Values {
                 vars: vec![VarId(9)],
@@ -2911,7 +3565,7 @@ mod tests {
     }
 
     #[test]
-    fn test_property_join_plan_accepts_exact_width_threshold() {
+    fn test_property_join_plan_rejects_unanchored_exact_width_threshold() {
         let s = VarId(0);
         let triples = vec![
             make_pattern(s, "type", VarId(1)),
@@ -2921,10 +3575,34 @@ mod tests {
         let patterns: Vec<Pattern> = triples.iter().cloned().map(Pattern::Triple).collect();
 
         let (decision, _tail) =
-            analyze_property_join_plan(&patterns, patterns.len(), &triples, false);
+            analyze_property_join_plan(&patterns, patterns.len(), &triples, &HashMap::new(), false);
 
         assert_eq!(decision.width_score, PROPERTY_JOIN_MIN_WIDTH_SCORE);
         assert!(decision.meets_width_threshold);
+        assert!(!decision.has_selective_anchor);
+        assert!(!decision.can_property_join);
+    }
+
+    #[test]
+    fn test_property_join_plan_accepts_anchored_exact_width_threshold() {
+        let s = VarId(0);
+        let triples = vec![
+            TriplePattern::new(
+                Ref::Var(s),
+                Ref::Sid(Sid::new(100, "type")),
+                Term::Sid(Sid::new(100, "Product")),
+            ),
+            make_pattern(s, "text", VarId(2)),
+            make_pattern(s, "vector", VarId(3)),
+        ];
+        let patterns: Vec<Pattern> = triples.iter().cloned().map(Pattern::Triple).collect();
+
+        let (decision, _tail) =
+            analyze_property_join_plan(&patterns, patterns.len(), &triples, &HashMap::new(), false);
+
+        assert_eq!(decision.width_score, PROPERTY_JOIN_MIN_WIDTH_SCORE);
+        assert!(decision.meets_width_threshold);
+        assert!(decision.has_selective_anchor);
         assert!(decision.can_property_join);
     }
 
@@ -3450,6 +4128,105 @@ mod tests {
 
         let hint = scan_index_hint_for_triple(&tp, &[], &[filter]);
         assert_eq!(hint, None);
+    }
+
+    // ---------------------------------------------------------------------
+    // Edge-annotation expansion — `f:reifiesObject` dtc propagation
+    // ---------------------------------------------------------------------
+
+    fn find_reifies_object_triple(chain: &[Pattern]) -> &TriplePattern {
+        let reifies_object = Ref::Sid(Sid::new(
+            fluree_vocab::namespaces::FLUREE_DB,
+            fluree_vocab::db::REIFIES_OBJECT,
+        ));
+        chain
+            .iter()
+            .find_map(|p| match p {
+                Pattern::Triple(tp) if tp.p == reifies_object => Some(tp),
+                _ => None,
+            })
+            .expect("synthesized f:reifiesObject lookup triple must be present in chain")
+    }
+
+    fn unwrap_default_graph_source(p: &Pattern) -> &[Pattern] {
+        match p {
+            Pattern::DefaultGraphSource { patterns } => patterns,
+            other => panic!("expected Pattern::DefaultGraphSource, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn expand_edge_annotation_propagates_explicit_dtc_to_reifies_object() {
+        let xsd_string = fluree_db_core::DatatypeConstraint::Explicit(Sid::new(2, "string"));
+        let edge = TriplePattern {
+            s: Ref::Var(VarId(0)),
+            p: Ref::Sid(Sid::new(100, "name")),
+            o: Term::Value(FlakeValue::String("Alice".to_string())),
+            dtc: Some(xsd_string.clone()),
+        };
+        let patterns = vec![Pattern::EdgeAnnotation {
+            edge,
+            annotation: Ref::Var(VarId(1)),
+            body: Vec::new(),
+        }];
+        let expanded = expand_edge_annotation_patterns(&patterns);
+        assert_eq!(
+            expanded.len(),
+            1,
+            "expansion produces one DefaultGraphSource wrapper"
+        );
+        let chain = unwrap_default_graph_source(&expanded[0]);
+        let reifies_obj = find_reifies_object_triple(chain);
+        assert_eq!(reifies_obj.dtc, Some(xsd_string));
+    }
+
+    #[test]
+    fn expand_edge_annotation_propagates_lang_tag_dtc_to_reifies_object() {
+        // The regression that motivates per-language disambiguation:
+        // a language-tagged literal on the base edge must constrain the
+        // synthesized f:reifiesObject lookup by the same lang tag, or
+        // same-lexical strings in different languages would cross-match.
+        let lang_fr = fluree_db_core::DatatypeConstraint::LangTag(std::sync::Arc::from("fr"));
+        let edge = TriplePattern {
+            s: Ref::Var(VarId(0)),
+            p: Ref::Sid(Sid::new(100, "label")),
+            o: Term::Value(FlakeValue::String("chat".to_string())),
+            dtc: Some(lang_fr.clone()),
+        };
+        let patterns = vec![Pattern::EdgeAnnotation {
+            edge,
+            annotation: Ref::Var(VarId(1)),
+            body: Vec::new(),
+        }];
+        let expanded = expand_edge_annotation_patterns(&patterns);
+        let chain = unwrap_default_graph_source(&expanded[0]);
+        let reifies_obj = find_reifies_object_triple(chain);
+        match &reifies_obj.dtc {
+            Some(fluree_db_core::DatatypeConstraint::LangTag(tag)) => {
+                assert_eq!(tag.as_ref(), "fr");
+            }
+            other => panic!("expected LangTag dtc on f:reifiesObject, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn expand_edge_annotation_no_dtc_when_edge_has_none() {
+        // Ref-object edge: no constraint on either side.
+        let edge = TriplePattern {
+            s: Ref::Var(VarId(0)),
+            p: Ref::Sid(Sid::new(100, "worksFor")),
+            o: Term::Var(VarId(2)),
+            dtc: None,
+        };
+        let patterns = vec![Pattern::EdgeAnnotation {
+            edge,
+            annotation: Ref::Var(VarId(1)),
+            body: Vec::new(),
+        }];
+        let expanded = expand_edge_annotation_patterns(&patterns);
+        let chain = unwrap_default_graph_source(&expanded[0]);
+        let reifies_obj = find_reifies_object_triple(chain);
+        assert!(reifies_obj.dtc.is_none());
     }
 
     // ========================================================================

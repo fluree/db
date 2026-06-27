@@ -19,12 +19,72 @@ use fluree_db_core::value::FlakeValue;
 use fluree_db_core::{GraphDbRef, Sid};
 use fluree_vocab::namespaces::{OWL, RDFS};
 use fluree_vocab::owl_names::*;
-use fluree_vocab::predicates::{RDFS_DOMAIN, RDFS_RANGE};
+use fluree_vocab::predicates::{RDFS_DOMAIN, RDFS_RANGE, RDFS_SUBCLASSOF, RDFS_SUBPROPERTYOF};
 use hashbrown::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::error::Result;
 use crate::rdf_list::{collect_chain_elements, collect_list_elements};
+
+/// Read `child <pred> parent` reference axioms (rdfs:subClassOf / rdfs:subPropertyOf)
+/// through the range provider — so committed-but-unindexed novelty is visible — and
+/// return each child mapped to the transitive closure of its ancestors.
+///
+/// Returns `child -> [ancestor, ...]` (i.e. super-classes / super-properties), which
+/// is what cax-sco and prp-spo1 consume.
+async fn read_super_via_range(db: &GraphDbRef<'_>, pred: Sid) -> Result<HashMap<Sid, Vec<Sid>>> {
+    // Direct child -> parents edges.
+    let mut direct: HashMap<Sid, Vec<Sid>> = HashMap::new();
+    let flakes = db
+        .range(
+            IndexType::Psot,
+            RangeTest::Eq,
+            RangeMatch {
+                p: Some(pred),
+                ..Default::default()
+            },
+        )
+        .await?;
+    for flake in flakes {
+        if !flake.op {
+            continue;
+        }
+        if let FlakeValue::Ref(parent) = &flake.o {
+            // Ignore reflexive self-edges (C subClassOf C) — they add no ancestors.
+            if &flake.s != parent {
+                direct
+                    .entry(flake.s.clone())
+                    .or_default()
+                    .push(parent.clone());
+            }
+        }
+    }
+
+    // Transitive closure: for each child, walk parents to all reachable ancestors.
+    let mut closure: HashMap<Sid, Vec<Sid>> = HashMap::new();
+    let children: Vec<Sid> = direct.keys().cloned().collect();
+    for child in children {
+        let mut seen: HashSet<Sid> = HashSet::new();
+        let mut stack: Vec<Sid> = direct.get(&child).cloned().unwrap_or_default();
+        while let Some(ancestor) = stack.pop() {
+            if ancestor == child {
+                continue;
+            }
+            if seen.insert(ancestor.clone()) {
+                if let Some(grandparents) = direct.get(&ancestor) {
+                    stack.extend(grandparents.iter().cloned());
+                }
+            }
+        }
+        let mut ancestors: Vec<Sid> = seen.into_iter().collect();
+        ancestors.sort();
+        ancestors.dedup();
+        if !ancestors.is_empty() {
+            closure.insert(child, ancestors);
+        }
+    }
+    Ok(closure)
+}
 
 /// OWL2-RL specific ontology information
 ///
@@ -303,60 +363,20 @@ impl OntologyRL {
             }
         }
 
-        // Build super_properties by inverting SchemaHierarchy.subproperties_of
-        // For prp-spo1: P1(x,y), P1 rdfs:subPropertyOf* P2 -> P2(x,y)
-        // subproperties_of(P2) gives us all P1s, so we invert to get P1 -> [P2s]
-        let mut super_properties: HashMap<Sid, Vec<Sid>> = HashMap::new();
-        if let Some(hierarchy) = db.snapshot.schema_hierarchy() {
-            // Get all properties that have subproperties by checking the schema
-            if let Some(schema) = &db.snapshot.schema {
-                for pred_info in &schema.pred.vals {
-                    let p2 = &pred_info.id;
-                    // Get all subproperties (descendants) of P2
-                    for p1 in hierarchy.subproperties_of(p2) {
-                        // P1 is a subproperty of P2, so P2 is a super-property of P1
-                        super_properties
-                            .entry(p1.clone())
-                            .or_default()
-                            .push(p2.clone());
-                    }
-                }
-            }
-        }
-
-        // Normalize super_properties: sort and dedup to avoid redundant work
-        for props in super_properties.values_mut() {
-            props.sort();
-            props.dedup();
-        }
-
-        // Build super_classes by inverting SchemaHierarchy.subclasses_of
-        // For cax-sco: type(x, C1), C1 rdfs:subClassOf* C2 -> type(x, C2)
-        // subclasses_of(C2) gives us all C1s, so we invert to get C1 -> [C2s]
-        // Note: In Fluree, classes are stored in pred.vals along with properties
-        let mut super_classes: HashMap<Sid, Vec<Sid>> = HashMap::new();
-        if let Some(hierarchy) = db.snapshot.schema_hierarchy() {
-            if let Some(schema) = &db.snapshot.schema {
-                for pred_info in &schema.pred.vals {
-                    let c2 = &pred_info.id;
-                    // Get all subclasses (descendants) of C2
-                    // For properties without subclasses, this returns empty
-                    for c1 in hierarchy.subclasses_of(c2) {
-                        // C1 is a subclass of C2, so C2 is a super-class of C1
-                        super_classes
-                            .entry(c1.clone())
-                            .or_default()
-                            .push(c2.clone());
-                    }
-                }
-            }
-        }
-
-        // Normalize super_classes: sort and dedup to avoid redundant work
-        for classes in super_classes.values_mut() {
-            classes.sort();
-            classes.dedup();
-        }
+        // Build super_properties (prp-spo1: P1(x,y), P1 rdfs:subPropertyOf* P2 -> P2(x,y))
+        // and super_classes (cax-sco: type(x,C1), C1 rdfs:subClassOf* C2 -> type(x,C2)).
+        //
+        // Read the rdfs:subPropertyOf / rdfs:subClassOf axioms through the range
+        // provider (`db.range`), NOT the indexed-only `snapshot.schema_hierarchy()` /
+        // `snapshot.schema`. After `fluree create`/import the ontology axioms live in
+        // committed-but-not-yet-background-indexed data, where the indexed root schema
+        // and its precomputed hierarchy are still empty — reading them there meant
+        // cax-sco/prp-spo1 silently derived nothing until background indexing ran.
+        // This mirrors how rdfs:domain/range and owl:equivalentClass are already read
+        // here, and the RDFS rewriter fix in fluree-db-query.
+        let super_properties =
+            read_super_via_range(&db, Sid::new(RDFS, RDFS_SUBPROPERTYOF)).await?;
+        let super_classes = read_super_via_range(&db, Sid::new(RDFS, RDFS_SUBCLASSOF)).await?;
 
         // Query PSOT index for all owl:equivalentClass assertions
         // C1 owl:equivalentClass C2 means type(x, C1) ↔ type(x, C2) (bidirectional)

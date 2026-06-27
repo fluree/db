@@ -11,8 +11,8 @@ use super::value::ComparableValue;
 use crate::ir::{ArithmeticOp, CompareOp};
 
 use super::{
-    arithmetic, cast, conditional, datetime, fluree, fulltext, geo, hash, logical, numeric, rdf,
-    string, types, uuid, vector,
+    arithmetic, cast, conditional, datetime, fluree, fulltext, geo, hash, list, logical, numeric,
+    path, rdf, string, types, uuid, vector,
 };
 
 impl Function {
@@ -176,6 +176,24 @@ impl Function {
             Function::XsdDouble => cast::eval_xsd_double(args, row, ctx),
             Function::XsdDecimal => cast::eval_xsd_decimal(args, row, ctx),
             Function::XsdString => cast::eval_xsd_string(args, row, ctx),
+
+            // Path functions
+            Function::PathLength => path::eval_path_length(args, row),
+
+            // List functions (scalar-returning; tail/list-reverse use the
+            // binding-producing path in `try_eval_to_binding`).
+            Function::Size => list::eval_size(args, row, ctx),
+            Function::Head => list::eval_head(args, row, ctx),
+            Function::Last => list::eval_last(args, row, ctx),
+            Function::Reverse => list::eval_reverse_string(args, row, ctx),
+            Function::ListIndex => list::eval_list_index(args, row, ctx),
+            // List-returning only; no scalar value (handled by the
+            // binding-producing path in `try_eval_to_binding`).
+            Function::Tail
+            | Function::MakeList
+            | Function::Nodes
+            | Function::Range
+            | Function::PathPairs => Ok(None),
 
             // Unknown function
             Function::Custom(name) => Err(QueryError::InvalidFilter(format!(

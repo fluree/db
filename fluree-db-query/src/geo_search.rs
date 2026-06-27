@@ -55,9 +55,7 @@ pub struct GeoSearchOperator {
     /// by `DictOverlay`.
     p_id: Option<u32>,
     /// Pre-translated novelty overlay operations, sorted by POST order.
-    overlay_ops: Vec<OverlayOp>,
-    /// Overlay epoch for cursor cache keying.
-    overlay_epoch: u64,
+    overlay_ops: std::sync::Arc<[OverlayOp]>,
     /// Dict overlay for ephemeral ID translation and forward resolution.
     dict_overlay: Option<crate::dict_overlay::DictOverlay>,
     /// Operator lifecycle state
@@ -96,8 +94,7 @@ impl GeoSearchOperator {
             out_pos,
             datatypes: WellKnownDatatypes::new(),
             p_id: None,
-            overlay_ops: Vec::new(),
-            overlay_epoch: 0,
+            overlay_ops: Vec::new().into(),
             dict_overlay: None,
             state: OperatorState::Created,
             out_schema: None,
@@ -218,7 +215,6 @@ impl GeoSearchOperator {
             // Time-travel and overlay support (must match binary scan semantics).
             cursor.set_to_t(to_t);
             if !self.overlay_ops.is_empty() {
-                cursor.set_epoch(self.overlay_epoch);
                 cursor.set_overlay_ops(self.overlay_ops.clone());
             }
 
@@ -401,12 +397,10 @@ impl Operator for GeoSearchOperator {
                     "GeoSearch: failed to translate overlay flake to V3".to_string(),
                 ));
             }
-            let epoch = ovl.epoch();
             if !ops.is_empty() {
                 sort_overlay_ops(&mut ops, RunSortOrder::Post);
                 resolve_overlay_ops(&mut ops);
-                self.overlay_ops = ops;
-                self.overlay_epoch = epoch;
+                self.overlay_ops = ops.into();
             }
             // Build DictOverlay for ephemeral ID translation.
             if let Some(dict_nov) = ctx.dict_novelty.as_ref() {
@@ -492,8 +486,22 @@ impl Operator for GeoSearchOperator {
                 row_idx,
             )?;
 
-            // Add results to output columns
+            // View-policy enforcement: geo reads location flakes directly from
+            // the index, bypassing per-flake policy filtering. Drop any hit whose
+            // location flake the identity cannot view (no-op for root / no policy).
+            let subject_pos = *self.out_pos.get(&self.pattern.subject_var).unwrap();
             for result_row in result_rows {
+                if let Some(subject_sid) = result_row[subject_pos].as_sid() {
+                    if !crate::search_readability::search_hit_readable_sids(
+                        ctx,
+                        subject_sid,
+                        std::slice::from_ref(&self.pattern.predicate),
+                    )
+                    .await?
+                    {
+                        continue;
+                    }
+                }
                 for (col_idx, binding) in result_row.into_iter().enumerate() {
                     columns[col_idx].push(binding);
                 }

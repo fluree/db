@@ -426,9 +426,82 @@ pub struct ServerConfig {
     #[arg(long, env = "FLUREE_CACHE_MAX_MB")]
     pub cache_max_mb: Option<usize>,
 
+    /// On-disk cache budget in MB, shared globally across Fluree object storage
+    /// and Iceberg data files (default: auto-detect from available disk; `0`
+    /// disables). `FLUREE_DISK_CACHE_BUDGET_BYTES` (bytes) still overrides this.
+    #[arg(long, env = "FLUREE_DISK_CACHE_MAX_MB")]
+    pub disk_cache_max_mb: Option<usize>,
+
     /// Request body size limit in bytes (default 50MB)
     #[arg(long, env = "FLUREE_BODY_LIMIT", default_value_t = server_defaults::DEFAULT_BODY_LIMIT)]
     pub body_limit: usize,
+
+    /// Query execution timeout in milliseconds (default 15 minutes, 0 disables)
+    #[arg(long, env = "FLUREE_QUERY_TIMEOUT_MS", default_value_t = server_defaults::DEFAULT_QUERY_TIMEOUT_MS)]
+    pub query_timeout_ms: u64,
+
+    /// Maximum time to wait for HTTP read-after-write min-t freshness checks.
+    #[arg(long, env = "FLUREE_QUERY_MIN_T_TIMEOUT_MS", default_value_t = server_defaults::DEFAULT_QUERY_MIN_T_TIMEOUT_MS)]
+    pub query_min_t_timeout_ms: u64,
+
+    /// Heartbeat interval (ms) for the streaming query endpoint. Keep-alive
+    /// records flush at this cadence during stalls; set below the fronting
+    /// proxy's idle timeout. 0 disables heartbeats.
+    #[arg(long, env = "FLUREE_STREAM_HEARTBEAT_MS", default_value_t = server_defaults::DEFAULT_STREAM_HEARTBEAT_MS)]
+    pub stream_heartbeat_ms: u64,
+
+    /// Enable query-time nameservice refresh checks before current-head reads.
+    #[arg(long, env = "FLUREE_QUERY_REFRESH_ENABLED", default_value_t = server_defaults::DEFAULT_QUERY_REFRESH_ENABLED)]
+    pub query_refresh_enabled: bool,
+
+    /// Minimum milliseconds between query-time refresh checks per ledger per server process.
+    #[arg(long, env = "FLUREE_QUERY_REFRESH_TTL_MS", default_value_t = server_defaults::DEFAULT_QUERY_REFRESH_TTL_MS)]
+    pub query_refresh_ttl_ms: u64,
+
+    /// Enable the negotiated presigned-upload import path (for clients that
+    /// cannot send a large body to `POST /import`, e.g. behind a payload-capped
+    /// gateway). Advertised in discovery; the reference impl stages uploads to
+    /// `import_staging_dir` and restores from there.
+    #[arg(long, env = "FLUREE_IMPORT_PRESIGN_ENABLED", default_value_t = false)]
+    pub import_presign_enabled: bool,
+
+    /// Max body size (bytes) accepted on the direct `POST /import` path,
+    /// advertised as `import.direct_max_bytes`. Clients with an archive larger
+    /// than this use the negotiated upload flow. Only meaningful when presign
+    /// is enabled.
+    #[arg(
+        long,
+        env = "FLUREE_IMPORT_DIRECT_MAX_BYTES",
+        default_value_t = 6_291_456
+    )]
+    pub import_direct_max_bytes: usize,
+
+    /// Directory the reference presigned-upload backend stages archives in
+    /// before restoring. Defaults to the system temp dir when unset.
+    #[arg(long, env = "FLUREE_IMPORT_STAGING_DIR")]
+    pub import_staging_dir: Option<std::path::PathBuf>,
+
+    /// Archive size (bytes) at or above which the negotiated upload switches
+    /// from a single presigned PUT to a multipart upload. A single S3 PUT caps
+    /// at 5 GiB, so archives larger than that MUST use multipart. Default 5 GiB.
+    /// Only meaningful when presign is enabled.
+    #[arg(
+        long,
+        env = "FLUREE_IMPORT_MULTIPART_THRESHOLD_BYTES",
+        default_value_t = 5_368_709_120
+    )]
+    pub import_multipart_threshold_bytes: u64,
+
+    /// Target part size (bytes) for multipart uploads. The server adapts this
+    /// upward when an archive would otherwise exceed the 10,000-part S3 ceiling.
+    /// Default 256 MiB (~84 parts for a 21 GB archive). Only meaningful when
+    /// presign is enabled.
+    #[arg(
+        long,
+        env = "FLUREE_IMPORT_MULTIPART_PART_SIZE_BYTES",
+        default_value_t = 268_435_456
+    )]
+    pub import_multipart_part_size_bytes: u64,
 
     /// Log level (trace, debug, info, warn, error)
     #[arg(long, env = "FLUREE_LOG_LEVEL", default_value = server_defaults::DEFAULT_LOG_LEVEL)]
@@ -629,6 +702,14 @@ pub struct ServerConfig {
     )]
     pub mcp_agent_json_max_bytes: usize,
 
+    /// Query execution timeout for MCP `sparql_query` in milliseconds (default 5 minutes, 0 disables timeout).
+    #[arg(
+        long,
+        env = "FLUREE_MCP_QUERY_TIMEOUT_MS",
+        default_value_t = server_defaults::DEFAULT_MCP_QUERY_TIMEOUT_MS
+    )]
+    pub mcp_query_timeout_ms: u64,
+
     // === Admin endpoint authentication options ===
     /// Authentication mode for admin endpoints (/fluree/create, /fluree/drop)
     #[arg(
@@ -650,6 +731,40 @@ pub struct ServerConfig {
     /// DANGEROUS: Accept any valid admin signature regardless of issuer (dev only)
     #[arg(long, env = "FLUREE_ADMIN_AUTH_INSECURE", hide = true)]
     pub admin_auth_insecure_accept_any_issuer: bool,
+
+    // === Raft cluster options (replicated writes) ===
+    //
+    // When `raft_enabled` is `true`, the server bootstraps an
+    // openraft node, mounts the follower-forward middleware over
+    // leader-only routes, and exposes the inter-node RPC + cluster
+    // admin routers on `raft_listen_addr` (a separate private
+    // listener). All four fields below are required when raft is
+    // on; validation rejects partial configs.
+    /// Replicate writes through a Raft cluster.
+    #[cfg(feature = "raft")]
+    #[arg(long, env = "FLUREE_RAFT_ENABLED")]
+    pub raft_enabled: bool,
+
+    /// This node's id in the Raft cluster. Must be unique and
+    /// stable across restarts — the openraft log + snapshots are
+    /// keyed by it.
+    #[cfg(feature = "raft")]
+    #[arg(long, env = "FLUREE_RAFT_NODE_ID")]
+    pub raft_node_id: Option<u64>,
+
+    /// Root directory for the Raft log and snapshots. Distinct
+    /// from `--storage-path` — losing this directory loses commits.
+    #[cfg(feature = "raft")]
+    #[arg(long, env = "FLUREE_RAFT_STORAGE_PATH")]
+    pub raft_storage_path: Option<PathBuf>,
+
+    /// VPC-internal address for the inter-node Raft RPC + cluster
+    /// admin listener. Distinct from `--listen-addr` (the
+    /// client-facing port). No auth — operators enforce trust at
+    /// the network layer.
+    #[cfg(feature = "raft")]
+    #[arg(long, env = "FLUREE_RAFT_LISTEN_ADDR")]
+    pub raft_listen_addr: Option<SocketAddr>,
 }
 
 impl Default for ServerConfig {
@@ -665,7 +780,18 @@ impl Default for ServerConfig {
             reindex_min_bytes: server_defaults::DEFAULT_REINDEX_MIN_BYTES,
             reindex_max_bytes: None,
             cache_max_mb: None,
+            disk_cache_max_mb: None,
             body_limit: server_defaults::DEFAULT_BODY_LIMIT,
+            query_timeout_ms: server_defaults::DEFAULT_QUERY_TIMEOUT_MS,
+            query_min_t_timeout_ms: server_defaults::DEFAULT_QUERY_MIN_T_TIMEOUT_MS,
+            stream_heartbeat_ms: server_defaults::DEFAULT_STREAM_HEARTBEAT_MS,
+            query_refresh_enabled: server_defaults::DEFAULT_QUERY_REFRESH_ENABLED,
+            query_refresh_ttl_ms: server_defaults::DEFAULT_QUERY_REFRESH_TTL_MS,
+            import_presign_enabled: false,
+            import_direct_max_bytes: 6_291_456,
+            import_staging_dir: None,
+            import_multipart_threshold_bytes: 5_368_709_120,
+            import_multipart_part_size_bytes: 268_435_456,
             log_level: server_defaults::DEFAULT_LOG_LEVEL.to_string(),
             events_auth_mode: EventsAuthMode::None,
             events_auth_audience: None,
@@ -709,10 +835,20 @@ impl Default for ServerConfig {
             mcp_auth_trusted_issuers: Vec::new(),
             mcp_auth_insecure_accept_any_issuer: false,
             mcp_agent_json_max_bytes: server_defaults::DEFAULT_MCP_AGENT_JSON_MAX_BYTES,
+            mcp_query_timeout_ms: server_defaults::DEFAULT_MCP_QUERY_TIMEOUT_MS,
             // Admin auth defaults
             admin_auth_mode: AdminAuthMode::None,
             admin_auth_trusted_issuers: Vec::new(),
             admin_auth_insecure_accept_any_issuer: false,
+            // Raft defaults
+            #[cfg(feature = "raft")]
+            raft_enabled: false,
+            #[cfg(feature = "raft")]
+            raft_node_id: None,
+            #[cfg(feature = "raft")]
+            raft_storage_path: None,
+            #[cfg(feature = "raft")]
+            raft_listen_addr: None,
         }
     }
 }
@@ -885,6 +1021,54 @@ impl ServerConfig {
             );
         }
 
+        // Raft validation: when enabled, node_id + storage_path +
+        // listen_addr must all be set, and proxy storage is
+        // incompatible with raft (raft replicates writes via the
+        // log; proxy mode forwards to a remote tx server).
+        #[cfg(feature = "raft")]
+        if self.raft_enabled {
+            if self.raft_node_id.is_none() {
+                return Err("raft.enabled=true requires --raft-node-id".to_string());
+            }
+            if self.raft_storage_path.is_none() {
+                return Err("raft.enabled=true requires --raft-storage-path".to_string());
+            }
+            if self.raft_listen_addr.is_none() {
+                return Err("raft.enabled=true requires --raft-listen-addr".to_string());
+            }
+            if self.is_proxy_storage_mode() {
+                return Err(
+                    "raft.enabled=true is incompatible with storage-access-mode=proxy".to_string(),
+                );
+            }
+            // The raft log + snapshot tree (raft_storage_path) and
+            // the ledger content store (storage_path) both manage
+            // their own directory layouts; overlapping them lets
+            // either side blow away the other's files on
+            // compaction/eviction, and tends to surface only after a
+            // restart corrupts state. Catch the misconfiguration up
+            // front rather than mid-recovery. Comparison is lexical
+            // (the dirs may not exist yet at validation time, so
+            // `canonicalize` would fail); operators using symlink
+            // aliasing tricks bypass this knowingly.
+            if let (Some(raft_path), Some(storage_path)) =
+                (self.raft_storage_path.as_ref(), self.storage_path.as_ref())
+            {
+                if raft_path == storage_path
+                    || raft_path.starts_with(storage_path)
+                    || storage_path.starts_with(raft_path)
+                {
+                    return Err(format!(
+                        "raft.storage_path ({}) must not equal or be nested under \
+                         storage.path ({}) (or vice versa) — the raft log + state-machine \
+                         snapshots and ledger content store need disjoint filesystem subtrees",
+                        raft_path.display(),
+                        storage_path.display(),
+                    ));
+                }
+            }
+        }
+
         // Peer mode validation
         if self.server_role == ServerRole::Peer {
             // Require transaction server URL
@@ -1026,4 +1210,70 @@ fn shellexpand(path: &str) -> String {
         }
     }
     path.to_string()
+}
+
+#[cfg(all(test, feature = "raft"))]
+mod raft_validation_tests {
+    use super::*;
+    use std::net::SocketAddr;
+    use std::path::PathBuf;
+
+    fn raft_enabled_base() -> ServerConfig {
+        ServerConfig {
+            raft_enabled: true,
+            raft_node_id: Some(1),
+            raft_listen_addr: Some(SocketAddr::from(([127, 0, 0, 1], 9001))),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn rejects_equal_raft_and_storage_paths() {
+        let mut cfg = raft_enabled_base();
+        cfg.storage_path = Some(PathBuf::from("/var/lib/fluree"));
+        cfg.raft_storage_path = Some(PathBuf::from("/var/lib/fluree"));
+        let err = cfg.validate().expect_err("must reject identical paths");
+        assert!(
+            err.contains("raft.storage_path") && err.contains("storage.path"),
+            "unexpected error message: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_raft_nested_under_storage() {
+        let mut cfg = raft_enabled_base();
+        cfg.storage_path = Some(PathBuf::from("/var/lib/fluree"));
+        cfg.raft_storage_path = Some(PathBuf::from("/var/lib/fluree/raft"));
+        let err = cfg.validate().expect_err("must reject nested raft path");
+        assert!(err.contains("disjoint"), "unexpected error message: {err}");
+    }
+
+    #[test]
+    fn rejects_storage_nested_under_raft() {
+        let mut cfg = raft_enabled_base();
+        cfg.raft_storage_path = Some(PathBuf::from("/srv/raft"));
+        cfg.storage_path = Some(PathBuf::from("/srv/raft/data"));
+        let err = cfg.validate().expect_err("must reject nested storage path");
+        assert!(err.contains("disjoint"), "unexpected error message: {err}");
+    }
+
+    #[test]
+    fn accepts_disjoint_paths() {
+        let mut cfg = raft_enabled_base();
+        cfg.storage_path = Some(PathBuf::from("/var/lib/fluree/data"));
+        cfg.raft_storage_path = Some(PathBuf::from("/var/lib/fluree/raft"));
+        cfg.validate()
+            .expect("sibling dirs should validate cleanly");
+    }
+
+    #[test]
+    fn accepts_raft_without_local_storage_path() {
+        // Connection-config-driven deployments don't set
+        // `storage_path` at all — the disjoint check should noop.
+        let mut cfg = raft_enabled_base();
+        cfg.raft_storage_path = Some(PathBuf::from("/var/lib/fluree/raft"));
+        cfg.storage_path = None;
+        cfg.validate()
+            .expect("missing storage_path should skip the disjoint check");
+    }
 }

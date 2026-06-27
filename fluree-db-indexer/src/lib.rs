@@ -36,6 +36,7 @@ pub mod fulltext_hook;
 pub mod gc;
 #[path = "stats/hll256.rs"]
 pub mod hll;
+pub mod mem;
 pub mod orchestrator;
 pub mod run_index;
 pub mod spatial_hook;
@@ -43,7 +44,8 @@ pub mod stats;
 
 // Re-export main types
 pub use config::{
-    ConfiguredFulltextProperty, ConfiguredFulltextScope, FulltextConfigProvider, IndexerConfig,
+    AttachmentEventCoverage, AttachmentEventsProvider, ConfiguredFulltextProperty,
+    ConfiguredFulltextScope, FulltextConfigProvider, IndexerConfig,
 };
 pub use drop::collect_ledger_cids;
 pub use error::{IndexerError, Result};
@@ -72,7 +74,7 @@ pub use run_index::build::build_from_commits::{
 };
 
 use fluree_db_core::ContentStore;
-use fluree_db_nameservice::{NameService, Publisher};
+use fluree_db_nameservice::{IndexPublisher, NameServiceLookup};
 use tracing::Instrument;
 
 /// Result of building an index
@@ -284,7 +286,7 @@ fn tally_fuel(tracker: &fluree_db_core::tracking::Tracker) -> Option<f64> {
 /// Use `rebuild_index_from_commits` directly to force a rebuild regardless.
 pub async fn build_index_for_ledger(
     content_store: std::sync::Arc<dyn ContentStore>,
-    nameservice: &dyn NameService,
+    nameservice: &dyn NameServiceLookup,
     ledger_id: &str,
     config: IndexerConfig,
 ) -> Result<IndexResult> {
@@ -303,7 +305,7 @@ pub async fn build_index_for_ledger(
 pub async fn build_index_for_ledger_with_tracker(
     content_store: std::sync::Arc<dyn ContentStore>,
     tracker: fluree_db_core::tracking::Tracker,
-    nameservice: &dyn NameService,
+    nameservice: &dyn NameServiceLookup,
     ledger_id: &str,
     mut config: IndexerConfig,
 ) -> Result<IndexResult> {
@@ -313,18 +315,14 @@ pub async fn build_index_for_ledger_with_tracker(
         .map_err(|e| IndexerError::NameService(e.to_string()))?
         .ok_or_else(|| IndexerError::LedgerNotFound(ledger_id.to_string()))?;
 
-    // Hand the commit-CID index (if any) to the incremental path so it can
-    // skip the serial commit-DAG walk. Errors degrade to `None` (fall back to
-    // the walk); the index is never a correctness dependency.
-    // `force_serial_commit_walk` leaves it unset to A/B the serial baseline.
-    config.pending_commit_cids = if config.force_serial_commit_walk {
-        None
-    } else {
-        nameservice
-            .pending_commit_cids(ledger_id, record.index_t)
-            .await
-            .unwrap_or(None)
-    };
+    // CLI / one-shot path: the commit-CID index optimization is opt-in for the
+    // background orchestrator (which holds the richer `IndexingNameService`
+    // surface and can call `pending_commit_cids`). This convenience entrypoint
+    // takes only the read trait, so the incremental path falls back to the
+    // serial commit-DAG walk — correctness-preserving, just an unmeasured
+    // micro-optimization away.
+    config.pending_commit_cids = None;
+    let _ = record.index_t;
 
     build_index_for_record_with_tracker(content_store, tracker, &record, config).await
 }
@@ -444,8 +442,16 @@ pub async fn upload_dicts_from_disk(
     .await
 }
 
-/// Publish index result to nameservice
-pub async fn publish_index_result(publisher: &dyn Publisher, result: &IndexResult) -> Result<()> {
+/// Publish index result to nameservice. Takes the narrower
+/// [`IndexPublisher`] surface because the index head is the only
+/// nameservice write the indexer ever makes — that way embedders
+/// (notably the Raft cluster's `RaftIndexPublisher`) can implement
+/// just this trait without faking commit / lifecycle writes they
+/// don't drive.
+pub async fn publish_index_result(
+    publisher: &dyn IndexPublisher,
+    result: &IndexResult,
+) -> Result<()> {
     publisher
         .publish_index(&result.ledger_id, result.index_t, &result.root_id)
         .await

@@ -54,6 +54,16 @@ pub trait OverlayProvider: Send + Sync {
     /// When epoch changes, cached leaf materializations are invalidated.
     fn epoch(&self) -> u64;
 
+    /// True when this overlay is guaranteed to contribute no flakes.
+    ///
+    /// Unlike `epoch() == 0` (never had novelty since load), this also
+    /// covers overlays drained after an index swap. Implementations must
+    /// only return `true` when emptiness is certain; the conservative
+    /// default keeps unknown overlays on merge-correct paths.
+    fn is_effectively_empty(&self) -> bool {
+        false
+    }
+
     /// Push overlay flakes for a leaf's range to the callback
     ///
     /// # Arguments
@@ -106,6 +116,10 @@ impl OverlayProvider for NoOverlay {
 
     fn epoch(&self) -> u64 {
         0
+    }
+
+    fn is_effectively_empty(&self) -> bool {
+        true
     }
 
     fn for_each_overlay_flake(

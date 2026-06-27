@@ -144,6 +144,16 @@ pub trait StorageRead: Debug + Send + Sync {
         Ok(full[start..end].to_vec())
     }
 
+    /// Whether [`read_byte_range`](Self::read_byte_range) is a **native**
+    /// ranged read. The default `read_byte_range` fetches the full object and
+    /// slices, so callers that issue many windowed reads over one object
+    /// (e.g. streaming import) must check this and fall back to a single
+    /// whole-object read when it returns `false` — otherwise each window
+    /// re-fetches the entire object.
+    fn supports_ranged_reads(&self) -> bool {
+        false
+    }
+
     /// List objects under a prefix together with their byte sizes.
     ///
     /// Used by callers (e.g. the bulk-import remote source) that need to
@@ -281,6 +291,10 @@ impl StorageRead for Arc<dyn Storage> {
 
     async fn read_byte_range(&self, address: &str, range: std::ops::Range<u64>) -> Result<Vec<u8>> {
         self.as_ref().read_byte_range(address, range).await
+    }
+
+    fn supports_ranged_reads(&self) -> bool {
+        self.as_ref().supports_ranged_reads()
     }
 
     async fn exists(&self, address: &str) -> Result<bool> {

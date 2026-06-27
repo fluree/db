@@ -8,7 +8,7 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use fluree_db_core::ids::DatatypeDictId;
@@ -36,6 +36,7 @@ use super::artifact_cache::{fetch_cached_bytes, fetch_cached_bytes_cid};
 use super::leaflet_cache::LeafletCache;
 
 const HOT_REMOTE_LEAF_PROMOTION_TOUCHES: usize = 2;
+const CAS_HELPER_RUNTIME_THREADS: usize = 2;
 
 // ============================================================================
 // Shared dictionary / CAS utilities
@@ -79,6 +80,38 @@ pub(crate) fn cas_sync_timeout() -> Option<Duration> {
         .map(Duration::from_millis)
 }
 
+fn shared_cas_helper_runtime() -> io::Result<&'static tokio::runtime::Runtime> {
+    static RT: OnceLock<Result<tokio::runtime::Runtime, String>> = OnceLock::new();
+
+    RT.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(CAS_HELPER_RUNTIME_THREADS)
+            .thread_name("fluree-cas-helper")
+            .enable_all()
+            .build()
+            .map_err(|e| format!("failed to build shared CAS helper runtime: {e}"))
+    })
+    .as_ref()
+    .map_err(|e| io::Error::other(e.clone()))
+}
+
+fn run_on_shared_cas_helper_thread<T, Fut>(fut: Fut) -> io::Result<T>
+where
+    T: Send + 'static,
+    Fut: std::future::Future<Output = io::Result<T>> + Send + 'static,
+{
+    let (tx, rx) = std::sync::mpsc::sync_channel::<io::Result<T>>(1);
+    std::thread::Builder::new()
+        .name("fluree-cas-helper-bridge".into())
+        .spawn(move || {
+            let result = shared_cas_helper_runtime().and_then(|rt| rt.block_on(fut));
+            let _ = tx.send(result);
+        })
+        .map_err(|e| io::Error::other(format!("failed to spawn CAS helper bridge: {e}")))?;
+    rx.recv()
+        .map_err(|_| io::Error::other("CAS helper bridge thread panicked"))?
+}
+
 /// Drive an async future to completion from synchronous code, safely on any
 /// Tokio runtime flavor.
 ///
@@ -86,8 +119,10 @@ pub(crate) fn cas_sync_timeout() -> Option<Duration> {
 /// the calling worker is converted to a blocking thread and Tokio promotes a
 /// replacement that keeps driving the IO reactor / timer, so the awaited
 /// future (e.g. an S3 `get`) makes progress even while this thread blocks.
-/// On a **current-thread** (or unknown / absent) runtime it runs the future on
-/// a self-contained helper runtime so it never deadlocks the single thread.
+/// On a **current-thread** (or unknown) runtime it moves the blocking wait to a
+/// helper thread backed by the process-wide CAS helper runtime, so it never
+/// deadlocks the single thread. With no ambient runtime (e.g. Rayon workers),
+/// it drives the future directly on that same long-lived helper runtime.
 ///
 /// This is the canonical sync→async bridge for the index read path. All
 /// CAS-backed reads (leaf bytes, dict-tree leaves, forward packs) must go
@@ -111,47 +146,22 @@ where
             tokio::runtime::RuntimeFlavor::CurrentThread => {
                 // Avoid deadlock:
                 // - We're on the single runtime thread.
-                // - If we block here waiting for another thread that calls
-                //   `handle.block_on(...)`, the runtime can't make progress.
-                // Instead, run the future on a self-contained runtime in a helper thread.
-                let (tx, rx) = std::sync::mpsc::sync_channel::<io::Result<T>>(1);
-                std::thread::spawn(move || {
-                    let result = tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                        .map_err(|e| {
-                            io::Error::other(format!("failed to build helper runtime: {e}"))
-                        })
-                        .and_then(|rt| rt.block_on(fut));
-                    let _ = tx.send(result);
-                });
-                rx.recv()
-                    .map_err(|_| io::Error::other("helper runtime thread panicked"))?
+                // - Calling `Runtime::block_on` directly here can panic or stall.
+                // Move the wait to a plain thread, but keep the async work on the
+                // long-lived CAS helper runtime so SDK dispatch tasks outlive each
+                // individual fetch.
+                run_on_shared_cas_helper_thread(fut)
             }
             _ => {
                 // Future-proofing: treat unknown flavors conservatively.
-                let (tx, rx) = std::sync::mpsc::sync_channel::<io::Result<T>>(1);
-                std::thread::spawn(move || {
-                    let result = tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                        .map_err(|e| {
-                            io::Error::other(format!("failed to build helper runtime: {e}"))
-                        })
-                        .and_then(|rt| rt.block_on(fut));
-                    let _ = tx.send(result);
-                });
-                rx.recv()
-                    .map_err(|_| io::Error::other("helper runtime thread panicked"))?
+                run_on_shared_cas_helper_thread(fut)
             }
         },
         Err(_) => {
-            // No runtime context available. Create a local runtime to run the future.
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|e| io::Error::other(format!("failed to build helper runtime: {e}")))?
-                .block_on(fut)
+            // No runtime context available (for example a Rayon worker). Use the
+            // process-wide runtime so pooled async-client connections keep their
+            // dispatch tasks on a runtime that is not dropped after each fetch.
+            shared_cas_helper_runtime()?.block_on(fut)
         }
     }
 }
@@ -713,6 +723,40 @@ impl BinaryIndexStore {
         )))
     }
 
+    /// Open just a leaf's decoded directory — no column payload access.
+    ///
+    /// For directory-only walks (metadata counts, leaflet skips) this reads
+    /// only the header+directory prefix (a few KB) instead of the full leaf
+    /// blob, regardless of whether the leaf is local, disk-cached, or remote
+    /// (`ContentStoreRangeFetcher` resolves locality with positional reads).
+    /// Decoded directories are cached in the shared [`LeafletCache`] keyed by
+    /// leaf CID — content-addressed, so entries never go stale.
+    ///
+    /// Callers that may need `load_columns` must use [`Self::open_leaf_handle`].
+    pub fn open_leaf_dir(&self, leaf_cid: &ContentId) -> io::Result<Arc<DecodedLeafDirV3>> {
+        let key = xxhash_rust::xxh3::xxh3_128(leaf_cid.to_bytes().as_ref());
+        if let Some(cache) = &self.leaflet_cache {
+            return cache.try_get_or_load_leaf_dir(key, || self.load_leaf_dir_uncached(leaf_cid));
+        }
+        self.load_leaf_dir_uncached(leaf_cid)
+    }
+
+    fn load_leaf_dir_uncached(&self, leaf_cid: &ContentId) -> io::Result<Arc<DecodedLeafDirV3>> {
+        // A prior full open may already have memoized this remote leaf's
+        // directory — reuse it rather than re-fetching.
+        if let Some(dir) = self.remote_leaf_metadata.read().get(leaf_cid) {
+            return Ok(Arc::new(dir.clone()));
+        }
+        let cs = self
+            .cas
+            .as_ref()
+            .ok_or_else(|| io::Error::other("no content store"))?;
+        let fetcher = ContentStoreRangeFetcher::new(Arc::clone(cs), self.cache_dir.clone());
+        let (dir, _payload_base) =
+            super::leaf_access::fetch_header_and_directory(&fetcher, leaf_cid)?;
+        Ok(Arc::new(dir))
+    }
+
     /// Fetch sidecar bytes by CID (full object, sync).
     ///
     /// Used by both the cursor (`open_leaf_handle`) and external callers
@@ -1161,9 +1205,10 @@ impl BinaryIndexStore {
         ))
     }
 
-    /// Compare two string dictionary IDs by lexicographic string value without allocating.
+    /// Compare two string dictionary IDs by lexicographic string value.
     ///
-    /// Useful for MIN/MAX over `Binding::EncodedLit` values of string-like kinds.
+    /// Use when value order is needed but raw ID order can't stand in for it —
+    /// i.e. on indexes without `lex_sorted_string_ids`.
     pub fn compare_string_lex(&self, a: u32, b: u32) -> io::Result<Ordering> {
         if a == b {
             return Ok(Ordering::Equal);
@@ -1446,6 +1491,42 @@ impl BinaryIndexStore {
     }
 
     /// Reverse subject lookup by namespace parts (avoids IRI construction).
+    /// Find the NumBig arena handle for an already-indexed big numeric value
+    /// (overflow `xsd:integer` / typed `xsd:decimal`) under `(g_id, p_id)`.
+    ///
+    /// Read-only: returns `None` when the value was never indexed for this
+    /// predicate — overlay translation treats that as untranslatable (raw
+    /// flake / fast-path decline) rather than minting a handle.
+    pub fn find_numbig_handle(
+        &self,
+        g_id: GraphId,
+        p_id: u32,
+        val: &fluree_db_core::value::FlakeValue,
+    ) -> Option<u32> {
+        let arena = self.graph_indexes.get(&g_id)?.numbig.get(&p_id)?;
+        match val {
+            fluree_db_core::value::FlakeValue::BigInt(bi) => arena.find_bigint(bi),
+            fluree_db_core::value::FlakeValue::Decimal(bd) => {
+                if arena.has_duplicate_handles() {
+                    // Legacy pre-normalization arena: the value may exist
+                    // under several handles (scale variants), and a single
+                    // handle cannot represent its identity — a translated
+                    // retract keyed on one handle would miss base rows under
+                    // another. Decline so callers fall back to decoded-value
+                    // comparison, which is handle-agnostic.
+                    let handles = arena.find_bigdec_handles(bd);
+                    return if handles.len() == 1 {
+                        Some(handles[0])
+                    } else {
+                        None
+                    };
+                }
+                arena.find_bigdec(bd)
+            }
+            _ => None,
+        }
+    }
+
     pub fn find_subject_id_by_parts(&self, ns_code: u16, suffix: &str) -> io::Result<Option<u64>> {
         match &self.dicts.subject_reverse_tree {
             Some(tree) => {
@@ -2852,6 +2933,175 @@ mod tests {
     }
 
     #[test]
+    fn open_leaf_dir_reads_prefix_only_and_caches() {
+        let store = CountingContentStore::new();
+        let leaf_bytes = build_test_leaf_bytes();
+        let leaf_cid = run_sync_on_runtime({
+            let store = store.clone();
+            async move {
+                store
+                    .put(ContentKind::IndexLeaf, &leaf_bytes)
+                    .await
+                    .map_err(|e| io::Error::other(e.to_string()))
+            }
+        })
+        .expect("store leaf bytes");
+        let cache_dir = temp_cache_dir();
+        let mut binary_store = empty_store(Arc::new(store.clone()), cache_dir.clone());
+        binary_store.leaflet_cache = Some(Arc::new(LeafletCache::with_max_mb(4)));
+
+        let dir = binary_store
+            .open_leaf_dir(&leaf_cid)
+            .expect("first dir open");
+        assert_eq!(dir.entries.len(), 1);
+        assert_eq!(dir.entries[0].row_count, 5);
+        assert_eq!(
+            store.get_calls(),
+            0,
+            "dir-only open must never fetch the full blob"
+        );
+        let first_range_calls = store.range_calls();
+        assert!(
+            first_range_calls >= 2,
+            "expected header + directory range reads"
+        );
+
+        let dir2 = binary_store
+            .open_leaf_dir(&leaf_cid)
+            .expect("second dir open");
+        assert_eq!(dir2.entries.len(), 1);
+        assert_eq!(
+            store.range_calls(),
+            first_range_calls,
+            "cached dir should avoid any further reads"
+        );
+        assert_eq!(store.get_calls(), 0);
+
+        // Same directory as a full-blob open would produce.
+        let handle = binary_store
+            .open_leaf_handle(&leaf_cid, None, false)
+            .expect("full open");
+        assert_eq!(handle.dir().entries.len(), dir.entries.len());
+        assert_eq!(handle.dir().entries[0].row_count, dir.entries[0].row_count);
+        assert_eq!(handle.dir().payload_base, dir.payload_base);
+
+        let _ = std::fs::remove_dir_all(cache_dir);
+    }
+
+    /// Content store whose blobs resolve to local files. `get`/`get_range`
+    /// count as CAS access — a dir-only open of a locally resolvable leaf
+    /// must be served entirely by positional reads on the local file.
+    #[derive(Debug, Clone)]
+    struct LocalFileContentStore {
+        inner: MemoryContentStore,
+        local: Arc<RwLock<HashMap<ContentId, PathBuf>>>,
+        cas_calls: Arc<AtomicUsize>,
+    }
+
+    impl LocalFileContentStore {
+        fn new() -> Self {
+            Self {
+                inner: MemoryContentStore::new(),
+                local: Arc::new(RwLock::new(HashMap::new())),
+                cas_calls: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ContentStore for LocalFileContentStore {
+        async fn has(&self, id: &ContentId) -> fluree_db_core::Result<bool> {
+            self.inner.has(id).await
+        }
+
+        async fn get(&self, id: &ContentId) -> fluree_db_core::Result<Vec<u8>> {
+            self.cas_calls.fetch_add(1, AtomicOrdering::Relaxed);
+            self.inner.get(id).await
+        }
+
+        async fn put(&self, kind: ContentKind, bytes: &[u8]) -> fluree_db_core::Result<ContentId> {
+            self.inner.put(kind, bytes).await
+        }
+
+        async fn put_with_id(&self, id: &ContentId, bytes: &[u8]) -> fluree_db_core::Result<()> {
+            self.inner.put_with_id(id, bytes).await
+        }
+
+        async fn release(&self, id: &ContentId) -> fluree_db_core::Result<()> {
+            self.inner.release(id).await
+        }
+
+        async fn get_range(
+            &self,
+            id: &ContentId,
+            range: std::ops::Range<u64>,
+        ) -> fluree_db_core::Result<Vec<u8>> {
+            self.cas_calls.fetch_add(1, AtomicOrdering::Relaxed);
+            self.inner.get_range(id, range).await
+        }
+
+        fn resolve_local_path(&self, id: &ContentId) -> Option<PathBuf> {
+            self.local.read().get(id).cloned()
+        }
+    }
+
+    #[test]
+    fn open_leaf_dir_serves_local_files_without_cas_access() {
+        let store = LocalFileContentStore::new();
+        let leaf_bytes = build_test_leaf_bytes();
+        let leaf_cid = run_sync_on_runtime({
+            let store = store.clone();
+            let leaf_bytes = leaf_bytes.clone();
+            async move {
+                store
+                    .put(ContentKind::IndexLeaf, &leaf_bytes)
+                    .await
+                    .map_err(|e| io::Error::other(e.to_string()))
+            }
+        })
+        .expect("store leaf bytes");
+
+        // Materialize the blob as a local file the store resolves to.
+        let local_dir = temp_cache_dir();
+        let leaf_path = local_dir.join(format!("{leaf_cid}.fli"));
+        std::fs::write(&leaf_path, &leaf_bytes).expect("write local leaf file");
+        store.local.write().insert(leaf_cid.clone(), leaf_path);
+
+        let cache_dir = temp_cache_dir();
+        let mut binary_store = empty_store(Arc::new(store.clone()), cache_dir.clone());
+
+        // No leaflet cache: every open must still resolve via the local file.
+        let dir = binary_store
+            .open_leaf_dir(&leaf_cid)
+            .expect("uncached local dir open");
+        assert_eq!(dir.entries.len(), 1);
+        assert_eq!(dir.entries[0].row_count, 5);
+        assert_eq!(
+            store.cas_calls.load(AtomicOrdering::Relaxed),
+            0,
+            "local leaf dir must be read from the file, not CAS"
+        );
+
+        // With the cache attached: same result, still no CAS access.
+        binary_store.leaflet_cache = Some(Arc::new(LeafletCache::with_max_mb(4)));
+        for _ in 0..2 {
+            let dir2 = binary_store
+                .open_leaf_dir(&leaf_cid)
+                .expect("cached local dir open");
+            assert_eq!(dir2.entries.len(), 1);
+            assert_eq!(dir2.entries[0].row_count, 5);
+        }
+        assert_eq!(
+            store.cas_calls.load(AtomicOrdering::Relaxed),
+            0,
+            "cached local dir opens must not touch CAS either"
+        );
+
+        let _ = std::fs::remove_dir_all(local_dir);
+        let _ = std::fs::remove_dir_all(cache_dir);
+    }
+
+    #[test]
     fn find_subject_id_uses_full_iri_fallback_when_store_has_it() {
         let cache_dir = temp_cache_dir();
         let mut store = empty_store(Arc::new(MemoryContentStore::new()), cache_dir);
@@ -3054,6 +3304,50 @@ mod tests {
             ),
             Err(_) => {
                 panic!("run_sync_on_runtime wedged a 2-worker runtime under fan-out (regression)")
+            }
+        }
+    }
+
+    /// Regression guard for the Lambda/Solo remote leaf-fetch failure mode.
+    ///
+    /// Fast-path leaf scans can run on Rayon workers with no ambient Tokio
+    /// runtime. The bridge must use the long-lived process-wide helper runtime
+    /// in that case, not create and drop a fresh runtime per fetch.
+    #[test]
+    fn run_sync_on_runtime_no_runtime_fanout_uses_shared_runtime() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        assert!(tokio::runtime::Handle::try_current().is_err());
+
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut workers = Vec::new();
+            for _ in 0..32 {
+                workers.push(std::thread::spawn(|| {
+                    run_sync_on_runtime(async {
+                        tokio::time::sleep(Duration::from_millis(25)).await;
+                        Ok::<(), std::io::Error>(())
+                    })
+                }));
+            }
+
+            let mut ok = 0usize;
+            for worker in workers {
+                if matches!(worker.join(), Ok(Ok(()))) {
+                    ok += 1;
+                }
+            }
+            let _ = tx.send(ok);
+        });
+
+        match rx.recv_timeout(Duration::from_secs(8)) {
+            Ok(done) => assert_eq!(
+                done, 32,
+                "all no-runtime bridged fetches must complete on the shared helper runtime"
+            ),
+            Err(_) => {
+                panic!("run_sync_on_runtime wedged no-runtime fan-out on shared helper runtime")
             }
         }
     }

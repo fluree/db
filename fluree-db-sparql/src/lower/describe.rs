@@ -16,7 +16,7 @@ use fluree_db_query::binding::Binding;
 use fluree_db_query::ir::triple::{Ref, Term, TriplePattern};
 use fluree_db_query::ir::{
     ConstructTemplate as QueryConstructTemplate, Expression, Pattern, Query, QueryOutput,
-    ReasoningConfig, SubqueryPattern,
+    SubqueryPattern,
 };
 use fluree_db_query::parse::encode::IriEncoder;
 use fluree_db_query::var_registry::VarId;
@@ -141,13 +141,14 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
             orig_context: Some(ctx_val),
             output: QueryOutput::Construct(template),
             patterns,
-            reasoning: ReasoningConfig::default(),
+            reasoning: self.reasoning_config()?,
             grouping: None,
             ordering: Vec::new(),
             order_binds: Vec::new(),
             limit: None,
             offset: None,
             post_values: None,
+            include_system_facts: false,
         })
     }
 

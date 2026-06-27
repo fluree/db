@@ -12,10 +12,11 @@ use crate::remote_service::RemoteServiceExecutor;
 use crate::var_registry::VarRegistry;
 use crate::vector::VectorIndexProvider;
 use fluree_db_binary_index::{BinaryGraphView, BinaryIndexStore, FulltextArena};
+use fluree_db_core::comparator::IndexType;
 use fluree_db_core::dict_novelty::DictNovelty;
 use fluree_db_core::{
-    GraphDbRef, GraphId, LedgerSnapshot, NoOverlay, OverlayProvider, RuntimeSmallDicts, Sid,
-    Tracker,
+    GraphDbRef, GraphId, LedgerSnapshot, NoOverlay, OverlayProvider, QueryCancellation,
+    RuntimeSmallDicts, Sid, Tracker, FIRST_USER_GRAPH_ID,
 };
 
 use crate::binary_range::BinaryRangeProvider;
@@ -55,9 +56,28 @@ pub enum ConstSidKey {
 /// derived per-graph contexts can share it and the context stays `Send + Sync`.
 pub type ConstSidCache = Arc<Mutex<FxHashMap<ConstSidKey, Option<u64>>>>;
 
+/// Shared handle to the per-query overlay-ops memo
+/// ([`OverlayOpsCache`](crate::fast_path_common::OverlayOpsCache)).
+pub type SharedOverlayOpsCache = Arc<crate::fast_path_common::OverlayOpsCache>;
+
 /// Map from `(graph_id, predicate_id, lang_id)` to fulltext BoW arenas used
 /// by `fulltext()` BM25 scoring.
 pub type FulltextProviders = HashMap<(GraphId, u32, u16), Arc<FulltextArena>>;
+
+/// Per-query memo for overlay flake → V3 `OverlayOp` translation, keyed by
+/// `(overlay epoch, graph id, index)`.
+///
+/// Translating the overlay walks every overlay flake and resolves each
+/// subject/predicate/object through the dictionaries, then sorts the result —
+/// O(overlay size × dict lookups). Per-row join probes open a fresh scan per
+/// left row; without this memo each probe re-translates the entire overlay
+/// (quadratic on reasoning queries, where the derived-facts overlay holds the
+/// whole materialization).
+///
+/// Scoping: contexts that swap the overlay (`with_graph_ref`) start a fresh
+/// memo, mirroring `const_sid_cache`; same-overlay derivations share it.
+pub type TranslatedOverlayCache =
+    Arc<Mutex<FxHashMap<(u64, GraphId, IndexType), Arc<crate::binary_scan::TranslatedOverlayOps>>>>;
 
 /// Execution context providing access to database and query state.
 ///
@@ -113,8 +133,19 @@ pub struct ExecutionContext<'a> {
     pub active_graph: ActiveGraph,
     /// Optional execution tracker (time/fuel/policy)
     pub tracker: Tracker,
+    /// Optional cooperative cancellation handle.
+    pub cancellation: QueryCancellation,
     /// When true, bind evaluation errors are treated as query errors.
     pub strict_bind_errors: bool,
+    /// When true, scan operators bypass the variable-predicate filter
+    /// that hides Fluree-system predicates (`f:reifies*` in every
+    /// graph; the broader `f:` namespace in the default graph) for
+    /// patterns whose predicate slot is a variable.
+    ///
+    /// Opt-in escape for debug / inspection workflows; defaults to
+    /// `false`. Surfaced through `opts.includeSystemFacts: true` on
+    /// JSON-LD queries.
+    pub include_system_facts: bool,
     /// Optional binary columnar index store for fast local-file scans.
     ///
     /// When present, scan operators use the binary cursor path for queries
@@ -195,6 +226,21 @@ pub struct ExecutionContext<'a> {
     /// Per-query memo: constant filter operands → internal subject id, so a
     /// `<const> != ?var` FILTER resolves the constant once, not per row.
     pub const_sid_cache: ConstSidCache,
+    /// Per-query memo: translated + resolved overlay ops per
+    /// `(graph, order, predicate)` — see
+    /// [`OverlayOpsCache`](crate::fast_path_common::OverlayOpsCache).
+    ///
+    /// Derivations that change `overlay`, `to_t`, dictionaries, or the binary
+    /// store must start a fresh cache; graph switches may share it (the graph
+    /// id is part of the cache key). The cache self-validates its binding at
+    /// access time, so a wrongly-shared cache degrades to uncached compute
+    /// rather than serving stale ops.
+    pub overlay_ops_cache: SharedOverlayOpsCache,
+    /// Per-query memo: WHOLE-overlay translation per `(epoch, graph, index)`,
+    /// so per-row scan opens reuse one overlay translation (see
+    /// [`TranslatedOverlayCache`]). Complements `overlay_ops_cache`, which
+    /// memoizes per-predicate subsets for the fast-path/probe lanes.
+    pub translated_overlay_cache: TranslatedOverlayCache,
 }
 
 impl<'a> ExecutionContext<'a> {
@@ -216,7 +262,9 @@ impl<'a> ExecutionContext<'a> {
             dataset: None,
             active_graph: ActiveGraph::Default,
             tracker: Tracker::disabled(),
+            cancellation: QueryCancellation::disabled(),
             strict_bind_errors: false,
+            include_system_facts: false,
             binary_store: None,
             binary_g_id: 0,
             dict_novelty: None,
@@ -231,6 +279,8 @@ impl<'a> ExecutionContext<'a> {
             eager_materialization: false,
             original_snapshot: snapshot,
             const_sid_cache: ConstSidCache::default(),
+            overlay_ops_cache: SharedOverlayOpsCache::default(),
+            translated_overlay_cache: TranslatedOverlayCache::default(),
         }
     }
 
@@ -264,7 +314,9 @@ impl<'a> ExecutionContext<'a> {
             dataset: None,
             active_graph: ActiveGraph::Default,
             tracker: Tracker::disabled(),
+            cancellation: QueryCancellation::disabled(),
             strict_bind_errors: false,
+            include_system_facts: false,
             binary_store,
             binary_g_id: db.g_id,
             dict_novelty,
@@ -279,6 +331,8 @@ impl<'a> ExecutionContext<'a> {
             eager_materialization: db.eager,
             original_snapshot: db.snapshot,
             const_sid_cache: ConstSidCache::default(),
+            overlay_ops_cache: SharedOverlayOpsCache::default(),
+            translated_overlay_cache: TranslatedOverlayCache::default(),
         }
     }
 
@@ -316,7 +370,9 @@ impl<'a> ExecutionContext<'a> {
             dataset: None,
             active_graph: ActiveGraph::Default,
             tracker: Tracker::disabled(),
+            cancellation: QueryCancellation::disabled(),
             strict_bind_errors: false,
+            include_system_facts: false,
             binary_store,
             binary_g_id: db.g_id,
             dict_novelty,
@@ -331,6 +387,8 @@ impl<'a> ExecutionContext<'a> {
             eager_materialization: db.eager,
             original_snapshot: db.snapshot,
             const_sid_cache: ConstSidCache::default(),
+            overlay_ops_cache: SharedOverlayOpsCache::default(),
+            translated_overlay_cache: TranslatedOverlayCache::default(),
         }
     }
 
@@ -357,7 +415,9 @@ impl<'a> ExecutionContext<'a> {
             dataset: None,
             active_graph: ActiveGraph::Default,
             tracker: Tracker::disabled(),
+            cancellation: QueryCancellation::disabled(),
             strict_bind_errors: false,
+            include_system_facts: false,
             binary_store: None,
             binary_g_id: 0,
             dict_novelty: None,
@@ -372,6 +432,8 @@ impl<'a> ExecutionContext<'a> {
             eager_materialization: false,
             original_snapshot: snapshot,
             const_sid_cache: ConstSidCache::default(),
+            overlay_ops_cache: SharedOverlayOpsCache::default(),
+            translated_overlay_cache: TranslatedOverlayCache::default(),
         }
     }
 
@@ -397,7 +459,9 @@ impl<'a> ExecutionContext<'a> {
             dataset: None,
             active_graph: ActiveGraph::Default,
             tracker: Tracker::disabled(),
+            cancellation: QueryCancellation::disabled(),
             strict_bind_errors: false,
+            include_system_facts: false,
             binary_store: None,
             binary_g_id: 0,
             dict_novelty: None,
@@ -412,6 +476,8 @@ impl<'a> ExecutionContext<'a> {
             eager_materialization: false,
             original_snapshot: snapshot,
             const_sid_cache: ConstSidCache::default(),
+            overlay_ops_cache: SharedOverlayOpsCache::default(),
+            translated_overlay_cache: TranslatedOverlayCache::default(),
         }
     }
 
@@ -439,7 +505,9 @@ impl<'a> ExecutionContext<'a> {
             dataset: None,
             active_graph: ActiveGraph::Default,
             tracker: Tracker::disabled(),
+            cancellation: QueryCancellation::disabled(),
             strict_bind_errors: false,
+            include_system_facts: false,
             binary_store: None,
             binary_g_id: 0,
             dict_novelty: None,
@@ -454,6 +522,8 @@ impl<'a> ExecutionContext<'a> {
             eager_materialization: false,
             original_snapshot: snapshot,
             const_sid_cache: ConstSidCache::default(),
+            overlay_ops_cache: SharedOverlayOpsCache::default(),
+            translated_overlay_cache: TranslatedOverlayCache::default(),
         }
     }
 
@@ -533,18 +603,67 @@ impl<'a> ExecutionContext<'a> {
         self
     }
 
+    /// Attach a cooperative cancellation handle to this context.
+    pub fn with_cancellation(mut self, cancellation: QueryCancellation) -> Self {
+        self.cancellation = cancellation;
+        self
+    }
+
+    /// Return an error if query execution has been cancelled or timed out.
+    #[inline]
+    pub fn check_cancelled(&self) -> Result<(), QueryError> {
+        match self.cancellation.reason() {
+            Some(reason) => Err(QueryError::Cancelled { reason }),
+            None => Ok(()),
+        }
+    }
+
     /// Enable strict bind error handling.
     pub fn with_strict_bind_errors(mut self) -> Self {
         self.strict_bind_errors = true;
         self
     }
 
-    /// Check if this context has an active (non-root) policy
+    /// Bypass the variable-predicate filter that hides Fluree-system
+    /// predicates. Opt-in for debug / inspection — see
+    /// [`Self::include_system_facts`].
+    pub fn with_include_system_facts(mut self, include: bool) -> Self {
+        self.include_system_facts = include;
+        self
+    }
+
+    /// Check if this context has an active (non-root) policy.
+    ///
+    /// Accounts for dataset mode: the top-level context may carry no enforcer
+    /// while a constituent graph does (the enforcer lives on the `GraphRef`,
+    /// applied via [`with_graph_ref`](Self::with_graph_ref)). Reporting policy
+    /// here whenever *any* active graph is filtered keeps `allow_unfiltered`
+    /// sound as the single canonical view-policy gate, even for callers that do
+    /// not also fold to a per-graph context first.
     pub fn has_policy(&self) -> bool {
-        self.policy_enforcer
+        let top_level = self
+            .policy_enforcer
             .as_ref()
             .map(|e| !e.is_root())
-            .unwrap_or(false)
+            .unwrap_or(false);
+        top_level || self.dataset.map(DataSet::has_any_policy).unwrap_or(false)
+    }
+
+    /// True when no view-policy filtering is required for this context — the
+    /// enforcer is absent or is the root (unrestricted) policy. The exact
+    /// negation of [`has_policy`](Self::has_policy).
+    ///
+    /// This is the single canonical predicate that protects view-policy
+    /// enforcement. The only operator that actually removes policy-hidden rows
+    /// is the range-fallback scan ([`BinaryScanOperator::filter_flakes_by_policy`]);
+    /// every fast path and raw-leaflet reader that does *not* route emitted
+    /// flakes through that filter MUST gate on `allow_unfiltered()` and decline
+    /// (fall back to the filtered scan) when it returns false. Adding a new
+    /// data-emitting operator that reads the index directly without consulting
+    /// this — or applying its own filter — is a policy leak.
+    #[inline]
+    pub fn allow_unfiltered(&self) -> bool {
+        !self.has_policy()
     }
 
     /// Get the effective overlay (NoOverlay if none set)
@@ -700,6 +819,29 @@ impl<'a> ExecutionContext<'a> {
         }
     }
 
+    /// True when the active scope resolves to exactly one graph and that
+    /// graph carries no novelty overlay (never had one, or drained by an
+    /// index swap).
+    ///
+    /// The batched join/probe helpers (`flush_batched_*_binary`,
+    /// `batched_subject_probe_binary`, `batched_subject_star_spot`) read base
+    /// leaflets directly and never merge overlay flakes, so they silently drop
+    /// novelty asserts and resurrect novelty-retracted rows. Every batched
+    /// leaflet-probe path must check this and fall back to the per-row scan
+    /// (whose binary cursor merges the overlay) when it returns `false`.
+    pub fn overlay_free_single_graph(&self) -> bool {
+        fn overlay_free(overlay: &dyn OverlayProvider) -> bool {
+            overlay.epoch() == 0 || overlay.is_effectively_empty()
+        }
+        match self.active_graphs() {
+            ActiveGraphs::Single => overlay_free(self.overlay()),
+            ActiveGraphs::Many(graphs) => match graphs.as_slice() {
+                [g] => overlay_free(g.overlay),
+                _ => false,
+            },
+        }
+    }
+
     /// Check whether the binary index fast path is available.
     ///
     /// Returns `true` when a binary store is present and the query is in
@@ -796,17 +938,50 @@ impl<'a> ExecutionContext<'a> {
         }
     }
 
+    /// Resolve a `GRAPH <iri>` to a user-registered named graph's `g_id`, or
+    /// `None` when a dataset scopes the named set (`FROM NAMED`), the IRI is
+    /// unregistered, or it names a reserved system graph. The ledger alias is
+    /// reserved for the default graph and never resolves here, even if a
+    /// registered graph shares the ledger's IRI.
+    pub fn single_db_user_graph_id(&self, iri: &str) -> Option<GraphId> {
+        if self.dataset.is_some() || iri == self.active_snapshot.ledger_id.as_str() {
+            return None;
+        }
+        self.active_snapshot
+            .graph_registry
+            .graph_id_for_iri(iri)
+            .filter(|g| *g >= FIRST_USER_GRAPH_ID)
+    }
+
+    /// User-registered named graph IRIs of the active snapshot, for `GRAPH ?g`
+    /// discovery. Excludes the default, reserved system graphs, and any graph
+    /// colliding with the ledger alias (which addresses the default graph);
+    /// empty in dataset mode.
+    pub fn single_db_user_graph_iris(&self) -> Vec<Arc<str>> {
+        if self.dataset.is_some() {
+            return Vec::new();
+        }
+        let alias = self.active_snapshot.ledger_id.as_str();
+        self.active_snapshot
+            .graph_registry
+            .iter_entries()
+            .filter(|(g, iri)| *g >= FIRST_USER_GRAPH_ID && *iri != alias)
+            .map(|(_, iri)| Arc::from(iri))
+            .collect()
+    }
+
     /// Create a new context with a specific named graph active
     ///
     /// This is cheap: just creates a new context with a different `active_graph` enum.
     /// Used by `GraphOperator` to switch graph context during GRAPH pattern execution.
     pub fn with_active_graph(&self, iri: Arc<str>) -> Self {
-        // In dataset mode, ensure binary scans route to the active graph's g_id.
-        // Without this, `BinaryScanOperator` would continue scanning the original graph
-        // even inside a `GRAPH <iri> { ... }` pattern.
+        // Route binary scans to the active graph's g_id: an explicit FROM NAMED
+        // entry, else a registered user graph (single-db), else inherit (the
+        // ledger alias addresses the default graph).
         let binary_g_id = self
             .dataset
             .and_then(|ds| ds.named_graph(&iri).map(|g| g.g_id))
+            .or_else(|| self.single_db_user_graph_id(&iri))
             .unwrap_or(self.binary_g_id);
         let active_graph = ActiveGraph::Named(iri);
         let multi_ledger = Self::compute_multi_ledger(self.dataset, &active_graph);
@@ -826,7 +1001,9 @@ impl<'a> ExecutionContext<'a> {
             dataset: self.dataset,
             active_graph,
             tracker: self.tracker.clone(),
+            cancellation: self.cancellation.clone(),
             strict_bind_errors: self.strict_bind_errors,
+            include_system_facts: self.include_system_facts,
             binary_store: self.binary_store.clone(),
             binary_g_id,
             dict_novelty: self.dict_novelty.clone(),
@@ -841,6 +1018,8 @@ impl<'a> ExecutionContext<'a> {
             eager_materialization: self.eager_materialization,
             original_snapshot: self.original_snapshot,
             const_sid_cache: self.const_sid_cache.clone(),
+            overlay_ops_cache: self.overlay_ops_cache.clone(),
+            translated_overlay_cache: self.translated_overlay_cache.clone(),
         }
     }
 
@@ -877,7 +1056,9 @@ impl<'a> ExecutionContext<'a> {
             dataset: self.dataset,
             active_graph: ActiveGraph::Default,
             tracker: self.tracker.clone(),
+            cancellation: self.cancellation.clone(),
             strict_bind_errors: self.strict_bind_errors,
+            include_system_facts: self.include_system_facts,
             binary_store: self.binary_store.clone(),
             binary_g_id,
             dict_novelty: self.dict_novelty.clone(),
@@ -892,6 +1073,8 @@ impl<'a> ExecutionContext<'a> {
             eager_materialization: self.eager_materialization,
             original_snapshot: self.original_snapshot,
             const_sid_cache: self.const_sid_cache.clone(),
+            overlay_ops_cache: self.overlay_ops_cache.clone(),
+            translated_overlay_cache: self.translated_overlay_cache.clone(),
         }
     }
 
@@ -924,7 +1107,9 @@ impl<'a> ExecutionContext<'a> {
             dataset: None,
             active_graph: ActiveGraph::Default,
             tracker: self.tracker.clone(),
+            cancellation: self.cancellation.clone(),
             strict_bind_errors: self.strict_bind_errors,
+            include_system_facts: self.include_system_facts,
             binary_store: Self::extract_binary_store(graph.snapshot),
             binary_g_id: graph.g_id,
             dict_novelty: Self::extract_dict_novelty(graph.snapshot),
@@ -946,6 +1131,8 @@ impl<'a> ExecutionContext<'a> {
             // graph/store into another. (`with_active_graph`/`with_default_graph`
             // keep the same store, so they correctly share the parent's memo.)
             const_sid_cache: ConstSidCache::default(),
+            overlay_ops_cache: SharedOverlayOpsCache::default(),
+            translated_overlay_cache: TranslatedOverlayCache::default(),
         }
     }
 
@@ -992,18 +1179,27 @@ impl<'a> ExecutionContext<'a> {
     pub fn with_binary_store(mut self, store: Arc<BinaryIndexStore>, g_id: GraphId) -> Self {
         self.binary_store = Some(store);
         self.binary_g_id = g_id;
+        // Store identity is part of the overlay-ops cache binding.
+        self.overlay_ops_cache = SharedOverlayOpsCache::default();
+        self.translated_overlay_cache = TranslatedOverlayCache::default();
         self
     }
 
     /// Attach a dictionary novelty layer for binary scan subject/string lookups.
     pub fn with_dict_novelty(mut self, dict_novelty: Arc<DictNovelty>) -> Self {
         self.dict_novelty = Some(dict_novelty);
+        // Dict-novelty identity is part of the overlay-ops cache binding.
+        self.overlay_ops_cache = SharedOverlayOpsCache::default();
+        self.translated_overlay_cache = TranslatedOverlayCache::default();
         self
     }
 
     /// Attach runtime predicate/datatype IDs carried by the db value.
     pub fn with_runtime_small_dicts(mut self, runtime_small_dicts: &'a RuntimeSmallDicts) -> Self {
         self.runtime_small_dicts = Some(runtime_small_dicts);
+        // Small-dict identity is part of the overlay-ops cache binding.
+        self.overlay_ops_cache = SharedOverlayOpsCache::default();
+        self.translated_overlay_cache = TranslatedOverlayCache::default();
         self
     }
 
@@ -1081,6 +1277,10 @@ pub struct WellKnownDatatypes {
     pub fluree_vector: Sid,
     /// rdf:JSON (@json datatype)
     pub rdf_json: Sid,
+    /// rdf:langString (datatype of lang-tagged literals)
+    pub rdf_lang_string: Sid,
+    /// fluree:fullText (@fulltext datatype)
+    pub fluree_full_text: Sid,
     /// geo:wktLiteral (http://www.opengis.net/ont/geosparql#wktLiteral)
     pub geo_wkt_literal: Sid,
 }
@@ -1117,8 +1317,10 @@ impl WellKnownDatatypes {
             xsd_day_time_duration: Sid::new(XSD, xsd_names::DAY_TIME_DURATION),
             xsd_year_month_duration: Sid::new(XSD, xsd_names::YEAR_MONTH_DURATION),
             id_type: Sid::new(JSON_LD, "id"),
-            fluree_vector: Sid::new(FLUREE_DB, "vector"),
+            fluree_vector: Sid::new(FLUREE_DB, "embeddingVector"),
             rdf_json: Sid::new(RDF, "JSON"),
+            rdf_lang_string: Sid::new(RDF, "langString"),
+            fluree_full_text: Sid::new(FLUREE_DB, "fullText"),
             geo_wkt_literal: Sid::new(OGC_GEO, geo_names::WKT_LITERAL),
         }
     }

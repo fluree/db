@@ -23,7 +23,7 @@ use axum::{
 };
 use chrono::Utc;
 use fluree_db_nameservice::{
-    GraphSourceRecord, NameService, NameServiceEvent, NsRecord, SubscriptionScope,
+    GraphSourceRecord, NameServiceEvent, NameServiceLookup, NsRecord, SubscriptionScope,
 };
 use fluree_sse::{SSE_KIND_GRAPH_SOURCE, SSE_KIND_LEDGER};
 use futures::stream::{self, Stream, StreamExt};
@@ -222,7 +222,7 @@ fn retracted_sse_event(kind: &'static str, resource_id: &str) -> Event {
 /// Build the initial snapshot of records on connection
 async fn build_initial_snapshot<N>(ns: &N, params: &EventsQuery) -> Vec<Event>
 where
-    N: NameService,
+    N: NameServiceLookup,
 {
     let mut events = Vec::new();
 
@@ -305,7 +305,7 @@ fn event_kind(event: &NameServiceEvent) -> &'static str {
 /// Transform a nameservice event to an SSE Event, fetching the current record
 async fn transform_event<N>(ns: &N, event: NameServiceEvent) -> Option<Event>
 where
-    N: NameService,
+    N: NameServiceLookup,
 {
     let resource_id = event_resource_id(&event).to_string();
 

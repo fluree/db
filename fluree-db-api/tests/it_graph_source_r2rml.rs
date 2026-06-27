@@ -13,7 +13,7 @@ mod support;
 use async_trait::async_trait;
 use fluree_db_iceberg::io::batch::{BatchSchema, Column, ColumnBatch, FieldInfo, FieldType};
 use fluree_db_query::error::{QueryError, Result as QueryResult};
-use fluree_db_query::r2rml::{R2rmlProvider, R2rmlTableProvider};
+use fluree_db_query::r2rml::{ColumnBatchStream, R2rmlProvider, R2rmlTableProvider, ScanFilter};
 use fluree_db_r2rml::loader::R2rmlLoader;
 use fluree_db_r2rml::mapping::CompiledR2rmlMapping;
 use std::sync::Arc;
@@ -22,10 +22,13 @@ use std::sync::Arc;
 use fluree_db_api::{
     execute, ContextConfig, ExecutableQuery, FlureeBuilder, ParsedContext, Pattern, VarRegistry,
 };
-use fluree_db_core::{GraphDbRef, NoOverlay, Tracker};
+use fluree_db_core::{FlakeValue, GraphDbRef, NoOverlay, Tracker};
 use fluree_db_query::ir::triple::{Ref, Term, TriplePattern};
 use fluree_db_query::ir::GraphName;
-use fluree_db_query::ir::{Query, QueryOutput};
+use fluree_db_query::ir::{
+    AggregateFn, AggregateSpec, Expression, Function, Grouping, InputSemantics, Query, QueryOutput,
+};
+use fluree_db_query::var_registry::VarId;
 use support::genesis_ledger;
 
 fn r2rml_test_config<'a, P: R2rmlProvider + R2rmlTableProvider>(
@@ -86,10 +89,17 @@ impl R2rmlTableProvider for MockR2rmlProvider {
         _graph_source_id: &str,
         _table_name: &str,
         _projection: &[String],
+        _filters: &[ScanFilter],
         _as_of_t: Option<i64>,
-    ) -> QueryResult<Vec<ColumnBatch>> {
-        Ok(self.batches.clone())
+    ) -> QueryResult<ColumnBatchStream> {
+        Ok(vec_batch_stream(self.batches.clone()))
     }
+}
+
+/// Wrap pre-built batches as a `ColumnBatchStream` for the mock providers.
+fn vec_batch_stream(batches: Vec<ColumnBatch>) -> ColumnBatchStream {
+    use futures::StreamExt;
+    Box::pin(futures::stream::iter(batches).map(Ok))
 }
 
 // =============================================================================
@@ -219,10 +229,14 @@ async fn test_mock_r2rml_provider() {
     assert_eq!(loaded.triples_maps.len(), 1);
 
     // Test scan_table
-    let batches = provider
-        .scan_table("test-gs:main", "openflights.airlines", &[], Some(0))
+    use futures::StreamExt;
+    let batches: Vec<ColumnBatch> = provider
+        .scan_table("test-gs:main", "openflights.airlines", &[], &[], Some(0))
         .await
-        .unwrap();
+        .unwrap()
+        .map(|b| b.unwrap())
+        .collect()
+        .await;
     assert_eq!(batches.len(), 1);
     assert_eq!(batches[0].num_rows, 3);
 }
@@ -746,8 +760,9 @@ impl R2rmlTableProvider for IcebergDirectProvider {
         _graph_source_id: &str,
         table_name: &str,
         projection: &[String],
+        _filters: &[ScanFilter],
         _as_of_t: Option<i64>,
-    ) -> QueryResult<Vec<ColumnBatch>> {
+    ) -> QueryResult<ColumnBatchStream> {
         use fluree_db_iceberg::{
             auth::AuthConfig,
             catalog::{
@@ -906,7 +921,7 @@ impl R2rmlTableProvider for IcebergDirectProvider {
         );
 
         if plan.is_empty() {
-            return Ok(Vec::new());
+            return Ok(vec_batch_stream(Vec::new()));
         }
 
         // Read Parquet files
@@ -929,7 +944,7 @@ impl R2rmlTableProvider for IcebergDirectProvider {
             total_rows
         );
 
-        Ok(all_batches)
+        Ok(vec_batch_stream(all_batches))
     }
 }
 
@@ -1165,13 +1180,14 @@ async fn engine_e2e_provider_method_calls() {
             graph_source_id: &str,
             table_name: &str,
             projection: &[String],
+            _filters: &[ScanFilter],
             _as_of_t: Option<i64>,
-        ) -> QueryResult<Vec<ColumnBatch>> {
+        ) -> QueryResult<ColumnBatchStream> {
             eprintln!(
                 "scan_table called: gs={graph_source_id}, table={table_name}, projection={projection:?}"
             );
             self.scan_table_called.fetch_add(1, Ordering::SeqCst);
-            Ok(self.batches.clone())
+            Ok(vec_batch_stream(self.batches.clone()))
         }
     }
 
@@ -1670,6 +1686,85 @@ async fn integration_query_graph_source_provider_wiring() {
     }
 }
 
+/// Streaming parity for `integration_query_graph_source_provider_wiring`: a
+/// streaming query over a mapped graph source must resolve through the real
+/// `FlureeR2rmlProvider`, not the no-op stand-in.
+///
+/// The no-op provider reports no mapping, so the GRAPH would read as an empty
+/// native graph and the stream would end cleanly with zero rows. The real
+/// provider instead rewrites to an R2RML scan and fails (there is no live
+/// Iceberg catalog) — so an `error` terminal proves the real provider was the
+/// one consulted on the streaming path.
+#[tokio::test]
+async fn streaming_graph_source_uses_real_r2rml_provider() {
+    use fluree_db_api::{OwnedStreamQuery, QueryExecutionOptions};
+    use support::graphdb_from_ledger;
+    use tokio::sync::mpsc;
+
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    let config = R2rmlCreateConfig::new(
+        "airlines-stream-test",
+        "https://polaris.example.com",
+        "openflights.airlines",
+        AIRLINE_MAPPING_TTL,
+    )
+    .with_mapping_media_type("text/turtle");
+    let graph_source_id = fluree
+        .create_r2rml_graph_source(config)
+        .await
+        .expect("graph source creation should succeed")
+        .graph_source_id;
+
+    let ledger = genesis_ledger(&fluree, "stream-gs-test:main");
+
+    let sparql = format!(
+        "SELECT ?s WHERE {{ GRAPH <{graph_source_id}> {{ ?s a <http://example.org/Airline> }} }}"
+    );
+
+    let graph = graphdb_from_ledger(&ledger);
+    let plan = fluree
+        .plan_stream_query(&graph, &OwnedStreamQuery::Sparql(sparql))
+        .await
+        .expect("plan should succeed");
+    drop(graph);
+
+    let (tx, mut rx) = mpsc::channel(1024);
+    fluree
+        .run_stream_query(
+            ledger,
+            plan,
+            Tracker::disabled(),
+            QueryExecutionOptions::default(),
+            tx,
+        )
+        .await;
+
+    let mut bytes = Vec::new();
+    while let Some(chunk) = rx.recv().await {
+        bytes.extend_from_slice(&chunk);
+    }
+    let records: Vec<serde_json::Value> = String::from_utf8(bytes)
+        .expect("ndjson is utf-8")
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(|l| serde_json::from_str(l).expect("each line is valid JSON"))
+        .collect();
+
+    let terminal = records.last().expect("a terminal record");
+    assert_eq!(
+        terminal["type"], "error",
+        "real provider attempts the R2RML scan and fails without a catalog; \
+         a clean `end` would mean the no-op provider was wired. Terminal: {terminal}"
+    );
+    assert!(
+        !terminal
+            .to_string()
+            .contains("does not support graph source operations"),
+        "must use FlureeR2rmlProvider, not the no-op. Terminal: {terminal}"
+    );
+}
+
 // =============================================================================
 // RefObjectMap Join Execution Tests
 // =============================================================================
@@ -1766,17 +1861,18 @@ impl R2rmlTableProvider for MultiTableMockProvider {
         _graph_source_id: &str,
         table_name: &str,
         _projection: &[String],
+        _filters: &[ScanFilter],
         _as_of_t: Option<i64>,
-    ) -> QueryResult<Vec<ColumnBatch>> {
+    ) -> QueryResult<ColumnBatchStream> {
         eprintln!("MultiTableMockProvider.scan_table: {table_name}");
         // Return appropriate batch based on table name
         // Table names are normalized to dot notation
         match table_name {
-            "openflights.airlines" => Ok(vec![self.airlines_batch.clone()]),
-            "openflights.routes" => Ok(vec![self.routes_batch.clone()]),
+            "openflights.airlines" => Ok(vec_batch_stream(vec![self.airlines_batch.clone()])),
+            "openflights.routes" => Ok(vec_batch_stream(vec![self.routes_batch.clone()])),
             _ => {
                 eprintln!("Unknown table: {table_name}");
-                Ok(vec![])
+                Ok(vec_batch_stream(vec![]))
             }
         }
     }
@@ -1953,4 +2049,296 @@ fn test_ref_object_map_composite_key_parsing() {
         }
         _ => panic!("Expected RefObjectMap"),
     }
+}
+
+// =============================================================================
+// Fused-aggregate correctness regressions (PR #1372 internal review)
+//
+// Run aggregate queries through the fused R2RML path (default) over crafted
+// column batches and assert the result matches exact SPARQL semantics. Each
+// test fails if the fused path diverges from the normal (fallback) pipeline.
+// =============================================================================
+
+/// R2RML mapping for `?s ex:val ?o`, with `val` typed as `datatype`
+/// (e.g. `xsd:integer`, `xsd:decimal`) so the object materializes as numeric.
+fn val_mapping(datatype: &str) -> String {
+    format!(
+        r#"
+@prefix rr: <http://www.w3.org/ns/r2rml#> .
+@prefix ex: <http://example.org/> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+<http://example.org/mapping#M> a rr:TriplesMap ;
+    rr:logicalTable [ rr:tableName "t" ] ;
+    rr:subjectMap [ rr:template "http://example.org/r/{{id}}" ] ;
+    rr:predicateObjectMap [ rr:predicate ex:val ;
+        rr:objectMap [ rr:column "val" ; rr:datatype {datatype} ] ] .
+"#
+    )
+}
+
+/// Build an `id` (non-null subject key) + `val` (crafted aggregate input) batch.
+fn id_val_batch(ids: Vec<Option<i64>>, val: Column, val_type: FieldType) -> ColumnBatch {
+    let schema = BatchSchema::new(vec![
+        FieldInfo {
+            name: "id".into(),
+            field_type: FieldType::Int64,
+            nullable: false,
+            field_id: 1,
+        },
+        FieldInfo {
+            name: "val".into(),
+            field_type: val_type,
+            nullable: true,
+            field_id: 2,
+        },
+    ]);
+    ColumnBatch::new(Arc::new(schema), vec![Column::Int64(ids), val]).unwrap()
+}
+
+/// Run `SELECT (agg) WHERE { GRAPH gs { ?s ex:val ?o } <extra> }` (implicit
+/// aggregation) over crafted batches via the fused path; return the single
+/// scalar result formatted with `{:?}`. `build` receives the registry and the
+/// object var `?o`, and returns any extra patterns (e.g. a `BIND`) plus the
+/// aggregate function.
+async fn run_val_agg(
+    datatype: &str,
+    batches: Vec<ColumnBatch>,
+    build: impl FnOnce(&mut VarRegistry, VarId) -> (Vec<Pattern>, AggregateFn),
+) -> String {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let mut ledger = genesis_ledger(&fluree, "fa:main");
+    Arc::make_mut(&mut ledger.snapshot)
+        .insert_namespace_code(9_999, "http://example.org/".to_string())
+        .unwrap();
+    let mapping = R2rmlLoader::from_turtle(&val_mapping(datatype))
+        .unwrap()
+        .compile()
+        .unwrap();
+    let provider = MockR2rmlProvider::new(mapping, batches);
+
+    let mut vars = VarRegistry::new();
+    let s = vars.get_or_insert("?s");
+    let o = vars.get_or_insert("?o");
+    let out = vars.get_or_insert("?agg");
+    let pred = ledger
+        .snapshot
+        .encode_iri("http://example.org/val")
+        .expect("example.org namespace registered");
+
+    let graph = Pattern::Graph {
+        name: GraphName::Iri("fa-gs:main".into()),
+        patterns: vec![Pattern::Triple(TriplePattern::new(
+            Ref::Var(s),
+            Ref::Sid(pred),
+            Term::Var(o),
+        ))],
+    };
+    let (extra, agg_fn) = build(&mut vars, o);
+    let mut patterns = vec![graph];
+    patterns.extend(extra);
+
+    let mut parsed = Query::new(ParsedContext::default());
+    parsed.patterns = patterns;
+    parsed.output = QueryOutput::select_all(vec![out]);
+    parsed.grouping = Grouping::assemble(
+        vec![],
+        vec![AggregateSpec {
+            function: agg_fn,
+            output_var: out,
+        }],
+        vec![],
+        None,
+    );
+
+    let executable = ExecutableQuery::simple(parsed);
+    let tracker = Tracker::disabled();
+    let result = execute(
+        GraphDbRef::new(&ledger.snapshot, 0, &NoOverlay, ledger.t()),
+        &vars,
+        &executable,
+        r2rml_test_config(&tracker, &provider),
+    )
+    .await
+    .expect("query should execute");
+
+    let batch = result
+        .into_iter()
+        .find(|b| !b.is_empty())
+        .expect("one result row");
+    let value = batch
+        .column_by_idx(0)
+        .and_then(|c| c.first())
+        .expect("a scalar value");
+    format!("{value:?}")
+}
+
+#[tokio::test]
+async fn fused_sum_distinct_dedups() {
+    // SUM(DISTINCT ?o) over [10, 10, 20] must dedup to 30, not 40.
+    let batch = id_val_batch(
+        vec![Some(1), Some(2), Some(3)],
+        Column::Int64(vec![Some(10), Some(10), Some(20)]),
+        FieldType::Int64,
+    );
+    let got = run_val_agg("xsd:integer", vec![batch], |_v, o| {
+        (vec![], AggregateFn::Sum(o, InputSemantics::Set))
+    })
+    .await;
+    assert!(
+        got.contains("30") && !got.contains("40"),
+        "SUM(DISTINCT) should dedup to 30, got {got}"
+    );
+}
+
+#[tokio::test]
+async fn fused_count_star_drops_null_object_rows() {
+    // COUNT(*) over `?s ex:val ?o` where val = [10, null, 30]: the null-val row
+    // produces no triple, so the count is 2, not 3.
+    let batch = id_val_batch(
+        vec![Some(1), Some(2), Some(3)],
+        Column::Int64(vec![Some(10), None, Some(30)]),
+        FieldType::Int64,
+    );
+    let got = run_val_agg("xsd:integer", vec![batch], |_v, _o| {
+        (vec![], AggregateFn::CountAll)
+    })
+    .await;
+    assert!(
+        got.contains('2') && !got.contains('3'),
+        "COUNT(*) should drop the null-object row → 2, got {got}"
+    );
+}
+
+#[tokio::test]
+async fn fused_sum_overflow_falls_back_to_exact() {
+    // Two huge decimal values whose unscaled i128 sum overflows: the fused
+    // accumulator must fall back to the BigDecimal pipeline, not wrap to a
+    // wrong value. i128::MAX - 5 + 10 = i128::MAX + 5 (a 39-digit number).
+    let batch = id_val_batch(
+        vec![Some(1), Some(2)],
+        Column::Decimal {
+            values: vec![Some(i128::MAX - 5), Some(10)],
+            precision: 38,
+            scale: 0,
+        },
+        FieldType::Decimal {
+            precision: 38,
+            scale: 0,
+        },
+    );
+    let got = run_val_agg("xsd:decimal", vec![batch], |_v, o| {
+        (vec![], AggregateFn::Sum(o, InputSemantics::List))
+    })
+    .await;
+    // Correct total is positive 2^127 + 4 (BigInt limbs [4, 2^63]); a wrapping
+    // i128 add would instead produce a negative (sign=Minus) wrong value.
+    assert!(
+        got.contains("sign=Plus") && got.contains("9223372036854775808"),
+        "overflowing SUM should fall back to the exact positive BigDecimal total, got {got}"
+    );
+}
+
+#[tokio::test]
+async fn fused_sum_integer_expr_keeps_integer_datatype() {
+    // SUM(?o * 2) over integer `?o` is xsd:integer in the normal pipeline; the
+    // native expr fold always finalizes as xsd:decimal, so it must fall back to
+    // keep the datatype exact. o = [10, 20] → 2*(10+20) = 60.
+    let batch = id_val_batch(
+        vec![Some(1), Some(2)],
+        Column::Int64(vec![Some(10), Some(20)]),
+        FieldType::Int64,
+    );
+    let got = run_val_agg("xsd:integer", vec![batch], |vars, o| {
+        let e = vars.get_or_insert("?e");
+        let expr = Expression::Call {
+            func: Function::Mul,
+            args: vec![Expression::Var(o), Expression::Const(FlakeValue::Long(2))],
+        };
+        (
+            vec![Pattern::Bind { var: e, expr }],
+            AggregateFn::Sum(e, InputSemantics::List),
+        )
+    })
+    .await;
+    assert!(
+        got.contains("60") && got.contains("integer") && !got.contains("decimal"),
+        "SUM(integer expr) should stay xsd:integer (= 60), got {got}"
+    );
+}
+
+#[tokio::test]
+async fn fused_fallback_applies_offset_once() {
+    // GROUP BY on an xsd:date column trips the fused operator's column-resolution
+    // gate (date isn't a supported group key), so it falls back to the normal
+    // pipeline at open. OFFSET must be applied exactly once: the fallback is built
+    // with OFFSET stripped and the engine's OffsetOperator wraps the result. The
+    // prior regression baked OFFSET into the fallback *and* re-applied it, which
+    // would drop twice as many rows.
+    let mapping = R2rmlLoader::from_turtle(&val_mapping("xsd:date"))
+        .unwrap()
+        .compile()
+        .unwrap();
+    // Three distinct date groups (days since epoch): {1: 2 rows, 2: 1, 3: 1}.
+    let batch = id_val_batch(
+        vec![Some(1), Some(2), Some(3), Some(4)],
+        Column::Date(vec![Some(1), Some(1), Some(2), Some(3)]),
+        FieldType::Date,
+    );
+    let provider = MockR2rmlProvider::new(mapping, vec![batch]);
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let mut ledger = genesis_ledger(&fluree, "fa:main");
+    Arc::make_mut(&mut ledger.snapshot)
+        .insert_namespace_code(9_999, "http://example.org/".to_string())
+        .unwrap();
+
+    let mut vars = VarRegistry::new();
+    let s = vars.get_or_insert("?s");
+    let o = vars.get_or_insert("?o");
+    let c = vars.get_or_insert("?c");
+    let pred = ledger
+        .snapshot
+        .encode_iri("http://example.org/val")
+        .expect("example.org namespace registered");
+
+    let graph = Pattern::Graph {
+        name: GraphName::Iri("fa-gs:main".into()),
+        patterns: vec![Pattern::Triple(TriplePattern::new(
+            Ref::Var(s),
+            Ref::Sid(pred),
+            Term::Var(o),
+        ))],
+    };
+
+    let mut parsed = Query::new(ParsedContext::default());
+    parsed.patterns = vec![graph];
+    // Detection requires the projection to equal {group keys} ∪ {agg outputs}.
+    parsed.output = QueryOutput::select_all(vec![o, c]);
+    parsed.grouping = Grouping::assemble(
+        vec![o],
+        vec![AggregateSpec {
+            function: AggregateFn::CountAll,
+            output_var: c,
+        }],
+        vec![],
+        None,
+    );
+    parsed.offset = Some(1);
+
+    let executable = ExecutableQuery::simple(parsed);
+    let tracker = Tracker::disabled();
+    let result = execute(
+        GraphDbRef::new(&ledger.snapshot, 0, &NoOverlay, ledger.t()),
+        &vars,
+        &executable,
+        r2rml_test_config(&tracker, &provider),
+    )
+    .await
+    .expect("query should execute");
+
+    let rows: usize = result.iter().fold(0, |acc, b| acc + b.len());
+    assert_eq!(
+        rows, 2,
+        "3 groups with OFFSET 1 must yield 2 rows (offset applied once, not twice)"
+    );
 }

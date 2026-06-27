@@ -6,8 +6,7 @@
 //! reports at least the floor, a parse error still reports it, and a `max-fuel`
 //! below the floor is rejected up front.
 
-mod support;
-
+use crate::support;
 use fluree_db_api::FlureeBuilder;
 use serde_json::json;
 

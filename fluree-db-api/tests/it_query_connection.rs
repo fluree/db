@@ -4,14 +4,12 @@
 //! - `query_connection` with `"from"` (combined datasets)
 //! - `query_connection` with `"fromNamed"` + `["graph", ...]` patterns (separate named graphs)
 
-mod support;
-
-use fluree_db_api::FlureeBuilder;
-use serde_json::json;
-use support::{
+use crate::support::{
     assert_index_defaults, context_ex_schema, genesis_ledger, normalize_rows, MemoryFluree,
     MemoryLedger,
 };
+use fluree_db_api::FlureeBuilder;
+use serde_json::json;
 
 fn ctx_schema() -> serde_json::Value {
     json!({
@@ -417,7 +415,7 @@ async fn query_connection_policy_identity_not_found_returns_empty() {
     let _ledger = seed_people_ledger(&fluree, "people:main").await;
 
     // Use an identity that doesn't exist in the database.
-    // With no inline default-allow, QueryConnectionOptions defaults to `default_allow: false`.
+    // With no inline default-allow, GovernanceOptions defaults to `default_allow: false`.
     // Unknown identity → empty restrictions → default-allow:false denies every row → 0 results.
     // The point of this test is that an unresolvable identity IRI does not surface as a 500;
     // it produces a clean empty result set.

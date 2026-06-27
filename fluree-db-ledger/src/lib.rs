@@ -37,7 +37,7 @@ use fluree_db_core::{
     BranchedContentStore, ContentId, ContentStore, DictNovelty, Flake, GraphDbRef, GraphId,
     LedgerSnapshot, RuntimeSmallDicts, StorageBackend, TXN_META_GRAPH_ID,
 };
-use fluree_db_nameservice::{NameService, NsRecord};
+use fluree_db_nameservice::{NameServiceLookup, NsRecord};
 use fluree_db_novelty::{
     generate_commit_flakes, stamp_graph_on_commit_flakes, trace_commits_by_id, Commit, Novelty,
 };
@@ -130,7 +130,7 @@ impl LedgerState {
     /// This is resilient to missing index - if the nameservice has commits
     /// but no index yet, it creates a genesis LedgerSnapshot and loads all commits as novelty.
     pub async fn load(
-        ns: &dyn NameService,
+        ns: &dyn NameServiceLookup,
         ledger_id: &str,
         backend: &StorageBackend,
     ) -> Result<Self> {
@@ -159,7 +159,7 @@ impl LedgerState {
     /// same logic via the nameservice helpers without taking on a
     /// `fluree-db-ledger` dependency.
     pub async fn build_branched_store(
-        ns: &dyn NameService,
+        ns: &dyn NameServiceLookup,
         record: &NsRecord,
         backend: &StorageBackend,
     ) -> Result<BranchedContentStore> {
@@ -494,14 +494,17 @@ impl LedgerState {
         );
         // Re-populate dict_novelty with any remaining novelty flakes (t > index_t)
         // so overlay translation can resolve newly-introduced subject/string IDs.
-        if !new_novelty.is_empty() {
+        // Note: use `size > 0` not `is_empty()` — after clear_up_to the arena still
+        // holds dead flakes, but `size` tracks only active bytes.
+        let has_remaining_novelty = new_novelty.size > 0;
+        if has_remaining_novelty {
             new_dict_novelty.populate_from_flakes_iter(
                 new_novelty.iter_flakes(fluree_db_core::IndexType::Post),
             );
         }
 
         let mut new_runtime_small_dicts = RuntimeSmallDicts::new();
-        if !new_novelty.is_empty() {
+        if has_remaining_novelty {
             new_runtime_small_dicts.populate_from_flakes_iter(
                 new_novelty.iter_flakes(fluree_db_core::IndexType::Post),
             );
@@ -736,7 +739,7 @@ impl LedgerState {
     /// - Other errors from `apply_index`
     pub async fn maybe_apply_newer_index(
         &mut self,
-        ns: &dyn NameService,
+        ns: &dyn NameServiceLookup,
         cs: &dyn ContentStore,
     ) -> Result<bool> {
         let record = ns
@@ -834,44 +837,66 @@ mod tests {
     /// watermarks, routing tables, etc.). We therefore include the full required
     /// FIR6 metadata *skeleton* with empty counts for all variable-length sections.
     fn build_test_fir6(ledger_id: &str, index_t: i64) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(64);
-        buf.extend_from_slice(b"FIR6"); // magic
-        buf.push(1); // version
-        buf.push(0); // flags (no optional sections)
-        buf.extend_from_slice(&0u16.to_le_bytes()); // pad
-        buf.extend_from_slice(&index_t.to_le_bytes()); // index_t
-        buf.extend_from_slice(&0i64.to_le_bytes()); // base_t
-                                                    // Ledger ID (u16 length prefix + UTF-8 bytes)
+        build_test_fir6_with_base(ledger_id, index_t, 0)
+    }
+
+    /// Variant of `build_test_fir6` that lets callers vary `base_t`.
+    /// Used by `test_apply_index_equal_t_noop` to produce two FIR6
+    /// blobs with the same `index_t` but different CIDs without
+    /// resorting to trailing-byte padding (which the strict
+    /// `FIR6: trailing bytes after annotation_index` check rejects).
+    fn build_test_fir6_with_base(ledger_id: &str, index_t: i64, base_t: i64) -> Vec<u8> {
+        // Mirror `fluree-db-core::db::decode_fir6_metadata` exactly.
+        // The decoder now enforces a strict trailing-byte check
+        // (`FIR6: trailing bytes after annotation_index`), so any
+        // section that doesn't exactly match what the decoder reads
+        // will surface either as truncation or trailing-byte error.
+        // Keep this skeleton in lockstep with the decoder.
+        let mut buf = Vec::with_capacity(128);
+        // ---- header ----
+        buf.extend_from_slice(b"FIR6"); // magic (4)
+        buf.push(1); // version (1)
+        buf.push(0); // flags (1) — no optional sections
+        buf.extend_from_slice(&0u16.to_le_bytes()); // pad (2)
+        buf.extend_from_slice(&index_t.to_le_bytes()); // index_t (8)
+        buf.extend_from_slice(&base_t.to_le_bytes()); // base_t (8)
+                                                      // ledger_id (u16 length prefix + UTF-8 bytes)
         let lid = ledger_id.as_bytes();
         buf.extend_from_slice(&(lid.len() as u16).to_le_bytes());
         buf.extend_from_slice(lid);
 
-        // ---- FIR6 metadata skeleton (all empty) ----
+        // ---- metadata skeleton, all empty ----
         buf.push(0); // subject_id_encoding (u8)
+        buf.push(0); // ns_split_mode_byte (u8) — decoder requires this
 
-        buf.extend_from_slice(&0u16.to_le_bytes()); // ns_count (u16) = 0
+        buf.extend_from_slice(&0u16.to_le_bytes()); // ns_count = 0
+        buf.extend_from_slice(&0u32.to_le_bytes()); // pred_count = 0
 
-        buf.extend_from_slice(&0u32.to_le_bytes()); // pred_count (u32) = 0
+        // graph_iris / datatype_iris / language_tags: string arrays (u16 count + entries)
+        buf.extend_from_slice(&0u16.to_le_bytes()); // graph_iris = 0
+        buf.extend_from_slice(&0u16.to_le_bytes()); // datatype_iris = 0
+        buf.extend_from_slice(&0u16.to_le_bytes()); // language_tags = 0
 
-        // graph_iris / datatype_iris / language_tags: string arrays (u16 count + strings)
-        buf.extend_from_slice(&0u16.to_le_bytes()); // graph_iris count = 0
-        buf.extend_from_slice(&0u16.to_le_bytes()); // datatype_iris count = 0
-        buf.extend_from_slice(&0u16.to_le_bytes()); // language_tags count = 0
+        // skip_dict_pack_refs: string forward packs sp_count + subject forward packs ns_count
+        buf.extend_from_slice(&0u16.to_le_bytes()); // string pack sp_count = 0
+        buf.extend_from_slice(&0u16.to_le_bytes()); // subject pack ns_count = 0
 
-        // dict pack refs: ns_count (u16) + packs; empty
-        buf.extend_from_slice(&0u16.to_le_bytes());
-        // dict tree refs: subject reverse, string reverse; each starts with u16 count
-        buf.extend_from_slice(&0u16.to_le_bytes()); // subject reverse sp_count = 0
-        buf.extend_from_slice(&0u16.to_le_bytes()); // string reverse sp_count = 0
+        // skip_dict_tree_refs (subject reverse): branch CID (u16 len + bytes) + leaf_count u32
+        buf.extend_from_slice(&0u16.to_le_bytes()); // branch CID len = 0
+        buf.extend_from_slice(&0u32.to_le_bytes()); // leaf_count = 0
 
-        // per-graph specialty arenas: arena_count (u16) = 0
+        // skip_dict_tree_refs (string reverse): same shape
+        buf.extend_from_slice(&0u16.to_le_bytes()); // branch CID len = 0
+        buf.extend_from_slice(&0u32.to_le_bytes()); // leaf_count = 0
+
+        // per-graph specialty arenas: arena_count = 0
         buf.extend_from_slice(&0u16.to_le_bytes());
 
         // watermarks
         buf.extend_from_slice(&0u16.to_le_bytes()); // wm_count = 0
         buf.extend_from_slice(&0u32.to_le_bytes()); // string_watermark = 0
 
-        // cumulative commit stats (3 * u64)
+        // cumulative commit stats (3 × u64)
         buf.extend_from_slice(&0u64.to_le_bytes()); // total_commit_size
         buf.extend_from_slice(&0u64.to_le_bytes()); // total_asserts
         buf.extend_from_slice(&0u64.to_le_bytes()); // total_retracts
@@ -885,10 +910,9 @@ mod tests {
         // named graph routing
         buf.extend_from_slice(&0u16.to_le_bytes()); // named_count = 0
 
-        // Defensive padding: keeps this test helper resilient to small FIR6
-        // metadata decode changes (additional trailing fields). All padding
-        // bytes are zero so any newly-read counts default to empty.
-        buf.extend(std::iter::repeat_n(0u8, 64));
+        // No optional sections (flags=0); no annotation_index section.
+        // The strict trailing-byte check requires exactly zero bytes
+        // beyond this point.
 
         buf
     }
@@ -1155,10 +1179,12 @@ mod tests {
         let novelty = Novelty::new(1);
         let mut state = LedgerState::new(snapshot, novelty);
 
-        // Create another FIR6 root at same t (append extra bytes to produce different CID)
+        // Create another FIR6 root at same index_t but a different
+        // base_t so the bytes differ (and so does the CID). We can't
+        // append trailing bytes — the FIR6 decoder enforces strict
+        // trailing-byte validation now.
         let store2 = content_store_for(storage.clone(), "test:main");
-        let mut bytes2 = build_test_fir6("test:main", 1);
-        bytes2.extend_from_slice(b"extra-padding");
+        let bytes2 = build_test_fir6_with_base("test:main", 1, /* base_t */ 7);
         let index_cid_same = store2.put(ContentKind::IndexRoot, &bytes2).await.unwrap();
 
         // Should succeed as no-op (equal t)

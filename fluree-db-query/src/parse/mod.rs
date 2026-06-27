@@ -81,6 +81,15 @@ pub(crate) fn parse_query_ast(
     json: &JsonValue,
     strict_override: Option<bool>,
 ) -> Result<(UnresolvedQuery, SelectMode)> {
+    // M1b: read-side firewall on user-authored `f:reifies*` IRIs.
+    // The IR-level expansion in `where_plan.rs::expand_edge_annotation_patterns`
+    // is the *only* legitimate way f:reifies* predicates enter the
+    // pattern stream — direct user mention of these IRIs in a query
+    // would expose system facts as ordinary RDF. We reject before
+    // even building the AST so the error message points at the
+    // user's input verbatim.
+    reject_user_authored_reifies_in_query(json)?;
+
     // Use shared counters so nested subqueries can generate unique implicit vars
     // across the full query tree (prevents collisions like ?__s0 between parent/subquery).
     let mut subject_counter: u32 = 0;
@@ -91,6 +100,95 @@ pub(crate) fn parse_query_ast(
         &mut nested_counter,
         strict_override,
     )
+}
+
+/// Reject user-authored `f:reifies*` IRIs anywhere in the query
+/// document. Resolves compact-IRI forms through the document's
+/// `@context` (and any nested per-node `@context`s) before checking,
+/// matching the write-side firewall in
+/// `fluree-db-transact::parse::edge_annotations`.
+fn reject_user_authored_reifies_in_query(json: &JsonValue) -> Result<()> {
+    let top_ctx = json
+        .as_object()
+        .and_then(|m| m.get("@context").or_else(|| m.get("context")))
+        .map(|v| fluree_graph_json_ld::parse_context(&normalize_context_value(v)))
+        .transpose()
+        .map_err(|e| ParseError::InvalidWhere(format!("failed to parse @context: {e}")))?
+        .unwrap_or_else(fluree_graph_json_ld::ParsedContext::new);
+    scan_query_for_reifies_iris(json, &top_ctx)
+}
+
+fn scan_query_for_reifies_iris(
+    value: &JsonValue,
+    context: &fluree_graph_json_ld::ParsedContext,
+) -> Result<()> {
+    use fluree_vocab::reifies_iris;
+    match value {
+        JsonValue::Object(map) => {
+            // Honor per-node `@context` overrides for compact-IRI
+            // resolution.
+            let merged: Option<fluree_graph_json_ld::ParsedContext> =
+                if let Some(local) = map.get("@context").or_else(|| map.get("context")) {
+                    Some(
+                        fluree_graph_json_ld::parse_context_with_base(
+                            context,
+                            &normalize_context_value(local),
+                        )
+                        .map_err(|e| {
+                            ParseError::InvalidWhere(format!(
+                                "failed to parse nested @context during firewall scan: {e}"
+                            ))
+                        })?,
+                    )
+                } else {
+                    None
+                };
+            let effective = merged.as_ref().unwrap_or(context);
+
+            for (k, v) in map {
+                if k == "@context" || k == "context" {
+                    continue;
+                }
+                let expanded_key = if k.starts_with('@') {
+                    k.clone()
+                } else {
+                    fluree_graph_json_ld::expand_iri(k, effective)
+                };
+                if reifies_iris::ALL.iter().any(|iri| *iri == expanded_key) {
+                    return Err(ParseError::InvalidWhere(format!(
+                        "'{k}' resolves to a system-controlled predicate '{expanded_key}'; \
+                         use @annotation or @reifies in queries instead"
+                    )));
+                }
+                scan_query_for_reifies_iris(v, effective)?;
+            }
+        }
+        JsonValue::Array(items) => {
+            for item in items {
+                scan_query_for_reifies_iris(item, context)?;
+            }
+        }
+        JsonValue::String(s) => {
+            // Reject `f:reifies*` IRIs appearing as a VALUE — `values`
+            // data, an `@id` reference, or a tuple-form predicate
+            // string — not just as an object KEY. Without this a user
+            // can bind a predicate variable to `f:reifiesSubject` via
+            // `values` and leak the internal bundle through a
+            // `?s ?p ?o` scan (the key-only check sees only the bare
+            // variable `?p`). A legitimate query value never resolves
+            // to one of the seven reserved IRIs, so this cannot reject
+            // real input.
+            let expanded = fluree_graph_json_ld::expand_iri(s, context);
+            if reifies_iris::ALL.iter().any(|iri| *iri == expanded) {
+                return Err(ParseError::InvalidWhere(format!(
+                    "value '{s}' resolves to a system-controlled predicate '{expanded}'; \
+                     use @annotation or @reifies in queries instead"
+                )));
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 fn parse_query_ast_internal(
@@ -157,6 +255,10 @@ fn parse_query_ast_internal(
         )?;
         // LIMIT 1 for efficiency — only need to know if any solution exists
         query.options.limit = Some(1);
+        // ASK returns before `parse_options` runs, so opts that the
+        // executor cares about have to be parsed inline. Currently
+        // just `includeSystemFacts`; extend here as more land.
+        query.options.include_system_facts = options::parse_include_system_facts(obj);
         return Ok((query, SelectMode::Ask));
     }
 
@@ -620,6 +722,9 @@ fn is_aggregate_name(name: &str) -> bool {
             | "sample"
             | "group-concat"
             | "groupconcat"
+            | "collect"
+            | "collect-distinct"
+            | "collectdistinct"
     )
 }
 
@@ -712,7 +817,15 @@ fn parse_select_string(
         }
 
         // Scalar expression with explicit alias — desugars to a BIND.
-        let expr = filter_sexpr::expr_from_sexpr_token(&list[1])?;
+        //
+        // Compound expressions can contain aggregate calls (e.g.
+        // `(as (- (max ?u) (min ?u)) ?spread)`). Each one is hoisted into
+        // `aggregates` with a synthetic output var and the call is rewritten
+        // to reference that var; the surrounding expression then lowers as a
+        // post-aggregation bind via `lower_select_expr_bind`.
+        let mut inner_tok = list[1].clone();
+        hoist_inline_aggregates(&mut inner_tok, aggregates)?;
+        let expr = filter_sexpr::expr_from_sexpr_token(&inner_tok)?;
         return Ok(UnresolvedColumn::Computation {
             expr,
             alias: Arc::from(alias),
@@ -814,6 +927,10 @@ fn parse_aggregate_fn_and_input(
                 "variance" => ast::UnresolvedAggregateFn::Variance,
                 "stddev" => ast::UnresolvedAggregateFn::Stddev,
                 "sample" => ast::UnresolvedAggregateFn::Sample,
+                "collect" => ast::UnresolvedAggregateFn::Collect,
+                "collect-distinct" | "collectdistinct" => {
+                    ast::UnresolvedAggregateFn::CollectDistinct
+                }
                 other => return Err(ParseError::UnknownAggregate(other.to_string())),
             };
             if args.len() != 1 {
@@ -834,6 +951,66 @@ fn parse_aggregate_fn_and_input(
     }
 
     Ok((function, input.to_string()))
+}
+
+/// Walk a SELECT-clause S-expression token tree, hoisting any nested
+/// aggregate call out into `aggregates` and rewriting the call to an atom
+/// that references the synthetic output variable.
+///
+/// Used by `parse_select_string` so a compound expression like
+/// `(- (max ?u) (min ?u))` becomes `(- ?__inline_agg_0 ?__inline_agg_1)`
+/// with two `UnresolvedAggregateSpec`s pushed onto `aggregates`. Lowering
+/// then routes the surrounding expression to `post_binds` because the
+/// synthetic vars appear in the aggregate-output set.
+///
+/// Identical aggregates (same function + same input) dedupe to one output
+/// var via the `seen` map keyed by `"fn|input"`.
+fn hoist_inline_aggregates(
+    tok: &mut sexpr_tokenize::SexprToken,
+    aggregates: &mut Vec<ast::UnresolvedAggregateSpec>,
+) -> Result<()> {
+    hoist_inline_aggregates_inner(tok, aggregates, &mut HashMap::new())
+}
+
+fn hoist_inline_aggregates_inner(
+    tok: &mut sexpr_tokenize::SexprToken,
+    aggregates: &mut Vec<ast::UnresolvedAggregateSpec>,
+    seen: &mut HashMap<String, Arc<str>>,
+) -> Result<()> {
+    use sexpr_tokenize::SexprToken;
+
+    let SexprToken::List(items) = tok else {
+        return Ok(());
+    };
+
+    // If this list is itself an aggregate call, hoist it whole.
+    if let Some(SexprToken::Atom(name)) = items.first() {
+        let head = name.to_lowercase();
+        if is_aggregate_name(&head) {
+            let (function, input_var) = parse_aggregate_fn_and_input(&head, &items[1..])?;
+            let output_var = seen
+                .entry(format!("{head}|{input_var}"))
+                .or_insert_with(|| {
+                    let name: Arc<str> = Arc::from(format!("?__inline_agg_{}", aggregates.len()));
+                    aggregates.push(ast::UnresolvedAggregateSpec {
+                        function,
+                        input_var: Arc::from(input_var),
+                        output_var: name.clone(),
+                    });
+                    name
+                })
+                .clone();
+            *tok = SexprToken::Atom(output_var.to_string());
+            return Ok(());
+        }
+    }
+
+    // Otherwise recurse into children. A nested aggregate inside an arithmetic
+    // or function call gets rewritten in place.
+    for child in items {
+        hoist_inline_aggregates_inner(child, aggregates, seen)?;
+    }
+    Ok(())
 }
 
 /// Parse a hydration object like `{"?person": ["*", {"ex:friend": ["*"]}]}`.
@@ -3253,22 +3430,16 @@ mod tests {
         let encoder = encode::MemoryEncoder::with_common_namespaces();
         let query = parse_query(&json, &encoder, &mut vars, None).unwrap();
 
+        let agg = query
+            .grouping
+            .as_ref()
+            .and_then(|g| g.aggregation())
+            .expect("aggregation phase present");
         // One aggregate, one post-aggregation BIND.
-        let aggregates: Vec<_> = query
-            .grouping
-            .as_ref()
-            .map(|g| g.aggregates().collect())
-            .unwrap_or_default();
-        assert_eq!(aggregates.len(), 1);
-        let post_binds = query
-            .grouping
-            .as_ref()
-            .and_then(crate::ir::Grouping::aggregation)
-            .map(|agg| agg.binds.as_slice())
-            .unwrap_or(&[]);
-        assert_eq!(post_binds.len(), 1);
+        assert_eq!(agg.aggregates.len(), 1);
+        assert_eq!(agg.binds.len(), 1);
         let adjusted_var = vars.get("?adjusted").expect("?adjusted registered");
-        assert_eq!(post_binds[0].0, adjusted_var);
+        assert_eq!(agg.binds[0].0, adjusted_var);
     }
 
     #[test]
@@ -3416,24 +3587,18 @@ mod tests {
         let query = parse_query(&json, &encoder, &mut vars, None).unwrap();
 
         // One aggregate, two post-aggregation BINDs (in select order).
-        let aggregates: Vec<_> = query
+        let agg = query
             .grouping
             .as_ref()
-            .map(|g| g.aggregates().collect())
-            .unwrap_or_default();
-        assert_eq!(aggregates.len(), 1);
-        let post_binds = query
-            .grouping
-            .as_ref()
-            .and_then(crate::ir::Grouping::aggregation)
-            .map(|agg| agg.binds.as_slice())
-            .unwrap_or(&[]);
-        assert_eq!(post_binds.len(), 2);
+            .and_then(|g| g.aggregation())
+            .expect("aggregation phase present");
+        assert_eq!(agg.aggregates.len(), 1);
+        assert_eq!(agg.binds.len(), 2);
 
         let adjusted_var = vars.get("?adjusted").expect("?adjusted registered");
         let again_var = vars.get("?again").expect("?again registered");
-        assert_eq!(post_binds[0].0, adjusted_var);
-        assert_eq!(post_binds[1].0, again_var);
+        assert_eq!(agg.binds[0].0, adjusted_var);
+        assert_eq!(agg.binds[1].0, again_var);
 
         // No leaked Pattern::Bind for these — they must NOT have been
         // pre-aggregation.
@@ -3779,5 +3944,476 @@ mod tests {
                 .expect("every column should be a hydration");
             assert_eq!(spec.depth, 2);
         }
+    }
+
+    // ---- Edge annotations (M0 parser surface) ----
+
+    #[test]
+    fn test_parse_edge_annotation_inline() {
+        // Canonical inline form: @annotation block on the object node-map.
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": ["?person", "?org", "?role"],
+            "where": {
+                "@id": "?person",
+                "ex:worksFor": {
+                    "@id": "?org",
+                    "@annotation": { "ex:role": "?role" }
+                }
+            }
+        });
+
+        let (ast, _) = parse_query_ast(&json, None).unwrap();
+        assert_eq!(ast.patterns.len(), 1, "expected one EdgeAnnotation pattern");
+
+        match &ast.patterns[0] {
+            UnresolvedPattern::EdgeAnnotation { edge, body, .. } => {
+                // Base edge: ?person ex:worksFor ?org
+                assert!(
+                    matches!(&edge.s, UnresolvedTerm::Var(v) if v.as_ref() == "?person"),
+                    "subject should be ?person"
+                );
+                assert!(
+                    matches!(&edge.p, UnresolvedTerm::Iri(p) if p.as_ref() == "http://example.org/worksFor"),
+                    "predicate should be ex:worksFor"
+                );
+                assert!(
+                    matches!(&edge.o, UnresolvedTerm::Var(v) if v.as_ref() == "?org"),
+                    "object should be ?org"
+                );
+                assert_eq!(body.len(), 1, "body should have one triple for ex:role");
+            }
+            other => panic!("expected EdgeAnnotation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_edge_alias_normalizes_to_annotation() {
+        // `@edge` is an alias for `@annotation` and should produce the same IR.
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": ["?person", "?org", "?role"],
+            "where": {
+                "@id": "?person",
+                "ex:worksFor": {
+                    "@id": "?org",
+                    "@edge": { "ex:role": "?role" }
+                }
+            }
+        });
+
+        let (ast, _) = parse_query_ast(&json, None).unwrap();
+        assert!(matches!(
+            &ast.patterns[0],
+            UnresolvedPattern::EdgeAnnotation { .. }
+        ));
+    }
+
+    #[test]
+    fn test_parse_annotation_target_via_reifies() {
+        // Annotation-rooted form: @reifies names the base triple, the
+        // surrounding map describes the annotation.
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": ["?person", "?org", "?since"],
+            "where": {
+                "ex:role": "Engineer",
+                "ex:since": "?since",
+                "@reifies": {
+                    "@id": "?person",
+                    "ex:worksFor": { "@id": "?org" }
+                }
+            }
+        });
+
+        let (ast, _) = parse_query_ast(&json, None).unwrap();
+        assert_eq!(ast.patterns.len(), 1);
+        match &ast.patterns[0] {
+            UnresolvedPattern::AnnotationTarget {
+                annotation,
+                edge,
+                body,
+            } => {
+                // Anonymous annotation → synthetic var.
+                assert!(
+                    matches!(annotation, UnresolvedTerm::Var(v) if v.as_ref().starts_with("?__ann")),
+                    "anonymous annotation should mint a synthetic var"
+                );
+                // Base edge: ?person ex:worksFor ?org
+                assert!(matches!(&edge.s, UnresolvedTerm::Var(v) if v.as_ref() == "?person"));
+                assert!(
+                    matches!(&edge.p, UnresolvedTerm::Iri(p) if p.as_ref() == "http://example.org/worksFor")
+                );
+                assert!(matches!(&edge.o, UnresolvedTerm::Var(v) if v.as_ref() == "?org"));
+                // Body: 2 facts about the annotation (ex:role, ex:since).
+                assert_eq!(body.len(), 2, "body should have ex:role + ex:since");
+            }
+            other => panic!("expected AnnotationTarget, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_annotation_target_named_subject() {
+        // Explicit @id on the annotation surrounding map names the
+        // annotation subject.
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": ["?ann"],
+            "where": {
+                "@id": "?ann",
+                "ex:role": "Engineer",
+                "@reifies": {
+                    "@id": "?person",
+                    "ex:worksFor": { "@id": "?org" }
+                }
+            }
+        });
+
+        let (ast, _) = parse_query_ast(&json, None).unwrap();
+        assert_eq!(ast.patterns.len(), 1);
+        match &ast.patterns[0] {
+            UnresolvedPattern::AnnotationTarget { annotation, .. } => {
+                assert!(matches!(annotation, UnresolvedTerm::Var(v) if v.as_ref() == "?ann"));
+            }
+            other => panic!("expected AnnotationTarget, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_edge_annotation_explicit_id() {
+        // Explicit @id on the @annotation block should be carried through
+        // as the annotation subject.
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": ["?ann", "?role"],
+            "where": {
+                "@id": "?person",
+                "ex:worksFor": {
+                    "@id": "?org",
+                    "@annotation": {
+                        "@id": "?ann",
+                        "ex:role": "?role"
+                    }
+                }
+            }
+        });
+
+        let (ast, _) = parse_query_ast(&json, None).unwrap();
+        match &ast.patterns[0] {
+            UnresolvedPattern::EdgeAnnotation { annotation, .. } => {
+                assert!(matches!(annotation, UnresolvedTerm::Var(v) if v.as_ref() == "?ann"));
+            }
+            other => panic!("expected EdgeAnnotation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_rejects_both_annotation_and_edge() {
+        // Cannot use both keys on the same object node.
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": ["?role"],
+            "where": {
+                "@id": "?person",
+                "ex:worksFor": {
+                    "@id": "?org",
+                    "@annotation": { "ex:role": "?role" },
+                    "@edge":       { "ex:role": "?role" }
+                }
+            }
+        });
+
+        let err = parse_query_ast(&json, None).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("@annotation") && msg.contains("@edge"),
+            "error should name both keywords: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_parse_rejects_extra_property_alongside_annotation() {
+        // Object node may carry only @id + @annotation/@edge. A free-form
+        // predicate alongside `@annotation` is the deferred shape.
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": ["?role"],
+            "where": {
+                "@id": "?person",
+                "ex:worksFor": {
+                    "@id": "?org",
+                    "ex:other": "?other",
+                    "@annotation": { "ex:role": "?role" }
+                }
+            }
+        });
+
+        let err = parse_query_ast(&json, None).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("ex:other") || msg.contains("extra property"),
+            "error should name the offending property: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_parse_rejects_multi_triple_reifies() {
+        // Multi-triple reifiers are deferred to v2: @reifies must lower
+        // to exactly one triple.
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": ["?role"],
+            "where": {
+                "ex:role": "?role",
+                "@reifies": {
+                    "@id": "?s",
+                    "ex:worksFor": { "@id": "?o" },
+                    "ex:since": "?since"
+                }
+            }
+        });
+
+        let err = parse_query_ast(&json, None).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("exactly one") || msg.contains("multi-triple") || msg.contains("deferred"),
+            "error should explain the multi-triple reifier deferral: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_parse_rejects_user_authored_full_reifies_iri() {
+        // The read-side firewall mirrors the write side: user-authored
+        // `f:reifies*` IRIs (full or compact) are system-controlled and
+        // cannot be queried directly.
+        let json = json!({
+            "select": ["?s"],
+            "where": {
+                "@id": "?ann",
+                "https://ns.flur.ee/db#reifiesSubject": "?s"
+            }
+        });
+        let err = parse_query_ast(&json, None).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("system-controlled") && msg.contains("reifiesSubject"),
+            "expected system-controlled rejection: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_parse_rejects_user_authored_compact_reifies_iri() {
+        // Compact form via `@context` is also blocked.
+        let json = json!({
+            "@context": { "f": "https://ns.flur.ee/db#" },
+            "select": ["?s"],
+            "where": {
+                "@id": "?ann",
+                "f:reifiesPredicate": "?p"
+            }
+        });
+        let err = parse_query_ast(&json, None).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("system-controlled") && msg.contains("reifiesPredicate"),
+            "expected system-controlled rejection: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_parse_lowers_literal_value_object_with_annotation_to_edge_annotation() {
+        // RDF 1.2: literal-valued objects may carry `@annotation`. The
+        // parser routes through `parse_literal_edge_annotation` and
+        // emits a `Pattern::EdgeAnnotation` with the base edge's
+        // `dtc` set so the scan matches the literal by exact datatype.
+        let json = json!({
+            "@context": {
+                "ex": "http://example.org/",
+                "xsd": "http://www.w3.org/2001/XMLSchema#"
+            },
+            "select": ["?since"],
+            "where": {
+                "@id": "?person",
+                "ex:joinedAt": {
+                    "@value": "?since",
+                    "@type": "xsd:date",
+                    "@annotation": { "ex:source": "?source" }
+                }
+            }
+        });
+
+        let (ast, _) = parse_query_ast(&json, None).unwrap();
+        match &ast.patterns[0] {
+            UnresolvedPattern::EdgeAnnotation { edge, body, .. } => {
+                assert!(
+                    edge.dtc.is_some(),
+                    "literal base edge must carry a dtc; got {:?}",
+                    edge.dtc
+                );
+                assert_eq!(body.len(), 1, "one annotation body entry");
+            }
+            other => panic!("expected UnresolvedPattern::EdgeAnnotation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_rejects_stray_property_on_annotated_literal_value_object() {
+        // Mirror of the ref-object path's "extra property alongside
+        // @annotation is deferred" rejection. Without this, the stray
+        // `ex:other` would be silently dropped by parse_value_object.
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": ["?x"],
+            "where": {
+                "@id": "?s",
+                "ex:name": {
+                    "@value": "Alice",
+                    "ex:other": "?x",
+                    "@annotation": { "ex:source": "hr" }
+                }
+            }
+        });
+        let err = parse_query_ast(&json, None).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("extra property 'ex:other'") && msg.contains("literal value object"),
+            "expected literal stray-key deferral, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_parse_rejects_metadata_bindings_combined_with_literal_annotation() {
+        // `@type: "?dt"` and `@annotation` in the same value object is
+        // an unsupported combination — the BIND for ?dt would need to
+        // sit inside the EdgeAnnotation's base-edge slot, which has
+        // no shape for it. Reject explicitly so the user splits the
+        // metadata binding into a separate triple.
+        let json = json!({
+            "@context": {
+                "ex": "http://example.org/",
+                "xsd": "http://www.w3.org/2001/XMLSchema#"
+            },
+            "select": ["?since", "?dt"],
+            "where": {
+                "@id": "?person",
+                "ex:joinedAt": {
+                    "@value": "?since",
+                    "@type": "?dt",
+                    "@annotation": { "ex:source": "?source" }
+                }
+            }
+        });
+        let err = parse_query_ast(&json, None).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("metadata-binding extensions"),
+            "expected metadata-binding deferral, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_parse_lowers_literal_value_object_with_edge_alias_to_edge_annotation() {
+        // Same path via the `@edge` alias keyword.
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": ["?val"],
+            "where": {
+                "@id": "?s",
+                "ex:label": {
+                    "@value": "?val",
+                    "@edge": { "ex:lang": "en" }
+                }
+            }
+        });
+
+        let (ast, _) = parse_query_ast(&json, None).unwrap();
+        assert!(matches!(
+            ast.patterns[0],
+            UnresolvedPattern::EdgeAnnotation { .. }
+        ));
+    }
+
+    #[test]
+    fn test_parse_edge_annotation_honors_id_alias() {
+        // `"id": "@id"` in @context should make `"id"` a valid alias
+        // for `@id` everywhere — including inside annotation node-maps.
+        let json = json!({
+            "@context": { "ex": "http://example.org/", "id": "@id" },
+            "select": ["?ann", "?role"],
+            "where": {
+                "id": "?person",
+                "ex:worksFor": {
+                    "id": "?org",
+                    "@annotation": {
+                        "id": "?ann",
+                        "ex:role": "?role"
+                    }
+                }
+            }
+        });
+
+        let (ast, _) = parse_query_ast(&json, None).unwrap();
+        match &ast.patterns[0] {
+            UnresolvedPattern::EdgeAnnotation {
+                edge,
+                annotation,
+                body,
+            } => {
+                // Aliased @id on the surrounding subject + nested object
+                // both resolve to user-named variables (not synthetic).
+                assert!(
+                    matches!(&edge.s, UnresolvedTerm::Var(v) if v.as_ref() == "?person"),
+                    "aliased @id on the surrounding subject should resolve to ?person"
+                );
+                assert!(
+                    matches!(&edge.o, UnresolvedTerm::Var(v) if v.as_ref() == "?org"),
+                    "aliased @id on the nested object should resolve to ?org"
+                );
+                // Aliased @id on the annotation block resolves to ?ann.
+                assert!(
+                    matches!(annotation, UnresolvedTerm::Var(v) if v.as_ref() == "?ann"),
+                    "aliased @id on the annotation block should resolve to ?ann"
+                );
+                // The aliased @id on the annotation block must NOT be
+                // re-emitted as a body triple ("id" → ?ann).
+                assert_eq!(
+                    body.len(),
+                    1,
+                    "aliased @id on annotation must be skipped, not re-emitted as a body triple"
+                );
+            }
+            other => panic!("expected EdgeAnnotation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_rejects_nested_annotation_in_body() {
+        // Annotation-of-annotation is deferred. The body of an
+        // `@annotation` block cannot itself carry `@annotation`.
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": ["?role"],
+            "where": {
+                "@id": "?person",
+                "ex:worksFor": {
+                    "@id": "?org",
+                    "@annotation": {
+                        "ex:role": {
+                            "@id": "?role",
+                            "@annotation": { "ex:nested": "?n" }
+                        }
+                    }
+                }
+            }
+        });
+
+        let err = parse_query_ast(&json, None).unwrap_err();
+        let msg = err.to_string();
+        // Any of these substrings is acceptable as long as something
+        // identifies this as the annotation-of-annotation case.
+        assert!(
+            msg.contains("annotation") && msg.contains("deferred"),
+            "error should explain the annotation-of-annotation deferral: {msg}"
+        );
     }
 }

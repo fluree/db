@@ -25,8 +25,10 @@ mod fulltext;
 mod geo;
 mod hash;
 mod helpers;
+mod list;
 mod logical;
 mod numeric;
+mod path;
 mod rdf;
 mod string;
 mod types;
@@ -35,6 +37,7 @@ mod value;
 mod vector;
 pub mod vector_math;
 
+pub(crate) use helpers::build_regex_with_flags;
 pub use helpers::PreparedBoolExpression;
 pub use value::{ArithmeticError, ComparableValue, ComparisonError, NullValueError};
 
@@ -174,6 +177,10 @@ impl Expression {
                     debug_assert!(false, "Grouped binding in filter evaluation");
                     Ok(None)
                 }
+                // A path or list is not a scalar — no comparable value. The
+                // relevant functions (`length`, `size`/`head`/…) read the
+                // binding directly via dispatch / the binding-producing path.
+                Some(Binding::Path(_) | Binding::List(_)) => Ok(None),
             },
 
             // FlakeValue::Null is the only variant TryFrom rejects (with
@@ -247,6 +254,25 @@ impl Expression {
         row: &R,
         ctx: Option<&ExecutionContext<'_>>,
     ) -> Result<Binding> {
+        // A bare variable may hold a `List` binding, which can't round-trip
+        // through `ComparableValue` (it would collapse to Unbound). Return it
+        // directly so `UNWIND ?listVar` and the collect→unwind round-trip
+        // preserve the list. Scalars fall through to the comparable path so
+        // their normalization is unchanged.
+        if let Expression::Var(v) = self {
+            if let Some(b @ Binding::List(_)) = row.get(*v) {
+                return Ok(b.clone());
+            }
+        }
+
+        // List-*returning* functions (tail, list-reverse) and list literals
+        // can't be a `ComparableValue` — evaluate them straight to a `Binding`.
+        if let Expression::Call { func, args } = self {
+            if let Some(binding) = list::eval_list_fn_to_binding(func, args, row, ctx)? {
+                return Ok(binding);
+            }
+        }
+
         let comparable = match self.eval_to_comparable(row, ctx) {
             Ok(Some(val)) => val,
             Ok(None) => {

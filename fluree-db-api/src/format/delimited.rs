@@ -258,7 +258,7 @@ fn resolve_select_vars(result: &QueryResult) -> Vec<VarId> {
                 b.schema()
                     .iter()
                     .copied()
-                    .filter(|&vid| !result.vars.name(vid).starts_with("?__"))
+                    .filter(|&vid| !super::is_internal_var_name(result.vars.name(vid)))
                     .map(|vid| {
                         let name = result
                             .vars
@@ -275,7 +275,7 @@ fn resolve_select_vars(result: &QueryResult) -> Vec<VarId> {
                 result
                     .vars
                     .iter()
-                    .filter(|(name, _)| !name.starts_with("?__"))
+                    .filter(|(name, _)| !super::is_internal_var_name(name))
                     .map(|(name, vid)| {
                         let stripped = name.strip_prefix('?').unwrap_or(name).to_string();
                         (stripped, vid)
@@ -386,8 +386,7 @@ fn write_binding_cell(
         }
         Binding::EncodedSid { s_id, .. } => {
             let gv = require_graph_view(gv)?;
-            let store = gv.store();
-            let iri = store.resolve_subject_iri(*s_id).map_err(|e| {
+            let iri = gv.resolve_subject_iri(*s_id).map_err(|e| {
                 FormatError::InvalidBinding(format!(
                     "Failed to resolve subject IRI for s_id {s_id}: {e}"
                 ))
@@ -417,15 +416,21 @@ fn write_binding_cell(
             let gv = require_graph_view(gv)?;
             let store = gv.store();
             if *o_kind == ObjKind::LEX_ID.as_u8() || *o_kind == ObjKind::JSON_ID.as_u8() {
-                store
-                    .write_string_value_bytes(*o_key as u32, cell)
-                    .map_err(|e| {
-                        FormatError::InvalidBinding(format!(
-                            "Failed to resolve string (kind={o_kind}, key={o_key}): {e}"
-                        ))
-                    })?;
+                // Zero-copy persisted lookup first; novelty string IDs sit above
+                // the pack watermark so the store lookup fails cleanly (without
+                // writing) and the novelty-aware decode takes over.
+                if store.write_string_value_bytes(*o_key as u32, cell).is_err() {
+                    let val = gv
+                        .decode_value_from_kind(*o_kind, *o_key, *p_id, *dt_id, *lang_id)
+                        .map_err(|e| {
+                            FormatError::InvalidBinding(format!(
+                                "Failed to resolve string (kind={o_kind}, key={o_key}): {e}"
+                            ))
+                        })?;
+                    write_flake_value(cell, &val, compactor);
+                }
             } else if *o_kind == ObjKind::REF_ID.as_u8() {
-                let iri = store.resolve_subject_iri(*o_key).map_err(|e| {
+                let iri = gv.resolve_subject_iri(*o_key).map_err(|e| {
                     FormatError::InvalidBinding(format!(
                         "Failed to resolve ref IRI for s_id {o_key}: {e}"
                     ))
@@ -445,6 +450,24 @@ fn write_binding_cell(
         }
         Binding::Grouped(values) => {
             // Semicolon-separate for pragmatic consumption.
+            for (j, val) in values.iter().enumerate() {
+                if j > 0 {
+                    cell.push(b';');
+                }
+                write_binding_cell(cell, val, compactor, gv)?;
+            }
+        }
+        // A path: arrow-separated node IRIs for pragmatic consumption.
+        Binding::Path(nodes) => {
+            for (j, sid) in nodes.iter().enumerate() {
+                if j > 0 {
+                    cell.extend_from_slice(b"->");
+                }
+                write_compacted_sid(cell, compactor, sid)?;
+            }
+        }
+        // A list: semicolon-separated elements (mirrors Grouped).
+        Binding::List(values) => {
             for (j, val) in values.iter().enumerate() {
                 if j > 0 {
                     cell.push(b';');
@@ -502,7 +525,7 @@ fn write_flake_value(cell: &mut Vec<u8>, val: &FlakeValue, compactor: &IriCompac
         }
         FlakeValue::Null => {}
         FlakeValue::BigInt(n) => cell.extend_from_slice(n.to_string().as_bytes()),
-        FlakeValue::Decimal(d) => cell.extend_from_slice(d.to_string().as_bytes()),
+        FlakeValue::Decimal(d) => cell.extend_from_slice(d.to_plain_string().as_bytes()),
         FlakeValue::DateTime(dt) => cell.extend_from_slice(dt.to_string().as_bytes()),
         FlakeValue::Date(d) => cell.extend_from_slice(d.to_string().as_bytes()),
         FlakeValue::Time(t) => cell.extend_from_slice(t.to_string().as_bytes()),

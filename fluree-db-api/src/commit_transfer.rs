@@ -18,8 +18,9 @@
 //! Pages walk backward via `parents` — O(limit) per page regardless of
 //! ledger size. Used by pull and clone operations.
 
-use crate::dataset::QueryConnectionOptions;
+use crate::dataset::GovernanceOptions;
 use crate::error::{ApiError, Result};
+use crate::ledger_manager::LedgerWriteGuard;
 use crate::policy_builder::build_policy_context_from_opts;
 use crate::tx::{IndexingMode, IndexingStatus};
 use crate::{Fluree, IndexConfig, LedgerHandle};
@@ -33,7 +34,7 @@ use fluree_db_core::{
 use fluree_db_core::{RangeMatch, RangeOptions, RangeTest, Storage};
 use fluree_db_core::{CODEC_FLUREE_COMMIT, CODEC_FLUREE_TXN};
 use fluree_db_ledger::LedgerState;
-use fluree_db_nameservice::{CasResult, RefKind, RefValue};
+use fluree_db_nameservice::{CasResult, NsRecordSnapshot, RefKind, RefValue};
 use fluree_db_novelty::{generate_commit_flakes, stamp_graph_on_commit_flakes, Novelty};
 use fluree_db_policy::PolicyContext;
 use serde::{Deserialize, Serialize};
@@ -51,6 +52,118 @@ impl Base64Bytes {
     pub fn into_inner(self) -> Vec<u8> {
         self.0
     }
+}
+
+/// Per-frame payload ceiling used when decoding a `.flpack` during restore.
+///
+/// Each data frame carries one whole CAS object (commit, dict pack, index
+/// leaf). The indexer packs dictionaries to a 256 MiB *target*
+/// (`DEFAULT_RUN_BUDGET_BYTES`), so a pack legitimately lands a little over
+/// 256 MiB once the last entry tips it across — which collides exactly with
+/// the conservative pull-path default (`DEFAULT_MAX_PAYLOAD`, also 256 MiB) and
+/// makes the archive's producer emit frames its own reader would refuse.
+///
+/// Restore reads a trusted, admin-supplied archive and SHA-256-verifies every
+/// frame, and the frame length is a `u32` (the real format bound), so the cap
+/// here is only a sanity ceiling against a corrupt length field — not a
+/// security boundary. 1 GiB sits 4× above the dict target: it absorbs the
+/// last-entry overshoot (and modest operator increases to the run budget)
+/// without re-breaking on the next larger ledger, while still bounding how far
+/// the streaming reader will buffer for a single malformed frame.
+const RESTORE_MAX_FRAME_PAYLOAD: u32 = 1024 * 1024 * 1024;
+
+/// Maximum number of CAS object writes a restore keeps in flight at once.
+///
+/// A `.flpack` for a large ledger holds tens of thousands of CAS objects
+/// (e.g. DBLP: ~74k index artifacts). Writing them one-at-a-time makes the
+/// restore wall-clock the *sum* of per-object storage round-trips — minutes of
+/// pure latency on a remote backend like S3, enough to blow a serverless time
+/// budget. Decoding stays sequential (it is CPU-cheap); the slow per-object
+/// writes are dispatched into a bounded pool so they overlap. 32 is a balance
+/// between latency-hiding and not exhausting the backend's connection pool.
+const RESTORE_MAX_WRITES_IN_FLIGHT: usize = 32;
+
+/// Maximum total bytes of pending write payloads held in memory at once.
+///
+/// The concurrency pool also bounds by bytes so a burst of large objects (a
+/// 256 MiB–1 GiB dictionary pack) can't balloon memory. Small objects (the
+/// common case) parallelize up to [`RESTORE_MAX_WRITES_IN_FLIGHT`]; large ones
+/// throttle here instead. A single object larger than this cap is still
+/// admitted once the pool drains, so it never deadlocks.
+const RESTORE_MAX_BYTES_IN_FLIGHT: usize = 512 * 1024 * 1024;
+
+/// Summary of a `.flpack` restore — the import counterpart of
+/// [`Fluree::archive_ledger`]'s [`crate::pack::PackStreamResult`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RestoreResult {
+    /// Name the ledger was restored under (independent of the source name).
+    pub ledger_id: String,
+    /// Commit blobs ingested.
+    pub commits: usize,
+    /// Transaction blobs ingested.
+    pub txn_blobs: usize,
+    /// Index artifact blobs ingested (0 for a commits-only archive).
+    pub index_artifacts: usize,
+    /// `t` the restored commit head was set to.
+    pub commit_t: i64,
+    /// `t` the restored index head was set to, when the archive carried one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub index_t: Option<i64>,
+}
+
+/// Verify a single CAS object from a `.flpack` data frame and write it to
+/// storage under `ledger_id`.
+///
+/// Mirrors the integrity rules the pull path uses: a commit-v2 blob hashes
+/// over its canonical sub-range (so the digest is derived via
+/// `verify_commit_blob`), while every other content kind is a full-bytes
+/// SHA-256 verified against the CID. Reimplemented here (rather than reusing
+/// `fluree-db-nameservice-sync::ingest_pack_frame`) so the API lib does not
+/// pull that crate's `reqwest` tree out of dev-dependencies.
+async fn ingest_cas_object<S: ContentAddressedWrite>(
+    storage: &S,
+    cid: &ContentId,
+    bytes: &[u8],
+    ledger_id: &str,
+) -> Result<()> {
+    use fluree_db_core::commit::codec::verify_commit_blob;
+
+    let kind = cid
+        .content_kind()
+        .ok_or_else(|| ApiError::http(400, format!("unknown content kind for CID {cid}")))?;
+
+    let is_commit_v2 = cid.codec() == CODEC_FLUREE_COMMIT && bytes.starts_with(b"FCV2");
+    let integrity_ok = if is_commit_v2 {
+        verify_commit_blob(bytes)
+            .map(|d| d == *cid)
+            .unwrap_or(false)
+    } else {
+        cid.verify(bytes)
+    };
+    if !integrity_ok {
+        return Err(ApiError::http(
+            400,
+            format!("integrity check failed for {cid}"),
+        ));
+    }
+
+    // Commit-v2 blobs persist under their canonical (sub-range) digest; all
+    // other kinds use the CID digest directly.
+    let digest_hex = if kind == ContentKind::Commit {
+        verify_commit_blob(bytes)
+            .map(|d| d.digest_hex())
+            .map_err(|e| {
+                ApiError::internal(format!("failed to derive commit digest for {cid}: {e}"))
+            })?
+    } else {
+        cid.digest_hex()
+    };
+
+    storage
+        .content_write_bytes_with_hash(kind, ledger_id, &digest_hex, bytes)
+        .await
+        .map_err(|e| ApiError::internal(format!("failed to write {cid}: {e}")))?;
+    Ok(())
 }
 
 impl Serialize for Base64Bytes {
@@ -105,37 +218,127 @@ pub struct PushedHead {
     pub commit_id: ContentId,
 }
 
-/// Push precomputed commits to a ledger handle (transaction server mode).
+/// Output of [`Fluree::prepare_push`].
+///
+/// Bundles everything the apply phase needs: receipt metadata
+/// (`ledger`, `accepted`, `indexing_status`), the rollback snapshot
+/// for local-mode bookkeeping, the ref endpoints the apply will
+/// advance between (CAS `expected_prev` = `pre_push_head`; new head
+/// = `new_head_*`), the post-push `final_state` to install through
+/// the held write guard, and the write guard itself held across the
+/// build → apply window.
+///
+/// `pending_blobs` is intentionally absent — push writes blobs
+/// inline during the build phase (they're content-addressed by hash
+/// and idempotent), so by the time `apply_push` runs the only thing
+/// left is the single ref advance.
+pub struct StagedPush {
+    /// Target ledger id (`"<name>:<branch>"`).
+    pub ledger: String,
+    /// Number of commits accepted in this push.
+    pub accepted: usize,
+    /// Branch's pre-push head snapshot. The local apply path passes
+    /// this to `RefPublisher::reset_head` to roll back a partial
+    /// publish on apply failure. The Raft apply path ignores it
+    /// (the `AdvanceRef` proposal either applies or doesn't).
+    pub rollback_snapshot: NsRecordSnapshot,
+    /// Branch's pre-push commit head. `expected_prev` for the CAS
+    /// or `AdvanceRef` proposal.
+    pub pre_push_head: RefValue,
+    /// Head ref the apply step advances the branch to (the last
+    /// commit in the push batch).
+    pub new_head_id: ContentId,
+    /// Companion to [`Self::new_head_id`].
+    pub new_head_t: i64,
+    /// Ledger write guard held across build → apply so concurrent
+    /// transactions stay serialized through the apply step. Always
+    /// present (push requires a managed ledger manager).
+    pub write_guard: LedgerWriteGuard,
+    /// Cumulative post-push state. The apply step installs this
+    /// through `write_guard` after the ref advance, so the cache
+    /// catches up with the new head atomically.
+    pub final_state: LedgerState,
+    /// Indexing-needed hint carried through to the receipt and the
+    /// background indexer trigger.
+    pub indexing_status: IndexingStatus,
+}
+
+/// Push precomputed commits to a ledger (transaction server mode).
 ///
 /// This acquires the ledger write mutex for the duration of validation + publish,
 /// so pushes are serialized with normal transactions.
 impl Fluree {
-    pub async fn push_commits_with_handle(
+    pub async fn push_commits(
         &self,
-        handle: &LedgerHandle,
+        ledger_id: &str,
         request: PushCommitsRequest,
-        opts: &QueryConnectionOptions,
+        opts: &GovernanceOptions,
         index_config: &IndexConfig,
     ) -> Result<PushCommitsResponse> {
+        let staged = self
+            .prepare_push(ledger_id, request, opts, index_config)
+            .await?;
+        self.apply_push(staged).await
+    }
+
+    /// Validate and write the push payload up to (but not including)
+    /// the CAS / ref-advance step. Returns a [`StagedPush`] the
+    /// caller can then apply via [`Self::apply_push`] (local
+    /// single-step apply: CAS + cache install) or by proposing a
+    /// single `AdvanceRef` through consensus (Raft path).
+    ///
+    /// The build phase:
+    /// - Acquires the ledger write guard (push requires a managed
+    ///   ledger manager).
+    /// - Decodes + validates the commit chain (strict sequencing,
+    ///   per-commit policy / SHACL / namespace / retraction checks
+    ///   against an evolving novelty overlay).
+    /// - Writes all referenced blobs and commit bytes to the
+    ///   content store. Content-addressed, so writes are idempotent
+    ///   and orphan blobs on failure are GC fodder.
+    /// - Derives the post-push `final_state` and the indexing
+    ///   status hint.
+    ///
+    /// Returns the `StagedPush` with the head endpoints (`pre_push_head`
+    /// as `expected_prev`, `new_head_*` as the target) and the held
+    /// write guard. The apply step performs only the single ref
+    /// advance + cache install.
+    pub async fn prepare_push(
+        &self,
+        ledger_id: &str,
+        request: PushCommitsRequest,
+        opts: &GovernanceOptions,
+        index_config: &IndexConfig,
+    ) -> Result<StagedPush> {
         if request.commits.is_empty() {
             return Err(ApiError::http(400, "missing required field 'commits'"));
         }
 
         // 0) Lock ledger state for write (serialize with transactions).
-        let mut guard = handle.lock_for_write().await;
+        let guard = self
+            .lock_ledger(ledger_id)
+            .await?
+            .ok_or_else(|| ApiError::internal("push requires a ledger manager"))?;
         let mut base_state = guard.clone_state();
 
-        // 1) Read current head ref (CAS expected).
-        let current_ref = self
-            .publisher()?
-            .get_ref(base_state.ledger_id(), RefKind::CommitHead)
-            .await?;
-        let Some(current_ref) = current_ref else {
-            return Err(ApiError::NotFound(format!(
-                "Ledger not found: {}",
-                base_state.ledger_id()
-            )));
+        // 1) Read current head ref (CAS expected). Use the lookup
+        //    surface rather than the publisher's `get_ref` so this
+        //    works in modes where the publisher trait isn't directly
+        //    available (e.g., a Raft state-machine projection where
+        //    writes flow through consensus proposals rather than the
+        //    `RefPublisher` surface).
+        let current_record = self
+            .nameservice()
+            .lookup(base_state.ledger_id())
+            .await?
+            .ok_or_else(|| {
+                ApiError::NotFound(format!("Ledger not found: {}", base_state.ledger_id()))
+            })?;
+        let current_ref = RefValue {
+            id: current_record.commit_head_id.clone(),
+            t: current_record.commit_t,
         };
+        let rollback_snapshot = NsRecordSnapshot::from_record(&current_record);
 
         // 2) Decode commits and preflight strict sequencing.
         let decoded = decode_and_validate_commit_chain(base_state.ledger_id(), &request)
@@ -292,7 +495,9 @@ impl Fluree {
             accepted_all_flakes.push((c.commit.t, all_flakes));
         }
 
-        // 5) Write required blobs and commit bytes to storage (safe before CAS).
+        // 5) Write required blobs and commit bytes to storage. Content
+        //    addressing makes these writes idempotent; orphan blobs on
+        //    a later apply failure are GC fodder.
         let storage = self
             .backend()
             .admin_storage_cloned()
@@ -306,20 +511,74 @@ impl Fluree {
             .map_err(PushError::into_api_error)?;
 
         let final_head = stored_commits.last().expect("non-empty stored_commits");
-        let new_ref = RefValue {
-            id: Some(final_head.commit_id.clone()),
-            t: final_head.t,
+        let new_head_id = final_head.commit_id.clone();
+        let new_head_t = final_head.t;
+        let accepted = decoded.len();
+
+        // 6) Derive the post-push LedgerState. The apply step
+        //    installs it through the held write guard.
+        let mut new_state = apply_pushed_commits_to_state(
+            base_state,
+            &accepted_all_flakes,
+            &decoded,
+            &stored_commits,
+        )
+        .map_err(PushError::into_api_error)?;
+        self.refresh_index(&mut new_state).await?;
+
+        // 7) Compute indexing status from the updated state.
+        let indexing_enabled = self.indexing_mode.is_enabled() && self.defaults_indexing_enabled();
+        let indexing_needed = new_state.should_reindex(index_config);
+        let indexing_status = IndexingStatus {
+            enabled: indexing_enabled,
+            needed: indexing_needed,
+            novelty_size: new_state.novelty_size(),
+            index_t: new_state.index_t(),
+            commit_t: new_head_t,
         };
 
-        // 6) CAS update CommitHead (single CAS, strict).
+        Ok(StagedPush {
+            ledger: ledger_id.to_string(),
+            accepted,
+            rollback_snapshot,
+            pre_push_head: current_ref,
+            new_head_id,
+            new_head_t,
+            write_guard: guard,
+            final_state: new_state,
+            indexing_status,
+        })
+    }
+
+    /// Apply a [`StagedPush`] through the local commit pipeline:
+    /// single CAS to advance the branch HEAD, then install the
+    /// cumulative state through the held write guard and trigger
+    /// background indexing if needed.
+    ///
+    /// Atomic with the build phase: blobs are already content-
+    /// addressed in storage; if the CAS fails, the orphan blobs are
+    /// GC fodder and the ref stays at `pre_push_head`.
+    async fn apply_push(&self, staged: StagedPush) -> Result<PushCommitsResponse> {
+        let StagedPush {
+            ledger,
+            accepted,
+            rollback_snapshot: _,
+            pre_push_head,
+            new_head_id,
+            new_head_t,
+            mut write_guard,
+            final_state,
+            indexing_status,
+        } = staged;
+
+        let new_ref = RefValue {
+            id: Some(new_head_id.clone()),
+            t: new_head_t,
+        };
+
         match self
             .publisher()?
-            .compare_and_set_ref(
-                base_state.ledger_id(),
-                RefKind::CommitHead,
-                Some(&current_ref),
-                &new_ref,
-            )
+            .compare_and_set_ref(&ledger, RefKind::CommitHead, Some(&pre_push_head), &new_ref)
             .await?
         {
             CasResult::Updated => {}
@@ -328,65 +587,32 @@ impl Fluree {
                     409,
                     format!(
                         "commit head changed during push (expected t={}, actual={:?})",
-                        current_ref.t, actual
+                        pre_push_head.t, actual
                     ),
                 ));
             }
         }
 
-        // 7) Update in-memory ledger state (now committed).
-        let new_state = apply_pushed_commits_to_state(
-            base_state,
-            &accepted_all_flakes,
-            &decoded,
-            &stored_commits,
-        )
-        .map_err(PushError::into_api_error)?;
-
-        let mut new_state = new_state;
-        if crate::ns_helpers::binary_store_missing_snapshot_namespaces(&new_state) {
-            let cache_dir = self.binary_store_cache_dir();
-            // Result unused: load_and_attach mutates new_state in-place
-            let _store = crate::ledger_manager::load_and_attach_binary_store(
-                self.backend(),
-                self.nameservice(),
-                &mut new_state,
-                &cache_dir,
-                Some(std::sync::Arc::clone(self.leaflet_cache())),
-            )
-            .await?;
-        }
-
-        // 8) Compute indexing status from the updated state.
-        let indexing_enabled = self.indexing_mode.is_enabled() && self.defaults_indexing_enabled();
-        let indexing_needed = new_state.should_reindex(index_config);
-
-        let indexing_status = IndexingStatus {
-            enabled: indexing_enabled,
-            needed: indexing_needed,
-            novelty_size: new_state.novelty_size(),
-            index_t: new_state.index_t(),
-            commit_t: final_head.t,
-        };
-
         // Sync binary_store BEFORE replacing state so that concurrent readers
         // (via snapshot()) never see the new state with a stale binary_store.
-        handle.sync_binary_store_from_state(&new_state).await;
-        guard.replace(new_state);
+        write_guard
+            .ledger()
+            .sync_binary_store_from_state(&final_state)
+            .await;
+        write_guard.replace(final_state);
 
-        // 9) Trigger background indexing if enabled and needed.
-        if let IndexingMode::Background(idx_handle) = &self.indexing_mode {
-            if indexing_enabled && indexing_needed {
-                idx_handle.trigger(handle.ledger_id(), final_head.t).await;
+        if indexing_status.enabled && indexing_status.needed {
+            if let IndexingMode::Background(idx_handle) = &self.indexing_mode {
+                idx_handle.trigger(&ledger, new_head_t).await;
             }
         }
 
         Ok(PushCommitsResponse {
-            ledger: handle.ledger_id().to_string(),
-            accepted: decoded.len(),
+            ledger,
+            accepted,
             head: PushedHead {
-                t: final_head.t,
-                commit_id: final_head.commit_id.clone(),
+                t: new_head_t,
+                commit_id: new_head_id,
             },
             indexing: indexing_status,
         })
@@ -444,6 +670,7 @@ struct GraphRoutingResult {
     /// (unresolved) graphs are intentionally omitted — no per-graph config can
     /// exist for a graph that isn't yet known to the store, so those fall back
     /// to the ledger-wide SHACL baseline.
+    #[cfg(feature = "shacl")]
     graph_iris: rustc_hash::FxHashMap<GraphId, String>,
 }
 
@@ -467,6 +694,7 @@ fn derive_graph_routing(state: &LedgerState, flakes: &[&Flake]) -> GraphRoutingR
     if graph_sids_set.is_empty() {
         return GraphRoutingResult {
             graph_sids: HashMap::new(),
+            #[cfg(feature = "shacl")]
             graph_iris: rustc_hash::FxHashMap::default(),
         };
     }
@@ -477,6 +705,7 @@ fn derive_graph_routing(state: &LedgerState, flakes: &[&Flake]) -> GraphRoutingR
         .and_then(|te| Arc::clone(&te.0).downcast::<BinaryIndexStore>().ok());
 
     let mut result: HashMap<GraphId, Sid> = HashMap::new();
+    #[cfg(feature = "shacl")]
     let mut graph_iris: rustc_hash::FxHashMap<GraphId, String> = rustc_hash::FxHashMap::default();
     let mut max_g_id: GraphId = 1; // 0=default, 1=txn-meta
     let mut unresolved: Vec<Sid> = Vec::new();
@@ -502,7 +731,10 @@ fn derive_graph_routing(state: &LedgerState, flakes: &[&Flake]) -> GraphRoutingR
         if let Some((g_id, iri)) = resolved {
             max_g_id = max_g_id.max(g_id);
             result.insert(g_id, g_sid.clone());
+            #[cfg(feature = "shacl")]
             graph_iris.insert(g_id, iri);
+            #[cfg(not(feature = "shacl"))]
+            drop(iri);
         } else {
             unresolved.push(g_sid.clone());
         }
@@ -517,6 +749,7 @@ fn derive_graph_routing(state: &LedgerState, flakes: &[&Flake]) -> GraphRoutingR
 
     GraphRoutingResult {
         graph_sids: result,
+        #[cfg(feature = "shacl")]
         graph_iris,
     }
 }
@@ -654,7 +887,7 @@ async fn build_policy_ctx_for_push(
     base: &LedgerState,
     evolving: &Novelty,
     current_t: i64,
-    opts: &QueryConnectionOptions,
+    opts: &GovernanceOptions,
 ) -> Result<PolicyContext> {
     // Build policy context from opts against current state (db + evolving novelty).
     build_policy_context_from_opts(
@@ -1041,7 +1274,7 @@ impl Fluree {
             .unwrap_or(EXPORT_DEFAULT_LIMIT)
             .min(EXPORT_MAX_LIMIT);
 
-        let ledger_id = handle.ledger_id();
+        let ledger_id = handle.id();
 
         // Read current head.
         let head_ref = self
@@ -1196,7 +1429,7 @@ impl Fluree {
         handle: &LedgerHandle,
         response: &ExportCommitsResponse,
     ) -> Result<BulkImportResult> {
-        let ledger_id = handle.ledger_id();
+        let ledger_id = handle.id();
         let storage = self.admin_storage().ok_or_else(|| {
             ApiError::config("import_commits_bulk requires a managed storage backend")
         })?;
@@ -1260,7 +1493,7 @@ impl Fluree {
         head_commit_id: &ContentId,
         head_t: i64,
     ) -> Result<()> {
-        let ledger_id = handle.ledger_id();
+        let ledger_id = handle.id();
         let new_ref = RefValue {
             id: Some(head_commit_id.clone()),
             t: head_t,
@@ -1303,7 +1536,7 @@ impl Fluree {
         index_id: &ContentId,
         index_t: i64,
     ) -> Result<()> {
-        let ledger_id = handle.ledger_id();
+        let ledger_id = handle.id();
         let new_ref = RefValue {
             id: Some(index_id.clone()),
             t: index_t,
@@ -1334,6 +1567,388 @@ impl Fluree {
         }
     }
 
+    /// Restore a ledger from a `.flpack` archive stream, creating a new
+    /// ledger under `new_ledger_id`.
+    ///
+    /// This is the wholesale-restore counterpart of [`Fluree::archive_ledger`]:
+    /// it streams pack frames from `reader` — a file, an HTTP body, an S3
+    /// `GetObject` body, anything `AsyncRead` — verifies each CAS object's
+    /// integrity, writes it to storage, and finalizes the commit (and, when
+    /// present, index) head from the embedded `phase: "nameservice"` manifest.
+    /// Unlike the push path it does **not** re-validate or replay commits; the
+    /// archive is trusted byte-for-byte (every frame is SHA-256 verified) and
+    /// the prebuilt index rides along, so the restored ledger is immediately
+    /// queryable.
+    ///
+    /// The new name is independent of the source ledger's name — CAS objects
+    /// are content-addressed, so only the nameservice pointer uses the name.
+    ///
+    /// On any failure after the empty ledger is created, the half-created
+    /// ledger is hard-dropped so a partial restore never leaves a head
+    /// pointing at incompletely-ingested data.
+    pub async fn restore_ledger<R>(
+        &self,
+        new_ledger_id: &str,
+        reader: &mut R,
+    ) -> Result<RestoreResult>
+    where
+        R: tokio::io::AsyncRead + Unpin + Send,
+    {
+        // Normalize to canonical `name:branch` form up front so the ingest,
+        // content-store namespace, head finalization, and rollback all agree —
+        // callers may pass a bare `name` (the CLI does), which `create_ledger`
+        // would register as `name:main` while raw-id storage writes would land
+        // in the wrong namespace.
+        let new_ledger_id = fluree_db_core::ledger_id::normalize_ledger_id(new_ledger_id)
+            .unwrap_or_else(|_| new_ledger_id.to_string());
+        let new_ledger_id = new_ledger_id.as_str();
+
+        // Create the empty target first. `create_ledger` errors if the name is
+        // already taken — callers map that to a 409 / usage error.
+        self.create_ledger(new_ledger_id).await?;
+
+        match self.restore_into_created(new_ledger_id, reader).await {
+            Ok(result) => Ok(result),
+            Err(e) => {
+                // Roll back so we never leave a ledger whose head points at
+                // partially-ingested data. `restore_ledger` only reaches here
+                // after `create_ledger` succeeded, which means the name did not
+                // previously exist — so dropping the whole name removes only
+                // what this restore created, never a pre-existing sibling.
+                // Soft drop (retract the nameservice pointer) is the right
+                // rollback: it cannot fail on file deletion, and any CAS blobs
+                // already written are harmless content-addressed orphans (a
+                // retry rewrites identical bytes; GC reclaims them otherwise).
+                // `drop_ledger` takes the bare name, so strip the branch suffix.
+                match fluree_db_core::ledger_id::split_ledger_id(new_ledger_id) {
+                    Ok((name, _branch)) => {
+                        if let Err(drop_err) = self.drop_ledger(&name, crate::DropMode::Soft).await
+                        {
+                            error!(
+                                ledger = %new_ledger_id,
+                                error = %drop_err,
+                                "failed to roll back partially-restored ledger after restore error"
+                            );
+                        }
+                    }
+                    Err(parse_err) => {
+                        error!(
+                            ledger = %new_ledger_id,
+                            error = %parse_err,
+                            "could not parse ledger id to roll back partially-restored ledger"
+                        );
+                    }
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// Stream-decode a `.flpack` into the already-created `new_ledger_id` and
+    /// finalize its heads. Split out from [`Fluree::restore_ledger`] so the
+    /// caller can roll back on any error returned here.
+    async fn restore_into_created<R>(
+        &self,
+        new_ledger_id: &str,
+        reader: &mut R,
+    ) -> Result<RestoreResult>
+    where
+        R: tokio::io::AsyncRead + Unpin + Send,
+    {
+        use fluree_db_core::pack::{
+            decode_frame, read_stream_preamble, PackError, PackFrame, PREAMBLE_SIZE,
+        };
+        use futures::stream::{FuturesUnordered, StreamExt as _};
+        use tokio::io::AsyncReadExt as _;
+
+        let storage = self
+            .backend()
+            .admin_storage_cloned()
+            .ok_or_else(|| ApiError::config("restore_ledger requires a managed storage backend"))?;
+
+        // Frames are decoded out of a growing byte buffer; `read` appends and
+        // `drain` consumes whole frames as they complete. Decoding stays
+        // sequential, but the slow per-object storage writes are dispatched
+        // into `in_flight` so they overlap (see `RESTORE_MAX_WRITES_IN_FLIGHT`).
+        // Memory is bounded by `in_flight`'s payloads plus the unparsed tail.
+        let mut buf: Vec<u8> = Vec::with_capacity(64 * 1024);
+        let mut read_chunk = [0u8; 64 * 1024];
+        let mut preamble_consumed = false;
+        let mut saw_header = false;
+        let mut ended = false;
+        let mut commits = 0usize;
+        let mut txn_blobs = 0usize;
+        let mut index_artifacts = 0usize;
+        let mut ns_manifest: Option<serde_json::Value> = None;
+
+        // Concurrent CAS writer pool. Each future owns its `(cid, payload)` and
+        // returns the byte count it frees on completion; errors propagate (and
+        // roll the restore back via the caller). `bytes_in_flight` throttles
+        // large payloads independently of the count cap.
+        let mut in_flight: FuturesUnordered<_> = FuturesUnordered::new();
+        let mut bytes_in_flight: usize = 0;
+
+        'read: loop {
+            // Strip the preamble once enough bytes have arrived.
+            if !preamble_consumed && buf.len() >= PREAMBLE_SIZE {
+                read_stream_preamble(&buf)
+                    .map_err(|e| ApiError::http(400, format!("invalid .flpack preamble: {e}")))?;
+                buf.drain(..PREAMBLE_SIZE);
+                preamble_consumed = true;
+            }
+
+            // Drain every complete frame currently in the buffer.
+            if preamble_consumed {
+                loop {
+                    match decode_frame(&buf, RESTORE_MAX_FRAME_PAYLOAD) {
+                        Ok((frame, consumed)) => {
+                            match frame {
+                                PackFrame::Header(_) => {
+                                    if saw_header {
+                                        return Err(ApiError::http(
+                                            400,
+                                            "invalid .flpack: duplicate Header frame",
+                                        ));
+                                    }
+                                    saw_header = true;
+                                }
+                                PackFrame::Data { cid, payload } => {
+                                    if !saw_header {
+                                        return Err(ApiError::http(
+                                            400,
+                                            "invalid .flpack: Data frame before Header",
+                                        ));
+                                    }
+                                    // Count at dispatch: any write failure aborts the
+                                    // whole restore (and rolls it back), so only the
+                                    // success path ever returns these counts.
+                                    match cid.content_kind() {
+                                        Some(ContentKind::Commit) => commits += 1,
+                                        Some(ContentKind::Txn) => txn_blobs += 1,
+                                        _ => index_artifacts += 1,
+                                    }
+                                    // Backpressure: drain completed writes until this one
+                                    // fits within both the count and byte budgets. The
+                                    // `!in_flight.is_empty()` guard still admits a single
+                                    // object larger than the byte budget once the pool
+                                    // drains, so an oversized frame never deadlocks.
+                                    let len = payload.len();
+                                    while in_flight.len() >= RESTORE_MAX_WRITES_IN_FLIGHT
+                                        || (bytes_in_flight + len > RESTORE_MAX_BYTES_IN_FLIGHT
+                                            && !in_flight.is_empty())
+                                    {
+                                        match in_flight.next().await {
+                                            Some(res) => bytes_in_flight -= res?,
+                                            None => break,
+                                        }
+                                    }
+                                    bytes_in_flight += len;
+                                    let storage_ref = &storage;
+                                    in_flight.push(async move {
+                                        ingest_cas_object(
+                                            storage_ref,
+                                            &cid,
+                                            &payload,
+                                            new_ledger_id,
+                                        )
+                                        .await?;
+                                        Ok::<usize, ApiError>(len)
+                                    });
+                                }
+                                PackFrame::Manifest(json) => {
+                                    if json.get("phase").and_then(|v| v.as_str())
+                                        == Some("nameservice")
+                                    {
+                                        ns_manifest = Some(json);
+                                    }
+                                }
+                                PackFrame::Error(msg) => {
+                                    return Err(ApiError::http(
+                                        400,
+                                        format!(".flpack contains error frame: {msg}"),
+                                    ));
+                                }
+                                PackFrame::End => {
+                                    ended = true;
+                                    break 'read;
+                                }
+                            }
+                            buf.drain(..consumed);
+                        }
+                        // Not enough bytes for the next frame yet — go read more.
+                        Err(PackError::Incomplete(_)) => break,
+                        Err(e) => {
+                            return Err(ApiError::http(400, format!("invalid .flpack frame: {e}")));
+                        }
+                    }
+                }
+            }
+
+            let n = reader
+                .read(&mut read_chunk)
+                .await
+                .map_err(|e| ApiError::internal(format!("error reading .flpack stream: {e}")))?;
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&read_chunk[..n]);
+        }
+
+        // Flush every write still in flight before finalizing heads — the
+        // manifest CID `content.has` checks below require each CAS object to be
+        // durable, and a failed write must surface here (rolling the restore
+        // back) rather than leaving a head pointing at an unwritten object.
+        while let Some(res) = in_flight.next().await {
+            res?;
+        }
+
+        if !saw_header {
+            return Err(ApiError::http(400, "invalid .flpack: no Header frame"));
+        }
+        if !ended {
+            return Err(ApiError::http(
+                400,
+                "unexpected end of .flpack stream (missing End frame)",
+            ));
+        }
+
+        let manifest = ns_manifest.ok_or_else(|| {
+            ApiError::http(
+                400,
+                ".flpack is missing its nameservice manifest — cannot determine commit/index heads",
+            )
+        })?;
+
+        // Resolve the head CIDs from the manifest, then verify they were
+        // actually ingested before pointing the nameservice at them — a
+        // truncated or mismatched archive must not yield a dangling head.
+        let content = self.content_store(new_ledger_id);
+
+        let commit_head_id = manifest
+            .get("commit_head_id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| ApiError::http(400, ".flpack manifest is missing commit_head_id"))?;
+        let commit_cid: ContentId = commit_head_id
+            .parse()
+            .map_err(|e| ApiError::http(400, format!("invalid commit CID in manifest: {e}")))?;
+        if !content.has(&commit_cid).await.unwrap_or(false) {
+            return Err(ApiError::http(
+                400,
+                format!(".flpack manifest names commit head {commit_cid} that the archive did not contain"),
+            ));
+        }
+        let commit_t = manifest
+            .get("commit_t")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(0);
+
+        let handle = self.ledger_cached(new_ledger_id).await?;
+        self.set_commit_head(&handle, &commit_cid, commit_t).await?;
+
+        let mut index_t_out = None;
+        if let Some(index_cid_str) = manifest.get("index_head_id").and_then(|v| v.as_str()) {
+            let index_cid: ContentId = index_cid_str
+                .parse()
+                .map_err(|e| ApiError::http(400, format!("invalid index CID in manifest: {e}")))?;
+            if !content.has(&index_cid).await.unwrap_or(false) {
+                return Err(ApiError::http(
+                    400,
+                    format!(".flpack manifest names index head {index_cid} that the archive did not contain"),
+                ));
+            }
+            let index_t = manifest
+                .get("index_t")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(0);
+
+            // The FIR6 index root embeds the *source* ledger_id as an inline
+            // identity field. Loading it under a new name trips
+            // `apply_loaded_db`'s identity check ("Index ledger_id '<src>' does
+            // not match expected '<dst>'"), which only the write path hits —
+            // leaving an otherwise-queryable restored ledger silently
+            // read-only. Re-stamp that one field and re-write the root under a
+            // fresh CID when the names differ. Every other artifact (branches,
+            // leaves, dicts) is name-independent and was ingested verbatim;
+            // the source ledger name is intentionally preserved in the
+            // historical txn-meta/config graph IRIs (those live in the
+            // content-addressed dict tree and match clone/pull semantics).
+            let head_index_cid = {
+                use fluree_db_binary_index::IndexRoot;
+                let root_bytes = content.get(&index_cid).await.map_err(|e| {
+                    ApiError::internal(format!(
+                        "failed to read restored index root {index_cid}: {e}"
+                    ))
+                })?;
+                let mut root = IndexRoot::decode(&root_bytes).map_err(|e| {
+                    ApiError::http(
+                        400,
+                        format!("restored index root {index_cid} is not a valid FIR6 root: {e}"),
+                    )
+                })?;
+                if root.ledger_id == new_ledger_id {
+                    index_cid
+                } else {
+                    root.ledger_id = new_ledger_id.to_string();
+                    let restamped = root.encode();
+                    let res = storage
+                        .content_write_bytes(ContentKind::IndexRoot, new_ledger_id, &restamped)
+                        .await
+                        .map_err(|e| {
+                            ApiError::internal(format!(
+                                "failed to write re-stamped index root: {e}"
+                            ))
+                        })?;
+                    ContentId::from_hex_digest(ContentKind::IndexRoot.to_codec(), &res.content_hash)
+                        .ok_or_else(|| {
+                            ApiError::internal(format!(
+                                "re-stamped index root produced an invalid content hash '{}'",
+                                res.content_hash
+                            ))
+                        })?
+                }
+            };
+
+            self.set_index_head(&handle, &head_index_cid, index_t)
+                .await?;
+            index_t_out = Some(index_t);
+        }
+
+        // Restore the ledger's stored default JSON-LD context, if the archive
+        // carried one. The blob was ingested above; re-point the new ledger's
+        // config at it so queries that omit an inline @context keep working.
+        if let Some(ctx_cid_str) = manifest.get("default_context_id").and_then(|v| v.as_str()) {
+            let ctx_cid: ContentId = ctx_cid_str.parse().map_err(|e| {
+                ApiError::http(400, format!("invalid default_context CID in manifest: {e}"))
+            })?;
+            if !content.has(&ctx_cid).await.unwrap_or(false) {
+                return Err(ApiError::http(
+                    400,
+                    format!(".flpack manifest names default-context blob {ctx_cid} that the archive did not contain"),
+                ));
+            }
+            let bytes = content.get(&ctx_cid).await.map_err(|e| {
+                ApiError::internal(format!(
+                    "failed to read default context blob {ctx_cid}: {e}"
+                ))
+            })?;
+            let ctx_json: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| {
+                ApiError::http(400, format!("default context blob is not valid JSON: {e}"))
+            })?;
+            // Re-points config + bumps configV via the standard CAS path; the
+            // re-put of the (content-addressed) blob is idempotent.
+            self.set_default_context(new_ledger_id, &ctx_json).await?;
+        }
+
+        Ok(RestoreResult {
+            ledger_id: new_ledger_id.to_string(),
+            commits,
+            txn_blobs,
+            index_artifacts,
+            commit_t,
+            index_t: index_t_out,
+        })
+    }
+
     /// Incrementally import commits (pull path).
     ///
     /// Validates the commit chain, verifies ancestry against the local head,
@@ -1342,7 +1957,7 @@ impl Fluree {
     /// `commits` must be ordered oldest → newest.
     pub async fn import_commits_incremental(
         &self,
-        handle: &LedgerHandle,
+        ledger_id: &str,
         commits: Vec<Base64Bytes>,
         blobs: HashMap<String, Base64Bytes>,
     ) -> Result<CommitImportResult> {
@@ -1350,7 +1965,10 @@ impl Fluree {
             return Err(ApiError::http(400, "no commits to import"));
         }
 
-        let mut guard = handle.lock_for_write().await;
+        let mut guard = self
+            .lock_ledger(ledger_id)
+            .await?
+            .ok_or_else(|| ApiError::internal("import requires a ledger manager"))?;
         let base_state = guard.clone_state();
 
         // 1) Read current head ref.
@@ -1459,13 +2077,16 @@ impl Fluree {
 
         // Sync binary_store BEFORE replacing state so that concurrent readers
         // (via snapshot()) never see the new state with a stale binary_store.
-        handle.sync_binary_store_from_state(&new_state).await;
+        guard
+            .ledger()
+            .sync_binary_store_from_state(&new_state)
+            .await;
         guard.replace(new_state);
 
         // 10) Trigger background indexing if enabled and needed.
         if let IndexingMode::Background(idx_handle) = &self.indexing_mode {
             if indexing_enabled && indexing_needed {
-                idx_handle.trigger(handle.ledger_id(), final_head.t).await;
+                idx_handle.trigger(ledger_id, final_head.t).await;
             }
         }
 

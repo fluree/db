@@ -4,7 +4,7 @@ use serde_json::Value as JsonValue;
 
 use crate::view::QueryInput;
 use crate::{
-    ApiError, Batch, DatasetSpec, ExecutableQuery, OverlayProvider, QueryConnectionOptions, Result,
+    ApiError, Batch, DatasetSpec, ExecutableQuery, GovernanceOptions, OverlayProvider, Result,
     Tracker, TrackingOptions, VarRegistry,
 };
 
@@ -274,6 +274,7 @@ pub(crate) fn tracker_for_limits(query_json: &JsonValue) -> Tracker {
 pub(crate) fn status_for_query_error(err: &fluree_db_query::QueryError) -> u16 {
     match err {
         fluree_db_query::QueryError::FuelLimitExceeded(_) => 400,
+        fluree_db_query::QueryError::Cancelled { .. } => 408,
         fluree_db_query::QueryError::InvalidQuery(_) => 400,
         fluree_db_query::QueryError::InvalidFilter(_) => 400,
         fluree_db_query::QueryError::InvalidExpression(_) => 400,
@@ -283,7 +284,7 @@ pub(crate) fn status_for_query_error(err: &fluree_db_query::QueryError) -> u16 {
 
 pub(crate) fn parse_dataset_spec(
     query_json: &JsonValue,
-) -> Result<(DatasetSpec, QueryConnectionOptions)> {
+) -> Result<(DatasetSpec, GovernanceOptions)> {
     DatasetSpec::from_query_json(query_json).map_err(|e| ApiError::query(e.to_string()))
 }
 

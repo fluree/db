@@ -220,7 +220,17 @@ Reader Lambda:
 
 **HTTP API:**
 
-The HTTP query endpoint does not yet expose `min_t` directly. For HTTP clients, use the SSE events endpoint (`GET /v1/fluree/events`) to receive real-time commit notifications, or poll the ledger info endpoint until the desired `t` is reached.
+HTTP query clients can request the same read-after-write guarantee by sending the transaction time in the `fluree-min-t` header. The server refreshes the target ledger(s) until each reaches at least that `t`, or until the min-t wait timeout expires:
+
+```http
+fluree-min-t: 42
+```
+
+JSON-LD query bodies may also use `opts.min-t` (or `opts.minT`) for the same request-level guarantee. Numeric query snapshot pins like `from: "ledger:main@t:42"` or `from: {"@id": "ledger:main", "t": 42}` also force the server to observe at least that `t` before executing, then read that pinned snapshot. ISO and commit pins still resolve through normal snapshot resolution.
+
+The wait is capped by `query_min_t_timeout_ms` (default 5 seconds), even if the general query execution timeout is disabled.
+
+Long-running HTTP query servers can also enable TTL-gated query-time refresh with `--query-refresh-enabled` and `--query-refresh-ttl-ms`. This makes the server call `refresh()` on demand before current-head queries, after that ledger's TTL window expires, so warm caches observe nameservice advances without checking DynamoDB on every request. The first query in a new TTL window pays the nameservice round-trip; idle ledgers are not refreshed. The TTL bounds ordinary staleness, but callers that must prove they observed a specific transaction should use `fluree-min-t` or `opts.min-t`.
 
 ### Rust API
 

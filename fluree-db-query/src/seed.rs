@@ -129,6 +129,67 @@ impl Operator for SeedOperator {
     }
 }
 
+/// Operator that yields all rows of a source batch at once (multi-row seed).
+///
+/// Unlike [`SeedOperator`] (one row), this feeds an entire parent batch into a
+/// nested subtree so a downstream operator can process the whole batch in one
+/// pass — e.g. running a GRAPH/R2RML block uncorrelated and hash-joining the
+/// parent rows instead of re-scanning per row.
+pub struct BatchSeedOperator {
+    schema: Arc<[VarId]>,
+    batch: Batch,
+    emitted: bool,
+    state: OperatorState,
+}
+
+impl BatchSeedOperator {
+    /// Create a multi-row seed from a whole batch.
+    pub fn from_batch(batch: Batch) -> Self {
+        let schema = Arc::from(batch.schema().to_vec().into_boxed_slice());
+        Self {
+            schema,
+            batch,
+            emitted: false,
+            state: OperatorState::Created,
+        }
+    }
+
+    /// Get the output schema (inherent method for use without trait bounds).
+    pub fn schema(&self) -> &[VarId] {
+        &self.schema
+    }
+}
+
+#[async_trait]
+impl Operator for BatchSeedOperator {
+    fn schema(&self) -> &[VarId] {
+        &self.schema
+    }
+
+    async fn open(&mut self, _ctx: &ExecutionContext<'_>) -> Result<()> {
+        self.state = OperatorState::Open;
+        self.emitted = false;
+        Ok(())
+    }
+
+    async fn next_batch(&mut self, _ctx: &ExecutionContext<'_>) -> Result<Option<Batch>> {
+        if self.state != OperatorState::Open || self.emitted {
+            self.state = OperatorState::Exhausted;
+            return Ok(None);
+        }
+        self.emitted = true;
+        Ok(Some(self.batch.clone()))
+    }
+
+    fn close(&mut self) {
+        self.state = OperatorState::Closed;
+    }
+
+    fn estimated_rows(&self) -> Option<usize> {
+        Some(self.batch.len())
+    }
+}
+
 /// Operator that yields a single empty solution
 ///
 /// Used when a query starts with a non-triple pattern (VALUES, BIND, UNION, FILTER).

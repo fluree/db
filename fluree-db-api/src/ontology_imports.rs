@@ -545,6 +545,8 @@ mod tests {
             schema_source,
             follow_owl_imports: follow,
             ontology_import_map: map,
+            max_facts: None,
+            max_seconds: None,
             override_control: OverrideControl::default(),
         }
     }

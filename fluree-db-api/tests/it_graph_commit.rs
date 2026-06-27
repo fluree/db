@@ -1,8 +1,8 @@
 #![cfg(feature = "native")]
 
-use std::sync::Arc;
-mod support;
-
+use crate::support::{
+    genesis_ledger, start_background_indexer_local, trigger_index_and_wait, MemoryFluree,
+};
 use fluree_db_api::{ApiError, FlureeBuilder};
 use fluree_db_core::{
     range_with_overlay, ContentId, Flake, FlakeValue, IndexType, RangeMatch, RangeOptions,
@@ -12,9 +12,6 @@ use fluree_db_ledger::LedgerState;
 use fluree_db_novelty::Novelty;
 use fluree_vocab::namespaces::{FLUREE_COMMIT, FLUREE_DB};
 use serde_json::json;
-use support::{
-    genesis_ledger, start_background_indexer_local, trigger_index_and_wait, MemoryFluree,
-};
 
 async fn seed_two_commits(
     fluree: &MemoryFluree,
@@ -119,7 +116,10 @@ async fn commit_t_resolves_indexed_commit_from_txn_meta_post_lookup() {
 
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        Arc::new(fluree.nameservice_mode().clone()),
+        fluree
+            .nameservice_mode()
+            .publisher_arc()
+            .expect("test setup requires ReadWrite nameservice mode"),
         fluree_db_indexer::IndexerConfig::small(),
     );
 

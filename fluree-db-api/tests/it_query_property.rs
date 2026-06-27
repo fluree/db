@@ -2,11 +2,10 @@
 //!
 //! We keep `@context` explicit and compare results order-insensitively when ordering is not defined.
 
-mod support;
-
+use crate::support;
+use crate::support::{genesis_ledger, normalize_rows, MemoryFluree, MemoryLedger};
 use fluree_db_api::FlureeBuilder;
 use serde_json::json;
-use support::{genesis_ledger, normalize_rows, MemoryFluree, MemoryLedger};
 
 async fn seed_subject_as_predicate(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
     let ledger0 = genesis_ledger(fluree, ledger_id);
@@ -296,12 +295,12 @@ async fn rdfs_subpropertyof_expansion() {
     });
     let ledger = fluree.insert(ledger3, &insert4).await.unwrap().ledger;
 
-    // Querying one-level up in subproperty hierarchy.
+    // Querying one-level up in subproperty hierarchy (reasoning is opt-in).
     let q1 = json!({
         "@context": {"ex":"http://example.org/ns/"},
         "select": "?parent",
-        "where": {"@id":"ex:bob","ex:biologicalParent":"?parent"}
-        // relies on default auto-RDFS (hierarchy exists)
+        "where": {"@id":"ex:bob","ex:biologicalParent":"?parent"},
+        "reasoning": "rdfs"
     });
     let rows1 = support::query_jsonld(&fluree, &ledger, &q1)
         .await
@@ -337,7 +336,7 @@ async fn rdfs_subpropertyof_expansion() {
         ]))
     );
 
-    // Sanity: explicit "none" disables auto-RDFS (so parent expansion disappears).
+    // Sanity: with no reasoning (explicit "none" == the default), no expansion.
     let q3 = json!({
         "@context": {"ex":"http://example.org/ns/"},
         "select": "?parent",

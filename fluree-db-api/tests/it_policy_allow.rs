@@ -2,11 +2,10 @@
 //!
 //! Tests f:allow true/false, precedence over f:query, and targeting modes.
 
-mod support;
-
+use crate::support;
+use crate::support::{assert_index_defaults, genesis_ledger, normalize_rows};
 use fluree_db_api::FlureeBuilder;
 use serde_json::json;
-use support::{assert_index_defaults, genesis_ledger, normalize_rows};
 
 /// Helper to seed test data with users having sensitive SSN property.
 async fn seed_user_data(fluree: &support::MemoryFluree, ledger_id: &str) {
@@ -676,7 +675,7 @@ async fn policy_onclass_and_onproperty_combined() {
 #[cfg(feature = "native")]
 #[tokio::test]
 async fn policy_onclass_applies_to_novelty_properties_without_type_restated() {
-    use fluree_db_api::dataset::QueryConnectionOptions;
+    use fluree_db_api::dataset::GovernanceOptions;
     use fluree_db_api::{build_policy_context, CommitOpts, GraphDb, IndexConfig, TxnOpts};
     use std::sync::Arc;
 
@@ -690,7 +689,10 @@ async fn policy_onclass_applies_to_novelty_properties_without_type_restated() {
 
     let (local, handle) = support::start_background_indexer_local(
         fluree.backend().clone(),
-        Arc::new(fluree.nameservice_mode().clone()),
+        fluree
+            .nameservice_mode()
+            .publisher_arc()
+            .expect("test setup requires ReadWrite nameservice mode"),
         fluree_db_indexer::IndexerConfig::small(),
     );
     fluree.set_indexing_mode(fluree_db_api::tx::IndexingMode::Background(handle.clone()));
@@ -784,7 +786,7 @@ async fn policy_onclass_applies_to_novelty_properties_without_type_restated() {
                 }
             ]);
 
-            let opts = QueryConnectionOptions {
+            let opts = GovernanceOptions {
                 policy: Some(policy),
                 default_allow: true,
                 ..Default::default()

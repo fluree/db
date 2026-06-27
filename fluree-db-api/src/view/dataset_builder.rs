@@ -4,7 +4,7 @@
 //! specifications, applying time travel, policy, and reasoning wrappers.
 
 use crate::view::{DataSetDb, GraphDb};
-use crate::{dataset, time_resolve, ApiError, DatasetSpec, Fluree, QueryConnectionOptions, Result};
+use crate::{dataset, time_resolve, ApiError, DatasetSpec, Fluree, GovernanceOptions, Result};
 use chrono::DateTime;
 
 macro_rules! build_dataset_view_from_spec {
@@ -119,7 +119,7 @@ impl Fluree {
 
     /// Build a `DataSetDb` with policy applied to all views.
     ///
-    /// Policy is built from `QueryConnectionOptions` and applied uniformly
+    /// Policy is built from `GovernanceOptions` and applied uniformly
     /// to all views in the dataset, unless a source has a per-source policy
     /// override which takes precedence.
     ///
@@ -131,7 +131,7 @@ impl Fluree {
     pub async fn build_dataset_view_with_policy(
         &self,
         spec: &DatasetSpec,
-        opts: &QueryConnectionOptions,
+        opts: &GovernanceOptions,
     ) -> Result<DataSetDb> {
         build_dataset_view_from_spec!(
             self,
@@ -165,12 +165,12 @@ impl Fluree {
     /// Apply policy with per-source override taking precedence over global.
     ///
     /// This is used by `build_dataset_view_with_policy` to allow per-source
-    /// policy to override the global policy from `QueryConnectionOptions`.
+    /// policy to override the global policy from `GovernanceOptions`.
     async fn apply_policy_with_override(
         &self,
         view: GraphDb,
         source: &dataset::GraphSource,
-        global_opts: &QueryConnectionOptions,
+        global_opts: &GovernanceOptions,
     ) -> Result<GraphDb> {
         // Per-source policy override takes precedence
         if let Some(policy_override) = &source.policy_override {

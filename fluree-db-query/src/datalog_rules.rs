@@ -594,6 +594,8 @@ fn resolve_filter_term(term: &RuleTerm, bindings: &Bindings) -> Option<FlakeValu
         RuleTerm::Var(name) => bindings.get(name.as_ref()).map(|bv| match bv {
             BindingValue::Long(n) => FlakeValue::Long(*n),
             BindingValue::Double(d) => FlakeValue::Double(*d),
+            BindingValue::Decimal(d) => FlakeValue::Decimal(d.clone()),
+            BindingValue::BigInt(n) => FlakeValue::BigInt(n.clone()),
             BindingValue::String(s) => FlakeValue::String(s.clone()),
             BindingValue::Boolean(b) => FlakeValue::Boolean(*b),
             BindingValue::Sid(sid) => FlakeValue::String(sid.name.to_string()),
@@ -613,13 +615,13 @@ fn resolve_filter_term(term: &RuleTerm, bindings: &Bindings) -> Option<FlakeValu
 /// Long/Double/String/Boolean variants of FlakeValue are inspected; other
 /// variants fall through to "incompatible".
 fn compare_values(left: &FlakeValue, right: &FlakeValue, op: CompareOp) -> bool {
-    // Try numeric comparison first
-    let numeric_result = match (left, right) {
-        (FlakeValue::Long(l), FlakeValue::Long(r)) => Some(l.cmp(r)),
-        (FlakeValue::Long(l), FlakeValue::Double(r)) => (*l as f64).partial_cmp(r),
-        (FlakeValue::Double(l), FlakeValue::Long(r)) => l.partial_cmp(&(*r as f64)),
-        (FlakeValue::Double(l), FlakeValue::Double(r)) => l.partial_cmp(r),
-        _ => None,
+    // Try numeric comparison first: exact across all numeric representations
+    // (Long/Double/BigInt/Decimal), with BigDecimal promotion where an f64
+    // cast would lose precision.
+    let numeric_result = if left.is_numeric() && right.is_numeric() {
+        left.numeric_cmp(right)
+    } else {
+        None
     };
 
     if let Some(cmp) = numeric_result {
@@ -827,7 +829,23 @@ enum ObjectMatch {
     String(String),
     Long(i64),
     Double(f64),
+    Decimal(Box<bigdecimal::BigDecimal>),
+    BigInt(Box<num_bigint::BigInt>),
     Boolean(bool),
+}
+
+impl ObjectMatch {
+    /// Numeric value for exact cross-representation comparison; None for
+    /// non-numeric variants.
+    fn as_numeric_flake(&self) -> Option<FlakeValue> {
+        match self {
+            ObjectMatch::Long(n) => Some(FlakeValue::Long(*n)),
+            ObjectMatch::Double(d) => Some(FlakeValue::Double(*d)),
+            ObjectMatch::Decimal(d) => Some(FlakeValue::Decimal(d.clone())),
+            ObjectMatch::BigInt(n) => Some(FlakeValue::BigInt(n.clone())),
+            _ => None,
+        }
+    }
 }
 
 fn binding_to_object_match(binding: &BindingValue) -> ObjectMatch {
@@ -836,6 +854,8 @@ fn binding_to_object_match(binding: &BindingValue) -> ObjectMatch {
         BindingValue::String(s) => ObjectMatch::String(s.clone()),
         BindingValue::Long(n) => ObjectMatch::Long(*n),
         BindingValue::Double(d) => ObjectMatch::Double(*d),
+        BindingValue::Decimal(d) => ObjectMatch::Decimal(d.clone()),
+        BindingValue::BigInt(n) => ObjectMatch::BigInt(n.clone()),
         BindingValue::Boolean(b) => ObjectMatch::Boolean(*b),
     }
 }
@@ -851,11 +871,17 @@ fn rule_value_to_object_match(val: &RuleValue) -> ObjectMatch {
 }
 
 fn flake_object_matches(flake_obj: &FlakeValue, expected: &ObjectMatch) -> bool {
+    // Numeric pairs compare by exact value across representations
+    // (Long/Double/BigInt/Decimal) — epsilon comparison conflates distinct
+    // values and a per-variant match would silently never match decimals.
+    if flake_obj.is_numeric() {
+        if let Some(expected_num) = expected.as_numeric_flake() {
+            return flake_obj.numeric_cmp(&expected_num) == Some(std::cmp::Ordering::Equal);
+        }
+    }
     match (flake_obj, expected) {
         (FlakeValue::Ref(a), ObjectMatch::Ref(b)) => a == b,
         (FlakeValue::String(a), ObjectMatch::String(b)) => a == b,
-        (FlakeValue::Long(a), ObjectMatch::Long(b)) => a == b,
-        (FlakeValue::Double(a), ObjectMatch::Double(b)) => (a - b).abs() < f64::EPSILON,
         (FlakeValue::Boolean(a), ObjectMatch::Boolean(b)) => a == b,
         _ => false,
     }
@@ -869,8 +895,8 @@ fn flake_value_to_binding(val: &FlakeValue) -> BindingValue {
         FlakeValue::Double(d) => BindingValue::Double(*d),
         FlakeValue::Boolean(b) => BindingValue::Boolean(*b),
         FlakeValue::Json(j) => BindingValue::String(j.clone()),
-        FlakeValue::BigInt(b) => BindingValue::Long(b.to_string().parse().unwrap_or(0)),
-        FlakeValue::Decimal(b) => BindingValue::Double(b.to_string().parse().unwrap_or(0.0)),
+        FlakeValue::BigInt(b) => BindingValue::BigInt(b.clone()),
+        FlakeValue::Decimal(b) => BindingValue::Decimal(b.clone()),
         FlakeValue::DateTime(dt) => BindingValue::String(dt.to_string()),
         FlakeValue::Date(d) => BindingValue::String(d.to_string()),
         FlakeValue::Time(t) => BindingValue::String(t.to_string()),
@@ -951,8 +977,19 @@ fn bindings_equal(a: &BindingValue, b: &BindingValue) -> bool {
         (BindingValue::Sid(a), BindingValue::Sid(b)) => a == b,
         (BindingValue::String(a), BindingValue::String(b)) => a == b,
         (BindingValue::Long(a), BindingValue::Long(b)) => a == b,
-        (BindingValue::Double(a), BindingValue::Double(b)) => (a - b).abs() < f64::EPSILON,
         (BindingValue::Boolean(a), BindingValue::Boolean(b)) => a == b,
+        // Numeric pairs (incl. cross-representation Decimal/BigInt) compare
+        // by exact value — epsilon comparison conflates distinct values.
+        (
+            BindingValue::Long(_)
+            | BindingValue::Double(_)
+            | BindingValue::Decimal(_)
+            | BindingValue::BigInt(_),
+            BindingValue::Long(_)
+            | BindingValue::Double(_)
+            | BindingValue::Decimal(_)
+            | BindingValue::BigInt(_),
+        ) => a.to_flake_value().numeric_cmp(&b.to_flake_value()) == Some(std::cmp::Ordering::Equal),
         _ => false,
     }
 }
@@ -1194,5 +1231,51 @@ mod tests {
         let context = serde_json::json!({});
         let result = expand_iri("?person", &context).unwrap();
         assert_eq!(result, "?person");
+    }
+
+    fn dec(s: &str) -> FlakeValue {
+        FlakeValue::Decimal(Box::new(s.parse().expect("decimal")))
+    }
+
+    #[test]
+    fn test_decimal_object_matching_and_binding_roundtrip() {
+        // Decimal flake objects must match decimal-bound constraints (they
+        // previously fell to the catch-all and never matched).
+        let bound = flake_value_to_binding(&dec("19.99"));
+        let m = binding_to_object_match(&bound);
+        assert!(flake_object_matches(&dec("19.99"), &m));
+        assert!(flake_object_matches(&dec("19.990"), &m), "scale variants");
+        assert!(!flake_object_matches(&dec("19.98"), &m));
+
+        // Round-trip preserves the exact value (no f64, no zeroing).
+        assert_eq!(bound.to_flake_value(), dec("19.99"));
+
+        // BigInt round-trip: previously parse::<i64>().unwrap_or(0) → 0.
+        let big = FlakeValue::BigInt(Box::new(
+            "123456789012345678901234567890".parse().expect("bigint"),
+        ));
+        let bound = flake_value_to_binding(&big);
+        assert_eq!(bound.to_flake_value(), big);
+        assert!(flake_object_matches(&big, &binding_to_object_match(&bound)));
+    }
+
+    #[test]
+    fn test_bindings_equal_exact_numeric() {
+        // Exact equality: the old epsilon comparison conflated distinct
+        // neighboring doubles.
+        let a = BindingValue::Double(1.0);
+        let next = BindingValue::Double(f64::from_bits(1.0f64.to_bits() + 1));
+        assert!(bindings_equal(&a, &a.clone()));
+        assert!(!bindings_equal(&a, &next), "adjacent doubles are distinct");
+        // Cross-representation numeric equality.
+        assert!(bindings_equal(
+            &BindingValue::Long(3),
+            &flake_value_to_binding(&dec("3.00"))
+        ));
+        // 19.99 has no exact f64 twin: decimal != nearest double.
+        assert!(!bindings_equal(
+            &flake_value_to_binding(&dec("19.99")),
+            &BindingValue::Double(19.99)
+        ));
     }
 }

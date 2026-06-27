@@ -15,6 +15,7 @@
 
 pub mod aggregate;
 pub(crate) mod aggregate_complement_fold;
+pub mod annotation_edge_probe;
 pub mod binary_history;
 pub mod binary_range;
 pub mod binary_scan;
@@ -25,9 +26,11 @@ pub mod context;
 pub(crate) mod count_plan;
 pub(crate) mod count_plan_exec;
 pub(crate) mod count_rows;
+pub(crate) mod cyclic_bgp;
 pub mod datalog_rules;
 pub mod dataset;
 pub mod dataset_operator;
+pub mod default_graph_source;
 pub mod dict_overlay;
 pub mod distinct;
 pub mod error;
@@ -45,6 +48,7 @@ pub(crate) mod fast_path_plus_count_all;
 pub(crate) mod fast_post_order_limit;
 pub(crate) mod fast_predicate_scalar_agg;
 pub(crate) mod fast_star_const_order_topk;
+pub(crate) mod fast_string_fold;
 pub(crate) mod fast_string_prefix_count_all;
 pub(crate) mod fast_sum_strlen_group_concat;
 pub(crate) mod fast_union_star_count_all;
@@ -80,9 +84,11 @@ pub mod rewrite;
 pub mod rewrite_owl_ql;
 pub mod s2_search;
 pub mod schema_bundle;
+pub mod search_readability;
 pub mod seed;
 pub(crate) mod semijoin;
 pub mod service;
+pub mod shortest_path;
 pub(crate) mod sid_iri;
 pub mod sort;
 pub mod sparql_results;
@@ -91,6 +97,7 @@ pub mod stats_query;
 pub mod subquery;
 pub mod temporal_mode;
 pub mod union;
+pub mod unwind;
 pub mod values;
 pub mod var_registry;
 pub mod vector;
@@ -107,7 +114,10 @@ pub use dataset::{ActiveGraph, ActiveGraphs, DataSet, GraphRef};
 pub use dataset_operator::{DatasetBuilder, DatasetOperator, ScanDatasetBuilder};
 pub use distinct::DistinctOperator;
 pub use error::{QueryError, Result};
-pub use execute::{build_operator_tree, execute, run_operator, ContextConfig, ExecutableQuery};
+pub use execute::{
+    build_operator_tree, execute, expand_edge_annotation_patterns, run_operator, ContextConfig,
+    ExecutableQuery,
+};
 pub use exists::ExistsOperator;
 pub use explain::{
     explain_execution_hints, explain_patterns, ExecutionStrategyHint, ExplainPlan, FallbackReason,
@@ -146,10 +156,12 @@ pub use reasoning::{global_reasoning_cache, ReasoningOverlay};
 pub use rewrite::{rewrite_patterns, Diagnostics as RewriteDiagnostics, PlanContext, PlanLimits};
 pub use rewrite_owl_ql::{rewrite_owl_ql_patterns, Ontology, OwlQlContext};
 pub use seed::{EmptyOperator, SeedOperator};
+pub use shortest_path::ShortestPathOperator;
 pub use sort::{compare_bindings, compare_flake_values, SortDirection, SortOperator, SortSpec};
 pub use stats_query::StatsCountByPredicateOperator;
 pub use subquery::SubqueryOperator;
 pub use temporal_mode::{PlanningContext, TemporalMode};
+pub use unwind::UnwindOperator;
 
 // Re-export DatatypeConstraint from fluree-db-core for convenience
 pub use fluree_db_core::DatatypeConstraint;

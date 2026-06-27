@@ -35,7 +35,16 @@ pub struct DerivedFactsOverlay {
     same_as: FrozenSameAs,
     /// Epoch for cache key differentiation
     epoch: u64,
+    /// Process-unique id assigned at construction (shared by clones).
+    ///
+    /// The `epoch` alone cannot distinguish two materializations built at the
+    /// same base-overlay epoch under different rule configs / ontologies —
+    /// caches keyed on overlay identity must incorporate this id.
+    instance_id: u64,
 }
+
+/// Process-wide counter for [`DerivedFactsOverlay::instance_id`].
+static OVERLAY_INSTANCE_IDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 impl DerivedFactsOverlay {
     /// Create an empty overlay (no derived facts) with default epoch and empty sameAs
@@ -57,6 +66,7 @@ impl DerivedFactsOverlay {
             opst: Arc::from([]),
             same_as,
             epoch,
+            instance_id: OVERLAY_INSTANCE_IDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         }
     }
 
@@ -85,7 +95,13 @@ impl DerivedFactsOverlay {
             opst: opst.into(),
             same_as,
             epoch,
+            instance_id: OVERLAY_INSTANCE_IDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         }
+    }
+
+    /// Process-unique identity of this materialization (stable across clones).
+    pub fn instance_id(&self) -> u64 {
+        self.instance_id
     }
 
     /// Get the sameAs equivalence structure

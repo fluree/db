@@ -1,6 +1,6 @@
 # SPARQL
 
-Fluree provides full support for SPARQL 1.1, the W3C standard query language for RDF. SPARQL enables compatibility with existing RDF tools, knowledge graphs, and semantic web applications.
+Fluree provides full support for SPARQL 1.1, the W3C standard query language for RDF, plus the RDF 1.2 / SPARQL 1.2 edge-annotation subset (see [Edge annotations](#edge-annotations-sparql-12--rdf-12) below). SPARQL enables compatibility with existing RDF tools, knowledge graphs, and semantic web applications.
 
 ## Overview
 
@@ -509,6 +509,26 @@ Fluree also exposes a built-in named graph inside each ledger for transaction / 
 
 See [Datasets](datasets.md) for details.
 
+### GRAPH patterns without `FROM NAMED`
+
+On the ledger-scoped query endpoint (`POST /query/{ledger}`), `GRAPH` patterns
+resolve the ledger's registered named graphs by default — no `FROM NAMED` is
+required:
+
+```sparql
+# Returns the named graph's triples even with no FROM NAMED
+SELECT ?s ?p ?o WHERE { GRAPH <urn:probegraph> { ?s ?p ?o } }
+
+# Discovers every user-registered named graph (plus the ledger alias,
+# which addresses the default graph)
+SELECT DISTINCT ?g WHERE { GRAPH ?g { ?s ?p ?o } }
+```
+
+Only user-registered named graphs are exposed this way; the reserved system
+graphs (`#txn-meta`, `#config`) remain addressable only via an explicit
+`FROM NAMED`. Supplying `FROM NAMED` still narrows `GRAPH` resolution to exactly
+the graphs listed.
+
 ## SPARQL Functions
 
 ### String Functions
@@ -547,7 +567,7 @@ See [Datasets](datasets.md) for details.
 
 - `STRDT(?str, ?datatype)` - String to typed literal
 - `STRLANG(?str, ?lang)` - String with language
-- `DATATYPE(?literal)` - Datatype
+- `DATATYPE(?literal)` - Datatype IRI of a literal (per W3C SPARQL 1.1 §17.4.2.3, an IRI term — e.g. the `xsd:decimal` IRI, **not** the string `"xsd:decimal"`). Compare it against a datatype IRI directly, e.g. `FILTER(DATATYPE(?v) = xsd:decimal)`. SPARQL results render it as the full IRI; JSON-LD results compact it against the active `@context`.
 - `IRI(?str)` - IRI from string
 - `URI(?str)` - URI from string
 - `BNODE(?str)` - Blank node
@@ -870,9 +890,59 @@ WHERE {
 }
 ```
 
+## Edge annotations (SPARQL 1.2 / RDF 1.2)
+
+In addition to SPARQL 1.1, Fluree supports the RDF 1.2 / SPARQL 1.2 **edge-annotation** subset — the annotation tail `{| ... |}`, the `~` reifier, and `rdf:reifies` with `<<( ... )>>` triple terms — on both the query and UPDATE surfaces. The mandated `VERSION "1.2"` prologue declaration is accepted (lexed and skipped), so conformant 1.2 clients parse normally. This is the standards-based way to attach metadata to a specific edge `(subject, predicate, object)`. For the full model, output shape, and lifecycle, see **[Edge annotations](../concepts/edge-annotations.md)**.
+
+### Querying annotations
+
+Match an edge's annotation metadata with an annotation tail in `WHERE`:
+
+```sparql
+PREFIX ex: <http://example.org/>
+SELECT ?role WHERE {
+  ex:alice ex:worksFor ex:acme {| ex:role ?role |} .
+}
+```
+
+Walk from an annotation subject back to the edge it reifies with `rdf:reifies` and a triple term:
+
+```sparql
+PREFIX ex:  <http://example.org/>
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+SELECT ?ann ?role WHERE {
+  ?ann rdf:reifies <<( ex:alice ex:worksFor ex:acme )>> ;
+       ex:role ?role .
+}
+```
+
+A triple term `<<( s p o )>>` is accepted **only** as the object of `rdf:reifies`. The bare (parenthesis-free) `<< s p o >>` form is a separate, Fluree-specific construct for `f:t` / `f:op` flake-metadata extraction (see [Time Travel](#history-queries) above) — the two do not compose.
+
+### Updating with annotations
+
+The reifier can be named (`~ <iri>`), a variable (`~ ?v`, templates only), blank (`~ _:b`), or anonymous (a bare `{| ... |}`):
+
+```sparql
+PREFIX ex: <http://example.org/>
+INSERT DATA {
+  ex:alice ex:worksFor ex:acme ~ ex:emp1 {| ex:role "Engineer" |} .
+}
+```
+
+Annotation tails are supported in `INSERT DATA`, `DELETE DATA`, and `INSERT { } WHERE { }` / `DELETE { } WHERE { }` templates. Per-operation reifier rules (e.g. variables are template-only; blank/anonymous reifiers are rejected in `DELETE DATA`) are tabulated in the [concept doc](../concepts/edge-annotations.md#sparql-update-rules-by-operation).
+
+### Boundaries (rejected at parse / lowering time)
+
+- **Default graph only.** An annotation tail inside an explicit `GRAPH { }` block, or under a `WITH <g>` template, is rejected — SPARQL UPDATE annotations target the default graph. Use the JSON-LD `@annotation` surface to annotate an edge inside a named graph.
+- **Simple-predicate triples only.** `?s ex:p1/ex:p2 ?o {| ... |}` (property-path) is rejected.
+- **Triple terms only as `rdf:reifies` objects**; any other use errors at parse time.
+- **No reserved predicates by hand.** The [system predicates](../reference/vocabulary.md#edge-annotation-predicates-reserved) that back annotations are rejected on every UPDATE clause; mint annotations only through the `~` / `{| |}` surface.
+- **No annotations in `CONSTRUCT` templates** (the template output form is deferred); a `CONSTRUCT` whose `WHERE` uses annotations to filter still works.
+- **SPARQL 1.2 triple-term functions** (`TRIPLE`, `SUBJECT`, `PREDICATE`, `OBJECT`, `isTRIPLE`, and the `BIND(<<( ?s ?p ?o )>> AS ?t)` constructor) are deferred.
+
 ## SPARQL UPDATE
 
-Fluree supports SPARQL 1.1 Update for modifying data using standard SPARQL syntax. SPARQL UPDATE requests use the `application/sparql-update` content type and are sent to the update endpoints.
+Fluree supports SPARQL 1.1 Update for modifying data using standard SPARQL syntax, plus the RDF 1.2 annotation tail described in [Edge annotations](#edge-annotations-sparql-12--rdf-12) above. SPARQL UPDATE requests use the `application/sparql-update` content type and are sent to the update endpoints.
 
 ### INSERT DATA
 
@@ -1022,6 +1092,7 @@ Current restrictions / boundaries:
 - **DELETE WHERE + GRAPH blocks**: `GRAPH <iri> { ... }` blocks are not yet supported inside `DELETE WHERE { ... }`.
 - **SERVICE**: Only local-ledger endpoints of the form `fluree:ledger:<name>[:<branch>]` are supported; arbitrary remote HTTP `SERVICE` endpoints are not supported.
 - **Property paths**: Supported in `WHERE` (subject to Fluree capability settings).
+- **Edge annotations are default-graph only**: an annotation tail (`{| ... |}`) inside an explicit `GRAPH { }` block or under a `WITH <g>` template is rejected; a blank or anonymous reifier is rejected in `DELETE DATA`. See [Edge annotations](#edge-annotations-sparql-12--rdf-12) for the full boundary list.
 
 ### Endpoint Usage
 
@@ -1060,6 +1131,7 @@ curl -X POST http://localhost:8090/v1/fluree/update \
 ## Related Documentation
 
 - [JSON-LD Query](jsonld-query.md): Fluree's native query language
+- [Edge annotations](../concepts/edge-annotations.md): RDF 1.2 / SPARQL 1.2 edge metadata (annotation tail, `~` reifier, `rdf:reifies`)
 - [CONSTRUCT Queries](construct.md): Generating RDF graphs
 - [Datasets](datasets.md): Multi-graph queries
 - [Output Formats](output-formats.md): Query result formats

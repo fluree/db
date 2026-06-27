@@ -63,6 +63,12 @@ pub enum QueryError {
     #[error(transparent)]
     FuelLimitExceeded(#[from] fluree_db_core::FuelExceededError),
 
+    /// Query execution was cancelled cooperatively.
+    #[error("Query cancelled: {reason}")]
+    Cancelled {
+        reason: fluree_db_core::QueryCancellationReason,
+    },
+
     /// Internal error (should not happen in normal operation)
     #[error("Internal error: {0}")]
     Internal(String),
@@ -74,6 +80,15 @@ pub enum QueryError {
     /// Query mode not yet supported with binary indexes
     #[error("Unsupported mode: {0}")]
     UnsupportedMode(String),
+
+    /// A syntactically valid query feature is not yet implemented.
+    ///
+    /// Distinguished from [`Self::UnsupportedMode`] (which is mode-bound) and
+    /// [`Self::InvalidQuery`] (which is user-error). Examples: edge
+    /// annotations parsed but no executor wired, deferred property-path
+    /// shapes, etc.
+    #[error("Unsupported feature: {0}")]
+    UnsupportedFeature(String),
 
     /// Requested time range not covered by binary index
     #[error("Time range not covered: requested t={requested_t} but base_t={base_t}")]

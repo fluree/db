@@ -470,6 +470,40 @@ impl VectorIndexProvider for FlureeIndexProvider<'_> {
 
         Ok(record.is_some() && record.map(|r| !r.retracted).unwrap_or(false))
     }
+
+    /// The expanded embedding property IRI this graph source indexes, read from
+    /// the published graph-source record config. Used to enforce view policy on
+    /// vector search hits.
+    async fn embedding_property(&self, graph_source_id: &str) -> QueryResult<Option<String>> {
+        let Some(record) = self
+            .fluree
+            .nameservice()
+            .lookup_graph_source(graph_source_id)
+            .await
+            .map_err(|e| QueryError::Internal(format!("Nameservice error: {e}")))?
+        else {
+            return Ok(None);
+        };
+        let config: serde_json::Value = serde_json::from_str(&record.config)
+            .map_err(|e| QueryError::Internal(format!("graph source config parse: {e}")))?;
+        let Some(raw) = config
+            .get("embedding_property")
+            .and_then(serde_json::Value::as_str)
+        else {
+            return Ok(None);
+        };
+        // Expand a prefixed name with the indexing query's @context, mirroring
+        // how the index itself resolves the property.
+        let context = config
+            .get("query")
+            .and_then(|q| q.get("@context"))
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({}));
+        let prefix_map = crate::graph_source::helpers::extract_prefix_map(&context);
+        let expanded = crate::graph_source::helpers::expand_prefixed_iri(raw, &prefix_map)
+            .unwrap_or_else(|| raw.to_string());
+        Ok(Some(expanded))
+    }
 }
 
 #[cfg(feature = "vector")]

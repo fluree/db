@@ -1063,6 +1063,7 @@ mod tests {
             offset: None,
             reasoning: ReasoningConfig::default(),
             post_values: None,
+            include_system_facts: false,
         }
     }
 

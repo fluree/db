@@ -195,7 +195,7 @@ listen_addr = "0.0.0.0:8090"
 storage_path = "/var/lib/fluree"
 log_level = "info"
 cors_enabled = true
-# cache_max_mb = 4096  # global cache budget (MB); default: tiered fraction of RAM (30% <4GB, 40% 4-8GB, 50% ≥8GB)
+# cache_max_mb = 4096  # global cache budget (MB); default: tiered by RAM (<4GB: 30%, 4-8GB: 40%, >=8GB: 35%)
 
 [server.indexing]
 enabled = true
@@ -228,10 +228,12 @@ fluree server run
 # error: server support not compiled. Rebuild with `--features server`.
 ```
 
-For S3/DynamoDB support via `--connection-config`, the `aws` feature must be enabled:
+S3/DynamoDB support via `--connection-config` requires the `aws` feature, which
+is **on by default** for the CLI (and the published Docker image). It is dormant
+unless an AWS backend is configured. To build a CLI *without* it:
 
 ```bash
-cargo build -p fluree-db-cli --features aws
+cargo build -p fluree-db-cli --no-default-features --features server,iceberg,shacl
 ```
 
 Without this feature, S3 storage configs in the connection config will produce a clear error at startup.

@@ -79,6 +79,27 @@ pub fn is_schema_flake(predicate: &Sid, object: &FlakeValue) -> bool {
         || (is_rdf_type(predicate) && is_schema_type(object))
 }
 
+/// Predicate-axis subset of [`is_schema_flake`]: predicates that can make a
+/// flake a schema flake irrespective of its object.
+///
+/// Used by [`PolicySet::covers_predicate`](crate::PolicySet::covers_predicate)
+/// so schema predicates are always reported as "covered" — keeping them on the
+/// per-flake path where the [`is_schema_flake`] bypass fires, instead of being
+/// constant-folded to an empty result under a default-deny policy.
+///
+/// `rdf:type`'s schema-ness depends on the object (only schema class/property
+/// objects qualify), but a query planner sees only the predicate, so `rdf:type`
+/// is treated as a schema predicate here. This is the safe over-covering
+/// direction: it forgoes the fast-path skip for `rdf:type` scans rather than
+/// risk constant-folding a genuine schema type-assertion.
+pub fn is_schema_predicate(predicate: &Sid) -> bool {
+    is_rdfs_subclass_of(predicate)
+        || is_rdfs_subproperty_of(predicate)
+        || is_rdfs_domain(predicate)
+        || is_rdfs_range(predicate)
+        || is_rdf_type(predicate)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -127,5 +148,19 @@ mod tests {
 
         // Regular property assertion is NOT a schema flake
         assert!(!is_schema_flake(&name_prop, &value));
+    }
+
+    #[test]
+    fn test_is_schema_predicate() {
+        // Schema structural predicates (object-independent).
+        assert!(is_schema_predicate(&make_sid(RDFS, "subClassOf")));
+        assert!(is_schema_predicate(&make_sid(RDFS, "subPropertyOf")));
+        assert!(is_schema_predicate(&make_sid(RDFS, "domain")));
+        assert!(is_schema_predicate(&make_sid(RDFS, "range")));
+        // rdf:type over-covers (schema-ness is object-dependent, but the
+        // planner sees only the predicate).
+        assert!(is_schema_predicate(&make_sid(RDF, "type")));
+        // A regular data property is not a schema predicate.
+        assert!(!is_schema_predicate(&make_sid(100, "name")));
     }
 }

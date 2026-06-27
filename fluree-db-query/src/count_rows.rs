@@ -118,8 +118,10 @@ impl Operator for CountRowsOperator {
         }
 
         while let Some(batch) = self.fast_child.next_batch(ctx).await? {
+            ctx.check_cancelled()?;
             self.count += batch.len() as i64;
         }
+        ctx.check_cancelled()?;
 
         self.done = true;
         Ok(Some(self.build_output_batch(self.count)?))

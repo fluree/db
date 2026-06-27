@@ -77,6 +77,11 @@ pub use scan::{
 // AWS/Send-safe types
 #[cfg(feature = "aws")]
 pub use catalog::SendDirectCatalogClient;
+/// Re-export of the shared on-disk blob cache (one global budget across Fluree's
+/// own object storage and Iceberg). The provider builds one per cache directory
+/// and threads it into the Parquet readers.
+#[cfg(feature = "aws")]
+pub use fluree_db_core::disk_cache::DiskArtifactCache;
 #[cfg(feature = "aws")]
 pub use io::{S3IcebergStorage, SendIcebergStorage, SendParquetReader};
 #[cfg(feature = "aws")]

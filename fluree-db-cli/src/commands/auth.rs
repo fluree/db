@@ -383,6 +383,7 @@ async fn run_oidc_login(config: &mut fluree_db_nameservice_sync::RemoteConfig) -
     };
 
     eprintln!("  IdP authentication successful");
+    warn_on_scope_downgrade(&scopes, idp_tokens.granted_scope.as_deref());
 
     // Step 3: Exchange IdP token for Fluree token
     //
@@ -408,7 +409,37 @@ async fn run_oidc_login(config: &mut fluree_db_nameservice_sync::RemoteConfig) -
     config.auth.token = Some(fluree_tokens.access_token);
     config.auth.refresh_token = fluree_tokens.refresh_token;
 
+    if config.auth.refresh_token.is_none() {
+        eprintln!(
+            "  {} no refresh token issued; you will need to run `fluree auth login` again when the token expires",
+            "note:".cyan().bold()
+        );
+    }
+
     Ok(())
+}
+
+/// Warn if the IdP granted fewer scopes than were requested.
+///
+/// OAuth providers may silently downgrade scopes (RFC 6749 §3.3); the token
+/// is still valid, so this is a warning, not an error — but a missing scope
+/// surfaces later as an unrelated authorization failure, which is hard to
+/// diagnose. Surfacing it at login makes the cause obvious. Skipped when the
+/// IdP does not echo a `scope` field (granted set is then unknown).
+fn warn_on_scope_downgrade(requested: &str, granted: Option<&str>) {
+    let Some(granted) = granted else { return };
+    let granted: std::collections::HashSet<&str> = granted.split_whitespace().collect();
+    let missing: Vec<&str> = requested
+        .split_whitespace()
+        .filter(|s| !granted.contains(s))
+        .collect();
+    if !missing.is_empty() {
+        eprintln!(
+            "  {} IdP granted fewer scopes than requested; missing: {}",
+            "warning:".yellow().bold(),
+            missing.join(", ")
+        );
+    }
 }
 
 /// Fetch OIDC discovery document and determine which flow to use.
@@ -591,6 +622,9 @@ struct IdpTokenResponse {
     /// Present when the IdP returns an id_token (e.g., Cognito auth code flow).
     /// Preferred for exchange because its `aud` claim matches the client_id.
     id_token: Option<String>,
+    /// The `scope` the IdP actually granted, when echoed in the token response.
+    /// Compared against the requested scopes to warn on a silent downgrade.
+    granted_scope: Option<String>,
 }
 
 /// Poll the token endpoint until the user completes authorization.
@@ -633,10 +667,12 @@ async fn poll_for_token(
                 .get("id_token")
                 .and_then(|v| v.as_str())
                 .map(String::from);
+            let granted_scope = body.get("scope").and_then(|v| v.as_str()).map(String::from);
 
             return Ok(IdpTokenResponse {
                 access_token,
                 id_token,
+                granted_scope,
             });
         }
 
@@ -793,10 +829,12 @@ async fn run_auth_code_flow(
         .get("id_token")
         .and_then(|v| v.as_str())
         .map(String::from);
+    let granted_scope = body.get("scope").and_then(|v| v.as_str()).map(String::from);
 
     Ok(IdpTokenResponse {
         access_token,
         id_token,
+        granted_scope,
     })
 }
 

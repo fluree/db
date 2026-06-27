@@ -476,28 +476,29 @@ impl DictOverlay {
     ///
     /// Unlike `BinaryIndexStore::value_to_obj_pair()`, this never returns `None`
     /// for representable values.
-    pub fn value_to_obj_pair(&mut self, val: &FlakeValue) -> io::Result<(ObjKind, ObjKey)> {
+    ///
+    /// Kept for: parity with the live `value_to_otype_okey` encoder in
+    /// `binary_scan.rs` — both must apply the same integral-double guard so a
+    /// future overlay write path can reuse this twin without reintroducing the
+    /// subnormal corruption (fluree/db-r#142).
+    /// Use when: a `DictOverlay`-based write path needs (ObjKind, ObjKey) pairs.
+    #[expect(dead_code)]
+    pub(crate) fn value_to_obj_pair(&mut self, val: &FlakeValue) -> io::Result<(ObjKind, ObjKey)> {
         match val {
             FlakeValue::Null => Ok((ObjKind::NULL, ObjKey::from_u64(0))),
             FlakeValue::Boolean(b) => Ok((ObjKind::BOOL, ObjKey::encode_bool(*b))),
             FlakeValue::Long(n) => Ok((ObjKind::NUM_INT, ObjKey::encode_i64(*n))),
 
             FlakeValue::Double(d) => {
-                // Integer-valued doubles that fit i64 → NUM_INT
-                if d.is_finite() && d.fract() == 0.0 {
-                    let as_i64 = *d as i64;
-                    if (as_i64 as f64) == *d {
-                        return Ok((ObjKind::NUM_INT, ObjKey::encode_i64(as_i64)));
-                    }
-                }
-                if d.is_finite() {
-                    match ObjKey::encode_f64(*d) {
-                        Ok(key) => Ok((ObjKind::NUM_F64, key)),
-                        Err(_) => Ok((ObjKind::NULL, ObjKey::from_u64(0))),
-                    }
-                } else {
-                    // NaN/Inf → NULL sentinel (can't represent in index)
-                    Ok((ObjKind::NULL, ObjKey::from_u64(0)))
+                // Do NOT optimize integral doubles to NUM_INT: when paired with a
+                // float/double datatype the decode resolves an F64 OType and runs
+                // decode_f64 over the i64-encoded bits, corrupting the value to a
+                // tiny subnormal. Mirrors value_to_otype_okey and the encode-side
+                // guards in resolver.rs / import_sink.rs. (fluree/db-r#142)
+                match ObjKey::encode_f64(*d) {
+                    Ok(key) => Ok((ObjKind::NUM_F64, key)),
+                    // NaN/Inf can't be order-encoded → NULL sentinel.
+                    Err(_) => Ok((ObjKind::NULL, ObjKey::from_u64(0))),
                 }
             }
 

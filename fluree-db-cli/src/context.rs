@@ -285,6 +285,13 @@ pub fn build_client_from_auth(base_url: &str, auth: &RemoteAuth) -> RemoteLedger
                 refresh_token: refresh_token.clone(),
             });
         }
+    } else if auth.refresh_token.is_some() {
+        // Auto-refresh only engages for `oidc_device`; a refresh_token under any
+        // other auth type is dead config that will never be used. Warn rather
+        // than silently ignore it.
+        eprintln!(
+            "warning: 'refresh_token' is set but auth type is not 'oidc_device'; it will be ignored"
+        );
     }
 
     client
@@ -329,6 +336,24 @@ pub fn build_fluree(dirs: &FlureeDir) -> CliResult<Fluree> {
     builder
         .build()
         .map_err(|e| CliError::Config(format!("failed to initialize Fluree: {e}")))
+}
+
+/// Build the Fluree instance that backs the developer-memory store
+/// (`mcp serve`, `fluree memory`).
+///
+/// Unlike [`build_fluree`], this uses a **process-private, in-memory** ledger
+/// rather than the shared on-disk `.fluree/storage`. The git-tracked
+/// `.fluree-memory/*.ttl` files remain the durable source of truth; the ledger
+/// is a disposable query cache rebuilt from them on startup. Keeping it private
+/// is what makes concurrent access safe: several memory helpers can run at once
+/// (one per IDE/agent session, plus overlapping CLI invocations) without one
+/// process's cache rebuild deleting commits another process is reading. It also
+/// right-sizes memory — an in-memory ledger never holds the server's RAM-tiered
+/// leaflet cache — and the cap below keeps that explicit.
+pub fn build_memory_fluree() -> Fluree {
+    FlureeBuilder::memory()
+        .cache_max_mb(fluree_db_api::server_defaults::DEFAULT_MEMORY_HELPER_CACHE_MAX_MB)
+        .build_memory()
 }
 
 /// Normalize a ledger identifier to include a branch suffix if missing.

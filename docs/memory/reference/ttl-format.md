@@ -52,6 +52,13 @@ When you `memory add`, the CLI / MCP server:
 
 If the ledger write fails, the hash is left stale and the next `ensure_synced` call rebuilds the ledger from the files. When git pulls in a new version of `repo.ttl`, the hash mismatch triggers the same rebuild. In practice this is invisible.
 
+## Concurrent access
+
+It's normal for several processes to touch one project's memory at once — Cursor and Claude Code together, or several Claude sessions, each running its own `fluree mcp serve`. Two guarantees keep that safe:
+
+- **The TTL file is the only shared mutable state, and writes are serialized.** Every mutation takes a cross-process file lock (`.fluree-memory/.local/rebuild.lock`) before rewriting the file, and re-reads the file under that lock, so two writers can't lose each other's memories.
+- **Each process keeps its ledger cache private.** The `mcp serve` ledger is held **in-memory** and rebuilt from the TTL files on startup, so one process refreshing its cache can never disturb another's. Each process also tracks, in memory, the file content its own ledger reflects — the shared on-disk `build-hash` alone can't tell a long-running process that *another* process changed the files, so the per-process watermark is what triggers its rebuild. (Short-lived `fluree memory` CLI commands keep a file-backed ledger for `import` and legacy migration; they're not long-lived enough to drift.)
+
 ## Editing by hand
 
 You *can* edit `repo.ttl` or `user.ttl` directly if you need to — fix a typo, reorder, batch-retag. After editing:

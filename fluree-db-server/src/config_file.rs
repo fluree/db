@@ -61,7 +61,14 @@ pub struct ServerFileConfig {
     pub log_level: Option<String>,
     pub cors_enabled: Option<bool>,
     pub body_limit: Option<usize>,
+    pub query_timeout_ms: Option<u64>,
+    pub query_min_t_timeout_ms: Option<u64>,
     pub cache_max_mb: Option<usize>,
+    pub disk_cache_max_mb: Option<usize>,
+
+    /// `[server.query_refresh]`
+    #[serde(default)]
+    pub query_refresh: Option<QueryRefreshFileConfig>,
 
     /// `[server.indexing]`
     #[serde(default)]
@@ -82,6 +89,23 @@ pub struct ServerFileConfig {
     /// `[server.storage_proxy]`
     #[serde(default)]
     pub storage_proxy: Option<StorageProxyFileConfig>,
+
+    /// `[server.raft]` — Raft cluster mode (replicated writes).
+    /// Only consumed when the `raft` feature is built; deserializes
+    /// silently when the feature is off so configs are portable.
+    #[serde(default)]
+    pub raft: Option<RaftFileConfig>,
+}
+
+/// Raft cluster mode settings. Mirrors the
+/// `--raft-*` CLI flags. All fields are optional in the file; the
+/// CLI overlay decides which are required at validation time.
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
+pub struct RaftFileConfig {
+    pub enabled: Option<bool>,
+    pub node_id: Option<u64>,
+    pub storage_path: Option<String>,
+    pub listen_addr: Option<String>,
 }
 
 #[derive(Debug, Default, Clone, Deserialize, Serialize)]
@@ -89,6 +113,12 @@ pub struct IndexingFileConfig {
     pub enabled: Option<bool>,
     pub reindex_min_bytes: Option<usize>,
     pub reindex_max_bytes: Option<usize>,
+}
+
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
+pub struct QueryRefreshFileConfig {
+    pub enabled: Option<bool>,
+    pub ttl_ms: Option<u64>,
 }
 
 #[derive(Debug, Default, Clone, Deserialize, Serialize)]
@@ -158,6 +188,8 @@ pub struct McpFileConfig {
     pub auth_trusted_issuers: Option<Vec<String>>,
     /// Byte budget for the MCP `sparql_query` Agent JSON envelope.
     pub agent_json_max_bytes: Option<usize>,
+    /// Query timeout for MCP `sparql_query`, in milliseconds.
+    pub query_timeout_ms: Option<u64>,
 }
 
 #[derive(Debug, Default, Clone, Deserialize, Serialize)]
@@ -373,7 +405,12 @@ pub const CONFIG_FILE_ARG_IDS: &[&str] = &[
     "log_level",
     "cors_enabled",
     "body_limit",
+    "query_timeout_ms",
+    "query_min_t_timeout_ms",
+    "query_refresh_enabled",
+    "query_refresh_ttl_ms",
     "cache_max_mb",
+    "disk_cache_max_mb",
     "indexing_enabled",
     "reindex_min_bytes",
     "reindex_max_bytes",
@@ -402,6 +439,7 @@ pub const CONFIG_FILE_ARG_IDS: &[&str] = &[
     "mcp_enabled",
     "mcp_auth_trusted_issuers",
     "mcp_agent_json_max_bytes",
+    "mcp_query_timeout_ms",
     "storage_proxy_enabled",
     "storage_proxy_trusted_issuers",
     "storage_proxy_default_identity",
@@ -476,9 +514,38 @@ pub fn apply_to_server_config(
             config.body_limit = v;
         }
     }
+    if is_default("query_timeout_ms") {
+        if let Some(v) = file.query_timeout_ms {
+            config.query_timeout_ms = v;
+        }
+    }
+    if is_default("query_min_t_timeout_ms") {
+        if let Some(v) = file.query_min_t_timeout_ms {
+            config.query_min_t_timeout_ms = v;
+        }
+    }
     if is_default("cache_max_mb") {
         if let Some(v) = file.cache_max_mb {
             config.cache_max_mb = Some(v);
+        }
+    }
+    if is_default("disk_cache_max_mb") {
+        if let Some(v) = file.disk_cache_max_mb {
+            config.disk_cache_max_mb = Some(v);
+        }
+    }
+
+    // --- Query-time refresh ---
+    if let Some(ref refresh) = file.query_refresh {
+        if is_default("query_refresh_enabled") {
+            if let Some(v) = refresh.enabled {
+                config.query_refresh_enabled = v;
+            }
+        }
+        if is_default("query_refresh_ttl_ms") {
+            if let Some(v) = refresh.ttl_ms {
+                config.query_refresh_ttl_ms = v;
+            }
         }
     }
 
@@ -711,6 +778,11 @@ pub fn apply_to_server_config(
                 config.mcp_agent_json_max_bytes = v;
             }
         }
+        if is_default("mcp_query_timeout_ms") {
+            if let Some(v) = mcp.query_timeout_ms {
+                config.mcp_query_timeout_ms = v;
+            }
+        }
     }
 
     // --- Storage proxy ---
@@ -740,6 +812,41 @@ pub fn apply_to_server_config(
                 config.storage_proxy_debug_headers = v;
             }
         }
+    }
+
+    // --- Raft ---
+    #[cfg(feature = "raft")]
+    if let Some(ref raft) = file.raft {
+        if is_default("raft_enabled") {
+            if let Some(v) = raft.enabled {
+                config.raft_enabled = v;
+            }
+        }
+        if is_default("raft_node_id") {
+            if let Some(v) = raft.node_id {
+                config.raft_node_id = Some(v);
+            }
+        }
+        if is_default("raft_storage_path") {
+            if let Some(ref v) = raft.storage_path {
+                config.raft_storage_path = Some(PathBuf::from(v));
+            }
+        }
+        if is_default("raft_listen_addr") {
+            if let Some(ref addr_str) = raft.listen_addr {
+                match addr_str.parse::<SocketAddr>() {
+                    Ok(addr) => config.raft_listen_addr = Some(addr),
+                    Err(_) => warn!(
+                        value = addr_str,
+                        "Invalid raft.listen_addr in config file, ignoring"
+                    ),
+                }
+            }
+        }
+    }
+    #[cfg(not(feature = "raft"))]
+    {
+        let _ = &file.raft;
     }
 }
 
@@ -875,7 +982,12 @@ listen_addr = "127.0.0.1:9090"
 storage_path = "/var/lib/fluree"
 log_level = "debug"
 cors_enabled = false
+query_min_t_timeout_ms = 5000
 cache_max_mb = 5000
+
+[server.query_refresh]
+enabled = true
+ttl_ms = 200
 
 [server.indexing]
 enabled = true
@@ -897,7 +1009,12 @@ default_policy_class = "ex:DefaultPolicy"
         assert_eq!(server.storage_path.as_deref(), Some("/var/lib/fluree"));
         assert_eq!(server.log_level.as_deref(), Some("debug"));
         assert_eq!(server.cors_enabled, Some(false));
+        assert_eq!(server.query_min_t_timeout_ms, Some(5000));
         assert_eq!(server.cache_max_mb, Some(5000));
+
+        let refresh = server.query_refresh.unwrap();
+        assert_eq!(refresh.enabled, Some(true));
+        assert_eq!(refresh.ttl_ms, Some(200));
 
         let idx = server.indexing.unwrap();
         assert_eq!(idx.enabled, Some(true));

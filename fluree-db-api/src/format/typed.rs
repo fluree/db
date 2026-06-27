@@ -202,6 +202,30 @@ fn write_value(
             }
             out.push(']');
         }
+        // A path renders as an array of `{"@id": ...}` node references.
+        Binding::Path(nodes) => {
+            out.push('[');
+            for (i, sid) in nodes.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                out.push_str(r#"{"@id":"#);
+                push_json_string(out, &compactor.compact_id_sid(sid)?);
+                out.push('}');
+            }
+            out.push(']');
+        }
+        // A list renders as a JSON array of its (typed) elements.
+        Binding::List(values) => {
+            out.push('[');
+            for (i, v) in values.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                write_value(out, result, v, compactor)?;
+            }
+            out.push(']');
+        }
         Binding::EncodedLit { .. } | Binding::EncodedSid { .. } | Binding::EncodedPid { .. } => {
             unreachable!("encoded bindings are materialized before write_value")
         }
@@ -298,7 +322,7 @@ fn write_lit(
 fn stringified(val: &FlakeValue) -> String {
     match val {
         FlakeValue::BigInt(n) => n.to_string(),
-        FlakeValue::Decimal(d) => d.to_string(),
+        FlakeValue::Decimal(d) => d.to_plain_string(),
         other => other.to_string(),
     }
 }
@@ -410,7 +434,7 @@ pub(crate) fn format_binding(
                     "@type": dt_iri
                 })),
                 FlakeValue::Decimal(d) => Ok(json!({
-                    "@value": d.to_string(),
+                    "@value": d.to_plain_string(),
                     "@type": dt_iri
                 })),
                 // Temporal types - serialize as original string with datatype
@@ -480,6 +504,24 @@ pub(crate) fn format_binding(
                 .collect();
             Ok(JsonValue::Array(arr?))
         }
+
+        // A path - array of `{"@id": ...}` node references.
+        Binding::Path(nodes) => {
+            let arr: Result<Vec<_>> = nodes
+                .iter()
+                .map(|sid| compactor.compact_id_sid(sid).map(|iri| json!({"@id": iri})))
+                .collect();
+            Ok(JsonValue::Array(arr?))
+        }
+
+        // A list - array of its (typed) elements.
+        Binding::List(values) => {
+            let arr: Result<Vec<_>> = values
+                .iter()
+                .map(|v| format_binding(result, v, compactor))
+                .collect();
+            Ok(JsonValue::Array(arr?))
+        }
     }
 }
 
@@ -540,9 +582,9 @@ fn format_row_wildcard(
             }
             let var_name = vars.name(var_id);
 
-            // Skip internal variables (e.g. ?__pp0, ?__s0, ?__n0) from wildcard output.
-            // The ?__ prefix is reserved for internal use.
-            if var_name.starts_with("?__") {
+            // Skip internal / non-distinguished variables (planner synthetics,
+            // annotation-reifier synthetics, SPARQL blank-node vars).
+            if super::is_internal_var_name(var_name) {
                 continue;
             }
 

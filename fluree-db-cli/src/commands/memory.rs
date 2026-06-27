@@ -7,11 +7,22 @@ use fluree_db_memory::{
     RecallEngine, RecallResult, Scope, SecretDetector,
 };
 
-mod ide;
-
 pub async fn run(action: MemoryAction, dirs: &FlureeDir) -> CliResult<()> {
     match action {
-        MemoryAction::Init { yes, no_mcp } => run_init(dirs, yes, no_mcp).await,
+        // Deprecated alias: `fluree memory init` used to create the store and
+        // install IDE config. The store is now created lazily on first use, so
+        // this just registers the memory MCP server (the IDE-config half).
+        MemoryAction::Init { ide, no_mcp, .. } => {
+            if no_mcp {
+                eprintln!(
+                    "note: `fluree memory init` is deprecated; the memory store is now created \
+                     lazily on first use, so there is nothing to initialize. To register the MCP \
+                     server, run `fluree mcp init --toolsets memory`."
+                );
+                return Ok(());
+            }
+            crate::commands::mcp::memory_alias_install(ide.as_deref())
+        }
         MemoryAction::Add {
             kind,
             text,
@@ -57,11 +68,18 @@ pub async fn run(action: MemoryAction, dirs: &FlureeDir) -> CliResult<()> {
         MemoryAction::Status => run_status(dirs).await,
         MemoryAction::Export => run_export(dirs).await,
         MemoryAction::Import { file } => run_import(&file, dirs).await,
-        MemoryAction::McpInstall { ide: ide_arg } => ide::run_mcp_install(ide_arg.as_deref()),
+        MemoryAction::McpInstall { ide: ide_arg } => {
+            crate::commands::mcp::memory_alias_install(ide_arg.as_deref())
+        }
     }
 }
 
 fn build_store(dirs: &FlureeDir) -> CliResult<MemoryStore> {
+    // Short-lived CLI commands keep a persistent (file-backed) ledger so that
+    // `import` and the `init` legacy-ledger migration work and repeated
+    // invocations don't rebuild from scratch. The long-lived `mcp serve` path
+    // uses an ephemeral in-memory ledger instead (see `mcp_serve`), which is
+    // what makes many concurrent MCP processes safe.
     let fluree = context::build_fluree(dirs)?;
 
     // Determine memory_dir: use .fluree-memory/ at the project root.
@@ -87,78 +105,7 @@ async fn build_synced_store(dirs: &FlureeDir) -> CliResult<MemoryStore> {
 }
 
 // ---------------------------------------------------------------------------
-// init
-// ---------------------------------------------------------------------------
-
-async fn run_init(dirs: &FlureeDir, yes: bool, no_mcp: bool) -> CliResult<()> {
-    // === Phase 1: Initialize memory store (existing behavior) ===
-    let store = build_store(dirs)?;
-    store.initialize().await.map_err(memory_err)?;
-
-    // Migration: export existing ledger memories to .ttl files
-    if let Some(memory_dir) = store.memory_dir() {
-        let memory_dir = memory_dir.to_path_buf();
-        let repo_ttl = fluree_db_memory::turtle_io::repo_ttl_path(&memory_dir);
-        let user_ttl = fluree_db_memory::turtle_io::user_ttl_path(&memory_dir);
-
-        let existing = store
-            .current_memories(&MemoryFilter::default())
-            .await
-            .map_err(memory_err)?;
-        if !existing.is_empty() {
-            let repo_mems: Vec<_> = existing
-                .iter()
-                .filter(|m| m.scope == fluree_db_memory::Scope::Repo)
-                .cloned()
-                .collect();
-            let user_mems: Vec<_> = existing
-                .iter()
-                .filter(|m| m.scope == fluree_db_memory::Scope::User)
-                .cloned()
-                .collect();
-
-            if !repo_mems.is_empty() {
-                fluree_db_memory::turtle_io::write_memory_file(
-                    &repo_ttl,
-                    &repo_mems,
-                    fluree_db_memory::turtle_io::REPO_HEADER,
-                )
-                .map_err(memory_err)?;
-            }
-            if !user_mems.is_empty() {
-                fluree_db_memory::turtle_io::write_memory_file(
-                    &user_ttl,
-                    &user_mems,
-                    fluree_db_memory::turtle_io::USER_HEADER,
-                )
-                .map_err(memory_err)?;
-            }
-
-            fluree_db_memory::file_sync::update_hash(&memory_dir).map_err(memory_err)?;
-
-            println!(
-                "Migrated {} existing memories to .ttl files.",
-                existing.len()
-            );
-        }
-
-        println!("Memory store initialized at {}", memory_dir.display());
-        println!();
-        println!("Repo memories are stored in .fluree-memory/repo.ttl (git-tracked).");
-        println!("Commit this directory to share project knowledge with your team.");
-    } else {
-        println!("Memory store initialized.");
-    }
-
-    // === Phase 2: Detect and configure AI tools ===
-    if no_mcp {
-        return Ok(());
-    }
-    ide::run_mcp_phase(yes)
-}
-
-// ---------------------------------------------------------------------------
-// Remaining subcommands (unchanged)
+// Subcommands
 // ---------------------------------------------------------------------------
 
 #[allow(clippy::too_many_arguments)]

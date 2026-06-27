@@ -154,6 +154,7 @@ fluree init --global     # Create global config (~/.config/fluree/)
 ```bash
 fluree create mydb                          # Create a new ledger
 fluree create mydb --from ./data.ttl        # Create and bulk-import Turtle data
+fluree create mydb --from ./data.jsonl      # Bulk-import newline-delimited JSON-LD
 fluree list                                 # List local ledgers
 fluree info mydb                            # Show ledger metadata
 fluree use mydb                             # Set active ledger (used as default)
@@ -200,6 +201,16 @@ fluree create mydb --from ./large-dataset/ \
   --memory-budget-mb 4096 \
   --chunk-size-mb 500
 ```
+
+`--from` accepts a single file or a directory of `.ttl`, `.nt`, `.nq`, `.trig`,
+`.jsonld`, or `.jsonl`/`.ndjson` (newline-delimited JSON-LD) files; any of them
+may carry a `.gz` or `.zst` suffix and is decoded transparently. An ndjson
+source streams in bounded memory regardless of file size: each line is one
+JSON-LD node, optionally preceded by a shared `{"@context": …}` line, and each
+file keeps its own context. A lone context line later in a file replaces the
+shared context from that point on, so concatenated ndjson files compose
+naturally. Directories must contain a single format family (Turtle-family or
+JSON-LD-family) per import.
 
 ### History & Audit
 
@@ -377,9 +388,15 @@ fluree.create_ledger("test").await?;
 
 | Format | Input | Output | Query Language |
 |--------|-------|--------|----------------|
-| **JSON-LD** | Insert/Upsert/Config | Query results | JSON-LD Query |
+| **JSON-LD** (`.jsonld`) | Import/Insert/Upsert/Config | Export, Query results | JSON-LD Query |
+| **Newline-delimited JSON-LD** (`.jsonl`, `.ndjson`) | Import (streaming) | — | — |
 | **Turtle** (`.ttl`) | Import/Insert | Export | — |
-| **TriG** (`.trig`) | Import | — | — |
+| **N-Triples** (`.nt`) | Import | Export | — |
+| **N-Quads** (`.nq`) | Import | Export (all graphs) | — |
+| **TriG** (`.trig`) | Import | Export (all graphs) | — |
 | **SPARQL** (`.rq`, `.sparql`) | — | — | SELECT/CONSTRUCT/UPDATE |
 | **CSV** | — | Query output | — |
 | **Table** | — | Query output (CLI) | — |
+
+Import formats may be compressed (`.gz` / `.zst`), e.g. `data.ttl.gz` or
+`shard-01.jsonl.zst`.

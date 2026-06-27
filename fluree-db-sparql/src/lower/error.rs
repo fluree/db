@@ -43,6 +43,14 @@ pub enum LowerError {
     #[error("Invalid integer literal '{value}'")]
     InvalidInteger { value: String, span: SourceSpan },
 
+    /// Invalid `# PRAGMA ...` directive value
+    #[error("Invalid PRAGMA {pragma}: {message}")]
+    InvalidPragma {
+        pragma: String,
+        message: String,
+        span: SourceSpan,
+    },
+
     /// Aggregate without alias (SELECT COUNT(?x) without AS ?var)
     #[error("Aggregate expressions must have an alias (AS ?var)")]
     AggregateWithoutAlias { span: SourceSpan },
@@ -127,6 +135,19 @@ impl LowerError {
         }
     }
 
+    /// Create an invalid pragma error.
+    pub fn invalid_pragma(
+        pragma: impl Into<String>,
+        message: impl Into<String>,
+        span: SourceSpan,
+    ) -> Self {
+        Self::InvalidPragma {
+            pragma: pragma.into(),
+            message: message.into(),
+            span,
+        }
+    }
+
     /// Create an aggregate without alias error.
     pub fn aggregate_without_alias(span: SourceSpan) -> Self {
         Self::AggregateWithoutAlias { span }
@@ -170,6 +191,7 @@ impl LowerError {
             Self::UnsupportedQueryForm { span, .. } => *span,
             Self::InvalidDecimal { span, .. } => *span,
             Self::InvalidInteger { span, .. } => *span,
+            Self::InvalidPragma { span, .. } => *span,
             Self::AggregateWithoutAlias { span } => *span,
             Self::UnsupportedCountStar { span } => *span,
             Self::InvalidPropertyPath { span, .. } => *span,

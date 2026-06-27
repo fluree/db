@@ -7,12 +7,10 @@
 
 #![cfg(feature = "native")]
 
-mod support;
-
+use crate::support::genesis_ledger;
 use fluree_db_api::{CommitOpts, FlureeBuilder, IndexConfig};
 use fluree_db_transact::ir::TxnOpts;
 use serde_json::json;
-use support::genesis_ledger;
 
 fn test_index_cfg() -> IndexConfig {
     IndexConfig {

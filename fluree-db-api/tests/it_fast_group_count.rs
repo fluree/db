@@ -8,11 +8,12 @@
 //! scan+aggregate pipeline (since there's no binary graph view), which
 //! exercises the fallback path including EmitMask pruning.
 
-mod support;
-
+use crate::support;
+use crate::support::{
+    context_ex_schema, genesis_ledger, normalize_rows, MemoryFluree, MemoryLedger,
+};
 use fluree_db_api::FlureeBuilder;
 use serde_json::json;
-use support::{context_ex_schema, genesis_ledger, normalize_rows, MemoryFluree, MemoryLedger};
 
 // =============================================================================
 // Seed helpers

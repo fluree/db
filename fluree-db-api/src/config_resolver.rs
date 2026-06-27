@@ -35,8 +35,8 @@ use fluree_vocab::config_iris;
 use fluree_vocab::rdf::TYPE as RDF_TYPE_IRI;
 
 use crate::error::Result;
-use crate::view::ReasoningModePrecedence;
-use crate::QueryConnectionOptions;
+use crate::view::{ConfigReasoningBudget, ReasoningModePrecedence};
+use crate::GovernanceOptions;
 
 // ============================================================================
 // Public: Privileged config read
@@ -310,9 +310,9 @@ pub fn configured_fulltext_properties_for_indexer(
 /// 3. No query policy → apply config defaults
 pub fn merge_policy_opts(
     resolved: &ResolvedConfig,
-    opts: &QueryConnectionOptions,
+    opts: &GovernanceOptions,
     server_identity: Option<&str>,
-) -> QueryConnectionOptions {
+) -> GovernanceOptions {
     let policy = match &resolved.policy {
         Some(p) => p,
         None => return opts.clone(),
@@ -383,6 +383,31 @@ pub fn merge_reasoning(
     };
 
     Some((modes.clone(), precedence))
+}
+
+/// Compute the effective OWL2-RL materialization budget from ledger config.
+///
+/// Independent of [`merge_reasoning`]: a ledger can configure a budget
+/// without configuring default modes (the budget then governs queries that
+/// request reasoning themselves). Returns `None` when neither budget field
+/// is configured.
+///
+/// `force` follows the reasoning group's override control: when the request
+/// identity may not override, a query-supplied budget is discarded in favor
+/// of these values.
+pub fn config_reasoning_budget(
+    resolved: &ResolvedConfig,
+    server_identity: Option<&str>,
+) -> Option<ConfigReasoningBudget> {
+    let reasoning = resolved.reasoning.as_ref()?;
+    if reasoning.max_facts.is_none() && reasoning.max_seconds.is_none() {
+        return None;
+    }
+    Some(ConfigReasoningBudget {
+        max_facts: reasoning.max_facts,
+        max_seconds: reasoning.max_seconds,
+        force: !reasoning.override_control.permits_override(server_identity),
+    })
 }
 
 /// Transaction-time SHACL configuration from config graph.
@@ -573,6 +598,8 @@ impl MergeableGroup for ReasoningDefaults {
             schema_source: self.schema_source.clone().or(base.schema_source.clone()),
             follow_owl_imports: self.follow_owl_imports.or(base.follow_owl_imports),
             ontology_import_map: import_map,
+            max_facts: self.max_facts.or(base.max_facts),
+            max_seconds: self.max_seconds.or(base.max_seconds),
             override_control: base.override_control.effective_min(&self.override_control),
         }
     }
@@ -993,6 +1020,22 @@ async fn read_reasoning_defaults(
     )
     .await?;
     let ontology_import_map = read_ontology_import_map(snapshot, overlay, to_t, &group_sid).await?;
+    let max_facts = read_budget_field(
+        snapshot,
+        overlay,
+        to_t,
+        &group_sid,
+        config_iris::REASONING_MAX_FACTS,
+    )
+    .await?;
+    let max_seconds = read_budget_field(
+        snapshot,
+        overlay,
+        to_t,
+        &group_sid,
+        config_iris::REASONING_MAX_SECONDS,
+    )
+    .await?;
     let override_control = read_override_control(snapshot, overlay, to_t, &group_sid).await?;
 
     Ok(Some(ReasoningDefaults {
@@ -1000,8 +1043,33 @@ async fn read_reasoning_defaults(
         schema_source,
         follow_owl_imports,
         ontology_import_map,
+        max_facts,
+        max_seconds,
         override_control,
     }))
+}
+
+/// Read a non-negative integer budget field; negative values are rejected
+/// with a warning rather than silently truncating the closure to zero.
+async fn read_budget_field(
+    snapshot: &LedgerSnapshot,
+    overlay: &dyn OverlayProvider,
+    to_t: i64,
+    subject_sid: &Sid,
+    pred_iri: &str,
+) -> Result<Option<u64>> {
+    match read_i64_field(snapshot, overlay, to_t, subject_sid, pred_iri).await? {
+        Some(n) if n >= 0 => Ok(Some(n as u64)),
+        Some(n) => {
+            tracing::warn!(
+                value = n,
+                predicate = pred_iri,
+                "Ignoring negative reasoning budget in ledger config"
+            );
+            Ok(None)
+        }
+        None => Ok(None),
+    }
 }
 
 /// Read an `f:ontologyImportMap` as a list of [`OntologyImportBinding`].
@@ -1960,7 +2028,7 @@ mod tests {
     #[test]
     fn no_config_policy_returns_opts_unchanged() {
         let resolved = ResolvedConfig::default();
-        let opts = QueryConnectionOptions {
+        let opts = GovernanceOptions {
             identity: Some("did:key:alice".into()),
             ..Default::default()
         };
@@ -1978,7 +2046,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let opts = QueryConnectionOptions::default();
+        let opts = GovernanceOptions::default();
         let merged = merge_policy_opts(&resolved, &opts, None);
         assert!(!merged.default_allow);
         assert_eq!(
@@ -1997,7 +2065,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let opts = QueryConnectionOptions {
+        let opts = GovernanceOptions {
             identity: Some("did:key:alice".into()),
             ..Default::default()
         };
@@ -2017,7 +2085,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let opts = QueryConnectionOptions {
+        let opts = GovernanceOptions {
             identity: Some("did:key:alice".into()),
             ..Default::default()
         };
@@ -2042,7 +2110,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let opts = QueryConnectionOptions {
+        let opts = GovernanceOptions {
             identity: Some("did:key:user".into()),
             ..Default::default()
         };
@@ -2064,7 +2132,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let opts = QueryConnectionOptions {
+        let opts = GovernanceOptions {
             identity: Some("did:key:user".into()),
             ..Default::default()
         };
@@ -2169,6 +2237,77 @@ mod tests {
             ..Default::default()
         };
         assert!(merge_reasoning(&resolved, None).is_none());
+    }
+
+    // --- config_reasoning_budget ---
+
+    #[test]
+    fn reasoning_budget_absent_returns_none() {
+        assert!(config_reasoning_budget(&ResolvedConfig::default(), None).is_none());
+
+        // A reasoning group without budget fields contributes no budget.
+        let resolved = ResolvedConfig {
+            reasoning: Some(ReasoningDefaults {
+                modes: Some(vec!["rdfs".into()]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(config_reasoning_budget(&resolved, None).is_none());
+    }
+
+    #[test]
+    fn reasoning_budget_allow_all_is_not_forced() {
+        let resolved = ResolvedConfig {
+            reasoning: Some(ReasoningDefaults {
+                max_facts: Some(100),
+                max_seconds: Some(10),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let budget = config_reasoning_budget(&resolved, None).unwrap();
+        assert_eq!(budget.max_facts, Some(100));
+        assert_eq!(budget.max_seconds, Some(10));
+        assert!(!budget.force);
+    }
+
+    #[test]
+    fn reasoning_budget_override_none_is_forced() {
+        let resolved = ResolvedConfig {
+            reasoning: Some(ReasoningDefaults {
+                max_facts: Some(100),
+                override_control: OverrideControl::None,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let budget = config_reasoning_budget(&resolved, None).unwrap();
+        assert!(budget.force);
+    }
+
+    #[test]
+    fn reasoning_budget_identity_restricted_follows_identity() {
+        let resolved = ResolvedConfig {
+            reasoning: Some(ReasoningDefaults {
+                max_seconds: Some(60),
+                override_control: OverrideControl::IdentityRestricted {
+                    allowed_identities: identity_set(&["did:key:admin"]),
+                },
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(
+            !config_reasoning_budget(&resolved, Some("did:key:admin"))
+                .unwrap()
+                .force
+        );
+        assert!(
+            config_reasoning_budget(&resolved, Some("did:key:user"))
+                .unwrap()
+                .force
+        );
     }
 
     // --- matches_graph_target ---

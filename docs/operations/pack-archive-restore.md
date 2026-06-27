@@ -51,10 +51,25 @@ For non-CLI archive flows (S3 upload, custom storage), use `Fluree::archive_ledg
 ### Restore (import from `.flpack`)
 
 ```bash
+# Restore into a new LOCAL ledger
 fluree create my-restored-ledger --from /path/to/archive.flpack
+
+# Restore onto a REMOTE server (streams the archive to POST /import)
+fluree create my-restored-ledger --remote origin --from /path/to/archive.flpack
 ```
 
-This reads the `.flpack` file, ingests all CAS objects, and creates a new ledger pointing at the imported commit chain. The ledger name (`my-restored-ledger`) is independent of whatever the original ledger was called.
+Both forms read the `.flpack` archive, ingest all CAS objects (verifying each), and create a new ledger pointing at the imported commit chain. The ledger name (`my-restored-ledger`) is independent of whatever the original ledger was called.
+
+The remote form streams the file to the server's `POST /import/<ledger>` endpoint, so the server materializes the ledger itself — no local staging instance required. This makes `.flpack` the universal on-ramp for getting data onto a server: build a ledger locally in **any** supported format, export it, then import it wholesale.
+
+```bash
+# The generic "load any data onto a server" pattern
+fluree create staging --from data.ttl          # any format: ttl, jsonld, nq, dir, jsonl, …
+fluree export staging --format ledger -o snap.flpack
+fluree create prod --remote origin --from snap.flpack
+```
+
+> **Restore vs. publish.** `fluree publish` folds a *local ledger's commits* into a remote, re-validated and reindexed (the `POST /push` path). `--remote --from <archive>.flpack` restores a *trusted snapshot* wholesale — byte-for-byte, index included, no replay. Use publish to merge ongoing work; use import to materialize a ledger from an archive.
 
 ## Rust API usage
 
@@ -124,87 +139,54 @@ To archive to S3 instead of a local file, replace the file writer with your S3 u
 
 ### Restore: ingest a `.flpack` file
 
-Use `ingest_pack_frame()` from `fluree-db-nameservice-sync` to write each object, then finalize the nameservice pointers with `set_commit_head()` / `set_index_head()`.
+`Fluree::restore_ledger` does the whole restore in one streaming call: it creates the target ledger, ingests and verifies every CAS object, finalizes the commit/index heads from the embedded nameservice manifest, and rolls back on any failure. It is the import counterpart of `Fluree::archive_ledger`.
 
-#### Streaming vs. memory-mapped reads
-
-Pack files can be very large for production ledgers. There are two approaches to reading them:
-
-- **Memory-mapped (mmap)**: The CLI uses `memmap2::Mmap` to map the entire file into virtual address space. This avoids heap allocation but still requires the OS to page the entire file through virtual memory. Suitable for files that fit comfortably in available address space.
-- **Streaming**: For very large archives or when reading from a non-seekable source (S3 `GetObject`, HTTP response, pipe), decode frames incrementally from a buffered reader. The network ingestion path (`ingest_pack_stream`) already works this way -- it processes one frame at a time and never holds more than a single frame in memory.
-
-For API consumers building archive/restore on large datasets, the streaming approach is recommended. The example below shows the mmap approach for simplicity; see `fluree-db-nameservice-sync::pack_client::ingest_pack_stream` for the streaming pattern using `BytesMut` + `decode_frame` in a loop.
+It reads from any `AsyncRead`, so the **source** of the archive is open-ended — a local file, an S3 `GetObject` body, an HTTP response, or a pipe. The archive is decoded one frame at a time and never buffered whole, so multi-gigabyte production archives restore without exhausting memory.
 
 ```rust
-use fluree_db_api::{Fluree, FlureeBuilder};
-use fluree_db_core::pack::{decode_frame, read_stream_preamble, PackFrame, DEFAULT_MAX_PAYLOAD};
-use fluree_db_core::{ContentKind, ContentStore};
-use fluree_db_nameservice_sync::pack_client::ingest_pack_frame;
+use fluree_db_api::Fluree;
 
-async fn restore_ledger(
-    fluree: &Fluree<impl Storage + Clone + Send + Sync + 'static, impl NameService + RefPublisher + Send + Sync>,
+async fn restore_from_file(
+    fluree: &Fluree,
     new_ledger_id: &str,
-    flpack_bytes: &[u8],
+    path: &std::path::Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // 1. Create the target ledger (empty)
-    fluree.create(new_ledger_id).await?;
-    let handle = fluree.ledger(new_ledger_id).await?;
-
-    // 2. Parse preamble
-    let mut pos = read_stream_preamble(flpack_bytes)?;
-
-    // 3. Decode frames and ingest each CAS object
-    let storage = fluree.storage();
-    let mut ns_manifest: Option<serde_json::Value> = None;
-
-    loop {
-        let (frame, consumed) = decode_frame(&flpack_bytes[pos..], DEFAULT_MAX_PAYLOAD)?;
-        pos += consumed;
-
-        match frame {
-            PackFrame::Header(_header) => {
-                // Metadata -- log or inspect as needed
-            }
-            PackFrame::Data { cid, payload } => {
-                ingest_pack_frame(&cid, &payload, storage, new_ledger_id).await?;
-            }
-            PackFrame::Manifest(json) => {
-                // The nameservice manifest contains commit/index head CIDs and t values
-                if json.get("phase").and_then(|v| v.as_str()) == Some("nameservice") {
-                    ns_manifest = Some(json);
-                }
-            }
-            PackFrame::End => break,
-            PackFrame::Error(msg) => {
-                return Err(format!("pack error: {msg}").into());
-            }
-        }
-    }
-
-    // 4. Finalize nameservice pointers from the manifest
-    let manifest = ns_manifest.ok_or("missing nameservice manifest in .flpack")?;
-
-    if let Some(cid_str) = manifest.get("commit_head_id").and_then(|v| v.as_str()) {
-        let commit_cid: fluree_db_core::ContentId = cid_str.parse()?;
-        let commit_t = manifest.get("commit_t").and_then(|v| v.as_i64()).unwrap_or(0);
-        fluree.set_commit_head(&handle, &commit_cid, commit_t).await?;
-    }
-    if let Some(cid_str) = manifest.get("index_head_id").and_then(|v| v.as_str()) {
-        let index_cid: fluree_db_core::ContentId = cid_str.parse()?;
-        let index_t = manifest.get("index_t").and_then(|v| v.as_i64()).unwrap_or(0);
-        fluree.set_index_head(&handle, &index_cid, index_t).await?;
-    }
-
+    let mut file = tokio::fs::File::open(path).await?;
+    let result = fluree.restore_ledger(new_ledger_id, &mut file).await?;
+    println!(
+        "restored {new_ledger_id}: {} commits, {} index artifacts",
+        result.commits, result.index_artifacts,
+    );
     Ok(())
 }
 ```
 
+To restore from a non-file source, adapt it into an `AsyncRead` and pass it to the same call:
+
+```rust
+// From an HTTP / S3 byte stream (Stream<Item = Result<Bytes, _>>):
+use tokio_util::io::StreamReader;
+let mut reader = StreamReader::new(byte_stream.map_err(std::io::Error::other));
+fluree.restore_ledger(new_ledger_id, &mut reader).await?;
+
+// From an aws-sdk-s3 GetObject body:
+let mut reader = get_object_output.body.into_async_read();
+fluree.restore_ledger(new_ledger_id, &mut reader).await?;
+```
+
+The server's `POST /import/<ledger>` endpoint is exactly this: it adapts the request body into an `AsyncRead` and calls `restore_ledger`.
+
 ### Key points
 
-- **Rename on restore**: The `new_ledger_id` parameter controls the ledger name. CAS objects are content-addressed and name-agnostic; only the nameservice pointer uses the name.
-- **Integrity**: Every data frame is verified (SHA-256) before writing. A corrupted archive is detected immediately.
-- **Indexes are optional**: Without indexes, the restored ledger is functional but will need to reindex (or replay from commits) before queries are efficient. With indexes, it's ready immediately.
-- **Storage-agnostic**: The same `.flpack` file can be restored to file storage, S3, or any backend that implements the `Storage` trait. Archive from file, restore to S3 (or vice versa).
+- **Rename on restore**: The `new_ledger_id` argument controls the ledger name (a bare name is normalized to `name:main`). CAS objects are content-addressed and name-agnostic; only the nameservice pointer uses the name. The one exception is the FIR6 **index root**, which carries the source `ledger_id` as an inline identity field: restoring under a new name re-stamps that field and re-writes the root under a fresh CID before pointing the index head at it. Without this, the restored ledger would query fine (cold load trusts the root's own name) but reject every write — `apply_loaded_db` asserts the loaded root's `ledger_id` matches the live ledger, so a mismatch loops writes as retryable and leaves the ledger silently read-only. Branches, leaves, and dict blobs are name-independent and ride along verbatim. (The historical txn-meta/config graph IRIs keep the source name — they live in the content-addressed dict tree, matching clone/pull semantics.)
+- **Integrity**: Every data frame is verified (SHA-256) before writing, and the manifest's commit/index head CIDs are checked to be present in the archive before the heads are set — a corrupted, truncated, or mismatched archive is rejected rather than creating a dangling head.
+- **Atomic on failure**: Any mid-stream error rolls back the half-created ledger, so a failed restore never leaves a live, partially-ingested ledger behind.
+- **Indexes are optional**: Without indexes, the restored ledger is functional but replays from commits (or reindexes) before queries are efficient. With indexes, it's queryable immediately.
+- **Default context preserved**: If the source ledger has a stored default JSON-LD context, its blob travels in the archive and the restored ledger keeps it — so queries that omit an inline `@context` and rely on the ledger's prefixes keep working. (Currently the local `archive_ledger` path; the remote `export --remote --format ledger` path does not yet carry it.)
+- **Storage-agnostic destination**: The restored ledger can live on file storage, S3, or any backend that implements the `Storage` trait — independent of where the archive's bytes came from.
+- **Concurrent CAS writes**: A large archive holds tens of thousands of CAS objects (DBLP: ~74k). Restore decodes frames sequentially (cheap) but dispatches the per-object storage writes into a bounded pool so they overlap — otherwise wall-clock is the *sum* of per-object round-trips (minutes of pure latency on S3). The pool is bounded by both count and bytes-in-flight, so a burst of large dictionary packs can't balloon memory. This still doesn't make a 20 GB+ restore instantaneous — the archive is read as one sequential stream — so a genuinely huge restore belongs on a long-lived worker, not a short-timeout serverless function.
+- **Per-frame size**: each data frame carries one whole CAS object. The indexer packs dictionaries to a 256 MiB target, so a single pack can land just over 256 MiB. Restore decodes with a 1 GiB per-frame ceiling (the frame length is a `u32`; every frame is SHA-256-verified) so these oversized-but-legitimate objects load. The conservative 256 MiB pull-path default would reject them — restore deliberately uses the larger cap.
+- **Large archives (> 5 GB) use multipart upload**: The `Fluree::restore_ledger` API itself streams an `AsyncRead` of any size with no cap. The size limit only appears in the *negotiated CLI upload* to a size-capped app server: a single S3 presigned PUT rejects bodies over 5 GiB, so the CLI/server negotiate a **multipart** upload (the app mints one presigned `UploadPart` URL per part, the CLI uploads parts, the app calls `CompleteMultipartUpload`). This is automatic — see the [Negotiated Upload Import Contract](../cli/server-integration.md#negotiated-upload-import-contract). Note that compressing the archive further is not a workaround: commit ops and index leaves are already compressed inside the `.flpack`, so an outer pass yields little.
 
 ## Wire format reference
 
@@ -220,7 +202,9 @@ For full protocol details including frame encoding, see:
 |---------|-------|----------|
 | Wire format (FPK1 frames, encode/decode) | `fluree-db-core` | `src/pack.rs` |
 | Pack stream generation (export) | `fluree-db-api` | `src/pack.rs` |
-| HTTP endpoint (`POST /v1/fluree/pack/*`) | `fluree-db-server` | `src/routes/pack.rs` |
-| Stream ingestion (import) | `fluree-db-nameservice-sync` | `src/pack_client.rs` |
-| Commit/index head finalization | `fluree-db-api` | `src/commit_transfer.rs` |
-| CLI `.flpack` file import | `fluree-db-cli` | `src/commands/create.rs` |
+| Archive export (`Fluree::archive_ledger`) | `fluree-db-api` | `src/lib.rs` |
+| Streaming restore (`Fluree::restore_ledger`) + head finalization | `fluree-db-api` | `src/commit_transfer.rs` |
+| HTTP export endpoint (`POST /v1/fluree/pack/*`) | `fluree-db-server` | `src/routes/pack.rs` |
+| HTTP import endpoint (`POST /v1/fluree/import/*`) | `fluree-db-server` | `src/routes/import.rs` |
+| Network sync ingestion (clone/pull) | `fluree-db-nameservice-sync` | `src/pack_client.rs` |
+| CLI `.flpack` import (local + `--remote`) | `fluree-db-cli` | `src/commands/create.rs` |
