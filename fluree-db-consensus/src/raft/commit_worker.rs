@@ -1189,38 +1189,15 @@ impl WorkerSupervisor {
 
     async fn compute_desired_owners(&self) -> HashSet<RefKey> {
         let state = self.shared_state.read().await;
-        // The replicated `worker_eligible_voters` is the
-        // authoritative input once observed; the leader's monitor
-        // demotes unreachable voters in it so they stop hosting
-        // workers. Fall back to raft membership during the initial
-        // window before any membership-apply has populated the
-        // set on this node (fresh cluster bootstrap, or a snapshot
-        // restored from a build that predates the field).
-        if !state.worker_eligible_voters.is_empty() {
-            // Steady-state path: iterate the BTreeSet directly so
-            // we don't allocate a fresh `Vec<NodeId>` every
-            // supervisor tick.
-            return state
-                .queues
-                .keys()
-                .filter(|ref_key| owner(ref_key, &state.worker_eligible_voters) == Some(self.id))
-                .cloned()
-                .collect();
-        }
-        // Boot-window fallback: read membership from raft metrics.
-        // The allocation here only happens once per tick until the
-        // first membership-apply populates `worker_eligible_voters`,
-        // then this branch goes dormant.
-        let voters = self.current_voters();
-        if voters.is_empty() {
-            return HashSet::new();
-        }
-        state
-            .queues
-            .keys()
-            .filter(|ref_key| owner(ref_key, &voters) == Some(self.id))
-            .cloned()
-            .collect()
+        // Read raft membership only when the eligible set is empty
+        // — that branch only fires during the boot window before
+        // any membership-apply has populated the replicated set.
+        let fallback = if state.worker_eligible_voters.is_empty() {
+            self.current_voters()
+        } else {
+            Vec::new()
+        };
+        desired_owners(&state, self.id, &fallback)
     }
 
     fn current_voters(&self) -> Vec<NodeId> {
@@ -1281,6 +1258,42 @@ impl WorkerSupervisor {
             self.staging.clone(),
         )
     }
+}
+
+/// Pure computation of the branches this node owns under
+/// rendezvous-hash assignment. Reads `state.worker_eligible_voters`
+/// when populated (the replicated, monitor-curated voter set);
+/// otherwise uses `fallback_voters` (the raft membership view that
+/// only the boot window sees). Empty voter set under either path
+/// yields no owners.
+///
+/// Pulled out as a free function so the same logic can be exercised
+/// by unit tests without constructing an `Arc<Raft<TypeConfig>>` —
+/// the async wrapper at
+/// [`WorkerSupervisor::compute_desired_owners`] just supplies the
+/// fallback from `raft.metrics()` when needed.
+fn desired_owners(
+    state: &crate::raft::state_machine::NameServiceState,
+    id: NodeId,
+    fallback_voters: &[NodeId],
+) -> HashSet<RefKey> {
+    if !state.worker_eligible_voters.is_empty() {
+        return state
+            .queues
+            .keys()
+            .filter(|ref_key| owner(ref_key, &state.worker_eligible_voters) == Some(id))
+            .cloned()
+            .collect();
+    }
+    if fallback_voters.is_empty() {
+        return HashSet::new();
+    }
+    state
+        .queues
+        .keys()
+        .filter(|ref_key| owner(ref_key, fallback_voters) == Some(id))
+        .cloned()
+        .collect()
 }
 
 /// Cross-check the queue entry's inline discriminator against the
@@ -1516,35 +1529,17 @@ mod tests {
             .and_then(|queue| queue.front().cloned())
     }
 
-    /// Replicates [`WorkerSupervisor::compute_desired_owners`] against
-    /// a bare `SharedState` plus a fallback voter list. Mirrors the
-    /// real implementation: reads `state.worker_eligible_voters` when
-    /// non-empty, otherwise uses `fallback_voters` (the test stand-in
-    /// for raft membership).
-    async fn compute_desired_owners_for_test(
-        state: &SharedState,
+    /// Drive [`desired_owners`] through the same lock acquisition the
+    /// supervisor's async wrapper does. Reads `worker_eligible_voters`
+    /// from the shared state when populated; otherwise uses
+    /// `fallback_voters` (the test stand-in for raft membership).
+    async fn desired_owners_under_lock(
+        shared: &SharedState,
         id: NodeId,
         fallback_voters: &[NodeId],
     ) -> HashSet<RefKey> {
-        use crate::raft::ownership::owner;
-        let state = state.read().await;
-        if !state.worker_eligible_voters.is_empty() {
-            return state
-                .queues
-                .keys()
-                .filter(|ref_key| owner(ref_key, &state.worker_eligible_voters) == Some(id))
-                .cloned()
-                .collect();
-        }
-        if fallback_voters.is_empty() {
-            return HashSet::new();
-        }
-        state
-            .queues
-            .keys()
-            .filter(|ref_key| owner(ref_key, fallback_voters) == Some(id))
-            .cloned()
-            .collect()
+        let state = shared.read().await;
+        desired_owners(&state, id, fallback_voters)
     }
 
     /// A worker only ever takes the front of its own branch — never
@@ -1616,7 +1611,7 @@ mod tests {
         install_queue(&mut state, "test/db", "feature", vec![]);
         let shared = Arc::new(RwLock::new(state));
 
-        let desired = compute_desired_owners_for_test(&shared, 1, &[1]).await;
+        let desired = desired_owners_under_lock(&shared, 1, &[1]).await;
         assert_eq!(desired.len(), 2);
         assert!(desired.contains(&RefKey::new("test/db", "main")));
         assert!(desired.contains(&RefKey::new("test/db", "feature")));
@@ -1637,7 +1632,7 @@ mod tests {
 
         let mut union = HashSet::new();
         for id in &voters {
-            let mine = compute_desired_owners_for_test(&shared, *id, &voters).await;
+            let mine = desired_owners_under_lock(&shared, *id, &voters).await;
             // Every claimed branch must belong to exactly one node.
             for k in &mine {
                 assert!(
@@ -1667,7 +1662,7 @@ mod tests {
         );
         let shared = Arc::new(RwLock::new(state));
 
-        let desired = compute_desired_owners_for_test(&shared, 1, &[]).await;
+        let desired = desired_owners_under_lock(&shared, 1, &[]).await;
         assert!(desired.is_empty());
     }
 
@@ -1690,7 +1685,7 @@ mod tests {
 
         // The demoted voter claims nothing despite still being in
         // the fallback list.
-        let demoted_share = compute_desired_owners_for_test(&shared, 3, &fallback).await;
+        let demoted_share = desired_owners_under_lock(&shared, 3, &fallback).await;
         assert!(
             demoted_share.is_empty(),
             "demoted voter must not own any branches"
@@ -1698,8 +1693,8 @@ mod tests {
 
         // The remaining eligible voters partition every branch
         // between them — nothing strands on the demoted voter.
-        let voter_1 = compute_desired_owners_for_test(&shared, 1, &fallback).await;
-        let voter_2 = compute_desired_owners_for_test(&shared, 2, &fallback).await;
+        let voter_1 = desired_owners_under_lock(&shared, 1, &fallback).await;
+        let voter_2 = desired_owners_under_lock(&shared, 2, &fallback).await;
         let union: HashSet<RefKey> = voter_1.union(&voter_2).cloned().collect();
         assert_eq!(
             union.len(),
@@ -1731,7 +1726,7 @@ mod tests {
         // 20 branches, and they partition the full set.
         let mut union = HashSet::new();
         for id in &fallback {
-            let mine = compute_desired_owners_for_test(&shared, *id, &fallback).await;
+            let mine = desired_owners_under_lock(&shared, *id, &fallback).await;
             for k in &mine {
                 assert!(
                     union.insert(k.clone()),
@@ -1758,7 +1753,7 @@ mod tests {
         state.worker_eligible_voters = [1, 2].into_iter().collect();
         let shared = Arc::new(RwLock::new(state));
         // Voter 3 is in the fallback, but not in the eligible set.
-        let desired = compute_desired_owners_for_test(&shared, 3, &[1, 2, 3]).await;
+        let desired = desired_owners_under_lock(&shared, 3, &[1, 2, 3]).await;
         assert!(desired.is_empty());
     }
 
