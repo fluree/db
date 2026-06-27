@@ -2045,11 +2045,7 @@ impl Operator for BinaryScanOperator {
                         // merged product is then resolved + cached per epoch.
                         let (mut ops, mut untranslated, ephemeral_preds) =
                             match collect_segment_merged_ops(
-                                ctx,
-                                &store_arc,
-                                self.g_id,
-                                self.index,
-                                ctx.to_t,
+                                ctx, &store_arc, self.g_id, self.index, ctx.to_t,
                             ) {
                                 Some(triple) => triple,
                                 None => {
@@ -2493,7 +2489,9 @@ fn translate_segment_cached(
             g_id,
         ) {
             Ok(op) => ops.push(op),
-            Err(e) if e.kind() == std::io::ErrorKind::Unsupported => untranslated.push(flake.clone()),
+            Err(e) if e.kind() == std::io::ErrorKind::Unsupported => {
+                untranslated.push(flake.clone())
+            }
             Err(_) => hard_error = true,
         }
     });

@@ -143,7 +143,8 @@ impl Operator for OffsetOperator {
     /// `offset`, the child must produce `offset + budget`. Row- and
     /// order-preserving, so the budget passes through.
     fn set_row_budget(&mut self, budget: usize) {
-        self.child.set_row_budget(budget.saturating_add(self.offset));
+        self.child
+            .set_row_budget(budget.saturating_add(self.offset));
     }
 }
 
