@@ -839,10 +839,10 @@ async fn indexed_sum_compare_as_count_matches_value() {
         .await;
 }
 
-/// `SUM` over an **empty** input is Unbound (not 0). For an absent predicate the
-/// fast path must defer to the general pipeline. We assert the indexed result
-/// matches the memory (general-pipeline) result so we don't depend on the exact
-/// Unbound serialization — only that the fast path doesn't substitute `0`.
+/// `SUM` over an **empty** input is the identity `"0"^^xsd:integer` (SPARQL 1.1
+/// §18.5.1.3). For an absent predicate the `SUM(?o cmp K)` fast path defers to the
+/// general pipeline; we assert the indexed result matches the memory
+/// (general-pipeline) result so the fast path can't diverge from it.
 #[tokio::test]
 async fn indexed_sum_compare_empty_predicate_matches_general() {
     assert_index_defaults();
@@ -855,7 +855,8 @@ async fn indexed_sum_compare_empty_predicate_matches_general() {
             ]
         })
     };
-    // `person:absent` is never asserted, so the WHERE matches zero rows and SUM is Unbound.
+    // `person:absent` is never asserted, so the WHERE matches zero rows and SUM is
+    // the empty-multiset identity 0.
     let q = r"
         PREFIX person: <http://example.org/Person#>
         SELECT (SUM(?v > 0) AS ?count)
@@ -939,8 +940,84 @@ async fn indexed_sum_compare_empty_predicate_matches_general() {
             );
             assert_eq!(
                 idx_rows, mem_rows,
-                "SUM over an absent predicate must yield the general Unbound result, not 0"
+                "indexed SUM over an absent predicate must match the general result (0)"
             );
+            // And that shared result is the empty-multiset identity 0, not unbound.
+            assert_eq!(mem_rows, normalize_rows(&json!([[0]])));
+        })
+        .await;
+}
+
+/// Scalar-aggregate fast paths (`fast_predicate_scalar_agg.rs`) bypass the
+/// generic `aggregate.rs`, so empty `SUM(?o)` / `AVG(?o)` must independently
+/// return the identity `"0"^^xsd:integer` (SPARQL 1.1 §18.5.1.3/.4). Here the
+/// predicate is absent from the persisted dictionary, so the fast path takes its
+/// `empty_result` branch directly (no fallback).
+#[tokio::test]
+async fn indexed_scalar_sum_avg_absent_predicate_returns_zero() {
+    assert_index_defaults();
+
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "it/indexed-scalar-empty-agg:main";
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        fluree
+            .nameservice_mode()
+            .publisher_arc()
+            .expect("test setup requires ReadWrite nameservice mode"),
+        fluree_db_indexer::IndexerConfig::small(),
+    );
+
+    local
+        .run_until(async move {
+            let index_cfg = IndexConfig {
+                reindex_min_bytes: 0,
+                reindex_max_bytes: 10_000_000,
+            };
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            // Seed an unrelated predicate so the ledger indexes; `ex:missing` is
+            // never asserted, so it stays absent from the dictionary.
+            let ledger = fluree
+                .insert_with_opts(
+                    ledger0,
+                    &json!({
+                        "@context": { "ex": "http://example.org/ns/" },
+                        "@graph": [{"@id": "ex:a", "ex:present": 1}]
+                    }),
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg,
+                )
+                .await
+                .expect("seed insert")
+                .ledger;
+            let _ = trigger_index_and_wait_outcome(&handle, ledger_id, ledger.t()).await;
+            let view = fluree
+                .db_at_t(ledger_id, ledger.t())
+                .await
+                .expect("load indexed view");
+
+            for (agg, expected) in [("SUM", json!([[0]])), ("AVG", json!([[0]]))] {
+                let q = format!(
+                    "PREFIX ex: <http://example.org/ns/> \
+                     SELECT ({agg}(?o) AS ?r) WHERE {{ ?s ex:missing ?o }}"
+                );
+                let rows = normalize_rows(
+                    &fluree
+                        .query(&view, QueryInput::Sparql(&q))
+                        .await
+                        .expect("indexed scalar-agg query")
+                        .to_jsonld(&view.snapshot)
+                        .expect("to_jsonld"),
+                );
+                assert_eq!(
+                    rows,
+                    normalize_rows(&expected),
+                    "indexed {agg} over an absent predicate must be the identity 0"
+                );
+            }
         })
         .await;
 }

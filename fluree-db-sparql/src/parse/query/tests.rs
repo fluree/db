@@ -610,6 +610,120 @@ fn test_group_by_with_expression() {
 }
 
 #[test]
+fn test_group_by_bare_builtin_call() {
+    // Issue #1362: `GROUP BY DATATYPE(?v)` — a bare BuiltInCall with no
+    // surrounding parens — is a valid SPARQL GroupCondition and must parse
+    // (previously it was silently dropped, degrading the query to a single
+    // implicit group).
+    let ast =
+        assert_parses("SELECT (DATATYPE(?v) AS ?dt) WHERE { ?s :p ?v } GROUP BY DATATYPE(?v)");
+    if let QueryBody::Select(q) = &ast.body {
+        let group_by = q.modifiers.group_by.as_ref().expect("Expected GROUP BY");
+        assert_eq!(group_by.conditions.len(), 1);
+        match &group_by.conditions[0] {
+            GroupCondition::Expr { alias, .. } => assert!(
+                alias.is_none(),
+                "bare BuiltInCall GROUP BY takes no AS alias"
+            ),
+            other => panic!("Expected Expr condition, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn test_group_by_bare_builtin_call_then_having() {
+    // The self-delimiting function call must stop at the HAVING keyword so the
+    // condition loop terminates and HAVING is still parsed.
+    let ast = assert_parses(
+        "SELECT (STR(?v) AS ?s) WHERE { ?x :p ?v } GROUP BY STR(?v) HAVING (COUNT(?v) > 1)",
+    );
+    if let QueryBody::Select(q) = &ast.body {
+        let group_by = q.modifiers.group_by.as_ref().expect("Expected GROUP BY");
+        assert_eq!(group_by.conditions.len(), 1);
+        assert!(q.modifiers.having.is_some(), "HAVING must still parse");
+    }
+}
+
+#[test]
+fn test_group_by_bare_builtin_then_var() {
+    // A bare function-call condition followed by a bare variable condition.
+    let ast = assert_parses("SELECT ?b WHERE { ?s :p ?a . ?s :q ?b } GROUP BY DATATYPE(?a) ?b");
+    if let QueryBody::Select(q) = &ast.body {
+        let group_by = q.modifiers.group_by.as_ref().expect("Expected GROUP BY");
+        assert_eq!(group_by.conditions.len(), 2);
+        assert!(matches!(
+            group_by.conditions[0],
+            GroupCondition::Expr { .. }
+        ));
+        assert!(matches!(group_by.conditions[1], GroupCondition::Var(_)));
+    }
+}
+
+/// Count the triples across all BGPs in a (possibly grouped) WHERE pattern.
+fn bgp_triple_count(pattern: &GraphPattern) -> usize {
+    match pattern {
+        GraphPattern::Bgp { patterns, .. } => patterns.len(),
+        GraphPattern::Group { patterns, .. } => patterns.iter().map(bgp_triple_count).sum(),
+        _ => 0,
+    }
+}
+
+#[test]
+fn test_blank_node_property_list_object() {
+    // `?s :p [ :q ?o ]` — a blank-node property list in object position must
+    // parse into the outer triple plus the nested `_b :q ?o` triple (no longer
+    // silently dropped). Both share one synthetic blank-node variable.
+    let ast = assert_parses("SELECT ?o WHERE { ?s :p [ :q ?o ] }");
+    if let QueryBody::Select(q) = &ast.body {
+        assert_eq!(
+            bgp_triple_count(&q.where_clause.pattern),
+            2,
+            "blank-node property list must expand to two triples"
+        );
+    }
+}
+
+#[test]
+fn test_blank_node_property_list_multi_predicate() {
+    // `[ :p ?a ; :q ?b ]` expands to two nested triples on the same node.
+    let ast = assert_parses("SELECT ?a ?b WHERE { ?s :has [ :p ?a ; :q ?b ] }");
+    if let QueryBody::Select(q) = &ast.body {
+        assert_eq!(bgp_triple_count(&q.where_clause.pattern), 3);
+    }
+}
+
+#[test]
+fn test_blank_node_property_list_nested() {
+    // Nested lists: `[ :p [ :q ?x ] ]` → three triples.
+    let ast = assert_parses("SELECT ?x WHERE { ?s :has [ :p [ :q ?x ] ] }");
+    if let QueryBody::Select(q) = &ast.body {
+        assert_eq!(bgp_triple_count(&q.where_clause.pattern), 3);
+    }
+}
+
+#[test]
+fn test_blank_node_property_list_bare_subject() {
+    // Bare subject form `[ :p ?o ] .` — the property list IS the content.
+    let ast = assert_parses("SELECT ?o WHERE { [ :p ?o ] }");
+    if let QueryBody::Select(q) = &ast.body {
+        assert_eq!(bgp_triple_count(&q.where_clause.pattern), 1);
+    }
+}
+
+#[test]
+fn test_empty_blank_node_still_anonymous() {
+    // `[]` stays a plain anonymous blank node (no nested triples).
+    let ast = assert_parses("SELECT ?s WHERE { ?s :p [] }");
+    if let QueryBody::Select(q) = &ast.body {
+        assert_eq!(
+            bgp_triple_count(&q.where_clause.pattern),
+            1,
+            "empty [] adds no triples"
+        );
+    }
+}
+
+#[test]
 fn test_having_simple() {
     let ast =
         assert_parses("SELECT ?name WHERE { ?s :name ?name } GROUP BY ?name HAVING (?cnt > 5)");
@@ -1304,6 +1418,51 @@ fn test_construct_multiple_triples() {
             assert_eq!(template.triples.len(), 2);
         }
         _ => panic!("Expected CONSTRUCT query"),
+    }
+}
+
+#[test]
+fn test_construct_template_blank_node_property_list() {
+    // A blank-node property list in a CONSTRUCT template must contribute its
+    // nested triples (and must not leak them into the WHERE clause). Here the
+    // template is `?s ex:has _b . _b ex:label ?l` → 2 triples; the WHERE is one.
+    let ast = assert_parses("CONSTRUCT { ?s ex:has [ ex:label ?l ] } WHERE { ?s ex:name ?l }");
+    match &ast.body {
+        QueryBody::Construct(q) => {
+            let template = q.template.as_ref().unwrap();
+            assert_eq!(
+                template.triples.len(),
+                2,
+                "CONSTRUCT template blank-node property list must add its nested triple"
+            );
+            // The WHERE must still be exactly its single triple (no leakage).
+            assert_eq!(bgp_triple_count(&q.where_clause.pattern), 1);
+        }
+        _ => panic!("Expected CONSTRUCT query"),
+    }
+}
+
+#[test]
+fn test_blank_node_property_list_label_no_user_collision() {
+    // A user blank node literally named `_:#bnpl0` is impossible (the lexer
+    // rejects `#`), so the synthetic property-list node cannot be addressed or
+    // accidentally joined. A user label like `_b` near a `[ … ]` stays distinct:
+    // `?s :p _:b . ?s :q [ :r ?o ]` → 2 + the user triple = 3 triples, and the
+    // synthetic node is its own variable.
+    let ast = assert_parses("SELECT ?o WHERE { ?s :p _:b . ?s :q [ :r ?o ] }");
+    if let QueryBody::Select(q) = &ast.body {
+        assert_eq!(bgp_triple_count(&q.where_clause.pattern), 3);
+    }
+}
+
+#[test]
+fn test_group_by_bare_builtin_does_not_desync() {
+    // The bare-builtin GROUP BY fallback must not consume tokens when the
+    // following token is not an expression — ORDER BY here must still parse.
+    let ast = assert_parses("SELECT ?dt WHERE { ?s :p ?v } GROUP BY DATATYPE(?v) ORDER BY ?dt");
+    if let QueryBody::Select(q) = &ast.body {
+        assert!(q.modifiers.group_by.is_some());
+        assert!(q.modifiers.order_by.is_some(), "ORDER BY must survive");
     }
 }
 

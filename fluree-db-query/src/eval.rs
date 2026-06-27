@@ -277,8 +277,10 @@ impl Expression {
         }
     }
 
-    /// Evaluate to binding in non-strict mode while preserving fatal execution
-    /// errors such as dictionary lookup failures.
+    /// Evaluate to binding under SPARQL 1.1 §18.5 `Extend` semantics: a dynamic
+    /// value error (arithmetic/comparison) leaves the variable unbound for this
+    /// solution, while structural errors (wrong arity, unknown datatype IRI) and
+    /// fatal execution errors (dictionary lookup) still propagate.
     pub fn try_eval_to_binding_non_strict<R: RowAccess>(
         &self,
         row: &R,
@@ -286,7 +288,7 @@ impl Expression {
     ) -> Result<Binding> {
         match self.try_eval_to_binding(row, ctx) {
             Ok(binding) => Ok(binding),
-            Err(err) if err.can_demote_in_expression() => Ok(Binding::Unbound),
+            Err(err) if err.demotes_to_unbound_in_extend() => Ok(Binding::Unbound),
             Err(err) => Err(err),
         }
     }
