@@ -131,6 +131,17 @@ pub fn sort_overlay_ops(ops: &mut [OverlayOp], order: RunSortOrder) {
     ops.sort_unstable_by(|a, b| cmp_overlay_v3(a, b, order));
 }
 
+/// Stable, run-adaptive variant of [`sort_overlay_ops`].
+///
+/// Rust's stable sort detects already-sorted input runs and merges them in
+/// ~O(n log k) rather than re-sorting from scratch. Use this when the input is
+/// a **concatenation of K already-sorted runs** (e.g. per-segment translated op
+/// runs assembled by the segment-aware overlay path): here it acts as a k-way
+/// merge of those runs, not a full re-sort.
+pub fn sort_overlay_ops_stable(ops: &mut [OverlayOp], order: RunSortOrder) {
+    ops.sort_by(|a, b| cmp_overlay_v3(a, b, order));
+}
+
 /// Resolve assert/retract lifecycles within overlay ops.
 ///
 /// When the same fact (same `FactKeyV3`) has both an assertion and a retraction

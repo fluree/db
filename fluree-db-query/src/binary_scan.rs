@@ -14,8 +14,8 @@ use async_trait::async_trait;
 use fluree_db_binary_index::format::column_block::ColumnId;
 use fluree_db_binary_index::read::column_types::ColumnSet;
 use fluree_db_binary_index::{
-    resolve_overlay_ops, sort_overlay_ops, BinaryCursor, BinaryFilter, BinaryGraphView,
-    BinaryIndexStore, ColumnBatch, ColumnProjection, OverlayOp,
+    resolve_overlay_ops, sort_overlay_ops, sort_overlay_ops_stable, BinaryCursor, BinaryFilter,
+    BinaryGraphView, BinaryIndexStore, ColumnBatch, ColumnProjection, OverlayOp,
 };
 use fluree_db_core::o_type::{DecodeKind, OType};
 use fluree_db_core::subject_id::SubjectId;
@@ -2028,7 +2028,7 @@ impl Operator for BinaryScanOperator {
                         ledger_id: ctx.active_snapshot.ledger_id.as_str().into(),
                         snapshot_t: ctx.active_snapshot.t,
                         overlay_epoch: epoch,
-                        store_max_t: store_arc.max_t(),
+                        store_id: store_arc.store_id(),
                         to_t: ctx.to_t,
                         g_id: self.g_id,
                         index: self.index,
@@ -2291,13 +2291,19 @@ pub type EphemeralPredicateMap = HashMap<Sid, u32>;
 /// Every component that can change the translated product is included:
 /// commits bump the overlay epoch (covering novelty contents, dict novelty,
 /// and runtime small dicts), snapshot/store swaps change `snapshot_t` /
-/// `store_max_t`, and `to_t` bounds which overlay flakes are visible.
+/// `store_id`, and `to_t` bounds which overlay flakes are visible.
+///
+/// `store_id` (process-unique per store instance) is used instead of
+/// `store_max_t` for the same reason as `SegmentOpsKey` (see its note): a
+/// same-`index_t` store rebuild (refresh-on-new-namespace, or a per-view load)
+/// re-ranks dict ids at an unchanged `store_max_t`, which the epoch protects
+/// against for the commit case but not for a per-view-vs-live collision.
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct GlobalTranslationKey {
     pub ledger_id: Arc<str>,
     pub snapshot_t: i64,
     pub overlay_epoch: u64,
-    pub store_max_t: i64,
+    pub store_id: u64,
     pub to_t: i64,
     pub g_id: GraphId,
     pub index: IndexType,
@@ -2620,9 +2626,14 @@ fn collect_segment_merged_ops(
         }
     }
 
-    // Per-segment runs are each sorted; the concatenation is not. Sort once
-    // (resolve is applied by the caller). A k-way merge is a later optimization.
-    sort_overlay_ops(&mut merged_ops, order);
+    // `merged_ops` is K already-sorted per-segment runs concatenated. The stable,
+    // run-adaptive sort detects those runs and merges them in ~O(n log k) — a
+    // k-way merge — rather than re-sorting (resolve is applied by the caller).
+    // The remaining O(n) copy is inherent to producing one owned op vec; true
+    // O(new-segment) cost would need an incremental/persistent merge, deferred
+    // until profiling shows the (now integer-only) merge dominates the
+    // already-cached per-segment dict translation.
+    sort_overlay_ops_stable(&mut merged_ops, order);
     Some((merged_ops, merged_untranslated, merged_eph))
 }
 
