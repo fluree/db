@@ -341,25 +341,35 @@ impl Worker {
                 Ok(())
             }
             Err(err) => {
-                if self.commit_replicated(&commit_id).await {
-                    // Apply landed; the adapter already took the
-                    // stash during waiter resolution, so our own
-                    // `take` here is a defensive no-op. Finalize the
-                    // local cache so this node catches up with the
-                    // replicated head.
-                    self.publishing.staged_receipts.take(entry.queue_id);
+                let landed = self.commit_replicated(&commit_id).await;
+                self.publishing.staged_receipts.take(entry.queue_id);
+                if landed {
+                    // Apply landed via another path (idempotency hit
+                    // or a sibling worker's race). The adapter
+                    // already took the stash during waiter
+                    // resolution; the `take` above is defensive.
+                    // Finalize the local cache so this node catches
+                    // up with the replicated head.
                     if let Some(install) = install {
                         self.finalize_after_publish(entry.queue_id, commit_t, install)
                             .await;
                     }
                     Ok(())
+                } else if matches!(err, WorkerError::Stale(_)) {
+                    // Queue front moved past our queue_id (admin
+                    // clear or sibling worker race that landed a
+                    // different commit). Our commit didn't land and
+                    // never will — drop the local install
+                    // (write_guard releases without `replace`, the
+                    // Fluree handle stays at its pre-stage head) and
+                    // let the run loop pick up the new queue front.
+                    Ok(())
                 } else {
-                    // Apply didn't land. Clean up the staged receipt
-                    // and drop `install`: write_guard releases
-                    // without calling `replace`, so this node's
-                    // Fluree handle stays at its pre-stage head —
-                    // same as every other node.
-                    self.publishing.staged_receipts.take(entry.queue_id);
+                    // Apply didn't land. Drop `install` (write_guard
+                    // releases without calling `replace`, so this
+                    // node's Fluree handle stays at its pre-stage
+                    // head — same as every other node) and propagate
+                    // the error for the outer retry/poison logic.
                     Err(err)
                 }
             }
@@ -920,14 +930,19 @@ impl Worker {
             // the leader-forwarded apply_staged_commit) route into
             // the poison path so the worker doesn't loop a known-
             // unfixable error forever and head-of-line-block the
-            // branch's queue. Everything else stays on the Raft path
-            // (transient — outer loop retries with backoff).
+            // branch's queue.
             Err(NameServiceError::NotFound(id)) => {
                 Err(stage(PoisonReason::LedgerNotFound { ledger_id: id }))
             }
             Err(NameServiceError::ApplyRejected(msg)) => Err(stage(PoisonReason::WorkerPanic {
                 message: format!("state machine rejected ApplyHead: {msg}"),
             })),
+            // The queue front advanced past our queue_id (racing
+            // worker or admin clear). Retrying won't help — the
+            // caller drops the install and lets the run loop pick
+            // up the new queue front once local raft applies the
+            // pop.
+            Err(NameServiceError::ApplyStale(msg)) => Err(WorkerError::Stale(msg)),
             Err(e) => Err(WorkerError::Raft(format!("publish_commit failed: {e}"))),
         }
     }
@@ -998,6 +1013,9 @@ impl Worker {
                 }
                 Ok(Err(WorkerError::Transient(_) | WorkerError::Stage(_))) => {
                     unreachable!("process_entry maps Transient/Stage failures to PoisonQueueEntry")
+                }
+                Ok(Err(WorkerError::Stale(_))) => {
+                    unreachable!("try_advance_head consumes Stale internally and returns Ok")
                 }
                 Ok(Err(WorkerError::Raft(propose_error))) => {
                     // Raft propose failed (leader stepped down, quorum
@@ -1346,6 +1364,13 @@ pub enum WorkerError {
     Stage(Box<PoisonReason>),
     #[error("raft propose: {0}")]
     Raft(String),
+    /// The replicated apply observed the queue front had moved past
+    /// our `queue_id` (racing worker or admin clear). Distinct from
+    /// [`Self::Raft`] so the retry path treats it as "drop work and
+    /// move on" rather than backing off and trying the same
+    /// `snapshot_front` again.
+    #[error("apply stale: {0}")]
+    Stale(String),
 }
 
 /// Output of a per-op staging path before consensus has confirmed

@@ -46,6 +46,15 @@ pub enum NameServiceError {
     /// poisoning) instead of looping on the same propose forever.
     #[error("State machine rejected propose: {0}")]
     ApplyRejected(String),
+
+    /// The replicated apply observed that the proposed work no
+    /// longer applies to its target — the queue entry was popped
+    /// by a racing worker or admin-cleared between stage and
+    /// propose. Distinguished from [`Self::Storage`] so callers
+    /// drop the local install and move on rather than retrying
+    /// against a state that will never match again.
+    #[error("Apply observed stale state: {0}")]
+    ApplyStale(String),
 }
 
 impl From<LedgerIdParseError> for NameServiceError {
@@ -93,5 +102,14 @@ impl NameServiceError {
     /// generic transient [`Self::storage`] phrasing.
     pub fn apply_rejected(msg: impl Into<String>) -> Self {
         Self::ApplyRejected(msg.into())
+    }
+
+    /// Create an [`Self::ApplyStale`] error signaling that the
+    /// proposed work no longer applies (queue front advanced past
+    /// the proposed queue_id, or the queue was admin-cleared).
+    /// Callers drop the local install and continue rather than
+    /// retrying.
+    pub fn apply_stale(msg: impl Into<String>) -> Self {
+        Self::ApplyStale(msg.into())
     }
 }

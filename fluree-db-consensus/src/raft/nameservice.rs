@@ -875,18 +875,23 @@ fn map_propose_error(
 
 /// Classify the structured `apply_staged_commit` response into the
 /// trait-surface [`NameServiceError`] the caller's outer retry vs
-/// poison logic switches on.
+/// poison vs drop logic switches on.
 ///
-/// Terminal failures route to variants the worker's
-/// `publish_head_advance` recognizes as poison-worthy
-/// ([`NameServiceError::NotFound`] for missing ledgers,
-/// [`NameServiceError::ApplyRejected`] for state-machine invariant
-/// violations); transient failures (leader transition, raft
-/// `Fatal`, stale queue front) collapse to [`NameServiceError::Storage`]
-/// so the outer loop continues to retry. Without this classification
-/// every cross-node failure flattened to `Storage` and a terminal
-/// `InvariantViolated` would spin forever, head-of-line-blocking the
-/// branch's queue.
+/// - [`Applied`](ApplyStagedCommitResponse::Applied) → `Ok(())`.
+/// - [`Stale`](ApplyStagedCommitResponse::Stale) → [`ApplyStale`](NameServiceError::ApplyStale).
+///   The queue front advanced past our `queue_id` or the queue was
+///   admin-cleared; retrying never matches. Worker drops the local
+///   install and moves on.
+/// - [`LedgerNotFound`](ApplyStagedCommitError::LedgerNotFound) →
+///   [`NotFound`](NameServiceError::NotFound). Terminal; worker
+///   poisons with `PoisonReason::LedgerNotFound`.
+/// - [`InvariantViolated`](ApplyStagedCommitError::InvariantViolated) →
+///   [`ApplyRejected`](NameServiceError::ApplyRejected). Terminal;
+///   worker poisons with `PoisonReason::WorkerPanic`.
+/// - [`NotLeader`](ApplyStagedCommitError::NotLeader),
+///   [`RaftPropose`](ApplyStagedCommitError::RaftPropose) →
+///   [`Storage`](NameServiceError::Storage). Transient; worker
+///   retries.
 fn classify_apply_staged_commit_outcome(
     outcome: std::result::Result<ApplyStagedCommitResponse, ApplyStagedCommitError>,
     queue_id: u64,
@@ -895,9 +900,8 @@ fn classify_apply_staged_commit_outcome(
         Ok(ApplyStagedCommitResponse::Applied { .. }) => Ok(()),
         Ok(ApplyStagedCommitResponse::Stale {
             current_front_queue_id,
-        }) => Err(NameServiceError::storage(format!(
-            "apply_staged_commit stale: queue_id {queue_id} no longer at front \
-             (current front: {current_front_queue_id:?})"
+        }) => Err(NameServiceError::apply_stale(format!(
+            "queue_id {queue_id} no longer at front (current front: {current_front_queue_id:?})"
         ))),
         Err(ApplyStagedCommitError::LedgerNotFound(id)) => Err(NameServiceError::not_found(id)),
         Err(ApplyStagedCommitError::InvariantViolated(msg)) => {
@@ -2187,11 +2191,13 @@ mod tests {
     }
 
     #[test]
-    fn classify_outcome_stale_is_transient_storage() {
-        // The `Stale` shape is transient: a racing worker already
-        // popped the front while ours was in flight; the next round
-        // of the supervisor will reconcile. `Storage` is the
-        // intended retry signal.
+    fn classify_outcome_stale_with_advanced_front_is_apply_stale() {
+        // The `Stale` shape means our queue_id is no longer at the
+        // front and never will be — a racing worker popped it, or
+        // an admin clear wiped the queue. Map to `ApplyStale` so
+        // the worker drops the local install and lets the run loop
+        // pick up the new front, instead of retrying forever
+        // against a queue front that won't match.
         let r = classify_apply_staged_commit_outcome(
             Ok(ApplyStagedCommitResponse::Stale {
                 current_front_queue_id: Some(8),
@@ -2200,11 +2206,31 @@ mod tests {
         );
         let err = r.expect_err("stale must be Err");
         assert!(
-            matches!(err, NameServiceError::Storage(_)),
-            "expected Storage, got {err:?}"
+            matches!(err, NameServiceError::ApplyStale(_)),
+            "expected ApplyStale, got {err:?}"
         );
         assert!(err.to_string().contains("queue_id 7"));
         assert!(err.to_string().contains("Some(8)"));
+    }
+
+    #[test]
+    fn classify_outcome_stale_with_empty_queue_is_apply_stale() {
+        // Admin-clear case: the queue was wiped between our stage
+        // and propose; `current_front_queue_id` is `None`. Same
+        // `ApplyStale` classification — the worker drops the
+        // install and moves on.
+        let r = classify_apply_staged_commit_outcome(
+            Ok(ApplyStagedCommitResponse::Stale {
+                current_front_queue_id: None,
+            }),
+            7,
+        );
+        let err = r.expect_err("stale must be Err");
+        assert!(
+            matches!(err, NameServiceError::ApplyStale(_)),
+            "expected ApplyStale, got {err:?}"
+        );
+        assert!(err.to_string().contains("None"));
     }
 
     #[test]
