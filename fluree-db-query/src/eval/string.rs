@@ -325,22 +325,71 @@ pub fn eval_concat<R: RowAccess>(
     Ok(Some(string_with_lang(&result, lang)))
 }
 
+/// Extract the `(string content, language tag)` of a STRBEFORE/STRAFTER argument.
+///
+/// Returns `None` when the argument is unbound or not a string-typed literal
+/// (e.g. a number or IRI) — both cases make the function raise a type error,
+/// which demotes to an unbound result. The language tag comes from a
+/// language-tagged `TypedLiteral` value (constants) or, for variable bindings
+/// that materialize as a plain string, from [`extract_lang_tag`].
+fn str_arg_and_lang<R: RowAccess>(
+    expr: &Expression,
+    value: Option<ComparableValue>,
+    row: &R,
+    ctx: Option<&ExecutionContext<'_>>,
+) -> Option<(String, Option<Arc<str>>)> {
+    match value? {
+        ComparableValue::String(s) => Some((s.to_string(), extract_lang_tag(expr, row, ctx))),
+        ComparableValue::TypedLiteral {
+            val: FlakeValue::String(s),
+            dtc,
+        } => {
+            let lang = match dtc {
+                Some(UnresolvedDatatypeConstraint::LangTag(tag)) => Some(tag),
+                // xsd:string (or any non-lang datatype) carries no language tag.
+                _ => extract_lang_tag(expr, row, ctx),
+            };
+            Some((s, lang))
+        }
+        _ => None,
+    }
+}
+
+/// SPARQL 1.1 §17.4.3.5 argument compatibility for STRBEFORE/STRAFTER.
+///
+/// The search string (`arg2`) is compatible when it is a simple literal /
+/// `xsd:string` (no language tag), or when it shares `arg1`'s language tag.
+/// An incompatible pair raises a type error (→ unbound).
+fn args_compatible(lang1: &Option<Arc<str>>, lang2: &Option<Arc<str>>) -> bool {
+    match lang2 {
+        None => true,
+        Some(l2) => lang1.as_deref() == Some(l2.as_ref()),
+    }
+}
+
 pub fn eval_str_before<R: RowAccess>(
     args: &[Expression],
     row: &R,
     ctx: Option<&ExecutionContext<'_>>,
 ) -> Result<Option<ComparableValue>> {
     check_arity(args, 2, "STRBEFORE")?;
-    let lang = extract_lang_tag(&args[0], row, ctx);
     let arg1 = args[0].eval_to_comparable(row, ctx)?;
     let arg2 = args[1].eval_to_comparable(row, ctx)?;
-    match (arg1, arg2) {
-        (Some(ComparableValue::String(s)), Some(ComparableValue::String(d))) => {
-            let result = s.find(d.as_ref()).map(|pos| &s[..pos]).unwrap_or("");
-            Ok(Some(string_with_lang(result, lang)))
-        }
-        (None, _) | (_, None) => Ok(None),
-        _ => Ok(None),
+    let (Some((s, lang1)), Some((sub, lang2))) = (
+        str_arg_and_lang(&args[0], arg1, row, ctx),
+        str_arg_and_lang(&args[1], arg2, row, ctx),
+    ) else {
+        return Ok(None);
+    };
+    if !args_compatible(&lang1, &lang2) {
+        return Ok(None);
+    }
+    match s.find(&sub) {
+        // Found (including the empty search string, found at position 0):
+        // the result carries arg1's language tag.
+        Some(pos) => Ok(Some(string_with_lang(&s[..pos], lang1))),
+        // Not found: a plain empty simple literal (no language tag).
+        None => Ok(Some(ComparableValue::String(Arc::from("")))),
     }
 }
 
@@ -350,19 +399,23 @@ pub fn eval_str_after<R: RowAccess>(
     ctx: Option<&ExecutionContext<'_>>,
 ) -> Result<Option<ComparableValue>> {
     check_arity(args, 2, "STRAFTER")?;
-    let lang = extract_lang_tag(&args[0], row, ctx);
     let arg1 = args[0].eval_to_comparable(row, ctx)?;
     let arg2 = args[1].eval_to_comparable(row, ctx)?;
-    match (arg1, arg2) {
-        (Some(ComparableValue::String(s)), Some(ComparableValue::String(d))) => {
-            let result = s
-                .find(d.as_ref())
-                .map(|pos| &s[pos + d.len()..])
-                .unwrap_or("");
-            Ok(Some(string_with_lang(result, lang)))
-        }
-        (None, _) | (_, None) => Ok(None),
-        _ => Ok(None),
+    let (Some((s, lang1)), Some((sub, lang2))) = (
+        str_arg_and_lang(&args[0], arg1, row, ctx),
+        str_arg_and_lang(&args[1], arg2, row, ctx),
+    ) else {
+        return Ok(None);
+    };
+    if !args_compatible(&lang1, &lang2) {
+        return Ok(None);
+    }
+    match s.find(&sub) {
+        // Found (the empty search string matches at 0 → the whole string):
+        // the result carries arg1's language tag.
+        Some(pos) => Ok(Some(string_with_lang(&s[pos + sub.len()..], lang1))),
+        // Not found: a plain empty simple literal (no language tag).
+        None => Ok(Some(ComparableValue::String(Arc::from("")))),
     }
 }
 
@@ -712,6 +765,7 @@ impl TrimSide {
 mod tests {
     use super::*;
     use crate::binding::Batch;
+    use crate::ir::Function;
     use crate::var_registry::VarId;
     use fluree_db_core::value::FlakeValue;
     use fluree_db_core::Sid;
@@ -781,5 +835,104 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result, Some(ComparableValue::Bool(true)));
+    }
+
+    // STRBEFORE / STRAFTER — SPARQL 1.1 §17.4.3.7/8 datatyping rules.
+
+    fn lang_batch(value: &str, lang: &str) -> Batch {
+        let schema: Arc<[VarId]> = Arc::from(vec![VarId(0)].into_boxed_slice());
+        let col = vec![Binding::lit_lang(
+            FlakeValue::String(value.to_string()),
+            lang,
+        )];
+        Batch::new(schema, vec![col]).unwrap()
+    }
+
+    fn lang_const(value: &str, lang: &str) -> Expression {
+        // `"value"@lang` in expression position lowers to STRLANG(value, lang).
+        Expression::Call {
+            func: Function::StrLang,
+            args: vec![
+                Expression::Const(FlakeValue::String(value.to_string())),
+                Expression::Const(FlakeValue::String(lang.to_string())),
+            ],
+        }
+    }
+
+    fn s_const(value: &str) -> Expression {
+        Expression::Const(FlakeValue::String(value.to_string()))
+    }
+
+    #[test]
+    fn test_strbefore_found_preserves_lang() {
+        let batch = lang_batch("english", "en");
+        let row = batch.row_view(0).unwrap();
+        let r =
+            eval_str_before::<_>(&[Expression::Var(VarId(0)), s_const("s")], &row, None).unwrap();
+        assert_eq!(r, Some(string_with_lang("engli", Some(Arc::from("en")))));
+    }
+
+    #[test]
+    fn test_strbefore_no_match_is_plain_empty() {
+        // No match must drop arg1's language tag → plain "".
+        let batch = lang_batch("日本語", "ja");
+        let row = batch.row_view(0).unwrap();
+        let r =
+            eval_str_before::<_>(&[Expression::Var(VarId(0)), s_const("s")], &row, None).unwrap();
+        assert_eq!(r, Some(ComparableValue::String(Arc::from(""))));
+    }
+
+    #[test]
+    fn test_strafter_empty_substring_returns_whole_with_lang() {
+        let batch = lang_batch("abc", "en");
+        let row = batch.row_view(0).unwrap();
+        let r = eval_str_after::<_>(&[Expression::Var(VarId(0)), s_const("")], &row, None).unwrap();
+        assert_eq!(r, Some(string_with_lang("abc", Some(Arc::from("en")))));
+    }
+
+    #[test]
+    fn test_strbefore_empty_substring_returns_empty_with_lang() {
+        let batch = lang_batch("abc", "en");
+        let row = batch.row_view(0).unwrap();
+        let r =
+            eval_str_before::<_>(&[Expression::Var(VarId(0)), s_const("")], &row, None).unwrap();
+        assert_eq!(r, Some(string_with_lang("", Some(Arc::from("en")))));
+    }
+
+    #[test]
+    fn test_strbefore_incompatible_lang_is_unbound() {
+        // arg1 @en, arg2 @cy → incompatible → type error → unbound.
+        let batch = lang_batch("abc", "en");
+        let row = batch.row_view(0).unwrap();
+        let r = eval_str_before::<_>(
+            &[Expression::Var(VarId(0)), lang_const("b", "cy")],
+            &row,
+            None,
+        )
+        .unwrap();
+        assert_eq!(r, None);
+
+        // Same lang → compatible.
+        let r2 = eval_str_before::<_>(
+            &[Expression::Var(VarId(0)), lang_const("b", "en")],
+            &row,
+            None,
+        )
+        .unwrap();
+        assert_eq!(r2, Some(string_with_lang("a", Some(Arc::from("en")))));
+    }
+
+    #[test]
+    fn test_strbefore_simple_arg1_with_lang_arg2_is_unbound() {
+        // arg1 simple (no lang), arg2 @en → incompatible.
+        let batch = make_string_batch(); // "Hello World", no lang
+        let row = batch.row_view(0).unwrap();
+        let r = eval_str_before::<_>(
+            &[Expression::Var(VarId(0)), lang_const("World", "en")],
+            &row,
+            None,
+        )
+        .unwrap();
+        assert_eq!(r, None);
     }
 }
