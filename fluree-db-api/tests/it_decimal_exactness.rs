@@ -1180,8 +1180,16 @@ async fn jsonld_decimal_renders_consistently_across_index_and_novelty() {
                 "decimal must render in one consistent shape across index/novelty: \
                  indexed={indexed}, novelty={novel}"
             );
-            assert_eq!(indexed, &JsonValue::String("19.99".to_string()), "indexed decimal");
-            assert_eq!(novel, &JsonValue::String("24.50".to_string()), "novelty decimal");
+            assert_eq!(
+                indexed,
+                &JsonValue::String("19.99".to_string()),
+                "indexed decimal"
+            );
+            assert_eq!(
+                novel,
+                &JsonValue::String("24.50".to_string()),
+                "novelty decimal"
+            );
 
             // Tabular SPARQL lane (object_binding): both the arena- and
             // novelty-served decimals must report xsd:decimal, not an empty
