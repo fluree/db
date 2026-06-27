@@ -2167,7 +2167,7 @@ async fn run_val_agg(
         .expect("one result row");
     let value = batch
         .column_by_idx(0)
-        .and_then(|c| c.get(0))
+        .and_then(|c| c.first())
         .expect("a scalar value");
     format!("{value:?}")
 }
@@ -2263,5 +2263,82 @@ async fn fused_sum_integer_expr_keeps_integer_datatype() {
     assert!(
         got.contains("60") && got.contains("integer") && !got.contains("decimal"),
         "SUM(integer expr) should stay xsd:integer (= 60), got {got}"
+    );
+}
+
+#[tokio::test]
+async fn fused_fallback_applies_offset_once() {
+    // GROUP BY on an xsd:date column trips the fused operator's column-resolution
+    // gate (date isn't a supported group key), so it falls back to the normal
+    // pipeline at open. OFFSET must be applied exactly once: the fallback is built
+    // with OFFSET stripped and the engine's OffsetOperator wraps the result. The
+    // prior regression baked OFFSET into the fallback *and* re-applied it, which
+    // would drop twice as many rows.
+    let mapping = R2rmlLoader::from_turtle(&val_mapping("xsd:date"))
+        .unwrap()
+        .compile()
+        .unwrap();
+    // Three distinct date groups (days since epoch): {1: 2 rows, 2: 1, 3: 1}.
+    let batch = id_val_batch(
+        vec![Some(1), Some(2), Some(3), Some(4)],
+        Column::Date(vec![Some(1), Some(1), Some(2), Some(3)]),
+        FieldType::Date,
+    );
+    let provider = MockR2rmlProvider::new(mapping, vec![batch]);
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let mut ledger = genesis_ledger(&fluree, "fa:main");
+    Arc::make_mut(&mut ledger.snapshot)
+        .insert_namespace_code(9_999, "http://example.org/".to_string())
+        .unwrap();
+
+    let mut vars = VarRegistry::new();
+    let s = vars.get_or_insert("?s");
+    let o = vars.get_or_insert("?o");
+    let c = vars.get_or_insert("?c");
+    let pred = ledger
+        .snapshot
+        .encode_iri("http://example.org/val")
+        .expect("example.org namespace registered");
+
+    let graph = Pattern::Graph {
+        name: GraphName::Iri("fa-gs:main".into()),
+        patterns: vec![Pattern::Triple(TriplePattern::new(
+            Ref::Var(s),
+            Ref::Sid(pred),
+            Term::Var(o),
+        ))],
+    };
+
+    let mut parsed = Query::new(ParsedContext::default());
+    parsed.patterns = vec![graph];
+    // Detection requires the projection to equal {group keys} ∪ {agg outputs}.
+    parsed.output = QueryOutput::select_all(vec![o, c]);
+    parsed.grouping = Grouping::assemble(
+        vec![o],
+        vec![AggregateSpec {
+            function: AggregateFn::CountAll,
+            output_var: c,
+        }],
+        vec![],
+        None,
+    );
+    parsed.offset = Some(1);
+
+    let executable = ExecutableQuery::simple(parsed);
+    let tracker = Tracker::disabled();
+    let result = execute(
+        GraphDbRef::new(&ledger.snapshot, 0, &NoOverlay, ledger.t()),
+        &vars,
+        &executable,
+        r2rml_test_config(&tracker, &provider),
+    )
+    .await
+    .expect("query should execute");
+
+    let rows: usize = result.iter().fold(0, |acc, b| acc + b.len());
+    assert_eq!(
+        rows, 2,
+        "3 groups with OFFSET 1 must yield 2 rows (offset applied once, not twice)"
     );
 }

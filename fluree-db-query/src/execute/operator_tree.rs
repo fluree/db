@@ -2436,7 +2436,17 @@ fn build_operator_tree_inner(
     // its column-resolution gates fail.
     if enable_fused_fast_paths {
         if let Some(plan) = crate::r2rml::detect_fused_r2rml_aggregate(query) {
-            let fallback = build_operator_tree_inner(query, stats.clone(), false, planning)?;
+            // Build the fallback with ORDER BY / OFFSET / LIMIT stripped: those
+            // wrap the operator below, so the fallback (which the operator streams
+            // when its column-resolution gates fail) must not apply them too —
+            // a doubled OFFSET would otherwise skip twice as many rows.
+            let mut fallback_query = query.clone();
+            fallback_query.ordering = Vec::new();
+            fallback_query.order_binds = Vec::new();
+            fallback_query.limit = None;
+            fallback_query.offset = None;
+            let fallback =
+                build_operator_tree_inner(&fallback_query, stats.clone(), false, planning)?;
             let mut op: BoxedOperator = Box::new(crate::r2rml::FusedR2rmlAggregateOperator::new(
                 plan, fallback,
             ));

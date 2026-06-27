@@ -83,8 +83,9 @@ enum DecKind {
 /// An exact fixed-point decimal `val * 10^-scale`, mirroring BigDecimal's
 /// (unscaled, scale) form so native `+`/`-`/`*` reproduce the engine's exact
 /// (no-rounding) decimal arithmetic. `i128` carries ~38 digits — ample for
-/// analytical decimal aggregates; an intermediate beyond that yields `None`
-/// (the row is skipped) rather than a wrong wraparound.
+/// analytical decimal aggregates; an intermediate beyond that yields `None`, and
+/// the caller escalates to the exact BigDecimal pipeline rather than wrap around
+/// or drop the row.
 #[derive(Clone, Copy)]
 struct Dec {
     val: i128,
@@ -164,27 +165,71 @@ fn expr_has_decimal_const(expr: &Expression) -> bool {
     }
 }
 
-/// Evaluate a native decimal arithmetic expression for one row. `vars` gives the
-/// already-read value of each referenced variable (`None` = null → the whole
-/// expression is `None`, and the row is skipped, matching SUM's null handling).
-fn eval_dec(expr: &Expression, vars: &[(VarId, Option<Dec>)]) -> Option<Dec> {
-    match expr {
-        Expression::Var(v) => vars.iter().find(|(x, _)| x == v).and_then(|(_, d)| *d),
-        Expression::Const(fv) => const_to_dec(fv),
-        Expression::Call { func, args } => match (func, args.as_slice()) {
-            (Function::Add, [a, b]) => eval_dec(a, vars)?.add_sub(eval_dec(b, vars)?, false),
-            (Function::Sub, [a, b]) => eval_dec(a, vars)?.add_sub(eval_dec(b, vars)?, true),
-            (Function::Mul, [a, b]) => eval_dec(a, vars)?.mul(eval_dec(b, vars)?),
-            (Function::Negate, [a]) => {
-                let d = eval_dec(a, vars)?;
-                Some(Dec {
-                    val: d.val.checked_neg()?,
-                    scale: d.scale,
-                })
-            }
-            _ => None,
+/// Outcome of evaluating a fused decimal expression for one row. A null operand
+/// and an i128 overflow are kept distinct: the former is a legitimate row drop
+/// (matching SUM/AVG null handling), the latter must escalate to the exact
+/// BigDecimal pipeline rather than silently omit the row.
+enum DecEval {
+    /// Exact value to fold in.
+    Val(Dec),
+    /// A referenced operand was null/absent — the row contributes nothing.
+    Null,
+    /// An i128 intermediate overflowed — the caller must fall back to the exact
+    /// pipeline so the row is computed, not dropped.
+    Overflow,
+}
+
+/// Combine two operand evaluations through an exact decimal op. Overflow takes
+/// precedence (always safe — the exact pipeline recomputes the row and still
+/// drops it if a null was also present), then null (drop), then the op itself,
+/// whose own i128 overflow escalates.
+fn combine_dec(a: DecEval, b: DecEval, op: impl FnOnce(Dec, Dec) -> Option<Dec>) -> DecEval {
+    match (a, b) {
+        (DecEval::Overflow, _) | (_, DecEval::Overflow) => DecEval::Overflow,
+        (DecEval::Null, _) | (_, DecEval::Null) => DecEval::Null,
+        (DecEval::Val(x), DecEval::Val(y)) => match op(x, y) {
+            Some(d) => DecEval::Val(d),
+            None => DecEval::Overflow,
         },
-        _ => None,
+    }
+}
+
+/// Evaluate a native decimal arithmetic expression for one row. `vars` gives the
+/// already-read value of each referenced variable (`None` = null → [`DecEval::Null`]).
+fn eval_dec(expr: &Expression, vars: &[(VarId, Option<Dec>)]) -> DecEval {
+    match expr {
+        Expression::Var(v) => match vars.iter().find(|(x, _)| x == v) {
+            Some((_, Some(d))) => DecEval::Val(*d),
+            _ => DecEval::Null,
+        },
+        // Detection (`expr_native_foldable`) rejects constants that don't fit
+        // i128, so a `None` here is unexpected — fall back rather than drop.
+        Expression::Const(fv) => match const_to_dec(fv) {
+            Some(d) => DecEval::Val(d),
+            None => DecEval::Overflow,
+        },
+        Expression::Call { func, args } => match (func, args.as_slice()) {
+            (Function::Add, [a, b]) => combine_dec(eval_dec(a, vars), eval_dec(b, vars), |x, y| {
+                x.add_sub(y, false)
+            }),
+            (Function::Sub, [a, b]) => combine_dec(eval_dec(a, vars), eval_dec(b, vars), |x, y| {
+                x.add_sub(y, true)
+            }),
+            (Function::Mul, [a, b]) => combine_dec(eval_dec(a, vars), eval_dec(b, vars), Dec::mul),
+            (Function::Negate, [a]) => match eval_dec(a, vars) {
+                DecEval::Val(d) => match d.val.checked_neg() {
+                    Some(val) => DecEval::Val(Dec {
+                        val,
+                        scale: d.scale,
+                    }),
+                    None => DecEval::Overflow,
+                },
+                other => other,
+            },
+            // Unsupported call shape (detection rejects these) — fall back.
+            _ => DecEval::Overflow,
+        },
+        _ => DecEval::Overflow,
     }
 }
 
@@ -543,19 +588,25 @@ fn accumulate_exact_row(
     }
 }
 
-/// Add one row's floating value to the accumulator.
+/// Add one row's floating value to the accumulator. NaN is dropped (neither
+/// summed nor counted), mirroring the standard aggregate pipeline's numeric
+/// coercion, so a NaN value can't poison SUM/AVG or inflate the count.
 fn accumulate_double_row(col: &Column, row: usize, sum: &mut f64, count: &mut u64) {
     match col {
         Column::Float64(values) => {
             if let Some(Some(v)) = values.get(row) {
-                *sum += *v;
-                *count += 1;
+                if !v.is_nan() {
+                    *sum += *v;
+                    *count += 1;
+                }
             }
         }
         Column::Float32(values) => {
             if let Some(Some(v)) = values.get(row) {
-                *sum += *v as f64;
-                *count += 1;
+                if !v.is_nan() {
+                    *sum += *v as f64;
+                    *count += 1;
+                }
             }
         }
         _ => {}
@@ -964,7 +1015,7 @@ impl Operator for FusedR2rmlAggregateOperator {
                                     Acc::Expr {
                                         sum, scale, count, ..
                                     },
-                                    Some(d),
+                                    DecEval::Val(d),
                                 ) => match sum.checked_add(d.val) {
                                     Some(s) => {
                                         *sum = s;
@@ -972,8 +1023,13 @@ impl Operator for FusedR2rmlAggregateOperator {
                                         *count += 1;
                                         true
                                     }
+                                    // Sum-level i128 overflow → exact pipeline.
                                     None => false,
                                 },
+                                // Intermediate i128 overflow → exact pipeline
+                                // (must not be confused with a null row drop).
+                                (_, DecEval::Overflow) => false,
+                                // Null operand → the row contributes nothing.
                                 _ => true,
                             }
                         }
@@ -1373,5 +1429,98 @@ mod tests {
             };
             assert!(detect_fused_r2rml_aggregate(&q).is_some());
         }
+    }
+
+    #[test]
+    fn accumulate_double_row_drops_nan() {
+        // A NaN must be dropped (not summed, not counted), matching the standard
+        // aggregate pipeline — else SUM/AVG poison to NaN and the count inflates.
+        let col = Column::Float64(vec![Some(1.0), Some(f64::NAN), Some(3.0)]);
+        let (mut sum, mut count) = (0.0f64, 0u64);
+        for row in 0..3 {
+            accumulate_double_row(&col, row, &mut sum, &mut count);
+        }
+        assert_eq!(count, 2, "NaN row is not counted");
+        assert_eq!(sum, 4.0, "NaN does not poison the sum");
+
+        let col32 = Column::Float32(vec![Some(2.0f32), Some(f32::NAN)]);
+        let (mut sum, mut count) = (0.0f64, 0u64);
+        accumulate_double_row(&col32, 0, &mut sum, &mut count);
+        accumulate_double_row(&col32, 1, &mut sum, &mut count);
+        assert_eq!(count, 1);
+        assert_eq!(sum, 2.0);
+    }
+
+    #[test]
+    fn eval_dec_drops_null_but_escalates_overflow() {
+        let (v, w) = (VarId(0), VarId(1));
+
+        // A present operand folds to a value.
+        let bound = [(v, Some(Dec { val: 5, scale: 0 }))];
+        assert!(matches!(
+            eval_dec(&Expression::Var(v), &bound),
+            DecEval::Val(_)
+        ));
+
+        // A null operand is a legitimate row drop, not an error.
+        let nullv = [(v, None)];
+        assert!(matches!(
+            eval_dec(&Expression::Var(v), &nullv),
+            DecEval::Null
+        ));
+
+        // Exact arithmetic on bound operands folds to a value.
+        let add = Expression::Call {
+            func: Function::Add,
+            args: vec![Expression::Var(v), Expression::Var(w)],
+        };
+        let ok = [
+            (v, Some(Dec { val: 3, scale: 0 })),
+            (w, Some(Dec { val: 4, scale: 0 })),
+        ];
+        assert!(matches!(eval_dec(&add, &ok), DecEval::Val(d) if d.val == 7));
+
+        // An i128 intermediate overflow escalates (must NOT collapse to a drop).
+        let mul = Expression::Call {
+            func: Function::Mul,
+            args: vec![Expression::Var(v), Expression::Var(w)],
+        };
+        let big = [
+            (
+                v,
+                Some(Dec {
+                    val: i128::MAX,
+                    scale: 0,
+                }),
+            ),
+            (w, Some(Dec { val: 2, scale: 0 })),
+        ];
+        assert!(matches!(eval_dec(&mul, &big), DecEval::Overflow));
+
+        // Overflow takes precedence over a null sibling — still a safe fallback.
+        let nested = Expression::Call {
+            func: Function::Mul,
+            args: vec![
+                Expression::Call {
+                    func: Function::Mul,
+                    args: vec![Expression::Var(v), Expression::Const(FlakeValue::Long(2))],
+                },
+                Expression::Var(w),
+            ],
+        };
+        let big_and_null = [
+            (
+                v,
+                Some(Dec {
+                    val: i128::MAX,
+                    scale: 0,
+                }),
+            ),
+            (w, None),
+        ];
+        assert!(matches!(
+            eval_dec(&nested, &big_and_null),
+            DecEval::Overflow
+        ));
     }
 }
