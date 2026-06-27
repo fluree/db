@@ -14,11 +14,9 @@
 //!
 //! See GitHub issue #1259.
 
-mod support;
-
+use crate::support::{genesis_ledger, MemoryFluree};
 use fluree_db_api::FlureeBuilder;
 use serde_json::json;
-use support::{genesis_ledger, MemoryFluree};
 
 /// Seed three federated ledgers with *divergent* entity vocabularies.
 ///

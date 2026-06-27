@@ -6,8 +6,7 @@
 //! commit IDs) is not currently testable because commit timestamps are generated
 //! internally via `Utc::now()`. See TODO in `fluree-db-transact/src/commit.rs`.
 
-mod support;
-
+use crate::support;
 use fluree_db_api::FlureeBuilder;
 use serde_json::json;
 

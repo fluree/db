@@ -4,11 +4,9 @@
 //! - identity-based policy loading via `f:policyClass` on the identity subject
 //! - view policy enforcement on direct selects and expansion formatting
 
-mod support;
-
+use crate::support::{assert_index_defaults, genesis_ledger, normalize_rows, seed_people_with_ssn};
 use fluree_db_api::FlureeBuilder;
 use serde_json::json;
-use support::{assert_index_defaults, genesis_ledger, normalize_rows, seed_people_with_ssn};
 
 #[tokio::test]
 async fn policy_inline_denies_restricted_property_in_direct_select() {

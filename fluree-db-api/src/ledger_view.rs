@@ -21,12 +21,13 @@ use fluree_db_nameservice::NsRecord;
 use fluree_db_novelty::Novelty;
 
 use crate::error::{ApiError, Result};
+use serde::{Deserialize, Serialize};
 
 /// How a caller identifies a commit.
 ///
 /// Commits have a canonical content-addressed id ([`CommitId`]), but there are
 /// several user-facing forms that resolve to the same id.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CommitRef {
     /// Fully resolved CID — no lookup needed.
     ///

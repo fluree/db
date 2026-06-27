@@ -8,11 +8,10 @@
 //! - Rule with multiple where patterns
 //! - Fixpoint iteration (rules triggering other rules)
 
-mod support;
-
+use crate::support;
+use crate::support::{genesis_ledger, normalize_rows};
 use fluree_db_api::FlureeBuilder;
 use serde_json::json;
-use support::{genesis_ledger, normalize_rows};
 
 // =============================================================================
 // Basic Datalog Rule Tests

@@ -39,7 +39,8 @@ storage_path = "/var/lib/fluree"
 log_level = "info"
 query_timeout_ms = 900000  # 15 minutes; set to 0 to disable
 query_min_t_timeout_ms = 5000
-# cache_max_mb = 4096  # global cache budget (MB); default: tiered by RAM (<4GB: 30%, 4-8GB: 40%, >=8GB: 35%)
+# cache_max_mb = 4096  # global in-memory cache budget (MB); default: tiered by RAM (<4GB: 30%, 4-8GB: 40%, >=8GB: 35%)
+# disk_cache_max_mb = 20480  # global on-disk cache budget (MB), shared across object storage + Iceberg; default: auto-detect; 0 disables
 
 [server.query_refresh]
 enabled = false
@@ -363,6 +364,7 @@ Global cache budget (MB):
 | Flag              | Env Var              | Default                |
 | ----------------- | -------------------- | ---------------------- |
 | `--cache-max-mb`  | `FLUREE_CACHE_MAX_MB`| Tiered by RAM: `<4GB: 30%, 4-8GB: 40%, >=8GB: 35%`    |
+| `--disk-cache-max-mb` | `FLUREE_DISK_CACHE_MAX_MB`| Auto-detect from free disk; `0` disables. Shared across object storage + Iceberg |
 
 ### Background Indexing
 
@@ -785,6 +787,7 @@ With a config file:
 [server]
 connection_config = "/etc/fluree/connection.jsonld"
 cache_max_mb = 4096
+disk_cache_max_mb = 20480
 
 [server.indexing]
 enabled = true
@@ -821,7 +824,9 @@ fluree server run \
 | `FLUREE_INDEXING_ENABLED`               | Enable background indexing                      | `true`                                                                  |
 | `FLUREE_REINDEX_MIN_BYTES`              | Soft reindex threshold (bytes)                  | `100000`                                                                |
 | `FLUREE_REINDEX_MAX_BYTES`              | Hard reindex threshold (bytes)                  | 20% of system RAM (256 MB fallback)                                      |
-| `FLUREE_CACHE_MAX_MB`                   | Global cache budget (MB)                        | Tiered by RAM: `<4GB: 30%, 4-8GB: 40%, >=8GB: 35%`                                                     |
+| `FLUREE_CACHE_MAX_MB`                   | Global in-memory cache budget (MB)              | Tiered by RAM: `<4GB: 30%, 4-8GB: 40%, >=8GB: 35%`                                                     |
+| `FLUREE_DISK_CACHE_MAX_MB`              | Global on-disk cache budget (MB), shared across object storage + Iceberg | Auto-detect from free disk; `0` disables |
+| `FLUREE_DISK_CACHE_BUDGET_BYTES`        | On-disk cache budget (bytes); overrides `FLUREE_DISK_CACHE_MAX_MB`        | Auto-detect from free disk; `0` disables |
 | `FLUREE_BODY_LIMIT`                     | Max request body bytes                          | `52428800`                                                              |
 | `FLUREE_QUERY_TIMEOUT_MS`               | Max query execution time in milliseconds (`0` disables) | `900000`                                                     |
 | `FLUREE_QUERY_MIN_T_TIMEOUT_MS`         | Max read-after-write min-t wait in milliseconds | `5000`                                                                  |
@@ -957,6 +962,36 @@ Bearer tokens are stored in memory on the `Fluree` instance. They are never seri
 The HTTP transport for remote SERVICE requires the `search-remote-client` Cargo feature (which enables `reqwest`). Without this feature, remote connections can be registered but queries against them will fail at runtime. The feature is enabled by default in the server binary.
 
 See [SPARQL: Remote Fluree Federation](../query/sparql.md#remote-fluree-federation) for query syntax and examples.
+
+## Memory Allocator (mimalloc)
+
+`fluree-db-server` and `fluree-db-cli` expose an opt-in `mimalloc` Cargo feature
+that swaps the global allocator to [mimalloc](https://github.com/microsoft/mimalloc).
+It is **off by default** — enable it in your release build:
+
+```bash
+cargo build --release -p fluree-db-server --features mimalloc
+```
+
+**When it helps:** allocation-heavy, multicore query paths — most notably
+R2RML/Iceberg graph-source scans, which materialize many RDF terms in parallel.
+On those workloads the system allocator's lock contention caps the parallel
+speedup; mimalloc roughly doubles the realized gain (e.g. TPC-H Q1 over a 6M-row
+Iceberg table: ~62s with the system allocator vs ~31s with mimalloc).
+
+**Tradeoffs (operational, not semantic):**
+
+- Changes the allocator for *every* allocation in the process (HTTP, query,
+  import, caches, AWS/Iceberg clients, tracing buffers).
+- Usually better multicore throughput and lower fragmentation, but may retain
+  more RSS due to per-thread heaps — relevant for large scans that already peak
+  high. Track RSS, p95 query latency, and concurrent-query behavior during a
+  soak before making it the default.
+- New native dependency in the binary; verify it builds for your target
+  (e.g. musl/cross builds) and keep a system-allocator fallback build.
+
+Pair it with bounded query parallelism so a single large scan cannot monopolize
+cores and allocator pressure under concurrent load.
 
 ## Related Documentation
 

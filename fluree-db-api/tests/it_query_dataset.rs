@@ -7,16 +7,15 @@
 //! - Variable GRAPH iteration over named graphs
 //! - Cross-graph joins
 
-mod support;
-
+use crate::support;
+use crate::support::{
+    assert_index_defaults, genesis_ledger, normalize_flat_results, normalize_rows, MemoryFluree,
+    MemoryLedger,
+};
 use fluree_db_api::TimeSpec;
 use fluree_db_api::{DataSetDb, DatasetSpec, FlureeBuilder, GraphDb, GraphSource, QueryInput};
 use fluree_db_core::load_commit_by_id;
 use serde_json::json;
-use support::{
-    assert_index_defaults, genesis_ledger, normalize_flat_results, normalize_rows, MemoryFluree,
-    MemoryLedger,
-};
 
 // =============================================================================
 // Helper functions

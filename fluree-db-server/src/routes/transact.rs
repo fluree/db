@@ -38,8 +38,7 @@ use fluree_db_api::{
     TxnType,
 };
 use fluree_db_consensus::{
-    Committer, IdempotencyKey, SubmissionError, TransactionBody, TransactionReceipt,
-    TransactionRequest,
+    IdempotencyKey, SubmissionError, TransactionBody, TransactionReceipt, TransactionRequest,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
@@ -281,8 +280,8 @@ fn build_commit_opts(
     commit_opts
 }
 
-/// Submit a prepared transaction through monolithic consensus and shape the
-/// HTTP response.
+/// Submit a prepared transaction through the configured committer and
+/// shape the HTTP response.
 ///
 /// All upstream preparation (header injection, identity wiring, opts
 /// assembly, `tx_id` derivation) happens in the caller. Request correlation
@@ -302,7 +301,7 @@ async fn transact_via_consensus(
     );
 
     let submission =
-        with_index_request_correlation(correlation, state.consensus.transact(request)).await;
+        with_index_request_correlation(correlation, state.committer.transact(request)).await;
     let receipt = match submission {
         Ok(receipt) => {
             tracing::info!(

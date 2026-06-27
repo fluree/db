@@ -35,6 +35,10 @@ shacl = ["fluree-db-api/shacl"]
 oidc = ["fluree-db-credential/oidc", "dep:jsonwebtoken"]
 # Iceberg / R2RML graph source support
 iceberg = ["fluree-db-api/iceberg"]
+# Use mimalloc as the global allocator. Better multicore allocation throughput
+# for the allocation-heavy query/materialization paths (e.g. R2RML/Iceberg
+# scans). Opt-in: enable in release packaging after a soak.
+mimalloc = ["dep:mimalloc"]
 # Enable Swagger UI endpoint (requires network during build to download assets)
 swagger-ui = ["dep:utoipa-swagger-ui"]
 # Enable OpenTelemetry tracing (optional)
@@ -44,14 +48,23 @@ otel = [
     "dep:opentelemetry-otlp",
     "dep:opentelemetry_sdk",
 ]
+# Replicate writes through a Raft cluster. Mounts the follower-forward
+# middleware on leader-only routes and exposes the inter-node RPC +
+# cluster-admin routers on a separate private listener.
+raft = ["fluree-db-consensus/raft", "dep:fluree-db-indexer"]
 
 [dependencies]
+# Optional global allocator (see the `mimalloc` feature).
+mimalloc = { workspace = true, optional = true }
 # Fluree DB crates
 fluree-db-api = { path = "../fluree-db-api" }
 fluree-db-connection = { path = "../fluree-db-connection" }
 fluree-db-core = { path = "../fluree-db-core" }
 fluree-db-consensus = { path = "../fluree-db-consensus" }
 fluree-db-credential = { path = "../fluree-db-credential" }
+# Optional; pulled in by the `raft` feature for the leader-aware
+# indexer launcher in `crate::raft::spawn_leader_watcher`'s closure.
+fluree-db-indexer = { path = "../fluree-db-indexer", optional = true }
 fluree-db-nameservice = { path = "../fluree-db-nameservice" }
 fluree-db-nameservice-sync = { path = "../fluree-db-nameservice-sync" }
 fluree-db-peer = { path = "../fluree-db-peer" }

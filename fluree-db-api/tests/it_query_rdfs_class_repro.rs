@@ -11,8 +11,7 @@
 //! `count_mixed_predicate_leaflet_regression` below.
 #![cfg(feature = "native")]
 
-mod support;
-
+use crate::support;
 use fluree_db_api::FlureeBuilder;
 use serde_json::json;
 use std::io::Write;

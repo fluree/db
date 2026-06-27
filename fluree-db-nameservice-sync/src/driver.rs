@@ -442,7 +442,7 @@ mod tests {
     use crate::config::{MemorySyncConfigStore, UpstreamConfig};
     use fluree_db_core::{ContentId, ContentKind};
     use fluree_db_nameservice::memory::MemoryNameService;
-    use fluree_db_nameservice::{MemoryTrackingStore, NsRecord, Publisher, RefLookup};
+    use fluree_db_nameservice::{CommitPublisher, MemoryTrackingStore, NsRecord, RefLookup};
 
     fn origin() -> RemoteName {
         RemoteName::new("origin")
@@ -469,7 +469,7 @@ mod tests {
     #[async_trait::async_trait]
     impl RemoteNameserviceClient for MockRemoteClient {
         async fn lookup(&self, ledger_id: &str) -> Result<Option<NsRecord>> {
-            use fluree_db_nameservice::NameService;
+            use fluree_db_nameservice::NameServiceLookup;
             Ok(self
                 .ns
                 .lookup(ledger_id)
@@ -478,7 +478,7 @@ mod tests {
         }
 
         async fn snapshot(&self) -> Result<RemoteSnapshot> {
-            use fluree_db_nameservice::NameService;
+            use fluree_db_nameservice::NameServiceLookup;
             let records = self
                 .ns
                 .all_records()

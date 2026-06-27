@@ -4,11 +4,10 @@
 //! property pattern on the same subject, while it works with a literal-valued
 //! property and works when the type is asserted (base) rather than derived.
 
-mod support;
-
+use crate::support;
+use crate::support::{genesis_ledger, normalize_rows, rebuild_and_publish_index};
 use fluree_db_api::{FlureeBuilder, QueryInput};
 use serde_json::json;
-use support::{genesis_ledger, normalize_rows, rebuild_and_publish_index};
 
 /// Insert `data`, build+publish the binary index, then run `q` against the
 /// reloaded indexed view (binary store attached — the path that diverged from

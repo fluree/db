@@ -7,8 +7,7 @@
 //! - query via JSON-LD query syntax
 //! - reload from file-backed nameservice + storage and re-run the query
 
-mod support;
-
+use crate::support;
 use fluree_db_api::{FlureeBuilder, LedgerState, Novelty};
 use fluree_db_core::LedgerSnapshot;
 use serde_json::json;

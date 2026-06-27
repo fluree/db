@@ -309,6 +309,13 @@ pub enum Commands {
         action: BranchAction,
     },
 
+    /// Bootstrap and manage a Raft cluster (replicated transaction servers)
+    #[cfg(feature = "server")]
+    Cluster {
+        #[command(subcommand)]
+        action: ClusterAction,
+    },
+
     /// Drop (delete) a ledger or graph source
     Drop {
         /// Ledger or graph source name to drop. The server resolves as a ledger
@@ -894,6 +901,12 @@ pub enum Commands {
         action: McpAction,
     },
 
+    /// Search the embedded, version-pinned Fluree documentation
+    Docs {
+        #[command(subcommand)]
+        action: DocsAction,
+    },
+
     /// Manage Apache Iceberg table connections
     Iceberg {
         #[command(subcommand)]
@@ -1162,17 +1175,108 @@ pub enum BranchAction {
     },
 }
 
+/// `cluster` subcommands.
+///
+/// Wraps the Fluree server's private `/cluster/*` admin endpoints
+/// for bootstrapping and managing a Raft cluster. All commands take
+/// an admin URL pointing at the VPC-internal listener (`--addr` for
+/// the target node, `--leader` for ops that must run on the
+/// leader). The endpoints carry no auth — the CLI assumes the
+/// operator is reaching them over a private network or SSH tunnel.
+#[cfg(feature = "server")]
+#[derive(Subcommand)]
+pub enum ClusterAction {
+    /// Bootstrap a fresh single-node cluster on this node. Run once
+    /// on the seed node — it auto-elects itself leader. Subsequent
+    /// peers are added with `add` followed by `promote`.
+    Init {
+        /// Admin URL of the seed node (e.g., http://node-1:9090).
+        #[arg(long)]
+        addr: String,
+        /// This node's id. Must be unique in the cluster and stable
+        /// across restarts.
+        #[arg(long)]
+        node_id: u64,
+        /// This node's inter-node Raft RPC URL
+        /// (e.g. http://node-1:9090/raft).
+        #[arg(long)]
+        raft_url: String,
+        /// This node's client-facing URL — used by other nodes
+        /// when forwarding client requests to this leader
+        /// (e.g. http://node-1:8080).
+        #[arg(long)]
+        client_url: String,
+    },
+
+    /// Add a non-voting peer (learner) to the cluster. Issue
+    /// against the leader. The new node replicates the log until
+    /// caught up, then can be promoted to a voter with
+    /// `cluster promote`.
+    Add {
+        /// Admin URL of the cluster leader.
+        #[arg(long)]
+        leader: String,
+        /// Id for the new peer.
+        #[arg(long)]
+        node_id: u64,
+        /// New peer's inter-node Raft RPC URL.
+        #[arg(long)]
+        raft_url: String,
+        /// New peer's client-facing URL.
+        #[arg(long)]
+        client_url: String,
+        /// Wait for the learner to catch up to the leader's log
+        /// before returning. Default: true (the safe choice for
+        /// orchestration scripts that immediately follow up with
+        /// `promote`).
+        #[arg(long, default_value_t = true)]
+        blocking: bool,
+    },
+
+    /// Change the cluster's voting membership — promotes learners
+    /// to voters or demotes / removes existing voters. Issue
+    /// against the leader.
+    Promote {
+        /// Admin URL of the cluster leader.
+        #[arg(long)]
+        leader: String,
+        /// New voter set, comma-separated (e.g., `1,2,3`).
+        #[arg(long, value_delimiter = ',')]
+        members: Vec<u64>,
+        /// Keep voters dropped from `--members` as learners.
+        /// Default: removed entirely.
+        #[arg(long)]
+        retain: bool,
+    },
+
+    /// Snapshot cluster state (current leader, term, voters,
+    /// learners, last applied index). Any node's admin URL works.
+    Status {
+        /// Admin URL of the node to query.
+        #[arg(long)]
+        addr: String,
+    },
+}
+
 /// Memory subcommands.
 #[derive(Subcommand)]
 pub enum MemoryAction {
-    /// Initialize the memory store and configure MCP for detected AI tools
+    /// Deprecated: use `fluree mcp init --toolsets memory`. Hidden back-compat
+    /// alias — registers the memory MCP server with detected/selected IDEs. The
+    /// store is now created lazily on first use, so there is nothing to
+    /// initialize up front.
+    #[command(hide = true)]
     Init {
-        /// Auto-confirm all detected tool installations (non-interactive)
-        #[arg(long, short = 'y')]
+        /// Target IDE (auto-detected if omitted)
+        #[arg(long)]
+        ide: Option<String>,
+
+        /// Accepted for back-compat; no longer affects behavior.
+        #[arg(long, short = 'y', hide = true)]
         yes: bool,
 
-        /// Skip MCP tool detection and installation
-        #[arg(long)]
+        /// Accepted for back-compat; no longer affects behavior.
+        #[arg(long, hide = true)]
         no_mcp: bool,
     },
 
@@ -1285,7 +1389,9 @@ pub enum MemoryAction {
         file: std::path::PathBuf,
     },
 
-    /// Install MCP configuration for an IDE
+    /// Deprecated: use `fluree mcp init --toolsets memory`. Hidden back-compat
+    /// alias.
+    #[command(hide = true)]
     McpInstall {
         /// Target: claude-code, vscode, cursor, windsurf, zed (auto-detected if omitted)
         #[arg(long)]
@@ -1293,14 +1399,96 @@ pub enum MemoryAction {
     },
 }
 
-/// MCP subcommands.
+/// MCP subcommands. One `fluree` MCP server exposes a selectable set of
+/// toolsets (`memory`, `docs`) over a single stdio transport.
 #[derive(Subcommand)]
 pub enum McpAction {
-    /// Start the MCP server (stdio transport for IDE integration)
+    /// Register Fluree's MCP server with an IDE (writes the IDE's MCP config)
+    Init {
+        /// Target: claude-code, vscode, cursor, windsurf, zed (auto-detected if omitted)
+        #[arg(long)]
+        ide: Option<String>,
+
+        /// Which toolset(s) to enable: `memory`, `docs`, a comma-separated list,
+        /// or `all` (default).
+        #[arg(long, default_value = "all")]
+        toolsets: String,
+    },
+
+    /// Start the Fluree MCP server (stdio transport for IDE integration)
     Serve {
         /// Transport: stdio (default) — reads JSON-RPC from stdin, writes to stdout
         #[arg(long, default_value = "stdio")]
         transport: String,
+
+        /// Which toolset(s) to expose: `memory`, `docs`, a comma-separated list,
+        /// or `all`. Defaults to `memory` for back-compat when omitted; `init`
+        /// always writes an explicit `--toolsets` into the args it installs.
+        #[arg(long, default_value = "memory")]
+        toolsets: String,
+    },
+
+    /// Show which toolsets are installed for each detected IDE
+    Status,
+
+    /// Deprecated alias for `init`.
+    #[command(hide = true)]
+    Install {
+        /// Target: claude-code, vscode, cursor, windsurf, zed (auto-detected if omitted)
+        #[arg(long)]
+        ide: Option<String>,
+
+        /// Which toolset(s) to enable (alias of `init`'s `--toolsets`).
+        #[arg(long, default_value = "all")]
+        toolsets: String,
+    },
+}
+
+/// Docs subcommands. The docs are embedded in this binary, so these work
+/// offline and are version-exact for this build.
+#[derive(Subcommand)]
+pub enum DocsAction {
+    /// Search the docs — ranked, section-level hits
+    Search {
+        /// Topic keywords, e.g. "property paths"
+        query: String,
+        /// Max hits
+        #[arg(long, default_value_t = 10)]
+        limit: usize,
+        /// Emit JSON instead of human-readable text
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print a page (or one heading-scoped section) as markdown
+    Get {
+        /// Book-relative page path, e.g. "query/sparql.md"
+        path: String,
+        /// Heading anchor to return just that section, e.g. "property-paths"
+        #[arg(long)]
+        anchor: Option<String>,
+        /// Emit JSON instead of raw markdown
+        #[arg(long)]
+        json: bool,
+    },
+    /// Extract code examples for a topic
+    Examples {
+        /// Topic keywords, e.g. "insert transaction"
+        query: String,
+        /// Filter by language, e.g. "json", "sparql"
+        #[arg(long)]
+        lang: Option<String>,
+        /// Max examples
+        #[arg(long, default_value_t = 10)]
+        limit: usize,
+        /// Emit JSON instead of human-readable text
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print the documentation table of contents
+    Tree {
+        /// Emit JSON instead of an indented tree
+        #[arg(long)]
+        json: bool,
     },
 }
 

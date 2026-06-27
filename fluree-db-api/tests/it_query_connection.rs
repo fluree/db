@@ -4,14 +4,12 @@
 //! - `query_connection` with `"from"` (combined datasets)
 //! - `query_connection` with `"fromNamed"` + `["graph", ...]` patterns (separate named graphs)
 
-mod support;
-
-use fluree_db_api::FlureeBuilder;
-use serde_json::json;
-use support::{
+use crate::support::{
     assert_index_defaults, context_ex_schema, genesis_ledger, normalize_rows, MemoryFluree,
     MemoryLedger,
 };
+use fluree_db_api::FlureeBuilder;
+use serde_json::json;
 
 fn ctx_schema() -> serde_json::Value {
     json!({

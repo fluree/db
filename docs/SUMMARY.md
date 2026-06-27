@@ -9,6 +9,7 @@
   - [list](cli/list.md)
   - [info](cli/info.md)
   - [branch](cli/branch.md)
+  - [cluster](cli/cluster.md)
   - [drop](cli/drop.md)
   - [graph](cli/graph.md)
   - [insert](cli/insert.md)
@@ -38,6 +39,7 @@
   - [server](cli/server.md)
   - [memory](cli/memory.md)
   - [mcp](cli/mcp.md)
+  - [docs](cli/docs.md)
   - [iceberg](cli/iceberg.md)
   - [completions](cli/completions.md)
 
@@ -87,6 +89,7 @@
   - [Ontology imports (`f:schemaSource` + `owl:imports`)](design/ontology-imports.md)
   - [Cross-ledger model enforcement](design/cross-ledger-model-enforcement.md)
   - [Storage traits](design/storage-traits.md)
+  - [Raft command queue and replicated state machine](design/raft-command-queue.md)
 
 - [HTTP API (fluree-db-server)](api/README.md)
   - [Overview](api/overview.md)
@@ -197,6 +200,7 @@
   - [IPFS storage](operations/ipfs-storage.md)
   - [DynamoDB nameservice](operations/dynamodb-guide.md)
   - [Query peers and replication](operations/query-peers.md)
+  - [Raft clusters (replicated writes)](operations/raft-clusters.md)
   - [Telemetry and logging](operations/telemetry.md)
   - [Distributed tracing integration](operations/distributed-tracing.md)
   - [Pack format: archive and restore](operations/pack-archive-restore.md)

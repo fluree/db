@@ -565,6 +565,15 @@ impl S2SearchPattern {
 // R2RML Pattern
 // ============================================================================
 
+/// A FILTER comparison on an R2RML object variable, ready to push to the scan.
+/// `var` is resolved to a table column by the operator (var → predicate → column).
+#[derive(Debug, Clone)]
+pub struct ScanPushdown {
+    pub var: VarId,
+    pub op: crate::r2rml::ScanCmpOp,
+    pub value: crate::r2rml::ScanValue,
+}
+
 /// R2RML scan pattern for querying Iceberg graph sources via R2RML mappings.
 ///
 /// This pattern scans an Iceberg table through R2RML term maps and produces
@@ -608,6 +617,22 @@ pub struct R2rmlPattern {
     ///
     /// Limits scan to TriplesMap(s) that produce this rdf:type.
     pub class_filter: Option<String>,
+
+    /// Pushed-down scan filters for Iceberg file pruning, resolved at execution
+    /// from FILTER comparisons on this pattern's object variables. Conservative:
+    /// the in-engine FILTER still runs, so these only skip data files.
+    pub scan_filters: Vec<ScanPushdown>,
+
+    /// Same-subject star: additional `(predicate IRI, object var)` bindings to
+    /// materialize in the SAME table scan, avoiding a self-join on the subject.
+    ///
+    /// When non-empty, this pattern represents a grouped star of triple patterns
+    /// that all share `subject_var`. The base binding is carried by
+    /// `predicate_filter` + `object_var` (the first member); these are the
+    /// additional members. The operator emits one row per table row (cross
+    /// product over multi-valued predicates) binding the subject and every
+    /// object var, instead of producing one pattern per triple and joining them.
+    pub star_bindings: Vec<(String, VarId)>,
 }
 
 impl R2rmlPattern {
@@ -624,12 +649,20 @@ impl R2rmlPattern {
             triples_map_iri: None,
             predicate_filter: None,
             class_filter: None,
+            star_bindings: Vec::new(),
+            scan_filters: Vec::new(),
         }
     }
 
     /// Set the predicate filter.
     pub fn with_predicate(mut self, predicate: impl Into<String>) -> Self {
         self.predicate_filter = Some(predicate.into());
+        self
+    }
+
+    /// Add same-subject star bindings (additional predicate→var pairs).
+    pub fn with_star_bindings(mut self, bindings: Vec<(String, VarId)>) -> Self {
+        self.star_bindings = bindings;
         self
     }
 
@@ -646,6 +679,9 @@ impl R2rmlPattern {
         let mut vars = vec![self.subject_var];
         if let Some(obj_var) = self.object_var {
             vars.push(obj_var);
+        }
+        for (_, var) in &self.star_bindings {
+            vars.push(*var);
         }
         vars
     }

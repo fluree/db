@@ -10,11 +10,10 @@
 //! - Cycles in the import graph don't loop forever.
 //! - The schema-projection whitelist keeps instance data from leaking.
 
-mod support;
-
+use crate::support;
+use crate::support::genesis_ledger;
 use fluree_db_api::{ApiError, FlureeBuilder};
 use serde_json::json;
-use support::genesis_ledger;
 
 fn config_graph_iri(ledger_id: &str) -> String {
     format!("urn:fluree:{ledger_id}#config")

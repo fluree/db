@@ -3,11 +3,10 @@
 //! We focus first on reverse predicates **in WHERE** (query semantics).
 //! Graph crawl output using reverse selections and policy wrapping are included but ignored for now.
 
-mod support;
-
+use crate::support;
+use crate::support::{genesis_ledger, normalize_rows, MemoryFluree, MemoryLedger};
 use fluree_db_api::FlureeBuilder;
 use serde_json::json;
-use support::{genesis_ledger, normalize_rows, MemoryFluree, MemoryLedger};
 
 async fn seed_reverse_friends(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
     let ledger0 = genesis_ledger(fluree, ledger_id);

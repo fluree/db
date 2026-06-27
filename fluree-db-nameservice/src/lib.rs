@@ -409,11 +409,17 @@ pub enum NsLookupResult {
     NotFound,
 }
 
-/// Read-only nameservice lookup trait
+/// Read-only nameservice lookup surface.
 ///
-/// Implementations provide ledger discovery by ledger ID.
+/// Implementations provide ledger discovery by ledger ID and the
+/// associated read concerns (refs, graph sources, status, config).
+/// This is the read-only counterpart to [`NameService`].
+///
+/// Callers that only need to read should bind this trait — that lets
+/// read-only backends (e.g., a replicated state machine projection)
+/// implement the lookup surface without claiming write capability.
 #[async_trait]
-pub trait NameService:
+pub trait NameServiceLookup:
     GraphSourceLookup + RefLookup + StatusLookup + ConfigLookup + Debug + Send + Sync
 {
     /// Look up a ledger by its ledger ID (e.g. "mydb:main")
@@ -441,7 +447,18 @@ pub trait NameService:
             .filter(|r| r.name == ledger_name && !r.retracted)
             .collect())
     }
+}
 
+/// Branch lifecycle writes — create, drop, and non-monotonic head reset.
+///
+/// Implementations that can't durably write (e.g., a Raft state-machine
+/// projection where writes flow through consensus proposals instead) should
+/// skip this trait entirely. Implementations of [`create_branch`](Self::create_branch)
+/// typically need to read the source branch to derive the starting commit
+/// head — they get that capability from also implementing
+/// [`NameServiceLookup`], not from a supertrait bound here.
+#[async_trait]
+pub trait BranchLifecycle: Debug + Send + Sync {
     /// Create a new branch for a ledger.
     ///
     /// Creates a new [`NsRecord`] for `ledger_name:new_branch` with its
@@ -546,12 +563,14 @@ impl NsRecordSnapshot {
     }
 }
 
-/// Publisher trait for writing nameservice records
+/// Ledger lifecycle writes — create, retract, purge.
 ///
-/// Implementations handle publishing commit and index updates with
-/// monotonic guarantees.
+/// Mirrors [`BranchLifecycle`] for ledger-level operations. The
+/// methods all mutate the nameservice record's existence (create
+/// it / mark it retracted / remove it), as opposed to advancing
+/// pointers on an existing record.
 #[async_trait]
-pub trait Publisher: Debug + Send + Sync {
+pub trait LedgerLifecycle: Debug + Send + Sync {
     /// Initialize a new ledger in the nameservice
     ///
     /// Creates a minimal NsRecord for a new ledger with no commits yet.
@@ -562,35 +581,7 @@ pub trait Publisher: Debug + Send + Sync {
     ///
     /// # Errors
     /// Returns an error if a record already exists (including retracted records).
-    async fn publish_ledger_init(&self, ledger_id: &str) -> Result<()>;
-
-    /// Publish a new commit
-    ///
-    /// Only updates if: `(not exists) OR (new_t > existing_t)`
-    ///
-    /// This is called by the transactor after each successful commit.
-    async fn publish_commit(
-        &self,
-        ledger_id: &str,
-        commit_t: i64,
-        commit_id: &ContentId,
-    ) -> Result<()>;
-
-    /// Publish a new index
-    ///
-    /// Only updates if: `(not exists) OR (new_t > existing_t)` - STRICTLY monotonic.
-    ///
-    /// This is called by the indexer after successfully writing new index roots.
-    /// The index is published to a separate file/attribute to avoid contention
-    /// with commit publishing.
-    ///
-    /// Note: "equal t prefers index file" is a READ-TIME merge rule, not a write rule.
-    async fn publish_index(
-        &self,
-        ledger_id: &str,
-        index_t: i64,
-        index_id: &ContentId,
-    ) -> Result<()>;
+    async fn init(&self, ledger_id: &str) -> Result<()>;
 
     /// Retract a ledger (soft drop)
     ///
@@ -607,6 +598,23 @@ pub trait Publisher: Debug + Send + Sync {
     async fn purge(&self, ledger_id: &str) -> Result<()> {
         self.retract(ledger_id).await
     }
+}
+
+/// Commit-head publishing — what the transactor calls after each
+/// successful commit.
+#[async_trait]
+pub trait CommitPublisher: Debug + Send + Sync {
+    /// Publish a new commit
+    ///
+    /// Only updates if: `(not exists) OR (new_t > existing_t)`
+    ///
+    /// This is called by the transactor after each successful commit.
+    async fn publish_commit(
+        &self,
+        ledger_id: &str,
+        commit_t: i64,
+        commit_id: &ContentId,
+    ) -> Result<()>;
 
     /// Get the publishing ledger ID for a ledger.
     ///
@@ -615,15 +623,77 @@ pub trait Publisher: Debug + Send + Sync {
     fn publishing_ledger_id(&self, ledger_id: &str) -> Option<String>;
 }
 
+/// Index-head publishing — what the indexer calls when a new
+/// index root has been written to the content store.
+///
+/// Carved off [`Publisher`] so embedders (notably the Raft index
+/// publisher) can satisfy just this surface without faking the
+/// commit / lifecycle writes they don't drive.
+#[async_trait]
+pub trait IndexPublisher: Debug + Send + Sync {
+    /// Publish a new index
+    ///
+    /// Only updates if: `(not exists) OR (new_t > existing_t)` - STRICTLY monotonic.
+    ///
+    /// This is called by the indexer after successfully writing new index roots.
+    /// The index is published to a separate file/attribute to avoid contention
+    /// with commit publishing.
+    ///
+    /// Note: "equal t prefers index file" is a READ-TIME merge rule, not a write rule.
+    async fn publish_index(
+        &self,
+        ledger_id: &str,
+        index_t: i64,
+        index_id: &ContentId,
+    ) -> Result<()>;
+}
+
+/// Combined write trait for nameservice records. A supertrait
+/// composition of the three responsibility-aligned write traits —
+/// types that implement all three get `Publisher` automatically.
+///
+/// Used as a `dyn` bound where callers genuinely need the full
+/// write surface; the carved-off traits ([`IndexPublisher`],
+/// [`CommitPublisher`], [`LedgerLifecycle`]) are what to reach for
+/// when only one slice is needed.
+pub trait Publisher: IndexPublisher + CommitPublisher + LedgerLifecycle {}
+impl<T> Publisher for T where T: IndexPublisher + CommitPublisher + LedgerLifecycle + ?Sized {}
+
 /// Combined read-write nameservice trait.
 ///
-/// A convenience super-trait for components that need both `NameService`
-/// (lookup) and `Publisher` (write) access via a single `dyn` reference.
-/// All types that implement both `NameService` and `Publisher` automatically
+/// A convenience super-trait for components that need lookup
+/// ([`NameServiceLookup`]), branch lifecycle writes ([`BranchLifecycle`]),
+/// and commit/index publishing ([`Publisher`]) access through a single
+/// `dyn` reference. All types that implement the three automatically
 /// implement this trait via the blanket impl.
-pub trait ReadWriteNameService: NameService + Publisher {}
+/// Combined surface indexing reaches through: ledger discovery plus
+/// index-head publishing. Carved off the broader
+/// [`ReadWriteNameService`] because indexing only needs reads and
+/// the one write — letting a replicated implementation (e.g.
+/// `RaftNameService` in `fluree-db-consensus`) implement both
+/// natively without having to fake the rest of the write surface.
+///
+/// All types that implement both halves automatically implement
+/// this trait via the blanket impl.
+pub trait IndexingNameService: NameServiceLookup + IndexPublisher + BranchLifecycle {}
 
-impl<T> ReadWriteNameService for T where T: NameService + Publisher {}
+impl<T> IndexingNameService for T where
+    T: NameServiceLookup + IndexPublisher + BranchLifecycle + ?Sized
+{
+}
+
+/// Combined read-write nameservice. Declared as
+/// [`IndexingNameService`] + [`BranchLifecycle`] + [`Publisher`]
+/// rather than [`NameServiceLookup`] + ... so that `dyn
+/// ReadWriteNameService` upcasts to `dyn IndexingNameService`
+/// directly — the embedder-friendly path for handing the same
+/// nameservice to the indexer alongside the broader write paths.
+/// (The constituent traits are unchanged; `IndexingNameService`
+/// already requires `NameServiceLookup`, and `Publisher` requires
+/// `IndexPublisher`, so the bound is materially the same.)
+pub trait ReadWriteNameService: IndexingNameService + BranchLifecycle + Publisher {}
+
+impl<T> ReadWriteNameService for T where T: IndexingNameService + BranchLifecycle + Publisher {}
 
 /// Admin-level publisher operations
 ///
@@ -1242,8 +1312,7 @@ pub trait ConfigPublisher: ConfigLookup {
 /// Use `Arc<dyn NameServicePublisher>` when a component needs ownership of a
 /// nameservice that supports all operations.
 pub trait NameServicePublisher:
-    NameService
-    + Publisher
+    ReadWriteNameService
     + AdminPublisher
     + RefPublisher
     + GraphSourcePublisher
@@ -1253,8 +1322,7 @@ pub trait NameServicePublisher:
 }
 
 impl<T> NameServicePublisher for T where
-    T: NameService
-        + Publisher
+    T: ReadWriteNameService
         + AdminPublisher
         + RefPublisher
         + GraphSourcePublisher
@@ -1315,9 +1383,9 @@ where
 }
 
 #[async_trait]
-impl<T> NameService for Arc<T>
+impl<T> NameServiceLookup for Arc<T>
 where
-    T: NameService + ?Sized,
+    T: NameServiceLookup + ?Sized,
 {
     async fn lookup(&self, ledger_id: &str) -> Result<Option<NsRecord>> {
         (**self).lookup(ledger_id).await
@@ -1330,7 +1398,13 @@ where
     async fn list_branches(&self, ledger_name: &str) -> Result<Vec<NsRecord>> {
         (**self).list_branches(ledger_name).await
     }
+}
 
+#[async_trait]
+impl<T> BranchLifecycle for Arc<T>
+where
+    T: BranchLifecycle + ?Sized,
+{
     async fn create_branch(
         &self,
         ledger_name: &str,
@@ -1365,14 +1439,28 @@ where
 }
 
 #[async_trait]
-impl<T> Publisher for Arc<T>
+impl<T> LedgerLifecycle for Arc<T>
 where
-    T: Publisher + ?Sized,
+    T: LedgerLifecycle + ?Sized,
 {
-    async fn publish_ledger_init(&self, ledger_id: &str) -> Result<()> {
-        (**self).publish_ledger_init(ledger_id).await
+    async fn init(&self, ledger_id: &str) -> Result<()> {
+        (**self).init(ledger_id).await
     }
 
+    async fn retract(&self, ledger_id: &str) -> Result<()> {
+        (**self).retract(ledger_id).await
+    }
+
+    async fn purge(&self, ledger_id: &str) -> Result<()> {
+        (**self).purge(ledger_id).await
+    }
+}
+
+#[async_trait]
+impl<T> CommitPublisher for Arc<T>
+where
+    T: CommitPublisher + ?Sized,
+{
     async fn publish_commit(
         &self,
         ledger_id: &str,
@@ -1384,6 +1472,16 @@ where
             .await
     }
 
+    fn publishing_ledger_id(&self, ledger_id: &str) -> Option<String> {
+        (**self).publishing_ledger_id(ledger_id)
+    }
+}
+
+#[async_trait]
+impl<T> IndexPublisher for Arc<T>
+where
+    T: IndexPublisher + ?Sized,
+{
     async fn publish_index(
         &self,
         ledger_id: &str,
@@ -1391,18 +1489,6 @@ where
         index_id: &ContentId,
     ) -> Result<()> {
         (**self).publish_index(ledger_id, index_t, index_id).await
-    }
-
-    async fn retract(&self, ledger_id: &str) -> Result<()> {
-        (**self).retract(ledger_id).await
-    }
-
-    async fn purge(&self, ledger_id: &str) -> Result<()> {
-        (**self).purge(ledger_id).await
-    }
-
-    fn publishing_ledger_id(&self, ledger_id: &str) -> Option<String> {
-        (**self).publishing_ledger_id(ledger_id)
     }
 }
 

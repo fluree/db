@@ -1,0 +1,74 @@
+name: Bench (nightly)
+
+# Bench smoke + reconcile. Runs on a nightly schedule (and on demand via
+# workflow_dispatch) — NOT per-PR. It compiles the whole workspace's benches
+# in release, which is the long pole and was never meant to gate every PR
+# (it had been wired into ci.yml by mistake). Per-PR coverage is preserved:
+# `clippy --all --all-features --all-targets` in ci.yml still compiles every
+# bench on every PR, so API/compile breakage is caught there; this nightly
+# adds the runtime smoke and the [[bench]] <-> regression-budget.json reconcile.
+
+on:
+  schedule:
+    - cron: "0 7 * * *" # 07:00 UTC daily
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_INCREMENTAL: 0
+  CARGO_PROFILE_DEV_DEBUG: 0
+  CARGO_PROFILE_TEST_DEBUG: 0
+  RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
+
+jobs:
+  bench-gate:
+    # Failure modes:
+    #   - A bench no longer compiles (real API regression).
+    #   - A bench's `--test` mode panics or never returns.
+    #   - A `[[bench]]` is declared in Cargo.toml without a matching
+    #     entry in `regression-budget.json` (or vice versa).
+    #
+    # A cold cache must compile the whole workspace's benches in release
+    # (consensus / search-service / search-httpd and their heavy deps);
+    # `timeout-minutes` caps the job so a genuinely hung bench fails fast.
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      FLUREE_BENCH_PROFILE: quick
+      FLUREE_BENCH_SCALE: tiny
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force
+
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: rui314/setup-mold@v1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      # Reconcile first — failure here is fast (no compile needed) and
+      # tells the contributor exactly which bench / budget entry is
+      # out of sync.
+      - name: Reconcile workspace [[bench]] entries with regression-budget.json
+        run: cargo test -p fluree-bench-support --test workspace_reconcile
+
+      # Build all benches in release. Heavy on cold cache; rust-cache
+      # makes subsequent runs cheap.
+      - name: Build benches
+        run: cargo bench --workspace --no-run
+
+      # Smoke-run every bench's scenarios at `tiny` scale via criterion's
+      # `--test` mode (one iteration per scenario, no statistics collected).
+      # Catches benches that compile but panic at runtime (bad SPARQL,
+      # broken setup, missing API surface).
+      - name: Smoke-run benches at tiny scale
+        run: cargo bench --workspace -- --test

@@ -35,18 +35,16 @@
 
 #![cfg(feature = "native")]
 
-mod support;
+use crate::support;
 
-use std::sync::Arc;
-
+use crate::support::{
+    genesis_ledger, genesis_ledger_for_fluree, start_background_indexer_local,
+    trigger_index_and_wait_outcome, MemoryFluree, MemoryLedger,
+};
 use fluree_db_api::{FlureeBuilder, GraphDb, IndexConfig, LedgerManagerConfig, QueryInput};
 use fluree_db_core::LedgerSnapshot;
 use fluree_db_transact::{CommitOpts, TxnOpts};
 use serde_json::json;
-use support::{
-    genesis_ledger, genesis_ledger_for_fluree, start_background_indexer_local,
-    trigger_index_and_wait_outcome, MemoryFluree, MemoryLedger,
-};
 
 const PREFIX: &str = "PREFIX ex: <http://example.org/>";
 
@@ -195,7 +193,10 @@ async fn seq_path_count_unit_novelty_vs_indexed() {
 
     let (local, handle) = start_background_indexer_local(
         fluree2.backend().clone(),
-        Arc::new(fluree2.nameservice_mode().clone()),
+        fluree2
+            .nameservice_mode()
+            .as_arc_indexing_nameservice()
+            .expect("test fluree has writable nameservice"),
         fluree_db_indexer::IndexerConfig::small(),
     );
 

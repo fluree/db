@@ -38,6 +38,10 @@ pub mod datatype_constraint;
 pub mod datatypes;
 pub mod db;
 pub mod dict_novelty;
+/// Shared LRU disk cache for content-addressed blobs (index artifacts, Iceberg
+/// data files), with a single global byte budget. Native (filesystem) only.
+#[cfg(feature = "native")]
+pub mod disk_cache;
 pub mod edge;
 pub mod error;
 pub mod flake;

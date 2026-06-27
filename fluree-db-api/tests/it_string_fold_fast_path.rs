@@ -7,8 +7,7 @@
 //! strings (STRLEN counts codepoints, not bytes).
 #![cfg(feature = "native")]
 
-mod support;
-
+use crate::support;
 use fluree_db_api::FlureeBuilder;
 use std::io::Write;
 use tempfile::TempDir;
@@ -289,7 +288,6 @@ async fn incremental_index_string_folds_exact() {
     use fluree_db_api::{IndexConfig, LedgerManagerConfig};
     use fluree_db_transact::{CommitOpts, TxnOpts};
     use serde_json::json;
-    use std::sync::Arc;
 
     let fluree = FlureeBuilder::memory()
         .with_ledger_cache_config(LedgerManagerConfig::default())
@@ -298,7 +296,10 @@ async fn incremental_index_string_folds_exact() {
 
     let (local, handle) = support::start_background_indexer_local(
         fluree.backend().clone(),
-        Arc::new(fluree.nameservice_mode().clone()),
+        fluree
+            .nameservice_mode()
+            .as_arc_indexing_nameservice()
+            .expect("test fluree has writable nameservice"),
         fluree_db_indexer::IndexerConfig::small(),
     );
 

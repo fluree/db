@@ -19,15 +19,13 @@
 //! to confirm the public API is wired together correctly end to end
 //! for non-server consumers.
 
-mod support;
-
 use std::sync::Arc;
 
+use crate::support::{genesis_ledger, MemoryFluree, MemoryLedger};
 use fluree_db_api::query::multi::MultiQueryError;
 use fluree_db_api::query::multi::{MultiQueryBounds, MultiQueryRequest, MultiQueryStatus};
 use fluree_db_api::{FlureeBuilder, FormatterConfig};
 use serde_json::json;
-use support::{genesis_ledger, MemoryFluree, MemoryLedger};
 
 /// Seed two ledgers with a couple of named entities each so we can run
 /// envelopes that hit both.

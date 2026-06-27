@@ -29,7 +29,7 @@
 //! ```
 
 use crate::{ApiError, Result};
-use fluree_db_nameservice::{GraphSourcePublisher, NameService, NameServiceEvent};
+use fluree_db_nameservice::{GraphSourcePublisher, NameServiceEvent, NameServiceLookup};
 use futures::StreamExt;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -198,7 +198,7 @@ impl Bm25WorkerHandle {
     /// Register a graph source for automatic maintenance.
     ///
     /// The worker will sync this graph source whenever any of its source ledgers are updated.
-    pub async fn register_graph_source<N: NameService + GraphSourcePublisher>(
+    pub async fn register_graph_source<N: NameServiceLookup + GraphSourcePublisher>(
         &self,
         ns: &N,
         graph_source_id: &str,

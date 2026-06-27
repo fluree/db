@@ -15,8 +15,7 @@
 
 #![cfg(feature = "native")]
 
-mod support;
-
+use crate::support;
 use fluree_db_api::FlureeBuilder;
 use fluree_db_core::{
     range_with_overlay, FlakeValue, IndexType, RangeMatch, RangeOptions, RangeTest, Sid,

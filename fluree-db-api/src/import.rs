@@ -5,7 +5,7 @@
 //!
 //! ## Pipeline overview (Tier 2: parallel local IDs + remap)
 //!
-//! 1. **Create ledger** — `nameservice.publish_ledger_init(ledger_id)`
+//! 1. **Create ledger** — `nameservice.init(ledger_id)`
 //! 2. **Parse + commit** — parallel chunk parsing with chunk-local IDs written
 //!    to spool files, serial commit finalization
 //! 3. **Dict merge** — merge chunk-local subject/string dicts into global dicts,
@@ -2476,6 +2476,15 @@ impl<'a> ImportBuilder<'a> {
         self
     }
 
+    /// Set the maximum number of chunks held in flight (the memory-budget
+    /// backpressure knob). `0` = derive from the budget. Forcing `1` makes the
+    /// remote producer re-park between chunks, exercising the single-worker
+    /// runtime handoff path; used by regression tests for that path.
+    pub fn max_inflight_chunks(mut self, n: usize) -> Self {
+        self.config.max_inflight_chunks = n;
+        self
+    }
+
     /// Set the maximum flakes per chunk. 0 = no limit. Default: 20_000_000.
     pub fn chunk_max_flakes(mut self, n: usize) -> Self {
         self.config.chunk_max_flakes = n;
@@ -2913,7 +2922,7 @@ where
 
         if needs_init {
             nameservice
-                .publish_ledger_init(&normalized_alias)
+                .init(&normalized_alias)
                 .await
                 .map_err(|e| ImportError::Storage(e.to_string()))?;
             tracing::info!(alias = %normalized_alias, "initialized new ledger in nameservice");
@@ -3372,8 +3381,27 @@ where
         let mut pending: std::collections::BTreeMap<usize, ParsedChunk> =
             std::collections::BTreeMap::new();
 
-        for recv_result in &result_rx {
-            let (idx, parsed) = recv_result.map_err(ImportError::Transact)?;
+        // Receive parsed chunks off the runtime worker. A direct blocking
+        // `recv()` on this `std` channel would park the single current-thread
+        // runtime worker, starving the spawned remote producer task (which
+        // drives storage reads and may be re-parked waiting for channel
+        // capacity) and the sort/write tasks — deadlocking the whole import on
+        // a single-worker runtime. The serial arm below documents and avoids
+        // the same hazard via `spawn_blocking`.
+        let result_rx = Arc::new(std::sync::Mutex::new(result_rx));
+        loop {
+            let recv_result = {
+                let rx = Arc::clone(&result_rx);
+                tokio::task::spawn_blocking(move || rx.lock().unwrap().recv())
+                    .await
+                    .map_err(|e| {
+                        ImportError::Transact(format!("parsed-chunk receive task panicked: {e}"))
+                    })?
+            };
+            let (idx, parsed) = match recv_result {
+                Ok(chunk) => chunk.map_err(ImportError::Transact)?,
+                Err(_) => break, // All parse workers dropped their senders.
+            };
             pending.insert(idx, parsed);
 
             while let Some(parsed) = pending.remove(&next_expected) {

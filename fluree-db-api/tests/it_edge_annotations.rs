@@ -23,13 +23,11 @@
 //! envelope of the IR-level expansion in
 //! `fluree-db-query/src/execute/where_plan.rs::expand_edge_annotation_patterns`.
 
-mod support;
+use crate::support;
 
-use std::sync::Arc;
-
+use crate::support::{genesis_ledger, genesis_ledger_for_fluree, MemoryFluree, MemoryLedger};
 use fluree_db_api::FlureeBuilder;
 use serde_json::{json, Value as JsonValue};
-use support::{genesis_ledger, genesis_ledger_for_fluree, MemoryFluree, MemoryLedger};
 
 fn ctx() -> JsonValue {
     json!({
@@ -549,7 +547,10 @@ async fn first_annotation_through_incremental_index_flips_has_annotations() {
 
     let (local, handle) = support::start_background_indexer_local(
         fluree.backend().clone(),
-        Arc::new(fluree.nameservice_mode().clone()),
+        fluree
+            .nameservice_mode()
+            .publisher_arc()
+            .expect("test setup requires ReadWrite nameservice mode"),
         fluree_db_indexer::IndexerConfig::small(),
     );
 
@@ -667,7 +668,10 @@ async fn cascade_fires_for_indexed_annotation_when_edge_is_retracted() {
 
     let (local, handle) = support::start_background_indexer_local(
         fluree.backend().clone(),
-        Arc::new(fluree.nameservice_mode().clone()),
+        fluree
+            .nameservice_mode()
+            .publisher_arc()
+            .expect("test setup requires ReadWrite nameservice mode"),
         fluree_db_indexer::IndexerConfig::small(),
     );
 
@@ -757,7 +761,10 @@ async fn subject_expansion_finds_annotation_after_reindex() {
 
     let (local, handle) = support::start_background_indexer_local(
         fluree.backend().clone(),
-        Arc::new(fluree.nameservice_mode().clone()),
+        fluree
+            .nameservice_mode()
+            .publisher_arc()
+            .expect("test setup requires ReadWrite nameservice mode"),
         fluree_db_indexer::IndexerConfig::small(),
     );
 

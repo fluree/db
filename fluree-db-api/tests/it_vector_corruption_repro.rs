@@ -31,8 +31,7 @@
 //!   of base-asserted vectors find their handle via the pre-populated
 //!   fact map.
 
-mod support;
-
+use crate::support;
 use fluree_db_api::{FlureeBuilder, LedgerState};
 use fluree_db_transact::{NamespaceRegistry, Txn, TxnOpts};
 use serde_json::json;
