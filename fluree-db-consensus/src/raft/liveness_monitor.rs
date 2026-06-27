@@ -167,16 +167,14 @@ impl LivenessMonitor {
             let tracker = trackers.entry(*peer_id).or_insert_with(PeerTracker::new);
             record_replication_progress(tracker, *peer_log, leader_last_log, now);
             match next_eligibility_proposal(tracker, now, &self.config) {
-                Some(EligibilityProposal::Promote) => {
-                    self.propose_eligible(*peer_id).await;
+                Some(EligibilityProposal::Promote) if self.propose_eligible(*peer_id).await => {
                     tracker.last_proposed = Some(EligibilityProposal::Promote);
                     tracker.recovering_since = None;
                 }
-                Some(EligibilityProposal::Demote) => {
-                    self.propose_ineligible(*peer_id).await;
+                Some(EligibilityProposal::Demote) if self.propose_ineligible(*peer_id).await => {
                     tracker.last_proposed = Some(EligibilityProposal::Demote);
                 }
-                None => {}
+                Some(_) | None => {}
             }
         }
         // Drop trackers for peers that left the voter set on a
@@ -187,25 +185,37 @@ impl LivenessMonitor {
         trackers.retain(|id, _| configured.contains(id));
     }
 
-    async fn propose_eligible(&self, voter: NodeId) {
+    /// Propose `eligible: true` for `voter`. Returns `true` when the
+    /// state machine reports the eligible set now contains the voter
+    /// (either flipped this call or already matched), `false` when
+    /// the propose failed, was refused, or returned an unexpected
+    /// response. A `false` return leaves the caller's hysteresis
+    /// flag unchanged so the next tick re-attempts.
+    async fn propose_eligible(&self, voter: NodeId) -> bool {
         self.propose_eligibility(WorkerEligibility {
             voter,
             eligible: true,
             applied_at_millis: now_millis(),
         })
-        .await;
+        .await
     }
 
-    async fn propose_ineligible(&self, voter: NodeId) {
+    /// Propose `eligible: false` for `voter`. Same return contract
+    /// as [`Self::propose_eligible`].
+    async fn propose_ineligible(&self, voter: NodeId) -> bool {
         self.propose_eligibility(WorkerEligibility {
             voter,
             eligible: false,
             applied_at_millis: now_millis(),
         })
-        .await;
+        .await
     }
 
-    async fn propose_eligibility(&self, args: WorkerEligibility) {
+    /// `true` only when the apply landed (or was idempotent against
+    /// state that already matched). `WorkerEligibilityRefused` —
+    /// notably the quorum-floor refusal — returns `false` so the
+    /// next tick re-attempts once the refusal condition clears.
+    async fn propose_eligibility(&self, args: WorkerEligibility) -> bool {
         let voter = args.voter;
         let eligible = args.eligible;
         let cmd = SmCommand::SetWorkerEligibility(args);
@@ -213,15 +223,18 @@ impl LivenessMonitor {
             Ok(resp) => match resp.data {
                 SmResponse::WorkerEligibilitySet { changed: true, .. } => {
                     debug!(voter, eligible, "worker eligibility flipped");
+                    true
                 }
                 SmResponse::WorkerEligibilitySet { changed: false, .. } => {
                     // Idempotent re-apply — state already matched.
                     // Common on monitor restart against a state
                     // machine the prior leader's monitor left
                     // populated.
+                    true
                 }
                 SmResponse::WorkerEligibilityRefused { reason, .. } => {
                     warn!(voter, eligible, ?reason, "eligibility propose refused");
+                    false
                 }
                 other => {
                     warn!(
@@ -230,9 +243,13 @@ impl LivenessMonitor {
                         ?other,
                         "unexpected eligibility propose response"
                     );
+                    false
                 }
             },
-            Err(err) => warn!(voter, eligible, error = %err, "eligibility propose failed"),
+            Err(err) => {
+                warn!(voter, eligible, error = %err, "eligibility propose failed");
+                false
+            }
         }
     }
 }
@@ -347,8 +364,9 @@ mod tests {
 
     /// Mirror of the `record_replication_progress` + `next_eligibility_proposal`
     /// pair the monitor runs each tick — plus the post-propose state
-    /// updates the caller does at the dispatch site. Tests use this
-    /// to advance the tracker one sample at a time.
+    /// updates the caller does at the dispatch site **when the apply
+    /// landed**. Tests use this to advance the tracker one sample at
+    /// a time under the normal "apply succeeded" path.
     fn tick(
         tracker: &mut PeerTracker,
         current_log: Option<LogId<NodeId>>,
@@ -356,17 +374,35 @@ mod tests {
         now: Instant,
         config: &LivenessConfig,
     ) -> Option<EligibilityProposal> {
+        tick_with_outcome(tracker, current_log, leader_last_log, now, config, true)
+    }
+
+    /// Same shape as [`tick`] but lets the test simulate the apply
+    /// being refused (e.g. `WorkerEligibilityRefused` /
+    /// `client_write` error). When `apply_landed` is `false`, the
+    /// tracker's `last_proposed` is **not** updated — so the next
+    /// tick can re-attempt.
+    fn tick_with_outcome(
+        tracker: &mut PeerTracker,
+        current_log: Option<LogId<NodeId>>,
+        leader_last_log: Option<u64>,
+        now: Instant,
+        config: &LivenessConfig,
+        apply_landed: bool,
+    ) -> Option<EligibilityProposal> {
         record_replication_progress(tracker, current_log, leader_last_log, now);
         let proposal = next_eligibility_proposal(tracker, now, config);
-        match proposal {
-            Some(EligibilityProposal::Promote) => {
-                tracker.last_proposed = Some(EligibilityProposal::Promote);
-                tracker.recovering_since = None;
+        if apply_landed {
+            match proposal {
+                Some(EligibilityProposal::Promote) => {
+                    tracker.last_proposed = Some(EligibilityProposal::Promote);
+                    tracker.recovering_since = None;
+                }
+                Some(EligibilityProposal::Demote) => {
+                    tracker.last_proposed = Some(EligibilityProposal::Demote);
+                }
+                None => {}
             }
-            Some(EligibilityProposal::Demote) => {
-                tracker.last_proposed = Some(EligibilityProposal::Demote);
-            }
-            None => {}
         }
         proposal
     }
@@ -544,5 +580,85 @@ mod tests {
         let t1 = t0 + cfg.live_after * 10;
         let d = tick(&mut tracker, Some(log_id(1, 10)), Some(10), t1, &cfg);
         assert_eq!(d, None);
+    }
+
+    #[test]
+    fn refused_demote_re_attempts_on_next_tick() {
+        // Quorum-floor scenario: monitor decides to demote, the
+        // state machine refuses (e.g. `QuorumWouldBreak`), apply
+        // didn't land. The tracker's `last_proposed` must stay
+        // unset so the next tick proposes Demote again — the
+        // refusal condition can clear later when quorum has
+        // headroom, and the monitor needs to retry then.
+        let cfg = fast_config();
+        let t0 = Instant::now();
+        let mut tracker = PeerTracker::new();
+        // Build up to a Demote decision: healthy sample, then a
+        // stuck sample, then enough time for `unreachable_after`.
+        let _ = tick_with_outcome(&mut tracker, Some(log_id(1, 5)), Some(5), t0, &cfg, true);
+        let t1 = t0 + cfg.sample_interval;
+        let _ = tick_with_outcome(&mut tracker, Some(log_id(1, 5)), Some(10), t1, &cfg, true);
+        let t2 = t1 + cfg.unreachable_after;
+        let first = tick_with_outcome(&mut tracker, Some(log_id(1, 5)), Some(10), t2, &cfg, false);
+        assert_eq!(
+            first,
+            Some(EligibilityProposal::Demote),
+            "monitor wants to demote"
+        );
+        assert_eq!(
+            tracker.last_proposed, None,
+            "refused apply must not update last_proposed"
+        );
+
+        // Next tick: still stuck, still want to demote. Without
+        // the fix, hysteresis would suppress this re-attempt.
+        let t3 = t2 + cfg.sample_interval;
+        let second = tick(&mut tracker, Some(log_id(1, 5)), Some(20), t3, &cfg);
+        assert_eq!(
+            second,
+            Some(EligibilityProposal::Demote),
+            "next tick must re-propose Demote because the prior apply didn't land"
+        );
+        assert_eq!(
+            tracker.last_proposed,
+            Some(EligibilityProposal::Demote),
+            "landed apply updates last_proposed"
+        );
+    }
+
+    #[test]
+    fn refused_promote_re_attempts_on_next_tick() {
+        // Symmetric to the refused-demote case for the promote
+        // path: monitor has the peer marked Demote, the peer
+        // recovers, monitor wants to promote, the apply doesn't
+        // land. The tracker's `last_proposed` must stay at Demote
+        // so the next tick re-proposes Promote.
+        let cfg = fast_config();
+        let t0 = Instant::now();
+        let mut tracker = PeerTracker::new();
+        tracker.last_observed_log = Some(log_id(1, 5));
+        tracker.last_proposed = Some(EligibilityProposal::Demote);
+        // First advance after demotion starts recovering_since.
+        let t1 = t0 + cfg.sample_interval;
+        let _ = tick_with_outcome(&mut tracker, Some(log_id(1, 6)), Some(10), t1, &cfg, true);
+        // Past the live_after threshold — monitor wants Promote.
+        let t2 = t1 + cfg.live_after;
+        let first = tick_with_outcome(&mut tracker, Some(log_id(1, 7)), Some(10), t2, &cfg, false);
+        assert_eq!(first, Some(EligibilityProposal::Promote));
+        assert_eq!(
+            tracker.last_proposed,
+            Some(EligibilityProposal::Demote),
+            "refused promote leaves last_proposed at Demote"
+        );
+
+        // Next tick: peer still advancing, monitor still wants
+        // Promote because last_proposed is still Demote.
+        let t3 = t2 + cfg.sample_interval;
+        let second = tick(&mut tracker, Some(log_id(1, 8)), Some(10), t3, &cfg);
+        assert_eq!(
+            second,
+            Some(EligibilityProposal::Promote),
+            "next tick must re-propose Promote because the prior apply didn't land"
+        );
     }
 }
