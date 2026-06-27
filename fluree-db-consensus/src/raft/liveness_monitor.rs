@@ -372,7 +372,11 @@ fn record_replication_progress(
         // it hasn't matched — the peer is lagging. Start the
         // unreachable timer on the first sample that observes the
         // lag; subsequent samples don't reset it until the peer
-        // advances.
+        // advances. A peer that has yet to match anything (e.g. a
+        // freshly-added voter mid-snapshot-install) falls through
+        // here without setting the timer: [`leader_is_ahead_of_peer`]
+        // returns `false` for a `None` `last_observed_log`, so the
+        // bootstrap window doesn't count as lag.
         tracker.unreachable_since.get_or_insert(now);
         tracker.recovering_since = None;
     }
@@ -414,10 +418,16 @@ fn log_advanced(prev: &Option<LogId<NodeId>>, curr: &Option<LogId<NodeId>>) -> b
     }
 }
 
+/// True when the peer has matched at least one entry AND the
+/// leader's log is past it. Returns `false` when `peer_log` is
+/// `None` — a peer that has yet to match anything (bootstrap,
+/// snapshot install) is in an indeterminate state distinct from
+/// lag, and treating the absence of a baseline as lag would demote
+/// a freshly-added voter before it had any chance to start
+/// replicating.
 fn leader_is_ahead_of_peer(leader_last_log: Option<u64>, peer_log: &Option<LogId<NodeId>>) -> bool {
     match (leader_last_log, peer_log) {
         (Some(leader_idx), Some(peer_log)) => leader_idx > peer_log.index,
-        (Some(_), None) => true,
         _ => false,
     }
 }
@@ -779,6 +789,50 @@ mod tests {
             Some(EligibilityProposal::Promote),
             "monitor promotes the peer the prior leader demoted, restoring \
              eligibility once it demonstrates recovery"
+        );
+    }
+
+    #[test]
+    fn freshly_added_voter_bootstraps_without_premature_demotion() {
+        // A voter just added via membership change has `peer_log:
+        // None` until the first successful append-entries — for a
+        // sizable state machine this means the entire snapshot
+        // install window, well past `unreachable_after`. The monitor
+        // must not start the unreachable timer during this window;
+        // once the peer matches its first entry, the standard
+        // observed-lag detection takes over.
+        let cfg = fast_config();
+        let t0 = Instant::now();
+        let mut tracker = PeerTracker::for_eligible_peer();
+        // Bootstrap window: leader's log grows far past anything
+        // the peer has matched (peer_log stays None). Far longer
+        // than `unreachable_after` elapses — nothing fires.
+        let t1 = t0 + cfg.unreachable_after * 10;
+        let d1 = tick(&mut tracker, None, Some(20), t1, &cfg);
+        assert_eq!(d1, None, "never-matched peer is not lag-classified");
+        assert!(
+            tracker.unreachable_since.is_none(),
+            "no lag timer for a peer that has yet to match anything"
+        );
+        // Peer matches its first entry — `last_observed_log` is
+        // now populated and the bootstrap window ends.
+        let t2 = t1 + cfg.sample_interval;
+        let _ = tick(&mut tracker, Some(log_id(1, 5)), Some(20), t2, &cfg);
+        assert_eq!(tracker.last_observed_log, Some(log_id(1, 5)));
+        // Leader keeps advancing; peer stuck at 5. Standard lag
+        // detection now applies from here.
+        let t3 = t2 + cfg.sample_interval;
+        let _ = tick(&mut tracker, Some(log_id(1, 5)), Some(30), t3, &cfg);
+        assert!(
+            tracker.unreachable_since.is_some(),
+            "lag timer starts once the peer has matched a baseline"
+        );
+        let t4 = t3 + cfg.unreachable_after;
+        let d4 = tick(&mut tracker, Some(log_id(1, 5)), Some(30), t4, &cfg);
+        assert_eq!(
+            d4,
+            Some(EligibilityProposal::Demote),
+            "post-bootstrap lag detection still fires"
         );
     }
 }
