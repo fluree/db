@@ -138,7 +138,7 @@ pub enum QueuePoisonError {
     /// failure on the leader side — distinct from a structured
     /// `Result::Err` body returned with 200).
     #[error("apply_queue_poison returned HTTP {0}")]
-    HttpStatus(String),
+    HttpStatus(reqwest::StatusCode),
     /// Postcard encode/decode of the request or response failed.
     #[error("apply_queue_poison codec: {0}")]
     Codec(String),

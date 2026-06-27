@@ -1188,7 +1188,7 @@ impl RaftNameService {
             .map_err(|e| QueuePoisonError::Transport(e.to_string()))?;
 
         if !resp.status().is_success() {
-            return Err(QueuePoisonError::HttpStatus(resp.status().to_string()));
+            return Err(QueuePoisonError::HttpStatus(resp.status()));
         }
 
         let body_bytes = resp
