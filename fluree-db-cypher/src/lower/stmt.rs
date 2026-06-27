@@ -1,6 +1,6 @@
 //! Statement-level read-path lowering.
 
-use fluree_db_core::{DatatypeConstraint, FlakeValue, Sid};
+use fluree_db_core::{FlakeValue, Sid};
 use fluree_db_query::binding::Binding;
 use fluree_db_query::ir::grouping::{AggregateFn, AggregateSpec, Grouping};
 use fluree_db_query::ir::{Pattern, Query, QueryOutput, SubqueryPattern};
@@ -1370,11 +1370,31 @@ fn lower_call_branch<E: IriEncoder>(
         }
     }
 
-    let body_referenced: std::collections::HashSet<VarId> = branch
+    let mut body_referenced: std::collections::HashSet<VarId> = branch
         .patterns
         .iter()
         .flat_map(Pattern::referenced_vars)
         .collect();
+    // Aggregate inputs, post-aggregation binds, and HAVING live under
+    // `branch.grouping`, not `branch.patterns`. A body that touches an outer
+    // variable only inside an aggregate (`RETURN count(x)`), a composite bind,
+    // or a HAVING filter must still be visible to BOTH the strict-shadowing
+    // check (else it's silently mis-bound to the outer var) and the correlated-
+    // aggregate promotion below (else the aggregate fails to partition per
+    // import). Fold those referenced vars in.
+    if let Some(g) = &branch.grouping {
+        for spec in g.aggregates() {
+            if let Some(input) = spec.function.input_var() {
+                body_referenced.insert(input);
+            }
+        }
+        for (_, expr) in g.binds() {
+            body_referenced.extend(expr.referenced_vars());
+        }
+        if let Some(having) = g.having() {
+            body_referenced.extend(having.referenced_vars());
+        }
+    }
 
     // Strict shadowing boundary: the subquery body may only see its imports. A
     // body that references a NON-imported variable whose name also exists in the
@@ -1570,7 +1590,3 @@ fn literal_to_binding(e: &Expr) -> Result<Binding> {
         Literal::Null(_) => Binding::Unbound,
     })
 }
-
-// Silence the unused-import linter for items reused by other slices.
-#[allow(dead_code)]
-fn _retain(_p: &ProjectionItem, _d: &DatatypeConstraint) {}

@@ -1166,6 +1166,17 @@ async fn run_cypher_query(
             "--track* / --max-fuel are not yet supported for Cypher queries".to_string(),
         ));
     }
+    // Cypher results render as a single cypher-json document, not a row stream,
+    // so the NDJSON path (and its `--envelope` shaping) does not apply. Reject it
+    // explicitly rather than silently emitting cypher-json — which would make
+    // `--envelope` look honored when it is not.
+    if output_format == OutputFormatKind::Ndjson {
+        return Err(CliError::Usage(
+            "--format ndjson is not supported for Cypher queries; Cypher renders as \
+             cypher-json (use --format json | typed-json | csv | tsv)"
+                .to_string(),
+        ));
+    }
 
     let (fluree, alias) = match mode {
         LedgerMode::Local { fluree, alias } => (fluree, alias),

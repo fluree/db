@@ -248,6 +248,16 @@ pub enum Binding {
     Map(Vec<(Arc<str>, Binding)>),
 }
 
+// `Binding` is cloned on nearly every join/sort/materialize step, so its size is
+// a hot-path tax. The rare large variants (`Rel`) are boxed to keep the enum at
+// 88 bytes; this guard fails the build if a new or widened variant regresses
+// that. If an increase is truly warranted, box the offending payload first — and
+// only then bump this bound with the same reasoning recorded.
+const _: () = assert!(
+    std::mem::size_of::<Binding>() <= 88,
+    "size_of::<Binding>() regressed past 88 bytes — box the large variant instead of widening the enum"
+);
+
 impl Binding {
     /// Create a new literal binding
     ///

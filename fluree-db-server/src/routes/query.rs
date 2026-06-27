@@ -1050,6 +1050,14 @@ pub async fn query_ledger(
             headers.identity.as_deref(),
         )
         .await;
+        // Honor the `Fluree-Min-T` read-your-writes freshness wait, same as the
+        // SPARQL/JSON-LD paths. Cypher has no FROM/dataset clause or `@t:` pin,
+        // so the header is the only requirement source, against this one ledger.
+        let mut min_t_requirements = BTreeMap::new();
+        if let Some(min_t) = headers.min_t {
+            merge_min_t_requirement(&mut min_t_requirements, &ledger, min_t);
+        }
+        await_query_min_t_requirements(state.as_ref(), min_t_requirements).await?;
         return execute_cypher_ledger(
             &state,
             &ledger,

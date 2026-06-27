@@ -20,6 +20,14 @@ pub struct TokenStream {
     depth: u32,
 }
 
+/// A backtrack point: token position plus recursion depth, captured by
+/// [`TokenStream::mark`] and restored by [`TokenStream::reset`].
+#[derive(Clone, Copy)]
+pub struct Mark {
+    pos: usize,
+    depth: u32,
+}
+
 impl TokenStream {
     pub fn new(tokens: Vec<Token>) -> Self {
         Self {
@@ -54,14 +62,23 @@ impl TokenStream {
         &self.tokens[self.pos]
     }
 
-    /// Snapshot the current position for speculative parsing.
-    pub fn mark(&self) -> usize {
-        self.pos
+    /// Snapshot the current position AND recursion depth for speculative
+    /// parsing. Both must be restored together on backtrack: a speculative parse
+    /// that calls `enter_recursion` and then fails via `?` returns before its
+    /// paired `leave_recursion`, leaking depth. Capturing depth here and rewinding
+    /// it in [`Self::reset`] keeps the swallowed-error path from spuriously
+    /// tripping the [`MAX_PARSE_DEPTH`] guard.
+    pub fn mark(&self) -> Mark {
+        Mark {
+            pos: self.pos,
+            depth: self.depth,
+        }
     }
 
-    /// Restore a position captured by [`Self::mark`] (backtracking).
-    pub fn reset(&mut self, mark: usize) {
-        self.pos = mark;
+    /// Restore a position and depth captured by [`Self::mark`] (backtracking).
+    pub fn reset(&mut self, mark: Mark) {
+        self.pos = mark.pos;
+        self.depth = mark.depth;
     }
 
     pub fn peek_kind(&self) -> &TokenKind {

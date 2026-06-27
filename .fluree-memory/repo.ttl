@@ -2057,6 +2057,36 @@ mem:fact-01kvgp6b4qm9nx50qfmv5djjfk a mem:Fact ;
     mem:branch "pr/2-rdf12-annotations" ;
     mem:createdAt "2026-06-19T19:37:13.623439+00:00"^^xsd:dateTime .
 
+mem:fact-01kw5ecx1yax7x1nxxbsppe5rj a mem:Fact ;
+    mem:content "Cypher parser union-chain length is bounded only by the shared MAX_PARSE_DEPTH(256) enter_recursion guard. parse_call_union_tail now carries its OWN guard (the parse_call_body/parse_call_union_tail cycle bypasses parse_statement, which was the unguarded DoS bug); top-level parse_union_tail is bounded only via guarded parse_statement. CRITICAL: do NOT make union parsing iterative to fix large-union false-rejection, because params.rs subst_query AND Drop both recurse over union_tail, so an unbounded-depth AST just moves the stack overflow to subst/drop time. Also mark()/reset() now snapshot+restore depth (a speculative parse that entered recursion then failed via ? leaked depth)." ;
+    mem:tag "cypher" ;
+    mem:tag "dos" ;
+    mem:tag "parser" ;
+    mem:tag "recursion" ;
+    mem:tag "union" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-cypher/src/params.rs" ;
+    mem:artifactRef "fluree-db-cypher/src/parse/stmt.rs" ;
+    mem:artifactRef "fluree-db-cypher/src/parse/stream.rs" ;
+    mem:branch "pr/3-cypher" ;
+    mem:createdAt "2026-06-27T21:05:03.038185+00:00"^^xsd:dateTime ;
+    mem:rationale "The reviewer-flagged flat-UNION over-counts-depth issue cannot be fixed by iteration because downstream walkers (Drop, param substitution) recurse over AST depth." .
+
+mem:fact-01kw5ed99y2bfke2szprh06dz3 a mem:Fact ;
+    mem:content "fluree-db-api/tests/it_query_cypher.rs (166 tests) is NOT wired into any test target: Cargo.toml has autotests=false and no grp_*.rs does `mod it_query_cypher`, so none of it runs in CI. Worse, wiring it into grp_query.rs FAILS TO COMPILE: transact_cypher_detach_delete_works_on_indexed_data (~line 1536) does Arc::new(fluree.nameservice_mode().clone()) but NameServiceMode does not impl IndexingNameService/BranchLifecycle (only Arc<concrete> types do). So the whole Cypher integration suite is dead. Verify Cypher lowering/runtime via fluree-db-cypher/tests/it_lower.rs + it_smoke.rs instead (those compile and run)." ;
+    mem:tag "ci" ;
+    mem:tag "cypher" ;
+    mem:tag "gotcha" ;
+    mem:tag "tests" ;
+    mem:tag "wiring" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/Cargo.toml" ;
+    mem:artifactRef "fluree-db-api/tests/grp_query.rs" ;
+    mem:artifactRef "fluree-db-api/tests/it_query_cypher.rs" ;
+    mem:branch "pr/3-cypher" ;
+    mem:createdAt "2026-06-27T21:05:15.582928+00:00"^^xsd:dateTime ;
+    mem:rationale "A reviewer's claim that a Cypher behavior has test coverage in it_query_cypher.rs is misleading: those tests never execute." .
+
 mem:fact-01ktcfc4gmhn2zh6xn29rskte8 a mem:Fact ;
     mem:content "Query top-k is real but never truncates the upstream scan. apply_solution_modifiers (operator_tree.rs:2740) uses SortOperator::new_topk for ORDER BY+LIMIT, and even under DISTINCT does project-distinct-before-sort+top-k when ORDER BY refs only projected vars (can_project_distinct_before_sort :3011). But SortOperator is blocking: it drains the FULL child stream, building a per-row Vec<Binding> for every input row (sort.rs:589-622); only the final select_nth/heap is k-bounded. So rows_per_returned≫LIMIT is expected. BSBM Explore query1 also has a dedicated bypass: detect_star_const_numeric_label_order_limit→star_const_ordered_limit_operator (operator_tree.rs:280, :2440), tried before the generic tree." ;
     mem:tag "bsbm" ;

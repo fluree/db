@@ -81,6 +81,22 @@ fn deep_call_nesting_errors() {
     assert!(parse_cypher(&calls).has_errors(), "deep CALL should error");
 }
 
+/// Regression: a long `UNION` chain *inside* `CALL { … }` recurses through the
+/// `parse_call_body ↔ parse_call_union_tail` cycle, which bypasses
+/// `parse_statement`. Without its own depth guard that cycle would recurse
+/// unbounded and overflow the stack (an unauthenticated DoS). The guard must
+/// trip and return a diagnostic instead.
+#[test]
+fn deep_call_union_nesting_errors() {
+    let branches: Vec<&str> = vec!["RETURN 1"; 50_000];
+    let body = branches.join(" UNION ");
+    let query = format!("CALL {{ {body} }} RETURN 1");
+    assert!(
+        parse_cypher(&query).has_errors(),
+        "deep CALL-UNION chain should error, not overflow"
+    );
+}
+
 /// The depth guard must not reject ordinary, modestly-nested queries.
 #[test]
 fn moderate_nesting_is_accepted() {

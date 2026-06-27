@@ -993,6 +993,26 @@ fn union_wildcard_return_rejected() {
 }
 
 #[test]
+fn call_subquery_outer_var_referenced_only_in_aggregate_is_rejected() {
+    // The CALL body touches the outer `a` ONLY inside `count(a)` — an aggregate
+    // input, which lives under `branch.grouping`, not `branch.patterns`. The
+    // strict-shadowing boundary must still see it: `a` is an outer var that the
+    // body neither binds nor imports, so silently treating it as the outer var
+    // would mis-bind it (unseeded → unbound inside the subquery). Reject instead.
+    let out =
+        parse_cypher("MATCH (a:Person) CALL { MATCH (b:Person) RETURN count(a) AS c } RETURN a, c");
+    assert!(!out.has_errors(), "parse errors: {:?}", out.diagnostics);
+    let ast = out.ast.unwrap();
+    let encoder = NoEncoder;
+    let mut vars = VarRegistry::new();
+    let r = lower_cypher(&ast, &encoder, &mut vars);
+    assert!(
+        r.is_err(),
+        "outer var used only inside a subquery aggregate must be rejected, not silently mis-bound"
+    );
+}
+
+#[test]
 fn mixed_projection_emits_explicit_grouping() {
     // RETURN n, count(*) AS c — mixing aggregates with a non-aggregate
     // projection must produce a GROUP BY keyed on `n`, not an

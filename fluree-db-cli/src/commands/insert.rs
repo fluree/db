@@ -57,11 +57,26 @@ fn looks_like_query(s: &str) -> bool {
     if trimmed.starts_with('<') {
         return true;
     }
-    // SPARQL keywords (case-insensitive)
+    // SPARQL query and Update lead keywords (case-insensitive). The Update set
+    // (WITH / CLEAR / DROP / LOAD / CREATE, alongside INSERT / DELETE) lets a
+    // bare `WITH <g> DELETE …`, `CLEAR GRAPH …`, `DROP GRAPH …`, `LOAD <url>`,
+    // or `CREATE GRAPH …` be recognized as an operation rather than a ledger name.
     let first_word = trimmed.split_whitespace().next().unwrap_or("");
     matches!(
         first_word.to_ascii_uppercase().as_str(),
-        "SELECT" | "ASK" | "CONSTRUCT" | "DESCRIBE" | "INSERT" | "DELETE" | "PREFIX" | "BASE"
+        "SELECT"
+            | "ASK"
+            | "CONSTRUCT"
+            | "DESCRIBE"
+            | "INSERT"
+            | "DELETE"
+            | "WITH"
+            | "CLEAR"
+            | "DROP"
+            | "LOAD"
+            | "CREATE"
+            | "PREFIX"
+            | "BASE"
     )
 }
 

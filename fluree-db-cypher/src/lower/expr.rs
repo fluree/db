@@ -9,7 +9,7 @@ use fluree_db_query::parse::encode::IriEncoder;
 use fluree_db_query::var_registry::VarId;
 
 use crate::ast::{
-    BinOp, CaseExpr, Expr, ListPredicateKind, Literal, MapProjectionSelector, ParamRef, UnaryOp,
+    BinOp, CaseExpr, Expr, ListPredicateKind, Literal, MapProjectionSelector, UnaryOp,
 };
 
 use super::context::LoweringContext;
@@ -572,8 +572,3 @@ pub fn lower_literal(lit: &Literal) -> Result<FlakeValue> {
         }
     })
 }
-
-// Silence unused-import lints for ParamRef which we keep for future
-// non-error wiring.
-#[allow(dead_code)]
-fn _retain_paramref(_p: &ParamRef) {}

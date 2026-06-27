@@ -255,6 +255,31 @@ fn peek(bytes: &[u8], i: usize) -> Option<u8> {
     bytes.get(i).copied()
 }
 
+/// Decode the single UTF-8 scalar value starting at `bytes[i]`, validating only
+/// its own 1–4 bytes — never the rest of the buffer. Returns `None` on a
+/// malformed or truncated sequence. This keeps string/backtick scanning O(n): a
+/// whole-remainder `from_utf8` per multibyte character would revalidate the tail
+/// each time, making a long non-ASCII literal O(n²) (a CPU-DoS vector).
+fn decode_utf8_char(bytes: &[u8], i: usize) -> Option<char> {
+    let lead = bytes[i];
+    let len = if lead < 0x80 {
+        1
+    } else if lead >> 5 == 0b110 {
+        2
+    } else if lead >> 4 == 0b1110 {
+        3
+    } else if lead >> 3 == 0b11110 {
+        4
+    } else {
+        return None; // stray continuation byte or invalid lead
+    };
+    let end = i + len;
+    if end > bytes.len() {
+        return None;
+    }
+    std::str::from_utf8(&bytes[i..end]).ok()?.chars().next()
+}
+
 fn is_ident_start(b: u8) -> bool {
     b.is_ascii_alphabetic() || b == b'_'
 }
@@ -311,13 +336,12 @@ fn read_string(bytes: &[u8], start: usize, quote: u8) -> Result<(String, usize),
             i += 1;
             continue;
         }
-        // Pass through bytes — for non-ASCII, decode UTF-8 character.
+        // Pass through bytes — for non-ASCII, decode a single UTF-8 character.
         if b < 0x80 {
             out.push(b as char);
             i += 1;
         } else {
-            let s = std::str::from_utf8(&bytes[i..]).map_err(|_| LexError::InvalidEscape(i))?;
-            let ch = s.chars().next().unwrap();
+            let ch = decode_utf8_char(bytes, i).ok_or(LexError::InvalidEscape(i))?;
             out.push(ch);
             i += ch.len_utf8();
         }
@@ -337,9 +361,7 @@ fn read_backtick(bytes: &[u8], start: usize) -> Result<(String, usize), LexError
             out.push(b as char);
             i += 1;
         } else {
-            let s = std::str::from_utf8(&bytes[i..])
-                .map_err(|_| LexError::UnterminatedBacktick(start))?;
-            let ch = s.chars().next().unwrap();
+            let ch = decode_utf8_char(bytes, i).ok_or(LexError::UnterminatedBacktick(start))?;
             out.push(ch);
             i += ch.len_utf8();
         }
@@ -522,6 +544,23 @@ mod tests {
             kinds(r#""line\nbreak""#),
             vec![TokenKind::String("line\nbreak".to_string())]
         );
+    }
+
+    #[test]
+    fn multibyte_string_roundtrips() {
+        // Each non-ASCII char is decoded from its own 1–4 bytes (not by
+        // revalidating the whole tail), so a long multibyte literal lexes in
+        // O(n). Correctness check: the full content survives intact.
+        let content = "café→🚀λ".repeat(1000);
+        let src = format!("\"{content}\"");
+        assert_eq!(kinds(&src), vec![TokenKind::String(content)]);
+    }
+
+    #[test]
+    fn multibyte_backtick_roundtrips() {
+        let content = "naïve_λ_🚀".repeat(100);
+        let src = format!("`{content}`");
+        assert_eq!(kinds(&src), vec![TokenKind::Ident(content)]);
     }
 
     #[test]

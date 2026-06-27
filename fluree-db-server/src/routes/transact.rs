@@ -754,6 +754,8 @@ async fn update_ledger_local(
 
     let input_format = if credential.is_sparql_update() {
         "sparql-update"
+    } else if headers.is_cypher_query() {
+        "cypher"
     } else if credential.is_trig() {
         "trig"
     } else if credential.is_turtle_or_trig() {

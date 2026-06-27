@@ -17,7 +17,8 @@ pub fn parse_statement(s: &mut TokenStream) -> Result<Statement, Diagnostic> {
     // Depth-guard statement nesting: UNION tails and `CALL { … }` subqueries
     // both recurse back through this entry, so a bound here (shared with the
     // expression guard via the same counter) caps total recursion — and hence
-    // AST depth, which bounds every downstream walker — against stack overflow.
+    // AST depth, which bounds every downstream walker (lowering, param
+    // substitution, Drop) — against stack overflow.
     s.enter_recursion()?;
     let result = parse_statement_inner(s);
     s.leave_recursion();
@@ -141,7 +142,9 @@ fn parse_union_tail(s: &mut TokenStream) -> Result<UnionTail, Diagnostic> {
     let start = s.expect(&TokenKind::Union)?;
     let all = s.eat(&TokenKind::All).is_some();
     // The right side is another full query (read-shaped only —
-    // UNION of writes is rejected by Cypher).
+    // UNION of writes is rejected by Cypher). The recursion through
+    // `parse_statement` is depth-guarded, bounding the union-chain length
+    // (and so the AST depth that Drop / param substitution recurse over).
     let right = match parse_statement(s)? {
         Statement::Query(q) => q,
         Statement::Update(_) => {
@@ -311,11 +314,19 @@ fn parse_call_body(s: &mut TokenStream) -> Result<Query, Diagnostic> {
 }
 
 /// Parse a `UNION [ALL] <call-body branch>` tail inside a `CALL { … }` body.
+///
+/// The mutual recursion `parse_call_body → parse_call_union_tail →
+/// parse_call_body` bypasses `parse_statement`, so it carries its OWN depth
+/// guard — without it a long `CALL { … UNION … UNION … }` chain would recurse
+/// unbounded and overflow the stack (the top-level `parse_union_tail` is bounded
+/// only because it routes back through the guarded `parse_statement`).
 fn parse_call_union_tail(s: &mut TokenStream) -> Result<UnionTail, Diagnostic> {
+    s.enter_recursion()?;
     let start = s.expect(&TokenKind::Union)?;
     let all = s.eat(&TokenKind::All).is_some();
     let right = parse_call_body(s)?;
     let end = s.peek_span();
+    s.leave_recursion();
     Ok(UnionTail {
         all,
         right,
