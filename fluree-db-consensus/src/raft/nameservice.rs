@@ -427,6 +427,11 @@ fn build_apply_head_command(
 ///   admin preemption (`QueueCleared`), former-leader straggler
 ///   proposals (`WrongFront`), or a state-machine invariant break.
 /// - [`SmResponse::LedgerNotFound`] → `Err(not_found)`.
+/// - [`SmResponse::LedgerRetracted`] → `Err(Retracted)`. Terminal —
+///   the branch was administratively retracted and any in-flight
+///   staged commit no longer applies; distinguished from `Storage`
+///   so the worker poisons with `BranchRetracted` instead of
+///   retrying.
 /// - Anything else → `Err(Storage)`. None of the other variants are
 ///   reachable for an ApplyHead command; if one appears it's a
 ///   state-machine bug worth surfacing rather than swallowing.
@@ -443,6 +448,7 @@ fn map_apply_head_response(resp: SmResponse) -> Result<()> {
             describe_desync_reason(&reason)
         ))),
         SmResponse::LedgerNotFound { ledger_id } => Err(NameServiceError::not_found(ledger_id)),
+        SmResponse::LedgerRetracted { ledger_id } => Err(NameServiceError::Retracted(ledger_id)),
         other => Err(NameServiceError::storage(format!(
             "unexpected Response variant for ApplyHead: {other:?}"
         ))),
@@ -519,6 +525,14 @@ pub enum ApplyStagedCommitError {
     /// this propose attempt.
     #[error("ledger {0} not found")]
     LedgerNotFound(String),
+    /// The branch has been administratively retracted. The queue
+    /// was drained at retract time, so any in-flight staged commit
+    /// no longer applies. Terminal — distinguished from
+    /// [`Self::InvariantViolated`] so callers can drop the staged
+    /// install rather than misclassify a benign operator action as
+    /// a state-machine invariant break.
+    #[error("ledger {0} has been retracted")]
+    LedgerRetracted(String),
     /// The receiving node isn't the current leader. The caller
     /// should look up the new leader (if known) and retry.
     #[error("not the leader; current leader: {leader:?}")]
@@ -629,6 +643,10 @@ impl RaftNameService {
             SmResponse::LedgerNotFound { ledger_id } => {
                 self.drop_staged_receipt(queue_id);
                 Err(ApplyStagedCommitError::LedgerNotFound(ledger_id))
+            }
+            SmResponse::LedgerRetracted { ledger_id } => {
+                self.drop_staged_receipt(queue_id);
+                Err(ApplyStagedCommitError::LedgerRetracted(ledger_id))
             }
             other => {
                 self.drop_staged_receipt(queue_id);
@@ -905,6 +923,12 @@ fn map_propose_error<E: FromRaftWriteError>(
 /// - [`LedgerNotFound`](ApplyStagedCommitError::LedgerNotFound) →
 ///   [`NotFound`](NameServiceError::NotFound). Terminal; worker
 ///   poisons with `PoisonReason::LedgerNotFound`.
+/// - [`LedgerRetracted`](ApplyStagedCommitError::LedgerRetracted) →
+///   [`Retracted`](NameServiceError::Retracted). Terminal; worker
+///   drops the install and moves on (the retract command already
+///   drained the queue, so the staged commit has nowhere to land —
+///   same drop-and-advance semantics as a `Stale` outcome, no
+///   spurious poison record).
 /// - [`InvariantViolated`](ApplyStagedCommitError::InvariantViolated) →
 ///   [`ApplyRejected`](NameServiceError::ApplyRejected). Terminal;
 ///   worker poisons with `PoisonReason::WorkerPanic`.
@@ -924,6 +948,7 @@ fn classify_apply_staged_commit_outcome(
             "queue_id {queue_id} no longer at front (current front: {current_front_queue_id:?})"
         ))),
         Err(ApplyStagedCommitError::LedgerNotFound(id)) => Err(NameServiceError::not_found(id)),
+        Err(ApplyStagedCommitError::LedgerRetracted(id)) => Err(NameServiceError::Retracted(id)),
         Err(ApplyStagedCommitError::InvariantViolated(msg)) => {
             Err(NameServiceError::apply_rejected(format!(
                 "apply_staged_commit invariant violated: {msg}"
@@ -2037,6 +2062,24 @@ mod tests {
     }
 
     #[test]
+    fn map_apply_head_response_ledger_retracted_is_retracted_err() {
+        // The leader-local apply path returns `LedgerRetracted`
+        // as a defense-in-depth catch for a retracted-but-not-
+        // drained branch. The mapping has to surface it as a
+        // distinct error so the worker can drop the install
+        // instead of treating it as a generic storage/raft error
+        // and looping forever.
+        let r = map_apply_head_response(SmResponse::LedgerRetracted {
+            ledger_id: "tombstone/db".into(),
+        });
+        let err = r.expect_err("retracted is error");
+        match err {
+            NameServiceError::Retracted(id) => assert_eq!(id, "tombstone/db"),
+            other => panic!("expected Retracted, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn map_apply_head_response_unexpected_variant_is_err() {
         assert!(map_apply_head_response(SmResponse::NoOp).is_err());
     }
@@ -2253,6 +2296,27 @@ mod tests {
         match err {
             NameServiceError::NotFound(id) => assert_eq!(id, "test/db:main"),
             other => panic!("expected NotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_outcome_ledger_retracted_is_terminal_retracted() {
+        // The branch was administratively retracted between stage
+        // and propose. Map to `Retracted` so the worker poisons
+        // with `PoisonReason::BranchRetracted` — without the
+        // dedicated arm this previously fell through to
+        // `InvariantViolated` and surfaced a benign operator
+        // action as a worker-panic poison record.
+        let r = classify_apply_staged_commit_outcome(
+            Err(ApplyStagedCommitError::LedgerRetracted(
+                "test/db:main".into(),
+            )),
+            7,
+        );
+        let err = r.expect_err("ledger_retracted must be Err");
+        match err {
+            NameServiceError::Retracted(id) => assert_eq!(id, "test/db:main"),
+            other => panic!("expected Retracted, got {other:?}"),
         }
     }
 

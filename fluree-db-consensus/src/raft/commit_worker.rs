@@ -960,6 +960,13 @@ impl Worker {
             Err(NameServiceError::NotFound(id)) => {
                 Err(stage(PoisonReason::LedgerNotFound { ledger_id: id }))
             }
+            // Admin-driven retraction. The branch's queue was
+            // drained by `RetractLedger` (waiters resolved at drain
+            // time), so the staged commit has nowhere to land. Map
+            // to `Stale` — same drop-install-and-advance semantics
+            // as a queue-front race, no spurious poison record for
+            // an entry that's already gone.
+            Err(NameServiceError::Retracted(msg)) => Err(WorkerError::Stale(msg)),
             Err(NameServiceError::ApplyRejected(msg)) => Err(stage(PoisonReason::WorkerPanic {
                 message: format!("state machine rejected ApplyHead: {msg}"),
             })),
