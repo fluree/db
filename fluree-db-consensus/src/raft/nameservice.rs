@@ -48,7 +48,7 @@
 //! [`LedgerState::load`]: fluree_db_ledger::LedgerState::load
 
 use crate::raft::commit_worker::{QueuePoisonError, QueuePoisonPublisher};
-use crate::raft::staged_receipt::{AppliedReceipt, StagedReceiptMap};
+use crate::raft::staged_receipt::{AppliedReceipt, StagedReceiptMap, StashGuard};
 use crate::raft::state_machine::{
     Command as SmCommand, ConfigUpdate, DesyncReason, EntryPoisoning, NameServiceState, NewBranch,
     NewIndexHead, NewLedger, PoisonReason, RecordedTally, RefKey, ResetHeadSnapshot,
@@ -558,6 +558,13 @@ pub enum ApplyStagedCommitError {
     /// state-machine bug, not a caller mistake.
     #[error("state machine invariant violated: {0}")]
     InvariantViolated(String),
+    /// A receipt is already stashed under this `queue_id` on the
+    /// leader — typically a second follower racing the first under
+    /// an ownership flap. The caller drops its install and lets
+    /// the in-flight ferry land; the entry is the same one either
+    /// way, so the outcome is correct.
+    #[error("a receipt is already stashed for queue_id {queue_id}")]
+    AlreadyStashed { queue_id: u64 },
 }
 
 /// RPC payload a follower's worker sends to the current leader when
@@ -594,11 +601,18 @@ impl RaftNameService {
     /// Called by the HTTP handler on the leader after a follower's
     /// worker forwards its staged work.
     ///
-    /// Receipt-stash lifecycle: stashed before propose so the
-    /// state-machine adapter has it when the apply fires; taken back
-    /// on the [`Stale`](ApplyStagedCommitResponse::Stale) path
-    /// (entry never applies, stash would leak), and on any error
-    /// before propose-returns (same reason).
+    /// Receipt-stash lifecycle uses a [`StashGuard`] over the
+    /// `client_write` await so every exit path — including the
+    /// handler future being dropped between stash and propose
+    /// (axum task abort on shutdown, hyper TCP RST) — runs `Drop`
+    /// and removes the receipt. The adapter `take`s on the Applied
+    /// path; the guard's `Drop` is a no-op `take` in that case.
+    ///
+    /// [`StashGuard::try_stash`] rejects a duplicate ferry for the
+    /// same `queue_id` (a second follower racing under an
+    /// ownership flap) rather than silently overwriting the first
+    /// ferry's receipt and resolving the waiter against the wrong
+    /// stash payload.
     pub async fn apply_staged_commit(
         &self,
         args: StagedCommit,
@@ -629,52 +643,36 @@ impl RaftNameService {
             flake_count,
         });
 
-        if let Some(stash) = &self.staged_receipts {
-            stash.stash(queue_id, ref_key.clone(), receipt);
-        }
-
-        let resp = match self.raft.client_write(cmd).await {
-            Ok(resp) => resp,
-            Err(err) => {
-                self.drop_staged_receipt(queue_id);
-                return Err(map_propose_error(err));
-            }
+        let _guard = match self.staged_receipts.as_ref() {
+            Some(stash) => match StashGuard::try_stash(stash, queue_id, ref_key.clone(), receipt) {
+                Some(g) => Some(g),
+                None => return Err(ApplyStagedCommitError::AlreadyStashed { queue_id }),
+            },
+            None => None,
         };
+
+        let resp = self
+            .raft
+            .client_write(cmd)
+            .await
+            .map_err(map_propose_error)?;
 
         match resp.data {
             SmResponse::HeadApplied { commit_t, .. } => {
                 Ok(ApplyStagedCommitResponse::Applied { commit_t })
             }
-            SmResponse::QueueDesync { .. } => {
-                self.drop_staged_receipt(queue_id);
-                Ok(ApplyStagedCommitResponse::Stale {
-                    current_front_queue_id: self.current_front_queue_id(&ref_key).await,
-                })
-            }
+            SmResponse::QueueDesync { .. } => Ok(ApplyStagedCommitResponse::Stale {
+                current_front_queue_id: self.current_front_queue_id(&ref_key).await,
+            }),
             SmResponse::LedgerNotFound { ledger_id } => {
-                self.drop_staged_receipt(queue_id);
                 Err(ApplyStagedCommitError::LedgerNotFound(ledger_id))
             }
             SmResponse::LedgerRetracted { ledger_id } => {
-                self.drop_staged_receipt(queue_id);
                 Err(ApplyStagedCommitError::LedgerRetracted(ledger_id))
             }
-            other => {
-                self.drop_staged_receipt(queue_id);
-                Err(ApplyStagedCommitError::InvariantViolated(format!(
-                    "unexpected Response variant for ApplyHead: {other:?}"
-                )))
-            }
-        }
-    }
-
-    /// Discard a stashed receipt when the propose path won't apply
-    /// it — `Stale`, `LedgerNotFound`, propose error, or an
-    /// unreachable response variant. The state-machine adapter
-    /// `take`s on the success path, so this is a no-op there.
-    fn drop_staged_receipt(&self, queue_id: u64) {
-        if let Some(stash) = &self.staged_receipts {
-            stash.take(queue_id);
+            other => Err(ApplyStagedCommitError::InvariantViolated(format!(
+                "unexpected Response variant for ApplyHead: {other:?}"
+            ))),
         }
     }
 
@@ -943,6 +941,11 @@ fn map_propose_error<E: FromRaftWriteError>(
 /// - [`InvariantViolated`](ApplyStagedCommitError::InvariantViolated) →
 ///   [`ApplyRejected`](NameServiceError::ApplyRejected). Terminal;
 ///   worker poisons with `PoisonReason::WorkerPanic`.
+/// - [`AlreadyStashed`](ApplyStagedCommitError::AlreadyStashed) →
+///   [`ApplyStale`](NameServiceError::ApplyStale). Another ferry
+///   for this `queue_id` is already in flight on the leader; the
+///   in-flight one will land. Worker drops its install and moves
+///   on — same drop-and-advance recovery as the queue-front race.
 /// - [`NotLeader`](ApplyStagedCommitError::NotLeader),
 ///   [`RaftPropose`](ApplyStagedCommitError::RaftPropose) →
 ///   [`Storage`](NameServiceError::Storage). Transient; worker
@@ -965,6 +968,9 @@ fn classify_apply_staged_commit_outcome(
                 "apply_staged_commit invariant violated: {msg}"
             )))
         }
+        Err(ApplyStagedCommitError::AlreadyStashed { queue_id }) => Err(
+            NameServiceError::apply_stale(format!("queue_id {queue_id} already in flight")),
+        ),
         Err(
             e @ (ApplyStagedCommitError::NotLeader { .. } | ApplyStagedCommitError::RaftPropose(_)),
         ) => Err(NameServiceError::storage(format!(
@@ -2408,6 +2414,24 @@ mod tests {
             NameServiceError::Retracted(id) => assert_eq!(id, "test/db:main"),
             other => panic!("expected Retracted, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn classify_outcome_already_stashed_is_apply_stale() {
+        // Duplicate ferry under an ownership flap: the in-flight
+        // first ferry will land, so the second's worker should drop
+        // its install and advance — same recovery shape as the
+        // queue-front race.
+        let r = classify_apply_staged_commit_outcome(
+            Err(ApplyStagedCommitError::AlreadyStashed { queue_id: 7 }),
+            7,
+        );
+        let err = r.expect_err("already_stashed must be Err");
+        assert!(
+            matches!(err, NameServiceError::ApplyStale(_)),
+            "expected ApplyStale, got {err:?}"
+        );
+        assert!(err.to_string().contains("queue_id 7"));
     }
 
     #[test]

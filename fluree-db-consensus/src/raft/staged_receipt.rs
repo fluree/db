@@ -161,8 +161,33 @@ impl StagedReceiptMap {
     /// staging and before proposing `ApplyHead`. `ref_key` is
     /// recorded so [`take_for_ref_key`](Self::take_for_ref_key) can
     /// drain every receipt belonging to a cleared branch.
+    ///
+    /// Overwrites any prior entry for `queue_id` silently. Callers
+    /// that need to detect a collision (e.g. the leader-side handler
+    /// guarding against a duplicate ferry under an ownership flap)
+    /// should use [`Self::stash_if_absent`] instead.
     pub fn stash(&self, queue_id: u64, ref_key: RefKey, receipt: AppliedReceipt) {
         self.receipts.insert(queue_id, (ref_key, receipt));
+    }
+
+    /// Park a receipt under `queue_id` only if no entry exists for
+    /// that slot. Returns `true` on insert, `false` when a prior
+    /// entry was already present (the existing entry is left in
+    /// place; the new `receipt` is discarded).
+    ///
+    /// Used by the leader-side `apply_staged_commit` handler so a
+    /// concurrent ferry from a second follower (ownership flap)
+    /// can't silently overwrite the first ferry's receipt and
+    /// resolve the waiter against the wrong stash payload.
+    pub fn stash_if_absent(&self, queue_id: u64, ref_key: RefKey, receipt: AppliedReceipt) -> bool {
+        use dashmap::mapref::entry::Entry;
+        match self.receipts.entry(queue_id) {
+            Entry::Vacant(slot) => {
+                slot.insert((ref_key, receipt));
+                true
+            }
+            Entry::Occupied(_) => false,
+        }
     }
 
     /// Remove and return the receipt for `queue_id`. The state-
@@ -270,6 +295,60 @@ impl StagedReceiptMap {
     #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.receipts.is_empty()
+    }
+}
+
+/// RAII wrapper around a [`StagedReceiptMap`] stash slot. Stashes a
+/// typed [`AppliedReceipt`] on construction; removes it on `Drop`.
+/// Ensures the caller's task being aborted mid-propose doesn't
+/// strand the receipt in the shared map — every exit path (normal
+/// return, error, task cancellation, panic) runs `Drop`. Removal
+/// is idempotent: paths where the state-machine adapter or the
+/// cross-node forward already consumed the receipt see `Drop`
+/// perform a no-op `take`.
+pub(crate) struct StashGuard<'a> {
+    receipts: &'a StagedReceiptMap,
+    queue_id: u64,
+}
+
+impl<'a> StashGuard<'a> {
+    /// Stash and return a guard. Always succeeds; existing entries
+    /// for `queue_id` are silently overwritten — for the worker
+    /// path where the invariant is one in-flight stash per
+    /// `queue_id` at a time, enforced by the guard's `Drop`.
+    pub(crate) fn stash(
+        receipts: &'a StagedReceiptMap,
+        queue_id: u64,
+        ref_key: RefKey,
+        receipt: AppliedReceipt,
+    ) -> Self {
+        receipts.stash(queue_id, ref_key, receipt);
+        Self { receipts, queue_id }
+    }
+
+    /// Stash and return a guard only if the slot is empty. Returns
+    /// `None` if an entry is already present for `queue_id` — for
+    /// the leader-side `apply_staged_commit` handler where a
+    /// duplicate ferry from a second follower (ownership flap)
+    /// must be rejected rather than silently overwriting the
+    /// first ferry's receipt.
+    pub(crate) fn try_stash(
+        receipts: &'a StagedReceiptMap,
+        queue_id: u64,
+        ref_key: RefKey,
+        receipt: AppliedReceipt,
+    ) -> Option<Self> {
+        if receipts.stash_if_absent(queue_id, ref_key, receipt) {
+            Some(Self { receipts, queue_id })
+        } else {
+            None
+        }
+    }
+}
+
+impl Drop for StashGuard<'_> {
+    fn drop(&mut self) {
+        self.receipts.take(self.queue_id);
     }
 }
 
@@ -452,6 +531,83 @@ mod tests {
         assert_eq!(taken_qid, 3);
         assert_eq!(taken_receipt.commit_id(), &cid(3));
         assert_eq!(map.len(), 2);
+    }
+
+    #[test]
+    fn stash_if_absent_inserts_on_empty_slot_and_refuses_on_conflict() {
+        // The leader-side handler depends on this rejection. Without
+        // it, a second ferry for the same queue_id (ownership flap)
+        // would silently overwrite the first ferry's receipt and
+        // the waiter would resolve against the wrong payload.
+        let map = StagedReceiptMap::new();
+        let main = RefKey::new("test/db", "main");
+        assert!(
+            map.stash_if_absent(
+                7,
+                main.clone(),
+                AppliedReceipt::Minimal {
+                    commit_id: cid(1),
+                    commit_t: 10,
+                },
+            ),
+            "insert into empty slot succeeds"
+        );
+        let conflict = AppliedReceipt::Minimal {
+            commit_id: cid(2),
+            commit_t: 20,
+        };
+        assert!(
+            !map.stash_if_absent(7, main.clone(), conflict),
+            "second insert at occupied slot must refuse"
+        );
+        // First receipt still in place.
+        let taken = map.take(7).expect("first receipt still present");
+        assert_eq!(taken.commit_id(), &cid(1));
+        assert_eq!(taken.commit_t(), 10);
+    }
+
+    #[test]
+    fn stash_guard_try_stash_returns_none_on_conflict() {
+        let map = StagedReceiptMap::new();
+        let main = RefKey::new("test/db", "main");
+        let first = AppliedReceipt::Minimal {
+            commit_id: cid(1),
+            commit_t: 10,
+        };
+        let second = AppliedReceipt::Minimal {
+            commit_id: cid(2),
+            commit_t: 20,
+        };
+        let _g1 = StashGuard::try_stash(&map, 7, main.clone(), first).expect("first stash");
+        assert!(
+            StashGuard::try_stash(&map, 7, main.clone(), second).is_none(),
+            "duplicate queue_id stash must return None"
+        );
+        // First entry is still present until _g1 drops.
+        assert_eq!(map.len(), 1);
+    }
+
+    #[test]
+    fn stash_guard_try_stash_drop_cleans_up_first_entry() {
+        // The RAII property: even when the conflict path returns
+        // None and propagates an error, the original guard still
+        // cleans up its own entry on scope exit.
+        let map = StagedReceiptMap::new();
+        let main = RefKey::new("test/db", "main");
+        {
+            let _g = StashGuard::try_stash(
+                &map,
+                7,
+                main.clone(),
+                AppliedReceipt::Minimal {
+                    commit_id: cid(1),
+                    commit_t: 10,
+                },
+            )
+            .expect("stash");
+            assert_eq!(map.len(), 1);
+        }
+        assert_eq!(map.len(), 0, "guard drop must clean up the entry");
     }
 
     #[test]

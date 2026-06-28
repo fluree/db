@@ -34,7 +34,7 @@ use crate::local::build_policy_context;
 use crate::raft::ownership::owner;
 use crate::raft::staged_receipt::{
     AppliedReceipt, MergeApplied, PushApplied, RebaseApplied, RevertApplied, StagedReceiptMap,
-    TransactApplied,
+    StashGuard, TransactApplied,
 };
 use crate::raft::state_machine::{BodyKind, PoisonReason, QueueEntry, RefKey};
 use crate::raft::state_machine_adapter::SharedState;
@@ -171,36 +171,6 @@ pub struct PublishingChannel {
 pub struct StagingContext {
     pub fluree: Arc<Fluree>,
     pub index_config: IndexConfig,
-}
-
-/// RAII wrapper around a [`StagedReceiptMap`] stash slot. Stashes a
-/// typed [`AppliedReceipt`] on construction; removes it on `Drop`.
-/// Ensures a worker aborted mid-publish doesn't strand its receipt
-/// in the shared map — every exit path (normal return, error, task
-/// cancellation, panic) runs `Drop`. Removal is idempotent: paths
-/// where the state-machine adapter or the cross-node forward
-/// already consumed the receipt see `Drop` perform a no-op `take`.
-struct StashGuard<'a> {
-    receipts: &'a StagedReceiptMap,
-    queue_id: u64,
-}
-
-impl<'a> StashGuard<'a> {
-    fn stash(
-        receipts: &'a StagedReceiptMap,
-        queue_id: u64,
-        ref_key: RefKey,
-        receipt: AppliedReceipt,
-    ) -> Self {
-        receipts.stash(queue_id, ref_key, receipt);
-        Self { receipts, queue_id }
-    }
-}
-
-impl Drop for StashGuard<'_> {
-    fn drop(&mut self) {
-        self.receipts.take(self.queue_id);
-    }
 }
 
 /// Per-branch staging task.
@@ -1951,7 +1921,9 @@ mod tests {
     /// guard's `Drop` fires, and the receipt is cleaned up.
     #[tokio::test]
     async fn stash_guard_removes_receipt_on_drop() {
-        use crate::raft::staged_receipt::{AppliedReceipt, StagedReceiptMap, TransactApplied};
+        use crate::raft::staged_receipt::{
+            AppliedReceipt, StagedReceiptMap, StashGuard, TransactApplied,
+        };
         use crate::raft::state_machine::RefKey;
         use fluree_db_api::{ContentId, ContentKind};
 
@@ -1964,8 +1936,7 @@ mod tests {
         });
 
         {
-            let _guard =
-                super::StashGuard::stash(&map, 42, RefKey::new("test/db", "main"), receipt);
+            let _guard = StashGuard::stash(&map, 42, RefKey::new("test/db", "main"), receipt);
             assert_eq!(map.len(), 1, "stash should populate the map");
         }
         assert_eq!(
@@ -1981,7 +1952,9 @@ mod tests {
     /// be a safe no-op rather than panic or corrupt the map.
     #[tokio::test]
     async fn stash_guard_drop_is_idempotent_after_external_take() {
-        use crate::raft::staged_receipt::{AppliedReceipt, StagedReceiptMap, TransactApplied};
+        use crate::raft::staged_receipt::{
+            AppliedReceipt, StagedReceiptMap, StashGuard, TransactApplied,
+        };
         use crate::raft::state_machine::RefKey;
         use fluree_db_api::{ContentId, ContentKind};
 
@@ -1994,8 +1967,7 @@ mod tests {
         });
 
         {
-            let _guard =
-                super::StashGuard::stash(&map, 42, RefKey::new("test/db", "main"), receipt);
+            let _guard = StashGuard::stash(&map, 42, RefKey::new("test/db", "main"), receipt);
             // Simulate the adapter / via-leader path taking the
             // receipt before the guard drops.
             assert!(map.take(42).is_some());
