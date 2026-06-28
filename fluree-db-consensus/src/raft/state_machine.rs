@@ -500,7 +500,6 @@ pub struct NameServiceState {
     /// state machine hasn't observed an explicit eligibility yet —
     /// the supervisor falls back to the raft membership in that
     /// case so a fresh cluster works without explicit init.
-    #[serde(default)]
     pub worker_eligible_voters: BTreeSet<NodeId>,
     /// The currently-configured voter set, mirrored from the raft
     /// `last_membership` by the state-machine adapter on every
@@ -511,7 +510,6 @@ pub struct NameServiceState {
     /// [`worker_eligible_voters`](Self::worker_eligible_voters) to
     /// this set on every membership change so newly-added voters
     /// start eligible and removed voters disappear from both sets.
-    #[serde(default)]
     pub configured_voters: BTreeSet<NodeId>,
 }
 
