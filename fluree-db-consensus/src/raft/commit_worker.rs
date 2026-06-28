@@ -1241,13 +1241,14 @@ impl WorkerSupervisor {
             .collect()
     }
 
-    /// Spawn workers for newly-desired branches; tear down workers
-    /// for branches no longer owned. Dead handles (a worker that
-    /// exited on its own — should not happen under normal operation
-    /// since `Worker::run` loops forever and panics are caught
-    /// per-entry) are left in place: they'll be removed on the next
-    /// ownership change, or stay dormant until the supervisor
-    /// restarts.
+    /// Spawn workers for newly-desired branches; respawn workers
+    /// whose handle has finished (panic outside `catch_unwind`, or
+    /// any other path that exits `Worker::run` unexpectedly); tear
+    /// down workers for branches no longer owned. Without the
+    /// respawn step, a single panic in an unguarded path
+    /// (`unreachable!()` arm, `propose_poison` await, lock
+    /// acquisition) would leave a dead handle in the map and stall
+    /// that branch's queue until ownership rotates off the node.
     ///
     /// Teardown uses [`abort_and_await`] — every aborted handle is
     /// awaited before this method returns. That serialization is
@@ -1261,6 +1262,23 @@ impl WorkerSupervisor {
         workers: &mut HashMap<RefKey, JoinHandle<()>>,
         desired: HashSet<RefKey>,
     ) {
+        // Drain dead handles for still-desired branches first so the
+        // spawn pass below treats them as missing entries. Joining
+        // returns immediately (the handles are already finished);
+        // log the cause so a panic outside `catch_unwind` is visible
+        // instead of silently respawning.
+        for dead in drain_dead_workers(workers, &desired) {
+            match dead.await {
+                Ok(()) => warn!(
+                    "worker task exited cleanly — Worker::run is supposed to loop forever; respawning"
+                ),
+                Err(err) if err.is_panic() => warn!(
+                    panic = %panic_message(err.into_panic()),
+                    "worker task panicked outside catch_unwind — respawning"
+                ),
+                Err(err) => warn!(error = ?err, "worker task ended unexpectedly — respawning"),
+            }
+        }
         for key in &desired {
             if !workers.contains_key(key) {
                 let handle = tokio::spawn(self.make_worker(key.clone()).run());
@@ -1324,6 +1342,27 @@ fn desired_owners(
         .keys()
         .filter(|ref_key| owner(ref_key, fallback_voters) == Some(id))
         .cloned()
+        .collect()
+}
+
+/// Remove and return the [`JoinHandle`]s for `workers` entries whose
+/// task has finished and whose [`RefKey`] is still in `desired`.
+/// Caller awaits each (returns immediately since they're already
+/// finished) to surface the panic cause, then the spawn pass
+/// recreates the worker. Dead handles whose key has dropped out of
+/// `desired` are left for the teardown pass to clean up.
+fn drain_dead_workers(
+    workers: &mut HashMap<RefKey, JoinHandle<()>>,
+    desired: &HashSet<RefKey>,
+) -> Vec<JoinHandle<()>> {
+    let dead_keys: Vec<RefKey> = workers
+        .iter()
+        .filter(|(key, handle)| desired.contains(*key) && handle.is_finished())
+        .map(|(key, _)| key.clone())
+        .collect();
+    dead_keys
+        .into_iter()
+        .filter_map(|key| workers.remove(&key))
         .collect()
 }
 
@@ -1850,6 +1889,59 @@ mod tests {
             0,
             "every aborted task's Drop must run before abort_and_await returns"
         );
+    }
+
+    /// Without [`drain_dead_workers`], a worker that exited (panic
+    /// outside `catch_unwind`, an `unreachable!()` arm tripping, the
+    /// poison-publish path panicking under future invariants slip)
+    /// would leave a finished [`JoinHandle`] in the supervisor's map,
+    /// and the next `reconcile_workers` tick would skip respawning
+    /// because `contains_key` is true. This test pins the helper:
+    /// a finished handle for a still-desired branch is drained out
+    /// so the spawn pass can replace it; a finished handle for a
+    /// branch that's no longer desired is left for the teardown
+    /// pass; a still-running handle is left alone.
+    #[tokio::test]
+    async fn drain_dead_workers_drains_only_finished_handles_for_desired_keys() {
+        use crate::raft::state_machine::RefKey;
+        use std::future::pending;
+
+        // Spawn a task that returns immediately so its handle is
+        // finished by the time we inspect it.
+        let dead_desired = tokio::spawn(async {});
+        let dead_undesired = tokio::spawn(async {});
+        while !dead_desired.is_finished() || !dead_undesired.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        // Spawn a task that never resolves so its handle stays
+        // unfinished — proves the helper doesn't touch live workers.
+        let alive_desired = tokio::spawn(pending::<()>());
+
+        let key_dead = RefKey::new("ledger", "dead");
+        let key_undesired = RefKey::new("ledger", "undesired");
+        let key_alive = RefKey::new("ledger", "alive");
+        let mut workers = HashMap::new();
+        workers.insert(key_dead.clone(), dead_desired);
+        workers.insert(key_undesired.clone(), dead_undesired);
+        workers.insert(key_alive.clone(), alive_desired);
+        let desired = HashSet::from([key_dead.clone(), key_alive.clone()]);
+
+        let drained = super::drain_dead_workers(&mut workers, &desired);
+
+        assert_eq!(drained.len(), 1, "only the desired+dead handle drains");
+        assert!(
+            !workers.contains_key(&key_dead),
+            "dead+desired handle removed so spawn pass can replace it"
+        );
+        assert!(
+            workers.contains_key(&key_undesired),
+            "dead+undesired handle stays for teardown pass"
+        );
+        assert!(workers.contains_key(&key_alive), "alive handle untouched");
+
+        // Cleanup so the pending task doesn't leak into other tests.
+        workers.remove(&key_alive).unwrap().abort();
+        workers.remove(&key_undesired);
     }
 
     /// `StashGuard` removes the receipt when the guard goes out of
