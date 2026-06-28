@@ -1025,6 +1025,7 @@ async fn liveness_monitor_demotes_killed_follower() {
         sample_interval: Duration::from_millis(50),
         unreachable_after: Duration::from_millis(500),
         live_after: Duration::from_millis(200),
+        refusal_backoff: Duration::from_millis(300),
     };
     let mut cluster = TestCluster::spawn_with_liveness(CLUSTER_SIZE, liveness_config).await;
     cluster.bootstrap().await;
