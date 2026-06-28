@@ -191,6 +191,46 @@ impl StagedReceiptMap {
             .collect()
     }
 
+    /// Return the queue_id of the pending stash entry for `ref_key`,
+    /// or `None` if no entry is currently stashed. Non-destructive
+    /// — leaves the receipt for the adapter to consume during apply.
+    ///
+    /// Used by the leader-local publish path to recover the worker's
+    /// queue_id from the stash instead of re-peeking the queue front
+    /// (which can shift between stage and publish under admin clears
+    /// or ownership flaps, attributing the worker's `commit_id` to
+    /// the wrong `queue_id`).
+    ///
+    /// Picks the smallest matching queue_id deterministically — the
+    /// worker invariant is one in-flight stash per branch per node,
+    /// so any match is the pending publish.
+    pub fn peek_queue_id_for(&self, ref_key: &RefKey) -> Option<u64> {
+        self.receipts
+            .iter()
+            .filter(|entry| &entry.value().0 == ref_key)
+            .map(|entry| *entry.key())
+            .min()
+    }
+
+    /// Remove and return the (queue_id, receipt) pair for the
+    /// pending stash entry on `ref_key`, or `None` if no entry is
+    /// stashed.
+    ///
+    /// Used by the follower-forward publish path: the worker stashes
+    /// before proposing, the publisher then takes both queue_id and
+    /// receipt out atomically by branch — avoids re-peeking the
+    /// queue front, which can race a queue shift between stage and
+    /// ferry and attribute the worker's `commit_id` to a different
+    /// `queue_id`.
+    ///
+    /// Same smallest-queue_id tiebreaker as [`Self::peek_queue_id_for`].
+    pub fn take_pending(&self, ref_key: &RefKey) -> Option<(u64, AppliedReceipt)> {
+        let queue_id = self.peek_queue_id_for(ref_key)?;
+        self.receipts
+            .remove(&queue_id)
+            .map(|(qid, (_, v))| (qid, v))
+    }
+
     /// Non-destructively read the per-transact metadata from a stashed
     /// [`AppliedReceipt::Transact`]. Returns `None` for any other
     /// variant or when the slot is empty. Used by `publish_commit`
@@ -311,6 +351,107 @@ mod tests {
     fn take_on_unknown_queue_id_is_none() {
         let map = StagedReceiptMap::new();
         assert!(map.take(9_999).is_none());
+    }
+
+    #[test]
+    fn peek_queue_id_for_returns_pending_stash_queue_id() {
+        // The worker stashes under entry.queue_id before publishing.
+        // The publish path must recover that exact queue_id from the
+        // stash — re-peeking the queue front would let a queue shift
+        // attribute the worker's commit_id to a different queue_id.
+        let map = StagedReceiptMap::new();
+        let main = RefKey::new("test/db", "main");
+        map.stash(
+            42,
+            main.clone(),
+            AppliedReceipt::Transact(TransactApplied {
+                commit_id: cid(1),
+                commit_t: 10,
+                flake_count: 0,
+                tally: None,
+            }),
+        );
+        assert_eq!(map.peek_queue_id_for(&main), Some(42));
+        // Non-destructive — receipt still available for the adapter
+        // to consume during apply.
+        assert!(map.take(42).is_some());
+    }
+
+    #[test]
+    fn peek_queue_id_for_empty_branch_is_none() {
+        let map = StagedReceiptMap::new();
+        let main = RefKey::new("test/db", "main");
+        let feature = RefKey::new("test/db", "feature");
+        map.stash(
+            1,
+            feature,
+            AppliedReceipt::Transact(TransactApplied {
+                commit_id: cid(1),
+                commit_t: 1,
+                flake_count: 0,
+                tally: None,
+            }),
+        );
+        assert_eq!(map.peek_queue_id_for(&main), None);
+    }
+
+    #[test]
+    fn take_pending_returns_queue_id_and_receipt_atomically() {
+        // The follower-forward publish path needs (queue_id, receipt)
+        // as an atomic pair sourced from the worker's stash. Without
+        // this atomicity (taking by ref_key rather than re-peeking
+        // queue_id and then taking the receipt under that key), a
+        // queue shift between the peek and take could attribute the
+        // wrong commit_id to the popped queue_id.
+        let map = StagedReceiptMap::new();
+        let main = RefKey::new("test/db", "main");
+        map.stash(
+            7,
+            main.clone(),
+            AppliedReceipt::Transact(TransactApplied {
+                commit_id: cid(99),
+                commit_t: 5,
+                flake_count: 0,
+                tally: None,
+            }),
+        );
+        let (queue_id, receipt) = map.take_pending(&main).expect("entry present");
+        assert_eq!(queue_id, 7);
+        assert_eq!(receipt.commit_id(), &cid(99));
+        // Stash drained.
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn take_pending_on_empty_branch_is_none() {
+        let map = StagedReceiptMap::new();
+        let main = RefKey::new("test/db", "main");
+        assert!(map.take_pending(&main).is_none());
+    }
+
+    #[test]
+    fn peek_and_take_pending_pick_smallest_queue_id_when_multiple_match() {
+        // The worker invariant is one in-flight stash per branch per
+        // node, so multi-match shouldn't happen in production. Pin
+        // the tiebreaker as smallest-queue_id for deterministic
+        // behavior if the invariant is ever violated.
+        let map = StagedReceiptMap::new();
+        let main = RefKey::new("test/db", "main");
+        for qid in [9_u64, 3, 7] {
+            map.stash(
+                qid,
+                main.clone(),
+                AppliedReceipt::Minimal {
+                    commit_id: cid(qid as u8),
+                    commit_t: qid as i64,
+                },
+            );
+        }
+        assert_eq!(map.peek_queue_id_for(&main), Some(3));
+        let (taken_qid, taken_receipt) = map.take_pending(&main).expect("entry present");
+        assert_eq!(taken_qid, 3);
+        assert_eq!(taken_receipt.commit_id(), &cid(3));
+        assert_eq!(map.len(), 2);
     }
 
     #[test]

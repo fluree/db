@@ -381,14 +381,15 @@ fn peek_queue_front_id(
 /// Build the state-machine command a [`CommitPublisher::publish_commit`]
 /// call translates into.
 ///
-/// The `queue_id` is sampled from the current per-branch queue front:
-/// the worker only ever calls `publish_commit` after staging the entry
-/// currently at the front, so peeking here recovers the queue_id the
-/// caller observed without requiring it to thread through the trait.
-/// If the front shifts between peek and apply (admin clear, leader
-/// change), the state machine returns [`SmResponse::QueueDesync`] and
-/// the caller surfaces it as an error — the race is the same one
-/// `QueueDesync` was designed to catch.
+/// The `queue_id` is recovered from the worker's stash entry for the
+/// branch — the worker's `StashGuard` keys by the entry's `queue_id`
+/// it just staged, so reading it back from the stash returns the
+/// exact value the caller is publishing for. The peek-the-queue-front
+/// fallback runs only when the stash is unavailable (no stash
+/// configured, or drained by an admin clear between stash and
+/// publish); the state machine still validates queue_id matches the
+/// actual front and returns [`SmResponse::QueueDesync`] if it
+/// doesn't.
 fn build_apply_head_command(
     state: &NameServiceState,
     ledger_id: &str,
@@ -398,7 +399,10 @@ fn build_apply_head_command(
 ) -> std::result::Result<SmCommand, NameServiceError> {
     let (ledger_name, branch) = split_ledger_id(ledger_id)?;
     let ref_key = RefKey::new(&ledger_name, &branch);
-    let queue_id = peek_queue_front_id(state, &ref_key)?;
+    let queue_id = match staged_receipts.and_then(|s| s.peek_queue_id_for(&ref_key)) {
+        Some(qid) => qid,
+        None => peek_queue_front_id(state, &ref_key)?,
+    };
     let applied_at_millis = crate::raft::current_millis();
     let metadata = staged_receipts.and_then(|s| s.peek_transact_metadata(queue_id));
     let tally = metadata
@@ -1068,6 +1072,13 @@ impl RaftNameService {
     /// fails the worker's outer error path re-stages the same entry
     /// (idempotent against the state machine's `queue_id` check).
     /// Holding a duplicate on the follower would leak.
+    ///
+    /// `queue_id` is sourced from the stash entry the worker wrote
+    /// before calling — atomic take by branch returns the exact
+    /// `(queue_id, receipt)` pair the worker stashed. Falling back
+    /// to a queue-front peek would let a queue shift between stage
+    /// and ferry attribute the worker's `commit_id` to a different
+    /// `queue_id`.
     async fn publish_commit_via_leader(
         &self,
         ledger_id: &str,
@@ -1078,19 +1089,33 @@ impl RaftNameService {
         let (ledger_name, branch) = split_ledger_id(ledger_id)?;
         let ref_key = RefKey::new(&ledger_name, &branch);
 
-        let queue_id = {
-            let state = self.state.read().await;
-            peek_queue_front_id(&state, &ref_key)?
-        };
-
-        let receipt = self
+        let (queue_id, receipt) = match self
             .staged_receipts
             .as_ref()
-            .and_then(|s| s.take(queue_id))
-            .unwrap_or_else(|| AppliedReceipt::Minimal {
-                commit_id: commit_id.clone(),
-                commit_t,
-            });
+            .and_then(|s| s.take_pending(&ref_key))
+        {
+            Some(pair) => pair,
+            None => {
+                // Stash empty — degraded fallback. Reachable only
+                // if the worker skipped stashing or an admin clear
+                // drained the stash between stash and publish. The
+                // queue-front peek + Minimal receipt matches the
+                // pre-stash-lookup behavior; the state machine
+                // still validates the queue_id and returns
+                // QueueDesync if the front shifted.
+                let queue_id = {
+                    let state = self.state.read().await;
+                    peek_queue_front_id(&state, &ref_key)?
+                };
+                (
+                    queue_id,
+                    AppliedReceipt::Minimal {
+                        commit_id: commit_id.clone(),
+                        commit_t,
+                    },
+                )
+            }
+        };
 
         let args = StagedCommit {
             ref_key,
@@ -1988,6 +2013,64 @@ mod tests {
         assert_eq!(args.commit_id, cid(99));
         assert_eq!(args.commit_t, 7);
         assert!(args.applied_at_millis > 0);
+    }
+
+    #[test]
+    fn build_apply_head_command_uses_stash_queue_id_when_it_disagrees_with_queue_front() {
+        // The worker stashed under queue_id=42, then between stash
+        // and publish the local queue front shifted (admin clear +
+        // new enqueue from a fast transactor, leader-failover race,
+        // etc.) so the local front now reports queue_id=99. Without
+        // the stash-driven lookup, the publish would build an
+        // ApplyHead carrying (queue_id=99, commit_id=<body of 42>)
+        // — a silent attribution corruption. With the lookup, the
+        // queue_id is sourced from the worker's stash and matches
+        // the commit_id the worker produced.
+        use crate::raft::staged_receipt::{AppliedReceipt, StagedReceiptMap, TransactApplied};
+        let stash = StagedReceiptMap::new();
+        stash.stash(
+            42,
+            RefKey::new("test/db", "main"),
+            AppliedReceipt::Transact(TransactApplied {
+                commit_id: cid(99),
+                commit_t: 7,
+                flake_count: 0,
+                tally: None,
+            }),
+        );
+
+        let mut state = NameServiceState::default();
+        install_queue_front(&mut state, "test/db:main", 99);
+
+        let cmd = build_apply_head_command(&state, "test/db:main", 7, &cid(99), Some(&stash))
+            .expect("build");
+        let SmCommand::ApplyHead(args) = cmd else {
+            panic!("expected ApplyHead");
+        };
+        assert_eq!(
+            args.queue_id, 42,
+            "queue_id must come from the worker's stash entry, not the (possibly shifted) local queue front"
+        );
+        assert_eq!(args.commit_id, cid(99));
+    }
+
+    #[test]
+    fn build_apply_head_command_falls_back_to_queue_front_when_stash_empty() {
+        // Stash is empty (no stash provided, or admin-drained). The
+        // pre-fix peek path stays in place as a degraded fallback —
+        // the state machine still validates queue_id against the
+        // actual front and returns QueueDesync if it doesn't match.
+        use crate::raft::staged_receipt::StagedReceiptMap;
+        let stash = StagedReceiptMap::new();
+        let mut state = NameServiceState::default();
+        install_queue_front(&mut state, "test/db:main", 42);
+
+        let cmd = build_apply_head_command(&state, "test/db:main", 7, &cid(99), Some(&stash))
+            .expect("build");
+        let SmCommand::ApplyHead(args) = cmd else {
+            panic!("expected ApplyHead");
+        };
+        assert_eq!(args.queue_id, 42);
     }
 
     #[test]
