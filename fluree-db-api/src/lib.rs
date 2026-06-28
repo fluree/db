@@ -3325,6 +3325,15 @@ impl Fluree {
 
     /// Like [`transact_cypher`](Self::transact_cypher) but substitutes
     /// `$param` references from `params` before lowering.
+    ///
+    /// This convenience method carries no [`PolicyContext`], so a conditional
+    /// `MERGE` here probes an UNWRAPPED view — correct precisely because there is
+    /// no policy to enforce. A policy-gated caller must NOT route through here:
+    /// it would choose the match-vs-create branch against unfiltered data. The
+    /// consensus write path wraps the probe instead (see
+    /// `fluree-db-consensus/src/local.rs`), and any future policy-aware variant
+    /// of this method must do the same before calling
+    /// [`resolve_conditional_cypher`](Self::resolve_conditional_cypher).
     pub async fn transact_cypher_with_params(
         &self,
         ledger: LedgerState,
@@ -3337,6 +3346,7 @@ impl Fluree {
         let txn = match plan {
             crate::cypher_write::WritePlan::Single(txn) => *txn,
             crate::cypher_write::WritePlan::Conditional(cw) => {
+                // Unwrapped probe: this method has no policy. See the method doc.
                 let probe = GraphDb::from_ledger_state(&ledger);
                 self.resolve_conditional_cypher(&cw, probe, ledger.ledger_id(), &ledger.snapshot)
                     .await?
@@ -3384,6 +3394,14 @@ impl Fluree {
     /// lowering the chosen branch to a concrete `Txn`. The probe view must
     /// represent the same pre-write state the resulting `Txn` will commit
     /// against.
+    ///
+    /// POLICY CONTRACT: `probe_view` must already be policy-wrapped to match the
+    /// write's governance. This method does not (and cannot) wrap it — it has no
+    /// `PolicyContext` — so passing an unwrapped view under an active policy
+    /// would select the `MERGE` match-vs-create branch against unfiltered data,
+    /// leaking existence. Callers under policy wrap first (see
+    /// `fluree-db-consensus/src/local.rs`, which wraps when the governance has
+    /// any policy inputs).
     pub async fn resolve_conditional_cypher(
         &self,
         cw: &crate::cypher_write::ConditionalCypherWrite,

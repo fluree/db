@@ -18,7 +18,7 @@ use fluree_db_core::query_bounds::{RangeMatch, RangeOptions, RangeTest};
 use fluree_db_core::range_provider::RangeQuery;
 use fluree_db_core::{FlakeValue, NoOverlay, Sid};
 use fluree_vocab::rdf;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use super::value::ComparableValue;
@@ -562,9 +562,10 @@ pub fn eval_keys_to_binding<R: RowAccess>(
 fn keys_binding(props: Vec<DataProperty>, ctx: &ExecutionContext<'_>) -> Result<Binding> {
     let dt = xsd_string_sid(ctx);
     let mut names: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
     for (pred, ..) in &props {
         if let Some(name) = cypher_name_from_sid(pred, ctx)? {
-            if !names.contains(&name) {
+            if seen.insert(name.clone()) {
                 names.push(name);
             }
         }
@@ -609,13 +610,12 @@ fn properties_binding(props: Vec<DataProperty>, ctx: &ExecutionContext<'_>) -> R
             continue;
         };
         let value = property_value_binding(val, dt, lang);
-        grouped
-            .entry(name.clone())
-            .or_default()
-            .push((value, list_index));
-        if !order.contains(&name) {
-            order.push(name);
+        // `grouped` already tracks which keys we've seen, so consult it for
+        // first-seen ordering instead of a per-row O(n) `order.contains` scan.
+        if !grouped.contains_key(&name) {
+            order.push(name.clone());
         }
+        grouped.entry(name).or_default().push((value, list_index));
     }
     let entries = order
         .into_iter()
