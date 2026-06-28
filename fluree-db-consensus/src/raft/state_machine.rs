@@ -1073,19 +1073,6 @@ pub enum EligibilityRefusal {
     /// way the apply refuses to mutate worker eligibility for a
     /// non-voter.
     VoterNotConfigured,
-    /// Flipping `voter` to `eligible: false` would shrink
-    /// [`NameServiceState::worker_eligible_voters`] below the
-    /// `floor(|configured_voters| / 2) + 1` quorum floor. Carried
-    /// counts let the proposer log why the refusal happened
-    /// without re-deriving them. Network partitions can chain
-    /// removals across nodes that disagree about who's live; this
-    /// floor stops a partition's leader from paralyzing the cluster
-    /// by walking the eligible set down to zero.
-    QuorumWouldBreak {
-        configured_voter_count: usize,
-        currently_eligible_count: usize,
-        quorum_floor: usize,
-    },
 }
 
 /// Why [`Response::QueueDesync`] fired. See the design doc.
@@ -1224,10 +1211,17 @@ pub fn apply(state: &mut NameServiceState, command: Command, log_index: u64) -> 
 }
 
 /// Apply [`Command::SetWorkerEligibility`]. Validate the voter is
-/// configured, enforce the quorum floor on demotion, then insert
-/// or remove `voter` from
+/// configured, then insert or remove `voter` from
 /// [`NameServiceState::worker_eligible_voters`] per the `eligible`
 /// flag. Idempotent: a no-op apply returns `changed: false`.
+///
+/// Worker eligibility and raft voting quorum are independent
+/// concerns — a peer can stop hosting workers without affecting
+/// its raft vote. The apply path doesn't impose a "minimum
+/// eligible count" floor; an operator or the liveness monitor can
+/// drive eligibility to zero. Routing degrades gracefully (queues
+/// stall until eligibility is restored) rather than refusing to
+/// record the operator's intent.
 fn apply_set_worker_eligibility(state: &mut NameServiceState, args: WorkerEligibility) -> Response {
     let WorkerEligibility {
         voter,
@@ -1243,24 +1237,6 @@ fn apply_set_worker_eligibility(state: &mut NameServiceState, args: WorkerEligib
         };
     }
 
-    // Demotion of a currently-eligible voter trips the quorum floor
-    // check; promotion and idempotent re-applies always proceed.
-    if !eligible && state.worker_eligible_voters.contains(&voter) {
-        let quorum_floor = quorum_floor(state.configured_voters.len());
-        let post_remove_count = state.worker_eligible_voters.len() - 1;
-        if post_remove_count < quorum_floor {
-            return Response::WorkerEligibilityRefused {
-                voter,
-                eligible,
-                reason: EligibilityRefusal::QuorumWouldBreak {
-                    configured_voter_count: state.configured_voters.len(),
-                    currently_eligible_count: state.worker_eligible_voters.len(),
-                    quorum_floor,
-                },
-            };
-        }
-    }
-
     let changed = if eligible {
         state.worker_eligible_voters.insert(voter)
     } else {
@@ -1271,15 +1247,6 @@ fn apply_set_worker_eligibility(state: &mut NameServiceState, args: WorkerEligib
         eligible,
         changed,
     }
-}
-
-/// Standard raft quorum floor: a set of `configured` voters needs
-/// at least `floor(configured / 2) + 1` to make progress. Used by
-/// [`apply_set_worker_eligibility`] to refuse demotions that would
-/// drop [`NameServiceState::worker_eligible_voters`] below this
-/// floor.
-fn quorum_floor(configured: usize) -> usize {
-    configured / 2 + 1
 }
 
 fn create_ledger(state: &mut NameServiceState, log_index: u64, args: NewLedger) -> Response {
@@ -5212,85 +5179,42 @@ mod tests {
     }
 
     #[test]
-    fn set_eligibility_refuses_demotion_that_would_break_quorum() {
-        // 3 configured voters → quorum floor 2. Two are eligible;
-        // demoting one would drop to 1 — below floor. Apply refuses.
+    fn set_eligibility_allows_demoting_every_voter_in_sequence() {
+        // Worker eligibility and raft voting quorum are independent
+        // — the apply path imposes no minimum on
+        // `worker_eligible_voters`. An operator (or the monitor
+        // chasing a wave of unreachable peers) can drive eligibility
+        // all the way to empty; routing degrades gracefully
+        // (queues stall until eligibility is restored) rather than
+        // refusing to record the operator's intent.
         let mut state = NameServiceState::new();
         seed_voters(&mut state, [1, 2, 3]);
-        state.worker_eligible_voters.remove(&3);
-        // Now eligible = {1, 2}, configured = {1, 2, 3}, floor = 2.
 
-        let resp = apply(&mut state, set_eligibility(2, false), 1);
-
-        match resp {
-            Response::WorkerEligibilityRefused {
-                voter,
-                eligible,
-                reason:
-                    EligibilityRefusal::QuorumWouldBreak {
-                        configured_voter_count,
-                        currently_eligible_count,
-                        quorum_floor,
-                    },
-            } => {
-                assert_eq!(voter, 2);
-                assert!(!eligible);
-                assert_eq!(configured_voter_count, 3);
-                assert_eq!(currently_eligible_count, 2);
-                assert_eq!(quorum_floor, 2);
-            }
-            other => panic!("expected QuorumWouldBreak refusal, got {other:?}"),
+        for voter in [1, 2, 3] {
+            let resp = apply(&mut state, set_eligibility(voter, false), voter);
+            assert!(
+                matches!(
+                    resp,
+                    Response::WorkerEligibilitySet {
+                        changed: true,
+                        eligible: false,
+                        ..
+                    }
+                ),
+                "demoting voter {voter} should succeed regardless of remaining count, got {resp:?}"
+            );
         }
-        // The eligible set is unchanged.
-        assert_eq!(state.worker_eligible_voters.len(), 2);
-        assert!(state.worker_eligible_voters.contains(&2));
-    }
-
-    #[test]
-    fn set_eligibility_refuses_demotion_at_quorum_floor_exactly() {
-        // 4 configured voters → quorum floor 3. Three are eligible
-        // (exactly at the floor) — demoting any of them would drop
-        // to 2, below floor. Apply refuses.
-        let mut state = NameServiceState::new();
-        seed_voters(&mut state, [1, 2, 3, 4]);
-        state.worker_eligible_voters.remove(&4);
-        // Eligible = {1, 2, 3}, configured = {1, 2, 3, 4}, floor = 3.
-
-        let resp = apply(&mut state, set_eligibility(1, false), 1);
-
-        assert!(matches!(
-            resp,
-            Response::WorkerEligibilityRefused {
-                reason: EligibilityRefusal::QuorumWouldBreak { .. },
-                ..
-            }
-        ));
-        // No mutation.
-        assert!(state.worker_eligible_voters.contains(&1));
-    }
-
-    #[test]
-    fn set_eligibility_quorum_floor_matches_raft_majority_invariant() {
-        // 1 → floor 1, 2 → floor 2, 3 → floor 2, 4 → floor 3,
-        // 5 → floor 3, 6 → floor 4, 7 → floor 4. These line up
-        // with raft's standard `floor(N/2)+1` majority. Pin the
-        // helper directly so a refactor of `quorum_floor` can't
-        // quietly change the contract.
-        assert_eq!(quorum_floor(1), 1);
-        assert_eq!(quorum_floor(2), 2);
-        assert_eq!(quorum_floor(3), 2);
-        assert_eq!(quorum_floor(4), 3);
-        assert_eq!(quorum_floor(5), 3);
-        assert_eq!(quorum_floor(6), 4);
-        assert_eq!(quorum_floor(7), 4);
+        assert!(
+            state.worker_eligible_voters.is_empty(),
+            "every demote lands; eligible set drains to empty"
+        );
     }
 
     #[test]
     fn set_eligibility_apply_is_deterministic_for_back_to_back_flips() {
         // Same voter, opposite eligibility — exercises that each
         // apply observes the prior apply's mutation rather than the
-        // pre-state. Five-voter set so the demotion stays above the
-        // quorum floor.
+        // pre-state.
         let mut state = NameServiceState::new();
         seed_voters(&mut state, [10, 11, 12, 13, 14]);
 

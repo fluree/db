@@ -46,6 +46,16 @@ pub const DEFAULT_UNREACHABLE_AFTER: Duration = Duration::from_secs(15);
 /// between states once per tick.
 pub const DEFAULT_LIVE_AFTER: Duration = Duration::from_secs(5);
 
+/// Default minimum time between consecutive eligibility proposes
+/// for the same peer after a refusal. A refused propose (e.g.
+/// quorum-floor refusal) still commits a raft log entry that
+/// applies as a no-op; without backoff, the monitor would commit
+/// one such entry every [`DEFAULT_SAMPLE_INTERVAL`] until the
+/// refusal condition clears. Set well above the sample interval
+/// so the cost amortizes; small enough that a transient refusal
+/// resolves within an operator's normal failover patience.
+pub const DEFAULT_REFUSAL_BACKOFF: Duration = Duration::from_secs(30);
+
 /// Threshold tuning for the liveness monitor.
 #[derive(Clone, Debug)]
 pub struct LivenessConfig {
@@ -60,6 +70,11 @@ pub struct LivenessConfig {
     /// less than `unreachable_after` to keep the hysteresis window
     /// non-degenerate.
     pub live_after: Duration,
+    /// Minimum time between consecutive eligibility proposes for
+    /// the same peer after the prior one was refused. Caps the
+    /// raft-log commit rate when the refusal condition (e.g.
+    /// quorum-floor) is persistent.
+    pub refusal_backoff: Duration,
 }
 
 impl Default for LivenessConfig {
@@ -68,6 +83,7 @@ impl Default for LivenessConfig {
             sample_interval: DEFAULT_SAMPLE_INTERVAL,
             unreachable_after: DEFAULT_UNREACHABLE_AFTER,
             live_after: DEFAULT_LIVE_AFTER,
+            refusal_backoff: DEFAULT_REFUSAL_BACKOFF,
         }
     }
 }
@@ -109,6 +125,16 @@ struct PeerTracker {
     /// propose lands. Read as hysteresis: re-propose only when the
     /// desired proposal differs from this.
     last_proposed: Option<EligibilityProposal>,
+    /// Wall-clock when the most recent eligibility propose for this
+    /// peer was refused (or failed at the raft transport).
+    /// [`next_eligibility_proposal`] short-circuits while less than
+    /// [`LivenessConfig::refusal_backoff`] has elapsed since this
+    /// timestamp, preventing the monitor from committing a raft
+    /// log entry every sample tick when the refusal condition
+    /// hasn't cleared. Cleared whenever a propose lands
+    /// successfully — the underlying refusal (e.g. quorum-floor)
+    /// is by definition no longer in effect.
+    last_refused: Option<Instant>,
 }
 
 impl PeerTracker {
@@ -123,6 +149,7 @@ impl PeerTracker {
             unreachable_since: None,
             recovering_since: None,
             last_proposed: None,
+            last_refused: None,
         }
     }
 
@@ -138,6 +165,7 @@ impl PeerTracker {
             unreachable_since: None,
             recovering_since: None,
             last_proposed: Some(EligibilityProposal::Demote),
+            last_refused: None,
         }
     }
 }
@@ -254,15 +282,32 @@ impl LivenessMonitor {
                 }
             });
             record_replication_progress(tracker, peer_log, leader_last_log, now);
-            match next_eligibility_proposal(tracker, now, &self.config) {
-                Some(EligibilityProposal::Promote) if self.propose_eligible(peer_id).await => {
-                    tracker.last_proposed = Some(EligibilityProposal::Promote);
-                    tracker.recovering_since = None;
+            let Some(proposal) = next_eligibility_proposal(tracker, now, &self.config) else {
+                continue;
+            };
+            let landed = match proposal {
+                EligibilityProposal::Promote => self.propose_eligible(peer_id).await,
+                EligibilityProposal::Demote => self.propose_ineligible(peer_id).await,
+            };
+            if landed {
+                tracker.last_refused = None;
+                match proposal {
+                    EligibilityProposal::Promote => {
+                        tracker.last_proposed = Some(EligibilityProposal::Promote);
+                        tracker.recovering_since = None;
+                    }
+                    EligibilityProposal::Demote => {
+                        tracker.last_proposed = Some(EligibilityProposal::Demote);
+                    }
                 }
-                Some(EligibilityProposal::Demote) if self.propose_ineligible(peer_id).await => {
-                    tracker.last_proposed = Some(EligibilityProposal::Demote);
-                }
-                Some(_) | None => {}
+            } else {
+                // Stamp the refusal so [`next_eligibility_proposal`]
+                // short-circuits the next `refusal_backoff` worth of
+                // ticks for this peer — refused proposes still cost a
+                // raft log entry (committed and applied as no-op), so
+                // re-firing every sample tick on a persistent refusal
+                // is the bug this guards.
+                tracker.last_refused = Some(now);
             }
         }
         // Drop trackers for peers that left the voter set on a
@@ -388,11 +433,22 @@ fn record_replication_progress(
 /// [`PeerTracker::last_proposed`] (and clears
 /// [`PeerTracker::recovering_since`] on a successful promote) after
 /// landing the propose.
+///
+/// Returns `None` while the [`LivenessConfig::refusal_backoff`]
+/// window after a refused propose is still in effect — without
+/// this short-circuit, a persistent refusal (e.g. quorum-floor)
+/// would commit a raft log entry every sample tick until the
+/// underlying condition cleared.
 fn next_eligibility_proposal(
     tracker: &PeerTracker,
     now: Instant,
     config: &LivenessConfig,
 ) -> Option<EligibilityProposal> {
+    if let Some(refused_at) = tracker.last_refused {
+        if now.saturating_duration_since(refused_at) < config.refusal_backoff {
+            return None;
+        }
+    }
     if let Some(since) = tracker.unreachable_since {
         if now.saturating_duration_since(since) >= config.unreachable_after
             && tracker.last_proposed != Some(EligibilityProposal::Demote)
@@ -446,12 +502,13 @@ mod tests {
 
     fn fast_config() -> LivenessConfig {
         // Sub-second thresholds keep the tests deterministic and
-        // fast — the relevant invariant is the ordering of the
-        // two thresholds, not their absolute size.
+        // fast — the relevant invariants are the orderings between
+        // these durations, not their absolute size.
         LivenessConfig {
             sample_interval: Duration::from_millis(1),
             unreachable_after: Duration::from_millis(100),
             live_after: Duration::from_millis(30),
+            refusal_backoff: Duration::from_millis(200),
         }
     }
 
@@ -485,17 +542,20 @@ mod tests {
     ) -> Option<EligibilityProposal> {
         record_replication_progress(tracker, current_log, leader_last_log, now);
         let proposal = next_eligibility_proposal(tracker, now, config);
-        if apply_landed {
-            match proposal {
-                Some(EligibilityProposal::Promote) => {
-                    tracker.last_proposed = Some(EligibilityProposal::Promote);
-                    tracker.recovering_since = None;
-                }
-                Some(EligibilityProposal::Demote) => {
-                    tracker.last_proposed = Some(EligibilityProposal::Demote);
-                }
-                None => {}
+        match (proposal, apply_landed) {
+            (Some(EligibilityProposal::Promote), true) => {
+                tracker.last_proposed = Some(EligibilityProposal::Promote);
+                tracker.recovering_since = None;
+                tracker.last_refused = None;
             }
+            (Some(EligibilityProposal::Demote), true) => {
+                tracker.last_proposed = Some(EligibilityProposal::Demote);
+                tracker.last_refused = None;
+            }
+            (Some(_), false) => {
+                tracker.last_refused = Some(now);
+            }
+            (None, _) => {}
         }
         proposal
     }
@@ -674,13 +734,16 @@ mod tests {
     }
 
     #[test]
-    fn refused_demote_re_attempts_on_next_tick() {
-        // Quorum-floor scenario: monitor decides to demote, the
-        // state machine refuses (e.g. `QuorumWouldBreak`), apply
-        // didn't land. The tracker's `last_proposed` must stay
-        // unset so the next tick proposes Demote again — the
-        // refusal condition can clear later when quorum has
-        // headroom, and the monitor needs to retry then.
+    fn refused_demote_re_attempts_after_refusal_backoff() {
+        // Stale-propose scenario: monitor decides to demote, the
+        // state machine refuses (e.g. `VoterNotConfigured` because
+        // the target voter was removed between the metrics snapshot
+        // and the apply), or `client_write` fails at the transport
+        // layer. The tracker's `last_proposed` must stay unset so
+        // the next tick can re-propose once the refusal condition
+        // clears — but only after `refusal_backoff` elapses, so a
+        // persistent refusal doesn't commit a raft log entry every
+        // sample interval.
         let cfg = fast_config();
         let t0 = Instant::now();
         let mut tracker = PeerTracker::for_eligible_peer();
@@ -701,29 +764,49 @@ mod tests {
             "refused apply must not update last_proposed"
         );
 
-        // Next tick: still stuck, still want to demote. Without
-        // the fix, hysteresis would suppress this re-attempt.
+        // Within the backoff window, the refusal must not re-fire
+        // — otherwise the monitor would commit a raft log entry
+        // every sample tick on a persistent refusal (e.g. quorum
+        // floor).
         let t3 = t2 + cfg.sample_interval;
-        let second = tick(&mut tracker, Some(log_id(1, 5)), Some(20), t3, &cfg);
+        assert!(t3 < t2 + cfg.refusal_backoff);
+        let throttled = tick(&mut tracker, Some(log_id(1, 5)), Some(20), t3, &cfg);
+        assert_eq!(
+            throttled, None,
+            "within refusal_backoff window, monitor must not re-attempt"
+        );
+        assert_eq!(
+            tracker.last_proposed, None,
+            "throttled tick still leaves last_proposed unset"
+        );
+
+        // After the backoff window elapses, the same condition
+        // re-fires.
+        let t4 = t2 + cfg.refusal_backoff;
+        let second = tick(&mut tracker, Some(log_id(1, 5)), Some(20), t4, &cfg);
         assert_eq!(
             second,
             Some(EligibilityProposal::Demote),
-            "next tick must re-propose Demote because the prior apply didn't land"
+            "after refusal_backoff elapses, monitor re-proposes Demote"
         );
         assert_eq!(
             tracker.last_proposed,
             Some(EligibilityProposal::Demote),
             "landed apply updates last_proposed"
         );
+        assert!(
+            tracker.last_refused.is_none(),
+            "landed apply clears last_refused"
+        );
     }
 
     #[test]
-    fn refused_promote_re_attempts_on_next_tick() {
+    fn refused_promote_re_attempts_after_refusal_backoff() {
         // Symmetric to the refused-demote case for the promote
         // path: monitor has the peer marked Demote, the peer
         // recovers, monitor wants to promote, the apply doesn't
-        // land. The tracker's `last_proposed` must stay at Demote
-        // so the next tick re-proposes Promote.
+        // land. The next tick within `refusal_backoff` must NOT
+        // re-fire; once the backoff elapses the re-attempt does.
         let cfg = fast_config();
         let t0 = Instant::now();
         let mut tracker = PeerTracker::for_ineligible_peer();
@@ -731,7 +814,8 @@ mod tests {
         // First advance after demotion starts recovering_since.
         let t1 = t0 + cfg.sample_interval;
         let _ = tick_with_outcome(&mut tracker, Some(log_id(1, 6)), Some(10), t1, &cfg, true);
-        // Past the live_after threshold — monitor wants Promote.
+        // Past the live_after threshold — monitor wants Promote;
+        // simulate the apply being refused.
         let t2 = t1 + cfg.live_after;
         let first = tick_with_outcome(&mut tracker, Some(log_id(1, 7)), Some(10), t2, &cfg, false);
         assert_eq!(first, Some(EligibilityProposal::Promote));
@@ -740,15 +824,31 @@ mod tests {
             Some(EligibilityProposal::Demote),
             "refused promote leaves last_proposed at Demote"
         );
+        assert_eq!(
+            tracker.last_refused,
+            Some(t2),
+            "refused promote stamps last_refused"
+        );
 
-        // Next tick: peer still advancing, monitor still wants
-        // Promote because last_proposed is still Demote.
+        // Within the backoff window: throttled. The peer keeps
+        // advancing — otherwise `record_replication_progress`
+        // would interpret the stall as fresh lag and clear the
+        // recovery anchor.
         let t3 = t2 + cfg.sample_interval;
-        let second = tick(&mut tracker, Some(log_id(1, 8)), Some(10), t3, &cfg);
+        let throttled = tick(&mut tracker, Some(log_id(1, 8)), Some(10), t3, &cfg);
+        assert_eq!(
+            throttled, None,
+            "within refusal_backoff window, monitor must not re-attempt the Promote"
+        );
+
+        // After the backoff window: re-fires. Peer's log advances
+        // again so it continues to count as recovering.
+        let t4 = t2 + cfg.refusal_backoff;
+        let second = tick(&mut tracker, Some(log_id(1, 9)), Some(10), t4, &cfg);
         assert_eq!(
             second,
             Some(EligibilityProposal::Promote),
-            "next tick must re-propose Promote because the prior apply didn't land"
+            "after refusal_backoff elapses, monitor re-proposes Promote"
         );
     }
 
