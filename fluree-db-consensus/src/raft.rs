@@ -55,10 +55,19 @@
 //!   follower can already win elections, refuse to replicate, vote
 //!   against quorum, and propose arbitrary `client_write` commands
 //!   through normal raft.
-//! - The cluster-admin endpoints ([`admin`]) are gated by an
-//!   operator-credential layer (`require_admin_token`) at the
-//!   server level; the consensus RPCs themselves carry no
-//!   authentication of their own.
+//! - The cluster-admin endpoints ([`admin`]) carry no auth of
+//!   their own; mount points are expected to layer credential
+//!   middleware over `/cluster/*`. The in-tree server applies
+//!   `routes::admin_auth::require_admin_token` to that subtree,
+//!   but the middleware is a pass-through when the operator
+//!   hasn't set `admin_auth_mode = Required` in `ServerConfig` —
+//!   the default is `None`, so an out-of-the-box deployment leans
+//!   entirely on the network perimeter for admin protection.
+//!   Embedders that go through `RaftIntegration::private_router`
+//!   instead of the in-tree assembly get no layer at all and must
+//!   wrap the router themselves. The consensus RPCs under
+//!   `/raft/*` carry no authentication regardless of admin
+//!   configuration.
 //!
 //! Consequences of this posture, and what it leaves the code
 //! responsible for:
