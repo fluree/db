@@ -1098,6 +1098,15 @@ pub enum DesyncReason {
     /// Per-branch queue was drained by a head-mutating admin
     /// command between the worker's stage and apply.
     QueueCleared { reason: ClearReason },
+    /// Proposed `commit_t` doesn't strictly advance the branch's
+    /// current head. Fires when a worker stages on a stale local
+    /// view (a Fluree handle that lags the replicated `state.refs`
+    /// — post-leader-flip cold replica, backed-up event listener),
+    /// so the staged commit's `t` lands at or below the head the
+    /// state machine already published. The queue entry is left at
+    /// the front so the worker can retry once its local view
+    /// catches up.
+    HeadNotMonotonic { current_t: i64, proposed_t: i64 },
     /// State-machine invariant violation — apply was reached
     /// without a matching admin clear marker, but the queue is
     /// missing or empty. Surfaces as an error for investigation
@@ -2153,6 +2162,34 @@ fn apply_head(state: &mut NameServiceState, log_index: u64, args: StagedHead) ->
         Ok(entry) => entry,
         Err(resp) => return *resp,
     };
+
+    // Monotonicity guard: refuse to overwrite a head whose `t` is
+    // at least the proposed `commit_t`. Fires when a worker stages
+    // on a stale local view (a Fluree handle lagging the replicated
+    // `state.refs` — cold replica, backed-up event listener) and
+    // produces a `commit_t` that wouldn't advance the published
+    // head. Without this guard the apply would silently regress
+    // `t` and replace the head's content lineage with a non-
+    // descendant. Push the popped entry back at the front so the
+    // worker retries once its local view catches up.
+    if let Some(existing) = state.refs.get(&ref_key) {
+        if commit_t <= existing.t {
+            let current_t = existing.t;
+            state
+                .queues
+                .get_mut(&ref_key)
+                .expect("queue still present; just popped from it")
+                .push_front(entry);
+            return Response::QueueDesync {
+                ledger_id: full_ledger_id,
+                requested_queue_id: queue_id,
+                reason: DesyncReason::HeadNotMonotonic {
+                    current_t,
+                    proposed_t: commit_t,
+                },
+            };
+        }
+    }
 
     // Advance the branch's `RefEntry`, carrying forward index +
     // lineage state from any existing entry (matches the
@@ -3645,6 +3682,108 @@ mod tests {
                 t: 0,
             })
         );
+    }
+
+    #[test]
+    fn apply_head_refuses_commit_t_not_strictly_greater_than_current_head() {
+        // A worker whose local Fluree handle lags the replicated
+        // `state.refs` stages on an older base and produces a
+        // `commit_t` at or below the published head's `t`. Without
+        // the monotonicity guard, the apply would overwrite the
+        // head with a non-descendant commit and regress `t`. The
+        // guard refuses with `HeadNotMonotonic`, leaves the head
+        // intact, and pushes the popped queue entry back so the
+        // worker can retry once its local view catches up.
+        let mut state = NameServiceState::new();
+        apply(&mut state, create_ledger("test/db"), 1);
+        let enq = apply(&mut state, enqueue("test/db", "main", 7, None), 2);
+        let qid1 = match enq {
+            Response::Enqueued { queue_id, .. } => queue_id,
+            other => panic!("not Enqueued: {other:?}"),
+        };
+        // First apply succeeds and lifts the head to t=15.
+        let resp = apply(
+            &mut state,
+            apply_head_cmd("test/db", "main", qid1, cid(15), 15),
+            3,
+        );
+        assert!(matches!(resp, Response::HeadApplied { commit_t: 15, .. }));
+
+        // Enqueue a second entry, then attempt to apply it with a
+        // stale-base commit_t (would-be commit_t = 11, below the
+        // current head's t=15).
+        let enq2 = apply(&mut state, enqueue("test/db", "main", 8, None), 4);
+        let qid2 = match enq2 {
+            Response::Enqueued { queue_id, .. } => queue_id,
+            other => panic!("not Enqueued: {other:?}"),
+        };
+        let resp = apply(
+            &mut state,
+            apply_head_cmd("test/db", "main", qid2, cid(11), 11),
+            5,
+        );
+        match resp {
+            Response::QueueDesync {
+                reason:
+                    DesyncReason::HeadNotMonotonic {
+                        current_t,
+                        proposed_t,
+                    },
+                ..
+            } => {
+                assert_eq!(current_t, 15);
+                assert_eq!(proposed_t, 11);
+            }
+            other => panic!("expected HeadNotMonotonic, got {other:?}"),
+        }
+
+        // Head unchanged.
+        let ref_key = RefKey::new("test/db", "main");
+        let entry = state.refs.get(&ref_key).expect("ref still present");
+        assert_eq!(entry.head, cid(15));
+        assert_eq!(entry.t, 15);
+        // Queue entry pushed back so the worker can retry.
+        let queue = state.queues.get(&ref_key).expect("queue present");
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue.front().unwrap().queue_id, qid2);
+    }
+
+    #[test]
+    fn apply_head_refuses_commit_t_equal_to_current_head() {
+        // Strict monotonicity — equality is also a refusal,
+        // matching the `RefKind::CommitHead` rule on the explicit
+        // CAS path (state_machine.rs apply_cas_ref).
+        let mut state = NameServiceState::new();
+        apply(&mut state, create_ledger("test/db"), 1);
+        let qid1 = match apply(&mut state, enqueue("test/db", "main", 7, None), 2) {
+            Response::Enqueued { queue_id, .. } => queue_id,
+            other => panic!("not Enqueued: {other:?}"),
+        };
+        apply(
+            &mut state,
+            apply_head_cmd("test/db", "main", qid1, cid(20), 20),
+            3,
+        );
+
+        let qid2 = match apply(&mut state, enqueue("test/db", "main", 8, None), 4) {
+            Response::Enqueued { queue_id, .. } => queue_id,
+            other => panic!("not Enqueued: {other:?}"),
+        };
+        let resp = apply(
+            &mut state,
+            apply_head_cmd("test/db", "main", qid2, cid(21), 20),
+            5,
+        );
+        assert!(matches!(
+            resp,
+            Response::QueueDesync {
+                reason: DesyncReason::HeadNotMonotonic {
+                    current_t: 20,
+                    proposed_t: 20
+                },
+                ..
+            }
+        ));
     }
 
     #[test]

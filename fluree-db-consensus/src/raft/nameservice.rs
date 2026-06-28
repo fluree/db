@@ -463,6 +463,13 @@ fn describe_desync_reason(reason: &DesyncReason) -> String {
         DesyncReason::QueueCleared { reason } => {
             format!("queue cleared by admin command ({reason:?})")
         }
+        DesyncReason::HeadNotMonotonic {
+            current_t,
+            proposed_t,
+        } => format!(
+            "proposed commit_t {proposed_t} would not advance current head (t={current_t}); \
+             local Fluree handle is behind the replicated head"
+        ),
         DesyncReason::InvariantViolated { description } => {
             format!("state-machine invariant violated: {description}")
         }
