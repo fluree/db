@@ -426,16 +426,21 @@ fn build_apply_head_command(
 /// result.
 ///
 /// - [`SmResponse::HeadApplied`] → `Ok(())`.
-/// - [`SmResponse::QueueDesync`] → `Err(Storage)` with the reason
-///   inlined so callers can decide whether to retry. Common causes are
-///   admin preemption (`QueueCleared`), former-leader straggler
-///   proposals (`WrongFront`), or a state-machine invariant break.
+/// - [`SmResponse::QueueDesync`] → `Err(ApplyStale)` with the reason
+///   inlined. Common causes are admin preemption (`QueueCleared`),
+///   former-leader straggler proposals (`WrongFront`), a stale-base
+///   commit_t (`HeadNotMonotonic`), or a state-machine invariant
+///   break. The worker maps `ApplyStale` to `WorkerError::Stale`
+///   and drops its local install — same recovery shape as the
+///   follower-forward path, so the leader-owned worker doesn't
+///   loop on a condition that can't recover by retrying the same
+///   propose.
 /// - [`SmResponse::LedgerNotFound`] → `Err(not_found)`.
 /// - [`SmResponse::LedgerRetracted`] → `Err(Retracted)`. Terminal —
 ///   the branch was administratively retracted and any in-flight
-///   staged commit no longer applies; distinguished from `Storage`
-///   so the worker poisons with `BranchRetracted` instead of
-///   retrying.
+///   staged commit no longer applies; the worker drops the install
+///   and moves on (the retract command already drained the queue,
+///   so there's nothing to poison).
 /// - Anything else → `Err(Storage)`. None of the other variants are
 ///   reachable for an ApplyHead command; if one appears it's a
 ///   state-machine bug worth surfacing rather than swallowing.
@@ -446,7 +451,7 @@ fn map_apply_head_response(resp: SmResponse) -> Result<()> {
             ledger_id,
             requested_queue_id,
             reason,
-        } => Err(NameServiceError::storage(format!(
+        } => Err(NameServiceError::apply_stale(format!(
             "raft ApplyHead desynced on {ledger_id} (queue_id={requested_queue_id}): \
              {}",
             describe_desync_reason(&reason)
@@ -2119,6 +2124,30 @@ mod tests {
         let msg = r.expect_err("desync is error").to_string();
         assert!(msg.contains("queue_id=7"), "got: {msg}");
         assert!(msg.contains("12"), "got: {msg}");
+    }
+
+    #[test]
+    fn map_apply_head_response_queue_desync_is_apply_stale_not_storage() {
+        // The follower-forward path classifies QueueDesync as
+        // ApplyStale, which the worker maps to WorkerError::Stale
+        // (drop install, advance). Before this fix the leader-local
+        // path mapped the same SM signal to Storage, which the
+        // worker treated as a transport hiccup (WorkerError::Raft,
+        // backoff+retry). Leader-owned workers hitting a clear- or
+        // race-induced QueueDesync would loop on a condition that
+        // can't recover from re-proposing the same commit.
+        let r = map_apply_head_response(SmResponse::QueueDesync {
+            ledger_id: "test/db:main".into(),
+            requested_queue_id: 7,
+            reason: DesyncReason::WrongFront {
+                actual_queue_id: 12,
+            },
+        });
+        let err = r.expect_err("desync is error");
+        assert!(
+            matches!(err, NameServiceError::ApplyStale(_)),
+            "expected ApplyStale (drop-and-advance), got {err:?}"
+        );
     }
 
     #[test]
