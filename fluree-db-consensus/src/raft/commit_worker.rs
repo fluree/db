@@ -352,17 +352,25 @@ impl Worker {
                     // Queue front moved past our queue_id (admin
                     // clear or sibling worker race that landed a
                     // different commit). Our commit didn't land and
-                    // never will — drop the local install
-                    // (write_guard releases without `replace`, the
-                    // Fluree handle stays at its pre-stage head) and
-                    // let the run loop pick up the new queue front.
+                    // never will — release the staged commit blob
+                    // (no replicated head references it), drop the
+                    // local install (write_guard releases without
+                    // `replace`, the Fluree handle stays at its
+                    // pre-stage head), and let the run loop pick up
+                    // the new queue front.
+                    self.release_orphaned_commit_blob(&commit_id).await;
                     Ok(())
                 } else {
-                    // Apply didn't land. Drop `install` (write_guard
-                    // releases without calling `replace`, so this
-                    // node's Fluree handle stays at its pre-stage
-                    // head — same as every other node) and propagate
-                    // the error for the outer retry/poison logic.
+                    // Apply didn't land. Release the staged commit
+                    // blob — the next retry rebuilds the commit with
+                    // a fresh timestamp, producing a different
+                    // `commit_id`, so this one is orphaned. Drop
+                    // `install` (write_guard releases without
+                    // calling `replace`, so this node's Fluree
+                    // handle stays at its pre-stage head — same as
+                    // every other node) and propagate the error for
+                    // the outer retry/poison logic.
+                    self.release_orphaned_commit_blob(&commit_id).await;
                     Err(err)
                 }
             }
@@ -419,6 +427,32 @@ impl Worker {
             .refs
             .get(&self.ref_key)
             .is_some_and(|entry| &entry.head == commit_id)
+    }
+
+    /// Release the staged commit blob from the local content store.
+    /// Called on the orphan paths in [`Self::try_advance_head`] —
+    /// the entry's `commit_t` won't land (either the queue front
+    /// moved past us, or the publish failed and the next retry
+    /// will rebuild the commit with a fresh timestamp, producing a
+    /// different `commit_id`). Without this release, every
+    /// transport blip or sibling-worker race leaks one blob per
+    /// failed attempt with no GC path: `release_envelopes` covers
+    /// the request body, not the staged commit; the state machine
+    /// doesn't track unreferenced commit blobs.
+    ///
+    /// Best effort — a failed release is logged but doesn't abort
+    /// the worker's retry loop. `ContentStore::release` is
+    /// idempotent on non-existent CIDs.
+    async fn release_orphaned_commit_blob(&self, commit_id: &ContentId) {
+        let full_ledger_id = self.ref_key.ledger_id();
+        let content_store = self.staging.fluree.content_store(&full_ledger_id);
+        if let Err(err) = content_store.release(commit_id).await {
+            warn!(
+                commit_id = %commit_id,
+                error = %err,
+                "failed to release orphaned commit blob; CAS will accumulate one entry"
+            );
+        }
     }
 
     /// Install staged ledger state through the held write guard
