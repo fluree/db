@@ -243,6 +243,21 @@ impl FlakeValue {
         )
     }
 
+    /// Canonical XSD datatype `Sid` for arbitrary-precision numerics.
+    ///
+    /// `BigInt` and `BigDecimal` share the NUM_BIG_OVERFLOW arena and the same
+    /// late-materialization `EncodedLit` (whose `dt_id` is hardcoded), so their
+    /// datatype can only be recovered from the value variant — not from the
+    /// `o_type` or `dt_id`. Returns `None` for every other variant (whose
+    /// datatype is already named by its `o_type`).
+    pub fn overflow_numeric_datatype_sid(&self) -> Option<Sid> {
+        match self {
+            FlakeValue::BigInt(_) => Some(Sid::xsd_integer()),
+            FlakeValue::Decimal(_) => Some(Sid::xsd_decimal()),
+            _ => None,
+        }
+    }
+
     /// Check if this is any temporal type (DateTime, Date, Time, g-types)
     pub fn is_temporal(&self) -> bool {
         matches!(
