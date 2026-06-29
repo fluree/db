@@ -33,6 +33,7 @@ use fluree_db_query::BinaryRangeProvider;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 use tracing::Instrument;
 
 /// Receipt returned after a successful commit
@@ -430,6 +431,7 @@ pub async fn build_commit(
     index_config: &IndexConfig,
     opts: CommitOpts,
 ) -> Result<StagedCommit> {
+    let total_started = Instant::now();
     // 1. Extract flakes from view
     let (mut base, flakes) = view.into_parts();
 
@@ -583,6 +585,7 @@ pub async fn build_commit(
     let signing = signing_key
         .as_ref()
         .map(|key| (key.as_ref(), ledger_id_for_publish.as_str()));
+    let serialize_started = Instant::now();
     let signed = {
         let span = tracing::debug_span!("commit_serialize_commit_blob");
         let _g = span.enter();
@@ -590,6 +593,24 @@ pub async fn build_commit(
     };
     let commit_cid = ContentId::new(ContentKind::Commit, &signed.bytes);
     commit_record.id = Some(commit_cid.clone());
+    tracing::info!(
+        target: "fluree::tx_timing",
+        phase = "commit_serialize_commit_blob",
+        commit_t = new_t,
+        flake_count,
+        commit_bytes = signed.bytes.len(),
+        elapsed_ms = serialize_started.elapsed().as_millis() as u64,
+        "transaction timing"
+    );
+    tracing::info!(
+        target: "fluree::tx_timing",
+        phase = "build_commit_total",
+        commit_t = new_t,
+        flake_count,
+        commit_bytes = signed.bytes.len(),
+        elapsed_ms = total_started.elapsed().as_millis() as u64,
+        "transaction timing"
+    );
 
     Ok(StagedCommit {
         commit: commit_record,
@@ -687,17 +708,35 @@ where
     //    then write the commit blob via put_with_id (idempotent).
     let write_and_publish = async {
         for (cid, bytes) in &referenced_bytes {
+            let referenced_started = Instant::now();
             content_store
                 .put_with_id(cid, bytes)
                 .instrument(tracing::debug_span!("commit_write_referenced_blob"))
                 .await?;
+            tracing::info!(
+                target: "fluree::tx_timing",
+                phase = "commit_write_referenced_blob",
+                commit_t = new_t,
+                blob_bytes = bytes.len(),
+                elapsed_ms = referenced_started.elapsed().as_millis() as u64,
+                "transaction timing"
+            );
         }
         {
             let span = tracing::debug_span!("commit_write_commit_blob");
             let _g = span.enter();
+            let write_started = Instant::now();
             content_store
                 .put_with_id(&commit_cid, &commit_bytes)
                 .await?;
+            tracing::info!(
+                target: "fluree::tx_timing",
+                phase = "commit_write_commit_blob",
+                commit_t = new_t,
+                commit_bytes = commit_bytes.len(),
+                elapsed_ms = write_started.elapsed().as_millis() as u64,
+                "transaction timing"
+            );
             tracing::info!(commit_bytes = commit_bytes.len(), "commit blob stored");
         }
 
@@ -706,6 +745,7 @@ where
             id: Some(commit_cid.clone()),
             t: new_t,
         };
+        let publish_started = Instant::now();
         let publish_result = if skip_sequencing {
             nameservice
                 .fast_forward_commit(ledger_id_for_publish.as_str(), &new_head_ref, 3)
@@ -722,6 +762,14 @@ where
                 .instrument(tracing::debug_span!("commit_publish_nameservice"))
                 .await?
         };
+        tracing::info!(
+            target: "fluree::tx_timing",
+            phase = "commit_publish_nameservice",
+            commit_t = new_t,
+            skip_sequencing,
+            elapsed_ms = publish_started.elapsed().as_millis() as u64,
+            "transaction timing"
+        );
         match publish_result {
             CasResult::Updated => {}
             CasResult::Conflict { actual } if skip_sequencing => {
@@ -772,7 +820,18 @@ where
     // `txn_id_for_release` value falls out of scope.
     let _ = txn_id_for_release;
 
-    finalize_state_with_base(commit_record, commit_cid, new_t, flake_count, base)
+    let finalize_started = Instant::now();
+    let finalized = finalize_state_with_base(commit_record, commit_cid, new_t, flake_count, base);
+    tracing::info!(
+        target: "fluree::tx_timing",
+        phase = "commit_finalize_state",
+        commit_t = new_t,
+        flake_count,
+        ok = finalized.is_ok(),
+        elapsed_ms = finalize_started.elapsed().as_millis() as u64,
+        "transaction timing"
+    );
+    finalized
 }
 
 fn finalize_state_with_base(
