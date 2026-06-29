@@ -1459,6 +1459,27 @@ fn history_shows_changes() {
         .args(["history", "ex:alice", "--format", "json"])
         .assert()
         .success();
+
+    // Default (table) output must render the records, not blank `?` cells.
+    let assert = fluree_cmd(&tmp)
+        .args(["history", "ex:alice"])
+        .assert()
+        .success()
+        // Header + populated value cells.
+        .stdout(predicate::str::contains("predicate"))
+        .stdout(predicate::str::contains("Alice Smith"))
+        .stdout(predicate::str::contains("ex:name"));
+
+    // The pre-fix bug produced a `?` op column. comfy-table pads each cell to
+    // the column width, so the raw output is `| ?  |` (header "op" is 2 wide),
+    // never `| ? |` — asserting on the raw form would never catch a regression.
+    // Collapse whitespace first so a `?` op cell surfaces as `| ? |`.
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    let normalized = stdout.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        !normalized.contains("| ? |"),
+        "op column should render +/- not `?`; got:\n{stdout}"
+    );
 }
 
 #[test]
