@@ -1,9 +1,9 @@
 # openCypher Support Matrix
 
-A tracked feature matrix for Fluree's [openCypher](../concepts/cypher.md)
+A tracked feature matrix for Fluree's [openCypher](../query/cypher.md)
 surface, against **openCypher 9** (the Cypher 9 language reference the
 [openCypher TCK](https://github.com/opencypher/openCypher) exercises). For
-syntax and semantics see [Cypher (concept)](../concepts/cypher.md); for recipes
+syntax and semantics see [Cypher (concept)](../query/cypher.md); for recipes
 see the [Cypher cookbook](../guides/cookbook-cypher.md).
 
 ## Legend
@@ -127,7 +127,7 @@ These shape everything below; read them first.
 This is a hand-maintained matrix, not yet a TCK-driven report. When a Cypher
 feature lands or a divergence changes:
 
-1. Update the relevant row here **and** the [concept doc](../concepts/cypher.md).
+1. Update the relevant row here **and** the [concept doc](../query/cypher.md).
 2. Prefer ⟂ over ⏳ when the divergence is an intentional RDF-model choice —
    and record *why* in the Notes column.
 

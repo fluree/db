@@ -4,7 +4,7 @@ Fluree accepts a subset of [openCypher 9][opencypher] on top of the same query
 IR and transaction pipeline as JSON-LD and SPARQL — the planner, executor, and
 result formatter are shared across all three surfaces. A Cypher
 relationship-with-properties — `(a)-[:WORKS_FOR {role: "..."}]->(b)` — maps to
-Fluree's edge-annotation primitive ([concept](edge-annotations.md),
+Fluree's edge-annotation primitive ([concept](../concepts/edge-annotations.md),
 [internals](../design/edge-annotations.md)), so property-graph edges and RDF
 quoted-triple annotations are the same data read from two angles.
 
@@ -219,7 +219,7 @@ ORDER BY / SKIP / LIMIT
   - **Identity:** `id(n)` / `elementId(n)` return the node/relationship's **IRI
     string** — Fluree has no integer element id, so this is its stable string
     identity (differs from Neo4j's integer `id`).
-- `WHERE` expressions: comparison, AND/OR/NOT, arithmetic +/-/*//, `^`,
+- `WHERE` expressions: comparison, AND/OR/XOR/NOT, arithmetic `+ - * / %`, `^`,
   STARTS WITH / ENDS WITH / CONTAINS, IS NULL / IS NOT NULL,
   `expr IN [a, b, ...]`, `CASE WHEN ... THEN ... END` (simple and
   subject forms), `EXISTS { pattern }` and the subquery form
@@ -238,6 +238,10 @@ ORDER BY / SKIP / LIMIT
   filter to age-bearing nodes above 30 (the `>` comparison on an
   unbound binding yields filter-context false). Bare-variable
   target only in v1; chained accessors (`n.a.b`) are rejected.
+- Temporal component accessors — `d.year`, `d.month`, `d.day`, `d.hour`,
+  `d.minute`, `d.second` extract a component of a date/dateTime-valued property
+  as an integer (e.g. `WHERE p.birthDate.year < 1990`). This is the one
+  property-accessor chain that is *not* rejected.
 - ORDER BY (variable, property-accessor, or general expression keys —
   e.g. `ORDER BY toInteger(n.id)`), SKIP, LIMIT.
 - `UNWIND [literals] AS x` — inline list literal unwinding, and
@@ -414,7 +418,7 @@ let committed = fluree.transact_cypher(ledger, cypher).await?;
 ```
 
 Writes default to LPG mode, where every relationship reifies (carries an
-annotation identity). See [Edge annotations](edge-annotations.md) for the RDF
+annotation identity). See [Edge annotations](../concepts/edge-annotations.md) for the RDF
 vs. LPG modes and the retraction semantics that follow from them.
 
 ## Not yet supported
@@ -445,7 +449,6 @@ produces a clear error rather than a silent wrong answer.
 
 **Expressions**
 
-- `^` (exponent).
 - Chained property accessors (`n.a.b` — bind an intermediate via `WITH`).
 - `NULL` literals; aggregates inside `CASE` / `EXISTS`.
 
@@ -466,9 +469,9 @@ produces a clear error rather than a silent wrong answer.
 
 ## See also
 
-- [Edge annotations (concept)](edge-annotations.md) — the storage primitive
+- [Edge annotations (concept)](../concepts/edge-annotations.md) — the storage primitive
   Cypher relationships sit on top of.
 - [Edge annotations (storage internals)](../design/edge-annotations.md) — the
   `f:reifies*` durable encoding.
-- [SPARQL](../query/sparql.md) and [JSON-LD Query](../query/jsonld-query.md) —
+- [SPARQL](sparql.md) and [JSON-LD Query](jsonld-query.md) —
   the parallel surfaces over the same IR.

@@ -1,14 +1,14 @@
 # Cookbook: Cypher
 
-Practical recipes for querying and writing Fluree with [openCypher](../concepts/cypher.md).
+Practical recipes for querying and writing Fluree with [openCypher](../query/cypher.md).
 Cypher runs on the same engine as JSON-LD and SPARQL, and Cypher relationships
 are stored as [edge annotations](../concepts/edge-annotations.md) — so data
 written here is readable from every surface.
 
 Examples assume a ledger whose default `@context` maps the bare names
-(`Person`, `KNOWS`, `name`, …) — see [IRI mapping](../concepts/cypher.md#iri-mapping-for-bare-identifiers).
+(`Person`, `KNOWS`, `name`, …) — see [IRI mapping](../query/cypher.md#iri-mapping-for-bare-identifiers).
 For how to send these statements (Rust / CLI / HTTP), see
-[Running Cypher](../concepts/cypher.md#running-cypher).
+[Running Cypher](../query/cypher.md#running-cypher).
 
 ## Model a property graph
 
@@ -39,7 +39,7 @@ RETURN p.name, r.role, o.name
 > filtering on its properties reads the *reified* edge (bag semantics, one row
 > per relationship). Without the variable (`-[:T]->`) you get the plain triple
 > (set semantics) and see every base edge, including ones not written through
-> Cypher/`@annotation`. See [relationship lowering](../concepts/cypher.md#relationship-lowering--three-shapes-three-behaviors).
+> Cypher/`@annotation`. See [relationship lowering](../query/cypher.md#relationship-lowering--three-shapes-three-behaviors).
 
 Optional matches and filters:
 
@@ -87,8 +87,10 @@ map value too — `$filter = {city: "NYC"}` can be passed and returned as-is.
 MERGE (p:Person {email: "alice@example.com"})
 ON CREATE SET p.created = 2024
 ON MATCH SET p.lastSeen = 2024
-RETURN p
 ```
+
+(A Cypher write returns a commit receipt, not query rows — there is no
+row-returning `RETURN` on a write statement.)
 
 `MERGE` also works on a relationship. Standalone, the whole path is the match
 key and missing endpoints are created:
@@ -278,8 +280,8 @@ surface as the same edge with the same `role` metadata — see
 
 ## See also
 
-- [Cypher (concept)](../concepts/cypher.md) — supported surface, RDF mapping,
-  and what's [not yet supported](../concepts/cypher.md#not-yet-supported).
+- [Cypher (concept)](../query/cypher.md) — supported surface, RDF mapping,
+  and what's [not yet supported](../query/cypher.md#not-yet-supported).
 - [Edge annotations](../concepts/edge-annotations.md) — the storage model behind
   Cypher relationships.
 - [Query patterns](cookbook-query-patterns.md) — the generic operators
