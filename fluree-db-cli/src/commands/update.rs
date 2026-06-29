@@ -134,45 +134,31 @@ pub async fn run(
 
             print_txn_result(&result);
         }
-        LedgerMode::Local { fluree, alias } => match txn_format {
-            UpdateFormat::SparqlUpdate => {
-                let policy_ctx = build_policy_ctx(&fluree, &alias, policy).await?;
-                let graph = fluree.graph(&alias);
-                let mut b = graph
-                    .transact()
-                    .sparql_update(&content)
-                    .commit_opts(CommitOpts::default());
-                if let Some(ctx) = policy_ctx {
-                    b = b.policy(ctx);
-                }
-                let result = b.commit().await?;
+        LedgerMode::Local { fluree, alias } => {
+            // Parse JSON-LD up front so the body outlives the borrowed builder.
+            let json = match txn_format {
+                UpdateFormat::JsonLd => Some(serde_json::from_str::<serde_json::Value>(&content)?),
+                UpdateFormat::SparqlUpdate => None,
+            };
+            let policy_ctx = build_policy_ctx(&fluree, &alias, policy).await?;
+            let graph = fluree.graph(&alias);
+            let txn = graph.transact().commit_opts(CommitOpts::default());
+            let txn = match &json {
+                Some(j) => txn.update(j),
+                None => txn.sparql_update(&content),
+            };
+            let txn = match policy_ctx {
+                Some(ctx) => txn.policy(ctx),
+                None => txn,
+            };
+            let result = txn.commit().await?;
 
-                println!(
-                    "Committed t={}, {} flakes",
-                    result.receipt.t, result.receipt.flake_count
-                );
-                warn_novelty_if_needed(&result.indexing);
-            }
-            UpdateFormat::JsonLd => {
-                let json: serde_json::Value = serde_json::from_str(&content)?;
-                let policy_ctx = build_policy_ctx(&fluree, &alias, policy).await?;
-                let graph = fluree.graph(&alias);
-                let mut b = graph
-                    .transact()
-                    .update(&json)
-                    .commit_opts(CommitOpts::default());
-                if let Some(ctx) = policy_ctx {
-                    b = b.policy(ctx);
-                }
-                let result = b.commit().await?;
-
-                println!(
-                    "Committed t={}, {} flakes",
-                    result.receipt.t, result.receipt.flake_count
-                );
-                warn_novelty_if_needed(&result.indexing);
-            }
-        },
+            println!(
+                "Committed t={}, {} flakes",
+                result.receipt.t, result.receipt.flake_count
+            );
+            warn_novelty_if_needed(&result.indexing);
+        }
     }
 
     Ok(())
