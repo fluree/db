@@ -826,8 +826,9 @@ impl Novelty {
         }
 
         // Record every kept flake (assert + retract) into the current-state
-        // index, per graph in batch order so the latest op per identity wins.
-        // After the keep loop, so within-batch decisions saw only prior state.
+        // index. `record` resolves lifecycle order-independently (highest-t
+        // wins, same-t retract wins), so batch order doesn't matter. After the
+        // keep loop, so within-batch dedup decisions saw only prior state.
         for (&g_id, batch) in &per_graph {
             for flake in batch {
                 self.fact_state.record(g_id, flake);
@@ -1230,8 +1231,11 @@ impl Novelty {
     /// - If leftmost=false: left boundary is EXCLUSIVE (> first)
     /// - If leftmost=true: no left boundary
     /// - rhs is INCLUSIVE when present
+    ///
+    /// Crate-internal: the owned ids it returns are read-scoped (see
+    /// [`Self::get_flake`]). External readers use [`Self::range_flakes`].
     #[must_use]
-    pub fn slice_for_range(
+    pub(crate) fn slice_for_range(
         &self,
         g_id: GraphId,
         index: IndexType,
@@ -1260,7 +1264,14 @@ impl Novelty {
     }
 
     /// Resolve a [`FlakeId`] produced by this novelty back to its flake.
-    pub fn get_flake(&self, id: FlakeId) -> &Flake {
+    ///
+    /// Crate-internal on purpose: a `FlakeId` is read-scoped (it encodes the
+    /// current segment layout), so resolving one after a segment-rebuilding
+    /// mutation would panic or return the wrong flake. Keeping the resolver
+    /// `pub(crate)` makes that hazard unreachable from other crates — external
+    /// readers use the borrow-safe [`Self::range_flakes`] / [`Self::iter_flakes`]
+    /// / `for_each_overlay_flake` which yield `&Flake` directly.
+    pub(crate) fn get_flake(&self, id: FlakeId) -> &Flake {
         let segs = self.graphs[id.graph()]
             .as_ref()
             .expect("FlakeId references a live graph");
@@ -2152,6 +2163,36 @@ mod tests {
             n.len(),
             before,
             "re-assert after compaction must still dedup"
+        );
+    }
+
+    /// A same-`t` assert+retract of one identity must resolve to ABSENT in
+    /// `fact_state` (retract wins, matching overlay lifecycle resolution), so a
+    /// later re-assert is KEPT, not silently deduped. Stage-level cancellation
+    /// normally prevents such a pair from a live commit, but `bulk_apply_commits`
+    /// (cold load) replays raw persisted flakes, so `fact_state` must not depend
+    /// on that invariant — otherwise the re-assert would be dropped (data loss).
+    #[test]
+    fn same_t_assert_retract_keeps_later_reassert() {
+        let rg = no_graphs();
+        let mut n = Novelty::new(0);
+
+        // One commit at t=1 carrying both ops for the same identity (s=7,p=1,o=1).
+        let commit = vec![
+            make_flake(7, 1, 1, 1, true),  // assert
+            make_flake(7, 1, 1, 1, false), // retract, same identity, same t
+        ];
+        n.bulk_apply_commits(vec![(commit, 1)], &rg).unwrap();
+        let before = n.len();
+
+        // Re-assert the same identity at a later t: the fact was absent (same-t
+        // retract won), so this must be kept rather than deduped.
+        n.apply_commit(vec![make_flake(7, 1, 1, 2, true)], 2, &rg)
+            .unwrap();
+        assert_eq!(
+            n.len(),
+            before + 1,
+            "re-assert after a same-t assert/retract must be kept, not deduped"
         );
     }
 
