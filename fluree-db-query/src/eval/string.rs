@@ -646,6 +646,131 @@ pub fn eval_str_lang<R: RowAccess>(
     }
 }
 
+/// Cypher `replace(original, search, replacement)` — LITERAL (non-regex)
+/// replace-all of every occurrence of `search`.
+pub fn eval_replace_all<R: RowAccess>(
+    args: &[Expression],
+    row: &R,
+    ctx: Option<&ExecutionContext<'_>>,
+) -> Result<Option<ComparableValue>> {
+    check_arity(args, 3, "replace")?;
+    let lang = extract_lang_tag(&args[0], row, ctx);
+    let input = args[0].eval_to_comparable(row, ctx)?;
+    let search = args[1].eval_to_comparable(row, ctx)?;
+    let replacement = args[2].eval_to_comparable(row, ctx)?;
+    match (
+        input.as_ref().and_then(ComparableValue::as_str),
+        search.as_ref().and_then(ComparableValue::as_str),
+        replacement.as_ref().and_then(ComparableValue::as_str),
+    ) {
+        (Some(s), Some(from), Some(to)) => {
+            if let Some(ctx) = ctx {
+                ctx.tracker.consume_fuel(1)?;
+            }
+            // Empty search would loop forever in some implementations; std's
+            // replace handles it (inserts between chars), but Cypher returns the
+            // input unchanged for an empty search.
+            let out = if from.is_empty() {
+                s.to_string()
+            } else {
+                s.replace(from, to)
+            };
+            Ok(Some(string_with_lang(&out, lang)))
+        }
+        _ if input.is_none() || search.is_none() || replacement.is_none() => Ok(None),
+        _ => Err(QueryError::InvalidFilter(
+            "replace() requires string arguments".to_string(),
+        )),
+    }
+}
+
+/// Cypher `trim` / `ltrim` / `rtrim` — strip surrounding whitespace.
+pub fn eval_trim<R: RowAccess>(
+    args: &[Expression],
+    row: &R,
+    ctx: Option<&ExecutionContext<'_>>,
+    side: TrimSide,
+) -> Result<Option<ComparableValue>> {
+    let name = side.fn_name();
+    check_arity(args, 1, name)?;
+    let lang = extract_lang_tag(&args[0], row, ctx);
+    match args[0].eval_to_comparable(row, ctx)? {
+        Some(v) => match v.as_str() {
+            Some(s) => {
+                let trimmed = match side {
+                    TrimSide::Both => s.trim(),
+                    TrimSide::Left => s.trim_start(),
+                    TrimSide::Right => s.trim_end(),
+                };
+                Ok(Some(string_with_lang(trimmed, lang)))
+            }
+            None => Err(QueryError::InvalidFilter(format!(
+                "{name}() requires a string argument"
+            ))),
+        },
+        None => Ok(None),
+    }
+}
+
+/// Cypher `left(s, n)` / `right(s, n)` — first / last `n` characters
+/// (character-based; clamps when `n` exceeds the length, returns empty for
+/// `n <= 0`).
+pub fn eval_left_right<R: RowAccess>(
+    args: &[Expression],
+    row: &R,
+    ctx: Option<&ExecutionContext<'_>>,
+    from_left: bool,
+) -> Result<Option<ComparableValue>> {
+    let name = if from_left { "left" } else { "right" };
+    check_arity(args, 2, name)?;
+    let lang = extract_lang_tag(&args[0], row, ctx);
+    let s = args[0].eval_to_comparable(row, ctx)?;
+    let n = args[1].eval_to_comparable(row, ctx)?;
+    let (s, n) = match (s, n) {
+        (Some(s), Some(n)) => (s, n),
+        _ => return Ok(None),
+    };
+    let Some(s) = s.as_str() else {
+        return Err(QueryError::InvalidFilter(format!(
+            "{name}() requires a string first argument"
+        )));
+    };
+    let n = match n {
+        ComparableValue::Long(n) => n.max(0) as usize,
+        _ => {
+            return Err(QueryError::InvalidFilter(format!(
+                "{name}() requires an integer length"
+            )))
+        }
+    };
+    let total = s.chars().count();
+    let take = n.min(total);
+    let out: String = if from_left {
+        s.chars().take(take).collect()
+    } else {
+        s.chars().skip(total - take).collect()
+    };
+    Ok(Some(string_with_lang(&out, lang)))
+}
+
+/// Which side(s) a [`eval_trim`] call strips.
+#[derive(Clone, Copy)]
+pub enum TrimSide {
+    Both,
+    Left,
+    Right,
+}
+
+impl TrimSide {
+    fn fn_name(self) -> &'static str {
+        match self {
+            TrimSide::Both => "trim",
+            TrimSide::Left => "ltrim",
+            TrimSide::Right => "rtrim",
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -25,8 +25,11 @@ mod fulltext;
 mod geo;
 mod hash;
 mod helpers;
+mod iter;
 mod list;
 mod logical;
+mod metadata;
+pub(crate) mod metadata_resolve;
 mod numeric;
 mod path;
 mod rdf;
@@ -68,11 +71,34 @@ impl Expression {
 
             Expression::Call { func, args } => func.eval_to_bool(args, row, ctx),
 
-            // EXISTS subexpressions in compound filters are pre-evaluated by the
-            // FilterOperator and replaced with Const(Bool) before this is called.
-            // If we reach here, it means the EXISTS was not pre-evaluated (bug).
+            // A map's effective boolean value: non-empty is truthy.
+            Expression::Map(_) => Ok((&self.try_eval_to_binding(row, ctx)?).into()),
+
+            // A list predicate is already boolean (null → false in EBV).
+            Expression::ListPredicate {
+                kind,
+                var,
+                list,
+                predicate,
+            } => Ok(
+                iter::eval_list_predicate(*kind, *var, list, predicate, row, ctx)?.unwrap_or(false),
+            ),
+
+            // Comprehension / reduce / member / a resolved value — EBV of it.
+            Expression::ListComprehension { .. }
+            | Expression::Reduce { .. }
+            | Expression::Member { .. }
+            | Expression::Resolved(_) => Ok((&self.try_eval_to_binding(row, ctx)?).into()),
+
+            // EXISTS / pattern comprehensions are pre-resolved per row by the
+            // Filter/Bind operators (replaced with Const(Bool) / Resolved). If we
+            // reach here, it means resolution didn't run (bug).
             Expression::Exists { .. } => {
                 tracing::warn!("EXISTS subexpression not pre-evaluated; treating as false");
+                Ok(false)
+            }
+            Expression::PatternComprehension { .. } => {
+                tracing::warn!("pattern comprehension not pre-resolved; treating as false");
                 Ok(false)
             }
         }
@@ -180,7 +206,9 @@ impl Expression {
                 // A path or list is not a scalar — no comparable value. The
                 // relevant functions (`length`, `size`/`head`/…) read the
                 // binding directly via dispatch / the binding-producing path.
-                Some(Binding::Path(_) | Binding::List(_)) => Ok(None),
+                Some(
+                    Binding::Path { .. } | Binding::Rel(_) | Binding::List(_) | Binding::Map(_),
+                ) => Ok(None),
             },
 
             // FlakeValue::Null is the only variant TryFrom rejects (with
@@ -188,6 +216,38 @@ impl Expression {
             Expression::Const(val) => Ok(val.try_into().ok()),
 
             Expression::Call { func, args } => func.eval(args, row, ctx),
+
+            // A map / comprehension / reduce is a structured value — no scalar
+            // form; consumers read the binding via `try_eval_to_binding`.
+            Expression::Map(_)
+            | Expression::ListComprehension { .. }
+            | Expression::Reduce { .. }
+            | Expression::PatternComprehension { .. } => Ok(None),
+
+            // A resolved value (pattern-comprehension list) — its comparable form.
+            Expression::Resolved(b) => Ok(list::element_to_comparable(b)),
+
+            // A list predicate is a boolean scalar.
+            Expression::ListPredicate {
+                kind,
+                var,
+                list,
+                predicate,
+            } => Ok(
+                iter::eval_list_predicate(*kind, *var, list, predicate, row, ctx)?
+                    .map(ComparableValue::Bool),
+            ),
+
+            // Member access yields a value; expose its comparable form (a scalar
+            // property is comparable; a map/list value collapses to None).
+            Expression::Member {
+                target,
+                key,
+                predicate_iri,
+            } => {
+                let b = iter::eval_member(target, key, predicate_iri, row, ctx)?;
+                Ok(list::element_to_comparable(&b))
+            }
 
             // EXISTS: pre-evaluated by FilterOperator; shouldn't reach here
             Expression::Exists { .. } => {
@@ -256,15 +316,70 @@ impl Expression {
         row: &R,
         ctx: Option<&ExecutionContext<'_>>,
     ) -> Result<Binding> {
-        // A bare variable may hold a `List` binding, which can't round-trip
-        // through `ComparableValue` (it would collapse to Unbound). Return it
-        // directly so `UNWIND ?listVar` and the collect→unwind round-trip
-        // preserve the list. Scalars fall through to the comparable path so
-        // their normalization is unchanged.
+        // A bare variable may hold a `List` or `Map` binding, which can't
+        // round-trip through `ComparableValue` (it would collapse to Unbound).
+        // Return it directly so reuse preserves the structured value — e.g.
+        // `UNWIND ?listVar`, the collect→unwind round-trip, and nesting a map
+        // var inside another value (`WITH properties(n) AS p RETURN {props: p}`).
+        // Scalars fall through to the comparable path so normalization is
+        // unchanged.
         if let Expression::Var(v) = self {
-            if let Some(b @ Binding::List(_)) = row.get(*v) {
+            if let Some(b @ (Binding::List(_) | Binding::Map(_))) = row.get(*v) {
                 return Ok(b.clone());
             }
+        }
+
+        // A map literal builds a `Binding::Map` directly (values evaluated per
+        // row, insertion order preserved, duplicate keys resolved last-wins).
+        if let Expression::Map(entries) = self {
+            let mut out: Vec<(Arc<str>, Binding)> = Vec::with_capacity(entries.len());
+            for (key, value_expr) in entries {
+                let value = value_expr.try_eval_to_binding(row, ctx)?;
+                if let Some(slot) = out.iter_mut().find(|(k, _)| k == key) {
+                    slot.1 = value; // last-wins
+                } else {
+                    out.push((Arc::clone(key), value));
+                }
+            }
+            return Ok(Binding::Map(out));
+        }
+
+        // A pre-resolved value (a pattern-comprehension list) is returned as-is.
+        if let Expression::Resolved(b) = self {
+            return Ok((**b).clone());
+        }
+
+        // Scoped list-iteration and eval-time member access produce structured
+        // values directly (a List / the accumulator / a looked-up value).
+        match self {
+            Expression::ListComprehension {
+                var,
+                list,
+                filter,
+                map,
+            } => {
+                return iter::eval_list_comprehension(
+                    *var,
+                    list,
+                    filter.as_deref(),
+                    map.as_deref(),
+                    row,
+                    ctx,
+                );
+            }
+            Expression::Reduce {
+                acc,
+                init,
+                var,
+                list,
+                body,
+            } => return iter::eval_reduce(*acc, init, *var, list, body, row, ctx),
+            Expression::Member {
+                target,
+                key,
+                predicate_iri,
+            } => return iter::eval_member(target, key, predicate_iri, row, ctx),
+            _ => {}
         }
 
         // List-*returning* functions (tail, list-reverse) and list literals

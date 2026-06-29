@@ -203,7 +203,7 @@ fn write_value(
             out.push(']');
         }
         // A path renders as an array of `{"@id": ...}` node references.
-        Binding::Path(nodes) => {
+        Binding::Path { nodes, .. } => {
             out.push('[');
             for (i, sid) in nodes.iter().enumerate() {
                 if i > 0 {
@@ -215,6 +215,22 @@ fn write_value(
             }
             out.push(']');
         }
+        // A relationship renders as `{start, type, end}` with `{"@id":...}` refs.
+        Binding::Rel(rel) => {
+            let id_ref = |out: &mut String, sid: &fluree_db_core::Sid| -> Result<()> {
+                out.push_str(r#"{"@id":"#);
+                push_json_string(out, &compactor.compact_id_sid(sid)?);
+                out.push('}');
+                Ok(())
+            };
+            out.push_str(r#"{"start":"#);
+            id_ref(out, &rel.start)?;
+            out.push_str(r#","type":"#);
+            id_ref(out, &rel.predicate)?;
+            out.push_str(r#","end":"#);
+            id_ref(out, &rel.end)?;
+            out.push('}');
+        }
         // A list renders as a JSON array of its (typed) elements.
         Binding::List(values) => {
             out.push('[');
@@ -225,6 +241,19 @@ fn write_value(
                 write_value(out, result, v, compactor)?;
             }
             out.push(']');
+        }
+        // A map renders as a JSON object of its (typed) values.
+        Binding::Map(entries) => {
+            out.push('{');
+            for (i, (k, v)) in entries.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                push_json_string(out, k);
+                out.push(':');
+                write_value(out, result, v, compactor)?;
+            }
+            out.push('}');
         }
         Binding::EncodedLit { .. } | Binding::EncodedSid { .. } | Binding::EncodedPid { .. } => {
             unreachable!("encoded bindings are materialized before write_value")
@@ -506,13 +535,20 @@ pub(crate) fn format_binding(
         }
 
         // A path - array of `{"@id": ...}` node references.
-        Binding::Path(nodes) => {
+        Binding::Path { nodes, .. } => {
             let arr: Result<Vec<_>> = nodes
                 .iter()
                 .map(|sid| compactor.compact_id_sid(sid).map(|iri| json!({"@id": iri})))
                 .collect();
             Ok(JsonValue::Array(arr?))
         }
+
+        // A relationship - `{start, type, end}` with `{"@id":...}` refs.
+        Binding::Rel(rel) => Ok(json!({
+            "start": {"@id": compactor.compact_id_sid(&rel.start)?},
+            "type": {"@id": compactor.compact_id_sid(&rel.predicate)?},
+            "end": {"@id": compactor.compact_id_sid(&rel.end)?},
+        })),
 
         // A list - array of its (typed) elements.
         Binding::List(values) => {
@@ -521,6 +557,14 @@ pub(crate) fn format_binding(
                 .map(|v| format_binding(result, v, compactor))
                 .collect();
             Ok(JsonValue::Array(arr?))
+        }
+        // A map - object of its (typed) values.
+        Binding::Map(entries) => {
+            let mut obj = serde_json::Map::with_capacity(entries.len());
+            for (k, v) in entries {
+                obj.insert(k.to_string(), format_binding(result, v, compactor)?);
+            }
+            Ok(JsonValue::Object(obj))
         }
     }
 }

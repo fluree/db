@@ -209,10 +209,39 @@ pub fn compare_bindings(a: &Binding, b: &Binding) -> Ordering {
         (_, Binding::Grouped(_)) => Ordering::Less,
         (Binding::Grouped(_), _) => Ordering::Greater,
 
-        // Path sorts last by node sequence (rarely sorted directly).
-        (Binding::Path(x), Binding::Path(y)) => x.cmp(y),
-        (_, Binding::Path(_)) => Ordering::Less,
-        (Binding::Path(_), _) => Ordering::Greater,
+        // Path sorts last, by node sequence then per-hop edges. Comparing edges
+        // after nodes keeps the order consistent with PartialEq/Hash (which key
+        // on nodes + edges), so equal paths compare Equal. (Rarely sorted
+        // directly; defensive total order.)
+        (
+            Binding::Path {
+                nodes: xn,
+                edges: xe,
+            },
+            Binding::Path {
+                nodes: yn,
+                edges: ye,
+            },
+        ) => xn.cmp(yn).then_with(|| xe.cmp(ye)),
+        (_, Binding::Path { .. }) => Ordering::Less,
+        (Binding::Path { .. }, _) => Ordering::Greater,
+
+        // Relationship: defensive total order consistent with PartialEq's
+        // reifier-or-(start,predicate,end) identity. When both are reified,
+        // compare reifier alone (the identity PartialEq uses) so equal
+        // relationships compare Equal; otherwise fall back to the full tuple,
+        // which keeps reified vs plain distinct and ordered.
+        (Binding::Rel(a), Binding::Rel(b)) => match (&a.reifier, &b.reifier) {
+            (Some(x), Some(y)) => x.cmp(y),
+            _ => (&a.reifier, &a.start, &a.predicate, &a.end).cmp(&(
+                &b.reifier,
+                &b.start,
+                &b.predicate,
+                &b.end,
+            )),
+        },
+        (_, Binding::Rel(_)) => Ordering::Less,
+        (Binding::Rel(_), _) => Ordering::Greater,
 
         // List sorts last, element-wise (cypher rejects ORDER BY <list>, so
         // this is only a defensive total order).
@@ -232,6 +261,35 @@ pub fn compare_bindings(a: &Binding, b: &Binding) -> Ordering {
             .unwrap_or(Ordering::Equal),
         (_, Binding::List(_)) => Ordering::Less,
         (Binding::List(_), _) => Ordering::Greater,
+
+        // Map sorts after List, key-then-value. Entries are compared in key
+        // order (not insertion order) so the order is consistent with the
+        // key-order-insensitive PartialEq/Hash — equal maps compare Equal.
+        // (Cypher rejects ORDER BY <map>, so this is only a defensive total
+        // order.)
+        (Binding::Map(x), Binding::Map(y)) => {
+            let mut xs: Vec<&(Arc<str>, Binding)> = x.iter().collect();
+            let mut ys: Vec<&(Arc<str>, Binding)> = y.iter().collect();
+            xs.sort_by(|a, b| a.0.cmp(&b.0));
+            ys.sort_by(|a, b| a.0.cmp(&b.0));
+            xs.iter()
+                .map(Some)
+                .chain(std::iter::repeat(None))
+                .zip(ys.iter().map(Some).chain(std::iter::repeat(None)))
+                .take(xs.len().max(ys.len()))
+                .map(|(a, b)| match (a, b) {
+                    (Some((ka, va)), Some((kb, vb))) => {
+                        ka.cmp(kb).then_with(|| compare_bindings(va, vb))
+                    }
+                    (Some(_), None) => Ordering::Greater,
+                    (None, Some(_)) => Ordering::Less,
+                    (None, None) => Ordering::Equal,
+                })
+                .find(|o| *o != Ordering::Equal)
+                .unwrap_or(Ordering::Equal)
+        }
+        (_, Binding::Map(_)) => Ordering::Less,
+        (Binding::Map(_), _) => Ordering::Greater,
 
         // IRI types vs Lit types: IRI sorts before Lit
         (

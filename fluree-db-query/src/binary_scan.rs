@@ -138,7 +138,23 @@ fn expr_needs_t(expr: &Expression) -> bool {
         Expression::Call { func, args } => {
             matches!(func, Function::T) || args.iter().any(expr_needs_t)
         }
-        Expression::Exists { .. } => false,
+        Expression::Map(entries) => entries.iter().any(|(_, v)| expr_needs_t(v)),
+        Expression::ListComprehension {
+            list, filter, map, ..
+        } => {
+            expr_needs_t(list)
+                || filter.as_deref().is_some_and(expr_needs_t)
+                || map.as_deref().is_some_and(expr_needs_t)
+        }
+        Expression::Reduce {
+            init, list, body, ..
+        } => expr_needs_t(init) || expr_needs_t(list) || expr_needs_t(body),
+        Expression::ListPredicate {
+            list, predicate, ..
+        } => expr_needs_t(list) || expr_needs_t(predicate),
+        Expression::Member { target, .. } => expr_needs_t(target),
+        Expression::PatternComprehension { projection, .. } => expr_needs_t(projection),
+        Expression::Exists { .. } | Expression::Resolved(_) => false,
     }
 }
 

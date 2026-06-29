@@ -10,6 +10,10 @@ If you're new to Fluree, start with the [Getting Started](../getting-started/REA
 
 Recipes for the list-value and path operators: dense / gap-filled series with `unwind` + `range`, collecting values into lists, the collect→unwind round-trip, working with list values, and shortest-path queries.
 
+### [Cypher](cookbook-cypher.md)
+
+Querying and writing with openCypher: modeling a property graph, querying relationships, `MERGE` find-or-create, updates and deletes, paths and shortest path, aggregation, and cross-surface round-trips with JSON-LD/SPARQL.
+
 ### [Full-Text and Vector Search](cookbook-search.md)
 
 Set up BM25 full-text search and vector similarity. Insert searchable data, write relevance-ranked queries, combine search with graph patterns, and build hybrid text+vector search.

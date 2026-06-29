@@ -165,7 +165,7 @@ fn resolve_subject_term(
                         "CONSTRUCT does not support GROUP BY (Binding::Grouped encountered)"
                             .to_string(),
                     )),
-                    Binding::Path(_) | Binding::List(_) => Err(FormatError::InvalidBinding(
+                    Binding::Path { .. } | Binding::Rel(_) | Binding::List(_) | Binding::Map(_) => Err(FormatError::InvalidBinding(
                         "CONSTRUCT does not support path/list values".to_string(),
                     )),
                 }
@@ -241,7 +241,7 @@ fn resolve_predicate_term(
                         "CONSTRUCT does not support GROUP BY (Binding::Grouped encountered)"
                             .to_string(),
                     )),
-                    Binding::Path(_) | Binding::List(_) => Err(FormatError::InvalidBinding(
+                    Binding::Path { .. } | Binding::Rel(_) | Binding::List(_) | Binding::Map(_) => Err(FormatError::InvalidBinding(
                         "CONSTRUCT does not support path/list values".to_string(),
                     )),
                 }
@@ -474,9 +474,9 @@ fn binding_to_ir_term(
         Binding::Grouped(_) => Err(FormatError::InvalidBinding(
             "CONSTRUCT does not support GROUP BY (Binding::Grouped encountered)".to_string(),
         )),
-        Binding::Path(_) | Binding::List(_) => Err(FormatError::InvalidBinding(
-            "CONSTRUCT does not support path/list values".to_string(),
-        )),
+        Binding::Path { .. } | Binding::Rel(_) | Binding::List(_) | Binding::Map(_) => Err(
+            FormatError::InvalidBinding("CONSTRUCT does not support path/list values".to_string()),
+        ),
     }
 }
 

@@ -534,10 +534,11 @@ Edge annotations are the storage primitive for the labeled-property-graph shape:
 - two relationships of the same type between the same endpoints become two parallel annotations (see *Parallel annotations* above),
 - *LPG mode* (`lpgEdgeLifecycle: true`) gives the "delete the relationship deletes its properties" lifecycle property graphs expect.
 
-A dedicated property-graph query/write language front-end is a separate surface and is not part of this release; the JSON-LD `@annotation` surface and the SPARQL 1.2 annotation tail are the supported ways to write and read this shape today.
+[Cypher](cypher.md) is the property-graph query/write front-end: a Cypher relationship `(a)-[r:T {p: v}]->(b)` lowers to exactly this annotated-edge shape, so property-graph users get LPG ergonomics while the data stays first-class RDF. The JSON-LD `@annotation` surface and the SPARQL 1.2 annotation tail read and write the same shape.
 
 ## See also
 
+- [Cypher](cypher.md) — the property-graph front-end; Cypher relationships map onto edge annotations.
 - [Edge annotations design](../design/edge-annotations.md) — storage internals (EdgeKey, sidecar arena, sticky-bit state machine, GC reachability).
 - [Datasets and named graphs](datasets-and-named-graphs.md) — annotations work in named graphs (via the JSON-LD `@annotation` surface) as well as the default graph; the SPARQL UPDATE surface is default-graph only.
 - [Time travel](time-travel.md) — annotation events live in history like every other fact.

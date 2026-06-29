@@ -108,7 +108,7 @@ pub use binary_history::BinaryHistoryScanOperator;
 pub use binary_range::BinaryRangeProvider;
 pub use binary_scan::BinaryScanOperator;
 pub use bind::BindOperator;
-pub use binding::{Batch, BatchError, BatchView, Binding, RowAccess, RowView};
+pub use binding::{Batch, BatchError, BatchView, Binding, RelValue, RowAccess, RowView};
 pub use context::{ExecutionContext, WellKnownDatatypes};
 pub use dataset::{ActiveGraph, ActiveGraphs, DataSet, GraphRef};
 pub use dataset_operator::{DatasetBuilder, DatasetOperator, ScanDatasetBuilder};

@@ -38,6 +38,7 @@ pub mod error;
 pub mod flake_sink;
 pub mod generate;
 pub mod ir;
+pub mod lower_cypher_update;
 pub mod lower_sparql_update;
 pub mod namespace;
 pub mod parse;

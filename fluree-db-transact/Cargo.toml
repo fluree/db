@@ -13,6 +13,7 @@ fluree-db-indexer = { path = "../fluree-db-indexer" }
 fluree-db-policy = { path = "../fluree-db-policy" }
 fluree-db-query = { path = "../fluree-db-query" }
 fluree-db-sparql = { path = "../fluree-db-sparql" }
+fluree-db-cypher = { path = "../fluree-db-cypher" }
 fluree-db-novelty = { path = "../fluree-db-novelty" }
 fluree-db-ledger = { path = "../fluree-db-ledger" }
 fluree-db-nameservice = { path = "../fluree-db-nameservice" }
