@@ -22,13 +22,37 @@ use crate::{
     ApiError, Fluree, PolicyContext, Result, TrackedErrorResponse, TrackedTransactionInput,
     Tracker, TrackingOptions, TrackingTally,
 };
-use fluree_db_core::{ContentId, ContentKind, ContentStore};
+use fluree_db_core::{ContentId, ContentKind, ContentStore, LedgerSnapshot};
 use fluree_db_ledger::{IndexConfig, LedgerState, StagedLedger};
 use fluree_db_nameservice::NsRecord;
 use fluree_db_transact::{
     lower_sparql_update_ast, parse_trig_phase1, CommitOpts, NamedGraphBlock, NamespaceRegistry,
     RawTrigMeta, TransactError, Txn, TxnOpts, TxnType,
 };
+
+/// Parse a SPARQL UPDATE string and lower it to the transaction IR against
+/// a snapshot's namespace registry. Errors map to HTTP 400 with the same
+/// shape the two builder paths previously emitted.
+pub(crate) fn parse_and_lower_sparql_update(
+    sparql: &str,
+    snapshot: &LedgerSnapshot,
+    txn_opts: TxnOpts,
+) -> Result<Txn> {
+    let parsed = fluree_db_sparql::parse_sparql(sparql);
+    if parsed.has_errors() {
+        let messages: Vec<String> = parsed.errors().map(|d| d.message.clone()).collect();
+        return Err(ApiError::http(
+            400,
+            format!("SPARQL UPDATE parse error: {}", messages.join("; ")),
+        ));
+    }
+    let ast = parsed
+        .ast
+        .ok_or_else(|| ApiError::http(400, "Failed to parse SPARQL UPDATE".to_string()))?;
+    let mut ns = NamespaceRegistry::from_db(snapshot);
+    lower_sparql_update_ast(&ast, &mut ns, txn_opts)
+        .map_err(|e| ApiError::http(400, format!("SPARQL UPDATE lowering error: {e}")))
+}
 
 /// Conflicts that heal by reconciling the cached writer state to the durable
 /// nameservice head and re-staging.
@@ -988,20 +1012,7 @@ impl Fluree {
         }
 
         if let Some(sparql) = core.pending_sparql {
-            let parsed = fluree_db_sparql::parse_sparql(sparql);
-            if parsed.has_errors() {
-                let messages: Vec<String> = parsed.errors().map(|d| d.message.clone()).collect();
-                return Err(ApiError::http(
-                    400,
-                    format!("SPARQL UPDATE parse error: {}", messages.join("; ")),
-                ));
-            }
-            let ast = parsed
-                .ast
-                .ok_or_else(|| ApiError::http(400, "Failed to parse SPARQL UPDATE".to_string()))?;
-            let mut ns = NamespaceRegistry::from_db(&ledger_state.snapshot);
-            let txn = lower_sparql_update_ast(&ast, &mut ns, core.txn_opts)
-                .map_err(|e| ApiError::http(400, format!("SPARQL UPDATE lowering error: {e}")))?;
+            let txn = parse_and_lower_sparql_update(sparql, &ledger_state.snapshot, core.txn_opts)?;
             let txn_type = txn.txn_type;
             let stage_result = self
                 .stage_transaction_from_txn(

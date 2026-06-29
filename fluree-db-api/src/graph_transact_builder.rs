@@ -8,14 +8,14 @@ use serde_json::Value as JsonValue;
 use crate::error::BuilderErrors;
 use crate::graph::Graph;
 use crate::graph_query_builder::GraphSnapshotQueryBuilder;
-use crate::tx_builder::{Staged, TransactCore, TransactOperation};
+use crate::tx_builder::{parse_and_lower_sparql_update, Staged, TransactCore, TransactOperation};
 use crate::view::GraphDb;
 use crate::{
     ApiError, Fluree, PolicyContext, Result, TrackedErrorResponse, TrackedTransactionInput,
     Tracker, TrackingOptions, TransactResultRef,
 };
 use fluree_db_ledger::IndexConfig;
-use fluree_db_transact::{lower_sparql_update_ast, CommitOpts, NamespaceRegistry, TxnOpts};
+use fluree_db_transact::{CommitOpts, TxnOpts};
 
 // ============================================================================
 // GraphTransactBuilder
@@ -200,20 +200,8 @@ impl<'a, 'g> GraphTransactBuilder<'a, 'g> {
         // Stage
         // TODO: Add trig_meta support to tracked+policy path
         let stage_result = if let Some(sparql) = self.core.pending_sparql {
-            let parsed = fluree_db_sparql::parse_sparql(sparql);
-            if parsed.has_errors() {
-                let messages: Vec<String> = parsed.errors().map(|d| d.message.clone()).collect();
-                return Err(ApiError::http(
-                    400,
-                    format!("SPARQL UPDATE parse error: {}", messages.join("; ")),
-                ));
-            }
-            let ast = parsed
-                .ast
-                .ok_or_else(|| ApiError::http(400, "Failed to parse SPARQL UPDATE".to_string()))?;
-            let mut ns = NamespaceRegistry::from_db(&ledger_state.snapshot);
-            let txn = lower_sparql_update_ast(&ast, &mut ns, self.core.txn_opts)
-                .map_err(|e| ApiError::http(400, format!("SPARQL UPDATE lowering error: {e}")))?;
+            let txn =
+                parse_and_lower_sparql_update(sparql, &ledger_state.snapshot, self.core.txn_opts)?;
             let tracker = self
                 .core
                 .tracking
