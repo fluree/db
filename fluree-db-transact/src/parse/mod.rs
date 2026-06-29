@@ -20,6 +20,9 @@ pub mod txn_meta;
 ///
 /// - [`jsonld::strip_opts_for_expansion`] removes these before JSON-LD
 ///   expansion so the single-object form does not leak them as predicates.
+///   It also rejects (rather than silently strips) a single-object document
+///   whose own `@context` defines one of these names as a term — that name is
+///   reserved, so the collision is an error, not a guess.
 /// - [`edge_annotations::is_envelope`] / [`edge_annotations::is_transaction_wrapper`]
 ///   tolerate them when classifying a document as an envelope / wrapper
 ///   rather than a data node-map, so annotation lowering still recurses into

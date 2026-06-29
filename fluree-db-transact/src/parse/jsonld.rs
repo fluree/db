@@ -184,7 +184,7 @@ fn parse_insert(json: &Value, opts: TxnOpts, ns_registry: &mut NamespaceRegistry
     let txn_meta = extract_txn_meta(json, &context, ns_registry, strict)?;
 
     // Strip top-level `opts` so it is not expanded as data (single-object form)
-    let json_for_expand = strip_opts_for_expansion(json);
+    let json_for_expand = strip_opts_for_expansion(json, &context)?;
     // Expand the document
     let expanded = expand_with_context_policy(&json_for_expand, &context, strict)?;
 
@@ -241,7 +241,7 @@ fn parse_upsert(json: &Value, opts: TxnOpts, ns_registry: &mut NamespaceRegistry
     let txn_meta = extract_txn_meta(json, &context, ns_registry, strict)?;
 
     // Strip top-level `opts` so it is not expanded as data (single-object form)
-    let json_for_expand = strip_opts_for_expansion(json);
+    let json_for_expand = strip_opts_for_expansion(json, &context)?;
     let expanded = expand_with_context_policy(&json_for_expand, &context, strict)?;
 
     let empty_aliases = HashMap::new();
@@ -880,18 +880,42 @@ fn extract_context(json: &Value) -> Result<ParsedContext> {
 /// a stray literal predicate (e.g. a dangling `<subject> ledger "x:main"`
 /// triple), so the strip is what keeps body-ledger writes clean.
 ///
+/// Collision guard: in single-object form, if the document's own `@context`
+/// defines a reserved name as a term, the user almost certainly means it as a
+/// real predicate — silently stripping it would drop genuine triples. Since
+/// the name is reserved (routing consumes `ledger` / `from*` before parse,
+/// `opts` / `txn-meta` are control sidecars), we reject the collision with an
+/// actionable error rather than guess. Envelope form is unaffected: there the
+/// reserved key is top-level metadata, never a data predicate.
+///
 /// Returns `Cow::Borrowed` when no stripping is needed, `Cow::Owned` otherwise.
-fn strip_opts_for_expansion(json: &Value) -> std::borrow::Cow<'_, Value> {
+fn strip_opts_for_expansion<'a>(
+    json: &'a Value,
+    context: &ParsedContext,
+) -> Result<std::borrow::Cow<'a, Value>> {
     use super::RESERVED_TXN_KEYS;
     match json.as_object() {
         Some(obj) if RESERVED_TXN_KEYS.iter().any(|k| obj.contains_key(*k)) => {
+            let is_envelope = obj.contains_key("@graph");
+            if !is_envelope {
+                if let Some(k) = RESERVED_TXN_KEYS
+                    .iter()
+                    .find(|k| obj.contains_key(**k) && context.contains(k))
+                {
+                    return Err(TransactError::Parse(format!(
+                        "@context term {k:?} collides with a reserved transactor key \
+                         and would be silently dropped; rename the term \
+                         (reserved keys: {RESERVED_TXN_KEYS:?})"
+                    )));
+                }
+            }
             let mut cloned = obj.clone();
             for k in RESERVED_TXN_KEYS {
                 cloned.remove(*k);
             }
-            std::borrow::Cow::Owned(Value::Object(cloned))
+            Ok(std::borrow::Cow::Owned(Value::Object(cloned)))
         }
-        _ => std::borrow::Cow::Borrowed(json),
+        _ => Ok(std::borrow::Cow::Borrowed(json)),
     }
 }
 
@@ -1910,7 +1934,7 @@ mod tests {
             obj.insert("ex:name".to_string(), json!("Alice"));
             obj.insert((*key).to_string(), json!("x:main"));
             let doc = Value::Object(obj);
-            let stripped = strip_opts_for_expansion(&doc);
+            let stripped = strip_opts_for_expansion(&doc, &ParsedContext::new()).unwrap();
             assert!(
                 stripped.get(key).is_none(),
                 "reserved key {key:?} must be stripped before expansion"
@@ -1920,6 +1944,54 @@ mod tests {
                 "data predicate must survive stripping of {key:?}"
             );
         }
+    }
+
+    #[test]
+    fn strip_errors_when_reserved_key_is_a_context_term() {
+        // Single-object form: a reserved name defined as a real @context term
+        // is almost certainly intended as data. Silently stripping it would
+        // drop genuine triples, so we reject the collision instead of guessing.
+        for key in super::super::RESERVED_TXN_KEYS {
+            let mut ctx = ParsedContext::new();
+            ctx.terms.insert(
+                (*key).to_string(),
+                fluree_graph_json_ld::ContextEntry {
+                    id: Some(format!("http://example.org/{key}")),
+                    ..Default::default()
+                },
+            );
+            let mut obj = serde_json::Map::new();
+            obj.insert("ex:name".to_string(), json!("Alice"));
+            obj.insert((*key).to_string(), json!("data value"));
+            let doc = Value::Object(obj);
+            let err = strip_opts_for_expansion(&doc, &ctx).unwrap_err();
+            assert!(
+                matches!(err, TransactError::Parse(ref m) if m.contains(key)),
+                "collision on {key:?} should error, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn strip_allows_reserved_context_term_in_envelope_form() {
+        // Envelope form (with @graph) never treats top-level keys as data
+        // predicates, so a context-term collision is harmless and must not
+        // error — the reserved key is just stripped as routing/control noise.
+        let mut ctx = ParsedContext::new();
+        ctx.terms.insert(
+            "graph".to_string(),
+            fluree_graph_json_ld::ContextEntry {
+                id: Some("http://example.org/graph".to_string()),
+                ..Default::default()
+            },
+        );
+        let doc = json!({
+            "graph": "x:main",
+            "@graph": [{"ex:name": "Alice"}]
+        });
+        let stripped = strip_opts_for_expansion(&doc, &ctx).unwrap();
+        assert!(stripped.get("graph").is_none());
+        assert!(stripped.get("@graph").is_some());
     }
 
     #[test]
