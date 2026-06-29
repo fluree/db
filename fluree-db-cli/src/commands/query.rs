@@ -1143,7 +1143,7 @@ async fn run_local_ndjson_stream_dataset(
                 ));
             }
             let mut source = fluree_db_api::GraphSource::new(alias);
-            if let Some(spec) = time_spec.clone() {
+            if let Some(spec) = time_spec {
                 source = source.with_time(spec);
             }
             let mut dataset_spec = fluree_db_api::DatasetSpec::new();
@@ -1159,9 +1159,9 @@ async fn run_local_ndjson_stream_dataset(
                 CliError::Input("JSON-LD query must be a JSON object".to_string())
             })?;
 
-            let from_id = match &time_spec {
+            let from_id = match time_spec {
                 Some(spec) => {
-                    attach_time_suffix_preserving_fragment(alias, &time_spec_to_suffix(spec))
+                    attach_time_suffix_preserving_fragment(alias, &time_spec_to_suffix(&spec))
                 }
                 None => alias.to_string(),
             };
