@@ -193,9 +193,10 @@ pub fn predicate_scalar_agg_operator(
 
 /// The folded result of a scalar aggregate, before batch construction.
 enum AggOutput {
-    /// `xsd:integer` value (SUM, COUNT-DISTINCT).
+    /// `xsd:integer` value (SUM, COUNT-DISTINCT, and the empty-group identity 0
+    /// for AVG).
     Integer(i64),
-    /// A pre-built binding (AVG: `xsd:double`, or `Unbound` for the empty input).
+    /// A pre-built binding (a non-empty AVG result, `xsd:double`).
     Binding(Binding),
 }
 
@@ -252,7 +253,9 @@ impl AggState {
             AggState::Sum { sum, .. } => AggOutput::Integer(sum),
             AggState::Avg { sum, count, .. } => {
                 if count == 0 {
-                    AggOutput::Binding(Binding::Unbound)
+                    // AVG of the empty multiset is the identity `"0"^^xsd:integer`
+                    // (SPARQL 1.1 §18.5.1.4), matching the generic aggregate path.
+                    AggOutput::Integer(0)
                 } else {
                     AggOutput::Binding(Binding::lit(
                         FlakeValue::Double(sum / count as f64),
@@ -335,11 +338,14 @@ impl AggState {
 }
 
 /// Result for a predicate that is absent from the persisted dictionary
-/// (empty input). SUM/COUNT-DISTINCT are 0; AVG of nothing is unbound.
+/// (empty input). SUM, AVG, and COUNT-DISTINCT all return their identity
+/// `"0"^^xsd:integer` over the empty multiset (SPARQL 1.1 §18.5.1), matching the
+/// generic aggregate path.
 fn empty_result(kind: ScalarAggKind) -> AggOutput {
     match kind {
-        ScalarAggKind::Sum(_) | ScalarAggKind::CountDistinctObject => AggOutput::Integer(0),
-        ScalarAggKind::AvgNumeric => AggOutput::Binding(Binding::Unbound),
+        ScalarAggKind::Sum(_) | ScalarAggKind::CountDistinctObject | ScalarAggKind::AvgNumeric => {
+            AggOutput::Integer(0)
+        }
     }
 }
 

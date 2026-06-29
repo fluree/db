@@ -18,6 +18,30 @@ Fluree implements the W3C RDF 1.1 specification:
 
 **Specification:** https://www.w3.org/TR/rdf11-concepts/
 
+### RDF 1.2
+
+**Status:** Partial support (edge annotations / reification)
+
+Fluree implements the RDF 1.2 reification model used for edge annotations:
+- `rdf:reifies` with triple terms (`<<( s p o )>>`) as the reified object
+- Reifiers identified by IRI, blank node, or variable
+
+Fluree also exposes a non-standard extension that reads commit metadata off a
+quoted triple (`<< s p o >> f:t ?t`, `f:op ?op`) for transaction-time and
+assert/retract introspection.
+
+Not yet supported:
+- Turtle 1.2 / TriG 1.2 annotation syntax on ingest (`{| ... |}` annotation
+  tails, the `~` reifier, and `<<( ... )>>` triple terms) — convert to JSON-LD,
+  or add annotations via SPARQL `INSERT DATA`, instead
+- Triple terms as arbitrary object values (only as the `rdf:reifies` object)
+- Triple terms in subject position and nested triple terms
+- Multiple triples reified by a single annotation
+
+See [Edge annotations](../concepts/edge-annotations.md).
+
+**Specification:** https://www.w3.org/TR/rdf12-concepts/
+
 ### JSON-LD 1.1
 
 **Status:** Fully compliant
@@ -50,13 +74,18 @@ Supported SPARQL features:
 - FILTER expressions
 - BIND expressions
 - Aggregations (COUNT, SUM, AVG, MIN, MAX, SAMPLE, GROUP_CONCAT) with DISTINCT modifier
-- GROUP BY (variables and expressions)
+- GROUP BY (variables and expressions, including bare built-in calls like `GROUP BY DATATYPE(?v)`)
 - ORDER BY
 - LIMIT and OFFSET
-- Subqueries
-- Property paths (partial: `+`, `*`, `^`, `|`, `/`; see [SPARQL docs](../query/sparql.md#property-paths))
+- Subqueries (evaluated independently — an inner `ORDER BY`/`LIMIT`/`OFFSET` scopes the sub-SELECT before it joins the enclosing pattern, per SPARQL 1.1 §18.2; there are no correlated/LATERAL sub-SELECTs)
+- Blank-node property lists (`[ :p ?o ]`) in subject and object position
+- Property paths (partial: `+`, `*`, `?`, `^`, `|`, `/`; negated property sets `!` and `{n,m}` depth ranges are not supported; see [SPARQL docs](../query/sparql.md#property-paths))
 
 **Aggregate result types:** COUNT and SUM of integers return `xsd:integer` (per W3C spec), not `xsd:long`. SUM of mixed types and AVG return `xsd:double`.
+
+**Empty-group aggregates:** Over an implicit single group (no `GROUP BY`) whose pattern matches nothing, `COUNT`, `SUM`, and `AVG` return their identity `"0"^^xsd:integer` (SPARQL 1.1 §18.5.1); `MIN`, `MAX`, and `SAMPLE` have no identity element and return unbound. A query *with* `GROUP BY` over an empty pattern returns zero rows.
+
+**Expression error semantics:** A *dynamic value* error in a `SELECT`/`BIND`/`ORDER BY` expression (e.g. arithmetic on incompatible operand types) leaves that variable unbound for the solution and the query still returns the remaining rows (SPARQL 1.1 §18.5 `Extend`); the same error in a `FILTER` eliminates the solution (§17.2). *Structural* errors — a built-in called with the wrong arity, an unknown datatype IRI — describe a malformed query and are reported as a query error. (Transactions evaluate their `WHERE` clause in strict mode, so a computed value error fails the transaction rather than silently writing an unbound value.)
 
 **W3C Compliance Testing:** Fluree runs the official W3C SPARQL test suite via the `testsuite-sparql` crate. The suite automatically discovers and runs 700+ test cases from W3C manifest files. See the [compliance test guide](../contributing/sparql-compliance.md) for details.
 
@@ -67,19 +96,45 @@ Supported SPARQL features:
 **Status:** Partial support
 
 Supported:
-- INSERT DATA (via JSON-LD transactions)
-- DELETE/INSERT WHERE (via WHERE/DELETE/INSERT)
+- INSERT DATA (including `GRAPH <iri> { ... }` named-graph blocks)
+- DELETE DATA (including `GRAPH <iri> { ... }` named-graph blocks)
+- DELETE WHERE (default graph only — `GRAPH` blocks are rejected)
+- DELETE/INSERT WHERE, including the `DELETE { } WHERE { }` and
+  `INSERT { } WHERE { }` short forms, with optional `WITH`/`USING` clauses and
+  `GRAPH <iri> { ... }` blocks in templates
 
 Not yet supported:
-- DELETE DATA
+- Variable graph names (`GRAPH ?g { ... }`) in any update — only ground IRIs
+- `GRAPH` blocks inside DELETE WHERE
 - LOAD
 - CLEAR
 - DROP
+- CREATE
 - COPY, MOVE, ADD
 
-Use JSON-LD transactions for transaction operations.
+JSON-LD transactions remain available as an alternative write surface.
 
 **Specification:** https://www.w3.org/TR/sparql11-update/
+
+### SPARQL 1.2
+
+**Status:** Partial support (annotations)
+
+Supported query and update annotation syntax:
+- Anonymous annotation blocks: `?s ?p ?o {| ?ap ?av |}`
+- Named reifiers: `?s ?p ?o ~ ?r {| ... |}` (IRI, blank-node, or variable reifier)
+- `rdf:reifies` form with `<<( s p o )>>` triple terms
+- Annotations in `INSERT DATA` / `DELETE DATA`
+
+Not yet supported:
+- Triple-term accessor functions: `TRIPLE()`, `SUBJECT()`, `PREDICATE()`,
+  `OBJECT()`, `isTRIPLE()`
+- Triple terms as arbitrary values, in `CONSTRUCT` patterns, or in subject
+  position; multi-triple and nested annotations
+- Named-graph edge annotations in SPARQL UPDATE (default graph only)
+- W3C SPARQL 1.2 test-suite execution (manifests present but not yet run)
+
+**Specification:** https://www.w3.org/TR/sparql12-query/
 
 ### Turtle
 
@@ -247,10 +302,13 @@ Supported SPARQL versions:
 |--------|------|-------|
 | JSON-LD | Yes | Yes |
 | Turtle | Yes | Yes |
-| N-Triples | Planned | Planned |
-| N-Quads | Planned | Planned |
-| RDF/XML | Planned | No |
-| TriG | Planned | Planned |
+| N-Triples | Yes | Yes |
+| N-Quads | Yes | Yes |
+| TriG | Yes | Yes |
+| RDF/XML | No | CONSTRUCT/DESCRIBE results only |
+
+Import accepts `.ttl`, `.nt`, `.nq`, `.trig`, and `.jsonld`/`.jsonl` files, each
+with transparent `.gz` / `.zst` decompression.
 
 ## Protocol Support
 
@@ -348,10 +406,11 @@ Export Fluree data to:
 ### Planned Features
 
 **Query:**
-- SPARQL property paths: remaining operators (`?` zero-or-one, `!` negated set)
-- GeoSPARQL
-- SPARQL 1.1 Federation
-- Full SPARQL UPDATE
+- SPARQL property paths: remaining operators (`!` negated property set, `{n,m}` depth ranges)
+- SPARQL 1.1 Federation (`SERVICE`)
+- Full SPARQL UPDATE (LOAD, CLEAR, DROP, CREATE, COPY, MOVE, ADD; variable graph names)
+- GeoSPARQL: remaining OGC functions (only `geof:distance` is implemented today)
+- RDF 1.2 / SPARQL 1.2: Turtle 1.2 annotation syntax on ingest; triple-term accessor functions; W3C 1.2 test-suite execution
 
 **Storage:**
 - Additional cloud providers (GCP, Azure)
